@@ -7,7 +7,6 @@ query LatestCommitment {
   commitments(orderBy: [blockNumber_DESC, treePosition_DESC], limit: 1) {
     treeNumber
     treePosition
-    blockNumber
   }
 }
 ";
@@ -20,9 +19,6 @@ query TreeLeaves($tree: Int!, $fromLeaf: Int!) {
     limit: 10000
   ) {
     treePosition
-    blockNumber
-    transactionHash
-    commitmentType
     hash
   }
 }
@@ -67,8 +63,6 @@ pub(crate) struct LatestCommitmentRow {
     pub tree_number: i64,
     #[serde(rename = "treePosition")]
     pub tree_position: i64,
-    #[serde(rename = "blockNumber")]
-    pub block_number: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,11 +74,5 @@ pub(crate) struct TreeLeavesResponse {
 pub(crate) struct CommitmentRow {
     #[serde(rename = "treePosition")]
     pub tree_position: i64,
-    #[serde(rename = "blockNumber")]
-    pub block_number: String,
-    #[serde(rename = "transactionHash")]
-    pub transaction_hash: String,
-    #[serde(rename = "commitmentType")]
-    pub commitment_type: String,
     pub hash: String,
 }

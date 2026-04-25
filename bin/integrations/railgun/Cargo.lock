@@ -739,6 +739,7 @@ name = "raven-railgun"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "raven-core",
  "raven-indexer",
  "reqwest",

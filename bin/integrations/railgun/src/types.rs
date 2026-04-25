@@ -1,51 +1,25 @@
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CommitmentKind {
-    Shield,
-    Transact,
-    LegacyGenerated,
-    LegacyEncrypted,
-}
-
-impl CommitmentKind {
-    pub(crate) fn from_subgraph_str(s: &str) -> Option<Self> {
-        match s {
-            "ShieldCommitment" => Some(Self::Shield),
-            "TransactCommitment" => Some(Self::Transact),
-            "LegacyGeneratedCommitment" => Some(Self::LegacyGenerated),
-            "LegacyEncryptedCommitment" => Some(Self::LegacyEncrypted),
-            _ => None,
-        }
-    }
-}
-
-impl fmt::Display for CommitmentKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Shield => "Shield",
-            Self::Transact => "Transact",
-            Self::LegacyGenerated => "LegacyGenerated",
-            Self::LegacyEncrypted => "LegacyEncrypted",
-        })
-    }
-}
+use bytes::Bytes;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitmentRecord {
     pub(crate) leaf_index: u32,
-    pub(crate) kind: CommitmentKind,
     pub(crate) hash: [u8; 32],
-    pub(crate) block_number: u64,
-    pub(crate) tx_hash: [u8; 32],
 }
 
 impl CommitmentRecord {
-    /// PIR / `StorageBackend` key. Tree is implicit (single active tree),
-    /// so the leaf index alone uniquely identifies a commitment.
-    #[allow(dead_code)]
-    pub(crate) fn pir_key(&self) -> u64 {
+    pub(crate) fn key(&self) -> u64 {
         u64::from(self.leaf_index)
+    }
+
+    pub(crate) fn to_bytes(&self) -> Bytes {
+        Bytes::copy_from_slice(&self.hash)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn try_hash_from_bytes(buf: &[u8]) -> Option<[u8; 32]> {
+        <[u8; 32]>::try_from(buf).ok()
     }
 }
 
@@ -53,25 +27,24 @@ impl fmt::Display for CommitmentRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{kind} leaf={leaf} hash=0x{hash} block={block} tx=0x{tx}",
-            kind = self.kind,
-            leaf = self.leaf_index,
-            hash = hex_lower(&self.hash),
-            block = self.block_number,
-            tx = hex_lower(&self.tx_hash),
+            "leaf={} hash=0x{}",
+            self.leaf_index,
+            hex_lower(&self.hash)
         )
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScanCursor {
-    /// Highest leaf index already printed; `None` before any leaves processed.
+    /// Highest leaf index already processed; `None` before any leaves processed.
     pub(crate) last_processed_leaf: Option<u32>,
 }
 
 impl ScanCursor {
     pub(crate) fn empty() -> Self {
-        Self { last_processed_leaf: None }
+        Self {
+            last_processed_leaf: None,
+        }
     }
 
     pub(crate) fn next_leaf(self) -> u32 {
@@ -83,14 +56,13 @@ impl ScanCursor {
 pub(crate) struct TreeStatus {
     pub(crate) tree_number: u32,
     pub(crate) size: u32,
-    pub(crate) last_block: u64,
 }
 
 impl TreeStatus {
     pub(crate) const TREE_CAPACITY: u32 = 1 << 16;
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         s.push(nib(b >> 4));
@@ -103,5 +75,37 @@ fn nib(n: u8) -> char {
     match n {
         0..=9 => (b'0' + n) as char,
         _ => (b'a' + (n - 10)) as char,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_roundtrips_through_bytes() {
+        let rec = CommitmentRecord {
+            leaf_index: 42,
+            hash: [7u8; 32],
+        };
+        let buf = rec.to_bytes();
+        assert_eq!(buf.len(), 32);
+        let back = CommitmentRecord::try_hash_from_bytes(&buf).expect("decode");
+        assert_eq!(back, rec.hash);
+    }
+
+    #[test]
+    fn key_is_leaf_index() {
+        let rec = CommitmentRecord {
+            leaf_index: 12345,
+            hash: [0u8; 32],
+        };
+        assert_eq!(rec.key(), 12345u64);
+    }
+
+    #[test]
+    fn try_hash_from_bytes_rejects_wrong_length() {
+        assert!(CommitmentRecord::try_hash_from_bytes(&[0u8; 31]).is_none());
+        assert!(CommitmentRecord::try_hash_from_bytes(&[0u8; 33]).is_none());
     }
 }

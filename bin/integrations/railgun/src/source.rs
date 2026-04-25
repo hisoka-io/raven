@@ -6,7 +6,7 @@ use crate::subgraph::{
     self, CommitmentRow, GraphRequest, GraphResponse, LatestCommitmentResponse, LatestVars,
     TreeLeavesResponse, TreeLeavesVars,
 };
-use crate::types::{CommitmentKind, CommitmentRecord, ScanCursor, TreeStatus};
+use crate::types::{CommitmentRecord, ScanCursor, TreeStatus};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SourceError {
@@ -20,8 +20,6 @@ pub(crate) enum SourceError {
     EmptyTree,
     #[error("invalid {field} from subgraph: {value}")]
     InvalidField { field: &'static str, value: String },
-    #[error("unknown commitmentType from subgraph: {0}")]
-    UnknownKind(String),
     #[error("active tree filled; restart to pick up the next")]
     TreeFilled,
 }
@@ -74,12 +72,8 @@ impl SubgraphSource {
             field: "treePosition",
             value: row.tree_position.to_string(),
         })?;
-        let last_block = row.block_number.parse::<u64>().map_err(|_| SourceError::InvalidField {
-            field: "blockNumber",
-            value: row.block_number,
-        })?;
 
-        Ok(TreeStatus { tree_number, size: last_leaf.saturating_add(1), last_block })
+        Ok(TreeStatus { tree_number, size: last_leaf.saturating_add(1) })
     }
 }
 
@@ -138,33 +132,9 @@ fn parse_row(row: CommitmentRow) -> Result<CommitmentRecord, SourceError> {
         field: "treePosition",
         value: row.tree_position.to_string(),
     })?;
-    let block_number = row.block_number.parse::<u64>().map_err(|_| SourceError::InvalidField {
-        field: "blockNumber",
-        value: row.block_number,
-    })?;
-    let kind = CommitmentKind::from_subgraph_str(&row.commitment_type)
-        .ok_or_else(|| SourceError::UnknownKind(row.commitment_type.clone()))?;
-    // Subgraph returns hashes as decimal BigInt strings (Poseidon field
-    // elements), and transactionHash as 0x-prefixed hex.
+    // Subgraph returns `hash` as a decimal BigInt string (Poseidon field element).
     let hash = decimal_to_bytes32(&row.hash, "hash")?;
-    let tx_hash = parse_hex_bytes32(&row.transaction_hash, "transactionHash")?;
-    Ok(CommitmentRecord { leaf_index, kind, hash, block_number, tx_hash })
-}
-
-fn parse_hex_bytes32(s: &str, field: &'static str) -> Result<[u8; 32], SourceError> {
-    let stripped = s.strip_prefix("0x").unwrap_or(s);
-    if stripped.len() != 64 {
-        return Err(SourceError::InvalidField { field, value: s.to_owned() });
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        let hi = hex_nibble(stripped.as_bytes()[i * 2])
-            .ok_or_else(|| SourceError::InvalidField { field, value: s.to_owned() })?;
-        let lo = hex_nibble(stripped.as_bytes()[i * 2 + 1])
-            .ok_or_else(|| SourceError::InvalidField { field, value: s.to_owned() })?;
-        *byte = (hi << 4) | lo;
-    }
-    Ok(out)
+    Ok(CommitmentRecord { leaf_index, hash })
 }
 
 /// Convert a decimal string (up to 256 bits) into 32 big-endian bytes.
@@ -179,7 +149,6 @@ fn decimal_to_bytes32(s: &str, field: &'static str) -> Result<[u8; 32], SourceEr
             return Err(SourceError::InvalidField { field, value: s.to_owned() });
         }
         let digit = u16::from(ch - b'0');
-        // out = out * 10 + digit, big-endian, propagating carries from LSB.
         let mut carry: u16 = digit;
         for byte in out.iter_mut().rev() {
             let v = u16::from(*byte) * 10 + carry;
@@ -191,15 +160,6 @@ fn decimal_to_bytes32(s: &str, field: &'static str) -> Result<[u8; 32], SourceEr
         }
     }
     Ok(out)
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 async fn post<V: serde::Serialize, R: for<'de> serde::Deserialize<'de>>(
@@ -216,4 +176,83 @@ async fn post<V: serde::Serialize, R: for<'de> serde::Deserialize<'de>>(
         return Err(SourceError::Graph(joined));
     }
     resp.data.ok_or(SourceError::MissingData)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use raven_core::{MemoryStore, StorageBackend};
+    use raven_indexer::Indexer;
+
+    /// Stub source that returns one canned batch per `poll_once`, then empty.
+    struct StubSource {
+        active_tree: u32,
+        batches: Mutex<std::vec::IntoIter<Vec<CommitmentRecord>>>,
+    }
+
+    impl StubSource {
+        fn new(active_tree: u32, batches: Vec<Vec<CommitmentRecord>>) -> Self {
+            Self {
+                active_tree,
+                batches: Mutex::new(batches.into_iter()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CommitmentSource for StubSource {
+        fn active_tree(&self) -> u32 {
+            self.active_tree
+        }
+
+        async fn poll_once(
+            &self,
+            cursor: ScanCursor,
+        ) -> Result<(ScanCursor, Vec<CommitmentRecord>), SourceError> {
+            let next_batch = {
+                let mut iter = self.batches.lock().expect("stub batches lock");
+                iter.next().unwrap_or_default()
+            };
+
+            let last = next_batch.last().map(|r| r.leaf_index).or(cursor.last_processed_leaf);
+            Ok((ScanCursor { last_processed_leaf: last }, next_batch))
+        }
+    }
+
+    fn rec(leaf: u32, byte: u8) -> CommitmentRecord {
+        CommitmentRecord { leaf_index: leaf, hash: [byte; 32] }
+    }
+
+    #[tokio::test]
+    async fn poller_writes_into_indexer_and_snapshot_reflects_all_leaves() {
+        let batch_a = vec![rec(0, 0xAA), rec(1, 0xBB), rec(2, 0xCC)];
+        let batch_b = vec![rec(3, 0xDD), rec(4, 0xEE)];
+        let total = batch_a.len() + batch_b.len();
+
+        let source = StubSource::new(0, vec![batch_a.clone(), batch_b.clone()]);
+        let indexer: Indexer<MemoryStore> = Indexer::new(MemoryStore::new());
+
+        let mut cursor = ScanCursor::empty();
+        for _ in 0..2 {
+            let (next, batch) = source.poll_once(cursor).await.expect("poll_once");
+            indexer
+                .put_many(batch.iter().map(|r| (r.key(), r.to_bytes())))
+                .expect("put_many");
+            cursor = next;
+        }
+
+        assert_eq!(indexer.len().expect("len"), total as u64);
+        assert_eq!(cursor.last_processed_leaf, Some(4));
+
+        for rec in batch_a.iter().chain(batch_b.iter()) {
+            let stored = indexer.get(rec.key()).expect("get").expect("present");
+            assert_eq!(&stored[..], &rec.hash[..]);
+        }
+
+        // Snapshot read confirms point-in-time view at the latest generation.
+        let snap = indexer.backend().snapshot().expect("snapshot");
+        assert_eq!(snap.len(), total as u64);
+    }
 }
