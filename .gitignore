@@ -1,0 +1,23 @@
+# build outputs
+target/
+**/target/
+
+# platform cruft
+.DS_Store
+
+# editor
+*.swp
+.idea/
+.vscode/
+
+# project-local AI + memory (never commit)
+no-commit/
+.claude/
+.agent/
+CLAUDE.md
+MEMORY.md
+tmp/
+.code-review-graph/
+
+# Cargo lock is committed for binaries + workspaces
+# (keep default: commit Cargo.lock)

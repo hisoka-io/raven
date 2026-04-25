@@ -1,0 +1,35 @@
+[workspace]
+
+[package]
+name = "raven-indexer"
+version = "0.1.0-alpha.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["Hisoka.io"]
+license = "Apache-2.0"
+description = "Synchronous facade over a Raven StorageBackend."
+publish = false
+
+[lints.rust]
+unsafe_code = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+
+[dependencies]
+raven-core = { path = "../raven-core", version = "0.1.0-alpha.0" }
