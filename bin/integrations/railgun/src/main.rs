@@ -43,7 +43,7 @@ async fn main() -> ExitCode {
 
     let indexer: Indexer<MemoryStore> = Indexer::new(MemoryStore::new());
 
-    print_banner(&cfg, &status);
+    print_banner(&cfg, status);
 
     let mut cursor = ScanCursor::empty();
 
@@ -120,7 +120,7 @@ async fn main() -> ExitCode {
     }
 }
 
-fn print_banner(cfg: &Config, status: &TreeStatus) {
+fn print_banner(cfg: &Config, status: TreeStatus) {
     let pct = (f64::from(status.size) / f64::from(TreeStatus::TREE_CAPACITY)) * 100.0;
     info!("subgraph = {}", cfg.subgraph_url);
     info!("latest tree = {}", status.tree_number);

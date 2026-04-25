@@ -105,7 +105,7 @@ impl CommitmentSource for SubgraphSource {
                 break;
             }
 
-            for row in resp.commitments {
+            for row in &resp.commitments {
                 let record = parse_row(row)?;
                 latest_processed = Some(record.leaf_index);
                 all.push(record);
@@ -127,7 +127,7 @@ impl CommitmentSource for SubgraphSource {
     }
 }
 
-fn parse_row(row: CommitmentRow) -> Result<CommitmentRecord, SourceError> {
+fn parse_row(row: &CommitmentRow) -> Result<CommitmentRecord, SourceError> {
     let leaf_index = u32::try_from(row.tree_position).map_err(|_| SourceError::InvalidField {
         field: "treePosition",
         value: row.tree_position.to_string(),
