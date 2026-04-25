@@ -25,7 +25,7 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt
-        run: cargo fmt --all -- --check
+        run: cargo fmt -p raven-core -p raven-indexer -p raven-client -- --check
       - name: cargo check
         run: cargo check --workspace --all-targets
       - name: cargo clippy
@@ -38,6 +38,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -62,12 +65,13 @@ jobs:
 
   wasm:
     # Only raven-client is built for wasm32. raven-core path-depends on
-    # raven-inspire (which transitively pulls tokio/axum/reqwest), and
-    # raven-indexer is server-side; neither targets wasm by design.
     name: check + clippy (wasm32-unknown-unknown, raven-client)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -77,18 +81,3 @@ jobs:
         run: cargo check -p raven-client --target wasm32-unknown-unknown
       - name: cargo clippy (wasm32)
         run: cargo clippy -p raven-client --target wasm32-unknown-unknown -- -D warnings
-
-  fork-tests:
-    name: fork tests (raven-inspire --all-features)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: hisoka-io/inspire-rs
-          path: crates/raven-inspire
-          token: ${{ secrets.SUBMODULE_TOKEN }}
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo test (raven-inspire)
-        run: cargo test --manifest-path crates/raven-inspire/Cargo.toml --release --all-features

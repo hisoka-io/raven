@@ -2,7 +2,6 @@
 
 [package]
 name = "raven-railgun"
-version = "0.1.0-alpha.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Hisoka.io"]
@@ -36,5 +35,5 @@ must_use_candidate = "allow"
 doc_markdown = "allow"
 
 [dependencies]
-raven-core = { path = "../../../crates/raven-core", version = "0.1.0-alpha.0" }
-raven-indexer = { path = "../../../crates/raven-indexer", version = "0.1.0-alpha.0" }
+raven-core = { path = "../../../crates/raven-core",  }
+raven-indexer = { path = "../../../crates/raven-indexer",  }
