@@ -1,0 +1,3 @@
+[submodule "crates/raven-inspire"]
+	path = crates/raven-inspire
+	url = git@github.com:hisoka-io/inspire-rs.git

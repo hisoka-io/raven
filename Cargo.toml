@@ -2,9 +2,11 @@
 resolver = "2"
 members = [
     "crates/raven-core",
+    "crates/raven-indexer",
+    "crates/raven-client",
 ]
 exclude = [
-    "crates/raven-indexer",
+    "crates/raven-inspire",
     "bin/integrations/railgun",
 ]
 

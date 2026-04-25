@@ -1,5 +1,5 @@
 [package]
-name = "raven-core"
+name = "raven-client"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,14 +8,10 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
-description = "Core types, errors, and storage traits for Raven."
+description = "Wasm-friendly client surface for Raven."
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
-thiserror = { workspace = true }
-bytes = { workspace = true }
-raven-inspire = { path = "../raven-inspire" }
-[dev-dependencies]
-proptest = { workspace = true }
