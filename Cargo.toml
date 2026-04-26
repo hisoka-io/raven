@@ -7,7 +7,6 @@ members = [
 ]
 exclude = [
     "crates/inspire",
-    "bin/integrations/railgun",
 ]
 
 [workspace.package]
