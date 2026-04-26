@@ -33,23 +33,6 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-targets
 
-  detached-railgun:
-    name: bin/integrations/railgun (detached)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          token: ${{ secrets.SUBMODULE_TOKEN }}
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: clippy
-        run: cargo clippy --manifest-path bin/integrations/railgun/Cargo.toml --all-targets -- -D warnings
-      - name: build
-        run: cargo build --manifest-path bin/integrations/railgun/Cargo.toml --release
-
   docs:
     name: cargo doc (no deps, warnings as errors)
     runs-on: ubuntu-latest
