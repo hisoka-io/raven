@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/raven-core",
-    "crates/raven-indexer",
-    "crates/raven-client",
+    "crates/core",
+    "crates/indexer",
+    "crates/client",
 ]
 exclude = [
-    "crates/raven-inspire",
+    "crates/inspire",
     "bin/integrations/railgun",
 ]
 

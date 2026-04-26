@@ -1,5 +1,5 @@
 [package]
-name = "raven-core"
+name = "raven-indexer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,14 +8,11 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
-description = "Core types, errors, and storage traits for Raven."
+description = "Synchronous facade over a Raven StorageBackend."
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
-thiserror = { workspace = true }
-bytes = { workspace = true }
-raven-inspire = { path = "../raven-inspire" }
-[dev-dependencies]
-proptest = { workspace = true }
+raven-core = { path = "../core", version = "0.1.0-alpha.0" }

@@ -17,6 +17,17 @@ impl<B: StorageBackend> Indexer<B> {
         Ok(())
     }
 
+    pub fn put_many<I>(&self, rows: I) -> Result<u64, Error>
+    where
+        I: IntoIterator<Item = (u64, Bytes)>,
+    {
+        let mut txn = self.backend.begin()?;
+        for (key, value) in rows {
+            txn.insert(key, value)?;
+        }
+        txn.commit()
+    }
+
     pub fn delete(&self, key: u64) -> Result<(), Error> {
         let mut txn = self.backend.begin()?;
         txn.remove(key)?;
@@ -113,6 +124,29 @@ mod tests {
         ix.put(1, b(b"a"))?;
         assert_eq!(ix.len()?, 1);
         assert!(!ix.is_empty()?);
+        Ok(())
+    }
+
+    #[test]
+    fn put_many_commits_all_rows_in_one_generation() -> Result<(), Error> {
+        let ix = ix();
+        let gen_before = ix.backend().generation();
+        let gen = ix.put_many([(1, b(b"a")), (2, b(b"b")), (3, b(b"c"))])?;
+        assert_eq!(ix.len()?, 3);
+        assert_eq!(gen, gen_before + 1);
+        assert_eq!(ix.get(1)?, Some(b(b"a")));
+        assert_eq!(ix.get(2)?, Some(b(b"b")));
+        assert_eq!(ix.get(3)?, Some(b(b"c")));
+        Ok(())
+    }
+
+    #[test]
+    fn put_many_empty_does_not_advance_generation() -> Result<(), Error> {
+        let ix = ix();
+        ix.put(1, b(b"a"))?;
+        let gen_before = ix.backend().generation();
+        let gen = ix.put_many(std::iter::empty())?;
+        assert_eq!(gen, gen_before);
         Ok(())
     }
 }
