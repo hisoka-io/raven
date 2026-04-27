@@ -10,6 +10,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "core",
     "poseidon",
 ]
 
@@ -47,10 +48,13 @@ similar_names = "allow"
 
 [workspace.dependencies]
 # Internal adapter crates
+raven-railgun-core = { path = "core", version = "0.1.0-alpha.0" }
 raven-railgun-poseidon = { path = "poseidon", version = "0.1.0-alpha.0" }
 
 # Common deps
 thiserror = "2"
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+bincode = "1.3"
 
 # Poseidon-BN254 for Railgun parity (Shield commitment_hash, blindedCommitment,
 # Merkle path construction). light-poseidon is byte-compatible with
