@@ -1,0 +1,67 @@
+# Standalone workspace. Excluded from the raven root workspace because it
+# pulls heavy transitive deps (axum + tokio + reqwest, once more crates land)
+# that would feature-unify into the wasm32 build of the core crates.
+#
+# Build everything:
+#   cargo build --manifest-path adapters/railgun/Cargo.toml --release
+#
+# Run tests:
+#   cargo test --manifest-path adapters/railgun/Cargo.toml
+[workspace]
+resolver = "2"
+members = [
+    "poseidon",
+]
+
+[workspace.package]
+version = "0.1.0-alpha.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["Raven contributors"]
+license = "Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+indexing_slicing = "warn"
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+needless_pass_by_value = "allow"
+similar_names = "allow"
+
+[workspace.dependencies]
+# Internal adapter crates
+raven-railgun-poseidon = { path = "poseidon", version = "0.1.0-alpha.0" }
+
+# Common deps
+thiserror = "2"
+
+# Poseidon-BN254 for Railgun parity (Shield commitment_hash, blindedCommitment,
+# Merkle path construction). light-poseidon is byte-compatible with
+# circomlibjs (Railgun TS reference).
+light-poseidon = "0.4"
+ark-bn254 = "0.5"
+ark-ff = "0.5"
+tiny-keccak = { version = "2", features = ["keccak"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+opt-level = 3

@@ -1,0 +1,19 @@
+[package]
+name = "raven-railgun-poseidon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Poseidon-BN254 helpers for Railgun parity. Wraps light-poseidon with the exact shapes Railgun TS engine uses (Shield commitment_hash, blindedCommitment, Merkle path construction)."
+
+[lints]
+workspace = true
+
+[dependencies]
+light-poseidon = { workspace = true }
+ark-bn254 = { workspace = true }
+ark-ff = { workspace = true }
+tiny-keccak = { workspace = true }
+thiserror = { workspace = true }
