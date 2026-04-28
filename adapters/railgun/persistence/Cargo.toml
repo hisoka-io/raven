@@ -1,0 +1,48 @@
+[package]
+name = "raven-railgun-persistence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Crash-consistent persistence for the Raven Railgun PIR engine: bincode snapshots + crc32-framed WAL + atomic-rename manifest."
+
+[lints]
+workspace = true
+
+[dependencies]
+raven-railgun-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+crc32fast = { workspace = true }
+sha2 = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+zstd = { version = "0.13", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fs4 = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+bincode = { workspace = true }
+bitcode = { version = "0.6", features = ["serde"] }
+
+[features]
+default = ["zstd-compression"]
+zstd-compression = ["dep:zstd"]
+chaos-tests = []
+
+[[bin]]
+name = "wal_chaos_child"
+path = "src/bin/wal_chaos_child.rs"
+required-features = ["chaos-tests"]
+
+[[bin]]
+name = "snapshot_chaos_child"
+path = "src/bin/snapshot_chaos_child.rs"
+required-features = ["chaos-tests"]
