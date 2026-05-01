@@ -1,0 +1,28 @@
+[package]
+name = "raven-railgun-ppoi-mirror"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Upstream PPOI service mirror for the Raven Railgun PIR adapter: HTTP pull + periodic polling that emits per-blindedCommitment status into the engine consumer."
+
+[lints]
+workspace = true
+
+[dependencies]
+raven-railgun-core = { workspace = true }
+raven-railgun-persistence = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+parking_lot = { workspace = true }
