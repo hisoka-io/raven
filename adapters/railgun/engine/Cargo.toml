@@ -1,0 +1,39 @@
+[package]
+name = "raven-railgun-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "PIR engine orchestrator: scheme trait, instance registry, snapshot pattern."
+
+[lints]
+workspace = true
+
+[dependencies]
+raven-railgun-core = { workspace = true }
+raven-railgun-persistence = { workspace = true }
+raven-railgun-indexer = { workspace = true }
+raven-railgun-poseidon = { workspace = true }
+raven-inspire = { workspace = true }
+arc-swap = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+bincode = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+rayon = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+async-trait = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+proptest = { workspace = true }
+serde_json = { workspace = true }
+bitcode = { version = "0.6", features = ["serde"] }
+zstd = "0.13"

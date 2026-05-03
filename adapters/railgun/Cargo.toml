@@ -11,6 +11,7 @@
 resolver = "2"
 members = [
     "core",
+    "engine",
     "indexer",
     "persistence",
     "poseidon",
@@ -52,10 +53,14 @@ similar_names = "allow"
 [workspace.dependencies]
 # Internal adapter crates
 raven-railgun-core = { path = "core", version = "0.1.0-alpha.0" }
+raven-railgun-engine = { path = "engine", version = "0.1.0-alpha.0" }
 raven-railgun-indexer = { path = "indexer", version = "0.1.0-alpha.0" }
 raven-railgun-persistence = { path = "persistence", version = "0.1.0-alpha.0" }
 raven-railgun-poseidon = { path = "poseidon", version = "0.1.0-alpha.0" }
 raven-railgun-ppoi-mirror = { path = "ppoi-mirror", version = "0.1.0-alpha.0" }
+
+# Cross-workspace path dep to the inspire submodule
+raven-inspire = { path = "../../crates/inspire" }
 
 # Common deps
 thiserror = "2"
@@ -75,6 +80,13 @@ alloy = { version = "1.2", features = ["std", "provider-http", "provider-ws", "p
 governor = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 axum = "0.7"
+
+# Engine concurrency + observability
+arc-swap = "1"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+rayon = "1"
+proptest = "1"
 
 # Poseidon-BN254 for Railgun parity (Shield commitment_hash, blindedCommitment,
 # Merkle path construction). light-poseidon is byte-compatible with

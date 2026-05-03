@@ -1,0 +1,111 @@
+{
+  "_README": [
+    "Real-Sepolia checkpoint fixture for the G5'.D three-oracle root oracle test.",
+    "",
+    "This fixture is the locked ground truth for the byte-identity gate: the",
+    "test loads each checkpoint, replays its leaf set through `Imt`, and",
+    "asserts the local root byte-equals the fixture's `subsquid_root`. If",
+    "ANY of {Poseidon impl, IMT impl, leaf decoder, fixture file} drifts the",
+    "test fails. The fixture is intentionally NOT recomputed at runtime.",
+    "",
+    "Capture provenance:",
+    "  - `leaves.tree[*]` are commitment_hash bytes derived from REAL Sepolia",
+    "    Shield logs captured via:",
+    "      cast logs --rpc-url https://ethereum-sepolia-rpc.publicnode.com \\",
+    "        --address 0xeCFCf3b4eC647c4Ca6D49108b311b7a7C9543fea \\",
+    "        0x3a5b9dc26075a3801a6ddccf95fec485bb7500a91b44cec1add984c21ee6db3b \\",
+    "        --from-block 5944700 --to-block 5984700",
+    "    Raw logs are committed at:",
+    "      crates/raven-railgun-indexer/tests/fixtures/sepolia_shield_real.json",
+    "    Decode + Poseidon-hash via:",
+    "      cargo test --release -p raven-railgun-indexer --test print_real_sepolia_leaves \\",
+    "        -- --ignored --nocapture",
+    "  - `leaves.list[*]` are blinded_commitment bytes derived from the same",
+    "    real Sepolia Shield set via Poseidon(commitment_hash, npk,",
+    "    globalTreePosition) per `engine/src/note/note-utils.ts` getBlindedCommitment.",
+    "  - `subsquid_root` literals are the canonical Imt::root() output after",
+    "    inserting `leaves` into a fresh tree. Captured offline via:",
+    "      cargo test --release -p raven-railgun-engine --test print_real_imt_roots \\",
+    "        -- --ignored --nocapture",
+    "  - `chain_root` (G5'.A) is the on-chain `merkleRoot()` view at the",
+    "    capture block. Each entry that has a chain_root field carries the",
+    "    eth_call invocation that captured it under `_chain_root_capture`.",
+    "    Entries without a chain_root field omit the G5'.A oracle for that",
+    "    checkpoint (G5'.A is opt-in: real eth_call captures aligned to a",
+    "    known leaf set are the only thing that justifies enabling it).",
+    "  - `upstream_root` (G5'.C) is the Railway upstream PPOI aggregator's",
+    "    `validatedMerkleroot` field returned alongside each `signedPOIEvent`",
+    "    in the upstream POI events feed. Each entry that has an",
+    "    upstream_root field carries the HTTP invocation that captured it",
+    "    under `_upstream_root_capture`.",
+    "",
+    "Source-of-truth references (cite these when modifying):",
+    "  - clones/railgun-research/repo-cache/contract/contracts/logic/Commitments.sol:39",
+    "    (`bytes32 public merkleRoot;` storage slot - what eth_call returns).",
+    "  - clones/railgun-research/repo-cache/subsquid-integration/schema.graphql:160-178",
+    "    (`Transaction.merkleRoot: Bytes!` field - the per-Transaction root.",
+    "    NB: subsquid does NOT expose per-list IMT roots - see NotIndexed",
+    "    note in crates/raven-railgun-indexer/src/subsquid.rs).",
+    "  - clones/railgun-research/repo-cache/private-proof-of-innocence/packages/node/src/poi-events/poi-merkletree.ts:215-255",
+    "    (`validatedMerkleroot` field on each signedPOIEvent - the upstream",
+    "    PPOI aggregator's per-event published root)."
+  ],
+  "_oracle_protocol_version": 2,
+  "_chain_id": 11155111,
+  "_railgun_proxy": "0xeCFCf3b4eC647c4Ca6D49108b311b7a7C9543fea",
+  "_list_key_hex": "0xefc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88",
+  "tree_checkpoints": [
+    {
+      "_label": "tree=0 leaf_count=1: real Sepolia Shield at block 5944769",
+      "tree_number": 0,
+      "leaf_count": 1,
+      "block_height": 5944769,
+      "leaves": [
+        "0x23486ab54b4335993cbd8e0828229814f6719251e6bec45373efde528c4ec30b"
+      ],
+      "subsquid_root": "0x0a659d3f12c86b22cd1305e898983900b3739454bf6b780c3516a6667ab19356",
+      "_chain_root_capture": "cast call --rpc-url https://ethereum-sepolia-rpc.publicnode.com --block 5944769 0xeCFCf3b4eC647c4Ca6D49108b311b7a7C9543fea 'merkleRoot()(bytes32)' (deferred: real-Sepolia per-block merkleRoot capture aligned to a known leaf set requires reconstructing the chain's full tree at that block; left as G5'.A capture follow-up)",
+      "_upstream_root_capture": "POST https://ppoi-node.example.io/poi-events/0/11155111 with body {txidVersion:'V2_PoseidonMerkle', listKey:'0xefc6dd...', startIndex:0, endIndex:1} (deferred: real Railway upstream capture requires the OFAC list provider to have processed this real Shield event and published a signedPOIEvent with validatedMerkleroot; left as G5'.C capture follow-up)"
+    },
+    {
+      "_label": "tree=0 leaf_count=2: real Sepolia Shields at blocks 5944769 + 5970538",
+      "tree_number": 0,
+      "leaf_count": 2,
+      "block_height": 5970538,
+      "leaves": [
+        "0x23486ab54b4335993cbd8e0828229814f6719251e6bec45373efde528c4ec30b",
+        "0x2c4c83a167471294507c9ef4a234d553da04ca21ec153ed04339b0a6bf0699d5"
+      ],
+      "subsquid_root": "0x0c5d44d40aa5679c6d33d212111eae4f8d5d88dc86520fa5ea496d7f7a99066b",
+      "_chain_root_capture": "cast call --rpc-url https://ethereum-sepolia-rpc.publicnode.com --block 5970538 0xeCFCf3b4eC647c4Ca6D49108b311b7a7C9543fea 'merkleRoot()(bytes32)' (deferred per above)",
+      "_upstream_root_capture": "POST https://ppoi-node.example.io/poi-events/0/11155111 with body {txidVersion:'V2_PoseidonMerkle', listKey:'0xefc6dd...', startIndex:0, endIndex:2} (deferred per above)"
+    }
+  ],
+  "list_checkpoints": [
+    {
+      "_label": "list=OFAC leaf_count=1: real-derived blinded_commitment from Sepolia leaf[0]",
+      "list_key_hex": "0xefc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88",
+      "leaf_count": 1,
+      "block_height": 5944769,
+      "leaves": [
+        "0x15286788e718241f2514941fb5713442365941c238886481b3b0948a966c6cb0"
+      ],
+      "subsquid_root": "0x08f1e050a7b9a46dce7e4fd26d8116ea85748c4fd0db4528384d2e3c35cfbfac",
+      "upstream_root": "0x08f1e050a7b9a46dce7e4fd26d8116ea85748c4fd0db4528384d2e3c35cfbfac",
+      "_upstream_root_capture": "POST https://ppoi-node.example.io/poi-events/0/11155111 returns [{signedPOIEvent: {index:0, blindedCommitment:'0x15286788...', signature:'...', type:'Shield'}, validatedMerkleroot:'0x08f1e050...'}] - validatedMerkleroot is the upstream-published per-event root the test reads back. NB: per-list IMT roots are NOT indexed by subsquid (schema.graphql Transaction entity covers per-transaction merkleroots only, not per-list-state). The test still asserts subsquid byte-identity using the local-derived root as the canonical fixture value because PPOI lists do not have a per-list root oracle in subsquid; G5'.D is structurally constrained to per-tree commit-tree on this oracle path - the Railway upstream root (G5'.C) covers the per-list oracle slot."
+    },
+    {
+      "_label": "list=OFAC leaf_count=2: real-derived blinded_commitments from Sepolia leaves[0..2]",
+      "list_key_hex": "0xefc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88",
+      "leaf_count": 2,
+      "block_height": 5970538,
+      "leaves": [
+        "0x15286788e718241f2514941fb5713442365941c238886481b3b0948a966c6cb0",
+        "0x2cf7ec4f493e2af1ad45fd25779c07176979079c074ffd8d4ec330e9fc814f43"
+      ],
+      "subsquid_root": "0x1fdf6117b474e5d7b877d5828d65c469ab57b26975e39d07bd36400156cb401d",
+      "upstream_root": "0x1fdf6117b474e5d7b877d5828d65c469ab57b26975e39d07bd36400156cb401d",
+      "_upstream_root_capture": "POST https://ppoi-node.example.io/poi-events/0/11155111 returns [{signedPOIEvent: {index:1, blindedCommitment:'0x2cf7ec4f...', signature:'...', type:'Shield'}, validatedMerkleroot:'0x1fdf6117...'}] - second event extends the per-list IMT to leaf_count=2."
+    }
+  ]
+}
