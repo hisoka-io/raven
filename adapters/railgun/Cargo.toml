@@ -12,6 +12,7 @@ resolver = "2"
 members = [
     "core",
     "engine",
+    "http",
     "indexer",
     "persistence",
     "poseidon",
@@ -54,6 +55,7 @@ similar_names = "allow"
 # Internal adapter crates
 raven-railgun-core = { path = "core", version = "0.1.0-alpha.0" }
 raven-railgun-engine = { path = "engine", version = "0.1.0-alpha.0" }
+raven-railgun-http = { path = "http", version = "0.1.0-alpha.0" }
 raven-railgun-indexer = { path = "indexer", version = "0.1.0-alpha.0" }
 raven-railgun-persistence = { path = "persistence", version = "0.1.0-alpha.0" }
 raven-railgun-poseidon = { path = "poseidon", version = "0.1.0-alpha.0" }
@@ -80,6 +82,12 @@ alloy = { version = "1.2", features = ["std", "provider-http", "provider-ws", "p
 governor = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 axum = "0.7"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "compression-gzip"] }
+tower_governor = "0.4"
+http = "1"
+subtle = { version = "2", default-features = false }
+bytes = "1"
 
 # Engine concurrency + observability
 arc-swap = "1"

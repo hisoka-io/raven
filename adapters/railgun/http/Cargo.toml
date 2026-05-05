@@ -1,0 +1,43 @@
+[package]
+name = "raven-railgun-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "HTTP layer for the Raven Railgun PIR adapter (axum + tower middleware)."
+
+[lints]
+workspace = true
+
+[dependencies]
+raven-railgun-core = { workspace = true }
+raven-railgun-engine = { workspace = true }
+raven-railgun-indexer = { workspace = true }
+raven-inspire = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tower_governor = { workspace = true }
+governor = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+parking_lot = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }
+http-body-util = "0.1"
+serde_json = { workspace = true }
+raven-railgun-persistence = { workspace = true }
+reqwest = { workspace = true }
