@@ -10,6 +10,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "cli",
     "core",
     "engine",
     "http",
@@ -53,6 +54,7 @@ similar_names = "allow"
 
 [workspace.dependencies]
 # Internal adapter crates
+raven-railgun-cli = { path = "cli", version = "0.1.0-alpha.0" }
 raven-railgun-core = { path = "core", version = "0.1.0-alpha.0" }
 raven-railgun-engine = { path = "engine", version = "0.1.0-alpha.0" }
 raven-railgun-http = { path = "http", version = "0.1.0-alpha.0" }
@@ -88,6 +90,12 @@ tower_governor = "0.4"
 http = "1"
 subtle = { version = "2", default-features = false }
 bytes = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 
 # Engine concurrency + observability
 arc-swap = "1"
