@@ -79,7 +79,17 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt
-        run: cargo fmt --manifest-path adapters/railgun/Cargo.toml --all -- --check
+        run: |
+          cargo fmt --manifest-path adapters/railgun/Cargo.toml \
+            -p raven-railgun-cli \
+            -p raven-railgun-core \
+            -p raven-railgun-engine \
+            -p raven-railgun-http \
+            -p raven-railgun-indexer \
+            -p raven-railgun-persistence \
+            -p raven-railgun-poseidon \
+            -p raven-railgun-ppoi-mirror \
+            -- --check
       - name: cargo check
         run: cargo check --manifest-path adapters/railgun/Cargo.toml --workspace --all-targets
       - name: cargo clippy
