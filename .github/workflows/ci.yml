@@ -47,8 +47,7 @@ jobs:
         run: cargo doc --workspace --no-deps --all-features
 
   wasm:
-    # Only raven-client is built for wasm32. raven-core path-depends on
-    name: check + clippy (wasm32-unknown-unknown, raven-client)
+    name: check + clippy (wasm32-unknown-unknown)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -60,7 +59,82 @@ jobs:
           targets: wasm32-unknown-unknown
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: cargo check (wasm32)
+      - name: cargo check (wasm32, raven-client)
         run: cargo check -p raven-client --target wasm32-unknown-unknown
-      - name: cargo clippy (wasm32)
+      - name: cargo clippy (wasm32, raven-client)
         run: cargo clippy -p raven-client --target wasm32-unknown-unknown -- -D warnings
+      - name: cargo check (wasm32, raven-inspire-client-wasm)
+        run: cargo check --manifest-path adapters/railgun/client-wasm/Cargo.toml --target wasm32-unknown-unknown
+
+  railgun:
+    name: railgun adapter workspace (native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --manifest-path adapters/railgun/Cargo.toml --all -- --check
+      - name: cargo check
+        run: cargo check --manifest-path adapters/railgun/Cargo.toml --workspace --all-targets
+      - name: cargo clippy
+        run: cargo clippy --manifest-path adapters/railgun/Cargo.toml --workspace --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --manifest-path adapters/railgun/Cargo.toml --workspace --all-targets
+
+  inspire-tests:
+    name: inspire submodule own tests (--all-features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (raven-inspire)
+        run: cargo test --manifest-path crates/inspire/Cargo.toml --release --all-features
+
+  sdk-tests:
+    # Fresh-clone-build gate: the TypeScript SDK at adapters/railgun/sdk
+    # depends on the wasm-pack output of raven-inspire-client-wasm
+    # (gitignored). A fresh clone must:
+    #   1. Build the wasm-pack pkg-node + pkg-bundler outputs.
+    #   2. Stay under the 500 KB gzipped bundle ceiling
+    #      (adapters/railgun/scripts/check-wasm-bundle-size.sh).
+    #   3. `pnpm install` resolve cleanly against pnpm-lock.yaml.
+    #   4. `pnpm test` pass against the freshly built pkg-node.
+    name: sdk tests (typescript + wasm-pack)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: adapters/railgun/sdk/pnpm-lock.yaml
+      - name: install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: build wasm-pack pkg-node + pkg-bundler + size gate
+        run: adapters/railgun/scripts/check-wasm-bundle-size.sh
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+        working-directory: adapters/railgun/sdk
+      - name: pnpm test
+        run: pnpm test
+        working-directory: adapters/railgun/sdk
