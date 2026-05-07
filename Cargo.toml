@@ -8,6 +8,7 @@ members = [
 exclude = [
     "crates/inspire",
     "adapters/railgun",
+    "adapters/railgun/client-wasm",
 ]
 
 [workspace.package]
