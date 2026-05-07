@@ -184,9 +184,7 @@ fn multi_instance_throughput_at_production_cell() {
         .enable_all()
         .build()
         .expect("rt");
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(8);
+    let cores = std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get);
     eprintln!(
         "multi_instance_throughput: cores={cores} instances={NUM_INSTANCES} K={K_PER_INSTANCE} \
          total_queries={TOTAL_QUERIES}"

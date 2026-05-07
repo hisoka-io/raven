@@ -179,8 +179,7 @@ pub fn run_export(opts: ExportOptions) -> anyhow::Result<()> {
 
     let exported_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
 
     let mut export_instances: Vec<ExportInstance> = Vec::with_capacity(planned.len());
     let mut all_content_hashes: Vec<u8> = Vec::new();
@@ -376,8 +375,7 @@ pub fn run_import(opts: ImportOptions) -> anyhow::Result<()> {
 
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
 
     let staging = sibling_with_suffix(&dest_root, &format!("{STAGING_PREFIX}{ts}"))?;
     if staging.exists() {

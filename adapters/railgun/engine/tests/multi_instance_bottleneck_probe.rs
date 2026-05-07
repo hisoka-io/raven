@@ -153,9 +153,7 @@ fn multi_instance_bottleneck_probe() {
         .enable_all()
         .build()
         .expect("rt");
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(8);
+    let cores = std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get);
     eprintln!(
         "BOTTLENECK_PROBE: cores={cores} instances={NUM_INSTANCES} K={K_PER_INSTANCE} \
          total_queries={TOTAL_QUERIES} seeds={SEEDS}"

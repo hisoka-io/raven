@@ -689,8 +689,7 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
     fn send_heartbeat(&self, chain_head_block: u64) -> std::result::Result<(), ()> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-            .unwrap_or(0);
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         let msg = IndexerMessage::Heartbeat {
             wallclock_unix_ms: now_ms,
             chain_head_block,

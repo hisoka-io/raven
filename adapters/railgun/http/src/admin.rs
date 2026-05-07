@@ -206,8 +206,7 @@ pub(crate) async fn session_establish_handler(
 
     let expires_at_unix_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
         .saturating_add(app.config.session_ttl_secs);
 
     let mut hdrs = HeaderMap::new();

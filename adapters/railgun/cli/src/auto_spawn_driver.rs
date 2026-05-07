@@ -591,8 +591,7 @@ fn spawn_one(inputs: &SpawnInputs<'_>, tree: u32, append_log: bool) -> anyhow::R
             data_dir: data_dir.clone(),
             spawned_at_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+                .map_or(0, |d| d.as_secs()),
         };
         append_spawn_record(&inputs.spawn_log_dir, &record)
             .with_context(|| "append spawn record")?;
@@ -910,8 +909,7 @@ fn spawn_one_ppoi_list(inputs: &PpoiListSpawnInputs<'_>, append_log: bool) -> an
             data_dir: data_dir.clone(),
             spawned_at_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+                .map_or(0, |d| d.as_secs()),
         };
         crate::auto_spawn::append_ppoi_list_spawn_record(&inputs.spawn_log_dir, &record)
             .with_context(|| "append ppoi_list_spawn record")?;

@@ -131,9 +131,7 @@ fn dispatch_at_k(
 #[test]
 #[ignore = "production-cell K-widening sweep; ~60-90s wall (heavy setup x 2 cells x 3 seeds)"]
 fn k_widening_at_two_cells() {
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(8);
+    let cores = std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get);
     eprintln!("k_widening: available_parallelism = {cores}");
     eprintln!("k_widening: K_VALUES = {K_VALUES:?}; BATCH_SIZE = {BATCH_SIZE}");
     eprintln!("k_widening: WARMUP_ITERS = {WARMUP_ITERS}; MEASURED_ITERS = {MEASURED_ITERS}; SEEDS = {SEEDS}");

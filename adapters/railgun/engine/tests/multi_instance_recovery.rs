@@ -382,8 +382,7 @@ async fn multi_instance_recovery_byte_identity() {
                 let pre_count = chain_counts_pre
                     .iter()
                     .find(|(tt, _)| *tt == t)
-                    .map(|(_, c)| *c)
-                    .unwrap_or(0);
+                    .map_or(0, |(_, c)| *c);
                 assert_eq!(
                     store.imt_root(t),
                     pre_root,
@@ -413,8 +412,7 @@ async fn multi_instance_recovery_byte_identity() {
                 let pre_count = ppoi_counts_pre
                     .iter()
                     .find(|(k, _)| *k == lk)
-                    .map(|(_, c)| *c)
-                    .unwrap_or(0);
+                    .map_or(0, |(_, c)| *c);
                 assert_eq!(
                     store.ppoi_imt_root(&lk),
                     pre_root,

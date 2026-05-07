@@ -74,9 +74,7 @@ fn k4_dispatcher_strategy_comparison() {
     let setup_elapsed = setup_start.elapsed();
     eprintln!("k4_bench: setup elapsed = {setup_elapsed:?}");
 
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(8);
+    let cores = std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get);
     eprintln!("k4_bench: available_parallelism = {cores}");
     eprintln!("k4_bench: K = {K}; BATCH_SIZE = {BATCH_SIZE}; warmup = {WARMUP_ITERS}; measured = {MEASURED_ITERS}");
 
@@ -184,9 +182,7 @@ fn strategy_a_dedicated_pool(
 ) -> Vec<ServerResponse> {
     use std::thread;
 
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(8);
+    let cores = std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get);
     let per_pool = (cores / K).max(1);
 
     let pools: Vec<Arc<rayon::ThreadPool>> = (0..K)

@@ -726,7 +726,7 @@ async fn layer2_fires_only_on_commit_tree_instances() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     assert!(
         chain_sources[0].verify_count() >= 1,

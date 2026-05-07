@@ -431,7 +431,7 @@ async fn flapping_streamer_exhausts_cumulative_budget() {
         tokio::spawn(async move { w.run(cfg).await })
     };
 
-    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
     let opens_after_budget = streamer.opens.load(Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(800)).await;
     let opens_after_grace = streamer.opens.load(Ordering::SeqCst);

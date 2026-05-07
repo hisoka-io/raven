@@ -678,10 +678,7 @@ fn import_refuses_tampered_tarball_byte_in_middle_with_specific_offset() {
     );
     assert!(
         !dst_root.exists()
-            || std::fs::read_dir(&dst_root)
-                .map(std::iter::Iterator::count)
-                .unwrap_or(0)
-                == 0,
+            || std::fs::read_dir(&dst_root).map_or(0, std::iter::Iterator::count) == 0,
         "destination must remain empty when tampering is detected"
     );
 }
@@ -760,10 +757,7 @@ fn import_refuses_tampered_signature_file_with_actionable_error() {
     );
     assert!(
         !dst_root.exists()
-            || std::fs::read_dir(&dst_root)
-                .map(std::iter::Iterator::count)
-                .unwrap_or(0)
-                == 0,
+            || std::fs::read_dir(&dst_root).map_or(0, std::iter::Iterator::count) == 0,
         "destination must remain empty when signature tampering is detected"
     );
 }

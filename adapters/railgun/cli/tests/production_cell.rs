@@ -231,7 +231,7 @@ async fn production_cell_round_trip_and_batch_within_budget() {
     // catalogued for an earlier cycle+ — that's where the <250 ms target
     // becomes reachable.
     assert!(
-        batch_total < Duration::from_millis(3000),
+        batch_total < Duration::from_secs(3),
         "batch total RT regressed: {batch_total:?} (sequential floor ~1.2 s)"
     );
 
