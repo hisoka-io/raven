@@ -43,7 +43,10 @@ fn manifest_save_under_readonly_parent_propagates_typed_io_error() {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500))
         .expect("chmod 500");
 
-    let mutated = Manifest { current_snapshot_seq: 99, ..sample_manifest() };
+    let mutated = Manifest {
+        current_snapshot_seq: 99,
+        ..sample_manifest()
+    };
     let result = mutated.save(&layout);
 
     // Restore permissions before asserting so a panic doesn't leave the tempdir un-cleanable.

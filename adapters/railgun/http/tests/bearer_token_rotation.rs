@@ -11,8 +11,8 @@
 )]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::PoisonError;
 use std::sync::Arc;
+use std::sync::PoisonError;
 use std::time::Duration;
 
 use axum::{
@@ -140,7 +140,11 @@ async fn bearer_rotation_observable_on_status_route() {
         .oneshot(build_status_request(OLD_TOKEN))
         .await
         .expect("dispatch pre");
-    assert_eq!(resp_pre.status(), StatusCode::OK, "pre-rotation OLD-token status must succeed");
+    assert_eq!(
+        resp_pre.status(),
+        StatusCode::OK,
+        "pre-rotation OLD-token status must succeed"
+    );
 
     app_state.set_read_token(NEW_TOKEN);
 
@@ -160,7 +164,11 @@ async fn bearer_rotation_observable_on_status_route() {
         .oneshot(build_status_request(NEW_TOKEN))
         .await
         .expect("dispatch new");
-    assert_eq!(resp_new.status(), StatusCode::OK, "post-rotation NEW-token status must succeed");
+    assert_eq!(
+        resp_new.status(),
+        StatusCode::OK,
+        "post-rotation NEW-token status must succeed"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -249,5 +257,8 @@ async fn bearer_rotation_does_not_kill_inflight_query_started_under_old_token() 
     let bytes = body_bytes(inflight_resp).await;
     let decoded: SleepyResponse =
         raven_railgun_http::read_versioned(&bytes).expect("decode in-flight response");
-    assert_eq!(decoded.echo_nonce, 9_001, "in-flight echo must match the original query nonce");
+    assert_eq!(
+        decoded.echo_nonce, 9_001,
+        "in-flight echo must match the original query nonce"
+    );
 }

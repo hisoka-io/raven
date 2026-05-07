@@ -34,10 +34,8 @@ fn migrate_encoder_and_bootstrap_lock_serialize_one_winner_per_round() {
         let boot_lock_ctr = Arc::clone(&bootstrap_lock_errors);
 
         let migrate_h = thread::spawn(move || {
-            let r = raven_railgun_cli::migrate_encoder::run(
-                &path_for_migrate,
-                EncoderKind::PerLeafBc,
-            );
+            let r =
+                raven_railgun_cli::migrate_encoder::run(&path_for_migrate, EncoderKind::PerLeafBc);
             // Migration MUST error on a fresh dir regardless of which
             // path it took: either lock contention (loser path) or
             // missing-manifest (winner path on a fresh dir).

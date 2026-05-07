@@ -21,9 +21,7 @@ const TOY_ENTRY_SIZE: usize = 32;
 
 fn build_toy_state(params: &InspireParams) -> InspireServerState {
     let db: Vec<u8> = (0..TOY_ENTRIES)
-        .flat_map(|i| {
-            (0..TOY_ENTRY_SIZE).map(move |j| u8::try_from((i + j) % 251).expect("< 251"))
-        })
+        .flat_map(|i| (0..TOY_ENTRY_SIZE).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
         .collect();
     let (state, _sk) = setup_state(params, &db, TOY_ENTRY_SIZE, InspireVariant::TwoPacking)
         .expect("toy setup_state");

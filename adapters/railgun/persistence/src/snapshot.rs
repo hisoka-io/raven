@@ -329,10 +329,14 @@ mod tests {
         let layout = StoreLayout::open(dir.path()).expect("open");
 
         let snap_a = Snapshot::build(b"first commit attempt".to_vec());
-        snap_a.save(&layout, SnapshotId(1)).expect("first save succeeds");
+        snap_a
+            .save(&layout, SnapshotId(1))
+            .expect("first save succeeds");
 
         let snap_b = Snapshot::build(b"retry commit attempt".to_vec());
-        snap_b.save(&layout, SnapshotId(1)).expect("retry save must NOT fail with ENOTEMPTY");
+        snap_b
+            .save(&layout, SnapshotId(1))
+            .expect("retry save must NOT fail with ENOTEMPTY");
 
         let loaded = Snapshot::load(&layout, SnapshotId(1)).expect("load post-retry");
         assert_eq!(loaded.data, b"retry commit attempt");

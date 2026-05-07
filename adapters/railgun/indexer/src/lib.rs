@@ -547,9 +547,7 @@ pub enum IndexerMessage {
         block_height: u64,
     },
     /// Reorg fence: surviving entries have `block_height <= height`.
-    Reorg {
-        height: u64,
-    },
+    Reorg { height: u64 },
     /// Heartbeat for liveness and lag-tracking.
     Heartbeat {
         wallclock_unix_ms: u64,

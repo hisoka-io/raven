@@ -110,7 +110,9 @@ fn corrupted_mid_stream_truncates_at_gap_recoverable_prefix_intact() {
     // Wal::open truncates the torn tail at open time; replay sees a clean file.
     assert_eq!(replay.truncated_at, None);
 
-    let next = wal2.append(&payload(50), 500).expect("append after recovery");
+    let next = wal2
+        .append(&payload(50), 500)
+        .expect("append after recovery");
     assert_eq!(next, 5);
 }
 
@@ -128,7 +130,11 @@ fn no_entries_to_replay_when_snapshot_captures_every_wal_entry() {
     let wal2 = Wal::open(&layout, Some(2)).expect("reopen with floor");
     let replay = wal2.replay().expect("replay");
     let snapshot_seq: u64 = 3;
-    let to_apply: Vec<_> = replay.entries.iter().filter(|e| e.seq >= snapshot_seq).collect();
+    let to_apply: Vec<_> = replay
+        .entries
+        .iter()
+        .filter(|e| e.seq >= snapshot_seq)
+        .collect();
     assert_eq!(to_apply.len(), 0);
 
     let next = wal2.append(&payload(99), 999).expect("append after replay");

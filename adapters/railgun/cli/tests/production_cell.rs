@@ -197,10 +197,9 @@ async fn production_cell_round_trip_and_batch_within_budget() {
     eprintln!("production_cell: batch (16 queries) total = {batch_total:?}");
 
     let batch_body = batch_response.bytes().await.expect("batch body");
-    let responses: Vec<ServerResponse> = raven_railgun_http::read_batch_response_versioned(
-        &batch_body,
-    )
-    .expect("deserialize batch (versioned)");
+    let responses: Vec<ServerResponse> =
+        raven_railgun_http::read_batch_response_versioned(&batch_body)
+            .expect("deserialize batch (versioned)");
     assert_eq!(responses.len(), 16, "batch returned 16 responses");
 
     for (k, (cs, response)) in client_states.iter().zip(responses.iter()).enumerate() {

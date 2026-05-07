@@ -74,4 +74,3 @@ async fn production_cell_zero_dimension_bails_regression() {
         );
     }
 }
-

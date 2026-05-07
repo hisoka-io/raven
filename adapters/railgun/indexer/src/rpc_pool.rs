@@ -42,7 +42,9 @@ pub enum EndpointHealth {
     /// Errors observed but below the circuit-breaker threshold.
     Degraded,
     /// In cooldown; cleared when `Instant::now()` passes `until`.
-    CoolingDown { until: Instant },
+    CoolingDown {
+        until: Instant,
+    },
 }
 
 /// Coarse classification of the RPC error for [`RpcEndpointPool::mark_endpoint_error`].
@@ -62,11 +64,7 @@ pub enum PoolError {
     #[error("rpc endpoint pool requires at least one endpoint")]
     Empty,
     #[error("rpc endpoint config: {url} has invalid rps={rps} burst={burst}; both must be >= 1")]
-    InvalidEndpointConfig {
-        url: String,
-        rps: u32,
-        burst: u32,
-    },
+    InvalidEndpointConfig { url: String, rps: u32, burst: u32 },
 }
 
 impl EndpointConfig {
@@ -906,7 +904,10 @@ mod tests {
         let err = cfg.validate().expect_err("malformed url must error");
         match err {
             PoolError::InvalidEndpointConfig { url, rps, burst } => {
-                assert!(url.contains("parse error"), "must surface parse failure; got {url}");
+                assert!(
+                    url.contains("parse error"),
+                    "must surface parse failure; got {url}"
+                );
                 assert_eq!(rps, 10);
                 assert_eq!(burst, 10);
             }

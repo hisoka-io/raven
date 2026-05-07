@@ -2,12 +2,7 @@
 
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use raven_railgun_engine::inspire::RavenInspireScheme;
 use raven_railgun_engine::PirScheme;
 use serde::{Deserialize, Serialize};

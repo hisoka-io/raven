@@ -4,9 +4,12 @@ use std::collections::BTreeSet;
 
 use raven_railgun_core::{AdapterError, Result};
 
+use super::{
+    labels, PirTableEncoder, LEAVES_PER_TREE, MIN_RECORD_SIZE, NODE_HASH_BYTES, PATH_RECORD_BYTES,
+    PER_NODE_TOTAL_NODES,
+};
 use crate::imt::TREE_DEPTH;
 use crate::inspire::{materialize_shard_bytes, LogicalLeafStore};
-use super::{labels, PirTableEncoder, LEAVES_PER_TREE, MIN_RECORD_SIZE, NODE_HASH_BYTES, PATH_RECORD_BYTES, PER_NODE_TOTAL_NODES};
 
 /// T1 BC-membership encoder: row = raw 32 B blinded commitment, padded
 /// with zeros up to `record_size`.

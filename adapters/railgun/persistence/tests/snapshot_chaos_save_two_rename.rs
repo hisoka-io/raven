@@ -116,7 +116,10 @@ fn kill_between_step_2_and_step_3_load_picks_final_dir_and_cleans_up() {
     let final_dir = layout.snapshot_dir(SnapshotId(SNAP_ID));
     let old_tmp = final_dir.with_extension("old.tmp");
     assert!(final_dir.is_dir(), "post-kill: `final_dir` must exist");
-    assert!(old_tmp.is_dir(), "post-kill: `.old.tmp` must still be present");
+    assert!(
+        old_tmp.is_dir(),
+        "post-kill: `.old.tmp` must still be present"
+    );
 
     let loaded = Snapshot::load(&layout, SnapshotId(SNAP_ID)).expect("load with both present");
     assert_eq!(loaded.data, NEW_PAYLOAD);
@@ -154,17 +157,29 @@ fn round_trip_save_kill_load_never_loses_data_at_any_step() {
 
         match target {
             "READY_FOR_CHAOS" | "STAGED_TMP" | "AFTER_STEP_1" => {
-                assert_eq!(loaded.data, BASE_PAYLOAD, "kill at `{target}` must recover BASE");
+                assert_eq!(
+                    loaded.data, BASE_PAYLOAD,
+                    "kill at `{target}` must recover BASE"
+                );
             }
             "AFTER_STEP_2" | "AFTER_STEP_3" => {
-                assert_eq!(loaded.data, NEW_PAYLOAD, "kill at `{target}` must surface NEW");
+                assert_eq!(
+                    loaded.data, NEW_PAYLOAD,
+                    "kill at `{target}` must surface NEW"
+                );
             }
             _ => unreachable!(),
         }
 
         let final_dir = layout.snapshot_dir(SnapshotId(SNAP_ID));
         let old_tmp = final_dir.with_extension("old.tmp");
-        assert!(!old_tmp.exists(), "post-load at `{target}`: `.old.tmp` must be cleaned up");
-        assert!(final_dir.is_dir(), "post-load at `{target}`: `final_dir` must exist");
+        assert!(
+            !old_tmp.exists(),
+            "post-load at `{target}`: `.old.tmp` must be cleaned up"
+        );
+        assert!(
+            final_dir.is_dir(),
+            "post-load at `{target}`: `final_dir` must exist"
+        );
     }
 }

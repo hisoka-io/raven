@@ -29,7 +29,10 @@ use crate::auto_spawn::{
 
 #[derive(Debug, Clone)]
 enum PolicyRefusal {
-    MaxInstanceCount { current: usize, cap: u32 },
+    MaxInstanceCount {
+        current: usize,
+        cap: u32,
+    },
     Cooldown {
         elapsed: std::time::Duration,
         cooldown: std::time::Duration,
@@ -260,7 +263,7 @@ impl SpawnRegistry {
             entry
                 .persistence
                 .set_snapshot_policy(SnapshotPolicy::static_default());
-                // If the predecessor was concurrently admin-drained, promote it to Drained atomically
+            // If the predecessor was concurrently admin-drained, promote it to Drained atomically
             // with the route-table append so /v1/status and the routing layer see them together.
             // No-op when the predecessor is still Active or already Drained (idempotent).
             let prev_state = entry.instance.drain_state();
@@ -760,15 +763,20 @@ impl PpoiListSpawnRegistry {
         &self,
         pair: &(String, [u8; 32]),
     ) -> Option<Arc<PirInstance<RavenInspireScheme>>> {
-        self.inner.lock().by_pair.get(pair).map(|e| Arc::clone(&e.instance))
+        self.inner
+            .lock()
+            .by_pair
+            .get(pair)
+            .map(|e| Arc::clone(&e.instance))
     }
 
     #[must_use]
-    pub fn persistence(
-        &self,
-        pair: &(String, [u8; 32]),
-    ) -> Option<Arc<InspirePersistence>> {
-        self.inner.lock().by_pair.get(pair).map(|e| Arc::clone(&e.persistence))
+    pub fn persistence(&self, pair: &(String, [u8; 32])) -> Option<Arc<InspirePersistence>> {
+        self.inner
+            .lock()
+            .by_pair
+            .get(pair)
+            .map(|e| Arc::clone(&e.persistence))
     }
 }
 
@@ -791,10 +799,7 @@ struct PpoiListSpawnInputs<'a> {
 /// Bootstrap one PPOI-list instance and wire it into the engine + route table + registry.
 /// Returns `Ok(false)` when the pair is already registered (idempotent dedup).
 #[allow(clippy::too_many_lines)]
-fn spawn_one_ppoi_list(
-    inputs: &PpoiListSpawnInputs<'_>,
-    append_log: bool,
-) -> anyhow::Result<bool> {
+fn spawn_one_ppoi_list(inputs: &PpoiListSpawnInputs<'_>, append_log: bool) -> anyhow::Result<bool> {
     let pair = (inputs.template.template_id.clone(), inputs.list_key);
     if inputs.registry.contains(&pair) {
         return Ok(false);
@@ -812,12 +817,8 @@ fn spawn_one_ppoi_list(
     let entries_per_shard_u32 =
         u32::try_from(entries.min(usize::from(u16::MAX) * 2)).unwrap_or(2048);
 
-    std::fs::create_dir_all(&data_dir).with_context(|| {
-        format!(
-            "create ppoi_list_template data_dir {}",
-            data_dir.display()
-        )
-    })?;
+    std::fs::create_dir_all(&data_dir)
+        .with_context(|| format!("create ppoi_list_template data_dir {}", data_dir.display()))?;
     let layout = StoreLayout::open(&data_dir)
         .with_context(|| format!("open StoreLayout at {}", data_dir.display()))?;
     let encoder: Arc<dyn PirTableEncoder> = encoder_kind
@@ -867,8 +868,7 @@ fn spawn_one_ppoi_list(
         .map_err(|e| anyhow::anyhow!("engine.add_live: {e}"))?;
 
     inputs.ppoi_list_routes.rcu(|cur| {
-        let mut next: Vec<([u8; 32], tokio::sync::mpsc::Sender<ConsumerEvent>)> =
-            (**cur).clone();
+        let mut next: Vec<([u8; 32], tokio::sync::mpsc::Sender<ConsumerEvent>)> = (**cur).clone();
         next.push((inputs.list_key, sender.clone()));
         next
     });
@@ -949,9 +949,7 @@ pub async fn run_ppoi_list_driver(
     mut list_observed: tokio::sync::broadcast::Receiver<[u8; 32]>,
 ) {
     if templates.is_empty() {
-        tracing::info!(
-            "ppoi_list driver: no [[ppoi_list_template]] rows configured; exiting"
-        );
+        tracing::info!("ppoi_list driver: no [[ppoi_list_template]] rows configured; exiting");
         return;
     }
     tracing::info!(
@@ -1033,7 +1031,10 @@ pub fn replay_ppoi_list_spawn_log(
             );
             continue;
         }
-        let Some(tpl) = templates.iter().find(|t| t.template_id == record.template_id) else {
+        let Some(tpl) = templates
+            .iter()
+            .find(|t| t.template_id == record.template_id)
+        else {
             tracing::error!(
                 template_id = %record.template_id,
                 "ppoi_list spawn_log replay: template_id not present in current config; skipping"

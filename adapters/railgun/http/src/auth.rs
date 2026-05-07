@@ -150,8 +150,7 @@ pub(crate) async fn bearer_auth<S: PirScheme>(
         // Always evaluate both read + admin compares so total work is constant.
         // Snapshot under read-lock so the comparison doesn't hold the lock.
         let active_read_token: String = app.read_token.read().clone();
-        let read_match: bool =
-            ct_eq_str(token.as_bytes(), active_read_token.as_bytes()).into();
+        let read_match: bool = ct_eq_str(token.as_bytes(), active_read_token.as_bytes()).into();
         let admin_match: bool = if let Some(admin) = app.admin_token.as_ref().as_ref() {
             ct_eq_str(token.as_bytes(), admin.as_bytes()).into()
         } else {

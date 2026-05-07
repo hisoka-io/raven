@@ -4,13 +4,13 @@
 #![deny(missing_docs)]
 
 pub mod imt;
+pub mod inspire;
 pub mod layer_two;
 pub mod offline_packing_keys_cache;
+pub mod orchestrator;
+pub mod persistence;
 pub mod pir_table;
 pub mod tree_fill_watcher;
-pub mod inspire;
-pub mod persistence;
-pub mod orchestrator;
 
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;

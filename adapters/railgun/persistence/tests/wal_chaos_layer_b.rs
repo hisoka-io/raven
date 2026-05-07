@@ -102,9 +102,12 @@ fn one_chaos_round(seed: u64, kill_delay: Duration) -> usize {
         );
         // `WalEntry::payload` is bincode-serialized bytes. Decode it
         // back into the typed variant for structural comparison.
-        let decoded: WalEntryPayload =
-            bincode::deserialize(&recovered.payload).expect("recovered payload must be valid bincode");
-        assert_eq!(decoded, canonical_payload_value, "entry {idx}: payload mismatch (seed={seed}, kill_delay={kill_delay:?})");
+        let decoded: WalEntryPayload = bincode::deserialize(&recovered.payload)
+            .expect("recovered payload must be valid bincode");
+        assert_eq!(
+            decoded, canonical_payload_value,
+            "entry {idx}: payload mismatch (seed={seed}, kill_delay={kill_delay:?})"
+        );
     }
     replay.entries.len()
 }

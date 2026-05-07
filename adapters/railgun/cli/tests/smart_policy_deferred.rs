@@ -456,17 +456,18 @@ data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
                         .iter()
                         .filter(|t| !known_ids.contains(&t.template_id))
                         .collect();
-                let chain_tree_added: Vec<&raven_railgun_cli::serve_production_multi::InstanceTemplateToml> =
-                    added
-                        .iter()
-                        .copied()
-                        .filter(|t| {
-                            matches!(
-                                t.encoder.as_str(),
-                                "per-leaf-bc" | "per-leaf-path" | "per-node"
-                            )
-                        })
-                        .collect();
+                let chain_tree_added: Vec<
+                    &raven_railgun_cli::serve_production_multi::InstanceTemplateToml,
+                > = added
+                    .iter()
+                    .copied()
+                    .filter(|t| {
+                        matches!(
+                            t.encoder.as_str(),
+                            "per-leaf-bc" | "per-leaf-path" | "per-node"
+                        )
+                    })
+                    .collect();
                 for tpl in &chain_tree_added {
                     let runtime = AutoSpawnRuntime {
                         data_dir_template: tpl.data_dir_template.clone(),

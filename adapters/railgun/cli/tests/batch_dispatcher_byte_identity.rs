@@ -111,10 +111,8 @@ async fn batch_dispatcher_byte_identity_across_k_values() {
         );
         let body = resp.bytes().await.expect("body bytes").to_vec();
 
-        let decoded: Vec<ServerResponse> = raven_railgun_http::read_batch_response_versioned(
-            &body,
-        )
-        .expect("decode batch responses");
+        let decoded: Vec<ServerResponse> = raven_railgun_http::read_batch_response_versioned(&body)
+            .expect("decode batch responses");
         assert_eq!(
             decoded.len(),
             BATCH_SIZE,

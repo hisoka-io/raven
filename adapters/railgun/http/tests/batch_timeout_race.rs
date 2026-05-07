@@ -64,7 +64,11 @@ impl PirScheme for SlowScheme {
     }
 }
 
-async fn spawn_test_server() -> (SocketAddr, Arc<PirInstance<SlowScheme>>, tokio::task::JoinHandle<()>) {
+async fn spawn_test_server() -> (
+    SocketAddr,
+    Arc<PirInstance<SlowScheme>>,
+    tokio::task::JoinHandle<()>,
+) {
     let instance: Arc<PirInstance<SlowScheme>> = Arc::new(PirInstance::new(
         InstanceId::new(INSTANCE),
         InstanceRole::Static,
@@ -222,7 +226,10 @@ async fn subsequent_batch_succeeds_after_a_timeout_race() {
          is still holding its semaphore permit."
     );
 
-    let calls = instance.current_state().respond_calls.load(Ordering::SeqCst);
+    let calls = instance
+        .current_state()
+        .respond_calls
+        .load(Ordering::SeqCst);
     assert!(
         calls >= 16,
         "respond must have been called at least 16 times for the \

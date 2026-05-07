@@ -481,8 +481,7 @@ pub type ChainTreeRoutes = Arc<arc_swap::ArcSwap<Vec<(u32, mpsc::Sender<Consumer
 /// Live-mutable PPOI-list routing table (`list_key` → consumer sender).
 ///
 /// Updated via `ArcSwap::rcu` by the auto-spawn driver on `list_observed`.
-pub type PpoiListRoutes =
-    Arc<arc_swap::ArcSwap<Vec<([u8; 32], mpsc::Sender<ConsumerEvent>)>>>;
+pub type PpoiListRoutes = Arc<arc_swap::ArcSwap<Vec<([u8; 32], mpsc::Sender<ConsumerEvent>)>>>;
 
 /// Operator-facing handle returned by [`bootstrap_railgun_engine_multi`].
 pub struct MultiOrchestratorHandle {
@@ -550,9 +549,8 @@ where
     let mut per_instance: Vec<PerInstanceHandles> = Vec::with_capacity(configs.len());
     for cfg in configs {
         let layout = if cfg.use_flock {
-            let (l, lock) = StoreLayout::open_with_lock(&cfg.data_dir).map_err(|e| {
-                AdapterError::Internal(format!("StoreLayout::open_with_lock: {e}"))
-            })?;
+            let (l, lock) = StoreLayout::open_with_lock(&cfg.data_dir)
+                .map_err(|e| AdapterError::Internal(format!("StoreLayout::open_with_lock: {e}")))?;
             let _ = Box::leak(Box::new(lock));
             l
         } else {
@@ -651,10 +649,8 @@ where
         })
         .collect();
 
-    let chain_tree_routes =
-        Arc::new(arc_swap::ArcSwap::from_pointee(initial_chain_tree_routes));
-    let ppoi_list_routes: PpoiListRoutes =
-        Arc::new(arc_swap::ArcSwap::from_pointee(ppoi_routes));
+    let chain_tree_routes = Arc::new(arc_swap::ArcSwap::from_pointee(initial_chain_tree_routes));
+    let ppoi_list_routes: PpoiListRoutes = Arc::new(arc_swap::ArcSwap::from_pointee(ppoi_routes));
     // Lagged receivers re-sync on the next event — capacity 64 is sufficient.
     let (tree_observed_tx, _) = tokio::sync::broadcast::channel::<u32>(64);
     let (list_observed_tx, _) = tokio::sync::broadcast::channel::<[u8; 32]>(64);
@@ -795,7 +791,11 @@ async fn forward_mirror_payload(
     // Fired before routing so a fresh list_key surfaces before any instance route exists.
     let _ = list_observed.send(lk);
     let routes = ppoi_list_routes.load();
-    if let Some(tx) = routes.iter().find(|(k, _)| *k == lk).map(|(_, s)| s.clone()) {
+    if let Some(tx) = routes
+        .iter()
+        .find(|(k, _)| *k == lk)
+        .map(|(_, s)| s.clone())
+    {
         let _ = tx.send(ConsumerEvent::Ppoi(payload, height)).await;
     } else {
         tracing::trace!("no instance routes list_key; dropping mirror payload");

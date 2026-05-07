@@ -34,7 +34,7 @@ impl Default for ToyDbConfig {
         Self {
             entries: TOY_DB_ENTRIES,
             entry_bytes: TOY_ENTRY_BYTES,
-                variant: InspireVariant::TwoPacking,
+            variant: InspireVariant::TwoPacking,
         }
     }
 }

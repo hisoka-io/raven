@@ -359,7 +359,11 @@ fn scan_full(path: &std::path::Path) -> Result<WalReplay> {
         // CRC validates internal consistency but not monotonicity.
         // A CRC-valid frame with a non-monotonic seq (e.g. retry landed at wrong offset)
         // is treated as a torn tail: truncate at this entry's start.
-        let expected_seq = if entries.is_empty() { None } else { Some(next_seq) };
+        let expected_seq = if entries.is_empty() {
+            None
+        } else {
+            Some(next_seq)
+        };
         if let Some(exp) = expected_seq {
             if seq != exp {
                 return Ok(WalReplay {
@@ -549,7 +553,11 @@ mod tests {
 
         let wal2 = Wal::open(&layout, None).expect("reopen");
         let replay = wal2.replay().expect("replay");
-        assert_eq!(replay.entries.len(), 3, "non-monotonic seq=99 frame must NOT be accepted");
+        assert_eq!(
+            replay.entries.len(),
+            3,
+            "non-monotonic seq=99 frame must NOT be accepted"
+        );
         assert_eq!(replay.next_seq, 3);
     }
 

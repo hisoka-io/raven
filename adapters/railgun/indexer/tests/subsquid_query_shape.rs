@@ -28,7 +28,10 @@ struct MockState {
     response: Arc<Value>,
 }
 
-async fn handle(State(state): State<MockState>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+async fn handle(
+    State(state): State<MockState>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
     state.captured.lock().push(body);
     (StatusCode::OK, Json((*state.response).clone()))
 }
@@ -134,4 +137,3 @@ async fn subsquid_client_surfaces_not_indexed_for_empty_transactions() {
         "got {err:?}"
     );
 }
-

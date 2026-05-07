@@ -88,7 +88,9 @@ fn manifest_save_failure_does_not_corrupt_prior_on_disk_manifest() {
     let baseline = sample_manifest();
     baseline.save(&layout).expect("baseline save");
 
-    let loaded_baseline = Manifest::load(&layout).expect("load baseline").expect("present");
+    let loaded_baseline = Manifest::load(&layout)
+        .expect("load baseline")
+        .expect("present");
     assert_eq!(loaded_baseline, baseline);
 
     let mutated = Manifest {
@@ -97,15 +99,24 @@ fn manifest_save_failure_does_not_corrupt_prior_on_disk_manifest() {
         ..sample_manifest()
     };
     let mut writer = StorageFullWriter::default();
-    let err = mutated.save_to_writer(&mut writer).expect_err("StorageFull writer must Err");
+    let err = mutated
+        .save_to_writer(&mut writer)
+        .expect_err("StorageFull writer must Err");
     assert!(matches!(err, PersistenceError::Io(_)), "got {err:?}");
 
     // Atomic-write contract: the failed write never reached the rename step,
     // so the baseline manifest must be intact.
-    let loaded_post_failure = Manifest::load(&layout).expect("load post-failure").expect("present");
+    let loaded_post_failure = Manifest::load(&layout)
+        .expect("load post-failure")
+        .expect("present");
     assert_eq!(loaded_post_failure, baseline);
 
     mutated.save(&layout).expect("post-failure recovery save");
-    let loaded_after_recovery = Manifest::load(&layout).expect("load after recovery").expect("present");
-    assert_eq!(loaded_after_recovery.current_snapshot_seq, baseline.current_snapshot_seq + 999);
+    let loaded_after_recovery = Manifest::load(&layout)
+        .expect("load after recovery")
+        .expect("present");
+    assert_eq!(
+        loaded_after_recovery.current_snapshot_seq,
+        baseline.current_snapshot_seq + 999
+    );
 }

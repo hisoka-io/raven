@@ -360,16 +360,12 @@ impl InspirePersistence {
     }
 
     /// Append a WAL entry. Returns `(seq, trigger)`.
-    pub fn apply_event(
-        &self,
-        payload: &WalEntryPayload,
-        block_height: u64,
-    ) -> Result<(u64, bool)> {
+    pub fn apply_event(&self, payload: &WalEntryPayload, block_height: u64) -> Result<(u64, bool)> {
         let seq = self
             .wal
             .append(payload, block_height)
             .map_err(|e| AdapterError::Internal(format!("wal append: {e}")))?;
-            let mut c = self.counters.lock();
+        let mut c = self.counters.lock();
         c.appends_since_snapshot = c.appends_since_snapshot.saturating_add(1);
         let elapsed = c.last_snapshot_at.elapsed();
         let policy_snap = *self.policy.read();
@@ -1179,9 +1175,7 @@ mod tests {
         let entries = 256usize;
         let entry_size = 256usize;
         let db: Vec<u8> = (0..entries)
-            .flat_map(|i| {
-                (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251"))
-            })
+            .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
             .collect();
         let (state, _sk) = super::super::inspire::setup_state(
             &params,
@@ -1400,8 +1394,7 @@ mod tests {
 
     fn shared_prometheus_handle() -> &'static metrics_exporter_prometheus::PrometheusHandle {
         use std::sync::OnceLock;
-        static HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
-            OnceLock::new();
+        static HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> = OnceLock::new();
         HANDLE.get_or_init(|| {
             let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
             builder
@@ -1795,8 +1788,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("wal").join("archived")).expect("mkdir");
         std::fs::create_dir_all(dir.path().join("snapshots")).expect("mkdir");
-        std::fs::write(dir.path().join("wal").join("current.log"), b"")
-            .expect("plant empty wal");
+        std::fs::write(dir.path().join("wal").join("current.log"), b"").expect("plant empty wal");
 
         let layout = StoreLayout::open(dir.path()).expect("layout");
         let opened = InspirePersistence::open(

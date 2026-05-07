@@ -223,7 +223,10 @@ async fn bc_to_idx_map_json_envelope_shape() {
         obj.keys().map(std::string::String::as_str).collect();
     let expected: std::collections::BTreeSet<&str> =
         ["epoch", "listKey", "entries"].iter().copied().collect();
-    assert_eq!(keys, expected, "envelope must be exactly {{ epoch, listKey, entries }}");
+    assert_eq!(
+        keys, expected,
+        "envelope must be exactly {{ epoch, listKey, entries }}"
+    );
     assert!(json["epoch"].is_number());
     assert_eq!(json["listKey"].as_str(), Some(lk_hex.as_str()));
     let entries = json["entries"].as_array().expect("entries");
@@ -232,7 +235,11 @@ async fn bc_to_idx_map_json_envelope_shape() {
         let inner = e.as_object().expect("entry object");
         let entry_keys: std::collections::BTreeSet<&str> =
             inner.keys().map(std::string::String::as_str).collect();
-        assert_eq!(entry_keys, ["bc", "idx"].iter().copied().collect(), "entry must be {{ bc, idx }}");
+        assert_eq!(
+            entry_keys,
+            ["bc", "idx"].iter().copied().collect(),
+            "entry must be {{ bc, idx }}"
+        );
         assert!(inner["bc"].is_string());
         assert!(inner["idx"].is_number());
     }

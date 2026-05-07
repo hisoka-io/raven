@@ -121,7 +121,8 @@ impl SubsquidRootSource for FixtureSubsquidSource {
 }
 
 /// Queries `Transaction.merkleRoot` for the latest tx with `utxoTreeOut == tree` at or before `block`.
-pub(crate) const SUBSQUID_TX_ROOT_QUERY: &str = "query TxMerkleRoot($tree: BigInt!, $block: BigInt!) { \
+pub(crate) const SUBSQUID_TX_ROOT_QUERY: &str =
+    "query TxMerkleRoot($tree: BigInt!, $block: BigInt!) { \
     transactions(\
         where: { utxoTreeOut_eq: $tree, blockNumber_lte: $block }, \
         orderBy: blockNumber_DESC, \

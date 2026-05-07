@@ -428,5 +428,4 @@ mod tests {
         let bad: serde_json::Result<POIStatus> = serde_json::from_str("\"nonsense\"");
         assert!(bad.is_err(), "unknown status must reject");
     }
-
 }

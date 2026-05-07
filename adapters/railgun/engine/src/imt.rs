@@ -351,7 +351,11 @@ mod tests {
         }
 
         assert_eq!(tree.leaf_count(), pre_count, "leaf_count must be unchanged");
-        assert_eq!(tree.root(), pre_root, "root must be unchanged (still empty)");
+        assert_eq!(
+            tree.root(),
+            pre_root,
+            "root must be unchanged (still empty)"
+        );
 
         tree.insert_leaves(0, &[valid])
             .expect("clean insert after rollback");

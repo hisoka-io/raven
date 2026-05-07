@@ -1048,7 +1048,10 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
             }
         }
         if drained > 0 {
-            tracing::info!(drained, "ppoi_list auto_spawn: drained consumers on shutdown");
+            tracing::info!(
+                drained,
+                "ppoi_list auto_spawn: drained consumers on shutdown"
+            );
         }
         driver.abort();
     }

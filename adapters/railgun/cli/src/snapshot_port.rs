@@ -38,7 +38,10 @@ pub enum SnapshotPortError {
         expected: u32,
     },
     #[error("export kind {observed:?} != expected {expected:?}")]
-    KindMismatch { observed: String, expected: &'static str },
+    KindMismatch {
+        observed: String,
+        expected: &'static str,
+    },
     #[error(
         "destination root already contains instance data_dirs; \
          pass --allow-overwrite to back them up to <root>.pre-import.<ts>/"

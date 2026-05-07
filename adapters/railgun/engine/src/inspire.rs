@@ -324,9 +324,9 @@ pub fn re_encode_shard(
 
     // `encode_database` builds shards starting at id=0; we keep
     // the caller-provided shard id stable on the in-place slot.
-    let new_shard = rebuilt.pop().ok_or_else(|| {
-        AdapterError::Scheme("re_encode_shard: encoder produced no shard".into())
-    })?;
+    let new_shard = rebuilt
+        .pop()
+        .ok_or_else(|| AdapterError::Scheme("re_encode_shard: encoder produced no shard".into()))?;
     existing.polynomials = new_shard.polynomials;
     Ok(())
 }
@@ -445,9 +445,8 @@ impl LogicalLeafStore {
                 let key = (*list_key, *blinded_commitment);
                 self.ppoi_status.insert(key, *status);
                 self.ppoi_block_height.insert(key, block_height);
-                self.dirty_shards.extend(
-                    encoder.affected_shards_for_ppoi_status(list_key, blinded_commitment),
-                );
+                self.dirty_shards
+                    .extend(encoder.affected_shards_for_ppoi_status(list_key, blinded_commitment));
                 if let Some(list_index) = self.ppoi_bc_index.get(&key).copied() {
                     self.dirty_shards
                         .extend(encoder.affected_shards_for_ppoi_leaf(list_key, list_index));
@@ -624,11 +623,7 @@ impl LogicalLeafStore {
 
     /// Look up a PPOI status row.
     #[must_use]
-    pub fn ppoi_status(
-        &self,
-        list_key: &[u8; 32],
-        blinded_commitment: &[u8; 32],
-    ) -> Option<u8> {
+    pub fn ppoi_status(&self, list_key: &[u8; 32], blinded_commitment: &[u8; 32]) -> Option<u8> {
         self.ppoi_status
             .get(&(*list_key, *blinded_commitment))
             .copied()
@@ -654,11 +649,7 @@ impl LogicalLeafStore {
 
     /// Per-list `(blinded_commitment -> list_index)` lookup.
     #[must_use]
-    pub fn ppoi_index_of(
-        &self,
-        list_key: &[u8; 32],
-        blinded_commitment: &[u8; 32],
-    ) -> Option<u32> {
+    pub fn ppoi_index_of(&self, list_key: &[u8; 32], blinded_commitment: &[u8; 32]) -> Option<u32> {
         self.ppoi_bc_index
             .get(&(*list_key, *blinded_commitment))
             .copied()
@@ -1093,13 +1084,21 @@ mod logical_store_tests {
         let pre_dirty: std::collections::BTreeSet<u32> = s.dirty_shards().clone();
         let pre_last_block = s.last_block_height();
 
-        let _err = apply_wal_entry(&mut s, &append(0, 5, 101), 101, &enc())
-            .expect_err("sparse must fail");
+        let _err =
+            apply_wal_entry(&mut s, &append(0, 5, 101), 101, &enc()).expect_err("sparse must fail");
 
         assert_eq!(s.leaf_count(), pre_leaf_count, "leaf_count unchanged");
         assert_eq!(s.imt_root(0), pre_root, "IMT root unchanged");
-        assert_eq!(s.dirty_shards().clone(), pre_dirty, "dirty_shards unchanged");
-        assert_eq!(s.last_block_height(), pre_last_block, "last_block_height unchanged");
+        assert_eq!(
+            s.dirty_shards().clone(),
+            pre_dirty,
+            "dirty_shards unchanged"
+        );
+        assert_eq!(
+            s.last_block_height(),
+            pre_last_block,
+            "last_block_height unchanged"
+        );
         assert!(s.leaf(0, 5).is_none(), "rejected leaf must NOT be in map");
     }
 
@@ -1112,7 +1111,10 @@ mod logical_store_tests {
         let sparse = append(0, 5, 101);
         let pre_root = s.imt_root(0);
         let err = super::validate_apply(&s, &sparse).expect_err("sparse must fail validate");
-        assert!(matches!(err, raven_railgun_core::AdapterError::InvalidQuery(_)));
+        assert!(matches!(
+            err,
+            raven_railgun_core::AdapterError::InvalidQuery(_)
+        ));
         assert_eq!(s.imt_root(0), pre_root);
         assert_eq!(s.leaf_count(), 1);
     }
@@ -1155,13 +1157,10 @@ mod re_encode_tests {
         let entries = 256usize;
         let entry_size = 256usize;
         let db: Vec<u8> = (0..entries)
-            .flat_map(|i| {
-                (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251"))
-            })
+            .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
             .collect();
         let (mut state, _sk) =
-            setup_state(&params, &db, entry_size, InspireVariant::TwoPacking)
-                .expect("setup_state");
+            setup_state(&params, &db, entry_size, InspireVariant::TwoPacking).expect("setup_state");
 
         // Snapshot original shard 0 polynomial-coefficients.
         let original_polys: Vec<_> = state
@@ -1211,13 +1210,10 @@ mod re_encode_tests {
         let entries = 256usize;
         let entry_size = 256usize;
         let db: Vec<u8> = (0..entries)
-            .flat_map(|i| {
-                (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251"))
-            })
+            .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
             .collect();
         let (mut state, _sk) =
-            setup_state(&params, &db, entry_size, InspireVariant::TwoPacking)
-                .expect("setup_state");
+            setup_state(&params, &db, entry_size, InspireVariant::TwoPacking).expect("setup_state");
 
         let original_polys: Vec<_> = state
             .encoded_db
@@ -1269,13 +1265,10 @@ mod re_encode_tests {
         let entries = 4096usize; // 2 × ring_dim => 2 shards.
         let entry_size = 32usize;
         let db: Vec<u8> = (0..entries)
-            .flat_map(|i| {
-                (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251"))
-            })
+            .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
             .collect();
         let (mut state, _sk) =
-            setup_state(&params, &db, entry_size, InspireVariant::TwoPacking)
-                .expect("setup_state");
+            setup_state(&params, &db, entry_size, InspireVariant::TwoPacking).expect("setup_state");
 
         assert!(
             state.encoded_db.shards.len() >= 2,
@@ -1293,8 +1286,8 @@ mod re_encode_tests {
             .clone();
 
         // Slice shard 1's bytes: [eps * es, 2*eps * es).
-        let entries_per_shard = usize::try_from(state.encoded_db.config.entries_per_shard())
-            .expect("eps fits usize");
+        let entries_per_shard =
+            usize::try_from(state.encoded_db.config.entries_per_shard()).expect("eps fits usize");
         let shard_bytes_len = entries_per_shard * entry_size;
         let shard_bytes = db
             .get(shard_bytes_len..2 * shard_bytes_len)
@@ -1326,13 +1319,10 @@ mod re_encode_tests {
         let entries = 256usize;
         let entry_size = 256usize;
         let db: Vec<u8> = (0..entries)
-            .flat_map(|i| {
-                (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251"))
-            })
+            .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
             .collect();
         let (mut state, _sk) =
-            setup_state(&params, &db, entry_size, InspireVariant::TwoPacking)
-                .expect("setup_state");
+            setup_state(&params, &db, entry_size, InspireVariant::TwoPacking).expect("setup_state");
         let err = re_encode_shard(&mut state.encoded_db, &params, 999, &[], entry_size)
             .expect_err("unknown shard id");
         let msg = format!("{err}");

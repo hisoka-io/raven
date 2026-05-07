@@ -172,7 +172,9 @@ fn per_list_imt_reorg_coherency_drops_and_reinserts_without_stale_cache_hits() {
         );
     }
     for i in 0..survivors {
-        let proof = store.ppoi_merkle_proof(&LIST_KEY, i).expect("survivor path");
+        let proof = store
+            .ppoi_merkle_proof(&LIST_KEY, i)
+            .expect("survivor path");
         assert_eq!(
             proof.root, post_reorg_root,
             "surviving path at idx {i} must reconstruct to post-reorg root"
@@ -203,9 +205,7 @@ fn per_list_imt_reorg_coherency_drops_and_reinserts_without_stale_cache_hits() {
         "all 100 leaves restored post-reinsert"
     );
 
-    let post_reinsert_root = store
-        .ppoi_imt_root(&LIST_KEY)
-        .expect("post-reinsert root");
+    let post_reinsert_root = store.ppoi_imt_root(&LIST_KEY).expect("post-reinsert root");
     assert_ne!(
         post_reorg_root, post_reinsert_root,
         "post-reinsert root must differ from post-reorg-truncated root"

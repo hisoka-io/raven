@@ -84,8 +84,7 @@ fn snapshot_zstd_bench_bincode_vs_zstd_l3() {
 
         let zd = Instant::now();
         let zstd_unwrapped: Vec<u8> =
-            zstd::bulk::decompress(&zstd_wrapped, 4 * 1024 * 1024 * 1024)
-                .expect("zstd decompress");
+            zstd::bulk::decompress(&zstd_wrapped, 4 * 1024 * 1024 * 1024).expect("zstd decompress");
         let _round2: Vec<u8> = bincode::deserialize(&zstd_unwrapped).expect("bincode de post-zstd");
         let zstd_de = zd.elapsed();
         zstd_de_t.push(zstd_de);
@@ -109,10 +108,8 @@ fn snapshot_zstd_bench_bincode_vs_zstd_l3() {
     let zstd_de_med = median(&mut zstd_de_t);
 
     let bytes_ratio = zstd_bytes_out as f64 / bincode_bytes_out as f64;
-    let ser_delta_ms =
-        zstd_ser_med.as_secs_f64() * 1000.0 - bincode_ser_med.as_secs_f64() * 1000.0;
-    let de_delta_ms =
-        zstd_de_med.as_secs_f64() * 1000.0 - bincode_de_med.as_secs_f64() * 1000.0;
+    let ser_delta_ms = zstd_ser_med.as_secs_f64() * 1000.0 - bincode_ser_med.as_secs_f64() * 1000.0;
+    let de_delta_ms = zstd_de_med.as_secs_f64() * 1000.0 - bincode_de_med.as_secs_f64() * 1000.0;
 
     eprintln!(
         "snapshot_zstd_bench: bincode-only 3-seed-median ser={:?} de={:?} bytes={}",

@@ -851,8 +851,8 @@ mod tests {
         assert_eq!(decoded, items, "round-trip equality must hold at K={k}");
 
         // Re-encode to verify determinism.
-        let bytes2 = super::write_batch_response_versioned(&decoded)
-            .expect("re-encode must succeed");
+        let bytes2 =
+            super::write_batch_response_versioned(&decoded).expect("re-encode must succeed");
         assert_eq!(bytes, bytes2, "encoder must be deterministic at K={k}");
     }
 
@@ -947,9 +947,7 @@ mod tests {
                      (\"draining or drained\"), got: {detail}"
                 );
             }
-            other => panic!(
-                "expected BatchError::Respond(NoActiveInstance), got {other:?}"
-            ),
+            other => panic!("expected BatchError::Respond(NoActiveInstance), got {other:?}"),
         }
     }
 

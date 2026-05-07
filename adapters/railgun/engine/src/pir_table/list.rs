@@ -4,10 +4,13 @@ use std::collections::BTreeSet;
 
 use raven_railgun_core::{AdapterError, Result};
 
+use super::leaf::PerNodeEncoder;
+use super::{
+    labels, PirTableEncoder, LEAVES_PER_TREE, MIN_RECORD_SIZE, NODE_HASH_BYTES, PATH_RECORD_BYTES,
+    PER_NODE_TOTAL_NODES,
+};
 use crate::imt::TREE_DEPTH;
 use crate::inspire::LogicalLeafStore;
-use super::leaf::PerNodeEncoder;
-use super::{labels, PirTableEncoder, LEAVES_PER_TREE, MIN_RECORD_SIZE, NODE_HASH_BYTES, PATH_RECORD_BYTES, PER_NODE_TOTAL_NODES};
 
 /// T1 status encoder: row at list_index = `[status_byte, blinded_commitment[0..31]]`
 /// padded with zeros to `record_size`. Pinned to one `list_key`. Status

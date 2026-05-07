@@ -118,12 +118,7 @@ async fn synthetic_upstream_emits_new_list_key_spawns_two_instances() {
     let harness = fresh_harness(tmp.path());
 
     let templates = vec![
-        template_runtime(
-            tmp.path(),
-            "ppoi-status",
-            "per-list-status",
-            TEST_LIST_KEY,
-        ),
+        template_runtime(tmp.path(), "ppoi-status", "per-list-status", TEST_LIST_KEY),
         template_runtime(tmp.path(), "ppoi-path", "per-list-path", TEST_LIST_KEY),
     ];
 
@@ -164,7 +159,10 @@ async fn synthetic_upstream_emits_new_list_key_spawns_two_instances() {
         "ppoi-path template must spawn; got {template_ids:?}"
     );
     for (_, lk) in &known {
-        assert_eq!(lk, &TEST_LIST_KEY, "every spawn must match the test list_key");
+        assert_eq!(
+            lk, &TEST_LIST_KEY,
+            "every spawn must match the test list_key"
+        );
     }
 
     let routes = harness.ppoi_list_routes.load();
@@ -198,12 +196,7 @@ async fn concurrent_list_observed_bursts_dedupe_to_one_spawn_per_template_per_li
     let harness = fresh_harness(tmp.path());
 
     let templates = vec![
-        template_runtime(
-            tmp.path(),
-            "ppoi-status",
-            "per-list-status",
-            TEST_LIST_KEY,
-        ),
+        template_runtime(tmp.path(), "ppoi-status", "per-list-status", TEST_LIST_KEY),
         template_runtime(tmp.path(), "ppoi-node", "per-list-node", TEST_LIST_KEY),
     ];
 
@@ -279,12 +272,7 @@ async fn restart_replay_picks_up_auto_spawned_ppoi_list_instances_from_spawn_log
     let harness = fresh_harness(tmp.path());
 
     let templates = vec![
-        template_runtime(
-            tmp.path(),
-            "ppoi-status",
-            "per-list-status",
-            TEST_LIST_KEY,
-        ),
+        template_runtime(tmp.path(), "ppoi-status", "per-list-status", TEST_LIST_KEY),
         template_runtime(tmp.path(), "ppoi-path", "per-list-path", TEST_LIST_KEY),
     ];
 
@@ -383,10 +371,7 @@ async fn restart_replay_picks_up_auto_spawned_ppoi_list_instances_from_spawn_log
 
     let auto_spawned = registry_v2.drain_auto_spawned();
     for handle in auto_spawned {
-        let _ = handle
-            .consumer_sender
-            .send(ConsumerEvent::Shutdown)
-            .await;
+        let _ = handle.consumer_sender.send(ConsumerEvent::Shutdown).await;
         let _ = tokio::time::timeout(Duration::from_secs(5), handle.consumer_join).await;
     }
 }

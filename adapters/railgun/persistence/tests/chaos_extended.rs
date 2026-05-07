@@ -107,13 +107,17 @@ fn partial_snapshot_dir_does_not_corrupt_subsequent_recovery() {
     std::fs::write(snap2_dir.join("data.bincode"), b"trunc").expect("write trunc payload");
 
     let err = Snapshot::load(&layout, SnapshotId(2)).expect_err("truncated snap must fail load");
-    assert!(matches!(err, PersistenceError::SnapshotCorrupt(_)), "got {err:?}");
+    assert!(
+        matches!(err, PersistenceError::SnapshotCorrupt(_)),
+        "got {err:?}"
+    );
 
     let layout2 = StoreLayout::open(dir.path()).expect("layout reopen");
-    let manifest2 = Manifest::load(&layout2).expect("manifest reload").expect("present");
+    let manifest2 = Manifest::load(&layout2)
+        .expect("manifest reload")
+        .expect("present");
     assert_eq!(manifest2.current_snapshot_id, SnapshotId(1));
     let snap1_back = Snapshot::load(&layout2, manifest2.current_snapshot_id)
         .expect("snap-1 must still load clean");
     assert_eq!(snap1_back.data, b"first valid snapshot");
 }
-

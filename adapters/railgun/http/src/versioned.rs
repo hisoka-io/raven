@@ -91,13 +91,11 @@ pub fn write_batch_response_versioned<T: serde::Serialize>(
 ) -> Result<Vec<u8>, bincode::Error> {
     let mut out = Vec::with_capacity(WIRE_SCHEMA_PREFIX_LEN + 8 + items.len() * 64);
     out.extend_from_slice(&WIRE_SCHEMA_VERSION.to_be_bytes());
-    let count =
-        u64::try_from(items.len()).map_err(|_| bincode::ErrorKind::SizeLimit)?;
+    let count = u64::try_from(items.len()).map_err(|_| bincode::ErrorKind::SizeLimit)?;
     out.extend_from_slice(&count.to_le_bytes());
     for item in items {
         let body = bincode::serialize(item)?;
-        let elem_len =
-            u64::try_from(body.len()).map_err(|_| bincode::ErrorKind::SizeLimit)?;
+        let elem_len = u64::try_from(body.len()).map_err(|_| bincode::ErrorKind::SizeLimit)?;
         out.extend_from_slice(&elem_len.to_le_bytes());
         out.extend_from_slice(&body);
     }
@@ -133,29 +131,28 @@ pub fn read_batch_response_versioned<T: serde::de::DeserializeOwned>(
             got: version,
         });
     }
-    let count_slice = bytes
-        .get(WIRE_SCHEMA_PREFIX_LEN..header_end)
-        .ok_or(VersionedDecodeError::Short {
-            got: bytes.len(),
-            need: header_end,
-        })?;
+    let count_slice =
+        bytes
+            .get(WIRE_SCHEMA_PREFIX_LEN..header_end)
+            .ok_or(VersionedDecodeError::Short {
+                got: bytes.len(),
+                need: header_end,
+            })?;
     let mut count_buf = [0u8; 8];
     count_buf.copy_from_slice(count_slice);
     let count_u64 = u64::from_le_bytes(count_buf);
-    let count = usize::try_from(count_u64).map_err(|_| VersionedDecodeError::Bincode(
-        format!("batch count exceeds usize: {count_u64}"),
-    ))?;
+    let count = usize::try_from(count_u64).map_err(|_| {
+        VersionedDecodeError::Bincode(format!("batch count exceeds usize: {count_u64}"))
+    })?;
     // Cap up-front allocation so a crafted count can't trigger Vec::with_capacity(2^48).
     let cap = count.min(usize::try_from(BINCODE_DESERIALIZE_LIMIT).unwrap_or(usize::MAX) / 16);
     let mut out: Vec<T> = Vec::with_capacity(cap);
     let mut offset = header_end;
     for idx in 0..count {
-        let elem_header_end = offset
-            .checked_add(8)
-            .ok_or(VersionedDecodeError::Short {
-                got: bytes.len(),
-                need: usize::MAX,
-            })?;
+        let elem_header_end = offset.checked_add(8).ok_or(VersionedDecodeError::Short {
+            got: bytes.len(),
+            need: usize::MAX,
+        })?;
         let len_slice = bytes
             .get(offset..elem_header_end)
             .ok_or(VersionedDecodeError::Short {
@@ -165,10 +162,11 @@ pub fn read_batch_response_versioned<T: serde::de::DeserializeOwned>(
         let mut len_buf = [0u8; 8];
         len_buf.copy_from_slice(len_slice);
         let elem_len_u64 = u64::from_le_bytes(len_buf);
-        let elem_len =
-            usize::try_from(elem_len_u64).map_err(|_| VersionedDecodeError::Bincode(format!(
+        let elem_len = usize::try_from(elem_len_u64).map_err(|_| {
+            VersionedDecodeError::Bincode(format!(
                 "element {idx} length exceeds usize: {elem_len_u64}"
-            )))?;
+            ))
+        })?;
         offset = elem_header_end;
         let elem_end = offset
             .checked_add(elem_len)

@@ -68,9 +68,14 @@ fn concurrent_open_with_lock_serializes_with_exactly_one_winner_per_round() {
         let won = winners.load(Ordering::SeqCst);
         let lost = losers.load(Ordering::SeqCst);
         assert_eq!(won + lost, CONTENDERS);
-        assert!(won >= 1, "round {round}: at least one contender must win the lock");
+        assert!(
+            won >= 1,
+            "round {round}: at least one contender must win the lock"
+        );
         let layout = StoreLayout::open(&path).expect("post-round open");
-        let manifest = Manifest::load(&layout).expect("post-round load").expect("present");
+        let manifest = Manifest::load(&layout)
+            .expect("post-round load")
+            .expect("present");
         assert_eq!(manifest.schema_version, MANIFEST_SCHEMA_VERSION);
     }
 }
@@ -161,6 +166,8 @@ fn manifest_save_during_concurrent_lock_attempts_is_atomic() {
     }
 
     let layout = StoreLayout::open(&path).expect("post open");
-    let final_manifest = Manifest::load(&layout).expect("post load").expect("present");
+    let final_manifest = Manifest::load(&layout)
+        .expect("post load")
+        .expect("present");
     assert_eq!(final_manifest.current_snapshot_seq, 49);
 }
