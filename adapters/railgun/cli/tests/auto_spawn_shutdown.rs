@@ -72,14 +72,15 @@ fn bootstrap_tree_zero_cfg(data_dir: PathBuf) -> InstanceConfig {
 }
 
 async fn wait_for_observer(observer: &BootstrapObserver) -> BootstrapView {
-    // 60 s: generous bound because CI runners + parallel test contention can balloon cold-start time.
-    for _ in 0..1200u32 {
+    // 180 s: generous bound because CI runners (ubuntu-latest is 2-core) under
+    // parallel test contention can balloon cold-start PIR setup well past 60 s.
+    for _ in 0..3600u32 {
         if let Some(view) = observer.lock().clone() {
             return view;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("bootstrap observer never populated within 60s");
+    panic!("bootstrap observer never populated within 180s");
 }
 
 async fn wait_for_data_dir(path: &std::path::Path, deadline: Duration) {

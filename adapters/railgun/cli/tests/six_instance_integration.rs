@@ -225,13 +225,15 @@ async fn wait_for_status(local_addr: SocketAddr) -> StatusJson {
 }
 
 async fn wait_for_observer(observer: &BootstrapObserver) -> BootstrapView {
-    for _ in 0..480u32 {
+    // 300 s: this test bootstraps six PIR instances; on 2-core CI runners
+    // under parallel test contention the cold-start budget is significant.
+    for _ in 0..1200u32 {
         if let Some(view) = observer.lock().clone() {
             return view;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    panic!("bootstrap observer never populated");
+    panic!("bootstrap observer never populated within 300s");
 }
 
 async fn shutdown(
