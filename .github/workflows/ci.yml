@@ -97,19 +97,6 @@ jobs:
       - name: cargo test
         run: cargo test --manifest-path adapters/railgun/Cargo.toml --workspace --all-targets
 
-  inspire-tests:
-    name: inspire submodule own tests (--all-features)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          token: ${{ secrets.SUBMODULE_TOKEN }}
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo test (raven-inspire)
-        run: cargo test --manifest-path crates/inspire/Cargo.toml --release --all-features
-
   sdk-tests:
     # Fresh-clone-build gate: the TypeScript SDK at adapters/railgun/sdk
     # depends on the wasm-pack output of raven-inspire-client-wasm

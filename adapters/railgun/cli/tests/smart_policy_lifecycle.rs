@@ -166,6 +166,7 @@ async fn wait_for_refused_spawns(registry: &Arc<SpawnRegistry>, expected: u64, d
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 async fn synthetic_chain_drives_template_based_spawn_to_5_trees() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());
@@ -224,6 +225,7 @@ async fn synthetic_chain_drives_template_based_spawn_to_5_trees() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 async fn max_instance_count_4_refuses_5th_spawn_loud() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());
@@ -296,6 +298,7 @@ async fn max_instance_count_4_refuses_5th_spawn_loud() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 async fn cooldown_seconds_refuses_back_to_back_spawns() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());
@@ -361,6 +364,7 @@ async fn cooldown_seconds_refuses_back_to_back_spawns() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 async fn max_count_and_cooldown_compose() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());

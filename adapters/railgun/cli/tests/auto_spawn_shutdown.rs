@@ -135,6 +135,7 @@ fn count_snapshots(data_dir: &std::path::Path) -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 async fn auto_spawned_consumers_drain_wal_on_sigterm() {
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)

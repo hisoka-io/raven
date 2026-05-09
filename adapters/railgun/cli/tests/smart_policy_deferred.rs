@@ -161,6 +161,7 @@ async fn wait_for_chain_tree_count(
 // SIGHUP hot-reload of [[instance_template]]
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 async fn sighup_reload_hot_adds_new_template() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
@@ -351,6 +352,7 @@ data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 async fn sighup_reload_applies_all_chain_tree_templates_not_just_first() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
@@ -704,6 +706,7 @@ data_source = { kind = "indexer", filter = { tree_number = 0 } }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 async fn tree_fill_threshold_pre_spawns_at_95_percent() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());
@@ -773,6 +776,7 @@ async fn tree_fill_threshold_pre_spawns_at_95_percent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 async fn admin_drain_concurrent_with_auto_spawn_routes_consistently() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());

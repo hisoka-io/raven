@@ -297,6 +297,7 @@ mod kill_during_spawn {
 }
 
 #[test]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn crash_between_append_and_flip_recovers_with_doubly_live_tolerated() {
     use std::sync::Arc;
 

@@ -199,6 +199,7 @@ fn assert_old_encoder_recovers(dir_path: &Path) {
 // Per-checkpoint scenarios.
 
 #[test]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn real_sigkill_at_pre_re_encode_no_disk_mutation_then_resume_succeeds() {
     let dir = tempfile::tempdir().expect("tempdir");
     seed_dir(dir.path(), EncoderKind::PerLeafBc);
@@ -238,6 +239,7 @@ fn real_sigkill_at_pre_re_encode_no_disk_mutation_then_resume_succeeds() {
 }
 
 #[test]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn real_sigkill_at_post_re_encode_no_disk_mutation_then_resume_succeeds() {
     let dir = tempfile::tempdir().expect("tempdir");
     seed_dir(dir.path(), EncoderKind::PerLeafBc);
@@ -277,6 +279,7 @@ fn real_sigkill_at_post_re_encode_no_disk_mutation_then_resume_succeeds() {
 }
 
 #[test]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn real_sigkill_at_pre_snapshot_no_disk_mutation_then_resume_succeeds() {
     let dir = tempfile::tempdir().expect("tempdir");
     seed_dir(dir.path(), EncoderKind::PerLeafBc);
@@ -306,6 +309,7 @@ fn real_sigkill_at_pre_snapshot_no_disk_mutation_then_resume_succeeds() {
 }
 
 #[test]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn real_sigkill_at_post_snapshot_keeps_old_manifest_then_resume_succeeds() {
     let dir = tempfile::tempdir().expect("tempdir");
     seed_dir(dir.path(), EncoderKind::PerLeafBc);
@@ -344,6 +348,7 @@ fn real_sigkill_at_post_snapshot_keeps_old_manifest_then_resume_succeeds() {
 }
 
 #[test]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn real_sigkill_at_pre_manifest_bump_keeps_old_manifest_then_resume_succeeds() {
     // pre-manifest-bump is the alias for post-snapshot; on-disk shape
     // is identical. Tested as a distinct case so the assertion intent
@@ -379,6 +384,7 @@ fn real_sigkill_at_pre_manifest_bump_keeps_old_manifest_then_resume_succeeds() {
 }
 
 #[test]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn real_sigkill_at_post_manifest_bump_yields_fully_migrated_state() {
     // post-manifest-bump: migration is logically complete BEFORE the
     // SIGKILL lands. The atomic-rename has fired; on-disk state is

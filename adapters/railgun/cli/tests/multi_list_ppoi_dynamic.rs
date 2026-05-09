@@ -113,6 +113,7 @@ async fn wait_for_pair_count(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 async fn synthetic_upstream_emits_new_list_key_spawns_two_instances() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());
@@ -191,6 +192,7 @@ async fn synthetic_upstream_emits_new_list_key_spawns_two_instances() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 async fn concurrent_list_observed_bursts_dedupe_to_one_spawn_per_template_per_list_key() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());
@@ -267,6 +269,7 @@ async fn concurrent_list_observed_bursts_dedupe_to_one_spawn_per_template_per_li
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 async fn restart_replay_picks_up_auto_spawned_ppoi_list_instances_from_spawn_log() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());

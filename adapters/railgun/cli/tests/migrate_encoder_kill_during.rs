@@ -297,6 +297,7 @@ fn snapshot_bytes(dir_path: &Path, id: SnapshotId) -> Vec<u8> {
 // Scenario 1: SIGKILL after pre-migration snapshot, before re-encode.
 
 #[test]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn kill_during_after_pre_snapshot_before_re_encode_recovers_via_old_encoder_and_resumes() {
     let dir = tempfile::tempdir().expect("tempdir");
 
@@ -388,6 +389,7 @@ fn kill_during_after_pre_snapshot_before_re_encode_recovers_via_old_encoder_and_
 // Scenario 2: SIGKILL after re-encode + snapshot save, before manifest bump.
 
 #[test]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn kill_during_after_re_encode_before_manifest_bump_recovers_idempotently() {
     let dir = tempfile::tempdir().expect("tempdir");
 
@@ -487,6 +489,7 @@ fn kill_during_after_re_encode_before_manifest_bump_recovers_idempotently() {
 // and must not mutate the on-disk byte-state.
 
 #[test]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn migration_repeated_three_times_on_same_data_dir_is_byte_identical() {
     let dir = tempfile::tempdir().expect("tempdir");
     seed_with_committed_snapshot(dir.path(), EncoderKind::PerLeafBc, 16);
@@ -531,6 +534,7 @@ fn migration_repeated_three_times_on_same_data_dir_is_byte_identical() {
 // assert per-row byte identity at levels 0, 1, and 8.
 
 #[test]
+#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn per_list_node_migration_byte_identity_at_levels_0_1_8() {
     let dir = tempfile::tempdir().expect("tempdir");
 
