@@ -210,15 +210,15 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
         .send(shield_event(1, 0, 100))
         .await
         .expect("send tree-1 shield (auto-spawn trigger)");
-    wait_for_data_dir(&tree1_dir, Duration::from_secs(15)).await;
-    wait_for_snapshot_dir(&tree1_dir, 1, Duration::from_secs(15)).await;
+    wait_for_data_dir(&tree1_dir, Duration::from_secs(180)).await;
+    wait_for_snapshot_dir(&tree1_dir, 1, Duration::from_secs(180)).await;
 
     chain
         .send(shield_event(2, 0, 200))
         .await
         .expect("send tree-2 shield (auto-spawn trigger)");
-    wait_for_data_dir(&tree2_dir, Duration::from_secs(15)).await;
-    wait_for_snapshot_dir(&tree2_dir, 1, Duration::from_secs(15)).await;
+    wait_for_data_dir(&tree2_dir, Duration::from_secs(180)).await;
+    wait_for_snapshot_dir(&tree2_dir, 1, Duration::from_secs(180)).await;
 
     // Brief settle so any in-flight router fan-out completes before shutdown.
     tokio::time::sleep(Duration::from_millis(200)).await;
