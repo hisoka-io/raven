@@ -3713,6 +3713,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "raven-railgun-mock-ppoi"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "axum",
+ "clap",
+ "parking_lot",
+ "raven-railgun-core",
+ "raven-railgun-engine",
+ "raven-railgun-persistence",
+ "raven-railgun-poseidon",
+ "raven-railgun-ppoi-mirror",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "raven-railgun-persistence"
 version = "0.1.0-alpha.0"
 dependencies = [

@@ -15,6 +15,7 @@ members = [
     "engine",
     "http",
     "indexer",
+    "mock-ppoi",
     "persistence",
     "poseidon",
     "ppoi-mirror",

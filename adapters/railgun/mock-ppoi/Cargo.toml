@@ -1,0 +1,36 @@
+[package]
+name = "raven-railgun-mock-ppoi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "SYNTHETIC PPOI surface impersonator. Demo-only; never deploy to production."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "raven-railgun-mock-ppoi"
+path = "src/main.rs"
+
+[dependencies]
+raven-railgun-core = { workspace = true }
+raven-railgun-engine = { workspace = true }
+raven-railgun-poseidon = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+raven-railgun-persistence = { workspace = true }
+raven-railgun-ppoi-mirror = { workspace = true }
+reqwest = { workspace = true }
+tracing-subscriber = { workspace = true }
