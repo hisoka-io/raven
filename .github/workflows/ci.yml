@@ -97,6 +97,28 @@ jobs:
       - name: cargo test
         run: cargo test --manifest-path adapters/railgun/Cargo.toml --workspace --all-targets
 
+  bff-tests:
+    name: binary-fuse-filter (detached workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --manifest-path crates/binary-fuse-filter/Cargo.toml -- --check
+      - name: cargo clippy
+        run: cargo clippy --manifest-path crates/binary-fuse-filter/Cargo.toml --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --manifest-path crates/binary-fuse-filter/Cargo.toml --release
+      - name: cargo check (wasm32)
+        run: cargo check --manifest-path crates/binary-fuse-filter/Cargo.toml --target wasm32-unknown-unknown
+
   sdk-tests:
     # Fresh-clone-build gate: the TypeScript SDK at adapters/railgun/sdk
     # depends on the wasm-pack output of raven-inspire-client-wasm
