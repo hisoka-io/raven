@@ -97,6 +97,28 @@ jobs:
       - name: cargo test
         run: cargo test --manifest-path adapters/railgun/Cargo.toml --workspace --all-targets
 
+  isimplepir-tests:
+    name: isimplepir (detached workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --manifest-path crates/isimplepir/Cargo.toml -- --check
+      - name: cargo clippy
+        run: cargo clippy --manifest-path crates/isimplepir/Cargo.toml --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --manifest-path crates/isimplepir/Cargo.toml --release
+      - name: cargo check (wasm32 client path)
+        run: cargo check --manifest-path crates/isimplepir/Cargo.toml --target wasm32-unknown-unknown --no-default-features
+
   bff-tests:
     name: binary-fuse-filter (detached workspace)
     runs-on: ubuntu-latest

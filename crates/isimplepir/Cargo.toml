@@ -1,0 +1,137 @@
+# Detached workspace. standalone crate, intentionally out of root
+# `workspace.members` to avoid feature-unification from optional deps
+# pulling non-wasm32-compatible transitive packages into other crates.
+# Build explicitly with:
+#   cargo build --manifest-path crates/isimplepir/Cargo.toml --release
+#
+# Client path (params, query, extract) builds for wasm32-unknown-unknown
+# by default. Server path (setup, respond) is documentary-WASM; it
+# compiles but is intended for server-side only.
+[workspace]
+
+[package]
+name = "raven-isimplepir"
+version = "0.1.0-alpha.0"
+edition = "2021"
+# AVX-512 intrinsics (`_mm512_mullo_epi32`, `_mm512_add_epi32`,
+# `_mm512_reduce_add_epi32`, `_mm512_loadu_si512`,
+# `_mm512_setzero_si512`) stabilised in Rust 1.89. Used by
+# `respond::row_dot_avx512` behind runtime
+# `is_x86_feature_detected!("avx512f")` gate.
+rust-version = "1.89"
+description = "Raven's pure-Rust implementation of iSimplePIR Entry-level (eprint 2026/030 Construction 1), ported from the `simplepir/` Go reference. Single-server client-preprocessing PIR with incremental updates preserving the H = D * A hint invariant exactly per Theorem 3."
+license = "Apache-2.0"
+authors = ["Raven contributors"]
+publish = false
+readme = "README.md"
+
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+
+[lints.clippy]
+# Crypto-adjacent code: keep the "no shortcuts" lints strict.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+# Pedantic as baseline but relax cast-related classes. this
+# crate does heavy u32/u64/f64 arithmetic at the LWE/ring boundary
+# where the cast intent is explicit and documented. Strict
+# cast_possible_truncation + cast_sign_loss would require a dozen
+# #[allow] attributes per module; relax at crate level so the code
+# reads cleanly, while keeping the critical safety lints above.
+pedantic = { level = "warn", priority = -1 }
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+indexing_slicing = "warn"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+explicit_iter_loop = "allow"
+return_self_not_must_use = "allow"
+needless_range_loop = "allow"
+unreadable_literal = "allow"
+similar_names = "allow"
+# doc_list_item_without_first_line_indent doesn't exist at our
+# clippy version; lint fixed in-source at lib.rs instead.
+manual_range_contains = "allow"
+single_match_else = "allow"
+if_not_else = "allow"
+match_wildcard_for_single_variants = "allow"
+unnecessary_cast = "allow"
+no_effect = "allow"
+unnecessary_wraps = "allow"
+items_after_statements = "allow"
+useless_vec = "allow"
+uninlined_format_args = "allow"
+
+[dependencies]
+# Errors
+thiserror = "2"
+
+# Byte containers
+bytes = "1"
+
+# PRG / seeding (WASM-compatible stable-Rust)
+rand_core = { version = "0.9", default-features = false }
+rand_chacha = { version = "0.9", default-features = false }
+getrandom = { version = "0.3", default-features = false }
+
+# Keyed HKDF for deterministic A matrix derivation
+sha2 = { version = "0.10", default-features = false }
+hkdf = { version = "0.12", default-features = false }
+
+# Serialization
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+bincode = "1.3"
+
+# Parallel matmul (server-side only; client path does not use rayon).
+# Pure-Rust default-feature path without rayon is the wasm32 route
+# but matmul in client's Query is O(n*M) with n small so single-threaded
+# is fine there. Only respond.rs opts into rayon.
+rayon = { version = "1", optional = true }
+
+# wasm32 bridge for `getrandom` (browser OS-entropy via
+# `crypto.getRandomValues` / `Web Crypto API`). Must be placed AFTER
+# the main `[dependencies]` block so it overrides getrandom's feature
+# set only on wasm32.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.3", default-features = false, features = ["wasm_js"] }
+
+[features]
+default = ["server"]
+# Server-side feature bundle. Enables rayon-parallel matmul in
+# respond.rs. Pure-Rust scalar fallback stays available; disable
+# this feature for wasm32 client builds.
+server = ["dep:rayon"]
+# Reserved for a future byte-identity differential KAT against the
+# Go `simplepir/` reference. That KAT requires implementing three
+# encoding changes (DB + p/2 shift at Setup, 3 x 10-bit column
+# packing, offset correction at Recover) so Raven's wire bytes
+# align with Go's; see UPSTREAM.md §kat-go scope. Determinism
+# regression coverage is provided unconditionally by
+# `tests/kat_fixtures.rs`, which locks Raven's own wire bytes
+# against committed fixture files.
+kat-go = []
+
+[dev-dependencies]
+# Test-only extras. Proptest for Theorem 3 update-invariant runs at
+# k ∈ {1, 10, 100, 1024}. `serde_json` + `hex` drive the
+# `tests/kat_fixtures.rs` byte-identity determinism test.
+proptest = "1"
+rand = "0.9"
+rand_core = { version = "0.9", default-features = false }
+serde_json = "1"
+hex = "0.4"
