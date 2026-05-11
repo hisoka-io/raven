@@ -1,0 +1,24 @@
+[package]
+name = "raven-crypto-primitives"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Shared cryptographic primitives for Raven PIR schemes: deterministic RNG, HKDF-based seed derivation, bit-packing utilities."
+
+[lints]
+workspace = true
+
+[dependencies]
+rand_core = { version = "0.9", default-features = false }
+rand_chacha = { version = "0.9", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+hkdf = "0.12"
+
+[dev-dependencies]
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+proptest = { workspace = true }
