@@ -286,7 +286,11 @@ async fn layer2_verifier_does_not_fire_on_upstream_signature_instance() {
             .expect("send");
     }
 
-    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // 30 s deadline gives debug-mode consumer the headroom it needs to
+    // drain 10 events while other tests in the same binary share the
+    // tokio scheduler. Release-mode + isolated runs drain in ~1 s; the
+    // deadline is a deadlock detector, not a throughput floor.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let m = *handle.metrics.lock();
         if m.events_processed >= 10 {
@@ -294,7 +298,7 @@ async fn layer2_verifier_does_not_fire_on_upstream_signature_instance() {
         }
         assert!(
             tokio::time::Instant::now() < drain_deadline,
-            "consumer did not drain 10 events within 10 s; events_processed = {}",
+            "consumer did not drain 10 events within 30 s; events_processed = {}",
             m.events_processed,
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
