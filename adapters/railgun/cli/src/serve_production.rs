@@ -115,6 +115,8 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
             opts.entry_bytes
         );
     }
+    raven_railgun_engine::pir_table::validate_total_entries(&opts.encoder, opts.entries)
+        .map_err(|e| anyhow::anyhow!("encoder cell shape rejected: {e}"))?;
     let params = InspireParams::secure_128_d2048();
     let entries = opts.entries;
     let entry_bytes = opts.entry_bytes;

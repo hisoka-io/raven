@@ -1547,6 +1547,14 @@ fn bootstrap_instances(
         Vec::with_capacity(opts.instances.len());
     for cfg in &opts.instances {
         let entry_size = cfg.record_size.max(32);
+        raven_railgun_engine::pir_table::validate_total_entries(&cfg.encoder, entries).map_err(
+            |e| {
+                anyhow::anyhow!(
+                    "encoder cell shape rejected for instance {id}: {e}",
+                    id = cfg.instance_id
+                )
+            },
+        )?;
         let initial_db: Vec<u8> = (0..entries)
             .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).unwrap_or(0)))
             .collect();
