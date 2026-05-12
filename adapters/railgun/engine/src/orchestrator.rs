@@ -575,7 +575,13 @@ where
             s
         } else {
             let s = fresh_state_factory(&cfg)?;
-            persistence.commit(&s, 0)?;
+            // Bootstrap first commit uses the V6 envelope so the
+            // embedded `LogicalLeafStore` travels with the snapshot
+            // from the very first manifest write. Empty store on
+            // first bootstrap; subsequent commits will carry the
+            // accumulated store via the commit driver.
+            let empty_store = LogicalLeafStore::default();
+            persistence.commit_v6(&s, &empty_store, 0)?;
             persistence.commit_notify().notify_waiters();
             s
         };

@@ -503,8 +503,12 @@ pub fn bootstrap_inspire_instance(
         s
     } else {
         // Fire commit_notify so observers waiting on first commit don't deadlock.
+        // Bootstrap first commit uses the V6 envelope so the embedded
+        // `LogicalLeafStore` travels with the snapshot from the very
+        // first manifest write. Empty store on first bootstrap.
         let s = fresh_state_factory()?;
-        persistence.commit(&s, 0)?;
+        let empty_store = super::inspire::LogicalLeafStore::default();
+        persistence.commit_v6(&s, &empty_store, 0)?;
         persistence.commit_notify().notify_waiters();
         s
     };
