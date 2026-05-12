@@ -60,7 +60,7 @@ fn per_shard_re_encode_cost_per_cell() {
 
         // Re-encode a single shard repeatedly without re-running setup; mutate
         // shard bytes between samples to avoid CPU-side caching artefacts.
-        let mut encoded_db = state.encoded_db.clone();
+        let mut encoded_db = (*state.encoded_db).clone();
         let total_shards = encoded_db.shards.len();
         let entries_per_shard = encoded_db.config.entries_per_shard() as usize;
         let shard_byte_len = entries_per_shard.checked_mul(*record_bytes).expect("ov");

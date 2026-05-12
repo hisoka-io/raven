@@ -52,7 +52,7 @@ fn swap_state_with_matching_seed_carries_cache_under_50ms() {
     for iter in 0..MEASURED_ITERS {
         let donor = instance.current_state();
         let crs_clone = (*donor.crs).clone();
-        let db_clone = donor.encoded_db.clone();
+        let db_clone = (*donor.encoded_db).clone();
         let variant = donor.variant;
         let entry_size = donor.entry_size;
         let next_epoch = instance.current_epoch().next();
@@ -108,7 +108,7 @@ fn swap_state_with_mismatched_seed_rebuilds_cache_above_baseline() {
             "rebuild test seed mutation must differ from donor seed (iter={iter})"
         );
         crs_clone.inspiring_w_seed = new_seed;
-        let db_clone = donor.encoded_db.clone();
+        let db_clone = (*donor.encoded_db).clone();
         let variant = donor.variant;
         let entry_size = donor.entry_size;
         let next_epoch = instance.current_epoch().next();

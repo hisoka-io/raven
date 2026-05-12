@@ -140,7 +140,7 @@ fn run_one_seed(cell: &Cell, preload_to: u32) -> (Duration, u32) {
     }
     store.clear_dirty_shards();
 
-    let mut encoded_db = state.encoded_db.clone();
+    let mut encoded_db = (*state.encoded_db).clone();
     let cap = LEAVES_PER_TREE.saturating_sub(preload_to);
     let to_take = SAMPLE_INSERTS.min(cap);
     let mut per_insert: Vec<Duration> = Vec::with_capacity(to_take as usize);

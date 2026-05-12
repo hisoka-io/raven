@@ -143,7 +143,7 @@ fn run_migration(dir_path: &std::path::Path, target: EncoderKind) -> Result<(), 
     for shard_id in 0..u32::try_from(shard_count).unwrap_or(u32::MAX) {
         let shard_bytes = encoder.materialize_shard(shard_id, &logical_store);
         re_encode_shard(
-            &mut state.encoded_db,
+            Arc::make_mut(&mut state.encoded_db),
             &state.crs.params,
             shard_id,
             &shard_bytes,

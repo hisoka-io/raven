@@ -14,14 +14,18 @@ use std::sync::Arc;
 
 /// Server state for one InsPIRe instance. Lives behind `PirInstance`'s ArcSwap.
 ///
-/// `crs`, `cache`, `session_store` are `Arc`-shared across re-encode swaps so
-/// re-preprocess avoids rebuilding the O(d^3) cache and preserves sticky sessions.
-/// `encoded_db` is owned so `drive_commit` can mutate per-shard polynomials.
+/// `crs`, `cache`, `session_store`, `encoded_db` are all `Arc`-shared across
+/// re-encode swaps so re-preprocess avoids rebuilding the O(d^3) cache and
+/// preserves sticky sessions. `Arc::make_mut` triggers a Vec memcpy IFF other
+/// `Arc`s are alive (in-flight queries holding the donor state); bounded to
+/// once per `drive_commit` re-encode batch.
 pub struct InspireServerState {
     /// Public CRS.
     pub crs: Arc<ServerCrs>,
-    /// Encoded shard polynomials. Owned; mutated per dirty shard at commit.
-    pub encoded_db: EncodedDatabase,
+    /// Encoded shard polynomials. Mutated per dirty shard at commit via
+    /// `Arc::make_mut`. Wrapped in `Arc` so same-shape rebuilds carry the
+    /// buffer via `Arc::clone` without paying a ~128 MiB `Vec` memcpy.
+    pub encoded_db: Arc<EncodedDatabase>,
     /// Pre-warmed packing keys. `Arc`-shared; rebuilt only on cell-shape change.
     pub cache: Arc<ServerInspiringCache>,
     /// Per-instance session store. `Arc`-shared so sessions survive re-encode swaps.
@@ -48,6 +52,15 @@ impl InspireServerState {
     /// Shard config needed by clients to build queries.
     pub fn shard_config(&self) -> &ShardConfig {
         &self.encoded_db.config
+    }
+
+    /// Borrow the encoded database directly. Useful for call sites that
+    /// need an explicit `&EncodedDatabase` (deref coercion of
+    /// `&Arc<EncodedDatabase>` works in argument position but not in
+    /// `let`-bindings).
+    #[must_use]
+    pub fn encoded_db(&self) -> &EncodedDatabase {
+        &self.encoded_db
     }
 }
 
@@ -88,7 +101,7 @@ pub fn setup_state(
     Ok((
         InspireServerState {
             crs: Arc::new(crs),
-            encoded_db,
+            encoded_db: Arc::new(encoded_db),
             cache: Arc::new(cache),
             session_store: Arc::new(session_store),
             variant,
@@ -158,7 +171,7 @@ pub fn swap_state(
         };
     let new_state = InspireServerState {
         crs,
-        encoded_db,
+        encoded_db: Arc::new(encoded_db),
         cache,
         session_store: Arc::new(ServerSessionStore::new()),
         variant,
@@ -263,7 +276,7 @@ impl std::fmt::Debug for PersistedInspireState {
 pub fn snapshot_inspire_state(state: &InspireServerState) -> Result<Vec<u8>> {
     let bundle = PersistedInspireState {
         crs: (*state.crs).clone(),
-        encoded_db: state.encoded_db.clone(),
+        encoded_db: (*state.encoded_db).clone(),
         variant: state.variant,
         entry_size: state.entry_size,
     };
@@ -280,7 +293,7 @@ pub fn restore_inspire_state(bytes: &[u8]) -> Result<InspireServerState> {
     let session_store = ServerSessionStore::new();
     Ok(InspireServerState {
         crs: Arc::new(bundle.crs),
-        encoded_db: bundle.encoded_db,
+        encoded_db: Arc::new(bundle.encoded_db),
         cache: Arc::new(cache),
         session_store: Arc::new(session_store),
         variant: bundle.variant,
@@ -1161,6 +1174,7 @@ mod logical_store_tests {
 mod re_encode_tests {
     use super::{re_encode_shard, setup_state, InspireVariant};
     use raven_inspire::params::InspireParams;
+    use std::sync::Arc;
 
     #[test]
     fn re_encode_matches_fresh_encode() {
@@ -1191,8 +1205,14 @@ mod re_encode_tests {
             .get(..shard_bytes_len)
             .expect("db slice for shard 0")
             .to_vec();
-        re_encode_shard(&mut state.encoded_db, &params, 0, &shard_bytes, entry_size)
-            .expect("re_encode_shard");
+        re_encode_shard(
+            Arc::make_mut(&mut state.encoded_db),
+            &params,
+            0,
+            &shard_bytes,
+            entry_size,
+        )
+        .expect("re_encode_shard");
 
         let new_polys = &state
             .encoded_db
@@ -1243,8 +1263,14 @@ mod re_encode_tests {
         if let Some(b) = shard_bytes.get_mut(7) {
             *b ^= 0xff;
         }
-        re_encode_shard(&mut state.encoded_db, &params, 0, &shard_bytes, entry_size)
-            .expect("re_encode_shard");
+        re_encode_shard(
+            Arc::make_mut(&mut state.encoded_db),
+            &params,
+            0,
+            &shard_bytes,
+            entry_size,
+        )
+        .expect("re_encode_shard");
 
         let new_polys = &state
             .encoded_db
@@ -1304,8 +1330,14 @@ mod re_encode_tests {
             .get(shard_bytes_len..2 * shard_bytes_len)
             .expect("shard 1 byte range")
             .to_vec();
-        re_encode_shard(&mut state.encoded_db, &params, 1, &shard_bytes, entry_size)
-            .expect("re_encode_shard k=1");
+        re_encode_shard(
+            Arc::make_mut(&mut state.encoded_db),
+            &params,
+            1,
+            &shard_bytes,
+            entry_size,
+        )
+        .expect("re_encode_shard k=1");
 
         let new_shard1 = &state
             .encoded_db
@@ -1334,8 +1366,14 @@ mod re_encode_tests {
             .collect();
         let (mut state, _sk) =
             setup_state(&params, &db, entry_size, InspireVariant::TwoPacking).expect("setup_state");
-        let err = re_encode_shard(&mut state.encoded_db, &params, 999, &[], entry_size)
-            .expect_err("unknown shard id");
+        let err = re_encode_shard(
+            Arc::make_mut(&mut state.encoded_db),
+            &params,
+            999,
+            &[],
+            entry_size,
+        )
+        .expect_err("unknown shard id");
         let msg = format!("{err}");
         assert!(
             msg.contains("999"),

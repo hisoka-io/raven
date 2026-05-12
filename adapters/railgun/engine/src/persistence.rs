@@ -1072,7 +1072,9 @@ fn drive_commit(
         return Ok(());
     }
 
-    // Clone encoded_db before re-encoding — must not corrupt the Arc in-flight queries read.
+    // Take an `Arc<EncodedDatabase>` from the donor state. `Arc::make_mut`
+    // below triggers a Vec memcpy IFF other Arcs are alive (e.g. an in-flight
+    // query holding the donor); bounded to once per drive_commit batch.
     let current = instance.current_state();
     let entries_per_shard = u32::try_from(
         current
@@ -1085,13 +1087,51 @@ fn drive_commit(
     let entry_size = current.entry_size;
 
     let _ = entries_per_shard;
-    let mut new_db = current.encoded_db.clone();
+    let mut new_db = Arc::clone(&current.encoded_db);
+    let instance_label = instance.id.as_str().to_owned();
     for shard_id in dirty {
         let bytes = {
             let store = logical_store.lock();
             encoder.materialize_shard(shard_id, &store)
         };
-        super::inspire::re_encode_shard(&mut new_db, params, shard_id, &bytes, entry_size)?;
+        match super::inspire::re_encode_shard(
+            Arc::make_mut(&mut new_db),
+            params,
+            shard_id,
+            &bytes,
+            entry_size,
+        ) {
+            Ok(()) => {}
+            Err(AdapterError::ShardOutOfRange {
+                shard_id: oor_id,
+                db_shard_count,
+            }) => {
+                // Structurally unencodable: the shard id is past the
+                // EncodedDatabase shard count for this instance. Drop it
+                // from `dirty_shards` to break the retry loop that would
+                // otherwise bump `consumer_errors` once per commit cadence
+                // trigger forever. Cardinality-bounded metric: only the
+                // `instance` label is dim'd; per-shard forensic detail is
+                // preserved in the tracing line below.
+                let removed = logical_store.lock().drop_dirty_shard(oor_id);
+                if removed {
+                    tracing::error!(
+                        instance_id = %instance_label,
+                        shard_id = oor_id,
+                        db_shard_count,
+                        "drive_commit: dropping unsatisfiable dirty shard \
+                         (id past EncodedDatabase shard count); subsequent \
+                         commits will not retry this shard"
+                    );
+                    metrics::counter!(
+                        "raven_railgun_unsatisfiable_dirty_shards_total",
+                        "instance" => instance_label.clone(),
+                    )
+                    .increment(1);
+                }
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     let new_state = super::inspire::InspireServerState {

@@ -237,7 +237,7 @@ fn re_encode_all_shards(prep: &mut PreparedMigration) {
             .encoder
             .materialize_shard(shard_id, &prep.logical_store);
         re_encode_shard(
-            &mut prep.state.encoded_db,
+            Arc::make_mut(&mut prep.state.encoded_db),
             &prep.state.crs.params,
             shard_id,
             &shard_bytes,

@@ -79,7 +79,7 @@ fn admin_swap_state_clears_session_store() {
         let donor = instance.current_state();
         (
             (*donor.crs).clone(),
-            donor.encoded_db.clone(),
+            (*donor.encoded_db).clone(),
             donor.variant,
             donor.entry_size,
             instance.current_epoch().next(),
@@ -150,7 +150,7 @@ fn drive_commit_path_preserves_session_store() {
         let current = instance.current_state();
         InspireServerState {
             crs: Arc::clone(&current.crs),
-            encoded_db: current.encoded_db.clone(),
+            encoded_db: Arc::clone(&current.encoded_db),
             cache: Arc::clone(&current.cache),
             session_store: Arc::clone(&current.session_store),
             variant: current.variant,

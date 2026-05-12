@@ -72,7 +72,7 @@ fn t3_pir_query_recovers_path_byte_identical_and_reconstructs_imt_root() {
     }
 
     let dirty: Vec<u32> = store.dirty_shards().iter().copied().collect();
-    let mut encoded_db = server_state.encoded_db.clone();
+    let mut encoded_db = (*server_state.encoded_db).clone();
     for shard_id in dirty {
         let bytes = encoder.materialize_shard(shard_id, &store);
         re_encode_shard(&mut encoded_db, &params, shard_id, &bytes, ENTRY_BYTES)
@@ -81,7 +81,7 @@ fn t3_pir_query_recovers_path_byte_identical_and_reconstructs_imt_root() {
 
     let live_state = raven_railgun_engine::inspire::InspireServerState {
         crs: Arc::clone(&server_state.crs),
-        encoded_db,
+        encoded_db: Arc::new(encoded_db),
         cache: Arc::clone(&server_state.cache),
         session_store: Arc::clone(&server_state.session_store),
         variant: server_state.variant,
