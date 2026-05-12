@@ -202,6 +202,41 @@ struct GlobalSection {
     /// surface via `/v1/health/ready.chain_source_mode`.
     #[serde(default)]
     ws_endpoint: Option<String>,
+    /// Operator-tunable per-IP rate limit (requests per second).
+    /// `HttpConfig::demo()` ships 200; override here for production
+    /// deployments expecting heavier scrape / wallet traffic.
+    #[serde(default)]
+    rate_limit_rps: Option<u64>,
+    /// Operator-tunable per-IP burst budget (token bucket capacity).
+    /// `HttpConfig::demo()` ships 400.
+    #[serde(default)]
+    rate_limit_burst: Option<u32>,
+    /// Explicit CORS allow-origin list. Empty (default) leaves CORS
+    /// off entirely; non-empty enables CORS for the listed origins.
+    /// Wildcard `*` and empty strings are rejected at `HttpConfig`
+    /// validation. Required for browser wallet integrations.
+    #[serde(default)]
+    cors_allowed_origins: Option<Vec<String>>,
+    /// Trust `X-Forwarded-For` / `cf-connecting-ip` for the rate-
+    /// limit key extractor. Only safe behind a trusted reverse proxy
+    /// that strips client-supplied headers.
+    #[serde(default)]
+    trust_proxy_header: Option<bool>,
+    /// Expose `/metrics` without bearer auth. Default `false`
+    /// (`HttpConfig::demo()` default-deny). Set `true` for a
+    /// scrape-only Prometheus instance reachable only via private
+    /// network.
+    #[serde(default)]
+    metrics_public: Option<bool>,
+    /// Periodic heartbeat session-eviction interval in seconds.
+    /// `HttpConfig::demo()` ships 3600. `0` disables.
+    #[serde(default)]
+    session_eviction_interval_secs: Option<u64>,
+    /// Optional `(block_number, block_hash)` sidecar path for the
+    /// Layer 1 reorg-window cache. Persistent across restart; absent
+    /// = ephemeral cache (each boot rebuilds from RPC).
+    #[serde(default)]
+    reorg_window_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -314,6 +349,23 @@ pub struct MultiServeOptions {
     /// WebSocket endpoint for chain indexer primary transport (HTTP RPC is used as fallback).
     /// `None` keeps the existing HTTP-only indexer behavior.
     pub ws_endpoint: Option<String>,
+    /// `HttpConfig.rate_limit_rps` override (`None` keeps the demo default).
+    pub rate_limit_rps: Option<u64>,
+    /// `HttpConfig.rate_limit_burst` override (`None` keeps the demo default).
+    pub rate_limit_burst: Option<u32>,
+    /// `HttpConfig.cors_allowed_origins` override. Empty `Vec` is the same as `None`.
+    pub cors_allowed_origins: Option<Vec<String>>,
+    /// `HttpConfig.trust_proxy_header` override.
+    pub trust_proxy_header: Option<bool>,
+    /// `HttpConfig.metrics_public` override.
+    pub metrics_public: Option<bool>,
+    /// `HttpConfig.session_eviction_interval_secs` override (also drives the
+    /// per-instance heartbeat ticker in `serve_production_multi::run`).
+    pub session_eviction_interval_secs: Option<u64>,
+    /// Persistent path for the indexer Layer 1 reorg-window cache. Absent
+    /// = ephemeral. When set, the indexer worker bootstrapps from the
+    /// sidecar at open and rebuilds via RPC on stale-top mismatch.
+    pub reorg_window_path: Option<PathBuf>,
 }
 
 pub type BootstrapObserver = Arc<parking_lot::Mutex<Option<BootstrapView>>>;
@@ -580,6 +632,13 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         tree_fill_threshold: parsed.global.tree_fill_threshold,
         reload_config_path: Some(path.to_path_buf()),
         ws_endpoint: parsed.global.ws_endpoint,
+        rate_limit_rps: parsed.global.rate_limit_rps,
+        rate_limit_burst: parsed.global.rate_limit_burst,
+        cors_allowed_origins: parsed.global.cors_allowed_origins,
+        trust_proxy_header: parsed.global.trust_proxy_header,
+        metrics_public: parsed.global.metrics_public,
+        session_eviction_interval_secs: parsed.global.session_eviction_interval_secs,
+        reorg_window_path: parsed.global.reorg_window_path,
     })
 }
 
@@ -846,6 +905,24 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     let mut http_config = HttpConfig::demo(opts.token.clone());
     http_config.max_concurrent_queries = opts.max_concurrent_queries.max(1);
     http_config.respond_timeout_secs = opts.respond_timeout_secs;
+    if let Some(rps) = opts.rate_limit_rps {
+        http_config.rate_limit_rps = rps;
+    }
+    if let Some(burst) = opts.rate_limit_burst {
+        http_config.rate_limit_burst = burst;
+    }
+    if let Some(origins) = opts.cors_allowed_origins.clone() {
+        http_config.cors_allowed_origins = origins;
+    }
+    if let Some(trust) = opts.trust_proxy_header {
+        http_config.trust_proxy_header = trust;
+    }
+    if let Some(public) = opts.metrics_public {
+        http_config.metrics_public = public;
+    }
+    if let Some(secs) = opts.session_eviction_interval_secs {
+        http_config.session_eviction_interval_secs = secs;
+    }
 
     let app_state =
         AppState::new(engine, http_config).map_err(|e| anyhow::anyhow!("AppState::new: {e}"))?;
@@ -1838,6 +1915,7 @@ async fn spawn_chain_indexer(
     let worker_config = IndexerWorkerConfig {
         start_block: opts.start_block,
         poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
+        reorg_window_path: opts.reorg_window_path.clone(),
         ..IndexerWorkerConfig::default()
     };
     let handle = tokio::spawn(async move {

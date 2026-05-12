@@ -188,6 +188,13 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
         tree_fill_threshold: None,
         reload_config_path: None,
         ws_endpoint: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        cors_allowed_origins: None,
+        trust_proxy_header: None,
+        metrics_public: None,
+        session_eviction_interval_secs: None,
+        reorg_window_path: None,
     };
 
     let (stop_tx, stop_rx) = oneshot::channel::<()>();

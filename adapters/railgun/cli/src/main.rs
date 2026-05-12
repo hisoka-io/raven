@@ -132,13 +132,19 @@ enum Commands {
         /// credential as wallet clients. Set this flag to opt-in for a
         /// scrape-only Prometheus instance with no shared secret.
         /// `/metrics` always bypasses the per-IP rate limiter; this
-        /// flag controls only the auth requirement. Honored on the
-        /// `--config` path once `MultiServeOptions.metrics_public`
-        /// plumbing lands; on the single-instance path a warning is
-        /// emitted because `ProductionServeOptions` does not yet
-        /// surface the override.
+        /// flag controls only the auth requirement. Honored on both
+        /// the `--config` (multi-instance) and single-instance paths
+        /// via the TOML/CLI -> HttpConfig override plumbing.
         #[arg(long, default_value_t = false)]
         metrics_public: bool,
+        /// Periodic heartbeat session-eviction interval (seconds).
+        /// `0` disables. Default 3600. Symmetric with multi-instance:
+        /// the runtime rebuilds the in-memory `ServerSessionStore` from
+        /// scratch each tick so resident memory is bounded under
+        /// sustained bearer churn at the cost of dropping live
+        /// sessions once per interval.
+        #[arg(long, default_value_t = 3600)]
+        session_eviction_interval_secs: u64,
     },
     /// Print engine status by curling /v1/status against a running server.
     Status {
@@ -406,6 +412,7 @@ async fn main() -> anyhow::Result<()> {
             tree_number,
             ws_endpoint,
             metrics_public,
+            session_eviction_interval_secs,
         } => {
             if let Some(path) = config {
                 let mut opts =
@@ -414,18 +421,7 @@ async fn main() -> anyhow::Result<()> {
                     opts.ws_endpoint = ws_endpoint;
                 }
                 if metrics_public {
-                    // `MultiServeOptions::metrics_public` is not yet
-                    // plumbed in this port slice; the CLI flag is
-                    // accepted for forward-compatibility but cannot
-                    // override the TOML / `HttpConfig::demo` default
-                    // until the corresponding field lands on
-                    // `MultiServeOptions` and flows into `HttpConfig`.
-                    tracing::warn!(
-                        "--metrics-public set but MultiServeOptions does not yet \
-                         expose this override; /metrics will remain default-deny. \
-                         Set metrics_public in HttpConfig directly until the \
-                         override path lands."
-                    );
+                    opts.metrics_public = Some(true);
                 }
                 return raven_railgun_cli::serve_production_multi::run(opts).await;
             }
@@ -433,17 +429,6 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!(
                     "--ws-endpoint is multi-instance only; pass --config <toml> alongside it. \
                      The single-instance path uses RpcChainSource directly without WS."
-                );
-            }
-            if metrics_public {
-                // Same forward-compat rationale: the single-instance
-                // `ProductionServeOptions` does not yet surface a
-                // `metrics_public` override field. Warn so operator
-                // intent is preserved in logs without silent drop.
-                tracing::warn!(
-                    "--metrics-public set but ProductionServeOptions does not yet \
-                     expose this override on the single-instance path; /metrics \
-                     will remain default-deny."
                 );
             }
             let encoder_kind = parse_encoder_kind(&encoder, tree_number, &list_key)?;
@@ -469,6 +454,8 @@ async fn main() -> anyhow::Result<()> {
                 entries,
                 entry_bytes,
                 encoder: encoder_kind,
+                session_eviction_interval_secs,
+                metrics_public,
             };
             raven_railgun_cli::serve_production::run(opts).await
         }
@@ -515,14 +502,12 @@ async fn main() -> anyhow::Result<()> {
             };
             raven_railgun_cli::snapshot_port::run_export(opts)
         }
-        Commands::PruneSnapshots { data_dir, keep } => {
-            raven_railgun_cli::snapshot_port::run_prune(
-                raven_railgun_cli::snapshot_port::PruneOptions {
-                    data_dir,
-                    keep_snapshots: keep,
-                },
-            )
-        }
+        Commands::PruneSnapshots { data_dir, keep } => raven_railgun_cli::snapshot_port::run_prune(
+            raven_railgun_cli::snapshot_port::PruneOptions {
+                data_dir,
+                keep_snapshots: keep,
+            },
+        ),
         Commands::ImportSnapshot {
             input,
             data_dir,

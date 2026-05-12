@@ -334,7 +334,10 @@ pub fn run_export(opts: ExportOptions) -> anyhow::Result<()> {
 /// `snapshots_dir` is also a no-op (cron-friendly: the pruner can race
 /// the directory's creation). Returns the count of tarballs removed
 /// (excluding `.sig` sidecars).
-pub fn prune_old_export_tarballs(snapshots_dir: &Path, keep_last_n: usize) -> anyhow::Result<usize> {
+pub fn prune_old_export_tarballs(
+    snapshots_dir: &Path,
+    keep_last_n: usize,
+) -> anyhow::Result<usize> {
     if keep_last_n == 0 {
         return Ok(0);
     }
