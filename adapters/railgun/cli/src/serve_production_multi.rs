@@ -1128,7 +1128,17 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         driver.abort();
     }
 
-    drop(chain_workers);
+    // Cooperative drain of the `mode_mirror` task so a panicked mirror
+    // surfaces as a join error in the log instead of being silently
+    // swallowed by `abort()`. The 5s timeout is generous given the
+    // 1s tick cadence; falls through to `abort()` via `Drop` on the
+    // worker JoinHandles themselves.
+    if let Some(mut workers) = chain_workers {
+        workers
+            .shutdown_mode_mirror(std::time::Duration::from_secs(5))
+            .await;
+        drop(workers);
+    }
     drop(mirror_workers);
 
     Ok(())
@@ -1911,7 +1921,6 @@ impl ChainWorkers {
     /// dropping `Self` to avoid an unconditional `JoinHandle::abort()`
     /// that hides panics from observation. Returns `true` if the task
     /// observed the signal and exited cleanly, `false` on timeout.
-    #[allow(dead_code)]
     async fn shutdown_mode_mirror(&mut self, timeout: std::time::Duration) -> bool {
         let Some(handle) = self.mode_mirror.take() else {
             return true;

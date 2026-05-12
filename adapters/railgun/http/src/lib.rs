@@ -359,6 +359,10 @@ fn build_cors_layer(allowed_origins: &[String]) -> Option<CorsLayer> {
                 http::HeaderName::from_static("x-raven-scheme"),
                 http::HeaderName::from_static("x-raven-schema-version"),
                 http::HeaderName::from_static("x-raven-session"),
+                // Rate-limit metadata so browser callers can back off
+                // precisely on 429 instead of guessing exponential delays.
+                http::HeaderName::from_static("x-ratelimit-after"),
+                http::HeaderName::from_static("retry-after"),
             ]),
     )
 }
