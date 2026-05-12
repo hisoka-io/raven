@@ -5,7 +5,10 @@
 
 pub mod auto_spawn;
 pub mod auto_spawn_driver;
+pub mod bootstrap_chainalysis;
+pub mod bootstrap_subsquid;
 pub mod migrate_encoder;
+pub mod rpc_pool_array_config;
 pub mod serve_production;
 pub mod serve_production_multi;
 pub mod snapshot_port;

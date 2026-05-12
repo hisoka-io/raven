@@ -20,6 +20,7 @@ raven-railgun-core = { workspace = true }
 raven-railgun-engine = { workspace = true }
 raven-railgun-http = { workspace = true }
 raven-railgun-indexer = { workspace = true }
+raven-railgun-poseidon = { workspace = true }
 raven-railgun-ppoi-mirror = { workspace = true }
 raven-railgun-persistence = { workspace = true }
 raven-inspire = { workspace = true }

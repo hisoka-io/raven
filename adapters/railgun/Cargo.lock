@@ -3665,6 +3665,7 @@ dependencies = [
  "raven-railgun-http",
  "raven-railgun-indexer",
  "raven-railgun-persistence",
+ "raven-railgun-poseidon",
  "raven-railgun-ppoi-mirror",
  "reqwest 0.12.28",
  "serde",
