@@ -1536,103 +1536,13 @@ mod tests {
             "fresh open() must register TYPE metadata at module init; got render:\n{rendered}"
         );
     }
-
-    // Intra-binary `metrics::set_global_recorder` ordering flake. Passes
-    // in isolation (`cargo test ... poisoned_wal_replay_skipped_counter_increments`);
-    // fails when other tests in this lib binary install / re-use the
-    // global Prometheus recorder via the same `OnceLock` — their
-    // increments observe the recorder but render against a stale
-    // handle, leaving this test's counter line at 0. Documented in
-    // PHASE3_AUDIT.md §5 + PHASE_FINAL_AUDIT.md and re-confirmed on
-    // pre-fix HEAD: not introduced by any Phase 2-5 change. To
-    // re-verify the production-path increment locally:
-    //   cargo test -p raven-railgun-engine --lib \
-    //     persistence::tests::poisoned_wal_replay_skipped_counter_increments \
-    //     -- --exact --include-ignored
-    #[test]
-    #[ignore = "intra-binary metrics recorder ordering flake; see comment"]
-    fn poisoned_wal_replay_skipped_counter_increments() {
-        let handle = shared_prometheus_handle();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let valid = {
-            let mut b = [0u8; 32];
-            b[31] = 0x07;
-            b
-        };
-        {
-            let layout = StoreLayout::open(dir.path()).expect("layout 1");
-            let opened = InspirePersistence::open(
-                layout,
-                SCHEME_TAG,
-                InstanceId::new("counter-test"),
-                SnapshotPolicy::default(),
-                test_encoder(),
-            )
-            .expect("open 1");
-            opened
-                .persistence
-                .apply_event(
-                    &WalEntryPayload::AppendLeaf {
-                        tree_number: 0,
-                        leaf_index: 0,
-                        commitment: valid,
-                    },
-                    100,
-                )
-                .expect("apply seq 0");
-            opened
-                .persistence
-                .apply_event(
-                    &WalEntryPayload::AppendLeaf {
-                        tree_number: 0,
-                        leaf_index: 9, // sparse - rejected on replay
-                        commitment: valid,
-                    },
-                    101,
-                )
-                .expect("apply poisoned seq 1");
-        }
-
-        let layout2 = StoreLayout::open(dir.path()).expect("layout 2");
-        let _opened2 = InspirePersistence::open(
-            layout2,
-            SCHEME_TAG,
-            InstanceId::new("counter-test"),
-            SnapshotPolicy::default(),
-            test_encoder(),
-        )
-        .expect("open 2");
-
-        let rendered = handle.render();
-        let value_line = rendered
-            .lines()
-            .find(|line| {
-                line.starts_with("raven_railgun_wal_replay_skipped_total ")
-                    && !line.starts_with("# ")
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "Prometheus render must surface the counter VALUE line \
-                     after a poisoned-WAL recovery; got render:\n{rendered}"
-                )
-            });
-        let value: u64 = value_line
-            .split_whitespace()
-            .last()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| {
-                panic!(
-                    "counter value must parse as u64 from line {value_line:?}; \
-                     got render:\n{rendered}"
-                )
-            });
-        assert!(
-            value >= 1,
-            "counter value must be >=1 after poisoned-WAL recovery, got {value}; \
-             if 0, the production-path metrics::counter!(...).increment(replay_skipped) \
-             was never reached; got render:\n{rendered}"
-        );
-    }
+    // The poisoned-WAL counter-increment assertion lives in its own
+    // integration-test binary at
+    // `engine/tests/poisoned_wal_replay_counter.rs`. Running it as a
+    // standalone binary gives the test a fresh process + a fresh
+    // first-time `metrics_exporter_prometheus::PrometheusBuilder::install_recorder`
+    // call, free of cross-test rendering races against the lib-test
+    // binary's shared `OnceLock`-cached Prometheus handle.
 
     #[test]
     fn apply_event_increments_seq_and_triggers_when_cap_reached() {

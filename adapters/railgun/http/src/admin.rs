@@ -238,6 +238,7 @@ pub(crate) async fn session_establish_handler(
     ))
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn params_handler(
     State(app): State<AppState<RavenInspireScheme>>,
     Path(id): Path<String>,
@@ -248,9 +249,64 @@ pub(crate) async fn params_handler(
         .engine
         .instance(&instance_id)
         .ok_or(StatusCode::NOT_FOUND)?;
+    let epoch = instance.current_epoch();
+
+    // Fast-path 304: when the cache already has a SHA for the current
+    // `(instance_id, epoch)` AND the caller's `If-None-Match` matches,
+    // we can skip body serialization entirely. CRS bincode at the
+    // production cell is multi-MB; this saves both the CPU + the
+    // allocation on every revalidation against an unchanged epoch.
+    let cached_etag_value = {
+        let guard = app.params_etag_cache.read();
+        guard
+            .get(&instance_id)
+            .filter(|(stored_epoch, _)| *stored_epoch == epoch)
+            .map(|(_, hash)| format!("\"{}\"", to_hex_lower(hash)))
+    };
+    let if_none_match = headers_in
+        .get(http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    if let (Some(cached_value), Some(provided)) = (cached_etag_value.as_ref(), if_none_match.as_ref())
+    {
+        if cached_value == provided {
+            let mut hdrs = HeaderMap::new();
+            hdrs.insert(
+                X_RAVEN_EPOCH,
+                HeaderValue::from_str(&epoch.0.to_string())
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            );
+            hdrs.insert(
+                X_RAVEN_SCHEME,
+                HeaderValue::from_str(&app.scheme_name)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            );
+            hdrs.insert(
+                http::header::ETAG,
+                HeaderValue::from_str(cached_value)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            );
+            hdrs.insert(
+                http::header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=86400, immutable"),
+            );
+            hdrs.insert(
+                http::header::VARY,
+                HeaderValue::from_static("Authorization"),
+            );
+            hdrs.insert(
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            return Ok((StatusCode::NOT_MODIFIED, hdrs, Bytes::new()));
+        }
+    }
+
+    // Cache miss OR caller's ETag is stale: serialize the body and
+    // populate the cache so the next revalidation against the same
+    // epoch hits the fast-path above.
     let state = instance.current_state();
     let state: &InspireServerState = state.as_ref();
-    let epoch = instance.current_epoch();
     let crs_bincode =
         bincode::serialize(&state.crs).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let shard_config_bincode = bincode::serialize(&state.encoded_db.config)
@@ -268,35 +324,27 @@ pub(crate) async fn params_handler(
     };
     let body = write_versioned(&payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // ETag is the SHA-256 of the full response body. Cache it keyed on
-    // `InstanceId` with `(epoch, sha256)` payload so an epoch bump
-    // invalidates the prior entry without growing the map. The cache
-    // lives on the per-process `AppState` so test isolation matches
-    // production isolation.
-    let cached = {
-        let guard = app.params_etag_cache.read();
-        guard
-            .get(&instance_id)
-            .filter(|(stored_epoch, _)| *stored_epoch == epoch)
-            .map(|(_, hash)| *hash)
-    };
-    let sha = if let Some(hit) = cached {
-        hit
+    // ETag = SHA-256 of the body. Cache keyed on `InstanceId` with
+    // `(epoch, sha256)` payload so an epoch bump invalidates the prior
+    // entry without growing the map; the cache lives on the per-process
+    // `AppState` so test isolation matches production isolation.
+    let sha = if let Some(value) = cached_etag_value.as_ref() {
+        // Cache hit on epoch but ETag string did not match the caller's
+        // If-None-Match (or no If-None-Match was supplied). Re-derive
+        // the bytes by re-parsing the cached hex — cheap relative to
+        // re-hashing the freshly-serialized body.
+        parse_hex_sha(value).unwrap_or_else(|| sha256_of(&body))
     } else {
-        use sha2::{Digest, Sha256};
-        let digest = Sha256::digest(&body);
-        let mut fresh = [0u8; 32];
-        fresh.copy_from_slice(digest.as_slice());
+        let fresh = sha256_of(&body);
         let mut guard = app.params_etag_cache.write();
         guard.insert(instance_id.clone(), (epoch, fresh));
         fresh
     };
     let etag_value = format!("\"{}\"", to_hex_lower(&sha));
 
-    let if_none_match = headers_in
-        .get(http::header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok());
-    let etag_matches = if_none_match.is_some_and(|v| v == etag_value);
+    let etag_matches = if_none_match
+        .as_deref()
+        .is_some_and(|v| v == etag_value);
 
     let mut hdrs = HeaderMap::new();
     hdrs.insert(
@@ -329,6 +377,37 @@ pub(crate) async fn params_handler(
         return Ok((StatusCode::NOT_MODIFIED, hdrs, Bytes::new()));
     }
     Ok((StatusCode::OK, hdrs, body.into()))
+}
+
+fn sha256_of(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_slice());
+    out
+}
+
+fn parse_hex_sha(quoted: &str) -> Option<[u8; 32]> {
+    let inner = quoted.strip_prefix('"').and_then(|s| s.strip_suffix('"'))?;
+    if inner.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, dst) in out.iter_mut().enumerate() {
+        let hi = char_to_nibble(inner.as_bytes().get(i * 2).copied()?)?;
+        let lo = char_to_nibble(inner.as_bytes().get(i * 2 + 1).copied()?)?;
+        *dst = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn char_to_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Lowercase hex encoding of a 32-byte SHA-256 digest. Avoids pulling
