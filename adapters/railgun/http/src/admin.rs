@@ -1,5 +1,7 @@
 //! Admin drain/undrain handlers and inspire-specific session/params handlers.
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -9,12 +11,12 @@ use axum::{
 };
 use bytes::Bytes;
 use raven_inspire::inspiring::ClientPackingKeys;
-use raven_railgun_core::InstanceId;
+use raven_railgun_core::{Epoch, InstanceId};
 use raven_railgun_engine::inspire::{InspireServerState, RavenInspireScheme};
 use raven_railgun_engine::{DrainState, PirScheme};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{ct_eq_str, EvictionOutcome, SessionKey};
+use crate::auth::{ct_eq_str, parse_client_id_header, EvictionOutcome, SessionKey};
 use crate::state::AppState;
 use crate::versioned::{read_versioned, write_versioned, WIRE_SCHEMA_VERSION};
 use crate::{X_RAVEN_EPOCH, X_RAVEN_SCHEME, X_RAVEN_SESSION};
@@ -129,12 +131,41 @@ pub struct InstanceParams {
     pub crs_bincode: Vec<u8>,
     /// Bincode-encoded [`raven_inspire::params::ShardConfig`].
     pub shard_config_bincode: Vec<u8>,
+    /// Bincode-encoded [`raven_inspire::params::InspireParams`]. Sourced
+    /// from the live [`InspireServerState`]'s CRS so the bytes always
+    /// match the operator-configured cell shape (rather than re-deriving
+    /// from a hard-coded preset). Wallets feed this directly into the
+    /// WASM client's `build_instance_params_blob` helper to derive the
+    /// RLWE secret key and assemble a [`raven_inspire::ClientSession`]
+    /// without needing a side-channel param distribution.
+    pub inspire_params_bincode: Vec<u8>,
     /// Plaintext entry size in bytes.
     pub entry_size: usize,
     /// InsPIRe variant the server is running.
     pub variant: String,
     /// Current snapshot epoch.
     pub epoch: u64,
+}
+
+/// Process-global ETag cache for `GET /v1/instance/{id}/params`.
+///
+/// Keyed by `(InstanceId, Epoch)` so SHA-256 is amortised across the
+/// per-epoch-stable response body. Entries are obsolete the moment the
+/// epoch bumps (via `swap_state` or heartbeat eviction) but are not
+/// proactively pruned — staleness is benign because the cache key
+/// pins the epoch, so a stale entry can never be looked up.
+///
+/// The cache lives in a private `OnceLock` so callers do not need an
+/// `AppState` field. If the orchestrator later wants to hang the cache
+/// off [`crate::AppState`] for explicit teardown control, replace the
+/// `OnceLock` with an `Arc<ParamsEtagCache>` field on `AppState` and
+/// thread it through `params_etag_cache()`. The cache type and key
+/// shape do not need to change for that migration.
+pub(crate) type ParamsEtagCache = parking_lot::RwLock<HashMap<(InstanceId, Epoch), [u8; 32]>>;
+
+fn params_etag_cache() -> &'static ParamsEtagCache {
+    static CACHE: OnceLock<ParamsEtagCache> = OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::RwLock::new(HashMap::new()))
 }
 
 pub(crate) async fn session_establish_handler(
@@ -171,7 +202,8 @@ pub(crate) async fn session_establish_handler(
         .register_server_side(keys, pack_params, &ctx)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let session_key = SessionKey::new(token, instance_id.clone());
+    let client_id = parse_client_id_header(&headers_in);
+    let session_key = SessionKey::new(token, instance_id.clone(), client_id);
     let ttl = Duration::from_secs(app.config.session_ttl_secs);
     let now = Instant::now();
     let expires_at = now + ttl;
@@ -232,6 +264,7 @@ pub(crate) async fn session_establish_handler(
 pub(crate) async fn params_handler(
     State(app): State<AppState<RavenInspireScheme>>,
     Path(id): Path<String>,
+    headers_in: HeaderMap,
 ) -> Result<(StatusCode, HeaderMap, Bytes), StatusCode> {
     let instance_id = InstanceId::new(id);
     let instance = app
@@ -240,28 +273,97 @@ pub(crate) async fn params_handler(
         .ok_or(StatusCode::NOT_FOUND)?;
     let state = instance.current_state();
     let state: &InspireServerState = state.as_ref();
+    let epoch = instance.current_epoch();
     let crs_bincode =
         bincode::serialize(&state.crs).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let shard_config_bincode = bincode::serialize(&state.encoded_db.config)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let inspire_params_bincode =
+        bincode::serialize(&state.crs.params).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let payload = InstanceParams {
         wire_schema_version: WIRE_SCHEMA_VERSION,
         crs_bincode,
         shard_config_bincode,
+        inspire_params_bincode,
         entry_size: state.entry_size,
         variant: format!("{:?}", state.variant),
-        epoch: instance.current_epoch().0,
+        epoch: epoch.0,
     };
     let body = write_versioned(&payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // ETag is the SHA-256 of the full response body. Cache it keyed on
+    // `(instance_id, epoch)` so we skip rehashing the body on every
+    // request at a stable epoch; the entry is invalidated implicitly
+    // when the epoch bumps (cache lookup misses the new key).
+    let cache_key = (instance_id.clone(), epoch);
+    let cached = {
+        let guard = params_etag_cache().read();
+        guard.get(&cache_key).copied()
+    };
+    let sha = if let Some(hit) = cached {
+        hit
+    } else {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(&body);
+        let mut fresh = [0u8; 32];
+        fresh.copy_from_slice(digest.as_slice());
+        let mut guard = params_etag_cache().write();
+        guard.insert(cache_key, fresh);
+        fresh
+    };
+    let etag_value = format!("\"{}\"", to_hex_lower(&sha));
+
+    let if_none_match = headers_in
+        .get(http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+    let etag_matches = if_none_match.is_some_and(|v| v == etag_value);
+
     let mut hdrs = HeaderMap::new();
     hdrs.insert(
         X_RAVEN_EPOCH,
-        HeaderValue::from_str(&instance.current_epoch().0.to_string())
+        HeaderValue::from_str(&epoch.0.to_string())
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
     );
     hdrs.insert(
         X_RAVEN_SCHEME,
         HeaderValue::from_str(&app.scheme_name).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
     );
+    hdrs.insert(
+        http::header::ETAG,
+        HeaderValue::from_str(&etag_value).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    );
+    hdrs.insert(
+        http::header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400, immutable"),
+    );
+    hdrs.insert(
+        http::header::VARY,
+        HeaderValue::from_static("Authorization"),
+    );
+    hdrs.insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+
+    if etag_matches {
+        return Ok((StatusCode::NOT_MODIFIED, hdrs, Bytes::new()));
+    }
     Ok((StatusCode::OK, hdrs, body.into()))
+}
+
+/// Lowercase hex encoding of a 32-byte SHA-256 digest. Avoids pulling
+/// the `hex` crate just for the ETag-formatting path. Bounded loop
+/// over fixed-length input; never panics.
+fn to_hex_lower(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        // `b >> 4` and `b & 0x0f` are bounded to 0..16, well within
+        // the radix-16 contract of `from_digit`; the `unwrap_or('0')`
+        // branch is unreachable but keeps the path panic-free.
+        let hi = char::from_digit(u32::from(b >> 4), 16).unwrap_or('0');
+        let lo = char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0');
+        out.push(hi);
+        out.push(lo);
+    }
+    out
 }
