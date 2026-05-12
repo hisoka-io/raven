@@ -77,6 +77,24 @@ pub struct ExportOptions {
     pub output: PathBuf,
     pub signing_key: Option<PathBuf>,
     pub include_current_wal: bool,
+    /// Retain only the N newest `*.tar.zst` tarballs in the parent
+    /// directory of `output` after a successful write. `0` disables.
+    /// Operator CLI default is 3; tests typically pass `0`.
+    pub keep_snapshots: usize,
+}
+
+/// Options for the standalone `PruneSnapshots` subcommand.
+///
+/// Cron / systemd-timer friendly: the entry point is idempotent, never
+/// touches the live `data_dir` itself, and only inspects `*.tar.zst`
+/// files (plus paired `.sig` sidecars) in the configured directory.
+#[derive(Debug, Clone)]
+pub struct PruneOptions {
+    /// Directory containing `*.tar.zst` export tarballs.
+    pub data_dir: PathBuf,
+    /// Retention floor: keep the N newest tarballs (plus paired `.sig`
+    /// sidecars). `0` disables; `1` keeps only the newest.
+    pub keep_snapshots: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -273,6 +291,135 @@ pub fn run_export(opts: ExportOptions) -> anyhow::Result<()> {
             }
         }
     }
+
+    // Opportunistic retention pass: trim the parent directory to the
+    // configured floor. Best-effort -- a prune failure must NOT fail
+    // the export itself; the operator still has a fresh tarball on
+    // disk. Per-entry failures inside the pruner are warn-logged.
+    if opts.keep_snapshots > 0 {
+        if let Some(parent) = opts.output.parent() {
+            if !parent.as_os_str().is_empty() {
+                match prune_old_export_tarballs(parent, opts.keep_snapshots) {
+                    Ok(removed) => {
+                        if removed > 0 {
+                            tracing::info!(
+                                directory = %parent.display(),
+                                removed,
+                                keep_snapshots = opts.keep_snapshots,
+                                "pruned stale export tarballs"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            directory = %parent.display(),
+                            error = %e,
+                            "post-export prune failed; tarball already written"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Trim the directory to the `keep_last_n` newest `*.tar.zst` files by
+/// modification time. Paired `.sig` sidecars are removed alongside the
+/// tarball they protect. Per-entry failures are logged at `warn` and
+/// do not abort the prune.
+///
+/// `keep_last_n = 0` is a no-op (returns `Ok(0)`). A non-existent
+/// `snapshots_dir` is also a no-op (cron-friendly: the pruner can race
+/// the directory's creation). Returns the count of tarballs removed
+/// (excluding `.sig` sidecars).
+pub fn prune_old_export_tarballs(snapshots_dir: &Path, keep_last_n: usize) -> anyhow::Result<usize> {
+    if keep_last_n == 0 {
+        return Ok(0);
+    }
+    if !snapshots_dir.exists() {
+        return Ok(0);
+    }
+    let read = match std::fs::read_dir(snapshots_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "read_dir snapshots directory {}",
+                snapshots_dir.display()
+            )));
+        }
+    };
+    let mut entries: Vec<(PathBuf, SystemTime)> = Vec::new();
+    for ent in read {
+        let Ok(ent) = ent else {
+            continue;
+        };
+        let path = ent.path();
+        if !path.is_file() {
+            continue;
+        }
+        let is_tarball = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|s| s.ends_with(".tar.zst"));
+        if !is_tarball {
+            continue;
+        }
+        let mtime = match ent.metadata().and_then(|m| m.modified()) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "prune: skipping entry; metadata/mtime unreadable"
+                );
+                continue;
+            }
+        };
+        entries.push((path, mtime));
+    }
+    // Sort newest-first by mtime; tie-break on filename for determinism.
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+    let mut removed = 0usize;
+    for (path, _) in entries.iter().skip(keep_last_n) {
+        let sig = sig_sidecar_path(path);
+        if let Err(e) = std::fs::remove_file(path) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "prune: failed to remove tarball; skipping"
+            );
+            continue;
+        }
+        removed = removed.saturating_add(1);
+        // Best-effort .sig sidecar removal -- absent or transient is fine.
+        match std::fs::remove_file(&sig) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(
+                    path = %sig.display(),
+                    error = %e,
+                    "prune: failed to remove .sig sidecar"
+                );
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// Standalone prune entry point. Suitable for cron / systemd-timer
+/// invocation between exports. Idempotent.
+pub fn run_prune(opts: PruneOptions) -> anyhow::Result<()> {
+    let removed = prune_old_export_tarballs(&opts.data_dir, opts.keep_snapshots)?;
+    tracing::info!(
+        directory = %opts.data_dir.display(),
+        removed,
+        keep_snapshots = opts.keep_snapshots,
+        "run_prune complete"
+    );
     Ok(())
 }
 
