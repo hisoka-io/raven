@@ -5,7 +5,7 @@
 
 #![allow(clippy::too_many_lines, clippy::missing_errors_doc)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -891,10 +891,72 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         *observer.lock() = Some(view);
     }
 
+    // Effective indexer floor: walk every chain-tree instance, take the
+    // MAX of (manifest_block_height, last_block_height) per tree, then
+    // compute `max(toml, recovered)` per tree. Without this map the
+    // single indexer cursor either silently re-scans the prefix below
+    // the recovered floor (toml = 0) OR silently SKIPS events for the
+    // lower-height instances when an operator picks
+    // `start_block = max(all manifest heights)`. Per-tree drop at the
+    // indexer's dispatch site closes both windows.
+    let mut per_tree_recovered: BTreeMap<u32, u64> = BTreeMap::new();
+    for h in &bootstrap.handles.instances {
+        if let DataSourceFilter::ChainTreeNumber(tree) = h.config.data_source {
+            let manifest_height = h.persistence.manifest_block_height();
+            let wal_height = h.logical_store.lock().last_block_height();
+            let height = manifest_height.max(wal_height);
+            per_tree_recovered
+                .entry(tree)
+                .and_modify(|v| *v = (*v).max(height))
+                .or_insert(height);
+        }
+    }
+    let per_tree_start_blocks =
+        compute_effective_start_block_per_tree(opts.start_block, &per_tree_recovered);
+    let min_effective_start_block = per_tree_start_blocks
+        .values()
+        .copied()
+        .min()
+        .unwrap_or(opts.start_block);
+    for (tree, floor) in &per_tree_start_blocks {
+        if *floor > opts.start_block {
+            tracing::info!(
+                tree_number = *tree,
+                toml_start_block = opts.start_block,
+                recovered_floor = *floor,
+                "indexer per-tree start_block raised to recovered manifest floor"
+            );
+        }
+    }
+
+    // Default reorg-window sidecar to a sibling of the first instance's
+    // data_dir so a restart resumes reorg state across operator restarts
+    // without forcing every operator to set `[global].reorg_window_path`.
+    // Operators wanting an explicit path keep the TOML override; those
+    // wanting purely ephemeral behaviour can point the sibling at an
+    // off-disk location.
+    let resolved_reorg_window_path = opts.reorg_window_path.clone().or_else(|| {
+        bootstrap
+            .handles
+            .instances
+            .first()
+            .and_then(|h| h.config.data_dir.parent().map(std::path::Path::to_path_buf))
+            .map(|parent| parent.join("indexer_reorg_window.bin"))
+    });
+
     let chain_workers = if opts.skip_chain_workers {
         None
     } else {
-        Some(spawn_chain_indexer(&opts, bootstrap.handles.channels.indexer_tx.clone()).await?)
+        Some(
+            spawn_chain_indexer(
+                &opts,
+                min_effective_start_block,
+                per_tree_start_blocks.clone(),
+                resolved_reorg_window_path.clone(),
+                bootstrap.handles.channels.indexer_tx.clone(),
+            )
+            .await?,
+        )
     };
     let mirror_workers = if opts.skip_mirror_workers {
         None
@@ -1366,6 +1428,53 @@ async fn run_sighup_reload_loop(
     }
 }
 
+/// Compute the indexer's effective `start_block` from the operator-
+/// supplied TOML floor and the per-instance recovered manifest heights.
+///
+/// Returns `max(toml_start_block, max(recovered))` so the indexer never
+/// scans events strictly below the slowest recovered baseline. On
+/// fresh-bootstrap (every recovered = 0) the result equals the TOML
+/// floor.
+///
+/// Single-tree (or single-floor) deployments may keep using this
+/// helper. Multi-instance deployments where instances bootstrapped at
+/// different heights MUST use [`compute_effective_start_block_per_tree`]
+/// instead: the global-MAX strategy would otherwise skip every event in
+/// `(min_recovered, max_recovered]` for the lower-height instances.
+#[must_use]
+pub fn compute_effective_start_block(
+    toml_start_block: u64,
+    recovered_block_heights: &[u64],
+) -> u64 {
+    let max_recovered = recovered_block_heights.iter().copied().max().unwrap_or(0);
+    toml_start_block.max(max_recovered)
+}
+
+/// Compute the per-tree indexer start block when each instance owns a
+/// distinct chain `tree_number` and may have bootstrapped at a different
+/// recovered manifest height.
+///
+/// For each tree, returns `max(toml_start_block, recovered)` so an
+/// operator manual override never backslides. Trees with no recovered
+/// entry default to `toml_start_block` (fresh-bootstrap path).
+///
+/// The single-cursor indexer worker scans from `min(per_tree)` and the
+/// route layer drops events for trees whose effective floor is higher
+/// than the event's block height. Without this map, a 3-instance
+/// deployment at `{25M, 24M, 23M}` running under the MAX strategy from
+/// [`compute_effective_start_block`] would start the indexer at 25M
+/// and miss every event in `(24M, 25M]` for the lower-height instances.
+#[must_use]
+pub fn compute_effective_start_block_per_tree(
+    toml_start_block: u64,
+    recovered_per_tree: &BTreeMap<u32, u64>,
+) -> BTreeMap<u32, u64> {
+    recovered_per_tree
+        .iter()
+        .map(|(&tree, &recovered)| (tree, toml_start_block.max(recovered)))
+        .collect()
+}
+
 #[must_use]
 pub fn compute_trigger_threshold(threshold: f32, tree_max_items: u32) -> usize {
     let clamped = f64::from(threshold).clamp(0.0, 1.0);
@@ -1772,6 +1881,9 @@ struct ChainWorkers {
 
 async fn spawn_chain_indexer(
     opts: &MultiServeOptions,
+    min_effective_start_block: u64,
+    per_tree_start_blocks: BTreeMap<u32, u64>,
+    resolved_reorg_window_path: Option<PathBuf>,
     indexer_tx: tokio::sync::mpsc::Sender<raven_railgun_indexer::IndexerMessage>,
 ) -> anyhow::Result<ChainWorkers> {
     use alloy::primitives::Address;
@@ -1913,9 +2025,10 @@ async fn spawn_chain_indexer(
     );
     let worker = IndexerWorker::new(Arc::new(chain_source), indexer_tx);
     let worker_config = IndexerWorkerConfig {
-        start_block: opts.start_block,
+        start_block: min_effective_start_block,
         poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
-        reorg_window_path: opts.reorg_window_path.clone(),
+        reorg_window_path: resolved_reorg_window_path,
+        per_tree_start_blocks,
         ..IndexerWorkerConfig::default()
     };
     let handle = tokio::spawn(async move {

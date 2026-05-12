@@ -424,6 +424,21 @@ impl InspirePersistence {
         self.manifest.lock().current_snapshot_id
     }
 
+    /// Recovered chain-event block height baseline.
+    ///
+    /// Returns `manifest.current_block_height`, advanced by
+    /// [`Self::commit_v6`] / [`Self::commit`] on every successful
+    /// commit and recovered by [`Self::open`]. Operator-facing
+    /// surfaces (`/v1/status.consumer.last_applied_block`, the
+    /// per-tree-floor map built at serve-time) seed off this value so
+    /// a freshly-restarted instance does NOT re-scan events the chain
+    /// driver already applied + the consumer task would only drop as
+    /// duplicates.
+    #[must_use]
+    pub fn manifest_block_height(&self) -> u64 {
+        self.manifest.lock().current_block_height
+    }
+
     /// Append a `Reorg` WAL marker. Returns the assigned WAL seq.
     pub fn signal_reorg(&self, height: u64) -> Result<u64> {
         let payload = WalEntryPayload::Reorg { height };

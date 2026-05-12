@@ -182,8 +182,22 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         Arc::clone(&chain_source),
         handle.channels.indexer_tx.clone(),
     );
+    // Recovered baseline: never start the indexer below the manifest's
+    // recovered chain-event height. A fresh-bootstrap returns 0 (so
+    // `opts.start_block` wins); a recovered instance returns the
+    // last committed `current_block_height` and the indexer resumes
+    // there instead of silently re-scanning the prefix the consumer
+    // task would only drop as duplicates.
+    let recovered_floor = opts.start_block.max(handle.persistence.manifest_block_height());
+    if recovered_floor > opts.start_block {
+        tracing::info!(
+            toml_start_block = opts.start_block,
+            recovered_floor,
+            "single-instance indexer start_block raised to recovered manifest height"
+        );
+    }
     let worker_config = IndexerWorkerConfig {
-        start_block: opts.start_block,
+        start_block: recovered_floor,
         poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
         ..IndexerWorkerConfig::default()
     };
