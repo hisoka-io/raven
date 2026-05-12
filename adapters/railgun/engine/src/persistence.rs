@@ -3,7 +3,7 @@
 //! `SnapshotPolicy` and the bootstrap/commit/archive flow.
 
 use super::inspire::{
-    restore_inspire_state, snapshot_inspire_state, InspireServerState, RavenInspireScheme,
+    snapshot_inspire_state, InspireServerState, RavenInspireScheme,
 };
 use super::{InstanceRole, PirInstance};
 use parking_lot::Mutex;
@@ -161,13 +161,19 @@ impl InspirePersistence {
             }
             // SnapshotId(0): sentinel for "manifest exists but no commit yet".
             // Reopen with id=0 → recovered_state is None; LogicalLeafStore rebuilt from WAL.
-            let (recovered_state, entries_per_shard) =
+            //
+            // V6-aware: `restore_inspire_state_v6` auto-dispatches on the
+            // `SNAPSHOT_V6_MAGIC` prefix. V6 snapshots carry the embedded
+            // [`LogicalLeafStore`] which seeds the replay base below; V5
+            // snapshots (legacy) return a default-empty store and rely on
+            // WAL replay to repopulate.
+            let (recovered_state, recovered_seed_store, entries_per_shard) =
                 if manifest.current_snapshot_id == SnapshotId(0) {
-                    (None, u32::MAX)
+                    (None, super::inspire::LogicalLeafStore::new(), u32::MAX)
                 } else {
                     let snap = Snapshot::load(&layout, manifest.current_snapshot_id)
                         .map_err(|e| AdapterError::Internal(format!("snapshot load: {e}")))?;
-                    let s = restore_inspire_state(&snap.data)?;
+                    let (s, store) = super::inspire::restore_inspire_state_v6(&snap.data)?;
                     let eps = u32::try_from(
                         s.encoded_db
                             .config
@@ -175,12 +181,12 @@ impl InspirePersistence {
                             .min(u64::from(u32::MAX)),
                     )
                     .unwrap_or(u32::MAX);
-                    (Some(s), eps)
+                    (Some(s), store, eps)
                 };
             let wal_floor = manifest.current_snapshot_seq.checked_sub(1);
             let wal = Wal::open(&layout, wal_floor)
                 .map_err(|e| AdapterError::Internal(format!("wal open: {e}")))?;
-            let mut logical_store = super::inspire::LogicalLeafStore::new();
+            let mut logical_store = recovered_seed_store;
             let replay = wal
                 .replay()
                 .map_err(|e| AdapterError::Internal(format!("wal replay: {e}")))?;
@@ -1096,7 +1102,15 @@ fn drive_commit(
 
     if dirty.is_empty() {
         let snapshot_state = instance.current_state();
-        let _new_id = persistence.commit(snapshot_state.as_ref(), height)?;
+        // Snapshot the LogicalLeafStore under-lock so the embedded V6 body
+        // is consistent with the InspireServerState captured above; release
+        // the lock before fsync work.
+        let store_snapshot = {
+            let s = logical_store.lock();
+            s.clone()
+        };
+        let _new_id =
+            persistence.commit_v6(snapshot_state.as_ref(), &store_snapshot, height)?;
         {
             let mut m = metrics.lock();
             m.commits_fired = m.commits_fired.saturating_add(1);
@@ -1180,7 +1194,15 @@ fn drive_commit(
     instance.swap_state(new_state, next_epoch);
 
     let snapshot_state = instance.current_state();
-    let _new_id = persistence.commit(snapshot_state.as_ref(), height)?;
+    // V6 commit carries the in-memory LogicalLeafStore alongside the
+    // InspireServerState so the next open path can restore both atomically.
+    // Snapshot the store under-lock (dirty-shards already drained into the
+    // new EncodedDatabase above) before clearing the dirty set.
+    let store_snapshot = {
+        let s = logical_store.lock();
+        s.clone()
+    };
+    let _new_id = persistence.commit_v6(snapshot_state.as_ref(), &store_snapshot, height)?;
 
     logical_store.lock().clear_dirty_shards();
     {
