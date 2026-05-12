@@ -759,6 +759,7 @@ export class RavenPOINodeInterface {
         let plaintext: Uint8Array;
         try {
           plaintext = ctx.wasm.extract_response(
+            ctx.session,
             ctx.crsBincode,
             queryBundles[k].clientStateBincode,
             responses[k],
@@ -821,7 +822,14 @@ export class RavenPOINodeInterface {
       ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, targetIdx),
     );
     const url = `${route.endpoint}/v1/instance/${encodeURIComponent(instanceLabel)}/query`;
-    this.captureRequest(url, "POST", queryBundle.queryBytes);
+    // The `/v1/instance/:id/query` endpoint expects the wire-schema
+    // envelope `[u16 BE schema_version][bincode body]` (mirrors the
+    // server-side `read_versioned`). Without the prefix the server
+    // rejects the body with HTTP 400 and `X-Raven-Schema-Version` set.
+    // `encodeBatchBody` already wraps batch requests; the single-query
+    // path needs the same treatment.
+    const wirePayload = wrapWithSchemaEnvelope(queryBundle.queryBytes);
+    this.captureRequest(url, "POST", wirePayload);
     let res: Response;
     try {
       res = await this.fetchImpl(url, {
@@ -830,7 +838,7 @@ export class RavenPOINodeInterface {
           "content-type": "application/octet-stream",
           authorization: `Bearer ${route.bearerToken}`,
         },
-        body: copyForBody(queryBundle.queryBytes),
+        body: copyForBody(wirePayload),
       });
     } catch (cause) {
       throw RavenError.network(`client-PIR query ${instanceLabel}`, {
@@ -855,8 +863,13 @@ export class RavenPOINodeInterface {
         status: res.status,
       });
     }
-    const responseBytes = new Uint8Array(await res.arrayBuffer());
+    // Server response carries the same `[u16 BE schema_version][bincode]`
+    // envelope; strip the 2-byte prefix before handing the inner bytes
+    // to `extract_response` (which expects bincode-only).
+    const envelopedBytes = new Uint8Array(await res.arrayBuffer());
+    const responseBytes = stripSchemaEnvelope(envelopedBytes, instanceLabel);
     const plaintext = ctx.wasm.extract_response(
+      ctx.session,
       ctx.crsBincode,
       queryBundle.clientStateBincode,
       responseBytes,
@@ -1004,6 +1017,44 @@ export class RavenPOINodeInterface {
  * `bincode::serialize(&Vec<SeededClientQuery>)` shape the
  * `dispatch_batch::<S>` worker expects.
  */
+/**
+ * Wrap a single-query bincode body with the server-side
+ * `read_versioned` envelope: `[u16 BE schema_version][body]`. Mirrors
+ * what `encodeBatchBody` does for the batch endpoint and what the
+ * Rust `native_live_replay.rs` does for parity. Without this prefix
+ * `/v1/instance/:id/query` rejects the body with HTTP 400.
+ */
+function wrapWithSchemaEnvelope(body: Uint8Array): Uint8Array {
+  const out = new Uint8Array(2 + body.length);
+  out[0] = 0;
+  out[1] = 1;
+  out.set(body, 2);
+  return out;
+}
+
+/**
+ * Inverse of [`wrapWithSchemaEnvelope`]. Validates the server's
+ * `[u16 BE schema_version]` prefix and returns the inner bincode
+ * body. Throws a typed `RavenError` if the envelope is missing or
+ * carries an unexpected version, so the wallet sees a structured
+ * decode error instead of a downstream `extract_response` panic on
+ * stray prefix bytes.
+ */
+function stripSchemaEnvelope(buf: Uint8Array, label: string): Uint8Array {
+  if (buf.length < 2) {
+    throw RavenError.decodeError(
+      `${label}: response too short for schema envelope (${buf.length})`,
+    );
+  }
+  const envelope = (buf[0] << 8) | buf[1];
+  if (envelope !== 1) {
+    throw RavenError.decodeError(
+      `${label}: unexpected schema envelope version ${envelope}`,
+    );
+  }
+  return buf.subarray(2);
+}
+
 function encodeBatchBody(queries: Uint8Array[]): Uint8Array {
   // 2 bytes BE schema version (matches WIRE_SCHEMA_VERSION = 1) +
   // 8 bytes LE length prefix + concatenated bodies.

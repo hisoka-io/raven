@@ -24,16 +24,27 @@ export type {
   RavenInspireWasm,
   RavenInspireClientSession,
   ClientPirQueryBundle,
+  LoadClientPirContextInput,
+  LoadClientPirContextResult,
 } from "./client-pir";
 
 export {
   decodeClientPirQueryBundle,
+  installPanicHook,
+  loadClientPirContext,
   statusByteToPOIStatus,
   validateBcHex,
   validateLeafIndex,
   validateListKeyHex,
   validateTreeNumber,
 } from "./client-pir";
+
+export {
+  idbGet,
+  idbPut,
+  idbClear,
+  sha256Hex,
+} from "./session-cache";
 
 export { ChainRegistry, type ChainRegistryEntry } from "./chain-registry";
 
@@ -44,3 +55,12 @@ export {
 } from "./imt-cache";
 
 export { RavenError, type RavenErrorKind, type RavenErrorContext } from "./errors";
+
+export {
+  subscribeRavenEvents,
+  type RavenEventsConfig,
+  type RavenEventsHandle,
+  type StatusBody as RavenStatusBody,
+  type InstanceStatus as RavenInstanceStatus,
+  type ConsumerStatus as RavenConsumerStatus,
+} from "./events-stream";

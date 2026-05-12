@@ -17,6 +17,7 @@
 
 import type { POIStatus } from "./raven-poi-node-interface";
 import { RavenError } from "./errors";
+import { idbGet, idbPut, sha256Hex } from "./session-cache";
 
 /**
  * Subset of the `raven-inspire-client-wasm` surface this SDK needs.
@@ -37,6 +38,7 @@ export interface RavenInspireWasm {
     targetIdx: bigint,
   ): Uint8Array;
   extract_response(
+    session: RavenInspireClientSession,
     crsBincode: Uint8Array,
     clientStateBincode: Uint8Array,
     responseBytes: Uint8Array,
@@ -46,10 +48,45 @@ export interface RavenInspireWasm {
     session: RavenInspireClientSession,
     instanceParamsBincode: Uint8Array,
   ): void;
+  /**
+   * Install the WASM-side panic hook so Rust panics inside the
+   * crate surface as structured `Error: panicked at '<msg>',
+   * <file>:<line>` JS exceptions instead of opaque
+   * `RuntimeError: unreachable executed` traps.
+   *
+   * Idempotent. Wallets SHOULD call this once at module load before
+   * any other call. The convenience wrapper [`installPanicHook`]
+   * forwards here and is a safe no-op when the wasm shim does not
+   * expose the symbol.
+   */
+  init_panic_hook?(): void;
   build_instance_params_blob(
     inspireParamsBincode: Uint8Array,
     shardConfigBincode: Uint8Array,
   ): Uint8Array;
+  /**
+   * Serialize a fully constructed client session to a bincode blob
+   * that can be cached across page reloads / process restarts.
+   *
+   * Optional: older WASM builds do not export this symbol; callers
+   * MUST treat it as `undefined` and skip the warm-cache path.
+   * Available since the `s036-client-session-serde` upstream pin.
+   */
+  serialize_client_session?(session: RavenInspireClientSession): Uint8Array;
+  /**
+   * Reconstitute a session from a previously cached bincode blob
+   * plus the same params bundle / CRS the cold path consumed.
+   *
+   * Optional: older WASM builds do not export this symbol; callers
+   * MUST treat it as `undefined` and fall through to
+   * `build_client_session`. Available since the
+   * `s036-client-session-serde` upstream pin.
+   */
+  deserialize_client_session?(
+    paramsBundleBincode: Uint8Array,
+    crsBincode: Uint8Array,
+    sessionBincode: Uint8Array,
+  ): RavenInspireClientSession;
   /**
    * Returns the 16 flat-global row indices needed for an auth-path
    * PIR query against `PerNodeEncoder` (commit-tree). Pure function;
@@ -145,6 +182,148 @@ export function decodeClientPirQueryBundle(buf: Uint8Array): ClientPirQueryBundl
     clientStateBincode: cloneBytes(clientStateBincode),
     queryBytes: cloneBytes(queryBytes),
   };
+}
+
+/**
+ * Install the wasm-side panic hook so Rust panics surface as
+ * structured `Error: panicked at '<msg>', <file>:<line>` JS
+ * exceptions. Wallets SHOULD call this once at module load before
+ * any other PIR call.
+ *
+ * Idempotent and dependency-injected: takes the same `wasm`
+ * module the SDK already accepts via `ClientPirContext`. Returns
+ * `true` if the hook was installed, `false` if the underlying
+ * wasm shim does not expose `init_panic_hook` (older builds).
+ *
+ * Without this hook, raven-inspire panics arrive at JS as
+ * `RuntimeError: unreachable executed` with no Rust file:line, so
+ * any production-side debugging is materially harder. With it,
+ * every panic carries the originating `file.rs:N:C` and the
+ * assertion message.
+ */
+export function installPanicHook(wasm: RavenInspireWasm): boolean {
+  if (typeof wasm.init_panic_hook === "function") {
+    wasm.init_panic_hook();
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Inputs for [`loadClientPirContext`]. The wallet supplies the
+ * already-fetched + decoded `/v1/instance/<id>/params` envelope
+ * pieces; this function takes them and produces a
+ * [`ClientPirContext`] ready for use, transparently using the
+ * IndexedDB warm-cache when available.
+ */
+export interface LoadClientPirContextInput {
+  /** WASM module exposing the `build_*` / `*_client_session` API. */
+  readonly wasm: RavenInspireWasm;
+  /** Stable identifier for the PIR instance (e.g.
+   *  `commit-tree-0`). Used as the first component of the cache
+   *  key so two instances with the same CRS hash never collide. */
+  readonly instanceId: string;
+  readonly crsBincode: Uint8Array;
+  readonly shardConfigBincode: Uint8Array;
+  readonly inspireParamsBincode: Uint8Array;
+  readonly entrySize: number;
+}
+
+/**
+ * Returned alongside the [`ClientPirContext`] so callers can
+ * observe whether the warm cache was hit. Test-only signal; the
+ * production path treats hit / miss interchangeably.
+ */
+export interface LoadClientPirContextResult {
+  readonly context: ClientPirContext;
+  /** `true` when the session was reconstituted from the cache;
+   *  `false` when [`build_client_session`] was invoked from cold. */
+  readonly cacheHit: boolean;
+}
+
+/**
+ * Build a [`ClientPirContext`] from the operator-side params
+ * bundle, transparently using the warm-cache path when the WASM
+ * module exposes [`serialize_client_session`] +
+ * [`deserialize_client_session`] AND a cached blob exists for
+ * `(instanceId, sha256(crsBincode))`.
+ *
+ * Cold-path cost: ~12.6 s at production-cell d=2048 (the WASM-side
+ * `PackParams::new` automorph-table O(d^3) search +
+ * `ClientPackingKeys::generate`).
+ *
+ * Warm-path cost: a few hundred ms for the IndexedDB read +
+ * bincode-deserialize of the cached session blob.
+ *
+ * The cache is keyed by `(instanceId, sha256(crsBincode))` so a
+ * CRS rotation (e.g. operator restart with a new seed) auto-
+ * invalidates every cached session without an explicit clear
+ * step.
+ *
+ * Storage failures degrade silently to the cold path (the cache
+ * is best-effort; correctness is preserved by always being able
+ * to fall back to [`build_client_session`]).
+ */
+export async function loadClientPirContext(
+  input: LoadClientPirContextInput,
+): Promise<LoadClientPirContextResult> {
+  const { wasm, instanceId, crsBincode, shardConfigBincode, inspireParamsBincode, entrySize } =
+    input;
+
+  const paramsBundle = wasm.build_instance_params_blob(
+    inspireParamsBincode,
+    shardConfigBincode,
+  );
+
+  // Try the warm path first when the WASM module exports the
+  // serialize/deserialize pair AND the cache holds a live entry.
+  const canCache =
+    typeof wasm.serialize_client_session === "function" &&
+    typeof wasm.deserialize_client_session === "function";
+
+  if (canCache) {
+    let crsHash: string;
+    try {
+      crsHash = await sha256Hex(crsBincode);
+    } catch {
+      // Web Crypto unavailable; degrade to cold.
+      return coldPath();
+    }
+    const cached = await idbGet(instanceId, crsHash);
+    if (cached) {
+      try {
+        const session = wasm.deserialize_client_session!(paramsBundle, crsBincode, cached);
+        return {
+          context: { wasm, session, crsBincode, shardConfigBincode, entrySize },
+          cacheHit: true,
+        };
+      } catch {
+        // Corrupt cache entry: fall through to cold rebuild + reseed.
+      }
+    }
+    // Cold rebuild + reseed the cache for the next page load.
+    const session = wasm.build_client_session(paramsBundle, crsBincode);
+    try {
+      const blob = wasm.serialize_client_session!(session);
+      await idbPut(instanceId, crsHash, blob);
+    } catch {
+      // best-effort; the session is still valid even if seeding fails.
+    }
+    return {
+      context: { wasm, session, crsBincode, shardConfigBincode, entrySize },
+      cacheHit: false,
+    };
+  }
+
+  return coldPath();
+
+  function coldPath(): LoadClientPirContextResult {
+    const session = wasm.build_client_session(paramsBundle, crsBincode);
+    return {
+      context: { wasm, session, crsBincode, shardConfigBincode, entrySize },
+      cacheHit: false,
+    };
+  }
 }
 
 /**

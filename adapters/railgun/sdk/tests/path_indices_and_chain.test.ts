@@ -67,7 +67,7 @@ function realPathStubWasm(): RavenInspireWasm {
   return {
     build_client_session: () => ({ free: () => undefined }),
     build_seeded_query: () => new Uint8Array(16),
-    extract_response: (_crs, _state, response, _entry) => {
+    extract_response: (_session, _crs, _state, response, _entry) => {
       // Pass-through: the test routes encode the desired plaintext
       // (status byte at offset 0 OR a 32 B node hash) directly into
       // the response body; the stub mirrors that into the SDK so
@@ -161,8 +161,17 @@ function mountSingleQueryRoute(server: MockServer, statusByte: number): void {
   server.route(
     (req) => /^\/v1\/instance\/[^/]+\/query$/.test(req.url ?? ""),
     (_req, _body, res) => {
-      const out = new Uint8Array(32);
-      out[0] = statusByte;
+      // SDK now strips the `[u16 BE schema][bincode]` envelope from
+      // single-query responses (mirroring the server's
+      // `write_versioned`); mock servers must prepend it too. Inner
+      // 32 bytes are the stub plaintext the SDK's stub
+      // `extract_response` (in `realPathStubWasm`) passes through.
+      const inner = new Uint8Array(32);
+      inner[0] = statusByte;
+      const out = new Uint8Array(2 + inner.length);
+      out[0] = 0;
+      out[1] = 1;
+      out.set(inner, 2);
       res.writeHead(200, {
         "content-type": "application/octet-stream",
         "x-raven-freshness": "lag_blocks=1 applied_height=10 epoch=1 confidence=0.99",
