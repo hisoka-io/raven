@@ -56,18 +56,14 @@ pub struct AppState<S: PirScheme> {
     /// single-cell [`AppState::with_consumer_metrics`]; the metrics
     /// handler falls back to that cell when this map is empty.
     ///
-    /// Wired by the orchestrator pass that connects
-    /// `refresh_dynamic_metrics` + `emit_instance_metrics` into the
-    /// `metrics_handler`.
-    #[allow(dead_code)]
+    /// Consumed by `refresh_dynamic_metrics` in the `metrics_handler` to
+    /// emit per-instance `consumer_*` gauges alongside the engine-side
+    /// `drain_state` / `in_flight` / `epoch` / `role` gauges from the
+    /// `engine.instances()` walk.
     pub(crate) instance_metrics: Arc<HashMap<InstanceId, Arc<parking_lot::Mutex<ConsumerMetrics>>>>,
     /// Process start instant. Used to render `raven_railgun_uptime_seconds`
     /// on every scrape. Resets on process restart per Prometheus
     /// counter convention.
-    ///
-    /// Wired by the orchestrator pass that connects
-    /// `refresh_dynamic_metrics` into the `metrics_handler`.
-    #[allow(dead_code)]
     pub(crate) process_started_at: Instant,
     /// Per-AppState ETag cache for `GET /v1/instance/:id/params`.
     /// Keyed by `InstanceId` with `(epoch, sha256)` payload so an epoch
@@ -338,15 +334,15 @@ pub(crate) fn describe_prometheus_metrics() {
         "Always 1.0; carries the operator-visible role label as a separate dim"
     );
     metrics::describe_gauge!(
-        "raven_railgun_indexer_last_applied_block",
+        "raven_railgun_consumer_last_applied_block",
         "Per-instance last-applied chain block height"
     );
     metrics::describe_gauge!(
-        "raven_railgun_indexer_chain_head_block_per_instance",
+        "raven_railgun_consumer_last_known_chain_head",
         "Per-instance last-known chain head"
     );
     metrics::describe_gauge!(
-        "raven_railgun_indexer_lag_blocks_per_instance",
+        "raven_railgun_consumer_indexer_lag_blocks",
         "Per-instance indexer lag (chain_head - last_applied)"
     );
     metrics::describe_gauge!(
@@ -358,20 +354,12 @@ pub(crate) fn describe_prometheus_metrics() {
         "Per-instance count of consumer per-event errors logged-and-continued"
     );
     metrics::describe_gauge!(
-        "raven_railgun_snapshots",
+        "raven_railgun_consumer_commits_fired",
         "Per-instance count of commits / snapshots fired"
     );
     metrics::describe_gauge!(
-        "raven_railgun_reorgs_handled",
+        "raven_railgun_consumer_reorgs_handled",
         "Per-instance count of reorgs handled by the consumer"
-    );
-    metrics::describe_gauge!(
-        "raven_railgun_indexer_lag_blocks",
-        "Process-global indexer lag (last writer wins under multi-instance)"
-    );
-    metrics::describe_gauge!(
-        "raven_railgun_indexer_chain_head_block",
-        "Process-global chain head (last writer wins under multi-instance)"
     );
     metrics::describe_counter!(
         "raven_railgun_sessions_established_total",
