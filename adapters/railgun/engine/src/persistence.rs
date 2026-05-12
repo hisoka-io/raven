@@ -295,13 +295,41 @@ impl InspirePersistence {
         }
     }
 
-    /// Snapshot state, archive WAL, and bump the manifest atomically.
+    /// Snapshot state (V5 legacy codec), archive WAL, and bump the
+    /// manifest atomically.
+    ///
+    /// Retained for the encoder-migration tools and back-compat
+    /// regression tests. New code should call [`InspirePersistence::commit_v6`]
+    /// so the embedded [`super::inspire::LogicalLeafStore`] travels with
+    /// the snapshot and survives WAL archival.
     pub fn commit(
         &self,
         state: &InspireServerState,
         current_block_height: u64,
     ) -> Result<SnapshotId> {
         let bundle = snapshot_inspire_state(state)?;
+        self.commit_serialized_bundle(bundle, current_block_height)
+    }
+
+    /// V6 commit: snapshot `(state, store)` to the V6 envelope, archive
+    /// WAL, and bump the manifest atomically. The manifest's
+    /// `schema_version` advances to [`raven_railgun_persistence::MANIFEST_SCHEMA_VERSION`]
+    /// (currently V6) on the next manifest save.
+    pub fn commit_v6(
+        &self,
+        state: &InspireServerState,
+        store: &super::inspire::LogicalLeafStore,
+        current_block_height: u64,
+    ) -> Result<SnapshotId> {
+        let bundle = super::inspire::snapshot_inspire_state_v6(state, store)?;
+        self.commit_serialized_bundle(bundle, current_block_height)
+    }
+
+    fn commit_serialized_bundle(
+        &self,
+        bundle: Vec<u8>,
+        current_block_height: u64,
+    ) -> Result<SnapshotId> {
         let snap = Snapshot::build(bundle);
 
         // Lock-drop + CAS: read next_id under lock, drop lock, save snapshot (slow),
@@ -333,6 +361,7 @@ impl InspirePersistence {
         m.current_snapshot_id = next_id;
         m.current_snapshot_seq = new_floor;
         m.current_block_height = current_block_height;
+        m.schema_version = MANIFEST_SCHEMA_VERSION;
         m.save(&self.layout)
             .map_err(|e| AdapterError::Internal(format!("manifest save: {e}")))?;
 

@@ -16,7 +16,7 @@ pub const TREE_DEPTH: usize = 16;
 /// Maximum leaves per tree (`2 ^ TREE_DEPTH = 65,536`).
 pub const TREE_MAX_ITEMS: usize = 1 << TREE_DEPTH;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct ZeroValues {
     /// `ZEROS[0..=TREE_DEPTH]`: empty-subtree hash per level.
     levels: [[u8; 32]; TREE_DEPTH + 1],
@@ -37,7 +37,7 @@ impl ZeroValues {
 }
 
 /// Sparse incremental Merkle tree backing one Railgun commitment-tree.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Imt {
     leaf_count: usize,
     nodes: Vec<HashMap<usize, [u8; 32]>>,
@@ -105,7 +105,26 @@ impl Imt {
             )));
         }
 
-        // Clone-and-swap for atomicity: a mid-batch Poseidon failure must not corrupt self.
+        // Single-leaf fast-path: skip the clone-and-stage. Every chain
+        // event today fires this branch (Shield/Transact emit one leaf
+        // per call; PPOI per-list inserts are also single-leaf). Bypass
+        // saves ~4 MiB Vec allocation per fire at full-tree fill, which
+        // the allocator cumulatively retains across the live-tree commit
+        // cadence.
+        if leaves.len() == 1 {
+            self.set_leaf_and_update_path(start_index, leaves[0])?;
+            self.leaf_count = end;
+            return Ok(());
+        }
+
+        // Multi-leaf path retains the clone-and-stage for atomic
+        // rollback if `set_leaf_and_update_path` fails mid-loop on a
+        // non-Fr-canonical leaf. Single-leaf can't tear because a
+        // failure aborts before any cross-level mutation is persisted
+        // (the helper is structured so the leaf-level insert happens
+        // first, then the parent path is rebuilt; partial parent-path
+        // staleness is bounded to the failing call's own ancestor
+        // chain). Multi-leaf staleness can leak across leaves.
         let mut staged = self.clone();
         for (offset, leaf) in leaves.iter().enumerate() {
             let leaf_index = start_index + offset;
@@ -447,5 +466,54 @@ mod tests {
         tree.insert_leaves(2, &[[42u8; 32]]).expect("re-insert");
         let proof = tree.merkle_proof(2).expect("proof");
         assert_eq!(reconstruct_root([42u8; 32], 2, &proof), tree.root());
+    }
+
+    /// The single-leaf fast-path must land state byte-identical to the
+    /// equivalent multi-leaf-of-one path (clone-and-stage). Asserts on
+    /// root + leaf_count + proof equality.
+    #[test]
+    fn single_leaf_insert_byte_identical_to_multi_leaf_path() {
+        let leaf: [u8; 32] = {
+            let mut b = [0u8; 32];
+            b[31] = 0x42;
+            b
+        };
+
+        let mut fast_path = Imt::new().expect("imt build");
+        fast_path
+            .insert_leaves(0, std::slice::from_ref(&leaf))
+            .expect("single-leaf fast path");
+
+        let mut multi_path = Imt::new().expect("imt build");
+        multi_path
+            .insert_leaves(0, &[leaf, [0x07; 32]])
+            .expect("multi-leaf path");
+        multi_path.truncate_to(1);
+
+        assert_eq!(fast_path.leaf_count(), 1);
+        assert_eq!(multi_path.leaf_count(), 1);
+        assert_eq!(fast_path.root(), multi_path.root());
+        let fp = fast_path.merkle_proof(0).expect("fp proof");
+        let mp = multi_path.merkle_proof(0).expect("mp proof");
+        assert_eq!(fp.elements, mp.elements);
+        assert_eq!(fp.indices, mp.indices);
+    }
+
+    /// A failed single-leaf insert at index 0 must leave the tree
+    /// recoverable: a subsequent valid insert at the same index must
+    /// succeed.
+    #[test]
+    fn single_leaf_insert_failure_leaves_tree_unchanged_on_post_index_zero() {
+        let invalid: [u8; 32] = [0xff; 32];
+        let valid: [u8; 32] = {
+            let mut b = [0u8; 32];
+            b[31] = 0x07;
+            b
+        };
+        let mut tree = Imt::new().expect("imt build");
+        let _ = tree.insert_leaves(0, std::slice::from_ref(&invalid));
+        tree.insert_leaves(0, std::slice::from_ref(&valid))
+            .expect("re-insert after single-leaf failure");
+        assert_eq!(tree.leaf_count(), 1);
     }
 }

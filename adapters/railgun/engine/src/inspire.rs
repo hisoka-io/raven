@@ -272,7 +272,11 @@ impl std::fmt::Debug for PersistedInspireState {
     }
 }
 
-/// Serialize an [`InspireServerState`] to bincode bytes.
+/// Serialize an [`InspireServerState`] to bincode bytes (V5 legacy codec).
+///
+/// Retained for the encoder-migration tools and for backward-compat
+/// regression tests. New code should call [`snapshot_inspire_state_v6`]
+/// to embed the [`LogicalLeafStore`] alongside the engine state.
 pub fn snapshot_inspire_state(state: &InspireServerState) -> Result<Vec<u8>> {
     let bundle = PersistedInspireState {
         crs: (*state.crs).clone(),
@@ -284,10 +288,55 @@ pub fn snapshot_inspire_state(state: &InspireServerState) -> Result<Vec<u8>> {
         .map_err(|e| AdapterError::Serialization(format!("snapshot serialize: {e}")))
 }
 
+/// Magic header for V6 snapshot envelope. V5 snapshots are raw bincode
+/// of [`PersistedInspireState`] — they have no magic prefix. The four
+/// bytes `RV6\0` are distinguishable from a bincode-serialized struct
+/// (which starts with the first field's encoding, never matching these
+/// bytes) so [`restore_inspire_state_v6`] can auto-dispatch on the
+/// leading bytes.
+pub const SNAPSHOT_V6_MAGIC: [u8; 4] = *b"RV6\0";
+
+/// V6 snapshot envelope: `InspireServerState` + the engine-side
+/// `LogicalLeafStore` embedded together so a successful commit
+/// archives the WAL without losing logical state on restart.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedInspireStateV6 {
+    state: PersistedInspireState,
+    store: LogicalLeafStore,
+}
+
+/// Serialize a `(state, store)` pair to a V6 snapshot envelope.
+///
+/// Format: `SNAPSHOT_V6_MAGIC || bincode(PersistedInspireStateV6)`.
+pub fn snapshot_inspire_state_v6(
+    state: &InspireServerState,
+    store: &LogicalLeafStore,
+) -> Result<Vec<u8>> {
+    let bundle = PersistedInspireStateV6 {
+        state: PersistedInspireState {
+            crs: (*state.crs).clone(),
+            encoded_db: (*state.encoded_db).clone(),
+            variant: state.variant,
+            entry_size: state.entry_size,
+        },
+        store: store.clone(),
+    };
+    let mut out = Vec::with_capacity(SNAPSHOT_V6_MAGIC.len() + 1024);
+    out.extend_from_slice(&SNAPSHOT_V6_MAGIC);
+    let body = bincode::serialize(&bundle)
+        .map_err(|e| AdapterError::Serialization(format!("v6 snapshot serialize: {e}")))?;
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
 /// Reconstruct an [`InspireServerState`] from bincode bytes. Rebuilds cache; session store starts empty.
 pub fn restore_inspire_state(bytes: &[u8]) -> Result<InspireServerState> {
     let bundle: PersistedInspireState = bincode::deserialize(bytes)
         .map_err(|e| AdapterError::Serialization(format!("snapshot deserialize: {e}")))?;
+    bundle_to_state(bundle)
+}
+
+fn bundle_to_state(bundle: PersistedInspireState) -> Result<InspireServerState> {
     let cache = ServerInspiringCache::new(&bundle.crs, &bundle.encoded_db)
         .map_err(|e| AdapterError::Scheme(format!("restore cache build: {e}")))?;
     let session_store = ServerSessionStore::new();
@@ -299,6 +348,31 @@ pub fn restore_inspire_state(bytes: &[u8]) -> Result<InspireServerState> {
         variant: bundle.variant,
         entry_size: bundle.entry_size,
     })
+}
+
+/// Reconstruct `(InspireServerState, LogicalLeafStore)` from snapshot bytes.
+///
+/// Auto-dispatches on the leading 4-byte magic header: V6 snapshots
+/// start with [`SNAPSHOT_V6_MAGIC`] and decode the full embedded store;
+/// legacy V5 snapshots (raw bincode of [`PersistedInspireState`])
+/// return a default-empty [`LogicalLeafStore`] with a `tracing::warn`
+/// — WAL replay rebuilds the store on first open and the next commit
+/// upgrades the snapshot envelope to V6.
+pub fn restore_inspire_state_v6(bytes: &[u8]) -> Result<(InspireServerState, LogicalLeafStore)> {
+    if let Some(body) = bytes.strip_prefix(SNAPSHOT_V6_MAGIC.as_slice()) {
+        let bundle: PersistedInspireStateV6 = bincode::deserialize(body)
+            .map_err(|e| AdapterError::Serialization(format!("v6 snapshot deserialize: {e}")))?;
+        let state = bundle_to_state(bundle.state)?;
+        Ok((state, bundle.store))
+    } else {
+        tracing::warn!(
+            target = "raven::engine::snapshot",
+            "legacy V5 snapshot (no V6 magic prefix); LogicalLeafStore starts empty and will \
+             be repopulated from WAL replay if WAL bytes are still present"
+        );
+        let state = restore_inspire_state(bytes)?;
+        Ok((state, LogicalLeafStore::default()))
+    }
 }
 
 /// Re-encode a single shard from a raw byte buffer in place.
@@ -384,7 +458,7 @@ pub fn materialize_shard_bytes(
 /// Accumulates leaves + PPOI status rows, marks affected shards dirty, and
 /// re-encodes only the dirty shards at explicit commit time (~5 ms per shard).
 /// Rebuilt from WAL replay on bootstrap.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogicalLeafStore {
     leaves: std::collections::BTreeMap<(u32, u32), [u8; 32]>,
     ppoi_status: std::collections::BTreeMap<([u8; 32], [u8; 32]), u8>,
@@ -814,6 +888,64 @@ pub fn validate_apply(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod snapshot_v6_tests {
+    use super::{
+        restore_inspire_state, restore_inspire_state_v6, setup_state, snapshot_inspire_state,
+        snapshot_inspire_state_v6, InspireVariant, LogicalLeafStore, SNAPSHOT_V6_MAGIC,
+    };
+    use raven_inspire::params::InspireParams;
+
+    fn toy_state_and_db() -> (super::InspireServerState, Vec<u8>) {
+        let params = InspireParams::secure_128_d2048();
+        let entries = 256usize;
+        let entry_size = 32usize;
+        let db: Vec<u8> = (0..entries)
+            .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
+            .collect();
+        let (state, _sk) =
+            setup_state(&params, &db, entry_size, InspireVariant::TwoPacking).expect("setup");
+        (state, db)
+    }
+
+    #[test]
+    fn v6_snapshot_carries_magic_prefix() {
+        let (state, _) = toy_state_and_db();
+        let store = LogicalLeafStore::new();
+        let bytes = snapshot_inspire_state_v6(&state, &store).expect("v6 serialize");
+        assert!(
+            bytes.starts_with(&SNAPSHOT_V6_MAGIC),
+            "V6 snapshot must start with RV6\\0 magic; got {:?}",
+            bytes.get(..SNAPSHOT_V6_MAGIC.len())
+        );
+    }
+
+    #[test]
+    fn v6_round_trip_restores_state_and_empty_store() {
+        let (state, _) = toy_state_and_db();
+        let store = LogicalLeafStore::new();
+        let bytes = snapshot_inspire_state_v6(&state, &store).expect("v6 serialize");
+        let (restored, store_back) = restore_inspire_state_v6(&bytes).expect("v6 restore");
+        assert_eq!(restored.entry_size, state.entry_size);
+        assert_eq!(store_back.ppoi_count(), 0);
+        assert_eq!(store_back.leaf_count(), 0);
+    }
+
+    #[test]
+    fn legacy_v5_snapshot_decodes_with_empty_store_via_v6_restore() {
+        let (state, _) = toy_state_and_db();
+        let v5_bytes = snapshot_inspire_state(&state).expect("v5 serialize");
+        assert!(
+            !v5_bytes.starts_with(&SNAPSHOT_V6_MAGIC),
+            "V5 raw bincode must NOT collide with V6 magic"
+        );
+        let (restored, store_back) = restore_inspire_state_v6(&v5_bytes).expect("v5 via v6");
+        assert_eq!(restored.entry_size, state.entry_size);
+        assert_eq!(store_back.ppoi_count(), 0);
+        let _ = restore_inspire_state(&v5_bytes).expect("v5 directly via legacy path");
+    }
 }
 
 #[cfg(test)]
