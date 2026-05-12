@@ -56,7 +56,7 @@ async fn six_instance_config_file_boots_and_status_lists_all() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let bind: SocketAddr = "127.0.0.1:0".parse().expect("addr");
     let example_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/mainnet-6-instance.toml");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/mainnet-6-instance.toml");
     let config_path = rewrite_to_tempdir(&example_path, tmp.path(), bind, BEARER_TOKEN);
 
     let mut opts = load_options_from_toml(&config_path).expect("parse config");
@@ -107,12 +107,12 @@ async fn six_instance_config_file_boots_and_status_lists_all() {
     assert_eq!(body.instances.len(), 6, "all 6 instances must be visible");
     let ids: Vec<&str> = body.instances.iter().map(|i| i.id.as_str()).collect();
     for expect in [
-        "commitments-tree-0",
-        "commitments-tree-1",
-        "commitments-tree-2",
-        "commitments-tree-live",
+        "commit-tree-0",
+        "commit-tree-1",
+        "commit-tree-2",
+        "commit-tree-3",
         "ppoi-status-ofac",
-        "ppoi-path-railway",
+        "ppoi-paths-ofac",
     ] {
         assert!(
             ids.iter().any(|id| *id == expect),
@@ -121,20 +121,20 @@ async fn six_instance_config_file_boots_and_status_lists_all() {
     }
 
     // Per Workstream N: active_k_concurrency must default per-encoder.
-    // commitments-tree-* are PerNode (migrated from PerLeafPath) -> 16.
+    // commit-tree-* are PerNode -> 16.
     // ppoi-status-ofac is PerListStatus -> 4.
-    // ppoi-path-railway is PerListNode (migrated from PerListPath) -> 16.
+    // ppoi-paths-ofac is PerListNode -> 16.
     let by_id: std::collections::HashMap<&str, u32> = body
         .instances
         .iter()
         .map(|i| (i.id.as_str(), i.active_k_concurrency))
         .collect();
-    assert_eq!(by_id["commitments-tree-0"], 16);
-    assert_eq!(by_id["commitments-tree-1"], 16);
-    assert_eq!(by_id["commitments-tree-2"], 16);
-    assert_eq!(by_id["commitments-tree-live"], 16);
+    assert_eq!(by_id["commit-tree-0"], 16);
+    assert_eq!(by_id["commit-tree-1"], 16);
+    assert_eq!(by_id["commit-tree-2"], 16);
+    assert_eq!(by_id["commit-tree-3"], 16);
     assert_eq!(by_id["ppoi-status-ofac"], 4);
-    assert_eq!(by_id["ppoi-path-railway"], 16);
+    assert_eq!(by_id["ppoi-paths-ofac"], 16);
 
     let _ = tx.send(());
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), server).await;
