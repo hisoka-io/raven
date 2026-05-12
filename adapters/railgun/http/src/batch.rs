@@ -9,7 +9,7 @@ use axum::{
 };
 use bytes::Bytes;
 use raven_railgun_core::InstanceId;
-use raven_railgun_engine::{DrainState, PirInstance, PirScheme};
+use raven_railgun_engine::{DrainState, PirInstance, PirScheme, Snapshot};
 use tokio::sync::Semaphore;
 
 use crate::state::AppState;
@@ -127,7 +127,13 @@ pub(crate) async fn batch_handler<S: PirScheme>(
     }
 
     let started = Instant::now();
-    let epoch_at_start = instance.current_epoch();
+    // Capture `(epoch, state)` ONCE for the whole batch. Every worker
+    // dispatched below serves from this exact snapshot, so a 17-row
+    // commit-tree path fanout cannot straddle a concurrent
+    // `swap_state` and produce a Frankenstein fold root that chain
+    // `rootHistory` would reject.
+    let snapshot_for_batch = instance.current_snapshot();
+    let epoch_at_start = snapshot_for_batch.epoch;
 
     let k = app.config.max_concurrent_queries.max(1);
     let respond_timeout = Duration::from_secs(app.config.respond_timeout_secs.max(1));
@@ -135,6 +141,7 @@ pub(crate) async fn batch_handler<S: PirScheme>(
     let responses_result = dispatch_batch::<S>(
         queries,
         Arc::clone(&instance),
+        snapshot_for_batch,
         Arc::clone(&app.semaphore),
         k,
         respond_timeout,
@@ -242,9 +249,14 @@ type WorkerOutcome<R> = (usize, Result<R, BatchError>);
 /// regresses ~2x on the HTTP path when nested inside `spawn_blocking`
 /// (see `research/K4_HTTP_DISPATCHER_BENCH.md`).
 /// Returns responses in input order; short-circuits on first error.
+///
+/// Every worker spawned below borrows the same `Arc<Snapshot<S>>` so all
+/// rows in the batch are byte-for-byte served from the SAME `(epoch, state)`
+/// pair, even if a concurrent `swap_state` fires mid-batch.
 pub(crate) async fn dispatch_batch<S: PirScheme>(
     queries: Vec<S::Query>,
     instance: Arc<PirInstance<S>>,
+    snapshot: Arc<Snapshot<S>>,
     semaphore: Arc<Semaphore>,
     k: usize,
     respond_timeout: Duration,
@@ -264,8 +276,9 @@ pub(crate) async fn dispatch_batch<S: PirScheme>(
         };
         let inst = Arc::clone(&instance);
         let sem = Arc::clone(&semaphore);
+        let snap = Arc::clone(&snapshot);
         let idx = next_idx;
-        join.spawn(async move { worker::<S>(idx, q, inst, sem, respond_timeout).await });
+        join.spawn(async move { worker::<S>(idx, q, inst, snap, sem, respond_timeout).await });
         next_idx += 1;
     }
 
@@ -313,8 +326,11 @@ pub(crate) async fn dispatch_batch<S: PirScheme>(
             if let Some(q) = queries_iter.next() {
                 let inst = Arc::clone(&instance);
                 let sem = Arc::clone(&semaphore);
+                let snap = Arc::clone(&snapshot);
                 let idx = next_idx;
-                join.spawn(async move { worker::<S>(idx, q, inst, sem, respond_timeout).await });
+                join.spawn(
+                    async move { worker::<S>(idx, q, inst, snap, sem, respond_timeout).await },
+                );
                 next_idx += 1;
             }
         }
@@ -327,19 +343,24 @@ pub(crate) async fn dispatch_batch<S: PirScheme>(
     collected.ok_or(BatchError::Invariant("response collect produced None"))
 }
 
-/// One in-flight batch worker. Acquires a permit, runs `query_active_tracked`
-/// on `spawn_blocking` under `tokio::time::timeout`. Permit is released on timeout.
+/// One in-flight batch worker. Acquires a permit, runs
+/// `query_active_tracked_with_snapshot` against the batch-captured
+/// `Arc<Snapshot<S>>` on `spawn_blocking` under `tokio::time::timeout`.
+/// Permit is released on timeout.
 async fn worker<S: PirScheme>(
     idx: usize,
     q: S::Query,
     instance: Arc<PirInstance<S>>,
+    snapshot: Arc<Snapshot<S>>,
     sem: Arc<Semaphore>,
     respond_timeout: Duration,
 ) -> WorkerOutcome<S::Response> {
     let Ok(_permit) = sem.acquire_owned().await else {
         return (idx, Err(BatchError::SemaphoreClosed));
     };
-    let join = tokio::task::spawn_blocking(move || instance.query_active_tracked(&q));
+    let join = tokio::task::spawn_blocking(move || {
+        instance.query_active_tracked_with_snapshot(&snapshot, &q)
+    });
     match tokio::time::timeout(respond_timeout, join).await {
         Ok(Ok(Ok((_epoch, r)))) => (idx, Ok(r)),
         Ok(Ok(Err(scheme_err))) => (
