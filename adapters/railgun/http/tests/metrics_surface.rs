@@ -228,35 +228,40 @@ async fn metrics_handler_emits_per_instance_engine_gauges() {
     use std::net::SocketAddr;
     use tower::ServiceExt;
 
-    let _g = APPSTATE_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Hold the lock ONLY during AppState::new (the
+    // `metrics::set_global_recorder` race window); release before any
+    // .await so clippy's `await_holding_lock` lint stays clean.
+    let router = {
+        let _g = APPSTATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    // Build a tiny InsPIRe instance so `inspire_router` accepts the
-    // engine. We don't query it; we only scrape `/metrics`.
-    let params = raven_inspire::params::InspireParams::secure_128_d2048();
-    let db: Vec<u8> = vec![0u8; 2048 * 32];
-    let (state, _sk) = setup_state(
-        &params,
-        &db,
-        32,
-        raven_inspire::params::InspireVariant::TwoPacking,
-    )
-    .expect("setup_state");
-    let instance: Arc<PirInstance<RavenInspireScheme>> = Arc::new(PirInstance::new(
-        InstanceId::new("metrics-scrape-instance"),
-        InstanceRole::Live,
-        state,
-    ));
-    let mut engine: Engine<RavenInspireScheme> = Engine::new();
-    engine
-        .register_instance(Arc::clone(&instance))
-        .expect("register");
+        // Build a tiny InsPIRe instance so `inspire_router` accepts the
+        // engine. We don't query it; we only scrape `/metrics`.
+        let params = raven_inspire::params::InspireParams::secure_128_d2048();
+        let db: Vec<u8> = vec![0u8; 2048 * 32];
+        let (state, _sk) = setup_state(
+            &params,
+            &db,
+            32,
+            raven_inspire::params::InspireVariant::TwoPacking,
+        )
+        .expect("setup_state");
+        let instance: Arc<PirInstance<RavenInspireScheme>> = Arc::new(PirInstance::new(
+            InstanceId::new("metrics-scrape-instance"),
+            InstanceRole::Live,
+            state,
+        ));
+        let mut engine: Engine<RavenInspireScheme> = Engine::new();
+        engine
+            .register_instance(Arc::clone(&instance))
+            .expect("register");
 
-    let mut cfg = HttpConfig::demo(TOKEN);
-    cfg.metrics_public = true;
-    let app_state = AppState::new(engine, cfg).expect("appstate");
-    let router = raven_railgun_http::inspire_router(app_state).expect("router");
+        let mut cfg = HttpConfig::demo(TOKEN);
+        cfg.metrics_public = true;
+        let app_state = AppState::new(engine, cfg).expect("appstate");
+        raven_railgun_http::inspire_router(app_state).expect("router")
+    };
 
     let mut req = Request::builder()
         .method(Method::GET)
