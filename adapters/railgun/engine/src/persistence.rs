@@ -1937,4 +1937,287 @@ mod tests {
         .expect_err("mismatch should reject");
         assert!(matches!(err, AdapterError::Internal(_)));
     }
+
+    // ---------------------------------------------------------------
+    // ShardOutOfRange producer + consumer wiring
+    //
+    // `re_encode_shard` must surface a typed `ShardOutOfRange` so
+    // `drive_commit` can drop the shard from `dirty_shards` (otherwise
+    // every commit cadence retries the structurally-bad id forever and
+    // bumps `consumer_errors`). The emitted metric carries only the
+    // `instance` label (bounded cardinality); per-shard forensic detail
+    // lives in the tracing log, not the metric label set.
+    // ---------------------------------------------------------------
+
+    type UnsatShardFixtures = (
+        Arc<crate::PirInstance<crate::inspire::RavenInspireScheme>>,
+        Arc<InspirePersistence>,
+        Arc<parking_lot::Mutex<crate::inspire::LogicalLeafStore>>,
+        raven_inspire::params::InspireParams,
+        Arc<dyn PirTableEncoder>,
+        Arc<parking_lot::Mutex<ConsumerMetrics>>,
+        tempfile::TempDir,
+    );
+
+    fn build_unsat_shard_fixtures() -> UnsatShardFixtures {
+        use crate::inspire::LogicalLeafStore;
+        use crate::{InstanceRole, PirInstance};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = StoreLayout::open(dir.path()).expect("layout");
+        let state = build_toy_state().expect("state");
+        let params = InspireParams::secure_128_d2048();
+        let encoder = test_encoder();
+        let opened = InspirePersistence::open(
+            layout,
+            SCHEME_TAG,
+            InstanceId::new("unsat-shard-fixtures"),
+            SnapshotPolicy::default(),
+            Arc::clone(&encoder),
+        )
+        .expect("open");
+        let persistence = Arc::new(opened.persistence);
+        let empty_store = LogicalLeafStore::default();
+        persistence
+            .commit_v6(&state, &empty_store, 0)
+            .expect("initial commit");
+        let instance = Arc::new(PirInstance::new(
+            InstanceId::new("unsat-shard-fixtures"),
+            InstanceRole::Live,
+            state,
+        ));
+        let logical_store = Arc::new(parking_lot::Mutex::new(LogicalLeafStore::new()));
+        let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default()));
+        (
+            instance,
+            persistence,
+            logical_store,
+            params,
+            encoder,
+            metrics,
+            dir,
+        )
+    }
+
+    #[test]
+    fn drive_commit_removes_unsatisfiable_shard_id_from_dirty_set() {
+        let (instance, persistence, logical_store, params, encoder, metrics, _dir) =
+            build_unsat_shard_fixtures();
+        let db_shard_count = instance.current_state().encoded_db.shards.len();
+        let unsat_id = u32::try_from(db_shard_count).expect("u32 shard id");
+        logical_store
+            .lock()
+            .dirty_shards_mut_for_test()
+            .insert(unsat_id);
+        assert!(logical_store.lock().dirty_shards().contains(&unsat_id));
+
+        super::drive_commit(
+            &instance,
+            &persistence,
+            &logical_store,
+            &params,
+            encoder.as_ref(),
+            10,
+            &metrics,
+        )
+        .expect("drive_commit must succeed despite the unsatisfiable shard");
+
+        assert!(
+            !logical_store.lock().dirty_shards().contains(&unsat_id),
+            "unsatisfiable shard {unsat_id} must be dropped from dirty_shards \
+             so subsequent commits do not retry it"
+        );
+    }
+
+    #[test]
+    fn unsatisfiable_shard_metric_increments_per_drop_with_bounded_cardinality() {
+        // Thread-local `DebuggingRecorder` avoids racing the process-
+        // global Prometheus handle that sibling tests install. The
+        // recorder is per-thread + scoped to the closure body; the
+        // emit shape under test is independent of which recorder runs.
+        //
+        // The metric MUST carry only the `instance` label. The
+        // pre-fix emission embedded `shard_id => oor_id.to_string()`,
+        // which under repeated encoder mismatch would retain one
+        // Prometheus series per (instance, shard_id) tuple forever.
+        // Per-shard forensic detail lives in the tracing log.
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            let (instance, persistence, logical_store, params, encoder, metrics, _dir) =
+                build_unsat_shard_fixtures();
+            let db_shard_count = instance.current_state().encoded_db.shards.len();
+            let unsat_id = u32::try_from(db_shard_count).expect("u32 shard id");
+            logical_store
+                .lock()
+                .dirty_shards_mut_for_test()
+                .insert(unsat_id);
+            super::drive_commit(
+                &instance,
+                &persistence,
+                &logical_store,
+                &params,
+                encoder.as_ref(),
+                42,
+                &metrics,
+            )
+            .expect("drive_commit must drop the unsatisfiable shard");
+        });
+
+        let snap = snapshotter.snapshot().into_vec();
+        let mut found_value: Option<u64> = None;
+        for (ck, _unit, _desc, value) in snap {
+            if ck.key().name() != "raven_railgun_unsatisfiable_dirty_shards_total" {
+                continue;
+            }
+            let labels: Vec<(&str, &str)> =
+                ck.key().labels().map(|l| (l.key(), l.value())).collect();
+            let has_shard_id = labels.iter().any(|(k, _)| *k == "shard_id");
+            assert!(
+                !has_shard_id,
+                "raven_railgun_unsatisfiable_dirty_shards_total MUST NOT carry a \
+                 `shard_id` label (cardinality leak); got {labels:?}"
+            );
+            let has_instance = labels.iter().any(|(k, _)| *k == "instance");
+            if has_instance {
+                if let DebugValue::Counter(v) = value {
+                    found_value = Some(v);
+                    break;
+                }
+            }
+        }
+        let v = found_value.unwrap_or_else(|| {
+            panic!(
+                "no counter slot for raven_railgun_unsatisfiable_dirty_shards_total{{instance=...}} \
+                 in DebuggingRecorder snapshot"
+            )
+        });
+        assert_eq!(
+            v, 1,
+            "counter must increment exactly once per drop; got {v}"
+        );
+    }
+
+    #[test]
+    fn unsatisfiable_shard_metric_cardinality_bounded_across_distinct_shard_ids() {
+        // Drive 32 commits, each inserting a fresh out-of-range shard id
+        // (base, base+1, ..., base+31). The load-bearing cardinality
+        // invariant: across all 32 distinct shard ids, the recorder
+        // exposes EXACTLY ONE counter slot keyed on `(instance,)`.
+        // Pre-fix the producer was `Internal(...)` and never reached the
+        // counter emit; an even-earlier shape carried `shard_id` as a
+        // label, which would have produced 32 distinct (instance,
+        // shard_id) tuples and a classical cardinality leak.
+        //
+        // The exact total value across 32 emits is a property of the
+        // recorder's accumulator semantics, not the production-code
+        // invariant under test. The per-drop counter total is locked
+        // separately by `unsatisfiable_shard_metric_increments_per_drop_*`.
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            let (instance, persistence, logical_store, params, encoder, metrics, _dir) =
+                build_unsat_shard_fixtures();
+            let db_shard_count = instance.current_state().encoded_db.shards.len();
+            let base = u32::try_from(db_shard_count).expect("u32 base shard id");
+            for k in 0u32..32u32 {
+                let unsat_id = base + k;
+                logical_store
+                    .lock()
+                    .dirty_shards_mut_for_test()
+                    .insert(unsat_id);
+                super::drive_commit(
+                    &instance,
+                    &persistence,
+                    &logical_store,
+                    &params,
+                    encoder.as_ref(),
+                    u64::from(k),
+                    &metrics,
+                )
+                .expect("drive_commit must drop each unsatisfiable shard");
+            }
+        });
+
+        let snap = snapshotter.snapshot().into_vec();
+        let mut series_count: usize = 0;
+        let mut has_shard_id_label = false;
+        let mut has_instance_label = false;
+        for (ck, _unit, _desc, _value) in snap {
+            if ck.key().name() != "raven_railgun_unsatisfiable_dirty_shards_total" {
+                continue;
+            }
+            series_count += 1;
+            for label in ck.key().labels() {
+                if label.key() == "shard_id" {
+                    has_shard_id_label = true;
+                }
+                if label.key() == "instance" {
+                    has_instance_label = true;
+                }
+            }
+        }
+        assert_eq!(
+            series_count, 1,
+            "metric must have exactly one (instance,) tuple regardless of how \
+             many distinct shard_ids were dropped; got {series_count} series \
+             (a regression that re-introduced a `shard_id` label would surface \
+             here as `series_count == 32`)"
+        );
+        assert!(
+            has_instance_label,
+            "the single slot must carry the `instance` label"
+        );
+        assert!(
+            !has_shard_id_label,
+            "metric MUST NOT carry a `shard_id` label (cardinality leak)"
+        );
+    }
+
+    #[test]
+    fn drive_commit_consumer_errors_bounded_after_unsatisfiable_shard() {
+        let (instance, persistence, logical_store, params, encoder, metrics, _dir) =
+            build_unsat_shard_fixtures();
+        let db_shard_count = instance.current_state().encoded_db.shards.len();
+        let unsat_id = u32::try_from(db_shard_count).expect("u32 shard id");
+        logical_store
+            .lock()
+            .dirty_shards_mut_for_test()
+            .insert(unsat_id);
+
+        // 100 successive commits: the first drops the shard; every
+        // subsequent commit walks the (now empty) dirty set and produces
+        // 0 errors. The contract is "drive_commit returns Ok after the
+        // first drop and consumer_errors does not accumulate". Pre-fix
+        // (Internal variant) every commit returned Err and the consumer
+        // task would have bumped `consumer_errors` once per cadence.
+        for height in 0..100u64 {
+            super::drive_commit(
+                &instance,
+                &persistence,
+                &logical_store,
+                &params,
+                encoder.as_ref(),
+                height,
+                &metrics,
+            )
+            .expect("drive_commit must remain Ok across the loop");
+        }
+
+        let m = metrics.lock();
+        assert_eq!(
+            m.consumer_errors, 0,
+            "100 commits with a once-unsatisfiable shard must not accumulate \
+             consumer_errors (drive_commit returns Ok after dropping the shard)"
+        );
+        assert_eq!(
+            m.commits_fired, 100,
+            "every drive_commit must still bump commits_fired"
+        );
+    }
 }

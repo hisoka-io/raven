@@ -446,7 +446,11 @@ pub fn restore_inspire_state_v6(bytes: &[u8]) -> Result<(InspireServerState, Log
 ///
 /// # Errors
 /// Returns [`AdapterError::Scheme`] if `encode_database` rejects the shape.
-/// Returns [`AdapterError::Internal`] if `shard_id` is not present.
+/// Returns [`AdapterError::ShardOutOfRange`] if `shard_id` is not present
+/// in `encoded_db.shards`. The commit driver matches this variant to
+/// drop the shard from `dirty_shards` (retrying a structurally-
+/// unencodable shard is futile) and bump the cardinality-bounded
+/// `raven_railgun_unsatisfiable_dirty_shards_total{instance}` counter.
 pub fn re_encode_shard(
     encoded_db: &mut EncodedDatabase,
     params: &InspireParams,
@@ -459,11 +463,9 @@ pub fn re_encode_shard(
         .shards
         .iter_mut()
         .find(|s| s.id == shard_id)
-        .ok_or_else(|| {
-            AdapterError::Internal(format!(
-                "re_encode_shard: shard id {shard_id} not present in EncodedDatabase \
-                 (have {total_shards} shards)"
-            ))
+        .ok_or(AdapterError::ShardOutOfRange {
+            shard_id,
+            db_shard_count: total_shards,
         })?;
 
     let entries = shard_bytes.len() / entry_size.max(1);
@@ -868,6 +870,17 @@ impl LogicalLeafStore {
     /// (io/serialization) keep the shard dirty for retry.
     pub fn drop_dirty_shard(&mut self, shard_id: u32) -> bool {
         self.dirty_shards.remove(&shard_id)
+    }
+
+    /// Test-only access to the dirty-shards set. Production code drives
+    /// dirty-shard insertion through [`Self::apply`] / the chain-event
+    /// encoder; tests that need to seed an out-of-range shard id (to
+    /// exercise the `drive_commit` drop-and-bump-counter path) inject
+    /// directly via this helper. Behind `cfg(test)` so the operator
+    /// surface stays minimal.
+    #[cfg(test)]
+    pub fn dirty_shards_mut_for_test(&mut self) -> &mut std::collections::BTreeSet<u32> {
+        &mut self.dirty_shards
     }
 
     /// Merkle auth path for `(tree_number, leaf_index)` against the per-tree IMT.

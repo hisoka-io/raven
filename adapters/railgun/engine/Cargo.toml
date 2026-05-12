@@ -33,6 +33,7 @@ rayon = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 async-trait = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+metrics-util = { version = "0.19", features = ["debugging"] }
 proptest = { workspace = true }
 serde_json = { workspace = true }
 bitcode = { version = "0.6", features = ["serde"] }

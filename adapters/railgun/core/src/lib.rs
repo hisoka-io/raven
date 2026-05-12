@@ -286,7 +286,7 @@ pub enum AdapterError {
         /// The shard id that was requested but is not present.
         shard_id: u32,
         /// Number of shards currently in the encoded database.
-        db_shard_count: u32,
+        db_shard_count: usize,
     },
 }
 
