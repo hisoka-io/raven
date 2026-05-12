@@ -86,7 +86,12 @@ pub(crate) async fn query_handler<S: PirScheme>(
         "kind" => "single"
     )
     .record(elapsed.as_secs_f64());
-    metrics::counter!("raven_railgun_queries_total", "kind" => "single").increment(1);
+    metrics::counter!(
+        "raven_railgun_queries_total",
+        "instance" => instance_id.to_string(),
+        "kind" => "single"
+    )
+    .increment(1);
 
     let body_bytes = write_versioned(&response).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -161,8 +166,12 @@ pub(crate) async fn batch_handler<S: PirScheme>(
         "kind" => "batch"
     )
     .record(elapsed.as_secs_f64());
-    metrics::counter!("raven_railgun_queries_total", "kind" => "batch")
-        .increment(responses.len() as u64);
+    metrics::counter!(
+        "raven_railgun_queries_total",
+        "instance" => instance_id.to_string(),
+        "kind" => "batch"
+    )
+    .increment(responses.len() as u64);
     #[allow(clippy::cast_precision_loss)]
     let batch_len_f64 = responses.len() as f64;
     metrics::histogram!(

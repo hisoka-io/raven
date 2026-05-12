@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
-use raven_railgun_engine::inspire::RavenInspireScheme;
 use raven_railgun_engine::PirScheme;
 use serde::{Deserialize, Serialize};
 
@@ -107,8 +106,8 @@ pub(crate) fn build_status_response<S: PirScheme>(app: &AppState<S>) -> StatusRe
     }
 }
 
-pub(crate) async fn metrics_handler(
-    State(app): State<AppState<RavenInspireScheme>>,
+pub(crate) async fn metrics_handler<S: raven_railgun_engine::PirScheme>(
+    State(app): State<AppState<S>>,
 ) -> impl IntoResponse {
     refresh_dynamic_metrics(&app);
     let body = app.metrics_handle.render();

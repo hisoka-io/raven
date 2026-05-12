@@ -126,6 +126,7 @@ pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
         .route("/v1/health/live", get(health_live_handler))
         .route("/v1/health/ready", get(health_ready_handler::<S>))
         .route("/v1/events", get(events_handler::<S>))
+        .route("/metrics", get(metrics_handler::<S>))
         .with_state(state)
         .layer(auth_layer);
 
@@ -238,7 +239,7 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
             get(health_ready_handler::<RavenInspireScheme>),
         )
         .route("/v1/events", get(events_handler::<RavenInspireScheme>))
-        .route("/metrics", get(metrics_handler))
+        .route("/metrics", get(metrics_handler::<RavenInspireScheme>))
         .with_state(state)
         .layer(auth_layer);
 

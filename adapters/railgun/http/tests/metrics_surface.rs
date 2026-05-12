@@ -311,3 +311,99 @@ async fn metrics_handler_emits_per_instance_engine_gauges() {
         "scrape must emit process semaphore_permits_available gauge"
     );
 }
+
+/// Parity with rave at `metrics_surface.rs:298-307`: every increment of
+/// `raven_railgun_queries_total` must carry the `instance` label so
+/// operator dashboards can filter per-instance QPS. Pre-fix the counter
+/// was emitted with only `kind` (single|batch), making per-instance
+/// query throughput unobservable in the 6-instance topology even
+/// though the sibling `respond_seconds` + `batch_size` metrics emitted
+/// in the same handler did carry the label.
+#[tokio::test(flavor = "current_thread")]
+async fn queries_total_carries_instance_label_for_single_query() {
+    use axum::body::Body;
+    use axum::http::{header, Method, Request, StatusCode};
+    use http_body_util::BodyExt;
+    use raven_railgun_http::{router, write_versioned};
+    use std::net::SocketAddr;
+    use tower::ServiceExt;
+
+    const QUERIES_INSTANCE: &str = "queries-total-instance";
+
+    let router_built = {
+        let _g = APPSTATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let instance: Arc<PirInstance<EchoScheme>> = Arc::new(PirInstance::new(
+            InstanceId::new(QUERIES_INSTANCE),
+            InstanceRole::Static,
+            EchoState,
+        ));
+        let mut engine: Engine<EchoScheme> = Engine::new();
+        engine
+            .register_instance(Arc::clone(&instance))
+            .expect("register");
+
+        let mut cfg = HttpConfig::demo(TOKEN);
+        cfg.respond_timeout_secs = 5;
+        cfg.max_concurrent_queries = 4;
+        cfg.rate_limit_rps = 10_000;
+        cfg.rate_limit_burst = 10_000;
+        cfg.metrics_public = true;
+        let state = AppState::new(engine, cfg).expect("appstate");
+        router::<EchoScheme>(state).expect("router")
+    };
+
+    let q = EchoQuery { tag: 7 };
+    let body_bytes = write_versioned(&q).expect("serialize");
+    let mut req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/v1/instance/{QUERIES_INSTANCE}/query"))
+        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .body(Body::from(body_bytes))
+        .expect("build req");
+    let peer: SocketAddr = "127.0.0.1:50102".parse().expect("addr");
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(peer));
+    let resp = router_built.clone().oneshot(req).await.expect("oneshot");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "single-query must succeed before scraping the counter"
+    );
+
+    let mut scrape_req = Request::builder()
+        .method(Method::GET)
+        .uri("/metrics")
+        .body(Body::empty())
+        .expect("scrape req");
+    let scrape_peer: SocketAddr = "127.0.0.1:50103".parse().expect("scrape addr");
+    scrape_req
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(scrape_peer));
+    let scrape_resp = router_built.oneshot(scrape_req).await.expect("scrape");
+    assert_eq!(scrape_resp.status(), StatusCode::OK);
+    let body = scrape_resp
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let text = String::from_utf8(body.to_vec()).expect("utf8");
+
+    let expected = format!("instance=\"{QUERIES_INSTANCE}\"");
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("raven_railgun_queries_total{") && l.contains(&expected));
+    assert!(
+        line.is_some(),
+        "raven_railgun_queries_total must carry {expected} after a query lands\n\
+         FULL OUTPUT:\n{text}"
+    );
+    let line = line.expect("queries_total line present");
+    assert!(
+        line.contains("kind=\"single\""),
+        "queries_total line must also carry kind=\"single\": {line}"
+    );
+}

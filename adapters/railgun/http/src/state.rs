@@ -287,7 +287,7 @@ pub(crate) fn describe_prometheus_metrics() {
     }
     metrics::describe_counter!(
         "raven_railgun_queries_total",
-        "Total PIR queries served, labelled by kind (single|batch)"
+        "Total PIR queries served, labelled by instance + kind (single|batch)"
     );
     metrics::describe_counter!(
         "raven_railgun_auth_ok_total",
