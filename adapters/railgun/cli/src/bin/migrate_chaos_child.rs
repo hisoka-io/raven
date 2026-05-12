@@ -23,8 +23,7 @@ use std::sync::Arc;
 
 use raven_railgun_core::AdapterError;
 use raven_railgun_engine::inspire::{
-    apply_wal_entry, re_encode_shard, restore_inspire_state, snapshot_inspire_state,
-    LogicalLeafStore,
+    apply_wal_entry, re_encode_shard, restore_inspire_state_v6, snapshot_inspire_state_v6,
 };
 use raven_railgun_engine::pir_table::{EncoderKind, PerLeafCommitmentEncoder, PirTableEncoder};
 use raven_railgun_persistence::{
@@ -167,14 +166,15 @@ fn main() {
     );
 
     let snap = Snapshot::load(&layout, manifest.current_snapshot_id).expect("load snapshot");
-    let mut state = restore_inspire_state(&snap.data).expect("restore inspire state");
+    let (mut state, recovered_seed_store) =
+        restore_inspire_state_v6(&snap.data).expect("restore_inspire_state_v6");
 
     let noop_encoder: Arc<dyn PirTableEncoder> =
         Arc::new(PerLeafCommitmentEncoder::new(32, 1).expect("noop encoder"));
     let wal_floor = manifest.current_snapshot_seq.checked_sub(1);
     let wal = Wal::open(&layout, wal_floor).expect("wal open");
     let replay = wal.replay().expect("wal replay");
-    let mut logical_store = LogicalLeafStore::new();
+    let mut logical_store = recovered_seed_store;
     for entry in &replay.entries {
         if entry.seq < manifest.current_snapshot_seq {
             continue;
@@ -230,7 +230,8 @@ fn main() {
         pause_until_killed(args.pause_at.name());
     }
 
-    let bundle = snapshot_inspire_state(&state).expect("snapshot_inspire_state");
+    let bundle =
+        snapshot_inspire_state_v6(&state, &logical_store).expect("snapshot_inspire_state_v6");
     let new_snap = Snapshot::build(bundle);
     let new_id = manifest.current_snapshot_id.next();
     new_snap.save(&layout, new_id).expect("snapshot save");
