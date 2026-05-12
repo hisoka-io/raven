@@ -189,6 +189,7 @@ async fn worker_emits_reorg_message_after_simulated_reorg() {
         start_block: 0,
         poll_interval_secs: 1,
         chunk_blocks: 30,
+        ..IndexerWorkerConfig::default()
     };
     let join = tokio::spawn(async move { worker.run(cfg).await });
 
