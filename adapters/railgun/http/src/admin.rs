@@ -1,7 +1,5 @@
 //! Admin drain/undrain handlers and inspire-specific session/params handlers.
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -11,7 +9,7 @@ use axum::{
 };
 use bytes::Bytes;
 use raven_inspire::inspiring::ClientPackingKeys;
-use raven_railgun_core::{Epoch, InstanceId};
+use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{InspireServerState, RavenInspireScheme};
 use raven_railgun_engine::{DrainState, PirScheme};
 use serde::{Deserialize, Serialize};
@@ -147,27 +145,6 @@ pub struct InstanceParams {
     pub epoch: u64,
 }
 
-/// Process-global ETag cache for `GET /v1/instance/{id}/params`.
-///
-/// Keyed by `(InstanceId, Epoch)` so SHA-256 is amortised across the
-/// per-epoch-stable response body. Entries are obsolete the moment the
-/// epoch bumps (via `swap_state` or heartbeat eviction) but are not
-/// proactively pruned — staleness is benign because the cache key
-/// pins the epoch, so a stale entry can never be looked up.
-///
-/// The cache lives in a private `OnceLock` so callers do not need an
-/// `AppState` field. If the orchestrator later wants to hang the cache
-/// off [`crate::AppState`] for explicit teardown control, replace the
-/// `OnceLock` with an `Arc<ParamsEtagCache>` field on `AppState` and
-/// thread it through `params_etag_cache()`. The cache type and key
-/// shape do not need to change for that migration.
-pub(crate) type ParamsEtagCache = parking_lot::RwLock<HashMap<(InstanceId, Epoch), [u8; 32]>>;
-
-fn params_etag_cache() -> &'static ParamsEtagCache {
-    static CACHE: OnceLock<ParamsEtagCache> = OnceLock::new();
-    CACHE.get_or_init(|| parking_lot::RwLock::new(HashMap::new()))
-}
-
 pub(crate) async fn session_establish_handler(
     State(app): State<AppState<RavenInspireScheme>>,
     Path(id): Path<String>,
@@ -292,13 +269,16 @@ pub(crate) async fn params_handler(
     let body = write_versioned(&payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // ETag is the SHA-256 of the full response body. Cache it keyed on
-    // `(instance_id, epoch)` so we skip rehashing the body on every
-    // request at a stable epoch; the entry is invalidated implicitly
-    // when the epoch bumps (cache lookup misses the new key).
-    let cache_key = (instance_id.clone(), epoch);
+    // `InstanceId` with `(epoch, sha256)` payload so an epoch bump
+    // invalidates the prior entry without growing the map. The cache
+    // lives on the per-process `AppState` so test isolation matches
+    // production isolation.
     let cached = {
-        let guard = params_etag_cache().read();
-        guard.get(&cache_key).copied()
+        let guard = app.params_etag_cache.read();
+        guard
+            .get(&instance_id)
+            .filter(|(stored_epoch, _)| *stored_epoch == epoch)
+            .map(|(_, hash)| *hash)
     };
     let sha = if let Some(hit) = cached {
         hit
@@ -307,8 +287,8 @@ pub(crate) async fn params_handler(
         let digest = Sha256::digest(&body);
         let mut fresh = [0u8; 32];
         fresh.copy_from_slice(digest.as_slice());
-        let mut guard = params_etag_cache().write();
-        guard.insert(cache_key, fresh);
+        let mut guard = app.params_etag_cache.write();
+        guard.insert(instance_id.clone(), (epoch, fresh));
         fresh
     };
     let etag_value = format!("\"{}\"", to_hex_lower(&sha));

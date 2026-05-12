@@ -19,7 +19,6 @@ use axum::{
     extract::ConnectInfo,
     http::{header, Method, Request, StatusCode},
 };
-use std::net::SocketAddr;
 use http_body_util::BodyExt;
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_core::{Epoch, InstanceId};
@@ -27,6 +26,7 @@ use raven_railgun_engine::inspire::{setup_state, RavenInspireScheme};
 use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
 use raven_railgun_http::{AppState, HttpConfig};
 use sha2::{Digest, Sha256};
+use std::net::SocketAddr;
 use tower::ServiceExt;
 
 const READ_TOKEN: &str = "BEARER-PARAMS-CACHE-padded-min-len-aabb";

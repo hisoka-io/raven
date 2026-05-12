@@ -69,7 +69,20 @@ pub struct AppState<S: PirScheme> {
     /// `refresh_dynamic_metrics` into the `metrics_handler`.
     #[allow(dead_code)]
     pub(crate) process_started_at: Instant,
+    /// Per-AppState ETag cache for `GET /v1/instance/:id/params`.
+    /// Keyed by `InstanceId` with `(epoch, sha256)` payload so an epoch
+    /// bump invalidates the cached hash for a given instance without
+    /// growing the map across the lifetime of the process.
+    pub(crate) params_etag_cache: Arc<ParamsEtagCache>,
 }
+
+/// Per-AppState ETag cache type for `/v1/instance/:id/params`.
+///
+/// Map shape: `InstanceId -> (Epoch, sha256)`. One entry per instance;
+/// an epoch bump overwrites the prior payload. The map never grows
+/// beyond `O(instance count)`.
+pub(crate) type ParamsEtagCache =
+    parking_lot::RwLock<HashMap<InstanceId, (raven_railgun_core::Epoch, [u8; 32])>>;
 
 impl<S: PirScheme> Clone for AppState<S> {
     fn clone(&self) -> Self {
@@ -89,6 +102,7 @@ impl<S: PirScheme> Clone for AppState<S> {
             metrics_handle: Arc::clone(&self.metrics_handle),
             instance_metrics: Arc::clone(&self.instance_metrics),
             process_started_at: self.process_started_at,
+            params_etag_cache: Arc::clone(&self.params_etag_cache),
         }
     }
 }
@@ -139,6 +153,7 @@ impl<S: PirScheme> AppState<S> {
             metrics_handle,
             instance_metrics: Arc::new(HashMap::new()),
             process_started_at: Instant::now(),
+            params_etag_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         })
     }
 
