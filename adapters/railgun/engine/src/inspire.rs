@@ -705,6 +705,17 @@ impl LogicalLeafStore {
         self.dirty_shards.clear();
     }
 
+    /// Remove a specific shard id from the dirty set.
+    ///
+    /// Returns `true` if the shard was present and dropped. Used by
+    /// `drive_commit` to discard structurally-unencodable shard ids
+    /// (`AdapterError::ShardOutOfRange`) so the commit driver stops
+    /// retrying them on every cadence trigger. Transient errors
+    /// (io/serialization) keep the shard dirty for retry.
+    pub fn drop_dirty_shard(&mut self, shard_id: u32) -> bool {
+        self.dirty_shards.remove(&shard_id)
+    }
+
     /// Merkle auth path for `(tree_number, leaf_index)` against the per-tree IMT.
     ///
     /// # Errors

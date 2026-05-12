@@ -274,6 +274,20 @@ pub enum AdapterError {
     /// Internal post-condition violation.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// Re-encode targeted a `shard_id` past the `EncodedDatabase` shard
+    /// count. Distinct from [`AdapterError::Internal`] so the commit
+    /// driver can drop the shard from `dirty_shards` (retrying a
+    /// structurally-unencodable shard is futile) while keeping
+    /// transient errors (network/io/serialization) on the dirty list
+    /// for retry.
+    #[error("shard out of range: shard_id {shard_id} (have {db_shard_count} shards)")]
+    ShardOutOfRange {
+        /// The shard id that was requested but is not present.
+        shard_id: u32,
+        /// Number of shards currently in the encoded database.
+        db_shard_count: u32,
+    },
 }
 
 /// Adapter-level result alias.
