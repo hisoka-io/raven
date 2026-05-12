@@ -55,7 +55,7 @@ async fn populate_from_zero_takes_under_30s_for_1k_events() {
         max_rows_per_fetch: corpus_size.into(),
         txid_version: "V2_PoseidonMerkle".into(),
     };
-    let mirror = Arc::new(UpstreamPpoiMirror::new(mirror_config));
+    let mirror = Arc::new(UpstreamPpoiMirror::new(mirror_config).expect("mirror"));
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(WalEntryPayload, u64)>(2_048);
 
     let started = Instant::now();

@@ -94,7 +94,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     use raven_railgun_indexer::{
         ChainSource, IndexerWorker, IndexerWorkerConfig, RpcChainSource, DEFAULT_POLL_INTERVAL_SECS,
     };
-    use raven_railgun_ppoi_mirror::{MirrorConfig, UpstreamPpoiMirror};
+    use raven_railgun_ppoi_mirror::{MirrorConfig, MirrorCursor, UpstreamPpoiMirror};
 
     let proxy_addr: Address = opts
         .railgun_proxy
@@ -183,11 +183,33 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         endpoint: opts.mirror_endpoint.clone(),
         ..MirrorConfig::default()
     };
-    let mirror = Arc::new(UpstreamPpoiMirror::new(mirror_config));
+    let mirror = Arc::new(
+        UpstreamPpoiMirror::new(mirror_config)
+            .map_err(|e| anyhow::anyhow!("ppoi mirror constructor: {e}"))?,
+    );
     let mirror_tx = handle.channels.mirror_tx.clone();
     let mirror_clone = Arc::clone(&mirror);
+    // Cursor sidecar lives under the operator-provided data_dir so a
+    // restart resumes from the post-WAL-replay floor rather than
+    // re-firing `expected list_index N, got 0..N-1` on every startup.
+    // Kind is dispatched from the configured encoder: per-list-path
+    // encoders own the path sidecar; chain-tree encoders + status
+    // encoders share the status sidecar by convention.
+    let mirror_kind = mirror_kind_for_encoder(opts.encoder);
+    let fallback = {
+        let store = handle.logical_store.lock();
+        #[allow(clippy::cast_possible_truncation)]
+        let count = store
+            .ppoi_imt(&list_key.0)
+            .map_or(0u64, |imt| imt.leaf_count() as u64);
+        count
+    };
+    let cursor = MirrorCursor::new(opts.data_dir.clone(), mirror_kind, fallback);
     let mirror_handle = tokio::spawn(async move {
-        if let Err(e) = mirror_clone.run_worker(list_key, 0, mirror_tx).await {
+        if let Err(e) = mirror_clone
+            .run_worker_with_cursor(list_key, 0, Some(cursor), mirror_tx)
+            .await
+        {
             tracing::error!(error = %e, "ppoi mirror worker exiting");
         }
     });
@@ -320,6 +342,25 @@ fn parse_hex32(s: &str) -> anyhow::Result<[u8; 32]> {
         *byte = (nib(hi)? << 4) | nib(lo)?;
     }
     Ok(out)
+}
+
+/// Dispatch [`raven_railgun_ppoi_mirror::MirrorKind`] from the
+/// configured encoder.
+///
+/// `per-list-path` owns the path sidecar; every other encoder kind
+/// defaults to the status sidecar. Chain-tree encoders (`PerLeafBc`,
+/// `PerLeafPath`, `PerNode`) still drive the single-list mirror feed
+/// in the single-instance entry point and the status sidecar is the
+/// canonical resume point there.
+fn mirror_kind_for_encoder(
+    encoder: raven_railgun_engine::pir_table::EncoderKind,
+) -> raven_railgun_ppoi_mirror::MirrorKind {
+    use raven_railgun_engine::pir_table::EncoderKind;
+    use raven_railgun_ppoi_mirror::MirrorKind;
+    match encoder {
+        EncoderKind::PerListPath { .. } => MirrorKind::Path,
+        _ => MirrorKind::Status,
+    }
 }
 
 #[cfg(test)]

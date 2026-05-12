@@ -31,10 +31,6 @@ use raven_railgun_mock_ppoi::{
 use raven_railgun_persistence::WalEntryPayload;
 use raven_railgun_ppoi_mirror::{MirrorConfig, UpstreamPpoiMirror};
 
-// IMT lockstep with the status map is gated on the mirror dual-emit
-// (`PpoiListLeafAdded` precedes `PpoiStatus`) which lives in the
-// indexer/mirror layer port. Re-enabled once that lands.
-#[ignore = "requires mirror dual-emit (PpoiListLeafAdded -> PpoiStatus)"]
 #[tokio::test]
 async fn adapter_consumes_mock_ppoi_events_and_populates_per_list_imt() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -65,7 +61,7 @@ async fn adapter_consumes_mock_ppoi_events_and_populates_per_list_imt() {
         max_rows_per_fetch: corpus_size.into(),
         txid_version: "V2_PoseidonMerkle".into(),
     };
-    let mirror = Arc::new(UpstreamPpoiMirror::new(mirror_config));
+    let mirror = Arc::new(UpstreamPpoiMirror::new(mirror_config).expect("mirror"));
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(WalEntryPayload, u64)>(64);
     let worker_handle = tokio::spawn({
         let mirror = mirror.clone();
