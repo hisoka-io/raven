@@ -196,6 +196,12 @@ struct GlobalSection {
     max_instance_count: Option<u32>,
     #[serde(default)]
     tree_fill_threshold: Option<f32>,
+    /// Optional WebSocket endpoint. When set, the chain indexer uses
+    /// `WsChainSource` as the primary transport and the configured
+    /// HTTP RPC (or pool) as automatic fallback; mode transitions
+    /// surface via `/v1/health/ready.chain_source_mode`.
+    #[serde(default)]
+    ws_endpoint: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -305,6 +311,9 @@ pub struct MultiServeOptions {
     pub tree_fill_threshold: Option<f32>,
     /// When `Some` on Unix, installs a SIGHUP handler for TOML hot-reload.
     pub reload_config_path: Option<PathBuf>,
+    /// WebSocket endpoint for chain indexer primary transport (HTTP RPC is used as fallback).
+    /// `None` keeps the existing HTTP-only indexer behavior.
+    pub ws_endpoint: Option<String>,
 }
 
 pub type BootstrapObserver = Arc<parking_lot::Mutex<Option<BootstrapView>>>;
@@ -570,6 +579,7 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         ppoi_list_templates: parsed.ppoi_list_template,
         tree_fill_threshold: parsed.global.tree_fill_threshold,
         reload_config_path: Some(path.to_path_buf()),
+        ws_endpoint: parsed.global.ws_endpoint,
     })
 }
 
@@ -830,7 +840,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     let mirror_workers = if opts.skip_mirror_workers {
         None
     } else {
-        Some(spawn_mirror_workers(&opts, &bootstrap.handles))
+        Some(spawn_mirror_workers(&opts, &bootstrap.handles)?)
     };
 
     let mut http_config = HttpConfig::demo(opts.token.clone());
@@ -934,6 +944,15 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         .map(Arc::clone)
     {
         app_state.with_rpc_pool(pool)
+    } else {
+        app_state
+    };
+    let app_state = if let Some(mode) = chain_workers
+        .as_ref()
+        .and_then(|w| w.chain_source_mode.as_ref())
+        .map(Arc::clone)
+    {
+        app_state.with_chain_source_mode(mode)
     } else {
         app_state
     };
@@ -1600,6 +1619,15 @@ fn bootstrap_instances(
 struct ChainWorkers {
     handle: tokio::task::JoinHandle<()>,
     rpc_pool: Option<Arc<raven_railgun_indexer::rpc_pool::RpcEndpointPool>>,
+    /// Live mode flag for `/v1/health/ready.chain_source_mode`.
+    /// `Some` when `--ws-endpoint` is set (WS auto-fallback active).
+    chain_source_mode: Option<Arc<raven_railgun_indexer::ModeFlag>>,
+    /// Background task that polls the `AutoFallbackChainSource.mode()`
+    /// at 1 s ticks and writes through to `chain_source_mode`.
+    mode_mirror: Option<tokio::task::JoinHandle<()>>,
+    /// Cooperative shutdown signal for `mode_mirror`. Always present;
+    /// the receiver in the spawned task observes `true` and exits.
+    mode_mirror_shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 async fn spawn_chain_indexer(
@@ -1611,7 +1639,8 @@ async fn spawn_chain_indexer(
         DynChainSource, EndpointConfig, PoolConfig, PooledRpcChainSource, RpcEndpointPool,
     };
     use raven_railgun_indexer::{
-        ChainSource, IndexerWorker, IndexerWorkerConfig, RpcChainSource, DEFAULT_POLL_INTERVAL_SECS,
+        AutoFallbackChainSource, ChainSource, IndexerWorker, IndexerWorkerConfig, ModeFlag,
+        RpcChainSource, WsChainSource, DEFAULT_POLL_INTERVAL_SECS,
     };
 
     let proxy_addr: Address = opts
@@ -1619,58 +1648,118 @@ async fn spawn_chain_indexer(
         .parse()
         .with_context(|| format!("invalid railgun_proxy: {}", opts.railgun_proxy))?;
 
-    let (chain_source, rpc_pool) = match opts.rpc_pool.as_ref() {
-        Some(pool_cfg) if pool_cfg.urls.len() >= 2 => {
-            let endpoint_configs = pool_cfg
-                .urls
-                .iter()
-                .map(|u| EndpointConfig {
-                    url: u.clone(),
-                    rps: pool_cfg.per_endpoint_rps,
-                    burst: pool_cfg.per_endpoint_burst,
-                })
-                .collect();
-            let pool_config = PoolConfig {
-                strategy: pool_cfg.strategy.into(),
-                cooldown_secs_on_error: u64::from(pool_cfg.cooldown_secs.max(1)),
-                ..PoolConfig::default()
-            };
-            let pool = Arc::new(
-                RpcEndpointPool::new(endpoint_configs, pool_config)
-                    .map_err(|e| anyhow::anyhow!("rpc_pool init: {e}"))?,
-            );
-            tracing::info!(
-                endpoints = pool.len(),
-                strategy = ?pool.config().strategy,
-                per_endpoint_rps = pool_cfg.per_endpoint_rps,
-                per_endpoint_burst = pool_cfg.per_endpoint_burst,
-                "rpc endpoint pool wired"
-            );
-            let pooled = Arc::new(PooledRpcChainSource::new(
-                Arc::clone(&pool),
-                proxy_addr,
-                opts.chain_id,
-            ));
-            (DynChainSource::Pooled(pooled), Some(pool))
-        }
-        _ => {
-            let url = match opts.rpc_pool.as_ref() {
-                Some(pool_cfg) if pool_cfg.urls.len() == 1 => pool_cfg
-                    .urls
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| opts.rpc_url.clone()),
-                _ => opts.rpc_url.clone(),
-            };
-            let single = Arc::new(RpcChainSource::new(
-                url,
-                proxy_addr,
-                opts.start_block,
-                opts.chain_id,
-            ));
-            (DynChainSource::Single(single), None)
-        }
+    let build_pool = |pool_cfg: &RpcPoolConfigToml| -> anyhow::Result<Arc<RpcEndpointPool>> {
+        let endpoint_configs = pool_cfg
+            .urls
+            .iter()
+            .map(|u| EndpointConfig {
+                url: u.clone(),
+                rps: pool_cfg.per_endpoint_rps,
+                burst: pool_cfg.per_endpoint_burst,
+            })
+            .collect();
+        let pool_config = PoolConfig {
+            strategy: pool_cfg.strategy.into(),
+            cooldown_secs_on_error: u64::from(pool_cfg.cooldown_secs.max(1)),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(
+            RpcEndpointPool::new(endpoint_configs, pool_config)
+                .map_err(|e| anyhow::anyhow!("rpc_pool init: {e}"))?,
+        );
+        tracing::info!(
+            endpoints = pool.len(),
+            strategy = ?pool.config().strategy,
+            per_endpoint_rps = pool_cfg.per_endpoint_rps,
+            per_endpoint_burst = pool_cfg.per_endpoint_burst,
+            "rpc endpoint pool wired"
+        );
+        Ok(pool)
     };
+
+    // (mode_mirror_shutdown_tx, mode_mirror_shutdown_rx) — always created;
+    // the receiver is only used by `spawn_mode_mirror` when WS is active.
+    let (mode_mirror_shutdown_tx, mode_mirror_shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let (chain_source, rpc_pool, chain_source_mode, mode_mirror) =
+        match (opts.ws_endpoint.as_deref(), opts.rpc_pool.as_ref()) {
+            // WS primary + multi-endpoint pooled fallback.
+            (Some(ws_url), Some(pool_cfg)) if pool_cfg.urls.len() >= 2 => {
+                let pool = build_pool(pool_cfg)?;
+                let pooled = Arc::new(PooledRpcChainSource::new(
+                    Arc::clone(&pool),
+                    proxy_addr,
+                    opts.chain_id,
+                ));
+                let ws = Arc::new(WsChainSource::new(ws_url, proxy_addr, opts.chain_id));
+                let auto = Arc::new(AutoFallbackChainSource::new(ws, pooled));
+                let mode_flag = Arc::new(ModeFlag::default());
+                let mirror = spawn_mode_mirror_pooled(
+                    Arc::clone(&auto),
+                    Arc::clone(&mode_flag),
+                    mode_mirror_shutdown_rx,
+                );
+                (
+                    DynChainSource::AutoFallbackPooled(auto),
+                    Some(pool),
+                    Some(mode_flag),
+                    Some(mirror),
+                )
+            }
+            // WS primary + single-endpoint HTTP fallback (either single-URL pool or rpc_url).
+            (Some(ws_url), _) => {
+                let single_url = opts
+                    .rpc_pool
+                    .as_ref()
+                    .and_then(|p| p.urls.first().cloned())
+                    .unwrap_or_else(|| opts.rpc_url.clone());
+                let single = Arc::new(RpcChainSource::new(
+                    single_url,
+                    proxy_addr,
+                    opts.start_block,
+                    opts.chain_id,
+                ));
+                let ws = Arc::new(WsChainSource::new(ws_url, proxy_addr, opts.chain_id));
+                let auto = Arc::new(AutoFallbackChainSource::new(ws, single));
+                let mode_flag = Arc::new(ModeFlag::default());
+                let mirror = spawn_mode_mirror_single(
+                    Arc::clone(&auto),
+                    Arc::clone(&mode_flag),
+                    mode_mirror_shutdown_rx,
+                );
+                (
+                    DynChainSource::AutoFallbackSingle(auto),
+                    None,
+                    Some(mode_flag),
+                    Some(mirror),
+                )
+            }
+            // No WS, multi-endpoint pooled HTTP.
+            (None, Some(pool_cfg)) if pool_cfg.urls.len() >= 2 => {
+                let pool = build_pool(pool_cfg)?;
+                let pooled = Arc::new(PooledRpcChainSource::new(
+                    Arc::clone(&pool),
+                    proxy_addr,
+                    opts.chain_id,
+                ));
+                (DynChainSource::Pooled(pooled), Some(pool), None, None)
+            }
+            // No WS, single-endpoint HTTP (legacy default).
+            _ => {
+                let url = opts
+                    .rpc_pool
+                    .as_ref()
+                    .and_then(|p| p.urls.first().cloned())
+                    .unwrap_or_else(|| opts.rpc_url.clone());
+                let single = Arc::new(RpcChainSource::new(
+                    url,
+                    proxy_addr,
+                    opts.start_block,
+                    opts.chain_id,
+                ));
+                (DynChainSource::Single(single), None, None, None)
+            }
+        };
 
     let head = chain_source
         .latest_block()
@@ -1679,6 +1768,7 @@ async fn spawn_chain_indexer(
     tracing::info!(
         chain_head = head,
         start_block = opts.start_block,
+        ws_endpoint = opts.ws_endpoint.as_deref().unwrap_or(""),
         "chain RPC reachable"
     );
     let worker = IndexerWorker::new(Arc::new(chain_source), indexer_tx);
@@ -1692,11 +1782,112 @@ async fn spawn_chain_indexer(
             tracing::error!(error = %e, "chain indexer worker exiting");
         }
     });
-    Ok(ChainWorkers { handle, rpc_pool })
+    Ok(ChainWorkers {
+        handle,
+        rpc_pool,
+        chain_source_mode,
+        mode_mirror,
+        mode_mirror_shutdown_tx,
+    })
+}
+
+/// Sample cadence for the `mode_mirror` task: 1 second matches the
+/// rave-WIP reference and keeps `/v1/health/ready.chain_source_mode`
+/// within one sample of the underlying `AutoFallbackChainSource` state.
+const MODE_MIRROR_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn spawn_mode_mirror_single(
+    source: Arc<
+        raven_railgun_indexer::AutoFallbackChainSource<
+            raven_railgun_indexer::WsChainSource,
+            raven_railgun_indexer::RpcChainSource,
+        >,
+    >,
+    flag: Arc<raven_railgun_indexer::ModeFlag>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(MODE_MIRROR_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    flag.set(source.mode().await);
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn spawn_mode_mirror_pooled(
+    source: Arc<
+        raven_railgun_indexer::AutoFallbackChainSource<
+            raven_railgun_indexer::WsChainSource,
+            raven_railgun_indexer::rpc_pool::PooledRpcChainSource,
+        >,
+    >,
+    flag: Arc<raven_railgun_indexer::ModeFlag>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(MODE_MIRROR_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    flag.set(source.mode().await);
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
+impl ChainWorkers {
+    /// Cooperative shutdown of the `mode_mirror` task. Falls back to
+    /// `abort()` on timeout. Caller awaits the returned future before
+    /// dropping `Self` to avoid an unconditional `JoinHandle::abort()`
+    /// that hides panics from observation. Returns `true` if the task
+    /// observed the signal and exited cleanly, `false` on timeout.
+    #[allow(dead_code)]
+    async fn shutdown_mode_mirror(&mut self, timeout: std::time::Duration) -> bool {
+        let Some(handle) = self.mode_mirror.take() else {
+            return true;
+        };
+        let _ = self.mode_mirror_shutdown_tx.send(true);
+        match tokio::time::timeout(timeout, handle).await {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) if e.is_cancelled() => true,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "mode_mirror task join error");
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = timeout.as_secs(),
+                    "mode_mirror task did not observe shutdown signal within timeout"
+                );
+                false
+            }
+        }
+    }
 }
 
 impl Drop for ChainWorkers {
     fn drop(&mut self) {
+        let _ = self.mode_mirror_shutdown_tx.send(true);
+        if let Some(handle) = self.mode_mirror.take() {
+            handle.abort();
+        }
         self.handle.abort();
     }
 }
@@ -1708,14 +1899,18 @@ struct MirrorWorkers {
 fn spawn_mirror_workers(
     opts: &MultiServeOptions,
     handle: &MultiOrchestratorHandle,
-) -> MirrorWorkers {
-    use raven_railgun_ppoi_mirror::{MirrorConfig, UpstreamPpoiMirror};
+) -> anyhow::Result<MirrorWorkers> {
+    use raven_railgun_engine::pir_table::EncoderKind;
+    use raven_railgun_ppoi_mirror::{MirrorConfig, MirrorCursor, MirrorKind, UpstreamPpoiMirror};
 
     let mirror_config = MirrorConfig {
         endpoint: opts.mirror_endpoint.clone(),
         ..MirrorConfig::default()
     };
-    let mirror = Arc::new(UpstreamPpoiMirror::new(mirror_config));
+    let mirror = Arc::new(
+        UpstreamPpoiMirror::new(mirror_config)
+            .map_err(|e| anyhow::anyhow!("ppoi mirror constructor: {e}"))?,
+    );
     let mirror_tx = handle.channels.mirror_tx.clone();
 
     let mut handles = Vec::new();
@@ -1723,15 +1918,36 @@ fn spawn_mirror_workers(
         if let DataSourceFilter::PpoiList(list_key) = inst.config.data_source {
             let mirror_clone = Arc::clone(&mirror);
             let tx = mirror_tx.clone();
+            // Per-instance cursor sidecar in the instance data_dir.
+            // Kind dispatch: per-list-path encoders own the path
+            // sidecar; per-list-status / per-list-node and any
+            // other encoder fall through to the status sidecar.
+            // Status / path advance independently after a restart.
+            let kind = match inst.config.encoder {
+                EncoderKind::PerListPath { .. } => MirrorKind::Path,
+                _ => MirrorKind::Status,
+            };
+            let fallback = {
+                let store = inst.logical_store.lock();
+                #[allow(clippy::cast_possible_truncation)]
+                let count = store
+                    .ppoi_imt(&list_key)
+                    .map_or(0u64, |imt| imt.leaf_count() as u64);
+                count
+            };
+            let cursor = MirrorCursor::new(inst.config.data_dir.clone(), kind, fallback);
             let h = tokio::spawn(async move {
-                if let Err(e) = mirror_clone.run_worker(ListKey(list_key), 0, tx).await {
+                if let Err(e) = mirror_clone
+                    .run_worker_with_cursor(ListKey(list_key), 0, Some(cursor), tx)
+                    .await
+                {
                     tracing::error!(error = %e, "ppoi mirror worker exiting");
                 }
             });
             handles.push(h);
         }
     }
-    MirrorWorkers { handles }
+    Ok(MirrorWorkers { handles })
 }
 
 impl Drop for MirrorWorkers {

@@ -187,6 +187,7 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
         ppoi_list_templates: vec![],
         tree_fill_threshold: None,
         reload_config_path: None,
+        ws_endpoint: None,
     };
 
     let (stop_tx, stop_rx) = oneshot::channel::<()>();

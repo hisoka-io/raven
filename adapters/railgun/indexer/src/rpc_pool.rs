@@ -790,11 +790,24 @@ impl ChainSource for PooledRpcChainSource {
     }
 }
 
-/// Erases the single-vs-pooled choice from the indexer worker type signature.
+/// Erases the single-vs-pooled-vs-WS-auto-fallback choice from the indexer
+/// worker type signature. The two `AutoFallback*` variants concretize
+/// [`crate::AutoFallbackChainSource`]'s fallback type parameter
+/// (single-RPC vs pooled), since the generic doesn't erase to a single trait
+/// object without a `Box<dyn ChainSource>` indirection that defeats per-method
+/// static dispatch.
 #[derive(Clone)]
 pub enum DynChainSource {
+    /// Single-endpoint legacy source.
     Single(Arc<RpcChainSource>),
+    /// Multi-endpoint pooled source.
     Pooled(Arc<PooledRpcChainSource>),
+    /// WS auto-fallback wrapping a single-RPC fallback.
+    AutoFallbackSingle(Arc<crate::AutoFallbackChainSource<crate::WsChainSource, RpcChainSource>>),
+    /// WS auto-fallback wrapping a pooled-RPC fallback.
+    AutoFallbackPooled(
+        Arc<crate::AutoFallbackChainSource<crate::WsChainSource, PooledRpcChainSource>>,
+    ),
 }
 
 impl std::fmt::Debug for DynChainSource {
@@ -802,6 +815,12 @@ impl std::fmt::Debug for DynChainSource {
         match self {
             Self::Single(_) => f.debug_tuple("DynChainSource::Single").finish(),
             Self::Pooled(_) => f.debug_tuple("DynChainSource::Pooled").finish(),
+            Self::AutoFallbackSingle(_) => {
+                f.debug_tuple("DynChainSource::AutoFallbackSingle").finish()
+            }
+            Self::AutoFallbackPooled(_) => {
+                f.debug_tuple("DynChainSource::AutoFallbackPooled").finish()
+            }
         }
     }
 }
@@ -812,12 +831,16 @@ impl ChainSource for DynChainSource {
         match self {
             Self::Single(s) => s.latest_block().await,
             Self::Pooled(s) => s.latest_block().await,
+            Self::AutoFallbackSingle(s) => s.latest_block().await,
+            Self::AutoFallbackPooled(s) => s.latest_block().await,
         }
     }
     async fn events_in_range(&self, from: u64, to: u64) -> Result<Vec<RailgunEvent>> {
         match self {
             Self::Single(s) => s.events_in_range(from, to).await,
             Self::Pooled(s) => s.events_in_range(from, to).await,
+            Self::AutoFallbackSingle(s) => s.events_in_range(from, to).await,
+            Self::AutoFallbackPooled(s) => s.events_in_range(from, to).await,
         }
     }
     async fn root_history(
@@ -829,24 +852,32 @@ impl ChainSource for DynChainSource {
         match self {
             Self::Single(s) => s.root_history(tree_number, merkle_root, at).await,
             Self::Pooled(s) => s.root_history(tree_number, merkle_root, at).await,
+            Self::AutoFallbackSingle(s) => s.root_history(tree_number, merkle_root, at).await,
+            Self::AutoFallbackPooled(s) => s.root_history(tree_number, merkle_root, at).await,
         }
     }
     async fn block_hash(&self, block_number: u64) -> Result<[u8; 32]> {
         match self {
             Self::Single(s) => s.block_hash(block_number).await,
             Self::Pooled(s) => s.block_hash(block_number).await,
+            Self::AutoFallbackSingle(s) => s.block_hash(block_number).await,
+            Self::AutoFallbackPooled(s) => s.block_hash(block_number).await,
         }
     }
     async fn merkle_root(&self, at: Option<alloy::eips::BlockId>) -> Result<[u8; 32]> {
         match self {
             Self::Single(s) => s.merkle_root(at).await,
             Self::Pooled(s) => s.merkle_root(at).await,
+            Self::AutoFallbackSingle(s) => s.merkle_root(at).await,
+            Self::AutoFallbackPooled(s) => s.merkle_root(at).await,
         }
     }
     async fn active_tree_number(&self, at: Option<alloy::eips::BlockId>) -> Result<u32> {
         match self {
             Self::Single(s) => s.active_tree_number(at).await,
             Self::Pooled(s) => s.active_tree_number(at).await,
+            Self::AutoFallbackSingle(s) => s.active_tree_number(at).await,
+            Self::AutoFallbackPooled(s) => s.active_tree_number(at).await,
         }
     }
 }

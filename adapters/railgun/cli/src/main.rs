@@ -9,8 +9,15 @@
 )]
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+
+/// Operator-CLI HTTP timeout for one-shot status requests. 30s matches the
+/// indexer's `MAX_RPC_TOTAL_ELAPSED_SECS` posture and the
+/// `SUBSQUID_REQUEST_TIMEOUT` precedent, preventing indefinite hangs on a
+/// stalled server.
+const STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -267,7 +274,11 @@ async fn main() -> anyhow::Result<()> {
             raven_railgun_cli::serve_production::run(opts).await
         }
         Commands::Status { url, token } => {
-            let resp = reqwest::Client::new()
+            let client = reqwest::Client::builder()
+                .timeout(STATUS_REQUEST_TIMEOUT)
+                .build()
+                .map_err(|e| anyhow::anyhow!("reqwest builder failed: {e}"))?;
+            let resp = client
                 .get(format!("{url}/v1/status"))
                 .bearer_auth(&token)
                 .send()
