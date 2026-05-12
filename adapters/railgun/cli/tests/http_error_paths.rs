@@ -134,15 +134,39 @@ async fn empty_batch_body_returns_400() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn metrics_endpoint_unauthenticated_returns_200() {
-    // /metrics is unauthenticated by design (Prometheus scrape).
+async fn metrics_endpoint_default_requires_bearer() {
+    // `/metrics` is default-deny (`HttpConfig.metrics_public = false`).
+    // Unauthenticated scrape -> 401; authenticated scrape -> 200 with
+    // a non-empty Prometheus body. Operators opt in to public scrape
+    // via `--metrics-public`.
     let (addr, h) = spawn_toy_server().await;
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/metrics");
+
     let resp = client.get(&url).send().await.expect("send");
-    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.status(),
+        401,
+        "/metrics must return 401 without bearer when metrics_public=false"
+    );
+
+    let resp = client
+        .get(&url)
+        .bearer_auth(BEARER_TOKEN)
+        .send()
+        .await
+        .expect("send authed");
+    assert_eq!(
+        resp.status(),
+        200,
+        "/metrics must return 200 with bearer regardless of metrics_public"
+    );
     let body = resp.text().await.expect("body");
-    assert!(body.is_empty() || body.contains("# HELP") || !body.is_empty());
+    assert!(
+        !body.is_empty(),
+        "/metrics body must be non-empty under bearer auth"
+    );
+
     h.abort();
     let _ = h.await;
 }
