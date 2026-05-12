@@ -956,6 +956,59 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     } else {
         app_state
     };
+    let per_instance_metrics: std::collections::HashMap<
+        InstanceId,
+        Arc<parking_lot::Mutex<raven_railgun_engine::persistence::ConsumerMetrics>>,
+    > = bootstrap
+        .handles
+        .instances
+        .iter()
+        .map(|h| (h.config.instance_id.clone(), Arc::clone(&h.metrics)))
+        .collect();
+    let app_state = app_state.with_instance_metrics(per_instance_metrics);
+
+    // Periodic session-map sweeper drops past-TTL entries even if the bearer
+    // never repeats. Cadence is 60 s; sweep cost is O(map size) under lock.
+    let sweeper_handle = app_state.start_session_sweeper(std::time::Duration::from_secs(60));
+    auxiliary_tasks.push(sweeper_handle);
+
+    // Per-instance heartbeat session eviction. `0` disables; default 3600 s
+    // bounds resident memory under sustained bearer churn at the cost of
+    // dropping every live session once per interval.
+    let eviction_secs = app_state.config.session_eviction_interval_secs;
+    if eviction_secs > 0 {
+        for inst in &bootstrap.handles.instances {
+            let instance = Arc::clone(&inst.instance);
+            let instance_id = inst.config.instance_id.clone();
+            let tick = std::time::Duration::from_secs(eviction_secs);
+            let handle = tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(tick);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                ticker.tick().await; // drop the immediate t=0 tick.
+                loop {
+                    ticker.tick().await;
+                    match raven_railgun_engine::inspire::heartbeat_session_eviction(&instance) {
+                        Ok(()) => {
+                            metrics::counter!(
+                                "raven_railgun_session_eviction_swaps_total",
+                                "instance" => instance_id.as_str().to_owned()
+                            )
+                            .increment(1);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                instance = instance_id.as_str(),
+                                error = %e,
+                                "heartbeat session eviction failed"
+                            );
+                        }
+                    }
+                }
+            });
+            auxiliary_tasks.push(handle);
+        }
+    }
+
     let router = inspire_router(app_state).map_err(|e| anyhow::anyhow!("inspire_router: {e}"))?;
 
     let local_addr = listener

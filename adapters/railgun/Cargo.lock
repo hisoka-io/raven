@@ -3657,6 +3657,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "libc",
+ "metrics",
  "parking_lot",
  "raven-inspire",
  "raven-railgun-core",
@@ -3721,6 +3722,7 @@ dependencies = [
 name = "raven-railgun-http"
 version = "0.1.0-alpha.0"
 dependencies = [
+ "async-stream",
  "axum",
  "bincode",
  "bytes",
@@ -3742,6 +3744,7 @@ dependencies = [
  "subtle",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tower",
  "tower-http",
  "tower_governor",
