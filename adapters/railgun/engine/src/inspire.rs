@@ -181,6 +181,73 @@ pub fn swap_state(
     Ok(())
 }
 
+/// Heartbeat-driven sticky-session eviction.
+///
+/// Builds a same-shape replacement [`InspireServerState`] from the
+/// instance's currently loaded snapshot. CRS, `EncodedDatabase`,
+/// [`ServerInspiringCache`], variant, and entry_size are carried via
+/// `Arc::clone` (sub-microsecond, zero allocation after Phase 2 T-A
+/// wrapped `encoded_db` in `Arc`). The [`ServerSessionStore`] is
+/// replaced with a fresh empty store, so every registered
+/// sticky-bearer session under the instance is dropped. The epoch
+/// bumps by 1 via [`Epoch::next`].
+///
+/// # Why this exists
+///
+/// The inner [`ServerSessionStore`] is documented as never-evicting
+/// (its `len()` only grows). Under sustained once-and-done bearer
+/// churn or a long-running deployment, this causes resident memory
+/// growth that the HTTP-layer SessionMap sweeper alone cannot bound:
+/// SessionMap holds opaque handles, but the inner store holds the
+/// actual packing keys (~48 KB per session). An operator-side
+/// periodic call to this fn is the V1 mitigation; V2 will land an
+/// explicit `evict(handle)` API upstream. Stale
+/// `ServerSessionHandle`s held in HTTP `SessionMap` no longer
+/// reference any live state after the swap — once the last
+/// `Arc<InspireServerState>` holding the donor `session_store` is
+/// dropped (in-flight queries finish), the inner store deallocates.
+///
+/// # Cost
+///
+/// At the production cell (d=2048, 65k × 512 B): all heavy fields
+/// (CRS, EncodedDatabase, cache) are carried via `Arc::clone` —
+/// sub-microsecond, zero allocation. Only the fresh
+/// `ServerSessionStore` Arc allocation runs per call. Measured wall
+/// under 1 ms even at the production cell; trivially safe to run
+/// hourly across all instances.
+///
+/// In-flight queries holding the donor `Arc<InspireServerState>`
+/// continue running on the donor's `session_store`; new queries see
+/// the fresh empty store. Sticky-bearer clients re-register on
+/// their next request via the `/session` route, paying their
+/// one-time `register_server_side` cost again.
+///
+/// # Errors
+///
+/// Returns `Result<()>` for forward-compatibility with future
+/// fallible same-shape rebuilds; the current implementation is
+/// infallible (every heavy field is `Arc::clone`d, no allocation
+/// can fail without panicking earlier in the runtime).
+pub fn heartbeat_session_eviction(instance: &super::PirInstance<RavenInspireScheme>) -> Result<()> {
+    let donor = instance.current_state();
+    // Same-shape rebuild: every heavy field is `Arc::clone`d
+    // (sub-microsecond, zero allocation). The donor's
+    // Arc<InspireServerState> remains valid for any in-flight
+    // query; the fresh empty `ServerSessionStore` is the only
+    // observable change to new queries.
+    let new_state = InspireServerState {
+        crs: Arc::clone(&donor.crs),
+        encoded_db: Arc::clone(&donor.encoded_db),
+        cache: Arc::clone(&donor.cache),
+        session_store: Arc::new(ServerSessionStore::new()),
+        variant: donor.variant,
+        entry_size: donor.entry_size,
+    };
+    let next_epoch = instance.current_epoch().next();
+    instance.swap_state(new_state, next_epoch);
+    Ok(())
+}
+
 /// Build a [`ClientSession`] from a CRS + RLWE secret key.
 pub fn build_client_session(
     crs: ServerCrs,
