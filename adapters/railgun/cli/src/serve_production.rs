@@ -188,7 +188,9 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     // last committed `current_block_height` and the indexer resumes
     // there instead of silently re-scanning the prefix the consumer
     // task would only drop as duplicates.
-    let recovered_floor = opts.start_block.max(handle.persistence.manifest_block_height());
+    let recovered_floor = opts
+        .start_block
+        .max(handle.persistence.manifest_block_height());
     if recovered_floor > opts.start_block {
         tracing::info!(
             toml_start_block = opts.start_block,

@@ -89,8 +89,8 @@ fn commit_v6_then_reopen_preserves_logical_leaf_store() {
     let db: Vec<u8> = (0..(ENTRIES_PER_SHARD as usize) * ENTRY_BYTES)
         .map(|i| u8::try_from(i & 0xff).expect("byte"))
         .collect();
-    let (state, _sk) = setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking)
-        .expect("setup_state");
+    let (state, _sk) =
+        setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("setup_state");
 
     // Phase 2: build a populated `LogicalLeafStore` (the store the
     // runtime would observe after applying 5 AppendLeaf events) and
@@ -134,7 +134,9 @@ fn commit_v6_then_reopen_preserves_logical_leaf_store() {
         "post-commit reopen must surface recovered_state"
     );
     assert_eq!(
-        opened2.recovered_logical_store.imt_leaf_count_for(TREE_NUMBER),
+        opened2
+            .recovered_logical_store
+            .imt_leaf_count_for(TREE_NUMBER),
         5,
         "V6 round-trip must restore the embedded LogicalLeafStore; if this \
          fails, persistence.rs:170 has reverted to the legacy \

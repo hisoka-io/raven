@@ -2,9 +2,7 @@
 //! Wraps `Manifest`, `Snapshot`, `Wal`, `StoreLayout` with a per-instance
 //! `SnapshotPolicy` and the bootstrap/commit/archive flow.
 
-use super::inspire::{
-    snapshot_inspire_state, InspireServerState, RavenInspireScheme,
-};
+use super::inspire::{snapshot_inspire_state, InspireServerState, RavenInspireScheme};
 use super::{InstanceRole, PirInstance};
 use parking_lot::Mutex;
 use raven_railgun_core::{AdapterError, Epoch, InstanceId, Result};
@@ -1124,8 +1122,7 @@ fn drive_commit(
             let s = logical_store.lock();
             s.clone()
         };
-        let _new_id =
-            persistence.commit_v6(snapshot_state.as_ref(), &store_snapshot, height)?;
+        let _new_id = persistence.commit_v6(snapshot_state.as_ref(), &store_snapshot, height)?;
         {
             let mut m = metrics.lock();
             m.commits_fired = m.commits_fired.saturating_add(1);

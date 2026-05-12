@@ -267,7 +267,8 @@ pub(crate) async fn params_handler(
         .get(http::header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    if let (Some(cached_value), Some(provided)) = (cached_etag_value.as_ref(), if_none_match.as_ref())
+    if let (Some(cached_value), Some(provided)) =
+        (cached_etag_value.as_ref(), if_none_match.as_ref())
     {
         if cached_value == provided {
             let mut hdrs = HeaderMap::new();
@@ -342,9 +343,7 @@ pub(crate) async fn params_handler(
     };
     let etag_value = format!("\"{}\"", to_hex_lower(&sha));
 
-    let etag_matches = if_none_match
-        .as_deref()
-        .is_some_and(|v| v == etag_value);
+    let etag_matches = if_none_match.as_deref().is_some_and(|v| v == etag_value);
 
     let mut hdrs = HeaderMap::new();
     hdrs.insert(

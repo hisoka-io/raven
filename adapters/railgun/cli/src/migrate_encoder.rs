@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use raven_railgun_core::AdapterError;
+use raven_railgun_engine::inspire::re_encode_shard;
 use raven_railgun_engine::inspire::{
     apply_wal_entry, restore_inspire_state_v6, snapshot_inspire_state_v6,
 };
-use raven_railgun_engine::inspire::re_encode_shard;
 use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
 use raven_railgun_persistence::{
     Manifest, Snapshot, SnapshotId, StoreLayout, Wal, WalEntryPayload,

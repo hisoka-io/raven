@@ -89,8 +89,8 @@ fn migrate_encoder_round_trip_preserves_logical_leaf_store() {
     let db: Vec<u8> = (0..(ENTRIES_PER_SHARD as usize) * ENTRY_BYTES)
         .map(|i| u8::try_from(i & 0xff).expect("byte"))
         .collect();
-    let (state, _sk) = setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking)
-        .expect("setup_state");
+    let (state, _sk) =
+        setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("setup_state");
 
     let mut staged = LogicalLeafStore::new();
     for i in 0..5u32 {

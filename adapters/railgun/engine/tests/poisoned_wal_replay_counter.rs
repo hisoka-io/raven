@@ -112,7 +112,9 @@ fn poisoned_wal_replay_skipped_counter_increments() {
         .last()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| {
-            panic!("counter value must parse as u64 from line {value_line:?}; got render:\n{rendered}")
+            panic!(
+                "counter value must parse as u64 from line {value_line:?}; got render:\n{rendered}"
+            )
         });
     assert!(
         value >= 1,

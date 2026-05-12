@@ -129,8 +129,8 @@ fn manifest_block_height_reflects_committed_height_after_reopen() {
     let db: Vec<u8> = (0..(ENTRIES_PER_SHARD as usize) * ENTRY_BYTES)
         .map(|i| u8::try_from(i & 0xff).expect("byte"))
         .collect();
-    let (state, _sk) = setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking)
-        .expect("setup_state");
+    let (state, _sk) =
+        setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("setup_state");
     let store = LogicalLeafStore::new();
 
     // Phase 1: fresh open, commit at height 12_345.
@@ -194,8 +194,8 @@ fn two_instances_at_different_heights_yield_per_tree_distinct_floors() {
     let db: Vec<u8> = (0..(ENTRIES_PER_SHARD as usize) * ENTRY_BYTES)
         .map(|i| u8::try_from(i & 0xff).expect("byte"))
         .collect();
-    let (state, _sk) = setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking)
-        .expect("setup_state");
+    let (state, _sk) =
+        setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("setup_state");
     let store = LogicalLeafStore::new();
 
     let layout_a = StoreLayout::open(dir_a.path()).expect("layout A");
