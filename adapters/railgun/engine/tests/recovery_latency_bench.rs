@@ -77,8 +77,9 @@ fn recovery_from_production_cell_snapshot_under_5s() {
     assert_eq!(recovered.entry_size, entry_size);
     assert_eq!(recovered.variant, InspireVariant::TwoPacking);
 
-    // Production target per ARCHITECTURE.md is <= 1 s. Loosened to 5 s
-    // for WSL2 + first-cold-page noise; tighten after baseline.
+    // Production-deployment recovery target is <= 1 s for the cache-
+    // rebuild-bound path. Loosened to 5 s for first-cold-page noise +
+    // contended-host variability; tighten after a steady-state baseline.
     assert!(
         recovery_elapsed < Duration::from_secs(5),
         "recovery latency regressed: {recovery_elapsed:?} > 5 s"

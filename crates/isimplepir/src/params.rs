@@ -227,11 +227,11 @@ mod tests {
         // use log_m = 18 (p = 416), but using log_m = 17 (p = 495)
         // is what Table 16 normatively says for that matrix size.
         //
-        // The "conservative smaller-p" advice in B2_NOISE_BUDGET.md
-        // §4 is for NOISE-BUDGET MARGIN: smaller p = less noise
-        // headroom required = easier Eq. (2) closure. But for
-        // PUBLISHED TABLE 16 MATCHING, we pick the row whose
-        // log_m matches the actual matrix dim.
+        // The "conservative smaller-p" reading of the same table is
+        // for NOISE-BUDGET MARGIN: smaller p = less noise headroom
+        // required = easier Eq. (2) closure. But for PUBLISHED TABLE
+        // 16 MATCHING, we pick the row whose log_m matches the
+        // actual matrix dim.
         //
         // Selection rule here: pick the largest log_m row ≤ input
         // log_m. This matches the matrix dim; if caller wants extra

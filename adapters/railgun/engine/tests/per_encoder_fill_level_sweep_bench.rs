@@ -58,16 +58,16 @@ fn median(timings: &mut [Duration]) -> Duration {
 }
 
 fn findings_path() -> PathBuf {
+    if let Ok(env_dir) = std::env::var("RAVEN_BENCH_FINDINGS_DIR") {
+        return PathBuf::from(env_dir).join("per-encoder-fill-level-sweep.md");
+    }
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // adapters/railgun/engine -> repo root
     p.pop(); // engine
     p.pop(); // railgun
     p.pop(); // adapters
-    p.push("no-commit");
-    p.push("railgun-demo");
-    p.push("bench-results");
-    p.push("2026-05-02-encoder-matrix");
-    p.push("FINDINGS.md");
+    p.push("target");
+    p.push("bench-findings");
+    p.push("per-encoder-fill-level-sweep.md");
     p
 }
 

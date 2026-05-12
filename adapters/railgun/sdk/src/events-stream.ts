@@ -1,5 +1,5 @@
 /**
- * SSE subscriber for the Raven adapter's `/v1/events` endpoint (S038).
+ * SSE subscriber for the Raven adapter's `/v1/events` endpoint.
  *
  * Replaces poll-based status fetches with one long-lived HTTP/2 stream
  * per browser tab. The server pushes a `status` event every ~5 s with

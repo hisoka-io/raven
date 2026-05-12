@@ -19,11 +19,12 @@
  *      to surface any byte-identity divergence in a wider sample.
  *
  *   4. Throughput benchmarks — per instance, 3 seeds × {K=1, K=4,
- *      K=16}, latency p50/p95/p99 + qps, M005 3-seed methodology.
+ *      K=16}, latency p50/p95/p99 + qps, 3-seed methodology.
  *
- * Findings are written to
- * `no-commit/bench-results/2026-05-06-aggressive-e2e/FINDINGS.md`
- * at the end of the run.
+ * Findings are written to a developer-local bench-results directory
+ * (computed from the operator-supplied `RAVEN_FINDINGS_DIR` env var
+ * or the default sibling of this test file). The path is private to
+ * the developer host; CI does not produce or consume it.
  *
  * Honest-stop posture: any 4xx, 5xx, or byte-identity divergence is
  * recorded with full request/response bytes in the FINDINGS.md
@@ -47,15 +48,12 @@ import {
 import { decodeClientPirQueryBundle } from "../src/client-pir";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const FINDINGS_DIR = resolve(
-  HERE,
-  "..",
-  "..",
-  "..",
-  "no-commit",
-  "bench-results",
-  "2026-05-06-aggressive-e2e",
-);
+// Bench output goes to a developer-local, gitignored cargo target
+// directory by default. Operators wanting a different sink (e.g. a
+// shared CI artefact dir) can override via `RAVEN_BENCH_FINDINGS_DIR`.
+const FINDINGS_DIR =
+  process.env.RAVEN_BENCH_FINDINGS_DIR ??
+  resolve(HERE, "..", "..", "..", "target", "bench-findings");
 
 const LIVE_URL = process.env.RAVEN_LIVE_URL;
 const LIVE_TOKEN = process.env.RAVEN_LIVE_TOKEN;
@@ -71,8 +69,9 @@ const PARAMS_DOWNLOAD_TIMEOUT_MS = 240_000;
 const TEST_TIMEOUT_MS = 1_200_000; // 20 min — fuzz + throughput is heavy
 
 // Per-tree leaf-count caps. Trees 0 and 2 are static-full (closed at
-// 65,536). Tree 1 was closed-short at 65,535 (S030 boundary
-// discovery). Tree 3 is the live tree; on-chain `nextLeafIndex` was
+// 65,536). Tree 1 was closed-short at 65,535 by the upstream
+// commit-tree rollover semantics (no batch can span trees).
+// Tree 3 is the live tree; on-chain `nextLeafIndex` was
 // 19,093 at session-open. Use a CONSERVATIVE upper bound to avoid
 // over-shooting the populated range.
 const TREE_LEAF_COUNT: Record<number, number> = {
@@ -972,7 +971,7 @@ function emitFindings(): void {
   out.push("## Hardware reality");
   out.push("");
   out.push(
-    "Live URL backed by an `m6i.large` EC2 instance: 2 vCPU / 8 GB RAM / Ice Lake Xeon Platinum 8375C. The locked production-variant respond is CPU-bound at ~70 ms/query on a 16-thread Zen 5 reference (per `INSPIRE_PRODUCTION_VARIANT_BENCH.md`); on 2 vCPU expect 4-10x degradation. K=4 saturates the 2 vCPU host; K=16 will not improve over K=4. Production deployments scale horizontally via N boxes behind a load-balancer (each box independently sticky-session-keyed).",
+    "Live URL backed by an `m6i.large` EC2 instance: 2 vCPU / 8 GB RAM / Ice Lake Xeon Platinum 8375C. The locked production-variant respond is CPU-bound at ~70 ms/query on a 16-thread Zen 5 reference; on 2 vCPU expect 4-10x degradation. K=4 saturates the 2 vCPU host; K=16 will not improve over K=4. Production deployments scale horizontally via N boxes behind a load-balancer (each box independently sticky-session-keyed).",
   );
   out.push("");
   out.push(

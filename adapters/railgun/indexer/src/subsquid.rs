@@ -1,4 +1,5 @@
-//! Subsquid oracle client + fixture for G5'.D root byte-identity tests.
+//! Subsquid oracle client + fixture for the subsquid root-oracle
+//! byte-identity tests.
 
 use async_trait::async_trait;
 use std::collections::HashMap;

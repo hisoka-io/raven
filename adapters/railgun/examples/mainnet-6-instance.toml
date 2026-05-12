@@ -1,10 +1,13 @@
 # Canonical V1.5 mainnet 6-instance shape consumed by
 # `raven-railgun serve-production --config <this file>`.
 #
-# Six instances per MAINNET_STATE.md:
+# Six instances reflecting the locked Railgun mainnet topology at
+# the time of writing:
 #   - 3 static commit-trees (filled, immutable; Static role + static_default snapshot policy)
 #   - 1 live commit-tree (currently filling; Live role)
 #   - 2 PPOI list instances (Live role; UpstreamSignature verification)
+# Operators upgrading to a new mainnet tree topology should adjust
+# the [[instance]] blocks below to match the on-chain reality.
 
 [global]
 bind = "0.0.0.0:8080"

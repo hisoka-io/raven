@@ -402,7 +402,7 @@ describe("idb chunked + integrity-verified storage", () => {
     const instanceId = "test";
     const crsHash = "cafebabe".repeat(8);
 
-    // Mimic the S036 storage shape: a single record under the bare
+    // Mimic the pre-chunked storage shape: a single record under the bare
     // key, with no `#meta` and no `#chunk-N` companions. The active
     // backend's get path looks up `#meta` first, so this must miss.
     const legacyKey = `v1:${instanceId}:${crsHash}`;

@@ -149,7 +149,7 @@ fn per_leaf_path_query_recovers_sibling_walk_and_root_for_target_leaves() {
                  (expected Imt::node({level}, {sibling_idx_at_level}))"
             );
 
-            // G5'.A IMT-rooted reconstruction: hash up the path with
+            // On-chain IMT-rooted reconstruction: hash up the path with
             // the recovered sibling, mirroring the wallet-side
             // verifier path.
             current = if bit == 1 {

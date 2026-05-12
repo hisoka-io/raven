@@ -405,12 +405,12 @@ async fn bootstrap_resume_from_partial_state() {
 }
 
 #[tokio::test]
-async fn bootstrap_bigint_decoder_parity_with_g5d_fixture() {
-    // G5'.D fixture root: real Sepolia leaf bytes are stored as
-    // `0x...`-prefixed hex but the on-chain BigInt encoding from
-    // upstream's TS is decimal. We parity-check the decoder accepts
-    // BOTH shapes for the same byte sequence (Subsquid serialises
-    // BigInt as decimal; some gateways relay as 0x-hex).
+async fn bootstrap_bigint_decoder_parity_with_subsquid_fixture() {
+    // Real Sepolia leaf bytes are stored as `0x...`-prefixed hex but
+    // the on-chain BigInt encoding from upstream's TS is decimal. We
+    // parity-check the decoder accepts BOTH shapes for the same byte
+    // sequence (Subsquid serialises BigInt as decimal; some gateways
+    // relay as 0x-hex).
     let leaf_hex = "0x23486ab54b4335993cbd8e0828229814f6719251e6bec45373efde528c4ec30b";
     let from_hex = decode_bigint_to_be_bytes32(leaf_hex).expect("hex shape decodes");
     let from_dec = decode_bigint_to_be_bytes32(

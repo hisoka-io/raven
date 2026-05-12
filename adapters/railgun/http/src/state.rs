@@ -273,12 +273,14 @@ impl<S: PirScheme> AppState<S> {
 ///
 /// Per-instance gauges (`raven_railgun_drain_state`,
 /// `raven_railgun_in_flight`, `raven_railgun_epoch`,
-/// `raven_railgun_consumer_*`, `raven_railgun_indexer_*_per_instance`,
-/// `raven_railgun_snapshots`, `raven_railgun_reorgs_handled`) are
-/// described here so dashboards see the HELP line at boot; the
-/// per-scrape *values* + `instance=".."` labels are produced by the
-/// orchestrator-side `refresh_dynamic_metrics` / `emit_instance_metrics`
-/// pass that the `metrics_handler` invokes before render.
+/// `raven_railgun_role`, and the `raven_railgun_consumer_*` family
+/// covering `_last_applied_block`, `_last_known_chain_head`,
+/// `_indexer_lag_blocks`, `_events_processed`, `_commits_fired`,
+/// `_consumer_errors`, `_reorgs_handled`) are described here so
+/// dashboards see the HELP line at boot; the per-scrape *values* +
+/// `instance=".."` labels are produced by the orchestrator-side
+/// `refresh_dynamic_metrics` / `emit_instance_consumer_gauges` pass
+/// that the `metrics_handler` invokes before render.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn describe_prometheus_metrics() {
     static DESCRIBED: OnceLock<()> = OnceLock::new();

@@ -2,7 +2,7 @@
 //!
 //! Per-tree algorithm:
 //!
-//! 1. Load the per-endpoint heterogeneous rpc-pool config (B2 shape).
+//! 1. Load the per-endpoint heterogeneous rpc-pool config.
 //! 2. Pin a `checkpoint_block = chain_head - checkpoint_depth` from
 //!    the live RPC.
 //! 3. Probe at least one pooled RPC endpoint for archival state at
@@ -13,10 +13,10 @@
 //!    chain ABI is the canonical verifier and archival state is
 //!    mandatory.
 //! 4. Page through Subsquid's `commitments(orderBy: treePosition_ASC,
-//!    treePosition_gt: $cursor, first: 1000)` until empty (B4 cursor
-//!    rule). Decode each `Commitment.hash` decimal-string `BigInt`
-//!    into a 32-byte big-endian field element (B3 decoder, validated
-//!    `< BN254_FR_MODULUS`).
+//!    treePosition_gt: $cursor, first: 1000)` until empty (single-key
+//!    cursor on `treePosition`). Decode each `Commitment.hash` decimal-
+//!    string `BigInt` into a 32-byte big-endian field element via the
+//!    `bigint_to_fr_bytes` decoder (validated `< BN254_FR_MODULUS`).
 //! 5. Replay leaves into a local `raven_railgun_engine::imt::Imt` to
 //!    produce `local_root`.
 //! 6. Branch on `chain.active_tree_number_at(checkpoint_block) ==
@@ -37,7 +37,7 @@
 //!    starts streaming chain events from `start_block = checkpoint`.
 //! 8. PPOI list bootstrap pulls upstream `/poi-events/{ct}/{cid}` from
 //!    Railway and asserts each `validatedMerkleroot` byte-equals our
-//!    locally-computed per-list IMT root (G5'.C oracle precedent).
+//!    locally-computed per-list IMT root (upstream-aggregator oracle).
 //!
 //! The module surfaces `BootstrapError` + a `bootstrap_one_tree`
 //! coroutine that the CLI subcommand orchestrates per tree number.

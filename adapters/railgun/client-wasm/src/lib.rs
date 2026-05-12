@@ -301,8 +301,7 @@ pub fn extract_response(
 /// does NOT derive `Serialize` / `Deserialize` / `Clone`. The SDK
 /// surface is shipped now so the wallet's storage layer can encode
 /// against a stable ABI, but every call surfaces a typed
-/// [`WasmClientError::Encode`] until the upstream derives land
-/// (tracked as the Phase 6 warm-cache deferral, option (a)). When
+/// [`WasmClientError::Encode`] until the upstream derives land. When
 /// the derives ship, switch this body to
 /// `Ok(encode(&session.inner, "client_session")?)` and the SDK warms
 /// up transparently — no ABI change required.
@@ -313,7 +312,8 @@ pub fn serialize_client_session(session: &ClientSessionHandle) -> Result<Vec<u8>
     Err(WasmClientError::Encode {
         what: "client_session",
         detail: "upstream raven_inspire::ClientSession at pin 119641b lacks \
-             Clone+Serialize+Deserialize derives; warm-cache deferred per Phase 6 (a)"
+             Clone+Serialize+Deserialize derives; warm-cache session blob \
+             round-trip is disabled until the upstream pin lands the derives"
             .to_string(),
     }
     .into())
@@ -372,7 +372,8 @@ pub fn deserialize_client_session(
     Err(WasmClientError::Decode {
         what: "client_session",
         detail: "upstream raven_inspire::ClientSession at pin 119641b lacks \
-             Clone+Serialize+Deserialize derives; warm-cache deferred per Phase 6 (a)"
+             Clone+Serialize+Deserialize derives; warm-cache session blob \
+             round-trip is disabled until the upstream pin lands the derives"
             .to_string(),
     }
     .into())
@@ -501,16 +502,17 @@ pub fn decode_trusted_for_test<T: for<'de> Deserialize<'de>>(
 ///
 /// At the locked upstream pin `119641b`, [`ClientSession`] does NOT
 /// derive `Serialize` / `Clone`. Returns the same typed error the
-/// wasm-bindgen surface surfaces so unit tests can lock the Phase 6
-/// (a) deferral shape; when upstream lands the derives this body
-/// switches to `bincode::serialize(session).map_err(|e| e.to_string())`
-/// and the test asserts the working path instead.
+/// wasm-bindgen surface surfaces so unit tests can lock the deferral
+/// shape; when upstream lands the derives this body switches to
+/// `bincode::serialize(session).map_err(|e| e.to_string())` and the
+/// test asserts the working path instead.
 #[doc(hidden)]
 pub fn serialize_client_session_rust(session: &ClientSession) -> Result<Vec<u8>, String> {
     let _ = session;
     Err(
         "upstream raven_inspire::ClientSession at pin 119641b lacks \
-         Clone+Serialize+Deserialize derives; warm-cache deferred per Phase 6 (a)"
+         Clone+Serialize+Deserialize derives; warm-cache session blob \
+         round-trip is disabled until the upstream pin lands the derives"
             .to_string(),
     )
 }
@@ -549,7 +551,8 @@ pub fn deserialize_client_session_rust(
     }
     Err(
         "upstream raven_inspire::ClientSession at pin 119641b lacks \
-         Clone+Serialize+Deserialize derives; warm-cache deferred per Phase 6 (a)"
+         Clone+Serialize+Deserialize derives; warm-cache session blob \
+         round-trip is disabled until the upstream pin lands the derives"
             .to_string(),
     )
 }

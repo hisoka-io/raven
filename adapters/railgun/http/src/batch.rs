@@ -254,9 +254,10 @@ type WorkerOutcome<R> = (usize, Result<R, BatchError>);
 
 /// Cross-query K-concurrent dispatcher.
 ///
-/// Uses `tokio::task::JoinSet` of K `spawn_blocking` workers. `rayon::par_iter`
-/// regresses ~2x on the HTTP path when nested inside `spawn_blocking`
-/// (see `research/K4_HTTP_DISPATCHER_BENCH.md`).
+/// Uses `tokio::task::JoinSet` of K `spawn_blocking` workers.
+/// `rayon::par_iter` regresses ~2× on the HTTP path when nested
+/// inside `spawn_blocking`, which is why the K-concurrent fan-out
+/// here uses `spawn_blocking` directly instead of a nested rayon pool.
 /// Returns responses in input order; short-circuits on first error.
 ///
 /// Every worker spawned below borrows the same `Arc<Snapshot<S>>` so all

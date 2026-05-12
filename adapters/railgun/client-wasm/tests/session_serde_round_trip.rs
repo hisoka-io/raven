@@ -1,10 +1,10 @@
 //! Session-blob round-trip tests for the WASM warm-cache path.
 //!
 //! At the locked upstream pin `119641b`, [`raven_inspire::ClientSession`]
-//! does NOT derive `Clone` / `Serialize` / `Deserialize`. The Phase 6
-//! warm-cache decision (option (a), "ship-with-warm-cache-deferred")
-//! means the SDK calls [`serialize_client_session`] and
-//! [`deserialize_client_session`] survive at the ABI but every
+//! does NOT derive `Clone` / `Serialize` / `Deserialize`. The SDK
+//! surface is shipped now so wallet integrators can encode against a
+//! stable ABI; [`serialize_client_session`] and
+//! [`deserialize_client_session`] survive at the boundary but every
 //! invocation surfaces a typed `Err`. These tests lock the typed-error
 //! shape so a future pin bump that lands the derives surfaces here as a
 //! failure (the bodies will switch from `Err` to `Ok` and the test
@@ -85,10 +85,10 @@ fn make_params_bundle(
 /// At the locked upstream pin `119641b`, [`ClientSession`] does not
 /// implement `Serialize`. The wasm-bindgen `serialize_client_session`
 /// (and its pure-Rust mirror) ship at the ABI but surface a typed
-/// `Err` carrying the Phase 6 (a) deferral wording. This test locks
-/// the wording so an upstream pin bump that lands the derives flips
-/// the test red — at which point the body switches from `Err` to
-/// `Ok` and the round-trip closure can be re-enabled.
+/// `Err` carrying the deferral wording. This test locks the wording
+/// so an upstream pin bump that lands the derives flips the test red
+/// — at which point the body switches from `Err` to `Ok` and the
+/// round-trip closure can be re-enabled.
 #[test]
 fn wasm_session_serialize_returns_typed_err_until_upstream_derives_land() {
     let params = test_params();
@@ -104,11 +104,11 @@ fn wasm_session_serialize_returns_typed_err_until_upstream_derives_land() {
         .expect_err("ClientSession serde unsupported at the locked submodule pin");
     assert!(
         err.contains("lacks Clone+Serialize+Deserialize derives"),
-        "expected the Phase 6 (a) deferral wording, got: {err}"
+        "expected the upstream-pin deferral wording, got: {err}"
     );
     assert!(
-        err.contains("Phase 6 (a)"),
-        "expected the explicit Phase 6 (a) tag, got: {err}"
+        err.contains("upstream pin lands the derives"),
+        "expected the explicit pin-bump-required tag, got: {err}"
     );
 }
 
@@ -137,7 +137,7 @@ fn wasm_session_deserialize_returns_typed_err_until_upstream_derives_land() {
         .expect_err("ClientSession serde unsupported at the locked submodule pin");
     assert!(
         err.contains("lacks Clone+Serialize+Deserialize derives"),
-        "expected the Phase 6 (a) deferral wording, got: {err}"
+        "expected the upstream-pin deferral wording, got: {err}"
     );
 }
 

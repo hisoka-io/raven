@@ -227,7 +227,7 @@ enum Commands {
     /// `validatedMerkleroot` events from Railway and asserts
     /// byte-identity against the local per-list IMT.
     BootstrapFromSubsquid {
-        /// Per-endpoint heterogeneous rpc-pool TOML (B2 shape).
+        /// Per-endpoint heterogeneous rpc-pool TOML.
         #[arg(long)]
         rpc_pool_config: std::path::PathBuf,
         /// Subsquid GraphQL endpoint.

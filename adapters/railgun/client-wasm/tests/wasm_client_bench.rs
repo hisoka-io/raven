@@ -158,16 +158,16 @@ mod native {
     }
 
     fn findings_path() -> PathBuf {
+        if let Ok(env_dir) = std::env::var("RAVEN_BENCH_FINDINGS_DIR") {
+            return PathBuf::from(env_dir).join("wasm-client-bench.md");
+        }
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        // adapters/railgun/client-wasm -> repo root
         p.pop(); // client-wasm
         p.pop(); // railgun
         p.pop(); // adapters
-        p.push("no-commit");
-        p.push("railgun-demo");
-        p.push("bench-results");
-        p.push("2026-05-02-encoder-matrix");
-        p.push("FINDINGS.md");
+        p.push("target");
+        p.push("bench-findings");
+        p.push("wasm-client-bench.md");
         p
     }
 

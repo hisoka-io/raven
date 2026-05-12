@@ -33,15 +33,9 @@ import * as wasmPkg from "raven-inspire-client-wasm";
 import { decodeClientPirQueryBundle } from "../src/client-pir";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const FINDINGS_DIR = resolve(
-  HERE,
-  "..",
-  "..",
-  "..",
-  "no-commit",
-  "bench-results",
-  "2026-05-07-live-latency-bench",
-);
+const FINDINGS_DIR =
+  process.env.RAVEN_BENCH_FINDINGS_DIR ??
+  resolve(HERE, "..", "..", "..", "target", "bench-findings");
 
 const LIVE_URL = process.env.RAVEN_LIVE_URL;
 const LIVE_TOKEN = process.env.RAVEN_LIVE_TOKEN;
