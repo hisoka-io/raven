@@ -21,6 +21,7 @@ pub mod admin;
 pub mod auth;
 pub mod batch;
 pub mod config;
+pub mod events;
 pub mod poi_shim;
 pub mod state;
 pub mod status;
@@ -65,6 +66,7 @@ use crate::admin::{
 };
 use crate::auth::bearer_auth;
 use crate::batch::{batch_handler, query_handler};
+use crate::events::{cf_connecting_ip_to_xff, events_handler};
 use crate::status::{health_live_handler, health_ready_handler, metrics_handler, status_handler};
 use crate::versioned::X_RAVEN_SCHEMA_VERSION_HEADER;
 
@@ -94,10 +96,9 @@ pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
     let auth_layer = middleware::from_fn_with_state(state.clone(), bearer_auth::<S>);
 
     let poi_routes = poi_shim::poi_shim_routes(state.clone());
-    let base = Router::new()
+
+    let rate_limited = Router::new()
         .route("/v1/status", get(status_handler::<S>))
-        .route("/v1/health/live", get(health_live_handler))
-        .route("/v1/health/ready", get(health_ready_handler::<S>))
         .route("/v1/instance/:id/query", post(query_handler::<S>))
         .route("/v1/instance/:id/batch", post(batch_handler::<S>))
         .route(
@@ -108,21 +109,38 @@ pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
             "/v1/admin/instances/undrain/:id",
             post(admin_undrain_handler::<S>),
         )
-        .with_state(state)
+        .with_state(state.clone())
         .merge(poi_routes)
-        .layer(auth_layer)
+        .layer(auth_layer.clone())
         .layer(DefaultBodyLimit::max(max_body));
 
-    let with_governor = if trust_proxy {
-        base.layer(build_governor_layer_smart(rps, burst)?)
+    let rate_limited = if trust_proxy {
+        rate_limited.layer(build_governor_layer_smart(rps, burst)?)
     } else {
-        base.layer(build_governor_layer_peer(rps, burst))
+        rate_limited.layer(build_governor_layer_peer(rps, burst))
+    };
+
+    // Public scope -- bypass Governor so scrape + SSE feed never exhaust the
+    // per-IP burst.
+    let public = Router::new()
+        .route("/v1/health/live", get(health_live_handler))
+        .route("/v1/health/ready", get(health_ready_handler::<S>))
+        .route("/v1/events", get(events_handler::<S>))
+        .with_state(state)
+        .layer(auth_layer);
+
+    let base = rate_limited.merge(public);
+
+    let base = if trust_proxy {
+        base.layer(middleware::from_fn(cf_connecting_ip_to_xff))
+    } else {
+        base
     };
 
     let with_cors = if let Some(layer) = cors_layer {
-        with_governor.layer(layer)
+        base.layer(layer)
     } else {
-        with_governor
+        base
     };
 
     Ok(with_cors.layer(
@@ -144,7 +162,16 @@ pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
     ))
 }
 
-/// Inspire-specific router; adds `/session`, `/params`, and `/metrics` routes.
+/// Inspire-specific router; adds `/session`, `/params`, `/events`, and `/metrics` routes.
+///
+/// Router shape splits into two scopes:
+/// - **Rate-limited** (Governor): PIR query/batch/status/admin/sessions/params/poi-shim.
+/// - **Public** (no Governor): `/v1/health/{live,ready}`, `/v1/events`, `/metrics`.
+///
+/// The public scope keeps Prometheus scrapes + the SSE status feed from
+/// exhausting the per-IP burst budget. `/metrics` is bearer-gated by default
+/// (`HttpConfig.metrics_public = false`); operators opt in to public scrape via
+/// `metrics_public = true`, which `bearer_auth` honors before forwarding.
 ///
 /// # Errors
 /// Same contract as [`router`].
@@ -158,13 +185,19 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
     let auth_layer =
         middleware::from_fn_with_state(state.clone(), bearer_auth::<RavenInspireScheme>);
 
-    let base = Router::new()
+    // `/params` body is multi-MiB CRS bincode. Empirical ratio at d=2048 is
+    // ~1.0x (the CRS is random-like; no compression win) so the route ships
+    // without a CompressionLayer. Adding the layer would require splitting
+    // body+ETag computation around the transform; the regression test in
+    // `tests/params_caching.rs` pins `ETag = SHA-256(raw body)` which
+    // breaks under per-request `Accept-Encoding`. The Cloudflare cache
+    // benefits are unaffected (cache key is the ETag, not Content-Encoding).
+    let params_route = Router::new()
+        .route("/v1/instance/:id/params", get(params_handler))
+        .with_state(state.clone());
+
+    let rate_limited = Router::new()
         .route("/v1/status", get(status_handler::<RavenInspireScheme>))
-        .route("/v1/health/live", get(health_live_handler))
-        .route(
-            "/v1/health/ready",
-            get(health_ready_handler::<RavenInspireScheme>),
-        )
         .route(
             "/v1/instance/:id/query",
             post(query_handler::<RavenInspireScheme>),
@@ -182,23 +215,47 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
             post(admin_undrain_handler::<RavenInspireScheme>),
         )
         .route("/v1/instance/:id/session", post(session_establish_handler))
-        .route("/v1/instance/:id/params", get(params_handler))
-        .route("/metrics", get(metrics_handler))
         .with_state(state.clone())
-        .merge(poi_shim::poi_shim_routes(state))
-        .layer(auth_layer)
+        .merge(params_route)
+        .merge(poi_shim::poi_shim_routes(state.clone()))
+        .layer(auth_layer.clone())
         .layer(DefaultBodyLimit::max(max_body));
 
-    let with_governor = if trust_proxy {
-        base.layer(build_governor_layer_smart(rps, burst)?)
+    let rate_limited = if trust_proxy {
+        rate_limited.layer(build_governor_layer_smart(rps, burst)?)
     } else {
-        base.layer(build_governor_layer_peer(rps, burst))
+        rate_limited.layer(build_governor_layer_peer(rps, burst))
+    };
+
+    // Public scope -- bypasses Governor so scrape + SSE never exhaust the
+    // per-IP burst. `bearer_auth` still applies; the path-match inside it
+    // bypasses health + events unconditionally and gates /metrics on
+    // `HttpConfig.metrics_public`.
+    let public = Router::new()
+        .route("/v1/health/live", get(health_live_handler))
+        .route(
+            "/v1/health/ready",
+            get(health_ready_handler::<RavenInspireScheme>),
+        )
+        .route("/v1/events", get(events_handler::<RavenInspireScheme>))
+        .route("/metrics", get(metrics_handler))
+        .with_state(state)
+        .layer(auth_layer);
+
+    let base = rate_limited.merge(public);
+
+    // Cloudflare Tunnel real-IP rewrite -- only mounted when operators
+    // declare the trust path explicitly.
+    let base = if trust_proxy {
+        base.layer(middleware::from_fn(cf_connecting_ip_to_xff))
+    } else {
+        base
     };
 
     let with_cors = if let Some(layer) = cors_layer {
-        with_governor.layer(layer)
+        base.layer(layer)
     } else {
-        with_governor
+        base
     };
 
     Ok(with_cors.layer(
@@ -488,9 +545,10 @@ mod tests {
     #[test]
     fn session_key_eq_round_trips_via_stable_hash() {
         let id = InstanceId::new("toy");
-        let a = SessionKey::new("token-X", id.clone());
-        let b = SessionKey::new("token-X", id.clone());
-        let c = SessionKey::new("token-Y", id);
+        let zero = [0u8; 16];
+        let a = SessionKey::new("token-X", id.clone(), zero);
+        let b = SessionKey::new("token-X", id.clone(), zero);
+        let c = SessionKey::new("token-Y", id, zero);
         assert_eq!(a, b, "same token + instance must produce equal keys");
         assert_ne!(a, c, "different token must differentiate");
     }
@@ -503,8 +561,10 @@ mod tests {
         assert_eq!(cfg.max_concurrent_queries, 4);
         assert_eq!(cfg.session_ttl_secs, 60 * 60);
         assert_eq!(cfg.session_lru_cap, 10_000);
-        assert_eq!(cfg.rate_limit_rps, 100);
-        assert_eq!(cfg.rate_limit_burst, 200);
+        assert_eq!(cfg.rate_limit_rps, 200);
+        assert_eq!(cfg.rate_limit_burst, 400);
+        assert!(!cfg.metrics_public);
+        assert_eq!(cfg.session_eviction_interval_secs, 3600);
         assert!(cfg.admin_token.is_none());
         cfg.validate().expect("padded token must validate");
     }
@@ -630,9 +690,10 @@ mod tests {
         let now = Instant::now();
         let ttl = Duration::from_secs(3600);
         // Cap=2; inserting a 3rd should evict the oldest-live with Pressure.
-        let k1 = SessionKey::new("a", InstanceId::new("toy"));
-        let k2 = SessionKey::new("b", InstanceId::new("toy"));
-        let k3 = SessionKey::new("c", InstanceId::new("toy"));
+        let zero = [0u8; 16];
+        let k1 = SessionKey::new("a", InstanceId::new("toy"), zero);
+        let k2 = SessionKey::new("b", InstanceId::new("toy"), zero);
+        let k3 = SessionKey::new("c", InstanceId::new("toy"), zero);
         let h = ServerSessionHandle(1);
         let _ = map.upsert(k1, h, now + ttl, 2, now);
         let _ = map.upsert(k2, h, now + ttl + Duration::from_secs(1), 2, now);
@@ -645,7 +706,7 @@ mod tests {
         use std::time::{Duration, Instant};
         let map = SessionMap::new();
         let now = Instant::now();
-        let k = SessionKey::new("a", InstanceId::new("toy"));
+        let k = SessionKey::new("a", InstanceId::new("toy"), [0u8; 16]);
         let h = ServerSessionHandle(7);
         let past = now
             .checked_sub(Duration::from_secs(1))
@@ -758,10 +819,12 @@ mod tests {
         ];
 
         let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        let snapshot = instance.current_snapshot();
         let started = std::time::Instant::now();
         let result = crate::batch::dispatch_batch::<SlowableScheme>(
             queries,
             Arc::clone(&instance),
+            snapshot,
             semaphore,
             4,
             std::time::Duration::from_millis(250),
@@ -796,9 +859,11 @@ mod tests {
         let queries: Vec<SlowableQuery> = (10u32..14u32).map(|tag| SlowableQuery { tag }).collect();
 
         let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        let snapshot = instance.current_snapshot();
         let result = crate::batch::dispatch_batch::<SlowableScheme>(
             queries,
             instance,
+            snapshot,
             semaphore,
             4,
             std::time::Duration::from_secs(2),
@@ -928,9 +993,11 @@ mod tests {
             inst_for_drain.set_drain_state(raven_railgun_engine::DrainState::Draining);
         });
 
+        let snapshot = instance.current_snapshot();
         let result = crate::batch::dispatch_batch::<SlowableScheme>(
             queries,
             Arc::clone(&instance),
+            snapshot,
             semaphore,
             2,
             std::time::Duration::from_secs(5),

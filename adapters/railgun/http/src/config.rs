@@ -36,6 +36,18 @@ pub struct HttpConfig {
     /// on an authenticated PIR server.
     #[serde(default)]
     pub cors_allowed_origins: Vec<String>,
+    /// Default-deny posture for `/metrics`. When `false`, the metrics
+    /// endpoint requires bearer auth; when `true`, it is unauthenticated
+    /// (operator opts in via `--metrics-public`).
+    #[serde(default)]
+    pub metrics_public: bool,
+    /// Periodic heartbeat session-eviction interval (seconds). `0` disables.
+    #[serde(default = "default_session_eviction_interval_secs")]
+    pub session_eviction_interval_secs: u64,
+}
+
+fn default_session_eviction_interval_secs() -> u64 {
+    3600
 }
 
 impl HttpConfig {
@@ -48,8 +60,8 @@ impl HttpConfig {
             read_token: read_token.into(),
             admin_token: None,
             max_body_bytes: 8 * 1024 * 1024,
-            rate_limit_rps: 100,
-            rate_limit_burst: 200,
+            rate_limit_rps: 200,
+            rate_limit_burst: 400,
             max_concurrent_queries: 4,
             session_ttl_secs: 60 * 60,
             session_lru_cap: 10_000,
@@ -57,6 +69,8 @@ impl HttpConfig {
             respond_timeout_secs: 30,
             trust_proxy_header: false,
             cors_allowed_origins: Vec::new(),
+            metrics_public: false,
+            session_eviction_interval_secs: 3600,
         }
     }
 

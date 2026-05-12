@@ -203,8 +203,14 @@ pub(crate) async fn bearer_auth<S: PirScheme>(
     next: Next,
 ) -> Result<Response, StatusCode> {
     let path = request.uri().path();
-    // Health/metrics probes are unauthenticated; operators layer gateway auth at the proxy.
-    if matches!(path, "/metrics" | "/v1/health/live" | "/v1/health/ready") {
+    // Health probes + SSE events stream are always unauthenticated. The SSE
+    // stream is the demo UI's status feed; auth happens at the gateway tier.
+    if matches!(path, "/v1/health/live" | "/v1/health/ready" | "/v1/events") {
+        return Ok(next.run(request).await);
+    }
+    // `/metrics` is default-deny (bearer required). Operators opt in to
+    // public scrape via `metrics_public = true` (`HttpConfig.metrics_public`).
+    if path == "/metrics" && app.config.metrics_public {
         return Ok(next.run(request).await);
     }
 
