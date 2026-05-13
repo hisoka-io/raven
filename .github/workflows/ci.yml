@@ -69,7 +69,12 @@ jobs:
   railgun:
     name: railgun adapter workspace (native)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # First-run release-mode build of the 9-inner-crate adapter + the
+    # raven-inspire submodule on a 2-vCPU GitHub runner is wall-time
+    # heavy (~35-45 min). Subsequent runs benefit from Swatinem/rust-cache
+    # and complete in 10-15 min. Cap at 75 min to absorb the first-run
+    # case without leaving the runner stranded if a real hang fires.
+    timeout-minutes: 75
     steps:
       - name: free disk space
         # The adapter workspace's target/ tree (10 inner crates, full
