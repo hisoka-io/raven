@@ -84,8 +84,15 @@ async fn batch_dispatcher_byte_identity_across_k_values() {
     }
     let batch_bytes = raven_railgun_http::write_versioned(&batch_queries).expect("serialize batch");
 
+    // 120s reqwest timeout: on a 2-vCPU GitHub Actions runner the
+    // K=16 batch of 16 InsPIRe queries can wall-clock past 30s in
+    // debug mode (per-query CPU at ~280-700ms with 2 cores serialising
+    // the JoinSet drain). The dispatcher correctness is independent
+    // of the network deadline; the deadline only needs to be longer
+    // than the slowest server-side path on the slowest runner the
+    // CI matrix tolerates.
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(120))
         .build()
         .expect("reqwest client");
 
