@@ -119,10 +119,13 @@ jobs:
         # on the multi-binary adapter workspace. Test-groups in
         # `.config/nextest.toml` serialise chaos-child / flock / arcswap
         # stress tests that compete on shared resources.
+        #
+        # Doc-tests skipped: the adapter workspace has zero runnable
+        # `///` Rust doctests today (only a `text`-fenced prose block
+        # in `http/src/versioned.rs`). `cargo test --doc` would re-build
+        # every release-profile dep from scratch for no actual coverage.
+        # If a real doctest lands later, re-add the step.
         run: cargo nextest run --manifest-path adapters/railgun/Cargo.toml --workspace --all-targets --release --profile ci
-      - name: cargo test --doc (release)
-        # nextest does not run doc tests; cover them separately.
-        run: cargo test --manifest-path adapters/railgun/Cargo.toml --workspace --doc --release
 
   isimplepir-tests:
     name: isimplepir (detached workspace)
