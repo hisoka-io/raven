@@ -242,9 +242,8 @@ mod native {
         let bm = median(&mut b);
         let em = median(&mut e);
         eprintln!(
-            "wasm_client_bench[native]: cell={label} 3-seed-median build={:?} extract={:?} \
-             (per-seed build={build_t:?} extract={extract_t:?})",
-            bm, em
+            "wasm_client_bench[native]: cell={label} 3-seed-median build={bm:?} extract={em:?} \
+             (per-seed build={build_t:?} extract={extract_t:?})"
         );
         let bm_us = bm.as_secs_f64() * 1_000_000.0;
         let em_us = em.as_secs_f64() * 1_000_000.0;

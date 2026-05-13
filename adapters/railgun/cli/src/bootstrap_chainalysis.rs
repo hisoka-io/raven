@@ -301,7 +301,7 @@ impl ChainalysisOnChainOracleSource {
             .iter()
             .filter(|row| sanctioned_set.contains(&row.from_address))
             .collect();
-        filtered.sort_by(|a, b| a.global_tree_position.cmp(&b.global_tree_position));
+        filtered.sort_by_key(|a| a.global_tree_position);
         let mut imt = raven_railgun_engine::imt::Imt::new()
             .map_err(|e| BootstrapError::Engine(format!("imt new: {e}")))?;
         let mut out = Vec::with_capacity(filtered.len());
