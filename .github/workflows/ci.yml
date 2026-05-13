@@ -69,6 +69,7 @@ jobs:
   railgun:
     name: railgun adapter workspace (native)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: free disk space
         # The adapter workspace's target/ tree (10 inner crates, full
@@ -91,6 +92,7 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
       - name: cargo fmt
         run: |
           cargo fmt --manifest-path adapters/railgun/Cargo.toml \
@@ -108,8 +110,19 @@ jobs:
         run: cargo check --manifest-path adapters/railgun/Cargo.toml --workspace --all-targets
       - name: cargo clippy
         run: cargo clippy --manifest-path adapters/railgun/Cargo.toml --workspace --all-targets -- -D warnings
-      - name: cargo test
-        run: cargo test --manifest-path adapters/railgun/Cargo.toml --workspace --all-targets
+      - name: cargo nextest (release)
+        # Release-mode test execution: InsPIRe's respond path is ~10-20x
+        # faster than debug, which dominates the per-test wall on a
+        # 2-vCPU runner. `cargo nextest` runs each test binary in its
+        # own process and parallelises across binaries — vs cargo test
+        # which serialises binaries — giving a further ~2-3x speedup
+        # on the multi-binary adapter workspace. Test-groups in
+        # `.config/nextest.toml` serialise chaos-child / flock / arcswap
+        # stress tests that compete on shared resources.
+        run: cargo nextest run --manifest-path adapters/railgun/Cargo.toml --workspace --all-targets --release --profile ci
+      - name: cargo test --doc (release)
+        # nextest does not run doc tests; cover them separately.
+        run: cargo test --manifest-path adapters/railgun/Cargo.toml --workspace --doc --release
 
   isimplepir-tests:
     name: isimplepir (detached workspace)
