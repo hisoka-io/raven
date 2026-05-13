@@ -529,13 +529,14 @@ where
             "bootstrap_railgun_engine_multi requires at least one InstanceConfig".to_owned(),
         ));
     }
-    let mut seen: std::collections::HashSet<DataSourceFilter> =
+    let mut seen: std::collections::HashSet<(DataSourceFilter, &'static str)> =
         std::collections::HashSet::with_capacity(configs.len());
     for cfg in &configs {
-        if !seen.insert(cfg.data_source) {
+        if !seen.insert((cfg.data_source, cfg.encoder.label())) {
             return Err(AdapterError::InvalidQuery(format!(
-                "duplicate data_source across InstanceConfigs: {:?}",
-                cfg.data_source
+                "duplicate (data_source, encoder) across InstanceConfigs: data_source={:?} encoder={}",
+                cfg.data_source,
+                cfg.encoder.label()
             )));
         }
     }
@@ -574,7 +575,13 @@ where
             s
         } else {
             let s = fresh_state_factory(&cfg)?;
-            persistence.commit(&s, 0)?;
+            // Bootstrap first commit uses the V6 envelope so the
+            // embedded `LogicalLeafStore` travels with the snapshot
+            // from the very first manifest write. Empty store on
+            // first bootstrap; subsequent commits will carry the
+            // accumulated store via the commit driver.
+            let empty_store = LogicalLeafStore::default();
+            persistence.commit_v6(&s, &empty_store, 0)?;
             persistence.commit_notify().notify_waiters();
             s
         };
@@ -791,13 +798,21 @@ async fn forward_mirror_payload(
     // Fired before routing so a fresh list_key surfaces before any instance route exists.
     let _ = list_observed.send(lk);
     let routes = ppoi_list_routes.load();
-    if let Some(tx) = routes
+    // Fan out to ALL senders bound to `lk`. Multiple instances can
+    // legitimately consume the same list_key under different encoder
+    // labels (e.g. `per-list-status` + `per-list-path` sharing the
+    // OFAC list); `.find()` would silently drop events for every
+    // instance after the first match.
+    let matched: Vec<mpsc::Sender<ConsumerEvent>> = routes
         .iter()
-        .find(|(k, _)| *k == lk)
+        .filter(|(k, _)| *k == lk)
         .map(|(_, s)| s.clone())
-    {
-        let _ = tx.send(ConsumerEvent::Ppoi(payload, height)).await;
-    } else {
+        .collect();
+    if matched.is_empty() {
         tracing::trace!("no instance routes list_key; dropping mirror payload");
+        return;
+    }
+    for tx in matched {
+        let _ = tx.send(ConsumerEvent::Ppoi(payload.clone(), height)).await;
     }
 }

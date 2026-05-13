@@ -558,9 +558,32 @@ pub enum IndexerMessage {
 /// Configuration for [`IndexerWorker::run`].
 #[derive(Clone, Debug)]
 pub struct IndexerWorkerConfig {
+    /// Block to start scanning from (resume point).
     pub start_block: u64,
+    /// Polling cadence between calls to `latest_block`.
     pub poll_interval_secs: u64,
+    /// Maximum span to fetch per `events_in_range` call.
+    /// Defaults to [`SCAN_CHUNK_BLOCKS`].
     pub chunk_blocks: u64,
+    /// Per-tree minimum block height filter. The single cursor scans
+    /// from `start_block`; emitted events whose `tree_number` has an
+    /// entry here AND whose `block_height` is below the floor are
+    /// dropped before the consumer sees them.
+    ///
+    /// Empty map = no per-tree filtering (single-tree deployments,
+    /// tests, or fresh-bootstrap deployments where every floor equals
+    /// `start_block`).
+    pub per_tree_start_blocks: std::collections::BTreeMap<u32, u64>,
+    /// Optional sidecar path for the Layer 1 reorg-window cache. When
+    /// set, the worker loads the persisted `(block_number, block_hash)`
+    /// pairs at startup and writes-through on every tip advance, every
+    /// reorg, and on stale-restart rebuild. Lets the worker detect a
+    /// reorg-while-down case even after a restart.
+    ///
+    /// `None` = ephemeral cache (fresh-start path, tests).
+    pub reorg_window_path: Option<std::path::PathBuf>,
+    /// Reorg cache depth (max entries). Defaults to [`REORG_CACHE_DEPTH`].
+    pub reorg_window_depth: usize,
 }
 
 impl Default for IndexerWorkerConfig {
@@ -569,6 +592,9 @@ impl Default for IndexerWorkerConfig {
             start_block: 0,
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
             chunk_blocks: SCAN_CHUNK_BLOCKS,
+            per_tree_start_blocks: std::collections::BTreeMap::new(),
+            reorg_window_path: None,
+            reorg_window_depth: REORG_CACHE_DEPTH,
         }
     }
 }
@@ -602,8 +628,52 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
         // `Delay` prevents burst catch-up ticks after a stalled scan from hammering the RPC.
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut cursor = config.start_block;
+        let cap_depth = config.reorg_window_depth.max(1);
+        // Bootstrap the hash cache from the persisted sidecar (when
+        // set) so a reorg-while-down case is detectable on resume.
         let mut hash_cache: std::collections::BTreeMap<u64, [u8; 32]> =
-            std::collections::BTreeMap::new();
+            match config.reorg_window_path.as_ref() {
+                Some(path) => match load_reorg_window(path) {
+                    Ok(map) => map,
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "indexer reorg-window sidecar load failed; starting empty"
+                        );
+                        std::collections::BTreeMap::new()
+                    }
+                },
+                None => std::collections::BTreeMap::new(),
+            };
+        // Reorged-while-we-were-down recovery: if the highest cached
+        // entry's hash no longer matches the canonical chain, rebuild
+        // the window from RPC across the recent span. The reorg
+        // walk-back on the next iteration then fires the standard
+        // Layer 1 path.
+        if let Some(path) = config.reorg_window_path.as_ref() {
+            if let Some((&top_height, &top_hash)) = hash_cache.iter().next_back() {
+                match self.source.block_hash(top_height).await {
+                    Ok(observed) if observed != top_hash => {
+                        tracing::warn!(
+                            top_height,
+                            "indexer reorg-window stale at restart; rebuilding from RPC"
+                        );
+                        hash_cache = self.rebuild_reorg_window(top_height, cap_depth).await;
+                        persist_reorg_window_best_effort(path, &hash_cache);
+                    }
+                    Ok(_) => { /* canonical; nothing to do. */ }
+                    Err(e) => {
+                        tracing::warn!(
+                            top_height,
+                            error = %e,
+                            "indexer reorg-window stale-check RPC failed; \
+                             keeping in-memory cache"
+                        );
+                    }
+                }
+            }
+        }
         loop {
             tick.tick().await;
             if self.sender.is_closed() {
@@ -630,6 +700,9 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
                         }
                         hash_cache.retain(|&n, _| n <= reorg_height);
                         cursor = reorg_height;
+                        if let Some(path) = config.reorg_window_path.as_ref() {
+                            persist_reorg_window_best_effort(path, &hash_cache);
+                        }
                         let _ = self.send_heartbeat(latest);
                         continue;
                     }
@@ -663,6 +736,25 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
                     | RailgunEvent::Nullified { block_number, .. }
                     | RailgunEvent::Unshield { block_number, .. } => *block_number,
                 };
+                let event_tree = match &event {
+                    RailgunEvent::Shield { tree_number, .. }
+                    | RailgunEvent::Transact { tree_number, .. }
+                    | RailgunEvent::Nullified { tree_number, .. } => Some(*tree_number),
+                    RailgunEvent::Unshield { .. } => None,
+                };
+                if let Some(tree) = event_tree {
+                    if let Some(&floor) = config.per_tree_start_blocks.get(&tree) {
+                        if block_height < floor {
+                            tracing::trace!(
+                                tree_number = tree,
+                                block_height,
+                                floor,
+                                "indexer dropping event below per-tree floor"
+                            );
+                            continue;
+                        }
+                    }
+                }
                 let msg = IndexerMessage::Event {
                     event,
                     block_height,
@@ -675,15 +767,48 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
 
             if let Ok(tip_hash) = self.source.block_hash(to).await {
                 hash_cache.insert(to, tip_hash);
-                if hash_cache.len() > REORG_CACHE_DEPTH {
-                    let to_keep = to.saturating_sub(MAX_REORG_BLOCKS);
+                if hash_cache.len() > cap_depth {
+                    let depth_u64 = u64::try_from(cap_depth).unwrap_or(u64::MAX);
+                    let to_keep = to.saturating_sub(depth_u64);
                     hash_cache.retain(|&n, _| n >= to_keep);
+                }
+                if let Some(path) = config.reorg_window_path.as_ref() {
+                    persist_reorg_window_best_effort(path, &hash_cache);
                 }
             }
 
             cursor = to;
             let _ = self.send_heartbeat(latest);
         }
+    }
+
+    /// Rebuild the reorg-window cache from RPC across the recent
+    /// `[top_height - depth, top_height]` span. Used when a sidecar
+    /// load detects a chain reorg deeper than the persisted window
+    /// (e.g. reorged-while-down).
+    async fn rebuild_reorg_window(
+        &self,
+        top_height: u64,
+        depth: usize,
+    ) -> std::collections::BTreeMap<u64, [u8; 32]> {
+        let depth_u64 = u64::try_from(depth).unwrap_or(u64::MAX);
+        let from = top_height.saturating_sub(depth_u64);
+        let mut rebuilt = std::collections::BTreeMap::new();
+        for n in from..=top_height {
+            match self.source.block_hash(n).await {
+                Ok(h) => {
+                    rebuilt.insert(n, h);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        block_number = n,
+                        error = %e,
+                        "indexer reorg-window rebuild block_hash failed; skipping"
+                    );
+                }
+            }
+        }
+        rebuilt
     }
 
     fn send_heartbeat(&self, chain_head_block: u64) -> std::result::Result<(), ()> {
@@ -699,6 +824,251 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
             Err(_) => Err(()),
         }
     }
+}
+
+/// Magic bytes identifying the on-disk reorg-window sidecar format.
+/// `RVNRGIDX` = "raven railgun indexer". Two trailing version bytes
+/// let a future on-disk schema bump fail-closed instead of silently
+/// loading drift.
+pub const REORG_WINDOW_MAGIC: [u8; 8] = *b"RVNRGIDX";
+/// Reorg-window sidecar schema version. Bump on layout changes.
+pub const REORG_WINDOW_VERSION: u16 = 1;
+
+/// Typed error for reorg-window sidecar codec failures.
+///
+/// Wire format for the reorg-window sidecar:
+/// `magic(8) || version(u16 LE) || count(u32 LE) || count × (block(u64 LE) || hash(32))`
+/// followed by a trailing CRC32 (u32 LE) over everything before it.
+///
+/// Atomic-renamed at write time so a torn write yields the previous
+/// good copy on the next load.
+#[derive(Debug)]
+pub struct ReorgWindowError(String);
+
+impl std::fmt::Display for ReorgWindowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ReorgWindowError {}
+
+/// Serialise the reorg-window cache to the on-disk byte format.
+#[must_use]
+pub fn encode_reorg_window(cache: &std::collections::BTreeMap<u64, [u8; 32]>) -> Vec<u8> {
+    // u32 entry count: cache size is bounded by `reorg_window_depth`
+    // which is a `usize` but in practice never exceeds u32::MAX.
+    // Saturate at u32::MAX as a defensive fail-closed for the rare
+    // case where an operator passes a giant depth.
+    let count: u32 = u32::try_from(cache.len()).unwrap_or(u32::MAX);
+    let body_len = REORG_WINDOW_MAGIC.len() + 2 + 4 + cache.len() * (8 + 32) + 4;
+    let mut buf = Vec::with_capacity(body_len);
+    buf.extend_from_slice(&REORG_WINDOW_MAGIC);
+    buf.extend_from_slice(&REORG_WINDOW_VERSION.to_le_bytes());
+    buf.extend_from_slice(&count.to_le_bytes());
+    for (height, hash) in cache {
+        buf.extend_from_slice(&height.to_le_bytes());
+        buf.extend_from_slice(hash);
+    }
+    let crc = crc32(&buf);
+    buf.extend_from_slice(&crc.to_le_bytes());
+    buf
+}
+
+/// Deserialise the reorg-window cache. Returns an empty map if the
+/// file is missing; returns an error if the magic / version / CRC
+/// checks fail.
+pub fn load_reorg_window(
+    path: &std::path::Path,
+) -> std::result::Result<std::collections::BTreeMap<u64, [u8; 32]>, ReorgWindowError> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(std::collections::BTreeMap::new());
+        }
+        Err(e) => return Err(ReorgWindowError(format!("read {}: {e}", path.display()))),
+    };
+    decode_reorg_window(&bytes)
+}
+
+/// Decode the reorg-window sidecar from a byte slice. Validates the
+/// trailing CRC32, magic, and version fields before yielding the map.
+pub fn decode_reorg_window(
+    bytes: &[u8],
+) -> std::result::Result<std::collections::BTreeMap<u64, [u8; 32]>, ReorgWindowError> {
+    let header_len = REORG_WINDOW_MAGIC.len() + 2 + 4;
+    if bytes.len() < header_len + 4 {
+        return Err(ReorgWindowError(format!(
+            "reorg-window sidecar too small: {} bytes",
+            bytes.len()
+        )));
+    }
+    let body_end = bytes.len() - 4;
+    let body = bytes
+        .get(..body_end)
+        .ok_or_else(|| ReorgWindowError("reorg-window body slice oob".to_owned()))?;
+    let crc_observed = crc32(body);
+    let crc_tail = bytes
+        .get(body_end..)
+        .ok_or_else(|| ReorgWindowError("reorg-window crc tail oob".to_owned()))?;
+    let crc_stored_arr: [u8; 4] = crc_tail
+        .try_into()
+        .map_err(|_| ReorgWindowError("CRC slice length mismatch".to_owned()))?;
+    let crc_stored = u32::from_le_bytes(crc_stored_arr);
+    if crc_observed != crc_stored {
+        return Err(ReorgWindowError(format!(
+            "reorg-window CRC mismatch: observed {crc_observed:08x}, stored {crc_stored:08x}"
+        )));
+    }
+    let magic_slice = body
+        .get(..REORG_WINDOW_MAGIC.len())
+        .ok_or_else(|| ReorgWindowError("reorg-window magic slice oob".to_owned()))?;
+    if magic_slice != REORG_WINDOW_MAGIC {
+        return Err(ReorgWindowError("reorg-window magic mismatch".to_owned()));
+    }
+    let mut cur = REORG_WINDOW_MAGIC.len();
+    let version_slice = body
+        .get(cur..cur + 2)
+        .ok_or_else(|| ReorgWindowError("reorg-window version slice oob".to_owned()))?;
+    let version_arr: [u8; 2] = version_slice
+        .try_into()
+        .map_err(|_| ReorgWindowError("version slice length mismatch".to_owned()))?;
+    cur += 2;
+    let version = u16::from_le_bytes(version_arr);
+    if version != REORG_WINDOW_VERSION {
+        return Err(ReorgWindowError(format!(
+            "reorg-window version mismatch: file v{version}, code v{REORG_WINDOW_VERSION}"
+        )));
+    }
+    let count_slice = body
+        .get(cur..cur + 4)
+        .ok_or_else(|| ReorgWindowError("reorg-window count slice oob".to_owned()))?;
+    let count_arr: [u8; 4] = count_slice
+        .try_into()
+        .map_err(|_| ReorgWindowError("count slice length mismatch".to_owned()))?;
+    cur += 4;
+    let count = u32::from_le_bytes(count_arr) as usize;
+    let entry_size = 8 + 32;
+    let expected = cur + count * entry_size + 4;
+    if expected != bytes.len() {
+        return Err(ReorgWindowError(format!(
+            "reorg-window length mismatch: header says {count} entries, file is {} bytes",
+            bytes.len()
+        )));
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for _ in 0..count {
+        let height_slice = body
+            .get(cur..cur + 8)
+            .ok_or_else(|| ReorgWindowError("reorg-window height slice oob".to_owned()))?;
+        let height_arr: [u8; 8] = height_slice
+            .try_into()
+            .map_err(|_| ReorgWindowError("height slice length mismatch".to_owned()))?;
+        cur += 8;
+        let height = u64::from_le_bytes(height_arr);
+        let hash_slice = body
+            .get(cur..cur + 32)
+            .ok_or_else(|| ReorgWindowError("reorg-window hash slice oob".to_owned()))?;
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(hash_slice);
+        cur += 32;
+        out.insert(height, hash);
+    }
+    Ok(out)
+}
+
+/// Atomic-rename writer. Errors are logged + dropped; a stale sidecar
+/// is recoverable on the next tick (or on the next restart via the
+/// magic / version / CRC checks).
+///
+/// The `raven_railgun_indexer_reorg_window_persist_failed_total`
+/// counter advances on every failure so operators can dashboard
+/// disk-full or permission-denied conditions without scraping logs.
+pub fn persist_reorg_window_best_effort(
+    path: &std::path::Path,
+    cache: &std::collections::BTreeMap<u64, [u8; 32]>,
+) {
+    if let Err(e) = persist_reorg_window(path, cache) {
+        metrics::counter!("raven_railgun_indexer_reorg_window_persist_failed_total").increment(1);
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "indexer reorg-window persist failed; will retry next tick"
+        );
+    }
+}
+
+/// Atomic-rename writer: `<path>.tmp` → fsync → rename → fsync parent
+/// (best-effort parent fsync; not all platforms honour it).
+pub fn persist_reorg_window(
+    path: &std::path::Path,
+    cache: &std::collections::BTreeMap<u64, [u8; 32]>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let bytes = encode_reorg_window(cache);
+    let tmp = match path.file_name() {
+        Some(name) => {
+            let mut tmp_name = std::ffi::OsString::from(name);
+            tmp_name.push(".tmp");
+            path.with_file_name(tmp_name)
+        }
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "reorg-window path has no file name",
+            ))
+        }
+    };
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    // Best-effort parent-directory fsync to persist the rename. A
+    // failure here MUST NOT propagate: a sidecar that's been renamed
+    // but not yet fdatasync'd to the parent is still recoverable on
+    // the next tick.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// CRC-32 (IEEE polynomial). Vendored to keep the indexer free of an
+/// external CRC dep; the entire window is a few KB so throughput is
+/// not the bottleneck. Pure software, table-driven.
+fn crc32(data: &[u8]) -> u32 {
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut t = [0u32; 256];
+        for (i, slot) in t.iter_mut().enumerate() {
+            let mut c = u32::try_from(i).unwrap_or(0);
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    0xedb8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+            }
+            *slot = c;
+        }
+        t
+    });
+    let mut crc = 0xffff_ffffu32;
+    for &b in data {
+        let idx = ((crc ^ u32::from(b)) & 0xff) as usize;
+        let slot = table.get(idx).copied().unwrap_or(0);
+        crc = slot ^ (crc >> 8);
+    }
+    crc ^ 0xffff_ffff
 }
 
 /// Build the bounded MPSC for indexer-to-engine messaging (capacity 1024).

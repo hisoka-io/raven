@@ -2,6 +2,13 @@
 //!
 //! [`AutoFallbackChainSource`] falls back on transport errors and re-probes WS after
 //! a floor of [`MIN_POLLING_DURATION`] to prevent mode oscillation.
+//!
+//! Wired in `serve-production` via `--ws-endpoint <URL>`; the constructed
+//! [`AutoFallbackChainSource`] wraps a [`WsChainSource`] over the configured
+//! fallback (single-RPC or `RpcEndpointPool`). The current transport mode is
+//! mirrored to `/v1/health/ready` as `chain_source_mode`. Without
+//! `--ws-endpoint`, the binary constructs a plain [`RpcChainSource`]
+//! (polling-only).
 
 use std::{sync::Arc, time::Duration};
 

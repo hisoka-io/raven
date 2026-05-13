@@ -99,8 +99,8 @@ describe("multi-input spend support", () => {
   });
 
   it("cross-tree spend: 3 commit-tree proofs each from a different tree", async () => {
-    // Wallet has UTXOs in trees 0, 2, 3 (per the M002 mainnet
-    // topology, tree 3 is live at boot). The SDK fetches one
+    // Wallet has UTXOs in trees 0, 2, 3 (per the mainnet topology
+    // at boot: trees 0/1/2 are closed-static, tree 3 is live). The SDK fetches one
     // commit-tree proof per UTXO; each proof is dispatched to the
     // tree-specific commit-tree-merkle-proof route.
     const inputs = [

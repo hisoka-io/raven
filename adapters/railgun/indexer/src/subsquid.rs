@@ -1,7 +1,14 @@
-//! Subsquid oracle client + fixture for G5'.D root byte-identity tests.
+//! Subsquid oracle client + fixture for the subsquid root-oracle
+//! byte-identity tests.
 
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::time::Duration;
+
+/// Per-request timeout for Subsquid GraphQL queries. 30s matches the indexer's
+/// `MAX_RPC_TOTAL_ELAPSED_SECS` posture; without it, a stalled gateway would
+/// hang `reqwest::Client::new()` indefinitely.
+pub const SUBSQUID_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SubsquidError {
@@ -194,9 +201,20 @@ impl std::fmt::Debug for SubsquidClient {
 
 impl SubsquidClient {
     pub fn new(endpoint: impl Into<String>) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(SUBSQUID_REQUEST_TIMEOUT)
+            .connect_timeout(SUBSQUID_REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "reqwest builder failed for SubsquidClient; falling back to Client::new() (no timeout)"
+                );
+                reqwest::Client::new()
+            });
         Self {
             endpoint: endpoint.into(),
-            http: reqwest::Client::new(),
+            http,
         }
     }
 }

@@ -1,4 +1,5 @@
-//! Three-oracle aggregator helper for the G5'.D byte-identity tests.
+//! Three-oracle aggregator helper for the subsquid root-oracle byte-
+//! identity tests.
 //!
 //! Used by `tests/g5_d_subsquid_root_oracle.rs`.
 
@@ -9,11 +10,11 @@
 /// specific source that drifted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OracleSource {
-    /// G5'.A on-chain `merkleRoot()` view.
+    /// On-chain `merkleRoot()` view.
     Chain,
-    /// G5'.C upstream PPOI / Railway aggregator root.
+    /// Upstream PPOI / Railway aggregator root.
     Upstream,
-    /// G5'.D subsquid GraphQL root.
+    /// Subsquid GraphQL root.
     Subsquid,
 }
 

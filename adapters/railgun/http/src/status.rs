@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
-use raven_railgun_engine::inspire::RavenInspireScheme;
 use raven_railgun_engine::PirScheme;
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +59,16 @@ pub struct ConsumerStatus {
 pub(crate) async fn status_handler<S: PirScheme>(
     State(app): State<AppState<S>>,
 ) -> Json<StatusResponse> {
+    Json(build_status_response(&app))
+}
+
+/// Build a snapshot of the operator-observable engine state.
+///
+/// Shared by [`status_handler`] (legacy `/v1/status` JSON endpoint) and
+/// `events_handler` (`/v1/events` SSE stream). Pure function over the
+/// existing [`AppState`]; performs no I/O beyond a brief
+/// `parking_lot::Mutex` snapshot of consumer metrics.
+pub(crate) fn build_status_response<S: PirScheme>(app: &AppState<S>) -> StatusResponse {
     let fallback_k = u32::try_from(app.config.max_concurrent_queries.max(1)).unwrap_or(u32::MAX);
     let instances = app
         .engine
@@ -90,22 +99,170 @@ pub(crate) async fn status_handler<S: PirScheme>(
             consumer_errors: snap.consumer_errors,
         }
     });
-    Json(StatusResponse {
+    StatusResponse {
         scheme: (*app.scheme_name).clone(),
         instances,
         consumer,
-    })
+    }
 }
 
-pub(crate) async fn metrics_handler(
-    State(app): State<AppState<RavenInspireScheme>>,
+pub(crate) async fn metrics_handler<S: raven_railgun_engine::PirScheme>(
+    State(app): State<AppState<S>>,
 ) -> impl IntoResponse {
+    refresh_dynamic_metrics(&app);
     let body = app.metrics_handle.render();
     (
         StatusCode::OK,
         [(http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         body,
     )
+}
+
+/// Emit per-scrape gauges so dashboards see live values, not just the
+/// HELP/TYPE registered at `AppState::new`. Walks both:
+///
+/// * `app.engine.instances()` — per-instance liveness gauges
+///   (`drain_state`, `in_flight`, `epoch`, `role`) read directly from
+///   the engine `PirInstance` snapshot. These do not depend on the
+///   per-instance `ConsumerMetrics` map being populated.
+/// * `app.instance_metrics` — per-instance `ConsumerMetrics` gauges
+///   (`consumer_*`) when the multi-instance map is wired.
+///
+/// When `instance_metrics` is empty (legacy single-cell deployments
+/// that wire only `with_consumer_metrics`) the consumer fields fall
+/// back to the single-cell value labelled with the FIRST engine
+/// instance's id. Cardinality is bounded by the configured instance
+/// count; no user input feeds any label.
+fn refresh_dynamic_metrics<S: raven_railgun_engine::PirScheme>(app: &AppState<S>) {
+    use std::time::Instant;
+    let uptime_secs = Instant::now()
+        .saturating_duration_since(app.process_started_at)
+        .as_secs();
+    #[allow(clippy::cast_precision_loss)]
+    let uptime_f = uptime_secs as f64;
+    metrics::gauge!("raven_railgun_uptime_seconds").set(uptime_f);
+
+    // Process-global sticky-session count + semaphore capacity. Single
+    // cell each; no per-instance label because the underlying state is
+    // process-global.
+    #[allow(clippy::cast_precision_loss)]
+    let sessions_active = app.sessions.len() as f64;
+    metrics::gauge!("raven_railgun_sessions_active").set(sessions_active);
+    #[allow(clippy::cast_precision_loss)]
+    let permits_avail = app.semaphore.available_permits() as f64;
+    metrics::gauge!("raven_railgun_semaphore_permits_available").set(permits_avail);
+
+    let instances = app.engine.instances();
+    for instance in &instances {
+        let instance_id = instance.id.as_str().to_owned();
+        emit_per_instance_engine_gauges(&instance_id, instance);
+
+        // Per-instance `ConsumerMetrics` from the wired map when present.
+        // The HashMap lookup is keyed on `InstanceId` (the same value
+        // `instance.id` carries); cheap clone for the lookup key.
+        if let Some(consumer) = app.instance_metrics.get(&instance.id) {
+            let snap = *consumer.lock();
+            emit_instance_consumer_gauges(&instance_id, &snap);
+        }
+    }
+
+    // Legacy single-cell `consumer_metrics` fallback: if the per-
+    // instance map is empty AND a single-cell handle is wired, label
+    // it with the FIRST instance's id so dashboards still surface
+    // a per-instance series under single-instance deployments.
+    if app.instance_metrics.is_empty() {
+        if let Some(cell) = app.consumer_metrics.as_ref().as_ref() {
+            if let Some(first) = instances.first() {
+                let snap = *cell.lock();
+                emit_instance_consumer_gauges(first.id.as_str(), &snap);
+            }
+        }
+    }
+}
+
+fn emit_per_instance_engine_gauges<S: raven_railgun_engine::PirScheme>(
+    instance_id: &str,
+    instance: &raven_railgun_engine::PirInstance<S>,
+) {
+    let label = instance_id.to_owned();
+    let drain = instance.drain_state();
+    #[allow(clippy::cast_precision_loss)]
+    let drain_val = f64::from(u8::from(drain.is_active()));
+    metrics::gauge!(
+        "raven_railgun_drain_state",
+        "instance" => label.clone(),
+        "label" => drain.label(),
+    )
+    .set(drain_val);
+
+    #[allow(clippy::cast_precision_loss)]
+    let in_flight_f = instance.in_flight_count() as f64;
+    metrics::gauge!(
+        "raven_railgun_in_flight",
+        "instance" => label.clone()
+    )
+    .set(in_flight_f);
+
+    let epoch = instance.current_epoch();
+    #[allow(clippy::cast_precision_loss)]
+    let epoch_f = epoch.0 as f64;
+    metrics::gauge!(
+        "raven_railgun_epoch",
+        "instance" => label.clone()
+    )
+    .set(epoch_f);
+
+    let role = instance.role();
+    metrics::gauge!(
+        "raven_railgun_role",
+        "instance" => label,
+        "label" => role.label(),
+    )
+    .set(1.0);
+}
+
+fn emit_instance_consumer_gauges(
+    instance_id: &str,
+    snap: &raven_railgun_engine::persistence::ConsumerMetrics,
+) {
+    let label = instance_id.to_owned();
+    #[allow(clippy::cast_precision_loss)]
+    let to_f = |v: u64| v as f64;
+    metrics::gauge!(
+        "raven_railgun_consumer_last_applied_block",
+        "instance" => label.clone()
+    )
+    .set(to_f(snap.last_applied_block));
+    metrics::gauge!(
+        "raven_railgun_consumer_last_known_chain_head",
+        "instance" => label.clone()
+    )
+    .set(to_f(snap.last_known_chain_head));
+    metrics::gauge!(
+        "raven_railgun_consumer_indexer_lag_blocks",
+        "instance" => label.clone()
+    )
+    .set(to_f(snap.indexer_lag_blocks()));
+    metrics::gauge!(
+        "raven_railgun_consumer_events_processed",
+        "instance" => label.clone()
+    )
+    .set(to_f(snap.events_processed));
+    metrics::gauge!(
+        "raven_railgun_consumer_commits_fired",
+        "instance" => label.clone()
+    )
+    .set(to_f(snap.commits_fired));
+    metrics::gauge!(
+        "raven_railgun_consumer_reorgs_handled",
+        "instance" => label.clone()
+    )
+    .set(to_f(snap.reorgs_handled));
+    metrics::gauge!(
+        "raven_railgun_consumer_errors",
+        "instance" => label
+    )
+    .set(to_f(snap.consumer_errors));
 }
 
 pub(crate) async fn health_live_handler() -> impl IntoResponse {

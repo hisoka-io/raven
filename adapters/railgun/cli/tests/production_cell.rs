@@ -27,8 +27,8 @@ const BEARER_TOKEN: &str = "production-cell-test-token";
 const PRODUCTION_INSTANCE_ID: &str = "ppoi-paths-ofac";
 const ENTRIES_LOG2: usize = 16;
 /// T2/T3 cell: 16 siblings × 32 B = 512 B per Merkle path.
-/// Locked by `INSPIRE_PRODUCTION_VARIANT_BENCH.md`: 71.9 ms total /
-/// 69.3 ms server / 32.9 KB response.
+/// 3-seed locked-variant numbers at the production cell: 71.9 ms
+/// total / 69.3 ms server / 32.9 KB response (Zen 5 reference host).
 const ENTRY_BYTES: usize = 512;
 
 fn entries() -> usize {
@@ -154,10 +154,9 @@ async fn production_cell_round_trip_and_batch_within_budget() {
     );
 
     // Bench gate: locked production target is ~71.9 ms total /
-    // 69.3 ms server (3-seed median, 0.6% spread) per
-    // INSPIRE_PRODUCTION_VARIANT_BENCH.md. Test asserts < 300 ms
-    // total RT to leave headroom for HTTP + serde + WSL2 noise +
-    // single-test variance.
+    // 69.3 ms server (3-seed median, 0.6% spread on the Zen 5
+    // reference). Test asserts < 300 ms total RT to leave headroom
+    // for HTTP + serde + contended-host noise + single-test variance.
     assert!(
         single_total < Duration::from_millis(300),
         "single query total RT regressed: {single_total:?} (production floor 71.9 ms total)"

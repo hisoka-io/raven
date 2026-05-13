@@ -14,14 +14,18 @@ use std::sync::Arc;
 
 /// Server state for one InsPIRe instance. Lives behind `PirInstance`'s ArcSwap.
 ///
-/// `crs`, `cache`, `session_store` are `Arc`-shared across re-encode swaps so
-/// re-preprocess avoids rebuilding the O(d^3) cache and preserves sticky sessions.
-/// `encoded_db` is owned so `drive_commit` can mutate per-shard polynomials.
+/// `crs`, `cache`, `session_store`, `encoded_db` are all `Arc`-shared across
+/// re-encode swaps so re-preprocess avoids rebuilding the O(d^3) cache and
+/// preserves sticky sessions. `Arc::make_mut` triggers a Vec memcpy IFF other
+/// `Arc`s are alive (in-flight queries holding the donor state); bounded to
+/// once per `drive_commit` re-encode batch.
 pub struct InspireServerState {
     /// Public CRS.
     pub crs: Arc<ServerCrs>,
-    /// Encoded shard polynomials. Owned; mutated per dirty shard at commit.
-    pub encoded_db: EncodedDatabase,
+    /// Encoded shard polynomials. Mutated per dirty shard at commit via
+    /// `Arc::make_mut`. Wrapped in `Arc` so same-shape rebuilds carry the
+    /// buffer via `Arc::clone` without paying a ~128 MiB `Vec` memcpy.
+    pub encoded_db: Arc<EncodedDatabase>,
     /// Pre-warmed packing keys. `Arc`-shared; rebuilt only on cell-shape change.
     pub cache: Arc<ServerInspiringCache>,
     /// Per-instance session store. `Arc`-shared so sessions survive re-encode swaps.
@@ -48,6 +52,15 @@ impl InspireServerState {
     /// Shard config needed by clients to build queries.
     pub fn shard_config(&self) -> &ShardConfig {
         &self.encoded_db.config
+    }
+
+    /// Borrow the encoded database directly. Useful for call sites that
+    /// need an explicit `&EncodedDatabase` (deref coercion of
+    /// `&Arc<EncodedDatabase>` works in argument position but not in
+    /// `let`-bindings).
+    #[must_use]
+    pub fn encoded_db(&self) -> &EncodedDatabase {
+        &self.encoded_db
     }
 }
 
@@ -88,7 +101,7 @@ pub fn setup_state(
     Ok((
         InspireServerState {
             crs: Arc::new(crs),
-            encoded_db,
+            encoded_db: Arc::new(encoded_db),
             cache: Arc::new(cache),
             session_store: Arc::new(session_store),
             variant,
@@ -158,13 +171,80 @@ pub fn swap_state(
         };
     let new_state = InspireServerState {
         crs,
-        encoded_db,
+        encoded_db: Arc::new(encoded_db),
         cache,
         session_store: Arc::new(ServerSessionStore::new()),
         variant,
         entry_size,
     };
     instance.swap_state(new_state, new_epoch);
+    Ok(())
+}
+
+/// Heartbeat-driven sticky-session eviction.
+///
+/// Builds a same-shape replacement [`InspireServerState`] from the
+/// instance's currently loaded snapshot. CRS, `EncodedDatabase`,
+/// [`ServerInspiringCache`], variant, and entry_size are carried via
+/// `Arc::clone` (sub-microsecond, zero allocation after Phase 2 T-A
+/// wrapped `encoded_db` in `Arc`). The [`ServerSessionStore`] is
+/// replaced with a fresh empty store, so every registered
+/// sticky-bearer session under the instance is dropped. The epoch
+/// bumps by 1 via [`Epoch::next`].
+///
+/// # Why this exists
+///
+/// The inner [`ServerSessionStore`] is documented as never-evicting
+/// (its `len()` only grows). Under sustained once-and-done bearer
+/// churn or a long-running deployment, this causes resident memory
+/// growth that the HTTP-layer SessionMap sweeper alone cannot bound:
+/// SessionMap holds opaque handles, but the inner store holds the
+/// actual packing keys (~48 KB per session). An operator-side
+/// periodic call to this fn is the V1 mitigation; V2 will land an
+/// explicit `evict(handle)` API upstream. Stale
+/// `ServerSessionHandle`s held in HTTP `SessionMap` no longer
+/// reference any live state after the swap — once the last
+/// `Arc<InspireServerState>` holding the donor `session_store` is
+/// dropped (in-flight queries finish), the inner store deallocates.
+///
+/// # Cost
+///
+/// At the production cell (d=2048, 65k × 512 B): all heavy fields
+/// (CRS, EncodedDatabase, cache) are carried via `Arc::clone` —
+/// sub-microsecond, zero allocation. Only the fresh
+/// `ServerSessionStore` Arc allocation runs per call. Measured wall
+/// under 1 ms even at the production cell; trivially safe to run
+/// hourly across all instances.
+///
+/// In-flight queries holding the donor `Arc<InspireServerState>`
+/// continue running on the donor's `session_store`; new queries see
+/// the fresh empty store. Sticky-bearer clients re-register on
+/// their next request via the `/session` route, paying their
+/// one-time `register_server_side` cost again.
+///
+/// # Errors
+///
+/// Returns `Result<()>` for forward-compatibility with future
+/// fallible same-shape rebuilds; the current implementation is
+/// infallible (every heavy field is `Arc::clone`d, no allocation
+/// can fail without panicking earlier in the runtime).
+pub fn heartbeat_session_eviction(instance: &super::PirInstance<RavenInspireScheme>) -> Result<()> {
+    let donor = instance.current_state();
+    // Same-shape rebuild: every heavy field is `Arc::clone`d
+    // (sub-microsecond, zero allocation). The donor's
+    // Arc<InspireServerState> remains valid for any in-flight
+    // query; the fresh empty `ServerSessionStore` is the only
+    // observable change to new queries.
+    let new_state = InspireServerState {
+        crs: Arc::clone(&donor.crs),
+        encoded_db: Arc::clone(&donor.encoded_db),
+        cache: Arc::clone(&donor.cache),
+        session_store: Arc::new(ServerSessionStore::new()),
+        variant: donor.variant,
+        entry_size: donor.entry_size,
+    };
+    let next_epoch = instance.current_epoch().next();
+    instance.swap_state(new_state, next_epoch);
     Ok(())
 }
 
@@ -259,11 +339,15 @@ impl std::fmt::Debug for PersistedInspireState {
     }
 }
 
-/// Serialize an [`InspireServerState`] to bincode bytes.
+/// Serialize an [`InspireServerState`] to bincode bytes (V5 legacy codec).
+///
+/// Retained for the encoder-migration tools and for backward-compat
+/// regression tests. New code should call [`snapshot_inspire_state_v6`]
+/// to embed the [`LogicalLeafStore`] alongside the engine state.
 pub fn snapshot_inspire_state(state: &InspireServerState) -> Result<Vec<u8>> {
     let bundle = PersistedInspireState {
         crs: (*state.crs).clone(),
-        encoded_db: state.encoded_db.clone(),
+        encoded_db: (*state.encoded_db).clone(),
         variant: state.variant,
         entry_size: state.entry_size,
     };
@@ -271,16 +355,61 @@ pub fn snapshot_inspire_state(state: &InspireServerState) -> Result<Vec<u8>> {
         .map_err(|e| AdapterError::Serialization(format!("snapshot serialize: {e}")))
 }
 
+/// Magic header for V6 snapshot envelope. V5 snapshots are raw bincode
+/// of [`PersistedInspireState`] — they have no magic prefix. The four
+/// bytes `RV6\0` are distinguishable from a bincode-serialized struct
+/// (which starts with the first field's encoding, never matching these
+/// bytes) so [`restore_inspire_state_v6`] can auto-dispatch on the
+/// leading bytes.
+pub const SNAPSHOT_V6_MAGIC: [u8; 4] = *b"RV6\0";
+
+/// V6 snapshot envelope: `InspireServerState` + the engine-side
+/// `LogicalLeafStore` embedded together so a successful commit
+/// archives the WAL without losing logical state on restart.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedInspireStateV6 {
+    state: PersistedInspireState,
+    store: LogicalLeafStore,
+}
+
+/// Serialize a `(state, store)` pair to a V6 snapshot envelope.
+///
+/// Format: `SNAPSHOT_V6_MAGIC || bincode(PersistedInspireStateV6)`.
+pub fn snapshot_inspire_state_v6(
+    state: &InspireServerState,
+    store: &LogicalLeafStore,
+) -> Result<Vec<u8>> {
+    let bundle = PersistedInspireStateV6 {
+        state: PersistedInspireState {
+            crs: (*state.crs).clone(),
+            encoded_db: (*state.encoded_db).clone(),
+            variant: state.variant,
+            entry_size: state.entry_size,
+        },
+        store: store.clone(),
+    };
+    let mut out = Vec::with_capacity(SNAPSHOT_V6_MAGIC.len() + 1024);
+    out.extend_from_slice(&SNAPSHOT_V6_MAGIC);
+    let body = bincode::serialize(&bundle)
+        .map_err(|e| AdapterError::Serialization(format!("v6 snapshot serialize: {e}")))?;
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
 /// Reconstruct an [`InspireServerState`] from bincode bytes. Rebuilds cache; session store starts empty.
 pub fn restore_inspire_state(bytes: &[u8]) -> Result<InspireServerState> {
     let bundle: PersistedInspireState = bincode::deserialize(bytes)
         .map_err(|e| AdapterError::Serialization(format!("snapshot deserialize: {e}")))?;
+    bundle_to_state(bundle)
+}
+
+fn bundle_to_state(bundle: PersistedInspireState) -> Result<InspireServerState> {
     let cache = ServerInspiringCache::new(&bundle.crs, &bundle.encoded_db)
         .map_err(|e| AdapterError::Scheme(format!("restore cache build: {e}")))?;
     let session_store = ServerSessionStore::new();
     Ok(InspireServerState {
         crs: Arc::new(bundle.crs),
-        encoded_db: bundle.encoded_db,
+        encoded_db: Arc::new(bundle.encoded_db),
         cache: Arc::new(cache),
         session_store: Arc::new(session_store),
         variant: bundle.variant,
@@ -288,11 +417,40 @@ pub fn restore_inspire_state(bytes: &[u8]) -> Result<InspireServerState> {
     })
 }
 
+/// Reconstruct `(InspireServerState, LogicalLeafStore)` from snapshot bytes.
+///
+/// Auto-dispatches on the leading 4-byte magic header: V6 snapshots
+/// start with [`SNAPSHOT_V6_MAGIC`] and decode the full embedded store;
+/// legacy V5 snapshots (raw bincode of [`PersistedInspireState`])
+/// return a default-empty [`LogicalLeafStore`] with a `tracing::warn`
+/// — WAL replay rebuilds the store on first open and the next commit
+/// upgrades the snapshot envelope to V6.
+pub fn restore_inspire_state_v6(bytes: &[u8]) -> Result<(InspireServerState, LogicalLeafStore)> {
+    if let Some(body) = bytes.strip_prefix(SNAPSHOT_V6_MAGIC.as_slice()) {
+        let bundle: PersistedInspireStateV6 = bincode::deserialize(body)
+            .map_err(|e| AdapterError::Serialization(format!("v6 snapshot deserialize: {e}")))?;
+        let state = bundle_to_state(bundle.state)?;
+        Ok((state, bundle.store))
+    } else {
+        tracing::warn!(
+            target = "raven::engine::snapshot",
+            "legacy V5 snapshot (no V6 magic prefix); LogicalLeafStore starts empty and will \
+             be repopulated from WAL replay if WAL bytes are still present"
+        );
+        let state = restore_inspire_state(bytes)?;
+        Ok((state, LogicalLeafStore::default()))
+    }
+}
+
 /// Re-encode a single shard from a raw byte buffer in place.
 ///
 /// # Errors
 /// Returns [`AdapterError::Scheme`] if `encode_database` rejects the shape.
-/// Returns [`AdapterError::Internal`] if `shard_id` is not present.
+/// Returns [`AdapterError::ShardOutOfRange`] if `shard_id` is not present
+/// in `encoded_db.shards`. The commit driver matches this variant to
+/// drop the shard from `dirty_shards` (retrying a structurally-
+/// unencodable shard is futile) and bump the cardinality-bounded
+/// `raven_railgun_unsatisfiable_dirty_shards_total{instance}` counter.
 pub fn re_encode_shard(
     encoded_db: &mut EncodedDatabase,
     params: &InspireParams,
@@ -305,11 +463,9 @@ pub fn re_encode_shard(
         .shards
         .iter_mut()
         .find(|s| s.id == shard_id)
-        .ok_or_else(|| {
-            AdapterError::Internal(format!(
-                "re_encode_shard: shard id {shard_id} not present in EncodedDatabase \
-                 (have {total_shards} shards)"
-            ))
+        .ok_or(AdapterError::ShardOutOfRange {
+            shard_id,
+            db_shard_count: total_shards,
         })?;
 
     let entries = shard_bytes.len() / entry_size.max(1);
@@ -371,7 +527,7 @@ pub fn materialize_shard_bytes(
 /// Accumulates leaves + PPOI status rows, marks affected shards dirty, and
 /// re-encodes only the dirty shards at explicit commit time (~5 ms per shard).
 /// Rebuilt from WAL replay on bootstrap.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogicalLeafStore {
     leaves: std::collections::BTreeMap<(u32, u32), [u8; 32]>,
     ppoi_status: std::collections::BTreeMap<([u8; 32], [u8; 32]), u8>,
@@ -705,6 +861,28 @@ impl LogicalLeafStore {
         self.dirty_shards.clear();
     }
 
+    /// Remove a specific shard id from the dirty set.
+    ///
+    /// Returns `true` if the shard was present and dropped. Used by
+    /// `drive_commit` to discard structurally-unencodable shard ids
+    /// (`AdapterError::ShardOutOfRange`) so the commit driver stops
+    /// retrying them on every cadence trigger. Transient errors
+    /// (io/serialization) keep the shard dirty for retry.
+    pub fn drop_dirty_shard(&mut self, shard_id: u32) -> bool {
+        self.dirty_shards.remove(&shard_id)
+    }
+
+    /// Test-only access to the dirty-shards set. Production code drives
+    /// dirty-shard insertion through [`Self::apply`] / the chain-event
+    /// encoder; tests that need to seed an out-of-range shard id (to
+    /// exercise the `drive_commit` drop-and-bump-counter path) inject
+    /// directly via this helper. Behind `cfg(test)` so the operator
+    /// surface stays minimal.
+    #[cfg(test)]
+    pub fn dirty_shards_mut_for_test(&mut self) -> &mut std::collections::BTreeSet<u32> {
+        &mut self.dirty_shards
+    }
+
     /// Merkle auth path for `(tree_number, leaf_index)` against the per-tree IMT.
     ///
     /// # Errors
@@ -790,6 +968,64 @@ pub fn validate_apply(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod snapshot_v6_tests {
+    use super::{
+        restore_inspire_state, restore_inspire_state_v6, setup_state, snapshot_inspire_state,
+        snapshot_inspire_state_v6, InspireVariant, LogicalLeafStore, SNAPSHOT_V6_MAGIC,
+    };
+    use raven_inspire::params::InspireParams;
+
+    fn toy_state_and_db() -> (super::InspireServerState, Vec<u8>) {
+        let params = InspireParams::secure_128_d2048();
+        let entries = 256usize;
+        let entry_size = 32usize;
+        let db: Vec<u8> = (0..entries)
+            .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
+            .collect();
+        let (state, _sk) =
+            setup_state(&params, &db, entry_size, InspireVariant::TwoPacking).expect("setup");
+        (state, db)
+    }
+
+    #[test]
+    fn v6_snapshot_carries_magic_prefix() {
+        let (state, _) = toy_state_and_db();
+        let store = LogicalLeafStore::new();
+        let bytes = snapshot_inspire_state_v6(&state, &store).expect("v6 serialize");
+        assert!(
+            bytes.starts_with(&SNAPSHOT_V6_MAGIC),
+            "V6 snapshot must start with RV6\\0 magic; got {:?}",
+            bytes.get(..SNAPSHOT_V6_MAGIC.len())
+        );
+    }
+
+    #[test]
+    fn v6_round_trip_restores_state_and_empty_store() {
+        let (state, _) = toy_state_and_db();
+        let store = LogicalLeafStore::new();
+        let bytes = snapshot_inspire_state_v6(&state, &store).expect("v6 serialize");
+        let (restored, store_back) = restore_inspire_state_v6(&bytes).expect("v6 restore");
+        assert_eq!(restored.entry_size, state.entry_size);
+        assert_eq!(store_back.ppoi_count(), 0);
+        assert_eq!(store_back.leaf_count(), 0);
+    }
+
+    #[test]
+    fn legacy_v5_snapshot_decodes_with_empty_store_via_v6_restore() {
+        let (state, _) = toy_state_and_db();
+        let v5_bytes = snapshot_inspire_state(&state).expect("v5 serialize");
+        assert!(
+            !v5_bytes.starts_with(&SNAPSHOT_V6_MAGIC),
+            "V5 raw bincode must NOT collide with V6 magic"
+        );
+        let (restored, store_back) = restore_inspire_state_v6(&v5_bytes).expect("v5 via v6");
+        assert_eq!(restored.entry_size, state.entry_size);
+        assert_eq!(store_back.ppoi_count(), 0);
+        let _ = restore_inspire_state(&v5_bytes).expect("v5 directly via legacy path");
+    }
 }
 
 #[cfg(test)]
@@ -1150,6 +1386,7 @@ mod logical_store_tests {
 mod re_encode_tests {
     use super::{re_encode_shard, setup_state, InspireVariant};
     use raven_inspire::params::InspireParams;
+    use std::sync::Arc;
 
     #[test]
     fn re_encode_matches_fresh_encode() {
@@ -1180,8 +1417,14 @@ mod re_encode_tests {
             .get(..shard_bytes_len)
             .expect("db slice for shard 0")
             .to_vec();
-        re_encode_shard(&mut state.encoded_db, &params, 0, &shard_bytes, entry_size)
-            .expect("re_encode_shard");
+        re_encode_shard(
+            Arc::make_mut(&mut state.encoded_db),
+            &params,
+            0,
+            &shard_bytes,
+            entry_size,
+        )
+        .expect("re_encode_shard");
 
         let new_polys = &state
             .encoded_db
@@ -1232,8 +1475,14 @@ mod re_encode_tests {
         if let Some(b) = shard_bytes.get_mut(7) {
             *b ^= 0xff;
         }
-        re_encode_shard(&mut state.encoded_db, &params, 0, &shard_bytes, entry_size)
-            .expect("re_encode_shard");
+        re_encode_shard(
+            Arc::make_mut(&mut state.encoded_db),
+            &params,
+            0,
+            &shard_bytes,
+            entry_size,
+        )
+        .expect("re_encode_shard");
 
         let new_polys = &state
             .encoded_db
@@ -1293,8 +1542,14 @@ mod re_encode_tests {
             .get(shard_bytes_len..2 * shard_bytes_len)
             .expect("shard 1 byte range")
             .to_vec();
-        re_encode_shard(&mut state.encoded_db, &params, 1, &shard_bytes, entry_size)
-            .expect("re_encode_shard k=1");
+        re_encode_shard(
+            Arc::make_mut(&mut state.encoded_db),
+            &params,
+            1,
+            &shard_bytes,
+            entry_size,
+        )
+        .expect("re_encode_shard k=1");
 
         let new_shard1 = &state
             .encoded_db
@@ -1323,8 +1578,14 @@ mod re_encode_tests {
             .collect();
         let (mut state, _sk) =
             setup_state(&params, &db, entry_size, InspireVariant::TwoPacking).expect("setup_state");
-        let err = re_encode_shard(&mut state.encoded_db, &params, 999, &[], entry_size)
-            .expect_err("unknown shard id");
+        let err = re_encode_shard(
+            Arc::make_mut(&mut state.encoded_db),
+            &params,
+            999,
+            &[],
+            entry_size,
+        )
+        .expect_err("unknown shard id");
         let msg = format!("{err}");
         assert!(
             msg.contains("999"),

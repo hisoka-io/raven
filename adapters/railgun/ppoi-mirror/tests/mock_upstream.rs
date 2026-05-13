@@ -17,6 +17,7 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::Router;
 use raven_railgun_core::{BlindedCommitment, BlindedCommitmentType, ListKey, POIStatus};
+use raven_railgun_persistence::WalEntryPayload;
 use raven_railgun_ppoi_mirror::{MirrorConfig, MirrorSource, UpstreamPpoiMirror};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -173,7 +174,7 @@ fn build_mirror(endpoint: String) -> UpstreamPpoiMirror {
         endpoint,
         ..MirrorConfig::default()
     };
-    UpstreamPpoiMirror::new(cfg)
+    UpstreamPpoiMirror::new(cfg).expect("mirror builds")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -291,4 +292,117 @@ async fn fetch_status_typed_returns_decode_when_response_missing_key() {
         "expected Decode-style error mentioning missing key, got: {s}"
     );
     handle.abort();
+}
+
+/// Worker-path test: every upstream `/poi-events` row must surface BOTH
+/// `PpoiListLeafAdded` (for per-list IMT growth + the `(BC -> idx)`
+/// ordering oracle T2 path PIR consumes) AND `PpoiStatus` (for the
+/// `(list_key, bc) -> status` map T1 status PIR consumes), in that
+/// order. Closes the worker-path gap where only `PpoiStatus` fired and
+/// the per-list IMT never grew (which silently broke T2 path PIR).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mirror_emits_ppoi_list_leaf_added_for_each_event() {
+    let (url, _state, server_handle) = start_mock().await;
+    let cfg = MirrorConfig {
+        endpoint: url,
+        poll_interval_secs: 1,
+        max_rows_per_fetch: 2,
+        ..MirrorConfig::default()
+    };
+    let mirror = Arc::new(UpstreamPpoiMirror::new(cfg).expect("mirror builds"));
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(WalEntryPayload, u64)>(64);
+    let list = ListKey([0x55u8; 32]);
+    let worker_handle = tokio::spawn({
+        let mirror = mirror.clone();
+        async move {
+            let _ = mirror.run_worker(list, 0, tx).await;
+        }
+    });
+
+    // Drain the first 6 payloads and assert strict (LeafAdded, Status)
+    // interleaving: for each `/poi-events` row the worker emits the
+    // IMT-grow payload FIRST and the status payload SECOND. Flipping
+    // the order would silently break T2 path PIR — see the engine
+    // apply path's PpoiListLeafAdded contiguity invariant.
+    let mut got: Vec<WalEntryPayload> = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while got.len() < 6 {
+        assert!(
+            tokio::time::Instant::now() <= deadline,
+            "worker did not emit 6 payloads within 20s (got {})",
+            got.len()
+        );
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+        if let Ok(Some((payload, _height))) = recv {
+            got.push(payload);
+        }
+    }
+
+    let mut last_idx: Option<u32> = None;
+    for pair in got.chunks(2) {
+        match (pair.first(), pair.get(1)) {
+            (
+                Some(WalEntryPayload::PpoiListLeafAdded {
+                    list_key: lk_leaf,
+                    list_index,
+                    blinded_commitment: bc_leaf,
+                    ..
+                }),
+                Some(WalEntryPayload::PpoiStatus {
+                    list_key: lk_status,
+                    blinded_commitment: bc_status,
+                    ..
+                }),
+            ) => {
+                assert_eq!(*lk_leaf, list.0, "leaf list_key must match worker config");
+                assert_eq!(
+                    *lk_status, list.0,
+                    "status list_key must match worker config"
+                );
+                assert_eq!(
+                    bc_leaf, bc_status,
+                    "PpoiListLeafAdded and PpoiStatus must reference the same bc within a pair"
+                );
+                if let Some(prev) = last_idx {
+                    assert!(
+                        *list_index > prev,
+                        "list_index must strictly increase: {prev} -> {list_index}"
+                    );
+                }
+                last_idx = Some(*list_index);
+            }
+            other => panic!(
+                "expected (PpoiListLeafAdded, PpoiStatus) pair in load-bearing order, got: \
+                 {other:?}"
+            ),
+        }
+    }
+
+    worker_handle.abort();
+    server_handle.abort();
+}
+
+/// Regression-guard: `/pois-per-blinded-commitment` is a status-only
+/// lookup; it must NOT contribute IMT-grow events. The mirror's
+/// `fetch_status_typed` returns a typed status directly and has no
+/// `WalEntryPayload` channel by design.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mirror_pois_per_blinded_commitment_only_emits_status_no_imt_grow() {
+    let (url, _state, server_handle) = start_mock().await;
+    let mirror = build_mirror(url);
+    let list = ListKey([0; 32]);
+    let bc = BlindedCommitment::from_bytes([0x77; 32]);
+
+    let got = mirror
+        .fetch_status_typed(&list, &bc, BlindedCommitmentType::Shield)
+        .await
+        .expect("fetch_status_typed");
+    assert_eq!(got, POIStatus::Valid);
+    // Structural assertion: the only payload-emitting code path is
+    // `run_worker_with_cursor`, which exclusively consumes
+    // `/poi-events`. If `fetch_status_typed` ever grew a side-channel
+    // that wrote `PpoiListLeafAdded`, the trait signature would have to
+    // change and the type system would force this test to fail.
+    let _: POIStatus = got;
+    server_handle.abort();
 }

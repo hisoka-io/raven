@@ -15,9 +15,9 @@ pub mod wal;
 use raven_railgun_core::InstanceId;
 use std::path::PathBuf;
 
-pub use manifest::{Manifest, MANIFEST_SCHEMA_VERSION};
+pub use manifest::{Manifest, MANIFEST_SCHEMA_VERSION, MIN_READABLE_MANIFEST_SCHEMA_VERSION};
 pub use snapshot::{Snapshot, SnapshotId};
-pub use wal::{Wal, WalEntry, WalEntryPayload, WalReplay};
+pub use wal::{Wal, WalEntry, WalEntryPayload, WalReplay, WAL_MAX_PAYLOAD_BYTES};
 
 /// Typed errors from the persistence layer.
 #[derive(thiserror::Error, Debug)]

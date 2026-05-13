@@ -124,7 +124,7 @@ proptest! {
         let pre_drop_leaf_count = store.imt_leaf_count_for(0);
         drop(opened);
 
-        // Reopen and replay; any soft-skip on the B4 path would diverge
+        // Reopen and replay; any soft-skip on the WAL-replay path would diverge
         // recovered leaf count from pre-drop leaf count.
         let layout2 = StoreLayout::open(dir.path()).expect("layout 2");
         let opened2 = InspirePersistence::open(

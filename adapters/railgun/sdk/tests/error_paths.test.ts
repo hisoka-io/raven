@@ -33,7 +33,7 @@ function stubWasm(): RavenInspireWasm {
       // Valid empty bincode: 8 bytes len(0) + 8 bytes len(0) = 16.
       return new Uint8Array(16);
     },
-    extract_response: (_a, _b, response, _entry) => {
+    extract_response: (_session, _a, _b, response, _entry) => {
       // Pass through whatever the server returned. If the server
       // sent garbage, the SDK still gets the bytes; the wallet's
       // domain layer (T1 status decoder, T2 path decoder) is

@@ -436,7 +436,28 @@ where
         log: alloy::rpc::types::eth::Log,
         observed_head: u64,
     ) -> Result<()> {
-        let block_number = log.block_number.unwrap_or(observed_head);
+        // Drop logs missing `block_number` rather than fabricate a
+        // height from the observed chain head: routing the event with
+        // the wrong height breaks downstream reorg-truncate semantics
+        // (the engine treats `Reorg(h)` as "delete leaves with
+        // block_height > h", and a fabricated height would either skip
+        // legitimate truncation or truncate canonical state). The
+        // operator metric `raven_railgun_indexer_dropped_logs_total`
+        // makes the drop observable.
+        let _ = observed_head;
+        let Some(block_number) = log.block_number else {
+            metrics::counter!(
+                "raven_railgun_indexer_dropped_logs_total",
+                "reason" => "missing_block_number"
+            )
+            .increment(1);
+            tracing::warn!(
+                tx_hash = ?log.transaction_hash,
+                topic0 = ?log.topic0(),
+                "dropping log with missing block_number"
+            );
+            return Ok(());
+        };
         let tx_hash = log.transaction_hash.map_or([0u8; 32], |h| h.0);
         let topic0 = log.topic0().copied().unwrap_or_default();
         let event = decode_log_to_railgun_event(topic0, &log, block_number, tx_hash)?;

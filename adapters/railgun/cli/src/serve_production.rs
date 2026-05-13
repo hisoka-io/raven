@@ -33,6 +33,16 @@ pub struct ProductionServeOptions {
     pub entries: usize,
     pub entry_bytes: usize,
     pub encoder: raven_railgun_engine::pir_table::EncoderKind,
+    /// Periodic heartbeat session-eviction interval (seconds). `0`
+    /// disables. Default 3600. Mirrors the multi-instance binary so
+    /// single-instance deployments also bound resident memory under
+    /// sustained bearer churn.
+    pub session_eviction_interval_secs: u64,
+    /// Expose `/metrics` without bearer auth. Default-deny (`false`).
+    /// When `true`, the scrape endpoint is unauthenticated; only safe
+    /// behind a private-network firewall where bearer rotation is not
+    /// a requirement.
+    pub metrics_public: bool,
 }
 
 /// Locked production-cell shape: 65,536 × 512 B (16 Poseidon-Merkle siblings × 32 B).
@@ -94,7 +104,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     use raven_railgun_indexer::{
         ChainSource, IndexerWorker, IndexerWorkerConfig, RpcChainSource, DEFAULT_POLL_INTERVAL_SECS,
     };
-    use raven_railgun_ppoi_mirror::{MirrorConfig, UpstreamPpoiMirror};
+    use raven_railgun_ppoi_mirror::{MirrorConfig, MirrorCursor, UpstreamPpoiMirror};
 
     let proxy_addr: Address = opts
         .railgun_proxy
@@ -115,6 +125,8 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
             opts.entry_bytes
         );
     }
+    raven_railgun_engine::pir_table::validate_total_entries(&opts.encoder, opts.entries)
+        .map_err(|e| anyhow::anyhow!("encoder cell shape rejected: {e}"))?;
     let params = InspireParams::secure_128_d2048();
     let entries = opts.entries;
     let entry_bytes = opts.entry_bytes;
@@ -170,8 +182,24 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         Arc::clone(&chain_source),
         handle.channels.indexer_tx.clone(),
     );
+    // Recovered baseline: never start the indexer below the manifest's
+    // recovered chain-event height. A fresh-bootstrap returns 0 (so
+    // `opts.start_block` wins); a recovered instance returns the
+    // last committed `current_block_height` and the indexer resumes
+    // there instead of silently re-scanning the prefix the consumer
+    // task would only drop as duplicates.
+    let recovered_floor = opts
+        .start_block
+        .max(handle.persistence.manifest_block_height());
+    if recovered_floor > opts.start_block {
+        tracing::info!(
+            toml_start_block = opts.start_block,
+            recovered_floor,
+            "single-instance indexer start_block raised to recovered manifest height"
+        );
+    }
     let worker_config = IndexerWorkerConfig {
-        start_block: opts.start_block,
+        start_block: recovered_floor,
         poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
         ..IndexerWorkerConfig::default()
     };
@@ -181,11 +209,33 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         endpoint: opts.mirror_endpoint.clone(),
         ..MirrorConfig::default()
     };
-    let mirror = Arc::new(UpstreamPpoiMirror::new(mirror_config));
+    let mirror = Arc::new(
+        UpstreamPpoiMirror::new(mirror_config)
+            .map_err(|e| anyhow::anyhow!("ppoi mirror constructor: {e}"))?,
+    );
     let mirror_tx = handle.channels.mirror_tx.clone();
     let mirror_clone = Arc::clone(&mirror);
+    // Cursor sidecar lives under the operator-provided data_dir so a
+    // restart resumes from the post-WAL-replay floor rather than
+    // re-firing `expected list_index N, got 0..N-1` on every startup.
+    // Kind is dispatched from the configured encoder: per-list-path
+    // encoders own the path sidecar; chain-tree encoders + status
+    // encoders share the status sidecar by convention.
+    let mirror_kind = mirror_kind_for_encoder(opts.encoder);
+    let fallback = {
+        let store = handle.logical_store.lock();
+        #[allow(clippy::cast_possible_truncation)]
+        let count = store
+            .ppoi_imt(&list_key.0)
+            .map_or(0u64, |imt| imt.leaf_count() as u64);
+        count
+    };
+    let cursor = MirrorCursor::new(opts.data_dir.clone(), mirror_kind, fallback);
     let mirror_handle = tokio::spawn(async move {
-        if let Err(e) = mirror_clone.run_worker(list_key, 0, mirror_tx).await {
+        if let Err(e) = mirror_clone
+            .run_worker_with_cursor(list_key, 0, Some(cursor), mirror_tx)
+            .await
+        {
             tracing::error!(error = %e, "ppoi mirror worker exiting");
         }
     });
@@ -193,6 +243,8 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     let mut http_config = HttpConfig::demo(opts.token.clone());
     http_config.max_concurrent_queries = opts.max_concurrent_queries;
     http_config.respond_timeout_secs = opts.respond_timeout_secs;
+    http_config.metrics_public = opts.metrics_public;
+    http_config.session_eviction_interval_secs = opts.session_eviction_interval_secs;
 
     let mut engine: Engine<raven_railgun_engine::inspire::RavenInspireScheme> = Engine::new();
     engine
@@ -206,6 +258,57 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         std::collections::HashMap::new();
     k_map.insert(handle.instance.id.clone(), resolved_k);
     let app_state = app_state.with_instance_concurrency(k_map);
+    // Wire instance_metrics so `/metrics` emits `instance="..."`-labelled
+    // gauges on the single-instance path too. Without this the scrape
+    // endpoint serves only the legacy single-cell `consumer_metrics`
+    // shape, hiding the per-instance label that dashboards expect.
+    let mut instance_metrics: std::collections::HashMap<
+        raven_railgun_core::InstanceId,
+        Arc<parking_lot::Mutex<raven_railgun_engine::persistence::ConsumerMetrics>>,
+    > = std::collections::HashMap::new();
+    instance_metrics.insert(handle.instance.id.clone(), Arc::clone(&handle.metrics));
+    let app_state = app_state.with_instance_metrics(instance_metrics);
+
+    // Periodic session-map sweeper drops past-TTL entries even if the
+    // bearer never repeats (rave's serve_production.rs carried the bug
+    // forward; this closes it). Cadence is 60 s.
+    let mut auxiliary_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    auxiliary_tasks.push(app_state.start_session_sweeper(std::time::Duration::from_secs(60)));
+
+    // Heartbeat session eviction. `0` disables; default 3600 s. Bounds
+    // resident memory under bearer churn at the cost of dropping every
+    // live session once per interval. Symmetry with the multi-instance
+    // binary.
+    if opts.session_eviction_interval_secs > 0 {
+        let instance = Arc::clone(&handle.instance);
+        let instance_id = handle.instance.id.clone();
+        let tick = std::time::Duration::from_secs(opts.session_eviction_interval_secs);
+        let h = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(tick);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // drop the immediate t=0 tick.
+            loop {
+                ticker.tick().await;
+                match raven_railgun_engine::inspire::heartbeat_session_eviction(&instance) {
+                    Ok(()) => {
+                        metrics::counter!(
+                            "raven_railgun_session_eviction_swaps_total",
+                            "instance" => instance_id.as_str().to_owned()
+                        )
+                        .increment(1);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            instance = instance_id.as_str(),
+                            error = %e,
+                            "heartbeat session eviction failed"
+                        );
+                    }
+                }
+            }
+        });
+        auxiliary_tasks.push(h);
+    }
 
     let router = inspire_router(app_state).map_err(|e| anyhow::anyhow!("inspire_router: {e}"))?;
     let local_addr = listener
@@ -257,6 +360,13 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         abort_await_deadline,
     )
     .await;
+
+    // Auxiliary tasks (session sweeper, heartbeat ticker) run forever;
+    // abort them on shutdown so the process exits cleanly.
+    for task in auxiliary_tasks {
+        task.abort();
+        let _ = tokio::time::timeout(abort_await_deadline, task).await;
+    }
 
     Ok(())
 }
@@ -318,6 +428,25 @@ fn parse_hex32(s: &str) -> anyhow::Result<[u8; 32]> {
         *byte = (nib(hi)? << 4) | nib(lo)?;
     }
     Ok(out)
+}
+
+/// Dispatch [`raven_railgun_ppoi_mirror::MirrorKind`] from the
+/// configured encoder.
+///
+/// `per-list-path` owns the path sidecar; every other encoder kind
+/// defaults to the status sidecar. Chain-tree encoders (`PerLeafBc`,
+/// `PerLeafPath`, `PerNode`) still drive the single-list mirror feed
+/// in the single-instance entry point and the status sidecar is the
+/// canonical resume point there.
+fn mirror_kind_for_encoder(
+    encoder: raven_railgun_engine::pir_table::EncoderKind,
+) -> raven_railgun_ppoi_mirror::MirrorKind {
+    use raven_railgun_engine::pir_table::EncoderKind;
+    use raven_railgun_ppoi_mirror::MirrorKind;
+    match encoder {
+        EncoderKind::PerListPath { .. } => MirrorKind::Path,
+        _ => MirrorKind::Status,
+    }
 }
 
 #[cfg(test)]

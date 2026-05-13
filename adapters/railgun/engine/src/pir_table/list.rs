@@ -230,20 +230,7 @@ impl PirTableEncoder for PerListPathEncoder {
         if list_index >= LEAVES_PER_TREE {
             return dirty;
         }
-        dirty.insert(list_index / self.entries_per_shard);
-        let total_shards_usize = (LEAVES_PER_TREE / self.entries_per_shard) as usize;
-        for k in 1..=u32::try_from(TREE_DEPTH).unwrap_or(u32::MAX) {
-            let block_size = 1u32 << k;
-            let block_start = (list_index / block_size) * block_size;
-            let mut affected = block_start;
-            while affected < list_index {
-                dirty.insert(affected / self.entries_per_shard);
-                affected += 1;
-            }
-            if dirty.len() >= total_shards_usize {
-                break;
-            }
-        }
+        super::path_affected_shards_into(self.entries_per_shard, list_index, &mut dirty);
         dirty
     }
 

@@ -5,7 +5,7 @@
 
 #![allow(clippy::too_many_lines, clippy::missing_errors_doc)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -196,6 +196,47 @@ struct GlobalSection {
     max_instance_count: Option<u32>,
     #[serde(default)]
     tree_fill_threshold: Option<f32>,
+    /// Optional WebSocket endpoint. When set, the chain indexer uses
+    /// `WsChainSource` as the primary transport and the configured
+    /// HTTP RPC (or pool) as automatic fallback; mode transitions
+    /// surface via `/v1/health/ready.chain_source_mode`.
+    #[serde(default)]
+    ws_endpoint: Option<String>,
+    /// Operator-tunable per-IP rate limit (requests per second).
+    /// `HttpConfig::demo()` ships 200; override here for production
+    /// deployments expecting heavier scrape / wallet traffic.
+    #[serde(default)]
+    rate_limit_rps: Option<u64>,
+    /// Operator-tunable per-IP burst budget (token bucket capacity).
+    /// `HttpConfig::demo()` ships 400.
+    #[serde(default)]
+    rate_limit_burst: Option<u32>,
+    /// Explicit CORS allow-origin list. Empty (default) leaves CORS
+    /// off entirely; non-empty enables CORS for the listed origins.
+    /// Wildcard `*` and empty strings are rejected at `HttpConfig`
+    /// validation. Required for browser wallet integrations.
+    #[serde(default)]
+    cors_allowed_origins: Option<Vec<String>>,
+    /// Trust `X-Forwarded-For` / `cf-connecting-ip` for the rate-
+    /// limit key extractor. Only safe behind a trusted reverse proxy
+    /// that strips client-supplied headers.
+    #[serde(default)]
+    trust_proxy_header: Option<bool>,
+    /// Expose `/metrics` without bearer auth. Default `false`
+    /// (`HttpConfig::demo()` default-deny). Set `true` for a
+    /// scrape-only Prometheus instance reachable only via private
+    /// network.
+    #[serde(default)]
+    metrics_public: Option<bool>,
+    /// Periodic heartbeat session-eviction interval in seconds.
+    /// `HttpConfig::demo()` ships 3600. `0` disables.
+    #[serde(default)]
+    session_eviction_interval_secs: Option<u64>,
+    /// Optional `(block_number, block_hash)` sidecar path for the
+    /// Layer 1 reorg-window cache. Persistent across restart; absent
+    /// = ephemeral cache (each boot rebuilds from RPC).
+    #[serde(default)]
+    reorg_window_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -305,6 +346,26 @@ pub struct MultiServeOptions {
     pub tree_fill_threshold: Option<f32>,
     /// When `Some` on Unix, installs a SIGHUP handler for TOML hot-reload.
     pub reload_config_path: Option<PathBuf>,
+    /// WebSocket endpoint for chain indexer primary transport (HTTP RPC is used as fallback).
+    /// `None` keeps the existing HTTP-only indexer behavior.
+    pub ws_endpoint: Option<String>,
+    /// `HttpConfig.rate_limit_rps` override (`None` keeps the demo default).
+    pub rate_limit_rps: Option<u64>,
+    /// `HttpConfig.rate_limit_burst` override (`None` keeps the demo default).
+    pub rate_limit_burst: Option<u32>,
+    /// `HttpConfig.cors_allowed_origins` override. Empty `Vec` is the same as `None`.
+    pub cors_allowed_origins: Option<Vec<String>>,
+    /// `HttpConfig.trust_proxy_header` override.
+    pub trust_proxy_header: Option<bool>,
+    /// `HttpConfig.metrics_public` override.
+    pub metrics_public: Option<bool>,
+    /// `HttpConfig.session_eviction_interval_secs` override (also drives the
+    /// per-instance heartbeat ticker in `serve_production_multi::run`).
+    pub session_eviction_interval_secs: Option<u64>,
+    /// Persistent path for the indexer Layer 1 reorg-window cache. Absent
+    /// = ephemeral. When set, the indexer worker bootstrapps from the
+    /// sidecar at open and rebuilds via RPC on stale-top mismatch.
+    pub reorg_window_path: Option<PathBuf>,
 }
 
 pub type BootstrapObserver = Arc<parking_lot::Mutex<Option<BootstrapView>>>;
@@ -570,6 +631,14 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         ppoi_list_templates: parsed.ppoi_list_template,
         tree_fill_threshold: parsed.global.tree_fill_threshold,
         reload_config_path: Some(path.to_path_buf()),
+        ws_endpoint: parsed.global.ws_endpoint,
+        rate_limit_rps: parsed.global.rate_limit_rps,
+        rate_limit_burst: parsed.global.rate_limit_burst,
+        cors_allowed_origins: parsed.global.cors_allowed_origins,
+        trust_proxy_header: parsed.global.trust_proxy_header,
+        metrics_public: parsed.global.metrics_public,
+        session_eviction_interval_secs: parsed.global.session_eviction_interval_secs,
+        reorg_window_path: parsed.global.reorg_window_path,
     })
 }
 
@@ -822,20 +891,100 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         *observer.lock() = Some(view);
     }
 
+    // Effective indexer floor: walk every chain-tree instance, take the
+    // MAX of (manifest_block_height, last_block_height) per tree, then
+    // compute `max(toml, recovered)` per tree. Without this map the
+    // single indexer cursor either silently re-scans the prefix below
+    // the recovered floor (toml = 0) OR silently SKIPS events for the
+    // lower-height instances when an operator picks
+    // `start_block = max(all manifest heights)`. Per-tree drop at the
+    // indexer's dispatch site closes both windows.
+    let mut per_tree_recovered: BTreeMap<u32, u64> = BTreeMap::new();
+    for h in &bootstrap.handles.instances {
+        if let DataSourceFilter::ChainTreeNumber(tree) = h.config.data_source {
+            let manifest_height = h.persistence.manifest_block_height();
+            let wal_height = h.logical_store.lock().last_block_height();
+            let height = manifest_height.max(wal_height);
+            per_tree_recovered
+                .entry(tree)
+                .and_modify(|v| *v = (*v).max(height))
+                .or_insert(height);
+        }
+    }
+    let per_tree_start_blocks =
+        compute_effective_start_block_per_tree(opts.start_block, &per_tree_recovered);
+    let min_effective_start_block = per_tree_start_blocks
+        .values()
+        .copied()
+        .min()
+        .unwrap_or(opts.start_block);
+    for (tree, floor) in &per_tree_start_blocks {
+        if *floor > opts.start_block {
+            tracing::info!(
+                tree_number = *tree,
+                toml_start_block = opts.start_block,
+                recovered_floor = *floor,
+                "indexer per-tree start_block raised to recovered manifest floor"
+            );
+        }
+    }
+
+    // Default reorg-window sidecar to a sibling of the first instance's
+    // data_dir so a restart resumes reorg state across operator restarts
+    // without forcing every operator to set `[global].reorg_window_path`.
+    // Operators wanting an explicit path keep the TOML override; those
+    // wanting purely ephemeral behaviour can point the sibling at an
+    // off-disk location.
+    let resolved_reorg_window_path = opts.reorg_window_path.clone().or_else(|| {
+        bootstrap
+            .handles
+            .instances
+            .first()
+            .and_then(|h| h.config.data_dir.parent().map(std::path::Path::to_path_buf))
+            .map(|parent| parent.join("indexer_reorg_window.bin"))
+    });
+
     let chain_workers = if opts.skip_chain_workers {
         None
     } else {
-        Some(spawn_chain_indexer(&opts, bootstrap.handles.channels.indexer_tx.clone()).await?)
+        Some(
+            spawn_chain_indexer(
+                &opts,
+                min_effective_start_block,
+                per_tree_start_blocks.clone(),
+                resolved_reorg_window_path.clone(),
+                bootstrap.handles.channels.indexer_tx.clone(),
+            )
+            .await?,
+        )
     };
     let mirror_workers = if opts.skip_mirror_workers {
         None
     } else {
-        Some(spawn_mirror_workers(&opts, &bootstrap.handles))
+        Some(spawn_mirror_workers(&opts, &bootstrap.handles)?)
     };
 
     let mut http_config = HttpConfig::demo(opts.token.clone());
     http_config.max_concurrent_queries = opts.max_concurrent_queries.max(1);
     http_config.respond_timeout_secs = opts.respond_timeout_secs;
+    if let Some(rps) = opts.rate_limit_rps {
+        http_config.rate_limit_rps = rps;
+    }
+    if let Some(burst) = opts.rate_limit_burst {
+        http_config.rate_limit_burst = burst;
+    }
+    if let Some(origins) = opts.cors_allowed_origins.clone() {
+        http_config.cors_allowed_origins = origins;
+    }
+    if let Some(trust) = opts.trust_proxy_header {
+        http_config.trust_proxy_header = trust;
+    }
+    if let Some(public) = opts.metrics_public {
+        http_config.metrics_public = public;
+    }
+    if let Some(secs) = opts.session_eviction_interval_secs {
+        http_config.session_eviction_interval_secs = secs;
+    }
 
     let app_state =
         AppState::new(engine, http_config).map_err(|e| anyhow::anyhow!("AppState::new: {e}"))?;
@@ -937,6 +1086,68 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     } else {
         app_state
     };
+    let app_state = if let Some(mode) = chain_workers
+        .as_ref()
+        .and_then(|w| w.chain_source_mode.as_ref())
+        .map(Arc::clone)
+    {
+        app_state.with_chain_source_mode(mode)
+    } else {
+        app_state
+    };
+    let per_instance_metrics: std::collections::HashMap<
+        InstanceId,
+        Arc<parking_lot::Mutex<raven_railgun_engine::persistence::ConsumerMetrics>>,
+    > = bootstrap
+        .handles
+        .instances
+        .iter()
+        .map(|h| (h.config.instance_id.clone(), Arc::clone(&h.metrics)))
+        .collect();
+    let app_state = app_state.with_instance_metrics(per_instance_metrics);
+
+    // Periodic session-map sweeper drops past-TTL entries even if the bearer
+    // never repeats. Cadence is 60 s; sweep cost is O(map size) under lock.
+    let sweeper_handle = app_state.start_session_sweeper(std::time::Duration::from_secs(60));
+    auxiliary_tasks.push(sweeper_handle);
+
+    // Per-instance heartbeat session eviction. `0` disables; default 3600 s
+    // bounds resident memory under sustained bearer churn at the cost of
+    // dropping every live session once per interval.
+    let eviction_secs = app_state.config.session_eviction_interval_secs;
+    if eviction_secs > 0 {
+        for inst in &bootstrap.handles.instances {
+            let instance = Arc::clone(&inst.instance);
+            let instance_id = inst.config.instance_id.clone();
+            let tick = std::time::Duration::from_secs(eviction_secs);
+            let handle = tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(tick);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                ticker.tick().await; // drop the immediate t=0 tick.
+                loop {
+                    ticker.tick().await;
+                    match raven_railgun_engine::inspire::heartbeat_session_eviction(&instance) {
+                        Ok(()) => {
+                            metrics::counter!(
+                                "raven_railgun_session_eviction_swaps_total",
+                                "instance" => instance_id.as_str().to_owned()
+                            )
+                            .increment(1);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                instance = instance_id.as_str(),
+                                error = %e,
+                                "heartbeat session eviction failed"
+                            );
+                        }
+                    }
+                }
+            });
+            auxiliary_tasks.push(handle);
+        }
+    }
+
     let router = inspire_router(app_state).map_err(|e| anyhow::anyhow!("inspire_router: {e}"))?;
 
     let local_addr = listener
@@ -1056,7 +1267,17 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         driver.abort();
     }
 
-    drop(chain_workers);
+    // Cooperative drain of the `mode_mirror` task so a panicked mirror
+    // surfaces as a join error in the log instead of being silently
+    // swallowed by `abort()`. The 5s timeout is generous given the
+    // 1s tick cadence; falls through to `abort()` via `Drop` on the
+    // worker JoinHandles themselves.
+    if let Some(mut workers) = chain_workers {
+        workers
+            .shutdown_mode_mirror(std::time::Duration::from_secs(5))
+            .await;
+        drop(workers);
+    }
     drop(mirror_workers);
 
     Ok(())
@@ -1205,6 +1426,53 @@ async fn run_sighup_reload_loop(
         }
         known_ids = new_ids;
     }
+}
+
+/// Compute the indexer's effective `start_block` from the operator-
+/// supplied TOML floor and the per-instance recovered manifest heights.
+///
+/// Returns `max(toml_start_block, max(recovered))` so the indexer never
+/// scans events strictly below the slowest recovered baseline. On
+/// fresh-bootstrap (every recovered = 0) the result equals the TOML
+/// floor.
+///
+/// Single-tree (or single-floor) deployments may keep using this
+/// helper. Multi-instance deployments where instances bootstrapped at
+/// different heights MUST use [`compute_effective_start_block_per_tree`]
+/// instead: the global-MAX strategy would otherwise skip every event in
+/// `(min_recovered, max_recovered]` for the lower-height instances.
+#[must_use]
+pub fn compute_effective_start_block(
+    toml_start_block: u64,
+    recovered_block_heights: &[u64],
+) -> u64 {
+    let max_recovered = recovered_block_heights.iter().copied().max().unwrap_or(0);
+    toml_start_block.max(max_recovered)
+}
+
+/// Compute the per-tree indexer start block when each instance owns a
+/// distinct chain `tree_number` and may have bootstrapped at a different
+/// recovered manifest height.
+///
+/// For each tree, returns `max(toml_start_block, recovered)` so an
+/// operator manual override never backslides. Trees with no recovered
+/// entry default to `toml_start_block` (fresh-bootstrap path).
+///
+/// The single-cursor indexer worker scans from `min(per_tree)` and the
+/// route layer drops events for trees whose effective floor is higher
+/// than the event's block height. Without this map, a 3-instance
+/// deployment at `{25M, 24M, 23M}` running under the MAX strategy from
+/// [`compute_effective_start_block`] would start the indexer at 25M
+/// and miss every event in `(24M, 25M]` for the lower-height instances.
+#[must_use]
+pub fn compute_effective_start_block_per_tree(
+    toml_start_block: u64,
+    recovered_per_tree: &BTreeMap<u32, u64>,
+) -> BTreeMap<u32, u64> {
+    recovered_per_tree
+        .iter()
+        .map(|(&tree, &recovered)| (tree, toml_start_block.max(recovered)))
+        .collect()
 }
 
 #[must_use]
@@ -1547,6 +1815,14 @@ fn bootstrap_instances(
         Vec::with_capacity(opts.instances.len());
     for cfg in &opts.instances {
         let entry_size = cfg.record_size.max(32);
+        raven_railgun_engine::pir_table::validate_total_entries(&cfg.encoder, entries).map_err(
+            |e| {
+                anyhow::anyhow!(
+                    "encoder cell shape rejected for instance {id}: {e}",
+                    id = cfg.instance_id
+                )
+            },
+        )?;
         let initial_db: Vec<u8> = (0..entries)
             .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).unwrap_or(0)))
             .collect();
@@ -1592,10 +1868,22 @@ fn bootstrap_instances(
 struct ChainWorkers {
     handle: tokio::task::JoinHandle<()>,
     rpc_pool: Option<Arc<raven_railgun_indexer::rpc_pool::RpcEndpointPool>>,
+    /// Live mode flag for `/v1/health/ready.chain_source_mode`.
+    /// `Some` when `--ws-endpoint` is set (WS auto-fallback active).
+    chain_source_mode: Option<Arc<raven_railgun_indexer::ModeFlag>>,
+    /// Background task that polls the `AutoFallbackChainSource.mode()`
+    /// at 1 s ticks and writes through to `chain_source_mode`.
+    mode_mirror: Option<tokio::task::JoinHandle<()>>,
+    /// Cooperative shutdown signal for `mode_mirror`. Always present;
+    /// the receiver in the spawned task observes `true` and exits.
+    mode_mirror_shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 async fn spawn_chain_indexer(
     opts: &MultiServeOptions,
+    min_effective_start_block: u64,
+    per_tree_start_blocks: BTreeMap<u32, u64>,
+    resolved_reorg_window_path: Option<PathBuf>,
     indexer_tx: tokio::sync::mpsc::Sender<raven_railgun_indexer::IndexerMessage>,
 ) -> anyhow::Result<ChainWorkers> {
     use alloy::primitives::Address;
@@ -1603,7 +1891,8 @@ async fn spawn_chain_indexer(
         DynChainSource, EndpointConfig, PoolConfig, PooledRpcChainSource, RpcEndpointPool,
     };
     use raven_railgun_indexer::{
-        ChainSource, IndexerWorker, IndexerWorkerConfig, RpcChainSource, DEFAULT_POLL_INTERVAL_SECS,
+        AutoFallbackChainSource, ChainSource, IndexerWorker, IndexerWorkerConfig, ModeFlag,
+        RpcChainSource, WsChainSource, DEFAULT_POLL_INTERVAL_SECS,
     };
 
     let proxy_addr: Address = opts
@@ -1611,58 +1900,118 @@ async fn spawn_chain_indexer(
         .parse()
         .with_context(|| format!("invalid railgun_proxy: {}", opts.railgun_proxy))?;
 
-    let (chain_source, rpc_pool) = match opts.rpc_pool.as_ref() {
-        Some(pool_cfg) if pool_cfg.urls.len() >= 2 => {
-            let endpoint_configs = pool_cfg
-                .urls
-                .iter()
-                .map(|u| EndpointConfig {
-                    url: u.clone(),
-                    rps: pool_cfg.per_endpoint_rps,
-                    burst: pool_cfg.per_endpoint_burst,
-                })
-                .collect();
-            let pool_config = PoolConfig {
-                strategy: pool_cfg.strategy.into(),
-                cooldown_secs_on_error: u64::from(pool_cfg.cooldown_secs.max(1)),
-                ..PoolConfig::default()
-            };
-            let pool = Arc::new(
-                RpcEndpointPool::new(endpoint_configs, pool_config)
-                    .map_err(|e| anyhow::anyhow!("rpc_pool init: {e}"))?,
-            );
-            tracing::info!(
-                endpoints = pool.len(),
-                strategy = ?pool.config().strategy,
-                per_endpoint_rps = pool_cfg.per_endpoint_rps,
-                per_endpoint_burst = pool_cfg.per_endpoint_burst,
-                "rpc endpoint pool wired"
-            );
-            let pooled = Arc::new(PooledRpcChainSource::new(
-                Arc::clone(&pool),
-                proxy_addr,
-                opts.chain_id,
-            ));
-            (DynChainSource::Pooled(pooled), Some(pool))
-        }
-        _ => {
-            let url = match opts.rpc_pool.as_ref() {
-                Some(pool_cfg) if pool_cfg.urls.len() == 1 => pool_cfg
-                    .urls
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| opts.rpc_url.clone()),
-                _ => opts.rpc_url.clone(),
-            };
-            let single = Arc::new(RpcChainSource::new(
-                url,
-                proxy_addr,
-                opts.start_block,
-                opts.chain_id,
-            ));
-            (DynChainSource::Single(single), None)
-        }
+    let build_pool = |pool_cfg: &RpcPoolConfigToml| -> anyhow::Result<Arc<RpcEndpointPool>> {
+        let endpoint_configs = pool_cfg
+            .urls
+            .iter()
+            .map(|u| EndpointConfig {
+                url: u.clone(),
+                rps: pool_cfg.per_endpoint_rps,
+                burst: pool_cfg.per_endpoint_burst,
+            })
+            .collect();
+        let pool_config = PoolConfig {
+            strategy: pool_cfg.strategy.into(),
+            cooldown_secs_on_error: u64::from(pool_cfg.cooldown_secs.max(1)),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(
+            RpcEndpointPool::new(endpoint_configs, pool_config)
+                .map_err(|e| anyhow::anyhow!("rpc_pool init: {e}"))?,
+        );
+        tracing::info!(
+            endpoints = pool.len(),
+            strategy = ?pool.config().strategy,
+            per_endpoint_rps = pool_cfg.per_endpoint_rps,
+            per_endpoint_burst = pool_cfg.per_endpoint_burst,
+            "rpc endpoint pool wired"
+        );
+        Ok(pool)
     };
+
+    // (mode_mirror_shutdown_tx, mode_mirror_shutdown_rx) — always created;
+    // the receiver is only used by `spawn_mode_mirror` when WS is active.
+    let (mode_mirror_shutdown_tx, mode_mirror_shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let (chain_source, rpc_pool, chain_source_mode, mode_mirror) =
+        match (opts.ws_endpoint.as_deref(), opts.rpc_pool.as_ref()) {
+            // WS primary + multi-endpoint pooled fallback.
+            (Some(ws_url), Some(pool_cfg)) if pool_cfg.urls.len() >= 2 => {
+                let pool = build_pool(pool_cfg)?;
+                let pooled = Arc::new(PooledRpcChainSource::new(
+                    Arc::clone(&pool),
+                    proxy_addr,
+                    opts.chain_id,
+                ));
+                let ws = Arc::new(WsChainSource::new(ws_url, proxy_addr, opts.chain_id));
+                let auto = Arc::new(AutoFallbackChainSource::new(ws, pooled));
+                let mode_flag = Arc::new(ModeFlag::default());
+                let mirror = spawn_mode_mirror_pooled(
+                    Arc::clone(&auto),
+                    Arc::clone(&mode_flag),
+                    mode_mirror_shutdown_rx,
+                );
+                (
+                    DynChainSource::AutoFallbackPooled(auto),
+                    Some(pool),
+                    Some(mode_flag),
+                    Some(mirror),
+                )
+            }
+            // WS primary + single-endpoint HTTP fallback (either single-URL pool or rpc_url).
+            (Some(ws_url), _) => {
+                let single_url = opts
+                    .rpc_pool
+                    .as_ref()
+                    .and_then(|p| p.urls.first().cloned())
+                    .unwrap_or_else(|| opts.rpc_url.clone());
+                let single = Arc::new(RpcChainSource::new(
+                    single_url,
+                    proxy_addr,
+                    opts.start_block,
+                    opts.chain_id,
+                ));
+                let ws = Arc::new(WsChainSource::new(ws_url, proxy_addr, opts.chain_id));
+                let auto = Arc::new(AutoFallbackChainSource::new(ws, single));
+                let mode_flag = Arc::new(ModeFlag::default());
+                let mirror = spawn_mode_mirror_single(
+                    Arc::clone(&auto),
+                    Arc::clone(&mode_flag),
+                    mode_mirror_shutdown_rx,
+                );
+                (
+                    DynChainSource::AutoFallbackSingle(auto),
+                    None,
+                    Some(mode_flag),
+                    Some(mirror),
+                )
+            }
+            // No WS, multi-endpoint pooled HTTP.
+            (None, Some(pool_cfg)) if pool_cfg.urls.len() >= 2 => {
+                let pool = build_pool(pool_cfg)?;
+                let pooled = Arc::new(PooledRpcChainSource::new(
+                    Arc::clone(&pool),
+                    proxy_addr,
+                    opts.chain_id,
+                ));
+                (DynChainSource::Pooled(pooled), Some(pool), None, None)
+            }
+            // No WS, single-endpoint HTTP (legacy default).
+            _ => {
+                let url = opts
+                    .rpc_pool
+                    .as_ref()
+                    .and_then(|p| p.urls.first().cloned())
+                    .unwrap_or_else(|| opts.rpc_url.clone());
+                let single = Arc::new(RpcChainSource::new(
+                    url,
+                    proxy_addr,
+                    opts.start_block,
+                    opts.chain_id,
+                ));
+                (DynChainSource::Single(single), None, None, None)
+            }
+        };
 
     let head = chain_source
         .latest_block()
@@ -1671,12 +2020,15 @@ async fn spawn_chain_indexer(
     tracing::info!(
         chain_head = head,
         start_block = opts.start_block,
+        ws_endpoint = opts.ws_endpoint.as_deref().unwrap_or(""),
         "chain RPC reachable"
     );
     let worker = IndexerWorker::new(Arc::new(chain_source), indexer_tx);
     let worker_config = IndexerWorkerConfig {
-        start_block: opts.start_block,
+        start_block: min_effective_start_block,
         poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
+        reorg_window_path: resolved_reorg_window_path,
+        per_tree_start_blocks,
         ..IndexerWorkerConfig::default()
     };
     let handle = tokio::spawn(async move {
@@ -1684,11 +2036,111 @@ async fn spawn_chain_indexer(
             tracing::error!(error = %e, "chain indexer worker exiting");
         }
     });
-    Ok(ChainWorkers { handle, rpc_pool })
+    Ok(ChainWorkers {
+        handle,
+        rpc_pool,
+        chain_source_mode,
+        mode_mirror,
+        mode_mirror_shutdown_tx,
+    })
+}
+
+/// Sample cadence for the `mode_mirror` task: 1 second matches the
+/// rave-WIP reference and keeps `/v1/health/ready.chain_source_mode`
+/// within one sample of the underlying `AutoFallbackChainSource` state.
+const MODE_MIRROR_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn spawn_mode_mirror_single(
+    source: Arc<
+        raven_railgun_indexer::AutoFallbackChainSource<
+            raven_railgun_indexer::WsChainSource,
+            raven_railgun_indexer::RpcChainSource,
+        >,
+    >,
+    flag: Arc<raven_railgun_indexer::ModeFlag>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(MODE_MIRROR_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    flag.set(source.mode().await);
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn spawn_mode_mirror_pooled(
+    source: Arc<
+        raven_railgun_indexer::AutoFallbackChainSource<
+            raven_railgun_indexer::WsChainSource,
+            raven_railgun_indexer::rpc_pool::PooledRpcChainSource,
+        >,
+    >,
+    flag: Arc<raven_railgun_indexer::ModeFlag>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(MODE_MIRROR_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    flag.set(source.mode().await);
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
+impl ChainWorkers {
+    /// Cooperative shutdown of the `mode_mirror` task. Falls back to
+    /// `abort()` on timeout. Caller awaits the returned future before
+    /// dropping `Self` to avoid an unconditional `JoinHandle::abort()`
+    /// that hides panics from observation. Returns `true` if the task
+    /// observed the signal and exited cleanly, `false` on timeout.
+    async fn shutdown_mode_mirror(&mut self, timeout: std::time::Duration) -> bool {
+        let Some(handle) = self.mode_mirror.take() else {
+            return true;
+        };
+        let _ = self.mode_mirror_shutdown_tx.send(true);
+        match tokio::time::timeout(timeout, handle).await {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) if e.is_cancelled() => true,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "mode_mirror task join error");
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = timeout.as_secs(),
+                    "mode_mirror task did not observe shutdown signal within timeout"
+                );
+                false
+            }
+        }
+    }
 }
 
 impl Drop for ChainWorkers {
     fn drop(&mut self) {
+        let _ = self.mode_mirror_shutdown_tx.send(true);
+        if let Some(handle) = self.mode_mirror.take() {
+            handle.abort();
+        }
         self.handle.abort();
     }
 }
@@ -1700,14 +2152,18 @@ struct MirrorWorkers {
 fn spawn_mirror_workers(
     opts: &MultiServeOptions,
     handle: &MultiOrchestratorHandle,
-) -> MirrorWorkers {
-    use raven_railgun_ppoi_mirror::{MirrorConfig, UpstreamPpoiMirror};
+) -> anyhow::Result<MirrorWorkers> {
+    use raven_railgun_engine::pir_table::EncoderKind;
+    use raven_railgun_ppoi_mirror::{MirrorConfig, MirrorCursor, MirrorKind, UpstreamPpoiMirror};
 
     let mirror_config = MirrorConfig {
         endpoint: opts.mirror_endpoint.clone(),
         ..MirrorConfig::default()
     };
-    let mirror = Arc::new(UpstreamPpoiMirror::new(mirror_config));
+    let mirror = Arc::new(
+        UpstreamPpoiMirror::new(mirror_config)
+            .map_err(|e| anyhow::anyhow!("ppoi mirror constructor: {e}"))?,
+    );
     let mirror_tx = handle.channels.mirror_tx.clone();
 
     let mut handles = Vec::new();
@@ -1715,15 +2171,36 @@ fn spawn_mirror_workers(
         if let DataSourceFilter::PpoiList(list_key) = inst.config.data_source {
             let mirror_clone = Arc::clone(&mirror);
             let tx = mirror_tx.clone();
+            // Per-instance cursor sidecar in the instance data_dir.
+            // Kind dispatch: per-list-path encoders own the path
+            // sidecar; per-list-status / per-list-node and any
+            // other encoder fall through to the status sidecar.
+            // Status / path advance independently after a restart.
+            let kind = match inst.config.encoder {
+                EncoderKind::PerListPath { .. } => MirrorKind::Path,
+                _ => MirrorKind::Status,
+            };
+            let fallback = {
+                let store = inst.logical_store.lock();
+                #[allow(clippy::cast_possible_truncation)]
+                let count = store
+                    .ppoi_imt(&list_key)
+                    .map_or(0u64, |imt| imt.leaf_count() as u64);
+                count
+            };
+            let cursor = MirrorCursor::new(inst.config.data_dir.clone(), kind, fallback);
             let h = tokio::spawn(async move {
-                if let Err(e) = mirror_clone.run_worker(ListKey(list_key), 0, tx).await {
+                if let Err(e) = mirror_clone
+                    .run_worker_with_cursor(ListKey(list_key), 0, Some(cursor), tx)
+                    .await
+                {
                     tracing::error!(error = %e, "ppoi mirror worker exiting");
                 }
             });
             handles.push(h);
         }
     }
-    MirrorWorkers { handles }
+    Ok(MirrorWorkers { handles })
 }
 
 impl Drop for MirrorWorkers {

@@ -1,4 +1,4 @@
-//! G5'.D subsquid root oracle test (real-Sepolia checkpoint flavour).
+//! Subsquid root oracle test (real-Sepolia checkpoint flavour).
 //! Three-oracle (chain / upstream / subsquid) byte-identity check, escalating
 //! to a 4-oracle assertion when `real_subsquid_root` is present in the fixture.
 
@@ -301,7 +301,7 @@ fn g5d_three_oracle_byte_identity_holds_for_every_checkpoint() {
         )
         .map_err(|e| {
             format!(
-                "G5'.D oracle disagreement at {context}: source={:?} our={:?} other={:?}",
+                "subsquid root oracle disagreement at {context}: source={:?} our={:?} other={:?}",
                 e.source, e.our_root, e.other_root
             )
         })
@@ -379,7 +379,7 @@ fn g5d_three_oracle_byte_identity_holds_for_every_checkpoint() {
         )
         .map_err(|e| {
             format!(
-                "G5'.D list-oracle disagreement at {context}: source={:?} our={:?} other={:?}",
+                "subsquid list-oracle disagreement at {context}: source={:?} our={:?} other={:?}",
                 e.source, e.our_root, e.other_root
             )
         })

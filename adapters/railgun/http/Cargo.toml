@@ -34,6 +34,8 @@ metrics-exporter-prometheus = { workspace = true }
 parking_lot = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
+tokio-stream = { version = "0.1", features = ["time"] }
+async-stream = "0.3"
 
 [dev-dependencies]
 tower = { workspace = true }

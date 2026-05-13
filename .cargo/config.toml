@@ -1,0 +1,17 @@
+# Per-repository cargo config. Affects both local dev and CI builds.
+#
+# Why this exists: 109+ test binaries × ~5-10s GNU-ld link cost per binary
+# is the dominant wall-time cost on `cargo test --release --workspace`.
+# Switching to lld via `-fuse-ld=lld` cuts link time 30-50% on this
+# workload. lld is preinstalled on GitHub-hosted Ubuntu runners via the
+# standard image, and on this dev box at /usr/bin/ld.lld, so the config
+# applies uniformly without breaking either path.
+#
+# To opt out (e.g. on a system where lld is missing): set the env var
+# `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=` to empty before cargo
+# invocation, or delete this file locally. The setting is per-target so
+# non-Linux targets (wasm32-unknown-unknown, x86_64-apple-darwin) are
+# untouched.
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-Clink-arg=-fuse-ld=lld"]

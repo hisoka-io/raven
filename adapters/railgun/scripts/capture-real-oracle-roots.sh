@@ -2,7 +2,7 @@
 #
 # adapters/railgun/scripts/capture-real-oracle-roots.sh
 #
-# Operator-driven one-shot capture script for the G5'.D root oracle
+# Operator-driven one-shot capture script for the subsquid root-oracle
 # fixture file at:
 #
 #   adapters/railgun/engine/tests/fixtures/subsquid_canonical_roots.json
@@ -24,10 +24,11 @@
 # json.tool`).
 #
 # This script is operator-run; it does NOT run in CI. It is also NOT
-# called from any test. The G5'.D oracle test (`tests/g5_d_subsquid_root_oracle.rs`)
-# reads whatever fields are present in the fixture and triggers the
-# 4-oracle assertion path only when ALL of `chain_root`, `upstream_root`,
-# `real_subsquid_root` are non-null.
+# called from any test. The subsquid root-oracle test
+# (`tests/g5_d_subsquid_root_oracle.rs`) reads whatever fields are
+# present in the fixture and triggers the 4-oracle assertion path only
+# when ALL of `chain_root`, `upstream_root`, `real_subsquid_root` are
+# non-null.
 #
 # REQUIREMENTS:
 #   - `cast` (Foundry) for chain_root captures.

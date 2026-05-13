@@ -219,6 +219,120 @@ fn bincode_roundtrip_preserves_query_and_state_shapes() {
         bincode::deserialize(&params_bytes).expect("deserialize params");
 }
 
+/// Regression-guard for the WASM `extract_response` fix: bincode
+/// round-tripping `ClientState` strips both `secret_key` and
+/// `rlwe_secret_key` (`#[serde(skip, default)]`) so a naive post-trip
+/// extract panics in `Poly::mul_ntt` with `Moduli must match`. The
+/// WASM crate's `extract_response` sidesteps this by rehydrating
+/// `rlwe_secret_key` from the live `ClientSession` before calling the
+/// extractor. Native parity tests had a blind spot here because they
+/// hold the live `ClientState` Rust value and never round-trip it;
+/// this test exercises the round-trip path explicitly.
+#[test]
+fn bincode_roundtrip_then_rehydrate_extracts_byte_identical_to_live_state() {
+    let params = test_params();
+    let database = build_test_db(&params);
+    let target_idx: u64 = 13;
+
+    let mut sampler = GaussianSampler::new(params.sigma);
+    let (crs, encoded_db, sk) =
+        inspire_setup(&params, &database, ENTRY_BYTES, &mut sampler).expect("inspire_setup");
+
+    let mut sampler_session = GaussianSampler::new(params.sigma);
+    let session = ClientSession::new(crs.clone(), sk, &mut sampler_session).expect("session");
+
+    let (live_state, query) =
+        build_seeded_query_rust(&session, &params, &encoded_db.config, target_idx).expect("query");
+
+    let cache = ServerInspiringCache::new(&crs, &encoded_db).expect("cache");
+    let store = ServerSessionStore::new();
+    let response = respond_seeded_inspiring_cached_with_session(
+        &crs,
+        &encoded_db,
+        &query,
+        &cache,
+        Some(&store),
+    )
+    .expect("respond");
+
+    // Path A: live state, no round-trip.
+    let plain_live =
+        extract_response_rust(&crs, &live_state, &response, ENTRY_BYTES).expect("extract live");
+
+    // Path B: bincode round-trip + rehydrate from session-held key.
+    // Mirrors the WASM `extract_response` runtime behaviour exactly.
+    let state_bytes = bincode::serialize(&live_state).expect("serialize state");
+    let mut state_rt: raven_inspire::ClientState =
+        bincode::deserialize(&state_bytes).expect("deserialize state");
+    state_rt.rlwe_secret_key = session.rlwe_secret_key().clone();
+
+    let plain_rt =
+        extract_response_rust(&crs, &state_rt, &response, ENTRY_BYTES).expect("extract round-trip");
+
+    assert_eq!(
+        plain_live, plain_rt,
+        "rehydrated round-tripped state must extract byte-identical bytes to live state"
+    );
+
+    // Honest-stop sanity: the live extract output matches the DB row at
+    // target_idx. If the rehydration path silently corrupts the row,
+    // this assertion would catch it before the parity assert above.
+    let db_row_start = (target_idx as usize) * ENTRY_BYTES;
+    let db_row_end = db_row_start + ENTRY_BYTES;
+    assert_eq!(plain_live, &database[db_row_start..db_row_end]);
+}
+
+/// Companion negative-control: confirm the bincode round-trip alone
+/// (without rehydration) fails. If this ever PASSES it means the
+/// upstream `#[serde(skip)]` annotations were dropped and the
+/// rehydration in `extract_response` is no longer load-bearing — at
+/// which point the WASM crate's extract path can be simplified.
+#[test]
+fn bincode_roundtrip_without_rehydrate_fails_in_extract() {
+    let params = test_params();
+    let database = build_test_db(&params);
+    let target_idx: u64 = 17;
+
+    let mut sampler = GaussianSampler::new(params.sigma);
+    let (crs, encoded_db, sk) =
+        inspire_setup(&params, &database, ENTRY_BYTES, &mut sampler).expect("inspire_setup");
+
+    let mut sampler_session = GaussianSampler::new(params.sigma);
+    let session = ClientSession::new(crs.clone(), sk, &mut sampler_session).expect("session");
+
+    let (live_state, query) =
+        build_seeded_query_rust(&session, &params, &encoded_db.config, target_idx).expect("query");
+
+    let cache = ServerInspiringCache::new(&crs, &encoded_db).expect("cache");
+    let store = ServerSessionStore::new();
+    let response = respond_seeded_inspiring_cached_with_session(
+        &crs,
+        &encoded_db,
+        &query,
+        &cache,
+        Some(&store),
+    )
+    .expect("respond");
+
+    let state_bytes = bincode::serialize(&live_state).expect("serialize state");
+    let state_rt: raven_inspire::ClientState =
+        bincode::deserialize(&state_bytes).expect("deserialize state");
+
+    // No rehydration: expect a panic in Poly::mul_ntt's
+    // `assert_eq!(self.moduli, other.moduli, "Moduli must match")`.
+    // We `catch_unwind` so the test fails cleanly on the regression
+    // (rather than aborting the harness).
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        extract_response_rust(&crs, &state_rt, &response, ENTRY_BYTES)
+    }));
+    assert!(
+        outcome.is_err(),
+        "bincode round-trip without rehydration must surface as a Poly::mul_ntt panic; \
+         if this passes upstream changed `#[serde(skip)]` and the WASM rehydration is no \
+         longer required"
+    );
+}
+
 #[test]
 fn rust_query_path_byte_equals_upstream_query_seeded() {
     // Sanity: confirm our `build_seeded_query_rust` is a pure

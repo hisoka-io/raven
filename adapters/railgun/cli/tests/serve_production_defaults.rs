@@ -47,6 +47,8 @@ async fn production_cell_zero_dimension_bails_regression() {
             entries,
             entry_bytes,
             encoder: EncoderKind::PerLeafBc,
+            session_eviction_interval_secs: 0,
+            metrics_public: false,
         }
     }
 

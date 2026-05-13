@@ -182,6 +182,7 @@ fn export_then_import_round_trip_preserves_byte_identity() {
         output: tarball.clone(),
         signing_key: None,
         include_current_wal: false,
+        keep_snapshots: 0,
     })
     .expect("export");
 
@@ -227,6 +228,7 @@ fn tampered_tarball_refused_at_checksum_check() {
         output: tarball.clone(),
         signing_key: None,
         include_current_wal: false,
+        keep_snapshots: 0,
     })
     .expect("export");
 
@@ -276,6 +278,7 @@ fn cross_version_v_minus_one_export_refused() {
         output: tarball.clone(),
         signing_key: None,
         include_current_wal: false,
+        keep_snapshots: 0,
     })
     .expect("export");
 
@@ -381,6 +384,7 @@ fn signed_export_verifies_with_correct_pubkey() {
         output: tarball.clone(),
         signing_key: Some(signing_path),
         include_current_wal: false,
+        keep_snapshots: 0,
     })
     .expect("export");
 
@@ -422,6 +426,7 @@ fn signed_export_refused_with_wrong_pubkey() {
         output: tarball.clone(),
         signing_key: Some(signing_path),
         include_current_wal: false,
+        keep_snapshots: 0,
     })
     .expect("export");
 
@@ -467,6 +472,7 @@ fn import_into_existing_data_dir_refused_without_allow_overwrite() {
         output: tarball.clone(),
         signing_key: None,
         include_current_wal: false,
+        keep_snapshots: 0,
     })
     .expect("export");
 
@@ -556,6 +562,7 @@ fn dedup_shared_crs_appears_once_in_tarball() {
         output: tarball.clone(),
         signing_key: None,
         include_current_wal: false,
+        keep_snapshots: 0,
     })
     .expect("export");
 
@@ -604,6 +611,7 @@ fn distinct_scheme_tags_get_distinct_shared_crs_entries() {
         output: tarball.clone(),
         signing_key: None,
         include_current_wal: false,
+        keep_snapshots: 0,
     })
     .expect("export");
 
@@ -637,6 +645,7 @@ fn import_refuses_tampered_tarball_byte_in_middle_with_specific_offset() {
         output: tarball.clone(),
         signing_key: None,
         include_current_wal: false,
+        keep_snapshots: 0,
     })
     .expect("export");
 
@@ -709,6 +718,7 @@ fn import_refuses_tampered_signature_file_with_actionable_error() {
         output: tarball.clone(),
         signing_key: Some(signing_path),
         include_current_wal: false,
+        keep_snapshots: 0,
     })
     .expect("export");
 

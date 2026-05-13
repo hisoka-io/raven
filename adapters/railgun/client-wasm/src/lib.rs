@@ -49,10 +49,77 @@ impl From<WasmClientError> for JsValue {
     }
 }
 
+/// Maximum legitimate WASM-side bincode payload (64 MiB). Defense-in-depth
+/// against a malicious server response that crosses the JS->Wasm boundary
+/// with an inflated length: rejecting before `bincode::deserialize` runs
+/// caps the worst-case allocation and avoids any pathological-input
+/// compute path inside the deserializer. The largest legitimate payload
+/// is the production-cell `ServerCrs` at ~35 MB (d=2048, p=65537,
+/// total_entries=131_072 for the per-node commit-tree shape); the params
+/// bundle, `SeededClientQuery`, and `ServerResponse` all fit comfortably.
+///
+/// Pre-check (rather than `bincode::DefaultOptions::with_limit`) because
+/// bincode 1.x's slice-deserialize entry point overrides any configured
+/// limit to `Infinite` (ref bincode-1.3.3 src/internal.rs:114
+/// `deserialize_seed`); the configured `with_limit` is a no-op for
+/// `bincode::deserialize(bytes)` and only takes effect on
+/// `deserialize_from(reader)`. The slice-length pre-check is the
+/// reliable enforcement mechanism on this boundary.
+pub const WASM_BINCODE_DESERIALIZE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Trusted-source bincode deserialize ceiling for self-written
+/// session blobs returned by [`serialize_client_session`].
+///
+/// At the locked production cell (d=2048) the bincoded `ClientSession`
+/// is ~194 MB (CRS ~35 MB + precomputed packing keys ~150 MB + secrets).
+/// Higher than the general [`WASM_BINCODE_DESERIALIZE_LIMIT_BYTES`] cap
+/// because the blob originates from the WASM itself (via the symmetric
+/// [`serialize_client_session`] write earlier in the wallet's session
+/// lifetime); the threat model differs from HTTP-sourced bytes which
+/// retain the 64 MiB cap.
+pub const WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES: usize = 256 * 1024 * 1024;
+
 fn decode<T: for<'de> Deserialize<'de>>(
     bytes: &[u8],
     what: &'static str,
 ) -> Result<T, WasmClientError> {
+    if bytes.len() > WASM_BINCODE_DESERIALIZE_LIMIT_BYTES {
+        return Err(WasmClientError::Decode {
+            what,
+            detail: format!(
+                "size limit reached: payload {} bytes exceeds cap {}",
+                bytes.len(),
+                WASM_BINCODE_DESERIALIZE_LIMIT_BYTES
+            ),
+        });
+    }
+    bincode::deserialize::<T>(bytes).map_err(|e| WasmClientError::Decode {
+        what,
+        detail: e.to_string(),
+    })
+}
+
+/// Trusted-source variant of [`decode`] using the larger
+/// [`WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES`] ceiling. Reserved for
+/// self-written blobs the wallet round-trips through its own storage
+/// (e.g. `serialize_client_session` -> IndexedDB ->
+/// `deserialize_client_session`). MUST NOT be called from any path
+/// that receives HTTP-sourced bytes; those keep the 64 MiB [`decode`]
+/// defense.
+fn decode_trusted<T: for<'de> Deserialize<'de>>(
+    bytes: &[u8],
+    what: &'static str,
+) -> Result<T, WasmClientError> {
+    if bytes.len() > WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES {
+        return Err(WasmClientError::Decode {
+            what,
+            detail: format!(
+                "size limit reached: payload {} bytes exceeds cap {}",
+                bytes.len(),
+                WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES
+            ),
+        });
+    }
     bincode::deserialize::<T>(bytes).map_err(|e| WasmClientError::Decode {
         what,
         detail: e.to_string(),
@@ -166,16 +233,49 @@ pub fn build_seeded_query(
     Ok(encode(&bundle, "wasm_seeded_query_output")?)
 }
 
-/// Decode a server response and return the plaintext row bytes via [`extract_inspiring`].
+/// Decode a server response and return the plaintext row bytes via
+/// [`extract_inspiring`].
+///
+/// All inputs except `session` are bincode blobs the SDK already holds:
+/// - `session`: the [`ClientSessionHandle`] that emitted the matching query
+/// - `crs_bincode`: from `InstanceParams::crs_bincode`
+/// - `client_state_bincode`: from [`build_seeded_query`] output
+/// - `response_bytes`: from the server's `POST /v1/instance/:id/query` reply
+/// - `entry_size`: from `InstanceParams::entry_size`
+///
+/// `client_state_bincode` is the bincode emitted by [`build_seeded_query`].
+/// Upstream [`raven_inspire::ClientState`] marks both `secret_key` (LWE)
+/// and `rlwe_secret_key` (RLWE) with `#[serde(skip, default)]` so secret
+/// material never crosses a serialization boundary by accident. The skip
+/// means a bincode round-trip yields a `ClientState` whose secret keys
+/// are `Default::default()` polynomials with empty `moduli` vectors;
+/// passing that to `extract_inspiring` panics inside `Poly::mul_ntt`
+/// (`Moduli must match`) because the ciphertext polynomial carries the
+/// live single-modulus shape but the default-built secret-key polynomial
+/// does not. Native parity tests do not surface this because they hold
+/// the `ClientState` Rust value in process and never bincode round-trip
+/// it; only the WASM boundary forces the trip. Fix: rehydrate the
+/// stripped RLWE secret key from the in-WASM-memory session, which owns
+/// the live key, before calling the extractor. The fix is lossless:
+/// `(state.index, state.shard_id, state.local_index)` are the only
+/// non-skip fields and they already round-trip cleanly.
 #[wasm_bindgen]
 pub fn extract_response(
+    session: &ClientSessionHandle,
     crs_bincode: &[u8],
     client_state_bincode: &[u8],
     response_bytes: &[u8],
     entry_size: u32,
 ) -> Result<Vec<u8>, JsValue> {
     let crs: ServerCrs = decode(crs_bincode, "server_crs")?;
-    let client_state: ClientState = decode(client_state_bincode, "client_state")?;
+    let mut client_state: ClientState = decode(client_state_bincode, "client_state")?;
+    // Rehydrate `#[serde(skip, default)]` `rlwe_secret_key` from the
+    // in-memory session. Without this, the field is an empty default
+    // `RlweSecretKey` (zero polynomial with empty `moduli` Vec) and
+    // `extract_inspiring` panics in `Poly::mul_ntt` with `Moduli must
+    // match`. The LWE `secret_key` field stays default;
+    // `extract_inspiring` reads only `rlwe_secret_key`.
+    client_state.rlwe_secret_key = session.inner.rlwe_secret_key().clone();
     let response: ServerResponse = decode(response_bytes, "server_response")?;
     let plaintext = extract_inspiring(&crs, &client_state, &response, entry_size as usize)
         .map_err(|e| WasmClientError::Inspire {
@@ -183,6 +283,100 @@ pub fn extract_response(
             detail: e.to_string(),
         })?;
     Ok(plaintext)
+}
+
+/// Serialize a fully constructed [`ClientSessionHandle`] to a bincode
+/// blob that can be persisted across browser tabs / page reloads /
+/// process boundaries.
+///
+/// Pairs with [`deserialize_client_session`] to amortise the heavy
+/// O(d^3) automorph-table + packing-key generation that
+/// [`build_client_session`] runs (~12.6 s for the production-cell
+/// d=2048 params). The SDK persists the blob to IndexedDB keyed by
+/// `(instanceId, sha256(crsBincode))`; on subsequent loads it
+/// reconstitutes the session via [`deserialize_client_session`] in
+/// milliseconds rather than re-running the cold path.
+///
+/// At the locked upstream pin `119641b`, [`raven_inspire::ClientSession`]
+/// does NOT derive `Serialize` / `Deserialize` / `Clone`. The SDK
+/// surface is shipped now so the wallet's storage layer can encode
+/// against a stable ABI, but every call surfaces a typed
+/// [`WasmClientError::Encode`] until the upstream derives land. When
+/// the derives ship, switch this body to
+/// `Ok(encode(&session.inner, "client_session")?)` and the SDK warms
+/// up transparently — no ABI change required.
+#[wasm_bindgen]
+pub fn serialize_client_session(session: &ClientSessionHandle) -> Result<Vec<u8>, JsValue> {
+    // Suppress unused-binding lint without dropping the symbol from the ABI.
+    let _ = session;
+    Err(WasmClientError::Encode {
+        what: "client_session",
+        detail: "upstream raven_inspire::ClientSession at pin 119641b lacks \
+             Clone+Serialize+Deserialize derives; warm-cache session blob \
+             round-trip is disabled until the upstream pin lands the derives"
+            .to_string(),
+    }
+    .into())
+}
+
+/// Reconstitute a [`ClientSessionHandle`] from a previously serialized
+/// session blob plus the same [`WasmInstanceParamsBundle`] + CRS bytes
+/// [`build_client_session`] consumed.
+///
+/// Symmetric counterpart to [`serialize_client_session`]. Validates the
+/// supplied `session_bincode` length against
+/// [`WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES`] and the params-bundle's
+/// `InspireParams::ring_dim` against the supplied `crs_bincode` so a
+/// CRS-rotation mismatch surfaces as a typed error rather than as a
+/// silently wrong query later.
+///
+/// At the locked upstream pin `119641b`,
+/// [`raven_inspire::ClientSession`] does NOT derive `Deserialize`. As
+/// with [`serialize_client_session`], the symbol is shipped now so the
+/// SDK can encode against a stable ABI; calls surface a typed
+/// [`WasmClientError::Decode`] until upstream lands the derives.
+#[wasm_bindgen]
+pub fn deserialize_client_session(
+    params_bundle_bincode: &[u8],
+    crs_bincode: &[u8],
+    session_bincode: &[u8],
+) -> Result<ClientSessionHandle, JsValue> {
+    // Pre-validate inputs the way the working serde pair will once
+    // upstream derives land, so wallet integration code sees the same
+    // typed-error surface across the two regimes.
+    let bundle: WasmInstanceParamsBundle = decode(params_bundle_bincode, "params_bundle")?;
+    let inspire_params: InspireParams = decode(&bundle.inspire_params_bincode, "inspire_params")?;
+    let crs: ServerCrs = decode(crs_bincode, "server_crs")?;
+    if crs.ring_dim() != inspire_params.ring_dim {
+        return Err(WasmClientError::Decode {
+            what: "client_session",
+            detail: format!(
+                "deserialize_client_session: CRS ring_dim {} does not match params-bundle InspireParams ring_dim {}",
+                crs.ring_dim(),
+                inspire_params.ring_dim
+            ),
+        }
+        .into());
+    }
+    if session_bincode.len() > WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES {
+        return Err(WasmClientError::Decode {
+            what: "client_session",
+            detail: format!(
+                "size limit reached: payload {} bytes exceeds cap {}",
+                session_bincode.len(),
+                WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES
+            ),
+        }
+        .into());
+    }
+    Err(WasmClientError::Decode {
+        what: "client_session",
+        detail: "upstream raven_inspire::ClientSession at pin 119641b lacks \
+             Clone+Serialize+Deserialize derives; warm-cache session blob \
+             round-trip is disabled until the upstream pin lands the derives"
+            .to_string(),
+    }
+    .into())
 }
 
 /// Generate a fresh RLWE secret key and return the [`WasmInstanceParamsBundle`]
@@ -270,6 +464,97 @@ pub fn path_indices_for_per_list_leaf(list_key: &[u8], idx: u32) -> Result<Vec<u
         walk >>= 1;
     }
     Ok(out)
+}
+
+/// Capped bincode-deserialize entry point for integration tests.
+///
+/// Mirrors the cap the wasm-bindgen surface enforces via `decode<T>`
+/// without exposing the helper itself (which is intentionally
+/// crate-private so callers route through the typed surface). Returns
+/// the same `String` shape as the wasm boundary's
+/// `WasmClientError::Decode { detail }` so a failing-cap test can
+/// assert on the surfaced detail.
+#[doc(hidden)]
+pub fn decode_capped_for_test<T: for<'de> Deserialize<'de>>(
+    bytes: &[u8],
+    what: &'static str,
+) -> Result<T, String> {
+    decode::<T>(bytes, what).map_err(|e| e.to_string())
+}
+
+/// Trusted-cap mirror of [`decode_capped_for_test`].
+///
+/// Routes through the same [`decode_trusted`] helper the
+/// [`deserialize_client_session`] wasm-bindgen surface uses (or would
+/// use, once upstream lands the `ClientSession` serde derives) for
+/// self-written session blobs, so tests can exercise the larger
+/// [`WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES`] ceiling without leaking
+/// the crate-private helper.
+#[doc(hidden)]
+pub fn decode_trusted_for_test<T: for<'de> Deserialize<'de>>(
+    bytes: &[u8],
+    what: &'static str,
+) -> Result<T, String> {
+    decode_trusted::<T>(bytes, what).map_err(|e| e.to_string())
+}
+
+/// Pure-Rust mirror of [`serialize_client_session`].
+///
+/// At the locked upstream pin `119641b`, [`ClientSession`] does NOT
+/// derive `Serialize` / `Clone`. Returns the same typed error the
+/// wasm-bindgen surface surfaces so unit tests can lock the deferral
+/// shape; when upstream lands the derives this body switches to
+/// `bincode::serialize(session).map_err(|e| e.to_string())` and the
+/// test asserts the working path instead.
+#[doc(hidden)]
+pub fn serialize_client_session_rust(session: &ClientSession) -> Result<Vec<u8>, String> {
+    let _ = session;
+    Err(
+        "upstream raven_inspire::ClientSession at pin 119641b lacks \
+         Clone+Serialize+Deserialize derives; warm-cache session blob \
+         round-trip is disabled until the upstream pin lands the derives"
+            .to_string(),
+    )
+}
+
+/// Pure-Rust mirror of [`deserialize_client_session`].
+///
+/// Pre-validates `session_bincode.len()` against the trusted cap and
+/// `crs.ring_dim()` against the params bundle so the "size limit
+/// reached" and ring-dim drift paths are testable, then surfaces the
+/// same typed `Err` the wasm-bindgen surface surfaces at pin
+/// `119641b`.
+#[doc(hidden)]
+pub fn deserialize_client_session_rust(
+    params_bundle_bincode: &[u8],
+    crs_bincode: &[u8],
+    session_bincode: &[u8],
+) -> Result<(ClientSession, InspireParams), String> {
+    if session_bincode.len() > WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES {
+        return Err(format!(
+            "size limit reached: payload {} bytes exceeds cap {}",
+            session_bincode.len(),
+            WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES
+        ));
+    }
+    let bundle: WasmInstanceParamsBundle =
+        bincode::deserialize(params_bundle_bincode).map_err(|e| e.to_string())?;
+    let inspire_params: InspireParams =
+        bincode::deserialize(&bundle.inspire_params_bincode).map_err(|e| e.to_string())?;
+    let crs: ServerCrs = bincode::deserialize(crs_bincode).map_err(|e| e.to_string())?;
+    if crs.ring_dim() != inspire_params.ring_dim {
+        return Err(format!(
+            "deserialize_client_session: CRS ring_dim {} does not match params-bundle InspireParams ring_dim {}",
+            crs.ring_dim(),
+            inspire_params.ring_dim
+        ));
+    }
+    Err(
+        "upstream raven_inspire::ClientSession at pin 119641b lacks \
+         Clone+Serialize+Deserialize derives; warm-cache session blob \
+         round-trip is disabled until the upstream pin lands the derives"
+            .to_string(),
+    )
 }
 
 /// Rust-native mirror of [`build_seeded_query`].

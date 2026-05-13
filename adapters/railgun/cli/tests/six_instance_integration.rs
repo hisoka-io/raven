@@ -122,7 +122,7 @@ fn rewrite_to_tempdir(src: &Path, tmp: &Path, bind: SocketAddr, token: &str) -> 
 }
 
 fn example_toml_path() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/mainnet-6-instance.toml")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/mainnet-6-instance.toml")
 }
 
 /// `aggressive_snapshot` overrides per-instance `SnapshotPolicy` to
@@ -463,12 +463,12 @@ async fn six_instance_bootstrap_serves_status_for_all_six() {
     assert_eq!(body.instances.len(), 6, "/v1/status must list 6 instances");
     let ids: Vec<&str> = body.instances.iter().map(|i| i.id.as_str()).collect();
     for expect in [
-        "commitments-tree-0",
-        "commitments-tree-1",
-        "commitments-tree-2",
-        "commitments-tree-live",
+        "commit-tree-0",
+        "commit-tree-1",
+        "commit-tree-2",
+        "commit-tree-3",
         "ppoi-status-ofac",
-        "ppoi-path-railway",
+        "ppoi-paths-ofac",
     ] {
         assert!(
             ids.iter().any(|id| *id == expect),
@@ -478,12 +478,12 @@ async fn six_instance_bootstrap_serves_status_for_all_six() {
 
     assert_eq!(view.instances.len(), 6);
     let label_for = |id: &str| find_inst(&view, id).encoder_label;
-    assert_eq!(label_for("commitments-tree-0"), "per-node");
-    assert_eq!(label_for("commitments-tree-1"), "per-node");
-    assert_eq!(label_for("commitments-tree-2"), "per-node");
-    assert_eq!(label_for("commitments-tree-live"), "per-node");
+    assert_eq!(label_for("commit-tree-0"), "per-node");
+    assert_eq!(label_for("commit-tree-1"), "per-node");
+    assert_eq!(label_for("commit-tree-2"), "per-node");
+    assert_eq!(label_for("commit-tree-3"), "per-node");
     assert_eq!(label_for("ppoi-status-ofac"), "per-list-status");
-    assert_eq!(label_for("ppoi-path-railway"), "per-list-node");
+    assert_eq!(label_for("ppoi-paths-ofac"), "per-list-node");
 
     shutdown(stop, server).await.expect("graceful shutdown");
 }
@@ -871,8 +871,8 @@ async fn manifest_label_mismatch_refuses_boot_per_instance() {
     let _view1 = wait_for_observer(&observer1).await;
     shutdown(stop1, server1).await.expect("first shutdown");
 
-    // Phase 2: same data_dirs but flip commitments-tree-0's encoder
-    // (PerLeafPath -> PerNode). Both are commit-tree-valid; only the
+    // Phase 2: same data_dirs but flip commit-tree-0's encoder
+    // (PerNode -> PerLeafPath). Both are commit-tree-valid; only the
     // manifest verifier rejects the mismatch.
     let observer2: BootstrapObserver = Arc::new(parking_lot::Mutex::new(None));
     let chain_sources2 = six_synthetic_sources();
@@ -884,8 +884,8 @@ async fn manifest_label_mismatch_refuses_boot_per_instance() {
         false,
     );
     for inst in &mut opts2.instances {
-        if inst.instance_id.as_str() == "commitments-tree-0" {
-            inst.encoder = EncoderKind::PerNode { tree_number: 0 };
+        if inst.instance_id.as_str() == "commit-tree-0" {
+            inst.encoder = EncoderKind::PerLeafPath { tree_number: 0 };
         }
     }
 

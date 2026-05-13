@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use raven_railgun_core::AdapterError;
+use raven_railgun_engine::inspire::re_encode_shard;
 use raven_railgun_engine::inspire::{
-    apply_wal_entry, restore_inspire_state, snapshot_inspire_state,
+    apply_wal_entry, restore_inspire_state_v6, snapshot_inspire_state_v6,
 };
-use raven_railgun_engine::inspire::{re_encode_shard, LogicalLeafStore};
 use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
 use raven_railgun_persistence::{
     Manifest, Snapshot, SnapshotId, StoreLayout, Wal, WalEntryPayload,
@@ -60,12 +60,17 @@ pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
     let snap = Snapshot::load(&layout, manifest.current_snapshot_id)
         .map_err(|e| anyhow::anyhow!("snapshot load: {e}"))?;
 
-    let mut state = restore_inspire_state(&snap.data)
-        .map_err(|e| anyhow::anyhow!("restore_inspire_state: {e}"))?;
+    // V6 dispatcher: returns `(state, embedded_store)` for V6 snapshots and
+    // falls back to a default-empty store for legacy V5 bytes (with a
+    // `tracing::warn` from the helper). The embedded store seeds the WAL
+    // replay base below, mirroring the open path at `InspirePersistence::open`.
+    let (mut state, recovered_seed_store) = restore_inspire_state_v6(&snap.data)
+        .map_err(|e| anyhow::anyhow!("restore_inspire_state_v6: {e}"))?;
 
-    // Replay WAL entries past the snapshot floor into a fresh LogicalLeafStore (mirrors
-    // InspirePersistence::open). The noop encoder is only needed for apply_wal_entry's
-    // dirty-shard tracking, which is irrelevant on the offline migration path.
+    // Replay WAL entries past the snapshot floor onto the recovered seed
+    // store (matches `InspirePersistence::open`). The noop encoder is only
+    // needed for `apply_wal_entry`'s dirty-shard tracking, which is
+    // irrelevant on the offline migration path.
     let noop_encoder: Arc<dyn PirTableEncoder> = {
         use raven_railgun_engine::pir_table::PerLeafCommitmentEncoder;
         Arc::new(
@@ -80,7 +85,7 @@ pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
         .replay()
         .map_err(|e| anyhow::anyhow!("wal replay: {e}"))?;
 
-    let mut logical_store = LogicalLeafStore::new();
+    let mut logical_store = recovered_seed_store;
     for entry in &replay.entries {
         if entry.seq < manifest.current_snapshot_seq {
             continue;
@@ -120,7 +125,7 @@ pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
     for shard_id in 0..u32::try_from(shard_count).unwrap_or(u32::MAX) {
         let shard_bytes = encoder.materialize_shard(shard_id, &logical_store);
         re_encode_shard(
-            &mut state.encoded_db,
+            Arc::make_mut(&mut state.encoded_db),
             &state.crs.params,
             shard_id,
             &shard_bytes,
@@ -129,8 +134,14 @@ pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("re_encode_shard {shard_id}: {e}"))?;
     }
 
-    let bundle = snapshot_inspire_state(&state)
-        .map_err(|e| anyhow::anyhow!("snapshot_inspire_state: {e}"))?;
+    // V6 envelope: re-embed the `LogicalLeafStore` we just rebuilt so the
+    // post-migration on-disk state stays internally consistent with the
+    // V6 manifest stamped below. The pre-fix writer (`snapshot_inspire_state`)
+    // dropped the store, leaving V6 manifest + V5 body + empty store — every
+    // subsequent open returned `recovered_logical_store = default::()` and
+    // chain events landed against an empty store.
+    let bundle = snapshot_inspire_state_v6(&state, &logical_store)
+        .map_err(|e| anyhow::anyhow!("snapshot_inspire_state_v6: {e}"))?;
     let new_snap = Snapshot::build(bundle);
     let new_id = manifest.current_snapshot_id.next();
     new_snap

@@ -23,6 +23,7 @@ reqwest = { workspace = true }
 governor = { workspace = true }
 parking_lot = { workspace = true }
 serde_json = { workspace = true }
+metrics = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
@@ -30,3 +31,5 @@ serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 raven-railgun-poseidon = { workspace = true }
 axum = { workspace = true }
+tempfile = "3"
+metrics-util = "0.20"

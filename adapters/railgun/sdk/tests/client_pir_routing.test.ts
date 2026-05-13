@@ -7,8 +7,8 @@
  *     getPOIsPerList throws.
  *   - Missing `bcToIdxMaps` entry: getPOIsPerList throws.
  *   - BC absent from the bc-to-idx-map (T1) -> SDK returns "Missing"
- *     for that BC (per the M015-style fail-soft convention; the
- *     wallet should not see an exception per BC).
+ *     for that BC (fail-soft convention; the wallet should not see
+ *     an exception per BC).
  *   - BC absent from the bc-to-idx-map (T2) -> SDK throws (T2 cannot
  *     fabricate a path; missing BC is a hard error).
  *   - getMerkleProof (T3) without context -> throws.

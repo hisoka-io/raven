@@ -137,3 +137,56 @@ async fn subsquid_client_surfaces_not_indexed_for_empty_transactions() {
         "got {err:?}"
     );
 }
+
+/// Spawn a TCP listener that accepts connections but never writes a response.
+/// Without the explicit `SUBSQUID_REQUEST_TIMEOUT` configured on the client,
+/// the call would hang indefinitely; with it, the client errors within ~30s.
+async fn spawn_silent_tcp_sink() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind silent sink");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        loop {
+            // Accept and hold; never read or write.
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                // Park the socket forever to ensure the client perceives a
+                // fully-silent server.
+                let _hold = stream;
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn subsquid_client_times_out_on_silent_server() {
+    let addr = spawn_silent_tcp_sink().await;
+    let client = SubsquidClient::new(format!("http://{addr}/graphql"));
+
+    // Bracket the call with a 60s wall-clock cap so the test fails fast if the
+    // timeout is missing (without it, the call hangs forever and only the
+    // outer test-runner timeout would kick in).
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        client.commitment_root_at_height(0, 5_944_900),
+    )
+    .await
+    .expect("must error inside 60s when 30s timeout is wired");
+    let elapsed = started.elapsed();
+
+    let err = outcome.expect_err("silent server must yield an error, not Ok");
+    assert!(
+        matches!(err, SubsquidError::Http(_) | SubsquidError::Decode(_)),
+        "expected Http/Decode timeout error, got {err:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(45),
+        "elapsed {elapsed:?} > 45s suggests the 30s timeout did not fire"
+    );
+}
