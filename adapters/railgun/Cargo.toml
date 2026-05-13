@@ -1,0 +1,149 @@
+# Standalone workspace. Excluded from the raven root workspace because it
+# pulls heavy transitive deps (axum + tokio + reqwest, once more crates land)
+# that would feature-unify into the wasm32 build of the core crates.
+#
+# Build everything:
+#   cargo build --manifest-path adapters/railgun/Cargo.toml --release
+#
+# Run tests:
+#   cargo test --manifest-path adapters/railgun/Cargo.toml
+[workspace]
+resolver = "2"
+members = [
+    "cli",
+    "core",
+    "engine",
+    "http",
+    "indexer",
+    "mock-ppoi",
+    "persistence",
+    "poseidon",
+    "ppoi-mirror",
+]
+
+[workspace.package]
+version = "0.1.0-alpha.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["Raven contributors"]
+license = "Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+indexing_slicing = "warn"
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+needless_pass_by_value = "allow"
+similar_names = "allow"
+
+[workspace.dependencies]
+# Internal adapter crates
+raven-railgun-cli = { path = "cli", version = "0.1.0-alpha.0" }
+raven-railgun-core = { path = "core", version = "0.1.0-alpha.0" }
+raven-railgun-engine = { path = "engine", version = "0.1.0-alpha.0" }
+raven-railgun-http = { path = "http", version = "0.1.0-alpha.0" }
+raven-railgun-indexer = { path = "indexer", version = "0.1.0-alpha.0" }
+raven-railgun-persistence = { path = "persistence", version = "0.1.0-alpha.0" }
+raven-railgun-poseidon = { path = "poseidon", version = "0.1.0-alpha.0" }
+raven-railgun-ppoi-mirror = { path = "ppoi-mirror", version = "0.1.0-alpha.0" }
+
+# Cross-workspace path dep to the inspire submodule
+raven-inspire = { path = "../../crates/inspire" }
+
+# Common deps
+thiserror = "2"
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = "1"
+bincode = "1.3"
+crc32fast = "1"
+sha2 = { version = "0.10", default-features = false }
+parking_lot = "0.12"
+tracing = "0.1"
+fs4 = "1"
+
+# Async runtime + chain source
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "signal", "time"] }
+async-trait = "0.1"
+alloy = { version = "1.2", features = ["std", "provider-http", "provider-ws", "pubsub", "rpc-types-eth", "sol-types"] }
+governor = "0.6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+axum = "0.7"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "compression-gzip"] }
+tower_governor = "0.4"
+http = "1"
+subtle = { version = "2", default-features = false }
+bytes = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+
+# Engine concurrency + observability
+arc-swap = "1"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+rayon = "1"
+proptest = "1"
+
+# Poseidon-BN254 for Railgun parity (Shield commitment_hash, blindedCommitment,
+# Merkle path construction). light-poseidon is byte-compatible with
+# circomlibjs (Railgun TS reference).
+light-poseidon = "0.4"
+ark-bn254 = "0.5"
+ark-ff = "0.5"
+tiny-keccak = { version = "2", features = ["keccak"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+opt-level = 3
+
+# CI test profile: inherits release semantics (so InsPIRe respond paths
+# stay fast enough to keep per-test wall under nextest's 120s ci slow-
+# timeout) but disables link-time optimization, parallelises LLVM
+# codegen across all available cores, and skips symbol stripping.
+#
+# Why the deviation from `release`:
+#   * `codegen-units = 1` forces single-unit LLVM codegen per crate.
+#     On a 2-vCPU runner that serialises raven-inspire's large crates.
+#     `codegen-units = 16` saturates both cores during codegen.
+#   * `lto = "thin"` adds a link-time optimisation pass that runs on
+#     EVERY one of the ~120 test binaries (each links the full
+#     raven-inspire dep closure). Cumulative cost dominates the build.
+#     `lto = "off"` removes the pass entirely.
+#   * `opt-level = 2` keeps respond paths within ~1.3x of opt-level=3
+#     wall (measured locally) while compiling materially faster than
+#     opt-level=3 (LLVM skips the most-expensive inlining passes).
+#   * `debug = "line-tables-only"` keeps panic backtraces resolvable
+#     without the full DWARF cost of `debug = true`.
+#
+# Use only for test execution under nextest. The `release` profile is
+# still the source of truth for benchmarks + the production binaries.
+[profile.ci-test]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+opt-level = 2
+strip = "none"
+debug = "line-tables-only"

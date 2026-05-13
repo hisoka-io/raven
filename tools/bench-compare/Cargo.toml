@@ -1,0 +1,35 @@
+# Standalone manifest. Excluded from the rave root workspace so its
+# CLI deps (clap) never unify into the wasm32 builds of the core
+# crates.
+#
+# Build:
+#   cargo build --manifest-path tools/bench-compare/Cargo.toml --release
+#
+# Test:
+#   cargo test  --manifest-path tools/bench-compare/Cargo.toml
+[package]
+name = "bench-compare"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Compare two raven bench JSON outputs and flag regressions."
+publish = false
+
+[lib]
+name = "bench_compare"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench-compare"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"

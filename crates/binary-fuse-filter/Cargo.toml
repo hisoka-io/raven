@@ -1,0 +1,88 @@
+# Detached workspace. standalone crate, kept out of the root
+# `workspace.members` so its deps (turboshake) do not feature-unify
+# into other mainline crates.
+# Build explicitly with:
+#   cargo build --manifest-path crates/binary-fuse-filter/Cargo.toml --release
+[workspace]
+
+[package]
+name = "raven-bff"
+version = "0.1.0-alpha.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Binary Fuse Filter (3-wise and 4-wise XOR variants), pure-Rust implementation ported from ChalametPIR's `chalametpir_common::binary_fuse_filter`."
+license = "Apache-2.0"
+authors = ["Raven contributors"]
+publish = false
+readme = "README.md"
+
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+
+[lints.clippy]
+# Library discipline matching the rest of Raven.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+pedantic = { level = "warn", priority = -1 }
+# BFF does a lot of small arithmetic on filter indices; strict
+# cast lints would force #[allow] throughout. Relax at crate level
+# while keeping the critical safety lints above.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+needless_range_loop = "allow"
+explicit_iter_loop = "allow"
+similar_names = "allow"
+unreadable_literal = "allow"
+uninlined_format_args = "allow"
+items_after_statements = "allow"
+manual_range_contains = "allow"
+too_many_lines = "allow"
+bool_to_int_with_if = "allow"
+redundant_closure_for_method_calls = "allow"
+
+[dependencies]
+# Errors
+thiserror = "2"
+
+# Hash function used to convert variable-length keys into 4 × 64-bit
+# digests. TurboShake128 is specified by NIST SP 800-185 and used by
+# the upstream ChalametPIR reference; keeping the same primitive
+# preserves byte-identity with the reference BFF for a given input.
+turboshake = "0.4"
+
+# Randomness: ChaCha20 seeded from the platform OS entropy via
+# `getrandom`. Same crate stack that `raven-isimplepir` uses; pure
+# Rust, WASM-compatible.
+rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }
+rand_chacha = { version = "0.9", default-features = false, features = ["os_rng"] }
+getrandom = { version = "0.3", default-features = false }
+
+# wasm32 bridge for `getrandom` (browser OS-entropy via
+# `crypto.getRandomValues`). Must live after the main
+# `[dependencies]` block so it overrides `getrandom`'s feature set
+# only on wasm32.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.3", default-features = false, features = ["wasm_js"] }
+
+[dev-dependencies]
+# Proptest for filter membership properties.
+proptest = "1"
+# For generating random keys in tests.
+rand = "0.9"

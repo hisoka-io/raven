@@ -1,0 +1,20 @@
+# Enable -C target-cpu=native for the B1 benchmark binary.
+#
+# raven-b1-bench is a measurement binary specific to the host hardware
+# (9800X3D Zen 5 + AVX-512 + IFMA52). Target-cpu=native unlocks
+# auto-vectorization of hot scalar loops (NTT butterflies, gadget
+# decomposition, pointwise multiplies). Measured impact: server 38.67
+# -> 28.9 ms (+1.34x) on 3-seed parity at 2^20 x 256 B.
+#
+# Scope note: this applies to the raven-b1-bench workspace only (it
+# has its own Cargo.toml and is excluded from the root workspace, so
+# this .cargo/config does not affect other crates).
+#
+# For raven-inspire (shipped library), target features are gated via
+# explicit `#[target_feature(enable = "...")]` annotations on hot
+# functions, with runtime dispatch via `is_x86_feature_detected!`.
+# This preserves wasm32-unknown-unknown compatibility and portability
+# across x86-64 microarchitectures.
+
+[build]
+rustflags = ["-C", "target-cpu=native"]

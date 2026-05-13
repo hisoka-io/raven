@@ -1,0 +1,45 @@
+# Standalone. See top-level Cargo.toml for why it's not a workspace member.
+[workspace]
+
+[package]
+name = "raven-b1-bench"
+version = "0.1.0-alpha.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["Hisoka.io"]
+license = "Apache-2.0"
+description = "Adapter bench driving the upstream inspire crate under Raven's harness."
+publish = false
+
+# Adapter code calls into upstream APIs that would trip our strict lints
+# without contributing to correctness; relax them here.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+pedantic = "allow"
+
+[dependencies]
+raven-bench = { path = "../raven-bench", version = "0.1.0-alpha.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1.3"
+# Log rayon thread count at startup; inspire pulls rayon
+# transitively anyway so this doesn't change the dependency closure.
+rayon = "1"
+
+# The adapter consumes the Raven-local fork at crates/inspire/.
+raven-inspire = { path = "../../crates/inspire", default-features = false, optional = true }
+
+[features]
+default = []
+# Opt-in because raven-inspire pulls hundreds of transitive deps.
+inspire = ["dep:raven-inspire"]
+
+[[bin]]
+name = "b1-inspire"
+path = "src/bin/b1_inspire.rs"
+required-features = ["inspire"]

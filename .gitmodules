@@ -1,3 +1,3 @@
-[submodule "crates/raven-inspire"]
-	path = crates/raven-inspire
+[submodule "crates/inspire"]
+	path = crates/inspire
 	url = git@github.com:hisoka-io/inspire-rs.git

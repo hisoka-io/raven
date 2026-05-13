@@ -1,13 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/raven-core",
-    "crates/raven-indexer",
-    "crates/raven-client",
+    "crates/core",
+    "crates/crypto-primitives",
+    "crates/indexer",
+    "crates/client",
+    "benches/raven-bench",
 ]
 exclude = [
-    "crates/raven-inspire",
-    "bin/integrations/railgun",
+    "crates/inspire",
+    "adapters/railgun",
+    "adapters/railgun/client-wasm",
+    "benches/b1-bench",
+    "benches/b2-bench",
+    "tools/bench-compare",
 ]
 
 [workspace.package]

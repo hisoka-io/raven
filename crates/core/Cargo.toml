@@ -1,0 +1,21 @@
+[package]
+name = "raven-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Core types, errors, and storage traits for Raven."
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+bytes = { workspace = true }
+raven-inspire = { path = "../inspire" }
+[dev-dependencies]
+proptest = { workspace = true }

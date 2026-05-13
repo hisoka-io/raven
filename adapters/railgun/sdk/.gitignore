@@ -1,0 +1,6 @@
+node_modules
+
+# pnpm-lock.yaml is the canonical lockfile for this package; npm's
+# package-lock.json is intentionally NOT committed (would diverge
+# from the pnpm-resolved graph and confuse fresh-clone installs).
+package-lock.json

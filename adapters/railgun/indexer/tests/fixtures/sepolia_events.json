@@ -1,0 +1,61 @@
+{
+  "_README": "Synthetic Railgun event fixture for indexer integration tests. Each entry mirrors the alloy::rpc::types::eth::Log shape (just the fields the decoder needs). Topic-0 hashes are alloy-computed at S006 close (see M010); S007 fixture-decode test reconciles by attempting to decode against alloy::sol_types::SolEvent and asserting structural correctness, not byte-equality with one specific sample.",
+  "_source": "Recon agent 6 (S005) captured 13 events from Sepolia post-PPOI-launch (block 5944700 + 100k). The data here is the structural shape - the decoder asserts the bytes round-trip cleanly, not that any particular log is on Sepolia today.",
+  "_chain_id": 11155111,
+  "_railgun_proxy": "0xeCFCf3b4eC647c4Ca6D49108b311b7a7C9543fea",
+  "logs": [
+    {
+      "_label": "Nullified event - 1 nullifier in batch",
+      "address": "0xeCFCf3b4eC647c4Ca6D49108b311b7a7C9543fea",
+      "topics": ["0x781745c57906dc2f175fec80a9c691744c91c48a34a83672c41c2604774eb11f"],
+      "data_hex_descriptor": "abi.encode(uint16 treeNumber, bytes32[] nullifiers)",
+      "block_number": 5944712,
+      "log_index": 0,
+      "tx_hash": "0xaa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11"
+    },
+    {
+      "_label": "Unshield event - to + token + amount + fee",
+      "address": "0xeCFCf3b4eC647c4Ca6D49108b311b7a7C9543fea",
+      "topics": ["0xd93cf895c7d5b2cd7dc7a098b678b3089f37d91f48d9b83a0800a91cbdf05284"],
+      "data_hex_descriptor": "abi.encode(address to, TokenData token, uint256 amount, uint256 fee)",
+      "block_number": 5944803,
+      "log_index": 0,
+      "tx_hash": "0xbb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22"
+    },
+    {
+      "_label": "Shield event - 1 commitment, ciphertext, fees",
+      "address": "0xeCFCf3b4eC647c4Ca6D49108b311b7a7C9543fea",
+      "_topic0_alloy": "0x3a5b9dc26075a3801a6ddccf95fec485bb7500a91b44cec1add984c21ee6db3b",
+      "_topic0_recon_agent_5": "0x05601fc92daf9bd6c41702be7649435aeb3c515e2be55ed1c35d77633bc891df",
+      "_reconciliation_note": "S007 fixture decode against alloy SolEvent will reveal which struct shape produces the on-chain hash; if neither matches, the contract source we're reading from is a different version. Recon agent 6 captured Sepolia logs with ~5 Shield/Transact-shaped events; the actual on-chain topic[0] from those logs is the authoritative answer.",
+      "topics": ["0x3a5b9dc26075a3801a6ddccf95fec485bb7500a91b44cec1add984c21ee6db3b"],
+      "data_hex_descriptor": "abi.encode(uint256 treeNumber, uint256 startPosition, CommitmentPreimage[] commitments, ShieldCiphertext[] shieldCiphertext, uint256[] fees)",
+      "block_number": 5944900,
+      "log_index": 0,
+      "tx_hash": "0xcc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33"
+    },
+    {
+      "_label": "Transact event - 1 hash output, 1 ciphertext",
+      "address": "0xeCFCf3b4eC647c4Ca6D49108b311b7a7C9543fea",
+      "_topic0_alloy": "0x56a618cda1e34057b7f849a5792f6c8587a2dbe11c83d0254e72cb3daffda7d1",
+      "_topic0_recon_agent_5": "0x386a02ea7e878bf9c183e96af555092e3bed4865ec5ccb90d3128aa72cc25efb",
+      "topics": ["0x56a618cda1e34057b7f849a5792f6c8587a2dbe11c83d0254e72cb3daffda7d1"],
+      "data_hex_descriptor": "abi.encode(uint256 treeNumber, uint256 startPosition, bytes32[] hash, CommitmentCiphertext[] ciphertext)",
+      "block_number": 5945010,
+      "log_index": 0,
+      "tx_hash": "0xdd44dd44dd44dd44dd44dd44dd44dd44dd44dd44dd44dd44dd44dd44dd44dd44"
+    }
+  ],
+  "_contract_state_at_capture": {
+    "treeNumber": 0,
+    "nextLeafIndex": 5887,
+    "merkleRoot": "0x1dd553f2335561da0e8c785d4eee2ce35fc5d81dc4850f6c92e03002e329119d"
+  },
+  "_known_event_count_in_100k_block_range_post_ppoi_launch": 13,
+  "_breakdown": {
+    "Nullified": 4,
+    "Unshield": 3,
+    "Shield_or_Transact_combined": 5,
+    "_unmatched_or_legacy": 1
+  }
+}
