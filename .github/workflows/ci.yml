@@ -70,6 +70,19 @@ jobs:
     name: railgun adapter workspace (native)
     runs-on: ubuntu-latest
     steps:
+      - name: free disk space
+        # The adapter workspace's target/ tree (10 inner crates, full
+        # test build with `--all-targets`) exceeds the runner's default
+        # ~14 GiB free budget. Strip pre-installed tooling that the
+        # Rust build path does not touch (CodeQL, Android SDK, .NET,
+        # Haskell, Docker pre-pulls) to free ~30 GiB.
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h
       - uses: actions/checkout@v4
         with:
           submodules: recursive
