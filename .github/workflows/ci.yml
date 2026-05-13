@@ -66,29 +66,14 @@ jobs:
       - name: cargo check (wasm32, raven-inspire-client-wasm)
         run: cargo check --manifest-path adapters/railgun/client-wasm/Cargo.toml --target wasm32-unknown-unknown
 
-  railgun:
-    name: railgun adapter workspace (native)
+  railgun-static:
+    name: railgun adapter (fmt + check + clippy)
     runs-on: ubuntu-latest
-    # First-run release-mode build of the 9-inner-crate adapter + the
-    # raven-inspire submodule on a 2-vCPU GitHub runner is wall-time
-    # heavy (~35-45 min). Subsequent runs benefit from Swatinem/rust-cache
-    # and complete in 10-15 min. Cap at 75 min to absorb the first-run
-    # case without leaving the runner stranded if a real hang fires.
-    timeout-minutes: 75
+    # fmt + cargo check + clippy land in ~5-8 min on the 2-vCPU runner
+    # because they skip codegen + link. Cap at 30 min so a hung tool
+    # surfaces fast instead of blocking the matrix.
+    timeout-minutes: 30
     steps:
-      - name: free disk space
-        # The adapter workspace's target/ tree (10 inner crates, full
-        # test build with `--all-targets`) exceeds the runner's default
-        # ~14 GiB free budget. Strip pre-installed tooling that the
-        # Rust build path does not touch (CodeQL, Android SDK, .NET,
-        # Haskell, Docker pre-pulls) to free ~30 GiB.
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force >/dev/null 2>&1 || true
-          df -h
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -97,7 +82,8 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
+        with:
+          shared-key: "railgun"
       - name: cargo fmt
         run: |
           cargo fmt --manifest-path adapters/railgun/Cargo.toml \
@@ -115,22 +101,120 @@ jobs:
         run: cargo check --manifest-path adapters/railgun/Cargo.toml --workspace --all-targets
       - name: cargo clippy
         run: cargo clippy --manifest-path adapters/railgun/Cargo.toml --workspace --all-targets -- -D warnings
-      - name: cargo nextest (release)
-        # Release-mode test execution: InsPIRe's respond path is ~10-20x
-        # faster than debug, which dominates the per-test wall on a
-        # 2-vCPU runner. `cargo nextest` runs each test binary in its
-        # own process and parallelises across binaries — vs cargo test
-        # which serialises binaries — giving a further ~2-3x speedup
-        # on the multi-binary adapter workspace. Test-groups in
-        # `.config/nextest.toml` serialise chaos-child / flock / arcswap
-        # stress tests that compete on shared resources.
+
+  railgun-tests:
+    # Test execution is the wall-time floor of CI: the 9-crate adapter +
+    # raven-inspire submodule build, under `release`, took ~48 min on a
+    # 2-vCPU runner. Four stacked optimisations bring it under ~20 min:
+    #
+    #   1. `[profile.ci-test]` in adapters/railgun/Cargo.toml
+    #      (lto=off, codegen-units=16, opt-level=2) — saturates both
+    #      cores during codegen and drops the ~120-binary thin-LTO link
+    #      pass.
+    #   2. lld linker via RUSTFLAGS — parallel symbol resolution, ~25%
+    #      off the link phase vs the default bfd ld.
+    #   3. sccache w/ GHA-cache backend — caches individual rustc
+    #      invocations across runs. Cold = no win; warm = ~70-80% hit
+    #      on the inspire dep closure (the dominant cost).
+    #   4. Matrix split — three parallel runners by package group.
+    #      Wall time = max(shard), not sum.
+    #
+    # Each shard groups packages so the per-shard test count is roughly
+    # balanced (engine=45, cli=23, rest=40 integration-test files).
+    # `fail-fast: false` lets a single shard fail without cancelling the
+    # others, which speeds debugging.
+    name: railgun tests (${{ matrix.shard.name }})
+    needs: railgun-static
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - name: engine
+            packages: "-p raven-railgun-engine"
+          - name: cli
+            packages: "-p raven-railgun-cli"
+          - name: rest
+            packages: >-
+              -p raven-railgun-http
+              -p raven-railgun-indexer
+              -p raven-railgun-mock-ppoi
+              -p raven-railgun-persistence
+              -p raven-railgun-poseidon
+              -p raven-railgun-ppoi-mirror
+              -p raven-railgun-core
+    env:
+      # sccache: official Mozilla wrapper. GHA backend ships with the
+      # action; `SCCACHE_GHA_ENABLED=true` is consumed by the action
+      # itself. Setting RUSTC_WRAPPER here makes cargo route every rustc
+      # invocation through sccache for the rest of the job.
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      # lld linker. `.cargo/config.toml` carries the same flag for local
+      # dev; setting it via RUSTFLAGS overrides any nested config that
+      # would re-pin the default ld. -D warnings is preserved from the
+      # workflow-level env to keep build-time lint posture identical.
+      RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=lld"
+    steps:
+      - name: free disk space
+        # The adapter workspace's target/ tree (10 inner crates, full
+        # test build with --all-targets) exceeds the runner's default
+        # ~14 GiB free budget. Strip pre-installed tooling that the
+        # Rust build path does not touch (CodeQL, Android SDK, .NET,
+        # Haskell, Docker pre-pulls) to free ~30 GiB.
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install lld linker
+        run: sudo apt-get update && sudo apt-get install -y lld
+      - name: install sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Shared cache across all three matrix shards so the second
+          # and third shards reuse the first shard's saved target/ tree.
+          # Without this, each shard would rebuild raven-inspire cold.
+          shared-key: "railgun-tests"
+      - uses: taiki-e/install-action@nextest
+      - name: cargo nextest (ci-test profile)
+        # `ci-test` profile (see adapters/railgun/Cargo.toml): inherits
+        # release semantics for runtime perf (so the InsPIRe respond
+        # path stays under nextest's 120s slow-test ceiling) but with
+        # lto=off + codegen-units=16 for compile parallelism.
         #
-        # Doc-tests skipped: the adapter workspace has zero runnable
-        # `///` Rust doctests today (only a `text`-fenced prose block
-        # in `http/src/versioned.rs`). `cargo test --doc` would re-build
-        # every release-profile dep from scratch for no actual coverage.
-        # If a real doctest lands later, re-add the step.
-        run: cargo nextest run --manifest-path adapters/railgun/Cargo.toml --workspace --all-targets --release --profile ci
+        # `--profile ci` selects the nextest profile in
+        # adapters/railgun/.config/nextest.toml: retries=0, JSON-only
+        # failure output, 120s slow-timeout × 3 strikes, test-groups
+        # serialising chaos-child / flock / arcswap stress tests.
+        #
+        # Doc-tests skipped: the adapter workspace has zero `///`
+        # Rust doctests today; `cargo test --doc` would re-build every
+        # dep from scratch for no coverage. Re-add the step if a real
+        # doctest lands later.
+        run: |
+          cargo nextest run \
+            --manifest-path adapters/railgun/Cargo.toml \
+            ${{ matrix.shard.packages }} \
+            --all-targets \
+            --cargo-profile ci-test \
+            --profile ci
+      - name: sccache stats
+        # Surface cache-hit rate so we can tell whether the warm-run
+        # speedup is materialising. First run will show ~0% hit; second
+        # run on the same branch should show >50% hit on the inspire
+        # dep closure.
+        run: sccache --show-stats
+        if: always()
 
   isimplepir-tests:
     name: isimplepir (detached workspace)
