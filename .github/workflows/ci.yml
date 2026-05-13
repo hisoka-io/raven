@@ -178,7 +178,11 @@ jobs:
       - name: install lld linker
         run: sudo apt-get update && sudo apt-get install -y lld
       - name: install sccache
-        uses: mozilla-actions/sccache-action@v0.0.6
+        # v0.0.10 ships sccache 0.10+ which uses the GHA cache service
+        # v2 endpoint. v0.0.6 still pinned sccache 0.8.x against the
+        # decommissioned classic /artifactcache endpoint and 400'd on
+        # every run.
+        uses: mozilla-actions/sccache-action@v0.0.10
       - uses: Swatinem/rust-cache@v2
         with:
           # Shared cache across all three matrix shards so the second
