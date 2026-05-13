@@ -5,11 +5,15 @@ members = [
     "crates/crypto-primitives",
     "crates/indexer",
     "crates/client",
+    "benches/raven-bench",
 ]
 exclude = [
     "crates/inspire",
     "adapters/railgun",
     "adapters/railgun/client-wasm",
+    "benches/b1-bench",
+    "benches/b2-bench",
+    "tools/bench-compare",
 ]
 
 [workspace.package]
