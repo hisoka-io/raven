@@ -60,8 +60,9 @@ fn build_test_db(params: &InspireParams) -> Vec<u8> {
 
 #[test]
 fn path_indices_for_leaf_overflow_returns_typed_err_no_panic() {
-    let outcome =
-        panic::catch_unwind(AssertUnwindSafe(|| path_indices_for_leaf_rust(0, LEAVES_PER_TREE)));
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        path_indices_for_leaf_rust(0, LEAVES_PER_TREE)
+    }));
     let inner = outcome.expect(
         "path_indices_for_leaf_rust must NOT panic on overflow input; \
          the wasm-bindgen surface returns Result<_, JsValue> for this case",
@@ -78,8 +79,7 @@ fn path_indices_for_leaf_negative_via_u32_max_cast_returns_typed_err() {
     // A JS caller might cast a negative i32 to u32 (wraps to large value).
     // u32::MAX is well past the 2^16 leaves-per-tree bound; the wrapper
     // MUST reject typed, never trap.
-    let outcome =
-        panic::catch_unwind(AssertUnwindSafe(|| path_indices_for_leaf_rust(0, u32::MAX)));
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| path_indices_for_leaf_rust(0, u32::MAX)));
     let inner = outcome.expect("u32::MAX leaf_idx must NOT panic");
     let err = inner.expect_err("u32::MAX must Err");
     assert!(err.contains(">= 2^TREE_DEPTH"), "got {err}");
@@ -196,11 +196,9 @@ fn extract_response_inflated_entry_size_returns_or_panics_caught_no_native_abort
         inspire_setup(&params, &database, ENTRY_BYTES, &mut sampler).expect("inspire_setup");
 
     let mut sampler_session = GaussianSampler::new(params.sigma);
-    let session =
-        ClientSession::new(crs.clone(), sk, &mut sampler_session).expect("session");
+    let session = ClientSession::new(crs.clone(), sk, &mut sampler_session).expect("session");
     let (state, query) =
-        build_seeded_query_rust(&session, &params, &encoded_db.config, target_idx)
-            .expect("query");
+        build_seeded_query_rust(&session, &params, &encoded_db.config, target_idx).expect("query");
     let cache = ServerInspiringCache::new(&crs, &encoded_db).expect("cache");
     let store = ServerSessionStore::new();
     let response = respond_seeded_inspiring_cached_with_session(
@@ -317,7 +315,16 @@ fn extract_with_zero_entry_size_does_not_panic() {
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
         extract_response_rust(&crs, &state, &response, 0)
     }));
-    assert!(outcome.is_ok(), "entry_size=0 must not panic; caught: {outcome:?}");
-    let bytes = outcome.expect("not panicked").expect("zero entry_size must Ok");
-    assert!(bytes.is_empty(), "entry_size=0 must produce empty plaintext, got {} bytes", bytes.len());
+    assert!(
+        outcome.is_ok(),
+        "entry_size=0 must not panic; caught: {outcome:?}"
+    );
+    let bytes = outcome
+        .expect("not panicked")
+        .expect("zero entry_size must Ok");
+    assert!(
+        bytes.is_empty(),
+        "entry_size=0 must produce empty plaintext, got {} bytes",
+        bytes.len()
+    );
 }
