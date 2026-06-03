@@ -31,7 +31,7 @@ MAX_GZIP_BYTES=512000
 # This crate is intentionally outside the parent adapter workspace
 # (so its `getrandom = ["js"]` enable doesn't feature-unify into
 # native builds), so we must cd into the crate's own directory before
-# invoking wasm-pack to keep it from picking up the rave root
+# invoking wasm-pack to keep it from picking up the workspace root
 # Cargo.toml.
 cd "${CRATE_DIR}"
 

@@ -270,7 +270,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     let app_state = app_state.with_instance_metrics(instance_metrics);
 
     // Periodic session-map sweeper drops past-TTL entries even if the
-    // bearer never repeats (rave's serve_production.rs carried the bug
+    // bearer never repeats (a prior implementation carried the bug
     // forward; this closes it). Cadence is 60 s.
     let mut auxiliary_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     auxiliary_tasks.push(app_state.start_session_sweeper(std::time::Duration::from_secs(60)));

@@ -3,7 +3,7 @@
  *
  * Each block in this file pins a specific contract surfaced by the
  * SDK against an upstream-canonical reference, with citations into
- * `clones/railgun-research/repo-cache/` so future drift is easy to
+ * the upstream Railgun repos (github.com/Railgun-Community) so future drift is easy to
  * triangulate.
  *
  * The tests in this file lock the five wire-parity bugs:
@@ -54,7 +54,7 @@ const BC_HEX_B =
   "0000000000000000000000000000000000000000000000000000000000000002";
 
 // Upstream test vectors lifted byte-for-byte from
-// `clones/railgun-research/repo-cache/engine/src/merkletree/__tests__/utxo-merkletree.test.ts`
+// `engine/src/merkletree/__tests__/utxo-merkletree.test.ts`
 // `Should hash left/right` block. Cross-validates that our
 // Poseidon binding matches upstream `Merkletree.hashLeftRight`.
 const UPSTREAM_HASH_LEFT_RIGHT_VECTORS = [
@@ -134,7 +134,7 @@ describe("wire parity: C1 — PoisPerListResponse outer key is BC (NOT listKey)"
     // Server emits the upstream shape:
     //   { [BC]: { [listKey]: status } }
     // per
-    // `clones/railgun-research/repo-cache/private-proof-of-innocence/packages/node/src/poi-events/poi-merkletree-manager.ts:215-218`.
+    // `private-proof-of-innocence/packages/node/src/poi-events/poi-merkletree-manager.ts:215-218`.
     const expected = {
       [BC_HEX_A]: { [LIST_KEY_HEX]: "Valid" },
       [BC_HEX_B]: { [LIST_KEY_HEX]: "ShieldBlocked" },

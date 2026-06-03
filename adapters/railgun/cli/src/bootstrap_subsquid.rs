@@ -1132,7 +1132,7 @@ pub async fn bootstrap_one_list_with_mode(
 /// Per-URL HTTP timeout when probing a Railway PPOI base. Operators
 /// run with multiple bases in priority order; on transport failure or
 /// non-2xx response we walk to the next base. Mirrors the upstream
-/// wallet behaviour at `repo-cache/wallet/src/services/poi/poi-node-request.ts`.
+/// wallet behaviour at `wallet/src/services/poi/poi-node-request.ts`.
 const RAILWAY_PER_URL_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// The default Railway base list that every operator gets unless they

@@ -15,7 +15,7 @@
 //! real-OFAC data with a synthetic corpus.
 //!
 //! The wire shape mirrors the upstream contract verified at
-//! `clones/railgun-research/repo-cache/private-proof-of-innocence/packages/node/src/api/schemas.ts`
+//! `private-proof-of-innocence/packages/node/src/api/schemas.ts`
 //! and `models/poi-types.ts` — `POST /poi-events/{chainType}/{chainID}`
 //! returns `Vec<POISyncedListEvent>` and
 //! `POST /pois-per-blinded-commitment/{chainType}/{chainID}` returns a

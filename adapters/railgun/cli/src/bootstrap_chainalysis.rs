@@ -15,7 +15,7 @@
 //!    derivation input) is that address, then computes
 //!    `BlindedCommitment = Poseidon(commitmentHash, npk,
 //!    globalTreePosition)` per
-//!    `repo-cache/engine/src/poi/blinded-commitment.ts:13-16`.
+//!    `engine/src/poi/blinded-commitment.ts:13-16`.
 //!
 //! The on-chain shield log carries the plaintext `npk: bytes32`
 //! and the `(treeNumber, startPosition)` global tree position,
@@ -46,7 +46,7 @@ sol! {
 
 /// Mainnet deployment of the Chainalysis OFAC sanctions oracle.
 /// Locked literal verified against
-/// `repo-cache/private-proof-of-innocence/packages/node/src/local-list-provider.ts`
+/// `private-proof-of-innocence/packages/node/src/local-list-provider.ts`
 /// (the upstream Railgun PPOI list provider routes through the same
 /// oracle via the public Chainalysis API).
 pub const CHAINALYSIS_ORACLE_MAINNET: &str = "0x40C57923924B5c5c5455c48D93317139ADDaC8fb";
