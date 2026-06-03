@@ -1,0 +1,38 @@
+# Image for the SYNTHETIC `raven-railgun-mock-ppoi` binary. NEVER deploy
+# as a real PPOI source: the corpus is synthetic and the signing key is
+# freshly generated and signs nothing.
+#
+# Build context MUST be the repo root:
+#   docker build -t raven-railgun-mock-ppoi -f adapters/railgun/Dockerfile.mock-ppoi .
+
+FROM rust:1.85-slim-bookworm AS build
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        pkg-config libssl-dev clang lld git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY rust-toolchain.toml ./
+COPY crates/inspire ./crates/inspire
+COPY adapters/railgun ./adapters/railgun
+RUN cargo build --release \
+        --manifest-path adapters/railgun/Cargo.toml \
+        --bin raven-railgun-mock-ppoi
+RUN strip /build/adapters/railgun/target/release/raven-railgun-mock-ppoi || true
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates curl tini \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 1500 raven \
+ && useradd  --system --uid 1500 --gid 1500 --home-dir /data --shell /usr/sbin/nologin raven
+COPY --from=build /build/adapters/railgun/target/release/raven-railgun-mock-ppoi \
+     /usr/local/bin/raven-railgun-mock-ppoi
+RUN strip /usr/local/bin/raven-railgun-mock-ppoi || true
+ENV RUST_LOG="info"
+EXPOSE 8088
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=15s \
+    CMD curl -f "http://localhost:8088/node-status-v2/efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88" || exit 1
+USER raven:raven
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/raven-railgun-mock-ppoi"]
+CMD ["serve", "--bind", "0.0.0.0:8088"]
