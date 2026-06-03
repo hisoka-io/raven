@@ -335,6 +335,7 @@ async fn freshness_header_value_format_is_well_formed() {
     use raven_railgun_engine::persistence::ConsumerMetrics;
     let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics {
         last_applied_block: 1000,
+        last_applied_leaf_block: 1000,
         last_known_chain_head: 1010,
         events_processed: 42,
         commits_fired: 5,

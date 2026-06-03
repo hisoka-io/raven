@@ -556,6 +556,11 @@ pub enum ConsumerEvent {
 pub struct ConsumerMetrics {
     /// Last block height applied.
     pub last_applied_block: u64,
+    /// Block height of the last state-mutating event actually applied to
+    /// the store (AppendLeaf / PPOI list leaf). Never advanced by
+    /// Nullified / Unshield / heartbeat, so it brackets every applied leaf
+    /// and is the only height safe to persist as the manifest resume floor.
+    pub last_applied_leaf_block: u64,
     /// Last chain head seen via heartbeat.
     pub last_known_chain_head: u64,
     /// Events processed since startup.
@@ -786,6 +791,15 @@ pub async fn run_consumer_task(
 
     ensure_layer2_metrics_described();
 
+    // Seed the leaf-block watermark from the recovered manifest so an idle
+    // instance does not reset its resume floor to 0 on a clean shutdown.
+    {
+        let mut m = metrics.lock();
+        if m.last_applied_leaf_block == 0 {
+            m.last_applied_leaf_block = persistence.manifest_block_height();
+        }
+    }
+
     let mut verifier_state = verifier_ctx.map(|ctx| {
         let baseline = *metrics.lock();
         Layer2VerifierState::new(ctx, &baseline)
@@ -926,9 +940,13 @@ pub async fn run_consumer_task(
                 // any dirty shards and bumps the snapshot, so the
                 // next cold-start has a fresh restore point with
                 // no stale WAL replay.
+                // Use the last applied-leaf block (NOT chain head): the
+                // resume floor reads this value, so committing the chain tip
+                // here would skip any leaf that lagged the head and wedge the
+                // tree on restart.
                 let final_height = {
                     let m = metrics.lock();
-                    m.last_applied_block.max(m.last_known_chain_head)
+                    m.last_applied_leaf_block
                 };
                 if let Err(e) = drive_commit(
                     &instance,
@@ -1023,6 +1041,7 @@ fn apply_one_leaf(
         let mut store = logical_store.lock();
         super::inspire::apply_wal_entry(&mut store, p, height, encoder)?;
     }
+    metrics.lock().last_applied_leaf_block = height;
     if trigger {
         drive_commit(
             instance,
@@ -1085,6 +1104,7 @@ fn apply_ppoi(
         let mut store = logical_store.lock();
         super::inspire::apply_wal_entry(&mut store, payload, height, encoder)?;
     }
+    metrics.lock().last_applied_leaf_block = height;
     if trigger {
         drive_commit(
             instance,

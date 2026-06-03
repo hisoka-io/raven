@@ -14,7 +14,7 @@
 //! Once the orchestrator pass lands, the scrape-surface tests
 //! (HELP lines for every described metric, per-instance label
 //! presence, uptime gauge monotone-increase) belong here too,
-//! ported from the rave reference suite.
+//! covering the documented metrics contract.
 
 #![allow(
     clippy::expect_used,
@@ -118,9 +118,10 @@ fn with_instance_metrics_builder_round_trips_map() {
     // handler invocation).
     //
     // Map shape is `HashMap<InstanceId, Arc<Mutex<ConsumerMetrics>>>`,
-    // matching the rave reference contract.
+    // matching the documented metrics contract.
     let cell = Arc::new(parking_lot::Mutex::new(ConsumerMetrics {
         last_applied_block: 12_345_678,
+        last_applied_leaf_block: 12_345_678,
         last_known_chain_head: 12_345_700,
         events_processed: 42,
         reorgs_handled: 1,
@@ -312,7 +313,7 @@ async fn metrics_handler_emits_per_instance_engine_gauges() {
     );
 }
 
-/// Parity with rave at `metrics_surface.rs:298-307`: every increment of
+/// Every increment of
 /// `raven_railgun_queries_total` must carry the `instance` label so
 /// operator dashboards can filter per-instance QPS. Pre-fix the counter
 /// was emitted with only `kind` (single|batch), making per-instance
