@@ -650,9 +650,7 @@ fn import_refuses_tampered_tarball_byte_in_middle_with_specific_offset() {
     .expect("export");
 
     let mut bytes = std::fs::read(&tarball).expect("read");
-    // Offset 256 lands inside the zstd-compressed body past the magic
-    // + frame header, so a 1-byte flip corrupts a real frame byte;
-    // detection happens via zstd xxhash or per-file SHA-256.
+    // offset 256 is past the zstd magic + frame header, so a flip corrupts a real frame byte
     let target_offset = 256usize;
     assert!(
         bytes.len() > target_offset,

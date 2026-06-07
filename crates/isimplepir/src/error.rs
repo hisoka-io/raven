@@ -33,7 +33,7 @@ pub enum IsimplePirError {
     Randomness(String),
 
     /// Caller asked for strong deletion; scheme provides only weak
-    /// (paper §2.4).
+    /// (eprint 2026/030 sec 2.4).
     #[error("strong deletion not supported; iSimplePIR provides weak deletion only")]
     WeakDeletionOnly,
 }

@@ -27,8 +27,7 @@ fn build_toy_state() -> raven_railgun_core::Result<InspireServerState> {
 async fn orchestrator_bootstraps_and_consumer_applies_events() {
     let dir = tempfile::tempdir().expect("tempdir");
 
-    // use_flock=false in tests to avoid leaking a process-lifetime lock
-    // across test runs in the same `cargo test` invocation.
+    // use_flock=false: a process-lifetime lock would leak across tests in one `cargo test` run
     let mut config = OrchestratorConfig::demo(dir.path().to_path_buf(), "toy");
     config.use_flock = false;
     config.role = InstanceRole::Live;
@@ -73,8 +72,7 @@ async fn orchestrator_bootstraps_and_consumer_applies_events() {
     assert_eq!(m.last_known_chain_head, 200);
     assert_eq!(m.last_applied_block, 102);
 
-    // Snapshot fields out so the parking_lot::MutexGuard isn't held
-    // across the .await below.
+    // snapshot fields out: don't hold the parking_lot guard across the await below
     let (count, has_0, has_1, has_2) = {
         let store = handle.logical_store.lock();
         (
@@ -130,15 +128,7 @@ async fn orchestrator_reorg_truncates_leaves_past_height() {
             .await
             .expect("send");
     }
-    // Wait for the consumer to drain the 3 events. We don't expect a
-    // commit yet (default policy doesn't trigger on 3 events) so there
-    // is no `commit_notify` to await; poll the LogicalLeafStore until
-    // it reports the expected count, with a generous deadline.
-    //
-    // A fixed `sleep(100ms)` raced the consumer task on WSL2 under
-    // parallel-test load (the kernel didn't schedule the consumer
-    // before the assertion fired). Polling against the actual
-    // condition kills the race regardless of host scheduler.
+    // poll the store, not a fixed sleep: default policy yields no commit_notify at 3 events, and a sleep races the consumer under load
     let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let count = handle.logical_store.lock().leaf_count();
@@ -152,9 +142,7 @@ async fn orchestrator_reorg_truncates_leaves_past_height() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // Reorg drives a commit. Register the notification BEFORE sending
-    // the reorg so the wake isn't missed; then await deterministically
-    // instead of polling on a sleep.
+    // register the notification before sending the reorg, else the wake is missed
     let commit_fut = handle.persistence.commit_notify().notified();
     tokio::pin!(commit_fut);
     commit_fut.as_mut().enable();
@@ -167,8 +155,7 @@ async fn orchestrator_reorg_truncates_leaves_past_height() {
         .await
         .expect("reorg-driven commit did not fire within 5s");
 
-    // Snapshot fields out so the parking_lot::MutexGuards aren't held
-    // across the .await below.
+    // snapshot fields out: don't hold the parking_lot guards across the await below
     let (count, has_0, has_1, has_2) = {
         let store = handle.logical_store.lock();
         (

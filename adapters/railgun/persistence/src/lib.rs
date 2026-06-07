@@ -2,7 +2,7 @@
 //!
 //! Three layered primitives: [`Snapshot`] (bincode + atomic-rename),
 //! [`Wal`] (crc32-framed append-only log), and [`Manifest`] (JSON,
-//! atomic-renamed — the single linearization point for snapshot commits).
+//! atomic-renamed; the single linearization point for snapshot commits).
 //! Recovery truncates on the first bad WAL crc (torn write at the tail).
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
@@ -54,7 +54,7 @@ pub enum PersistenceError {
     #[error("instance {0} not registered")]
     UnknownInstance(InstanceId),
 
-    /// Invariant violation; not a panic — caller decides recovery strategy.
+    /// Invariant violation; not a panic, caller decides recovery strategy.
     #[error("invariant violated: {0}")]
     Invariant(String),
 
@@ -188,7 +188,7 @@ pub(crate) fn create_owner_only(path: &std::path::Path) -> Result<std::fs::File>
 /// Exclusive advisory lock on `data_dir/.lock`.
 ///
 /// Acquired via [`StoreLayout::open_with_lock`]. Dropping the guard releases the lock.
-/// Not compiled on `wasm32` — no concurrent-writer surface in browsers.
+/// Not compiled on `wasm32`; no concurrent-writer surface in browsers.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 pub struct ExclusiveLock {
@@ -300,7 +300,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         {
             let (_layout, _lock) = StoreLayout::open_with_lock(dir.path()).expect("first");
-        } // lock released on drop
+        }
         let _again = StoreLayout::open_with_lock(dir.path()).expect("second after drop");
     }
 

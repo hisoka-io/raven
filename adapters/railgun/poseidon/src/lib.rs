@@ -27,7 +27,6 @@ pub type Result<T, E = PoseidonError> = core::result::Result<T, E>;
 
 /// Decode a 32-byte big-endian buffer into a BN254 Fr, rejecting non-canonical inputs (>= modulus).
 fn fr_from_be_bytes(bytes: &[u8; 32]) -> Result<Fr> {
-    // `from_be_bytes_mod_order` always succeeds; re-encode and compare to enforce canonical input.
     let candidate = Fr::from_be_bytes_mod_order(bytes);
     let canonical = candidate.into_bigint().to_bytes_be();
     if canonical.as_slice() != bytes.as_slice() {
@@ -85,7 +84,7 @@ pub fn merkle_node(left: [u8; 32], right: [u8; 32]) -> Result<[u8; 32]> {
     hash_n(&[left, right])
 }
 
-/// `keccak256("Railgun") mod SNARK_PRIME` — leaf-level zero value of every Railgun IMT.
+/// `keccak256("Railgun") mod SNARK_PRIME`: leaf-level zero value of every Railgun IMT.
 #[must_use]
 pub fn railgun_merkle_zero_value() -> [u8; 32] {
     use tiny_keccak::{Hasher, Keccak};

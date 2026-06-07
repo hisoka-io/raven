@@ -1,5 +1,5 @@
-//! SimplePIR parameter calibration. Table 16 from paper 2022/949
-//! §4.2 at `(n, q, sigma, delta) = (1024, 2^32, 6.4, 2^-40)`.
+//! SimplePIR parameter calibration. Table 16 from eprint 2022/949
+//! sec 4.2 at `(n, q, sigma, delta) = (1024, 2^32, 6.4, 2^-40)`.
 
 use serde::{Deserialize, Serialize};
 
@@ -69,7 +69,7 @@ impl LweParams {
                 reason: format!(
                     "SimplePIR Eq. (2) violated: LHS floor(q/p) = {:.1} < RHS = {:.1} \
                      (n = {}, q = 2^{}, p = {}, sigma = {}, delta = 2^-{}, N = L*M = {:.3e}). \
-                     Reduce p (paper 2022/949 §4.2 Table 16) to restore margin.",
+                     Reduce p (eprint 2022/949 sec 4.2 Table 16) to restore margin.",
                     lhs_f,
                     rhs,
                     self.n,
@@ -167,7 +167,6 @@ pub fn for_cell(entries: u64, entry_bytes: usize) -> Result<LweParams> {
     }
     let total_bits: u128 = u128::from(entries) * (entry_bytes as u128) * 8;
 
-    // Initial guess: square matrix dim = ceil(sqrt(total_bits)).
     let side_lower = (total_bits as f64).sqrt();
     let log_m_est = side_lower.log2().ceil() as u32;
     let row = table16_row_for_log_m(log_m_est);
@@ -175,7 +174,6 @@ pub fn for_cell(entries: u64, entry_bytes: usize) -> Result<LweParams> {
         .saturating_sub(1)
         .max(1);
 
-    // Recompute L, M given chosen p. Square packing.
     let n_elements = total_bits.div_ceil(u128::from(bits_per_element));
     let side = (n_elements as f64).sqrt().ceil();
     let side_u = usize::try_from(side as u64).map_err(|_| IsimplePirError::InvalidParams {
@@ -219,23 +217,7 @@ mod tests {
         assert_eq!(row.log_m, 17);
         assert_eq!(row.p, 495);
 
-        // Between rows: returns smaller log_m (i.e. Larger p ,
-        // BUT we want smaller p for conservative direction. Since
-        // smaller log_m gives larger p, and we pick smaller log_m,
-        // we pick larger p. That's the paper's direction: a cell
-        // that fits in log_m = 17 (p = 495) is still safe if we
-        // use log_m = 18 (p = 416), but using log_m = 17 (p = 495)
-        // is what Table 16 normatively says for that matrix size.
-        //
-        // The "conservative smaller-p" reading of the same table is
-        // for NOISE-BUDGET MARGIN: smaller p = less noise headroom
-        // required = easier Eq. (2) closure. But for PUBLISHED TABLE
-        // 16 MATCHING, we pick the row whose log_m matches the
-        // actual matrix dim.
-        //
-        // Selection rule here: pick the largest log_m row ≤ input
-        // log_m. This matches the matrix dim; if caller wants extra
-        // margin, they can override p downward manually.
+        // Between rows: largest log_m row <= input, matching matrix dim.
         let row = table16_row_for_log_m(18);
         assert_eq!(row.log_m, 18);
         assert_eq!(row.p, 416);
@@ -243,12 +225,8 @@ mod tests {
 
     #[test]
     fn c3_cell_passes_eq2() {
-        // c3: 2^28 entries × 256 B.
         let params = for_cell(1u64 << 28, 256).expect("c3 should build");
-        // Theorem 3 + Eq. (2) should close; validate_eq2 internal
-        // to validate() at this point.
         params.validate().expect("c3 params should pass Eq. (2)");
-        // Sanity: c3 lands in Table 16 log_m = 18 ballpark.
         assert!(
             params.p >= 247 && params.p <= 416,
             "c3 p = {} should be between 247 and 416",
@@ -258,7 +236,6 @@ mod tests {
 
     #[test]
     fn all_pse_cells_pass_eq2() {
-        // PSE 3×3 grid: entries ∈ {2^20, 2^24, 2^28} × bytes ∈ {8, 32, 256}.
         let entries_set = [1u64 << 20, 1u64 << 24, 1u64 << 28];
         let bytes_set = [8usize, 32, 256];
         for e in entries_set {
@@ -285,7 +262,6 @@ mod tests {
         };
         // validate() lets it through for toy/test usage.
         assert!(p.validate().is_ok());
-        // validate_production() rejects it.
         assert!(matches!(
             p.validate_production(),
             Err(IsimplePirError::InvalidParams { .. })

@@ -1,19 +1,5 @@
-/**
- * Unit tests for the warm-cache path in `loadClientPirContext`.
- *
- * Vitest's Node test env does not expose `IndexedDB`, so the
- * session cache transparently falls through to the in-memory
- * `MemoryBackend`. These tests assert:
- *
- *   1. The first `loadClientPirContext` call invokes the cold
- *      path (`build_client_session`) and seeds the cache.
- *   2. A second call with the same `(instanceId, crsBincode)`
- *      hits the cache (`deserialize_client_session`) and skips
- *      the cold path.
- *   3. A second call with a different CRS hash (e.g. operator
- *      rotation) misses the cache and re-runs the cold path,
- *      seeding the new entry.
- */
+// Warm-cache path for loadClientPirContext. Node test env has no IndexedDB, so the
+// cache falls through to the in-memory MemoryBackend.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   loadClientPirContext,
@@ -49,14 +35,12 @@ function makeSpyWasm(): SpyWasm {
       _crs: Uint8Array,
     ): RavenInspireClientSession => {
       _build += 1;
-      // shadow into the spy object so callers can read after each call
       spy.build_count = _build;
       return handle;
     },
     serialize_client_session: (_session: RavenInspireClientSession): Uint8Array => {
       _serialize += 1;
       spy.serialize_count = _serialize;
-      // Non-empty blob so the cache stores something deserializable.
       return new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
     },
     deserialize_client_session: (
@@ -78,16 +62,11 @@ function makeSpyWasm(): SpyWasm {
 
 afterEach(async () => {
   await idbClear();
-  // Reset to the auto-detected default backend so each test gets a
-  // fresh in-memory map (Node test env => MemoryBackend).
   _setBackendForTests(null);
   vi.restoreAllMocks();
 });
 
-// Test seam mirroring the in-tree MemoryBackend's storage shape:
-// chunk records under `${key}#chunk-i` and a JSON meta record under
-// `${key}#meta`. We expose the underlying Map so failure-injection
-// tests can flip a byte inside a single chunk.
+// Mirrors MemoryBackend's storage shape (`#chunk-i` + `#meta`) and exposes the Map so failure-injection can corrupt a chunk.
 class ProbeBackend {
   readonly map = new Map<string, Uint8Array>();
   private readonly CHUNK_SIZE = 32 * 1024 * 1024;
@@ -170,8 +149,7 @@ class ProbeBackend {
 }
 
 function deterministicBlob(len: number, seed: number): Uint8Array {
-  // xorshift32 — keeps SHA-256 meaningful (not all-zeros) without
-  // pulling Math.random's entropy into the test.
+  // xorshift32: non-trivial bytes for a meaningful SHA-256, deterministic across runs.
   let s = seed | 0;
   if (s === 0) s = 1;
   const out = new Uint8Array(len);
@@ -245,12 +223,11 @@ describe("loadClientPirContext warm-cache", () => {
     });
     expect(second.cacheHit).toBe(false);
     expect(wasm.build_count).toBe(2);
-    // Cache now holds two entries (one per CRS hash).
   });
 
   it("falls through to cold path when WASM lacks serde symbols", async () => {
     const wasm = makeSpyWasm();
-    // Strip the optional serde methods to emulate an older WASM build.
+    // Emulate an older WASM build lacking the optional serde methods.
     delete wasm.serialize_client_session;
     delete wasm.deserialize_client_session;
 
@@ -277,7 +254,6 @@ describe("loadClientPirContext warm-cache", () => {
       inspireParamsBincode: inspire,
       entrySize: 32,
     });
-    // No serde => no caching => cold every time.
     expect(second.cacheHit).toBe(false);
     expect(wasm.build_count).toBe(2);
   });
@@ -301,7 +277,6 @@ describe("loadClientPirContext warm-cache", () => {
     const shard = new Uint8Array([0xde, 0xad]);
     const inspire = new Uint8Array([0xbe, 0xef]);
 
-    // Cold rebuild + seed.
     await loadClientPirContext({
       wasm,
       instanceId: "commit-tree-2",
@@ -312,8 +287,7 @@ describe("loadClientPirContext warm-cache", () => {
     });
     expect(wasm.build_count).toBe(1);
 
-    // Now flip the deserialize to simulate corrupt cache: the next
-    // call should fall through to a cold rebuild rather than throw.
+    // Corrupt-cache simulation: the next call must cold-rebuild, not throw.
     throwOnDeserialize = true;
     const recovered = await loadClientPirContext({
       wasm,
@@ -339,12 +313,10 @@ describe("idb chunked + integrity-verified storage", () => {
     expect(got).not.toBeNull();
     if (!got) return;
     expect(got.length).toBe(blob.length);
-    // Spot-check head + tail + a mid-chunk byte to cover all 3 chunks
-    // without paying the cost of a full byte-by-byte walk.
+    // Head/tail/mid-chunk spot-check across all 3 chunks; full equality via the hash below.
     expect(got[0]).toBe(blob[0]);
     expect(got[blob.length - 1]).toBe(blob[blob.length - 1]);
     expect(got[40 * 1024 * 1024]).toBe(blob[40 * 1024 * 1024]);
-    // And a hash-equality check for the full-buffer guarantee.
     const subtle = globalThis.crypto.subtle;
     const gotCopy = new Uint8Array(got.length);
     gotCopy.set(got);
@@ -365,8 +337,7 @@ describe("idb chunked + integrity-verified storage", () => {
 
     await idbPut(instanceId, crsHash, blob);
 
-    // Find the actual storage key (idbPut prefixes with the version
-    // tag) so we can flip a byte inside chunk-1.
+    // idbPut version-prefixes the key; find it to corrupt chunk-1.
     const metaSuffix = "#meta";
     const metaEntry = Array.from(probe.map.keys()).find((k) =>
       k.endsWith(metaSuffix),
@@ -390,7 +361,6 @@ describe("idb chunked + integrity-verified storage", () => {
     );
     expect(stragglers).toEqual([]);
 
-    // A second get without re-put still misses.
     const second = await idbGet(instanceId, crsHash);
     expect(second).toBeNull();
   });
@@ -402,9 +372,7 @@ describe("idb chunked + integrity-verified storage", () => {
     const instanceId = "test";
     const crsHash = "cafebabe".repeat(8);
 
-    // Mimic the pre-chunked storage shape: a single record under the bare
-    // key, with no `#meta` and no `#chunk-N` companions. The active
-    // backend's get path looks up `#meta` first, so this must miss.
+    // Pre-chunked shape: a bare-key record with no `#meta`; the get path looks up `#meta` first, so it must miss.
     const legacyKey = `v1:${instanceId}:${crsHash}`;
     probe.map.set(legacyKey, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
 

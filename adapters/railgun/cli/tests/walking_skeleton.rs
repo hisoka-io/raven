@@ -127,7 +127,6 @@ async fn pir_query_round_trip_recovers_planted_row() {
     assert_eq!(only.id, TOY_INSTANCE_ID);
     assert_eq!(only.epoch, 0);
 
-    // 10. Auth: missing bearer token must be rejected.
     let no_auth_resp = client
         .post(&url)
         .body(Vec::<u8>::new())
@@ -136,7 +135,6 @@ async fn pir_query_round_trip_recovers_planted_row() {
         .expect("POST without auth");
     assert_eq!(no_auth_resp.status(), 401);
 
-    // 11. Cleanup.
     server_handle.abort();
     let _ = server_handle.await;
 }

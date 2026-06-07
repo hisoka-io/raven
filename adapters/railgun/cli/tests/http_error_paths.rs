@@ -135,10 +135,7 @@ async fn empty_batch_body_returns_400() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn metrics_endpoint_default_requires_bearer() {
-    // `/metrics` is default-deny (`HttpConfig.metrics_public = false`).
-    // Unauthenticated scrape -> 401; authenticated scrape -> 200 with
-    // a non-empty Prometheus body. Operators opt in to public scrape
-    // via `--metrics-public`.
+    // `/metrics` is default-deny; `--metrics-public` opts into unauthed scrape
     let (addr, h) = spawn_toy_server().await;
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/metrics");

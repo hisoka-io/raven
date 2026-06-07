@@ -1,8 +1,6 @@
 //! Snapshot codec acceleration bench (`#[ignore]`-gated): compares
-//! bincode (today), bitcode (serde feature), and zstd-on-bincode at
-//! the locked production cell. 3-seed median per (codec, op). borsh
-//! is intentionally absent (no auto-derive from serde for upstream
-//! types — structural blocker, don't fake the bench).
+//! bincode, bitcode, and zstd-on-bincode at the production cell, 3-seed
+//! median per (codec, op). borsh is absent: no serde auto-derive for the upstream types.
 
 #![allow(
     clippy::expect_used,
@@ -25,10 +23,10 @@ use raven_railgun_engine::inspire::{
     restore_inspire_state, setup_state, snapshot_inspire_state, PersistedInspireState,
 };
 
-const ENTRIES_LOG2: usize = 16; // 65,536 entries
-const ENTRY_BYTES: usize = 512; // T2/T3 production cell
+const ENTRIES_LOG2: usize = 16;
+const ENTRY_BYTES: usize = 512;
 const SEEDS: usize = 3;
-const ZSTD_LEVEL: i32 = 3; // zstd default
+const ZSTD_LEVEL: i32 = 3;
 
 fn build_synthetic_db(n_entries: usize, entry_bytes: usize, salt: u64) -> Vec<u8> {
     (0..n_entries)
@@ -87,16 +85,14 @@ fn snapshot_codec_acceleration_at_production_cell() {
             fmt_us(setup_elapsed)
         );
 
-        // bincode: time a fresh ser inside the timed window so we
-        // measure clean serialization, not setup overhead.
+        // time a fresh ser inside the window to measure clean serialization, not setup overhead
         let bs = Instant::now();
         let bincoded = snapshot_inspire_state(&server_state).expect("bincode ser");
         let bincode_ser = bs.elapsed();
         bincode_bytes = bincoded.len();
         bincode_ser_t.push(bincode_ser);
 
-        // Restore is two stages (bincode::deserialize + cache rebuild).
-        // Time them separately to surface which stage pays the bill.
+        // restore is deserialize + cache rebuild; time them separately to attribute cost
         let bd_pure = Instant::now();
         let bundle_for_restore: PersistedInspireState =
             bincode::deserialize(&bincoded).expect("bincode de pure");
@@ -104,15 +100,11 @@ fn snapshot_codec_acceleration_at_production_cell() {
         bincode_de_pure_t.push(bincode_de_pure);
 
         let cache_start = Instant::now();
-        // Round-trip via restore_inspire_state and subtract
-        // bincode_de_pure to attribute the cache-rebuild cost.
         let restored = restore_inspire_state(&bincoded).expect("bincode de full");
         let bincode_de_with_cache = cache_start.elapsed() + bincode_de_pure;
         bincode_de_with_cache_t.push(bincode_de_with_cache);
         cache_rebuild_t.push(cache_start.elapsed());
 
-        // Round-trip correctness via canonical-byte equality (restored
-        // bundle re-serialized must match the original blob).
         let recanonical = snapshot_inspire_state(&restored).expect("bincode resnap");
         assert_eq!(
             recanonical.len(),
@@ -124,18 +116,15 @@ fn snapshot_codec_acceleration_at_production_cell() {
             "bincode round-trip must be byte-identical"
         );
 
-        // Free the restored state to keep peak RSS bounded.
         drop(restored);
         drop(bundle_for_restore);
 
-        // Stand-alone cache-rebuild measurement.
         let cache_only_start = Instant::now();
         let _cache = ServerInspiringCache::new(&server_state.crs, &server_state.encoded_db)
             .expect("standalone cache rebuild");
         let cache_only = cache_only_start.elapsed();
 
-        // bitcode: deserialize bincode blob outside the timed window so
-        // bitcode ser measures pure codec cost on the same in-memory value.
+        // deserialize outside the window so bitcode ser measures pure codec cost on the same value
         let bundle: raven_railgun_engine::inspire::PersistedInspireState =
             bincode::deserialize(&bincoded).expect("bincode de for bitcode-input");
         let bts = Instant::now();
@@ -150,9 +139,7 @@ fn snapshot_codec_acceleration_at_production_cell() {
         let bitcode_de = btd.elapsed();
         bitcode_de_t.push(bitcode_de);
 
-        // Round-trip correctness: re-serialize via bincode and assert
-        // byte-identity vs the canonical to prove bitcode preserved
-        // every field that matters to the on-disk format.
+        // re-serialize via bincode to prove bitcode preserved every on-disk-format field
         let recanonical_via_bitcode =
             bincode::serialize(&bundle_back).expect("bincode reser via bitcode round-trip");
         assert_eq!(
@@ -163,7 +150,6 @@ fn snapshot_codec_acceleration_at_production_cell() {
         drop(bundle);
         drop(bundle_back);
 
-        // zstd-on-bincode (level=3).
         let zs = Instant::now();
         let mut compressed = Vec::with_capacity(bincoded.len() / 2);
         {
@@ -207,7 +193,6 @@ fn snapshot_codec_acceleration_at_production_cell() {
             zstd_bytes,
         );
 
-        // Drop heavy state to keep peak memory bounded across seeds.
         drop(server_state);
     }
 

@@ -1,12 +1,5 @@
-# Standalone workspace. Excluded from the raven root workspace because it
-# pulls heavy transitive deps (axum + tokio + reqwest, once more crates land)
-# that would feature-unify into the wasm32 build of the core crates.
-#
-# Build everything:
-#   cargo build --manifest-path adapters/railgun/Cargo.toml --release
-#
-# Run tests:
-#   cargo test --manifest-path adapters/railgun/Cargo.toml
+# Standalone workspace, detached from the raven root so its heavy native
+# deps (axum, tokio, reqwest) don't feature-unify into the core wasm32 build.
 [workspace]
 resolver = "2"
 members = [
@@ -119,27 +112,9 @@ codegen-units = 1
 strip = "symbols"
 opt-level = 3
 
-# CI test profile: inherits release semantics (so InsPIRe respond paths
-# stay fast enough to keep per-test wall under nextest's 120s ci slow-
-# timeout) but disables link-time optimization, parallelises LLVM
-# codegen across all available cores, and skips symbol stripping.
-#
-# Why the deviation from `release`:
-#   * `codegen-units = 1` forces single-unit LLVM codegen per crate.
-#     On a 2-vCPU runner that serialises raven-inspire's large crates.
-#     `codegen-units = 16` saturates both cores during codegen.
-#   * `lto = "thin"` adds a link-time optimisation pass that runs on
-#     EVERY one of the ~120 test binaries (each links the full
-#     raven-inspire dep closure). Cumulative cost dominates the build.
-#     `lto = "off"` removes the pass entirely.
-#   * `opt-level = 2` keeps respond paths within ~1.3x of opt-level=3
-#     wall (measured locally) while compiling materially faster than
-#     opt-level=3 (LLVM skips the most-expensive inlining passes).
-#   * `debug = "line-tables-only"` keeps panic backtraces resolvable
-#     without the full DWARF cost of `debug = true`.
-#
-# Use only for test execution under nextest. The `release` profile is
-# still the source of truth for benchmarks + the production binaries.
+# Test-only profile: keep release-grade runtime perf so respond paths stay
+# under nextest's slow-timeout, but trade link/codegen optimisation for
+# compile parallelism. release stays the source of truth for benches + prod.
 [profile.ci-test]
 inherits = "release"
 lto = "off"

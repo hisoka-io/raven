@@ -4,12 +4,8 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
-//! Determinism of the A matrix derivation ( R5).
-//!
-//! Same master seed, byte-identical A across independent
-//! Setup calls. Enables client-side A regeneration from a
-//! 32-byte seed shared over the wire, avoiding the 4 MiB+
-//! A-matrix transfer.
+//! A-matrix derivation determinism: same master seed yields byte-identical A,
+//! letting the client regenerate A from a 32-byte seed instead of transferring it.
 
 use raven_isimplepir::{setup, LweParams};
 
@@ -52,10 +48,6 @@ fn different_seed_yields_different_hint() {
 
 #[test]
 fn deterministic_across_sessions() {
-    // Simulates restart: setup produces hint, drop state,
-    // setup again with same seed should produce byte-identical
-    // output. This is the invariant that lets a client
-    // re-hydrate from disk / IndexedDB.
     let params = toy_params();
     let db: Vec<u32> = vec![42u32; 16];
     let hint_data_run1: Vec<u32>;
@@ -63,7 +55,6 @@ fn deterministic_across_sessions() {
         let out = setup(&db, params, Some([99u8; 32])).expect("setup 1");
         hint_data_run1 = out.hint.data.clone();
     }
-    // Simulate restart: only the seed survives.
     let out2 = setup(&db, params, Some([99u8; 32])).expect("setup 2");
     assert_eq!(hint_data_run1, out2.hint.data);
 }

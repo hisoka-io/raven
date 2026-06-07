@@ -100,8 +100,6 @@ fn one_chaos_round(seed: u64, kill_delay: Duration) -> usize {
             recovered.block_height, canonical_height,
             "entry {idx}: block_height mismatch (seed={seed}, kill_delay={kill_delay:?})"
         );
-        // `WalEntry::payload` is bincode-serialized bytes. Decode it
-        // back into the typed variant for structural comparison.
         let decoded: WalEntryPayload = bincode::deserialize(&recovered.payload)
             .expect("recovered payload must be valid bincode");
         assert_eq!(

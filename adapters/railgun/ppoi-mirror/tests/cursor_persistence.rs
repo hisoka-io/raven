@@ -1,10 +1,8 @@
 //! Cursor persistence integration tests for `UpstreamPpoiMirror`.
 //!
-//! Closes the operator-observed bug where every restart re-emitted
-//! upstream events from index 0 because the worker held its cursor on
-//! the stack. The mirror now writes a per-(list_key, kind) sidecar
-//! into the operator-supplied data_dir on every successful upstream
-//! batch and resumes from it on the next worker spawn.
+//! The worker writes a per-(list_key, kind) sidecar on every successful
+//! upstream batch and resumes from it on the next spawn rather than
+//! re-emitting from index 0.
 //!
 //! Failure-injection coverage:
 //!
@@ -265,11 +263,11 @@ async fn mirror_cursor_falls_back_to_zero_when_both_sidecar_and_lls_empty() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mirror_cursor_atomic_write_survives_kill_at_temp_step() {
     // Failure injection: write a stale sidecar (cursor=200), drop a
-    // separate `.tmp` file with a TORN payload (5 bytes — short of the
+    // separate `.tmp` file with a TORN payload (5 bytes, short of the
     // expected 8), then spawn a worker. The torn `.tmp` is invisible
     // to the resume path: the worker reads the canonical sidecar
     // (cursor=200) and proceeds. After the next batch, the canonical
-    // sidecar is replaced atomically — the `.tmp` remnant is either
+    // sidecar is replaced atomically; the `.tmp` remnant is either
     // overwritten or left on disk but never observed as cursor data.
     let (url, mock, server) = start_mock().await;
     let mirror = build_mirror(url);
@@ -303,9 +301,6 @@ async fn mirror_cursor_atomic_write_survives_kill_at_temp_step() {
     server.abort();
 }
 
-/// Unit-style: write a cursor, resolve it back, then tamper with the
-/// sidecar (write garbage) — `resolve_start` falls back to the
-/// configured fallback.
 #[test]
 fn mirror_cursor_persist_then_resolve_round_trips_and_tamper_falls_back() {
     let scratch = tempfile::tempdir().expect("tempdir");

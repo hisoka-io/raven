@@ -69,19 +69,14 @@ impl PirTableEncoder for PerLeafCommitmentEncoder {
     }
 }
 
-/// Backward-compat alias from the prior trait surface.
+/// Alias for [`PerLeafCommitmentEncoder`].
 pub type PerLeafEncoder = PerLeafCommitmentEncoder;
 
 /// T2/T3 path encoder: row `idx` = 16 sibling hashes packed leaf-to-root
-/// (`PATH_RECORD_BYTES = 16 × 32 = 512` bytes), one row per leaf.
+/// (`PATH_RECORD_BYTES = 512` bytes), one row per leaf.
 ///
-/// Row layout matches the `bincode::serialize(&[[u8;32]; 16])` shape
-/// from the locked T1/T2/T3 encoding spec — fixed-length byte array,
-/// no headers, no length prefix.
-///
-/// Inserting leaf X invalidates the stored path of every prior leaf
-/// sharing an ancestor with X; `affected_shards_for_leaf` returns the
-/// full set of shard ids whose rows need re-encoding.
+/// Row layout matches `bincode::serialize(&[[u8;32]; 16])` per the encoding
+/// spec: fixed-length byte array, no headers, no length prefix.
 #[derive(Debug, Clone)]
 pub struct PerLeafPathEncoder {
     record_size: usize,
@@ -176,13 +171,10 @@ impl PirTableEncoder for PerLeafPathEncoder {
     }
 }
 
-/// Per-node encoder: each row is a single Merkle node (32 B), with rows
-/// laid out in flat-global-index order — leaves first (`[0, 2^TREE_DEPTH)`),
-/// then level-1 nodes, then level-2 nodes, ..., up to the root.
+/// Per-node encoder: each row is a single Merkle node (32 B), laid out in
+/// flat-global-index order: leaves (`[0, 2^TREE_DEPTH)`), then level-1, ..., root.
 ///
-/// Inserting leaf X dirties at most TREE_DEPTH+1 rows (the leaf plus its
-/// ancestors), de-duplicated to ~7 shards at the locked production cell
-/// shape (per the dirty-shard-count bench).
+/// Inserting a leaf dirties at most TREE_DEPTH+1 rows (the leaf plus its ancestors).
 #[derive(Debug, Clone)]
 pub struct PerNodeEncoder {
     entries_per_shard: u32,

@@ -1,14 +1,5 @@
-/**
- * Upstream-passthrough endpoint tests.
- *
- * `validatePOIMerkleroots` / `submitPOI` /
- * `submitLegacyTransactProofs` are forwarded verbatim to the
- * configured `upstreamFallbackEndpoint`. The Raven adapter does not
- * relay these — the wallet shouldn't lose the ability to submit POI
- * proofs while migrating to the PIR adapter.
- *
- * Tests here lock the wire shape and the error semantics.
- */
+// validatePOIMerkleroots / submitPOI / submitLegacyTransactProofs forward verbatim to
+// upstreamFallbackEndpoint; the adapter does not relay them. Locks wire shape + error semantics.
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
@@ -42,13 +33,11 @@ describe("upstream-passthrough endpoints", () => {
     });
     const got = await sdk.validatePOIMerkleroots(LIST_KEY_HEX, [ROOT_A, ROOT_B]);
     expect(got).toBe(true);
-    // No wire request fires because the upstream is absent.
     expect(sdk.lastWireRequests().length).toBe(0);
   });
 
   it("validatePOIMerkleroots posts the correct shape to upstream", async () => {
-    // Upstream path: /validate-poi-merkleroots/<chainType>/<chainID>
-    // per private-proof-of-innocence/packages/node/src/api/api.ts:786
+    // Upstream path /validate-poi-merkleroots/<chainType>/<chainID> (api.ts:786).
     server.route(
       (req) => req.url === "/validate-poi-merkleroots/0/1",
       (_req, _body, res) => {
@@ -67,8 +56,6 @@ describe("upstream-passthrough endpoints", () => {
     expect(wires.length).toBe(1);
     expect(wires[0].url).toMatch(/\/validate-poi-merkleroots\/0\/1$/);
     const decoded = JSON.parse(new TextDecoder().decode(wires[0].body));
-    // Body field name is `poiMerkleroots` to match upstream
-    // ValidatePOIMerklerootsParams.
     expect(decoded.chainType).toBe("0");
     expect(decoded.chainID).toBe("1");
     expect(decoded.txidVersion).toBe("V2_PoseidonMerkle");
@@ -120,8 +107,7 @@ describe("upstream-passthrough endpoints", () => {
   });
 
   it("submitPOI posts to upstream with full upstream 9-arg shape", async () => {
-    // Upstream path: /submit-transact-proof/<chainType>/<chainID>
-    // per private-proof-of-innocence/packages/node/src/api/api.ts:653
+    // Upstream path /submit-transact-proof/<chainType>/<chainID> (api.ts:653).
     server.route(
       (req) => req.url === "/submit-transact-proof/0/1",
       (_req, _body, res) => {

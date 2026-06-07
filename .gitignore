@@ -14,10 +14,9 @@ target/
 no-commit/
 .claude/
 .agent/
-CLAUDE.md
+CLAUDE.*
 MEMORY.md
 tmp/
 .code-review-graph/
-
-# Cargo lock is committed for binaries + workspaces
-# (keep default: commit Cargo.lock)
+.mcp.json
+run/

@@ -24,13 +24,11 @@ const NODE_BYTES: usize = 32;
 const PATH_RECORD_BYTES: usize = TREE_DEPTH * NODE_BYTES;
 const LIST_KEY: [u8; 32] = [0xA7; 32];
 const LEAVES: u32 = 256;
-// Small `entries_per_shard` so a single shard spans many flat rows;
-// this exercises the row-offset math at every level cleanly.
+// small so a single shard spans many flat rows, exercising row-offset math at every level
 const ENTRIES_PER_SHARD: u32 = 64;
 
 fn bc_for(idx: u32) -> [u8; 32] {
-    // BN254-Fr-canonical encoding: high bytes zero so the leaf passes
-    // Poseidon's canonicality check inside `Imt::insert_leaves`.
+    // Fr-canonical (high bytes zero) to pass Poseidon's canonicality check
     let mut b = [0u8; 32];
     b[28..32].copy_from_slice(&idx.saturating_add(1).to_be_bytes());
     b
@@ -95,9 +93,6 @@ fn per_list_node_row_byte_identity_at_level_1_and_level_8() {
     let (store, encoder) = build_store(LEAVES);
     let imt = store.ppoi_imt(&LIST_KEY).expect("per-list IMT present");
 
-    // Level 1: parents of leaves. With LEAVES = 256, level 1 has
-    // LEAVES / 2 = 128 populated nodes; sweep the first 16 + a band
-    // around the populated tail to cover boundary behaviour.
     let level1_indices: Vec<u32> = (0u32..16)
         .chain(((LEAVES / 2).saturating_sub(8))..(LEAVES / 2))
         .collect();
@@ -109,10 +104,7 @@ fn per_list_node_row_byte_identity_at_level_1_and_level_8() {
             row, expected,
             "level-1 row at idx {idx} (flat {flat}) byte mismatch"
         );
-        // Internal-node rows must be non-zero — a regression that
-        // returns the per-level zero hash for populated subtrees would
-        // pass `==` but fail this guard. With LEAVES = 256 the entire
-        // first 128 level-1 positions are populated.
+        // non-zero guard: returning the per-level zero hash for a populated subtree would pass == but fail here
         if (idx as usize) < (LEAVES as usize / 2) {
             assert_ne!(
                 row, [0u8; NODE_BYTES],
@@ -121,11 +113,7 @@ fn per_list_node_row_byte_identity_at_level_1_and_level_8() {
         }
     }
 
-    // Level 8: mid-tree (TREE_DEPTH = 16, so level 8 is exactly the
-    // halfway level). With LEAVES = 256 = 2^8, level 8 has exactly
-    // ONE populated node (`idx = 0`); the rest read through the zero
-    // cache. Cover idx = 0 (populated) and a band of empty positions
-    // (which exercises the zero-cache fall-through path).
+    // with LEAVES = 2^8, level 8 has exactly one populated node; the rest exercise the zero-cache fall-through
     let level8_indices: Vec<u32> = (0u32..16).collect();
     let mut populated_seen = false;
     for idx in level8_indices {
@@ -185,10 +173,7 @@ fn per_list_node_and_per_list_path_agree_on_auth_path_bytes() {
 
     let mut store = LogicalLeafStore::new();
     for i in 0..LEAVES {
-        // Apply against BOTH encoders' dirty-shard accounting; we use
-        // node_encoder for the apply-time dirty marking (any encoder
-        // produces correct LogicalLeafStore state — the dirty-shard
-        // set differs but does not affect IMT growth).
+        // any encoder yields correct store state; the dirty-shard set differs but IMT growth does not
         apply_wal_entry(
             &mut store,
             &ppoi_payload(i),

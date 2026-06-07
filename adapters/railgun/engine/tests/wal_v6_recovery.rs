@@ -354,10 +354,7 @@ fn v5_bytes_decoded_by_v6_reader_yields_empty_store() {
 
 #[test]
 fn drive_commit_truncates_wal_yet_v6_recovery_is_complete() {
-    // This test asserts the original gap closure: after commit_v6, the WAL
-    // gets archived. A subsequent reopen reads ZERO entries from current.log
-    // (replay() points at current.log, which is freshly truncated). The V6
-    // snapshot must still recover every applied leaf.
+    // commit_v6 archives the WAL, so reopen reads zero entries from current.log; the V6 snapshot must still recover every leaf
     let dir = tempfile::tempdir().expect("tempdir");
 
     {

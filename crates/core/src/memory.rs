@@ -105,7 +105,7 @@ impl Transaction for MemoryTxn<'_> {
             }
         }
 
-        // Bump generation under the write lock so the returned value identifies this commit.
+        // under write lock: returned gen uniquely identifies this commit
         let new_gen = store
             .generation
             .fetch_add(1, Ordering::AcqRel)

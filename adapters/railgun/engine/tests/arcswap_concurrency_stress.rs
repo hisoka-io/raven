@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use raven_railgun_core::{AdapterError, Epoch, InstanceId, Result};
 use raven_railgun_engine::{DrainState, PirInstance, PirScheme};
 
-// state.value == epoch on every swap, so a torn read surfaces as epoch != value.
+// state.value == epoch on every swap; a torn read surfaces as epoch != value.
 #[derive(Debug)]
 struct WitnessScheme;
 

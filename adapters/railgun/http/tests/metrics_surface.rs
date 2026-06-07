@@ -1,20 +1,7 @@
-//! Prometheus `/metrics` surface tests.
-//!
-//! Scope: T-M state-layer additions.
-//!
-//! This file covers what `state.rs` accomplishes today: the
-//! [`AppState::with_instance_metrics`] builder round-trips the
-//! per-instance [`ConsumerMetrics`] map into the state, and the
-//! cheap-clone `Clone` impl preserves it. Wire-up of the map into
-//! the `/metrics` handler itself (HELP/TYPE surface + per-instance
-//! gauges driven by `refresh_dynamic_metrics` + `emit_instance_metrics`)
-//! is the orchestrator pass that adds `/metrics` to the generic
-//! router and invokes the refresh helper before render.
-//!
-//! Once the orchestrator pass lands, the scrape-surface tests
-//! (HELP lines for every described metric, per-instance label
-//! presence, uptime gauge monotone-increase) belong here too,
-//! covering the documented metrics contract.
+//! Prometheus `/metrics` surface tests: the
+//! [`AppState::with_instance_metrics`] builder round-trips the per-instance
+//! [`ConsumerMetrics`] map, `Clone` preserves it, and the `/metrics` handler
+//! renders the per-instance gauge surface.
 
 #![allow(
     clippy::expect_used,
@@ -93,32 +80,18 @@ fn build_state() -> AppState<EchoScheme> {
 
 #[test]
 fn appstate_new_is_idempotent_for_describe_prometheus_metrics() {
-    // `AppState::new` invokes the state-layer `describe_prometheus_metrics`
-    // helper, which registers HELP descriptions + force-seeds zero-default
-    // counters into the process-global recorder. The helper is guarded by
-    // a `OnceLock` so repeat `AppState::new` calls inside one process are
-    // cheap + side-effect-free. This test exercises the multi-construct
-    // path that property tests + multi-tenant deployments hit.
+    // Repeat `AppState::new` must be cheap + side-effect-free (OnceLock-guarded
+    // `describe_prometheus_metrics`).
     let s1 = build_state();
     let s2 = build_state();
-    // Both states must carry the same process_started_at-derived value
-    // (the lock-free helper is process-wide; the per-state Instants are
-    // independent + monotonic).
     drop(s1);
     drop(s2);
 }
 
 #[test]
 fn with_instance_metrics_builder_round_trips_map() {
-    // Builder regression: `with_instance_metrics` must wire the
-    // per-instance ConsumerMetrics map into the state field, and
-    // `Clone` must preserve it (the metrics handler clones the
-    // state on every scrape; if `Clone` dropped the Arc, the
-    // per-instance gauges would silently disappear on a cloned
-    // handler invocation).
-    //
-    // Map shape is `HashMap<InstanceId, Arc<Mutex<ConsumerMetrics>>>`,
-    // matching the documented metrics contract.
+    // `with_instance_metrics` must wire the map in and `Clone` must preserve it
+    // (the handler clones state per scrape; a dropped Arc loses the gauges).
     let cell = Arc::new(parking_lot::Mutex::new(ConsumerMetrics {
         last_applied_block: 12_345_678,
         last_applied_leaf_block: 12_345_678,
@@ -131,10 +104,7 @@ fn with_instance_metrics_builder_round_trips_map() {
     let mut map: HashMap<InstanceId, Arc<parking_lot::Mutex<ConsumerMetrics>>> = HashMap::new();
     let id = InstanceId::new("with-instance-metrics-roundtrip");
     map.insert(id, Arc::clone(&cell));
-    // Capture the strong-count immediately after insert so the
-    // round-trip assertions below can compare against the
-    // builder-time baseline. Two strong refs: the one in `cell`
-    // and the one in `map`.
+    // Baseline: two strong refs (`cell` + the entry in `map`).
     let baseline_strong = Arc::strong_count(&cell);
     assert_eq!(
         baseline_strong, 2,
@@ -143,19 +113,14 @@ fn with_instance_metrics_builder_round_trips_map() {
 
     let state = build_state().with_instance_metrics(map);
 
-    // After the builder consumed `map`, the only strong refs to `cell`
-    // are: `cell` itself + the entry inside the state's
-    // `instance_metrics` map. So strong-count must still be 2.
+    // Builder consumed `map`; refs are now `cell` + the state's entry.
     assert_eq!(
         Arc::strong_count(&cell),
         2,
         "after `with_instance_metrics`, the per-instance Arc must be held by the state"
     );
 
-    // `Clone` on AppState must preserve the per-instance map. Cloning
-    // increments the strong count of the outer `Arc<HashMap<..>>`,
-    // NOT the per-entry Arcs (the HashMap is shared via the outer
-    // Arc, not deep-cloned). So `cell`'s strong-count stays at 2.
+    // `Clone` shares the map via the outer Arc, not a per-entry deep clone.
     let cloned = state.clone();
     assert_eq!(
         Arc::strong_count(&cell),
@@ -163,8 +128,7 @@ fn with_instance_metrics_builder_round_trips_map() {
         "Clone must NOT deep-clone the map; per-entry Arcs stay at strong-count 2"
     );
 
-    // Drop one of the AppState refs. The map outlives because the
-    // clone still holds it.
+    // Map outlives this drop because the clone still holds it.
     drop(state);
     assert_eq!(
         Arc::strong_count(&cell),
@@ -172,10 +136,8 @@ fn with_instance_metrics_builder_round_trips_map() {
         "dropping one AppState ref must NOT drop the per-entry Arc"
     );
 
-    // Mutation through the shared inner Mutex must be visible from
-    // outside the state: this is the entire point of the design
-    // (the orchestrator updates `last_applied_block` in the consumer
-    // task; the metrics handler scrapes it).
+    // Mutation through the shared Mutex must be visible outside the state:
+    // the consumer task updates it while the handler scrapes it.
     {
         let mut g = cell.lock();
         g.events_processed = 999;
@@ -187,8 +149,7 @@ fn with_instance_metrics_builder_round_trips_map() {
     );
     drop(snap);
 
-    // Now drop the cloned AppState; the per-entry Arc count must
-    // fall to 1 (only the test-local `cell` remains).
+    // Final drop: only the test-local `cell` ref remains.
     drop(cloned);
     assert_eq!(
         Arc::strong_count(&cell),
@@ -199,14 +160,9 @@ fn with_instance_metrics_builder_round_trips_map() {
 
 #[test]
 fn with_instance_metrics_empty_map_is_legal_default() {
-    // Default `AppState::new` populates `instance_metrics` with an
-    // empty map; the explicit empty-map builder call must be a
-    // no-op idempotently (single-instance deployments + tests that
-    // wire only the legacy single-cell `consumer_metrics`).
+    // The explicit empty-map builder call must be a no-op.
     let empty: HashMap<InstanceId, Arc<parking_lot::Mutex<ConsumerMetrics>>> = HashMap::new();
     let state = build_state().with_instance_metrics(empty);
-    // Reaching here without a panic + carrying through `Clone` proves
-    // the empty-map path is wired correctly.
     let _cloned = state.clone();
 }
 
@@ -216,7 +172,7 @@ fn with_instance_metrics_empty_map_is_legal_default() {
 /// `refresh_dynamic_metrics::engine.instances()` walk these names are
 /// described but never `.set()`, so dashboards see no data row.
 ///
-/// This is a thin smoke test — it asserts the metric names appear
+/// This is a thin smoke test: it asserts the metric names appear
 /// SOMEWHERE in the scrape output with the `instance=...` label. It
 /// does NOT pin specific values (those depend on the engine state
 /// which has no test fixture).

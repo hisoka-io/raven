@@ -21,8 +21,7 @@ impl PhaseSamples {
     /// Record one sample from a `std::time::Duration`.
     #[inline]
     pub fn record(&mut self, d: std::time::Duration) {
-        // Saturate rather than overflow. A bench that runs for 500_000+ years
-        // per sample has bigger problems than a rollover here.
+        // Saturate; a per-sample duration that overflows u64 micros is not a real bench.
         let micros = u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
         self.record_us(micros);
     }
@@ -49,26 +48,21 @@ impl PhaseSamples {
             return None;
         }
         let sum: u128 = self.samples_us.iter().map(|&x| u128::from(x)).sum();
-        // f64 conversion is lossless for counts up to 2^53 and sums up to ~1.8e19
-        // microseconds, which is ~600_000 years. Both are fine for bench use.
+        // f64 is lossless below 2^53; sample counts and microsecond sums stay well under it.
         #[allow(clippy::cast_precision_loss)]
         Some(sum as f64 / self.samples_us.len() as f64)
     }
 
-    /// Return the `q`-th percentile (`q ∈ [0.0, 1.0]`) using nearest-rank
-    /// selection on a sorted copy of the samples.
+    /// `q`-th percentile (`q` in `[0.0, 1.0]`) by nearest-rank on a sorted copy.
     ///
-    /// Returns `None` if no samples recorded; panics only if `q` is NaN, which
-    /// the `q.is_finite()` guard protects against by returning `None`.
+    /// `None` for no samples or non-finite/out-of-range `q`.
     pub fn percentile(&self, q: f64) -> Option<u64> {
         if !q.is_finite() || !(0.0..=1.0).contains(&q) || self.samples_us.is_empty() {
             return None;
         }
         let mut sorted = self.samples_us.clone();
         sorted.sort_unstable();
-        // nearest-rank: rank = ceil(q * n), 1-indexed. Sample counts we care
-        // about are well under 2^52, so usize -> f64 precision loss is not a
-        // real hazard here.
+        // nearest-rank: rank = ceil(q * n), 1-indexed.
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -171,17 +165,13 @@ mod tests {
     #[test]
     fn percentiles_match_nearest_rank_definition() {
         let mut s = PhaseSamples::default();
-        // Samples 1..=100 inclusive.
         for i in 1u64..=100 {
             s.record_us(i);
         }
-        // Nearest-rank: p50 = sample at rank ceil(0.5*100)=50 (value 50).
+        // Nearest-rank over 1..=100: pN = value N.
         assert_eq!(s.median(), Some(50));
-        // p95 = rank 95 = value 95
         assert_eq!(s.p95(), Some(95));
-        // p99 = rank 99 = value 99
         assert_eq!(s.p99(), Some(99));
-        // min/max are deterministic
         assert_eq!(s.min(), Some(1));
         assert_eq!(s.max(), Some(100));
     }

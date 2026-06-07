@@ -141,8 +141,7 @@ fn no_entries_to_replay_when_snapshot_captures_every_wal_entry() {
     assert_eq!(next, 3);
 }
 
-/// Regression guard: `current_snapshot_seq = 0` must produce `None` floor, not `Some(0)`.
-/// A previous bug passed `Some(0)` which silently skipped the seq-0 entry.
+// `current_snapshot_seq = 0` must yield a `None` floor; `Some(0)` would skip seq-0
 #[test]
 fn init_path_does_not_skip_seq_zero_entry() {
     let (_d, layout) = make_layout();

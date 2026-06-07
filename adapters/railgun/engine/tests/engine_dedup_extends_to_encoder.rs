@@ -1,11 +1,6 @@
-//! Bootstrap dedup widens from `DataSourceFilter` alone to
-//! `(DataSourceFilter, encoder_label)`.
-//!
-//! Two instances may legitimately share the same PPOI list_key when
-//! they own different encoder kinds (e.g. `per-list-status` alongside
-//! `per-list-path` over the OFAC list); the engine bootstrap must
-//! accept that combination while still rejecting two instances that
-//! agree on BOTH axes.
+//! Bootstrap dedup keys on `(DataSourceFilter, encoder_label)`: same
+//! list_key with different encoder kinds is allowed; agreement on both
+//! axes is rejected.
 
 #![allow(
     clippy::expect_used,
@@ -156,10 +151,8 @@ async fn bootstrap_railgun_engine_multi_routes_two_ppoi_instances_with_same_list
     let _ = mh;
 }
 
-/// Direct test of the dispatcher fan-out: build a routes Vec with two
-/// entries for the same list_key, dispatch one mirror payload, and
-/// assert BOTH consumer channels received it. Exercises the
-/// `.filter().for_each(send)` codepath that replaced `.find().map(send)`.
+/// One list_key with two route entries must fan out to both consumers
+/// (`.filter().for_each(send)`, not `.find().map(send)`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ppoi_route_dispatch_does_not_collide_for_status_and_paths_on_same_list_key() {
     let lk = ofac_list_key();
@@ -175,8 +168,7 @@ async fn ppoi_route_dispatch_does_not_collide_for_status_and_paths_on_same_list_
         status: 1,
     };
 
-    // Inline the dispatcher logic: filter all senders matching `lk`,
-    // send a clone to each. Mirrors the production fan-out.
+    // Mirrors the production fan-out: every sender matching `lk` gets a clone.
     let loaded = routes.load();
     let matched: Vec<_> = loaded
         .iter()

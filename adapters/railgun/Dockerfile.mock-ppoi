@@ -1,7 +1,5 @@
-# Image for the SYNTHETIC `raven-railgun-mock-ppoi` binary. NEVER deploy
-# as a real PPOI source: the corpus is synthetic and the signing key is
-# freshly generated and signs nothing.
-#
+# SYNTHETIC raven-railgun-mock-ppoi binary: corpus is fake and the signing
+# key is freshly generated, so NEVER deploy this as a real PPOI source.
 # Build context MUST be the repo root:
 #   docker build -t raven-railgun-mock-ppoi -f adapters/railgun/Dockerfile.mock-ppoi .
 

@@ -3,17 +3,12 @@
 //! accumulates BOTH the `(list_key, bc) -> status` map (T1 status PIR)
 //! AND the per-list IMT (T2 path PIR) from the mock corpus.
 //!
-//! Engine surface: the mirror's `run_worker` emits each
-//! `/poi-events` row twice -- first as
+//! The mirror emits each `/poi-events` row as
 //! [`raven_railgun_persistence::WalEntryPayload::PpoiListLeafAdded`]
-//! (drives per-list IMT growth + the `(BC -> idx)` ordering oracle),
-//! then as `PpoiStatus` (idempotent re-assert of the status map for
-//! consumers that don't follow the IMT path). This test exercises
-//! both halves: `LogicalLeafStore::ppoi_count()` reflects status-map
-//! population; `ppoi_imt(&list_key).leaf_count()` reflects IMT
-//! growth. Closes the gap noted in the prior incarnation of this
-//! comment (the mirror previously emitted only `PpoiStatus`, leaving
-//! the IMT empty even when events flowed).
+//! (per-list IMT growth + `(BC -> idx)` ordering oracle) then
+//! `PpoiStatus` (idempotent status-map re-assert). This exercises
+//! both halves: `ppoi_count()` for the status map,
+//! `ppoi_imt(..).leaf_count()` for IMT growth.
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
@@ -97,13 +92,7 @@ async fn adapter_consumes_mock_ppoi_events_and_populates_per_list_imt() {
         "all synthetic events surfaced via mirror",
     );
 
-    // Per-list IMT must have grown lockstep with the status map.
-    // Each mirror-emitted `/poi-events` row generates a
-    // `PpoiListLeafAdded` payload that the engine apply path inserts
-    // at `(list_key, list_index)` -- see
-    // `raven-railgun-engine/src/lib.rs` PpoiListLeafAdded arm. T2
-    // path PIR consumes this IMT; if it stays at 0, T2 returns
-    // empty rows.
+    // T2 path PIR consumes this IMT; if it stays at 0, T2 returns empty rows.
     let imt_leaves = store
         .ppoi_imt(&list_key.0)
         .map_or(0, raven_railgun_engine::imt::Imt::leaf_count);
@@ -112,8 +101,7 @@ async fn adapter_consumes_mock_ppoi_events_and_populates_per_list_imt() {
         "per-list IMT must grow lockstep with status map (got {imt_leaves}, want {want})",
     );
 
-    // Spot-check: every status emitted by the mirror is `Valid` (status
-    // byte 0) because the corpus has no blocked overrides.
+    // No blocked overrides in the corpus, so every status is `Valid` (byte 0).
     let bc0 = store.ppoi_status(
         &list_key.0,
         &Corpus::generate(CorpusConfig {

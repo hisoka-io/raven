@@ -72,8 +72,7 @@ fn bootstrap_tree_zero_cfg(data_dir: PathBuf) -> InstanceConfig {
 }
 
 async fn wait_for_observer(observer: &BootstrapObserver) -> BootstrapView {
-    // 180 s: generous bound because CI runners (ubuntu-latest is 2-core) under
-    // parallel test contention can balloon cold-start PIR setup well past 60 s.
+    // 180s: cold-start PIR setup balloons under parallel 2-core CI contention
     for _ in 0..3600u32 {
         if let Some(view) = observer.lock().clone() {
             return view;
@@ -120,8 +119,7 @@ async fn wait_for_snapshot_dir(data_dir: &std::path::Path, id: u64, deadline: Du
     );
 }
 
-// Bootstrap writes snap-000001/; the Shutdown-arm drive_commit must write snap-000002+.
-// Pre-fix the count stayed at 1 because the consumer never saw Shutdown.
+// bootstrap writes snap-000001; the Shutdown-arm drive_commit must add snap-000002+
 fn count_snapshots(data_dir: &std::path::Path) -> usize {
     let snap_dir = data_dir.join("snapshots");
     if !snap_dir.is_dir() {
@@ -208,10 +206,8 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
     let view = wait_for_observer(&observer).await;
     let chain = view.channels.indexer_tx.clone();
 
-    // Wait for snap-000001/ before triggering the next tree: the driver processes
-    // boundaries one-at-a-time but events can stack on the broadcast tap, and
-    // wait_for_data_dir alone would race the bootstrap commit (create_dir_all
-    // runs before bootstrap_inspire_instance writes the first snapshot).
+    // gate on snap-000001 before the next tree: data_dir alone races the
+    // bootstrap commit (create_dir_all precedes the first snapshot write)
     let tree1_dir = tmp.path().join("auto-tree-1");
     let tree2_dir = tmp.path().join("auto-tree-2");
 
@@ -229,7 +225,7 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
     wait_for_data_dir(&tree2_dir, Duration::from_secs(180)).await;
     wait_for_snapshot_dir(&tree2_dir, 1, Duration::from_secs(180)).await;
 
-    // Brief settle so any in-flight router fan-out completes before shutdown.
+    // let in-flight router fan-out drain before shutdown
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let _ = stop_tx.send(());
@@ -266,7 +262,6 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
             manifest.current_snapshot_id,
         );
 
-        // All events must have been checkpointed; nothing past the snapshot floor should need replay.
         let wal_floor = manifest.current_snapshot_seq.checked_sub(1);
         let wal = raven_railgun_persistence::Wal::open(&layout, wal_floor).expect("reopen wal");
         let replay = wal.replay().expect("replay wal");

@@ -128,8 +128,7 @@ fn token_data_hash_nft_keccak_then_mod_snark_prime() {
 #[test]
 fn shield_commitment_hash_railgun_known_vector() {
     // npk=1, tokenHash=2, valueAfterFee=1_000_000.
-    // Expected: 0x0a2161b423d7c3e51089062558fbb8ab175493c89395381ddd483608228664b1
-    // Source: @railgun-community/circomlibjs Node oracle (second-auditor pass).
+    // Source: @railgun-community/circomlibjs Node oracle.
     let npk = fr_from_u64(1);
     let token = fr_from_u64(2);
     let value = fr_from_u64(1_000_000);

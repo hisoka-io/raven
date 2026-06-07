@@ -114,17 +114,7 @@ async fn arcswap_routes_no_torn_reads_no_dropped_writes_under_50_readers_10_writ
          a regression that dropped writes would surface as a smaller len"
     );
 
-    // Sanity: every reader executed at least once. The two load-
-    // bearing correctness invariants below (final_snap.len ==
-    // expected_final_len for no-dropped-writes + torn == 0 for
-    // no-torn-reads) are the actual correctness signals. The
-    // earlier reads-count perf floor was host-dependent: under
-    // nextest's parallel-test-binary scheduler the test runs
-    // alongside 100+ concurrent processes and the read throughput
-    // drops below any uniform floor we could pick. Starvation-by-
-    // exclusive-lock would surface as `reads == 0` for many readers
-    // (long blocking on lock contention) — the `> 0` floor is a
-    // smoke test on that pathology.
+    // floor is `> 0`, not a throughput target: an exclusive lock on `load()` would surface as zero reads
     let reads = total_reads.load(Ordering::Relaxed);
     assert!(
         reads > 0,

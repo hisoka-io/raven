@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 const TOKEN: &str = "max-body-test-token-padded-1234";
 const INSTANCE: &str = "max-body-instance";
-// 4 KiB cap, 16 KiB body — unambiguous 413.
+// 4 KiB cap, 16 KiB body: unambiguous 413.
 const CONFIGURED_MAX_BODY: usize = 4 * 1024;
 const POST_BODY_LEN: usize = 16 * 1024;
 

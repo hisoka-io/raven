@@ -24,7 +24,7 @@ pub mod labels {
     pub const PER_LEAF_BC: &str = "per-leaf-bc";
     /// T2/T3 path encoder.
     pub const PER_LEAF_PATH: &str = "per-leaf-path";
-    /// V2 candidate per-node encoder.
+    /// Per-node encoder.
     pub const PER_NODE: &str = "per-node";
     /// T1 PPOI status encoder.
     pub const PER_LIST_STATUS: &str = "per-list-status";
@@ -51,7 +51,7 @@ pub enum EncoderKind {
         /// Tree this encoder is pinned to.
         tree_number: u32,
     },
-    /// V2 candidate per-node encoder; row = 32 B Merkle node from per-tree IMT.
+    /// Per-node encoder; row = 32 B Merkle node from per-tree IMT.
     PerNode {
         /// Tree this encoder is pinned to.
         tree_number: u32,
@@ -91,18 +91,12 @@ impl EncoderKind {
         }
     }
 
-    /// Minimum `total_entries` an `EncodedDatabase` must hold for this
-    /// encoder kind to be safely usable.
+    /// Minimum `total_entries` an `EncodedDatabase` must hold for this encoder.
     ///
-    /// The per-node family (PerNode / PerListNode) flat-indexes every IMT
-    /// node into a single PIR table; a leaf insert at the boundary dirties
-    /// shards spanning `[0, PER_NODE_TOTAL_NODES)`, so the `EncodedDatabase`
-    /// must allocate at least that many entry slots or `re_encode_shard`
-    /// fails on dirty-shard ids past the end.
-    ///
-    /// The path / leaf-keyed family (PerLeafPath / PerListPath / PerLeafBc /
-    /// PerListStatus) flat-indexes by leaf, requiring `LEAVES_PER_TREE`
-    /// entries.
+    /// Per-node encoders flat-index every IMT node, needing
+    /// `PER_NODE_TOTAL_NODES` slots; leaf-keyed encoders flat-index by leaf,
+    /// needing `LEAVES_PER_TREE`. Undersizing makes `re_encode_shard` fail on
+    /// dirty-shard ids past the end.
     #[must_use]
     pub const fn min_total_entries(&self) -> u32 {
         match self {
@@ -116,12 +110,8 @@ impl EncoderKind {
 
     /// Recommended `total_entries` cell size per encoder kind.
     ///
-    /// Path / leaf-keyed encoders use `LEAVES_PER_TREE = 65,536`. Per-node
-    /// encoders walk the full flat `[0, PER_NODE_TOTAL_NODES)` index space;
-    /// the next `entries_per_shard`-aligned ceiling of
-    /// `PER_NODE_TOTAL_NODES = 131,071` rounds up to `131,072` (next
-    /// 2048-multiple) so dirty-shard ids stay within the allocated
-    /// `EncodedDatabase` slots.
+    /// Leaf-keyed: `LEAVES_PER_TREE` (65,536). Per-node: `PER_NODE_TOTAL_NODES`
+    /// rounded up to the next 2048-multiple (131,072) so every dirty-shard id fits.
     #[must_use]
     pub const fn default_total_entries(&self) -> usize {
         match self {
@@ -134,10 +124,6 @@ impl EncoderKind {
     }
 
     /// Per-encoder default for the operator-facing concurrency cap.
-    ///
-    /// - `PerNode` / `PerListNode` / `PerListPath`: 16
-    /// - `PerLeafPath`: 8
-    /// - `PerLeafBc` / `PerListStatus`: 4
     #[must_use]
     pub const fn default_concurrency(&self) -> usize {
         match self {
@@ -199,9 +185,7 @@ pub const LEAVES_PER_TREE: u32 = 1u32 << TREE_DEPTH;
 /// layout used by `PerNodeEncoder` and `PerListNodeEncoder`.
 pub const PER_NODE_TOTAL_NODES: u32 = (1u32 << (TREE_DEPTH + 1)) - 1;
 
-/// Free-function alias for [`EncoderKind::default_total_entries`]. Kept as
-/// a free function so call sites that read the encoder by reference (e.g.
-/// the operator binary's TOML resolver) can call it directly.
+/// By-reference free-function alias for [`EncoderKind::default_total_entries`].
 #[must_use]
 pub const fn default_entries_for(encoder: &EncoderKind) -> usize {
     encoder.default_total_entries()
@@ -213,20 +197,14 @@ pub const fn default_concurrency_for(encoder: &EncoderKind) -> usize {
     encoder.default_concurrency()
 }
 
-/// Validate that the supplied `total_entries` fits the encoder's minimum
-/// cell-shape invariant.
+/// Validate `total_entries` against the encoder's minimum cell shape.
 ///
-/// This is the canonical pre-allocation check operator-binary call sites
-/// run before constructing an `EncodedDatabase`: the raven-inspire engine
-/// sizes its shard count from `total_entries / entries_per_shard`, so an
-/// undersized cell silently allocates fewer shards than the encoder will
-/// dirty, leading to `re_encode_shard: shard id N not present` runtime
-/// failures.
+/// Pre-allocation check: shard count is `total_entries / entries_per_shard`, so
+/// an undersized cell allocates fewer shards than the encoder dirties and
+/// `re_encode_shard` fails at runtime on shard ids past the end.
 ///
 /// # Errors
-/// Returns [`AdapterError::InvalidQuery`] when the cell is too small for
-/// the encoder kind (e.g. PerNode with
-/// `total_entries < PER_NODE_TOTAL_NODES`).
+/// Returns [`AdapterError::InvalidQuery`] when the cell is too small for the encoder.
 pub fn validate_total_entries(encoder: &EncoderKind, total_entries: usize) -> Result<()> {
     let min = encoder.min_total_entries() as usize;
     if total_entries < min {
@@ -240,23 +218,13 @@ pub fn validate_total_entries(encoder: &EncoderKind, total_entries: usize) -> Re
     Ok(())
 }
 
-/// Shared shard-dirty walk for both [`PerLeafPathEncoder::affected_shards_for_leaf`]
-/// and [`PerListPathEncoder::affected_shards_for_ppoi_leaf`]. Inserting
-/// `leaf_index` invalidates the path of every prior leaf sharing an
-/// ancestor with it. Each level `k` (1..=TREE_DEPTH) defines a block of
-/// `2^k` consecutive leaves; the block start is `(leaf_index >> k) << k`.
-/// The dirty leaves at level `k` are `[block_start, leaf_index)` — inserting
-/// at `block_start..=leaf_index` changes every prior leaf's sibling at level
-/// k.
+/// Shard-dirty walk shared by the path encoders. Inserting `leaf_index`
+/// invalidates the stored path of every prior leaf sharing an ancestor: at
+/// level `k` those are `[block_start, leaf_index)` where
+/// `block_start = (leaf_index >> k) << k`.
 ///
-/// We accumulate shard ids by leaf-range rather than by per-leaf walk:
-/// for each level the prior-leaf range `[block_start, leaf_index)` maps
-/// to the inclusive shard range
-/// `[block_start / eps ..= (leaf_index - 1) / eps]`. That bounds the
-/// inner work to `O(num_shards × TREE_DEPTH)` ≈ 32 × 16 = 512 inserts at
-/// the production cell, instead of `O(leaf_index × TREE_DEPTH)` ≈
-/// 65,535 × 16 ≈ 1 M for the prior O(N) implementation (2000× speedup
-/// at the worst-case leaf).
+/// Mapped per level to the shard range `[block_start/eps ..= (leaf_index-1)/eps]`
+/// so the cost is `O(num_shards × TREE_DEPTH)`, not `O(leaf_index × TREE_DEPTH)`.
 pub(crate) fn path_affected_shards_into(
     entries_per_shard: u32,
     leaf_index: u32,
@@ -576,7 +544,6 @@ mod tests {
         let parent = imt.node(1, 0);
         assert_ne!(parent, [0u8; 32], "parent of two leaves must be non-zero");
     }
-    // ---- T-B encoder cell-shape API tests --------------------------------
 
     #[test]
     fn default_entries_for_returns_131072_for_per_node_family() {
@@ -670,10 +637,8 @@ mod tests {
 
     #[test]
     fn per_list_node_max_shard_id_overflows_undersized_cell_regression() {
-        // Regression for the bug "shard id 32 not present in EncodedDatabase
-        // (have 32 shards)": at the undersized 65,536-entry cell with
-        // entries_per_shard=2048, the EncodedDatabase has 32 shards
-        // (ids 0..=31) but PerListNodeEncoder dirties ids up to 63.
+        // At an undersized 65,536-entry cell (32 shards) PerListNodeEncoder
+        // dirties shard ids past 31, so the cell must be sized off PER_NODE_TOTAL_NODES.
         let entries_per_shard: u32 = 2048;
         let pln_enc = PerListNodeEncoder::new(entries_per_shard, [0; 32]).expect("encoder");
         let undersized_total: u32 = 65_536;

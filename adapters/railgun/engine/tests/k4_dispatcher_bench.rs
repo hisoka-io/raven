@@ -104,12 +104,8 @@ fn k4_dispatcher_strategy_comparison() {
     }
 }
 
-// Strategy implementations.
-
-/// Baseline: mirrors the production `dispatch_batch` exactly. Tokio
-/// `JoinSet` of K spawn_blocking workers, each holding a Semaphore
-/// permit, calling `RavenInspireScheme::respond` (which uses the
-/// global rayon pool internally for its per-shard column loop).
+/// Baseline mirroring production `dispatch_batch`: `JoinSet` of K
+/// semaphore-gated spawn_blocking workers over the global rayon pool.
 fn strategy_baseline(
     state: &Arc<InspireServerState>,
     queries: &[raven_inspire::SeededClientQuery],
@@ -172,10 +168,8 @@ fn strategy_baseline(
     })
 }
 
-/// (a) Dedicated rayon pool per worker: K workers, each running in a
-/// pool sized to `cores / K` so the per-respond rayon work doesn't
-/// thrash the global pool. Pools are constructed once at strategy
-/// boot and reused for all measured iters.
+/// (a) K workers, each in its own `cores / K`-sized rayon pool, so
+/// per-respond work does not thrash the global pool.
 fn strategy_a_dedicated_pool(
     state: &Arc<InspireServerState>,
     queries: &[raven_inspire::SeededClientQuery],
@@ -238,9 +232,8 @@ fn strategy_a_dedicated_pool(
     responses.into_iter().map(|o| o.expect("filled")).collect()
 }
 
-/// (b) `std::thread::scope` inside one tokio `spawn_blocking`: K OS
-/// threads, each calls `S::respond` against the global rayon pool.
-/// Removes JoinSet + semaphore + per-task spawn overhead.
+/// (b) K OS threads via `std::thread::scope`, dropping the JoinSet +
+/// semaphore + per-task spawn overhead.
 fn strategy_b_thread_scope(
     state: &Arc<InspireServerState>,
     queries: &[raven_inspire::SeededClientQuery],
@@ -282,10 +275,8 @@ fn strategy_b_thread_scope(
     })
 }
 
-/// (c) Single `rayon::par_iter` fanout. Treat the whole 16-batch as
-/// one job; rayon's work-stealing handles outer + inner parallelism
-/// in one pool. noted this thrashed; bench at the cleaner
-/// /batch boundary to confirm or refute.
+/// (c) Single `rayon::par_iter` fanout: one pool handles outer + inner
+/// parallelism via work-stealing.
 fn strategy_c_par_iter(
     state: &Arc<InspireServerState>,
     queries: &[raven_inspire::SeededClientQuery],

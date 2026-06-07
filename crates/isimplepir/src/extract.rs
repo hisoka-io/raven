@@ -14,7 +14,6 @@ pub fn extract(
     state: &ClientState,
     response: &ServerResponse,
 ) -> Result<u32> {
-    // Shape checks.
     if hint.l != params.l || hint.n != params.n {
         return Err(IsimplePirError::InvalidParams {
             reason: format!(
@@ -128,7 +127,6 @@ mod tests {
         let result = extract(&params, &h, &s, &r);
         assert!(matches!(result, Err(IsimplePirError::InvalidParams { .. })));
 
-        // Restore valid shape; then break secret length.
         h = ClientHint {
             l: params.l,
             n: params.n,

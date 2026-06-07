@@ -1,8 +1,7 @@
-//! Toy in-memory PIR-engine wiring used by `serve` + the walking-skeleton test.
+//! Toy in-memory PIR-engine wiring used by `serve` and integration tests.
 //!
-//! Record size 256 B: even sizes ≥ 32 B decrypt cleanly under TwoPacking + InspiRING.
-//! 33 B fails due to slot-alignment (each 16-bit slot encodes 2 bytes; odd record_bytes leaves a
-//! half-slot unrecoverable), not a γ-calibration bug.
+//! Record size must be even: each 16-bit TwoPacking slot encodes 2 bytes, so an
+//! odd record_bytes leaves a half-slot unrecoverable on decrypt.
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 #![allow(missing_docs)]

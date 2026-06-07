@@ -120,10 +120,7 @@ async fn six_instance_config_file_boots_and_status_lists_all() {
         );
     }
 
-    // Per Workstream N: active_k_concurrency must default per-encoder.
-    // commit-tree-* are PerNode -> 16.
-    // ppoi-status-ofac is PerListStatus -> 4.
-    // ppoi-paths-ofac is PerListNode -> 16.
+    // active_k_concurrency defaults per-encoder: PerNode->16, PerListStatus->4, PerListNode->16
     let by_id: std::collections::HashMap<&str, u32> = body
         .instances
         .iter()

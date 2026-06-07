@@ -51,12 +51,6 @@ fn median(timings: &mut [Duration]) -> Duration {
 }
 
 fn findings_path() -> PathBuf {
-    // Bench output goes to a developer-local, cargo-gitignored
-    // location under `target/bench-findings/`. Operators wanting a
-    // different sink (e.g. shared CI artefact dir) can override via
-    // `RAVEN_BENCH_FINDINGS_DIR`. The path resolution is best-effort:
-    // bench output is informational, not a CI gate, and a write
-    // failure does NOT fail the test.
     if let Ok(env_dir) = std::env::var("RAVEN_BENCH_FINDINGS_DIR") {
         return PathBuf::from(env_dir).join("per-insert-wall-time.md");
     }
@@ -70,9 +64,7 @@ fn findings_path() -> PathBuf {
     p
 }
 
-/// Append a single line to FINDINGS.md. Bench output is the load-bearing
-/// artefact; failure to write is non-fatal so the test still reports
-/// numbers via `eprintln`.
+// write failure is non-fatal; numbers still print via eprintln
 fn append_findings_line(line: &str) {
     let path = findings_path();
     if let Some(parent) = path.parent() {
@@ -122,10 +114,7 @@ fn payload_for(cell: &Cell, idx: u32) -> WalEntryPayload {
     }
 }
 
-/// Runs SAMPLE_INSERTS sample inserts after pre-loading the cell to
-/// `preload_to`. Returns the per-seed MEDIAN per-insert duration
-/// (not the mean) plus the count of samples actually taken (capped
-/// when `preload_to + SAMPLE_INSERTS` would overflow capacity).
+// returns per-seed median (not mean) per-insert duration and the sample count taken
 fn run_one_seed(cell: &Cell, preload_to: u32) -> (Duration, u32) {
     let params = InspireParams::secure_128_d2048();
     let db = build_synthetic_db(cell.entries, cell.entry_bytes);

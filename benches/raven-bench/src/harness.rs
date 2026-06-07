@@ -104,8 +104,7 @@ pub fn run_cell<S: BenchScheme>(
 
     let measured_start = Instant::now();
     let mut completed: u64 = 0;
-    // Start measured queries past the warmup-trial range so they hit
-    // fresh indices and avoid cache priming.
+    // Past the warmup-trial range so measured queries hit fresh indices.
     let measured_start_trial = u64::from(config.warmup_queries);
     for i in 0..config.measured_queries {
         if measured_start.elapsed() >= config.budget {
@@ -176,8 +175,7 @@ mod tests {
             42
         }
         fn query(&self, _index: u64) -> QuerySizes {
-            // Busy-wait a known amount so median timings are observable
-            // without sleep/OS scheduling jitter making the test flaky.
+            // Busy-wait rather than sleep so OS scheduling jitter can't flake the median.
             let start = Instant::now();
             while start.elapsed() < self.query_delay {
                 std::hint::spin_loop();
@@ -289,8 +287,6 @@ mod tests {
         assert!(diffs > 8);
     }
 
-    /// Scheme that records every queried index. Used to prove the harness
-    /// does not overlap the warmup and measured index sets.
     struct RecordingScheme {
         indices: std::cell::RefCell<Vec<u64>>,
     }
@@ -321,11 +317,7 @@ mod tests {
 
     #[test]
     fn warmup_and_measured_indices_are_disjoint_under_sequential_pattern() {
-        // Sequential is the worst case: trial_idx i -> DB index i. If the
-        // harness started the measured loop at i=0 again, the first W
-        // measured indices would be identical to the warmup indices and the
-        // caches would be fully primed for them. This test pins that
-        // regression.
+        // Worst case: trial_idx i -> DB index i, so a measured loop restarting at 0 would re-prime warmup caches.
         let scheme = RecordingScheme::new();
         let cell = GridCell {
             entries_log2: 20,
@@ -361,12 +353,7 @@ mod tests {
 
     #[test]
     fn warmup_and_measured_indices_are_disjoint_under_randomised_pattern() {
-        // Not a hard requirement (random overlaps are possible), but the
-        // pseudo-random mapping uses trial_idx as input, so shifting the
-        // measured loop's start by warmup_queries WILL produce a disjoint
-        // prefix for small enough warmup+measured counts. This guards the
-        // fix from a future regression where someone reverts to `i` in the
-        // measured loop.
+        // Mapping keys on trial_idx, so shifting the measured start by warmup_queries yields a disjoint prefix at this scale.
         let scheme = RecordingScheme::new();
         let cell = GridCell {
             entries_log2: 20,
@@ -386,9 +373,6 @@ mod tests {
         let indices = scheme.indices.borrow().clone();
         let warmup_set: std::collections::BTreeSet<u64> = indices[..8].iter().copied().collect();
         let measured_set: std::collections::BTreeSet<u64> = indices[8..].iter().copied().collect();
-        // At this scale the trial-idx shift produces disjoint prefixes by
-        // construction. If this ever fails it means the measured loop
-        // regressed to starting trial_idx at 0.
         let overlap: Vec<u64> = warmup_set.intersection(&measured_set).copied().collect();
         assert!(
             overlap.is_empty(),
@@ -398,9 +382,7 @@ mod tests {
 
     #[test]
     fn harness_default_index_pattern_is_randomised() {
-        // The default harness config should not hit the sequential artefact
-        // by accident. This guards the default choice against silent
-        // regressions that would revert to 0, 1, 2, ...
+        // Guards against the default reverting to the sequential 0,1,2,... artefact.
         let cfg = HarnessConfig::default();
         match cfg.index_pattern {
             IndexPattern::Randomised { .. } => {}

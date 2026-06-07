@@ -196,45 +196,28 @@ struct GlobalSection {
     max_instance_count: Option<u32>,
     #[serde(default)]
     tree_fill_threshold: Option<f32>,
-    /// Optional WebSocket endpoint. When set, the chain indexer uses
-    /// `WsChainSource` as the primary transport and the configured
-    /// HTTP RPC (or pool) as automatic fallback; mode transitions
-    /// surface via `/v1/health/ready.chain_source_mode`.
+    /// WS primary transport; HTTP RPC (or pool) becomes automatic fallback.
     #[serde(default)]
     ws_endpoint: Option<String>,
-    /// Operator-tunable per-IP rate limit (requests per second).
-    /// `HttpConfig::demo()` ships 200; override here for production
-    /// deployments expecting heavier scrape / wallet traffic.
+    /// Per-IP rate limit (requests/sec); defaults to the `HttpConfig` value.
     #[serde(default)]
     rate_limit_rps: Option<u64>,
-    /// Operator-tunable per-IP burst budget (token bucket capacity).
-    /// `HttpConfig::demo()` ships 400.
+    /// Per-IP burst budget (token-bucket capacity).
     #[serde(default)]
     rate_limit_burst: Option<u32>,
-    /// Explicit CORS allow-origin list. Empty (default) leaves CORS
-    /// off entirely; non-empty enables CORS for the listed origins.
-    /// Wildcard `*` and empty strings are rejected at `HttpConfig`
-    /// validation. Required for browser wallet integrations.
+    /// CORS allow-origin list; empty leaves CORS off. `*` and empty strings are rejected.
     #[serde(default)]
     cors_allowed_origins: Option<Vec<String>>,
-    /// Trust `X-Forwarded-For` / `cf-connecting-ip` for the rate-
-    /// limit key extractor. Only safe behind a trusted reverse proxy
-    /// that strips client-supplied headers.
+    /// Trust `X-Forwarded-For` / `cf-connecting-ip`; only safe behind a trusted proxy.
     #[serde(default)]
     trust_proxy_header: Option<bool>,
-    /// Expose `/metrics` without bearer auth. Default `false`
-    /// (`HttpConfig::demo()` default-deny). Set `true` for a
-    /// scrape-only Prometheus instance reachable only via private
-    /// network.
+    /// Expose `/metrics` without bearer auth (default-deny).
     #[serde(default)]
     metrics_public: Option<bool>,
-    /// Periodic heartbeat session-eviction interval in seconds.
-    /// `HttpConfig::demo()` ships 3600. `0` disables.
+    /// Heartbeat session-eviction interval (seconds); `0` disables.
     #[serde(default)]
     session_eviction_interval_secs: Option<u64>,
-    /// Optional `(block_number, block_hash)` sidecar path for the
-    /// Layer 1 reorg-window cache. Persistent across restart; absent
-    /// = ephemeral cache (each boot rebuilds from RPC).
+    /// Layer 1 reorg-window cache sidecar; absent = ephemeral (rebuilt from RPC).
     #[serde(default)]
     reorg_window_path: Option<PathBuf>,
 }
@@ -359,12 +342,9 @@ pub struct MultiServeOptions {
     pub trust_proxy_header: Option<bool>,
     /// `HttpConfig.metrics_public` override.
     pub metrics_public: Option<bool>,
-    /// `HttpConfig.session_eviction_interval_secs` override (also drives the
-    /// per-instance heartbeat ticker in `serve_production_multi::run`).
+    /// `HttpConfig.session_eviction_interval_secs` override; also drives the per-instance ticker.
     pub session_eviction_interval_secs: Option<u64>,
-    /// Persistent path for the indexer Layer 1 reorg-window cache. Absent
-    /// = ephemeral. When set, the indexer worker bootstrapps from the
-    /// sidecar at open and rebuilds via RPC on stale-top mismatch.
+    /// Indexer Layer 1 reorg-window cache path; absent = ephemeral.
     pub reorg_window_path: Option<PathBuf>,
 }
 
@@ -540,7 +520,7 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         }
         Some(cfg)
     } else {
-        // Synthesize from the first chain-tree template so the driver wiring stays unchanged.
+        // Synthesize from the first chain-tree template so driver wiring is unchanged.
         parsed
             .instance_template
             .iter()
@@ -891,14 +871,9 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         *observer.lock() = Some(view);
     }
 
-    // Effective indexer floor: walk every chain-tree instance, take the
-    // MAX of (manifest_block_height, last_block_height) per tree, then
-    // compute `max(toml, recovered)` per tree. Without this map the
-    // single indexer cursor either silently re-scans the prefix below
-    // the recovered floor (toml = 0) OR silently SKIPS events for the
-    // lower-height instances when an operator picks
-    // `start_block = max(all manifest heights)`. Per-tree drop at the
-    // indexer's dispatch site closes both windows.
+    // Per-tree floor = max(toml, max(manifest_height, wal_height)). A single
+    // global floor would either re-scan below the recovered prefix or skip events
+    // for the lower-height trees; per-tree drop at dispatch closes both windows.
     let mut per_tree_recovered: BTreeMap<u32, u64> = BTreeMap::new();
     for h in &bootstrap.handles.instances {
         if let DataSourceFilter::ChainTreeNumber(tree) = h.config.data_source {
@@ -929,12 +904,8 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         }
     }
 
-    // Default reorg-window sidecar to a sibling of the first instance's
-    // data_dir so a restart resumes reorg state across operator restarts
-    // without forcing every operator to set `[global].reorg_window_path`.
-    // Operators wanting an explicit path keep the TOML override; those
-    // wanting purely ephemeral behaviour can point the sibling at an
-    // off-disk location.
+    // Default the reorg-window sidecar beside the first instance's data_dir so a
+    // restart resumes reorg state without forcing `[global].reorg_window_path`.
     let resolved_reorg_window_path = opts.reorg_window_path.clone().or_else(|| {
         bootstrap
             .handles
@@ -989,8 +960,8 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     let app_state =
         AppState::new(engine, http_config).map_err(|e| anyhow::anyhow!("AppState::new: {e}"))?;
 
-    // Registry Arc retained here so shutdown can drain auto-spawned consumer handles and signal
-    // ConsumerEvent::Shutdown — otherwise tasks skip the final-drive-on-shutdown WAL flush.
+    // Registry Arc retained so shutdown can drain auto-spawned consumers and send
+    // ConsumerEvent::Shutdown, else they skip the final-drive WAL flush.
     let auto_spawn_state: Option<AutoSpawnWiring> = if let Some(cfg) = opts
         .auto_spawn
         .as_ref()
@@ -1106,14 +1077,12 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         .collect();
     let app_state = app_state.with_instance_metrics(per_instance_metrics);
 
-    // Periodic session-map sweeper drops past-TTL entries even if the bearer
-    // never repeats. Cadence is 60 s; sweep cost is O(map size) under lock.
+    // Sweeper drops past-TTL session entries even if the bearer never repeats.
     let sweeper_handle = app_state.start_session_sweeper(std::time::Duration::from_secs(60));
     auxiliary_tasks.push(sweeper_handle);
 
-    // Per-instance heartbeat session eviction. `0` disables; default 3600 s
-    // bounds resident memory under sustained bearer churn at the cost of
-    // dropping every live session once per interval.
+    // Per-instance heartbeat eviction bounds resident memory by dropping every
+    // live session once per interval. `0` disables.
     let eviction_secs = app_state.config.session_eviction_interval_secs;
     if eviction_secs > 0 {
         for inst in &bootstrap.handles.instances {
@@ -1176,13 +1145,13 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     }
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), bootstrap.handles.router).await;
 
-    // Abort auxiliary tasks first so a SIGHUP can't race the driver/registry teardown.
+    // Abort aux tasks first so a SIGHUP can't race driver/registry teardown.
     for t in auxiliary_tasks {
         t.abort();
     }
 
-    // Drain consumers before aborting the driver to avoid racing registry drain against
-    // an in-flight tree-observed event.
+    // Drain consumers before aborting the driver, else registry drain races an
+    // in-flight tree-observed event.
     if let Some(wiring) = auto_spawn_state {
         let AutoSpawnWiring {
             driver,
@@ -1267,11 +1236,8 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         driver.abort();
     }
 
-    // Cooperative drain of the `mode_mirror` task so a panicked mirror
-    // surfaces as a join error in the log instead of being silently
-    // swallowed by `abort()`. The 5s timeout is generous given the
-    // 1s tick cadence; falls through to `abort()` via `Drop` on the
-    // worker JoinHandles themselves.
+    // Cooperative drain of `mode_mirror` so a panic surfaces as a logged join
+    // error instead of being swallowed by `abort()`.
     if let Some(mut workers) = chain_workers {
         workers
             .shutdown_mode_mirror(std::time::Duration::from_secs(5))
@@ -1356,8 +1322,8 @@ async fn run_sighup_reload_loop(
             );
         }
 
-        // Multiple chain-tree templates applied in order; last one wins. Each is logged so
-        // the operator can audit the sequence (silent-drop bug when > 1 template per SIGHUP).
+        // Multiple chain-tree templates apply in order, last wins; each is logged
+        // so > 1 template per SIGHUP is not silently dropped.
         let added: Vec<&InstanceTemplateToml> = opts
             .instance_templates
             .iter()
@@ -1428,19 +1394,10 @@ async fn run_sighup_reload_loop(
     }
 }
 
-/// Compute the indexer's effective `start_block` from the operator-
-/// supplied TOML floor and the per-instance recovered manifest heights.
-///
-/// Returns `max(toml_start_block, max(recovered))` so the indexer never
-/// scans events strictly below the slowest recovered baseline. On
-/// fresh-bootstrap (every recovered = 0) the result equals the TOML
-/// floor.
-///
-/// Single-tree (or single-floor) deployments may keep using this
-/// helper. Multi-instance deployments where instances bootstrapped at
-/// different heights MUST use [`compute_effective_start_block_per_tree`]
-/// instead: the global-MAX strategy would otherwise skip every event in
-/// `(min_recovered, max_recovered]` for the lower-height instances.
+/// `max(toml_start_block, max(recovered))` so the indexer never scans below the
+/// slowest recovered baseline. Single-floor deployments only: trees bootstrapped
+/// at different heights MUST use [`compute_effective_start_block_per_tree`], else
+/// the global MAX skips every event in `(min_recovered, max_recovered]`.
 #[must_use]
 pub fn compute_effective_start_block(
     toml_start_block: u64,
@@ -1450,20 +1407,9 @@ pub fn compute_effective_start_block(
     toml_start_block.max(max_recovered)
 }
 
-/// Compute the per-tree indexer start block when each instance owns a
-/// distinct chain `tree_number` and may have bootstrapped at a different
-/// recovered manifest height.
-///
-/// For each tree, returns `max(toml_start_block, recovered)` so an
-/// operator manual override never backslides. Trees with no recovered
-/// entry default to `toml_start_block` (fresh-bootstrap path).
-///
-/// The single-cursor indexer worker scans from `min(per_tree)` and the
-/// route layer drops events for trees whose effective floor is higher
-/// than the event's block height. Without this map, a 3-instance
-/// deployment at `{25M, 24M, 23M}` running under the MAX strategy from
-/// [`compute_effective_start_block`] would start the indexer at 25M
-/// and miss every event in `(24M, 25M]` for the lower-height instances.
+/// Per-tree `max(toml_start_block, recovered)` so a manual override never
+/// backslides. The single-cursor indexer scans from `min(per_tree)` and the
+/// route layer drops events for trees whose floor exceeds the event height.
 #[must_use]
 pub fn compute_effective_start_block_per_tree(
     toml_start_block: u64,
@@ -1486,7 +1432,7 @@ pub fn compute_trigger_threshold(threshold: f32, tree_max_items: u32) -> usize {
     if rounded >= f64::from(tree_max_items) {
         return tree_max_items as usize;
     }
-    // `as u64` sound: u64 covers every finite f64 < 2^53; upper-bound check excludes values >= u32::MAX.
+    // `as u64` sound: rounded is finite, > 0, and < tree_max_items <= u32::MAX.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let rounded_u64 = rounded as u64;
     usize::try_from(rounded_u64).unwrap_or(0)
@@ -1632,7 +1578,7 @@ fn wire_auto_spawn(
 
     let runtime = runtime_from_auto_spawn_section(cfg, opts.entries);
 
-    // Spawn log co-located with the first instance's data_dir so it survives restarts.
+    // Spawn log beside the first instance's data_dir so it survives restarts.
     let spawn_log_dir = match initial_handles.first() {
         Some(h) => h
             .config
@@ -1868,14 +1814,11 @@ fn bootstrap_instances(
 struct ChainWorkers {
     handle: tokio::task::JoinHandle<()>,
     rpc_pool: Option<Arc<raven_railgun_indexer::rpc_pool::RpcEndpointPool>>,
-    /// Live mode flag for `/v1/health/ready.chain_source_mode`.
-    /// `Some` when `--ws-endpoint` is set (WS auto-fallback active).
+    /// Mode flag for `/v1/health/ready.chain_source_mode`; `Some` when WS is set.
     chain_source_mode: Option<Arc<raven_railgun_indexer::ModeFlag>>,
-    /// Background task that polls the `AutoFallbackChainSource.mode()`
-    /// at 1 s ticks and writes through to `chain_source_mode`.
+    /// Polls `AutoFallbackChainSource.mode()` and writes through to `chain_source_mode`.
     mode_mirror: Option<tokio::task::JoinHandle<()>>,
-    /// Cooperative shutdown signal for `mode_mirror`. Always present;
-    /// the receiver in the spawned task observes `true` and exits.
+    /// Cooperative shutdown signal for `mode_mirror`.
     mode_mirror_shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
@@ -1929,8 +1872,7 @@ async fn spawn_chain_indexer(
         Ok(pool)
     };
 
-    // (mode_mirror_shutdown_tx, mode_mirror_shutdown_rx) — always created;
-    // the receiver is only used by `spawn_mode_mirror` when WS is active.
+    // Always created; the receiver is only used by `spawn_mode_mirror` under WS.
     let (mode_mirror_shutdown_tx, mode_mirror_shutdown_rx) = tokio::sync::watch::channel(false);
 
     let (chain_source, rpc_pool, chain_source_mode, mode_mirror) =
@@ -2045,9 +1987,7 @@ async fn spawn_chain_indexer(
     })
 }
 
-/// Sample cadence for the `mode_mirror` task: 1 second keeps
-/// `/v1/health/ready.chain_source_mode`
-/// within one sample of the underlying `AutoFallbackChainSource` state.
+/// `mode_mirror` sample cadence: keeps `chain_source_mode` within one tick of the source.
 const MODE_MIRROR_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn spawn_mode_mirror_single(
@@ -2107,11 +2047,8 @@ fn spawn_mode_mirror_pooled(
 }
 
 impl ChainWorkers {
-    /// Cooperative shutdown of the `mode_mirror` task. Falls back to
-    /// `abort()` on timeout. Caller awaits the returned future before
-    /// dropping `Self` to avoid an unconditional `JoinHandle::abort()`
-    /// that hides panics from observation. Returns `true` if the task
-    /// observed the signal and exited cleanly, `false` on timeout.
+    /// Cooperative shutdown of `mode_mirror`; await before dropping `Self` so a
+    /// panic is observed rather than hidden by `Drop`'s `abort()`. `false` on timeout.
     async fn shutdown_mode_mirror(&mut self, timeout: std::time::Duration) -> bool {
         let Some(handle) = self.mode_mirror.take() else {
             return true;
@@ -2171,11 +2108,7 @@ fn spawn_mirror_workers(
         if let DataSourceFilter::PpoiList(list_key) = inst.config.data_source {
             let mirror_clone = Arc::clone(&mirror);
             let tx = mirror_tx.clone();
-            // Per-instance cursor sidecar in the instance data_dir.
-            // Kind dispatch: per-list-path encoders own the path
-            // sidecar; per-list-status / per-list-node and any
-            // other encoder fall through to the status sidecar.
-            // Status / path advance independently after a restart.
+            // per-list-path owns the path sidecar; every other kind uses status.
             let kind = match inst.config.encoder {
                 EncoderKind::PerListPath { .. } => MirrorKind::Path,
                 _ => MirrorKind::Status,

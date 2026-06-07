@@ -116,7 +116,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 /// Positive: ETag header is `"<sha256-hex>"` of the full body bytes,
 /// emitted alongside `Cache-Control: public, max-age=86400, immutable`
-/// and `Vary: Authorization` — the headers Cloudflare needs to cache
+/// and `Vary: Authorization`: the headers Cloudflare needs to cache
 /// the body across origin epoch boundaries.
 #[tokio::test]
 async fn params_handler_emits_etag_and_immutable_cache_control() {
@@ -276,8 +276,8 @@ async fn params_handler_invalidates_etag_on_epoch_bump() {
 
     // Build a fresh InspireServerState and swap_state-bump the epoch.
     // The new state is bit-for-bit different from the boot state
-    // (different DB contents) so the body bytes — and therefore the
-    // SHA-256 — must differ.
+    // (different DB contents) so the body bytes, and therefore the
+    // SHA-256, must differ.
     let params = InspireParams::secure_128_d2048();
     let db_v2: Vec<u8> = (0..TOY_ENTRIES)
         .flat_map(|i| {

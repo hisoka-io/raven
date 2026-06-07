@@ -238,12 +238,7 @@ mod tests {
         assert!(json.contains("\"client_time_ms\":0.2"));
     }
 
-    /// Deserialise a handwritten JSON fragment shaped like upstream's
-    /// `schema_v2.jsonc` benchmark entries and verify our types accept it.
-    ///
-    /// This is the other half of the roundtrip: if upstream adds or renames
-    /// a field that our types depend on (e.g. Dropping `num_entries_label`),
-    /// the test fails here and we learn about it before publishing numbers.
+    // Fails if upstream renames or drops a field our types depend on.
     #[test]
     fn deserialize_upstream_shaped_config_fragment() {
         let json = r#"{

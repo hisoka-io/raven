@@ -1,25 +1,5 @@
-/**
- * Per-network operator endpoints + SDK validation tests.
- *
- * Per `shared-models/src/models/network-config.ts` Railgun runs on:
- *   - Ethereum mainnet (chain id 1)
- *   - Sepolia       (11155111)
- *   - BSC           (56)
- *   - Polygon       (137)
- *   - Arbitrum      (42161)
- *
- * The SDK does not bake in chain IDs; each operator deployment
- * exposes its own chain-id config (operator chooses one per
- * deployment). The wallet wires `endpoint` per chain. We exercise
- * the mock-server pattern across each chain to lock that the SDK is
- * chain-agnostic. A mismatch test verifies that a wallet pointing
- * at the wrong operator gets a typed error rather than silently
- * accepting wrong-chain data.
- *
- * Validation tests document the SDK's current acceptance shape so
- * future tightening (e.g. hex-length checks) is a deliberate
- * reviewable change rather than a silent contract widening.
- */
+// Locks the SDK as chain-agnostic: chain ids are not baked in, the wallet wires
+// `endpoint` per chain. Chain list per shared-models/src/models/network-config.ts.
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
@@ -55,10 +35,6 @@ describe("per-network deployments + validation", () => {
 
   for (const net of NETWORKS) {
     it(`SDK works against a ${net.name} (chain ${net.chainId}) operator`, async () => {
-      // Operator surfaces its chain via response payload — wallets
-      // can verify by reading the status route. This test confirms
-      // the SDK can round-trip data tagged with the network's chain
-      // id without tripping any client-side filter.
       server.route(
         (req) => req.url === "/v1/poi/pois-per-list",
         (_req, _body, res) => {
@@ -87,13 +63,7 @@ describe("per-network deployments + validation", () => {
   }
 
   it("operator chain-id mismatch surfaces via response inspection (test-side check)", async () => {
-    // The SDK does not currently verify chain-id; the wallet
-    // integrator is expected to read `X-Raven-Chain-Id` from the
-    // status route and bail before issuing PIR queries against the
-    // wrong network. This regression-guard test documents that
-    // current behavior so a future contract tightening (SDK-side
-    // chain-id verification) lands as a deliberate change rather
-    // than a silent shift.
+    // Documents that the SDK does not verify chain-id; the wallet must read X-Raven-Chain-Id out-of-band.
     server.route(
       (req) => req.url === "/v1/poi/pois-per-list",
       (_req, _body, res) => {
@@ -113,7 +83,6 @@ describe("per-network deployments + validation", () => {
       bearerToken: TOKEN,
       useClientPir: false,
     });
-    // SDK accepts; wallet integrator MUST verify out-of-band.
     await expect(
       sdk.getPOIsPerList(
         [LIST_KEY_HEX],
@@ -127,9 +96,7 @@ describe("per-network deployments + validation", () => {
       endpoint: "http://localhost:8080/",
       bearerToken: TOKEN,
     });
-    // No way to inspect endpoint directly; trigger a request that
-    // would fail the path concatenation if the trailing slash had
-    // leaked.
+    // endpoint is private; a leaked trailing slash would break path concatenation on use.
     expect(() => sdk).not.toThrow();
   });
 
@@ -157,8 +124,6 @@ describe("per-network deployments + validation", () => {
     server.route(
       (req) => req.url === "/v1/poi/pois-per-list",
       (_req, _body, res) => {
-        // Outer-key is BC; with no BCs in the request the response
-        // is an empty object, mirroring upstream POIsPerListMap.
         writeJson(res, {});
         return true;
       },
@@ -219,7 +184,6 @@ describe("per-network deployments + validation", () => {
     let callCount = 0;
     const customFetch: typeof fetch = async (url, init) => {
       callCount += 1;
-      // Defer to native fetch so the request actually hits the mock.
       return fetch(url, init);
     };
     server.route(

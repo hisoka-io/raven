@@ -1,35 +1,8 @@
-/**
- * Client-side IMT (Incremental Merkle Tree) node cache.
- *
- * Layered to handle both browser-wallet and Node-test environments:
- * - **IndexedDB** is preferred when the runtime exposes
- *   `globalThis.indexedDB` (modern browsers, desktop wallets backed by
- *   electron, hybrid mobile webviews).
- * - **In-memory** fallback always available; used by Node tests and as
- *   the L1 layer in browsers (so a cache hit doesn't have to await an
- *   async IndexedDB transaction every time).
- *
- * Cache keys are tuples (encoded as string) keyed on the chain ID,
- * tree number (commit-tree) or list_key hex (per-list), level, and
- * idx-at-level. The flat-global-index could be used directly but
- * (level, idx_at_level) is the wallet's natural lookup key from
- * `path_indices_for_leaf` (the wallet computes the sibling indices,
- * not the flat layout).
- *
- * Invalidation: the cache is parameterised by an opaque "epoch tag"
- * (Raven's `X-Raven-Epoch` header) AND a wire-schema-version tag
- * (`X-Raven-Schema-Version`). Either advancing in the response from
- * the server clears the cache slice for the affected chain ID.
- */
+/** Two-layer IMT node cache: synchronous in-memory L1 over an optional IndexedDB L2. */
 
 const ASYNC_TIMEOUT_MS = 5000;
 
-/**
- * Bounded in-memory LRU. Backed by `Map` (insertion-order iteration);
- * on overflow the oldest key is evicted. The whole cache occupies at
- * most `capacity` entries × 32 byte values = 32 KB at the default
- * 1024 entries.
- */
+/** Bounded LRU backed by `Map` insertion order; evicts oldest on overflow. */
 class InMemoryLru {
   private readonly map: Map<string, Uint8Array> = new Map();
   private readonly capacity: number;
@@ -41,7 +14,7 @@ class InMemoryLru {
   get(key: string): Uint8Array | undefined {
     const v = this.map.get(key);
     if (v !== undefined) {
-      // Touch: re-insert to move to back (Map preserves insertion order).
+      // re-insert to mark most-recently-used (Map keeps insertion order)
       this.map.delete(key);
       this.map.set(key, v);
     }
@@ -54,7 +27,6 @@ class InMemoryLru {
     }
     this.map.set(key, value);
     if (this.map.size > this.capacity) {
-      // Evict oldest.
       const oldestKey = this.map.keys().next().value;
       if (oldestKey !== undefined) {
         this.map.delete(oldestKey);
@@ -71,10 +43,7 @@ class InMemoryLru {
   }
 }
 
-/**
- * Optional IndexedDB-backed L2. Constructed lazily only if the runtime
- * exposes an `indexedDB` global; otherwise stays as a no-op shim.
- */
+/** Optional IndexedDB-backed L2; null when the runtime lacks `indexedDB`. */
 interface IndexedDbBacking {
   get(key: string): Promise<Uint8Array | undefined>;
   set(key: string, value: Uint8Array): Promise<void>;
@@ -86,7 +55,6 @@ function makeIndexedDbBacking(dbName: string): IndexedDbBacking | null {
   if (!idb) {
     return null;
   }
-  // Open on first use.
   let dbPromise: Promise<IDBDatabase> | null = null;
   function openDb(): Promise<IDBDatabase> {
     if (dbPromise) return dbPromise;
@@ -169,11 +137,7 @@ function makeIndexedDbBacking(dbName: string): IndexedDbBacking | null {
   };
 }
 
-/**
- * Compose a cache key from `(chainId, scope, level, idxAtLevel,
- * epochTag, schemaVersion)`. `scope` is either `tree-N` for a commit
- * tree or `list-<hex>` for a per-list PPOI tree.
- */
+/** Cache key over `(chainId, scope, level, idxAtLevel, epochTag, schemaVersion)`; `scope` is `tree-N` or `list-<hex>`. */
 export function imtCacheKey(parts: {
   chainId: number;
   scope: string;
@@ -192,10 +156,7 @@ export function imtCacheKey(parts: {
   ].join("|");
 }
 
-/**
- * Configurable IMT cache with a synchronous in-memory L1 and an
- * optional async IndexedDB L2.
- */
+/** Construction options for [`ImtCache`]. */
 export interface ImtCacheConfig {
   /** Opaque cache namespace; allows unrelated SDK instances to coexist. */
   readonly namespace?: string;
@@ -216,19 +177,12 @@ export class ImtCache {
     this.idb = config.disableIndexedDb ? null : makeIndexedDbBacking(`raven-imt-cache-${config.namespace ?? "default"}`);
   }
 
-  /**
-   * Synchronous fast-path. Returns the cached node hash bytes if
-   * present in the in-memory layer; otherwise undefined. Callers
-   * must NOT block on this; use `getAsync` to also probe IDB.
-   */
+  /** Synchronous L1-only lookup; use `getAsync` to also probe IDB. */
   getSync(key: string): Uint8Array | undefined {
     return this.memory.get(key);
   }
 
-  /**
-   * Probe both layers; falls through to IDB on a memory miss.
-   * Promotes IDB hits into memory before returning.
-   */
+  /** Probe both layers; promotes IDB hits into memory. */
   async getAsync(key: string): Promise<Uint8Array | undefined> {
     const m = this.memory.get(key);
     if (m !== undefined) return m;
@@ -240,16 +194,11 @@ export class ImtCache {
       }
       return v;
     } catch {
-      // IDB transient failure: fall through to memory-only behaviour.
       return undefined;
     }
   }
 
-  /**
-   * Insert into both layers. The IDB write is fire-and-forget so
-   * callers don't need to await it on the hot path; rejections are
-   * swallowed (the cache is best-effort, not authoritative).
-   */
+  /** Insert into both layers; the IDB write is best-effort fire-and-forget. */
   set(key: string, value: Uint8Array): void {
     this.memory.set(key, value);
     if (this.idb) {
@@ -257,11 +206,7 @@ export class ImtCache {
     }
   }
 
-  /**
-   * Note the latest epoch + schema version observed from a server
-   * response. If either has advanced, drop both cache layers so a
-   * stale node can't survive a server-side reorg or schema bump.
-   */
+  /** Drop both layers if epoch or schema version advanced, so no stale node survives a reorg/schema bump. */
   noteFreshness(epochTag: string, schemaVersion: number): void {
     if (epochTag === this.currentEpochTag && schemaVersion === this.currentSchemaVersion) {
       return;
@@ -274,9 +219,7 @@ export class ImtCache {
     }
   }
 
-  /**
-   * Force-drop both cache layers. Test helper.
-   */
+  /** Force-drop both cache layers. */
   async clearAll(): Promise<void> {
     this.memory.clear();
     if (this.idb) {

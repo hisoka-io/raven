@@ -16,40 +16,28 @@ use crate::GridCell;
 pub enum TrialOutcome {
     /// The decoded value matched the reference.
     Correct,
-    /// The decoded value differed from the reference. The scheme did not
-    /// detect this. That is precisely the silent-failure mode we measure.
+    /// Decoded value differed and the scheme did not detect it; the measured failure mode.
     SilentMismatch,
-    /// The scheme surfaced an explicit error (query failed, decode rejected,
-    /// etc.). Counted separately because it is NOT a silent failure.
+    /// Scheme surfaced an explicit error; counted apart from silent failures.
     ExplicitError,
 }
 
-/// Inputs passed to each trial. The scheme uses these to derive any internal
-/// randomness deterministically so failing trials can be reproduced.
+/// Inputs for one trial; schemes derive all randomness from `seed` for reproducibility.
 #[derive(Debug, Clone, Copy)]
 pub struct TrialInput {
     /// Monotonic trial index in `[0, config.trials)`.
     pub trial_idx: u64,
-    /// Caller-supplied seed for this trial. Schemes should derive all internal
-    /// randomness from this seed (e.g. `ChaCha20Rng::seed_from_u64(seed)`) so
-    /// that reproducing a failing trial requires only the seed.
+    /// Seed all per-trial randomness so a failing trial reproduces from the seed alone.
     pub seed: u64,
     /// Index the client queries on this trial.
     pub index: u64,
 }
 
 /// A PIR scheme under noise-validation bench.
-///
-/// The scheme is set up once (hint, parameters) and then queried
-/// `config.trials` times. The harness never inspects the scheme's internal
-/// noise accounting. It only cares whether each trial returned the correct
-/// plaintext.
 pub trait NoiseValidatable {
-    /// Execute one trial end-to-end (query generation, server response,
-    /// client decode, comparison against the reference oracle).
+    /// Run one trial end-to-end and compare against the reference oracle.
     ///
-    /// Implementations MUST be deterministic in `TrialInput::seed` so the
-    /// harness can reproduce mismatches by seed alone.
+    /// MUST be deterministic in `TrialInput::seed` so mismatches reproduce by seed alone.
     fn run_trial(&self, input: TrialInput) -> TrialOutcome;
 }
 
@@ -58,15 +46,11 @@ pub trait NoiseValidatable {
 pub struct NoiseBenchConfig {
     /// Grid cell under measurement (db shape).
     pub cell: GridCell,
-    /// Number of trials to run. Higher is more statistical power but more
-    /// wall time. A typical default is `1_000_000` per cell.
+    /// Number of trials to run; more trials buy statistical power at wall-clock cost.
     pub trials: u64,
-    /// Base seed. Trial `i` uses seed `base_seed ^ (i as u64).rotate_left(32)`
-    /// so seeds are independent but reproducible.
+    /// Base seed; trial `i` uses `base_seed ^ (i).rotate_left(32)`.
     pub base_seed: u64,
-    /// Index stride pattern: if `Some(k)`, trial `i` queries index `(i * k) mod n`.
-    /// If `None`, the harness picks uniformly random indices derived from `base_seed`.
-    /// Deterministic stride is preferred when reproducing specific failures.
+    /// `Some(k)`: trial `i` queries `(i*k) mod n`. `None`: reproducible pseudo-random index.
     pub index_stride: Option<u64>,
 }
 
@@ -86,8 +70,7 @@ impl NoiseBenchConfig {
         match self.index_stride {
             Some(stride) if stride != 0 => trial_idx.wrapping_mul(stride) % n.max(1),
             _ => {
-                // SplitMix-style stride from the base seed; avoids needing an
-                // extra RNG when the caller just wants "something reproducible".
+                // SplitMix-style stride; reproducible without a separate RNG.
                 let mut h = self.base_seed ^ trial_idx;
                 h = h.wrapping_mul(0x9E37_79B9_7F4A_7C15);
                 h ^= h >> 32;
@@ -99,10 +82,7 @@ impl NoiseBenchConfig {
 
 /// Result of a noise-validation run.
 ///
-/// Reports raw counts plus a Wilson-interval upper bound on the silent-mismatch
-/// rate, which is what drives the risk-register cap. Wilson is used rather
-/// than normal-approximation because the observed failure count can be zero
-/// and Wilson degrades gracefully.
+/// Wilson upper bound rather than normal-approximation: it degrades gracefully at zero observed failures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NoiseBenchReport {
     /// Configuration the run used.
@@ -115,21 +95,14 @@ pub struct NoiseBenchReport {
     pub explicit_errors: u64,
     /// Point estimate of silent-failure rate: `silent_mismatches / trials`.
     pub silent_failure_rate: f64,
-    /// Wilson upper confidence bound on the silent-failure rate at z = 1.96
-    /// (i.e. A one-sided upper 97.5% confidence, equivalently the upper end
-    /// of a two-sided 95% interval). The more conservative choice of z keeps
-    /// the cap safer when observed failure counts are small.
+    /// Wilson upper bound on the silent-failure rate at z = 1.96 (one-sided 97.5%).
     pub silent_failure_wilson_upper_97_5: f64,
 }
 
 impl NoiseBenchReport {
-    /// Build a report from raw counts + the supplied configuration.
-    ///
-    /// `trials` MUST be positive; callers are responsible for not producing
-    /// empty runs.
+    /// Build a report from raw counts and the supplied configuration.
     #[must_use]
     pub fn summarize(config: NoiseBenchConfig, trials: u64, silent: u64, explicit: u64) -> Self {
-        // Guard: the harness must never submit zero trials.
         let trials = trials.max(1);
         let silent = silent.min(trials);
         #[allow(clippy::cast_precision_loss)]
@@ -245,7 +218,6 @@ mod tests {
 
     #[test]
     fn wilson_upper_bound_is_1_for_all_failures() {
-        // When every trial fails, the upper bound hits the unit boundary.
         let w = wilson_upper_95(100, 100);
         assert!(w > 0.95);
         assert!(w <= 1.0);
@@ -276,8 +248,6 @@ mod tests {
         assert!((r.silent_failure_rate - 1.0).abs() < 1e-9);
     }
 
-    // A scheme that reports `Correct` on every trial; used to sanity-check
-    // the harness loop without any real crypto.
     struct AlwaysCorrect;
     impl NoiseValidatable for AlwaysCorrect {
         fn run_trial(&self, _: TrialInput) -> TrialOutcome {
@@ -285,7 +255,6 @@ mod tests {
         }
     }
 
-    // A scheme that fails silently every Nth trial (deterministic by trial_idx).
     struct EveryNthSilentMismatch {
         n: u64,
     }
@@ -326,7 +295,6 @@ mod tests {
         let r = run_noise_bench(&EveryNthSilentMismatch { n: 10 }, cfg);
         assert_eq!(r.silent_mismatches, 100);
         assert!((r.silent_failure_rate - 0.1).abs() < 1e-12);
-        // Wilson upper bound is > observed rate.
         assert!(r.silent_failure_wilson_upper_97_5 > 0.1);
     }
 }

@@ -190,7 +190,7 @@ async fn subsequent_batch_succeeds_after_a_timeout_race() {
     );
 
     // Second batch: all fast. Must succeed even though the first batch's slow worker
-    // is still mid-sleep — permits must have been released on the first batch's timeout.
+    // is still mid-sleep; permits must have been released on the first batch's timeout.
     let queries_second: Vec<SlowQuery> = (0..16)
         .map(|i| SlowQuery {
             slow: false,

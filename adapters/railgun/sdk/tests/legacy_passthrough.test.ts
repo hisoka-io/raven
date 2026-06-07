@@ -1,18 +1,7 @@
 /**
- * Legacy plaintext-BC fallback path tests.
- *
- * When `useClientPir: false`, the SDK MUST hit the wallet-shim
- * routes (`POST /v1/poi/pois-per-list`, `POST /v1/poi/merkle-proofs`,
- * `POST /v1/commit-tree/:n/merkle-proof`) with the BCs serialized
- * into the JSON body. Tests here lock that wire shape so wallets
- * deployed against the shim know exactly what to expect, and the
- * privacy-baseline regression-guard test in
- * `privacy_invariant.test.ts` keeps proving the legacy path leaks.
- *
- * Per-event-type and per-status-enum coverage is folded in: the
- * shim currently serves the same JSON wire shape regardless of the
- * BlindedCommitmentType field, so the SDK's outbound body is the
- * stable contract.
+ * Legacy plaintext-BC fallback tests. With `useClientPir: false` the SDK hits
+ * the wallet-shim routes with BCs serialized into the JSON body; these lock
+ * that wire shape.
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -44,13 +33,7 @@ describe("legacy plaintext fallback paths", () => {
     server.reset();
   });
 
-  // 4 tests for each Railgun event type — Shield, Transact,
-  // Unshield. The fourth ("Nullified") is not a BlindedCommitmentType
-  // in upstream's enum (Nullified events kill leaves; the BC for the
-  // killed leaf was a Shield/Transact one), so we use Shield twice
-  // for round-trip parity (different bc bytes, same type field) to
-  // round out a 4-test set.
-
+  // Shield/Transact/Unshield; Nullified is not a BlindedCommitmentType, so Shield repeats to round out 4
   for (const [name, type, bc] of [
     ["Shield", "Shield", BC_VALID],
     ["Transact", "Transact", BC_BLOCKED],
@@ -89,8 +72,7 @@ describe("legacy plaintext fallback paths", () => {
     });
   }
 
-  // 4 PPOI status enum round-trips. Outer key is BC, inner is
-  // listKey, mirroring upstream POIsPerListMap shape.
+  // PPOI status enum round-trips; outer key BC, inner listKey (upstream POIsPerListMap shape)
   for (const [status, bc] of [
     ["Valid", BC_VALID],
     ["ShieldBlocked", BC_BLOCKED],
@@ -122,7 +104,6 @@ describe("legacy plaintext fallback paths", () => {
     });
   }
 
-  // Multi-input tests: N=1, N=2, N=4, N=13.
   for (const n of [1, 2, 4, 13]) {
     it(`getPOIMerkleProofs legacy mode N=${n} fetches N proofs`, async () => {
       const bcs = Array.from({ length: n }, (_, i) =>
@@ -213,8 +194,7 @@ describe("legacy plaintext fallback paths", () => {
   });
 
   it("legacy mode propagates upstream fallback URL when freshness is below floor", async () => {
-    // primary returns very-low confidence in the freshness header;
-    // SDK MUST then call the upstream passthrough path.
+    // low-confidence freshness header forces the upstream passthrough
     server.route(
       (req) => req.url === "/v1/poi/pois-per-list",
       (_req, _body, res) => {
@@ -228,8 +208,7 @@ describe("legacy plaintext fallback paths", () => {
         return true;
       },
     );
-    // Upstream path: /pois-per-list/<chainType>/<chainID>
-    // per private-proof-of-innocence/packages/node/src/api/api.ts:713
+    // upstream /pois-per-list/<chainType>/<chainID> (private-proof-of-innocence node api.ts)
     server.route(
       (req) => req.url === "/pois-per-list/0/1",
       (_req, _body, res) => {
@@ -249,7 +228,7 @@ describe("legacy plaintext fallback paths", () => {
       [{ blindedCommitment: BC_VALID, type: "Shield" }],
     );
     expect(got[BC_VALID][LIST_KEY_HEX]).toBe("Valid");
-    // Two wire requests: primary then upstream passthrough.
+    // primary then upstream passthrough
     expect(sdk.lastWireRequests().length).toBe(2);
   });
 
@@ -257,7 +236,7 @@ describe("legacy plaintext fallback paths", () => {
     server.route(
       (req) => req.url === "/v1/poi/pois-per-list",
       (_req, _body, res) => {
-        // No freshness header at all.
+        // no freshness header
         writeJson(res, { [BC_VALID]: { [LIST_KEY_HEX]: "Valid" } });
         return true;
       },
@@ -265,7 +244,6 @@ describe("legacy plaintext fallback paths", () => {
     server.route(
       (req) => req.url === "/pois-per-list/0/1",
       (_req, _body, _res) => {
-        // If this route fires, the test fails. Throw to catch it.
         throw new Error("upstream passthrough unexpectedly invoked");
       },
     );
@@ -293,8 +271,7 @@ describe("legacy plaintext fallback paths", () => {
         return true;
       },
     );
-    // Upstream path: /merkle-proofs/<chainType>/<chainID>
-    // per private-proof-of-innocence/packages/node/src/api/api.ts:739
+    // upstream /merkle-proofs/<chainType>/<chainID> (private-proof-of-innocence node api.ts)
     server.route(
       (req) => req.url === "/merkle-proofs/0/1",
       (_req, _body, res) => {

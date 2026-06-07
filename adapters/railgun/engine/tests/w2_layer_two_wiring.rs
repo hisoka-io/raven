@@ -1,7 +1,6 @@
-//! Workstream H closure for Layer 2 root-verifier wiring into the
-//! orchestrator's `drive_commit` loop. Locks: per-commit verify on
-//! ChainRootHistory; OutOfSync cascade through `apply_reorg`;
-//! UpstreamSignature instances never call the verifier.
+//! Layer 2 root-verifier wiring into the orchestrator's `drive_commit`
+//! loop. Locks: per-commit verify on ChainRootHistory; OutOfSync cascade
+//! through `apply_reorg`; UpstreamSignature instances never call the verifier.
 
 #![allow(
     clippy::expect_used,
@@ -27,20 +26,14 @@ use raven_railgun_indexer::{BlockId, ChainSource, IndexerError, Result as Indexe
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-w2-layer2-test";
 
-/// Synthetic [`ChainSource`] for verifier wiring tests. Returns
-/// `InSync` for the first `flip_after_calls` rounds, then `OutOfSync`
-/// (fixed `[0xee; 32]` root) so the active-tree branch sees rootHistory
-/// hit but merkle_root mismatch.
+// returns InSync for `flip_after_calls` rounds, then OutOfSync (root [0xee; 32])
 struct SyntheticChainSource {
     verify_calls: AtomicU64,
     merkle_root_calls: AtomicU64,
     root_history_calls: AtomicU64,
     active_tree_calls: AtomicU64,
     flip_after_calls: u64,
-    // Verifier runs `root_history(tree, local_root)` BEFORE
-    // `merkle_root()`; caching the value here lets the synthetic
-    // `merkle_root()` return the in-sync match without mirroring the
-    // engine's IMT in the test.
+    // verifier calls root_history before merkle_root; caching the root lets merkle_root match without mirroring the engine IMT
     last_seen_root: parking_lot::Mutex<[u8; 32]>,
 }
 
@@ -118,8 +111,7 @@ fn build_toy_state() -> raven_railgun_core::Result<InspireServerState> {
 
 fn canonical_commitment(byte: u8) -> [u8; 32] {
     let mut b = [0u8; 32];
-    // High byte must be < 0x30 to keep the value Fr-canonical for the
-    // IMT's Poseidon hash; differentiate via the low byte.
+    // high byte < 0x30 keeps the value Fr-canonical for the IMT's Poseidon hash
     b[31] = byte;
     b
 }
@@ -149,11 +141,7 @@ async fn layer2_verifier_fires_per_commit_and_cascades_reorg_on_out_of_sync() {
     let params = InspireParams::secure_128_d2048();
     let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
 
-    // 50 single-leaf Transacts at blocks 100..150; every event triggers
-    // a commit (max_appends_per_snapshot = 1) and the verifier fires
-    // (cadence_n = 1). The synthetic source stashes the root the
-    // verifier passes to `root_history` and returns it from
-    // `merkle_root()`, so we don't thread roots through a side channel.
+    // every event triggers a commit (max_appends_per_snapshot=1) and a verify (cadence_n=1)
     for i in 0..50u32 {
         let height = 100 + u64::from(i);
         let leaf = canonical_commitment(u8::try_from((i & 0xff) | 0x01).expect("byte"));
@@ -176,11 +164,7 @@ async fn layer2_verifier_fires_per_commit_and_cascades_reorg_on_out_of_sync() {
             .expect("send leaf");
     }
 
-    // First 5 leaves verify InSync; the 6th flips and cascades a
-    // synthetic Reorg(104) through `apply_reorg`. Asserting on
-    // `reorgs_handled >= 1` rather than full drain because the cascade
-    // is the load-bearing post-condition (post-cascade leaf appends are
-    // rejected as non-contiguous, so events_processed stalls).
+    // assert on reorgs_handled, not full drain: post-cascade appends are rejected as non-contiguous, so events_processed stalls
     let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         let m = *handle.metrics.lock();
@@ -198,7 +182,6 @@ async fn layer2_verifier_fires_per_commit_and_cascades_reorg_on_out_of_sync() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // Final tick for the verifier to run on trailing commits.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let verify_calls = chain_source.verify_count();
@@ -220,14 +203,13 @@ async fn layer2_verifier_fires_per_commit_and_cascades_reorg_on_out_of_sync() {
         "post-cascade leaf_count must be <= 5 (the flip-window survivor); got {post_cascade_count}"
     );
 
-    // Leaf at index 0 landed at block 100 <= last_in_sync_height = 104.
+    // leaf 0 landed at block 100 <= last_in_sync_height (104)
     assert!(
         handle.logical_store.lock().leaf(0, 0).is_some(),
         "leaf at index 0 must survive the cascade",
     );
 
-    // root_history must be consulted at least once per verify cycle
-    // (anchor-threading regression guard).
+    // root_history once per verify cycle: anchor-threading regression guard
     let history_calls = chain_source.root_history_count();
     assert!(
         history_calls >= verify_calls,
@@ -245,9 +227,7 @@ async fn layer2_verifier_fires_per_commit_and_cascades_reorg_on_out_of_sync() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn layer2_verifier_does_not_fire_on_upstream_signature_instance() {
     let dir = tempfile::tempdir().expect("tempdir");
-    // flip_after_calls = 0: fail on first verify call. If the verifier
-    // fires for an UpstreamSignature instance, verify_count() > 0
-    // catches it immediately.
+    // flip_after_calls=0 fails on the first verify; any verify on an UpstreamSignature instance trips it
     let chain_source = Arc::new(SyntheticChainSource::new(0));
 
     let mut config = OrchestratorConfig::demo(dir.path().to_path_buf(), "w2-ppoi-regression");
@@ -286,10 +266,7 @@ async fn layer2_verifier_does_not_fire_on_upstream_signature_instance() {
             .expect("send");
     }
 
-    // 30 s deadline gives debug-mode consumer the headroom it needs to
-    // drain 10 events while other tests in the same binary share the
-    // tokio scheduler. Release-mode + isolated runs drain in ~1 s; the
-    // deadline is a deadlock detector, not a throughput floor.
+    // 30s deadline is a deadlock detector, not a throughput floor (debug + shared scheduler headroom)
     let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let m = *handle.metrics.lock();

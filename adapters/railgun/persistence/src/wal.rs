@@ -1,7 +1,7 @@
 //! Append-only crc32-framed write-ahead log.
 //!
 //! Frame layout: `[seq u64 BE | block_height u64 BE | payload_len u32 BE | crc32 u32 BE | payload]`.
-//! CRC covers all preceding fields + payload. Torn write at the tail → bad CRC → truncate.
+//! CRC covers all preceding fields + payload. A torn tail write yields a bad CRC and truncates.
 //! `seq` is monotonically increasing; `block_height` enables reorg-safe truncation.
 
 use crate::{PersistenceError, Result, StoreLayout};
@@ -273,7 +273,7 @@ fn scan_for_tail(path: &std::path::Path) -> Result<ScanResult> {
     })
 }
 
-#[allow(clippy::too_many_lines)] // added monotonic-seq invariant
+#[allow(clippy::too_many_lines)] // single linear frame scanner; splitting hurts readability
 fn scan_full(path: &std::path::Path) -> Result<WalReplay> {
     if !path.exists() {
         return Ok(WalReplay {
@@ -356,9 +356,7 @@ fn scan_full(path: &std::path::Path) -> Result<WalReplay> {
             });
         }
 
-        // CRC validates internal consistency but not monotonicity.
-        // A CRC-valid frame with a non-monotonic seq (e.g. retry landed at wrong offset)
-        // is treated as a torn tail: truncate at this entry's start.
+        // CRC checks integrity, not order: a non-monotonic seq is a torn tail
         let expected_seq = if entries.is_empty() {
             None
         } else {
@@ -471,7 +469,6 @@ mod tests {
         }
         let wal2 = Wal::open(&layout, None).expect("reopen with torn tail");
         let replay = wal2.replay().expect("replay");
-        // The 3 valid entries survive; garbage was truncated.
         assert_eq!(replay.entries.len(), 3);
         assert_eq!(replay.next_seq, 3);
     }

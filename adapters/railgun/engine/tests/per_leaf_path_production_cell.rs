@@ -128,10 +128,7 @@ fn per_leaf_path_query_recovers_sibling_walk_and_root_for_target_leaves() {
             .get(..PATH_RECORD_BYTES)
             .expect("row plaintext present");
 
-        // Sibling-walk oracle: independently compute each level's
-        // sibling index from leaf_idx and read it directly from the
-        // IMT via Imt::node — bypassing Imt::merkle_proof which the
-        // encoder itself consumes (closure-rule independence).
+        // independent oracle: read siblings via Imt::node, bypassing the Imt::merkle_proof the encoder consumes
         let mut path_idx = leaf_idx as usize;
         let mut current = canonical(u8::try_from(leaf_idx % 250).unwrap_or(0).saturating_add(1));
         for level in 0..TREE_DEPTH {
@@ -149,9 +146,7 @@ fn per_leaf_path_query_recovers_sibling_walk_and_root_for_target_leaves() {
                  (expected Imt::node({level}, {sibling_idx_at_level}))"
             );
 
-            // On-chain IMT-rooted reconstruction: hash up the path with
-            // the recovered sibling, mirroring the wallet-side
-            // verifier path.
+            // hash up the path, mirroring the wallet-side verifier
             current = if bit == 1 {
                 merkle_node(expected_sibling, current).expect("hash right")
             } else {

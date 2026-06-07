@@ -359,10 +359,7 @@ pub fn parse_chainalysis_oracle(s: &str) -> Result<Address, String> {
         .map_err(|e| format!("invalid chainalysis-oracle address {s}: {e}"))
 }
 
-/// Suppress unused variable warning. `U256` and `B256` are kept in
-/// scope to make the next-cycle live-derivation work (which will
-/// pull `Shield(uint256 treeNumber, uint256 startPosition, ...)`
-/// directly from the same RPC pool) a one-line import edit.
+/// Keeps `U256`/`B256` in scope for the live-derivation path.
 #[doc(hidden)]
 #[allow(dead_code)]
 pub fn __keep_alloy_imports() -> (U256, B256) {

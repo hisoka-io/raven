@@ -207,7 +207,7 @@ pub fn bootstrap_railgun_engine(
     let layout = if config.use_flock {
         let (l, lock) = StoreLayout::open_with_lock(&config.data_dir)
             .map_err(|e| AdapterError::Internal(format!("StoreLayout::open_with_lock: {e}")))?;
-        // Leak the lock guard for the process lifetime; V2 will thread it through the handle.
+        // Hold the flock for the process lifetime.
         let _ = Box::leak(Box::new(lock));
         l
     } else {
@@ -575,11 +575,8 @@ where
             s
         } else {
             let s = fresh_state_factory(&cfg)?;
-            // Bootstrap first commit uses the V6 envelope so the
-            // embedded `LogicalLeafStore` travels with the snapshot
-            // from the very first manifest write. Empty store on
-            // first bootstrap; subsequent commits will carry the
-            // accumulated store via the commit driver.
+            // V6 envelope so the embedded store travels with the snapshot from
+            // the first manifest write; empty on first bootstrap.
             let empty_store = LogicalLeafStore::default();
             persistence.commit_v6(&s, &empty_store, 0)?;
             persistence.commit_notify().notify_waiters();
@@ -798,11 +795,8 @@ async fn forward_mirror_payload(
     // Fired before routing so a fresh list_key surfaces before any instance route exists.
     let _ = list_observed.send(lk);
     let routes = ppoi_list_routes.load();
-    // Fan out to ALL senders bound to `lk`. Multiple instances can
-    // legitimately consume the same list_key under different encoder
-    // labels (e.g. `per-list-status` + `per-list-path` sharing the
-    // OFAC list); `.find()` would silently drop events for every
-    // instance after the first match.
+    // Fan out to ALL senders bound to `lk`: distinct encoders can share one
+    // list_key, so `.find()` would drop events past the first match.
     let matched: Vec<mpsc::Sender<ConsumerEvent>> = routes
         .iter()
         .filter(|(k, _)| *k == lk)

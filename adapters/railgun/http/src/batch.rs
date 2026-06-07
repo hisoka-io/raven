@@ -48,8 +48,8 @@ pub(crate) async fn query_handler<S: PirScheme>(
 
     let started = Instant::now();
     let respond_timeout = Duration::from_secs(app.config.respond_timeout_secs.max(1));
-    // spawn_blocking + timeout: pathological queries release their permit instead of
-    // blocking subsequent requests indefinitely (AUDIT fix).
+    // spawn_blocking + timeout so a pathological query releases its permit
+    // instead of blocking later requests.
     let instance_clone = Arc::clone(&instance);
     let join = tokio::task::spawn_blocking(move || instance_clone.query_active_tracked(&query));
     let (epoch, response) = match tokio::time::timeout(respond_timeout, join).await {
@@ -132,11 +132,8 @@ pub(crate) async fn batch_handler<S: PirScheme>(
     }
 
     let started = Instant::now();
-    // Capture `(epoch, state)` ONCE for the whole batch. Every worker
-    // dispatched below serves from this exact snapshot, so a 17-row
-    // commit-tree path fanout cannot straddle a concurrent
-    // `swap_state` and produce a Frankenstein fold root that chain
-    // `rootHistory` would reject.
+    // Capture `(epoch, state)` ONCE: every worker serves this exact snapshot so
+    // the batch can't straddle a concurrent `swap_state`.
     let snapshot_for_batch = instance.current_snapshot();
     let epoch_at_start = snapshot_for_batch.epoch;
 
@@ -252,17 +249,13 @@ impl BatchError {
 
 type WorkerOutcome<R> = (usize, Result<R, BatchError>);
 
-/// Cross-query K-concurrent dispatcher.
+/// Cross-query K-concurrent dispatcher; responses in input order,
+/// short-circuits on first error.
 ///
-/// Uses `tokio::task::JoinSet` of K `spawn_blocking` workers.
-/// `rayon::par_iter` regresses ~2× on the HTTP path when nested
-/// inside `spawn_blocking`, which is why the K-concurrent fan-out
-/// here uses `spawn_blocking` directly instead of a nested rayon pool.
-/// Returns responses in input order; short-circuits on first error.
-///
-/// Every worker spawned below borrows the same `Arc<Snapshot<S>>` so all
-/// rows in the batch are byte-for-byte served from the SAME `(epoch, state)`
-/// pair, even if a concurrent `swap_state` fires mid-batch.
+/// Uses K `spawn_blocking` workers directly: nesting `rayon::par_iter` inside
+/// `spawn_blocking` regresses ~2x on the HTTP path. Every worker borrows the
+/// same `Arc<Snapshot<S>>` so the whole batch serves one `(epoch, state)` even
+/// under a concurrent `swap_state`.
 pub(crate) async fn dispatch_batch<S: PirScheme>(
     queries: Vec<S::Query>,
     instance: Arc<PirInstance<S>>,

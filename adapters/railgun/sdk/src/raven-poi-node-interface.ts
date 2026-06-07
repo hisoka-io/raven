@@ -29,89 +29,47 @@ export interface MerkleProof {
   root: string;
 }
 
-/**
- * Upstream Railgun Chain shape (mirrors
- * `engine/src/models/engine-types.ts`). EVM is currently the only
- * `ChainType` member; we keep `type` numeric to match upstream wire
- * shape.
- */
+/** Upstream Railgun Chain shape (engine/src/models/engine-types.ts); numeric `type` matches upstream wire shape. */
 export interface Chain {
   /** Upstream `ChainType` enum: 0 = EVM. */
   type: number;
   id: number;
 }
 
-/**
- * Upstream `Proof` shape (mirrors
- * `engine/src/models/prover-types.ts`). Carried through verbatim by
- * the SDK since the Raven adapter is not the proof generator.
- */
+/** Upstream `Proof` shape (engine/src/models/prover-types.ts), carried verbatim. */
 export interface Proof {
   pi_a: [string, string];
   pi_b: [[string, string], [string, string]];
   pi_c: [string, string];
 }
 
-/**
- * Constructor options for the SDK. The wallet supplies a single
- * `RavenConfig` per chain (legacy mode) or a `ChainRegistry` carrying
- * per-chain entries (multi-chain mode); when both are provided the
- * registry takes precedence.
- */
+/** SDK constructor options; a supplied `chainRegistry` takes precedence over the single-chain `endpoint`/`bearerToken`/`chainId`. */
 export interface RavenConfig {
   endpoint: string;
   bearerToken: string;
-  /** EVM chain id this adapter serves. Required when using
-   *  `ChainRegistry`; defaults to 1 (Ethereum mainnet) for the
-   *  single-chain legacy constructor shape. */
+  /** EVM chain id this adapter serves; defaults to 1 (mainnet). */
   chainId?: number;
-  /** Upstream Railgun `chainType` (0 = EVM). Used to build upstream
-   *  PPOI passthrough URLs of the form
-   *  `<upstream>/<segment>/<chainType>/<chainID>` per
-   *  `private-proof-of-innocence/packages/node/src/api/api.ts`.
-   *  Defaults to `0` (EVM) when omitted. */
+  /** Upstream Railgun `chainType` (0 = EVM); used in PPOI passthrough URLs `<upstream>/<segment>/<chainType>/<chainID>`. */
   chainType?: number;
-  /** Multi-chain routing table. When supplied the SDK consults this
-   *  per request; when omitted the SDK builds an internal one-entry
-   *  registry from `endpoint` + `bearerToken` + `chainId`. */
+  /** Multi-chain routing table; when omitted an internal one-entry registry is built. */
   chainRegistry?: ChainRegistry;
   upstreamFallbackEndpoint?: string;
   txidVersion?: string;
   fetchImpl?: typeof fetch;
   freshnessConfidenceFloor?: number;
-  /**
-   * When true (default), the SDK builds encrypted PIR queries
-   * client-side via the bundled `raven-inspire-client-wasm` module
-   * and POSTs only the encrypted blob. Plaintext blinded commitments
-   * never cross the wire.
-   */
+  /** When true (default), PIR queries are built client-side; plaintext blinded commitments never cross the wire. */
   useClientPir?: boolean;
   /**
-   * Pre-loaded client-PIR contexts, keyed by instance ID. The SDK
-   * looks up the appropriate context per request.
-   *
-   * Mapping convention:
-   * - `t1Status:<chainId>:<listKeyHex>` -> the T1 PPOI status PIR instance
-   * - `t2Path:<chainId>:<listKeyHex>`   -> the T2 PPOI auth-path PIR instance
-   *   (for client-side auth-path: per-list-node encoder)
-   * - `t3CommitTree:<chainId>:<treeNumber>` -> the T3 commit-tree per-node PIR instance
-   *
-   * For backward compatibility the legacy keys
-   * `t1Status:<listKeyHex>` / `t2Path:<listKeyHex>` /
-   * `t3CommitTree:<treeNumber>` (without chain id) are accepted as
-   * fallbacks; the SDK prefers the chain-aware key when both are present.
+   * Pre-loaded client-PIR contexts. Chain-aware keys are preferred;
+   * legacy non-chain-aware keys are accepted as fallbacks:
+   * - `t1Status:<chainId>:<listKeyHex>` / `t1Status:<listKeyHex>`
+   * - `t2Path:<chainId>:<listKeyHex>` / `t2Path:<listKeyHex>`
+   * - `t3CommitTree:<chainId>:<treeNumber>` / `t3CommitTree:<treeNumber>`
    */
   clientPirContexts?: Map<string, ClientPirContext>;
-  /**
-   * Pre-loaded BC -> idx maps, keyed by `<listKeyHex>` (legacy) or
-   * `<chainId>:<listKeyHex>` (multi-chain).
-   */
+  /** Pre-loaded BC -> idx maps, keyed by `<chainId>:<listKeyHex>` or legacy `<listKeyHex>`. */
   bcToIdxMaps?: Map<string, BcToIdxMap>;
-  /**
-   * IMT cache for client-side auth-path reconstruction. Optional;
-   * when omitted the SDK builds one with default settings (in-memory
-   * 1024 entries; IndexedDB if `globalThis.indexedDB` is available).
-   */
+  /** IMT cache for auth-path reconstruction; defaults to in-memory 1024 entries plus IndexedDB when available. */
   imtCache?: ImtCache;
 }
 
@@ -121,9 +79,7 @@ interface BlindedCommitmentData {
 }
 
 interface PoisPerListResponse {
-  // Outer key is BC hex, inner is list-key hex. Mirrors upstream
-  // POIsPerListMap from
-  // shared-models/src/models/proof-of-innocence.ts:153.
+  // Outer key BC hex, inner list-key hex; mirrors upstream POIsPerListMap (shared-models/src/models/proof-of-innocence.ts:153).
   [bcHex: string]: { [listKey: string]: POIStatus };
 }
 
@@ -134,10 +90,7 @@ interface FreshnessHeader {
   confidence: number;
 }
 
-/**
- * Captured outbound HTTP request shape. Used by the privacy-invariant
- * test harness to assert no BC bytes appear in any body.
- */
+/** Captured outbound HTTP request; the privacy-invariant test harness asserts no BC bytes appear in any body. */
 export interface CapturedWireRequest {
   url: string;
   method: string;
@@ -168,13 +121,7 @@ export class RavenPOINodeInterface {
   private readonly bcToIdxMaps: Map<string, BcToIdxMap>;
   private readonly cache: ImtCache;
 
-  /**
-   * Bounded ring of recent outbound HTTP requests. Recorded for the
-   * privacy-invariant test harness and never exposed to user code
-   * (mutated only via the `lastWireRequests` getter). Capacity-
-   * bounded at 64 to prevent unbounded memory growth in long-running
-   * wallets.
-   */
+  // Bounded ring (cap 64) of recent outbound requests for the privacy-invariant test harness.
   private readonly capturedRequests: CapturedWireRequest[] = [];
 
   constructor(config: RavenConfig) {
@@ -191,7 +138,6 @@ export class RavenPOINodeInterface {
 
     if (config.chainRegistry) {
       this.registry = config.chainRegistry;
-      // Ensure the requested chain id is registered.
       this.registry.resolve(this.chainId);
     } else {
       this.registry = new ChainRegistry(
@@ -207,17 +153,11 @@ export class RavenPOINodeInterface {
     }
   }
 
-  /** Convenience: resolve to the active per-chain entry. */
   private route(): ChainRegistryEntry {
     return this.registry.resolve(this.chainId);
   }
 
-  /**
-   * Returns a snapshot of the most recent outbound HTTP requests
-   * captured by this SDK instance. Test-only hook; production code
-   * should not depend on the ordering or completeness of this array.
-   * The returned array is a defensive copy.
-   */
+  /** Defensive-copy snapshot of recent captured requests. Test-only; ordering/completeness not guaranteed. */
   lastWireRequests(): CapturedWireRequest[] {
     return this.capturedRequests.map((r) => ({
       url: r.url,
@@ -226,9 +166,7 @@ export class RavenPOINodeInterface {
     }));
   }
 
-  /**
-   * Reset the captured wire-request ring. Useful between test cases.
-   */
+  /** Reset the captured wire-request ring. */
   resetWireCapture(): void {
     this.capturedRequests.length = 0;
   }
@@ -301,14 +239,10 @@ export class RavenPOINodeInterface {
   }
 
   /**
-   * Validate a list of POI merkleroots against the upstream PPOI
-   * service. Mirrors upstream
-   * `POINodeInterface.validatePOIMerkleroots`
-   * (`engine/src/poi/poi-node-interface.ts:30-35`) and posts to
-   * `<upstream>/validate-poi-merkleroots/<chainType>/<chainID>` per
-   * `private-proof-of-innocence/packages/node/src/api/api.ts:786`.
-   * Body field name is `poiMerkleroots` to match upstream
-   * `ValidatePOIMerklerootsParams`.
+   * Validate POI merkleroots against upstream PPOI. Mirrors
+   * `POINodeInterface.validatePOIMerkleroots` (engine/src/poi/poi-node-interface.ts:30-35);
+   * posts to `<upstream>/validate-poi-merkleroots/<chainType>/<chainID>`
+   * (api.ts:786). Body field `poiMerkleroots` matches upstream `ValidatePOIMerklerootsParams`.
    */
   async validatePOIMerkleroots(
     listKey: string,
@@ -345,15 +279,9 @@ export class RavenPOINodeInterface {
 
   /**
    * Submit a POI proof to upstream PPOI. Matches upstream's 9-arg
-   * `POINodeInterface.submitPOI` signature
-   * (`engine/src/poi/poi-node-interface.ts:37-47`):
-   * `(txidVersion, chain, listKey, snarkProof, poiMerkleroots,
-   * txidMerkleroot, txidMerklerootIndex, blindedCommitmentsOut,
-   * railgunTxidIfHasUnshield)`.
-   *
-   * Posts to `<upstream>/submit-transact-proof/<chainType>/<chainID>`
-   * per upstream `api.ts:653` carrying `transactProofData` in the
-   * body.
+   * `POINodeInterface.submitPOI` (engine/src/poi/poi-node-interface.ts:37-47);
+   * posts to `<upstream>/submit-transact-proof/<chainType>/<chainID>`
+   * (api.ts:653) carrying `transactProofData`.
    */
   async submitPOI(
     txidVersion: string,
@@ -404,11 +332,9 @@ export class RavenPOINodeInterface {
   }
 
   /**
-   * Submit legacy transact proofs to upstream PPOI. Mirrors upstream
-   * `POINodeInterface.submitLegacyTransactProofs`
-   * (`engine/src/poi/poi-node-interface.ts:49-54`) shape and posts to
-   * `<upstream>/submit-legacy-transact-proofs/<chainType>/<chainID>`
-   * per upstream `api.ts:673`.
+   * Submit legacy transact proofs to upstream PPOI. Mirrors
+   * `POINodeInterface.submitLegacyTransactProofs` (engine/src/poi/poi-node-interface.ts:49-54);
+   * posts to `<upstream>/submit-legacy-transact-proofs/<chainType>/<chainID>` (api.ts:673).
    */
   async submitLegacyTransactProofs(
     listKeys: string[],
@@ -488,16 +414,7 @@ export class RavenPOINodeInterface {
     return await res.json();
   }
 
-  // ------------------------------------------------------------------
-  // Client-PIR paths
-  // ------------------------------------------------------------------
-
-  /**
-   * Look up a context first by chain-aware key, then fall back to
-   * the legacy non-chain-aware key shape. Returning undefined defers
-   * the "missing context" error to the caller (which carries the
-   * domain-appropriate message).
-   */
+  // Chain-aware key first, then legacy non-chain-aware fallback; undefined defers the error to the caller.
   private lookupContext(prefix: string, scope: string): ClientPirContext | undefined {
     const chainAware = this.clientPirContexts.get(`${prefix}:${this.chainId}:${scope}`);
     if (chainAware) return chainAware;
@@ -514,13 +431,8 @@ export class RavenPOINodeInterface {
     listKeys: string[],
     blindedCommitmentDatas: BlindedCommitmentData[],
   ): Promise<PoisPerListResponse> {
-    // Outer key is BC hex, inner is list-key hex. Mirrors upstream
-    // POIsPerListMap shape from
-    // shared-models/src/models/proof-of-innocence.ts:153.
     const out: PoisPerListResponse = {};
-    // Pre-init the BC slots so unknown-BC rows still surface in the
-    // map even if no list yields a status. Matches the upstream
-    // merge behaviour at poi-merkletree-manager.ts:215-218.
+    // Pre-init BC slots so unknown-BC rows still surface; matches upstream merge (poi-merkletree-manager.ts:215-218).
     for (const { blindedCommitment } of blindedCommitmentDatas) {
       const bcHex = normalizeHex(blindedCommitment);
       out[bcHex] ??= {};
@@ -540,8 +452,6 @@ export class RavenPOINodeInterface {
         const bcHex = normalizeHex(blindedCommitment);
         const idx = bcMap.get(bcHex);
         if (idx === undefined) {
-          // BC not present in this list yet. Mirror upstream's
-          // missing-BC semantics.
           out[bcHex][lkHex] = "Missing";
           continue;
         }
@@ -551,12 +461,8 @@ export class RavenPOINodeInterface {
           const statusByte = plaintext.length > 0 ? plaintext[0] : 0;
           status = statusByteToPOIStatus(statusByte);
         } catch (cause) {
-          // Discriminate by error class. Only network-transient
-          // failures fall through to Missing. Schema mismatches,
-          // server errors and decode failures propagate so the
-          // wallet can retry against a fresh routing table or fall
-          // back to upstream PPOI rather than silently spending on
-          // unmarked BCs.
+          // Only transient network failures degrade to Missing; schema/server/decode errors propagate so
+          // the wallet retries or falls back rather than spending on unmarked BCs.
           if (cause instanceof RavenError && cause.kind === "Network") {
             status = "Missing";
           } else {
@@ -591,9 +497,7 @@ export class RavenPOINodeInterface {
           `client-PIR: BC ${bcHex} not present in list ${lkHex} (idx unknown)`,
         );
       }
-      // Path indices are derived from the per-list Merkle layout via
-      // the WASM helper. The leaf index never crosses the wire — only
-      // the encrypted PIR row queries do.
+      // Leaf index never crosses the wire; only the encrypted PIR row queries do.
       const indices = pathIndicesForPerListLeaf(ctx.wasm, lkHex, idx);
       const siblings = await this.fetchAuthPathNodes(
         `t2Path-${lkHex}`,
@@ -628,14 +532,9 @@ export class RavenPOINodeInterface {
   }
 
   /**
-   * Fetch the 16 sibling node hashes for an auth path. For each
-   * `(level, idxAtLevel)` tuple we first probe the IMT cache; cache
-   * misses are batched into a single `POST /v1/instance/<id>/batch`
-   * request whose body carries one encrypted PIR query per missing
-   * index.
-   *
-   * Returns a `Uint8Array[]` of length `TREE_DEPTH = 16`, indexed by
-   * level (level 0 = sibling of the leaf).
+   * Fetch the TREE_DEPTH sibling node hashes for an auth path, indexed by
+   * level (0 = sibling of the leaf). Cache misses batch into a single
+   * `POST /v1/instance/<id>/batch` of encrypted PIR queries.
    */
   private async fetchAuthPathNodes(
     instanceLabel: string,
@@ -654,7 +553,7 @@ export class RavenPOINodeInterface {
     const epochTag = String(route.epoch ?? 0);
     const schemaVersion = route.schemaVersion ?? 0;
 
-    // L1 (synchronous in-memory) probe.
+    // L1 synchronous in-memory probe.
     for (let i = 0; i < indices.length; i += 1) {
       const key = imtCacheKey({
         chainId: this.chainId,
@@ -672,7 +571,7 @@ export class RavenPOINodeInterface {
       }
     }
 
-    // L2 (async IndexedDB) probe for any L1 misses.
+    // L2 async IndexedDB probe for L1 misses.
     const stillMissing: number[] = [];
     for (const i of missing) {
       const key = imtCacheKey({
@@ -692,9 +591,7 @@ export class RavenPOINodeInterface {
     }
 
     if (stillMissing.length > 0) {
-      // Build one encrypted PIR query per missing level + dispatch as a
-      // single batch. Path-indices computation is local; only the
-      // encrypted batch crosses the wire.
+      // One encrypted query per missing level, dispatched as one batch; only the encrypted batch crosses the wire.
       const queryBundles = stillMissing.map((level) => {
         const target = BigInt(indices[level]);
         return decodeClientPirQueryBundle(
@@ -721,7 +618,7 @@ export class RavenPOINodeInterface {
         });
       }
       if (res.status === 400) {
-        // 400 with `X-Raven-Schema-Version` set means a schema mismatch.
+        // 400 with X-Raven-Schema-Version set signals a schema mismatch.
         const sv = res.headers.get(X_RAVEN_SCHEMA_VERSION);
         if (sv) {
           throw RavenError.staleAdapter(`client-PIR batch ${instanceLabel}: schema mismatch`, {
@@ -738,8 +635,7 @@ export class RavenPOINodeInterface {
           status: res.status,
         });
       }
-      // Note freshness from the server response so the cache layer
-      // invalidates on epoch / schema-version drift.
+      // Cache layer invalidates on epoch / schema-version drift.
       const serverEpoch = res.headers.get(X_RAVEN_EPOCH);
       const serverSchema = res.headers.get(X_RAVEN_SCHEMA_VERSION);
       if (serverEpoch !== null && serverSchema !== null) {
@@ -771,8 +667,7 @@ export class RavenPOINodeInterface {
             { cause: String(cause) },
           );
         }
-        // The PerNodeEncoder row is exactly 32 bytes per node; the
-        // first 32 bytes of the plaintext is the node hash.
+        // PerNodeEncoder row is one NODE_HASH_BYTES node hash.
         const node = plaintext.subarray(0, NODE_HASH_BYTES);
         if (node.length !== NODE_HASH_BYTES) {
           throw RavenError.decodeError(
@@ -798,8 +693,7 @@ export class RavenPOINodeInterface {
     for (let i = 0; i < indices.length; i += 1) {
       const v = out[i];
       if (!v) {
-        // Should be impossible: every level was either a cache hit
-        // or filled from the batch response above.
+        // Unreachable: every level is a cache hit or filled from the batch above.
         throw RavenError.decodeError(`fetchAuthPathNodes: missing sibling at level ${i}`);
       }
       final[i] = v;
@@ -807,11 +701,7 @@ export class RavenPOINodeInterface {
     return final;
   }
 
-  /**
-   * Single-query path used by the T1 status flow. Wraps the wasm
-   * query builder + POST to `/v1/instance/:id/query` and decrypts
-   * the response.
-   */
+  /** Single-query path (T1 status): build query, POST to `/v1/instance/:id/query`, decrypt the response. */
   private async runClientPirQuery(
     instanceLabel: string,
     ctx: ClientPirContext,
@@ -822,12 +712,7 @@ export class RavenPOINodeInterface {
       ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, targetIdx),
     );
     const url = `${route.endpoint}/v1/instance/${encodeURIComponent(instanceLabel)}/query`;
-    // The `/v1/instance/:id/query` endpoint expects the wire-schema
-    // envelope `[u16 BE schema_version][bincode body]` (mirrors the
-    // server-side `read_versioned`). Without the prefix the server
-    // rejects the body with HTTP 400 and `X-Raven-Schema-Version` set.
-    // `encodeBatchBody` already wraps batch requests; the single-query
-    // path needs the same treatment.
+    // Wire-schema envelope `[u16 BE schema_version][bincode]` mirrors server-side read_versioned; without it the server returns 400.
     const wirePayload = wrapWithSchemaEnvelope(queryBundle.queryBytes);
     this.captureRequest(url, "POST", wirePayload);
     let res: Response;
@@ -863,9 +748,7 @@ export class RavenPOINodeInterface {
         status: res.status,
       });
     }
-    // Server response carries the same `[u16 BE schema_version][bincode]`
-    // envelope; strip the 2-byte prefix before handing the inner bytes
-    // to `extract_response` (which expects bincode-only).
+    // Strip the 2-byte envelope; extract_response expects bincode-only.
     const envelopedBytes = new Uint8Array(await res.arrayBuffer());
     const responseBytes = stripSchemaEnvelope(envelopedBytes, instanceLabel);
     const plaintext = ctx.wasm.extract_response(
@@ -934,8 +817,7 @@ export class RavenPOINodeInterface {
       listKeys,
       blindedCommitmentDatas,
     });
-    // Upstream path: pois-per-list/:chainType/:chainID per
-    // private-proof-of-innocence/packages/node/src/api/api.ts:713.
+    // Upstream path pois-per-list/:chainType/:chainID (api.ts:713).
     const url = `${this.upstream}/pois-per-list/${this.chainType}/${this.chainId}`;
     this.captureRequest(url, "POST", new TextEncoder().encode(body));
     let res: Response;
@@ -971,9 +853,7 @@ export class RavenPOINodeInterface {
       listKey,
       blindedCommitments,
     });
-    // Upstream literal segment is `merkle-proofs` (NOT
-    // `poi-merkle-proofs`) per
-    // private-proof-of-innocence/packages/node/src/api/api.ts:739.
+    // Upstream segment is `merkle-proofs`, not `poi-merkle-proofs` (api.ts:739).
     const url = `${this.upstream}/merkle-proofs/${this.chainType}/${this.chainId}`;
     this.captureRequest(url, "POST", new TextEncoder().encode(body));
     let res: Response;
@@ -1004,26 +884,7 @@ export class RavenPOINodeInterface {
   }
 }
 
-/**
- * Encode a batch body as a length-prefixed sequence of bincode-shaped
- * `Vec<SeededClientQuery>`. The HTTP layer already speaks
- * `read_versioned`+ versioned-bincode of `Vec<S::Query>`; this encoder
- * mirrors that layout: u16 schema version + u64 LE length prefix +
- * concatenated query bytes.
- *
- * NOTE: we hand the server *the same* per-query bincode-encoded
- * `SeededClientQuery` shape it would receive on `/v1/instance/:id/query`,
- * concatenated by a u64 LE length prefix. This is the
- * `bincode::serialize(&Vec<SeededClientQuery>)` shape the
- * `dispatch_batch::<S>` worker expects.
- */
-/**
- * Wrap a single-query bincode body with the server-side
- * `read_versioned` envelope: `[u16 BE schema_version][body]`. Mirrors
- * what `encodeBatchBody` does for the batch endpoint and what the
- * Rust `native_live_replay.rs` does for parity. Without this prefix
- * `/v1/instance/:id/query` rejects the body with HTTP 400.
- */
+/** Wrap a bincode body with the server-side read_versioned envelope `[u16 BE schema_version][body]`; without it `/v1/instance/:id/query` returns 400. */
 function wrapWithSchemaEnvelope(body: Uint8Array): Uint8Array {
   const out = new Uint8Array(2 + body.length);
   out[0] = 0;
@@ -1032,14 +893,7 @@ function wrapWithSchemaEnvelope(body: Uint8Array): Uint8Array {
   return out;
 }
 
-/**
- * Inverse of [`wrapWithSchemaEnvelope`]. Validates the server's
- * `[u16 BE schema_version]` prefix and returns the inner bincode
- * body. Throws a typed `RavenError` if the envelope is missing or
- * carries an unexpected version, so the wallet sees a structured
- * decode error instead of a downstream `extract_response` panic on
- * stray prefix bytes.
- */
+/** Inverse of `wrapWithSchemaEnvelope`; validates the prefix and throws a typed error on a missing/unexpected envelope. */
 function stripSchemaEnvelope(buf: Uint8Array, label: string): Uint8Array {
   if (buf.length < 2) {
     throw RavenError.decodeError(
@@ -1055,9 +909,8 @@ function stripSchemaEnvelope(buf: Uint8Array, label: string): Uint8Array {
   return buf.subarray(2);
 }
 
+/** Encode `[u16 BE schema_version][u64 LE count][concatenated per-query bincode]`, the `Vec<SeededClientQuery>` shape `dispatch_batch` expects. */
 function encodeBatchBody(queries: Uint8Array[]): Uint8Array {
-  // 2 bytes BE schema version (matches WIRE_SCHEMA_VERSION = 1) +
-  // 8 bytes LE length prefix + concatenated bodies.
   const schemaPrefix = new Uint8Array([0, 1]);
   let bodyBytes = 8;
   for (const q of queries) {
@@ -1076,21 +929,12 @@ function encodeBatchBody(queries: Uint8Array[]): Uint8Array {
   return out;
 }
 
-/**
- * Decode the server's batch reply: u16 schema version + u64 LE length
- * + concatenated `bincode(ServerResponse)` blobs. The SDK doesn't try
- * to parse the inner blobs structurally; it slices them into one
- * `Uint8Array` per query and hands each to `extract_response`.
- *
- * The server emits responses delimited by a per-element u64 LE length
- * prefix (since `ServerResponse` is variable-length).
- */
+/** Decode `[u16 schema_version][u64 LE count][per-element u64 LE len + bincode(ServerResponse)]` into one slice per query. */
 function decodeBatchBody(buf: Uint8Array): Uint8Array[] {
   if (buf.length < 2 + 8) {
     throw RavenError.decodeError(`decodeBatchBody: buffer too short (${buf.length})`);
   }
   const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  // Skip 2-byte schema version prefix.
   let offset = 2;
   const lenLo = view.getUint32(offset, true);
   const lenHi = view.getUint32(offset + 4, true);
@@ -1125,24 +969,11 @@ function decodeBatchBody(buf: Uint8Array): Uint8Array[] {
 }
 
 /**
- * Build a `MerkleProof` value from the leaf index + the 16 sibling
- * node hashes.
- *
- * Wire-format conventions (mirrors upstream
- * `engine/src/merkletree/merkletree.ts:128-160`):
- *
- * - `leaf`, `elements[i]`, `root` — 64-char no-`0x`-prefix hex.
- * - `indices` — `nToHex(BigInt(leafIndex), UINT_256)` = 64-char
- *   no-`0x`-prefix hex (NOT 8-char uint32 hex). Bit `i` of the
- *   indices value is the path bit at level `i`: bit set means the
- *   leaf at that level is the right child (matches upstream
- *   `merkletree/merkle-proof.ts:32-49 verifyMerkleProof`).
- * - `root` is computed by folding `leaf` with `siblings` via
- *   Poseidon `hashLeftRight` — the PIR adapter does NOT return the
- *   on-chain root, only the auth-path nodes, so the SDK must
- *   reconstruct it client-side. Upstream's `getMerkleProof` reads
- *   the root from a separately-stored top-level node which we don't
- *   have access to via the PIR adapter.
+ * Build a `MerkleProof` matching upstream wire shape (engine/src/merkletree/merkletree.ts:128-160):
+ * `leaf`/`elements[i]`/`root` are 64-char no-prefix hex; `indices` is
+ * `nToHex(leafIndex, UINT_256)` (64-char, NOT 8-char uint32), bit `i`
+ * set meaning right child at level `i`. The adapter returns only
+ * auth-path nodes, so `root` is folded client-side.
  */
 function buildMerkleProof(
   leafIndex: number,
@@ -1151,13 +982,9 @@ function buildMerkleProof(
 ): MerkleProof {
   const elements = siblings.map((s) => bytesToHex(s));
   const leaf = bcHex !== "" ? normalizeHex(bcHex) : "0".repeat(64);
-  // Compute the verifiable root by folding leaf with siblings using
-  // Poseidon, matching upstream's verifyMerkleProof shape.
   const root = elements.length > 0
     ? foldMerkleRoot(leaf, elements, BigInt(leafIndex))
     : leaf;
-  // Upstream nToHex(BigInt(index), UINT_256) -> 64-char no-prefix
-  // hex. NOT 8-char uint32.
   const indicesHex = leafIndex.toString(16).padStart(64, "0");
   return {
     leaf,
@@ -1167,13 +994,7 @@ function buildMerkleProof(
   };
 }
 
-/**
- * Copy a Uint8Array into a new ArrayBuffer suitable for use as a
- * `BodyInit`. Two reasons: (1) BodyInit's union rejects
- * `ArrayBufferLike` (which includes SharedArrayBuffer), and (2) the
- * Blob owns the copy so wasm-side memory backing the source is safe
- * to free after the call.
- */
+// Owned copy: BodyInit rejects SharedArrayBuffer-backed views, and the Blob owning it frees the wasm-side source.
 function copyForBody(src: Uint8Array): Blob {
   const buf = new ArrayBuffer(src.byteLength);
   new Uint8Array(buf).set(src);
@@ -1208,8 +1029,6 @@ function parseFreshnessHeader(value: string | null): FreshnessHeader | null {
   return out as FreshnessHeader;
 }
 
-// Re-export client-PIR primitives + helper utilities so consumers can
-// pre-load contexts and inspect captured wire requests in tests.
 export {
   containsByteSequence,
   hexToBytes,

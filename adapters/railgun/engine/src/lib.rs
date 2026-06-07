@@ -41,7 +41,7 @@ pub enum InstanceRole {
     Static,
     /// Currently filling. Re-preprocess on a schedule.
     Live,
-    /// Sidecar mode for incremental schemes. Reserved for V2.
+    /// Sidecar mode for incremental schemes.
     Sidecar,
 }
 
@@ -59,9 +59,8 @@ impl InstanceRole {
 
 /// Operator-driven maintenance state of an engine instance.
 ///
-/// Distinct from [`InstanceRole`]: drain_state is operator-driven and route-affecting —
-/// routing layers MUST skip instances whose drain_state is not `Active`.
-/// Encoded as `AtomicU8` (0=Active, 1=Draining, 2=Drained) for wait-free routing reads.
+/// Route-affecting: routing layers MUST skip instances whose state is not
+/// `Active`. Encoded `AtomicU8` (0=Active,1=Draining,2=Drained) for wait-free reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrainState {
     /// Routing layers MUST consider this instance for new queries.
@@ -253,19 +252,10 @@ impl<S: PirScheme> PirInstance<S> {
     /// Run a PIR query against a PRE-CAPTURED snapshot rather than the
     /// current `ArcSwap` cell. Returns `(snap.epoch, response)`.
     ///
-    /// **Batch-snapshot invariant.** Multi-row batch handlers (e.g. the
-    /// 17-row commit-tree path fanout) capture `current_snapshot()`
-    /// once and thread the resulting `Arc<Snapshot<S>>` into every
-    /// per-row worker. Every row in the batch is then served from a
-    /// byte-identical `(epoch, state)` pair, so a concurrent
-    /// `swap_state` cannot straddle a batch and produce a fold root
-    /// that mixes leaves from two IMT states (a "Frankenstein" root
-    /// that chain `rootHistory` would reject).
-    ///
-    /// Same drain-aware contract as [`query_active_tracked`]: refuses
-    /// with [`AdapterError::NoActiveInstance`] if the instance is no
-    /// longer active at guard-acquire time, but commits to completion
-    /// once the guard is held.
+    /// Lets a multi-row batch pin one `(epoch, state)` so a concurrent
+    /// `swap_state` cannot straddle the batch and mix rows from two states.
+    /// Drain-aware like [`query_active_tracked`]: refuses with
+    /// [`AdapterError::NoActiveInstance`] if not active at guard-acquire.
     pub fn query_active_tracked_with_snapshot(
         self: &Arc<Self>,
         snap: &Arc<Snapshot<S>>,
@@ -487,8 +477,6 @@ mod tests {
         assert!(matches!(err, AdapterError::Internal(_)));
     }
 
-    /// Regression (C12): `add_live` without `rcu` could lose instances
-    /// under concurrent calls; the fix uses `ArcSwap::rcu` to retry.
     #[test]
     fn engine_add_live_concurrent_does_not_lose_instances() {
         use std::sync::Arc;
@@ -565,11 +553,6 @@ mod tests {
         assert!(engine.instance(&InstanceId::new("b")).is_none());
     }
 
-    /// Regression: a batch capturing one `current_snapshot()` MUST
-    /// serve every row from that same `(epoch, state)` pair even when
-    /// `swap_state` fires mid-batch. The 17-row commit-tree fanout
-    /// relies on this invariant: a swap straddling the batch would
-    /// produce a fold root mixing leaves from two IMT states.
     #[test]
     fn query_active_tracked_with_snapshot_pins_epoch_across_mid_batch_swap() {
         let inst: Arc<PirInstance<EchoScheme>> = Arc::new(PirInstance::new(
@@ -586,8 +569,6 @@ mod tests {
         assert_eq!(e0, snap_epoch);
         assert_eq!(r0, 10);
 
-        // Concurrent swap_state fires mid-batch. Subsequent rows must
-        // still observe the captured (epoch, state), not the new one.
         inst.swap_state(vec![99, 99, 99, 99, 99], Epoch(snap_epoch.0 + 1));
         assert_eq!(inst.current_epoch(), Epoch(snap_epoch.0 + 1));
 
@@ -606,15 +587,11 @@ mod tests {
             );
         }
 
-        // A fresh `query_active_tracked` now sees the post-swap state.
         let (e_after, r_after) = inst.query_active_tracked(&0).expect("post-swap query");
         assert_eq!(e_after, Epoch(snap_epoch.0 + 1));
         assert_eq!(r_after, 99);
     }
 
-    /// Regression: `query_active_tracked_with_snapshot` MUST refuse a
-    /// row whose instance has been drained, even if the caller still
-    /// holds an `Arc<Snapshot<S>>` from before the drain.
     #[test]
     fn query_active_tracked_with_snapshot_refuses_when_drained() {
         let inst: Arc<PirInstance<EchoScheme>> = Arc::new(PirInstance::new(

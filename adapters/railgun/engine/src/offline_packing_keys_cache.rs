@@ -1,10 +1,7 @@
 //! Disk-backed cache for InspiRING `(PackParams, OfflinePackingKeys)`.
 //!
-//! `ServerInspiringCache::new` runs O(d^3) automorph-table search plus rotation
-//! work; both depend only on `(crs.params, num_columns, inspiring_w_seed)`.
-//! Persisting once and reloading via `from_parts` skips the offline phase on
-//! restart. Atomic-rename writes; cell-shape fingerprint guards against reuse
-//! against a different CRS.
+//! Persisting the offline phase skips its O(d^3) rebuild on restart. Writes are
+//! atomic-rename; a cell-shape fingerprint rejects reuse against a different CRS.
 
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -257,8 +254,7 @@ pub enum CacheBuildError<E> {
     Cache(#[from] OfflinePackingKeysCacheError),
 }
 
-// Atomic write: tmp + fsync + rename + parent fsync. Mirrors the helper in
-// raven-railgun-persistence so this module stays self-contained.
+// tmp + fsync + rename + parent fsync.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), OfflinePackingKeysCacheError> {
     let parent = path
         .parent()

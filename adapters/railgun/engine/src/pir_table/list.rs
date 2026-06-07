@@ -13,10 +13,8 @@ use crate::imt::TREE_DEPTH;
 use crate::inspire::LogicalLeafStore;
 
 /// T1 status encoder: row at list_index = `[status_byte, blinded_commitment[0..31]]`
-/// padded with zeros to `record_size`. Pinned to one `list_key`. Status
-/// PIR row layout chosen so the wallet recovers BOTH the status and the
-/// canonical BC bytes from a single PIR query (the BC is the on-chain-
-/// witnessed identity of the queried entry; status is the PPOI verdict).
+/// padded to `record_size`, pinned to one `list_key`. The BC tail lets a single
+/// query recover both the verdict and the entry's canonical BC bytes.
 #[derive(Debug, Clone)]
 pub struct PerListStatusEncoder {
     record_size: usize,
@@ -134,13 +132,9 @@ impl PirTableEncoder for PerListStatusEncoder {
     }
 }
 
-/// T2 path encoder: row at list_index = 16 sibling hashes from the
-/// per-list IMT proof for that leaf, packed leaf-to-root
-/// (`PATH_RECORD_BYTES = 512` bytes). Pinned to one `list_key`.
-///
-/// Same cascading dirty-shard semantics as [`PerLeafPathEncoder`] —
-/// inserting list_index X invalidates every prior leaf sharing an
-/// ancestor with X.
+/// T2 path encoder: row at list_index = 16 sibling hashes from the per-list
+/// IMT proof, packed leaf-to-root (`PATH_RECORD_BYTES = 512` bytes), pinned to
+/// one `list_key`. Same cascading dirty-shard semantics as [`PerLeafPathEncoder`].
 #[derive(Debug, Clone)]
 pub struct PerListPathEncoder {
     record_size: usize,
@@ -239,13 +233,9 @@ impl PirTableEncoder for PerListPathEncoder {
     }
 }
 
-/// Per-list Merkle-node encoder: each row is a single Merkle node (32 B)
-/// from the per-list PPOI IMT, laid out in the same flat-global-index order
-/// as [`PerNodeEncoder`] — leaves first (`[0, 2^TREE_DEPTH)`), then
-/// level-1 nodes, ..., up to the root. Pinned to one `list_key`.
-///
-/// Inserting list_index X dirties at most TREE_DEPTH+1 rows (the leaf
-/// plus its ancestors), de-duplicated per the per-node dirty-shard walk.
+/// Per-list Merkle-node encoder: each row is a single 32 B node from the
+/// per-list PPOI IMT, in the same flat-global-index layout as [`PerNodeEncoder`],
+/// pinned to one `list_key`. Inserting a leaf dirties at most TREE_DEPTH+1 rows.
 #[derive(Debug, Clone)]
 pub struct PerListNodeEncoder {
     entries_per_shard: u32,

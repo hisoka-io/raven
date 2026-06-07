@@ -97,8 +97,6 @@ mod tests {
         let mut rng = DeterministicRng::from_seed([0u8; 32]);
         let mut got = [0u8; 64];
         rng.fill_bytes(&mut got);
-        // RFC 8439 §2.3.2 test vector 1 (key = all-zero, nonce = all-zero,
-        // counter = 0) keystream block.
         let expected_hex = concat!(
             "76b8e0ada0f13d90405d6ae55386bd28",
             "bdd219b8a08ded1aa836efcc8b770dc7",
@@ -109,16 +107,8 @@ mod tests {
         assert_eq!(got.as_slice(), expected.as_slice());
     }
 
-    /// KAT for ChaCha20 with the RFC 8439 §2.3.2 Test Vector 2 seed.
-    ///
-    /// Reference: RFC 8439 §2.4.2 Test Vector 2 (ChaCha20 encryption of an
-    /// all-zero plaintext with key = 0x00..00:01, nonce = 0x00..00:02,
-    /// counter = 1). With rand_chacha's default nonce=0, counter=0 we
-    /// cannot exercise the nonce+counter path, but we CAN exercise the
-    /// keystream under a non-all-zero key, covering a different
-    /// initialisation regime than Test Vector 1.
-    ///
-    /// expands the RNG KAT suite beyond the all-zero-key case.
+    /// KAT for ChaCha20 keystream under a non-all-zero key, covering a
+    /// different initialisation regime than the all-zero-key vector.
     #[test]
     fn kat_rfc8439_nonzero_key_first_block() {
         let mut seed = [0u8; 32];
@@ -126,19 +116,8 @@ mod tests {
         let mut rng = DeterministicRng::from_seed(seed);
         let mut got = [0u8; 64];
         rng.fill_bytes(&mut got);
-        // Expected value derived independently by running
-        // `chacha20` (reference impl, pure-Rust, `chacha20` crate v0.9,
-        // same algorithm as `rand_chacha`) with identical inputs and
-        // verified against the rand_chacha output on Raven's hardware
-        // (9800X3D, Rust 1.94.1) during WP-2 derivation. Same seed must
-        // produce the same 64-byte keystream across every
-        // ChaCha20-compliant impl; a mismatch indicates either a
-        // backend swap or a broken rand_chacha release.
-        // Expected hex derived by running rand_chacha's ChaCha20 under
-        // the seed above (byte-stability snapshot, ). Any
-        // divergence indicates a backend change in rand_chacha OR a
-        // break from RFC 8439 ChaCha20 semantics. Either is a
-        // regression this KAT will catch.
+        // Cross-checked against the `chacha20` crate under the same seed;
+        // any divergence means a rand_chacha backend change or RFC 8439 break.
         let expected_hex = concat!(
             "4540f05a9f1fb296d7736e7b208e3c96",
             "eb4fe1834688d2604f450952ed432d41",
@@ -149,19 +128,11 @@ mod tests {
         assert_eq!(got.as_slice(), expected.as_slice());
     }
 
-    /// Documentation note: RFC 8439 §A.5 is the ChaCha20-Poly1305 AEAD
-    /// decryption test vector, not a ChaCha20 block KAT. Raven uses
-    /// ChaCha20 as a PRG (keystream generator), not as AEAD, so A.5
-    /// is out of scope. The RFC block-function KATs (A.1 Test Vectors
-    /// 1-5) are the relevant reference; the two KATs above cover the
-    /// all-zero-key and a non-zero-key case. A.1 Test Vectors 2-4
-    /// require direct counter/nonce control which `rand_chacha`'s
-    /// `SeedableRng` API doesn't expose. Porting those would need
-    /// the lower-level `ChaCha20` crate, out of scope for .
+    /// Scope marker: ChaCha20 is used as a PRG, not AEAD, so RFC 8439 §A.5
+    /// and the A.1 vectors needing counter/nonce control are out of scope;
+    /// `SeedableRng` does not expose those inputs.
     #[test]
-    fn aead_scope_note() {
-        // No-op; compile-time documentation that RFC §A.5 is not applicable.
-    }
+    fn aead_scope_note() {}
 
     #[test]
     fn from_u64_is_deterministic_and_distinct_per_seed() {

@@ -7,8 +7,7 @@
 //! Scheme-bound math (NTT kernels, gadget matrices, scheme-specific hashing)
 //! lives in the scheme crates, not here.
 
-// Stricter cast discipline for crypto paths: any intentional cast needs a
-// local allow with a reason.
+// Crypto paths: every intentional cast needs a local allow with a reason.
 #![deny(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,

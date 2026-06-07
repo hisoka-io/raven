@@ -2,7 +2,7 @@
 //! `TREE_DEPTH = 16`, Poseidon-hashed nodes, zero value = `keccak256("Railgun") mod SNARK_PRIME`.
 //! Used for Layer 2 reorg detection and PIR Merkle-path table construction.
 
-// Indexing into statically-sized [TREE_DEPTH+1] / [TREE_DEPTH] arrays is safe by construction.
+// Indexing into statically-sized [TREE_DEPTH+1] / [TREE_DEPTH] arrays is in-bounds by construction.
 #![allow(clippy::indexing_slicing, clippy::needless_range_loop)]
 
 use std::collections::HashMap;
@@ -105,26 +105,16 @@ impl Imt {
             )));
         }
 
-        // Single-leaf fast-path: skip the clone-and-stage. Every chain
-        // event today fires this branch (Shield/Transact emit one leaf
-        // per call; PPOI per-list inserts are also single-leaf). Bypass
-        // saves ~4 MiB Vec allocation per fire at full-tree fill, which
-        // the allocator cumulatively retains across the live-tree commit
-        // cadence.
+        // Skips the clone-and-stage: a single-leaf failure can't tear
+        // since `leaf_count` only advances after the helper succeeds.
         if leaves.len() == 1 {
             self.set_leaf_and_update_path(start_index, leaves[0])?;
             self.leaf_count = end;
             return Ok(());
         }
 
-        // Multi-leaf path retains the clone-and-stage for atomic
-        // rollback if `set_leaf_and_update_path` fails mid-loop on a
-        // non-Fr-canonical leaf. Single-leaf can't tear because a
-        // failure aborts before any cross-level mutation is persisted
-        // (the helper is structured so the leaf-level insert happens
-        // first, then the parent path is rebuilt; partial parent-path
-        // staleness is bounded to the failing call's own ancestor
-        // chain). Multi-leaf staleness can leak across leaves.
+        // Clone-and-stage so a mid-loop failure on a non-Fr-canonical
+        // leaf rolls back; multi-leaf staleness can leak across leaves.
         let mut staged = self.clone();
         for (offset, leaf) in leaves.iter().enumerate() {
             let leaf_index = start_index + offset;
@@ -311,7 +301,7 @@ mod tests {
 
     #[test]
     fn truncate_to_k_equals_fresh_insert_of_first_k() {
-        // Leaves are big-endian u32 zero-padded to 32 bytes — below BN254 Fr prime.
+        // Leaves are big-endian u32 zero-padded to 32 bytes, below BN254 Fr prime.
         let leaves: Vec<[u8; 32]> = (0..12u32)
             .map(|i| {
                 let mut b = [0u8; 32];
@@ -354,7 +344,7 @@ mod tests {
             b[31] = 0x07;
             b
         };
-        // 0xff...ff exceeds BN254 scalar prime — Poseidon refuses.
+        // 0xff...ff exceeds BN254 scalar prime, so Poseidon refuses.
         let invalid: [u8; 32] = [0xff; 32];
 
         let mut tree = Imt::new().expect("imt build");
@@ -468,9 +458,6 @@ mod tests {
         assert_eq!(reconstruct_root([42u8; 32], 2, &proof), tree.root());
     }
 
-    /// The single-leaf fast-path must land state byte-identical to the
-    /// equivalent multi-leaf-of-one path (clone-and-stage). Asserts on
-    /// root + leaf_count + proof equality.
     #[test]
     fn single_leaf_insert_byte_identical_to_multi_leaf_path() {
         let leaf: [u8; 32] = {
@@ -499,9 +486,6 @@ mod tests {
         assert_eq!(fp.indices, mp.indices);
     }
 
-    /// A failed single-leaf insert at index 0 must leave the tree
-    /// recoverable: a subsequent valid insert at the same index must
-    /// succeed.
     #[test]
     fn single_leaf_insert_failure_leaves_tree_unchanged_on_post_index_zero() {
         let invalid: [u8; 32] = [0xff; 32];

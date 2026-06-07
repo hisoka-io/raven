@@ -4,9 +4,8 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
-//! Version-k discipline ( R3): out-of-order `StateUpdate`
-//! calls MUST produce `IsimplePirError::VersionMismatch`, not silent
-//! success.
+//! Version-k discipline: out-of-order `StateUpdate` calls MUST produce
+//! `IsimplePirError::VersionMismatch`, not silent success.
 
 use raven_isimplepir::{db_update_modify, setup, state_update_entry, IsimplePirError, LweParams};
 
@@ -33,10 +32,10 @@ fn out_of_order_update_rejected() {
     let _d1 = db_update_modify(&mut state, 0, 0, 1).expect("d1");
     let d2 = db_update_modify(&mut state, 0, 1, 2).expect("d2");
 
-    // Apply d2 directly without d1. VersionMismatch expected.
-    let result = state_update_entry(&mut hint, &a_seed, &params, &d2);
+    // d2 applied without d1.
+    let update_result = state_update_entry(&mut hint, &a_seed, &params, &d2);
     assert!(matches!(
-        result,
+        update_result,
         Err(IsimplePirError::VersionMismatch { .. }),
     ));
 }
@@ -52,13 +51,12 @@ fn duplicate_update_rejected() {
 
     let d1 = db_update_modify(&mut state, 0, 0, 1).expect("d1");
 
-    // Apply d1 successfully.
     state_update_entry(&mut hint, &a_seed, &params, &d1).expect("first apply should succeed");
 
-    // Re-apply d1. VersionMismatch expected (replay attack guard).
-    let result = state_update_entry(&mut hint, &a_seed, &params, &d1);
+    // replay guard: re-applying d1 must fail.
+    let replay_result = state_update_entry(&mut hint, &a_seed, &params, &d1);
     assert!(matches!(
-        result,
+        replay_result,
         Err(IsimplePirError::VersionMismatch { .. }),
     ));
 }

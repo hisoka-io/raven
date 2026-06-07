@@ -16,7 +16,7 @@
 //!
 //! The wire shape mirrors the upstream contract verified at
 //! `private-proof-of-innocence/packages/node/src/api/schemas.ts`
-//! and `models/poi-types.ts` — `POST /poi-events/{chainType}/{chainID}`
+//! and `models/poi-types.ts`: `POST /poi-events/{chainType}/{chainID}`
 //! returns `Vec<POISyncedListEvent>` and
 //! `POST /pois-per-blinded-commitment/{chainType}/{chainID}` returns a
 //! `{[bc]: POIStatus}` map.
@@ -231,10 +231,6 @@ impl Corpus {
 fn derive_blinded_commitment(seed: &[u8; 32], index: u32, list_key: &[u8; 32]) -> Result<[u8; 32]> {
     let mut index_be = [0u8; 32];
     index_be[28..].copy_from_slice(&index.to_be_bytes());
-    // light-poseidon enforces canonical Fr inputs. Mask the most
-    // significant 4 bits of seed and list_key copies so any operator-
-    // supplied seed reduces deterministically below the BN254 modulus
-    // without surfacing as an error.
     let seed_masked = mask_to_fr(seed);
     let list_key_masked = mask_to_fr(list_key);
     hash_n(&[seed_masked, index_be, list_key_masked])
@@ -444,20 +440,20 @@ async fn handle_pois_per_blinded_commitment(
         let map: BTreeMap<String, POIStatus> = body
             .blinded_commitment_datas
             .into_iter()
-            .map(|item| (item.blinded_commitment, POIStatus::Missing))
+            .map(|bc_data| (bc_data.blinded_commitment, POIStatus::Missing))
             .collect();
         return Json(map).into_response();
     }
     let mut map: BTreeMap<String, POIStatus> = BTreeMap::new();
-    for item in body.blinded_commitment_datas {
-        let bc_hex = item
+    for bc_data in body.blinded_commitment_datas {
+        let bc_hex = bc_data
             .blinded_commitment
             .strip_prefix("0x")
-            .unwrap_or(&item.blinded_commitment)
+            .unwrap_or(&bc_data.blinded_commitment)
             .to_owned();
         let status =
             decode_hex32(&bc_hex).map_or(POIStatus::Missing, |bytes| corpus.status_for(&bytes));
-        map.insert(item.blinded_commitment, status);
+        map.insert(bc_data.blinded_commitment, status);
     }
     Json(map).into_response()
 }

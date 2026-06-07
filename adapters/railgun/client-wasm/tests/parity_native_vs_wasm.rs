@@ -1,9 +1,5 @@
-//! Byte-equality parity tests: WASM-bindgen wrappers vs pure-Rust client path.
-//!
-//! The wasm-bindgen wrappers can't be invoked from a native test harness (they
-//! take `JsValue` errors). We exercise the underlying marshalling shape via the
-//! pure-Rust mirror functions ([`build_seeded_query_rust`],
-//! [`extract_response_rust`]) which are kept byte-identical with the wasm surface.
+//! Byte-equality parity tests via the pure-Rust mirrors, which are kept identical
+//! to the wasm-bindgen wrappers (the wrappers take `JsValue` and can't run natively).
 
 #![allow(
     clippy::expect_used,
@@ -24,10 +20,7 @@ use raven_inspire::{
 
 use raven_inspire_client_wasm::{build_seeded_query_rust, extract_response_rust};
 
-/// Small parameter set for fast tests. Keeps the secure-128 layout
-/// shape but at d=2048 the test takes ~12 s; we use small here so
-/// CI completes quickly. The byte-equality property holds at any
-/// param shape.
+/// Small params for fast CI; the byte-equality property holds at any param shape.
 fn test_params() -> InspireParams {
     InspireParams {
         ring_dim: 256,
@@ -61,8 +54,7 @@ fn wasm_query_byte_equals_native_when_session_seed_is_pinned() {
     let (crs, encoded_db, sk) =
         inspire_setup(&params, &database, ENTRY_BYTES, &mut sampler).expect("inspire_setup");
 
-    // Two sessions from the same inputs. Packing keys differ (Gaussian samples)
-    // but the protocol output must be byte-equal at the same DB+CRS+index.
+    // packing keys differ across the two sessions, but protocol output is byte-equal
     let mut sampler_native = GaussianSampler::new(params.sigma);
     let session_native =
         ClientSession::new(crs.clone(), sk.clone(), &mut sampler_native).expect("session native");
@@ -118,7 +110,6 @@ fn wasm_query_byte_equals_native_when_session_seed_is_pinned() {
         "wasm-mirror and native client paths must recover byte-identical plaintext for the same row"
     );
 
-    // Sanity: the recovered plaintext matches the database row.
     let db_row_start = (target_idx as usize) * ENTRY_BYTES;
     let db_row_end = db_row_start + ENTRY_BYTES;
     assert_eq!(
@@ -138,8 +129,6 @@ fn wasm_extract_byte_equals_native() {
     let (crs, encoded_db, sk) =
         inspire_setup(&params, &database, ENTRY_BYTES, &mut sampler).expect("inspire_setup");
 
-    // One session, one query, two extract paths. Same response in,
-    // same plaintext out.
     let mut sampler_session = GaussianSampler::new(params.sigma);
     let session = ClientSession::new(crs.clone(), sk, &mut sampler_session).expect("session");
 
@@ -170,10 +159,7 @@ fn wasm_extract_byte_equals_native() {
 
 #[test]
 fn bincode_roundtrip_preserves_query_and_state_shapes() {
-    // The wasm boundary marshals everything via bincode. Confirm
-    // that round-tripping a query + state through bincode is
-    // structurally lossless (so that JS-side hold-and-restore of
-    // the client_state_bincode bytes works).
+    // JS-side hold-and-restore relies on bincode round-trip being structurally lossless
     let params = test_params();
     let database = build_test_db(&params);
     let target_idx: u64 = 3;
@@ -194,11 +180,7 @@ fn bincode_roundtrip_preserves_query_and_state_shapes() {
     assert_eq!(query.shard_id, query_rt.shard_id);
     assert_eq!(query.packing_mode, query_rt.packing_mode);
 
-    // ClientState's secret_key + rlwe_secret_key fields are
-    // `#[serde(skip)]`. After bincode round-trip those fields are
-    // empty / default. The non-skipped index metadata MUST round-
-    // trip; that's what the SDK relies on to map a server response
-    // back to its query index.
+    // keys are serde(skip); only the index metadata round-trips, which is what maps responses to queries
     let state_bytes = bincode::serialize(&state).expect("serialize state");
     let state_rt: raven_inspire::ClientState =
         bincode::deserialize(&state_bytes).expect("deserialize state");
@@ -219,15 +201,9 @@ fn bincode_roundtrip_preserves_query_and_state_shapes() {
         bincode::deserialize(&params_bytes).expect("deserialize params");
 }
 
-/// Regression-guard for the WASM `extract_response` fix: bincode
-/// round-tripping `ClientState` strips both `secret_key` and
-/// `rlwe_secret_key` (`#[serde(skip, default)]`) so a naive post-trip
-/// extract panics in `Poly::mul_ntt` with `Moduli must match`. The
-/// WASM crate's `extract_response` sidesteps this by rehydrating
-/// `rlwe_secret_key` from the live `ClientSession` before calling the
-/// extractor. Native parity tests had a blind spot here because they
-/// hold the live `ClientState` Rust value and never round-trip it;
-/// this test exercises the round-trip path explicitly.
+/// Round-trip strips serde(skip) keys; `extract_response` must rehydrate
+/// `rlwe_secret_key` from the session or `Poly::mul_ntt` panics with `Moduli must
+/// match`. Exercises the trip explicitly since live-value tests never hit it.
 #[test]
 fn bincode_roundtrip_then_rehydrate_extracts_byte_identical_to_live_state() {
     let params = test_params();
@@ -259,8 +235,7 @@ fn bincode_roundtrip_then_rehydrate_extracts_byte_identical_to_live_state() {
     let plain_live =
         extract_response_rust(&crs, &live_state, &response, ENTRY_BYTES).expect("extract live");
 
-    // Path B: bincode round-trip + rehydrate from session-held key.
-    // Mirrors the WASM `extract_response` runtime behaviour exactly.
+    // Path B: round-trip + rehydrate, mirroring the WASM extract_response runtime path
     let state_bytes = bincode::serialize(&live_state).expect("serialize state");
     let mut state_rt: raven_inspire::ClientState =
         bincode::deserialize(&state_bytes).expect("deserialize state");
@@ -274,19 +249,14 @@ fn bincode_roundtrip_then_rehydrate_extracts_byte_identical_to_live_state() {
         "rehydrated round-tripped state must extract byte-identical bytes to live state"
     );
 
-    // Honest-stop sanity: the live extract output matches the DB row at
-    // target_idx. If the rehydration path silently corrupts the row,
-    // this assertion would catch it before the parity assert above.
+    // also pin against the DB row so silent corruption fails before the parity assert
     let db_row_start = (target_idx as usize) * ENTRY_BYTES;
     let db_row_end = db_row_start + ENTRY_BYTES;
     assert_eq!(plain_live, &database[db_row_start..db_row_end]);
 }
 
-/// Companion negative-control: confirm the bincode round-trip alone
-/// (without rehydration) fails. If this ever PASSES it means the
-/// upstream `#[serde(skip)]` annotations were dropped and the
-/// rehydration in `extract_response` is no longer load-bearing — at
-/// which point the WASM crate's extract path can be simplified.
+/// Negative control: round-trip without rehydration must fail. If it ever passes,
+/// upstream dropped `#[serde(skip)]` and the rehydration is no longer load-bearing.
 #[test]
 fn bincode_roundtrip_without_rehydrate_fails_in_extract() {
     let params = test_params();
@@ -318,10 +288,7 @@ fn bincode_roundtrip_without_rehydrate_fails_in_extract() {
     let state_rt: raven_inspire::ClientState =
         bincode::deserialize(&state_bytes).expect("deserialize state");
 
-    // No rehydration: expect a panic in Poly::mul_ntt's
-    // `assert_eq!(self.moduli, other.moduli, "Moduli must match")`.
-    // We `catch_unwind` so the test fails cleanly on the regression
-    // (rather than aborting the harness).
+    // no rehydration: expect a panic in Poly::mul_ntt ("Moduli must match"), caught here
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         extract_response_rust(&crs, &state_rt, &response, ENTRY_BYTES)
     }));
@@ -335,10 +302,7 @@ fn bincode_roundtrip_without_rehydrate_fails_in_extract() {
 
 #[test]
 fn rust_query_path_byte_equals_upstream_query_seeded() {
-    // Sanity: confirm our `build_seeded_query_rust` is a pure
-    // wrapper around the upstream `query_seeded` + a single
-    // `packing_mode` overwrite. If these diverge the wasm boundary
-    // is no longer faithful.
+    // build_seeded_query_rust must stay a thin wrapper over upstream query_seeded + packing_mode set
     let params = test_params();
     let database = build_test_db(&params);
     let target_idx: u64 = 5;
@@ -347,8 +311,7 @@ fn rust_query_path_byte_equals_upstream_query_seeded() {
     let (crs, encoded_db, sk) =
         inspire_setup(&params, &database, ENTRY_BYTES, &mut sampler).expect("inspire_setup");
 
-    // Path A: upstream query() (full ClientQuery, not SeededClientQuery,
-    // so we use query_seeded() for an apples-to-apples compare).
+    // Path A: upstream query_seeded directly
     let mut sampler_a = GaussianSampler::new(params.sigma);
     let sk_a: RlweSecretKey = sk.clone();
     let (state_a, mut query_a) =
@@ -356,7 +319,7 @@ fn rust_query_path_byte_equals_upstream_query_seeded() {
             .expect("upstream query_seeded");
     query_a.packing_mode = PackingMode::Inspiring;
 
-    // Path B: our wasm-mirror via ClientSession.
+    // Path B: wasm-mirror via ClientSession
     let mut sampler_b = GaussianSampler::new(params.sigma);
     let session = ClientSession::new(crs.clone(), sk, &mut sampler_b).expect("session");
     let (state_b, query_b) =

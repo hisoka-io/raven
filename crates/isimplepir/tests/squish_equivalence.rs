@@ -4,29 +4,9 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
-//! Equivalence of squished and unsquished respond paths.
-//!
-//! The squish optimization is correctness-preserving only if the
-//! packed matmul produces a byte-identical answer vector `c ∈ Z_q^L`
-//! to the unsquished `respond` for the same `(DB, query)` pair.
-//! This test file locks that property at E2E scope:
-//!
-//! 1. `squish_respond_byte_equivalent`. For a fixed seeded
-//!    `(db, a_seed, rng_seed, target)`, both `respond(state, query)`
-//!    and `respond_packed(squish_db(state.db), query)` produce
-//!    byte-identical `ServerResponse.answer` vectors.
-//!
-//! 2. `squish_e2e_recovers_planted_value`. Full round-trip via
-//!    the squished path (`setup, query, respond_packed, extract`)
-//!    recovers the planted plaintext element at the target index.
-//!
-//! 3. `squish_unaligned_m_e2e`. `M` not a multiple of 3 forces
-//!    zero-padding of the last packed column; assert the
-//!    equivalence still holds.
-//!
-//! Together these tests prove that a caller may substitute
-//! `respond_packed` for `respond` without observable change at
-//! the protocol layer (same wire bytes, same recovered plaintext).
+//! Squished and unsquished respond paths are equivalent: the packed matmul must
+//! produce a byte-identical answer `c ∈ Z_q^L` to `respond`, so a caller can
+//! substitute `respond_packed` with no protocol-layer change.
 
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
@@ -50,10 +30,9 @@ fn squishable_params(l: usize, m: usize) -> LweParams {
 #[test]
 fn squish_respond_byte_equivalent() {
     let l = 4;
-    let m = 6; // M aligned to compression=3
+    let m = 6; // aligned to compression factor 3
     let params = squishable_params(l, m);
 
-    // Deterministic DB values.
     let db: Vec<u32> = (0..(l * m))
         .map(|i| (i as u32 * 11 + 5) % params.p)
         .collect();
@@ -66,10 +45,8 @@ fn squish_respond_byte_equivalent() {
     let (_state, client_query) =
         query(&mut rng, &out.server.a_seed, &out.server.params, target_idx).expect("query");
 
-    // Unsquished respond.
     let c_unsquished = respond(&out.server, &client_query.query).expect("respond");
 
-    // Squished respond against the same DB.
     let packed = squish_db(&out.server.db, &out.server.params).expect("squish");
     let c_squished = respond_packed(&packed, &client_query.query).expect("respond_packed");
 
@@ -105,9 +82,6 @@ fn squish_e2e_recovers_planted_value() {
     let packed = squish_db(&out.server.db, &out.server.params).expect("squish");
     let c_squished = respond_packed(&packed, &client_query.query).expect("respond_packed");
 
-    // Extract is agnostic to whether the response came from the
-    // squished or unsquished respond path. The wire bytes are
-    // identical.
     let recovered = extract(&out.server.params, &out.hint, &state, &c_squished).expect("extract");
 
     assert_eq!(
@@ -119,8 +93,7 @@ fn squish_e2e_recovers_planted_value() {
 
 #[test]
 fn squish_unaligned_m_e2e() {
-    // M = 5 forces 2 packed columns: one full (cols 0, 1, 2) +
-    // one partial (cols 3, 4, pad).
+    // m = 5 forces a partial last packed column (cols 3, 4, pad).
     let l = 3;
     let m = 5;
     let params = squishable_params(l, m);
@@ -142,7 +115,6 @@ fn squish_unaligned_m_e2e() {
     let (state, client_query) =
         query(&mut rng, &out.server.a_seed, &out.server.params, target_idx).expect("query");
 
-    // Byte-equivalence under unaligned m.
     let c_unsquished = respond(&out.server, &client_query.query).expect("respond");
     let packed = squish_db(&out.server.db, &out.server.params).expect("squish");
     let c_squished = respond_packed(&packed, &client_query.query).expect("respond_packed");
@@ -151,7 +123,6 @@ fn squish_unaligned_m_e2e() {
         "unaligned-m: squished must byte-match unsquished"
     );
 
-    // E2E recovery via squished path.
     let recovered = extract(&out.server.params, &out.hint, &state, &c_squished).expect("extract");
     assert_eq!(recovered, expected);
 }

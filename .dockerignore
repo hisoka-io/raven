@@ -1,11 +1,9 @@
-# Docker build context filter. Build context is the repo root
-# (the railgun adapter path-depends on ../../crates/inspire).
+# Build context is the repo root (the adapter path-depends on ../../crates/inspire).
 
-# Build outputs.
 target/
 **/target/
 
-# Secrets + local-only AI/context. NEVER ship to the daemon or image.
+# secrets + local-only AI/context; never ship to the daemon or image
 run/
 no-commit/
 .claude/
@@ -16,17 +14,14 @@ CLAUDE.*.md
 MEMORY.md
 .mcp.json
 
-# VCS internals. The submodule SOURCE under crates/inspire/ is kept;
-# only the gitlink/.git metadata is dropped.
+# drop the gitlink metadata but keep the crates/inspire source
 .git/
 **/.git
 
-# Node / wasm-pack scratch.
 **/node_modules/
 **/pkg-node/
 **/pkg-bundler/
 
-# Editor / OS cruft.
 **/.DS_Store
 **/*.swp
 **/.idea/

@@ -106,9 +106,8 @@ fn snapshot_bytes(dir_path: &Path, id: SnapshotId) -> Vec<u8> {
     snap.data
 }
 
-/// Spawn the chaos child with `--pause-at <name>`, block until the
-/// JSON sentinel for that checkpoint lands on the child's stdout, then
-/// SIGKILL the child via `Child::kill()` and wait for it to exit.
+/// Spawn the chaos child paused at `checkpoint`, then SIGKILL it once its
+/// stdout sentinel confirms it reached that point.
 fn spawn_park_kill(dir_path: &Path, target: &str, checkpoint: &str) -> String {
     let bin = env!("CARGO_BIN_EXE_migrate_chaos_child");
     let mut child: Child = Command::new(bin)
@@ -133,8 +132,7 @@ fn spawn_park_kill(dir_path: &Path, target: &str, checkpoint: &str) -> String {
         line.clear();
         let n = reader.read_line(&mut line).expect("read child stdout");
         if n == 0 {
-            // EOF before sentinel: the child exited unexpectedly.
-            break;
+            break; // EOF before sentinel: child exited unexpectedly
         }
         let trimmed = line.trim();
         if trimmed.contains("\"checkpoint\"") {
@@ -195,8 +193,6 @@ fn assert_old_encoder_recovers(dir_path: &Path) {
     );
     drop(opened);
 }
-
-// Per-checkpoint scenarios.
 
 #[test]
 #[ignore = "slow: cold-start PIR keygen; run with --ignored"]
@@ -319,8 +315,7 @@ fn real_sigkill_at_post_snapshot_keeps_old_manifest_then_resume_succeeds() {
 
     spawn_park_kill(dir.path(), "per-node", "post-snapshot");
 
-    // New snapshot file is on disk at id+1, but the manifest still
-    // points at the old id (no atomic-rename fired).
+    // snapshot id+1 is on disk but the manifest still points at the old id (no rename fired)
     let manifest_post_kill = read_manifest(dir.path());
     assert_eq!(
         manifest_bytes(dir.path()),
@@ -350,9 +345,7 @@ fn real_sigkill_at_post_snapshot_keeps_old_manifest_then_resume_succeeds() {
 #[test]
 #[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn real_sigkill_at_pre_manifest_bump_keeps_old_manifest_then_resume_succeeds() {
-    // pre-manifest-bump is the alias for post-snapshot; on-disk shape
-    // is identical. Tested as a distinct case so the assertion intent
-    // is named alongside the checkpoint.
+    // pre-manifest-bump aliases post-snapshot (identical on-disk shape); kept distinct for intent
     let dir = tempfile::tempdir().expect("tempdir");
     seed_dir(dir.path(), EncoderKind::PerLeafBc);
 
@@ -386,10 +379,7 @@ fn real_sigkill_at_pre_manifest_bump_keeps_old_manifest_then_resume_succeeds() {
 #[test]
 #[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn real_sigkill_at_post_manifest_bump_yields_fully_migrated_state() {
-    // post-manifest-bump: migration is logically complete BEFORE the
-    // SIGKILL lands. The atomic-rename has fired; on-disk state is
-    // fully migrated. Re-running migration must hit the idempotency
-    // guard ("nothing to migrate") rather than touching disk again.
+    // migration completes before the kill; re-running must hit the idempotency guard, not touch disk
     let dir = tempfile::tempdir().expect("tempdir");
     seed_dir(dir.path(), EncoderKind::PerLeafBc);
 

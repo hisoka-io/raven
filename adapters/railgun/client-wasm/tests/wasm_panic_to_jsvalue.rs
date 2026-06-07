@@ -1,12 +1,6 @@
-//! Invalid-input hardening: every public WASM-bindgen export must surface
-//! bad input as a typed `JsValue` error, not as a WASM trap or native abort.
-//!
-//! Exercises the pure-Rust mirror surface (`build_seeded_query_rust`,
-//! `extract_response_rust`, `path_indices_for_leaf_rust`,
-//! `path_indices_for_per_list_leaf_rust`) plus the bincode decode helpers
-//! behind every wrapper. Each call runs inside `std::panic::catch_unwind`;
-//! structured `Err` is preferred but a caught panic is acceptable as long as
-//! `init_panic_hook` is the documented safety net.
+//! Invalid-input hardening: every export must surface bad input as a typed error
+//! or a caught panic, never a WASM trap or native abort. Runs against the pure-Rust
+//! mirrors, each wrapped in `catch_unwind`.
 
 #![allow(
     clippy::expect_used,
@@ -56,8 +50,6 @@ fn build_test_db(params: &InspireParams) -> Vec<u8> {
     (0..(n * ENTRY_BYTES)).map(|i| (i % 251) as u8).collect()
 }
 
-// path_indices_for_leaf — overflow & boundary inputs
-
 #[test]
 fn path_indices_for_leaf_overflow_returns_typed_err_no_panic() {
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -76,9 +68,7 @@ fn path_indices_for_leaf_overflow_returns_typed_err_no_panic() {
 
 #[test]
 fn path_indices_for_leaf_negative_via_u32_max_cast_returns_typed_err() {
-    // A JS caller might cast a negative i32 to u32 (wraps to large value).
-    // u32::MAX is well past the 2^16 leaves-per-tree bound; the wrapper
-    // MUST reject typed, never trap.
+    // u32::MAX models a JS negative-i32-to-u32 cast; must reject typed, never trap
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| path_indices_for_leaf_rust(0, u32::MAX)));
     let inner = outcome.expect("u32::MAX leaf_idx must NOT panic");
     let err = inner.expect_err("u32::MAX must Err");
@@ -87,10 +77,7 @@ fn path_indices_for_leaf_negative_via_u32_max_cast_returns_typed_err() {
 
 #[test]
 fn path_indices_for_leaf_max_valid_leaf_succeeds_with_16_indices() {
-    // Boundary success: leaf_idx == 2^TREE_DEPTH - 1 is the last valid
-    // leaf and must succeed cleanly. Locks the off-by-one boundary so a
-    // future regression that flips `>=` to `>` (admitting overflow) or
-    // `>=` to `<=` (rejecting the max valid leaf) surfaces here.
+    // last valid leaf; locks the off-by-one so a `>=`->`>` or `>=`->`<=` flip fails here
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
         path_indices_for_leaf_rust(0, LEAVES_PER_TREE - 1)
     }));
@@ -98,8 +85,6 @@ fn path_indices_for_leaf_max_valid_leaf_succeeds_with_16_indices() {
     let indices = inner.expect("max-valid leaf must Ok");
     assert_eq!(indices.len(), 16);
 }
-
-// path_indices_for_per_list_leaf — wrong-length list_key
 
 #[test]
 fn path_indices_for_per_list_leaf_short_list_key_returns_typed_err() {
@@ -151,8 +136,6 @@ fn path_indices_for_per_list_leaf_negative_via_u32_max_returns_typed_err() {
     assert!(err.contains(">= 2^TREE_DEPTH"), "got {err}");
 }
 
-// build_seeded_query — OOB target_idx (ShardConfig panics, not Err; caught by init_panic_hook)
-
 #[test]
 fn build_seeded_query_oob_target_idx_panics_caught_by_unwind() {
     let params = small_params();
@@ -169,21 +152,16 @@ fn build_seeded_query_oob_target_idx_panics_caught_by_unwind() {
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
         build_seeded_query_rust(&session, &params, &encoded_db.config, oob_idx)
     }));
-    // Either (a) raven-inspire returns a typed Err (preferred for
-    // future hardening), OR (b) it panics and `catch_unwind` traps
-    // the unwind. Both are acceptable safety states; the load-bearing
-    // requirement is that the test runner does not abort.
+    // typed Err or caught panic both pass; the requirement is no native abort
     match outcome {
         Ok(Ok(_)) => {
             panic!("u64::MAX target_idx must surface as Err or caught panic, not silent Ok");
         }
         Ok(Err(_)) | Err(_) => {
-            // Pass: surface is structured (Err) or unwind-caught (panic).
+            // structured Err or unwind-caught panic
         }
     }
 }
-
-// extract_response — inflated entry_size (companion to panic_safety.rs)
 
 #[test]
 fn extract_response_inflated_entry_size_returns_or_panics_caught_no_native_abort() {
@@ -210,29 +188,18 @@ fn extract_response_inflated_entry_size_returns_or_panics_caught_no_native_abort
     )
     .expect("respond");
 
-    // Driver: inflate entry_size so num_columns climbs past ring_dim.
+    // drives num_columns past ring_dim
     let inflated_entry_size = (params.ring_dim + 1) * 2;
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
         extract_response_rust(&crs, &state, &response, inflated_entry_size)
     }));
-    // Either Result, regardless of Ok/Err, is acceptable: the
-    // load-bearing assertion is "no native abort". A successful Ok is
-    // also acceptable since the wallet-side check would catch it
-    // separately via the entry-size validation in the wallet SDK.
     match outcome {
-        Ok(_) => {
-            // raven-inspire returned a Result (Ok or Err) without
-            // panicking — best safety state.
-        }
-        Err(_caught_panic) => {
-            // raven-inspire panicked but the unwind was caught.
-            // `init_panic_hook` documents this as the wasm-side
-            // safety net.
-        }
+        // upstream returned a Result without panicking
+        Ok(_) => {}
+        // upstream panicked but the unwind was caught (init_panic_hook net)
+        Err(_caught_panic) => {}
     }
 }
-
-// bincode decode — full wire-shape catalogue; garbage bytes must Err, never panic
 
 #[test]
 fn bincode_decode_garbage_bytes_per_wire_type_returns_err_never_panics() {
