@@ -100,25 +100,12 @@ fn cold_load_writes_cache_then_warm_load_skips_offline_phase() {
          ratio={:.4}",
         warm_elapsed.as_secs_f64() / cold_elapsed.as_secs_f64().max(1e-9)
     );
-    // Correctness invariant is enforced above (line 86 panics if
-    // `build_fresh` runs on the warm path). The timing assertion below
-    // is a smoke check on perf-regression-by-redundant-build; tight
-    // ratio bounds are hardware-dependent. The toy fixture uses
-    // TEST_ENTRIES=256 rather than the d=2048 production cell, so the
-    // cold offline-phase is only tens of ms; under a noisy CI host
-    // running matrix-parallel test shards the cold/warm ratio can drift
-    // close to 1.0 from scheduler jitter alone, even when the warm
-    // path correctly skips O(d^3) build work. The looser invariant
-    // (warm ≤ cold) is enough to catch a regression that re-ran the
-    // build on the warm path; the strict ratio floor lives in the
-    // #[ignore]-gated `production_cell_three_seed_cold_vs_warm` bench
-    // below, which runs at the real cell shape and reports 3-seed
-    // medians.
-    assert!(
-        warm_elapsed <= cold_elapsed,
-        "warm load must be no slower than cold; \
-         cold={cold_elapsed:?} warm={warm_elapsed:?}"
-    );
+    // No wall-clock assertion here: the skip-the-offline-phase invariant
+    // is enforced deterministically by the warm-path panic closure. At the
+    // toy cell both paths are sub-second and I/O-bound, so a cold/warm
+    // comparison is scheduler jitter on a contended CI host. The strict
+    // speedup floor lives in the #[ignore]-gated
+    // `production_cell_three_seed_cold_vs_warm` bench at the real shape.
 }
 
 #[test]
