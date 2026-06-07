@@ -57,14 +57,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: cargo check (wasm32, raven-client)
         run: cargo check -p raven-client --target wasm32-unknown-unknown
       - name: cargo clippy (wasm32, raven-client)
         run: cargo clippy -p raven-client --target wasm32-unknown-unknown -- -D warnings
+      - name: cargo fmt (raven-inspire-client-wasm)
+        run: cargo fmt --manifest-path adapters/railgun/client-wasm/Cargo.toml -- --check
       - name: cargo check (wasm32, raven-inspire-client-wasm)
         run: cargo check --manifest-path adapters/railgun/client-wasm/Cargo.toml --target wasm32-unknown-unknown
+      - name: cargo clippy (wasm32, raven-inspire-client-wasm)
+        run: cargo clippy --manifest-path adapters/railgun/client-wasm/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
 
   railgun-static:
     name: railgun adapter (fmt + check + clippy)

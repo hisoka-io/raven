@@ -66,7 +66,7 @@ RAILWAY_ENDPOINT="${RAVEN_RAILWAY_ENDPOINT:-https://ppoi-node.example.io}"
 SUBSQUID_GRAPHQL="${RAVEN_SUBSQUID_GRAPHQL:-https://squid.example.io/graphql}"
 
 # Sepolia chain id for the Railway endpoint path. Source-of-truth:
-# clones/railgun-research/repo-cache/private-proof-of-innocence/packages/node/src/api/schemas.ts:5
+# private-proof-of-innocence/packages/node/src/api/schemas.ts:5
 SEPOLIA_CHAIN_TYPE=0
 SEPOLIA_CHAIN_ID=11155111
 
@@ -154,7 +154,7 @@ for ((i = 0; i < TREE_COUNT; i++)); do
 
   # ---- Step 2: upstream_root via Railway POST ----
   # Source-of-truth for endpoint shape:
-  #   clones/railgun-research/repo-cache/private-proof-of-innocence/packages/node/src/api/schemas.ts:20-29
+  #   private-proof-of-innocence/packages/node/src/api/schemas.ts:20-29
   #     - GetPOIListEventRangeBodySchema requires:
   #       txidVersion, startIndex, endIndex, listKey
   RAILWAY_URL="$RAILWAY_ENDPOINT/poi-events/$SEPOLIA_CHAIN_TYPE/$SEPOLIA_CHAIN_ID"
@@ -194,7 +194,7 @@ EOF
 
   # ---- Step 3: real_subsquid_root via Subsquid GraphQL ----
   # Source-of-truth for the GraphQL field shape:
-  #   clones/railgun-research/repo-cache/subsquid-integration/schema.graphql:160-178
+  #   subsquid-integration/schema.graphql:160-178
   #     type Transaction { ... merkleRoot: Bytes! ... utxoTreeOut: BigInt! ... }
   # Per-tree IMT root is exposed via Transaction.merkleRoot at the
   # transaction that brought the tree to leaf_count == LEAF_COUNT.

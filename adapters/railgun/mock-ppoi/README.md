@@ -2,7 +2,7 @@
 
 > **SYNTHETIC mock; NOT real OFAC data; NEVER deploy to production.**
 
-Standalone axum binary that impersonates the upstream Railway PPOI
+Standalone axum binary that impersonates the upstream Railgun PPOI
 surface so the adapter's PPOI mirror worker can populate empty PPOI
 instances during the public demo.
 
@@ -33,13 +33,13 @@ authoritative would conflate real-OFAC data with a synthetic corpus.
 Exactly two endpoints are required by the adapter mirror; the other
 two are convenience read-only endpoints:
 
-- `POST /poi-events/{chainType}/{chainID}` — body
+- `POST /poi-events/{chainType}/{chainID}` - body
   `{txidVersion, listKey, startIndex, endIndex}` -> `Vec<POISyncedListEvent>`
-- `POST /pois-per-blinded-commitment/{chainType}/{chainID}` — body
+- `POST /pois-per-blinded-commitment/{chainType}/{chainID}` - body
   `{txidVersion, listKey, blindedCommitmentDatas: [{blindedCommitment, type}]}`
   -> `{[bc]: POIStatus}`
-- `GET /node-status-v2` — list of supported list keys
-- `GET /node-status-v2/{listKey}` — synthetic status for a list
+- `GET /node-status-v2` - list of supported list keys
+- `GET /node-status-v2/{listKey}` - synthetic status for a list
 
 Schemas mirror upstream
 `private-proof-of-innocence/packages/node/src/api/schemas.ts` and

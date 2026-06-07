@@ -186,6 +186,80 @@ async fn phase4_chain_event_propagates_to_pir_response() {
     let _ = tokio::time::timeout(Duration::from_secs(5), handle.consumer).await;
 }
 
+// Gap A regression: a clean shutdown after the chain head has raced ahead of
+// the last applied leaf must persist the LEAF block as the manifest resume
+// floor, not the chain head. A head-based floor skips the lagged leaves on
+// restart and wedges the tree on the next non-contiguous append.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_floor_is_last_leaf_block_not_chain_head() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let params = InspireParams::secure_128_d2048();
+    let db = build_initial_db();
+    let (state, _sk) =
+        setup_state(&params, &db, TOY_ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup");
+    let mut state_holder = Some(state);
+    let factory = move || {
+        state_holder.take().ok_or_else(|| {
+            raven_railgun_core::AdapterError::Internal("factory called twice".into())
+        })
+    };
+
+    let mut config = OrchestratorConfig::demo(dir.path().to_path_buf(), "gap-a-toy");
+    config.use_flock = false;
+    config.role = InstanceRole::Live;
+    config.scheme_tag = SCHEME_TAG.to_owned();
+    config.record_size = TOY_ENTRY_SIZE;
+    config.entries_per_shard = u32::try_from(TOY_ENTRIES).expect("toy entries fits u32");
+    let handle = bootstrap_railgun_engine(config, params, factory).expect("bootstrap");
+
+    const LEAF_BLOCK: u64 = 100;
+    const CHAIN_HEAD: u64 = 5_000;
+    let planted: [u8; 32] = {
+        let mut b = [0u8; 32];
+        b[31] = 0x07;
+        b[30] = 0xab;
+        b
+    };
+    let chain_event = RailgunEvent::Transact {
+        block_number: LEAF_BLOCK,
+        tx_hash: [0u8; 32],
+        tree_number: 0,
+        start_position: 0,
+        leaves: vec![CommitmentLeaf {
+            tree_number: 0,
+            leaf_index: 0,
+            commitment_hash: planted,
+            ciphertext: vec![],
+        }],
+    };
+    handle
+        .sender
+        .send(ConsumerEvent::Chain(chain_event, LEAF_BLOCK))
+        .await
+        .expect("send leaf");
+    // Heartbeat: chain head races far past the last applied leaf (stall shape).
+    handle
+        .sender
+        .send(ConsumerEvent::Heartbeat(CHAIN_HEAD))
+        .await
+        .expect("send heartbeat");
+    handle
+        .sender
+        .send(ConsumerEvent::Shutdown)
+        .await
+        .expect("shutdown");
+    let _ = tokio::time::timeout(Duration::from_secs(30), handle.consumer)
+        .await
+        .expect("consumer joins");
+
+    assert_eq!(
+        handle.persistence.manifest_block_height(),
+        LEAF_BLOCK,
+        "manifest resume floor must equal the last applied-leaf block, not the \
+         chain head ({CHAIN_HEAD}); a head-based floor wedges the tree on restart"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "production cell ~17s; runs alongside production_cell.rs"]
 #[allow(clippy::too_many_lines)]

@@ -2045,8 +2045,8 @@ async fn spawn_chain_indexer(
     })
 }
 
-/// Sample cadence for the `mode_mirror` task: 1 second matches the
-/// rave-WIP reference and keeps `/v1/health/ready.chain_source_mode`
+/// Sample cadence for the `mode_mirror` task: 1 second keeps
+/// `/v1/health/ready.chain_source_mode`
 /// within one sample of the underlying `AutoFallbackChainSource` state.
 const MODE_MIRROR_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 

@@ -18,8 +18,8 @@ Raven closes that gap on the query layer. The wallet sends an encrypted query, t
 
 | Scheme                                              | Status      |
 | --------------------------------------------------- | ----------- |
-| [InsPIRe](https://eprint.iacr.org/2026/030)         | Integrated. |
-| [iSimplePIR](https://eprint.iacr.org/2025/1352)     | WIP         |
+| [InsPIRe](https://eprint.iacr.org/2025/1352)        | Integrated. |
+| [iSimplePIR](https://eprint.iacr.org/2026/030)      | WIP         |
 
 ## Adapters
 

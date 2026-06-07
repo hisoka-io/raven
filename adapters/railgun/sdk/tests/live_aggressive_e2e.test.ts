@@ -5,7 +5,7 @@
  * instance with byte-identity verification + per-instance throughput.
  *
  * Four sweep blocks, all gated behind `RAVEN_LIVE_URL` +
- * `RAVEN_LIVE_TOKEN` env vars:
+ * `RAVEN_LIVE_TOKEN` + `RAVEN_INFURA_URL` env vars:
  *
  *   1. Per-tree byte-identity sweep — N=20 random leaves per
  *      `commit-tree-{0,1,2,3}`, PIR-folded root cross-verified
@@ -57,12 +57,11 @@ const FINDINGS_DIR =
 
 const LIVE_URL = process.env.RAVEN_LIVE_URL;
 const LIVE_TOKEN = process.env.RAVEN_LIVE_TOKEN;
-const INFURA_URL =
-  process.env.RAVEN_INFURA_URL ??
-  "https://mainnet.infura.io/v3/564e7c2feede491db90fead384dbf2f5";
+const INFURA_URL = process.env.RAVEN_INFURA_URL ?? "";
 const RAILGUN_PROXY = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9";
 
-const RUN_LIVE = LIVE_URL !== undefined && LIVE_TOKEN !== undefined;
+const RUN_LIVE =
+  LIVE_URL !== undefined && LIVE_TOKEN !== undefined && INFURA_URL !== "";
 const liveDescribe = RUN_LIVE ? describe : describe.skip;
 
 const PARAMS_DOWNLOAD_TIMEOUT_MS = 240_000;

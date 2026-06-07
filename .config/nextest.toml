@@ -1,4 +1,4 @@
-# nextest config for the rave workspace. Loaded by `cargo nextest run`.
+# nextest config for the raven workspace. Loaded by `cargo nextest run`.
 # Does NOT affect `cargo test` invocations.
 #
 # Why this exists: 109+ release-mode test binaries. `cargo test` runs

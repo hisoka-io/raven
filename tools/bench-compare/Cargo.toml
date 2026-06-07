@@ -1,4 +1,4 @@
-# Standalone manifest. Excluded from the rave root workspace so its
+# Standalone manifest. Excluded from the raven root workspace so its
 # CLI deps (clap) never unify into the wasm32 builds of the core
 # crates.
 #

@@ -16,9 +16,10 @@
  *   6. Cross-validate the recovered root against on-chain
  *      `RailgunSmartWallet.rootHistory(treeNumber, root)` via Infura.
  *
- * Gated entirely behind `RAVEN_LIVE_URL` + `RAVEN_LIVE_TOKEN` env vars.
- * When unset (the CI default), every block is `it.skip(...)`'d so this
- * test never makes network calls in offline lanes.
+ * Gated entirely behind `RAVEN_LIVE_URL` + `RAVEN_LIVE_TOKEN` +
+ * `RAVEN_INFURA_URL` (mainnet RPC for the on-chain root cross-check) env
+ * vars. When any is unset (the CI default), every block is `it.skip(...)`'d
+ * so this test never makes network calls in offline lanes.
  */
 
 import { afterAll, describe, expect, it } from "vitest";
@@ -37,13 +38,12 @@ import { decodeClientPirQueryBundle } from "../src/client-pir";
 
 const LIVE_URL = process.env.RAVEN_LIVE_URL;
 const LIVE_TOKEN = process.env.RAVEN_LIVE_TOKEN;
-const INFURA_URL =
-  process.env.RAVEN_INFURA_URL ??
-  "https://mainnet.infura.io/v3/564e7c2feede491db90fead384dbf2f5";
+const INFURA_URL = process.env.RAVEN_INFURA_URL ?? "";
 const RAILGUN_PROXY = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9";
 const CHAIN_ID = 1;
 
-const RUN_LIVE = LIVE_URL !== undefined && LIVE_TOKEN !== undefined;
+const RUN_LIVE =
+  LIVE_URL !== undefined && LIVE_TOKEN !== undefined && INFURA_URL !== "";
 const liveIt = RUN_LIVE ? it : it.skip;
 
 const PARAMS_DOWNLOAD_TIMEOUT_MS = 240_000;

@@ -1,0 +1,33 @@
+# Keyless RPC pool for `serve-production --config <mainnet.toml>`.
+#
+# Paste this `[rpc_pool]` table into the multi-instance config (next to
+# `[global]`). When present with >= 2 `urls`, the indexer round-robins
+# HTTP eth_getLogs across them with a per-endpoint circuit breaker, and
+# `[global].rpc_url` becomes an unused fallback. No API key required.
+#
+# Live indexing needs only eth_chainId / eth_getBlockByNumber /
+# eth_getLogs (chunked to 499 blocks) / reorg block-hash lookups, all of
+# which these public endpoints serve. Archival eth_call at old blocks is
+# bootstrap-only and is configured separately.
+
+[rpc_pool]
+strategy = "round-robin"        # or "primary-with-failover"
+per_endpoint_rps = 15
+per_endpoint_burst = 30
+cooldown_secs = 30
+urls = [
+  # Tier A: fast, getLogs-capable.
+  "https://eth.drpc.org",
+  "https://ethereum-rpc.publicnode.com",
+  "https://ethereum.public.blockpi.network/v1/rpc/public",
+  "https://eth1.lava.build",
+  "https://ethereum-public.nodies.app",
+  "https://eth.api.onfinality.io/public",
+  "https://rpc.fullsend.to",
+  # Tier B: slower, kept for failover under the circuit breaker.
+  "https://1rpc.io/eth",
+  "https://rpc.sentio.xyz/mainnet",
+  "https://rpc.mevblocker.io/noreverts",
+  "https://rpc.flashbots.net",
+  "https://ethereum-mainnet.gateway.tatum.io",
+]
