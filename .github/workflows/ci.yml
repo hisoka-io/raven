@@ -70,6 +70,17 @@ jobs:
       - name: cargo clippy (wasm32, raven-inspire-client-wasm)
         run: cargo clippy --manifest-path adapters/railgun/client-wasm/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
 
+  hygiene:
+    name: docs/comment hygiene (no internal-label / no-commit-path leaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN }}
+      - name: check-hygiene
+        run: adapters/railgun/scripts/check-hygiene.sh
+
   railgun-static:
     name: railgun adapter (fmt + check + clippy)
     runs-on: ubuntu-latest
