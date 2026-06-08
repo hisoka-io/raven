@@ -155,7 +155,6 @@ pub fn gauss_sample_sigma_6_4<R: RngCore>(rng: &mut R) -> i64 {
             continue;
         };
         if y < cdf {
-            // Flip sign with prob 1/2.
             let sign_bit = rng.next_u64() & 1;
             let mut x = x_candidate as i64;
             if sign_bit == 0 {
@@ -294,8 +293,6 @@ pub fn query<R: RngCore>(
         *slot = u32::from_le_bytes(buf);
     }
 
-    // Pre-sample noise sequentially so RNG consumption is the same
-    // under scalar and parallel matmul (`query_determinism_*` test).
     let mut noise = vec![0u32; params.m];
     for slot in noise.iter_mut() {
         let e_k = gauss_sample_sigma_6_4(rng);
@@ -344,7 +341,6 @@ mod tests {
         let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
         for _ in 0..10_000 {
             let x = gauss_sample_sigma_6_4(&mut rng);
-            // |x| < table_len by construction.
             assert!(
                 x.abs() < table_len,
                 "sampled {x} outside table range [0, {table_len})"
@@ -354,14 +350,9 @@ mod tests {
 
     #[test]
     fn cdf_table_structure_invariants() {
-        // 129 entries matching `simplepir/pir/gauss.go` verbatim:
-        // Go uses a `[...]float64` auto-sized literal; both sides
-        // have been counted element-by-element.
         let len = CDF_TABLE_SIGMA_6_4.len();
         assert_eq!(len, 129, "CDF table must have exactly 129 entries");
-        // cdf[0] = 0.5 (half-Gaussian median at zero).
         assert!((CDF_TABLE_SIGMA_6_4[0] - 0.5).abs() < 1e-9);
-        // Monotonically decreasing past index 1 (values decay rapidly).
         for i in 2..len {
             let prev = CDF_TABLE_SIGMA_6_4[i - 1];
             let curr = CDF_TABLE_SIGMA_6_4[i];

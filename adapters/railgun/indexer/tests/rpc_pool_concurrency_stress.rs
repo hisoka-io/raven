@@ -44,9 +44,6 @@ fn build_balanced_pool() -> Arc<RpcEndpointPool> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn round_robin_distribution_stays_balanced_under_100_concurrent_selectors() {
     let pool = build_balanced_pool();
-    // Index → AtomicU32 selection count. Reuses indexer-side helper:
-    // identify the picked endpoint by `Arc::ptr_eq` against
-    // `pool.endpoints()`.
     let counts: Arc<Vec<AtomicU32>> =
         Arc::new((0..N_ENDPOINTS).map(|_| AtomicU32::new(0)).collect());
 

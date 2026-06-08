@@ -4,11 +4,8 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
-//! End-to-end correctness smoke: setup, query, respond, extract
-//! recovers the planted byte at known indices.
-//!
-//! Toy parameters (small n / L / M) for rapid iteration; the
-//! production-scale 9-PSE-cell bench is out of scope for V0.1.
+//! End-to-end correctness smoke: setup, query, respond, extract recovers the
+//! planted byte at known indices.
 
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
@@ -28,7 +25,6 @@ fn toy_params(l: usize, m: usize) -> LweParams {
 
 #[test]
 fn smoke_e2e_recovers_planted_value_at_one_index() {
-    // Small 4×4 DB populated with (i + j) mod 251 pattern.
     let l = 4;
     let m = 4;
     let params = toy_params(l, m);
@@ -42,8 +38,7 @@ fn smoke_e2e_recovers_planted_value_at_one_index() {
     let a_seed: [u8; SEED_BYTES] = [42u8; 32];
     let out = setup(&db, params, Some(a_seed)).expect("setup");
 
-    // Query index (1, 2): linear idx = 1 * 4 + 2 = 6.
-    let target_idx = 6usize;
+    let target_idx = 6usize; // (row 1, col 2)
     let expected = db[target_idx];
 
     let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
@@ -61,8 +56,6 @@ fn smoke_e2e_recovers_planted_value_at_one_index() {
 
 #[test]
 fn smoke_e2e_three_indices_three_seeds() {
-    // Byte-equality across 3 indices × 3 RNG seeds. Replicates
-    // the adapter-level smoke pattern from raven-b1-bench.
     let l = 8;
     let m = 8;
     let params = toy_params(l, m);

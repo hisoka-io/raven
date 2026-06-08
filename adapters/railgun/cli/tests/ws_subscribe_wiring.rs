@@ -1,31 +1,9 @@
-//! Wiring tests for the `--ws-endpoint` flag on `serve-production`.
+//! Wiring tests for `--ws-endpoint` on `serve-production`: the WS primary
+//! serves while healthy, transport-class errors fall back to polling, and the
+//! transition surfaces through the `ModeFlag` the `/v1/health/ready` handler reads.
 //!
-//! Verify that:
-//!
-//! 1. The chain-source construction in the multi-instance bootstrap
-//!    selects [`raven_railgun_indexer::AutoFallbackChainSource`] when
-//!    `--ws-endpoint` is set, and that synchronous chain methods route
-//!    through the WS primary first, falling through to the polling
-//!    fallback on transport-class errors.
-//!
-//! 2. The fallback transition is observable through a
-//!    [`raven_railgun_indexer::ModeFlag`] mirror — the same flag the
-//!    HTTP `/v1/health/ready` handler reads to surface
-//!    `chain_source_mode=subscribe|polling`.
-//!
-//! 3. A synthetic WS that returns a "method not supported" error for
-//!    `eth_call`-class methods is treated as a transport break and
-//!    pool-routed sync calls succeed via fallback.
-//!
-//! 4. The `/v1/health/ready` JSON body surfaces `chain_source_mode`
-//!    when an [`AppState`] is built with
-//!    [`raven_railgun_http::AppState::with_chain_source_mode`].
-//!
-//! These tests do NOT spin up a real `tokio_tungstenite` WS server —
-//! that path is covered by `raven-railgun-indexer`'s own
-//! `tests/ws_subscribe_listener.rs`. Here we drive the wrapper with
-//! synthetic [`raven_railgun_indexer::ChainSource`] impls so the
-//! assertions stay deterministic.
+//! Driven with synthetic `ChainSource` impls for determinism; the real
+//! `tokio_tungstenite` listener is covered by the indexer crate's own tests.
 
 #![allow(
     clippy::expect_used,
@@ -53,9 +31,8 @@ fn proxy() -> alloy::primitives::Address {
     alloy::primitives::address!("fa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9")
 }
 
-/// Synthetic primary that mimics a WS endpoint. Returns `Ok` for the
-/// first `success_budget` calls, then `Err(IndexerError::Rpc(...))`
-/// matching the WS-transport classifier so the wrapper falls back.
+/// WS-like primary: `Ok` for `success_budget` calls, then a transport-class
+/// `Rpc` error so the wrapper falls back.
 #[derive(Debug)]
 struct FlakyWsLike {
     success_budget: AtomicU64,
@@ -137,9 +114,7 @@ impl ChainSource for FlakyWsLike {
     }
 }
 
-/// Static fallback: every method returns a fixed sentinel value, no
-/// failure modes. Used to prove the wrapper actually routed via the
-/// fallback after the primary failed.
+/// Always-succeeds fallback returning fixed sentinels; proves the wrapper routed here.
 #[derive(Debug)]
 struct StaticFallback {
     head: u64,
@@ -191,11 +166,7 @@ impl ChainSource for StaticFallback {
     }
 }
 
-/// 1. Verifies that synthetic events flow through the WS primary in
-///    `Subscribe` mode and that the orchestrator's mode-mirror task
-///    keeps the [`ModeFlag`] aligned with the wrapper's internal mode.
-///    Models the "happy path" the operator sees on `/v1/health/ready`
-///    when the WS endpoint is healthy.
+/// Happy path: healthy WS stays in `Subscribe` and the mirror keeps `ModeFlag` aligned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serve_production_with_ws_endpoint_uses_subscribe_listener() {
     let primary = Arc::new(FlakyWsLike::new(64, 1_001));
@@ -205,8 +176,7 @@ async fn serve_production_with_ws_endpoint_uses_subscribe_listener() {
         Arc::clone(&fallback),
     ));
 
-    // Same mirror task the production binary spawns: poll the
-    // wrapper's mode and write into a ModeFlag.
+    // mirrors the production task: poll wrapper mode into a ModeFlag
     let flag = Arc::new(ModeFlag::new(ChainSourceMode::Subscribe));
     let flag_for_task = Arc::clone(&flag);
     let auto_for_task = Arc::clone(&auto);
@@ -217,7 +187,6 @@ async fn serve_production_with_ws_endpoint_uses_subscribe_listener() {
         }
     });
 
-    // Drive a few sync calls; primary serves them.
     for _ in 0..5u32 {
         let n = auto.latest_block().await.expect("latest");
         assert_eq!(n, 1_001, "WS primary should serve while budget remains");
@@ -234,10 +203,7 @@ async fn serve_production_with_ws_endpoint_uses_subscribe_listener() {
     drop(auto);
 }
 
-/// 2. Verifies that a WS primary that fails after `success_budget`
-///    calls trips the AutoFallback wrapper into `Polling` mode, and
-///    that the operator-visible ModeFlag picks up the transition
-///    within ~1 mirror-tick (the production binary uses a 1 s tick).
+/// WS failure after budget trips the wrapper to `Polling` and the ModeFlag follows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serve_production_ws_drop_falls_back_to_pool_within_60s() {
     let primary = Arc::new(FlakyWsLike::new(2, 9_999));
@@ -257,8 +223,7 @@ async fn serve_production_ws_drop_falls_back_to_pool_within_60s() {
         }
     });
 
-    // Drain past the budget; the third call hits the WS error path,
-    // routes to fallback, and the wrapper stamps Polling.
+    // third call exhausts the budget, routes to fallback, stamps Polling
     let _a = auto.latest_block().await.expect("first ok");
     let _b = auto.latest_block().await.expect("second ok");
     let n = auto
@@ -270,7 +235,6 @@ async fn serve_production_ws_drop_falls_back_to_pool_within_60s() {
         "after WS budget exhausts, the value must come from fallback"
     );
 
-    // Mirror task lifts the ModeFlag to Polling within a tick.
     let started = std::time::Instant::now();
     while started.elapsed() < Duration::from_secs(2) {
         if flag.get() == ChainSourceMode::Polling {
@@ -288,15 +252,9 @@ async fn serve_production_ws_drop_falls_back_to_pool_within_60s() {
     let _ = tokio::time::timeout(Duration::from_secs(2), mirror).await;
 }
 
-/// 3. Verifies the prompt's specified case: WS primary returns
-///    "method not supported" on a `root_history`-class call (as a
-///    node without `eth_call` over WS would). The wrapper classifies
-///    the error as transport-level and routes via the pool fallback.
+/// "method not supported" on a `root_history` call is a transport break that routes to fallback.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serve_production_pool_handles_eth_call_when_ws_returns_method_not_supported() {
-    // Budget=0 makes the primary's `root_history` arm immediately
-    // surface "method not supported", which `is_ws_transport_error`
-    // classifies as a transport break.
     let primary = Arc::new(FlakyWsLike::new(0, 0));
     let fallback = Arc::new(StaticFallback::new(0));
     let auto = AutoFallbackChainSource::new(Arc::clone(&primary), Arc::clone(&fallback));
@@ -318,20 +276,10 @@ async fn serve_production_pool_handles_eth_call_when_ws_returns_method_not_suppo
     );
 }
 
-/// 4. End-to-end: build a stand-alone `WsChainSource` and confirm
-///    that the orchestrator-side wiring produces a `ModeFlag` whose
-///    string form (`subscribe` / `polling`) is exactly what the HTTP
-///    `/v1/health/ready` handler serializes (per the JSON wiring at
-///    `crates/raven-railgun-adapter/crates/raven-railgun-http/src/lib.rs`
-///    near `health_ready_handler`). We don't stand up a server here —
-///    the JSON shape is locked by the http crate's own tests; this
-///    test guards the FlagMode → string mapping the orchestrator
-///    relies on.
+/// Guards the `ChainSourceMode` -> string mapping the `/v1/health/ready` handler serializes.
 #[tokio::test]
 async fn serve_production_health_ready_surfaces_chain_source_mode() {
-    // Construct a real `WsChainSource` to confirm the constructor
-    // accepts a `wss://...` URL without an immediate handshake (lazy
-    // `provider()`) — the orchestrator's bootstrap depends on this.
+    // constructor must accept a wss:// URL without an eager handshake (lazy provider)
     let ws = WsChainSource::new("wss://eth.example/v1", proxy(), 1);
     assert_eq!(ws.rpc_url(), "wss://eth.example/v1");
     assert_eq!(
@@ -339,7 +287,6 @@ async fn serve_production_health_ready_surfaces_chain_source_mode() {
         format!("0x{PROXY_HEX}")
     );
 
-    // Verify the FlagMode → string mapping the HTTP handler surfaces.
     let flag = Arc::new(ModeFlag::new(ChainSourceMode::Subscribe));
     let mode_str = match flag.get() {
         ChainSourceMode::Subscribe => "subscribe",
@@ -354,10 +301,7 @@ async fn serve_production_health_ready_surfaces_chain_source_mode() {
     assert_eq!(mode_str, "polling");
 }
 
-/// MultiServeOptions plumbing regression: the new `ws_endpoint` field
-/// is constructible alongside the rest of the struct so the
-/// integration paths don't have to be modified again to thread WS
-/// through.
+/// `MultiServeOptions` is constructible with the `ws_endpoint` field set.
 #[test]
 fn multi_serve_options_accepts_ws_endpoint() {
     use raven_railgun_cli::serve_production_multi::MultiServeOptions;

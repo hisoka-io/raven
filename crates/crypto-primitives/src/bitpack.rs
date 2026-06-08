@@ -31,11 +31,11 @@ pub fn pack_u32s(values: &[u32], bits_per_limb: u8) -> Result<Vec<u8>, BitpackEr
     let mut out = vec![0u8; total_bytes];
 
     let mut bit_cursor: usize = 0;
-    for &v in values {
+    for &limb in values {
         let masked = if bits_per_limb == MAX_BITS_PER_LIMB {
-            v
+            limb
         } else {
-            v & ((1u32 << bits_per_limb) - 1)
+            limb & ((1u32 << bits_per_limb) - 1)
         };
         for bit_idx in 0..bits_per_limb_usize {
             let bit = (masked >> bit_idx) & 1;
@@ -85,7 +85,7 @@ pub fn unpack_u32s(
     let mut out = Vec::with_capacity(count);
     let mut bit_cursor: usize = 0;
     for _ in 0..count {
-        let mut v: u32 = 0;
+        let mut limb: u32 = 0;
         for bit_idx in 0..bits_per_limb_usize {
             let src_bit = bit_cursor + bit_idx;
             let byte = src_bit / 8;
@@ -94,9 +94,9 @@ pub fn unpack_u32s(
             #[allow(clippy::expect_used)]
             let src_byte = *bytes.get(byte).expect("cursor within bounds");
             let bit = u32::from((src_byte >> offset) & 1);
-            v |= bit << bit_idx;
+            limb |= bit << bit_idx;
         }
-        out.push(v);
+        out.push(limb);
         bit_cursor += bits_per_limb_usize;
     }
     Ok(out)
@@ -171,7 +171,6 @@ mod tests {
 
     #[test]
     fn high_bits_beyond_width_are_masked_on_pack() {
-        // 3-bit packing: only low 3 bits survive.
         let packed = pack_u32s(&[0xFFFF_FFFFu32], 3).expect("pack");
         let unpacked = unpack_u32s(&packed, 1, 3).expect("unpack");
         assert_eq!(unpacked, vec![0b111]);
@@ -199,12 +198,10 @@ mod tests {
 
     #[test]
     fn truncated_input_is_rejected() {
-        // Packing 10 limbs at 14 bits = 140 bits = 18 bytes.
         let values: Vec<u32> = vec![1; 10];
         let packed = pack_u32s(&values, 14).expect("pack");
         assert_eq!(packed.len(), 18);
 
-        // Drop last byte, attempt to unpack.
         let truncated = &packed[..packed.len() - 1];
         let err = unpack_u32s(truncated, 10, 14).expect_err("should refuse short input");
         let (got, needed) = <(usize, usize)>::try_from(err).expect("truncation variant");

@@ -71,9 +71,7 @@ fn per_leaf_bc_rejects_zero_entries_per_shard() {
 fn per_list_status_rejects_too_small_record_size() {
     let err = PerListStatusEncoder::new(8, ENTRIES, LIST_KEY).expect_err("must reject 8");
     let msg = format!("{err}");
-    // The encoder may surface either the size floor or a different
-    // structural rejection; both are valid signals — assert at
-    // least that an Err surfaced.
+    // Size floor or other structural rejection both acceptable; assert only Err.
     assert!(!msg.is_empty());
 }
 
@@ -98,10 +96,7 @@ fn encoder_kind_build_round_trips_record_size_for_perleaf_bc() {
 
 #[test]
 fn encoder_kind_build_pins_path_record_to_512_bytes_regardless_of_hint() {
-    // PerLeafPath ignores the caller's record_size hint and pins to
-    // 512 B (16 siblings * 32 B). The `build` method's contract is
-    // that the resulting encoder's `record_size()` MUST be 512 B,
-    // not the hint.
+    // PerLeafPath pins record_size() to 16 siblings * 32 B, ignoring the hint.
     let built = EncoderKind::PerLeafPath { tree_number: 0 }
         .build(123, ENTRIES)
         .expect("build");
@@ -118,10 +113,7 @@ fn encoder_kind_build_pins_list_path_record_to_512_bytes_regardless_of_hint() {
 
 #[test]
 fn per_node_encoder_flat_index_round_trips_level_and_offset() {
-    // Per `PerNodeEncoder` contract: level 0 is leaves and occupies
-    // `[0, 2^D)` with D=16 (TREE_DEPTH); each successive level
-    // halves the slot count. Round-trip MUST hold for every valid
-    // (level, offset) pair within that span.
+    // Level 0 (leaves) spans [0, 2^D), D=16; each level halves the slot count.
     let depth: u32 = 16;
     for level in 0u32..=depth {
         let span = 1u32 << (depth - level);
@@ -147,12 +139,6 @@ fn per_node_encoder_flat_index_round_trips_level_and_offset() {
 #[test]
 fn per_leaf_path_encoder_pins_tree_number() {
     let enc = PerLeafPathEncoder::new(PATH_BYTES, ENTRIES, 42).expect("build");
-    // The encoder's label is the same string as for any other tree
-    // (label is the encoder kind, not the instance), but the inner
-    // tree_number is what makes the encoder produce the right path.
-    // Cross-check by materializing an empty shard and asserting it
-    // returns a vector of the right size — proves the constructor
-    // succeeded with the supplied tree_number.
     let store = raven_railgun_engine::inspire::LogicalLeafStore::new();
     let bytes = enc.materialize_shard(0, &store);
     assert_eq!(

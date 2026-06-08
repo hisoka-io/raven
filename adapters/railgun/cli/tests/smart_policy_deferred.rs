@@ -158,7 +158,6 @@ async fn wait_for_chain_tree_count(
     );
 }
 
-// SIGHUP hot-reload of [[instance_template]]
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "slow: cold-start PIR keygen; run with --ignored"]
@@ -223,13 +222,11 @@ data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
     let live_runtime: Arc<arc_swap::ArcSwap<AutoSpawnRuntime>> =
         Arc::new(arc_swap::ArcSwap::from_pointee(initial_runtime));
 
-    // Inline reload loop matching the production handler so the test
-    // does not need to expose the internal helper across the lib boundary.
+    // inline reload loop mirroring the production handler; avoids exposing it across the lib boundary
     let reload_handle = {
         let cfg_path = cfg_path.clone();
         let live = Arc::clone(&live_runtime);
         tokio::spawn(async move {
-            // Inline reload loop matching the production handler:
             use tokio::signal::unix::{signal, SignalKind};
             let mut hup = signal(SignalKind::hangup()).expect("sighup handler");
             let mut known_ids: std::collections::HashSet<String> =
@@ -584,8 +581,7 @@ data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
     reload_handle.abort();
 }
 
-// Multi-list PPOI auto-spawn — parser-validation half. Dynamic
-// discovery is deferred until the engine exposes a list_observed tap.
+// PPOI list-template TOML parsing and validation
 #[test]
 fn multi_list_ppoi_auto_spawn_on_new_list_key() {
     use std::io::Write;
@@ -742,8 +738,7 @@ async fn tree_fill_threshold_pre_spawns_at_95_percent() {
         tree1_dir.display(),
     );
 
-    // Idempotency: a second invocation for the same tree is a no-op,
-    // otherwise a flapping fill metric would spam spawns each tick.
+    // idempotent: a flapping fill metric must not respawn a known tree each tick
     let again = pre_spawn_for_tree(
         &runtime,
         &params,

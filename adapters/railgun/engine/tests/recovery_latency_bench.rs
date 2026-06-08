@@ -24,10 +24,7 @@ fn test_encoder() -> Arc<dyn PirTableEncoder> {
 
 #[test]
 #[ignore = "production-cell setup is heavy (~12s); cold-start measurement"]
-// Asserts the V1 budget (< 5 s). The function name reflects the
-// asserted budget rather than the original architecture target
-// (≤ 1 s). V1 cannot hit ≤ 1 s without a cache-carry-across-swaps
-// optimization, deferred to V2.
+// asserts < 5s; the < 1s target needs cache-carry-across-swaps, not yet implemented
 fn recovery_from_production_cell_snapshot_under_5s() {
     let setup_start = Instant::now();
     let params = InspireParams::secure_128_d2048();
@@ -42,7 +39,6 @@ fn recovery_from_production_cell_snapshot_under_5s() {
     let setup_elapsed = setup_start.elapsed();
     eprintln!("recovery_bench: setup elapsed = {setup_elapsed:?}");
 
-    // Snapshot the state to disk.
     let dir = tempfile::tempdir().expect("tempdir");
     {
         let layout = StoreLayout::open(dir.path()).expect("layout");
@@ -57,9 +53,7 @@ fn recovery_from_production_cell_snapshot_under_5s() {
         opened.persistence.commit(&state, 0).expect("commit");
     }
 
-    // Cold-start recovery: manifest-load + snapshot-load +
-    // bincode-deserialize + ServerInspiringCache rebuild. WAL replay is
-    // empty (no events appended).
+    // cold start: manifest-load + snapshot-load + deserialize + cache rebuild; WAL replay is empty
     let layout2 = StoreLayout::open(dir.path()).expect("layout 2");
     let recovery_start = Instant::now();
     let opened = InspirePersistence::open(
@@ -77,9 +71,7 @@ fn recovery_from_production_cell_snapshot_under_5s() {
     assert_eq!(recovered.entry_size, entry_size);
     assert_eq!(recovered.variant, InspireVariant::TwoPacking);
 
-    // Production-deployment recovery target is <= 1 s for the cache-
-    // rebuild-bound path. Loosened to 5 s for first-cold-page noise +
-    // contended-host variability; tighten after a steady-state baseline.
+    // 5s floor (target is 1s): absorbs first-cold-page noise and contended-host variability
     assert!(
         recovery_elapsed < Duration::from_secs(5),
         "recovery latency regressed: {recovery_elapsed:?} > 5 s"

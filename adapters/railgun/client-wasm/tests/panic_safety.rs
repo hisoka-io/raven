@@ -1,39 +1,6 @@
-//! Failure-injection tests for the WASM client surface.
-//!
-//! Pathological inputs MUST never cause an unhandled Rust panic that
-//! crosses the FFI boundary as an opaque `RuntimeError: unreachable
-//! executed` trap (the WebAssembly trap surfaced when a Rust panic
-//! aborts in a `panic = "abort"` build). Every documented entry-point
-//! must either return a structured error (`Result<_, JsValue>` /
-//! `Result<_, String>` for the pure-Rust mirrors) or, if upstream
-//! raven-inspire panics on a load-bearing invariant, the panic must
-//! be caught by `console_error_panic_hook` (installed via
-//! [`raven_inspire_client_wasm::init_panic_hook`]) so the SDK's JS
-//! caller receives a structured `Error` instead of a trap.
-//!
-//! The wasm-bindgen wrappers themselves cannot be invoked from a
-//! native test harness (they take `JsValue` errors). We exercise the
-//! pure-Rust mirror surface
-//! ([`extract_response_rust`], [`build_seeded_query_rust`]) plus the
-//! bincode decode helpers behind the wasm-bindgen wrappers, against
-//! every malformed-input shape we expect a hostile or buggy SDK to
-//! hand the module.
-//!
-//! Coverage:
-//!
-//! 1. `bincode::deserialize` of garbage bytes returns `Err`; never
-//!    panics. Every constructor argument the SDK passes (CRS, params
-//!    bundle, secret key, shard config, query, state, response) is
-//!    bincode-decoded inside the wasm-bindgen surface.
-//! 2. `extract_response_rust` against a structurally wrong (mismatched
-//!    CRS / response / state) input returns either a typed `Err` or
-//!    panics in upstream raven-inspire. If a panic surfaces, this
-//!    test catches it via `std::panic::catch_unwind` and asserts that
-//!    the panic-hook-installer documented in `init_panic_hook` is
-//!    advertised as the supported safety net.
-//! 3. `extract_response_rust` against a state with an `entry_size`
-//!    that drives `num_columns > ring_dim` (the raven-inspire
-//!    panic-on-out-of-bounds invariant) is caught.
+//! Failure-injection tests: pathological input must surface as a typed `Err` or a
+//! caught panic, never as an unhandled WASM trap. Run against the pure-Rust mirrors
+//! since the wasm-bindgen wrappers take `JsValue` and can't run natively.
 
 #![allow(
     clippy::expect_used,
@@ -182,16 +149,8 @@ fn extract_with_inflated_entry_size_does_not_silently_succeed() {
     )
     .expect("respond");
 
-    // Inflate `entry_size` so `num_columns = ceil(entry_size * 8 / 16)`
-    // climbs past the ring dimension. raven-inspire's
-    // `extract_inspiring` indexes `decrypted.coeff(col)` for
-    // `col in 0..num_columns`; the underlying `Polynomial::coeff`
-    // panics with `assert!` on out-of-bounds (see
-    // `crates/raven-inspire/src/math/poly.rs`). The wasm boundary
-    // MUST either propagate this as a typed error or, on a panic,
-    // the `init_panic_hook` safety net surfaces a structured JS
-    // exception. We assert the call returns from `catch_unwind`
-    // (no native abort) so the hook is the load-bearing safety net.
+    // drives num_columns past ring_dim, hitting Polynomial::coeff's bounds assert
+    // (crates/raven-inspire/src/math/poly.rs); must surface as Err or caught panic
     let inflated_entry_size = (params.ring_dim + 1) * 2;
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
         extract_response_rust(&crs, &state, &response, inflated_entry_size)
@@ -250,25 +209,10 @@ fn extract_with_zero_entry_size_does_not_panic() {
 
 #[test]
 fn build_seeded_query_with_oob_target_idx_panics_in_upstream_caught_by_panic_hook() {
-    // BUG-LOCK: raven-inspire's `ShardConfig::shard_id_for_global` (in
-    // `crates/raven-inspire/src/params.rs`) calls
-    // `u32::try_from(shard_id).expect("ShardConfig produces shard_id
-    // > u32::MAX; ShardConfig::validate should have been called")`
-    // when `target_idx` exceeds `entries_per_shard * u32::MAX`. The
-    // wasm boundary's `build_seeded_query` reaches this path on a
-    // hostile / buggy SDK that hands an out-of-range `target_idx`.
-    //
-    // In a `panic = "abort"` WASM build the panic would surface as
-    // `RuntimeError: unreachable executed` with no message. The
-    // production safety net is `init_panic_hook` (added with this
-    // workstream); when JS calls `init_panic_hook()` once at module
-    // load, `console_error_panic_hook::set_once()` registers a hook
-    // that converts panics to `console.error` + a JS `Error` instead
-    // of an opaque trap.
-    //
-    // This test runs natively (panic = "unwind") and asserts via
-    // `catch_unwind` that the panic IS caught - the same panic
-    // payload that `console_error_panic_hook` intercepts in WASM.
+    // out-of-range target_idx hits an upstream `expect` in
+    // `ShardConfig::shard_id_for_global` (crates/raven-inspire/src/params.rs).
+    // catch_unwind here stands in for the WASM `init_panic_hook` net that turns
+    // the same panic into a JS Error instead of an opaque trap.
     let params = small_params();
     let database = build_test_db(&params);
 

@@ -1,13 +1,4 @@
-/**
- * Multi-chain raven-railgun adapter routing registry.
- *
- * Wallet integrators run one raven-railgun deployment per chain;
- * `ChainRegistry` is the table the SDK consults to map a `chainId`
- * to the right adapter URL + bearer token. The table is initially
- * seeded by the wallet (per-chain config) and refreshed from the
- * server's `/v1/status` route on bootstrap or on observed epoch
- * advance.
- */
+/** Per-chain routing table mapping `chainId` to adapter URL + bearer token. */
 
 import { RavenError } from "./errors";
 
@@ -24,11 +15,7 @@ export interface ChainRegistryEntry {
   readonly schemaVersion?: number;
 }
 
-/**
- * Routing table the SDK consults per request. Uses a `Map<chainId,
- * Entry>` so lookups are O(1) and multi-chain wallets can register
- * one entry per chain.
- */
+/** Per-request routing table; one entry per chain. */
 export class ChainRegistry {
   private readonly entries: Map<number, ChainRegistryEntry> = new Map();
   private fetchImpl: typeof fetch;
@@ -74,13 +61,7 @@ export class ChainRegistry {
     return Array.from(this.entries.keys()).sort((a, b) => a - b);
   }
 
-  /**
-   * Re-fetch `/v1/status` for the named chain and update the cached
-   * `epoch` + `schemaVersion`. The /v1/status route returns a JSON
-   * body with `epoch` and `wire_schema_version` fields; on a 4xx /
-   * 5xx the registry entry is left unchanged but the call surfaces
-   * a typed error.
-   */
+  /** Re-fetch `/v1/status` and update cached `epoch` + `schemaVersion`; entry unchanged on error. */
   async refresh(chainId: number): Promise<ChainRegistryEntry> {
     const e = this.resolve(chainId);
     const url = `${e.endpoint}/v1/status`;

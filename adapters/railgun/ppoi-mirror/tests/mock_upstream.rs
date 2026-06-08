@@ -295,11 +295,9 @@ async fn fetch_status_typed_returns_decode_when_response_missing_key() {
 }
 
 /// Worker-path test: every upstream `/poi-events` row must surface BOTH
-/// `PpoiListLeafAdded` (for per-list IMT growth + the `(BC -> idx)`
-/// ordering oracle T2 path PIR consumes) AND `PpoiStatus` (for the
-/// `(list_key, bc) -> status` map T1 status PIR consumes), in that
-/// order. Closes the worker-path gap where only `PpoiStatus` fired and
-/// the per-list IMT never grew (which silently broke T2 path PIR).
+/// `PpoiListLeafAdded` (per-list IMT growth + `(BC -> idx)` ordering
+/// oracle for T2 path PIR) AND `PpoiStatus` (`(list_key, bc) -> status`
+/// map for T1 status PIR), in that order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mirror_emits_ppoi_list_leaf_added_for_each_event() {
     let (url, _state, server_handle) = start_mock().await;
@@ -319,11 +317,8 @@ async fn mirror_emits_ppoi_list_leaf_added_for_each_event() {
         }
     });
 
-    // Drain the first 6 payloads and assert strict (LeafAdded, Status)
-    // interleaving: for each `/poi-events` row the worker emits the
-    // IMT-grow payload FIRST and the status payload SECOND. Flipping
-    // the order would silently break T2 path PIR — see the engine
-    // apply path's PpoiListLeafAdded contiguity invariant.
+    // Flipping the (LeafAdded, Status) order would silently break T2 path PIR;
+    // see the engine apply path's PpoiListLeafAdded contiguity invariant.
     let mut got: Vec<WalEntryPayload> = Vec::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
     while got.len() < 6 {

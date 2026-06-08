@@ -19,8 +19,7 @@ use raven_railgun_persistence::{
 
 #[allow(clippy::too_many_lines)]
 pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
-    // open_with_lock acquires flock(LOCK_EX | LOCK_NB); fails with LockHeld if a live server
-    // holds the data_dir. Lock guard bound for the function's lifetime.
+    // Exclusive flock held for the function lifetime; LockHeld if a live server holds the data_dir.
     let (layout, _data_dir_lock) = StoreLayout::open_with_lock(data_dir).map_err(|e| {
         anyhow::anyhow!(
             "open data_dir {} (with exclusive lock): {e}. \
@@ -60,17 +59,12 @@ pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
     let snap = Snapshot::load(&layout, manifest.current_snapshot_id)
         .map_err(|e| anyhow::anyhow!("snapshot load: {e}"))?;
 
-    // V6 dispatcher: returns `(state, embedded_store)` for V6 snapshots and
-    // falls back to a default-empty store for legacy V5 bytes (with a
-    // `tracing::warn` from the helper). The embedded store seeds the WAL
-    // replay base below, mirroring the open path at `InspirePersistence::open`.
+    // Embedded store (default-empty for legacy V5) seeds the WAL replay base, per `open`.
     let (mut state, recovered_seed_store) = restore_inspire_state_v6(&snap.data)
         .map_err(|e| anyhow::anyhow!("restore_inspire_state_v6: {e}"))?;
 
-    // Replay WAL entries past the snapshot floor onto the recovered seed
-    // store (matches `InspirePersistence::open`). The noop encoder is only
-    // needed for `apply_wal_entry`'s dirty-shard tracking, which is
-    // irrelevant on the offline migration path.
+    // Replay past the snapshot floor onto the seed store. The noop encoder only feeds
+    // `apply_wal_entry`'s dirty-shard tracking, irrelevant on the offline migration path.
     let noop_encoder: Arc<dyn PirTableEncoder> = {
         use raven_railgun_engine::pir_table::PerLeafCommitmentEncoder;
         Arc::new(
@@ -134,12 +128,8 @@ pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("re_encode_shard {shard_id}: {e}"))?;
     }
 
-    // V6 envelope: re-embed the `LogicalLeafStore` we just rebuilt so the
-    // post-migration on-disk state stays internally consistent with the
-    // V6 manifest stamped below. The pre-fix writer (`snapshot_inspire_state`)
-    // dropped the store, leaving V6 manifest + V5 body + empty store — every
-    // subsequent open returned `recovered_logical_store = default::()` and
-    // chain events landed against an empty store.
+    // Re-embed the rebuilt store so the V6 body stays consistent with the manifest stamped below;
+    // otherwise opens recover an empty store and chain events land against nothing.
     let bundle = snapshot_inspire_state_v6(&state, &logical_store)
         .map_err(|e| anyhow::anyhow!("snapshot_inspire_state_v6: {e}"))?;
     let new_snap = Snapshot::build(bundle);

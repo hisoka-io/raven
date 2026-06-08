@@ -23,13 +23,11 @@ use std::time::Duration;
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-test";
 
-// Toy DB: smallest cell (256x256) that exercises the production stack.
+// smallest cell that exercises the production stack
 const TOY_ENTRIES: usize = 256;
 const TOY_ENTRY_SIZE: usize = 256;
 
-// Locked production cell: T2/T3 PPOI / commit-tree path-table shape.
-// ~17 s wall (3.7 s setup + 3.7 s ClientSession + ~5 ms re-encode
-// + ~70 ms respond) so `#[ignore]`-gated.
+// production cell shape; ~17s wall so `#[ignore]`-gated
 const PROD_ENTRIES: usize = 65_536;
 const PROD_ENTRY_SIZE: usize = 512;
 
@@ -50,8 +48,7 @@ async fn phase4_chain_event_propagates_to_pir_response() {
     let params = InspireParams::secure_128_d2048();
     let db = build_initial_db();
 
-    // Setup state OUTSIDE bootstrap so we keep the secret_key for
-    // client session building.
+    // setup outside bootstrap to keep the secret_key for client session building
     let (state, sk) =
         setup_state(&params, &db, TOY_ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup");
 
@@ -71,18 +68,13 @@ async fn phase4_chain_event_propagates_to_pir_response() {
 
     let handle = bootstrap_railgun_engine(config, params.clone(), factory).expect("bootstrap");
 
-    // Sessions are Arc-shared across re-encode-driven swaps so the
-    // handle stays valid post-commit.
+    // sessions are Arc-shared across re-encode swaps so the handle stays valid post-commit
     let live_state: Arc<InspireServerState> = handle.instance.current_state();
     let crs_for_client = (*live_state.crs).clone();
     let mut client_session = build_client_session(crs_for_client, sk, &params).expect("client");
     register_client_session(&mut client_session, live_state.as_ref()).expect("register session");
 
-    // The IMT requires contiguous-strict appends per tree (leaf_index 0
-    // first, 1 next, ...). The planted commitment is BN254-Fr-canonical
-    // (high byte = 0x07 < 0x30) so the IMT's Poseidon hash on insert
-    // succeeds; a non-canonical pattern would surface as InvalidQuery
-    // via the tolerant-replay path.
+    // IMT requires contiguous appends; planted commitment is Fr-canonical (high byte < 0x30) for the Poseidon hash
     const TARGET: u32 = 0;
     let planted: [u8; 32] = {
         let mut b = [0u8; 32];
@@ -109,9 +101,7 @@ async fn phase4_chain_event_propagates_to_pir_response() {
         .await
         .expect("send chain event");
 
-    // Register the commit notification BEFORE sending the trigger so
-    // the wake isn't missed. Reorg to height 100 so the planted leaf
-    // at block 100 SURVIVES.
+    // register the notification before the trigger, else the wake is missed; reorg to 100 so the leaf survives
     let commit_fut = handle.persistence.commit_notify().notified();
     tokio::pin!(commit_fut);
     commit_fut.as_mut().enable();
@@ -186,10 +176,7 @@ async fn phase4_chain_event_propagates_to_pir_response() {
     let _ = tokio::time::timeout(Duration::from_secs(5), handle.consumer).await;
 }
 
-// Gap A regression: a clean shutdown after the chain head has raced ahead of
-// the last applied leaf must persist the LEAF block as the manifest resume
-// floor, not the chain head. A head-based floor skips the lagged leaves on
-// restart and wedges the tree on the next non-contiguous append.
+// shutdown with the chain head ahead of the last applied leaf must persist the leaf block as the resume floor; a head-based floor wedges the tree on the next non-contiguous append
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resume_floor_is_last_leaf_block_not_chain_head() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -237,7 +224,7 @@ async fn resume_floor_is_last_leaf_block_not_chain_head() {
         .send(ConsumerEvent::Chain(chain_event, LEAF_BLOCK))
         .await
         .expect("send leaf");
-    // Heartbeat: chain head races far past the last applied leaf (stall shape).
+    // heartbeat drives the chain head far past the last applied leaf (stall shape)
     handle
         .sender
         .send(ConsumerEvent::Heartbeat(CHAIN_HEAD))
@@ -297,8 +284,7 @@ async fn phase4_chain_event_propagates_to_pir_response_at_production_cell() {
     let mut client_session = build_client_session(crs_for_client, sk, &params).expect("client");
     register_client_session(&mut client_session, live_state.as_ref()).expect("register session");
 
-    // BN254-Fr-canonical commitment (high byte = 0x07 < 0x30) so the
-    // IMT's Poseidon hash on insert succeeds.
+    // Fr-canonical commitment (high byte < 0x30) for the IMT's Poseidon hash
     const TARGET: u32 = 0;
     let planted: [u8; 32] = {
         let mut b = [0u8; 32];

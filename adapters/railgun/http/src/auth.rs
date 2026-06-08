@@ -28,23 +28,10 @@ pub enum AuthScope {
 
 /// Sticky-session identity keyed by `(sha256_truncated_token, instance_id, client_id)`.
 ///
-/// The bearer token is hashed (SHA-256 truncated to 8 bytes) before being
-/// used as a key component so raw bearer values never appear in map keys
-/// or telemetry. The hash is **stable across calls**: same input -> same
-/// `u64`, so subsequent requests from the same client land on the same
-/// key.
-///
-/// `client_id` is parsed from the `X-Raven-Client-Id` request header
-/// (16 bytes; UUID-shaped hex with or without `-` separators). Two
-/// clients sharing a single bearer token (e.g. an operator-shared scrape
-/// credential against several wallets) MUST send distinct client ids so
-/// they do not collide on the same session entry: without it the second
-/// `/session` establish would overwrite the first client's CRS state and
-/// both clients would race on the same handle. Absent header maps to the
-/// all-zero id and preserves back-compat with single-client deploys.
-///
-/// Not a cryptographic auth check; bearer validation happens in
-/// [`bearer_auth`].
+/// The bearer token is hashed before keying so raw values never appear in map
+/// keys or telemetry. `client_id` keeps two clients sharing one bearer from
+/// colliding on the same session entry; absent header maps to the all-zero id.
+/// Not an auth check; bearer validation happens in [`bearer_auth`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SessionKey {
     token_hash: u64,
@@ -62,19 +49,14 @@ impl SessionKey {
     }
 }
 
-/// Header name carrying the per-client identifier that scopes the
-/// sticky-session entry. Two clients sharing a single bearer token MUST
-/// send distinct values so their session state does not collide in the
-/// [`SessionMap`]. Missing header falls back to the all-zero id.
+/// Header name scoping a sticky-session entry to a client; missing header
+/// falls back to the all-zero id.
 pub const X_RAVEN_CLIENT_ID: &str = "X-Raven-Client-Id";
 
 /// Parse `X-Raven-Client-Id` into a 16-byte client id.
 ///
-/// Accepts `[0-9a-fA-F]{32}` with optional `-` separators (UUID shape;
-/// e.g. `550e8400-e29b-41d4-a716-446655440000` or
-/// `550e8400e29b41d4a716446655440000`). Returns the all-zero id when the
-/// header is absent or malformed — callers that want stricter validation
-/// should reject malformed ids at the edge.
+/// Accepts `[0-9a-fA-F]{32}` with optional `-` separators (UUID shape);
+/// returns the all-zero id when the header is absent or malformed.
 pub fn parse_client_id_header(headers: &http::HeaderMap) -> [u8; 16] {
     let Some(raw) = headers.get(X_RAVEN_CLIENT_ID).and_then(|v| v.to_str().ok()) else {
         return [0u8; 16];
@@ -171,16 +153,9 @@ impl SessionMap {
         self.inner.lock().len()
     }
 
-    /// Drop every entry whose `expires_at` is at or before `now`.
-    ///
-    /// Called by the periodic sweeper task spawned by the orchestrator.
-    /// Without it, expired entries past [`HttpConfig::session_ttl_secs`]
-    /// are only purged lazily on `get` against the same key — a token
-    /// that churns once and never repeats stays in the map until the
-    /// process restarts.
-    ///
-    /// Returns the count of entries removed (used to label a per-sweep
-    /// eviction counter).
+    /// Drop every entry expired at or before `now`, returning the count removed.
+    /// Without this, expired entries are only purged lazily on `get`, so a
+    /// once-churned token lingers until process restart.
     pub(crate) fn sweep_expired(&self, now: Instant) -> usize {
         let mut guard = self.inner.lock();
         let before = guard.len();
@@ -203,13 +178,11 @@ pub(crate) async fn bearer_auth<S: PirScheme>(
     next: Next,
 ) -> Result<Response, StatusCode> {
     let path = request.uri().path();
-    // Health probes + SSE events stream are always unauthenticated. The SSE
-    // stream is the demo UI's status feed; auth happens at the gateway tier.
+    // Health probes + SSE feed are always unauthenticated (gateway-tier auth).
     if matches!(path, "/v1/health/live" | "/v1/health/ready" | "/v1/events") {
         return Ok(next.run(request).await);
     }
-    // `/metrics` is default-deny (bearer required). Operators opt in to
-    // public scrape via `metrics_public = true` (`HttpConfig.metrics_public`).
+    // `/metrics` is default-deny; operators opt in via `metrics_public`.
     if path == "/metrics" && app.config.metrics_public {
         return Ok(next.run(request).await);
     }
@@ -221,15 +194,14 @@ pub(crate) async fn bearer_auth<S: PirScheme>(
         .unwrap_or_default();
 
     let scope = if let Some(token) = header.strip_prefix("Bearer ") {
-        // Constant-time via `subtle::ConstantTimeEq`; raw `==` is variable-time.
-        // Always evaluate both read + admin compares so total work is constant.
-        // Snapshot under read-lock so the comparison doesn't hold the lock.
+        // Constant-time: evaluate both compares; snapshot the token so the
+        // comparison doesn't hold the lock.
         let active_read_token: String = app.read_token.read().clone();
         let read_match: bool = ct_eq_str(token.as_bytes(), active_read_token.as_bytes()).into();
         let admin_match: bool = if let Some(admin) = app.admin_token.as_ref().as_ref() {
             ct_eq_str(token.as_bytes(), admin.as_bytes()).into()
         } else {
-            // Fixed-cost dummy compare so the no-admin path doesn't short-circuit earlier.
+            // Fixed-cost dummy compare keeps the no-admin path equal-cost.
             let _ = ct_eq_str(token.as_bytes(), &[]);
             false
         };
@@ -242,7 +214,7 @@ pub(crate) async fn bearer_auth<S: PirScheme>(
             None
         }
     } else {
-        // Pay constant-time cost even on missing-prefix path.
+        // Pay constant-time cost even on the missing-prefix path.
         let active_read_token: String = app.read_token.read().clone();
         let _ = ct_eq_str(b"", active_read_token.as_bytes());
         if let Some(admin) = app.admin_token.as_ref().as_ref() {
@@ -379,19 +351,13 @@ mod tests {
 
     #[test]
     fn session_key_distinguishes_client_id_under_shared_bearer() {
-        // Two clients sharing one bearer + one instance MUST land on
-        // distinct SessionMap entries when they advertise distinct
-        // client_ids. Without the third tuple element the map would
-        // resolve client A's bearer to client B's handle and both
-        // clients would race on the same in-memory CRS state.
+        // Distinct client_ids under a shared bearer must not collide.
         let id = InstanceId::new("toy");
         let alice = SessionKey::new("shared-bearer", id.clone(), [0xaa; 16]);
         let bob = SessionKey::new("shared-bearer", id.clone(), [0xbb; 16]);
         assert_ne!(alice, bob, "distinct client_ids must produce distinct keys");
 
-        // Back-compat: legacy single-client wallets that never send
-        // X-Raven-Client-Id map to the same all-zero key under one
-        // bearer + instance.
+        // Absent header collapses to the all-zero key (back-compat).
         let legacy_a = SessionKey::new("legacy-bearer", id.clone(), [0u8; 16]);
         let legacy_b = SessionKey::new("legacy-bearer", id, [0u8; 16]);
         assert_eq!(

@@ -174,8 +174,6 @@ async fn detect_reorg_layer1_returns_too_deep_when_cache_exhausted() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_emits_reorg_message_after_simulated_reorg() {
-    // Pre-seed canonical chain at blocks 0..=120 with deterministic
-    // hashes; events at blocks 100, 105, 110.
     let src = Arc::new(MockChainSource::new());
     for n in 0..=120u64 {
         src.set_block(n, [u8::try_from(n & 0xff).expect("byte"); 32]);

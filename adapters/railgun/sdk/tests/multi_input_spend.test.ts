@@ -1,17 +1,7 @@
 /**
- * Multi-input spend tests.
- *
- * Railgun's `circuits-v2/lib/circuitConfigs.js:4-11` caps inputs per
- * spend at 13. We exercise N=1 / N=2 / N=4 / N=13 to lock that the
- * SDK can issue N parallel PIR queries per spend without state
- * cross-contamination, plus a cross-tree spend (UTXOs split across
- * trees 0+2+3) to lock the per-instance routing.
- *
- * Each test uses the legacy passthrough path because that route is
- * tractable to assert against without running real WASM PIR per
- * spend; the encrypted-PIR equivalent is covered by the
- * privacy_all_paths tests at smaller N (the network-shape behavior
- * is the same — the SDK loops BC-by-BC).
+ * Multi-input spend tests over the legacy passthrough path. N=1/2/4/13 (the
+ * upstream circuitConfigs.js input cap) plus a cross-tree spend lock that the
+ * SDK fans out per BC and per instance without state cross-contamination.
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -74,12 +64,7 @@ describe("multi-input spend support", () => {
   }
 
   it("13-input spend stays at the circuit cap", async () => {
-    // Locks the upstream MAX_OUTPUT cap from
-    // circuits-v2/lib/circuitConfigs.js:4-11. Wallet integrators
-    // assemble a SpendInfo with at most 13 outputs per
-    // transaction-batch; we don't enforce that in the SDK (the
-    // wallet does), but we lock that 13 parallel proofs round-trip
-    // cleanly through the SDK.
+    // 13 = upstream circuitConfigs.js cap; the SDK does not enforce it, only round-trips it
     const n = 13;
     const bcs = Array.from({ length: n }, (_, i) => bcAt(i + 1));
     server.route(
@@ -99,10 +84,7 @@ describe("multi-input spend support", () => {
   });
 
   it("cross-tree spend: 3 commit-tree proofs each from a different tree", async () => {
-    // Wallet has UTXOs in trees 0, 2, 3 (per the mainnet topology
-    // at boot: trees 0/1/2 are closed-static, tree 3 is live). The SDK fetches one
-    // commit-tree proof per UTXO; each proof is dispatched to the
-    // tree-specific commit-tree-merkle-proof route.
+    // one proof per UTXO, each dispatched to its tree-specific commit-tree route
     const inputs = [
       { tree: 0, leafIndex: 100, expectedRoot: "aa".repeat(32) },
       { tree: 2, leafIndex: 5_000, expectedRoot: "bb".repeat(32) },
@@ -134,7 +116,6 @@ describe("multi-input spend support", () => {
     proofs.forEach((p, i) => expect(p.root).toBe(inputs[i].expectedRoot));
     const wires = sdk.lastWireRequests();
     expect(wires.length).toBe(3);
-    // Each request hits its own tree URL.
     const urls = wires.map((w) => w.url);
     expect(urls).toContain(`${server.url}/v1/commit-tree/0/merkle-proof`);
     expect(urls).toContain(`${server.url}/v1/commit-tree/2/merkle-proof`);

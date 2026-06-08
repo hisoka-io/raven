@@ -184,7 +184,6 @@ fn zstd_compression_ratio_at_production_blob() {
         "zstd-l3 ratio at production cell must be <= 0.30; got {ratio:.4}",
     );
 
-    // Round-trip sanity.
     let loaded = Snapshot::load(&layout, SnapshotId(101)).expect("load");
     assert_eq!(loaded.data.len(), payload.len());
     assert_eq!(loaded.data, payload);

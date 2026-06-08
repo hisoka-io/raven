@@ -347,9 +347,7 @@ async fn multi_instance_recovery_byte_identity() {
         }
     }
 
-    // Hard-abort rather than graceful Shutdown so WAL entries past
-    // current_snapshot_seq survive for replay to reconstruct the
-    // LogicalLeafStore on restart.
+    // hard-abort, not graceful Shutdown: WAL entries past current_snapshot_seq must survive for replay
     let MultiOrchestratorHandleParts {
         instances,
         channels,

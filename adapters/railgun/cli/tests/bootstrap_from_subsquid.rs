@@ -29,25 +29,16 @@ use raven_railgun_cli::bootstrap_subsquid::{
 use raven_railgun_engine::imt::Imt;
 use std::sync::Arc;
 
-/// Synthetic chain oracle. Models the live + static branches and the
-/// archival-probe path in one stub:
-///
-/// - `chain_root` controls the live-tree byte-identity answer;
-/// - `recorded_roots` controls `rootHistory` membership;
-/// - `pruning_at_block` simulates an RPC pool that refuses historical
-///   state at any block (every method returns a pruning-flavored
-///   `RpcUnreachable`).
+/// Synthetic chain oracle covering live byte-identity, static membership,
+/// and the archival-probe (pruning) branch in one stub.
 struct StubChain {
     head: u64,
     active_tree: u32,
     chain_root: Mutex<Option<[u8; 32]>>,
-    /// Roots the chain reports as recorded for each tree number.
+    /// Roots the chain reports as recorded per tree number.
     recorded_roots: Mutex<Vec<(u32, [u8; 32])>>,
     pruning: Mutex<bool>,
-    /// Per-block commitment events the boundary-repair path can fetch.
-    /// Keyed by `(block_number, tree_number, leaf_index) -> commitment_hash`.
-    /// `commitment_events_in_range` returns every entry whose block lies
-    /// in the inclusive range.
+    /// Commitment events the boundary-repair path fetches by block range.
     chain_events: Mutex<Vec<ChainEventRow>>,
 }
 
@@ -143,13 +134,11 @@ impl ChainOracle for StubChain {
     }
 }
 
-/// Synthetic Subsquid leaves source (leaves-only, no canonical-root
-/// query).
+/// Synthetic leaves-only Subsquid source.
 struct StubLeaves {
     rows: Vec<CommitmentRow>,
     fail_with_503: bool,
-    /// When set: cap pagination to this many rows total even though
-    /// `rows` carries more (simulates partial-leaf-count drift).
+    /// Caps pagination below `rows.len()` to simulate partial-leaf-count drift.
     cap: Option<usize>,
 }
 
@@ -202,16 +191,13 @@ impl SubsquidLeavesSource for StubLeaves {
     }
 }
 
-/// Build a deterministic, valid set of leaves: each leaf is a
-/// 32-byte big-endian encoding of `index + 1` (small enough to be
-/// canonical). Returns (rows, local_root).
+/// Deterministic canonical leaves (leaf = BE(index+1)); returns (rows, local_root).
 fn synthetic_leaves(count: usize) -> (Vec<CommitmentRow>, [u8; 32]) {
     synthetic_leaves_at_block(count, 1)
 }
 
-/// Variant that stamps every synthetic row with a fixed block number,
-/// so boundary-repair tests can correlate `min/max blockNumber` with
-/// chain-injected events.
+/// Like `synthetic_leaves` but stamps a fixed block number so boundary-repair
+/// tests can correlate row blocks with chain-injected events.
 fn synthetic_leaves_at_block(count: usize, block_number: u64) -> (Vec<CommitmentRow>, [u8; 32]) {
     let mut rows = Vec::with_capacity(count);
     for i in 0..count {
@@ -234,9 +220,7 @@ fn synthetic_leaves_at_block(count: usize, block_number: u64) -> (Vec<Commitment
 fn fresh_data_dir(stem: &str) -> std::path::PathBuf {
     let base = tempfile::tempdir().expect("tempdir");
     let path = base.path().join(stem);
-    // Leak the tempdir so the path stays alive until the test body
-    // drops it; tempfile auto-cleans on drop, which is fine for the
-    // assertions we make here.
+    // leak so the dir outlives the handle for the test body
     std::mem::forget(base);
     path
 }
@@ -247,9 +231,7 @@ fn cfg_for(tree_number: u32, dir: std::path::PathBuf) -> BootstrapTreeConfig {
         checkpoint_depth: 64,
         data_dir: dir,
         instance_id: format!("commit-tree-{tree_number}"),
-        // Use a tiny cell shape so tests run in seconds, not minutes.
-        // Production cell (65k * 512) lives behind `#[ignore]` benches
-        // (run separately when benching).
+        // tiny cell so tests run in seconds; production cell lives behind #[ignore] benches
         entries: 16,
         entry_bytes: 32,
         max_wall_mins: 5,
@@ -261,7 +243,7 @@ fn cfg_for(tree_number: u32, dir: std::path::PathBuf) -> BootstrapTreeConfig {
 async fn bootstrap_static_tree_membership_oracle_pass() {
     let (rows, root) = synthetic_leaves(8);
     let leaves = StubLeaves::new(rows);
-    // Active tree is 99, queried tree is 0 → static path.
+    // active tree 99 != queried tree 0 -> static path
     let chain = StubChain::new(20_000_000, 99);
     chain.record_root(0, root);
     let cfg = cfg_for(0, fresh_data_dir("commit-tree-0-static"));
@@ -294,7 +276,7 @@ async fn bootstrap_static_tree_membership_mismatch_hard_stop() {
     let (rows, root) = synthetic_leaves(8);
     let leaves = StubLeaves::new(rows);
     let chain = StubChain::new(20_000_000, 99);
-    // Record a DIFFERENT root for tree 0 → membership returns false.
+    // record a different root for tree 0 so membership returns false
     let mut other = root;
     other[0] ^= 0xff;
     chain.record_root(0, other);
@@ -344,9 +326,7 @@ async fn bootstrap_subsquid_unreachable_actionable_error() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_partial_leaf_count_hard_stop() {
-    // 8 leaves expected → cap source at 7 → chain has the FULL-8 root
-    // recorded → membership oracle fires false because our local root
-    // (over 7 leaves) is not what the chain recorded.
+    // cap source at 7 while chain recorded the full-8 root: local 7-leaf root mismatches
     let (rows, root_full) = synthetic_leaves(8);
     let leaves = StubLeaves::new(rows).cap_at(7);
     let chain = StubChain::new(20_000_000, 99);
@@ -368,7 +348,7 @@ async fn bootstrap_partial_leaf_count_hard_stop() {
 async fn bootstrap_concurrent_run_lock_contention() {
     let dir = fresh_data_dir("commit-tree-0-conflict");
     std::fs::create_dir_all(&dir).expect("mkdir");
-    // First, hold the lock via a long-lived StoreLayout::open_with_lock.
+    // hold the lock first so the bootstrap runner contends for it
     let (_layout, _lock) =
         raven_railgun_persistence::StoreLayout::open_with_lock(&dir).expect("acquire first lock");
     let (rows, root) = synthetic_leaves(2);
@@ -394,8 +374,6 @@ async fn bootstrap_resume_from_partial_state() {
         .await
         .expect("first run");
 
-    // Re-open the manifest and confirm the second run (idempotent
-    // re-bootstrap) leaves the manifest in a healthy state.
     let layout = raven_railgun_persistence::StoreLayout::open(&dir).expect("layout");
     let manifest = raven_railgun_persistence::Manifest::load(&layout)
         .expect("load")
@@ -406,11 +384,8 @@ async fn bootstrap_resume_from_partial_state() {
 
 #[tokio::test]
 async fn bootstrap_bigint_decoder_parity_with_subsquid_fixture() {
-    // Real Sepolia leaf bytes are stored as `0x...`-prefixed hex but
-    // the on-chain BigInt encoding from upstream's TS is decimal. We
-    // parity-check the decoder accepts BOTH shapes for the same byte
-    // sequence (Subsquid serialises BigInt as decimal; some gateways
-    // relay as 0x-hex).
+    // decoder must accept both shapes: Subsquid serialises BigInt as decimal,
+    // some gateways relay as 0x-hex
     let leaf_hex = "0x23486ab54b4335993cbd8e0828229814f6719251e6bec45373efde528c4ec30b";
     let from_hex = decode_bigint_to_be_bytes32(leaf_hex).expect("hex shape decodes");
     let from_dec = decode_bigint_to_be_bytes32(
@@ -427,8 +402,7 @@ async fn bootstrap_bigint_decoder_parity_with_subsquid_fixture() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_pagination_treeposition_cursor_handles_gap() {
-    // 1500 leaves spread over 2 pages (1000 + 500). Confirm the
-    // cursor advances across the boundary so no leaf is missed.
+    // 1500 leaves over 2 pages: the cursor must advance across the boundary
     let (rows, root) = synthetic_leaves(1500);
     let leaves = StubLeaves::new(rows);
     let chain = StubChain::new(20_000_000, 99);
@@ -443,10 +417,7 @@ async fn bootstrap_pagination_treeposition_cursor_handles_gap() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_no_archival_rpc_actionable_error() {
-    // Chain stub returns `-32000 historical state ... not available`
-    // for every probe. The archival_probe trait method MUST classify
-    // this as `NoArchivalRpc` with an actionable message that names
-    // archival RPC providers.
+    // a pruning chain must classify as NoArchivalRpc with an actionable message
     let chain = StubChain::new(20_000_000, 99);
     chain.set_pruning();
     let probe_block = 20_000_000u64.saturating_sub(64);
@@ -471,9 +442,7 @@ async fn bootstrap_no_archival_rpc_actionable_error() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_pruning_during_run_classified_as_no_archival() {
-    // Skip the probe (some operators may bypass it) and confirm the
-    // per-tree path also classifies a pruning failure mid-run as
-    // NoArchivalRpc rather than a generic RpcUnreachable.
+    // mid-run pruning failure must also classify as NoArchivalRpc, not generic RpcUnreachable
     let (rows, _root) = synthetic_leaves(4);
     let leaves = StubLeaves::new(rows);
     let chain = StubChain::new(20_000_000, 99);
@@ -485,9 +454,7 @@ async fn bootstrap_pruning_during_run_classified_as_no_archival() {
     assert!(matches!(err, BootstrapError::NoArchivalRpc { .. }));
 }
 
-/// Synthetic PPOI source. Each event carries the per-step IMT root
-/// the upstream signed; the bootstrap rebuilds locally and asserts
-/// byte-equality at every step.
+/// Synthetic PPOI source; each event carries the per-step IMT root the upstream signed.
 struct StubPpoi {
     events: Vec<PpoiEventRow>,
 }
@@ -504,9 +471,7 @@ impl PpoiEventsSource for StubPpoi {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ppoi_list_root_via_railway_capture() {
-    // Build 4 leaves; the upstream "validatedMerkleroot" at each step
-    // is the local IMT root at that step. Bootstrap asserts byte-
-    // identity at every insert.
+    // upstream validatedMerkleroot at each step is the local IMT root; bootstrap asserts parity
     let mut imt = Imt::new().expect("imt new");
     let mut events = Vec::new();
     for i in 0..4 {
@@ -525,8 +490,7 @@ async fn ppoi_list_root_via_railway_capture() {
         .expect("ppoi bootstrap ok");
     assert_eq!(report.events, 4);
 
-    // Negative case: corrupt the last validated_merkleroot and
-    // confirm the oracle fires.
+    // corrupt the last validated_merkleroot: the oracle must fire
     let mut bad = src.events.clone();
     let last = bad.len() - 1;
     bad[last].validated_merkleroot[0] ^= 0xff;
@@ -543,10 +507,8 @@ async fn ppoi_list_root_via_railway_capture() {
     ));
 }
 
-/// Build a synthetic "filled" boundary-repair config: 8-leaf trees with
-/// the repair threshold set so that 7-leaf rows trigger the gap-walk.
-/// Mirrors the mainnet shape (drop +1 stowaway, gap-walk + chain
-/// backfill) at a fixture size that completes in milliseconds.
+/// Boundary-repair config at fixture size: 8-leaf trees, repair trigger low
+/// enough that sparse rows fire the gap-walk + chain backfill.
 fn cfg_for_boundary(tree_number: u32, dir: std::path::PathBuf) -> BootstrapTreeConfig {
     BootstrapTreeConfig {
         tree_number,
@@ -556,10 +518,7 @@ fn cfg_for_boundary(tree_number: u32, dir: std::path::PathBuf) -> BootstrapTreeC
         entries: 16,
         entry_bytes: 32,
         max_wall_mins: 5,
-        // Trigger repair as soon as 4+ leaves are present (vs the
-        // production default of TREE_MAX_ITEMS - 16 = 65,520).
         repair_trigger_threshold: 4,
-        // Synthetic "filled" tree size: 8 leaves not 65,536.
         expected_filled_count: 8,
         ..BootstrapTreeConfig::default()
     }
@@ -851,9 +810,7 @@ async fn boundary_repair_post_fix_chain_oracle_byte_identity_passes_all_three_fi
     assert!(carry.is_empty(), "no residue after final tree drains carry");
 }
 
-/// 3-seed wall-clock micro-bench at PRODUCTION CELL. Disabled by
-/// default; run with `--ignored --release` when capturing fresh
-/// numbers. Keeps the regular test loop fast.
+/// 3-seed wall-clock micro-bench at the production cell; run with `--ignored --release`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn bootstrap_three_seed_production_cell_bench() {
@@ -889,12 +846,7 @@ async fn bootstrap_three_seed_production_cell_bench() {
     );
 }
 
-/// 3-seed wall-clock micro-bench for the boundary-repair path: per
-/// tree, drop one position, chain-backfill it, run IMT build + chain
-/// verify, capture wall. Synthetic 8-leaf cells (boundary repair is
-/// O(missing_positions) chain calls + O(tree_size) IMT inserts; the
-/// production gating sets `expected_filled_count = TREE_MAX_ITEMS`,
-/// which we don't bench inside the unit-test runner).
+/// 3-seed wall-clock micro-bench for the boundary-repair path on synthetic 8-leaf cells.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn boundary_repair_three_seed_per_tree_bench() {
@@ -959,8 +911,7 @@ async fn boundary_repair_three_seed_per_tree_bench() {
     }
 }
 
-// Tag bindings to keep the import graph happy when the bench above
-// is `#[ignore]`-gated and would otherwise look unused.
+// keeps the Arc import live when the #[ignore]-gated benches don't use it
 #[allow(dead_code)]
 fn _arc_keep<T>(_x: Arc<T>) {}
 
@@ -1180,10 +1131,7 @@ mod ppoi_resilience {
         s
     }
 
-    /// Sealed-port URL that any TCP connect refuses immediately.
-    /// We bind+drop a listener to reserve a port, then close it; the
-    /// port is now sitting unbound and connect attempts fail fast,
-    /// covering the connect-refused branch of the multi-URL walker.
+    /// URL on a bound-then-closed port so connects fail fast (connect-refused branch).
     async fn sealed_url() -> String {
         let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = l.local_addr().expect("local addr");
@@ -1217,9 +1165,7 @@ mod ppoi_resilience {
         }
     }
 
-    /// Layer 1 closure: walk a 3-URL list. URLs 1 and 2 are unreachable
-    /// (sealed-port + always-503); URL 3 returns a valid signed-event
-    /// page. The bootstrap MUST return events from URL 3.
+    /// Multi-URL walker skips two dead bases (sealed + 503) and serves from the third.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ppoi_bootstrap_multi_url_fallback_walks_url_list() {
         let bad = sealed_url().await;
@@ -1250,14 +1196,9 @@ mod ppoi_resilience {
         let _ = good_shutdown.send(());
     }
 
-    /// Layer 2 closure: every source fails with `PpoiUnreachable`. The
-    /// skip-on-unreachable mode MUST emit a WARN-level log mentioning
-    /// the upstream-signature gap, and MUST seed an EMPTY per-list
-    /// IMT (events == 0).
+    /// All sources dead: skip-on-unreachable WARNs about the signature gap and seeds an empty IMT.
     ///
-    /// `flavor = "current_thread"` keeps everything on one thread so
-    /// the thread-local default subscriber set by `set_default` is
-    /// visible to the bootstrap call's tracing emissions.
+    /// `current_thread` so the `set_default` thread-local subscriber sees the bootstrap's emissions.
     #[tokio::test(flavor = "current_thread")]
     async fn ppoi_bootstrap_skip_on_unreachable_logs_gap_and_seeds_empty_imt() {
         let bad1 = sealed_url().await;
@@ -1310,8 +1251,7 @@ mod ppoi_resilience {
         );
     }
 
-    /// Backward-compat closure: strict mode (the V1 default) still
-    /// hard-stops with `PpoiUnreachable` when every source fails.
+    /// Strict mode (the default) hard-stops with `PpoiUnreachable` when every source fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ppoi_bootstrap_strict_mode_returns_pp_unreachable_error_when_all_fail() {
         let bad1 = sealed_url().await;
@@ -1339,8 +1279,7 @@ mod ppoi_resilience {
         let _ = shutdown_bad2.send(());
     }
 
-    /// Smoke: the multi-URL constructor rejects empty lists and
-    /// trims whitespace-only entries.
+    /// The multi-URL constructor rejects empty and whitespace-only base lists.
     #[test]
     fn railway_ppoi_client_rejects_empty_base_list() {
         let err = RailwayPpoiClient::new_multi(vec![], 0, 1).expect_err("empty list rejected");
@@ -1350,13 +1289,8 @@ mod ppoi_resilience {
         assert!(err2.contains("empty"), "{err2}");
     }
 
-    /// The single-base `RailwayPpoiClient::new` constructor must enforce
-    /// a per-URL timeout even on the fallback path (an earlier
-    /// implementation called `reqwest::Client::new()` with no timeout,
-    /// leaving the client to hang indefinitely on a stalled server).
-    /// We exercise the constructor against a TCP listener that accepts
-    /// but never writes, and assert the call
-    /// returns within `RAILWAY_PER_URL_TIMEOUT + slack`.
+    /// Single-base `RailwayPpoiClient::new` must enforce a per-URL timeout against a
+    /// silent server; a no-timeout `reqwest::Client::new()` would hang forever.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn railway_ppoi_single_base_times_out() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1377,10 +1311,7 @@ mod ppoi_resilience {
         let url = format!("http://{addr}");
         let client = RailwayPpoiClient::new(url, 0, 1);
 
-        // `bootstrap_one_list_with_mode` is the operator-facing entry
-        // that drives the client. Strict mode escalates a single-base
-        // failure into a `BootstrapError`. We bracket with 60s so a
-        // missing per-URL timeout fails the test fast.
+        // 60s outer bracket so a missing per-URL timeout fails fast instead of hanging
         let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(60),
@@ -1396,7 +1327,6 @@ mod ppoi_resilience {
         .expect("must error inside 60s when per-URL timeout is wired");
         let elapsed = started.elapsed();
 
-        // SkipOnUnreachable yields Ok with empty events on full failure.
         let report = outcome.expect("skip-on-unreachable degrades to empty");
         assert_eq!(report.events, 0, "no events from a silent server");
         assert!(

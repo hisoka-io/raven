@@ -64,7 +64,7 @@ fn encoder() -> PerLeafCommitmentEncoder {
     PerLeafCommitmentEncoder::new(32, ENTRIES_PER_SHARD).expect("encoder")
 }
 
-/// Zeroes in the high 16 bytes, `tag` in the low 16 — stays below the BN254 field modulus.
+/// Zeroes in the high 16 bytes, `tag` in the low 16; stays below the BN254 field modulus.
 fn fr_canonical(tag: u8) -> [u8; 32] {
     let mut out = [0u8; 32];
     for byte in out.iter_mut().skip(16) {

@@ -9,9 +9,7 @@
 use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, ShardConfig};
 
-/// Install [`console_error_panic_hook`] so Rust panics surface as structured
-/// JS exceptions instead of opaque `unreachable executed` traps. Call once at
-/// module load; idempotent.
+/// Route Rust panics to structured JS exceptions instead of opaque WASM traps. Idempotent.
 #[wasm_bindgen]
 pub fn init_panic_hook() {
     console_error_panic_hook::set_once();
@@ -24,7 +22,6 @@ use raven_inspire::{
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
-// Private wire bundle passed to/from build_instance_params_blob and build_client_session.
 #[derive(Serialize, Deserialize, Debug)]
 #[allow(clippy::struct_field_names)]
 struct WasmInstanceParamsBundle {
@@ -49,34 +46,19 @@ impl From<WasmClientError> for JsValue {
     }
 }
 
-/// Maximum legitimate WASM-side bincode payload (64 MiB). Defense-in-depth
-/// against a malicious server response that crosses the JS->Wasm boundary
-/// with an inflated length: rejecting before `bincode::deserialize` runs
-/// caps the worst-case allocation and avoids any pathological-input
-/// compute path inside the deserializer. The largest legitimate payload
-/// is the production-cell `ServerCrs` at ~35 MB (d=2048, p=65537,
-/// total_entries=131_072 for the per-node commit-tree shape); the params
-/// bundle, `SeededClientQuery`, and `ServerResponse` all fit comfortably.
+/// Allocation cap for untrusted bincode crossing the JS->Wasm boundary (64 MiB).
 ///
-/// Pre-check (rather than `bincode::DefaultOptions::with_limit`) because
-/// bincode 1.x's slice-deserialize entry point overrides any configured
-/// limit to `Infinite` (ref bincode-1.3.3 src/internal.rs:114
-/// `deserialize_seed`); the configured `with_limit` is a no-op for
-/// `bincode::deserialize(bytes)` and only takes effect on
-/// `deserialize_from(reader)`. The slice-length pre-check is the
-/// reliable enforcement mechanism on this boundary.
+/// Enforced as a slice-length pre-check, not `bincode::Options::with_limit`:
+/// bincode 1.3.3's slice path (`src/internal.rs:114` `deserialize_seed`) overrides
+/// any configured limit to `Infinite`, so `with_limit` is a no-op for
+/// `bincode::deserialize(bytes)`.
 pub const WASM_BINCODE_DESERIALIZE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
-/// Trusted-source bincode deserialize ceiling for self-written
-/// session blobs returned by [`serialize_client_session`].
+/// Allocation cap for self-written session blobs from [`serialize_client_session`] (256 MiB).
 ///
-/// At the locked production cell (d=2048) the bincoded `ClientSession`
-/// is ~194 MB (CRS ~35 MB + precomputed packing keys ~150 MB + secrets).
-/// Higher than the general [`WASM_BINCODE_DESERIALIZE_LIMIT_BYTES`] cap
-/// because the blob originates from the WASM itself (via the symmetric
-/// [`serialize_client_session`] write earlier in the wallet's session
-/// lifetime); the threat model differs from HTTP-sourced bytes which
-/// retain the 64 MiB cap.
+/// Higher than [`WASM_BINCODE_DESERIALIZE_LIMIT_BYTES`] because the blob is
+/// WASM-authored, not HTTP-sourced: at d=2048 the bincoded `ClientSession` is
+/// ~194 MB (CRS + packing keys + secrets).
 pub const WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
 fn decode<T: for<'de> Deserialize<'de>>(
@@ -99,13 +81,8 @@ fn decode<T: for<'de> Deserialize<'de>>(
     })
 }
 
-/// Trusted-source variant of [`decode`] using the larger
-/// [`WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES`] ceiling. Reserved for
-/// self-written blobs the wallet round-trips through its own storage
-/// (e.g. `serialize_client_session` -> IndexedDB ->
-/// `deserialize_client_session`). MUST NOT be called from any path
-/// that receives HTTP-sourced bytes; those keep the 64 MiB [`decode`]
-/// defense.
+/// [`decode`] with the 256 MiB trusted cap. MUST NOT see HTTP-sourced bytes;
+/// only self-written session blobs round-tripped through wallet storage.
 fn decode_trusted<T: for<'de> Deserialize<'de>>(
     bytes: &[u8],
     what: &'static str,
@@ -137,8 +114,6 @@ fn encode<T: Serialize>(value: &T, what: &'static str) -> Result<Vec<u8>, WasmCl
 #[wasm_bindgen]
 pub struct ClientSessionHandle {
     inner: ClientSession,
-    // Cached alongside the session because query_seeded needs a fresh sampler
-    // each call but params are stable.
     params: InspireParams,
 }
 
@@ -233,32 +208,12 @@ pub fn build_seeded_query(
     Ok(encode(&bundle, "wasm_seeded_query_output")?)
 }
 
-/// Decode a server response and return the plaintext row bytes via
-/// [`extract_inspiring`].
+/// Decode a server response to plaintext row bytes via [`extract_inspiring`].
 ///
-/// All inputs except `session` are bincode blobs the SDK already holds:
-/// - `session`: the [`ClientSessionHandle`] that emitted the matching query
-/// - `crs_bincode`: from `InstanceParams::crs_bincode`
-/// - `client_state_bincode`: from [`build_seeded_query`] output
-/// - `response_bytes`: from the server's `POST /v1/instance/:id/query` reply
-/// - `entry_size`: from `InstanceParams::entry_size`
-///
-/// `client_state_bincode` is the bincode emitted by [`build_seeded_query`].
-/// Upstream [`raven_inspire::ClientState`] marks both `secret_key` (LWE)
-/// and `rlwe_secret_key` (RLWE) with `#[serde(skip, default)]` so secret
-/// material never crosses a serialization boundary by accident. The skip
-/// means a bincode round-trip yields a `ClientState` whose secret keys
-/// are `Default::default()` polynomials with empty `moduli` vectors;
-/// passing that to `extract_inspiring` panics inside `Poly::mul_ntt`
-/// (`Moduli must match`) because the ciphertext polynomial carries the
-/// live single-modulus shape but the default-built secret-key polynomial
-/// does not. Native parity tests do not surface this because they hold
-/// the `ClientState` Rust value in process and never bincode round-trip
-/// it; only the WASM boundary forces the trip. Fix: rehydrate the
-/// stripped RLWE secret key from the in-WASM-memory session, which owns
-/// the live key, before calling the extractor. The fix is lossless:
-/// `(state.index, state.shard_id, state.local_index)` are the only
-/// non-skip fields and they already round-trip cleanly.
+/// `client_state_bincode` is the [`build_seeded_query`] output. Its
+/// `rlwe_secret_key` is `#[serde(skip)]`, so it arrives default-built (empty
+/// `moduli`) and must be rehydrated from `session` before extraction; otherwise
+/// `Poly::mul_ntt` panics with `Moduli must match`.
 #[wasm_bindgen]
 pub fn extract_response(
     session: &ClientSessionHandle,
@@ -269,12 +224,7 @@ pub fn extract_response(
 ) -> Result<Vec<u8>, JsValue> {
     let crs: ServerCrs = decode(crs_bincode, "server_crs")?;
     let mut client_state: ClientState = decode(client_state_bincode, "client_state")?;
-    // Rehydrate `#[serde(skip, default)]` `rlwe_secret_key` from the
-    // in-memory session. Without this, the field is an empty default
-    // `RlweSecretKey` (zero polynomial with empty `moduli` Vec) and
-    // `extract_inspiring` panics in `Poly::mul_ntt` with `Moduli must
-    // match`. The LWE `secret_key` field stays default;
-    // `extract_inspiring` reads only `rlwe_secret_key`.
+    // rehydrate serde-skipped key; extract_inspiring reads only rlwe_secret_key
     client_state.rlwe_secret_key = session.inner.rlwe_secret_key().clone();
     let response: ServerResponse = decode(response_bytes, "server_response")?;
     let plaintext = extract_inspiring(&crs, &client_state, &response, entry_size as usize)
@@ -285,29 +235,13 @@ pub fn extract_response(
     Ok(plaintext)
 }
 
-/// Serialize a fully constructed [`ClientSessionHandle`] to a bincode
-/// blob that can be persisted across browser tabs / page reloads /
-/// process boundaries.
+/// Serialize a [`ClientSessionHandle`] to a persistable warm-cache blob.
 ///
-/// Pairs with [`deserialize_client_session`] to amortise the heavy
-/// O(d^3) automorph-table + packing-key generation that
-/// [`build_client_session`] runs (~12.6 s for the production-cell
-/// d=2048 params). The SDK persists the blob to IndexedDB keyed by
-/// `(instanceId, sha256(crsBincode))`; on subsequent loads it
-/// reconstitutes the session via [`deserialize_client_session`] in
-/// milliseconds rather than re-running the cold path.
-///
-/// At the locked upstream pin `119641b`, [`raven_inspire::ClientSession`]
-/// does NOT derive `Serialize` / `Deserialize` / `Clone`. The SDK
-/// surface is shipped now so the wallet's storage layer can encode
-/// against a stable ABI, but every call surfaces a typed
-/// [`WasmClientError::Encode`] until the upstream derives land. When
-/// the derives ship, switch this body to
-/// `Ok(encode(&session.inner, "client_session")?)` and the SDK warms
-/// up transparently — no ABI change required.
+/// Returns a typed [`WasmClientError::Encode`] until upstream
+/// [`raven_inspire::ClientSession`] derives `Serialize`; the symbol ships now
+/// so the SDK can encode against a stable ABI.
 #[wasm_bindgen]
 pub fn serialize_client_session(session: &ClientSessionHandle) -> Result<Vec<u8>, JsValue> {
-    // Suppress unused-binding lint without dropping the symbol from the ABI.
     let _ = session;
     Err(WasmClientError::Encode {
         what: "client_session",
@@ -319,31 +253,18 @@ pub fn serialize_client_session(session: &ClientSessionHandle) -> Result<Vec<u8>
     .into())
 }
 
-/// Reconstitute a [`ClientSessionHandle`] from a previously serialized
-/// session blob plus the same [`WasmInstanceParamsBundle`] + CRS bytes
-/// [`build_client_session`] consumed.
+/// Reconstitute a [`ClientSessionHandle`] from a [`serialize_client_session`] blob.
 ///
-/// Symmetric counterpart to [`serialize_client_session`]. Validates the
-/// supplied `session_bincode` length against
-/// [`WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES`] and the params-bundle's
-/// `InspireParams::ring_dim` against the supplied `crs_bincode` so a
-/// CRS-rotation mismatch surfaces as a typed error rather than as a
-/// silently wrong query later.
-///
-/// At the locked upstream pin `119641b`,
-/// [`raven_inspire::ClientSession`] does NOT derive `Deserialize`. As
-/// with [`serialize_client_session`], the symbol is shipped now so the
-/// SDK can encode against a stable ABI; calls surface a typed
-/// [`WasmClientError::Decode`] until upstream lands the derives.
+/// Validates blob length against [`WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES`] and the
+/// bundle's ring_dim against the CRS so a CRS rotation surfaces as a typed error,
+/// not a silently wrong query. Returns a typed [`WasmClientError::Decode`] until
+/// upstream [`raven_inspire::ClientSession`] derives `Deserialize`.
 #[wasm_bindgen]
 pub fn deserialize_client_session(
     params_bundle_bincode: &[u8],
     crs_bincode: &[u8],
     session_bincode: &[u8],
 ) -> Result<ClientSessionHandle, JsValue> {
-    // Pre-validate inputs the way the working serde pair will once
-    // upstream derives land, so wallet integration code sees the same
-    // typed-error surface across the two regimes.
     let bundle: WasmInstanceParamsBundle = decode(params_bundle_bincode, "params_bundle")?;
     let inspire_params: InspireParams = decode(&bundle.inspire_params_bincode, "inspire_params")?;
     let crs: ServerCrs = decode(crs_bincode, "server_crs")?;
@@ -387,7 +308,7 @@ pub fn build_instance_params_blob(
     shard_config_bincode: &[u8],
 ) -> Result<Vec<u8>, JsValue> {
     let inspire_params: InspireParams = decode(inspire_params_bincode, "inspire_params")?;
-    // Validate shard_config decodes cleanly (catches operator/wallet mismatch at boot).
+    // decode-check catches operator/wallet shard mismatch at boot
     let _shard_config: ShardConfig = decode(shard_config_bincode, "shard_config")?;
     let mut sampler = GaussianSampler::new(inspire_params.sigma);
     let secret_key = RlweSecretKey::generate(&inspire_params, &mut sampler);
@@ -400,18 +321,13 @@ pub fn build_instance_params_blob(
     Ok(encode(&bundle, "wasm_instance_params_bundle")?)
 }
 
-// Tree depth matches `engine/src/models/merkletree-types.ts:7` and
-// `raven-railgun-engine::imt::TREE_DEPTH`. Pinned here so this crate
-// stays a pure leaf in the WASM dependency graph.
+// must match raven-railgun-engine::imt::TREE_DEPTH; duplicated to keep this crate a leaf in the WASM dep graph
 const PATH_INDEX_TREE_DEPTH: u32 = 16;
 const PATH_INDEX_LEAVES_PER_TREE: u32 = 1u32 << PATH_INDEX_TREE_DEPTH;
 const PATH_INDICES_LEN: usize = PATH_INDEX_TREE_DEPTH as usize;
 
-/// Flat-global-index for `(level, idx_at_level)` in a depth-D binary tree.
-///
-/// Level 0 (leaves) occupies `[0, 2^D)`; level 1 follows in `[2^D, 2^D + 2^(D-1))`,
-/// …, root at `2^(D+1) - 2`. Mirrors `PerNodeEncoder::flat_index` in
-/// `raven-railgun-engine`.
+/// Flat-global index for `(level, idx_at_level)`: leaves in `[0, 2^D)`, root at
+/// `2^(D+1) - 2`. Mirrors `PerNodeEncoder::flat_index` in `raven-railgun-engine`.
 fn flat_index_for(level: u32, idx_at_level: u32) -> u32 {
     let depth = PATH_INDEX_TREE_DEPTH;
     let total = 1u32 << (depth + 1);
@@ -466,14 +382,7 @@ pub fn path_indices_for_per_list_leaf(list_key: &[u8], idx: u32) -> Result<Vec<u
     Ok(out)
 }
 
-/// Capped bincode-deserialize entry point for integration tests.
-///
-/// Mirrors the cap the wasm-bindgen surface enforces via `decode<T>`
-/// without exposing the helper itself (which is intentionally
-/// crate-private so callers route through the typed surface). Returns
-/// the same `String` shape as the wasm boundary's
-/// `WasmClientError::Decode { detail }` so a failing-cap test can
-/// assert on the surfaced detail.
+/// Test-only mirror of the crate-private [`decode`]; surfaces its error as `String`.
 #[doc(hidden)]
 pub fn decode_capped_for_test<T: for<'de> Deserialize<'de>>(
     bytes: &[u8],
@@ -482,14 +391,7 @@ pub fn decode_capped_for_test<T: for<'de> Deserialize<'de>>(
     decode::<T>(bytes, what).map_err(|e| e.to_string())
 }
 
-/// Trusted-cap mirror of [`decode_capped_for_test`].
-///
-/// Routes through the same [`decode_trusted`] helper the
-/// [`deserialize_client_session`] wasm-bindgen surface uses (or would
-/// use, once upstream lands the `ClientSession` serde derives) for
-/// self-written session blobs, so tests can exercise the larger
-/// [`WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES`] ceiling without leaking
-/// the crate-private helper.
+/// Test-only mirror of the crate-private [`decode_trusted`]; surfaces its error as `String`.
 #[doc(hidden)]
 pub fn decode_trusted_for_test<T: for<'de> Deserialize<'de>>(
     bytes: &[u8],
@@ -499,13 +401,6 @@ pub fn decode_trusted_for_test<T: for<'de> Deserialize<'de>>(
 }
 
 /// Pure-Rust mirror of [`serialize_client_session`].
-///
-/// At the locked upstream pin `119641b`, [`ClientSession`] does NOT
-/// derive `Serialize` / `Clone`. Returns the same typed error the
-/// wasm-bindgen surface surfaces so unit tests can lock the deferral
-/// shape; when upstream lands the derives this body switches to
-/// `bincode::serialize(session).map_err(|e| e.to_string())` and the
-/// test asserts the working path instead.
 #[doc(hidden)]
 pub fn serialize_client_session_rust(session: &ClientSession) -> Result<Vec<u8>, String> {
     let _ = session;
@@ -518,12 +413,6 @@ pub fn serialize_client_session_rust(session: &ClientSession) -> Result<Vec<u8>,
 }
 
 /// Pure-Rust mirror of [`deserialize_client_session`].
-///
-/// Pre-validates `session_bincode.len()` against the trusted cap and
-/// `crs.ring_dim()` against the params bundle so the "size limit
-/// reached" and ring-dim drift paths are testable, then surfaces the
-/// same typed `Err` the wasm-bindgen surface surfaces at pin
-/// `119641b`.
 #[doc(hidden)]
 pub fn deserialize_client_session_rust(
     params_bundle_bincode: &[u8],
@@ -629,9 +518,7 @@ mod path_indices_tests {
 
     #[test]
     fn path_indices_for_leaf_zero_matches_per_node_encoder_layout() {
-        // For leaf 0 the sibling at level 0 is leaf 1 -> flat_index(0, 1) = 1.
-        // Sibling at level 1 is the right child of the level-1 root segment
-        // -> flat_index(1, 1) = 2^16 + 1 = 65537.
+        // leaf 0: sibling flat_index(0,1)=1, then flat_index(1,1)=2^16+1=65537
         let out = path_indices_for_leaf_rust(0, 0).expect("leaf 0 ok");
         assert_eq!(out[0], 1);
         assert_eq!(out[1], 65537);
@@ -639,8 +526,7 @@ mod path_indices_tests {
 
     #[test]
     fn path_indices_for_per_list_returns_same_layout_as_per_node_encoder() {
-        // Per-list and commit-tree paths share the per-node flat layout;
-        // for the same leaf index the index sequences must be byte-identical.
+        // per-list and commit-tree share the flat layout: identical for the same index
         let key = [7u8; 32];
         let a = path_indices_for_leaf_rust(0, 1234).expect("leaf 1234 ok");
         let b = path_indices_for_per_list_leaf_rust(&key, 1234).expect("per-list 1234 ok");

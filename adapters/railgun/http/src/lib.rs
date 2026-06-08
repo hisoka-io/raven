@@ -1,7 +1,7 @@
 //! HTTP layer for the PIR engine.
 //!
 //! Versioned bincode wire format (see [`WIRE_SCHEMA_VERSION`]).
-//! No `CompressionLayer` — PIR ciphertext is incompressible.
+//! No `CompressionLayer`: PIR ciphertext is incompressible.
 //! `trust_proxy_header` gates `SmartIpKeyExtractor` vs `PeerIpKeyExtractor`.
 
 #![cfg_attr(
@@ -75,17 +75,11 @@ pub(crate) const X_RAVEN_SCHEME: HeaderName = HeaderName::from_static("x-raven-s
 pub(crate) const X_RAVEN_SESSION: HeaderName = HeaderName::from_static("x-raven-session");
 pub(crate) const X_RAVEN_FRESHNESS: HeaderName = HeaderName::from_static("x-raven-freshness");
 
-// Router builders
-
 /// Build the production axum router (generic over [`PirScheme`]).
 ///
 /// # Errors
-///
-/// Returns `Err` if the configured rate-limit knobs combine into a
-/// `tower-governor` config that the upstream rejects. Currently
-/// unreachable for clamped `(rps >= 1, burst >= 1)` but propagated as
-/// a typed error so a future upstream regression is caught at
-/// router-build time instead of mid-runtime.
+/// `Err` only if `tower-governor` rejects the clamped `(rps, burst)` config
+/// (unreachable today; propagated to catch an upstream regression).
 pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
     let trust_proxy = state.config.trust_proxy_header;
     let rps = state.config.rate_limit_rps.max(1);
@@ -120,8 +114,7 @@ pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
         rate_limited.layer(build_governor_layer_peer(rps, burst))
     };
 
-    // Public scope -- bypass Governor so scrape + SSE feed never exhaust the
-    // per-IP burst.
+    // Bypasses Governor so scrape + SSE never exhaust the per-IP burst.
     let public = Router::new()
         .route("/v1/health/live", get(health_live_handler))
         .route("/v1/health/ready", get(health_ready_handler::<S>))
@@ -163,16 +156,11 @@ pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
     ))
 }
 
-/// Inspire-specific router; adds `/session`, `/params`, `/events`, and `/metrics` routes.
+/// Inspire-specific router; adds `/session` and `/params` routes.
 ///
-/// Router shape splits into two scopes:
-/// - **Rate-limited** (Governor): PIR query/batch/status/admin/sessions/params/poi-shim.
-/// - **Public** (no Governor): `/v1/health/{live,ready}`, `/v1/events`, `/metrics`.
-///
-/// The public scope keeps Prometheus scrapes + the SSE status feed from
-/// exhausting the per-IP burst budget. `/metrics` is bearer-gated by default
-/// (`HttpConfig.metrics_public = false`); operators opt in to public scrape via
-/// `metrics_public = true`, which `bearer_auth` honors before forwarding.
+/// Splits into a rate-limited (Governor) scope and a public scope. The public
+/// scope keeps scrapes + the SSE feed from exhausting the per-IP burst budget.
+/// `/metrics` is bearer-gated unless `HttpConfig.metrics_public = true`.
 ///
 /// # Errors
 /// Same contract as [`router`].
@@ -186,13 +174,8 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
     let auth_layer =
         middleware::from_fn_with_state(state.clone(), bearer_auth::<RavenInspireScheme>);
 
-    // `/params` body is multi-MiB CRS bincode. Empirical ratio at d=2048 is
-    // ~1.0x (the CRS is random-like; no compression win) so the route ships
-    // without a CompressionLayer. Adding the layer would require splitting
-    // body+ETag computation around the transform; the regression test in
-    // `tests/params_caching.rs` pins `ETag = SHA-256(raw body)` which
-    // breaks under per-request `Accept-Encoding`. The Cloudflare cache
-    // benefits are unaffected (cache key is the ETag, not Content-Encoding).
+    // No CompressionLayer: CRS bincode is random-like (~1.0x), and per-request
+    // Accept-Encoding would break the `ETag = SHA-256(raw body)` cache contract.
     let params_route = Router::new()
         .route("/v1/instance/:id/params", get(params_handler))
         .with_state(state.clone());
@@ -228,10 +211,8 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
         rate_limited.layer(build_governor_layer_peer(rps, burst))
     };
 
-    // Public scope -- bypasses Governor so scrape + SSE never exhaust the
-    // per-IP burst. `bearer_auth` still applies; the path-match inside it
-    // bypasses health + events unconditionally and gates /metrics on
-    // `HttpConfig.metrics_public`.
+    // Bypasses Governor; `bearer_auth` still applies (it path-bypasses health
+    // + events and gates /metrics on `HttpConfig.metrics_public`).
     let public = Router::new()
         .route("/v1/health/live", get(health_live_handler))
         .route(
@@ -245,8 +226,7 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
 
     let base = rate_limited.merge(public);
 
-    // Cloudflare Tunnel real-IP rewrite -- only mounted when operators
-    // declare the trust path explicitly.
+    // Cloudflare Tunnel real-IP rewrite; mounted only when trust is declared.
     let base = if trust_proxy {
         base.layer(middleware::from_fn(cf_connecting_ip_to_xff))
     } else {
@@ -277,8 +257,6 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
             }),
     ))
 }
-
-// Helpers
 
 type RavenGovernorLayerPeer = tower_governor::GovernorLayer<
     tower_governor::key_extractor::PeerIpKeyExtractor,
@@ -360,13 +338,8 @@ fn build_cors_layer(allowed_origins: &[String]) -> Option<CorsLayer> {
                 http::HeaderName::from_static("x-raven-scheme"),
                 http::HeaderName::from_static("x-raven-schema-version"),
                 http::HeaderName::from_static("x-raven-session"),
-                // Rate-limit backoff metadata so browser callers can
-                // back off precisely on 429 instead of guessing
-                // exponential delays. `tower_governor` 0.4 emits
-                // `x-ratelimit-after` on every 429 response (lib.rs:109,
-                // :278 in the upstream crate). `retry-after` is NOT
-                // emitted by the governor; it is omitted here so the
-                // expose list reflects what callers will actually see.
+                // `tower_governor` 0.4 emits `x-ratelimit-after` (not
+                // `retry-after`) on 429; expose only what callers will see.
                 http::HeaderName::from_static("x-ratelimit-after"),
             ]),
     )
@@ -465,8 +438,6 @@ pub(crate) fn global_prometheus_handle(
     }
 }
 
-// Inline tests
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,7 +459,7 @@ mod tests {
     #[test]
     fn ct_eq_str_differing_byte_returns_false() {
         let a = b"super-secret-token";
-        let b = b"super-secret-tokeN"; // last byte differs
+        let b = b"super-secret-tokeN";
         let choice = ct_eq_str(a, b);
         let yes: bool = choice.into();
         assert!(!yes);
@@ -760,8 +731,6 @@ mod tests {
         assert!(json.contains("\"last_known_chain_head\":200"));
     }
 
-    // dispatch_batch failure-injection tests
-
     #[derive(Debug, Default)]
     struct SlowableScheme;
 
@@ -883,8 +852,6 @@ mod tests {
         assert_eq!(tags, vec![10, 11, 12, 13]);
     }
 
-    // write_batch_response_versioned round-trip tests
-
     #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
     struct VarLenItem {
         tag: u32,
@@ -973,8 +940,6 @@ mod tests {
         );
     }
 
-    // Drain-aware batch test
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn dispatch_batch_drain_during_batch_blocks_late_queries() {
         let state = SlowableState::default();
@@ -1026,8 +991,6 @@ mod tests {
             other => panic!("expected BatchError::Respond(NoActiveInstance), got {other:?}"),
         }
     }
-
-    // max_body_bytes validation tests
 
     #[test]
     fn http_config_validate_rejects_zero_max_body_bytes() {

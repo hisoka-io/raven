@@ -97,7 +97,6 @@ fn sample_cache() -> BTreeMap<u64, [u8; 32]> {
     m
 }
 
-/// Round-trip: encode → decode is the identity function.
 #[test]
 fn reorg_window_codec_round_trips_a_known_map() {
     let cache = sample_cache();
@@ -107,9 +106,7 @@ fn reorg_window_codec_round_trips_a_known_map() {
     assert_eq!(decoded, cache, "decode must be the inverse of encode");
 }
 
-/// Locked magic value: any drift in the literal triggers a test
-/// failure before a live deployment loads a sidecar with the wrong
-/// fingerprint. The exact bytes are part of the wire contract.
+/// Locks the magic/version: the exact bytes are part of the on-disk wire contract.
 #[test]
 fn reorg_window_magic_constant_locked_to_rvnrgidx() {
     assert_eq!(REORG_WINDOW_MAGIC, *b"RVNRGIDX");
@@ -136,9 +133,7 @@ fn reorg_window_decode_rejects_wrong_magic() {
     bytes[0] = b'X';
     let err = decode_reorg_window(&bytes).expect_err("must fail magic");
     let msg = format!("{err}");
-    // Wrong magic flips the CRC too: decode fails CRC first OR magic
-    // - either is an acceptable fail-closed outcome for the test
-    //   semantics, since both reject the byte stream.
+    // wrong magic also breaks the CRC, so either error is a valid fail-closed outcome.
     assert!(
         msg.contains("magic") || msg.contains("CRC"),
         "expected magic or CRC error; got {msg}"
@@ -187,12 +182,10 @@ fn reorg_window_persist_recovers_after_dangling_tmp() {
     std::fs::write(&tmp_path, b"corrupt-leftover-from-prior-run").expect("write tmp");
     assert!(tmp_path.is_file());
 
-    // Persist succeeds and overwrites both tmp + final.
     let cache = sample_cache();
     persist_reorg_window(&path, &cache).expect("persist ok");
     assert!(path.is_file(), "final sidecar must exist after persist");
 
-    // Final file round-trips.
     let loaded = load_reorg_window(&path).expect("load ok");
     assert_eq!(loaded, cache);
 }

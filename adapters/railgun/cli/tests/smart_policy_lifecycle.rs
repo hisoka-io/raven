@@ -347,9 +347,7 @@ async fn cooldown_seconds_refuses_back_to_back_spawns() {
 
     tokio::time::sleep(cooldown + Duration::from_millis(250)).await;
 
-    // Send tree-3 (not 2) so the watcher's monotonicity invariant is
-    // unambiguous: a resend of 2 would interact with the previous
-    // refusal's advanced state.
+    // send tree-3 not 2: a resend of 2 would collide with the watcher's advanced monotonic state
     tx.send(3).expect("send tree-3 post-cooldown");
     wait_for_chain_tree_count(&harness.registry, 3, Duration::from_secs(60)).await;
     let tree3_dir = tmp.path().join("auto-tree-3");
@@ -397,11 +395,9 @@ async fn max_count_and_cooldown_compose() {
     tx.send(1).expect("send 1");
     wait_for_chain_tree_count(&harness.registry, 2, Duration::from_secs(60)).await;
 
-    // Tree 2 hits cooldown immediately.
     tx.send(2).expect("send 2");
     wait_for_refused_spawns(&harness.registry, 1, Duration::from_secs(5)).await;
 
-    // Past the cooldown, tree 3 lands and takes us to the ceiling.
     tokio::time::sleep(cooldown + Duration::from_millis(250)).await;
     tx.send(3).expect("send 3");
     wait_for_chain_tree_count(&harness.registry, 3, Duration::from_secs(60)).await;
@@ -411,7 +407,7 @@ async fn max_count_and_cooldown_compose() {
         "registry at ceiling after 2 spawns",
     );
 
-    // Past cooldown, tree 4 hits the ceiling instead.
+    // past cooldown, but tree-4 now hits the ceiling
     tokio::time::sleep(cooldown + Duration::from_millis(250)).await;
     tx.send(4).expect("send 4");
     wait_for_refused_spawns(&harness.registry, 2, Duration::from_secs(5)).await;

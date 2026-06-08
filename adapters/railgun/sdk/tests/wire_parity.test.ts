@@ -1,39 +1,6 @@
-/**
- * Wire-parity regression suite for upstream Railgun POINodeInterface.
- *
- * Each block in this file pins a specific contract surfaced by the
- * SDK against an upstream-canonical reference, with citations into
- * the upstream Railgun repos (github.com/Railgun-Community) so future drift is easy to
- * triangulate.
- *
- * The tests in this file lock the five wire-parity bugs:
- *
- *   C1 — `PoisPerListResponse` shape: `{[bc]: {[listKey]: status}}`
- *        (NOT the inverted shape) per
- *        `shared-models/src/models/proof-of-innocence.ts:153`.
- *
- *   C3 — `MerkleProof.root` is folded with Poseidon over the leaf +
- *        the sibling auth path, matching upstream
- *        `engine/src/merkletree/merkle-proof.ts verifyMerkleProof`
- *        and using upstream `Merkletree.hashLeftRight` exactly.
- *
- *   C4 — `submitPOI` is the upstream 9-arg shape, the
- *        `validatePOIMerkleroots` body uses `poiMerkleroots`, and
- *        `MerkleProof.indices` is 64-hex (uint256) NOT 8-hex
- *        (uint32). Hex emissions are no-`0x`-prefix to match
- *        upstream `nToHex(_, UINT_256)` shape.
- *
- *   H3 — Error class discrimination: only Network errors
- *        substitute Missing; ServerError + StaleAdapter +
- *        DecodeError propagate so the wallet sees the failure.
- *
- *   H17 — Upstream passthrough URLs include `/<chainType>/<chainID>`
- *        and the literal segment matches upstream
- *        (`/merkle-proofs`, `/pois-per-list`,
- *        `/validate-poi-merkleroots`,
- *        `/submit-transact-proof`,
- *        `/submit-legacy-transact-proofs`).
- */
+// Wire-parity regression suite against upstream Railgun POINodeInterface
+// (github.com/Railgun-Community). Each describe block pins one contract and cites
+// the upstream source so future drift is easy to triangulate.
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
@@ -53,10 +20,7 @@ const BC_HEX_A =
 const BC_HEX_B =
   "0000000000000000000000000000000000000000000000000000000000000002";
 
-// Upstream test vectors lifted byte-for-byte from
-// `engine/src/merkletree/__tests__/utxo-merkletree.test.ts`
-// `Should hash left/right` block. Cross-validates that our
-// Poseidon binding matches upstream `Merkletree.hashLeftRight`.
+// Upstream KAT vectors from engine/src/merkletree/__tests__/utxo-merkletree.test.ts ("Should hash left/right").
 const UPSTREAM_HASH_LEFT_RIGHT_VECTORS = [
   {
     left: "115cc0f5e7d690413df64c6b9662e9cf2a3617f2743245519e19607a4417189a",
@@ -131,10 +95,7 @@ describe("wire parity: C1 — PoisPerListResponse outer key is BC (NOT listKey)"
   });
 
   it("legacy mode round-trips upstream POIsPerListMap shape verbatim", async () => {
-    // Server emits the upstream shape:
-    //   { [BC]: { [listKey]: status } }
-    // per
-    // `private-proof-of-innocence/packages/node/src/poi-events/poi-merkletree-manager.ts:215-218`.
+    // Upstream `{ [BC]: { [listKey]: status } }` (poi-merkletree-manager.ts:215-218).
     const expected = {
       [BC_HEX_A]: { [LIST_KEY_HEX]: "Valid" },
       [BC_HEX_B]: { [LIST_KEY_HEX]: "ShieldBlocked" },
@@ -159,20 +120,16 @@ describe("wire parity: C1 — PoisPerListResponse outer key is BC (NOT listKey)"
       ],
     );
     expect(got).toEqual(expected);
-    // Outer key must be BC, NOT listKey:
     expect(got[BC_HEX_A][LIST_KEY_HEX]).toBe("Valid");
     expect(got[BC_HEX_B][LIST_KEY_HEX]).toBe("ShieldBlocked");
-    // The inverted shape MUST NOT be observable in the wire:
+    // Inverted (listKey-outer) shape must not be observable.
     expect(got[LIST_KEY_HEX]).toBeUndefined();
   });
 });
 
 describe("wire parity: C4 — MerkleProof.indices is uint256 (64 hex chars)", () => {
   it("MerkleProof type carries 64-char no-prefix hex indices", () => {
-    // Asserts the buildMerkleProof emit shape via the public type
-    // surface. Constructed shape mirrors upstream
-    // `engine/src/merkletree/merkletree.ts:148`:
-    //   `nToHex(BigInt(index), UINT_256)` -> 64 hex chars no prefix.
+    // Upstream nToHex(index, UINT_256) -> 64 hex chars, no prefix (merkletree.ts:148).
     const proof: import("../src/index").MerkleProof = {
       leaf: "0".repeat(64),
       elements: [],
@@ -301,10 +258,7 @@ describe("wire parity: H17 — upstream passthrough URLs include chainType + cha
   });
 
   it("getPOIMerkleProofs passthrough hits upstream `/merkle-proofs/<chainType>/<chainID>`", async () => {
-    // Stale freshness on primary forces fallback to upstream. The
-    // literal segment must be `merkle-proofs` (NOT
-    // `poi-merkle-proofs`) per upstream
-    // `private-proof-of-innocence/packages/node/src/api/api.ts:739`.
+    // Stale freshness forces upstream fallback; segment is `merkle-proofs`, not `poi-merkle-proofs` (api.ts:739).
     mainServer.route(
       (req) => req.url === "/v1/poi/merkle-proofs",
       (_req, _body, res) => {
@@ -378,8 +332,7 @@ describe("wire parity: H17 — upstream passthrough URLs include chainType + cha
       [LIST_KEY_HEX],
       [{ blindedCommitment: BC_HEX_A, type: "Shield" }],
     );
-    // Sepolia chain id 11155111 must round-trip into the URL,
-    // proving multi-network deployments don't collide on a default.
+    // Sepolia chain id must round-trip into the URL, not collapse to a default.
     expect(upstreamUrl).toBe("/pois-per-list/0/11155111");
   });
 
@@ -407,8 +360,6 @@ describe("wire parity: H17 — upstream passthrough URLs include chainType + cha
     ]);
     expect(got).toBe(true);
     expect(observed).toBe("/validate-poi-merkleroots/0/1");
-    // Body field name MUST be `poiMerkleroots` per upstream
-    // ValidatePOIMerklerootsParams (NOT `roots`).
     const decoded = observedBody as Record<string, unknown>;
     expect(decoded.poiMerkleroots).toEqual(["11".repeat(32)]);
     expect(decoded.listKey).toBe(LIST_KEY_HEX);

@@ -204,9 +204,7 @@ async fn concurrent_list_observed_bursts_dedupe_to_one_spawn_per_template_per_li
 
     let params = InspireParams::secure_128_d2048();
     let registry = Arc::new(PpoiListSpawnRegistry::new());
-    // Capacity well above the burst size so no broadcast value is
-    // dropped before the driver consumes it; the dedup gate must do
-    // the work, not the channel.
+    // capacity above the burst so dedup, not the channel, drops duplicates
     let (tx, rx) = tokio::sync::broadcast::channel::<[u8; 32]>(64);
     let log_dir = harness.bootstrap_dir.clone();
 
@@ -230,8 +228,7 @@ async fn concurrent_list_observed_bursts_dedupe_to_one_spawn_per_template_per_li
     for _ in 0..10 {
         let tx_clone = tx.clone();
         firing.push(tokio::spawn(async move {
-            // tokio broadcast::Sender::send is sync; the spawn just
-            // gives us parallel firing across worker threads.
+            // spawn only to fire in parallel; broadcast send is sync
             tx_clone.send(TEST_LIST_KEY).expect("broadcast burst");
         }));
     }
@@ -241,7 +238,7 @@ async fn concurrent_list_observed_bursts_dedupe_to_one_spawn_per_template_per_li
 
     wait_for_pair_count(&registry, 2, Duration::from_secs(60)).await;
 
-    // Allow time for any rogue duplicate spawn to surface.
+    // let any rogue duplicate spawn surface
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     assert_eq!(
@@ -305,8 +302,7 @@ async fn restart_replay_picks_up_auto_spawned_ppoi_list_instances_from_spawn_log
     tx.send(TEST_LIST_KEY).expect("broadcast list_key");
     wait_for_pair_count(&registry_v1, 2, Duration::from_secs(60)).await;
 
-    // Tear down v1 to simulate a process restart; the on-disk JSONL
-    // spawn log is the durable state.
+    // simulate restart: the on-disk JSONL spawn log is the only durable state
     drop(tx);
     let _ = tokio::time::timeout(Duration::from_secs(5), driver_v1).await;
     drop(registry_v1);

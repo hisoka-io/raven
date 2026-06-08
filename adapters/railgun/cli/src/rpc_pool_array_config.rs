@@ -1,13 +1,5 @@
-//! Per-endpoint heterogeneous TOML loader for the bootstrap path.
-//!
-//! Layered atop the existing `RpcPoolConfigToml` (which bakes per-endpoint
-//! rps/burst into pool-wide defaults) so an operator can ship a
-//! production rpc-pool.toml whose endpoints carry independent rate-limit
-//! budgets (e.g. a paid Alchemy URL at 200 rps next to a public RPC at
-//! 5 rps). The bootstrap subcommand consumes this shape; serve-production
-//! continues to read the legacy pool config until a future migration.
-//!
-//! Wire shape this loader expects:
+//! Per-endpoint heterogeneous TOML loader: each `[[rpc_endpoint]]` carries its
+//! own rps/burst, unlike `RpcPoolConfigToml` which bakes one budget pool-wide.
 //!
 //! ```toml
 //! [[rpc_endpoint]]
@@ -15,23 +7,13 @@
 //! rps   = 200
 //! burst = 400
 //!
-//! [[rpc_endpoint]]
-//! url   = "https://public.rpc.example"
-//! rps   = 5
-//! burst = 10
-//!
 //! [rpc_pool]
-//! strategy                = "round-robin"
-//! cooldown_secs_on_error  = 30
+//! strategy               = "round-robin"
+//! cooldown_secs_on_error = 30
 //!
 //! [ws_endpoints]
-//! urls = ["wss://primary-ws.example/", "wss://failover-ws.example/"]
+//! urls = ["wss://primary-ws.example/"]
 //! ```
-//!
-//! The `[rpc_pool]` table fixes pool-wide knobs (selection strategy +
-//! per-endpoint cooldown after 429/5xx). The `[ws_endpoints]` table is
-//! parsed for forward-compatibility with the multi-WS subscription path
-//! and surfaced as `Vec<String>` (validated non-empty when present).
 
 use serde::Deserialize;
 use std::path::Path;
@@ -122,9 +104,7 @@ impl RpcEndpointArrayConfig {
         Self::load_from_str(&raw)
     }
 
-    /// Parse + validate from a TOML string. Catches the
-    /// "operator dropped a stray endpoint with rps=0" footgun before
-    /// anything binds the pool.
+    /// Parse + validate from a TOML string.
     pub fn load_from_str(raw: &str) -> Result<Self, RpcPoolArrayError> {
         let parsed: Self =
             toml::from_str(raw).map_err(|e| RpcPoolArrayError::Parse(e.to_string()))?;
@@ -165,10 +145,8 @@ impl RpcEndpointArrayConfig {
         Ok(())
     }
 
-    /// Materialise the validated config into an `RpcEndpointPool`.
-    /// Per-endpoint rps/burst flow through unchanged (no clamp, no
-    /// pool-wide override) so the operator's heterogeneous budget
-    /// reaches the limiter.
+    /// Materialise into an `RpcEndpointPool`; per-endpoint rps/burst flow
+    /// through unclamped so heterogeneous budgets reach the limiter.
     pub fn build_pool(&self) -> Result<RpcEndpointPool, RpcPoolArrayError> {
         let strategy = match self.rpc_pool.strategy.as_str() {
             "round-robin" => PoolStrategy::RoundRobin,
@@ -269,9 +247,7 @@ strategy = "least-loaded"
 [rpc_pool]
 strategy = "round-robin"
 "#;
-        // Missing required `rpc_endpoint` array — toml parser surfaces
-        // `Parse` rather than the validate-time `Empty` because serde
-        // rejects the missing field outright.
+        // serde rejects the missing field, so this is `Parse`, not `Empty`.
         let err = RpcEndpointArrayConfig::load_from_str(bad).expect_err("must reject");
         assert!(matches!(err, RpcPoolArrayError::Parse(_)));
     }

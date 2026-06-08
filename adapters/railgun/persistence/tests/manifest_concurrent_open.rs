@@ -89,7 +89,7 @@ fn concurrent_lock_release_then_reacquire_is_clean() {
         let (layout, _lock) = StoreLayout::open_with_lock(&path).expect("first acquire");
         let m = sample_manifest(1, 100);
         m.save(&layout).expect("save under first lock");
-    } // lock released
+    }
 
     let (layout, _lock) = StoreLayout::open_with_lock(&path).expect("re-acquire");
     let back = Manifest::load(&layout)
@@ -123,7 +123,6 @@ fn manifest_save_during_concurrent_lock_attempts_is_atomic() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_path_buf();
 
-    // Seed an initial well-formed manifest.
     {
         let (layout, _lock) = StoreLayout::open_with_lock(&path).expect("seed acquire");
         sample_manifest(0, 0).save(&layout).expect("seed save");

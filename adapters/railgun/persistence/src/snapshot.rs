@@ -35,7 +35,7 @@ pub const SNAPSHOT_MAGIC: [u8; 16] = *b"RAVEN_RAILGUN_01";
 /// uncompressed payload in both paths so no manifest schema bump is needed.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
-/// zstd level 3: ~3–4× size reduction on bincode-shaped state, single-digit-percent CPU overhead.
+/// zstd level 3: ~3-4x size reduction on bincode-shaped state, single-digit-percent CPU overhead.
 #[cfg(feature = "zstd-compression")]
 const ZSTD_LEVEL: i32 = 3;
 
@@ -67,18 +67,16 @@ impl Snapshot {
 
     /// Persist the snapshot under `layout.snapshot_dir(id)`.
     ///
-    /// Uses a two-rename idiom for crash-atomicity (fix C8):
-    /// (1) rename existing `final_dir` → `.old.tmp`,
-    /// (2) rename `tmp_dir` → `final_dir`,
-    /// (3) remove `.old.tmp`.
-    /// A kill between steps leaves recoverable state that [`Snapshot::load`] handles.
-    /// Idempotent under retry with the same `id` (fix #2).
+    /// Two-rename idiom for crash-atomicity: (1) rename existing
+    /// `final_dir` to `.old.tmp`, (2) rename `tmp_dir` to `final_dir`,
+    /// (3) remove `.old.tmp`. A kill between steps leaves recoverable
+    /// state that [`Snapshot::load`] handles. Idempotent under retry
+    /// with the same `id`.
     pub fn save(&self, layout: &StoreLayout, id: SnapshotId) -> Result<()> {
         let final_dir = layout.snapshot_dir(id);
         let tmp_dir = final_dir.with_extension("tmp");
         let final_old_tmp = final_dir.with_extension("old.tmp");
 
-        // Clean any previous tmp directories from a prior aborted save.
         let _ = std::fs::remove_dir_all(&tmp_dir);
         let _ = std::fs::remove_dir_all(&final_old_tmp);
         std::fs::create_dir_all(&tmp_dir)?;
@@ -88,7 +86,6 @@ impl Snapshot {
         let body = wrap_for_disk(&self.data)?;
         atomic_write(&tmp_dir.join("data.bincode"), &body)?;
 
-        // Step 1: displace the existing final_dir (if any).
         let had_final = final_dir.exists();
         if had_final {
             if let Err(e) = std::fs::rename(&final_dir, &final_old_tmp) {
@@ -100,7 +97,6 @@ impl Snapshot {
             }
         }
 
-        // Step 2: rename tmp_dir → final_dir.
         if let Err(e) = std::fs::rename(&tmp_dir, &final_dir) {
             if had_final {
                 if let Err(rollback_err) = std::fs::rename(&final_old_tmp, &final_dir) {
@@ -122,7 +118,7 @@ impl Snapshot {
             fsync_parent_dir(parent)?;
         }
 
-        // Step 3: reclaim the displaced old snapshot. Best-effort; load recovery handles leaks.
+        // best-effort reclaim; load recovery handles leaks
         if had_final {
             if let Err(e) = std::fs::remove_dir_all(&final_old_tmp) {
                 tracing::warn!(
@@ -321,8 +317,7 @@ mod tests {
         assert!(matches!(err, PersistenceError::SnapshotCorrupt(_)));
     }
 
-    /// Idempotency under retry: if commit() succeeded at snap.save but failed at wal.archive,
-    /// the next commit retries save with the same id. Pre-fix this failed with ENOTEMPTY.
+    // re-saving the same id must not fail with ENOTEMPTY
     #[test]
     fn save_is_idempotent_under_existing_final_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -342,8 +337,7 @@ mod tests {
         assert_eq!(loaded.data, b"retry commit attempt");
     }
 
-    /// Crash-window 1 back-compat: a snapshot with only `final_dir` and no `.old.tmp`
-    /// loads cleanly (no migration step).
+    // only `final_dir`, no `.old.tmp`: loads with no migration step
     #[test]
     fn load_handles_pre_c8_snapshot_with_only_final_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -357,8 +351,7 @@ mod tests {
         assert_eq!(loaded.data, payload);
     }
 
-    /// Crash-window 1: kill between step 1 (rename final_dir → .old.tmp) and step 2.
-    /// Load must rename `.old.tmp` back and return the prior-good payload.
+    // kill after final_dir was displaced to `.old.tmp`: load promotes it back
     #[test]
     fn load_recovers_when_only_old_tmp_exists() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -377,8 +370,7 @@ mod tests {
         assert!(!old_tmp.exists());
     }
 
-    /// Crash-window 2: kill between step 2 (rename tmp_dir → final_dir) and step 3 (remove .old.tmp).
-    /// Both dirs exist; `final_dir` wins and `.old.tmp` is cleaned up.
+    // kill with both dirs present: `final_dir` wins, `.old.tmp` cleaned up
     #[test]
     fn load_prefers_final_dir_when_both_present_and_cleans_up_old_tmp() {
         let dir = tempfile::tempdir().expect("tempdir");

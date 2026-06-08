@@ -1,12 +1,6 @@
-//! Snapshot export-tarball pruning tests.
-//!
-//! Closes the operator-observed accumulation: `/srv/raven/snapshots`
-//! grew unbounded across deploy cycles because `run_export` only ever
-//! wrote new tarballs without trimming the drop zone. The fix:
-//! `prune_old_export_tarballs(dir, N)` lists `*.tar.zst` files by
-//! mtime descending and removes all but the `keep_last_n` newest
-//! (deleting the paired `.sig` sidecars too). `run_export` invokes
-//! the pruner after a successful tarball write.
+//! Snapshot export-tarball pruning: `prune_old_export_tarballs` keeps the
+//! `keep_last_n` newest `*.tar.zst` by mtime, dropping paired `.sig` sidecars,
+//! and `run_export` invokes it after each successful write.
 
 #![allow(
     clippy::expect_used,
@@ -28,9 +22,7 @@ use raven_railgun_persistence::{
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
 
-/// Build a minimal instance data_dir so `run_export` has at least one
-/// instance to walk. Does not exercise the WAL path; the manifest +
-/// snapshot are sufficient for the pruner's surface area.
+/// Minimal manifest+snapshot data_dir so `run_export` has one instance to walk.
 fn bootstrap_minimal_instance(root: &Path, instance_id: &str, payload: &[u8]) {
     let inst_dir = root.join(instance_id);
     let layout = StoreLayout::open(&inst_dir).expect("StoreLayout::open");
@@ -50,7 +42,7 @@ fn bootstrap_minimal_instance(root: &Path, instance_id: &str, payload: &[u8]) {
     manifest.save(&layout).expect("manifest save");
 }
 
-/// Touch a file to write `bytes` and stamp `mtime` deterministically.
+/// Write `bytes` and stamp `mtime` deterministically.
 fn write_with_mtime(path: &Path, bytes: &[u8], mtime: SystemTime) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("create parent");
@@ -89,7 +81,6 @@ fn prune_old_export_tarballs_keeps_last_3_by_mtime() {
     let scratch = tempfile::tempdir().expect("tempdir");
     let dir = scratch.path();
     let now = SystemTime::now();
-    // 5 tarballs with strictly increasing mtime: t0 oldest, t4 newest.
     for (i, name) in [
         "e0.tar.zst",
         "e1.tar.zst",
@@ -127,8 +118,6 @@ fn prune_old_export_tarballs_removes_paired_sig_sidecar_with_tarball() {
 
     let removed = prune_old_export_tarballs(dir, 2).expect("prune");
     assert_eq!(removed, 2);
-    // a.tar.zst + a.tar.zst.sig + b.tar.zst + b.tar.zst.sig must be gone;
-    // c + d (and their sidecars) must remain.
     assert!(!dir.join("a.tar.zst").exists());
     assert!(
         !dir.join("a.tar.zst.sig").exists(),
@@ -152,13 +141,11 @@ fn prune_old_export_tarballs_zero_when_count_below_keep() {
     let now = SystemTime::now();
     write_with_mtime(&dir.join("only.tar.zst"), b"x", now);
 
-    // keep=3, only 1 file present -> nothing to prune.
     let removed = prune_old_export_tarballs(dir, 3).expect("prune");
     assert_eq!(removed, 0);
     assert!(dir.join("only.tar.zst").exists());
 
-    // keep=0 means "disabled"; even if 5 files were present, prune is
-    // a no-op.
+    // keep=0 disables pruning
     for i in 0..5 {
         write_with_mtime(
             &dir.join(format!("k{i}.tar.zst")),
@@ -172,10 +159,6 @@ fn prune_old_export_tarballs_zero_when_count_below_keep() {
 
 #[test]
 fn prune_snapshots_subcommand_removes_oldest_tarballs() {
-    // Standalone `prune-snapshots` subcommand path: an operator runs
-    // this from cron without driving an export. With keep=2 and 5
-    // tarballs present, the 3 oldest must be removed and the 2 newest
-    // must remain.
     let scratch = tempfile::tempdir().expect("tempdir");
     let dir = scratch.path();
     let now = SystemTime::now();
@@ -207,9 +190,6 @@ fn prune_snapshots_subcommand_removes_oldest_tarballs() {
 
 #[test]
 fn prune_snapshots_keeps_paired_sig_sidecars_with_kept_tarballs() {
-    // Regression-guard: the standalone subcommand must preserve the
-    // `.sig` sidecars of tarballs it keeps. Each surviving tarball
-    // pairs to exactly one sidecar.
     let scratch = tempfile::tempdir().expect("tempdir");
     let dir = scratch.path();
     let now = SystemTime::now();
@@ -229,7 +209,6 @@ fn prune_snapshots_keeps_paired_sig_sidecars_with_kept_tarballs() {
     })
     .expect("run_prune");
 
-    // Oldest gone (tarball + sidecar both).
     assert!(
         !dir.join("a.tar.zst").exists(),
         "oldest tarball must be pruned"
@@ -238,7 +217,6 @@ fn prune_snapshots_keeps_paired_sig_sidecars_with_kept_tarballs() {
         !dir.join("a.tar.zst.sig").exists(),
         "oldest tarball's paired .sig sidecar must be pruned"
     );
-    // Two newest kept (with sidecars).
     assert!(dir.join("b.tar.zst").exists());
     assert!(
         dir.join("b.tar.zst.sig").exists(),
@@ -253,16 +231,11 @@ fn prune_snapshots_keeps_paired_sig_sidecars_with_kept_tarballs() {
 
 #[test]
 fn prune_snapshots_zero_when_count_below_keep() {
-    // Regression-guard: the standalone subcommand is idempotent and a
-    // no-op when fewer tarballs are present than `--keep`. Also covers
-    // an empty / non-existent directory and the `--keep 0` (disabled)
-    // path so cron jobs never error out on a clean snapshot dir.
     let scratch = tempfile::tempdir().expect("tempdir");
     let dir = scratch.path();
     let now = SystemTime::now();
     write_with_mtime(&dir.join("only.tar.zst"), b"x", now);
 
-    // keep=5 with 1 file: nothing to prune, file must still exist.
     run_prune(PruneOptions {
         data_dir: dir.to_path_buf(),
         keep_snapshots: 5,
@@ -273,7 +246,7 @@ fn prune_snapshots_zero_when_count_below_keep() {
         "single tarball must survive when count < --keep"
     );
 
-    // keep=0 (disabled): even with extra files, nothing removed.
+    // keep=0 disables pruning
     for i in 0..3 {
         write_with_mtime(
             &dir.join(format!("z{i}.tar.zst")),
@@ -293,7 +266,7 @@ fn prune_snapshots_zero_when_count_below_keep() {
         "keep_snapshots=0 must be a no-op even when many tarballs are present"
     );
 
-    // Non-existent directory: no error, no panic.
+    // missing dir must not error
     let missing = scratch.path().join("does-not-exist");
     run_prune(PruneOptions {
         data_dir: missing,
@@ -309,7 +282,7 @@ fn export_snapshot_invokes_pruner_after_write() {
     std::fs::create_dir_all(&src_root).expect("mkdir src");
     bootstrap_minimal_instance(&src_root, "alpha", b"deadbeef-payload");
 
-    // Pre-seed the parent directory with stale tarballs (older mtime).
+    // pre-seed stale tarballs the export must prune
     let parent = scratch.path().join("snapshots");
     std::fs::create_dir_all(&parent).expect("mkdir snapshots");
     let now = SystemTime::now();

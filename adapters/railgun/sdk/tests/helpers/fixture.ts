@@ -1,14 +1,4 @@
-/**
- * Shared fixture loader for SDK tests that need a real
- * `ClientPirContext` (built against the precomputed binary fixture
- * shipped under `tests/fixtures/`). The fixture itself is generated
- * by the Rust `emit_test_fixture` example.
- *
- * Loaded once per test module; the underlying wasm session is shared
- * across all tests in that module (the wasm session is single-
- * threaded but reusable across sequential `build_seeded_query`
- * calls).
- */
+/** Loads the precomputed binary fixture under `tests/fixtures/` into a real `ClientPirContext`. */
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";

@@ -45,10 +45,6 @@ pub fn write_frame<W: Write>(mut w: W, payload: &[u8]) -> io::Result<()> {
 pub fn read_frame<R: Read>(mut r: R) -> io::Result<Vec<u8>> {
     let mut len_bytes = [0u8; 4];
     r.read_exact(&mut len_bytes)?;
-    // integer cast hygiene. `u32 as usize` is widening on
-    // every modern target (usize is ≥ 32 bits for our supported
-    // platforms native + wasm32). Explicit `try_into` matches the
-    // lint posture + keeps the cast inspectable.
     let len = usize::try_from(u32::from_le_bytes(len_bytes)).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -88,19 +84,13 @@ mod tests {
         assert_eq!(out, payload);
     }
 
-    /// Known-answer test for the exact on-wire byte layout.
-    ///
-    /// This freezes the wire format so a reader written to an older version
-    /// of this module can still decode frames produced today, and vice
-    /// versa. Any change that alters the bytes here is breaking and must be
-    /// versioned explicitly.
+    // Freezes the wire format; any byte change here is breaking.
     #[test]
     fn kat_hello_frame_bytes() {
         let payload = b"hello";
         let mut buf = Vec::new();
         write_frame(&mut buf, payload).expect("write");
 
-        // u32 little-endian length prefix (= 5) followed by the payload.
         let expected: [u8; 9] = [0x05, 0x00, 0x00, 0x00, b'h', b'e', b'l', b'l', b'o'];
         assert_eq!(buf, expected);
     }

@@ -1,7 +1,5 @@
-//! H11 regression guards for the session-store lifecycle divergence:
-//! admin-path `inspire::swap_state` resets the session store; the
-//! consumer-task `drive_commit` re-encode path carries it via
-//! `Arc::clone`.
+//! Session-store lifecycle: admin-path `inspire::swap_state` resets the
+//! session store; the `drive_commit` re-encode path carries it via `Arc::clone`.
 
 #![allow(clippy::expect_used)]
 
@@ -31,9 +29,7 @@ fn build_toy_state(params: &InspireParams) -> InspireServerState {
 fn register_one_session(instance: &Arc<PirInstance<RavenInspireScheme>>, params: &InspireParams) {
     let snap = instance.current_state();
     let crs_clone = (*snap.crs).clone();
-    // Synthesize a matching sk via a sibling setup_state call; sk is
-    // independent of server state contents and we only need a
-    // structurally-valid RlweSecretKey for the session.
+    // sk is independent of server-state contents; a sibling setup gives a structurally-valid one
     let (_off_state, sk) = {
         let db: Vec<u8> = (0..TOY_ENTRIES)
             .flat_map(|i| {
@@ -45,8 +41,6 @@ fn register_one_session(instance: &Arc<PirInstance<RavenInspireScheme>>, params:
     let mut session = build_client_session(crs_clone, sk, params).expect("client session");
     register_client_session(&mut session, snap.as_ref()).expect("register session");
 }
-
-// H11.a: admin-path `inspire::swap_state` clears session_store.
 
 #[test]
 fn admin_swap_state_clears_session_store() {
@@ -68,8 +62,7 @@ fn admin_swap_state_clears_session_store() {
         "donor session_store must be non-empty before the admin swap (got len={pre_swap_len})"
     );
 
-    // Capture the donor's Arc pointer so we can assert post-swap the
-    // store is a DIFFERENT Arc (not just equal-by-content).
+    // capture the donor Arc pointer to assert post-swap it's a different Arc, not equal-by-content
     let donor_session_store_ptr: *const ServerSessionStore = {
         let snap = instance.current_state();
         Arc::as_ptr(&snap.session_store)
@@ -100,8 +93,7 @@ fn admin_swap_state_clears_session_store() {
          got post-swap len={post_swap_len}"
     );
 
-    // Must be a DIFFERENT Arc — guards against a future "always carry"
-    // regression that would type-check but leak donor sessions.
+    // different-Arc guard: an "always carry" regression would type-check but leak donor sessions
     let post_swap_session_store_ptr: *const ServerSessionStore = {
         let snap = instance.current_state();
         Arc::as_ptr(&snap.session_store)
@@ -116,8 +108,6 @@ fn admin_swap_state_clears_session_store() {
         "swap_state must bump the epoch"
     );
 }
-
-// H11.b: re-encode path preserves session_store via Arc::clone.
 
 #[test]
 fn drive_commit_path_preserves_session_store() {
@@ -143,9 +133,7 @@ fn drive_commit_path_preserves_session_store() {
         Arc::as_ptr(&snap.session_store)
     };
 
-    // Mirror `Engine::drive_commit`'s new_state shape. encoded_db is
-    // cloned without re-encoding (no dirty shards) because the property
-    // under test is session lifecycle, not re-encode correctness.
+    // mirror drive_commit's new_state shape; encoded_db is cloned without re-encoding since the property under test is session lifecycle
     let new_state = {
         let current = instance.current_state();
         InspireServerState {

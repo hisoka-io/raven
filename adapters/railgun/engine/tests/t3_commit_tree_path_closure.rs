@@ -111,8 +111,7 @@ fn t3_pir_query_recovers_path_byte_identical_and_reconstructs_imt_root() {
         let plaintext = extract_response(&live_state.crs, &client_state, &response, ENTRY_BYTES)
             .expect("extract");
 
-        // Independent oracle: imt.node walked directly, not
-        // imt.merkle_proof, so a self-consistent encoder bug fails.
+        // independent oracle: walk imt.node directly, not imt.merkle_proof, to catch a self-consistent encoder bug
         let mut pir_siblings = [[0u8; 32]; TREE_DEPTH];
         for level in 0..TREE_DEPTH {
             let s = level * 32;
@@ -145,7 +144,6 @@ fn t3_pir_query_recovers_path_byte_identical_and_reconstructs_imt_root() {
             "T3 PIR path at idx={target_idx} must reconstruct to per-tree IMT root"
         );
 
-        // Sanity: PerLeafPathEncoder byte-agrees with Imt::merkle_proof.
         let oracle = imt.merkle_proof(target_idx as usize).expect("imt proof");
         let oracle_proof = MerkleProof {
             root: oracle.root,

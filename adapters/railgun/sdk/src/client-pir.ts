@@ -1,32 +1,10 @@
-/**
- * Client-side PIR helper for the Raven Railgun POI SDK.
- *
- * Wraps the `raven-inspire-client-wasm` Wasm artifact that ships the
- * raven-inspire client API (build_seeded_query / extract_response).
- * The wallet builds encrypted PIR queries entirely in-process and
- * POSTs only the encrypted blob to the adapter server. Plaintext
- * blinded commitments and leaf indices never cross the wire.
- *
- * Two consumers:
- * - `RavenPOINodeInterface` constructed with `useClientPir: true`
- *   uses this module to build queries.
- * - The privacy-invariant test harness uses the exported types to
- *   capture wire requests and assert no BC bytes appear in any
- *   request body.
- */
+/** Client-side PIR helper over `raven-inspire-client-wasm`; only the encrypted blob crosses the wire. */
 
 import type { POIStatus } from "./raven-poi-node-interface";
 import { RavenError } from "./errors";
 import { idbGet, idbPut, sha256Hex } from "./session-cache";
 
-/**
- * Subset of the `raven-inspire-client-wasm` surface this SDK needs.
- *
- * The wasm-pack output is loaded lazily; this interface is the
- * structural contract the SDK consumes regardless of how the wasm
- * was loaded (bundler import vs Node CJS require vs direct
- * WebAssembly instantiation).
- */
+/** Structural contract for the subset of `raven-inspire-client-wasm` this SDK consumes. */
 export interface RavenInspireWasm {
   build_client_session(
     paramsBundleBincode: Uint8Array,
@@ -48,72 +26,32 @@ export interface RavenInspireWasm {
     session: RavenInspireClientSession,
     instanceParamsBincode: Uint8Array,
   ): void;
-  /**
-   * Install the WASM-side panic hook so Rust panics inside the
-   * crate surface as structured `Error: panicked at '<msg>',
-   * <file>:<line>` JS exceptions instead of opaque
-   * `RuntimeError: unreachable executed` traps.
-   *
-   * Idempotent. Wallets SHOULD call this once at module load before
-   * any other call. The convenience wrapper [`installPanicHook`]
-   * forwards here and is a safe no-op when the wasm shim does not
-   * expose the symbol.
-   */
+  /** Install the WASM panic hook so Rust panics carry file:line; idempotent. Optional on older builds. */
   init_panic_hook?(): void;
   build_instance_params_blob(
     inspireParamsBincode: Uint8Array,
     shardConfigBincode: Uint8Array,
   ): Uint8Array;
-  /**
-   * Serialize a fully constructed client session to a bincode blob
-   * that can be cached across page reloads / process restarts.
-   *
-   * Optional: older WASM builds do not export this symbol; callers
-   * MUST treat it as `undefined` and skip the warm-cache path.
-   * Available since the `s036-client-session-serde` upstream pin.
-   */
+  /** Serialize a session to a cacheable bincode blob. Optional; treat as `undefined` and skip warm-cache on older builds. */
   serialize_client_session?(session: RavenInspireClientSession): Uint8Array;
-  /**
-   * Reconstitute a session from a previously cached bincode blob
-   * plus the same params bundle / CRS the cold path consumed.
-   *
-   * Optional: older WASM builds do not export this symbol; callers
-   * MUST treat it as `undefined` and fall through to
-   * `build_client_session`. Available since the
-   * `s036-client-session-serde` upstream pin.
-   */
+  /** Reconstitute a session from a cached blob + same params/CRS. Optional; fall through to `build_client_session` on older builds. */
   deserialize_client_session?(
     paramsBundleBincode: Uint8Array,
     crsBincode: Uint8Array,
     sessionBincode: Uint8Array,
   ): RavenInspireClientSession;
-  /**
-   * Returns the 16 flat-global row indices needed for an auth-path
-   * PIR query against `PerNodeEncoder` (commit-tree). Pure function;
-   * deterministic. Throws on `leaf_idx >= 2^16`.
-   */
+  /** 16 flat-global auth-path row indices for a commit-tree leaf. Throws on `leaf_idx >= 2^16`. */
   path_indices_for_leaf(treeNumber: number, leafIdx: number): Uint32Array;
-  /**
-   * Returns the 16 flat-global row indices needed for an auth-path
-   * PIR query against `PerListNodeEncoder` (per-list PPOI tree).
-   * Pure function; deterministic. Throws on
-   * `list_key.length != 32` or `idx >= 2^16`.
-   */
+  /** 16 flat-global auth-path row indices for a per-list leaf. Throws on `list_key.length != 32` or `idx >= 2^16`. */
   path_indices_for_per_list_leaf(listKey: Uint8Array, idx: number): Uint32Array;
 }
 
-/**
- * Opaque handle owned by the wasm module. The SDK never inspects it.
- */
+/** Opaque wasm-owned handle; the SDK never inspects it. */
 export interface RavenInspireClientSession {
   free(): void;
 }
 
-/**
- * Cached state for one (instance_id, list_key) tuple. Built once per
- * session boot via `loadClientPir`; reused across all
- * `getPOIsPerList` / `getPOIMerkleProofs` / `getMerkleProof` calls.
- */
+/** Cached per-instance PIR state; built once at boot, reused across all queries. */
 export interface ClientPirContext {
   readonly wasm: RavenInspireWasm;
   readonly session: RavenInspireClientSession;
@@ -122,40 +60,20 @@ export interface ClientPirContext {
   readonly entrySize: number;
 }
 
-/**
- * Pre-computed BC -> idx map for one PPOI list. The wallet fetches
- * this once at boot from the server's public publishing channel
- * (`GET /v1/poi/:list/bc-to-idx-map`). Lookup happens locally; the
- * idx is then handed to the wasm query builder.
- */
+/** BC -> idx map for one PPOI list, fetched once from `GET /v1/poi/:list/bc-to-idx-map`. */
 export type BcToIdxMap = Map<string, number>;
 
-/**
- * Decoded shape of a single client-PIR query bundle. Mirrors the
- * Rust `WasmSeededQueryOutput` bincode struct.
- */
+/** Decoded client-PIR query bundle; mirrors the Rust `WasmSeededQueryOutput` bincode struct. */
 export interface ClientPirQueryBundle {
-  /**
-   * Local-only; held in memory while the HTTP request is in flight
-   * and passed back to `extract_response` when the server replies.
-   * Never sent to the server.
-   */
+  /** Local-only; replayed into `extract_response`, never sent to the server. */
   clientStateBincode: Uint8Array;
-  /**
-   * The encrypted PIR query blob. POSTed to `/v1/instance/:id/query`.
-   */
+  /** Encrypted PIR query blob; POSTed to `/v1/instance/:id/query`. */
   queryBytes: Uint8Array;
 }
 
-/**
- * Decode the bincode payload returned by `build_seeded_query`.
- *
- * The wasm module emits a single `Uint8Array` carrying the bincode
- * of `{ client_state_bincode: Vec<u8>, query_bytes: Vec<u8> }`. Both
- * inner Vec<u8>s are bincode-prefix-encoded.
- */
+/** Decode the bincode `{ client_state: Vec<u8>, query_bytes: Vec<u8> }` from `build_seeded_query`. */
 export function decodeClientPirQueryBundle(buf: Uint8Array): ClientPirQueryBundle {
-  // bincode v1 default config: u64 LE length prefix for Vec<u8>.
+  // bincode v1: u64 LE length prefix per Vec<u8>
   if (buf.length < 8) {
     throw RavenError.decodeError(`decodeClientPirQueryBundle: buffer too short (${buf.length})`);
   }
@@ -184,23 +102,7 @@ export function decodeClientPirQueryBundle(buf: Uint8Array): ClientPirQueryBundl
   };
 }
 
-/**
- * Install the wasm-side panic hook so Rust panics surface as
- * structured `Error: panicked at '<msg>', <file>:<line>` JS
- * exceptions. Wallets SHOULD call this once at module load before
- * any other PIR call.
- *
- * Idempotent and dependency-injected: takes the same `wasm`
- * module the SDK already accepts via `ClientPirContext`. Returns
- * `true` if the hook was installed, `false` if the underlying
- * wasm shim does not expose `init_panic_hook` (older builds).
- *
- * Without this hook, raven-inspire panics arrive at JS as
- * `RuntimeError: unreachable executed` with no Rust file:line, so
- * any production-side debugging is materially harder. With it,
- * every panic carries the originating `file.rs:N:C` and the
- * assertion message.
- */
+/** Install the wasm panic hook so Rust panics carry file:line. Returns false on older builds lacking the symbol. */
 export function installPanicHook(wasm: RavenInspireWasm): boolean {
   if (typeof wasm.init_panic_hook === "function") {
     wasm.init_panic_hook();
@@ -209,19 +111,11 @@ export function installPanicHook(wasm: RavenInspireWasm): boolean {
   return false;
 }
 
-/**
- * Inputs for [`loadClientPirContext`]. The wallet supplies the
- * already-fetched + decoded `/v1/instance/<id>/params` envelope
- * pieces; this function takes them and produces a
- * [`ClientPirContext`] ready for use, transparently using the
- * IndexedDB warm-cache when available.
- */
+/** Decoded `/v1/instance/<id>/params` pieces consumed by [`loadClientPirContext`]. */
 export interface LoadClientPirContextInput {
   /** WASM module exposing the `build_*` / `*_client_session` API. */
   readonly wasm: RavenInspireWasm;
-  /** Stable identifier for the PIR instance (e.g.
-   *  `commit-tree-0`). Used as the first component of the cache
-   *  key so two instances with the same CRS hash never collide. */
+  /** PIR instance id; first component of the cache key so same-CRS instances never collide. */
   readonly instanceId: string;
   readonly crsBincode: Uint8Array;
   readonly shardConfigBincode: Uint8Array;
@@ -229,40 +123,18 @@ export interface LoadClientPirContextInput {
   readonly entrySize: number;
 }
 
-/**
- * Returned alongside the [`ClientPirContext`] so callers can
- * observe whether the warm cache was hit. Test-only signal; the
- * production path treats hit / miss interchangeably.
- */
+/** [`ClientPirContext`] plus a warm-cache hit signal (test-only; prod treats hit/miss alike). */
 export interface LoadClientPirContextResult {
   readonly context: ClientPirContext;
-  /** `true` when the session was reconstituted from the cache;
-   *  `false` when [`build_client_session`] was invoked from cold. */
+  /** `true` when reconstituted from cache; `false` on a cold `build_client_session`. */
   readonly cacheHit: boolean;
 }
 
 /**
- * Build a [`ClientPirContext`] from the operator-side params
- * bundle, transparently using the warm-cache path when the WASM
- * module exposes [`serialize_client_session`] +
- * [`deserialize_client_session`] AND a cached blob exists for
- * `(instanceId, sha256(crsBincode))`.
- *
- * Cold-path cost: ~12.6 s at production-cell d=2048 (the WASM-side
- * `PackParams::new` automorph-table O(d^3) search +
- * `ClientPackingKeys::generate`).
- *
- * Warm-path cost: a few hundred ms for the IndexedDB read +
- * bincode-deserialize of the cached session blob.
- *
- * The cache is keyed by `(instanceId, sha256(crsBincode))` so a
- * CRS rotation (e.g. operator restart with a new seed) auto-
- * invalidates every cached session without an explicit clear
- * step.
- *
- * Storage failures degrade silently to the cold path (the cache
- * is best-effort; correctness is preserved by always being able
- * to fall back to [`build_client_session`]).
+ * Build a [`ClientPirContext`], using the IndexedDB warm cache when the WASM
+ * exposes serialize/deserialize and a blob exists. Cache key is
+ * `(instanceId, sha256(crsBincode))` so a CRS rotation auto-invalidates every
+ * session. Storage failures degrade to the cold `build_client_session` path.
  */
 export async function loadClientPirContext(
   input: LoadClientPirContextInput,
@@ -275,8 +147,6 @@ export async function loadClientPirContext(
     shardConfigBincode,
   );
 
-  // Try the warm path first when the WASM module exports the
-  // serialize/deserialize pair AND the cache holds a live entry.
   const canCache =
     typeof wasm.serialize_client_session === "function" &&
     typeof wasm.deserialize_client_session === "function";
@@ -286,7 +156,6 @@ export async function loadClientPirContext(
     try {
       crsHash = await sha256Hex(crsBincode);
     } catch {
-      // Web Crypto unavailable; degrade to cold.
       return coldPath();
     }
     const cached = await idbGet(instanceId, crsHash);
@@ -298,16 +167,15 @@ export async function loadClientPirContext(
           cacheHit: true,
         };
       } catch {
-        // Corrupt cache entry: fall through to cold rebuild + reseed.
+        // corrupt entry: fall through to cold rebuild + reseed
       }
     }
-    // Cold rebuild + reseed the cache for the next page load.
     const session = wasm.build_client_session(paramsBundle, crsBincode);
     try {
       const blob = wasm.serialize_client_session!(session);
       await idbPut(instanceId, crsHash, blob);
     } catch {
-      // best-effort; the session is still valid even if seeding fails.
+      // best-effort seed
     }
     return {
       context: { wasm, session, crsBincode, shardConfigBincode, entrySize },
@@ -326,12 +194,7 @@ export async function loadClientPirContext(
   }
 }
 
-/**
- * Map the leading byte of a PIR-extracted plaintext row to the
- * Railgun POI status enum. Mirrors the server-side encoder
- * (`PerListStatusEncoder`) where the first byte of every row is the
- * status enum value.
- */
+/** Map the leading plaintext-row byte to the POI status enum; mirrors `PerListStatusEncoder`. */
 export function statusByteToPOIStatus(b: number): POIStatus {
   switch (b) {
     case 0:
@@ -348,14 +211,10 @@ export function statusByteToPOIStatus(b: number): POIStatus {
 }
 
 function readU64LE(view: DataView, offset: number): number {
-  // bincode v1 emits u64 LE. JS only safely represents integers up
-  // to 2^53; the bincode payloads we decode here are byte vectors
-  // whose lengths are always well under that ceiling (~hundreds of
-  // KB), so the truncation to Number is safe in practice.
+  // payload lengths stay far under 2^32, so truncating the u64 to Number is safe
   const lo = view.getUint32(offset, true);
   const hi = view.getUint32(offset + 4, true);
   if (hi !== 0) {
-    // Defensive: no byte vector we decode should hit 4 GB.
     throw RavenError.decodeError(`readU64LE: payload length exceeds 2^32 (hi=${hi})`);
   }
   return lo;
@@ -367,11 +226,7 @@ function cloneBytes(src: Uint8Array): Uint8Array {
   return out;
 }
 
-/**
- * Convert a hex string (with or without 0x prefix) to a Uint8Array.
- * Accepts both upper- and lowercase. Used for searching wire bodies
- * for BC bytes during the privacy-invariant test.
- */
+/** Convert a hex string (optional 0x prefix, any case) to a Uint8Array. */
 export function hexToBytes(hex: string): Uint8Array {
   const stripped = hex.startsWith("0x") || hex.startsWith("0X") ? hex.slice(2) : hex;
   if (stripped.length % 2 !== 0) {
@@ -388,10 +243,7 @@ export function hexToBytes(hex: string): Uint8Array {
   return out;
 }
 
-/**
- * Lower-case hex (no 0x prefix) of a Uint8Array. Used by tests +
- * by the SDK's own logging.
- */
+/** Lower-case hex (no 0x prefix) of a Uint8Array. */
 export function bytesToHex(bytes: Uint8Array): string {
   let out = "";
   for (let i = 0; i < bytes.length; i += 1) {
@@ -400,11 +252,7 @@ export function bytesToHex(bytes: Uint8Array): string {
   return out;
 }
 
-/**
- * Returns true if `haystack` contains every byte of `needle` in
- * order, contiguous. Used by the privacy-invariant test to assert
- * no BC bytes appear anywhere in any wire request body.
- */
+/** True if `haystack` contains `needle` as a contiguous byte subsequence. */
 export function containsByteSequence(haystack: Uint8Array, needle: Uint8Array): boolean {
   if (needle.length === 0) return true;
   if (needle.length > haystack.length) return false;
@@ -417,22 +265,13 @@ export function containsByteSequence(haystack: Uint8Array, needle: Uint8Array): 
   return false;
 }
 
-/**
- * Tree-depth used by the Railgun commitment-tree (16). Mirrors the
- * Rust constant in `raven-railgun-engine::imt::TREE_DEPTH`.
- */
+/** Commitment-tree depth; mirrors Rust `raven-railgun-engine::imt::TREE_DEPTH`. */
 export const TREE_DEPTH = 16;
 
-/**
- * Maximum leaves per tree (`2 ^ TREE_DEPTH`).
- */
+/** Maximum leaves per tree (`2 ^ TREE_DEPTH`). */
 export const TREE_MAX_LEAVES = 1 << TREE_DEPTH;
 
-/**
- * Validate a hex-encoded blinded commitment: must decode to exactly
- * 32 bytes. Throws `RavenError.invalidQuery` on failure with the
- * offending value embedded in the message.
- */
+/** Validate a hex blinded commitment decodes to exactly 32 bytes. */
 export function validateBcHex(bc: string, label: string = "blindedCommitment"): void {
   const stripped = bc.startsWith("0x") || bc.startsWith("0X") ? bc.slice(2) : bc;
   if (stripped.length !== 64) {
@@ -445,9 +284,7 @@ export function validateBcHex(bc: string, label: string = "blindedCommitment"): 
   }
 }
 
-/**
- * Validate a hex-encoded list_key: must decode to exactly 32 bytes.
- */
+/** Validate a hex list_key decodes to exactly 32 bytes. */
 export function validateListKeyHex(listKey: string, label: string = "listKey"): void {
   const stripped = listKey.startsWith("0x") || listKey.startsWith("0X") ? listKey.slice(2) : listKey;
   if (stripped.length !== 64) {
@@ -460,9 +297,7 @@ export function validateListKeyHex(listKey: string, label: string = "listKey"): 
   }
 }
 
-/**
- * Validate a leaf-index against the tree's leaf range.
- */
+/** Validate a leaf-index against the tree's leaf range. */
 export function validateLeafIndex(idx: number, label: string = "leafIndex"): void {
   if (!Number.isInteger(idx)) {
     throw RavenError.invalidQuery(`${label}: ${idx} must be an integer`);
@@ -475,11 +310,7 @@ export function validateLeafIndex(idx: number, label: string = "leafIndex"): voi
   }
 }
 
-/**
- * Validate a tree number against the chain's known tree set
- * (range-only here; the upstream Railgun protocol caps trees at
- * `0..2^32` via the `treeNumber: u32` shape).
- */
+/** Validate a tree number against the `u32` range upstream uses for `treeNumber`. */
 export function validateTreeNumber(treeNumber: number, label: string = "treeNumber"): void {
   if (!Number.isInteger(treeNumber)) {
     throw RavenError.invalidQuery(`${label}: ${treeNumber} must be an integer`);
@@ -492,17 +323,7 @@ export function validateTreeNumber(treeNumber: number, label: string = "treeNumb
   }
 }
 
-// ---------------------------------------------------------------------------
-// Path-indices helpers (TS-side wrappers over the WASM exports)
-// ---------------------------------------------------------------------------
-
-/**
- * Wrap `wasm.path_indices_for_leaf` with TS-side validation +
- * defensive copy. Returns a plain `number[]` of length 16; throws
- * `RavenError.invalidQuery` on out-of-range input or
- * `RavenError.decodeError` if the wasm output isn't the expected
- * shape (defensive guard).
- */
+/** Validated, defensively-copied wrapper over `wasm.path_indices_for_leaf`; returns 16 indices. */
 export function pathIndicesForLeaf(
   wasm: RavenInspireWasm,
   treeNumber: number,
@@ -531,10 +352,7 @@ export function pathIndicesForLeaf(
   return out;
 }
 
-/**
- * Wrap `wasm.path_indices_for_per_list_leaf` with TS-side validation
- * + defensive copy.
- */
+/** Validated, defensively-copied wrapper over `wasm.path_indices_for_per_list_leaf`. */
 export function pathIndicesForPerListLeaf(
   wasm: RavenInspireWasm,
   listKeyHex: string,

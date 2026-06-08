@@ -1,41 +1,14 @@
-# nextest config for the raven workspace. Loaded by `cargo nextest run`.
-# Does NOT affect `cargo test` invocations.
-#
-# Why this exists: 109+ release-mode test binaries. `cargo test` runs
-# binaries SEQUENTIALLY (parallelism only within a binary via
-# --test-threads). nextest builds all binaries first, then runs them
-# all in parallel processes, saturating cores across binaries. On this
-# 16-core box that translates to a 2-4× wall-time reduction on full
-# workspace test runs.
-#
-# Usage:
-#   cargo nextest run                                    # all default tests
-#   cargo nextest run --release                          # release-mode (matches CI)
-#   cargo nextest run -p raven-railgun-cli               # single crate
-#   cargo nextest run --features chaos-tests             # include chaos
-#   cargo nextest run --no-fail-fast                     # don't bail on first failure
-#
-# Doc tests are NOT run by nextest; use `cargo test --doc` for those.
+# nextest config for the railgun adapter workspace; does not affect `cargo test`.
 
 [profile.default]
-# Retry once on flake (network-touching tests, port-bind races); a real
-# bug surfaces after the second pass too.
+# absorb network/port-bind flake; a real bug fails the retry too
 retries = 1
-# Surface progress as tests run, not just at the end. Helps when a
-# single binary stalls a long run.
 status-level = "pass"
 final-status-level = "fail"
-# Capture both stdout and stderr; surface only on failure.
 failure-output = "immediate"
 success-output = "never"
-
-# Slow-test detection. Tests over 60s in release mode are exceptional
-# (only chaos children + production-cell #[ignore]'d ones). Surface
-# them so the slow-tail is visible.
 slow-timeout = { period = "60s", terminate-after = 5 }
 
-# CI profile: stricter — no retries (fail loudly so flakes get fixed),
-# JSON output for parsing. Activate via `cargo nextest run --profile ci`.
 [profile.ci]
 retries = 0
 status-level = "all"
@@ -44,16 +17,8 @@ failure-output = "final"
 success-output = "never"
 slow-timeout = { period = "120s", terminate-after = 3 }
 
-# Test groups: serialize tests that fight on global resources. Each
-# group is allowed ONE test at a time across the whole run.
-#
-# - chaos-subprocess: tests that fork+SIGKILL a child binary. They share
-#   the same child-binary executable, port binds, /tmp dirs, and have
-#   long teardown. Running them concurrent triggers race conditions
-#   that the production code does not have to handle.
-# - flock-tests: tests that take an flock on a shared data_dir layout.
-#   Rare, but already-once a real source of flake.
-
+# serialize tests that contend on shared global resources (child binary,
+# port binds, /tmp dirs, flock on a shared data_dir): one at a time
 [test-groups]
 chaos-subprocess = { max-threads = 1 }
 flock-tests = { max-threads = 1 }

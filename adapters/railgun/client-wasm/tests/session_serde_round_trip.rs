@@ -1,20 +1,8 @@
 //! Session-blob round-trip tests for the WASM warm-cache path.
 //!
-//! At the locked upstream pin `119641b`, [`raven_inspire::ClientSession`]
-//! does NOT derive `Clone` / `Serialize` / `Deserialize`. The SDK
-//! surface is shipped now so wallet integrators can encode against a
-//! stable ABI; [`serialize_client_session`] and
-//! [`deserialize_client_session`] survive at the boundary but every
-//! invocation surfaces a typed `Err`. These tests lock the typed-error
-//! shape so a future pin bump that lands the derives surfaces here as a
-//! failure (the bodies will switch from `Err` to `Ok` and the test
-//! suite must be updated in lockstep).
-//!
-//! Companion tests cover the pre-validation paths that DO run before
-//! the deferred-symbol stop fires:
-//! - CRS ring_dim drift against the params bundle's `InspireParams`.
-//! - Session-blob byte-length cap (256 MiB trusted ceiling).
-//! - Untrusted 64 MiB cap unchanged for HTTP-sourced bincode payloads.
+//! Upstream `ClientSession` lacks serde derives, so the serialize/deserialize
+//! entry points surface a typed `Err`; these tests lock that wording (and the
+//! pre-validation paths that run before it) so a derive-landing pin bump fails here.
 
 #![allow(
     clippy::expect_used,
@@ -56,11 +44,7 @@ fn build_test_db(params: &InspireParams) -> Vec<u8> {
         .collect()
 }
 
-/// `WasmInstanceParamsBundle` mirror used for test fixtures. The
-/// upstream type is crate-private inside the WASM lib (so the SDK
-/// only sees it as bincode bytes); here we reconstruct the same wire
-/// shape with serde-eq fields so tests can build a bundle without a
-/// private API.
+/// Wire-shape mirror of the crate-private `WasmInstanceParamsBundle`.
 #[derive(serde::Serialize)]
 #[allow(clippy::struct_field_names)]
 struct TestParamsBundle {
@@ -82,13 +66,8 @@ fn make_params_bundle(
     bincode::serialize(&bundle).expect("serialize bundle")
 }
 
-/// At the locked upstream pin `119641b`, [`ClientSession`] does not
-/// implement `Serialize`. The wasm-bindgen `serialize_client_session`
-/// (and its pure-Rust mirror) ship at the ABI but surface a typed
-/// `Err` carrying the deferral wording. This test locks the wording
-/// so an upstream pin bump that lands the derives flips the test red
-/// — at which point the body switches from `Err` to `Ok` and the
-/// round-trip closure can be re-enabled.
+/// Locks the deferral wording `serialize_client_session` returns until upstream
+/// `ClientSession` derives `Serialize`; a derive-landing pin bump flips this red.
 #[test]
 fn wasm_session_serialize_returns_typed_err_until_upstream_derives_land() {
     let params = test_params();
@@ -112,11 +91,8 @@ fn wasm_session_serialize_returns_typed_err_until_upstream_derives_land() {
     );
 }
 
-/// Symmetric to the serialize test: the deserialize entry point also
-/// surfaces a typed `Err` with the deferral wording. This test inputs
-/// valid params + CRS bytes + a small dummy session blob so the
-/// CRS/params validation passes; the deferral `Err` is the final
-/// return.
+/// Deserialize counterpart: valid params + CRS + dummy blob pass the pre-checks,
+/// then the deferral `Err` is the final return.
 #[test]
 fn wasm_session_deserialize_returns_typed_err_until_upstream_derives_land() {
     let params = test_params();
@@ -128,9 +104,7 @@ fn wasm_session_deserialize_returns_typed_err_until_upstream_derives_land() {
     let bundle_bytes = make_params_bundle(&params, &encoded_db.config, &sk);
     let crs_bytes = bincode::serialize(&crs).expect("serialize crs");
 
-    // 16-byte stub: under the trusted cap and under any plausible
-    // bincode prefix, so the pre-checks pass and the deferred-symbol
-    // stop fires.
+    // small enough to clear the pre-checks so the deferral stop is what fires
     let session_stub = vec![0u8; 16];
 
     let err = deserialize_client_session_rust(&bundle_bytes, &crs_bytes, &session_stub)
@@ -141,10 +115,8 @@ fn wasm_session_deserialize_returns_typed_err_until_upstream_derives_land() {
     );
 }
 
-/// Ring-dim drift between the params bundle's `InspireParams` and the
-/// supplied CRS surfaces as a typed `Err` BEFORE the deferred-symbol
-/// stop fires. This validates the pre-check path the SDK relies on to
-/// detect CRS rotation against a stale cached bundle.
+/// ring_dim drift between bundle and CRS must error before the deferral stop:
+/// the SDK relies on this to detect CRS rotation against a stale cached bundle.
 #[test]
 fn wasm_session_deserialize_validates_ring_dim_drift() {
     let params = test_params();
@@ -153,10 +125,7 @@ fn wasm_session_deserialize_validates_ring_dim_drift() {
     let (crs, encoded_db, sk) =
         inspire_setup(&params, &database, ENTRY_BYTES, &mut sampler).expect("inspire_setup");
 
-    // Build a params bundle whose `InspireParams::ring_dim` differs
-    // from the CRS. The honest mismatch path: clone the params,
-    // bump ring_dim, re-bincode the bundle. The CRS still carries
-    // the original (256) ring_dim so the pre-check must fire.
+    // bundle ring_dim bumped to 512 while the CRS keeps 256, so the pre-check fires
     let mut drifted_params = params.clone();
     drifted_params.ring_dim = 512;
     let drifted_bundle = TestParamsBundle {
@@ -180,10 +149,7 @@ fn wasm_session_deserialize_validates_ring_dim_drift() {
     );
 }
 
-/// Boundary: one byte past the trusted cap must trigger the
-/// slice-length pre-check before any bincode work runs. Drop the
-/// buffer immediately so it does not pin 256 MiB of RSS for the rest
-/// of the test process.
+/// One byte past the trusted cap triggers the length pre-check before any bincode work.
 #[test]
 fn wasm_session_deserialize_rejects_oversize_blob_with_typed_error() {
     let params = test_params();
@@ -206,12 +172,7 @@ fn wasm_session_deserialize_rejects_oversize_blob_with_typed_error() {
     );
 }
 
-/// Trusted cap admits payloads at the 256 MiB boundary: the
-/// slice-length pre-check must NOT fire. The helper either decodes
-/// or surfaces a typed bincode-decode error from the body (the
-/// zero-filled buffer is not a valid `ClientSession` bincode prefix
-/// — but that's a body error, not a cap error). Either outcome
-/// proves cap admission.
+/// At exactly the cap the pre-check must NOT fire; a body decode error still proves admission.
 #[test]
 fn wasm_session_trusted_cap_admits_payload_at_256_mib_boundary() {
     let outcome = {
@@ -230,10 +191,7 @@ fn wasm_session_trusted_cap_admits_payload_at_256_mib_boundary() {
     }
 }
 
-/// Defense-in-depth: the original 64 MiB cap remains the enforcement
-/// point for HTTP-sourced bincode payloads routed through
-/// `decode_capped_for_test`. A regression that widens the untrusted
-/// cap surfaces here.
+/// The 64 MiB cap stays the enforcement point for HTTP-sourced bytes; a widened cap fails here.
 #[test]
 fn wasm_untrusted_cap_unchanged_at_64_mib_for_http_sourced_bytes() {
     let err = {

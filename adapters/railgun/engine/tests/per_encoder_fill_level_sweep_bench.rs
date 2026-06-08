@@ -26,8 +26,7 @@ const LEAVES_PER_TREE: u32 = 1u32 << ENTRIES_LOG2;
 const SEEDS: usize = 3;
 const SAMPLE_INSERTS: u32 = 16;
 
-/// (preload_to, label). Last entry is `(LEAVES_PER_TREE - SAMPLE_INSERTS - 1, "100%")`
-/// so the very last available insert is the one being timed.
+// last entry times the very last available insert
 const FILL_LEVELS: &[(u32, &str)] = &[
     (LEAVES_PER_TREE / 4, "25%"),
     (LEAVES_PER_TREE / 2, "50%"),

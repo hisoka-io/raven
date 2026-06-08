@@ -20,27 +20,14 @@ const ENTRIES_PER_SHARD: u32 = 64;
 const NODE_BYTES: usize = 32;
 
 const TOTAL_LEAVES: u32 = 100;
-/// Surviving leaf count after the synthetic L1 reorg. Pinned to the
-/// hardening-spec target of 70 BC. The rewind value below is derived
-/// from this so the on-disk math stays internally consistent: heights
-/// are dense (one block per leaf), so dropping `TOTAL_LEAVES -
-/// REORG_BOUNDARY = 30` indices means rewinding the same 30 blocks
-/// from the chain tip.
+// surviving leaf count after the reorg; heights are dense (one block per leaf)
 const REORG_BOUNDARY: u32 = 70;
-/// Size of the synthetic Layer-1 rewind in blocks. Equals
-/// `TOTAL_LEAVES - REORG_BOUNDARY` because every per-list leaf was
-/// applied at a distinct height (one per block); a deeper rewind on
-/// the same dense layout would drop more leaves.
 const REORG_REWIND_BLOCKS: u64 = (TOTAL_LEAVES - REORG_BOUNDARY) as u64;
 
 const FIRST_LEAF_HEIGHT: u64 = 100;
 
 fn old_bc_for(idx: u32) -> [u8; 32] {
-    // BN254-Fr-canonical encoding (high bytes zero so Poseidon's
-    // canonicality check inside `Imt::insert_leaves` accepts the leaf).
-    // Tag the OLD generation in byte 27 so a stale-cache regression
-    // (returning OLD bytes when the test expects NEW) surfaces
-    // immediately on a byte compare.
+    // Fr-canonical (high bytes zero); byte 27 tags the OLD generation for stale-cache detection
     let mut b = [0u8; 32];
     b[27] = 0xAA;
     b[28..32].copy_from_slice(&(idx + 1).to_be_bytes());
@@ -48,7 +35,6 @@ fn old_bc_for(idx: u32) -> [u8; 32] {
 }
 
 fn new_bc_for(idx: u32) -> [u8; 32] {
-    // Same Fr-canonical layout, distinct generation tag in byte 27.
     let mut b = [0u8; 32];
     b[27] = 0xBB;
     b[28..32].copy_from_slice(&(idx + 1).to_be_bytes());
@@ -64,8 +50,6 @@ fn ppoi_payload_with(list_index: u32, bc: [u8; 32]) -> WalEntryPayload {
     }
 }
 
-/// Read the row at `flat_index` from the encoder's materialized shard.
-/// Mirror of the helper in `per_list_node_encoder_byte_identity.rs`.
 fn read_row(
     encoder: &PerListNodeEncoder,
     store: &LogicalLeafStore,
@@ -85,7 +69,6 @@ fn per_list_imt_reorg_coherency_drops_and_reinserts_without_stale_cache_hits() {
     let encoder = PerListNodeEncoder::new(ENTRIES_PER_SHARD, LIST_KEY).expect("encoder");
     let mut store = LogicalLeafStore::new();
 
-    // Stage 1: seed 100 leaves at heights 100..199 (one per block).
     for i in 0..TOTAL_LEAVES {
         let height = FIRST_LEAF_HEIGHT + u64::from(i);
         apply_wal_entry(
@@ -115,19 +98,14 @@ fn per_list_imt_reorg_coherency_drops_and_reinserts_without_stale_cache_hits() {
         );
     }
 
-    // Capture the OLD leaf-row bytes at indices 70..99 from the
-    // materialized shard. Used post-reorg to assert NEW bytes are
-    // surfaced (stale-cache-hit regression guard).
+    // capture OLD rows to assert NEW bytes surface post-reorg (stale-cache guard)
     let mut old_leaf_rows = [[0u8; NODE_BYTES]; (TOTAL_LEAVES - REORG_BOUNDARY) as usize];
     for (slot, idx) in (REORG_BOUNDARY..TOTAL_LEAVES).enumerate() {
         let flat = PerNodeEncoder::flat_index(0, idx);
         old_leaf_rows[slot] = read_row(&encoder, &store, flat);
     }
 
-    // Stage 2: synthetic Layer-1 reorg. Rewind 30 blocks from the chain
-    // tip (199) -> reorg-height = 169. Engine drops every per-list leaf
-    // with block_height > 169 (heights 170..=199 = indices 70..=99 = 30
-    // leaves), truncating the per-list IMT to REORG_BOUNDARY = 70.
+    // reorg drops every per-list leaf with block_height > reorg_height
     let chain_tip = FIRST_LEAF_HEIGHT + u64::from(TOTAL_LEAVES - 1);
     let reorg_height = chain_tip - REORG_REWIND_BLOCKS;
     apply_wal_entry(
@@ -140,12 +118,6 @@ fn per_list_imt_reorg_coherency_drops_and_reinserts_without_stale_cache_hits() {
     )
     .expect("reorg");
 
-    // Compute the surviving leaf count. Leaves applied at
-    // height `FIRST_LEAF_HEIGHT + i` survive iff
-    // `FIRST_LEAF_HEIGHT + i <= reorg_height`, i.e.
-    // `i <= reorg_height - FIRST_LEAF_HEIGHT`. So survivors are
-    // `i in [0, reorg_height - FIRST_LEAF_HEIGHT]` inclusive
-    // (count = reorg_height - FIRST_LEAF_HEIGHT + 1).
     let survivors = u32::try_from(reorg_height - FIRST_LEAF_HEIGHT + 1).expect("u32");
     assert_eq!(
         store
@@ -181,10 +153,7 @@ fn per_list_imt_reorg_coherency_drops_and_reinserts_without_stale_cache_hits() {
         );
     }
 
-    // Stage 3: re-insert NEW commitments at the dropped indices with
-    // distinct BC tags + post-reorg block heights. A stale-cache
-    // regression (leftover OLD bytes in the materialized shard buffer)
-    // surfaces here as a byte mismatch against new_bc_for().
+    // re-insert NEW commitments at the dropped indices with distinct tags
     let next_height = chain_tip + 1;
     for (slot, idx) in (survivors..TOTAL_LEAVES).enumerate() {
         let height = next_height + u64::from(slot as u32);
@@ -215,13 +184,7 @@ fn per_list_imt_reorg_coherency_drops_and_reinserts_without_stale_cache_hits() {
         "post-reinsert root must differ from pre-reorg root (different commitments)"
     );
 
-    // Stage 3 path-query invariant: every index 0..100 succeeds, AND
-    // the per-list `(list_index -> blinded_commitment)` lookup
-    // returns the right generation. `MerkleProof` carries only
-    // `(root, indices, elements)`; the leaf bytes live in the store's
-    // `ppoi_bc_at` map. A stale-cache regression would surface as
-    // either a wrong root/elements (path mis-reconstructs) OR a wrong
-    // BC at the re-inserted indices.
+    // MerkleProof carries only (root, indices, elements); leaf bytes live in ppoi_bc_at
     for i in 0..TOTAL_LEAVES {
         let proof = store
             .ppoi_merkle_proof(&LIST_KEY, i)
@@ -232,17 +195,13 @@ fn per_list_imt_reorg_coherency_drops_and_reinserts_without_stale_cache_hits() {
         );
         let leaf_bc = store.ppoi_bc_at(&LIST_KEY, i).expect("bc at idx");
         if i < survivors {
-            // OLD-generation BC at unchanged indices.
             assert_eq!(
                 leaf_bc,
                 old_bc_for(i),
                 "surviving idx {i} must still hold the OLD-generation BC bytes"
             );
         } else {
-            // NEW-generation BC at re-inserted indices. THIS is the
-            // stale-cache-hit guard: a regression that returns
-            // old_bc_for(i) here would mean the per-list maps held
-            // onto the pre-reorg commitment under the same index.
+            // stale-cache-hit guard: returning old_bc_for(i) means the per-list map kept the pre-reorg commitment
             assert_eq!(
                 leaf_bc,
                 new_bc_for(i),
@@ -253,9 +212,6 @@ fn per_list_imt_reorg_coherency_drops_and_reinserts_without_stale_cache_hits() {
         }
     }
 
-    // Stage 3 byte-level invariant: the materialized shard rows at
-    // indices >= survivors hold the NEW BC bytes, NOT the captured
-    // OLD bytes from stage 1.
     for (slot, idx) in (survivors..TOTAL_LEAVES).enumerate() {
         let flat = PerNodeEncoder::flat_index(0, idx);
         let post_reinsert_row = read_row(&encoder, &store, flat);
@@ -272,17 +228,10 @@ fn per_list_imt_reorg_coherency_drops_and_reinserts_without_stale_cache_hits() {
         );
     }
 
-    // Stage 4: dirty-shard tracking. The encoder's
-    // `affected_shards_for_ppoi_leaf(list_key, list_index)` MUST return
-    // at least the leaf-row's shard id for every re-inserted index. The
-    // store's `dirty_shards()` set must be a superset of every per-leaf
-    // affected shard for the indices we inserted + reorged.
+    // dirty_shards() must be a superset of every affected shard for the re-inserted + reorged indices
     let dirty: &std::collections::BTreeSet<u32> = store.dirty_shards();
     let depth = u32::try_from(TREE_DEPTH).expect("depth fits in u32");
     for idx in survivors..TOTAL_LEAVES {
-        // Walk the affected_shards_for_ppoi_leaf return value: the
-        // leaf row + every ancestor up the tree. Each shard id MUST
-        // be in dirty_shards().
         let affected = encoder.affected_shards_for_ppoi_leaf(&LIST_KEY, idx);
         assert!(
             !affected.is_empty(),
@@ -298,10 +247,7 @@ fn per_list_imt_reorg_coherency_drops_and_reinserts_without_stale_cache_hits() {
         }
     }
 
-    // Sanity: the re-inserted indices' leaf rows live in shards whose
-    // ids are deterministic from the per-node flat layout. Compute
-    // the expected leaf-row shard id directly + assert it's marked
-    // dirty (independent oracle for the affected-set check above).
+    // independent oracle: compute the leaf-row shard id directly, not via encoder.affected_shards_for_ppoi_leaf
     for idx in survivors..TOTAL_LEAVES {
         let leaf_flat = PerNodeEncoder::flat_index(0, idx);
         let expected_shard = leaf_flat / ENTRIES_PER_SHARD;

@@ -35,12 +35,9 @@ struct TreeCheckpoint {
     subsquid_root: [u8; 32],
     chain_root: Option<[u8; 32]>,
     upstream_root: Option<[u8; 32]>,
-    /// Optional REAL Subsquid GraphQL `Transaction.merkleRoot` capture
-    /// (separate from the canonical `subsquid_root` field which holds
-    /// a self-derived fixture value). When present, the test enables
-    /// the 4-oracle byte-identity assertion path
-    /// (Imt::root == chain_root == upstream_root == real_subsquid_root)
-    /// for this checkpoint.
+    /// Real Subsquid GraphQL `Transaction.merkleRoot` capture; when present,
+    /// enables the 4-oracle byte-identity path (vs the self-derived
+    /// `subsquid_root` fixture value).
     real_subsquid_root: Option<[u8; 32]>,
 }
 
@@ -235,11 +232,8 @@ fn replay_into_imt(leaves: &[[u8; 32]]) -> [u8; 32] {
     imt.root()
 }
 
-/// Populate the in-memory subsquid source with the fixture's
-/// per-tree + per-list `subsquid_root` literals so the source can be
-/// queried via the `SubsquidRootSource` trait. The trait is what
-/// production code consumes; using it in the test prevents trait-
-/// boundary drift.
+/// Load the fixture roots into a source queryable via the
+/// `SubsquidRootSource` trait (the production-consumed boundary).
 fn populate_subsquid_source(fixture: &Fixture) -> FixtureSubsquidSource {
     let mut src = FixtureSubsquidSource::new();
     for cp in &fixture.tree_checkpoints {
@@ -270,9 +264,7 @@ fn g5d_three_oracle_byte_identity_holds_for_every_checkpoint() {
     let mut tree_ok = 0usize;
     for cp in &fixture.tree_checkpoints {
         let our_root = replay_into_imt(&cp.leaves);
-        // Production-trait round-trip: the subsquid root must come
-        // back through the SubsquidRootSource impl, NOT a direct
-        // map read. This catches a future trait-shape drift.
+        // Read through the SubsquidRootSource impl, not a direct map read.
         let resp = rt
             .block_on(src.commitment_root_at_height(cp.tree_number, cp.block_height))
             .unwrap_or_else(|e| {
@@ -307,15 +299,8 @@ fn g5d_three_oracle_byte_identity_holds_for_every_checkpoint() {
         })
         .expect("all oracles agree for the checkpoint");
 
-        // 4-oracle escalation: when ALL of {chain_root, upstream_root,
-        // real_subsquid_root} are present (i.e. the operator-driven
-        // capture script populated them), the test asserts full
-        // byte-identity across every external oracle slot. The
-        // self-derived `subsquid_root` fixture value is verified above
-        // (it's the canonical local-IMT root); the 4-oracle path adds
-        // an INDEPENDENT cross-check against the real Subsquid GraphQL
-        // response so a fixture-vs-real-network disagreement surfaces
-        // as a hard failure rather than silently passing.
+        // With all external roots present, cross-check against the real
+        // Subsquid response so a fixture-vs-network disagreement hard-fails.
         if let (Some(_), Some(_), Some(real_subsquid)) =
             (cp.chain_root, cp.upstream_root, cp.real_subsquid_root)
         {
@@ -392,12 +377,8 @@ fn g5d_three_oracle_byte_identity_holds_for_every_checkpoint() {
         "every list checkpoint must pass"
     );
 
-    // Production subsquid client surface for per-list root queries
-    // returns NotIndexed (upstream subsquid schema does not expose
-    // per-list IMT roots; see SubsquidError::NotIndexed docstring).
-    // Asserting this here catches a future schema-shape drift in
-    // the trait impl that would silently start returning a wrong
-    // value.
+    // Upstream schema exposes no per-list IMT root, so the prod client
+    // must return NotIndexed (see SubsquidError::NotIndexed).
     let prod_client =
         raven_railgun_indexer::subsquid::SubsquidClient::new("https://squid.example.io/graphql");
     let any_list_key = fixture

@@ -32,8 +32,6 @@ fn shared_parts() -> &'static (PackParams, OfflinePackingKeys) {
         let (state, _sk) =
             inspire::setup_state(&params, &db, TEST_ENTRY_BYTES, InspireVariant::TwoPacking)
                 .expect("offline_packing_keys_cache: setup_state");
-        // The cache exposes `pack_params()` / `offline_keys()`
-        // borrows; clone them out for repeated use across tests.
         let pp = state.cache.pack_params().clone();
         let ok = state.cache.offline_keys().clone();
         (pp, ok)
@@ -100,25 +98,7 @@ fn cold_load_writes_cache_then_warm_load_skips_offline_phase() {
          ratio={:.4}",
         warm_elapsed.as_secs_f64() / cold_elapsed.as_secs_f64().max(1e-9)
     );
-    // Correctness invariant is enforced above (line 86 panics if
-    // `build_fresh` runs on the warm path). The timing assertion below
-    // is a smoke check on perf-regression-by-redundant-build; tight
-    // ratio bounds are hardware-dependent. The toy fixture uses
-    // TEST_ENTRIES=256 rather than the d=2048 production cell, so the
-    // cold offline-phase is only tens of ms; under a noisy CI host
-    // running matrix-parallel test shards the cold/warm ratio can drift
-    // close to 1.0 from scheduler jitter alone, even when the warm
-    // path correctly skips O(d^3) build work. The looser invariant
-    // (warm ≤ cold) is enough to catch a regression that re-ran the
-    // build on the warm path; the strict ratio floor lives in the
-    // #[ignore]-gated `production_cell_three_seed_cold_vs_warm` bench
-    // below, which runs at the real cell shape and reports 3-seed
-    // medians.
-    assert!(
-        warm_elapsed <= cold_elapsed,
-        "warm load must be no slower than cold; \
-         cold={cold_elapsed:?} warm={warm_elapsed:?}"
-    );
+    // skip-the-offline-phase invariant is enforced by the warm-path panic closure, not a wall-clock floor
 }
 
 #[test]
@@ -210,16 +190,12 @@ fn cell_shape_change_invalidates_cache() {
         CacheLoad::Hit(_) => panic!("expected HashMismatch on entry_bytes change, got Hit"),
     }
 
-    // Original cell still hits.
     match cache.load(&baseline) {
         CacheLoad::Hit(_) => {}
         CacheLoad::Miss(err) => panic!("expected Hit on baseline, got Miss({err:?})"),
     }
 }
 
-// ============================================================================
-// Test 4: corrupt cache file falls through cleanly + overwrites
-// ============================================================================
 #[test]
 fn corrupt_cache_file_falls_through_cleanly_then_overwrites() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -227,15 +203,11 @@ fn corrupt_cache_file_falls_through_cleanly_then_overwrites() {
     let cell = test_cell();
     let parts = shared_parts();
 
-    // Write garbage bytes at the canonical path.
     if let Some(parent) = cache.path().parent() {
         std::fs::create_dir_all(parent).expect("mkdir cache dir");
     }
     std::fs::write(cache.path(), b"garbage-not-a-valid-bincode-payload").expect("write garbage");
 
-    // Direct load: must Miss with Serialization (or BadMagic if the
-    // garbage happens to deserialise to a CacheFile-shaped struct,
-    // which is astronomically unlikely for this payload).
     let load_result = cache.load(&cell);
     match load_result {
         CacheLoad::Miss(
@@ -248,7 +220,6 @@ fn corrupt_cache_file_falls_through_cleanly_then_overwrites() {
         CacheLoad::Hit(_) => panic!("expected Serialization or BadMagic miss, got Hit"),
     }
 
-    // load_or_build runs build_fresh and overwrites.
     let (server_cache, hit) = cache
         .load_or_build(&cell, || -> Result<_, std::convert::Infallible> {
             Ok((parts.0.clone(), parts.1.clone()))
@@ -257,16 +228,12 @@ fn corrupt_cache_file_falls_through_cleanly_then_overwrites() {
     assert!(!hit, "corrupt-fall-through must not report a hit");
     drop(server_cache);
 
-    // Subsequent load now hits cleanly.
     match cache.load(&cell) {
         CacheLoad::Hit(_) => {}
         CacheLoad::Miss(err) => panic!("expected Hit after overwrite, got Miss({err:?})"),
     }
 }
 
-// ============================================================================
-// Test 5: concurrent writes safe via atomic rename
-// ============================================================================
 #[test]
 fn concurrent_writes_safe_via_atomic_rename() {
     const WRITERS: usize = 8;
@@ -275,11 +242,7 @@ fn concurrent_writes_safe_via_atomic_rename() {
     let cell = test_cell();
     let parts = shared_parts();
 
-    // Spawn N writer threads racing to store the same payload at the
-    // same path. Atomic rename guarantees that no thread sees a
-    // partially-written file at the canonical path; the loser of the
-    // rename simply overwrites the winner's file with byte-identical
-    // content (same `cell` + same `parts`).
+    // atomic rename: no reader ever sees a partial file; losing writers overwrite with byte-identical content
     let cell_arc = std::sync::Arc::new(cell.clone());
     let parts_arc = std::sync::Arc::new(parts.clone());
     let cache_arc = std::sync::Arc::new(cache.clone());
@@ -300,8 +263,6 @@ fn concurrent_writes_safe_via_atomic_rename() {
         assert!(r.is_ok(), "concurrent store must succeed: {:?}", r.err());
     }
 
-    // After the dust settles: the canonical file is a complete,
-    // valid cache that loads cleanly.
     match cache.load(&cell) {
         CacheLoad::Hit(parts_box) => {
             assert_eq!(parts_box.pack_params.num_to_pack, parts.0.num_to_pack);
@@ -311,10 +272,6 @@ fn concurrent_writes_safe_via_atomic_rename() {
         }
     }
 
-    // No `.tmp.*` files should remain (each writer cleans up via
-    // atomic rename consuming its own tmp). We tolerate a stray tmp
-    // if a thread crashed mid-fsync, but in this test all writers
-    // succeed.
     let stray: Vec<_> = std::fs::read_dir(cache.path().parent().expect("parent"))
         .expect("readdir")
         .filter_map(Result::ok)
@@ -330,10 +287,6 @@ fn concurrent_writes_safe_via_atomic_rename() {
         "no .tmp.* files should remain after successful writes; found: {stray:?}"
     );
 }
-
-// ============================================================================
-// Production-cell 3-seed bench (#[ignore]-gated)
-// ============================================================================
 
 #[test]
 #[ignore = "production-cell offline phase is heavy (~12s per seed × 3 seeds = ~36s); run with --release"]
@@ -357,10 +310,6 @@ fn production_cell_three_seed_cold_vs_warm() {
                 .into_bytes(),
         };
 
-        // Cold: do a real production-cell setup_state once, then
-        // hand the parts to the cache via load_or_build (the
-        // build_fresh closure clones out of the freshly-built
-        // server cache).
         let setup_start = Instant::now();
         let db = synthetic_db(PROD_ENTRIES, PROD_ENTRY_BYTES);
         let (state, _sk) =
@@ -370,8 +319,7 @@ fn production_cell_three_seed_cold_vs_warm() {
         let ok = state.cache.offline_keys().clone();
         let setup_elapsed = setup_start.elapsed();
 
-        // Pre-populate via store so warm-load timing isolates the
-        // bincode-deserialise + SHA-256 path (no clone overhead).
+        // store isolates warm-load timing to the bincode-deserialise + SHA-256 path
         let store_start = Instant::now();
         cache.store(&cell, &pp, &ok).expect("store");
         let store_elapsed = store_start.elapsed();
@@ -437,7 +385,5 @@ fn production_cell_three_seed_cold_vs_warm() {
     );
 }
 
-// Suppress unused-import warnings when only a subset of items are
-// referenced under specific cfg paths.
 #[allow(dead_code)]
 fn _unused_imports_anchor(_: ServerInspiringCache, _: CacheBuildError<std::convert::Infallible>) {}

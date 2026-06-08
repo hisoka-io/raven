@@ -77,23 +77,17 @@ pub struct ExportOptions {
     pub output: PathBuf,
     pub signing_key: Option<PathBuf>,
     pub include_current_wal: bool,
-    /// Retain only the N newest `*.tar.zst` tarballs in the parent
-    /// directory of `output` after a successful write. `0` disables.
-    /// Operator CLI default is 3; tests typically pass `0`.
+    /// Retain the N newest `*.tar.zst` tarballs beside `output`; `0` disables.
     pub keep_snapshots: usize,
 }
 
-/// Options for the standalone `PruneSnapshots` subcommand.
-///
-/// Cron / systemd-timer friendly: the entry point is idempotent, never
-/// touches the live `data_dir` itself, and only inspects `*.tar.zst`
-/// files (plus paired `.sig` sidecars) in the configured directory.
+/// Options for the standalone `PruneSnapshots` subcommand. Idempotent; never
+/// touches the live `data_dir`, only `*.tar.zst` files and paired `.sig` sidecars.
 #[derive(Debug, Clone)]
 pub struct PruneOptions {
     /// Directory containing `*.tar.zst` export tarballs.
     pub data_dir: PathBuf,
-    /// Retention floor: keep the N newest tarballs (plus paired `.sig`
-    /// sidecars). `0` disables; `1` keeps only the newest.
+    /// Keep the N newest tarballs (plus paired `.sig` sidecars); `0` disables.
     pub keep_snapshots: usize,
 }
 
@@ -292,10 +286,7 @@ pub fn run_export(opts: ExportOptions) -> anyhow::Result<()> {
         }
     }
 
-    // Opportunistic retention pass: trim the parent directory to the
-    // configured floor. Best-effort -- a prune failure must NOT fail
-    // the export itself; the operator still has a fresh tarball on
-    // disk. Per-entry failures inside the pruner are warn-logged.
+    // Best-effort: a prune failure must not fail the export itself.
     if opts.keep_snapshots > 0 {
         if let Some(parent) = opts.output.parent() {
             if !parent.as_os_str().is_empty() {
@@ -325,15 +316,9 @@ pub fn run_export(opts: ExportOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Trim the directory to the `keep_last_n` newest `*.tar.zst` files by
-/// modification time. Paired `.sig` sidecars are removed alongside the
-/// tarball they protect. Per-entry failures are logged at `warn` and
-/// do not abort the prune.
-///
-/// `keep_last_n = 0` is a no-op (returns `Ok(0)`). A non-existent
-/// `snapshots_dir` is also a no-op (cron-friendly: the pruner can race
-/// the directory's creation). Returns the count of tarballs removed
-/// (excluding `.sig` sidecars).
+/// Keep the `keep_last_n` newest `*.tar.zst` by mtime, removing older ones plus
+/// their `.sig` sidecars. Per-entry failures are warn-logged, not fatal. Returns
+/// tarballs removed (excluding sidecars); `keep_last_n = 0` or a missing dir is a no-op.
 pub fn prune_old_export_tarballs(
     snapshots_dir: &Path,
     keep_last_n: usize,
@@ -383,7 +368,7 @@ pub fn prune_old_export_tarballs(
         };
         entries.push((path, mtime));
     }
-    // Sort newest-first by mtime; tie-break on filename for determinism.
+    // newest-first; filename tie-break for determinism.
     entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
     let mut removed = 0usize;
     for (path, _) in entries.iter().skip(keep_last_n) {
@@ -397,7 +382,6 @@ pub fn prune_old_export_tarballs(
             continue;
         }
         removed = removed.saturating_add(1);
-        // Best-effort .sig sidecar removal -- absent or transient is fine.
         match std::fs::remove_file(&sig) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

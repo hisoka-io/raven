@@ -109,8 +109,6 @@ pub(crate) async fn admin_undrain_handler<S: PirScheme>(
     }))
 }
 
-// Inspire-specific routes: session establish + params
-
 /// JSON returned by `POST /v1/instance/{id}/session`.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SessionEstablishResponse {
@@ -129,13 +127,9 @@ pub struct InstanceParams {
     pub crs_bincode: Vec<u8>,
     /// Bincode-encoded [`raven_inspire::params::ShardConfig`].
     pub shard_config_bincode: Vec<u8>,
-    /// Bincode-encoded [`raven_inspire::params::InspireParams`]. Sourced
-    /// from the live [`InspireServerState`]'s CRS so the bytes always
-    /// match the operator-configured cell shape (rather than re-deriving
-    /// from a hard-coded preset). Wallets feed this directly into the
-    /// WASM client's `build_instance_params_blob` helper to derive the
-    /// RLWE secret key and assemble a [`raven_inspire::ClientSession`]
-    /// without needing a side-channel param distribution.
+    /// Bincode-encoded [`raven_inspire::params::InspireParams`], sourced from
+    /// the live CRS so the bytes always match the operator-configured cell
+    /// shape; wallets derive the RLWE secret key from this.
     pub inspire_params_bincode: Vec<u8>,
     /// Plaintext entry size in bytes.
     pub entry_size: usize,
@@ -251,11 +245,8 @@ pub(crate) async fn params_handler(
         .ok_or(StatusCode::NOT_FOUND)?;
     let epoch = instance.current_epoch();
 
-    // Fast-path 304: when the cache already has a SHA for the current
-    // `(instance_id, epoch)` AND the caller's `If-None-Match` matches,
-    // we can skip body serialization entirely. CRS bincode at the
-    // production cell is multi-MB; this saves both the CPU + the
-    // allocation on every revalidation against an unchanged epoch.
+    // Skip multi-MB CRS serialization when the cached `(epoch, sha)` matches
+    // the caller's `If-None-Match`.
     let cached_etag_value = {
         let guard = app.params_etag_cache.read();
         guard
@@ -303,9 +294,6 @@ pub(crate) async fn params_handler(
         }
     }
 
-    // Cache miss OR caller's ETag is stale: serialize the body and
-    // populate the cache so the next revalidation against the same
-    // epoch hits the fast-path above.
     let state = instance.current_state();
     let state: &InspireServerState = state.as_ref();
     let crs_bincode =
@@ -325,15 +313,10 @@ pub(crate) async fn params_handler(
     };
     let body = write_versioned(&payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // ETag = SHA-256 of the body. Cache keyed on `InstanceId` with
-    // `(epoch, sha256)` payload so an epoch bump invalidates the prior
-    // entry without growing the map; the cache lives on the per-process
-    // `AppState` so test isolation matches production isolation.
+    // ETag = SHA-256(body), cached as `(epoch, sha)` so an epoch bump
+    // invalidates without growing the map.
     let sha = if let Some(value) = cached_etag_value.as_ref() {
-        // Cache hit on epoch but ETag string did not match the caller's
-        // If-None-Match (or no If-None-Match was supplied). Re-derive
-        // the bytes by re-parsing the cached hex — cheap relative to
-        // re-hashing the freshly-serialized body.
+        // Re-parse the cached hex rather than re-hash the fresh body.
         parse_hex_sha(value).unwrap_or_else(|| sha256_of(&body))
     } else {
         let fresh = sha256_of(&body);
@@ -409,15 +392,11 @@ fn char_to_nibble(b: u8) -> Option<u8> {
     }
 }
 
-/// Lowercase hex encoding of a 32-byte SHA-256 digest. Avoids pulling
-/// the `hex` crate just for the ETag-formatting path. Bounded loop
-/// over fixed-length input; never panics.
+/// Lowercase hex encoding of a 32-byte SHA-256 digest.
 fn to_hex_lower(bytes: &[u8; 32]) -> String {
     let mut out = String::with_capacity(64);
     for b in bytes {
-        // `b >> 4` and `b & 0x0f` are bounded to 0..16, well within
-        // the radix-16 contract of `from_digit`; the `unwrap_or('0')`
-        // branch is unreachable but keeps the path panic-free.
+        // Nibbles are 0..16, within `from_digit`'s radix-16 contract.
         let hi = char::from_digit(u32::from(b >> 4), 16).unwrap_or('0');
         let lo = char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0');
         out.push(hi);

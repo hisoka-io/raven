@@ -104,8 +104,7 @@ impl ChainSource for SyntheticChainSource {
         Ok(*self.last_seen_root.lock())
     }
     async fn active_tree_number(&self, _at: Option<BlockId>) -> IndexerResult<u32> {
-        // Fixed 3: trees 0/1/2 are frozen-branch (root_history alone),
-        // tree 3 is active-branch (root_history + merkle_root).
+        // 3: trees 0/1/2 frozen-branch (root_history), tree 3 active (root_history + merkle_root)
         Ok(3)
     }
 }
@@ -125,9 +124,8 @@ fn example_toml_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/mainnet-6-instance.toml")
 }
 
-/// `aggressive_snapshot` overrides per-instance `SnapshotPolicy` to
-/// `max_appends_per_snapshot = 1` so each event triggers a commit;
-/// tests exercising the cadence-1 verifier opt in.
+/// `aggressive_snapshot` sets `max_appends_per_snapshot = 1` so each event commits,
+/// exercising the cadence-1 verifier.
 fn build_opts(
     tmp: &Path,
     bind: SocketAddr,
@@ -225,8 +223,7 @@ async fn wait_for_status(local_addr: SocketAddr) -> StatusJson {
 }
 
 async fn wait_for_observer(observer: &BootstrapObserver) -> BootstrapView {
-    // 300 s: this test bootstraps six PIR instances; on 2-core CI runners
-    // under parallel test contention the cold-start budget is significant.
+    // 300s: six cold-start PIR bootstraps under parallel 2-core CI contention
     for _ in 0..1200u32 {
         if let Some(view) = observer.lock().clone() {
             return view;
@@ -248,17 +245,15 @@ async fn shutdown(
     }
 }
 
-/// Cancels the server task without firing the graceful-shutdown
-/// oneshot, so consumer tasks exit on channel-close without a final
-/// `drive_commit`; WAL tail survives for cold-restart replay.
+/// Aborts the server without the graceful-shutdown oneshot, so consumers exit on
+/// channel-close with no final `drive_commit`; the WAL tail survives for restart replay.
 async fn abort_without_final_commit(
     _tx: oneshot::Sender<()>,
     server: tokio::task::JoinHandle<anyhow::Result<()>>,
 ) {
     server.abort();
     let _ = tokio::time::timeout(Duration::from_secs(20), server).await;
-    // Let consumers release per-instance Persistence Arcs (file locks)
-    // before restart attempts to reacquire them.
+    // let consumers release per-instance file locks before restart reacquires them
     tokio::time::sleep(Duration::from_millis(500)).await;
 }
 
@@ -440,7 +435,6 @@ fn find_inst<'a>(view: &'a BootstrapView, id: &str) -> &'a BootstrapInstanceView
         .unwrap_or_else(|| panic!("no instance {id}"))
 }
 
-// Closure 1: bootstrap surfaces all six instances + their encoder labels.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "stands up 6 InsPIRe instances; ~10 s wall on Zen 5"]
 async fn six_instance_bootstrap_serves_status_for_all_six() {
@@ -488,7 +482,6 @@ async fn six_instance_bootstrap_serves_status_for_all_six() {
     shutdown(stop, server).await.expect("graceful shutdown");
 }
 
-// Closure 2: chain events route to the correct commit-tree instance only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "stands up 6 InsPIRe instances; drives 4 chain events; ~12 s wall on Zen 5"]
 async fn chain_events_route_to_correct_commit_tree_instance() {
@@ -588,7 +581,6 @@ async fn chain_events_route_to_correct_commit_tree_instance() {
     shutdown(stop, server).await.expect("graceful shutdown");
 }
 
-// Closure 3: PPOI events route to the matching list-key instance only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "stands up 6 InsPIRe instances; drives 4 PPOI events; ~12 s wall on Zen 5"]
 async fn ppoi_events_route_to_correct_list_instance() {
@@ -663,7 +655,6 @@ async fn ppoi_events_route_to_correct_list_instance() {
     shutdown(stop, server).await.expect("graceful shutdown");
 }
 
-// Closure 4: layer 2 verifier fires only on commit-tree instances.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "stands up 6 InsPIRe instances; drives 4 chain events + asserts L2 cadence; ~14 s wall"]
 async fn layer2_fires_only_on_commit_tree_instances() {
@@ -671,11 +662,8 @@ async fn layer2_fires_only_on_commit_tree_instances() {
     let bind: SocketAddr = "127.0.0.1:0".parse().expect("addr");
     let observer: BootstrapObserver = Arc::new(parking_lot::Mutex::new(None));
     let chain_sources = six_synthetic_sources();
-    // Aggressive snapshot policy: each event triggers a commit so
-    // the cadence-1 verifier loop fires. Entries bumped to match
-    // entries_per_shard so the re-encode path is shape-stable
-    // (re-encoding with a different shape than the initial setup
-    // would produce a polynomial vector of mismatched length).
+    // entries bumped to entries_per_shard: re-encode must keep the setup shape
+    // or the polynomial vector length mismatches
     let mut opts = build_opts(
         tmp.path(),
         bind,
@@ -688,9 +676,8 @@ async fn layer2_fires_only_on_commit_tree_instances() {
     let (_local_addr, server, stop) = spawn_server(opts).await;
     let view = wait_for_observer(&observer).await;
 
-    // Toy cell shape (256 entries × 2048 EPS = 1 shard) only fits
-    // tree-0 leaves into shard 0; tree-N (N>0) leaves map out of range.
-    // One commit-tree firing the verifier suffices to lock the positive arm.
+    // toy cell (256 entries x 2048 EPS = 1 shard) only fits tree-0 into shard 0;
+    // one commit-tree firing the verifier suffices for the positive arm
     view.channels
         .indexer_tx
         .send(IndexerMessage::Event {
@@ -736,8 +723,7 @@ async fn layer2_fires_only_on_commit_tree_instances() {
         chain_sources[0].verify_count(),
     );
 
-    // PPOI instances must record 0 reorgs/commits — verifier never
-    // runs (no chain_source) and no events were routed to them.
+    // PPOI instances have no chain_source and no routed events: 0 reorgs/commits
     for inst in &view.instances {
         if matches!(inst.data_source, DataSourceFilter::PpoiList(_)) {
             let m = inst.metrics.lock();
@@ -757,7 +743,6 @@ async fn layer2_fires_only_on_commit_tree_instances() {
     shutdown(stop, server).await.expect("graceful shutdown");
 }
 
-// Closure 5: kill + restart preserves per-instance state from disk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "stands up 6 InsPIRe instances twice (kill + restart cycle); ~25 s wall on Zen 5"]
 async fn kill_restart_preserves_per_instance_state() {
@@ -767,7 +752,6 @@ async fn kill_restart_preserves_per_instance_state() {
     let lk_ofac = parse_hex32(PPOI_LIST_OFAC_HEX);
     let lk_railway = parse_hex32(PPOI_LIST_RAILWAY_HEX);
 
-    // Phase 1: cold boot, drive events, capture per-instance state.
     let observer1: BootstrapObserver = Arc::new(parking_lot::Mutex::new(None));
     let chain_sources1 = six_synthetic_sources();
     let opts1 = build_opts(
@@ -799,13 +783,10 @@ async fn kill_restart_preserves_per_instance_state() {
         }
     }
 
-    // Hard-kill: aborting drops `bootstrap` in place; consumers exit on
-    // channel-close without a final `drive_commit`. WAL tail past
-    // `current_snapshot_seq` is the V1 carrier for the LogicalLeafStore
-    // sidecar (snapshotted state alone does not carry it).
+    // WAL tail past current_snapshot_seq carries the LogicalLeafStore sidecar; the
+    // snapshot alone does not, so the abort must leave the tail intact for replay
     abort_without_final_commit(stop1, server1).await;
 
-    // Phase 2: cold restart from the same data_dirs.
     let observer2: BootstrapObserver = Arc::new(parking_lot::Mutex::new(None));
     let chain_sources2 = six_synthetic_sources();
     let opts2 = build_opts(
@@ -818,7 +799,7 @@ async fn kill_restart_preserves_per_instance_state() {
     let (_addr2, server2, stop2) = spawn_server(opts2).await;
     let view2 = wait_for_observer(&observer2).await;
 
-    // Let consumers finish recovery + apply tail WAL entries.
+    // let consumers finish recovery + apply tail WAL entries
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     for (t, _pre_block, pre_leaf) in &chain_pre {
@@ -851,7 +832,6 @@ async fn kill_restart_preserves_per_instance_state() {
     shutdown(stop2, server2).await.expect("second shutdown");
 }
 
-// Closure 6: bootstrap refuses when manifest encoder_label diverges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "stands up 6 InsPIRe instances once + retries one with mismatched encoder; ~14 s wall"]
 async fn manifest_label_mismatch_refuses_boot_per_instance() {
@@ -871,9 +851,8 @@ async fn manifest_label_mismatch_refuses_boot_per_instance() {
     let _view1 = wait_for_observer(&observer1).await;
     shutdown(stop1, server1).await.expect("first shutdown");
 
-    // Phase 2: same data_dirs but flip commit-tree-0's encoder
-    // (PerNode -> PerLeafPath). Both are commit-tree-valid; only the
-    // manifest verifier rejects the mismatch.
+    // flip commit-tree-0's encoder (PerNode -> PerLeafPath); both are valid encoders,
+    // only the manifest verifier rejects the mismatch
     let observer2: BootstrapObserver = Arc::new(parking_lot::Mutex::new(None));
     let chain_sources2 = six_synthetic_sources();
     let mut opts2 = build_opts(

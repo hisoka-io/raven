@@ -1,6 +1,6 @@
 //! Layer 2 reorg detection: protocol-layer guarantee that the local IMT root
 //! matches the contract's `rootHistory(tree, root)`. Catches the case Layer 1
-//! misses — events applied locally in the wrong order, or the indexer dropping
+//! misses: events applied locally in the wrong order, or the indexer dropping
 //! a Shield event between `eth_getLogs` chunks. See [`VerifyOutcome`] for the
 //! soundness model.
 
@@ -17,7 +17,7 @@ use crate::imt::Imt;
 /// "canonical at some past height", not currently canonical. Branches:
 /// - **Active tree** (`tree == active`): InSync requires rootHistory hit AND
 ///   `merkleRoot() == local_root`.
-/// - **Frozen tree** (`tree < active`): rootHistory hit is sufficient — frozen
+/// - **Frozen tree** (`tree < active`): rootHistory hit is sufficient; frozen
 ///   trees can never gain a newer canonical root.
 /// - **Future tree** (`tree > active`): always OutOfSync.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,9 +45,8 @@ pub async fn verify_root_against_chain<S: ChainSource + ?Sized>(
 ) -> Result<VerifyOutcome> {
     let local_root = imt.root();
 
-    // Capture the chain anchor ONCE so all three eth_calls observe the same
-    // state. Without this, chain advancement between calls produces false
-    // InSync/OutOfSync. Pin to finalized to avoid tip-reorg races.
+    // One anchor for all three eth_calls: mid-round chain advancement would
+    // otherwise yield false InSync/OutOfSync.
     let anchor_block = source
         .latest_block()
         .await
@@ -193,8 +192,8 @@ mod tests {
 
     #[tokio::test]
     async fn active_tree_history_hit_but_stale_current_is_out_of_sync() {
-        // W2 soundness regression: stale-but-historic root passes rootHistory
-        // but merkleRoot() has moved past it.
+        // Regression: a stale-but-historic root passes rootHistory yet
+        // merkleRoot() has moved past it.
         let mut imt = Imt::new().expect("imt");
         imt.insert_leaves(0, &[[1u8; 32]]).expect("seed");
         let stale_local = imt.root();
@@ -275,7 +274,7 @@ mod tests {
         );
     }
 
-    // W2 race-fix regression: all three eth_calls must thread the same anchor.
+    // Regression: all three eth_calls must thread the same anchor.
     #[tokio::test]
     async fn verifier_threads_block_anchor_to_all_three_calls() {
         use std::sync::Mutex;

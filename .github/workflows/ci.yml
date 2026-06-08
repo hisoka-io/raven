@@ -73,9 +73,7 @@ jobs:
   railgun-static:
     name: railgun adapter (fmt + check + clippy)
     runs-on: ubuntu-latest
-    # fmt + cargo check + clippy land in ~5-8 min on the 2-vCPU runner
-    # because they skip codegen + link. Cap at 30 min so a hung tool
-    # surfaces fast instead of blocking the matrix.
+    # cap so a hung tool surfaces instead of blocking the matrix
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -107,26 +105,8 @@ jobs:
         run: cargo clippy --manifest-path adapters/railgun/Cargo.toml --workspace --all-targets -- -D warnings
 
   railgun-tests:
-    # Test execution is the wall-time floor of CI: the 9-crate adapter +
-    # raven-inspire submodule build, under `release`, took ~48 min on a
-    # 2-vCPU runner. Four stacked optimisations bring it under ~20 min:
-    #
-    #   1. `[profile.ci-test]` in adapters/railgun/Cargo.toml
-    #      (lto=off, codegen-units=16, opt-level=2) — saturates both
-    #      cores during codegen and drops the ~120-binary thin-LTO link
-    #      pass.
-    #   2. lld linker via RUSTFLAGS — parallel symbol resolution, ~25%
-    #      off the link phase vs the default bfd ld.
-    #   3. sccache w/ GHA-cache backend — caches individual rustc
-    #      invocations across runs. Cold = no win; warm = ~70-80% hit
-    #      on the inspire dep closure (the dominant cost).
-    #   4. Matrix split — three parallel runners by package group.
-    #      Wall time = max(shard), not sum.
-    #
-    # Each shard groups packages so the per-shard test count is roughly
-    # balanced (engine=45, cli=23, rest=40 integration-test files).
-    # `fail-fast: false` lets a single shard fail without cancelling the
-    # others, which speeds debugging.
+    # split into three balanced shards (ci-test profile + lld + sccache)
+    # to keep the adapter + inspire test build under the time budget
     name: railgun tests (${{ matrix.shard.name }})
     needs: railgun-static
     runs-on: ubuntu-latest
@@ -149,24 +129,13 @@ jobs:
               -p raven-railgun-ppoi-mirror
               -p raven-railgun-core
     env:
-      # sccache: official Mozilla wrapper. GHA backend ships with the
-      # action; `SCCACHE_GHA_ENABLED=true` is consumed by the action
-      # itself. Setting RUSTC_WRAPPER here makes cargo route every rustc
-      # invocation through sccache for the rest of the job.
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
-      # lld linker. `.cargo/config.toml` carries the same flag for local
-      # dev; setting it via RUSTFLAGS overrides any nested config that
-      # would re-pin the default ld. -D warnings is preserved from the
-      # workflow-level env to keep build-time lint posture identical.
+      # re-declare -D warnings since RUSTFLAGS overrides the workflow-level env
       RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=lld"
     steps:
       - name: free disk space
-        # The adapter workspace's target/ tree (10 inner crates, full
-        # test build with --all-targets) exceeds the runner's default
-        # ~14 GiB free budget. Strip pre-installed tooling that the
-        # Rust build path does not touch (CodeQL, Android SDK, .NET,
-        # Haskell, Docker pre-pulls) to free ~30 GiB.
+        # adapter target/ tree overruns the runner's default free budget
         run: |
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
@@ -182,33 +151,14 @@ jobs:
       - name: install lld linker
         run: sudo apt-get update && sudo apt-get install -y lld
       - name: install sccache
-        # v0.0.10 ships sccache 0.10+ which uses the GHA cache service
-        # v2 endpoint. v0.0.6 still pinned sccache 0.8.x against the
-        # decommissioned classic /artifactcache endpoint and 400'd on
-        # every run.
+        # v0.0.10 ships sccache 0.10+ for the GHA cache v2 endpoint
         uses: mozilla-actions/sccache-action@v0.0.10
       - uses: Swatinem/rust-cache@v2
         with:
-          # Shared cache across all three matrix shards so the second
-          # and third shards reuse the first shard's saved target/ tree.
-          # Without this, each shard would rebuild raven-inspire cold.
+          # shared so shards reuse the first shard's target/ instead of rebuilding inspire cold
           shared-key: "railgun-tests"
       - uses: taiki-e/install-action@nextest
       - name: cargo nextest (ci-test profile)
-        # `ci-test` profile (see adapters/railgun/Cargo.toml): inherits
-        # release semantics for runtime perf (so the InsPIRe respond
-        # path stays under nextest's 120s slow-test ceiling) but with
-        # lto=off + codegen-units=16 for compile parallelism.
-        #
-        # `--profile ci` selects the nextest profile in
-        # adapters/railgun/.config/nextest.toml: retries=0, JSON-only
-        # failure output, 120s slow-timeout × 3 strikes, test-groups
-        # serialising chaos-child / flock / arcswap stress tests.
-        #
-        # Doc-tests skipped: the adapter workspace has zero `///`
-        # Rust doctests today; `cargo test --doc` would re-build every
-        # dep from scratch for no coverage. Re-add the step if a real
-        # doctest lands later.
         run: |
           cargo nextest run \
             --manifest-path adapters/railgun/Cargo.toml \
@@ -217,10 +167,6 @@ jobs:
             --cargo-profile ci-test \
             --profile ci
       - name: sccache stats
-        # Surface cache-hit rate so we can tell whether the warm-run
-        # speedup is materialising. First run will show ~0% hit; second
-        # run on the same branch should show >50% hit on the inspire
-        # dep closure.
         run: sccache --show-stats
         if: always()
 
@@ -269,14 +215,8 @@ jobs:
         run: cargo check --manifest-path crates/binary-fuse-filter/Cargo.toml --target wasm32-unknown-unknown
 
   sdk-tests:
-    # Fresh-clone-build gate: the TypeScript SDK at adapters/railgun/sdk
-    # depends on the wasm-pack output of raven-inspire-client-wasm
-    # (gitignored). A fresh clone must:
-    #   1. Build the wasm-pack pkg-node + pkg-bundler outputs.
-    #   2. Stay under the 500 KB gzipped bundle ceiling
-    #      (adapters/railgun/scripts/check-wasm-bundle-size.sh).
-    #   3. `pnpm install` resolve cleanly against pnpm-lock.yaml.
-    #   4. `pnpm test` pass against the freshly built pkg-node.
+    # fresh-clone gate: SDK depends on the gitignored wasm-pack output,
+    # so this rebuilds it, enforces the bundle ceiling, then runs tests
     name: sdk tests (typescript + wasm-pack)
     runs-on: ubuntu-latest
     steps:

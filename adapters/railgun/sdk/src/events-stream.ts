@@ -1,14 +1,4 @@
-/**
- * SSE subscriber for the Raven adapter's `/v1/events` endpoint.
- *
- * Replaces poll-based status fetches with one long-lived HTTP/2 stream
- * per browser tab. The server pushes a `status` event every ~5 s with
- * the same shape the JSON-on-demand `/v1/status` endpoint returns.
- *
- * Falls back to no-op if the runtime lacks `EventSource` (older Node
- * test environments). Wallet integrators on browser targets get the
- * stream; SSR / non-browser callers get a static null.
- */
+/** SSE subscriber for `/v1/events`; no-op when the runtime lacks `EventSource`. */
 
 export interface InstanceStatus {
   id: string;
@@ -88,7 +78,7 @@ export function subscribeRavenEvents(
         const parsed = JSON.parse(data) as StatusBody;
         onStatus(parsed);
       } catch {
-        // ignore: malformed event payload
+        // drop malformed event payload
       }
     });
     es.addEventListener("error", () => {

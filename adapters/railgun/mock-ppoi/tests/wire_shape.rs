@@ -119,9 +119,6 @@ async fn mock_ppoi_pois_per_blinded_commitment_returns_valid_for_seeded_bcs() {
 
 #[tokio::test]
 async fn mock_ppoi_returns_blocked_for_csv_overridden_bc() {
-    // Pre-compute the third BC deterministically, write it to a temp
-    // CSV, then start the server with the CSV path so the binary path
-    // exercises load_blocked_csv end-to-end.
     let baseline = fixture_corpus(8, Vec::new());
     let target = baseline
         .events_view()
@@ -227,19 +224,8 @@ async fn mock_ppoi_validatedmerkleroot_advances_with_event_count() {
 
 #[test]
 fn mock_ppoi_emits_synthetic_banner_on_startup() {
-    // The banner-firing claim is verified by source-level introspection:
-    // 1. The public SYNTHETIC_BANNER const carries the expected literal
-    //    so callers cannot accidentally drift the wording.
-    // 2. The lib source contains both `serve` and `serve_on` invocations
-    //    of `tracing::info!(... SYNTHETIC_BANNER)` so any subscriber a
-    //    caller installs will receive the banner. Runtime capture across
-    //    `tokio::spawn` requires either propagating the dispatcher
-    //    (tracing-subscriber + with_dispatch) or pinning a global
-    //    default; both are coupled to test ordering and would either
-    //    flake under parallel execution or interfere with peer tests.
-    //    Source-level verification is robust to test ordering and
-    //    catches the regression we actually care about: someone removing
-    //    or silencing the banner.
+    // Source-level introspection, not runtime capture: dispatcher propagation
+    // across `tokio::spawn` would flake under parallel test ordering.
     assert_eq!(
         SYNTHETIC_BANNER,
         "raven-railgun-mock-ppoi: SYNTHETIC corpus, do not pass off as real OFAC"

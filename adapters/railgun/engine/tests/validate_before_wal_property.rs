@@ -29,17 +29,14 @@ fn test_encoder_arc() -> Arc<dyn PirTableEncoder> {
     Arc::new(test_encoder())
 }
 
-// Fr-canonical 32-byte commitment: high byte 0x00, last byte
-// deterministic non-zero so the leaf is non-trivial.
+// Fr-canonical (high byte zero); last byte non-zero so the leaf is non-trivial
 fn canonical_commitment(seed: u8) -> [u8; 32] {
     let mut b = [0u8; 32];
     b[31] = seed.max(1);
     b
 }
 
-// Tree number is fixed at 0 because cross-tree contiguity is covered
-// by unit tests; here we want long runs against the same store + tree
-// to exercise the `imt_leaf_count_for` advance.
+// fixed tree=0: long runs against one tree exercise the imt_leaf_count_for advance (cross-tree is unit-tested)
 fn append_leaf_strategy() -> impl Strategy<Value = WalEntryPayload> {
     (0u32..32u32, any::<u8>()).prop_map(|(leaf_index, seed)| WalEntryPayload::AppendLeaf {
         tree_number: 0,
@@ -107,8 +104,7 @@ proptest! {
         .expect("open 1");
 
         for (i, p) in payloads.iter().enumerate() {
-            // Mirror apply_one_leaf: validate, then WAL, then mutate.
-            // If validate rejects, neither WAL nor store is touched.
+            // validate, then WAL, then mutate: a rejected validate touches neither WAL nor store
             let block_height = 100 + u64::try_from(i).unwrap_or(0);
             if validate_apply(&store, p).is_ok() {
                 opened
@@ -124,8 +120,7 @@ proptest! {
         let pre_drop_leaf_count = store.imt_leaf_count_for(0);
         drop(opened);
 
-        // Reopen and replay; any soft-skip on the WAL-replay path would diverge
-        // recovered leaf count from pre-drop leaf count.
+        // a soft-skip on the WAL-replay path would diverge recovered count from pre-drop count
         let layout2 = StoreLayout::open(dir.path()).expect("layout 2");
         let opened2 = InspirePersistence::open(
             layout2,

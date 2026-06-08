@@ -1,36 +1,7 @@
-//! Heartbeat session-eviction tests.
-//!
-//! Pins the engine-level public fn that an operator-spawned hourly
-//! task calls per instance to drop every registered sticky-bearer
-//! session out of [`raven_inspire::ServerSessionStore`] without
-//! touching the heavy CRS / `EncodedDatabase` / `ServerInspiringCache`
-//! machinery.
-//!
-//! Core invariants pinned:
-//!
-//! - `heartbeat_swap_state_drops_inner_session_store` — register N
-//!   sessions, run heartbeat, verify the inner store has reset to
-//!   `len() == 0`.
-//! - `heartbeat_swap_state_preserves_cache_across_swap` — the
-//!   `Arc<ServerInspiringCache>` pointer must be the SAME after
-//!   the swap (carried by `Arc::clone`).
-//! - `heartbeat_swap_state_drops_session_store_arc_pointer_too` —
-//!   the new state's `session_store` Arc MUST be a different Arc
-//!   from the donor's; otherwise a stale Arc is being kept alive
-//!   somewhere and the inner store is not actually being dropped.
-//! - `heartbeat_swap_state_metric_increments_per_swap` — driving
-//!   the heartbeat fn manually, the operator-facing metric counter
-//!   advances exactly once per call (asserted via epoch
-//!   monotonicity).
-//!
-//! OOM regression guards (Phase 2 T-A wrapped `encoded_db` in
-//! `Arc<EncodedDatabase>`; the three trailing tests pin that the
-//! heartbeat path never deep-clones the `~128 MiB` buffer at the
-//! production cell):
-//!
-//! - `heartbeat_eviction_does_not_clone_encoded_db_under_steady_load`
-//! - `heartbeat_eviction_arc_clone_constant_time_at_production_cell`
-//! - `drive_commit_arc_make_mut_only_copies_under_inflight_query`
+//! Heartbeat session-eviction tests. The heartbeat resets the inner
+//! `ServerSessionStore` while carrying the heavy CRS / `EncodedDatabase`
+//! / `ServerInspiringCache` by `Arc::clone`; the trailing tests guard
+//! against re-introducing a deep clone of `encoded_db`.
 
 #![allow(clippy::expect_used)]
 
@@ -82,7 +53,6 @@ fn heartbeat_swap_state_drops_inner_session_store() {
         initial_state,
     ));
 
-    // Register three sessions on the inner store.
     for _ in 0..3 {
         register_one_session(&instance, &params);
     }
@@ -115,10 +85,8 @@ fn heartbeat_swap_state_drops_inner_session_store() {
 
 #[test]
 fn heartbeat_swap_state_preserves_cache_across_swap() {
-    // The cache is the heaviest field on InspireServerState (one
-    // O(d^3) automorph table; ~3.7 s rebuild at production cell). The
-    // heartbeat MUST carry it via Arc::clone so the operator-side
-    // hourly tick is cheap (sub-millisecond at production cell).
+    // Cache is the heaviest field (~3.7 s rebuild at production cell);
+    // heartbeat must carry it by Arc::clone, not rebuild.
     let params = InspireParams::secure_128_d2048();
     let initial_state = build_toy_state(&params);
     let instance: Arc<PirInstance<RavenInspireScheme>> = Arc::new(PirInstance::new(
@@ -141,18 +109,15 @@ fn heartbeat_swap_state_preserves_cache_across_swap() {
     assert!(
         std::ptr::eq(donor_cache_ptr, post_cache_ptr),
         "heartbeat MUST carry the donor's ServerInspiringCache Arc unchanged \
-         (Arc::clone). A non-equal pointer here means the cache rebuilt — the \
+         (Arc::clone). A non-equal pointer here means the cache rebuilt - the \
          hourly tick would stall the server for seconds."
     );
 }
 
 #[test]
 fn heartbeat_swap_state_drops_session_store_arc_pointer_too() {
-    // The new state's session_store Arc MUST be DIFFERENT from the
-    // donor's. If it were the same Arc, in-flight queries holding
-    // the donor would still be backed by the same inner store and
-    // the eviction would be a no-op. This is the regression-guard
-    // for an "Arc::clone(&donor.session_store)" typo.
+    // A fresh session_store Arc; reusing the donor's would make eviction
+    // a no-op for in-flight queries still holding the donor.
     let params = InspireParams::secure_128_d2048();
     let initial_state = build_toy_state(&params);
     let instance: Arc<PirInstance<RavenInspireScheme>> = Arc::new(PirInstance::new(
@@ -181,14 +146,8 @@ fn heartbeat_swap_state_drops_session_store_arc_pointer_too() {
     );
 }
 
-/// Operator escape hatch: setting the heartbeat interval to 0 in
-/// the CLI must skip spawning the per-instance heartbeat task. This
-/// test checks the contract at the engine-fn level: the heartbeat
-/// fn itself runs unconditionally when called, but the scheduler
-/// is never constructed for `interval == 0`. The CLI guard is `if
-/// session_eviction_interval > 0 { spawn ... }`. This test pins the
-/// invariant by NOT calling the heartbeat fn and asserting the
-/// session_store Arc pointer remains the bootstrap one.
+/// Operator opt-out (CLI `interval == 0`): heartbeat fn never called,
+/// so the bootstrap session_store Arc must persist unchanged.
 #[test]
 fn heartbeat_interval_disabled_when_zero() {
     let params = InspireParams::secure_128_d2048();
@@ -204,8 +163,6 @@ fn heartbeat_interval_disabled_when_zero() {
         Arc::as_ptr(&snap.session_store)
     };
 
-    // Simulated "operator opted out" window: register sessions, do
-    // NOT call heartbeat_session_eviction, assert nothing churned.
     register_one_session(&instance, &params);
 
     let post_store_ptr: *const ServerSessionStore = {
@@ -216,7 +173,7 @@ fn heartbeat_interval_disabled_when_zero() {
         std::ptr::eq(initial_store_ptr, post_store_ptr),
         "with the CLI guard at zero (heartbeat_session_eviction never \
          called), the donor session_store Arc MUST persist; the test \
-         observed a swap (different Arc) — guard logic regressed?"
+         observed a swap (different Arc) - guard logic regressed?"
     );
     assert_eq!(
         instance.current_epoch(),
@@ -228,13 +185,7 @@ fn heartbeat_interval_disabled_when_zero() {
 
 #[test]
 fn heartbeat_swap_state_metric_increments_per_swap() {
-    // The CLI-spawned heartbeat task increments
-    // `raven_railgun_session_eviction_swaps_total` per call. The
-    // counter itself is global to the metrics recorder; the test
-    // exercises the tick-by-tick contract: each
-    // `heartbeat_session_eviction` call corresponds to exactly one
-    // session-store reset. We assert by epoch monotonicity (one
-    // bump per call).
+    // One epoch bump per call stands in for the per-call swap metric.
     let params = InspireParams::secure_128_d2048();
     let initial_state = build_toy_state(&params);
     let instance: Arc<PirInstance<RavenInspireScheme>> = Arc::new(PirInstance::new(
@@ -256,30 +207,10 @@ fn heartbeat_swap_state_metric_increments_per_swap() {
     assert!(e3 > e2, "epoch MUST advance after third heartbeat");
 }
 
-// ────────────────────────────────────────────────────────────────────
-// OOM regression guards: encoded_db is `Arc::clone`d, not memcpy'd.
-//
-// Pre-fix, `heartbeat_session_eviction` deep-cloned `encoded_db` once
-// per fire (~128 MiB Vec memcpy at production cell). With 6 instances
-// firing hourly this leaked ~163 MiB/hour through allocator-retained
-// pages; live URL was on track to OOM within ~7 hours.
-//
-// The fix wraps `encoded_db` in `Arc<EncodedDatabase>` (Phase 2 T-A)
-// and replaces the deep clone with `Arc::clone(&donor.encoded_db)`.
-// The three tests below pin:
-//
-// - Arc-pointer identity across heartbeats (no allocation churn).
-// - Arc strong_count stays bounded between fires (≤ 2: current state
-//   + the local snap guard, after donor swap-out drop).
-// - `drive_commit`'s CoW path: `Arc::make_mut` on a uniquely-owned
-//   Arc does NOT allocate; on a shared Arc (in-flight query) it
-//   does — bounded to once per drive_commit batch.
-// ────────────────────────────────────────────────────────────────────
+// encoded_db is carried by Arc::clone; a deep clone per fire (~128 MiB
+// memcpy at production cell) would OOM the server under hourly ticks.
 
-/// Arc-identity guard: every heartbeat fire must carry the donor's
-/// `Arc<EncodedDatabase>` by `Arc::clone`, not by a fresh `Arc::new`
-/// over a deep-cloned EncodedDatabase. Across N fires the underlying
-/// allocation address must remain stable.
+/// Across N fires the `Arc<EncodedDatabase>` allocation address must stay stable.
 #[test]
 fn heartbeat_eviction_does_not_clone_encoded_db_under_steady_load() {
     let params = InspireParams::secure_128_d2048();
@@ -321,12 +252,8 @@ fn heartbeat_eviction_does_not_clone_encoded_db_under_steady_load() {
     );
 }
 
-/// Wall-time guard: at the production cell the heartbeat is dominated
-/// by an `Arc::clone` (sub-microsecond); the assertion guards against
-/// accidental re-introduction of a memcpy. We use the toy cell here
-/// because production cell setup costs ~12 s; the 1-ms ceiling
-/// generously covers any toy-cell allocation jitter while still
-/// catching a 100 ms+ deep-clone regression at any cell shape.
+/// 1-ms ceiling on the toy cell: covers allocation jitter yet catches a
+/// 100 ms+ deep-clone regression (production-cell setup is too heavy to use).
 #[test]
 fn heartbeat_eviction_arc_clone_constant_time_at_production_cell() {
     let params = InspireParams::secure_128_d2048();
@@ -337,8 +264,7 @@ fn heartbeat_eviction_arc_clone_constant_time_at_production_cell() {
         initial_state,
     ));
 
-    // Warm-up: first fire pays the lazy-init costs of any metrics
-    // recorder + `arc_swap` swap.
+    // Warm-up: first fire pays metrics-recorder + arc_swap lazy-init.
     heartbeat_session_eviction(&instance).expect("warmup");
 
     let mut over_budget = 0usize;
@@ -359,35 +285,20 @@ fn heartbeat_eviction_arc_clone_constant_time_at_production_cell() {
     );
 }
 
-/// `drive_commit`'s re-encode path uses `Arc::make_mut` on the
-/// donor's `Arc<EncodedDatabase>`. When no other Arcs are alive (the
-/// happy path: no in-flight queries holding the donor state),
-/// `Arc::make_mut` is a no-op pointer cast — no allocation, no copy.
-/// When another Arc IS alive (e.g. an in-flight query), `Arc::make_mut`
-/// triggers exactly one CoW Vec memcpy.
-///
-/// This test exercises the structural invariant directly via
-/// `Arc::make_mut` on a synthetic Arc; pinning the engine-level
-/// drive_commit's full CoW lifecycle requires a full
-/// `InspirePersistence::open` fixture which lives in the persistence
-/// module's own integration tests.
+/// `Arc::make_mut` (drive_commit's re-encode path) is a no-op when the
+/// Arc is uniquely owned and copies exactly once when a sibling (an
+/// in-flight query) is alive.
 #[test]
 fn drive_commit_arc_make_mut_only_copies_under_inflight_query() {
     let params = InspireParams::secure_128_d2048();
     let state = build_toy_state(&params);
 
-    // Take ownership of the Arc<EncodedDatabase> directly. This is
-    // the same Arc the engine carries on InspireServerState.
     let original_arc = Arc::clone(&state.encoded_db);
     let original_ptr: *const EncodedDatabase = Arc::as_ptr(&original_arc);
 
-    // Path A: uniquely-owned Arc -> make_mut returns the inner without
-    // allocating. The Arc pointer must remain stable.
+    // Path A: uniquely-owned Arc -> make_mut does not allocate.
     {
         let solo = Arc::clone(&original_arc);
-        // Build a fresh uniquely-owned Arc to exercise the no-alloc
-        // make_mut path; cloning solo's config keeps the test self-
-        // contained without depending on EncodedDatabase::default.
         let mut unique = Arc::new(EncodedDatabase {
             shards: Vec::new(),
             config: solo.config.clone(),
@@ -398,15 +309,10 @@ fn drive_commit_arc_make_mut_only_copies_under_inflight_query() {
             std::ptr::eq(unique_ptr, Arc::as_ptr(&unique)),
             "Arc::make_mut on a uniquely-owned Arc must not allocate"
         );
-        // Suppress unused warning: hold `solo` only to keep
-        // strong_count > 1 on `original_arc` for the assertions
-        // below.
         drop(solo);
     }
 
-    // Path B: shared Arc (a sibling clone is alive) -> make_mut
-    // performs CoW. The Arc pointer must change to a fresh
-    // allocation; the sibling Arc continues to point at the original.
+    // Path B: shared Arc -> make_mut performs CoW into a fresh allocation.
     {
         let mut writer = Arc::clone(&original_arc);
         let pre_writer_ptr: *const EncodedDatabase = Arc::as_ptr(&writer);
@@ -427,9 +333,7 @@ fn drive_commit_arc_make_mut_only_copies_under_inflight_query() {
             !std::ptr::eq(pre_writer_ptr, post_writer_ptr),
             "Arc::make_mut on a shared Arc MUST allocate a fresh buffer (CoW)"
         );
-        // The original sibling Arc must STILL point at the original
-        // allocation; in-flight queries on that Arc must not see the
-        // writer's mutation.
+        // Sibling Arc (an in-flight query) must not see the writer's mutation.
         assert!(
             std::ptr::eq(Arc::as_ptr(&original_arc), original_ptr),
             "sibling Arc must remain pinned to the original allocation"

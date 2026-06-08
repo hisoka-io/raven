@@ -94,11 +94,6 @@ async fn populate_from_zero_takes_under_30s_for_1k_events() {
         throughput_rows_per_sec = throughput,
         "mock-ppoi populate bench result",
     );
-    // tracing::info goes to the test runner's stderr by default when
-    // `tracing_subscriber::fmt::try_init()` succeeds at the top of
-    // the test; the assert below is the binding gate, the log line
-    // is captured for the FINDINGS report.
-
     worker_handle.abort();
     server_handle.abort();
 

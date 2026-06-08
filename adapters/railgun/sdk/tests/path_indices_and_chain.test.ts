@@ -1,28 +1,5 @@
-/**
- * Path-indices-driven auth-path PIR + multi-chain routing + IMT
- * cache + typed-error coverage. This file is the closure for the
- * client-side path-construction story:
- *
- *   - The wallet locally computes the 16 row-indices for an auth
- *     path via `wasm.path_indices_for_leaf` /
- *     `wasm.path_indices_for_per_list_leaf`.
- *   - The SDK dispatches one batch of 16 encrypted PIR queries to
- *     `POST /v1/instance/<id>/batch`.
- *   - No plaintext leaf-index or BC ever crosses the wire.
- *
- * Plus the surrounding production-readiness coverage:
- *   - per-status routing (Shield × {Valid, ShieldBlocked,
- *     ProofSubmitted, Missing}, Transact × ditto, Nullified ×
- *     {Valid, Missing}, Unshield × {Valid, Missing})
- *   - cross-tree spend (leaf in tree N, spend in tree M)
- *   - cache hit / cache miss
- *   - multi-chain routing (chain id 1 vs 11155111)
- *   - routing-table refresh on epoch advance
- *   - input validation (malformed BC, wrong list_key length, negative
- *     leaf_idx, overflow leaf_idx)
- *   - typed RavenError taxonomy (Network, ServerError, StaleAdapter,
- *     InvalidQuery, BatchMismatch, DecodeError)
- */
+// Locks the privacy invariant: path indices are computed locally and only the
+// encrypted batch crosses the wire, never a plaintext leaf-index or BC.
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
@@ -51,13 +28,7 @@ const LIST_KEY_HEX = "ababababababababababababababababababababababababababababab
 const BC_HEX = "0000000000000000000000000000000000000000000000000000000000000001";
 const BC_HEX_2 = "0000000000000000000000000000000000000000000000000000000000000002";
 
-/**
- * Stub WASM whose path-indices accessors mirror the real Rust math
- * (so tests assert on real geometry, not fabricated values). We do
- * NOT load the real wasm here to keep these tests deterministic and
- * fast (the real wasm is exercised by the privacy-invariant test
- * file).
- */
+// Stub mirroring the real Rust path-indices math so tests assert on real geometry; the real wasm runs in the privacy-invariant file.
 function realPathStubWasm(): RavenInspireWasm {
   function flatIndex(level: number, idxAtLevel: number): number {
     const total = 1 << (TREE_DEPTH + 1);
@@ -68,10 +39,7 @@ function realPathStubWasm(): RavenInspireWasm {
     build_client_session: () => ({ free: () => undefined }),
     build_seeded_query: () => new Uint8Array(16),
     extract_response: (_session, _crs, _state, response, _entry) => {
-      // Pass-through: the test routes encode the desired plaintext
-      // (status byte at offset 0 OR a 32 B node hash) directly into
-      // the response body; the stub mirrors that into the SDK so
-      // routing-matrix tests assert on the plaintext semantics.
+      // Pass-through: test routes encode the desired plaintext directly into the response body.
       if (response.length === 0) return new Uint8Array(0);
       return new Uint8Array(response);
     },
@@ -112,12 +80,7 @@ function stubCtx(): ClientPirContext {
   };
 }
 
-/**
- * Mount a `/v1/instance/:id/batch` route that returns 16 synthetic
- * 32 B node hashes (one per element). Each hash is derived from the
- * level so the SDK's reconstruction logic surfaces a deterministic
- * MerkleProof.
- */
+// Mount a batch route returning 16 synthetic 32 B node hashes, each derived from its level for a deterministic MerkleProof.
 function mountBatchRoute(server: MockServer, freshness?: { epoch?: number; schemaVersion?: number }): void {
   server.route(
     (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
@@ -136,7 +99,6 @@ function mountBatchRoute(server: MockServer, freshness?: { epoch?: number; schem
         dv.setUint32(off, elemBytes, true);
         dv.setUint32(off + 4, 0, true);
         off += 8;
-        // Synthetic 32 B node hash: 0xab in slot 0, level in slot 31.
         out[off] = 0xab;
         out[off + 31] = level;
         off += elemBytes;
@@ -161,11 +123,7 @@ function mountSingleQueryRoute(server: MockServer, statusByte: number): void {
   server.route(
     (req) => /^\/v1\/instance\/[^/]+\/query$/.test(req.url ?? ""),
     (_req, _body, res) => {
-      // SDK now strips the `[u16 BE schema][bincode]` envelope from
-      // single-query responses (mirroring the server's
-      // `write_versioned`); mock servers must prepend it too. Inner
-      // 32 bytes are the stub plaintext the SDK's stub
-      // `extract_response` (in `realPathStubWasm`) passes through.
+      // SDK strips the `[u16 BE schema][bincode]` envelope, so the mock must prepend it.
       const inner = new Uint8Array(32);
       inner[0] = statusByte;
       const out = new Uint8Array(2 + inner.length);
@@ -278,7 +236,6 @@ describe("client-PIR auth-path reconstruction (T2/T3)", () => {
     const ascii = new TextEncoder().encode("12345");
     const raw = new Uint8Array([0x39, 0x30, 0, 0]); // 12345 LE u32
     for (const w of sdk.lastWireRequests()) {
-      // ASCII or LE-u32 leaf-index must not appear in any body.
       expect(containsExact(w.body, ascii)).toBe(false);
       expect(containsExact(w.body, raw)).toBe(false);
     }
@@ -303,7 +260,7 @@ describe("client-PIR auth-path reconstruction (T2/T3)", () => {
     server.route(
       (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
       (_req, _body, res) => {
-        // Only 8 elements; SDK expected 16.
+        // 8 elements where the SDK expects 16.
         const elemCount = 8;
         const elemBytes = 32;
         const total = 2 + 8 + elemCount * (8 + elemBytes);
@@ -451,7 +408,6 @@ describe("client-side IMT cache hit / miss", () => {
     });
     await sdk.getMerkleProof(0, 0);
     expect(batchHits).toBe(1);
-    // Same leaf -> all 16 sibling indices are in cache.
     await sdk.getMerkleProof(0, 0);
     expect(batchHits).toBe(1);
   });
@@ -490,12 +446,9 @@ describe("client-side IMT cache hit / miss", () => {
     });
     await sdk.getMerkleProof(0, 0);
     expect(batchHits).toBe(1);
-    // Same epoch + schema version -> all 16 nodes hit in cache.
     await sdk.getMerkleProof(0, 0);
     expect(batchHits).toBe(1);
-    // Operator advances epoch (e.g. via /v1/status refresh from
-    // a separate routing-table tick); cache layers drop -> next call
-    // refetches.
+    // Epoch advance drops the cache layers; next call refetches.
     cache.noteFreshness("2", 1);
     await sdk.getMerkleProof(0, 0);
     expect(batchHits).toBe(2);
@@ -750,10 +703,7 @@ describe("status-routing matrix (BC type x POI status)", () => {
     });
   }
 
-  // Nullified status: surfaced via the "Valid" / "Missing" axis;
-  // ProofSubmitted is the upstream surrogate for the
-  // "spend-known-but-not-yet-finalized" state. Locks the two cases
-  // the wallet treats as "spendable" vs "wait/refresh".
+  // Nullified surfaces on the Valid/Missing axis; locks the spendable vs wait/refresh cases.
   it("Nullified x Valid: status byte 0 surfaces as Valid", async () => {
     mountSingleQueryRoute(server, 0);
     const sdk = new RavenPOINodeInterface({
@@ -771,10 +721,7 @@ describe("status-routing matrix (BC type x POI status)", () => {
   });
 
   it("Nullified x Missing: server 5xx propagates as ServerError under H3 (no silent Missing)", async () => {
-    // Post-H3 contract: a server-side 503 propagates as a typed
-    // ServerError so the wallet can retry against a fresh routing
-    // table or fall back to upstream PPOI rather than silently
-    // spending against an unmarked BC.
+    // A 503 propagates as a typed ServerError so the wallet retries or falls back rather than spending on an unmarked BC.
     server.route(
       (req) => req.url?.startsWith("/v1/instance/") ?? false,
       (_req, _body, res) => {
@@ -875,7 +822,7 @@ describe("freshness fallback to upstream PPOI", () => {
     mainServer.route(
       (req) => req.url === "/v1/poi/pois-per-list",
       (_req, _body, res) => {
-        // Stale: confidence 0.1 below floor 0.5 -> fallback fires.
+        // confidence 0.1 below floor 0.5 fires the fallback.
         writeJson(
           res,
           { [BC_HEX]: { [LIST_KEY_HEX]: "ProofSubmitted" } },
@@ -885,7 +832,6 @@ describe("freshness fallback to upstream PPOI", () => {
       },
     );
     let upstreamHit = false;
-    // Upstream path: /pois-per-list/<chainType>/<chainID>
     upstreamServer.route(
       (req) => req.url === "/pois-per-list/0/1",
       (_req, _body, res) => {
@@ -909,12 +855,7 @@ describe("freshness fallback to upstream PPOI", () => {
   });
 });
 
-/**
- * Substring-search that does NOT short-circuit on prefix overlap.
- * The exported `containsByteSequence` is what we'd ideally call but
- * we keep this self-contained so failures here don't depend on
- * the helper layer.
- */
+// Self-contained byte-substring search so failures here do not depend on the helper layer.
 function containsExact(haystack: Uint8Array, needle: Uint8Array): boolean {
   if (needle.length === 0) return true;
   if (needle.length > haystack.length) return false;

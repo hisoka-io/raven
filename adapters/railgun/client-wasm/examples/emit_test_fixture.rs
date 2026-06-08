@@ -1,26 +1,7 @@
-//! Emit a binary fixture for the SDK privacy-invariant test.
+//! Emit the binary fixture the SDK privacy-invariant TS test reads.
 //!
-//! Builds a minimal raven-inspire instance (small ring dim for speed),
-//! serializes the CRS + ShardConfig + InspireParams + the params
-//! bundle (built via the wasm-mirror helper), and a server response
-//! for a single known target index. The TS test reads these files,
-//! constructs the wasm client session against them, and exercises
-//! the SDK end-to-end against a node:http mock server that serves
-//! the precomputed response back.
-//!
-//! Run:
-//!   cargo run --release --example emit_test_fixture \
-//!     --manifest-path adapters/railgun/client-wasm/Cargo.toml \
-//!     -- <out-dir>
-//!
-//! Files written:
-//!   <out-dir>/inspire_params.bin
-//!   <out-dir>/crs.bin
-//!   <out-dir>/shard_config.bin
-//!   <out-dir>/params_bundle.bin
-//!   <out-dir>/list_key.bin       (32-byte test list key)
-//!   <out-dir>/bc_for_idx_<N>.bin (32-byte BC for idx N, for N in {0,1,2,3,4})
-//!   <out-dir>/fixture.json       (metadata: entry_size, target_indices, hex BCs)
+//! Run: `cargo run --release --example emit_test_fixture --manifest-path
+//! adapters/railgun/client-wasm/Cargo.toml -- <out-dir>`
 
 #![allow(
     clippy::expect_used,
@@ -83,10 +64,7 @@ fn main() {
 
     let params = test_params();
 
-    // Build a database whose row N's first byte is N % 4 (POI status:
-    // Valid/ShieldBlocked/ProofSubmitted/Missing) and bytes 1..32 are
-    // the BC for row N. This mirrors the production T1 PerListStatus
-    // encoder shape: [status, bc[1..32]].
+    // Row shape [status, bc[1..32]] mirrors the production T1 PerListStatus encoder.
     let num_entries = params.ring_dim;
     let mut db = vec![0u8; num_entries * ENTRY_BYTES];
     for idx in 0..(num_entries as u32) {
@@ -102,15 +80,12 @@ fn main() {
     let (crs, encoded_db, sk) =
         inspire_setup(&params, &db, ENTRY_BYTES, &mut sampler).expect("setup");
 
-    // Build a ClientSession + the params bundle the JS side will hand
-    // to wasm.build_client_session.
     let inspire_params_bin = bincode::serialize(&params).expect("serialize params");
     let crs_bin = bincode::serialize(&crs).expect("serialize crs");
     let shard_config_bin = bincode::serialize(&encoded_db.config).expect("serialize shard");
     let sk_bin = bincode::serialize(&sk).expect("serialize sk");
 
-    // WasmInstanceParamsBundle fields are private to the wasm crate; hand-build
-    // the bincode shape (3 length-prefixed Vec<u8>s in declaration order).
+    // WasmInstanceParamsBundle fields are crate-private; hand-build the bincode shape.
     let params_bundle_bin =
         bincode_three_byte_vecs(&inspire_params_bin, &shard_config_bin, &sk_bin);
 
@@ -122,7 +97,6 @@ fn main() {
     let list_key: [u8; 32] = [0x42u8; 32];
     fs::write(out.join("list_key.bin"), list_key).expect("write list_key");
 
-    // Pre-compute server responses so the JS mock server can serve them back.
     let mut sampler_session = GaussianSampler::new(params.sigma);
     let session = raven_inspire::ClientSession::new(crs.clone(), sk.clone(), &mut sampler_session)
         .expect("session");
@@ -147,7 +121,6 @@ fn main() {
         )
         .expect("respond");
 
-        // Sanity: the precomputed response decrypts correctly.
         let plain = extract_response_rust(&crs, &state, &resp, ENTRY_BYTES).expect("extract");
         assert_eq!(
             plain[0],
@@ -168,7 +141,6 @@ fn main() {
     let meta_json = serde_json::to_vec_pretty(&meta).expect("serialize meta");
     fs::write(out.join("fixture.json"), meta_json).expect("write meta");
 
-    // Avoid unused-binding warnings on items the SDK doesn't need.
     drop(_unused_witness((crs, encoded_db)));
     let _ = RlweSecretKey::clone(&sk);
     println!("OK: fixture written to {}", out.display());
@@ -186,10 +158,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Hand-built bincode of `(Vec<u8>, Vec<u8>, Vec<u8>)`-shaped struct.
-/// Matches the wasm crate's private `WasmInstanceParamsBundle` layout
-/// (3 Vec<u8> fields in declaration order, default bincode config:
-/// u64 LE length prefix, no struct headers).
+/// Bincode matching crate-private `WasmInstanceParamsBundle`: 3 `Vec<u8>` fields, u64 LE length prefix, no headers.
 fn bincode_three_byte_vecs(a: &[u8], b: &[u8], c: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(24 + a.len() + b.len() + c.len());
     out.extend_from_slice(

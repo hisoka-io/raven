@@ -1,19 +1,7 @@
 //! Process-isolated regression for the poisoned-WAL recovery counter.
 //!
-//! Asserts that after an open path replays a WAL whose tail contains a
-//! sparse leaf (rejected by `apply_wal_entry`), the production-path
-//! emission `metrics::counter!("raven_railgun_wal_replay_skipped_total")
-//! .increment(skipped_count)` actually drives the rendered Prometheus
-//! counter line to at least 1.
-//!
-//! Lives in its own integration-test binary so it gets a dedicated
-//! process with a freshly-installed `metrics_exporter_prometheus`
-//! recorder. Inlined in the lib-test mod alongside sibling tests, the
-//! shared `OnceLock`-cached PrometheusHandle would race with concurrent
-//! handle renders and surface a flake (value occasionally 0 when this
-//! test's render happened before the increment was flushed). The
-//! integration-binary boundary makes the recorder install + render
-//! observation hermetic.
+//! Its own integration binary gets a hermetic Prometheus recorder; sharing one across sibling
+//! tests would race the render against the increment flush and flake to 0.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
@@ -83,8 +71,7 @@ fn poisoned_wal_replay_skipped_counter_increments() {
             .expect("apply poisoned seq 1");
     }
 
-    // Reopen: WAL replay must reject the sparse leaf via the
-    // soft-skip path AND drive the Prometheus counter to >= 1.
+    // reopen: WAL replay soft-skips the sparse leaf and drives the counter to >= 1
     let layout2 = StoreLayout::open(dir.path()).expect("layout 2");
     let _opened2 = InspirePersistence::open(
         layout2,

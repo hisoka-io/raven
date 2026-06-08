@@ -26,9 +26,7 @@ use tokio::sync::oneshot;
 const BEARER_TOKEN: &str = "production-cell-test-token";
 const PRODUCTION_INSTANCE_ID: &str = "ppoi-paths-ofac";
 const ENTRIES_LOG2: usize = 16;
-/// T2/T3 cell: 16 siblings × 32 B = 512 B per Merkle path.
-/// 3-seed locked-variant numbers at the production cell: 71.9 ms
-/// total / 69.3 ms server / 32.9 KB response (Zen 5 reference host).
+/// 16 siblings × 32 B per Merkle path.
 const ENTRY_BYTES: usize = 512;
 
 fn entries() -> usize {
@@ -37,7 +35,6 @@ fn entries() -> usize {
 
 #[allow(clippy::cast_possible_truncation)]
 fn build_synthetic_db(n_entries: usize, entry_bytes: usize) -> Vec<u8> {
-    // Deterministic but non-trivial: byte (i, j) = (i * 31 + j * 17) mod 251.
     (0..n_entries)
         .flat_map(|i| (0..entry_bytes).map(move |j| ((i * 31 + j * 17) % 251) as u8))
         .collect()
@@ -77,8 +74,6 @@ async fn production_cell_round_trip_and_batch_within_budget() {
     let setup_elapsed = setup_start.elapsed();
     eprintln!("production_cell: setup elapsed = {setup_elapsed:?}");
 
-    // Snapshot the engine's live server state for in-process query
-    // construction (same shard_config /v1/instance/{id}/params surfaces).
     let server_state_arc = app_state
         .engine
         .instance(&InstanceId::new(PRODUCTION_INSTANCE_ID))
@@ -101,7 +96,7 @@ async fn production_cell_round_trip_and_batch_within_budget() {
     });
     ready_rx.await.expect("server ready");
 
-    let _ = session_handle; // session was registered in-process; HTTP queries use it via the session.
+    let _ = session_handle; // registered in-process; HTTP queries use it
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -153,16 +148,12 @@ async fn production_cell_round_trip_and_batch_within_budget() {
         "single-query byte equality"
     );
 
-    // Bench gate: locked production target is ~71.9 ms total /
-    // 69.3 ms server (3-seed median, 0.6% spread on the Zen 5
-    // reference). Test asserts < 300 ms total RT to leave headroom
-    // for HTTP + serde + contended-host noise + single-test variance.
+    // 300ms ceiling leaves headroom over the ~72ms floor for HTTP/serde/host noise
     assert!(
         single_total < Duration::from_millis(300),
         "single query total RT regressed: {single_total:?} (production floor 71.9 ms total)"
     );
 
-    // BATCH of 16 queries — the 16-sibling Merkle-proof case.
     let mut batch_queries = Vec::with_capacity(16);
     let mut client_states = Vec::with_capacity(16);
     let mut targets = Vec::with_capacity(16);
@@ -218,17 +209,9 @@ async fn production_cell_round_trip_and_batch_within_budget() {
         );
     }
 
-    // Batch wall-time gate. The /batch endpoint runs queries
-    // sequentially inside spawn_blocking — each call already uses
-    // rayon internally for the per-shard column loop, so wrapping
-    // them in `par_iter` thrashes the global pool and makes the
-    // batch slower than serial.
-    //
-    // Sequential floor: 16 × ~75 ms = ~1200 ms. Plus HTTP overhead +
-    // WSL2 variance gives a realistic budget of ~3 s. Cross-query
-    // K-style concurrency (memory 061, 3.97× at our cell) is
-    // catalogued for an earlier cycle+ — that's where the <250 ms target
-    // becomes reachable.
+    // /batch runs queries serially; each already saturates rayon per-shard, so
+    // par_iter would thrash the global pool. Floor 16 x ~75ms = ~1.2s; 3s budget
+    // absorbs HTTP + WSL2 variance.
     assert!(
         batch_total < Duration::from_secs(3),
         "batch total RT regressed: {batch_total:?} (sequential floor ~1.2 s)"

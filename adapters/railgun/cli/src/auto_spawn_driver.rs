@@ -263,9 +263,8 @@ impl SpawnRegistry {
             entry
                 .persistence
                 .set_snapshot_policy(SnapshotPolicy::static_default());
-            // If the predecessor was concurrently admin-drained, promote it to Drained atomically
-            // with the route-table append so /v1/status and the routing layer see them together.
-            // No-op when the predecessor is still Active or already Drained (idempotent).
+            // Promote a concurrently-drained predecessor atomically with the route append so
+            // /v1/status and routing observe it together; no-op otherwise (idempotent).
             let prev_state = entry.instance.drain_state();
             if matches!(
                 prev_state,
@@ -571,10 +570,8 @@ fn spawn_one(inputs: &SpawnInputs<'_>, tree: u32, append_log: bool) -> anyhow::R
     };
     let consumer_join = spawn_consumer_task(consumer_inputs);
 
-    // Record before the role flip so the predecessor lookup in flip_predecessor_to_static
-    // does not race a concurrent `registry.known()` reader.
-    // record_auto_spawned retains the JoinHandle so the serve loop can send Shutdown and await
-    // the final drive_commit; without this the task exits via channel-close without committing.
+    // Record before the role flip so flip_predecessor_to_static does not race a concurrent
+    // `registry.known()` reader; the retained JoinHandle lets the serve loop drive a final commit.
     inputs
         .registry
         .record_spawn(tree, Arc::clone(&instance_arc), Arc::clone(&persistence));
@@ -1143,8 +1140,6 @@ mod tests {
 
     #[tokio::test]
     async fn registry_seed_then_flip_marks_predecessor_static() {
-        // Use the engine helpers: build two synthetic instances, seed
-        // them, then flip predecessor for tree=1 and inspect roles.
         use raven_inspire::params::InspireVariant;
         use raven_railgun_engine::orchestrator::InstanceConfig;
         let params = InspireParams::secure_128_d2048();

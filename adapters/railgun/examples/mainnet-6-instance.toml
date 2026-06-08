@@ -1,20 +1,14 @@
-# Canonical V1.5 mainnet 6-instance shape consumed by
+# Example 6-instance mainnet config for
 # `raven-railgun serve-production --config <this file>`.
 #
-# Six instances reflecting the locked Railgun mainnet topology at
-# the time of writing:
-#   - 3 static commit-trees (filled, immutable; Static role + static_default snapshot policy)
-#   - 1 live commit-tree (currently filling; Live role)
-#   - 2 PPOI list instances (Live role; UpstreamSignature verification)
-# Operators upgrading to a new mainnet tree topology should adjust
-# the [[instance]] blocks below to match the on-chain reality.
+# Mirrors the Railgun mainnet topology: 3 static (filled) commit-trees,
+# 1 live commit-tree, and 2 PPOI list instances. Adjust the [[instance]]
+# blocks to match the current on-chain tree topology.
 
 [global]
 bind = "0.0.0.0:8080"
-# REPLACE_ME: bearer token for the operator-side HTTP server. MUST
-# be at least 16 bytes of entropy (config-time check enforces this
-# and bails on the literal "REPLACE_ME" string). Generate via e.g.
-# `openssl rand -hex 32`.
+# bearer token; config-time check rejects the literal "REPLACE_ME" and
+# requires >= 16 bytes of entropy. Generate via `openssl rand -hex 32`.
 token = "REPLACE_ME"
 rpc_url = "https://mainnet.example/eth"
 railgun_proxy = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
@@ -29,23 +23,13 @@ scheme_tag = "raven-inspire-twopacking-inspiring-wp3-cache-session"
 use_flock = true
 channel_capacity = 1024
 
-# Trust X-Forwarded-For / Forwarded for per-IP rate-limit keying.
-# REQUIRED behind any reverse proxy (Cloudflare Tunnel, ALB, nginx)
-# where the inbound TCP peer is the proxy daemon (one IP for all
-# public visitors). Without this, every internet visitor shares a
-# single rate-limit bucket and a single demo session trips the
-# bucket for everyone behind the proxy.
-#
-# SECURITY: only set true when the origin port is firewalled to the
-# proxy network. A publicly reachable origin port lets attackers
-# forge X-Forwarded-For and bypass per-IP throttling.
+# Key per-IP rate limiting off X-Forwarded-For; set true ONLY behind a
+# trusted reverse proxy whose origin port is firewalled to it. A publicly
+# reachable origin lets attackers forge the header and bypass throttling.
 trust_proxy_header = false
 
-# Per-IP rate-limit refill rate (requests / second). Default 200.
-# rate_limit_rps = 200
-
-# Per-IP rate-limit burst budget (token-bucket capacity). Default 400.
-# rate_limit_burst = 400
+# rate_limit_rps = 200      # per-IP refill rate (req/s)
+# rate_limit_burst = 400    # per-IP token-bucket capacity
 
 [[instance]]
 id = "commit-tree-0"

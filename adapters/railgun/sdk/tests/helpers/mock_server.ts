@@ -1,13 +1,4 @@
-/**
- * Shared mock-server helpers for the SDK test harness.
- *
- * All SDK tests run against an in-process `node:http` server so we
- * exercise the SDK's outbound HTTP layer end-to-end without binding
- * to a real RPC, real PPOI service, or a browser. The mock records
- * every request body so tests can both inspect the SDK's
- * `lastWireRequests` capture AND cross-check the bytes the server
- * actually received.
- */
+/** In-process `node:http` mock that records every request body for the SDK test harness. */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
@@ -26,11 +17,7 @@ export interface MockServer {
   url: string;
   port: number;
   requests: RecordedRequest[];
-  /**
-   * Add a new route handler; handlers are tried in registration
-   * order and the first to return `true` claims the request. If no
-   * handler claims, the server returns 404.
-   */
+  /** Register a handler; tried in order, first to return `true` claims the request, else 404. */
   route(matcher: (req: IncomingMessage) => boolean, handler: RouteHandler): void;
   reset(): void;
   close(): Promise<void>;
@@ -64,7 +51,7 @@ export async function startMockServer(): Promise<MockServer> {
         res.writeHead(400);
         res.end();
       } catch {
-        // Connection may already be closed.
+        // connection may already be closed
       }
     });
   });
@@ -97,9 +84,7 @@ export async function startMockServer(): Promise<MockServer> {
   };
 }
 
-/**
- * Helper: write a JSON 200 response with optional freshness header.
- */
+/** Write a JSON 200 response with optional extra headers. */
 export function writeJson(
   res: ServerResponse,
   payload: unknown,
@@ -112,10 +97,7 @@ export function writeJson(
   res.end(JSON.stringify(payload));
 }
 
-/**
- * Helper: write an octet-stream 200 response with optional freshness
- * header.
- */
+/** Write an octet-stream 200 response with optional extra headers. */
 export function writeBinary(
   res: ServerResponse,
   bytes: Uint8Array,
@@ -128,9 +110,7 @@ export function writeBinary(
   res.end(Buffer.from(bytes));
 }
 
-/**
- * Helper: write a typed error response with status + plain text body.
- */
+/** Write a plain-text error response with the given status. */
 export function writeError(
   res: ServerResponse,
   status: number,
@@ -140,10 +120,7 @@ export function writeError(
   res.end(message);
 }
 
-/**
- * Builds a 32-byte commitment-shaped buffer for tests, deterministic
- * per `tag` byte.
- */
+/** Deterministic 32-byte commitment-shaped buffer keyed on `tag`. */
 export function makeBc(tag: number): Uint8Array {
   const out = new Uint8Array(32);
   out[0] = 0xbc;

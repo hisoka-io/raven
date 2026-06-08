@@ -1,9 +1,4 @@
-//! Engine-level auto-spawn lifecycle tests.
-//!
-//! Exercises `Engine::add_live`, `PirInstance::set_role`,
-//! `InspirePersistence::set_snapshot_policy`, and the
-//! `chain_tree_routes` ArcSwap + `tree_observed` broadcast tap.
-//! Does NOT spin up the CLI driver task.
+//! Engine-level auto-spawn lifecycle tests (no CLI driver task).
 
 #![allow(
     clippy::expect_used,

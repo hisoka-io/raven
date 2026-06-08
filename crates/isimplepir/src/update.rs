@@ -1,10 +1,7 @@
-//! `DBUpdate` + `StateUpdate` (paper 2026/030 Fig. 2 Construction 1).
-//! Entry-level, row-aggregated, and paper-exact batch primitives,
-//! all preserving Theorem 3.
-//!
-//! Deletion is **weak only**: a pre-deletion client retaining the
-//! hint can recover deleted entries via related-index queries.
-//! Callers needing strong deletion must re-run `Setup`.
+//! `DBUpdate` + `StateUpdate` (eprint 2026/030 Fig. 2 Construction 1),
+//! preserving Theorem 3. Deletion is weak only: a pre-deletion client
+//! retaining the hint can recover deleted entries; strong deletion
+//! requires re-running `Setup`.
 
 use rand_core::RngCore;
 use rand_core::TryRngCore;
@@ -101,10 +98,10 @@ pub fn db_update_modify(
     })
 }
 
-/// `DBUpdate` for a deletion. Replaces the entry with `r ←$ Z_p`.
-/// `rng` MUST be OS entropy; a predictable `r` lets a client
+/// `DBUpdate` for a deletion. Replaces the entry with `r` uniform in
+/// `Z_p`. `rng` MUST be OS entropy; a predictable `r` lets a client
 /// subtract it from a follow-up query and recover the original.
-/// Weak deletion only (paper §2.4).
+/// Weak deletion only (eprint 2026/030 sec 2.4).
 pub fn db_update_delete<R: RngCore>(
     state: &mut ServerState,
     row: usize,
@@ -457,7 +454,6 @@ pub fn db_update_batch<R: RngCore>(
         });
     }
 
-    // Sub-ops each bump state.version; rewrite inner deltas to one shared version.
     let batch_version = state.version.next();
 
     let mut beta_edit = Vec::with_capacity(op.modifications.len());

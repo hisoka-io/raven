@@ -362,13 +362,7 @@ impl UpstreamPpoiMirror {
             }
             for ev in &events {
                 let status_byte = poi_status_to_byte(ev.status);
-                // Order is load-bearing: PpoiListLeafAdded must precede
-                // PpoiStatus so the engine's `(BC -> idx)` ordering
-                // oracle is allocated before the status-only update
-                // touches its key. The engine apply path treats
-                // PpoiListLeafAdded as the IMT-grow + bc-index +
-                // status oracle; the following PpoiStatus is an
-                // idempotent re-assertion for non-IMT consumers.
+                // PpoiListLeafAdded must precede PpoiStatus; see the emission-order doc above.
                 let leaf_added = raven_railgun_persistence::WalEntryPayload::PpoiListLeafAdded {
                     list_key: list.0,
                     list_index: ev.list_index,

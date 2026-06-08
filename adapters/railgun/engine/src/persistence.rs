@@ -157,14 +157,9 @@ impl InspirePersistence {
                     manifest.encoder_label, encoder_label
                 )));
             }
-            // SnapshotId(0): sentinel for "manifest exists but no commit yet".
-            // Reopen with id=0 → recovered_state is None; LogicalLeafStore rebuilt from WAL.
-            //
-            // V6-aware: `restore_inspire_state_v6` auto-dispatches on the
-            // `SNAPSHOT_V6_MAGIC` prefix. V6 snapshots carry the embedded
-            // [`LogicalLeafStore`] which seeds the replay base below; V5
-            // snapshots (legacy) return a default-empty store and rely on
-            // WAL replay to repopulate.
+            // SnapshotId(0): manifest exists but no commit yet; rebuild store from WAL.
+            // V6 snapshots seed the replay base with their embedded store; V5
+            // return empty and rely on WAL replay.
             let (recovered_state, recovered_seed_store, entries_per_shard) =
                 if manifest.current_snapshot_id == SnapshotId(0) {
                     (None, super::inspire::LogicalLeafStore::new(), u32::MAX)
@@ -299,13 +294,10 @@ impl InspirePersistence {
         }
     }
 
-    /// Snapshot state (V5 legacy codec), archive WAL, and bump the
-    /// manifest atomically.
+    /// Snapshot state (V5 codec), archive WAL, and bump the manifest atomically.
     ///
-    /// Retained for the encoder-migration tools and back-compat
-    /// regression tests. New code should call [`InspirePersistence::commit_v6`]
-    /// so the embedded [`super::inspire::LogicalLeafStore`] travels with
-    /// the snapshot and survives WAL archival.
+    /// New code should call [`InspirePersistence::commit_v6`] so the embedded
+    /// [`super::inspire::LogicalLeafStore`] travels with the snapshot.
     pub fn commit(
         &self,
         state: &InspireServerState,
@@ -315,10 +307,8 @@ impl InspirePersistence {
         self.commit_serialized_bundle(bundle, current_block_height)
     }
 
-    /// V6 commit: snapshot `(state, store)` to the V6 envelope, archive
-    /// WAL, and bump the manifest atomically. The manifest's
-    /// `schema_version` advances to [`raven_railgun_persistence::MANIFEST_SCHEMA_VERSION`]
-    /// (currently V6) on the next manifest save.
+    /// V6 commit: snapshot `(state, store)` to the V6 envelope, archive WAL,
+    /// and bump the manifest atomically.
     pub fn commit_v6(
         &self,
         state: &InspireServerState,
@@ -336,8 +326,7 @@ impl InspirePersistence {
     ) -> Result<SnapshotId> {
         let snap = Snapshot::build(bundle);
 
-        // Lock-drop + CAS: read next_id under lock, drop lock, save snapshot (slow),
-        // re-lock and CAS-check before committing — keeps manifest lock contention minimal.
+        // Save snapshot (slow) outside the manifest lock; CAS-check on re-lock.
         let next_id = {
             let m = self.manifest.lock();
             m.current_snapshot_id.next()
@@ -422,16 +411,10 @@ impl InspirePersistence {
         self.manifest.lock().current_snapshot_id
     }
 
-    /// Recovered chain-event block height baseline.
+    /// Recovered chain-event block-height baseline (the restart resume floor).
     ///
-    /// Returns `manifest.current_block_height`, advanced by
-    /// [`Self::commit_v6`] / [`Self::commit`] on every successful
-    /// commit and recovered by [`Self::open`]. Operator-facing
-    /// surfaces (`/v1/status.consumer.last_applied_block`, the
-    /// per-tree-floor map built at serve-time) seed off this value so
-    /// a freshly-restarted instance does NOT re-scan events the chain
-    /// driver already applied + the consumer task would only drop as
-    /// duplicates.
+    /// `manifest.current_block_height`, advanced on every commit and recovered
+    /// by [`Self::open`]; restart seeds off it to avoid re-scanning applied events.
     #[must_use]
     pub fn manifest_block_height(&self) -> u64 {
         self.manifest.lock().current_block_height
@@ -458,8 +441,7 @@ impl InspirePersistence {
             .filter_map(std::result::Result::ok)
             .filter(|e| e.file_name().to_string_lossy().starts_with("seq-"))
             .collect();
-        // Sort newest-first by filename (filenames embed seq
-        // numbers + are zero-padded by `wal_archived_path`).
+        // Newest-first; filenames are zero-padded so lexical == numeric order.
         entries.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
         for old in entries.into_iter().skip(retain) {
             let _ = std::fs::remove_file(old.path());
@@ -491,10 +473,7 @@ impl InspirePersistence {
         entries.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
         for (id, path) in entries.into_iter().skip(retain) {
             if id == live_id.0 {
-                // Never delete the live snapshot. (This branch
-                // fires when policy.snapshots_retain is small
-                // enough that the live id is older than the
-                // retention window; it's a load-bearing safety.)
+                // Never delete the live snapshot, even if outside the retain window.
                 continue;
             }
             let _ = std::fs::remove_dir_all(&path);
@@ -521,10 +500,8 @@ pub fn bootstrap_inspire_instance(
     let state = if let Some(s) = opened.recovered_state {
         s
     } else {
-        // Fire commit_notify so observers waiting on first commit don't deadlock.
-        // Bootstrap first commit uses the V6 envelope so the embedded
-        // `LogicalLeafStore` travels with the snapshot from the very
-        // first manifest write. Empty store on first bootstrap.
+        // V6 first commit so the embedded store ships with the snapshot;
+        // notify so observers waiting on first commit don't deadlock.
         let s = fresh_state_factory()?;
         let empty_store = super::inspire::LogicalLeafStore::default();
         persistence.commit_v6(&s, &empty_store, 0)?;
@@ -532,7 +509,7 @@ pub fn bootstrap_inspire_instance(
         s
     };
     let instance = PirInstance::new(instance_id, role, state);
-    let _ = Epoch::ZERO; // import path
+    let _ = Epoch::ZERO;
     Ok((instance, persistence))
 }
 
@@ -556,10 +533,9 @@ pub enum ConsumerEvent {
 pub struct ConsumerMetrics {
     /// Last block height applied.
     pub last_applied_block: u64,
-    /// Block height of the last state-mutating event actually applied to
-    /// the store (AppendLeaf / PPOI list leaf). Never advanced by
-    /// Nullified / Unshield / heartbeat, so it brackets every applied leaf
-    /// and is the only height safe to persist as the manifest resume floor.
+    /// Block height of the last leaf-mutating event applied (AppendLeaf / PPOI
+    /// leaf). Never advanced by Nullified / Unshield / heartbeat, so it is the
+    /// only height safe to persist as the manifest resume floor.
     pub last_applied_leaf_block: u64,
     /// Last chain head seen via heartbeat.
     pub last_known_chain_head: u64,
@@ -859,9 +835,8 @@ pub async fn run_consumer_task(
                                     .await;
                             }
                         }
-                        // Per-leaf path above handled commit +
-                        // metrics; the outer match arm only
-                        // updates aggregate event counters.
+                        // Per-leaf path handled commit + metrics; only aggregate
+                        // counters remain.
                         let _ = (tree_number, leaves);
                         {
                             let mut m = metrics.lock();
@@ -873,20 +848,14 @@ pub async fn run_consumer_task(
                         continue;
                     }
                     raven_railgun_core::RailgunEvent::Nullified { .. } => {
-                        // Nullifiers don't produce new leaves; tracked
-                        // out-of-band by the wallet (it computes its
-                        // own nullifier and cross-references against
-                        // chain Nullified events). The engine just
-                        // records the height; no WAL payload is the
-                        // stable behavior.
+                        // No new leaves; record height only, no WAL payload.
                         let mut m = metrics.lock();
                         m.last_applied_block = height;
                         m.events_processed = m.events_processed.saturating_add(1);
                         continue;
                     }
                     raven_railgun_core::RailgunEvent::Unshield { .. } => {
-                        // Unshield emits to public; not a tree mutation.
-                        // Same as Nullified above.
+                        // Not a tree mutation; record height only.
                         let mut m = metrics.lock();
                         m.last_applied_block = height;
                         m.events_processed = m.events_processed.saturating_add(1);
@@ -916,12 +885,6 @@ pub async fn run_consumer_task(
                 m.last_known_chain_head = chain_head;
                 let lag = m.indexer_lag_blocks();
                 drop(m);
-                // emit indexer_lag_blocks gauge so
-                // operators can alert on stale indexers from
-                // /metrics. The gauge is process-global; the
-                // HTTP layer's /v1/status endpoint can read the
-                // same `metrics` struct via the orchestrator
-                // handle when wired in V2.
                 #[allow(clippy::cast_precision_loss)]
                 let lag_f64 = lag as f64;
                 #[allow(clippy::cast_precision_loss)]
@@ -931,19 +894,10 @@ pub async fn run_consumer_task(
                 continue;
             }
             ConsumerEvent::Shutdown => {
-                // Final-drive-on-shutdown: on shutdown, force a
-                // final `drive_commit` so any dirty shards land
-                // on disk + the manifest reflects the latest
-                // applied block_height. The persistence layer's
-                // per-WAL-append fsync already protects committed
-                // events; the final commit additionally re-encodes
-                // any dirty shards and bumps the snapshot, so the
-                // next cold-start has a fresh restore point with
-                // no stale WAL replay.
-                // Use the last applied-leaf block (NOT chain head): the
-                // resume floor reads this value, so committing the chain tip
-                // here would skip any leaf that lagged the head and wedge the
-                // tree on restart.
+                // Final commit flushes dirty shards so cold-start needs no WAL replay.
+                // Height MUST be the last applied-leaf block, not chain head: the
+                // resume floor reads it, and committing the tip would skip a
+                // lagging leaf and wedge the tree on restart.
                 let final_height = {
                     let m = metrics.lock();
                     m.last_applied_leaf_block
@@ -1135,9 +1089,8 @@ fn drive_commit(
 
     if dirty.is_empty() {
         let snapshot_state = instance.current_state();
-        // Snapshot the LogicalLeafStore under-lock so the embedded V6 body
-        // is consistent with the InspireServerState captured above; release
-        // the lock before fsync work.
+        // Snapshot the store under-lock so it stays consistent with the state
+        // captured above; release before fsync.
         let store_snapshot = {
             let s = logical_store.lock();
             s.clone()
@@ -1151,9 +1104,8 @@ fn drive_commit(
         return Ok(());
     }
 
-    // Take an `Arc<EncodedDatabase>` from the donor state. `Arc::make_mut`
-    // below triggers a Vec memcpy IFF other Arcs are alive (e.g. an in-flight
-    // query holding the donor); bounded to once per drive_commit batch.
+    // `Arc::make_mut` below copies only if another Arc is live (e.g. an
+    // in-flight query holds the donor); at most once per drive_commit.
     let current = instance.current_state();
     let entries_per_shard = u32::try_from(
         current
@@ -1185,13 +1137,10 @@ fn drive_commit(
                 shard_id: oor_id,
                 db_shard_count,
             }) => {
-                // Structurally unencodable: the shard id is past the
-                // EncodedDatabase shard count for this instance. Drop it
-                // from `dirty_shards` to break the retry loop that would
-                // otherwise bump `consumer_errors` once per commit cadence
-                // trigger forever. Cardinality-bounded metric: only the
-                // `instance` label is dim'd; per-shard forensic detail is
-                // preserved in the tracing line below.
+                // Shard id past the EncodedDatabase end is unencodable: drop it
+                // from `dirty_shards` to break the per-cadence retry loop.
+                // Metric carries only `instance` (bounded cardinality); per-shard
+                // detail goes to the tracing line.
                 let removed = logical_store.lock().drop_dirty_shard(oor_id);
                 if removed {
                     tracing::error!(
@@ -1226,10 +1175,8 @@ fn drive_commit(
     instance.swap_state(new_state, next_epoch);
 
     let snapshot_state = instance.current_state();
-    // V6 commit carries the in-memory LogicalLeafStore alongside the
-    // InspireServerState so the next open path can restore both atomically.
-    // Snapshot the store under-lock (dirty-shards already drained into the
-    // new EncodedDatabase above) before clearing the dirty set.
+    // Snapshot the store under-lock so it restores atomically with the state;
+    // dirty shards are already drained into the new EncodedDatabase above.
     let store_snapshot = {
         let s = logical_store.lock();
         s.clone()
@@ -1364,8 +1311,7 @@ mod tests {
         assert_eq!(recovered.variant, state.variant);
     }
 
-    /// Regression: pre-fix V1 skipped seq-0 events on fresh-bootstrap
-    /// replay; V2 replays from seq 0 inclusive.
+    /// Regression: fresh-bootstrap replay must include seq 0 inclusive.
     #[test]
     fn fresh_bootstrap_seq0_event_survives_drop_and_reopen() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1421,8 +1367,7 @@ mod tests {
         );
     }
 
-    /// Regression: invalid WAL entries (sparse `AppendLeaf` → `InvalidQuery`) must
-    /// soft-skip on replay; valid entries still land in the recovered store.
+    /// Regression: invalid WAL entries soft-skip on replay; valid ones land.
     #[test]
     fn poisoned_wal_is_tolerantly_replayed_with_soft_skip() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1553,13 +1498,9 @@ mod tests {
             "fresh open() must register TYPE metadata at module init; got render:\n{rendered}"
         );
     }
-    // The poisoned-WAL counter-increment assertion lives in its own
-    // integration-test binary at
-    // `engine/tests/poisoned_wal_replay_counter.rs`. Running it as a
-    // standalone binary gives the test a fresh process + a fresh
-    // first-time `metrics_exporter_prometheus::PrometheusBuilder::install_recorder`
-    // call, free of cross-test rendering races against the lib-test
-    // binary's shared `OnceLock`-cached Prometheus handle.
+    // The poisoned-WAL counter-increment assertion runs in its own
+    // integration-test binary so it gets a fresh process for the one-time
+    // Prometheus recorder install, free of cross-test rendering races.
 
     #[test]
     fn apply_event_increments_seq_and_triggers_when_cap_reached() {
@@ -1804,7 +1745,7 @@ mod tests {
         assert_eq!(opened.persistence.wal_next_seq(), 1);
     }
 
-    /// Regression (fix #3): non-empty WAL with no manifest must be refused.
+    /// Regression: non-empty WAL with no manifest must be refused.
     #[test]
     fn fresh_bootstrap_refuses_wal_ghost() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1879,17 +1820,6 @@ mod tests {
         .expect_err("mismatch should reject");
         assert!(matches!(err, AdapterError::Internal(_)));
     }
-
-    // ---------------------------------------------------------------
-    // ShardOutOfRange producer + consumer wiring
-    //
-    // `re_encode_shard` must surface a typed `ShardOutOfRange` so
-    // `drive_commit` can drop the shard from `dirty_shards` (otherwise
-    // every commit cadence retries the structurally-bad id forever and
-    // bumps `consumer_errors`). The emitted metric carries only the
-    // `instance` label (bounded cardinality); per-shard forensic detail
-    // lives in the tracing log, not the metric label set.
-    // ---------------------------------------------------------------
 
     type UnsatShardFixtures = (
         Arc<crate::PirInstance<crate::inspire::RavenInspireScheme>>,
@@ -1972,16 +1902,9 @@ mod tests {
 
     #[test]
     fn unsatisfiable_shard_metric_increments_per_drop_with_bounded_cardinality() {
-        // Thread-local `DebuggingRecorder` avoids racing the process-
-        // global Prometheus handle that sibling tests install. The
-        // recorder is per-thread + scoped to the closure body; the
-        // emit shape under test is independent of which recorder runs.
-        //
-        // The metric MUST carry only the `instance` label. The
-        // pre-fix emission embedded `shard_id => oor_id.to_string()`,
-        // which under repeated encoder mismatch would retain one
-        // Prometheus series per (instance, shard_id) tuple forever.
-        // Per-shard forensic detail lives in the tracing log.
+        // Thread-local recorder avoids racing the process-global Prometheus
+        // handle sibling tests install. The metric MUST carry only the
+        // `instance` label; a `shard_id` label would leak one series per id.
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
@@ -2044,19 +1967,9 @@ mod tests {
 
     #[test]
     fn unsatisfiable_shard_metric_cardinality_bounded_across_distinct_shard_ids() {
-        // Drive 32 commits, each inserting a fresh out-of-range shard id
-        // (base, base+1, ..., base+31). The load-bearing cardinality
-        // invariant: across all 32 distinct shard ids, the recorder
-        // exposes EXACTLY ONE counter slot keyed on `(instance,)`.
-        // Pre-fix the producer was `Internal(...)` and never reached the
-        // counter emit; an even-earlier shape carried `shard_id` as a
-        // label, which would have produced 32 distinct (instance,
-        // shard_id) tuples and a classical cardinality leak.
-        //
-        // The exact total value across 32 emits is a property of the
-        // recorder's accumulator semantics, not the production-code
-        // invariant under test. The per-drop counter total is locked
-        // separately by `unsatisfiable_shard_metric_increments_per_drop_*`.
+        // 32 commits each dropping a distinct out-of-range shard id must yield
+        // EXACTLY ONE counter series keyed on `(instance,)`; a `shard_id` label
+        // would produce 32 series (cardinality leak).
         use metrics_util::debugging::DebuggingRecorder;
 
         let recorder = DebuggingRecorder::new();
@@ -2132,12 +2045,8 @@ mod tests {
             .dirty_shards_mut_for_test()
             .insert(unsat_id);
 
-        // 100 successive commits: the first drops the shard; every
-        // subsequent commit walks the (now empty) dirty set and produces
-        // 0 errors. The contract is "drive_commit returns Ok after the
-        // first drop and consumer_errors does not accumulate". Pre-fix
-        // (Internal variant) every commit returned Err and the consumer
-        // task would have bumped `consumer_errors` once per cadence.
+        // First commit drops the shard; the remaining 99 walk an empty dirty
+        // set and must accumulate 0 consumer_errors.
         for height in 0..100u64 {
             super::drive_commit(
                 &instance,

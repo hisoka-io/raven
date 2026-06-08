@@ -28,8 +28,6 @@ const LAST_MODIFIED_HEADER: HeaderName = HeaderName::from_static("last-modified"
 /// Hex-encoded 32-byte blob. No `0x` prefix (matches Railgun upstream).
 type HexHash = String;
 
-// Wallet-facing routes
-
 /// Body for `POST /v1/poi/pois-per-list`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -223,8 +221,6 @@ pub(crate) async fn commit_tree_proof_handler<S: PirScheme>(
         .unwrap_or_default();
     Ok(Json(MerkleProofJson::from_core(&proof, leaf_hex)))
 }
-
-// Publishing channels
 
 /// JSON shape returned by `GET /v1/poi/:list_key_hex/bc-to-idx-map`.
 #[derive(Debug, Clone, Serialize)]

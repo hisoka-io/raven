@@ -27,7 +27,7 @@ pub struct InstanceStatus {
     pub id: String,
     /// Current snapshot epoch.
     pub epoch: u64,
-    /// `"static"`, `"live"`, or `"sidecar"` — observational only, does not affect routing.
+    /// `"static"`, `"live"`, or `"sidecar"`; observational only, does not affect routing.
     pub role: String,
     /// `"active"`, `"draining"`, or `"drained"`. Routing MUST reject non-`"active"` instances.
     pub drain_state: String,
@@ -62,12 +62,8 @@ pub(crate) async fn status_handler<S: PirScheme>(
     Json(build_status_response(&app))
 }
 
-/// Build a snapshot of the operator-observable engine state.
-///
-/// Shared by [`status_handler`] (legacy `/v1/status` JSON endpoint) and
-/// `events_handler` (`/v1/events` SSE stream). Pure function over the
-/// existing [`AppState`]; performs no I/O beyond a brief
-/// `parking_lot::Mutex` snapshot of consumer metrics.
+/// Snapshot of operator-observable engine state, shared by the `/v1/status`
+/// JSON endpoint and the `/v1/events` SSE stream.
 pub(crate) fn build_status_response<S: PirScheme>(app: &AppState<S>) -> StatusResponse {
     let fallback_k = u32::try_from(app.config.max_concurrent_queries.max(1)).unwrap_or(u32::MAX);
     let instances = app
@@ -118,21 +114,9 @@ pub(crate) async fn metrics_handler<S: raven_railgun_engine::PirScheme>(
     )
 }
 
-/// Emit per-scrape gauges so dashboards see live values, not just the
-/// HELP/TYPE registered at `AppState::new`. Walks both:
-///
-/// * `app.engine.instances()` — per-instance liveness gauges
-///   (`drain_state`, `in_flight`, `epoch`, `role`) read directly from
-///   the engine `PirInstance` snapshot. These do not depend on the
-///   per-instance `ConsumerMetrics` map being populated.
-/// * `app.instance_metrics` — per-instance `ConsumerMetrics` gauges
-///   (`consumer_*`) when the multi-instance map is wired.
-///
-/// When `instance_metrics` is empty (legacy single-cell deployments
-/// that wire only `with_consumer_metrics`) the consumer fields fall
-/// back to the single-cell value labelled with the FIRST engine
-/// instance's id. Cardinality is bounded by the configured instance
-/// count; no user input feeds any label.
+/// Emit per-scrape gauge values (the HELP/TYPE are registered once at
+/// `AppState::new`). When `instance_metrics` is empty the consumer fields fall
+/// back to the single cell, labelled with the first instance's id.
 fn refresh_dynamic_metrics<S: raven_railgun_engine::PirScheme>(app: &AppState<S>) {
     use std::time::Instant;
     let uptime_secs = Instant::now()
@@ -142,9 +126,7 @@ fn refresh_dynamic_metrics<S: raven_railgun_engine::PirScheme>(app: &AppState<S>
     let uptime_f = uptime_secs as f64;
     metrics::gauge!("raven_railgun_uptime_seconds").set(uptime_f);
 
-    // Process-global sticky-session count + semaphore capacity. Single
-    // cell each; no per-instance label because the underlying state is
-    // process-global.
+    // Process-global, so no per-instance label.
     #[allow(clippy::cast_precision_loss)]
     let sessions_active = app.sessions.len() as f64;
     metrics::gauge!("raven_railgun_sessions_active").set(sessions_active);
@@ -157,19 +139,13 @@ fn refresh_dynamic_metrics<S: raven_railgun_engine::PirScheme>(app: &AppState<S>
         let instance_id = instance.id.as_str().to_owned();
         emit_per_instance_engine_gauges(&instance_id, instance);
 
-        // Per-instance `ConsumerMetrics` from the wired map when present.
-        // The HashMap lookup is keyed on `InstanceId` (the same value
-        // `instance.id` carries); cheap clone for the lookup key.
         if let Some(consumer) = app.instance_metrics.get(&instance.id) {
             let snap = *consumer.lock();
             emit_instance_consumer_gauges(&instance_id, &snap);
         }
     }
 
-    // Legacy single-cell `consumer_metrics` fallback: if the per-
-    // instance map is empty AND a single-cell handle is wired, label
-    // it with the FIRST instance's id so dashboards still surface
-    // a per-instance series under single-instance deployments.
+    // Single-cell fallback: label it with the first instance's id.
     if app.instance_metrics.is_empty() {
         if let Some(cell) = app.consumer_metrics.as_ref().as_ref() {
             if let Some(first) = instances.first() {

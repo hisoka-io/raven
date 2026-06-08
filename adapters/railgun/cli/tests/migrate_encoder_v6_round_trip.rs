@@ -1,25 +1,6 @@
-//! Regression guard: the offline `migrate-encoder` tool must read AND write
-//! through the V6 codec so the `LogicalLeafStore` embedded in the snapshot
-//! survives the encoder swap.
-//!
-//! The pre-fix path used `restore_inspire_state` (V5-only) on the reader
-//! side, which cannot strip the `SNAPSHOT_V6_MAGIC` prefix that
-//! `commit_v6` writes — every post-V6 snapshot would fail to decode (or,
-//! if the engine somehow handed back a V5 blob, the store rebuilt from
-//! WAL replay would START from `LogicalLeafStore::default()`, dropping
-//! the historical leaves already archived past the snapshot floor). The
-//! writer side used `snapshot_inspire_state` (V5) while stamping
-//! `schema_version: 6` on the manifest — successful migration would
-//! produce an internally inconsistent (V6 manifest, V5 body, no
-//! embedded store) data dir.
-//!
-//! This test pre-populates the V6 snapshot with 5 leaves, runs
-//! `migrate_encoder::run` end-to-end on a fresh encoder kind, reopens
-//! with the new encoder, and asserts the per-tree IMT still carries
-//! the original 5 leaves. The pre-fix path fails immediately at the
-//! reader (V6 magic confuses the V5 bincode decoder), or — under any
-//! scenario where the V5 fallback fires — fails at the post-reopen
-//! assertion because the embedded store is gone.
+//! `migrate-encoder` must read AND write through the V6 codec so the
+//! embedded `LogicalLeafStore` survives the encoder swap; a V5-only reader
+//! or writer drops the store and corrupts the manifest/body version pairing.
 
 #![allow(
     clippy::expect_used,
@@ -66,8 +47,6 @@ fn migrate_encoder_round_trip_preserves_logical_leaf_store() {
         "migrate-encoder requires distinct labels; test fixture invariant"
     );
 
-    // Phase 1: open fresh persistence with the FROM encoder; commit a V6
-    // snapshot embedding a `LogicalLeafStore` with 5 leaves.
     let from_encoder = encoder_for(from_kind);
     let instance = InstanceId::new("migrate-roundtrip-inst");
 
@@ -115,18 +94,8 @@ fn migrate_encoder_round_trip_preserves_logical_leaf_store() {
         .expect("commit_v6");
     drop(opened);
 
-    // Phase 2: run the offline migrator. The pre-fix path reads via V5,
-    // which either fails to decode the V6 magic bytes OR — in a synthetic
-    // scenario where the V5 fallback fires — drops the embedded store
-    // and writes back V5 bytes under a V6 manifest. The post-fix path
-    // reads via V6 (recovering the embedded store) and writes back V6
-    // with the rebuilt store.
     raven_railgun_cli::migrate_encoder::run(dir.path(), to_kind).expect("migrate-encoder run");
 
-    // Phase 3: reopen with the TO encoder. The recovered logical store
-    // must still carry the 5 leaves. If migrate-encoder dropped the
-    // embedded store at write time, `imt_leaf_count_for(TREE_NUMBER)`
-    // would be 0 here.
     let to_encoder = encoder_for(to_kind);
     let layout2 = StoreLayout::open(dir.path()).expect("reopen layout");
     let reopened = InspirePersistence::open(

@@ -128,8 +128,6 @@ pub enum BootstrapError {
         observed_hex: String,
         /// Index in the leaf sequence at which the rebuilt IMT first
         /// matched the target root (or `leaves.len()` if no match).
-        /// Renamed from `divergence_leaf_index` to reflect the
-        /// post-insert search semantics.
         first_match_index: usize,
     },
     #[error("data_dir lock held: {path}")]
@@ -1380,9 +1378,6 @@ const SUBSQUID_COMMITMENTS_QUERY: &str =
     ) { treePosition hash blockNumber } \
 }";
 
-// Subsquid is leaves-only. The chain ABI (`merkleRoot()` /
-// `rootHistory(tree, root)`) is the canonical post-state oracle.
-
 #[async_trait]
 impl SubsquidLeavesSource for SubsquidLeavesClient {
     #[allow(clippy::too_many_lines)]
@@ -1393,10 +1388,7 @@ impl SubsquidLeavesSource for SubsquidLeavesClient {
         cursor: Option<u64>,
         page_size: usize,
     ) -> Result<Vec<CommitmentRow>, BootstrapError> {
-        // First-page cursor sentinel `-1` so the `treePosition_gt`
-        // filter includes leaf 0. Subsequent pages use the last
-        // `treePosition` from the previous page. `treePosition` is
-        // `Int!` upstream so we send it as a JSON integer.
+        // `-1` sentinel so `treePosition_gt` includes leaf 0; upstream `treePosition` is `Int!`.
         let cursor_value: i64 = match cursor {
             Some(c) => i64::try_from(c).unwrap_or(i64::MAX),
             None => -1,

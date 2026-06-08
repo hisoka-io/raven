@@ -4,33 +4,13 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
-//! Byte-identity determinism KAT.
+//! Byte-identity determinism KAT: each `tests/fixtures/` file pins inputs to a
+//! fixed `(query, response, recovered)` triple, so any divergence flags a
+//! regression in seeding, bincode layout, HKDF label, sampler, matmul, or rounding.
 //!
-//! Each fixture file under `tests/fixtures/` pins an `(a_seed,
-//! rng_seed, db, target_idx)` tuple to a specific
-//! `(query_bytes, response_bytes, recovered)` triple. A second
-//! run of Raven against the same inputs must produce
-//! byte-identical outputs; any divergence indicates a regression
-//! (accidental change to ChaCha20 seeding, bincode layout, HKDF
-//! label, Gaussian sampler, matmul order, or rounding formula).
-//!
-//! The fixtures lock *Raven's own wire bytes*; they are NOT
-//! byte-identical to the Go `simplepir/` reference because Raven
-//! uses the paper-verbatim Extract formulation (no DB + p/2 shift,
-//! no offset correction) plus HKDF + ChaCha20 for the A-matrix
-//! derivation. See `UPSTREAM.md §kat-go scope` for the deferred
-//! cross-language KAT.
-//!
-//! ## Regenerating fixtures
-//!
-//! If a deliberate wire-format change lands, regenerate fixtures:
-//!
-//! ```bash
-//! cargo test --release --test kat_fixtures -- --ignored update_fixtures
-//! ```
-//!
-//! The regeneration test writes the fixture files in place and is
-//! marked `#[ignore]` so CI does not overwrite them.
+//! These lock Raven's own wire bytes, NOT the Go `simplepir/` reference: Raven uses
+//! the paper-verbatim Extract (no DB + p/2 shift) plus HKDF + ChaCha20 A-derivation.
+//! See `UPSTREAM.md §kat-go scope` for the deferred cross-language KAT.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,29 +25,15 @@ use raven_isimplepir::{
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Fixture {
-    /// Human-readable label (informational; not used for keying).
     label: String,
-    /// Scheme parameters for this fixture. Toy cells are
-    /// intentional: small `n`, `l`, `m` keep the fixture file
-    /// small and the test fast while still exercising every hot
-    /// path (A derivation, Gaussian sampling, matmul, rounding).
     params: LweParams,
-    /// 32-byte hex-encoded master seed for the A matrix.
     a_seed_hex: String,
-    /// 32-byte hex-encoded ChaCha20 seed for client-side LWE
-    /// secret + Gaussian sampling.
     rng_seed_hex: String,
-    /// Plaintext database laid out `l * m` row-major, each
-    /// element in `[0, p)`.
+    /// `l * m` row-major plaintext, each element in `[0, p)`.
     db_u32: Vec<u32>,
-    /// Target linear index for the query (row-major).
     target_idx: usize,
-    /// Expected bincode-serialized `ClientQuery` as hex.
     expected_query_bincode_hex: String,
-    /// Expected bincode-serialized `ServerResponse` as hex.
     expected_response_bincode_hex: String,
-    /// Expected recovered plaintext element (must equal
-    /// `db_u32[target_idx]`).
     expected_recovered: u32,
 }
 
@@ -83,8 +49,6 @@ fn hex_to_seed(hex_str: &str) -> [u8; SEED_BYTES] {
     out
 }
 
-/// Replay a fixture end-to-end and return the observed bytes +
-/// recovered plaintext.
 fn replay(fx: &Fixture) -> (String, String, u32) {
     let a_seed = hex_to_seed(&fx.a_seed_hex);
     let rng_seed = hex_to_seed(&fx.rng_seed_hex);
@@ -108,14 +72,8 @@ fn replay(fx: &Fixture) -> (String, String, u32) {
     (hex::encode(q_bytes), hex::encode(r_bytes), recovered)
 }
 
-/// The set of fixtures exercised by the KAT test. Edit this list
-/// when a new fixture is added; the regeneration helper iterates
-/// over the same list.
-///
-/// Toy params live in code so the fixture JSON can be regenerated
-/// deterministically if bincode layout changes. The DB and seeds
-/// are also in code for the same reason. The fixture file only
-/// locks the *output* bytes.
+// Inputs live in code so fixtures regenerate deterministically; the JSON only
+// locks the output bytes.
 fn fixture_spec_toy_4x4_p991() -> Fixture {
     let params = LweParams {
         n: 128,
@@ -135,8 +93,7 @@ fn fixture_spec_toy_4x4_p991() -> Fixture {
         rng_seed_hex: "07".repeat(SEED_BYTES),
         db_u32: db,
         target_idx: 6,
-        // Placeholders; overwritten by regeneration + compared
-        // against the committed fixture on assertion.
+        // filled by regeneration; the committed fixture holds the asserted bytes.
         expected_query_bincode_hex: String::new(),
         expected_response_bincode_hex: String::new(),
         expected_recovered: 0,
@@ -213,7 +170,6 @@ fn kat_toy_4x4_p991_byte_identity() {
         recovered, committed.expected_recovered,
         "recovered plaintext diverged"
     );
-    // Sanity: recovered must equal the planted value.
     assert_eq!(
         recovered, committed.db_u32[committed.target_idx],
         "recovered plaintext does not match planted value"
@@ -236,14 +192,8 @@ fn kat_toy_8x8_p701_byte_identity() {
     assert_eq!(recovered, committed.db_u32[committed.target_idx]);
 }
 
-/// Regenerate every fixture in `all_fixture_specs()` in place.
-///
-/// Marked `#[ignore]` so CI does not overwrite committed fixtures.
-/// Run manually when a deliberate wire-format change lands:
-///
-/// ```bash
-/// cargo test --release --test kat_fixtures -- --ignored update_fixtures
-/// ```
+/// Regenerate every fixture in place after an intentional wire-format change:
+/// `cargo test --release --test kat_fixtures -- --ignored update_fixtures`.
 #[test]
 #[ignore = "writes files; run manually after intentional wire-format changes"]
 #[allow(clippy::print_stdout)]
@@ -261,11 +211,8 @@ fn update_fixtures() {
     }
 }
 
-/// Sanity: enumerate every spec at test-collection time, confirm
-/// its committed fixture file exists on disk. Prevents the case
-/// where `all_fixture_specs` gets a new entry but the regenerator
-/// wasn't run. The byte-identity test would otherwise silently
-/// skip the missing fixture.
+/// Every registered spec must have a committed fixture; otherwise a new entry
+/// would silently skip the byte-identity check.
 #[test]
 fn all_specs_have_committed_fixtures() {
     for (name, _spec) in all_fixture_specs() {
@@ -290,24 +237,18 @@ fn all_specs_have_committed_fixtures() {
     }
 }
 
-// ---------- RowUpdate byte-identity KAT ----------
-
-/// Fixture for the paper Fig. 2 row-aggregation delta shape
-/// `β_edit = (i, u'_i, k)`. Locks the bincode wire bytes for a
-/// `RowUpdate` emitted against a known DB + known edit list so any
-/// future change to `u'_i` computation order, bincode layout, or
-/// version-k numbering surfaces as a byte-mismatch.
+/// Locks the `RowUpdate` wire bytes for the paper Fig. 2 row-aggregation delta
+/// `β_edit = (i, u'_i, k)` so any change to `u'_i` order, bincode layout, or
+/// version numbering surfaces as a byte mismatch.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RowUpdateFixture {
     label: String,
     params: LweParams,
     a_seed_hex: String,
     db_u32: Vec<u32>,
-    /// Single row targeted by the aggregated modifications.
     target_row: usize,
-    /// List of `(col, new_value)` edits applied in order.
+    /// `(col, new_value)` edits applied in order.
     edits: Vec<(usize, u32)>,
-    /// Expected bincode-serialized `RowUpdate` as hex.
     expected_row_update_bincode_hex: String,
 }
 
@@ -375,10 +316,7 @@ fn kat_row_update_toy_4x4_p991_byte_identity() {
     );
 }
 
-/// Extends the primary `update_fixtures` helper with row-update
-/// fixtures. Marked `#[ignore]` so CI never overwrites committed
-/// bytes. Run alongside `update_fixtures` whenever a wire-format
-/// change lands.
+/// Row-update counterpart to `update_fixtures`; run alongside it on a wire change.
 #[test]
 #[ignore = "writes files; run manually after intentional wire-format changes"]
 #[allow(clippy::print_stdout)]

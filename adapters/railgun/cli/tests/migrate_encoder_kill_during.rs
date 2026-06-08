@@ -294,8 +294,6 @@ fn snapshot_bytes(dir_path: &Path, id: SnapshotId) -> Vec<u8> {
     snap.data
 }
 
-// Scenario 1: SIGKILL after pre-migration snapshot, before re-encode.
-
 #[test]
 #[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn kill_during_after_pre_snapshot_before_re_encode_recovers_via_old_encoder_and_resumes() {
@@ -306,11 +304,10 @@ fn kill_during_after_pre_snapshot_before_re_encode_recovers_via_old_encoder_and_
     let pre_snap_bytes = snapshot_bytes(dir.path(), manifest_pre.current_snapshot_id);
     let pre_manifest_raw = manifest_bytes(dir.path());
 
-    // SIGKILL simulation: re-encode in memory, drop before any disk write.
+    // simulate crash: re-encode in memory, drop before any disk write
     {
         let mut prep = prepare_migration(dir.path(), EncoderKind::PerNode { tree_number: 0 });
         re_encode_all_shards(&mut prep);
-        // SIGKILL: drop without save_re_encoded_snapshot / bump_manifest.
     }
 
     let manifest_post_crash = read_manifest(dir.path());
@@ -386,8 +383,6 @@ fn kill_during_after_pre_snapshot_before_re_encode_recovers_via_old_encoder_and_
     );
 }
 
-// Scenario 2: SIGKILL after re-encode + snapshot save, before manifest bump.
-
 #[test]
 #[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn kill_during_after_re_encode_before_manifest_bump_recovers_idempotently() {
@@ -402,7 +397,7 @@ fn kill_during_after_re_encode_before_manifest_bump_recovers_idempotently() {
         let mut prep = prepare_migration(dir.path(), EncoderKind::PerNode { tree_number: 0 });
         re_encode_all_shards(&mut prep);
         staged_id = save_re_encoded_snapshot(&prep);
-        // SIGKILL: drop without bump_manifest.
+        // crash: drop before bump_manifest
     }
 
     let manifest_post_crash = read_manifest(dir.path());
@@ -444,8 +439,7 @@ fn kill_during_after_re_encode_before_manifest_bump_recovers_idempotently() {
         snapshot_bytes(dir.path(), manifest_resumed_a.current_snapshot_id);
     let manifest_after_first_resume = manifest_bytes(dir.path());
 
-    // Confirm snapshot byte-stability: save-only operations must not change
-    // the live manifest or the snapshot bytes at the live id.
+    // save-only operations must not touch the live manifest or live-id snapshot bytes
     {
         let prep = prepare_migration(dir.path(), EncoderKind::PerLeafBc);
         let mut prep_mut = prep;
@@ -484,9 +478,6 @@ fn kill_during_after_re_encode_before_manifest_bump_recovers_idempotently() {
         manifest_pre.current_snapshot_id.next()
     );
 }
-
-// Scenario 3: idempotency — subsequent migration attempts must be rejected
-// and must not mutate the on-disk byte-state.
 
 #[test]
 #[ignore = "slow: cold-start PIR keygen; run with --ignored"]
@@ -529,9 +520,6 @@ fn migration_repeated_three_times_on_same_data_dir_is_byte_identical() {
         );
     }
 }
-
-// Per-list-node migration: seed PerListPathEncoder, migrate to PerListNodeEncoder,
-// assert per-row byte identity at levels 0, 1, and 8.
 
 #[test]
 #[ignore = "slow: cold-start PIR keygen; run with --ignored"]
@@ -580,17 +568,13 @@ fn per_list_node_migration_byte_identity_at_levels_0_1_8() {
         manifest_pre.current_snapshot_id.next()
     );
 
-    // Build both encoders against the oracle store + assert byte-row
-    // parity at levels 0, 1, and 8 of the per-list IMT. PerListNode uses
-    // the same flat-global-index layout as PerNode (leaves first, then
-    // level-1 nodes, ..., to root), so the level-k row at index `idx_at_level`
-    // sits at flat index `flat_index(level, idx_at_level)`.
+    // PerListNode uses the same flat-global-index layout as PerNode (leaves first,
+    // then level-1 nodes, ..., root)
     let path_enc = PerListPathEncoder::new(PATH_RECORD_BYTES, ENTRIES_PER_SHARD, LIST_KEY_OFAC)
         .expect("path encoder");
     let node_enc = PerListNodeEncoder::new(ENTRIES_PER_SHARD, LIST_KEY_OFAC).expect("node encoder");
 
-    // Byte-identity 1: PerListNode rows at level 0 (first 32 rows of
-    // shard 0) reconstruct the seeded leaves byte-for-byte.
+    // level-0 PerListNode rows must reconstruct the seeded leaf hashes
     let node_shard0 = node_enc.materialize_shard(0, &store_oracle);
     for leaf_idx in 0u32..32 {
         let row_byte_start = (leaf_idx as usize) * 32;
@@ -604,9 +588,7 @@ fn per_list_node_migration_byte_identity_at_levels_0_1_8() {
         );
     }
 
-    // Byte-identity 2: PerListPath sibling at level 0 (path row 0,
-    // first 32 bytes) equals the PerListNode row for that sibling
-    // (level 0, idx XOR 1).
+    // a path row's level-0 sibling must equal the PerListNode row at idx^1
     let path_shard0 = path_enc.materialize_shard(0, &store_oracle);
     for leaf_idx in 0usize..16 {
         let path_row_start = leaf_idx * PATH_RECORD_BYTES;
@@ -624,10 +606,7 @@ fn per_list_node_migration_byte_identity_at_levels_0_1_8() {
         );
     }
 
-    // Byte-identity 3: at level 1, the path-row level-1 sibling slice
-    // (bytes [32, 64) of the path row) must equal the per-list-node row
-    // at flat_index(1, sibling_idx_at_level_1). For leaf_idx=0, the
-    // level-1 idx is 0 and the sibling at level 1 is 1.
+    // the path-row level-1 sibling (bytes [32,64)) must equal IMT.node(1, sibling_idx)
     for leaf_idx in 0u32..16 {
         let path_row_start = (leaf_idx as usize) * PATH_RECORD_BYTES;
         let path_sibling_l1 = path_shard0
@@ -643,15 +622,7 @@ fn per_list_node_migration_byte_identity_at_levels_0_1_8() {
         );
     }
 
-    // Byte-identity 4: at level 8, every level-8 row from per-list-node
-    // matches the IMT oracle's `node(8, idx)`. The level-8 nodes start
-    // at flat index `(2^17 - 1) - (2^9 - 1) = 130560` (sum of levels 0..7
-    // = 2^17 - 2^9). Use PerListNode's flat-index symmetry with
-    // PerNodeEncoder by querying via the IMT directly.
-    //
-    // Level-8 has 2^8 = 256 nodes; first 32 leaves only populate
-    // node(8, 0). Verify nodes at level 8 are non-zero where data exists
-    // and zero past it.
+    // 32 seeded leaves populate only node(8, 0); it must hash non-zero
     let level8_idx_zero = imt_oracle.node(8, 0);
     assert_ne!(
         level8_idx_zero, [0u8; 32],

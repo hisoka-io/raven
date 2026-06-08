@@ -28,7 +28,7 @@ const ENTRIES_LOG2: usize = 16;
 const ENTRY_BYTES: usize = 512;
 const NUM_INSTANCES: usize = 6;
 const K_PER_INSTANCE: usize = 4;
-const TOTAL_QUERIES: usize = 240; // shorter than the throughput bench: 40/instance
+const TOTAL_QUERIES: usize = 240;
 const SEEDS: usize = 3;
 
 fn median_dur(values: &mut [Duration]) -> Duration {
@@ -201,8 +201,6 @@ fn multi_instance_bottleneck_probe() {
 
     let entries = 1u64 << ENTRIES_LOG2;
 
-    // Build a fixed query corpus: TOTAL_QUERIES queries spread evenly
-    // across instances by k % NUM_INSTANCES (deterministic per index).
     let mut multi_queries: Vec<(usize, raven_inspire::SeededClientQuery)> =
         Vec::with_capacity(TOTAL_QUERIES);
     for k in 0..TOTAL_QUERIES as u64 {
@@ -234,8 +232,6 @@ fn multi_instance_bottleneck_probe() {
 
     let single_pools_dummy: Vec<Arc<rayon::ThreadPool>> = vec![Arc::clone(&dedicated_pools[0])];
 
-    // We can't easily box closures with different captured borrows
-    // without lifetime gymnastics; run sequentially in a fixed order.
     type ConfigFn<'a> = Box<dyn Fn() -> DispatchStats + 'a>;
     let configs: Vec<(&str, ConfigFn<'_>)> = vec![
         (

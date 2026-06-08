@@ -1,13 +1,4 @@
-/**
- * Unit tests for the SDK's exported helper primitives.
- *
- * These are the building blocks the privacy-invariant harness uses
- * (`hexToBytes`, `bytesToHex`, `containsByteSequence`,
- * `decodeClientPirQueryBundle`, `statusByteToPOIStatus`). Locking
- * their behavior with focused unit tests means a regression in the
- * helper layer surfaces here, not as a confusing failure deep in a
- * privacy-invariant assertion.
- */
+/** Unit tests for the SDK's exported helper primitives. */
 
 import { describe, expect, it } from "vitest";
 
@@ -128,7 +119,6 @@ describe("decodeClientPirQueryBundle round-trip", () => {
   });
 
   it("decodes a small state + query bundle", () => {
-    // state = [1, 2, 3, 4]; query = [5, 6, 7, 8, 9, 10].
     const state = new Uint8Array([1, 2, 3, 4]);
     const query = new Uint8Array([5, 6, 7, 8, 9, 10]);
     const buf = new Uint8Array(8 + state.length + 8 + query.length);
@@ -150,9 +140,8 @@ describe("decodeClientPirQueryBundle round-trip", () => {
     new DataView(buf.buffer).setUint32(8 + state.length, query.length, true);
     buf.set(query, 8 + state.length + 8);
     const bundle = decodeClientPirQueryBundle(buf);
-    // Mutate the source after decode.
     buf.fill(0xff);
-    // The decoded slices must NOT see the mutation.
+    // decoded slices are copies, unaffected by the source mutation
     expect(bundle.clientStateBincode[0]).toBe(1);
     expect(bundle.queryBytes[0]).toBe(5);
   });

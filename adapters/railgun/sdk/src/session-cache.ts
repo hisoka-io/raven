@@ -1,31 +1,8 @@
-/**
- * Session-blob cache for the WASM `ClientSession`.
- *
- * Backs the warm-cache path that closes the ~12.6 s
- * `build_client_session` cold start at production-cell d=2048.
- * The session blob is keyed by `(instanceId, sha256(crsBincode))`
- * so a CRS rotation auto-invalidates every cached entry without
- * an explicit clear step.
- *
- * Browser path: `window.indexedDB`.
- * Node.js path: in-memory `Map<string, Uint8Array>` fallback (vitest
- * + node test environments do not expose IndexedDB).
- *
- * Storage shape (chunked + integrity-verified):
- *   - `${key}#chunk-i` for i in [0, chunkCount) holds up to
- *     `CHUNK_SIZE` bytes; the last chunk may be shorter.
- *   - `${key}#meta` holds JSON-serialized
- *     `{ chunkCount, totalLen, sha256 }`.
- *   The single readwrite IDB transaction wrapping every put makes
- *   the chunk + meta set atomic per IndexedDB semantics. On read,
- *   any missing chunk, length mismatch, or SHA-256 mismatch evicts
- *   the entry and degrades to a cache miss so the cold path
- *   produces a fresh, verified entry.
- *
- * Migration: pre-chunked entries from the prior single-blob layout
- * have no `${key}#meta` record and are treated as misses; the cold
- * path overwrites them on next put. No online migration is run.
- */
+// WASM ClientSession blob cache. Keyed by (instanceId, sha256(crsBincode)) so a
+// CRS rotation auto-invalidates every entry. Stored as `${key}#chunk-i` plus a
+// `${key}#meta` {chunkCount,totalLen,sha256}; one readwrite IDB transaction makes
+// the chunk+meta set atomic. Any missing chunk / length / sha256 mismatch evicts
+// the entry and degrades to a miss. IndexedDB in-browser, in-memory Map under node.
 import { RavenError } from "./errors";
 
 const DB_NAME = "raven-pir-session-cache-v1";
@@ -67,15 +44,7 @@ function bytesToHex(bytes: Uint8Array): string {
   return out;
 }
 
-/**
- * Compute the SHA-256 of `bytes` and return it as a lower-case hex
- * string. Used both as the second component of the cache key (CRS
- * fingerprint) and as the per-entry integrity tag verified on read.
- *
- * Uses Web Crypto API (`crypto.subtle.digest`) which is available
- * in modern browsers AND in Node.js >= 18 (`globalThis.crypto`).
- * Throws a typed `RavenError` if neither path is available.
- */
+/** Lower-case hex SHA-256 via Web Crypto; throws a typed error if `crypto.subtle` is unavailable. */
 export async function sha256Hex(bytes: Uint8Array): Promise<string> {
   const subtle = globalThis.crypto?.subtle;
   if (!subtle) {
@@ -126,8 +95,7 @@ function planChunks(blobLen: number): { chunkCount: number; ranges: Array<[numbe
 }
 
 class MemoryBackend implements CacheBackend {
-  // Exposed so failure-injection tests can corrupt a chunk without
-  // an extra public surface in the production build.
+  // Exposed so failure-injection tests can corrupt a chunk.
   readonly map = new Map<string, Uint8Array>();
 
   async get(key: string): Promise<Uint8Array | null> {
@@ -164,8 +132,7 @@ class MemoryBackend implements CacheBackend {
   async put(key: string, blob: Uint8Array): Promise<void> {
     const sha = await sha256Hex(blob);
     const { chunkCount, ranges } = planChunks(blob.length);
-    // Evict any prior shape (including legacy single-blob) before
-    // writing the new chunk set so stale chunks cannot survive.
+    // Evict any prior shape first so stale chunks cannot survive.
     await this.evict(key, chunkCount);
     for (let i = 0; i < ranges.length; i += 1) {
       const [start, end] = ranges[i];
@@ -188,7 +155,7 @@ class MemoryBackend implements CacheBackend {
     for (let i = 0; i < limit; i += 1) {
       this.map.delete(chunkKey(key, i));
     }
-    // Best-effort sweep for any stragglers past the known count.
+    // Sweep stragglers past the known count.
     for (const k of Array.from(this.map.keys())) {
       if (k.startsWith(`${key}#chunk-`)) this.map.delete(k);
     }
@@ -254,8 +221,7 @@ class IndexedDbBackend implements CacheBackend {
     const db = await this.openDb();
     const sha = await sha256Hex(blob);
     const { chunkCount, ranges } = planChunks(blob.length);
-    // Drop any prior shape first so stale chunks past the new
-    // count cannot linger.
+    // Drop any prior shape first so stale chunks cannot linger.
     await this.evict(key, Number.MAX_SAFE_INTEGER);
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE, "readwrite");
@@ -373,8 +339,7 @@ class IndexedDbBackend implements CacheBackend {
       for (let i = 0; i < limit; i += 1) {
         store.delete(chunkKey(key, i));
       }
-      // For the unknown-upper-bound path (legacy / pre-evict before
-      // put), sweep any straggler chunk records via cursor.
+      // Unknown-upper-bound path: sweep straggler chunk records via cursor.
       if (knownChunkCount === Number.MAX_SAFE_INTEGER) {
         const prefix = `${key}#chunk-`;
         const req = store.openCursor();
@@ -417,24 +382,12 @@ function ensureBackend(): CacheBackend {
   return backend;
 }
 
-/**
- * Replace the active backend. Test-only seam: the SDK's production
- * codepath uses `ensureBackend()` directly.
- */
+/** Replace the active backend. Test-only seam. */
 export function _setBackendForTests(b: CacheBackend | null): void {
   backend = b;
 }
 
-/**
- * Lookup a cached session blob.
- *
- * Returns `null` on miss (no entry, missing IDB, integrity failure,
- * or storage failure caught and degraded). Storage failures
- * intentionally degrade to miss — the cold path is correct and a
- * transient backend issue should not break query construction. An
- * integrity failure additionally evicts the entry so a poisoned
- * blob cannot resurface.
- */
+/** Lookup a cached session blob; storage/integrity failures degrade to `null` so a backend issue never breaks query construction. */
 export async function idbGet(
   instanceId: string,
   crsHash: string,
@@ -446,13 +399,7 @@ export async function idbGet(
   }
 }
 
-/**
- * Cache a session blob under `(instanceId, crsHash)`. Storage
- * failures are caught and silently dropped (best-effort cache).
- * The blob is split into 32 MiB chunks plus a meta record holding
- * the SHA-256 of the original bytes; the chunk + meta writes share
- * one IDB transaction so the entry is atomic per IDB semantics.
- */
+/** Best-effort cache of a session blob under `(instanceId, crsHash)`; chunk + meta writes share one atomic IDB transaction. */
 export async function idbPut(
   instanceId: string,
   crsHash: string,
@@ -461,14 +408,11 @@ export async function idbPut(
   try {
     await ensureBackend().put(makeKey(instanceId, crsHash), blob);
   } catch {
-    // best-effort cache: a failed put degrades to no caching
+    // best-effort cache
   }
 }
 
-/**
- * Empty the cache. Used by tests to reset between cases; production
- * wallets do not call this directly.
- */
+/** Empty the cache. Used by tests to reset between cases. */
 export async function idbClear(): Promise<void> {
   try {
     await ensureBackend().clear();

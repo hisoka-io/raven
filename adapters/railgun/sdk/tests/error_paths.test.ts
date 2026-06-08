@@ -1,19 +1,7 @@
 /**
- * Error-path + truncated-response handling tests.
- *
- * The SDK MUST fail closed on:
- *   - Server response truncated mid-bincode (PIR query) → typed error
- *     surfaces; SDK does not return garbage.
- *   - Server response 5xx → typed error, no silent empty result.
- *   - Server returns malformed JSON → typed error.
- *   - Client-PIR query returns a too-short bincode (truncated state
- *     prefix) → typed error from `decodeClientPirQueryBundle`.
- *
- * The "fail closed" property is the central correctness invariant
- * for a privacy adapter: a wallet that silently accepts wrong data
- * leaks information by acting on it (sending an unshield against a
- * stale path triggers a chain-side rejection that's observable to
- * the operator, leaking the wallet's intent).
+ * Error-path + truncated-response tests: the SDK must fail closed on
+ * truncated/malformed/5xx responses. Silently accepting wrong data leaks
+ * intent (a spend against a stale path is rejected observably on-chain).
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -30,16 +18,11 @@ function stubWasm(): RavenInspireWasm {
   return {
     build_client_session: () => ({ free: () => undefined }),
     build_seeded_query: () => {
-      // Valid empty bincode: 8 bytes len(0) + 8 bytes len(0) = 16.
+      // empty bincode: len(0) + len(0) = 16 bytes
       return new Uint8Array(16);
     },
     extract_response: (_session, _a, _b, response, _entry) => {
-      // Pass through whatever the server returned. If the server
-      // sent garbage, the SDK still gets the bytes; the wallet's
-      // domain layer (T1 status decoder, T2 path decoder) is
-      // expected to reject zero-length / wrong-shape plaintexts.
-      // For T2/T3 path queries the SDK extracts a 32 B node hash, so
-      // we surface 32 zero-bytes when the response is non-empty.
+      // surface a 32 B node hash for non-empty responses; the domain decoders reject bad shapes
       return response.length === 0 ? new Uint8Array(0) : new Uint8Array(32);
     },
     build_instance_params_blob: () => new Uint8Array(0),
@@ -80,14 +63,14 @@ describe("error-path + truncated-response handling", () => {
   });
 
   it("decodeClientPirQueryBundle rejects truncated state payload", () => {
-    // Claim 1000-byte client_state, supply only 16 bytes.
+    // claim 1000-byte client_state, supply 16
     const buf = new Uint8Array(16);
     new DataView(buf.buffer).setUint32(0, 1000, true);
     expect(() => decodeClientPirQueryBundle(buf)).toThrow(/truncated state payload/);
   });
 
   it("decodeClientPirQueryBundle rejects truncated query payload", () => {
-    // Valid 0-len state + claim 100-byte query, supply only 16+8.
+    // 0-len state + claim 100-byte query, supply 24
     const buf = new Uint8Array(24);
     new DataView(buf.buffer).setUint32(0, 0, true);
     new DataView(buf.buffer).setUint32(8, 100, true);
@@ -96,7 +79,7 @@ describe("error-path + truncated-response handling", () => {
 
   it("decodeClientPirQueryBundle rejects payload > 2^32 bytes (defensive)", () => {
     const buf = new Uint8Array(32);
-    // hi word non-zero -> trips the readU64LE check.
+    // non-zero hi word trips the readU64LE 2^32 guard
     new DataView(buf.buffer).setUint32(0, 0, true);
     new DataView(buf.buffer).setUint32(4, 1, true);
     expect(() => decodeClientPirQueryBundle(buf)).toThrow(/exceeds 2\^32/);
@@ -125,10 +108,7 @@ describe("error-path + truncated-response handling", () => {
   });
 
   it("client-PIR query with HTTP 5xx propagates as typed ServerError (no silent Missing)", async () => {
-    // Post-H3 contract: 5xx propagates as a typed RavenError so the
-    // wallet can retry against a fresh routing table or fall back
-    // to upstream PPOI rather than silently spending against
-    // unmarked BCs (which would leak intent to the operator).
+    // 5xx must propagate so the wallet retries/falls back instead of silently spending against unmarked BCs
     server.route(
       (req) => req.url?.startsWith("/v1/instance/") ?? false,
       (_req, _body, res) => {
@@ -179,12 +159,7 @@ describe("error-path + truncated-response handling", () => {
   });
 
   it("client-PIR T2 empty batch body surfaces as a typed DecodeError (no silent zero-elt proof)", async () => {
-    // The server response is a zero-byte body; under the auth-path
-    // batch flow this is malformed — there's no schema-version
-    // prefix or element count. The SDK MUST throw a typed
-    // RavenError.decodeError rather than silently fabricate a
-    // 0-element proof, because a wallet acting on a 0-element proof
-    // would attempt to spend against a malformed Merkle tree.
+    // a zero-byte batch body is malformed; throw rather than fabricate a 0-element proof
     server.route(
       (req) => req.url?.startsWith("/v1/instance/") ?? false,
       (_req, _body, res) => {

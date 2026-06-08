@@ -4,39 +4,15 @@
 use crate::{atomic_write, PersistenceError, Result, SnapshotId, StoreLayout};
 use serde::{Deserialize, Serialize};
 
-/// Schema version of the manifest file; old versions outside the
+/// Schema version of the manifest; versions outside the
 /// `[MIN_READABLE_MANIFEST_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION]`
-/// window are rejected at load time.
-///
-/// V6 bumps the snapshot payload format to embed the engine-side
-/// `LogicalLeafStore` alongside `InspireServerState`. Pre-V6 snapshots
-/// had only the encoded-DB / CRS bundle; the LogicalLeafStore was
-/// rebuilt from WAL replay alone, which is fragile across the
-/// commit-time WAL archive boundary (a successful `drive_commit`
-/// archives WAL ranges that the next reopen would have needed to
-/// rebuild the store from scratch). V6 makes the store durable with
-/// the snapshot. The on-disk manifest itself gains no new fields
-/// between V5 and V6 — the bump is purely a signal that the snapshot
-/// binary on this disk encodes the V6 envelope.
-///
-/// V5 manifests still load (legacy compatibility); the engine
-/// recognises them and falls back to the V5 snapshot decoder
-/// (returning an empty `LogicalLeafStore` that gets repopulated from
-/// WAL replay if WAL bytes are still present).
-///
-/// V5 adds `prev_encoder_label: Option<String>` (`#[serde(default)]`), so V4 manifests
-/// still deserialize with `prev_encoder_label = None`. V4 added `PpoiListLeafAdded`.
-/// V3 added `encoder_label`; bootstrap rejects a label mismatch.
+/// window are rejected at load time. V6 signals the snapshot binary
+/// embeds the leaf store; V5 snapshots rebuild it from WAL replay.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 6;
 
-/// Oldest manifest schema version this build can read. Manifests at
-/// this version or newer (and at most [`MANIFEST_SCHEMA_VERSION`])
-/// load successfully; anything older is rejected.
-///
-/// V5 is the read-only legacy ceiling: we can decode V5 snapshots
-/// (they lack the embedded `LogicalLeafStore`) but the engine rebuilds
-/// the store via WAL replay on first open and then upgrades to V6 on
-/// the next commit.
+/// Oldest manifest schema version this build can read; anything older
+/// is rejected. V5 is read-only legacy: decoded, rebuilt from WAL on
+/// open, upgraded to V6 on the next commit.
 pub const MIN_READABLE_MANIFEST_SCHEMA_VERSION: u32 = 5;
 
 /// On-disk manifest; JSON-serialized for human-readable forensics.

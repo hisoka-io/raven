@@ -110,10 +110,8 @@ impl BinaryFuseFilter {
         for _ in 0..max_attempt_count {
             rng.fill_bytes(&mut seed);
 
-            // Each attempt rehashes; clear the map so failed-attempt
-            // entries don't accumulate. Correctness is unaffected by
-            // the upstream's accumulation bug (overwrite-on-collision
-            // semantics), but this bounds map capacity to N.
+            // Each attempt rehashes; clear so failed-attempt entries don't
+            // accumulate, bounding map capacity to N.
             hash_to_key.clear();
 
             for (idx, val) in start_pos.iter_mut().enumerate() {
@@ -851,9 +849,8 @@ mod tests {
 
     #[test]
     fn murmur64_matches_fixed_vector() {
-        // murmur64 preserves zero (xor-shift + mul both fix 0).
+        // murmur64 fixes zero (xor-shift + mul both fix 0).
         assert_eq!(murmur64(0), 0);
-        // Lock a deterministic non-zero output.
         let h = murmur64(1);
         assert_ne!(h, 0);
         assert_eq!(h, murmur64(1));

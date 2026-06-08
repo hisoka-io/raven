@@ -259,12 +259,9 @@ async fn drain_state_transition_is_idempotent() {
     inst.set_drain_state(DrainState::Draining);
     inst.set_drain_state(DrainState::Draining);
     assert_eq!(inst.drain_state(), DrainState::Draining);
-    // Idle wait so the trait test runtime doesn't shut the runtime
-    // down before the (background) tracing event sink has flushed.
+    // Let the background tracing sink flush before the runtime shuts down.
     tokio::time::sleep(Duration::from_millis(10)).await;
 }
-
-// Helpers
 
 fn build_real_query(
     inst: &Arc<PirInstance<RavenInspireScheme>>,
@@ -274,9 +271,8 @@ fn build_real_query(
     };
     let params = InspireParams::secure_128_d2048();
     let snap = inst.current_state();
-    // Build a fresh sk-bearing state pair off-side just to obtain a
-    // matching RlweSecretKey. The CRS is the one belonging to the
-    // server snapshot so packing keys derive against the same CRS.
+    // Off-side state pair only yields a matching RlweSecretKey; the CRS
+    // below is the snapshot's so packing keys derive against the same CRS.
     let (_off_state, sk) = {
         let db: Vec<u8> = (0..TOY_ENTRIES)
             .flat_map(|i| {
@@ -287,10 +283,7 @@ fn build_real_query(
     };
     let crs_clone = (*snap.crs).clone();
     let mut session = build_client_session(crs_clone, sk, &params).expect("client session");
-    // Register against the SAME session store that respond will read
-    // (the instance's current snapshot). This is the wiring pattern
-    // production tests use — the client session stores packing keys
-    // on the server's session store before issuing a seeded query.
+    // Register against the same session store respond() reads (this snapshot).
     register_client_session(&mut session, snap.as_ref()).expect("register");
     let shard_config = snap.shard_config().clone();
     let (_state, query) =
