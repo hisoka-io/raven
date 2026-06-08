@@ -20,10 +20,10 @@ exclude = [
 version = "0.1.0-alpha.0"
 edition = "2021"
 rust-version = "1.85"
-authors = ["Hisoka.io"]
+authors = ["The Raven Authors"]
 license = "Apache-2.0"
-repository = "https://github.com/hisoka-io/raven"
-homepage = "https://github.com/hisoka-io/raven"
+repository = "https://github.com/REPLACE-WITH-PUBLIC-ORG/raven"
+homepage = "https://github.com/REPLACE-WITH-PUBLIC-ORG/raven"
 readme = "README.md"
 
 [workspace.dependencies]
