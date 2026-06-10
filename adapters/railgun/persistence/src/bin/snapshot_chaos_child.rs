@@ -12,7 +12,7 @@
     clippy::unwrap_used
 )]
 
-use raven_railgun_persistence::{Snapshot, SnapshotId, StoreLayout};
+use raven_railgun_persistence::{Snapshot, SnapshotId, StoreLayout, SNAPSHOT_MAGIC};
 use std::io::Write;
 use std::time::Duration;
 
@@ -116,13 +116,13 @@ fn main() {
     std::fs::create_dir_all(&args.data_dir).expect("mkdir data_dir");
     let layout = StoreLayout::open(&args.data_dir).expect("open layout");
 
-    let base = Snapshot::build(args.base_payload.clone());
+    let base = Snapshot::build(args.base_payload.clone(), SNAPSHOT_MAGIC);
     base.save(&layout, SnapshotId(args.id)).expect("base save");
     println!("READY_FOR_CHAOS");
     std::io::stdout().flush().ok();
     std::thread::sleep(args.pause);
 
-    let new_snap = Snapshot::build(args.new_payload.clone());
+    let new_snap = Snapshot::build(args.new_payload.clone(), SNAPSHOT_MAGIC);
     let final_dir = layout.snapshot_dir(SnapshotId(args.id));
     let tmp_dir = final_dir.with_extension("tmp");
     let final_old_tmp = final_dir.with_extension("old.tmp");

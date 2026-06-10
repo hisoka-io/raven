@@ -27,7 +27,9 @@ use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{setup_state, InspireServerState};
 use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
-use raven_railgun_persistence::{Manifest, Snapshot, SnapshotId, StoreLayout, WalEntryPayload};
+use raven_railgun_persistence::{
+    Manifest, Snapshot, SnapshotId, StoreLayout, WalEntryPayload, SNAPSHOT_MAGIC,
+};
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-real-sigkill-migration";
 const TOY_ENTRIES: usize = 256;
@@ -102,7 +104,7 @@ fn manifest_bytes(dir_path: &Path) -> Vec<u8> {
 
 fn snapshot_bytes(dir_path: &Path, id: SnapshotId) -> Vec<u8> {
     let layout = StoreLayout::open(dir_path).expect("layout");
-    let snap = Snapshot::load(&layout, id).expect("load snap");
+    let snap = Snapshot::load(&layout, id, SNAPSHOT_MAGIC).expect("load snap");
     snap.data
 }
 

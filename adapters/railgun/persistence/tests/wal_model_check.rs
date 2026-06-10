@@ -84,7 +84,7 @@ proptest! {
         for (i, recovered) in replay.entries.iter().enumerate() {
             let row = written.get(i).expect("written index in range");
             prop_assert_eq!(recovered.seq, row.0);
-            prop_assert_eq!(recovered.block_height, row.1);
+            prop_assert_eq!(recovered.marker, row.1);
             let parsed: WalEntryPayload =
                 bincode::deserialize(&recovered.payload).expect("deser");
             prop_assert_eq!(&parsed, &row.2);

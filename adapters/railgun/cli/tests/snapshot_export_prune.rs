@@ -17,7 +17,7 @@ use raven_railgun_cli::snapshot_port::{
     prune_old_export_tarballs, run_export, run_prune, ExportOptions, PruneOptions,
 };
 use raven_railgun_persistence::{
-    Manifest, Snapshot, SnapshotId, StoreLayout, MANIFEST_SCHEMA_VERSION,
+    Manifest, Snapshot, SnapshotId, StoreLayout, MANIFEST_SCHEMA_VERSION, SNAPSHOT_MAGIC,
 };
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
@@ -26,7 +26,7 @@ const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
 fn bootstrap_minimal_instance(root: &Path, instance_id: &str, payload: &[u8]) {
     let inst_dir = root.join(instance_id);
     let layout = StoreLayout::open(&inst_dir).expect("StoreLayout::open");
-    let snap = Snapshot::build(payload.to_vec());
+    let snap = Snapshot::build(payload.to_vec(), SNAPSHOT_MAGIC);
     let snap_id = SnapshotId(7);
     snap.save(&layout, snap_id).expect("snapshot save");
     let manifest = Manifest {
@@ -35,7 +35,7 @@ fn bootstrap_minimal_instance(root: &Path, instance_id: &str, payload: &[u8]) {
         instance_id: instance_id.to_owned(),
         current_snapshot_id: snap_id,
         current_snapshot_seq: 1,
-        current_block_height: 100,
+        current_marker: 100,
         encoder_label: "per-leaf-bc".to_owned(),
         prev_encoder_label: None,
     };

@@ -14,7 +14,7 @@
 
 use raven_railgun_persistence::{
     Manifest, PersistenceError, Snapshot, SnapshotId, StoreLayout, Wal, WalEntryPayload,
-    MANIFEST_SCHEMA_VERSION,
+    MANIFEST_SCHEMA_VERSION, SNAPSHOT_MAGIC,
 };
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
@@ -39,7 +39,7 @@ fn manifest_for(instance: &str, encoder_label: &str) -> Manifest {
         instance_id: instance.to_owned(),
         current_snapshot_id: SnapshotId(1),
         current_snapshot_seq: 0,
-        current_block_height: 0,
+        current_marker: 0,
         encoder_label: encoder_label.to_owned(),
         prev_encoder_label: None,
     }
@@ -60,9 +60,9 @@ fn kill_one_instance_mid_commit_does_not_affect_others() {
             wal_a.append(&payload, h).expect("A append");
             wal_b.append(&payload, h).expect("B append");
         }
-        let snap_a = Snapshot::build(b"instance-A pre-kill state".to_vec());
+        let snap_a = Snapshot::build(b"instance-A pre-kill state".to_vec(), SNAPSHOT_MAGIC);
         snap_a.save(&layout_a, SnapshotId(1)).expect("A snap.save");
-        let snap_b = Snapshot::build(b"instance-B steady state".to_vec());
+        let snap_b = Snapshot::build(b"instance-B steady state".to_vec(), SNAPSHOT_MAGIC);
         snap_b.save(&layout_b, SnapshotId(1)).expect("B snap.save");
         let manifest_b = manifest_for("instance-b", "per-leaf-bc");
         manifest_b.save(&layout_b).expect("B manifest.save");
@@ -74,7 +74,7 @@ fn kill_one_instance_mid_commit_does_not_affect_others() {
         .expect("B manifest load")
         .expect("B manifest present");
     assert_eq!(manifest_b2.current_snapshot_id, SnapshotId(1));
-    let snap_b2 = Snapshot::load(&layout_b2, SnapshotId(1)).expect("B snap reload");
+    let snap_b2 = Snapshot::load(&layout_b2, SnapshotId(1), SNAPSHOT_MAGIC).expect("B snap reload");
     assert_eq!(snap_b2.data, b"instance-B steady state");
     let wal_b2 = Wal::open(&layout_b2, None).expect("B wal reopen");
     let replay_b = wal_b2.replay().expect("B replay");
@@ -92,7 +92,7 @@ fn partial_snapshot_dir_does_not_corrupt_subsequent_recovery() {
     let dir = tempfile::tempdir().expect("tempdir");
     let layout = StoreLayout::open(dir.path()).expect("layout");
 
-    let snap = Snapshot::build(b"first valid snapshot".to_vec());
+    let snap = Snapshot::build(b"first valid snapshot".to_vec(), SNAPSHOT_MAGIC);
     snap.save(&layout, SnapshotId(1)).expect("save snap-1");
     let manifest = manifest_for("partial-snap-test", "per-leaf-bc");
     manifest.save(&layout).expect("save manifest");
@@ -101,12 +101,16 @@ fn partial_snapshot_dir_does_not_corrupt_subsequent_recovery() {
     // but the manifest still points at snap-1 (atomic-rename never fired for snap-2).
     let snap2_dir = layout.snapshot_dir(SnapshotId(2));
     std::fs::create_dir_all(&snap2_dir).expect("mkdir snap-2");
-    let snap2_full = Snapshot::build(b"snap-2 full payload that we will truncate".to_vec());
+    let snap2_full = Snapshot::build(
+        b"snap-2 full payload that we will truncate".to_vec(),
+        SNAPSHOT_MAGIC,
+    );
     let header_bytes = bincode::serialize(&snap2_full.header).expect("ser header");
     std::fs::write(snap2_dir.join("header.bin"), &header_bytes).expect("write header");
     std::fs::write(snap2_dir.join("data.bincode"), b"trunc").expect("write trunc payload");
 
-    let err = Snapshot::load(&layout, SnapshotId(2)).expect_err("truncated snap must fail load");
+    let err = Snapshot::load(&layout, SnapshotId(2), SNAPSHOT_MAGIC)
+        .expect_err("truncated snap must fail load");
     assert!(
         matches!(err, PersistenceError::SnapshotCorrupt(_)),
         "got {err:?}"
@@ -117,7 +121,7 @@ fn partial_snapshot_dir_does_not_corrupt_subsequent_recovery() {
         .expect("manifest reload")
         .expect("present");
     assert_eq!(manifest2.current_snapshot_id, SnapshotId(1));
-    let snap1_back = Snapshot::load(&layout2, manifest2.current_snapshot_id)
+    let snap1_back = Snapshot::load(&layout2, manifest2.current_snapshot_id, SNAPSHOT_MAGIC)
         .expect("snap-1 must still load clean");
     assert_eq!(snap1_back.data, b"first valid snapshot");
 }

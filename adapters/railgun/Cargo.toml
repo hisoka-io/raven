@@ -57,8 +57,11 @@ raven-railgun-persistence = { path = "persistence", version = "0.1.0-alpha.0" }
 raven-railgun-poseidon = { path = "poseidon", version = "0.1.0-alpha.0" }
 raven-railgun-ppoi-mirror = { path = "ppoi-mirror", version = "0.1.0-alpha.0" }
 
-# Cross-workspace path dep to the inspire submodule
-raven-inspire = { path = "../../crates/inspire" }
+# Cross-workspace path dep to the inspire submodule.
+# Server-side: enable the `parallel` (rayon) feature for the respond hot loops.
+# The wasm clients (client-wasm, crates/client) are detached workspaces and keep
+# the sequential default, so no rayon reaches the browser bundle.
+raven-inspire = { path = "../../crates/inspire", features = ["parallel"] }
 
 # Common deps
 thiserror = "2"

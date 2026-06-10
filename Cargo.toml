@@ -5,6 +5,8 @@ members = [
     "crates/crypto-primitives",
     "crates/indexer",
     "crates/client",
+    "crates/storage",
+    "crates/server",
     "benches/raven-bench",
 ]
 exclude = [
@@ -30,6 +32,16 @@ readme = "README.md"
 thiserror = "2"
 bytes = "1"
 proptest = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+crc32fast = "1"
+sha2 = { version = "0.10", default-features = false }
+parking_lot = "0.12"
+tracing = "0.1"
+fs4 = "1"
+tempfile = "3"
+arc-swap = "1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

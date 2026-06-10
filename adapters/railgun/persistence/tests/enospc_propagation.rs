@@ -24,7 +24,7 @@ fn sample_manifest() -> Manifest {
         instance_id: "enospc-propagation-test".to_owned(),
         current_snapshot_id: SnapshotId(11),
         current_snapshot_seq: 256,
-        current_block_height: 24_500_000,
+        current_marker: 24_500_000,
         encoder_label: "per-leaf-bc".to_owned(),
         prev_encoder_label: None,
     }

@@ -25,7 +25,7 @@ fn sample_manifest() -> Manifest {
         instance_id: "atomic-write-enospc-test".to_owned(),
         current_snapshot_id: SnapshotId(7),
         current_snapshot_seq: 42,
-        current_block_height: 24_000_000,
+        current_marker: 24_000_000,
         encoder_label: "per-leaf-bc".to_owned(),
         prev_encoder_label: None,
     }

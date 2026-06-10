@@ -1,0 +1,20 @@
+[package]
+name = "raven-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "PIR server runtime: the scheme trait, instance lifecycle, atomic state-swap, and the instance registry."
+
+[lints]
+workspace = true
+
+[dependencies]
+raven-core = { path = "../core" }
+arc-swap = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }

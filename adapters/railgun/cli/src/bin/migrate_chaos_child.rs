@@ -28,6 +28,7 @@ use raven_railgun_engine::inspire::{
 use raven_railgun_engine::pir_table::{EncoderKind, PerLeafCommitmentEncoder, PirTableEncoder};
 use raven_railgun_persistence::{
     Manifest, Snapshot, SnapshotId, StoreLayout, Wal, WalEntryPayload, MANIFEST_SCHEMA_VERSION,
+    SNAPSHOT_MAGIC,
 };
 
 #[derive(Debug, Clone)]
@@ -165,7 +166,8 @@ fn main() {
         "child requires a committed snapshot in the seeded data_dir"
     );
 
-    let snap = Snapshot::load(&layout, manifest.current_snapshot_id).expect("load snapshot");
+    let snap = Snapshot::load(&layout, manifest.current_snapshot_id, SNAPSHOT_MAGIC)
+        .expect("load snapshot");
     let (mut state, recovered_seed_store) =
         restore_inspire_state_v6(&snap.data).expect("restore_inspire_state_v6");
 
@@ -184,7 +186,7 @@ fn main() {
         if let Err(AdapterError::InvalidQuery(_msg)) = apply_wal_entry(
             &mut logical_store,
             &payload,
-            entry.block_height,
+            entry.marker,
             noop_encoder.as_ref(),
         ) {
             continue;
@@ -232,7 +234,7 @@ fn main() {
 
     let bundle =
         snapshot_inspire_state_v6(&state, &logical_store).expect("snapshot_inspire_state_v6");
-    let new_snap = Snapshot::build(bundle);
+    let new_snap = Snapshot::build(bundle, SNAPSHOT_MAGIC);
     let new_id = manifest.current_snapshot_id.next();
     new_snap.save(&layout, new_id).expect("snapshot save");
 
@@ -249,7 +251,7 @@ fn main() {
         instance_id: manifest.instance_id.clone(),
         current_snapshot_id: new_id,
         current_snapshot_seq: manifest.current_snapshot_seq,
-        current_block_height: manifest.current_block_height,
+        current_marker: manifest.current_marker,
         encoder_label: new_label.to_owned(),
         prev_encoder_label: Some(old_label.clone()),
     };

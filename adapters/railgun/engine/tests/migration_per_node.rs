@@ -17,6 +17,7 @@ use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{EncoderKind, PerLeafCommitmentEncoder, PirTableEncoder};
 use raven_railgun_persistence::{
     Manifest, Snapshot, SnapshotId, StoreLayout, Wal, WalEntryPayload, MANIFEST_SCHEMA_VERSION,
+    SNAPSHOT_MAGIC,
 };
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-migration-test";
@@ -102,7 +103,7 @@ fn run_migration(dir_path: &std::path::Path, target: EncoderKind) -> Result<(), 
         return Err("no committed snapshot (id=0)".to_owned());
     }
 
-    let snap = Snapshot::load(&layout, manifest.current_snapshot_id)
+    let snap = Snapshot::load(&layout, manifest.current_snapshot_id, SNAPSHOT_MAGIC)
         .map_err(|e| format!("snap load: {e}"))?;
     let mut state = restore_inspire_state(&snap.data).map_err(|e| format!("restore: {e}"))?;
 
@@ -121,7 +122,7 @@ fn run_migration(dir_path: &std::path::Path, target: EncoderKind) -> Result<(), 
         let _ = apply_wal_entry(
             &mut logical_store,
             &payload,
-            entry.block_height,
+            entry.marker,
             noop_encoder.as_ref(),
         );
     }
@@ -154,7 +155,7 @@ fn run_migration(dir_path: &std::path::Path, target: EncoderKind) -> Result<(), 
 
     let bundle =
         snapshot_inspire_state(&state).map_err(|e| format!("snapshot_inspire_state: {e}"))?;
-    let new_snap = Snapshot::build(bundle);
+    let new_snap = Snapshot::build(bundle, SNAPSHOT_MAGIC);
     let new_id = manifest.current_snapshot_id.next();
     new_snap
         .save(&layout, new_id)
@@ -166,7 +167,7 @@ fn run_migration(dir_path: &std::path::Path, target: EncoderKind) -> Result<(), 
         instance_id: manifest.instance_id.clone(),
         current_snapshot_id: new_id,
         current_snapshot_seq: manifest.current_snapshot_seq,
-        current_block_height: manifest.current_block_height,
+        current_marker: manifest.current_marker,
         encoder_label: new_label.to_owned(),
         prev_encoder_label: Some(old_label.clone()),
     };

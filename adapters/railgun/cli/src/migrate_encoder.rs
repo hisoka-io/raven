@@ -14,7 +14,7 @@ use raven_railgun_engine::inspire::{
 };
 use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
 use raven_railgun_persistence::{
-    Manifest, Snapshot, SnapshotId, StoreLayout, Wal, WalEntryPayload,
+    Manifest, Snapshot, SnapshotId, StoreLayout, Wal, WalEntryPayload, SNAPSHOT_MAGIC,
 };
 
 #[allow(clippy::too_many_lines)]
@@ -56,7 +56,7 @@ pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
         );
     }
 
-    let snap = Snapshot::load(&layout, manifest.current_snapshot_id)
+    let snap = Snapshot::load(&layout, manifest.current_snapshot_id, SNAPSHOT_MAGIC)
         .map_err(|e| anyhow::anyhow!("snapshot load: {e}"))?;
 
     // Embedded store (default-empty for legacy V5) seeds the WAL replay base, per `open`.
@@ -89,7 +89,7 @@ pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
         if let Err(AdapterError::InvalidQuery(msg)) = apply_wal_entry(
             &mut logical_store,
             &payload,
-            entry.block_height,
+            entry.marker,
             noop_encoder.as_ref(),
         ) {
             tracing::warn!(
@@ -132,7 +132,7 @@ pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
     // otherwise opens recover an empty store and chain events land against nothing.
     let bundle = snapshot_inspire_state_v6(&state, &logical_store)
         .map_err(|e| anyhow::anyhow!("snapshot_inspire_state_v6: {e}"))?;
-    let new_snap = Snapshot::build(bundle);
+    let new_snap = Snapshot::build(bundle, SNAPSHOT_MAGIC);
     let new_id = manifest.current_snapshot_id.next();
     new_snap
         .save(&layout, new_id)
@@ -145,7 +145,7 @@ pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
         instance_id: manifest.instance_id.clone(),
         current_snapshot_id: new_id,
         current_snapshot_seq: manifest.current_snapshot_seq,
-        current_block_height: manifest.current_block_height,
+        current_marker: manifest.current_marker,
         encoder_label: new_label.to_owned(),
         prev_encoder_label: Some(old_label.clone()),
     };

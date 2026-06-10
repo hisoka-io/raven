@@ -296,8 +296,10 @@ pub(crate) async fn params_handler(
 
     let state = instance.current_state();
     let state: &InspireServerState = state.as_ref();
-    let crs_bincode =
-        bincode::serialize(&state.crs).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let crs_bincode = state
+        .crs
+        .to_versioned_bytes()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let shard_config_bincode = bincode::serialize(&state.encoded_db.config)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let inspire_params_bincode =

@@ -1,0 +1,36 @@
+[package]
+name = "raven-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Crash-consistent durability primitives for PIR servers: bincode snapshots + crc32-framed WAL + atomic-rename manifest."
+
+[lints]
+workspace = true
+
+[dependencies]
+raven-core = { path = "../core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+crc32fast = { workspace = true }
+sha2 = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+zstd = { version = "0.13", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fs4 = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
+
+[features]
+default = ["zstd-compression"]
+zstd-compression = ["dep:zstd"]

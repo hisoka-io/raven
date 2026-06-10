@@ -8,6 +8,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Generic server-runtime identity and error types, re-exported from `raven-core`
+/// so existing `raven_railgun_core::{InstanceId, Epoch, AdapterError}` import
+/// sites keep compiling. The definitions live in `raven-core`.
+pub use raven_core::{Epoch, InstanceId, ServerError as AdapterError};
+
 /// 32-byte blinded commitment as defined in `engine/src/poi/blinded-commitment.ts`.
 ///
 /// For shield/transact: `Poseidon(commitmentHash, npk, globalTreePosition)`.
@@ -81,59 +86,6 @@ pub enum POIStatus {
     ProofSubmitted,
     /// No PPOI association recorded for this BC.
     Missing,
-}
-
-/// Identifier for a PIR engine instance. Operator-defined; immutable after registration.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct InstanceId(
-    /// Operator-defined string. The engine uses string identity for lookup;
-    /// callers must keep the value stable across restarts.
-    pub String,
-);
-
-impl InstanceId {
-    /// Construct from any string.
-    pub fn new<S: Into<String>>(s: S) -> Self {
-        Self(s.into())
-    }
-
-    /// Underlying string.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for InstanceId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Monotonic snapshot version. Bumped every time an instance's `ServerState`
-/// is swapped (post re-preprocess, post update batch, etc.).
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
-pub struct Epoch(
-    /// Monotonic counter; saturates at `u64::MAX`.
-    pub u64,
-);
-
-impl Epoch {
-    /// Sentinel value for a fresh instance before any state swap.
-    pub const ZERO: Self = Self(0);
-
-    /// Next epoch (saturating at `u64::MAX`).
-    #[must_use]
-    pub const fn next(self) -> Self {
-        Self(self.0.saturating_add(1))
-    }
-}
-
-impl std::fmt::Display for Epoch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
 }
 
 /// Merkle authentication path: 16 sibling hashes (Poseidon BN254 field elements,
@@ -235,88 +187,12 @@ pub struct PoiStatusRow {
     pub status: POIStatus,
 }
 
-/// Adapter-level error surface.
-#[derive(thiserror::Error, Debug)]
-pub enum AdapterError {
-    /// Engine instance lookup failed.
-    #[error("instance not found: {0}")]
-    InstanceNotFound(InstanceId),
-
-    /// Instance is draining or drained. Routing layers should return 503
-    /// (transient, retry) rather than 404.
-    #[error("instance draining or drained: {instance_id}")]
-    NoActiveInstance {
-        /// Instance whose drain state was non-Active at routing time.
-        instance_id: InstanceId,
-    },
-
-    /// Client query referenced a stale snapshot epoch.
-    #[error("epoch mismatch: client requires >= {client}, server is at {server}")]
-    EpochMismatch {
-        /// Minimum epoch the client's session was prepared against.
-        client: Epoch,
-        /// Current server epoch at query time.
-        server: Epoch,
-    },
-
-    /// Wrapped scheme-layer error (e.g. raven-inspire decryption failure).
-    #[error("scheme error: {0}")]
-    Scheme(String),
-
-    /// Wire-format decode/encode error.
-    #[error("serialization error: {0}")]
-    Serialization(String),
-
-    /// Query failed structural validation before scheme dispatch.
-    #[error("invalid query: {0}")]
-    InvalidQuery(String),
-
-    /// Internal post-condition violation.
-    #[error("internal error: {0}")]
-    Internal(String),
-
-    /// Re-encode targeted a `shard_id` past the `EncodedDatabase` shard
-    /// count. Distinct from [`AdapterError::Internal`] so the commit
-    /// driver can drop the shard from `dirty_shards` (retrying a
-    /// structurally-unencodable shard is futile) while keeping
-    /// transient errors (network/io/serialization) on the dirty list
-    /// for retry.
-    #[error("shard out of range: shard_id {shard_id} (have {db_shard_count} shards)")]
-    ShardOutOfRange {
-        /// The shard id that was requested but is not present.
-        shard_id: u32,
-        /// Number of shards currently in the encoded database.
-        db_shard_count: usize,
-    },
-}
-
 /// Adapter-level result alias.
 pub type Result<T, E = AdapterError> = core::result::Result<T, E>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn epoch_next_is_monotonic() {
-        let e = Epoch::ZERO;
-        assert_eq!(e.next(), Epoch(1));
-        assert_eq!(e.next().next(), Epoch(2));
-    }
-
-    #[test]
-    fn epoch_next_saturates() {
-        let max = Epoch(u64::MAX);
-        assert_eq!(max.next(), max);
-    }
-
-    #[test]
-    fn instance_id_round_trip_serde() {
-        let id = InstanceId::new("commit-tree-0");
-        let bytes = bincode::serialize(&id).expect("serialize");
-        let back: InstanceId = bincode::deserialize(&bytes).expect("deserialize");
-        assert_eq!(id, back);
-    }
 
     #[test]
     fn blinded_commitment_round_trip_serde() {

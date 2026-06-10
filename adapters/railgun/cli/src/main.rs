@@ -638,7 +638,7 @@ async fn main() -> anyhow::Result<()> {
                     println!("  instance_id          = {}", m.instance_id);
                     println!("  current_snapshot_id  = {:?}", m.current_snapshot_id);
                     println!("  current_snapshot_seq = {}", m.current_snapshot_seq);
-                    println!("  current_block_height = {}", m.current_block_height);
+                    println!("  current_block_height = {}", m.current_marker);
                 }
                 None => println!(
                     "(no manifest at {}; data_dir is empty / fresh)",

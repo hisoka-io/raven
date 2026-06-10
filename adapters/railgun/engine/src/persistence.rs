@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 use raven_railgun_core::{AdapterError, Epoch, InstanceId, Result};
 use raven_railgun_persistence::{
     Manifest, Snapshot, SnapshotId, StoreLayout, Wal, WalEntryPayload, MANIFEST_SCHEMA_VERSION,
+    SNAPSHOT_MAGIC,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -164,8 +165,9 @@ impl InspirePersistence {
                 if manifest.current_snapshot_id == SnapshotId(0) {
                     (None, super::inspire::LogicalLeafStore::new(), u32::MAX)
                 } else {
-                    let snap = Snapshot::load(&layout, manifest.current_snapshot_id)
-                        .map_err(|e| AdapterError::Internal(format!("snapshot load: {e}")))?;
+                    let snap =
+                        Snapshot::load(&layout, manifest.current_snapshot_id, SNAPSHOT_MAGIC)
+                            .map_err(|e| AdapterError::Internal(format!("snapshot load: {e}")))?;
                     let (s, store) = super::inspire::restore_inspire_state_v6(&snap.data)?;
                     let eps = u32::try_from(
                         s.encoded_db
@@ -197,13 +199,13 @@ impl InspirePersistence {
                 if let Err(e) = super::inspire::apply_wal_entry(
                     &mut logical_store,
                     &payload,
-                    entry.block_height,
+                    entry.marker,
                     replay_encoder,
                 ) {
                     if matches!(e, AdapterError::InvalidQuery(_)) {
                         tracing::warn!(
                             seq = entry.seq,
-                            block_height = entry.block_height,
+                            block_height = entry.marker,
                             error = %e,
                             "wal replay: skipping invalid entry; \
                              production-path validate_apply should have prevented \
@@ -266,7 +268,7 @@ impl InspirePersistence {
                 instance_id: instance_id.to_string(),
                 current_snapshot_id: SnapshotId(0),
                 current_snapshot_seq: 0,
-                current_block_height: 0,
+                current_marker: 0,
                 encoder_label: encoder_label.to_owned(),
                 prev_encoder_label: None,
             };
@@ -324,7 +326,7 @@ impl InspirePersistence {
         bundle: Vec<u8>,
         current_block_height: u64,
     ) -> Result<SnapshotId> {
-        let snap = Snapshot::build(bundle);
+        let snap = Snapshot::build(bundle, SNAPSHOT_MAGIC);
 
         // Save snapshot (slow) outside the manifest lock; CAS-check on re-lock.
         let next_id = {
@@ -353,7 +355,7 @@ impl InspirePersistence {
         let new_floor = self.wal.next_seq();
         m.current_snapshot_id = next_id;
         m.current_snapshot_seq = new_floor;
-        m.current_block_height = current_block_height;
+        m.current_marker = current_block_height;
         m.schema_version = MANIFEST_SCHEMA_VERSION;
         m.save(&self.layout)
             .map_err(|e| AdapterError::Internal(format!("manifest save: {e}")))?;
@@ -413,11 +415,11 @@ impl InspirePersistence {
 
     /// Recovered chain-event block-height baseline (the restart resume floor).
     ///
-    /// `manifest.current_block_height`, advanced on every commit and recovered
+    /// `manifest.current_marker`, advanced on every commit and recovered
     /// by [`Self::open`]; restart seeds off it to avoid re-scanning applied events.
     #[must_use]
     pub fn manifest_block_height(&self) -> u64 {
-        self.manifest.lock().current_block_height
+        self.manifest.lock().current_marker
     }
 
     /// Append a `Reorg` WAL marker. Returns the assigned WAL seq.

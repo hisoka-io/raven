@@ -16,6 +16,8 @@ workspace = true
 [dependencies]
 thiserror = { workspace = true }
 bytes = { workspace = true }
-raven-inspire = { path = "../inspire" }
+serde = { workspace = true }
+
 [dev-dependencies]
 proptest = { workspace = true }
+bincode = { workspace = true }
