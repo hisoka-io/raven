@@ -23,7 +23,7 @@ fn sample_manifest(id: u32, seq: u64) -> Manifest {
         instance_id: format!("ppoi-paths-test-{id}"),
         current_snapshot_id: SnapshotId(u64::from(id)),
         current_snapshot_seq: seq,
-        current_block_height: 24_000_000,
+        current_marker: 24_000_000,
         encoder_label: "per-leaf-bc".to_owned(),
         prev_encoder_label: None,
     }

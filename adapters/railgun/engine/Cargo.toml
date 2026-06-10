@@ -12,6 +12,7 @@ description = "PIR engine orchestrator: scheme trait, instance registry, snapsho
 workspace = true
 
 [dependencies]
+raven-server = { path = "../../../crates/server" }
 raven-railgun-core = { workspace = true }
 raven-railgun-persistence = { workspace = true }
 raven-railgun-indexer = { workspace = true }

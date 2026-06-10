@@ -81,7 +81,7 @@ fn main() {
         inspire_setup(&params, &db, ENTRY_BYTES, &mut sampler).expect("setup");
 
     let inspire_params_bin = bincode::serialize(&params).expect("serialize params");
-    let crs_bin = bincode::serialize(&crs).expect("serialize crs");
+    let crs_bin = crs.to_versioned_bytes().expect("versioned crs");
     let shard_config_bin = bincode::serialize(&encoded_db.config).expect("serialize shard");
     let sk_bin = bincode::serialize(&sk).expect("serialize sk");
 

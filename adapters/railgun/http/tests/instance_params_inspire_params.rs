@@ -175,7 +175,8 @@ async fn instance_params_inspire_params_decodes_to_secure_128_d2048() {
     // Sanity: the CRS + shard-config blobs round-trip too. This is
     // the tuple the wallet hands to `build_client_session`; if any
     // of the three blobs gets corrupted, bootstrap fails.
-    let _crs: ServerCrs = bincode::deserialize(&decoded.crs_bincode).expect("decode ServerCrs");
+    let _crs: ServerCrs =
+        ServerCrs::from_versioned_bytes(&decoded.crs_bincode).expect("decode versioned ServerCrs");
     let _shard: ShardConfig =
         bincode::deserialize(&decoded.shard_config_bincode).expect("decode ShardConfig");
 }

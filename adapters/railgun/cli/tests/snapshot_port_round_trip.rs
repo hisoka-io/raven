@@ -17,6 +17,7 @@ use raven_railgun_cli::snapshot_port::{
 };
 use raven_railgun_persistence::{
     Manifest, Snapshot, SnapshotId, StoreLayout, Wal, WalEntryPayload, MANIFEST_SCHEMA_VERSION,
+    SNAPSHOT_MAGIC,
 };
 
 const SCHEME_TAG_A: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
@@ -32,7 +33,7 @@ fn bootstrap_instance(
 ) -> PathBuf {
     let inst_dir = root.join(instance_id);
     let layout = StoreLayout::open(&inst_dir).expect("StoreLayout::open");
-    let snap = Snapshot::build(snapshot_payload.to_vec());
+    let snap = Snapshot::build(snapshot_payload.to_vec(), SNAPSHOT_MAGIC);
     let snap_id = SnapshotId(7);
     snap.save(&layout, snap_id).expect("snapshot save");
     let wal = Wal::open(&layout, Some(0)).expect("wal open");
@@ -55,7 +56,7 @@ fn bootstrap_instance(
         instance_id: instance_id.to_owned(),
         current_snapshot_id: snap_id,
         current_snapshot_seq: 1,
-        current_block_height: 12_345_678,
+        current_marker: 12_345_678,
         encoder_label: encoder_label.to_owned(),
         prev_encoder_label: None,
     };

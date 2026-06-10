@@ -8,10 +8,32 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
-description = "Wasm-friendly client surface for Raven."
+description = "Wasm-friendly PIR client surface for Raven: query construction and response extraction across the JS/Wasm boundary."
 publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [lints]
 workspace = true
 
 [dependencies]
+raven-inspire = { path = "../inspire" }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
+
+[package.metadata.wasm-pack.profile.dev]
+wasm-opt = false

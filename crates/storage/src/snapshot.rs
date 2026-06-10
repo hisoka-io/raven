@@ -19,7 +19,7 @@ impl SnapshotId {
 /// 16-byte magic + SHA-256 checksum + payload length stored alongside the bincode payload.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotHeader {
-    /// ASCII magic bytes (`RAVEN_RAILGUN_01`).
+    /// Caller-supplied format magic; [`SnapshotFile::load`] rejects a mismatch.
     pub magic: [u8; 16],
     /// SHA-256 of the uncompressed bincode payload, hex-encoded.
     pub data_sha256_hex: String,
@@ -27,10 +27,7 @@ pub struct SnapshotHeader {
     pub data_len: u64,
 }
 
-/// Expected magic bytes.
-pub const SNAPSHOT_MAGIC: [u8; 16] = *b"RAVEN_RAILGUN_01";
-
-/// zstd frame magic (RFC 8878 §3.1.1). `Snapshot::load` sniffs these bytes to dispatch
+/// zstd frame magic (RFC 8878 sec 3.1.1). `SnapshotFile::load` sniffs these bytes to dispatch
 /// between zstd-wrapped (new) and bare-bincode (legacy) payloads. SHA-256 covers the
 /// uncompressed payload in both paths so no manifest schema bump is needed.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -39,25 +36,33 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 #[cfg(feature = "zstd-compression")]
 const ZSTD_LEVEL: i32 = 3;
 
-/// Opaque snapshot payload. The persistence crate treats the bytes as a black box;
-/// callers serialize their scheme-specific state and hand it in.
+/// Opaque snapshot payload. The storage crate treats the bytes as a black box;
+/// callers serialize their scheme-specific state and hand it in along with the
+/// 16-byte format magic that pins their on-disk version.
+///
+/// ```
+/// use raven_storage::SnapshotFile;
+/// let snap = SnapshotFile::build(b"encoded state".to_vec(), *b"MYFMT00000000001");
+/// assert_eq!(snap.header.data_len, 13);
+/// assert_eq!(snap.data, b"encoded state");
+/// ```
 #[derive(Clone, Debug)]
-pub struct Snapshot {
+pub struct SnapshotFile {
     /// Header metadata.
     pub header: SnapshotHeader,
     /// Bincode-serialized state payload.
     pub data: Vec<u8>,
 }
 
-impl Snapshot {
-    /// Build a snapshot, computing the header checksum from `data`.
-    pub fn build(data: Vec<u8>) -> Self {
+impl SnapshotFile {
+    /// Build a snapshot, stamping `magic` and computing the header checksum from `data`.
+    pub fn build(data: Vec<u8>, magic: [u8; 16]) -> Self {
         let digest = Sha256::digest(&data);
         let hex = bytes_to_hex(&digest);
         let data_len = u64::try_from(data.len()).unwrap_or(u64::MAX);
         Self {
             header: SnapshotHeader {
-                magic: SNAPSHOT_MAGIC,
+                magic,
                 data_sha256_hex: hex,
                 data_len,
             },
@@ -70,7 +75,7 @@ impl Snapshot {
     /// Two-rename idiom for crash-atomicity: (1) rename existing
     /// `final_dir` to `.old.tmp`, (2) rename `tmp_dir` to `final_dir`,
     /// (3) remove `.old.tmp`. A kill between steps leaves recoverable
-    /// state that [`Snapshot::load`] handles. Idempotent under retry
+    /// state that [`SnapshotFile::load`] handles. Idempotent under retry
     /// with the same `id`.
     pub fn save(&self, layout: &StoreLayout, id: SnapshotId) -> Result<()> {
         let final_dir = layout.snapshot_dir(id);
@@ -101,7 +106,7 @@ impl Snapshot {
             if had_final {
                 if let Err(rollback_err) = std::fs::rename(&final_old_tmp, &final_dir) {
                     tracing::error!(
-                        target: "raven::persistence::snapshot",
+                        target: "raven::storage::snapshot",
                         rollback_err = %rollback_err,
                         save_err = %e,
                         snap_id = id.0,
@@ -122,7 +127,7 @@ impl Snapshot {
         if had_final {
             if let Err(e) = std::fs::remove_dir_all(&final_old_tmp) {
                 tracing::warn!(
-                    target: "raven::persistence::snapshot",
+                    target: "raven::storage::snapshot",
                     err = %e,
                     snap_id = id.0,
                     "snapshot save: failed to remove displaced `.old.tmp`; \
@@ -133,13 +138,13 @@ impl Snapshot {
         Ok(())
     }
 
-    /// Load a snapshot, verifying magic and SHA-256.
+    /// Load a snapshot, verifying `expected_magic` and the SHA-256 checksum.
     ///
     /// Sniffs the leading 4 bytes for the zstd frame magic to dispatch between
     /// compressed and legacy bare-bincode payloads. Handles the three crash-recovery
     /// states left by `save`'s two-rename pipeline: `.old.tmp` alone (promotes it back),
     /// both present (`final_dir` wins, `.old.tmp` cleaned up), or only `final_dir`.
-    pub fn load(layout: &StoreLayout, id: SnapshotId) -> Result<Self> {
+    pub fn load(layout: &StoreLayout, id: SnapshotId, expected_magic: [u8; 16]) -> Result<Self> {
         let dir = layout.snapshot_dir(id);
         let old_tmp = dir.with_extension("old.tmp");
         let dir_exists = dir.is_dir();
@@ -149,7 +154,7 @@ impl Snapshot {
             (true, true) => {
                 if let Err(e) = std::fs::remove_dir_all(&old_tmp) {
                     tracing::warn!(
-                        target: "raven::persistence::snapshot",
+                        target: "raven::storage::snapshot",
                         err = %e,
                         snap_id = id.0,
                         "snapshot load: failed to clean obsolete `.old.tmp`; \
@@ -163,7 +168,7 @@ impl Snapshot {
                     fsync_parent_dir(parent)?;
                 }
                 tracing::info!(
-                    target: "raven::persistence::snapshot",
+                    target: "raven::storage::snapshot",
                     snap_id = id.0,
                     "snapshot load: recovered from `.old.tmp` left by \
                      interrupted save"
@@ -180,7 +185,7 @@ impl Snapshot {
         }
         let header_bytes = std::fs::read(dir.join("header.bin"))?;
         let header: SnapshotHeader = bincode::deserialize(&header_bytes)?;
-        if header.magic != SNAPSHOT_MAGIC {
+        if header.magic != expected_magic {
             return Err(PersistenceError::SnapshotCorrupt(format!(
                 "snap-{:06}: magic mismatch",
                 id.0
@@ -229,8 +234,7 @@ fn unwrap_from_disk(raw: &[u8], id: SnapshotId) -> Result<Vec<u8>> {
 
 #[cfg(feature = "zstd-compression")]
 fn decompress_zstd_body(raw: &[u8], id: SnapshotId) -> Result<Vec<u8>> {
-    // 4 GiB cap prevents heap exhaustion from a hostile/corrupt frame;
-    // production payloads are ~170 MiB so this stays well clear of valid bodies.
+    // 4 GiB cap prevents heap exhaustion from a hostile/corrupt frame.
     const MAX_DECOMPRESSED: usize = 4 * 1024 * 1024 * 1024;
     zstd::bulk::decompress(raw, MAX_DECOMPRESSED).map_err(|e| {
         PersistenceError::SnapshotCorrupt(format!("snap-{:06}: zstd decompress: {e}", id.0))
@@ -261,6 +265,8 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    const TEST_MAGIC: [u8; 16] = *b"RAVEN_STORAGE_T1";
+
     #[test]
     fn snapshot_id_next_saturates() {
         assert_eq!(SnapshotId(0).next(), SnapshotId(1));
@@ -271,19 +277,19 @@ mod tests {
     fn build_round_trips_via_save_load() {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = StoreLayout::open(dir.path()).expect("open");
-        let payload = b"hello inspire snapshot".to_vec();
-        let snap = Snapshot::build(payload.clone());
+        let payload = b"hello storage snapshot".to_vec();
+        let snap = SnapshotFile::build(payload.clone(), TEST_MAGIC);
         snap.save(&layout, SnapshotId(1)).expect("save");
-        let back = Snapshot::load(&layout, SnapshotId(1)).expect("load");
+        let back = SnapshotFile::load(&layout, SnapshotId(1), TEST_MAGIC).expect("load");
         assert_eq!(back.data, payload);
-        assert_eq!(back.header.magic, SNAPSHOT_MAGIC);
+        assert_eq!(back.header.magic, TEST_MAGIC);
     }
 
     #[test]
     fn missing_snapshot_returns_not_found() {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = StoreLayout::open(dir.path()).expect("open");
-        let err = Snapshot::load(&layout, SnapshotId(99)).expect_err("missing");
+        let err = SnapshotFile::load(&layout, SnapshotId(99), TEST_MAGIC).expect_err("missing");
         assert!(matches!(err, PersistenceError::SnapshotNotFound(_)));
     }
 
@@ -291,14 +297,14 @@ mod tests {
     fn corrupt_data_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = StoreLayout::open(dir.path()).expect("open");
-        let snap = Snapshot::build(b"original".to_vec());
+        let snap = SnapshotFile::build(b"original".to_vec(), TEST_MAGIC);
         snap.save(&layout, SnapshotId(1)).expect("save");
         std::fs::write(
             layout.snapshot_dir(SnapshotId(1)).join("data.bincode"),
             b"tampered",
         )
         .expect("write");
-        let err = Snapshot::load(&layout, SnapshotId(1)).expect_err("corrupt");
+        let err = SnapshotFile::load(&layout, SnapshotId(1), TEST_MAGIC).expect_err("corrupt");
         assert!(matches!(err, PersistenceError::SnapshotCorrupt(_)));
     }
 
@@ -306,14 +312,14 @@ mod tests {
     fn wrong_magic_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = StoreLayout::open(dir.path()).expect("open");
-        let mut snap = Snapshot::build(b"x".to_vec());
+        let mut snap = SnapshotFile::build(b"x".to_vec(), TEST_MAGIC);
         snap.header.magic = *b"WRONG_MAGIC_HERE";
         let header_bytes = bincode::serialize(&snap.header).expect("ser");
         let final_dir = layout.snapshot_dir(SnapshotId(1));
         std::fs::create_dir_all(&final_dir).expect("mkdir");
         std::fs::write(final_dir.join("header.bin"), &header_bytes).expect("write h");
         std::fs::write(final_dir.join("data.bincode"), &snap.data).expect("write d");
-        let err = Snapshot::load(&layout, SnapshotId(1)).expect_err("magic");
+        let err = SnapshotFile::load(&layout, SnapshotId(1), TEST_MAGIC).expect_err("magic");
         assert!(matches!(err, PersistenceError::SnapshotCorrupt(_)));
     }
 
@@ -323,31 +329,31 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = StoreLayout::open(dir.path()).expect("open");
 
-        let snap_a = Snapshot::build(b"first commit attempt".to_vec());
+        let snap_a = SnapshotFile::build(b"first commit attempt".to_vec(), TEST_MAGIC);
         snap_a
             .save(&layout, SnapshotId(1))
             .expect("first save succeeds");
 
-        let snap_b = Snapshot::build(b"retry commit attempt".to_vec());
+        let snap_b = SnapshotFile::build(b"retry commit attempt".to_vec(), TEST_MAGIC);
         snap_b
             .save(&layout, SnapshotId(1))
             .expect("retry save must NOT fail with ENOTEMPTY");
 
-        let loaded = Snapshot::load(&layout, SnapshotId(1)).expect("load post-retry");
+        let loaded = SnapshotFile::load(&layout, SnapshotId(1), TEST_MAGIC).expect("load post-retry");
         assert_eq!(loaded.data, b"retry commit attempt");
     }
 
     // only `final_dir`, no `.old.tmp`: loads with no migration step
     #[test]
-    fn load_handles_pre_c8_snapshot_with_only_final_dir() {
+    fn load_handles_snapshot_with_only_final_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = StoreLayout::open(dir.path()).expect("open");
-        let payload = b"pre-c8 deployment payload".to_vec();
-        let snap = Snapshot::build(payload.clone());
+        let payload = b"steady-state payload".to_vec();
+        let snap = SnapshotFile::build(payload.clone(), TEST_MAGIC);
         snap.save(&layout, SnapshotId(7)).expect("save");
         let old_tmp = layout.snapshot_dir(SnapshotId(7)).with_extension("old.tmp");
         assert!(!old_tmp.exists());
-        let loaded = Snapshot::load(&layout, SnapshotId(7)).expect("load pre-c8 layout");
+        let loaded = SnapshotFile::load(&layout, SnapshotId(7), TEST_MAGIC).expect("load");
         assert_eq!(loaded.data, payload);
     }
 
@@ -357,14 +363,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = StoreLayout::open(dir.path()).expect("open");
         let payload = b"prior good snapshot bytes".to_vec();
-        let snap = Snapshot::build(payload.clone());
+        let snap = SnapshotFile::build(payload.clone(), TEST_MAGIC);
         snap.save(&layout, SnapshotId(3)).expect("save");
 
         let final_dir = layout.snapshot_dir(SnapshotId(3));
         let old_tmp = final_dir.with_extension("old.tmp");
         std::fs::rename(&final_dir, &old_tmp).expect("simulated step-1 displacement");
 
-        let loaded = Snapshot::load(&layout, SnapshotId(3)).expect("load with recovery");
+        let loaded = SnapshotFile::load(&layout, SnapshotId(3), TEST_MAGIC).expect("load with recovery");
         assert_eq!(loaded.data, payload);
         assert!(final_dir.is_dir());
         assert!(!old_tmp.exists());
@@ -376,21 +382,21 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = StoreLayout::open(dir.path()).expect("open");
 
-        let prev = Snapshot::build(b"previous payload".to_vec());
+        let prev = SnapshotFile::build(b"previous payload".to_vec(), TEST_MAGIC);
         prev.save(&layout, SnapshotId(2)).expect("save prev");
         let final_dir = layout.snapshot_dir(SnapshotId(2));
         let old_tmp = final_dir.with_extension("old.tmp");
         std::fs::rename(&final_dir, &old_tmp).expect("displace prev");
 
         let new_payload = b"new winning payload".to_vec();
-        let new_snap = Snapshot::build(new_payload.clone());
+        let new_snap = SnapshotFile::build(new_payload.clone(), TEST_MAGIC);
         std::fs::create_dir_all(&final_dir).expect("mkdir final_dir");
         let header_bytes = bincode::serialize(&new_snap.header).expect("ser header");
         atomic_write(&final_dir.join("header.bin"), &header_bytes).expect("header");
         let body = wrap_for_disk(&new_snap.data).expect("wrap");
         atomic_write(&final_dir.join("data.bincode"), &body).expect("data");
 
-        let loaded = Snapshot::load(&layout, SnapshotId(2)).expect("load with both present");
+        let loaded = SnapshotFile::load(&layout, SnapshotId(2), TEST_MAGIC).expect("load with both present");
         assert_eq!(loaded.data, new_payload);
         assert!(!old_tmp.exists());
     }

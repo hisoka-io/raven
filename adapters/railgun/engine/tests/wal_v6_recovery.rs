@@ -12,6 +12,7 @@ use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
 use raven_railgun_persistence::{
     Manifest, Snapshot, SnapshotId, StoreLayout, Wal, WalEntryPayload, MANIFEST_SCHEMA_VERSION,
+    SNAPSHOT_MAGIC,
 };
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-wal-v6-recovery";
@@ -259,7 +260,7 @@ fn manifest_v5_compatibility_on_open_existing_data() {
     );
 
     let snap_id = SnapshotId(1);
-    let snap = Snapshot::build(v5_bytes);
+    let snap = Snapshot::build(v5_bytes, SNAPSHOT_MAGIC);
     snap.save(&layout, snap_id).expect("save v5 snapshot");
 
     let manifest = Manifest {
@@ -268,7 +269,7 @@ fn manifest_v5_compatibility_on_open_existing_data() {
         instance_id: "v5-compat".to_owned(),
         current_snapshot_id: snap_id,
         current_snapshot_seq: 0,
-        current_block_height: 0,
+        current_marker: 0,
         encoder_label: encoder_arc().label().to_owned(),
         prev_encoder_label: None,
     };

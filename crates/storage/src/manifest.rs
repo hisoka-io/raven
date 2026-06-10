@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// Schema version of the manifest; versions outside the
 /// `[MIN_READABLE_MANIFEST_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION]`
 /// window are rejected at load time. V6 signals the snapshot binary
-/// embeds the leaf store; V5 snapshots rebuild it from WAL replay.
+/// embeds the full encoded state; V5 snapshots rebuild it from WAL replay.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 6;
 
 /// Oldest manifest schema version this build can read; anything older
@@ -28,8 +28,10 @@ pub struct Manifest {
     pub current_snapshot_id: SnapshotId,
     /// First WAL seq the replayer must consume (`last_seq_in_snapshot + 1`).
     pub current_snapshot_seq: u64,
-    /// Chain block height covered by the current snapshot.
-    pub current_block_height: u64,
+    /// Caller-supplied monotonic marker covered by the current snapshot.
+    /// On-disk key stays `current_block_height` for format stability.
+    #[serde(rename = "current_block_height")]
+    pub current_marker: u64,
     /// Encoder discriminator; bootstrap rejects a label mismatch.
     pub encoder_label: String,
     /// Set only during an in-flight encoder migration; `None` at steady state.
@@ -70,9 +72,8 @@ impl Manifest {
 
     /// Serialize the manifest into an arbitrary writer without the atomic-rename pipeline.
     ///
-    /// Used by fault-injection tests (`tests/enospc_propagation.rs`) to force a
-    /// `StorageFull` error through the JSON-encode → `write_all` boundary that
-    /// the production path traverses, without needing a real tmpfs.
+    /// Exercises the JSON-encode -> `write_all` boundary the production path traverses,
+    /// so fault-injection tests can force a write error without a real tmpfs.
     pub fn save_to_writer<W: std::io::Write>(&self, writer: &mut W) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(self)?;
         writer.write_all(&bytes).map_err(PersistenceError::Io)
@@ -86,12 +87,12 @@ mod tests {
     fn sample() -> Manifest {
         Manifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
-            scheme_tag: "raven-inspire-twopacking-inspiring-wp3".to_owned(),
-            instance_id: "ppoi-paths-ofac".to_owned(),
+            scheme_tag: "test-scheme-v1".to_owned(),
+            instance_id: "test-instance".to_owned(),
             current_snapshot_id: SnapshotId(7),
             current_snapshot_seq: 100_000,
-            current_block_height: 24_978_046,
-            encoder_label: "per-leaf-bc".to_owned(),
+            current_marker: 24_978_046,
+            encoder_label: "test-encoder".to_owned(),
             prev_encoder_label: None,
         }
     }
@@ -139,24 +140,24 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v5_manifest_loads_for_backward_compat() {
+    fn legacy_min_readable_manifest_loads_for_backward_compat() {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = StoreLayout::open(dir.path()).expect("open");
         let mut m = sample();
-        m.schema_version = 5;
-        m.save(&layout).expect("save v5");
-        let back = Manifest::load(&layout).expect("load v5").expect("present");
-        assert_eq!(back.schema_version, 5);
+        m.schema_version = MIN_READABLE_MANIFEST_SCHEMA_VERSION;
+        m.save(&layout).expect("save legacy");
+        let back = Manifest::load(&layout).expect("load legacy").expect("present");
+        assert_eq!(back.schema_version, MIN_READABLE_MANIFEST_SCHEMA_VERSION);
     }
 
     #[test]
-    fn pre_v5_manifest_rejected() {
+    fn below_min_readable_manifest_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = StoreLayout::open(dir.path()).expect("open");
         let mut m = sample();
-        m.schema_version = 4;
-        m.save(&layout).expect("save v4");
-        let err = Manifest::load(&layout).expect_err("v4 must be rejected");
+        m.schema_version = MIN_READABLE_MANIFEST_SCHEMA_VERSION - 1;
+        m.save(&layout).expect("save");
+        let err = Manifest::load(&layout).expect_err("must be rejected");
         assert!(matches!(err, PersistenceError::ManifestMissing(_)));
     }
 
@@ -170,40 +171,40 @@ mod tests {
     }
 
     #[test]
-    fn v4_manifest_without_prev_encoder_label_reads_into_v5_struct_with_default_none() {
+    fn manifest_without_prev_encoder_label_reads_with_default_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = StoreLayout::open(dir.path()).expect("open");
-        let v4_json = serde_json::json!({
+        let json = serde_json::json!({
             "schema_version": MANIFEST_SCHEMA_VERSION,
-            "scheme_tag": "raven-inspire-twopacking-inspiring-wp3",
-            "instance_id": "v4-compat",
+            "scheme_tag": "test-scheme-v1",
+            "instance_id": "compat",
             "current_snapshot_id": 3,
             "current_snapshot_seq": 7,
             "current_block_height": 24_000_000u64,
-            "encoder_label": "per-leaf-bc"
+            "encoder_label": "test-encoder"
         });
         std::fs::write(
             layout.manifest_path(),
-            serde_json::to_vec_pretty(&v4_json).expect("ser"),
+            serde_json::to_vec_pretty(&json).expect("ser"),
         )
         .expect("write");
         let loaded = Manifest::load(&layout).expect("load").expect("present");
         assert_eq!(loaded.prev_encoder_label, None);
-        assert_eq!(loaded.encoder_label, "per-leaf-bc");
-        assert_eq!(loaded.instance_id, "v4-compat");
+        assert_eq!(loaded.encoder_label, "test-encoder");
+        assert_eq!(loaded.instance_id, "compat");
     }
 
     #[test]
-    fn v5_manifest_with_prev_encoder_label_round_trips() {
+    fn manifest_with_prev_encoder_label_round_trips() {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = StoreLayout::open(dir.path()).expect("open");
         let mut m = sample();
-        m.encoder_label = "per-node".to_owned();
-        m.prev_encoder_label = Some("per-leaf-bc".to_owned());
+        m.encoder_label = "encoder-b".to_owned();
+        m.prev_encoder_label = Some("encoder-a".to_owned());
         m.save(&layout).expect("save");
         let back = Manifest::load(&layout).expect("load").expect("present");
-        assert_eq!(back.encoder_label, "per-node");
-        assert_eq!(back.prev_encoder_label, Some("per-leaf-bc".to_owned()));
+        assert_eq!(back.encoder_label, "encoder-b");
+        assert_eq!(back.prev_encoder_label, Some("encoder-a".to_owned()));
         assert_eq!(back, m);
     }
 }

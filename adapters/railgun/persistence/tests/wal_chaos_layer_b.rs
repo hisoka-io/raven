@@ -97,8 +97,8 @@ fn one_chaos_round(seed: u64, kill_delay: Duration) -> usize {
     for (idx, recovered) in replay.entries.iter().enumerate() {
         let (canonical_payload_value, canonical_height) = canonical_payload(seed, idx);
         assert_eq!(
-            recovered.block_height, canonical_height,
-            "entry {idx}: block_height mismatch (seed={seed}, kill_delay={kill_delay:?})"
+            recovered.marker, canonical_height,
+            "entry {idx}: marker mismatch (seed={seed}, kill_delay={kill_delay:?})"
         );
         let decoded: WalEntryPayload = bincode::deserialize(&recovered.payload)
             .expect("recovered payload must be valid bincode");

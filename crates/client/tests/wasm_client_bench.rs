@@ -1,6 +1,6 @@
 //! WASM client bench, also runnable natively via the `_rust` mirror entry points.
 //!
-//! - WASM: `wasm-pack test --node --manifest-path adapters/railgun/client-wasm/Cargo.toml`
+//! - WASM: `wasm-pack test --node --manifest-path crates/client/Cargo.toml`
 //! - Native: `cargo test --release ... --test wasm_client_bench -- --ignored --nocapture`
 
 #![allow(
@@ -14,13 +14,13 @@
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_only {
+    use raven_client::{build_seeded_query_rust, extract_response_rust};
     use raven_inspire::math::GaussianSampler;
     use raven_inspire::params::{InspireParams, SecurityLevel};
     use raven_inspire::respond_seeded_inspiring_cached_with_session;
     use raven_inspire::{
         setup as inspire_setup, ClientSession, ServerInspiringCache, ServerSessionStore,
     };
-    use raven_inspire_client_wasm::{build_seeded_query_rust, extract_response_rust};
     use wasm_bindgen_test::wasm_bindgen_test;
 
     const SEEDS: usize = 3;
@@ -99,8 +99,7 @@ mod wasm_only {
         web_sys::console::log_1(
             &format!(
                 "wasm_client_bench: cell={label} entry_bytes={entry_bytes} \
-                 3-seed-median build={:.3}ms extract={:.3}ms",
-                build_med, extract_med
+                 3-seed-median build={build_med:.3}ms extract={extract_med:.3}ms"
             )
             .into(),
         );
@@ -120,13 +119,13 @@ mod native {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
+    use raven_client::{build_seeded_query_rust, extract_response_rust};
     use raven_inspire::math::GaussianSampler;
     use raven_inspire::params::{InspireParams, SecurityLevel};
     use raven_inspire::respond_seeded_inspiring_cached_with_session;
     use raven_inspire::{
         setup as inspire_setup, ClientSession, ServerInspiringCache, ServerSessionStore,
     };
-    use raven_inspire_client_wasm::{build_seeded_query_rust, extract_response_rust};
 
     const SEEDS: usize = 3;
 
@@ -162,9 +161,8 @@ mod native {
             return PathBuf::from(env_dir).join("wasm-client-bench.md");
         }
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.pop(); // client-wasm
-        p.pop(); // railgun
-        p.pop(); // adapters
+        p.pop(); // client
+        p.pop(); // crates
         p.push("target");
         p.push("bench-findings");
         p.push("wasm-client-bench.md");

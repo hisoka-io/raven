@@ -3640,6 +3640,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "raven-core"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "bytes",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "raven-inspire"
 version = "0.1.0-alpha.0"
 dependencies = [
@@ -3699,9 +3708,9 @@ name = "raven-railgun-core"
 version = "0.1.0-alpha.0"
 dependencies = [
  "bincode",
+ "raven-core",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3722,6 +3731,7 @@ dependencies = [
  "raven-railgun-indexer",
  "raven-railgun-persistence",
  "raven-railgun-poseidon",
+ "raven-server",
  "rayon",
  "serde",
  "serde_json",
@@ -3815,17 +3825,11 @@ version = "0.1.0-alpha.0"
 dependencies = [
  "bincode",
  "bitcode",
- "crc32fast",
- "fs4",
- "parking_lot",
  "proptest",
- "raven-railgun-core",
+ "raven-storage",
  "serde",
- "serde_json",
  "sha2",
  "tempfile",
- "thiserror 2.0.18",
- "tracing",
  "zstd",
 ]
 
@@ -3856,6 +3860,34 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "raven-server"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "arc-swap",
+ "parking_lot",
+ "raven-core",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "raven-storage"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "bincode",
+ "crc32fast",
+ "fs4",
+ "parking_lot",
+ "raven-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tracing",
+ "zstd",
 ]
 
 [[package]]

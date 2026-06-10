@@ -379,7 +379,7 @@ async fn bootstrap_resume_from_partial_state() {
         .expect("load")
         .expect("manifest present after first bootstrap");
     let head = chain.chain_head().await.unwrap();
-    assert_eq!(manifest.current_block_height, head - cfg.checkpoint_depth);
+    assert_eq!(manifest.current_marker, head - cfg.checkpoint_depth);
 }
 
 #[tokio::test]

@@ -12,7 +12,7 @@ description = "Shared types for the Raven Railgun PIR adapter."
 workspace = true
 
 [dependencies]
-thiserror = { workspace = true }
+raven-core = { path = "../../../crates/core" }
 serde = { workspace = true }
 
 [dev-dependencies]

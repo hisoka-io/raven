@@ -225,6 +225,51 @@ jobs:
       - name: cargo check (wasm32)
         run: cargo check --manifest-path crates/binary-fuse-filter/Cargo.toml --target wasm32-unknown-unknown
 
+  inspire-tests:
+    # submodule detached workspace; --release avoids the dev-mode d=2048 timeout.
+    # lld + sccache keep the two test runs (default + parallel) under budget.
+    name: raven-inspire (submodule workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      # re-declare -D warnings since RUSTFLAGS overrides the workflow-level env
+      RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=lld"
+    steps:
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+      - name: install lld linker
+        run: sudo apt-get update && sudo apt-get install -y lld
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "inspire-tests"
+      - name: cargo fmt
+        run: cargo fmt --manifest-path crates/inspire/Cargo.toml -- --check
+      - name: cargo clippy
+        run: cargo clippy --manifest-path crates/inspire/Cargo.toml --all-targets -- -D warnings
+      - name: cargo test (default)
+        run: cargo test --manifest-path crates/inspire/Cargo.toml --release
+      - name: cargo test (parallel feature)
+        # re-runs the byte-identity KAT under the rayon path so it cannot regress undetected
+        run: cargo test --manifest-path crates/inspire/Cargo.toml --release --features parallel
+      - name: cargo check (wasm32, client-clean / no rayon)
+        run: cargo check --manifest-path crates/inspire/Cargo.toml --target wasm32-unknown-unknown --no-default-features
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+
   sdk-tests:
     # fresh-clone gate: SDK depends on the gitignored wasm-pack output,
     # so this rebuilds it, enforces the bundle ceiling, then runs tests

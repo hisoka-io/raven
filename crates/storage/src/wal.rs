@@ -1,17 +1,17 @@
 //! Append-only crc32-framed write-ahead log.
 //!
-//! Frame layout: `[seq u64 BE | block_height u64 BE | payload_len u32 BE | crc32 u32 BE | payload]`.
+//! Frame layout: `[seq u64 BE | marker u64 BE | payload_len u32 BE | crc32 u32 BE | payload]`.
 //! CRC covers all preceding fields + payload. A torn tail write yields a bad CRC and truncates.
-//! `seq` is monotonically increasing; `block_height` enables reorg-safe truncation.
+//! `seq` is the WAL's own monotonic counter; `marker` is a caller-supplied monotonic
+//! value recorded per entry, enabling truncation of entries above a given value.
+//! Payloads are opaque: [`Wal::append`] serializes any `Serialize` value and the log
+//! returns the raw bytes back on [`Wal::replay`]; the caller owns deserialization.
 
 use crate::{PersistenceError, Result, StoreLayout};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-
-#[allow(dead_code)] // on-the-wire format is hand-coded; constant is for documentation
-const WAL_HEADER_BYTES: usize = 24;
 
 /// Maximum payload length per entry; guards against nonsense `payload_len` from torn writes.
 pub const WAL_MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
@@ -21,55 +21,10 @@ pub const WAL_MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 pub struct WalEntry {
     /// Monotonic sequence number.
     pub seq: u64,
-    /// Chain block height; used for reorg-safe truncation.
-    pub block_height: u64,
-    /// Bincode-serialized [`WalEntryPayload`].
+    /// Caller-supplied monotonic marker recorded per entry; enables truncation above a value.
+    pub marker: u64,
+    /// Bincode-serialized opaque payload.
     pub payload: Vec<u8>,
-}
-
-/// Scheme-agnostic payload variants.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub enum WalEntryPayload {
-    /// Append a leaf to a Railgun commitment-tree shard.
-    AppendLeaf {
-        /// Tree index (`0..=tree_count-1`).
-        tree_number: u32,
-        /// Leaf index within the tree.
-        leaf_index: u32,
-        /// 32-byte Poseidon BN254 commitment hash.
-        commitment: [u8; 32],
-    },
-    /// Add / update a PPOI status row.
-    PpoiStatus {
-        /// 32-byte list key.
-        list_key: [u8; 32],
-        /// 32-byte blinded commitment.
-        blinded_commitment: [u8; 32],
-        /// Status byte (`Valid` / `ShieldBlocked` / `ProofSubmitted` / `Missing`).
-        status: u8,
-    },
-    /// New leaf appended to a per-list PPOI Merkle tree.
-    /// Drives per-list IMT growth and the `(blinded_commitment → list_index)` oracle.
-    PpoiListLeafAdded {
-        /// 32-byte list key.
-        list_key: [u8; 32],
-        /// Upstream-issued contiguous index within the list.
-        list_index: u32,
-        /// 32-byte blinded commitment.
-        blinded_commitment: [u8; 32],
-        /// Initial status byte.
-        status: u8,
-    },
-    /// Reorg marker: engine truncates WAL entries with `block_height > height`.
-    Reorg {
-        /// Chain height at the fork point.
-        height: u64,
-    },
-    /// Heartbeat (no-op) emitted at each snapshot to mark the WAL.
-    Heartbeat {
-        /// Unix milliseconds at emission.
-        wallclock_unix_ms: u64,
-    },
 }
 
 /// Append-only WAL. Internal mutex serializes `append`; `replay` opens a fresh read handle.
@@ -83,7 +38,7 @@ pub struct Wal {
 struct WalState {
     file: File,
     next_seq: u64,
-    last_block_height: u64,
+    last_marker: u64,
 }
 
 impl Wal {
@@ -124,13 +79,17 @@ impl Wal {
             inner: Mutex::new(WalState {
                 file,
                 next_seq,
-                last_block_height: scan.last_block_height,
+                last_marker: scan.last_marker,
             }),
         })
     }
 
     /// Append a payload entry; assigns next seq, fsyncs, returns the assigned seq.
-    pub fn append(&self, payload: &WalEntryPayload, block_height: u64) -> Result<u64> {
+    ///
+    /// The payload is bincode-serialized and stored opaquely; the bound is
+    /// `Serialize` only because the WAL never deserializes - [`Wal::replay`]
+    /// returns the raw bytes and the caller owns the decode.
+    pub fn append<P: Serialize>(&self, payload: &P, marker: u64) -> Result<u64> {
         let bincoded = bincode::serialize(payload)?;
         if bincoded.len() > WAL_MAX_PAYLOAD_BYTES {
             return Err(PersistenceError::Invariant(format!(
@@ -151,7 +110,7 @@ impl Wal {
 
         let mut header = [0u8; 24];
         header[0..8].copy_from_slice(&seq.to_be_bytes());
-        header[8..16].copy_from_slice(&block_height.to_be_bytes());
+        header[8..16].copy_from_slice(&marker.to_be_bytes());
         header[16..20].copy_from_slice(&payload_len.to_be_bytes());
 
         let mut hasher = crc32fast::Hasher::new();
@@ -165,7 +124,7 @@ impl Wal {
         state.file.sync_all()?;
 
         state.next_seq = state.next_seq.saturating_add(1);
-        state.last_block_height = block_height;
+        state.last_marker = marker;
         Ok(seq)
     }
 
@@ -181,9 +140,9 @@ impl Wal {
         self.inner.lock().next_seq
     }
 
-    /// Block height of the most recently appended entry.
-    pub fn last_block_height(&self) -> u64 {
-        self.inner.lock().last_block_height
+    /// Marker of the most recently appended entry.
+    pub fn last_marker(&self) -> u64 {
+        self.inner.lock().last_marker
     }
 
     /// Archive `current.log` and start a fresh one.
@@ -231,14 +190,14 @@ pub struct WalReplay {
     pub truncated_at: Option<u64>,
     /// Next free seq (last valid seq + 1, or 0).
     pub next_seq: u64,
-    /// Block height of the last valid entry, or 0.
-    pub last_block_height: u64,
+    /// Marker of the last valid entry, or 0.
+    pub last_marker: u64,
 }
 
 #[derive(Debug)]
 struct ScanResult {
     next_seq: u64,
-    last_block_height: u64,
+    last_marker: u64,
     truncate_at: Option<u64>,
 }
 
@@ -268,7 +227,7 @@ fn scan_for_tail(path: &std::path::Path) -> Result<ScanResult> {
     let scan = scan_full(path)?;
     Ok(ScanResult {
         next_seq: scan.next_seq,
-        last_block_height: scan.last_block_height,
+        last_marker: scan.last_marker,
         truncate_at: scan.truncated_at,
     })
 }
@@ -280,7 +239,7 @@ fn scan_full(path: &std::path::Path) -> Result<WalReplay> {
             entries: Vec::new(),
             truncated_at: None,
             next_seq: 0,
-            last_block_height: 0,
+            last_marker: 0,
         });
     }
     let mut file = File::open(path)?;
@@ -300,7 +259,7 @@ fn scan_full(path: &std::path::Path) -> Result<WalReplay> {
                 entries,
                 truncated_at: Some(offset),
                 next_seq,
-                last_block_height: last_block,
+                last_marker: last_block,
             });
         }
         file.seek(SeekFrom::Start(offset))?;
@@ -312,7 +271,7 @@ fn scan_full(path: &std::path::Path) -> Result<WalReplay> {
         let seq = u64::from_be_bytes(s);
         let mut h = [0u8; 8];
         h.copy_from_slice(header.get(8..16).unwrap_or(&[0u8; 8]));
-        let block_height = u64::from_be_bytes(h);
+        let marker = u64::from_be_bytes(h);
         let mut l = [0u8; 4];
         l.copy_from_slice(header.get(16..20).unwrap_or(&[0u8; 4]));
         let payload_len = u64::from(u32::from_be_bytes(l));
@@ -325,7 +284,7 @@ fn scan_full(path: &std::path::Path) -> Result<WalReplay> {
                 entries,
                 truncated_at: Some(offset),
                 next_seq,
-                last_block_height: last_block,
+                last_marker: last_block,
             });
         }
         if total < offset + 24 + payload_len {
@@ -333,7 +292,7 @@ fn scan_full(path: &std::path::Path) -> Result<WalReplay> {
                 entries,
                 truncated_at: Some(offset),
                 next_seq,
-                last_block_height: last_block,
+                last_marker: last_block,
             });
         }
         let payload_len_usize = usize::try_from(payload_len).map_err(|_| {
@@ -352,7 +311,7 @@ fn scan_full(path: &std::path::Path) -> Result<WalReplay> {
                 entries,
                 truncated_at: Some(offset),
                 next_seq,
-                last_block_height: last_block,
+                last_marker: last_block,
             });
         }
 
@@ -368,18 +327,18 @@ fn scan_full(path: &std::path::Path) -> Result<WalReplay> {
                     entries,
                     truncated_at: Some(offset),
                     next_seq,
-                    last_block_height: last_block,
+                    last_marker: last_block,
                 });
             }
         }
 
         entries.push(WalEntry {
             seq,
-            block_height,
+            marker,
             payload,
         });
         next_seq = seq.saturating_add(1);
-        last_block = block_height;
+        last_block = marker;
         offset += 24 + payload_len;
     }
 
@@ -387,13 +346,14 @@ fn scan_full(path: &std::path::Path) -> Result<WalReplay> {
         entries,
         truncated_at: None,
         next_seq,
-        last_block_height: last_block,
+        last_marker: last_block,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
 
     fn make_layout() -> (tempfile::TempDir, StoreLayout) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -401,11 +361,20 @@ mod tests {
         (dir, layout)
     }
 
-    fn payload_leaf(idx: u32) -> WalEntryPayload {
-        WalEntryPayload::AppendLeaf {
-            tree_number: 3,
-            leaf_index: idx,
-            commitment: [(idx & 0xff) as u8; 32],
+    // Exercises the generic `append<P>` with a real struct payload; the WAL itself
+    // is payload-agnostic, so any `Serialize` type round-trips.
+    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+    struct TestPayload {
+        tag: u32,
+        index: u32,
+        blob: [u8; 32],
+    }
+
+    fn test_payload(idx: u32) -> TestPayload {
+        TestPayload {
+            tag: 3,
+            index: idx,
+            blob: [(idx & 0xff) as u8; 32],
         }
     }
 
@@ -414,18 +383,18 @@ mod tests {
         let (_d, layout) = make_layout();
         let wal = Wal::open(&layout, None).expect("open");
         for i in 0..10u32 {
-            wal.append(&payload_leaf(i), 100 + u64::from(i))
+            wal.append(&test_payload(i), 100 + u64::from(i))
                 .expect("append");
         }
         let replay = wal.replay().expect("replay");
         assert_eq!(replay.entries.len(), 10);
         assert_eq!(replay.truncated_at, None);
         assert_eq!(replay.next_seq, 10);
-        assert_eq!(replay.last_block_height, 109);
+        assert_eq!(replay.last_marker, 109);
         for (i, entry) in replay.entries.iter().enumerate() {
-            let parsed: WalEntryPayload = bincode::deserialize(&entry.payload).expect("deser");
+            let parsed: TestPayload = bincode::deserialize(&entry.payload).expect("deser");
             let i_u32 = u32::try_from(i).expect("test index fits in u32");
-            assert_eq!(parsed, payload_leaf(i_u32));
+            assert_eq!(parsed, test_payload(i_u32));
             assert_eq!(entry.seq, i as u64);
         }
     }
@@ -436,13 +405,13 @@ mod tests {
         {
             let wal = Wal::open(&layout, None).expect("open");
             for i in 0..5u32 {
-                wal.append(&payload_leaf(i), 100 + u64::from(i))
+                wal.append(&test_payload(i), 100 + u64::from(i))
                     .expect("append");
             }
         }
         let wal2 = Wal::open(&layout, None).expect("reopen");
         assert_eq!(wal2.next_seq(), 5);
-        wal2.append(&payload_leaf(99), 200).expect("append");
+        wal2.append(&test_payload(99), 200).expect("append");
         let replay = wal2.replay().expect("replay");
         assert_eq!(replay.entries.len(), 6);
         assert_eq!(replay.next_seq, 6);
@@ -454,7 +423,7 @@ mod tests {
         {
             let wal = Wal::open(&layout, None).expect("open");
             for i in 0..3u32 {
-                wal.append(&payload_leaf(i), 100 + u64::from(i))
+                wal.append(&test_payload(i), 100 + u64::from(i))
                     .expect("append");
             }
         }
@@ -479,7 +448,7 @@ mod tests {
         {
             let wal = Wal::open(&layout, None).expect("open");
             for i in 0..3u32 {
-                wal.append(&payload_leaf(i), 100 + u64::from(i))
+                wal.append(&test_payload(i), 100 + u64::from(i))
                     .expect("append");
             }
         }
@@ -501,14 +470,14 @@ mod tests {
         let (_d, layout) = make_layout();
         let wal = Wal::open(&layout, None).expect("open");
         for i in 0..3u32 {
-            wal.append(&payload_leaf(i), 100 + u64::from(i))
+            wal.append(&test_payload(i), 100 + u64::from(i))
                 .expect("append");
         }
         wal.archive(0, 2).expect("archive");
         assert!(layout.wal_archived_path(0, 2).is_file());
         let replay = wal.replay().expect("replay");
         assert_eq!(replay.entries.len(), 0);
-        wal.append(&payload_leaf(99), 200).expect("append");
+        wal.append(&test_payload(99), 200).expect("append");
         let replay = wal.replay().expect("replay");
         assert_eq!(replay.entries.len(), 1);
         assert_eq!(replay.entries.first().expect("present").seq, 3);
@@ -520,12 +489,12 @@ mod tests {
         let (_d, layout) = make_layout();
         let wal = Wal::open(&layout, None).expect("open");
         for i in 0..3u32 {
-            wal.append(&payload_leaf(i), 100 + u64::from(i))
+            wal.append(&test_payload(i), 100 + u64::from(i))
                 .expect("append");
         }
         drop(wal);
 
-        let payload_bin = bincode::serialize(&payload_leaf(99)).expect("ser");
+        let payload_bin = bincode::serialize(&test_payload(99)).expect("ser");
         let payload_len: u32 = payload_bin.len().try_into().expect("len");
         let mut header = [0u8; 24];
         header[0..8].copy_from_slice(&99u64.to_be_bytes()); // seq=99, should be 3
@@ -562,7 +531,7 @@ mod tests {
     fn fresh_open_with_min_seq_floor_resumes_at_floor() {
         let (_d, layout) = make_layout();
         let wal = Wal::open(&layout, Some(99)).expect("open");
-        let seq = wal.append(&payload_leaf(0), 100).expect("append");
+        let seq = wal.append(&test_payload(0), 100).expect("append");
         assert_eq!(seq, 100);
     }
 }

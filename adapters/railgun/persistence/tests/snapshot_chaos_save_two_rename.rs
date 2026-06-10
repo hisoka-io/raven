@@ -18,7 +18,7 @@
     clippy::cast_possible_truncation
 )]
 
-use raven_railgun_persistence::{Snapshot, SnapshotId, StoreLayout};
+use raven_railgun_persistence::{Snapshot, SnapshotId, StoreLayout, SNAPSHOT_MAGIC};
 use std::io::{BufRead, BufReader};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -97,7 +97,8 @@ fn kill_between_step_1_and_step_2_load_recovers_base_payload() {
     assert!(old_tmp.is_dir(), "post-kill: `.old.tmp` must exist");
     assert!(!final_dir.is_dir(), "post-kill: `final_dir` must be absent");
 
-    let loaded = Snapshot::load(&layout, SnapshotId(SNAP_ID)).expect("load with recovery");
+    let loaded =
+        Snapshot::load(&layout, SnapshotId(SNAP_ID), SNAPSHOT_MAGIC).expect("load with recovery");
     assert_eq!(loaded.data, BASE_PAYLOAD);
     assert!(final_dir.is_dir());
     assert!(!old_tmp.exists());
@@ -121,7 +122,8 @@ fn kill_between_step_2_and_step_3_load_picks_final_dir_and_cleans_up() {
         "post-kill: `.old.tmp` must still be present"
     );
 
-    let loaded = Snapshot::load(&layout, SnapshotId(SNAP_ID)).expect("load with both present");
+    let loaded = Snapshot::load(&layout, SnapshotId(SNAP_ID), SNAPSHOT_MAGIC)
+        .expect("load with both present");
     assert_eq!(loaded.data, NEW_PAYLOAD);
     assert!(!old_tmp.exists());
 }
@@ -146,7 +148,7 @@ fn round_trip_save_kill_load_never_loses_data_at_any_step() {
         let _ = child.wait();
 
         let layout = StoreLayout::open(dir.path()).expect("open layout");
-        let loaded = Snapshot::load(&layout, SnapshotId(SNAP_ID)).unwrap_or_else(|e| {
+        let loaded = Snapshot::load(&layout, SnapshotId(SNAP_ID), SNAPSHOT_MAGIC).unwrap_or_else(|e| {
             panic!("post-kill load at marker `{target}` must succeed; got {e:?}")
         });
         assert!(

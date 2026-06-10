@@ -5,7 +5,8 @@
     clippy::expect_used,
     clippy::unwrap_used,
     clippy::panic,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    clippy::indexing_slicing
 )]
 
 use raven_inspire::math::GaussianSampler;
@@ -18,7 +19,7 @@ use raven_inspire::{
     ServerInspiringCache, ServerResponse, ServerSessionStore,
 };
 
-use raven_inspire_client_wasm::{build_seeded_query_rust, extract_response_rust};
+use raven_client::{build_seeded_query_rust, extract_response_rust};
 
 /// Small params for fast CI; the byte-equality property holds at any param shape.
 fn test_params() -> InspireParams {

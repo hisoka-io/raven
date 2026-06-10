@@ -11,8 +11,9 @@
     clippy::unusual_byte_groupings
 )]
 
-use raven_railgun_persistence::snapshot::{Snapshot, SnapshotHeader, SnapshotId, SNAPSHOT_MAGIC};
-use raven_railgun_persistence::{PersistenceError, StoreLayout};
+use raven_railgun_persistence::{
+    PersistenceError, Snapshot, SnapshotHeader, SnapshotId, StoreLayout, SNAPSHOT_MAGIC,
+};
 use sha2::{Digest, Sha256};
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
@@ -56,7 +57,8 @@ fn legacy_bincode_payload_loads_via_sniff() {
 
     write_legacy_snapshot(&layout, SnapshotId(7), &payload).expect("write legacy");
 
-    let loaded = Snapshot::load(&layout, SnapshotId(7)).expect("legacy load via sniff");
+    let loaded =
+        Snapshot::load(&layout, SnapshotId(7), SNAPSHOT_MAGIC).expect("legacy load via sniff");
     assert_eq!(loaded.data, payload);
     assert_eq!(loaded.header.magic, SNAPSHOT_MAGIC);
     assert_eq!(loaded.header.data_len, payload.len() as u64);
@@ -77,14 +79,14 @@ fn new_zstd_payload_round_trips_via_save_then_load() {
         payload.push((rng_state & 0xFF) as u8);
     }
 
-    let snap = Snapshot::build(payload.clone());
+    let snap = Snapshot::build(payload.clone(), SNAPSHOT_MAGIC);
     snap.save(&layout, SnapshotId(11)).expect("save");
 
     let on_disk =
         std::fs::read(layout.snapshot_dir(SnapshotId(11)).join("data.bincode")).expect("read");
     assert_eq!(&on_disk[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
 
-    let loaded = Snapshot::load(&layout, SnapshotId(11)).expect("load round trip");
+    let loaded = Snapshot::load(&layout, SnapshotId(11), SNAPSHOT_MAGIC).expect("load round trip");
     assert_eq!(loaded.data, payload);
     assert_eq!(loaded.header.data_len, payload.len() as u64);
 }
@@ -103,7 +105,7 @@ fn corrupt_zstd_returns_typed_error() {
         rng ^= rng << 17;
         payload.push((rng & 0xFF) as u8);
     }
-    let snap = Snapshot::build(payload);
+    let snap = Snapshot::build(payload, SNAPSHOT_MAGIC);
     snap.save(&layout, SnapshotId(13)).expect("save");
 
     let body_path = layout.snapshot_dir(SnapshotId(13)).join("data.bincode");
@@ -118,7 +120,8 @@ fn corrupt_zstd_returns_typed_error() {
     on_disk[mid] ^= 0xFF;
     std::fs::write(&body_path, &on_disk).expect("rewrite tampered body");
 
-    let err = Snapshot::load(&layout, SnapshotId(13)).expect_err("tampered zstd body");
+    let err =
+        Snapshot::load(&layout, SnapshotId(13), SNAPSHOT_MAGIC).expect_err("tampered zstd body");
     match err {
         PersistenceError::SnapshotCorrupt(msg) => {
             assert!(
@@ -161,7 +164,7 @@ fn zstd_compression_ratio_at_production_blob() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let layout = StoreLayout::open(dir.path()).expect("open");
-    let snap = Snapshot::build(payload.clone());
+    let snap = Snapshot::build(payload.clone(), SNAPSHOT_MAGIC);
     snap.save(&layout, SnapshotId(101)).expect("save");
 
     let body_path = layout.snapshot_dir(SnapshotId(101)).join("data.bincode");
@@ -184,7 +187,7 @@ fn zstd_compression_ratio_at_production_blob() {
         "zstd-l3 ratio at production cell must be <= 0.30; got {ratio:.4}",
     );
 
-    let loaded = Snapshot::load(&layout, SnapshotId(101)).expect("load");
+    let loaded = Snapshot::load(&layout, SnapshotId(101), SNAPSHOT_MAGIC).expect("load");
     assert_eq!(loaded.data.len(), payload.len());
     assert_eq!(loaded.data, payload);
 }

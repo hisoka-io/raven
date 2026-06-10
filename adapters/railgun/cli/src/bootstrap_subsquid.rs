@@ -974,7 +974,7 @@ fn persist_initial_snapshot(
         .ok_or_else(|| {
             BootstrapError::Snapshot("manifest absent after bootstrap_inspire_instance".into())
         })?;
-    manifest.current_block_height = checkpoint_block;
+    manifest.current_marker = checkpoint_block;
     manifest
         .save(&layout_clone)
         .map_err(|e| BootstrapError::Snapshot(format!("manifest save: {e}")))?;
