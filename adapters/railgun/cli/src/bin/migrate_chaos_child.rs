@@ -166,8 +166,8 @@ fn main() {
         "child requires a committed snapshot in the seeded data_dir"
     );
 
-    let snap =
-        Snapshot::load(&layout, manifest.current_snapshot_id, SNAPSHOT_MAGIC).expect("load snapshot");
+    let snap = Snapshot::load(&layout, manifest.current_snapshot_id, SNAPSHOT_MAGIC)
+        .expect("load snapshot");
     let (mut state, recovered_seed_store) =
         restore_inspire_state_v6(&snap.data).expect("restore_inspire_state_v6");
 

@@ -339,7 +339,8 @@ mod tests {
             .save(&layout, SnapshotId(1))
             .expect("retry save must NOT fail with ENOTEMPTY");
 
-        let loaded = SnapshotFile::load(&layout, SnapshotId(1), TEST_MAGIC).expect("load post-retry");
+        let loaded =
+            SnapshotFile::load(&layout, SnapshotId(1), TEST_MAGIC).expect("load post-retry");
         assert_eq!(loaded.data, b"retry commit attempt");
     }
 
@@ -370,7 +371,8 @@ mod tests {
         let old_tmp = final_dir.with_extension("old.tmp");
         std::fs::rename(&final_dir, &old_tmp).expect("simulated step-1 displacement");
 
-        let loaded = SnapshotFile::load(&layout, SnapshotId(3), TEST_MAGIC).expect("load with recovery");
+        let loaded =
+            SnapshotFile::load(&layout, SnapshotId(3), TEST_MAGIC).expect("load with recovery");
         assert_eq!(loaded.data, payload);
         assert!(final_dir.is_dir());
         assert!(!old_tmp.exists());
@@ -396,7 +398,8 @@ mod tests {
         let body = wrap_for_disk(&new_snap.data).expect("wrap");
         atomic_write(&final_dir.join("data.bincode"), &body).expect("data");
 
-        let loaded = SnapshotFile::load(&layout, SnapshotId(2), TEST_MAGIC).expect("load with both present");
+        let loaded =
+            SnapshotFile::load(&layout, SnapshotId(2), TEST_MAGIC).expect("load with both present");
         assert_eq!(loaded.data, new_payload);
         assert!(!old_tmp.exists());
     }

@@ -165,8 +165,9 @@ impl InspirePersistence {
                 if manifest.current_snapshot_id == SnapshotId(0) {
                     (None, super::inspire::LogicalLeafStore::new(), u32::MAX)
                 } else {
-                    let snap = Snapshot::load(&layout, manifest.current_snapshot_id, SNAPSHOT_MAGIC)
-                        .map_err(|e| AdapterError::Internal(format!("snapshot load: {e}")))?;
+                    let snap =
+                        Snapshot::load(&layout, manifest.current_snapshot_id, SNAPSHOT_MAGIC)
+                            .map_err(|e| AdapterError::Internal(format!("snapshot load: {e}")))?;
                     let (s, store) = super::inspire::restore_inspire_state_v6(&snap.data)?;
                     let eps = u32::try_from(
                         s.encoded_db

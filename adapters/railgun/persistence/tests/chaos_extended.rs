@@ -101,8 +101,10 @@ fn partial_snapshot_dir_does_not_corrupt_subsequent_recovery() {
     // but the manifest still points at snap-1 (atomic-rename never fired for snap-2).
     let snap2_dir = layout.snapshot_dir(SnapshotId(2));
     std::fs::create_dir_all(&snap2_dir).expect("mkdir snap-2");
-    let snap2_full =
-        Snapshot::build(b"snap-2 full payload that we will truncate".to_vec(), SNAPSHOT_MAGIC);
+    let snap2_full = Snapshot::build(
+        b"snap-2 full payload that we will truncate".to_vec(),
+        SNAPSHOT_MAGIC,
+    );
     let header_bytes = bincode::serialize(&snap2_full.header).expect("ser header");
     std::fs::write(snap2_dir.join("header.bin"), &header_bytes).expect("write header");
     std::fs::write(snap2_dir.join("data.bincode"), b"trunc").expect("write trunc payload");

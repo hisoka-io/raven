@@ -146,7 +146,9 @@ mod tests {
         let mut m = sample();
         m.schema_version = MIN_READABLE_MANIFEST_SCHEMA_VERSION;
         m.save(&layout).expect("save legacy");
-        let back = Manifest::load(&layout).expect("load legacy").expect("present");
+        let back = Manifest::load(&layout)
+            .expect("load legacy")
+            .expect("present");
         assert_eq!(back.schema_version, MIN_READABLE_MANIFEST_SCHEMA_VERSION);
     }
 

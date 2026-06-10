@@ -148,9 +148,10 @@ fn round_trip_save_kill_load_never_loses_data_at_any_step() {
         let _ = child.wait();
 
         let layout = StoreLayout::open(dir.path()).expect("open layout");
-        let loaded = Snapshot::load(&layout, SnapshotId(SNAP_ID), SNAPSHOT_MAGIC).unwrap_or_else(|e| {
-            panic!("post-kill load at marker `{target}` must succeed; got {e:?}")
-        });
+        let loaded =
+            Snapshot::load(&layout, SnapshotId(SNAP_ID), SNAPSHOT_MAGIC).unwrap_or_else(|e| {
+                panic!("post-kill load at marker `{target}` must succeed; got {e:?}")
+            });
         assert!(
             loaded.data == BASE_PAYLOAD || loaded.data == NEW_PAYLOAD,
             "post-kill at `{target}`: unexpected payload ({} bytes)",
