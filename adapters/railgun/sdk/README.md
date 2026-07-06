@@ -2,20 +2,21 @@
 
 Drop-in `POINodeInterface` for the Railgun wallet stack. Privately resolves PPOI status, PPOI auth-paths, and commit-tree auth-paths against a Raven Railgun PIR adapter server.
 
-## One-line wallet swap
+## How it plugs in
+
+`RavenPOINodeInterface` implements Railgun's abstract `POINodeInterface`, the same class the stock `WalletPOINodeInterface` implements:
 
 ```ts
-import { RailgunWallet } from "@railgun-community/wallet";
 import { RavenPOINodeInterface } from "@raven/railgun-poi-node-interface";
 
-RailgunWallet.setPOINodeInterface(
-  new RavenPOINodeInterface({
-    endpoint: "https://raven.example.com",
-    bearerToken: process.env.RAVEN_BEARER_TOKEN!,
-    upstreamFallbackEndpoint: "https://poi.us.proxy.railwayapi.xyz",
-  }),
-);
+const poi = new RavenPOINodeInterface({
+  endpoint: "https://raven.example.com",
+  bearerToken: process.env.RAVEN_BEARER_TOKEN!,
+  upstreamFallbackEndpoint: "https://poi.us.proxy.railwayapi.xyz",
+});
 ```
+
+Wiring it into a wallet: today `startRailgunEngine` takes a list of POI node URLs and builds the stock `WalletPOINodeInterface` internally, and neither `WalletPOI` nor a POI-interface setter is part of the wallet's public API. Making `RavenPOINodeInterface` the active POI interface therefore needs a small, additive injection point in Railgun (one hook that accepts any `POINodeInterface`), or it is wired in through a fork. That injection point is the integration to land with the Railgun team.
 
 ## What it routes
 
