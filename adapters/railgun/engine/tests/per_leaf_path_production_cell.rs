@@ -117,7 +117,6 @@ fn pir_query_leaf_row(
 }
 
 #[test]
-#[ignore = "production-cell setup is heavy (~12s); per-leaf-path E2E sibling-walk byte-identity"]
 fn per_leaf_path_query_recovers_sibling_walk_and_root_for_target_leaves() {
     let (live_state, client_session, store, params) = build_live_state_and_session();
     let imt = store.imt(TREE_NUMBER).expect("tree present");

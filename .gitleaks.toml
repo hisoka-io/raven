@@ -1,0 +1,72 @@
+title = "Raven secret-scanning configuration"
+
+# Extends the upstream gitleaks ruleset. The rules below exist because the
+# default ruleset does NOT match RPC-provider credentials that are embedded as
+# a URL path segment: they are bare hex/alphanumeric strings with no
+# distinguishing prefix, so the generic-api-key heuristic skips them. Verified
+# by running the default ruleset against a commit known to contain one and
+# getting "no leaks found".
+[extend]
+useDefault = true
+
+[[rules]]
+id = "infura-project-id-in-url"
+description = "Infura project ID embedded in an RPC endpoint URL"
+regex = '''(?i)\b(?:https?|wss?)://[a-z0-9.-]*\binfura\.io/(?:ws/)?v3/([0-9a-f]{32})\b'''
+secretGroup = 1
+keywords = ["infura.io"]
+tags = ["rpc-provider", "infura", "credential"]
+
+[[rules]]
+id = "alchemy-api-key-in-url"
+description = "Alchemy API key embedded in an RPC endpoint URL"
+regex = '''(?i)\b(?:https?|wss?)://[a-z0-9.-]*\b(?:alchemyapi\.io|g\.alchemy\.com)/v2/([A-Za-z0-9_-]{20,})\b'''
+secretGroup = 1
+keywords = ["alchemyapi.io", "g.alchemy.com"]
+tags = ["rpc-provider", "alchemy", "credential"]
+
+[[rules]]
+id = "quicknode-endpoint-token"
+description = "QuickNode endpoint token embedded in an RPC endpoint URL"
+regex = '''(?i)\b(?:https?|wss?)://[a-z0-9.-]*\bquiknode\.pro/([0-9a-f]{40})\b'''
+secretGroup = 1
+keywords = ["quiknode.pro"]
+tags = ["rpc-provider", "quicknode", "credential"]
+
+[allowlist]
+description = """
+Build outputs, and the Railgun PPOI list identifier.
+
+`list_key` / `list_key_hex` is a 32-byte PUBLIC list identifier, not a
+credential: clients supply it in request bodies to the PPOI shim endpoints
+(`adapters/railgun/http/src/poi_shim.rs:39` `pub list_keys: Vec<HexHash>` and
+`:63` `pub list_key: HexHash`). A value the public API accepts as input cannot
+be a server secret. It trips the default `generic-api-key` heuristic purely on
+hex entropy.
+
+The allowlist is anchored on the `list_key` assignment shape rather than on the
+containing paths, so an actual credential appearing in the same files is still
+reported.
+
+The path entries are build outputs plus the directories `.gitignore` excludes
+from the repository entirely. `gitleaks --no-git` walks the filesystem and does
+not read `.gitignore`, so without these the scan reports local scratch state
+that can never reach a commit. Every path below is an explicit `.gitignore`
+entry (`.gitignore:2,14,15,16,19,22`); the scan therefore covers exactly the
+set of files that can be committed. Do NOT add a path here that git tracks.
+"""
+regexTarget = "line"
+regexes = [
+  '''list_key(_hex)?"?\s*[:=]\s*"(0x)?[0-9a-fA-F]{64}"''',
+]
+paths = [
+  '''(^|/)target/''',
+  '''(^|/)node_modules/''',
+  '''(^|/)pkg-node/''',
+  '''(^|/)pkg-bundler/''',
+  '''(^|/)no-commit/''',
+  '''(^|/)\.claude/''',
+  '''(^|/)\.agent/''',
+  '''(^|/)run/''',
+  '''(^|/)tmp/''',
+]

@@ -111,7 +111,6 @@ fn pir_query_at_flat(
 }
 
 #[test]
-#[ignore = "production-cell setup is heavy (~12s); per-node E2E byte-identity at multiple levels"]
 fn per_node_query_recovers_internal_nodes_at_levels_0_1_and_8() {
     let (live_state, client_session, store, params) = build_live_state_and_session();
     let imt = store.imt(TREE_NUMBER).expect("tree present");

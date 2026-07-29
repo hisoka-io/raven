@@ -17,6 +17,15 @@ failure-output = "final"
 success-output = "never"
 slow-timeout = { period = "120s", terminate-after = 3 }
 
+# Nightly production-parameter cell-shape closure lane. Identical to `ci` except
+# for the timeout budget: the empirical cell-width ladder performs ten full
+# ring_dim=2048 PIR setups and measured 147s wall / 430s CPU on a 16-core box,
+# so `ci`'s 120s x 3 = 360s termination would kill a healthy run on a 4-vCPU
+# runner. Raised here rather than in `ci` so the per-commit budget is unchanged.
+[profile.production-cell]
+inherits = "ci"
+slow-timeout = { period = "300s", terminate-after = 4 }
+
 # serialize tests that contend on shared global resources (child binary,
 # port binds, /tmp dirs, flock on a shared data_dir): one at a time
 [test-groups]

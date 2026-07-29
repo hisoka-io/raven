@@ -5,6 +5,10 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+  schedule:
+    # nightly production-cell closure lane
+    - cron: "0 3 * * *"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -80,6 +84,47 @@ jobs:
           token: ${{ secrets.SUBMODULE_TOKEN }}
       - name: check-hygiene
         run: adapters/railgun/scripts/check-hygiene.sh
+
+  secret-scan:
+    name: secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+      GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN }}
+          # full history so the pull-request range scan below can resolve
+          # base..head; the default shallow clone cannot
+          fetch-depth: 0
+      - name: install gitleaks
+        # pinned by version AND checksum: this job is a supply-chain control,
+        # so it must not itself fetch an unverified binary
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o /tmp/gitleaks.tar.gz "$url"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - name: scan working tree
+        # catches a secret that is present in the source right now, including
+        # submodule contents. --redact keeps any hit out of the public log.
+        run: gitleaks detect --source . --config .gitleaks.toml --no-git --redact --no-banner --exit-code 1
+      - name: scan commits introduced by this pull request
+        if: github.event_name == 'pull_request'
+        # blocks a secret that is added and then deleted within the same branch,
+        # which the working-tree scan above cannot see. Scoped to the PR range,
+        # NOT to full history: pre-existing history is a separate remediation
+        # tracked by the owner, and a permanently red job trains reviewers to
+        # ignore CI. Do not "fix" this by allowlisting a known-leaked credential.
+        run: |
+          set -euo pipefail
+          gitleaks detect --source . --config .gitleaks.toml --redact --no-banner --exit-code 1 \
+            --log-opts "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
 
   railgun-static:
     name: railgun adapter (fmt + check + clippy)
@@ -177,6 +222,63 @@ jobs:
             --all-targets \
             --cargo-profile ci-test \
             --profile ci
+      - name: sccache stats
+        run: sccache --show-stats
+        if: always()
+
+  production-cell-closure:
+    # nightly + on-demand. Runs the production-parameter (ring_dim 2048) cell-shape
+    # closure tests with --run-ignored all. A wrong cell shape does not error, it
+    # returns plaintext that decrypts to the wrong bytes, so this lane is the loud
+    # failure.
+    #
+    # The cheap closure tests are NOT ignored and so also run per-commit in the
+    # railgun-tests engine shard. What only runs here is the empirical cell-width
+    # ladder, which performs ten full production-parameter setups (~150 s) and is
+    # the evidence the width law is derived from.
+    #
+    # The filter is an explicit binary list, not `-p raven-railgun-engine`:
+    # --run-ignored all over the whole package would also start the ignored
+    # multi-instance and fill-sweep benches, which run for tens of minutes.
+    name: production-cell closure (d=2048, --run-ignored all)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      # re-declare -D warnings since RUSTFLAGS overrides the workflow-level env
+      RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=lld"
+    steps:
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install lld linker
+        run: sudo apt-get update && sudo apt-get install -y lld
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "railgun-tests"
+      - uses: taiki-e/install-action@nextest
+      - name: cargo nextest (production-cell closure, ignored included)
+        run: |
+          cargo nextest run \
+            --manifest-path adapters/railgun/Cargo.toml \
+            -p raven-railgun-engine \
+            --cargo-profile ci-test \
+            --profile production-cell \
+            --run-ignored all \
+            -E 'binary(db1_note_record_production_cell) + binary(db2_block_production_cell) + binary(pir_cell_width_law) + binary(per_leaf_path_production_cell) + binary(per_node_production_cell)'
       - name: sccache stats
         run: sccache --show-stats
         if: always()
