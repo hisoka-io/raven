@@ -1,5 +1,8 @@
-//! Byte-equality parity tests via the pure-Rust mirrors, which are kept identical
-//! to the wasm-bindgen wrappers (the wrappers take `JsValue` and can't run natively).
+//! Byte-equality parity tests via the pure-Rust mirrors.
+//!
+//! The production query path draws Gaussian noise from OS entropy, which no byte
+//! comparison can survive, so every call here goes through the pinned-noise-seed
+//! mirror. Entropy on the shipped surface is asserted in `client_entropy_kat.rs`.
 
 #![allow(
     clippy::expect_used,
@@ -19,7 +22,7 @@ use raven_inspire::{
     ServerInspiringCache, ServerResponse, ServerSessionStore,
 };
 
-use raven_client::{build_seeded_query_rust, extract_response_rust};
+use raven_client::{build_seeded_query_rust_with_noise_seed, extract_response_rust};
 
 /// Small params for fast CI; the byte-equality property holds at any param shape.
 fn test_params() -> InspireParams {
@@ -37,10 +40,34 @@ fn test_params() -> InspireParams {
 
 const ENTRY_BYTES: usize = 32;
 
+/// Fixed noise seed so the two legs of a parity comparison are byte-comparable.
+const PINNED_NOISE_SEED: [u8; 32] = [0x5a; 32];
+
 fn build_test_db(params: &InspireParams) -> Vec<u8> {
     let num_entries = params.ring_dim;
     (0..(num_entries * ENTRY_BYTES))
         .map(|i| (i % 251) as u8)
+        .collect()
+}
+
+/// `e + msg_term` per RGSW row, recovered as `b + a*s`. The `a` seeds come from
+/// `thread_rng` upstream, so this is the only byte-level view of a seeded query that
+/// two legs can be compared on.
+fn noise_witness(
+    query: &SeededClientQuery,
+    sk: &RlweSecretKey,
+    params: &InspireParams,
+) -> Vec<Vec<u64>> {
+    let ctx = params.ntt_context();
+    query
+        .rgsw_ciphertext
+        .rows
+        .iter()
+        .map(|row| {
+            let full = row.expand();
+            let a_s = full.a.mul_ntt(&sk.poly, &ctx);
+            (&full.b + &a_s).coeffs().to_vec()
+        })
         .collect()
 }
 
@@ -64,12 +91,22 @@ fn wasm_query_byte_equals_native_when_session_seed_is_pinned() {
     let session_wasm =
         ClientSession::new(crs.clone(), sk.clone(), &mut sampler_wasm_path).expect("session wasm");
 
-    let (state_native, query_native) =
-        build_seeded_query_rust(&session_native, &params, &encoded_db.config, target_idx)
-            .expect("native query");
-    let (state_wasm, query_wasm) =
-        build_seeded_query_rust(&session_wasm, &params, &encoded_db.config, target_idx)
-            .expect("wasm-mirror query");
+    let (state_native, query_native) = build_seeded_query_rust_with_noise_seed(
+        &session_native,
+        &params,
+        &encoded_db.config,
+        target_idx,
+        PINNED_NOISE_SEED,
+    )
+    .expect("native query");
+    let (state_wasm, query_wasm) = build_seeded_query_rust_with_noise_seed(
+        &session_wasm,
+        &params,
+        &encoded_db.config,
+        target_idx,
+        PINNED_NOISE_SEED,
+    )
+    .expect("wasm-mirror query");
 
     assert_eq!(query_native.shard_id, query_wasm.shard_id);
     assert_eq!(query_native.packing_mode, PackingMode::Inspiring);
@@ -79,6 +116,11 @@ fn wasm_query_byte_equals_native_when_session_seed_is_pinned() {
     assert_eq!(state_wasm.index, target_idx);
     assert_eq!(state_native.local_index, state_wasm.local_index);
     assert_eq!(state_native.shard_id, state_wasm.shard_id);
+    assert_eq!(
+        noise_witness(&query_native, &sk, &params),
+        noise_witness(&query_wasm, &sk, &params),
+        "under one pinned noise seed both legs must emit byte-identical query noise"
+    );
 
     let cache = ServerInspiringCache::new(&crs, &encoded_db).expect("cache");
     let store = ServerSessionStore::new();
@@ -133,8 +175,14 @@ fn wasm_extract_byte_equals_native() {
     let mut sampler_session = GaussianSampler::new(params.sigma);
     let session = ClientSession::new(crs.clone(), sk, &mut sampler_session).expect("session");
 
-    let (state, query) =
-        build_seeded_query_rust(&session, &params, &encoded_db.config, target_idx).expect("query");
+    let (state, query) = build_seeded_query_rust_with_noise_seed(
+        &session,
+        &params,
+        &encoded_db.config,
+        target_idx,
+        PINNED_NOISE_SEED,
+    )
+    .expect("query");
 
     let cache = ServerInspiringCache::new(&crs, &encoded_db).expect("cache");
     let store = ServerSessionStore::new();
@@ -172,8 +220,14 @@ fn bincode_roundtrip_preserves_query_and_state_shapes() {
     let mut sampler_session = GaussianSampler::new(params.sigma);
     let session = ClientSession::new(crs.clone(), sk, &mut sampler_session).expect("session");
 
-    let (state, query) =
-        build_seeded_query_rust(&session, &params, &encoded_db.config, target_idx).expect("query");
+    let (state, query) = build_seeded_query_rust_with_noise_seed(
+        &session,
+        &params,
+        &encoded_db.config,
+        target_idx,
+        PINNED_NOISE_SEED,
+    )
+    .expect("query");
 
     let query_bytes = bincode::serialize(&query).expect("serialize query");
     let query_rt: SeededClientQuery =
@@ -218,8 +272,14 @@ fn bincode_roundtrip_then_rehydrate_extracts_byte_identical_to_live_state() {
     let mut sampler_session = GaussianSampler::new(params.sigma);
     let session = ClientSession::new(crs.clone(), sk, &mut sampler_session).expect("session");
 
-    let (live_state, query) =
-        build_seeded_query_rust(&session, &params, &encoded_db.config, target_idx).expect("query");
+    let (live_state, query) = build_seeded_query_rust_with_noise_seed(
+        &session,
+        &params,
+        &encoded_db.config,
+        target_idx,
+        PINNED_NOISE_SEED,
+    )
+    .expect("query");
 
     let cache = ServerInspiringCache::new(&crs, &encoded_db).expect("cache");
     let store = ServerSessionStore::new();
@@ -232,7 +292,6 @@ fn bincode_roundtrip_then_rehydrate_extracts_byte_identical_to_live_state() {
     )
     .expect("respond");
 
-    // Path A: live state, no round-trip.
     let plain_live =
         extract_response_rust(&crs, &live_state, &response, ENTRY_BYTES).expect("extract live");
 
@@ -271,8 +330,14 @@ fn bincode_roundtrip_without_rehydrate_fails_in_extract() {
     let mut sampler_session = GaussianSampler::new(params.sigma);
     let session = ClientSession::new(crs.clone(), sk, &mut sampler_session).expect("session");
 
-    let (live_state, query) =
-        build_seeded_query_rust(&session, &params, &encoded_db.config, target_idx).expect("query");
+    let (live_state, query) = build_seeded_query_rust_with_noise_seed(
+        &session,
+        &params,
+        &encoded_db.config,
+        target_idx,
+        PINNED_NOISE_SEED,
+    )
+    .expect("query");
 
     let cache = ServerInspiringCache::new(&crs, &encoded_db).expect("cache");
     let store = ServerSessionStore::new();
@@ -312,24 +377,32 @@ fn rust_query_path_byte_equals_upstream_query_seeded() {
     let (crs, encoded_db, sk) =
         inspire_setup(&params, &database, ENTRY_BYTES, &mut sampler).expect("inspire_setup");
 
-    // Path A: upstream query_seeded directly
-    let mut sampler_a = GaussianSampler::new(params.sigma);
+    let mut sampler_a = GaussianSampler::from_seed(params.sigma, PINNED_NOISE_SEED);
     let sk_a: RlweSecretKey = sk.clone();
     let (state_a, mut query_a) =
         upstream_query_seeded(&crs, target_idx, &encoded_db.config, &sk_a, &mut sampler_a)
             .expect("upstream query_seeded");
     query_a.packing_mode = PackingMode::Inspiring;
 
-    // Path B: wasm-mirror via ClientSession
     let mut sampler_b = GaussianSampler::new(params.sigma);
     let session = ClientSession::new(crs.clone(), sk, &mut sampler_b).expect("session");
-    let (state_b, query_b) =
-        build_seeded_query_rust(&session, &params, &encoded_db.config, target_idx)
-            .expect("wasm-mirror query");
+    let (state_b, query_b) = build_seeded_query_rust_with_noise_seed(
+        &session,
+        &params,
+        &encoded_db.config,
+        target_idx,
+        PINNED_NOISE_SEED,
+    )
+    .expect("wasm-mirror query");
 
     assert_eq!(state_a.index, state_b.index);
     assert_eq!(state_a.shard_id, state_b.shard_id);
     assert_eq!(state_a.local_index, state_b.local_index);
     assert_eq!(query_a.shard_id, query_b.shard_id);
     assert_eq!(query_a.packing_mode, query_b.packing_mode);
+    assert_eq!(
+        noise_witness(&query_a, &sk_a, &params),
+        noise_witness(&query_b, &sk_a, &params),
+        "the mirror must draw the same noise as upstream query_seeded under one seed"
+    );
 }

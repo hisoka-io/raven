@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// sites keep compiling. The definitions live in `raven-core`.
 pub use raven_core::{Epoch, InstanceId, ServerError as AdapterError};
 
-/// 32-byte blinded commitment as defined in `engine/src/poi/blinded-commitment.ts`.
+/// 32-byte blinded commitment as defined in the Railgun engine's `src/poi/blinded-commitment.ts`.
 ///
 /// For shield/transact: `Poseidon(commitmentHash, npk, globalTreePosition)`.
 /// For unshield: `railgunTxid` formatted to 32 bytes.
@@ -58,7 +58,7 @@ impl ListKey {
 }
 
 /// Commitment type per `BlindedCommitmentType` in
-/// `shared-models/src/models/proof-of-innocence.ts:104-108`.
+/// `shared-models/src/models/proof-of-innocence.ts`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum BlindedCommitmentType {
@@ -74,7 +74,7 @@ pub enum BlindedCommitmentType {
 }
 
 /// PPOI status per `POIStatus` in
-/// `shared-models/src/models/proof-of-innocence.ts:138-147`.
+/// `shared-models/src/models/proof-of-innocence.ts`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum POIStatus {
@@ -91,7 +91,7 @@ pub enum POIStatus {
 /// Merkle authentication path: 16 sibling hashes (Poseidon BN254 field elements,
 /// 32 bytes each), the root they hash to, and the leaf-position bitmap.
 ///
-/// Same shape Railgun uses (`shared-models/src/models/proof-of-innocence.ts:28-33`)
+/// Same shape Railgun uses (`shared-models/src/models/proof-of-innocence.ts`)
 /// for both the commitment tree, the TXID tree, and per-list PPOI trees.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MerkleProof {
@@ -100,7 +100,7 @@ pub struct MerkleProof {
     /// Leaf-position bitmap: `bit_i = (leaf_index >> i) & 1`. During
     /// reconstruction, `0` = leaf-side is LEFT, `1` = leaf-side is RIGHT.
     /// Packed into `u16` vs the upstream 32-byte hex string
-    /// (`engine/src/merkletree/merkletree.ts:128-160`).
+    /// (Railgun engine `src/merkletree/merkletree.ts`).
     pub indices: u16,
     /// 16 sibling hashes, leaf-to-root.
     pub elements: [[u8; 32]; 16],

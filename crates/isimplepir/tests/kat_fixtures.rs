@@ -10,7 +10,7 @@
 //!
 //! These lock Raven's own wire bytes, NOT the Go `simplepir/` reference: Raven uses
 //! the paper-verbatim Extract (no DB + p/2 shift) plus HKDF + ChaCha20 A-derivation.
-//! See `UPSTREAM.md §kat-go scope` for the deferred cross-language KAT.
+//! See `UPSTREAM.md`, kat-go scope, for the deferred cross-language KAT.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -237,9 +237,9 @@ fn all_specs_have_committed_fixtures() {
     }
 }
 
-/// Locks the `RowUpdate` wire bytes for the paper Fig. 2 row-aggregation delta
-/// `β_edit = (i, u'_i, k)` so any change to `u'_i` order, bincode layout, or
-/// version numbering surfaces as a byte mismatch.
+/// Locks the `RowUpdate` wire bytes for the Fig. 2 row-aggregation delta
+/// `beta_edit = (i, u'_i, k)` so any change to `u'_i` order, bincode layout,
+/// or version numbering surfaces as a byte mismatch.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RowUpdateFixture {
     label: String,

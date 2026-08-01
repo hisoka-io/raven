@@ -39,7 +39,8 @@ pub struct ProductionServeOptions {
     pub metrics_public: bool,
 }
 
-/// Locked production-cell shape: 65,536 x 512 B (16 Poseidon-Merkle siblings x 32 B).
+/// Default cell for the per-leaf encoder family: 65,536 rows x 512 B (16 siblings x 32 B).
+/// The per-node encoders derive a different shape from `TREE_DEPTH`.
 pub const DEFAULT_PRODUCTION_ENTRIES: usize = 65_536;
 pub const DEFAULT_PRODUCTION_ENTRY_BYTES: usize = 512;
 
@@ -119,9 +120,14 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
             opts.entry_bytes
         );
     }
-    raven_railgun_engine::pir_table::validate_total_entries(&opts.encoder, opts.entries)
-        .map_err(|e| anyhow::anyhow!("encoder cell shape rejected: {e}"))?;
     let params = InspireParams::secure_128_d2048();
+    raven_railgun_engine::pir_table::validate_cell_shape(
+        &opts.encoder,
+        opts.entries,
+        opts.entry_bytes,
+        params.ring_dim,
+    )
+    .map_err(|e| anyhow::anyhow!("encoder cell shape rejected: {e}"))?;
     let entries = opts.entries;
     let entry_bytes = opts.entry_bytes;
     let initial_db: Vec<u8> = (0..entries)
@@ -149,7 +155,12 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     config.role = InstanceRole::Live;
     config.encoder = opts.encoder;
     config.record_size = opts.entry_bytes;
-    config.entries_per_shard = u32::try_from(opts.entries.min(2048)).unwrap_or(2048);
+    config.entries_per_shard = u32::try_from(opts.entries.min(params.ring_dim)).unwrap_or(u32::MAX);
+    raven_railgun_engine::pir_table::validate_rows_per_shard(
+        config.entries_per_shard,
+        params.ring_dim,
+    )
+    .map_err(|e| anyhow::anyhow!("rows per shard rejected: {e}"))?;
     config.max_concurrent_queries = Some(opts.max_concurrent_queries);
     let resolved_k = u32::try_from(config.resolved_max_concurrent_queries()).unwrap_or(u32::MAX);
 

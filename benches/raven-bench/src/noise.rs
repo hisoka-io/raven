@@ -119,13 +119,13 @@ impl NoiseBenchReport {
     }
 }
 
-/// Standard normal quantile for a two-sided 95% confidence interval.
+/// Standard normal quantile bounding a two-sided 95% interval.
 const WILSON_Z_95: f64 = 1.96;
 
-/// Wilson score interval, upper bound at 95% confidence.
+/// Upper limit of the two-sided 95% Wilson score interval, i.e. a one-sided 97.5% bound.
 ///
-/// Defined as (p + z²/(2n) + z·sqrt(p(1-p)/n + z²/(4n²))) / (1 + z²/n)
-/// with z = 1.96. See <https://en.wikipedia.org/wiki/Binomial_proportion_confidence_interval#Wilson_score_interval>.
+/// Defined as (p + z^2/(2n) + z*sqrt(p(1-p)/n + z^2/(4n^2))) / (1 + z^2/n) with z = 1.96.
+/// See <https://en.wikipedia.org/wiki/Binomial_proportion_confidence_interval#Wilson_score_interval>.
 #[allow(clippy::cast_precision_loss)]
 fn wilson_upper_95(successes: u64, trials: u64) -> f64 {
     if trials == 0 {

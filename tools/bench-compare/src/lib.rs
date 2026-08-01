@@ -49,8 +49,14 @@ pub struct Comparison {
 
 #[derive(Debug)]
 pub enum CompareError {
-    Io { path: String, source: io::Error },
-    Parse { path: String, source: serde_json::Error },
+    Io {
+        path: String,
+        source: io::Error,
+    },
+    Parse {
+        path: String,
+        source: serde_json::Error,
+    },
 }
 
 impl fmt::Display for CompareError {
@@ -73,8 +79,14 @@ impl std::error::Error for CompareError {
 
 pub fn load(path: &Path) -> Result<BenchFile, CompareError> {
     let p = || path.display().to_string();
-    let bytes = fs::read(path).map_err(|e| CompareError::Io { path: p(), source: e })?;
-    serde_json::from_slice(&bytes).map_err(|e| CompareError::Parse { path: p(), source: e })
+    let bytes = fs::read(path).map_err(|e| CompareError::Io {
+        path: p(),
+        source: e,
+    })?;
+    serde_json::from_slice(&bytes).map_err(|e| CompareError::Parse {
+        path: p(),
+        source: e,
+    })
 }
 
 /// Produce comparisons sorted by bench name.
@@ -86,17 +98,40 @@ pub fn compare(baseline: &BenchFile, current: &BenchFile, threshold: f64) -> Vec
     for r in &current.results {
         by_name.entry(&r.bench).or_default().1 = Some(r);
     }
-    by_name.into_iter().map(|(n, (b, c))| compare_one(n, b, c, threshold)).collect()
+    by_name
+        .into_iter()
+        .map(|(n, (b, c))| compare_one(n, b, c, threshold))
+        .collect()
 }
 
-fn compare_one(name: &str, b: Option<&BenchResult>, c: Option<&BenchResult>, threshold: f64) -> Comparison {
+fn compare_one(
+    name: &str,
+    b: Option<&BenchResult>,
+    c: Option<&BenchResult>,
+    threshold: f64,
+) -> Comparison {
     let baseline_ns = b.map(|x| x.median_ns);
     let current_ns = c.map(|x| x.median_ns);
     let (Some(b), Some(c)) = (b, c) else {
-        let verdict = if baseline_ns.is_none() { Verdict::BaselineMissing } else { Verdict::CurrentMissing };
-        return Comparison { bench: name.into(), baseline_ns, current_ns, delta_pct: None, p_value: None, verdict };
+        let verdict = if baseline_ns.is_none() {
+            Verdict::BaselineMissing
+        } else {
+            Verdict::CurrentMissing
+        };
+        return Comparison {
+            bench: name.into(),
+            baseline_ns,
+            current_ns,
+            delta_pct: None,
+            p_value: None,
+            verdict,
+        };
     };
-    let delta_pct = if b.median_ns == 0.0 { 0.0 } else { (c.median_ns - b.median_ns) / b.median_ns };
+    let delta_pct = if b.median_ns == 0.0 {
+        0.0
+    } else {
+        (c.median_ns - b.median_ns) / b.median_ns
+    };
     let verdict = if b.median_ns == c.median_ns {
         Verdict::Identical
     } else if delta_pct.abs() <= threshold {
@@ -159,7 +194,7 @@ fn student_t_two_sided_p(t: f64, df: f64) -> f64 {
     reg_incomplete_beta(x, 0.5 * df, 0.5).clamp(0.0, 1.0)
 }
 
-/// Regularized incomplete beta `I(x; a, b)` via Lentz CF (NR §6.4) with
+/// Regularized incomplete beta `I(x; a, b)` via Lentz CF (Numerical Recipes 6.4) with
 /// symmetric branch swap at `x > (a + 1) / (a + b + 2)` for tail stability.
 fn reg_incomplete_beta(x: f64, a: f64, b: f64) -> f64 {
     if !(x.is_finite() && a.is_finite() && b.is_finite()) || a <= 0.0 || b <= 0.0 {
@@ -172,8 +207,7 @@ fn reg_incomplete_beta(x: f64, a: f64, b: f64) -> f64 {
         return 1.0;
     }
     // ln front factor: x^a * (1-x)^b / (a * B(a,b))
-    let log_front =
-        a * x.ln() + b * (1.0 - x).ln() - (ln_gamma(a) + ln_gamma(b) - ln_gamma(a + b));
+    let log_front = a * x.ln() + b * (1.0 - x).ln() - (ln_gamma(a) + ln_gamma(b) - ln_gamma(a + b));
     let symmetry_pivot = (a + 1.0) / (a + b + 2.0);
     if x < symmetry_pivot {
         let cf = beta_cf(x, a, b);
@@ -184,7 +218,7 @@ fn reg_incomplete_beta(x: f64, a: f64, b: f64) -> f64 {
     }
 }
 
-/// Modified Lentz CF for the incomplete beta (NR §6.4). Iteration cap +
+/// Modified Lentz CF for the incomplete beta (Numerical Recipes 6.4). Iteration cap +
 /// tiny-floor keep the loop finite for pathological inputs.
 fn beta_cf(x: f64, a: f64, b: f64) -> f64 {
     const MAX_ITER: u32 = 200;
@@ -216,7 +250,7 @@ fn beta_cf(x: f64, a: f64, b: f64) -> f64 {
     h
 }
 
-/// Lanczos ln Γ(z), g=7 / 9-coef; |err| < 1e-13 for z > 0.5.
+/// Lanczos ln Gamma(z), g=7 / 9-coef; |err| < 1e-13 for z > 0.5.
 fn ln_gamma(z: f64) -> f64 {
     const G: f64 = 7.0;
     const COEF: [f64; 9] = [
@@ -231,7 +265,7 @@ fn ln_gamma(z: f64) -> f64 {
         1.505_632_735_149_311_6e-7,
     ];
     if z < 0.5 {
-        // Reflection: ln Γ(z) = ln(π / sin(π z)) - ln Γ(1 - z).
+        // Reflection: ln Gamma(z) = ln(pi / sin(pi z)) - ln Gamma(1 - z).
         let pi = std::f64::consts::PI;
         return (pi / (pi * z).sin()).ln() - ln_gamma(1.0 - z);
     }
@@ -244,10 +278,18 @@ fn ln_gamma(z: f64) -> f64 {
     0.5 * (2.0 * std::f64::consts::PI).ln() + (z + 0.5) * t.ln() - t + x.ln()
 }
 
-pub fn render_human(baseline_path: &str, current_path: &str, threshold: f64, rows: &[Comparison]) -> String {
+pub fn render_human(
+    baseline_path: &str,
+    current_path: &str,
+    threshold: f64,
+    rows: &[Comparison],
+) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
-    let _ = writeln!(out, "Bench-compare: baseline={baseline_path} vs current={current_path}");
+    let _ = writeln!(
+        out,
+        "Bench-compare: baseline={baseline_path} vs current={current_path}"
+    );
     let _ = writeln!(out, "Regression threshold: {:.1}%", threshold * 100.0);
     let _ = writeln!(
         out,
@@ -259,7 +301,10 @@ pub fn render_human(baseline_path: &str, current_path: &str, threshold: f64, row
     for r in rows {
         let baseline = r.baseline_ns.map(format_ns).unwrap_or_else(na);
         let current = r.current_ns.map(format_ns).unwrap_or_else(na);
-        let delta = r.delta_pct.map(|d| format!("{:+.1}%", d * 100.0)).unwrap_or_else(na);
+        let delta = r
+            .delta_pct
+            .map(|d| format!("{:+.1}%", d * 100.0))
+            .unwrap_or_else(na);
         let sig = r.p_value.map(|p| format!("{p:.3}")).unwrap_or_else(na);
         let verdict = match r.verdict {
             Verdict::Identical => "identical",
@@ -270,33 +315,56 @@ pub fn render_human(baseline_path: &str, current_path: &str, threshold: f64, row
             Verdict::CurrentMissing => "CURRENT MISSING",
         };
         let _ = writeln!(
-            out, "| {:<34} | {:>14} | {:>14} | {:>8} | {:<7} | {:<14} |",
-            truncate(&r.bench, 34), baseline, current, delta, sig, verdict,
+            out,
+            "| {:<34} | {:>14} | {:>14} | {:>8} | {:<7} | {:<14} |",
+            truncate(&r.bench, 34),
+            baseline,
+            current,
+            delta,
+            sig,
+            verdict,
         );
     }
-    let regressed: Vec<&str> = rows.iter().filter(|r| r.verdict == Verdict::Regression).map(|r| r.bench.as_str()).collect();
+    let regressed: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.verdict == Verdict::Regression)
+        .map(|r| r.bench.as_str())
+        .collect();
     out.push('\n');
     if regressed.is_empty() {
         out.push_str("Verdict: no benches regressed past threshold. Exit code: 0.\n");
     } else {
         let _ = writeln!(
-            out, "Verdict: {} bench(es) REGRESSED past {:.1}% threshold ({}). Exit code: 1.",
-            regressed.len(), threshold * 100.0, regressed.join(", "),
+            out,
+            "Verdict: {} bench(es) REGRESSED past {:.1}% threshold ({}). Exit code: 1.",
+            regressed.len(),
+            threshold * 100.0,
+            regressed.join(", "),
         );
     }
     out
 }
 
 fn format_ns(ns: f64) -> String {
-    if ns >= 1e9 { format!("{:.2} s", ns / 1e9) }
-    else if ns >= 1e6 { format!("{:.2} ms", ns / 1e6) }
-    else if ns >= 1e3 { format!("{:.3} us", ns / 1e3) }
-    else { format!("{ns:.0} ns") }
+    if ns >= 1e9 {
+        format!("{:.2} s", ns / 1e9)
+    } else if ns >= 1e6 {
+        format!("{:.2} ms", ns / 1e6)
+    } else if ns >= 1e3 {
+        format!("{:.3} us", ns / 1e3)
+    } else {
+        format!("{ns:.0} ns")
+    }
 }
 
 fn truncate(s: &str, width: usize) -> String {
-    if s.len() <= width { s.to_string() }
-    else { let mut t = s[..width.saturating_sub(1)].to_string(); t.push('~'); t }
+    if s.len() <= width {
+        s.to_string()
+    } else {
+        let mut t = s[..width.saturating_sub(1)].to_string();
+        t.push('~');
+        t
+    }
 }
 
 pub fn has_regression(rows: &[Comparison]) -> bool {
@@ -314,7 +382,10 @@ mod welch_tests {
         let baseline = vec![-1.0, 0.0, 1.0]; // sample var = 1
         let current = vec![0.0, 1.0, 2.0];
         let p = welch_p(&baseline, &current).expect("p exists");
-        assert!((p - 0.287_993_3).abs() < 0.01, "expected p ~= 0.288, got {p}");
+        assert!(
+            (p - 0.287_993_3).abs() < 0.01,
+            "expected p ~= 0.288, got {p}"
+        );
     }
 
     // n=10 vs n=10, mean shift ~ 0.94 sample-sigma. df=18, |t| ~= 2.10
@@ -337,7 +408,10 @@ mod welch_tests {
         let current = vec![0.0, 1.0, 2.0];
         let p_t = welch_p(&baseline, &current).expect("p exists");
         let p_normal_reference = 0.2207_f64;
-        assert!(p_t > p_normal_reference + 0.05, "p_t {p_t} not > p_normal {p_normal_reference}");
+        assert!(
+            p_t > p_normal_reference + 0.05,
+            "p_t {p_t} not > p_normal {p_normal_reference}"
+        );
     }
 
     // Zero variance both sides: equal means -> p=1.0, distinct means -> p=0.0.
@@ -346,8 +420,14 @@ mod welch_tests {
         let a = vec![1000.0, 1000.0, 1000.0];
         let b = vec![1500.0, 1500.0, 1500.0];
         let p_equal = welch_p(&a, &a).expect("p exists");
-        assert!((p_equal - 1.0).abs() < 1e-12, "equal-means p {p_equal} != 1.0");
+        assert!(
+            (p_equal - 1.0).abs() < 1e-12,
+            "equal-means p {p_equal} != 1.0"
+        );
         let p_distinct = welch_p(&a, &b).expect("p exists");
-        assert!(p_distinct.abs() < 1e-12, "distinct-means p {p_distinct} != 0.0");
+        assert!(
+            p_distinct.abs() < 1e-12,
+            "distinct-means p {p_distinct} != 0.0"
+        );
     }
 }

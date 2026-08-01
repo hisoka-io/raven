@@ -183,7 +183,7 @@ impl Imt {
         }
     }
 
-    /// Return the 16-sibling Merkle proof for the leaf at `leaf_index`.
+    /// Return the [`TREE_DEPTH`]-sibling Merkle proof for the leaf at `leaf_index`.
     ///
     /// # Errors
     /// Returns [`AdapterError::InvalidQuery`] if `leaf_index >= leaf_count`.

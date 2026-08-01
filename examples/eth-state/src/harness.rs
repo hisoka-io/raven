@@ -2,9 +2,12 @@
 //! drives a WRITE firehose while serving + verifying concurrent private READs.
 //!
 //! Proves the closing correctness story: C1 (every read byte-identical to the independent
-//! ledger, zero tolerance), C2 (freshness: chain_head - last_applied <= N), C5 (sustain:
-//! sidecar served-state lag bounded under load; serving-QPS reported honestly). The read
-//! path is the consume-both fan-out, so C3 (timing-leak safety) holds on every read.
+//! ledger, zero tolerance) and C2 (freshness: chain_head - last_applied <= N). The read path
+//! is the consume-both fan-out, so C3 (timing-leak safety) holds on every read.
+//!
+//! Two measurement contracts a reader must not overstate: the applied-marker lag equals the
+//! caller-supplied `head_ahead` (it is injected, not observed), and `qps_per_core` divides the
+//! read count by accumulated READ time only - the write firehose and the folds are excluded.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

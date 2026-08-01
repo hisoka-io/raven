@@ -193,6 +193,7 @@ version = "0.1.0-alpha.0"
 dependencies = [
  "bincode",
  "console_error_panic_hook",
+ "rand",
  "raven-inspire",
  "serde",
  "thiserror",

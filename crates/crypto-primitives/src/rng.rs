@@ -86,12 +86,7 @@ mod tests {
         assert_ne!(ba, bb);
     }
 
-    /// KAT for ChaCha20 with an all-zero seed and an all-zero nonce.
-    ///
-    /// Reference: RFC 8439 §2.3.2 test vector for ChaCha20 block function,
-    /// with key = 0x00..00 and counter/nonce = 0. `rand_chacha::ChaCha20Rng`
-    /// initialises its keystream identically, so the first 64 bytes of the
-    /// RNG output must match the RFC's first-block keystream bytes verbatim.
+    /// RFC 8439 appendix A.1 test vector 1: key 0, nonce 0, counter 0.
     #[test]
     fn kat_rfc8439_zero_seed_first_block() {
         let mut rng = DeterministicRng::from_seed([0u8; 32]);
@@ -128,9 +123,8 @@ mod tests {
         assert_eq!(got.as_slice(), expected.as_slice());
     }
 
-    /// Scope marker: ChaCha20 is used as a PRG, not AEAD, so RFC 8439 §A.5
-    /// and the A.1 vectors needing counter/nonce control are out of scope;
-    /// `SeedableRng` does not expose those inputs.
+    /// ChaCha20 is a PRG here, not AEAD; `SeedableRng` pins counter/nonce to 0,
+    /// so RFC 8439 vectors that vary them are unreachable.
     #[test]
     fn aead_scope_note() {}
 

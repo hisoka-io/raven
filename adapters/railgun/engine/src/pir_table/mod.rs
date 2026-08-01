@@ -17,7 +17,7 @@ pub mod list;
 pub use leaf::{PerLeafCommitmentEncoder, PerLeafEncoder, PerLeafPathEncoder, PerNodeEncoder};
 pub use list::{PerListNodeEncoder, PerListPathEncoder, PerListStatusEncoder};
 
-/// Static label registry — every concrete encoder exports a stable
+/// Static label registry - every concrete encoder exports a stable
 /// label string for `/v1/status` + manifest `encoder_label` matching.
 pub mod labels {
     /// T1 BC-membership encoder (default).
@@ -46,7 +46,7 @@ pub enum EncoderKind {
     /// T1 default: row = 32 B blinded commitment, padded to record_size.
     #[default]
     PerLeafBc,
-    /// T2/T3 path encoder; row = 16 siblings × 32 B = 512 B from per-tree IMT.
+    /// T2/T3 path encoder; row = 16 siblings x 32 B = 512 B from per-tree IMT.
     PerLeafPath {
         /// Tree this encoder is pinned to.
         tree_number: u32,
@@ -133,10 +133,29 @@ impl EncoderKind {
         }
     }
 
+    /// Row width the variant's canonical layout pins, ignoring any request.
+    #[must_use]
+    pub const fn fixed_record_size(&self) -> Option<usize> {
+        match self {
+            Self::PerLeafPath { .. } | Self::PerListPath { .. } => Some(PATH_RECORD_BYTES),
+            Self::PerNode { .. } | Self::PerListNode { .. } => Some(NODE_HASH_BYTES),
+            Self::PerLeafBc | Self::PerListStatus { .. } => None,
+        }
+    }
+
+    /// Row width [`Self::build`] will actually use for `requested`.
+    #[must_use]
+    pub const fn effective_record_size(&self, requested: usize) -> usize {
+        match self.fixed_record_size() {
+            Some(fixed) => fixed,
+            None => requested,
+        }
+    }
+
     /// Construct the underlying encoder impl for `(record_size, entries_per_shard)`.
-    /// PerLeafPath is fixed at `record_size = 512` per the locked T2/T3 spec
-    /// regardless of the requested record_size — caller's `record_size`
-    /// hint is ignored for the path variant.
+    /// Variants with a canonical row layout ignore `record_size`; ask
+    /// [`Self::effective_record_size`] first, or gate on [`validate_cell_shape`],
+    /// so the substitution is never silent.
     pub fn build(
         &self,
         record_size: usize,
@@ -176,8 +195,8 @@ impl EncoderKind {
 pub const MIN_RECORD_SIZE: usize = 32;
 /// 32-byte BN254 Poseidon node / leaf / blinded-commitment hash size.
 pub const NODE_HASH_BYTES: usize = 32;
-/// 16 sibling hashes × 32 B = 512 B path record size for `PerLeafPath` /
-/// `PerListPath` encoders.
+/// Path record size for `PerLeafPath` / `PerListPath`: [`TREE_DEPTH`] siblings
+/// x [`NODE_HASH_BYTES`].
 pub const PATH_RECORD_BYTES: usize = TREE_DEPTH * NODE_HASH_BYTES;
 /// 2^16 = 65,536 leaves per Railgun commitment tree.
 pub const LEAVES_PER_TREE: u32 = 1u32 << TREE_DEPTH;
@@ -218,13 +237,134 @@ pub fn validate_total_entries(encoder: &EncoderKind, total_entries: usize) -> Re
     Ok(())
 }
 
+/// Column count `entry_size` induces in the InspiRING packing.
+#[must_use]
+pub fn pir_cell_columns(entry_size: usize) -> usize {
+    entry_size.div_ceil(2).max(1)
+}
+
+/// Whether `entry_size` is a legal cell width at `ring_dim`.
+///
+/// The packing generator is `2n / gamma + 1` for `gamma < n` and `5` otherwise;
+/// the division is integer, so a column count outside this law yields the wrong
+/// automorphism and plaintext that decrypts to unrelated bytes with no error on
+/// the query path. Empirical ladder: `engine/tests/pir_cell_width_law.rs`.
+#[must_use]
+pub fn is_legal_cell_width(entry_size: usize, ring_dim: usize) -> bool {
+    let cols = pir_cell_columns(entry_size);
+    entry_size > 0 && cols.is_power_of_two() && cols <= ring_dim / 2
+}
+
+/// Next ladder width at or above `entry_size` - `entry_size` rounded up to a power-of-two
+/// width - or `None` for 0 and for widths past the `ring_dim` ceiling.
+///
+/// Not the smallest width [`is_legal_cell_width`] accepts: 63 and 511 satisfy the predicate
+/// and this still returns 64 and 512. The predicate only tests the induced column count,
+/// while the seven widths in `engine/tests/pir_cell_width_law.rs` are the ones measured end
+/// to end, so a remedy points at a measured width.
+#[must_use]
+pub fn next_legal_cell_width(entry_size: usize, ring_dim: usize) -> Option<usize> {
+    if entry_size == 0 {
+        return None;
+    }
+    let cols = pir_cell_columns(entry_size).next_power_of_two();
+    (cols <= ring_dim / 2).then_some(cols * 2)
+}
+
+/// Validate a record width against [`is_legal_cell_width`].
+///
+/// # Errors
+/// Returns [`AdapterError::InvalidQuery`] when `entry_size` is zero or induces a
+/// column count that is not a power of two no larger than `ring_dim / 2`.
+pub fn validate_cell_width(entry_size: usize, ring_dim: usize) -> Result<()> {
+    if entry_size == 0 {
+        return Err(AdapterError::InvalidQuery(
+            "PIR record width must be > 0".to_string(),
+        ));
+    }
+    if is_legal_cell_width(entry_size, ring_dim) {
+        return Ok(());
+    }
+    let cols = pir_cell_columns(entry_size);
+    let max_cols = ring_dim / 2;
+    let remedy = match next_legal_cell_width(entry_size, ring_dim) {
+        Some(next) => format!("configure record width {next}"),
+        None => format!(
+            "no legal width at or above {entry_size} exists; the widest legal record at \
+             ring_dim {ring_dim} is {max_legal}",
+            max_legal = max_cols * 2
+        ),
+    };
+    Err(AdapterError::InvalidQuery(format!(
+        "PIR record width {entry_size} induces num_columns = ceil({entry_size}/2) = {cols}, \
+         which must be a power of two no larger than ring_dim/2 = {max_cols}. Outside that \
+         law the InspiRING generator 2n/gamma+1 is inexact, every served byte is wrong, and \
+         nothing on the query path returns an error. {remedy}"
+    )))
+}
+
+/// Validate the operator-supplied cell shape for `encoder` at `ring_dim`.
+///
+/// # Errors
+/// Returns [`AdapterError::InvalidQuery`] when the cell undersizes the encoder, when
+/// `record_size` differs from a canonical layout the encoder would substitute, or
+/// when the width breaks [`is_legal_cell_width`].
+pub fn validate_cell_shape(
+    encoder: &EncoderKind,
+    total_entries: usize,
+    record_size: usize,
+    ring_dim: usize,
+) -> Result<()> {
+    validate_total_entries(encoder, total_entries)?;
+    if let Some(fixed) = encoder.fixed_record_size() {
+        if record_size != fixed {
+            return Err(AdapterError::InvalidQuery(format!(
+                "encoder {label} pins record width {fixed} by its canonical row layout and \
+                 will not honor the requested {record_size}: the encoded database would be \
+                 built at {record_size} while every re-encoded shard delivers {fixed}-byte \
+                 rows. Configure record width {fixed}. If a data_dir was already populated \
+                 at {record_size}-byte rows it must also be re-bootstrapped, because \
+                 reconfiguring the width does not convert existing shards; reopening a \
+                 {record_size}-byte cell under this encoder is refused at recovery.",
+                label = encoder.label(),
+            )));
+        }
+    }
+    validate_cell_width(record_size, ring_dim)
+}
+
+/// Validate the rows-per-shard an encoder will be built with against `ring_dim`.
+///
+/// `setup` sizes every shard at `ring_dim * entry_size` bytes, so
+/// `ShardConfig::entries_per_shard` is exactly `ring_dim` rows at any record width. Below that
+/// the encoder maps shard `s` to the row window starting at `s * entries_per_shard` while the
+/// shard it overwrites starts at `s * ring_dim`, and the rebuilt buffer is still one
+/// well-formed shard, so nothing on the re-encode or query path returns an error. Above it
+/// `encode_database` refuses the shard config.
+///
+/// # Errors
+/// Returns [`AdapterError::InvalidQuery`] unless `entries_per_shard == ring_dim`.
+pub fn validate_rows_per_shard(entries_per_shard: u32, ring_dim: usize) -> Result<()> {
+    if entries_per_shard as usize == ring_dim {
+        return Ok(());
+    }
+    Err(AdapterError::InvalidQuery(format!(
+        "rows per shard {entries_per_shard} must equal ring_dim {ring_dim}: PIR setup sizes \
+         every shard at ring_dim * entry_size bytes, so ShardConfig::entries_per_shard is \
+         always exactly {ring_dim} rows, whatever the record width. At {entries_per_shard} the \
+         encoder writes shard s from the rows starting at s * {entries_per_shard} into the \
+         shard holding the rows starting at s * {ring_dim}, and neither the re-encode nor the \
+         query path returns an error. Configure rows per shard {ring_dim}."
+    )))
+}
+
 /// Shard-dirty walk shared by the path encoders. Inserting `leaf_index`
 /// invalidates the stored path of every prior leaf sharing an ancestor: at
 /// level `k` those are `[block_start, leaf_index)` where
 /// `block_start = (leaf_index >> k) << k`.
 ///
 /// Mapped per level to the shard range `[block_start/eps ..= (leaf_index-1)/eps]`
-/// so the cost is `O(num_shards × TREE_DEPTH)`, not `O(leaf_index × TREE_DEPTH)`.
+/// so the cost is `O(num_shards x TREE_DEPTH)`, not `O(leaf_index x TREE_DEPTH)`.
 pub(crate) fn path_affected_shards_into(
     entries_per_shard: u32,
     leaf_index: u32,
@@ -660,7 +800,7 @@ mod tests {
 
     #[test]
     fn path_affected_shards_byte_identity_old_vs_new_impl() {
-        // Old O(N) implementation kept inline as oracle.
+        // O(N) reference oracle.
         fn old_impl(entries_per_shard: u32, leaf_index: u32) -> std::collections::BTreeSet<u32> {
             let mut dirty = std::collections::BTreeSet::new();
             if leaf_index >= LEAVES_PER_TREE {

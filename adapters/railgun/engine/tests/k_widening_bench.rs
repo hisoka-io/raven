@@ -36,7 +36,7 @@ struct CellShape {
     label: &'static str,
     entries_log2: u32,
     entry_bytes: usize,
-    /// γ = ceil(entry_bytes * 8 / 16) = ceil(entry_bytes / 2)
+    /// gamma = ceil(entry_bytes * 8 / 16) = ceil(entry_bytes / 2)
     gamma: usize,
 }
 

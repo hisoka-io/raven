@@ -73,14 +73,14 @@ pub struct CommitTreeProofRequest {
     pub leaf_index: u32,
 }
 
-/// Railgun-shaped Merkle proof JSON (`shared-models/proof-of-innocence.ts:28-33`).
+/// Railgun-shaped Merkle proof JSON (`shared-models/src/models/proof-of-innocence.ts`).
 #[derive(Debug, Clone, Serialize)]
 pub struct MerkleProofJson {
     /// Blinded commitment hex for PPOI proofs; empty for commit-tree proofs.
     pub leaf: HexHash,
     /// Sibling-hash chain, leaf-to-root, 16 entries.
     pub elements: Vec<HexHash>,
-    /// Leaf index as 32-byte big-endian hex (matches upstream `BigInt` → `nToHex(., 32)`).
+    /// Leaf index as 32-byte big-endian hex (matches upstream `BigInt` -> `nToHex(., 32)`).
     pub indices: HexHash,
     /// Merkle root hex.
     pub root: HexHash,

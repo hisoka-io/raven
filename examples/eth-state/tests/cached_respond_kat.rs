@@ -2,8 +2,13 @@
 //! the SERIALIZED-response level (a stronger assertion than the existing decode/plaintext
 //! equality), and must be dramatically faster at the demo's 32-byte / gamma=16 cell. Both
 //! functions are exercised directly here, independent of the crate's `cached-respond` feature.
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, clippy::print_stdout, clippy::print_stderr)]
-
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 
 use std::time::Instant;
 
@@ -62,8 +67,7 @@ fn cached_vs_noncached_latency() {
     let session =
         build_session(&state.crs, sk, params.sigma, seed.wrapping_add(1)).expect("session");
     let shard_cfg = state.encoded_db.config.clone();
-    let (_qs, query) =
-        build_seeded_query_rust(&session, &params, &shard_cfg, 1000).expect("query");
+    let (_qs, query) = build_seeded_query_rust(&session, &params, &shard_cfg, 1000).expect("query");
 
     // Non-cached rebuilds PackParams/OfflinePackingKeys inline per call (the ~3.8s cost), so
     // sample it sparingly; the cached path reuses the prebuilt cache.
@@ -99,7 +103,10 @@ fn cached_vs_noncached_latency() {
     // ISOLATED single-respond micro-bench (not the end-to-end consume-both read, which is ~2 legs
     // plus query/extract). The measured win is ~300x+; a floor of 100x catches a broken/bypassed
     // cache without flaking on machine variance.
-    assert!(speedup > 100.0, "cached respond speedup must be large; got {speedup:.1}x");
+    assert!(
+        speedup > 100.0,
+        "cached respond speedup must be large; got {speedup:.1}x"
+    );
 }
 
 const ENTRIES_PER_SHARD: usize = 2048;

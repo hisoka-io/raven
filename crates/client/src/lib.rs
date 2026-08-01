@@ -6,10 +6,16 @@
 //! complex Rust types cross the JS boundary as bincode-encoded `Vec<u8>`. See
 //! `tests/parity_native_vs_wasm.rs` for byte-equality tests against a native
 //! Rust client.
+//!
+//! Every secret drawn here - the RLWE key, the packing-key noise, the per-query
+//! noise - comes from `OsRng`. No entry point on this surface accepts a caller-
+//! supplied seed; `tests/client_entropy_kat.rs` holds that line.
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 #![deny(missing_docs)]
 
+use rand::rngs::OsRng;
+use rand::RngCore;
 use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, ShardConfig};
 use raven_inspire::rlwe::RlweSecretKey;
@@ -52,6 +58,25 @@ enum WasmClientError {
     Encode { what: &'static str, detail: String },
     #[error("raven-inspire {op}: {detail}")]
     Inspire { op: &'static str, detail: String },
+    #[error("OS entropy unavailable for {what}: {detail}")]
+    Entropy { what: &'static str, detail: String },
+}
+
+/// Gaussian sampler over a fresh 32-byte OS seed.
+///
+/// `GaussianSampler::new` and `with_seed` build `ChaCha20Rng::seed_from_u64`, so
+/// `new` is a fixed all-zero seed: every client would draw the same secret key and
+/// the same noise. `from_seed` is the only constructor that takes full entropy, and
+/// a failed draw MUST surface as an error rather than fall back to a weaker source.
+fn os_seeded_sampler(sigma: f64, what: &'static str) -> Result<GaussianSampler, WasmClientError> {
+    let mut seed = [0u8; 32];
+    OsRng
+        .try_fill_bytes(&mut seed)
+        .map_err(|e| WasmClientError::Entropy {
+            what,
+            detail: e.to_string(),
+        })?;
+    Ok(GaussianSampler::from_seed(sigma, seed))
 }
 
 impl From<WasmClientError> for JsValue {
@@ -174,7 +199,8 @@ pub fn build_client_session(
     let inspire_params: InspireParams = decode(&bundle.inspire_params_bincode, "inspire_params")?;
     let secret_key: RlweSecretKey = decode(&bundle.rlwe_secret_key_bincode, "rlwe_secret_key")?;
     let crs = decode_versioned_crs(crs_bincode)?;
-    let mut sampler = GaussianSampler::new(inspire_params.sigma);
+    // the packing keys ship to the server; a known error term solves for the secret key
+    let mut sampler = os_seeded_sampler(inspire_params.sigma, "client_session_packing_keys")?;
     let session = ClientSession::new(crs, secret_key, &mut sampler).map_err(|e| {
         WasmClientError::Inspire {
             op: "ClientSession::new",
@@ -226,7 +252,8 @@ pub fn build_seeded_query(
     target_idx: u64,
 ) -> Result<Vec<u8>, JsValue> {
     let shard_config: ShardConfig = decode(shard_config_bincode, "shard_config")?;
-    let mut sampler = GaussianSampler::new(session.params.sigma);
+    // reused query noise lets the server re-encrypt each candidate index and match bytes
+    let mut sampler = os_seeded_sampler(session.params.sigma, "seeded_query_noise")?;
     let (client_state, mut query) = session
         .inner
         .query_seeded(target_idx, &shard_config, &mut sampler)
@@ -346,7 +373,8 @@ pub fn build_instance_params_blob(
     let inspire_params: InspireParams = decode(inspire_params_bincode, "inspire_params")?;
     // decode-check catches caller params/shard drift at session bind
     let _shard_config: ShardConfig = decode(shard_config_bincode, "shard_config")?;
-    let mut sampler = GaussianSampler::new(inspire_params.sigma);
+    // the key is derived entirely from this sampler: one seed here is one key for every client
+    let mut sampler = os_seeded_sampler(inspire_params.sigma, "rlwe_secret_key")?;
     let secret_key = RlweSecretKey::generate(&inspire_params, &mut sampler);
     let secret_key_bincode = encode(&secret_key, "rlwe_secret_key")?;
     let bundle = WasmInstanceParamsBundle {
@@ -415,16 +443,44 @@ pub fn deserialize_client_session_rust(
     Ok((inner, inspire_params))
 }
 
-/// Rust-native mirror of [`build_seeded_query`].
+/// Rust-native mirror of [`build_seeded_query`]. Draws query noise from OS entropy,
+/// so the mirror is never weaker than the wasm path it stands in for.
 pub fn build_seeded_query_rust(
     session: &ClientSession,
     params: &InspireParams,
     shard_config: &ShardConfig,
     target_idx: u64,
 ) -> Result<(ClientState, SeededClientQuery), String> {
-    let mut sampler = GaussianSampler::new(params.sigma);
+    let mut sampler =
+        os_seeded_sampler(params.sigma, "seeded_query_noise").map_err(|e| e.to_string())?;
+    seeded_query_with_sampler(session, shard_config, target_idx, &mut sampler)
+}
+
+/// [`build_seeded_query_rust`] with the Gaussian noise seed pinned by the caller.
+///
+/// Test seam only: two calls under one seed emit byte-identical noise, which is what
+/// makes a native-vs-wasm byte comparison possible at all. Callers on a real query
+/// path MUST NOT pin a seed - a reused seed hands the server the query index.
+#[doc(hidden)]
+pub fn build_seeded_query_rust_with_noise_seed(
+    session: &ClientSession,
+    params: &InspireParams,
+    shard_config: &ShardConfig,
+    target_idx: u64,
+    noise_seed: [u8; 32],
+) -> Result<(ClientState, SeededClientQuery), String> {
+    let mut sampler = GaussianSampler::from_seed(params.sigma, noise_seed);
+    seeded_query_with_sampler(session, shard_config, target_idx, &mut sampler)
+}
+
+fn seeded_query_with_sampler(
+    session: &ClientSession,
+    shard_config: &ShardConfig,
+    target_idx: u64,
+    sampler: &mut GaussianSampler,
+) -> Result<(ClientState, SeededClientQuery), String> {
     let (state, mut query) = session
-        .query_seeded(target_idx, shard_config, &mut sampler)
+        .query_seeded(target_idx, shard_config, sampler)
         .map_err(|e| e.to_string())?;
     query.packing_mode = PackingMode::Inspiring;
     Ok((state, query))

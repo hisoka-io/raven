@@ -210,9 +210,9 @@ fn extract_with_zero_entry_size_does_not_panic() {
 #[test]
 fn build_seeded_query_with_oob_target_idx_panics_in_upstream_caught_by_panic_hook() {
     // out-of-range target_idx hits an upstream `expect` in
-    // `ShardConfig::shard_id_for_global` (crates/inspire/src/params.rs).
-    // catch_unwind here stands in for the WASM `init_panic_hook` net that turns
-    // the same panic into a JS Error instead of an opaque trap.
+    // `ShardConfig::index_to_shard`. catch_unwind here stands in for the WASM
+    // `init_panic_hook` net that turns the same panic into a JS Error instead
+    // of an opaque trap.
     let params = small_params();
     let database = build_test_db(&params);
 

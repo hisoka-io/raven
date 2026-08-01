@@ -44,9 +44,18 @@ fn identity_comparison_zero_diff() {
     cmd.arg(&baseline).arg(&baseline);
     let assert = cmd.assert().success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8");
-    assert!(stdout.contains("identical"), "expected 'identical' verdict, got:\n{stdout}");
-    assert!(stdout.contains("+0.0%"), "expected zero delta, got:\n{stdout}");
-    assert!(stdout.contains("Exit code: 0"), "expected zero-exit summary, got:\n{stdout}");
+    assert!(
+        stdout.contains("identical"),
+        "expected 'identical' verdict, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("+0.0%"),
+        "expected zero delta, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Exit code: 0"),
+        "expected zero-exit summary, got:\n{stdout}"
+    );
 }
 
 #[test]
@@ -56,7 +65,10 @@ fn significant_regression_detected() {
     let current = write_json(dir.path(), "current.json", CURRENT_1500);
 
     let mut cmd = Command::cargo_bin("bench-compare").expect("binary");
-    cmd.arg(&baseline).arg(&current).arg("--regression-threshold").arg("0.20");
+    cmd.arg(&baseline)
+        .arg(&current)
+        .arg("--regression-threshold")
+        .arg("0.20");
     cmd.assert()
         .failure()
         .code(1)
@@ -71,7 +83,10 @@ fn significant_improvement_acknowledged() {
     let current = write_json(dir.path(), "current.json", CURRENT_500);
 
     let mut cmd = Command::cargo_bin("bench-compare").expect("binary");
-    cmd.arg(&baseline).arg(&current).arg("--regression-threshold").arg("0.20");
+    cmd.arg(&baseline)
+        .arg(&current)
+        .arg("--regression-threshold")
+        .arg("0.20");
     cmd.assert()
         .success()
         .stdout(contains("IMPROVEMENT"))

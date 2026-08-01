@@ -7,18 +7,18 @@
  * Four sweep blocks, all gated behind `RAVEN_LIVE_URL` +
  * `RAVEN_LIVE_TOKEN` + `RAVEN_INFURA_URL` env vars:
  *
- *   1. Per-tree byte-identity sweep — N=20 random leaves per
+ *   1. Per-tree byte-identity sweep - N=20 random leaves per
  *      `commit-tree-{0,1,2,3}`, PIR-folded root cross-verified
  *      against on-chain `RailgunSmartWallet.rootHistory`.
  *
- *   2. Per-PPOI sweep — `ppoi-status-ofac` + `ppoi-paths-ofac`
+ *   2. Per-PPOI sweep - `ppoi-status-ofac` + `ppoi-paths-ofac`
  *      probed for non-empty corpus; if empty (Railway-deploy gap)
  *      the section `it.skip`s with a clear reason.
  *
- *   3. Fuzz testing — ~100 random-leaf iterations per commit-tree
+ *   3. Fuzz testing - ~100 random-leaf iterations per commit-tree
  *      to surface any byte-identity divergence in a wider sample.
  *
- *   4. Throughput benchmarks — per instance, 3 seeds × {K=1, K=4,
+ *   4. Throughput benchmarks - per instance, 3 seeds x {K=1, K=4,
  *      K=16}, latency p50/p95/p99 + qps, 3-seed methodology.
  *
  * Findings are written to a developer-local bench-results directory
@@ -65,7 +65,7 @@ const RUN_LIVE =
 const liveDescribe = RUN_LIVE ? describe : describe.skip;
 
 const PARAMS_DOWNLOAD_TIMEOUT_MS = 240_000;
-const TEST_TIMEOUT_MS = 1_200_000; // 20 min — fuzz + throughput is heavy
+const TEST_TIMEOUT_MS = 1_200_000; // 20 min - fuzz + throughput is heavy
 
 // Per-tree leaf-count caps. Trees 0 and 2 are static-full (closed at
 // 65,536). Tree 1 was closed-short at 65,535 by the upstream
@@ -81,7 +81,7 @@ const TREE_LEAF_COUNT: Record<number, number> = {
 };
 
 // Sample size per sweep. Defaults are tuned for the m6i.large 2-vCPU
-// host (each leaf-fold is 17 PIR queries × ~150ms = ~2.5s wall). The
+// host (each leaf-fold is 17 PIR queries x ~150ms = ~2.5s wall). The
 // per-tree byte-identity sweep at 20 leaves dominates wall time;
 // fuzz adds breadth at lower per-iteration cost via /batch.
 //
@@ -421,7 +421,7 @@ async function fetchBatch(
   // Hand the caller back the per-query `clientStateBincode` blobs
   // alongside the raw responses. `extract_response` requires the
   // exact `clientStateBincode` produced by the matching
-  // `build_seeded_query` call — re-issuing `build_seeded_query` for
+  // `build_seeded_query` call - re-issuing `build_seeded_query` for
   // the same idx would yield a different (fresh-randomness)
   // clientStateBincode that fails to decrypt.
   const clientStates = queryBundles.map((b) => b.clientStateBincode);

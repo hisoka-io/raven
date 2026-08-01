@@ -5,7 +5,7 @@
     clippy::indexing_slicing
 )]
 //! Squished and unsquished respond paths are equivalent: the packed matmul must
-//! produce a byte-identical answer `c ∈ Z_q^L` to `respond`, so a caller can
+//! produce a byte-identical answer `c in Z_q^L` to `respond`, so a caller can
 //! substitute `respond_packed` with no protocol-layer change.
 
 use rand_chacha::ChaCha20Rng;

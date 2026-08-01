@@ -19,7 +19,7 @@ use std::sync::Arc;
 pub struct InspireServerState {
     /// Public CRS.
     pub crs: Arc<ServerCrs>,
-    /// Encoded shard polynomials; `Arc`-wrapped so same-shape rebuilds clone the buffer instead of a ~128 MiB memcpy.
+    /// Encoded shard polynomials; `Arc`-shared so session-only swaps clone the pointer, not the buffer.
     pub encoded_db: Arc<EncodedDatabase>,
     /// Pre-warmed packing keys, rebuilt only on cell-shape change.
     pub cache: Arc<ServerInspiringCache>,
@@ -387,7 +387,9 @@ pub fn restore_inspire_state_v6(bytes: &[u8]) -> Result<(InspireServerState, Log
 /// Re-encode a single shard from a raw byte buffer in place.
 ///
 /// # Errors
-/// Returns [`AdapterError::Scheme`] if `encode_database` rejects the shape.
+/// Returns [`AdapterError::Scheme`] if `encode_database` rejects the shape, or if
+/// `shard_bytes` holds more than one shard's worth of rows and so re-shards into
+/// several - installing one of those would give the slot the wrong row window.
 /// Returns [`AdapterError::ShardOutOfRange`] if `shard_id` is absent; the
 /// commit driver treats this as terminal and drops the shard from `dirty_shards`.
 pub fn re_encode_shard(
@@ -417,6 +419,23 @@ pub fn re_encode_shard(
         raven_inspire::encode_database(shard_bytes, entry_size, params, &single_shard_config)
             .map_err(|e| AdapterError::Scheme(format!("re_encode_shard: {e}")))?;
 
+    // A shard is exactly `entries_per_shard` rows wide, so a well-shaped buffer re-shards
+    // into exactly one. Anything else means the caller sized the buffer off the cell's total
+    // row count; taking one of several rebuilt shards would install the wrong row window.
+    if rebuilt.len() != 1 {
+        let per_shard = single_shard_config.entries_per_shard();
+        return Err(AdapterError::Scheme(format!(
+            "re_encode_shard: shard {shard_id} was handed {entries} rows \
+             ({buf_len} bytes at entry_size {entry_size}) and re-sharded into \
+             {rebuilt_count} shards; one shard holds exactly {per_shard} rows \
+             (shard_size_bytes {shard_size_bytes} / entry_size {entry_size}), so the caller \
+             must materialize {per_shard} rows per shard - not the cell's total row count",
+            buf_len = shard_bytes.len(),
+            rebuilt_count = rebuilt.len(),
+            shard_size_bytes = single_shard_config.shard_size_bytes,
+        )));
+    }
+
     // `encode_database` re-numbers from id=0; keep the in-place slot's id.
     let new_shard = rebuilt
         .pop()
@@ -427,7 +446,7 @@ pub fn re_encode_shard(
 
 /// Build the raw byte buffer for a shard from the [`LogicalLeafStore`].
 ///
-/// Row layout: `entries_per_shard × entry_size` bytes, row-major.
+/// Row layout: `entries_per_shard x entry_size` bytes, row-major.
 /// First 32 bytes of each row = `commitment_hash`; remainder zero-filled.
 #[must_use]
 pub fn materialize_shard_bytes(
@@ -1417,7 +1436,7 @@ mod re_encode_tests {
     #[test]
     fn re_encode_shard_k1_byte_identity() {
         let params = InspireParams::secure_128_d2048();
-        let entries = 4096usize; // 2 × ring_dim => 2 shards.
+        let entries = 4096usize; // 2 x ring_dim => 2 shards.
         let entry_size = 32usize;
         let db: Vec<u8> = (0..entries)
             .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))

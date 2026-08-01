@@ -1,23 +1,21 @@
 # raven-b1-bench
 
 Adapter bench driving the Raven-local fork of `inspire-rs`
-(at [`../raven-inspire`](../raven-inspire)) through the
+(at [`../../crates/inspire`](../../crates/inspire)) through the
 `setup` / `query` / `respond` / `extract` sequence. Emits a
 [`BenchReport`](../raven-bench/src/lib.rs) JSON plus per-trial
 CSV. Every run prepends a correctness smoke that halts the
 bench on any byte mismatch.
 
-The crate lives in its own `[workspace]` because the upstream
-crate tree carries transitive deps (previously tokio/axum,
-now just rayon via the fork plus bincode/rand) that do not
+The crate lives in its own `[workspace]` (the root `Cargo.toml`
+excludes it) because the upstream crate tree carries transitive
+deps - rayon via the fork, plus bincode/rand - that do not
 unify cleanly with the mainline workspace's wasm32 build graph.
-See the top-level `Cargo.toml` for the detached-workspace
-rationale.
 
 ## Build
 
 ```bash
-cargo build --manifest-path crates/raven-b1-bench/Cargo.toml \
+cargo build --manifest-path benches/b1-bench/Cargo.toml \
             --features inspire --release
 ```
 
@@ -32,7 +30,7 @@ cores on the Ryzen 9800X3D (0-15, 8 physical cores x 2 SMT
 threads):
 
 ```bash
-taskset -c 0-15 ./crates/raven-b1-bench/target/release/b1-inspire \
+taskset -c 0-15 ./benches/b1-bench/target/release/b1-inspire \
     --entries-log2 20 --record-bytes 256 --variant two-packing \
     --full-bench --warmup 4 --measured 16 \
     --seeds 0,1,2 \

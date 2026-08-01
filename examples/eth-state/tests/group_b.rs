@@ -1,7 +1,12 @@
 //! Fold/encode optimization gates: bounded-materializer early-break, whole-shard dedup of the
 //! fold re-encode, and WAL archive bounding the next recover's replay.
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, clippy::print_stdout, clippy::print_stderr)]
-
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 
 use bytes::Bytes;
 use eth_state::fold::{materialize_shard_bytes, MainSidecar};
@@ -68,8 +73,9 @@ fn dedup_whole_shard_reuses_sidecar() {
     let (mut ms, main_sk, _ssk) =
         MainSidecar::seed(&params, &db, ENTRY_SIZE, dir.path(), 0x0000_D4D0).expect("seed");
 
-    let updates: Vec<(u64, Bytes)> =
-        (0..n as u64).map(|i| (i, rec((i as u128 + 1) * 13))).collect();
+    let updates: Vec<(u64, Bytes)> = (0..n as u64)
+        .map(|i| (i, rec((i as u128 + 1) * 13)))
+        .collect();
     ms.apply_updates(1, &updates).expect("apply");
     let before = ms.re_encode_count();
     ms.fold().expect("fold");
@@ -138,7 +144,8 @@ fn cached_respond_survives_shard_growth() {
         MainSidecar::seed(&params, &db, ENTRY_SIZE, dir.path(), 0x0000_6604).expect("seed");
 
     let new_leaf = ENTRIES_PER_SHARD as u64 + 5; // a leaf in a not-yet-present shard
-    ms.apply_updates(1, &[(new_leaf, rec(987_654))]).expect("apply into a new shard");
+    ms.apply_updates(1, &[(new_leaf, rec(987_654))])
+        .expect("apply into a new shard");
     ms.fold().expect("fold"); // main re-encodes the grown shard
 
     assert_eq!(

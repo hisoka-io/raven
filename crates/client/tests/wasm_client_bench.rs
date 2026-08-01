@@ -161,8 +161,8 @@ mod native {
             return PathBuf::from(env_dir).join("wasm-client-bench.md");
         }
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.pop(); // client
-        p.pop(); // crates
+        p.pop();
+        p.pop();
         p.push("target");
         p.push("bench-findings");
         p.push("wasm-client-bench.md");

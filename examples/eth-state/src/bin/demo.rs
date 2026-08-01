@@ -2,8 +2,8 @@
 //!
 //! Boots a flat `address -> 32-byte balance` corpus, registers a main (Live) + a Sidecar
 //! engine, runs the fold loop + a WRITE firehose while serving + verifying concurrent private
-//! READs through the consume-both fan-out, and prints C1/C2/C3/C4/C5 plus the honest
-//! serving-QPS curve. Synthetic (deterministic, no chain) is the local gate; `--mode anvil`
+//! READs through the consume-both fan-out, and prints C1/C2/C3/C4/C5 plus the measured
+//! serving QPS. Synthetic (deterministic, no chain) is the local gate; `--mode anvil`
 //! is the real-E2E Sepolia-promotion path.
 //!
 //! Run: `cargo run --manifest-path examples/eth-state/Cargo.toml --profile ci-test --bin demo`
@@ -72,8 +72,14 @@ fn main() -> ExitCode {
     let c4 = res.fold_count > 0 && c1; // folds ran + correctness held across them
     let c5 = res.qps_per_core > 0.0 && res.max_lag <= 2;
 
-    println!("C1 correctness (read == ledger, byte-identical): {}", pass(c1));
-    println!("C2 freshness (chain_head - last_applied <= 2):    {}", pass(c2));
+    println!(
+        "C1 correctness (read == ledger, byte-identical): {}",
+        pass(c1)
+    );
+    println!(
+        "C2 freshness (chain_head - last_applied <= 2):    {}",
+        pass(c2)
+    );
     println!(
         "C3 timing-safe consume-both ({} sidecar hits):     {}",
         res.sidecar_hits,
@@ -84,7 +90,10 @@ fn main() -> ExitCode {
         res.fold_count,
         pass(c4)
     );
-    println!("C5 sustain (lag bounded <= 2, QPS reported):      {}", pass(c5));
+    println!(
+        "C5 sustain (lag bounded <= 2, QPS reported):      {}",
+        pass(c5)
+    );
     println!(
         "{{\"bench\":\"eth_state_demo\",\"reads\":{},\"folds\":{},\"sidecar_hits\":{},\"mean_read_ms\":{:.3},\"qps_per_core\":{:.1},\"max_lag\":{}}}",
         res.reads, res.fold_count, res.sidecar_hits, res.mean_read_ms, res.qps_per_core, res.max_lag

@@ -23,17 +23,17 @@ use raven_core::server_error::Result as SchemeResult;
 use raven_core::ServerError;
 use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, ShardConfig};
+#[cfg(not(feature = "cached-respond"))]
+use raven_inspire::respond_seeded_inspiring;
 use raven_inspire::rlwe::RlweSecretKey;
+#[cfg(feature = "cached-respond")]
+use raven_inspire::{respond_seeded_inspiring_cached, ServerInspiringCache};
 use raven_inspire::{
     setup_with_rng, ClientSession, EncodedDatabase, SeededClientQuery, ServerCrs, ServerResponse,
 };
-#[cfg(feature = "cached-respond")]
-use raven_inspire::{respond_seeded_inspiring_cached, ServerInspiringCache};
-#[cfg(not(feature = "cached-respond"))]
-use raven_inspire::respond_seeded_inspiring;
+use raven_server::{PirInstance, PirScheme};
 #[cfg(feature = "cached-respond")]
 use std::sync::Arc;
-use raven_server::{PirInstance, PirScheme};
 
 use raven_client::{build_seeded_query_rust, extract_response_rust};
 
@@ -90,9 +90,8 @@ pub fn pad_record(value: &[u8]) -> Result<Bytes, EthStateError> {
     Ok(Bytes::from(buf))
 }
 
-/// Decoded record bytes, verbatim. The byte-0 tag MUST survive here: [`record_present`] runs on
-/// these bytes downstream in the fan-out, so stripping the tag would make a present-zero record
-/// read as absent. The comparison against a normalized expected stays symmetric (both tagged).
+/// Decoded record bytes, verbatim: the byte-0 tag MUST survive because [`record_present`] runs
+/// on these bytes downstream.
 ///
 /// ```
 /// let r = eth_state::pad_record(&[7u8; 8]).expect("fits");
@@ -283,7 +282,7 @@ pub async fn read_balance_consume_both(
 mod tests {
     use crate::harness::Demo;
     use crate::ingest::normalize_balance_be;
-    use crate::{record_present, EXTRACT_LEG_COUNT, ENTRY_SIZE, PRESENT_TAG};
+    use crate::{record_present, ENTRY_SIZE, EXTRACT_LEG_COUNT, PRESENT_TAG};
     use serial_test::serial;
     use std::sync::atomic::Ordering;
 
@@ -292,8 +291,14 @@ mod tests {
     fn record_present_tags_zero_vs_absent() {
         let zero = normalize_balance_be(&0u128.to_be_bytes()).expect("fits");
         assert_eq!(zero[0], PRESENT_TAG);
-        assert!(record_present(&zero), "a present (changed-to-zero) record is present");
-        assert!(!record_present(&[0u8; ENTRY_SIZE]), "an all-zero slot is absent");
+        assert!(
+            record_present(&zero),
+            "a present (changed-to-zero) record is present"
+        );
+        assert!(
+            !record_present(&[0u8; ENTRY_SIZE]),
+            "an all-zero slot is absent"
+        );
         let nonzero = normalize_balance_be(&5u128.to_be_bytes()).expect("fits");
         assert!(record_present(&nonzero), "a non-zero balance is present");
     }

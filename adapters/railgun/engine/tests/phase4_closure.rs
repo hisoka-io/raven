@@ -1,5 +1,5 @@
-//! Phase 4 closure E2E: chain-event -> consumer apply -> re-encode at
-//! commit -> swap_state -> PIR response reflects new bytes.
+//! Chain-event -> consumer apply -> re-encode at commit -> swap_state -> PIR response
+//! reflects new bytes.
 
 #![allow(
     clippy::expect_used,

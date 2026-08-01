@@ -14,13 +14,11 @@ use raven_inspire::params::{InspireParams, InspireVariant, SecurityLevel, ShardC
 use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::{
     extract_inspiring, extract_with_variant, query, respond_seeded_inspiring_cached_with_session,
-    respond_with_variant, setup, ClientSession, EncodedDatabase, PackingMode,
-    ServerInspiringCache, ServerSessionStore,
+    respond_with_variant, setup, ClientSession, EncodedDatabase, PackingMode, ServerInspiringCache,
+    ServerSessionStore,
 };
 
-use raven_b1_bench::adaptive_params::{
-    derive_medium_payload, fmt_derivation, AdaptiveInputs,
-};
+use raven_b1_bench::adaptive_params::{derive_medium_payload, fmt_derivation, AdaptiveInputs};
 use raven_bench::{BenchReport, GridCell};
 
 #[derive(Debug, Clone, Copy)]
@@ -87,8 +85,7 @@ fn round_trip(
         }
         _ => {
             let t0 = Instant::now();
-            let (state, q) =
-                query(crs, idx, &encoded_db.config, sk, &mut sampler).expect("query");
+            let (state, q) = query(crs, idx, &encoded_db.config, sk, &mut sampler).expect("query");
             let t1 = Instant::now();
             let r = respond_with_variant(crs, encoded_db, &q, variant).expect("respond");
             let t2 = Instant::now();
@@ -146,13 +143,18 @@ struct CliArgs {
 }
 
 fn parse_variant(s: &str) -> InspireVariant {
-    match s.to_ascii_lowercase().replace('-', "").replace('_', "").as_str() {
+    match s
+        .to_ascii_lowercase()
+        .replace('-', "")
+        .replace('_', "")
+        .as_str()
+    {
         "nopacking" => InspireVariant::NoPacking,
         "onepacking" => InspireVariant::OnePacking,
         "twopacking" => InspireVariant::TwoPacking,
-        other => panic!(
-            "unknown variant: {other:?} (expected no-packing | one-packing | two-packing)"
-        ),
+        other => {
+            panic!("unknown variant: {other:?} (expected no-packing | one-packing | two-packing)")
+        }
     }
 }
 
@@ -325,17 +327,16 @@ fn main() {
 
     let session_build_start = Instant::now();
     let mut session_sampler = GaussianSampler::new(params.sigma);
-    let mut session =
-        ClientSession::new(crs.clone(), sk.clone(), &mut session_sampler)
-            .expect("ClientSession::new");
+    let mut session = ClientSession::new(crs.clone(), sk.clone(), &mut session_sampler)
+        .expect("ClientSession::new");
     eprintln!(
         "client session built in {} ms",
         session_build_start.elapsed().as_millis()
     );
 
     let server_cache_build_start = Instant::now();
-    let server_cache = ServerInspiringCache::new(&crs, &encoded_db)
-        .expect("ServerInspiringCache::new");
+    let server_cache =
+        ServerInspiringCache::new(&crs, &encoded_db).expect("ServerInspiringCache::new");
     eprintln!(
         "server cache built in {} ms",
         server_cache_build_start.elapsed().as_millis()
@@ -381,7 +382,10 @@ fn main() {
             );
             std::process::exit(3);
         }
-        eprintln!("smoke OK (index {smoke_index}, {} bytes match)", recovered.len());
+        eprintln!(
+            "smoke OK (index {smoke_index}, {} bytes match)",
+            recovered.len()
+        );
     }
 
     if cli.smoke_only {
@@ -426,8 +430,15 @@ fn main() {
                 h ^= h >> 31;
                 let idx = h % entries;
                 let (_decoded, rt) = round_trip(
-                    &session, &server_cache, &session_store, &encoded_db, &sk,
-                    &params, cli.variant, idx, cli.record_bytes,
+                    &session,
+                    &server_cache,
+                    &session_store,
+                    &encoded_db,
+                    &sk,
+                    &params,
+                    cli.variant,
+                    idx,
+                    cli.record_bytes,
                 );
                 trials.push((trial, idx, rt));
             }
@@ -458,9 +469,15 @@ fn main() {
                             h ^= h >> 31;
                             let idx = h % entries;
                             let (_decoded, rt) = round_trip(
-                                session_ref, server_cache_ref, session_store_ref,
-                                encoded_db_ref, sk_ref, params_ref, variant,
-                                idx, record_bytes,
+                                session_ref,
+                                server_cache_ref,
+                                session_store_ref,
+                                encoded_db_ref,
+                                sk_ref,
+                                params_ref,
+                                variant,
+                                idx,
+                                record_bytes,
                             );
                             local.push((trial, idx, rt));
                         }
@@ -468,7 +485,10 @@ fn main() {
                     });
                     handles.push(handle);
                 }
-                handles.into_iter().map(|h| h.join().expect("thread panic")).collect()
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("thread panic"))
+                    .collect()
             });
             trials_per_thread.into_iter().flatten().collect()
         };
@@ -506,8 +526,8 @@ fn main() {
 
         // Throughput modes: K=1 reports per-core sustained
         // (sum-of-per-trial); K>1 reports concurrent-wall.
-        let measured_secs_sum = total_times_us.iter().map(|&x| x as u128).sum::<u128>() as f64
-            / 1_000_000.0;
+        let measured_secs_sum =
+            total_times_us.iter().map(|&x| x as u128).sum::<u128>() as f64 / 1_000_000.0;
         let throughput_serial = if measured_secs_sum > 0.0 {
             total_times_us.len() as f64 / measured_secs_sum
         } else {
@@ -559,9 +579,7 @@ fn main() {
             response_bytes: last_response_bytes,
             query_ms_median: total_median_us as f64 / 1000.0,
             server_ms_median: Some(server_median_us as f64 / 1000.0),
-            client_ms_median: Some(
-                (query_gen_median_us + extract_median_us) as f64 / 1000.0,
-            ),
+            client_ms_median: Some((query_gen_median_us + extract_median_us) as f64 / 1000.0),
             throughput_qps_per_core: throughput,
             measured_queries: total_times_us.len() as u64,
         };

@@ -29,8 +29,8 @@
 //!      [`OracleKind::ChainStaticTree`], membership semantics: "this
 //!      root was recorded by the chain for this tree at this block").
 //!
-//!    The chain oracle is mandatory in V1; there is no graceful
-//!    degrade path. Subsquid is leaves-only.
+//!    The chain oracle is mandatory; there is no graceful degrade
+//!    path. Subsquid is leaves-only.
 //! 7. Drop the initial snapshot via `bootstrap_inspire_instance` with
 //!    a deterministic placeholder DB matching the production cell
 //!    shape; the real per-leaf encoding lands once the consumer task
@@ -58,16 +58,13 @@ use raven_railgun_engine::imt::{Imt, TREE_MAX_ITEMS};
 use raven_railgun_engine::inspire::{setup_state, LogicalLeafStore};
 use raven_railgun_engine::persistence::{bootstrap_inspire_instance, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{
-    EncoderKind, PirTableEncoder, LEAVES_PER_TREE, NODE_HASH_BYTES, PATH_RECORD_BYTES,
-    PER_NODE_TOTAL_NODES,
+    validate_rows_per_shard, EncoderKind, PirTableEncoder, LEAVES_PER_TREE, NODE_HASH_BYTES,
+    PATH_RECORD_BYTES, PER_NODE_TOTAL_NODES,
 };
 use raven_railgun_engine::InstanceRole;
 use raven_railgun_persistence::{StoreLayout, WalEntryPayload};
 
-/// BN254 Fr modulus as 32 big-endian bytes:
-/// `21888242871839275222246405745257275088548364400416034343698204186575808495617`.
-/// Locked literal taken from `raven-railgun-poseidon`'s upstream
-/// reference (BN254 SNARK_PRIME).
+/// BN254 Fr modulus (SNARK_PRIME) as 32 big-endian bytes, mirroring `raven-railgun-poseidon`.
 const BN254_FR_MODULUS_BE: [u8; 32] = [
     0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29, 0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58, 0x5d,
     0x28, 0x33, 0xe8, 0x48, 0x79, 0xb9, 0x70, 0x91, 0x43, 0xe1, 0xf5, 0x93, 0xf0, 0x00, 0x00, 0x01,
@@ -857,7 +854,7 @@ fn first_match_index(leaves: &[[u8; 32]], target_root: &[u8; 32]) -> Result<usiz
     Ok(leaves.len())
 }
 
-/// Cell shape (total rows × record-size in bytes) the PIR table for a
+/// Cell shape (total rows x record-size in bytes) the PIR table for a
 /// given encoder kind expects. Single source of truth for all bootstrap
 /// encoded_db sizing.
 fn cell_shape_for_encoder(kind: EncoderKind) -> (u32, usize) {
@@ -899,7 +896,10 @@ fn persist_initial_snapshot(
 
     let encoder_kind = cfg.encoder_kind;
     let (total_rows, record_size) = cell_shape_for_encoder(encoder_kind);
-    let entries_per_shard: u32 = 2048;
+    let params = InspireParams::secure_128_d2048();
+    let entries_per_shard = u32::try_from(params.ring_dim).unwrap_or(u32::MAX);
+    validate_rows_per_shard(entries_per_shard, params.ring_dim)
+        .map_err(|e| BootstrapError::Engine(format!("rows per shard: {e}")))?;
     let num_shards = total_rows.div_ceil(entries_per_shard);
 
     let encoder: Arc<dyn PirTableEncoder> = encoder_kind
@@ -927,7 +927,6 @@ fn persist_initial_snapshot(
         encoded_db.extend_from_slice(&shard_bytes);
     }
 
-    let params = InspireParams::secure_128_d2048();
     let mut state_holder = Some({
         let (state, _sk) = setup_state(
             &params,
@@ -1041,7 +1040,7 @@ impl PpoiBootstrapMode {
     }
 }
 
-/// Bootstrap one PPOI list — assert each upstream
+/// Bootstrap one PPOI list - assert each upstream
 /// `validatedMerkleroot` matches our locally rebuilt per-list IMT root
 /// after each successive insert.
 ///

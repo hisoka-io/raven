@@ -19,8 +19,7 @@ pub struct Table16Row {
     pub p: u32,
 }
 
-/// Table 16. For cells between rows, pick the next-smaller-or-equal
-/// row (smaller `p` widens the Eq. (2) margin).
+/// Table 16. For cells between rows, pick the next-smaller-or-equal row.
 pub const TABLE_16: &[Table16Row] = &[
     Table16Row { log_m: 13, p: 991 },
     Table16Row { log_m: 14, p: 833 },

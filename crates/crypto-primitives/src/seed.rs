@@ -64,19 +64,8 @@ mod tests {
         assert_ne!(s1, s2);
     }
 
-    /// RFC 5869 §A.1 test vector for HKDF-SHA256.
-    ///
-    /// Inputs:
-    ///   IKM  = 0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b (22 bytes)
-    ///   salt = 0x000102030405060708090a0b0c (13 bytes)
-    ///   info = 0xf0f1f2f3f4f5f6f7f8f9 (10 bytes)
-    ///   L    = 42 bytes
-    /// Output first 32 bytes of OKM:
-    ///   3cb25f25faacd57a90434f64d0362f2a
-    ///   2d2d0a90cf1a5a4c5db02d56ecc4c5bf
-    ///
-    /// We ask for 32 bytes here, which equals those first 32 bytes of the
-    /// reference 42-byte output.
+    /// RFC 5869 appendix A.1 test vector for HKDF-SHA256, truncated to the
+    /// first 32 bytes of its 42-byte OKM.
     #[test]
     fn kat_rfc5869_basic() {
         let ikm = hex::decode("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").expect("hex");

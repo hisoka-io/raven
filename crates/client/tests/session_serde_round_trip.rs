@@ -159,7 +159,7 @@ fn wasm_session_deserialize_rejects_unversioned_crs() {
 }
 
 /// One byte past the trusted cap triggers the length pre-check. The CRS is versioned
-/// so it passes the magic check (which now precedes the cap), isolating the cap.
+/// so it passes the magic check that precedes the cap, isolating the cap.
 #[test]
 fn wasm_session_deserialize_rejects_oversize_blob_with_typed_error() {
     let params = test_params();
@@ -183,8 +183,8 @@ fn wasm_session_deserialize_rejects_oversize_blob_with_typed_error() {
 }
 
 /// At exactly the cap the length pre-check must NOT fire; a deliberately-truncated
-/// body then fails the decode (not the cap), so the Err arm is guaranteed - unlike
-/// an all-zero blob (length 0 -> Ok), which made this assertion vacuous.
+/// body then fails the decode (not the cap), so the Err arm is guaranteed. An
+/// all-zero blob would decode as length 0 -> Ok and make the assertion vacuous.
 #[test]
 fn wasm_session_trusted_cap_admits_payload_at_cap_boundary() {
     let cap = WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES;

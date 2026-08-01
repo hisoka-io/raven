@@ -1,5 +1,5 @@
 //! Property tests for the WAL recovery path: random truncation must preserve intact-prefix semantics.
-//! 100 trials × 3 seeds; runs in CI.
+//! 100 trials x 3 seeds; runs in CI.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 

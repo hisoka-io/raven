@@ -344,7 +344,6 @@ mod tests {
         assert_eq!(loaded.data, b"retry commit attempt");
     }
 
-    // only `final_dir`, no `.old.tmp`: loads with no migration step
     #[test]
     fn load_handles_snapshot_with_only_final_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -358,7 +357,6 @@ mod tests {
         assert_eq!(loaded.data, payload);
     }
 
-    // kill after final_dir was displaced to `.old.tmp`: load promotes it back
     #[test]
     fn load_recovers_when_only_old_tmp_exists() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -378,7 +376,6 @@ mod tests {
         assert!(!old_tmp.exists());
     }
 
-    // kill with both dirs present: `final_dir` wins, `.old.tmp` cleaned up
     #[test]
     fn load_prefers_final_dir_when_both_present_and_cleans_up_old_tmp() {
         let dir = tempfile::tempdir().expect("tempdir");

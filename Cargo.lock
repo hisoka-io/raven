@@ -663,6 +663,7 @@ dependencies = [
  "bincode",
  "console_error_panic_hook",
  "js-sys",
+ "rand 0.8.6",
  "raven-inspire",
  "serde",
  "thiserror",

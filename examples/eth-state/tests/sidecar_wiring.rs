@@ -1,11 +1,16 @@
 //! Sidecar-wiring gate: a generic flat-state PirScheme served by a main (Live) engine
-//! and the first-ever Sidecar engine, read through the consume-both client fan-out.
+//! and a Sidecar engine, read through the consume-both client fan-out.
 //!
 //! Proves: both engines respond; the fan-out selects the correct engine on decrypted
 //! CONTENT (never arrival order); balances decode byte-identically; main and sidecar
 //! responses are byte-length-uniform (the size side-channel control).
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, clippy::print_stdout, clippy::print_stderr)]
-
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 
 use std::sync::Arc;
 
@@ -52,8 +57,10 @@ fn sidecar_wiring() {
     let (side_state, side_sk) =
         build_flat_state(&params, &side_db, ENTRY_SIZE, 0x0000_B0B0).expect("sidecar setup");
 
-    let main_session = build_session(&main_state.crs, main_sk, params.sigma, 1).expect("main session");
-    let side_session = build_session(&side_state.crs, side_sk, params.sigma, 2).expect("sidecar session");
+    let main_session =
+        build_session(&main_state.crs, main_sk, params.sigma, 1).expect("main session");
+    let side_session =
+        build_session(&side_state.crs, side_sk, params.sigma, 2).expect("sidecar session");
 
     // Snapshot the client-side inputs before the states move into the instances.
     let main_shard = main_state.encoded_db.config.clone();
@@ -74,7 +81,9 @@ fn sidecar_wiring() {
 
     let engine = Engine::<FlatBalanceScheme>::new();
     engine.add_live(main_inst.clone()).expect("register main");
-    engine.add_live(side_inst.clone()).expect("register sidecar");
+    engine
+        .add_live(side_inst.clone())
+        .expect("register sidecar");
 
     let main_h = EngineHandle {
         instance: &main_inst,
@@ -92,14 +101,32 @@ fn sidecar_wiring() {
     };
 
     // main-only account (leaf 0): sidecar absent -> select main -> 100.
-    let (bytes0, eng0) = block_on(read_balance_consume_both(&main_h, &side_h, 0)).expect("read leaf 0");
-    assert_eq!(eng0, AnsweringEngine::Main, "main-only leaf must select main");
-    assert_eq!(bytes0.as_ref(), expected_be(100), "leaf 0 balance byte-identical");
+    let (bytes0, eng0) =
+        block_on(read_balance_consume_both(&main_h, &side_h, 0)).expect("read leaf 0");
+    assert_eq!(
+        eng0,
+        AnsweringEngine::Main,
+        "main-only leaf must select main"
+    );
+    assert_eq!(
+        bytes0.as_ref(),
+        expected_be(100),
+        "leaf 0 balance byte-identical"
+    );
 
     // sidecar-held account (leaf 2): sidecar present -> select sidecar -> 999.
-    let (bytes2, eng2) = block_on(read_balance_consume_both(&main_h, &side_h, 2)).expect("read leaf 2");
-    assert_eq!(eng2, AnsweringEngine::Sidecar, "sidecar-held leaf must select sidecar");
-    assert_eq!(bytes2.as_ref(), expected_be(999), "leaf 2 balance byte-identical");
+    let (bytes2, eng2) =
+        block_on(read_balance_consume_both(&main_h, &side_h, 2)).expect("read leaf 2");
+    assert_eq!(
+        eng2,
+        AnsweringEngine::Sidecar,
+        "sidecar-held leaf must select sidecar"
+    );
+    assert_eq!(
+        bytes2.as_ref(),
+        expected_be(999),
+        "leaf 2 balance byte-identical"
+    );
 
     // Uniform wire shape: both engines' responses serialize to the same byte length,
     // so a response-size observer cannot infer which engine answered.

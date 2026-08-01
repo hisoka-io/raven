@@ -25,6 +25,8 @@ use raven_railgun_engine::InstanceRole;
 use raven_railgun_indexer::{BlockId, ChainSource, IndexerError, Result as IndexerResult};
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-w2-layer2-test";
+/// Row width of the toy cell; the configured encoder must emit it.
+const TOY_ENTRY_SIZE: usize = 256;
 
 // returns InSync for `flip_after_calls` rounds, then OutOfSync (root [0xee; 32])
 struct SyntheticChainSource {
@@ -101,7 +103,7 @@ impl ChainSource for SyntheticChainSource {
 fn build_toy_state() -> raven_railgun_core::Result<InspireServerState> {
     let params = InspireParams::secure_128_d2048();
     let entries = 256usize;
-    let entry_size = 256usize;
+    let entry_size = TOY_ENTRY_SIZE;
     let db: Vec<u8> = (0..entries)
         .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
         .collect();
@@ -129,6 +131,7 @@ async fn layer2_verifier_fires_per_commit_and_cascades_reorg_on_out_of_sync() {
     let chain_source = Arc::new(SyntheticChainSource::new(5));
 
     let mut config = OrchestratorConfig::demo(dir.path().to_path_buf(), "w2-positive");
+    config.record_size = TOY_ENTRY_SIZE;
     config.use_flock = false;
     config.role = InstanceRole::Live;
     config.scheme_tag = SCHEME_TAG.to_owned();
@@ -231,6 +234,7 @@ async fn layer2_verifier_does_not_fire_on_upstream_signature_instance() {
     let chain_source = Arc::new(SyntheticChainSource::new(0));
 
     let mut config = OrchestratorConfig::demo(dir.path().to_path_buf(), "w2-ppoi-regression");
+    config.record_size = TOY_ENTRY_SIZE;
     config.use_flock = false;
     config.role = InstanceRole::Live;
     config.scheme_tag = SCHEME_TAG.to_owned();

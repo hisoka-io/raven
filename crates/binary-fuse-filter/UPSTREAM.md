@@ -16,8 +16,9 @@ reference implementations
   Refer to the paper + FastFilter C++ references for the
   underlying construction + analysis.
 - **Rust port base**:
-  `ChalametPIR/chalametpir_common/src/binary_fuse_filter.rs`
-  at commit state present in the repository snapshot. BSD-3-Clause
+  `chalametpir_common/src/binary_fuse_filter.rs` at
+  `itzmeanjan/ChalametPIR` commit
+  `448698f7c314fd4eb36e889f6a6ec7fba64db03d`. BSD-3-Clause
   per `ChalametPIR/LICENSE`. Raven redistributes under
   Apache-2.0 per Raven's framework-level license choice; no
   rights are waived on the original upstream.
@@ -64,28 +65,17 @@ All behavioral; no algorithmic changes to the construction math.
   produces equivalent behavior for well-formed inputs.
 
 - **Memory-hygiene fix: `hash_to_key` cleared per attempt.**
-  Upstream declares `hash_to_key` *outside* the
-  `for _ in 0..max_attempt_count` loop, so entries from failed
-  attempts accumulate under different seeds. The returned map
-  can contain up to `max_attempt_count × N` dead entries when
-  construction takes multiple retries. **Correctness is
-  unaffected**: downstream consumers (`matrix.rs:709, :841`)
-  query `hash_to_key.get(&hash).unwrap_unchecked()` using
-  hashes derived from the successful seed; `HashMap::insert`
-  overwrites any stale entry that happens to share a `u64`
-  key, so every queried hash resolves to its own key. Stale
-  entries with distinct hashes are present but never queried.
-  The residual incorrect-lookup risk is bounded by the
-  hash-collision rate over a `u64` keyspace
-  (`N² · 2^-64` worst-case) which is negligible for any
-  realistic `N`, and would still be overwritten by the
-  successful attempt's insert when it occurs. The fix is
-  therefore memory hygiene (map capacity bounded to `N`), not
-  correctness. Raven-bff calls `hash_to_key.clear()` at the
-  start of each attempt so the returned map reflects only the
-  successful seed's mapping. Surfaced by the property test
-  `construct_*_wise_succeeds_on_random_distinct_keys` which
-  asserts `hash_to_key.len() == db.len()`.
+  Upstream declares `hash_to_key` outside the
+  `for _ in 0..max_attempt_count` loop, so failed attempts
+  leave dead entries under stale seeds (up to
+  `max_attempt_count * N`). Raven-bff calls
+  `hash_to_key.clear()` at the top of each attempt, bounding
+  the returned map to `N`. Capacity only, not correctness:
+  callers query the map with hashes from the successful seed,
+  and same-`u64` collisions are overwritten by that attempt's
+  insert. Asserted by
+  `construct_*_wise_succeeds_on_random_distinct_keys`
+  (`hash_to_key.len() == db.len()`).
 
 ## What's in / what's out
 

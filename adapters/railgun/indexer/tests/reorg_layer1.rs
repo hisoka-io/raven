@@ -182,7 +182,7 @@ async fn worker_emits_reorg_message_after_simulated_reorg() {
     let (tx, mut rx) = mpsc::channel::<IndexerMessage>(64);
     let worker = IndexerWorker::new(Arc::clone(&src), tx);
 
-    // chunk_blocks=30 produces a 4-tick catchup (0→30→60→90→120).
+    // chunk_blocks=30 produces a 4-tick catchup (0->30->60->90->120).
     let cfg = IndexerWorkerConfig {
         start_block: 0,
         poll_interval_secs: 1,

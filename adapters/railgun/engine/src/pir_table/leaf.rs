@@ -86,7 +86,7 @@ pub struct PerLeafPathEncoder {
 
 impl PerLeafPathEncoder {
     /// Build a path encoder pinned to `tree_number`. `record_size` must
-    /// be exactly 512 B (16 siblings × 32 B); `entries_per_shard` must
+    /// be exactly 512 B (16 siblings x 32 B); `entries_per_shard` must
     /// be non-zero.
     pub fn new(record_size: usize, entries_per_shard: u32, tree_number: u32) -> Result<Self> {
         if record_size != PATH_RECORD_BYTES {

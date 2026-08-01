@@ -1,4 +1,5 @@
-# Standalone. See top-level Cargo.toml for why it's not a workspace member.
+# Standalone. Held outside the root workspace so the upstream crate tree's
+# transitive deps don't feature-unify into the mainline wasm32 build graph.
 [workspace]
 
 [package]
@@ -6,7 +7,7 @@ name = "raven-b1-bench"
 version = "0.1.0-alpha.0"
 edition = "2021"
 rust-version = "1.85"
-authors = ["Hisoka.io"]
+authors = ["The Raven Authors"]
 license = "Apache-2.0"
 description = "Adapter bench driving the upstream inspire crate under Raven's harness."
 publish = false

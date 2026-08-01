@@ -5,8 +5,8 @@
     clippy::indexing_slicing
 )]
 //! Theorem 3 exact-hint invariant: the incrementally maintained hint stays
-//! byte-identical to a full `H' = D' · A` recomputation after any update sequence.
-//! Paper 2026/030 §4.1 p.14 Theorem 3.
+//! byte-identical to a full `H' = D' * A` recomputation after any update sequence.
+//! eprint 2026/030 sec 4.1 p.14 Theorem 3.
 
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
@@ -230,8 +230,6 @@ fn row_agg_version_mismatch_rejected() {
         other => panic!("expected VersionMismatch, got {other:?}"),
     }
 }
-
-// paper Fig. 2 β = (β_edit, β_del, β_add)
 
 #[test]
 fn invariant_after_mixed_batch() {

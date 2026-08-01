@@ -278,7 +278,7 @@ async function rootHistoryContains(
 /**
  * Issue a single direct PIR query for a flat-global row index. Used to
  * fetch the leaf node hash itself (level-0 row in the `PerNodeEncoder`
- * layout) so the test can fold leaf+siblings → root locally without
+ * layout) so the test can fold leaf+siblings -> root locally without
  * relying on a separately-known BC.
  */
 async function fetchSingleRow(

@@ -358,7 +358,7 @@ impl ChainSource for RpcChainSource {
 }
 
 /// Compute Railgun's canonical `tokenHash` from a decoded `TokenData` log struct.
-/// Dispatches on `tokenType` per `engine/src/note/note-util.ts:191-200`.
+/// Dispatches on `tokenType` per the Railgun engine's `src/note/note-util.ts`.
 fn compute_token_data_hash(token: &abi::TokenData) -> Result<[u8; 32]> {
     use raven_railgun_poseidon::{token_data_hash, TokenType};
 
@@ -375,7 +375,7 @@ fn compute_token_data_hash(token: &abi::TokenData) -> Result<[u8; 32]> {
 
 /// Compute the Railgun-canonical Shield `commitment_hash` from a decoded `CommitmentPreimage`.
 ///
-/// `commitment_hash = Poseidon(npk, tokenHash, valueAfterFee)` per `shield-note.ts:49-54`.
+/// `commitment_hash = Poseidon(npk, tokenHash, valueAfterFee)` per `shield-note.ts`.
 fn compute_shield_commitment_hash(preimage: &abi::CommitmentPreimage) -> Result<[u8; 32]> {
     use raven_railgun_poseidon::shield_commitment_hash;
 
@@ -815,7 +815,7 @@ pub const REORG_WINDOW_VERSION: u16 = 1;
 /// Typed error for reorg-window sidecar codec failures.
 ///
 /// Wire format for the reorg-window sidecar:
-/// `magic(8) || version(u16 LE) || count(u32 LE) || count × (block(u64 LE) || hash(32))`
+/// `magic(8) || version(u16 LE) || count(u32 LE) || count x (block(u64 LE) || hash(32))`
 /// followed by a trailing CRC32 (u32 LE) over everything before it.
 ///
 /// Atomic-renamed at write time so a torn write yields the previous

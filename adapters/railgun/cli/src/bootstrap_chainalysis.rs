@@ -15,11 +15,11 @@
 //!    derivation input) is that address, then computes
 //!    `BlindedCommitment = Poseidon(commitmentHash, npk,
 //!    globalTreePosition)` per
-//!    `engine/src/poi/blinded-commitment.ts:13-16`.
+//!    the Railgun engine's `src/poi/blinded-commitment.ts`.
 //!
 //! The on-chain shield log carries the plaintext `npk: bytes32`
 //! and the `(treeNumber, startPosition)` global tree position,
-//! so the derivation is deterministic from chain state alone — no
+//! so the derivation is deterministic from chain state alone - no
 //! off-chain wallet metadata required.
 //!
 //! Synthetic-fixture testing keeps the wiring exercise-able
@@ -39,7 +39,7 @@ use raven_railgun_indexer::rpc_pool::RpcEndpointPool;
 sol! {
     /// Chainalysis OFAC oracle event emitted when one or more
     /// addresses are added to the sanctions list. Indexed `addedAddresses`
-    /// is the only field — no indexed topics.
+    /// is the only field - no indexed topics.
     #[allow(missing_docs)]
     event SanctionedAddressesAdded(address[] addedAddresses);
 }
@@ -279,7 +279,7 @@ impl ChainalysisOnChainOracleSource {
     }
 
     /// Derive the canonical PPOI event sequence for `list_key` from
-    /// the union of (sanctioned addresses) × (shield rows whose
+    /// the union of (sanctioned addresses) x (shield rows whose
     /// `from_address` is sanctioned). Each row's
     /// blinded-commitment is computed via
     /// `Poseidon(commitmentHash, npk, globalTreePosition)`.

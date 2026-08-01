@@ -7,7 +7,7 @@ use raven_inspire::params::{InspireParams, SecurityLevel};
 pub struct AdaptiveInputs {
     pub input_num_items: usize,
     pub input_item_size_bits: usize,
-    /// Gamma triple. `[64, 1024, 64]` for 256 B records (paper §7.1).
+    /// Gamma triple. `[64, 1024, 64]` for 256 B records (InsPIRe paper, section 7.1).
     pub gammas: [usize; 3],
     /// Power of two; trailing zeros skew `(nu_1, nu_2)` toward
     /// `nu_1`. `1` matches Google.

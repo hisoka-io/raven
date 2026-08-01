@@ -1,6 +1,6 @@
 //! Production-cell integration test (`#[ignore]`-gated).
 //! Exercises the full HTTP stack against the locked T2/T3 production
-//! cell: 65,536 entries × 512 B records (16 × 32 B Merkle siblings).
+//! cell: 65,536 entries x 512 B records (16 x 32 B Merkle siblings).
 
 #![allow(
     clippy::expect_used,
@@ -26,7 +26,7 @@ use tokio::sync::oneshot;
 const BEARER_TOKEN: &str = "production-cell-test-token";
 const PRODUCTION_INSTANCE_ID: &str = "ppoi-paths-ofac";
 const ENTRIES_LOG2: usize = 16;
-/// 16 siblings × 32 B per Merkle path.
+/// 16 siblings x 32 B per Merkle path.
 const ENTRY_BYTES: usize = 512;
 
 fn entries() -> usize {

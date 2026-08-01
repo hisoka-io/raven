@@ -82,7 +82,7 @@ async fn round_robin_distribution_stays_balanced_under_100_concurrent_selectors(
         "every selection must land in exactly one endpoint slot"
     );
 
-    // ±25% window: the Relaxed cursor is racy under task interleaving so tighter
+    // +/-25% window: the Relaxed cursor is racy under task interleaving so tighter
     // bounds cannot be guaranteed without a barrier-locked cursor.
     let expected_per = (N_TASKS * CALLS_PER_TASK) as u32 / N_ENDPOINTS as u32;
     let lower = expected_per - expected_per / 4;
@@ -116,7 +116,7 @@ fn token_bucket_drains_under_tight_loop_and_surfaces_exhausted() {
             Err(other) => panic!("unexpected pool error: {other:?}"),
         }
     }
-    // burst=5 ⇒ first 5 accepted; rest must be Exhausted (test window << 1s replenishment).
+    // burst=5 => first 5 accepted; rest must be Exhausted (test window << 1s replenishment).
     assert!(
         (5..=6).contains(&accepted),
         "burst=5 must accept exactly 5 (allow ±1 for token-bucket clock granularity); accepted={accepted}, refused={refused}"

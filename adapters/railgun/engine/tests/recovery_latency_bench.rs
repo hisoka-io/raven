@@ -24,7 +24,6 @@ fn test_encoder() -> Arc<dyn PirTableEncoder> {
 
 #[test]
 #[ignore = "production-cell setup is heavy (~12s); cold-start measurement"]
-// asserts < 5s; the < 1s target needs cache-carry-across-swaps, not yet implemented
 fn recovery_from_production_cell_snapshot_under_5s() {
     let setup_start = Instant::now();
     let params = InspireParams::secure_128_d2048();

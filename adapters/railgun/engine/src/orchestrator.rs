@@ -79,9 +79,9 @@ pub struct OrchestratorHandle {
     pub logical_store: Arc<parking_lot::Mutex<LogicalLeafStore>>,
     /// Bridge channel senders for indexer and mirror workers.
     pub channels: OrchestratorChannels,
-    /// Indexer→consumer bridge task.
+    /// Indexer->consumer bridge task.
     pub indexer_bridge: tokio::task::JoinHandle<()>,
-    /// Mirror→consumer bridge task.
+    /// Mirror->consumer bridge task.
     pub mirror_bridge: tokio::task::JoinHandle<()>,
 }
 
@@ -109,7 +109,7 @@ pub struct OrchestratorConfig {
     pub instance_id: InstanceId,
     /// Instance role.
     pub role: InstanceRole,
-    /// MPSC capacity for indexer → consumer messaging.
+    /// MPSC capacity for indexer -> consumer messaging.
     pub channel_capacity: usize,
     /// Encoder kind.
     pub encoder: super::pir_table::EncoderKind,
@@ -344,7 +344,7 @@ pub struct InstanceConfig {
     pub snapshot_policy: SnapshotPolicy,
     /// Scheme tag stored in the manifest.
     pub scheme_tag: String,
-    /// MPSC capacity for indexer/mirror → consumer messaging.
+    /// MPSC capacity for indexer/mirror -> consumer messaging.
     pub channel_capacity: usize,
     /// Max concurrent in-flight respond ops. `None` resolves via [`default_k_for`].
     pub max_concurrent_queries: Option<usize>,
@@ -472,13 +472,13 @@ impl std::fmt::Debug for PerInstanceHandles {
     }
 }
 
-/// Live-mutable chain-tree routing table (`tree_number` → consumer sender).
+/// Live-mutable chain-tree routing table (`tree_number` -> consumer sender).
 ///
 /// Updated via `ArcSwap::rcu` by the auto-spawn driver; router picks up new routes
 /// lock-free.
 pub type ChainTreeRoutes = Arc<arc_swap::ArcSwap<Vec<(u32, mpsc::Sender<ConsumerEvent>)>>>;
 
-/// Live-mutable PPOI-list routing table (`list_key` → consumer sender).
+/// Live-mutable PPOI-list routing table (`list_key` -> consumer sender).
 ///
 /// Updated via `ArcSwap::rcu` by the auto-spawn driver on `list_observed`.
 pub type PpoiListRoutes = Arc<arc_swap::ArcSwap<Vec<([u8; 32], mpsc::Sender<ConsumerEvent>)>>>;
@@ -655,7 +655,7 @@ where
 
     let chain_tree_routes = Arc::new(arc_swap::ArcSwap::from_pointee(initial_chain_tree_routes));
     let ppoi_list_routes: PpoiListRoutes = Arc::new(arc_swap::ArcSwap::from_pointee(ppoi_routes));
-    // Lagged receivers re-sync on the next event — capacity 64 is sufficient.
+    // Lagged receivers re-sync on the next event - capacity 64 is sufficient.
     let (tree_observed_tx, _) = tokio::sync::broadcast::channel::<u32>(64);
     let (list_observed_tx, _) = tokio::sync::broadcast::channel::<[u8; 32]>(64);
 
@@ -747,12 +747,21 @@ async fn forward_indexer_message(
             if let Some(t) = target_tree {
                 let _ = tree_observed.send(t);
                 let routes = chain_tree_routes.load();
-                if let Some(tx) = routes
+                // Fan out to ALL senders bound to `t`: distinct encoders can share one
+                // tree_number, so `.find()` would drop events past the first match.
+                let matched: Vec<mpsc::Sender<ConsumerEvent>> = routes
                     .iter()
-                    .find(|(tn, _)| *tn == t)
+                    .filter(|(tn, _)| *tn == t)
                     .map(|(_, s)| s.clone())
-                {
-                    let _ = tx.send(ConsumerEvent::Chain(event, block_height)).await;
+                    .collect();
+                // move into the final recipient; the shipped topology is one route per tree
+                if let Some((last, rest)) = matched.split_last() {
+                    for tx in rest {
+                        let _ = tx
+                            .send(ConsumerEvent::Chain(event.clone(), block_height))
+                            .await;
+                    }
+                    let _ = last.send(ConsumerEvent::Chain(event, block_height)).await;
                 } else {
                     tracing::trace!(tree_number = t, "no instance routes tree; dropping event");
                 }
@@ -802,11 +811,13 @@ async fn forward_mirror_payload(
         .filter(|(k, _)| *k == lk)
         .map(|(_, s)| s.clone())
         .collect();
-    if matched.is_empty() {
+    // move into the final recipient; the shipped topology is one route per list_key
+    let Some((last, rest)) = matched.split_last() else {
         tracing::trace!("no instance routes list_key; dropping mirror payload");
         return;
-    }
-    for tx in matched {
+    };
+    for tx in rest {
         let _ = tx.send(ConsumerEvent::Ppoi(payload.clone(), height)).await;
     }
+    let _ = last.send(ConsumerEvent::Ppoi(payload, height)).await;
 }

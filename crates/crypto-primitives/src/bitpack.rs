@@ -1,4 +1,4 @@
-//! Pack and unpack `u32` limbs at arbitrary widths ≤ 32 bits.
+//! Pack and unpack `u32` limbs at arbitrary widths <= 32 bits.
 //!
 //! PIR schemes emit vectors of `u32` limbs carrying only `bits_per_limb`
 //! payload bits; shipping 32 bits per limb wastes bandwidth.

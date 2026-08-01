@@ -22,10 +22,8 @@ crc32fast = { workspace = true }
 sha2 = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
-zstd = { version = "0.13", optional = true }
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 fs4 = { workspace = true }
+zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

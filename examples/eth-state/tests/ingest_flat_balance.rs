@@ -5,8 +5,13 @@
 //! generation advances exactly once per non-empty batch (and not at all for an empty one);
 //! the bounded shard materializer matches a brute-force full-scan reference and touches only
 //! the shard range; and a WAL replay after a simulated restart reconstructs the same rows.
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, clippy::print_stdout, clippy::print_stderr)]
-
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 
 use bytes::Bytes;
 
@@ -61,7 +66,10 @@ fn ingest_flat_balance() {
         .map(|i| {
             let leaf = (i * 37) % 3000;
             let bal = (i as u128) + 5_000_000;
-            (leaf, Bytes::copy_from_slice(&normalize_balance_be(&bal.to_be_bytes()).expect("norm")))
+            (
+                leaf,
+                Bytes::copy_from_slice(&normalize_balance_be(&bal.to_be_bytes()).expect("norm")),
+            )
         })
         .collect();
     ms.apply_updates(7, &updates).expect("apply batch");
@@ -71,7 +79,11 @@ fn ingest_flat_balance() {
     assert_eq!(gen1, gen0 + 1, "one generation per non-empty batch");
     // an empty batch does not advance the generation.
     ms.apply_updates(8, &[]).expect("apply empty");
-    assert_eq!(ms.generation(), gen1, "empty batch does not advance generation");
+    assert_eq!(
+        ms.generation(),
+        gen1,
+        "empty batch does not advance generation"
+    );
 
     // each updated row is byte-identical to the fixed 32-byte big-endian balance.
     let snap = ms.store_snapshot().expect("snap");
@@ -84,7 +96,10 @@ fn ingest_flat_balance() {
     let shard = shard_of(updates[0].0);
     let bounded = materialize_shard_bytes(&snap, shard, ENTRY_SIZE).expect("bounded");
     let brute = brute_materialize(&snap, shard, ENTRY_SIZE);
-    assert_eq!(bounded, brute, "bounded materializer matches brute-force reference");
+    assert_eq!(
+        bounded, brute,
+        "bounded materializer matches brute-force reference"
+    );
 
     // WAL replay after a simulated restart reconstructs the same rows.
     drop(ms);
@@ -92,11 +107,17 @@ fn ingest_flat_balance() {
         MainSidecar::recover(&params, ENTRY_SIZE, dir.path(), 0x0000_1A6E).expect("recover");
     let snap2 = ms2.store_snapshot().expect("snap2");
     for (leaf, val) in &updates {
-        let got = snap2.get(*leaf).expect("get2").expect("recovered row present");
+        let got = snap2
+            .get(*leaf)
+            .expect("get2")
+            .expect("recovered row present");
         assert_eq!(&got[..], &val[..], "recovered row {leaf} byte-identical");
     }
     // a seeded (untouched) row also survives recovery.
-    let seeded = snap2.get(1500).expect("get seeded").expect("seeded row present");
+    let seeded = snap2
+        .get(1500)
+        .expect("get seeded")
+        .expect("seeded row present");
     assert_eq!(
         &seeded[..],
         &normalize_balance_be(&(1501u128).to_be_bytes()).expect("norm")[..],
@@ -109,6 +130,10 @@ fn ingest_flat_balance() {
     let b = [2u8; 20];
     assert_eq!(idx.assign(a), 0);
     assert_eq!(idx.assign(b), 1);
-    assert_eq!(idx.assign(a), 0, "stable: re-assigning an address returns its leaf");
+    assert_eq!(
+        idx.assign(a),
+        0,
+        "stable: re-assigning an address returns its leaf"
+    );
     assert_eq!(idx.len(), 2);
 }

@@ -34,7 +34,7 @@ pub enum OfflinePackingKeysCacheError {
         /// On-disk magic bytes.
         found: [u8; 8],
     },
-    /// Stale cache — fingerprint mismatch.
+    /// Stale cache - fingerprint mismatch.
     #[error("hash mismatch: expected {expected}, found {found}")]
     HashMismatch {
         /// Hex of expected fingerprint.

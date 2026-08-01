@@ -4,6 +4,11 @@
 # Mirrors the Railgun mainnet topology: 3 static (filled) commit-trees,
 # 1 live commit-tree, and 2 PPOI list instances. Adjust the [[instance]]
 # blocks to match the current on-chain tree topology.
+#
+# Constraint: the --config path hardwires total_entries to 65,536 and exposes no
+# [global] entries key, while the per-node / per-list-node encoders require
+# total_entries >= 131,071, so those instances are rejected at boot. Serving them
+# needs a [global] entries key plus a cell-shape re-bootstrap of existing data.
 
 [global]
 bind = "0.0.0.0:8080"

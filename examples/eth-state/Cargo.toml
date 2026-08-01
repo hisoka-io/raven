@@ -35,7 +35,7 @@ tokio = { version = "1", default-features = false, features = [
 
 [features]
 default = ["cached-respond"]
-# Serve through the cached InsPIRe respond path (~800x). Off -> non-cached baseline.
+# Serve through the cached InsPIRe respond path. Off -> non-cached baseline.
 cached-respond = []
 # Real anvil JSON-RPC E2E driver (alloy/tokio). Off by default: the synthetic mode is the gate.
 anvil-e2e = ["dep:alloy", "dep:tokio"]

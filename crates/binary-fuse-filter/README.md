@@ -6,9 +6,7 @@ construction with a trimmed API and typed-error discipline.
 
 ## Status
 
-Alpha. 16 tests pass (5 inline + 10 integration / property +
-1 doctest). Clippy `-D warnings` clean. Builds for
-`wasm32-unknown-unknown`.
+Alpha. Builds for `wasm32-unknown-unknown`.
 
 ## Usage
 

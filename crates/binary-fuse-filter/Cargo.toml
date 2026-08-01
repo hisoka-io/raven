@@ -61,10 +61,10 @@ redundant_closure_for_method_calls = "allow"
 # Errors
 thiserror = "2"
 
-# Hash function used to convert variable-length keys into 4 × 64-bit
-# digests. TurboShake128 is specified by NIST SP 800-185 and used by
-# the upstream ChalametPIR reference; keeping the same primitive
-# preserves byte-identity with the reference BFF for a given input.
+# Hash function used to convert variable-length keys into 4 x 64-bit
+# digests. TurboShake128 is what the upstream ChalametPIR reference
+# uses; keeping the same primitive preserves byte-identity with the
+# reference BFF for a given input.
 turboshake = "0.4"
 
 # Randomness: ChaCha20 seeded from the platform OS entropy via

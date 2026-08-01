@@ -436,14 +436,9 @@ where
         log: alloy::rpc::types::eth::Log,
         observed_head: u64,
     ) -> Result<()> {
-        // Drop logs missing `block_number` rather than fabricate a
-        // height from the observed chain head: routing the event with
-        // the wrong height breaks downstream reorg-truncate semantics
-        // (the engine treats `Reorg(h)` as "delete leaves with
-        // block_height > h", and a fabricated height would either skip
-        // legitimate truncation or truncate canonical state). The
-        // operator metric `raven_railgun_indexer_dropped_logs_total`
-        // makes the drop observable.
+        // Drop logs missing `block_number` rather than fabricate a height from the observed
+        // head - a wrong height breaks `Reorg(h)` truncate semantics. Counted by
+        // `raven_railgun_indexer_dropped_logs_total`.
         let _ = observed_head;
         let Some(block_number) = log.block_number else {
             metrics::counter!(

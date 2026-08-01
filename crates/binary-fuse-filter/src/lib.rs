@@ -9,8 +9,8 @@
 )]
 #![allow(missing_docs)]
 //! Binary Fuse Filter (3-wise and 4-wise XOR variants). Probabilistic
-//! membership in `~1.1` bits per entry above the minimum; queries
-//! XOR-reduce 3 or 4 hash-derived slots.
+//! membership over a fingerprint array oversized by a factor of
+//! `~1.1`; queries XOR-reduce 3 or 4 hash-derived slots.
 //!
 //! Pure-Rust port of the construction in
 //! `chalametpir_common::binary_fuse_filter` (BSD-3-Clause). Algorithm

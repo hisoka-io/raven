@@ -229,7 +229,6 @@ liveDescribe("live latency bench", () => {
   it(
     `cold + ${HOT_QUERIES} hot against ${INSTANCE}`,
     async () => {
-      // ---------- COLD 1: GET /params ----------
       const t0 = performance.now();
       const res = await fetchWithTimeout(
         `${LIVE_URL}/v1/instance/${encodeURIComponent(INSTANCE)}/params`,
@@ -242,7 +241,6 @@ liveDescribe("live latency bench", () => {
       const paramsFetchMs = t1 - t0;
       bandwidthMbps = (paramsBody.length * 8) / 1e6 / (paramsFetchMs / 1e3);
 
-      // ---------- COLD 2: decode envelope ----------
       const t2 = performance.now();
       const decoded = decodeInstanceParams(paramsBody);
       const t3 = performance.now();
@@ -250,7 +248,6 @@ liveDescribe("live latency bench", () => {
       variantLabel = decoded.variant;
       entrySize = decoded.entrySize;
 
-      // ---------- COLD 3: build_client_session ----------
       const t4 = performance.now();
       const paramsBundle = wasm.build_instance_params_blob(
         decoded.inspireParamsBincode,
@@ -267,7 +264,6 @@ liveDescribe("live latency bench", () => {
         buildSessionMs,
       };
 
-      // ---------- HOT (reuse session) ----------
       for (let i = 0; i < HOT_QUERIES; i += 1) {
         const targetIdx = (TARGET_IDX + i) % 65_536;
 
@@ -329,18 +325,10 @@ liveDescribe("live latency bench", () => {
         });
       }
 
-      // ---------- WARM (cache hit re-use of build_client_session) ----------
-      //
-      // After the cold + hot sweeps are complete, exercise the new
-      // serialize/deserialize_client_session pair to capture the
-      // wall-time cost a wallet pays on its second page load (when
-      // IndexedDB has a cached blob keyed by `(instanceId,
-      // sha256(crsBincode))`). The warm path replaces COLD step 3
-      // (`build_client_session` -> ~12.6 s on production-cell d=2048)
-      // with `deserialize_client_session` -> a few hundred ms.
-      //
-      // Skipped when the WASM build does not export the new symbols
-      // (older pin pre-`s036-client-session-serde`).
+      // Warm path: the wall time a wallet pays on its second page load, where
+      // `deserialize_client_session` (a few hundred ms) replaces
+      // `build_client_session` (~12.6 s on the production cell at d=2048).
+      // Skipped when the WASM build does not export the pair.
       if (
         typeof wasm.serialize_client_session === "function" &&
         typeof wasm.deserialize_client_session === "function"

@@ -4,7 +4,8 @@
 //!
 //! Strict ordering: the old main serves throughout; the main swap commits BEFORE the sidecar
 //! resets; dirty shards are cleared only after the V6 commit succeeds; the sidecar resets LAST.
-//! A crash before the commit replays the same dirty shards.
+//! A crash before the commit loses nothing: `recover` rebuilds from the last committed snapshot
+//! plus the WAL replay.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -16,7 +17,9 @@ use raven_inspire::params::{InspireParams, ShardConfig};
 use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::{encode_database, EncodedDatabase, ShardData};
 use raven_server::{InstanceRole, PirInstance};
-use raven_storage::{Manifest, SnapshotFile, SnapshotId, StoreLayout, Wal, MANIFEST_SCHEMA_VERSION};
+use raven_storage::{
+    Manifest, SnapshotFile, SnapshotId, StoreLayout, Wal, MANIFEST_SCHEMA_VERSION,
+};
 
 use crate::ingest::BalanceWalPayload;
 use crate::{
@@ -84,8 +87,11 @@ impl MainSidecar {
             .map_err(|e| EthStateError::Setup(format!("store begin: {e}")))?;
         for i in 0..total {
             let off = i * entry_size;
-            txn.insert(i as u64, Bytes::copy_from_slice(&database[off..off + entry_size]))
-                .map_err(|e| EthStateError::Setup(format!("store insert: {e}")))?;
+            txn.insert(
+                i as u64,
+                Bytes::copy_from_slice(&database[off..off + entry_size]),
+            )
+            .map_err(|e| EthStateError::Setup(format!("store insert: {e}")))?;
         }
         txn.commit()
             .map_err(|e| EthStateError::Setup(format!("store commit: {e}")))?;
@@ -109,8 +115,8 @@ impl MainSidecar {
             side_state,
         ));
 
-        let wal = Wal::open(&layout, None)
-            .map_err(|e| EthStateError::Setup(format!("wal open: {e}")))?;
+        let wal =
+            Wal::open(&layout, None).map_err(|e| EthStateError::Setup(format!("wal open: {e}")))?;
         let mut this = Self {
             store,
             main,
@@ -210,14 +216,24 @@ impl MainSidecar {
     fn ensure_main_covers(&self, shards: &BTreeSet<u32>) -> Result<(), EthStateError> {
         let snap = self.main.current_snapshot();
         let present: BTreeSet<u32> = snap.state.encoded_db.shards.iter().map(|s| s.id).collect();
-        let missing: Vec<u32> = shards.iter().copied().filter(|s| !present.contains(s)).collect();
+        let missing: Vec<u32> = shards
+            .iter()
+            .copied()
+            .filter(|s| !present.contains(s))
+            .collect();
         if missing.is_empty() {
             return Ok(());
         }
         let mut new_encoded: EncodedDatabase = snap.state.encoded_db.clone();
         let zero = vec![0u8; ENTRIES_PER_SHARD * self.entry_size];
         for shard_id in missing {
-            re_encode_shard(&mut new_encoded, shard_id, &zero, &self.params, self.entry_size)?;
+            re_encode_shard(
+                &mut new_encoded,
+                shard_id,
+                &zero,
+                &self.params,
+                self.entry_size,
+            )?;
         }
         let new_state = FlatServerState {
             crs: snap.state.crs.clone(),
@@ -264,7 +280,13 @@ impl MainSidecar {
             ) {
                 set_shard_slot(&mut new_encoded, shard);
             } else {
-                re_encode_shard(&mut new_encoded, *shard_id, &bytes, &self.params, self.entry_size)?;
+                re_encode_shard(
+                    &mut new_encoded,
+                    *shard_id,
+                    &bytes,
+                    &self.params,
+                    self.entry_size,
+                )?;
                 self.re_encode_count += 1;
             }
         }
@@ -278,7 +300,7 @@ impl MainSidecar {
         // Atomic swap: in-flight reads against the old Arc complete unaffected.
         self.main.swap_state(new_state, snap.epoch.next());
 
-        // Commit V6 durability BEFORE clearing dirty (a crash before commit replays dirty).
+        // Commit V6 durability BEFORE clearing dirty: until it lands, recovery is snapshot+WAL.
         self.commit_v6()?;
 
         // Seal the pre-snapshot WAL so the next recover replays only the post-fold tail and
@@ -317,7 +339,13 @@ impl MainSidecar {
             .map_err(|e| EthStateError::Setup(format!("store snapshot: {e}")))?;
         for shard_id in self.dirty.iter().copied().collect::<Vec<_>>() {
             let bytes = materialize_shard_bytes(&store_snap, shard_id, self.entry_size)?;
-            re_encode_shard(&mut new_encoded, shard_id, &bytes, &self.params, self.entry_size)?;
+            re_encode_shard(
+                &mut new_encoded,
+                shard_id,
+                &bytes,
+                &self.params,
+                self.entry_size,
+            )?;
         }
         let new_state = FlatServerState {
             crs: snap.state.crs.clone(),
@@ -335,7 +363,13 @@ impl MainSidecar {
         let snap = self.sidecar.current_snapshot();
         let mut new_encoded: EncodedDatabase = snap.state.encoded_db.clone();
         let buf = sparse_shard_bytes(shard_id, &self.changed, self.entry_size);
-        re_encode_shard(&mut new_encoded, shard_id, &buf, &self.params, self.entry_size)?;
+        re_encode_shard(
+            &mut new_encoded,
+            shard_id,
+            &buf,
+            &self.params,
+            self.entry_size,
+        )?;
         let new_state = FlatServerState {
             crs: snap.state.crs.clone(),
             encoded_db: new_encoded,
@@ -528,7 +562,7 @@ pub fn materialize_shard_bytes(
             continue;
         }
         if k >= shard_end {
-            break; // sorted keys -> early-exit, no full scan past the shard
+            break;
         }
         let off = (k - shard_start) as usize * entry_size;
         let n = v.len().min(entry_size);
@@ -647,7 +681,8 @@ mod kill_mid_fold {
             let (mut ms, _msk, _ssk) =
                 MainSidecar::seed(&params, &db, ENTRY_SIZE, dir.path(), seed).expect("seed");
             let rec3 = normalize_balance_be(&424_242u128.to_be_bytes()).expect("norm");
-            ms.apply_updates(5, &[(3, Bytes::copy_from_slice(&rec3))]).expect("apply");
+            ms.apply_updates(5, &[(3, Bytes::copy_from_slice(&rec3))])
+                .expect("apply");
             // Abort the fold after the main swap: no commit, dirty not cleared, sidecar not reset.
             ms.fold_abort_after_swap().expect("abort fold after swap");
         }
@@ -656,6 +691,10 @@ mod kill_mid_fold {
             MainSidecar::recover(&params, ENTRY_SIZE, dir.path(), seed).expect("recover");
         let got = read_main(&ms2, main_sk, 3);
         let expected = normalize_balance_be(&424_242u128.to_be_bytes()).expect("norm");
-        assert_eq!(&got[..], &expected[..], "swap..commit window recovers byte-identical");
+        assert_eq!(
+            &got[..],
+            &expected[..],
+            "swap..commit window recovers byte-identical"
+        );
     }
 }

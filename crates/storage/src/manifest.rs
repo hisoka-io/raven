@@ -18,7 +18,7 @@ pub const MIN_READABLE_MANIFEST_SCHEMA_VERSION: u32 = 5;
 /// On-disk manifest; JSON-serialized for human-readable forensics.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Manifest {
-    /// Must equal [`MANIFEST_SCHEMA_VERSION`].
+    /// Accepted range `[MIN_READABLE_MANIFEST_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION]`.
     pub schema_version: u32,
     /// Scheme tag; bootstrap rejects a scheme mismatch against the configured engine.
     pub scheme_tag: String,

@@ -1,5 +1,5 @@
 //! Auto-spawn helpers: data-dir templating, spawn log (JSONL) read/write, and instance-id
-//! generation. Pure sync — no tokio, no PIR engine interaction.
+//! generation. Pure sync - no tokio, no PIR engine interaction.
 
 use std::path::{Path, PathBuf};
 

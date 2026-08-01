@@ -29,7 +29,7 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt
-        run: cargo fmt -p raven-core -p raven-crypto-primitives -p raven-indexer -p raven-client -- --check
+        run: cargo fmt --all -- --check
       - name: cargo check
         run: cargo check --workspace --all-targets
       - name: cargo clippy
@@ -371,6 +371,92 @@ jobs:
       - name: sccache stats
         if: always()
         run: sccache --show-stats
+
+  eth-state-example:
+    name: eth-state example (detached workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --manifest-path examples/eth-state/Cargo.toml -- --check
+      - name: cargo clippy
+        run: cargo clippy --manifest-path examples/eth-state/Cargo.toml --all-targets -- -D warnings
+      - name: cargo check
+        run: cargo check --manifest-path examples/eth-state/Cargo.toml --all-targets
+      - name: cargo test (ci-test profile)
+        # release-grade profile: the InsPIRe setup this demo drives is slow
+        # enough under the dev profile to read as a hang
+        run: cargo test --manifest-path examples/eth-state/Cargo.toml --profile ci-test
+
+  b1-bench:
+    name: b1-bench (detached workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --manifest-path benches/b1-bench/Cargo.toml -- --check
+      - name: cargo clippy
+        # the `inspire` feature gates the crate's only binary via
+        # required-features, so an unfeatured run compiles nothing
+        run: cargo clippy --manifest-path benches/b1-bench/Cargo.toml --features inspire --all-targets -- -D warnings
+      - name: cargo check
+        run: cargo check --manifest-path benches/b1-bench/Cargo.toml --features inspire --all-targets
+
+  b2-bench:
+    name: b2-bench (detached workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --manifest-path benches/b2-bench/Cargo.toml -- --check
+      - name: cargo clippy
+        run: cargo clippy --manifest-path benches/b2-bench/Cargo.toml --all-targets -- -D warnings
+      - name: cargo check
+        run: cargo check --manifest-path benches/b2-bench/Cargo.toml --all-targets
+
+  bench-compare:
+    name: bench-compare (detached workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --manifest-path tools/bench-compare/Cargo.toml -- --check
+      - name: cargo clippy
+        run: cargo clippy --manifest-path tools/bench-compare/Cargo.toml --all-targets -- -D warnings
+      - name: cargo check
+        run: cargo check --manifest-path tools/bench-compare/Cargo.toml --all-targets
+      - name: cargo test
+        run: cargo test --manifest-path tools/bench-compare/Cargo.toml
 
   sdk-tests:
     # fresh-clone gate: SDK depends on the gitignored wasm-pack output,

@@ -108,6 +108,17 @@ pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
     )
     .unwrap_or(u32::MAX);
     let entry_size = state.entry_size;
+    if let Some(fixed) = target.fixed_record_size() {
+        if fixed != entry_size {
+            anyhow::bail!(
+                "encoder '{new_label}' emits {fixed}-byte rows but the stored cell is \
+                 {entry_size} bytes wide; migrating would re-encode every shard at the \
+                 wrong width. Re-bootstrap the data_dir at record width {fixed} instead \
+                 (data_dir: {})",
+                data_dir.display()
+            );
+        }
+    }
 
     let encoder = target
         .build(entry_size, entries_per_shard)

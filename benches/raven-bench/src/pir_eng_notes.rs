@@ -3,7 +3,7 @@
 //! unit-suffixed identifiers (`query_size_kb: f64`, `server_time_ms: f64`).
 //!
 //! Unit convention: upstream's `*_kb` / `*_mb` fields use binary prefixes
-//! (KiB = 1024, MiB = 1024²). `bytes_to_kib` / `bytes_to_mib` below match.
+//! (KiB = 1024, MiB = 1024^2). `bytes_to_kib` / `bytes_to_mib` below match.
 //!
 //! `throughput_gbps` and `rate` are not emitted: both need scheme-specific
 //! plaintext-space arithmetic that the scheme crate owns.

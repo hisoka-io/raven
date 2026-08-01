@@ -1,6 +1,6 @@
 //! Insert / re-encode cost bench (`#[ignore]`-gated). Measures per-shard
 //! re-encode cost across cell shapes; total per-insert wall-clock is
-//! `dirty_shards × per_shard_re_encode`. Output is stderr-only.
+//! `dirty_shards x per_shard_re_encode`. Output is stderr-only.
 
 #![allow(
     clippy::expect_used,
@@ -17,9 +17,9 @@ use raven_railgun_engine::inspire;
 
 const CELLS: &[(u32, usize, &str)] = &[
     (16, 32, "65k_x_32B"),
-    (16, 64, "65k_x_64B"),   // γ=32
-    (16, 128, "65k_x_128B"), // γ=64
-    (16, 256, "65k_x_256B"), // γ=128
+    (16, 64, "65k_x_64B"),   // gamma=32
+    (16, 128, "65k_x_128B"), // gamma=64
+    (16, 256, "65k_x_256B"), // gamma=128
     (16, 512, "65k_x_512B"),
     (17, 32, "131k_x_32B"),
 ];

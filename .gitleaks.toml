@@ -48,12 +48,15 @@ The allowlist is anchored on the `list_key` assignment shape rather than on the
 containing paths, so an actual credential appearing in the same files is still
 reported.
 
-The path entries are build outputs plus the directories `.gitignore` excludes
-from the repository entirely. `gitleaks --no-git` walks the filesystem and does
-not read `.gitignore`, so without these the scan reports local scratch state
-that can never reach a commit. Every path below is an explicit `.gitignore`
-entry (`.gitignore:2,14,15,16,19,22`); the scan therefore covers exactly the
-set of files that can be committed. Do NOT add a path here that git tracks.
+The path entries are build outputs plus the directories git ignores entirely.
+`gitleaks --no-git` walks the filesystem and does not read `.gitignore`, so
+without these the scan reports local scratch state that can never reach a
+commit. `target/`, `no-commit/`, `.claude/`, `.agent/`, `tmp/` and `run/` are
+git-ignored by the root `.gitignore`; `node_modules/` by
+`adapters/railgun/sdk/.gitignore`. `pkg-node/` and `pkg-bundler/` are wasm-pack
+outputs that do not exist until a build runs and carry their own generated
+`.gitignore`, so they are listed here to cover the post-build tree.
+Do NOT add a path here that git tracks.
 """
 regexTarget = "line"
 regexes = [

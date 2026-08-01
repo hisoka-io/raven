@@ -28,8 +28,8 @@ value on a Raven deployment is gated on resolving them as described.
 
 ### G6 - Unresolved noise-variance factor in parameter derivation
 
-Location: crates/inspire/src/params.rs (get_variance, approximately lines
-510-530).
+Location: crates/inspire/src/params.rs - get_variance and
+InspireParams::for_scenario. Both carry the disclosure in-source.
 
 An external review flagged a potentially missing (q~ / q)^2 factor in the
 ring-LWE noise-variance computation (the get_variance derivation, cross-checked
@@ -38,6 +38,21 @@ Google private-membership InsPIRe reference verbatim; the factor, if it is
 authoritatively required by the paper, may be absorbed upstream into
 noise-budget slack. Under the current formula, sampled parameter cells satisfy
 the noise budget with only a thin slack margin.
+
+A second, related gap is disclosed at the same location. The reproduced
+get_variance formula covers Spiral-family LWE and gadget noise only; it does NOT
+model the additional noise that InspiRING 2-matrix packing introduces.
+Empirically the derived q ~= 2^53 is insufficient for a 2^20 x 256 B cell under
+TwoPacking + InspiRING even though the noise-budget gate reports approximately
+0.093 bits of slack. The failure mode is SILENT: decryption produces
+random-looking bytes once the packing noise term crosses the delta = floor(q/p)
+scaling boundary, with no error raised. The shipped mitigation is
+InspireParams::for_scenario_with_crt with a wider 2-CRT pair (typically 2 x
+30-bit primes, q ~= 2^60); for_scenario is retained for scenarios where the
+tree-packed extract path is the only one in use.
+
+Consequence for operators: the thin slack margin above must not be read as a
+passing margin. It is a reading from a formula with a known missing term.
 
 Status: GATED ON CRYPTOGRAPHER REVIEW. This item must be resolved by a direct
 read of InsPIRe Theorem 7 against the implementation plus a noise-calibration
@@ -53,8 +68,9 @@ question plainly than ship an unaudited "fix."
 The client computes the target shard locally and addresses the query to a shard
 by an explicit, PLAINTEXT shard identifier. PIR hides WHICH ENTRY within a shard
 the client wants, but WHICH SHARD is in the clear. Consequently the anonymity
-set is ONE SHARD (approximately 2048 entries with default parameters), NOT the
-full database N.
+set is ONE SHARD, NOT the full database N. Raven core ships no default shard
+size; entries-per-shard is set by the deploying adapter, and that figure is what
+an operator must reason about here.
 
 Impact: an observer learns the shard partition the target entry lives in. For a
 deployment with many shards this is a coarse-grained but real leak of where the

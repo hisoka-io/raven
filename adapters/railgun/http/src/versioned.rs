@@ -82,7 +82,7 @@ pub fn write_versioned<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, bincod
 ///
 /// Per-element length-prefixing is required because `S::Response` is variable-length;
 /// a flat `bincode::serialize(&Vec<T>)` emits no per-element delimiters.
-/// SDK decoder: `sdk/typescript-railgun/src/raven-poi-node-interface.ts:909-946`.
+/// SDK decoder: `decodeBatchBody` in `adapters/railgun/sdk/src/raven-poi-node-interface.ts`.
 ///
 /// # Errors
 /// Returns `bincode::Error` if any element fails to serialize.

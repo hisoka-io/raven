@@ -7,7 +7,11 @@ import { RavenError } from "./errors";
 
 const DB_NAME = "raven-pir-session-cache-v1";
 const STORE = "sessions";
-const KEY_VERSION = 1;
+/// Drives both `makeKey` and the IndexedDB version, so a bump rotates every key AND
+/// fires `onupgradeneeded`. Bump whenever a cached residue must not be rehydrated by
+/// the current build - a residue carries the client's RLWE secret key, so accepting a
+/// stale one silently reinstates whatever key wrote it.
+const KEY_VERSION = 2;
 const CHUNK_SIZE = 32 * 1024 * 1024;
 
 interface CacheBackend {
@@ -173,7 +177,12 @@ class IndexedDbBackend implements CacheBackend {
         const db = req.result;
         if (!db.objectStoreNames.contains(STORE)) {
           db.createObjectStore(STORE);
+          return;
         }
+        // A residue carries the session's RLWE secret key, so a stale entry is not
+        // merely unusable, it is a key that must leave the disk. Rotating the key
+        // prefix alone would orphan it, not remove it.
+        req.transaction?.objectStore(STORE).clear();
       };
       req.onsuccess = () => resolve(req.result);
       req.onerror = () =>

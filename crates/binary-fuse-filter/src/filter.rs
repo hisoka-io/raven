@@ -298,9 +298,9 @@ impl BinaryFuseFilter {
         ))
     }
 
-    /// 4-wise XOR Binary Fuse Filter. Slightly denser than 3-wise
-    /// (~1.08 vs ~1.13 bits/entry overhead) at the cost of one
-    /// extra memory access per query.
+    /// 4-wise XOR Binary Fuse Filter. Smaller array than 3-wise
+    /// (size factor ~1.08 vs ~1.13) at the cost of one extra
+    /// memory access per query.
     pub fn construct_4_wise<'a>(
         db: &HashMap<&'a [u8], &[u8]>,
         mat_elem_bit_len: usize,
@@ -642,7 +642,6 @@ impl BinaryFuseFilter {
             return Err(BffError::FailedToDeserializeFilterFromBytes);
         }
 
-        // Length check above bounds all indexing below.
         let seed: [u8; 32] = bytes
             .get(OFFSET0..OFFSET1)
             .and_then(|s| s.try_into().ok())
@@ -778,7 +777,7 @@ pub fn hash_of_key(key: &[u8]) -> [u64; 4] {
     [read_u64(0), read_u64(8), read_u64(16), read_u64(24)]
 }
 
-/// Mix a 4 × u64 digest with a 32-byte seed into a u64 filter hash.
+/// Mix a 4 x u64 digest with a 32-byte seed into a u64 filter hash.
 #[inline]
 pub fn mix256(key: &[u64; 4], seed: &[u8; 32]) -> u64 {
     let read_u64 = |offset: usize| -> u64 {

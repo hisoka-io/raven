@@ -1,4 +1,4 @@
-//! Walking-skeleton E2E: full HTTP stack against a 256 × 256 B InsPIRe instance.
+//! Walking-skeleton E2E: full HTTP stack against a 256 x 256 B InsPIRe instance.
 //! Verifies PIR round-trip byte-equality, status, and auth header semantics.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]

@@ -1,7 +1,7 @@
 //! Multi-instance throughput bench (`#[ignore]`-gated).
 //!
 //! 6 InspireServerState instances at production cell shape
-//! (65,536 × 512 B, K=4), measuring aggregate QPS vs a single-instance
+//! (65,536 x 512 B, K=4), measuring aggregate QPS vs a single-instance
 //! baseline.
 
 #![allow(

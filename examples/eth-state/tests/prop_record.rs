@@ -1,8 +1,13 @@
 //! Property + KAT coverage for the structural-tag record layout that C1 byte-identity depends
 //! on: byte 0 is the presence tag, bytes 1..32 the big-endian balance. A mis-tagged or
 //! mis-aligned record shifts encoder columns or breaks the present-vs-absent distinction.
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, clippy::print_stdout, clippy::print_stderr)]
-
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 
 use eth_state::ingest::normalize_balance_be;
 use eth_state::{pad_record, unpad_record, ENTRY_SIZE, PRESENT_TAG};

@@ -61,7 +61,7 @@ pub fn hash_n(inputs: &[[u8; 32]]) -> Result<[u8; 32]> {
     Ok(fr_to_be_bytes(hash))
 }
 
-/// `Poseidon(npk, tokenHash, valueAfterFee)` per `engine/src/note/shield-note.ts:49-54`.
+/// `Poseidon(npk, tokenHash, valueAfterFee)` per the Railgun engine's `src/note/shield-note.ts`.
 pub fn shield_commitment_hash(
     npk: [u8; 32],
     token_hash: [u8; 32],
@@ -70,7 +70,7 @@ pub fn shield_commitment_hash(
     hash_n(&[npk, token_hash, value_after_fee])
 }
 
-/// `Poseidon(commitmentHash, npk, globalTreePosition)` per `engine/src/note/note-utils.ts`.
+/// `Poseidon(commitmentHash, npk, globalTreePosition)` per the Railgun engine's `src/note/note-util.ts`.
 pub fn blinded_commitment(
     commitment_hash: [u8; 32],
     npk: [u8; 32],
@@ -153,7 +153,7 @@ pub fn token_data_hash_nft(
     out
 }
 
-/// Railgun `TokenType` discriminant (`engine/src/models/formatted-types.ts:43-47`).
+/// Railgun `TokenType` discriminant (Railgun engine `src/models/formatted-types.ts`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TokenType {

@@ -1,4 +1,4 @@
-//! Indexer↔Consumer + Mirror↔Consumer bridge property tests.
+//! Indexer<->Consumer + Mirror<->Consumer bridge property tests.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 

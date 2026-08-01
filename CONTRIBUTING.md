@@ -21,7 +21,11 @@ The client path MUST stay browser-compatible. Add the WebAssembly target once:
 
 Then verify the client-path crates compile to WASM:
 
-    cargo check --target wasm32-unknown-unknown
+    cargo check -p raven-client --target wasm32-unknown-unknown
+
+Scope the wasm check to the client path. A bare invocation selects every root
+workspace member, including server-side crates that depend on native-only code
+and are not expected to build for wasm32.
 
 Any change that breaks the wasm32-unknown-unknown build for a client-path crate
 is rejected at review, not at release.
@@ -36,7 +40,7 @@ A change is ready to merge only when ALL of the following hold:
 
    and, for any client-path crate:
 
-       cargo check --target wasm32-unknown-unknown
+       cargo check -p <crate> --target wasm32-unknown-unknown
 
 2. Lints pass with warnings denied:
 

@@ -33,14 +33,12 @@ fn leaf_address(i: usize) -> EvmAddress {
     EvmAddress::from(a)
 }
 
-async fn run_async(
-    rpc_url: &str,
-    num_accounts: usize,
-    reads: usize,
-) -> Result<(), Box<dyn Error>> {
+async fn run_async(rpc_url: &str, num_accounts: usize, reads: usize) -> Result<(), Box<dyn Error>> {
     let provider = ProviderBuilder::new().connect(rpc_url).await?;
     // baseFee=0 so the cheat-coded balances are the whole ledger (no fee term).
-    provider.anvil_set_next_block_base_fee_per_gas(0u128).await?;
+    provider
+        .anvil_set_next_block_base_fee_per_gas(0u128)
+        .await?;
 
     // Seed balances via the cheat code, then read each back as the ground truth.
     let mut ledger: Vec<u128> = Vec::with_capacity(num_accounts);
@@ -74,8 +72,7 @@ async fn run_async(
     let dir = std::env::temp_dir().join(format!("raven-eth-state-anvil-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
-    let (ms, main_sk, side_sk) =
-        MainSidecar::seed(&params, &db, ENTRY_SIZE, &dir, 0x0000_A471)?;
+    let (ms, main_sk, side_sk) = MainSidecar::seed(&params, &db, ENTRY_SIZE, &dir, 0x0000_A471)?;
 
     let main_crs = ms.main.current_snapshot().state.crs.clone();
     let side_crs = ms.sidecar.current_snapshot().state.crs.clone();
@@ -111,7 +108,10 @@ async fn run_async(
 
     let c1 = c1_failures == 0;
     println!("anvil E2E (rpc {rpc_url}): seeded {num_accounts} accounts, served {served} reads.");
-    println!("C1 correctness (PIR == on-chain balance): {}", if c1 { "PASS" } else { "FAIL" });
+    println!(
+        "C1 correctness (PIR == on-chain balance): {}",
+        if c1 { "PASS" } else { "FAIL" }
+    );
     println!(
         "{{\"bench\":\"eth_state_anvil\",\"accounts\":{num_accounts},\"reads\":{served},\"c1_failures\":{c1_failures}}}"
     );

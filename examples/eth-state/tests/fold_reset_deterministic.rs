@@ -5,8 +5,13 @@
 //! re-encoded; (b) the post-fold main answers updated + untouched balances byte-identically;
 //! (c) the sidecar is reset to empty; (d) the main epoch advanced by exactly 1; (e) a
 //! captured pre-fold snapshot still answers the pre-fold balance (old main served throughout).
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, clippy::print_stdout, clippy::print_stderr)]
-
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 
 use bytes::Bytes;
 
@@ -93,7 +98,11 @@ fn fold_reset_deterministic() {
         |q| ms.main.query(q).expect("main respond").1,
         10,
     );
-    assert_eq!(&b10[..], &expected_be(10 + 1_000_000)[..], "post-fold updated leaf 10");
+    assert_eq!(
+        &b10[..],
+        &expected_be(10 + 1_000_000)[..],
+        "post-fold updated leaf 10"
+    );
     let b2500 = read(
         &main_session,
         &params,
@@ -102,7 +111,11 @@ fn fold_reset_deterministic() {
         |q| ms.main.query(q).expect("main respond").1,
         2500,
     );
-    assert_eq!(&b2500[..], &expected_be(2501)[..], "untouched shard-1 leaf 2500");
+    assert_eq!(
+        &b2500[..],
+        &expected_be(2501)[..],
+        "untouched shard-1 leaf 2500"
+    );
 
     // (c) sidecar reset to empty.
     let b_side = read(
@@ -113,10 +126,18 @@ fn fold_reset_deterministic() {
         |q| ms.sidecar.query(q).expect("sidecar respond").1,
         10,
     );
-    assert_eq!(&b_side[..], &[0u8; ENTRY_SIZE][..], "sidecar reset to empty after fold");
+    assert_eq!(
+        &b_side[..],
+        &[0u8; ENTRY_SIZE][..],
+        "sidecar reset to empty after fold"
+    );
 
     // (d) epoch advanced by exactly 1.
-    assert_eq!(ms.main.current_epoch(), pre_epoch.next(), "main epoch advanced by 1");
+    assert_eq!(
+        ms.main.current_epoch(),
+        pre_epoch.next(),
+        "main epoch advanced by 1"
+    );
 
     // (e) old main served continuously: the captured pre-fold snapshot still answers the
     // pre-fold balance after the swap landed (snapshot isolation across swap_state).
@@ -128,5 +149,9 @@ fn fold_reset_deterministic() {
         |q| <FlatBalanceScheme as PirScheme>::respond(&pre_snap.state, q).expect("snap respond"),
         10,
     );
-    assert_eq!(&b10_old[..], &expected_be(11)[..], "captured pre-fold snapshot answers old balance");
+    assert_eq!(
+        &b10_old[..],
+        &expected_be(11)[..],
+        "captured pre-fold snapshot answers old balance"
+    );
 }

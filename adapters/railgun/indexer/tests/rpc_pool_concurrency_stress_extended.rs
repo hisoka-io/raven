@@ -84,7 +84,7 @@ async fn round_robin_distributes_across_5_endpoints_under_1000_concurrent_tasks(
         "every selection must land in exactly one endpoint slot"
     );
 
-    // ±25% window; Relaxed cursor produces small deviations under task interleave.
+    // +/-25% window; Relaxed cursor produces small deviations under task interleave.
     let expected_per = (N_TASKS * CALLS_PER_TASK) as u32 / N_ENDPOINTS as u32;
     let lower = expected_per - expected_per / 4;
     let upper = expected_per + expected_per / 4;

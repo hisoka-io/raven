@@ -223,7 +223,7 @@ pub enum BatchError {
 }
 
 impl BatchError {
-    /// Map to HTTP status: `Respond`/`Invariant` → 500; others → 503.
+    /// Map to HTTP status: `Respond`/`Invariant` -> 500; others -> 503.
     pub fn status(&self) -> StatusCode {
         match self {
             BatchError::Respond { .. } | BatchError::Invariant(_) => {

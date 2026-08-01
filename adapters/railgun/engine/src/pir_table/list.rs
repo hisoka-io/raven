@@ -23,9 +23,8 @@ pub struct PerListStatusEncoder {
 }
 
 impl PerListStatusEncoder {
-    /// `record_size` must be `>= 33` (1 status byte + 32 BC bytes); the
-    /// production cell uses 32 (status byte only) — drop the BC tail in
-    /// that case. `entries_per_shard` must be non-zero.
+    /// `record_size` must be `>= 32`; at exactly 32 the row is the status byte
+    /// plus the first 31 BC bytes. `entries_per_shard` must be non-zero.
     pub fn new(record_size: usize, entries_per_shard: u32, list_key: [u8; 32]) -> Result<Self> {
         if record_size < MIN_RECORD_SIZE {
             return Err(AdapterError::InvalidQuery(format!(
@@ -143,7 +142,7 @@ pub struct PerListPathEncoder {
 }
 
 impl PerListPathEncoder {
-    /// `record_size` must be exactly 512 B (16 siblings × 32 B);
+    /// `record_size` must be exactly 512 B (16 siblings x 32 B);
     /// `entries_per_shard` must be non-zero.
     pub fn new(record_size: usize, entries_per_shard: u32, list_key: [u8; 32]) -> Result<Self> {
         if record_size != PATH_RECORD_BYTES {

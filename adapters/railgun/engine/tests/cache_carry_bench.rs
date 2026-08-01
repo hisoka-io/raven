@@ -1,5 +1,5 @@
 //! `inspire::swap_state` cache-carry bench (`#[ignore]`-gated).
-//! Carry path asserts median ≤ 50 ms; rebuild path asserts median > 1 s as a
+//! Carry path asserts median <= 50 ms; rebuild path asserts median > 1 s as a
 //! regression guard against an always-carry bug.
 
 #![allow(clippy::expect_used, clippy::print_stderr)]

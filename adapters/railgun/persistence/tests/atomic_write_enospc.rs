@@ -2,7 +2,7 @@
 //!
 //! True ENOSPC is unavailable in CI (no `CAP_SYS_ADMIN`, no `unsafe` for `setrlimit`).
 //! Instead we use EACCES (read-only parent dir) to exercise the identical
-//! `create_owner_only(&tmp)?` → `PersistenceError::Io` propagation path that ENOSPC would hit.
+//! `create_owner_only(&tmp)?` -> `PersistenceError::Io` propagation path that ENOSPC would hit.
 
 #![cfg(unix)]
 #![allow(

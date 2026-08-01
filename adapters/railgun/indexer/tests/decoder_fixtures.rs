@@ -18,7 +18,7 @@ use raven_railgun_indexer::abi;
 const FIXTURE_PATH: &str = "tests/fixtures/sepolia_events.json";
 const REAL_SHIELD_FIXTURE: &str = "tests/fixtures/sepolia_shield_real.json";
 
-/// Locked Shield topic[0] — triangulated via `cast logs` against a real Sepolia log.
+/// Locked Shield topic[0] - triangulated via `cast logs` against a real Sepolia log.
 const LOCKED_SHIELD_TOPIC0: &str =
     "0x3a5b9dc26075a3801a6ddccf95fec485bb7500a91b44cec1add984c21ee6db3b";
 

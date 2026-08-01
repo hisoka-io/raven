@@ -11,11 +11,13 @@ use raven_railgun_engine::InstanceRole;
 use std::time::Duration;
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-test";
+/// Row width of [`build_toy_state`]'s cell; the configured encoder must emit it.
+const TOY_ENTRY_SIZE: usize = 256;
 
 fn build_toy_state() -> raven_railgun_core::Result<InspireServerState> {
     let params = InspireParams::secure_128_d2048();
     let entries = 256usize;
-    let entry_size = 256usize;
+    let entry_size = TOY_ENTRY_SIZE;
     let db: Vec<u8> = (0..entries)
         .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
         .collect();
@@ -29,6 +31,7 @@ async fn orchestrator_bootstraps_and_consumer_applies_events() {
 
     // use_flock=false: a process-lifetime lock would leak across tests in one `cargo test` run
     let mut config = OrchestratorConfig::demo(dir.path().to_path_buf(), "toy");
+    config.record_size = TOY_ENTRY_SIZE;
     config.use_flock = false;
     config.role = InstanceRole::Live;
     config.scheme_tag = SCHEME_TAG.to_owned();
@@ -104,6 +107,7 @@ async fn orchestrator_bootstraps_and_consumer_applies_events() {
 async fn orchestrator_reorg_truncates_leaves_past_height() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut config = OrchestratorConfig::demo(dir.path().to_path_buf(), "toy-reorg");
+    config.record_size = TOY_ENTRY_SIZE;
     config.use_flock = false;
     config.scheme_tag = SCHEME_TAG.to_owned();
     let params = InspireParams::secure_128_d2048();

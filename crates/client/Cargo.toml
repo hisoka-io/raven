@@ -24,6 +24,9 @@ bincode = { workspace = true }
 thiserror = { workspace = true }
 wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1"
+# OsRng only. On wasm32 the browser backend comes from the getrandom `js` feature
+# raven-inspire already declares, so this adds no crate to the tree.
+rand = { version = "0.8", default-features = false, features = ["getrandom"] }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

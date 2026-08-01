@@ -119,10 +119,54 @@ pub struct OpenedInstance {
     pub recovered_logical_store: super::inspire::LogicalLeafStore,
 }
 
+/// Reject an encoder whose row width diverges from the recovered cell's.
+///
+/// `encoder_label` is stable across the two variants whose width is
+/// operator-supplied, so it cannot see a width swap.
+///
+/// # Errors
+/// Returns [`AdapterError::Internal`] when `encoder.record_size()` differs from
+/// the stored `entry_size_bytes`.
+fn ensure_encoder_matches_stored_cell(
+    stored: &raven_inspire::params::ShardConfig,
+    stored_rows_per_shard: u32,
+    encoder: &dyn super::pir_table::PirTableEncoder,
+) -> Result<()> {
+    let stored_width = stored.entry_size_bytes;
+    let emitted = encoder.record_size();
+    if emitted != stored_width {
+        return Err(AdapterError::Internal(format!(
+            "manifest encoder width mismatch: stored {stored_width}-byte rows != configured \
+             encoder {label} emitting {emitted}-byte rows; encoder_label matches on both \
+             sides, so nothing downstream detects this and every re-encoded shard would \
+             serve unrelated bytes with no query-path error. The data_dir must be \
+             re-bootstrapped at record width {emitted} - reconfiguring the width does not \
+             convert existing shards - OR the configuration that produced {stored_width}-byte \
+             rows must be restored",
+            label = encoder.label(),
+        )));
+    }
+    // Warn, not reject: refusing here would refuse an existing data_dir, and
+    // `pir_table::validate_rows_per_shard` already rejects the same divergence at boot.
+    let encoder_rows = encoder.entries_per_shard();
+    if encoder_rows != stored_rows_per_shard {
+        tracing::warn!(
+            encoder_label = encoder.label(),
+            stored_rows_per_shard,
+            encoder_rows_per_shard = encoder_rows,
+            "recovered cell holds {stored_rows_per_shard} rows per shard but the configured \
+             encoder materializes {encoder_rows}; every shard id above 0 is re-encoded from \
+             the wrong row window"
+        );
+    }
+    Ok(())
+}
+
 impl InspirePersistence {
     /// Open at `layout`. Recovers from an existing manifest or initializes fresh.
     ///
-    /// Rejects if `encoder.label()` doesn't match the manifest's stored label.
+    /// Rejects if `encoder.label()` doesn't match the manifest's stored label, or
+    /// if `encoder.record_size()` doesn't match the recovered cell's row width.
     #[allow(clippy::too_many_lines)]
     pub fn open(
         layout: StoreLayout,
@@ -178,6 +222,13 @@ impl InspirePersistence {
                     .unwrap_or(u32::MAX);
                     (Some(s), store, eps)
                 };
+            if let Some(state) = recovered_state.as_ref() {
+                ensure_encoder_matches_stored_cell(
+                    state.shard_config(),
+                    entries_per_shard,
+                    encoder.as_ref(),
+                )?;
+            }
             let wal_floor = manifest.current_snapshot_seq.checked_sub(1);
             let wal = Wal::open(&layout, wal_floor)
                 .map_err(|e| AdapterError::Internal(format!("wal open: {e}")))?;
@@ -188,7 +239,6 @@ impl InspirePersistence {
             // Tolerant-replay: `InvalidQuery` during replay is soft-skipped (log + count).
             // `Internal`/`Serialization` errors still bubble.
             let mut replay_skipped: u64 = 0;
-            let _ = entries_per_shard;
             let replay_encoder = encoder.as_ref();
             for entry in &replay.entries {
                 if entry.seq < manifest.current_snapshot_seq {
@@ -348,8 +398,8 @@ impl InspirePersistence {
             )));
         }
 
-        // Manifest-save BEFORE archive: crash between (1) and (2) is safe — replay
-        // floor already advanced, so surviving events in current.log are replayed.
+        // Manifest-save BEFORE archive: a crash in between is safe because the replay floor
+        // has already advanced, so surviving events in current.log are replayed.
         let prev_seq = m.current_snapshot_seq;
         let cur_seq = self.wal.next_seq().saturating_sub(1);
         let new_floor = self.wal.next_seq();
@@ -1106,8 +1156,8 @@ fn drive_commit(
         return Ok(());
     }
 
-    // `Arc::make_mut` below copies only if another Arc is live (e.g. an
-    // in-flight query holds the donor); at most once per drive_commit.
+    // `Arc::make_mut` below copies the encoded buffer once per drive_commit - the donor state
+    // held by `current` is always a live second reference.
     let current = instance.current_state();
     let entries_per_shard = u32::try_from(
         current
@@ -1119,7 +1169,7 @@ fn drive_commit(
     .unwrap_or(u32::MAX);
     let entry_size = current.entry_size;
 
-    let _ = entries_per_shard;
+    ensure_encoder_matches_stored_cell(current.shard_config(), entries_per_shard, encoder)?;
     let mut new_db = Arc::clone(&current.encoded_db);
     let instance_label = instance.id.as_str().to_owned();
     for shard_id in dirty {
@@ -1202,9 +1252,16 @@ mod tests {
     use raven_railgun_core::InstanceId;
 
     const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-test";
+    /// Shared by [`test_encoder`] and [`build_toy_state`]; a divergence is a
+    /// cell-shape mismatch the open/commit guards refuse.
+    const TOY_ENTRY_SIZE: usize = 256;
+    const TOY_ENTRIES_PER_SHARD: u32 = 2048;
 
     fn test_encoder() -> Arc<dyn PirTableEncoder> {
-        Arc::new(PerLeafCommitmentEncoder::new(32, 2048).expect("test encoder"))
+        Arc::new(
+            PerLeafCommitmentEncoder::new(TOY_ENTRY_SIZE, TOY_ENTRIES_PER_SHARD)
+                .expect("test encoder"),
+        )
     }
 
     #[test]
@@ -1249,7 +1306,7 @@ mod tests {
     fn build_toy_state() -> Result<InspireServerState> {
         let params = InspireParams::secure_128_d2048();
         let entries = 256usize;
-        let entry_size = 256usize;
+        let entry_size = TOY_ENTRY_SIZE;
         let db: Vec<u8> = (0..entries)
             .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
             .collect();
@@ -1556,7 +1613,7 @@ mod tests {
             .expect("open 1");
             opened.persistence.commit(&state, 100).expect("commit 1");
             // Commitments encode `i` as big-endian u32 zero-padded to 32 bytes
-            // — trivially below BN254 Fr prime.
+            // - trivially below BN254 Fr prime.
             for i in 0..1000u32 {
                 let mut commitment = [0u8; 32];
                 if let Some(dst) = commitment.get_mut(28..) {

@@ -6,6 +6,7 @@
 //! Recovery truncates on the first bad WAL crc (torn write at the tail).
 //! The snapshot and WAL payloads are opaque `Vec<u8>`: callers serialize
 //! their scheme-specific state and hand it in.
+//! Server-side only; never on the wasm client path.
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 #![deny(missing_docs)]
@@ -107,8 +108,6 @@ impl StoreLayout {
     ///
     /// Returns `PersistenceError::LockHeld` if another process holds the lock.
     /// Dropping the returned [`ExclusiveLock`] releases it.
-    /// Not available on `wasm32` (no concurrent-writer surface in browsers).
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn open_with_lock(data_dir: impl Into<PathBuf>) -> Result<(Self, ExclusiveLock)> {
         let layout = Self::open(data_dir)?;
         let lock = ExclusiveLock::acquire(layout.data_dir.join(".lock"))?;
@@ -190,8 +189,6 @@ pub(crate) fn create_owner_only(path: &std::path::Path) -> Result<std::fs::File>
 /// Exclusive advisory lock on `data_dir/.lock`.
 ///
 /// Acquired via [`StoreLayout::open_with_lock`]. Dropping the guard releases the lock.
-/// Not compiled on `wasm32`; no concurrent-writer surface in browsers.
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 pub struct ExclusiveLock {
     // Kept open so the kernel holds the flock alive until drop.
@@ -199,7 +196,6 @@ pub struct ExclusiveLock {
     path: PathBuf,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl ExclusiveLock {
     /// Acquire an exclusive non-blocking advisory lock on `path`, creating it if absent.
     pub fn acquire(path: PathBuf) -> Result<Self> {
@@ -287,7 +283,6 @@ mod tests {
         assert_eq!(read, b"second");
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn open_with_lock_rejects_second_holder() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -296,7 +291,6 @@ mod tests {
         assert!(matches!(err, PersistenceError::LockHeld(_)));
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn open_with_lock_succeeds_after_drop() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -308,7 +302,6 @@ mod tests {
 
     /// Pins the fs4 `TryLockError::WouldBlock` -> `LockHeld` mapping directly
     /// on `ExclusiveLock::acquire` so a regression shows as a type-shape failure.
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn fs4_exclusive_lock_contention_returns_lock_held() {
         let dir = tempfile::tempdir().expect("tempdir");

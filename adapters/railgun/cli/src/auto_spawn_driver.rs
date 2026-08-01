@@ -1,8 +1,7 @@
 //! Runtime driver that turns `tree_observed` broadcast signals into live PIR instances.
 //!
-//! Spawn-log append is intentionally LAST: a crash before the append leaves no log entry pointing
-//! at a half-built data directory. On restart, `replay_spawn_log` re-bootstraps every record in
-//! the log; records whose data directory has disappeared are skipped with a loud error.
+//! On restart, `replay_spawn_log` re-bootstraps every record in the log; records whose data
+//! directory has disappeared are skipped with a loud error.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,7 +17,10 @@ use raven_railgun_engine::persistence::{
     bootstrap_inspire_instance, run_consumer_task, ConsumerEvent, ConsumerMetrics,
     InspirePersistence, Layer2VerifierContext, SnapshotPolicy,
 };
-use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
+use raven_railgun_engine::pir_table::{
+    validate_cell_width, validate_rows_per_shard, validate_total_entries, EncoderKind,
+    PirTableEncoder,
+};
 use raven_railgun_engine::tree_fill_watcher::TreeFillWatcher;
 use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
 use raven_railgun_persistence::StoreLayout;
@@ -85,6 +87,13 @@ impl AutoSpawnRuntime {
             ),
         }
     }
+}
+
+/// Rows per shard, which is what `ShardConfig::entries_per_shard` will report: `setup` sizes
+/// every shard at `ring_dim * entry_size` bytes, so a shard is exactly `ring_dim` rows wide
+/// regardless of how many rows the whole cell holds.
+fn rows_per_shard(params: &InspireParams) -> u32 {
+    u32::try_from(params.ring_dim).unwrap_or(u32::MAX)
 }
 
 struct SpawnInputs<'a> {
@@ -460,6 +469,18 @@ pub fn pre_spawn_for_tree(
     Ok(registry.known().contains(&tree))
 }
 
+fn warn_on_record_size_override(encoder: EncoderKind, requested: usize, effective: usize) {
+    if requested == effective {
+        return;
+    }
+    tracing::warn!(
+        encoder = encoder.label(),
+        requested_entry_bytes = requested,
+        effective_entry_bytes = effective,
+        "auto_spawn: encoder layout pins the record width; configured entry_bytes ignored"
+    );
+}
+
 /// Bootstrap one successor instance, wire it into the engine + route table + registry, and
 /// (when `append_log = true`) append a [`SpawnRecord`] to the JSONL log, then flip the
 /// predecessor to Static. Log append is AFTER all in-memory side effects so a crash before it
@@ -486,19 +507,25 @@ fn spawn_one(inputs: &SpawnInputs<'_>, tree: u32, append_log: bool) -> anyhow::R
     let encoder_kind = runtime.resolve_encoder(tree)?;
     let requested_entry_size = runtime.entry_bytes.max(32);
     let entries = runtime.entries.max(1);
-    let entries_per_shard_u32 =
-        u32::try_from(entries.min(usize::from(u16::MAX) * 2)).unwrap_or(2048);
+    let entries_per_shard_u32 = rows_per_shard(inputs.params);
 
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create auto_spawn data_dir {}", data_dir.display()))?;
     let layout = StoreLayout::open(&data_dir)
         .with_context(|| format!("open StoreLayout at {}", data_dir.display()))?;
+    let entry_size = encoder_kind.effective_record_size(requested_entry_size);
+    warn_on_record_size_override(encoder_kind, requested_entry_size, entry_size);
+    validate_cell_width(entry_size, inputs.params.ring_dim)
+        .map_err(|e| anyhow::anyhow!("encoder cell shape rejected: {e}"))?;
+    validate_rows_per_shard(entries_per_shard_u32, inputs.params.ring_dim)
+        .map_err(|e| anyhow::anyhow!("auto_spawn rows per shard rejected: {e}"))?;
+    // an undersized cell dirties shards past the allocated database, and drive_commit
+    // drops those rather than failing, so the instance serves factory bytes forever
+    validate_total_entries(&encoder_kind, entries)
+        .map_err(|e| anyhow::anyhow!("auto_spawn total entries rejected: {e}"))?;
     let encoder: Arc<dyn PirTableEncoder> = encoder_kind
-        .build(requested_entry_size, entries_per_shard_u32)
+        .build(entry_size, entries_per_shard_u32)
         .map_err(|e| anyhow::anyhow!("build encoder: {e}"))?;
-    // Per-leaf-path / per-node encoders override the requested size with their canonical layout;
-    // re-read so setup_state builds a matching initial DB.
-    let entry_size = encoder.record_size();
 
     let policy = SnapshotPolicy::default();
     let params = inputs.params.clone();
@@ -637,7 +664,7 @@ fn spawn_consumer_task(inputs: ConsumerSpawnInputs) -> tokio::task::JoinHandle<(
     })
 }
 
-// Multi-list PPOI dynamic discovery — mirrors the chain-tree driver above but keys off
+// Multi-list PPOI dynamic discovery - mirrors the chain-tree driver above but keys off
 // `list_observed: broadcast::Sender<[u8; 32]>` instead of `tree_observed`.
 
 /// Engine-facing view of one `[[ppoi_list_template]]` TOML row.
@@ -810,18 +837,25 @@ fn spawn_one_ppoi_list(inputs: &PpoiListSpawnInputs<'_>, append_log: bool) -> an
     let encoder_kind = template.resolve_encoder()?;
     let requested_entry_size = template.entry_bytes.max(32);
     let entries = template.entries.max(1);
-    let entries_per_shard_u32 =
-        u32::try_from(entries.min(usize::from(u16::MAX) * 2)).unwrap_or(2048);
+    let entries_per_shard_u32 = rows_per_shard(inputs.params);
 
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create ppoi_list_template data_dir {}", data_dir.display()))?;
     let layout = StoreLayout::open(&data_dir)
         .with_context(|| format!("open StoreLayout at {}", data_dir.display()))?;
+    let entry_size = encoder_kind.effective_record_size(requested_entry_size);
+    warn_on_record_size_override(encoder_kind, requested_entry_size, entry_size);
+    validate_cell_width(entry_size, inputs.params.ring_dim)
+        .map_err(|e| anyhow::anyhow!("encoder cell shape rejected: {e}"))?;
+    validate_rows_per_shard(entries_per_shard_u32, inputs.params.ring_dim)
+        .map_err(|e| anyhow::anyhow!("auto_spawn rows per shard rejected: {e}"))?;
+    // an undersized cell dirties shards past the allocated database, and drive_commit
+    // drops those rather than failing, so the instance serves factory bytes forever
+    validate_total_entries(&encoder_kind, entries)
+        .map_err(|e| anyhow::anyhow!("auto_spawn total entries rejected: {e}"))?;
     let encoder: Arc<dyn PirTableEncoder> = encoder_kind
-        .build(requested_entry_size, entries_per_shard_u32)
+        .build(entry_size, entries_per_shard_u32)
         .map_err(|e| anyhow::anyhow!("build encoder: {e}"))?;
-    // Per-list-path / per-list-node override the requested size; re-read to avoid a shape mismatch.
-    let entry_size = encoder.record_size();
 
     let policy = SnapshotPolicy::default();
     let params = inputs.params.clone();
@@ -1118,6 +1152,26 @@ mod tests {
             EncoderKind::PerNode { tree_number } => assert_eq!(tree_number, 7),
             other => panic!("expected PerNode, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rows_per_shard_equals_the_shard_config_setup_builds() {
+        let params = InspireParams::secure_128_d2048();
+        let entry_size = 32usize;
+        let db: Vec<u8> = (0..4096usize)
+            .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).unwrap_or(0)))
+            .collect();
+        let (state, _sk) =
+            setup_state(&params, &db, entry_size, InspireVariant::TwoPacking).expect("setup_state");
+        assert!(
+            state.encoded_db.shards.len() > 1,
+            "a multi-shard cell is what makes this assertion discriminating"
+        );
+        assert_eq!(
+            u64::from(rows_per_shard(&params)),
+            state.encoded_db.config.entries_per_shard(),
+            "the encoder must be told a shard's row count, not the cell's total"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! C6 regression: `SubsquidClient` must POST `{query, variables}` targeting the `Transaction`
+//! `SubsquidClient` must POST `{query, variables}` targeting the `Transaction`
 //! entity, not the non-existent `commitmentBatches` field.
 
 #![allow(

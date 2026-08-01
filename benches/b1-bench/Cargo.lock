@@ -241,7 +241,7 @@ name = "raven-core"
 version = "0.1.0-alpha.0"
 dependencies = [
  "bytes",
- "raven-inspire",
+ "serde",
  "thiserror",
 ]
 
@@ -255,7 +255,6 @@ dependencies = [
  "hex",
  "rand",
  "rand_chacha",
- "rayon",
  "serde",
  "serde_json",
  "tiny-keccak",

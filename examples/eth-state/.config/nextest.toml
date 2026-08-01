@@ -1,0 +1,7 @@
+# nextest config for this example's workspace; does not affect `cargo test`.
+
+[profile.default]
+# Each test builds a full PIR demo instance: measured peak RSS 2.0 GiB per
+# process. `#[serial]` is an in-process lock, so it bounds `cargo test` but not
+# nextest, which forks one process per test. Cap concurrency instead.
+test-threads = 2

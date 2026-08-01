@@ -235,7 +235,7 @@ pub(crate) async fn bearer_auth<S: PirScheme>(
 }
 
 /// Constant-time byte-slice equality; returns `Choice(0)` on length mismatch.
-/// Length is not secret: tokens are required to be ≥ [`HttpConfig::MIN_TOKEN_LEN`].
+/// Length is not secret: tokens are required to be >= [`HttpConfig::MIN_TOKEN_LEN`].
 #[inline]
 pub(crate) fn ct_eq_str(a: &[u8], b: &[u8]) -> subtle::Choice {
     use subtle::ConstantTimeEq;

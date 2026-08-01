@@ -1,4 +1,4 @@
-//! Per-encoder × fill-level wall-clock sweep.
+//! Per-encoder x fill-level wall-clock sweep.
 
 #![allow(
     clippy::expect_used,
