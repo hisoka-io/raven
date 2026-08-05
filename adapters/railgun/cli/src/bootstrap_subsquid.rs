@@ -1,48 +1,8 @@
 //! Bootstrap an instance's on-disk state from a Subsquid checkpoint.
 //!
-//! Per-tree algorithm:
-//!
-//! 1. Load the per-endpoint heterogeneous rpc-pool config.
-//! 2. Pin a `checkpoint_block = chain_head - checkpoint_depth` from
-//!    the live RPC.
-//! 3. Probe at least one pooled RPC endpoint for archival state at
-//!    `checkpoint_block`: a dry `eth_call merkleRoot()` MUST succeed
-//!    on at least one endpoint, otherwise bail with
-//!    [`BootstrapError::NoArchivalRpc`] before any per-tree work.
-//!    Subsquid does not expose a per-tree post-state anchor, so the
-//!    chain ABI is the canonical verifier and archival state is
-//!    mandatory.
-//! 4. Page through Subsquid's `commitments(orderBy: treePosition_ASC,
-//!    treePosition_gt: $cursor, first: 1000)` until empty (single-key
-//!    cursor on `treePosition`). Decode each `Commitment.hash` decimal-
-//!    string `BigInt` into a 32-byte big-endian field element via the
-//!    `bigint_to_fr_bytes` decoder (validated `< BN254_FR_MODULUS`).
-//! 5. Replay leaves into a local `raven_railgun_engine::imt::Imt` to
-//!    produce `local_root`.
-//! 6. Branch on `chain.active_tree_number_at(checkpoint_block) ==
-//!    tree`:
-//!    - Live tree: fetch `chain.merkle_root_at(checkpoint_block)`
-//!      and assert byte-identity vs `local_root` (oracle kind
-//!      [`OracleKind::ChainLiveTree`]).
-//!    - Static tree: call `chain.root_history_at(tree, local_root,
-//!      checkpoint_block)` and assert it returns `true` (oracle kind
-//!      [`OracleKind::ChainStaticTree`], membership semantics: "this
-//!      root was recorded by the chain for this tree at this block").
-//!
-//!    The chain oracle is mandatory; there is no graceful degrade
-//!    path. Subsquid is leaves-only.
-//! 7. Drop the initial snapshot via `bootstrap_inspire_instance` with
-//!    a deterministic placeholder DB matching the production cell
-//!    shape; the real per-leaf encoding lands once the consumer task
-//!    starts streaming chain events from `start_block = checkpoint`.
-//! 8. PPOI list bootstrap pulls upstream `/poi-events/{ct}/{cid}` from
-//!    Railway and asserts each `validatedMerkleroot` byte-equals our
-//!    locally-computed per-list IMT root (upstream-aggregator oracle).
-//!
-//! The module surfaces `BootstrapError` + a `bootstrap_one_tree`
-//! coroutine that the CLI subcommand orchestrates per tree number.
-//! Test doubles (`SubsquidLeavesSource` + `ChainOracle`) keep the
-//! algorithm exercise-able without live network I/O.
+//! Subsquid is leaves-only, so the chain ABI is the only root verifier and
+//! archival RPC state at the pinned checkpoint block is mandatory - there is no
+//! graceful-degrade path.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -79,21 +39,13 @@ const DEFAULT_MAX_BOOTSTRAP_WALL_MINS: u64 = 30;
 /// Source identifier for an oracle byte-identity disagreement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OracleKind {
-    /// Live-tree path: `chain.merkle_root_at()` disagreed with the
-    /// locally rebuilt IMT root (byte-identity oracle).
     ChainLiveTree,
-    /// Static-tree path: `chain.root_history_at(tree, local_root)`
-    /// returned `false` (membership oracle: the chain has not
-    /// recorded this root for this tree).
+    /// Membership oracle: `root_history_at(tree, local_root)` returned false.
     ChainStaticTree,
-    /// PPOI: Railway `validatedMerkleroot` disagreed with our local
-    /// per-list IMT root.
     PpoiUpstreamList,
 }
 
-/// Bootstrap-time errors. All variants are actionable: each carries
-/// the operator-facing context needed to decide whether to retry,
-/// re-pin the checkpoint, or escalate.
+/// Bootstrap-time errors.
 #[derive(Debug, thiserror::Error)]
 pub enum BootstrapError {
     #[error("invalid pool config: {0}")]
@@ -123,8 +75,7 @@ pub enum BootstrapError {
         tree_number: u32,
         expected_hex: String,
         observed_hex: String,
-        /// Index in the leaf sequence at which the rebuilt IMT first
-        /// matched the target root (or `leaves.len()` if no match).
+        /// `leaves.len()` when no prefix matched.
         first_match_index: usize,
     },
     #[error("data_dir lock held: {path}")]
@@ -143,10 +94,6 @@ pub enum BootstrapError {
     PpoiDecode(String),
     #[error("PPOI list_key {list_hex} bootstrap: {reason}")]
     PpoiList { list_hex: String, reason: String },
-    /// Boundary repair could not recover a missing leaf from the chain.
-    /// Surfaces the residual gap so the operator can decide whether
-    /// the divergence is an upstream Subsquid bug, a deeper local
-    /// bug, or a chain RPC pruning the boundary range.
     #[error(
         "boundary repair failed at tree={tree_number} missing_index={missing_index}: {reason}"
     )]
@@ -157,12 +104,9 @@ pub enum BootstrapError {
     },
 }
 
-/// Decode a Subsquid `BigInt` decimal-string (`Commitment.hash`) into
-/// a 32-byte big-endian buffer. Rejects values `>= BN254_FR_MODULUS`
-/// (off-curve leaves) and any non-decimal characters. Strips a single
-/// `0x`-prefix only when present and the rest is hex (safety net for
-/// gateways that relay BigInt as hex; documented as a non-canonical
-/// shape upstream).
+/// Decode a Subsquid `BigInt` decimal-string into 32 big-endian bytes,
+/// rejecting values `>= BN254_FR_MODULUS`. A `0x` prefix is tolerated because
+/// some gateways relay BigInt as hex.
 pub fn decode_bigint_to_be_bytes32(s: &str) -> Result<[u8; 32], String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -193,9 +137,7 @@ pub fn decode_bigint_to_be_bytes32(s: &str) -> Result<[u8; 32], String> {
     Ok(big)
 }
 
-/// Long-form decimal -> 32-byte BE conversion. Walks the digit string
-/// via a base-10 multiply-add over a 32-byte big-endian accumulator;
-/// returns an error if the result would exceed 32 bytes.
+/// Decimal digits -> 32-byte BE via base-10 multiply-add; errors on overflow.
 fn decimal_string_to_be_bytes32(digits: &str) -> Result<[u8; 32], String> {
     let mut acc = [0u8; 32];
     for ch in digits.chars() {
@@ -233,26 +175,19 @@ fn to_hex(b: &[u8; 32]) -> String {
     out
 }
 
-/// One Subsquid commitment row (subset relevant to bootstrap).
+/// One Subsquid commitment row.
 #[derive(Debug, Clone)]
 pub struct CommitmentRow {
     pub tree_position: u64,
     pub leaf: [u8; 32],
-    /// Block number the upstream indexer recorded for this leaf.
-    /// Used by boundary-repair to seed chain `eth_getLogs` ranges
-    /// without an out-of-band hint.
+    /// Seeds boundary-repair `eth_getLogs` ranges.
     pub block_number: u64,
 }
 
-/// Trait abstracting the paginated commitments source so tests can
-/// swap in a deterministic stub. Subsquid is leaves-only; per-tree
-/// post-state anchors are fetched from the chain ABI, not Subsquid.
+/// Paginated commitments source.
 #[async_trait]
 pub trait SubsquidLeavesSource: Send + Sync {
-    /// Fetch up to [`SUBSQUID_PAGE`] commitments for `tree_number` at
-    /// `block_height_lte = checkpoint_block`, ordered ascending by
-    /// `treePosition`, with `treePosition_gt = cursor`. An empty page
-    /// signals end-of-stream.
+    /// Ascending by `treePosition`, `treePosition_gt = cursor`; empty page ends the stream.
     async fn fetch_commitments_page(
         &self,
         tree_number: u32,
@@ -262,16 +197,7 @@ pub trait SubsquidLeavesSource: Send + Sync {
     ) -> Result<Vec<CommitmentRow>, BootstrapError>;
 }
 
-/// Chain-side oracle surface. Surfaces the three pinned reads the
-/// bootstrap needs:
-///
-/// - `chain_head()` to pin a `checkpoint_block = head - depth`.
-/// - `active_tree_number_at(block)` to branch live vs static.
-/// - `merkle_root_at(block)` for the live-tree byte-identity oracle.
-/// - `root_history_at(tree, root, block)` for the static-tree
-///   membership oracle.
-/// - `archival_probe(block)` to fail-fast if the operator's RPC pool
-///   has no archival endpoint covering the checkpoint.
+/// Chain-side reads the bootstrap verifies against.
 #[async_trait]
 pub trait ChainOracle: Send + Sync {
     async fn chain_head(&self) -> Result<u64, BootstrapError>;
@@ -283,24 +209,14 @@ pub trait ChainOracle: Send + Sync {
         merkle_root: [u8; 32],
         block: u64,
     ) -> Result<bool, BootstrapError>;
-    /// Fetch decoded Shield/Transact commitment events for the inclusive
-    /// block range `[from_block, to_block]` and project them down to
-    /// `(tree_number, leaf_index, commitment_hash)` triples. Used by the
-    /// Subsquid boundary-repair path to chain-backfill leaves that the
-    /// upstream indexer dropped or duplicated at a tree-rollover block.
-    /// The caller is expected to pass a small range (the repair path
-    /// uses ~21 blocks) so this stays within typical RPC `eth_getLogs`
-    /// span limits.
+    /// `(tree_number, leaf_index, commitment_hash)` over the inclusive block
+    /// range. Callers must pass a narrow range to stay inside RPC `eth_getLogs` caps.
     async fn commitment_events_in_range(
         &self,
         from_block: u64,
         to_block: u64,
     ) -> Result<Vec<(u32, u32, [u8; 32])>, BootstrapError>;
-    /// Best-effort dry probe: succeed iff at least one endpoint in the
-    /// underlying pool can serve historical state at `block`. The
-    /// default implementation issues `merkle_root_at(block)` and maps
-    /// any error to a typed `NoArchivalRpc`. Implementations may
-    /// override to walk the pool explicitly.
+    /// Succeeds iff some pooled endpoint serves historical state at `block`.
     async fn archival_probe(&self, block: u64) -> Result<(), BootstrapError> {
         match self.merkle_root_at(block).await {
             Ok(_) => Ok(()),
@@ -320,11 +236,8 @@ pub trait ChainOracle: Send + Sync {
     }
 }
 
-/// Heuristic: classify an RPC error string as the upstream
-/// "historical state not available" / "pruning" family. Mainnet RPCs
-/// surface this as JSON-RPC code -32000 with various message strings;
-/// matching on substrings is the operator-friendly compromise versus
-/// parsing the raw JSON-RPC error body.
+/// Substring-matches the "historical state not available" JSON-RPC -32000 family,
+/// whose message text is not standardised across providers.
 fn looks_like_pruning_error(msg: &str) -> bool {
     let lc = msg.to_lowercase();
     lc.contains("-32000")
@@ -336,21 +249,16 @@ fn looks_like_pruning_error(msg: &str) -> bool {
         || lc.contains("archive node")
 }
 
-/// One bootstrap-tree invocation summary surfaced for benching.
+/// Per-tree bootstrap summary.
 #[derive(Debug, Clone)]
 pub struct BootstrapTreeReport {
     pub tree_number: u32,
     pub checkpoint_block: u64,
     pub leaves: usize,
     pub local_root: [u8; 32],
-    /// `Some(root)` when the live-tree byte-identity oracle was used
-    /// (i.e. `chain.active_tree_number_at(checkpoint) == tree`). For
-    /// static trees this is `None` and verification used the
-    /// membership oracle instead.
+    /// `Some` only on the live-tree byte-identity path.
     pub chain_live_root: Option<[u8; 32]>,
-    /// `true` iff the static-tree membership oracle returned `true`
-    /// (i.e. the chain's `rootHistory(tree, local_root)` recorded
-    /// this root). `None` for live trees.
+    /// `None` for live trees.
     pub chain_static_membership: Option<bool>,
     pub wall_clock_secs: f64,
     pub subsquid_pages: u32,
@@ -368,24 +276,12 @@ pub struct BootstrapTreeConfig {
     pub entries: usize,
     pub entry_bytes: usize,
     pub max_wall_mins: u64,
-    /// Filled-tree row-count threshold above which the boundary
-    /// repair path will gap-walk + chain-backfill missing leaves.
-    /// Production defaults to `TREE_MAX_ITEMS - 16` (i.e. only act
-    /// on trees that are essentially full); tests lower this so
-    /// the repair path stays exercise-able with synthetic 4/8/N-leaf
-    /// fixtures instead of forcing every test to allocate 65,536
-    /// rows + 65,536 IMT inserts.
+    /// Row count above which boundary repair gap-walks and chain-backfills.
     pub repair_trigger_threshold: usize,
-    /// Expected post-repair count of leaves for a filled tree. The
-    /// gap-walk visits `0..expected_filled_count`; production locks
-    /// this at `TREE_MAX_ITEMS = 65,536` per Railgun's
-    /// `Commitments.sol::TREE_DEPTH = 16`. Tests scale this down so
-    /// the synthetic fixtures stay small.
+    /// Gap-walk visits `0..expected_filled_count`; production pins `TREE_MAX_ITEMS`
+    /// per `Commitments.sol::TREE_DEPTH = 16`.
     pub expected_filled_count: usize,
-    /// Encoder kind to stamp into the manifest for this tree. Defaults
-    /// to [`EncoderKind::PerLeafBc`] for backward compatibility; the
-    /// CLI orchestrator overrides this to match the production lock
-    /// (per-tree `EncoderKind::PerNode { tree_number }`).
+    /// Stamped into the manifest for this tree.
     pub encoder_kind: EncoderKind,
 }
 
@@ -407,38 +303,21 @@ impl Default for BootstrapTreeConfig {
     }
 }
 
-/// Cross-tree carry for Subsquid stowaway rows whose `treePosition`
-/// landed `>= TREE_MAX_ITEMS` for the tree that was being bootstrapped.
-/// Per `Commitments.sol` no batch spans tree boundaries, so an
-/// impossible-position row is the SAME physical commitment that the
-/// chain emitted at `treeNumber = N+1, startPosition = 0`. Boundary
-/// repair re-tags `tree_position -= TREE_MAX_ITEMS` and stows it under
-/// the target tree number; the next tree's bootstrap drains the carry
-/// before chain-backfill so the leaf data is preserved end-to-end.
+/// Rows Subsquid tagged `treePosition >= TREE_MAX_ITEMS`, keyed by the tree that
+/// must drain them. Per `Commitments.sol` no batch spans tree boundaries, so such
+/// a row is the next tree's `startPosition = 0` commitment under the wrong key.
 pub type StowawayCarry = HashMap<u32, Vec<CommitmentRow>>;
 
-/// Sliding window (in blocks) for chain-backfill `eth_getLogs` queries
-/// when boundary repair has to recover a missing leaf. Selected to be
-/// large enough to cover the rollover transaction and any neighbouring
-/// commitment events but small enough to stay within typical RPC
-/// `eth_getLogs` span caps.
+/// Half-width in blocks of the boundary-repair `eth_getLogs` window; wide enough
+/// for the rollover transaction, narrow enough for RPC span caps.
 const BOUNDARY_REPAIR_WINDOW_BLOCKS: u64 = 10;
 
-/// Below this filled-tree row count (post position-filter) we skip the
-/// chain gap-walk: a tree this far from `TREE_MAX_ITEMS` is either an
-/// artificial test fixture or a degenerate Subsquid response, and the
-/// existing static-membership oracle is the right place to hard-stop.
-/// At or above this threshold the tree is clearly "almost full" and we
-/// chain-backfill the residual gap.
+/// Below this row count the static-membership oracle hard-stops instead of
+/// gap-walking; a tree that far from full is a degenerate response, not a gap.
 const BOUNDARY_REPAIR_TRIGGER_THRESHOLD: usize = TREE_MAX_ITEMS - 16;
 
-/// Extract every row in `rows` whose `tree_position >= TREE_MAX_ITEMS`
-/// and re-tag it as the same physical commitment in tree
-/// `tree_number + 1` at `tree_position - TREE_MAX_ITEMS`. Returns the
-/// count of rows moved into the carry. Per `Commitments.sol` no batch
-/// spans tree boundaries, so an impossible-position row in tree `N`
-/// from Subsquid's perspective is the chain's `treeNumber = N + 1,
-/// startPosition = 0` log carried under the wrong key.
+/// Moves `tree_position >= TREE_MAX_ITEMS` rows into `carry[tree_number + 1]`
+/// re-tagged to `tree_position - TREE_MAX_ITEMS`; returns the count moved.
 fn extract_cross_tree_stowaways(
     rows: &mut Vec<CommitmentRow>,
     tree_number: u32,
@@ -475,38 +354,9 @@ fn extract_cross_tree_stowaways(
     count
 }
 
-/// Filter impossible `treePosition >= TREE_MAX_ITEMS` rows by
-/// re-tagging them as the next tree's leaf-zero stowaway, then chain-
-/// backfill any remaining gaps for a filled tree. Mutates `rows` in
-/// place; returns the number of leaves repaired (`re-tags + backfills`).
-///
-/// Algorithm:
-///
-/// 1. For any row with `tree_position >= TREE_MAX_ITEMS` (e.g. the
-///    Subsquid stowaway at position 65,536 in mainnet tree 0): drop
-///    it from the current tree AND push a re-tagged copy
-///    (`tree_position -= TREE_MAX_ITEMS`) into
-///    `carry[tree_number + 1]` so the next per-tree call can drain it
-///    before its own gap-walk. Per `Commitments.sol` no batch spans
-///    tree boundaries; the chain log was emitted at
-///    `treeNumber = N + 1, startPosition = 0` and Subsquid mis-tagged
-///    it as `treeNumber = N, startPosition = TREE_MAX_ITEMS`. Each
-///    re-tag emits a `tracing::warn!` carrying the row's
-///    `block_number` so an operator can correlate.
-/// 2. If the tree is filled (`active_tree_number > tree_number`) and
-///    the row count is short of `TREE_MAX_ITEMS`, gap-walk the
-///    sorted positions and chain-backfill each missing position via
-///    [`ChainOracle::commitment_events_in_range`]. The query window
-///    is `[anchor - BOUNDARY_REPAIR_WINDOW_BLOCKS,
-///    anchor + BOUNDARY_REPAIR_WINDOW_BLOCKS]` where `anchor` is
-///    derived from neighbouring rows' `block_number`s (boundary
-///    rollovers happen at the smallest / largest blockNumbers; this
-///    is monotone with `treePosition` per the Railgun proxy's append
-///    semantics).
-/// 3. If a position cannot be recovered, surfaces
-///    [`BootstrapError::BoundaryRepairFailed`] with the residual
-///    diagnostic. Live-tree rows are NOT gap-walked: a partial live
-///    tree is operationally normal.
+/// Re-tags cross-tree stowaways, then chain-backfills residual gaps in a filled
+/// tree. Mutates `rows` in place; returns the leaves repaired. A partial LIVE
+/// tree is operationally normal and is never gap-walked.
 async fn repair_boundary_if_needed(
     rows: &mut Vec<CommitmentRow>,
     tree_number: u32,
@@ -617,11 +467,7 @@ async fn repair_boundary_if_needed(
     Ok(repaired)
 }
 
-/// Page through the Subsquid commitments feed for one tree, returning
-/// the accumulated `(rows, page_count)` tuple. Extracted from
-/// [`bootstrap_one_tree`] for clippy::too_many_lines hygiene + so the
-/// boundary-repair flow can be unit-tested without the surrounding
-/// chain-oracle dance.
+/// Page the Subsquid commitments feed for one tree into `(rows, page_count)`.
 async fn page_subsquid_leaves(
     cfg: &BootstrapTreeConfig,
     leaves_src: &dyn SubsquidLeavesSource,
@@ -666,27 +512,9 @@ async fn page_subsquid_leaves(
     Ok((rows, pages))
 }
 
-/// Run the bootstrap algorithm against a single tree.
-///
-/// Algorithm: page leaves from Subsquid, replay locally into an IMT,
-/// then verify the rebuilt root with the chain ABI:
-///
-/// - LIVE tree (`active_tree_number_at(checkpoint) == tree`): assert
-///   byte-identity vs `merkle_root_at(checkpoint)`.
-/// - STATIC tree: assert membership via
-///   `root_history_at(tree, local_root, checkpoint) == true`.
-///
-/// Caller is expected to have run [`ChainOracle::archival_probe`]
-/// before invoking this. Mismatches surface as
-/// [`BootstrapError::OracleByteIdentityMismatch`].
-///
-/// Convenience wrapper over [`bootstrap_one_tree_with_carry`] for
-/// callers that bootstrap a single tree without a cross-tree stowaway
-/// re-tag (e.g. the live tree on its own). Production orchestrators
-/// MUST use [`bootstrap_one_tree_with_carry`] and thread the same
-/// [`StowawayCarry`] across the per-tree loop so any
-/// `tree_position >= TREE_MAX_ITEMS` row in tree `N` lands as the
-/// `position 0` leaf in tree `N+1`.
+/// Bootstrap a single tree with no cross-tree carry. Callers must have run
+/// [`ChainOracle::archival_probe`] first. Multi-tree orchestrators MUST use
+/// [`bootstrap_one_tree_with_carry`] instead.
 pub async fn bootstrap_one_tree(
     cfg: &BootstrapTreeConfig,
     leaves_src: &dyn SubsquidLeavesSource,
@@ -696,12 +524,8 @@ pub async fn bootstrap_one_tree(
     bootstrap_one_tree_with_carry(cfg, leaves_src, chain, &mut carry).await
 }
 
-/// Variant of [`bootstrap_one_tree`] that accepts a shared
-/// [`StowawayCarry`] across per-tree calls so any Subsquid stowaway at
-/// `treePosition >= TREE_MAX_ITEMS` in tree `N` is preserved as the
-/// `position 0` leaf of tree `N + 1`. The orchestrator MUST invoke
-/// trees in ascending order so a stowaway is in the carry before the
-/// downstream tree's pagination resolves.
+/// Bootstrap one tree threading a shared [`StowawayCarry`]. Trees MUST be
+/// visited in ascending order so a stowaway lands before its target tree pages.
 pub async fn bootstrap_one_tree_with_carry(
     cfg: &BootstrapTreeConfig,
     leaves_src: &dyn SubsquidLeavesSource,
@@ -757,11 +581,7 @@ pub async fn bootstrap_one_tree_with_carry(
     }
     let local_root = imt.root();
 
-    // Chain branch: live vs static. Both reads are pinned to the
-    // checkpoint block; archival state is mandatory and the caller
-    // is expected to have probed for it before getting here.
-    // `active_for_repair` was already fetched above to drive the
-    // boundary-repair "is this tree filled" decision; reuse it.
+    // Both reads pinned to the checkpoint block.
     let is_live = active_for_repair == cfg.tree_number;
 
     let mut chain_live_root: Option<[u8; 32]> = None;
@@ -814,10 +634,7 @@ pub async fn bootstrap_one_tree_with_carry(
     })
 }
 
-/// Map a transient `RpcUnreachable` whose message screams "no archival
-/// state" into the typed [`BootstrapError::NoArchivalRpc`] variant so
-/// the operator gets an actionable message instead of a generic RPC
-/// error. Pass-through for every other error.
+/// Retypes an archival-pruning `RpcUnreachable` as [`BootstrapError::NoArchivalRpc`].
 fn classify_archival_error(e: BootstrapError, checkpoint_block: u64) -> BootstrapError {
     match e {
         BootstrapError::RpcUnreachable(msg) if looks_like_pruning_error(&msg) => {
@@ -836,11 +653,7 @@ fn classify_archival_error(e: BootstrapError, checkpoint_block: u64) -> Bootstra
     }
 }
 
-/// Walk the leaf sequence and return the first index `i` such that the
-/// IMT after `i+1` inserts equals `target_root`, or `leaves.len()` if
-/// no prefix matches. Used to give the operator a precise "the last
-/// good leaf was N" hint when the byte-identity oracle disagrees with
-/// our locally rebuilt root.
+/// First `i` whose `i+1`-leaf IMT prefix hits `target_root`, else `leaves.len()`.
 fn first_match_index(leaves: &[[u8; 32]], target_root: &[u8; 32]) -> Result<usize, BootstrapError> {
     let mut imt =
         Imt::new().map_err(|e| BootstrapError::Engine(format!("imt new (match-search): {e}")))?;
@@ -854,9 +667,7 @@ fn first_match_index(leaves: &[[u8; 32]], target_root: &[u8; 32]) -> Result<usiz
     Ok(leaves.len())
 }
 
-/// Cell shape (total rows x record-size in bytes) the PIR table for a
-/// given encoder kind expects. Single source of truth for all bootstrap
-/// encoded_db sizing.
+/// Cell shape (rows x record bytes) an encoder kind expects.
 fn cell_shape_for_encoder(kind: EncoderKind) -> (u32, usize) {
     match kind {
         EncoderKind::PerLeafBc | EncoderKind::PerListStatus { .. } => {
@@ -980,13 +791,10 @@ fn persist_initial_snapshot(
     Ok(())
 }
 
-/// PPOI list bootstrap (Railway upstream is the only path; Subsquid
-/// schema does not expose per-list IMT roots).
+/// Per-list event source; the Subsquid schema exposes no per-list IMT roots.
 #[async_trait]
 pub trait PpoiEventsSource: Send + Sync {
-    /// Fetch every event for `list_key`. Each row carries the
-    /// upstream-published `validatedMerkleroot` that the sequence is
-    /// asserted against.
+    /// Each row carries the upstream `validatedMerkleroot` the replay is asserted against.
     async fn fetch_all_events(
         &self,
         list_key: [u8; 32],
@@ -1008,27 +816,17 @@ pub struct PpoiListReport {
 }
 
 /// Operator-side resilience policy for the PPOI bootstrap step.
-///
-/// `Strict` preserves the original V1 behaviour: any upstream
-/// unreachability hard-stops the bootstrap. `SkipOnUnreachable` is the
-/// always-works baseline: when every upstream source fails with a
-/// transport-level error, the per-list IMT is seeded EMPTY and a loud
-/// warn-level log is emitted to surface the upstream-signature gap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PpoiBootstrapMode {
-    /// Hard-stop on any upstream unreachability. Default for V1
-    /// backward compatibility.
+    /// Hard-stop on any upstream unreachability.
     #[default]
     Strict,
-    /// Loudly warn and seed an EMPTY per-list IMT when every upstream
-    /// source returns a `PpoiUnreachable` (or `PpoiDecode`) error. Any
-    /// non-transport error (e.g. byte-identity mismatch) still
-    /// hard-stops to preserve oracle integrity.
+    /// Warn and seed an EMPTY IMT when every source fails at transport level;
+    /// a byte-identity mismatch still hard-stops.
     SkipOnUnreachable,
 }
 
 impl PpoiBootstrapMode {
-    /// Parse the CLI string into a mode value.
     pub fn parse_cli(s: &str) -> Result<Self, String> {
         match s {
             "strict" => Ok(Self::Strict),
@@ -1040,13 +838,7 @@ impl PpoiBootstrapMode {
     }
 }
 
-/// Bootstrap one PPOI list - assert each upstream
-/// `validatedMerkleroot` matches our locally rebuilt per-list IMT root
-/// after each successive insert.
-///
-/// Convenience wrapper for the strict-mode default. Tests and the CLI
-/// MUST call [`bootstrap_one_list_with_mode`] when they need to expose
-/// the operator-side resilience policy.
+/// Strict-mode [`bootstrap_one_list_with_mode`].
 pub async fn bootstrap_one_list(
     list_key: [u8; 32],
     src: &dyn PpoiEventsSource,
@@ -1062,10 +854,8 @@ pub async fn bootstrap_one_list(
     .await
 }
 
-/// Bootstrap one PPOI list with explicit operator-side resilience
-/// policy. `tried_sources_for_log` is informational only; it ends up
-/// in the WARN message emitted in [`PpoiBootstrapMode::SkipOnUnreachable`]
-/// mode so operators can see exactly which URLs were tried.
+/// Assert each upstream `validatedMerkleroot` byte-equals the locally rebuilt
+/// per-list IMT root after every insert. `tried_sources_for_log` is log-only.
 pub async fn bootstrap_one_list_with_mode(
     list_key: [u8; 32],
     src: &dyn PpoiEventsSource,
@@ -1126,30 +916,19 @@ pub async fn bootstrap_one_list_with_mode(
     })
 }
 
-/// Per-URL HTTP timeout when probing a Railway PPOI base. Operators
-/// run with multiple bases in priority order; on transport failure or
-/// non-2xx response we walk to the next base. Mirrors the upstream
-/// wallet behaviour at `wallet/src/services/poi/poi-node-request.ts`.
+/// Per-base HTTP timeout before walking to the next base; mirrors upstream
+/// `wallet/src/services/poi/poi-node-request.ts`.
 const RAILWAY_PER_URL_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// The default Railway base list that every operator gets unless they
-/// override `--ppoi-endpoint`. Order is priority-significant: the first
-/// reachable base wins.
+/// Default bases for `--ppoi-endpoint`; order is priority, first reachable wins.
 pub const DEFAULT_RAILWAY_BASES: &[&str] = &[
     "https://poi.us.proxy.railwayapi.xyz",
     "https://poi-lb.us.proxy.railwayapi.xyz",
     "https://ppoi-agg.horsewithsixlegs.xyz",
 ];
 
-/// Live HTTP client wrapping the upstream Railway PPOI events feed.
-/// Only consumed by the CLI binary; tests use an in-process axum stub
-/// implementing [`PpoiEventsSource`] directly.
-///
-/// Operators supply an ordered list of base URLs; the client walks
-/// them sequentially with a per-URL `RAILWAY_PER_URL_TIMEOUT`. On
-/// connect-error / TCP-timeout / non-2xx response, the next base is
-/// tried. `BootstrapError::PpoiUnreachable` only fires after every
-/// base fails.
+/// Live client over the upstream PPOI events feed. Walks the bases in order and
+/// only reports `PpoiUnreachable` once every base has failed.
 pub struct RailwayPpoiClient {
     bases: Vec<String>,
     chain_type: u32,
@@ -1168,9 +947,7 @@ impl std::fmt::Debug for RailwayPpoiClient {
 }
 
 impl RailwayPpoiClient {
-    /// Single-base constructor preserved for existing call sites; the
-    /// multi-base variant is what the CLI threads through.
-    /// Returns an error if `base` is empty after trimming.
+    /// Errors when `base` is empty after trimming.
     pub fn new(base: impl Into<String>, chain_type: u32, chain_id: u64) -> Self {
         let s: String = base.into();
         if let Ok(c) = Self::new_multi(vec![s.clone()], chain_type, chain_id) {
@@ -1195,9 +972,7 @@ impl RailwayPpoiClient {
         }
     }
 
-    /// Multi-base constructor. Returns an error when the base list is
-    /// empty (operator-input validation: the CLI converts this into a
-    /// clean `clap` error).
+    /// Errors when the base list is empty.
     pub fn new_multi(bases: Vec<String>, chain_type: u32, chain_id: u64) -> Result<Self, String> {
         if bases.is_empty() {
             return Err("RailwayPpoiClient: at least one base URL is required".to_owned());
@@ -1223,9 +998,6 @@ impl RailwayPpoiClient {
         })
     }
 
-    /// Read-only accessor for the bases list (used by the CLI to
-    /// thread the same set into `bootstrap_one_list_with_mode`'s
-    /// operator-facing log).
     pub fn bases(&self) -> &[String] {
         &self.bases
     }
@@ -1322,8 +1094,7 @@ fn parse_hex32(s: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-/// Live Subsquid client implementing [`SubsquidLeavesSource`] against
-/// a real GraphQL endpoint. Tests use an in-process stub.
+/// Live GraphQL [`SubsquidLeavesSource`].
 pub struct SubsquidLeavesClient {
     endpoint: String,
     http: reqwest::Client,
@@ -1337,15 +1108,11 @@ impl std::fmt::Debug for SubsquidLeavesClient {
     }
 }
 
-/// Per-request timeout for Subsquid GraphQL pages. Operator's gateway
-/// is intermittently slow (502s + outright stalls observed on mainnet);
-/// without a timeout, `reqwest::Client::new()` waits indefinitely on a
-/// hung connection and the per-tree wall budget never fires because it
-/// is checked between pages, not during a stalled request.
+/// Per-page timeout: the wall budget is only checked between pages, so a stalled
+/// request would otherwise hang forever.
 const SUBSQUID_PER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Maximum retry attempts on transient Subsquid failures (5xx, decode
-/// errors, network timeouts). Backoff is exponential: 2s, 4s, 8s.
+/// Retries on transient Subsquid failures; backoff 2s, 4s, 8s.
 const SUBSQUID_MAX_RETRIES: u32 = 3;
 
 impl SubsquidLeavesClient {
@@ -1489,9 +1256,7 @@ impl SubsquidLeavesSource for SubsquidLeavesClient {
     }
 }
 
-/// Adapter wrapping a [`raven_railgun_indexer::ChainSource`] into the
-/// bootstrap [`ChainOracle`] surface so the live CLI can drive the
-/// 3-oracle path against a real RPC pool.
+/// [`ChainOracle`] over a live [`raven_railgun_indexer::ChainSource`].
 pub struct ChainSourceOracle {
     inner: Arc<dyn raven_railgun_indexer::ChainSource>,
 }
@@ -1573,8 +1338,7 @@ impl ChainOracle for ChainSourceOracle {
     }
 }
 
-/// Resolve the data_dir for a tree number from a template containing
-/// the literal `{N}` substring. Errors if the substring is absent.
+/// Expands `{N}` in a data_dir template; errors when absent.
 pub fn resolve_data_dir_template(template: &str, tree_number: u32) -> Result<PathBuf, String> {
     if !template.contains("{N}") {
         return Err(format!("template must contain {{N}}: {template}"));
@@ -1584,7 +1348,7 @@ pub fn resolve_data_dir_template(template: &str, tree_number: u32) -> Result<Pat
     ))
 }
 
-/// Resolve the PPOI data_dir from a template containing `{LIST_KEY}`.
+/// Expands `{LIST_KEY}` in a data_dir template; errors when absent.
 pub fn resolve_ppoi_data_dir(template: &str, list_key: [u8; 32]) -> Result<PathBuf, String> {
     if !template.contains("{LIST_KEY}") {
         return Err(format!("template must contain {{LIST_KEY}}: {template}"));
@@ -1594,8 +1358,6 @@ pub fn resolve_ppoi_data_dir(template: &str, list_key: [u8; 32]) -> Result<PathB
     ))
 }
 
-/// Convenience accessor used by tests that need to round-trip the
-/// modulus literal.
 #[doc(hidden)]
 pub fn modulus_be() -> [u8; 32] {
     BN254_FR_MODULUS_BE

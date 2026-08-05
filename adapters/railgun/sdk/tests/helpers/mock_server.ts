@@ -51,7 +51,6 @@ export async function startMockServer(): Promise<MockServer> {
         res.writeHead(400);
         res.end();
       } catch {
-        // connection may already be closed
       }
     });
   });

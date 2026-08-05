@@ -1,4 +1,4 @@
-//! Per-list PPOI encoders: PerListStatus, PerListPath, PerListNode.
+//! Per-list encoders keyed on `list_key`.
 
 use std::collections::BTreeSet;
 
@@ -12,9 +12,8 @@ use super::{
 use crate::imt::TREE_DEPTH;
 use crate::inspire::LogicalLeafStore;
 
-/// T1 status encoder: row at list_index = `[status_byte, blinded_commitment[0..31]]`
-/// padded to `record_size`, pinned to one `list_key`. The BC tail lets a single
-/// query recover both the verdict and the entry's canonical BC bytes.
+/// Status encoder: row at `list_index` is `[status_byte, bc[0..31]]` padded to
+/// `record_size`. The BC tail lets one query recover verdict and canonical bytes.
 #[derive(Debug, Clone)]
 pub struct PerListStatusEncoder {
     record_size: usize,
@@ -23,8 +22,7 @@ pub struct PerListStatusEncoder {
 }
 
 impl PerListStatusEncoder {
-    /// `record_size` must be `>= 32`; at exactly 32 the row is the status byte
-    /// plus the first 31 BC bytes. `entries_per_shard` must be non-zero.
+    /// Requires `record_size >= 32` and non-zero `entries_per_shard`.
     pub fn new(record_size: usize, entries_per_shard: u32, list_key: [u8; 32]) -> Result<Self> {
         if record_size < MIN_RECORD_SIZE {
             return Err(AdapterError::InvalidQuery(format!(
@@ -120,9 +118,8 @@ impl PirTableEncoder for PerListStatusEncoder {
         if list_key != &self.list_key {
             return BTreeSet::new();
         }
-        // Trait has no store handle; the apply path resolves BC -> idx
-        // and calls `affected_shards_for_ppoi_leaf` directly, so we
-        // return empty here without losing dirty marking.
+        // Empty is safe: the apply path resolves BC -> idx and calls
+        // `affected_shards_for_ppoi_leaf` itself, which this trait cannot reach.
         BTreeSet::new()
     }
 
@@ -131,9 +128,8 @@ impl PirTableEncoder for PerListStatusEncoder {
     }
 }
 
-/// T2 path encoder: row at list_index = 16 sibling hashes from the per-list
-/// IMT proof, packed leaf-to-root (`PATH_RECORD_BYTES = 512` bytes), pinned to
-/// one `list_key`. Same cascading dirty-shard semantics as [`PerLeafPathEncoder`].
+/// Path encoder: row at `list_index` is the per-list IMT proof packed
+/// leaf-to-root. Same cascading dirty-shard semantics as [`PerLeafPathEncoder`].
 #[derive(Debug, Clone)]
 pub struct PerListPathEncoder {
     record_size: usize,
@@ -142,8 +138,7 @@ pub struct PerListPathEncoder {
 }
 
 impl PerListPathEncoder {
-    /// `record_size` must be exactly 512 B (16 siblings x 32 B);
-    /// `entries_per_shard` must be non-zero.
+    /// Requires `record_size == PATH_RECORD_BYTES` and non-zero `entries_per_shard`.
     pub fn new(record_size: usize, entries_per_shard: u32, list_key: [u8; 32]) -> Result<Self> {
         if record_size != PATH_RECORD_BYTES {
             return Err(AdapterError::InvalidQuery(format!(
@@ -232,9 +227,8 @@ impl PirTableEncoder for PerListPathEncoder {
     }
 }
 
-/// Per-list Merkle-node encoder: each row is a single 32 B node from the
-/// per-list PPOI IMT, in the same flat-global-index layout as [`PerNodeEncoder`],
-/// pinned to one `list_key`. Inserting a leaf dirties at most TREE_DEPTH+1 rows.
+/// Per-list node encoder: [`PerNodeEncoder`]'s flat-global-index layout over
+/// the per-list IMT. A leaf insert dirties at most `TREE_DEPTH + 1` rows.
 #[derive(Debug, Clone)]
 pub struct PerListNodeEncoder {
     entries_per_shard: u32,
@@ -242,8 +236,7 @@ pub struct PerListNodeEncoder {
 }
 
 impl PerListNodeEncoder {
-    /// Build a per-list-node encoder pinned to `list_key`.
-    /// `entries_per_shard` must be non-zero.
+    /// Build a per-list-node encoder; `entries_per_shard` must be non-zero.
     pub fn new(entries_per_shard: u32, list_key: [u8; 32]) -> Result<Self> {
         if entries_per_shard == 0 {
             return Err(AdapterError::InvalidQuery(

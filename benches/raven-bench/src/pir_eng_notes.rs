@@ -1,40 +1,25 @@
-//! Exporter from [`BenchReport`] to the PIR-Eng-Notes v2 reporting JSON
-//! schema. Bridges Raven's Rust-native field names to the upstream's
-//! unit-suffixed identifiers (`query_size_kb: f64`, `server_time_ms: f64`).
+//! [`BenchReport`] exporter for the PIR-Eng-Notes v2 reporting schema.
 //!
-//! Unit convention: upstream's `*_kb` / `*_mb` fields use binary prefixes
-//! (KiB = 1024, MiB = 1024^2). `bytes_to_kib` / `bytes_to_mib` below match.
-//!
-//! `throughput_gbps` and `rate` are not emitted: both need scheme-specific
-//! plaintext-space arithmetic that the scheme crate owns.
+//! Upstream's `*_kb` / `*_mb` fields are binary prefixes: KiB = 1024, MiB = 1024^2.
+//! `throughput_gbps` and `rate` are omitted - both need plaintext-space arithmetic the
+//! scheme crate owns.
 
 use serde::{Deserialize, Serialize};
 
 use crate::{BenchReport, GridCell};
 
-/// One configuration entry in the upstream `configs` array.
-///
-/// Mirrors the `schema_v2.jsonc` shape:
-/// ```jsonc
-/// {
-///   "config_id": "2^20x256B",
-///   "num_entries": 1048576,
-///   "num_entries_label": "2^20",
-///   "entry_size_bytes": 256,
-///   "entry_size_label": "256 B"
-/// }
-/// ```
+/// One entry in the upstream `configs` array; mirrors `schema_v2.jsonc`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PirEngNotesConfig {
-    /// Stable identifier combining entry count + size, e.g. `"2^20x256B"`.
+    /// Entry count and size combined, e.g. `"2^20x256B"`.
     pub config_id: String,
-    /// Entry count as a plain integer.
+    /// Entry count.
     pub num_entries: u64,
-    /// Human-readable entry-count label, e.g. `"2^20"`.
+    /// Entry-count label, e.g. `"2^20"`.
     pub num_entries_label: String,
     /// Per-row size in bytes.
     pub entry_size_bytes: u64,
-    /// Human-readable record-size label, e.g. `"256 B"`.
+    /// Record-size label, e.g. `"256 B"`.
     pub entry_size_label: String,
 }
 
@@ -50,43 +35,37 @@ impl From<GridCell> for PirEngNotesConfig {
     }
 }
 
-/// One benchmark row in the upstream `benchmarks` array.
-///
-/// Fields match the most commonly populated subset of the upstream
-/// `metrics` object. Fields that aren't observable under Raven's
-/// current harness ship as `None` (serialised as JSON `null`).
+/// One row in the upstream `benchmarks` array; unobservable metrics ship as `None`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PirEngNotesBenchmark {
-    /// Scheme variant. Matches the upstream `variant` field.
+    /// Scheme variant.
     pub variant: String,
-    /// Refers back to the config in the configs array.
+    /// Key into the configs array.
     pub config_id: String,
-    /// Provenance. `"raven-bench internal"` for our-emitted rows.
+    /// Provenance of the row.
     pub source_ref: String,
-    /// Threading mode, one of `"single"`, `"multi"`, `"gpu"`.
+    /// One of `"single"`, `"multi"`, `"gpu"`.
     pub threading: String,
     /// Metrics sub-object.
     pub metrics: PirEngNotesMetrics,
 }
 
-/// Upstream `metrics` sub-object. Unit suffixes per upstream convention.
+/// Upstream `metrics` sub-object.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PirEngNotesMetrics {
-    /// Per-query request size, KiB (bytes / 1024).
+    /// Per-query request size, KiB.
     pub query_size_kb: f64,
     /// Per-query response size, KiB.
     pub response_size_kb: f64,
     /// Median end-to-end query time, milliseconds.
     pub query_time_ms: f64,
-    /// Median server compute time, milliseconds. `None` when the harness
-    /// cannot separate server compute from client work.
+    /// Median server compute time, milliseconds; `None` when inseparable from client work.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_time_ms: Option<f64>,
-    /// Median client encode+decode time, milliseconds. Same condition as
-    /// `server_time_ms`.
+    /// Median client encode plus decode time, milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_time_ms: Option<f64>,
-    /// Client storage (hint size) in MiB.
+    /// Hint size in MiB.
     pub client_storage_mb: f64,
     /// Server preprocessing time in milliseconds.
     pub client_preprocessing_time_ms: f64,
@@ -95,7 +74,7 @@ pub struct PirEngNotesMetrics {
 }
 
 impl BenchReport {
-    /// Produce the upstream-shaped config + benchmark pair for this report.
+    /// The upstream-shaped config and benchmark pair for this report.
     #[must_use]
     pub fn to_pir_eng_notes(&self) -> (PirEngNotesConfig, PirEngNotesBenchmark) {
         let config = PirEngNotesConfig::from(self.cell);
@@ -210,7 +189,6 @@ mod tests {
         assert!((m.query_time_ms - 1.26).abs() < 1e-9);
         assert!(m.server_time_ms.is_none());
         assert!(m.client_time_ms.is_none());
-        // 3.88 MiB ~ 3.878 906 25
         assert!((m.client_storage_mb - 3.878_906_25).abs() < 1e-9);
         assert!((m.client_preprocessing_time_ms - 1260.0).abs() < 1e-9);
     }
@@ -238,7 +216,7 @@ mod tests {
         assert!(json.contains("\"client_time_ms\":0.2"));
     }
 
-    // Fails if upstream renames or drops a field our types depend on.
+    // Fails if upstream renames or drops a field these types depend on.
     #[test]
     fn deserialize_upstream_shaped_config_fragment() {
         let json = r#"{
@@ -258,8 +236,6 @@ mod tests {
 
     #[test]
     fn deserialize_upstream_shaped_benchmark_fragment_without_optional_timings() {
-        // Upstream omits absent metrics entirely (no `null` placeholder),
-        // matching our `skip_serializing_if`. Round-trip through serde.
         let json = r#"{
             "variant": "Example",
             "config_id": "2^20x256B",

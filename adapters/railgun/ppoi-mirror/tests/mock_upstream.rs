@@ -221,7 +221,7 @@ async fn fetch_status_typed_posts_correct_body_and_decodes_each_status() {
         .expect("fetch_status_typed");
     assert_eq!(status, POIStatus::Valid);
 
-    // Scope the guard so it's released before any subsequent .await (parking_lot guards are not Send).
+    // parking_lot guards are not Send, so drop before the next await.
     {
         let guard = state.last_pois_per_bc.lock();
         let captured = guard.as_ref().expect("captured request");
@@ -294,10 +294,8 @@ async fn fetch_status_typed_returns_decode_when_response_missing_key() {
     handle.abort();
 }
 
-/// Worker-path test: every upstream `/poi-events` row must surface BOTH
-/// `PpoiListLeafAdded` (per-list IMT growth + `(BC -> idx)` ordering
-/// oracle for T2 path PIR) AND `PpoiStatus` (`(list_key, bc) -> status`
-/// map for T1 status PIR), in that order.
+/// Every `/poi-events` row must surface `PpoiListLeafAdded` then `PpoiStatus`,
+/// feeding per-list IMT growth and the status map respectively.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mirror_emits_ppoi_list_leaf_added_for_each_event() {
     let (url, _state, server_handle) = start_mock().await;
@@ -317,8 +315,8 @@ async fn mirror_emits_ppoi_list_leaf_added_for_each_event() {
         }
     });
 
-    // Flipping the (LeafAdded, Status) order would silently break T2 path PIR;
-    // see the engine apply path's PpoiListLeafAdded contiguity invariant.
+    // Flipping the order silently breaks path PIR; see the apply path's
+    // PpoiListLeafAdded contiguity invariant.
     let mut got: Vec<WalEntryPayload> = Vec::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
     while got.len() < 6 {
@@ -377,10 +375,8 @@ async fn mirror_emits_ppoi_list_leaf_added_for_each_event() {
     server_handle.abort();
 }
 
-/// Regression-guard: `/pois-per-blinded-commitment` is a status-only
-/// lookup; it must NOT contribute IMT-grow events. The mirror's
-/// `fetch_status_typed` returns a typed status directly and has no
-/// `WalEntryPayload` channel by design.
+/// `/pois-per-blinded-commitment` is status-only and must contribute no
+/// IMT-growth events; `fetch_status_typed` has no `WalEntryPayload` channel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mirror_pois_per_blinded_commitment_only_emits_status_no_imt_grow() {
     let (url, _state, server_handle) = start_mock().await;
@@ -393,11 +389,8 @@ async fn mirror_pois_per_blinded_commitment_only_emits_status_no_imt_grow() {
         .await
         .expect("fetch_status_typed");
     assert_eq!(got, POIStatus::Valid);
-    // Structural assertion: the only payload-emitting code path is
-    // `run_worker_with_cursor`, which exclusively consumes
-    // `/poi-events`. If `fetch_status_typed` ever grew a side-channel
-    // that wrote `PpoiListLeafAdded`, the trait signature would have to
-    // change and the type system would force this test to fail.
+    // Structural, not runtime: `run_worker_with_cursor` is the only payload
+    // emitter, so a side-channel would have to change this trait signature.
     let _: POIStatus = got;
     server_handle.abort();
 }

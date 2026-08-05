@@ -15,14 +15,12 @@ use std::time::Instant;
 
 use super::session_pool::BoundedSessionStore;
 
-/// Server state for one InsPIRe instance, held behind `PirInstance`'s `ArcSwap`.
-///
-/// Fields are `Arc`-shared across re-encode swaps so re-preprocess avoids
-/// rebuilding the O(d^3) cache and preserves sticky sessions.
+/// Server state for one InsPIRe instance. `Arc` fields carry across re-encode
+/// swaps so re-preprocess skips the O(d^3) cache rebuild.
 pub struct InspireServerState {
     /// Public CRS.
     pub crs: Arc<ServerCrs>,
-    /// Encoded shard polynomials; `Arc`-shared so session-only swaps clone the pointer, not the buffer.
+    /// Encoded shard polynomials.
     pub encoded_db: Arc<EncodedDatabase>,
     /// Pre-warmed packing keys, rebuilt only on cell-shape change.
     pub cache: Arc<ServerInspiringCache>,
@@ -69,8 +67,7 @@ impl PirScheme for RavenInspireScheme {
     type Response = ServerResponse;
 
     fn respond(state: &Self::ServerState, query: &Self::Query) -> Result<Self::Response> {
-        // Resolving first keeps an evicted handle a typed 400-shaped error
-        // instead of a scheme error from inside the frozen store.
+        // Resolve first: an evicted handle must surface as a typed 400, not a scheme error.
         let store = state
             .session_store
             .resolve(query.session_handle, Instant::now())?;
@@ -110,11 +107,9 @@ pub fn setup_state(
     ))
 }
 
-/// Cache-affecting fingerprint for an [`InspireServerState`].
-///
-/// `ServerInspiringCache` is a pure function of `(params, num_columns, inspiring_w_seed)`.
-/// States with equal fingerprints share a structurally identical cache. A `num_columns == 0`
-/// fingerprint (empty `EncodedDatabase`) never matches, forcing rebuild.
+/// Cache-affecting fingerprint: the cache is a pure function of
+/// `(params, num_columns, inspiring_w_seed)`. `num_columns == 0` never matches,
+/// forcing a rebuild.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CacheFingerprint {
     params: InspireParams,
@@ -139,11 +134,11 @@ impl InspireServerState {
     }
 }
 
-/// Atomically swap in a new state. Carries the donor cache on fingerprint match
-/// (avoid O(d^3) rebuild); installs a fresh empty session store.
+/// Atomically swap in a new state, carrying the donor cache on fingerprint
+/// match and installing a fresh empty session store.
 ///
 /// # Errors
-/// Returns [`AdapterError::Scheme`] if the cache rebuild fires and fails.
+/// [`AdapterError::Scheme`] if the cache rebuild fires and fails.
 pub fn swap_state(
     instance: &super::PirInstance<RavenInspireScheme>,
     crs: ServerCrs,
@@ -180,17 +175,12 @@ pub fn swap_state(
     Ok(())
 }
 
-/// Swap in a same-shape state carrying a fresh empty session store, dropping
-/// every registered sticky-bearer session and bumping the epoch.
-///
-/// This is the operator-scheduled flush, on top of the occupancy and TTL bounds
-/// [`BoundedSessionStore`] already enforces. Heavy fields are carried via
-/// `Arc::clone`, so in-flight queries keep running on the donor store while new
-/// queries see the empty one.
+/// Operator-scheduled session flush: same-shape swap with an empty session
+/// store, on top of the occupancy and TTL bounds [`BoundedSessionStore`]
+/// enforces. In-flight queries keep running on the donor store.
 ///
 /// # Errors
-/// Returns `Result<()>` for forward-compatibility with future fallible
-/// same-shape rebuilds; the current implementation cannot fail.
+/// Infallible today; `Result` reserved for fallible same-shape rebuilds.
 pub fn heartbeat_session_eviction(instance: &super::PirInstance<RavenInspireScheme>) -> Result<()> {
     let donor = instance.current_state();
     let new_state = InspireServerState {
@@ -246,23 +236,17 @@ pub fn build_seeded_query(
     Ok((state, query))
 }
 
-/// Build a batch padded up to the next [`batch_ladder`] step.
+/// Build a batch padded up to the next [`batch_ladder`] step. Slots stay in
+/// `global_indices` order, so `states[i]` decodes `responses[i]`.
 ///
-/// Returned slots are in `global_indices` order, so `states[i]` decodes
-/// `responses[i]` for every real slot; the padded tail is discarded by the
-/// caller. Padding is the client's job because the server is the adversary the
-/// ladder hides the count from: a server-generated pad would be a pad the
-/// server knows about.
-///
-/// A pad re-queries an index already in the batch with fresh encryption
-/// randomness, so it is drawn from exactly the distribution of the real slots
-/// and costs a full database pass. Skipping that pass server-side would itself
-/// be the distinguisher.
+/// Padding is client-side because the server is the adversary the ladder hides
+/// the count from: a pad the server generates is a pad the server knows about.
+/// Each pad re-queries an in-batch index with fresh randomness and costs a full
+/// database pass, so it is indistinguishable from a real slot.
 ///
 /// # Errors
-/// Returns [`AdapterError::InvalidQuery`] when `global_indices` is empty or
-/// longer than [`batch_ladder::max_batch_size`], and [`AdapterError::Scheme`]
-/// if query construction fails.
+/// [`AdapterError::InvalidQuery`] when `global_indices` is empty or exceeds
+/// [`batch_ladder::max_batch_size`]; [`AdapterError::Scheme`] on query build.
 pub fn build_padded_batch(
     client_session: &ClientSession,
     shard_config: &ShardConfig,
@@ -334,8 +318,7 @@ pub fn unpad_record(padded: &[u8], payload_len: usize) -> Option<&[u8]> {
 /// Minimum InsPIRe-safe record size in bytes. 33 B causes decryption garbage.
 pub const MIN_SAFE_RECORD_BYTES: usize = 32;
 
-/// Bincode-serializable snapshot bundle. Cache and session store are excluded;
-/// they're derived or empty on restore.
+/// Snapshot bundle; cache and session store are derived or empty on restore.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct PersistedInspireState {
     crs: ServerCrs,
@@ -353,10 +336,8 @@ impl std::fmt::Debug for PersistedInspireState {
     }
 }
 
-/// Serialize an [`InspireServerState`] to legacy V5 bincode bytes.
-///
-/// New code should call [`snapshot_inspire_state_v6`], which embeds the
-/// [`LogicalLeafStore`] alongside the engine state.
+/// Serialize an [`InspireServerState`] to legacy V5 bincode bytes. Prefer
+/// [`snapshot_inspire_state_v6`], which also embeds the [`LogicalLeafStore`].
 pub fn snapshot_inspire_state(state: &InspireServerState) -> Result<Vec<u8>> {
     let bundle = PersistedInspireState {
         crs: (*state.crs).clone(),
@@ -368,21 +349,19 @@ pub fn snapshot_inspire_state(state: &InspireServerState) -> Result<Vec<u8>> {
         .map_err(|e| AdapterError::Serialization(format!("snapshot serialize: {e}")))
 }
 
-/// Magic header for V6 snapshots. Raw-bincode V5 snapshots never begin with
-/// these bytes, so [`restore_inspire_state_v6`] dispatches on the prefix.
+/// V6 magic header; V5 raw bincode never starts with these bytes, so restore
+/// dispatches on the prefix.
 pub const SNAPSHOT_V6_MAGIC: [u8; 4] = *b"RV6\0";
 
-/// V6 envelope embedding the engine state and `LogicalLeafStore` together so a
-/// commit can archive the WAL without losing logical state on restart.
+/// V6 envelope; bundling the store lets a commit archive the WAL without
+/// losing logical state on restart.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PersistedInspireStateV6 {
     state: PersistedInspireState,
     store: LogicalLeafStore,
 }
 
-/// Serialize a `(state, store)` pair to a V6 snapshot envelope.
-///
-/// Format: `SNAPSHOT_V6_MAGIC || bincode(PersistedInspireStateV6)`.
+/// Serialize `(state, store)` as `SNAPSHOT_V6_MAGIC || bincode(envelope)`.
 pub fn snapshot_inspire_state_v6(
     state: &InspireServerState,
     store: &LogicalLeafStore,
@@ -424,11 +403,8 @@ fn bundle_to_state(bundle: PersistedInspireState) -> Result<InspireServerState> 
     })
 }
 
-/// Reconstruct `(InspireServerState, LogicalLeafStore)` from snapshot bytes,
-/// dispatching on [`SNAPSHOT_V6_MAGIC`].
-///
-/// Legacy V5 snapshots return an empty [`LogicalLeafStore`]; WAL replay
-/// repopulates it and the next commit upgrades the envelope to V6.
+/// Reconstruct `(InspireServerState, LogicalLeafStore)`, dispatching on
+/// [`SNAPSHOT_V6_MAGIC`]. V5 yields an empty store that WAL replay refills.
 pub fn restore_inspire_state_v6(bytes: &[u8]) -> Result<(InspireServerState, LogicalLeafStore)> {
     if let Some(body) = bytes.strip_prefix(SNAPSHOT_V6_MAGIC.as_slice()) {
         let bundle: PersistedInspireStateV6 = bincode::deserialize(body)
@@ -449,11 +425,9 @@ pub fn restore_inspire_state_v6(bytes: &[u8]) -> Result<(InspireServerState, Log
 /// Re-encode a single shard from a raw byte buffer in place.
 ///
 /// # Errors
-/// Returns [`AdapterError::Scheme`] if `encode_database` rejects the shape, or if
-/// `shard_bytes` holds more than one shard's worth of rows and so re-shards into
-/// several - installing one of those would give the slot the wrong row window.
-/// Returns [`AdapterError::ShardOutOfRange`] if `shard_id` is absent; the
-/// commit driver treats this as terminal and drops the shard from `dirty_shards`.
+/// [`AdapterError::Scheme`] if the shape is rejected or `shard_bytes` re-shards
+/// into more than one shard; [`AdapterError::ShardOutOfRange`] if `shard_id` is
+/// absent, which the commit driver treats as terminal.
 pub fn re_encode_shard(
     encoded_db: &mut EncodedDatabase,
     params: &InspireParams,
@@ -481,9 +455,8 @@ pub fn re_encode_shard(
         raven_inspire::encode_database(shard_bytes, entry_size, params, &single_shard_config)
             .map_err(|e| AdapterError::Scheme(format!("re_encode_shard: {e}")))?;
 
-    // A shard is exactly `entries_per_shard` rows wide, so a well-shaped buffer re-shards
-    // into exactly one. Anything else means the caller sized the buffer off the cell's total
-    // row count; taking one of several rebuilt shards would install the wrong row window.
+    // >1 rebuilt shard means the buffer was sized off the cell's total row count,
+    // and installing one of them would give the slot the wrong row window.
     if rebuilt.len() != 1 {
         let per_shard = single_shard_config.entries_per_shard();
         return Err(AdapterError::Scheme(format!(
@@ -506,10 +479,8 @@ pub fn re_encode_shard(
     Ok(())
 }
 
-/// Build the raw byte buffer for a shard from the [`LogicalLeafStore`].
-///
-/// Row layout: `entries_per_shard x entry_size` bytes, row-major.
-/// First 32 bytes of each row = `commitment_hash`; remainder zero-filled.
+/// Materialize a shard buffer: row-major `entries_per_shard x entry_size`,
+/// each row `commitment_hash` (32 B) then zero fill.
 #[must_use]
 pub fn materialize_shard_bytes(
     store: &LogicalLeafStore,
@@ -541,10 +512,8 @@ pub fn materialize_shard_bytes(
     buf
 }
 
-/// Sidecar logical-state store for chain events.
-///
-/// Accumulates leaves and PPOI rows, marks affected shards dirty, and re-encodes
-/// only the dirty shards at commit time. Rebuilt from WAL replay on bootstrap.
+/// Sidecar logical-state store; accumulates chain rows and marks shards dirty
+/// so commit re-encodes only those. Rebuilt from WAL replay on bootstrap.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogicalLeafStore {
     leaves: std::collections::BTreeMap<(u32, u32), [u8; 32]>,
@@ -682,8 +651,7 @@ impl LogicalLeafStore {
                         .extend(encoder.affected_shards_for_leaf(tree_number, leaf_index));
                     affected_trees.insert(tree_number);
                 }
-                // Per-tree surviving count = max remaining leaf_index + 1; the
-                // `(tree,0)..(tree+1,0)` range scopes the scan to one tree.
+                // Surviving count = max remaining leaf_index + 1, scoped to one tree.
                 for tree in &affected_trees {
                     let new_count: usize = match self
                         .leaves
@@ -845,10 +813,10 @@ impl LogicalLeafStore {
             .map(|((_, idx), bc)| (*idx, bc))
     }
 
-    /// Merkle auth path for `(list_key, list_index)` against the per-list IMT.
+    /// Merkle auth path for `(list_key, list_index)`.
     ///
     /// # Errors
-    /// Returns [`AdapterError::InvalidQuery`] if no IMT exists or index is out of range.
+    /// [`AdapterError::InvalidQuery`] if no IMT exists or the index is out of range.
     pub fn ppoi_merkle_proof(
         &self,
         list_key: &[u8; 32],
@@ -870,10 +838,8 @@ impl LogicalLeafStore {
         self.dirty_shards.clear();
     }
 
-    /// Remove a shard id from the dirty set, returning whether it was present.
-    ///
-    /// Used to discard structurally-unencodable shards so the commit driver
-    /// stops retrying them; transient errors leave the shard dirty.
+    /// Discard a shard id from the dirty set so the commit driver stops
+    /// retrying a structurally-unencodable shard; transient errors leave it.
     pub fn drop_dirty_shard(&mut self, shard_id: u32) -> bool {
         self.dirty_shards.remove(&shard_id)
     }
@@ -884,10 +850,10 @@ impl LogicalLeafStore {
         &mut self.dirty_shards
     }
 
-    /// Merkle auth path for `(tree_number, leaf_index)` against the per-tree IMT.
+    /// Merkle auth path for `(tree_number, leaf_index)`.
     ///
     /// # Errors
-    /// Returns [`AdapterError::InvalidQuery`] if no IMT exists or index is out of range.
+    /// [`AdapterError::InvalidQuery`] if no IMT exists or the index is out of range.
     pub fn merkle_proof(
         &self,
         tree_number: u32,
@@ -941,11 +907,11 @@ pub fn apply_wal_entry(
     store.apply(payload, block_height, encoder)
 }
 
-/// Non-mutating pre-check. Catches non-contiguous `AppendLeaf` before
-/// the WAL write so rejected events never poison the WAL.
+/// Non-mutating pre-check run before the WAL write so a rejected event never
+/// poisons the WAL.
 ///
 /// # Errors
-/// Returns [`AdapterError::InvalidQuery`] on contiguity violation.
+/// [`AdapterError::InvalidQuery`] on contiguity violation.
 pub fn validate_apply(
     store: &LogicalLeafStore,
     payload: &raven_railgun_persistence::WalEntryPayload,
@@ -1307,7 +1273,7 @@ mod logical_store_tests {
         ));
     }
 
-    /// Regression: rejected non-contiguous `AppendLeaf` leaves no torn state.
+    /// Rejected non-contiguous `AppendLeaf` leaves no torn state.
     #[test]
     fn rejected_append_leaves_no_torn_state() {
         let mut s = LogicalLeafStore::new();
@@ -1336,7 +1302,7 @@ mod logical_store_tests {
         assert!(s.leaf(0, 5).is_none(), "rejected leaf must NOT be in map");
     }
 
-    /// Regression: pre-check rejects non-contiguous `AppendLeaf` without mutating.
+    /// Pre-check rejects non-contiguous `AppendLeaf` without mutating.
     #[test]
     fn validate_apply_rejects_non_contiguous_without_mutating() {
         let mut s = LogicalLeafStore::new();
@@ -1353,7 +1319,7 @@ mod logical_store_tests {
         assert_eq!(s.leaf_count(), 1);
     }
 
-    /// Regression: validate accepts contiguous leaf for empty + non-empty tree.
+    /// Validate accepts a contiguous leaf for empty and non-empty trees.
     #[test]
     fn validate_apply_accepts_contiguous() {
         let s = LogicalLeafStore::new();

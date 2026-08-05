@@ -116,7 +116,6 @@ describe("batch bodies leaving the SDK are padded to a ladder step", () => {
       clientPirContexts: new Map([["t3CommitTree:0", stubCtx()]]),
     });
 
-    // Cold call fills every level; 16 is already a ladder step.
     await sdk.getMerkleProof(0, 1234);
     const cold = sdk.lastWireRequests();
     expect(cold).toHaveLength(1);

@@ -248,7 +248,7 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
             "auto-spawned instance at {} has only {snap_count} snapshot(s); \
              expected >= 2 (snap-000001 from bootstrap + snap-000002 from \
              the Shutdown-arm drive_commit). The consumer never saw \
-             ConsumerEvent::Shutdown — cross-audit A6 regression.",
+             ConsumerEvent::Shutdown.",
             tree_dir.display(),
         );
 

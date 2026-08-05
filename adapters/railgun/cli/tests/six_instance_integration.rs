@@ -1,5 +1,4 @@
-//! End-to-end synthetic-chain integration test for the canonical
-//! 6-instance mainnet topology. Each test is `#[ignore]`-gated.
+//! End-to-end synthetic-chain test for the 6-instance topology; `#[ignore]`-gated.
 
 #![allow(
     clippy::expect_used,
@@ -246,8 +245,8 @@ async fn shutdown(
     }
 }
 
-/// Aborts the server without the graceful-shutdown oneshot, so consumers exit on
-/// channel-close with no final `drive_commit`; the WAL tail survives for restart replay.
+/// Aborts without the graceful-shutdown oneshot, so no final `drive_commit` runs and
+/// the WAL tail survives for restart replay.
 async fn abort_without_final_commit(
     _tx: oneshot::Sender<()>,
     server: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -663,8 +662,7 @@ async fn layer2_fires_only_on_commit_tree_instances() {
     let bind: SocketAddr = "127.0.0.1:0".parse().expect("addr");
     let observer: BootstrapObserver = Arc::new(parking_lot::Mutex::new(None));
     let chain_sources = six_synthetic_sources();
-    // entries bumped to entries_per_shard: re-encode must keep the setup shape
-    // or the polynomial vector length mismatches
+    // Re-encode must keep the setup shape or the polynomial vector length mismatches.
     let mut opts = build_opts(
         tmp.path(),
         bind,
@@ -677,8 +675,7 @@ async fn layer2_fires_only_on_commit_tree_instances() {
     let (_local_addr, server, stop) = spawn_server(opts).await;
     let view = wait_for_observer(&observer).await;
 
-    // toy cell (256 entries x 2048 EPS = 1 shard) only fits tree-0 into shard 0;
-    // one commit-tree firing the verifier suffices for the positive arm
+    // The toy cell fits only tree-0 into shard 0, so one commit-tree covers the arm.
     view.channels
         .indexer_tx
         .send(IndexerMessage::Event {
@@ -784,8 +781,7 @@ async fn kill_restart_preserves_per_instance_state() {
         }
     }
 
-    // WAL tail past current_snapshot_seq carries the LogicalLeafStore sidecar; the
-    // snapshot alone does not, so the abort must leave the tail intact for replay
+    // Only the WAL tail past current_snapshot_seq carries the LogicalLeafStore sidecar.
     abort_without_final_commit(stop1, server1).await;
 
     let observer2: BootstrapObserver = Arc::new(parking_lot::Mutex::new(None));
@@ -852,8 +848,7 @@ async fn manifest_label_mismatch_refuses_boot_per_instance() {
     let _view1 = wait_for_observer(&observer1).await;
     shutdown(stop1, server1).await.expect("first shutdown");
 
-    // flip commit-tree-0's encoder (PerNode -> PerLeafPath); both are valid encoders,
-    // only the manifest verifier rejects the mismatch
+    // Both encoders are valid; only the manifest verifier rejects the mismatch.
     let observer2: BootstrapObserver = Arc::new(parking_lot::Mutex::new(None));
     let chain_sources2 = six_synthetic_sources();
     let mut opts2 = build_opts(

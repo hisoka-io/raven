@@ -271,8 +271,8 @@ fn build_real_query(
     };
     let params = InspireParams::secure_128_d2048();
     let snap = inst.current_state();
-    // Off-side state pair only yields a matching RlweSecretKey; the CRS
-    // below is the snapshot's so packing keys derive against the same CRS.
+    // Only the secret key is taken from this pair; the CRS below is the
+    // snapshot's, so packing keys derive against the same CRS.
     let (_off_state, sk) = {
         let db: Vec<u8> = (0..TOY_ENTRIES)
             .flat_map(|i| {

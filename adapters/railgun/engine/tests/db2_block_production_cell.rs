@@ -1,21 +1,10 @@
-//! DB2 block end-to-end production-cell test.
+//! End-to-end block test: `2^BLOCK_K` commitments at 32 bytes, served by plain
+//! indexed fetch rather than PIR because the resulting record is far outside the
+//! legal cell widths (see `pir_cell_width_law.rs`).
 //!
-//! Cell shape under test: a block of `2^k` leaf commitments at 32 bytes each,
-//! `k = 10`, so 32,768 bytes per block. The block is served by plain indexed
-//! fetch, not PIR: at `ring_dim = 2048` a 32,768-byte record induces 16,384
-//! InspiRING columns against a 2,048-entry generator-power table and the packing
-//! aborts on an out-of-bounds lookup. `pir_cell_width_law.rs` pins the width law;
-//! `db2_block_is_outside_the_pir_cell_width_range` restates the consequence here.
-//!
-//! What this test closes is the block cell shape itself: the bytes a client
-//! fetches, the subtree it recomputes from them, and the authentication path it
+//! Covers the bytes a client fetches, the subtree it recomputes, and the path it
 //! splices onto the public upper tree. The oracle is independent of the block
-//! encoder: blocks are built from the logical leaf map and checked against
-//! `Imt::node`, the recomputed subtree root is checked against `Imt::node(k, block)`,
-//! and the spliced path is checked byte-for-byte against `Imt::merkle_proof`.
-//!
-//! Tree depth here is the Railgun adapter's 16, so the upper tree spans levels
-//! 10 to 16. The depth-32 form is the tree-block crate's own work.
+//! encoder: everything is checked against `Imt::node` and `Imt::merkle_proof`.
 
 #![allow(
     clippy::expect_used,
@@ -78,11 +67,9 @@ fn seed_store(leaves: u32) -> LogicalLeafStore {
     store
 }
 
-/// Serialize block `block_index` from the logical leaf map. Slots with no leaf
-/// carry the tree's level-0 empty value, which is what the client must fold.
-///
-/// Reads the leaf map, never the IMT node maps, so `Imt::node` stays an
-/// independent oracle for the result.
+/// Serialize block `block_index` from the leaf map, empty slots carrying the
+/// level-0 zero value. Never reads the IMT node maps, so `Imt::node` stays an
+/// independent oracle.
 fn materialize_block(store: &LogicalLeafStore, block_index: usize) -> Vec<u8> {
     let mut buf = vec![0u8; BLOCK_BYTES];
     let base = block_index * BLOCK_LEAVES;
@@ -105,9 +92,8 @@ fn block_slot(block: &[u8], slot: usize) -> [u8; 32] {
     out
 }
 
-/// Recompute the internal nodes of one block, bottom up. Returns the node hashes
-/// per level, `levels[0]` being the 1024 leaves and `levels[BLOCK_K]` the single
-/// subtree root. This is the client-side work the design puts at `2^k - 1` hashes.
+/// Recompute one block's internal nodes bottom up: `levels[0]` the leaves,
+/// `levels[BLOCK_K]` the subtree root. `2^BLOCK_K - 1` hashes of client work.
 fn recompute_subtree(block: &[u8]) -> Vec<Vec<[u8; 32]>> {
     let mut levels: Vec<Vec<[u8; 32]>> = Vec::with_capacity(BLOCK_K + 1);
     levels.push((0..BLOCK_LEAVES).map(|s| block_slot(block, s)).collect());
@@ -174,8 +160,7 @@ fn spliced_path_is_byte_identical_to_the_merkle_proof_oracle() {
     let store = seed_store(LEAVES_PRELOADED);
     let imt = store.imt(TREE_NUMBER).expect("tree present");
 
-    // first leaf, an interior leaf, both sides of the 0/1 block boundary,
-    // and the rightmost populated leaf inside the partial tail block
+    // First, interior, both sides of a block boundary, and the rightmost leaf.
     for leaf_index in [0u32, 511, 1_023, 1_024, 2_047, LEAVES_PRELOADED - 1] {
         let block_index = leaf_index as usize / BLOCK_LEAVES;
         let block = materialize_block(&store, block_index);
@@ -251,13 +236,9 @@ fn full_blocks_freeze_and_only_the_tail_block_changes_on_append() {
     );
 }
 
-/// Pin the block exponent itself.
-///
-/// The structural tests above derive block boundaries from `BLOCK_K` on both the
-/// subject and the oracle side, so they stay green at any `k` and prove the splice
-/// arithmetic rather than the shape. `k` is a wire-format parameter: changing it
-/// changes the bytes every client fetches and the size of the public upper tree.
-/// Nothing else in this file would notice, so it is asserted here.
+/// Pin `BLOCK_K` itself: the structural tests derive boundaries from it on both
+/// sides and stay green at any `k`, but it is a wire-format parameter that
+/// changes the bytes every client fetches.
 #[test]
 fn block_exponent_and_payload_are_pinned_to_the_read_path_design() {
     assert_eq!(

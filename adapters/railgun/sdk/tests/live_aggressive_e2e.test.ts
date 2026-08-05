@@ -1,35 +1,9 @@
 /**
- * Aggressive end-to-end test suite against the live deployed Raven
- * adapter URL. Demonstrates that the Raven PIR adapter is a drop-in
- * default-trust layer for Railgun's wallet stack across every demo
- * instance with byte-identity verification + per-instance throughput.
+ * End-to-end sweeps against a live adapter: per-tree byte identity vs on-chain
+ * `rootHistory`, PPOI probes, random-leaf fuzz, and per-instance throughput.
  *
- * Four sweep blocks, all gated behind `RAVEN_LIVE_URL` +
- * `RAVEN_LIVE_TOKEN` + `RAVEN_INFURA_URL` env vars:
- *
- *   1. Per-tree byte-identity sweep - N=20 random leaves per
- *      `commit-tree-{0,1,2,3}`, PIR-folded root cross-verified
- *      against on-chain `RailgunSmartWallet.rootHistory`.
- *
- *   2. Per-PPOI sweep - `ppoi-status-ofac` + `ppoi-paths-ofac`
- *      probed for non-empty corpus; if empty (Railway-deploy gap)
- *      the section `it.skip`s with a clear reason.
- *
- *   3. Fuzz testing - ~100 random-leaf iterations per commit-tree
- *      to surface any byte-identity divergence in a wider sample.
- *
- *   4. Throughput benchmarks - per instance, 3 seeds x {K=1, K=4,
- *      K=16}, latency p50/p95/p99 + qps, 3-seed methodology.
- *
- * Findings are written to a developer-local bench-results directory
- * (computed from the operator-supplied `RAVEN_FINDINGS_DIR` env var
- * or the default sibling of this test file). The path is private to
- * the developer host; CI does not produce or consume it.
- *
- * Honest-stop posture: any 4xx, 5xx, or byte-identity divergence is
- * recorded with full request/response bytes in the FINDINGS.md
- * reproducer block. The suite never papers over a failure with a
- * silent retry.
+ * Gated behind `RAVEN_LIVE_URL` + `RAVEN_LIVE_TOKEN` + `RAVEN_INFURA_URL`.
+ * Divergences are recorded with full request/response bytes; never retried away.
  */
 
 import { afterAll, describe, expect, it } from "vitest";
@@ -48,9 +22,6 @@ import {
 import { decodeClientPirQueryBundle } from "../src/client-pir";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-// Bench output goes to a developer-local, gitignored cargo target
-// directory by default. Operators wanting a different sink (e.g. a
-// shared CI artefact dir) can override via `RAVEN_BENCH_FINDINGS_DIR`.
 const FINDINGS_DIR =
   process.env.RAVEN_BENCH_FINDINGS_DIR ??
   resolve(HERE, "..", "..", "..", "target", "bench-findings");
@@ -67,12 +38,8 @@ const liveDescribe = RUN_LIVE ? describe : describe.skip;
 const PARAMS_DOWNLOAD_TIMEOUT_MS = 240_000;
 const TEST_TIMEOUT_MS = 1_200_000; // 20 min - fuzz + throughput is heavy
 
-// Per-tree leaf-count caps. Trees 0 and 2 are static-full (closed at
-// 65,536). Tree 1 was closed-short at 65,535 by the upstream
-// commit-tree rollover semantics (no batch can span trees).
-// Tree 3 is the live tree; on-chain `nextLeafIndex` was
-// 19,093 at session-open. Use a CONSERVATIVE upper bound to avoid
-// over-shooting the populated range.
+// Trees 0 and 2 closed full; tree 1 closed short at 65,535 because no batch spans
+// trees. Tree 3 is live, so its cap is a conservative under-estimate.
 const TREE_LEAF_COUNT: Record<number, number> = {
   0: 65_536,
   1: 65_535,
@@ -80,15 +47,7 @@ const TREE_LEAF_COUNT: Record<number, number> = {
   3: 19_000,
 };
 
-// Sample size per sweep. Defaults are tuned for the m6i.large 2-vCPU
-// host (each leaf-fold is 17 PIR queries x ~150ms = ~2.5s wall). The
-// per-tree byte-identity sweep at 20 leaves dominates wall time;
-// fuzz adds breadth at lower per-iteration cost via /batch.
-//
-// Override at runtime via:
-//   RAVEN_PER_TREE_SAMPLE, RAVEN_FUZZ_SAMPLE, RAVEN_THROUGHPUT_SAMPLE,
-//   RAVEN_THROUGHPUT_SEEDS
-// for a faster smoke run or a deeper soak run.
+// Each leaf-fold is 17 PIR queries, so the per-tree sweep dominates wall time.
 const PER_TREE_SAMPLE = Number(process.env.RAVEN_PER_TREE_SAMPLE ?? "20");
 const FUZZ_SAMPLE = Number(process.env.RAVEN_FUZZ_SAMPLE ?? "25");
 const THROUGHPUT_SAMPLE = Number(process.env.RAVEN_THROUGHPUT_SAMPLE ?? "30");
@@ -293,12 +252,8 @@ interface SingleQueryResult {
   serverSchema: string | null;
 }
 
-/**
- * Issue a single direct PIR query against the `/v1/instance/:id/query`
- * endpoint. Returns the decrypted plaintext PLUS observability fields
- * (request/response sizes, server-emitted freshness headers) so the
- * caller can correlate failures.
- */
+/** Direct `/v1/instance/:id/query`, returning plaintext plus request/response
+ * sizes and freshness headers so failures can be correlated. */
 async function fetchSingleRow(
   endpoint: string,
   token: string,
@@ -398,7 +353,7 @@ async function fetchBatch(
     throw new Error(`fetchBatch(${instanceId}): HTTP ${res.status}`);
   }
   const respBuf = new Uint8Array(await res.arrayBuffer());
-  // Response format mirrors batch encode: [u16 BE schema][u64 LE count][per-elem [u64 LE len][body]]
+  // [u16 BE schema][u64 LE count][{u64 LE len, body}*]
   if (respBuf.length < 10) {
     throw new Error(`fetchBatch(${instanceId}): response too short ${respBuf.length}`);
   }
@@ -418,12 +373,8 @@ async function fetchBatch(
     out.push(new Uint8Array(respBuf.subarray(respOff, respOff + elemLen)));
     respOff += elemLen;
   }
-  // Hand the caller back the per-query `clientStateBincode` blobs
-  // alongside the raw responses. `extract_response` requires the
-  // exact `clientStateBincode` produced by the matching
-  // `build_seeded_query` call - re-issuing `build_seeded_query` for
-  // the same idx would yield a different (fresh-randomness)
-  // clientStateBincode that fails to decrypt.
+  // `extract_response` needs the exact `clientStateBincode` its own
+  // `build_seeded_query` produced; a re-issue draws fresh randomness and fails.
   const clientStates = queryBundles.map((b) => b.clientStateBincode);
   return {
     responses: out,
@@ -464,7 +415,7 @@ interface SeededRng {
   nextInt(lo: number, hi: number): number;
 }
 
-// xorshift32; deterministic per seed.
+// xorshift32, deterministic per seed.
 function makeRng(seed: number): SeededRng {
   let s = seed >>> 0;
   if (s === 0) s = 0xdeadbeef;
@@ -575,9 +526,7 @@ liveDescribe("aggressive E2E (per-tree byte identity)", () => {
         for (const leafIndex of leafIndices) {
           try {
             const indices = pathIndicesForLeaf(wasm, treeNumber, leafIndex);
-            // Fetch each sibling individually so we can capture per-leaf
-            // request bytes for the divergence reproducer if anything
-            // breaks. Throughput sweep uses /batch.
+            // Individually, so a divergence reproducer captures per-leaf bytes.
             const siblings: string[] = [];
             for (let level = 0; level < indices.length; level += 1) {
               const r = await fetchSingleRow(
@@ -589,7 +538,6 @@ liveDescribe("aggressive E2E (per-tree byte identity)", () => {
               );
               siblings.push(bytesToHexNoPrefix(r.plaintext.subarray(0, 32)));
             }
-            // Independent leaf fetch (level-0 row at flat_index = leafIndex).
             const leafR = await fetchSingleRow(
               LIVE_URL,
               LIVE_TOKEN,
@@ -626,13 +574,9 @@ liveDescribe("aggressive E2E (per-tree byte identity)", () => {
           }
         }
         perTreeRows.push(row);
-        // Emit FINDINGS.md incrementally so a mid-suite interrupt
-        // still surfaces partial results to the operator.
+        // Incremental, so a mid-suite interrupt still surfaces partial results.
         emitFindings();
-        // Pass criterion: at least one leaf must match. (For Tree 3
-        // some leaves may exceed our conservative cap; for static
-        // trees all should match.) The full per-tree pass-count is
-        // captured for FINDINGS.md regardless.
+        // One match suffices: the live tree's cap is a conservative under-estimate.
         expect(row.passed).toBeGreaterThan(0);
       },
       TEST_TIMEOUT_MS,
@@ -657,8 +601,7 @@ liveDescribe("aggressive E2E (PPOI architecture probe)", () => {
           emitFindings();
           return;
         }
-        // Heuristic: epoch 0 + drain_state active + no consumer block
-        // applied = empty corpus pre-mock-ppoi-redeploy.
+        // epoch 0 + active drain_state + no applied block reads as an empty corpus.
         const empty = inst.epoch === 0 && status.consumer.last_applied_block === 0;
         if (empty) {
           ppoiRows.push({
@@ -669,8 +612,6 @@ liveDescribe("aggressive E2E (PPOI architecture probe)", () => {
           emitFindings();
           return;
         }
-        // Non-empty path: download params + try a small probe at idx 0
-        // to confirm the scheme + extract_response work end-to-end.
         const bundle = await getInstance(instanceId);
         try {
           const r = await fetchSingleRow(
@@ -723,7 +664,6 @@ liveDescribe("aggressive E2E (fuzz)", () => {
           const leafIndex = rng.nextInt(0, leafCount);
           try {
             const indices = pathIndicesForLeaf(wasm, treeNumber, leafIndex);
-            // Use /batch for fuzz to keep the wall-time tractable.
             const allIdx = [leafIndex, ...Array.from(indices)];
             const batch = await fetchBatch(
               LIVE_URL,
@@ -791,8 +731,6 @@ liveDescribe("aggressive E2E (throughput)", () => {
         const bundle = await getInstance(instanceId);
         const leafCount = TREE_LEAF_COUNT[treeNumber];
         for (const K of [1, 4, 16]) {
-          // Three seeds; report median qps + percentiles aggregated
-          // across all seeds.
           const allLatencies: number[] = [];
           let totalErrors = 0;
           const qpsSamples: number[] = [];
@@ -804,10 +742,7 @@ liveDescribe("aggressive E2E (throughput)", () => {
             }
             const seedLatencies: number[] = [];
             const seedStart = Date.now();
-            // Drive K concurrent workers. Each pulls the next index
-            // off the queue until exhausted (`cursor` is single-thread
-            // synchronous between awaits, so no atomicity primitive
-            // needed in JS's single-threaded event loop).
+            // `cursor` needs no atomicity: JS is single-threaded between awaits.
             const cursor = { current: 0 };
             const worker = async (): Promise<void> => {
               while (true) {
@@ -852,8 +787,7 @@ liveDescribe("aggressive E2E (throughput)", () => {
             paramsFetchMs: bundle.fetchMs,
           });
         }
-        // End-to-end wallet-experience timing: a full Merkle proof =
-        // 16 sibling PIR queries via /batch. Capture once per instance.
+        // A full Merkle proof is 16 sibling PIR queries via /batch.
         const rng = makeRng(0xbeef + treeNumber);
         const leafIndex = rng.nextInt(0, leafCount);
         const indices = pathIndicesForLeaf(wasm, treeNumber, leafIndex);

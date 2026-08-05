@@ -1,6 +1,5 @@
-//! Insert / re-encode cost bench (`#[ignore]`-gated). Measures per-shard
-//! re-encode cost across cell shapes; total per-insert wall-clock is
-//! `dirty_shards x per_shard_re_encode`. Output is stderr-only.
+//! Per-shard re-encode cost across cell shapes; per-insert wall time is
+//! `dirty_shards x per_shard_re_encode`. Gated, stderr-only.
 
 #![allow(
     clippy::expect_used,

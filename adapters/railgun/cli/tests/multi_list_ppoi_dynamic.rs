@@ -1,5 +1,4 @@
-//! Multi-list PPOI dynamic-discovery lifecycle tests.
-//! Cross-validates the discovery driver wired on top of the engine's
+//! Multi-list PPOI dynamic-discovery lifecycle over the engine's
 //! `Arc<ArcSwap>`-promoted `ppoi_list_routes` and `list_observed` tap.
 
 #![allow(
@@ -204,7 +203,7 @@ async fn concurrent_list_observed_bursts_dedupe_to_one_spawn_per_template_per_li
 
     let params = InspireParams::secure_128_d2048();
     let registry = Arc::new(PpoiListSpawnRegistry::new());
-    // capacity above the burst so dedup, not the channel, drops duplicates
+    // Above the burst so dedup, not the channel, drops duplicates.
     let (tx, rx) = tokio::sync::broadcast::channel::<[u8; 32]>(64);
     let log_dir = harness.bootstrap_dir.clone();
 
@@ -228,7 +227,6 @@ async fn concurrent_list_observed_bursts_dedupe_to_one_spawn_per_template_per_li
     for _ in 0..10 {
         let tx_clone = tx.clone();
         firing.push(tokio::spawn(async move {
-            // spawn only to fire in parallel; broadcast send is sync
             tx_clone.send(TEST_LIST_KEY).expect("broadcast burst");
         }));
     }
@@ -238,7 +236,6 @@ async fn concurrent_list_observed_bursts_dedupe_to_one_spawn_per_template_per_li
 
     wait_for_pair_count(&registry, 2, Duration::from_secs(60)).await;
 
-    // let any rogue duplicate spawn surface
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     assert_eq!(
@@ -302,7 +299,7 @@ async fn restart_replay_picks_up_auto_spawned_ppoi_list_instances_from_spawn_log
     tx.send(TEST_LIST_KEY).expect("broadcast list_key");
     wait_for_pair_count(&registry_v1, 2, Duration::from_secs(60)).await;
 
-    // simulate restart: the on-disk JSONL spawn log is the only durable state
+    // The on-disk JSONL spawn log is the only durable state across a restart.
     drop(tx);
     let _ = tokio::time::timeout(Duration::from_secs(5), driver_v1).await;
     drop(registry_v1);

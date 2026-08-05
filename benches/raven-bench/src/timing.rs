@@ -1,7 +1,4 @@
-//! Percentile-aware per-phase timing: min / median / p95 / p99 / mean.
-//!
-//! Samples are held unsorted in a `Vec<u64>` (microseconds); percentile
-//! queries sort a clone. `record` is O(1); percentile queries are O(n log n).
+//! Per-phase timing in microseconds. `record` is O(1); a percentile query sorts a clone.
 
 use std::collections::BTreeMap;
 
@@ -21,7 +18,7 @@ impl PhaseSamples {
     /// Record one sample from a `std::time::Duration`.
     #[inline]
     pub fn record(&mut self, d: std::time::Duration) {
-        // Saturate; a per-sample duration that overflows u64 micros is not a real bench.
+        // A per-sample duration that overflows u64 micros is not a real bench.
         let micros = u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
         self.record_us(micros);
     }
@@ -32,30 +29,28 @@ impl PhaseSamples {
         self.samples_us.len()
     }
 
-    /// Minimum sample, or `None` if no samples recorded.
+    /// Minimum sample.
     pub fn min(&self) -> Option<u64> {
         self.samples_us.iter().copied().min()
     }
 
-    /// Maximum sample, or `None` if no samples recorded.
+    /// Maximum sample.
     pub fn max(&self) -> Option<u64> {
         self.samples_us.iter().copied().max()
     }
 
-    /// Arithmetic mean, or `None` if no samples recorded.
+    /// Arithmetic mean.
     pub fn mean(&self) -> Option<f64> {
         if self.samples_us.is_empty() {
             return None;
         }
         let sum: u128 = self.samples_us.iter().map(|&x| u128::from(x)).sum();
-        // f64 is lossless below 2^53; sample counts and microsecond sums stay well under it.
+        // f64 is lossless below 2^53; microsecond sums stay well under it.
         #[allow(clippy::cast_precision_loss)]
         Some(sum as f64 / self.samples_us.len() as f64)
     }
 
-    /// `q`-th percentile (`q` in `[0.0, 1.0]`) by nearest-rank on a sorted copy.
-    ///
-    /// `None` for no samples or non-finite/out-of-range `q`.
+    /// `q`-th percentile by nearest-rank; `None` for no samples or `q` outside `[0.0, 1.0]`.
     pub fn percentile(&self, q: f64) -> Option<u64> {
         if !q.is_finite() || !(0.0..=1.0).contains(&q) || self.samples_us.is_empty() {
             return None;
@@ -73,17 +68,17 @@ impl PhaseSamples {
         sorted.get(idx).copied()
     }
 
-    /// Convenience accessor. 50th percentile.
+    /// 50th percentile.
     pub fn median(&self) -> Option<u64> {
         self.percentile(0.50)
     }
 
-    /// Convenience accessor. 95th percentile.
+    /// 95th percentile.
     pub fn p95(&self) -> Option<u64> {
         self.percentile(0.95)
     }
 
-    /// Convenience accessor. 99th percentile.
+    /// 99th percentile.
     pub fn p99(&self) -> Option<u64> {
         self.percentile(0.99)
     }
@@ -168,7 +163,6 @@ mod tests {
         for i in 1u64..=100 {
             s.record_us(i);
         }
-        // Nearest-rank over 1..=100: pN = value N.
         assert_eq!(s.median(), Some(50));
         assert_eq!(s.p95(), Some(95));
         assert_eq!(s.p99(), Some(99));

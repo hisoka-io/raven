@@ -31,7 +31,7 @@ export class RavenError extends Error {
     this.name = "RavenError";
     this.kind = kind;
     this.context = context;
-    // restore prototype so `instanceof RavenError` survives transpiled extends
+    // Restores `instanceof RavenError` across a transpiled `extends`.
     Object.setPrototypeOf(this, RavenError.prototype);
   }
 

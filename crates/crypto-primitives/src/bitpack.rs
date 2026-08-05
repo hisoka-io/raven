@@ -1,9 +1,5 @@
-//! Pack and unpack `u32` limbs at arbitrary widths <= 32 bits.
-//!
-//! PIR schemes emit vectors of `u32` limbs carrying only `bits_per_limb`
-//! payload bits; shipping 32 bits per limb wastes bandwidth.
-//!
-//! Packed byte length is `ceil(xs.len() * width / 8)`; byte order is
+//! Pack and unpack `u32` limbs at widths <= 32 bits. Bit order is
+//! LSB-first within each limb and each byte, so the encoding is
 //! host-independent.
 
 use core::convert::TryFrom;
@@ -11,16 +7,8 @@ use core::convert::TryFrom;
 /// Maximum width (in bits) accepted by [`pack_u32s`] and [`unpack_u32s`].
 pub const MAX_BITS_PER_LIMB: u8 = 32;
 
-/// Pack a slice of `u32` values, each carrying `bits_per_limb` payload bits,
-/// into a byte buffer.
-///
-/// Any bits above `bits_per_limb` in each input limb are ignored (masked).
-/// The output length is exactly `ceil(values.len() * bits_per_limb / 8)`.
-///
-/// # Errors
-///
-/// Returns `Err(BitpackError::WidthOutOfRange)` if `bits_per_limb` is `0` or
-/// greater than [`MAX_BITS_PER_LIMB`].
+/// Pack `values` at `bits_per_limb` bits each; bits above the width are
+/// masked off. Output is `ceil(values.len() * bits_per_limb / 8)` bytes.
 pub fn pack_u32s(values: &[u32], bits_per_limb: u8) -> Result<Vec<u8>, BitpackError> {
     if bits_per_limb == 0 || bits_per_limb > MAX_BITS_PER_LIMB {
         return Err(BitpackError::WidthOutOfRange { bits_per_limb });
@@ -43,7 +31,7 @@ pub fn pack_u32s(values: &[u32], bits_per_limb: u8) -> Result<Vec<u8>, BitpackEr
                 let dst_bit = bit_cursor + bit_idx;
                 let byte = dst_bit / 8;
                 let offset = dst_bit % 8;
-                // byte < out.len() by construction: out is sized to cover total_bits.
+                // out is sized to cover total_bits, so byte < out.len().
                 #[allow(clippy::expect_used)]
                 let slot = out.get_mut(byte).expect("cursor within bounds");
                 *slot |= 1u8 << offset;
@@ -54,16 +42,9 @@ pub fn pack_u32s(values: &[u32], bits_per_limb: u8) -> Result<Vec<u8>, BitpackEr
     Ok(out)
 }
 
-/// Unpack a byte buffer produced by [`pack_u32s`] into a vector of `u32`s.
-///
-/// `count` is the number of limbs expected; the caller must have recorded
-/// this out-of-band at pack time.
-///
-/// # Errors
-///
-/// - `BitpackError::WidthOutOfRange`. `bits_per_limb` is `0` or > 32.
-/// - `BitpackError::TruncatedInput`. `bytes` is shorter than the packed
-///   representation of `count` limbs at `bits_per_limb` bits each.
+/// Unpack `count` limbs of `bits_per_limb` bits from a [`pack_u32s`] buffer.
+/// `count` and `bits_per_limb` are not encoded in the buffer - the caller
+/// records them out-of-band.
 pub fn unpack_u32s(
     bytes: &[u8],
     count: usize,
@@ -90,7 +71,7 @@ pub fn unpack_u32s(
             let src_bit = bit_cursor + bit_idx;
             let byte = src_bit / 8;
             let offset = src_bit % 8;
-            // byte < bytes.len(): we rejected shorter inputs above.
+            // shorter inputs were rejected above, so byte < bytes.len().
             #[allow(clippy::expect_used)]
             let src_byte = *bytes.get(byte).expect("cursor within bounds");
             let bit = u32::from((src_byte >> offset) & 1);
@@ -105,18 +86,10 @@ pub fn unpack_u32s(
 /// Errors surfaced by [`pack_u32s`] and [`unpack_u32s`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BitpackError {
-    /// `bits_per_limb` was `0` or greater than [`MAX_BITS_PER_LIMB`].
-    WidthOutOfRange {
-        /// The invalid width supplied.
-        bits_per_limb: u8,
-    },
-    /// The input byte slice was shorter than the packed representation.
-    TruncatedInput {
-        /// Bytes supplied.
-        got: usize,
-        /// Bytes required for the stated `count` and `bits_per_limb`.
-        needed: usize,
-    },
+    /// Width was `0` or greater than [`MAX_BITS_PER_LIMB`].
+    WidthOutOfRange { bits_per_limb: u8 },
+    /// Input was shorter than the packed representation of `count` limbs.
+    TruncatedInput { got: usize, needed: usize },
 }
 
 impl core::fmt::Display for BitpackError {
@@ -228,11 +201,9 @@ mod tests {
             len in 0usize..128,
             base in any::<u32>(),
         ) {
-            // Derive values from a base so proptest shrinking stays small.
             let values: Vec<u32> = (0..len).map(|i| base.wrapping_add(u32::try_from(i).unwrap())).collect();
             let packed = pack_u32s(&values, width).expect("pack");
             let unpacked = unpack_u32s(&packed, len, width).expect("unpack");
-            // Masked comparison: pack drops bits above the width.
             let mask = if width == 32 { u32::MAX } else { (1u32 << width) - 1 };
             let masked: Vec<u32> = values.iter().map(|v| v & mask).collect();
             prop_assert_eq!(unpacked, masked);

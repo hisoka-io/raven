@@ -1,17 +1,4 @@
 //! `/v1/instance/{id}/fanout`: one uploaded query served against k shards.
-//!
-//! Pins seven properties:
-//!
-//! 1. Each fan-out slot is byte-identical to the single-query response for the
-//!    same shard, and extracts to that shard's plaintext entry.
-//! 2. Responses come back in `shard_ids` order, including permutations and repeats.
-//! 3. Out-of-range shard ids and an empty list are rejected with 400, and the
-//!    body names the offending shard id.
-//! 4. A list longer than `max_fanout_shards` is rejected with 400.
-//! 5. The route is bearer-gated (a router refactor must not ship it unauthenticated).
-//! 6. A drained instance refuses fan-out with 503.
-//! 7. A slot addressing the padded tail of a partially filled shard returns a
-//!    valid all-zeros plaintext.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -224,7 +211,7 @@ async fn fanout_slots_match_per_shard_single_queries_byte_exact() {
         );
     }
 
-    // The whole point: upload is flat in k, not linear.
+    // Upload is flat in k, not linear.
     let (status_k1, _, k1_upload) = post_fanout(&client, &fixture, &query, vec![0]).await;
     assert_eq!(status_k1, 200);
     assert!(
@@ -269,7 +256,7 @@ async fn fanout_returns_responses_in_request_order() {
     let fixture = spawn_multi_shard_server().await;
     let client = reqwest::Client::new();
     let (_client_state, query) = fixture.build_query();
-    // Permuted and repeated: order must follow the request, not the shard index.
+    // Order follows the request, not the shard index.
     let shard_ids: Vec<u32> = vec![2, 0, 1, 0];
 
     let (status, body, _) = post_fanout(&client, &fixture, &query, shard_ids.clone()).await;
@@ -418,11 +405,9 @@ async fn fanout_refuses_a_draining_instance() {
     fixture.shutdown().await;
 }
 
-/// HAZARD: the padded tail of a partially filled shard is a real, decryptable
-/// all-zeros record. A cover group whose shared local index sits past the tail
-/// shard's fill point gets a well-formed answer that no error distinguishes
-/// from a genuine zero-valued entry. Applications must carry a presence tag in
-/// the record layout - `examples/eth-state` reserves record byte 0 for it.
+/// The padded tail of a partially filled shard decrypts to a well-formed
+/// all-zeros record that no error distinguishes from a genuine zero entry, so
+/// applications must carry their own presence tag in the record layout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fanout_tail_shard_padding_extracts_as_all_zeros() {
     let fixture = spawn_partially_filled_server().await;

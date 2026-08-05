@@ -1,11 +1,8 @@
 //! Occupancy-bounded wrapper around [`ServerSessionStore`].
 //!
-//! `ServerSessionStore` allocates handles monotonically and exposes no
-//! per-entry removal, so the only reclamation primitive available is dropping
-//! the whole store. Bounding therefore has two layers: TTL bookkeeping decides
-//! which handles are still *serviceable*, and a backstop flush - triggered on
-//! the inner store's own length, never on the serviceable count - decides when
-//! the bytes are actually reclaimed.
+//! The inner store has no per-entry removal, so bounding is two layers: TTL
+//! bookkeeping decides which handles stay serviceable, and a backstop flush -
+//! gated on the inner length, never the serviceable count - reclaims bytes.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,14 +17,10 @@ use raven_railgun_core::AdapterError;
 
 use super::Result;
 
-/// Serviceable-session ceiling before the backstop flush fires.
-///
-/// A registered session costs 11.94 MiB of packing keys at gamma=128 and 23.98
-/// MiB at gamma=256, so this constant is a memory ceiling in disguise: 64
-/// sessions is ~764 MiB / ~1.50 GiB respectively. It is deliberately three
-/// orders of magnitude below the HTTP layer's `session_lru_cap`, which bounds
-/// the sticky-token map (a handle each, not keys) and would be a 116 GiB
-/// ceiling if it were ever applied here.
+/// Session ceiling before the backstop flush fires. A memory ceiling in
+/// disguise: packing keys cost 11.94 MiB per session at gamma=128, so this is
+/// deliberately far below the HTTP layer's `session_lru_cap`, which bounds only
+/// handles.
 pub const DEFAULT_MAX_SESSIONS: usize = 64;
 
 /// Serviceable lifetime of a registered session.
@@ -65,20 +58,14 @@ impl Generation {
     }
 }
 
-/// Bounded, metered session store.
+/// Bounded, metered session store. Unknown, removed, and expired handles fail
+/// closed in [`resolve`](Self::resolve) rather than reaching the inner store.
 ///
-/// Handles are serviceable only while [`resolve`](Self::resolve) says so:
-/// unknown, removed, and expired handles fail closed rather than reaching the
-/// inner store. Reclamation is a whole-generation flush, so a handle registered
-/// before a flush is not merely unserviceable but genuinely gone; an in-flight
-/// request is unaffected because [`resolve`](Self::resolve) hands back an
-/// `Arc` that keeps the pre-flush generation alive for the request's duration.
-///
-/// Handle numbering restarts at zero in the fresh generation, so a low
-/// pre-flush handle can be reissued. A stale client presenting one is answered
-/// under the new holder's packing keys, which it cannot decrypt - the
-/// denial-of-useful-response already documented for handle guessing, not a key
-/// disclosure. Per-entry removal in the inner store would close that window.
+/// Reclamation is a whole-generation flush; in-flight requests are unaffected
+/// because `resolve` returns an `Arc` pinning the pre-flush generation. Handle
+/// numbering restarts at zero, so a stale client presenting a reissued handle
+/// is answered under keys it cannot decrypt - a denial of useful response, not
+/// a key disclosure.
 pub struct BoundedSessionStore {
     limits: SessionStoreLimits,
     current: RwLock<Generation>,
@@ -162,8 +149,7 @@ impl BoundedSessionStore {
     /// Register wire-delivered packing keys, deriving the server-side NTT form.
     ///
     /// # Errors
-    /// Returns [`AdapterError::Scheme`] if the inner store's lock is poisoned
-    /// or derivation rejects the keys.
+    /// [`AdapterError::Scheme`] on a poisoned lock or rejected derivation.
     pub fn register_server_side(
         &self,
         keys: ClientPackingKeys,
@@ -176,8 +162,7 @@ impl BoundedSessionStore {
     /// [`register_server_side`](Self::register_server_side) against an explicit clock.
     ///
     /// # Errors
-    /// Returns [`AdapterError::Scheme`] if the inner store's lock is poisoned
-    /// or derivation rejects the keys.
+    /// [`AdapterError::Scheme`] on a poisoned lock or rejected derivation.
     pub fn register_server_side_at(
         &self,
         keys: ClientPackingKeys,
@@ -197,12 +182,11 @@ impl BoundedSessionStore {
         Ok(handle)
     }
 
-    /// Register an in-process [`ClientSession`] through the same bounds.
-    ///
-    /// Returns `Ok(None)` when the session carries no packing keys to upload.
+    /// Register an in-process [`ClientSession`]; `Ok(None)` when it carries no
+    /// packing keys.
     ///
     /// # Errors
-    /// Returns [`AdapterError::Scheme`] if the inner store rejects the keys.
+    /// [`AdapterError::Scheme`] if the inner store rejects the keys.
     pub fn register_client_session_at(
         &self,
         session: &mut ClientSession,
@@ -221,14 +205,12 @@ impl BoundedSessionStore {
         Ok(handle)
     }
 
-    /// Resolve the store a respond call should read `handle` from.
-    ///
-    /// `None` selects the current generation without a serviceability check -
-    /// the inline-packing-keys path never consults the store.
+    /// Store a respond call should read `handle` from. `None` skips the
+    /// serviceability check; the inline-packing-keys path never consults it.
     ///
     /// # Errors
-    /// Returns [`AdapterError::InvalidQuery`] when the handle is unknown,
-    /// removed, or past its TTL.
+    /// [`AdapterError::InvalidQuery`] when the handle is unknown, removed, or
+    /// past its TTL.
     pub fn resolve(
         &self,
         handle: Option<ServerSessionHandle>,
@@ -255,10 +237,8 @@ impl BoundedSessionStore {
         }
     }
 
-    /// Stop serving `handle`. Returns whether it was serviceable.
-    ///
-    /// The keys stay resident until the next flush; the frozen inner store has
-    /// no per-entry removal.
+    /// Stop serving `handle`. Keys stay resident until the next flush - the
+    /// inner store has no per-entry removal.
     pub fn remove(&self, handle: ServerSessionHandle) -> bool {
         let mut gen = self.current.write();
         let removed = gen.expiry.remove(&handle.0).is_some();
@@ -291,11 +271,9 @@ impl BoundedSessionStore {
         before - gen.expiry.len()
     }
 
-    /// Reclaim if the inner store - not the serviceable count - is at the cap.
-    ///
-    /// Gating on `store.len()` is load-bearing: expired handles leave the
-    /// bookkeeping map but their keys stay resident, so a serviceable-count
-    /// gate would let the resident set grow without bound.
+    /// Reclaim when the inner store is at the cap. Gating on `store.len()` is
+    /// load-bearing: expired handles leave the map but their keys stay
+    /// resident, so a serviceable-count gate grows without bound.
     fn make_room(&self, gen: &mut Generation, now: Instant) {
         let swept = Self::sweep_locked(gen, now);
         if swept > 0 {
@@ -336,8 +314,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    /// Structurally empty keys: the store never inspects them, and the
-    /// production-shaped 11.94 MiB payload would make cap tests unaffordable.
+    /// Empty keys; the store never inspects them and 11.94 MiB each would make
+    /// cap tests unaffordable.
     fn keys() -> ClientPackingKeys {
         ClientPackingKeys {
             y_body: Vec::new(),
@@ -406,8 +384,8 @@ mod tests {
         );
     }
 
-    /// The fresh generation restarts handle numbering, so only a handle above
-    /// the reissue window is provably gone.
+    /// Handle numbering restarts, so only a handle above the reissue window is
+    /// provably gone.
     #[test]
     fn evicted_handles_fail_closed_instead_of_resolving() {
         let s = store(4);

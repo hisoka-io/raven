@@ -1,23 +1,16 @@
-//! HKDF-SHA256 seed derivation with domain separation.
-//!
-//! Every scheme that needs a reproducible 32-byte seed (e.g. Deterministic
-//! matrix-A construction) routes through [`derive_seed`]. Inputs: caller's
-//! master secret (`ikm`), a domain separator (scheme-constant salt), and an
-//! `info` string that disambiguates sub-uses within a scheme (e.g.
-//! `"inspire.matrix_a"` vs `"inspire.hint"`). Output is always 32 bytes.
+//! HKDF-SHA256 seed derivation. `domain` is the scheme-constant salt,
+//! `info` separates sub-uses within one scheme.
 
 use hkdf::Hkdf;
 use sha2::Sha256;
 
 use crate::rng::SeedBytes;
 
-/// Domain separator. Newtype so callers can't accidentally swap `ikm` and
-/// `domain` arguments at a call site.
+/// HKDF salt. Newtype so `ikm` and `domain` cannot be swapped at a call site.
 #[derive(Debug, Clone, Copy)]
 pub struct DomainSeparator<'a>(pub &'a [u8]);
 
-/// Canonical domain separator for Raven scheme seed derivation. Schemes that
-/// want a sub-domain push it via `info` rather than changing the salt.
+/// Canonical salt for scheme seed derivation; sub-domains go in `info`.
 pub const SCHEME_SEED_DOMAIN: DomainSeparator<'static> = DomainSeparator(b"raven/scheme/v1");
 
 /// Derive a 32-byte seed from `ikm` + `domain` + `info`.
@@ -25,8 +18,7 @@ pub const SCHEME_SEED_DOMAIN: DomainSeparator<'static> = DomainSeparator(b"raven
 pub fn derive_seed(ikm: &[u8], domain: DomainSeparator<'_>, info: &[u8]) -> SeedBytes {
     let hk = Hkdf::<Sha256>::new(Some(domain.0), ikm);
     let mut out = [0u8; 32];
-    // HKDF-Expand for SHA-256 can only fail above 255 * 32 = 8160 output bytes;
-    // we request exactly 32.
+    // HKDF-Expand fails only above 255 * 32 output bytes; 32 always fits.
     #[allow(clippy::expect_used)]
     hk.expand(info, &mut out).expect("32 bytes always fits");
     out
@@ -64,8 +56,7 @@ mod tests {
         assert_ne!(s1, s2);
     }
 
-    /// RFC 5869 appendix A.1 test vector for HKDF-SHA256, truncated to the
-    /// first 32 bytes of its 42-byte OKM.
+    /// RFC 5869 A.1, truncated to the first 32 of its 42 OKM bytes.
     #[test]
     fn kat_rfc5869_basic() {
         let ikm = hex::decode("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").expect("hex");

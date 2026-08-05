@@ -8,17 +8,12 @@
     )
 )]
 #![allow(missing_docs)]
-//! Binary Fuse Filter (3-wise and 4-wise XOR variants). Probabilistic
-//! membership over a fingerprint array oversized by a factor of
-//! `~1.1`; queries XOR-reduce 3 or 4 hash-derived slots.
+//! Binary Fuse Filter, 3-wise and 4-wise XOR variants. Pure-Rust port of
+//! `chalametpir_common::binary_fuse_filter` (BSD-3-Clause), algorithm from
+//! <https://arxiv.org/abs/2201.01174>.
 //!
-//! Pure-Rust port of the construction in
-//! `chalametpir_common::binary_fuse_filter` (BSD-3-Clause). Algorithm
-//! described in <https://arxiv.org/abs/2201.01174>.
-//!
-//! Not a cryptographic primitive: the keyed hash gives good avalanche,
-//! but fingerprints are small enough to be collision-susceptible. Do
-//! not use as a secret-dependent decision primitive.
+//! Not a cryptographic primitive: fingerprints are small enough to be
+//! collision-susceptible, so never use this for a secret-dependent decision.
 //!
 //! ```no_run
 //! use std::collections::HashMap;

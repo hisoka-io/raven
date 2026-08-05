@@ -29,7 +29,7 @@ fn build_toy_state(params: &InspireParams) -> InspireServerState {
 fn register_one_session(instance: &Arc<PirInstance<RavenInspireScheme>>, params: &InspireParams) {
     let snap = instance.current_state();
     let crs_clone = (*snap.crs).clone();
-    // sk is independent of server-state contents; a sibling setup gives a structurally-valid one
+    // The key is independent of state contents, so a sibling setup suffices.
     let (_off_state, sk) = {
         let db: Vec<u8> = (0..TOY_ENTRIES)
             .flat_map(|i| {
@@ -62,7 +62,7 @@ fn admin_swap_state_clears_session_store() {
         "donor session_store must be non-empty before the admin swap (got len={pre_swap_len})"
     );
 
-    // capture the donor Arc pointer to assert post-swap it's a different Arc, not equal-by-content
+    // Compare Arc identity, not content.
     let donor_session_store_ptr: *const BoundedSessionStore = {
         let snap = instance.current_state();
         Arc::as_ptr(&snap.session_store)
@@ -93,7 +93,7 @@ fn admin_swap_state_clears_session_store() {
          got post-swap len={post_swap_len}"
     );
 
-    // different-Arc guard: an "always carry" regression would type-check but leak donor sessions
+    // An always-carry regression would type-check but leak donor sessions.
     let post_swap_session_store_ptr: *const BoundedSessionStore = {
         let snap = instance.current_state();
         Arc::as_ptr(&snap.session_store)
@@ -133,7 +133,7 @@ fn drive_commit_path_preserves_session_store() {
         Arc::as_ptr(&snap.session_store)
     };
 
-    // mirror drive_commit's new_state shape; encoded_db is cloned without re-encoding since the property under test is session lifecycle
+    // Mirrors drive_commit's new_state shape; re-encoding is irrelevant here.
     let new_state = {
         let current = instance.current_state();
         InspireServerState {

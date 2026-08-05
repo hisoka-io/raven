@@ -1,16 +1,6 @@
-//! Wallet self-bootstrap regression: `/v1/instance/{id}/params`
-//! must ship `inspire_params_bincode` alongside `crs_bincode` and
-//! `shard_config_bincode` so the WASM client can derive an RLWE
-//! secret key without a side-channel param distribution.
-//!
-//! Three properties are pinned:
-//!
-//! 1. The bincode envelope decodes to an `InstanceParams` whose
-//!    `inspire_params_bincode` field is non-empty.
-//! 2. The bytes round-trip into a `raven_inspire::params::InspireParams`
-//!    that matches what the engine was bootstrapped with.
-//! 3. The wire schema version remains `1` (no envelope bump needed
-//!    for this additive change at the bincode-struct end).
+//! `/v1/instance/{id}/params` must ship `inspire_params_bincode` beside
+//! `crs_bincode` and `shard_config_bincode`, so the WASM client can derive an RLWE
+//! secret key with no side-channel param distribution.
 
 #![allow(
     clippy::expect_used,
@@ -156,11 +146,8 @@ async fn instance_params_inspire_params_decodes_to_secure_128_d2048() {
         bincode::deserialize(&decoded.inspire_params_bincode).expect("decode InspireParams");
     let expected = InspireParams::secure_128_d2048();
 
-    // Field-by-field equality: `InspireParams` doesn't derive `Eq`,
-    // but every constituent field is hashable / comparable. Spot-check
-    // the load-bearing ones the WASM client reads in
-    // `build_instance_params_blob` (sigma drives the sampler, ring_dim
-    // drives the secret-key shape).
+    // `InspireParams` has no `Eq`; sigma drives the sampler and ring_dim the
+    // secret-key shape, so those are the load-bearing fields.
     assert_eq!(recovered_params.ring_dim, expected.ring_dim);
     assert_eq!(recovered_params.q, expected.q);
     assert_eq!(recovered_params.crt_moduli, expected.crt_moduli);
@@ -172,9 +159,7 @@ async fn instance_params_inspire_params_decodes_to_secure_128_d2048() {
     assert_eq!(recovered_params.gadget_base, expected.gadget_base);
     assert_eq!(recovered_params.gadget_len, expected.gadget_len);
 
-    // Sanity: the CRS + shard-config blobs round-trip too. This is
-    // the tuple the wallet hands to `build_client_session`; if any
-    // of the three blobs gets corrupted, bootstrap fails.
+    // The tuple the wallet hands to `build_client_session`.
     let _crs: ServerCrs =
         ServerCrs::from_versioned_bytes(&decoded.crs_bincode).expect("decode versioned ServerCrs");
     let _shard: ShardConfig =

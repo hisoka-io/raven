@@ -67,9 +67,8 @@ fn median(timings: &[Duration]) -> Duration {
     *sorted.get(sorted.len() / 2).expect("non-empty")
 }
 
-/// Dispatch BATCH_SIZE queries against `state` at concurrency cap `k`.
-/// Mirrors the production HTTP `dispatch_batch` semantics: tokio
-/// `JoinSet` + `tokio::sync::Semaphore` + per-worker `spawn_blocking`.
+/// Dispatch BATCH_SIZE queries at concurrency cap `k`, mirroring the production
+/// `JoinSet` + `Semaphore` + `spawn_blocking` shape.
 fn dispatch_at_k(
     rt: &tokio::runtime::Runtime,
     state: &Arc<InspireServerState>,

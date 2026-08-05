@@ -71,7 +71,6 @@ async function startMockServer(
 
       const url = req.url ?? "";
 
-      // bc-to-idx-map publishing channel
       if (url.startsWith("/v1/poi/") && url.endsWith("/bc-to-idx-map")) {
         const entries = meta.target_indices.map((idx) => ({
           bc: meta.bcs_hex[idx],
@@ -87,7 +86,6 @@ async function startMockServer(
         return;
       }
 
-      // Encrypted PIR query
       if (url.match(/^\/v1\/instance\/[^/]+\/query$/)) {
         const idx = responseSequence[responseCursor];
         responseCursor = (responseCursor + 1) % responseSequence.length;
@@ -178,8 +176,7 @@ describe("RavenPOINodeInterface privacy invariant", () => {
           [{ blindedCommitment: bc, type: "Shield" as const }],
         );
       } catch {
-        // Decode failure expected; only the wire-body invariant below is asserted.
-      }
+        }
     }
 
     const wireRequests = sdk.lastWireRequests();
@@ -245,7 +242,6 @@ describe("RavenPOINodeInterface privacy invariant", () => {
         queriedBcs.map((bc) => ({ blindedCommitment: bc, type: "Shield" as const })),
       );
     } catch {
-      // 404 from the mock; only the outbound body matters here.
     }
 
     const wireRequests = leakySdk.lastWireRequests();

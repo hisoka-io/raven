@@ -1,11 +1,6 @@
-//! Empirical noise-validation for lattice-based PIR.
-//!
-//! SimplePIR-family schemes can fail silently: a query whose accumulated
-//! noise exceeds the budget decodes to the wrong plaintext with no error.
-//! Paper-derived bounds aren't always tight in practice. Schemes implement
-//! [`NoiseValidatable`], the harness runs `N` trials, and
-//! [`NoiseBenchReport`] reports the observed silent-failure rate with a
-//! Wilson upper bound.
+//! Empirical noise-validation for lattice-based PIR: a query whose accumulated noise exceeds
+//! the budget decodes to the wrong plaintext with no error, and paper-derived bounds are not
+//! always tight, so the observed silent-failure rate is measured with a Wilson upper bound.
 
 use serde::{Deserialize, Serialize};
 
@@ -16,18 +11,18 @@ use crate::GridCell;
 pub enum TrialOutcome {
     /// The decoded value matched the reference.
     Correct,
-    /// Decoded value differed and the scheme did not detect it; the measured failure mode.
+    /// Wrong value, undetected by the scheme; the measured failure mode.
     SilentMismatch,
-    /// Scheme surfaced an explicit error; counted apart from silent failures.
+    /// Scheme surfaced an error; counted apart from silent failures.
     ExplicitError,
 }
 
 /// Inputs for one trial; schemes derive all randomness from `seed` for reproducibility.
 #[derive(Debug, Clone, Copy)]
 pub struct TrialInput {
-    /// Monotonic trial index in `[0, config.trials)`.
+    /// Trial index in `[0, config.trials)`.
     pub trial_idx: u64,
-    /// Seed all per-trial randomness so a failing trial reproduces from the seed alone.
+    /// All per-trial randomness MUST derive from this, so a failure reproduces from it alone.
     pub seed: u64,
     /// Index the client queries on this trial.
     pub index: u64,
@@ -35,18 +30,16 @@ pub struct TrialInput {
 
 /// A PIR scheme under noise-validation bench.
 pub trait NoiseValidatable {
-    /// Run one trial end-to-end and compare against the reference oracle.
-    ///
-    /// MUST be deterministic in `TrialInput::seed` so mismatches reproduce by seed alone.
+    /// One trial against the reference oracle. MUST be deterministic in `TrialInput::seed`.
     fn run_trial(&self, input: TrialInput) -> TrialOutcome;
 }
 
 /// Caller-supplied configuration for a noise-validation run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NoiseBenchConfig {
-    /// Grid cell under measurement (db shape).
+    /// Database shape under measurement.
     pub cell: GridCell,
-    /// Number of trials to run; more trials buy statistical power at wall-clock cost.
+    /// Trials to run; more buys statistical power at wall-clock cost.
     pub trials: u64,
     /// Base seed; trial `i` uses `base_seed ^ (i).rotate_left(32)`.
     pub base_seed: u64,
@@ -80,20 +73,19 @@ impl NoiseBenchConfig {
     }
 }
 
-/// Result of a noise-validation run.
-///
-/// Wilson upper bound rather than normal-approximation: it degrades gracefully at zero observed failures.
+/// Result of a noise-validation run. Wilson rather than normal-approximation because it
+/// degrades gracefully at zero observed failures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NoiseBenchReport {
     /// Configuration the run used.
     pub config: NoiseBenchConfig,
     /// Trials completed.
     pub trials: u64,
-    /// Number of silent mismatches (`TrialOutcome::SilentMismatch`).
+    /// Silent mismatches observed.
     pub silent_mismatches: u64,
-    /// Number of explicit errors (`TrialOutcome::ExplicitError`).
+    /// Explicit errors observed.
     pub explicit_errors: u64,
-    /// Point estimate of silent-failure rate: `silent_mismatches / trials`.
+    /// `silent_mismatches / trials`.
     pub silent_failure_rate: f64,
     /// Wilson upper bound on the silent-failure rate at z = 1.96 (one-sided 97.5%).
     pub silent_failure_wilson_upper_97_5: f64,
@@ -123,8 +115,6 @@ impl NoiseBenchReport {
 const WILSON_Z_95: f64 = 1.96;
 
 /// Upper limit of the two-sided 95% Wilson score interval, i.e. a one-sided 97.5% bound.
-///
-/// Defined as (p + z^2/(2n) + z*sqrt(p(1-p)/n + z^2/(4n^2))) / (1 + z^2/n) with z = 1.96.
 /// See <https://en.wikipedia.org/wiki/Binomial_proportion_confidence_interval#Wilson_score_interval>.
 #[allow(clippy::cast_precision_loss)]
 fn wilson_upper_95(successes: u64, trials: u64) -> f64 {
@@ -141,8 +131,7 @@ fn wilson_upper_95(successes: u64, trials: u64) -> f64 {
     ((centre + spread) / denom).clamp(0.0, 1.0)
 }
 
-/// Drive a noise-validation bench end-to-end against any [`NoiseValidatable`]
-/// scheme. Returns a [`NoiseBenchReport`].
+/// Drive a noise-validation bench against any [`NoiseValidatable`] scheme.
 pub fn run_noise_bench<S: NoiseValidatable>(
     scheme: &S,
     config: NoiseBenchConfig,
@@ -225,8 +214,6 @@ mod tests {
 
     #[test]
     fn wilson_upper_bound_is_strictly_positive_for_zero_failures() {
-        // Zero observed failures does NOT mean zero failure rate; Wilson
-        // gives a positive upper bound that shrinks with n.
         let w_small = wilson_upper_95(0, 100);
         let w_large = wilson_upper_95(0, 100_000);
         assert!(w_small > 0.0);
@@ -242,7 +229,6 @@ mod tests {
             base_seed: 0,
             index_stride: Some(1),
         };
-        // Intentionally misuse. Silent > trials
         let r = NoiseBenchReport::summarize(cfg, 10, 999, 0);
         assert_eq!(r.silent_mismatches, 10);
         assert!((r.silent_failure_rate - 1.0).abs() < 1e-9);
@@ -291,7 +277,6 @@ mod tests {
             base_seed: 1,
             index_stride: Some(1),
         };
-        // Fails every 10th trial: 100 silent mismatches in 1000 trials.
         let r = run_noise_bench(&EveryNthSilentMismatch { n: 10 }, cfg);
         assert_eq!(r.silent_mismatches, 100);
         assert!((r.silent_failure_rate - 0.1).abs() < 1e-12);

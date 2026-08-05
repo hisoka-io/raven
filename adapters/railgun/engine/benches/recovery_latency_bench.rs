@@ -1,7 +1,5 @@
-//! Recovery latency bench (`#[ignore]`-gated): cold-start latency for
-//! the bootstrap-from-disk path at the production cell shape
-//! (65,536 x 512 B). Target <= 1 s for manifest-load + snapshot-restore
-//! + cache rebuild.
+//! Cold-start bootstrap-from-disk latency at the production cell shape; target
+//! is 1 s for manifest load, snapshot restore and cache rebuild.
 
 #![allow(clippy::expect_used, clippy::print_stderr)]
 
@@ -52,7 +50,6 @@ fn recovery_from_production_cell_snapshot_under_5s() {
         opened.persistence.commit(&state, 0).expect("commit");
     }
 
-    // cold start: manifest-load + snapshot-load + deserialize + cache rebuild; WAL replay is empty
     let layout2 = StoreLayout::open(dir.path()).expect("layout 2");
     let recovery_start = Instant::now();
     let opened = InspirePersistence::open(
@@ -70,7 +67,7 @@ fn recovery_from_production_cell_snapshot_under_5s() {
     assert_eq!(recovered.entry_size, entry_size);
     assert_eq!(recovered.variant, InspireVariant::TwoPacking);
 
-    // 5s floor (target is 1s): absorbs first-cold-page noise and contended-host variability
+    // Ceiling sits above the 1s target to absorb cold-page and host variability.
     assert!(
         recovery_elapsed < Duration::from_secs(5),
         "recovery latency regressed: {recovery_elapsed:?} > 5 s"

@@ -168,8 +168,8 @@ fn strategy_baseline(
     })
 }
 
-/// (a) K workers, each in its own `cores / K`-sized rayon pool, so
-/// per-respond work does not thrash the global pool.
+/// K workers, each in its own `cores / K`-sized rayon pool, so per-respond work
+/// does not thrash the global pool.
 fn strategy_a_dedicated_pool(
     state: &Arc<InspireServerState>,
     queries: &[raven_inspire::SeededClientQuery],
@@ -232,8 +232,8 @@ fn strategy_a_dedicated_pool(
     responses.into_iter().map(|o| o.expect("filled")).collect()
 }
 
-/// (b) K OS threads via `std::thread::scope`, dropping the JoinSet +
-/// semaphore + per-task spawn overhead.
+/// K OS threads via `std::thread::scope`, dropping the JoinSet, semaphore and
+/// per-task spawn overhead.
 fn strategy_b_thread_scope(
     state: &Arc<InspireServerState>,
     queries: &[raven_inspire::SeededClientQuery],
@@ -275,8 +275,8 @@ fn strategy_b_thread_scope(
     })
 }
 
-/// (c) Single `rayon::par_iter` fanout: one pool handles outer + inner
-/// parallelism via work-stealing.
+/// Single `rayon::par_iter` fanout: one pool handles outer and inner
+/// parallelism by work-stealing.
 fn strategy_c_par_iter(
     state: &Arc<InspireServerState>,
     queries: &[raven_inspire::SeededClientQuery],

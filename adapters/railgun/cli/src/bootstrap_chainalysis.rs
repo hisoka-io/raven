@@ -1,29 +1,9 @@
-//! Chainalysis OFAC oracle PPOI bootstrap adapter.
+//! [`PpoiEventsSource`] derived from the on-chain Chainalysis sanctions oracle.
 //!
-//! Implements [`PpoiEventsSource`] by reading the on-chain
-//! Chainalysis sanctions oracle (mainnet:
-//! `0x40C57923924B5c5c5455c48D93317139ADDaC8fb`) and deriving the
-//! per-list IMT events the PPOI bootstrap pipeline expects.
-//!
-//! The adapter has two cooperating layers:
-//!
-//! 1. **Oracle layer.** Reads `SanctionedAddressesAdded(address[])`
-//!    log entries from the oracle contract via `eth_getLogs`,
-//!    block-chunked to a free-tier-safe span.
-//! 2. **Derivation layer.** Maps each sanctioned address into the
-//!    set of Railgun shield events whose deposit recipient (NPK
-//!    derivation input) is that address, then computes
-//!    `BlindedCommitment = Poseidon(commitmentHash, npk,
-//!    globalTreePosition)` per
-//!    the Railgun engine's `src/poi/blinded-commitment.ts`.
-//!
-//! The on-chain shield log carries the plaintext `npk: bytes32`
-//! and the `(treeNumber, startPosition)` global tree position,
-//! so the derivation is deterministic from chain state alone - no
-//! off-chain wallet metadata required.
-//!
-//! Synthetic-fixture testing keeps the wiring exercise-able
-//! without live RPC. See `tests/ppoi_chainalysis_adapter.rs`.
+//! Sanctioned addresses come from `SanctionedAddressesAdded` logs; each matching
+//! shield row becomes `BlindedCommitment = Poseidon(commitmentHash, npk,
+//! globalTreePosition)` per the upstream engine's `src/poi/blinded-commitment.ts`.
+//! Every input is on-chain, so the derivation needs no wallet metadata.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,61 +17,36 @@ use crate::bootstrap_subsquid::{BootstrapError, PpoiEventRow, PpoiEventsSource};
 use raven_railgun_indexer::rpc_pool::RpcEndpointPool;
 
 sol! {
-    /// Chainalysis OFAC oracle event emitted when one or more
-    /// addresses are added to the sanctions list. Indexed `addedAddresses`
-    /// is the only field - no indexed topics.
     #[allow(missing_docs)]
     event SanctionedAddressesAdded(address[] addedAddresses);
 }
 
-/// Mainnet deployment of the Chainalysis OFAC sanctions oracle.
-/// Locked literal verified against
-/// `private-proof-of-innocence/packages/node/src/local-list-provider.ts`
-/// (the upstream Railgun PPOI list provider routes through the same
-/// oracle via the public Chainalysis API).
+/// Mainnet sanctions oracle; matches upstream
+/// `private-proof-of-innocence/packages/node/src/local-list-provider.ts`.
 pub const CHAINALYSIS_ORACLE_MAINNET: &str = "0x40C57923924B5c5c5455c48D93317139ADDaC8fb";
 
-/// Earliest block at which the Chainalysis oracle was deployed and
-/// the first sanctioned-address-added events appeared. Anything
-/// earlier returns no logs.
+/// Oracle deployment block; earlier ranges return no logs.
 pub const CHAINALYSIS_ORACLE_FIRST_BLOCK: u64 = 14_356_508;
 
-/// Default `eth_getLogs` chunk span. Free-tier mainnet RPCs
-/// (Infura/Alchemy) cap at 10k blocks for log queries; we use a
-/// conservative span that completes within the per-call timeout
-/// even on the slowest publicnode endpoint.
+/// `eth_getLogs` chunk span, under the 10k free-tier cap and the per-call timeout.
 pub const DEFAULT_LOG_CHUNK_BLOCKS: u64 = 5_000;
 
-/// Per-call RPC timeout. Matches the existing PPOI client.
+/// Per-call RPC timeout.
 const PER_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Synthetic Shield-event row used by the derivation layer to map a
-/// sanctioned address to one or more on-chain commitments. In
-/// production this is hydrated from the same `eth_getLogs` pool
-/// (the indexer already decodes `Shield(...)` per
-/// `decode_log_to_railgun_event`); the adapter accepts pre-decoded
-/// rows so synthetic-fixture tests can drive the derivation without
-/// touching RPC.
+/// Pre-decoded shield row consumed by the derivation layer.
 #[derive(Debug, Clone)]
 pub struct SyntheticShieldRow {
-    /// EOA / contract that authored the shield deposit; matched
-    /// byte-equal against the sanctioned set.
+    /// Matched byte-equal against the sanctioned set.
     pub from_address: Address,
-    /// Shield commitment hash: `Poseidon(npk, tokenHash,
-    /// valueAfterFee)`.
+    /// `Poseidon(npk, tokenHash, valueAfterFee)`.
     pub commitment_hash: [u8; 32],
-    /// Plaintext NPK as published in the shield log's
-    /// `CommitmentPreimage`.
     pub npk: [u8; 32],
-    /// Global tree position: `tree_number * 65_536 + leaf_index`,
-    /// big-endian-padded into a 32-byte field element.
+    /// `tree_number * 65_536 + leaf_index`, big-endian in a 32-byte field element.
     pub global_tree_position: [u8; 32],
 }
 
-/// Builder/config for [`ChainalysisOnChainOracleSource`]. Holds the
-/// oracle address, block range, chunk size, and an optional
-/// synthetic override that bypasses RPC entirely (used by the test
-/// fixture).
+/// Config for [`ChainalysisOnChainOracleSource`].
 #[derive(Clone)]
 pub struct ChainalysisOnChainOracleSource {
     pool: Option<Arc<RpcEndpointPool>>,
@@ -120,9 +75,7 @@ impl std::fmt::Debug for ChainalysisOnChainOracleSource {
 }
 
 impl ChainalysisOnChainOracleSource {
-    /// Live-RPC constructor. The oracle address parses from the
-    /// canonical mainnet literal; pass an alternate `oracle_addr`
-    /// only for non-mainnet probes.
+    /// Live-RPC constructor.
     pub fn new_live(
         pool: Arc<RpcEndpointPool>,
         oracle_addr: Address,
@@ -140,10 +93,7 @@ impl ChainalysisOnChainOracleSource {
         }
     }
 
-    /// Synthetic-fixture constructor. The `sanctioned_override`
-    /// short-circuits the on-chain log walk, returning the supplied
-    /// addresses verbatim. `shield_rows` feeds the derivation layer
-    /// directly. Used only by tests.
+    /// Test constructor: `sanctioned_override` short-circuits the log walk.
     #[must_use]
     pub fn new_synthetic(
         oracle_addr: Address,
@@ -161,20 +111,14 @@ impl ChainalysisOnChainOracleSource {
         }
     }
 
-    /// Override the chunk size (default
-    /// [`DEFAULT_LOG_CHUNK_BLOCKS`]). Operators on archival nodes
-    /// can raise; free-tier endpoints typically cap at 10k.
+    /// Override [`DEFAULT_LOG_CHUNK_BLOCKS`].
     #[must_use]
     pub fn with_chunk_size(mut self, blocks: u64) -> Self {
         self.chunk_size = blocks.max(1);
         self
     }
 
-    /// Append a list of pre-decoded shield rows that the derivation
-    /// layer will scan when matching sanctioned addresses. In
-    /// live-RPC mode operators populate this from the indexer's
-    /// existing `events_in_range` walk; the synthetic fixture path
-    /// uses the constructor argument directly.
+    /// Append shield rows for the derivation layer to scan.
     pub fn extend_shield_rows<I>(&mut self, rows: I)
     where
         I: IntoIterator<Item = SyntheticShieldRow>,
@@ -182,15 +126,12 @@ impl ChainalysisOnChainOracleSource {
         self.shield_rows.extend(rows);
     }
 
-    /// Read-only accessor for tests + diagnostics.
     #[must_use]
     pub fn oracle_addr(&self) -> Address {
         self.oracle_addr
     }
 
-    /// Decode a single `SanctionedAddressesAdded` log entry into the
-    /// list of addresses it added. Public so tests can verify the
-    /// `sol!` decode shape directly without a full pipeline run.
+    /// Decode one `SanctionedAddressesAdded` entry into the addresses it added.
     pub fn decode_added_log(log: &alloy::rpc::types::eth::Log) -> Result<Vec<Address>, String> {
         let primary = log
             .topic0()
@@ -207,10 +148,7 @@ impl ChainalysisOnChainOracleSource {
         Ok(decoded.addedAddresses.clone())
     }
 
-    /// Live RPC walk: chunked `eth_getLogs` over
-    /// `[block_start, block_end]` against `oracle_addr`, decoding
-    /// every `SanctionedAddressesAdded` entry. Returns the
-    /// deduplicated set of sanctioned addresses in
+    /// Chunked `eth_getLogs` walk; returns sanctioned addresses deduplicated in
     /// first-occurrence order.
     async fn fetch_sanctioned_live(&self) -> Result<Vec<Address>, BootstrapError> {
         let pool = self.pool.as_ref().ok_or_else(|| {
@@ -278,16 +216,8 @@ impl ChainalysisOnChainOracleSource {
         Ok(out)
     }
 
-    /// Derive the canonical PPOI event sequence for `list_key` from
-    /// the union of (sanctioned addresses) x (shield rows whose
-    /// `from_address` is sanctioned). Each row's
-    /// blinded-commitment is computed via
-    /// `Poseidon(commitmentHash, npk, globalTreePosition)`.
-    ///
-    /// The local IMT root is rolled forward as we go; each
-    /// `PpoiEventRow.validated_merkleroot` carries the post-insert
-    /// root so the upstream byte-identity oracle in
-    /// `bootstrap_one_list_with_mode` accepts the sequence.
+    /// PPOI event sequence for `list_key` over shield rows whose `from_address`
+    /// is sanctioned. Each row's `validated_merkleroot` is the POST-insert root.
     fn derive_event_rows(
         sanctioned: &[Address],
         shield_rows: &[SyntheticShieldRow],
@@ -342,9 +272,8 @@ impl PpoiEventsSource for ChainalysisOnChainOracleSource {
         if self.shield_rows.is_empty() && self.pool.is_some() {
             return Err(BootstrapError::PpoiUnreachable(
                 "Chainalysis adapter: sanctioned-address set is non-empty but no shield rows \
-                 supplied — derivation layer requires the indexer to feed pre-decoded shield \
-                 events. Live npk→EOA convergence ships in a follow-up; runtime fallback will \
-                 seed an empty IMT under skip-on-unreachable."
+                 supplied. The derivation layer requires the indexer to feed pre-decoded \
+                 shield events; without them, use skip-on-unreachable to seed an empty IMT."
                     .to_owned(),
             ));
         }
@@ -352,8 +281,6 @@ impl PpoiEventsSource for ChainalysisOnChainOracleSource {
     }
 }
 
-/// Parse the canonical mainnet oracle address. Convenience wrapper
-/// keeps CLI parsing diagnostics actionable.
 pub fn parse_chainalysis_oracle(s: &str) -> Result<Address, String> {
     s.parse::<Address>()
         .map_err(|e| format!("invalid chainalysis-oracle address {s}: {e}"))

@@ -1,6 +1,5 @@
-//! Subsquid root oracle test (real-Sepolia checkpoint flavour).
-//! Three-oracle (chain / upstream / subsquid) byte-identity check, escalating
-//! to a 4-oracle assertion when `real_subsquid_root` is present in the fixture.
+//! Byte-identity check across the chain, upstream and subsquid root oracles,
+//! escalating to four oracles when the fixture carries `real_subsquid_root`.
 
 #![allow(
     clippy::expect_used,
@@ -216,8 +215,7 @@ fn load_fixture() -> Fixture {
     }
 }
 
-/// Replay `leaves` into a fresh `Imt` and return its root. Asserts
-/// the IMT is internally consistent (leaf_count matches input).
+/// Replay `leaves` into a fresh `Imt` and return its root.
 fn replay_into_imt(leaves: &[[u8; 32]]) -> [u8; 32] {
     let mut imt = Imt::new().expect("imt new");
     for (i, leaf) in leaves.iter().enumerate() {
@@ -232,8 +230,7 @@ fn replay_into_imt(leaves: &[[u8; 32]]) -> [u8; 32] {
     imt.root()
 }
 
-/// Load the fixture roots into a source queryable via the
-/// `SubsquidRootSource` trait (the production-consumed boundary).
+/// Expose the fixture roots through the production `SubsquidRootSource` trait.
 fn populate_subsquid_source(fixture: &Fixture) -> FixtureSubsquidSource {
     let mut src = FixtureSubsquidSource::new();
     for cp in &fixture.tree_checkpoints {
@@ -353,8 +350,7 @@ fn g5d_three_oracle_byte_identity_holds_for_every_checkpoint() {
             "{} (list_key={:?}, leaf_count={}, block={})",
             cp.label, cp.list_key, cp.leaf_count, cp.block_height
         );
-        // Per-list path: chain root is structurally None (chain
-        // doesn't store per-list IMT). Subsquid + Upstream cover.
+        // Chain stores no per-list IMT, so its root is structurally None.
         assert_three_oracle_byte_identity(
             our_root,
             None,
@@ -377,8 +373,7 @@ fn g5d_three_oracle_byte_identity_holds_for_every_checkpoint() {
         "every list checkpoint must pass"
     );
 
-    // Upstream schema exposes no per-list IMT root, so the prod client
-    // must return NotIndexed (see SubsquidError::NotIndexed).
+    // Upstream exposes no per-list IMT root, so the client must return NotIndexed.
     let prod_client =
         raven_railgun_indexer::subsquid::SubsquidClient::new("https://squid.example.io/graphql");
     let any_list_key = fixture

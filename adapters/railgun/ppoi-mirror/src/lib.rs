@@ -1,8 +1,5 @@
-//! Upstream PPOI mirror for the Raven Railgun PIR adapter.
-//!
-//! All upstream endpoints use **POST** with JSON body (not GET).
-//! Routes consumed: `/poi-events` (event feed) and
-//! `/pois-per-blinded-commitment` (canonical status query).
+//! Upstream PPOI mirror. Every route consumed - `/poi-events` and
+//! `/pois-per-blinded-commitment` - is POST with a JSON body, not GET.
 
 #![allow(missing_docs, clippy::items_after_statements)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
@@ -95,21 +92,18 @@ impl Default for MirrorConfig {
     }
 }
 
-/// Per-(list_key, kind) cursor identifier. The mirror keeps the status
-/// feed and the path-projection feed on separate sidecars because they
-/// advance independently across restart boundaries.
+/// Cursor kind. Status and path-projection feeds get separate sidecars
+/// because they advance independently across restarts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MirrorKind {
-    /// Drives `PpoiStatus` consumers (T1 status PIR encoder).
+    /// Drives `PpoiStatus` consumers.
     Status,
-    /// Drives `PpoiListLeafAdded` consumers used by path-projection
-    /// encoders (T2 path / per-list-node).
+    /// Drives `PpoiListLeafAdded` consumers used by path-projection encoders.
     Path,
 }
 
 impl MirrorKind {
-    /// Stable filename suffix for the per-(list_key, kind) cursor
-    /// sidecar. Two distinct files so status and path advance
+    /// Sidecar filename suffix; distinct per kind so the two feeds advance
     /// independently after a restart.
     #[must_use]
     pub const fn sidecar_filename(self) -> &'static str {
@@ -120,24 +114,17 @@ impl MirrorKind {
     }
 }
 
-/// Sidecar cursor wired into [`UpstreamPpoiMirror::run_worker_with_cursor`].
-///
-/// Atomic-rename semantics: the on-disk write is
-/// `fs::write(tmp); fsync; fs::rename(tmp, final)` so a torn cursor is
-/// never observable. On a crash between `tmp` write and rename the next
-/// worker start observes the prior valid sidecar (or the configured
-/// `fallback` when that too is absent).
+/// Sidecar cursor for [`UpstreamPpoiMirror::run_worker_with_cursor`]. Written
+/// write-tmp + fsync + rename, so a torn cursor is never observable; a crash
+/// mid-write leaves the prior sidecar, or the `fallback` when absent.
 #[derive(Clone, Debug)]
 pub struct MirrorCursor {
-    /// Directory the sidecar lives in. Full path is
-    /// `data_dir / kind.sidecar_filename()`.
+    /// Directory holding `kind.sidecar_filename()`.
     pub data_dir: PathBuf,
-    /// Cursor kind: status or path; determines the sidecar filename.
+    /// Cursor kind; selects the sidecar filename.
     pub kind: MirrorKind,
-    /// Fallback cursor used when the sidecar is missing or torn. Caller
-    /// derives this from `LogicalLeafStore::ppoi_imt(&list_key)
-    /// .map_or(0, |i| i.leaf_count() as u64)` so a fresh-bootstrap with
-    /// already-replayed WAL state never re-pulls from index 0.
+    /// Used when the sidecar is missing or torn. Derive it from the replayed
+    /// per-list leaf count so a fresh bootstrap never re-pulls from index 0.
     pub fallback: u64,
 }
 
@@ -158,10 +145,7 @@ impl MirrorCursor {
         self.data_dir.join(self.kind.sidecar_filename())
     }
 
-    /// Resolve the worker's starting cursor: prefer the sidecar value
-    /// when present and decodable; fall back to `self.fallback`
-    /// otherwise. Tracing is loud on each branch so an operator
-    /// auditing a restart sees exactly which path fired.
+    /// Starting cursor: the sidecar when decodable, else `self.fallback`.
     #[must_use]
     pub fn resolve_start(&self) -> u64 {
         let path = self.sidecar_path();
@@ -182,28 +166,22 @@ impl MirrorCursor {
         }
     }
 
-    /// Atomically persist the new cursor to disk. Errors are surfaced
-    /// as `std::io::Error` so callers can log + continue; the worker
-    /// uses `tracing::warn` and proceeds (the next successful batch
-    /// will re-attempt the write).
+    /// Atomically persist the cursor. The worker logs and continues on error;
+    /// the next successful batch retries the write.
     ///
     /// # Errors
     ///
-    /// Returns the underlying [`std::io::Error`] if creating the parent
-    /// directory, writing the temp file, fsync'ing, or renaming fails.
+    /// [`std::io::Error`] from mkdir, temp write, fsync, or rename.
     pub fn persist(&self, cursor: u64) -> std::io::Result<()> {
         write_cursor_sidecar_atomic(&self.sidecar_path(), cursor)
     }
 }
 
-/// Wire size of a serialized cursor sidecar: u64 little-endian = 8
-/// bytes. Promoted to a const so callers (tests, forensics) can reason
-/// about on-disk layout without re-encoding the magic number.
+/// Cursor sidecar wire size: one little-endian u64.
 pub const MIRROR_CURSOR_SIDECAR_BYTES: usize = 8;
 
-/// Atomically write `cursor` to `path` as 8 little-endian bytes. Uses
-/// `<path>.tmp` + fsync + rename so a torn cursor is never observable
-/// across a crash.
+/// Write `cursor` as little-endian bytes via tmp + fsync + rename, so a torn
+/// cursor is never observable across a crash.
 fn write_cursor_sidecar_atomic(path: &Path, cursor: u64) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
@@ -227,8 +205,7 @@ fn write_cursor_sidecar_atomic(path: &Path, cursor: u64) -> std::io::Result<()> 
     Ok(())
 }
 
-/// Read the sidecar at `path`. Returns `None` on any failure (absent,
-/// short, torn, IO error) so the worker falls back cleanly.
+/// Read the sidecar; `None` on any failure so the worker falls back cleanly.
 fn read_cursor_sidecar(path: &Path) -> Option<u64> {
     let bytes = std::fs::read(path).ok()?;
     if bytes.len() != MIRROR_CURSOR_SIDECAR_BYTES {
@@ -256,14 +233,12 @@ impl std::fmt::Debug for UpstreamPpoiMirror {
 }
 
 impl UpstreamPpoiMirror {
-    /// Build from config with a default `reqwest::Client` (10s timeout).
+    /// Build from config with a default 10s-timeout `reqwest::Client`.
     ///
     /// # Errors
     ///
-    /// Returns [`MirrorError::Upstream`] if `reqwest::Client::builder().build()`
-    /// fails (typically TLS root-store initialisation). On that path no
-    /// functional client exists, so we escalate rather than silently
-    /// fall back to a timeout-less client.
+    /// [`MirrorError::Upstream`] if client construction fails; escalated rather
+    /// than falling back to a timeout-less client.
     pub fn new(config: MirrorConfig) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -287,15 +262,13 @@ impl UpstreamPpoiMirror {
         &self.config.endpoint
     }
 
-    /// Periodic polling worker: fetches new PPOI rows and emits them as
-    /// WAL payloads. Exits when the channel closes or the task is
-    /// cancelled. Legacy no-cursor entry point; delegates to
+    /// No-cursor polling worker; delegates to
     /// [`Self::run_worker_with_cursor`] with `None`.
     ///
     /// # Errors
     ///
-    /// Returns [`MirrorError`] only for non-recoverable failures; the
-    /// per-batch fetch path logs + retries on the next tick.
+    /// [`MirrorError`] only for non-recoverable failures; per-batch fetch
+    /// failures log and retry on the next tick.
     pub async fn run_worker(
         self: std::sync::Arc<Self>,
         list: ListKey,
@@ -306,28 +279,21 @@ impl UpstreamPpoiMirror {
             .await
     }
 
-    /// Cursor-aware worker entry point. When `persistent_cursor` is
-    /// `Some`, the worker resolves its starting position from the
-    /// sidecar (falling back to the operator-supplied
-    /// [`MirrorCursor::fallback`] when absent / torn) and atomically
-    /// writes the advanced cursor after every successful upstream
-    /// batch. `starting_cursor` is honoured only when
-    /// `persistent_cursor` is `None`; it is preserved as the no-cursor
-    /// fast path for the legacy callers and tests.
+    /// Cursor-aware polling worker. With `persistent_cursor` set, the start
+    /// position comes from the sidecar and the advanced cursor is persisted
+    /// after every successful batch; `starting_cursor` applies only when it is
+    /// `None`.
     ///
     /// # Load-bearing emission order
     ///
-    /// For every `/poi-events` row consumed from upstream the worker
-    /// emits [`raven_railgun_persistence::WalEntryPayload::PpoiListLeafAdded`]
-    /// FIRST, then [`raven_railgun_persistence::WalEntryPayload::PpoiStatus`].
-    /// The engine apply path's `(blinded_commitment -> list_index)`
-    /// ordering oracle MUST be allocated before the status-only update
-    /// touches its key. Flipping the order leaves the per-list IMT
-    /// stale and silently breaks T2 path PIR.
+    /// Per upstream row, `PpoiListLeafAdded` MUST be emitted before
+    /// `PpoiStatus`: the apply path allocates the
+    /// `(blinded_commitment -> list_index)` mapping from the former, and the
+    /// reverse order leaves the per-list IMT silently stale.
     ///
     /// # Errors
     ///
-    /// Returns [`MirrorError`] only for non-recoverable failures.
+    /// [`MirrorError`] only for non-recoverable failures.
     pub async fn run_worker_with_cursor(
         self: std::sync::Arc<Self>,
         list: ListKey,
@@ -337,7 +303,7 @@ impl UpstreamPpoiMirror {
     ) -> Result<()> {
         use tokio::time::{interval, Duration, MissedTickBehavior};
         let mut tick = interval(Duration::from_secs(self.config.poll_interval_secs.max(1)));
-        // Delay: schedule next tick relative to actual completion time, not the missed tick.
+        // Next tick is relative to completion, not to the missed tick.
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut cursor = match persistent_cursor.as_ref() {
             Some(pc) => pc.resolve_start(),
@@ -362,7 +328,7 @@ impl UpstreamPpoiMirror {
             }
             for ev in &events {
                 let status_byte = poi_status_to_byte(ev.status);
-                // PpoiListLeafAdded must precede PpoiStatus; see the emission-order doc above.
+                // Emission order is load-bearing; see the worker doc.
                 let leaf_added = raven_railgun_persistence::WalEntryPayload::PpoiListLeafAdded {
                     list_key: list.0,
                     list_index: ev.list_index,
@@ -399,14 +365,9 @@ impl UpstreamPpoiMirror {
         }
     }
 
-    /// Internal indexed-fetch path used by [`Self::run_worker_with_cursor`].
-    ///
-    /// Pulls upstream `/poi-events` and surfaces each row's full
-    /// `(list_index, blinded_commitment, status)` tuple. The
-    /// trait-level [`MirrorSource::fetch_status_range`] strips the
-    /// index because its consumers (status PIR / external callers)
-    /// don't need it; the worker does, because it must drive per-list
-    /// IMT growth via `PpoiListLeafAdded`.
+    /// `/poi-events` pull retaining each row's `list_index`, which the worker
+    /// needs to drive per-list IMT growth and
+    /// [`MirrorSource::fetch_status_range`] therefore strips.
     async fn fetch_indexed_events(
         &self,
         list: &ListKey,
@@ -464,9 +425,7 @@ impl UpstreamPpoiMirror {
     }
 }
 
-/// Internal indexed-event row carried from `fetch_indexed_events` into
-/// `run_worker_with_cursor`. Pairs the `list_index` (for IMT growth)
-/// with the bc + status (for the status map).
+/// Indexed event row: `list_index` for IMT growth, bc + status for the map.
 #[derive(Clone, Debug)]
 struct IndexedPoiEvent {
     list_index: u32,
@@ -506,12 +465,8 @@ struct WirePOISyncedListEvent {
 
 #[derive(Debug, Deserialize)]
 struct WireSignedPOIEvent {
-    /// Upstream-issued contiguous position of this entry within the
-    /// list. Wire shape is JSON `number`; decoded as `u64` and narrowed
-    /// to `u32` at the WAL-payload boundary because
-    /// [`raven_railgun_persistence::WalEntryPayload::PpoiListLeafAdded`]
-    /// uses `u32`. Indices > `u32::MAX` would exceed per-list IMT
-    /// capacity and are rejected with a typed [`MirrorError::Decode`].
+    /// Contiguous position within the list. Narrowed to `u32` at the WAL
+    /// boundary; anything wider exceeds per-list IMT capacity and is rejected.
     index: u64,
     #[serde(rename = "blindedCommitment")]
     blinded_commitment: String,
@@ -637,7 +592,7 @@ impl MirrorSource for UpstreamPpoiMirror {
             .json()
             .await
             .map_err(|e| MirrorError::Decode(format!("/pois-per-blinded-commitment JSON: {e}")))?;
-        // Upstream may key by `bc_hex` with or without `0x` prefix.
+        // Upstream keys by `bc_hex` with or without the `0x` prefix.
         let prefixed = format!("0x{bc_hex}");
         map.get(&bc_hex)
             .or_else(|| map.get(&prefixed))

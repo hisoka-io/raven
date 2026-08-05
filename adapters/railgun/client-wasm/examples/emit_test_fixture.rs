@@ -64,7 +64,7 @@ fn main() {
 
     let params = test_params();
 
-    // Row shape [status, bc[1..32]] mirrors the production T1 PerListStatus encoder.
+    // Row shape [status, bc[1..32]] mirrors the PerListStatus encoder.
     let num_entries = params.ring_dim;
     let mut db = vec![0u8; num_entries * ENTRY_BYTES];
     for idx in 0..(num_entries as u32) {
@@ -158,7 +158,8 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Bincode matching crate-private `WasmInstanceParamsBundle`: 3 `Vec<u8>` fields, u64 LE length prefix, no headers.
+/// Bincode shape of the crate-private `WasmInstanceParamsBundle`: 3 `Vec<u8>`,
+/// u64 LE length prefixes, no header.
 fn bincode_three_byte_vecs(a: &[u8], b: &[u8], c: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(24 + a.len() + b.len() + c.len());
     out.extend_from_slice(

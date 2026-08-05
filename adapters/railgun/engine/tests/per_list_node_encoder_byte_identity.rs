@@ -1,6 +1,5 @@
-//! Byte-identity tests for `PerListNodeEncoder` against an independent
-//! `Imt::node(level, idx)` oracle, plus a cross-encoder migration guard
-//! between `PerListPathEncoder` and `PerListNodeEncoder`.
+//! `PerListNodeEncoder` byte identity against an independent `Imt::node` oracle,
+//! plus a cross-encoder migration guard.
 
 #![allow(
     clippy::expect_used,
@@ -24,11 +23,11 @@ const NODE_BYTES: usize = 32;
 const PATH_RECORD_BYTES: usize = TREE_DEPTH * NODE_BYTES;
 const LIST_KEY: [u8; 32] = [0xA7; 32];
 const LEAVES: u32 = 256;
-// small so a single shard spans many flat rows, exercising row-offset math at every level
+// Small enough that one shard spans many flat rows, exercising row-offset math.
 const ENTRIES_PER_SHARD: u32 = 64;
 
 fn bc_for(idx: u32) -> [u8; 32] {
-    // Fr-canonical (high bytes zero) to pass Poseidon's canonicality check
+    // Fr-canonical, so Poseidon accepts it.
     let mut b = [0u8; 32];
     b[28..32].copy_from_slice(&idx.saturating_add(1).to_be_bytes());
     b
@@ -104,7 +103,7 @@ fn per_list_node_row_byte_identity_at_level_1_and_level_8() {
             row, expected,
             "level-1 row at idx {idx} (flat {flat}) byte mismatch"
         );
-        // non-zero guard: returning the per-level zero hash for a populated subtree would pass == but fail here
+        // A per-level zero hash for a populated subtree would pass == but fail here.
         if (idx as usize) < (LEAVES as usize / 2) {
             assert_ne!(
                 row, [0u8; NODE_BYTES],
@@ -113,7 +112,7 @@ fn per_list_node_row_byte_identity_at_level_1_and_level_8() {
         }
     }
 
-    // with LEAVES = 2^8, level 8 has exactly one populated node; the rest exercise the zero-cache fall-through
+    // Level 8 has exactly one populated node; the rest hit the zero-cache path.
     let level8_indices: Vec<u32> = (0u32..16).collect();
     let mut populated_seen = false;
     for idx in level8_indices {
@@ -173,7 +172,7 @@ fn per_list_node_and_per_list_path_agree_on_auth_path_bytes() {
 
     let mut store = LogicalLeafStore::new();
     for i in 0..LEAVES {
-        // any encoder yields correct store state; the dirty-shard set differs but IMT growth does not
+        // The dirty-shard set differs per encoder, but IMT growth does not.
         apply_wal_entry(
             &mut store,
             &ppoi_payload(i),

@@ -1,6 +1,5 @@
-//! Encoder label + invariant audit tests. Locks `EncoderKind` label parity,
-//! rejection of degenerate inputs, list-key round-trip, and path-record size
-//! pinning.
+//! `EncoderKind` label parity, degenerate-input rejection, list-key round-trip,
+//! and path-record size pinning.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -71,7 +70,6 @@ fn per_leaf_bc_rejects_zero_entries_per_shard() {
 fn per_list_status_rejects_too_small_record_size() {
     let err = PerListStatusEncoder::new(8, ENTRIES, LIST_KEY).expect_err("must reject 8");
     let msg = format!("{err}");
-    // Size floor or other structural rejection both acceptable; assert only Err.
     assert!(!msg.is_empty());
 }
 

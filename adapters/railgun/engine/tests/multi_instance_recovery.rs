@@ -1,7 +1,5 @@
-//! Multi-instance bootstrap routing + recovery tests.
-//!
-//! `#[ignore]`-gated; each test stands up six InsPIRe instances and
-//! only runs in the production-cell sweep.
+//! Multi-instance bootstrap routing and recovery. Gated: each case stands up six
+//! instances.
 
 #![allow(
     clippy::expect_used,
@@ -347,7 +345,8 @@ async fn multi_instance_recovery_byte_identity() {
         }
     }
 
-    // hard-abort, not graceful Shutdown: WAL entries past current_snapshot_seq must survive for replay
+    // Hard abort, not graceful shutdown: entries past current_snapshot_seq must
+    // survive for replay.
     let MultiOrchestratorHandleParts {
         instances,
         channels,

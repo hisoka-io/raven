@@ -1,7 +1,5 @@
-//! Bearer-token hot-rotation tests.
-//!
-//! Verifies that token rotation takes effect immediately for new requests
-//! while leaving in-flight queries (that already cleared auth) uninterrupted.
+//! Token rotation must bind immediately for new requests while leaving in-flight
+//! queries that already cleared auth uninterrupted.
 
 #![allow(
     clippy::expect_used,
@@ -37,7 +35,7 @@ const OLD_TOKEN: &str = "BEARER-TOKEN-OLD-padded-to-min-len-1234";
 const NEW_TOKEN: &str = "BEARER-TOKEN-NEW-padded-to-min-len-5678";
 const INSTANCE_ID: &str = "rotation-test-instance";
 
-// Serialise AppState::new to avoid races on the global metrics recorder.
+// Serialises AppState::new against the global metrics recorder.
 static APPSTATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Default)]
@@ -213,7 +211,6 @@ async fn bearer_rotation_old_succeeds_before_and_new_succeeds_after_with_infligh
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bearer_rotation_does_not_kill_inflight_query_started_under_old_token() {
-    // respond sleeps 750 ms; rotate while the query is mid-sleep; it must still 200.
     let sleepy = Arc::new(SleepyState {
         sleep_ms: parking_lot::Mutex::new(750),
     });
@@ -225,7 +222,6 @@ async fn bearer_rotation_does_not_kill_inflight_query_started_under_old_token() 
         router_clone.oneshot(req).await.expect("dispatch slow")
     });
 
-    // 75 ms is well under the 750 ms sleep; query is still mid-flight when we rotate.
     tokio::time::sleep(Duration::from_millis(75)).await;
 
     app_state.set_read_token(NEW_TOKEN);

@@ -1,10 +1,8 @@
-//! Child subprocess for the real-SIGKILL `migrate-encoder` chaos harness.
+//! Child subprocess for the real-SIGKILL `migrate-encoder` harness.
 //!
-//! Steps through the offline encoder migration and pauses at a requested checkpoint by writing
-//! `{"checkpoint":"<name>"}` to stdout, then sleeping until the parent SIGKILLs it.
-//!
-//! Checkpoints: `pre-re-encode`, `post-re-encode`, `pre-snapshot`, `post-snapshot`,
-//! `pre-manifest-bump`, `post-manifest-bump`.
+//! Pauses at a requested checkpoint (`pre-re-encode`, `post-re-encode`,
+//! `pre-snapshot`, `post-snapshot`, `pre-manifest-bump`, `post-manifest-bump`),
+//! emits `{"checkpoint":"<name>"}`, then sleeps until the parent SIGKILLs it.
 
 #![allow(
     clippy::expect_used,

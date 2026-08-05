@@ -1,8 +1,6 @@
-//! Poseidon-BN254 helpers matching the exact shapes Railgun TS engine uses.
-//!
-//! All inputs/outputs are 32-byte big-endian BN254 Fr field elements
-//! (circomlibjs Buffer convention). See `tests/circomlibjs_parity.rs`
-//! for byte-equality checks against circomlibjs reference vectors.
+//! Poseidon-BN254 helpers matching the upstream TS engine's shapes. Every input
+//! and output is a 32-byte big-endian Fr element (circomlibjs Buffer
+//! convention); `tests/circomlibjs_parity.rs` pins byte equality.
 
 #![deny(missing_docs)]
 #![allow(clippy::items_after_statements)]
@@ -14,7 +12,7 @@ use light_poseidon::{Poseidon, PoseidonHasher};
 /// Errors surfaced by Poseidon helpers.
 #[derive(thiserror::Error, Debug)]
 pub enum PoseidonError {
-    /// `light-poseidon` rejected the input arity (supported range: 1..=12).
+    /// Input arity outside the supported 1..=12 range.
     #[error("light-poseidon: {0}")]
     LightPoseidon(String),
     /// Input bytes are >= BN254 field modulus.
@@ -61,7 +59,7 @@ pub fn hash_n(inputs: &[[u8; 32]]) -> Result<[u8; 32]> {
     Ok(fr_to_be_bytes(hash))
 }
 
-/// `Poseidon(npk, tokenHash, valueAfterFee)` per the Railgun engine's `src/note/shield-note.ts`.
+/// `Poseidon(npk, tokenHash, valueAfterFee)` per upstream `src/note/shield-note.ts`.
 pub fn shield_commitment_hash(
     npk: [u8; 32],
     token_hash: [u8; 32],
@@ -70,7 +68,7 @@ pub fn shield_commitment_hash(
     hash_n(&[npk, token_hash, value_after_fee])
 }
 
-/// `Poseidon(commitmentHash, npk, globalTreePosition)` per the Railgun engine's `src/note/note-util.ts`.
+/// `Poseidon(commitmentHash, npk, globalTreePosition)` per upstream `src/note/note-util.ts`.
 pub fn blinded_commitment(
     commitment_hash: [u8; 32],
     npk: [u8; 32],
@@ -79,12 +77,12 @@ pub fn blinded_commitment(
     hash_n(&[commitment_hash, npk, global_tree_position])
 }
 
-/// `Poseidon(left, right)` for the binary IMT used in PIR path-table and reorg detection.
+/// `Poseidon(left, right)` for the binary IMT.
 pub fn merkle_node(left: [u8; 32], right: [u8; 32]) -> Result<[u8; 32]> {
     hash_n(&[left, right])
 }
 
-/// `keccak256("Railgun") mod SNARK_PRIME`: leaf-level zero value of every Railgun IMT.
+/// `keccak256("Railgun") mod SNARK_PRIME`: the IMT leaf-level zero value.
 #[must_use]
 pub fn railgun_merkle_zero_value() -> [u8; 32] {
     use tiny_keccak::{Hasher, Keccak};
@@ -153,7 +151,7 @@ pub fn token_data_hash_nft(
     out
 }
 
-/// Railgun `TokenType` discriminant (Railgun engine `src/models/formatted-types.ts`).
+/// `TokenType` discriminant per upstream `src/models/formatted-types.ts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TokenType {
@@ -166,7 +164,7 @@ pub enum TokenType {
 }
 
 impl TokenType {
-    /// Decode a `uint8 tokenType` from the chain; out-of-range returns `None`.
+    /// Decode a `uint8 tokenType`; `None` when out of range.
     #[must_use]
     pub fn from_u8(b: u8) -> Option<Self> {
         match b {

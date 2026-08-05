@@ -1,13 +1,11 @@
-// Folds a leaf with PIR-fetched siblings into a root client-side: the
-// adapter returns only auth-path nodes, not the on-chain root. Must
-// match upstream Merkletree.hashLeftRight so the root verifies against
-// upstream verifyMerkleProof.
+// The adapter returns auth-path nodes, not the root, so the fold happens here and
+// must match upstream Merkletree.hashLeftRight to verify under verifyMerkleProof.
 
 import { poseidonHex } from "@railgun-community/poseidon-hash-wasm";
 
 const FIELD_HEX_LEN = 64;
 
-/** Poseidon-BN254 hash of two 64-char no-prefix hex inputs; output matches upstream Merkletree.hashLeftRight byte shape. */
+/** Poseidon-BN254 over two 64-char no-prefix hex inputs. */
 export function hashLeftRight(left: string, right: string): string {
   const a = stripAndPad(left);
   const b = stripAndPad(right);

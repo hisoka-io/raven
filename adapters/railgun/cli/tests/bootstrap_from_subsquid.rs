@@ -1,10 +1,5 @@
-//! Integration tests for `bootstrap-from-subsquid`.
-//!
-//! Each test wires synthetic [`SubsquidLeavesSource`] /
-//! [`ChainOracle`] / [`PpoiEventsSource`] stubs into the bootstrap
-//! algorithm. Subsquid is leaves-only; the chain ABI is the canonical
-//! per-tree post-state oracle (live: byte-identity vs `merkleRoot()`;
-//! static: membership via `rootHistory(tree, root)`).
+//! `bootstrap-from-subsquid` over synthetic [`SubsquidLeavesSource`] /
+//! [`ChainOracle`] / [`PpoiEventsSource`] stubs.
 
 #![allow(
     clippy::expect_used,
@@ -29,16 +24,13 @@ use raven_railgun_cli::bootstrap_subsquid::{
 use raven_railgun_engine::imt::Imt;
 use std::sync::Arc;
 
-/// Synthetic chain oracle covering live byte-identity, static membership,
-/// and the archival-probe (pruning) branch in one stub.
+/// Covers live byte-identity, static membership, and the pruning branch.
 struct StubChain {
     head: u64,
     active_tree: u32,
     chain_root: Mutex<Option<[u8; 32]>>,
-    /// Roots the chain reports as recorded per tree number.
     recorded_roots: Mutex<Vec<(u32, [u8; 32])>>,
     pruning: Mutex<bool>,
-    /// Commitment events the boundary-repair path fetches by block range.
     chain_events: Mutex<Vec<ChainEventRow>>,
 }
 
@@ -191,13 +183,12 @@ impl SubsquidLeavesSource for StubLeaves {
     }
 }
 
-/// Deterministic canonical leaves (leaf = BE(index+1)); returns (rows, local_root).
+/// Canonical leaves `leaf = BE(index+1)` -> `(rows, local_root)`.
 fn synthetic_leaves(count: usize) -> (Vec<CommitmentRow>, [u8; 32]) {
     synthetic_leaves_at_block(count, 1)
 }
 
-/// Like `synthetic_leaves` but stamps a fixed block number so boundary-repair
-/// tests can correlate row blocks with chain-injected events.
+/// [`synthetic_leaves`] with a fixed block number to correlate chain-injected events.
 fn synthetic_leaves_at_block(count: usize, block_number: u64) -> (Vec<CommitmentRow>, [u8; 32]) {
     let mut rows = Vec::with_capacity(count);
     for i in 0..count {

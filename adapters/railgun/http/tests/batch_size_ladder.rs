@@ -1,9 +1,5 @@
-//! `POST /v1/instance/{id}/batch` admits only fixed-size-ladder lengths.
-//!
-//! Before the ladder every length was served, so `|batch|` published the
-//! caller's exact query count. These cases pin that an off-ladder length is now
-//! refused before dispatch, and that a padded length still serves every slot in
-//! order on one pinned snapshot.
+//! `POST /v1/instance/{id}/batch` admits only fixed-size-ladder lengths: serving
+//! an arbitrary `|batch|` would publish the caller's exact query count.
 
 #![allow(
     dead_code,

@@ -1,24 +1,20 @@
-//! Deterministic ChaCha20 RNG wrapper.
-//!
-//! One named type every scheme routes through for reproducible randomness.
-//! Seeded from a 32-byte [`SeedBytes`]; `from_u64` exists for tests.
-//! Schemes that need non-determinism use `OsRng` explicitly.
+//! Deterministic ChaCha20 RNG. Schemes needing non-determinism seed it
+//! from `OsRng` explicitly.
 
 use rand_chacha::rand_core::SeedableRng;
 
 /// 32-byte seed for the deterministic RNG.
 pub type SeedBytes = [u8; 32];
 
-/// Thin wrapper over [`rand_chacha::ChaCha20Rng`] so every scheme routes
-/// through one named type and the underlying PRG can be swapped without
-/// touching call sites.
+/// The one named PRG type every scheme routes through, so the backing
+/// stream cipher can be swapped without touching call sites.
 #[derive(Debug, Clone)]
 pub struct DeterministicRng {
     inner: rand_chacha::ChaCha20Rng,
 }
 
 impl DeterministicRng {
-    /// Construct from a fully-specified 32-byte seed.
+    /// Seed from a full 32-byte key.
     #[must_use]
     pub fn from_seed(seed: SeedBytes) -> Self {
         Self {
@@ -26,12 +22,8 @@ impl DeterministicRng {
         }
     }
 
-    /// Construct from a `u64`, placing its little-endian bytes in the low
-    /// eight bytes of the seed and zero-padding the rest.
-    ///
-    /// Intended for tests and stable reproduction cases; schemes SHOULD
-    /// prefer [`DeterministicRng::from_seed`] with a derived 32-byte seed so
-    /// the key space is not truncated.
+    /// Seed from a `u64` zero-padded to 32 bytes. Truncates the key space -
+    /// for reproduction cases only, never production key material.
     #[must_use]
     pub fn from_u64(seed: u64) -> Self {
         let mut full: SeedBytes = [0u8; 32];
@@ -39,8 +31,7 @@ impl DeterministicRng {
         Self::from_seed(full)
     }
 
-    /// Borrow the inner `ChaCha20Rng` as a [`rand_core::RngCore`] impl for
-    /// passing into APIs that want `&mut R`.
+    /// Borrow the inner `ChaCha20Rng` for APIs that want `&mut R`.
     #[must_use]
     pub fn inner_mut(&mut self) -> &mut rand_chacha::ChaCha20Rng {
         &mut self.inner
@@ -102,8 +93,6 @@ mod tests {
         assert_eq!(got.as_slice(), expected.as_slice());
     }
 
-    /// KAT for ChaCha20 keystream under a non-all-zero key, covering a
-    /// different initialisation regime than the all-zero-key vector.
     #[test]
     fn kat_rfc8439_nonzero_key_first_block() {
         let mut seed = [0u8; 32];
@@ -111,8 +100,7 @@ mod tests {
         let mut rng = DeterministicRng::from_seed(seed);
         let mut got = [0u8; 64];
         rng.fill_bytes(&mut got);
-        // Cross-checked against the `chacha20` crate under the same seed;
-        // any divergence means a rand_chacha backend change or RFC 8439 break.
+        // Cross-checked against the `chacha20` crate under the same seed.
         let expected_hex = concat!(
             "4540f05a9f1fb296d7736e7b208e3c96",
             "eb4fe1834688d2604f450952ed432d41",
@@ -123,8 +111,8 @@ mod tests {
         assert_eq!(got.as_slice(), expected.as_slice());
     }
 
-    /// ChaCha20 is a PRG here, not AEAD; `SeedableRng` pins counter/nonce to 0,
-    /// so RFC 8439 vectors that vary them are unreachable.
+    /// `SeedableRng` pins counter and nonce to 0, so RFC 8439 vectors that
+    /// vary them are unreachable through this type.
     #[test]
     fn aead_scope_note() {}
 

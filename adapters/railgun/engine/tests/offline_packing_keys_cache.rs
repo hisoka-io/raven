@@ -1,8 +1,5 @@
-//! Disk-backed cache tests for InspiRING offline packing keys.
-//!
-//! Shared `(PackParams, OfflinePackingKeys)` built once per process at
-//! the smallest viable cell shape; all tests clone from it to avoid
-//! paying the `O(d^3)` automorph-table cost repeatedly.
+//! Disk-backed offline-packing-key cache. One `(PackParams, OfflinePackingKeys)`
+//! per process, cloned per test, to pay the `O(d^3)` build once.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::print_stderr)]
 
@@ -98,7 +95,7 @@ fn cold_load_writes_cache_then_warm_load_skips_offline_phase() {
          ratio={:.4}",
         warm_elapsed.as_secs_f64() / cold_elapsed.as_secs_f64().max(1e-9)
     );
-    // skip-the-offline-phase invariant is enforced by the warm-path panic closure, not a wall-clock floor
+    // Enforced by the warm-path panic closure, not by a wall-clock floor.
 }
 
 #[test]
@@ -242,7 +239,8 @@ fn concurrent_writes_safe_via_atomic_rename() {
     let cell = test_cell();
     let parts = shared_parts();
 
-    // atomic rename: no reader ever sees a partial file; losing writers overwrite with byte-identical content
+    // Atomic rename: no reader sees a partial file, and losing writers overwrite
+    // with byte-identical content.
     let cell_arc = std::sync::Arc::new(cell.clone());
     let parts_arc = std::sync::Arc::new(parts.clone());
     let cache_arc = std::sync::Arc::new(cache.clone());
@@ -319,7 +317,6 @@ fn production_cell_three_seed_cold_vs_warm() {
         let ok = state.cache.offline_keys().clone();
         let setup_elapsed = setup_start.elapsed();
 
-        // store isolates warm-load timing to the bincode-deserialise + SHA-256 path
         let store_start = Instant::now();
         cache.store(&cell, &pp, &ok).expect("store");
         let store_elapsed = store_start.elapsed();

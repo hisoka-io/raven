@@ -1,8 +1,7 @@
 //! Boot-path rejection of illegal PIR cell shapes.
 //!
-//! An illegal record width returns every byte wrong with no error at query time
-//! (`engine/tests/pir_cell_width_law.rs`), so the only safe place to notice it is
-//! before the server accepts traffic.
+//! An illegal record width returns every byte wrong with no query-time error, so
+//! boot is the only place it can be caught.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -116,8 +115,8 @@ async fn serve_production_multi_rejects_an_illegal_global_record_size() {
     );
 }
 
-/// An operator rows-per-shard below `ring_dim` maps every shard id to a row window narrower
-/// than the shard it writes, and both the re-encode and the query path return success.
+/// Rows-per-shard below `ring_dim` narrows every shard's row window while both the
+/// re-encode and query paths still return success.
 #[tokio::test]
 async fn serve_production_multi_rejects_an_under_width_rows_per_shard() {
     let tmp = tempfile::tempdir().expect("tempdir");

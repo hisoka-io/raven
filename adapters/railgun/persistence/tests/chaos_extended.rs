@@ -1,8 +1,6 @@
-//! Extended chaos scenarios at the persistence-layer surface.
-//!
-//! Covers: cross-instance isolation under a mid-commit kill, partial snapshot dir
-//! on disk-full, WAL `last_block_height` bounding under a feed stall,
-//! encoder-label round-trip visibility, and `PpoiListLeafAdded + Reorg` replay ordering.
+//! Persistence-layer chaos: mid-commit kill isolation, partial snapshot dir on
+//! disk-full, block-height bounding under a feed stall, encoder-label
+//! round-trip, and reorg replay ordering.
 
 #![allow(
     clippy::expect_used,
@@ -97,8 +95,8 @@ fn partial_snapshot_dir_does_not_corrupt_subsequent_recovery() {
     let manifest = manifest_for("partial-snap-test", "per-leaf-bc");
     manifest.save(&layout).expect("save manifest");
 
-    // Simulate disk-full mid-write of snap-2: snap-dir exists with a truncated data.bincode,
-    // but the manifest still points at snap-1 (atomic-rename never fired for snap-2).
+    // Disk-full mid-write of snap-2: its dir is truncated and the manifest still
+    // points at snap-1, because the atomic rename never fired.
     let snap2_dir = layout.snapshot_dir(SnapshotId(2));
     std::fs::create_dir_all(&snap2_dir).expect("mkdir snap-2");
     let snap2_full = Snapshot::build(

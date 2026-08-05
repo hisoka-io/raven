@@ -27,8 +27,7 @@ enum Cmd {
         /// Address to bind for incoming HTTP traffic.
         #[arg(long, default_value = "0.0.0.0:8088")]
         bind: SocketAddr,
-        /// 32-byte list key (lowercase hex, no 0x prefix). Defaults to
-        /// the production OFAC list id.
+        /// 32-byte list key, lowercase hex without `0x`.
         #[arg(long, default_value = DEFAULT_LIST_KEY_HEX)]
         list_key: String,
         /// Number of synthetic blinded commitments to generate.
@@ -37,9 +36,7 @@ enum Cmd {
         /// 32-byte deterministic seed (lowercase hex, no 0x prefix).
         #[arg(long, default_value = DEFAULT_CORPUS_SEED_HEX)]
         corpus_seed: String,
-        /// Optional path to a newline-delimited CSV of blinded
-        /// commitments to flag as ShieldBlocked. One BC per line; lines
-        /// starting with `#` are comments.
+        /// Newline-delimited commitments to flag as ShieldBlocked; `#` comments.
         #[arg(long)]
         blocked_bcs_csv: Option<PathBuf>,
     },

@@ -1,8 +1,5 @@
-//! Server-sent events for the operator dashboard.
-//!
-//! Emits a `status` event (same shape as `/v1/status`) at 5 s cadence with a
-//! 15 s keep-alive against reverse-proxy idle timeouts. Per-connection; no
-//! shared broadcast channel.
+//! Per-connection SSE `status` events on a 5 s cadence, with a 15 s keep-alive
+//! against reverse-proxy idle timeouts.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -33,7 +30,6 @@ pub(crate) async fn events_handler<S: PirScheme>(
     State(app): State<AppState<S>>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     let stream = async_stream::stream! {
-        // Immediate first emit so subscribers don't wait a full cadence.
         let payload = build_status_response(&app);
         match serde_json::to_string(&payload) {
             Ok(json) => yield Ok(SseEvent::default().event("status").data(json)),
@@ -44,7 +40,7 @@ pub(crate) async fn events_handler<S: PirScheme>(
 
         let mut ticker = tokio::time::interval(SSE_CADENCE);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Drop the t=0 tick; the initial emit above already covered it.
+        // The t=0 tick duplicates the initial emit.
         ticker.tick().await;
         loop {
             ticker.tick().await;

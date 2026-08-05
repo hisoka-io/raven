@@ -64,7 +64,6 @@ describe("wire parity: C3 — Poseidon hashLeftRight matches upstream", () => {
   });
 
   it("foldMerkleRoot one-level: indices=0 places leaf on the LEFT", () => {
-    // bit 0 = 0 -> leaf is left child, sibling is right.
     const leaf = UPSTREAM_HASH_LEFT_RIGHT_VECTORS[0].left;
     const sib = UPSTREAM_HASH_LEFT_RIGHT_VECTORS[0].right;
     expect(foldMerkleRoot(leaf, [sib], 0n)).toBe(
@@ -73,7 +72,6 @@ describe("wire parity: C3 — Poseidon hashLeftRight matches upstream", () => {
   });
 
   it("foldMerkleRoot one-level: indices=1 places leaf on the RIGHT", () => {
-    // bit 0 = 1 -> leaf is right child, sibling is left.
     const sib = UPSTREAM_HASH_LEFT_RIGHT_VECTORS[0].left;
     const leaf = UPSTREAM_HASH_LEFT_RIGHT_VECTORS[0].right;
     expect(foldMerkleRoot(leaf, [sib], 1n)).toBe(
@@ -95,7 +93,7 @@ describe("wire parity: C1 — PoisPerListResponse outer key is BC (NOT listKey)"
   });
 
   it("legacy mode round-trips upstream POIsPerListMap shape verbatim", async () => {
-    // Upstream `{ [BC]: { [listKey]: status } }` (poi-merkletree-manager.ts:215-218).
+    // Upstream `{ [BC]: { [listKey]: status } }` (poi-merkletree-manager.ts).
     const expected = {
       [BC_HEX_A]: { [LIST_KEY_HEX]: "Valid" },
       [BC_HEX_B]: { [LIST_KEY_HEX]: "ShieldBlocked" },
@@ -122,14 +120,13 @@ describe("wire parity: C1 — PoisPerListResponse outer key is BC (NOT listKey)"
     expect(got).toEqual(expected);
     expect(got[BC_HEX_A][LIST_KEY_HEX]).toBe("Valid");
     expect(got[BC_HEX_B][LIST_KEY_HEX]).toBe("ShieldBlocked");
-    // Inverted (listKey-outer) shape must not be observable.
     expect(got[LIST_KEY_HEX]).toBeUndefined();
   });
 });
 
 describe("wire parity: C4 — MerkleProof.indices is uint256 (64 hex chars)", () => {
   it("MerkleProof type carries 64-char no-prefix hex indices", () => {
-    // Upstream nToHex(index, UINT_256) -> 64 hex chars, no prefix (merkletree.ts:148).
+    // Upstream nToHex(index, UINT_256) -> 64 hex chars, no prefix (merkletree.ts).
     const proof: import("../src/index").MerkleProof = {
       leaf: "0".repeat(64),
       elements: [],
@@ -258,7 +255,7 @@ describe("wire parity: H17 — upstream passthrough URLs include chainType + cha
   });
 
   it("getPOIMerkleProofs passthrough hits upstream `/merkle-proofs/<chainType>/<chainID>`", async () => {
-    // Stale freshness forces upstream fallback; segment is `merkle-proofs`, not `poi-merkle-proofs` (api.ts:739).
+    // Stale freshness forces upstream fallback; segment is `merkle-proofs`, not `poi-merkle-proofs` (api.ts).
     mainServer.route(
       (req) => req.url === "/v1/poi/merkle-proofs",
       (_req, _body, res) => {

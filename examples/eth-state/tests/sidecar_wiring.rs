@@ -1,9 +1,5 @@
-//! Sidecar-wiring gate: a generic flat-state PirScheme served by a main (Live) engine
-//! and a Sidecar engine, read through the consume-both client fan-out.
-//!
-//! Proves: both engines respond; the fan-out selects the correct engine on decrypted
-//! CONTENT (never arrival order); balances decode byte-identically; main and sidecar
-//! responses are byte-length-uniform (the size side-channel control).
+//! A flat-state scheme served by a main plus a sidecar engine, read through the client
+//! fan-out. Response byte-length uniformity across the two engines is the size-channel control.
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -25,7 +21,6 @@ use raven_core::InstanceId;
 use raven_inspire::params::InspireParams;
 use raven_server::{Engine, InstanceRole, PirInstance};
 
-/// A present balance record: byte 0 the presence tag, the u128 big-endian in the low 16 bytes.
 fn expected_be(balance: u128) -> [u8; ENTRY_SIZE] {
     let mut rec = [0u8; ENTRY_SIZE];
     rec[0] = eth_state::PRESENT_TAG;
@@ -33,7 +28,6 @@ fn expected_be(balance: u128) -> [u8; ENTRY_SIZE] {
     rec
 }
 
-/// A flat record buffer where every leaf is present (tagged).
 fn build_db(balances: &[u128]) -> Vec<u8> {
     let mut db = Vec::with_capacity(balances.len() * ENTRY_SIZE);
     for &b in balances {
@@ -46,8 +40,7 @@ fn build_db(balances: &[u128]) -> Vec<u8> {
 fn sidecar_wiring() {
     let params = InspireParams::secure_128_d2048();
 
-    // main corpus: leaf 0=100, 1=200, 2=300, 3=0 (all present/tagged). The sidecar holds only the
-    // changed leaf 2 (fresher 999, tagged); every other sidecar leaf is all-zero (absent).
+    // The sidecar holds only the changed leaf 2; every other sidecar leaf reads as absent.
     let main_db = build_db(&[100, 200, 300, 0]);
     let mut side_db = vec![0u8; 4 * ENTRY_SIZE];
     side_db[2 * ENTRY_SIZE..3 * ENTRY_SIZE].copy_from_slice(&expected_be(999));
@@ -62,7 +55,6 @@ fn sidecar_wiring() {
     let side_session =
         build_session(&side_state.crs, side_sk, params.sigma, 2).expect("sidecar session");
 
-    // Snapshot the client-side inputs before the states move into the instances.
     let main_shard = main_state.encoded_db.config.clone();
     let side_shard = side_state.encoded_db.config.clone();
     let main_crs = main_state.crs.clone();
@@ -100,7 +92,6 @@ fn sidecar_wiring() {
         shard_config: &side_shard,
     };
 
-    // main-only account (leaf 0): sidecar absent -> select main -> 100.
     let (bytes0, eng0) =
         block_on(read_balance_consume_both(&main_h, &side_h, 0)).expect("read leaf 0");
     assert_eq!(
@@ -114,7 +105,6 @@ fn sidecar_wiring() {
         "leaf 0 balance byte-identical"
     );
 
-    // sidecar-held account (leaf 2): sidecar present -> select sidecar -> 999.
     let (bytes2, eng2) =
         block_on(read_balance_consume_both(&main_h, &side_h, 2)).expect("read leaf 2");
     assert_eq!(
@@ -128,8 +118,7 @@ fn sidecar_wiring() {
         "leaf 2 balance byte-identical"
     );
 
-    // Uniform wire shape: both engines' responses serialize to the same byte length,
-    // so a response-size observer cannot infer which engine answered.
+    // A response-size observer must not be able to infer which engine answered.
     let (_sm, q_m) =
         build_seeded_query_rust(&main_session, &params, &main_shard, 2).expect("main query");
     let (_es, r_m) = main_inst.query(&q_m).expect("main respond");

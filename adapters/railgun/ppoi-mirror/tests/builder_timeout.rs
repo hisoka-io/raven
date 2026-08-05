@@ -1,13 +1,6 @@
-//! Regression-guard: the `UpstreamPpoiMirror` constructor MUST build a
-//! `reqwest::Client` with an explicit request-level timeout. Without
-//! it, a silent upstream (TCP accepted, never written to) hangs the
-//! mirror's `fetch_status_*` calls indefinitely.
-//!
-//! The configured timeout (per `lib.rs`) is `Duration::from_secs(10)`.
-//! This test brackets the call with 45s; the configured 10s timeout
-//! must fire well within the bracket. If the builder's `.timeout(..)`
-//! call is ever removed, the request never returns and this test
-//! hits the outer 45s timeout and fails, surfacing the regression.
+//! The mirror's `reqwest::Client` MUST carry a request-level timeout; without
+//! it a silent upstream (TCP accepted, never written to) hangs `fetch_status_*`
+//! forever. The outer 45s bracket fails if the configured 10s timeout is gone.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
@@ -16,9 +9,8 @@ use raven_railgun_ppoi_mirror::{MirrorConfig, MirrorSource, UpstreamPpoiMirror};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ppoi_mirror_builder_carries_request_timeout() {
-    // Bind a TCP listener that accepts connections but never writes
-    // back. The mirror's HTTP request will hang at the response read
-    // until the request-level timeout fires.
+    // Accepts connections but never writes, so the request hangs at the response
+    // read until the request-level timeout fires.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind silent listener");
@@ -29,7 +21,6 @@ async fn ppoi_mirror_builder_carries_request_timeout() {
                 break;
             };
             tokio::spawn(async move {
-                // Hold the stream forever; never write a byte.
                 let _hold = stream;
                 std::future::pending::<()>().await;
             });

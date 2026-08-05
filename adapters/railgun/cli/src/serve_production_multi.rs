@@ -1,7 +1,4 @@
-//! Multi-instance production serve path.
-//!
-//! Boots N PIR instances from a single TOML config file and serves them on one axum router.
-//! Tests use `run_with_listener` to drive shutdown via a oneshot future.
+//! Boots N PIR instances from one TOML config onto a single axum router.
 
 #![allow(clippy::too_many_lines, clippy::missing_errors_doc)]
 
@@ -174,8 +171,8 @@ impl From<PoolStrategyString> for raven_railgun_indexer::rpc_pool::PoolStrategy 
 #[derive(Debug, Deserialize)]
 struct GlobalSection {
     bind: SocketAddr,
-    /// Inline bearer token. Mutually exclusive with `token_file` and
-    /// [`BEARER_TOKEN_ENV`]; forces a 600-mode config file.
+    /// Mutually exclusive with `token_file` and [`BEARER_TOKEN_ENV`]; forces a
+    /// 600-mode config file.
     #[serde(default)]
     token: Option<String>,
     /// 600-mode file holding the bearer token; the production path.
@@ -338,8 +335,7 @@ pub struct MultiServeOptions {
     /// Tests set this to skip the live RPC + indexer worker.
     pub skip_chain_workers: bool,
     pub skip_mirror_workers: bool,
-    /// Cell row count for instances absent from `instance_entries`, and the
-    /// default handed to the auto-spawn / list-template drivers.
+    /// Fallback for instances absent from `instance_entries`.
     pub entries: usize,
     /// Resolved cell row count per configured instance.
     pub instance_entries: HashMap<InstanceId, usize>,
@@ -352,8 +348,7 @@ pub struct MultiServeOptions {
     pub tree_fill_threshold: Option<f32>,
     /// When `Some` on Unix, installs a SIGHUP handler for TOML hot-reload.
     pub reload_config_path: Option<PathBuf>,
-    /// WebSocket endpoint for chain indexer primary transport (HTTP RPC is used as fallback).
-    /// `None` keeps the existing HTTP-only indexer behavior.
+    /// Primary indexer transport; HTTP RPC is the fallback.
     pub ws_endpoint: Option<String>,
     /// `HttpConfig.rate_limit_rps` override (`None` keeps the demo default).
     pub rate_limit_rps: Option<u64>,
@@ -367,7 +362,7 @@ pub struct MultiServeOptions {
     pub trusted_proxy_cidrs: Option<Vec<String>>,
     /// `HttpConfig.metrics_public` override.
     pub metrics_public: Option<bool>,
-    /// `HttpConfig.session_eviction_interval_secs` override; also drives the per-instance ticker.
+    /// `HttpConfig.session_eviction_interval_secs` override; drives the per-instance ticker.
     pub session_eviction_interval_secs: Option<u64>,
     /// Indexer Layer 1 reorg-window cache path; absent = ephemeral.
     pub reorg_window_path: Option<PathBuf>,
@@ -448,8 +443,7 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
             InstanceRole::Static => SnapshotPolicy::static_default(),
             _ => SnapshotPolicy::default(),
         };
-        // An explicit width is carried verbatim so `validate_cell_shape` rejects a
-        // conflict with the encoder's canonical layout instead of substituting.
+        // Verbatim so `validate_cell_shape` rejects a conflict instead of substituting.
         let record_size = raw.record_size.unwrap_or_else(|| {
             let effective = encoder.effective_record_size(fallback_record_size);
             crate::auto_spawn_driver::warn_on_record_size_override(
@@ -564,7 +558,6 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         }
         Some(cfg)
     } else {
-        // Synthesize from the first chain-tree template so driver wiring is unchanged.
         parsed
             .instance_template
             .iter()
@@ -623,8 +616,6 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         }
     }
 
-    // Rejects the example placeholder, a token reachable by group or other, and
-    // any count of token sources other than one.
     let bearer = resolve_bearer_token(
         parsed.global.token.as_deref(),
         parsed.global.token_file.as_deref(),
@@ -633,8 +624,8 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
     )?;
     tracing::info!(source = bearer.source.label(), "bearer token resolved");
 
-    // Checked here, not only in `HttpConfig::validate`, so an exposed-origin
-    // trust posture is refused before bootstrap does any chain work.
+    // Ahead of `HttpConfig::validate` so an exposed-origin posture is refused
+    // before bootstrap does any chain work.
     resolve_declared_ranges(
         parsed.global.trust_proxy_header.unwrap_or(false),
         parsed.global.trusted_proxy_cidrs.as_deref().unwrap_or(&[]),
@@ -930,9 +921,8 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         *observer.lock() = Some(view);
     }
 
-    // Per-tree floor = max(toml, max(manifest_height, wal_height)). A single
-    // global floor would either re-scan below the recovered prefix or skip events
-    // for the lower-height trees; per-tree drop at dispatch closes both windows.
+    // Per-tree floor; a single global floor would either re-scan below the
+    // recovered prefix or skip events for the lower-height trees.
     let mut per_tree_recovered: BTreeMap<u32, u64> = BTreeMap::new();
     for h in &bootstrap.handles.instances {
         if let DataSourceFilter::ChainTreeNumber(tree) = h.config.data_source {
@@ -963,8 +953,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         }
     }
 
-    // Default the reorg-window sidecar beside the first instance's data_dir so a
-    // restart resumes reorg state without forcing `[global].reorg_window_path`.
+    // Sidecar beside the first data_dir so restarts resume reorg state unconfigured.
     let resolved_reorg_window_path = opts.reorg_window_path.clone().or_else(|| {
         bootstrap
             .handles
@@ -1022,8 +1011,8 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     let app_state =
         AppState::new(engine, http_config).map_err(|e| anyhow::anyhow!("AppState::new: {e}"))?;
 
-    // Registry Arc retained so shutdown can drain auto-spawned consumers and send
-    // ConsumerEvent::Shutdown, else they skip the final-drive WAL flush.
+    // Retained so shutdown can drain auto-spawned consumers; else they skip the
+    // final WAL flush.
     let auto_spawn_state: Option<AutoSpawnWiring> = if let Some(cfg) = opts
         .auto_spawn
         .as_ref()
@@ -1139,13 +1128,11 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         .collect();
     let app_state = app_state.with_instance_metrics(per_instance_metrics);
 
-    // Sweeper drops past-TTL session entries even if the bearer never repeats.
     let sweeper_handle = app_state.start_session_sweeper(std::time::Duration::from_secs(60));
     auxiliary_tasks.push(sweeper_handle);
     auxiliary_tasks.push(app_state.start_packing_key_sweeper(std::time::Duration::from_secs(60)));
 
-    // Per-instance heartbeat eviction bounds resident memory by dropping every
-    // live session once per interval. `0` disables.
+    // Bounds resident memory by dropping every live session per interval.
     let eviction_secs = app_state.config.session_eviction_interval_secs;
     if eviction_secs > 0 {
         for inst in &bootstrap.handles.instances {
@@ -1208,13 +1195,12 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     }
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), bootstrap.handles.router).await;
 
-    // Abort aux tasks first so a SIGHUP can't race driver/registry teardown.
+    // Before teardown so a SIGHUP can't race driver/registry shutdown.
     for t in auxiliary_tasks {
         t.abort();
     }
 
-    // Drain consumers before aborting the driver, else registry drain races an
-    // in-flight tree-observed event.
+    // Before the driver: else registry drain races an in-flight tree-observed event.
     if let Some(wiring) = auto_spawn_state {
         let AutoSpawnWiring {
             driver,
@@ -1299,8 +1285,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         driver.abort();
     }
 
-    // Cooperative drain of `mode_mirror` so a panic surfaces as a logged join
-    // error instead of being swallowed by `abort()`.
+    // Cooperative so a panic surfaces as a join error rather than being aborted away.
     if let Some(mut workers) = chain_workers {
         workers
             .shutdown_mode_mirror(std::time::Duration::from_secs(5))
@@ -1385,8 +1370,7 @@ async fn run_sighup_reload_loop(
             );
         }
 
-        // Multiple chain-tree templates apply in order, last wins; each is logged
-        // so > 1 template per SIGHUP is not silently dropped.
+        // Last template wins; each is logged so extras are not silently dropped.
         let added: Vec<&InstanceTemplateToml> = opts
             .instance_templates
             .iter()
@@ -1457,10 +1441,9 @@ async fn run_sighup_reload_loop(
     }
 }
 
-/// `max(toml_start_block, max(recovered))` so the indexer never scans below the
-/// slowest recovered baseline. Single-floor deployments only: trees bootstrapped
-/// at different heights MUST use [`compute_effective_start_block_per_tree`], else
-/// the global MAX skips every event in `(min_recovered, max_recovered]`.
+/// `max(toml_start_block, max(recovered))`. Single-floor deployments ONLY: mixed
+/// bootstrap heights MUST use [`compute_effective_start_block_per_tree`], else the
+/// global max skips every event in `(min_recovered, max_recovered]`.
 #[must_use]
 pub fn compute_effective_start_block(
     toml_start_block: u64,
@@ -1470,9 +1453,8 @@ pub fn compute_effective_start_block(
     toml_start_block.max(max_recovered)
 }
 
-/// Per-tree `max(toml_start_block, recovered)` so a manual override never
-/// backslides. The single-cursor indexer scans from `min(per_tree)` and the
-/// route layer drops events for trees whose floor exceeds the event height.
+/// Per-tree `max(toml_start_block, recovered)`. The single-cursor indexer scans
+/// from `min(per_tree)`; dispatch drops events below a tree's own floor.
 #[must_use]
 pub fn compute_effective_start_block_per_tree(
     toml_start_block: u64,
@@ -1501,7 +1483,7 @@ pub fn compute_trigger_threshold(threshold: f32, tree_max_items: u32) -> usize {
     usize::try_from(rounded_u64).unwrap_or(0)
 }
 
-/// Must mirror the engine's `TREE_MAX_ITEMS`; update if Railgun ever changes tree depth.
+/// Must mirror the engine's `TREE_MAX_ITEMS`.
 const WATCHER_TREE_MAX_ITEMS: u32 = 65_536;
 const WATCHER_TREE_FILL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -1641,7 +1623,6 @@ fn wire_auto_spawn(
 
     let runtime = runtime_from_auto_spawn_section(cfg, opts.entries);
 
-    // Spawn log beside the first instance's data_dir so it survives restarts.
     let spawn_log_dir = match initial_handles.first() {
         Some(h) => h
             .config
@@ -1967,12 +1948,10 @@ async fn spawn_chain_indexer(
         Ok(pool)
     };
 
-    // Always created; the receiver is only used by `spawn_mode_mirror` under WS.
     let (mode_mirror_shutdown_tx, mode_mirror_shutdown_rx) = tokio::sync::watch::channel(false);
 
     let (chain_source, rpc_pool, chain_source_mode, mode_mirror) =
         match (opts.ws_endpoint.as_deref(), opts.rpc_pool.as_ref()) {
-            // WS primary + multi-endpoint pooled fallback.
             (Some(ws_url), Some(pool_cfg)) if pool_cfg.urls.len() >= 2 => {
                 let pool = build_pool(pool_cfg)?;
                 let pooled = Arc::new(PooledRpcChainSource::new(
@@ -1995,7 +1974,6 @@ async fn spawn_chain_indexer(
                     Some(mirror),
                 )
             }
-            // WS primary + single-endpoint HTTP fallback (either single-URL pool or rpc_url).
             (Some(ws_url), _) => {
                 let single_url = opts
                     .rpc_pool
@@ -2023,7 +2001,6 @@ async fn spawn_chain_indexer(
                     Some(mirror),
                 )
             }
-            // No WS, multi-endpoint pooled HTTP.
             (None, Some(pool_cfg)) if pool_cfg.urls.len() >= 2 => {
                 let pool = build_pool(pool_cfg)?;
                 let pooled = Arc::new(PooledRpcChainSource::new(
@@ -2033,7 +2010,6 @@ async fn spawn_chain_indexer(
                 ));
                 (DynChainSource::Pooled(pooled), Some(pool), None, None)
             }
-            // No WS, single-endpoint HTTP (legacy default).
             _ => {
                 let url = opts
                     .rpc_pool
@@ -2142,8 +2118,8 @@ fn spawn_mode_mirror_pooled(
 }
 
 impl ChainWorkers {
-    /// Cooperative shutdown of `mode_mirror`; await before dropping `Self` so a
-    /// panic is observed rather than hidden by `Drop`'s `abort()`. `false` on timeout.
+    /// Await before dropping `Self` so a `mode_mirror` panic is observed rather
+    /// than hidden by `Drop`'s `abort()`. `false` on timeout.
     async fn shutdown_mode_mirror(&mut self, timeout: std::time::Duration) -> bool {
         let Some(handle) = self.mode_mirror.take() else {
             return true;
@@ -2489,9 +2465,8 @@ data_source = { kind = "indexer", filter = { tree_number = 0 } }
             "entries < 2^16 must breach the small-cell threshold"
         );
 
-        // Encoder switched from per-leaf-path to per-leaf-bc: path encoders pin
-        // PATH_RECORD_BYTES, so `[global].record_size = 32` no longer reaches the
-        // instance and the 32-byte cell this case exists to pin would vanish.
+        // per-leaf-bc, not a path encoder: path encoders pin PATH_RECORD_BYTES and
+        // `[global].record_size = 32` would never reach the instance.
         let body_small = r#"
 [global]
 bind = "127.0.0.1:0"
@@ -2611,8 +2586,7 @@ data_source = { kind = "mirror", list_key = "00000000000000000000000000000000000
 
     const OFAC_LIST_KEY: &str = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88";
 
-    /// The deployed topology: 3 static + 1 live commit-tree on `per-node`,
-    /// one `per-list-status` and one `per-list-node` PPOI instance.
+    /// Deployed topology: 3 static + 1 live commit-tree, plus two PPOI instances.
     fn live_six_instance_toml(entries_override: Option<usize>) -> String {
         use std::fmt::Write as _;
         let mut body = String::from(

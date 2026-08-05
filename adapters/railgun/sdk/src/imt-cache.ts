@@ -14,7 +14,7 @@ class InMemoryLru {
   get(key: string): Uint8Array | undefined {
     const v = this.map.get(key);
     if (v !== undefined) {
-      // re-insert to mark most-recently-used (Map keeps insertion order)
+      // Map keeps insertion order, so re-inserting marks most-recently-used.
       this.map.delete(key);
       this.map.set(key, v);
     }
@@ -207,7 +207,7 @@ export class ImtCache {
     }
   }
 
-  /** Drop both layers if epoch or schema version advanced, so no stale node survives a reorg/schema bump. */
+  /** Drop both layers on an epoch or schema advance, so no node survives a reorg. */
   noteFreshness(epochTag: string, schemaVersion: number): void {
     if (epochTag === this.currentEpochTag && schemaVersion === this.currentSchemaVersion) {
       return;
@@ -227,7 +227,6 @@ export class ImtCache {
       try {
         await this.idb.clear();
       } catch {
-        // best-effort
       }
     }
   }

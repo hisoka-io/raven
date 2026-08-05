@@ -1,8 +1,5 @@
-//! PIR-table encoder trait + implementations.
-//!
-//! Encoders are pure functions over `(LogicalLeafStore, shard_id)` and are
-//! reconstructible from CRS + cell shape, so the persistence layer never
-//! serializes encoder state.
+//! PIR-table encoders. Pure functions over `(LogicalLeafStore, shard_id)` and
+//! reconstructible from CRS + cell shape, so encoder state is never persisted.
 
 use crate::imt::TREE_DEPTH;
 use crate::inspire::LogicalLeafStore;
@@ -17,8 +14,8 @@ pub mod list;
 pub use leaf::{PerLeafCommitmentEncoder, PerLeafEncoder, PerLeafPathEncoder, PerNodeEncoder};
 pub use list::{PerListNodeEncoder, PerListPathEncoder, PerListStatusEncoder};
 
-/// Static label registry - every concrete encoder exports a stable
-/// label string for `/v1/status` + manifest `encoder_label` matching.
+/// Stable encoder labels, surfaced on `/v1/status` and matched against the
+/// manifest's `encoder_label`.
 pub mod labels {
     /// T1 BC-membership encoder (default).
     pub const PER_LEAF_BC: &str = "per-leaf-bc";
@@ -30,16 +27,12 @@ pub mod labels {
     pub const PER_LIST_STATUS: &str = "per-list-status";
     /// T2 PPOI auth-path encoder.
     pub const PER_LIST_PATH: &str = "per-list-path";
-    /// Per-list Merkle-node encoder; row = 32 B Merkle node from the
-    /// per-list PPOI IMT. Symmetric to `per-node` but keyed on `list_key`.
+    /// Per-list Merkle-node encoder; `per-node` keyed on `list_key`.
     pub const PER_LIST_NODE: &str = "per-list-node";
 }
 
-/// Operator-facing encoder discriminator. Carries per-encoder config
-/// (e.g. `tree_number`) needed to construct the underlying impl.
-///
-/// Persisted in the manifest as `encoder_label`; bootstrap rejects
-/// loading a manifest whose label diverges from the configured encoder.
+/// Operator-facing encoder discriminator with its construction config.
+/// Persisted as `encoder_label`; bootstrap rejects a diverging label.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "kind")]
 pub enum EncoderKind {
@@ -68,9 +61,8 @@ pub enum EncoderKind {
         /// 32-byte list_key this encoder is pinned to.
         list_key: [u8; 32],
     },
-    /// Per-list Merkle-node encoder; row = 32 B Merkle node from the
-    /// per-list PPOI IMT, in the same flat-global-index layout as
-    /// [`PerNode`]. Pinned to one `list_key`.
+    /// Per-list Merkle-node encoder: [`PerNode`]'s layout over the per-list
+    /// IMT, pinned to one `list_key`.
     PerListNode {
         /// 32-byte list_key this encoder is pinned to.
         list_key: [u8; 32],
@@ -91,11 +83,8 @@ impl EncoderKind {
         }
     }
 
-    /// Minimum `total_entries` an `EncodedDatabase` must hold for this encoder.
-    ///
-    /// Per-node encoders flat-index every IMT node, needing
-    /// `PER_NODE_TOTAL_NODES` slots; leaf-keyed encoders flat-index by leaf,
-    /// needing `LEAVES_PER_TREE`. Undersizing makes `re_encode_shard` fail on
+    /// Minimum `total_entries`: node-keyed encoders flat-index every IMT node,
+    /// leaf-keyed encoders every leaf. Undersizing fails `re_encode_shard` on
     /// dirty-shard ids past the end.
     #[must_use]
     pub const fn min_total_entries(&self) -> u32 {
@@ -108,10 +97,8 @@ impl EncoderKind {
         }
     }
 
-    /// Recommended `total_entries` cell size per encoder kind.
-    ///
-    /// Leaf-keyed: `LEAVES_PER_TREE` (65,536). Per-node: `PER_NODE_TOTAL_NODES`
-    /// rounded up to the next 2048-multiple (131,072) so every dirty-shard id fits.
+    /// Recommended cell size: `LEAVES_PER_TREE` leaf-keyed, `PER_NODE_TOTAL_NODES`
+    /// rounded up to a 2048-multiple node-keyed, so every dirty-shard id fits.
     #[must_use]
     pub const fn default_total_entries(&self) -> usize {
         match self {
@@ -152,10 +139,9 @@ impl EncoderKind {
         }
     }
 
-    /// Construct the underlying encoder impl for `(record_size, entries_per_shard)`.
-    /// Variants with a canonical row layout ignore `record_size`; ask
-    /// [`Self::effective_record_size`] first, or gate on [`validate_cell_shape`],
-    /// so the substitution is never silent.
+    /// Construct the encoder for `(record_size, entries_per_shard)`. Variants
+    /// with a canonical row layout ignore `record_size`, so gate on
+    /// [`Self::effective_record_size`] or [`validate_cell_shape`] first.
     pub fn build(
         &self,
         record_size: usize,
@@ -216,14 +202,11 @@ pub const fn default_concurrency_for(encoder: &EncoderKind) -> usize {
     encoder.default_concurrency()
 }
 
-/// Validate `total_entries` against the encoder's minimum cell shape.
-///
-/// Pre-allocation check: shard count is `total_entries / entries_per_shard`, so
-/// an undersized cell allocates fewer shards than the encoder dirties and
-/// `re_encode_shard` fails at runtime on shard ids past the end.
+/// Validate `total_entries` before allocation: an undersized cell allocates
+/// fewer shards than the encoder dirties, failing `re_encode_shard` at runtime.
 ///
 /// # Errors
-/// Returns [`AdapterError::InvalidQuery`] when the cell is too small for the encoder.
+/// [`AdapterError::InvalidQuery`] when the cell is too small for the encoder.
 pub fn validate_total_entries(encoder: &EncoderKind, total_entries: usize) -> Result<()> {
     let min = encoder.min_total_entries() as usize;
     if total_entries < min {
@@ -243,25 +226,20 @@ pub fn pir_cell_columns(entry_size: usize) -> usize {
     entry_size.div_ceil(2).max(1)
 }
 
-/// Whether `entry_size` is a legal cell width at `ring_dim`.
-///
-/// The packing generator is `2n / gamma + 1` for `gamma < n` and `5` otherwise;
-/// the division is integer, so a column count outside this law yields the wrong
-/// automorphism and plaintext that decrypts to unrelated bytes with no error on
-/// the query path. Empirical ladder: `engine/tests/pir_cell_width_law.rs`.
+/// Whether `entry_size` is a legal cell width at `ring_dim`. The packing
+/// generator is `2n / gamma + 1` under integer division, so an off-law column
+/// count picks the wrong automorphism and silently decrypts to unrelated bytes.
+/// Measured ladder: `engine/tests/pir_cell_width_law.rs`.
 #[must_use]
 pub fn is_legal_cell_width(entry_size: usize, ring_dim: usize) -> bool {
     let cols = pir_cell_columns(entry_size);
     entry_size > 0 && cols.is_power_of_two() && cols <= ring_dim / 2
 }
 
-/// Next ladder width at or above `entry_size` - `entry_size` rounded up to a power-of-two
-/// width - or `None` for 0 and for widths past the `ring_dim` ceiling.
-///
-/// Not the smallest width [`is_legal_cell_width`] accepts: 63 and 511 satisfy the predicate
-/// and this still returns 64 and 512. The predicate only tests the induced column count,
-/// while the seven widths in `engine/tests/pir_cell_width_law.rs` are the ones measured end
-/// to end, so a remedy points at a measured width.
+/// `entry_size` rounded up to the next power-of-two ladder width, or `None`
+/// past the `ring_dim` ceiling. Deliberately coarser than
+/// [`is_legal_cell_width`] - which only tests the induced column count - so a
+/// remedy always points at a width measured end to end.
 #[must_use]
 pub fn next_legal_cell_width(entry_size: usize, ring_dim: usize) -> Option<usize> {
     if entry_size == 0 {
@@ -274,8 +252,8 @@ pub fn next_legal_cell_width(entry_size: usize, ring_dim: usize) -> Option<usize
 /// Validate a record width against [`is_legal_cell_width`].
 ///
 /// # Errors
-/// Returns [`AdapterError::InvalidQuery`] when `entry_size` is zero or induces a
-/// column count that is not a power of two no larger than `ring_dim / 2`.
+/// [`AdapterError::InvalidQuery`] when `entry_size` is zero or induces a column
+/// count that is not a power of two no larger than `ring_dim / 2`.
 pub fn validate_cell_width(entry_size: usize, ring_dim: usize) -> Result<()> {
     if entry_size == 0 {
         return Err(AdapterError::InvalidQuery(
@@ -306,9 +284,9 @@ pub fn validate_cell_width(entry_size: usize, ring_dim: usize) -> Result<()> {
 /// Validate the operator-supplied cell shape for `encoder` at `ring_dim`.
 ///
 /// # Errors
-/// Returns [`AdapterError::InvalidQuery`] when the cell undersizes the encoder, when
-/// `record_size` differs from a canonical layout the encoder would substitute, or
-/// when the width breaks [`is_legal_cell_width`].
+/// [`AdapterError::InvalidQuery`] when the cell undersizes the encoder, when
+/// `record_size` would be silently substituted, or when the width breaks
+/// [`is_legal_cell_width`].
 pub fn validate_cell_shape(
     encoder: &EncoderKind,
     total_entries: usize,
@@ -333,17 +311,12 @@ pub fn validate_cell_shape(
     validate_cell_width(record_size, ring_dim)
 }
 
-/// Validate the rows-per-shard an encoder will be built with against `ring_dim`.
-///
-/// `setup` sizes every shard at `ring_dim * entry_size` bytes, so
-/// `ShardConfig::entries_per_shard` is exactly `ring_dim` rows at any record width. Below that
-/// the encoder maps shard `s` to the row window starting at `s * entries_per_shard` while the
-/// shard it overwrites starts at `s * ring_dim`, and the rebuilt buffer is still one
-/// well-formed shard, so nothing on the re-encode or query path returns an error. Above it
-/// `encode_database` refuses the shard config.
+/// Require `entries_per_shard == ring_dim`: shards are `ring_dim * entry_size`
+/// bytes, and a smaller value silently offsets the encoder's row window against
+/// the shard it overwrites with no error anywhere on the re-encode or query path.
 ///
 /// # Errors
-/// Returns [`AdapterError::InvalidQuery`] unless `entries_per_shard == ring_dim`.
+/// [`AdapterError::InvalidQuery`] unless `entries_per_shard == ring_dim`.
 pub fn validate_rows_per_shard(entries_per_shard: u32, ring_dim: usize) -> Result<()> {
     if entries_per_shard as usize == ring_dim {
         return Ok(());
@@ -358,13 +331,10 @@ pub fn validate_rows_per_shard(entries_per_shard: u32, ring_dim: usize) -> Resul
     )))
 }
 
-/// Shard-dirty walk shared by the path encoders. Inserting `leaf_index`
-/// invalidates the stored path of every prior leaf sharing an ancestor: at
-/// level `k` those are `[block_start, leaf_index)` where
-/// `block_start = (leaf_index >> k) << k`.
-///
-/// Mapped per level to the shard range `[block_start/eps ..= (leaf_index-1)/eps]`
-/// so the cost is `O(num_shards x TREE_DEPTH)`, not `O(leaf_index x TREE_DEPTH)`.
+/// Shard-dirty walk for the path encoders. Inserting `leaf_index` invalidates
+/// every prior leaf sharing an ancestor - `[(leaf_index >> k) << k, leaf_index)`
+/// at level `k` - mapped per level to a shard range so the cost is
+/// `O(num_shards x TREE_DEPTH)`, not `O(leaf_index x TREE_DEPTH)`.
 pub(crate) fn path_affected_shards_into(
     entries_per_shard: u32,
     leaf_index: u32,
@@ -390,8 +360,7 @@ pub(crate) fn path_affected_shards_into(
     }
 }
 
-/// Per-shard byte-layout encoder consumed by the consumer task at commit
-/// time.
+/// Per-shard byte-layout encoder, driven at commit time.
 pub trait PirTableEncoder: Send + Sync + std::fmt::Debug {
     /// Bytes per row.
     fn record_size(&self) -> usize;
@@ -405,8 +374,7 @@ pub trait PirTableEncoder: Send + Sync + std::fmt::Debug {
     /// Shard ids whose stored rows must be re-encoded after a leaf insert.
     fn affected_shards_for_leaf(&self, tree: u32, leaf_index: u32) -> BTreeSet<u32>;
 
-    /// Shard ids re-encoded after a per-list PPOI leaf insert. Default
-    /// no-op for chain-tree encoders; per-list encoders override.
+    /// Shard ids dirtied by a per-list leaf insert; no-op for chain-tree encoders.
     fn affected_shards_for_ppoi_leaf(
         &self,
         _list_key: &[u8; 32],
@@ -415,8 +383,7 @@ pub trait PirTableEncoder: Send + Sync + std::fmt::Debug {
         BTreeSet::new()
     }
 
-    /// Shard ids re-encoded after a per-list PPOI status update. Default
-    /// no-op for chain-tree encoders; T1 status encoders override.
+    /// Shard ids dirtied by a per-list status update; no-op for chain-tree encoders.
     fn affected_shards_for_ppoi_status(
         &self,
         _list_key: &[u8; 32],
@@ -777,8 +744,8 @@ mod tests {
 
     #[test]
     fn per_list_node_max_shard_id_overflows_undersized_cell_regression() {
-        // At an undersized 65,536-entry cell (32 shards) PerListNodeEncoder
-        // dirties shard ids past 31, so the cell must be sized off PER_NODE_TOTAL_NODES.
+        // A 65,536-entry cell gives 32 shards, but the node encoder dirties ids
+        // past 31, so the cell must be sized off PER_NODE_TOTAL_NODES.
         let entries_per_shard: u32 = 2048;
         let pln_enc = PerListNodeEncoder::new(entries_per_shard, [0; 32]).expect("encoder");
         let undersized_total: u32 = 65_536;
@@ -800,7 +767,6 @@ mod tests {
 
     #[test]
     fn path_affected_shards_byte_identity_old_vs_new_impl() {
-        // O(N) reference oracle.
         fn old_impl(entries_per_shard: u32, leaf_index: u32) -> std::collections::BTreeSet<u32> {
             let mut dirty = std::collections::BTreeSet::new();
             if leaf_index >= LEAVES_PER_TREE {

@@ -1,6 +1,5 @@
-//! Smart-policy deferred-feature tests: SIGHUP hot-reload, PPOI
-//! list-template parsing, `tree_fill_threshold` pre-spawn, and
-//! admin-drain x smart-policy auto-spawn interactions.
+//! SIGHUP hot-reload, PPOI list-template parsing, `tree_fill_threshold`
+//! pre-spawn, and admin-drain x auto-spawn interactions.
 
 #![allow(
     clippy::expect_used,
@@ -223,7 +222,7 @@ data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
     let live_runtime: Arc<arc_swap::ArcSwap<AutoSpawnRuntime>> =
         Arc::new(arc_swap::ArcSwap::from_pointee(initial_runtime));
 
-    // inline reload loop mirroring the production handler; avoids exposing it across the lib boundary
+    // Mirrors the production handler without exposing it across the lib boundary.
     let reload_handle = {
         let cfg_path = cfg_path.clone();
         let live = Arc::clone(&live_runtime);
@@ -585,7 +584,6 @@ data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
     reload_handle.abort();
 }
 
-// PPOI list-template TOML parsing and validation
 #[test]
 fn multi_list_ppoi_auto_spawn_on_new_list_key() {
     use std::io::Write;
@@ -631,7 +629,6 @@ data_source = { kind = "indexer", filter = { tree_number = 0 } }
     assert_eq!(opts.ppoi_list_templates[0].encoder, "per-list-status");
     assert_eq!(opts.ppoi_list_templates[1].encoder, "per-list-node");
 
-    // Reject: data_dir_template missing {list_key} placeholder.
     let bad_body = r#"
 [global]
 bind = "127.0.0.1:0"
@@ -666,7 +663,6 @@ data_source = { kind = "indexer", filter = { tree_number = 0 } }
         "expected missing-placeholder error; got: {msg}"
     );
 
-    // Reject: encoder label is not a PPOI encoder.
     let wrong_encoder = r#"
 [global]
 bind = "127.0.0.1:0"
@@ -742,7 +738,7 @@ async fn tree_fill_threshold_pre_spawns_at_95_percent() {
         tree1_dir.display(),
     );
 
-    // idempotent: a flapping fill metric must not respawn a known tree each tick
+    // A flapping fill metric must not respawn a known tree each tick.
     let again = pre_spawn_for_tree(
         &runtime,
         &params,
@@ -782,7 +778,6 @@ async fn admin_drain_concurrent_with_auto_spawn_routes_consistently() {
     let runtime = toy_runtime(tmp.path());
     let params = InspireParams::secure_128_d2048();
 
-    // Model the HTTP admin-route's pre-promote step directly.
     harness
         .bootstrap_instance
         .set_drain_state(DrainState::Draining);
@@ -825,7 +820,7 @@ async fn admin_drain_concurrent_with_auto_spawn_routes_consistently() {
     assert_eq!(
         harness.bootstrap_instance.drain_state(),
         DrainState::Drained,
-        "predecessor must promote from Draining → Drained when a successor lands"
+        "predecessor must promote from Draining to Drained when a successor lands"
     );
 
     let active_ids: Vec<String> = harness

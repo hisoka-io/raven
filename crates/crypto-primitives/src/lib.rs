@@ -1,11 +1,6 @@
-//! Cryptographic primitives shared across Raven schemes.
-//!
-//! - [`rng`]: deterministic ChaCha20 RNG.
-//! - [`seed`]: HKDF-SHA256 seed derivation with domain separation.
-//! - [`bitpack`]: variable-width packing for LWE ciphertext limbs.
-//!
-//! Scheme-bound math (NTT kernels, gadget matrices, scheme-specific hashing)
-//! lives in the scheme crates, not here.
+//! Cryptographic primitives shared across schemes. Scheme-bound math
+//! (NTT kernels, gadget matrices, scheme-specific hashing) stays in the
+//! scheme crates.
 
 // Crypto paths: every intentional cast needs a local allow with a reason.
 #![deny(

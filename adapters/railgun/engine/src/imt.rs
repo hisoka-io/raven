@@ -1,8 +1,7 @@
-//! Incremental Merkle tree matching Railgun's commitment-tree shape.
-//! `TREE_DEPTH = 16`, Poseidon-hashed nodes, zero value = `keccak256("Railgun") mod SNARK_PRIME`.
-//! Used for Layer 2 reorg detection and PIR Merkle-path table construction.
+//! Incremental Merkle tree matching the upstream commitment-tree shape:
+//! depth 16, Poseidon nodes, zero value `keccak256("Railgun") mod SNARK_PRIME`.
 
-// Indexing into statically-sized [TREE_DEPTH+1] / [TREE_DEPTH] arrays is in-bounds by construction.
+// Indexing the fixed-length level arrays is in-bounds by construction.
 #![allow(clippy::indexing_slicing, clippy::needless_range_loop)]
 
 use std::collections::HashMap;
@@ -48,7 +47,7 @@ impl Imt {
     /// Build an empty tree of depth [`TREE_DEPTH`].
     ///
     /// # Errors
-    /// Returns [`AdapterError::Internal`] if the zero-cache Poseidon hash fails.
+    /// [`AdapterError::Internal`] if the zero-cache Poseidon hash fails.
     pub fn new() -> Result<Self> {
         let zeros = ZeroValues::new()?;
         let nodes = (0..=TREE_DEPTH).map(|_| HashMap::new()).collect();
@@ -85,10 +84,10 @@ impl Imt {
         self.node_hash(level, index_at_level)
     }
 
-    /// Append `leaves` starting at `start_index`. Must equal `leaf_count`.
+    /// Append `leaves` at `start_index`, which must equal `leaf_count`.
     ///
     /// # Errors
-    /// Returns [`AdapterError::InvalidQuery`] on non-contiguous insert or capacity overflow.
+    /// [`AdapterError::InvalidQuery`] on non-contiguous insert or overflow.
     pub fn insert_leaves(&mut self, start_index: usize, leaves: &[[u8; 32]]) -> Result<()> {
         if start_index != self.leaf_count {
             return Err(AdapterError::InvalidQuery(format!(
@@ -105,16 +104,14 @@ impl Imt {
             )));
         }
 
-        // Skips the clone-and-stage: a single-leaf failure can't tear
-        // since `leaf_count` only advances after the helper succeeds.
+        // No staging needed: `leaf_count` advances only after the helper succeeds.
         if leaves.len() == 1 {
             self.set_leaf_and_update_path(start_index, leaves[0])?;
             self.leaf_count = end;
             return Ok(());
         }
 
-        // Clone-and-stage so a mid-loop failure on a non-Fr-canonical
-        // leaf rolls back; multi-leaf staleness can leak across leaves.
+        // Stage a clone so a mid-loop failure on a non-canonical leaf rolls back.
         let mut staged = self.clone();
         for (offset, leaf) in leaves.iter().enumerate() {
             let leaf_index = start_index + offset;
@@ -183,10 +180,10 @@ impl Imt {
         }
     }
 
-    /// Return the [`TREE_DEPTH`]-sibling Merkle proof for the leaf at `leaf_index`.
+    /// [`TREE_DEPTH`]-sibling Merkle proof for `leaf_index`.
     ///
     /// # Errors
-    /// Returns [`AdapterError::InvalidQuery`] if `leaf_index >= leaf_count`.
+    /// [`AdapterError::InvalidQuery`] if `leaf_index >= leaf_count`.
     pub fn merkle_proof(&self, leaf_index: usize) -> Result<MerkleProof> {
         if leaf_index >= self.leaf_count {
             return Err(AdapterError::InvalidQuery(format!(
@@ -201,7 +198,7 @@ impl Imt {
             elements[level] = self.node_hash(level, sibling_index);
         }
 
-        // `indices` bit i = (leaf_index >> i) & 1; 16 bits fit in u16.
+        // bit i = (leaf_index >> i) & 1; TREE_DEPTH bits fit a u16.
         let truncated = leaf_index & ((1 << TREE_DEPTH) - 1);
         #[allow(clippy::cast_possible_truncation)]
         let indices = truncated as u16;
@@ -222,7 +219,7 @@ mod tests {
     #[test]
     fn merkle_zero_value_matches_railgun_constant() {
         let v = railgun_merkle_zero_value();
-        // Verified against the Railgun TS reference via circomlibjs Poseidon.
+        // Verified against the upstream circomlibjs Poseidon reference.
         let expected_hex = "0488f89b25bc7011eaf6a5edce71aeafb9fe706faa3c0a5cd9cbe868ae3b9ffc";
         let actual_hex = hex_encode(&v);
         assert_eq!(
@@ -301,7 +298,7 @@ mod tests {
 
     #[test]
     fn truncate_to_k_equals_fresh_insert_of_first_k() {
-        // Leaves are big-endian u32 zero-padded to 32 bytes, below BN254 Fr prime.
+        // Big-endian u32 zero-padded to 32 bytes, so below the BN254 Fr prime.
         let leaves: Vec<[u8; 32]> = (0..12u32)
             .map(|i| {
                 let mut b = [0u8; 32];
@@ -336,7 +333,7 @@ mod tests {
         }
     }
 
-    /// Regression: mid-batch Poseidon failure must leave tree unchanged.
+    /// Mid-batch Poseidon failure must leave the tree unchanged.
     #[test]
     fn insert_leaves_is_atomic_on_mid_batch_poseidon_failure() {
         let valid: [u8; 32] = {
@@ -344,7 +341,7 @@ mod tests {
             b[31] = 0x07;
             b
         };
-        // 0xff...ff exceeds BN254 scalar prime, so Poseidon refuses.
+        // All-ones exceeds the BN254 scalar prime, so Poseidon refuses.
         let invalid: [u8; 32] = [0xff; 32];
 
         let mut tree = Imt::new().expect("imt build");
@@ -409,7 +406,6 @@ mod tests {
         tree.truncate_to(5);
         assert_eq!(tree.leaf_count(), 5);
 
-        // Proofs for leaves 0..5 still reconstruct the new root.
         let new_root = tree.root();
         assert_ne!(pre_root, new_root, "truncate must change root");
         for i in 0..5 {
@@ -420,7 +416,6 @@ mod tests {
             );
         }
 
-        // Proof for a dropped leaf must error.
         let err = tree.merkle_proof(5).expect_err("dropped");
         assert!(matches!(err, AdapterError::InvalidQuery(_)), "err={err:?}");
     }

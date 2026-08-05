@@ -59,12 +59,11 @@ pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
     let snap = Snapshot::load(&layout, manifest.current_snapshot_id, SNAPSHOT_MAGIC)
         .map_err(|e| anyhow::anyhow!("snapshot load: {e}"))?;
 
-    // Embedded store (default-empty for legacy V5) seeds the WAL replay base, per `open`.
+    // Seeds the WAL replay base, default-empty for legacy V5.
     let (mut state, recovered_seed_store) = restore_inspire_state_v6(&snap.data)
         .map_err(|e| anyhow::anyhow!("restore_inspire_state_v6: {e}"))?;
 
-    // Replay past the snapshot floor onto the seed store. The noop encoder only feeds
-    // `apply_wal_entry`'s dirty-shard tracking, irrelevant on the offline migration path.
+    // The noop encoder only feeds dirty-shard tracking, inert on the offline path.
     let noop_encoder: Arc<dyn PirTableEncoder> = {
         use raven_railgun_engine::pir_table::PerLeafCommitmentEncoder;
         Arc::new(
@@ -139,8 +138,8 @@ pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("re_encode_shard {shard_id}: {e}"))?;
     }
 
-    // Re-embed the rebuilt store so the V6 body stays consistent with the manifest stamped below;
-    // otherwise opens recover an empty store and chain events land against nothing.
+    // Keeps the V6 body consistent with the manifest stamped below; without it opens
+    // recover an empty store and chain events land against nothing.
     let bundle = snapshot_inspire_state_v6(&state, &logical_store)
         .map_err(|e| anyhow::anyhow!("snapshot_inspire_state_v6: {e}"))?;
     let new_snap = Snapshot::build(bundle, SNAPSHOT_MAGIC);
@@ -149,7 +148,6 @@ pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
         .save(&layout, new_id)
         .map_err(|e| anyhow::anyhow!("snapshot save: {e}"))?;
 
-    // current_snapshot_seq stays the same: no new WAL events landed since the snapshot we read.
     let new_manifest = Manifest {
         schema_version: raven_railgun_persistence::MANIFEST_SCHEMA_VERSION,
         scheme_tag: manifest.scheme_tag.clone(),

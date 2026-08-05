@@ -23,7 +23,6 @@ use std::time::Duration;
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-test";
 
-// smallest cell that exercises the production stack
 const TOY_ENTRIES: usize = 256;
 const TOY_ENTRY_SIZE: usize = 256;
 
@@ -48,7 +47,7 @@ async fn phase4_chain_event_propagates_to_pir_response() {
     let params = InspireParams::secure_128_d2048();
     let db = build_initial_db();
 
-    // setup outside bootstrap to keep the secret_key for client session building
+    // Setup outside bootstrap so the secret key survives for the client session.
     let (state, sk) =
         setup_state(&params, &db, TOY_ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup");
 
@@ -176,7 +175,8 @@ async fn phase4_chain_event_propagates_to_pir_response() {
     let _ = tokio::time::timeout(Duration::from_secs(5), handle.consumer).await;
 }
 
-// shutdown with the chain head ahead of the last applied leaf must persist the leaf block as the resume floor; a head-based floor wedges the tree on the next non-contiguous append
+// A head-based resume floor would wedge the tree on the next append, so shutdown
+// must persist the last applied leaf block instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resume_floor_is_last_leaf_block_not_chain_head() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -224,7 +224,7 @@ async fn resume_floor_is_last_leaf_block_not_chain_head() {
         .send(ConsumerEvent::Chain(chain_event, LEAF_BLOCK))
         .await
         .expect("send leaf");
-    // heartbeat drives the chain head far past the last applied leaf (stall shape)
+    // Heartbeat drives the chain head far past the last applied leaf.
     handle
         .sender
         .send(ConsumerEvent::Heartbeat {

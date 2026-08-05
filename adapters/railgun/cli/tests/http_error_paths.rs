@@ -1,5 +1,4 @@
-//! HTTP layer error-path tests: 401 wrong-bearer, 401 missing-bearer, 401 malformed-prefix,
-//! 404 unknown-instance, 400 malformed body, 400 empty batch, 200 metrics, 200 status.
+//! HTTP layer error paths: auth, unknown instance, malformed body, empty batch.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 

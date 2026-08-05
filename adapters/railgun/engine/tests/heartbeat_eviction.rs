@@ -1,7 +1,5 @@
-//! Heartbeat session-eviction tests. The heartbeat resets the inner
-//! `BoundedSessionStore` while carrying the heavy CRS / `EncodedDatabase`
-//! / `ServerInspiringCache` by `Arc::clone`; the trailing tests guard
-//! against re-introducing a deep clone of `encoded_db`.
+//! Heartbeat session eviction: the store resets while CRS, `EncodedDatabase` and
+//! cache are carried by `Arc::clone`, never deep-cloned.
 
 #![allow(clippy::expect_used)]
 
@@ -86,8 +84,7 @@ fn heartbeat_swap_state_drops_inner_session_store() {
 
 #[test]
 fn heartbeat_swap_state_preserves_cache_across_swap() {
-    // Cache is the heaviest field (~3.7 s rebuild at production cell);
-    // heartbeat must carry it by Arc::clone, not rebuild.
+    // Cache rebuild is ~3.7 s at production cell, so it must be carried, not rebuilt.
     let params = InspireParams::secure_128_d2048();
     let initial_state = build_toy_state(&params);
     let instance: Arc<PirInstance<RavenInspireScheme>> = Arc::new(PirInstance::new(
@@ -117,8 +114,8 @@ fn heartbeat_swap_state_preserves_cache_across_swap() {
 
 #[test]
 fn heartbeat_swap_state_drops_session_store_arc_pointer_too() {
-    // A fresh session_store Arc; reusing the donor's would make eviction
-    // a no-op for in-flight queries still holding the donor.
+    // A fresh Arc; reusing the donor's would make eviction a no-op for in-flight
+    // queries still holding it.
     let params = InspireParams::secure_128_d2048();
     let initial_state = build_toy_state(&params);
     let instance: Arc<PirInstance<RavenInspireScheme>> = Arc::new(PirInstance::new(
@@ -147,8 +144,7 @@ fn heartbeat_swap_state_drops_session_store_arc_pointer_too() {
     );
 }
 
-/// Operator opt-out (CLI `interval == 0`): heartbeat fn never called,
-/// so the bootstrap session_store Arc must persist unchanged.
+/// At `interval == 0` the heartbeat never fires, so the bootstrap Arc persists.
 #[test]
 fn heartbeat_interval_disabled_when_zero() {
     let params = InspireParams::secure_128_d2048();
@@ -186,7 +182,6 @@ fn heartbeat_interval_disabled_when_zero() {
 
 #[test]
 fn heartbeat_swap_state_metric_increments_per_swap() {
-    // One epoch bump per call stands in for the per-call swap metric.
     let params = InspireParams::secure_128_d2048();
     let initial_state = build_toy_state(&params);
     let instance: Arc<PirInstance<RavenInspireScheme>> = Arc::new(PirInstance::new(
@@ -208,8 +203,8 @@ fn heartbeat_swap_state_metric_increments_per_swap() {
     assert!(e3 > e2, "epoch MUST advance after third heartbeat");
 }
 
-// encoded_db is carried by Arc::clone; a deep clone per fire (~128 MiB
-// memcpy at production cell) would OOM the server under hourly ticks.
+// A deep clone per fire is ~128 MiB at production cell and would OOM under
+// hourly ticks.
 
 /// Across N fires the `Arc<EncodedDatabase>` allocation address must stay stable.
 #[test]
@@ -253,8 +248,7 @@ fn heartbeat_eviction_does_not_clone_encoded_db_under_steady_load() {
     );
 }
 
-/// 1-ms ceiling on the toy cell: covers allocation jitter yet catches a
-/// 100 ms+ deep-clone regression (production-cell setup is too heavy to use).
+/// 1-ms ceiling on the toy cell: absorbs jitter, catches a deep-clone regression.
 #[test]
 fn heartbeat_eviction_arc_clone_constant_time_at_production_cell() {
     let params = InspireParams::secure_128_d2048();
@@ -265,7 +259,7 @@ fn heartbeat_eviction_arc_clone_constant_time_at_production_cell() {
         initial_state,
     ));
 
-    // Warm-up: first fire pays metrics-recorder + arc_swap lazy-init.
+    // First fire pays metrics-recorder and arc_swap lazy init.
     heartbeat_session_eviction(&instance).expect("warmup");
 
     let mut over_budget = 0usize;
@@ -286,9 +280,8 @@ fn heartbeat_eviction_arc_clone_constant_time_at_production_cell() {
     );
 }
 
-/// `Arc::make_mut` (drive_commit's re-encode path) is a no-op when the
-/// Arc is uniquely owned and copies exactly once when a sibling (an
-/// in-flight query) is alive.
+/// `Arc::make_mut` is free when uniquely owned and copies exactly once when an
+/// in-flight query holds a sibling.
 #[test]
 fn drive_commit_arc_make_mut_only_copies_under_inflight_query() {
     let params = InspireParams::secure_128_d2048();
@@ -297,7 +290,6 @@ fn drive_commit_arc_make_mut_only_copies_under_inflight_query() {
     let original_arc = Arc::clone(&state.encoded_db);
     let original_ptr: *const EncodedDatabase = Arc::as_ptr(&original_arc);
 
-    // Path A: uniquely-owned Arc -> make_mut does not allocate.
     {
         let solo = Arc::clone(&original_arc);
         let mut unique = Arc::new(EncodedDatabase {
@@ -313,7 +305,6 @@ fn drive_commit_arc_make_mut_only_copies_under_inflight_query() {
         drop(solo);
     }
 
-    // Path B: shared Arc -> make_mut performs CoW into a fresh allocation.
     {
         let mut writer = Arc::clone(&original_arc);
         let pre_writer_ptr: *const EncodedDatabase = Arc::as_ptr(&writer);

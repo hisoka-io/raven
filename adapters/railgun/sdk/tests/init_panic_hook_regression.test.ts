@@ -27,7 +27,6 @@ describe("init_panic_hook regression-guard", () => {
       build_instance_params_blob: () => new Uint8Array(0),
       path_indices_for_leaf: () => new Uint32Array(16),
       path_indices_for_per_list_leaf: () => new Uint32Array(16),
-      // init_panic_hook intentionally omitted
     };
     expect(installPanicHook(stub)).toBe(false);
   });

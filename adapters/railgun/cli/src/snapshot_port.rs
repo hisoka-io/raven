@@ -81,13 +81,10 @@ pub struct ExportOptions {
     pub keep_snapshots: usize,
 }
 
-/// Options for the standalone `PruneSnapshots` subcommand. Idempotent; never
-/// touches the live `data_dir`, only `*.tar.zst` files and paired `.sig` sidecars.
+/// Idempotent; touches only `*.tar.zst` files and paired `.sig` sidecars.
 #[derive(Debug, Clone)]
 pub struct PruneOptions {
-    /// Directory containing `*.tar.zst` export tarballs.
     pub data_dir: PathBuf,
-    /// Keep the N newest tarballs (plus paired `.sig` sidecars); `0` disables.
     pub keep_snapshots: usize,
 }
 
@@ -316,9 +313,8 @@ pub fn run_export(opts: ExportOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Keep the `keep_last_n` newest `*.tar.zst` by mtime, removing older ones plus
-/// their `.sig` sidecars. Per-entry failures are warn-logged, not fatal. Returns
-/// tarballs removed (excluding sidecars); `keep_last_n = 0` or a missing dir is a no-op.
+/// Keep the `keep_last_n` newest `*.tar.zst` by mtime plus their `.sig` sidecars;
+/// returns tarballs removed. Per-entry failures are warn-logged, not fatal.
 pub fn prune_old_export_tarballs(
     snapshots_dir: &Path,
     keep_last_n: usize,
@@ -397,8 +393,7 @@ pub fn prune_old_export_tarballs(
     Ok(removed)
 }
 
-/// Standalone prune entry point. Suitable for cron / systemd-timer
-/// invocation between exports. Idempotent.
+/// Standalone prune entry point; idempotent.
 pub fn run_prune(opts: PruneOptions) -> anyhow::Result<()> {
     let removed = prune_old_export_tarballs(&opts.data_dir, opts.keep_snapshots)?;
     tracing::info!(

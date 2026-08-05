@@ -82,7 +82,6 @@ export function subscribeRavenEvents(
         const parsed = JSON.parse(data) as StatusBody;
         onStatus(parsed);
       } catch {
-        // drop malformed event payload
       }
     });
     es.addEventListener("error", () => {

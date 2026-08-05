@@ -1,9 +1,5 @@
-//! The engine session store is bounded on the real registration path.
-//!
-//! Registration used to append to an uncapped `ServerSessionStore` with no
-//! removal path, so occupancy equalled lifetime registrations. These cases
-//! drive the production `register_client_session` / `respond` pair and pin that
-//! occupancy stays under the cap and that a retired handle fails closed.
+//! The session store stays under its cap on the production
+//! `register_client_session` / `respond` path, and a retired handle fails closed.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 

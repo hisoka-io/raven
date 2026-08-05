@@ -1,6 +1,5 @@
-//! The operator image's allowlist `COPY` set must cover every path dependency
-//! that leaves the adapter workspace, or `cargo build` fails inside the image
-//! long after a green host build.
+//! The image's allowlist `COPY` set must cover every path dependency leaving the
+//! adapter workspace, else `cargo build` fails in-image after a green host build.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 

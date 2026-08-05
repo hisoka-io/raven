@@ -1,6 +1,4 @@
-//! Wire-shape parity vs upstream Railgun JSON (`proof-of-innocence.ts`).
-//!
-//! Source of truth: `shared-models/src/models/proof-of-innocence.ts`.
+//! Wire-shape parity vs upstream `shared-models/src/models/proof-of-innocence.ts`.
 
 #![allow(
     dead_code,

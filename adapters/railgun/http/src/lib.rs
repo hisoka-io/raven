@@ -81,11 +81,8 @@ pub(crate) const X_RAVEN_SCHEME: HeaderName = HeaderName::from_static("x-raven-s
 pub(crate) const X_RAVEN_SESSION: HeaderName = HeaderName::from_static("x-raven-session");
 pub(crate) const X_RAVEN_FRESHNESS: HeaderName = HeaderName::from_static("x-raven-freshness");
 
-/// Build the production axum router (generic over [`PirScheme`]).
-///
-/// # Errors
-/// `Err` only if `tower-governor` rejects the clamped `(rps, burst)` config
-/// (unreachable today; propagated to catch an upstream regression).
+/// Build the production axum router. `Err` only if `tower-governor` rejects the
+/// clamped `(rps, burst)` config.
 pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
     let trusted_proxies = resolve_trusted_proxies(&state.config)?;
     let rps = state.config.rate_limit_rps.max(1);
@@ -164,14 +161,8 @@ pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
     ))
 }
 
-/// Inspire-specific router; adds `/session` and `/params` routes.
-///
-/// Splits into a rate-limited (Governor) scope and a public scope. The public
-/// scope keeps scrapes + the SSE feed from exhausting the per-IP burst budget.
-/// `/metrics` is bearer-gated unless `HttpConfig.metrics_public = true`.
-///
-/// # Errors
-/// Same contract as [`router`].
+/// Inspire router; adds `/session` and `/params`. Splits into a Governor-limited
+/// scope and a public scope so scrapes and SSE cannot exhaust the per-IP burst.
 pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, String> {
     let trusted_proxies = resolve_trusted_proxies(&state.config)?;
     let rps = state.config.rate_limit_rps.max(1);
@@ -182,8 +173,8 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
     let auth_layer =
         middleware::from_fn_with_state(state.clone(), bearer_auth::<RavenInspireScheme>);
 
-    // No CompressionLayer: CRS bincode is random-like (~1.0x), and per-request
-    // Accept-Encoding would break the `ETag = SHA-256(raw body)` cache contract.
+    // CRS bincode is incompressible and per-request Accept-Encoding would break the
+    // `ETag = SHA-256(raw body)` cache contract.
     let params_route = Router::new()
         .route("/v1/instance/:id/params", get(params_handler))
         .with_state(state.clone());
@@ -220,8 +211,7 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
         rate_limited.layer(build_governor_layer_peer(rps, burst))
     };
 
-    // Bypasses Governor; `bearer_auth` still applies (it path-bypasses health
-    // + events and gates /metrics on `HttpConfig.metrics_public`).
+    // Bypasses Governor only; `bearer_auth` still applies.
     let public = Router::new()
         .route("/v1/health/live", get(health_live_handler))
         .route(
@@ -308,8 +298,7 @@ fn build_governor_layer_peer(rps: u64, burst: u32) -> RavenGovernorLayerPeer {
     }
 }
 
-/// Returns `Err` only if `tower-governor` rejects a `(rps >= 1, burst >= 1)` config
-/// (currently impossible per upstream contract; propagated to catch future regressions).
+/// `Err` only if `tower-governor` rejects a `(rps >= 1, burst >= 1)` config.
 fn build_governor_layer_trusted(
     rps: u64,
     burst: u32,
@@ -335,8 +324,7 @@ fn build_governor_layer_trusted(
     })
 }
 
-/// Build a CORS layer; returns `None` when `allowed_origins` is empty.
-/// Exposes `X-Raven-*` headers; limits methods to GET + POST.
+/// CORS layer exposing `X-Raven-*` over GET + POST; `None` when no origins are set.
 fn build_cors_layer(allowed_origins: &[String]) -> Option<CorsLayer> {
     use http::header::{AUTHORIZATION, CONTENT_TYPE};
     use http::HeaderValue;
@@ -361,8 +349,7 @@ fn build_cors_layer(allowed_origins: &[String]) -> Option<CorsLayer> {
                 http::HeaderName::from_static("x-raven-scheme"),
                 http::HeaderName::from_static("x-raven-schema-version"),
                 http::HeaderName::from_static("x-raven-session"),
-                // `tower_governor` 0.4 emits `x-ratelimit-after` (not
-                // `retry-after`) on 429; expose only what callers will see.
+                // tower_governor 0.4 emits `x-ratelimit-after`, not `retry-after`.
                 http::HeaderName::from_static("x-ratelimit-after"),
             ]),
     )
@@ -387,8 +374,7 @@ pub(crate) fn build_response_headers(epoch: u64, scheme: &str) -> Result<HeaderM
     Ok(headers)
 }
 
-/// Format the `X-Raven-Freshness` header value.
-/// `confidence = 1.0 - clamp(lag / 256.0, 0, 1)` (full at zero lag, zero at 256 blocks).
+/// `X-Raven-Freshness`: `confidence = 1.0 - clamp(lag / 256.0, 0, 1)`.
 fn freshness_header_value(
     metrics: Option<&parking_lot::Mutex<raven_railgun_engine::persistence::ConsumerMetrics>>,
     epoch: u64,
@@ -440,7 +426,6 @@ pub(crate) fn global_prometheus_handle(
     match builder.install_recorder() {
         Ok(handle) => {
             let arc = Arc::new(handle);
-            // A concurrent caller may have raced past our `get` and set HANDLE first.
             match HANDLE.set(Arc::clone(&arc)) {
                 Ok(()) => Ok(arc),
                 Err(_) => HANDLE
@@ -450,7 +435,6 @@ pub(crate) fn global_prometheus_handle(
             }
         }
         Err(install_err) => {
-            // Already installed by a concurrent caller; re-read HANDLE.
             if let Some(h) = HANDLE.get() {
                 return Ok(Arc::clone(h));
             }
@@ -795,7 +779,6 @@ mod tests {
         let map = SessionMap::new();
         let now = Instant::now();
         let ttl = Duration::from_secs(3600);
-        // Cap=2; inserting a 3rd should evict the oldest-live with Pressure.
         let zero = [0u8; 16];
         let k1 = SessionKey::new("a", InstanceId::new("toy"), zero);
         let k2 = SessionKey::new("b", InstanceId::new("toy"), zero);
@@ -997,7 +980,7 @@ mod tests {
     }
 
     fn assert_batch_round_trip_at_k(k: usize) {
-        // Vary payload sizes so per-element length prefixing is exercised.
+        // Varied sizes exercise per-element length prefixing.
         let items: Vec<VarLenItem> = (0..k)
             .map(|i| make_varlen_item(i as u32, 1 + (i * 13) % 257))
             .collect();
@@ -1021,7 +1004,6 @@ mod tests {
             super::read_batch_response_versioned(&bytes).expect("decode must succeed");
         assert_eq!(decoded, items, "round-trip equality must hold at K={k}");
 
-        // Re-encode to verify determinism.
         let bytes2 =
             super::write_batch_response_versioned(&decoded).expect("re-encode must succeed");
         assert_eq!(bytes, bytes2, "encoder must be deterministic at K={k}");
@@ -1073,8 +1055,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn dispatch_batch_drain_during_batch_blocks_late_queries() {
         let state = SlowableState::default();
-        // Slots 0-1 sleep 250 ms, holding in-flight guards across the drain flip.
-        // Later slots acquire after drain and must surface NoActiveInstance.
+        // Slots 0-1 hold in-flight guards across the drain flip; later slots acquire
+        // after it and must surface NoActiveInstance.
         state.sleep_ms_per_query.lock().insert(100, 250);
         state.sleep_ms_per_query.lock().insert(101, 250);
         let instance = build_slowable_instance(state);

@@ -1,7 +1,4 @@
-//! Runtime driver that turns `tree_observed` broadcast signals into live PIR instances.
-//!
-//! On restart, `replay_spawn_log` re-bootstraps every record in the log; records whose data
-//! directory has disappeared are skipped with a loud error.
+//! Turns `tree_observed` broadcast signals into live PIR instances.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -89,9 +86,8 @@ impl AutoSpawnRuntime {
     }
 }
 
-/// Rows per shard, which is what `ShardConfig::entries_per_shard` will report: `setup` sizes
-/// every shard at `ring_dim * entry_size` bytes, so a shard is exactly `ring_dim` rows wide
-/// regardless of how many rows the whole cell holds.
+/// Rows per shard: `setup` sizes every shard at `ring_dim * entry_size` bytes, so a
+/// shard is `ring_dim` rows wide regardless of total cell rows.
 fn rows_per_shard(params: &InspireParams) -> u32 {
     u32::try_from(params.ring_dim).unwrap_or(u32::MAX)
 }
@@ -107,10 +103,7 @@ struct SpawnInputs<'a> {
     chain_source: Option<Arc<dyn raven_railgun_indexer::ChainSource>>,
 }
 
-/// Registry of every chain-tree instance the driver knows about.
-///
-/// Auto-spawned instances register an [`AutoSpawnedHandle`] so the serve loop can send
-/// `ConsumerEvent::Shutdown` and await the consumer task on graceful shutdown.
+/// Chain-tree instances the driver knows about.
 pub struct SpawnRegistry {
     inner: parking_lot::Mutex<RegistryInner>,
 }
@@ -130,7 +123,7 @@ impl std::fmt::Debug for SpawnRegistry {
 
 struct RegistryInner {
     by_tree: std::collections::BTreeMap<u32, RegistryEntry>,
-    /// Bootstrap-seeded entries are NOT here; those shut down via `MultiOrchestratorHandle`.
+    /// Auto-spawned only; bootstrap-seeded entries shut down via `MultiOrchestratorHandle`.
     auto_spawned: Vec<AutoSpawnedHandle>,
     last_spawn_at: Option<std::time::Instant>,
     refused_spawns: u64,
@@ -272,8 +265,7 @@ impl SpawnRegistry {
             entry
                 .persistence
                 .set_snapshot_policy(SnapshotPolicy::static_default());
-            // Promote a concurrently-drained predecessor atomically with the route append so
-            // /v1/status and routing observe it together; no-op otherwise (idempotent).
+            // Atomic with the route append so /v1/status and routing observe it together.
             let prev_state = entry.instance.drain_state();
             if matches!(
                 prev_state,
@@ -304,8 +296,7 @@ impl Default for SpawnRegistry {
     }
 }
 
-/// Re-bootstrap every record in `spawn_log.jsonl`. Per-record failures log and skip; only a
-/// directory-level I/O error is returned.
+/// Re-bootstrap every record in `spawn_log.jsonl`; only directory-level I/O errors return.
 #[allow(clippy::too_many_arguments)]
 pub fn replay_spawn_log(
     runtime: &AutoSpawnRuntime,
@@ -378,8 +369,7 @@ pub async fn run_driver(
     .await;
 }
 
-/// Hot-reload variant of [`run_driver`]: reads `live_runtime` on each spawn so a SIGHUP can swap
-/// templates without restarting. The serve loop uses this; tests use `run_driver`.
+/// [`run_driver`] re-reading `live_runtime` per spawn so SIGHUP can swap templates.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_driver_dynamic(
     live_runtime: Arc<arc_swap::ArcSwap<AutoSpawnRuntime>>,
@@ -420,8 +410,7 @@ pub async fn run_driver_dynamic(
                         error = %e,
                         "auto_spawn: failed to bootstrap successor; will retry on next tree event"
                     );
-                    // Roll back so a subsequent event for the same tree triggers a retry;
-                    // without this the watcher would skip the duplicate.
+                    // Roll back, else the watcher skips the retry event for this tree.
                     watcher = TreeFillWatcher::new(new_tree.saturating_sub(1));
                 }
             }
@@ -439,8 +428,8 @@ pub async fn run_driver_dynamic(
     }
 }
 
-/// Pre-spawn a successor instance when the active tree's leaf-fill count crosses the configured
-/// threshold. Returns `Ok(false)` when `tree` is already registered (idempotent).
+/// Pre-spawn a successor once leaf-fill crosses the threshold; `Ok(false)` when
+/// `tree` is already registered.
 #[allow(clippy::too_many_arguments)]
 pub fn pre_spawn_for_tree(
     runtime: &AutoSpawnRuntime,
@@ -465,7 +454,7 @@ pub fn pre_spawn_for_tree(
         chain_source,
     };
     spawn_one(&inputs, tree, /*append_log=*/ true)?;
-    // spawn_one returns Ok(()) on policy refusal; check the registry to distinguish.
+    // spawn_one returns Ok(()) on policy refusal, so the registry is the discriminator.
     Ok(registry.known().contains(&tree))
 }
 
@@ -485,16 +474,14 @@ pub(crate) fn warn_on_record_size_override(
     );
 }
 
-/// Bootstrap one successor instance, wire it into the engine + route table + registry, and
-/// (when `append_log = true`) append a [`SpawnRecord`] to the JSONL log, then flip the
-/// predecessor to Static. Log append is AFTER all in-memory side effects so a crash before it
-/// leaves no log entry pointing at a half-built layout. Log append is BEFORE the predecessor
-/// flip so a crash between the two is recoverable on the next successful spawn.
+/// Bootstrap a successor, wire it into engine + routes + registry, append the
+/// [`SpawnRecord`], then flip the predecessor to Static. That order is crash-safe:
+/// no log entry can point at a half-built layout, and a crash after the append is
+/// recovered by the next successful spawn.
 #[allow(clippy::too_many_lines)]
 fn spawn_one(inputs: &SpawnInputs<'_>, tree: u32, append_log: bool) -> anyhow::Result<()> {
     let runtime = inputs.runtime;
-    // On the recovery path (append_log = false), bypass the policy gate: replay must reconstruct
-    // every record the operator wrote pre-crash.
+    // Replay must reconstruct every pre-crash record, so it bypasses the policy gate.
     if append_log {
         let now = std::time::Instant::now();
         if let Err(refusal) = inputs.registry.check_policy(runtime, now) {
@@ -523,8 +510,8 @@ fn spawn_one(inputs: &SpawnInputs<'_>, tree: u32, append_log: bool) -> anyhow::R
         .map_err(|e| anyhow::anyhow!("encoder cell shape rejected: {e}"))?;
     validate_rows_per_shard(entries_per_shard_u32, inputs.params.ring_dim)
         .map_err(|e| anyhow::anyhow!("auto_spawn rows per shard rejected: {e}"))?;
-    // an undersized cell dirties shards past the allocated database, and drive_commit
-    // drops those rather than failing, so the instance serves factory bytes forever
+    // An undersized cell dirties shards past the allocated database and drive_commit
+    // drops them silently, so the instance would serve factory bytes forever.
     validate_total_entries(&encoder_kind, entries)
         .map_err(|e| anyhow::anyhow!("auto_spawn total entries rejected: {e}"))?;
     let encoder: Arc<dyn PirTableEncoder> = encoder_kind
@@ -601,8 +588,7 @@ fn spawn_one(inputs: &SpawnInputs<'_>, tree: u32, append_log: bool) -> anyhow::R
     };
     let consumer_join = spawn_consumer_task(consumer_inputs);
 
-    // Record before the role flip so flip_predecessor_to_static does not race a concurrent
-    // `registry.known()` reader; the retained JoinHandle lets the serve loop drive a final commit.
+    // Before the role flip, else flip_predecessor_to_static races a `registry.known()` reader.
     inputs
         .registry
         .record_spawn(tree, Arc::clone(&instance_arc), Arc::clone(&persistence));
@@ -626,7 +612,7 @@ fn spawn_one(inputs: &SpawnInputs<'_>, tree: u32, append_log: bool) -> anyhow::R
     }
     inputs.registry.flip_predecessor_to_static(tree);
     if append_log {
-        // Stamp after every side effect so the cooldown measures successful-spawn intervals.
+        // After every side effect: the cooldown measures successful-spawn intervals.
         inputs.registry.stamp_spawned_at(std::time::Instant::now());
     }
     tracing::info!(
@@ -668,9 +654,6 @@ fn spawn_consumer_task(inputs: ConsumerSpawnInputs) -> tokio::task::JoinHandle<(
     })
 }
 
-// Multi-list PPOI dynamic discovery - mirrors the chain-tree driver above but keys off
-// `list_observed: broadcast::Sender<[u8; 32]>` instead of `tree_observed`.
-
 /// Engine-facing view of one `[[ppoi_list_template]]` TOML row.
 #[derive(Debug, Clone)]
 pub struct PpoiListTemplateRuntime {
@@ -706,7 +689,7 @@ impl PpoiListTemplateRuntime {
     }
 }
 
-/// Registry of PPOI-list spawns. Deduplicates `(template_id, list_key)` pairs.
+/// PPOI-list spawns, deduplicated on `(template_id, list_key)`.
 pub struct PpoiListSpawnRegistry {
     inner: parking_lot::Mutex<PpoiListRegistryInner>,
 }
@@ -823,8 +806,7 @@ struct PpoiListSpawnInputs<'a> {
     spawn_log_dir: std::path::PathBuf,
 }
 
-/// Bootstrap one PPOI-list instance and wire it into the engine + route table + registry.
-/// Returns `Ok(false)` when the pair is already registered (idempotent dedup).
+/// Bootstrap one PPOI-list instance; `Ok(false)` when already registered.
 #[allow(clippy::too_many_lines)]
 fn spawn_one_ppoi_list(inputs: &PpoiListSpawnInputs<'_>, append_log: bool) -> anyhow::Result<bool> {
     let pair = (inputs.template.template_id.clone(), inputs.list_key);
@@ -853,8 +835,8 @@ fn spawn_one_ppoi_list(inputs: &PpoiListSpawnInputs<'_>, append_log: bool) -> an
         .map_err(|e| anyhow::anyhow!("encoder cell shape rejected: {e}"))?;
     validate_rows_per_shard(entries_per_shard_u32, inputs.params.ring_dim)
         .map_err(|e| anyhow::anyhow!("auto_spawn rows per shard rejected: {e}"))?;
-    // an undersized cell dirties shards past the allocated database, and drive_commit
-    // drops those rather than failing, so the instance serves factory bytes forever
+    // An undersized cell dirties shards past the allocated database and drive_commit
+    // drops them silently, so the instance would serve factory bytes forever.
     validate_total_entries(&encoder_kind, entries)
         .map_err(|e| anyhow::anyhow!("auto_spawn total entries rejected: {e}"))?;
     let encoder: Arc<dyn PirTableEncoder> = encoder_kind
@@ -909,7 +891,7 @@ fn spawn_one_ppoi_list(inputs: &PpoiListSpawnInputs<'_>, append_log: bool) -> an
 
     let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default()));
     let logical_store = Arc::new(parking_lot::Mutex::new(LogicalLeafStore::new()));
-    // PPOI instances skip the L2 chain-root verifier; upstream-signature verification covers them.
+    // Upstream-signature verification stands in for the L2 chain-root verifier here.
     let verifier_ctx: Option<Layer2VerifierContext> = None;
 
     let consumer_inputs = ConsumerSpawnInputs {
@@ -1043,7 +1025,7 @@ pub async fn run_ppoi_list_driver(
     }
 }
 
-/// Re-bootstrap every record in `ppoi_list_spawn_log.jsonl`. Per-record failures log and skip.
+/// Re-bootstrap every record in `ppoi_list_spawn_log.jsonl`.
 pub fn replay_ppoi_list_spawn_log(
     templates: &[PpoiListTemplateRuntime],
     params: &InspireParams,

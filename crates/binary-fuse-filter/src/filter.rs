@@ -9,34 +9,30 @@ use crate::error::{BffError, Result};
 
 const HASHED_KEY_BYTE_LEN: usize = 32;
 
-/// BFF descriptor. Serializes to a fixed byte layout via
-/// [`to_bytes`](BinaryFuseFilter::to_bytes); the fingerprint array
-/// is stored separately by the caller.
+/// Descriptor only; the caller stores the fingerprint array separately.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BinaryFuseFilter {
     pub seed: [u8; 32],
-    /// Arity (3 or 4).
+    /// 3 or 4.
     pub arity: u32,
     pub segment_length: u32,
     pub segment_count_length: u32,
     pub num_fingerprints: usize,
-    /// Filter occupancy after construction (= keys inserted on success).
+    /// Keys inserted on a successful construction.
     pub filter_size: usize,
     /// Bits per fingerprint slot; sets the false-positive rate.
     pub mat_elem_bit_len: usize,
 }
 
-/// `(filter, reverse_order, reverse_h, hash_to_key)`. Caller uses
-/// `reverse_order` + `reverse_h` to populate the fingerprint array
-/// in dependency order; `hash_to_key` recovers the source key bytes.
+/// `(filter, reverse_order, reverse_h, hash_to_key)`. `reverse_order` plus
+/// `reverse_h` give the dependency order the fingerprint array must be
+/// filled in; `hash_to_key` recovers the source key bytes.
 pub type BinaryFuseFilterIntermediateStageResult<'a> =
     (BinaryFuseFilter, Vec<u64>, Vec<u8>, HashMap<u64, &'a [u8]>);
 
 impl BinaryFuseFilter {
-    /// Construct a 3-wise XOR Binary Fuse Filter. Adapted from
+    /// FP rate is `2^-mat_elem_bit_len`. Adapted from
     /// `FastFilter/fastfilter_cpp/.../3wise_xor_binary_fuse_filter_lowmem.h`.
-    /// `mat_elem_bit_len` sets the FP rate (`2^-mat_elem_bit_len`);
-    /// `max_attempt_count` retries with fresh seeds.
     pub fn construct_3_wise<'a>(
         db: &HashMap<&'a [u8], &[u8]>,
         mat_elem_bit_len: usize,
@@ -110,8 +106,7 @@ impl BinaryFuseFilter {
         for _ in 0..max_attempt_count {
             rng.fill_bytes(&mut seed);
 
-            // Each attempt rehashes; clear so failed-attempt entries don't
-            // accumulate, bounding map capacity to N.
+            // each attempt rehashes; without this the map grows past N
             hash_to_key.clear();
 
             for (idx, val) in start_pos.iter_mut().enumerate() {
@@ -298,8 +293,7 @@ impl BinaryFuseFilter {
         ))
     }
 
-    /// 4-wise XOR Binary Fuse Filter. Smaller array than 3-wise
-    /// (size factor ~1.08 vs ~1.13) at the cost of one extra
+    /// Smaller array than 3-wise (size factor ~1.08 vs ~1.13) for one extra
     /// memory access per query.
     pub fn construct_4_wise<'a>(
         db: &HashMap<&'a [u8], &[u8]>,
@@ -374,7 +368,6 @@ impl BinaryFuseFilter {
         for _ in 0..max_attempt_count {
             rng.fill_bytes(&mut seed);
 
-            // See `construct_3_wise` for the rehash-clear rationale.
             hash_to_key.clear();
 
             for (idx, val) in start_pos.iter_mut().enumerate().take(start_pos_len) {
@@ -598,7 +591,7 @@ impl BinaryFuseFilter {
             / (self.filter_size as f64)
     }
 
-    /// Serialize the descriptor (little-endian).
+    /// Little-endian, fixed layout.
     pub fn to_bytes(&self) -> Vec<u8> {
         let offset0 = 0;
         let offset1 = offset0 + self.seed.len();
@@ -611,7 +604,7 @@ impl BinaryFuseFilter {
 
         let mut bytes = vec![0u8; total_byte_len];
 
-        // Indexing is bounded by the offset math above.
+        // bounded by the offset math above
         #[allow(clippy::indexing_slicing)]
         {
             bytes[offset0..offset1].copy_from_slice(&self.seed);
@@ -626,8 +619,7 @@ impl BinaryFuseFilter {
         bytes
     }
 
-    /// Deserialize a descriptor produced by `to_bytes`. Errors on
-    /// length mismatch.
+    /// Inverse of [`to_bytes`](BinaryFuseFilter::to_bytes).
     pub fn from_bytes(bytes: &[u8]) -> Result<BinaryFuseFilter> {
         const OFFSET0: usize = 0;
         const OFFSET1: usize = OFFSET0 + std::mem::size_of::<[u8; 32]>();
@@ -695,7 +687,7 @@ impl BinaryFuseFilter {
     }
 }
 
-/// Per-segment length for a given entry count and arity.
+/// Per-segment slot count.
 #[inline]
 pub fn segment_length<const ARITY: u32>(size: u32) -> u32 {
     if size == 0 {
@@ -708,7 +700,7 @@ pub fn segment_length<const ARITY: u32>(size: u32) -> u32 {
     }
 }
 
-/// Fingerprint-array size factor relative to entry count.
+/// Fingerprint-array oversizing relative to entry count.
 #[inline]
 pub fn size_factor<const ARITY: u32>(size: u32) -> f64 {
     match ARITY {
@@ -749,13 +741,13 @@ pub const fn murmur64(mut h: u64) -> u64 {
     h
 }
 
-/// One-step mix of `(key, seed)` into a u64.
+/// One-step `(key, seed)` mix.
 #[inline]
 pub const fn mix(key: u64, seed: u64) -> u64 {
     murmur64(key.wrapping_add(seed))
 }
 
-/// Hash key bytes to a 32-byte digest via TurboShake128.
+/// TurboShake128 digest of the key, as four words.
 #[inline]
 pub fn hash_of_key(key: &[u8]) -> [u64; 4] {
     let mut hasher = TurboShake128::default();
@@ -777,7 +769,7 @@ pub fn hash_of_key(key: &[u8]) -> [u64; 4] {
     [read_u64(0), read_u64(8), read_u64(16), read_u64(24)]
 }
 
-/// Mix a 4 x u64 digest with a 32-byte seed into a u64 filter hash.
+/// Digest plus seed to filter hash.
 #[inline]
 pub fn mix256(key: &[u64; 4], seed: &[u8; 32]) -> u64 {
     let read_u64 = |offset: usize| -> u64 {
@@ -800,7 +792,7 @@ pub fn mix256(key: &[u64; 4], seed: &[u8; 32]) -> u64 {
         .fold(0u64, |acc, r| acc.wrapping_add(r))
 }
 
-/// 3-wise variant: three filter-array indices for a hash.
+/// The three array slots a hash reduces over.
 #[inline]
 pub const fn hash_batch_for_3_wise_xor_filter(
     hash: u64,
@@ -820,7 +812,7 @@ pub const fn hash_batch_for_3_wise_xor_filter(
     (h0, h1, h2)
 }
 
-/// 4-wise variant: four filter-array indices for a hash.
+/// The four array slots a hash reduces over.
 #[inline]
 pub const fn hash_batch_for_4_wise_xor_filter(
     hash: u64,

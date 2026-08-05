@@ -1,8 +1,5 @@
-//! /batch dispatcher byte-identity test.
-//!
-//! Verifies that dispatching the same batch at K=1, K=4, and K=16 produces byte-identical
-//! response vectors. Catches index-shuffling in the JoinSet drain loop and non-determinism
-//! against a frozen server state.
+//! The same batch at K=1, K=4, K=16 must produce byte-identical response vectors,
+//! catching index-shuffling in the JoinSet drain loop.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 

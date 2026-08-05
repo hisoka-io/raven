@@ -1,5 +1,5 @@
-//! zstd back-compat: magic-sniff dispatch between zstd-wrapped and legacy bare-bincode payloads.
-//! SHA-256 covers the uncompressed payload in both paths; no manifest schema bump required.
+//! Magic-sniff dispatch between zstd-wrapped and legacy bare-bincode payloads.
+//! SHA-256 covers the uncompressed payload on both paths.
 
 #![allow(
     clippy::expect_used,
@@ -139,8 +139,8 @@ fn corrupt_zstd_returns_typed_error() {
 /// Verifies zstd-l3 compresses a production-shaped 170 MiB blob to <= 30% of input size.
 #[test]
 fn zstd_compression_ratio_at_production_blob() {
-    // ~12.5% high-entropy bytes (8 random per 64-byte record) matches the
-    // (commitment_hash, leaf_index, tree_number) shape of a partially-filled Railgun tree.
+    // 8 random bytes per 64-byte record matches the entropy of a partially-filled
+    // commitment tree.
     const TOTAL: usize = 170 * 1024 * 1024;
     let mut payload: Vec<u8> = Vec::with_capacity(TOTAL);
     let mut rng: u64 = 0xDEAD_BEEF_CAFE_F00D_u64;

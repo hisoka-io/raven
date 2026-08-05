@@ -1,9 +1,4 @@
-//! C3 gate: the consume-both timing-leak invariant has its own barrier.
-//!
-//! A timing leak could pass the stress gate if a sidecar hit were never exercised, so C3 is
-//! a distinct asserting test: both engine legs are decoded and the answer is selected on
-//! decrypted CONTENT (a present sidecar value wins; an absent one falls back to main),
-//! never on arrival order. This test covers content-based selection only; the
+//! The fan-out selects on decrypted content, never on arrival order. The companion
 //! both-legs-extracted invariant is asserted by `both_legs_extracted` in src/lib.rs.
 #![allow(
     clippy::expect_used,
@@ -21,14 +16,11 @@ fn consume_both() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut demo = Demo::new(3000, 1_000_000, dir.path(), 0x0000_C0DE).expect("demo");
 
-    // Change two accounts at block 1 (they land in the sidecar, fresher than main).
     let changed_a = demo.accounts[42];
     let changed_b = demo.accounts[2500]; // a different shard
     demo.apply_block(1, &[(changed_a, 777_777), (changed_b, 888_888)])
         .expect("apply block");
 
-    // A changed account: the sidecar holds the fresh value -> selected on content, and the
-    // decoded value is byte-identical to the ledger (proves the sidecar leg was extracted).
     let (ok_a, eng_a) = demo.read_verify(&changed_a).expect("read a");
     assert!(ok_a, "C1: changed account a byte-identical to ledger");
     assert_eq!(
@@ -45,8 +37,6 @@ fn consume_both() {
         "fresh account (other shard) selects sidecar"
     );
 
-    // An untouched account: the sidecar is absent -> falls back to main (proves the main leg
-    // was extracted and the selection is content-based, not arrival-order).
     let untouched = demo.accounts[100];
     let (ok_m, eng_m) = demo.read_verify(&untouched).expect("read main");
     assert!(ok_m, "C1: untouched account byte-identical to ledger");
@@ -56,7 +46,6 @@ fn consume_both() {
         "untouched account falls back to main"
     );
 
-    // After a fold the sidecar resets: the once-changed account is now served by main.
     demo.fold().expect("fold");
     let (ok_post, eng_post) = demo.read_verify(&changed_a).expect("read post-fold");
     assert!(

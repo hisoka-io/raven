@@ -206,17 +206,14 @@ mod tests {
 
     #[test]
     fn table16_row_selection_conservative() {
-        // Below smallest row: returns log_m = 13 row.
         let row = table16_row_for_log_m(10);
         assert_eq!(row.log_m, 13);
         assert_eq!(row.p, 991);
 
-        // Exact match: returns that row.
         let row = table16_row_for_log_m(17);
         assert_eq!(row.log_m, 17);
         assert_eq!(row.p, 495);
 
-        // Between rows: largest log_m row <= input, matching matrix dim.
         let row = table16_row_for_log_m(18);
         assert_eq!(row.log_m, 18);
         assert_eq!(row.p, 416);
@@ -252,14 +249,13 @@ mod tests {
     #[test]
     fn production_validation_rejects_non_canonical_n() {
         let p = LweParams {
-            n: 512, // wrong for production (correct: 1024)
+            n: 512,
             log2_q: 32,
             p: 991,
             l: 1024,
             m: 1024,
             bits_per_element: 9,
         };
-        // validate() lets it through for toy/test usage.
         assert!(p.validate().is_ok());
         assert!(matches!(
             p.validate_production(),

@@ -1,5 +1,4 @@
-//! Fold/encode optimization gates: bounded-materializer early-break, whole-shard dedup of the
-//! fold re-encode, and WAL archive bounding the next recover's replay.
+//! Materializer early-break, whole-shard dedup of the fold re-encode, and WAL archiving.
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -33,8 +32,7 @@ fn read_main(ms: &MainSidecar, sk: RlweSecretKey, leaf: u64) -> Vec<u8> {
     extract_response_rust(&crs, &state, &resp, ENTRY_SIZE).expect("extract")
 }
 
-/// The materializer early-breaks past `shard_end`. A row in a far shard is never read - and
-/// without the break its out-of-shard offset would index past the shard buffer and panic.
+/// Without the early break, a far row's out-of-shard offset would index past the buffer.
 #[test]
 fn materialize_early_break() {
     let store = MemoryStore::new();
@@ -57,9 +55,6 @@ fn materialize_early_break() {
     );
 }
 
-/// A whole-shard change since the last fold makes the sidecar's encoded shard byte-identical
-/// to main's re-encode of the same bytes, so the fold reuses it (the fold-site re-encode counter
-/// does not advance) and the folded main still answers byte-identically.
 #[test]
 #[serial]
 fn dedup_whole_shard_reuses_sidecar() {
@@ -92,8 +87,6 @@ fn dedup_whole_shard_reuses_sidecar() {
     );
 }
 
-/// A fold archives `current.log`, so the next recover replays only the post-fold tail; recover
-/// still reproduces byte-identical state, including an update applied after the archive.
 #[test]
 #[serial]
 fn wal_archive_after_fold_recover() {
@@ -109,13 +102,12 @@ fn wal_archive_after_fold_recover() {
         MainSidecar::seed(&params, &db, ENTRY_SIZE, dir.path(), seed).expect("seed");
 
     ms.apply_updates(1, &[(3, rec(424_242))]).expect("apply1");
-    ms.fold().expect("fold"); // archives the pre-fold WAL
+    ms.fold().expect("fold");
 
     let archived = dir.path().join("wal").join("archived");
     let n_archived = std::fs::read_dir(&archived).map(|d| d.count()).unwrap_or(0);
     assert!(n_archived > 0, "the fold archived current.log");
 
-    // An update appended after the archive, then a crash + recover from snapshot + short tail.
     ms.apply_updates(2, &[(7, rec(555_555))]).expect("apply2");
     drop(ms);
     let (ms2, main_sk, _ssk2) =
@@ -127,9 +119,7 @@ fn wal_archive_after_fold_recover() {
     );
 }
 
-/// Cache survives shard growth: appending a leaf into a new shard grows main (ensure_main_covers)
-/// and, after a fold, the cached respond path answers the new shard byte-identically. Covers the
-/// ensure_main_covers path that the cache-equivalence KAT does not.
+/// Shard growth path, which the cache-equivalence KAT does not reach.
 #[test]
 #[serial]
 fn cached_respond_survives_shard_growth() {
@@ -146,7 +136,7 @@ fn cached_respond_survives_shard_growth() {
     let new_leaf = ENTRIES_PER_SHARD as u64 + 5; // a leaf in a not-yet-present shard
     ms.apply_updates(1, &[(new_leaf, rec(987_654))])
         .expect("apply into a new shard");
-    ms.fold().expect("fold"); // main re-encodes the grown shard
+    ms.fold().expect("fold");
 
     assert_eq!(
         &read_main(&ms, main_sk, new_leaf)[..],

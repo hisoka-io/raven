@@ -1,8 +1,8 @@
-//! Auto-spawn at the production cell shape: the spawned instance must re-encode its dirty
-//! shards and land every row in the slot its global row index selects. `LEAVES` exceeds
-//! `ring_dim`, so the oracle window spans slots 0 and 1: a per-shard row count below
-//! `ring_dim` under-fills slot 0 and shifts every later row into the wrong slot, and a
-//! window confined to one shard's populated prefix cannot see either.
+//! Auto-spawn at the production cell shape.
+//!
+//! `LEAVES` exceeds `ring_dim` so the oracle window spans slots 0 and 1: a
+//! per-shard row count below `ring_dim` under-fills slot 0 and shifts every later
+//! row, which a window confined to one shard's prefix cannot see.
 
 #![allow(
     clippy::expect_used,
@@ -45,8 +45,8 @@ fn tagged_column_value(leaf: u32) -> u64 {
     u64::from(c[30]) | (u64::from(c[31]) << 8)
 }
 
-/// Rows past `leaf_count` hold the IMT's empty-subtree constant, which is not zero, so only
-/// the populated prefix of a slot is a row-identity oracle.
+/// Rows past `leaf_count` hold the IMT empty-subtree constant, not zero, so only a
+/// slot's populated prefix is a row-identity oracle.
 fn assert_slot_carries_leaves(
     coeffs: &[u64],
     shard_id: u32,
@@ -83,7 +83,7 @@ fn runtime(tmp: &std::path::Path) -> AutoSpawnRuntime {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawned_instance_re_encodes_slot_zero_with_first_window_rows() {
-    // The consumer task swallows a failed commit into a tracing error line, so surface it.
+    // The consumer swallows a failed commit into a tracing line, so surface it.
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_max_level(tracing::Level::ERROR)
@@ -153,8 +153,7 @@ async fn spawned_instance_re_encodes_slot_zero_with_first_window_rows() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Quiesce the consumer before the tempdir drops; a commit racing the directory removal
-    // fails on a missing WAL path and muddies the failure output.
+    // Quiesce before the tempdir drops, else a commit races the directory removal.
     handle
         .consumer_sender
         .send(ConsumerEvent::Shutdown)

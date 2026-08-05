@@ -1,7 +1,7 @@
 //! Versioned bincode wire format helpers.
 
-/// Bincode allocation cap per deserialize call; matches the HTTP body cap.
-/// Prevents a crafted length prefix triggering `Vec::with_capacity(2^48)`.
+/// Bincode allocation cap per deserialize; blocks a crafted length prefix from
+/// triggering `Vec::with_capacity(2^48)`.
 pub(crate) const BINCODE_DESERIALIZE_LIMIT: u64 = 8 * 1024 * 1024;
 
 pub(crate) fn bincode_deserialize_capped<T: serde::de::DeserializeOwned>(
@@ -15,8 +15,8 @@ pub(crate) fn bincode_deserialize_capped<T: serde::de::DeserializeOwned>(
         .deserialize(bytes)
 }
 
-/// Wire-protocol schema version; u16 BE prefix on every bincode body.
-/// A major bump means a structural break requiring all clients to upgrade.
+/// Wire-protocol schema version; u16 BE prefix on every bincode body. A bump is a
+/// structural break requiring every client to upgrade.
 pub const WIRE_SCHEMA_VERSION: u16 = 1;
 
 /// Length of the [`WIRE_SCHEMA_VERSION`] prefix in bytes.
@@ -70,22 +70,11 @@ pub fn write_versioned<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, bincod
     Ok(out)
 }
 
-/// Serialize a batch into the cross-language wire format the SDK decoder expects.
+/// Serialize a batch as `[u16 BE version][u64 LE count]{[u64 LE len][bincode]}*`.
 ///
-/// ```text
-/// [u16 BE schema version]
-/// [u64 LE element count]
-/// for each element:
-///   [u64 LE element length]
-///   [bincode(element) bytes]
-/// ```
-///
-/// Per-element length-prefixing is required because `S::Response` is variable-length;
-/// a flat `bincode::serialize(&Vec<T>)` emits no per-element delimiters.
-/// SDK decoder: `decodeBatchBody` in `adapters/railgun/sdk/src/raven-poi-node-interface.ts`.
-///
-/// # Errors
-/// Returns `bincode::Error` if any element fails to serialize.
+/// Per-element length prefixes are required: `S::Response` is variable-length and a
+/// flat `bincode::serialize(&Vec<T>)` emits no delimiters. Decoder counterpart is
+/// `decodeBatchBody` in `sdk/src/raven-poi-node-interface.ts`.
 pub fn write_batch_response_versioned<T: serde::Serialize>(
     items: &[T],
 ) -> Result<Vec<u8>, bincode::Error> {
@@ -103,9 +92,6 @@ pub fn write_batch_response_versioned<T: serde::Serialize>(
 }
 
 /// Decode a batch-response body emitted by [`write_batch_response_versioned`].
-///
-/// # Errors
-/// Returns [`VersionedDecodeError`] on schema mismatch, short body, or bincode failure.
 pub fn read_batch_response_versioned<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<Vec<T>, VersionedDecodeError> {
@@ -144,7 +130,7 @@ pub fn read_batch_response_versioned<T: serde::de::DeserializeOwned>(
     let count = usize::try_from(count_u64).map_err(|_| {
         VersionedDecodeError::Bincode(format!("batch count exceeds usize: {count_u64}"))
     })?;
-    // Cap up-front allocation so a crafted count can't trigger Vec::with_capacity(2^48).
+    // A crafted count must not reach Vec::with_capacity(2^48).
     let cap = count.min(usize::try_from(BINCODE_DESERIALIZE_LIMIT).unwrap_or(usize::MAX) / 16);
     let mut out: Vec<T> = Vec::with_capacity(cap);
     let mut offset = header_end;

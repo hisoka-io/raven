@@ -1,18 +1,14 @@
-//! Manifest: single source of truth for the current snapshot.
-//! Atomic-renamed on every bump; crash before rename leaves the prior snapshot live.
+//! Single source of truth for the current snapshot. Atomic-renamed on every
+//! bump, so a crash before rename leaves the prior snapshot live.
 
 use crate::{atomic_write, PersistenceError, Result, SnapshotId, StoreLayout};
 use serde::{Deserialize, Serialize};
 
-/// Schema version of the manifest; versions outside the
-/// `[MIN_READABLE_MANIFEST_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION]`
-/// window are rejected at load time. V6 signals the snapshot binary
-/// embeds the full encoded state; V5 snapshots rebuild it from WAL replay.
+/// Current schema. V6 embeds the encoded state in the snapshot binary;
+/// V5 rebuilt it from WAL replay.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 6;
 
-/// Oldest manifest schema version this build can read; anything older
-/// is rejected. V5 is read-only legacy: decoded, rebuilt from WAL on
-/// open, upgraded to V6 on the next commit.
+/// Oldest readable schema; V5 is upgraded to V6 on the next commit.
 pub const MIN_READABLE_MANIFEST_SCHEMA_VERSION: u32 = 5;
 
 /// On-disk manifest; JSON-serialized for human-readable forensics.
@@ -20,7 +16,7 @@ pub const MIN_READABLE_MANIFEST_SCHEMA_VERSION: u32 = 5;
 pub struct Manifest {
     /// Accepted range `[MIN_READABLE_MANIFEST_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION]`.
     pub schema_version: u32,
-    /// Scheme tag; bootstrap rejects a scheme mismatch against the configured engine.
+    /// Bootstrap rejects a mismatch against the configured engine.
     pub scheme_tag: String,
     /// Operator-defined instance id.
     pub instance_id: String,
@@ -28,20 +24,19 @@ pub struct Manifest {
     pub current_snapshot_id: SnapshotId,
     /// First WAL seq the replayer must consume (`last_seq_in_snapshot + 1`).
     pub current_snapshot_seq: u64,
-    /// Caller-supplied monotonic marker covered by the current snapshot.
-    /// On-disk key stays `current_block_height` for format stability.
+    /// Caller-supplied monotonic marker; on-disk key stays
+    /// `current_block_height` for format stability.
     #[serde(rename = "current_block_height")]
     pub current_marker: u64,
     /// Encoder discriminator; bootstrap rejects a label mismatch.
     pub encoder_label: String,
-    /// Set only during an in-flight encoder migration; `None` at steady state.
-    /// Allows recovery to detect a partially completed migration.
+    /// `Some` only mid-migration, which is how recovery detects a partial one.
     #[serde(default)]
     pub prev_encoder_label: Option<String>,
 }
 
 impl Manifest {
-    /// Load the manifest. Returns `Ok(None)` if the file is missing (caller bootstraps fresh).
+    /// `Ok(None)` when the file is missing; the caller bootstraps fresh.
     pub fn load(layout: &StoreLayout) -> Result<Option<Self>> {
         let path = layout.manifest_path();
         let bytes = match std::fs::read(&path) {
@@ -70,10 +65,8 @@ impl Manifest {
         atomic_write(&layout.manifest_path(), &bytes)
     }
 
-    /// Serialize the manifest into an arbitrary writer without the atomic-rename pipeline.
-    ///
-    /// Exercises the JSON-encode -> `write_all` boundary the production path traverses,
-    /// so fault-injection tests can force a write error without a real tmpfs.
+    /// Serialize into an arbitrary writer, skipping the atomic-rename pipeline,
+    /// so fault injection can force a write error without a real tmpfs.
     pub fn save_to_writer<W: std::io::Write>(&self, writer: &mut W) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(self)?;
         writer.write_all(&bytes).map_err(PersistenceError::Io)

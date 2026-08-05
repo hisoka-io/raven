@@ -1,9 +1,5 @@
-//! Wiring tests for `--ws-endpoint` on `serve-production`: the WS primary
-//! serves while healthy, transport-class errors fall back to polling, and the
-//! transition surfaces through the `ModeFlag` the `/v1/health/ready` handler reads.
-//!
-//! Driven with synthetic `ChainSource` impls for determinism; the real
-//! `tokio_tungstenite` listener is covered by the indexer crate's own tests.
+//! `--ws-endpoint` wiring: WS primary while healthy, fallback to polling on a
+//! transport-class error, surfaced through the `/v1/health/ready` `ModeFlag`.
 
 #![allow(
     clippy::expect_used,

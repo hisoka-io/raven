@@ -1,10 +1,4 @@
-//! Fold/reset gate: deterministic in-process fold + reset (no chain).
-//!
-//! Seeds N>2048 accounts across 3 shards, drives in-place updates into shards 0 and 2
-//! only (shard 1 untouched), folds once, and asserts: (a) only the dirty shards are
-//! re-encoded; (b) the post-fold main answers updated + untouched balances byte-identically;
-//! (c) the sidecar is reset to empty; (d) the main epoch advanced by exactly 1; (e) a
-//! captured pre-fold snapshot still answers the pre-fold balance (old main served throughout).
+//! Deterministic in-process fold and reset over 3 shards, only two of them dirty.
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -50,7 +44,7 @@ fn fold_reset_deterministic() {
     let params = InspireParams::secure_128_d2048();
     let dir = tempfile::tempdir().expect("tempdir");
 
-    // 5000 accounts span shards 0 (0..2048), 1 (2048..4096), 2 (4096..5000). balance = leaf+1.
+    // 5000 accounts span shards 0, 1 and 2; balance = leaf + 1.
     let n = 5000usize;
     let mut db = vec![0u8; n * ENTRY_SIZE];
     for leaf in 0..n {
@@ -67,7 +61,7 @@ fn fold_reset_deterministic() {
     let main_session = build_session(&main_crs, main_sk, params.sigma, 1).expect("main session");
     let side_session = build_session(&side_crs, side_sk, params.sigma, 2).expect("side session");
 
-    // 128 updates in shards 0 and 2 ONLY (shard 1 untouched), crossing the shard boundary.
+    // Shards 0 and 2 only; shard 1 stays clean.
     let mut updates = Vec::new();
     for leaf in 0u64..64 {
         updates.push((leaf, bytes_be((leaf as u128) + 1_000_000)));
@@ -82,14 +76,12 @@ fn fold_reset_deterministic() {
 
     ms.fold().expect("fold");
 
-    // (a) bounded materialization: only the 2 dirty shards (0, 2) re-encoded, not all 3.
     assert_eq!(
         ms.re_encode_count(),
         2,
         "only the 2 dirty shards re-encoded, not num_shards (3)"
     );
 
-    // (b) post-fold correctness: updated leaf is fresh; untouched shard-1 leaf is unchanged.
     let b10 = read(
         &main_session,
         &params,
@@ -117,7 +109,6 @@ fn fold_reset_deterministic() {
         "untouched shard-1 leaf 2500"
     );
 
-    // (c) sidecar reset to empty.
     let b_side = read(
         &side_session,
         &params,
@@ -132,15 +123,13 @@ fn fold_reset_deterministic() {
         "sidecar reset to empty after fold"
     );
 
-    // (d) epoch advanced by exactly 1.
     assert_eq!(
         ms.main.current_epoch(),
         pre_epoch.next(),
         "main epoch advanced by 1"
     );
 
-    // (e) old main served continuously: the captured pre-fold snapshot still answers the
-    // pre-fold balance after the swap landed (snapshot isolation across swap_state).
+    // Snapshot isolation across swap_state: the captured old main still serves.
     let b10_old = read(
         &main_session,
         &params,

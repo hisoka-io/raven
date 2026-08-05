@@ -1,9 +1,8 @@
-//! Real anvil JSON-RPC E2E driver (feature `anvil-e2e`). Seeds balances via the anvil cheat
-//! codes (no signing, no gas), reads them back, and serves them through the SAME consume-both
-//! fan-out + C1 verifier as the synthetic gate. The synthetic deterministic mode remains the
-//! offline exit gate; this path needs a running anvil node and is the Sepolia-promotion route.
+//! Anvil JSON-RPC driver. Seeds balances via the cheat codes (no signing, no gas), reads them
+//! back, and serves them through the same consume-both fan-out and verifier as the synthetic
+//! gate. Requires a running anvil node.
 
-// Operator-facing E2E driver output, like the synthetic bin entry point.
+// Operator-facing driver output.
 #![allow(clippy::print_stdout)]
 
 use std::error::Error;
@@ -18,8 +17,8 @@ use crate::ingest::normalize_balance_be;
 use crate::{build_session, read_balance_consume_both, EngineHandle, ENTRY_SIZE};
 use raven_inspire::params::InspireParams;
 
-/// Run the anvil-backed E2E: seed `num_accounts` balances on the node, serve `reads` private
-/// reads through the consume-both fan-out, and verify each against the on-chain balance.
+/// Seed `num_accounts` balances on the node, serve `reads` private reads, verify each against
+/// the on-chain balance.
 pub fn run(rpc_url: &str, num_accounts: usize, reads: usize) -> Result<(), Box<dyn Error>> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -35,12 +34,11 @@ fn leaf_address(i: usize) -> EvmAddress {
 
 async fn run_async(rpc_url: &str, num_accounts: usize, reads: usize) -> Result<(), Box<dyn Error>> {
     let provider = ProviderBuilder::new().connect(rpc_url).await?;
-    // baseFee=0 so the cheat-coded balances are the whole ledger (no fee term).
+    // baseFee=0 so the cheat-coded balances are the whole ledger, with no fee term.
     provider
         .anvil_set_next_block_base_fee_per_gas(0u128)
         .await?;
 
-    // Seed balances via the cheat code, then read each back as the ground truth.
     let mut ledger: Vec<u128> = Vec::with_capacity(num_accounts);
     for i in 0..num_accounts {
         let addr = leaf_address(i);
@@ -52,8 +50,7 @@ async fn run_async(rpc_url: &str, num_accounts: usize, reads: usize) -> Result<(
     for i in 0..num_accounts {
         let bal: U256 = provider.get_balance(leaf_address(i)).await?;
         let be = bal.to_be_bytes::<32>();
-        // Guarded narrowing to u128 (the demo's ground-truth ledger is u128): error rather than
-        // truncate if a balance exceeds 2^128. The tagged record itself holds up to 2^248.
+        // Fail rather than truncate: the ledger is u128, the tagged record holds up to 2^248.
         if be[..16].iter().any(|&b| b != 0) {
             return Err(format!("on-chain balance for account {i} exceeds u128").into());
         }
@@ -62,7 +59,6 @@ async fn run_async(rpc_url: &str, num_accounts: usize, reads: usize) -> Result<(
         ledger.push(u128::from_be_bytes(low));
     }
 
-    // Build the PIR corpus from the on-chain balances and serve it.
     let params = InspireParams::secure_128_d2048();
     let mut db = vec![0u8; num_accounts * ENTRY_SIZE];
     for (i, &bal) in ledger.iter().enumerate() {

@@ -1,16 +1,12 @@
-//! Fixed-size ladder for batched PIR requests.
-//!
-//! An unpadded batch publishes `|batch|` in the clear, which is the wallet's
-//! note count. Padding to a dyadic ladder replaces that with the bucket the
-//! count falls in, at under 2x worst-case slot overhead.
+//! Fixed-size ladder for batched PIR requests. An unpadded batch publishes
+//! `|batch|` in the clear; padding to a dyadic ladder leaks only the bucket, at
+//! under 2x worst-case slot overhead.
 
 use serde::{Deserialize, Serialize};
 
-/// Permitted batch sizes, ascending.
-///
-/// Dyadic so worst-case padding overhead stays under 2x. The ladder stops at
-/// 32 because a 32-slot upload is 3.16 MB at the measured 98,840 B/query,
-/// which fits the 8 MiB default body cap with headroom; 64 would not.
+/// Permitted batch sizes, ascending. Dyadic to cap padding overhead at 2x, and
+/// stopping at 32 because 64 slots exceed the 8 MiB default body cap at the
+/// measured 98,840 B/query.
 pub const BATCH_SIZE_LADDER: [usize; 6] = [1, 2, 4, 8, 16, 32];
 
 /// Largest batch the ladder admits.
@@ -25,11 +21,9 @@ pub fn is_on_ladder(len: usize) -> bool {
     BATCH_SIZE_LADDER.contains(&len)
 }
 
-/// Smallest ladder step that fits `len` real queries.
-///
-/// `None` for an empty batch and for anything above [`max_batch_size`]; a
-/// caller with more real queries than the top step must split into several
-/// batches, each of which pads independently.
+/// Smallest ladder step fitting `len` real queries; `None` when empty or above
+/// [`max_batch_size`], where the caller must split into independently-padded
+/// batches.
 #[must_use]
 pub fn padded_len(len: usize) -> Option<usize> {
     BATCH_SIZE_LADDER.iter().copied().find(|step| *step >= len)
@@ -82,7 +76,7 @@ impl std::error::Error for LadderViolation {}
 /// Accept `len` only if it is a ladder step.
 ///
 /// # Errors
-/// Returns the [`LadderViolation`] naming the step the caller should have used.
+/// A [`LadderViolation`] naming the step the caller should have used.
 pub fn check_batch_len(len: usize) -> Result<(), LadderViolation> {
     if len == 0 {
         return Err(LadderViolation::Empty);

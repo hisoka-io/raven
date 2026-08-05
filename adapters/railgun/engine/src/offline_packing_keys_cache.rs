@@ -1,7 +1,6 @@
-//! Disk-backed cache for InspiRING `(PackParams, OfflinePackingKeys)`.
-//!
-//! Persisting the offline phase skips its O(d^3) rebuild on restart. Writes are
-//! atomic-rename; a cell-shape fingerprint rejects reuse against a different CRS.
+//! Disk-backed `(PackParams, OfflinePackingKeys)` cache, skipping the O(d^3)
+//! offline rebuild on restart. Atomic-rename writes; a cell-shape fingerprint
+//! rejects reuse against a different CRS.
 
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -55,15 +54,13 @@ pub enum OfflinePackingKeysCacheError {
 /// Cell-shape fingerprint identifying a `(PackParams, OfflinePackingKeys)` pair.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CellShape {
-    /// Scheme tag (e.g. `b"raven-inspire-twopacking-wp3"`). Rejects caches
-    /// from sibling schemes that picked the same cell dimensions.
+    /// Scheme tag; rejects sibling schemes that picked the same cell shape.
     pub scheme_tag: Vec<u8>,
     /// Number of database entries.
     pub entries: u64,
     /// Bytes per entry.
     pub entry_bytes: u64,
-    /// Stable identifier for the InspiRING packing parameters; caller derives
-    /// from a serialised view of `InspireParams`.
+    /// Stable identifier for the packing parameters.
     pub packing_param_id: Vec<u8>,
 }
 
@@ -98,7 +95,7 @@ struct CacheFile {
     offline_keys: OfflinePackingKeys,
 }
 
-/// Boxed inside [`CacheLoad::Hit`] (clippy `large_enum_variant`).
+/// Boxed inside [`CacheLoad::Hit`] to keep the enum small.
 #[derive(Debug)]
 pub struct CacheParts {
     /// Cached pack parameters.
@@ -145,8 +142,7 @@ impl OfflinePackingKeysCache {
         &self.path
     }
 
-    /// Try to load. `Miss` carries a typed reason; returns no `Result` so the
-    /// caller is forced to handle the miss inline.
+    /// Try to load; `Miss` carries a typed reason, so the caller cannot `?` past it.
     #[must_use]
     pub fn load(&self, cell: &CellShape) -> CacheLoad {
         match self.try_load(cell) {
@@ -209,8 +205,7 @@ impl OfflinePackingKeysCache {
         atomic_write(&self.path, &bytes)
     }
 
-    /// Try the cache; on miss run `build_fresh` and persist. Returns the cache
-    /// paired with `true` for a disk hit, `false` if the offline phase ran.
+    /// Load, or run `build_fresh` and persist. The flag is `true` on a disk hit.
     pub fn load_or_build<F, E>(
         &self,
         cell: &CellShape,
@@ -254,7 +249,6 @@ pub enum CacheBuildError<E> {
     Cache(#[from] OfflinePackingKeysCacheError),
 }
 
-// tmp + fsync + rename + parent fsync.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), OfflinePackingKeysCacheError> {
     let parent = path
         .parent()
@@ -264,7 +258,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), OfflinePackingKeysCache
     let file_name = path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "cache path has no file name")
     })?;
-    // Suffix with pid+seq so concurrent writers don't stomp each other's tmp.
+    // pid+seq suffix so concurrent writers do not stomp each other's tmp file.
     let mut tmp_name = file_name.to_owned();
     tmp_name.push(format!(".tmp.{:x}.{}", std::process::id(), next_tmp_seq()));
     tmp.set_file_name(tmp_name);

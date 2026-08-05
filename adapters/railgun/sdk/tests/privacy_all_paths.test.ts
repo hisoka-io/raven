@@ -82,7 +82,6 @@ describe("privacy across every SDK call path", () => {
       (req) => /^\/v1\/instance\/[^/]+\/(query|batch)$/.test(req.url ?? ""),
       (req, _body, res) => {
         if ((req.url ?? "").endsWith("/batch")) {
-          // Synthetic batch reply: `[u16 schema][u64 LE count][per-elem u64 LE len + bytes]`, 16 slots per auth path.
           const elemCount = 16;
           const r = responses[cursor % responses.length];
           cursor += 1;
@@ -127,7 +126,6 @@ describe("privacy across every SDK call path", () => {
         queriedBcs.map((bc) => ({ blindedCommitment: bc, type: "Shield" as const })),
       );
     } catch {
-      // Tolerated: only the captured wire requests matter here.
     }
     assertNoBcLeaked(sdk.lastWireRequests(), queriedBcs);
     assertNoBcLeaked(
@@ -143,7 +141,6 @@ describe("privacy across every SDK call path", () => {
       (req) => /^\/v1\/instance\/[^/]+\/(query|batch)$/.test(req.url ?? ""),
       (req, _body, res) => {
         if ((req.url ?? "").endsWith("/batch")) {
-          // Synthetic batch reply: `[u16 schema][u64 LE count][per-elem u64 LE len + bytes]`, 16 slots per auth path.
           const elemCount = 16;
           const r = responses[cursor % responses.length];
           cursor += 1;
@@ -185,7 +182,6 @@ describe("privacy across every SDK call path", () => {
     try {
       await sdk.getPOIMerkleProofs(fixture.meta.list_key_hex, queriedBcs);
     } catch {
-      // Tolerated: only the wire-out direction is asserted.
     }
     assertNoBcLeaked(sdk.lastWireRequests(), queriedBcs);
     assertNoBcLeaked(
@@ -201,7 +197,6 @@ describe("privacy across every SDK call path", () => {
       (req) => /^\/v1\/instance\/[^/]+\/(query|batch)$/.test(req.url ?? ""),
       (req, _body, res) => {
         if ((req.url ?? "").endsWith("/batch")) {
-          // Synthetic batch reply: `[u16 schema][u64 LE count][per-elem u64 LE len + bytes]`, 16 slots per auth path.
           const elemCount = 16;
           const r = responses[cursor % responses.length];
           cursor += 1;
@@ -242,7 +237,6 @@ describe("privacy across every SDK call path", () => {
     try {
       await sdk.getMerkleProof(0, 1234);
     } catch {
-      // Tolerated: only the wire-out direction is asserted.
     }
 
     const wires = sdk.lastWireRequests();

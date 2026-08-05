@@ -1,11 +1,9 @@
 //! Append-only crc32-framed write-ahead log.
 //!
-//! Frame layout: `[seq u64 BE | marker u64 BE | payload_len u32 BE | crc32 u32 BE | payload]`.
-//! CRC covers all preceding fields + payload. A torn tail write yields a bad CRC and truncates.
-//! `seq` is the WAL's own monotonic counter; `marker` is a caller-supplied monotonic
-//! value recorded per entry, enabling truncation of entries above a given value.
-//! Payloads are opaque: [`Wal::append`] serializes any `Serialize` value and the log
-//! returns the raw bytes back on [`Wal::replay`]; the caller owns deserialization.
+//! Frame: `[seq u64 BE | marker u64 BE | payload_len u32 BE | crc32 u32 BE | payload]`,
+//! crc over everything preceding it plus the payload. `seq` is the WAL's own
+//! monotonic counter; `marker` is caller-supplied and also monotonic. Payloads
+//! are opaque - [`Wal::replay`] hands the raw bytes back undecoded.
 
 use crate::{PersistenceError, Result, StoreLayout};
 use parking_lot::Mutex;
@@ -13,21 +11,21 @@ use serde::Serialize;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 
-/// Maximum payload length per entry; guards against nonsense `payload_len` from torn writes.
+/// Per-entry ceiling; rejects a nonsense `payload_len` from a torn write.
 pub const WAL_MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 /// One on-the-wire WAL entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WalEntry {
-    /// Monotonic sequence number.
+    /// Monotonic within the log.
     pub seq: u64,
-    /// Caller-supplied monotonic marker recorded per entry; enables truncation above a value.
+    /// Caller-supplied, monotonic; lets a caller truncate above a value.
     pub marker: u64,
-    /// Bincode-serialized opaque payload.
+    /// Opaque to this crate.
     pub payload: Vec<u8>,
 }
 
-/// Append-only WAL. Internal mutex serializes `append`; `replay` opens a fresh read handle.
+/// Append-only WAL. The mutex serializes `append`; `replay` opens its own read handle.
 #[derive(Debug)]
 pub struct Wal {
     layout: StoreLayout,
@@ -42,10 +40,8 @@ struct WalState {
 }
 
 impl Wal {
-    /// Open or create the WAL at `data_dir/wal/current.log`.
-    ///
-    /// `last_committed_seq`: `Some(s)` = snapshot committed through seq `s`; `None` = fresh DB.
-    /// The on-disk tail wins when higher than the floor.
+    /// Open or create `data_dir/wal/current.log`. `last_committed_seq` sets a
+    /// resume floor; the on-disk tail wins when it is higher.
     pub fn open(layout: &StoreLayout, last_committed_seq: Option<u64>) -> Result<Self> {
         let path = layout.wal_current_path();
         if let Some(parent) = path.parent() {
@@ -65,7 +61,7 @@ impl Wal {
         }
 
         if let Some(truncate_at) = scan.truncate_at {
-            // Drop before re-opening for write; some filesystems disallow concurrent write handles.
+            // some filesystems disallow concurrent write handles
             drop(file);
             let f = OpenOptions::new().write(true).open(&path)?;
             f.set_len(truncate_at)?;
@@ -84,11 +80,8 @@ impl Wal {
         })
     }
 
-    /// Append a payload entry; assigns next seq, fsyncs, returns the assigned seq.
-    ///
-    /// The payload is bincode-serialized and stored opaquely; the bound is
-    /// `Serialize` only because the WAL never deserializes - [`Wal::replay`]
-    /// returns the raw bytes and the caller owns the decode.
+    /// Assigns the next seq, fsyncs, returns that seq. The bound is `Serialize`
+    /// alone because the WAL never decodes what it stores.
     pub fn append<P: Serialize>(&self, payload: &P, marker: u64) -> Result<u64> {
         let bincoded = bincode::serialize(payload)?;
         if bincoded.len() > WAL_MAX_PAYLOAD_BYTES {
@@ -128,7 +121,7 @@ impl Wal {
         Ok(seq)
     }
 
-    /// Replay all entries from the start of the file.
+    /// All entries from the start of the file, in seq order.
     pub fn replay(&self) -> Result<WalReplay> {
         let path = self.layout.wal_current_path();
         let scan = scan_full(&path)?;
@@ -145,10 +138,8 @@ impl Wal {
         self.inner.lock().last_marker
     }
 
-    /// Archive `current.log` and start a fresh one.
-    ///
-    /// Fsyncs both the source (`wal/`) and target (`wal/archived/`) parent directories
-    /// after the rename so the rename is durable before returning success.
+    /// Seal `current.log` under `wal/archived/` and start a fresh one. Both
+    /// parent dirs are fsynced, so the rename is durable before this returns.
     pub fn archive(&self, from_seq: u64, to_seq: u64) -> Result<()> {
         let mut state = self.inner.lock();
         state.file.sync_all()?;
@@ -172,7 +163,7 @@ impl Wal {
         crate::fsync_parent_dir(&archive_parent)?;
         let new_file = open_wal_owner_only(&current)?;
         new_file.sync_all()?;
-        // Fsync source parent again to make the new current.log creation durable.
+        // second pass makes the new current.log's creation durable
         if let Some(source_parent) = current.parent() {
             crate::fsync_parent_dir(source_parent)?;
         }
@@ -184,11 +175,11 @@ impl Wal {
 /// Result of a full WAL replay.
 #[derive(Debug)]
 pub struct WalReplay {
-    /// All valid entries in seq order.
+    /// Valid entries, in seq order.
     pub entries: Vec<WalEntry>,
     /// Byte offset of a torn tail, if any.
     pub truncated_at: Option<u64>,
-    /// Next free seq (last valid seq + 1, or 0).
+    /// Last valid seq + 1, or 0.
     pub next_seq: u64,
     /// Marker of the last valid entry, or 0.
     pub last_marker: u64,
@@ -201,7 +192,7 @@ struct ScanResult {
     truncate_at: Option<u64>,
 }
 
-/// Open the WAL with owner-only mode on Unix (0o600); falls back to default on non-Unix.
+/// Mode 0o600 on Unix; default elsewhere.
 fn open_wal_owner_only(path: &std::path::Path) -> Result<File> {
     #[cfg(unix)]
     {
@@ -254,7 +245,6 @@ fn scan_full(path: &std::path::Path) -> Result<WalReplay> {
             break;
         }
         if total - offset < 24 {
-            // Partial header; truncate at the start of this entry.
             return Ok(WalReplay {
                 entries,
                 truncated_at: Some(offset),
@@ -361,8 +351,6 @@ mod tests {
         (dir, layout)
     }
 
-    // Exercises the generic `append<P>` with a real struct payload; the WAL itself
-    // is payload-agnostic, so any `Serialize` type round-trips.
     #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
     struct TestPayload {
         tag: u32,
@@ -483,7 +471,6 @@ mod tests {
         assert_eq!(replay.entries.first().expect("present").seq, 3);
     }
 
-    /// A CRC-valid frame with a non-monotonic seq must be detected and truncated.
     #[test]
     fn non_monotonic_seq_is_treated_as_torn_tail() {
         let (_d, layout) = make_layout();
@@ -497,7 +484,7 @@ mod tests {
         let payload_bin = bincode::serialize(&test_payload(99)).expect("ser");
         let payload_len: u32 = payload_bin.len().try_into().expect("len");
         let mut header = [0u8; 24];
-        header[0..8].copy_from_slice(&99u64.to_be_bytes()); // seq=99, should be 3
+        header[0..8].copy_from_slice(&99u64.to_be_bytes()); // next valid seq is 3
         header[8..16].copy_from_slice(&200u64.to_be_bytes());
         header[16..20].copy_from_slice(&payload_len.to_be_bytes());
         let mut hasher = crc32fast::Hasher::new();

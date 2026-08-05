@@ -22,7 +22,6 @@ use raven_railgun_indexer::rpc_pool::{
     EndpointConfig, PoolConfig, PoolStrategy, RpcEndpointPool, DEFAULT_COOLDOWN_SECS,
 };
 
-/// Per-endpoint heterogeneous entry.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EndpointEntry {
     pub url: String,
@@ -30,7 +29,6 @@ pub struct EndpointEntry {
     pub burst: u32,
 }
 
-/// Pool-wide knobs.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PoolMeta {
     #[serde(default = "default_strategy")]
@@ -47,14 +45,13 @@ fn default_cooldown() -> u64 {
     DEFAULT_COOLDOWN_SECS
 }
 
-/// Optional `[ws_endpoints]` block.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct WsConfig {
     #[serde(default)]
     pub urls: Vec<String>,
 }
 
-/// Top-level array-shaped pool config consumed by the bootstrap subcommand.
+/// Array-shaped pool config consumed by the bootstrap subcommand.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RpcEndpointArrayConfig {
     pub rpc_endpoint: Vec<EndpointEntry>,
@@ -71,7 +68,6 @@ fn default_pool_meta() -> PoolMeta {
     }
 }
 
-/// Errors surfaced by the loader.
 #[derive(Debug, thiserror::Error)]
 pub enum RpcPoolArrayError {
     #[error("read {path}: {error}")]
@@ -95,7 +91,6 @@ pub enum RpcPoolArrayError {
 }
 
 impl RpcEndpointArrayConfig {
-    /// Load + validate the config from disk.
     pub fn load_from_path(path: &Path) -> Result<Self, RpcPoolArrayError> {
         let raw = std::fs::read_to_string(path).map_err(|e| RpcPoolArrayError::Read {
             path: path.display().to_string(),
@@ -104,7 +99,6 @@ impl RpcEndpointArrayConfig {
         Self::load_from_str(&raw)
     }
 
-    /// Parse + validate from a TOML string.
     pub fn load_from_str(raw: &str) -> Result<Self, RpcPoolArrayError> {
         let parsed: Self =
             toml::from_str(raw).map_err(|e| RpcPoolArrayError::Parse(e.to_string()))?;
@@ -145,8 +139,8 @@ impl RpcEndpointArrayConfig {
         Ok(())
     }
 
-    /// Materialise into an `RpcEndpointPool`; per-endpoint rps/burst flow
-    /// through unclamped so heterogeneous budgets reach the limiter.
+    /// Per-endpoint rps/burst flow through unclamped so heterogeneous budgets
+    /// reach the limiter.
     pub fn build_pool(&self) -> Result<RpcEndpointPool, RpcPoolArrayError> {
         let strategy = match self.rpc_pool.strategy.as_str() {
             "round-robin" => PoolStrategy::RoundRobin,

@@ -1,6 +1,7 @@
-//! Single-instance production serve path: wires persistence, chain indexer, PPOI mirror,
-//! and axum HTTP server. On SIGINT/SIGTERM: drains in-flight requests, sends
-//! `ConsumerEvent::Shutdown` for a final `drive_commit`, then waits for indexer + mirror workers.
+//! Single-instance production serve path.
+//!
+//! Shutdown order is load-bearing: drain in-flight requests, send
+//! `ConsumerEvent::Shutdown` for a final `drive_commit`, then await the workers.
 
 #![allow(clippy::too_many_lines, clippy::missing_errors_doc)]
 
@@ -39,8 +40,8 @@ pub struct ProductionServeOptions {
     pub metrics_public: bool,
 }
 
-/// Default cell for the per-leaf encoder family: 65,536 rows x 512 B (16 siblings x 32 B).
-/// The per-node encoders derive a different shape from `TREE_DEPTH`.
+/// Per-leaf cell: 65,536 rows x 512 B (16 siblings x 32 B). Per-node encoders
+/// derive a different shape from `TREE_DEPTH`.
 pub const DEFAULT_PRODUCTION_ENTRIES: usize = 65_536;
 pub const DEFAULT_PRODUCTION_ENTRY_BYTES: usize = 512;
 
@@ -85,7 +86,6 @@ async fn signal_shutdown() {
     }
 }
 
-/// Bind- and shutdown-injected variant for tests.
 pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'static>(
     opts: ProductionServeOptions,
     listener: tokio::net::TcpListener,
@@ -93,7 +93,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
 ) -> anyhow::Result<()> {
     const CONSUMER_DRAIN_SECS: u64 = 5;
     const WORKER_DRAIN_SECS: u64 = 12;
-    // abort() is a signal; the task drops at its next await. 2 s covers RPC poll latency.
+    // abort() only signals; the task drops at its next await, up to one RPC poll away.
     const ABORT_AWAIT_SECS: u64 = 2;
     use alloy::primitives::Address;
     use raven_railgun_indexer::{
@@ -187,8 +187,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         Arc::clone(&chain_source),
         handle.channels.indexer_tx.clone(),
     );
-    // Never start the indexer below the recovered manifest height, else it
-    // re-scans a prefix the consumer would only drop as duplicates.
+    // Below the recovered manifest height the indexer re-scans a duplicate prefix.
     let recovered_floor = opts
         .start_block
         .max(handle.persistence.manifest_block_height());
@@ -216,8 +215,8 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     );
     let mirror_tx = handle.channels.mirror_tx.clone();
     let mirror_clone = Arc::clone(&mirror);
-    // Cursor sidecar under data_dir so a restart resumes from the post-WAL-replay
-    // floor instead of re-firing `expected list_index N, got 0..N-1` on startup.
+    // Under data_dir so a restart resumes from the post-WAL-replay floor instead of
+    // re-firing `expected list_index N, got 0..N-1`.
     let mirror_kind = mirror_kind_for_encoder(opts.encoder);
     let fallback = {
         let store = handle.logical_store.lock();
@@ -255,8 +254,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         std::collections::HashMap::new();
     k_map.insert(handle.instance.id.clone(), resolved_k);
     let app_state = app_state.with_instance_concurrency(k_map);
-    // Wire instance_metrics so `/metrics` emits the `instance="..."` label that
-    // dashboards expect, not just the legacy single-cell `consumer_metrics` shape.
+    // Emits the `instance="..."` label, not just the single-cell `consumer_metrics` shape.
     let mut instance_metrics: std::collections::HashMap<
         raven_railgun_core::InstanceId,
         Arc<parking_lot::Mutex<raven_railgun_engine::persistence::ConsumerMetrics>>,
@@ -264,13 +262,11 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     instance_metrics.insert(handle.instance.id.clone(), Arc::clone(&handle.metrics));
     let app_state = app_state.with_instance_metrics(instance_metrics);
 
-    // Sweeper drops past-TTL session entries even if the bearer never repeats.
     let mut auxiliary_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     auxiliary_tasks.push(app_state.start_session_sweeper(std::time::Duration::from_secs(60)));
     auxiliary_tasks.push(app_state.start_packing_key_sweeper(std::time::Duration::from_secs(60)));
 
-    // Heartbeat eviction bounds resident memory under bearer churn by dropping
-    // every live session once per interval. `0` disables.
+    // Bounds resident memory under bearer churn by dropping every live session.
     if opts.session_eviction_interval_secs > 0 {
         let instance = Arc::clone(&handle.instance);
         let instance_id = handle.instance.id.clone();
@@ -319,9 +315,8 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     .with_graceful_shutdown(shutdown)
     .await?;
 
-    // Order: Shutdown -> consumer final drive_commit -> receiver drop closes the
-    // indexer/mirror bridges -> workers exit. abort_handle captured before the
-    // timeout consumes the JoinHandle, else abort() could not fire.
+    // Shutdown -> consumer final drive_commit -> receiver drop closes the bridges ->
+    // workers exit. abort_handle is captured before the timeout consumes the JoinHandle.
     let indexer_abort = indexer_handle.abort_handle();
     let mirror_abort = mirror_handle.abort_handle();
     let _ = handle
@@ -353,7 +348,6 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     )
     .await;
 
-    // Auxiliary tasks run forever; abort them so the process exits cleanly.
     for task in auxiliary_tasks {
         task.abort();
         let _ = tokio::time::timeout(abort_await_deadline, task).await;
@@ -362,8 +356,8 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     Ok(())
 }
 
-/// Wait `drain_deadline` for the worker; if still alive, `abort()` (dropping a
-/// JoinHandle only detaches) and wait `abort_await_deadline` for unwinding.
+/// Wait `drain_deadline`, then `abort()` and wait `abort_await_deadline` for
+/// unwinding; dropping a JoinHandle only detaches.
 async fn drain_or_abort_worker<T>(
     name: &str,
     handle: tokio::task::JoinHandle<T>,
@@ -380,7 +374,6 @@ async fn drain_or_abort_worker<T>(
         "worker did not exit within drain window; aborting"
     );
     abort.abort();
-    // abort() returns immediately; sleep so cancellation can propagate.
     tokio::time::sleep(abort_await_deadline).await;
     tracing::warn!(
         worker = name,
@@ -419,7 +412,6 @@ fn parse_hex32(s: &str) -> anyhow::Result<[u8; 32]> {
     Ok(out)
 }
 
-/// Dispatch [`raven_railgun_ppoi_mirror::MirrorKind`] from the encoder:
 /// `per-list-path` owns the path sidecar; every other kind uses the status sidecar.
 fn mirror_kind_for_encoder(
     encoder: raven_railgun_engine::pir_table::EncoderKind,
@@ -470,7 +462,6 @@ mod tests {
         let timed_out = tokio::time::timeout(std::time::Duration::from_millis(50), handle).await;
         assert!(timed_out.is_err(), "timeout must fire on infinite task");
         abort.abort();
-        // Re-spawn to exercise the JoinError path (original handle is consumed).
         let handle2 = tokio::spawn(async {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;

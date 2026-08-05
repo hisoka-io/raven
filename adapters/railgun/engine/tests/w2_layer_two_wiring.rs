@@ -1,6 +1,6 @@
-//! Layer 2 root-verifier wiring into the orchestrator's `drive_commit`
-//! loop. Locks: per-commit verify on ChainRootHistory; OutOfSync cascade
-//! through `apply_reorg`; UpstreamSignature instances never call the verifier.
+//! Layer 2 verifier wiring in `drive_commit`: per-commit verify under
+//! ChainRootHistory, OutOfSync cascading through `apply_reorg`, and no verifier
+//! call at all under UpstreamSignature.
 
 #![allow(
     clippy::expect_used,
@@ -35,7 +35,8 @@ struct SyntheticChainSource {
     root_history_calls: AtomicU64,
     active_tree_calls: AtomicU64,
     flip_after_calls: u64,
-    // verifier calls root_history before merkle_root; caching the root lets merkle_root match without mirroring the engine IMT
+    // root_history runs first, so caching its root lets merkle_root agree without
+    // mirroring the engine IMT.
     last_seen_root: parking_lot::Mutex<[u8; 32]>,
 }
 
@@ -113,7 +114,7 @@ fn build_toy_state() -> raven_railgun_core::Result<InspireServerState> {
 
 fn canonical_commitment(byte: u8) -> [u8; 32] {
     let mut b = [0u8; 32];
-    // high byte < 0x30 keeps the value Fr-canonical for the IMT's Poseidon hash
+    // Keeps the value Fr-canonical for the IMT's Poseidon hash.
     b[31] = byte;
     b
 }
@@ -144,7 +145,6 @@ async fn layer2_verifier_fires_per_commit_and_cascades_reorg_on_out_of_sync() {
     let params = InspireParams::secure_128_d2048();
     let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
 
-    // every event triggers a commit (max_appends_per_snapshot=1) and a verify (cadence_n=1)
     for i in 0..50u32 {
         let height = 100 + u64::from(i);
         let leaf = canonical_commitment(u8::try_from((i & 0xff) | 0x01).expect("byte"));
@@ -167,7 +167,8 @@ async fn layer2_verifier_fires_per_commit_and_cascades_reorg_on_out_of_sync() {
             .expect("send leaf");
     }
 
-    // assert on reorgs_handled, not full drain: post-cascade appends are rejected as non-contiguous, so events_processed stalls
+    // Post-cascade appends are rejected as non-contiguous, so events_processed
+    // stalls and only reorgs_handled is a sound assertion target.
     let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         let m = *handle.metrics.lock();
@@ -206,13 +207,12 @@ async fn layer2_verifier_fires_per_commit_and_cascades_reorg_on_out_of_sync() {
         "post-cascade leaf_count must be <= 5 (the flip-window survivor); got {post_cascade_count}"
     );
 
-    // leaf 0 landed at block 100 <= last_in_sync_height (104)
     assert!(
         handle.logical_store.lock().leaf(0, 0).is_some(),
         "leaf at index 0 must survive the cascade",
     );
 
-    // root_history once per verify cycle: anchor-threading regression guard
+    // One root_history call per verify cycle guards the shared anchor.
     let history_calls = chain_source.root_history_count();
     assert!(
         history_calls >= verify_calls,
@@ -230,7 +230,7 @@ async fn layer2_verifier_fires_per_commit_and_cascades_reorg_on_out_of_sync() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn layer2_verifier_does_not_fire_on_upstream_signature_instance() {
     let dir = tempfile::tempdir().expect("tempdir");
-    // flip_after_calls=0 fails on the first verify; any verify on an UpstreamSignature instance trips it
+    // Fails on the first verify, so any verifier call at all trips this.
     let chain_source = Arc::new(SyntheticChainSource::new(0));
 
     let mut config = OrchestratorConfig::demo(dir.path().to_path_buf(), "w2-ppoi-regression");
@@ -270,7 +270,7 @@ async fn layer2_verifier_does_not_fire_on_upstream_signature_instance() {
             .expect("send");
     }
 
-    // 30s deadline is a deadlock detector, not a throughput floor (debug + shared scheduler headroom)
+    // Deadlock detector, not a throughput floor.
     let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let m = *handle.metrics.lock();

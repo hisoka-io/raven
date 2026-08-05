@@ -1,9 +1,7 @@
 //! Peer-gated client-IP extraction.
 //!
 //! Forwarding headers are attacker-controlled unless the immediate peer is a
-//! proxy the operator named. A boolean cannot express that distinction, so
-//! trust is scoped to CIDR ranges and an untrusted peer always keys to its own
-//! socket address.
+//! proxy the operator named, so trust is scoped to CIDR ranges.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
@@ -74,10 +72,8 @@ pub struct IpCidr {
 }
 
 impl IpCidr {
-    /// True when `addr` falls inside this network.
-    ///
-    /// IPv4-mapped IPv6 peers are compared as IPv4, so a dual-stack listener
-    /// still matches IPv4 ranges. Write IPv4 ranges in IPv4 form.
+    /// True when `addr` falls inside this network. IPv4-mapped IPv6 peers compare
+    /// as IPv4, so write IPv4 ranges in IPv4 form.
     pub fn contains(&self, addr: IpAddr) -> bool {
         match (self.network, canonical_ip(addr)) {
             (IpAddr::V4(network), IpAddr::V4(ip)) => mask_v4(ip, self.prefix_len) == network,
@@ -159,20 +155,12 @@ impl FromStr for IpCidr {
 }
 
 /// Parse a `trusted_proxy_cidrs` list, preserving order.
-///
-/// # Errors
-/// The first entry that fails to parse.
 pub fn parse_trusted_ranges(entries: &[String]) -> Result<Vec<IpCidr>, CidrParseError> {
     entries.iter().map(|e| e.parse()).collect()
 }
 
-/// Resolve an operator's `(trust_proxy_header, trusted_proxy_cidrs)` pair.
-///
-/// Empty result means no peer is trusted. Callable before any engine work so an
-/// exposed-origin config is refused at parse time rather than after bootstrap.
-///
-/// # Errors
-/// `Err(String)` when the two fields disagree or an entry fails to parse.
+/// Resolve an operator's `(trust_proxy_header, trusted_proxy_cidrs)` pair; empty
+/// means no peer is trusted. Callable before any engine work.
 pub fn resolve_declared_ranges(
     trust_proxy_header: bool,
     trusted_proxy_cidrs: &[String],
@@ -198,13 +186,10 @@ pub fn resolve_declared_ranges(
     }
 }
 
-/// Rate-limit key extractor that honours forwarding headers only from trusted peers.
+/// Rate-limit key extractor honouring forwarding headers only from trusted peers.
 ///
-/// An untrusted peer keys to its own socket address. A trusted peer's
-/// `x-forwarded-for` chain is walked RIGHT to LEFT and the first entry outside
-/// every trusted range wins: a proxy appends the address it saw, so only the
-/// suffix is proxy-authored and everything left of it is caller-supplied.
-/// An empty range list trusts nobody.
+/// `x-forwarded-for` is walked RIGHT to LEFT and the first entry outside every
+/// trusted range wins: only the proxy-appended suffix is authentic.
 #[derive(Clone, Debug)]
 pub struct TrustedProxyIpKeyExtractor {
     trusted: Arc<[IpCidr]>,
@@ -226,10 +211,8 @@ impl TrustedProxyIpKeyExtractor {
         peer_ip(req).is_some_and(|peer| self.trusts(peer))
     }
 
-    /// Rightmost `x-forwarded-for` entry outside every trusted range.
-    ///
-    /// `None` when the chain is absent, unparseable, or entirely trusted; the
-    /// caller then falls back to the socket peer.
+    /// Rightmost `x-forwarded-for` entry outside every trusted range; `None` when
+    /// the chain is absent, unparseable, or entirely trusted.
     fn rightmost_untrusted<T>(&self, req: &Request<T>) -> Option<IpAddr> {
         let chain: Vec<IpAddr> = req
             .headers()

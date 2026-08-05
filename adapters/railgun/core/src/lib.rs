@@ -1,7 +1,5 @@
-//! Shared types for the Raven Railgun PIR adapter.
-//!
-//! These types mirror Railgun's wire shapes (per `shared-models/src/models/`)
-//! but are owned by Raven so we don't take a hard TS-package dependency.
+//! Shared adapter types. Mirror the upstream wire shapes in
+//! `shared-models/src/models/` without depending on the TS package.
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 #![deny(missing_docs)]
@@ -10,15 +8,12 @@ use serde::{Deserialize, Serialize};
 
 pub mod batch_ladder;
 
-/// Generic server-runtime identity and error types, re-exported from `raven-core`
-/// so existing `raven_railgun_core::{InstanceId, Epoch, AdapterError}` import
-/// sites keep compiling. The definitions live in `raven-core`.
+/// Server-runtime identity and error types, re-exported from `raven-core`.
 pub use raven_core::{Epoch, InstanceId, ServerError as AdapterError};
 
-/// 32-byte blinded commitment as defined in the Railgun engine's `src/poi/blinded-commitment.ts`.
-///
-/// For shield/transact: `Poseidon(commitmentHash, npk, globalTreePosition)`.
-/// For unshield: `railgunTxid` formatted to 32 bytes.
+/// Blinded commitment per upstream `src/poi/blinded-commitment.ts`:
+/// `Poseidon(commitmentHash, npk, globalTreePosition)` for shield/transact,
+/// the txid as 32 bytes for unshield.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BlindedCommitment(
     /// Raw bytes.
@@ -37,10 +32,7 @@ impl BlindedCommitment {
     }
 }
 
-/// PPOI list identifier (32-byte content hash).
-///
-/// In production the only active list is OFAC,
-/// `efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88`.
+/// 32-byte list content hash.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ListKey(
     /// Raw bytes.
@@ -59,30 +51,25 @@ impl ListKey {
     }
 }
 
-/// Commitment type per `BlindedCommitmentType` in
-/// `shared-models/src/models/proof-of-innocence.ts`.
+/// Commitment type per upstream `BlindedCommitmentType`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum BlindedCommitmentType {
-    /// On-chain `Shield` event commitment. `npk` is public; `bc =
-    /// Poseidon(commitmentHash, npk, globalTreePosition)`.
+    /// `Shield` event commitment; `npk` is public.
     Shield,
-    /// On-chain `Transact` event commitment. `npk` is encrypted in
-    /// the ciphertext; the BC is computed by Railgun off-chain.
+    /// `Transact` event commitment; `npk` is encrypted, so the BC is off-chain.
     Transact,
-    /// On-chain `Unshield` event. The BC is the `railgunTxid` formatted
-    /// to 32 bytes (no Poseidon hashing).
+    /// `Unshield` event; the BC is the txid as 32 bytes, unhashed.
     Unshield,
 }
 
-/// PPOI status per `POIStatus` in
-/// `shared-models/src/models/proof-of-innocence.ts`.
+/// Status per upstream `POIStatus`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum POIStatus {
     /// PPOI submitted and accepted.
     Valid,
-    /// Shield blocked by the list provider (e.g. an OFAC sanction match).
+    /// Shield blocked by the list provider.
     ShieldBlocked,
     /// PPOI proof submitted but not yet validated.
     ProofSubmitted,
@@ -90,19 +77,14 @@ pub enum POIStatus {
     Missing,
 }
 
-/// Merkle authentication path: 16 sibling hashes (Poseidon BN254 field elements,
-/// 32 bytes each), the root they hash to, and the leaf-position bitmap.
-///
-/// Same shape Railgun uses (`shared-models/src/models/proof-of-innocence.ts`)
-/// for both the commitment tree, the TXID tree, and per-list PPOI trees.
+/// Merkle authentication path: 16 Poseidon BN254 siblings, their root, and the
+/// leaf-position bitmap. Shared by every upstream tree shape.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MerkleProof {
     /// Merkle root the path hashes up to.
     pub root: [u8; 32],
-    /// Leaf-position bitmap: `bit_i = (leaf_index >> i) & 1`. During
-    /// reconstruction, `0` = leaf-side is LEFT, `1` = leaf-side is RIGHT.
-    /// Packed into `u16` vs the upstream 32-byte hex string
-    /// (Railgun engine `src/merkletree/merkletree.ts`).
+    /// `bit_i = (leaf_index >> i) & 1`; 0 puts the leaf side left, 1 right.
+    /// Packed to `u16` where upstream uses a 32-byte hex string.
     pub indices: u16,
     /// 16 sibling hashes, leaf-to-root.
     pub elements: [[u8; 32]; 16],
@@ -111,22 +93,20 @@ pub struct MerkleProof {
 /// One leaf of the on-chain commitment tree.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitmentLeaf {
-    /// Tree index (0-based) within the Railgun proxy's commitment-tree set.
+    /// 0-based tree index within the commitment-tree set.
     pub tree_number: u32,
     /// Leaf index within the tree.
     pub leaf_index: u32,
     /// Poseidon-derived commitment hash (leaf value of the IMT).
     pub commitment_hash: [u8; 32],
-    /// Encrypted note payload (variable length per V2/V3 encoding).
+    /// Encrypted payload; length varies by encoding version.
     pub ciphertext: Vec<u8>,
 }
 
-/// Decoded chain event the indexer emits to the engine.
-///
-/// Mirrors Railgun's event schema (`RailgunLogic.sol:56-77`).
+/// Decoded chain event, mirroring the upstream `RailgunLogic.sol` schema.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RailgunEvent {
-    /// `Shield` event: deposits to the Railgun proxy, npk is public.
+    /// `Shield`: deposit, `npk` public.
     Shield {
         /// Block height.
         block_number: u64,
@@ -139,7 +119,7 @@ pub enum RailgunEvent {
         /// New commitment leaves.
         leaves: Vec<CommitmentLeaf>,
     },
-    /// `Transact` event: private transfer; npk is encrypted in `ciphertext`.
+    /// `Transact`: private transfer, `npk` encrypted in `ciphertext`.
     Transact {
         /// Block height.
         block_number: u64,
@@ -152,7 +132,7 @@ pub enum RailgunEvent {
         /// New commitment leaves.
         leaves: Vec<CommitmentLeaf>,
     },
-    /// `Nullified` event: previously-shielded note marked spent.
+    /// `Nullified`: a prior commitment marked spent.
     Nullified {
         /// Block height.
         block_number: u64,
@@ -163,7 +143,7 @@ pub enum RailgunEvent {
         /// Nullifier hashes.
         nullifiers: Vec<[u8; 32]>,
     },
-    /// `Unshield` event: withdrawal to a public address.
+    /// `Unshield`: withdrawal to a public address.
     Unshield {
         /// Block height.
         block_number: u64,
@@ -180,7 +160,7 @@ pub enum RailgunEvent {
     },
 }
 
-/// Per-`(blindedCommitment, listKey)` association (a single row of T1's table).
+/// One `(blindedCommitment, listKey)` association row.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoiStatusRow {
     /// The BC keyed against the list.
@@ -206,7 +186,7 @@ mod tests {
 
     #[test]
     fn poi_status_serde_pascal_case() {
-        // serde rename_all = "PascalCase" matches Railgun's TS enum string format.
+        // PascalCase matches the upstream TS enum string format.
         let s = serde_json::to_string(&POIStatus::Valid).expect("serialize");
         assert_eq!(s, "\"Valid\"");
         let s = serde_json::to_string(&POIStatus::ShieldBlocked).expect("serialize");

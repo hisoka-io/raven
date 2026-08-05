@@ -1,25 +1,12 @@
-//! SYNTHETIC PPOI surface impersonator.
+//! Synthetic stand-in for the upstream PPOI service, so the mirror worker can
+//! populate empty instances without a live upstream.
 //!
-//! Stands in for the upstream Railway PPOI service so the adapter's
-//! mirror worker can populate empty PPOI instances during the public
-//! demo. The corpus is generated deterministically from a seed and
-//! tagged as Valid by default; an optional CSV file lets the operator
-//! flip specific blinded commitments to ShieldBlocked for the
-//! leak-vs-no-leak demo contrast.
+//! NEVER deploy this crate. The corpus is synthetic, signatures are
+//! deterministic placeholders, and there is no list authority; it is adequate
+//! only because the adapter does not verify upstream signatures.
 //!
-//! NEVER deploy this crate to production. The data is synthetic. The
-//! signing key is freshly generated at startup. There is no list
-//! authority. The adapter does not verify upstream signatures, which
-//! is what makes this stand-in functionally adequate for the demo
-//! pipeline; treating its output as authoritative would conflate
-//! real-OFAC data with a synthetic corpus.
-//!
-//! The wire shape mirrors the upstream contract verified at
-//! `private-proof-of-innocence/packages/node/src/api/schemas.ts`
-//! and `models/poi-types.ts`: `POST /poi-events/{chainType}/{chainID}`
-//! returns `Vec<POISyncedListEvent>` and
-//! `POST /pois-per-blinded-commitment/{chainType}/{chainID}` returns a
-//! `{[bc]: POIStatus}` map.
+//! Wire shape mirrors `private-proof-of-innocence/packages/node/src/api`
+//! (`schemas.ts`, `models/poi-types.ts`).
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 #![deny(missing_docs)]
@@ -50,9 +37,8 @@ pub const DEFAULT_CORPUS_SEED_HEX: &str =
 pub const DEFAULT_LIST_KEY_HEX: &str =
     "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88";
 
-/// Distinct startup banner. Tests assert this fires so stale binaries
-/// without the synthetic-tag log can never silently pass for real
-/// upstream feeds.
+/// Startup banner; tests assert it fires so an untagged stale binary can never
+/// pass for a real upstream feed.
 pub const SYNTHETIC_BANNER: &str =
     "raven-railgun-mock-ppoi: SYNTHETIC corpus, do not pass off as real OFAC";
 
@@ -68,8 +54,7 @@ pub enum MockError {
     /// Underlying engine error from the per-list IMT.
     #[error("imt: {0}")]
     Imt(String),
-    /// Poseidon hash construction failed (should be impossible for
-    /// canonical 32-byte inputs).
+    /// Poseidon hash construction failed.
     #[error("poseidon: {0}")]
     Poseidon(String),
     /// TCP bind / accept failed.
@@ -80,11 +65,8 @@ pub enum MockError {
 /// Convenience type alias for fallible operations within this crate.
 pub type Result<T> = core::result::Result<T, MockError>;
 
-/// Synthetic PPOI corpus state, materialised once at startup.
-///
-/// The corpus is `(blinded_commitment, status, validatedMerkleroot)`
-/// triples ordered by their list-index, plus a lookup map
-/// `bc -> (index, status)` for the per-bc query endpoint.
+/// Synthetic corpus: `(blinded_commitment, status, validatedMerkleroot)`
+/// ordered by list-index, plus a `bc -> (index, status)` lookup.
 #[derive(Debug)]
 pub struct Corpus {
     list_key_bytes: [u8; 32],
@@ -93,17 +75,14 @@ pub struct Corpus {
     by_bc: HashMap<[u8; 32], (u32, POIStatus)>,
 }
 
-/// Public accessor row for an entry in the synthetic corpus. Tests
-/// and integrations consume this via [`Corpus::events_view`] without
-/// needing to reach into private fields.
+/// Read-only view of one corpus entry, yielded by [`Corpus::events_view`].
 #[derive(Clone, Copy, Debug)]
 pub struct SyntheticEvent {
-    /// List-index assigned by the corpus generator (monotone from 0).
+    /// List-index, monotone from 0.
     pub index: u32,
-    /// 32-byte blinded commitment (Poseidon-derived).
+    /// Poseidon-derived blinded commitment.
     pub blinded_commitment: [u8; 32],
-    /// Status as the corpus reports it (`Valid` by default; CSV
-    /// overrides flip selected BCs to `ShieldBlocked`).
+    /// `Valid` unless a CSV override flips it to `ShieldBlocked`.
     pub status: POIStatus,
     /// Per-list IMT root after this event was inserted.
     pub validated_merkleroot: [u8; 32],
@@ -118,29 +97,20 @@ pub struct CorpusConfig {
     pub seed: [u8; 32],
     /// Number of synthetic blinded commitments to emit.
     pub size: u32,
-    /// Optional override-set: BCs that should report `ShieldBlocked`
-    /// instead of the default `Valid`.
+    /// BCs that report `ShieldBlocked` instead of `Valid`.
     pub blocked: Vec<[u8; 32]>,
 }
 
 impl Corpus {
-    /// Deterministically construct a synthetic corpus.
-    ///
-    /// Each blinded commitment is `Poseidon(seed, i, list_key)` with
-    /// inputs encoded as 32-byte big-endian field elements (the same
-    /// circomlibjs convention the rest of the adapter uses). The
-    /// `validatedMerkleroot` for event `i` is the post-insert root of
-    /// a per-list IMT built incrementally; the spec requires roots to
-    /// strictly advance as events accrue.
+    /// Deterministically construct a synthetic corpus. Each commitment is
+    /// `Poseidon(seed, i, list_key)` over 32-byte big-endian field elements
+    /// (circomlibjs convention); `validatedMerkleroot` is the post-insert
+    /// per-list IMT root, which must strictly advance per event.
     ///
     /// # Errors
     ///
-    /// Returns [`MockError::Poseidon`] if a deterministic input falls
-    /// outside the BN254 scalar field (in practice never; we mask the
-    /// high bits of each input below `Fr::MODULUS`). Returns
-    /// [`MockError::Imt`] if leaf insertion ever fails (also unreachable
-    /// for canonical inputs but surfaced as a typed error rather than
-    /// a panic).
+    /// [`MockError::Poseidon`] if an input falls outside the BN254 scalar
+    /// field, [`MockError::Imt`] if leaf insertion fails.
     pub fn generate(config: CorpusConfig) -> Result<Self> {
         let CorpusConfig {
             list_key,
@@ -194,8 +164,7 @@ impl Corpus {
         self.events.get(start_us..end_us).unwrap_or(&[])
     }
 
-    /// Look up the status of a single blinded commitment. Returns
-    /// `Missing` if the BC is not in the synthetic corpus.
+    /// Status of one blinded commitment; `Missing` when absent.
     fn status_for(&self, bc: &[u8; 32]) -> POIStatus {
         self.by_bc
             .get(bc)
@@ -237,9 +206,7 @@ fn derive_blinded_commitment(seed: &[u8; 32], index: u32, list_key: &[u8; 32]) -
         .map_err(|e| MockError::Poseidon(format!("hash_n: {e}")))
 }
 
-/// Clear the top 4 bits so the resulting big-endian buffer is always
-/// below the BN254 scalar modulus (`p` has its top byte = 0x30, so
-/// masking to 0x0F leaves headroom).
+/// Mask the top 4 bits so the big-endian buffer stays below the BN254 modulus.
 fn mask_to_fr(input: &[u8; 32]) -> [u8; 32] {
     let mut out = *input;
     if let Some(byte) = out.first_mut() {
@@ -293,12 +260,11 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Bind to `addr` and serve the router until the future is dropped.
+/// Bind to `addr` and serve until the future is dropped.
 ///
 /// # Errors
 ///
-/// Returns [`MockError::Bind`] if the TCP bind fails or if `axum::serve`
-/// errors during the accept loop.
+/// [`MockError::Bind`] on bind failure or an accept-loop error.
 pub async fn serve(addr: SocketAddr, state: AppState) -> Result<()> {
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(addr)
@@ -310,15 +276,12 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> Result<()> {
         .map_err(|e| MockError::Bind(format!("serve: {e}")))
 }
 
-/// Bind to `addr` (resolving port-zero to an OS-chosen port) and return
-/// the listener alongside the bound `SocketAddr`. Used by integration
-/// tests so they can spawn the service on a dynamic port without
-/// racing on a hard-coded one.
+/// Bind to `addr`, resolving port zero to an OS-chosen port, and return the
+/// listener with its bound `SocketAddr`.
 ///
 /// # Errors
 ///
-/// Returns [`MockError::Bind`] if the TCP bind fails or the resulting
-/// local-address read fails.
+/// [`MockError::Bind`] on bind failure or a local-address read failure.
 pub async fn bind_listener(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr)> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -329,11 +292,11 @@ pub async fn bind_listener(addr: SocketAddr) -> Result<(tokio::net::TcpListener,
     Ok((listener, local))
 }
 
-/// Serve `state` on a pre-bound listener. Pairs with [`bind_listener`].
+/// Serve `state` on a listener from [`bind_listener`].
 ///
 /// # Errors
 ///
-/// Returns [`MockError::Bind`] if the axum accept loop errors.
+/// [`MockError::Bind`] if the accept loop errors.
 pub async fn serve_on(listener: tokio::net::TcpListener, state: AppState) -> Result<()> {
     let app = build_router(state);
     tracing::info!("{SYNTHETIC_BANNER}");
@@ -497,14 +460,13 @@ async fn handle_node_status_root(State(state): State<AppState>) -> impl IntoResp
     })
 }
 
-/// Read newline-delimited blinded-commitment hex strings from `path`.
-/// Empty lines and lines starting with `#` are ignored. Each entry
-/// must be exactly 64 hex chars (with an optional `0x` prefix).
+/// Read newline-delimited 64-char commitment hex from `path`, skipping blank
+/// and `#` lines.
 ///
 /// # Errors
 ///
-/// - [`MockError::CsvRead`] if the file cannot be opened or read.
-/// - [`MockError::InvalidHex`] if any non-comment line fails to decode.
+/// [`MockError::CsvRead`] on read failure, [`MockError::InvalidHex`] on a
+/// non-comment line that fails to decode.
 pub fn load_blocked_csv(path: &Path) -> Result<Vec<[u8; 32]>> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| MockError::CsvRead(format!("{}: {e}", path.display())))?;
@@ -559,13 +521,9 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
-/// Synthesize a deterministic 64-byte signature hex placeholder.
-///
-/// The adapter does not verify upstream signatures, so the wire shape
-/// only needs a non-empty hex string of plausible length. We expand a
-/// `Poseidon(bc, index)` digest into 64 bytes by hashing twice with
-/// distinct domain bytes; the value is reproducible across runs but
-/// cryptographically meaningless.
+/// Deterministic 64-byte signature placeholder. Cryptographically meaningless;
+/// the adapter does not verify upstream signatures, so only the wire shape
+/// matters.
 fn synthetic_signature_hex(bc: &[u8; 32], index: u32) -> String {
     let mut idx_buf = [0u8; 32];
     idx_buf[28..].copy_from_slice(&index.to_be_bytes());
@@ -582,22 +540,22 @@ fn synthetic_signature_hex(bc: &[u8; 32], index: u32) -> String {
     out
 }
 
-/// Decode a hex-encoded list-key parameter into a [`ListKey`].
+/// Decode a hex list key.
 ///
 /// # Errors
 ///
-/// Returns [`MockError::InvalidHex`] if the string is not 64 hex chars.
+/// [`MockError::InvalidHex`] if the string is not 64 hex chars.
 pub fn list_key_from_hex(hex: &str) -> Result<ListKey> {
     let bytes = decode_hex32(hex)
         .ok_or_else(|| MockError::InvalidHex(format!("expected 64 hex chars, got: {hex}")))?;
     Ok(ListKey::from_bytes(bytes))
 }
 
-/// Decode a hex-encoded 32-byte seed.
+/// Decode a hex 32-byte seed.
 ///
 /// # Errors
 ///
-/// Returns [`MockError::InvalidHex`] if the string is not 64 hex chars.
+/// [`MockError::InvalidHex`] if the string is not 64 hex chars.
 pub fn seed_from_hex(hex: &str) -> Result<[u8; 32]> {
     decode_hex32(hex).ok_or_else(|| MockError::InvalidHex(format!("seed must be 64 hex: {hex}")))
 }

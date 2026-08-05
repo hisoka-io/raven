@@ -227,7 +227,6 @@ describe("loadClientPirContext warm-cache", () => {
 
   it("falls through to cold path when WASM lacks serde symbols", async () => {
     const wasm = makeSpyWasm();
-    // Emulate an older WASM build lacking the optional serde methods.
     delete wasm.serialize_client_session;
     delete wasm.deserialize_client_session;
 
@@ -337,7 +336,6 @@ describe("idb chunked + integrity-verified storage", () => {
 
     await idbPut(instanceId, crsHash, blob);
 
-    // idbPut version-prefixes the key; find it to corrupt chunk-1.
     const metaSuffix = "#meta";
     const metaEntry = Array.from(probe.map.keys()).find((k) =>
       k.endsWith(metaSuffix),
@@ -355,7 +353,6 @@ describe("idb chunked + integrity-verified storage", () => {
     const got = await idbGet(instanceId, crsHash);
     expect(got).toBeNull();
 
-    // The failed get must have evicted every record for the entry.
     const stragglers = Array.from(probe.map.keys()).filter(
       (k) => k === baseKey || k.startsWith(`${baseKey}#`),
     );

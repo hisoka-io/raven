@@ -33,7 +33,7 @@ pub struct DrainAdminResponse {
 
 pub(crate) fn admin_token_matches<S: PirScheme>(app: &AppState<S>, headers: &HeaderMap) -> bool {
     let Some(admin) = app.admin_token.as_ref().as_ref() else {
-        // Dummy compare keeps the no-admin path the same cost as the with-admin path.
+        // Keeps the no-admin path equal-cost.
         let _ = ct_eq_str(b"", b"");
         return false;
     };
@@ -71,7 +71,6 @@ pub(crate) async fn admin_drain_handler<S: PirScheme>(
     let deadline = Instant::now() + Duration::from_millis(DRAIN_PROMOTE_BUDGET_MS);
     while Instant::now() < deadline {
         if instance.in_flight_count() == 0 {
-            // Guard against a concurrent undrain racing in.
             if instance.drain_state() == DrainState::Draining {
                 instance.set_drain_state(DrainState::Drained);
             }
@@ -210,7 +209,6 @@ pub(crate) async fn session_establish_handler(
         "instance" => instance_id.to_string()
     )
     .increment(1);
-    // session_lru_cap < 2^32 by default; cast is safe.
     #[allow(clippy::cast_precision_loss)]
     let occupancy = app.sessions.len() as f64;
     metrics::gauge!(
@@ -264,8 +262,7 @@ pub(crate) async fn params_handler(
         .ok_or(StatusCode::NOT_FOUND)?;
     let epoch = instance.current_epoch();
 
-    // Skip multi-MB CRS serialization when the cached `(epoch, sha)` matches
-    // the caller's `If-None-Match`.
+    // Skips multi-MB CRS serialization on an If-None-Match hit.
     let cached_etag_value = {
         let guard = app.params_etag_cache.read();
         guard
@@ -331,8 +328,7 @@ pub(crate) async fn params_handler(
     };
     let body = write_versioned(&payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // ETag = SHA-256(body), cached as `(epoch, sha)` so an epoch bump
-    // invalidates without growing the map.
+    // Cached as `(epoch, sha)` so an epoch bump invalidates without growing the map.
     let sha = if let Some(value) = cached_etag_value.as_ref() {
         // Re-parse the cached hex rather than re-hash the fresh body.
         parse_hex_sha(value).unwrap_or_else(|| sha256_of(&body))

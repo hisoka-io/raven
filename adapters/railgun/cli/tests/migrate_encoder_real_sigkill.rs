@@ -1,6 +1,5 @@
-//! Real-SIGKILL closure for the offline `migrate-encoder` tool.
-//! Spawns migration as a fork+exec'd subprocess, parks at a named
-//! checkpoint, then SIGKILLs and asserts the documented disk-state contract.
+//! Real-SIGKILL closure for `migrate-encoder`: park a subprocess at a named
+//! checkpoint, kill it, assert the disk-state contract.
 
 #![cfg(unix)]
 #![cfg_attr(
@@ -347,7 +346,7 @@ fn real_sigkill_at_post_snapshot_keeps_old_manifest_then_resume_succeeds() {
 #[test]
 #[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn real_sigkill_at_pre_manifest_bump_keeps_old_manifest_then_resume_succeeds() {
-    // pre-manifest-bump aliases post-snapshot (identical on-disk shape); kept distinct for intent
+    // Aliases post-snapshot on disk; kept distinct for intent.
     let dir = tempfile::tempdir().expect("tempdir");
     seed_dir(dir.path(), EncoderKind::PerLeafBc);
 
@@ -381,7 +380,7 @@ fn real_sigkill_at_pre_manifest_bump_keeps_old_manifest_then_resume_succeeds() {
 #[test]
 #[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn real_sigkill_at_post_manifest_bump_yields_fully_migrated_state() {
-    // migration completes before the kill; re-running must hit the idempotency guard, not touch disk
+    // The kill lands post-migration, so the re-run must hit the idempotency guard.
     let dir = tempfile::tempdir().expect("tempdir");
     seed_dir(dir.path(), EncoderKind::PerLeafBc);
 

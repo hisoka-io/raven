@@ -1,5 +1,4 @@
-//! Auto-spawn helpers: data-dir templating, spawn log (JSONL) read/write, and instance-id
-//! generation. Pure sync - no tokio, no PIR engine interaction.
+//! Data-dir templating, JSONL spawn log, and instance-id generation. Pure sync.
 
 use std::path::{Path, PathBuf};
 
@@ -15,7 +14,6 @@ pub struct AutoSpawnConfig {
     pub entry_bytes: usize,
 }
 
-/// One line in `spawn_log.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnRecord {
     pub tree_number: u32,
@@ -72,12 +70,11 @@ pub fn append_spawn_record(registry_dir: &Path, record: &SpawnRecord) -> anyhow:
     Ok(())
 }
 
-/// One line in `ppoi_list_spawn_log.jsonl`. Kept in a separate file from [`SpawnRecord`]
-/// so chain-tree replay (which keys on `tree_number`) stays isolated.
+/// One line in `ppoi_list_spawn_log.jsonl`, kept apart from [`SpawnRecord`] so
+/// chain-tree replay stays keyed purely on `tree_number`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PpoiListSpawnRecord {
-    /// Template id is recorded so restart replay can locate the matching `[[ppoi_list_template]]`
-    /// row even if the operator reordered the TOML between runs.
+    /// Locates the matching `[[ppoi_list_template]]` row across TOML reorderings.
     pub template_id: String,
     pub list_key_hex: String,
     pub encoder: String,
@@ -96,9 +93,8 @@ pub fn data_dir_for_list(template: &str, list_key: &[u8; 32]) -> PathBuf {
     PathBuf::from(template.replace("{list_key}", &list_key_hex_lower(list_key)))
 }
 
-/// `<template_id>-<first-8-hex-chars-of-list-key>`. Template id is the discriminator so two
-/// templates with the same encoder but different `template_id` on the same list_key get distinct
-/// engine slots.
+/// `<template_id>-<first-8-hex-of-list-key>`; the template id keeps two templates
+/// over one list_key in distinct engine slots.
 #[must_use]
 pub fn instance_id_for_list(template_id: &str, list_key: &[u8; 32]) -> String {
     let hex = list_key_hex_lower(list_key);
@@ -141,7 +137,7 @@ pub fn append_ppoi_list_spawn_record(
     Ok(())
 }
 
-/// Load all valid records from `ppoi_list_spawn_log.jsonl`; skips malformed lines.
+/// Valid records from `ppoi_list_spawn_log.jsonl`; malformed lines are skipped.
 pub fn load_ppoi_list_spawn_log(registry_dir: &Path) -> anyhow::Result<Vec<PpoiListSpawnRecord>> {
     use std::io::BufRead;
 
@@ -185,7 +181,7 @@ pub fn load_ppoi_list_spawn_log(registry_dir: &Path) -> anyhow::Result<Vec<PpoiL
     Ok(records)
 }
 
-/// Load all valid records from `spawn_log.jsonl`; skips malformed lines. Returns oldest first.
+/// Valid records from `spawn_log.jsonl`, oldest first; malformed lines are skipped.
 pub fn load_spawn_log(registry_dir: &Path) -> anyhow::Result<Vec<SpawnRecord>> {
     use std::io::BufRead;
 

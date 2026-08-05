@@ -30,7 +30,7 @@ use tower::ServiceExt;
 const TOKEN: &str = "test-token-padded-long-enough-1234";
 const ENTRIES_PER_SHARD: u32 = 65_536;
 
-// Serialise AppState::new to avoid races on the global metrics recorder.
+// Serialises AppState::new against the global metrics recorder.
 static APPSTATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Default)]
@@ -323,7 +323,7 @@ async fn status_header_partitions_blocked_and_pending_bcs() {
     );
 }
 
-// Trip-wire: compile fails if PoiStatusRow or InstanceId are removed from the workspace.
+// Compile-time trip-wire on PoiStatusRow + InstanceId.
 #[test]
 fn poi_status_row_remains_in_workspace() {
     let _ = std::any::type_name::<PoiStatusRow>();
@@ -355,7 +355,6 @@ async fn freshness_header_value_format_is_well_formed() {
     .with_logical_store(Arc::clone(&store_arc))
     .with_consumer_metrics(Arc::clone(&metrics));
 
-    // Guards the format-string contract; flipping field separators would fail here.
     let snap = *metrics.lock();
     let lag = snap.indexer_lag_blocks();
     assert_eq!(lag, 10);
@@ -516,8 +515,7 @@ async fn pois_per_list_rejects_more_blinded_commitments_than_the_cap() {
 #[tokio::test]
 async fn pois_per_list_rejects_a_lookup_product_past_the_cap_when_each_vector_fits() {
     let (router, _) = build_router();
-    // 64 x 1024 = 65,536 store lookups and BTreeMap inserts under the global store
-    // mutex, from two vectors that each satisfy their own cap.
+    // 65,536 lookups under the global store mutex from two individually-capped vectors.
     let payload = serde_json::json!({
         "listKeys": distinct_list_keys(64),
         "blindedCommitmentDatas": distinct_bc_datas(1024),

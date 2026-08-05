@@ -14,10 +14,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use raven_railgun_cli::bearer_token::BEARER_TOKEN_ENV;
 
-/// Operator-CLI HTTP timeout for one-shot status requests. 30s matches the
-/// indexer's `MAX_RPC_TOTAL_ELAPSED_SECS` posture and the
-/// `SUBSQUID_REQUEST_TIMEOUT` precedent, preventing indefinite hangs on a
-/// stalled server.
+/// One-shot status timeout; matches the indexer's `MAX_RPC_TOTAL_ELAPSED_SECS`.
 const STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Parser, Debug)]
@@ -71,10 +68,8 @@ enum Commands {
         /// Local address to bind the HTTP server.
         #[arg(long, default_value = "127.0.0.1:8080")]
         bind: SocketAddr,
-        /// Bearer token for Authorization header. `RAVEN_BEARER_TOKEN` is read as a
-        /// fallback after arg parsing, not by clap: an env-sourced arg counts as
-        /// present for `conflicts_with_all`, which would make the variable
-        /// unusable alongside `--config`.
+        /// Bearer token for Authorization header. `RAVEN_BEARER_TOKEN` is read
+        /// after arg parsing, not by clap, so it stays usable alongside `--config`.
         #[arg(long)]
         token: Option<String>,
         /// Ethereum JSON-RPC URL (mainnet / Sepolia / etc).
@@ -110,10 +105,8 @@ enum Commands {
         /// Per-query response timeout in seconds.
         #[arg(long, default_value_t = 30)]
         respond_timeout_secs: u64,
-        /// PIR cell entry count. Single-instance only, hence the `--config`
-        /// conflict: a multi-instance fleet mixes encoders whose canonical
-        /// totals differ, so `--config` carries `entries` per `[[instance]]`,
-        /// defaulting to that instance's encoder total.
+        /// PIR cell entry count. Single-instance only; `--config` carries
+        /// `entries` per `[[instance]]` because encoder totals differ.
         #[arg(long, default_value_t = raven_railgun_cli::serve_production::DEFAULT_PRODUCTION_ENTRIES)]
         entries: usize,
         /// PIR cell record width in bytes.
@@ -125,31 +118,17 @@ enum Commands {
         /// Tree number for chain encoders (ignored for per-leaf-bc and per-list-* variants).
         #[arg(long, default_value_t = 0)]
         tree_number: u32,
-        /// Optional WebSocket RPC URL (e.g. `wss://...`). When set with
-        /// `--config`, overrides the TOML's `ws_endpoint` global key so
-        /// the chain source wraps a `WsChainSource` in
-        /// `AutoFallbackChainSource` over the configured pool / single-RPC
-        /// fallback. Multi-instance only: rejected at runtime when
-        /// `--config` is not provided (the single-instance path uses
-        /// `RpcChainSource` directly without WS).
+        /// WebSocket RPC URL; overrides the TOML `ws_endpoint`. Multi-instance
+        /// only - rejected at runtime without `--config`.
         #[arg(long)]
         ws_endpoint: Option<String>,
-        /// Expose `/metrics` without bearer auth. Default-deny posture
-        /// (off): Prometheus scrapers must present the same bearer
-        /// credential as wallet clients. Set this flag to opt-in for a
-        /// scrape-only Prometheus instance with no shared secret.
-        /// `/metrics` always bypasses the per-IP rate limiter; this
-        /// flag controls only the auth requirement. Honored on both
-        /// the `--config` (multi-instance) and single-instance paths
-        /// via the TOML/CLI -> HttpConfig override plumbing.
+        /// Expose `/metrics` without bearer auth (default-deny). Affects auth
+        /// only; `/metrics` always bypasses the per-IP rate limiter.
         #[arg(long, default_value_t = false)]
         metrics_public: bool,
-        /// Periodic heartbeat session-eviction interval (seconds).
-        /// `0` disables. Default 3600. Symmetric with multi-instance:
-        /// the runtime rebuilds the in-memory `ServerSessionStore` from
-        /// scratch each tick so resident memory is bounded under
-        /// sustained bearer churn at the cost of dropping live
-        /// sessions once per interval.
+        /// Heartbeat session-eviction interval in seconds; `0` disables. Each
+        /// tick rebuilds `ServerSessionStore`, bounding memory but dropping
+        /// live sessions.
         #[arg(long, default_value_t = 3600)]
         session_eviction_interval_secs: u64,
     },
@@ -185,14 +164,11 @@ enum Commands {
         /// Capture `wal/current.log` in addition to archived WAL segments.
         #[arg(long, default_value_t = false)]
         include_current_wal: bool,
-        /// Retain only the N newest `*.tar.zst` tarballs in the output's
-        /// parent directory after a successful write (cron-friendly).
-        /// `0` disables.
+        /// Retain only the N newest `*.tar.zst` beside the output; `0` disables.
         #[arg(long, default_value_t = 3)]
         keep_snapshots: usize,
     },
-    /// Standalone retention pass: trim the snapshot drop-zone to the N
-    /// newest tarballs. Cron / systemd-timer friendly; idempotent.
+    /// Trim the snapshot drop-zone to the N newest tarballs. Idempotent.
     PruneSnapshots {
         /// Directory containing `*.tar.zst` export tarballs.
         #[arg(long)]
@@ -222,17 +198,9 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         allow_overwrite: bool,
     },
-    /// Bootstrap on-disk instance state from a Subsquid checkpoint:
-    /// page through `commitments` ordered by `treePosition_ASC`, build
-    /// a local IMT, then verify against the chain ABI (live tree:
-    /// byte-identity vs `merkleRoot()`; static tree: membership via
-    /// `rootHistory(tree, root)`) and drop an initial snapshot stamped
-    /// at the agreed checkpoint block. The chain oracle is mandatory;
-    /// archival state at `chain_head - checkpoint_depth` is required
-    /// (probe surfaces `NoArchivalRpc` early if the operator's pool
-    /// has no archival endpoint). PPOI list bootstrap pulls upstream
-    /// `validatedMerkleroot` events from Railway and asserts
-    /// byte-identity against the local per-list IMT.
+    /// Bootstrap on-disk instance state from a Subsquid checkpoint, verified
+    /// against the chain ABI. Requires archival RPC state at
+    /// `chain_head - checkpoint_depth`.
     BootstrapFromSubsquid {
         /// Per-endpoint heterogeneous rpc-pool TOML.
         #[arg(long)]
@@ -252,8 +220,7 @@ enum Commands {
         /// Block depth below chain head to anchor the checkpoint at.
         #[arg(long, default_value_t = 64)]
         checkpoint_depth: u64,
-        /// Comma-separated PPOI list keys to bootstrap (hex, 64 chars
-        /// each, optional `0x` prefix).
+        /// Comma-separated PPOI list keys (64 hex chars, optional `0x`).
         #[arg(
             long,
             default_value = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88",
@@ -263,11 +230,8 @@ enum Commands {
         /// PPOI per-list data_dir template; must contain `{LIST_KEY}`.
         #[arg(long)]
         ppoi_list_data_dir_template: Option<String>,
-        /// Upstream Railway PPOI base URL(s). Repeatable; comma-
-        /// separated values are also accepted. The list is walked in
-        /// priority order with an 8-second per-URL timeout. Defaults
-        /// to the three known Railway proxies; only the first
-        /// reachable one is used.
+        /// Upstream PPOI base URL(s), repeatable or comma-separated. Walked in
+        /// priority order; the first reachable base wins.
         #[arg(
             long,
             default_values_t = raven_railgun_cli::bootstrap_subsquid::DEFAULT_RAILWAY_BASES
@@ -277,28 +241,21 @@ enum Commands {
             value_delimiter = ','
         )]
         ppoi_endpoint: Vec<String>,
-        /// PPOI bootstrap resilience policy. `strict` (default)
-        /// hard-stops on upstream unreachability; `skip-on-unreachable`
-        /// emits a loud warn and seeds an EMPTY per-list IMT,
-        /// signalling the upstream-signature gap.
+        /// `strict` hard-stops on upstream unreachability;
+        /// `skip-on-unreachable` warns and seeds an EMPTY per-list IMT.
         #[arg(long, default_value = "strict")]
         ppoi_bootstrap_mode: String,
-        /// PPOI events source. `railway` (default) pulls signed
-        /// events from the upstream Railway PPOI aggregator;
-        /// `chainalysis-oracle` derives the OFAC list locally from
-        /// the on-chain Chainalysis sanctions oracle.
+        /// `railway` pulls signed upstream events; `chainalysis-oracle` derives
+        /// the list locally from the on-chain sanctions oracle.
         #[arg(long, default_value = "railway")]
         ppoi_source: String,
-        /// Chainalysis OFAC oracle address (used when
-        /// `--ppoi-source chainalysis-oracle`). Defaults to the
-        /// canonical mainnet deployment.
+        /// Sanctions oracle address for `--ppoi-source chainalysis-oracle`.
         #[arg(
             long,
             default_value = raven_railgun_cli::bootstrap_chainalysis::CHAINALYSIS_ORACLE_MAINNET
         )]
         chainalysis_oracle: String,
-        /// First block to scan for Chainalysis sanctions-added
-        /// events. Defaults to the oracle's deployment block.
+        /// First block scanned for sanctions-added events.
         #[arg(
             long,
             default_value_t = raven_railgun_cli::bootstrap_chainalysis::CHAINALYSIS_ORACLE_FIRST_BLOCK
@@ -328,24 +285,17 @@ enum Commands {
         /// Wall-clock cap for the entire bootstrap loop.
         #[arg(long, default_value_t = 30)]
         max_bootstrap_wall_mins: u64,
-        /// Hex-encoded Railgun proxy contract address (used for the
-        /// chain-side oracle). Defaults to mainnet proxy.
+        /// Hex-encoded proxy contract address for the chain-side oracle.
         #[arg(long, default_value = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9")]
         railgun_proxy: String,
-        /// Per-chain-tree encoder family stamped into each tree's
-        /// manifest `encoder_label`. One of `per-leaf-bc`,
-        /// `per-leaf-path`, or `per-node`. Default `per-node` matches
-        /// the production lock; the orchestrator binds the per-tree
-        /// `tree_number` per iteration so a single CLI flag covers
-        /// every bootstrapped tree.
+        /// Encoder family stamped into each tree's manifest `encoder_label`:
+        /// `per-leaf-bc`, `per-leaf-path`, or `per-node`.
         #[arg(long, default_value = "per-node")]
         encoder: String,
-        /// PPOI per-list status encoder family. One of
-        /// `per-list-status`, `per-list-path`, or `per-list-node`.
+        /// PPOI status encoder: `per-list-status`, `per-list-path`, or `per-list-node`.
         #[arg(long, default_value = "per-list-status")]
         ppoi_status_encoder: String,
-        /// PPOI per-list path encoder family. One of
-        /// `per-list-status`, `per-list-path`, or `per-list-node`.
+        /// PPOI path encoder: `per-list-status`, `per-list-path`, or `per-list-node`.
         #[arg(long, default_value = "per-list-node")]
         ppoi_path_encoder: String,
     },

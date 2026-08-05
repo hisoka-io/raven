@@ -1,8 +1,7 @@
-//! Wallet-facing PPOI passthrough routes (Railgun JSON shapes).
-//!
-//! Mirrors `getPOIsPerList` / `getPOIMerkleProofs` from upstream
+//! Wallet-facing PPOI passthrough routes mirroring upstream
 //! `private-proof-of-innocence/packages/node/src/api/api.ts`.
-//! Wallet privacy still requires client-side PIR via `/v1/instance/:id/query`.
+//!
+//! These routes are NOT private; wallet privacy needs `/v1/instance/:id/query`.
 
 use std::sync::Arc;
 
@@ -138,13 +137,9 @@ fn poi_status_to_str(byte: u8) -> &'static str {
 type PoisPerListMap =
     std::collections::BTreeMap<HexHash, std::collections::BTreeMap<HexHash, String>>;
 
-/// Element caps on the shim request vectors.
-///
-/// These handlers run under the global [`LogicalLeafStore`] mutex, which the
-/// block-commit path also takes mutably, so an oversized body stalls the
-/// indexer for as long as it runs. The `pois-per-list` work is the product of
-/// the two vectors; capping each alone still admits 8 MiB x 8 MiB worth of
-/// pairs, so the product is capped too.
+/// Element caps on the shim request vectors. These handlers hold the global
+/// [`LogicalLeafStore`] mutex that block-commit also takes, so an oversized body
+/// stalls the indexer; `pois-per-list` caps the vector product, not just each side.
 const MAX_SHIM_LIST_KEYS: usize = 64;
 const MAX_SHIM_BLINDED_COMMITMENTS: usize = 1024;
 const MAX_SHIM_LOOKUP_PAIRS: usize = 16_384;
@@ -447,7 +442,7 @@ pub fn poi_shim_routes<S: PirScheme>(state: AppState<S>) -> axum::Router {
         .with_state(state)
 }
 
-/// Re-export for test fixtures that need to seed a [`LogicalLeafStore`].
+/// Re-exported so fixtures can seed a [`LogicalLeafStore`].
 pub use raven_railgun_engine::inspire::apply_wal_entry as apply_wal_entry_for_test;
 
 /// `Arc<Mutex<LogicalLeafStore>>` alias for passing to [`AppState`].

@@ -131,7 +131,6 @@ impl SessionMap {
         let mut guard = self.inner.lock();
         let mut outcome = EvictionOutcome::None;
         if guard.len() >= cap && !guard.contains_key(&key) {
-            // O(n) scan acceptable at cap = 10k default.
             if let Some((oldest_key, oldest_expires)) = guard
                 .iter()
                 .min_by_key(|(_, v)| v.expires_at)
@@ -194,14 +193,13 @@ pub(crate) async fn bearer_auth<S: PirScheme>(
         .unwrap_or_default();
 
     let scope = if let Some(token) = header.strip_prefix("Bearer ") {
-        // Constant-time: evaluate both compares; snapshot the token so the
-        // comparison doesn't hold the lock.
+        // Both compares always evaluate; the snapshot keeps the lock off the compare.
         let active_read_token: String = app.read_token.read().clone();
         let read_match: bool = ct_eq_str(token.as_bytes(), active_read_token.as_bytes()).into();
         let admin_match: bool = if let Some(admin) = app.admin_token.as_ref().as_ref() {
             ct_eq_str(token.as_bytes(), admin.as_bytes()).into()
         } else {
-            // Fixed-cost dummy compare keeps the no-admin path equal-cost.
+            // Keeps the no-admin path equal-cost.
             let _ = ct_eq_str(token.as_bytes(), &[]);
             false
         };
@@ -320,7 +318,6 @@ mod tests {
     #[test]
     fn parse_client_id_header_rejects_short_returns_zero() {
         let mut headers = HeaderMap::new();
-        // 30 hex chars - below the 32-char floor.
         headers.insert(
             HeaderName::from_static("x-raven-client-id"),
             HeaderValue::from_static("0102030405060708090a0b0c0d0e0f"),
@@ -341,7 +338,6 @@ mod tests {
     #[test]
     fn parse_client_id_header_rejects_non_hex_chars_returns_zero() {
         let mut headers = HeaderMap::new();
-        // 32 chars but contains non-hex 'z'.
         headers.insert(
             HeaderName::from_static("x-raven-client-id"),
             HeaderValue::from_static("z102030405060708090a0b0c0d0e0f10"),
@@ -351,13 +347,11 @@ mod tests {
 
     #[test]
     fn session_key_distinguishes_client_id_under_shared_bearer() {
-        // Distinct client_ids under a shared bearer must not collide.
         let id = InstanceId::new("toy");
         let alice = SessionKey::new("shared-bearer", id.clone(), [0xaa; 16]);
         let bob = SessionKey::new("shared-bearer", id.clone(), [0xbb; 16]);
         assert_ne!(alice, bob, "distinct client_ids must produce distinct keys");
 
-        // Absent header collapses to the all-zero key (back-compat).
         let legacy_a = SessionKey::new("legacy-bearer", id.clone(), [0u8; 16]);
         let legacy_b = SessionKey::new("legacy-bearer", id, [0u8; 16]);
         assert_eq!(
@@ -374,13 +368,11 @@ mod tests {
         let h = ServerSessionHandle(1);
         let cap = 100;
 
-        // Two soon-to-be-expired entries.
         let dead_a = SessionKey::new("dead-a", InstanceId::new("toy"), [0u8; 16]);
         let dead_b = SessionKey::new("dead-b", InstanceId::new("toy"), [0u8; 16]);
         let _ = map.upsert(dead_a, h, t0 + ttl, cap, t0);
         let _ = map.upsert(dead_b, h, t0 + ttl, cap, t0);
 
-        // One long-lived entry.
         let alive = SessionKey::new("alive", InstanceId::new("toy"), [0u8; 16]);
         let _ = map.upsert(alive.clone(), h, t0 + Duration::from_secs(3600), cap, t0);
 

@@ -1,14 +1,6 @@
-//! Integration test wiring the adapter's `UpstreamPpoiMirror` against
-//! the synthetic mock service. Asserts the engine's `LogicalLeafStore`
-//! accumulates BOTH the `(list_key, bc) -> status` map (T1 status PIR)
-//! AND the per-list IMT (T2 path PIR) from the mock corpus.
-//!
-//! The mirror emits each `/poi-events` row as
-//! [`raven_railgun_persistence::WalEntryPayload::PpoiListLeafAdded`]
-//! (per-list IMT growth + `(BC -> idx)` ordering oracle) then
-//! `PpoiStatus` (idempotent status-map re-assert). This exercises
-//! both halves: `ppoi_count()` for the status map,
-//! `ppoi_imt(..).leaf_count()` for IMT growth.
+//! `UpstreamPpoiMirror` against the synthetic service: the store must accumulate
+//! both the status map and the per-list IMT, exercised via `ppoi_count()` and
+//! `ppoi_imt(..).leaf_count()`.
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
@@ -92,7 +84,7 @@ async fn adapter_consumes_mock_ppoi_events_and_populates_per_list_imt() {
         "all synthetic events surfaced via mirror",
     );
 
-    // T2 path PIR consumes this IMT; if it stays at 0, T2 returns empty rows.
+    // Path PIR consumes this IMT; at 0 it would return empty rows.
     let imt_leaves = store
         .ppoi_imt(&list_key.0)
         .map_or(0, raven_railgun_engine::imt::Imt::leaf_count);

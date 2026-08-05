@@ -1,7 +1,6 @@
-//! Recovery-time cell-shape guard: a data_dir stored at one row width must not
-//! reopen under an encoder emitting a different width. `encoder_label` alone is
-//! label-stable across the operator-supplied widths (`PerLeafBc`,
-//! `PerListStatus`), so the label check cannot see this.
+//! A data_dir stored at one row width must not reopen under an encoder emitting
+//! a different width; `encoder_label` is stable across operator-supplied widths,
+//! so the label check alone cannot see it.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 

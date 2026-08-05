@@ -1,6 +1,5 @@
-//! Bootstrap dedup keys on `(DataSourceFilter, encoder_label)`: same
-//! list_key with different encoder kinds is allowed; agreement on both
-//! axes is rejected.
+//! Bootstrap dedup keys on `(DataSourceFilter, encoder_label)`, so one list key
+//! may carry several encoder kinds but not a duplicate pair.
 
 #![allow(
     clippy::expect_used,
@@ -151,8 +150,7 @@ async fn bootstrap_railgun_engine_multi_routes_two_ppoi_instances_with_same_list
     let _ = mh;
 }
 
-/// One list_key with two route entries must fan out to both consumers
-/// (`.filter().for_each(send)`, not `.find().map(send)`).
+/// One list key with two route entries must reach both consumers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ppoi_route_dispatch_does_not_collide_for_status_and_paths_on_same_list_key() {
     let lk = ofac_list_key();

@@ -1,9 +1,7 @@
-//! Crash-recovery, idempotency, and per-list-node migration tests for
-//! the offline `migrate-encoder` tool.
+//! Crash-recovery, idempotency, and per-list-node migration for `migrate-encoder`.
 //!
-//! Drives simulated crashes via library calls (no subprocess); each migration
-//! step lands on disk before returning, so the state machine is fully
-//! exercisable in-process.
+//! Crashes are simulated in-process: every migration step lands on disk before
+//! returning.
 
 #![cfg_attr(
     test,
@@ -441,7 +439,7 @@ fn kill_during_after_re_encode_before_manifest_bump_recovers_idempotently() {
         snapshot_bytes(dir.path(), manifest_resumed_a.current_snapshot_id);
     let manifest_after_first_resume = manifest_bytes(dir.path());
 
-    // save-only operations must not touch the live manifest or live-id snapshot bytes
+    // Save-only must not touch the live manifest or live-id snapshot bytes.
     {
         let prep = prepare_migration(dir.path(), EncoderKind::PerLeafBc);
         let mut prep_mut = prep;
@@ -570,8 +568,7 @@ fn per_list_node_migration_byte_identity_at_levels_0_1_8() {
         manifest_pre.current_snapshot_id.next()
     );
 
-    // PerListNode uses the same flat-global-index layout as PerNode (leaves first,
-    // then level-1 nodes, ..., root)
+    // PerListNode shares PerNode's flat-global-index layout: leaves, level 1, ..., root.
     let path_enc = PerListPathEncoder::new(PATH_RECORD_BYTES, ENTRIES_PER_SHARD, LIST_KEY_OFAC)
         .expect("path encoder");
     let node_enc = PerListNodeEncoder::new(ENTRIES_PER_SHARD, LIST_KEY_OFAC).expect("node encoder");

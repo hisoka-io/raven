@@ -1,8 +1,5 @@
-//! WASM client surface for the Raven Railgun adapter.
-//!
-//! Re-exports the generic PIR query/extract surface from `raven-client` (the
-//! wasm-bindgen ABI and Rust API stay byte-stable through the re-export) and adds
-//! the Railgun commitment-tree / PPOI per-list Merkle auth-path helpers.
+//! WASM client surface: `raven-client`'s PIR query/extract exports (byte-stable
+//! through the re-export) plus commitment-tree / per-list auth-path helpers.
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
@@ -10,7 +7,8 @@ use wasm_bindgen::prelude::*;
 
 pub use raven_client::*;
 
-// must match raven-railgun-engine::imt::TREE_DEPTH; duplicated to keep this crate a leaf in the WASM dep graph
+// Must match raven-railgun-engine::imt::TREE_DEPTH; duplicated to keep this crate
+// a leaf in the WASM dep graph.
 const PATH_INDEX_TREE_DEPTH: u32 = 16;
 const PATH_INDEX_LEAVES_PER_TREE: u32 = 1u32 << PATH_INDEX_TREE_DEPTH;
 const PATH_INDICES_LEN: usize = PATH_INDEX_TREE_DEPTH as usize;
@@ -24,9 +22,8 @@ fn flat_index_for(level: u32, idx_at_level: u32) -> u32 {
     level_offset + idx_at_level
 }
 
-/// 16 flat-global row indices for the Merkle auth path of `leaf_idx` in a
-/// commit tree (`PerNodeEncoder` layout). The wallet issues one PIR query per
-/// index and reconstructs the path locally.
+/// 16 flat-global row indices for the auth path of `leaf_idx` under the
+/// `PerNodeEncoder` layout; one PIR query per index, reconstructed client-side.
 #[wasm_bindgen]
 pub fn path_indices_for_leaf(tree_number: u32, leaf_idx: u32) -> Result<Vec<u32>, JsValue> {
     let _ = tree_number;
@@ -45,9 +42,7 @@ pub fn path_indices_for_leaf(tree_number: u32, leaf_idx: u32) -> Result<Vec<u32>
     Ok(out)
 }
 
-/// 16 flat-global row indices for the Merkle auth path of per-list PPOI leaf
-/// `idx` (`PerListNodeEncoder` layout). Mirror of [`path_indices_for_leaf`]
-/// keyed on `list_key` rather than `tree_number`.
+/// [`path_indices_for_leaf`] under `PerListNodeEncoder`, keyed on `list_key`.
 #[wasm_bindgen]
 pub fn path_indices_for_per_list_leaf(list_key: &[u8], idx: u32) -> Result<Vec<u32>, JsValue> {
     if list_key.len() != 32 {
@@ -118,7 +113,6 @@ mod path_indices_tests {
 
     #[test]
     fn path_indices_for_leaf_zero_matches_per_node_encoder_layout() {
-        // leaf 0: sibling flat_index(0,1)=1, then flat_index(1,1)=2^16+1=65537
         let out = path_indices_for_leaf_rust(0, 0).expect("leaf 0 ok");
         assert_eq!(out[0], 1);
         assert_eq!(out[1], 65537);
@@ -126,7 +120,7 @@ mod path_indices_tests {
 
     #[test]
     fn path_indices_for_per_list_returns_same_layout_as_per_node_encoder() {
-        // per-list and commit-tree share the flat layout: identical for the same index
+        // Per-list and commit-tree share the flat layout.
         let key = [7u8; 32];
         let a = path_indices_for_leaf_rust(0, 1234).expect("leaf 1234 ok");
         let b = path_indices_for_per_list_leaf_rust(&key, 1234).expect("per-list 1234 ok");

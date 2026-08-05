@@ -1,11 +1,9 @@
-//! Application WAL payload variants persisted by this adapter.
-
 use serde::{Deserialize, Serialize};
 
 /// Application WAL payload variants for this adapter.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WalEntryPayload {
-    /// Append a leaf to a Railgun commitment-tree shard.
+    /// Append a leaf to a commitment-tree shard.
     AppendLeaf {
         /// Tree index (`0..=tree_count-1`).
         tree_number: u32,
@@ -20,11 +18,11 @@ pub enum WalEntryPayload {
         list_key: [u8; 32],
         /// 32-byte blinded commitment.
         blinded_commitment: [u8; 32],
-        /// Status byte (`Valid` / `ShieldBlocked` / `ProofSubmitted` / `Missing`).
+        /// Encoded status byte.
         status: u8,
     },
-    /// New leaf appended to a per-list PPOI Merkle tree.
-    /// Drives per-list IMT growth and the `(blinded_commitment -> list_index)` oracle.
+    /// New per-list leaf; drives IMT growth and the
+    /// `(blinded_commitment -> list_index)` oracle.
     PpoiListLeafAdded {
         /// 32-byte list key.
         list_key: [u8; 32],
@@ -35,12 +33,12 @@ pub enum WalEntryPayload {
         /// Initial status byte.
         status: u8,
     },
-    /// Reorg marker: the engine truncates WAL entries whose `marker` exceeds `height`.
+    /// Reorg fence; entries with a `marker` above `height` are truncated.
     Reorg {
         /// Chain height at the fork point.
         height: u64,
     },
-    /// Heartbeat (no-op) emitted at each snapshot to mark the WAL.
+    /// No-op WAL marker emitted at each snapshot.
     Heartbeat {
         /// Unix milliseconds at emission.
         wallclock_unix_ms: u64,

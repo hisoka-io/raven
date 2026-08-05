@@ -1,11 +1,6 @@
-//! Crash-consistent durability primitives for a PIR server.
-//!
-//! Three layered primitives: [`SnapshotFile`] (bincode + atomic-rename),
-//! [`Wal`] (crc32-framed append-only log), and [`Manifest`] (JSON,
-//! atomic-renamed; the single linearization point for snapshot commits).
-//! Recovery truncates on the first bad WAL crc (torn write at the tail).
-//! The snapshot and WAL payloads are opaque `Vec<u8>`: callers serialize
-//! their scheme-specific state and hand it in.
+//! Crash-consistent durability primitives for a PIR server. [`Manifest`] is
+//! the single linearization point for snapshot commits; recovery truncates
+//! the WAL at the first bad crc. Payloads are opaque `Vec<u8>`.
 //! Server-side only; never on the wasm client path.
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
@@ -25,31 +20,31 @@ pub use wal::{Wal, WalEntry, WalReplay, WAL_MAX_PAYLOAD_BYTES};
 /// Typed errors from the durability layer.
 #[derive(thiserror::Error, Debug)]
 pub enum PersistenceError {
-    /// Underlying I/O failure.
+    /// I/O failure.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Bincode serialize / deserialize failure.
+    /// Snapshot or WAL codec failure.
     #[error("bincode: {0}")]
     Bincode(String),
 
-    /// JSON serialize / deserialize failure (manifest only).
+    /// Manifest codec failure.
     #[error("json: {0}")]
     Json(String),
 
-    /// Snapshot referenced by the manifest cannot be loaded.
+    /// Manifest points at a snapshot that cannot be loaded.
     #[error("snapshot {0:?} not found")]
     SnapshotNotFound(SnapshotId),
 
-    /// Manifest is missing or unparseable; recovery bootstraps fresh.
+    /// Missing or unparseable; recovery bootstraps fresh.
     #[error("manifest missing or corrupt: {0}")]
     ManifestMissing(String),
 
-    /// Snapshot header magic / checksum did not match.
+    /// Header magic or checksum mismatch.
     #[error("snapshot corrupt: {0}")]
     SnapshotCorrupt(String),
 
-    /// WAL entry crc32 mismatch; recovery truncates at this position.
+    /// crc32 mismatch; recovery truncates at this position.
     #[error("wal entry corrupt at seq {0}")]
     WalCorrupt(u64),
 
@@ -57,11 +52,11 @@ pub enum PersistenceError {
     #[error("instance {0} not registered")]
     UnknownInstance(InstanceId),
 
-    /// Invariant violation; not a panic, caller decides recovery strategy.
+    /// Post-condition violation surfaced as an error, not a panic.
     #[error("invariant violated: {0}")]
     Invariant(String),
 
-    /// Advisory lock on `data_dir/.lock` is held by another process.
+    /// Another process holds `data_dir/.lock`.
     #[error("data_dir is locked by another process: {0}")]
     LockHeld(String),
 }
@@ -81,21 +76,16 @@ impl From<serde_json::Error> for PersistenceError {
 /// Convenience [`Result`] alias.
 pub type Result<T, E = PersistenceError> = core::result::Result<T, E>;
 
-/// Filesystem layout owned by a single persistent instance.
-///
-/// Assumes exclusive write ownership of `data_dir`. Use
-/// [`StoreLayout::open_with_lock`] to enforce the single-writer contract
-/// via a POSIX `flock` advisory lock.
+/// Filesystem layout for one instance. Assumes exclusive write ownership of
+/// `data_dir`; [`StoreLayout::open_with_lock`] enforces that with `flock`.
 #[derive(Clone, Debug)]
 pub struct StoreLayout {
     data_dir: PathBuf,
 }
 
 impl StoreLayout {
-    /// Build a layout rooted at `data_dir`, creating subdirs if absent.
-    ///
-    /// Does NOT acquire an advisory lock. Use [`StoreLayout::open_with_lock`]
-    /// to prevent concurrent writers from corrupting the WAL.
+    /// Creates subdirs if absent. Takes no lock, so concurrent writers can
+    /// corrupt the WAL; prefer [`StoreLayout::open_with_lock`].
     pub fn open(data_dir: impl Into<PathBuf>) -> Result<Self> {
         let data_dir = data_dir.into();
         std::fs::create_dir_all(&data_dir)?;
@@ -104,10 +94,8 @@ impl StoreLayout {
         Ok(Self { data_dir })
     }
 
-    /// Build a layout and acquire an exclusive advisory lock on `data_dir/.lock`.
-    ///
-    /// Returns `PersistenceError::LockHeld` if another process holds the lock.
-    /// Dropping the returned [`ExclusiveLock`] releases it.
+    /// As [`StoreLayout::open`], plus an exclusive advisory lock released on
+    /// [`ExclusiveLock`] drop.
     pub fn open_with_lock(data_dir: impl Into<PathBuf>) -> Result<(Self, ExclusiveLock)> {
         let layout = Self::open(data_dir)?;
         let lock = ExclusiveLock::acquire(layout.data_dir.join(".lock"))?;
@@ -145,11 +133,8 @@ impl StoreLayout {
     }
 }
 
-/// Write `bytes` to `path` atomically: write to `path.tmp`, fsync, rename, fsync parent.
-///
-/// POSIX same-fs renames are atomic. Parent-dir fsync makes the rename durable after a crash.
-/// Parent-fsync errors are propagated except EINVAL (some FSes disallow dir fsync),
-/// `Unsupported` (WSL2/virtio-fs), and `PermissionDenied` on dir open (sandbox quirks).
+/// Write to `path.tmp`, fsync, rename, fsync parent. The parent fsync is what
+/// makes the same-fs atomic rename durable across a crash.
 pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     {
@@ -165,10 +150,8 @@ pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Create a file with owner-only permissions on Unix (mode 0o600).
-///
-/// Prevents local tampering between fsync and restart on multi-tenant hosts.
-/// On non-Unix targets the mode is ignored; ACLs from the parent directory apply.
+/// Mode 0o600 on Unix, blocking local tampering between fsync and restart on
+/// multi-tenant hosts. Elsewhere the parent directory's ACLs apply.
 pub(crate) fn create_owner_only(path: &std::path::Path) -> Result<std::fs::File> {
     #[cfg(unix)]
     {
@@ -186,18 +169,16 @@ pub(crate) fn create_owner_only(path: &std::path::Path) -> Result<std::fs::File>
     }
 }
 
-/// Exclusive advisory lock on `data_dir/.lock`.
-///
-/// Acquired via [`StoreLayout::open_with_lock`]. Dropping the guard releases the lock.
+/// Exclusive advisory lock on `data_dir/.lock`, released on drop.
 #[derive(Debug)]
 pub struct ExclusiveLock {
-    // Kept open so the kernel holds the flock alive until drop.
+    // held open so the kernel keeps the flock alive until drop
     _file: std::fs::File,
     path: PathBuf,
 }
 
 impl ExclusiveLock {
-    /// Acquire an exclusive non-blocking advisory lock on `path`, creating it if absent.
+    /// Non-blocking; creates `path` if absent.
     pub fn acquire(path: PathBuf) -> Result<Self> {
         use fs4::{FileExt, TryLockError};
 
@@ -231,8 +212,8 @@ impl ExclusiveLock {
     }
 }
 
-/// Fsync a parent directory to make an atomic rename durable after a crash.
-/// Tolerates EINVAL, Unsupported, and PermissionDenied; propagates everything else.
+/// Tolerates EINVAL (FSes that disallow dir fsync), `Unsupported`
+/// (WSL2/virtio-fs) and `PermissionDenied`; propagates everything else.
 pub(crate) fn fsync_parent_dir(parent: &std::path::Path) -> Result<()> {
     match std::fs::File::open(parent) {
         Ok(dir) => match dir.sync_all() {
@@ -300,8 +281,6 @@ mod tests {
         let _again = StoreLayout::open_with_lock(dir.path()).expect("second after drop");
     }
 
-    /// Pins the fs4 `TryLockError::WouldBlock` -> `LockHeld` mapping directly
-    /// on `ExclusiveLock::acquire` so a regression shows as a type-shape failure.
     #[test]
     fn fs4_exclusive_lock_contention_returns_lock_held() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -326,7 +305,6 @@ mod tests {
         let _l2 = StoreLayout::open(dir.path()).expect("second bare open");
     }
 
-    /// `fsync_parent_dir` must propagate I/O errors rather than swallow them.
     #[test]
     fn fsync_parent_dir_propagates_notfound_on_missing_parent() {
         let dir = tempfile::tempdir().expect("tempdir");

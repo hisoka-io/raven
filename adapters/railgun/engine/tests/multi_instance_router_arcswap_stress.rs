@@ -1,9 +1,5 @@
-//! Concurrency stress on the multi-instance router's chain-tree
-//! routing table (`ChainTreeRoutes = Arc<ArcSwap<Vec<...>>>`).
-//!
-//! Exercises three invariants under contention: reads see consistent
-//! snapshots, concurrent `rcu` writers don't drop appends, and 50
-//! readers don't deadlock under write pressure.
+//! Chain-tree routing table under contention: reads see consistent snapshots,
+//! concurrent `rcu` writers drop no appends, and readers never deadlock.
 
 #![allow(
     clippy::expect_used,
@@ -114,7 +110,7 @@ async fn arcswap_routes_no_torn_reads_no_dropped_writes_under_50_readers_10_writ
          a regression that dropped writes would surface as a smaller len"
     );
 
-    // floor is `> 0`, not a throughput target: an exclusive lock on `load()` would surface as zero reads
+    // A `> 0` floor, not a throughput target: an exclusive `load()` reads zero.
     let reads = total_reads.load(Ordering::Relaxed);
     assert!(
         reads > 0,

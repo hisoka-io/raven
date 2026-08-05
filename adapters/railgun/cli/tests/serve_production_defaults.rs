@@ -1,5 +1,4 @@
-//! Regression guard for the production-cell defaults the operator
-//! binary ships with. Asserts the locked T2/T3 production cell shape.
+//! Pins the production cell shape the operator binary defaults to.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -22,7 +21,7 @@ fn production_cell_defaults_match_locked_t2_t3_shape_documentation_only() {
     assert_eq!(
         DEFAULT_PRODUCTION_ENTRY_BYTES,
         16 * 32,
-        "T2/T3 record = 16 × 32 B Poseidon-Merkle siblings"
+        "T2/T3 record = 16 x 32 B Poseidon-Merkle siblings"
     );
 }
 

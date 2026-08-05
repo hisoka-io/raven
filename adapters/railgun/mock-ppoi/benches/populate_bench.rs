@@ -1,12 +1,5 @@
-//! Time-to-populate-from-zero measurement for the synthetic mirror.
-//!
-//! Run via:
-//!   cargo test --manifest-path crates/raven-railgun-adapter/Cargo.toml \
-//!     -p raven-railgun-mock-ppoi --release --bench populate_bench \
-//!     -- --ignored --nocapture
-//!
-//! The test is `#[ignore]`-gated so the regular suite stays fast.
-//! Output rows: corpus_size, wall_secs, throughput_rows_per_sec.
+//! Time-to-populate-from-zero for the synthetic mirror. Gated; emits
+//! `corpus_size, wall_secs, throughput_rows_per_sec`.
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 

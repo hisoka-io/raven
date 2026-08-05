@@ -1,27 +1,11 @@
-//! Legal InsPIRe cell widths at production parameters.
+//! Legal InsPIRe cell widths at production parameters: `ceil(entry_size / 2)`
+//! must be a power of two no larger than `ring_dim / 2`.
 //!
-//! A record width is legal only if the InspiRING column count it induces,
-//! `num_columns = ceil(entry_size / 2)` (`crates/inspire/src/pir/setup.rs`,
-//! `crates/inspire/src/pir/encode_db.rs`), is a power of two no larger than
-//! `ring_dim / 2`.
-//!
-//! Mechanism: the packing generator is `2n / gamma + 1` for `gamma < n` and `5`
-//! otherwise (`crates/inspire/src/inspiring/inspiring2.rs:114-119`). The division
-//! is integer, so a `gamma` that does not divide `2n` silently yields the wrong
-//! generator, the wrong automorphism, and plaintext that decrypts to unrelated
-//! bytes. Nothing on the path returns an error.
-//!
-//! Measured outside the law, at `ring_dim = 2048`:
-//!
-//! | entry_size | num_columns | outcome |
-//! |---|---|---|
-//! | 328 | 164 | every byte wrong, no error |
-//! | 640 | 320 | every byte wrong, no error |
-//! | 4096 | 2048 | every byte wrong, no error |
-//! | 4098 and above | 2049 and above | panic, `inspiring2.rs:509` / `:1027`, index out of bounds |
-//!
-//! `production_cell_width_ladder_is_empirically_correct` reproduces the first three
-//! rows. Widths at or above 4098 are excluded from it because they abort the process.
+//! The packing generator `2n / gamma + 1` divides integrally, so an off-law
+//! `gamma` silently picks the wrong automorphism and decrypts to unrelated
+//! bytes with no error anywhere. Measured at `ring_dim = 2048`: 328, 640 and
+//! 4096 return every byte wrong; 4098 and above abort on an out-of-bounds
+//! generator-power lookup, which is why the ladder test stops below them.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
@@ -33,8 +17,8 @@ use raven_railgun_engine::inspire::{
 use raven_railgun_engine::pir_table::{NODE_HASH_BYTES, PATH_RECORD_BYTES};
 use raven_railgun_engine::PirScheme;
 
-/// The DB1 note record: 32 commitment + 8 leaf index + 32 ephemeral public key
-/// + 32 wrapped content key + 7 x 32 ciphertext.
+/// Note record: 32 commitment + 8 leaf index + 32 ephemeral public key + 32
+/// wrapped content key + 7 x 32 ciphertext.
 const NOTE_RECORD_BYTES: usize = 328;
 
 /// Column count a record width induces in the InspiRING packing.
@@ -51,8 +35,7 @@ fn is_legal_cell_width(entry_size: usize, ring_dim: usize) -> bool {
 /// Widths proven correct by the empirical ladder below.
 const LEGAL_WIDTHS: [usize; 7] = [32, 64, 128, 256, 512, 1024, 2048];
 
-/// Widths that produce wrong bytes with no error. 328 is the DB1 note record and
-/// 32768 is the DB2 block; both are named cell shapes in the read-path design.
+/// Widths producing wrong bytes with no error; both are named cell shapes.
 const ILLEGAL_WIDTHS: [usize; 5] = [328, 640, 4096, 8192, 32768];
 
 #[test]
@@ -152,9 +135,8 @@ fn worst_mismatch_at_width(entry_size: usize) -> usize {
     worst
 }
 
-/// Evidence for the law. Ten full production-parameter setups, several minutes of
-/// wall time, so it runs in the nightly production-cell lane rather than on every
-/// commit. The cheap tests above encode its result and run everywhere.
+/// Evidence for the law. Ten production-parameter setups, minutes of wall time,
+/// so it is gated; the cheap tests above encode its result.
 #[test]
 #[ignore = "ten production-parameter PIR setups (~4 min); nightly production-cell lane runs it with --run-ignored all"]
 fn production_cell_width_ladder_is_empirically_correct() {
@@ -168,8 +150,7 @@ fn production_cell_width_ladder_is_empirically_correct() {
             num_columns(width)
         );
     }
-    // 8192 and 32768 are excluded: num_columns exceeds ring_dim and the packing
-    // panics on an out-of-bounds generator-power lookup rather than returning bytes.
+    // 8192 and 32768 excluded: they abort rather than returning wrong bytes.
     for width in [328usize, 640, 4096] {
         let worst = worst_mismatch_at_width(width);
         assert!(

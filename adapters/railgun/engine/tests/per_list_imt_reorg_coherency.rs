@@ -1,5 +1,4 @@
-//! Pre-mainnet hardening: per-list IMT cache coherency under a
-//! Layer-1 reorg.
+//! Per-list IMT cache coherency under a Layer-1 reorg.
 
 #![allow(
     clippy::expect_used,

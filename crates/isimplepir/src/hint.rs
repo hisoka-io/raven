@@ -67,7 +67,7 @@ impl ClientHint {
                 reason: "hint storage corrupt (length shorter than L * n)".into(),
             });
         }
-        // Safe because we checked `end <= self.data.len()`.
+        // end <= self.data.len() checked above
         #[allow(clippy::indexing_slicing)]
         for (dest, src) in self.data[start..end].iter_mut().zip(delta.iter()) {
             *dest = dest.wrapping_add(*src);
@@ -128,9 +128,7 @@ mod tests {
         let mut h = ClientHint::zeros(&p);
         let delta = vec![u32::MAX; crate::params::LWE_DIM];
         h.add_to_row(0, &delta).expect("add delta");
-        // Wrapping: 0 + u32::MAX = u32::MAX.
         assert_eq!(h.get(0, 0).expect("get"), u32::MAX);
-        // Add the same delta again: u32::MAX + u32::MAX = u32::MAX - 1 (wrap).
         h.add_to_row(0, &delta).expect("add delta 2");
         assert_eq!(h.get(0, 0).expect("get 2"), u32::MAX.wrapping_add(u32::MAX));
     }

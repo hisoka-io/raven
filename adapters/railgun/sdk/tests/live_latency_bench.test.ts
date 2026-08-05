@@ -60,13 +60,8 @@ interface WarmTimings {
   serializeMs: number;
   serializedBlobBytes: number;
   deserializeMs: number;
-  /** Total per-warm-load wall: only `deserialize_client_session`.
-   *  `serializeMs` is paid once at the END of the cold path (right
-   *  after `build_client_session`) so it is NOT in the per-warm
-   *  budget; it is reported separately for completeness.
-   *  The IndexedDB read is a cheap memory copy on the Node-side
-   *  in-memory backend used by this bench; we expose the WASM-bound
-   *  cost which is the load-bearing latency on real wallets. */
+  /** Per-warm-load wall; `serializeMs` is paid once on the cold path and reported
+   * separately. Only the WASM-bound cost is load-bearing on real wallets. */
   totalWarmMs: number;
 }
 
@@ -325,10 +320,8 @@ liveDescribe("live latency bench", () => {
         });
       }
 
-      // Warm path: the wall time a wallet pays on its second page load, where
-      // `deserialize_client_session` (a few hundred ms) replaces
-      // `build_client_session` (~12.6 s on the production cell at d=2048).
-      // Skipped when the WASM build does not export the pair.
+      // Second-page-load wall: `deserialize_client_session` in place of a
+      // multi-second `build_client_session`. Skipped when the pair is not exported.
       if (
         typeof wasm.serialize_client_session === "function" &&
         typeof wasm.deserialize_client_session === "function"
@@ -354,7 +347,6 @@ liveDescribe("live latency bench", () => {
           totalWarmMs: deserializeMs,
         };
 
-        // Sanity: a one-off warm-path query must extract correctly.
         const warmTargetIdx = (TARGET_IDX + HOT_QUERIES) % 65_536;
         const warmQueryBundle = decodeClientPirQueryBundle(
           wasm.build_seeded_query(warmSession, decoded.shardConfigBincode, BigInt(warmTargetIdx)),
@@ -396,12 +388,8 @@ liveDescribe("live latency bench", () => {
         }
 
         warmSession.free();
-        // Load-bearing assertion: per-warm-load deserialize must
-        // complete under 700 ms at production-cell d=2048. Empirical
-        // floor is ~524 ms (200 MB bincode parse + memcpy of NTT-
-        // domain packing keys); 700 ms reserves comfort margin for
-        // host noise + slower devices. Vs the ~11.6 s cold-path
-        // build_client_session this is a 16-22x warm-path speedup.
+        // Empirical floor at production-cell d=2048 is ~524 ms (200 MB bincode
+        // parse plus a memcpy of NTT-domain packing keys); the rest is host margin.
         expect(warm.totalWarmMs).toBeLessThan(700);
       }
 

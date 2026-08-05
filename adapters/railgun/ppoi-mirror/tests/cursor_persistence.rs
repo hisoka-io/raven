@@ -1,17 +1,7 @@
-//! Cursor persistence integration tests for `UpstreamPpoiMirror`.
-//!
-//! The worker writes a per-(list_key, kind) sidecar on every successful
-//! upstream batch and resumes from it on the next spawn rather than
-//! re-emitting from index 0.
-//!
-//! Failure-injection coverage:
-//!
-//! - status / path kinds round-trip independently across a restart.
-//! - missing sidecar falls back to caller-supplied LLS-derived value.
-//! - missing sidecar AND zero LLS falls back to 0 cleanly.
-//! - torn-temp at the rename step never produces a half-decoded
-//!   cursor; the worker either reads the prior valid sidecar OR the
-//!   fallback.
+//! Cursor persistence for `UpstreamPpoiMirror`: the worker writes a sidecar per
+//! successful batch and resumes from it instead of re-emitting from index 0.
+//! Covers independent round-trip per kind, both fallback paths, and a torn temp
+//! file at the rename step.
 
 #![allow(
     clippy::expect_used,
@@ -36,18 +26,14 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Mock upstream that hands back exactly `start_index..start_index +
-/// MOCK_BATCH` events on every poll, with monotone `index` fields. The
-/// bug is observable only when `index` is monotone-increasing across
-/// restart boundaries: a non-resuming worker re-fires from 0 every
-/// boot, and the engine's contiguity check (`expected list_index N,
-/// got 0..N-1`) tells us we regressed.
+/// Mock upstream returning `start_index..start_index + MOCK_BATCH` with monotone
+/// indices, so a non-resuming worker re-fires from 0 and trips the engine's
+/// contiguity check.
 const MOCK_BATCH: u64 = 4;
 
 #[derive(Default)]
 struct MockState {
-    /// Highest `start_index` the mock has seen so a test can audit
-    /// "did the worker resume from a non-zero cursor?"
+    /// Highest `start_index` seen, so a test can tell whether the worker resumed.
     highest_start: AtomicU64,
 }
 
@@ -119,9 +105,8 @@ fn build_mirror(endpoint: String) -> Arc<UpstreamPpoiMirror> {
     Arc::new(UpstreamPpoiMirror::new(cfg).expect("mirror builds"))
 }
 
-/// Spawn a worker with a sidecar-cursor wired and let it process at
-/// least `min_events` upstream rows before returning. Returns the
-/// last cursor value observed in the sidecar.
+/// Run a sidecar-cursor worker through at least `min_events` rows and return the
+/// last cursor observed in the sidecar.
 async fn run_until_n_events(
     mirror: Arc<UpstreamPpoiMirror>,
     list: ListKey,
@@ -177,9 +162,8 @@ async fn mirror_cursor_persists_across_restart_for_status_kind() {
         "first run advanced cursor past at least 8 events, got {after_first}"
     );
 
-    // Second worker spawn: fallback set to nonsense (99_999); the
-    // sidecar must win. Also resets the mock's highest_start to
-    // confirm the second worker did NOT request startIndex=0.
+    // Fallback deliberately absurd so the sidecar must win; highest_start is
+    // reset to confirm the second worker did not request startIndex=0.
     mock.highest_start.store(0, Ordering::SeqCst);
     let cursor2 = MirrorCursor::new(data_dir.clone(), MirrorKind::Status, 99_999);
     let after_second = run_until_n_events(Arc::clone(&mirror), list, cursor2, 4).await;
@@ -231,8 +215,7 @@ async fn mirror_cursor_falls_back_to_logical_leaf_store_on_missing_sidecar() {
     let scratch = tempfile::tempdir().expect("tempdir");
     let data_dir = scratch.path().to_path_buf();
 
-    // Sidecar absent; LLS-derived fallback is 64. Worker must request
-    // startIndex >= 64 on first poll.
+    // No sidecar, so the derived fallback must set the first poll's startIndex.
     let cursor = MirrorCursor::new(data_dir, MirrorKind::Status, 64);
     let _final = run_until_n_events(Arc::clone(&mirror), list, cursor, 4).await;
     let observed_start = mock.highest_start.load(Ordering::SeqCst);
@@ -262,13 +245,8 @@ async fn mirror_cursor_falls_back_to_zero_when_both_sidecar_and_lls_empty() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mirror_cursor_atomic_write_survives_kill_at_temp_step() {
-    // Failure injection: write a stale sidecar (cursor=200), drop a
-    // separate `.tmp` file with a TORN payload (5 bytes, short of the
-    // expected 8), then spawn a worker. The torn `.tmp` is invisible
-    // to the resume path: the worker reads the canonical sidecar
-    // (cursor=200) and proceeds. After the next batch, the canonical
-    // sidecar is replaced atomically; the `.tmp` remnant is either
-    // overwritten or left on disk but never observed as cursor data.
+    // A torn `.tmp` must stay invisible to the resume path: the worker reads the
+    // canonical sidecar and replaces it atomically on the next batch.
     let (url, mock, server) = start_mock().await;
     let mirror = build_mirror(url);
     let list = ListKey([0x88; 32]);
@@ -291,7 +269,6 @@ async fn mirror_cursor_atomic_write_survives_kill_at_temp_step() {
         "torn .tmp must be ignored; worker must resume from canonical sidecar=200 (saw {observed_start})"
     );
 
-    // After the run, the canonical sidecar is a clean 8-byte LE u64.
     let after = std::fs::read(&sidecar).expect("sidecar still readable");
     assert_eq!(
         after.len(),
@@ -316,7 +293,6 @@ fn mirror_cursor_persist_then_resolve_round_trips_and_tamper_falls_back() {
     assert_eq!(u64::from_le_bytes(arr), 42);
     assert_eq!(cursor.resolve_start(), 42, "sidecar present and decodable");
 
-    // Tamper: short write that's not 8 bytes.
     std::fs::write(&path, [0xFF; 5]).expect("tamper");
     assert_eq!(
         cursor.resolve_start(),

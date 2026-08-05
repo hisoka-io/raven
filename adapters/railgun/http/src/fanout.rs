@@ -1,12 +1,9 @@
 //! One uploaded query served against k shards on a single pinned snapshot.
 //!
-//! **Privacy caveat**, in the spirit of [`raven_inspire::SeededClientQuery`]'s:
-//! the whole cover group arrives as ONE client's single request, so the server
-//! learns the group is one client's - a linkage k queries over k separate
-//! circuits do not hand it. Every slot resolves the SAME encrypted local index,
-//! so a cover group is `{(shard_j, i)}` for one fixed `i`. Duplicate shard ids
-//! are served as requested and never de-duplicated: `[0,0,0]` has an anonymity
-//! set of one while the width histogram records 3.
+//! Privacy caveat: the cover group arrives as ONE request, so the server learns
+//! the group is one client's - linkage that k separate queries do not hand it.
+//! Every slot resolves the SAME encrypted local index, and duplicate shard ids are
+//! served verbatim, so `[0,0,0]` has an anonymity set of one.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,12 +24,8 @@ use crate::state::AppState;
 use crate::versioned::{read_versioned, write_batch_response_versioned};
 use crate::{attach_freshness_header, build_response_headers};
 
-/// Request body of `POST /v1/instance/{id}/fanout`.
-///
-/// Read the module-level privacy caveat before choosing `shard_ids`. A slot
-/// addressing the padded tail of a partially filled shard decrypts to a valid
-/// all-zeros plaintext, indistinguishable from a genuine zero entry unless the
-/// record layout carries a presence tag.
+/// Request body of `POST /v1/instance/{id}/fanout`. See the module privacy caveat;
+/// a slot on a shard's padded tail decrypts to a valid all-zeros plaintext.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FanoutRequest {
     /// The single uploaded query. Its `shard_id` is overridden per slot.
@@ -114,8 +107,8 @@ impl FanoutError {
         }
     }
 
-    /// Caller-facing detail: the offending shard id, position and counts. Carries
-    /// no scheme error string, which can echo request-shaped text.
+    /// Offending shard id, position and counts. Never a scheme error string, which
+    /// can echo request-shaped text.
     #[must_use]
     pub fn detail(&self) -> String {
         match self {
@@ -159,11 +152,9 @@ impl From<FanoutSlot> for SeededClientQuery {
     }
 }
 
-/// Validate `shard_ids` and bind one slot per id to the shared upload.
-///
-/// `encode_database` numbers shards contiguously from 0, so a length compare
-/// is an exact membership test against the pinned snapshot. Each slot holds an
-/// `Arc`, so peak query copies track the concurrency limit, not `shard_ids.len()`.
+/// Validate `shard_ids` and bind one slot per id to the shared upload. Shards are
+/// numbered contiguously from 0, so a length compare is exact membership. Slots
+/// share an `Arc`, so peak copies track the concurrency limit, not `shard_ids.len()`.
 fn expand_fanout(
     query: &Arc<SeededClientQuery>,
     shard_ids: &[u32],
@@ -249,8 +240,7 @@ pub(crate) async fn fanout_handler(
         })?;
 
     let started = Instant::now();
-    // Capture `(epoch, state)` ONCE: shard bounds and every worker read this
-    // exact snapshot, so validation can't race a concurrent `swap_state`.
+    // Captured ONCE so validation and every worker read the same snapshot.
     let snapshot_for_fanout = instance.current_snapshot();
     let epoch_at_start = snapshot_for_fanout.epoch;
     let shard_count = snapshot_for_fanout.state.encoded_db.shards.len();

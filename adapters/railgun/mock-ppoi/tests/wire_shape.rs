@@ -224,8 +224,8 @@ async fn mock_ppoi_validatedmerkleroot_advances_with_event_count() {
 
 #[test]
 fn mock_ppoi_emits_synthetic_banner_on_startup() {
-    // Source-level introspection, not runtime capture: dispatcher propagation
-    // across `tokio::spawn` would flake under parallel test ordering.
+    // Source-level, not runtime: dispatcher propagation across `tokio::spawn`
+    // flakes under parallel test ordering.
     assert_eq!(
         SYNTHETIC_BANNER,
         "raven-railgun-mock-ppoi: SYNTHETIC corpus, do not pass off as real OFAC"

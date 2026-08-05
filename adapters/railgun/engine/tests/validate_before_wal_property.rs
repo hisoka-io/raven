@@ -1,6 +1,5 @@
-//! Validate-before-WAL property test: locks the `apply_one_leaf`
-//! invariant that `validate_apply` agrees with `apply_wal_entry` and
-//! that the WAL ends up containing exactly the validated events.
+//! `validate_apply` must agree with `apply_wal_entry`, and the WAL must contain
+//! exactly the validated events.
 
 #![allow(
     clippy::expect_used,
@@ -36,7 +35,7 @@ fn canonical_commitment(seed: u8) -> [u8; 32] {
     b
 }
 
-// fixed tree=0: long runs against one tree exercise the imt_leaf_count_for advance (cross-tree is unit-tested)
+// One tree, so long runs exercise the leaf-count advance; cross-tree is unit-tested.
 fn append_leaf_strategy() -> impl Strategy<Value = WalEntryPayload> {
     (0u32..32u32, any::<u8>()).prop_map(|(leaf_index, seed)| WalEntryPayload::AppendLeaf {
         tree_number: 0,
@@ -104,7 +103,7 @@ proptest! {
         .expect("open 1");
 
         for (i, p) in payloads.iter().enumerate() {
-            // validate, then WAL, then mutate: a rejected validate touches neither WAL nor store
+            // Validate first: a rejection must touch neither WAL nor store.
             let block_height = 100 + u64::try_from(i).unwrap_or(0);
             if validate_apply(&store, p).is_ok() {
                 opened

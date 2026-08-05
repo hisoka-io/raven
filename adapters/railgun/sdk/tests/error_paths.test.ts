@@ -18,7 +18,6 @@ function stubWasm(): RavenInspireWasm {
   return {
     build_client_session: () => ({ free: () => undefined }),
     build_seeded_query: () => {
-      // empty bincode: len(0) + len(0) = 16 bytes
       return new Uint8Array(16);
     },
     extract_response: (_session, _a, _b, response, _entry) => {
@@ -63,14 +62,12 @@ describe("error-path + truncated-response handling", () => {
   });
 
   it("decodeClientPirQueryBundle rejects truncated state payload", () => {
-    // claim 1000-byte client_state, supply 16
     const buf = new Uint8Array(16);
     new DataView(buf.buffer).setUint32(0, 1000, true);
     expect(() => decodeClientPirQueryBundle(buf)).toThrow(/truncated state payload/);
   });
 
   it("decodeClientPirQueryBundle rejects truncated query payload", () => {
-    // 0-len state + claim 100-byte query, supply 24
     const buf = new Uint8Array(24);
     new DataView(buf.buffer).setUint32(0, 0, true);
     new DataView(buf.buffer).setUint32(8, 100, true);

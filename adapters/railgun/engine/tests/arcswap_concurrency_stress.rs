@@ -1,8 +1,6 @@
-//! Concurrency stress on `PirInstance` snapshot atomicity.
-//!
-//! Regression guard for the `epoch + state` packing fix: both fields live in
-//! a single `Snapshot<S>` cell so a `swap_state` racing inside `query()` cannot
-//! produce a torn `(new_epoch, old_state_response)` pair.
+//! Snapshot atomicity under contention: epoch and state share one `Snapshot<S>`
+//! cell, so a `swap_state` racing `query()` cannot yield a torn
+//! `(new_epoch, old_state_response)` pair.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 

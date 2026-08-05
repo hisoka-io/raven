@@ -26,15 +26,15 @@ export interface RavenInspireWasm {
     session: RavenInspireClientSession,
     instanceParamsBincode: Uint8Array,
   ): void;
-  /** Install the WASM panic hook so Rust panics carry file:line; idempotent. Optional on older builds. */
+  /** Install the WASM panic hook so Rust panics carry file:line; idempotent. */
   init_panic_hook?(): void;
   build_instance_params_blob(
     inspireParamsBincode: Uint8Array,
     shardConfigBincode: Uint8Array,
   ): Uint8Array;
-  /** Serialize a session to a cacheable bincode blob. Optional; treat as `undefined` and skip warm-cache on older builds. */
+  /** Serialize a session to a cacheable blob; absent on older builds. */
   serialize_client_session?(session: RavenInspireClientSession): Uint8Array;
-  /** Reconstitute a session from a cached blob + same params/CRS. Optional; fall through to `build_client_session` on older builds. */
+  /** Reconstitute a session from a cached blob and the same params/CRS. */
   deserialize_client_session?(
     paramsBundleBincode: Uint8Array,
     crsBincode: Uint8Array,
@@ -73,7 +73,7 @@ export interface ClientPirQueryBundle {
 
 /** Decode the bincode `{ client_state: Vec<u8>, query_bytes: Vec<u8> }` from `build_seeded_query`. */
 export function decodeClientPirQueryBundle(buf: Uint8Array): ClientPirQueryBundle {
-  // bincode v1: u64 LE length prefix per Vec<u8>
+  // bincode v1: u64 LE length prefix per Vec<u8>.
   if (buf.length < 8) {
     throw RavenError.decodeError(`decodeClientPirQueryBundle: buffer too short (${buf.length})`);
   }
@@ -115,7 +115,7 @@ export function installPanicHook(wasm: RavenInspireWasm): boolean {
 export interface LoadClientPirContextInput {
   /** WASM module exposing the `build_*` / `*_client_session` API. */
   readonly wasm: RavenInspireWasm;
-  /** PIR instance id; first component of the cache key so same-CRS instances never collide. */
+  /** PIR instance id; first cache-key component, so same-CRS instances never collide. */
   readonly instanceId: string;
   readonly crsBincode: Uint8Array;
   readonly shardConfigBincode: Uint8Array;
@@ -123,7 +123,7 @@ export interface LoadClientPirContextInput {
   readonly entrySize: number;
 }
 
-/** [`ClientPirContext`] plus a warm-cache hit signal (test-only; prod treats hit/miss alike). */
+/** [`ClientPirContext`] plus a test-only warm-cache hit signal. */
 export interface LoadClientPirContextResult {
   readonly context: ClientPirContext;
   /** `true` when reconstituted from cache; `false` on a cold `build_client_session`. */
@@ -131,10 +131,9 @@ export interface LoadClientPirContextResult {
 }
 
 /**
- * Build a [`ClientPirContext`], using the IndexedDB warm cache when the WASM
- * exposes serialize/deserialize and a blob exists. Cache key is
- * `(instanceId, sha256(crsBincode))` so a CRS rotation auto-invalidates every
- * session. Storage failures degrade to the cold `build_client_session` path.
+ * Build a [`ClientPirContext`], preferring the IndexedDB warm cache. The key
+ * `(instanceId, sha256(crsBincode))` makes a CRS rotation self-invalidating;
+ * storage failures degrade to the cold `build_client_session` path.
  */
 export async function loadClientPirContext(
   input: LoadClientPirContextInput,
@@ -167,7 +166,6 @@ export async function loadClientPirContext(
           cacheHit: true,
         };
       } catch {
-        // corrupt entry: fall through to cold rebuild + reseed
       }
     }
     const session = wasm.build_client_session(paramsBundle, crsBincode);
@@ -175,7 +173,6 @@ export async function loadClientPirContext(
       const blob = wasm.serialize_client_session!(session);
       await idbPut(instanceId, crsHash, blob);
     } catch {
-      // best-effort seed
     }
     return {
       context: { wasm, session, crsBincode, shardConfigBincode, entrySize },
@@ -211,7 +208,7 @@ export function statusByteToPOIStatus(b: number): POIStatus {
 }
 
 function readU64LE(view: DataView, offset: number): number {
-  // payload lengths stay far under 2^32, so truncating the u64 to Number is safe
+  // Payload lengths stay far under 2^32, so truncating the u64 is safe.
   const lo = view.getUint32(offset, true);
   const hi = view.getUint32(offset + 4, true);
   if (hi !== 0) {

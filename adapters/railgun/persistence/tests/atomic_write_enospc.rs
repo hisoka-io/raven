@@ -1,8 +1,6 @@
-//! Failure-injection for `atomic_write` / `Manifest::save` write failures.
-//!
-//! True ENOSPC is unavailable in CI (no `CAP_SYS_ADMIN`, no `unsafe` for `setrlimit`).
-//! Instead we use EACCES (read-only parent dir) to exercise the identical
-//! `create_owner_only(&tmp)?` -> `PersistenceError::Io` propagation path that ENOSPC would hit.
+//! Write-failure injection for `atomic_write` / `Manifest::save`. True ENOSPC
+//! needs privileges CI lacks, so EACCES on a read-only parent exercises the same
+//! `create_owner_only` -> `PersistenceError::Io` path.
 
 #![cfg(unix)]
 #![allow(
@@ -71,8 +69,7 @@ fn manifest_save_under_readonly_parent_propagates_typed_io_error() {
     assert_eq!(observed.current_snapshot_seq, 99);
 }
 
-/// Documents the ENOSPC propagation contract via `/dev/full`.
-/// A regression that swallows `write_all` errors would surface here first.
+/// ENOSPC propagation via `/dev/full`; catches a swallowed `write_all` error.
 #[test]
 fn dev_full_write_returns_typed_io_error_documenting_enospc_propagation() {
     use std::io::Write;

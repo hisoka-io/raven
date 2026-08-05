@@ -1,7 +1,5 @@
-//! Prometheus `/metrics` surface tests: the
-//! [`AppState::with_instance_metrics`] builder round-trips the per-instance
-//! [`ConsumerMetrics`] map, `Clone` preserves it, and the `/metrics` handler
-//! renders the per-instance gauge surface.
+//! `/metrics`: [`AppState::with_instance_metrics`] round-trips the per-instance
+//! [`ConsumerMetrics`] map, `Clone` preserves it, and the handler renders it.
 
 #![allow(
     clippy::expect_used,
@@ -80,8 +78,6 @@ fn build_state() -> AppState<EchoScheme> {
 
 #[test]
 fn appstate_new_is_idempotent_for_describe_prometheus_metrics() {
-    // Repeat `AppState::new` must be cheap + side-effect-free (OnceLock-guarded
-    // `describe_prometheus_metrics`).
     let s1 = build_state();
     let s2 = build_state();
     drop(s1);
@@ -90,8 +86,7 @@ fn appstate_new_is_idempotent_for_describe_prometheus_metrics() {
 
 #[test]
 fn with_instance_metrics_builder_round_trips_map() {
-    // `with_instance_metrics` must wire the map in and `Clone` must preserve it
-    // (the handler clones state per scrape; a dropped Arc loses the gauges).
+    // The handler clones state per scrape; a dropped Arc loses the gauges.
     let cell = Arc::new(parking_lot::Mutex::new(ConsumerMetrics {
         last_applied_block: 12_345_678,
         last_scanned_block: 12_345_678,
@@ -105,7 +100,6 @@ fn with_instance_metrics_builder_round_trips_map() {
     let mut map: HashMap<InstanceId, Arc<parking_lot::Mutex<ConsumerMetrics>>> = HashMap::new();
     let id = InstanceId::new("with-instance-metrics-roundtrip");
     map.insert(id, Arc::clone(&cell));
-    // Baseline: two strong refs (`cell` + the entry in `map`).
     let baseline_strong = Arc::strong_count(&cell);
     assert_eq!(
         baseline_strong, 2,
@@ -114,14 +108,12 @@ fn with_instance_metrics_builder_round_trips_map() {
 
     let state = build_state().with_instance_metrics(map);
 
-    // Builder consumed `map`; refs are now `cell` + the state's entry.
     assert_eq!(
         Arc::strong_count(&cell),
         2,
         "after `with_instance_metrics`, the per-instance Arc must be held by the state"
     );
 
-    // `Clone` shares the map via the outer Arc, not a per-entry deep clone.
     let cloned = state.clone();
     assert_eq!(
         Arc::strong_count(&cell),
@@ -129,7 +121,6 @@ fn with_instance_metrics_builder_round_trips_map() {
         "Clone must NOT deep-clone the map; per-entry Arcs stay at strong-count 2"
     );
 
-    // Map outlives this drop because the clone still holds it.
     drop(state);
     assert_eq!(
         Arc::strong_count(&cell),
@@ -137,8 +128,7 @@ fn with_instance_metrics_builder_round_trips_map() {
         "dropping one AppState ref must NOT drop the per-entry Arc"
     );
 
-    // Mutation through the shared Mutex must be visible outside the state:
-    // the consumer task updates it while the handler scrapes it.
+    // The consumer task updates this while the handler scrapes it.
     {
         let mut g = cell.lock();
         g.events_processed = 999;
@@ -150,7 +140,6 @@ fn with_instance_metrics_builder_round_trips_map() {
     );
     drop(snap);
 
-    // Final drop: only the test-local `cell` ref remains.
     drop(cloned);
     assert_eq!(
         Arc::strong_count(&cell),
@@ -161,7 +150,6 @@ fn with_instance_metrics_builder_round_trips_map() {
 
 #[test]
 fn with_instance_metrics_empty_map_is_legal_default() {
-    // The explicit empty-map builder call must be a no-op.
     let empty: HashMap<InstanceId, Arc<parking_lot::Mutex<ConsumerMetrics>>> = HashMap::new();
     let state = build_state().with_instance_metrics(empty);
     let _cloned = state.clone();
@@ -186,16 +174,12 @@ async fn metrics_handler_emits_per_instance_engine_gauges() {
     use std::net::SocketAddr;
     use tower::ServiceExt;
 
-    // Hold the lock ONLY during AppState::new (the
-    // `metrics::set_global_recorder` race window); release before any
-    // .await so clippy's `await_holding_lock` lint stays clean.
+    // Held only across `metrics::set_global_recorder`; released before any .await.
     let router = {
         let _g = APPSTATE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Build a tiny InsPIRe instance so `inspire_router` accepts the
-        // engine. We don't query it; we only scrape `/metrics`.
         let params = raven_inspire::params::InspireParams::secure_128_d2048();
         let db: Vec<u8> = vec![0u8; 2048 * 32];
         let (state, _sk) = setup_state(

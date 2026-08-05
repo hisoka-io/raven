@@ -1,8 +1,6 @@
-//! WAL replay floor edge cases.
-//!
-//! Locks the four manifest schema-v2 floor semantics: fresh bootstrap (None floor),
-//! pre-snapshot entries are filterable, corrupt mid-stream truncates cleanly,
-//! and snapshot-captures-everything leaves zero entries to apply.
+//! WAL replay floor semantics: fresh bootstrap yields no floor, pre-snapshot
+//! entries filter out, a corrupt mid-stream truncates cleanly, and a
+//! fully-capturing snapshot leaves nothing to apply.
 
 #![allow(
     clippy::expect_used,

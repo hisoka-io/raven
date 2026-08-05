@@ -14,19 +14,14 @@ pub const BEARER_TOKEN_ENV: &str = "RAVEN_BEARER_TOKEN";
 /// Placeholder shipped in the example config; never a usable token.
 pub const PLACEHOLDER_TOKEN: &str = "REPLACE_ME";
 
-/// Which surface supplied the token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenSource {
-    /// `[global].token` in the config file.
     Inline,
-    /// The file named by `[global].token_file`.
     File,
-    /// The [`BEARER_TOKEN_ENV`] environment variable.
     Env,
 }
 
 impl TokenSource {
-    /// Operator-facing name, as written in the config or shell.
     pub fn label(self) -> &'static str {
         match self {
             Self::Inline => "[global].token",
@@ -36,95 +31,61 @@ impl TokenSource {
     }
 }
 
-/// A resolved token and the surface it came from.
 #[derive(Debug, Clone)]
 pub struct ResolvedBearerToken {
-    /// The token, whitespace-trimmed.
     pub token: String,
-    /// Where it was read from.
     pub source: TokenSource,
 }
 
-/// Failure resolving or permission-checking the bearer token.
+/// Bearer-token resolution and permission-check failures.
 #[derive(Debug, Error)]
 pub enum BearerTokenError {
-    /// Nothing supplied a token.
     #[error(
         "no bearer token: set exactly one of [global].token, [global].token_file, or the \
          {env} environment variable (config: {config})"
     )]
-    NoSource {
-        /// Config file that was read.
-        config: PathBuf,
-        /// Name of the environment variable that was consulted.
-        env: &'static str,
-    },
-    /// More than one surface supplied a token.
+    NoSource { config: PathBuf, env: &'static str },
     #[error(
         "ambiguous bearer token: {sources} are all set (config: {config}); leave exactly one \
          so the serving token is unambiguous"
     )]
-    MultipleSources {
-        /// Config file that was read.
-        config: PathBuf,
-        /// Comma-separated labels of every source that resolved.
-        sources: String,
-    },
-    /// A surface was present but carried nothing usable.
+    MultipleSources { config: PathBuf, sources: String },
     #[error("{source_label} is set but empty after trimming whitespace (config: {config})")]
     Empty {
-        /// Config file that was read.
         config: PathBuf,
-        /// Label of the empty source.
         source_label: &'static str,
     },
-    /// The token file could not be read.
     #[error("read [global].token_file {path}: {source}")]
     ReadTokenFile {
-        /// Path that failed to read.
         path: PathBuf,
-        /// Underlying I/O failure.
         #[source]
         source: std::io::Error,
     },
-    /// A file carrying the token is reachable by group or other.
     #[error(
         "{path} is mode {mode:04o} and carries {carries}; group and other can read it. \
          Run `chmod 600 {path}` and re-run, or move the token into a 600-mode file \
          referenced by [global].token_file"
     )]
     Permissions {
-        /// The over-permissive file.
         path: PathBuf,
-        /// Permission bits found, as reported by `st_mode & 0o7777`.
         mode: u32,
-        /// What the file holds, for the operator reading the message.
         carries: &'static str,
     },
-    /// The example-config placeholder reached the serving path.
     #[error(
         "{source_label} is the literal placeholder {placeholder:?} from the example config \
          (config: {config}). Replace it with at least 16 bytes of operator-private entropy \
          (e.g. `openssl rand -hex 32`) before serving"
     )]
     Placeholder {
-        /// Config file that was read.
         config: PathBuf,
-        /// Label of the source that carried the placeholder.
         source_label: &'static str,
-        /// The rejected literal.
         placeholder: &'static str,
     },
 }
 
-/// Resolve the bearer token from exactly one surface, permission-gating any file that carries it.
-///
-/// `env_token` is passed in rather than read here so callers can test the
-/// precedence rules without mutating process environment.
-///
-/// # Errors
-/// Zero or multiple sources, an empty source, an unreadable token file, a
-/// group- or world-reachable file carrying the token, or the example placeholder.
+/// Resolve the bearer token from exactly one surface, permission-gating any file
+/// that carries it. `env_token` is a parameter so tests can exercise precedence
+/// without mutating process environment.
 pub fn resolve_bearer_token(
     inline: Option<&str>,
     token_file: Option<&Path>,
@@ -189,12 +150,9 @@ pub fn resolve_bearer_token(
     Ok(ResolvedBearerToken { token, source })
 }
 
-/// Refuse any group- or other-reachable mode on a file that carries the token.
-///
-/// # Errors
-/// [`BearerTokenError::Permissions`] when any of the low six mode bits is set.
-/// A stat failure is not fatal here: the read that follows reports it with a
-/// path, and an unreadable file cannot leak.
+/// Refuse any of the low six mode bits on a file carrying the token. A stat
+/// failure is not fatal: the following read reports it, and an unreadable file
+/// cannot leak.
 #[cfg(unix)]
 pub fn ensure_secret_file_mode(path: &Path, carries: &'static str) -> Result<(), BearerTokenError> {
     use std::os::unix::fs::PermissionsExt;
@@ -213,7 +171,7 @@ pub fn ensure_secret_file_mode(path: &Path, carries: &'static str) -> Result<(),
     Ok(())
 }
 
-/// No-op off unix: the mode bits this gate reads do not exist there.
+/// No-op off unix: these mode bits do not exist there.
 #[cfg(not(unix))]
 pub fn ensure_secret_file_mode(
     _path: &Path,

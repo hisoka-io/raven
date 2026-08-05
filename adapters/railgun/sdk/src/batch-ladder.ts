@@ -1,9 +1,6 @@
 /**
- * Fixed-size ladder for batched PIR requests.
- *
- * An unpadded batch publishes its own length, which is the wallet's
- * cache-miss count. Padding to a dyadic ladder replaces that with the bucket
- * the count falls in. Must stay byte-for-byte in step with the Rust ladder in
+ * Fixed-size ladder for batched PIR requests: an unpadded batch publishes the
+ * wallet's exact cache-miss count. Must stay in step with the Rust ladder in
  * `raven_railgun_core::batch_ladder`; the server refuses off-ladder lengths.
  */
 
@@ -19,11 +16,8 @@ export function isOnLadder(len: number): boolean {
 }
 
 /**
- * Smallest ladder step that fits `realCount` queries.
- *
- * Throws for a non-positive count and for anything above {@link MAX_BATCH_SIZE};
- * a caller with more queries than the top step splits into several batches,
- * each padding independently.
+ * Smallest ladder step fitting `realCount`. Throws above {@link MAX_BATCH_SIZE};
+ * callers with more queries split into independently-padded batches.
  */
 export function paddedBatchLength(realCount: number): number {
   if (!Number.isInteger(realCount) || realCount < 1) {

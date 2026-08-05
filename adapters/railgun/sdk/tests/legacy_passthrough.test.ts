@@ -228,7 +228,6 @@ describe("legacy plaintext fallback paths", () => {
       [{ blindedCommitment: BC_VALID, type: "Shield" }],
     );
     expect(got[BC_VALID][LIST_KEY_HEX]).toBe("Valid");
-    // primary then upstream passthrough
     expect(sdk.lastWireRequests().length).toBe(2);
   });
 
@@ -236,7 +235,6 @@ describe("legacy plaintext fallback paths", () => {
     server.route(
       (req) => req.url === "/v1/poi/pois-per-list",
       (_req, _body, res) => {
-        // no freshness header
         writeJson(res, { [BC_VALID]: { [LIST_KEY_HEX]: "Valid" } });
         return true;
       },

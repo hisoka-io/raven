@@ -7,9 +7,8 @@ use crate::trusted_proxy::{resolve_declared_ranges, IpCidr};
 /// Sanity ceiling for [`HttpConfig::max_body_bytes`]; rejected at validate time.
 pub(crate) const HTTP_MAX_BODY_CEILING: usize = 64 * 1024 * 1024;
 
-/// Sanity ceiling for [`HttpConfig::max_fanout_shards`]; rejected at validate time.
-/// One request already costs k respond operations, so the cap is the only bound
-/// on request amplification.
+/// Sanity ceiling for [`HttpConfig::max_fanout_shards`]; the only bound on request
+/// amplification, since one request costs k respond operations.
 pub(crate) const HTTP_MAX_FANOUT_CEILING: usize = 128;
 
 /// HTTP layer configuration; all knobs are tunable without recompiling.
@@ -33,24 +32,18 @@ pub struct HttpConfig {
     pub session_lru_cap: usize,
     /// Identifier surfaced in the `X-Raven-Scheme` response header.
     pub scheme_name: String,
-    /// Per-query response timeout in seconds. A timed-out worker releases
-    /// its semaphore permit so subsequent queries aren't blocked indefinitely.
+    /// Per-query response timeout; a timed-out worker releases its semaphore permit.
     pub respond_timeout_secs: u64,
-    /// Enables forwarding-header trust. Requires a non-empty
-    /// [`HttpConfig::trusted_proxy_cidrs`]; the pair is validated together.
+    /// Requires a non-empty [`HttpConfig::trusted_proxy_cidrs`]; validated as a pair.
     pub trust_proxy_header: bool,
-    /// Peer ranges (CIDR, e.g. `127.0.0.1/32`, `172.16.0.0/12`, `fd00::/8`) whose
-    /// `X-Forwarded-For` / `cf-connecting-ip` is honoured. Every other peer keys
-    /// to its own socket address.
+    /// Peer CIDRs whose `X-Forwarded-For` / `cf-connecting-ip` is honoured; every
+    /// other peer keys to its own socket address.
     #[serde(default)]
     pub trusted_proxy_cidrs: Vec<String>,
-    /// Explicit CORS origins. Empty = no CORS layer. Never use `["*"]`
-    /// on an authenticated PIR server.
+    /// Explicit CORS origins; empty disables the layer. Never `["*"]` here.
     #[serde(default)]
     pub cors_allowed_origins: Vec<String>,
-    /// Default-deny posture for `/metrics`. When `false`, the metrics
-    /// endpoint requires bearer auth; when `true`, it is unauthenticated
-    /// (operator opts in via `--metrics-public`).
+    /// When `true`, `/metrics` is unauthenticated. Default-deny.
     #[serde(default)]
     pub metrics_public: bool,
     /// Periodic heartbeat session-eviction interval (seconds). `0` disables.
@@ -95,10 +88,8 @@ impl HttpConfig {
         }
     }
 
-    /// Validate config; called by [`AppState::new`].
-    ///
-    /// # Errors
-    /// Returns `Err(String)` describing the first failing invariant.
+    /// Validate config; called by [`AppState::new`]. `Err` names the first failing
+    /// invariant.
     pub fn validate(&self) -> Result<(), String> {
         if self.read_token.len() < Self::MIN_TOKEN_LEN {
             return Err(format!(
@@ -148,12 +139,8 @@ impl HttpConfig {
         Ok(())
     }
 
-    /// Parse the trusted-proxy ranges, enforcing agreement with `trust_proxy_header`.
-    ///
-    /// Returns an empty vector when proxy trust is off.
-    ///
-    /// # Errors
-    /// `Err(String)` when the two fields disagree or an entry fails to parse.
+    /// Parse the trusted-proxy ranges, enforcing agreement with
+    /// `trust_proxy_header`; empty when proxy trust is off.
     pub fn resolve_trusted_proxy_ranges(&self) -> Result<Vec<IpCidr>, String> {
         resolve_declared_ranges(self.trust_proxy_header, &self.trusted_proxy_cidrs)
     }

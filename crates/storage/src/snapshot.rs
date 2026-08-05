@@ -9,36 +9,36 @@ use sha2::{Digest, Sha256};
 pub struct SnapshotId(pub u64);
 
 impl SnapshotId {
-    /// Successor id. Saturates at `u64::MAX`.
+    /// Saturates at `u64::MAX` rather than wrapping.
     #[must_use]
     pub const fn next(self) -> Self {
         Self(self.0.saturating_add(1))
     }
 }
 
-/// 16-byte magic + SHA-256 checksum + payload length stored alongside the bincode payload.
+/// 16-byte magic, SHA-256 checksum and payload length, written to its own file
+/// beside the bincode payload.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotHeader {
     /// Caller-supplied format magic; [`SnapshotFile::load`] rejects a mismatch.
     pub magic: [u8; 16],
-    /// SHA-256 of the uncompressed bincode payload, hex-encoded.
+    /// Over the uncompressed payload, hex-encoded.
     pub data_sha256_hex: String,
-    /// Length of the uncompressed bincode payload.
+    /// Uncompressed payload length.
     pub data_len: u64,
 }
 
-/// zstd frame magic (RFC 8878 sec 3.1.1). `SnapshotFile::load` sniffs these bytes to dispatch
-/// between zstd-wrapped (new) and bare-bincode (legacy) payloads. SHA-256 covers the
-/// uncompressed payload in both paths so no manifest schema bump is needed.
+/// RFC 8878 sec 3.1.1. Sniffed on load to tell zstd-wrapped from bare-bincode
+/// payloads; SHA-256 covers the uncompressed bytes either way, so old
+/// snapshots stay readable without a schema bump.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
-/// zstd level 3: ~3-4x size reduction on bincode-shaped state, single-digit-percent CPU overhead.
+/// ~3-4x on bincode-shaped state for single-digit-percent CPU.
 #[cfg(feature = "zstd-compression")]
 const ZSTD_LEVEL: i32 = 3;
 
-/// Opaque snapshot payload. The storage crate treats the bytes as a black box;
-/// callers serialize their scheme-specific state and hand it in along with the
-/// 16-byte format magic that pins their on-disk version.
+/// Opaque payload plus the caller's 16-byte format magic; the storage crate
+/// never interprets the bytes.
 ///
 /// ```
 /// use raven_storage::SnapshotFile;
@@ -48,14 +48,14 @@ const ZSTD_LEVEL: i32 = 3;
 /// ```
 #[derive(Clone, Debug)]
 pub struct SnapshotFile {
-    /// Header metadata.
+    /// Magic, checksum and length.
     pub header: SnapshotHeader,
-    /// Bincode-serialized state payload.
+    /// Serialized state.
     pub data: Vec<u8>,
 }
 
 impl SnapshotFile {
-    /// Build a snapshot, stamping `magic` and computing the header checksum from `data`.
+    /// Stamps `magic` and computes the header checksum over `data`.
     pub fn build(data: Vec<u8>, magic: [u8; 16]) -> Self {
         let digest = Sha256::digest(&data);
         let hex = bytes_to_hex(&digest);
@@ -70,13 +70,9 @@ impl SnapshotFile {
         }
     }
 
-    /// Persist the snapshot under `layout.snapshot_dir(id)`.
-    ///
-    /// Two-rename idiom for crash-atomicity: (1) rename existing
-    /// `final_dir` to `.old.tmp`, (2) rename `tmp_dir` to `final_dir`,
-    /// (3) remove `.old.tmp`. A kill between steps leaves recoverable
-    /// state that [`SnapshotFile::load`] handles. Idempotent under retry
-    /// with the same `id`.
+    /// Crash-atomic via two renames - displace `final_dir` to `.old.tmp`,
+    /// rename `tmp_dir` in, drop `.old.tmp`. Any kill in between leaves a
+    /// state [`SnapshotFile::load`] recovers, so retrying one `id` is safe.
     pub fn save(&self, layout: &StoreLayout, id: SnapshotId) -> Result<()> {
         let final_dir = layout.snapshot_dir(id);
         let tmp_dir = final_dir.with_extension("tmp");
@@ -123,7 +119,6 @@ impl SnapshotFile {
             fsync_parent_dir(parent)?;
         }
 
-        // best-effort reclaim; load recovery handles leaks
         if had_final {
             if let Err(e) = std::fs::remove_dir_all(&final_old_tmp) {
                 tracing::warn!(
@@ -138,12 +133,8 @@ impl SnapshotFile {
         Ok(())
     }
 
-    /// Load a snapshot, verifying `expected_magic` and the SHA-256 checksum.
-    ///
-    /// Sniffs the leading 4 bytes for the zstd frame magic to dispatch between
-    /// compressed and legacy bare-bincode payloads. Handles the three crash-recovery
-    /// states left by `save`'s two-rename pipeline: `.old.tmp` alone (promotes it back),
-    /// both present (`final_dir` wins, `.old.tmp` cleaned up), or only `final_dir`.
+    /// Verifies `expected_magic` and the checksum. Of the states `save` can
+    /// leave behind, `final_dir` always wins and a lone `.old.tmp` is promoted.
     pub fn load(layout: &StoreLayout, id: SnapshotId, expected_magic: [u8; 16]) -> Result<Self> {
         let dir = layout.snapshot_dir(id);
         let old_tmp = dir.with_extension("old.tmp");
@@ -234,7 +225,7 @@ fn unwrap_from_disk(raw: &[u8], id: SnapshotId) -> Result<Vec<u8>> {
 
 #[cfg(feature = "zstd-compression")]
 fn decompress_zstd_body(raw: &[u8], id: SnapshotId) -> Result<Vec<u8>> {
-    // 4 GiB cap prevents heap exhaustion from a hostile/corrupt frame.
+    // caps heap exhaustion from a hostile or corrupt frame
     const MAX_DECOMPRESSED: usize = 4 * 1024 * 1024 * 1024;
     zstd::bulk::decompress(raw, MAX_DECOMPRESSED).map_err(|e| {
         PersistenceError::SnapshotCorrupt(format!("snap-{:06}: zstd decompress: {e}", id.0))
@@ -323,7 +314,6 @@ mod tests {
         assert!(matches!(err, PersistenceError::SnapshotCorrupt(_)));
     }
 
-    // re-saving the same id must not fail with ENOTEMPTY
     #[test]
     fn save_is_idempotent_under_existing_final_dir() {
         let dir = tempfile::tempdir().expect("tempdir");

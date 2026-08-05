@@ -96,7 +96,6 @@ describe("client-PIR routing + pre-flight", () => {
       [{ blindedCommitment: BC_HEX, type: "Shield" }],
     );
     expect(got[BC_HEX][LIST_KEY_HEX]).toBe("Missing");
-    // missing-BC path short-circuits client-side
     expect(sdk.lastWireRequests().length).toBe(0);
   });
 
@@ -219,7 +218,6 @@ describe("client-PIR routing + pre-flight", () => {
       try {
         await sdk.fetchBcToIdxMap(LIST_KEY_HEX);
       } catch {
-        // expected 404
       }
     }
     const wires = sdk.lastWireRequests();
@@ -243,7 +241,6 @@ describe("client-PIR routing + pre-flight", () => {
     try {
       await sdk.fetchBcToIdxMap(LIST_KEY_HEX);
     } catch {
-      // expected.
     }
     expect(sdk.lastWireRequests().length).toBe(1);
     sdk.resetWireCapture();
@@ -266,7 +263,6 @@ describe("client-PIR routing + pre-flight", () => {
     try {
       await sdk.fetchBcToIdxMap(LIST_KEY_HEX);
     } catch {
-      // expected.
     }
     const ring1 = sdk.lastWireRequests();
     const len1 = ring1.length;

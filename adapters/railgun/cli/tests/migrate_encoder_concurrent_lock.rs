@@ -1,8 +1,5 @@
-//! Failure-injection: `migrate-encoder` must serialize against a live
-//! `serve-production` holding the same `data_dir` lock.
-//!
-//! Cross-binary regression guard for `StoreLayout::open_with_lock`;
-//! confirms the lock gate fires loudly and is released on Err return.
+//! `migrate-encoder` must serialize against a live `serve-production` holding the
+//! same `data_dir` lock, and release the gate on Err return.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -14,8 +11,7 @@ fn migrate_encoder_refuses_while_serve_production_holds_data_dir_lock() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
 
-    // Stand-in for `serve-production`'s lock: `open_with_lock` suffices
-    // to reproduce contention without a full server boot.
+    // Reproduces contention without a full server boot.
     let (_layout, server_lock) =
         StoreLayout::open_with_lock(&data_dir).expect("server-side lock acquire");
 
@@ -28,8 +24,7 @@ fn migrate_encoder_refuses_while_serve_production_holds_data_dir_lock() {
          finds the path immediately; got: {msg}"
     );
 
-    // After drop, a fresh data_dir has no manifest so the error flips
-    // from "lock" to "manifest", proving the gate is released.
+    // A released gate flips the error from "lock" to "manifest" on a fresh data_dir.
     drop(server_lock);
 
     let result_after = raven_railgun_cli::migrate_encoder::run(&data_dir, EncoderKind::PerLeafBc);
@@ -45,7 +40,6 @@ fn migrate_encoder_refuses_while_serve_production_holds_data_dir_lock() {
 
 #[test]
 fn migrate_encoder_lock_release_permits_a_second_migration_invocation() {
-    // Guards against a leaked lock wedging future operator commands on Err return.
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
 

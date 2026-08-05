@@ -1,7 +1,5 @@
-//! Batch dispatcher timeout race.
-//!
-//! Verifies that a slow worker surfaces 503, releases its semaphore permit,
-//! and does not block subsequent batches.
+//! A slow batch worker must surface 503, release its permit, and not block the
+//! next batch.
 
 #![allow(
     dead_code,
@@ -56,7 +54,6 @@ impl PirScheme for SlowScheme {
     fn respond(state: &Self::ServerState, query: &Self::Query) -> RailgunResult<Self::Response> {
         state.respond_calls.fetch_add(1, Ordering::SeqCst);
         if query.slow {
-            // Blocking sleep; the dispatcher's timeout must fire while this is in progress.
             std::thread::sleep(Duration::from_millis(SLOW_QUERY_BLOCK_MS));
             state.slow_completed.fetch_add(1, Ordering::SeqCst);
         }
@@ -114,7 +111,7 @@ async fn batch_with_one_slow_query_returns_503_within_timeout_window() {
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/v1/instance/{INSTANCE}/batch");
 
-    // K=16 queries; index 14 is slow. Dispatcher must 503 at timeout, not wait for it.
+    // Index 14 is slow; the dispatcher must 503 at timeout rather than wait.
     let mut queries: Vec<SlowQuery> = (0..16)
         .map(|i| SlowQuery {
             slow: false,
@@ -144,7 +141,6 @@ async fn batch_with_one_slow_query_returns_503_within_timeout_window() {
          see BatchError::status() for the typed mapping. got {status}"
     );
 
-    // Wall-clock must be near the configured timeout (1 s), not the slow worker's full 2.5 s.
     let timeout_budget = Duration::from_secs(RESPOND_TIMEOUT_SECS);
     let upper_bound = timeout_budget + Duration::from_millis(900);
     assert!(
@@ -189,8 +185,7 @@ async fn subsequent_batch_succeeds_after_a_timeout_race() {
         "first batch (with slow worker) must surface 503"
     );
 
-    // Second batch: all fast. Must succeed even though the first batch's slow worker
-    // is still mid-sleep; permits must have been released on the first batch's timeout.
+    // Must succeed while the first batch's slow worker is still mid-sleep.
     let queries_second: Vec<SlowQuery> = (0..16)
         .map(|i| SlowQuery {
             slow: false,

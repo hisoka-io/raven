@@ -64,10 +64,8 @@ enum WasmClientError {
 
 /// Gaussian sampler over a fresh 32-byte OS seed.
 ///
-/// `GaussianSampler::new` and `with_seed` build `ChaCha20Rng::seed_from_u64`, so
-/// `new` is a fixed all-zero seed: every client would draw the same secret key and
-/// the same noise. `from_seed` is the only constructor that takes full entropy, and
-/// a failed draw MUST surface as an error rather than fall back to a weaker source.
+/// A failed draw surfaces as an error; falling back to a weaker source would
+/// hand every client the same secret key.
 fn os_seeded_sampler(sigma: f64, what: &'static str) -> Result<GaussianSampler, WasmClientError> {
     let mut seed = [0u8; 32];
     OsRng

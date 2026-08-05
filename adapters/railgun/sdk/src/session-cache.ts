@@ -1,16 +1,13 @@
-// WASM ClientSession blob cache. Keyed by (instanceId, sha256(crsBincode)) so a
-// CRS rotation auto-invalidates every entry. Stored as `${key}#chunk-i` plus a
-// `${key}#meta` {chunkCount,totalLen,sha256}; one readwrite IDB transaction makes
-// the chunk+meta set atomic. Any missing chunk / length / sha256 mismatch evicts
-// the entry and degrades to a miss. IndexedDB in-browser, in-memory Map under node.
+// ClientSession blob cache keyed by (instanceId, sha256(crsBincode)), so a CRS
+// rotation self-invalidates. Chunks plus a `#meta` record are written in ONE
+// readwrite IDB transaction; any missing chunk or digest mismatch evicts the entry.
 import { RavenError } from "./errors";
 
 const DB_NAME = "raven-pir-session-cache-v1";
 const STORE = "sessions";
-/// Drives both `makeKey` and the IndexedDB version, so a bump rotates every key AND
-/// fires `onupgradeneeded`. Bump whenever a cached residue must not be rehydrated by
-/// the current build - a residue carries the client's RLWE secret key, so accepting a
-/// stale one silently reinstates whatever key wrote it.
+// Drives both `makeKey` and the IndexedDB version, so a bump rotates every key AND
+// fires `onupgradeneeded`. A residue carries the client's RLWE secret key, so a
+// stale one silently reinstates whatever key wrote it.
 const KEY_VERSION = 2;
 const CHUNK_SIZE = 32 * 1024 * 1024;
 
@@ -99,7 +96,6 @@ function planChunks(blobLen: number): { chunkCount: number; ranges: Array<[numbe
 }
 
 class MemoryBackend implements CacheBackend {
-  // Exposed so failure-injection tests can corrupt a chunk.
   readonly map = new Map<string, Uint8Array>();
 
   async get(key: string): Promise<Uint8Array | null> {
@@ -136,7 +132,7 @@ class MemoryBackend implements CacheBackend {
   async put(key: string, blob: Uint8Array): Promise<void> {
     const sha = await sha256Hex(blob);
     const { chunkCount, ranges } = planChunks(blob.length);
-    // Evict any prior shape first so stale chunks cannot survive.
+    // Evict first, else stale chunks survive a shape change.
     await this.evict(key, chunkCount);
     for (let i = 0; i < ranges.length; i += 1) {
       const [start, end] = ranges[i];
@@ -159,7 +155,6 @@ class MemoryBackend implements CacheBackend {
     for (let i = 0; i < limit; i += 1) {
       this.map.delete(chunkKey(key, i));
     }
-    // Sweep stragglers past the known count.
     for (const k of Array.from(this.map.keys())) {
       if (k.startsWith(`${key}#chunk-`)) this.map.delete(k);
     }
@@ -179,9 +174,8 @@ class IndexedDbBackend implements CacheBackend {
           db.createObjectStore(STORE);
           return;
         }
-        // A residue carries the session's RLWE secret key, so a stale entry is not
-        // merely unusable, it is a key that must leave the disk. Rotating the key
-        // prefix alone would orphan it, not remove it.
+        // A key-prefix rotation would orphan the RLWE-key-bearing residue, not
+        // remove it from disk.
         req.transaction?.objectStore(STORE).clear();
       };
       req.onsuccess = () => resolve(req.result);

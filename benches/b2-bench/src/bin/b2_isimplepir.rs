@@ -39,9 +39,8 @@ fn median_of(samples: &mut [u64]) -> u64 {
     samples[samples.len() / 2]
 }
 
-// Deterministic synthetic DB: `byte = ((i + j) % 251) as u8`.
-// 251 is prime so no aliasing with power-of-two record sizes;
-// computing on-the-fly avoids materializing the raw byte DB.
+// 251 is prime, so no aliasing with power-of-two record sizes; computed on the fly to avoid
+// materializing the raw byte DB.
 #[inline]
 fn raw_byte(entry_idx: usize, byte_offset: usize) -> u8 {
     ((entry_idx + byte_offset) % 251) as u8
@@ -189,11 +188,9 @@ struct CliArgs {
     seeds: Vec<u64>,
     out_dir: PathBuf,
     smoke_only: bool,
-    /// Use `setup_owned` (moves the DB; halves peak memory at
-    /// large cells). Default on.
+    /// `setup_owned` moves the DB, halving peak memory at large cells. Default on.
     use_setup_owned: bool,
-    /// Squish `ServerState.db` post-setup and use `respond_packed`.
-    /// Requires `p <= 1024`. Off by default.
+    /// Squish the DB post-setup and use `respond_packed`; requires `p <= 1024`.
     use_squish: bool,
 }
 
@@ -269,8 +266,7 @@ fn main() {
         (packed.len() * 4) as f64 / (1024.0 * 1024.0)
     );
 
-    // Fixed `a_seed` so reruns are reproducible; per-seed query
-    // RNG varies across the 3 seeds.
+    // Fixed so reruns are reproducible; the per-seed query RNG still varies.
     let a_seed = [0u8; 32];
 
     let setup_start = Instant::now();

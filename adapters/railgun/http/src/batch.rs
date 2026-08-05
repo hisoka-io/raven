@@ -49,8 +49,7 @@ pub(crate) async fn query_handler<S: PirScheme>(
 
     let started = Instant::now();
     let respond_timeout = Duration::from_secs(app.config.respond_timeout_secs.max(1));
-    // spawn_blocking + timeout so a pathological query releases its permit
-    // instead of blocking later requests.
+    // A pathological query must release its permit rather than block later requests.
     let instance_clone = Arc::clone(&instance);
     let join = tokio::task::spawn_blocking(move || instance_clone.query_active_tracked(&query));
     let (epoch, response) = match tokio::time::timeout(respond_timeout, join).await {
@@ -132,8 +131,7 @@ pub(crate) async fn batch_handler<S: PirScheme>(
         tracing::warn!(?err, "batch versioned-bincode deserialize failed");
         StatusCode::BAD_REQUEST
     })?;
-    // Off-ladder lengths are refused rather than served: a client that skipped
-    // padding would otherwise publish its exact query count, silently.
+    // Serving an off-ladder length would publish the caller's exact query count.
     if let Err(violation) = check_batch_len(queries.len()) {
         tracing::warn!(
             instance_id = %instance.id,
@@ -149,8 +147,7 @@ pub(crate) async fn batch_handler<S: PirScheme>(
     }
 
     let started = Instant::now();
-    // Capture `(epoch, state)` ONCE: every worker serves this exact snapshot so
-    // the batch can't straddle a concurrent `swap_state`.
+    // Captured ONCE so the batch cannot straddle a concurrent `swap_state`.
     let snapshot_for_batch = instance.current_snapshot();
     let epoch_at_start = snapshot_for_batch.epoch;
 
@@ -370,7 +367,7 @@ where
                 );
             }
             Err(e) => {
-                // Log class+index only; `Respond { detail }` may carry attacker-influenced text.
+                // `Respond { detail }` may carry attacker-influenced text.
                 tracing::warn!(
                     failed_idx = idx,
                     class = e.class(),

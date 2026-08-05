@@ -134,8 +134,7 @@ async fn params_crs_drops_galois_keys_and_keeps_every_serialized_field() {
     assert_eq!(wire.inspiring_v_seed, full.inspiring_v_seed);
     assert_eq!(wire.inspiring_num_columns, full.inspiring_num_columns);
 
-    // The constructor also nulls these two; both are `#[serde(skip)]`, so the full CRS
-    // loses them on its own round trip and the nulling is inert on the wire.
+    // Both are `#[serde(skip)]`, so the full CRS loses them on its own round trip.
     assert!(wire.inspiring_pack_params.is_none());
     assert!(wire.inspiring_packing_key.is_none());
     assert!(

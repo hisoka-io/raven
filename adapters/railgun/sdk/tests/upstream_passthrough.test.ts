@@ -37,7 +37,7 @@ describe("upstream-passthrough endpoints", () => {
   });
 
   it("validatePOIMerkleroots posts the correct shape to upstream", async () => {
-    // Upstream path /validate-poi-merkleroots/<chainType>/<chainID> (api.ts:786).
+    // Upstream path /validate-poi-merkleroots/<chainType>/<chainID> (api.ts).
     server.route(
       (req) => req.url === "/validate-poi-merkleroots/0/1",
       (_req, _body, res) => {
@@ -107,7 +107,7 @@ describe("upstream-passthrough endpoints", () => {
   });
 
   it("submitPOI posts to upstream with full upstream 9-arg shape", async () => {
-    // Upstream path /submit-transact-proof/<chainType>/<chainID> (api.ts:653).
+    // Upstream path /submit-transact-proof/<chainType>/<chainID> (api.ts).
     server.route(
       (req) => req.url === "/submit-transact-proof/0/1",
       (_req, _body, res) => {

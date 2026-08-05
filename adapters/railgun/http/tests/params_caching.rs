@@ -1,9 +1,5 @@
-//! Cloudflare-cacheability regression suite for
-//! `GET /v1/instance/{id}/params`.
-//!
-//! Pins the ETag + Cache-Control + Vary contract surfaced to public
-//! caches, the `If-None-Match` 304-fast-path, and the per-instance
-//! ETag cache invalidation on epoch advance.
+//! `GET /v1/instance/{id}/params` cacheability: the ETag + Cache-Control + Vary
+//! contract, the `If-None-Match` 304 path, and ETag invalidation on epoch advance.
 
 #![allow(
     clippy::expect_used,
@@ -167,7 +163,6 @@ async fn params_handler_returns_304_on_matching_if_none_match() {
     let app_state = build_app_state();
     let router = build_router(app_state);
 
-    // First fetch to capture the live ETag.
     let resp1 = router
         .clone()
         .oneshot(build_params_request(READ_TOKEN))
@@ -182,7 +177,6 @@ async fn params_handler_returns_304_on_matching_if_none_match() {
         .expect("ascii")
         .to_owned();
 
-    // Re-fetch with If-None-Match equal to the captured ETag.
     let resp2 = router
         .oneshot(build_params_request_inm(READ_TOKEN, &etag))
         .await
@@ -251,8 +245,6 @@ async fn params_handler_returns_200_on_mismatching_if_none_match() {
 async fn params_handler_invalidates_etag_on_epoch_bump() {
     let app_state = build_app_state();
 
-    // Capture handle on the live instance so we can drive swap_state
-    // out-of-band before issuing the second request.
     let instance = app_state
         .engine
         .instance(&InstanceId::new(INSTANCE_ID))
@@ -274,10 +266,7 @@ async fn params_handler_invalidates_etag_on_epoch_bump() {
         .expect("ascii")
         .to_owned();
 
-    // Build a fresh InspireServerState and swap_state-bump the epoch.
-    // The new state is bit-for-bit different from the boot state
-    // (different DB contents) so the body bytes, and therefore the
-    // SHA-256, must differ.
+    // Different DB contents, so the body bytes and their SHA-256 must differ.
     let params = InspireParams::secure_128_d2048();
     let db_v2: Vec<u8> = (0..TOY_ENTRIES)
         .flat_map(|i| {
@@ -295,9 +284,7 @@ async fn params_handler_invalidates_etag_on_epoch_bump() {
         "swap_state must bump epoch"
     );
 
-    // Re-fetch with the now-stale ETag. The cache lookup keys on
-    // (instance_id, epoch) so the old digest is unreachable; we get a
-    // 200 with a fresh ETag rather than a 304.
+    // The cache keys on (instance_id, epoch), so the stale digest is unreachable.
     let resp2 = router
         .oneshot(build_params_request_inm(READ_TOKEN, &etag_pre))
         .await
@@ -319,7 +306,6 @@ async fn params_handler_invalidates_etag_on_epoch_bump() {
         "etag must change when the epoch advances"
     );
 
-    // X-Raven-Epoch reflects the new epoch on the post-swap response.
     let epoch_hdr = resp2
         .headers()
         .get("x-raven-epoch")

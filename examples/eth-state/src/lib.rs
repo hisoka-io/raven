@@ -1,14 +1,8 @@
-//! Generic Ethereum-state private-balance PIR demo (flat state, no trie).
+//! Flat `address -> 32-byte big-endian balance` PIR demo over the InsPIRe respond path:
+//! one changed account is one row plus one shard re-encode, no trie and no root churn.
 //!
-//! Serves a flat `address -> 32-byte big-endian balance` corpus through the
-//! InsPIRe respond path. One changed account is one row plus one shard re-encode:
-//! no trie, no state root, no ancestor churn. Generic Ethereum-state vocabulary
-//! only; depends on the framework crates, never on an application adapter.
-//!
-//! The address -> leaf-index map follows the flat single-keyspace shape of
-//! EIP-7864 (Unified Binary Tree, draft): a plain dense `u64` leaf assigned per
-//! address, `shard = flat_index / ENTRIES_PER_SHARD`. It does NOT build a live
-//! unified binary tree and uses no per-tree key schedule.
+//! Leaf assignment is a dense `u64` per address with `shard = flat_index / ENTRIES_PER_SHARD`,
+//! the flat single-keyspace shape of EIP-7864 (draft). No live tree is built.
 
 #[cfg(feature = "anvil-e2e")]
 pub mod anvil;
@@ -37,21 +31,20 @@ use std::sync::Arc;
 
 use raven_client::{build_seeded_query_rust, extract_response_rust};
 
-/// Fixed record width: byte 0 is the presence tag, bytes 1..32 the big-endian balance. Even,
-/// so the encoder's 16-bit-chunk reader is well-defined; `num_polys = (32*8)/16 = 16`.
+/// Record width; byte 0 is the presence tag. MUST stay even: the encoder reads 16-bit chunks.
 pub const ENTRY_SIZE: usize = 32;
 
-/// Presence tag at record byte 0 on every constructed record (including a zero balance), so a
-/// changed-to-zero balance is distinguishable from an absent (all-zero) slot.
+/// Byte-0 tag set on every constructed record, so a changed-to-zero balance is
+/// distinguishable from an absent (all-zero) slot.
 pub const PRESENT_TAG: u8 = 0x01;
 
-/// Entries per shard, equal to the ring dimension; `shard = flat_index / 2048`.
+/// Entries per shard, equal to the ring dimension.
 pub const ENTRIES_PER_SHARD: usize = 2048;
 
-/// Errors from the flat-state demo glue. Every variant names the failing operation.
+/// Errors from the flat-state demo glue.
 #[derive(Debug, thiserror::Error)]
 pub enum EthStateError {
-    /// A record exceeds the fixed 32-byte entry width.
+    /// Record wider than the balance field.
     #[error("record too large: {got} bytes exceeds the 31-byte balance field (byte 0 is the presence tag)")]
     RecordTooLarge {
         /// Observed record length.
@@ -71,9 +64,7 @@ pub enum EthStateError {
     Respond(String),
 }
 
-/// Construct the fixed [`ENTRY_SIZE`]-byte record: byte 0 is the [`PRESENT_TAG`], the value is
-/// big-endian right-aligned in bytes `1..ENTRY_SIZE`. A value wider than `ENTRY_SIZE - 1` is
-/// rejected, since byte 0 is reserved for the tag.
+/// Fixed-width record: [`PRESENT_TAG`] at byte 0, `value` big-endian right-aligned after it.
 ///
 /// ```
 /// let r = eth_state::pad_record(&[7u8; 8]).expect("fits");
@@ -90,8 +81,7 @@ pub fn pad_record(value: &[u8]) -> Result<Bytes, EthStateError> {
     Ok(Bytes::from(buf))
 }
 
-/// Decoded record bytes, verbatim: the byte-0 tag MUST survive because [`record_present`] runs
-/// on these bytes downstream.
+/// Decoded record bytes verbatim; the byte-0 tag MUST survive for [`record_present`].
 ///
 /// ```
 /// let r = eth_state::pad_record(&[7u8; 8]).expect("fits");
@@ -105,19 +95,16 @@ pub fn unpad_record(record: &[u8]) -> Bytes {
 pub struct FlatServerState {
     /// Public common reference string.
     pub crs: ServerCrs,
-    /// Encoded shard corpus (its `config` is the client's [`ShardConfig`]).
+    /// Encoded shard corpus.
     pub encoded_db: EncodedDatabase,
-    /// Per-database server-compute cache (CRS-static `pack_params`/`offline_keys`, zero
-    /// per-client data). Built once per engine and Arc-cloned through every fold, never
-    /// rebuilt: `num_columns` is fixed for a fixed `entry_size`.
+    /// CRS-static server-compute cache, no per-client data. Arc-cloned through every fold,
+    /// never rebuilt: `num_columns` is fixed for a fixed `entry_size`.
     #[cfg(feature = "cached-respond")]
     pub cache: Arc<ServerInspiringCache>,
 }
 
-/// Generic flat-state balance PIR scheme. Serves a fixed-width record corpus via
-/// the handshake-free InsPIRe respond path: each query carries inline packing keys
-/// with `session_handle: None` and the respond call is given no server session
-/// store, so the engine is both client-stateless and server-stateless.
+/// Flat-balance PIR scheme over the handshake-free InsPIRe respond path: queries carry inline
+/// packing keys with no `session_handle`, so the engine is client- and server-stateless.
 pub struct FlatBalanceScheme;
 
 impl PirScheme for FlatBalanceScheme {
@@ -128,9 +115,8 @@ impl PirScheme for FlatBalanceScheme {
     fn respond(state: &Self::ServerState, query: &Self::Query) -> SchemeResult<Self::Response> {
         #[cfg(feature = "cached-respond")]
         let result = {
-            // The cache was built for this engine's `num_columns = ceil(entry_size/2)`; a fold
-            // that diverged the corpus shape from the cache would silently corrupt the response.
-            // Make the doc-only invariant a debug guard.
+            // Cache is bound to num_columns = entry_size/2; a fold that diverged the corpus
+            // shape from it would silently corrupt the response.
             debug_assert!(
                 state
                     .encoded_db
@@ -147,13 +133,9 @@ impl PirScheme for FlatBalanceScheme {
     }
 }
 
-/// Build one flat-balance engine state from a flat record buffer (`entry_size`
-/// bytes per record).
-///
-/// Uses a seeded [`ChaCha20Rng`] (never `thread_rng`) so the CRS is reproducible.
-/// `setup_with_rng` derives the correct flat shard config
-/// (`shard_size_bytes = ring_dim * entry_size`), so the 1 GiB `for_flat_db` default
-/// trap is never hit and one shard holds exactly `ring_dim` entries.
+/// Build one engine from a flat record buffer. Seeded [`ChaCha20Rng`], never `thread_rng`, so
+/// the CRS is reproducible; `setup_with_rng` derives `shard_size_bytes = ring_dim * entry_size`
+/// rather than the 1 GiB `for_flat_db` default.
 pub fn build_flat_state(
     params: &InspireParams,
     database: &[u8],
@@ -193,8 +175,7 @@ pub fn build_session(
         .map_err(|e| EthStateError::Setup(e.to_string()))
 }
 
-/// Which engine's value a fan-out read selected: `Sidecar` when it held a fresher record,
-/// else `Main`. Both legs are always extracted regardless (timing-leak safety).
+/// Which engine's value a fan-out read selected. Both legs are extracted regardless.
 ///
 /// ```
 /// use eth_state::AnsweringEngine;
@@ -208,31 +189,27 @@ pub enum AnsweringEngine {
     Sidecar,
 }
 
-/// Presence predicate over a decoded record: the sidecar holds an account iff the structural
-/// [`PRESENT_TAG`] at byte 0 is set. Structural, not content-derived, so a freshly-changed-to-zero
-/// balance (tag set, balance bytes zero) is present, while an untouched all-zero slot is absent.
-/// One constant-position byte read, no secret-dependent short-circuit over the balance content;
-/// the check is client-local, after both legs have emitted.
+/// Structural, not content-derived: a changed-to-zero balance is present, an untouched all-zero
+/// slot is absent. One constant-position read, no short-circuit over the balance bytes.
 fn record_present(bytes: &[u8]) -> bool {
     bytes.first() == Some(&PRESENT_TAG)
 }
 
 /// Client-side handle for one engine in a main+sidecar pair.
 pub struct EngineHandle<'a> {
-    /// The registered instance answering queries.
+    /// Registered instance answering queries.
     pub instance: &'a PirInstance<FlatBalanceScheme>,
-    /// The client session bound to this engine's CRS.
+    /// Session bound to this engine's CRS.
     pub session: &'a ClientSession,
-    /// This engine's public CRS, for response extraction.
+    /// This engine's public CRS.
     pub crs: &'a ServerCrs,
-    /// Scheme params for query construction.
+    /// Scheme params.
     pub params: &'a InspireParams,
-    /// Shard config for query construction.
+    /// Shard config.
     pub shard_config: &'a ShardConfig,
 }
 
-/// One read leg: build a seeded query, query the instance, extract the response.
-/// The extract always runs; it is never gated behind a cross-leg selection.
+/// Build, query, extract. The extract always runs; never gated behind a cross-leg selection.
 async fn read_leg(h: &EngineHandle<'_>, leaf: u64) -> Result<Bytes, EthStateError> {
     let (state, query) = build_seeded_query_rust(h.session, h.params, h.shard_config, leaf)
         .map_err(EthStateError::Query)?;
@@ -242,32 +219,26 @@ async fn read_leg(h: &EngineHandle<'_>, leaf: u64) -> Result<Bytes, EthStateErro
         .map_err(|e| EthStateError::Respond(e.to_string()))?;
     let bytes = extract_response_rust(h.crs, &state, &response, ENTRY_SIZE)
         .map_err(EthStateError::Decode)?;
-    // The counter travels with the extract it certifies (not read_leg entry): a lazy regression
-    // that skips the losing leg's extract reads 1, not 2. Test-only, off the production/WASM path.
+    // Counts the extract, not leg entry, so a lazy skip of the losing leg reads 1 not 2.
     #[cfg(test)]
     EXTRACT_LEG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(unpad_record(&bytes))
 }
 
-/// Per-leg extract counter for the C3 both-legs-extracted gate. Test-only so the production read
-/// path carries no per-query cross-leg observable.
+/// Test-only, so the production read path carries no cross-leg observable.
 #[cfg(test)]
 pub(crate) static EXTRACT_LEG_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Privacy-critical fan-out: fire a query at BOTH the main and the sidecar engine
-/// for the SAME leaf, await BOTH, extract BOTH (the extract is never gated behind
-/// the selection), then select the answer on decrypted CONTENT via a presence
-/// predicate. Both legs always run to completion, so the server cannot learn which
-/// engine held the record from timing or request shape. The two legs use distinct
-/// sessions/CRSes and are never crossed.
+/// Fan out the same leaf at both engines, await and extract BOTH, then select on decrypted
+/// content. Unconditional completion of both legs is what keeps the server from learning
+/// which engine held the record. The legs use distinct sessions/CRSes and are never crossed.
 pub async fn read_balance_consume_both(
     main: &EngineHandle<'_>,
     sidecar: &EngineHandle<'_>,
     leaf: u64,
 ) -> Result<(Bytes, AnsweringEngine), EthStateError> {
     let (main_res, side_res) = futures::join!(read_leg(main, leaf), read_leg(sidecar, leaf));
-    // Both legs (and both extracts) have already run; select only after both resolve.
     let main_bytes = main_res?;
     let side_bytes = side_res?;
     if record_present(&side_bytes) {
@@ -286,7 +257,6 @@ mod tests {
     use serial_test::serial;
     use std::sync::atomic::Ordering;
 
-    /// The structural tag distinguishes a present-zero balance from an absent slot.
     #[test]
     fn record_present_tags_zero_vs_absent() {
         let zero = normalize_balance_be(&0u128.to_be_bytes()).expect("fits");
@@ -303,8 +273,6 @@ mod tests {
         assert!(record_present(&nonzero), "a non-zero balance is present");
     }
 
-    /// A single fan-out read extracts BOTH legs (count == 2) regardless of which the content
-    /// predicate selects. A lazy-extract-only-the-selected-leg regression would read 1 and fail.
     #[test]
     #[serial]
     fn both_legs_extracted() {

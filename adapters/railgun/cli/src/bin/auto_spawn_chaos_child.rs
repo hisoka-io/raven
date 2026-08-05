@@ -1,10 +1,8 @@
-//! Child subprocess for the real-SIGKILL auto-spawn lifecycle harness.
+//! Child subprocess for the real-SIGKILL auto-spawn harness.
 //!
-//! Reproduces `spawn_one` up to one of three pause points, emits `{"paused_at":"<name>"}` to
-//! stdout, then parks until the parent SIGKILLs it. Tests inspect on-disk recovery semantics at
-//! each crash window that the append-LAST ordering invariant is designed to close.
-//!
-//! Pause points: `before-add-live`, `after-add-live-before-log`, `after-log`.
+//! Runs `spawn_one` to a pause point (`before-add-live`,
+//! `after-add-live-before-log`, `after-log`), emits `{"paused_at":"<name>"}`, then
+//! parks until the parent SIGKILLs it.
 
 #![allow(
     clippy::expect_used,

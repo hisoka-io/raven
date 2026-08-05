@@ -1,6 +1,5 @@
-//! Scheme-agnostic bench driver. Server-only (uses
-//! `std::time::Instant`); the `lib` target compiles to wasm32
-//! but the harness itself is not exercised there.
+//! Scheme-agnostic bench driver. `std::time::Instant` makes it server-only, though the `lib`
+//! target still compiles to wasm32.
 
 use std::time::{Duration, Instant};
 
@@ -66,8 +65,7 @@ impl IndexPattern {
 pub struct HarnessConfig {
     pub warmup_queries: u32,
     pub measured_queries: u32,
-    /// Wall-clock budget; harness stops at `measured_queries` or
-    /// `budget`, whichever first.
+    /// Stops at `measured_queries` or this budget, whichever comes first.
     pub budget: Duration,
     pub index_pattern: IndexPattern,
 }
@@ -83,9 +81,8 @@ impl Default for HarnessConfig {
     }
 }
 
-/// Drive `scheme` through warmup + measured queries against `cell`,
-/// summarize into a `BenchReport`. `setup_time` is supplied by the
-/// caller; harness only times queries.
+/// Warm up, then time measured queries against `cell`. `setup_time` is caller-supplied; only
+/// queries are timed here.
 pub fn run_cell<S: BenchScheme>(
     scheme: &S,
     cell: GridCell,
@@ -279,8 +276,6 @@ mod tests {
         for i in 0u64..16 {
             assert_eq!(p1.index_for(i, 1_000_000), p2.index_for(i, 1_000_000));
         }
-        // Different seeds should produce different sequences (with
-        // overwhelming probability at this sample size).
         let diffs = (0u64..16)
             .filter(|&i| p1.index_for(i, 1_000_000) != p3.index_for(i, 1_000_000))
             .count();
@@ -317,7 +312,7 @@ mod tests {
 
     #[test]
     fn warmup_and_measured_indices_are_disjoint_under_sequential_pattern() {
-        // Worst case: trial_idx i -> DB index i, so a measured loop restarting at 0 would re-prime warmup caches.
+        // Worst case: trial i maps to index i, so restarting at 0 would re-prime warmup caches.
         let scheme = RecordingScheme::new();
         let cell = GridCell {
             entries_log2: 20,
@@ -353,7 +348,6 @@ mod tests {
 
     #[test]
     fn warmup_and_measured_indices_are_disjoint_under_randomised_pattern() {
-        // Mapping keys on trial_idx, so shifting the measured start by warmup_queries yields a disjoint prefix at this scale.
         let scheme = RecordingScheme::new();
         let cell = GridCell {
             entries_log2: 20,
@@ -382,7 +376,6 @@ mod tests {
 
     #[test]
     fn harness_default_index_pattern_is_randomised() {
-        // Guards against the default reverting to the sequential 0,1,2,... artefact.
         let cfg = HarnessConfig::default();
         match cfg.index_pattern {
             IndexPattern::Randomised { .. } => {}

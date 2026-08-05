@@ -1,25 +1,9 @@
 /**
- * Live mainnet PIR smoke test.
+ * Live mainnet smoke: params fetch -> WASM session -> auth-path PIR query ->
+ * Poseidon fold -> on-chain `rootHistory` cross-check.
  *
- * Exercises the full end-to-end flow against a deployed Raven adapter
- * and the live Ethereum mainnet `RailgunSmartWallet` proxy:
- *
- *   1. Fetch `/v1/instance/<id>/params` (server's bincode envelope)
- *      and decode it into `crsBincode`, `shardConfigBincode`, and
- *      `inspireParamsBincode`.
- *   2. Build a real WASM client session via
- *      `build_instance_params_blob` + `build_client_session`.
- *   3. Issue a `getMerkleProof` (T3) auth-path PIR query against the
- *      live commit-tree instance.
- *   4. Decrypt the 16 sibling node hashes with `extract_response`.
- *   5. Fold the leaf with the path via Poseidon to recover the root.
- *   6. Cross-validate the recovered root against on-chain
- *      `RailgunSmartWallet.rootHistory(treeNumber, root)` via Infura.
- *
- * Gated entirely behind `RAVEN_LIVE_URL` + `RAVEN_LIVE_TOKEN` +
- * `RAVEN_INFURA_URL` (mainnet RPC for the on-chain root cross-check) env
- * vars. When any is unset (the CI default), every block is `it.skip(...)`'d
- * so this test never makes network calls in offline lanes.
+ * Every block skips unless `RAVEN_LIVE_URL` + `RAVEN_LIVE_TOKEN` +
+ * `RAVEN_INFURA_URL` are set, so offline lanes make no network calls.
  */
 
 import { afterAll, describe, expect, it } from "vitest";
@@ -93,9 +77,8 @@ function readString(buf: Uint8Array, offset: number): { value: string; next: num
 }
 
 /**
- * Decode the `/v1/instance/:id/params` response. Wire shape (mirrors
- * `raven-railgun-http::InstanceParams` plus the `write_versioned`
- * envelope at the front):
+ * Decode `/v1/instance/:id/params`, mirroring `InstanceParams` behind the
+ * `write_versioned` envelope:
  *
  *   [u16 BE  schema_version]
  *   [u16 LE  wire_schema_version]
@@ -152,11 +135,8 @@ interface InstanceBundle {
 }
 
 const wasm = wasmPkg as unknown as RavenInspireWasm;
-// Install the Rust panic hook so any panic surfaces as a structured
-// JS Error with the original Rust file:line:msg, rather than the
-// opaque `RuntimeError: unreachable executed` that obliterates all
-// diagnostic context. Without this, every internal raven-inspire
-// panic looks identical to the wallet.
+// Without the hook every Rust panic reaches the wallet as an identical opaque
+// `RuntimeError: unreachable executed`.
 const wasmInit = wasmPkg as unknown as { init_panic_hook?: () => void };
 if (typeof wasmInit.init_panic_hook === "function") {
   wasmInit.init_panic_hook();
@@ -248,13 +228,9 @@ async function ethCall(
 }
 
 /**
- * Encode a call to `rootHistory(uint256 treeNumber, bytes32 root)`.
- *
- * Selector = first 4 bytes of keccak256("rootHistory(uint256,bytes32)").
- * Verified locally via `cast sig 'rootHistory(uint256,bytes32)'`. The
- * mapping shape is `mapping(uint256 => mapping(bytes32 => bool)) public
- * rootHistory` (Solidity auto-getter) at upstream
- * `contract/contracts/logic/Commitments.sol:58`.
+ * Encode `rootHistory(uint256,bytes32)`; the selector is the first 4 bytes of its
+ * keccak256, and the getter is auto-generated from the `mapping(uint256 =>
+ * mapping(bytes32 => bool)) public rootHistory` in upstream `Commitments.sol`.
  */
 const ROOT_HISTORY_SELECTOR = "0xc718dbda";
 
@@ -271,16 +247,11 @@ async function rootHistoryContains(
 ): Promise<boolean> {
   const data = encodeRootHistoryCall(treeNumber, rootHexNoPrefix);
   const result = await ethCall(rpc, RAILGUN_PROXY, data);
-  // Result is 32 bytes hex. `true` = 0x...01, `false` = 0x...00.
   return /[1-9a-f]/.test(result.replace(/^0x/, ""));
 }
 
-/**
- * Issue a single direct PIR query for a flat-global row index. Used to
- * fetch the leaf node hash itself (level-0 row in the `PerNodeEncoder`
- * layout) so the test can fold leaf+siblings -> root locally without
- * relying on a separately-known BC.
- */
+/** Direct PIR query for a flat-global row index, so the leaf hash itself can be
+ * folded with its siblings without a separately-known BC. */
 async function fetchSingleRow(
   endpoint: string,
   token: string,
@@ -292,16 +263,12 @@ async function fetchSingleRow(
     ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, BigInt(flatIdx)),
   );
   const url = `${endpoint}/v1/instance/${encodeURIComponent(instanceId)}/query`;
-  // Server's `read_versioned` expects `[u16 BE schema][bincode body]`.
-  // Mirrors what the SDK's `runClientPirQuery` and the Rust
-  // `native_live_replay.rs` do.
+  // `read_versioned` expects `[u16 BE schema][bincode body]`.
   const wireBody = new Uint8Array(2 + queryBundle.queryBytes.length);
   wireBody[0] = 0;
   wireBody[1] = 1;
   wireBody.set(queryBundle.queryBytes, 2);
-  // ArrayBuffer view that the WHATWG fetch impl accepts as BodyInit.
-  // Some tsc targets refuse a `Uint8Array<ArrayBufferLike>`; the
-  // explicit `BodyInit` cast keeps the test source portable.
+  // Some tsc targets refuse `Uint8Array<ArrayBufferLike>` as BodyInit.
   const fetchBody = wireBody as unknown as BodyInit;
   const res = await fetch(url, {
     method: "POST",
@@ -347,8 +314,7 @@ function recordFinding(row: FindingsRow): void {
   findings.push(row);
 }
 
-// Module-level cache so successive tests in one run reuse downloaded
-// params (each `/v1/instance/<id>/params` blob is ~35 MB).
+// Each params blob is ~35 MB, so successive tests in a run reuse it.
 const bundleCache = new Map<string, InstanceBundle>();
 
 async function getInstance(instanceId: string): Promise<InstanceBundle> {
@@ -363,7 +329,6 @@ async function getInstance(instanceId: string): Promise<InstanceBundle> {
 describe("live mainnet PIR smoke", () => {
   if (!RUN_LIVE) {
     it.skip("requires RAVEN_LIVE_URL + RAVEN_LIVE_TOKEN env vars", () => {
-      // Recorded so test runs in unset env make this fact visible.
     });
   }
 
@@ -390,9 +355,7 @@ describe("live mainnet PIR smoke", () => {
       const leafIndex = 0;
       const t0 = Date.now();
       const proof = await sdk.getMerkleProof(0, leafIndex);
-      // Independently PIR-fetch the leaf node (PerNodeEncoder level-0
-      // row at flat_index=leafIndex). Required because the SDK's
-      // getMerkleProof currently surfaces an empty leaf placeholder.
+      // getMerkleProof surfaces an empty leaf placeholder, so fetch level-0 directly.
       const leafBytes = await fetchSingleRow(
         LIVE_URL,
         LIVE_TOKEN,
@@ -420,7 +383,6 @@ describe("live mainnet PIR smoke", () => {
         leafHex,
         notes: `params_fetch=${bundle.fetchMs}ms variant=${bundle.decoded.variant} epoch=${bundle.decoded.epoch}`,
       });
-      // Honest-stop: surface the raw bytes rather than papering over.
       expect(onChain).toBe(true);
     },
     TEST_TIMEOUT_MS,
@@ -476,9 +438,7 @@ describe("live mainnet PIR smoke", () => {
       if (!LIVE_URL || !LIVE_TOKEN) throw new Error("env guard");
       const bundle = await getInstance("ppoi-status-ofac");
       const listKey = "00".repeat(32);
-      // Empty bc-to-idx map proves the SDK preflight short-circuits to
-      // "Missing" without a wire query, exercising the T1 architecture
-      // contract even when the per-list IMT is empty.
+      // An empty bc-to-idx map must short-circuit to "Missing" with no wire query.
       const sdk = new RavenPOINodeInterface({
         endpoint: LIVE_URL,
         bearerToken: LIVE_TOKEN,
@@ -497,8 +457,6 @@ describe("live mainnet PIR smoke", () => {
       );
       const elapsed = Date.now() - t0;
       expect(got[bcHex][listKey]).toBe("Missing");
-      // No wire request for the BC: the bcToIdxMap miss short-circuits
-      // before any HTTP call is issued.
       expect(sdk.lastWireRequests().length).toBe(0);
       recordFinding({
         scope: "T1 ppoi-status-ofac empty bcToIdxMap",

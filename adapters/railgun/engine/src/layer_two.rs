@@ -1,8 +1,6 @@
-//! Layer 2 reorg detection: protocol-layer guarantee that the local IMT root
-//! matches the contract's `rootHistory(tree, root)`. Catches the case Layer 1
-//! misses: events applied locally in the wrong order, or the indexer dropping
-//! a Shield event between `eth_getLogs` chunks. See [`VerifyOutcome`] for the
-//! soundness model.
+//! Layer 2 reorg detection: cross-checks the local IMT root against the
+//! contract's `rootHistory`, catching what Layer 1 misses - locally misordered
+//! events, or an event dropped between `eth_getLogs` chunks.
 
 use std::cmp::Ordering;
 
@@ -11,21 +9,17 @@ use raven_railgun_indexer::ChainSource;
 
 use crate::imt::Imt;
 
-/// Outcome of one Layer 2 verification round.
+/// Outcome of one verification round.
 ///
-/// `rootHistory` is monotonic-set (never cleared) so a hit alone proves
-/// "canonical at some past height", not currently canonical. Branches:
-/// - **Active tree** (`tree == active`): InSync requires rootHistory hit AND
-///   `merkleRoot() == local_root`.
-/// - **Frozen tree** (`tree < active`): rootHistory hit is sufficient; frozen
-///   trees can never gain a newer canonical root.
-/// - **Future tree** (`tree > active`): always OutOfSync.
+/// `rootHistory` is a monotonic set, so a hit alone proves only "canonical at
+/// some past height". The active tree therefore also requires
+/// `merkleRoot() == local_root`; a frozen tree needs the hit alone, since it
+/// can never gain a newer root; a future tree is always out of sync.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerifyOutcome {
     /// Local root passes the soundness check for the given tree.
     InSync,
-    /// Local root failed verification; orchestrator should emit
-    /// `IndexerMessage::Reorg` and walk back.
+    /// Verification failed; the orchestrator should emit a reorg and walk back.
     OutOfSync {
         /// Locally-computed root that failed.
         local_root: [u8; 32],
@@ -34,10 +28,10 @@ pub enum VerifyOutcome {
     },
 }
 
-/// Verify the IMT's current root against chain state. See [`VerifyOutcome`].
+/// Verify the IMT's current root against chain state per [`VerifyOutcome`].
 ///
 /// # Errors
-/// Returns [`AdapterError::Scheme`] on chain source failure. Treat as transient.
+/// [`AdapterError::Scheme`] on chain source failure; treat as transient.
 pub async fn verify_root_against_chain<S: ChainSource + ?Sized>(
     source: &S,
     tree_number: u32,
@@ -45,8 +39,8 @@ pub async fn verify_root_against_chain<S: ChainSource + ?Sized>(
 ) -> Result<VerifyOutcome> {
     let local_root = imt.root();
 
-    // One anchor for all three eth_calls: mid-round chain advancement would
-    // otherwise yield false InSync/OutOfSync.
+    // All three eth_calls share one anchor; mid-round chain advancement would
+    // otherwise yield a false verdict.
     let anchor_block = source
         .latest_block()
         .await
@@ -192,8 +186,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_tree_history_hit_but_stale_current_is_out_of_sync() {
-        // Regression: a stale-but-historic root passes rootHistory yet
-        // merkleRoot() has moved past it.
+        // A stale-but-historic root passes rootHistory yet merkleRoot() moved on.
         let mut imt = Imt::new().expect("imt");
         imt.insert_leaves(0, &[[1u8; 32]]).expect("seed");
         let stale_local = imt.root();
@@ -274,7 +267,7 @@ mod tests {
         );
     }
 
-    // Regression: all three eth_calls must thread the same anchor.
+    // All three eth_calls must thread the same anchor.
     #[tokio::test]
     async fn verifier_threads_block_anchor_to_all_three_calls() {
         use std::sync::Mutex;
@@ -357,7 +350,6 @@ mod tests {
             merkle_root_value: [0xff; 32],
             history: vec![(0, local_root)], // hit on tree 0 (irrelevant)
         };
-        // We claim local IMT belongs to tree 5 (future).
         let outcome = verify_root_against_chain(&source, 5, &imt)
             .await
             .expect("verify");

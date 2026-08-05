@@ -16,8 +16,8 @@ use crate::global_prometheus_handle;
 
 pub use crate::auth::X_RAVEN_CLIENT_ID;
 
-/// Application state shared across handlers. Cheap to clone (Arc inside).
-/// Manual `Clone` impl avoids the derive's incorrect `S: Clone` bound.
+/// Handler-shared state; cheap to clone. The manual `Clone` avoids the derive's
+/// spurious `S: Clone` bound.
 pub struct AppState<S: PirScheme> {
     /// Engine registry of PIR instances.
     pub engine: Arc<Engine<S>>,
@@ -44,18 +44,15 @@ pub struct AppState<S: PirScheme> {
     pub(crate) sessions: Arc<SessionMap>,
     pub(crate) semaphore: Arc<Semaphore>,
     pub(crate) metrics_handle: Arc<metrics_exporter_prometheus::PrometheusHandle>,
-    /// Per-instance [`ConsumerMetrics`] for instance-labelled `/metrics` gauges.
-    /// Empty maps fall back to the single-cell `consumer_metrics`.
+    /// Instance-labelled `/metrics` gauges; empty falls back to `consumer_metrics`.
     pub(crate) instance_metrics: Arc<HashMap<InstanceId, Arc<parking_lot::Mutex<ConsumerMetrics>>>>,
     /// Process start instant, for `raven_railgun_uptime_seconds`.
     pub(crate) process_started_at: Instant,
-    /// ETag cache for `GET /v1/instance/:id/params`; an epoch bump invalidates
-    /// per instance without growing the map.
+    /// ETag cache keyed so an epoch bump invalidates without growing the map.
     pub(crate) params_etag_cache: Arc<ParamsEtagCache>,
 }
 
-/// ETag cache for `/v1/instance/:id/params`: `InstanceId -> (Epoch, sha256)`,
-/// one entry per instance.
+/// `InstanceId -> (Epoch, sha256)` for `/v1/instance/:id/params`.
 pub(crate) type ParamsEtagCache =
     parking_lot::RwLock<HashMap<InstanceId, (raven_railgun_core::Epoch, [u8; 32])>>;
 
@@ -96,10 +93,7 @@ impl<S: PirScheme> std::fmt::Debug for AppState<S> {
 }
 
 impl<S: PirScheme> AppState<S> {
-    /// Build an [`AppState`]. Installs the global Prometheus recorder (idempotent).
-    ///
-    /// # Errors
-    /// Returns `Err` if config validation fails or the Prometheus recorder install fails.
+    /// Build an [`AppState`], installing the global Prometheus recorder (idempotent).
     pub fn new(engine: Engine<S>, config: HttpConfig) -> Result<Self, String> {
         config.validate()?;
         let read_token = Arc::new(parking_lot::RwLock::new(config.read_token.clone()));
@@ -166,8 +160,7 @@ impl<S: PirScheme> AppState<S> {
         self
     }
 
-    /// Register per-instance [`ConsumerMetrics`] so `/metrics` emits
-    /// `instance="<id>"`-labelled gauges; empty falls back to the single cell.
+    /// `/metrics` emits `instance="<id>"` gauges; empty falls back to the single cell.
     #[must_use]
     pub fn with_instance_metrics(
         mut self,
@@ -187,19 +180,15 @@ impl<S: PirScheme> AppState<S> {
         self
     }
 
-    /// Hot-rotate the read bearer token in-process without dropping in-flight queries.
-    /// In-flight requests that already cleared auth continue on their prior snapshot.
+    /// Hot-rotate the read bearer token; requests that already cleared auth continue
+    /// on their prior snapshot.
     pub fn set_read_token(&self, new_token: &str) {
         let mut guard = self.read_token.write();
         new_token.clone_into(&mut guard);
     }
 
-    /// Spawn a periodic sweeper dropping past-TTL session entries.
-    ///
-    /// Without it, expired entries purge only lazily on `get`, so a
-    /// once-churned token lingers until restart. `interval` is clamped to a 1 s
-    /// floor so the sweeper never spins; each removal bumps
-    /// `raven_railgun_session_evictions_total{reason="ttl"}`.
+    /// Sweep past-TTL session entries, which otherwise purge only lazily on `get`
+    /// and leak a once-churned token until restart. `interval` has a 1 s floor.
     #[must_use]
     pub fn start_session_sweeper(
         &self,
@@ -226,11 +215,9 @@ impl<S: PirScheme> AppState<S> {
 }
 
 impl AppState<raven_railgun_engine::inspire::RavenInspireScheme> {
-    /// Spawn a periodic sweeper dropping past-TTL packing-key registrations from
-    /// every instance's [`BoundedSessionStore`](raven_railgun_engine::session_pool::BoundedSessionStore).
-    ///
-    /// `resolve` already refuses an expired handle, so this only keeps the
-    /// occupancy gauges honest on an instance that has stopped registering.
+    /// Sweep past-TTL packing-key registrations from every instance's
+    /// [`BoundedSessionStore`](raven_railgun_engine::session_pool::BoundedSessionStore).
+    /// `resolve` already refuses expired handles; this only keeps gauges honest.
     #[must_use]
     pub fn start_packing_key_sweeper(
         &self,
@@ -252,8 +239,7 @@ impl AppState<raven_railgun_engine::inspire::RavenInspireScheme> {
     }
 }
 
-/// Register HELP + TYPE for every Prometheus metric the HTTP layer emits, so
-/// descriptions land before the first scrape. [`OnceLock`]-guarded; idempotent.
+/// Register HELP + TYPE before the first scrape. [`OnceLock`]-guarded.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn describe_prometheus_metrics() {
     static DESCRIBED: OnceLock<()> = OnceLock::new();
@@ -392,8 +378,7 @@ pub(crate) fn describe_prometheus_metrics() {
         "Lifetime count of reorg-window persistence failures"
     );
 
-    // Seed the counter at boot so an unfired series scrapes as zero, not
-    // "no data" (dashboards alert on its rate).
+    // An unfired series must scrape as zero, not "no data"; dashboards alert on rate.
     metrics::counter!(
         "raven_railgun_session_evictions_total",
         "reason" => "ttl",

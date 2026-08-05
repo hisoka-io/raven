@@ -22,10 +22,9 @@ use serde::{de::DeserializeOwned, Serialize};
 /// Contract every PIR scheme must satisfy.
 ///
 /// ```
-/// use raven_server::{InstanceRole, PirInstance, PirScheme};
 /// use raven_core::server_error::Result;
 /// use raven_core::{InstanceId, ServerError};
-///
+/// use raven_server::{InstanceRole, PirInstance, PirScheme};
 /// struct Echo;
 /// impl PirScheme for Echo {
 ///     type ServerState = Vec<u8>;
@@ -35,39 +34,37 @@ use serde::{de::DeserializeOwned, Serialize};
 ///         state.get(*q).copied().ok_or_else(|| ServerError::InvalidQuery(format!("index {q} OOB")))
 ///     }
 /// }
-///
-/// let inst: PirInstance<Echo> =
-///     PirInstance::new(InstanceId::new("demo"), InstanceRole::Static, vec![10, 20, 30]);
-/// let (_epoch, value) = inst.query(&1).expect("query");
-/// assert_eq!(value, 20);
+/// let inst = PirInstance::<Echo>::new(
+///     InstanceId::new("demo"), InstanceRole::Static, vec![10, 20, 30]);
+/// assert_eq!(inst.query(&1).expect("query").1, 20);
 /// ```
 pub trait PirScheme: Send + Sync + 'static {
-    /// Server-side preprocessed state (CRS, encoded DB, caches, etc.).
+    /// Preprocessed server state - CRS, encoded DB, caches.
     type ServerState: Send + Sync + 'static;
 
-    /// Wire query type. Must round-trip through bincode.
+    /// Must round-trip through bincode.
     type Query: Serialize + DeserializeOwned + Send + Sync;
 
-    /// Wire response type. Must round-trip through bincode.
+    /// Must round-trip through bincode.
     type Response: Serialize + DeserializeOwned + Send + Sync;
 
-    /// Server compute. Pure function of state and query.
+    /// Must be a pure function of `state` and `query`.
     fn respond(state: &Self::ServerState, query: &Self::Query) -> Result<Self::Response>;
 }
 
-/// Role of an engine instance - informs the orchestrator's re-preprocess schedule.
+/// Informs the orchestrator's re-preprocess schedule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstanceRole {
-    /// Filled, immutable.
+    /// Filled and immutable.
     Static,
-    /// Currently filling. Re-preprocess on a schedule.
+    /// Still filling; re-preprocessed on a schedule.
     Live,
-    /// Sidecar mode for incremental schemes.
+    /// Sidecar for incremental schemes.
     Sidecar,
 }
 
 impl InstanceRole {
-    /// Stable lowercase label for HTTP serialization.
+    /// Stable wire label.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
@@ -78,22 +75,20 @@ impl InstanceRole {
     }
 }
 
-/// Operator-driven maintenance state of an engine instance.
-///
-/// Route-affecting: routing layers MUST skip instances whose state is not
-/// `Active`. Encoded `AtomicU8` (0=Active,1=Draining,2=Drained) for wait-free reads.
+/// Operator-driven maintenance state. Routing layers MUST refuse new queries
+/// for anything but `Active`. Stored as `AtomicU8` for wait-free reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrainState {
-    /// Routing layers MUST consider this instance for new queries.
+    /// Serving.
     Active,
-    /// Operator-initiated maintenance. Routing layers MUST refuse new queries.
+    /// Operator-initiated maintenance; in-flight queries still running.
     Draining,
-    /// In-flight count has reached zero. Routing layers MUST refuse queries.
+    /// Drain complete: in-flight count reached zero.
     Drained,
 }
 
 impl DrainState {
-    /// Stable lowercase label for HTTP serialization.
+    /// Stable wire label.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
@@ -103,7 +98,7 @@ impl DrainState {
         }
     }
 
-    /// Returns `true` if this state accepts new queries.
+    /// Whether new queries are accepted.
     #[must_use]
     pub fn is_active(self) -> bool {
         matches!(self, Self::Active)
@@ -126,11 +121,10 @@ impl DrainState {
     }
 }
 
-/// One PIR instance holding a scheme + DB + snapshot pointer.
-///
-/// `(epoch, state)` are packed into a single [`Snapshot`] cell and loaded atomically.
+/// One PIR instance. `(epoch, state)` share a single [`Snapshot`] cell so
+/// readers never observe a half-applied swap.
 pub struct PirInstance<S: PirScheme> {
-    /// Operator-assigned identifier. Immutable.
+    /// Immutable after construction.
     pub id: InstanceId,
     role: parking_lot::RwLock<InstanceRole>,
     drain_state: AtomicU8,
@@ -138,11 +132,11 @@ pub struct PirInstance<S: PirScheme> {
     snapshot: ArcSwap<Snapshot<S>>,
 }
 
-/// Atomic `(epoch, state)` pair. Both fields move together on `swap_state`.
+/// Both fields move together on every `swap_state`.
 pub struct Snapshot<S: PirScheme> {
-    /// Epoch counter. Bumps on every `swap_state`.
+    /// Bumped on each swap.
     pub epoch: Epoch,
-    /// Server state.
+    /// State this epoch describes.
     pub state: Arc<S::ServerState>,
 }
 
@@ -165,7 +159,7 @@ impl<S: PirScheme> std::fmt::Debug for PirInstance<S> {
 }
 
 impl<S: PirScheme> PirInstance<S> {
-    /// Construct a fresh instance at epoch 0.
+    /// Starts at [`Epoch::ZERO`] and [`DrainState::Active`].
     pub fn new(id: InstanceId, role: InstanceRole, state: S::ServerState) -> Self {
         Self {
             id,
@@ -179,29 +173,29 @@ impl<S: PirScheme> PirInstance<S> {
         }
     }
 
-    /// Current epoch.
+    /// Epoch of the currently-published snapshot.
     pub fn current_epoch(&self) -> Epoch {
         self.snapshot.load().epoch
     }
 
-    /// Current instance role.
+    /// Current role.
     #[must_use]
     pub fn role(&self) -> InstanceRole {
         *self.role.read()
     }
 
-    /// Atomically update the instance role. Does NOT affect query routing.
+    /// Does not affect query routing.
     pub fn set_role(&self, new_role: InstanceRole) {
         *self.role.write() = new_role;
     }
 
-    /// Current operator-driven [`DrainState`].
+    /// Current drain state.
     #[must_use]
     pub fn drain_state(&self) -> DrainState {
         DrainState::from_u8(self.drain_state.load(Ordering::Acquire))
     }
 
-    /// Atomically transition the [`DrainState`].
+    /// Transition the drain state, logging any change.
     pub fn set_drain_state(&self, new: DrainState) {
         let prev = self.drain_state.swap(new.as_u8(), Ordering::AcqRel);
         let prev = DrainState::from_u8(prev);
@@ -216,13 +210,13 @@ impl<S: PirScheme> PirInstance<S> {
         }
     }
 
-    /// Current in-flight query count.
+    /// Queries currently executing under a guard.
     #[must_use]
     pub fn in_flight_count(&self) -> u64 {
         self.in_flight.load(Ordering::Acquire)
     }
 
-    /// Acquire an [`InFlightGuard`]. Returns `None` when not [`DrainState::Active`].
+    /// `None` unless [`DrainState::Active`].
     #[must_use]
     pub fn acquire_in_flight_guard(self: &Arc<Self>) -> Option<InFlightGuard<S>> {
         if self.drain_state() != DrainState::Active {
@@ -234,17 +228,17 @@ impl<S: PirScheme> PirInstance<S> {
         })
     }
 
-    /// Current server state.
+    /// State of the currently-published snapshot.
     pub fn current_state(&self) -> Arc<S::ServerState> {
         Arc::clone(&self.snapshot.load().state)
     }
 
-    /// Load the current `(epoch, state)` pair atomically.
+    /// The published `(epoch, state)` pair, loaded atomically.
     pub fn current_snapshot(&self) -> Arc<Snapshot<S>> {
         self.snapshot.load_full()
     }
 
-    /// Run a PIR query. Returns `(epoch, response)`.
+    /// Untracked query; refuses unless active.
     pub fn query(&self, q: &S::Query) -> Result<(Epoch, S::Response)> {
         if !self.drain_state().is_active() {
             return Err(ServerError::NoActiveInstance {
@@ -257,7 +251,7 @@ impl<S: PirScheme> PirInstance<S> {
         Ok((epoch, response))
     }
 
-    /// Like [`query`](Self::query) but increments the in-flight counter via [`InFlightGuard`].
+    /// As [`query`](Self::query), but counted in `in_flight`.
     pub fn query_active_tracked(self: &Arc<Self>, q: &S::Query) -> Result<(Epoch, S::Response)> {
         let _guard =
             self.acquire_in_flight_guard()
@@ -270,13 +264,8 @@ impl<S: PirScheme> PirInstance<S> {
         Ok((epoch, response))
     }
 
-    /// Run a PIR query against a PRE-CAPTURED snapshot rather than the
-    /// current `ArcSwap` cell. Returns `(snap.epoch, response)`.
-    ///
-    /// Lets a multi-row batch pin one `(epoch, state)` so a concurrent
-    /// `swap_state` cannot straddle the batch and mix rows from two states.
-    /// Drain-aware like [`query_active_tracked`](Self::query_active_tracked): refuses with
-    /// [`ServerError::NoActiveInstance`] if not active at guard-acquire.
+    /// Serves from a pre-captured snapshot so a multi-row batch cannot
+    /// straddle a concurrent `swap_state` and mix rows from two states.
     pub fn query_active_tracked_with_snapshot(
         self: &Arc<Self>,
         snap: &Arc<Snapshot<S>>,
@@ -291,7 +280,7 @@ impl<S: PirScheme> PirInstance<S> {
         Ok((snap.epoch, response))
     }
 
-    /// Swap in a new server state and bump the epoch.
+    /// Publish a new state at `new_epoch`.
     pub fn swap_state(&self, new_state: S::ServerState, new_epoch: Epoch) {
         self.snapshot.store(Arc::new(Snapshot {
             epoch: new_epoch,
@@ -300,7 +289,7 @@ impl<S: PirScheme> PirInstance<S> {
     }
 }
 
-/// RAII guard that decrements the per-instance in-flight counter on drop.
+/// Decrements the instance's in-flight counter on drop.
 pub struct InFlightGuard<S: PirScheme> {
     instance: Arc<PirInstance<S>>,
 }
@@ -319,7 +308,7 @@ impl<S: PirScheme> Drop for InFlightGuard<S> {
     }
 }
 
-/// Registry of [`PirInstance<S>`] keyed by [`InstanceId`].
+/// Instance registry, looked up by [`InstanceId`].
 pub struct Engine<S: PirScheme> {
     instances: arc_swap::ArcSwap<Vec<Arc<PirInstance<S>>>>,
 }
@@ -339,27 +328,25 @@ impl<S: PirScheme> Default for Engine<S> {
 }
 
 impl<S: PirScheme> Engine<S> {
-    /// Build an empty engine.
+    /// Empty registry.
     pub fn new() -> Self {
         Self {
             instances: arc_swap::ArcSwap::from_pointee(Vec::new()),
         }
     }
 
-    /// Register an owned instance. Refuses duplicates.
+    /// Refuses a duplicate id.
     pub fn add_instance(&mut self, instance: PirInstance<S>) -> Result<()> {
         self.register_instance(Arc::new(instance))
     }
 
-    /// Register a shared instance. Refuses duplicates.
+    /// Refuses a duplicate id.
     pub fn register_instance(&mut self, instance: Arc<PirInstance<S>>) -> Result<()> {
         self.add_live(instance)
     }
 
-    /// Live-register a shared instance through `&self`. Uses `ArcSwap::rcu` to avoid lost-updates.
-    ///
-    /// # Errors
-    /// Returns [`ServerError::Internal`] if an instance with the same id is already registered.
+    /// Registers through `&self`; `ArcSwap::rcu` is what keeps concurrent
+    /// registrations from losing each other's updates.
     // by-value Arc signals ownership transfer of the registered instance
     #[allow(clippy::needless_pass_by_value)]
     pub fn add_live(&self, instance: Arc<PirInstance<S>>) -> Result<()> {
@@ -381,7 +368,7 @@ impl<S: PirScheme> Engine<S> {
         Ok(())
     }
 
-    /// Look up an instance by id.
+    /// Any instance with this id, draining or not.
     pub fn instance(&self, id: &InstanceId) -> Option<Arc<PirInstance<S>>> {
         self.instances
             .load()
@@ -390,18 +377,18 @@ impl<S: PirScheme> Engine<S> {
             .map(Arc::clone)
     }
 
-    /// Look up an active (non-draining) instance by id.
+    /// Only if [`DrainState::Active`].
     pub fn active_instance(&self, id: &InstanceId) -> Option<Arc<PirInstance<S>>> {
         self.instance(id)
             .filter(|inst| inst.drain_state() == DrainState::Active)
     }
 
-    /// All registered instances.
+    /// Every registered instance.
     pub fn instances(&self) -> Vec<Arc<PirInstance<S>>> {
         self.instances.load().iter().map(Arc::clone).collect()
     }
 
-    /// All active (non-draining) instances.
+    /// Only those in [`DrainState::Active`].
     pub fn active_instances(&self) -> Vec<Arc<PirInstance<S>>> {
         self.instances
             .load()

@@ -1,10 +1,7 @@
-//! One-command LOCAL demo driver for the generic Ethereum-state private-balance PIR demo.
-//!
-//! Boots a flat `address -> 32-byte balance` corpus, registers a main (Live) + a Sidecar
-//! engine, runs the fold loop + a WRITE firehose while serving + verifying concurrent private
-//! READs through the consume-both fan-out, and prints C1/C2/C3/C4/C5 plus the measured
-//! serving QPS. Synthetic (deterministic, no chain) is the local gate; `--mode anvil`
-//! is the real-E2E Sepolia-promotion path.
+//! One-command driver: boots a flat `address -> 32-byte balance` corpus, registers a main plus
+//! a sidecar engine, runs the fold loop and a write firehose while serving and verifying
+//! concurrent private reads, and prints the gates plus measured serving QPS. `--mode anvil`
+//! drives a real node instead of the deterministic synthetic corpus.
 //!
 //! Run: `cargo run --manifest-path examples/eth-state/Cargo.toml --profile ci-test --bin demo`
 
@@ -23,7 +20,6 @@ fn pass(b: bool) -> &'static str {
 }
 
 fn main() -> ExitCode {
-    // Accept the documented `--mode anvil` (and a bare `anvil`) so the doc and parser agree.
     let args: Vec<String> = std::env::args().collect();
     let anvil = args.iter().any(|a| a == "anvil")
         || args.windows(2).any(|w| w[0] == "--mode" && w[1] == "anvil");
@@ -47,18 +43,13 @@ fn main() -> ExitCode {
         );
     }
 
-    // Unique per-process data dir: a fixed shared dir would let overlapping runs delete each
-    // other's WAL and trip the archive-rename (ENOENT). tempfile is dev-only, so PID-suffix.
+    // PID-suffixed: a shared dir lets overlapping runs delete each other's WAL.
     let dir = std::env::temp_dir().join(format!("raven-eth-state-demo-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create demo data dir");
 
     println!("Raven eth-state demo: flat address -> 32B big-endian balance, main + sidecar fold.");
-    // Serving goes through the cached InsPIRe respond path (the default-on cached-respond
-    // feature): the cached_respond_kat latency bench measures it at this 32B / gamma=16 cell.
-    // The stress_c1_c2_c5 gate is the heavier sustain proof.
-    // head_ahead = 1: the chain runs one block beyond raven's last-applied marker, so the C2/C5
-    // gates assert against a real non-zero lag (1), bounded under N = 2.
+    // head_ahead = 1 so the freshness gates assert against a real non-zero lag, bounded under 2.
     let mut demo = Demo::new(3000, 1_000_000, dir.clone(), 0x0000_DE70).expect("build demo");
     let res = demo
         .run_stress(8, 4, 1, 2, 1, 0x0000_DE70)
@@ -66,10 +57,10 @@ fn main() -> ExitCode {
 
     let c1 = res.c1_failures == 0;
     let c2 = res.max_lag <= 2;
-    // sidecar_hits proves only that the content-selection path was reachable; the load-bearing
-    // both-legs-extracted invariant is asserted by the `both_legs_extracted` test (count == 2).
+    // Reachability of the content-selection path only; both-legs-extracted is asserted by the
+    // `both_legs_extracted` test.
     let c3 = res.sidecar_hits > 0;
-    let c4 = res.fold_count > 0 && c1; // folds ran + correctness held across them
+    let c4 = res.fold_count > 0 && c1;
     let c5 = res.qps_per_core > 0.0 && res.max_lag <= 2;
 
     println!(

@@ -50,8 +50,7 @@ fn migrate_encoder_and_bootstrap_lock_serialize_one_winner_per_round() {
         });
 
         let bootstrap_h = thread::spawn(move || {
-            // stand-in for serve-production bootstrap; hold long enough to race
-            // the fail-fast migration against the held lock across rounds
+            // Held long enough to race the fail-fast migration across rounds.
             match StoreLayout::open_with_lock(&path_for_bootstrap) {
                 Ok((_layout, lock)) => {
                     thread::sleep(Duration::from_millis(20));
@@ -67,7 +66,7 @@ fn migrate_encoder_and_bootstrap_lock_serialize_one_winner_per_round() {
         migrate_h.join().expect("migrate joined");
         bootstrap_h.join().expect("bootstrap joined");
 
-        // lock must be releasable post-round (proves no leak)
+        // Releasable post-round, proving no leak.
         let (_layout, _lock) = StoreLayout::open_with_lock(&path)
             .unwrap_or_else(|e| panic!("post-round {round} reacquire failed: {e:?}"));
     }
@@ -118,8 +117,7 @@ fn fan_out_migrate_and_bootstrap_against_same_data_dir_yield_no_corruption() {
 
     let (layout, _lock) = StoreLayout::open_with_lock(&path)
         .expect("post-fan-out reacquire must succeed; lock leak otherwise");
-    // no worker completes a full migration; any manifest present must still
-    // be well-formed bincode (atomic-rename contract)
+    // Atomic-rename contract: any manifest present is well-formed bincode.
     if let Some(m) = Manifest::load(&layout).expect("manifest load may succeed or be None") {
         assert_eq!(
             m.schema_version,

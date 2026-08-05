@@ -1,6 +1,6 @@
 //! Replay a PIR query against a running operator server and print the recovered row.
 //!
-//! Transport is the caller's, so the example needs no HTTP dependency:
+//! Transport is the caller's, so this example carries no HTTP dependency:
 //!
 //! ```text
 //! curl -sH "Authorization: Bearer $TOKEN" $ENDPOINT/v1/instance/$ID/params -o params.bin
@@ -14,9 +14,8 @@
 //!   -- extract <work-dir> response.wire
 //! ```
 //!
-//! `mkquery` pins the RLWE key seed and the Gaussian noise seed, so the same
-//! `(params.bin, flat-index)` always yields the same `query.wire`. Two servers
-//! holding the same snapshot are therefore comparable byte for byte on the response.
+//! `mkquery` pins both seeds, so one `(params.bin, flat-index)` always yields the
+//! same `query.wire` and two servers on one snapshot are byte-comparable.
 
 #![allow(
     clippy::expect_used,

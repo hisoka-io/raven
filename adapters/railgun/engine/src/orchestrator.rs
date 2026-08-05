@@ -1,5 +1,5 @@
-//! Single- and multi-instance bootstrap: wires indexer + PPOI mirror
-//! into an orchestrated consumer-task graph.
+//! Single- and multi-instance bootstrap: wires indexer and mirror workers into
+//! a consumer-task graph.
 
 use crate::inspire::{InspireServerState, LogicalLeafStore, RavenInspireScheme};
 use crate::persistence::{
@@ -201,9 +201,8 @@ pub const fn default_k_for(encoder: super::pir_table::EncoderKind) -> usize {
     }
 }
 
-/// Bootstrap the Railgun engine (persistence + consumer task).
-///
-/// `fresh_state_factory` is called only on first bootstrap (no manifest).
+/// Bootstrap persistence plus the consumer task. `fresh_state_factory` runs
+/// only when no manifest exists.
 pub fn bootstrap_railgun_engine(
     config: OrchestratorConfig,
     params: raven_inspire::params::InspireParams,
@@ -212,7 +211,7 @@ pub fn bootstrap_railgun_engine(
     let layout = if config.use_flock {
         let (l, lock) = StoreLayout::open_with_lock(&config.data_dir)
             .map_err(|e| AdapterError::Internal(format!("StoreLayout::open_with_lock: {e}")))?;
-        // Hold the flock for the process lifetime.
+        // deliberate: the flock must outlive this scope or the data_dir unlocks
         let _ = Box::leak(Box::new(lock));
         l
     } else {
@@ -304,9 +303,8 @@ pub fn bootstrap_railgun_engine(
     })
 }
 
-/// On-disk-state authority for a deployment instance.
-///
-/// PPOI instances must use `UpstreamSignature`; PPOI list roots are not chain-anchored.
+/// State authority for an instance. List instances must use
+/// `UpstreamSignature`; their roots are not chain-anchored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerificationMode {
     /// Cross-check IMT root against `RailgunSmartWallet.rootHistory`.
@@ -477,15 +475,11 @@ impl std::fmt::Debug for PerInstanceHandles {
     }
 }
 
-/// Live-mutable chain-tree routing table (`tree_number` -> consumer sender).
-///
-/// Updated via `ArcSwap::rcu` by the auto-spawn driver; router picks up new routes
-/// lock-free.
+/// Chain-tree routing table, swapped via `ArcSwap::rcu` so the router picks up
+/// new routes lock-free.
 pub type ChainTreeRoutes = Arc<arc_swap::ArcSwap<Vec<(u32, mpsc::Sender<ConsumerEvent>)>>>;
 
-/// Live-mutable PPOI-list routing table (`list_key` -> consumer sender).
-///
-/// Updated via `ArcSwap::rcu` by the auto-spawn driver on `list_observed`.
+/// Per-list routing table, swapped via `ArcSwap::rcu` on `list_observed`.
 pub type PpoiListRoutes = Arc<arc_swap::ArcSwap<Vec<([u8; 32], mpsc::Sender<ConsumerEvent>)>>>;
 
 /// Operator-facing handle returned by [`bootstrap_railgun_engine_multi`].
@@ -514,12 +508,12 @@ impl std::fmt::Debug for MultiOrchestratorHandle {
     }
 }
 
-/// Bootstrap a multi-instance Railgun engine with a single shared router.
+/// Bootstrap several instances behind one shared router.
 ///
 /// # Errors
 ///
-/// Returns [`AdapterError::InvalidQuery`] if `configs` is empty or two configs share
-/// the same `data_source`.
+/// [`AdapterError::InvalidQuery`] if `configs` is empty or two share a
+/// `data_source`.
 #[allow(clippy::too_many_lines)]
 pub fn bootstrap_railgun_engine_multi<F>(
     configs: Vec<InstanceConfig>,
@@ -580,8 +574,7 @@ where
             s
         } else {
             let s = fresh_state_factory(&cfg)?;
-            // V6 envelope so the embedded store travels with the snapshot from
-            // the first manifest write; empty on first bootstrap.
+            // V6 so the store travels with the snapshot from the first manifest write.
             let empty_store = LogicalLeafStore::default();
             persistence.commit_v6(&s, &empty_store, 0)?;
             persistence.commit_notify().notify_waiters();
@@ -660,7 +653,7 @@ where
 
     let chain_tree_routes = Arc::new(arc_swap::ArcSwap::from_pointee(initial_chain_tree_routes));
     let ppoi_list_routes: PpoiListRoutes = Arc::new(arc_swap::ArcSwap::from_pointee(ppoi_routes));
-    // Lagged receivers re-sync on the next event - capacity 64 is sufficient.
+    // Lagged receivers re-sync on the next event, so a small capacity suffices.
     let (tree_observed_tx, _) = tokio::sync::broadcast::channel::<u32>(64);
     let (list_observed_tx, _) = tokio::sync::broadcast::channel::<[u8; 32]>(64);
 
@@ -687,8 +680,8 @@ where
     })
 }
 
-/// Fans indexer and mirror events to per-instance consumers by `data_source`.
-/// Returns when both inbound channels are closed.
+/// Fan indexer and mirror events to per-instance consumers by `data_source`.
+/// Returns once both inbound channels close.
 async fn multi_instance_router(
     mut indexer_rx: mpsc::Receiver<IndexerMessage>,
     mut mirror_rx: mpsc::Receiver<(WalEntryPayload, u64)>,
@@ -752,14 +745,14 @@ async fn forward_indexer_message(
             if let Some(t) = target_tree {
                 let _ = tree_observed.send(t);
                 let routes = chain_tree_routes.load();
-                // Fan out to ALL senders bound to `t`: distinct encoders can share one
-                // tree_number, so `.find()` would drop events past the first match.
+                // Fan out to every sender bound to `t`: encoders can share a tree
+                // number, so `.find()` would drop events past the first match.
                 let matched: Vec<mpsc::Sender<ConsumerEvent>> = routes
                     .iter()
                     .filter(|(tn, _)| *tn == t)
                     .map(|(_, s)| s.clone())
                     .collect();
-                // move into the final recipient; the shipped topology is one route per tree
+                // Last recipient takes ownership, so the common single-route case never clones.
                 if let Some((last, rest)) = matched.split_last() {
                     for tx in rest {
                         let _ = tx
@@ -813,17 +806,17 @@ async fn forward_mirror_payload(
         tracing::trace!("mirror payload without list_key; dropping");
         return;
     };
-    // Fired before routing so a fresh list_key surfaces before any instance route exists.
+    // Fires before routing so a fresh list key surfaces before its route exists.
     let _ = list_observed.send(lk);
     let routes = ppoi_list_routes.load();
-    // Fan out to ALL senders bound to `lk`: distinct encoders can share one
-    // list_key, so `.find()` would drop events past the first match.
+    // Fan out to every sender bound to `lk`: encoders can share a list key, so
+    // `.find()` would drop events past the first match.
     let matched: Vec<mpsc::Sender<ConsumerEvent>> = routes
         .iter()
         .filter(|(k, _)| *k == lk)
         .map(|(_, s)| s.clone())
         .collect();
-    // move into the final recipient; the shipped topology is one route per list_key
+    // Last recipient takes ownership, so the common single-route case never clones.
     let Some((last, rest)) = matched.split_last() else {
         tracing::trace!("no instance routes list_key; dropping mirror payload");
         return;

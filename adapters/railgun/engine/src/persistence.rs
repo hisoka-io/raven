@@ -1,6 +1,5 @@
-//! Persistence integration glue for [`PirInstance<RavenInspireScheme>`].
-//! Wraps `Manifest`, `Snapshot`, `Wal`, `StoreLayout` with a per-instance
-//! `SnapshotPolicy` and the bootstrap/commit/archive flow.
+//! Persistence glue for [`PirInstance<RavenInspireScheme>`]: manifest, snapshot,
+//! WAL and layout behind a per-instance policy and the commit/archive flow.
 
 use super::inspire::{snapshot_inspire_state, InspireServerState, RavenInspireScheme};
 use super::{InstanceRole, PirInstance};
@@ -119,14 +118,13 @@ pub struct OpenedInstance {
     pub recovered_logical_store: super::inspire::LogicalLeafStore,
 }
 
-/// Reject an encoder whose row width diverges from the recovered cell's.
-///
-/// `encoder_label` is stable across the two variants whose width is
-/// operator-supplied, so it cannot see a width swap.
+/// Reject an encoder whose row width diverges from the recovered cell's;
+/// `encoder_label` is stable across operator-supplied widths so it cannot
+/// catch a width swap on its own.
 ///
 /// # Errors
-/// Returns [`AdapterError::Internal`] when `encoder.record_size()` differs from
-/// the stored `entry_size_bytes`.
+/// [`AdapterError::Internal`] when `encoder.record_size()` differs from the
+/// stored `entry_size_bytes`.
 fn ensure_encoder_matches_stored_cell(
     stored: &raven_inspire::params::ShardConfig,
     stored_rows_per_shard: u32,
@@ -146,8 +144,8 @@ fn ensure_encoder_matches_stored_cell(
             label = encoder.label(),
         )));
     }
-    // Warn, not reject: refusing here would refuse an existing data_dir, and
-    // `pir_table::validate_rows_per_shard` already rejects the same divergence at boot.
+    // Warn, not reject: `pir_table::validate_rows_per_shard` already rejects this
+    // at boot, and refusing here would refuse an existing data_dir.
     let encoder_rows = encoder.entries_per_shard();
     if encoder_rows != stored_rows_per_shard {
         tracing::warn!(
@@ -163,10 +161,9 @@ fn ensure_encoder_matches_stored_cell(
 }
 
 impl InspirePersistence {
-    /// Open at `layout`. Recovers from an existing manifest or initializes fresh.
-    ///
-    /// Rejects if `encoder.label()` doesn't match the manifest's stored label, or
-    /// if `encoder.record_size()` doesn't match the recovered cell's row width.
+    /// Open at `layout`, recovering from an existing manifest or initializing
+    /// fresh. Rejects an encoder whose label or row width diverges from the
+    /// recovered cell.
     #[allow(clippy::too_many_lines)]
     pub fn open(
         layout: StoreLayout,
@@ -202,9 +199,8 @@ impl InspirePersistence {
                     manifest.encoder_label, encoder_label
                 )));
             }
-            // SnapshotId(0): manifest exists but no commit yet; rebuild store from WAL.
-            // V6 snapshots seed the replay base with their embedded store; V5
-            // return empty and rely on WAL replay.
+            // SnapshotId(0) means no commit yet. V6 seeds the replay base with its
+            // embedded store; V5 starts empty and relies wholly on WAL replay.
             let (recovered_state, recovered_seed_store, entries_per_shard) =
                 if manifest.current_snapshot_id == SnapshotId(0) {
                     (None, super::inspire::LogicalLeafStore::new(), u32::MAX)
@@ -236,8 +232,7 @@ impl InspirePersistence {
             let replay = wal
                 .replay()
                 .map_err(|e| AdapterError::Internal(format!("wal replay: {e}")))?;
-            // Tolerant-replay: `InvalidQuery` during replay is soft-skipped (log + count).
-            // `Internal`/`Serialization` errors still bubble.
+            // Tolerant replay: `InvalidQuery` soft-skips; Internal/Serialization bubble.
             let mut replay_skipped: u64 = 0;
             let replay_encoder = encoder.as_ref();
             for entry in &replay.entries {
@@ -293,8 +288,7 @@ impl InspirePersistence {
                 recovered_logical_store: logical_store,
             })
         } else {
-            // Fresh bootstrap: no manifest. Refuse if WAL is non-empty to avoid replaying
-            // ghost entries from a prior failed bootstrap.
+            // No manifest plus a non-empty WAL means ghost entries from a failed bootstrap.
             let current_wal_path = layout.wal_current_path();
             if current_wal_path.exists() {
                 let len = std::fs::metadata(&current_wal_path)
@@ -322,7 +316,7 @@ impl InspirePersistence {
                 encoder_label: encoder_label.to_owned(),
                 prev_encoder_label: None,
             };
-            // Persist manifest before returning so a commit() failure lands in recovery path.
+            // Persist the manifest first so a failed commit() still lands in recovery.
             manifest
                 .save(&layout)
                 .map_err(|e| AdapterError::Internal(format!("manifest save (fresh): {e}")))?;
@@ -346,10 +340,8 @@ impl InspirePersistence {
         }
     }
 
-    /// Snapshot state (V5 codec), archive WAL, and bump the manifest atomically.
-    ///
-    /// New code should call [`InspirePersistence::commit_v6`] so the embedded
-    /// [`super::inspire::LogicalLeafStore`] travels with the snapshot.
+    /// V5 commit: snapshot, archive WAL, bump manifest atomically. Prefer
+    /// [`InspirePersistence::commit_v6`], which also carries the leaf store.
     pub fn commit(
         &self,
         state: &InspireServerState,
@@ -359,8 +351,7 @@ impl InspirePersistence {
         self.commit_serialized_bundle(bundle, current_block_height)
     }
 
-    /// V6 commit: snapshot `(state, store)` to the V6 envelope, archive WAL,
-    /// and bump the manifest atomically.
+    /// V6 commit: snapshot `(state, store)`, archive WAL, bump manifest atomically.
     pub fn commit_v6(
         &self,
         state: &InspireServerState,
@@ -378,7 +369,7 @@ impl InspirePersistence {
     ) -> Result<SnapshotId> {
         let snap = Snapshot::build(bundle, SNAPSHOT_MAGIC);
 
-        // Save snapshot (slow) outside the manifest lock; CAS-check on re-lock.
+        // Slow snapshot save runs outside the manifest lock; CAS-checked on re-lock.
         let next_id = {
             let m = self.manifest.lock();
             m.current_snapshot_id.next()
@@ -398,8 +389,8 @@ impl InspirePersistence {
             )));
         }
 
-        // Manifest-save BEFORE archive: a crash in between is safe because the replay floor
-        // has already advanced, so surviving events in current.log are replayed.
+        // Manifest save precedes archive: the replay floor has already advanced, so a
+        // crash in between still replays the survivors in current.log.
         let prev_seq = m.current_snapshot_seq;
         let cur_seq = self.wal.next_seq().saturating_sub(1);
         let new_floor = self.wal.next_seq();
@@ -463,10 +454,8 @@ impl InspirePersistence {
         self.manifest.lock().current_snapshot_id
     }
 
-    /// Recovered chain-event block-height baseline (the restart resume floor).
-    ///
-    /// `manifest.current_marker`, advanced on every commit and recovered
-    /// by [`Self::open`]; restart seeds off it to avoid re-scanning applied events.
+    /// Restart resume floor, advanced on every commit, so restart does not
+    /// re-scan applied events.
     #[must_use]
     pub fn manifest_block_height(&self) -> u64 {
         self.manifest.lock().current_marker
@@ -493,7 +482,7 @@ impl InspirePersistence {
             .filter_map(std::result::Result::ok)
             .filter(|e| e.file_name().to_string_lossy().starts_with("seq-"))
             .collect();
-        // Newest-first; filenames are zero-padded so lexical == numeric order.
+        // Filenames are zero-padded, so lexical order equals numeric order.
         entries.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
         for old in entries.into_iter().skip(retain) {
             let _ = std::fs::remove_file(old.path());
@@ -525,7 +514,7 @@ impl InspirePersistence {
         entries.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
         for (id, path) in entries.into_iter().skip(retain) {
             if id == live_id.0 {
-                // Never delete the live snapshot, even if outside the retain window.
+                // The live snapshot is never deleted, retain window notwithstanding.
                 continue;
             }
             let _ = std::fs::remove_dir_all(&path);
@@ -534,9 +523,8 @@ impl InspirePersistence {
     }
 }
 
-/// Construct a [`PirInstance<RavenInspireScheme>`] tied to a persistence handle.
-///
-/// Recovers from disk if a manifest exists; otherwise calls `fresh_state_factory`.
+/// Construct a [`PirInstance<RavenInspireScheme>`] tied to a persistence handle,
+/// recovering from disk when a manifest exists.
 pub fn bootstrap_inspire_instance(
     layout: StoreLayout,
     scheme_tag: impl Into<String>,
@@ -552,8 +540,8 @@ pub fn bootstrap_inspire_instance(
     let state = if let Some(s) = opened.recovered_state {
         s
     } else {
-        // V6 first commit so the embedded store ships with the snapshot;
-        // notify so observers waiting on first commit don't deadlock.
+        // V6 first commit ships the store with the snapshot; notify so observers
+        // waiting on first commit do not deadlock.
         let s = fresh_state_factory()?;
         let empty_store = super::inspire::LogicalLeafStore::default();
         persistence.commit_v6(&s, &empty_store, 0)?;
@@ -588,15 +576,14 @@ pub enum ConsumerEvent {
 /// Consumer-task progress and lag metrics.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ConsumerMetrics {
-    /// Last block height of an applied chain/PPOI event. Monotonic; frozen while
-    /// no event lands, so it measures event flow, not indexer progress.
+    /// Height of the last applied event. Monotonic; measures event flow, not
+    /// indexer progress.
     pub last_applied_block: u64,
-    /// Highest block the indexer has scanned, event-bearing or not. The only
-    /// height lag may be measured against.
+    /// Highest block scanned, event-bearing or not; the only height lag may be
+    /// measured against.
     pub last_scanned_block: u64,
-    /// Block height of the last leaf-mutating event applied (AppendLeaf / PPOI
-    /// leaf). Never advanced by Nullified / Unshield / heartbeat, so it is the
-    /// only height safe to persist as the manifest resume floor.
+    /// Height of the last leaf-mutating event. Never advanced by non-mutating
+    /// events, so it is the only height safe to persist as the resume floor.
     pub last_applied_leaf_block: u64,
     /// Last chain head seen via heartbeat.
     pub last_known_chain_head: u64,
@@ -619,19 +606,18 @@ impl ConsumerMetrics {
     }
 
     /// Blocks since the last applied event. Grows on a quiet chain by design;
-    /// alert on it only together with a nonzero [`Self::indexer_lag_blocks`].
+    /// alert only alongside a nonzero [`Self::indexer_lag_blocks`].
     #[must_use]
     pub fn blocks_since_last_applied_event(&self) -> u64 {
         self.last_known_chain_head
             .saturating_sub(self.last_applied_block)
     }
 
-    /// Record an applied event height. Monotonic in both pointers; leaves the
-    /// resume floor (`last_applied_leaf_block`) untouched.
+    /// Record an applied event height. Monotonic; leaves the resume floor alone.
     pub fn record_applied_block(&mut self, height: u64) {
-        // The max is load-bearing, not cosmetic: the PPOI mirror emits every row at
-        // height 0 and shares this struct with the chain bridge in single-instance
-        // mode, so a plain assignment slams both pointers back to 0.
+        // `max` is load-bearing: in single-instance mode the PPOI mirror worker shares
+        // this struct with the chain bridge and emits every row at height 0, so plain
+        // assignment would reset the pointer.
         self.last_applied_block = self.last_applied_block.max(height);
         self.last_scanned_block = self.last_scanned_block.max(height);
     }
@@ -846,8 +832,7 @@ pub async fn run_consumer_task(
 
     ensure_layer2_metrics_described();
 
-    // Seed the leaf-block watermark from the recovered manifest so an idle
-    // instance does not reset its resume floor to 0 on a clean shutdown.
+    // Seed from the manifest so an idle instance does not reset its resume floor.
     {
         let mut m = metrics.lock();
         if m.last_applied_leaf_block == 0 {
@@ -914,8 +899,7 @@ pub async fn run_consumer_task(
                                     .await;
                             }
                         }
-                        // Per-leaf path handled commit + metrics; only aggregate
-                        // counters remain.
+                        // Per-leaf path already committed and recorded metrics.
                         let _ = (tree_number, leaves);
                         {
                             let mut m = metrics.lock();
@@ -927,14 +911,14 @@ pub async fn run_consumer_task(
                         continue;
                     }
                     raven_railgun_core::RailgunEvent::Nullified { .. } => {
-                        // No new leaves; record height only, no WAL payload.
+                        // No new leaves, so height only; never advances the resume floor.
                         let mut m = metrics.lock();
                         m.record_applied_block(height);
                         m.events_processed = m.events_processed.saturating_add(1);
                         continue;
                     }
                     raven_railgun_core::RailgunEvent::Unshield { .. } => {
-                        // Not a tree mutation; record height only.
+                        // Not a tree mutation, so height only.
                         let mut m = metrics.lock();
                         m.record_applied_block(height);
                         m.events_processed = m.events_processed.saturating_add(1);
@@ -965,8 +949,8 @@ pub async fn run_consumer_task(
             } => {
                 let mut m = metrics.lock();
                 m.last_known_chain_head = chain_head;
-                // Tracks the cursor verbatim, rewinds included: a reorg really
-                // does leave those blocks to re-scan.
+                // Tracks the cursor verbatim, rewinds included: a reorg does leave
+                // those blocks to re-scan.
                 m.last_scanned_block = scanned_through;
                 let lag = m.indexer_lag_blocks();
                 let scanned = m.last_scanned_block;
@@ -983,10 +967,9 @@ pub async fn run_consumer_task(
                 continue;
             }
             ConsumerEvent::Shutdown => {
-                // Final commit flushes dirty shards so cold-start needs no WAL replay.
-                // Height MUST be the last applied-leaf block, not chain head: the
-                // resume floor reads it, and committing the tip would skip a
-                // lagging leaf and wedge the tree on restart.
+                // Height MUST be the last applied-leaf block, not the chain head:
+                // the resume floor reads it, and the tip would skip a lagging leaf
+                // and wedge the tree on restart.
                 let final_height = {
                     let m = metrics.lock();
                     m.last_applied_leaf_block
@@ -1063,7 +1046,6 @@ fn record_consumer_error(
     m.consumer_errors = m.consumer_errors.saturating_add(1);
 }
 
-// validate-before-WAL-write: rejected events do not poison the WAL.
 #[allow(clippy::too_many_arguments)]
 fn apply_one_leaf(
     p: &raven_railgun_persistence::WalEntryPayload,
@@ -1119,7 +1101,6 @@ fn apply_reorg(
         let mut m = metrics.lock();
         m.reorgs_handled = m.reorgs_handled.saturating_add(1);
     }
-    // After a reorg always commit so dirty shards re-encode.
     drive_commit(
         instance,
         persistence,
@@ -1178,8 +1159,7 @@ fn drive_commit(
 
     if dirty.is_empty() {
         let snapshot_state = instance.current_state();
-        // Snapshot the store under-lock so it stays consistent with the state
-        // captured above; release before fsync.
+        // Snapshot the store under-lock so it matches the state captured above.
         let store_snapshot = {
             let s = logical_store.lock();
             s.clone()
@@ -1193,8 +1173,8 @@ fn drive_commit(
         return Ok(());
     }
 
-    // `Arc::make_mut` below copies the encoded buffer once per drive_commit - the donor state
-    // held by `current` is always a live second reference.
+    // `Arc::make_mut` copies once per drive_commit; `current` is always a live
+    // second reference.
     let current = instance.current_state();
     let entries_per_shard = u32::try_from(
         current
@@ -1226,10 +1206,8 @@ fn drive_commit(
                 shard_id: oor_id,
                 db_shard_count,
             }) => {
-                // Shard id past the EncodedDatabase end is unencodable: drop it
-                // from `dirty_shards` to break the per-cadence retry loop.
-                // Metric carries only `instance` (bounded cardinality); per-shard
-                // detail goes to the tracing line.
+                // Out-of-range shard ids are unencodable; dropping breaks the retry
+                // loop. Metric carries only `instance` to bound label cardinality.
                 let removed = logical_store.lock().drop_dirty_shard(oor_id);
                 if removed {
                     tracing::error!(
@@ -1264,8 +1242,7 @@ fn drive_commit(
     instance.swap_state(new_state, next_epoch);
 
     let snapshot_state = instance.current_state();
-    // Snapshot the store under-lock so it restores atomically with the state;
-    // dirty shards are already drained into the new EncodedDatabase above.
+    // Snapshot the store under-lock so it restores atomically with the state.
     let store_snapshot = {
         let s = logical_store.lock();
         s.clone()
@@ -1289,7 +1266,7 @@ mod tests {
     use raven_railgun_core::InstanceId;
 
     const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-test";
-    /// Shared by [`test_encoder`] and [`build_toy_state`]; a divergence is a
+    /// Shared by [`test_encoder`] and [`build_toy_state`]; divergence is a
     /// cell-shape mismatch the open/commit guards refuse.
     const TOY_ENTRY_SIZE: usize = 256;
     const TOY_ENTRIES_PER_SHARD: u32 = 2048;
@@ -1484,7 +1461,7 @@ mod tests {
         assert_eq!(recovered.variant, state.variant);
     }
 
-    /// Regression: fresh-bootstrap replay must include seq 0 inclusive.
+    /// Fresh-bootstrap replay must include seq 0 inclusive.
     #[test]
     fn fresh_bootstrap_seq0_event_survives_drop_and_reopen() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1499,7 +1476,7 @@ mod tests {
                 test_encoder(),
             )
             .expect("open 1");
-            // Commitment must be a valid BN254 Fr element (high byte < 0x30).
+            // Commitment must be a valid BN254 Fr element.
             let commitment = {
                 let mut b = [0u8; 32];
                 b[31] = 0x07;
@@ -1540,7 +1517,7 @@ mod tests {
         );
     }
 
-    /// Regression: invalid WAL entries soft-skip on replay; valid ones land.
+    /// Invalid WAL entries soft-skip on replay; valid ones land.
     #[test]
     fn poisoned_wal_is_tolerantly_replayed_with_soft_skip() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1671,9 +1648,8 @@ mod tests {
             "fresh open() must register TYPE metadata at module init; got render:\n{rendered}"
         );
     }
-    // The poisoned-WAL counter-increment assertion runs in its own
-    // integration-test binary so it gets a fresh process for the one-time
-    // Prometheus recorder install, free of cross-test rendering races.
+    // The counter-increment assertion lives in its own test binary: the Prometheus
+    // recorder installs once per process and cross-test rendering races otherwise.
 
     #[test]
     fn apply_event_increments_seq_and_triggers_when_cap_reached() {
@@ -1726,8 +1702,7 @@ mod tests {
             )
             .expect("open 1");
             opened.persistence.commit(&state, 100).expect("commit 1");
-            // Commitments encode `i` as big-endian u32 zero-padded to 32 bytes
-            // - trivially below BN254 Fr prime.
+            // Big-endian u32 zero-padded to 32 bytes, so below the BN254 Fr prime.
             for i in 0..1000u32 {
                 let mut commitment = [0u8; 32];
                 if let Some(dst) = commitment.get_mut(28..) {
@@ -1918,7 +1893,7 @@ mod tests {
         assert_eq!(opened.persistence.wal_next_seq(), 1);
     }
 
-    /// Regression: non-empty WAL with no manifest must be refused.
+    /// Non-empty WAL with no manifest must be refused.
     #[test]
     fn fresh_bootstrap_refuses_wal_ghost() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2075,9 +2050,8 @@ mod tests {
 
     #[test]
     fn unsatisfiable_shard_metric_increments_per_drop_with_bounded_cardinality() {
-        // Thread-local recorder avoids racing the process-global Prometheus
-        // handle sibling tests install. The metric MUST carry only the
-        // `instance` label; a `shard_id` label would leak one series per id.
+        // Thread-local recorder avoids racing the process-global Prometheus handle.
+        // The metric MUST carry only `instance`; `shard_id` would leak a series per id.
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
@@ -2140,9 +2114,7 @@ mod tests {
 
     #[test]
     fn unsatisfiable_shard_metric_cardinality_bounded_across_distinct_shard_ids() {
-        // 32 commits each dropping a distinct out-of-range shard id must yield
-        // EXACTLY ONE counter series keyed on `(instance,)`; a `shard_id` label
-        // would produce 32 series (cardinality leak).
+        // 32 dropped shard ids must yield exactly one series keyed on `(instance,)`.
         use metrics_util::debugging::DebuggingRecorder;
 
         let recorder = DebuggingRecorder::new();
@@ -2218,8 +2190,7 @@ mod tests {
             .dirty_shards_mut_for_test()
             .insert(unsat_id);
 
-        // First commit drops the shard; the remaining 99 walk an empty dirty
-        // set and must accumulate 0 consumer_errors.
+        // After the first commit the dirty set is empty, so no further errors.
         for height in 0..100u64 {
             super::drive_commit(
                 &instance,

@@ -1,10 +1,5 @@
-//! Pure comparison logic for `bench-compare`.
-//!
-//! Loads two bench-result JSON files and produces per-bench
-//! comparison records. Threshold drives the regression/improvement
-//! verdict; Welch t-statistic with Welch-Satterthwaite df + Student's
-//! t-distribution two-sided p-value via regularized incomplete beta +
-//! Lanczos lnGamma gives a supplementary p-value valid at small n.
+//! Per-bench comparison of two bench-result JSON files. The threshold drives the verdict; a
+//! Welch t with Welch-Satterthwaite df supplies a p-value that stays valid at small n.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -151,9 +146,8 @@ fn compare_one(
     }
 }
 
-/// Welch t with Welch-Satterthwaite df; two-sided p via Student's t.
-/// `None` when either sample has < 2 entries. With zero combined SE:
-/// `Some(1.0)` if means match, `Some(0.0)` otherwise.
+/// Welch t with Welch-Satterthwaite df. `None` below 2 samples; at zero combined SE, 1.0 for
+/// equal means and 0.0 otherwise.
 fn welch_p(b: &[f64], c: &[f64]) -> Option<f64> {
     let (mb, vb) = mean_var(b)?;
     let (mc, vc) = mean_var(c)?;
@@ -232,12 +226,10 @@ fn beta_cf(x: f64, a: f64, b: f64) -> f64 {
     for m in 1..=MAX_ITER {
         let mf = f64::from(m);
         let m2 = 2.0 * mf;
-        // Even step.
         let aa = mf * (b - mf) * x / ((qam + m2) * (a + m2));
         d = 1.0 / floor(1.0 + aa * d);
         c = floor(1.0 + aa / c);
         h *= d * c;
-        // Odd step.
         let aa = -(a + mf) * (qab + mf) * x / ((a + m2) * (qap + m2));
         d = 1.0 / floor(1.0 + aa * d);
         c = floor(1.0 + aa / c);
@@ -388,8 +380,7 @@ mod welch_tests {
         );
     }
 
-    // n=10 vs n=10, mean shift ~ 0.94 sample-sigma. df=18, |t| ~= 2.10
-    // -> two-sided p ~ 0.05.
+    // n=10 each, mean shift ~0.94 sample-sigma: df=18, |t| ~= 2.10, two-sided p ~ 0.05.
     #[test]
     fn t_cdf_n10_two_sigma_diff_returns_p_around_0_05() {
         let raw: Vec<f64> = (0..10).map(|i| (i as f64) - 4.5).collect();
@@ -400,8 +391,7 @@ mod welch_tests {
         assert!((p - 0.05).abs() < 0.01, "expected p ~= 0.05, got {p}");
     }
 
-    // Small-n t has fatter tails than the normal, so p_t > p_normal.
-    // Two-sided normal-CDF p for |t|=sqrt(1.5) ~= 0.2207.
+    // Small-n t has fatter tails, so p_t > the 0.2207 two-sided normal p at |t|=sqrt(1.5).
     #[test]
     fn t_cdf_diverges_from_normal_at_small_n() {
         let baseline = vec![-1.0, 0.0, 1.0];

@@ -302,8 +302,7 @@ fn main() {
         }
     };
 
-    // shard_size_bytes is recomputed by upstream `setup()`; this
-    // value is documentation only.
+    // Documentation only: upstream `setup()` recomputes shard_size_bytes.
     let _shard_cfg_documentation_only: ShardConfig = ShardConfig {
         shard_size_bytes: (params.ring_dim as u64) * (cli.record_bytes as u64),
         entry_size_bytes: cli.record_bytes,
@@ -524,8 +523,7 @@ fn main() {
         let extract_median_us = median_of(&mut extract_times_us);
         let total_median_us = median_of(&mut total_times_us);
 
-        // Throughput modes: K=1 reports per-core sustained
-        // (sum-of-per-trial); K>1 reports concurrent-wall.
+        // K=1 reports per-core sustained; K>1 reports concurrent-wall.
         let measured_secs_sum =
             total_times_us.iter().map(|&x| x as u128).sum::<u128>() as f64 / 1_000_000.0;
         let throughput_serial = if measured_secs_sum > 0.0 {

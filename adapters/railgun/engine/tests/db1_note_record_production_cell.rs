@@ -1,19 +1,10 @@
-//! DB1 note-record end-to-end production-cell test.
+//! End-to-end note-record test at `ring_dim = 2048`, `entries_per_shard = 2048`,
+//! `entry_size = 512` holding a 328-byte record.
 //!
-//! Cell shape under test: `ring_dim = 2048`, `p = 65537`, `entries_per_shard = 2048`,
-//! `entry_size = 512` carrying a 328-byte note record (32 commitment + 8 leaf index +
-//! 32 ephemeral public key + 32 wrapped content key + 7 x 32 ciphertext) zero-padded
-//! to the cell width.
-//!
-//! The 328-byte payload is NOT a legal InsPIRe cell width: `num_columns =
-//! ceil(entry_size / 2) = 164` does not divide `2 * ring_dim`, so the InspiRING
-//! generator `2n / gamma + 1` (`crates/inspire/src/inspiring/inspiring2.rs:115-119`)
-//! truncates and extraction returns garbage with no error. `pir_cell_width_law.rs`
-//! pins that law; this test runs the payload at the smallest legal width above it.
-//!
-//! The oracle is independent of the encoder under test: the commitment field is
-//! checked against `Imt::node(0, leaf)` and then folded to the root with siblings
-//! read from `Imt::node(level, sibling)`, never from the row that produced it.
+//! 328 is not a legal cell width (see `pir_cell_width_law.rs`), so the record
+//! runs at the smallest legal width above it. The oracle is independent of the
+//! encoder: fields are checked against `Imt::node`, never against the row that
+//! produced them.
 
 #![allow(
     clippy::expect_used,
@@ -36,8 +27,7 @@ use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder, LEAVES_PER_T
 use raven_railgun_persistence::WalEntryPayload;
 use raven_railgun_poseidon::merkle_node;
 
-/// Note-record field offsets. Restated on the oracle side rather than shared,
-/// so a one-sided layout change fails instead of round-tripping.
+/// Field offsets, restated rather than shared so a one-sided layout change fails.
 const COMMITMENT_OFF: usize = 0;
 const LEAF_INDEX_OFF: usize = 32;
 const EPH_PUB_OFF: usize = 40;
@@ -69,9 +59,8 @@ fn commitment_for(leaf_index: u32) -> [u8; 32] {
     )
 }
 
-/// Deterministic, position-sensitive fixture material for the non-commitment
-/// fields. Distinct per `(leaf_index, field, byte)` so a row-aliasing or
-/// byte-shift defect cannot produce a passing comparison.
+/// Fixture material distinct per `(leaf_index, field, byte)`, so row aliasing or
+/// a byte shift cannot produce a passing comparison.
 fn fixture_word(leaf_index: u32, field_tag: u8, word: usize) -> [u8; 32] {
     let mut out = [0u8; 32];
     for (j, slot) in out.iter_mut().enumerate() {
@@ -97,7 +86,7 @@ fn ciphertext_word_for(leaf_index: u32, word: usize) -> [u8; 32] {
     fixture_word(leaf_index, 3, word)
 }
 
-/// Build one DB1 row: the 328-byte note record zero-padded to the cell width.
+/// Build one row: the note record zero-padded to the cell width.
 fn note_record_row(leaf_index: u32, commitment: [u8; 32]) -> Vec<u8> {
     let mut row = vec![0u8; CELL_RECORD_BYTES];
     let write = |row: &mut Vec<u8>, at: usize, src: &[u8]| {
@@ -124,7 +113,7 @@ fn note_record_row(leaf_index: u32, commitment: [u8; 32]) -> Vec<u8> {
     row
 }
 
-/// Materialize the raw bytes of one DB1 shard from the logical store.
+/// Materialize the raw bytes of one shard from the logical store.
 fn materialize_db1_shard(store: &LogicalLeafStore, shard_id: u32) -> Vec<u8> {
     let eps = ENTRIES_PER_SHARD as usize;
     let mut buf = vec![0u8; eps * CELL_RECORD_BYTES];
@@ -156,7 +145,7 @@ fn build_live_state_and_session() -> (
         setup_state(&params, &db, CELL_RECORD_BYTES, InspireVariant::TwoPacking)
             .expect("setup_state");
 
-    // Drives the IMT and the dirty-shard set only; DB1 rows are materialized locally.
+    // Drives the IMT and dirty-shard set only; rows are materialized locally.
     let encoder: Arc<dyn PirTableEncoder> = EncoderKind::PerLeafBc
         .build(CELL_RECORD_BYTES, ENTRIES_PER_SHARD)
         .expect("encoder build");
@@ -243,8 +232,7 @@ fn db1_note_record_query_recovers_every_field_and_folds_to_root() {
             .get(..CELL_RECORD_BYTES)
             .expect("row plaintext present");
 
-        // independent oracle: the leaf commitment read from Imt::node, not from
-        // the LogicalLeafStore leaf map that materialize_db1_shard consumed
+        // Independent oracle: Imt::node, not the leaf map the row was built from.
         let expected_commitment = imt.node(0, leaf_idx as usize);
         let recovered_commitment = row
             .get(COMMITMENT_OFF..COMMITMENT_OFF + 32)
@@ -290,7 +278,6 @@ fn db1_note_record_query_recovers_every_field_and_folds_to_root() {
             "leaf_idx={leaf_idx}: cell padding past the {NOTE_RECORD_BYTES}-byte record must be zero"
         );
 
-        // Poseidon root fold, siblings from the Imt::node oracle
         let mut path_idx = leaf_idx as usize;
         let mut current = expected_commitment;
         for level in 0..TREE_DEPTH {
@@ -313,8 +300,7 @@ fn db1_note_record_query_recovers_every_field_and_folds_to_root() {
         recovered_rows.push((leaf_idx, row.to_vec()));
     }
 
-    // A cell that always returns the same row would satisfy every per-row check
-    // above for leaf 0 only; distinctness rules that failure mode out.
+    // Distinctness rules out a cell that returns the same row for every index.
     for (i, (leaf_a, row_a)) in recovered_rows.iter().enumerate() {
         for (leaf_b, row_b) in recovered_rows.iter().skip(i + 1) {
             assert_ne!(

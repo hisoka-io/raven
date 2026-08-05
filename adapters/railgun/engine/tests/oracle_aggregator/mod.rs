@@ -1,13 +1,9 @@
-//! Three-oracle aggregator helper for the subsquid root-oracle byte-
-//! identity tests.
-//!
-//! Used by `tests/g5_d_subsquid_root_oracle.rs`.
+//! Multi-oracle root aggregator used by the root-oracle byte-identity tests.
 
 #![allow(dead_code, unreachable_pub)]
 
-/// Source labels for each oracle the aggregator can compare. Returned
-/// inside [`OracleDisagreement`] so test-failure messages name the
-/// specific source that drifted.
+/// Oracle source label, carried in [`OracleDisagreement`] so a failure names
+/// the source that drifted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OracleSource {
     /// On-chain `merkleRoot()` view.
@@ -18,8 +14,7 @@ pub enum OracleSource {
     Subsquid,
 }
 
-/// Failure variant returned when at least one oracle disagrees with
-/// the local IMT-derived root.
+/// Returned when an oracle disagrees with the local IMT-derived root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OracleDisagreement {
     /// Local IMT root from `Imt::root()` / `LogicalLeafStore::imt_root`.
@@ -28,7 +23,7 @@ pub struct OracleDisagreement {
     pub source: OracleSource,
     /// The disagreeing source's reported root.
     pub other_root: [u8; 32],
-    /// Optional context label (e.g. "tree=0 milestone=4") for forensics.
+    /// Optional context label for forensics.
     pub context: String,
 }
 

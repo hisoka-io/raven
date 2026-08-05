@@ -276,8 +276,7 @@ describe("client-PIR auth-path reconstruction (T2/T3)", () => {
     server.route(
       (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
       (_req, _body, res) => {
-        // 8 elements where the SDK expects 16.
-        const elemCount = 8;
+          const elemCount = 8;
         const elemBytes = 32;
         const total = 2 + 8 + elemCount * (8 + elemBytes);
         const out = new Uint8Array(total);
@@ -464,11 +463,9 @@ describe("client-side IMT cache hit / miss", () => {
     expect(batchHits).toBe(1);
     await sdk.getMerkleProof(0, 0);
     expect(batchHits).toBe(1);
-    // Epoch advance drops the cache layers; next call refetches.
     cache.noteFreshness("2", 1);
     await sdk.getMerkleProof(0, 0);
     expect(batchHits).toBe(2);
-    // Schema-version bump alone also clears.
     cache.noteFreshness("2", 2);
     await sdk.getMerkleProof(0, 0);
     expect(batchHits).toBe(3);

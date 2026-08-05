@@ -48,8 +48,8 @@ pub struct ConsumerStatus {
     pub last_known_chain_head: u64,
     /// `last_known_chain_head - last_scanned_block`, saturating at 0.
     pub indexer_lag_blocks: u64,
-    /// `last_known_chain_head - last_applied_block`, saturating at 0. Grows on
-    /// a quiet chain even when the indexer is caught up.
+    /// `last_known_chain_head - last_applied_block`, saturating; grows on a quiet
+    /// chain even when caught up.
     pub blocks_since_last_applied_event: u64,
     /// Total chain events applied since process start.
     pub events_processed: u64,
@@ -57,7 +57,7 @@ pub struct ConsumerStatus {
     pub commits_fired: u64,
     /// Total chain reorgs handled.
     pub reorgs_handled: u64,
-    /// Per-event errors the consumer continued past. Alert when rising while `events_processed` stalls.
+    /// Per-event errors the consumer continued past.
     pub consumer_errors: u64,
 }
 
@@ -67,8 +67,7 @@ pub(crate) async fn status_handler<S: PirScheme>(
     Json(build_status_response(&app))
 }
 
-/// Snapshot of operator-observable engine state, shared by the `/v1/status`
-/// JSON endpoint and the `/v1/events` SSE stream.
+/// Operator-observable engine state, shared by `/v1/status` and `/v1/events`.
 pub(crate) fn build_status_response<S: PirScheme>(app: &AppState<S>) -> StatusResponse {
     let fallback_k = u32::try_from(app.config.max_concurrent_queries.max(1)).unwrap_or(u32::MAX);
     let instances = app
@@ -121,9 +120,8 @@ pub(crate) async fn metrics_handler<S: raven_railgun_engine::PirScheme>(
     )
 }
 
-/// Emit per-scrape gauge values (the HELP/TYPE are registered once at
-/// `AppState::new`). When `instance_metrics` is empty the consumer fields fall
-/// back to the single cell, labelled with the first instance's id.
+/// Per-scrape gauge values; HELP/TYPE are registered once at `AppState::new`.
+/// An empty `instance_metrics` falls back to the single cell.
 fn refresh_dynamic_metrics<S: raven_railgun_engine::PirScheme>(app: &AppState<S>) {
     use std::time::Instant;
     let uptime_secs = Instant::now()
@@ -133,7 +131,6 @@ fn refresh_dynamic_metrics<S: raven_railgun_engine::PirScheme>(app: &AppState<S>
     let uptime_f = uptime_secs as f64;
     metrics::gauge!("raven_railgun_uptime_seconds").set(uptime_f);
 
-    // Process-global, so no per-instance label.
     #[allow(clippy::cast_precision_loss)]
     let sessions_active = app.sessions.len() as f64;
     metrics::gauge!("raven_railgun_sessions_active").set(sessions_active);
@@ -152,7 +149,6 @@ fn refresh_dynamic_metrics<S: raven_railgun_engine::PirScheme>(app: &AppState<S>
         }
     }
 
-    // Single-cell fallback: label it with the first instance's id.
     if app.instance_metrics.is_empty() {
         if let Some(cell) = app.consumer_metrics.as_ref().as_ref() {
             if let Some(first) = instances.first() {

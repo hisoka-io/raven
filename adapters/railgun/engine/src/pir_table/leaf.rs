@@ -1,4 +1,4 @@
-//! Chain-tree encoders: PerLeafCommitment, PerLeafPath, PerNode.
+//! Chain-tree encoders keyed on `tree_number`.
 
 use std::collections::BTreeSet;
 
@@ -11,8 +11,7 @@ use super::{
 use crate::imt::TREE_DEPTH;
 use crate::inspire::{materialize_shard_bytes, LogicalLeafStore};
 
-/// T1 BC-membership encoder: row = raw 32 B blinded commitment, padded
-/// with zeros up to `record_size`.
+/// Membership encoder: row is the 32 B commitment, zero-padded to `record_size`.
 #[derive(Debug, Clone)]
 pub struct PerLeafCommitmentEncoder {
     record_size: usize,
@@ -20,9 +19,8 @@ pub struct PerLeafCommitmentEncoder {
 }
 
 impl PerLeafCommitmentEncoder {
-    /// Validate cell shape + return an encoder. `record_size` must be
-    /// `>= 32` (BN254 commitment width); `entries_per_shard` must be
-    /// non-zero.
+    /// Build after validating the cell shape; requires `record_size >= 32` and
+    /// non-zero `entries_per_shard`.
     pub fn new(record_size: usize, entries_per_shard: u32) -> Result<Self> {
         if record_size < MIN_RECORD_SIZE {
             return Err(AdapterError::InvalidQuery(format!(
@@ -72,11 +70,9 @@ impl PirTableEncoder for PerLeafCommitmentEncoder {
 /// Alias for [`PerLeafCommitmentEncoder`].
 pub type PerLeafEncoder = PerLeafCommitmentEncoder;
 
-/// T2/T3 path encoder: row `idx` = 16 sibling hashes packed leaf-to-root
-/// (`PATH_RECORD_BYTES = 512` bytes), one row per leaf.
-///
-/// Row layout matches `bincode::serialize(&[[u8;32]; 16])` per the encoding
-/// spec: fixed-length byte array, no headers, no length prefix.
+/// Path encoder: one row per leaf holding its siblings packed leaf-to-root.
+/// Byte layout equals `bincode::serialize(&[[u8; 32]; TREE_DEPTH])` - no header,
+/// no length prefix.
 #[derive(Debug, Clone)]
 pub struct PerLeafPathEncoder {
     record_size: usize,
@@ -85,9 +81,8 @@ pub struct PerLeafPathEncoder {
 }
 
 impl PerLeafPathEncoder {
-    /// Build a path encoder pinned to `tree_number`. `record_size` must
-    /// be exactly 512 B (16 siblings x 32 B); `entries_per_shard` must
-    /// be non-zero.
+    /// Build a path encoder; requires `record_size == PATH_RECORD_BYTES` and
+    /// non-zero `entries_per_shard`.
     pub fn new(record_size: usize, entries_per_shard: u32, tree_number: u32) -> Result<Self> {
         if record_size != PATH_RECORD_BYTES {
             return Err(AdapterError::InvalidQuery(format!(
@@ -171,10 +166,9 @@ impl PirTableEncoder for PerLeafPathEncoder {
     }
 }
 
-/// Per-node encoder: each row is a single Merkle node (32 B), laid out in
-/// flat-global-index order: leaves (`[0, 2^TREE_DEPTH)`), then level-1, ..., root.
-///
-/// Inserting a leaf dirties at most TREE_DEPTH+1 rows (the leaf plus its ancestors).
+/// Per-node encoder: one Merkle node per row in flat-global-index order,
+/// leaves first then each level up to the root. A leaf insert dirties at most
+/// `TREE_DEPTH + 1` rows.
 #[derive(Debug, Clone)]
 pub struct PerNodeEncoder {
     entries_per_shard: u32,
@@ -195,8 +189,8 @@ impl PerNodeEncoder {
         })
     }
 
-    /// Flat global index for `(level, idx_at_level)` in a depth-D tree.
-    /// Level 0 occupies `[0, 2^D)`; subsequent levels follow in order.
+    /// Flat global index for `(level, idx_at_level)`; level 0 occupies
+    /// `[0, 2^TREE_DEPTH)` and higher levels follow in order.
     pub fn flat_index(level: u32, idx_at_level: u32) -> u32 {
         let depth = u32::try_from(TREE_DEPTH).unwrap_or(u32::MAX);
         let total = 1u32 << (depth + 1);
