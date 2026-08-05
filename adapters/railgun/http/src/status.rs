@@ -42,10 +42,15 @@ pub struct InstanceStatus {
 pub struct ConsumerStatus {
     /// Last block height applied by the consumer task.
     pub last_applied_block: u64,
+    /// Highest block height the indexer has scanned.
+    pub last_scanned_block: u64,
     /// Last block height reported as the chain tip.
     pub last_known_chain_head: u64,
-    /// `last_known_chain_head - last_applied_block`, saturating at 0.
+    /// `last_known_chain_head - last_scanned_block`, saturating at 0.
     pub indexer_lag_blocks: u64,
+    /// `last_known_chain_head - last_applied_block`, saturating at 0. Grows on
+    /// a quiet chain even when the indexer is caught up.
+    pub blocks_since_last_applied_event: u64,
     /// Total chain events applied since process start.
     pub events_processed: u64,
     /// Total snapshot commits driven.
@@ -87,8 +92,10 @@ pub(crate) fn build_status_response<S: PirScheme>(app: &AppState<S>) -> StatusRe
         let snap = *m.lock();
         ConsumerStatus {
             last_applied_block: snap.last_applied_block,
+            last_scanned_block: snap.last_scanned_block,
             last_known_chain_head: snap.last_known_chain_head,
             indexer_lag_blocks: snap.indexer_lag_blocks(),
+            blocks_since_last_applied_event: snap.blocks_since_last_applied_event(),
             events_processed: snap.events_processed,
             commits_fired: snap.commits_fired,
             reorgs_handled: snap.reorgs_handled,
@@ -210,6 +217,11 @@ fn emit_instance_consumer_gauges(
     )
     .set(to_f(snap.last_applied_block));
     metrics::gauge!(
+        "raven_railgun_consumer_last_scanned_block",
+        "instance" => label.clone()
+    )
+    .set(to_f(snap.last_scanned_block));
+    metrics::gauge!(
         "raven_railgun_consumer_last_known_chain_head",
         "instance" => label.clone()
     )
@@ -219,6 +231,11 @@ fn emit_instance_consumer_gauges(
         "instance" => label.clone()
     )
     .set(to_f(snap.indexer_lag_blocks()));
+    metrics::gauge!(
+        "raven_railgun_consumer_blocks_since_last_applied_event",
+        "instance" => label.clone()
+    )
+    .set(to_f(snap.blocks_since_last_applied_event()));
     metrics::gauge!(
         "raven_railgun_consumer_events_processed",
         "instance" => label.clone()
@@ -270,12 +287,16 @@ pub struct HealthReadyResponse {
 /// Indexer-consumer view in [`HealthReadyResponse`].
 #[derive(Serialize, Deserialize, Debug)]
 pub struct HealthConsumerView {
-    /// Saturating lag in blocks.
+    /// Saturating chain-tip-minus-scanned lag in blocks.
     pub indexer_lag_blocks: u64,
     /// Last applied block height.
     pub last_applied_block: u64,
+    /// Highest scanned block height.
+    pub last_scanned_block: u64,
     /// Last known chain tip.
     pub last_known_chain_head: u64,
+    /// Saturating chain-tip-minus-applied distance in blocks.
+    pub blocks_since_last_applied_event: u64,
 }
 
 /// RPC pool view in [`HealthReadyResponse`].
@@ -319,7 +340,9 @@ pub(crate) async fn health_ready_handler<S: PirScheme>(
         HealthConsumerView {
             indexer_lag_blocks: snap.indexer_lag_blocks(),
             last_applied_block: snap.last_applied_block,
+            last_scanned_block: snap.last_scanned_block,
             last_known_chain_head: snap.last_known_chain_head,
+            blocks_since_last_applied_event: snap.blocks_since_last_applied_event(),
         }
     });
     let chain_source_mode = app

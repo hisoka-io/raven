@@ -6,12 +6,12 @@
 use std::sync::Arc;
 
 use raven_inspire::params::{InspireParams, InspireVariant};
-use raven_inspire::ServerSessionStore;
 use raven_railgun_core::{Epoch, InstanceId};
 use raven_railgun_engine::inspire::{
     build_client_session, register_client_session, setup_state, InspireServerState,
     RavenInspireScheme,
 };
+use raven_railgun_engine::session_pool::BoundedSessionStore;
 use raven_railgun_engine::{inspire, InstanceRole, PirInstance};
 
 const TOY_ENTRIES: usize = 256;
@@ -63,7 +63,7 @@ fn admin_swap_state_clears_session_store() {
     );
 
     // capture the donor Arc pointer to assert post-swap it's a different Arc, not equal-by-content
-    let donor_session_store_ptr: *const ServerSessionStore = {
+    let donor_session_store_ptr: *const BoundedSessionStore = {
         let snap = instance.current_state();
         Arc::as_ptr(&snap.session_store)
     };
@@ -89,18 +89,18 @@ fn admin_swap_state_clears_session_store() {
     };
     assert_eq!(
         post_swap_len, 0,
-        "admin swap_state MUST install a fresh empty ServerSessionStore (documented contract); \
+        "admin swap_state MUST install a fresh empty BoundedSessionStore (documented contract); \
          got post-swap len={post_swap_len}"
     );
 
     // different-Arc guard: an "always carry" regression would type-check but leak donor sessions
-    let post_swap_session_store_ptr: *const ServerSessionStore = {
+    let post_swap_session_store_ptr: *const BoundedSessionStore = {
         let snap = instance.current_state();
         Arc::as_ptr(&snap.session_store)
     };
     assert!(
         !std::ptr::eq(donor_session_store_ptr, post_swap_session_store_ptr),
-        "admin swap_state MUST install a fresh ServerSessionStore Arc, not carry the donor's"
+        "admin swap_state MUST install a fresh BoundedSessionStore Arc, not carry the donor's"
     );
 
     assert!(
@@ -128,7 +128,7 @@ fn drive_commit_path_preserves_session_store() {
         pre_swap_len >= 1,
         "donor session_store must be non-empty before the drive_commit-shaped swap"
     );
-    let donor_session_store_ptr: *const ServerSessionStore = {
+    let donor_session_store_ptr: *const BoundedSessionStore = {
         let snap = instance.current_state();
         Arc::as_ptr(&snap.session_store)
     };
@@ -157,13 +157,13 @@ fn drive_commit_path_preserves_session_store() {
         "drive_commit-shaped swap MUST preserve the session_store contents (Arc::clone pattern); \
          pre={pre_swap_len} post={post_swap_len}"
     );
-    let post_swap_session_store_ptr: *const ServerSessionStore = {
+    let post_swap_session_store_ptr: *const BoundedSessionStore = {
         let snap = instance.current_state();
         Arc::as_ptr(&snap.session_store)
     };
     assert!(
         std::ptr::eq(donor_session_store_ptr, post_swap_session_store_ptr),
-        "drive_commit-shaped swap MUST carry the donor's ServerSessionStore Arc unchanged"
+        "drive_commit-shaped swap MUST carry the donor's BoundedSessionStore Arc unchanged"
     );
 
     assert!(

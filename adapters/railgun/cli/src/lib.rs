@@ -5,6 +5,7 @@
 
 pub mod auto_spawn;
 pub mod auto_spawn_driver;
+pub mod bearer_token;
 pub mod bootstrap_chainalysis;
 pub mod bootstrap_subsquid;
 pub mod migrate_encoder;

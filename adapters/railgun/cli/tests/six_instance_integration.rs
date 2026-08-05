@@ -117,6 +117,7 @@ fn rewrite_to_tempdir(src: &Path, tmp: &Path, bind: SocketAddr, token: &str) -> 
     out = out.replace("REPLACE_ME", token);
     let path = tmp.join("config.toml");
     std::fs::write(&path, out).expect("write rewritten config");
+    restrict_to_owner(&path);
     path
 }
 
@@ -918,4 +919,16 @@ fn example_toml_parses_to_six_instances_with_expected_encoders() {
             ),
         }
     }
+}
+
+/// The parser refuses a group- or world-readable config carrying an inline token.
+fn restrict_to_owner(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("fixture config must be owner-only");
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }

@@ -1,5 +1,5 @@
 //! Heartbeat session-eviction tests. The heartbeat resets the inner
-//! `ServerSessionStore` while carrying the heavy CRS / `EncodedDatabase`
+//! `BoundedSessionStore` while carrying the heavy CRS / `EncodedDatabase`
 //! / `ServerInspiringCache` by `Arc::clone`; the trailing tests guard
 //! against re-introducing a deep clone of `encoded_db`.
 
@@ -8,12 +8,13 @@
 use std::sync::Arc;
 
 use raven_inspire::params::{InspireParams, InspireVariant};
-use raven_inspire::{EncodedDatabase, ServerInspiringCache, ServerSessionStore};
+use raven_inspire::{EncodedDatabase, ServerInspiringCache};
 use raven_railgun_core::{Epoch, InstanceId};
 use raven_railgun_engine::inspire::{
     build_client_session, heartbeat_session_eviction, register_client_session, setup_state,
     InspireServerState, RavenInspireScheme,
 };
+use raven_railgun_engine::session_pool::BoundedSessionStore;
 use raven_railgun_engine::{InstanceRole, PirInstance};
 
 const TOY_ENTRIES: usize = 256;
@@ -74,7 +75,7 @@ fn heartbeat_swap_state_drops_inner_session_store() {
     };
     assert_eq!(
         post_len, 0,
-        "heartbeat MUST install a fresh empty ServerSessionStore; got post len={post_len}"
+        "heartbeat MUST install a fresh empty BoundedSessionStore; got post len={post_len}"
     );
 
     assert!(
@@ -128,20 +129,20 @@ fn heartbeat_swap_state_drops_session_store_arc_pointer_too() {
 
     register_one_session(&instance, &params);
 
-    let donor_store_ptr: *const ServerSessionStore = {
+    let donor_store_ptr: *const BoundedSessionStore = {
         let snap = instance.current_state();
         Arc::as_ptr(&snap.session_store)
     };
 
     heartbeat_session_eviction(&instance).expect("heartbeat");
 
-    let post_store_ptr: *const ServerSessionStore = {
+    let post_store_ptr: *const BoundedSessionStore = {
         let snap = instance.current_state();
         Arc::as_ptr(&snap.session_store)
     };
     assert!(
         !std::ptr::eq(donor_store_ptr, post_store_ptr),
-        "heartbeat MUST install a fresh ServerSessionStore Arc; the donor's \
+        "heartbeat MUST install a fresh BoundedSessionStore Arc; the donor's \
          Arc must not survive into the new state"
     );
 }
@@ -158,14 +159,14 @@ fn heartbeat_interval_disabled_when_zero() {
         initial_state,
     ));
 
-    let initial_store_ptr: *const ServerSessionStore = {
+    let initial_store_ptr: *const BoundedSessionStore = {
         let snap = instance.current_state();
         Arc::as_ptr(&snap.session_store)
     };
 
     register_one_session(&instance, &params);
 
-    let post_store_ptr: *const ServerSessionStore = {
+    let post_store_ptr: *const BoundedSessionStore = {
         let snap = instance.current_state();
         Arc::as_ptr(&snap.session_store)
     };

@@ -230,5 +230,18 @@ data_source = {{ kind = "mirror", list_key = "{list_key}", what = "status" }}
     );
     let path = dir.join("config.toml");
     std::fs::write(&path, body).expect("write config");
+    restrict_to_owner(&path);
     path
+}
+
+/// The parser refuses a group- or world-readable config carrying an inline token.
+fn restrict_to_owner(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("fixture config must be owner-only");
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }

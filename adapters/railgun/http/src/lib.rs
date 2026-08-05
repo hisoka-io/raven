@@ -2,7 +2,8 @@
 //!
 //! Versioned bincode wire format (see [`WIRE_SCHEMA_VERSION`]).
 //! No `CompressionLayer`: PIR ciphertext is incompressible.
-//! `trust_proxy_header` gates `SmartIpKeyExtractor` vs `PeerIpKeyExtractor`.
+//! `trust_proxy_header` + `trusted_proxy_cidrs` gate whether forwarding headers
+//! are read at all; an untrusted peer always keys to its socket address.
 
 #![cfg_attr(
     test,
@@ -22,20 +23,24 @@ pub mod auth;
 pub mod batch;
 pub mod config;
 pub mod events;
+pub mod fanout;
 pub mod poi_shim;
 pub mod state;
 pub mod status;
+pub mod trusted_proxy;
 pub mod versioned;
 
 pub use admin::{DrainAdminResponse, InstanceParams, SessionEstablishResponse};
 pub use auth::AuthScope;
 pub use batch::BatchError;
 pub use config::HttpConfig;
+pub use fanout::{FanoutError, FanoutRequest};
 pub use state::AppState;
 pub use status::{
     ConsumerStatus, HealthConsumerView, HealthReadyResponse, InstanceStatus, RpcEndpointHealthView,
     RpcPoolHealthView, StatusResponse,
 };
+pub use trusted_proxy::{CidrParseError, IpCidr, TrustedProxyIpKeyExtractor};
 pub use versioned::{
     read_batch_response_versioned, read_versioned, write_batch_response_versioned, write_versioned,
     VersionedDecodeError, WIRE_SCHEMA_PREFIX_LEN, WIRE_SCHEMA_VERSION, X_RAVEN_SCHEMA_VERSION,
@@ -67,6 +72,7 @@ use crate::admin::{
 use crate::auth::bearer_auth;
 use crate::batch::{batch_handler, query_handler};
 use crate::events::{cf_connecting_ip_to_xff, events_handler};
+use crate::fanout::fanout_handler;
 use crate::status::{health_live_handler, health_ready_handler, metrics_handler, status_handler};
 use crate::versioned::X_RAVEN_SCHEMA_VERSION_HEADER;
 
@@ -81,7 +87,7 @@ pub(crate) const X_RAVEN_FRESHNESS: HeaderName = HeaderName::from_static("x-rave
 /// `Err` only if `tower-governor` rejects the clamped `(rps, burst)` config
 /// (unreachable today; propagated to catch an upstream regression).
 pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
-    let trust_proxy = state.config.trust_proxy_header;
+    let trusted_proxies = resolve_trusted_proxies(&state.config)?;
     let rps = state.config.rate_limit_rps.max(1);
     let burst = state.config.rate_limit_burst.max(1);
     let max_body = state.config.max_body_bytes;
@@ -108,8 +114,8 @@ pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
         .layer(auth_layer.clone())
         .layer(DefaultBodyLimit::max(max_body));
 
-    let rate_limited = if trust_proxy {
-        rate_limited.layer(build_governor_layer_smart(rps, burst)?)
+    let rate_limited = if let Some(extractor) = trusted_proxies.clone() {
+        rate_limited.layer(build_governor_layer_trusted(rps, burst, extractor)?)
     } else {
         rate_limited.layer(build_governor_layer_peer(rps, burst))
     };
@@ -125,8 +131,10 @@ pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
 
     let base = rate_limited.merge(public);
 
-    let base = if trust_proxy {
-        base.layer(middleware::from_fn(cf_connecting_ip_to_xff))
+    let base = if let Some(extractor) = trusted_proxies {
+        base.layer(middleware::from_fn(move |req, next| {
+            cf_connecting_ip_to_xff(extractor.clone(), req, next)
+        }))
     } else {
         base
     };
@@ -165,7 +173,7 @@ pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
 /// # Errors
 /// Same contract as [`router`].
 pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, String> {
-    let trust_proxy = state.config.trust_proxy_header;
+    let trusted_proxies = resolve_trusted_proxies(&state.config)?;
     let rps = state.config.rate_limit_rps.max(1);
     let burst = state.config.rate_limit_burst.max(1);
     let max_body = state.config.max_body_bytes;
@@ -190,6 +198,7 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
             "/v1/instance/:id/batch",
             post(batch_handler::<RavenInspireScheme>),
         )
+        .route("/v1/instance/:id/fanout", post(fanout_handler))
         .route(
             "/v1/admin/instances/drain/:id",
             post(admin_drain_handler::<RavenInspireScheme>),
@@ -205,8 +214,8 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
         .layer(auth_layer.clone())
         .layer(DefaultBodyLimit::max(max_body));
 
-    let rate_limited = if trust_proxy {
-        rate_limited.layer(build_governor_layer_smart(rps, burst)?)
+    let rate_limited = if let Some(extractor) = trusted_proxies.clone() {
+        rate_limited.layer(build_governor_layer_trusted(rps, burst, extractor)?)
     } else {
         rate_limited.layer(build_governor_layer_peer(rps, burst))
     };
@@ -227,8 +236,10 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
     let base = rate_limited.merge(public);
 
     // Cloudflare Tunnel real-IP rewrite; mounted only when trust is declared.
-    let base = if trust_proxy {
-        base.layer(middleware::from_fn(cf_connecting_ip_to_xff))
+    let base = if let Some(extractor) = trusted_proxies {
+        base.layer(middleware::from_fn(move |req, next| {
+            cf_connecting_ip_to_xff(extractor.clone(), req, next)
+        }))
     } else {
         base
     };
@@ -263,10 +274,19 @@ type RavenGovernorLayerPeer = tower_governor::GovernorLayer<
     governor::middleware::NoOpMiddleware,
 >;
 
-type RavenGovernorLayerSmart = tower_governor::GovernorLayer<
-    tower_governor::key_extractor::SmartIpKeyExtractor,
-    governor::middleware::NoOpMiddleware,
->;
+type RavenGovernorLayerTrusted =
+    tower_governor::GovernorLayer<TrustedProxyIpKeyExtractor, governor::middleware::NoOpMiddleware>;
+
+/// `None` when proxy trust is off, so the caller keeps `PeerIpKeyExtractor`.
+fn resolve_trusted_proxies(
+    config: &HttpConfig,
+) -> Result<Option<TrustedProxyIpKeyExtractor>, String> {
+    let ranges = config.resolve_trusted_proxy_ranges()?;
+    if ranges.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(TrustedProxyIpKeyExtractor::new(ranges.into())))
+}
 
 fn build_governor_layer_peer(rps: u64, burst: u32) -> RavenGovernorLayerPeer {
     use tower_governor::governor::GovernorConfigBuilder;
@@ -290,20 +310,23 @@ fn build_governor_layer_peer(rps: u64, burst: u32) -> RavenGovernorLayerPeer {
 
 /// Returns `Err` only if `tower-governor` rejects a `(rps >= 1, burst >= 1)` config
 /// (currently impossible per upstream contract; propagated to catch future regressions).
-fn build_governor_layer_smart(rps: u64, burst: u32) -> Result<RavenGovernorLayerSmart, String> {
+fn build_governor_layer_trusted(
+    rps: u64,
+    burst: u32,
+    extractor: TrustedProxyIpKeyExtractor,
+) -> Result<RavenGovernorLayerTrusted, String> {
     use tower_governor::governor::GovernorConfigBuilder;
-    use tower_governor::key_extractor::SmartIpKeyExtractor;
     use tower_governor::GovernorLayer;
     let rps = rps.max(1);
     let burst = burst.max(1);
     let cfg = GovernorConfigBuilder::default()
-        .key_extractor(SmartIpKeyExtractor)
+        .key_extractor(extractor)
         .per_second(rps)
         .burst_size(burst)
         .finish()
         .ok_or_else(|| {
             format!(
-                "tower-governor rejected SmartIp config (rps={rps}, burst={burst}); \
+                "tower-governor rejected trusted-proxy config (rps={rps}, burst={burst}); \
                  upstream invariant changed - file against tower-governor"
             )
         })?;
@@ -442,7 +465,7 @@ pub(crate) fn global_prometheus_handle(
 mod tests {
     use super::*;
     use crate::auth::{ct_eq_str, stable_hash_token, EvictionOutcome, SessionKey, SessionMap};
-    use crate::config::HTTP_MAX_BODY_CEILING;
+    use crate::config::{HTTP_MAX_BODY_CEILING, HTTP_MAX_FANOUT_CEILING};
     use raven_inspire::ServerSessionHandle;
     use raven_railgun_core::InstanceId;
     use raven_railgun_engine::PirInstance;
@@ -511,6 +534,80 @@ mod tests {
         let s = format!("{err}");
         assert!(s.contains("12"), "Display must include the index: {s}");
         assert!(s.contains("scheme err"), "Display must include detail: {s}");
+    }
+
+    #[test]
+    fn batch_error_index_resolves_slot_and_drops_the_unattributed_sentinel() {
+        assert_eq!(
+            BatchError::Respond {
+                index: 5,
+                detail: "x".to_owned()
+            }
+            .index(),
+            Some(5)
+        );
+        assert_eq!(BatchError::Timeout { index: 2, secs: 1 }.index(), Some(2));
+        assert_eq!(
+            BatchError::WorkerAborted { index: usize::MAX }.index(),
+            None,
+            "the JoinSet-level sentinel must not be reported as slot usize::MAX"
+        );
+        assert_eq!(BatchError::SemaphoreClosed.index(), None);
+        assert_eq!(BatchError::Invariant("x").index(), None);
+    }
+
+    #[test]
+    fn fanout_error_validation_variants_map_to_400() {
+        assert_eq!(FanoutError::NoShards.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            FanoutError::TooManyShards { got: 99, cap: 16 }.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            FanoutError::ShardOutOfRange {
+                shard_id: 7,
+                index: 1,
+                shard_count: 3
+            }
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn fanout_error_dispatch_delegates_status_and_names_the_shard() {
+        let err = FanoutError::Dispatch {
+            shard_id: 11,
+            index: 2,
+            source: BatchError::Timeout { index: 2, secs: 30 },
+        };
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.class(), "timeout");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("shard 11"),
+            "Display must name the failing shard: {rendered}"
+        );
+    }
+
+    #[test]
+    fn http_config_validate_rejects_zero_max_fanout_shards() {
+        let mut cfg = HttpConfig::demo("test-token-padded-long-enough-1234");
+        cfg.max_fanout_shards = 0;
+        let err = cfg
+            .validate()
+            .expect_err("zero max_fanout_shards must reject");
+        assert!(err.contains("max_fanout_shards"), "err = {err}");
+    }
+
+    #[test]
+    fn http_config_validate_rejects_oversize_max_fanout_shards() {
+        let mut cfg = HttpConfig::demo("test-token-padded-long-enough-1234");
+        cfg.max_fanout_shards = HTTP_MAX_FANOUT_CEILING + 1;
+        let err = cfg
+            .validate()
+            .expect_err("oversize max_fanout_shards must reject");
+        assert!(err.contains("max_fanout_shards"), "err = {err}");
     }
 
     #[test]
@@ -597,6 +694,35 @@ mod tests {
     fn build_cors_layer_returns_some_for_real_origin() {
         let origins = vec!["https://wallet.example.com".to_owned()];
         assert!(super::build_cors_layer(&origins).is_some());
+    }
+
+    #[test]
+    fn resolve_trusted_proxies_defaults_to_the_peer_extractor() {
+        let config = HttpConfig::demo("read-token-padded-long-enough");
+        assert!(super::resolve_trusted_proxies(&config)
+            .expect("default config resolves")
+            .is_none());
+    }
+
+    #[test]
+    fn resolve_trusted_proxies_refuses_a_bare_boolean() {
+        let mut config = HttpConfig::demo("read-token-padded-long-enough");
+        config.trust_proxy_header = true;
+        let err = super::resolve_trusted_proxies(&config)
+            .expect_err("router construction must refuse unscoped proxy trust");
+        assert!(err.contains("trusted_proxy_cidrs"), "{err}");
+    }
+
+    #[test]
+    fn resolve_trusted_proxies_builds_an_extractor_from_declared_ranges() {
+        let mut config = HttpConfig::demo("read-token-padded-long-enough");
+        config.trust_proxy_header = true;
+        config.trusted_proxy_cidrs = vec!["172.16.0.0/12".to_owned()];
+        let extractor = super::resolve_trusted_proxies(&config)
+            .expect("declared ranges resolve")
+            .expect("proxy trust is on");
+        assert!(extractor.trusts("172.17.0.1".parse().expect("parses")));
+        assert!(!extractor.trusts("203.0.113.9".parse().expect("parses")));
     }
 
     #[tokio::test]
@@ -717,8 +843,10 @@ mod tests {
             instances: vec![],
             consumer: Some(ConsumerStatus {
                 last_applied_block: 100,
+                last_scanned_block: 200,
                 last_known_chain_head: 200,
-                indexer_lag_blocks: 100,
+                indexer_lag_blocks: 0,
+                blocks_since_last_applied_event: 100,
                 events_processed: 5,
                 commits_fired: 1,
                 reorgs_handled: 0,
@@ -726,8 +854,10 @@ mod tests {
             }),
         };
         let json = serde_json::to_string(&resp).expect("serialize");
-        assert!(json.contains("\"indexer_lag_blocks\":100"));
+        assert!(json.contains("\"indexer_lag_blocks\":0"));
+        assert!(json.contains("\"blocks_since_last_applied_event\":100"));
         assert!(json.contains("\"last_applied_block\":100"));
+        assert!(json.contains("\"last_scanned_block\":200"));
         assert!(json.contains("\"last_known_chain_head\":200"));
     }
 
@@ -799,7 +929,7 @@ mod tests {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
         let snapshot = instance.current_snapshot();
         let started = std::time::Instant::now();
-        let result = crate::batch::dispatch_batch::<SlowableScheme>(
+        let result = crate::batch::dispatch_batch::<SlowableScheme, SlowableQuery>(
             queries,
             Arc::clone(&instance),
             snapshot,
@@ -838,7 +968,7 @@ mod tests {
 
         let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
         let snapshot = instance.current_snapshot();
-        let result = crate::batch::dispatch_batch::<SlowableScheme>(
+        let result = crate::batch::dispatch_batch::<SlowableScheme, SlowableQuery>(
             queries,
             instance,
             snapshot,
@@ -968,7 +1098,7 @@ mod tests {
         });
 
         let snapshot = instance.current_snapshot();
-        let result = crate::batch::dispatch_batch::<SlowableScheme>(
+        let result = crate::batch::dispatch_batch::<SlowableScheme, SlowableQuery>(
             queries,
             Arc::clone(&instance),
             snapshot,

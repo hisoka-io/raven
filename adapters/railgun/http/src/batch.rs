@@ -8,6 +8,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use bytes::Bytes;
+use raven_railgun_core::batch_ladder::check_batch_len;
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::{DrainState, PirInstance, PirScheme, Snapshot};
 use tokio::sync::Semaphore;
@@ -60,6 +61,10 @@ pub(crate) async fn query_handler<S: PirScheme>(
                 "single-query refused: instance drained mid-acquire"
             );
             return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Ok(Ok(Err(err @ raven_railgun_core::AdapterError::InvalidQuery(_)))) => {
+            tracing::info!(%err, "single-query refused: caller-side defect");
+            return Err(StatusCode::BAD_REQUEST);
         }
         Ok(Ok(Err(err))) => {
             tracing::error!(?err, "single-query respond failed");
@@ -127,7 +132,19 @@ pub(crate) async fn batch_handler<S: PirScheme>(
         tracing::warn!(?err, "batch versioned-bincode deserialize failed");
         StatusCode::BAD_REQUEST
     })?;
-    if queries.is_empty() {
+    // Off-ladder lengths are refused rather than served: a client that skipped
+    // padding would otherwise publish its exact query count, silently.
+    if let Err(violation) = check_batch_len(queries.len()) {
+        tracing::warn!(
+            instance_id = %instance.id,
+            violation = %violation,
+            "batch refused: length is off the fixed-size ladder"
+        );
+        metrics::counter!(
+            "raven_railgun_batch_off_ladder_total",
+            "instance" => instance_id.to_string()
+        )
+        .increment(1);
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -140,7 +157,7 @@ pub(crate) async fn batch_handler<S: PirScheme>(
     let k = app.config.max_concurrent_queries.max(1);
     let respond_timeout = Duration::from_secs(app.config.respond_timeout_secs.max(1));
 
-    let responses_result = dispatch_batch::<S>(
+    let responses_result = dispatch_batch::<S, S::Query>(
         queries,
         Arc::clone(&instance),
         snapshot_for_batch,
@@ -200,6 +217,14 @@ pub enum BatchError {
         /// Display-formatted scheme error.
         detail: String,
     },
+    /// The slot at `index` was rejected as caller-side malformed.
+    #[error("slot {index} rejected: {detail}")]
+    InvalidSlot {
+        /// 0-based slot index.
+        index: usize,
+        /// Display-formatted scheme error.
+        detail: String,
+    },
     /// Per-query timeout fired; permits are released on `Elapsed`.
     #[error("respond timed out at index {index} after {secs}s")]
     Timeout {
@@ -229,9 +254,28 @@ impl BatchError {
             BatchError::Respond { .. } | BatchError::Invariant(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+            BatchError::InvalidSlot { .. } => StatusCode::BAD_REQUEST,
             BatchError::WorkerAborted { .. }
             | BatchError::SemaphoreClosed
             | BatchError::Timeout { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    /// 0-based slot the failure is attributed to; `None` when unattributable.
+    #[must_use]
+    pub fn index(&self) -> Option<usize> {
+        match self {
+            BatchError::Respond { index, .. }
+            | BatchError::InvalidSlot { index, .. }
+            | BatchError::Timeout { index, .. }
+            | BatchError::WorkerAborted { index } => {
+                if *index == usize::MAX {
+                    None
+                } else {
+                    Some(*index)
+                }
+            }
+            BatchError::SemaphoreClosed | BatchError::Invariant(_) => None,
         }
     }
 
@@ -239,6 +283,7 @@ impl BatchError {
     pub fn class(&self) -> &'static str {
         match self {
             BatchError::Respond { .. } => "respond",
+            BatchError::InvalidSlot { .. } => "invalid_slot",
             BatchError::Timeout { .. } => "timeout",
             BatchError::WorkerAborted { .. } => "worker_aborted",
             BatchError::SemaphoreClosed => "semaphore_closed",
@@ -256,32 +301,43 @@ type WorkerOutcome<R> = (usize, Result<R, BatchError>);
 /// `spawn_blocking` regresses ~2x on the HTTP path. Every worker borrows the
 /// same `Arc<Snapshot<S>>` so the whole batch serves one `(epoch, state)` even
 /// under a concurrent `swap_state`.
-pub(crate) async fn dispatch_batch<S: PirScheme>(
-    queries: Vec<S::Query>,
+///
+/// A slot becomes an `S::Query` inside the worker, after its permit: a caller
+/// fanning one shared upload across slots pays at most `k` live copies, not one
+/// per slot. `/batch` owns its queries outright and converts through the
+/// identity `Into`.
+pub(crate) async fn dispatch_batch<S, Q>(
+    slots: Vec<Q>,
     instance: Arc<PirInstance<S>>,
     snapshot: Arc<Snapshot<S>>,
     semaphore: Arc<Semaphore>,
     k: usize,
     respond_timeout: Duration,
-) -> Result<Vec<S::Response>, BatchError> {
+) -> Result<Vec<S::Response>, BatchError>
+where
+    S: PirScheme,
+    Q: Into<S::Query> + Send + 'static,
+{
     use tokio::task::JoinSet;
 
-    let n = queries.len();
+    let n = slots.len();
     let mut responses: Vec<Option<S::Response>> = (0..n).map(|_| None).collect();
     let mut join: JoinSet<WorkerOutcome<S::Response>> = JoinSet::new();
 
     let mut next_idx = 0usize;
-    let mut queries_iter: std::vec::IntoIter<S::Query> = queries.into_iter();
+    let mut slots_iter: std::vec::IntoIter<Q> = slots.into_iter();
 
     while next_idx < k.min(n) {
-        let Some(q) = queries_iter.next() else {
+        let Some(slot) = slots_iter.next() else {
             break;
         };
         let inst = Arc::clone(&instance);
         let sem = Arc::clone(&semaphore);
         let snap = Arc::clone(&snapshot);
         let idx = next_idx;
-        join.spawn(async move { worker::<S>(idx, q, inst, snap, sem, respond_timeout).await });
+        join.spawn(
+            async move { worker::<S, Q>(idx, slot, inst, snap, sem, respond_timeout).await },
+        );
         next_idx += 1;
     }
 
@@ -326,14 +382,14 @@ pub(crate) async fn dispatch_batch<S: PirScheme>(
             }
         }
         if first_error.is_none() {
-            if let Some(q) = queries_iter.next() {
+            if let Some(slot) = slots_iter.next() {
                 let inst = Arc::clone(&instance);
                 let sem = Arc::clone(&semaphore);
                 let snap = Arc::clone(&snapshot);
                 let idx = next_idx;
-                join.spawn(
-                    async move { worker::<S>(idx, q, inst, snap, sem, respond_timeout).await },
-                );
+                join.spawn(async move {
+                    worker::<S, Q>(idx, slot, inst, snap, sem, respond_timeout).await
+                });
                 next_idx += 1;
             }
         }
@@ -349,23 +405,36 @@ pub(crate) async fn dispatch_batch<S: PirScheme>(
 /// One in-flight batch worker. Acquires a permit, runs
 /// `query_active_tracked_with_snapshot` against the batch-captured
 /// `Arc<Snapshot<S>>` on `spawn_blocking` under `tokio::time::timeout`.
-/// Permit is released on timeout.
-async fn worker<S: PirScheme>(
+/// Permit is released on timeout. The slot materializes under the permit, so
+/// an unacquired worker holds no query-sized allocation.
+async fn worker<S, Q>(
     idx: usize,
-    q: S::Query,
+    slot: Q,
     instance: Arc<PirInstance<S>>,
     snapshot: Arc<Snapshot<S>>,
     sem: Arc<Semaphore>,
     respond_timeout: Duration,
-) -> WorkerOutcome<S::Response> {
+) -> WorkerOutcome<S::Response>
+where
+    S: PirScheme,
+    Q: Into<S::Query> + Send + 'static,
+{
     let Ok(_permit) = sem.acquire_owned().await else {
         return (idx, Err(BatchError::SemaphoreClosed));
     };
     let join = tokio::task::spawn_blocking(move || {
-        instance.query_active_tracked_with_snapshot(&snapshot, &q)
+        let query = slot.into();
+        instance.query_active_tracked_with_snapshot(&snapshot, &query)
     });
     match tokio::time::timeout(respond_timeout, join).await {
         Ok(Ok(Ok((_epoch, r)))) => (idx, Ok(r)),
+        Ok(Ok(Err(scheme_err @ raven_railgun_core::AdapterError::InvalidQuery(_)))) => (
+            idx,
+            Err(BatchError::InvalidSlot {
+                index: idx,
+                detail: format!("{scheme_err}"),
+            }),
+        ),
         Ok(Ok(Err(scheme_err))) => (
             idx,
             Err(BatchError::Respond {

@@ -28,7 +28,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Highest block height applied to each instance's logical store. Sourced from the raven_railgun_indexer_chain_head_block gauge minus the indexer_lag_blocks gauge per instance label. A flat line indicates the indexer worker is wedged.",
+      "description": "Highest block height applied to each instance's logical store. A flat line means no Railgun events landed, which on a quiet chain is normal; pair it with the indexer lag panel before calling a stall.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -69,7 +69,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "raven_railgun_indexer_chain_head_block - on(instance) raven_railgun_indexer_lag_blocks",
+          "expr": "raven_railgun_consumer_last_applied_block",
           "legendFormat": "applied {{instance}}",
           "refId": "A"
         }
@@ -123,7 +123,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "raven_railgun_indexer_lag_blocks",
+          "expr": "raven_railgun_consumer_indexer_lag_blocks",
           "legendFormat": "lag {{instance}}",
           "refId": "A"
         }

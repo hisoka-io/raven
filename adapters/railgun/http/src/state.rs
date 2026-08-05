@@ -225,6 +225,33 @@ impl<S: PirScheme> AppState<S> {
     }
 }
 
+impl AppState<raven_railgun_engine::inspire::RavenInspireScheme> {
+    /// Spawn a periodic sweeper dropping past-TTL packing-key registrations from
+    /// every instance's [`BoundedSessionStore`](raven_railgun_engine::session_pool::BoundedSessionStore).
+    ///
+    /// `resolve` already refuses an expired handle, so this only keeps the
+    /// occupancy gauges honest on an instance that has stopped registering.
+    #[must_use]
+    pub fn start_packing_key_sweeper(
+        &self,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let engine = Arc::clone(&self.engine);
+        let interval = interval.max(std::time::Duration::from_secs(1));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let now = Instant::now();
+                for instance in engine.instances() {
+                    instance.current_state().session_store.sweep_expired(now);
+                }
+            }
+        })
+    }
+}
+
 /// Register HELP + TYPE for every Prometheus metric the HTTP layer emits, so
 /// descriptions land before the first scrape. [`OnceLock`]-guarded; idempotent.
 #[allow(clippy::too_many_lines)]
@@ -235,7 +262,7 @@ pub(crate) fn describe_prometheus_metrics() {
     }
     metrics::describe_counter!(
         "raven_railgun_queries_total",
-        "Total PIR queries served, labelled by instance + kind (single|batch)"
+        "Total PIR queries served, labelled by instance + kind (single|batch|fanout)"
     );
     metrics::describe_counter!(
         "raven_railgun_auth_ok_total",
@@ -248,6 +275,10 @@ pub(crate) fn describe_prometheus_metrics() {
     metrics::describe_histogram!(
         "raven_railgun_batch_size",
         "PIR batch size (queries per batch), labelled by instance"
+    );
+    metrics::describe_histogram!(
+        "raven_railgun_fanout_shards",
+        "Fan-out width (shards served per uploaded query), labelled by instance"
     );
     metrics::describe_gauge!(
         "raven_railgun_uptime_seconds",
@@ -286,12 +317,20 @@ pub(crate) fn describe_prometheus_metrics() {
         "Per-instance last-applied chain block height"
     );
     metrics::describe_gauge!(
+        "raven_railgun_consumer_last_scanned_block",
+        "Per-instance highest scanned chain block height"
+    );
+    metrics::describe_gauge!(
         "raven_railgun_consumer_last_known_chain_head",
         "Per-instance last-known chain head"
     );
     metrics::describe_gauge!(
         "raven_railgun_consumer_indexer_lag_blocks",
-        "Per-instance indexer lag (chain_head - last_applied)"
+        "Per-instance indexer lag (chain_head - last_scanned)"
+    );
+    metrics::describe_gauge!(
+        "raven_railgun_consumer_blocks_since_last_applied_event",
+        "Per-instance chain_head - last_applied; grows on a quiet chain by design"
     );
     metrics::describe_gauge!(
         "raven_railgun_consumer_events_processed",
@@ -315,8 +354,26 @@ pub(crate) fn describe_prometheus_metrics() {
     );
     metrics::describe_counter!(
         "raven_railgun_session_evictions_total",
-        "Lifetime count of sticky-session entries evicted, labelled by `reason` \
-         (ttl = swept past expires_at, lru = displaced on cap-pressure upsert)"
+        "Lifetime count of session entries evicted, labelled by `reason` \
+         (ttl = sticky entry swept past expires_at, lru = displaced on cap-pressure \
+         upsert, expired = packing keys past TTL, removed = explicit removal, \
+         flushed = dropped by the packing-key occupancy backstop)"
+    );
+    metrics::describe_counter!(
+        "raven_railgun_batch_off_ladder_total",
+        "Lifetime count of batches refused for an off-ladder length, labelled by instance"
+    );
+    metrics::describe_counter!(
+        "raven_railgun_session_store_flushes_total",
+        "Lifetime count of packing-key store flushes triggered by the occupancy cap"
+    );
+    metrics::describe_gauge!(
+        "raven_railgun_session_store_occupancy",
+        "Packing-key sets resident in the engine session store; the memory-occupancy figure"
+    );
+    metrics::describe_gauge!(
+        "raven_railgun_session_store_serviceable",
+        "Session handles the engine store will still resolve"
     );
     metrics::describe_counter!(
         "raven_railgun_session_eviction_pressure_total",

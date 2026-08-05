@@ -98,7 +98,15 @@ Please report suspected security vulnerabilities PRIVATELY. Do NOT open a public
 issue, pull request, or discussion for an undisclosed vulnerability, and do not
 disclose it on social channels before a fix is available.
 
-Contact: ACTION-REQUIRED (repository owner) - set the reporting channel here; not filled in automatically because publishing an acknowledgement promise on a public policy is an owner decision. Verified candidates: enable GitHub private vulnerability reporting on this repository and reference it, or use hello@hisoka.io (published on the hisoka-io GitHub organisation profile, but a general inbox rather than a monitored security mailbox).
+Preferred channel: GitHub private vulnerability reporting on this repository -
+the "Security" tab, then "Report a vulnerability". Reports filed there are
+visible only to the maintainers.
+
+Fallback, if private reporting is unavailable to you: hello@hisoka.io, published
+on the hisoka-io GitHub organisation profile. It is a general inbox rather than a
+dedicated security mailbox, so expect a slower first response than the timeline
+below and do not include any exploit detail you would not want read by a
+non-security recipient.
 
 In your report, please include where practical:
 

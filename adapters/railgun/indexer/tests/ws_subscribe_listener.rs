@@ -185,6 +185,33 @@ impl LogStreamer for FlappingStreamer {
     }
 }
 
+#[derive(Debug, Default)]
+struct HalfOpenStreamer {
+    opens: AtomicU64,
+}
+
+#[async_trait]
+impl LogStreamer for HalfOpenStreamer {
+    async fn open(&self) -> Result<SubscribeStreams> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        let (heads_tx, heads_rx) = mpsc::channel(4);
+        // Logs close at once while heads keep arriving: the half-open transport.
+        let (logs_tx, logs_rx) = mpsc::channel::<Result<alloy::rpc::types::eth::Log>>(1);
+        drop(logs_tx);
+        tokio::spawn(async move {
+            let mut n = 1u64;
+            while heads_tx.send(Ok(n)).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                n += 1;
+            }
+        });
+        Ok(SubscribeStreams {
+            heads: heads_rx,
+            logs: logs_rx,
+        })
+    }
+}
+
 #[derive(Debug)]
 struct StaticFallback(u64);
 
@@ -457,4 +484,96 @@ async fn flapping_streamer_exhausts_cumulative_budget() {
 
     drop(rx);
     let _ = tokio::time::timeout(Duration::from_secs(5), worker_handle).await;
+}
+
+/// A cold worker whose first WS open fails must not report the whole chain as lag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_first_open_floors_the_scan_watermark_at_the_tip() {
+    let streamer = Arc::new(AlwaysFailStreamer::default());
+    let fallback = Arc::new(StaticFallback(23_000_000));
+    let (tx, mut rx) = mpsc::channel(256);
+
+    let worker = Arc::new(SubscribeWorker::new(
+        Arc::clone(&streamer),
+        Arc::clone(&fallback),
+        tx,
+    ));
+
+    let cfg = SubscribeWorkerConfig {
+        heartbeat_secs: 1,
+        reconnect_total_secs: 1,
+        polling_dwell: Duration::from_millis(300),
+    };
+
+    let worker_handle = {
+        let w = Arc::clone(&worker);
+        tokio::spawn(async move { w.run(cfg).await })
+    };
+
+    let mut beats: Vec<(u64, u64)> = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while beats.len() < 2 && std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(1500), rx.recv()).await {
+            Ok(Some(IndexerMessage::Heartbeat {
+                chain_head_block,
+                scanned_through_block,
+                ..
+            })) => beats.push((chain_head_block, scanned_through_block)),
+            Ok(None) => break,
+            Ok(Some(_)) | Err(_) => {}
+        }
+    }
+
+    assert!(
+        streamer.attempts.load(Ordering::SeqCst) >= 1,
+        "the streamer must have been tried and failed"
+    );
+    assert!(!beats.is_empty(), "expected at least one polling heartbeat");
+    for (head, scanned) in &beats {
+        assert_eq!(*scanned, 23_000_000, "watermark floors at the tip on entry");
+        assert_eq!(
+            head.saturating_sub(*scanned),
+            0,
+            "a worker that never scanned must not claim 23M blocks of lag"
+        );
+    }
+
+    drop(rx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker_handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closed_logs_stream_reconnects_even_while_heads_flow() {
+    let streamer = Arc::new(HalfOpenStreamer::default());
+    let fallback = Arc::new(StaticFallback(9_999));
+    let (tx, _rx) = mpsc::channel(256);
+
+    let worker = Arc::new(SubscribeWorker::new(
+        Arc::clone(&streamer),
+        Arc::clone(&fallback),
+        tx,
+    ));
+
+    // Heartbeat far exceeds the observation window, so surviving on heads alone
+    // would never trip it and open() would stay at 1.
+    let cfg = SubscribeWorkerConfig {
+        heartbeat_secs: 300,
+        reconnect_total_secs: 300,
+        polling_dwell: Duration::from_millis(50),
+    };
+
+    let worker_handle = {
+        let w = Arc::clone(&worker);
+        tokio::spawn(async move { w.run(cfg).await })
+    };
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let opens = streamer.opens.load(Ordering::SeqCst);
+    worker_handle.abort();
+
+    assert!(
+        opens > 1,
+        "a clean logs close is a transport break; the worker must reconnect \
+         rather than ride the heads stream reporting zero lag (saw {opens} open(s))"
+    );
 }

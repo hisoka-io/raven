@@ -548,9 +548,15 @@ pub enum IndexerMessage {
     /// Reorg fence: surviving entries have `block_height <= height`.
     Reorg { height: u64 },
     /// Heartbeat for liveness and lag-tracking.
+    ///
+    /// `scanned_through_block` is the worker's scan watermark, NOT the chain
+    /// tip: every block up to it has been fetched and its events dispatched.
+    /// Lag is measured against it because an applied-event height stalls on a
+    /// quiet chain even when the scanner is fully caught up.
     Heartbeat {
         wallclock_unix_ms: u64,
         chain_head_block: u64,
+        scanned_through_block: u64,
     },
 }
 
@@ -684,7 +690,7 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
                         if let Some(path) = config.reorg_window_path.as_ref() {
                             persist_reorg_window_best_effort(path, &hash_cache);
                         }
-                        let _ = self.send_heartbeat(latest);
+                        let _ = self.send_heartbeat(latest, cursor);
                         continue;
                     }
                     Err(e) => {
@@ -695,7 +701,7 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
             }
 
             if latest <= cursor {
-                let _ = self.send_heartbeat(latest);
+                let _ = self.send_heartbeat(latest, cursor);
                 continue;
             }
             let to = (cursor.saturating_add(config.chunk_blocks)).min(latest);
@@ -759,7 +765,7 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
             }
 
             cursor = to;
-            let _ = self.send_heartbeat(latest);
+            let _ = self.send_heartbeat(latest, cursor);
         }
     }
 
@@ -792,13 +798,18 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
         rebuilt
     }
 
-    fn send_heartbeat(&self, chain_head_block: u64) -> std::result::Result<(), ()> {
+    fn send_heartbeat(
+        &self,
+        chain_head_block: u64,
+        scanned_through_block: u64,
+    ) -> std::result::Result<(), ()> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         let msg = IndexerMessage::Heartbeat {
             wallclock_unix_ms: now_ms,
             chain_head_block,
+            scanned_through_block,
         };
         match self.sender.try_send(msg) {
             Ok(()) => Ok(()),

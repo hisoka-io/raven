@@ -60,7 +60,10 @@ async fn orchestrator_bootstraps_and_consumer_applies_events() {
 
     handle
         .sender
-        .send(ConsumerEvent::Heartbeat(200))
+        .send(ConsumerEvent::Heartbeat {
+            chain_head: 200,
+            scanned_through: 200,
+        })
         .await
         .expect("send heartbeat");
 
@@ -74,6 +77,33 @@ async fn orchestrator_bootstraps_and_consumer_applies_events() {
     );
     assert_eq!(m.last_known_chain_head, 200);
     assert_eq!(m.last_applied_block, 102);
+    assert_eq!(m.last_scanned_block, 200);
+    assert_eq!(
+        m.indexer_lag_blocks(),
+        0,
+        "scanner caught up to the tip: lag must be 0 even though the last \
+         event landed at 102"
+    );
+    assert_eq!(m.blocks_since_last_applied_event(), 98);
+
+    // 98 quiet blocks later: lag holds at zero, event distance keeps growing.
+    handle
+        .sender
+        .send(ConsumerEvent::Heartbeat {
+            chain_head: 298,
+            scanned_through: 298,
+        })
+        .await
+        .expect("send quiet heartbeat");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let quiet = *handle.metrics.lock();
+    assert_eq!(quiet.indexer_lag_blocks(), 0);
+    assert_eq!(quiet.blocks_since_last_applied_event(), 196);
+    assert_eq!(
+        quiet.last_applied_leaf_block, 102,
+        "resume floor must not move on heartbeats"
+    );
 
     // snapshot fields out: don't hold the parking_lot guard across the await below
     let (count, has_0, has_1, has_2) = {

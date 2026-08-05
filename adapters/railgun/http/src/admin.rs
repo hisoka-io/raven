@@ -9,6 +9,7 @@ use axum::{
 };
 use bytes::Bytes;
 use raven_inspire::inspiring::ClientPackingKeys;
+use raven_inspire::ServerCrs;
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{InspireServerState, RavenInspireScheme};
 use raven_railgun_engine::{DrainState, PirScheme};
@@ -137,6 +138,24 @@ pub struct InstanceParams {
     pub variant: String,
     /// Current snapshot epoch.
     pub epoch: u64,
+}
+
+/// Wire CRS. Empties `galois_keys` - 99.98% of the bytes, read only by the server's own
+/// [`raven_inspire::PackingMode::Tree`] path - and the two `#[serde(skip)]` `inspiring_*`
+/// options, which never reach the wire either way. Field-by-field so a CRS layout change
+/// fails to compile rather than silently re-inflating.
+fn crs_wire_bytes(crs: &ServerCrs) -> raven_inspire::pir::Result<Vec<u8>> {
+    ServerCrs {
+        params: crs.params.clone(),
+        galois_keys: Vec::new(),
+        rgsw_gadget: crs.rgsw_gadget.clone(),
+        inspiring_pack_params: None,
+        inspiring_packing_key: None,
+        inspiring_w_seed: crs.inspiring_w_seed,
+        inspiring_v_seed: crs.inspiring_v_seed,
+        inspiring_num_columns: crs.inspiring_num_columns,
+    }
+    .to_versioned_bytes()
 }
 
 pub(crate) async fn session_establish_handler(
@@ -296,10 +315,7 @@ pub(crate) async fn params_handler(
 
     let state = instance.current_state();
     let state: &InspireServerState = state.as_ref();
-    let crs_bincode = state
-        .crs
-        .to_versioned_bytes()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let crs_bincode = crs_wire_bytes(&state.crs).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let shard_config_bincode = bincode::serialize(&state.encoded_db.config)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let inspire_params_bincode =

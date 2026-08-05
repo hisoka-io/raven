@@ -14,6 +14,7 @@ import {
   validateTreeNumber,
   TREE_DEPTH,
 } from "./client-pir";
+import { paddedBatchLength } from "./batch-ladder";
 import { ChainRegistry, type ChainRegistryEntry } from "./chain-registry";
 import { RavenError } from "./errors";
 import { ImtCache, imtCacheKey } from "./imt-cache";
@@ -591,8 +592,15 @@ export class RavenPOINodeInterface {
     }
 
     if (stillMissing.length > 0) {
-      // One encrypted query per missing level, dispatched as one batch; only the encrypted batch crosses the wire.
-      const queryBundles = stillMissing.map((level) => {
+      // One encrypted query per missing level, padded up to a ladder step so the
+      // batch length publishes a bucket rather than the exact cache-miss count.
+      // A pad re-queries a level already in the request, so it is drawn from the
+      // real slots' own distribution and costs the server a full pass - any
+      // shortcut it could take would be the distinguisher.
+      const realCount = stillMissing.length;
+      const paddedCount = paddedBatchLength(realCount);
+      const queryBundles = Array.from({ length: paddedCount }, (_unused, slot) => {
+        const level = stillMissing[slot % realCount];
         const target = BigInt(indices[level]);
         return decodeClientPirQueryBundle(
           ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, target),

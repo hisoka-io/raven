@@ -443,8 +443,10 @@ interface ProbeStatus {
   }>;
   consumer: {
     last_applied_block: number;
+    last_scanned_block: number;
     last_known_chain_head: number;
     indexer_lag_blocks: number;
+    blocks_since_last_applied_event: number;
   };
 }
 

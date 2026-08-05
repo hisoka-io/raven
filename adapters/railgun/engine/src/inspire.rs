@@ -7,10 +7,13 @@ use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::{
     extract_inspiring, respond_seeded_inspiring_cached_with_session, setup as inspire_setup,
     ClientSession, ClientState, EncodedDatabase, PackingMode, SeededClientQuery, ServerCrs,
-    ServerInspiringCache, ServerResponse, ServerSessionStore,
+    ServerInspiringCache, ServerResponse,
 };
-use raven_railgun_core::AdapterError;
+use raven_railgun_core::{batch_ladder, AdapterError};
 use std::sync::Arc;
+use std::time::Instant;
+
+use super::session_pool::BoundedSessionStore;
 
 /// Server state for one InsPIRe instance, held behind `PirInstance`'s `ArcSwap`.
 ///
@@ -24,7 +27,7 @@ pub struct InspireServerState {
     /// Pre-warmed packing keys, rebuilt only on cell-shape change.
     pub cache: Arc<ServerInspiringCache>,
     /// Per-instance session store; survives re-encode swaps.
-    pub session_store: Arc<ServerSessionStore>,
+    pub session_store: Arc<BoundedSessionStore>,
     /// InsPIRe variant.
     pub variant: InspireVariant,
     /// Entry size in bytes.
@@ -66,12 +69,17 @@ impl PirScheme for RavenInspireScheme {
     type Response = ServerResponse;
 
     fn respond(state: &Self::ServerState, query: &Self::Query) -> Result<Self::Response> {
+        // Resolving first keeps an evicted handle a typed 400-shaped error
+        // instead of a scheme error from inside the frozen store.
+        let store = state
+            .session_store
+            .resolve(query.session_handle, Instant::now())?;
         respond_seeded_inspiring_cached_with_session(
             state.crs.as_ref(),
             &state.encoded_db,
             query,
             state.cache.as_ref(),
-            Some(state.session_store.as_ref()),
+            Some(store.as_ref()),
         )
         .map_err(|e| AdapterError::Scheme(format!("inspire respond: {e}")))
     }
@@ -89,13 +97,12 @@ pub fn setup_state(
         .map_err(|e| AdapterError::Scheme(format!("inspire setup: {e}")))?;
     let cache = ServerInspiringCache::new(&crs, &encoded_db)
         .map_err(|e| AdapterError::Scheme(format!("inspire cache build: {e}")))?;
-    let session_store = ServerSessionStore::new();
     Ok((
         InspireServerState {
             crs: Arc::new(crs),
             encoded_db: Arc::new(encoded_db),
             cache: Arc::new(cache),
-            session_store: Arc::new(session_store),
+            session_store: Arc::new(BoundedSessionStore::new()),
             variant,
             entry_size,
         },
@@ -165,7 +172,7 @@ pub fn swap_state(
         crs,
         encoded_db: Arc::new(encoded_db),
         cache,
-        session_store: Arc::new(ServerSessionStore::new()),
+        session_store: Arc::new(BoundedSessionStore::new()),
         variant,
         entry_size,
     };
@@ -176,10 +183,10 @@ pub fn swap_state(
 /// Swap in a same-shape state carrying a fresh empty session store, dropping
 /// every registered sticky-bearer session and bumping the epoch.
 ///
-/// The inner [`ServerSessionStore`] never evicts on its own, so its packing
-/// keys (~48 KB/session) accumulate; this is the operator-side bound. Heavy
-/// fields are carried via `Arc::clone`, so in-flight queries keep running on
-/// the donor store while new queries see the empty one.
+/// This is the operator-scheduled flush, on top of the occupancy and TTL bounds
+/// [`BoundedSessionStore`] already enforces. Heavy fields are carried via
+/// `Arc::clone`, so in-flight queries keep running on the donor store while new
+/// queries see the empty one.
 ///
 /// # Errors
 /// Returns `Result<()>` for forward-compatibility with future fallible
@@ -190,7 +197,7 @@ pub fn heartbeat_session_eviction(instance: &super::PirInstance<RavenInspireSche
         crs: Arc::clone(&donor.crs),
         encoded_db: Arc::clone(&donor.encoded_db),
         cache: Arc::clone(&donor.cache),
-        session_store: Arc::new(ServerSessionStore::new()),
+        session_store: Arc::new(BoundedSessionStore::new()),
         variant: donor.variant,
         entry_size: donor.entry_size,
     };
@@ -211,13 +218,16 @@ pub fn build_client_session(
 }
 
 /// Register a [`ClientSession`] on the server's session store via server-side derivation.
+///
+/// # Errors
+/// Returns [`AdapterError::Scheme`] if the store rejects the derived keys.
 pub fn register_client_session(
     client_session: &mut ClientSession,
     state: &InspireServerState,
 ) -> Result<()> {
-    client_session
-        .register_with_server_derivation(state.session_store.as_ref())
-        .map_err(|e| AdapterError::Scheme(format!("session register: {e}")))?;
+    state
+        .session_store
+        .register_client_session_at(client_session, Instant::now())?;
     Ok(())
 }
 
@@ -234,6 +244,59 @@ pub fn build_seeded_query(
         .map_err(|e| AdapterError::Scheme(format!("query_seeded: {e}")))?;
     query.packing_mode = PackingMode::Inspiring;
     Ok((state, query))
+}
+
+/// Build a batch padded up to the next [`batch_ladder`] step.
+///
+/// Returned slots are in `global_indices` order, so `states[i]` decodes
+/// `responses[i]` for every real slot; the padded tail is discarded by the
+/// caller. Padding is the client's job because the server is the adversary the
+/// ladder hides the count from: a server-generated pad would be a pad the
+/// server knows about.
+///
+/// A pad re-queries an index already in the batch with fresh encryption
+/// randomness, so it is drawn from exactly the distribution of the real slots
+/// and costs a full database pass. Skipping that pass server-side would itself
+/// be the distinguisher.
+///
+/// # Errors
+/// Returns [`AdapterError::InvalidQuery`] when `global_indices` is empty or
+/// longer than [`batch_ladder::max_batch_size`], and [`AdapterError::Scheme`]
+/// if query construction fails.
+pub fn build_padded_batch(
+    client_session: &ClientSession,
+    shard_config: &ShardConfig,
+    params: &InspireParams,
+    global_indices: &[u64],
+) -> Result<(Vec<ClientState>, Vec<SeededClientQuery>)> {
+    let padded = batch_ladder::padded_len(global_indices.len()).ok_or_else(|| {
+        AdapterError::InvalidQuery(format!(
+            "batch of {} exceeds the fixed-size ladder maximum {}; split into \
+             several batches and pad each",
+            global_indices.len(),
+            batch_ladder::max_batch_size()
+        ))
+    })?;
+    if global_indices.is_empty() {
+        return Err(AdapterError::InvalidQuery(
+            "batch must carry at least one real query; an empty batch has nothing to pad"
+                .to_owned(),
+        ));
+    }
+
+    let mut states = Vec::with_capacity(padded);
+    let mut queries = Vec::with_capacity(padded);
+    for slot in 0..padded {
+        // Cycling keeps the pads' cleartext shard distribution equal to the real slots'.
+        let index = global_indices
+            .get(slot % global_indices.len())
+            .copied()
+            .unwrap_or_default();
+        let (state, query) = build_seeded_query(client_session, shard_config, index, params)?;
+        states.push(state);
+        queries.push(query);
+    }
+    Ok((states, queries))
 }
 
 /// Decode a server response into the original plaintext bytes.
@@ -351,12 +414,11 @@ pub fn restore_inspire_state(bytes: &[u8]) -> Result<InspireServerState> {
 fn bundle_to_state(bundle: PersistedInspireState) -> Result<InspireServerState> {
     let cache = ServerInspiringCache::new(&bundle.crs, &bundle.encoded_db)
         .map_err(|e| AdapterError::Scheme(format!("restore cache build: {e}")))?;
-    let session_store = ServerSessionStore::new();
     Ok(InspireServerState {
         crs: Arc::new(bundle.crs),
         encoded_db: Arc::new(bundle.encoded_db),
         cache: Arc::new(cache),
-        session_store: Arc::new(session_store),
+        session_store: Arc::new(BoundedSessionStore::new()),
         variant: bundle.variant,
         entry_size: bundle.entry_size,
     })

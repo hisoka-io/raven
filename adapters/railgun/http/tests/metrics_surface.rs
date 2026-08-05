@@ -94,6 +94,7 @@ fn with_instance_metrics_builder_round_trips_map() {
     // (the handler clones state per scrape; a dropped Arc loses the gauges).
     let cell = Arc::new(parking_lot::Mutex::new(ConsumerMetrics {
         last_applied_block: 12_345_678,
+        last_scanned_block: 12_345_678,
         last_applied_leaf_block: 12_345_678,
         last_known_chain_head: 12_345_700,
         events_processed: 42,

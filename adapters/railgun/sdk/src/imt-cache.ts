@@ -52,9 +52,10 @@ interface IndexedDbBacking {
 
 function makeIndexedDbBacking(dbName: string): IndexedDbBacking | null {
   const idb = (globalThis as unknown as { indexedDB?: IDBFactory }).indexedDB;
-  if (!idb) {
-    return null;
-  }
+  return idb === undefined ? null : indexedDbBacking(idb, dbName);
+}
+
+function indexedDbBacking(idb: IDBFactory, dbName: string): IndexedDbBacking {
   let dbPromise: Promise<IDBDatabase> | null = null;
   function openDb(): Promise<IDBDatabase> {
     if (dbPromise) return dbPromise;

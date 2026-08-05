@@ -469,15 +469,19 @@ pub fn pre_spawn_for_tree(
     Ok(registry.known().contains(&tree))
 }
 
-fn warn_on_record_size_override(encoder: EncoderKind, requested: usize, effective: usize) {
+pub(crate) fn warn_on_record_size_override(
+    encoder: EncoderKind,
+    requested: usize,
+    effective: usize,
+) {
     if requested == effective {
         return;
     }
     tracing::warn!(
         encoder = encoder.label(),
-        requested_entry_bytes = requested,
-        effective_entry_bytes = effective,
-        "auto_spawn: encoder layout pins the record width; configured entry_bytes ignored"
+        requested_record_size = requested,
+        effective_record_size = effective,
+        "encoder layout pins the record width; the configured width is ignored"
     );
 }
 

@@ -1,7 +1,7 @@
 //! Snapshot zstd-l3 wrap bench (`#[ignore]`-gated).
 //!
 //! 3-seed median per (codec, op) at the production ~170 MiB payload shape.
-//! Run: `cargo test --release -p raven-railgun-persistence --test snapshot_zstd_bench -- --ignored --nocapture`
+//! Run: `cargo test --release -p raven-railgun-persistence --bench snapshot_zstd_bench -- --ignored --nocapture`
 
 #![allow(
     clippy::expect_used,

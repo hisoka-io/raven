@@ -227,7 +227,10 @@ async fn resume_floor_is_last_leaf_block_not_chain_head() {
     // heartbeat drives the chain head far past the last applied leaf (stall shape)
     handle
         .sender
-        .send(ConsumerEvent::Heartbeat(CHAIN_HEAD))
+        .send(ConsumerEvent::Heartbeat {
+            chain_head: CHAIN_HEAD,
+            scanned_through: CHAIN_HEAD,
+        })
         .await
         .expect("send heartbeat");
     handle

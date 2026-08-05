@@ -335,6 +335,7 @@ async fn freshness_header_value_format_is_well_formed() {
     use raven_railgun_engine::persistence::ConsumerMetrics;
     let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics {
         last_applied_block: 1000,
+        last_scanned_block: 1000,
         last_applied_leaf_block: 1000,
         last_known_chain_head: 1010,
         events_processed: 42,
@@ -450,4 +451,118 @@ async fn bc_to_idx_map_etag_matches_body_under_concurrent_updates() {
 
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = writer.join();
+}
+
+/// Distinct-but-valid hex list keys; the shim decodes every one before it reaches the cap check,
+/// so a rejection cannot be confused with a hex-decode 400.
+fn distinct_list_keys(count: usize) -> Vec<String> {
+    (0..count)
+        .map(|i| {
+            let mut k = [0u8; 32];
+            k[24..32].copy_from_slice(&(i as u64).to_be_bytes());
+            hex_encode_bytes(&k)
+        })
+        .collect()
+}
+
+fn distinct_bc_datas(count: usize) -> Vec<serde_json::Value> {
+    (0..count)
+        .map(|i| {
+            let mut bc = [0u8; 32];
+            bc[16..24].copy_from_slice(&(i as u64).to_be_bytes());
+            serde_json::json!({ "blindedCommitment": hex_encode_bytes(&bc), "type": "Shield" })
+        })
+        .collect()
+}
+
+async fn post_json(router: Router, uri: &str, payload: &serde_json::Value) -> StatusCode {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(payload.to_string()))
+        .expect("build req");
+    router.oneshot(req).await.expect("dispatch").status()
+}
+
+#[tokio::test]
+async fn pois_per_list_rejects_more_list_keys_than_the_cap() {
+    let (router, _) = build_router();
+    let payload = serde_json::json!({
+        "listKeys": distinct_list_keys(65),
+        "blindedCommitmentDatas": distinct_bc_datas(1),
+    });
+    assert_eq!(
+        post_json(router, "/v1/poi/pois-per-list", &payload).await,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "65 list keys exceeds the 64-key cap; uncapped this body is served 200 OK"
+    );
+}
+
+#[tokio::test]
+async fn pois_per_list_rejects_more_blinded_commitments_than_the_cap() {
+    let (router, list_key) = build_router();
+    let payload = serde_json::json!({
+        "listKeys": [hex_encode_bytes(&list_key)],
+        "blindedCommitmentDatas": distinct_bc_datas(1025),
+    });
+    assert_eq!(
+        post_json(router, "/v1/poi/pois-per-list", &payload).await,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "1025 blinded commitments exceeds the 1024 cap"
+    );
+}
+
+#[tokio::test]
+async fn pois_per_list_rejects_a_lookup_product_past_the_cap_when_each_vector_fits() {
+    let (router, _) = build_router();
+    // 64 x 1024 = 65,536 store lookups and BTreeMap inserts under the global store
+    // mutex, from two vectors that each satisfy their own cap.
+    let payload = serde_json::json!({
+        "listKeys": distinct_list_keys(64),
+        "blindedCommitmentDatas": distinct_bc_datas(1024),
+    });
+    assert_eq!(
+        post_json(router, "/v1/poi/pois-per-list", &payload).await,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "product cap must reject 64 x 1024 even though each vector is within its own cap"
+    );
+}
+
+#[tokio::test]
+async fn pois_per_list_still_serves_a_body_at_the_caps() {
+    let (router, list_key) = build_router();
+    let mut list_keys = distinct_list_keys(63);
+    list_keys.push(hex_encode_bytes(&list_key));
+    let payload = serde_json::json!({
+        "listKeys": list_keys,
+        "blindedCommitmentDatas": distinct_bc_datas(256),
+    });
+    assert_eq!(
+        post_json(router, "/v1/poi/pois-per-list", &payload).await,
+        StatusCode::OK,
+        "64 x 256 is inside every cap and must still be served"
+    );
+}
+
+#[tokio::test]
+async fn merkle_proofs_rejects_more_blinded_commitments_than_the_cap() {
+    let (router, list_key) = build_router();
+    let bcs: Vec<String> = (0..1025u64)
+        .map(|i| {
+            let mut bc = [0u8; 32];
+            bc[16..24].copy_from_slice(&i.to_be_bytes());
+            hex_encode_bytes(&bc)
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "listKey": hex_encode_bytes(&list_key),
+        "blindedCommitments": bcs,
+    });
+    assert_eq!(
+        post_json(router, "/v1/poi/merkle-proofs", &payload).await,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "1025 blinded commitments must be refused before the store lock is taken; \
+         uncapped this body walks every entry and answers 404 on the first unknown BC"
+    );
 }

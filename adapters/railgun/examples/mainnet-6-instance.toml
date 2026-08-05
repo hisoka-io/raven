@@ -5,15 +5,25 @@
 # 1 live commit-tree, and 2 PPOI list instances. Adjust the [[instance]]
 # blocks to match the current on-chain tree topology.
 #
-# Constraint: the --config path hardwires total_entries to 65,536 and exposes no
-# [global] entries key, while the per-node / per-list-node encoders require
-# total_entries >= 131,071, so those instances are rejected at boot. Serving them
-# needs a [global] entries key plus a cell-shape re-bootstrap of existing data.
+# Cell shape: each [[instance]] takes an optional `entries` (row count) and
+# `record_size` (row width). Both default to the instance encoder's canonical
+# layout - 131,072 rows for per-node / per-list-node, 65,536 for the leaf-keyed
+# encoders - so the four commit-trees and the PPOI path instance below size
+# themselves. Setting either to a value the encoder cannot serve is rejected at
+# boot; changing either on a populated data_dir needs a re-bootstrap, because
+# reconfiguring the shape does not convert existing shards.
 
 [global]
 bind = "0.0.0.0:8080"
-# bearer token; config-time check rejects the literal "REPLACE_ME" and
-# requires >= 16 bytes of entropy. Generate via `openssl rand -hex 32`.
+# Bearer token, from EXACTLY ONE of: `token` (inline), `token_file`, or the
+# RAVEN_BEARER_TOKEN environment variable. Zero or two sources is a boot error.
+# The literal "REPLACE_ME" is rejected from every source; generate via
+# `openssl rand -hex 32`.
+#
+# Preferred: keep the secret out of this file. A `token_file` and, when `token`
+# is inline, this config itself must be mode 600 - anything group- or
+# world-reachable refuses to boot and names the file, the mode, and the fix.
+#   token_file = "/srv/raven/secrets/bearer-token"
 token = "REPLACE_ME"
 rpc_url = "https://mainnet.example/eth"
 railgun_proxy = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
@@ -28,9 +38,13 @@ scheme_tag = "raven-inspire-twopacking-inspiring-wp3-cache-session"
 use_flock = true
 channel_capacity = 1024
 
-# Key per-IP rate limiting off X-Forwarded-For; set true ONLY behind a
-# trusted reverse proxy whose origin port is firewalled to it. A publicly
-# reachable origin lets attackers forge the header and bypass throttling.
+# Key per-IP rate limiting off X-Forwarded-For / cf-connecting-ip. Enabling it
+# requires naming the peer ranges the proxy connects FROM: a boolean cannot tell
+# "behind a proxy" from "directly reachable", and on an exposed origin anyone can
+# forge the header and escape the per-IP limit. Every peer outside the list keys
+# on its socket address regardless of what it sends.
+#   trust_proxy_header = true
+#   trusted_proxy_cidrs = ["127.0.0.1/32", "172.16.0.0/12"]
 trust_proxy_header = false
 
 # rate_limit_rps = 200      # per-IP refill rate (req/s)

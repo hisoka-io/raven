@@ -64,3 +64,10 @@ export {
   type InstanceStatus as RavenInstanceStatus,
   type ConsumerStatus as RavenConsumerStatus,
 } from "./events-stream";
+
+export {
+  BATCH_SIZE_LADDER,
+  MAX_BATCH_SIZE,
+  isOnLadder,
+  paddedBatchLength,
+} from "./batch-ladder";

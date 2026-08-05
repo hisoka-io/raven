@@ -11,8 +11,12 @@ export interface InstanceStatus {
 
 export interface ConsumerStatus {
   last_applied_block: number;
+  last_scanned_block: number;
   last_known_chain_head: number;
+  /** `last_known_chain_head - last_scanned_block`; zero when caught up. */
   indexer_lag_blocks: number;
+  /** `last_known_chain_head - last_applied_block`; grows on a quiet chain. */
+  blocks_since_last_applied_event: number;
   events_processed: number;
   commits_fired: number;
   reorgs_handled: number;

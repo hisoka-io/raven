@@ -19,6 +19,7 @@ import {
   type RavenInspireWasm,
   type POIStatus,
   type BlindedCommitmentType,
+  type RavenErrorKind,
 } from "../src/index";
 
 import { startMockServer, writeJson, type MockServer } from "./helpers/mock_server";
@@ -26,7 +27,22 @@ import { startMockServer, writeJson, type MockServer } from "./helpers/mock_serv
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX = "abababababababababababababababababababababababababababababababab";
 const BC_HEX = "0000000000000000000000000000000000000000000000000000000000000001";
-const BC_HEX_2 = "0000000000000000000000000000000000000000000000000000000000000002";
+
+// `expect(fn).toThrow(RavenError)` is not expressible: RavenError's constructor is
+// private, so the class is not a `Constructable` for vitest's matcher.
+function expectThrowsRavenError(fn: () => unknown, kind: RavenErrorKind): void {
+  let thrown: unknown;
+  let returned = false;
+  try {
+    fn();
+    returned = true;
+  } catch (e) {
+    thrown = e;
+  }
+  expect(returned).toBe(false);
+  expect(thrown).toBeInstanceOf(RavenError);
+  expect(RavenError.is(thrown, kind)).toBe(true);
+}
 
 // Stub mirroring the real Rust path-indices math so tests assert on real geometry; the real wasm runs in the privacy-invariant file.
 function realPathStubWasm(): RavenInspireWasm {
@@ -179,7 +195,7 @@ describe("WASM path-indices accessors", () => {
   });
 
   it("pathIndicesForLeaf rejects out-of-range leaf via typed InvalidQuery", () => {
-    expect(() => pathIndicesForLeaf(wasm, 0, 1 << 16)).toThrow(RavenError);
+    expectThrowsRavenError(() => pathIndicesForLeaf(wasm, 0, 1 << 16), "InvalidQuery");
     try {
       pathIndicesForLeaf(wasm, 0, 1 << 16);
     } catch (e) {
@@ -188,7 +204,7 @@ describe("WASM path-indices accessors", () => {
   });
 
   it("pathIndicesForPerListLeaf rejects malformed list_key via typed InvalidQuery", () => {
-    expect(() => pathIndicesForPerListLeaf(wasm, "ab", 0)).toThrow(RavenError);
+    expectThrowsRavenError(() => pathIndicesForPerListLeaf(wasm, "ab", 0), "InvalidQuery");
     try {
       pathIndicesForPerListLeaf(wasm, "ab", 0);
     } catch (e) {
@@ -507,7 +523,7 @@ describe("multi-chain routing", () => {
     const registry = new ChainRegistry([
       { chainId: 1, endpoint: mainnetServer.url, bearerToken: TOKEN },
     ]);
-    expect(() => registry.resolve(999)).toThrow(RavenError);
+    expectThrowsRavenError(() => registry.resolve(999), "InvalidQuery");
     try {
       registry.resolve(999);
     } catch (e) {
@@ -558,12 +574,12 @@ describe("multi-chain routing", () => {
 
 describe("input validation hardening", () => {
   it("validateBcHex rejects malformed hex (wrong length)", () => {
-    expect(() => validateBcHex("ab")).toThrow(RavenError);
-    expect(() => validateBcHex("a".repeat(63))).toThrow(RavenError);
+    expectThrowsRavenError(() => validateBcHex("ab"), "InvalidQuery");
+    expectThrowsRavenError(() => validateBcHex("a".repeat(63)), "InvalidQuery");
   });
 
   it("validateBcHex rejects non-hex characters", () => {
-    expect(() => validateBcHex("z".repeat(64))).toThrow(RavenError);
+    expectThrowsRavenError(() => validateBcHex("z".repeat(64)), "InvalidQuery");
   });
 
   it("validateBcHex accepts 0x-prefixed 64-char hex", () => {
@@ -571,28 +587,28 @@ describe("input validation hardening", () => {
   });
 
   it("validateListKeyHex rejects wrong length", () => {
-    expect(() => validateListKeyHex("ab")).toThrow(RavenError);
-    expect(() => validateListKeyHex("a".repeat(63))).toThrow(RavenError);
+    expectThrowsRavenError(() => validateListKeyHex("ab"), "InvalidQuery");
+    expectThrowsRavenError(() => validateListKeyHex("a".repeat(63)), "InvalidQuery");
   });
 
   it("validateLeafIndex rejects negative", () => {
-    expect(() => validateLeafIndex(-1)).toThrow(RavenError);
+    expectThrowsRavenError(() => validateLeafIndex(-1), "InvalidQuery");
   });
 
   it("validateLeafIndex rejects overflow", () => {
-    expect(() => validateLeafIndex(1 << 16)).toThrow(RavenError);
+    expectThrowsRavenError(() => validateLeafIndex(1 << 16), "InvalidQuery");
   });
 
   it("validateLeafIndex rejects non-integer", () => {
-    expect(() => validateLeafIndex(1.5)).toThrow(RavenError);
+    expectThrowsRavenError(() => validateLeafIndex(1.5), "InvalidQuery");
   });
 
   it("validateTreeNumber rejects negative", () => {
-    expect(() => validateTreeNumber(-1)).toThrow(RavenError);
+    expectThrowsRavenError(() => validateTreeNumber(-1), "InvalidQuery");
   });
 
   it("validateTreeNumber rejects > u32", () => {
-    expect(() => validateTreeNumber(0x1_0000_0000)).toThrow(RavenError);
+    expectThrowsRavenError(() => validateTreeNumber(0x1_0000_0000), "InvalidQuery");
   });
 
   it("getMerkleProof rejects malformed leaf index (negative) pre-flight", async () => {

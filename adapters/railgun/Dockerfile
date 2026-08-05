@@ -1,5 +1,5 @@
 # Operator binary image for raven-railgun. Build context MUST be the repo
-# root, since the adapter path-depends on ../../crates/inspire:
+# root, since the adapter path-depends on crates/ outside its own workspace:
 #   docker build -t raven-railgun -f adapters/railgun/Dockerfile .
 
 FROM rust:1.85-slim-bookworm AS build
@@ -9,10 +9,13 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 
-# allowlist COPY: crates/inspire is the only external path-dep, so nothing
-# else from root (run/ secrets, no-commit/) lands in a build layer
-COPY rust-toolchain.toml ./
-COPY crates/inspire ./crates/inspire
+# allowlist COPY, so nothing else from root (run/ secrets, no-commit/) lands in
+# a build layer. Whole directories, not named crates: the external path-deps
+# inherit `version.workspace`/`lints.workspace` from the root manifest, so cargo
+# loads every root workspace member even to build one adapter binary.
+COPY rust-toolchain.toml Cargo.toml Cargo.lock README.md ./
+COPY crates ./crates
+COPY benches ./benches
 COPY adapters/railgun ./adapters/railgun
 
 RUN cargo build --release \

@@ -11,6 +11,7 @@ pub mod offline_packing_keys_cache;
 pub mod orchestrator;
 pub mod persistence;
 pub mod pir_table;
+pub mod session_pool;
 pub mod tree_fill_watcher;
 
 pub use raven_server::{

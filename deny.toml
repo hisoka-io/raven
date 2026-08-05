@@ -1,0 +1,44 @@
+# Advisory gate for every Raven workspace. Run per manifest:
+#   cargo deny --manifest-path <manifest> --all-features check -c deny.toml advisories
+#
+# Every `ignore` entry is accepted risk with a named retirement trigger. Adding
+# one is an owner decision, because the alternative - changing a dependency - is
+# itself an owner decision. A NEW advisory must fail this job, never be silenced
+# by widening a rule.
+
+[advisories]
+unmaintained = "all"
+yanked = "deny"
+ignore = [
+  { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 unmaintained, not vulnerable. It encodes the on-disk snapshot and the on-the-wire session, so bincode 2 is a format break needing owner ratification plus a migration. Retire when that migration lands." },
+  { id = "RUSTSEC-2026-0190", reason = "anyhow <=1.0.102 Error::downcast_mut unsoundness, reachable only via wit-bindgen -> getrandom -> tempfile -> proptest, i.e. the test harness, never a runtime path. Retire when the transitive tree resolves anyhow >= 1.0.103." },
+  { id = "RUSTSEC-2026-0204", reason = "crossbeam-epoch 0.9.18 invalid pointer dereference in the fmt::Pointer impl for Atomic/Shared. Reached only by formatting an Atomic/Shared with {:p}, which no Raven crate does; the crate arrives transitively under rayon. Retire when the tree resolves crossbeam-epoch >= 0.9.19." },
+  { id = "RUSTSEC-2026-0220", reason = "ruint 1.18.0 Uint shift operations report incorrect overflow flags and truncate the shift amount. Arrives under alloy-primitives. Raven's U256 use is fail-fast width conversion, not shifting. Retire when alloy resolves ruint >= 1.18.1; the upgrade is a dependency change and needs owner ratification." },
+  { id = "RUSTSEC-2024-0436", reason = "paste unmaintained, no known vulnerability, proc-macro only. Arrives transitively under the alloy and metrics stacks; no direct dependency to drop. Retire when both stacks stop pulling it." },
+  { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained, no known vulnerability, proc-macro only, transitive. Retire when the tree stops pulling it." },
+  { crate = "metrics@0.24.5", reason = "yanked from crates.io while the adapter Cargo.lock still pins it. `cargo update -p metrics` clears it, which is a lockfile change and an owner decision. Retire by re-resolving the adapter lock." },
+]
+
+[bans]
+multiple-versions = "allow"
+
+[licenses]
+version = 2
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "MIT-0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "CDLA-Permissive-2.0",
+  "MPL-2.0",
+  "BSL-1.0",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

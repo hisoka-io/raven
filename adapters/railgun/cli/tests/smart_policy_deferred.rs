@@ -203,6 +203,7 @@ data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
     );
     let cfg_path = tmp.path().join("config.toml");
     std::fs::write(&cfg_path, initial_body).expect("write initial config");
+    restrict_to_owner(&cfg_path);
 
     let opts = load_options_from_toml(&cfg_path).expect("load initial");
     assert_eq!(opts.instance_templates.len(), 1);
@@ -319,6 +320,7 @@ data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
 "#
     );
     std::fs::write(&cfg_path, updated_body).expect("rewrite config");
+    restrict_to_owner(&cfg_path);
 
     // SAFETY: getpid + kill are async-signal-safe and have well-defined
     // semantics for SIGHUP delivery to self.
@@ -402,6 +404,7 @@ data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
     );
     let cfg_path = tmp.path().join("config.toml");
     std::fs::write(&cfg_path, initial_body).expect("write initial config");
+    restrict_to_owner(&cfg_path);
 
     let initial_runtime = AutoSpawnRuntime {
         data_dir_template: template_a.clone(),
@@ -531,6 +534,7 @@ data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
 "#
     );
     std::fs::write(&cfg_path, updated_body).expect("rewrite config");
+    restrict_to_owner(&cfg_path);
 
     // SAFETY: getpid + kill are async-signal-safe and have well-defined
     // semantics for SIGHUP delivery to self.
@@ -847,4 +851,16 @@ async fn admin_drain_concurrent_with_auto_spawn_routes_consistently() {
 
     drop(tx);
     let _ = tokio::time::timeout(Duration::from_secs(5), driver).await;
+}
+
+/// The parser refuses a group- or world-readable config carrying an inline token.
+fn restrict_to_owner(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("fixture config must be owner-only");
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }

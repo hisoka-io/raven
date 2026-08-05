@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use raven_railgun_cli::bearer_token::BEARER_TOKEN_ENV;
 
 /// Operator-CLI HTTP timeout for one-shot status requests. 30s matches the
 /// indexer's `MAX_RPC_TOTAL_ELAPSED_SECS` posture and the
@@ -70,8 +71,11 @@ enum Commands {
         /// Local address to bind the HTTP server.
         #[arg(long, default_value = "127.0.0.1:8080")]
         bind: SocketAddr,
-        /// Bearer token for Authorization header.
-        #[arg(long, env = "RAVEN_BEARER_TOKEN", required_unless_present = "config")]
+        /// Bearer token for Authorization header. `RAVEN_BEARER_TOKEN` is read as a
+        /// fallback after arg parsing, not by clap: an env-sourced arg counts as
+        /// present for `conflicts_with_all`, which would make the variable
+        /// unusable alongside `--config`.
+        #[arg(long)]
         token: Option<String>,
         /// Ethereum JSON-RPC URL (mainnet / Sepolia / etc).
         #[arg(long, env = "RAVEN_RPC_URL", required_unless_present = "config")]
@@ -106,7 +110,10 @@ enum Commands {
         /// Per-query response timeout in seconds.
         #[arg(long, default_value_t = 30)]
         respond_timeout_secs: u64,
-        /// PIR cell entry count.
+        /// PIR cell entry count. Single-instance only, hence the `--config`
+        /// conflict: a multi-instance fleet mixes encoders whose canonical
+        /// totals differ, so `--config` carries `entries` per `[[instance]]`,
+        /// defaulting to that instance's encoder total.
         #[arg(long, default_value_t = raven_railgun_cli::serve_production::DEFAULT_PRODUCTION_ENTRIES)]
         entries: usize,
         /// PIR cell record width in bytes.
@@ -432,8 +439,14 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             let encoder_kind = parse_encoder_kind(&encoder, tree_number, &list_key)?;
-            let token =
-                token.ok_or_else(|| anyhow::anyhow!("--token required when --config not set"))?;
+            let token = token
+                .or_else(|| std::env::var(BEARER_TOKEN_ENV).ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no bearer token: pass --token or set {BEARER_TOKEN_ENV} \
+                         (--config sources it from the TOML instead)"
+                    )
+                })?;
             let rpc_url = rpc_url
                 .ok_or_else(|| anyhow::anyhow!("--rpc-url required when --config not set"))?;
             let data_dir = data_dir

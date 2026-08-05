@@ -301,6 +301,17 @@ where
     pub async fn run(&self, config: SubscribeWorkerConfig) -> Result<()> {
         let total_budget = Duration::from_secs(config.reconnect_total_secs);
         let outer_started = Instant::now();
+        // Floored at the tip on entry: a live-tail worker owns nothing below its
+        // start height, so a failed first open would otherwise report the whole
+        // chain as lag. Frozen across a polling dwell on purpose - that mode
+        // consumes no logs, so the watermark genuinely stops and lag must grow.
+        let mut scanned_through = match self.fallback.latest_block().await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(error = %e, "no tip for the scan-watermark floor; starting at 0");
+                0
+            }
+        };
         loop {
             if self.sender.is_closed() {
                 tracing::info!("subscribe worker exiting; outbound channel closed");
@@ -313,7 +324,8 @@ where
             match self.streamer.open().await {
                 Ok(streams) => {
                     tracing::info!("WS subscription opened");
-                    self.drain_streams(streams, &config).await?;
+                    let streamed_head = self.drain_streams(streams, &config).await?;
+                    scanned_through = scanned_through.max(streamed_head);
                     tracing::warn!("WS subscription closed; entering polling dwell");
                 }
                 Err(e) => {
@@ -332,7 +344,8 @@ where
             self.mode.set(ChainSourceMode::Polling);
             let polling_started = Instant::now();
             let dwell = config.polling_dwell;
-            self.run_polling(polling_started, dwell).await?;
+            self.run_polling(polling_started, dwell, scanned_through)
+                .await?;
 
             if self.sender.is_closed() {
                 return Ok(());
@@ -344,17 +357,19 @@ where
                     budget_secs = total_budget.as_secs(),
                     "subscribe reconnect budget exhausted; staying in polling mode"
                 );
-                self.run_polling_indefinitely().await?;
+                self.run_polling_indefinitely(scanned_through).await?;
                 return Ok(());
             }
         }
     }
 
+    /// Returns the highest head observed on this connection: the scan
+    /// watermark the polling dwell inherits.
     async fn drain_streams(
         &self,
         streams: SubscribeStreams,
         config: &SubscribeWorkerConfig,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let SubscribeStreams {
             mut heads,
             mut logs,
@@ -362,10 +377,8 @@ where
         let heartbeat = Duration::from_secs(config.heartbeat_secs.max(1));
         let mut last_chain_head: u64 = 0;
         let mut last_frame_at = Instant::now();
-        let mut heads_open = true;
-        let mut logs_open = true;
 
-        while heads_open || logs_open {
+        loop {
             let since_last = last_frame_at.elapsed();
             let remaining = heartbeat.saturating_sub(since_last);
             if remaining.is_zero() {
@@ -373,35 +386,39 @@ where
                     window_secs = heartbeat.as_secs(),
                     "WS heartbeat window expired without frames"
                 );
-                return Ok(());
+                return Ok(last_chain_head);
             }
 
             tokio::select! {
                 biased;
 
                 () = self.sender.closed() => {
-                    return Ok(());
+                    return Ok(last_chain_head);
                 }
 
-                head_frame = async { heads.recv().await }, if heads_open => {
+                head_frame = async { heads.recv().await } => {
                     match head_frame {
                         Some(Ok(n)) => {
                             last_chain_head = n;
                             last_frame_at = Instant::now();
-                            self.send_heartbeat(n);
+                            // Optimistic watermark: newHeads and logs are independent
+                            // subscriptions with no ordering guarantee, so a log for n may
+                            // land after this beat. It is applied at its own height either
+                            // way; the cost is that lag under-reports across that window.
+                            self.send_heartbeat(n, n);
                         }
                         Some(Err(e)) => {
                             tracing::warn!(error = %e, "WS newHeads error frame");
-                            return Ok(());
+                            return Ok(last_chain_head);
                         }
                         None => {
-                            tracing::debug!("WS newHeads stream closed; logs stream may continue");
-                            heads_open = false;
+                            tracing::warn!("WS newHeads stream closed; reconnecting");
+                            break;
                         }
                     }
                 }
 
-                log_frame = async { logs.recv().await }, if logs_open => {
+                log_frame = async { logs.recv().await } => {
                     match log_frame {
                         Some(Ok(log)) => {
                             last_frame_at = Instant::now();
@@ -409,11 +426,14 @@ where
                         }
                         Some(Err(e)) => {
                             tracing::warn!(error = %e, "WS logs error frame");
-                            return Ok(());
+                            return Ok(last_chain_head);
                         }
+                        // Surviving on one stream reports health it does not have: heads keep
+                        // refreshing last_frame_at so the heartbeat never fires, while lag
+                        // pins to 0 against a chain head nothing is indexing against.
                         None => {
-                            tracing::debug!("WS logs stream closed; heads stream may continue");
-                            logs_open = false;
+                            tracing::warn!("WS logs stream closed; reconnecting");
+                            break;
                         }
                     }
                 }
@@ -423,12 +443,21 @@ where
                         window_secs = heartbeat.as_secs(),
                         "WS heartbeat missed; treating as transport break"
                     );
-                    return Ok(());
+                    return Ok(last_chain_head);
                 }
             }
         }
-        tracing::debug!("both WS streams closed cleanly; returning to reconnect loop");
-        Ok(())
+
+        // Frames already queued when the peer closed are still ours to apply;
+        // dropping them would lose events the reconnect will not replay.
+        while let Ok(Ok(n)) = heads.try_recv() {
+            last_chain_head = n;
+            self.send_heartbeat(n, n);
+        }
+        while let Ok(Ok(log)) = logs.try_recv() {
+            self.handle_log_frame(log, last_chain_head).await?;
+        }
+        Ok(last_chain_head)
     }
 
     async fn handle_log_frame(
@@ -468,18 +497,24 @@ where
         Ok(())
     }
 
-    fn send_heartbeat(&self, chain_head_block: u64) {
+    fn send_heartbeat(&self, chain_head_block: u64, scanned_through_block: u64) {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         let msg = IndexerMessage::Heartbeat {
             wallclock_unix_ms: now_ms,
             chain_head_block,
+            scanned_through_block,
         };
         let _ = self.sender.try_send(msg);
     }
 
-    async fn run_polling(&self, started: Instant, dwell: Duration) -> Result<()> {
+    async fn run_polling(
+        &self,
+        started: Instant,
+        dwell: Duration,
+        scanned_through: u64,
+    ) -> Result<()> {
         let base_tick = Duration::from_secs(crate::DEFAULT_POLL_INTERVAL_SECS.max(1));
         let tick = base_tick.min(dwell.max(Duration::from_millis(1)));
         loop {
@@ -491,7 +526,7 @@ where
             }
             match self.fallback.latest_block().await {
                 Ok(n) => {
-                    self.send_heartbeat(n);
+                    self.send_heartbeat(n, scanned_through);
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "polling fallback latest_block failed");
@@ -501,12 +536,12 @@ where
         }
     }
 
-    async fn run_polling_indefinitely(&self) -> Result<()> {
+    async fn run_polling_indefinitely(&self, scanned_through: u64) -> Result<()> {
         let tick = Duration::from_secs(crate::DEFAULT_POLL_INTERVAL_SECS.max(1));
         while !self.sender.is_closed() {
             match self.fallback.latest_block().await {
                 Ok(n) => {
-                    self.send_heartbeat(n);
+                    self.send_heartbeat(n, scanned_through);
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "polling fallback latest_block failed");

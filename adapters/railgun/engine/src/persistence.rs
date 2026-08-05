@@ -574,8 +574,13 @@ pub enum ConsumerEvent {
     Reorg(u64),
     /// A PPOI status row from the upstream mirror.
     Ppoi(raven_railgun_persistence::WalEntryPayload, u64),
-    /// Heartbeat carrying the chain-head block number.
-    Heartbeat(u64),
+    /// Heartbeat carrying the chain head and the indexer's scan watermark.
+    Heartbeat {
+        /// Chain tip observed by the indexer.
+        chain_head: u64,
+        /// Highest block the indexer has scanned and dispatched events for.
+        scanned_through: u64,
+    },
     /// Operator-driven shutdown signal.
     Shutdown,
 }
@@ -583,8 +588,12 @@ pub enum ConsumerEvent {
 /// Consumer-task progress and lag metrics.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ConsumerMetrics {
-    /// Last block height applied.
+    /// Last block height of an applied chain/PPOI event. Monotonic; frozen while
+    /// no event lands, so it measures event flow, not indexer progress.
     pub last_applied_block: u64,
+    /// Highest block the indexer has scanned, event-bearing or not. The only
+    /// height lag may be measured against.
+    pub last_scanned_block: u64,
     /// Block height of the last leaf-mutating event applied (AppendLeaf / PPOI
     /// leaf). Never advanced by Nullified / Unshield / heartbeat, so it is the
     /// only height safe to persist as the manifest resume floor.
@@ -602,11 +611,29 @@ pub struct ConsumerMetrics {
 }
 
 impl ConsumerMetrics {
-    /// Lag = chain_head - last_applied.
+    /// Blocks the indexer is behind the chain tip. Zero on a quiet chain.
     #[must_use]
     pub fn indexer_lag_blocks(&self) -> u64 {
         self.last_known_chain_head
+            .saturating_sub(self.last_scanned_block)
+    }
+
+    /// Blocks since the last applied event. Grows on a quiet chain by design;
+    /// alert on it only together with a nonzero [`Self::indexer_lag_blocks`].
+    #[must_use]
+    pub fn blocks_since_last_applied_event(&self) -> u64 {
+        self.last_known_chain_head
             .saturating_sub(self.last_applied_block)
+    }
+
+    /// Record an applied event height. Monotonic in both pointers; leaves the
+    /// resume floor (`last_applied_leaf_block`) untouched.
+    pub fn record_applied_block(&mut self, height: u64) {
+        // The max is load-bearing, not cosmetic: the PPOI mirror emits every row at
+        // height 0 and shares this struct with the chain bridge in single-instance
+        // mode, so a plain assignment slams both pointers back to 0.
+        self.last_applied_block = self.last_applied_block.max(height);
+        self.last_scanned_block = self.last_scanned_block.max(height);
     }
 }
 
@@ -892,7 +919,7 @@ pub async fn run_consumer_task(
                         let _ = (tree_number, leaves);
                         {
                             let mut m = metrics.lock();
-                            m.last_applied_block = height;
+                            m.record_applied_block(height);
                             if !had_error {
                                 m.events_processed = m.events_processed.saturating_add(1);
                             }
@@ -902,14 +929,14 @@ pub async fn run_consumer_task(
                     raven_railgun_core::RailgunEvent::Nullified { .. } => {
                         // No new leaves; record height only, no WAL payload.
                         let mut m = metrics.lock();
-                        m.last_applied_block = height;
+                        m.record_applied_block(height);
                         m.events_processed = m.events_processed.saturating_add(1);
                         continue;
                     }
                     raven_railgun_core::RailgunEvent::Unshield { .. } => {
                         // Not a tree mutation; record height only.
                         let mut m = metrics.lock();
-                        m.last_applied_block = height;
+                        m.record_applied_block(height);
                         m.events_processed = m.events_processed.saturating_add(1);
                         continue;
                     }
@@ -932,17 +959,27 @@ pub async fn run_consumer_task(
                 continue;
             }
             ConsumerEvent::Ppoi(payload, height) => (payload, height),
-            ConsumerEvent::Heartbeat(chain_head) => {
+            ConsumerEvent::Heartbeat {
+                chain_head,
+                scanned_through,
+            } => {
                 let mut m = metrics.lock();
                 m.last_known_chain_head = chain_head;
+                // Tracks the cursor verbatim, rewinds included: a reorg really
+                // does leave those blocks to re-scan.
+                m.last_scanned_block = scanned_through;
                 let lag = m.indexer_lag_blocks();
+                let scanned = m.last_scanned_block;
                 drop(m);
                 #[allow(clippy::cast_precision_loss)]
                 let lag_f64 = lag as f64;
                 #[allow(clippy::cast_precision_loss)]
                 let head_f64 = chain_head as f64;
+                #[allow(clippy::cast_precision_loss)]
+                let scanned_f64 = scanned as f64;
                 metrics::gauge!("raven_railgun_indexer_lag_blocks").set(lag_f64);
                 metrics::gauge!("raven_railgun_indexer_chain_head_block").set(head_f64);
+                metrics::gauge!("raven_railgun_indexer_scanned_block").set(scanned_f64);
                 continue;
             }
             ConsumerEvent::Shutdown => {
@@ -991,7 +1028,7 @@ pub async fn run_consumer_task(
         }
         {
             let mut m = metrics.lock();
-            m.last_applied_block = height;
+            m.record_applied_block(height);
             m.events_processed = m.events_processed.saturating_add(1);
         }
         if let Some(state) = verifier_state.as_mut() {
@@ -1262,6 +1299,83 @@ mod tests {
             PerLeafCommitmentEncoder::new(TOY_ENTRY_SIZE, TOY_ENTRIES_PER_SHARD)
                 .expect("test encoder"),
         )
+    }
+
+    #[test]
+    fn quiet_chain_holds_lag_at_zero_while_event_distance_grows() {
+        let mut m = ConsumerMetrics::default();
+        m.record_applied_block(1_000);
+        m.last_applied_leaf_block = 1_000;
+
+        for head in [1_001u64, 1_500, 20_000, 9_000_000] {
+            m.last_known_chain_head = head;
+            m.last_scanned_block = head;
+            assert_eq!(
+                m.indexer_lag_blocks(),
+                0,
+                "scanner at tip must report zero lag at head {head}"
+            );
+            assert_eq!(m.blocks_since_last_applied_event(), head - 1_000);
+        }
+
+        assert_eq!(m.last_applied_block, 1_000);
+        assert_eq!(
+            m.last_applied_leaf_block, 1_000,
+            "resume floor must be untouched by scan progress"
+        );
+    }
+
+    #[test]
+    fn backfill_reports_real_lag() {
+        let m = ConsumerMetrics {
+            last_applied_block: 500,
+            last_scanned_block: 600,
+            last_known_chain_head: 10_600,
+            ..ConsumerMetrics::default()
+        };
+        assert_eq!(m.indexer_lag_blocks(), 10_000);
+    }
+
+    #[test]
+    fn record_applied_block_leaves_resume_floor_alone() {
+        let mut m = ConsumerMetrics {
+            last_applied_leaf_block: 42,
+            ..ConsumerMetrics::default()
+        };
+        m.record_applied_block(777);
+        assert_eq!(m.last_applied_block, 777);
+        assert_eq!(m.last_scanned_block, 777);
+        assert_eq!(m.last_applied_leaf_block, 42);
+    }
+
+    #[test]
+    fn ppoi_height_zero_cannot_regress_the_applied_pointer() {
+        let mut m = ConsumerMetrics {
+            last_applied_leaf_block: 22_950_000,
+            ..ConsumerMetrics::default()
+        };
+        m.record_applied_block(23_000_000);
+        m.last_known_chain_head = 23_000_005;
+
+        for _ in 0..4 {
+            m.record_applied_block(0);
+        }
+
+        assert_eq!(
+            m.last_applied_block, 23_000_000,
+            "a PPOI row at height 0 sharing the chain bridge's metrics must not \
+             reset the applied pointer"
+        );
+        assert_eq!(m.last_scanned_block, 23_000_000);
+        assert_eq!(
+            m.blocks_since_last_applied_event(),
+            5,
+            "the derived gauge must stay bounded, not read the whole chain height"
+        );
+        assert_eq!(
+            m.last_applied_leaf_block, 22_950_000,
+            "resume floor is written only by the leaf paths"
+        );
     }
 
     #[test]

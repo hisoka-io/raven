@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::bearer_token::{resolve_bearer_token, BEARER_TOKEN_ENV};
 use anyhow::Context;
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_core::{InstanceId, ListKey};
@@ -23,7 +24,9 @@ use raven_railgun_engine::orchestrator::{
 use raven_railgun_engine::persistence::{ConsumerMetrics, SnapshotPolicy};
 use raven_railgun_engine::pir_table::EncoderKind;
 use raven_railgun_engine::{Engine, InstanceRole};
-use raven_railgun_http::{inspire_router, AppState, HttpConfig};
+use raven_railgun_http::{
+    inspire_router, trusted_proxy::resolve_declared_ranges, AppState, HttpConfig,
+};
 use serde::Deserialize;
 
 /// Optional `[auto_spawn]` TOML section.
@@ -171,7 +174,13 @@ impl From<PoolStrategyString> for raven_railgun_indexer::rpc_pool::PoolStrategy 
 #[derive(Debug, Deserialize)]
 struct GlobalSection {
     bind: SocketAddr,
-    token: String,
+    /// Inline bearer token. Mutually exclusive with `token_file` and
+    /// [`BEARER_TOKEN_ENV`]; forces a 600-mode config file.
+    #[serde(default)]
+    token: Option<String>,
+    /// 600-mode file holding the bearer token; the production path.
+    #[serde(default)]
+    token_file: Option<PathBuf>,
     rpc_url: String,
     railgun_proxy: String,
     chain_id: u64,
@@ -208,9 +217,13 @@ struct GlobalSection {
     /// CORS allow-origin list; empty leaves CORS off. `*` and empty strings are rejected.
     #[serde(default)]
     cors_allowed_origins: Option<Vec<String>>,
-    /// Trust `X-Forwarded-For` / `cf-connecting-ip`; only safe behind a trusted proxy.
+    /// Trust `X-Forwarded-For` / `cf-connecting-ip`; requires `trusted_proxy_cidrs`.
     #[serde(default)]
     trust_proxy_header: Option<bool>,
+    /// Peer ranges (CIDR) whose forwarding headers are honoured. Every other
+    /// peer keys to its own socket address.
+    #[serde(default)]
+    trusted_proxy_cidrs: Option<Vec<String>>,
     /// Expose `/metrics` without bearer auth (default-deny).
     #[serde(default)]
     metrics_public: Option<bool>,
@@ -236,6 +249,12 @@ struct InstanceSection {
     data_source: DataSourceSection,
     #[serde(default)]
     max_concurrent_queries: Option<usize>,
+    /// Cell width for this instance; overrides `[global].record_size`.
+    #[serde(default)]
+    record_size: Option<usize>,
+    /// Cell row count for this instance; defaults to the encoder's canonical total.
+    #[serde(default)]
+    entries: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -319,7 +338,11 @@ pub struct MultiServeOptions {
     /// Tests set this to skip the live RPC + indexer worker.
     pub skip_chain_workers: bool,
     pub skip_mirror_workers: bool,
+    /// Cell row count for instances absent from `instance_entries`, and the
+    /// default handed to the auto-spawn / list-template drivers.
     pub entries: usize,
+    /// Resolved cell row count per configured instance.
+    pub instance_entries: HashMap<InstanceId, usize>,
     /// Tests set this to drive synthetic events without spinning workers.
     pub bootstrap_observer: Option<BootstrapObserver>,
     pub auto_spawn: Option<AutoSpawnConfigToml>,
@@ -340,6 +363,8 @@ pub struct MultiServeOptions {
     pub cors_allowed_origins: Option<Vec<String>>,
     /// `HttpConfig.trust_proxy_header` override.
     pub trust_proxy_header: Option<bool>,
+    /// `HttpConfig.trusted_proxy_cidrs` override. Empty `Vec` is the same as `None`.
+    pub trusted_proxy_cidrs: Option<Vec<String>>,
     /// `HttpConfig.metrics_public` override.
     pub metrics_public: Option<bool>,
     /// `HttpConfig.session_eviction_interval_secs` override; also drives the per-instance ticker.
@@ -404,12 +429,14 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         .scheme_tag
         .clone()
         .unwrap_or_else(|| SCHEME_TAG_DEFAULT.to_owned());
-    let record_size = parsed.global.record_size.unwrap_or(16 * 32);
+    let fallback_record_size = parsed.global.record_size.unwrap_or(16 * 32);
     let entries_per_shard = parsed.global.entries_per_shard.unwrap_or(2048);
     let use_flock = parsed.global.use_flock.unwrap_or(true);
     let channel_capacity = parsed.global.channel_capacity.unwrap_or(1024);
 
     let mut instances: Vec<InstanceConfig> = Vec::with_capacity(parsed.instance.len());
+    let mut instance_entries: HashMap<InstanceId, usize> =
+        HashMap::with_capacity(parsed.instance.len());
     for raw in parsed.instance {
         let role: InstanceRole = raw.role.into();
         let verification_mode: VerificationMode = raw.verification_mode.into();
@@ -421,8 +448,25 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
             InstanceRole::Static => SnapshotPolicy::static_default(),
             _ => SnapshotPolicy::default(),
         };
+        // An explicit width is carried verbatim so `validate_cell_shape` rejects a
+        // conflict with the encoder's canonical layout instead of substituting.
+        let record_size = raw.record_size.unwrap_or_else(|| {
+            let effective = encoder.effective_record_size(fallback_record_size);
+            crate::auto_spawn_driver::warn_on_record_size_override(
+                encoder,
+                fallback_record_size,
+                effective,
+            );
+            effective
+        });
+        let instance_id = InstanceId::new(raw.id);
+        instance_entries.insert(
+            instance_id.clone(),
+            raw.entries
+                .unwrap_or_else(|| encoder.default_total_entries()),
+        );
         instances.push(InstanceConfig {
-            instance_id: InstanceId::new(raw.id),
+            instance_id,
             role,
             data_dir: raw.data_dir,
             encoder,
@@ -579,20 +623,27 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         }
     }
 
-    // Reject the example-config placeholder token so operators can't accidentally ship it.
-    if parsed.global.token == "REPLACE_ME" {
-        anyhow::bail!(
-            "[global].token is the literal placeholder \"REPLACE_ME\" \
-             from the example config. Replace it with at least 16 bytes \
-             of operator-private entropy (e.g. `openssl rand -hex 32`) \
-             before serving. See {} for the canonical 6-instance shape.",
-            path.display()
-        );
-    }
+    // Rejects the example placeholder, a token reachable by group or other, and
+    // any count of token sources other than one.
+    let bearer = resolve_bearer_token(
+        parsed.global.token.as_deref(),
+        parsed.global.token_file.as_deref(),
+        std::env::var(BEARER_TOKEN_ENV).ok(),
+        path,
+    )?;
+    tracing::info!(source = bearer.source.label(), "bearer token resolved");
+
+    // Checked here, not only in `HttpConfig::validate`, so an exposed-origin
+    // trust posture is refused before bootstrap does any chain work.
+    resolve_declared_ranges(
+        parsed.global.trust_proxy_header.unwrap_or(false),
+        parsed.global.trusted_proxy_cidrs.as_deref().unwrap_or(&[]),
+    )
+    .map_err(|e| anyhow::anyhow!("[global] {e}"))?;
 
     Ok(MultiServeOptions {
         bind: parsed.global.bind,
-        token: parsed.global.token,
+        token: bearer.token,
         rpc_url: parsed.global.rpc_url,
         railgun_proxy: parsed.global.railgun_proxy,
         chain_id: parsed.global.chain_id,
@@ -604,6 +655,7 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         skip_chain_workers: false,
         skip_mirror_workers: false,
         entries: DEFAULT_PRODUCTION_ENTRIES,
+        instance_entries,
         bootstrap_observer: None,
         auto_spawn,
         rpc_pool: parsed.rpc_pool,
@@ -616,6 +668,7 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         rate_limit_burst: parsed.global.rate_limit_burst,
         cors_allowed_origins: parsed.global.cors_allowed_origins,
         trust_proxy_header: parsed.global.trust_proxy_header,
+        trusted_proxy_cidrs: parsed.global.trusted_proxy_cidrs,
         metrics_public: parsed.global.metrics_public,
         session_eviction_interval_secs: parsed.global.session_eviction_interval_secs,
         reorg_window_path: parsed.global.reorg_window_path,
@@ -833,11 +886,17 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     }
 
     let params = InspireParams::secure_128_d2048();
-    let entries = opts.entries.max(1);
+    let fleet_default_entries = opts.entries.max(1);
+    let smallest_cell_entries = opts
+        .instances
+        .iter()
+        .map(|cfg| entries_for_instance(&opts, cfg, fleet_default_entries))
+        .min()
+        .unwrap_or(fleet_default_entries);
 
-    warn_if_ifma52_small_cell(&opts, entries);
+    warn_if_ifma52_small_cell(&opts, smallest_cell_entries);
 
-    let bootstrap = bootstrap_instances(&opts, entries, &params)?;
+    let bootstrap = bootstrap_instances(&opts, fleet_default_entries, &params)?;
 
     let mut engine: Engine<RavenInspireScheme> = Engine::new();
     let mut k_map: HashMap<InstanceId, u32> =
@@ -949,6 +1008,9 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     }
     if let Some(trust) = opts.trust_proxy_header {
         http_config.trust_proxy_header = trust;
+    }
+    if let Some(cidrs) = opts.trusted_proxy_cidrs.clone() {
+        http_config.trusted_proxy_cidrs = cidrs;
     }
     if let Some(public) = opts.metrics_public {
         http_config.metrics_public = public;
@@ -1080,6 +1142,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     // Sweeper drops past-TTL session entries even if the bearer never repeats.
     let sweeper_handle = app_state.start_session_sweeper(std::time::Duration::from_secs(60));
     auxiliary_tasks.push(sweeper_handle);
+    auxiliary_tasks.push(app_state.start_packing_key_sweeper(std::time::Duration::from_secs(60)));
 
     // Per-instance heartbeat eviction bounds resident memory by dropping every
     // live session once per interval. `0` disables.
@@ -1752,37 +1815,55 @@ struct Bootstrap {
     handles: MultiOrchestratorHandle,
 }
 
+/// Row count `cfg` boots at: the resolved per-instance value, else `fleet_default`.
+fn entries_for_instance(
+    opts: &MultiServeOptions,
+    cfg: &InstanceConfig,
+    fleet_default: usize,
+) -> usize {
+    opts.instance_entries
+        .get(&cfg.instance_id)
+        .copied()
+        .unwrap_or(fleet_default)
+}
+
+fn validate_instance_cell_shape(
+    cfg: &InstanceConfig,
+    entries: usize,
+    ring_dim: usize,
+) -> anyhow::Result<()> {
+    raven_railgun_engine::pir_table::validate_cell_shape(
+        &cfg.encoder,
+        entries,
+        cfg.record_size.max(32),
+        ring_dim,
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "encoder cell shape rejected for instance {id}: {e}",
+            id = cfg.instance_id
+        )
+    })?;
+    raven_railgun_engine::pir_table::validate_rows_per_shard(cfg.entries_per_shard, ring_dim)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "[global] entries_per_shard rejected for instance {id}: {e}",
+                id = cfg.instance_id
+            )
+        })
+}
+
 fn bootstrap_instances(
     opts: &MultiServeOptions,
-    entries: usize,
+    fleet_default_entries: usize,
     params: &InspireParams,
 ) -> anyhow::Result<Bootstrap> {
     let mut state_holders: Vec<Option<InspireServerState>> =
         Vec::with_capacity(opts.instances.len());
     for cfg in &opts.instances {
         let entry_size = cfg.record_size.max(32);
-        raven_railgun_engine::pir_table::validate_cell_shape(
-            &cfg.encoder,
-            entries,
-            entry_size,
-            params.ring_dim,
-        )
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "encoder cell shape rejected for instance {id}: {e}",
-                id = cfg.instance_id
-            )
-        })?;
-        raven_railgun_engine::pir_table::validate_rows_per_shard(
-            cfg.entries_per_shard,
-            params.ring_dim,
-        )
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "[global] entries_per_shard rejected for instance {id}: {e}",
-                id = cfg.instance_id
-            )
-        })?;
+        let entries = entries_for_instance(opts, cfg, fleet_default_entries);
+        validate_instance_cell_shape(cfg, entries, params.ring_dim)?;
         let initial_db: Vec<u8> = (0..entries)
             .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).unwrap_or(0)))
             .collect();
@@ -2252,6 +2333,127 @@ data_source = { kind = "indexer", filter = { tree_number = 0 } }
         );
     }
 
+    fn config_with_global_extras(extras: &str) -> String {
+        format!(
+            r#"
+[global]
+bind = "127.0.0.1:0"
+rpc_url = "http://127.0.0.1:1"
+railgun_proxy = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
+chain_id = 1
+start_block = 0
+mirror_endpoint = "http://127.0.0.1:1"
+{extras}
+
+[[instance]]
+id = "tree-0"
+role = "static"
+encoder = "per-leaf-path"
+tree_number = 0
+data_dir = "/tmp/raven-tree-0"
+verification_mode = "chain-root-history"
+data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
+"#
+        )
+    }
+
+    #[test]
+    fn token_file_sources_the_bearer_token() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let token_path = dir.path().join("bearer-token");
+        std::fs::write(&token_path, "file-sourced-token-long-enough\n").expect("write token file");
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod token file");
+
+        let body =
+            config_with_global_extras(&format!("token_file = {:?}", token_path.to_string_lossy()));
+        let f = write_temp_toml(&body);
+        let opts = load_options_from_toml(f.path()).expect("token_file is a valid single source");
+        assert_eq!(opts.token, "file-sourced-token-long-enough");
+    }
+
+    #[test]
+    fn token_and_token_file_together_are_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let token_path = dir.path().join("bearer-token");
+        std::fs::write(&token_path, "file-sourced-token").expect("write token file");
+
+        let body = config_with_global_extras(&format!(
+            "token = \"inline-token-long-enough\"\ntoken_file = {:?}",
+            token_path.to_string_lossy()
+        ));
+        let f = write_temp_toml(&body);
+        let err = load_options_from_toml(f.path()).expect_err("two sources must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("[global].token,"), "{msg}");
+        assert!(msg.contains("[global].token_file"), "{msg}");
+    }
+
+    #[test]
+    fn no_token_source_at_all_is_rejected() {
+        let body = config_with_global_extras("");
+        let f = write_temp_toml(&body);
+        let err = load_options_from_toml(f.path()).expect_err("zero sources must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("RAVEN_BEARER_TOKEN"), "{msg}");
+    }
+
+    #[test]
+    fn trusted_proxy_cidrs_reach_the_serve_options() {
+        let body = config_with_global_extras(
+            "token = \"test-token-padded-long-enough\"\n\
+             trust_proxy_header = true\n\
+             trusted_proxy_cidrs = [\"127.0.0.1/32\", \"fd00::/8\"]",
+        );
+        let f = write_temp_toml(&body);
+        let opts = load_options_from_toml(f.path()).expect("parse");
+        assert_eq!(opts.trust_proxy_header, Some(true));
+        assert_eq!(
+            opts.trusted_proxy_cidrs.as_deref(),
+            Some(["127.0.0.1/32".to_owned(), "fd00::/8".to_owned()].as_slice())
+        );
+    }
+
+    #[test]
+    fn bare_trust_proxy_header_is_rejected_at_parse_time() {
+        let body = config_with_global_extras(
+            "token = \"test-token-padded-long-enough\"\ntrust_proxy_header = true",
+        );
+        let f = write_temp_toml(&body);
+        let err =
+            load_options_from_toml(f.path()).expect_err("unscoped proxy trust must not reach boot");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("trusted_proxy_cidrs"), "{msg}");
+    }
+
+    #[test]
+    fn trusted_proxy_cidrs_without_trust_are_rejected_at_parse_time() {
+        let body = config_with_global_extras(
+            "token = \"test-token-padded-long-enough\"\n\
+             trusted_proxy_cidrs = [\"127.0.0.1/32\"]",
+        );
+        let f = write_temp_toml(&body);
+        let err = load_options_from_toml(f.path())
+            .expect_err("ranges that cannot apply must not reach boot");
+        assert!(
+            format!("{err:#}").contains("trust_proxy_header = false"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_trusted_proxy_cidr_is_rejected_at_parse_time() {
+        let body = config_with_global_extras(
+            "token = \"test-token-padded-long-enough\"\n\
+             trust_proxy_header = true\n\
+             trusted_proxy_cidrs = [\"172.16.0.1/12\"]",
+        );
+        let f = write_temp_toml(&body);
+        let err = load_options_from_toml(f.path()).expect_err("host bits must be rejected");
+        assert!(format!("{err:#}").contains("172.16.0.0/12"), "{err:#}");
+    }
+
     #[test]
     fn ifma52_small_cell_threshold_predicate() {
         let body = r#"
@@ -2287,6 +2489,9 @@ data_source = { kind = "indexer", filter = { tree_number = 0 } }
             "entries < 2^16 must breach the small-cell threshold"
         );
 
+        // Encoder switched from per-leaf-path to per-leaf-bc: path encoders pin
+        // PATH_RECORD_BYTES, so `[global].record_size = 32` no longer reaches the
+        // instance and the 32-byte cell this case exists to pin would vanish.
         let body_small = r#"
 [global]
 bind = "127.0.0.1:0"
@@ -2301,8 +2506,7 @@ record_size = 32
 [[instance]]
 id = "tree-0"
 role = "static"
-encoder = "per-leaf-path"
-tree_number = 0
+encoder = "per-leaf-bc"
 data_dir = "/tmp/raven-tree-0"
 verification_mode = "chain-root-history"
 data_source = { kind = "indexer", filter = { tree_number = 0 } }
@@ -2313,6 +2517,273 @@ data_source = { kind = "indexer", filter = { tree_number = 0 } }
             ifma52_small_cell_threshold_breached(&opts_small, 1usize << 16),
             "record_size <= 32 must breach the small-cell threshold even at 2^16 entries"
         );
+    }
+
+    #[test]
+    fn record_size_resolves_per_instance() {
+        let body = r#"
+[global]
+bind = "127.0.0.1:0"
+token = "test-token-padded-long-enough"
+rpc_url = "http://127.0.0.1:1"
+railgun_proxy = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
+chain_id = 1
+start_block = 0
+mirror_endpoint = "http://127.0.0.1:1"
+record_size = 512
+
+[[instance]]
+id = "commit-tree-0"
+role = "live"
+encoder = "per-node"
+tree_number = 0
+data_dir = "/tmp/raven-commit-tree-0"
+verification_mode = "chain-root-history"
+data_source = { kind = "indexer", filter = { tree_number = 0 } }
+
+[[instance]]
+id = "ppoi-paths"
+role = "live"
+encoder = "per-list-node"
+list_key = "0000000000000000000000000000000000000000000000000000000000000001"
+data_dir = "/tmp/raven-ppoi-paths"
+verification_mode = "upstream-signature"
+data_source = { kind = "mirror", list_key = "0000000000000000000000000000000000000000000000000000000000000001" }
+
+[[instance]]
+id = "ppoi-status"
+role = "live"
+encoder = "per-list-status"
+list_key = "0000000000000000000000000000000000000000000000000000000000000001"
+data_dir = "/tmp/raven-ppoi-status"
+verification_mode = "upstream-signature"
+data_source = { kind = "mirror", list_key = "0000000000000000000000000000000000000000000000000000000000000001", what = "status" }
+
+[[instance]]
+id = "ppoi-status-wide"
+role = "live"
+encoder = "per-list-status"
+list_key = "0000000000000000000000000000000000000000000000000000000000000001"
+record_size = 128
+data_dir = "/tmp/raven-ppoi-status-wide"
+verification_mode = "upstream-signature"
+data_source = { kind = "mirror", list_key = "0000000000000000000000000000000000000000000000000000000000000001", what = "status" }
+"#;
+        let f = write_temp_toml(body);
+        let opts = load_options_from_toml(f.path()).expect("parse");
+        let width = |id: &str| {
+            opts.instances
+                .iter()
+                .find(|i| i.instance_id.as_str() == id)
+                .unwrap_or_else(|| panic!("instance {id} missing"))
+                .record_size
+        };
+
+        let node_hash = raven_railgun_engine::pir_table::NODE_HASH_BYTES;
+        assert_eq!(
+            width("commit-tree-0"),
+            node_hash,
+            "per-node pins its canonical width over [global].record_size"
+        );
+        assert_eq!(
+            width("ppoi-paths"),
+            node_hash,
+            "per-list-node pins its canonical width over [global].record_size"
+        );
+        assert_eq!(
+            width("ppoi-status"),
+            512,
+            "an encoder without a canonical width inherits [global].record_size"
+        );
+        assert_eq!(
+            width("ppoi-status-wide"),
+            128,
+            "a per-instance record_size overrides [global].record_size"
+        );
+
+        let ring_dim = InspireParams::secure_128_d2048().ring_dim;
+        for cfg in &opts.instances {
+            let entries = entries_for_instance(&opts, cfg, DEFAULT_PRODUCTION_ENTRIES);
+            validate_instance_cell_shape(cfg, entries, ring_dim)
+                .unwrap_or_else(|e| panic!("instance {} rejected: {e}", cfg.instance_id));
+        }
+    }
+
+    const OFAC_LIST_KEY: &str = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88";
+
+    /// The deployed topology: 3 static + 1 live commit-tree on `per-node`,
+    /// one `per-list-status` and one `per-list-node` PPOI instance.
+    fn live_six_instance_toml(entries_override: Option<usize>) -> String {
+        use std::fmt::Write as _;
+        let mut body = String::from(
+            r#"
+[global]
+bind = "127.0.0.1:0"
+token = "test-token-padded-long-enough"
+rpc_url = "http://127.0.0.1:1"
+railgun_proxy = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
+chain_id = 1
+start_block = 14737691
+mirror_endpoint = "http://127.0.0.1:1"
+record_size = 512
+"#,
+        );
+        for tree in 0..4u32 {
+            let role = if tree == 3 { "live" } else { "static" };
+            let entries_line = match entries_override {
+                Some(n) => format!("entries = {n}\n"),
+                None => String::new(),
+            };
+            write!(
+                body,
+                r#"
+[[instance]]
+id = "commit-tree-{tree}"
+role = "{role}"
+encoder = "per-node"
+tree_number = {tree}
+{entries_line}data_dir = "/tmp/raven-commit-tree-{tree}"
+verification_mode = "chain-root-history"
+data_source = {{ kind = "indexer", filter = {{ tree_number = {tree} }} }}
+"#
+            )
+            .expect("String writes are infallible");
+        }
+        write!(
+            body,
+            r#"
+[[instance]]
+id = "ppoi-status-ofac"
+role = "live"
+encoder = "per-list-status"
+list_key = "{OFAC_LIST_KEY}"
+data_dir = "/tmp/raven-ppoi-status-ofac"
+verification_mode = "upstream-signature"
+data_source = {{ kind = "mirror", list_key = "{OFAC_LIST_KEY}", what = "status" }}
+
+[[instance]]
+id = "ppoi-paths-ofac"
+role = "live"
+encoder = "per-list-node"
+list_key = "{OFAC_LIST_KEY}"
+data_dir = "/tmp/raven-ppoi-paths-ofac"
+verification_mode = "upstream-signature"
+data_source = {{ kind = "mirror", list_key = "{OFAC_LIST_KEY}", what = "path" }}
+"#
+        )
+        .expect("String writes are infallible");
+        body
+    }
+
+    fn resolved_entries(opts: &MultiServeOptions, id: &str) -> usize {
+        let cfg = opts
+            .instances
+            .iter()
+            .find(|i| i.instance_id.as_str() == id)
+            .unwrap_or_else(|| panic!("instance {id} missing"));
+        entries_for_instance(opts, cfg, DEFAULT_PRODUCTION_ENTRIES)
+    }
+
+    #[test]
+    fn every_live_instance_shape_resolves_a_bootable_cell() {
+        let f = write_temp_toml(&live_six_instance_toml(None));
+        let opts = load_options_from_toml(f.path()).expect("parse");
+        assert_eq!(opts.instances.len(), 6);
+
+        for tree in 0..4u32 {
+            assert_eq!(
+                resolved_entries(&opts, &format!("commit-tree-{tree}")),
+                131_072,
+                "per-node resolves its canonical total"
+            );
+        }
+        assert_eq!(resolved_entries(&opts, "ppoi-paths-ofac"), 131_072);
+        assert_eq!(
+            resolved_entries(&opts, "ppoi-status-ofac"),
+            DEFAULT_PRODUCTION_ENTRIES,
+            "leaf-keyed encoders keep the 65,536-row cell; a fleet-wide total would double it"
+        );
+
+        let ring_dim = InspireParams::secure_128_d2048().ring_dim;
+        for cfg in &opts.instances {
+            let entries = entries_for_instance(&opts, cfg, DEFAULT_PRODUCTION_ENTRIES);
+            validate_instance_cell_shape(cfg, entries, ring_dim).unwrap_or_else(|e| {
+                panic!(
+                    "instance {} rejected at its resolved cell: {e}",
+                    cfg.instance_id
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn a_fleet_wide_default_production_entries_rejects_the_node_family() {
+        let f = write_temp_toml(&live_six_instance_toml(None));
+        let opts = load_options_from_toml(f.path()).expect("parse");
+        let ring_dim = InspireParams::secure_128_d2048().ring_dim;
+
+        let rejected: Vec<&str> = opts
+            .instances
+            .iter()
+            .filter(|cfg| {
+                validate_instance_cell_shape(cfg, DEFAULT_PRODUCTION_ENTRIES, ring_dim).is_err()
+            })
+            .map(|cfg| cfg.instance_id.as_str())
+            .collect();
+        assert_eq!(
+            rejected,
+            [
+                "commit-tree-0",
+                "commit-tree-1",
+                "commit-tree-2",
+                "commit-tree-3",
+                "ppoi-paths-ofac",
+            ],
+            "one global row count cannot serve both encoder families"
+        );
+    }
+
+    #[test]
+    fn an_undersized_per_instance_entries_is_rejected_with_an_actionable_error() {
+        let f = write_temp_toml(&live_six_instance_toml(Some(DEFAULT_PRODUCTION_ENTRIES)));
+        let opts = load_options_from_toml(f.path()).expect("parse");
+        let ring_dim = InspireParams::secure_128_d2048().ring_dim;
+        let cfg = opts
+            .instances
+            .iter()
+            .find(|i| i.instance_id.as_str() == "commit-tree-3")
+            .expect("instance present");
+        assert_eq!(
+            entries_for_instance(&opts, cfg, 0),
+            DEFAULT_PRODUCTION_ENTRIES,
+            "an explicit entries value is carried verbatim, not substituted"
+        );
+
+        let err = validate_instance_cell_shape(cfg, DEFAULT_PRODUCTION_ENTRIES, ring_dim)
+            .expect_err("65,536 rows undersize the per-node flat-index layout")
+            .to_string();
+        for needle in ["commit-tree-3", "per-node", "65536", "131071"] {
+            assert!(err.contains(needle), "error {err:?} must name {needle}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_per_instance_entries_overrides_the_encoder_default() {
+        let f = write_temp_toml(&live_six_instance_toml(Some(262_144)));
+        let opts = load_options_from_toml(f.path()).expect("parse");
+        assert_eq!(resolved_entries(&opts, "commit-tree-0"), 262_144);
+        assert_eq!(
+            resolved_entries(&opts, "ppoi-status-ofac"),
+            DEFAULT_PRODUCTION_ENTRIES,
+            "the override is per-instance, not fleet-wide"
+        );
+
+        let ring_dim = InspireParams::secure_128_d2048().ring_dim;
+        for cfg in &opts.instances {
+            let entries = entries_for_instance(&opts, cfg, DEFAULT_PRODUCTION_ENTRIES);
+            validate_instance_cell_shape(cfg, entries, ring_dim)
+                .unwrap_or_else(|e| panic!("instance {} rejected: {e}", cfg.instance_id));
+        }
     }
 
     #[test]

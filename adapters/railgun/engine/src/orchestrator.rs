@@ -26,8 +26,13 @@ pub async fn indexer_to_consumer_bridge(
             } => ConsumerEvent::Chain(event, block_height),
             IndexerMessage::Reorg { height } => ConsumerEvent::Reorg(height),
             IndexerMessage::Heartbeat {
-                chain_head_block, ..
-            } => ConsumerEvent::Heartbeat(chain_head_block),
+                chain_head_block,
+                scanned_through_block,
+                ..
+            } => ConsumerEvent::Heartbeat {
+                chain_head: chain_head_block,
+                scanned_through: scanned_through_block,
+            },
         };
         if tx.send(translated).await.is_err() {
             tracing::info!("indexer_to_consumer_bridge: consumer channel closed; exiting");
@@ -774,11 +779,18 @@ async fn forward_indexer_message(
             }
         }
         IndexerMessage::Heartbeat {
-            chain_head_block, ..
+            chain_head_block,
+            scanned_through_block,
+            ..
         } => {
             let routes = chain_tree_routes.load();
             for (_, tx) in routes.iter() {
-                let _ = tx.send(ConsumerEvent::Heartbeat(chain_head_block)).await;
+                let _ = tx
+                    .send(ConsumerEvent::Heartbeat {
+                        chain_head: chain_head_block,
+                        scanned_through: scanned_through_block,
+                    })
+                    .await;
             }
         }
     }

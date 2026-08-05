@@ -45,6 +45,7 @@ async fn indexer_bridge_translates_event_reorg_heartbeat() {
         .send(IndexerMessage::Heartbeat {
             wallclock_unix_ms: 1_700_000_000,
             chain_head_block: 200,
+            scanned_through_block: 198,
         })
         .await
         .expect("send heartbeat");
@@ -72,7 +73,13 @@ async fn indexer_bridge_translates_event_reorg_heartbeat() {
         .await
         .expect("recv 3")
         .expect("event present");
-    assert!(matches!(got, ConsumerEvent::Heartbeat(200)));
+    assert!(matches!(
+        got,
+        ConsumerEvent::Heartbeat {
+            chain_head: 200,
+            scanned_through: 198,
+        }
+    ));
 
     drop(idx_tx);
     tokio::time::timeout(Duration::from_secs(2), bridge)
@@ -124,6 +131,7 @@ async fn indexer_bridge_exits_when_consumer_closes() {
         .send(IndexerMessage::Heartbeat {
             wallclock_unix_ms: 0,
             chain_head_block: 0,
+            scanned_through_block: 0,
         })
         .await;
     tokio::time::timeout(Duration::from_secs(2), bridge)

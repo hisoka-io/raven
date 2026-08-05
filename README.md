@@ -35,6 +35,14 @@ Live demo: <https://demo.railgun.hisoka.io/>
 
 ## Build
 
+`crates/inspire` is a git submodule and the root workspace does not resolve without it:
+
+```bash
+git clone --recursive https://github.com/hisoka-io/raven.git
+# already cloned without --recursive:
+git submodule update --init --recursive
+```
+
 ```bash
 cargo test --workspace
 cargo check -p raven-client --target wasm32-unknown-unknown

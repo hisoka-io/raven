@@ -1,7 +1,7 @@
 //! WAL replay scaling bench (`#[ignore]`-gated).
 //!
 //! Measures `Wal::replay()` wall-clock at 1k/10k/100k entries (3-seed median).
-//! Run: `cargo test --release -p raven-railgun-persistence --test wal_replay_scaling_bench -- --ignored --nocapture`
+//! Run: `cargo test --release -p raven-railgun-persistence --bench wal_replay_scaling_bench -- --ignored --nocapture`
 
 #![allow(
     clippy::expect_used,

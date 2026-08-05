@@ -138,17 +138,36 @@ fn poi_status_to_str(byte: u8) -> &'static str {
 type PoisPerListMap =
     std::collections::BTreeMap<HexHash, std::collections::BTreeMap<HexHash, String>>;
 
+/// Element caps on the shim request vectors.
+///
+/// These handlers run under the global [`LogicalLeafStore`] mutex, which the
+/// block-commit path also takes mutably, so an oversized body stalls the
+/// indexer for as long as it runs. The `pois-per-list` work is the product of
+/// the two vectors; capping each alone still admits 8 MiB x 8 MiB worth of
+/// pairs, so the product is capped too.
+const MAX_SHIM_LIST_KEYS: usize = 64;
+const MAX_SHIM_BLINDED_COMMITMENTS: usize = 1024;
+const MAX_SHIM_LOOKUP_PAIRS: usize = 16_384;
+
 pub(crate) async fn pois_per_list_handler<S: PirScheme>(
     State(app): State<AppState<S>>,
     Json(req): Json<PoisPerListRequest>,
 ) -> Result<Json<PoisPerListMap>, StatusCode> {
+    if req.list_keys.len() > MAX_SHIM_LIST_KEYS
+        || req.blinded_commitment_datas.len() > MAX_SHIM_BLINDED_COMMITMENTS
+        || req
+            .list_keys
+            .len()
+            .saturating_mul(req.blinded_commitment_datas.len())
+            > MAX_SHIM_LOOKUP_PAIRS
+    {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
     let store = app
         .logical_store
         .as_ref()
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let mut out: PoisPerListMap = PoisPerListMap::new();
-    let store = store.lock();
 
     let list_keys: Vec<[u8; 32]> = req
         .list_keys
@@ -158,14 +177,23 @@ pub(crate) async fn pois_per_list_handler<S: PirScheme>(
     if list_keys.len() != req.list_keys.len() {
         return Err(StatusCode::BAD_REQUEST);
     }
+    let blinded_commitments: Vec<[u8; 32]> = req
+        .blinded_commitment_datas
+        .iter()
+        .filter_map(|d| hex_decode_32(&d.blinded_commitment))
+        .collect();
+    if blinded_commitments.len() != req.blinded_commitment_datas.len() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
-    for bc_data in &req.blinded_commitment_datas {
-        let bc = hex_decode_32(&bc_data.blinded_commitment).ok_or(StatusCode::BAD_REQUEST)?;
-        let bc_hex = hex_encode(&bc);
+    let mut out: PoisPerListMap = PoisPerListMap::new();
+    let store = store.lock();
+    for bc in &blinded_commitments {
+        let bc_hex = hex_encode(bc);
         let mut per_list: std::collections::BTreeMap<HexHash, String> =
             std::collections::BTreeMap::new();
         for (list_key_hex, list_key) in req.list_keys.iter().zip(list_keys.iter()) {
-            let status_str = match store.ppoi_status(list_key, &bc) {
+            let status_str = match store.ppoi_status(list_key, bc) {
                 Some(byte) => poi_status_to_str(byte),
                 None => "Missing",
             };
@@ -180,23 +208,33 @@ pub(crate) async fn merkle_proofs_handler<S: PirScheme>(
     State(app): State<AppState<S>>,
     Json(req): Json<MerkleProofsRequest>,
 ) -> Result<Json<Vec<MerkleProofJson>>, StatusCode> {
+    if req.blinded_commitments.len() > MAX_SHIM_BLINDED_COMMITMENTS {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
     let store = app
         .logical_store
         .as_ref()
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let list_key = hex_decode_32(&req.list_key).ok_or(StatusCode::BAD_REQUEST)?;
+    let blinded_commitments: Vec<[u8; 32]> = req
+        .blinded_commitments
+        .iter()
+        .filter_map(|s| hex_decode_32(s))
+        .collect();
+    if blinded_commitments.len() != req.blinded_commitments.len() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let store = store.lock();
-    let mut proofs = Vec::with_capacity(req.blinded_commitments.len());
-    for bc_hex in &req.blinded_commitments {
-        let bc = hex_decode_32(bc_hex).ok_or(StatusCode::BAD_REQUEST)?;
+    let mut proofs = Vec::with_capacity(blinded_commitments.len());
+    for bc in &blinded_commitments {
         let idx = store
-            .ppoi_index_of(&list_key, &bc)
+            .ppoi_index_of(&list_key, bc)
             .ok_or(StatusCode::NOT_FOUND)?;
         let proof = store
             .ppoi_merkle_proof(&list_key, idx)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        proofs.push(MerkleProofJson::from_core(&proof, hex_encode(&bc)));
+        proofs.push(MerkleProofJson::from_core(&proof, hex_encode(bc)));
     }
     Ok(Json(proofs))
 }

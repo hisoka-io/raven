@@ -267,6 +267,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     // Sweeper drops past-TTL session entries even if the bearer never repeats.
     let mut auxiliary_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     auxiliary_tasks.push(app_state.start_session_sweeper(std::time::Duration::from_secs(60)));
+    auxiliary_tasks.push(app_state.start_packing_key_sweeper(std::time::Duration::from_secs(60)));
 
     // Heartbeat eviction bounds resident memory under bearer churn by dropping
     // every live session once per interval. `0` disables.

@@ -2,7 +2,7 @@
 //!
 //! Run via:
 //!   cargo test --manifest-path crates/raven-railgun-adapter/Cargo.toml \
-//!     -p raven-railgun-mock-ppoi --release --test populate_bench \
+//!     -p raven-railgun-mock-ppoi --release --bench populate_bench \
 //!     -- --ignored --nocapture
 //!
 //! The test is `#[ignore]`-gated so the regular suite stays fast.

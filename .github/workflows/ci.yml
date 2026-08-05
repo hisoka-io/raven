@@ -84,6 +84,41 @@ jobs:
           token: ${{ secrets.SUBMODULE_TOKEN }}
       - name: check-hygiene
         run: adapters/railgun/scripts/check-hygiene.sh
+      - name: check-repo-hygiene
+        run: scripts/check-repo-hygiene.sh
+
+  advisories:
+    name: cargo-deny advisories (every workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-deny
+        run: cargo install cargo-deny --version ^0.19 --locked
+      - name: check advisories
+        # detached workspaces are invisible to the root graph, so each manifest
+        # is gated separately. deny.toml carries the accepted-risk ignores.
+        run: |
+          set -euo pipefail
+          for manifest in \
+            Cargo.toml \
+            adapters/railgun/Cargo.toml \
+            crates/inspire/Cargo.toml \
+            crates/isimplepir/Cargo.toml \
+            crates/binary-fuse-filter/Cargo.toml \
+            examples/eth-state/Cargo.toml \
+            benches/b1-bench/Cargo.toml \
+            benches/b2-bench/Cargo.toml \
+            tools/bench-compare/Cargo.toml
+          do
+            echo "::group::cargo-deny $manifest"
+            cargo deny --manifest-path "$manifest" --all-features check -c deny.toml advisories
+            echo "::endgroup::"
+          done
 
   secret-scan:
     name: secret scan (gitleaks)
@@ -226,6 +261,68 @@ jobs:
         run: sccache --show-stats
         if: always()
 
+  durability-and-closure:
+    # The crash-safety and PIR-closure corpora are `#[ignore]`-gated for local
+    # wall time and therefore ran in NO lane at all. Measured on a Zen 5 box:
+    # crash-safety 253 s / 16 tests, closure + recovery 113 s / 9 tests, all green.
+    # Nothing here is a benchmark; every test asserts byte identity or recovery.
+    name: durability + closure (${{ matrix.lane.name }}, --run-ignored all)
+    needs: railgun-static
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        lane:
+          - name: crash-safety
+            packages: "-p raven-railgun-cli"
+            nextest_profile: ci
+            filter: "binary(migrate_encoder_real_sigkill) + binary(migrate_encoder_kill_during) + binary(auto_spawn_races)"
+          - name: closure
+            packages: "-p raven-railgun-engine"
+            # production-cell, not ci: multi_instance_recovery_byte_identity
+            # measures 113 s on a 16-core box and would trip ci's 120 s x 3 cap
+            # on a 4-vCPU runner
+            nextest_profile: production-cell
+            filter: "binary(t1_status_closure) + binary(t2_path_closure) + binary(t3_commit_tree_path_closure) + binary(phase4_closure) + binary(multi_instance_recovery) + binary(multi_instance_reorg_cascade)"
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=lld"
+    steps:
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install lld linker
+        run: sudo apt-get update && sudo apt-get install -y lld
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "railgun-tests"
+      - uses: taiki-e/install-action@nextest
+      - name: cargo nextest (ignored included)
+        run: |
+          cargo nextest run \
+            --manifest-path adapters/railgun/Cargo.toml \
+            ${{ matrix.lane.packages }} \
+            --cargo-profile ci-test \
+            --profile ${{ matrix.lane.nextest_profile }} \
+            --run-ignored all \
+            -E '${{ matrix.lane.filter }}'
+      - name: sccache stats
+        run: sccache --show-stats
+        if: always()
+
   production-cell-closure:
     # nightly + on-demand. Runs the production-parameter (ring_dim 2048) cell-shape
     # closure tests with --run-ignored all. A wrong cell shape does not error, it
@@ -238,8 +335,8 @@ jobs:
     # the evidence the width law is derived from.
     #
     # The filter is an explicit binary list, not `-p raven-railgun-engine`:
-    # --run-ignored all over the whole package would also start the ignored
-    # multi-instance and fill-sweep benches, which run for tens of minutes.
+    # --run-ignored all over the whole package would also start the remaining
+    # ignored heavy tests, which run for tens of minutes.
     name: production-cell closure (d=2048, --run-ignored all)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -486,6 +583,11 @@ jobs:
         run: adapters/railgun/scripts/check-wasm-bundle-size.sh
       - name: pnpm install
         run: pnpm install --frozen-lockfile
+        working-directory: adapters/railgun/sdk
+      - name: pnpm typecheck
+        # must run from the SDK directory: a repo-root `tsc` resolves nothing
+        # and exits 0, which is why 15 type errors survived here unnoticed
+        run: pnpm typecheck
         working-directory: adapters/railgun/sdk
       - name: pnpm test
         run: pnpm test

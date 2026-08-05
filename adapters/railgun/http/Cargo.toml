@@ -39,6 +39,7 @@ async-stream = "0.3"
 
 [dev-dependencies]
 tower = { workspace = true }
+proptest = { workspace = true }
 http-body-util = "0.1"
 serde_json = { workspace = true }
 raven-railgun-persistence = { workspace = true }

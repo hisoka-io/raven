@@ -2,8 +2,15 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::trusted_proxy::{resolve_declared_ranges, IpCidr};
+
 /// Sanity ceiling for [`HttpConfig::max_body_bytes`]; rejected at validate time.
 pub(crate) const HTTP_MAX_BODY_CEILING: usize = 64 * 1024 * 1024;
+
+/// Sanity ceiling for [`HttpConfig::max_fanout_shards`]; rejected at validate time.
+/// One request already costs k respond operations, so the cap is the only bound
+/// on request amplification.
+pub(crate) const HTTP_MAX_FANOUT_CEILING: usize = 128;
 
 /// HTTP layer configuration; all knobs are tunable without recompiling.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -29,9 +36,14 @@ pub struct HttpConfig {
     /// Per-query response timeout in seconds. A timed-out worker releases
     /// its semaphore permit so subsequent queries aren't blocked indefinitely.
     pub respond_timeout_secs: u64,
-    /// When `true`, uses `SmartIpKeyExtractor` (reads `X-Forwarded-For`).
-    /// Only safe behind a trusted reverse proxy that strips client-supplied headers.
+    /// Enables forwarding-header trust. Requires a non-empty
+    /// [`HttpConfig::trusted_proxy_cidrs`]; the pair is validated together.
     pub trust_proxy_header: bool,
+    /// Peer ranges (CIDR, e.g. `127.0.0.1/32`, `172.16.0.0/12`, `fd00::/8`) whose
+    /// `X-Forwarded-For` / `cf-connecting-ip` is honoured. Every other peer keys
+    /// to its own socket address.
+    #[serde(default)]
+    pub trusted_proxy_cidrs: Vec<String>,
     /// Explicit CORS origins. Empty = no CORS layer. Never use `["*"]`
     /// on an authenticated PIR server.
     #[serde(default)]
@@ -44,10 +56,17 @@ pub struct HttpConfig {
     /// Periodic heartbeat session-eviction interval (seconds). `0` disables.
     #[serde(default = "default_session_eviction_interval_secs")]
     pub session_eviction_interval_secs: u64,
+    /// Max shard ids accepted per `POST /v1/instance/{id}/fanout` request.
+    #[serde(default = "default_max_fanout_shards")]
+    pub max_fanout_shards: usize,
 }
 
 fn default_session_eviction_interval_secs() -> u64 {
     3600
+}
+
+fn default_max_fanout_shards() -> usize {
+    16
 }
 
 impl HttpConfig {
@@ -68,9 +87,11 @@ impl HttpConfig {
             scheme_name: "raven-inspire".to_owned(),
             respond_timeout_secs: 30,
             trust_proxy_header: false,
+            trusted_proxy_cidrs: Vec::new(),
             cors_allowed_origins: Vec::new(),
             metrics_public: false,
             session_eviction_interval_secs: 3600,
+            max_fanout_shards: default_max_fanout_shards(),
         }
     }
 
@@ -114,6 +135,87 @@ impl HttpConfig {
                 self.max_body_bytes, HTTP_MAX_BODY_CEILING
             ));
         }
+        if self.max_fanout_shards == 0 {
+            return Err("max_fanout_shards must be > 0".to_owned());
+        }
+        if self.max_fanout_shards > HTTP_MAX_FANOUT_CEILING {
+            return Err(format!(
+                "max_fanout_shards too large: {} (sanity ceiling {})",
+                self.max_fanout_shards, HTTP_MAX_FANOUT_CEILING
+            ));
+        }
+        self.resolve_trusted_proxy_ranges()?;
         Ok(())
+    }
+
+    /// Parse the trusted-proxy ranges, enforcing agreement with `trust_proxy_header`.
+    ///
+    /// Returns an empty vector when proxy trust is off.
+    ///
+    /// # Errors
+    /// `Err(String)` when the two fields disagree or an entry fails to parse.
+    pub fn resolve_trusted_proxy_ranges(&self) -> Result<Vec<IpCidr>, String> {
+        resolve_declared_ranges(self.trust_proxy_header, &self.trusted_proxy_cidrs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> HttpConfig {
+        HttpConfig::demo("read-token-padded-long-enough")
+    }
+
+    #[test]
+    fn default_posture_trusts_no_proxy() {
+        let cfg = config();
+        assert!(!cfg.trust_proxy_header);
+        assert!(cfg.trusted_proxy_cidrs.is_empty());
+        assert_eq!(
+            cfg.resolve_trusted_proxy_ranges()
+                .expect("default is valid"),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn trust_without_ranges_is_rejected() {
+        let mut cfg = config();
+        cfg.trust_proxy_header = true;
+        let err = cfg.validate().expect_err("bare boolean trust is rejected");
+        assert!(err.contains("trusted_proxy_cidrs"), "{err}");
+        assert!(err.contains("directly reachable"), "{err}");
+    }
+
+    #[test]
+    fn ranges_without_trust_are_rejected() {
+        let mut cfg = config();
+        cfg.trusted_proxy_cidrs = vec!["127.0.0.1/32".to_owned()];
+        let err = cfg
+            .validate()
+            .expect_err("ranges that cannot apply are rejected");
+        assert!(err.contains("trust_proxy_header = false"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_range_fails_validation_with_the_entry_named() {
+        let mut cfg = config();
+        cfg.trust_proxy_header = true;
+        cfg.trusted_proxy_cidrs = vec!["127.0.0.1/32".to_owned(), "10.0.0.1/8".to_owned()];
+        let err = cfg.validate().expect_err("host bits are rejected");
+        assert!(err.contains("10.0.0.1/8"), "{err}");
+    }
+
+    #[test]
+    fn a_declared_proxy_range_validates_and_resolves() {
+        let mut cfg = config();
+        cfg.trust_proxy_header = true;
+        cfg.trusted_proxy_cidrs = vec!["127.0.0.1/32".to_owned(), "fd00::/8".to_owned()];
+        cfg.validate().expect("declared ranges validate");
+        assert_eq!(
+            cfg.resolve_trusted_proxy_ranges().expect("resolves").len(),
+            2
+        );
     }
 }

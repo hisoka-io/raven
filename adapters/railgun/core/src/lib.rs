@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod batch_ladder;
+
 /// Generic server-runtime identity and error types, re-exported from `raven-core`
 /// so existing `raven_railgun_core::{InstanceId, Epoch, AdapterError}` import
 /// sites keep compiling. The definitions live in `raven-core`.

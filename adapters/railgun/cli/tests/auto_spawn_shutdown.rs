@@ -169,6 +169,7 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
         skip_chain_workers: true,
         skip_mirror_workers: true,
         entries: TOY_ENTRIES,
+        instance_entries: std::collections::HashMap::new(),
         bootstrap_observer: Some(Arc::clone(&observer)),
         auto_spawn: Some(AutoSpawnConfigToml {
             enabled: true,
@@ -190,6 +191,7 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
         rate_limit_burst: None,
         cors_allowed_origins: None,
         trust_proxy_header: None,
+        trusted_proxy_cidrs: None,
         metrics_public: None,
         session_eviction_interval_secs: None,
         reorg_window_path: None,

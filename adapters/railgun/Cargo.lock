@@ -3757,6 +3757,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "parking_lot",
+ "proptest",
  "raven-inspire",
  "raven-railgun-core",
  "raven-railgun-engine",

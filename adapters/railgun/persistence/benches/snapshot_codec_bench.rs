@@ -1,7 +1,7 @@
 //! Codec bench: bincode vs bitcode on 32k `AppendLeaf` entries (~1.6 MiB).
 //! Borsh absent: requires derive traits not on `WalEntryPayload` (structural blocker).
 //!
-//! Run: cargo test --release -p raven-railgun-persistence --test snapshot_codec_bench -- --ignored --nocapture
+//! Run: cargo test --release -p raven-railgun-persistence --bench snapshot_codec_bench -- --ignored --nocapture
 
 #![allow(
     clippy::expect_used,
