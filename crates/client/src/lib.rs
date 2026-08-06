@@ -1,9 +1,10 @@
 //! Wasm-compatible PIR client surface for Raven: query construction and response
 //! extraction across the JS/Wasm boundary.
 //!
-//! This surface is InsPIRe-typed (`InspireParams`/`ShardConfig`; forces
-//! `PackingMode::Inspiring` to match the server's packing configuration). All
-//! complex Rust types cross the JS boundary as bincode-encoded `Vec<u8>`. See
+//! This surface is InsPIRe-typed (`InspireParams`/`ShardConfig`). The packing
+//! mode is whatever the session derived from the CRS and whatever the server
+//! tagged the response with; this layer never overrides either. All complex Rust
+//! types cross the JS boundary as bincode-encoded `Vec<u8>`. See
 //! `tests/parity_native_vs_wasm.rs` for byte-equality tests against a native
 //! Rust client.
 //!
@@ -20,8 +21,8 @@ use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, ShardConfig};
 use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::{
-    extract_inspiring, ClientSession, ClientState, PackingMode, SeededClientQuery, ServerCrs,
-    ServerResponse, SessionResidue,
+    extract_two_packing, ClientSession, ClientState, SeededClientQuery, ServerCrs, ServerResponse,
+    SessionResidue,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -252,14 +253,13 @@ pub fn build_seeded_query(
     let shard_config: ShardConfig = decode(shard_config_bincode, "shard_config")?;
     // reused query noise lets the server re-encrypt each candidate index and match bytes
     let mut sampler = os_seeded_sampler(session.params.sigma, "seeded_query_noise")?;
-    let (client_state, mut query) = session
+    let (client_state, query) = session
         .inner
         .query_seeded(target_idx, &shard_config, &mut sampler)
         .map_err(|e| WasmClientError::Inspire {
             op: "ClientSession::query_seeded",
             detail: e.to_string(),
         })?;
-    query.packing_mode = PackingMode::Inspiring;
     let client_state_bincode = encode(&client_state, "client_state")?;
     let query_bytes = encode(&query, "seeded_client_query")?;
     let bundle = WasmSeededQueryOutput {
@@ -269,7 +269,8 @@ pub fn build_seeded_query(
     Ok(encode(&bundle, "wasm_seeded_query_output")?)
 }
 
-/// Decode a server response to plaintext row bytes via [`extract_inspiring`].
+/// Decode a server response to plaintext row bytes, dispatching on the server's
+/// declared packing mode.
 ///
 /// `client_state_bincode` is the [`build_seeded_query`] output. Its
 /// `rlwe_secret_key` is `#[serde(skip)]`, so it arrives default-built (empty
@@ -285,12 +286,12 @@ pub fn extract_response(
 ) -> Result<Vec<u8>, JsValue> {
     let crs = decode_versioned_crs(crs_bincode)?;
     let mut client_state: ClientState = decode(client_state_bincode, "client_state")?;
-    // rehydrate serde-skipped key; extract_inspiring reads only rlwe_secret_key
+    // rehydrate serde-skipped key; extraction reads only rlwe_secret_key
     client_state.rlwe_secret_key = session.inner.rlwe_secret_key().clone();
     let response: ServerResponse = decode(response_bytes, "server_response")?;
-    let plaintext = extract_inspiring(&crs, &client_state, &response, entry_size as usize)
+    let plaintext = extract_two_packing(&crs, &client_state, &response, entry_size as usize)
         .map_err(|e| WasmClientError::Inspire {
-            op: "extract_inspiring",
+            op: "extract_two_packing",
             detail: e.to_string(),
         })?;
     Ok(plaintext)
@@ -477,10 +478,9 @@ fn seeded_query_with_sampler(
     target_idx: u64,
     sampler: &mut GaussianSampler,
 ) -> Result<(ClientState, SeededClientQuery), String> {
-    let (state, mut query) = session
+    let (state, query) = session
         .query_seeded(target_idx, shard_config, sampler)
         .map_err(|e| e.to_string())?;
-    query.packing_mode = PackingMode::Inspiring;
     Ok((state, query))
 }
 
@@ -491,5 +491,5 @@ pub fn extract_response_rust(
     response: &ServerResponse,
     entry_size: usize,
 ) -> Result<Vec<u8>, String> {
-    extract_inspiring(crs, client_state, response, entry_size).map_err(|e| e.to_string())
+    extract_two_packing(crs, client_state, response, entry_size).map_err(|e| e.to_string())
 }

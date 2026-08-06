@@ -231,6 +231,41 @@ pub(crate) fn fsync_parent_dir(parent: &std::path::Path) -> Result<()> {
     }
 }
 
+/// Durably publish a snapshot: write it, advance the manifest, then archive the log.
+///
+/// The order is a crash-safety contract, not a style choice. The manifest save
+/// moves the replay floor to `wal.next_seq()` BEFORE the archive moves the log,
+/// so a crash between the two still replays the survivors in `current.log`.
+/// Archiving first would strand entries the floor still points at.
+///
+/// `mutate` receives the snapshot id and the new replay floor and applies them to
+/// the caller's manifest, so the caller keeps ownership of its own fields.
+///
+/// # Errors
+/// Any snapshot write, manifest write, or archive failure, unmodified.
+pub fn publish_snapshot<F>(
+    layout: &StoreLayout,
+    wal: &Wal,
+    manifest: &mut Manifest,
+    snapshot_id: SnapshotId,
+    payload: Vec<u8>,
+    magic: [u8; 16],
+    mutate: F,
+) -> Result<()>
+where
+    F: FnOnce(&mut Manifest, SnapshotId, u64),
+{
+    let archive_from = manifest.current_snapshot_seq;
+    let archive_to = wal.next_seq().saturating_sub(1);
+    let new_floor = wal.next_seq();
+
+    SnapshotFile::build(payload, magic).save(layout, snapshot_id)?;
+    mutate(manifest, snapshot_id, new_floor);
+    manifest.save(layout)?;
+    wal.archive(archive_from, archive_to)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

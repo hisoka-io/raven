@@ -37,6 +37,19 @@ struct WalState {
     file: File,
     next_seq: u64,
     last_marker: u64,
+    /// Set when an append tore. Every later append is refused, because an
+    /// fsync-acknowledged entry that a later replay drops is worse than a
+    /// refused write.
+    poisoned: bool,
+}
+
+/// One whole frame: header then payload then fsync. Any error leaves the caller
+/// to rewind, because a header without its payload stops replay.
+fn write_frame(file: &mut File, header: &[u8; 24], payload: &[u8]) -> Result<()> {
+    file.write_all(header)?;
+    file.write_all(payload)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 impl Wal {
@@ -76,6 +89,7 @@ impl Wal {
                 file,
                 next_seq,
                 last_marker: scan.last_marker,
+                poisoned: false,
             }),
         })
     }
@@ -112,9 +126,25 @@ impl Wal {
         let crc = hasher.finalize();
         header[20..24].copy_from_slice(&crc.to_be_bytes());
 
-        state.file.write_all(&header)?;
-        state.file.write_all(&bincoded)?;
-        state.file.sync_all()?;
+        if state.poisoned {
+            return Err(PersistenceError::Invariant(
+                "WAL is poisoned by an earlier torn append; reopen to recover".to_owned(),
+            ));
+        }
+
+        // A partial write leaves a frame replay stops at, silently dropping every later
+        // entry even though append returned Ok and fsynced. Rewind to the last whole
+        // frame; poison only if the rewind itself fails, since then the tail is unknown.
+        let offset = state.file.stream_position()?;
+        if let Err(e) = write_frame(&mut state.file, &header, &bincoded) {
+            let rewound = state
+                .file
+                .set_len(offset)
+                .and_then(|()| state.file.sync_all())
+                .and_then(|()| state.file.seek(SeekFrom::Start(offset)).map(|_| ()));
+            state.poisoned = rewound.is_err();
+            return Err(e);
+        }
 
         state.next_seq = state.next_seq.saturating_add(1);
         state.last_marker = marker;
@@ -168,6 +198,8 @@ impl Wal {
             crate::fsync_parent_dir(source_parent)?;
         }
         state.file = new_file;
+        // a fresh file has no torn tail to be poisoned by
+        state.poisoned = false;
         Ok(())
     }
 }
@@ -520,5 +552,62 @@ mod tests {
         let wal = Wal::open(&layout, Some(99)).expect("open");
         let seq = wal.append(&test_payload(0), 100).expect("append");
         assert_eq!(seq, 100);
+    }
+
+    /// A torn append must not leave bytes that make replay drop later entries.
+    /// Pre-fix the header landed with no payload, subsequent appends returned Ok
+    /// and fsynced, and replay stopped at the tear.
+    #[test]
+    fn a_torn_append_rewinds_so_later_entries_still_replay() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = StoreLayout::open(dir.path()).expect("layout");
+        let wal = Wal::open(&layout, None).expect("open");
+
+        wal.append(&test_payload(0), 1).expect("first append");
+
+        // a payload one byte over the cap fails after the length check, exercising
+        // the same early-return path a write error takes
+        let oversized = vec![0u8; WAL_MAX_PAYLOAD_BYTES + 1];
+        assert!(
+            wal.append(&oversized, 2).is_err(),
+            "oversized must be refused"
+        );
+
+        let seq = wal
+            .append(&test_payload(2), 3)
+            .expect("append after a refused write");
+        let replay = wal.replay().expect("replay");
+
+        assert_eq!(
+            replay.entries.len(),
+            2,
+            "both good entries must survive a refused append; got {:?}",
+            replay.entries.iter().map(|e| e.seq).collect::<Vec<_>>()
+        );
+        let last = replay.entries.last().expect("two entries asserted above");
+        assert_eq!(last.seq, seq);
+        assert_eq!(replay.truncated_at, None, "no torn tail may remain");
+    }
+
+    /// The file offset must not drift when an append is refused, or the next
+    /// frame is written into a hole.
+    #[test]
+    fn a_refused_append_leaves_the_write_offset_where_it_was() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = StoreLayout::open(dir.path()).expect("layout");
+        let wal = Wal::open(&layout, None).expect("open");
+
+        wal.append(&test_payload(0), 1).expect("first append");
+        let before = std::fs::metadata(layout.wal_current_path())
+            .expect("stat")
+            .len();
+
+        let oversized = vec![0u8; WAL_MAX_PAYLOAD_BYTES + 1];
+        let _ = wal.append(&oversized, 2);
+
+        let after = std::fs::metadata(layout.wal_current_path())
+            .expect("stat")
+            .len();
+        assert_eq!(before, after, "a refused append must not grow the file");
     }
 }

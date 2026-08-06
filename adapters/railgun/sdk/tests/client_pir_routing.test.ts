@@ -22,7 +22,7 @@ function stubWasm(): RavenInspireWasm {
     },
     extract_response: () => new Uint8Array(0),
     build_instance_params_blob: (_a, _b) => new Uint8Array(0),
-    register_client_session: undefined,
+    register_client_session: () => {},
     path_indices_for_leaf: () => new Uint32Array(16),
     path_indices_for_per_list_leaf: () => new Uint32Array(16),
   };

@@ -25,7 +25,7 @@ function stubWasm(): RavenInspireWasm {
       return response.length === 0 ? new Uint8Array(0) : new Uint8Array(32);
     },
     build_instance_params_blob: () => new Uint8Array(0),
-    register_client_session: undefined,
+    register_client_session: () => {},
     path_indices_for_leaf: () => new Uint32Array(16),
     path_indices_for_per_list_leaf: () => new Uint32Array(16),
   };

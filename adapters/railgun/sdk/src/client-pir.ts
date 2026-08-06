@@ -22,7 +22,9 @@ export interface RavenInspireWasm {
     responseBytes: Uint8Array,
     entrySize: number,
   ): Uint8Array;
-  register_client_session?(
+  /** Bind the session to the server's instance params. Throws on a geometry
+   * mismatch, which would otherwise return a plausible record from the wrong row. */
+  register_client_session(
     session: RavenInspireClientSession,
     instanceParamsBincode: Uint8Array,
   ): void;
@@ -169,6 +171,7 @@ export async function loadClientPirContext(
       }
     }
     const session = wasm.build_client_session(paramsBundle, crsBincode);
+    wasm.register_client_session(session, paramsBundle);
     try {
       const blob = wasm.serialize_client_session!(session);
       await idbPut(instanceId, crsHash, blob);
@@ -184,6 +187,7 @@ export async function loadClientPirContext(
 
   function coldPath(): LoadClientPirContextResult {
     const session = wasm.build_client_session(paramsBundle, crsBincode);
+    wasm.register_client_session(session, paramsBundle);
     return {
       context: { wasm, session, crsBincode, shardConfigBincode, entrySize },
       cacheHit: false,

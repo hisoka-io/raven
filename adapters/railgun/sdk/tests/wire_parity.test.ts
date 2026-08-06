@@ -157,7 +157,7 @@ describe("wire parity: H3 — Error-class discrimination on T1 client-PIR", () =
         build_seeded_query: () => new Uint8Array(16),
         extract_response: () => new Uint8Array(32),
         build_instance_params_blob: () => new Uint8Array(0),
-        register_client_session: undefined,
+        register_client_session: () => {},
         path_indices_for_leaf: () => new Uint32Array(16),
         path_indices_for_per_list_leaf: () => new Uint32Array(16),
       },

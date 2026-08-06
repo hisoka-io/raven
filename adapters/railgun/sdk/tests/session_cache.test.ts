@@ -30,6 +30,7 @@ function makeSpyWasm(): SpyWasm {
       _inspire: Uint8Array,
       _shard: Uint8Array,
     ): Uint8Array => new Uint8Array([0xa, 0xb, 0xc]),
+    register_client_session: () => {},
     build_client_session: (
       _params: Uint8Array,
       _crs: Uint8Array,

@@ -28,7 +28,7 @@ function pathStubWasm(): RavenInspireWasm {
     extract_response: (_session, _crs, _state, response, _entry) =>
       response.length === 0 ? new Uint8Array(0) : new Uint8Array(response),
     build_instance_params_blob: () => new Uint8Array(0),
-    register_client_session: undefined,
+    register_client_session: () => {},
     path_indices_for_leaf: (_tree: number, leafIdx: number): Uint32Array => {
       const out = new Uint32Array(TREE_DEPTH);
       let walk = leafIdx;

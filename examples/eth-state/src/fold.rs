@@ -396,24 +396,30 @@ impl MainSidecar {
         let data = bincode::serialize(&rows)
             .map_err(|e| EthStateError::Setup(format!("snapshot serialize: {e}")))?;
         let snap_id = SnapshotId(self.next_snapshot_id);
-        SnapshotFile::build(data, SNAPSHOT_MAGIC)
-            .save(&self.layout, snap_id)
-            .map_err(|e| EthStateError::Setup(format!("snapshot save: {e}")))?;
-        let manifest = Manifest {
+        let mut manifest = Manifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
             scheme_tag: SCHEME_TAG.to_string(),
             instance_id: INSTANCE_ID.to_string(),
             current_snapshot_id: snap_id,
-            // Contract: first WAL seq the replayer must consume. The snapshot covers every
-            // append so far, so that is exactly `next_seq`.
             current_snapshot_seq: self.wal.next_seq(),
             current_marker: self.marker,
             encoder_label: ENCODER_LABEL.to_string(),
             prev_encoder_label: None,
         };
-        manifest
-            .save(&self.layout)
-            .map_err(|e| EthStateError::Setup(format!("manifest save: {e}")))?;
+        raven_storage::publish_snapshot(
+            &self.layout,
+            &self.wal,
+            &mut manifest,
+            snap_id,
+            data,
+            SNAPSHOT_MAGIC,
+            |m, id, floor| {
+                m.current_snapshot_id = id;
+                m.current_snapshot_seq = floor;
+            },
+        )
+        .map_err(|e| EthStateError::Setup(format!("publish snapshot: {e}")))?;
+        self.wal_floor = self.wal.next_seq();
         self.next_snapshot_id += 1;
         Ok(())
     }
