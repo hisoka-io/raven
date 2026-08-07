@@ -6,8 +6,8 @@ use super::{InstanceRole, PirInstance};
 use parking_lot::Mutex;
 use raven_railgun_core::{AdapterError, Epoch, InstanceId, Result};
 use raven_railgun_persistence::{
-    Manifest, Snapshot, SnapshotId, StoreLayout, Wal, WalEntryPayload, MANIFEST_SCHEMA_VERSION,
-    SNAPSHOT_MAGIC,
+    advance_manifest_and_archive, Manifest, Snapshot, SnapshotId, StoreLayout, Wal,
+    WalEntryPayload, MANIFEST_SCHEMA_VERSION, SNAPSHOT_MAGIC,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -389,22 +389,19 @@ impl InspirePersistence {
             )));
         }
 
-        // Manifest save precedes archive: the replay floor has already advanced, so a
-        // crash in between still replays the survivors in current.log.
-        let prev_seq = m.current_snapshot_seq;
-        let cur_seq = self.wal.next_seq().saturating_sub(1);
-        let new_floor = self.wal.next_seq();
-        m.current_snapshot_id = next_id;
-        m.current_snapshot_seq = new_floor;
-        m.current_marker = current_block_height;
-        m.schema_version = MANIFEST_SCHEMA_VERSION;
-        m.save(&self.layout)
-            .map_err(|e| AdapterError::Internal(format!("manifest save: {e}")))?;
-
-        let archive_from = prev_seq;
-        self.wal
-            .archive(archive_from, cur_seq)
-            .map_err(|e| AdapterError::Internal(format!("wal archive: {e}")))?;
+        advance_manifest_and_archive(
+            &self.layout,
+            &self.wal,
+            &mut m,
+            next_id,
+            |man, id, floor| {
+                man.current_snapshot_id = id;
+                man.current_snapshot_seq = floor;
+                man.current_marker = current_block_height;
+                man.schema_version = MANIFEST_SCHEMA_VERSION;
+            },
+        )
+        .map_err(|e| AdapterError::Internal(format!("publish snapshot: {e}")))?;
 
         {
             let mut c = self.counters.lock();

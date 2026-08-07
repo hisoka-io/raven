@@ -231,15 +231,10 @@ pub(crate) fn fsync_parent_dir(parent: &std::path::Path) -> Result<()> {
     }
 }
 
-/// Durably publish a snapshot: write it, advance the manifest, then archive the log.
+/// Durably publish a snapshot: write it, then [`advance_manifest_and_archive`].
 ///
-/// The order is a crash-safety contract, not a style choice. The manifest save
-/// moves the replay floor to `wal.next_seq()` BEFORE the archive moves the log,
-/// so a crash between the two still replays the survivors in `current.log`.
-/// Archiving first would strand entries the floor still points at.
-///
-/// `mutate` receives the snapshot id and the new replay floor and applies them to
-/// the caller's manifest, so the caller keeps ownership of its own fields.
+/// A caller that must keep a slow snapshot write off its manifest lock calls the
+/// two halves separately instead.
 ///
 /// # Errors
 /// Any snapshot write, manifest write, or archive failure, unmodified.
@@ -255,11 +250,36 @@ pub fn publish_snapshot<F>(
 where
     F: FnOnce(&mut Manifest, SnapshotId, u64),
 {
+    SnapshotFile::build(payload, magic).save(layout, snapshot_id)?;
+    advance_manifest_and_archive(layout, wal, manifest, snapshot_id, mutate)
+}
+
+/// Point the manifest at `snapshot_id`, then archive the WAL range it consumed.
+///
+/// The order is a crash-safety contract, not a style choice: the manifest save
+/// moves the replay floor to `wal.next_seq()` BEFORE the archive moves the log,
+/// so a crash between the two still replays the survivors in `current.log`.
+/// Archiving first would strand entries the floor still points at.
+///
+/// `mutate` receives the snapshot id and the new replay floor, so the caller
+/// keeps ownership of its own manifest fields.
+///
+/// # Errors
+/// Any manifest write or archive failure, unmodified.
+pub fn advance_manifest_and_archive<F>(
+    layout: &StoreLayout,
+    wal: &Wal,
+    manifest: &mut Manifest,
+    snapshot_id: SnapshotId,
+    mutate: F,
+) -> Result<()>
+where
+    F: FnOnce(&mut Manifest, SnapshotId, u64),
+{
     let archive_from = manifest.current_snapshot_seq;
     let archive_to = wal.next_seq().saturating_sub(1);
     let new_floor = wal.next_seq();
 
-    SnapshotFile::build(payload, magic).save(layout, snapshot_id)?;
     mutate(manifest, snapshot_id, new_floor);
     manifest.save(layout)?;
     wal.archive(archive_from, archive_to)?;
@@ -297,6 +317,81 @@ mod tests {
         atomic_write(&path, b"second").expect("write2");
         let read = std::fs::read(&path).expect("read");
         assert_eq!(read, b"second");
+    }
+
+    fn publish_fixture() -> (tempfile::TempDir, StoreLayout, Wal, Manifest) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = StoreLayout::open(dir.path()).expect("open");
+        let wal = Wal::open(&layout, None).expect("wal");
+        for i in 0..3u32 {
+            wal.append(&i, 100 + u64::from(i)).expect("append");
+        }
+        let manifest = Manifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            scheme_tag: "test-scheme".to_owned(),
+            instance_id: "test-instance".to_owned(),
+            current_snapshot_id: SnapshotId(0),
+            current_snapshot_seq: 0,
+            current_marker: 0,
+            encoder_label: "test-encoder".to_owned(),
+            prev_encoder_label: None,
+        };
+        (dir, layout, wal, manifest)
+    }
+
+    fn point_at(m: &mut Manifest, id: SnapshotId, floor: u64) {
+        m.current_snapshot_id = id;
+        m.current_snapshot_seq = floor;
+    }
+
+    #[test]
+    fn publish_snapshot_advances_the_floor_and_seals_the_log() {
+        let (_d, layout, wal, mut manifest) = publish_fixture();
+        let expected_floor = wal.next_seq();
+
+        publish_snapshot(
+            &layout,
+            &wal,
+            &mut manifest,
+            SnapshotId(1),
+            b"payload".to_vec(),
+            *b"TESTMAGIC_000001",
+            point_at,
+        )
+        .expect("publish");
+
+        let on_disk = Manifest::load(&layout).expect("load").expect("present");
+        assert_eq!(on_disk.current_snapshot_id, SnapshotId(1));
+        assert_eq!(on_disk.current_snapshot_seq, expected_floor);
+        assert!(
+            wal.replay().expect("replay").entries.is_empty(),
+            "the consumed log must be sealed"
+        );
+    }
+
+    /// A crash between the two writes must not strand entries the floor still
+    /// points at, so the archive runs only after the manifest lands.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_manifest_save_leaves_the_log_unarchived() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_d, layout, wal, mut manifest) = publish_fixture();
+        let root = layout.root().to_path_buf();
+        let restore = std::fs::metadata(&root).expect("meta").permissions();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+
+        let err =
+            advance_manifest_and_archive(&layout, &wal, &mut manifest, SnapshotId(1), point_at)
+                .expect_err("manifest save must fail under a read-only root");
+
+        std::fs::set_permissions(&root, restore).expect("restore");
+        assert!(matches!(err, PersistenceError::Io(_)), "got {err:?}");
+        assert_eq!(
+            wal.replay().expect("replay").entries.len(),
+            3,
+            "entries must survive a failed publish"
+        );
     }
 
     #[test]
