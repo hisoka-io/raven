@@ -268,10 +268,19 @@ jobs:
         lane:
           - name: crash-safety
             packages: "-p raven-railgun-cli"
+            cargo_flags: ""
             nextest_profile: ci
             filter: "binary(migrate_encoder_real_sigkill) + binary(migrate_encoder_kill_during) + binary(auto_spawn_races)"
+          - name: wal-and-snapshot-chaos
+            packages: "-p raven-railgun-persistence"
+            # both suites are #![cfg(feature = "chaos-tests")] and compile to
+            # empty without it, so the flag is what makes this lane real
+            cargo_flags: "--features chaos-tests"
+            nextest_profile: ci
+            filter: "binary(wal_chaos_layer_b) + binary(snapshot_chaos_save_two_rename)"
           - name: closure
             packages: "-p raven-railgun-engine"
+            cargo_flags: ""
             # production-cell, not ci: multi_instance_recovery_byte_identity
             # measures 113 s on a 16-core box and would trip ci's 120 s x 3 cap
             # on a 4-vCPU runner
@@ -306,6 +315,7 @@ jobs:
           cargo nextest run \
             --manifest-path adapters/railgun/Cargo.toml \
             ${{ matrix.lane.packages }} \
+            ${{ matrix.lane.cargo_flags }} \
             --cargo-profile ci-test \
             --profile ${{ matrix.lane.nextest_profile }} \
             --run-ignored all \
