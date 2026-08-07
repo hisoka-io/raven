@@ -107,22 +107,45 @@ fn one_chaos_round(seed: u64, kill_delay: Duration) -> usize {
             "entry {idx}: payload mismatch (seed={seed}, kill_delay={kill_delay:?})"
         );
     }
+    // a killed writer must leave the log appendable, not wedged; this holds even
+    // when the kill landed before the child wrote anything, which is the only
+    // property the zero-delay trial can assert
+    let seq = wal
+        .append(
+            &WalEntryPayload::Heartbeat {
+                wallclock_unix_ms: 1,
+            },
+            u64::MAX,
+        )
+        .expect("wal must accept an append after crash recovery");
+    assert!(
+        seq >= replay.entries.len() as u64,
+        "post-recovery seq {seq} rewound below the {} recovered entries \
+         (seed={seed}, kill_delay={kill_delay:?})",
+        replay.entries.len()
+    );
+
     replay.entries.len()
 }
 
 #[test]
 fn chaos_kill_at_random_offsets_recovers_clean_prefix() {
+    let mut total = 0usize;
     for (trial, delay_ms) in [(1u64, 10u64), (2, 30), (3, 60), (4, 120), (5, 250)] {
         let recovered = one_chaos_round(trial, Duration::from_millis(delay_ms));
         eprintln!(
             "Layer B chaos trial {trial} (delay={delay_ms}ms): \
              recovered {recovered} entries"
         );
+        total += recovered;
     }
+    assert!(
+        total > 0,
+        "every trial recovered zero entries: fsync-acknowledged appends are not surviving a kill"
+    );
 }
 
 #[test]
-fn chaos_zero_delay_kill_recovers_zero_or_more_entries() {
-    let recovered = one_chaos_round(99, Duration::from_millis(0));
-    eprintln!("Layer B chaos zero-delay: recovered {recovered} entries");
+fn chaos_zero_delay_kill_leaves_a_readable_appendable_wal() {
+    one_chaos_round(99, Duration::from_millis(0));
 }

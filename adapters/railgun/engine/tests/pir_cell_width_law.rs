@@ -2,10 +2,9 @@
 //! must be a power of two no larger than `ring_dim / 2`.
 //!
 //! The packing generator `2n / gamma + 1` divides integrally, so an off-law
-//! `gamma` silently picks the wrong automorphism and decrypts to unrelated
-//! bytes with no error anywhere. Measured at `ring_dim = 2048`: 328, 640 and
-//! 4096 return every byte wrong; 4098 and above abort on an out-of-bounds
-//! generator-power lookup, which is why the ladder test stops below them.
+//! `gamma` picks the wrong automorphism and decrypts to unrelated bytes. Setup
+//! now refuses an off-law width up front, so the ladder asserts refusal rather
+//! than the wrong bytes it used to measure.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
@@ -135,6 +134,15 @@ fn worst_mismatch_at_width(entry_size: usize) -> usize {
     worst
 }
 
+/// `Some(error)` when setup refuses the width, `None` when it accepts.
+fn setup_rejection_at_width(entry_size: usize) -> Option<String> {
+    let params = InspireParams::secure_128_d2048();
+    let db = vec![0u8; 8 * entry_size];
+    setup_state(&params, &db, entry_size, InspireVariant::TwoPacking)
+        .err()
+        .map(|e| e.to_string())
+}
+
 /// Evidence for the law. Ten production-parameter setups, minutes of wall time,
 /// so it is gated; the cheap tests above encode its result.
 #[test]
@@ -150,16 +158,19 @@ fn production_cell_width_ladder_is_empirically_correct() {
             num_columns(width)
         );
     }
-    // 8192 and 32768 excluded: they abort rather than returning wrong bytes.
-    for width in [328usize, 640, 4096] {
-        let worst = worst_mismatch_at_width(width);
+    for width in ILLEGAL_WIDTHS {
+        let err = setup_rejection_at_width(width).unwrap_or_else(|| {
+            panic!(
+                "entry_size {width} (num_columns {}) was accepted by setup. The width law is \
+                 derived from this being refused; if the InspiRING packing now supports \
+                 non-power-of-two or gamma >= ring_dim widths, re-derive is_legal_cell_width \
+                 from the current generator formula before relaxing anything",
+                num_columns(width)
+            )
+        });
         assert!(
-            worst > 0,
-            "entry_size {width} (num_columns {}) round-tripped cleanly. The width law \
-             is derived from this failing; if the InspiRING packing now supports \
-             non-power-of-two or gamma == ring_dim widths, re-derive is_legal_cell_width \
-             from the current generator formula before relaxing anything",
-            num_columns(width)
+            err.contains(&width.to_string()),
+            "entry_size {width} was refused, but the error never names the width: {err}"
         );
     }
 }
