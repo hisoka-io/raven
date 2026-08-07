@@ -66,7 +66,11 @@ async fn spawn_fanout_server(entries: usize) -> FanoutFixture {
         entry_bytes: ENTRY_BYTES,
         variant: raven_inspire::params::InspireVariant::TwoPacking,
     };
-    let pieces = build_toy_pieces(BEARER_TOKEN.to_owned(), config).expect("toy stack");
+    let mut pieces = build_toy_pieces(BEARER_TOKEN.to_owned(), config).expect("toy stack");
+    // the route is opt-in; this suite is what exercises it
+    let mut http_config = (*pieces.app_state.config).clone();
+    http_config.enable_fanout = true;
+    pieces.app_state.config = std::sync::Arc::new(http_config);
     let instance = pieces
         .app_state
         .engine
@@ -462,4 +466,44 @@ async fn fanout_tail_shard_padding_extracts_as_all_zeros() {
 
     drop(state);
     fixture.shutdown().await;
+}
+
+/// Every other test here opts in, so only this one catches the default flipping.
+#[tokio::test]
+async fn fanout_is_not_mounted_by_default() {
+    let params = raven_inspire::params::InspireParams::secure_128_d2048();
+    let config = ToyDbConfig {
+        entries: params.ring_dim * SHARD_COUNT,
+        entry_bytes: ENTRY_BYTES,
+        variant: raven_inspire::params::InspireVariant::TwoPacking,
+    };
+    let pieces = build_toy_pieces(BEARER_TOKEN.to_owned(), config).expect("toy stack");
+    assert!(
+        !pieces.app_state.config.enable_fanout,
+        "enable_fanout must default to false"
+    );
+
+    let router = inspire_router(pieces.app_state.clone()).expect("router");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
+    });
+
+    let res = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/v1/instance/{TOY_INSTANCE_ID}/fanout"
+        ))
+        .bearer_auth(BEARER_TOKEN)
+        .body(Vec::<u8>::new())
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(res.status(), 404, "an unmounted route must 404, not serve");
 }

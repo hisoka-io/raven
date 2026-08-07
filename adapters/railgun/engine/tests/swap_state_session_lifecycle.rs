@@ -146,7 +146,9 @@ fn drive_commit_path_preserves_session_store() {
         }
     };
     let next_epoch = instance.current_epoch().next();
-    instance.swap_state(new_state, next_epoch);
+    instance
+        .swap_state(new_state, next_epoch)
+        .expect("same-shape swap");
 
     let post_swap_len = {
         let snap = instance.current_state();

@@ -19,12 +19,25 @@ use raven_core::server_error::Result;
 use raven_core::{Epoch, InstanceId, ServerError};
 use serde::{de::DeserializeOwned, Serialize};
 
+/// The cell geometry a client's query is bound to.
+///
+/// A client decomposes its index against these two numbers, so a state may only
+/// replace another when they agree. Corpus growth is legal and deliberately not
+/// represented here: new indices become valid, old ones still map the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateShape {
+    /// Bytes per record.
+    pub entry_size_bytes: usize,
+    /// Rows per shard.
+    pub rows_per_shard: u64,
+}
+
 /// Contract every PIR scheme must satisfy.
 ///
 /// ```
 /// use raven_core::server_error::Result;
 /// use raven_core::{InstanceId, ServerError};
-/// use raven_server::{InstanceRole, PirInstance, PirScheme};
+/// use raven_server::{InstanceRole, PirInstance, PirScheme, StateShape};
 /// struct Echo;
 /// impl PirScheme for Echo {
 ///     type ServerState = Vec<u8>;
@@ -32,6 +45,9 @@ use serde::{de::DeserializeOwned, Serialize};
 ///     type Response = u8;
 ///     fn respond(state: &Vec<u8>, q: &usize) -> Result<u8> {
 ///         state.get(*q).copied().ok_or_else(|| ServerError::InvalidQuery(format!("index {q} OOB")))
+///     }
+///     fn state_shape(_state: &Vec<u8>) -> StateShape {
+///         StateShape { entry_size_bytes: 1, rows_per_shard: u64::MAX }
 ///     }
 /// }
 /// let inst = PirInstance::<Echo>::new(
@@ -50,6 +66,12 @@ pub trait PirScheme: Send + Sync + 'static {
 
     /// Must be a pure function of `state` and `query`.
     fn respond(state: &Self::ServerState, query: &Self::Query) -> Result<Self::Response>;
+
+    /// Cell geometry of `state`, checked on every [`PirInstance::swap_state`].
+    ///
+    /// Required rather than defaulted: a scheme that cannot answer this cannot
+    /// be gated, and an ungated swap returns wrong bytes with no error.
+    fn state_shape(state: &Self::ServerState) -> StateShape;
 }
 
 /// Informs the orchestrator's re-preprocess schedule.
@@ -280,12 +302,27 @@ impl<S: PirScheme> PirInstance<S> {
         Ok((snap.epoch, response))
     }
 
-    /// Publish a new state at `new_epoch`.
-    pub fn swap_state(&self, new_state: S::ServerState, new_epoch: Epoch) {
+    /// Publish a new state at `new_epoch`, rejecting a change of cell geometry.
+    ///
+    /// # Errors
+    /// [`ServerError::StateShapeMismatch`] when the incoming state would move
+    /// live clients onto a geometry their queries were not built against.
+    pub fn swap_state(&self, new_state: S::ServerState, new_epoch: Epoch) -> Result<()> {
+        let live = S::state_shape(&self.snapshot.load().state);
+        let incoming = S::state_shape(&new_state);
+        if live != incoming {
+            return Err(ServerError::StateShapeMismatch {
+                live_entry_size: live.entry_size_bytes,
+                live_rows: live.rows_per_shard,
+                new_entry_size: incoming.entry_size_bytes,
+                new_rows: incoming.rows_per_shard,
+            });
+        }
         self.snapshot.store(Arc::new(Snapshot {
             epoch: new_epoch,
             state: Arc::new(new_state),
         }));
+        Ok(())
     }
 }
 
@@ -417,6 +454,14 @@ mod tests {
                 .copied()
                 .ok_or_else(|| ServerError::InvalidQuery(format!("index {query} OOB")))
         }
+
+        fn state_shape(_state: &Self::ServerState) -> StateShape {
+            // flat vector, index used directly: no decomposition to invalidate
+            StateShape {
+                entry_size_bytes: 1,
+                rows_per_shard: u64::MAX,
+            }
+        }
     }
 
     #[test]
@@ -436,7 +481,8 @@ mod tests {
     fn swap_state_bumps_epoch_and_visible_immediately() {
         let inst: PirInstance<EchoScheme> =
             PirInstance::new(InstanceId::new("toy"), InstanceRole::Live, vec![10, 20, 30]);
-        inst.swap_state(vec![1, 2, 3], Epoch(1));
+        inst.swap_state(vec![1, 2, 3], Epoch(1))
+            .expect("same shape");
         let (epoch, value) = inst.query(&0).expect("query");
         assert_eq!(epoch, Epoch(1));
         assert_eq!(value, 1);
@@ -577,7 +623,8 @@ mod tests {
         assert_eq!(e0, snap_epoch);
         assert_eq!(r0, 10);
 
-        inst.swap_state(vec![99, 99, 99, 99, 99], Epoch(snap_epoch.0 + 1));
+        inst.swap_state(vec![99, 99, 99, 99, 99], Epoch(snap_epoch.0 + 1))
+            .expect("same shape");
         assert_eq!(inst.current_epoch(), Epoch(snap_epoch.0 + 1));
 
         for idx in 1..5 {
@@ -613,5 +660,70 @@ mod tests {
             .query_active_tracked_with_snapshot(&snap, &0)
             .expect_err("drained instance must refuse new queries");
         assert!(matches!(err, ServerError::NoActiveInstance { .. }));
+    }
+
+    /// A scheme whose shape follows its state, so a swap can change geometry.
+    #[derive(Debug)]
+    struct ShapedScheme;
+
+    impl PirScheme for ShapedScheme {
+        type ServerState = (usize, u64);
+        type Query = usize;
+        type Response = u8;
+
+        fn respond(_state: &Self::ServerState, _query: &Self::Query) -> Result<Self::Response> {
+            Ok(0)
+        }
+
+        fn state_shape(state: &Self::ServerState) -> StateShape {
+            StateShape {
+                entry_size_bytes: state.0,
+                rows_per_shard: state.1,
+            }
+        }
+    }
+
+    #[test]
+    fn swap_state_rejects_a_changed_entry_size() {
+        let inst = PirInstance::<ShapedScheme>::new(
+            InstanceId::new("shape"),
+            InstanceRole::Live,
+            (32, 2048),
+        );
+        let err = inst
+            .swap_state((64, 2048), Epoch(1))
+            .expect_err("a changed entry_size must be refused");
+        assert!(
+            matches!(err, ServerError::StateShapeMismatch { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            inst.snapshot.load().epoch,
+            Epoch(0),
+            "state must not publish"
+        );
+    }
+
+    #[test]
+    fn swap_state_rejects_changed_rows_per_shard() {
+        let inst = PirInstance::<ShapedScheme>::new(
+            InstanceId::new("shape"),
+            InstanceRole::Live,
+            (32, 2048),
+        );
+        assert!(inst.swap_state((32, 4096), Epoch(1)).is_err());
+    }
+
+    /// Corpus growth is the normal case and must stay legal.
+    #[test]
+    fn swap_state_accepts_the_same_geometry() {
+        let inst = PirInstance::<ShapedScheme>::new(
+            InstanceId::new("shape"),
+            InstanceRole::Live,
+            (32, 2048),
+        );
+        inst.swap_state((32, 2048), Epoch(1))
+            .expect("identical geometry must publish");
+        assert_eq!(inst.snapshot.load().epoch, Epoch(1));
     }
 }

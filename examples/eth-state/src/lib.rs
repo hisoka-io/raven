@@ -131,6 +131,13 @@ impl PirScheme for FlatBalanceScheme {
         let result = respond_seeded_inspiring(&state.crs, &state.encoded_db, query);
         result.map_err(|e| ServerError::Scheme(format!("flat-state respond failed: {e}")))
     }
+    fn state_shape(state: &Self::ServerState) -> raven_server::StateShape {
+        let cfg = &state.encoded_db.config;
+        raven_server::StateShape {
+            entry_size_bytes: cfg.entry_size_bytes,
+            rows_per_shard: cfg.entries_per_shard(),
+        }
+    }
 }
 
 /// Build one engine from a flat record buffer. Seeded [`ChaCha20Rng`], never `thread_rng`, so

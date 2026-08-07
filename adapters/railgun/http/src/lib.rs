@@ -189,7 +189,6 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
             "/v1/instance/:id/batch",
             post(batch_handler::<RavenInspireScheme>),
         )
-        .route("/v1/instance/:id/fanout", post(fanout_handler))
         .route(
             "/v1/admin/instances/drain/:id",
             post(admin_drain_handler::<RavenInspireScheme>),
@@ -198,7 +197,15 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
             "/v1/admin/instances/undrain/:id",
             post(admin_undrain_handler::<RavenInspireScheme>),
         )
-        .route("/v1/instance/:id/session", post(session_establish_handler))
+        .route("/v1/instance/:id/session", post(session_establish_handler));
+
+    let rate_limited = if state.config.enable_fanout {
+        rate_limited.route("/v1/instance/:id/fanout", post(fanout_handler))
+    } else {
+        rate_limited
+    };
+
+    let rate_limited = rate_limited
         .with_state(state.clone())
         .merge(params_route)
         .merge(poi_shim::poi_shim_routes(state.clone()))
@@ -882,6 +889,13 @@ mod tests {
             Ok(SlowableResponse {
                 echo_tag: query.tag,
             })
+        }
+
+        fn state_shape(_state: &Self::ServerState) -> raven_railgun_engine::StateShape {
+            raven_railgun_engine::StateShape {
+                entry_size_bytes: 1,
+                rows_per_shard: u64::MAX,
+            }
         }
     }
 

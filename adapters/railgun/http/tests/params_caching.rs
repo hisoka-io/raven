@@ -277,7 +277,9 @@ async fn params_handler_invalidates_etag_on_epoch_bump() {
         setup_state(&params, &db_v2, TOY_ENTRY_BYTES, InspireVariant::TwoPacking)
             .expect("toy state v2");
     let next_epoch: Epoch = pre_epoch.next();
-    instance.swap_state(new_state, next_epoch);
+    instance
+        .swap_state(new_state, next_epoch)
+        .expect("same-shape swap");
     assert_ne!(
         instance.current_epoch(),
         pre_epoch,

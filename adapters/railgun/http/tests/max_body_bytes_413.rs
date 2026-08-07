@@ -42,6 +42,12 @@ impl PirScheme for EchoScheme {
     fn respond(_state: &Self::ServerState, _query: &Self::Query) -> RailgunResult<Self::Response> {
         Ok(EchoResponse)
     }
+    fn state_shape(_state: &Self::ServerState) -> raven_railgun_engine::StateShape {
+        raven_railgun_engine::StateShape {
+            entry_size_bytes: 1,
+            rows_per_shard: u64::MAX,
+        }
+    }
 }
 
 async fn spawn_server(max_body_bytes: usize) -> (SocketAddr, tokio::task::JoinHandle<()>) {

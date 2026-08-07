@@ -42,6 +42,26 @@ pub enum ServerError {
     #[error("internal error: {0}")]
     Internal(String),
 
+    /// A published state changed the cell geometry a live client's query is
+    /// bound to. Growth is legal; changing `entry_size` or rows-per-shard is not,
+    /// because an in-flight query decomposes its index against the old geometry
+    /// and would decode a plausible record from the wrong row.
+    #[error(
+        "state shape mismatch: live is entry_size={live_entry_size} rows_per_shard={live_rows}, \
+         incoming is entry_size={new_entry_size} rows_per_shard={new_rows}; re-bootstrap the \
+         data_dir instead of swapping geometry under live clients"
+    )]
+    StateShapeMismatch {
+        /// Bytes per record in the currently-published state.
+        live_entry_size: usize,
+        /// Rows per shard in the currently-published state.
+        live_rows: u64,
+        /// Bytes per record in the state being published.
+        new_entry_size: usize,
+        /// Rows per shard in the state being published.
+        new_rows: u64,
+    },
+
     /// Re-encode or query targeted a `shard_id` past the shard count. Distinct
     /// from [`ServerError::Internal`] so a caller can treat a
     /// structurally-unencodable shard as terminal while retrying transient errors.

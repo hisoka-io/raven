@@ -73,6 +73,12 @@ impl PirScheme for SleepyScheme {
             echo_nonce: query.nonce,
         })
     }
+    fn state_shape(_state: &Self::ServerState) -> raven_railgun_engine::StateShape {
+        raven_railgun_engine::StateShape {
+            entry_size_bytes: 1,
+            rows_per_shard: u64::MAX,
+        }
+    }
 }
 
 fn build_state_and_router(state: Arc<SleepyState>) -> (AppState<SleepyScheme>, axum::Router) {

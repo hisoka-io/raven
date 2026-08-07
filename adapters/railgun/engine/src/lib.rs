@@ -15,7 +15,7 @@ pub mod session_pool;
 pub mod tree_fill_watcher;
 
 pub use raven_server::{
-    DrainState, Engine, InFlightGuard, InstanceRole, PirInstance, PirScheme, Snapshot,
+    DrainState, Engine, InFlightGuard, InstanceRole, PirInstance, PirScheme, Snapshot, StateShape,
 };
 
 use raven_railgun_core::{Epoch, Result};

@@ -1239,7 +1239,7 @@ fn drive_commit(
     };
 
     let next_epoch = instance.current_epoch().next();
-    instance.swap_state(new_state, next_epoch);
+    instance.swap_state(new_state, next_epoch)?;
 
     let snapshot_state = instance.current_state();
     // Snapshot the store under-lock so it restores atomically with the state.

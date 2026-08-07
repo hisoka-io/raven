@@ -52,6 +52,12 @@ pub struct HttpConfig {
     /// Max shard ids accepted per `POST /v1/instance/{id}/fanout` request.
     #[serde(default = "default_max_fanout_shards")]
     pub max_fanout_shards: usize,
+    /// Mount `POST /v1/instance/{id}/fanout`. Off by default: the route has no
+    /// batch-size ladder, so `shard_ids.len()` travels in the clear, and it clones
+    /// the query per shard, so peak memory is `k x body`. Enable only with a cover
+    /// strategy that fixes the group size.
+    #[serde(default)]
+    pub enable_fanout: bool,
 }
 
 fn default_session_eviction_interval_secs() -> u64 {
@@ -84,6 +90,7 @@ impl HttpConfig {
             cors_allowed_origins: Vec::new(),
             metrics_public: false,
             session_eviction_interval_secs: 3600,
+            enable_fanout: false,
             max_fanout_shards: default_max_fanout_shards(),
         }
     }

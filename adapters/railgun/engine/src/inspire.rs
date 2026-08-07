@@ -5,8 +5,8 @@ use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, InspireVariant, ShardConfig};
 use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::{
-    extract_inspiring, respond_seeded_inspiring_cached_with_session, setup as inspire_setup,
-    ClientSession, ClientState, EncodedDatabase, PackingMode, SeededClientQuery, ServerCrs,
+    extract_two_packing, respond_seeded_inspiring_cached_with_session, setup as inspire_setup,
+    ClientSession, ClientState, EncodedDatabase, SeededClientQuery, ServerCrs,
     ServerInspiringCache, ServerResponse,
 };
 use raven_railgun_core::{batch_ladder, AdapterError};
@@ -79,6 +79,13 @@ impl PirScheme for RavenInspireScheme {
             Some(store.as_ref()),
         )
         .map_err(|e| AdapterError::Scheme(format!("inspire respond: {e}")))
+    }
+    fn state_shape(state: &Self::ServerState) -> raven_server::StateShape {
+        let cfg = &state.encoded_db.config;
+        raven_server::StateShape {
+            entry_size_bytes: cfg.entry_size_bytes,
+            rows_per_shard: cfg.entries_per_shard(),
+        }
     }
 }
 
@@ -171,7 +178,7 @@ pub fn swap_state(
         variant,
         entry_size,
     };
-    instance.swap_state(new_state, new_epoch);
+    instance.swap_state(new_state, new_epoch)?;
     Ok(())
 }
 
@@ -180,7 +187,7 @@ pub fn swap_state(
 /// enforces. In-flight queries keep running on the donor store.
 ///
 /// # Errors
-/// Infallible today; `Result` reserved for fallible same-shape rebuilds.
+/// [`ServerError::StateShapeMismatch`] if the donor geometry ever diverges.
 pub fn heartbeat_session_eviction(instance: &super::PirInstance<RavenInspireScheme>) -> Result<()> {
     let donor = instance.current_state();
     let new_state = InspireServerState {
@@ -192,7 +199,7 @@ pub fn heartbeat_session_eviction(instance: &super::PirInstance<RavenInspireSche
         entry_size: donor.entry_size,
     };
     let next_epoch = instance.current_epoch().next();
-    instance.swap_state(new_state, next_epoch);
+    instance.swap_state(new_state, next_epoch)?;
     Ok(())
 }
 
@@ -221,7 +228,8 @@ pub fn register_client_session(
     Ok(())
 }
 
-/// Build a [`SeededClientQuery`] for the given index. Forces `PackingMode::Inspiring`.
+/// Build a [`SeededClientQuery`] for the given index, in whatever packing mode
+/// the session derived from the CRS.
 pub fn build_seeded_query(
     client_session: &ClientSession,
     shard_config: &ShardConfig,
@@ -229,10 +237,9 @@ pub fn build_seeded_query(
     params: &InspireParams,
 ) -> Result<(ClientState, SeededClientQuery)> {
     let mut sampler = GaussianSampler::new(params.sigma);
-    let (state, mut query) = client_session
+    let (state, query) = client_session
         .query_seeded(global_index, shard_config, &mut sampler)
         .map_err(|e| AdapterError::Scheme(format!("query_seeded: {e}")))?;
-    query.packing_mode = PackingMode::Inspiring;
     Ok((state, query))
 }
 
@@ -290,7 +297,7 @@ pub fn extract_response(
     response: &ServerResponse,
     entry_size: usize,
 ) -> Result<Vec<u8>> {
-    extract_inspiring(crs, client_state, response, entry_size)
+    extract_two_packing(crs, client_state, response, entry_size)
         .map_err(|e| AdapterError::Scheme(format!("inspire extract: {e}")))
 }
 

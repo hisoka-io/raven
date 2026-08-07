@@ -49,6 +49,12 @@ impl PirScheme for StubScheme {
     ) -> raven_railgun_core::Result<Self::Response> {
         Err(raven_railgun_core::AdapterError::Scheme("stub".to_owned()))
     }
+    fn state_shape(_state: &Self::ServerState) -> raven_railgun_engine::StateShape {
+        raven_railgun_engine::StateShape {
+            entry_size_bytes: 1,
+            rows_per_shard: u64::MAX,
+        }
+    }
 }
 
 fn fr_canonical(tag: u8) -> [u8; 32] {

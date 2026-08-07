@@ -59,6 +59,12 @@ impl PirScheme for SlowScheme {
         }
         Ok(SlowResponse { tag: query.tag })
     }
+    fn state_shape(_state: &Self::ServerState) -> raven_railgun_engine::StateShape {
+        raven_railgun_engine::StateShape {
+            entry_size_bytes: 1,
+            rows_per_shard: u64::MAX,
+        }
+    }
 }
 
 async fn spawn_test_server() -> (

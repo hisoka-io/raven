@@ -51,6 +51,12 @@ impl PirScheme for EchoScheme {
         state.respond_calls.fetch_add(1, Ordering::SeqCst);
         Ok(EchoResponse { tag: query.tag })
     }
+    fn state_shape(_state: &Self::ServerState) -> raven_railgun_engine::StateShape {
+        raven_railgun_engine::StateShape {
+            entry_size_bytes: 1,
+            rows_per_shard: u64::MAX,
+        }
+    }
 }
 
 async fn spawn_test_server() -> (

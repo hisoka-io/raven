@@ -28,6 +28,12 @@ impl PirScheme for WitnessScheme {
     fn respond(state: &Self::ServerState, _q: &Self::Query) -> Result<Self::Response> {
         Ok(state.value)
     }
+    fn state_shape(_state: &Self::ServerState) -> raven_railgun_engine::StateShape {
+        raven_railgun_engine::StateShape {
+            entry_size_bytes: 1,
+            rows_per_shard: u64::MAX,
+        }
+    }
 }
 
 #[test]
@@ -74,7 +80,8 @@ fn query_atomicity_under_100_concurrent_queries_and_swaps() {
         handles.push(std::thread::spawn(move || {
             while !stop.load(Ordering::Acquire) {
                 let e = next_epoch.fetch_add(1, Ordering::Relaxed);
-                inst.swap_state(WitnessState { value: e }, Epoch(e));
+                inst.swap_state(WitnessState { value: e }, Epoch(e))
+                    .expect("same-shape swap");
                 total_swaps.fetch_add(1, Ordering::Relaxed);
             }
         }));
@@ -150,7 +157,8 @@ fn current_snapshot_returns_a_consistent_pair_under_stress() {
         handles.push(std::thread::spawn(move || {
             while !stop.load(Ordering::Acquire) {
                 let e = next_epoch.fetch_add(1, Ordering::Relaxed);
-                inst.swap_state(WitnessState { value: e }, Epoch(e));
+                inst.swap_state(WitnessState { value: e }, Epoch(e))
+                    .expect("same-shape swap");
             }
         }));
     }
@@ -240,7 +248,8 @@ fn in_flight_query_observes_pre_swap_state_even_after_concurrent_swap() {
         raven_railgun_engine::InstanceRole::Live,
         WitnessState { value: 1 },
     ));
-    inst.swap_state(WitnessState { value: 1 }, Epoch(1));
+    inst.swap_state(WitnessState { value: 1 }, Epoch(1))
+        .expect("same-shape swap");
 
     let snap_pre = inst.current_snapshot();
     assert_eq!(snap_pre.epoch.0, 1);
@@ -248,7 +257,9 @@ fn in_flight_query_observes_pre_swap_state_even_after_concurrent_swap() {
 
     let inst_for_swap = Arc::clone(&inst);
     let h = std::thread::spawn(move || {
-        inst_for_swap.swap_state(WitnessState { value: 99 }, Epoch(99));
+        inst_for_swap
+            .swap_state(WitnessState { value: 99 }, Epoch(99))
+            .expect("same-shape swap");
     });
     h.join().expect("swap joined");
 

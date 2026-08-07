@@ -28,6 +28,10 @@ use crate::{
 /// 16-byte version magic for the demo's snapshot payload.
 pub const SNAPSHOT_MAGIC: [u8; 16] = *b"RAVEN_ETHSTATE_1";
 
+fn swap_failed(e: raven_core::ServerError) -> EthStateError {
+    EthStateError::Setup(format!("swap state: {e}"))
+}
+
 const SCHEME_TAG: &str = "inspire-flat-balance";
 const ENCODER_LABEL: &str = "flat-balance-v1";
 const INSTANCE_ID: &str = "eth-state";
@@ -231,7 +235,9 @@ impl MainSidecar {
             #[cfg(feature = "cached-respond")]
             cache: snap.state.cache.clone(),
         };
-        self.main.swap_state(new_state, snap.epoch.next());
+        self.main
+            .swap_state(new_state, snap.epoch.next())
+            .map_err(swap_failed)?;
         Ok(())
     }
 
@@ -284,7 +290,9 @@ impl MainSidecar {
             cache: snap.state.cache.clone(),
         };
         // Atomic swap: in-flight reads against the old Arc complete unaffected.
-        self.main.swap_state(new_state, snap.epoch.next());
+        self.main
+            .swap_state(new_state, snap.epoch.next())
+            .map_err(swap_failed)?;
 
         // MUST precede the dirty clear: until it lands, recovery is snapshot plus WAL.
         self.commit_v6()?;
@@ -336,7 +344,9 @@ impl MainSidecar {
             #[cfg(feature = "cached-respond")]
             cache: snap.state.cache.clone(),
         };
-        self.main.swap_state(new_state, snap.epoch.next());
+        self.main
+            .swap_state(new_state, snap.epoch.next())
+            .map_err(swap_failed)?;
         Ok(())
     }
 
@@ -358,7 +368,9 @@ impl MainSidecar {
             #[cfg(feature = "cached-respond")]
             cache: snap.state.cache.clone(),
         };
-        self.sidecar.swap_state(new_state, snap.epoch.next());
+        self.sidecar
+            .swap_state(new_state, snap.epoch.next())
+            .map_err(swap_failed)?;
         Ok(())
     }
 
@@ -377,7 +389,9 @@ impl MainSidecar {
             #[cfg(feature = "cached-respond")]
             cache: snap.state.cache.clone(),
         };
-        self.sidecar.swap_state(new_state, snap.epoch.next());
+        self.sidecar
+            .swap_state(new_state, snap.epoch.next())
+            .map_err(swap_failed)?;
         Ok(())
     }
 
