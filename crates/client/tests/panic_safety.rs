@@ -196,11 +196,9 @@ fn extract_with_zero_entry_size_does_not_panic() {
          caught: {outcome:?}"
     );
     let inner = outcome.expect("not panicked");
-    let bytes = inner.expect("zero entry_size must Ok with empty Vec");
     assert!(
-        bytes.is_empty(),
-        "entry_size=0 must produce a zero-length plaintext, got {} bytes",
-        bytes.len()
+        inner.is_err(),
+        "entry_size=0 is not a legal cell width and must fail closed, got {inner:?}"
     );
 }
 

@@ -9,14 +9,18 @@
 //! Rust client.
 //!
 //! Every secret drawn here - the RLWE key, the packing-key noise, the per-query
-//! noise - comes from `OsRng`. No entry point on this surface accepts a caller-
-//! supplied seed; `tests/client_entropy_kat.rs` holds that line.
+//! noise - comes from `OsRng`. No `#[wasm_bindgen]` entry point accepts a caller-
+//! supplied seed; the one seeded constructor,
+//! [`build_seeded_query_rust_with_noise_seed`], is a `#[doc(hidden)]` test seam
+//! that never crosses the JS boundary. `tests/client_entropy_kat.rs` covers the
+//! entropy-drawn path.
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 #![deny(missing_docs)]
 
 use rand::rngs::OsRng;
 use rand::RngCore;
+use raven_inspire::inspiring::PackParams;
 use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, ShardConfig};
 use raven_inspire::rlwe::RlweSecretKey;
@@ -100,6 +104,25 @@ pub const WASM_BINCODE_DESERIALIZE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 /// residue, so a malformed cached blob is rejected by the cheap length check
 /// before a large contiguous allocation is attempted in a 32-bit wasm heap.
 pub const WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
+/// Decode server-supplied [`InspireParams`] and enforce [`InspireParams::validate`].
+///
+/// Every field arrives over the wire under the server's control, and `sigma` in
+/// particular drives secret-key and query-noise sampling, so nothing downstream may
+/// consume these unvalidated.
+fn decode_validated_params(
+    bytes: &[u8],
+    what: &'static str,
+) -> Result<InspireParams, WasmClientError> {
+    let params: InspireParams = decode(bytes, what)?;
+    params
+        .validate()
+        .map_err(|detail| WasmClientError::Decode {
+            what,
+            detail: format!("server-supplied params rejected: {detail}"),
+        })?;
+    Ok(params)
+}
 
 fn decode<T: for<'de> Deserialize<'de>>(
     bytes: &[u8],
@@ -195,7 +218,7 @@ pub fn build_client_session(
     crs_bincode: &[u8],
 ) -> Result<ClientSessionHandle, JsValue> {
     let bundle: WasmInstanceParamsBundle = decode(params_bundle_bincode, "params_bundle")?;
-    let inspire_params: InspireParams = decode(&bundle.inspire_params_bincode, "inspire_params")?;
+    let inspire_params = decode_validated_params(&bundle.inspire_params_bincode, "inspire_params")?;
     let secret_key: RlweSecretKey = decode(&bundle.rlwe_secret_key_bincode, "rlwe_secret_key")?;
     let crs = decode_versioned_crs(crs_bincode)?;
     // the packing keys ship to the server; a known error term solves for the secret key
@@ -220,13 +243,14 @@ pub fn register_client_session(
     instance_params_bincode: &[u8],
 ) -> Result<(), JsValue> {
     let bundle: WasmInstanceParamsBundle = decode(instance_params_bincode, "params_bundle")?;
-    let inspire_params: InspireParams = decode(&bundle.inspire_params_bincode, "inspire_params")?;
+    let inspire_params = decode_validated_params(&bundle.inspire_params_bincode, "inspire_params")?;
     if inspire_params.ring_dim != session.params.ring_dim
         || inspire_params.q != session.params.q
         || inspire_params.p != session.params.p
+        || inspire_params.sigma.to_bits() != session.params.sigma.to_bits()
     {
         return Err(JsValue::from_str(
-            "register_client_session: instance params drift detected (ring_dim/q/p mismatch with session)",
+            "register_client_session: instance params drift detected (ring_dim/q/p/sigma mismatch with session)",
         ));
     }
     Ok(())
@@ -242,8 +266,12 @@ pub struct WasmSeededQueryOutput {
     pub query_bytes: Vec<u8>,
 }
 
-/// Build a seeded PIR query for `target_idx`. Forces `PackingMode::Inspiring`
-/// to match the server's packing configuration.
+/// Build a seeded PIR query for `target_idx`, in whatever packing mode the
+/// session derived from the CRS.
+///
+/// The caller re-supplies `shard_config` per query, so it is checked against the
+/// session's ring: a drifted geometry would otherwise map `target_idx` to a
+/// different shard and retrieve the wrong record with no error.
 #[wasm_bindgen]
 pub fn build_seeded_query(
     session: &ClientSessionHandle,
@@ -251,6 +279,12 @@ pub fn build_seeded_query(
     target_idx: u64,
 ) -> Result<Vec<u8>, JsValue> {
     let shard_config: ShardConfig = decode(shard_config_bincode, "shard_config")?;
+    shard_config
+        .validate_for_params(&session.params)
+        .map_err(|detail| WasmClientError::Decode {
+            what: "shard_config",
+            detail: format!("shard geometry does not match the session ring: {detail}"),
+        })?;
     // reused query noise lets the server re-encrypt each candidate index and match bytes
     let mut sampler = os_seeded_sampler(session.params.sigma, "seeded_query_noise")?;
     let (client_state, query) = session
@@ -289,12 +323,34 @@ pub fn extract_response(
     // rehydrate serde-skipped key; extraction reads only rlwe_secret_key
     client_state.rlwe_secret_key = session.inner.rlwe_secret_key().clone();
     let response: ServerResponse = decode(response_bytes, "server_response")?;
-    let plaintext = extract_two_packing(&crs, &client_state, &response, entry_size as usize)
-        .map_err(|e| WasmClientError::Inspire {
-            op: "extract_two_packing",
-            detail: e.to_string(),
+    let entry_size = checked_entry_size(entry_size as usize, session.params.ring_dim)?;
+    let plaintext =
+        extract_two_packing(&crs, &client_state, &response, entry_size).map_err(|e| {
+            WasmClientError::Inspire {
+                op: "extract_two_packing",
+                detail: e.to_string(),
+            }
         })?;
     Ok(plaintext)
+}
+
+/// Reject an `entry_size` the session's ring cannot have encoded.
+///
+/// The caller supplies this across the JS boundary while the session holds the
+/// authoritative ring, so an off-law width would otherwise decode a well-formed
+/// record of the wrong length and return it as success.
+fn checked_entry_size(entry_size: usize, ring_dim: usize) -> Result<usize, WasmClientError> {
+    if entry_size == 0 || !PackParams::is_legal_width(ring_dim, entry_size.div_ceil(2)) {
+        return Err(WasmClientError::Decode {
+            what: "entry_size",
+            detail: format!(
+                "entry_size {entry_size} is not a legal cell width at ring_dim {ring_dim}: \
+                 ceil(entry_size/2) must be a non-zero power of two no larger than {}",
+                ring_dim / 2
+            ),
+        });
+    }
+    Ok(entry_size)
 }
 
 /// Serialize a [`ClientSessionHandle`] to a persistable warm-cache blob.
@@ -332,7 +388,7 @@ pub fn deserialize_client_session(
     session_bincode: &[u8],
 ) -> Result<ClientSessionHandle, JsValue> {
     let bundle: WasmInstanceParamsBundle = decode(params_bundle_bincode, "params_bundle")?;
-    let inspire_params: InspireParams = decode(&bundle.inspire_params_bincode, "inspire_params")?;
+    let inspire_params = decode_validated_params(&bundle.inspire_params_bincode, "inspire_params")?;
     ServerCrs::check_magic(crs_bincode).map_err(|e| WasmClientError::Decode {
         what: "server_crs",
         detail: e.to_string(),
@@ -369,9 +425,14 @@ pub fn build_instance_params_blob(
     inspire_params_bincode: &[u8],
     shard_config_bincode: &[u8],
 ) -> Result<Vec<u8>, JsValue> {
-    let inspire_params: InspireParams = decode(inspire_params_bincode, "inspire_params")?;
-    // decode-check catches caller params/shard drift at session bind
-    let _shard_config: ShardConfig = decode(shard_config_bincode, "shard_config")?;
+    let inspire_params = decode_validated_params(inspire_params_bincode, "inspire_params")?;
+    let shard_config: ShardConfig = decode(shard_config_bincode, "shard_config")?;
+    shard_config
+        .validate_for_params(&inspire_params)
+        .map_err(|detail| WasmClientError::Decode {
+            what: "shard_config",
+            detail: format!("shard geometry does not match the params ring: {detail}"),
+        })?;
     // the key is derived entirely from this sampler: one seed here is one key for every client
     let mut sampler = os_seeded_sampler(inspire_params.sigma, "rlwe_secret_key")?;
     let secret_key = RlweSecretKey::generate(&inspire_params, &mut sampler);
@@ -491,5 +552,6 @@ pub fn extract_response_rust(
     response: &ServerResponse,
     entry_size: usize,
 ) -> Result<Vec<u8>, String> {
+    let entry_size = checked_entry_size(entry_size, crs.ring_dim()).map_err(|e| e.to_string())?;
     extract_two_packing(crs, client_state, response, entry_size).map_err(|e| e.to_string())
 }

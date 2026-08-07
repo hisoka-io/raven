@@ -8,6 +8,9 @@ pub type SeedBytes = [u8; 32];
 
 /// The one named PRG type every scheme routes through, so the backing
 /// stream cipher can be swapped without touching call sites.
+///
+/// `SeedableRng` pins counter and nonce to 0, so RFC 8439 vectors that vary
+/// them are unreachable through this type.
 #[derive(Debug, Clone)]
 pub struct DeterministicRng {
     inner: rand_chacha::ChaCha20Rng,
@@ -110,11 +113,6 @@ mod tests {
         let expected = hex::decode(expected_hex).expect("valid hex");
         assert_eq!(got.as_slice(), expected.as_slice());
     }
-
-    /// `SeedableRng` pins counter and nonce to 0, so RFC 8439 vectors that
-    /// vary them are unreachable through this type.
-    #[test]
-    fn aead_scope_note() {}
 
     #[test]
     fn from_u64_is_deterministic_and_distinct_per_seed() {
