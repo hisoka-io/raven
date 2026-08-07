@@ -156,12 +156,9 @@ fn extract_with_inflated_entry_size_does_not_silently_succeed() {
         extract_response_rust(&crs, &state, &response, inflated_entry_size)
     }));
     assert!(
-        outcome.is_ok() || outcome.is_err(),
-        "catch_unwind always returns - this assertion exists to document \
-         that the test PASSES whether the boundary returns Err OR panics; \
-         the load-bearing requirement is that the wasm-bindgen surface \
-         calls init_panic_hook so JS receives a structured Error in \
-         either case (see init_panic_hook docs)"
+        !matches!(outcome, Ok(Ok(_))),
+        "entry_size {inflated_entry_size} exceeds ring_dim: extraction must \
+         fail closed with Err or a caught panic, never return a decoded value"
     );
 }
 

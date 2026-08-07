@@ -503,6 +503,33 @@ mod tests {
         assert_eq!(replay.entries.first().expect("present").seq, 3);
     }
 
+    /// The range arguments only name the archive file; the whole `current.log`
+    /// is sealed. A caller assuming partial semantics would lose the tail.
+    #[test]
+    fn archive_seals_the_whole_log_regardless_of_the_range_arguments() {
+        let (_d, layout) = make_layout();
+        let wal = Wal::open(&layout, None).expect("open");
+        for i in 0..5u32 {
+            wal.append(&test_payload(i), 100 + u64::from(i))
+                .expect("append");
+        }
+        wal.archive(0, 1).expect("archive");
+        assert!(layout.wal_archived_path(0, 1).is_file());
+        let replay = wal.replay().expect("replay");
+        assert!(
+            replay.entries.is_empty(),
+            "seqs 2..=4 are outside the named range yet were sealed too; if they \
+             now survive, archive honours its range and callers may rely on it"
+        );
+        wal.append(&test_payload(99), 200).expect("append");
+        let replay = wal.replay().expect("replay");
+        assert_eq!(
+            replay.entries.first().expect("present").seq,
+            5,
+            "seq allocation continues across an archive"
+        );
+    }
+
     #[test]
     fn non_monotonic_seq_is_treated_as_torn_tail() {
         let (_d, layout) = make_layout();

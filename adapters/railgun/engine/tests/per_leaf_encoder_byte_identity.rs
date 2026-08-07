@@ -80,6 +80,38 @@ proptest! {
         }
     }
 
+    /// The sibling test holds for any encoding; this pins the encoding itself.
+    #[test]
+    fn materialize_shard_places_each_leaf_at_its_row_and_zeroes_the_rest(
+        insert_count in 0u32..(TOTAL_SHARDS * ENTRIES_PER_SHARD),
+    ) {
+        let store = build_store_from_pattern(insert_count as usize);
+
+        for shard_id in 0..TOTAL_SHARDS {
+            let bytes = materialize_shard_bytes(&store, shard_id, ENTRIES_PER_SHARD, RECORD_SIZE);
+            prop_assert_eq!(bytes.len(), ENTRIES_PER_SHARD as usize * RECORD_SIZE);
+
+            for row in 0..ENTRIES_PER_SHARD {
+                let global = shard_id * ENTRIES_PER_SHARD + row;
+                let start = row as usize * RECORD_SIZE;
+                let expected = if global < insert_count {
+                    canonical((global % 250) as u8 + 1)
+                } else {
+                    [0u8; 32]
+                };
+                prop_assert_eq!(
+                    &bytes[start..start + RECORD_SIZE],
+                    &expected[..],
+                    "shard {} row {} (global {}, insert_count {})",
+                    shard_id,
+                    row,
+                    global,
+                    insert_count
+                );
+            }
+        }
+    }
+
     #[test]
     fn per_leaf_affected_shards_matches_logical_store_dirty_marking(
         leaf_index in 0u32..(TOTAL_SHARDS * ENTRIES_PER_SHARD),
