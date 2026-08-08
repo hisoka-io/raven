@@ -124,6 +124,22 @@ fn decode_validated_params(
     Ok(params)
 }
 
+/// Decode the bundle's `ShardConfig`, pin it to `params`, and return the server's
+/// declared record width.
+fn bundle_entry_size(
+    shard_config_bincode: &[u8],
+    params: &InspireParams,
+) -> Result<usize, WasmClientError> {
+    let shard_config: ShardConfig = decode(shard_config_bincode, "shard_config")?;
+    shard_config
+        .validate_for_params(params)
+        .map_err(|detail| WasmClientError::Decode {
+            what: "shard_config",
+            detail: format!("shard geometry does not match the params ring: {detail}"),
+        })?;
+    Ok(shard_config.entry_size_bytes)
+}
+
 fn decode<T: for<'de> Deserialize<'de>>(
     bytes: &[u8],
     what: &'static str,
@@ -198,12 +214,16 @@ fn decode_versioned_crs(bytes: &[u8]) -> Result<ServerCrs, WasmClientError> {
 pub struct ClientSessionHandle {
     inner: ClientSession,
     params: InspireParams,
+    /// Server-declared record width from the params bundle's `ShardConfig`.
+    /// Extraction rejects any caller-supplied width that disagrees.
+    entry_size_bytes: usize,
 }
 
 impl std::fmt::Debug for ClientSessionHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientSessionHandle")
             .field("ring_dim", &self.params.ring_dim)
+            .field("entry_size_bytes", &self.entry_size_bytes)
             .field("has_handle", &self.inner.session_handle().is_some())
             .finish_non_exhaustive()
     }
@@ -229,9 +249,11 @@ pub fn build_client_session(
             detail: e.to_string(),
         }
     })?;
+    let entry_size_bytes = bundle_entry_size(&bundle.shard_config_bincode, &inspire_params)?;
     Ok(ClientSessionHandle {
         inner: session,
         params: inspire_params,
+        entry_size_bytes,
     })
 }
 
@@ -323,7 +345,7 @@ pub fn extract_response(
     // rehydrate serde-skipped key; extraction reads only rlwe_secret_key
     client_state.rlwe_secret_key = session.inner.rlwe_secret_key().clone();
     let response: ServerResponse = decode(response_bytes, "server_response")?;
-    let entry_size = checked_entry_size(entry_size as usize, session.params.ring_dim)?;
+    let entry_size = entry_size_against_session(entry_size as usize, session)?;
     let plaintext =
         extract_two_packing(&crs, &client_state, &response, entry_size).map_err(|e| {
             WasmClientError::Inspire {
@@ -351,6 +373,74 @@ fn checked_entry_size(entry_size: usize, ring_dim: usize) -> Result<usize, WasmC
         });
     }
     Ok(entry_size)
+}
+
+/// Pin a caller-supplied width to the server's declared one.
+///
+/// The width law alone admits a *smaller* legal width, which decodes a prefix of
+/// the record and returns it as success, so the declared size is the authority.
+fn pin_entry_size(
+    entry_size: usize,
+    ring_dim: usize,
+    declared: usize,
+) -> Result<usize, WasmClientError> {
+    let entry_size = checked_entry_size(entry_size, ring_dim)?;
+    if entry_size != declared {
+        return Err(WasmClientError::Decode {
+            what: "entry_size",
+            detail: format!(
+                "entry_size {entry_size} disagrees with the server-declared record size \
+                 {declared}; extraction would return a truncated or over-read record"
+            ),
+        });
+    }
+    Ok(entry_size)
+}
+
+fn entry_size_against_session(
+    entry_size: usize,
+    session: &ClientSessionHandle,
+) -> Result<usize, WasmClientError> {
+    pin_entry_size(
+        entry_size,
+        session.params.ring_dim,
+        session.entry_size_bytes,
+    )
+}
+
+#[cfg(test)]
+mod entry_size_tests {
+    use super::pin_entry_size;
+
+    const RING_DIM: usize = 2048;
+    const DECLARED: usize = 512;
+
+    #[test]
+    fn the_declared_width_is_accepted() {
+        assert_eq!(
+            pin_entry_size(DECLARED, RING_DIM, DECLARED).expect("declared width"),
+            DECLARED
+        );
+    }
+
+    /// The case the cell-width law alone cannot catch: 256 is a legal width, so
+    /// only the declared size refuses it.
+    #[test]
+    fn a_deflated_but_legal_width_is_refused() {
+        let err = pin_entry_size(256, RING_DIM, DECLARED)
+            .expect_err("a legal-but-wrong width must be refused");
+        assert!(
+            err.to_string().contains("server-declared record size"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_inflated_width_and_zero_are_refused() {
+        pin_entry_size(1024, RING_DIM, DECLARED).expect_err("inflated width");
+        pin_entry_size(0, RING_DIM, DECLARED).expect_err("zero width");
+        pin_entry_size(328, RING_DIM, DECLARED).expect_err("off-law width");
+    }
 }
 
 /// Serialize a [`ClientSessionHandle`] to a persistable warm-cache blob.
@@ -412,9 +502,11 @@ pub fn deserialize_client_session(
         }
         .into());
     }
+    let entry_size_bytes = bundle_entry_size(&bundle.shard_config_bincode, &inspire_params)?;
     Ok(ClientSessionHandle {
         inner,
         params: inspire_params,
+        entry_size_bytes,
     })
 }
 
