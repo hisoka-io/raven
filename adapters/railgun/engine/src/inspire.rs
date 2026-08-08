@@ -278,11 +278,28 @@ pub fn build_padded_batch(
     let mut states = Vec::with_capacity(padded);
     let mut queries = Vec::with_capacity(padded);
     for slot in 0..padded {
-        // Cycling keeps the pads' cleartext shard distribution equal to the real slots'.
-        let index = global_indices
-            .get(slot % global_indices.len())
-            .copied()
-            .unwrap_or_default();
+        // Pads draw uniformly from the real set: same cleartext shard distribution as
+        // cycling, without the period-`global_indices.len()` repeat that published the
+        // real count. Residual: reals hold slots 0..len in order, so with distinct
+        // reals the first repeated shard still bounds the count. Closing that needs a
+        // whole-batch shuffle plus a permutation map, which changes this contract.
+        let index = if let Some(real) = global_indices.get(slot) {
+            *real
+        } else {
+            let draw = raven_inspire::math::gaussian::os_seed("batch_pad_index")
+                .map_err(|e| AdapterError::Scheme(format!("pad index entropy: {e}")))?;
+            let draw64 = u64::from_le_bytes([
+                draw[0], draw[1], draw[2], draw[3], draw[4], draw[5], draw[6], draw[7],
+            ]);
+            let len = u64::try_from(global_indices.len())
+                .map_err(|_| AdapterError::Scheme("batch length exceeds u64".to_owned()))?;
+            let pick = usize::try_from(draw64 % len)
+                .map_err(|_| AdapterError::Scheme("pad index exceeds usize".to_owned()))?;
+            global_indices
+                .get(pick)
+                .copied()
+                .ok_or_else(|| AdapterError::Scheme("pad index out of range".to_owned()))?
+        };
         let (state, query) = build_seeded_query(client_session, shard_config, index, params)?;
         states.push(state);
         queries.push(query);
