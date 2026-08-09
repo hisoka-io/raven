@@ -135,6 +135,31 @@ function mountBatchRoute(server: MockServer, freshness?: { epoch?: number; schem
   );
 }
 
+// The fully-cached auth path revalidates against `/v1/status`, so a batch mock that
+// reports an epoch has to publish the same epoch here.
+function mountStatusRoute(server: MockServer, instanceId: string, epoch: number): void {
+  server.route(
+    (req) => req.url === "/v1/status",
+    (_req, _body, res) => {
+      writeJson(res, {
+        scheme: "inspire",
+        instances: [
+          {
+            id: instanceId,
+            epoch,
+            role: "live",
+            drain_state: "active",
+            in_flight: 0,
+            active_k_concurrency: 4,
+          },
+        ],
+        consumer: null,
+      });
+      return true;
+    },
+  );
+}
+
 function mountSingleQueryRoute(server: MockServer, statusByte: number): void {
   server.route(
     (req) => /^\/v1\/instance\/[^/]+\/query$/.test(req.url ?? ""),
@@ -408,11 +433,16 @@ describe("client-side IMT cache hit / miss", () => {
           dv.setUint32(off, elemBytes, true);
           off += 8 + elemBytes;
         }
-        res.writeHead(200, { "content-type": "application/octet-stream" });
+        res.writeHead(200, {
+          "content-type": "application/octet-stream",
+          "x-raven-epoch": "1",
+          "x-raven-schema-version": "1",
+        });
         res.end(Buffer.from(out));
         return true;
       },
     );
+    mountStatusRoute(server, "commit-tree-0", 1);
     const cache = new ImtCache({ disableIndexedDb: true });
     const sdk = new RavenPOINodeInterface({
       endpoint: server.url,
@@ -445,11 +475,16 @@ describe("client-side IMT cache hit / miss", () => {
           dv.setUint32(off, elemBytes, true);
           off += 8 + elemBytes;
         }
-        res.writeHead(200, { "content-type": "application/octet-stream" });
+        res.writeHead(200, {
+          "content-type": "application/octet-stream",
+          "x-raven-epoch": "1",
+          "x-raven-schema-version": "1",
+        });
         res.end(Buffer.from(out));
         return true;
       },
     );
+    mountStatusRoute(server, "commit-tree-0", 1);
     const cache = new ImtCache({ disableIndexedDb: true });
     cache.noteFreshness("1", 1);
     const sdk = new RavenPOINodeInterface({

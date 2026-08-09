@@ -1,9 +1,11 @@
-//! `handle_log_frame` must DROP malformed log frames whose
-//! `block_number` is `None` rather than fabricate a height from the
-//! observed chain head. Routing the event with a fabricated height
-//! breaks downstream reorg-truncate semantics; the operator-visible
-//! `raven_railgun_indexer_dropped_logs_total` counter makes the drop
-//! observable.
+//! Every log-ingest path must DROP malformed logs whose `block_number`
+//! is `None` rather than fabricate a height. Routing the event with a
+//! fabricated height breaks downstream reorg-truncate semantics; the
+//! operator-visible `raven_railgun_indexer_dropped_logs_total` counter
+//! makes the drop observable.
+//!
+//! Covers the WS frame path (`handle_log_frame`) and the polling
+//! `events_in_range` paths served over a mock JSON-RPC endpoint.
 
 #![allow(
     clippy::expect_used,
@@ -26,15 +28,20 @@ use std::{
     time::Duration,
 };
 
-use alloy::primitives::{Address as AlloyAddress, B256, U256};
+use alloy::primitives::{address, Address as AlloyAddress, B256, U256};
 use alloy::sol_types::SolValue;
 use async_trait::async_trait;
+use axum::{extract::State as AxumState, http::StatusCode, routing::post, Json, Router};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use raven_railgun_core::RailgunEvent;
-use raven_railgun_indexer::{
-    abi, ChainSource, IndexerMessage, LogStreamer, Result, SubscribeStreams, SubscribeWorker,
-    SubscribeWorkerConfig,
+use raven_railgun_indexer::rpc_pool::{
+    EndpointConfig, PoolConfig, PoolStrategy, PooledRpcChainSource, RpcEndpointPool,
 };
+use raven_railgun_indexer::{
+    abi, ChainSource, IndexerMessage, LogStreamer, Result, RpcChainSource, SubscribeStreams,
+    SubscribeWorker, SubscribeWorkerConfig,
+};
+use serde_json::json;
 use std::sync::OnceLock;
 use tokio::sync::mpsc;
 
@@ -342,4 +349,185 @@ async fn subscribe_handle_log_succeeds_when_block_number_present() {
         }
         other => panic!("expected Shield; got {other:?}"),
     }
+}
+
+const MOCK_CHAIN_ID: u64 = 1;
+
+/// `blockNumber: null` is what an `eth_getLogs` window overlapping the
+/// pending block returns; alloy rejects an omitted key outright, so null
+/// is the only shape that reaches the decoder as `None`.
+fn shield_log_json(block_number: Option<u64>) -> serde_json::Value {
+    use alloy::sol_types::SolEvent;
+    let log = synthetic_shield_log(block_number, 0);
+    json!({
+        "address": "0x0000000000000000000000000000000000000000",
+        "topics": [format!("0x{}", alloy::hex::encode(abi::Shield::SIGNATURE_HASH))],
+        "data": format!("0x{}", alloy::hex::encode(&log.inner.data.data)),
+        "blockHash": "0x0000000000000000000000000000000000000000000000000000000000000001",
+        "blockNumber": block_number.map(|n| format!("0x{n:x}")),
+        "transactionHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "transactionIndex": "0x0",
+        "logIndex": "0x0",
+        "removed": false,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct LogsMockState {
+    logs: Arc<Vec<serde_json::Value>>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct JsonRpcRequest {
+    method: String,
+    #[serde(default)]
+    id: serde_json::Value,
+}
+
+async fn logs_mock_handler(
+    AxumState(state): AxumState<LogsMockState>,
+    Json(req): Json<JsonRpcRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let result = match req.method.as_str() {
+        "eth_chainId" => json!(format!("0x{MOCK_CHAIN_ID:x}")),
+        "eth_getLogs" => serde_json::Value::Array(state.logs.as_ref().clone()),
+        other => {
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": req.id,
+                    "error": { "code": -32601, "message": format!("unexpected method: {other}") }
+                })),
+            );
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(json!({ "jsonrpc": "2.0", "id": req.id, "result": result })),
+    )
+}
+
+async fn spawn_logs_mock(logs: Vec<serde_json::Value>) -> (String, tokio::task::JoinHandle<()>) {
+    let state = LogsMockState {
+        logs: Arc::new(logs),
+    };
+    let app = Router::new()
+        .route("/", post(logs_mock_handler))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}/"), handle)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn polling_events_in_range_drops_log_when_block_number_none() {
+    let s = snap();
+    let before = dropped_counter_by_name(s);
+
+    let (url, _server) = spawn_logs_mock(vec![
+        shield_log_json(Some(100)),
+        shield_log_json(None),
+        shield_log_json(Some(102)),
+    ])
+    .await;
+
+    let proxy = address!("fa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9");
+    let source = RpcChainSource::new(url, proxy, 0, MOCK_CHAIN_ID);
+    let events = source.events_in_range(1, 200).await.expect("events");
+
+    let heights: Vec<u64> = events
+        .iter()
+        .map(|e| match e {
+            RailgunEvent::Shield { block_number, .. } => *block_number,
+            other => panic!("expected Shield; got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        heights,
+        vec![100, 102],
+        "the heightless log must be dropped, not fabricated at 0"
+    );
+    let after = dropped_counter_by_name(s);
+    assert!(
+        after > before,
+        "drop counter must advance; before={before} after={after}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pooled_events_in_range_drops_log_when_block_number_none() {
+    let s = snap();
+    let before = dropped_counter_by_name(s);
+
+    let (url, _server) = spawn_logs_mock(vec![
+        shield_log_json(Some(300)),
+        shield_log_json(None),
+        shield_log_json(Some(301)),
+    ])
+    .await;
+
+    let pool = Arc::new(
+        RpcEndpointPool::new(
+            vec![EndpointConfig {
+                url,
+                rps: 100,
+                burst: 100,
+            }],
+            PoolConfig {
+                strategy: PoolStrategy::RoundRobin,
+                ..PoolConfig::default()
+            },
+        )
+        .expect("pool builds"),
+    );
+    let proxy = address!("fa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9");
+    let source = PooledRpcChainSource::new(Arc::clone(&pool), proxy, MOCK_CHAIN_ID);
+    let events = source.events_in_range(1, 400).await.expect("events");
+
+    let heights: Vec<u64> = events
+        .iter()
+        .map(|e| match e {
+            RailgunEvent::Shield { block_number, .. } => *block_number,
+            other => panic!("expected Shield; got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        heights,
+        vec![300, 301],
+        "the heightless log must be dropped, not fabricated at 0"
+    );
+    let after = dropped_counter_by_name(s);
+    assert!(
+        after > before,
+        "drop counter must advance; before={before} after={after}"
+    );
+}
+
+/// The WS `events_in_range` path shares this decision but needs a live
+/// WebSocket peer to drive end to end, so it is pinned here directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn block_number_or_drop_counts_the_drop_and_keeps_concrete_heights() {
+    let s = snap();
+    let before = dropped_counter_by_name(s);
+
+    assert_eq!(
+        raven_railgun_indexer::block_number_or_drop(&synthetic_shield_log(Some(77), 0)),
+        Some(77)
+    );
+    assert_eq!(dropped_counter_by_name(s), before, "no drop to count");
+
+    assert_eq!(
+        raven_railgun_indexer::block_number_or_drop(&synthetic_shield_log(None, 0)),
+        None
+    );
+    assert!(
+        dropped_counter_by_name(s) > before,
+        "the heightless log must be counted as dropped"
+    );
 }

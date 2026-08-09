@@ -228,6 +228,105 @@ async fn layer2_verifier_fires_per_commit_and_cascades_reorg_on_out_of_sync() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn layer2_first_verdict_out_of_sync_must_not_truncate_to_genesis() {
+    const LEAF_COUNT: u32 = 5;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    // No InSync round precedes the flip, so the verifier has no anchor height.
+    let chain_source = Arc::new(SyntheticChainSource::new(0));
+
+    let mut config = OrchestratorConfig::demo(dir.path().to_path_buf(), "w2-no-anchor");
+    config.record_size = TOY_ENTRY_SIZE;
+    config.use_flock = false;
+    config.role = InstanceRole::Live;
+    config.scheme_tag = SCHEME_TAG.to_owned();
+    config.snapshot_policy = aggressive_snapshot_policy();
+    config.verification_mode = VerificationMode::ChainRootHistory;
+    config.verification_cadence_n = 1;
+    config.verification_tree_number = 0;
+    config.chain_source = Some(Arc::clone(&chain_source) as Arc<dyn ChainSource>);
+
+    let params = InspireParams::secure_128_d2048();
+    let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
+
+    for i in 0..LEAF_COUNT {
+        let height = 100 + u64::from(i);
+        let event = RailgunEvent::Transact {
+            block_number: height,
+            tx_hash: [0u8; 32],
+            tree_number: 0,
+            start_position: i,
+            leaves: vec![CommitmentLeaf {
+                tree_number: 0,
+                leaf_index: i,
+                commitment_hash: canonical_commitment(
+                    u8::try_from((i & 0xff) | 0x20).expect("byte"),
+                ),
+                ciphertext: vec![],
+            }],
+        };
+        handle
+            .sender
+            .send(ConsumerEvent::Chain(event, height))
+            .await
+            .expect("send leaf");
+    }
+
+    // A genesis cascade stalls events_processed at 1 and fires a reorg; a refusal
+    // drains all five. Either settles this loop, so it cannot mask the defect.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let m = *handle.metrics.lock();
+        if chain_source.verify_count() >= 1
+            && (m.events_processed >= u64::from(LEAF_COUNT) || m.reorgs_handled >= 1)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < drain_deadline,
+            "verifier never fired within 30 s; events_processed = {}, commits_fired = {}, \
+             reorgs_handled = {}, verify_calls = {}",
+            m.events_processed,
+            m.commits_fired,
+            m.reorgs_handled,
+            chain_source.verify_count(),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let verify_calls = chain_source.verify_count();
+    assert!(
+        verify_calls >= 1,
+        "verifier must have produced at least one OutOfSync verdict; got {verify_calls}"
+    );
+
+    let leaf_count = handle.logical_store.lock().leaf_count();
+    assert!(
+        leaf_count > 0,
+        "an anchorless OutOfSync must not truncate the tree to genesis; leaf_count = {leaf_count}"
+    );
+    assert!(
+        handle.logical_store.lock().leaf(0, 0).is_some(),
+        "leaf at index 0 must survive an anchorless OutOfSync verdict",
+    );
+
+    let metrics = *handle.metrics.lock();
+    assert_eq!(
+        metrics.reorgs_handled, 0,
+        "OutOfSync with no prior InSync anchor MUST NOT cascade a reorg; got {}",
+        metrics.reorgs_handled,
+    );
+
+    handle
+        .sender
+        .send(ConsumerEvent::Shutdown)
+        .await
+        .expect("shutdown");
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle.consumer).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn layer2_verifier_does_not_fire_on_upstream_signature_instance() {
     let dir = tempfile::tempdir().expect("tempdir");
     // Fails on the first verify, so any verifier call at all trips this.

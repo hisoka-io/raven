@@ -53,6 +53,21 @@ pub enum IndexerError {
         /// Chain id reported by the RPC's `eth_chainId` response.
         actual: u64,
     },
+    #[error(
+        "reorg window holds no hash for cursor {cursor}: {window_len} entries, \
+         oldest={window_oldest:?} newest={window_newest:?}; a window gap is \
+         indistinguishable from a divergence, so no reorg height can be derived"
+    )]
+    ReorgWindowMiss {
+        /// Height whose cached hash was required.
+        cursor: u64,
+        /// Entries present in the window.
+        window_len: usize,
+        /// Lowest cached height, `None` when the window is empty.
+        window_oldest: Option<u64>,
+        /// Highest cached height, `None` when the window is empty.
+        window_newest: Option<u64>,
+    },
 }
 
 pub type Result<T, E = IndexerError> = core::result::Result<T, E>;
@@ -247,7 +262,9 @@ impl ChainSource for RpcChainSource {
 
         let mut events = Vec::with_capacity(logs.len());
         for log in logs {
-            let block_number = log.block_number.unwrap_or(0);
+            let Some(block_number) = block_number_or_drop(&log) else {
+                continue;
+            };
             let tx_hash = log.transaction_hash.map_or([0u8; 32], |h| h.0);
             let primary_topic = log.topic0().copied().unwrap_or_default();
             let event = decode_log_to_railgun_event(primary_topic, &log, block_number, tx_hash)?;
@@ -385,6 +402,28 @@ fn compute_shield_commitment_hash(preimage: &abi::CommitmentPreimage) -> Result<
     let value_be = value_u256.to_be_bytes::<32>();
     shield_commitment_hash(npk, token_hash, value_be)
         .map_err(|e| IndexerError::Decode(format!("shield commitment Poseidon: {e}")))
+}
+
+/// Height of a log, or `None` after counting it on
+/// `raven_railgun_indexer_dropped_logs_total`.
+///
+/// A pending log carries no height. Fabricating one lands the event at height
+/// 0, which no later `Reorg(h)` can undo: truncation drops only leaves above `h`.
+#[must_use]
+pub fn block_number_or_drop(log: &alloy::rpc::types::eth::Log) -> Option<u64> {
+    if log.block_number.is_none() {
+        metrics::counter!(
+            "raven_railgun_indexer_dropped_logs_total",
+            "reason" => "missing_block_number"
+        )
+        .increment(1);
+        tracing::warn!(
+            tx_hash = ?log.transaction_hash,
+            topic0 = ?log.topic0(),
+            "dropping log with missing block_number"
+        );
+    }
+    log.block_number
 }
 
 /// Decode a single `eth_getLogs` entry into a typed `RailgunEvent`.
@@ -752,16 +791,31 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
                 }
             }
 
-            if let Ok(tip_hash) = self.source.block_hash(to).await {
-                hash_cache.insert(to, tip_hash);
-                if hash_cache.len() > cap_depth {
-                    let depth_u64 = u64::try_from(cap_depth).unwrap_or(u64::MAX);
-                    let to_keep = to.saturating_sub(depth_u64);
-                    hash_cache.retain(|&n, _| n >= to_keep);
+            // An uncached tip is a hole the walk-back cannot cross, so hold the
+            // cursor rather than scan past it.
+            let tip_hash = match self.source.block_hash(to).await {
+                Ok(h) => h,
+                Err(e) => {
+                    metrics::counter!("raven_railgun_indexer_reorg_window_tip_hash_failed_total")
+                        .increment(1);
+                    tracing::warn!(
+                        error = %e,
+                        to,
+                        cursor,
+                        "reorg-window tip hash unavailable; holding cursor"
+                    );
+                    let _ = self.send_heartbeat(latest, cursor);
+                    continue;
                 }
-                if let Some(path) = config.reorg_window_path.as_ref() {
-                    persist_reorg_window_best_effort(path, &hash_cache);
-                }
+            };
+            hash_cache.insert(to, tip_hash);
+            // Bound by entry count: a tick spans a whole chunk, so a
+            // block-distance bound would evict every prior boundary.
+            while hash_cache.len() > cap_depth {
+                hash_cache.pop_first();
+            }
+            if let Some(path) = config.reorg_window_path.as_ref() {
+                persist_reorg_window_best_effort(path, &hash_cache);
             }
 
             cursor = to;
@@ -1057,7 +1111,8 @@ pub fn build_indexer_channel() -> (
 /// Layer 1 reorg detection.
 ///
 /// Re-fetches the cursor's block hash and walks the cache backward to find the surviving tip.
-/// Returns `Ok(None)` if canonical, `Ok(Some(h))` with the surviving height, or
+/// Returns `Ok(None)` if canonical, `Ok(Some(h))` with the surviving height,
+/// `Err(ReorgWindowMiss)` if the cursor is not in the window, or
 /// `Err(ReorgTooDeep)` if no cached entry survives (operator intervention required).
 pub async fn detect_reorg_layer1<S: ChainSource + ?Sized>(
     source: &S,
@@ -1065,7 +1120,14 @@ pub async fn detect_reorg_layer1<S: ChainSource + ?Sized>(
     cursor: u64,
 ) -> Result<Option<u64>> {
     let observed = source.block_hash(cursor).await?;
-    let cached = cache.get(&cursor).copied().unwrap_or([0u8; 32]);
+    let Some(cached) = cache.get(&cursor).copied() else {
+        return Err(IndexerError::ReorgWindowMiss {
+            cursor,
+            window_len: cache.len(),
+            window_oldest: cache.keys().next().copied(),
+            window_newest: cache.keys().next_back().copied(),
+        });
+    };
     if observed == cached {
         return Ok(None);
     }

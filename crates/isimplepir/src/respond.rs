@@ -24,6 +24,19 @@ pub fn respond(state: &ServerState, query: &[u32]) -> Result<ServerResponse> {
         });
     }
 
+    let expected_db_len = params.l.saturating_mul(params.m);
+    if state.db.len() != expected_db_len {
+        return Err(IsimplePirError::DatabaseShape {
+            reason: format!(
+                "database length {} does not match L * M = {} * {} = {}",
+                state.db.len(),
+                params.l,
+                params.m,
+                expected_db_len,
+            ),
+        });
+    }
+
     let answer = respond_matmul(&state.db, query, params.l, params.m);
     Ok(ServerResponse { answer })
 }

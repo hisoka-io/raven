@@ -93,6 +93,11 @@ getrandom = { version = "0.3", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 hkdf = { version = "0.12", default-features = false }
 
+# Constant-time selects/compares. Default features deliberately: its barrier is
+# an out-of-line volatile read, which `core::hint::black_box` is not, and that is
+# what stops LLVM re-introducing a branch on a secret operand.
+subtle = "2.6"
+
 # Serialization
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 bincode = "1.3"

@@ -14,11 +14,17 @@ pub fn extract(
     state: &ClientState,
     response: &ServerResponse,
 ) -> Result<u32> {
-    if hint.l != params.l || hint.n != params.n {
+    let expected_hint_len = params.l.saturating_mul(params.n);
+    if hint.l != params.l || hint.n != params.n || hint.data.len() != expected_hint_len {
         return Err(IsimplePirError::InvalidParams {
             reason: format!(
-                "hint shape ({}, {}) mismatches params (L={}, n={})",
-                hint.l, hint.n, params.l, params.n,
+                "hint shape (L={}, n={}, data={}) mismatches params (L={}, n={}, data={})",
+                hint.l,
+                hint.n,
+                hint.data.len(),
+                params.l,
+                params.n,
+                expected_hint_len,
             ),
         });
     }
@@ -56,15 +62,20 @@ pub fn extract(
     }
 
     let row_start = state.row.saturating_mul(params.n);
+    let row_end = row_start.saturating_add(params.n);
+    let Some(hint_row) = hint.data.get(row_start..row_end) else {
+        return Err(IsimplePirError::InvalidParams {
+            reason: format!(
+                "hint storage corrupt: row {} spans [{}, {}) but data length is {}",
+                state.row,
+                row_start,
+                row_end,
+                hint.data.len(),
+            ),
+        });
+    };
     let mut interm: u32 = 0;
-    for j in 0..params.n {
-        let h_idx = row_start.saturating_add(j);
-        let Some(&h_ij) = hint.data.get(h_idx) else {
-            continue;
-        };
-        let Some(&s_j) = state.secret.get(j) else {
-            continue;
-        };
+    for (&h_ij, &s_j) in hint_row.iter().zip(state.secret.iter()) {
         interm = interm.wrapping_add(h_ij.wrapping_mul(s_j));
     }
 

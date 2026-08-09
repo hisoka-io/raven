@@ -1,3 +1,8 @@
+//! In-memory reference implementation of the [`crate::storage`] contract.
+//!
+//! The `BTreeMap` is what makes [`crate::storage::Snapshot::scan`] ascending;
+//! a hash-ordered container would violate the contract.
+
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -7,6 +12,7 @@ use bytes::Bytes;
 use crate::error::Error;
 use crate::storage::{Row, Snapshot, StorageBackend, Transaction};
 
+/// Non-persistent [`StorageBackend`] holding every row in process memory.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     inner: RwLock<BTreeMap<u64, Bytes>>,
@@ -14,14 +20,17 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
+    /// Empty store at generation `0`.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Generation of the most recent commit.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
 
+    /// Pin a snapshot as [`MemorySnapshot`] rather than a boxed trait object.
     pub fn snapshot_concrete(&self) -> Result<MemorySnapshot, Error> {
         let guard = self
             .inner
@@ -115,6 +124,7 @@ impl Transaction for MemoryTxn<'_> {
     }
 }
 
+/// Isolated view of a [`MemoryStore`], cheap to clone and pinned to one generation.
 #[derive(Debug, Clone)]
 pub struct MemorySnapshot {
     rows: Arc<Vec<Row>>,

@@ -106,6 +106,9 @@ const DEFAULT_CHAIN_ID = 1;
 const DEFAULT_CHAIN_TYPE = 0; // upstream `ChainType.EVM`
 const NODE_HASH_BYTES = 32;
 const PATH_RECORD_BYTES = TREE_DEPTH * NODE_HASH_BYTES;
+/** Epoch tag before the instance has ever reported one; never collides with a real epoch. */
+const UNOBSERVED_EPOCH = "";
+const AUTH_PATH_ATTEMPTS = 2;
 
 export class RavenPOINodeInterface {
   private readonly chainId: number;
@@ -119,6 +122,8 @@ export class RavenPOINodeInterface {
   private readonly clientPirContexts: Map<string, ClientPirContext>;
   private readonly bcToIdxMaps: Map<string, BcToIdxMap>;
   private readonly cache: ImtCache;
+  // Last snapshot epoch each instance reported; auth-path cache entries are tagged with it.
+  private readonly observedEpochs: Map<string, string> = new Map();
 
   // Bounded ring for the privacy-invariant test harness.
   private readonly capturedRequests: CapturedWireRequest[] = [];
@@ -521,8 +526,8 @@ export class RavenPOINodeInterface {
     return buildMerkleProof(leafIndex, "", siblings);
   }
 
-  /** Auth-path sibling hashes indexed by level (0 = sibling of the leaf); cache
-   * misses batch into one `POST /v1/instance/<id>/batch`. */
+  /** Auth-path sibling hashes indexed by level (0 = sibling of the leaf); every level
+   * resolves against one snapshot epoch, retrying once if the adapter re-snapshots mid-assembly. */
   private async fetchAuthPathNodes(
     instanceLabel: string,
     ctx: ClientPirContext,
@@ -534,22 +539,42 @@ export class RavenPOINodeInterface {
         `fetchAuthPathNodes: expected ${TREE_DEPTH} indices, got ${indices.length}`,
       );
     }
+    for (let attempt = 0; attempt < AUTH_PATH_ATTEMPTS; attempt += 1) {
+      const nodes = await this.assembleAuthPath(instanceLabel, ctx, indices, cacheScope);
+      if (nodes) return nodes;
+    }
+    throw RavenError.staleAdapter(
+      `client-PIR ${instanceLabel}: snapshot epoch advanced on all ${AUTH_PATH_ATTEMPTS} ` +
+        `assembly attempts; the adapter is re-snapshotting faster than one auth path resolves`,
+    );
+  }
+
+  /** One single-epoch assembly attempt; `undefined` when the epoch moved under it and the
+   * levels gathered so far can no longer be certified by one root. Cache misses batch into
+   * one `POST /v1/instance/<id>/batch`. */
+  private async assembleAuthPath(
+    instanceLabel: string,
+    ctx: ClientPirContext,
+    indices: number[],
+    cacheScope: string,
+  ): Promise<Uint8Array[] | undefined> {
     const route = this.route();
     const out: (Uint8Array | undefined)[] = new Array(indices.length).fill(undefined);
     const missing: number[] = [];
-    const epochTag = String(route.epoch ?? 0);
+    const epochTag = this.observedEpochs.get(instanceLabel) ?? UNOBSERVED_EPOCH;
     const schemaVersion = route.schemaVersion ?? 0;
-
-    for (let i = 0; i < indices.length; i += 1) {
-      const key = imtCacheKey({
+    const keyAt = (level: number, tag: string): string =>
+      imtCacheKey({
         chainId: this.chainId,
         scope: cacheScope,
-        level: i,
-        idxAtLevel: indices[i],
-        epochTag,
+        level,
+        idxAtLevel: indices[level],
+        epochTag: tag,
         schemaVersion,
       });
-      const hit = this.cache.getSync(key);
+
+    for (let i = 0; i < indices.length; i += 1) {
+      const hit = this.cache.getSync(keyAt(i, epochTag));
       if (hit) {
         out[i] = hit;
       } else {
@@ -559,15 +584,7 @@ export class RavenPOINodeInterface {
 
     const stillMissing: number[] = [];
     for (const i of missing) {
-      const key = imtCacheKey({
-        chainId: this.chainId,
-        scope: cacheScope,
-        level: i,
-        idxAtLevel: indices[i],
-        epochTag,
-        schemaVersion,
-      });
-      const hit = await this.cache.getAsync(key);
+      const hit = await this.cache.getAsync(keyAt(i, epochTag));
       if (hit) {
         out[i] = hit;
       } else {
@@ -575,117 +592,163 @@ export class RavenPOINodeInterface {
       }
     }
 
-    if (stillMissing.length > 0) {
-      // Padded to a ladder step so the length publishes a bucket, not the exact
-      // cache-miss count. Pads re-query a real level, so they are drawn from the
-      // real slots' distribution and cost the server a full pass.
-      const realCount = stillMissing.length;
-      const paddedCount = paddedBatchLength(realCount);
-      const queryBundles = Array.from({ length: paddedCount }, (_unused, slot) => {
-        const level = stillMissing[slot % realCount];
-        const target = BigInt(indices[level]);
-        return decodeClientPirQueryBundle(
-          ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, target),
-        );
+    const fromCache = indices.length - stillMissing.length;
+
+    if (stillMissing.length === 0) {
+      // Nothing would cross the wire, so the epoch has to be asked for outright or a
+      // superseded path is served forever. One JSON GET replaces the whole batch it skips.
+      const liveEpoch = await this.fetchInstanceEpoch(instanceLabel);
+      if (liveEpoch !== epochTag) {
+        this.observedEpochs.set(instanceLabel, liveEpoch);
+        this.cache.noteFreshness(liveEpoch, schemaVersion);
+        return undefined;
+      }
+      return collectAuthPath(out);
+    }
+
+    // Padded to a ladder step so the length publishes a bucket, not the exact
+    // cache-miss count. Pads re-query a real level, so they are drawn from the
+    // real slots' distribution and cost the server a full pass.
+    const realCount = stillMissing.length;
+    const paddedCount = paddedBatchLength(realCount);
+    const queryBundles = Array.from({ length: paddedCount }, (_unused, slot) => {
+      const level = stillMissing[slot % realCount];
+      const target = BigInt(indices[level]);
+      return decodeClientPirQueryBundle(
+        ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, target),
+      );
+    });
+    const batchBody = encodeBatchBody(queryBundles.map((b) => b.queryBytes));
+    const url = `${route.endpoint}/v1/instance/${encodeURIComponent(instanceLabel)}/batch`;
+    this.captureRequest(url, "POST", batchBody);
+    let res: Response;
+    try {
+      res = await this.fetchImpl(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/octet-stream",
+          authorization: `Bearer ${route.bearerToken}`,
+        },
+        body: copyForBody(batchBody),
       });
-      const batchBody = encodeBatchBody(queryBundles.map((b) => b.queryBytes));
-      const url = `${route.endpoint}/v1/instance/${encodeURIComponent(instanceLabel)}/batch`;
-      this.captureRequest(url, "POST", batchBody);
-      let res: Response;
-      try {
-        res = await this.fetchImpl(url, {
-          method: "POST",
-          headers: {
-            "content-type": "application/octet-stream",
-            authorization: `Bearer ${route.bearerToken}`,
-          },
-          body: copyForBody(batchBody),
-        });
-      } catch (cause) {
-        throw RavenError.network(`client-PIR batch ${instanceLabel}`, {
+    } catch (cause) {
+      throw RavenError.network(`client-PIR batch ${instanceLabel}`, {
+        url,
+        cause: String(cause),
+      });
+    }
+    if (res.status === 400) {
+      const sv = res.headers.get(X_RAVEN_SCHEMA_VERSION);
+      if (sv) {
+        throw RavenError.staleAdapter(`client-PIR batch ${instanceLabel}: schema mismatch`, {
           url,
-          cause: String(cause),
+          status: 400,
+          serverWireSchemaVersion: Number(sv),
+          clientWireSchemaVersion: schemaVersion,
         });
       }
-      if (res.status === 400) {
-        const sv = res.headers.get(X_RAVEN_SCHEMA_VERSION);
-        if (sv) {
-          throw RavenError.staleAdapter(`client-PIR batch ${instanceLabel}: schema mismatch`, {
-            url,
-            status: 400,
-            serverWireSchemaVersion: Number(sv),
-            clientWireSchemaVersion: schemaVersion,
-          });
-        }
+    }
+    if (!res.ok) {
+      throw RavenError.serverError(`client-PIR batch ${instanceLabel}: ${res.status}`, {
+        url,
+        status: res.status,
+      });
+    }
+    const serverEpoch = res.headers.get(X_RAVEN_EPOCH);
+    const serverSchema = res.headers.get(X_RAVEN_SCHEMA_VERSION);
+    if (serverEpoch !== null && serverSchema !== null) {
+      this.cache.noteFreshness(serverEpoch, Number(serverSchema));
+    }
+    const servedEpoch = serverEpoch ?? epochTag;
+    if (servedEpoch !== epochTag) {
+      this.observedEpochs.set(instanceLabel, servedEpoch);
+      if (fromCache > 0) {
+        // Cached levels predate this snapshot; folding them with fresh siblings would
+        // build a path no single root ever certified.
+        return undefined;
       }
-      if (!res.ok) {
-        throw RavenError.serverError(`client-PIR batch ${instanceLabel}: ${res.status}`, {
-          url,
-          status: res.status,
-        });
-      }
-      const serverEpoch = res.headers.get(X_RAVEN_EPOCH);
-      const serverSchema = res.headers.get(X_RAVEN_SCHEMA_VERSION);
-      if (serverEpoch !== null && serverSchema !== null) {
-        this.cache.noteFreshness(serverEpoch, Number(serverSchema));
-      }
+    }
 
-      const bytes = new Uint8Array(await res.arrayBuffer());
-      const responses = decodeBatchBody(bytes);
-      if (responses.length !== queryBundles.length) {
-        throw RavenError.batchMismatch(
-          `client-PIR batch ${instanceLabel}: expected ${queryBundles.length} responses, got ${responses.length}`,
-          { url },
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const responses = decodeBatchBody(bytes);
+    if (responses.length !== queryBundles.length) {
+      throw RavenError.batchMismatch(
+        `client-PIR batch ${instanceLabel}: expected ${queryBundles.length} responses, got ${responses.length}`,
+        { url },
+      );
+    }
+    for (let k = 0; k < stillMissing.length; k += 1) {
+      const level = stillMissing[k];
+      let plaintext: Uint8Array;
+      try {
+        plaintext = ctx.wasm.extract_response(
+          ctx.session,
+          ctx.crsBincode,
+          queryBundles[k].clientStateBincode,
+          responses[k],
+          ctx.entrySize,
+        );
+      } catch (cause) {
+        throw RavenError.decodeError(
+          `client-PIR batch ${instanceLabel}: extract_response failed at level ${level}`,
+          { cause: String(cause) },
         );
       }
-      for (let k = 0; k < stillMissing.length; k += 1) {
-        const level = stillMissing[k];
-        let plaintext: Uint8Array;
-        try {
-          plaintext = ctx.wasm.extract_response(
-            ctx.session,
-            ctx.crsBincode,
-            queryBundles[k].clientStateBincode,
-            responses[k],
-            ctx.entrySize,
-          );
-        } catch (cause) {
-          throw RavenError.decodeError(
-            `client-PIR batch ${instanceLabel}: extract_response failed at level ${level}`,
-            { cause: String(cause) },
-          );
-        }
-        const node = plaintext.subarray(0, NODE_HASH_BYTES);
-        if (node.length !== NODE_HASH_BYTES) {
-          throw RavenError.decodeError(
-            `client-PIR batch ${instanceLabel}: node hash truncated at level ${level} ` +
-              `(${node.length} < ${NODE_HASH_BYTES})`,
-          );
-        }
-        const cached = new Uint8Array(node);
-        out[level] = cached;
-        const key = imtCacheKey({
-          chainId: this.chainId,
-          scope: cacheScope,
-          level,
-          idxAtLevel: indices[level],
-          epochTag,
-          schemaVersion,
-        });
-        this.cache.set(key, cached);
+      const node = plaintext.subarray(0, NODE_HASH_BYTES);
+      if (node.length !== NODE_HASH_BYTES) {
+        throw RavenError.decodeError(
+          `client-PIR batch ${instanceLabel}: node hash truncated at level ${level} ` +
+            `(${node.length} < ${NODE_HASH_BYTES})`,
+        );
       }
+      const cached = new Uint8Array(node);
+      out[level] = cached;
+      this.cache.set(keyAt(level, servedEpoch), cached);
     }
 
-    const final: Uint8Array[] = new Array(indices.length);
-    for (let i = 0; i < indices.length; i += 1) {
-      const v = out[i];
-      if (!v) {
-        // Every level is a cache hit or filled from the batch above.
-        throw RavenError.decodeError(`fetchAuthPathNodes: missing sibling at level ${i}`);
-      }
-      final[i] = v;
+    return collectAuthPath(out);
+  }
+
+  /** Snapshot epoch `instanceId` reports in `/v1/status`; cached auth-path nodes are only
+   * trusted while this still matches the epoch they were fetched at. */
+  private async fetchInstanceEpoch(instanceId: string): Promise<string> {
+    const route = this.route();
+    const url = `${route.endpoint}/v1/status`;
+    this.captureRequest(url, "GET", new Uint8Array());
+    let res: Response;
+    try {
+      res = await this.fetchImpl(url, {
+        headers: { authorization: `Bearer ${route.bearerToken}` },
+      });
+    } catch (cause) {
+      throw RavenError.network(`epoch probe for instance ${instanceId}`, {
+        url,
+        cause: String(cause),
+      });
     }
-    return final;
+    if (!res.ok) {
+      throw RavenError.serverError(
+        `epoch probe for instance ${instanceId}: ${res.status}`,
+        { url, status: res.status },
+      );
+    }
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch (cause) {
+      throw RavenError.decodeError(
+        `epoch probe for instance ${instanceId}: malformed /v1/status JSON`,
+        { url, cause: String(cause) },
+      );
+    }
+    const epoch = instanceEpochIn(body, instanceId);
+    if (epoch === undefined) {
+      throw RavenError.decodeError(
+        `epoch probe for instance ${instanceId}: /v1/status carries no integer epoch for it`,
+        { url },
+      );
+    }
+    return epoch;
   }
 
   /** Single-query path (T1 status): build query, POST to `/v1/instance/:id/query`, decrypt the response. */
@@ -870,6 +933,33 @@ export class RavenPOINodeInterface {
     }
     this.capturedRequests.push({ url, method, body });
   }
+}
+
+function collectAuthPath(levels: (Uint8Array | undefined)[]): Uint8Array[] {
+  const out: Uint8Array[] = new Array(levels.length);
+  for (let i = 0; i < levels.length; i += 1) {
+    const v = levels[i];
+    if (!v) {
+      throw RavenError.decodeError(`fetchAuthPathNodes: missing sibling at level ${i}`);
+    }
+    out[i] = v;
+  }
+  return out;
+}
+
+/** Snapshot epoch of `instanceId` in a `/v1/status` body; `undefined` when absent or malformed. */
+function instanceEpochIn(body: unknown, instanceId: string): string | undefined {
+  if (typeof body !== "object" || body === null) return undefined;
+  const { instances } = body as { instances?: unknown };
+  if (!Array.isArray(instances)) return undefined;
+  for (const row of instances) {
+    if (typeof row !== "object" || row === null) continue;
+    const { id, epoch } = row as { id?: unknown; epoch?: unknown };
+    if (id !== instanceId) continue;
+    if (typeof epoch !== "number" || !Number.isInteger(epoch) || epoch < 0) return undefined;
+    return String(epoch);
+  }
+  return undefined;
 }
 
 /** Wrap a bincode body in the read_versioned envelope `[u16 BE version][body]`. */

@@ -262,10 +262,18 @@ where
 /// Archiving first would strand entries the floor still points at.
 ///
 /// `mutate` receives the snapshot id and the new replay floor, so the caller
-/// keeps ownership of its own manifest fields.
+/// keeps ownership of its own manifest fields. It MUST assign both: a manifest
+/// left on the old floor with the log already sealed replays from a range the
+/// archive took away, so a `mutate` that does not is refused before any write.
+///
+/// The sealed range is named from the log rather than from the incoming
+/// manifest, so a caller that pre-advanced its own floor cannot alias two
+/// archives onto one path.
 ///
 /// # Errors
-/// Any manifest write or archive failure, unmodified.
+/// [`PersistenceError::Invariant`] when `mutate` leaves the manifest off
+/// `snapshot_id` or off the new floor, plus any manifest write or archive
+/// failure, unmodified.
 pub fn advance_manifest_and_archive<F>(
     layout: &StoreLayout,
     wal: &Wal,
@@ -276,11 +284,19 @@ pub fn advance_manifest_and_archive<F>(
 where
     F: FnOnce(&mut Manifest, SnapshotId, u64),
 {
-    let archive_from = manifest.current_snapshot_seq;
-    let archive_to = wal.next_seq().saturating_sub(1);
     let new_floor = wal.next_seq();
+    let archive_to = new_floor.saturating_sub(1);
+    let archive_from = wal.first_seq().unwrap_or(new_floor);
 
     mutate(manifest, snapshot_id, new_floor);
+    if manifest.current_snapshot_id != snapshot_id || manifest.current_snapshot_seq != new_floor {
+        return Err(PersistenceError::Invariant(format!(
+            "publish must leave the manifest at snapshot {:?} floor {new_floor}; mutate left \
+             snapshot {:?} floor {}. Nothing was written, so WAL seqs {archive_from}..={archive_to} \
+             still replay.",
+            snapshot_id, manifest.current_snapshot_id, manifest.current_snapshot_seq
+        )));
+    }
     manifest.save(layout)?;
     wal.archive(archive_from, archive_to)?;
     Ok(())
@@ -391,6 +407,63 @@ mod tests {
             wal.replay().expect("replay").entries.len(),
             3,
             "entries must survive a failed publish"
+        );
+    }
+
+    /// A mutate that leaves the floor behind would point recovery at a range
+    /// the archive just took away, so nothing may be written.
+    #[test]
+    fn a_mutate_that_ignores_the_new_floor_is_refused_before_the_log_is_sealed() {
+        let (_d, layout, wal, mut manifest) = publish_fixture();
+
+        let err = advance_manifest_and_archive(
+            &layout,
+            &wal,
+            &mut manifest,
+            SnapshotId(1),
+            |m, id, _floor| {
+                m.current_snapshot_id = id;
+            },
+        )
+        .expect_err("a mutate that leaves the floor behind must be refused");
+
+        assert!(matches!(err, PersistenceError::Invariant(_)), "got {err:?}");
+        assert_eq!(
+            wal.replay().expect("replay").entries.len(),
+            3,
+            "the log must not be sealed when the floor did not advance"
+        );
+        assert!(
+            Manifest::load(&layout).expect("load").is_none(),
+            "no manifest may be written for a refused publish"
+        );
+    }
+
+    /// The sealed range is named from the log, not from the caller's incoming
+    /// floor; otherwise two publishes can alias onto one archive path and the
+    /// second, empty one replaces the first.
+    #[test]
+    fn a_second_publish_with_no_appends_keeps_the_first_archive() {
+        let (_d, layout, wal, mut manifest) = publish_fixture();
+        manifest.current_snapshot_seq = wal.next_seq();
+        let sealed_len = std::fs::metadata(layout.wal_current_path())
+            .expect("stat")
+            .len();
+        assert!(sealed_len > 0, "fixture must leave a non-empty log");
+
+        advance_manifest_and_archive(&layout, &wal, &mut manifest, SnapshotId(1), point_at)
+            .expect("first publish");
+        advance_manifest_and_archive(&layout, &wal, &mut manifest, SnapshotId(2), point_at)
+            .expect("second publish");
+
+        let sizes: Vec<u64> = std::fs::read_dir(layout.root().join("wal").join("archived"))
+            .expect("read archive dir")
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.metadata().map_or(0, |m| m.len()))
+            .collect();
+        assert!(
+            sizes.contains(&sealed_len),
+            "the sealed entries must survive the second publish; archived sizes {sizes:?}, sealed {sealed_len} bytes"
         );
     }
 

@@ -2,6 +2,7 @@
 //! (NTT kernels, gadget matrices, scheme-specific hashing) stays in the
 //! scheme crates.
 
+#![deny(missing_docs)]
 // Crypto paths: every intentional cast needs a local allow with a reason.
 #![deny(
     clippy::cast_possible_truncation,

@@ -941,22 +941,42 @@ pub fn validate_apply(
     payload: &raven_railgun_persistence::WalEntryPayload,
 ) -> Result<()> {
     use raven_railgun_persistence::WalEntryPayload as P;
-    if let P::AppendLeaf {
-        tree_number,
-        leaf_index,
-        ..
-    } = payload
-    {
-        let leaf_idx_usize = usize::try_from(*leaf_index).map_err(|_| {
-            AdapterError::InvalidQuery(format!("leaf_index {leaf_index} out of usize range"))
-        })?;
-        let expected = store.imt_leaf_count_for(*tree_number);
-        if leaf_idx_usize != expected {
-            return Err(AdapterError::InvalidQuery(format!(
-                "non-contiguous AppendLeaf: tree {tree_number} expected leaf_index \
-                 {expected}, got {leaf_index}"
-            )));
+    match payload {
+        P::AppendLeaf {
+            tree_number,
+            leaf_index,
+            ..
+        } => {
+            let leaf_idx_usize = usize::try_from(*leaf_index).map_err(|_| {
+                AdapterError::InvalidQuery(format!("leaf_index {leaf_index} out of usize range"))
+            })?;
+            let expected = store.imt_leaf_count_for(*tree_number);
+            if leaf_idx_usize != expected {
+                return Err(AdapterError::InvalidQuery(format!(
+                    "non-contiguous AppendLeaf: tree {tree_number} expected leaf_index \
+                     {expected}, got {leaf_index}"
+                )));
+            }
         }
+        P::PpoiListLeafAdded {
+            list_key,
+            list_index,
+            ..
+        } => {
+            let leaf_idx_usize = usize::try_from(*list_index).map_err(|_| {
+                AdapterError::InvalidQuery(format!("list_index {list_index} out of usize range"))
+            })?;
+            let expected = store
+                .ppoi_imt(list_key)
+                .map_or(0, super::imt::Imt::leaf_count);
+            if leaf_idx_usize != expected {
+                return Err(AdapterError::InvalidQuery(format!(
+                    "non-contiguous PpoiListLeafAdded: list expected list_index \
+                     {expected}, got {list_index}"
+                )));
+            }
+        }
+        P::PpoiStatus { .. } | P::Reorg { .. } | P::Heartbeat { .. } => {}
     }
     Ok(())
 }

@@ -49,4 +49,10 @@ The client-side IMT (Incremental Merkle Tree) node cache (entry point: `ImtCache
 
 There is **no `localStorage` L2.** Every supported browser ships IndexedDB, so a synchronous-blocking 5 MB key-value store would only add eviction-policy complexity without unlocking a real environment. In the rare no-IDB case (Safari private browsing on older versions, custom embedders that strip IDB), the L1 in-memory layer alone is the fallback -- the cache is best-effort, not authoritative.
 
-Invalidation is driven by the `X-Raven-Epoch` and `X-Raven-Schema-Version` headers: `noteFreshness(epochTag, schemaVersion)` drops both layers whenever either advances, so stale nodes cannot survive a server-side reorg or schema bump.
+Cached nodes are tagged with the snapshot epoch of the instance they came from, read off the `X-Raven-Epoch` header of every batch response. Three rules keep a served auth path current:
+
+- **Every level of one path resolves at one epoch.** If a batch response reports an epoch newer than the cached levels already gathered, those levels are discarded and the path is reassembled, so a proof is never folded from siblings of two different trees.
+- **A fully-cached path is revalidated before it is trusted.** No batch leaves the SDK in that case, so the epoch is asked for outright with `GET /v1/status`; a moved epoch invalidates the cache and refetches. One JSON request replaces the batch it skipped.
+- **An unreachable revalidation fails closed.** A failed probe raises a typed `RavenError` rather than returning nodes the SDK can no longer certify.
+
+`X-Raven-Schema-Version` invalidates independently: `noteFreshness(epochTag, schemaVersion)` drops both layers whenever either value advances.

@@ -3,6 +3,7 @@
 
 use rand_core::{RngCore, TryRngCore};
 use serde::{Deserialize, Serialize};
+use subtle::{ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
 
 use crate::error::{IsimplePirError, Result};
 use crate::params::LweParams;
@@ -142,25 +143,35 @@ pub const CDF_TABLE_SIGMA_6_4: &[f64] = &[
     1.3839e-87,
 ];
 
+/// Keeps the rejection modulus a literal, so it reduces without a
+/// variable-latency hardware divide on the drawn value.
+const CDF_TABLE_LEN: u64 = CDF_TABLE_SIGMA_6_4.len() as u64;
+
+/// Acceptance threshold for `x`, read without addressing memory by `x`.
+fn cdf_bits_at(x: u64) -> u64 {
+    let mut bits = 0u64;
+    for (i, &cdf) in CDF_TABLE_SIGMA_6_4.iter().enumerate() {
+        bits |= u64::conditional_select(&0, &cdf.to_bits(), (i as u64).ct_eq(&x));
+    }
+    bits
+}
+
 /// Discrete Gaussian sample at sigma = 6.4. Mirrors
 /// `simplepir/pir/gauss.go:GaussSample`.
+///
+/// `y.to_bits() < cdf.to_bits()` is exactly `y < cdf`: both operands are
+/// non-negative and non-NaN, and IEEE-754 orders those the same way an
+/// unsigned integer orders their bit patterns. Preserving that equivalence
+/// is what keeps this stream identical to the branching form.
 pub fn gauss_sample_sigma_6_4<R: RngCore>(rng: &mut R) -> i64 {
-    let table_len = CDF_TABLE_SIGMA_6_4.len() as u64;
     loop {
-        let x_candidate = rng.next_u64() % table_len;
+        let x_candidate = rng.next_u64() % CDF_TABLE_LEN;
         // Uniform f64 in [0, 1): 53 significant bits from rng.
         let y: f64 = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
-        let idx = x_candidate as usize;
-        let Some(&cdf) = CDF_TABLE_SIGMA_6_4.get(idx) else {
-            continue;
-        };
-        if y < cdf {
+        if bool::from(y.to_bits().ct_lt(&cdf_bits_at(x_candidate))) {
             let sign_bit = rng.next_u64() & 1;
-            let mut x = x_candidate as i64;
-            if sign_bit == 0 {
-                x = -x;
-            }
-            return x;
+            let x = x_candidate as i64;
+            return i64::conditional_select(&x, &x.wrapping_neg(), sign_bit.ct_eq(&0));
         }
     }
 }

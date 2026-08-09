@@ -12,7 +12,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 
-use raven_railgun_persistence::{StoreLayout, Wal, WalEntryPayload};
+use raven_railgun_persistence::{PersistenceError, StoreLayout, Wal, WalEntryPayload};
 
 fn make_layout() -> (tempfile::TempDir, StoreLayout) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -137,6 +137,29 @@ fn no_entries_to_replay_when_snapshot_captures_every_wal_entry() {
 
     let next = wal2.append(&payload(99), 999).expect("append after replay");
     assert_eq!(next, 3);
+}
+
+// A floor above the logged tail would append past a gap that replay drops
+#[test]
+fn a_resume_floor_above_the_logged_tail_is_refused() {
+    let (_d, layout) = make_layout();
+    {
+        let wal = Wal::open(&layout, None).expect("open");
+        for i in 0..4u32 {
+            wal.append(&payload(i), 100 + u64::from(i)).expect("append");
+        }
+    }
+
+    let err = Wal::open(&layout, Some(41)).expect_err("a floor above the tail must be refused");
+    assert!(matches!(err, PersistenceError::Invariant(_)), "got {err:?}");
+
+    let wal2 = Wal::open(&layout, Some(3)).expect("reopen at the real floor");
+    let replay = wal2.replay().expect("replay");
+    assert_eq!(
+        replay.entries.len(),
+        4,
+        "a refused open must leave the log untouched"
+    );
 }
 
 // `current_snapshot_seq = 0` must yield a `None` floor; `Some(0)` would skip seq-0

@@ -641,7 +641,9 @@ impl ChainSource for PooledRpcChainSource {
                 .map_err(|e| IndexerError::Rpc(format!("get_logs: {e}")))?;
             let mut events = Vec::with_capacity(logs.len());
             for log in logs {
-                let block_number = log.block_number.unwrap_or(0);
+                let Some(block_number) = crate::block_number_or_drop(&log) else {
+                    continue;
+                };
                 let tx_hash = log.transaction_hash.map_or([0u8; 32], |h| h.0);
                 let primary_topic = log.topic0().copied().unwrap_or_default();
                 if let Some(e) =

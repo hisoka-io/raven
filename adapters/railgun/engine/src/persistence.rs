@@ -646,7 +646,9 @@ impl std::fmt::Debug for Layer2VerifierContext {
 struct Layer2VerifierState {
     ctx: Layer2VerifierContext,
     commits_since_last_verify: u32,
-    last_in_sync_height: u64,
+    /// Only a real InSync verdict sets it; a process-start default of 0 would
+    /// truncate every tree to genesis.
+    last_in_sync_height: Option<u64>,
     last_seen_commits: u64,
     last_seen_reorgs: u64,
 }
@@ -656,7 +658,7 @@ impl Layer2VerifierState {
         Self {
             ctx,
             commits_since_last_verify: 0,
-            last_in_sync_height: baseline_metrics.last_applied_block,
+            last_in_sync_height: None,
             last_seen_commits: baseline_metrics.commits_fired,
             last_seen_reorgs: baseline_metrics.reorgs_handled,
         }
@@ -751,7 +753,7 @@ impl Layer2VerifierState {
 
         match outcome {
             crate::layer_two::VerifyOutcome::InSync => {
-                self.last_in_sync_height = current_height;
+                self.last_in_sync_height = Some(current_height);
                 metrics::counter!("raven_railgun_layer2_in_sync_total").increment(1);
             }
             crate::layer_two::VerifyOutcome::OutOfSync {
@@ -759,18 +761,28 @@ impl Layer2VerifierState {
                 tree_number,
             } => {
                 metrics::counter!("raven_railgun_layer2_out_of_sync_total").increment(1);
+                let Some(fork_height) = self.last_in_sync_height else {
+                    metrics::counter!("raven_railgun_layer2_cascade_suppressed_total").increment(1);
+                    tracing::error!(
+                        ?local_root,
+                        tree_number,
+                        "layer2 verifier: OutOfSync before any in-sync verdict; \
+                         refusing to cascade a reorg with no known fork point"
+                    );
+                    return;
+                };
                 tracing::warn!(
                     ?local_root,
                     tree_number,
-                    last_in_sync_height = self.last_in_sync_height,
+                    last_in_sync_height = fork_height,
                     "layer2 verifier: OutOfSync; cascading reorg through existing reorg path"
                 );
                 let payload = WalEntryPayload::Reorg {
-                    height: self.last_in_sync_height,
+                    height: fork_height,
                 };
                 if let Err(e) = apply_reorg(
                     &payload,
-                    self.last_in_sync_height,
+                    fork_height,
                     instance,
                     persistence,
                     logical_store,
@@ -778,12 +790,7 @@ impl Layer2VerifierState {
                     encoder,
                     metrics,
                 ) {
-                    record_consumer_error(
-                        metrics,
-                        &e,
-                        "Layer2 synthetic reorg apply",
-                        self.last_in_sync_height,
-                    );
+                    record_consumer_error(metrics, &e, "Layer2 synthetic reorg apply", fork_height);
                 } else {
                     self.last_seen_reorgs = {
                         let m = metrics.lock();
@@ -807,10 +814,18 @@ fn ensure_layer2_metrics_described() {
         "raven_railgun_layer2_out_of_sync_total",
         metrics::Unit::Count,
         "Count of Layer 2 verifier rounds that observed an out-of-sync \
-         IMT root and cascaded a synthetic reorg through the existing \
-         reorg path."
+         IMT root."
     );
     metrics::counter!("raven_railgun_layer2_out_of_sync_total").increment(0);
+    metrics::describe_counter!(
+        "raven_railgun_layer2_cascade_suppressed_total",
+        metrics::Unit::Count,
+        "Count of out-of-sync Layer 2 verdicts that did NOT cascade a \
+         synthetic reorg because no in-sync verdict had established a fork \
+         point yet. Non-zero means the local tree disagrees with the chain \
+         and the verifier cannot safely repair it; operator action required."
+    );
+    metrics::counter!("raven_railgun_layer2_cascade_suppressed_total").increment(0);
 }
 
 /// Run the engine consumer task until [`ConsumerEvent::Shutdown`] or channel close.
@@ -1120,6 +1135,10 @@ fn apply_ppoi(
     encoder: &dyn super::pir_table::PirTableEncoder,
     metrics: &Arc<parking_lot::Mutex<ConsumerMetrics>>,
 ) -> Result<()> {
+    {
+        let store = logical_store.lock();
+        super::inspire::validate_apply(&store, payload)?;
+    }
     let (_seq, trigger) = persistence.apply_event(payload, height)?;
     {
         let mut store = logical_store.lock();

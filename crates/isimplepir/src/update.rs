@@ -205,6 +205,14 @@ pub fn state_update_entry(
             received: delta.version.get(),
         });
     }
+    if delta.col >= params.m {
+        return Err(IsimplePirError::DatabaseShape {
+            reason: format!(
+                "state update col {} out of range for M = {}",
+                delta.col, params.m,
+            ),
+        });
+    }
 
     let a_matrix = derive_a_matrix(a_seed, params)?;
     let row_start = delta.col.saturating_mul(params.n);
@@ -517,6 +525,14 @@ pub fn state_update_batch(
             return Err(IsimplePirError::VersionMismatch {
                 expected: delta.version.get(),
                 received: inner.version.get(),
+            });
+        }
+        if inner.col >= params.m {
+            return Err(IsimplePirError::DatabaseShape {
+                reason: format!(
+                    "batch state update col {} out of range for M = {}",
+                    inner.col, params.m,
+                ),
             });
         }
     }

@@ -108,6 +108,61 @@ proptest! {
     }
 
     #[test]
+    fn scan_yields_strictly_ascending_keys(ops in arb_ops()) {
+        let store = MemoryStore::new();
+        commit_inserts(&store, &ops);
+        let snap = store.snapshot().expect("snapshot");
+
+        let keys: Vec<u64> = snap
+            .scan()
+            .map(|r| r.expect("scan row").0)
+            .collect();
+
+        for (prev, next) in keys.iter().zip(keys.iter().skip(1)) {
+            prop_assert!(
+                prev < next,
+                "scan order violated: key {} followed by {}",
+                prev,
+                next
+            );
+        }
+
+        let mut sorted_unique: Vec<u64> = ops.iter().map(|(k, _)| *k).collect();
+        sorted_unique.sort_unstable();
+        sorted_unique.dedup();
+        prop_assert_eq!(keys, sorted_unique);
+    }
+
+    #[test]
+    fn scan_prefix_window_is_contiguous(ops in arb_ops(), lo in arb_key(), len in 1u64..=512) {
+        let store = MemoryStore::new();
+        commit_inserts(&store, &ops);
+        let snap = store.snapshot().expect("snapshot");
+        let hi = lo.saturating_add(len);
+
+        let mut windowed = Vec::new();
+        for row in snap.scan() {
+            let (k, _) = row.expect("scan row");
+            if k < lo {
+                continue;
+            }
+            if k >= hi {
+                break;
+            }
+            windowed.push(k);
+        }
+
+        let mut expected: Vec<u64> = ops
+            .iter()
+            .map(|(k, _)| *k)
+            .filter(|k| *k >= lo && *k < hi)
+            .collect();
+        expected.sort_unstable();
+        expected.dedup();
+        prop_assert_eq!(windowed, expected);
+    }
+
+    #[test]
     fn snapshot_len_matches_scan_count(ops in arb_ops()) {
         let store = MemoryStore::new();
         commit_inserts(&store, &ops);

@@ -87,9 +87,17 @@ pub fn unpack_u32s(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BitpackError {
     /// Width was `0` or greater than [`MAX_BITS_PER_LIMB`].
-    WidthOutOfRange { bits_per_limb: u8 },
+    WidthOutOfRange {
+        /// The rejected width, in bits.
+        bits_per_limb: u8,
+    },
     /// Input was shorter than the packed representation of `count` limbs.
-    TruncatedInput { got: usize, needed: usize },
+    TruncatedInput {
+        /// Bytes supplied.
+        got: usize,
+        /// Bytes the requested `count` and width demand.
+        needed: usize,
+    },
 }
 
 impl core::fmt::Display for BitpackError {

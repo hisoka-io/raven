@@ -36,6 +36,8 @@ pub struct Wal {
 struct WalState {
     file: File,
     next_seq: u64,
+    /// Lowest seq still in `current.log`; `None` once it holds nothing.
+    first_seq: Option<u64>,
     last_marker: u64,
     /// Set when an append tore. Every later append is refused, because an
     /// fsync-acknowledged entry that a later replay drops is worse than a
@@ -55,6 +57,10 @@ fn write_frame(file: &mut File, header: &[u8; 24], payload: &[u8]) -> Result<()>
 impl Wal {
     /// Open or create `data_dir/wal/current.log`. `last_committed_seq` sets a
     /// resume floor; the on-disk tail wins when it is higher.
+    ///
+    /// # Errors
+    /// [`PersistenceError::Invariant`] when the floor sits above a non-empty
+    /// tail, plus any I/O failure while scanning or truncating.
     pub fn open(layout: &StoreLayout, last_committed_seq: Option<u64>) -> Result<Self> {
         let path = layout.wal_current_path();
         if let Some(parent) = path.parent() {
@@ -70,6 +76,16 @@ impl Wal {
         };
         let mut next_seq = scan.next_seq;
         if floor > next_seq {
+            if let Some(first) = scan.first_seq {
+                return Err(PersistenceError::Invariant(format!(
+                    "WAL resume floor {floor} is above the tail of {}, which holds seqs \
+                     {first}..={}; appending at {floor} would leave a seq gap that replay \
+                     reads as a torn tail and drops. Reconcile the manifest floor against \
+                     the log before reopening.",
+                    path.display(),
+                    next_seq.saturating_sub(1)
+                )));
+            }
             next_seq = floor;
         }
 
@@ -88,6 +104,7 @@ impl Wal {
             inner: Mutex::new(WalState {
                 file,
                 next_seq,
+                first_seq: scan.first_seq,
                 last_marker: scan.last_marker,
                 poisoned: false,
             }),
@@ -147,6 +164,7 @@ impl Wal {
         }
 
         state.next_seq = state.next_seq.saturating_add(1);
+        state.first_seq.get_or_insert(seq);
         state.last_marker = marker;
         Ok(seq)
     }
@@ -161,6 +179,11 @@ impl Wal {
     /// Next seq the next `append` will assign.
     pub fn next_seq(&self) -> u64 {
         self.inner.lock().next_seq
+    }
+
+    /// Lowest seq `current.log` still holds, `None` when it holds nothing.
+    pub(crate) fn first_seq(&self) -> Option<u64> {
+        self.inner.lock().first_seq
     }
 
     /// Marker of the most recently appended entry.
@@ -198,6 +221,7 @@ impl Wal {
             crate::fsync_parent_dir(source_parent)?;
         }
         state.file = new_file;
+        state.first_seq = None;
         // a fresh file has no torn tail to be poisoned by
         state.poisoned = false;
         Ok(())
@@ -220,6 +244,7 @@ pub struct WalReplay {
 #[derive(Debug)]
 struct ScanResult {
     next_seq: u64,
+    first_seq: Option<u64>,
     last_marker: u64,
     truncate_at: Option<u64>,
 }
@@ -250,6 +275,7 @@ fn scan_for_tail(path: &std::path::Path) -> Result<ScanResult> {
     let scan = scan_full(path)?;
     Ok(ScanResult {
         next_seq: scan.next_seq,
+        first_seq: scan.entries.first().map(|e| e.seq),
         last_marker: scan.last_marker,
         truncate_at: scan.truncated_at,
     })
@@ -579,6 +605,30 @@ mod tests {
         let wal = Wal::open(&layout, Some(99)).expect("open");
         let seq = wal.append(&test_payload(0), 100).expect("append");
         assert_eq!(seq, 100);
+    }
+
+    /// A floor above the logged tail would put the next frame past a gap that
+    /// replay reads as a torn tail and drops, after append returned Ok.
+    #[test]
+    fn a_resume_floor_above_a_non_empty_tail_is_refused() {
+        let (_d, layout) = make_layout();
+        {
+            let wal = Wal::open(&layout, None).expect("open");
+            for i in 0..3u32 {
+                wal.append(&test_payload(i), 100 + u64::from(i))
+                    .expect("append");
+            }
+        }
+
+        let err = Wal::open(&layout, Some(9)).expect_err("a floor above the tail must be refused");
+        assert!(matches!(err, PersistenceError::Invariant(_)), "got {err:?}");
+
+        let reopened = Wal::open(&layout, Some(2)).expect("reopen at the real floor");
+        assert_eq!(
+            reopened.replay().expect("replay").entries.len(),
+            3,
+            "a refused open must leave the log untouched"
+        );
     }
 
     /// A torn append must not leave bytes that make replay drop later entries.

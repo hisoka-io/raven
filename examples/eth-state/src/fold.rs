@@ -415,7 +415,7 @@ impl MainSidecar {
             scheme_tag: SCHEME_TAG.to_string(),
             instance_id: INSTANCE_ID.to_string(),
             current_snapshot_id: snap_id,
-            current_snapshot_seq: self.wal.next_seq(),
+            current_snapshot_seq: self.wal_floor,
             current_marker: self.marker,
             encoder_label: ENCODER_LABEL.to_string(),
             prev_encoder_label: None,

@@ -1,15 +1,41 @@
+//! Synchronous single-row facade over a [`StorageBackend`].
+//!
+//! Every mutating call opens and commits its own transaction, so each advances
+//! the backend generation. Batch through [`Indexer::put_many`] to land many rows
+//! in one generation.
+//!
+//! ```
+//! use raven_core::{Bytes, Error, MemoryStore};
+//! use raven_indexer::Indexer;
+//!
+//! # fn main() -> Result<(), Error> {
+//! let ix = Indexer::new(MemoryStore::new());
+//! ix.put_many([(2, Bytes::from_static(b"beta")), (0, Bytes::from_static(b"alpha"))])?;
+//!
+//! assert_eq!(ix.get(0)?, Some(Bytes::from_static(b"alpha")));
+//! let keys: Vec<u64> = ix.scan()?.into_iter().map(|(k, _)| k).collect();
+//! assert_eq!(keys, vec![0, 2]);
+//! # Ok(())
+//! # }
+//! ```
+
+#![deny(missing_docs)]
+
 use raven_core::{Bytes, Error, Row, StorageBackend};
 
+/// Owning facade that turns single-row calls into backend transactions.
 #[derive(Debug)]
 pub struct Indexer<B> {
     backend: B,
 }
 
 impl<B: StorageBackend> Indexer<B> {
+    /// Take ownership of `backend`.
     pub fn new(backend: B) -> Self {
         Self { backend }
     }
 
+    /// Commit one row, replacing any existing value for `key`.
     pub fn put(&self, key: u64, value: Bytes) -> Result<(), Error> {
         let mut txn = self.backend.begin()?;
         txn.insert(key, value)?;
@@ -17,6 +43,7 @@ impl<B: StorageBackend> Indexer<B> {
         Ok(())
     }
 
+    /// Commit every row in one transaction and return the resulting generation.
     pub fn put_many<I>(&self, rows: I) -> Result<u64, Error>
     where
         I: IntoIterator<Item = (u64, Bytes)>,
@@ -28,6 +55,7 @@ impl<B: StorageBackend> Indexer<B> {
         txn.commit()
     }
 
+    /// Commit a deletion. Deleting an absent key is not an error.
     pub fn delete(&self, key: u64) -> Result<(), Error> {
         let mut txn = self.backend.begin()?;
         txn.remove(key)?;
@@ -35,26 +63,32 @@ impl<B: StorageBackend> Indexer<B> {
         Ok(())
     }
 
+    /// Value at `key` in a fresh snapshot, or `None` if absent.
     pub fn get(&self, key: u64) -> Result<Option<Bytes>, Error> {
         self.backend.snapshot()?.get(key)
     }
 
+    /// Whether `key` is present in a fresh snapshot.
     pub fn exists(&self, key: u64) -> Result<bool, Error> {
         Ok(self.get(key)?.is_some())
     }
 
+    /// Every row of a fresh snapshot, in strictly ascending key order.
     pub fn scan(&self) -> Result<Vec<Row>, Error> {
         self.backend.snapshot()?.scan().collect()
     }
 
+    /// Count of committed rows.
     pub fn len(&self) -> Result<u64, Error> {
         self.backend.len()
     }
 
+    /// Whether no rows are committed.
     pub fn is_empty(&self) -> Result<bool, Error> {
         self.backend.is_empty()
     }
 
+    /// Borrow the wrapped backend.
     pub fn backend(&self) -> &B {
         &self.backend
     }
