@@ -32,6 +32,7 @@ pub use alloy::eips::BlockId;
 pub use alloy::eips::BlockNumberOrTag;
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum IndexerError {
     #[error("rpc error: {0}")]
     Rpc(String),
@@ -88,8 +89,14 @@ pub const MAX_RPC_TOTAL_ELAPSED_SECS: u64 = 90;
 /// Default polling cadence (seconds).
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 10;
 
-/// Maximum scanned-back blocks during reorg recovery before bailing.
+/// Maximum BLOCK DISTANCE a Layer 1 walk-back may travel below the cursor
+/// before bailing. Not an entry count: see [`REORG_WINDOW_ENTRIES`].
 pub const MAX_REORG_BLOCKS: u64 = 256;
+
+/// Maximum cached `(block_number, block_hash)` ENTRIES retained for Layer 1
+/// reorg detection. Not a block distance: one entry per tick covers a whole
+/// [`SCAN_CHUNK_BLOCKS`] chunk, so N entries span up to N chunks of blocks.
+pub const REORG_WINDOW_ENTRIES: usize = 256;
 
 /// A source of decoded Railgun chain events, ordered by block.
 ///
@@ -410,7 +417,7 @@ fn compute_shield_commitment_hash(preimage: &abi::CommitmentPreimage) -> Result<
 /// A pending log carries no height. Fabricating one lands the event at height
 /// 0, which no later `Reorg(h)` can undo: truncation drops only leaves above `h`.
 #[must_use]
-pub fn block_number_or_drop(log: &alloy::rpc::types::eth::Log) -> Option<u64> {
+pub(crate) fn block_number_or_drop(log: &alloy::rpc::types::eth::Log) -> Option<u64> {
     if log.block_number.is_none() {
         metrics::counter!(
             "raven_railgun_indexer_dropped_logs_total",
@@ -613,8 +620,10 @@ pub struct IndexerWorkerConfig {
     pub per_tree_start_blocks: std::collections::BTreeMap<u32, u64>,
     /// Sidecar path for the Layer 1 reorg-window cache, persisting it across restarts. `None` = ephemeral.
     pub reorg_window_path: Option<std::path::PathBuf>,
-    /// Reorg cache depth (max entries). Defaults to [`REORG_CACHE_DEPTH`].
-    pub reorg_window_depth: usize,
+    /// Cached `(height, hash)` entries retained. Defaults to [`REORG_WINDOW_ENTRIES`].
+    pub reorg_window_entries: usize,
+    /// Block distance a walk-back may travel below the cursor. Defaults to [`MAX_REORG_BLOCKS`].
+    pub reorg_max_depth_blocks: u64,
 }
 
 impl Default for IndexerWorkerConfig {
@@ -625,7 +634,8 @@ impl Default for IndexerWorkerConfig {
             chunk_blocks: SCAN_CHUNK_BLOCKS,
             per_tree_start_blocks: std::collections::BTreeMap::new(),
             reorg_window_path: None,
-            reorg_window_depth: REORG_CACHE_DEPTH,
+            reorg_window_entries: REORG_WINDOW_ENTRIES,
+            reorg_max_depth_blocks: MAX_REORG_BLOCKS,
         }
     }
 }
@@ -639,10 +649,6 @@ pub struct IndexerWorker<S: ChainSource + std::fmt::Debug> {
     source: std::sync::Arc<S>,
     sender: tokio::sync::mpsc::Sender<IndexerMessage>,
 }
-
-/// Maximum cached `(block_number, block_hash)` pairs for Layer 1 reorg detection.
-#[allow(clippy::cast_possible_truncation)]
-pub const REORG_CACHE_DEPTH: usize = MAX_REORG_BLOCKS as usize;
 
 impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
     pub fn new(
@@ -659,7 +665,8 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
         // `Delay` prevents burst catch-up ticks after a stalled scan from hammering the RPC.
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut cursor = config.start_block;
-        let cap_depth = config.reorg_window_depth.max(1);
+        let entry_cap = config.reorg_window_entries.max(1);
+        let max_depth_blocks = config.reorg_max_depth_blocks.max(1);
         // bootstrap from sidecar so a reorg-while-down is detectable on resume.
         let mut hash_cache: std::collections::BTreeMap<u64, [u8; 32]> =
             match config.reorg_window_path.as_ref() {
@@ -685,7 +692,9 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
                             top_height,
                             "indexer reorg-window stale at restart; rebuilding from RPC"
                         );
-                        hash_cache = self.rebuild_reorg_window(top_height, cap_depth).await;
+                        hash_cache = self
+                            .rebuild_reorg_window(top_height, max_depth_blocks, entry_cap)
+                            .await;
                         persist_reorg_window_best_effort(path, &hash_cache);
                     }
                     Ok(_) => {}
@@ -714,28 +723,55 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
                 }
             };
 
-            if cursor > 0 && hash_cache.contains_key(&cursor) {
-                match detect_reorg_layer1(&*self.source, &hash_cache, cursor).await {
-                    Ok(None) => {}
-                    Ok(Some(reorg_height)) => {
-                        let msg = IndexerMessage::Reorg {
-                            height: reorg_height,
-                        };
-                        if self.sender.send(msg).await.is_err() {
-                            return Ok(cursor);
+            // Gating this on `contains_key(cursor)` would skip the check exactly
+            // when the window cannot vouch for the cursor. An empty window is a
+            // cold start with no baseline to check against.
+            if cursor > 0 && !hash_cache.is_empty() {
+                let rewind_to = match detect_reorg_layer1(
+                    &*self.source,
+                    &hash_cache,
+                    cursor,
+                    max_depth_blocks,
+                )
+                .await
+                {
+                    Ok(None) => None,
+                    Ok(Some(reorg_height)) => Some(reorg_height),
+                    // A gap and a divergence are the same observation, so no
+                    // reorg height can be derived across it: fall back to the
+                    // newest height the window can still vouch for.
+                    Err(miss @ IndexerError::ReorgWindowMiss { .. }) => {
+                        tracing::warn!(error = %miss, "rewinding to the newest verifiable height");
+                        let verifiable = hash_cache.range(..cursor).next_back().map(|(&h, _)| h);
+                        if verifiable.is_none() {
+                            hash_cache.clear();
+                            if let Some(path) = config.reorg_window_path.as_ref() {
+                                persist_reorg_window_best_effort(path, &hash_cache);
+                            }
                         }
-                        hash_cache.retain(|&n, _| n <= reorg_height);
-                        cursor = reorg_height;
-                        if let Some(path) = config.reorg_window_path.as_ref() {
-                            persist_reorg_window_best_effort(path, &hash_cache);
-                        }
-                        let _ = self.send_heartbeat(latest, cursor);
-                        continue;
+                        verifiable
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "Layer 1 reorg check failed; will retry");
                         continue;
                     }
+                };
+                if let Some(height) = rewind_to {
+                    if self
+                        .sender
+                        .send(IndexerMessage::Reorg { height })
+                        .await
+                        .is_err()
+                    {
+                        return Ok(cursor);
+                    }
+                    hash_cache.retain(|&n, _| n <= height);
+                    cursor = height;
+                    if let Some(path) = config.reorg_window_path.as_ref() {
+                        persist_reorg_window_best_effort(path, &hash_cache);
+                    }
+                    let _ = self.send_heartbeat(latest, cursor);
+                    continue;
                 }
             }
 
@@ -755,6 +791,36 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
                     continue;
                 }
             };
+            // An uncached tip is a hole the walk-back cannot cross, so hold the
+            // cursor rather than scan past it. Held before delivery: a hold after
+            // delivery replays the whole chunk on every subsequent tick, and a
+            // crash between the two would leave the window short of the events
+            // the consumer already applied.
+            let tip_hash = match self.source.block_hash(to).await {
+                Ok(h) => h,
+                Err(e) => {
+                    metrics::counter!("raven_railgun_indexer_reorg_window_tip_hash_failed_total")
+                        .increment(1);
+                    tracing::warn!(
+                        error = %e,
+                        to,
+                        cursor,
+                        "reorg-window tip hash unavailable; holding cursor"
+                    );
+                    let _ = self.send_heartbeat(latest, cursor);
+                    continue;
+                }
+            };
+            hash_cache.insert(to, tip_hash);
+            // Bound by entry count: a tick spans a whole chunk, so a
+            // block-distance bound would evict every prior boundary.
+            while hash_cache.len() > entry_cap {
+                hash_cache.pop_first();
+            }
+            if let Some(path) = config.reorg_window_path.as_ref() {
+                persist_reorg_window_best_effort(path, &hash_cache);
+            }
+
             for event in events {
                 let block_height = match &event {
                     RailgunEvent::Shield { block_number, .. }
@@ -791,49 +857,26 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
                 }
             }
 
-            // An uncached tip is a hole the walk-back cannot cross, so hold the
-            // cursor rather than scan past it.
-            let tip_hash = match self.source.block_hash(to).await {
-                Ok(h) => h,
-                Err(e) => {
-                    metrics::counter!("raven_railgun_indexer_reorg_window_tip_hash_failed_total")
-                        .increment(1);
-                    tracing::warn!(
-                        error = %e,
-                        to,
-                        cursor,
-                        "reorg-window tip hash unavailable; holding cursor"
-                    );
-                    let _ = self.send_heartbeat(latest, cursor);
-                    continue;
-                }
-            };
-            hash_cache.insert(to, tip_hash);
-            // Bound by entry count: a tick spans a whole chunk, so a
-            // block-distance bound would evict every prior boundary.
-            while hash_cache.len() > cap_depth {
-                hash_cache.pop_first();
-            }
-            if let Some(path) = config.reorg_window_path.as_ref() {
-                persist_reorg_window_best_effort(path, &hash_cache);
-            }
-
             cursor = to;
             let _ = self.send_heartbeat(latest, cursor);
         }
     }
 
-    /// Rebuild the reorg-window cache from RPC across the recent
-    /// `[top_height - depth, top_height]` span. Used when a sidecar
-    /// load detects a chain reorg deeper than the persisted window
+    /// Rebuild the reorg-window cache from RPC below `top_height`. Used when a
+    /// sidecar load detects a chain reorg deeper than the persisted window
     /// (e.g. reorged-while-down).
+    ///
+    /// Bounded by both inputs, which are different units: walking deeper than
+    /// `depth_blocks` outruns what the walk-back can use, and walking further
+    /// back than `entry_cap` buys hashes the cap immediately evicts.
     async fn rebuild_reorg_window(
         &self,
         top_height: u64,
-        depth: usize,
+        depth_blocks: u64,
+        entry_cap: usize,
     ) -> std::collections::BTreeMap<u64, [u8; 32]> {
-        let depth_u64 = u64::try_from(depth).unwrap_or(u64::MAX);
-        let from = top_height.saturating_sub(depth_u64);
+        let span = depth_blocks.min(u64::try_from(entry_cap).unwrap_or(u64::MAX));
+        let from = top_height.saturating_sub(span);
         let mut rebuilt = std::collections::BTreeMap::new();
         for n in from..=top_height {
             match self.source.block_hash(n).await {
@@ -848,6 +891,9 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
                     );
                 }
             }
+        }
+        while rebuilt.len() > entry_cap.max(1) {
+            rebuilt.pop_first();
         }
         rebuilt
     }
@@ -1108,18 +1154,25 @@ pub fn build_indexer_channel() -> (
     tokio::sync::mpsc::channel(1024)
 }
 
-/// Layer 1 reorg detection.
+/// Layer 1 reorg detection, bounded to `max_depth_blocks` below `cursor`.
 ///
 /// Re-fetches the cursor's block hash and walks the cache backward to find the surviving tip.
 /// Returns `Ok(None)` if canonical, `Ok(Some(h))` with the surviving height,
 /// `Err(ReorgWindowMiss)` if the cursor is not in the window, or
-/// `Err(ReorgTooDeep)` if no cached entry survives (operator intervention required).
+/// `Err(ReorgTooDeep)` if no cached entry within the bound survives (operator
+/// intervention required).
+///
+/// `max_depth_blocks` is a BLOCK DISTANCE. The window is capped by entry count,
+/// and a tick caches one entry per whole chunk, so an unbounded walk-back would
+/// truncate thousands of blocks below the cursor.
 pub async fn detect_reorg_layer1<S: ChainSource + ?Sized>(
     source: &S,
     cache: &std::collections::BTreeMap<u64, [u8; 32]>,
     cursor: u64,
+    max_depth_blocks: u64,
 ) -> Result<Option<u64>> {
-    let observed = source.block_hash(cursor).await?;
+    // Checked before any RPC: a miss is knowable from the window alone, and
+    // surfacing it as an Rpc error would hide the gap behind a retry.
     let Some(cached) = cache.get(&cursor).copied() else {
         return Err(IndexerError::ReorgWindowMiss {
             cursor,
@@ -1128,11 +1181,16 @@ pub async fn detect_reorg_layer1<S: ChainSource + ?Sized>(
             window_newest: cache.keys().next_back().copied(),
         });
     };
+    let observed = source.block_hash(cursor).await?;
     if observed == cached {
         return Ok(None);
     }
-    let candidates: Vec<(u64, [u8; 32])> =
-        cache.range(..cursor).rev().map(|(&k, &v)| (k, v)).collect();
+    let floor = cursor.saturating_sub(max_depth_blocks);
+    let candidates: Vec<(u64, [u8; 32])> = cache
+        .range(floor..cursor)
+        .rev()
+        .map(|(&k, &v)| (k, v))
+        .collect();
     for (height, cached_hash) in candidates {
         let observed_at = match source.block_hash(height).await {
             Ok(h) => h,
@@ -1419,6 +1477,52 @@ mod tests {
         assert_ne!(
             h_nft, h_same_addr,
             "ERC-20 padded-address path must differ from NFT keccak path"
+        );
+    }
+
+    /// Covers the routing decision over both height classes, not the
+    /// `raven_railgun_indexer_dropped_logs_total` increment: the counter is
+    /// asserted over the public ingest paths in `tests/subscribe_block_number_drop.rs`.
+    #[test]
+    fn block_number_or_drop_passes_heights_through_and_drops_pending() {
+        let at_height = alloy::rpc::types::eth::Log {
+            block_number: Some(77),
+            ..Default::default()
+        };
+        assert_eq!(block_number_or_drop(&at_height), Some(77));
+
+        let pending = alloy::rpc::types::eth::Log {
+            block_number: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            block_number_or_drop(&pending),
+            None,
+            "a pending log must drop, not land at a fabricated height"
+        );
+    }
+
+    /// Spelling gate, NOT a proof that downstream matches need a wildcard: an
+    /// exhaustive match inside the defining crate compiles either way, so only
+    /// a compile-fail harness could observe the semantic effect.
+    #[test]
+    fn indexer_error_declares_non_exhaustive() {
+        let src = include_str!("lib.rs");
+        let decl = src
+            .find("pub enum IndexerError {")
+            .expect("`pub enum IndexerError {` must be present in src/lib.rs");
+        let attrs: Vec<&str> = src[..decl]
+            .lines()
+            .rev()
+            .take_while(|l| {
+                let t = l.trim_start();
+                t.is_empty() || t.starts_with('#') || t.starts_with("///")
+            })
+            .collect();
+        assert!(
+            attrs.iter().any(|l| l.trim() == "#[non_exhaustive]"),
+            "IndexerError must carry #[non_exhaustive]; without it every added \
+             variant is a breaking change for downstream matches. attrs found: {attrs:?}"
         );
     }
 }

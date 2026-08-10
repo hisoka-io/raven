@@ -143,8 +143,6 @@ pub const CDF_TABLE_SIGMA_6_4: &[f64] = &[
     1.3839e-87,
 ];
 
-/// Keeps the rejection modulus a literal, so it reduces without a
-/// variable-latency hardware divide on the drawn value.
 const CDF_TABLE_LEN: u64 = CDF_TABLE_SIGMA_6_4.len() as u64;
 
 /// Acceptance threshold for `x`, read without addressing memory by `x`.
@@ -159,10 +157,9 @@ fn cdf_bits_at(x: u64) -> u64 {
 /// Discrete Gaussian sample at sigma = 6.4. Mirrors
 /// `simplepir/pir/gauss.go:GaussSample`.
 ///
-/// `y.to_bits() < cdf.to_bits()` is exactly `y < cdf`: both operands are
-/// non-negative and non-NaN, and IEEE-754 orders those the same way an
-/// unsigned integer orders their bit patterns. Preserving that equivalence
-/// is what keeps this stream identical to the branching form.
+/// `y.to_bits() < cdf.to_bits()` is exactly the reference's `y < cdf`: both
+/// operands are non-negative and non-NaN, and IEEE-754 orders those the same
+/// way an unsigned integer orders their bit patterns.
 pub fn gauss_sample_sigma_6_4<R: RngCore>(rng: &mut R) -> i64 {
     loop {
         let x_candidate = rng.next_u64() % CDF_TABLE_LEN;

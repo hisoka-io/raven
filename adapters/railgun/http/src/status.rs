@@ -278,6 +278,10 @@ pub struct HealthReadyResponse {
     /// RPC pool snapshot; omitted for single-endpoint deployments.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpc_pool: Option<RpcPoolHealthView>,
+    /// Instances whose tree the Layer 2 verifier proved out of sync and could
+    /// not repair. Non-empty forces 503.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layer2_divergent_instances: Vec<String>,
 }
 
 /// Indexer-consumer view in [`HealthReadyResponse`].
@@ -328,9 +332,11 @@ pub(crate) async fn health_ready_handler<S: PirScheme>(
             consumer: None,
             chain_source_mode: None,
             rpc_pool: None,
+            layer2_divergent_instances: Vec::new(),
         };
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body));
     }
+    let divergent = raven_railgun_engine::persistence::layer2_divergent_instances();
     let consumer = app.consumer_metrics.as_ref().as_ref().map(|m| {
         let snap = *m.lock();
         HealthConsumerView {
@@ -354,14 +360,22 @@ pub(crate) async fn health_ready_handler<S: PirScheme>(
         .as_ref()
         .as_ref()
         .map(build_rpc_pool_health_view);
+    // Known divergence fails closed: the tree this endpoint would answer from is
+    // provably not the chain's.
+    let (code, status) = if divergent.is_empty() {
+        (StatusCode::OK, "ready")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "not_ready")
+    };
     let body = HealthReadyResponse {
-        status: "ready".to_owned(),
+        status: status.to_owned(),
         instances: instance_count,
         consumer,
         chain_source_mode,
         rpc_pool,
+        layer2_divergent_instances: divergent,
     };
-    (StatusCode::OK, Json(body))
+    (code, Json(body))
 }
 
 fn build_rpc_pool_health_view(
@@ -388,4 +402,101 @@ fn build_rpc_pool_health_view(
         })
         .collect();
     RpcPoolHealthView { endpoints }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::{health_ready_handler, HealthReadyResponse};
+    use crate::config::HttpConfig;
+    use crate::state::AppState;
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+    use raven_railgun_core::InstanceId;
+    use raven_railgun_engine::persistence::{clear_layer2_divergent, mark_layer2_divergent};
+    use raven_railgun_engine::{Engine, InstanceRole, PirInstance, PirScheme};
+    use std::sync::Arc;
+
+    #[derive(Debug, Default)]
+    struct StubScheme;
+    #[derive(Debug, Default)]
+    struct StubState;
+    #[derive(serde::Serialize, serde::Deserialize, Debug)]
+    struct StubQuery;
+    #[derive(serde::Serialize, serde::Deserialize, Debug)]
+    struct StubResponse;
+
+    impl PirScheme for StubScheme {
+        type ServerState = StubState;
+        type Query = StubQuery;
+        type Response = StubResponse;
+        fn respond(
+            _state: &Self::ServerState,
+            _query: &Self::Query,
+        ) -> raven_railgun_core::Result<Self::Response> {
+            Err(raven_railgun_core::AdapterError::Scheme("stub".to_owned()))
+        }
+        fn state_shape(_state: &Self::ServerState) -> raven_railgun_engine::StateShape {
+            raven_railgun_engine::StateShape {
+                entry_size_bytes: 1,
+                rows_per_shard: u64::MAX,
+            }
+        }
+    }
+
+    fn state_with_one_instance(id: &str) -> AppState<StubScheme> {
+        let mut engine: Engine<StubScheme> = Engine::new();
+        engine
+            .register_instance(Arc::new(PirInstance::new(
+                InstanceId::new(id),
+                InstanceRole::Live,
+                StubState,
+            )))
+            .expect("register instance");
+        AppState::new(engine, HttpConfig::demo("health-gate-token")).expect("appstate")
+    }
+
+    async fn ready_probe(app: AppState<StubScheme>) -> (http::StatusCode, HealthReadyResponse) {
+        let response = health_ready_handler(State(app)).await.into_response();
+        let code = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let body: HealthReadyResponse = serde_json::from_slice(&bytes).expect("decode body");
+        (code, body)
+    }
+
+    #[tokio::test]
+    async fn ready_probe_fails_closed_while_an_instance_is_layer2_divergent() {
+        const ID: &str = "health-gate-divergent-instance";
+        clear_layer2_divergent(ID);
+
+        let (code, body) = ready_probe(state_with_one_instance(ID)).await;
+        assert_eq!(
+            code,
+            http::StatusCode::OK,
+            "a registered instance with no divergence must be ready"
+        );
+        assert_eq!(body.status, "ready");
+        assert!(body.layer2_divergent_instances.is_empty());
+
+        mark_layer2_divergent(ID);
+        let (code, body) = ready_probe(state_with_one_instance(ID)).await;
+        assert_eq!(
+            code,
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "a known Layer 2 divergence must take the endpoint out of rotation"
+        );
+        assert_eq!(body.status, "not_ready");
+        assert_eq!(body.layer2_divergent_instances, vec![ID.to_owned()]);
+
+        clear_layer2_divergent(ID);
+        let (code, body) = ready_probe(state_with_one_instance(ID)).await;
+        assert_eq!(
+            code,
+            http::StatusCode::OK,
+            "clearing the divergence must restore readiness"
+        );
+        assert!(body.layer2_divergent_instances.is_empty());
+    }
 }

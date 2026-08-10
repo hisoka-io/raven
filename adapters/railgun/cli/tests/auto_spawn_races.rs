@@ -272,7 +272,7 @@ mod kill_during_spawn {
         let encoder = build_encoder();
         let instance_id = InstanceId::new(records[0].instance_id.clone());
         let factory = || -> raven_railgun_core::Result<_> { Ok(build_toy_state()) };
-        let (instance, _persistence) = bootstrap_inspire_instance(
+        let (instance, _persistence, _recovered_store) = bootstrap_inspire_instance(
             layout,
             SCHEME_TAG,
             instance_id.clone(),

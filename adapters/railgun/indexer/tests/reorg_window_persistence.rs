@@ -220,7 +220,7 @@ async fn indexer_reorg_window_persists_across_restart() {
         poll_interval_secs: 1,
         chunk_blocks: 49,
         reorg_window_path: Some(path.clone()),
-        reorg_window_depth: 256,
+        reorg_window_entries: 256,
         ..IndexerWorkerConfig::default()
     };
     let join = tokio::spawn(async move { worker.run(cfg).await });
@@ -258,7 +258,7 @@ async fn indexer_reorg_window_persists_across_restart() {
         poll_interval_secs: 1,
         chunk_blocks: 49,
         reorg_window_path: Some(path.clone()),
-        reorg_window_depth: 256,
+        reorg_window_entries: 256,
         ..IndexerWorkerConfig::default()
     };
     let join2 = tokio::spawn(async move { worker2.run(cfg2).await });
@@ -296,7 +296,7 @@ async fn indexer_reorg_window_rebuilds_when_chain_advanced_past_cache() {
         poll_interval_secs: 1,
         chunk_blocks: 19,
         reorg_window_path: Some(path.clone()),
-        reorg_window_depth: 32,
+        reorg_window_entries: 32,
         ..IndexerWorkerConfig::default()
     };
     let join = tokio::spawn(async move { worker.run(cfg).await });
@@ -323,7 +323,7 @@ async fn indexer_reorg_window_rebuilds_when_chain_advanced_past_cache() {
         poll_interval_secs: 1,
         chunk_blocks: 19,
         reorg_window_path: Some(path.clone()),
-        reorg_window_depth: 32,
+        reorg_window_entries: 32,
         ..IndexerWorkerConfig::default()
     };
     let join2 = tokio::spawn(async move { worker2.run(cfg2).await });
@@ -368,7 +368,7 @@ async fn indexer_reorg_window_falls_back_to_empty_on_missing_sidecar() {
         poll_interval_secs: 1,
         chunk_blocks: 9,
         reorg_window_path: Some(path.clone()),
-        reorg_window_depth: 16,
+        reorg_window_entries: 16,
         ..IndexerWorkerConfig::default()
     };
     let join = tokio::spawn(async move { worker.run(cfg).await });

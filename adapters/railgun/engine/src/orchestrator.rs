@@ -223,7 +223,7 @@ pub fn bootstrap_railgun_engine(
         .encoder
         .build(config.record_size, config.entries_per_shard)?;
 
-    let (instance, persistence) = bootstrap_inspire_instance(
+    let (instance, persistence, recovered_store) = bootstrap_inspire_instance(
         layout,
         config.scheme_tag.clone(),
         config.instance_id.clone(),
@@ -244,7 +244,7 @@ pub fn bootstrap_railgun_engine(
     let (mirror_tx, mirror_rx) = mpsc::channel::<(WalEntryPayload, u64)>(cap);
 
     let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default()));
-    let logical_store = Arc::new(parking_lot::Mutex::new(LogicalLeafStore::new()));
+    let logical_store = Arc::new(parking_lot::Mutex::new(recovered_store));
 
     let verifier_ctx = config
         .chain_source

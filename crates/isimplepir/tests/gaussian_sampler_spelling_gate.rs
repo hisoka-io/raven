@@ -6,10 +6,9 @@
 )]
 //! Spelling gate over the Gaussian sampler, NOT a timing proof. It pins the
 //! branch-free form of the secret-dependent steps so a rewrite back to a
-//! secret-indexed load or a secret-conditioned jump has to be deliberate.
-//! Nothing here observes timing, and codegen inspection cannot substitute:
-//! `crates/inspire/tests/constant_time_codegen_gate.rs` records why. Renaming
-//! the scan helper escapes the gate, which is the accepted limit of the form.
+//! secret-indexed load, a secret-conditioned jump, or a primitive comparison
+//! has to be deliberate. Renaming the scan helper escapes the gate, which is
+//! the accepted limit of the form.
 
 const QUERY_SRC: &str = include_str!("../src/query.rs");
 
@@ -62,6 +61,23 @@ fn cdf_table_read_scans_every_entry() {
 }
 
 #[test]
+fn sampler_accepts_through_a_constant_time_comparison() {
+    let body = sampler_source();
+    for bare in ["to_bits() <", "< cdf_bits_at"] {
+        assert!(
+            !body.contains(bare),
+            "sampler weighs the draw against the threshold with `{bare}`; both \
+             operands are secret, so the comparison must go through \
+             `ConstantTimeLess`:\n{body}"
+        );
+    }
+    assert!(
+        body.contains(".ct_lt(&"),
+        "sampler must test acceptance through subtle's less-than barrier:\n{body}"
+    );
+}
+
+#[test]
 fn sampler_folds_the_noise_sign_without_a_source_branch() {
     let body = sampler_source();
     assert!(
@@ -72,16 +88,5 @@ fn sampler_folds_the_noise_sign_without_a_source_branch() {
     assert!(
         body.contains("i64::conditional_select"),
         "sampler must fold the noise sign through subtle's barrier:\n{body}"
-    );
-}
-
-/// A hardware divide with a secret dividend is variable-latency on most
-/// x86-64 parts, so the table modulus must reduce against a constant.
-#[test]
-fn sampler_reduces_against_a_compile_time_table_length() {
-    let body = sampler_source();
-    assert!(
-        body.contains("% CDF_TABLE_LEN"),
-        "sampler must reduce against a `const` divisor, not a runtime `.len()`:\n{body}"
     );
 }

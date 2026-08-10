@@ -34,6 +34,14 @@ class InMemoryLru {
     }
   }
 
+  deleteByPrefix(prefix: string): void {
+    for (const key of Array.from(this.map.keys())) {
+      if (key.startsWith(prefix)) {
+        this.map.delete(key);
+      }
+    }
+  }
+
   clear(): void {
     this.map.clear();
   }
@@ -47,6 +55,7 @@ class InMemoryLru {
 interface IndexedDbBacking {
   get(key: string): Promise<Uint8Array | undefined>;
   set(key: string, value: Uint8Array): Promise<void>;
+  deleteByPrefix(prefix: string): Promise<void>;
   clear(): Promise<void>;
 }
 
@@ -123,6 +132,19 @@ function indexedDbBacking(idb: IDBFactory, dbName: string): IndexedDbBacking {
         }),
       );
     },
+    async deleteByPrefix(prefix: string): Promise<void> {
+      const db = await openDb();
+      return withTimeout(
+        new Promise<void>((resolve, reject) => {
+          const tx = db.transaction("nodes", "readwrite");
+          const store = tx.objectStore("nodes");
+          const req = store.delete(IDBKeyRange.bound(prefix, `${prefix}\uffff`));
+          req.onsuccess = (): void => resolve();
+          req.onerror = (): void =>
+            reject(new Error(`indexedDB deleteByPrefix: ${req.error?.message ?? "unknown"}`));
+        }),
+      );
+    },
     async clear(): Promise<void> {
       const db = await openDb();
       return withTimeout(
@@ -138,6 +160,11 @@ function indexedDbBacking(idb: IDBFactory, dbName: string): IndexedDbBacking {
   };
 }
 
+/** Key prefix every node of one instance's scope shares; `scope` is `tree-N` or `list-<hex>`. */
+export function imtCacheScopeKey(parts: { chainId: number; scope: string }): string {
+  return `c=${parts.chainId}|s=${parts.scope}|`;
+}
+
 /** Cache key over `(chainId, scope, level, idxAtLevel, epochTag, schemaVersion)`; `scope` is `tree-N` or `list-<hex>`. */
 export function imtCacheKey(parts: {
   chainId: number;
@@ -147,14 +174,15 @@ export function imtCacheKey(parts: {
   epochTag: string;
   schemaVersion: number;
 }): string {
-  return [
-    `c=${parts.chainId}`,
-    `s=${parts.scope}`,
-    `l=${parts.level}`,
-    `i=${parts.idxAtLevel}`,
-    `e=${parts.epochTag}`,
-    `v=${parts.schemaVersion}`,
-  ].join("|");
+  return (
+    imtCacheScopeKey(parts) +
+    [
+      `l=${parts.level}`,
+      `i=${parts.idxAtLevel}`,
+      `e=${parts.epochTag}`,
+      `v=${parts.schemaVersion}`,
+    ].join("|")
+  );
 }
 
 /** Construction options for [`ImtCache`]. */
@@ -167,11 +195,15 @@ export interface ImtCacheConfig {
   readonly disableIndexedDb?: boolean;
 }
 
+interface ScopeFreshness {
+  epochTag: string;
+  schemaVersion: number;
+}
+
 export class ImtCache {
   private readonly memory: InMemoryLru;
   private readonly idb: IndexedDbBacking | null;
-  private currentEpochTag: string = "";
-  private currentSchemaVersion: number = 0;
+  private readonly freshness: Map<string, ScopeFreshness> = new Map();
 
   constructor(config: ImtCacheConfig = {}) {
     this.memory = new InMemoryLru(config.inMemoryCapacity ?? 1024);
@@ -207,21 +239,23 @@ export class ImtCache {
     }
   }
 
-  /** Drop both layers on an epoch or schema advance, so no node survives a reorg. */
-  noteFreshness(epochTag: string, schemaVersion: number): void {
-    if (epochTag === this.currentEpochTag && schemaVersion === this.currentSchemaVersion) {
+  /** Drop one scope's nodes from both layers on its own epoch or schema advance, so no node
+   * survives a reorg. Snapshots advance per instance, so a sibling scope keeps its nodes. */
+  noteFreshness(scopeKey: string, epochTag: string, schemaVersion: number): void {
+    const seen = this.freshness.get(scopeKey);
+    if (seen !== undefined && seen.epochTag === epochTag && seen.schemaVersion === schemaVersion) {
       return;
     }
-    this.currentEpochTag = epochTag;
-    this.currentSchemaVersion = schemaVersion;
-    this.memory.clear();
+    this.freshness.set(scopeKey, { epochTag, schemaVersion });
+    this.memory.deleteByPrefix(scopeKey);
     if (this.idb) {
-      this.idb.clear().catch(() => undefined);
+      this.idb.deleteByPrefix(scopeKey).catch(() => undefined);
     }
   }
 
-  /** Force-drop both cache layers. */
+  /** Force-drop both cache layers, every scope. */
   async clearAll(): Promise<void> {
+    this.freshness.clear();
     this.memory.clear();
     if (this.idb) {
       try {

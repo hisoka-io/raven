@@ -1,5 +1,5 @@
-// Locks the auth-path freshness contract: a fully-cached path is revalidated against the
-// server's snapshot epoch, and siblings drawn from two epochs are never folded into one proof.
+// Locks the auth-path freshness contract: every path is revalidated against the epoch its
+// batch reply reports, and siblings drawn from two epochs are never folded into one proof.
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
@@ -59,8 +59,8 @@ function stubCtx(): ClientPirContext {
 interface AdapterState {
   epoch: number;
   batchHits: number;
+  batchStatus: number;
   statusHits: number;
-  statusStatus: number;
 }
 
 // Every node byte 0 carries the serving epoch, so a mixed-epoch fold is visible in `elements`.
@@ -90,6 +90,11 @@ function mountAdapter(server: MockServer, state: AdapterState): void {
     (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
     (_req, body, res) => {
       state.batchHits += 1;
+      if (state.batchStatus !== 200) {
+        res.writeHead(state.batchStatus);
+        res.end();
+        return true;
+      }
       res.writeHead(200, {
         "content-type": "application/octet-stream",
         "x-raven-epoch": String(state.epoch),
@@ -103,11 +108,6 @@ function mountAdapter(server: MockServer, state: AdapterState): void {
     (req) => req.url === "/v1/status",
     (_req, _body, res) => {
       state.statusHits += 1;
-      if (state.statusStatus !== 200) {
-        res.writeHead(state.statusStatus);
-        res.end();
-        return true;
-      }
       writeJson(res, {
         scheme: "inspire",
         instances: [
@@ -156,28 +156,28 @@ describe("auth-path epoch revalidation", () => {
   });
 
   function freshAdapter(): AdapterState {
-    state = { epoch: 7, batchHits: 0, statusHits: 0, statusStatus: 200 };
+    state = { epoch: 7, batchHits: 0, batchStatus: 200, statusHits: 0 };
     mountAdapter(server, state);
     return state;
   }
 
-  it("refetches a fully-cached path once the server snapshot epoch advances", async () => {
+  it("serves only the current snapshot's nodes once the server epoch advances", async () => {
     freshAdapter();
     const sdk = newSdk(server);
 
     const cold = await sdk.getMerkleProof(TREE_NUMBER, 1234);
     expect(state.batchHits).toBe(1);
-    expect(state.statusHits).toBe(0);
     expect(epochMarkers(cold.elements)).toEqual(["07"]);
 
     const warm = await sdk.getMerkleProof(TREE_NUMBER, 1234);
-    expect(state.batchHits).toBe(1);
+    expect(state.batchHits).toBe(2);
     expect(epochMarkers(warm.elements)).toEqual(["07"]);
 
     state.epoch = 8;
     const afterAdvance = await sdk.getMerkleProof(TREE_NUMBER, 1234);
-    expect(state.batchHits).toBe(2);
+    expect(state.batchHits).toBe(3);
     expect(epochMarkers(afterAdvance.elements)).toEqual(["08"]);
+    expect(state.statusHits).toBe(0);
   });
 
   it("never folds siblings from two epochs into one proof on a partial cache hit", async () => {
@@ -192,12 +192,12 @@ describe("auth-path epoch revalidation", () => {
     expect(epochMarkers(mixed.elements)).toEqual(["08"]);
   });
 
-  it("fails closed when the epoch probe is unreachable instead of serving the cached path", async () => {
+  it("fails closed when the revalidating batch is unreachable instead of serving the cached path", async () => {
     freshAdapter();
     const sdk = newSdk(server);
 
     await sdk.getMerkleProof(TREE_NUMBER, 1234);
-    state.statusStatus = 503;
+    state.batchStatus = 503;
 
     let thrown: unknown;
     let returned = false;

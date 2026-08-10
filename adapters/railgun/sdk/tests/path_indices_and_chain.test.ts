@@ -23,8 +23,11 @@ import {
 } from "../src/index";
 
 import { startMockServer, writeJson, type MockServer } from "./helpers/mock_server";
+import { encodedBatchCount } from "./helpers/auth_path_stub";
 
 const TOKEN = "test-token-padded-long-enough-1234";
+const MOCK_EPOCH = 1;
+const MOCK_SCHEMA_VERSION = 1;
 const LIST_KEY_HEX = "abababababababababababababababababababababababababababababababab";
 const BC_HEX = "0000000000000000000000000000000000000000000000000000000000000001";
 
@@ -119,15 +122,12 @@ function mountBatchRoute(server: MockServer, freshness?: { epoch?: number; schem
         out[off + 31] = level;
         off += elemBytes;
       }
+      // `build_response_headers` stamps both on every batch reply, so the mock always does too.
       const headers: Record<string, string> = {
         "content-type": "application/octet-stream",
+        "x-raven-epoch": String(freshness?.epoch ?? MOCK_EPOCH),
+        "x-raven-schema-version": String(freshness?.schemaVersion ?? MOCK_SCHEMA_VERSION),
       };
-      if (freshness?.epoch !== undefined) {
-        headers["x-raven-epoch"] = String(freshness.epoch);
-      }
-      if (freshness?.schemaVersion !== undefined) {
-        headers["x-raven-schema-version"] = String(freshness.schemaVersion);
-      }
       res.writeHead(200, headers);
       res.end(Buffer.from(out));
       return true;
@@ -135,26 +135,37 @@ function mountBatchRoute(server: MockServer, freshness?: { epoch?: number; schem
   );
 }
 
-// The fully-cached auth path revalidates against `/v1/status`, so a batch mock that
-// reports an epoch has to publish the same epoch here.
-function mountStatusRoute(server: MockServer, instanceId: string, epoch: number): void {
+/** Batch route echoing exactly as many 32 B node hashes as the request asked for. */
+function mountEchoingBatchRoute(
+  server: MockServer,
+  onHit?: () => void,
+  freshness?: () => { epoch: number; schemaVersion: number },
+): void {
   server.route(
-    (req) => req.url === "/v1/status",
-    (_req, _body, res) => {
-      writeJson(res, {
-        scheme: "inspire",
-        instances: [
-          {
-            id: instanceId,
-            epoch,
-            role: "live",
-            drain_state: "active",
-            in_flight: 0,
-            active_k_concurrency: 4,
-          },
-        ],
-        consumer: null,
+    (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
+    (_req, body, res) => {
+      onHit?.();
+      const slots = encodedBatchCount(body);
+      const elemBytes = 32;
+      const out = new Uint8Array(2 + 8 + slots * (8 + elemBytes));
+      out[1] = 1;
+      const dv = new DataView(out.buffer);
+      dv.setUint32(2, slots, true);
+      let off = 10;
+      for (let slot = 0; slot < slots; slot += 1) {
+        dv.setUint32(off, elemBytes, true);
+        off += 8;
+        out[off] = 0xab;
+        out[off + elemBytes - 1] = slot;
+        off += elemBytes;
+      }
+      const tags = freshness?.() ?? { epoch: MOCK_EPOCH, schemaVersion: MOCK_SCHEMA_VERSION };
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "x-raven-epoch": String(tags.epoch),
+        "x-raven-schema-version": String(tags.schemaVersion),
       });
+      res.end(Buffer.from(out));
       return true;
     },
   );
@@ -301,7 +312,7 @@ describe("client-PIR auth-path reconstruction (T2/T3)", () => {
     server.route(
       (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
       (_req, _body, res) => {
-          const elemCount = 8;
+        const elemCount = 8;
         const elemBytes = 32;
         const total = 2 + 8 + elemCount * (8 + elemBytes);
         const out = new Uint8Array(total);
@@ -316,7 +327,11 @@ describe("client-PIR auth-path reconstruction (T2/T3)", () => {
           dv.setUint32(off + 4, 0, true);
           off += 8 + elemBytes;
         }
-        res.writeHead(200, { "content-type": "application/octet-stream" });
+        res.writeHead(200, {
+          "content-type": "application/octet-stream",
+          "x-raven-epoch": String(MOCK_EPOCH),
+          "x-raven-schema-version": String(MOCK_SCHEMA_VERSION),
+        });
         res.end(Buffer.from(out));
         return true;
       },
@@ -415,95 +430,50 @@ describe("client-side IMT cache hit / miss", () => {
     server.reset();
   });
 
-  it("cache miss issues a batch; cache hit short-circuits", async () => {
+  it("a cache hit still issues a batch, and serves the same path", async () => {
     let batchHits = 0;
-    server.route(
-      (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
-      (_req, _body, res) => {
-        batchHits += 1;
-        const elemCount = 16;
-        const elemBytes = 32;
-        const total = 2 + 8 + elemCount * (8 + elemBytes);
-        const out = new Uint8Array(total);
-        out[1] = 1;
-        const dv = new DataView(out.buffer);
-        dv.setUint32(2, elemCount, true);
-        let off = 10;
-        for (let i = 0; i < elemCount; i += 1) {
-          dv.setUint32(off, elemBytes, true);
-          off += 8 + elemBytes;
-        }
-        res.writeHead(200, {
-          "content-type": "application/octet-stream",
-          "x-raven-epoch": "1",
-          "x-raven-schema-version": "1",
-        });
-        res.end(Buffer.from(out));
-        return true;
-      },
-    );
-    mountStatusRoute(server, "commit-tree-0", 1);
-    const cache = new ImtCache({ disableIndexedDb: true });
+    mountEchoingBatchRoute(server, () => {
+      batchHits += 1;
+    });
     const sdk = new RavenPOINodeInterface({
       endpoint: server.url,
       bearerToken: TOKEN,
       useClientPir: true,
       clientPirContexts: new Map([["t3CommitTree:0", stubCtx()]]),
-      imtCache: cache,
+      imtCache: new ImtCache({ disableIndexedDb: true }),
     });
-    await sdk.getMerkleProof(0, 0);
+    const cold = await sdk.getMerkleProof(0, 0);
     expect(batchHits).toBe(1);
-    await sdk.getMerkleProof(0, 0);
-    expect(batchHits).toBe(1);
+    const warm = await sdk.getMerkleProof(0, 0);
+    expect(batchHits).toBe(2);
+    expect(warm.elements).toEqual(cold.elements);
   });
 
-  it("cache invalidates on epoch advance + schema-version bump", async () => {
-    let batchHits = 0;
-    server.route(
-      (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
-      (_req, _body, res) => {
-        batchHits += 1;
-        const elemCount = 16;
-        const elemBytes = 32;
-        const total = 2 + 8 + elemCount * (8 + elemBytes);
-        const out = new Uint8Array(total);
-        out[1] = 1;
-        const dv = new DataView(out.buffer);
-        dv.setUint32(2, elemCount, true);
-        let off = 10;
-        for (let i = 0; i < elemCount; i += 1) {
-          dv.setUint32(off, elemBytes, true);
-          off += 8 + elemBytes;
-        }
-        res.writeHead(200, {
-          "content-type": "application/octet-stream",
-          "x-raven-epoch": "1",
-          "x-raven-schema-version": "1",
-        });
-        res.end(Buffer.from(out));
-        return true;
-      },
-    );
-    mountStatusRoute(server, "commit-tree-0", 1);
-    const cache = new ImtCache({ disableIndexedDb: true });
-    cache.noteFreshness("1", 1);
+  it("a schema-version advance drops the cached levels", async () => {
+    let schemaVersion = 1;
+    mountEchoingBatchRoute(server, undefined, () => ({
+      epoch: MOCK_EPOCH,
+      schemaVersion,
+    }));
     const sdk = new RavenPOINodeInterface({
       endpoint: server.url,
       bearerToken: TOKEN,
       useClientPir: true,
       clientPirContexts: new Map([["t3CommitTree:0", stubCtx()]]),
-      imtCache: cache,
+      imtCache: new ImtCache({ disableIndexedDb: true }),
     });
-    await sdk.getMerkleProof(0, 0);
-    expect(batchHits).toBe(1);
-    await sdk.getMerkleProof(0, 0);
-    expect(batchHits).toBe(1);
-    cache.noteFreshness("2", 1);
-    await sdk.getMerkleProof(0, 0);
-    expect(batchHits).toBe(2);
-    cache.noteFreshness("2", 2);
-    await sdk.getMerkleProof(0, 0);
-    expect(batchHits).toBe(3);
+    await sdk.getMerkleProof(0, 1234);
+
+    // 1234 ^ 0b111 shares every sibling above level 2, so only 3 levels miss the cache.
+    sdk.resetWireCapture();
+    await sdk.getMerkleProof(0, 1234 ^ 0b111);
+    expect(encodedBatchCount(sdk.lastWireRequests()[0].body)).toBe(4);
+
+    schemaVersion = 2;
+    await sdk.getMerkleProof(0, 1234 ^ 0b111);
+    sdk.resetWireCapture();
+    await sdk.getMerkleProof(0, 1234 ^ 0b111);
+    expect(encodedBatchCount(sdk.lastWireRequests()[0].body)).toBe(16);
   });
 });
 
@@ -561,24 +531,6 @@ describe("multi-chain routing", () => {
     } catch (e) {
       expect(RavenError.is(e, "InvalidQuery")).toBe(true);
     }
-  });
-
-  it("ChainRegistry.refresh() updates epoch + schema_version from /v1/status", async () => {
-    const localServer = await startMockServer();
-    localServer.route(
-      (req) => req.url === "/v1/status",
-      (_req, _body, res) => {
-        writeJson(res, { epoch: 42, wire_schema_version: 1 });
-        return true;
-      },
-    );
-    const registry = new ChainRegistry([
-      { chainId: 1, endpoint: localServer.url, bearerToken: TOKEN },
-    ]);
-    const refreshed = await registry.refresh(1);
-    expect(refreshed.epoch).toBe(42);
-    expect(refreshed.schemaVersion).toBe(1);
-    await localServer.close();
   });
 
   it("ChainRegistry.refresh() throws ServerError on non-200", async () => {

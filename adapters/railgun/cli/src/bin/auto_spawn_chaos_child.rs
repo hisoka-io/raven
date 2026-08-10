@@ -163,7 +163,7 @@ fn run(args: &Args) -> ! {
         let params = params.clone();
         move || -> raven_railgun_core::Result<_> { Ok(build_fresh_state(&params)) }
     };
-    let (instance, _persistence) = bootstrap_inspire_instance(
+    let (instance, _persistence, _recovered_store) = bootstrap_inspire_instance(
         layout,
         SCHEME_TAG,
         instance_id.clone(),

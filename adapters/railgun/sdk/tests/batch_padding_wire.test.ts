@@ -91,7 +91,11 @@ function mountEchoingBatchRoute(server: MockServer): void {
         out[off + 31] = slot;
         off += elemBytes;
       }
-      res.writeHead(200, { "content-type": "application/octet-stream" });
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "x-raven-epoch": "1",
+        "x-raven-schema-version": "1",
+      });
       res.end(Buffer.from(out));
       return true;
     },

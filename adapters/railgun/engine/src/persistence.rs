@@ -522,6 +522,10 @@ impl InspirePersistence {
 
 /// Construct a [`PirInstance<RavenInspireScheme>`] tied to a persistence handle,
 /// recovering from disk when a manifest exists.
+///
+/// The returned store MUST be the one the consumer task runs against: the
+/// encoded DB and the logical store share a leaf-index contiguity invariant, and
+/// a fresh store behind a recovered DB rejects every subsequent append.
 pub fn bootstrap_inspire_instance(
     layout: StoreLayout,
     scheme_tag: impl Into<String>,
@@ -530,10 +534,15 @@ pub fn bootstrap_inspire_instance(
     policy: SnapshotPolicy,
     encoder: Arc<dyn super::pir_table::PirTableEncoder>,
     fresh_state_factory: impl FnOnce() -> Result<InspireServerState>,
-) -> Result<(PirInstance<RavenInspireScheme>, Arc<InspirePersistence>)> {
+) -> Result<(
+    PirInstance<RavenInspireScheme>,
+    Arc<InspirePersistence>,
+    super::inspire::LogicalLeafStore,
+)> {
     let opened =
         InspirePersistence::open(layout, scheme_tag, instance_id.clone(), policy, encoder)?;
     let persistence = Arc::new(opened.persistence);
+    let recovered_store = opened.recovered_logical_store;
     let state = if let Some(s) = opened.recovered_state {
         s
     } else {
@@ -547,7 +556,7 @@ pub fn bootstrap_inspire_instance(
     };
     let instance = PirInstance::new(instance_id, role, state);
     let _ = Epoch::ZERO;
-    Ok((instance, persistence))
+    Ok((instance, persistence, recovered_store))
 }
 
 /// One unit of work the engine consumer task processes.
@@ -579,8 +588,9 @@ pub struct ConsumerMetrics {
     /// Highest block scanned, event-bearing or not; the only height lag may be
     /// measured against.
     pub last_scanned_block: u64,
-    /// Height of the last leaf-mutating event. Never advanced by non-mutating
-    /// events, so it is the only height safe to persist as the resume floor.
+    /// Height of the last leaf-mutating event. Rises only on an applied leaf and
+    /// falls only on a reorg rewind, so it is the only height safe to persist as
+    /// the resume floor.
     pub last_applied_leaf_block: u64,
     /// Last chain head seen via heartbeat.
     pub last_known_chain_head: u64,
@@ -753,8 +763,21 @@ impl Layer2VerifierState {
 
         match outcome {
             crate::layer_two::VerifyOutcome::InSync => {
-                self.last_in_sync_height = Some(current_height);
                 metrics::counter!("raven_railgun_layer2_in_sync_total").increment(1);
+                // The root is proven on chain, so the divergence is resolved even
+                // when the verdict carries no usable height.
+                clear_layer2_divergent(instance.id.as_str());
+                if current_height == 0 {
+                    // Mirror rows carry height 0; anchoring there would rewind
+                    // every tree to genesis on the next out-of-sync verdict.
+                    tracing::debug!(
+                        tree_number = self.ctx.tree_number,
+                        "layer2 verifier: in-sync verdict carries no chain height; \
+                         fork anchor left unchanged"
+                    );
+                } else {
+                    self.last_in_sync_height = Some(current_height);
+                }
             }
             crate::layer_two::VerifyOutcome::OutOfSync {
                 local_root,
@@ -763,11 +786,14 @@ impl Layer2VerifierState {
                 metrics::counter!("raven_railgun_layer2_out_of_sync_total").increment(1);
                 let Some(fork_height) = self.last_in_sync_height else {
                     metrics::counter!("raven_railgun_layer2_cascade_suppressed_total").increment(1);
+                    mark_layer2_divergent(instance.id.as_str());
                     tracing::error!(
                         ?local_root,
                         tree_number,
-                        "layer2 verifier: OutOfSync before any in-sync verdict; \
-                         refusing to cascade a reorg with no known fork point"
+                        instance = instance.id.as_str(),
+                        "layer2 verifier: OutOfSync with no chain-anchored in-sync \
+                         verdict; refusing to cascade a reorg with no known fork \
+                         point, marking the instance divergent"
                     );
                     return;
                 };
@@ -800,6 +826,54 @@ impl Layer2VerifierState {
             }
         }
     }
+}
+
+/// Instance ids whose local tree is known to disagree with the chain and which
+/// the verifier could not repair.
+///
+/// Process-wide because a readiness probe is process-wide: any divergent
+/// instance must take the whole endpoint out of rotation.
+static LAYER2_DIVERGENT: Mutex<std::collections::BTreeSet<String>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+/// Instance ids with an unrepaired Layer 2 divergence, sorted. Readiness probes
+/// MUST fail closed while this is non-empty.
+///
+/// ```
+/// # use raven_railgun_engine::persistence::layer2_divergent_instances;
+/// assert!(
+///     layer2_divergent_instances().is_empty(),
+///     "no verifier round has run in this process, so nothing can be divergent"
+/// );
+/// ```
+#[must_use]
+pub fn layer2_divergent_instances() -> Vec<String> {
+    LAYER2_DIVERGENT.lock().iter().cloned().collect()
+}
+
+/// Record that `instance_id` holds a tree the verifier proved out of sync and
+/// could not repair.
+///
+/// ```
+/// # use raven_railgun_engine::persistence::{mark_layer2_divergent, clear_layer2_divergent, layer2_divergent_instances};
+/// mark_layer2_divergent("doc-example-instance");
+/// assert!(layer2_divergent_instances().iter().any(|id| id == "doc-example-instance"));
+/// clear_layer2_divergent("doc-example-instance");
+/// ```
+pub fn mark_layer2_divergent(instance_id: &str) {
+    LAYER2_DIVERGENT.lock().insert(instance_id.to_owned());
+}
+
+/// Drop the divergence mark for `instance_id`. Only a chain-anchored in-sync
+/// verdict, or an operator that has repaired the tree, may call this.
+///
+/// ```
+/// # use raven_railgun_engine::persistence::{clear_layer2_divergent, layer2_divergent_instances};
+/// clear_layer2_divergent("doc-example-never-marked");
+/// assert!(!layer2_divergent_instances().iter().any(|id| id == "doc-example-never-marked"));
+/// ```
+pub fn clear_layer2_divergent(instance_id: &str) {
+    LAYER2_DIVERGENT.lock().remove(instance_id);
 }
 
 fn ensure_layer2_metrics_described() {
@@ -1109,17 +1183,21 @@ fn apply_reorg(
         let mut store = logical_store.lock();
         super::inspire::apply_wal_entry(&mut store, p, height, encoder)?;
     }
-    {
+    // A rewind is the only thing that may lower the floor, and it may never raise
+    // it past blocks whose leaves were never applied.
+    let floor = {
         let mut m = metrics.lock();
         m.reorgs_handled = m.reorgs_handled.saturating_add(1);
-    }
+        m.last_applied_leaf_block = m.last_applied_leaf_block.min(height);
+        m.last_applied_leaf_block
+    };
     drive_commit(
         instance,
         persistence,
         logical_store,
         params,
         encoder,
-        height,
+        floor,
         metrics,
     )
 }
@@ -1144,7 +1222,13 @@ fn apply_ppoi(
         let mut store = logical_store.lock();
         super::inspire::apply_wal_entry(&mut store, payload, height, encoder)?;
     }
-    metrics.lock().last_applied_leaf_block = height;
+    // Mirror rows carry height 0, so neither the floor nor the commit marker may
+    // be driven from `height`.
+    let floor = {
+        let mut m = metrics.lock();
+        m.last_applied_leaf_block = m.last_applied_leaf_block.max(height);
+        m.last_applied_leaf_block
+    };
     if trigger {
         drive_commit(
             instance,
@@ -1152,7 +1236,7 @@ fn apply_ppoi(
             logical_store,
             params,
             encoder,
-            height,
+            floor,
             metrics,
         )?;
     }

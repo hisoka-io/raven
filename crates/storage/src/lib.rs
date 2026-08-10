@@ -264,14 +264,16 @@ where
 /// `mutate` receives the snapshot id and the new replay floor, so the caller
 /// keeps ownership of its own manifest fields. It MUST assign both: a manifest
 /// left on the old floor with the log already sealed replays from a range the
-/// archive took away, so a `mutate` that does not is refused before any write.
+/// archive took away. `mutate` runs against a staged copy that is validated
+/// before it replaces `manifest`, so a refusal leaves the caller holding the
+/// manifest it passed in rather than a half-advanced one.
 ///
 /// The sealed range is named from the log rather than from the incoming
 /// manifest, so a caller that pre-advanced its own floor cannot alias two
 /// archives onto one path.
 ///
 /// # Errors
-/// [`PersistenceError::Invariant`] when `mutate` leaves the manifest off
+/// [`PersistenceError::Invariant`] when `mutate` leaves the staged manifest off
 /// `snapshot_id` or off the new floor, plus any manifest write or archive
 /// failure, unmodified.
 pub fn advance_manifest_and_archive<F>(
@@ -288,15 +290,17 @@ where
     let archive_to = new_floor.saturating_sub(1);
     let archive_from = wal.first_seq().unwrap_or(new_floor);
 
-    mutate(manifest, snapshot_id, new_floor);
-    if manifest.current_snapshot_id != snapshot_id || manifest.current_snapshot_seq != new_floor {
+    let mut staged = manifest.clone();
+    mutate(&mut staged, snapshot_id, new_floor);
+    if staged.current_snapshot_id != snapshot_id || staged.current_snapshot_seq != new_floor {
         return Err(PersistenceError::Invariant(format!(
             "publish must leave the manifest at snapshot {:?} floor {new_floor}; mutate left \
-             snapshot {:?} floor {}. Nothing was written, so WAL seqs {archive_from}..={archive_to} \
-             still replay.",
-            snapshot_id, manifest.current_snapshot_id, manifest.current_snapshot_seq
+             snapshot {:?} floor {}. Nothing was written and the caller's manifest is unchanged, \
+             so WAL seqs {archive_from}..={archive_to} still replay.",
+            snapshot_id, staged.current_snapshot_id, staged.current_snapshot_seq
         )));
     }
+    *manifest = staged;
     manifest.save(layout)?;
     wal.archive(archive_from, archive_to)?;
     Ok(())
@@ -376,7 +380,14 @@ mod tests {
         )
         .expect("publish");
 
+        assert_eq!(
+            manifest.current_snapshot_id,
+            SnapshotId(1),
+            "the staged mutation must be committed into the caller's manifest"
+        );
+        assert_eq!(manifest.current_snapshot_seq, expected_floor);
         let on_disk = Manifest::load(&layout).expect("load").expect("present");
+        assert_eq!(on_disk, manifest, "disk must mirror the caller's manifest");
         assert_eq!(on_disk.current_snapshot_id, SnapshotId(1));
         assert_eq!(on_disk.current_snapshot_seq, expected_floor);
         assert!(
@@ -436,6 +447,33 @@ mod tests {
         assert!(
             Manifest::load(&layout).expect("load").is_none(),
             "no manifest may be written for a refused publish"
+        );
+    }
+
+    /// A refusal must leave the caller holding the manifest it came in with. A
+    /// half-advanced in-memory manifest matches neither the disk nor the log, so
+    /// the next publish or recovery reads a floor nothing ever committed.
+    #[test]
+    fn a_refused_mutate_leaves_the_callers_manifest_untouched() {
+        let (_d, layout, wal, mut manifest) = publish_fixture();
+        let before = manifest.clone();
+
+        let err = advance_manifest_and_archive(
+            &layout,
+            &wal,
+            &mut manifest,
+            SnapshotId(1),
+            |m, id, _floor| {
+                m.current_snapshot_id = id;
+            },
+        )
+        .expect_err("a mutate that leaves the floor behind must be refused");
+
+        assert!(matches!(err, PersistenceError::Invariant(_)), "got {err:?}");
+        assert_eq!(
+            manifest, before,
+            "the caller's in-memory manifest must be byte-identical after a refusal; \
+             reading manifest.json back cannot catch this because nothing was written"
         );
     }
 

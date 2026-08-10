@@ -105,7 +105,7 @@ async fn detect_reorg_layer1_returns_none_when_canonical_matches() {
     cache.insert(100, [0xaa; 32]);
     cache.insert(101, [0xbb; 32]);
 
-    let result = detect_reorg_layer1(&src, &cache, 101)
+    let result = detect_reorg_layer1(&src, &cache, 101, MAX_REORG_BLOCKS)
         .await
         .expect("detect");
     assert_eq!(result, None, "no divergence => Ok(None)");
@@ -125,7 +125,7 @@ async fn detect_reorg_layer1_finds_divergence_point() {
 
     src.reorg(102, 102, [0xdd; 32]);
 
-    let result = detect_reorg_layer1(&src, &cache, 102)
+    let result = detect_reorg_layer1(&src, &cache, 102, MAX_REORG_BLOCKS)
         .await
         .expect("detect");
     assert_eq!(
@@ -148,7 +148,7 @@ async fn detect_reorg_layer1_walks_back_through_multiple_blocks() {
 
     src.reorg(105, 110, [0xff; 32]);
 
-    let result = detect_reorg_layer1(&src, &cache, 110)
+    let result = detect_reorg_layer1(&src, &cache, 110, MAX_REORG_BLOCKS)
         .await
         .expect("detect");
     assert_eq!(result, Some(104), "surviving prefix is 100..=104");
@@ -166,7 +166,7 @@ async fn detect_reorg_layer1_returns_too_deep_when_cache_exhausted() {
 
     src.reorg(100, 101, [0xff; 32]);
 
-    let err = detect_reorg_layer1(&src, &cache, 101)
+    let err = detect_reorg_layer1(&src, &cache, 101, MAX_REORG_BLOCKS)
         .await
         .expect_err("must error");
     assert!(matches!(err, IndexerError::ReorgTooDeep(_)));
@@ -258,7 +258,7 @@ fn seed_chain_with_depth(depth: u64) -> (MockChainSource, BTreeMap<u64, [u8; 32]
 async fn detect_reorg_layer1_walks_back_at_depth_32() {
     let (src, cache, top) = seed_chain_with_depth(32);
     src.reorg(top - 31, top, [0xff; 32]);
-    let result = detect_reorg_layer1(&src, &cache, top)
+    let result = detect_reorg_layer1(&src, &cache, top, MAX_REORG_BLOCKS)
         .await
         .expect("detect");
     assert_eq!(
@@ -272,7 +272,7 @@ async fn detect_reorg_layer1_walks_back_at_depth_32() {
 async fn detect_reorg_layer1_walks_back_at_depth_256() {
     let (src, cache, top) = seed_chain_with_depth(256);
     src.reorg(top - 255, top, [0xff; 32]);
-    let result = detect_reorg_layer1(&src, &cache, top)
+    let result = detect_reorg_layer1(&src, &cache, top, MAX_REORG_BLOCKS)
         .await
         .expect("detect");
     assert_eq!(
@@ -287,7 +287,7 @@ async fn detect_reorg_layer1_returns_too_deep_at_max_reorg_blocks_boundary() {
     let (src, cache, top) = seed_chain_with_depth(MAX_REORG_BLOCKS);
     let oldest = top - MAX_REORG_BLOCKS;
     src.reorg(oldest, top, [0xff; 32]);
-    let err = detect_reorg_layer1(&src, &cache, top)
+    let err = detect_reorg_layer1(&src, &cache, top, MAX_REORG_BLOCKS)
         .await
         .expect_err("must error past the boundary");
     match err {

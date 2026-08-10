@@ -547,6 +547,12 @@ pub fn state_update_batch(
 
     let a_matrix = derive_a_matrix(a_seed, params)?;
 
+    // staged on a clone rather than pre-validated field by field: `add_to_row`
+    // and `append_row` check row bounds and length only at apply time, so any
+    // mid-batch rejection would otherwise leave the hint half-applied with its
+    // version stale, and a later extract returns a plaintext no peer ever held
+    let mut staged = hint.clone();
+
     for edit in delta.beta_edit.iter().chain(delta.beta_del.iter()) {
         let row_start = edit.col.saturating_mul(params.n);
         let mut x_i = vec![0u32; params.n];
@@ -560,14 +566,15 @@ pub fn state_update_batch(
             };
             *slot = edit.gamma.wrapping_mul(a_cj);
         }
-        hint.add_to_row(edit.row, &x_i)?;
+        staged.add_to_row(edit.row, &x_i)?;
     }
 
     for insert in &delta.beta_add {
-        hint.append_row(&insert.w_prime)?;
+        staged.append_row(&insert.w_prime)?;
     }
 
-    hint.version = delta.version;
+    staged.version = delta.version;
+    *hint = staged;
     Ok(())
 }
 

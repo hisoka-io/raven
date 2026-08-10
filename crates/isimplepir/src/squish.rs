@@ -1,7 +1,6 @@
 //! Column-packed DB and packed matmul. When `p <= 2^SQUISH_BASIS`,
 //! `SQUISH_COMPRESSION` plaintexts pack into one `u32`, giving a
-//! 3x server-side memory cut. `respond_packed` is byte-identical
-//! to [`crate::respond::respond`].
+//! 3x server-side memory cut.
 //!
 //! On `x86_64` with AVX2 / AVX-512F, the per-row dot uses
 //! `_mm{256,512}_i32gather_epi32` for stride-3 query reads.
@@ -322,7 +321,41 @@ enum PackedKernel {
 #[cfg(feature = "server")]
 const MIN_PACKED_SIMD_CELLS: usize = 1365;
 
-/// Byte-identical to [`crate::respond::respond`] on the same input.
+fn validate_packed_shape(packed: &SquishedDatabase) -> Result<()> {
+    let expected_m_packed = packed
+        .original_m
+        .saturating_add(SQUISH_COMPRESSION)
+        .saturating_sub(1)
+        / SQUISH_COMPRESSION;
+    if packed.m_packed != expected_m_packed {
+        return Err(IsimplePirError::DatabaseShape {
+            reason: format!(
+                "packed width {} does not match ceil(original M / {SQUISH_COMPRESSION}) = ceil({} / {SQUISH_COMPRESSION}) = {}",
+                packed.m_packed, packed.original_m, expected_m_packed,
+            ),
+        });
+    }
+
+    let expected_len = packed.l.saturating_mul(packed.m_packed);
+    if packed.data.len() != expected_len {
+        return Err(IsimplePirError::DatabaseShape {
+            reason: format!(
+                "packed database length {} does not match L * m_packed = {} * {} = {}",
+                packed.data.len(),
+                packed.l,
+                packed.m_packed,
+                expected_len,
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+/// Answers byte-identically to [`crate::respond::respond`] given a
+/// [`SquishedDatabase`] from [`squish_db`] over the same params and query.
+/// Any other declared shape is rejected: the kernels read cells through
+/// `.get()`, so an unchecked shape answers `Ok` over zero-fill.
 pub fn respond_packed(packed: &SquishedDatabase, query: &[u32]) -> Result<ServerResponse> {
     if query.len() != packed.original_m {
         return Err(IsimplePirError::QueryShape {
@@ -333,6 +366,8 @@ pub fn respond_packed(packed: &SquishedDatabase, query: &[u32]) -> Result<Server
             ),
         });
     }
+
+    validate_packed_shape(packed)?;
 
     let mask = (1u32 << SQUISH_BASIS).saturating_sub(1);
     let padded_m = packed.m_packed.saturating_mul(SQUISH_COMPRESSION);

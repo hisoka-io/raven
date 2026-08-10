@@ -78,6 +78,8 @@ struct ScriptedStreamer {
     heads: std::sync::Mutex<Option<Vec<u64>>>,
     logs: std::sync::Mutex<Option<Vec<alloy::rpc::types::eth::Log>>>,
     opens: AtomicU64,
+    heads_tx: std::sync::Mutex<Option<mpsc::Sender<Result<u64>>>>,
+    logs_tx: std::sync::Mutex<Option<mpsc::Sender<Result<alloy::rpc::types::eth::Log>>>>,
 }
 
 impl ScriptedStreamer {
@@ -86,6 +88,8 @@ impl ScriptedStreamer {
             heads: std::sync::Mutex::new(Some(heads)),
             logs: std::sync::Mutex::new(Some(logs)),
             opens: AtomicU64::new(0),
+            heads_tx: std::sync::Mutex::new(None),
+            logs_tx: std::sync::Mutex::new(None),
         }
     }
     fn opens(&self) -> u64 {
@@ -104,22 +108,21 @@ impl LogStreamer for ScriptedStreamer {
             .take()
             .unwrap_or_default();
         let logs = self.logs.lock().expect("poison").take().unwrap_or_default();
-        let (heads_tx, heads_rx) = mpsc::channel(64);
-        let (logs_tx, logs_rx) = mpsc::channel(64);
-        tokio::spawn(async move {
-            for n in heads {
-                if heads_tx.send(Ok(n)).await.is_err() {
-                    return;
-                }
-            }
-        });
-        tokio::spawn(async move {
-            for log in logs {
-                if logs_tx.send(Ok(log)).await.is_err() {
-                    return;
-                }
-            }
-        });
+        let (heads_tx, heads_rx) = mpsc::channel(heads.len() + 1);
+        let (logs_tx, logs_rx) = mpsc::channel(logs.len() + 1);
+        // Enqueued before the worker sees either receiver, and sized to the
+        // script so no send can block.
+        for n in heads {
+            heads_tx.try_send(Ok(n)).expect("heads script fits");
+        }
+        for log in logs {
+            logs_tx.try_send(Ok(log)).expect("logs script fits");
+        }
+        // The script is one-shot, so a reconnect replays nothing. Either stream
+        // closing tears down the pair, dropping whatever the other had left, so
+        // both senders stay alive and the heartbeat window ends the connection.
+        *self.heads_tx.lock().expect("poison") = Some(heads_tx);
+        *self.logs_tx.lock().expect("poison") = Some(logs_tx);
         Ok(SubscribeStreams {
             heads: heads_rx,
             logs: logs_rx,

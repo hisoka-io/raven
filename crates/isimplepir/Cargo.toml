@@ -140,3 +140,9 @@ rand = "0.9"
 rand_core = { version = "0.9", default-features = false }
 serde_json = "1"
 hex = "0.4"
+
+# Own `main` over `std::time::Instant`: criterion would be a new dependency,
+# and libtest's `#[bench]` is nightly-only.
+[[bench]]
+name = "gauss_sampler"
+harness = false

@@ -538,7 +538,7 @@ fn spawn_one(inputs: &SpawnInputs<'_>, tree: u32, append_log: bool) -> anyhow::R
         Ok(state)
     };
 
-    let (instance, persistence) = bootstrap_inspire_instance(
+    let (instance, persistence, _recovered_store) = bootstrap_inspire_instance(
         layout,
         runtime.scheme_tag.clone(),
         instance_id.clone(),
@@ -863,7 +863,7 @@ fn spawn_one_ppoi_list(inputs: &PpoiListSpawnInputs<'_>, append_log: bool) -> an
         Ok(state)
     };
 
-    let (instance, persistence) = bootstrap_inspire_instance(
+    let (instance, persistence, _recovered_store) = bootstrap_inspire_instance(
         layout,
         template.scheme_tag.clone(),
         instance_id.clone(),

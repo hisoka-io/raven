@@ -240,12 +240,19 @@ impl AppState<raven_railgun_engine::inspire::RavenInspireScheme> {
 }
 
 /// Register HELP + TYPE before the first scrape. [`OnceLock`]-guarded.
-#[allow(clippy::too_many_lines)]
 pub(crate) fn describe_prometheus_metrics() {
     static DESCRIBED: OnceLock<()> = OnceLock::new();
     if DESCRIBED.get().is_some() {
         return;
     }
+    register_prometheus_descriptions();
+    let _ = DESCRIBED.set(());
+}
+
+/// Unguarded body of [`describe_prometheus_metrics`], so a recorder can be
+/// driven through it more than once per process.
+#[allow(clippy::too_many_lines)]
+fn register_prometheus_descriptions() {
     metrics::describe_counter!(
         "raven_railgun_queries_total",
         "Total PIR queries served, labelled by instance + kind (single|batch|fanout)"
@@ -377,6 +384,11 @@ pub(crate) fn describe_prometheus_metrics() {
         "raven_railgun_indexer_reorg_window_persist_failed_total",
         "Lifetime count of reorg-window persistence failures"
     );
+    metrics::describe_counter!(
+        "raven_railgun_indexer_reorg_window_tip_hash_failed_total",
+        "Lifetime count of scan ticks held because the chunk's tip block hash \
+         could not be fetched, leaving the reorg window unable to span it"
+    );
 
     // An unfired series must scrape as zero, not "no data"; dashboards alert on rate.
     metrics::counter!(
@@ -385,6 +397,31 @@ pub(crate) fn describe_prometheus_metrics() {
     )
     .increment(0);
     metrics::counter!("raven_railgun_indexer_reorg_window_persist_failed_total").increment(0);
+    metrics::counter!("raven_railgun_indexer_reorg_window_tip_hash_failed_total").increment(0);
+}
 
-    let _ = DESCRIBED.set(());
+#[cfg(test)]
+mod tests {
+    use super::register_prometheus_descriptions;
+
+    const TIP_HASH_FAILED: &str = "raven_railgun_indexer_reorg_window_tip_hash_failed_total";
+
+    /// A described-but-unfired counter renders nothing, so the operator sees
+    /// "no data" where a rate alert needs a zero series.
+    #[test]
+    fn indexer_tip_hash_failed_counter_scrapes_zero_before_it_fires() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, register_prometheus_descriptions);
+        let rendered = handle.render();
+
+        assert!(
+            rendered.contains(&format!("# HELP {TIP_HASH_FAILED}")),
+            "counter must register HELP text; rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("{TIP_HASH_FAILED} 0")),
+            "counter must scrape as zero before it fires; rendered:\n{rendered}"
+        );
+    }
 }

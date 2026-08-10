@@ -17,7 +17,7 @@ import {
 import { paddedBatchLength } from "./batch-ladder";
 import { ChainRegistry, type ChainRegistryEntry } from "./chain-registry";
 import { RavenError } from "./errors";
-import { ImtCache, imtCacheKey } from "./imt-cache";
+import { ImtCache, imtCacheKey, imtCacheScopeKey } from "./imt-cache";
 import { foldMerkleRoot } from "./poseidon";
 
 export type POIStatus = "Valid" | "ShieldBlocked" | "ProofSubmitted" | "Missing";
@@ -563,6 +563,7 @@ export class RavenPOINodeInterface {
     const missing: number[] = [];
     const epochTag = this.observedEpochs.get(instanceLabel) ?? UNOBSERVED_EPOCH;
     const schemaVersion = route.schemaVersion ?? 0;
+    const scopeKey = imtCacheScopeKey({ chainId: this.chainId, scope: cacheScope });
     const keyAt = (level: number, tag: string): string =>
       imtCacheKey({
         chainId: this.chainId,
@@ -592,27 +593,18 @@ export class RavenPOINodeInterface {
       }
     }
 
-    const fromCache = indices.length - stillMissing.length;
-
-    if (stillMissing.length === 0) {
-      // Nothing would cross the wire, so the epoch has to be asked for outright or a
-      // superseded path is served forever. One JSON GET replaces the whole batch it skips.
-      const liveEpoch = await this.fetchInstanceEpoch(instanceLabel);
-      if (liveEpoch !== epochTag) {
-        this.observedEpochs.set(instanceLabel, liveEpoch);
-        this.cache.noteFreshness(liveEpoch, schemaVersion);
-        return undefined;
-      }
-      return collectAuthPath(out);
-    }
+    // A zero-miss path re-queries every level rather than skipping the batch: an absent
+    // request publishes a fully-warm cache more precisely than any batch length does.
+    const queryLevels =
+      stillMissing.length > 0 ? stillMissing : indices.map((_unused, level) => level);
+    const foldsCachedLevels = queryLevels.length < indices.length;
 
     // Padded to a ladder step so the length publishes a bucket, not the exact
     // cache-miss count. Pads re-query a real level, so they are drawn from the
     // real slots' distribution and cost the server a full pass.
-    const realCount = stillMissing.length;
-    const paddedCount = paddedBatchLength(realCount);
+    const paddedCount = paddedBatchLength(queryLevels.length);
     const queryBundles = Array.from({ length: paddedCount }, (_unused, slot) => {
-      const level = stillMissing[slot % realCount];
+      const level = queryLevels[slot % queryLevels.length];
       const target = BigInt(indices[level]);
       return decodeClientPirQueryBundle(
         ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, target),
@@ -654,15 +646,25 @@ export class RavenPOINodeInterface {
         status: res.status,
       });
     }
-    const serverEpoch = res.headers.get(X_RAVEN_EPOCH);
-    const serverSchema = res.headers.get(X_RAVEN_SCHEMA_VERSION);
-    if (serverEpoch !== null && serverSchema !== null) {
-      this.cache.noteFreshness(serverEpoch, Number(serverSchema));
+    // Header absent and header empty both arrive as UNOBSERVED_EPOCH, which would re-key
+    // every node as never-observed and silently defeat the epoch tag.
+    const servedEpoch = res.headers.get(X_RAVEN_EPOCH) ?? UNOBSERVED_EPOCH;
+    if (servedEpoch === UNOBSERVED_EPOCH) {
+      throw RavenError.staleAdapter(
+        `client-PIR batch ${instanceLabel}: reply carries no ${X_RAVEN_EPOCH}, so the ` +
+          `${indices.length} nodes it returned cannot be pinned to one snapshot`,
+        { url, status: res.status },
+      );
     }
-    const servedEpoch = serverEpoch ?? epochTag;
+    const serverSchema = res.headers.get(X_RAVEN_SCHEMA_VERSION);
+    this.cache.noteFreshness(
+      scopeKey,
+      servedEpoch,
+      serverSchema === null ? schemaVersion : Number(serverSchema),
+    );
     if (servedEpoch !== epochTag) {
       this.observedEpochs.set(instanceLabel, servedEpoch);
-      if (fromCache > 0) {
+      if (foldsCachedLevels) {
         // Cached levels predate this snapshot; folding them with fresh siblings would
         // build a path no single root ever certified.
         return undefined;
@@ -677,8 +679,8 @@ export class RavenPOINodeInterface {
         { url },
       );
     }
-    for (let k = 0; k < stillMissing.length; k += 1) {
-      const level = stillMissing[k];
+    for (let k = 0; k < queryLevels.length; k += 1) {
+      const level = queryLevels[k];
       let plaintext: Uint8Array;
       try {
         plaintext = ctx.wasm.extract_response(
@@ -707,48 +709,6 @@ export class RavenPOINodeInterface {
     }
 
     return collectAuthPath(out);
-  }
-
-  /** Snapshot epoch `instanceId` reports in `/v1/status`; cached auth-path nodes are only
-   * trusted while this still matches the epoch they were fetched at. */
-  private async fetchInstanceEpoch(instanceId: string): Promise<string> {
-    const route = this.route();
-    const url = `${route.endpoint}/v1/status`;
-    this.captureRequest(url, "GET", new Uint8Array());
-    let res: Response;
-    try {
-      res = await this.fetchImpl(url, {
-        headers: { authorization: `Bearer ${route.bearerToken}` },
-      });
-    } catch (cause) {
-      throw RavenError.network(`epoch probe for instance ${instanceId}`, {
-        url,
-        cause: String(cause),
-      });
-    }
-    if (!res.ok) {
-      throw RavenError.serverError(
-        `epoch probe for instance ${instanceId}: ${res.status}`,
-        { url, status: res.status },
-      );
-    }
-    let body: unknown;
-    try {
-      body = await res.json();
-    } catch (cause) {
-      throw RavenError.decodeError(
-        `epoch probe for instance ${instanceId}: malformed /v1/status JSON`,
-        { url, cause: String(cause) },
-      );
-    }
-    const epoch = instanceEpochIn(body, instanceId);
-    if (epoch === undefined) {
-      throw RavenError.decodeError(
-        `epoch probe for instance ${instanceId}: /v1/status carries no integer epoch for it`,
-        { url },
-      );
-    }
-    return epoch;
   }
 
   /** Single-query path (T1 status): build query, POST to `/v1/instance/:id/query`, decrypt the response. */
@@ -945,21 +905,6 @@ function collectAuthPath(levels: (Uint8Array | undefined)[]): Uint8Array[] {
     out[i] = v;
   }
   return out;
-}
-
-/** Snapshot epoch of `instanceId` in a `/v1/status` body; `undefined` when absent or malformed. */
-function instanceEpochIn(body: unknown, instanceId: string): string | undefined {
-  if (typeof body !== "object" || body === null) return undefined;
-  const { instances } = body as { instances?: unknown };
-  if (!Array.isArray(instances)) return undefined;
-  for (const row of instances) {
-    if (typeof row !== "object" || row === null) continue;
-    const { id, epoch } = row as { id?: unknown; epoch?: unknown };
-    if (id !== instanceId) continue;
-    if (typeof epoch !== "number" || !Number.isInteger(epoch) || epoch < 0) return undefined;
-    return String(epoch);
-  }
-  return undefined;
 }
 
 /** Wrap a bincode body in the read_versioned envelope `[u16 BE version][body]`. */

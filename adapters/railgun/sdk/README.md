@@ -49,10 +49,11 @@ The client-side IMT (Incremental Merkle Tree) node cache (entry point: `ImtCache
 
 There is **no `localStorage` L2.** Every supported browser ships IndexedDB, so a synchronous-blocking 5 MB key-value store would only add eviction-policy complexity without unlocking a real environment. In the rare no-IDB case (Safari private browsing on older versions, custom embedders that strip IDB), the L1 in-memory layer alone is the fallback -- the cache is best-effort, not authoritative.
 
-Cached nodes are tagged with the snapshot epoch of the instance they came from, read off the `X-Raven-Epoch` header of every batch response. Three rules keep a served auth path current:
+Cached nodes are tagged with the snapshot epoch of the instance they came from, read off the `X-Raven-Epoch` header of every batch response. Four rules keep a served auth path current:
 
+- **A batch reply without `X-Raven-Epoch` is refused.** The nodes cannot be pinned to a snapshot, so the SDK raises a typed `StaleAdapter` `RavenError` instead of caching them. An empty header value counts as absent.
 - **Every level of one path resolves at one epoch.** If a batch response reports an epoch newer than the cached levels already gathered, those levels are discarded and the path is reassembled, so a proof is never folded from siblings of two different trees.
-- **A fully-cached path is revalidated before it is trusted.** No batch leaves the SDK in that case, so the epoch is asked for outright with `GET /v1/status`; a moved epoch invalidates the cache and refetches. One JSON request replaces the batch it skipped.
-- **An unreachable revalidation fails closed.** A failed probe raises a typed `RavenError` rather than returning nodes the SDK can no longer certify.
+- **A fully-cached path still sends its batch.** It re-queries every level, so the request carries the same slot count as a cold path and the wire never publishes that the wallet already holds the path. There is no `GET /v1/status` shortcut: the reply's own `X-Raven-Epoch` is the revalidation.
+- **An unreachable revalidation fails closed.** A failed batch raises a typed `RavenError` rather than returning cached nodes the SDK can no longer certify.
 
-`X-Raven-Schema-Version` invalidates independently: `noteFreshness(epochTag, schemaVersion)` drops both layers whenever either value advances.
+`X-Raven-Schema-Version` invalidates independently, and invalidation is scoped to one instance: `noteFreshness(scopeKey, epochTag, schemaVersion)` drops only that instance's nodes from both layers, because snapshots advance per instance and a list instance's epoch says nothing about a tree instance's cached nodes. A scope the cache holds no recorded tuple for (a fresh page over a surviving IndexedDB layer) is dropped rather than trusted. Build `scopeKey` with the exported `imtCacheScopeKey({ chainId, scope })`.

@@ -62,20 +62,9 @@ pub fn extract(
     }
 
     let row_start = state.row.saturating_mul(params.n);
-    let row_end = row_start.saturating_add(params.n);
-    let Some(hint_row) = hint.data.get(row_start..row_end) else {
-        return Err(IsimplePirError::InvalidParams {
-            reason: format!(
-                "hint storage corrupt: row {} spans [{}, {}) but data length is {}",
-                state.row,
-                row_start,
-                row_end,
-                hint.data.len(),
-            ),
-        });
-    };
     let mut interm: u32 = 0;
-    for (&h_ij, &s_j) in hint_row.iter().zip(state.secret.iter()) {
+    // zip caps the row at secret.len(), checked == n above
+    for (&h_ij, &s_j) in hint.data.iter().skip(row_start).zip(state.secret.iter()) {
         interm = interm.wrapping_add(h_ij.wrapping_mul(s_j));
     }
 
@@ -152,6 +141,80 @@ mod tests {
         };
         let result = extract(&params, &h, &bad_s, &r);
         assert!(matches!(result, Err(IsimplePirError::QueryShape { .. })));
+    }
+
+    /// Every row carries a delta-scale ramp, so reading a neighbouring row - or stopping the
+    /// dot product short of n - lands on a different plaintext instead of rounding back.
+    #[test]
+    fn extract_reads_only_the_targeted_hint_row() {
+        let params = toy_params();
+        let delta = params.delta();
+        let data: Vec<u32> = (0..params.l * params.n)
+            .map(|i| delta.wrapping_mul(i as u32 + 1))
+            .collect();
+        let hint = ClientHint {
+            l: params.l,
+            n: params.n,
+            data,
+            version: HintVersion::INITIAL,
+        };
+        let secret = vec![1u32; params.n];
+
+        for row in 0..params.l {
+            let row_sum = hint.data[row * params.n..(row + 1) * params.n]
+                .iter()
+                .fold(0u32, |acc, &h_ij| acc.wrapping_add(h_ij));
+            let expected = row as u32 + 1;
+            let mut answer = vec![0u32; params.l];
+            answer[row] = row_sum.wrapping_add(delta.wrapping_mul(expected));
+            let state = ClientState {
+                secret: secret.clone(),
+                row,
+                col: 0,
+                query_vec: vec![0u32; params.m],
+            };
+            let response = ServerResponse { answer };
+            assert_eq!(
+                extract(&params, &hint, &state, &response).expect("extract"),
+                expected,
+                "row {row} must fold exactly hint.data[{}..{}]",
+                row * params.n,
+                (row + 1) * params.n
+            );
+        }
+    }
+
+    /// The last row's span ends exactly at `data.len()`, the tightest case for the row offset.
+    #[test]
+    fn extract_accepts_the_final_row() {
+        let params = toy_params();
+        let delta = params.delta();
+        let row = params.l - 1;
+        let mut data = vec![0u32; params.l * params.n];
+        for slot in &mut data[row * params.n..] {
+            *slot = delta;
+        }
+        let hint = ClientHint {
+            l: params.l,
+            n: params.n,
+            data,
+            version: HintVersion::INITIAL,
+        };
+        let state = ClientState {
+            secret: vec![1u32; params.n],
+            row,
+            col: 0,
+            query_vec: vec![0u32; params.m],
+        };
+        let mut answer = vec![0u32; params.l];
+        answer[row] = delta
+            .wrapping_mul(params.n as u32)
+            .wrapping_add(delta.wrapping_mul(3));
+        let response = ServerResponse { answer };
+        assert_eq!(
+            extract(&params, &hint, &state, &response).expect("extract"),
+            3
+        );
     }
 
     #[test]

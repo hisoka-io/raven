@@ -536,6 +536,70 @@ pub fn materialize_shard_bytes(
     buf
 }
 
+/// BN254 scalar field modulus, big-endian. IMT leaves are Poseidon field
+/// elements, so bytes at or above this never hash.
+const BN254_FR_MODULUS_BE: [u8; 32] = [
+    0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29, 0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58, 0x5d,
+    0x28, 0x33, 0xe8, 0x48, 0x79, 0xb9, 0x70, 0x91, 0x43, 0xe1, 0xf5, 0x93, 0xf0, 0x00, 0x00, 0x01,
+];
+
+#[derive(Clone, Copy)]
+enum ImtSlot {
+    CommitmentTree(u32),
+    PpoiList,
+}
+
+impl ImtSlot {
+    const fn index_field(self) -> &'static str {
+        match self {
+            Self::CommitmentTree(_) => "leaf_index",
+            Self::PpoiList => "list_index",
+        }
+    }
+
+    fn non_contiguous(self, expected: usize, got: u32) -> AdapterError {
+        AdapterError::InvalidQuery(match self {
+            Self::CommitmentTree(tree_number) => format!(
+                "non-contiguous AppendLeaf: tree {tree_number} expected leaf_index \
+                 {expected}, got {got}"
+            ),
+            Self::PpoiList => format!(
+                "non-contiguous PpoiListLeafAdded: list expected list_index \
+                 {expected}, got {got}"
+            ),
+        })
+    }
+}
+
+/// Everything the IMT would refuse, refused before the WAL write. Capacity is
+/// judged on the index alone so the refusal does not depend on store state.
+fn checked_imt_append(
+    slot: ImtSlot,
+    index: u32,
+    expected: usize,
+    leaf: &[u8; 32],
+) -> Result<usize> {
+    let field = slot.index_field();
+    let index_usize = usize::try_from(index)
+        .map_err(|_| AdapterError::InvalidQuery(format!("{field} {index} out of usize range")))?;
+    if index_usize >= super::imt::TREE_MAX_ITEMS {
+        return Err(AdapterError::InvalidQuery(format!(
+            "{field} {index} is at or past IMT capacity {}",
+            super::imt::TREE_MAX_ITEMS
+        )));
+    }
+    if index_usize != expected {
+        return Err(slot.non_contiguous(expected, index));
+    }
+    if leaf >= &BN254_FR_MODULUS_BE {
+        return Err(AdapterError::InvalidQuery(format!(
+            "non-canonical Fr leaf at {field} {index}: {leaf:02x?} is at or above \
+             the BN254 scalar modulus"
+        )));
+    }
+    Ok(index_usize)
+}
+
 /// Sidecar logical-state store; accumulates chain rows and marks shards dirty
 /// so commit re-encodes only those. Rebuilt from WAL replay on bootstrap.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
@@ -575,21 +639,16 @@ impl LogicalLeafStore {
                 leaf_index,
                 commitment,
             } => {
-                let leaf_idx_usize = usize::try_from(*leaf_index).map_err(|_| {
-                    AdapterError::InvalidQuery(format!(
-                        "leaf_index {leaf_index} out of usize range"
-                    ))
-                })?;
                 let expected_idx = self
                     .imts
                     .get(tree_number)
                     .map_or(0, super::imt::Imt::leaf_count);
-                if leaf_idx_usize != expected_idx {
-                    return Err(AdapterError::InvalidQuery(format!(
-                        "non-contiguous AppendLeaf: tree {tree_number} expected leaf_index \
-                         {expected_idx}, got {leaf_index}"
-                    )));
-                }
+                let leaf_idx_usize = checked_imt_append(
+                    ImtSlot::CommitmentTree(*tree_number),
+                    *leaf_index,
+                    expected_idx,
+                    commitment,
+                )?;
 
                 let imt = match self.imts.entry(*tree_number) {
                     std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
@@ -625,21 +684,16 @@ impl LogicalLeafStore {
                 blinded_commitment,
                 status,
             } => {
-                let leaf_idx_usize = usize::try_from(*list_index).map_err(|_| {
-                    AdapterError::InvalidQuery(format!(
-                        "list_index {list_index} out of usize range"
-                    ))
-                })?;
                 let expected_idx = self
                     .ppoi_imts
                     .get(list_key)
                     .map_or(0, super::imt::Imt::leaf_count);
-                if leaf_idx_usize != expected_idx {
-                    return Err(AdapterError::InvalidQuery(format!(
-                        "non-contiguous PpoiListLeafAdded: list expected list_index \
-                         {expected_idx}, got {list_index}"
-                    )));
-                }
+                let leaf_idx_usize = checked_imt_append(
+                    ImtSlot::PpoiList,
+                    *list_index,
+                    expected_idx,
+                    blinded_commitment,
+                )?;
                 let imt = match self.ppoi_imts.entry(*list_key) {
                     std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
                     std::collections::hash_map::Entry::Vacant(v) => {
@@ -931,11 +985,15 @@ pub fn apply_wal_entry(
     store.apply(payload, block_height, encoder)
 }
 
-/// Non-mutating pre-check run before the WAL write so a rejected event never
-/// poisons the WAL.
+/// Non-mutating pre-check run before the WAL write. Screens the two IMT-backed
+/// variants on index contiguity, tree capacity and leaf Fr-canonicity; the
+/// other variants are unconditionally accepted. Runs the same screen
+/// [`LogicalLeafStore::apply`] does, so a payload that passes here and is then
+/// applied against the same store cannot be refused for one of those reasons.
 ///
 /// # Errors
-/// [`AdapterError::InvalidQuery`] on contiguity violation.
+/// [`AdapterError::InvalidQuery`] on a non-contiguous index, an index at or
+/// past IMT capacity, or a leaf at or above the BN254 scalar modulus.
 pub fn validate_apply(
     store: &LogicalLeafStore,
     payload: &raven_railgun_persistence::WalEntryPayload,
@@ -945,36 +1003,25 @@ pub fn validate_apply(
         P::AppendLeaf {
             tree_number,
             leaf_index,
-            ..
+            commitment,
         } => {
-            let leaf_idx_usize = usize::try_from(*leaf_index).map_err(|_| {
-                AdapterError::InvalidQuery(format!("leaf_index {leaf_index} out of usize range"))
-            })?;
-            let expected = store.imt_leaf_count_for(*tree_number);
-            if leaf_idx_usize != expected {
-                return Err(AdapterError::InvalidQuery(format!(
-                    "non-contiguous AppendLeaf: tree {tree_number} expected leaf_index \
-                     {expected}, got {leaf_index}"
-                )));
-            }
+            checked_imt_append(
+                ImtSlot::CommitmentTree(*tree_number),
+                *leaf_index,
+                store.imt_leaf_count_for(*tree_number),
+                commitment,
+            )?;
         }
         P::PpoiListLeafAdded {
             list_key,
             list_index,
+            blinded_commitment,
             ..
         } => {
-            let leaf_idx_usize = usize::try_from(*list_index).map_err(|_| {
-                AdapterError::InvalidQuery(format!("list_index {list_index} out of usize range"))
-            })?;
             let expected = store
                 .ppoi_imt(list_key)
                 .map_or(0, super::imt::Imt::leaf_count);
-            if leaf_idx_usize != expected {
-                return Err(AdapterError::InvalidQuery(format!(
-                    "non-contiguous PpoiListLeafAdded: list expected list_index \
-                     {expected}, got {list_index}"
-                )));
-            }
+            checked_imt_append(ImtSlot::PpoiList, *list_index, expected, blinded_commitment)?;
         }
         P::PpoiStatus { .. } | P::Reorg { .. } | P::Heartbeat { .. } => {}
     }

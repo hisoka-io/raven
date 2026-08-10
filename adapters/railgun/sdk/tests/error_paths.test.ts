@@ -160,7 +160,10 @@ describe("error-path + truncated-response handling", () => {
     server.route(
       (req) => req.url?.startsWith("/v1/instance/") ?? false,
       (_req, _body, res) => {
-        writeBinary(res, new Uint8Array(0));
+        writeBinary(res, new Uint8Array(0), {
+          "x-raven-epoch": "1",
+          "x-raven-schema-version": "1",
+        });
         return true;
       },
     );

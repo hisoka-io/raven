@@ -294,18 +294,9 @@ impl MainSidecar {
             .swap_state(new_state, snap.epoch.next())
             .map_err(swap_failed)?;
 
-        // MUST precede the dirty clear: until it lands, recovery is snapshot plus WAL.
+        // MUST precede the dirty clear: until it lands, recovery is snapshot plus WAL. Its
+        // publish also seals the log, so the next recover replays only the post-fold tail.
         self.commit_v6()?;
-
-        // Seal the pre-snapshot WAL so the next recover replays only the post-fold tail. Safe on
-        // either side of a crash because replay is idempotent over the full log.
-        let through = self.wal.next_seq();
-        if through > self.wal_floor {
-            self.wal
-                .archive(self.wal_floor, through - 1)
-                .map_err(|e| EthStateError::Setup(format!("wal archive: {e}")))?;
-            self.wal_floor = through;
-        }
 
         self.dirty.clear();
         self.changed.clear();
@@ -676,6 +667,56 @@ mod kill_mid_fold {
             &got[..],
             &expected[..],
             "swap..commit window recovers byte-identical"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod wal_floor {
+    use super::MainSidecar;
+    use crate::ingest::normalize_balance_be;
+    use crate::ENTRY_SIZE;
+    use bytes::Bytes;
+    use raven_inspire::params::InspireParams;
+    use serial_test::serial;
+
+    /// `fold` seals no WAL range of its own because `commit_v6` already published through the
+    /// log head. The middle assertion pins the window where an unsealed range does exist.
+    #[test]
+    #[serial]
+    fn commit_v6_advances_the_floor_to_the_log_head() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let params = InspireParams::secure_128_d2048();
+        let n = 64usize;
+        let mut db = vec![0u8; n * ENTRY_SIZE];
+        for i in 0..n {
+            let rec = normalize_balance_be(&((i as u128 + 1) * 7).to_be_bytes()).expect("norm");
+            db[i * ENTRY_SIZE..(i + 1) * ENTRY_SIZE].copy_from_slice(&rec);
+        }
+        let (mut ms, _msk, _ssk) =
+            MainSidecar::seed(&params, &db, ENTRY_SIZE, dir.path(), 0x0000_A5F0).expect("seed");
+        assert_eq!(
+            ms.wal_floor,
+            ms.wal.next_seq(),
+            "the base snapshot leaves nothing unsealed"
+        );
+
+        let rec = normalize_balance_be(&424_242u128.to_be_bytes()).expect("norm");
+        ms.apply_updates(1, &[(3, Bytes::copy_from_slice(&rec))])
+            .expect("apply");
+        assert!(
+            ms.wal.next_seq() > ms.wal_floor,
+            "precondition: an applied update leaves seqs {}..{} unsealed",
+            ms.wal_floor,
+            ms.wal.next_seq()
+        );
+
+        ms.commit_v6().expect("commit");
+        assert_eq!(
+            ms.wal_floor,
+            ms.wal.next_seq(),
+            "commit_v6 must seal through the log head"
         );
     }
 }

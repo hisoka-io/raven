@@ -755,7 +755,7 @@ fn persist_initial_snapshot(
     };
     let instance_id = InstanceId::new(cfg.instance_id.clone());
     let layout_clone = layout.clone();
-    let (_inst, persistence) = bootstrap_inspire_instance(
+    let (_inst, persistence, _recovered_store) = bootstrap_inspire_instance(
         layout,
         cfg.scheme_tag.clone(),
         instance_id,
