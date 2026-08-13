@@ -282,6 +282,14 @@ pub struct HealthReadyResponse {
     /// not repair. Non-empty forces 503.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub layer2_divergent_instances: Vec<String>,
+    /// Instances whose last WAL replay left an entry unapplied, so the served
+    /// tree is behind its own WAL. Non-empty forces 503.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wal_replay_skipped_instances: Vec<String>,
+    /// Instances whose consumer has dropped every event since its last applied
+    /// one, so the served tree is missing chain state. Non-empty forces 503.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stalled_consumer_instances: Vec<String>,
 }
 
 /// Indexer-consumer view in [`HealthReadyResponse`].
@@ -321,6 +329,36 @@ pub struct RpcEndpointHealthView {
     pub burst: u32,
 }
 
+/// Instances whose consumer has failed every event since its last applied one.
+///
+/// Reads the same cells the consumer tasks mutate, with the single-cell fallback
+/// `refresh_dynamic_metrics` uses: a deployment that wires only
+/// `with_consumer_metrics` still gets a gate.
+fn stalled_consumer_instances<S: PirScheme>(app: &AppState<S>) -> Vec<String> {
+    let instances = app.engine.instances();
+    if app.instance_metrics.is_empty() {
+        let Some(cell) = app.consumer_metrics.as_ref().as_ref() else {
+            return Vec::new();
+        };
+        let stalled = cell.lock().consecutive_event_errors > 0;
+        return match instances.first() {
+            Some(first) if stalled => vec![first.id.as_str().to_owned()],
+            _ => Vec::new(),
+        };
+    }
+    let mut stalled: Vec<String> = instances
+        .iter()
+        .filter(|instance| {
+            app.instance_metrics
+                .get(&instance.id)
+                .is_some_and(|cell| cell.lock().consecutive_event_errors > 0)
+        })
+        .map(|instance| instance.id.as_str().to_owned())
+        .collect();
+    stalled.sort();
+    stalled
+}
+
 pub(crate) async fn health_ready_handler<S: PirScheme>(
     State(app): State<AppState<S>>,
 ) -> impl IntoResponse {
@@ -333,10 +371,14 @@ pub(crate) async fn health_ready_handler<S: PirScheme>(
             chain_source_mode: None,
             rpc_pool: None,
             layer2_divergent_instances: Vec::new(),
+            wal_replay_skipped_instances: Vec::new(),
+            stalled_consumer_instances: Vec::new(),
         };
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body));
     }
     let divergent = raven_railgun_engine::persistence::layer2_divergent_instances();
+    let replay_skipped = raven_railgun_engine::persistence::wal_replay_skipped_instances();
+    let stalled = stalled_consumer_instances(&app);
     let consumer = app.consumer_metrics.as_ref().as_ref().map(|m| {
         let snap = *m.lock();
         HealthConsumerView {
@@ -361,8 +403,10 @@ pub(crate) async fn health_ready_handler<S: PirScheme>(
         .as_ref()
         .map(build_rpc_pool_health_view);
     // Known divergence fails closed: the tree this endpoint would answer from is
-    // provably not the chain's.
-    let (code, status) = if divergent.is_empty() {
+    // provably not the chain's, not even its own WAL's, or missing every event
+    // its consumer has dropped since the last one it applied.
+    let (code, status) = if divergent.is_empty() && replay_skipped.is_empty() && stalled.is_empty()
+    {
         (StatusCode::OK, "ready")
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "not_ready")
@@ -374,6 +418,8 @@ pub(crate) async fn health_ready_handler<S: PirScheme>(
         chain_source_mode,
         rpc_pool,
         layer2_divergent_instances: divergent,
+        wal_replay_skipped_instances: replay_skipped,
+        stalled_consumer_instances: stalled,
     };
     (code, Json(body))
 }
@@ -413,7 +459,10 @@ mod tests {
     use axum::extract::State;
     use axum::response::IntoResponse;
     use raven_railgun_core::InstanceId;
-    use raven_railgun_engine::persistence::{clear_layer2_divergent, mark_layer2_divergent};
+    use raven_railgun_engine::persistence::{
+        clear_layer2_divergent, clear_wal_replay_skipped, mark_layer2_divergent,
+        mark_wal_replay_skipped,
+    };
     use raven_railgun_engine::{Engine, InstanceRole, PirInstance, PirScheme};
     use std::sync::Arc;
 
@@ -466,10 +515,15 @@ mod tests {
         (code, body)
     }
 
+    /// Both registries are process-wide, so the two gates share one test rather
+    /// than racing each other's probes. `InspirePersistence::open` is what fills
+    /// the replay-skip registry in production; the engine-side
+    /// `poisoned_wal_replay_skipped_marks_the_instance_unready` covers that half.
     #[tokio::test]
-    async fn ready_probe_fails_closed_while_an_instance_is_layer2_divergent() {
+    async fn ready_probe_fails_closed_on_every_known_divergence() {
         const ID: &str = "health-gate-divergent-instance";
         clear_layer2_divergent(ID);
+        clear_wal_replay_skipped(ID);
 
         let (code, body) = ready_probe(state_with_one_instance(ID)).await;
         assert_eq!(
@@ -479,6 +533,7 @@ mod tests {
         );
         assert_eq!(body.status, "ready");
         assert!(body.layer2_divergent_instances.is_empty());
+        assert!(body.wal_replay_skipped_instances.is_empty());
 
         mark_layer2_divergent(ID);
         let (code, body) = ready_probe(state_with_one_instance(ID)).await;
@@ -498,5 +553,24 @@ mod tests {
             "clearing the divergence must restore readiness"
         );
         assert!(body.layer2_divergent_instances.is_empty());
+
+        mark_wal_replay_skipped(ID);
+        let (code, body) = ready_probe(state_with_one_instance(ID)).await;
+        assert_eq!(
+            code,
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "a tree behind its own WAL must take the endpoint out of rotation"
+        );
+        assert_eq!(body.status, "not_ready");
+        assert_eq!(body.wal_replay_skipped_instances, vec![ID.to_owned()]);
+
+        clear_wal_replay_skipped(ID);
+        let (code, body) = ready_probe(state_with_one_instance(ID)).await;
+        assert_eq!(
+            code,
+            http::StatusCode::OK,
+            "clearing the replay-skip mark must restore readiness"
+        );
+        assert!(body.wal_replay_skipped_instances.is_empty());
     }
 }

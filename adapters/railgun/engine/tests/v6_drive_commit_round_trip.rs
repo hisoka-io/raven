@@ -28,7 +28,7 @@ fn canonical(seed: u8) -> [u8; 32] {
 fn encoder_for(kind: EncoderKind) -> Arc<dyn PirTableEncoder> {
     let record_size = match kind {
         EncoderKind::PerLeafPath { .. } | EncoderKind::PerListPath { .. } => 16 * 32,
-        EncoderKind::PerLeafBc
+        EncoderKind::PerLeafBc { .. }
         | EncoderKind::PerNode { .. }
         | EncoderKind::PerListNode { .. }
         | EncoderKind::PerListStatus { .. } => 32,
@@ -41,7 +41,7 @@ fn encoder_for(kind: EncoderKind) -> Arc<dyn PirTableEncoder> {
 fn commit_v6_then_reopen_preserves_logical_leaf_store() {
     let dir = tempfile::tempdir().expect("tempdir");
     let layout = StoreLayout::open(dir.path()).expect("layout");
-    let encoder = encoder_for(EncoderKind::PerLeafBc);
+    let encoder = encoder_for(EncoderKind::PerLeafBc { tree_number: 0 });
     let instance = InstanceId::new("v6-roundtrip-inst");
 
     let opened = InspirePersistence::open(

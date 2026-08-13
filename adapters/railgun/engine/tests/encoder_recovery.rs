@@ -19,7 +19,7 @@ fn canonical(seed: u8) -> [u8; 32] {
 fn encoder_for(kind: EncoderKind) -> Arc<dyn PirTableEncoder> {
     let record_size = match kind {
         EncoderKind::PerLeafPath { .. } | EncoderKind::PerListPath { .. } => 16 * 32,
-        EncoderKind::PerLeafBc
+        EncoderKind::PerLeafBc { .. }
         | EncoderKind::PerNode { .. }
         | EncoderKind::PerListNode { .. }
         | EncoderKind::PerListStatus { .. } => 32,
@@ -74,7 +74,10 @@ fn round_trip(kind: EncoderKind, instance: &str) {
 
 #[test]
 fn per_leaf_bc_round_trip_preserves_logical_store() {
-    round_trip(EncoderKind::PerLeafBc, "per-leaf-bc-inst");
+    round_trip(
+        EncoderKind::PerLeafBc { tree_number: 0 },
+        "per-leaf-bc-inst",
+    );
 }
 
 #[test]
@@ -101,7 +104,7 @@ fn manifest_encoder_label_mismatch_is_rejected_on_reopen() {
             SCHEME_TAG,
             InstanceId::new("encoder-mismatch"),
             SnapshotPolicy::default(),
-            encoder_for(EncoderKind::PerLeafBc),
+            encoder_for(EncoderKind::PerLeafBc { tree_number: 0 }),
         )
         .expect("fresh open with PerLeafBc");
     }

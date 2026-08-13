@@ -123,6 +123,12 @@ export interface LoadClientPirContextInput {
   readonly shardConfigBincode: Uint8Array;
   readonly inspireParamsBincode: Uint8Array;
   readonly entrySize: number;
+  /**
+   * Opt in to caching the session across page loads. The blob holds the client's RLWE
+   * secret key, so enabling it places that secret at rest and needs the user's informed
+   * consent. Defaults to `false`.
+   */
+  readonly persistSession?: boolean;
 }
 
 /** [`ClientPirContext`] plus a test-only warm-cache hit signal. */
@@ -133,9 +139,10 @@ export interface LoadClientPirContextResult {
 }
 
 /**
- * Build a [`ClientPirContext`], preferring the IndexedDB warm cache. The key
- * `(instanceId, sha256(crsBincode))` makes a CRS rotation self-invalidating;
- * storage failures degrade to the cold `build_client_session` path.
+ * Build a [`ClientPirContext`]. With `persistSession` the IndexedDB warm cache is
+ * preferred, keyed `(instanceId, sha256(crsBincode))` so a CRS rotation self-invalidates;
+ * storage failures degrade to the cold `build_client_session` path. Without it no session
+ * blob is read or written, because that blob is the client's secret key at rest.
  */
 export async function loadClientPirContext(
   input: LoadClientPirContextInput,
@@ -149,6 +156,7 @@ export async function loadClientPirContext(
   );
 
   const canCache =
+    input.persistSession === true &&
     typeof wasm.serialize_client_session === "function" &&
     typeof wasm.deserialize_client_session === "function";
 
@@ -195,7 +203,45 @@ export async function loadClientPirContext(
   }
 }
 
-/** Map the leading plaintext-row byte to the POI status enum; mirrors `PerListStatusEncoder`. */
+/** Narrowest T1 status row the Rust status encoder will build. */
+export const MIN_STATUS_ROW_BYTES = 32;
+
+/**
+ * Read a T1 verdict out of a status row, refusing any row whose blinded-commitment
+ * tail is not `expectedBcHex`. An unpopulated row is zero-filled and status byte 0
+ * means `Valid`, so the tail is the only thing separating a real verdict from a row
+ * that was never written.
+ */
+export function decodeStatusRow(
+  plaintext: Uint8Array,
+  expectedBcHex: string,
+  label: string,
+): POIStatus {
+  if (plaintext.length < MIN_STATUS_ROW_BYTES) {
+    throw RavenError.decodeError(
+      `${label}: status row is ${plaintext.length} bytes, need >= ${MIN_STATUS_ROW_BYTES}`,
+    );
+  }
+  validateBcHex(expectedBcHex, `${label}: expected blindedCommitment`);
+  const expected = hexToBytes(expectedBcHex);
+  // Row layout `[status, bc[0..tailLen]]`; tailLen mirrors the Rust status encoder.
+  const tailLen = Math.min(plaintext.length - 1, expected.length);
+  for (let i = 0; i < tailLen; i += 1) {
+    if (plaintext[1 + i] !== expected[i]) {
+      throw RavenError.decodeError(
+        `${label}: status row BC tail differs from the requested ${expectedBcHex} ` +
+          `at tail byte ${i} of ${tailLen}; the row does not describe this blinded commitment`,
+      );
+    }
+  }
+  return statusByteToPOIStatus(plaintext[0]);
+}
+
+/**
+ * Map the leading plaintext-row byte to the POI status enum; mirrors `PerListStatusEncoder`.
+ * Byte-level only: it cannot tell a written row from a zero-filled one, so a verdict about a
+ * specific blinded commitment must come from [`decodeStatusRow`], never from this directly.
+ */
 export function statusByteToPOIStatus(b: number): POIStatus {
   switch (b) {
     case 0:

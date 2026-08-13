@@ -51,7 +51,7 @@ fn commitment_for(leaf_index: u32) -> [u8; 32] {
 }
 
 fn seed_store(leaves: u32) -> LogicalLeafStore {
-    let encoder: Arc<dyn PirTableEncoder> = EncoderKind::PerLeafBc
+    let encoder: Arc<dyn PirTableEncoder> = EncoderKind::PerLeafBc { tree_number: 0 }
         .build(32, ENTRIES_PER_SHARD)
         .expect("encoder build");
     let mut store = LogicalLeafStore::new();

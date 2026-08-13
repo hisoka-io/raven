@@ -157,7 +157,7 @@ fn default_k_for_per_node_is_sixteen() {
         default_k_for(EncoderKind::PerLeafPath { tree_number: 0 }),
         8
     );
-    assert_eq!(default_k_for(EncoderKind::PerLeafBc), 4);
+    assert_eq!(default_k_for(EncoderKind::PerLeafBc { tree_number: 0 }), 4);
     assert_eq!(
         default_k_for(EncoderKind::PerListStatus {
             list_key: [0u8; 32]

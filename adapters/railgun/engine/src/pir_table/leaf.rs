@@ -12,16 +12,18 @@ use crate::imt::TREE_DEPTH;
 use crate::inspire::{materialize_shard_bytes, LogicalLeafStore};
 
 /// Membership encoder: row is the 32 B commitment, zero-padded to `record_size`.
+/// Rows cover one tree's leaf range; an insert outside it dirties no shard.
 #[derive(Debug, Clone)]
 pub struct PerLeafCommitmentEncoder {
     record_size: usize,
     entries_per_shard: u32,
+    tree_number: u32,
 }
 
 impl PerLeafCommitmentEncoder {
     /// Build after validating the cell shape; requires `record_size >= 32` and
     /// non-zero `entries_per_shard`.
-    pub fn new(record_size: usize, entries_per_shard: u32) -> Result<Self> {
+    pub fn new(record_size: usize, entries_per_shard: u32, tree_number: u32) -> Result<Self> {
         if record_size < MIN_RECORD_SIZE {
             return Err(AdapterError::InvalidQuery(format!(
                 "PerLeafCommitmentEncoder: record_size {record_size} must be >= {MIN_RECORD_SIZE}"
@@ -35,6 +37,7 @@ impl PerLeafCommitmentEncoder {
         Ok(Self {
             record_size,
             entries_per_shard,
+            tree_number,
         })
     }
 }
@@ -49,17 +52,44 @@ impl PirTableEncoder for PerLeafCommitmentEncoder {
     }
 
     fn materialize_shard(&self, shard_id: u32, store: &LogicalLeafStore) -> Vec<u8> {
-        materialize_shard_bytes(store, shard_id, self.entries_per_shard, self.record_size)
+        materialize_shard_bytes(
+            store,
+            shard_id,
+            self.entries_per_shard,
+            self.record_size,
+            self.tree_number,
+        )
     }
 
     fn affected_shards_for_leaf(&self, tree: u32, leaf_index: u32) -> BTreeSet<u32> {
-        let global = u64::from(tree) * u64::from(LEAVES_PER_TREE) + u64::from(leaf_index);
-        let shard = (global / u64::from(self.entries_per_shard))
-            .try_into()
-            .unwrap_or(u32::MAX);
-        let mut out = BTreeSet::new();
-        out.insert(shard);
-        out
+        let mut dirty = BTreeSet::new();
+        // The pin is the invariant, not the router: the single-instance ingest path
+        // forwards every tree, and the row index is `leaf_index` alone, so an unfiltered
+        // foreign leaf would overwrite this tree's row.
+        if tree != self.tree_number {
+            tracing::warn!(
+                target = "raven::pir_table",
+                encoder = "per-leaf-bc",
+                pinned_tree = self.tree_number,
+                event_tree = tree,
+                event_leaf = leaf_index,
+                "leaf from a tree this encoder is not pinned to; no shard holds it"
+            );
+            return dirty;
+        }
+        if leaf_index >= LEAVES_PER_TREE {
+            tracing::warn!(
+                target = "raven::pir_table",
+                encoder = "per-leaf-bc",
+                event_leaf = leaf_index,
+                row_space = LEAVES_PER_TREE,
+                "leaf index past one tree's row space; no shard holds it, so re-encode \
+                 cannot fire and the row it would occupy stays zero"
+            );
+            return dirty;
+        }
+        dirty.insert(leaf_index / self.entries_per_shard);
+        dirty
     }
 
     fn label(&self) -> &'static str {

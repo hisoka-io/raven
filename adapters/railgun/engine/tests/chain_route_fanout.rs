@@ -38,7 +38,7 @@ fn commit_tree_cfg(id: &str, dir: std::path::PathBuf, tree_number: u32) -> Insta
         instance_id: InstanceId::new(id),
         role: InstanceRole::Live,
         data_dir: dir,
-        encoder: EncoderKind::PerLeafBc,
+        encoder: EncoderKind::PerLeafBc { tree_number: 0 },
         record_size: TOY_ENTRY_SIZE,
         entries_per_shard: TOY_ENTRIES_PER_SHARD,
         verification_mode: VerificationMode::ChainRootHistory,

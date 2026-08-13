@@ -67,7 +67,7 @@ pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
     let noop_encoder: Arc<dyn PirTableEncoder> = {
         use raven_railgun_engine::pir_table::PerLeafCommitmentEncoder;
         Arc::new(
-            PerLeafCommitmentEncoder::new(32, 1)
+            PerLeafCommitmentEncoder::new(32, 1, 0)
                 .map_err(|e| anyhow::anyhow!("noop encoder: {e}"))?,
         )
     };

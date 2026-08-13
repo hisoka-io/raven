@@ -13,6 +13,7 @@ import {
 } from "../src/index";
 
 import { startMockServer, writeJson, type MockServer } from "./helpers/mock_server";
+import { authPathOf, epochMarkers } from "./helpers/auth_path_stub";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const TREE_NUMBER = 0;
@@ -137,10 +138,6 @@ function newSdk(server: MockServer): RavenPOINodeInterface {
   });
 }
 
-function epochMarkers(elements: string[]): string[] {
-  return Array.from(new Set(elements.map((e) => e.slice(0, 2)))).sort();
-}
-
 describe("auth-path epoch revalidation", () => {
   let server: MockServer;
   let state: AdapterState;
@@ -167,16 +164,16 @@ describe("auth-path epoch revalidation", () => {
 
     const cold = await sdk.getMerkleProof(TREE_NUMBER, 1234);
     expect(state.batchHits).toBe(1);
-    expect(epochMarkers(cold.elements)).toEqual(["07"]);
+    expect(epochMarkers(authPathOf(cold).elements)).toEqual(["07"]);
 
     const warm = await sdk.getMerkleProof(TREE_NUMBER, 1234);
     expect(state.batchHits).toBe(2);
-    expect(epochMarkers(warm.elements)).toEqual(["07"]);
+    expect(epochMarkers(authPathOf(warm).elements)).toEqual(["07"]);
 
     state.epoch = 8;
     const afterAdvance = await sdk.getMerkleProof(TREE_NUMBER, 1234);
     expect(state.batchHits).toBe(3);
-    expect(epochMarkers(afterAdvance.elements)).toEqual(["08"]);
+    expect(epochMarkers(authPathOf(afterAdvance).elements)).toEqual(["08"]);
     expect(state.statusHits).toBe(0);
   });
 
@@ -189,7 +186,7 @@ describe("auth-path epoch revalidation", () => {
 
     // 1234 ^ 0b111 shares every sibling above level 2, so 13 levels come from the epoch-7 cache.
     const mixed = await sdk.getMerkleProof(TREE_NUMBER, 1234 ^ 0b111);
-    expect(epochMarkers(mixed.elements)).toEqual(["08"]);
+    expect(epochMarkers(authPathOf(mixed).elements)).toEqual(["08"]);
   });
 
   it("fails closed when the revalidating batch is unreachable instead of serving the cached path", async () => {

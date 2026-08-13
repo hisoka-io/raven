@@ -1,6 +1,12 @@
 /** Auth-path test rig: a path-indices wasm stub and a batch encoder whose nodes carry their serving epoch. */
 
-import { TREE_DEPTH, type ClientPirContext, type RavenInspireWasm } from "../../src/index";
+import {
+  TREE_DEPTH,
+  type ClientPirContext,
+  type CommitTreeAuthPath,
+  type CommitTreeProof,
+  type RavenInspireWasm,
+} from "../../src/index";
 
 export const TOKEN = "test-token-padded-long-enough-1234";
 export const NODE_BYTES = 32;
@@ -72,4 +78,12 @@ export function encodedBatchCount(body: Uint8Array): number {
 
 export function epochMarkers(elements: string[]): string[] {
   return Array.from(new Set(elements.map((e) => e.slice(0, 2)))).sort();
+}
+
+/** Narrow a commit-tree result to its rootless auth-path arm. */
+export function authPathOf(proof: CommitTreeProof): CommitTreeAuthPath {
+  if (proof.kind !== "authPath") {
+    throw new Error(`expected a commit-tree auth path, got kind=${proof.kind}`);
+  }
+  return proof;
 }

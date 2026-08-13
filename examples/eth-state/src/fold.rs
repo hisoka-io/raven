@@ -63,8 +63,6 @@ pub struct MainSidecar {
     wal: Wal,
     next_snapshot_id: u64,
     marker: u64,
-    /// First WAL seq still in `current.log` (the start of the next archive range).
-    wal_floor: u64,
 }
 
 impl MainSidecar {
@@ -128,7 +126,6 @@ impl MainSidecar {
             wal,
             next_snapshot_id: 0,
             marker: 0,
-            wal_floor: 0,
         };
         // Base snapshot so a later recover() has something to load.
         this.commit_v6()?;
@@ -406,7 +403,7 @@ impl MainSidecar {
             scheme_tag: SCHEME_TAG.to_string(),
             instance_id: INSTANCE_ID.to_string(),
             current_snapshot_id: snap_id,
-            current_snapshot_seq: self.wal_floor,
+            current_snapshot_seq: self.wal.next_seq(),
             current_marker: self.marker,
             encoder_label: ENCODER_LABEL.to_string(),
             prev_encoder_label: None,
@@ -424,7 +421,6 @@ impl MainSidecar {
             },
         )
         .map_err(|e| EthStateError::Setup(format!("publish snapshot: {e}")))?;
-        self.wal_floor = self.wal.next_seq();
         self.next_snapshot_id += 1;
         Ok(())
     }
@@ -458,7 +454,6 @@ impl MainSidecar {
         // range; None at seq 0 means a fresh WAL.
         let wal = Wal::open(&layout, manifest.current_snapshot_seq.checked_sub(1))
             .map_err(|e| EthStateError::Setup(format!("wal open: {e}")))?;
-        let wal_floor = wal.next_seq();
         let replay = wal
             .replay()
             .map_err(|e| EthStateError::Setup(format!("wal replay: {e}")))?;
@@ -519,7 +514,6 @@ impl MainSidecar {
                 wal,
                 next_snapshot_id: manifest.current_snapshot_id.0 + 1,
                 marker: manifest.current_marker,
-                wal_floor,
             },
             main_sk,
             side_sk,
@@ -679,7 +673,16 @@ mod wal_floor {
     use crate::ENTRY_SIZE;
     use bytes::Bytes;
     use raven_inspire::params::InspireParams;
+    use raven_storage::Manifest;
     use serial_test::serial;
+
+    /// The floor `recover` reads back, not an in-memory mirror of it.
+    fn published_floor(ms: &MainSidecar) -> u64 {
+        Manifest::load(&ms.layout)
+            .expect("manifest load")
+            .expect("manifest present after commit")
+            .current_snapshot_seq
+    }
 
     /// `fold` seals no WAL range of its own because `commit_v6` already published through the
     /// log head. The middle assertion pins the window where an unsealed range does exist.
@@ -697,7 +700,7 @@ mod wal_floor {
         let (mut ms, _msk, _ssk) =
             MainSidecar::seed(&params, &db, ENTRY_SIZE, dir.path(), 0x0000_A5F0).expect("seed");
         assert_eq!(
-            ms.wal_floor,
+            published_floor(&ms),
             ms.wal.next_seq(),
             "the base snapshot leaves nothing unsealed"
         );
@@ -706,15 +709,15 @@ mod wal_floor {
         ms.apply_updates(1, &[(3, Bytes::copy_from_slice(&rec))])
             .expect("apply");
         assert!(
-            ms.wal.next_seq() > ms.wal_floor,
+            ms.wal.next_seq() > published_floor(&ms),
             "precondition: an applied update leaves seqs {}..{} unsealed",
-            ms.wal_floor,
+            published_floor(&ms),
             ms.wal.next_seq()
         );
 
         ms.commit_v6().expect("commit");
         assert_eq!(
-            ms.wal_floor,
+            published_floor(&ms),
             ms.wal.next_seq(),
             "commit_v6 must seal through the log head"
         );

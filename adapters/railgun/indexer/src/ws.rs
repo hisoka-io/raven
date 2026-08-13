@@ -113,63 +113,80 @@ impl WsChainSource {
 #[async_trait]
 impl ChainSource for WsChainSource {
     async fn latest_block(&self) -> Result<u64> {
-        let p = self.provider().await?;
-        let block = p
-            .get_block_by_number(alloy::eips::BlockNumberOrTag::Finalized)
-            .await
-            .map_err(|e| IndexerError::Rpc(format!("get_block_by_number(finalized): {e}")))?;
-        let block = block.ok_or_else(|| {
-            IndexerError::Rpc("finalized block not yet available; chain too young".into())
-        })?;
-        Ok(block.header.number)
+        crate::with_rpc_timeout(
+            "ws latest_block",
+            Box::pin(async {
+                let p = self.provider().await?;
+                let block = p
+                    .get_block_by_number(alloy::eips::BlockNumberOrTag::Finalized)
+                    .await
+                    .map_err(|e| {
+                        IndexerError::Rpc(format!("get_block_by_number(finalized): {e}"))
+                    })?;
+                let block = block.ok_or_else(|| {
+                    IndexerError::Rpc("finalized block not yet available; chain too young".into())
+                })?;
+                Ok(block.header.number)
+            }),
+        )
+        .await
     }
 
     async fn events_in_range(&self, from_block: u64, to_block: u64) -> Result<Vec<RailgunEvent>> {
-        if to_block < from_block {
-            return Ok(Vec::new());
-        }
-        let span = to_block.saturating_sub(from_block).saturating_add(1);
-        if span > crate::SCAN_CHUNK_BLOCKS {
-            return Err(IndexerError::Rpc(format!(
-                "events_in_range called with span={span} blocks; caller must chunk \
-                 to <= SCAN_CHUNK_BLOCKS={} per the trait contract",
-                crate::SCAN_CHUNK_BLOCKS
-            )));
-        }
-        let p = self.provider().await?;
+        crate::with_rpc_timeout(
+            "ws events_in_range",
+            Box::pin(async {
+                if to_block < from_block {
+                    return Ok(Vec::new());
+                }
+                let span = to_block.saturating_sub(from_block).saturating_add(1);
+                if span > crate::SCAN_CHUNK_BLOCKS {
+                    return Err(IndexerError::Rpc(format!(
+                        "events_in_range called with span={span} blocks; caller must chunk \
+                     to <= SCAN_CHUNK_BLOCKS={} per the trait contract",
+                        crate::SCAN_CHUNK_BLOCKS
+                    )));
+                }
+                let p = self.provider().await?;
 
-        use alloy::sol_types::SolEvent;
-        let topic0 = [
-            crate::abi::Shield::SIGNATURE_HASH,
-            crate::abi::Transact::SIGNATURE_HASH,
-            crate::abi::Unshield::SIGNATURE_HASH,
-            crate::abi::Nullified::SIGNATURE_HASH,
-        ];
-        let filter = alloy::rpc::types::eth::Filter::new()
-            .address(self.railgun_proxy)
-            .from_block(from_block)
-            .to_block(to_block)
-            .event_signature(topic0.to_vec());
+                use alloy::sol_types::SolEvent;
+                let topic0 = [
+                    crate::abi::Shield::SIGNATURE_HASH,
+                    crate::abi::Transact::SIGNATURE_HASH,
+                    crate::abi::Unshield::SIGNATURE_HASH,
+                    crate::abi::Nullified::SIGNATURE_HASH,
+                ];
+                let filter = alloy::rpc::types::eth::Filter::new()
+                    .address(self.railgun_proxy)
+                    .from_block(from_block)
+                    .to_block(to_block)
+                    .event_signature(topic0.to_vec());
 
-        let logs = p
-            .get_logs(&filter)
-            .await
-            .map_err(|e| IndexerError::Rpc(format!("get_logs: {e}")))?;
+                let logs = p
+                    .get_logs(&filter)
+                    .await
+                    .map_err(|e| IndexerError::Rpc(format!("get_logs: {e}")))?;
 
-        let mut events = Vec::with_capacity(logs.len());
-        for log in logs {
-            let Some(block_number) = crate::block_number_or_drop(&log) else {
-                continue;
-            };
-            let tx_hash = log.transaction_hash.map_or([0u8; 32], |h| h.0);
-            let primary_topic = log.topic0().copied().unwrap_or_default();
-            if let Some(e) =
-                crate::decode_log_to_railgun_event(primary_topic, &log, block_number, tx_hash)?
-            {
-                events.push(e);
-            }
-        }
-        Ok(events)
+                let mut events = Vec::with_capacity(logs.len());
+                for log in logs {
+                    let Some(block_number) = crate::block_number_or_drop(&log) else {
+                        continue;
+                    };
+                    let tx_hash = log.transaction_hash.map_or([0u8; 32], |h| h.0);
+                    let primary_topic = log.topic0().copied().unwrap_or_default();
+                    if let Some(e) = crate::decode_log_to_railgun_event(
+                        primary_topic,
+                        &log,
+                        block_number,
+                        tx_hash,
+                    )? {
+                        events.push(e);
+                    }
+                }
+                Ok(events)
+            }),
+        )
+        .await
     }
 
     async fn root_history(
@@ -178,84 +195,111 @@ impl ChainSource for WsChainSource {
         merkle_root: [u8; 32],
         at: Option<alloy::eips::BlockId>,
     ) -> Result<bool> {
-        use alloy::sol_types::SolCall;
-        let p = self.provider().await?;
-        let call = crate::abi::rootHistoryCall {
-            tree: alloy::primitives::U256::from(tree_number),
-            root: alloy::primitives::FixedBytes::<32>::from(merkle_root),
-        };
-        let calldata: alloy::primitives::Bytes = call.abi_encode().into();
-        let tx = alloy::rpc::types::eth::TransactionRequest {
-            to: Some(alloy::primitives::TxKind::Call(self.railgun_proxy)),
-            input: alloy::rpc::types::eth::TransactionInput::new(calldata),
-            ..Default::default()
-        };
-        let mut call_builder = p.call(tx);
-        if let Some(b) = at {
-            call_builder = call_builder.block(b);
-        }
-        let result_bytes: alloy::primitives::Bytes = call_builder
-            .await
-            .map_err(|e| IndexerError::Rpc(format!("eth_call rootHistory: {e}")))?;
-        let decoded = crate::abi::rootHistoryCall::abi_decode_returns(&result_bytes)
-            .map_err(|e| IndexerError::Decode(format!("rootHistory decode: {e}")))?;
-        Ok(decoded)
+        crate::with_rpc_timeout(
+            "ws root_history",
+            Box::pin(async {
+                use alloy::sol_types::SolCall;
+                let p = self.provider().await?;
+                let call = crate::abi::rootHistoryCall {
+                    tree: alloy::primitives::U256::from(tree_number),
+                    root: alloy::primitives::FixedBytes::<32>::from(merkle_root),
+                };
+                let calldata: alloy::primitives::Bytes = call.abi_encode().into();
+                let tx = alloy::rpc::types::eth::TransactionRequest {
+                    to: Some(alloy::primitives::TxKind::Call(self.railgun_proxy)),
+                    input: alloy::rpc::types::eth::TransactionInput::new(calldata),
+                    ..Default::default()
+                };
+                let mut call_builder = p.call(tx);
+                if let Some(b) = at {
+                    call_builder = call_builder.block(b);
+                }
+                let result_bytes: alloy::primitives::Bytes = call_builder
+                    .await
+                    .map_err(|e| IndexerError::Rpc(format!("eth_call rootHistory: {e}")))?;
+                let decoded = crate::abi::rootHistoryCall::abi_decode_returns(&result_bytes)
+                    .map_err(|e| IndexerError::Decode(format!("rootHistory decode: {e}")))?;
+                Ok(decoded)
+            }),
+        )
+        .await
     }
 
     async fn block_hash(&self, block_number: u64) -> Result<[u8; 32]> {
-        let p = self.provider().await?;
-        let block = p
-            .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(block_number))
-            .await
-            .map_err(|e| IndexerError::Rpc(format!("get_block_by_number({block_number}): {e}")))?;
-        let block = block
-            .ok_or_else(|| IndexerError::Rpc(format!("block {block_number} not yet available")))?;
-        Ok(block.header.hash.0)
+        crate::with_rpc_timeout(
+            "ws block_hash",
+            Box::pin(async {
+                let p = self.provider().await?;
+                let block = p
+                    .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(block_number))
+                    .await
+                    .map_err(|e| {
+                        IndexerError::Rpc(format!("get_block_by_number({block_number}): {e}"))
+                    })?;
+                let block = block.ok_or_else(|| {
+                    IndexerError::Rpc(format!("block {block_number} not yet available"))
+                })?;
+                Ok(block.header.hash.0)
+            }),
+        )
+        .await
     }
 
     async fn merkle_root(&self, at: Option<alloy::eips::BlockId>) -> Result<[u8; 32]> {
-        use alloy::sol_types::SolCall;
-        let p = self.provider().await?;
-        let call = crate::abi::merkleRootCall {};
-        let calldata: alloy::primitives::Bytes = call.abi_encode().into();
-        let tx = alloy::rpc::types::eth::TransactionRequest {
-            to: Some(alloy::primitives::TxKind::Call(self.railgun_proxy)),
-            input: alloy::rpc::types::eth::TransactionInput::new(calldata),
-            ..Default::default()
-        };
-        let mut call_builder = p.call(tx);
-        if let Some(b) = at {
-            call_builder = call_builder.block(b);
-        }
-        let result_bytes: alloy::primitives::Bytes = call_builder
-            .await
-            .map_err(|e| IndexerError::Rpc(format!("eth_call merkleRoot: {e}")))?;
-        let decoded = crate::abi::merkleRootCall::abi_decode_returns(&result_bytes)
-            .map_err(|e| IndexerError::Decode(format!("merkleRoot decode: {e}")))?;
-        Ok(decoded.0)
+        crate::with_rpc_timeout(
+            "ws merkle_root",
+            Box::pin(async {
+                use alloy::sol_types::SolCall;
+                let p = self.provider().await?;
+                let call = crate::abi::merkleRootCall {};
+                let calldata: alloy::primitives::Bytes = call.abi_encode().into();
+                let tx = alloy::rpc::types::eth::TransactionRequest {
+                    to: Some(alloy::primitives::TxKind::Call(self.railgun_proxy)),
+                    input: alloy::rpc::types::eth::TransactionInput::new(calldata),
+                    ..Default::default()
+                };
+                let mut call_builder = p.call(tx);
+                if let Some(b) = at {
+                    call_builder = call_builder.block(b);
+                }
+                let result_bytes: alloy::primitives::Bytes = call_builder
+                    .await
+                    .map_err(|e| IndexerError::Rpc(format!("eth_call merkleRoot: {e}")))?;
+                let decoded = crate::abi::merkleRootCall::abi_decode_returns(&result_bytes)
+                    .map_err(|e| IndexerError::Decode(format!("merkleRoot decode: {e}")))?;
+                Ok(decoded.0)
+            }),
+        )
+        .await
     }
 
     async fn active_tree_number(&self, at: Option<alloy::eips::BlockId>) -> Result<u32> {
-        use alloy::sol_types::SolCall;
-        let p = self.provider().await?;
-        let call = crate::abi::treeNumberCall {};
-        let calldata: alloy::primitives::Bytes = call.abi_encode().into();
-        let tx = alloy::rpc::types::eth::TransactionRequest {
-            to: Some(alloy::primitives::TxKind::Call(self.railgun_proxy)),
-            input: alloy::rpc::types::eth::TransactionInput::new(calldata),
-            ..Default::default()
-        };
-        let mut call_builder = p.call(tx);
-        if let Some(b) = at {
-            call_builder = call_builder.block(b);
-        }
-        let result_bytes: alloy::primitives::Bytes = call_builder
-            .await
-            .map_err(|e| IndexerError::Rpc(format!("eth_call treeNumber: {e}")))?;
-        let decoded = crate::abi::treeNumberCall::abi_decode_returns(&result_bytes)
-            .map_err(|e| IndexerError::Decode(format!("treeNumber decode: {e}")))?;
-        let tree_u32 = u32::try_from(decoded).unwrap_or(u32::MAX);
-        Ok(tree_u32)
+        crate::with_rpc_timeout(
+            "ws active_tree_number",
+            Box::pin(async {
+                use alloy::sol_types::SolCall;
+                let p = self.provider().await?;
+                let call = crate::abi::treeNumberCall {};
+                let calldata: alloy::primitives::Bytes = call.abi_encode().into();
+                let tx = alloy::rpc::types::eth::TransactionRequest {
+                    to: Some(alloy::primitives::TxKind::Call(self.railgun_proxy)),
+                    input: alloy::rpc::types::eth::TransactionInput::new(calldata),
+                    ..Default::default()
+                };
+                let mut call_builder = p.call(tx);
+                if let Some(b) = at {
+                    call_builder = call_builder.block(b);
+                }
+                let result_bytes: alloy::primitives::Bytes = call_builder
+                    .await
+                    .map_err(|e| IndexerError::Rpc(format!("eth_call treeNumber: {e}")))?;
+                let decoded = crate::abi::treeNumberCall::abi_decode_returns(&result_bytes)
+                    .map_err(|e| IndexerError::Decode(format!("treeNumber decode: {e}")))?;
+                let tree_u32 = u32::try_from(decoded).unwrap_or(u32::MAX);
+                Ok(tree_u32)
+            }),
+        )
+        .await
     }
 }
 

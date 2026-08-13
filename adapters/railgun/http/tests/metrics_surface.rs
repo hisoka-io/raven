@@ -102,6 +102,7 @@ fn with_instance_metrics_builder_round_trips_map() {
         reorgs_handled: 1,
         commits_fired: 7,
         consumer_errors: 0,
+        consecutive_event_errors: 0,
     }));
     let mut map: HashMap<InstanceId, Arc<parking_lot::Mutex<ConsumerMetrics>>> = HashMap::new();
     let id = InstanceId::new("with-instance-metrics-roundtrip");

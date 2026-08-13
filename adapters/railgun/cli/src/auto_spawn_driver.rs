@@ -75,7 +75,7 @@ pub struct AutoSpawnRuntime {
 impl AutoSpawnRuntime {
     pub fn resolve_encoder(&self, t: u32) -> anyhow::Result<EncoderKind> {
         match self.encoder.as_str() {
-            "per-leaf-bc" => Ok(EncoderKind::PerLeafBc),
+            "per-leaf-bc" => Ok(EncoderKind::PerLeafBc { tree_number: 0 }),
             "per-leaf-path" => Ok(EncoderKind::PerLeafPath { tree_number: t }),
             "per-node" => Ok(EncoderKind::PerNode { tree_number: t }),
             other => anyhow::bail!(
@@ -538,7 +538,7 @@ fn spawn_one(inputs: &SpawnInputs<'_>, tree: u32, append_log: bool) -> anyhow::R
         Ok(state)
     };
 
-    let (instance, persistence, _recovered_store) = bootstrap_inspire_instance(
+    let (instance, persistence, recovered_store) = bootstrap_inspire_instance(
         layout,
         runtime.scheme_tag.clone(),
         instance_id.clone(),
@@ -565,7 +565,7 @@ fn spawn_one(inputs: &SpawnInputs<'_>, tree: u32, append_log: bool) -> anyhow::R
     });
 
     let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default()));
-    let logical_store = Arc::new(parking_lot::Mutex::new(LogicalLeafStore::new()));
+    let logical_store = Arc::new(parking_lot::Mutex::new(recovered_store));
     let verifier_ctx = inputs
         .chain_source
         .as_ref()
@@ -863,7 +863,7 @@ fn spawn_one_ppoi_list(inputs: &PpoiListSpawnInputs<'_>, append_log: bool) -> an
         Ok(state)
     };
 
-    let (instance, persistence, _recovered_store) = bootstrap_inspire_instance(
+    let (instance, persistence, recovered_store) = bootstrap_inspire_instance(
         layout,
         template.scheme_tag.clone(),
         instance_id.clone(),
@@ -890,7 +890,7 @@ fn spawn_one_ppoi_list(inputs: &PpoiListSpawnInputs<'_>, append_log: bool) -> an
     });
 
     let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default()));
-    let logical_store = Arc::new(parking_lot::Mutex::new(LogicalLeafStore::new()));
+    let logical_store = Arc::new(parking_lot::Mutex::new(recovered_store));
     // Upstream-signature verification stands in for the L2 chain-root verifier here.
     let verifier_ctx: Option<Layer2VerifierContext> = None;
 
@@ -1205,7 +1205,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let layout = StoreLayout::open(tmp.path()).expect("layout");
-        let encoder: Arc<dyn PirTableEncoder> = EncoderKind::PerLeafBc
+        let encoder: Arc<dyn PirTableEncoder> = EncoderKind::PerLeafBc { tree_number: 0 }
             .build(entry_size, 256)
             .expect("encoder");
         let opened = InspirePersistence::open(

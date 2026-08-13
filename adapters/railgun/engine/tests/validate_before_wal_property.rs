@@ -30,7 +30,7 @@ const BN254_FR_MODULUS_BE: [u8; 32] = [
 ];
 
 fn test_encoder() -> PerLeafCommitmentEncoder {
-    PerLeafCommitmentEncoder::new(32, ENTRIES_PER_SHARD).expect("test encoder")
+    PerLeafCommitmentEncoder::new(32, ENTRIES_PER_SHARD, 0).expect("test encoder")
 }
 
 fn test_encoder_arc() -> Arc<dyn PirTableEncoder> {

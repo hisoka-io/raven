@@ -162,7 +162,7 @@ describe("legacy plaintext fallback paths", () => {
       useClientPir: false,
     });
     const got = await sdk.getMerkleProof(2, 42);
-    expect(got).toEqual(proof);
+    expect(got).toEqual({ kind: "rooted", proof });
     const wires = sdk.lastWireRequests();
     expect(wires.length).toBe(1);
     const decoded = JSON.parse(new TextDecoder().decode(wires[0].body));

@@ -184,7 +184,7 @@ fn assert_old_encoder_recovers(dir_path: &Path) {
         SCHEME_TAG,
         InstanceId::new("real-sigkill-migrate"),
         SnapshotPolicy::default(),
-        encoder_arc(EncoderKind::PerLeafBc),
+        encoder_arc(EncoderKind::PerLeafBc { tree_number: 0 }),
     )
     .expect("reopen with prior encoder must succeed after kill");
     assert_eq!(
@@ -199,7 +199,7 @@ fn assert_old_encoder_recovers(dir_path: &Path) {
 #[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn real_sigkill_at_pre_re_encode_no_disk_mutation_then_resume_succeeds() {
     let dir = tempfile::tempdir().expect("tempdir");
-    seed_dir(dir.path(), EncoderKind::PerLeafBc);
+    seed_dir(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 });
 
     let manifest_pre = read_manifest(dir.path());
     let pre_manifest_raw = manifest_bytes(dir.path());
@@ -239,7 +239,7 @@ fn real_sigkill_at_pre_re_encode_no_disk_mutation_then_resume_succeeds() {
 #[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn real_sigkill_at_post_re_encode_no_disk_mutation_then_resume_succeeds() {
     let dir = tempfile::tempdir().expect("tempdir");
-    seed_dir(dir.path(), EncoderKind::PerLeafBc);
+    seed_dir(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 });
 
     let manifest_pre = read_manifest(dir.path());
     let pre_manifest_raw = manifest_bytes(dir.path());
@@ -279,7 +279,7 @@ fn real_sigkill_at_post_re_encode_no_disk_mutation_then_resume_succeeds() {
 #[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn real_sigkill_at_pre_snapshot_no_disk_mutation_then_resume_succeeds() {
     let dir = tempfile::tempdir().expect("tempdir");
-    seed_dir(dir.path(), EncoderKind::PerLeafBc);
+    seed_dir(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 });
 
     let manifest_pre = read_manifest(dir.path());
     let pre_manifest_raw = manifest_bytes(dir.path());
@@ -309,7 +309,7 @@ fn real_sigkill_at_pre_snapshot_no_disk_mutation_then_resume_succeeds() {
 #[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn real_sigkill_at_post_snapshot_keeps_old_manifest_then_resume_succeeds() {
     let dir = tempfile::tempdir().expect("tempdir");
-    seed_dir(dir.path(), EncoderKind::PerLeafBc);
+    seed_dir(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 });
 
     let manifest_pre = read_manifest(dir.path());
     let pre_manifest_raw = manifest_bytes(dir.path());
@@ -348,7 +348,7 @@ fn real_sigkill_at_post_snapshot_keeps_old_manifest_then_resume_succeeds() {
 fn real_sigkill_at_pre_manifest_bump_keeps_old_manifest_then_resume_succeeds() {
     // Aliases post-snapshot on disk; kept distinct for intent.
     let dir = tempfile::tempdir().expect("tempdir");
-    seed_dir(dir.path(), EncoderKind::PerLeafBc);
+    seed_dir(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 });
 
     let manifest_pre = read_manifest(dir.path());
     let pre_manifest_raw = manifest_bytes(dir.path());
@@ -382,7 +382,7 @@ fn real_sigkill_at_pre_manifest_bump_keeps_old_manifest_then_resume_succeeds() {
 fn real_sigkill_at_post_manifest_bump_yields_fully_migrated_state() {
     // The kill lands post-migration, so the re-run must hit the idempotency guard.
     let dir = tempfile::tempdir().expect("tempdir");
-    seed_dir(dir.path(), EncoderKind::PerLeafBc);
+    seed_dir(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 });
 
     let manifest_pre = read_manifest(dir.path());
 

@@ -78,6 +78,10 @@ pub struct InspirePersistence {
     scheme_tag: String,
     instance_id: InstanceId,
     commit_notify: tokio::sync::Notify,
+    /// Leaf count of the store the published snapshot carries. The commit driver
+    /// refuses to publish a store below it without a dirty shard to explain the
+    /// drop.
+    committed_leaf_count: std::sync::atomic::AtomicUsize,
 }
 
 impl std::fmt::Debug for InspirePersistence {
@@ -105,7 +109,68 @@ impl InspirePersistence {
     pub fn set_snapshot_policy(&self, new_policy: SnapshotPolicy) {
         *self.policy.write() = new_policy;
     }
+
+    /// Leaf count carried by the currently published snapshot.
+    #[must_use]
+    pub fn committed_leaf_count(&self) -> usize {
+        self.committed_leaf_count
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Mark this instance's tree divergent from the chain, in memory and on disk.
+    ///
+    /// # Errors
+    /// [`AdapterError::Internal`] if the on-disk marker cannot be written; the
+    /// in-memory mark is set either way.
+    pub fn mark_layer2_divergent(&self) -> Result<()> {
+        self::mark_layer2_divergent(self.instance_id.as_str());
+        let path = self.layer2_divergent_marker_path();
+        std::fs::write(&path, self.instance_id.as_str()).map_err(|e| {
+            AdapterError::Internal(format!(
+                "layer2 divergence marker write failed at {}: {e}; a restart would \
+                 report ready with the tree still unrepaired",
+                path.display()
+            ))
+        })
+    }
+
+    /// Drop this instance's divergence mark, in memory and on disk.
+    ///
+    /// # Errors
+    /// [`AdapterError::Internal`] if the on-disk marker exists and cannot be
+    /// removed; the in-memory mark is cleared either way.
+    pub fn clear_layer2_divergent(&self) -> Result<()> {
+        self::clear_layer2_divergent(self.instance_id.as_str());
+        let path = self.layer2_divergent_marker_path();
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(AdapterError::Internal(format!(
+                "layer2 divergence marker removal failed at {}: {e}; the next open \
+                 will re-mark this instance divergent",
+                path.display()
+            ))),
+        }
+    }
+
+    fn mark_divergent_or_log(&self, instance_label: &str) {
+        if let Err(e) = self.mark_layer2_divergent() {
+            tracing::error!(
+                error = %e,
+                instance = instance_label,
+                "layer2 verifier: divergence mark set in memory only"
+            );
+        }
+    }
+
+    fn layer2_divergent_marker_path(&self) -> std::path::PathBuf {
+        self.layout.root().join(LAYER2_DIVERGENT_MARKER)
+    }
 }
+
+/// Store-root file whose presence re-marks an instance divergent on open. A
+/// restart is not evidence that the tree was repaired.
+const LAYER2_DIVERGENT_MARKER: &str = "layer2-divergent";
 
 /// Result of [`InspirePersistence::open`].
 #[derive(Debug)]
@@ -173,6 +238,9 @@ impl InspirePersistence {
         encoder: Arc<dyn super::pir_table::PirTableEncoder>,
     ) -> Result<OpenedInstance> {
         ensure_metrics_described();
+        if layout.root().join(LAYER2_DIVERGENT_MARKER).exists() {
+            mark_layer2_divergent(instance_id.as_str());
+        }
         let scheme_tag = scheme_tag.into();
         let encoder_label = encoder.label();
         if let Some(manifest) = Manifest::load(&layout)
@@ -232,7 +300,8 @@ impl InspirePersistence {
             let replay = wal
                 .replay()
                 .map_err(|e| AdapterError::Internal(format!("wal replay: {e}")))?;
-            // Tolerant replay: `InvalidQuery` soft-skips; Internal/Serialization bubble.
+            // An unencodable leaf is replay-fatal; every other `InvalidQuery`
+            // soft-skips, and Internal/Serialization bubble.
             let mut replay_skipped: u64 = 0;
             let replay_encoder = encoder.as_ref();
             for entry in &replay.entries {
@@ -241,6 +310,17 @@ impl InspirePersistence {
                 }
                 let payload: WalEntryPayload = bincode::deserialize(&entry.payload)
                     .map_err(|e| AdapterError::Serialization(format!("wal payload: {e}")))?;
+                super::inspire::ensure_canonical_leaf(&payload).map_err(|e| {
+                    AdapterError::Internal(format!(
+                        "wal replay refused at seq {} (block {}): {e}. Skipping it \
+                         would leave the tree short a leaf and discard every later \
+                         entry for that tree; repair or truncate the WAL under \
+                         {} before reopening",
+                        entry.seq,
+                        entry.marker,
+                        layout.root().display(),
+                    ))
+                })?;
                 if let Err(e) = super::inspire::apply_wal_entry(
                     &mut logical_store,
                     &payload,
@@ -265,10 +345,12 @@ impl InspirePersistence {
             if replay_skipped > 0 {
                 tracing::warn!(
                     count = replay_skipped,
+                    instance = instance_id.as_str(),
                     "wal replay completed with {replay_skipped} skipped invalid entries"
                 );
                 metrics::counter!("raven_railgun_wal_replay_skipped_total")
                     .increment(replay_skipped);
+                mark_wal_replay_skipped(instance_id.as_str());
             }
             Ok(OpenedInstance {
                 persistence: Self {
@@ -283,6 +365,9 @@ impl InspirePersistence {
                     scheme_tag,
                     instance_id,
                     commit_notify: tokio::sync::Notify::new(),
+                    committed_leaf_count: std::sync::atomic::AtomicUsize::new(
+                        logical_store.leaf_count(),
+                    ),
                 },
                 recovered_state,
                 recovered_logical_store: logical_store,
@@ -333,6 +418,7 @@ impl InspirePersistence {
                     scheme_tag,
                     instance_id,
                     commit_notify: tokio::sync::Notify::new(),
+                    committed_leaf_count: std::sync::atomic::AtomicUsize::new(0),
                 },
                 recovered_state: None,
                 recovered_logical_store: super::inspire::LogicalLeafStore::new(),
@@ -359,7 +445,10 @@ impl InspirePersistence {
         current_block_height: u64,
     ) -> Result<SnapshotId> {
         let bundle = super::inspire::snapshot_inspire_state_v6(state, store)?;
-        self.commit_serialized_bundle(bundle, current_block_height)
+        let id = self.commit_serialized_bundle(bundle, current_block_height)?;
+        self.committed_leaf_count
+            .store(store.leaf_count(), std::sync::atomic::Ordering::Release);
+        Ok(id)
     }
 
     fn commit_serialized_bundle(
@@ -602,6 +691,10 @@ pub struct ConsumerMetrics {
     pub commits_fired: u64,
     /// Per-event errors (log-and-continue) since startup.
     pub consumer_errors: u64,
+    /// Failed events since the last applied one. Nonzero means the consumer is
+    /// stalled on a repeating failure; the lag gauges cannot say that, because a
+    /// heartbeat keeps the scan watermark at the tip while nothing applies.
+    pub consecutive_event_errors: u64,
 }
 
 impl ConsumerMetrics {
@@ -627,6 +720,14 @@ impl ConsumerMetrics {
         // assignment would reset the pointer.
         self.last_applied_block = self.last_applied_block.max(height);
         self.last_scanned_block = self.last_scanned_block.max(height);
+    }
+
+    /// Record one successfully applied event: the height, the event count, and
+    /// the end of any error run.
+    pub fn record_applied_event(&mut self, height: u64) {
+        self.record_applied_block(height);
+        self.events_processed = self.events_processed.saturating_add(1);
+        self.consecutive_event_errors = 0;
     }
 }
 
@@ -661,6 +762,7 @@ struct Layer2VerifierState {
     last_in_sync_height: Option<u64>,
     last_seen_commits: u64,
     last_seen_reorgs: u64,
+    last_seen_consumer_errors: u64,
 }
 
 impl Layer2VerifierState {
@@ -671,6 +773,7 @@ impl Layer2VerifierState {
             last_in_sync_height: None,
             last_seen_commits: baseline_metrics.commits_fired,
             last_seen_reorgs: baseline_metrics.reorgs_handled,
+            last_seen_consumer_errors: baseline_metrics.consumer_errors,
         }
     }
 
@@ -698,28 +801,36 @@ impl Layer2VerifierState {
             return;
         }
 
-        let (commits, reorgs) = {
+        let (commits, reorgs, consumer_errors) = {
             let m = metrics.lock();
-            (m.commits_fired, m.reorgs_handled)
+            (m.commits_fired, m.reorgs_handled, m.consumer_errors)
         };
 
         if commits == self.last_seen_commits {
             if reorgs > self.last_seen_reorgs {
                 self.last_seen_reorgs = reorgs;
                 self.commits_since_last_verify = 0;
+                return;
             }
-            return;
-        }
-        self.last_seen_commits = commits;
+            // Errors climbing with no commit is a wedge, not a quiet window, and a
+            // wedged instance is the one that most needs the divergence verdict.
+            if consumer_errors == self.last_seen_consumer_errors {
+                return;
+            }
+            self.last_seen_consumer_errors = consumer_errors;
+        } else {
+            self.last_seen_commits = commits;
+            self.last_seen_consumer_errors = consumer_errors;
 
-        if reorgs > self.last_seen_reorgs {
-            self.last_seen_reorgs = reorgs;
-            self.commits_since_last_verify = 0;
-            tracing::debug!(
-                tree_number = self.ctx.tree_number,
-                "layer2 verifier: skipping cycle; layer1 reorg fired this cycle"
-            );
-            return;
+            if reorgs > self.last_seen_reorgs {
+                self.last_seen_reorgs = reorgs;
+                self.commits_since_last_verify = 0;
+                tracing::debug!(
+                    tree_number = self.ctx.tree_number,
+                    "layer2 verifier: skipping cycle; layer1 reorg fired this cycle"
+                );
+                return;
+            }
         }
 
         self.commits_since_last_verify = self.commits_since_last_verify.saturating_add(1);
@@ -766,7 +877,14 @@ impl Layer2VerifierState {
                 metrics::counter!("raven_railgun_layer2_in_sync_total").increment(1);
                 // The root is proven on chain, so the divergence is resolved even
                 // when the verdict carries no usable height.
-                clear_layer2_divergent(instance.id.as_str());
+                if let Err(e) = persistence.clear_layer2_divergent() {
+                    tracing::error!(
+                        error = %e,
+                        instance = instance.id.as_str(),
+                        "layer2 verifier: in-sync verdict could not clear the \
+                         on-disk divergence marker"
+                    );
+                }
                 if current_height == 0 {
                     // Mirror rows carry height 0; anchoring there would rewind
                     // every tree to genesis on the next out-of-sync verdict.
@@ -786,7 +904,7 @@ impl Layer2VerifierState {
                 metrics::counter!("raven_railgun_layer2_out_of_sync_total").increment(1);
                 let Some(fork_height) = self.last_in_sync_height else {
                     metrics::counter!("raven_railgun_layer2_cascade_suppressed_total").increment(1);
-                    mark_layer2_divergent(instance.id.as_str());
+                    persistence.mark_divergent_or_log(instance.id.as_str());
                     tracing::error!(
                         ?local_root,
                         tree_number,
@@ -817,6 +935,9 @@ impl Layer2VerifierState {
                     metrics,
                 ) {
                     record_consumer_error(metrics, &e, "Layer2 synthetic reorg apply", fork_height);
+                    // Repair failed, so the verdict stands unrepaired: same state as
+                    // the arm with no anchor at all.
+                    persistence.mark_divergent_or_log(instance.id.as_str());
                 } else {
                     self.last_seen_reorgs = {
                         let m = metrics.lock();
@@ -852,7 +973,8 @@ pub fn layer2_divergent_instances() -> Vec<String> {
 }
 
 /// Record that `instance_id` holds a tree the verifier proved out of sync and
-/// could not repair.
+/// could not repair. In-memory only; use
+/// [`InspirePersistence::mark_layer2_divergent`] to survive a restart.
 ///
 /// ```
 /// # use raven_railgun_engine::persistence::{mark_layer2_divergent, clear_layer2_divergent, layer2_divergent_instances};
@@ -866,6 +988,8 @@ pub fn mark_layer2_divergent(instance_id: &str) {
 
 /// Drop the divergence mark for `instance_id`. Only a chain-anchored in-sync
 /// verdict, or an operator that has repaired the tree, may call this.
+/// In-memory only; use [`InspirePersistence::clear_layer2_divergent`] to also
+/// drop the on-disk marker.
 ///
 /// ```
 /// # use raven_railgun_engine::persistence::{clear_layer2_divergent, layer2_divergent_instances};
@@ -874,6 +998,52 @@ pub fn mark_layer2_divergent(instance_id: &str) {
 /// ```
 pub fn clear_layer2_divergent(instance_id: &str) {
     LAYER2_DIVERGENT.lock().remove(instance_id);
+}
+
+/// Instance ids whose WAL replay could not apply every entry it read.
+///
+/// Process-wide for the same reason as [`LAYER2_DIVERGENT`]: the tree such an
+/// instance would answer from is behind its own WAL.
+static WAL_REPLAY_SKIPPED: Mutex<std::collections::BTreeSet<String>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+/// Instance ids whose last open skipped a WAL entry, sorted. Readiness probes
+/// MUST fail closed while this is non-empty.
+///
+/// ```
+/// # use raven_railgun_engine::persistence::wal_replay_skipped_instances;
+/// assert!(
+///     wal_replay_skipped_instances().is_empty(),
+///     "no instance has been opened in this process, so no replay can have skipped"
+/// );
+/// ```
+#[must_use]
+pub fn wal_replay_skipped_instances() -> Vec<String> {
+    WAL_REPLAY_SKIPPED.lock().iter().cloned().collect()
+}
+
+/// Record that `instance_id` recovered with at least one unapplied WAL entry.
+///
+/// ```
+/// # use raven_railgun_engine::persistence::{mark_wal_replay_skipped, clear_wal_replay_skipped, wal_replay_skipped_instances};
+/// mark_wal_replay_skipped("doc-example-skipped");
+/// assert!(wal_replay_skipped_instances().iter().any(|id| id == "doc-example-skipped"));
+/// clear_wal_replay_skipped("doc-example-skipped");
+/// ```
+pub fn mark_wal_replay_skipped(instance_id: &str) {
+    WAL_REPLAY_SKIPPED.lock().insert(instance_id.to_owned());
+}
+
+/// Drop the replay-skip mark for `instance_id`. Only an operator who has
+/// repaired the WAL may call this; a reopen re-derives the mark on its own.
+///
+/// ```
+/// # use raven_railgun_engine::persistence::{clear_wal_replay_skipped, wal_replay_skipped_instances};
+/// clear_wal_replay_skipped("doc-example-never-skipped");
+/// assert!(!wal_replay_skipped_instances().iter().any(|id| id == "doc-example-never-skipped"));
+/// ```
+pub fn clear_wal_replay_skipped(instance_id: &str) {
+    WAL_REPLAY_SKIPPED.lock().remove(instance_id);
 }
 
 fn ensure_layer2_metrics_described() {
@@ -952,6 +1122,20 @@ pub async fn run_consumer_task(
                     } => {
                         let mut had_error = false;
                         for leaf in &leaves {
+                            match replay_disposition(&logical_store, leaf) {
+                                Ok(LeafDisposition::AlreadyApplied) => continue,
+                                Ok(LeafDisposition::Pending) => {}
+                                Err(e) => {
+                                    had_error = true;
+                                    record_consumer_error(
+                                        &metrics,
+                                        &e,
+                                        "AppendLeaf replay screen",
+                                        height,
+                                    );
+                                    break;
+                                }
+                            }
                             let p = WalEntryPayload::AppendLeaf {
                                 tree_number: leaf.tree_number,
                                 leaf_index: leaf.leaf_index,
@@ -987,27 +1171,24 @@ pub async fn run_consumer_task(
                         }
                         // Per-leaf path already committed and recorded metrics.
                         let _ = (tree_number, leaves);
-                        {
+                        if !had_error {
                             let mut m = metrics.lock();
-                            m.record_applied_block(height);
-                            if !had_error {
-                                m.events_processed = m.events_processed.saturating_add(1);
-                            }
+                            // Only now is block `height` fully applied. A chain source
+                            // returning a range unsorted delivers a lower block after a
+                            // higher one; only a reorg rewind may lower the floor.
+                            m.last_applied_leaf_block = m.last_applied_leaf_block.max(height);
+                            m.record_applied_event(height);
                         }
                         continue;
                     }
                     raven_railgun_core::RailgunEvent::Nullified { .. } => {
                         // No new leaves, so height only; never advances the resume floor.
-                        let mut m = metrics.lock();
-                        m.record_applied_block(height);
-                        m.events_processed = m.events_processed.saturating_add(1);
+                        metrics.lock().record_applied_event(height);
                         continue;
                     }
                     raven_railgun_core::RailgunEvent::Unshield { .. } => {
                         // Not a tree mutation, so height only.
-                        let mut m = metrics.lock();
-                        m.record_applied_block(height);
-                        m.events_processed = m.events_processed.saturating_add(1);
+                        metrics.lock().record_applied_event(height);
                         continue;
                     }
                 }
@@ -1095,11 +1276,7 @@ pub async fn run_consumer_task(
             record_consumer_error(&metrics, &e, "Ppoi apply", height);
             continue;
         }
-        {
-            let mut m = metrics.lock();
-            m.record_applied_block(height);
-            m.events_processed = m.events_processed.saturating_add(1);
-        }
+        metrics.lock().record_applied_event(height);
         if let Some(state) = verifier_state.as_mut() {
             state
                 .maybe_verify_and_act(
@@ -1130,6 +1307,34 @@ fn record_consumer_error(
     );
     let mut m = metrics.lock();
     m.consumer_errors = m.consumer_errors.saturating_add(1);
+    m.consecutive_event_errors = m.consecutive_event_errors.saturating_add(1);
+}
+
+enum LeafDisposition {
+    AlreadyApplied,
+    Pending,
+}
+
+// A kill mid-event leaves the resume floor inside that block, so the indexer
+// re-reads it and redelivers every leaf; refusing the already-applied prefix
+// would abort the event before its unapplied tail, and every restart would
+// replay the same prefix. Identical bytes are the only proof an index is a
+// replay, so differing bytes stay a hard refusal.
+fn replay_disposition(
+    logical_store: &Arc<Mutex<super::inspire::LogicalLeafStore>>,
+    leaf: &raven_railgun_core::CommitmentLeaf,
+) -> Result<LeafDisposition> {
+    let store = logical_store.lock();
+    match store.leaf(leaf.tree_number, leaf.leaf_index) {
+        None => Ok(LeafDisposition::Pending),
+        Some(applied) if applied == &leaf.commitment_hash => Ok(LeafDisposition::AlreadyApplied),
+        Some(applied) => Err(AdapterError::InvalidQuery(format!(
+            "redelivered leaf_index {} on tree {} carries commitment {:02x?}, \
+             but {:02x?} is already applied there; the chain source is serving a \
+             divergent history and no reorg rewound it",
+            leaf.leaf_index, leaf.tree_number, leaf.commitment_hash, applied
+        ))),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1152,7 +1357,12 @@ fn apply_one_leaf(
         let mut store = logical_store.lock();
         super::inspire::apply_wal_entry(&mut store, p, height, encoder)?;
     }
-    metrics.lock().last_applied_leaf_block = height;
+    // The floor names the last FULLY applied block, so a leaf does not advance it:
+    // an event that fails partway would otherwise leave the marker on a block the
+    // indexer resumes above, and its remaining leaves are never re-read. The caller
+    // advances it once the whole event lands. A commit driven mid-event therefore
+    // commits under the previous floor, which is the conservative direction.
+    let floor = { metrics.lock().last_applied_leaf_block };
     if trigger {
         drive_commit(
             instance,
@@ -1160,7 +1370,7 @@ fn apply_one_leaf(
             logical_store,
             params,
             encoder,
-            height,
+            floor,
             metrics,
         )?;
     }
@@ -1243,6 +1453,28 @@ fn apply_ppoi(
     Ok(())
 }
 
+/// A rewind that drops leaves always marks their shards dirty, so on the branch
+/// with nothing dirty no legitimate cause can have shrunk the store. Publishing
+/// anyway archives the WAL that still holds those leaves and no later build
+/// recovers the tree.
+fn ensure_store_not_shorter_than_published(
+    persistence: &InspirePersistence,
+    instance_id: &str,
+    staged: usize,
+    height: u64,
+) -> Result<()> {
+    let committed = persistence.committed_leaf_count();
+    if staged < committed {
+        return Err(AdapterError::Internal(format!(
+            "commit refused for instance {instance_id}: staging {staged} leaves \
+             against a published snapshot of {committed} with no dirty shard to \
+             explain the drop (height {height}); publishing would archive the WAL \
+             that still holds them"
+        )));
+    }
+    Ok(())
+}
+
 fn drive_commit(
     instance: &Arc<PirInstance<RavenInspireScheme>>,
     persistence: &Arc<InspirePersistence>,
@@ -1264,6 +1496,12 @@ fn drive_commit(
             let s = logical_store.lock();
             s.clone()
         };
+        ensure_store_not_shorter_than_published(
+            persistence,
+            instance.id.as_str(),
+            store_snapshot.leaf_count(),
+            height,
+        )?;
         let _new_id = persistence.commit_v6(snapshot_state.as_ref(), &store_snapshot, height)?;
         {
             let mut m = metrics.lock();
@@ -1274,8 +1512,11 @@ fn drive_commit(
     }
 
     // `Arc::make_mut` copies once per drive_commit; `current` is always a live
-    // second reference.
-    let current = instance.current_state();
+    // second reference. State and epoch come from ONE load so the swap below can
+    // refuse a derivation another writer has already superseded.
+    let derived_from = instance.current_snapshot();
+    let derived_from_epoch = derived_from.epoch;
+    let current = Arc::clone(&derived_from.state);
     let entries_per_shard = u32::try_from(
         current
             .encoded_db
@@ -1338,8 +1579,9 @@ fn drive_commit(
         entry_size: current.entry_size,
     };
 
-    let next_epoch = instance.current_epoch().next();
-    instance.swap_state(new_state, next_epoch)?;
+    // Derived from `current`, so the epoch must come from the same load; see
+    // `heartbeat_session_eviction`.
+    instance.swap_state(new_state, derived_from_epoch.next())?;
 
     let snapshot_state = instance.current_state();
     // Snapshot the store under-lock so it restores atomically with the state.
@@ -1373,7 +1615,7 @@ mod tests {
 
     fn test_encoder() -> Arc<dyn PirTableEncoder> {
         Arc::new(
-            PerLeafCommitmentEncoder::new(TOY_ENTRY_SIZE, TOY_ENTRIES_PER_SHARD)
+            PerLeafCommitmentEncoder::new(TOY_ENTRY_SIZE, TOY_ENTRIES_PER_SHARD, 0)
                 .expect("test encoder"),
         )
     }
@@ -2118,6 +2360,62 @@ mod tests {
         )
     }
 
+    /// The resume floor names the last FULLY applied block. A leaf that fails partway
+    /// through an event must not leave the floor on that block: the marker is written
+    /// from it (`commit_v6` -> `current_marker`) and the indexer resumes above it, so
+    /// the event's remaining leaves would never be re-delivered.
+    #[test]
+    fn a_failed_leaf_does_not_leave_the_resume_floor_on_a_partially_applied_block() {
+        const PRIOR: u64 = 100;
+        const EVENT: u64 = 200;
+        let (instance, persistence, logical_store, params, encoder, metrics, _dir) =
+            build_unsat_shard_fixtures();
+        metrics.lock().last_applied_leaf_block = PRIOR;
+
+        let leaf = |idx: u32, seed: u8| {
+            let mut c = [0u8; 32];
+            c[31] = seed;
+            WalEntryPayload::AppendLeaf {
+                tree_number: 0,
+                leaf_index: idx,
+                commitment: c,
+            }
+        };
+
+        super::apply_one_leaf(
+            &leaf(0, 1),
+            EVENT,
+            &instance,
+            &persistence,
+            &logical_store,
+            &params,
+            encoder.as_ref(),
+            &metrics,
+        )
+        .expect("first leaf of the event applies");
+
+        // Non-contiguous: leaf 5 with only leaf 0 present. Aborts the event mid-way.
+        super::apply_one_leaf(
+            &leaf(5, 2),
+            EVENT,
+            &instance,
+            &persistence,
+            &logical_store,
+            &params,
+            encoder.as_ref(),
+            &metrics,
+        )
+        .expect_err("a non-contiguous leaf must be refused");
+
+        assert_eq!(
+            metrics.lock().last_applied_leaf_block,
+            PRIOR,
+            "block {EVENT} is only partially applied, so the floor must still name {PRIOR}; \
+             advancing it writes a manifest marker the indexer resumes above, and the \
+             event's remaining leaves are never re-read"
+        );
+    }
+
     #[test]
     fn drive_commit_removes_unsatisfiable_shard_id_from_dirty_set() {
         let (instance, persistence, logical_store, params, encoder, metrics, _dir) =
@@ -2145,6 +2443,65 @@ mod tests {
             !logical_store.lock().dirty_shards().contains(&unsat_id),
             "unsatisfiable shard {unsat_id} must be dropped from dirty_shards \
              so subsequent commits do not retry it"
+        );
+    }
+
+    /// The empty-dirty branch commits the store verbatim and archives the WAL
+    /// that held the leaves, so a store shorter than the committed one converts a
+    /// bad start state into permanent loss.
+    #[test]
+    fn drive_commit_refuses_a_store_shorter_than_the_committed_snapshot() {
+        use crate::inspire::LogicalLeafStore;
+        let (instance, persistence, logical_store, params, encoder, metrics, _dir) =
+            build_unsat_shard_fixtures();
+
+        for leaf_index in 0..3u32 {
+            let mut commitment = [0u8; 32];
+            commitment[31] = u8::try_from(leaf_index).expect("< 3") | 0x20;
+            let payload = WalEntryPayload::AppendLeaf {
+                tree_number: 0,
+                leaf_index,
+                commitment,
+            };
+            logical_store
+                .lock()
+                .apply(&payload, 100 + u64::from(leaf_index), encoder.as_ref())
+                .expect("seed leaf applies");
+        }
+        super::drive_commit(
+            &instance,
+            &persistence,
+            &logical_store,
+            &params,
+            encoder.as_ref(),
+            102,
+            &metrics,
+        )
+        .expect("the seeded leaves must commit");
+        assert_eq!(persistence.committed_leaf_count(), 3);
+
+        let published = persistence.current_snapshot_id();
+        let fresh_store = Arc::new(parking_lot::Mutex::new(LogicalLeafStore::new()));
+        let err = super::drive_commit(
+            &instance,
+            &persistence,
+            &fresh_store,
+            &params,
+            encoder.as_ref(),
+            103,
+            &metrics,
+        )
+        .expect_err("a store shorter than the committed snapshot must refuse");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains('0') && msg.contains('3'),
+            "the refusal must name both leaf counts, got: {msg}"
+        );
+        assert_eq!(
+            persistence.current_snapshot_id(),
+            published,
+            "the refusal must not advance the manifest; advancing archives the WAL \
+             that still holds the leaves"
         );
     }
 

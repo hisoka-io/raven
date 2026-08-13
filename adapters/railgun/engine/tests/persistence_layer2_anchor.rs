@@ -28,8 +28,8 @@ use raven_railgun_engine::InstanceRole;
 use raven_railgun_indexer::{BlockId, ChainSource, IndexerError, Result as IndexerResult};
 use raven_railgun_persistence::WalEntryPayload;
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-wave2-layer2-anchor";
-const INSTANCE_ID: &str = "wave2-layer2-anchor";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-layer2-anchor";
+const INSTANCE_ID: &str = "layer2-anchor";
 const TOY_ENTRY_SIZE: usize = 256;
 const LIST_KEY: [u8; 32] = [0x5d; 32];
 const LEAVES: u32 = 5;

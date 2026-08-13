@@ -70,7 +70,7 @@ fn build_router_with_seed(
     list_leaves: &[([u8; 32], u32, u8, u8)],
 ) -> Router {
     let mut store = LogicalLeafStore::new();
-    let enc = PerLeafCommitmentEncoder::new(32, ENTRIES_PER_SHARD).expect("encoder");
+    let enc = PerLeafCommitmentEncoder::new(32, ENTRIES_PER_SHARD, 0).expect("encoder");
     for (tree, idx, tag) in leaves {
         apply_wal_entry(
             &mut store,

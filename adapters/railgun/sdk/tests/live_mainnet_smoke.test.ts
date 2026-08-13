@@ -19,6 +19,7 @@ import {
 } from "../src/index";
 import { RavenError } from "../src/errors";
 import { decodeClientPirQueryBundle } from "../src/client-pir";
+import { authPathOf } from "./helpers/auth_path_stub";
 
 const LIVE_URL = process.env.RAVEN_LIVE_URL;
 const LIVE_TOKEN = process.env.RAVEN_LIVE_TOKEN;
@@ -354,8 +355,8 @@ describe("live mainnet PIR smoke", () => {
 
       const leafIndex = 0;
       const t0 = Date.now();
-      const proof = await sdk.getMerkleProof(0, leafIndex);
-      // getMerkleProof surfaces an empty leaf placeholder, so fetch level-0 directly.
+      const path = authPathOf(await sdk.getMerkleProof(0, leafIndex));
+      // The auth path carries no leaf, so the row is fetched on its own to fold a root.
       const leafBytes = await fetchSingleRow(
         LIVE_URL,
         LIVE_TOKEN,
@@ -365,12 +366,12 @@ describe("live mainnet PIR smoke", () => {
       );
       const elapsed = Date.now() - t0;
 
-      expect(proof.elements.length).toBe(TREE_DEPTH);
-      for (const elem of proof.elements) {
+      expect(path.elements.length).toBe(TREE_DEPTH);
+      for (const elem of path.elements) {
         expect(elem.length).toBe(64);
       }
       const leafHex = bytesToHexNoPrefix(leafBytes);
-      const computedRoot = foldMerkleRoot(leafHex, proof.elements, BigInt(leafIndex));
+      const computedRoot = foldMerkleRoot(leafHex, path.elements, BigInt(leafIndex));
       expect(computedRoot.length).toBe(64);
 
       const onChain = await rootHistoryContains(INFURA_URL, 0, computedRoot);
@@ -403,7 +404,7 @@ describe("live mainnet PIR smoke", () => {
 
       const leafIndex = 100;
       const t0 = Date.now();
-      const proof = await sdk.getMerkleProof(3, leafIndex);
+      const path = authPathOf(await sdk.getMerkleProof(3, leafIndex));
       const leafBytes = await fetchSingleRow(
         LIVE_URL,
         LIVE_TOKEN,
@@ -413,9 +414,9 @@ describe("live mainnet PIR smoke", () => {
       );
       const elapsed = Date.now() - t0;
 
-      expect(proof.elements.length).toBe(TREE_DEPTH);
+      expect(path.elements.length).toBe(TREE_DEPTH);
       const leafHex = bytesToHexNoPrefix(leafBytes);
-      const computedRoot = foldMerkleRoot(leafHex, proof.elements, BigInt(leafIndex));
+      const computedRoot = foldMerkleRoot(leafHex, path.elements, BigInt(leafIndex));
 
       const onChain = await rootHistoryContains(INFURA_URL, 3, computedRoot);
       recordFinding({

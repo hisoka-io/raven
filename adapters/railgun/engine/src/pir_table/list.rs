@@ -12,8 +12,16 @@ use super::{
 use crate::imt::TREE_DEPTH;
 use crate::inspire::LogicalLeafStore;
 
+/// Status byte for a leaf whose status row is absent.
+///
+/// Must not be 0: 0 is `Valid`, the verdict that authorizes a spend, so defaulting to
+/// it fails open. Matches what the plaintext shim returns for the same state
+/// (`poi_shim.rs` maps `None` to `Missing`).
+pub const ABSENT_STATUS_BYTE: u8 = 3;
+
 /// Status encoder: row at `list_index` is `[status_byte, bc[0..31]]` padded to
 /// `record_size`. The BC tail lets one query recover verdict and canonical bytes.
+/// A leaf present with no status encodes [`ABSENT_STATUS_BYTE`], never `Valid`.
 #[derive(Debug, Clone)]
 pub struct PerListStatusEncoder {
     record_size: usize,
@@ -69,7 +77,12 @@ impl PirTableEncoder for PerListStatusEncoder {
             let Some(bc) = store.ppoi_bc_at(&self.list_key, list_index) else {
                 continue;
             };
-            let status = store.ppoi_status(&self.list_key, &bc).unwrap_or(0);
+            // Absent, not Valid. A reorg between a leaf and its later status update
+            // clears `ppoi_status` while `ppoi_index_bc` survives, so this default is
+            // reachable and 0 would publish a rolled-back ShieldBlocked as clean.
+            let status = store
+                .ppoi_status(&self.list_key, &bc)
+                .unwrap_or(ABSENT_STATUS_BYTE);
             let row_byte_start = row_offset * self.record_size;
             if let Some(dst) = buf.get_mut(row_byte_start..row_byte_start + self.record_size) {
                 if let Some(b) = dst.first_mut() {

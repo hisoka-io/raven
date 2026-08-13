@@ -73,7 +73,7 @@ impl Checkpoint {
 
 fn parse_target(label: &str, tree_number: u32) -> Result<EncoderKind, String> {
     match label {
-        "per-leaf-bc" => Ok(EncoderKind::PerLeafBc),
+        "per-leaf-bc" => Ok(EncoderKind::PerLeafBc { tree_number: 0 }),
         "per-leaf-path" => Ok(EncoderKind::PerLeafPath { tree_number }),
         "per-node" => Ok(EncoderKind::PerNode { tree_number }),
         other => Err(format!("unsupported --target {other}")),
@@ -170,7 +170,7 @@ fn main() {
         restore_inspire_state_v6(&snap.data).expect("restore_inspire_state_v6");
 
     let noop_encoder: Arc<dyn PirTableEncoder> =
-        Arc::new(PerLeafCommitmentEncoder::new(32, 1).expect("noop encoder"));
+        Arc::new(PerLeafCommitmentEncoder::new(32, 1, 0).expect("noop encoder"));
     let wal_floor = manifest.current_snapshot_seq.checked_sub(1);
     let wal = Wal::open(&layout, wal_floor).expect("wal open");
     let replay = wal.replay().expect("wal replay");

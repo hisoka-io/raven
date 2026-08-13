@@ -16,7 +16,7 @@ use raven_railgun_engine::persistence::{ConsumerEvent, SnapshotPolicy};
 use raven_railgun_engine::InstanceRole;
 use raven_railgun_persistence::WalEntryPayload;
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-wave2-resume-floor";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-resume-floor";
 const TOY_ENTRY_SIZE: usize = 256;
 const LIST_KEY: [u8; 32] = [0x7c; 32];
 
@@ -108,7 +108,7 @@ async fn ppoi_height_zero_must_not_collapse_the_resume_floor() {
     const LAST_LEAF_HEIGHT: u64 = 100 + (LEAVES as u64) - 1;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = quiet_config(dir.path(), "wave2-ppoi-floor");
+    let config = quiet_config(dir.path(), "ppoi-floor");
     let params = InspireParams::secure_128_d2048();
     let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
 
@@ -165,6 +165,67 @@ async fn ppoi_height_zero_must_not_collapse_the_resume_floor() {
     let _ = tokio::time::timeout(Duration::from_secs(30), handle.consumer).await;
 }
 
+/// Nothing but a reorg rewind may lower the floor. A chain source that returns a
+/// range unsorted delivers a lower block after a higher one, and the resulting
+/// marker would re-scan blocks whose leaves are already applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_leaf_below_the_floor_must_not_lower_it() {
+    const LEAVES: u32 = 4;
+    const LAST_LEAF_HEIGHT: u64 = 100 + (LEAVES as u64) - 1;
+    const STALE_HEIGHT: u64 = 50;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = quiet_config(dir.path(), "leaf-below-floor");
+    let params = InspireParams::secure_128_d2048();
+    let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
+
+    for i in 0..LEAVES {
+        let height = 100 + u64::from(i);
+        handle
+            .sender
+            .send(ConsumerEvent::Chain(leaf_event(i, height), height))
+            .await
+            .expect("send leaf");
+    }
+    drain_until(&handle.metrics, "chain leaves", |m| {
+        m.last_applied_leaf_block >= LAST_LEAF_HEIGHT && m.commits_fired >= u64::from(LEAVES)
+    })
+    .await;
+
+    handle
+        .sender
+        .send(ConsumerEvent::Chain(
+            leaf_event(LEAVES, STALE_HEIGHT),
+            STALE_HEIGHT,
+        ))
+        .await
+        .expect("send out-of-order leaf");
+    drain_until(&handle.metrics, "out-of-order leaf", |m| {
+        m.commits_fired > u64::from(LEAVES)
+    })
+    .await;
+
+    assert_eq!(
+        handle.metrics.lock().last_applied_leaf_block,
+        LAST_LEAF_HEIGHT,
+        "a leaf delivered below the floor must not lower it; only a reorg rewind may",
+    );
+    assert_eq!(
+        handle.persistence.manifest_block_height(),
+        LAST_LEAF_HEIGHT,
+        "the commit that leaf drives must publish the floor, not the raw height; \
+         blocks {} to {LAST_LEAF_HEIGHT} are already applied",
+        STALE_HEIGHT + 1,
+    );
+
+    handle
+        .sender
+        .send(ConsumerEvent::Shutdown)
+        .await
+        .expect("shutdown");
+    let _ = tokio::time::timeout(Duration::from_secs(30), handle.consumer).await;
+}
+
 /// A reorg rewinds applied leaves, so the floor it leaves behind must be the
 /// rewind height. Shutdown commits that floor; a stale high-water would skip
 /// the re-scan and wedge the tree.
@@ -176,7 +237,7 @@ async fn reorg_must_lower_the_shutdown_resume_floor() {
     const DEEP_REORG_HEIGHT: u64 = 400;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = quiet_config(dir.path(), "wave2-reorg-floor");
+    let config = quiet_config(dir.path(), "reorg-floor");
     let params = InspireParams::secure_128_d2048();
     let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
 

@@ -3,7 +3,10 @@ export {
   type RavenConfig,
   type POIStatus,
   type BlindedCommitmentType,
+  type StatusHeader,
   type MerkleProof,
+  type CommitTreeAuthPath,
+  type CommitTreeProof,
   type Chain,
   type Proof,
   type CapturedWireRequest,
@@ -51,6 +54,7 @@ export { ChainRegistry, type ChainRegistryEntry } from "./chain-registry";
 export {
   ImtCache,
   imtCacheKey,
+  imtCacheScopeKey,
   type ImtCacheConfig,
 } from "./imt-cache";
 

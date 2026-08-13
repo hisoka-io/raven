@@ -88,7 +88,7 @@ fn build_three_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
         mk(
             "tree-0",
             "tree-0",
-            EncoderKind::PerLeafBc,
+            EncoderKind::PerLeafBc { tree_number: 0 },
             DataSourceFilter::ChainTreeNumber(0),
             VerificationMode::ChainRootHistory,
             InstanceRole::Live,
@@ -96,7 +96,7 @@ fn build_three_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
         mk(
             "tree-1",
             "tree-1",
-            EncoderKind::PerLeafBc,
+            EncoderKind::PerLeafBc { tree_number: 0 },
             DataSourceFilter::ChainTreeNumber(1),
             VerificationMode::ChainRootHistory,
             InstanceRole::Live,
@@ -104,7 +104,7 @@ fn build_three_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
         mk(
             "ppoi-list-a",
             "ppoi-a",
-            EncoderKind::PerLeafBc,
+            EncoderKind::PerLeafBc { tree_number: 0 },
             DataSourceFilter::PpoiList(lk_a),
             VerificationMode::UpstreamSignature,
             InstanceRole::Live,

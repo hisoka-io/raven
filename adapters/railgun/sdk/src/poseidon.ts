@@ -36,9 +36,28 @@ function stripAndPad(hex: string): string {
   return padTo64(stripped.toLowerCase());
 }
 
+/**
+ * Left-pad a field element to 64 hex chars, refusing anything longer.
+ *
+ * Truncating an over-long input - which this did, keeping the LAST 64 chars - silently
+ * hashes a DIFFERENT field element and returns a plausible root for input the caller
+ * never supplied. There is no over-long value whose correct interpretation is "drop the
+ * leading bytes": a 33-byte value is a bug at the caller, and the only safe answer is to
+ * say so. Short values are still zero-padded; that is the documented contract and the
+ * Rust side agrees.
+ */
 function padTo64(hex: string): string {
-  if (hex.length >= FIELD_HEX_LEN) {
-    return hex.slice(hex.length - FIELD_HEX_LEN);
+  if (!/^[0-9a-f]*$/.test(hex)) {
+    throw new Error(
+      `poseidon: field element must be lower-case hex, got ${JSON.stringify(hex)}`,
+    );
+  }
+  if (hex.length > FIELD_HEX_LEN) {
+    throw new Error(
+      `poseidon: field element is ${hex.length} hex chars, over the ${FIELD_HEX_LEN}-char ` +
+        `field width; truncating it would hash a different value and return a root for ` +
+        `input that was never supplied`,
+    );
   }
   return hex.padStart(FIELD_HEX_LEN, "0");
 }

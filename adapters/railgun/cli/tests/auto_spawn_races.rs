@@ -125,7 +125,7 @@ mod kill_during_spawn {
     }
 
     fn build_encoder() -> Arc<dyn PirTableEncoder> {
-        EncoderKind::PerLeafBc
+        EncoderKind::PerLeafBc { tree_number: 0 }
             .build(TOY_ENTRY_SIZE, ENTRIES_PER_SHARD)
             .expect("build per-leaf-bc encoder")
     }

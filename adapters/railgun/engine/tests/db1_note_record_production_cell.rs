@@ -146,7 +146,7 @@ fn build_live_state_and_session() -> (
             .expect("setup_state");
 
     // Drives the IMT and dirty-shard set only; rows are materialized locally.
-    let encoder: Arc<dyn PirTableEncoder> = EncoderKind::PerLeafBc
+    let encoder: Arc<dyn PirTableEncoder> = EncoderKind::PerLeafBc { tree_number: 0 }
         .build(CELL_RECORD_BYTES, ENTRIES_PER_SHARD)
         .expect("encoder build");
 

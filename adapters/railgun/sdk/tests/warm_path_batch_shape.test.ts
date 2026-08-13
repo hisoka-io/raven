@@ -7,7 +7,13 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { ImtCache, RavenPOINodeInterface, isOnLadder } from "../src/index";
 
 import { startMockServer, writeJson, type MockServer } from "./helpers/mock_server";
-import { TOKEN, encodeBatchResponse, encodedBatchCount, stubCtx } from "./helpers/auth_path_stub";
+import {
+  TOKEN,
+  authPathOf,
+  encodeBatchResponse,
+  encodedBatchCount,
+  stubCtx,
+} from "./helpers/auth_path_stub";
 
 const TREE_NUMBER = 0;
 const INSTANCE_ID = `commit-tree-${TREE_NUMBER}`;
@@ -117,10 +123,10 @@ describe("a fully-cached auth path still crosses the wire", () => {
     adapter = mountAdapter(server);
     const sdk = newSdk(server);
 
-    const cold = await sdk.getMerkleProof(TREE_NUMBER, LEAF);
-    const warm = await sdk.getMerkleProof(TREE_NUMBER, LEAF);
+    const cold = authPathOf(await sdk.getMerkleProof(TREE_NUMBER, LEAF));
+    const warm = authPathOf(await sdk.getMerkleProof(TREE_NUMBER, LEAF));
     expect(warm.elements).toEqual(cold.elements);
-    expect(warm.root).toBe(cold.root);
+    expect(warm.indices).toBe(cold.indices);
   });
 
   it("still pads a partial hit to its own ladder step", async () => {

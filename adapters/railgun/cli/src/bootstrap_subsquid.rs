@@ -15,8 +15,12 @@ use serde::Deserialize;
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_core::{InstanceId, RailgunEvent};
 use raven_railgun_engine::imt::{Imt, TREE_MAX_ITEMS};
-use raven_railgun_engine::inspire::{setup_state, LogicalLeafStore};
-use raven_railgun_engine::persistence::{bootstrap_inspire_instance, SnapshotPolicy};
+use raven_railgun_engine::inspire::{
+    apply_wal_entry, setup_state, validate_apply, LogicalLeafStore,
+};
+use raven_railgun_engine::persistence::{
+    bootstrap_inspire_instance, InspirePersistence, SnapshotPolicy,
+};
 use raven_railgun_engine::pir_table::{
     validate_rows_per_shard, EncoderKind, PirTableEncoder, LEAVES_PER_TREE, NODE_HASH_BYTES,
     PATH_RECORD_BYTES, PER_NODE_TOTAL_NODES,
@@ -298,7 +302,7 @@ impl Default for BootstrapTreeConfig {
             max_wall_mins: DEFAULT_MAX_BOOTSTRAP_WALL_MINS,
             repair_trigger_threshold: BOUNDARY_REPAIR_TRIGGER_THRESHOLD,
             expected_filled_count: TREE_MAX_ITEMS,
-            encoder_kind: EncoderKind::PerLeafBc,
+            encoder_kind: EncoderKind::PerLeafBc { tree_number: 0 },
         }
     }
 }
@@ -670,7 +674,7 @@ fn first_match_index(leaves: &[[u8; 32]], target_root: &[u8; 32]) -> Result<usiz
 /// Cell shape (rows x record bytes) an encoder kind expects.
 fn cell_shape_for_encoder(kind: EncoderKind) -> (u32, usize) {
     match kind {
-        EncoderKind::PerLeafBc | EncoderKind::PerListStatus { .. } => {
+        EncoderKind::PerLeafBc { .. } | EncoderKind::PerListStatus { .. } => {
             (LEAVES_PER_TREE, NODE_HASH_BYTES)
         }
         EncoderKind::PerLeafPath { .. } | EncoderKind::PerListPath { .. } => {
@@ -755,29 +759,25 @@ fn persist_initial_snapshot(
     };
     let instance_id = InstanceId::new(cfg.instance_id.clone());
     let layout_clone = layout.clone();
-    let (_inst, persistence, _recovered_store) = bootstrap_inspire_instance(
+    let (_inst, persistence, recovered_store) = bootstrap_inspire_instance(
         layout,
         cfg.scheme_tag.clone(),
         instance_id,
         InstanceRole::Live,
         SnapshotPolicy::default(),
-        encoder,
+        Arc::clone(&encoder),
         factory,
     )
     .map_err(|e| BootstrapError::Engine(format!("bootstrap_inspire_instance: {e}")))?;
 
-    for (idx, leaf) in leaves.iter().enumerate() {
-        let leaf_index = u32::try_from(idx)
-            .map_err(|_| BootstrapError::Engine(format!("leaf_index {idx} overflows u32")))?;
-        let payload = WalEntryPayload::AppendLeaf {
-            tree_number: cfg.tree_number,
-            leaf_index,
-            commitment: *leaf,
-        };
-        persistence
-            .apply_event(&payload, checkpoint_block)
-            .map_err(|e| BootstrapError::Engine(format!("apply_event leaf {idx}: {e}")))?;
-    }
+    seed_wal_from_leaves(
+        cfg,
+        leaves,
+        checkpoint_block,
+        &persistence,
+        recovered_store,
+        encoder.as_ref(),
+    )?;
 
     let mut manifest = raven_railgun_persistence::Manifest::load(&layout_clone)
         .map_err(|e| BootstrapError::Snapshot(format!("manifest load: {e}")))?
@@ -788,6 +788,44 @@ fn persist_initial_snapshot(
     manifest
         .save(&layout_clone)
         .map_err(|e| BootstrapError::Snapshot(format!("manifest save: {e}")))?;
+    Ok(())
+}
+
+/// Append the checkpoint's leaves to the WAL, screening each against the store
+/// recovered from disk. The WAL write is durable, so a payload the recovered
+/// state cannot accept must be refused before it lands, not skipped on replay.
+fn seed_wal_from_leaves(
+    cfg: &BootstrapTreeConfig,
+    leaves: &[[u8; 32]],
+    checkpoint_block: u64,
+    persistence: &InspirePersistence,
+    recovered_store: LogicalLeafStore,
+    encoder: &dyn PirTableEncoder,
+) -> Result<(), BootstrapError> {
+    let mut wal_store = recovered_store;
+    for (idx, leaf) in leaves.iter().enumerate() {
+        let leaf_index = u32::try_from(idx)
+            .map_err(|_| BootstrapError::Engine(format!("leaf_index {idx} overflows u32")))?;
+        let payload = WalEntryPayload::AppendLeaf {
+            tree_number: cfg.tree_number,
+            leaf_index,
+            commitment: *leaf,
+        };
+        validate_apply(&wal_store, &payload).map_err(|e| {
+            BootstrapError::Engine(format!(
+                "leaf {idx} refused against the state recovered from {}: {e}. \
+                 Bootstrap writes durably, so it targets an empty --data-dir only; \
+                 this one already holds committed state.",
+                cfg.data_dir.display()
+            ))
+        })?;
+        persistence
+            .apply_event(&payload, checkpoint_block)
+            .map_err(|e| BootstrapError::Engine(format!("apply_event leaf {idx}: {e}")))?;
+        apply_wal_entry(&mut wal_store, &payload, checkpoint_block, encoder).map_err(|e| {
+            BootstrapError::Engine(format!("advance recovered store, leaf {idx}: {e}"))
+        })?;
+    }
     Ok(())
 }
 

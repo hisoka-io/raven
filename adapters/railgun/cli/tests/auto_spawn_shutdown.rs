@@ -56,7 +56,7 @@ fn bootstrap_tree_zero_cfg(data_dir: PathBuf) -> InstanceConfig {
         instance_id: InstanceId::new("commit-tree-0"),
         role: InstanceRole::Live,
         data_dir,
-        encoder: EncoderKind::PerLeafBc,
+        encoder: EncoderKind::PerLeafBc { tree_number: 0 },
         record_size: TOY_ENTRY_BYTES,
         entries_per_shard: 256,
         verification_mode: VerificationMode::ChainRootHistory,

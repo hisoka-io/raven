@@ -481,27 +481,51 @@ impl PooledRpcChainSource {
         self.pool.pinned_session().map_err(IndexerError::from)
     }
 
+    /// Verify EVERY endpoint's chain id, once.
+    ///
+    /// Probing whichever endpoint `select_for_request` happened to return left the
+    /// other n-1 unchecked while `run_with_pool` round-robins across all of them, so a
+    /// foreign endpoint answered its share of `events_in_range` with `Ok(vec![])` and
+    /// the worker advanced its cursor over the skipped range.
     async fn verify_chain_id_once(&self) -> Result<()> {
         self.chain_id_verified
             .get_or_try_init(|| async {
-                let endpoint = self.pool.select_for_request().map_err(IndexerError::from)?;
-                let provider = endpoint.provider().await?;
-                let actual = alloy::providers::Provider::get_chain_id(provider)
-                    .await
-                    .map_err(|e| IndexerError::Rpc(format!("eth_chainId: {e}")))?;
-                self.pool.release_in_flight(&endpoint);
-                if actual != self.chain_id {
-                    self.pool.mark_endpoint_error(&endpoint, ErrorKind::Other);
-                    return Err(IndexerError::ChainIdMismatch {
-                        expected: self.chain_id,
-                        actual,
-                    });
+                for endpoint in self.pool.endpoints() {
+                    let actual = self.probe_chain_id(endpoint).await?;
+                    if actual != self.chain_id {
+                        self.pool.mark_endpoint_error(endpoint, ErrorKind::Other);
+                        return Err(IndexerError::ChainIdMismatch {
+                            expected: self.chain_id,
+                            actual,
+                        });
+                    }
+                    self.pool.mark_endpoint_success(endpoint);
                 }
-                self.pool.mark_endpoint_success(&endpoint);
                 Ok::<(), IndexerError>(())
             })
             .await?;
         Ok(())
+    }
+
+    /// One `eth_chainId` against a named endpoint.
+    ///
+    /// Deliberately does NOT touch `in_flight`: that counter exists to steer
+    /// `select_for_request`, and this probe bypasses selection to reach a specific
+    /// endpoint. The previous form incremented it via `select_for_request` and released
+    /// it only after two `?`, so either error leaked the count and biased selection away
+    /// from a healthy endpoint forever. Not incrementing it removes the leak by
+    /// construction rather than adding a release the next edit can skip.
+    async fn probe_chain_id(&self, endpoint: &Arc<RpcEndpoint>) -> Result<u64> {
+        // Bounded like every other attempt. This runs BEFORE `run_with_pool` on every
+        // pooled method, so leaving it unbounded left the chokepoint timeout unreachable:
+        // a black-holing endpoint hung here and never got as far as the pooled op.
+        crate::with_rpc_timeout("eth_chainId probe", async {
+            let provider = endpoint.provider().await?;
+            alloy::providers::Provider::get_chain_id(provider)
+                .await
+                .map_err(|e| IndexerError::Rpc(format!("eth_chainId: {e}")))
+        })
+        .await
     }
 }
 
@@ -548,7 +572,9 @@ where
             }
         };
         let endpoint_for_release = Arc::clone(&endpoint);
-        let result = op(endpoint).await;
+        // Every pooled ChainSource method funnels through here, so the timeout lives at
+        // the chokepoint: a new method cannot be added that forgets it.
+        let result = crate::with_rpc_timeout("pooled rpc attempt", op(endpoint)).await;
         pool.release_in_flight(&endpoint_for_release);
         match result {
             Ok(v) => {
@@ -575,7 +601,8 @@ where
     Fut: std::future::Future<Output = Result<T>>,
 {
     let endpoint_for_marking = Arc::clone(&endpoint);
-    let result = op(endpoint).await;
+    // Same chokepoint reasoning as `run_with_pool`: a pinned attempt gets the same bound.
+    let result = crate::with_rpc_timeout("pinned rpc attempt", op(endpoint)).await;
     match result {
         Ok(v) => {
             pool.mark_endpoint_success(&endpoint_for_marking);

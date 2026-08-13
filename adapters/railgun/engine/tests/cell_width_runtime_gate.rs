@@ -114,7 +114,7 @@ fn next_legal_width_rounds_onto_the_ladder_not_onto_the_predicate() {
 fn effective_record_size_predicts_what_build_returns() {
     let requested = 512usize;
     for kind in [
-        EncoderKind::PerLeafBc,
+        EncoderKind::PerLeafBc { tree_number: 0 },
         EncoderKind::PerLeafPath { tree_number: 0 },
         EncoderKind::PerNode { tree_number: 0 },
         EncoderKind::PerListStatus { list_key: [0; 32] },
@@ -133,7 +133,10 @@ fn effective_record_size_predicts_what_build_returns() {
 
 #[test]
 fn fixed_layout_variants_report_their_canonical_width() {
-    assert_eq!(EncoderKind::PerLeafBc.fixed_record_size(), None);
+    assert_eq!(
+        EncoderKind::PerLeafBc { tree_number: 0 }.fixed_record_size(),
+        None
+    );
     assert_eq!(
         EncoderKind::PerListStatus { list_key: [0; 32] }.fixed_record_size(),
         None
@@ -179,7 +182,13 @@ fn shipped_cell_shapes_pass_the_runtime_gate() {
     let ring_dim = ring_dim();
     let leaves = LEAVES_PER_TREE as usize;
     let nodes = PER_NODE_TOTAL_NODES as usize + 1;
-    validate_cell_shape(&EncoderKind::PerLeafBc, leaves, 512, ring_dim).expect("per-leaf-bc 512");
+    validate_cell_shape(
+        &EncoderKind::PerLeafBc { tree_number: 0 },
+        leaves,
+        512,
+        ring_dim,
+    )
+    .expect("per-leaf-bc 512");
     validate_cell_shape(
         &EncoderKind::PerLeafPath { tree_number: 0 },
         leaves,

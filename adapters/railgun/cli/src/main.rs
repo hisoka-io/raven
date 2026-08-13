@@ -620,7 +620,7 @@ fn parse_encoder_kind(
 ) -> anyhow::Result<raven_railgun_engine::pir_table::EncoderKind> {
     use raven_railgun_engine::pir_table::EncoderKind;
     match encoder {
-        "per-leaf-bc" => Ok(EncoderKind::PerLeafBc),
+        "per-leaf-bc" => Ok(EncoderKind::PerLeafBc { tree_number: 0 }),
         "per-leaf-path" => Ok(EncoderKind::PerLeafPath { tree_number }),
         "per-node" => Ok(EncoderKind::PerNode { tree_number }),
         "per-list-status" => Ok(EncoderKind::PerListStatus {
@@ -759,7 +759,7 @@ impl ChainEncoderFamily {
     fn for_tree(self, tree_number: u32) -> raven_railgun_engine::pir_table::EncoderKind {
         use raven_railgun_engine::pir_table::EncoderKind;
         match self {
-            Self::PerLeafBc => EncoderKind::PerLeafBc,
+            Self::PerLeafBc => EncoderKind::PerLeafBc { tree_number: 0 },
             Self::PerLeafPath => EncoderKind::PerLeafPath { tree_number },
             Self::PerNode => EncoderKind::PerNode { tree_number },
         }

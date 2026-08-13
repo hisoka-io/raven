@@ -274,6 +274,7 @@ dependencies = [
  "rayon",
  "serde",
  "sha2",
+ "subtle",
  "thiserror",
 ]
 

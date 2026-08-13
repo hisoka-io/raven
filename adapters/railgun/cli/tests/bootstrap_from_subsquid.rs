@@ -230,6 +230,50 @@ fn cfg_for(tree_number: u32, dir: std::path::PathBuf) -> BootstrapTreeConfig {
     }
 }
 
+/// The bootstrap loop is a durable-WAL ingress: a second run over an already
+/// populated data_dir would re-append leaf 0.. on top of the recovered prefix,
+/// leaving entries no replay can ever apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_bootstrap_over_a_populated_data_dir_refuses_before_the_wal_grows() {
+    let (rows, root) = synthetic_leaves(8);
+    let dir = fresh_data_dir("commit-tree-0-rerun");
+    let cfg = cfg_for(0, dir.clone());
+    let chain = StubChain::new(20_000_000, 99);
+    chain.record_root(0, root);
+
+    let first = bootstrap_one_tree(&cfg, &StubLeaves::new(rows.clone()), &chain)
+        .await
+        .expect("first bootstrap seeds the data dir");
+    assert_eq!(first.leaves, 8);
+
+    let wal = dir.join("wal").join("current.log");
+    let before = std::fs::metadata(&wal)
+        .expect("wal/current.log after the first bootstrap")
+        .len();
+    assert!(before > 0, "the first bootstrap must have written the WAL");
+
+    let err = bootstrap_one_tree(&cfg, &StubLeaves::new(rows), &chain)
+        .await
+        .expect_err("a re-bootstrap over a populated data_dir must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("expected leaf_index 8, got 0"),
+        "the refusal must name the recovered leaf count and the offending index; got: {msg}"
+    );
+    assert!(
+        msg.contains("empty --data-dir"),
+        "the refusal must tell the operator what to do; got: {msg}"
+    );
+
+    let after = std::fs::metadata(&wal)
+        .expect("wal/current.log after the refused bootstrap")
+        .len();
+    assert_eq!(
+        before, after,
+        "a refused bootstrap must not have appended to the WAL"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_static_tree_membership_oracle_pass() {
     let (rows, root) = synthetic_leaves(8);

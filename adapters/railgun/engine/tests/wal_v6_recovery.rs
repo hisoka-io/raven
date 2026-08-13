@@ -31,7 +31,7 @@ fn build_toy_state() -> InspireServerState {
 }
 
 fn encoder_arc() -> Arc<dyn PirTableEncoder> {
-    EncoderKind::PerLeafBc
+    EncoderKind::PerLeafBc { tree_number: 0 }
         .build(TOY_ENTRY_SIZE, ENTRIES_PER_SHARD)
         .expect("build encoder")
 }

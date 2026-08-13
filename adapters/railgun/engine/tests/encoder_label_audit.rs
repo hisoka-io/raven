@@ -15,10 +15,13 @@ const LIST_KEY: [u8; 32] = [0xab; 32];
 
 #[test]
 fn per_leaf_bc_label_matches_built() {
-    let built: std::sync::Arc<dyn PirTableEncoder> = EncoderKind::PerLeafBc
+    let built: std::sync::Arc<dyn PirTableEncoder> = EncoderKind::PerLeafBc { tree_number: 0 }
         .build(RECORD, ENTRIES)
         .expect("build");
-    assert_eq!(EncoderKind::PerLeafBc.label(), built.label());
+    assert_eq!(
+        EncoderKind::PerLeafBc { tree_number: 0 }.label(),
+        built.label()
+    );
 }
 
 #[test]
@@ -51,7 +54,7 @@ fn per_list_path_label_matches_built() {
 
 #[test]
 fn per_leaf_bc_rejects_too_small_record_size() {
-    let err = PerLeafCommitmentEncoder::new(31, ENTRIES).expect_err("must reject 31");
+    let err = PerLeafCommitmentEncoder::new(31, ENTRIES, 0).expect_err("must reject 31");
     let msg = format!("{err}");
     assert!(
         msg.contains("must be >= 32"),
@@ -61,7 +64,7 @@ fn per_leaf_bc_rejects_too_small_record_size() {
 
 #[test]
 fn per_leaf_bc_rejects_zero_entries_per_shard() {
-    let err = PerLeafCommitmentEncoder::new(32, 0).expect_err("must reject 0");
+    let err = PerLeafCommitmentEncoder::new(32, 0, 0).expect_err("must reject 0");
     let msg = format!("{err}");
     assert!(msg.contains("> 0"), "rejected with unexpected msg: {msg}");
 }
@@ -87,7 +90,9 @@ fn per_list_path_carries_list_key_round_trip() {
 
 #[test]
 fn encoder_kind_build_round_trips_record_size_for_perleaf_bc() {
-    let built = EncoderKind::PerLeafBc.build(64, ENTRIES).expect("build");
+    let built = EncoderKind::PerLeafBc { tree_number: 0 }
+        .build(64, ENTRIES)
+        .expect("build");
     assert_eq!(built.record_size(), 64);
     assert_eq!(built.entries_per_shard(), ENTRIES);
 }

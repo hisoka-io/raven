@@ -153,7 +153,7 @@ fn seed_ppoi_list_with_committed_snapshot(
 
 fn replay_wal_into_logical_store(layout: &StoreLayout, manifest: &Manifest) -> LogicalLeafStore {
     let noop_encoder: Arc<dyn PirTableEncoder> =
-        Arc::new(PerLeafCommitmentEncoder::new(32, 1).expect("noop encoder"));
+        Arc::new(PerLeafCommitmentEncoder::new(32, 1, 0).expect("noop encoder"));
     let wal_floor = manifest.current_snapshot_seq.checked_sub(1);
     let wal = Wal::open(layout, wal_floor).expect("wal open");
     let replay = wal.replay().expect("wal replay");
@@ -299,7 +299,7 @@ fn snapshot_bytes(dir_path: &Path, id: SnapshotId) -> Vec<u8> {
 fn kill_during_after_pre_snapshot_before_re_encode_recovers_via_old_encoder_and_resumes() {
     let dir = tempfile::tempdir().expect("tempdir");
 
-    seed_with_committed_snapshot(dir.path(), EncoderKind::PerLeafBc, 50);
+    seed_with_committed_snapshot(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 }, 50);
     let manifest_pre = read_manifest(dir.path());
     let pre_snap_bytes = snapshot_bytes(dir.path(), manifest_pre.current_snapshot_id);
     let pre_manifest_raw = manifest_bytes(dir.path());
@@ -359,7 +359,7 @@ fn kill_during_after_pre_snapshot_before_re_encode_recovers_via_old_encoder_and_
         SCHEME_TAG,
         InstanceId::new("kill-during-migrate"),
         SnapshotPolicy::default(),
-        encoder_arc(EncoderKind::PerLeafBc),
+        encoder_arc(EncoderKind::PerLeafBc { tree_number: 0 }),
     )
     .expect("reopen with prior encoder must succeed");
     assert_eq!(
@@ -388,7 +388,8 @@ fn kill_during_after_pre_snapshot_before_re_encode_recovers_via_old_encoder_and_
 fn kill_during_after_re_encode_before_manifest_bump_recovers_idempotently() {
     let dir = tempfile::tempdir().expect("tempdir");
 
-    let pre_id = seed_with_committed_snapshot(dir.path(), EncoderKind::PerLeafBc, 32);
+    let pre_id =
+        seed_with_committed_snapshot(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 }, 32);
     let manifest_pre = read_manifest(dir.path());
     let pre_manifest_raw = manifest_bytes(dir.path());
 
@@ -423,7 +424,7 @@ fn kill_during_after_re_encode_before_manifest_bump_recovers_idempotently() {
             SCHEME_TAG,
             InstanceId::new("kill-during-migrate"),
             SnapshotPolicy::default(),
-            encoder_arc(EncoderKind::PerLeafBc),
+            encoder_arc(EncoderKind::PerLeafBc { tree_number: 0 }),
         )
         .expect("reopen with old encoder");
         assert_eq!(
@@ -441,7 +442,7 @@ fn kill_during_after_re_encode_before_manifest_bump_recovers_idempotently() {
 
     // Save-only must not touch the live manifest or live-id snapshot bytes.
     {
-        let prep = prepare_migration(dir.path(), EncoderKind::PerLeafBc);
+        let prep = prepare_migration(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 });
         let mut prep_mut = prep;
         re_encode_all_shards(&mut prep_mut);
         let id_extra = save_re_encoded_snapshot(&prep_mut);
@@ -483,7 +484,7 @@ fn kill_during_after_re_encode_before_manifest_bump_recovers_idempotently() {
 #[ignore = "slow: cold-start PIR keygen; run with --ignored"]
 fn migration_repeated_three_times_on_same_data_dir_is_byte_identical() {
     let dir = tempfile::tempdir().expect("tempdir");
-    seed_with_committed_snapshot(dir.path(), EncoderKind::PerLeafBc, 16);
+    seed_with_committed_snapshot(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 }, 16);
 
     run_full_migration(dir.path(), EncoderKind::PerNode { tree_number: 0 });
     let manifest_after_run1 = read_manifest(dir.path());

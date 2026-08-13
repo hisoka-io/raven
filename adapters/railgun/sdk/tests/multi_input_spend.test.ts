@@ -113,7 +113,10 @@ describe("multi-input spend support", () => {
       inputs.map((inp) => sdk.getMerkleProof(inp.tree, inp.leafIndex)),
     );
     expect(proofs).toHaveLength(3);
-    proofs.forEach((p, i) => expect(p.root).toBe(inputs[i].expectedRoot));
+    proofs.forEach((p, i) => {
+      if (p.kind !== "rooted") throw new Error(`expected a rooted proof, got kind=${p.kind}`);
+      expect(p.proof.root).toBe(inputs[i].expectedRoot);
+    });
     const wires = sdk.lastWireRequests();
     expect(wires.length).toBe(3);
     const urls = wires.map((w) => w.url);

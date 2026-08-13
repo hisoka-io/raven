@@ -58,7 +58,7 @@ async fn serve_production_rejects_the_328_byte_note_record_width() {
     let msg = boot_error(opts_with(
         65_536,
         NOTE_RECORD_BYTES,
-        EncoderKind::PerLeafBc,
+        EncoderKind::PerLeafBc { tree_number: 0 },
         tmp.path().to_path_buf(),
     ))
     .await;
@@ -161,7 +161,7 @@ fn migrate_encoder_refuses_a_target_whose_row_width_the_stored_cell_cannot_hold(
     const STORED_WIDTH: usize = 512;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let from_encoder = EncoderKind::PerLeafBc
+    let from_encoder = EncoderKind::PerLeafBc { tree_number: 0 }
         .build(STORED_WIDTH, ENTRIES_PER_SHARD)
         .expect("build from encoder");
     let layout = StoreLayout::open(dir.path()).expect("layout");

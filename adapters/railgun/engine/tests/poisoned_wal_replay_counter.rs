@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use raven_railgun_core::InstanceId;
-use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
+use raven_railgun_engine::persistence::{
+    wal_replay_skipped_instances, InspirePersistence, SnapshotPolicy,
+};
 use raven_railgun_engine::pir_table::{PerLeafCommitmentEncoder, PirTableEncoder};
 use raven_railgun_persistence::{StoreLayout, WalEntryPayload};
 
@@ -25,11 +27,11 @@ fn install_recorder() -> &'static metrics_exporter_prometheus::PrometheusHandle 
 }
 
 fn encoder() -> Arc<dyn PirTableEncoder> {
-    Arc::new(PerLeafCommitmentEncoder::new(32, 2048).expect("test encoder"))
+    Arc::new(PerLeafCommitmentEncoder::new(32, 2048, 0).expect("test encoder"))
 }
 
 #[test]
-fn poisoned_wal_replay_skipped_counter_increments() {
+fn poisoned_wal_replay_skipped_marks_the_instance_unready() {
     let handle = install_recorder();
     let dir = tempfile::tempdir().expect("tempdir");
     let commitment = {
@@ -109,5 +111,11 @@ fn poisoned_wal_replay_skipped_counter_increments() {
          if 0, the production-path \
          `metrics::counter!(\"raven_railgun_wal_replay_skipped_total\").increment(...)` \
          was never reached. Render:\n{rendered}"
+    );
+    assert_eq!(
+        wal_replay_skipped_instances(),
+        vec!["poisoned-wal-counter".to_owned()],
+        "a skipped entry must take the readiness probe out of rotation, not just \
+         bump a counter"
     );
 }

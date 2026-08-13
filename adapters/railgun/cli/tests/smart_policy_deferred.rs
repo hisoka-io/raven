@@ -81,7 +81,7 @@ fn fresh_harness(tmp: &Path) -> TestHarness {
         use raven_railgun_persistence::StoreLayout;
 
         let layout = StoreLayout::open(&bootstrap_dir).expect("layout");
-        let encoder: Arc<dyn PirTableEncoder> = EncoderKind::PerLeafBc
+        let encoder: Arc<dyn PirTableEncoder> = EncoderKind::PerLeafBc { tree_number: 0 }
             .build(TOY_ENTRY_BYTES, 256)
             .expect("build encoder");
         let opened = InspirePersistence::open(

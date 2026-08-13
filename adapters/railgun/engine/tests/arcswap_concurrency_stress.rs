@@ -79,9 +79,17 @@ fn query_atomicity_under_100_concurrent_queries_and_swaps() {
         let total_swaps = Arc::clone(&total_swaps);
         handles.push(std::thread::spawn(move || {
             while !stop.load(Ordering::Acquire) {
-                let e = next_epoch.fetch_add(1, Ordering::Relaxed);
-                inst.swap_state(WitnessState { value: e }, Epoch(e))
-                    .expect("same-shape swap");
+                // A concurrent writer can publish a higher epoch between this
+                // worker's allocation and its swap. `swap_state` refuses that as
+                // stale rather than overwriting the newer state, so re-derive and
+                // retry - which is what its error tells a real writer to do. The
+                // counter only rises, so a retry always clears the published epoch.
+                loop {
+                    let e = next_epoch.fetch_add(1, Ordering::Relaxed);
+                    if inst.swap_state(WitnessState { value: e }, Epoch(e)).is_ok() {
+                        break;
+                    }
+                }
                 total_swaps.fetch_add(1, Ordering::Relaxed);
             }
         }));
@@ -156,9 +164,17 @@ fn current_snapshot_returns_a_consistent_pair_under_stress() {
         let next_epoch = Arc::clone(&next_epoch);
         handles.push(std::thread::spawn(move || {
             while !stop.load(Ordering::Acquire) {
-                let e = next_epoch.fetch_add(1, Ordering::Relaxed);
-                inst.swap_state(WitnessState { value: e }, Epoch(e))
-                    .expect("same-shape swap");
+                // A concurrent writer can publish a higher epoch between this
+                // worker's allocation and its swap. `swap_state` refuses that as
+                // stale rather than overwriting the newer state, so re-derive and
+                // retry - which is what its error tells a real writer to do. The
+                // counter only rises, so a retry always clears the published epoch.
+                loop {
+                    let e = next_epoch.fetch_add(1, Ordering::Relaxed);
+                    if inst.swap_state(WitnessState { value: e }, Epoch(e)).is_ok() {
+                        break;
+                    }
+                }
             }
         }));
     }

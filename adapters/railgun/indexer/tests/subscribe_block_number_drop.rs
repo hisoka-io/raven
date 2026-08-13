@@ -103,6 +103,8 @@ fn synthetic_shield_log(block_number: Option<u64>, leaf_index: u32) -> alloy::rp
 struct ScriptedStreamer {
     heads: std::sync::Mutex<Option<Vec<u64>>>,
     logs: std::sync::Mutex<Option<Vec<alloy::rpc::types::eth::Log>>>,
+    late_logs: std::sync::Mutex<Option<Vec<alloy::rpc::types::eth::Log>>>,
+    late_after: Duration,
     opens: AtomicU64,
     heads_tx: std::sync::Mutex<Option<mpsc::Sender<Result<u64>>>>,
     logs_tx: std::sync::Mutex<Option<mpsc::Sender<Result<alloy::rpc::types::eth::Log>>>>,
@@ -110,9 +112,23 @@ struct ScriptedStreamer {
 
 impl ScriptedStreamer {
     fn new(heads: Vec<u64>, logs: Vec<alloy::rpc::types::eth::Log>) -> Self {
+        Self::with_late_logs(heads, logs, Vec::new(), Duration::ZERO)
+    }
+
+    /// `late_logs` are delivered `late_after` into the connection instead of
+    /// being queued up front, so a consumer that closes the channel on an
+    /// earlier frame closes it before these frames are decoded.
+    fn with_late_logs(
+        heads: Vec<u64>,
+        logs: Vec<alloy::rpc::types::eth::Log>,
+        late_logs: Vec<alloy::rpc::types::eth::Log>,
+        late_after: Duration,
+    ) -> Self {
         Self {
             heads: std::sync::Mutex::new(Some(heads)),
             logs: std::sync::Mutex::new(Some(logs)),
+            late_logs: std::sync::Mutex::new(Some(late_logs)),
+            late_after,
             opens: AtomicU64::new(0),
             heads_tx: std::sync::Mutex::new(None),
             logs_tx: std::sync::Mutex::new(None),
@@ -131,8 +147,14 @@ impl LogStreamer for ScriptedStreamer {
             .take()
             .unwrap_or_default();
         let logs = self.logs.lock().expect("poison").take().unwrap_or_default();
+        let late_logs = self
+            .late_logs
+            .lock()
+            .expect("poison")
+            .take()
+            .unwrap_or_default();
         let (heads_tx, heads_rx) = mpsc::channel(heads.len() + 1);
-        let (logs_tx, logs_rx) = mpsc::channel(logs.len() + 1);
+        let (logs_tx, logs_rx) = mpsc::channel(logs.len() + late_logs.len() + 1);
         // Enqueued before the worker sees either receiver, and sized to the
         // script so no send can block.
         for n in heads {
@@ -140,6 +162,18 @@ impl LogStreamer for ScriptedStreamer {
         }
         for log in logs {
             logs_tx.try_send(Ok(log)).expect("logs script fits");
+        }
+        if !late_logs.is_empty() {
+            let late_tx = logs_tx.clone();
+            let after = self.late_after;
+            tokio::spawn(async move {
+                tokio::time::sleep(after).await;
+                for log in late_logs {
+                    if late_tx.send(Ok(log)).await.is_err() {
+                        break;
+                    }
+                }
+            });
         }
         // The script is one-shot, so a reconnect replays nothing. Either stream
         // closing tears down the pair, dropping whatever the other had left, so
@@ -208,6 +242,9 @@ async fn collect_events(
 /// snapshot's debug-formatted keys. `metrics-util`'s exact CompositeKey
 /// shape varies between versions; the counter name is unique to the
 /// indexer crate so a substring match is robust.
+///
+/// Reads once: `snapshot()` consumes what it reports, so a second call returns
+/// the increments since the first, not the running total.
 fn dropped_counter_by_name(snap: &Snapshotter) -> u64 {
     let dump = snap.snapshot();
     let entries = dump.into_vec();
@@ -220,6 +257,23 @@ fn dropped_counter_by_name(snap: &Snapshotter) -> u64 {
         }
     }
     0
+}
+
+/// Poll the counter to `budget`, summing the reads because each one consumes what
+/// it reports. Waiting on an event count instead would gate on an observable that
+/// LEADS this one: the worker's frame loop returns as soon as the outbound channel
+/// closes, so closing it on the first event can beat the decode of a later
+/// malformed frame.
+async fn dropped_counter_above(snap: &Snapshotter, floor: u64, budget: Duration) -> u64 {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut total = floor;
+    loop {
+        total = total.saturating_add(dropped_counter_by_name(snap));
+        if total > floor || tokio::time::Instant::now() >= deadline {
+            return total;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -281,12 +335,14 @@ async fn subscribe_dropped_logs_metric_increments_on_drop() {
 
     let before = dropped_counter_by_name(s);
 
-    // Single malformed log: forces exactly one drop.
-    let logs = vec![
-        synthetic_shield_log(Some(50), 0),
-        synthetic_shield_log(None, 1),
-    ];
-    let streamer = Arc::new(ScriptedStreamer::new(vec![10], logs));
+    // Single malformed log: forces exactly one drop. It arrives after the valid
+    // one, which is the frame ordering a live subscription produces.
+    let streamer = Arc::new(ScriptedStreamer::with_late_logs(
+        vec![10],
+        vec![synthetic_shield_log(Some(50), 0)],
+        vec![synthetic_shield_log(None, 1)],
+        Duration::from_millis(300),
+    ));
     let fallback = Arc::new(StaticFallback(2_000));
     let (tx, mut rx) = mpsc::channel::<IndexerMessage>(256);
 
@@ -305,16 +361,18 @@ async fn subscribe_dropped_logs_metric_increments_on_drop() {
         tokio::spawn(async move { w.run(cfg).await })
     };
 
+    // The channel stays open until the drop is observable; the surviving event
+    // is already queued behind it (capacity 256, so no send can block).
+    let after = dropped_counter_above(s, before, Duration::from_secs(20)).await;
     let events = collect_events(&mut rx, 1, 6).await;
     drop(rx);
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 
-    assert_eq!(events.len(), 1, "exactly one valid event must survive");
-    let after = dropped_counter_by_name(s);
     assert!(
         after > before,
         "drop counter must advance; before={before} after={after}"
     );
+    assert_eq!(events.len(), 1, "exactly one valid event must survive");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

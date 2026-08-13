@@ -20,7 +20,7 @@ const NARROW_WIDTH: usize = 32;
 const CELL_ROWS: usize = 64;
 
 fn encoder_at(width: usize) -> Arc<dyn PirTableEncoder> {
-    EncoderKind::PerLeafBc
+    EncoderKind::PerLeafBc { tree_number: 0 }
         .build(width, ENTRIES_PER_SHARD)
         .expect("build per-leaf-bc encoder")
 }

@@ -6,7 +6,13 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { ImtCache, RavenError, RavenPOINodeInterface } from "../src/index";
 
 import { startMockServer, type MockServer } from "./helpers/mock_server";
-import { TOKEN, encodeBatchResponse, encodedBatchCount, stubCtx } from "./helpers/auth_path_stub";
+import {
+  TOKEN,
+  authPathOf,
+  encodeBatchResponse,
+  encodedBatchCount,
+  stubCtx,
+} from "./helpers/auth_path_stub";
 
 const TREE_NUMBER = 0;
 const LEAF = 1234;
@@ -90,8 +96,8 @@ describe("X-Raven-Epoch is mandatory on a batch reply", () => {
 
   it("serves the path when the header is present", async () => {
     mountBatchRoute(server, { epoch: String(SERVED_EPOCH), schemaVersion: "1" });
-    const proof = await newSdk(server).getMerkleProof(TREE_NUMBER, LEAF);
-    expect(proof.elements).toHaveLength(16);
-    expect(proof.elements.every((e) => e.startsWith("07"))).toBe(true);
+    const path = authPathOf(await newSdk(server).getMerkleProof(TREE_NUMBER, LEAF));
+    expect(path.elements).toHaveLength(16);
+    expect(path.elements.every((e) => e.startsWith("07"))).toBe(true);
   });
 });

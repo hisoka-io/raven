@@ -189,7 +189,12 @@ pub fn swap_state(
 /// # Errors
 /// [`ServerError::StateShapeMismatch`] if the donor geometry ever diverges.
 pub fn heartbeat_session_eviction(instance: &super::PirInstance<RavenInspireScheme>) -> Result<()> {
-    let donor = instance.current_state();
+    // State and epoch must come from ONE load. Reading the epoch separately lets a
+    // commit land in between: the donor is then pre-re-encode while the epoch is
+    // post-commit, so the proposed epoch clears `swap_state`'s monotonicity guard and
+    // republishes the shard the commit just replaced.
+    let snapshot = instance.current_snapshot();
+    let donor = &snapshot.state;
     let new_state = InspireServerState {
         crs: Arc::clone(&donor.crs),
         encoded_db: Arc::clone(&donor.encoded_db),
@@ -198,8 +203,7 @@ pub fn heartbeat_session_eviction(instance: &super::PirInstance<RavenInspireSche
         variant: donor.variant,
         entry_size: donor.entry_size,
     };
-    let next_epoch = instance.current_epoch().next();
-    instance.swap_state(new_state, next_epoch)?;
+    instance.swap_state(new_state, snapshot.epoch.next())?;
     Ok(())
 }
 
@@ -511,6 +515,7 @@ pub fn materialize_shard_bytes(
     shard_id: u32,
     entries_per_shard: u32,
     entry_size: usize,
+    tree_number: u32,
 ) -> Vec<u8> {
     let eps = entries_per_shard as usize;
     let total_bytes = eps.saturating_mul(entry_size);
@@ -518,8 +523,17 @@ pub fn materialize_shard_bytes(
     let shard_start_global = u64::from(shard_id) * u64::from(entries_per_shard);
     let shard_end_global = shard_start_global + u64::from(entries_per_shard);
 
+    // Row index is the leaf index alone, and the tree is a FILTER rather than part of the
+    // index. The invariant lives in the encoder's `tree_number` pin, NOT in the router:
+    // the multi-instance path scopes by route table but `indexer_to_consumer_bridge` on
+    // the single-instance path forwards every tree, so a store can hold more than one.
+    // Folding the tree into the index instead would shift an already-tree-local leaf out
+    // of its own cell; ignoring it entirely would let a foreign tree overwrite this row.
     for ((tree, leaf), commitment) in store.leaves_iter() {
-        let global = u64::from(*tree) * 65_536 + u64::from(*leaf);
+        if *tree != tree_number {
+            continue;
+        }
+        let global = u64::from(*leaf);
         if global < shard_start_global || global >= shard_end_global {
             continue;
         }
@@ -557,6 +571,14 @@ impl ImtSlot {
         }
     }
 
+    fn non_canonical_leaf(self, index: u32, leaf: &[u8; 32]) -> AdapterError {
+        let field = self.index_field();
+        AdapterError::InvalidQuery(format!(
+            "non-canonical Fr leaf at {field} {index}: {leaf:02x?} is at or above \
+             the BN254 scalar modulus"
+        ))
+    }
+
     fn non_contiguous(self, expected: usize, got: u32) -> AdapterError {
         AdapterError::InvalidQuery(match self {
             Self::CommitmentTree(tree_number) => format!(
@@ -592,12 +614,49 @@ fn checked_imt_append(
         return Err(slot.non_contiguous(expected, index));
     }
     if leaf >= &BN254_FR_MODULUS_BE {
-        return Err(AdapterError::InvalidQuery(format!(
-            "non-canonical Fr leaf at {field} {index}: {leaf:02x?} is at or above \
-             the BN254 scalar modulus"
-        )));
+        return Err(slot.non_canonical_leaf(index, leaf));
     }
     Ok(index_usize)
+}
+
+/// Refuse a payload carrying an IMT leaf that is not a canonical BN254 Fr
+/// element. WAL replay runs this before [`apply_wal_entry`]: the value can never
+/// hash, so skipping the entry would leave the tree permanently short a leaf and
+/// fail the contiguity screen for every later entry on that tree.
+///
+/// # Errors
+/// [`AdapterError::InvalidQuery`] if the payload's leaf is at or above the BN254
+/// scalar modulus.
+///
+/// ```
+/// # use raven_railgun_engine::inspire::ensure_canonical_leaf;
+/// # use raven_railgun_persistence::WalEntryPayload;
+/// let heartbeat = WalEntryPayload::Heartbeat { wallclock_unix_ms: 0 };
+/// assert!(ensure_canonical_leaf(&heartbeat).is_ok());
+/// ```
+pub fn ensure_canonical_leaf(payload: &raven_railgun_persistence::WalEntryPayload) -> Result<()> {
+    use raven_railgun_persistence::WalEntryPayload as P;
+    let (slot, index, leaf) = match payload {
+        P::AppendLeaf {
+            tree_number,
+            leaf_index,
+            commitment,
+        } => (
+            ImtSlot::CommitmentTree(*tree_number),
+            *leaf_index,
+            commitment,
+        ),
+        P::PpoiListLeafAdded {
+            list_index,
+            blinded_commitment,
+            ..
+        } => (ImtSlot::PpoiList, *list_index, blinded_commitment),
+        P::PpoiStatus { .. } | P::Reorg { .. } | P::Heartbeat { .. } => return Ok(()),
+    };
+    if leaf >= &BN254_FR_MODULUS_BE {
+        return Err(slot.non_canonical_leaf(index, leaf));
+    }
+    Ok(())
 }
 
 /// Sidecar logical-state store; accumulates chain rows and marks shards dirty
@@ -1095,7 +1154,7 @@ mod logical_store_tests {
     const ENTRIES_PER_SHARD: u32 = 65_536;
 
     fn enc() -> PerLeafCommitmentEncoder {
-        PerLeafCommitmentEncoder::new(32, ENTRIES_PER_SHARD).expect("test encoder")
+        PerLeafCommitmentEncoder::new(32, ENTRIES_PER_SHARD, 0).expect("test encoder")
     }
 
     fn append(tree: u32, leaf: u32, _height: u64) -> WalEntryPayload {
@@ -1117,17 +1176,34 @@ mod logical_store_tests {
     }
 
     #[test]
-    fn encoder_shard_layout_folds_tree_then_leaf() {
+    fn encoder_shard_layout_is_tree_local() {
         use crate::pir_table::PirTableEncoder;
         let e = enc();
-        let dirty_00 = e.affected_shards_for_leaf(0, 0);
-        assert!(dirty_00.contains(&0));
-        let dirty_0_max = e.affected_shards_for_leaf(0, 65_535);
-        assert!(dirty_0_max.contains(&0));
-        let dirty_10 = e.affected_shards_for_leaf(1, 0);
-        assert!(dirty_10.contains(&1));
-        let dirty_2_mid = e.affected_shards_for_leaf(2, 32_768);
-        assert!(dirty_2_mid.contains(&2));
+        assert!(e.affected_shards_for_leaf(0, 0).contains(&0));
+        assert!(e.affected_shards_for_leaf(0, 65_535).contains(&0));
+
+        // The row INDEX is tree-local: encoders pinned to different trees map the same
+        // leaf index to the same shard. The tree is a filter, not part of the index.
+        for tree in [1u32, 2, 7] {
+            let pinned =
+                super::super::pir_table::PerLeafCommitmentEncoder::new(32, ENTRIES_PER_SHARD, tree)
+                    .expect("encoder");
+            assert_eq!(
+                pinned.affected_shards_for_leaf(tree, 0),
+                e.affected_shards_for_leaf(0, 0),
+                "tree {tree} leaf 0 must map to the same shard as tree 0 leaf 0"
+            );
+            // ...and a leaf from outside the pin dirties nothing, or it would overwrite
+            // this tree's row: the store can hold two trees on the single-instance path.
+            assert!(
+                e.affected_shards_for_leaf(tree, 0).is_empty(),
+                "an encoder pinned to tree 0 must ignore tree {tree}"
+            );
+        }
+        assert!(
+            e.affected_shards_for_leaf(0, 65_536).is_empty(),
+            "a leaf past one tree's row space has no row"
+        );
     }
 
     #[test]
@@ -1192,8 +1268,10 @@ mod logical_store_tests {
     fn clear_dirty_shards_drains_set() {
         let mut s = LogicalLeafStore::new();
         apply_wal_entry(&mut s, &append(0, 0, 100), 100, &enc()).expect("apply");
+        // the tree-1 append enters the store but dirties nothing: a one-tree cell
+        // holds no row for it
         apply_wal_entry(&mut s, &append(1, 0, 101), 101, &enc()).expect("apply");
-        assert_eq!(s.dirty_shards().len(), 2);
+        assert_eq!(s.dirty_shards().len(), 1);
         s.clear_dirty_shards();
         assert_eq!(s.dirty_shards().len(), 0);
         apply_wal_entry(&mut s, &append(0, 1, 102), 102, &enc()).expect("apply");

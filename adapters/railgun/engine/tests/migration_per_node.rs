@@ -107,8 +107,9 @@ fn run_migration(dir_path: &std::path::Path, target: EncoderKind) -> Result<(), 
         .map_err(|e| format!("snap load: {e}"))?;
     let mut state = restore_inspire_state(&snap.data).map_err(|e| format!("restore: {e}"))?;
 
-    let noop_encoder: Arc<dyn PirTableEncoder> =
-        Arc::new(PerLeafCommitmentEncoder::new(32, 1).map_err(|e| format!("noop encoder: {e}"))?);
+    let noop_encoder: Arc<dyn PirTableEncoder> = Arc::new(
+        PerLeafCommitmentEncoder::new(32, 1, 0).map_err(|e| format!("noop encoder: {e}"))?,
+    );
     let wal_floor = manifest.current_snapshot_seq.checked_sub(1);
     let wal = Wal::open(&layout, wal_floor).map_err(|e| format!("wal open: {e}"))?;
     let replay = wal.replay().map_err(|e| format!("wal replay: {e}"))?;
@@ -181,7 +182,7 @@ fn run_migration(dir_path: &std::path::Path, target: EncoderKind) -> Result<(), 
 #[test]
 fn migrate_encoder_per_leaf_bc_to_per_node_round_trips() {
     let dir = tempfile::tempdir().expect("tempdir");
-    bootstrap_with_committed_snapshot(dir.path(), EncoderKind::PerLeafBc, 32);
+    bootstrap_with_committed_snapshot(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 }, 32);
 
     let layout_pre = StoreLayout::open(dir.path()).expect("layout pre");
     let manifest_pre = Manifest::load(&layout_pre)
@@ -223,7 +224,7 @@ fn migrate_encoder_per_leaf_bc_to_per_node_round_trips() {
 #[test]
 fn migrate_encoder_idempotent_on_same_label() {
     let dir = tempfile::tempdir().expect("tempdir");
-    bootstrap_with_committed_snapshot(dir.path(), EncoderKind::PerLeafBc, 8);
+    bootstrap_with_committed_snapshot(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 }, 8);
 
     run_migration(dir.path(), EncoderKind::PerNode { tree_number: 0 }).expect("first migrate");
 

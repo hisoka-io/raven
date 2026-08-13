@@ -177,6 +177,7 @@ describe("loadClientPirContext warm-cache", () => {
       shardConfigBincode: shard,
       inspireParamsBincode: inspire,
       entrySize: 32,
+      persistSession: true,
     });
     expect(first.cacheHit).toBe(false);
     expect(wasm.build_count).toBe(1);
@@ -190,6 +191,7 @@ describe("loadClientPirContext warm-cache", () => {
       shardConfigBincode: shard,
       inspireParamsBincode: inspire,
       entrySize: 32,
+      persistSession: true,
     });
     expect(second.cacheHit).toBe(true);
     expect(wasm.build_count).toBe(1);
@@ -210,6 +212,7 @@ describe("loadClientPirContext warm-cache", () => {
       shardConfigBincode: shard,
       inspireParamsBincode: inspire,
       entrySize: 32,
+      persistSession: true,
     });
     expect(first.cacheHit).toBe(false);
     expect(wasm.build_count).toBe(1);
@@ -221,6 +224,7 @@ describe("loadClientPirContext warm-cache", () => {
       shardConfigBincode: shard,
       inspireParamsBincode: inspire,
       entrySize: 32,
+      persistSession: true,
     });
     expect(second.cacheHit).toBe(false);
     expect(wasm.build_count).toBe(2);
@@ -242,6 +246,7 @@ describe("loadClientPirContext warm-cache", () => {
       shardConfigBincode: shard,
       inspireParamsBincode: inspire,
       entrySize: 32,
+      persistSession: true,
     });
     expect(first.cacheHit).toBe(false);
     expect(wasm.build_count).toBe(1);
@@ -253,6 +258,7 @@ describe("loadClientPirContext warm-cache", () => {
       shardConfigBincode: shard,
       inspireParamsBincode: inspire,
       entrySize: 32,
+      persistSession: true,
     });
     expect(second.cacheHit).toBe(false);
     expect(wasm.build_count).toBe(2);
@@ -284,6 +290,7 @@ describe("loadClientPirContext warm-cache", () => {
       shardConfigBincode: shard,
       inspireParamsBincode: inspire,
       entrySize: 32,
+      persistSession: true,
     });
     expect(wasm.build_count).toBe(1);
 
@@ -296,6 +303,7 @@ describe("loadClientPirContext warm-cache", () => {
       shardConfigBincode: shard,
       inspireParamsBincode: inspire,
       entrySize: 32,
+      persistSession: true,
     });
     expect(recovered.cacheHit).toBe(false);
     expect(wasm.build_count).toBe(2);

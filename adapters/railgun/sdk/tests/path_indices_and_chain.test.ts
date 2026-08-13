@@ -8,6 +8,7 @@ import {
   ImtCache,
   RavenError,
   RavenPOINodeInterface,
+  hexToBytes,
   pathIndicesForLeaf,
   pathIndicesForPerListLeaf,
   validateBcHex,
@@ -23,13 +24,14 @@ import {
 } from "../src/index";
 
 import { startMockServer, writeJson, type MockServer } from "./helpers/mock_server";
-import { encodedBatchCount } from "./helpers/auth_path_stub";
+import { authPathOf, encodedBatchCount } from "./helpers/auth_path_stub";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const MOCK_EPOCH = 1;
 const MOCK_SCHEMA_VERSION = 1;
 const LIST_KEY_HEX = "abababababababababababababababababababababababababababababababab";
-const BC_HEX = "0000000000000000000000000000000000000000000000000000000000000001";
+// Non-zero in its leading bytes so a status row's BC tail cannot match by accident.
+const BC_HEX = "9f3c17aa04e1b28d6605c9713fe82b40d1a7c35e96280bf4517ade0c2b6d8391";
 
 // `expect(fn).toThrow(RavenError)` is not expressible: RavenError's constructor is
 // private, so the class is not a `Constructable` for vitest's matcher.
@@ -176,8 +178,10 @@ function mountSingleQueryRoute(server: MockServer, statusByte: number): void {
     (req) => /^\/v1\/instance\/[^/]+\/query$/.test(req.url ?? ""),
     (_req, _body, res) => {
       // SDK strips the `[u16 BE schema][bincode]` envelope, so the mock must prepend it.
+      // Row `[status, bc[0..31]]` mirrors the Rust status encoder at a 32 B record.
       const inner = new Uint8Array(32);
       inner[0] = statusByte;
+      inner.set(hexToBytes(BC_HEX).subarray(0, 31), 1);
       const out = new Uint8Array(2 + inner.length);
       out[0] = 0;
       out[1] = 1;
@@ -269,8 +273,8 @@ describe("client-PIR auth-path reconstruction (T2/T3)", () => {
       useClientPir: true,
       clientPirContexts: new Map([["t3CommitTree:0", stubCtx()]]),
     });
-    const proof = await sdk.getMerkleProof(0, 1234);
-    expect(proof.elements).toHaveLength(16);
+    const path = authPathOf(await sdk.getMerkleProof(0, 1234));
+    expect(path.elements).toHaveLength(16);
     const wires = sdk.lastWireRequests();
     expect(wires.length).toBe(1);
     expect(wires[0].url).toContain("/v1/instance/commit-tree-0/batch");
@@ -442,9 +446,9 @@ describe("client-side IMT cache hit / miss", () => {
       clientPirContexts: new Map([["t3CommitTree:0", stubCtx()]]),
       imtCache: new ImtCache({ disableIndexedDb: true }),
     });
-    const cold = await sdk.getMerkleProof(0, 0);
+    const cold = authPathOf(await sdk.getMerkleProof(0, 0));
     expect(batchHits).toBe(1);
-    const warm = await sdk.getMerkleProof(0, 0);
+    const warm = authPathOf(await sdk.getMerkleProof(0, 0));
     expect(batchHits).toBe(2);
     expect(warm.elements).toEqual(cold.elements);
   });

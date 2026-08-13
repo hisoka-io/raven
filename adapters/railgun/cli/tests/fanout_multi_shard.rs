@@ -351,13 +351,21 @@ async fn fanout_rejects_list_longer_than_cap() {
     fixture.shutdown().await;
 }
 
+/// The observable is the refusal itself, not that the upload finished. A refusal
+/// abandons the uploaded query unread, so the connection is spent; the caller
+/// must still get a 401 it can act on, and must be told not to reuse the socket.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fanout_requires_a_valid_bearer_token() {
     let fixture = spawn_multi_shard_server().await;
-    let client = reqwest::Client::new();
+    // Each refusal ends its connection, so a pooled socket would carry a doomed
+    // handshake into the next probe and mask the status under a transport error.
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .expect("build unpooled client");
     let (_client_state, query) = fixture.build_query();
     let body = write_versioned(&FanoutRequest {
-        query,
+        query: query.clone(),
         shard_ids: vec![0, 1],
     })
     .expect("encode fanout request");
@@ -367,12 +375,17 @@ async fn fanout_requires_a_valid_bearer_token() {
         .body(body.clone())
         .send()
         .await
-        .expect("send unauthenticated fanout");
+        .unwrap_or_else(|e| {
+            panic!(
+                "an unauthenticated fan-out must be refused with 401, not fail in transport: {e}"
+            )
+        });
     assert_eq!(
         no_auth.status(),
         401,
         "fan-out must never be reachable without a bearer token"
     );
+    assert_connection_closed(no_auth.headers(), "unauthenticated");
 
     let wrong_token = client
         .post(fixture.fanout_url())
@@ -380,10 +393,32 @@ async fn fanout_requires_a_valid_bearer_token() {
         .body(body)
         .send()
         .await
-        .expect("send wrong-token fanout");
+        .unwrap_or_else(|e| {
+            panic!("a wrong bearer must be refused with 401, not fail in transport: {e}")
+        });
     assert_eq!(wrong_token.status(), 401, "a wrong bearer must be rejected");
+    assert_connection_closed(wrong_token.headers(), "wrong-bearer");
+
+    let (served, _, _) = post_fanout(&client, &fixture, &query, vec![0, 1]).await;
+    assert_eq!(
+        served, 200,
+        "the refusals must not leave the server unable to serve a valid bearer"
+    );
 
     fixture.shutdown().await;
+}
+
+fn assert_connection_closed(headers: &reqwest::header::HeaderMap, label: &str) {
+    let connection = headers
+        .get(reqwest::header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        connection.contains("close"),
+        "the {label} refusal left the uploaded query unread, so it must mark the \
+         connection unreusable; got {connection:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

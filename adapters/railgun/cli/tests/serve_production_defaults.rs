@@ -45,7 +45,7 @@ async fn production_cell_zero_dimension_bails_regression() {
             respond_timeout_secs: 30,
             entries,
             entry_bytes,
-            encoder: EncoderKind::PerLeafBc,
+            encoder: EncoderKind::PerLeafBc { tree_number: 0 },
             session_eviction_interval_secs: 0,
             metrics_public: false,
         }

@@ -22,6 +22,24 @@ fn rec(bal: u128) -> Bytes {
     Bytes::copy_from_slice(&normalize_balance_be(&bal.to_be_bytes()).expect("balance fits"))
 }
 
+/// Total bytes sealed under `wal/archived`. A file count cannot separate an
+/// empty seal from one carrying entries, so it cannot attribute a seal to the
+/// publish under test.
+fn sealed_bytes(data_dir: &std::path::Path) -> u64 {
+    let archived = data_dir.join("wal").join("archived");
+    let Ok(entries) = std::fs::read_dir(&archived) else {
+        return 0;
+    };
+    entries
+        .map(|e| {
+            e.expect("archive dir entry")
+                .metadata()
+                .expect("archive metadata")
+                .len()
+        })
+        .sum()
+}
+
 fn read_main(ms: &MainSidecar, sk: RlweSecretKey, leaf: u64) -> Vec<u8> {
     let params = InspireParams::secure_128_d2048();
     let crs = ms.main.current_snapshot().state.crs.clone();
@@ -102,11 +120,15 @@ fn wal_archive_after_fold_recover() {
         MainSidecar::seed(&params, &db, ENTRY_SIZE, dir.path(), seed).expect("seed");
 
     ms.apply_updates(1, &[(3, rec(424_242))]).expect("apply1");
+    let sealed_before_fold = sealed_bytes(dir.path());
     ms.fold().expect("fold");
 
-    let archived = dir.path().join("wal").join("archived");
-    let n_archived = std::fs::read_dir(&archived).map(|d| d.count()).unwrap_or(0);
-    assert!(n_archived > 0, "the fold archived current.log");
+    let sealed_after_fold = sealed_bytes(dir.path());
+    assert!(
+        sealed_after_fold > sealed_before_fold,
+        "the fold must seal the applied update under wal/archived: {sealed_before_fold} \
+         bytes before, {sealed_after_fold} after"
+    );
 
     ms.apply_updates(2, &[(7, rec(555_555))]).expect("apply2");
     drop(ms);

@@ -15,8 +15,8 @@ use raven_railgun_engine::orchestrator::{
 use raven_railgun_engine::persistence::{ConsumerEvent, SnapshotPolicy};
 use raven_railgun_engine::InstanceRole;
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-wave2-recovered-store";
-const INSTANCE_ID: &str = "wave2-recovered-store";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-recovered-store";
+const INSTANCE_ID: &str = "recovered-store";
 const TOY_ENTRY_SIZE: usize = 256;
 const SEEDED_LEAVES: u32 = 4;
 

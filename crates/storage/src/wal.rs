@@ -10,9 +10,18 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Per-entry ceiling; rejects a nonsense `payload_len` from a torn write.
 pub const WAL_MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+static RESUME_FLOOR_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide count of [`Wal::open`] calls refused for a resume floor above a
+/// non-empty tail. Monotonic; exporters read it, nothing resets it.
+pub fn resume_floor_refusals() -> u64 {
+    RESUME_FLOOR_REFUSALS.load(Ordering::Relaxed)
+}
 
 /// One on-the-wire WAL entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,16 +67,15 @@ impl Wal {
     /// Open or create `data_dir/wal/current.log`. `last_committed_seq` sets a
     /// resume floor; the on-disk tail wins when it is higher.
     ///
-    /// A floor above a non-empty tail is healed only when `manifest.json`
-    /// publishes a replay floor at least as high, which is what proves the
-    /// surviving frames are already inside the live snapshot; they are then
-    /// sealed under `wal/archived/` so the resumed log carries no seq gap.
-    /// An uncorroborated floor is refused instead.
+    /// A floor above a non-empty tail is refused, never repaired. Callers derive
+    /// the floor from `manifest.json`, so the manifest cannot corroborate it, and
+    /// nothing else on disk can: the divergence is between the manifest and the
+    /// log, and only an operator knows which of the two is the good copy.
+    /// Refusals are counted by [`resume_floor_refusals`].
     ///
     /// # Errors
     /// [`PersistenceError::Invariant`] when the floor sits above a non-empty
-    /// tail that no published snapshot covers, plus any I/O failure while
-    /// scanning, truncating, or sealing.
+    /// tail, plus any I/O failure while scanning or truncating.
     pub fn open(layout: &StoreLayout, last_committed_seq: Option<u64>) -> Result<Self> {
         let path = layout.wal_current_path();
         if let Some(parent) = path.parent() {
@@ -82,23 +90,26 @@ impl Wal {
             None => 0,
         };
         let mut next_seq = scan.next_seq;
-        let mut seal_survivors = None;
         if floor > next_seq {
             if let Some(first) = scan.first_seq {
                 let last = next_seq.saturating_sub(1);
-                if let Err(why) = snapshot_covers(layout, floor) {
-                    return Err(PersistenceError::Invariant(format!(
-                        "wal open refused: resume floor {floor} is above the tail of \
-                         wal/current.log, which holds seqs {first}..={last}, and {why}. \
-                         Appending at {floor} would leave a seq gap that replay reads as a \
-                         torn tail, dropping every entry written after it. Operator: restore \
-                         manifest.json and wal/ from the same point in time, OR point \
-                         manifest.json at a snapshot whose current_snapshot_seq is at most \
-                         {next_seq}. Path: {}",
-                        layout.root().display()
-                    )));
-                }
-                seal_survivors = Some((first, last));
+                RESUME_FLOOR_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    resume_floor = floor,
+                    tail_first_seq = first,
+                    tail_last_seq = last,
+                    data_dir = %layout.root().display(),
+                    "wal open refused: resume floor above the log tail"
+                );
+                return Err(PersistenceError::Invariant(format!(
+                    "wal open refused: resume floor {floor} is above the tail of \
+                     wal/current.log, which holds seqs {first}..={last}. Appending at {floor} \
+                     would leave a seq gap that replay reads as a torn tail, dropping every \
+                     entry written after it. Operator: restore manifest.json and wal/ from the \
+                     same point in time, OR point manifest.json at a snapshot whose \
+                     current_snapshot_seq is at most {next_seq}. Path: {}",
+                    layout.root().display()
+                )));
             }
             next_seq = floor;
         }
@@ -113,7 +124,7 @@ impl Wal {
 
         let file = open_wal_owner_only(&path)?;
 
-        let wal = Self {
+        Ok(Self {
             layout: layout.clone(),
             inner: Mutex::new(WalState {
                 file,
@@ -122,11 +133,7 @@ impl Wal {
                 last_marker: scan.last_marker,
                 poisoned: false,
             }),
-        };
-        if let Some((first, last)) = seal_survivors {
-            wal.archive(first, last)?;
-        }
-        Ok(wal)
+        })
     }
 
     /// Assigns the next seq, fsyncs, returns that seq. The bound is `Serialize`
@@ -168,16 +175,27 @@ impl Wal {
         }
 
         // A partial write leaves a frame replay stops at, silently dropping every later
-        // entry even though append returned Ok and fsynced. Rewind to the last whole
-        // frame; poison only if the rewind itself fails, since then the tail is unknown.
-        let offset = state.file.stream_position()?;
+        // entry even though append returned Ok and fsynced. Rewind to the last whole frame.
+        //
+        // The target is the file LENGTH, never the fd offset: O_APPEND leaves the offset at
+        // 0 until the kernel repositions it on the first write, so on the first append after
+        // any reopen `stream_position` reports 0 and a rewind to it truncates the whole log.
+        let tail = rewind_target(&state.file)?;
         if let Err(e) = write_frame(&mut state.file, &header, &bincoded) {
             let rewound = state
                 .file
-                .set_len(offset)
+                .set_len(tail)
                 .and_then(|()| state.file.sync_all())
-                .and_then(|()| state.file.seek(SeekFrom::Start(offset)).map(|_| ()));
-            state.poisoned = rewound.is_err();
+                .and_then(|()| state.file.seek(SeekFrom::Start(tail)).map(|_| ()));
+            // Poison on a rewind that failed OR that left the file shorter than the tail it
+            // was meant to restore: both mean the on-disk extent is no longer known good,
+            // and a successful truncation to the wrong length is the more dangerous of the
+            // two because it looks like a clean recovery.
+            let shorter_than_tail = match state.file.metadata() {
+                Ok(m) => m.len() < tail,
+                Err(_) => true,
+            };
+            state.poisoned = rewound.is_err() || shorter_than_tail;
             return Err(e);
         }
 
@@ -211,10 +229,28 @@ impl Wal {
 
     /// Seal `current.log` under `wal/archived/` and start a fresh one. Both
     /// parent dirs are fsynced, so the rename is durable before this returns.
+    ///
+    /// The target path is named from `from_seq..=to_seq` alone, so an occupied
+    /// path is refused: renaming onto it would destroy an already-sealed range
+    /// with no trace.
+    ///
+    /// # Errors
+    /// [`PersistenceError::Invariant`] when `wal/archived/` already holds that
+    /// range, plus any I/O failure while syncing, renaming, or reopening.
     pub fn archive(&self, from_seq: u64, to_seq: u64) -> Result<()> {
         let mut state = self.inner.lock();
         state.file.sync_all()?;
         let target = self.layout.wal_archived_path(from_seq, to_seq);
+        if target.exists() {
+            return Err(PersistenceError::Invariant(format!(
+                "wal archive refused: seqs {from_seq}..={to_seq} are already sealed at {}, and \
+                 sealing them again would rename over that file. Operator: the log and \
+                 wal/archived/ disagree about which seqs are sealed, which a restore from \
+                 mismatched backups produces; reconcile them before publishing again. Path: {}",
+                target.display(),
+                self.layout.root().display()
+            )));
+        }
         let archive_parent = match target.parent() {
             Some(p) => {
                 std::fs::create_dir_all(p)?;
@@ -228,21 +264,24 @@ impl Wal {
         };
         let current = self.layout.wal_current_path();
         std::fs::rename(&current, &target)?;
-        if let Some(source_parent) = current.parent() {
-            crate::fsync_parent_dir(source_parent)?;
+        // Past the rename the log has moved on disk while `state.file` still holds the
+        // sealed inode. An early return here would leave appends writing and fsyncing
+        // into a file `replay()` never opens - it resolves `current.log` by path - so
+        // every fsync-acknowledged entry after it would be silently unreplayable.
+        // Poison instead: a refused write beats an acknowledged one that is lost.
+        match reopen_current_after_archive(&current, &archive_parent) {
+            Ok(new_file) => {
+                state.file = new_file;
+                state.first_seq = None;
+                // a fresh file has no torn tail to be poisoned by
+                state.poisoned = false;
+                Ok(())
+            }
+            Err(e) => {
+                state.poisoned = true;
+                Err(e)
+            }
         }
-        crate::fsync_parent_dir(&archive_parent)?;
-        let new_file = open_wal_owner_only(&current)?;
-        new_file.sync_all()?;
-        // second pass makes the new current.log's creation durable
-        if let Some(source_parent) = current.parent() {
-            crate::fsync_parent_dir(source_parent)?;
-        }
-        state.file = new_file;
-        state.first_seq = None;
-        // a fresh file has no torn tail to be poisoned by
-        state.poisoned = false;
-        Ok(())
     }
 }
 
@@ -267,6 +306,37 @@ struct ScanResult {
     truncate_at: Option<u64>,
 }
 
+/// Reopen `current.log` after `archive` renamed it away, making both the removal and
+/// the creation durable.
+///
+/// Every step runs with the log already moved, so the caller MUST poison on `Err`:
+/// returning while `state.file` still points at the sealed inode turns later appends
+/// into acknowledged, unreplayable writes.
+fn reopen_current_after_archive(
+    current: &std::path::Path,
+    archive_parent: &std::path::Path,
+) -> Result<File> {
+    if let Some(source_parent) = current.parent() {
+        crate::fsync_parent_dir(source_parent)?;
+    }
+    crate::fsync_parent_dir(archive_parent)?;
+    let new_file = open_wal_owner_only(current)?;
+    new_file.sync_all()?;
+    // second pass makes the new current.log's creation durable
+    if let Some(source_parent) = current.parent() {
+        crate::fsync_parent_dir(source_parent)?;
+    }
+    Ok(new_file)
+}
+
+/// Byte length the log must be restored to if a frame write fails.
+///
+/// Not the fd offset: `O_APPEND` leaves it at 0 until the first write repositions it,
+/// so the offset reads 0 on the first append after any reopen of a non-empty log.
+fn rewind_target(file: &File) -> Result<u64> {
+    Ok(file.metadata()?.len())
+}
+
 /// Mode 0o600 on Unix; default elsewhere.
 fn open_wal_owner_only(path: &std::path::Path) -> Result<File> {
     #[cfg(unix)]
@@ -286,28 +356,6 @@ fn open_wal_owner_only(path: &std::path::Path) -> Result<File> {
             .read(true)
             .append(true)
             .open(path)?)
-    }
-}
-
-/// `Ok` when the published manifest's replay floor reaches `floor`, so every
-/// seq below it is inside the live snapshot; `Err` carries the operator-facing
-/// reason it does not.
-fn snapshot_covers(layout: &StoreLayout, floor: u64) -> std::result::Result<(), String> {
-    match crate::Manifest::load(layout) {
-        Ok(Some(m)) if m.current_snapshot_seq >= floor => Ok(()),
-        Ok(Some(m)) => Err(format!(
-            "manifest.json publishes replay floor {}, below {floor}, leaving seqs {}..={} in \
-             neither the snapshot nor the log",
-            m.current_snapshot_seq,
-            m.current_snapshot_seq,
-            floor.saturating_sub(1)
-        )),
-        Ok(None) => Err(
-            "manifest.json is absent, so no published snapshot vouches for that floor".to_owned(),
-        ),
-        Err(e) => Err(format!(
-            "manifest.json is unreadable ({e}), so no published snapshot vouches for that floor"
-        )),
     }
 }
 
@@ -654,8 +702,8 @@ mod tests {
         .expect("manifest save");
     }
 
-    /// An empty log has no frame a floor can skip, so the heal needs no
-    /// snapshot to corroborate it; this is the normal boot after an archive.
+    /// An empty log has no frame a floor can skip, so resuming at the floor
+    /// loses nothing; this is the normal boot after an archive.
     #[test]
     fn fresh_open_with_min_seq_floor_resumes_at_floor() {
         let (_d, layout) = make_layout();
@@ -664,11 +712,11 @@ mod tests {
         assert_eq!(seq, 100);
     }
 
-    /// Frames below the published replay floor are already inside the snapshot,
-    /// so the heal seals them. Leaving them in place would put the next append
-    /// past a gap that replay reads as a torn tail.
+    /// Callers derive the floor from `manifest.json`, so a manifest that reaches
+    /// the floor is restating the floor, not vouching for it. It must not buy
+    /// permission to append past the tail.
     #[test]
-    fn a_floor_above_the_tail_heals_when_the_snapshot_covers_the_survivors() {
+    fn a_floor_above_the_tail_is_refused_when_the_manifest_reaches_it() {
         let (_d, layout) = make_layout();
         {
             let wal = Wal::open(&layout, None).expect("open");
@@ -679,35 +727,33 @@ mod tests {
         }
         publish_manifest_at(&layout, 10);
 
-        let healed = Wal::open(&layout, Some(9)).expect("a covered floor must heal");
-        assert_eq!(healed.next_seq(), 10);
-        let sealed = scan_full(&layout.wal_archived_path(0, 2)).expect("scan the sealed log");
+        let err = Wal::open(&layout, Some(9))
+            .expect_err("a manifest at the floor must not license the floor");
+        assert!(matches!(err, PersistenceError::Invariant(_)), "got {err:?}");
+        assert!(
+            std::fs::read_dir(layout.root().join("wal").join("archived"))
+                .expect("read archive dir")
+                .next()
+                .is_none(),
+            "a refused open must seal nothing"
+        );
+        let reopened = Wal::open(&layout, Some(2)).expect("reopen at the tail");
         assert_eq!(
-            sealed.entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            reopened
+                .replay()
+                .expect("replay")
+                .entries
+                .iter()
+                .map(|e| e.seq)
+                .collect::<Vec<_>>(),
             vec![0, 1, 2],
-            "the heal must seal the survivors intact, not merely create an archive file"
-        );
-
-        let seq = healed
-            .append(&test_payload(9), 200)
-            .expect("append after the heal");
-        assert_eq!(seq, 10);
-        let replay = healed.replay().expect("replay");
-        assert_eq!(
-            replay.truncated_at, None,
-            "the healed log must carry no seq gap"
-        );
-        assert_eq!(
-            replay.entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
-            vec![10],
-            "an entry written after the heal must survive replay"
+            "a refused open must leave the log untouched"
         );
     }
 
-    /// A floor the published snapshot does not reach would skip seqs held by
-    /// neither the snapshot nor the log, so it is refused rather than healed.
+    /// The refusal names the floor, the tail it would skip, and the way out.
     #[test]
-    fn a_floor_above_what_the_snapshot_covers_is_refused() {
+    fn a_floor_above_the_tail_is_refused_when_the_manifest_falls_short() {
         let (_d, layout) = make_layout();
         {
             let wal = Wal::open(&layout, None).expect("open");
@@ -718,8 +764,7 @@ mod tests {
         }
         publish_manifest_at(&layout, 5);
 
-        let err =
-            Wal::open(&layout, Some(9)).expect_err("floor 10 above coverage 5 must be refused");
+        let err = Wal::open(&layout, Some(9)).expect_err("floor 10 above tail 3 must be refused");
         let PersistenceError::Invariant(msg) = &err else {
             panic!("expected Invariant, got {err:?}");
         };
@@ -728,8 +773,12 @@ mod tests {
             "the error must name the refused floor; got `{msg}`"
         );
         assert!(
-            msg.contains("replay floor 5") && msg.contains("seqs 5..=9"),
-            "the error must name the coverage it fell short of; got `{msg}`"
+            msg.contains("seqs 0..=2"),
+            "the error must name the tail it would skip; got `{msg}`"
+        );
+        assert!(
+            msg.contains("at most 3"),
+            "the error must name the highest floor the log admits; got `{msg}`"
         );
         assert!(
             msg.contains("Operator:"),
@@ -743,7 +792,7 @@ mod tests {
                 .is_none(),
             "a refused open must seal nothing"
         );
-        let reopened = Wal::open(&layout, Some(2)).expect("reopen at a covered floor");
+        let reopened = Wal::open(&layout, Some(2)).expect("reopen at the tail");
         assert_eq!(
             reopened.replay().expect("replay").entries.len(),
             3,
@@ -779,19 +828,102 @@ mod tests {
         );
     }
 
-    /// A torn append must not leave bytes that make replay drop later entries.
-    /// Pre-fix the header landed with no payload, subsequent appends returned Ok
-    /// and fsynced, and replay stopped at the tear.
+    /// The post-rename reopen must report failure rather than half-succeeding, because
+    /// its caller poisons on `Err` and would otherwise keep the sealed inode live.
     #[test]
-    fn a_torn_append_rewinds_so_later_entries_still_replay() {
+    fn reopen_after_archive_errors_when_current_cannot_be_recreated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("no-such-dir");
+        let current = missing.join("current.log");
+        let err = reopen_current_after_archive(&current, dir.path())
+            .expect_err("a current.log under a missing parent cannot be recreated");
+        assert!(
+            matches!(err, PersistenceError::Io(_)),
+            "expected an I/O failure, got: {err}"
+        );
+    }
+
+    /// The collision guard fires BEFORE the rename, so the log has not moved and the
+    /// WAL must stay usable. Poisoning here would turn a safe refusal into an outage.
+    #[test]
+    fn an_archive_refused_before_the_rename_leaves_the_log_appendable() {
+        let (_d, layout) = make_layout();
+        let wal = Wal::open(&layout, None).expect("open");
+        wal.append(&test_payload(0), 1).expect("first");
+        wal.append(&test_payload(1), 2).expect("second");
+        wal.archive(0, 1).expect("first archive seals 0..=1");
+
+        wal.append(&test_payload(2), 3)
+            .expect("append after archive");
+        let err = wal
+            .archive(0, 1)
+            .expect_err("re-sealing an existing range must be refused");
+        assert!(
+            format!("{err}").contains("already sealed"),
+            "expected the no-clobber refusal, got: {err}"
+        );
+
+        let seq = wal
+            .append(&test_payload(3), 4)
+            .expect("a pre-rename refusal must not poison the log");
+        let replay = wal.replay().expect("replay");
+        assert_eq!(
+            replay.entries.len(),
+            2,
+            "current.log holds only what was written after the successful archive"
+        );
+        assert_eq!(replay.entries.last().expect("two entries").seq, seq);
+    }
+
+    /// A successful archive leaves a fresh, unpoisoned, appendable log.
+    #[test]
+    fn a_successful_archive_leaves_the_log_appendable_and_unpoisoned() {
+        let (_d, layout) = make_layout();
+        let wal = Wal::open(&layout, None).expect("open");
+        wal.append(&test_payload(0), 1).expect("first");
+        wal.archive(0, 0).expect("archive");
+        assert!(
+            !wal.inner.lock().poisoned,
+            "a clean archive must not poison"
+        );
+        wal.append(&test_payload(1), 2)
+            .expect("append after archive");
+        assert_eq!(wal.replay().expect("replay").entries.len(), 1);
+    }
+
+    /// The rewind target of a reopened non-empty log is its length. `O_APPEND` leaves
+    /// the fd offset at 0 until the first write repositions it, so an offset-derived
+    /// target truncates the whole log on the first append after any reopen.
+    #[test]
+    fn rewind_target_reports_file_length_not_fd_offset() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("current.log");
+        let seeded = vec![0u8; 3840];
+        std::fs::write(&path, &seeded).expect("seed a non-empty log");
+
+        let file = open_wal_owner_only(&path).expect("reopen through the production option set");
+
+        assert_eq!(
+            rewind_target(&file).expect("rewind target"),
+            u64::try_from(seeded.len()).expect("a 3840-byte seed fits u64"),
+            "rewind target must be the file length; an fd-offset target reads 0 here and \
+             truncates every committed frame"
+        );
+    }
+
+    /// A refused append must leave the log appendable, with no bytes that make replay
+    /// drop later entries. Does NOT reach the rewind block - see
+    /// `rewind_target_reports_file_length_not_fd_offset` for that.
+    #[test]
+    fn an_append_refused_at_the_size_guard_leaves_the_log_appendable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = StoreLayout::open(dir.path()).expect("layout");
         let wal = Wal::open(&layout, None).expect("open");
 
         wal.append(&test_payload(0), 1).expect("first append");
 
-        // a payload one byte over the cap fails after the length check, exercising
-        // the same early-return path a write error takes
+        // refused at the size guard, which returns before the mutex, the poison check
+        // and the rewind block - a write error takes none of this path
         let oversized = vec![0u8; WAL_MAX_PAYLOAD_BYTES + 1];
         assert!(
             wal.append(&oversized, 2).is_err(),

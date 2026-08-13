@@ -302,27 +302,53 @@ impl<S: PirScheme> PirInstance<S> {
         Ok((snap.epoch, response))
     }
 
-    /// Publish a new state at `new_epoch`, rejecting a change of cell geometry.
+    /// Publish a new state at `new_epoch`, rejecting a change of cell geometry
+    /// and any epoch that does not advance the published one.
+    ///
+    /// `new_state` and `new_epoch` MUST come from one
+    /// [`current_snapshot`](Self::current_snapshot): the epoch is what tells this
+    /// call which state the swap supersedes. Two writers deriving from the same
+    /// snapshot propose the same epoch, and the loser is refused rather than
+    /// republishing the state the winner already replaced.
     ///
     /// # Errors
     /// [`ServerError::StateShapeMismatch`] when the incoming state would move
     /// live clients onto a geometry their queries were not built against.
+    /// [`ServerError::Internal`] when another writer reached `new_epoch` first;
+    /// re-derive from the current snapshot and retry.
     pub fn swap_state(&self, new_state: S::ServerState, new_epoch: Epoch) -> Result<()> {
-        let live = S::state_shape(&self.snapshot.load().state);
         let incoming = S::state_shape(&new_state);
-        if live != incoming {
-            return Err(ServerError::StateShapeMismatch {
-                live_entry_size: live.entry_size_bytes,
-                live_rows: live.rows_per_shard,
-                new_entry_size: incoming.entry_size_bytes,
-                new_rows: incoming.rows_per_shard,
-            });
-        }
-        self.snapshot.store(Arc::new(Snapshot {
+        let proposed = Arc::new(Snapshot {
             epoch: new_epoch,
             state: Arc::new(new_state),
-        }));
-        Ok(())
+        });
+        loop {
+            let current = self.snapshot.load();
+            let live = S::state_shape(&current.state);
+            if live != incoming {
+                return Err(ServerError::StateShapeMismatch {
+                    live_entry_size: live.entry_size_bytes,
+                    live_rows: live.rows_per_shard,
+                    new_entry_size: incoming.entry_size_bytes,
+                    new_rows: incoming.rows_per_shard,
+                });
+            }
+            if new_epoch <= current.epoch {
+                return Err(ServerError::Internal(format!(
+                    "stale state swap on instance {}: published epoch {}, attempted epoch {}; \
+                     the snapshot this state was derived from is already superseded, so \
+                     publishing it would drop the update that replaced it. Re-derive from \
+                     current_snapshot() and retry.",
+                    self.id, current.epoch, new_epoch
+                )));
+            }
+            let previous = self
+                .snapshot
+                .compare_and_swap(&*current, Arc::clone(&proposed));
+            if Arc::ptr_eq(&current, &previous) {
+                return Ok(());
+            }
+        }
     }
 }
 

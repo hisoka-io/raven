@@ -214,7 +214,7 @@ fn per_insert_wall_time_per_encoder_at_50pct_fill() {
             label: "per-leaf-bc 65536x32 tree=0",
             entries: leaf_entries,
             entry_bytes: 32,
-            encoder_kind: EncoderKind::PerLeafBc,
+            encoder_kind: EncoderKind::PerLeafBc { tree_number: 0 },
             insert_kind: InsertKind::PerTreeAppend,
         },
         Cell {

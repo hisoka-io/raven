@@ -46,7 +46,7 @@ fn commit_tree_cfg(
         instance_id: InstanceId::new(id),
         role,
         data_dir: dir,
-        encoder: EncoderKind::PerLeafBc,
+        encoder: EncoderKind::PerLeafBc { tree_number: 0 },
         record_size: TOY_ENTRY_SIZE,
         entries_per_shard: TOY_ENTRIES_PER_SHARD,
         verification_mode: VerificationMode::ChainRootHistory,
@@ -127,9 +127,10 @@ async fn live_to_static_role_transition_on_next_tree_spawn() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let layout = raven_railgun_persistence::StoreLayout::open(tmp.path()).expect("layout");
-    let encoder: Arc<dyn raven_railgun_engine::pir_table::PirTableEncoder> = EncoderKind::PerLeafBc
-        .build(TOY_ENTRY_SIZE, TOY_ENTRIES_PER_SHARD)
-        .expect("enc");
+    let encoder: Arc<dyn raven_railgun_engine::pir_table::PirTableEncoder> =
+        EncoderKind::PerLeafBc { tree_number: 0 }
+            .build(TOY_ENTRY_SIZE, TOY_ENTRIES_PER_SHARD)
+            .expect("enc");
     let opened = raven_railgun_engine::persistence::InspirePersistence::open(
         layout,
         SCHEME_TAG,

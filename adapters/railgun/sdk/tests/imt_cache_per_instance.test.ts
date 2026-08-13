@@ -5,7 +5,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { ImtCache, RavenPOINodeInterface, imtCacheKey } from "../src/index";
-// Not re-exported from the barrel yet; the barrel is outside this change's write set.
+// Imported directly: the barrel does not re-export it yet.
 import { imtCacheScopeKey } from "../src/imt-cache";
 
 import { startMockServer, type MockServer } from "./helpers/mock_server";

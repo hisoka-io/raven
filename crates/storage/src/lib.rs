@@ -270,7 +270,9 @@ where
 ///
 /// The sealed range is named from the log rather than from the incoming
 /// manifest, so a caller that pre-advanced its own floor cannot alias two
-/// archives onto one path.
+/// archives onto one path. A log holding nothing has no range to seal, so the
+/// manifest advances and the log is left in place; a snapshot cadence that fires
+/// with no appends in between would otherwise name one path over and over.
 ///
 /// # Errors
 /// [`PersistenceError::Invariant`] when `mutate` leaves the staged manifest off
@@ -288,7 +290,8 @@ where
 {
     let new_floor = wal.next_seq();
     let archive_to = new_floor.saturating_sub(1);
-    let archive_from = wal.first_seq().unwrap_or(new_floor);
+    let sealable = wal.first_seq();
+    let archive_from = sealable.unwrap_or(new_floor);
 
     let mut staged = manifest.clone();
     mutate(&mut staged, snapshot_id, new_floor);
@@ -302,7 +305,9 @@ where
     }
     *manifest = staged;
     manifest.save(layout)?;
-    wal.archive(archive_from, archive_to)?;
+    if sealable.is_some() {
+        wal.archive(archive_from, archive_to)?;
+    }
     Ok(())
 }
 

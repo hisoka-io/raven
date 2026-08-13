@@ -222,7 +222,7 @@ pub(crate) async fn bearer_auth<S: PirScheme>(
     };
 
     let Some(scope) = scope else {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Ok(unauthorized_close());
     };
     metrics::counter!(
         "raven_railgun_auth_ok_total",
@@ -230,6 +230,20 @@ pub(crate) async fn bearer_auth<S: PirScheme>(
     )
     .increment(1);
     Ok(next.run(request).await)
+}
+
+/// Rejecting on headers leaves the request body unread, so the connection is not
+/// reusable. Draining it would be amplification on an unauthenticated path, so the
+/// peer is told instead: without this the socket goes back into a client pool the
+/// server is about to close.
+fn unauthorized_close() -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::UNAUTHORIZED;
+    response.headers_mut().insert(
+        http::header::CONNECTION,
+        http::HeaderValue::from_static("close"),
+    );
+    response
 }
 
 /// Constant-time byte-slice equality; returns `Choice(0)` on length mismatch.

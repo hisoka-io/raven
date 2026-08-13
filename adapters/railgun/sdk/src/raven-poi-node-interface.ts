@@ -4,10 +4,10 @@ import {
   bytesToHex,
   containsByteSequence,
   decodeClientPirQueryBundle,
+  decodeStatusRow,
   hexToBytes,
   pathIndicesForLeaf,
   pathIndicesForPerListLeaf,
-  statusByteToPOIStatus,
   validateBcHex,
   validateLeafIndex,
   validateListKeyHex,
@@ -20,8 +20,88 @@ import { RavenError } from "./errors";
 import { ImtCache, imtCacheKey, imtCacheScopeKey } from "./imt-cache";
 import { foldMerkleRoot } from "./poseidon";
 
+/**
+ * Uniform integer in `[0, bound)` from Web Crypto, rejection-sampled so the modulus does
+ * not bias low values.
+ *
+ * Used to draw batch pads. `Math.random` would do for a cosmetic shuffle but not here:
+ * the draw hides the cache-miss count from a server that sees every `shard_id` in
+ * cleartext, so a predictable sequence is a predictable leak.
+ */
+function randomBelow(bound: number): number {
+  if (!Number.isInteger(bound) || bound <= 0) {
+    throw RavenError.invalidQuery(`randomBelow: bound must be a positive integer, got ${bound}`);
+  }
+  if (bound === 1) return 0;
+  const c = globalThis.crypto;
+  if (!c || typeof c.getRandomValues !== "function") {
+    throw RavenError.invalidQuery(
+      "randomBelow: globalThis.crypto.getRandomValues is unavailable; batch padding " +
+        "cannot be drawn without a CSPRNG and cycling pads leaks the cache-miss count",
+    );
+  }
+  // Largest multiple of `bound` that fits a u32; draws at or above it are rejected.
+  const limit = Math.floor(0x1_0000_0000 / bound) * bound;
+  const buf = new Uint32Array(1);
+  for (;;) {
+    c.getRandomValues(buf);
+    const v = buf[0];
+    if (v < limit) return v % bound;
+  }
+}
+
 export type POIStatus = "Valid" | "ShieldBlocked" | "ProofSubmitted" | "Missing";
 export type BlindedCommitmentType = "Shield" | "Transact" | "Unshield";
+
+/**
+ * `GET /v1/poi/:list_key/status-header`, in the shape the server actually sends.
+ *
+ * Keys are camelCase because the handler carries `#[serde(rename_all = "camelCase")]`.
+ * Declaring them snake_case made TypeScript report `string[]` for fields that were
+ * `undefined` at runtime, so `new Set(h.blocked_bcs ?? [])` produced an empty set and
+ * every ShieldBlocked commitment on the list read as clean.
+ */
+export interface StatusHeader {
+  /** Block height of the snapshot. */
+  epoch: number;
+  /** Hex-encoded 32-byte list key. */
+  listKey: string;
+  /** Shield-blocked blinded commitments, hex. */
+  blockedBcs: string[];
+  /** Proof-submitted (pending) blinded commitments, hex. */
+  pendingBcs: string[];
+}
+
+/** Throws rather than defaulting a missing array to empty: an absent blocked set and an
+ *  empty one mean opposite things to a wallet. */
+function parseStatusHeader(body: unknown, url: string): StatusHeader {
+  const stringArray = (value: unknown, field: string): string[] => {
+    if (!Array.isArray(value) || value.some((v) => typeof v !== "string")) {
+      throw RavenError.serverError(
+        `status-header: ${field} must be an array of hex strings; an absent or malformed ` +
+          `blocked set would silently read as "nothing is blocked"`,
+        { url },
+      );
+    }
+    return value as string[];
+  };
+  if (typeof body !== "object" || body === null) {
+    throw RavenError.serverError("status-header: body is not an object", { url });
+  }
+  const raw = body as Record<string, unknown>;
+  if (typeof raw.epoch !== "number") {
+    throw RavenError.serverError("status-header: epoch must be a number", { url });
+  }
+  if (typeof raw.listKey !== "string") {
+    throw RavenError.serverError("status-header: listKey must be a hex string", { url });
+  }
+  return {
+    epoch: raw.epoch,
+    listKey: raw.listKey,
+    blockedBcs: stringArray(raw.blockedBcs, "blockedBcs"),
+    pendingBcs: stringArray(raw.pendingBcs, "pendingBcs"),
+  };
+}
 
 export interface MerkleProof {
   leaf: string;
@@ -29,6 +109,23 @@ export interface MerkleProof {
   indices: string;
   root: string;
 }
+
+/** Commit-tree auth path with no root: sibling hashes and the leaf's path bits only. */
+export interface CommitTreeAuthPath {
+  /** 64-char no-prefix hex sibling hashes, level 0 (sibling of the leaf) first. */
+  elements: string[];
+  /** `nToHex(leafIndex, UINT_256)`; bit `i` set means right child at level `i`. */
+  indices: string;
+}
+
+/**
+ * Commit-tree proof, discriminated by whether a root is available. Client-PIR retrieves
+ * auth-path siblings and never the leaf, so it cannot fold a root and does not claim one;
+ * only the plaintext route, which the adapter answers with its own root, carries `rooted`.
+ */
+export type CommitTreeProof =
+  | { readonly kind: "rooted"; readonly proof: MerkleProof }
+  | ({ readonly kind: "authPath" } & CommitTreeAuthPath);
 
 // Upstream Railgun Chain shape (engine/src/models/engine-types.ts); numeric `type` matches upstream wire shape.
 /** Upstream Chain shape; numeric `type` matches the upstream wire shape. */
@@ -230,7 +327,7 @@ export class RavenPOINodeInterface {
     return json;
   }
 
-  async getMerkleProof(treeNumber: number, leafIndex: number): Promise<MerkleProof> {
+  async getMerkleProof(treeNumber: number, leafIndex: number): Promise<CommitTreeProof> {
     validateTreeNumber(treeNumber);
     validateLeafIndex(leafIndex);
     if (this.useClientPir) {
@@ -240,7 +337,7 @@ export class RavenPOINodeInterface {
       `/v1/commit-tree/${treeNumber}/merkle-proof`,
       { leafIndex },
     );
-    return json;
+    return { kind: "rooted", proof: json };
   }
 
   // `POINodeInterface.validatePOIMerkleroots` (engine/src/poi/poi-node-interface.ts:30-35);
@@ -387,7 +484,7 @@ export class RavenPOINodeInterface {
     return await res.json();
   }
 
-  async fetchStatusHeader(listKey: string): Promise<{ epoch: number; blocked_bcs: string[]; pending_bcs: string[] }> {
+  async fetchStatusHeader(listKey: string): Promise<StatusHeader> {
     validateListKeyHex(listKey);
     const route = this.route();
     const url = `${route.endpoint}/v1/poi/${listKey}/status-header`;
@@ -406,7 +503,7 @@ export class RavenPOINodeInterface {
         status: res.status,
       });
     }
-    return await res.json();
+    return parseStatusHeader(await res.json(), url);
   }
 
   // Chain-aware key first, then the legacy fallback.
@@ -452,12 +549,15 @@ export class RavenPOINodeInterface {
         }
         let status: POIStatus;
         try {
+          const label = `client-PIR t1Status-${lkHex} idx ${idx}`;
           const plaintext = await this.runClientPirQuery(`t1Status-${lkHex}`, ctx, BigInt(idx));
-          const statusByte = plaintext.length > 0 ? plaintext[0] : 0;
-          status = statusByteToPOIStatus(statusByte);
+          status = decodeStatusRow(plaintext, bcHex, label);
         } catch (cause) {
-          // Only transient network failures degrade to Missing, else the wallet could
-          // spend on unmarked BCs instead of retrying.
+          // KNOWN FAIL-OPEN, retained deliberately pending an owner ruling. `Missing` is
+          // the NON-blocking verdict, so degrading a transport failure to it tells the
+          // wallet a possibly-ShieldBlocked commitment is merely unproven. Removing the
+          // downgrade surfaces those as errors, which is correct only once an oversized
+          // upload reliably receives its 401 rather than a socket reset.
           if (cause instanceof RavenError && cause.kind === "Network") {
             status = "Missing";
           } else {
@@ -508,7 +608,7 @@ export class RavenPOINodeInterface {
   private async getMerkleProofClientPir(
     treeNumber: number,
     leafIndex: number,
-  ): Promise<MerkleProof> {
+  ): Promise<CommitTreeProof> {
     const ctx = this.lookupContext("t3CommitTree", String(treeNumber));
     if (!ctx) {
       throw RavenError.invalidQuery(
@@ -523,7 +623,11 @@ export class RavenPOINodeInterface {
       indices,
       `tree-${treeNumber}`,
     );
-    return buildMerkleProof(leafIndex, "", siblings);
+    return {
+      kind: "authPath",
+      elements: siblings.map((s) => bytesToHex(s)),
+      indices: leafIndexToIndicesHex(leafIndex),
+    };
   }
 
   /** Auth-path sibling hashes indexed by level (0 = sibling of the leaf); every level
@@ -602,9 +706,18 @@ export class RavenPOINodeInterface {
     // Padded to a ladder step so the length publishes a bucket, not the exact
     // cache-miss count. Pads re-query a real level, so they are drawn from the
     // real slots' distribution and cost the server a full pass.
+    //
+    // Pads are drawn at RANDOM, never cycled. `SeededClientQuery.shard_id` is
+    // unencrypted on the wire, so `queryLevels[slot % len]` made slot j and slot j+len
+    // address the identical global index - the server reads the repeat period straight
+    // off the shard sequence and recovers the exact miss count, which is the one
+    // quantity the ladder exists to hide. Mirrors the Rust `build_padded_batch` fix.
     const paddedCount = paddedBatchLength(queryLevels.length);
     const queryBundles = Array.from({ length: paddedCount }, (_unused, slot) => {
-      const level = queryLevels[slot % queryLevels.length];
+      const level =
+        slot < queryLevels.length
+          ? queryLevels[slot]
+          : queryLevels[randomBelow(queryLevels.length)];
       const target = BigInt(indices[level]);
       return decodeClientPirQueryBundle(
         ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, target),
@@ -635,7 +748,7 @@ export class RavenPOINodeInterface {
         throw RavenError.staleAdapter(`client-PIR batch ${instanceLabel}: schema mismatch`, {
           url,
           status: 400,
-          serverWireSchemaVersion: Number(sv),
+          serverWireSchemaVersion: parseSchemaVersion(sv) ?? undefined,
           clientWireSchemaVersion: schemaVersion,
         });
       }
@@ -656,12 +769,19 @@ export class RavenPOINodeInterface {
         { url, status: res.status },
       );
     }
-    const serverSchema = res.headers.get(X_RAVEN_SCHEMA_VERSION);
-    this.cache.noteFreshness(
-      scopeKey,
-      servedEpoch,
-      serverSchema === null ? schemaVersion : Number(serverSchema),
-    );
+    // A non-numeric version would reach the cache as NaN, and `NaN !== NaN` makes its
+    // unchanged-tuple comparison unreachable, purging the scope on every reply forever.
+    const serverSchemaRaw = res.headers.get(X_RAVEN_SCHEMA_VERSION)?.trim() ?? "";
+    const serverSchema =
+      serverSchemaRaw === "" ? schemaVersion : parseSchemaVersion(serverSchemaRaw);
+    if (serverSchema === null) {
+      throw RavenError.staleAdapter(
+        `client-PIR batch ${instanceLabel}: ${X_RAVEN_SCHEMA_VERSION} is "${serverSchemaRaw}", ` +
+          "not a decimal non-negative integer, so the reply cannot be pinned to a wire schema",
+        { url, status: res.status, clientWireSchemaVersion: schemaVersion },
+      );
+    }
+    this.cache.noteFreshness(scopeKey, servedEpoch, serverSchema);
     if (servedEpoch !== epochTag) {
       this.observedEpochs.set(instanceLabel, servedEpoch);
       if (foldsCachedLevels) {
@@ -747,7 +867,7 @@ export class RavenPOINodeInterface {
         throw RavenError.staleAdapter(`client-PIR query ${instanceLabel}: schema mismatch`, {
           url,
           status: 400,
-          serverWireSchemaVersion: Number(sv),
+          serverWireSchemaVersion: parseSchemaVersion(sv) ?? undefined,
           clientWireSchemaVersion: route.schemaVersion ?? 0,
         });
       }
@@ -992,28 +1112,36 @@ function decodeBatchBody(buf: Uint8Array): Uint8Array[] {
   return out;
 }
 
-// Build a `MerkleProof` matching upstream wire shape (engine/src/merkletree/merkletree.ts:128-160):
+/** `nToHex(leafIndex, UINT_256)` - 64 chars, NOT 8-char uint32 (engine/src/merkletree/merkletree.ts). */
+function leafIndexToIndicesHex(leafIndex: number): string {
+  return leafIndex.toString(16).padStart(64, "0");
+}
+
 /**
  * `MerkleProof` in upstream wire shape: 64-char no-prefix hex for
- * `leaf`/`elements[i]`/`root`, and `indices = nToHex(leafIndex, UINT_256)` - 64
- * chars, NOT 8-char uint32 - with bit `i` set meaning right child at level `i`.
- * `root` is folded client-side because the adapter returns only auth-path nodes.
+ * `leaf`/`elements[i]`/`root`. `root` is folded client-side from `bcHex` because the
+ * adapter returns only auth-path nodes, so an empty `bcHex` would fold a root over a
+ * leaf the caller never proved and is refused.
  */
 function buildMerkleProof(
   leafIndex: number,
   bcHex: string,
   siblings: Uint8Array[],
 ): MerkleProof {
+  const leaf = normalizeHex(bcHex);
+  if (leaf.length !== 64) {
+    throw RavenError.invalidQuery(
+      `buildMerkleProof: leaf must be 64 hex chars to fold a root, got ${leaf.length}`,
+    );
+  }
   const elements = siblings.map((s) => bytesToHex(s));
-  const leaf = bcHex !== "" ? normalizeHex(bcHex) : "0".repeat(64);
   const root = elements.length > 0
     ? foldMerkleRoot(leaf, elements, BigInt(leafIndex))
     : leaf;
-  const indicesHex = leafIndex.toString(16).padStart(64, "0");
   return {
     leaf,
     elements,
-    indices: indicesHex,
+    indices: leafIndexToIndicesHex(leafIndex),
     root,
   };
 }
@@ -1030,6 +1158,13 @@ function normalizeHex(hex: string): string {
   return (hex.startsWith("0x") || hex.startsWith("0X") ? hex.slice(2) : hex).toLowerCase();
 }
 
+/** Decimal non-negative wire-schema version, or `null` when the value is not one. */
+function parseSchemaVersion(raw: string): number | null {
+  if (!/^[0-9]+$/.test(raw)) return null;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
 function parseFreshnessHeader(value: string | null): FreshnessHeader | null {
   if (!value) return null;
   const out: Partial<FreshnessHeader> = {};
@@ -1044,10 +1179,10 @@ function parseFreshnessHeader(value: string | null): FreshnessHeader | null {
     else if (k === "confidence") out.confidence = Number(v);
   }
   if (
-    out.lagBlocks == null ||
-    out.appliedHeight == null ||
-    out.epoch == null ||
-    out.confidence == null
+    !Number.isFinite(out.lagBlocks) ||
+    !Number.isFinite(out.appliedHeight) ||
+    !Number.isFinite(out.epoch) ||
+    !Number.isFinite(out.confidence)
   ) {
     return null;
   }

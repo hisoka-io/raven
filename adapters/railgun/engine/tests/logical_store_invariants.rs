@@ -18,7 +18,7 @@ fn fr_canonical(tag: u8) -> [u8; 32] {
 }
 
 fn enc() -> PerLeafCommitmentEncoder {
-    PerLeafCommitmentEncoder::new(32, ENTRIES_PER_SHARD).expect("encoder")
+    PerLeafCommitmentEncoder::new(32, ENTRIES_PER_SHARD, 0).expect("encoder")
 }
 
 #[test]

@@ -34,8 +34,10 @@ fn migrate_encoder_and_bootstrap_lock_serialize_one_winner_per_round() {
         let boot_lock_ctr = Arc::clone(&bootstrap_lock_errors);
 
         let migrate_h = thread::spawn(move || {
-            let r =
-                raven_railgun_cli::migrate_encoder::run(&path_for_migrate, EncoderKind::PerLeafBc);
+            let r = raven_railgun_cli::migrate_encoder::run(
+                &path_for_migrate,
+                EncoderKind::PerLeafBc { tree_number: 0 },
+            );
             // fresh dir: migration errors via lock contention (loser) or
             // missing-manifest (winner)
             let err = r.expect_err("fresh data_dir + migration must error");
@@ -93,7 +95,10 @@ fn fan_out_migrate_and_bootstrap_against_same_data_dir_yield_no_corruption() {
     for _ in 0..N_MIGRATE {
         let path = path.clone();
         handles.push(thread::spawn(move || {
-            let r = raven_railgun_cli::migrate_encoder::run(&path, EncoderKind::PerLeafBc);
+            let r = raven_railgun_cli::migrate_encoder::run(
+                &path,
+                EncoderKind::PerLeafBc { tree_number: 0 },
+            );
             let _ = r.expect_err("fresh dir + migration must error");
         }));
     }

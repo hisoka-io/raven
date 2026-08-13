@@ -160,6 +160,24 @@ pub enum RailgunEvent {
     },
 }
 
+impl RailgunEvent {
+    /// Commitment tree this event belongs to, or `None` for `Unshield`, which carries no
+    /// tree because it removes value rather than appending a leaf.
+    ///
+    /// Used by the single-instance ingest bridge to scope a store to one tree. That scope
+    /// is load-bearing: `per-leaf-bc` indexes rows by `leaf_index` alone, so two trees in
+    /// one store would write the same row.
+    #[must_use]
+    pub const fn tree_number(&self) -> Option<u32> {
+        match self {
+            Self::Shield { tree_number, .. }
+            | Self::Transact { tree_number, .. }
+            | Self::Nullified { tree_number, .. } => Some(*tree_number),
+            Self::Unshield { .. } => None,
+        }
+    }
+}
+
 /// One `(blindedCommitment, listKey)` association row.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoiStatusRow {

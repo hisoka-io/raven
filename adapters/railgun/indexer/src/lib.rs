@@ -89,9 +89,24 @@ pub const MAX_RPC_TOTAL_ELAPSED_SECS: u64 = 90;
 /// Default polling cadence (seconds).
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 10;
 
+/// Chunk boundaries a Layer 1 walk-back may travel below the cursor. The cursor
+/// tracks finalized heights per the [`ChainSource::latest_block`] contract, so
+/// this only has to clear the window's own spacing.
+pub const MAX_REORG_CHUNKS: u64 = 4;
+
 /// Maximum BLOCK DISTANCE a Layer 1 walk-back may travel below the cursor
 /// before bailing. Not an entry count: see [`REORG_WINDOW_ENTRIES`].
-pub const MAX_REORG_BLOCKS: u64 = 256;
+///
+/// Derived from chunk spacing rather than picked: the window caches one entry
+/// per chunk, so any bound below [`SCAN_CHUNK_BLOCKS`] leaves the walk-back no
+/// cached entry to inspect and turns every divergence into
+/// [`IndexerError::ReorgTooDeep`].
+pub const MAX_REORG_BLOCKS: u64 = SCAN_CHUNK_BLOCKS * MAX_REORG_CHUNKS;
+
+const _: () = assert!(
+    MAX_REORG_BLOCKS > SCAN_CHUNK_BLOCKS,
+    "the walk-back bound must span more than one chunk of window spacing"
+);
 
 /// Maximum cached `(block_number, block_hash)` ENTRIES retained for Layer 1
 /// reorg detection. Not a block distance: one entry per tick covers a whole
@@ -683,7 +698,8 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
                 },
                 None => std::collections::BTreeMap::new(),
             };
-        // stale top hash means reorg-while-down: rebuild so the next-tick walk-back fires.
+        // stale top hash means reorg-while-down: refill from RPC so the window
+        // carries a canonical baseline again.
         if let Some(path) = config.reorg_window_path.as_ref() {
             if let Some((&top_height, &top_hash)) = hash_cache.iter().next_back() {
                 match self.source.block_hash(top_height).await {
@@ -697,7 +713,28 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
                             .await;
                         persist_reorg_window_best_effort(path, &hash_cache);
                     }
-                    Ok(_) => {}
+                    // A restart resumes mid-chunk while the window holds only
+                    // chunk tips. A canonical top vouches for every height below
+                    // it, so seed the cursor instead of reading its absence as a
+                    // divergence. Above the top nothing vouches for it.
+                    Ok(_) => {
+                        if cursor > 0 && cursor < top_height && !hash_cache.contains_key(&cursor) {
+                            match self.source.block_hash(cursor).await {
+                                Ok(cursor_hash) => {
+                                    hash_cache.insert(cursor, cursor_hash);
+                                    persist_reorg_window_best_effort(path, &hash_cache);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        cursor,
+                                        error = %e,
+                                        "indexer resume-cursor hash unavailable; the window \
+                                         cannot vouch for the cursor this tick"
+                                    );
+                                }
+                            }
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(
                             top_height,
@@ -744,15 +781,32 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
                         tracing::warn!(error = %miss, "rewinding to the newest verifiable height");
                         let verifiable = hash_cache.range(..cursor).next_back().map(|(&h, _)| h);
                         if verifiable.is_none() {
-                            hash_cache.clear();
+                            // Clearing disables Layer 1 detection until a fresh
+                            // tip is cached; refill below the cursor instead.
+                            hash_cache = self
+                                .rebuild_reorg_window(cursor, max_depth_blocks, entry_cap)
+                                .await;
                             if let Some(path) = config.reorg_window_path.as_ref() {
                                 persist_reorg_window_best_effort(path, &hash_cache);
                             }
                         }
                         verifiable
                     }
+                    // Unresolvable, but the worker still owns the liveness
+                    // signal: without a heartbeat the lag gauge holds its last
+                    // healthy value while ingestion has stopped.
                     Err(e) => {
+                        let reason = match &e {
+                            IndexerError::ReorgTooDeep(_) => "reorg_too_deep",
+                            _ => "rpc",
+                        };
+                        metrics::counter!(
+                            "raven_railgun_indexer_reorg_check_failed_total",
+                            "reason" => reason
+                        )
+                        .increment(1);
                         tracing::warn!(error = %e, "Layer 1 reorg check failed; will retry");
+                        let _ = self.send_heartbeat(latest, cursor);
                         continue;
                     }
                 };
@@ -786,8 +840,11 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
                 .await
             {
                 Ok(v) => v,
+                // Same liveness contract as a refused reorg check: the head is
+                // known here, so the beat keeps lag growing against a held cursor.
                 Err(e) => {
                     tracing::warn!(error = %e, from = cursor + 1, to, "events_in_range failed");
+                    let _ = self.send_heartbeat(latest, cursor);
                     continue;
                 }
             };
@@ -1239,6 +1296,31 @@ fn is_non_retryable(err: &IndexerError) -> bool {
 ///
 /// Bounded by [`MAX_RPC_RETRIES`] and [`MAX_RPC_TOTAL_ELAPSED_SECS`]. Per-attempt timeout
 /// is [`RPC_TIMEOUT_SECS`]. Non-retryable errors (HTTP 4xx, JSON decode, "method not found")
+/// Bound one RPC attempt by [`RPC_TIMEOUT_SECS`].
+///
+/// The single-endpoint path has always had this via [`retry_rpc`]; the pooled and WS paths
+/// had no timeout at all, and alloy's `connect_http` builds a reqwest client with no
+/// default. A gateway that completes TLS and then black-holes therefore hung the tick
+/// forever, and because `ConsumerEvent::Heartbeat` is the only writer of
+/// `indexer_lag_blocks`, the gauge FROZE at its last healthy value instead of growing -
+/// ingestion dead, every operator signal green.
+///
+/// The message contains "timeout", which both existing classifiers already match
+/// (`classify_indexer_error` -> `ErrorKind::Network`, `is_ws_transport_error` -> true), so
+/// failover and cooldown work without touching either.
+pub(crate) async fn with_rpc_timeout<T>(
+    label: &str,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(std::time::Duration::from_secs(RPC_TIMEOUT_SECS), fut).await {
+        Ok(r) => r,
+        Err(_) => Err(IndexerError::Rpc(format!(
+            "timeout after {RPC_TIMEOUT_SECS}s on {label}; the endpoint accepted the \
+             connection and never answered"
+        ))),
+    }
+}
+
 /// fail-fast without consuming the retry budget.
 async fn retry_rpc<F, Fut, T>(mut op: F) -> Result<T>
 where
@@ -1480,16 +1562,52 @@ mod tests {
         );
     }
 
-    /// Covers the routing decision over both height classes, not the
-    /// `raven_railgun_indexer_dropped_logs_total` increment: the counter is
-    /// asserted over the public ingest paths in `tests/subscribe_block_number_drop.rs`.
+    /// Installed once per test binary: `metrics::set_global_recorder` rejects the
+    /// second installation and silently leaves the counter unobservable.
+    fn dropped_logs_snapshotter() -> &'static metrics_util::debugging::Snapshotter {
+        static SNAP: std::sync::OnceLock<metrics_util::debugging::Snapshotter> =
+            std::sync::OnceLock::new();
+        SNAP.get_or_init(|| {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _ = metrics::set_global_recorder(recorder);
+            snapshotter
+        })
+    }
+
+    /// Substring scan over debug-formatted keys: `metrics-util`'s CompositeKey
+    /// shape varies between versions, while the counter name is unique here.
+    /// Reads once: `snapshot()` consumes what it reports.
+    fn dropped_logs_total(snapshotter: &metrics_util::debugging::Snapshotter) -> u64 {
+        for (composite_key, _, _, value) in snapshotter.snapshot().into_vec() {
+            if format!("{composite_key:?}").contains("raven_railgun_indexer_dropped_logs_total") {
+                if let metrics_util::debugging::DebugValue::Counter(v) = value {
+                    return v;
+                }
+            }
+        }
+        0
+    }
+
+    /// Covers the routing decision over both height classes and both directions
+    /// of the `raven_railgun_indexer_dropped_logs_total` increment. The same
+    /// counter is asserted end to end over the public ingest paths in
+    /// `tests/subscribe_block_number_drop.rs`.
     #[test]
     fn block_number_or_drop_passes_heights_through_and_drops_pending() {
+        let snapshotter = dropped_logs_snapshotter();
+        let before = dropped_logs_total(snapshotter);
+
         let at_height = alloy::rpc::types::eth::Log {
             block_number: Some(77),
             ..Default::default()
         };
         assert_eq!(block_number_or_drop(&at_height), Some(77));
+        assert_eq!(
+            dropped_logs_total(snapshotter),
+            before,
+            "no drop to count for a log carrying a height"
+        );
 
         let pending = alloy::rpc::types::eth::Log {
             block_number: None,
@@ -1499,6 +1617,11 @@ mod tests {
             block_number_or_drop(&pending),
             None,
             "a pending log must drop, not land at a fabricated height"
+        );
+        assert_eq!(
+            dropped_logs_total(snapshotter),
+            before + 1,
+            "the drop must be counted exactly once"
         );
     }
 

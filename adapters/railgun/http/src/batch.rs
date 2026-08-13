@@ -49,10 +49,9 @@ pub(crate) async fn query_handler<S: PirScheme>(
 
     let started = Instant::now();
     let respond_timeout = Duration::from_secs(app.config.respond_timeout_secs.max(1));
-    // A pathological query must release its permit rather than block later requests.
     let instance_clone = Arc::clone(&instance);
-    let join = tokio::task::spawn_blocking(move || instance_clone.query_active_tracked(&query));
-    let (epoch, response) = match tokio::time::timeout(respond_timeout, join).await {
+    let mut join = tokio::task::spawn_blocking(move || instance_clone.query_active_tracked(&query));
+    let (epoch, response) = match tokio::time::timeout(respond_timeout, &mut join).await {
         Ok(Ok(Ok(pair))) => pair,
         Ok(Ok(Err(raven_railgun_core::AdapterError::NoActiveInstance { instance_id: id }))) => {
             tracing::info!(
@@ -78,6 +77,7 @@ pub(crate) async fn query_handler<S: PirScheme>(
                 secs = respond_timeout.as_secs(),
                 "single-query respond timed out"
             );
+            hold_permit_until_detached(join, permit, "single");
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
     };
@@ -201,6 +201,28 @@ pub(crate) async fn batch_handler<S: PirScheme>(
         epoch_at_start.0,
     );
     Ok((StatusCode::OK, headers, body_bytes.into()))
+}
+
+/// Keep the concurrency permit with the work, not with the request.
+///
+/// A timeout only drops the `JoinHandle`; `spawn_blocking` has no cancellation,
+/// so the respond keeps a blocking thread and its `Arc<Snapshot>` alive.
+/// Returning the permit at the deadline would let `max_concurrent_queries`
+/// admit fresh work on top of it, unbounded, while the permit gauge reads free.
+fn hold_permit_until_detached<T: Send + 'static>(
+    join: tokio::task::JoinHandle<T>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    kind: &'static str,
+) {
+    metrics::counter!(
+        "raven_railgun_respond_detached_total",
+        "kind" => kind
+    )
+    .increment(1);
+    tokio::spawn(async move {
+        let _ = join.await;
+        drop(permit);
+    });
 }
 
 /// Failure mode of a [`dispatch_batch`] call.
@@ -402,8 +424,9 @@ where
 /// One in-flight batch worker. Acquires a permit, runs
 /// `query_active_tracked_with_snapshot` against the batch-captured
 /// `Arc<Snapshot<S>>` on `spawn_blocking` under `tokio::time::timeout`.
-/// Permit is released on timeout. The slot materializes under the permit, so
-/// an unacquired worker holds no query-sized allocation.
+/// A timed-out slot keeps its permit until the detached respond ends. The slot
+/// materializes under the permit, so an unacquired worker holds no query-sized
+/// allocation.
 async fn worker<S, Q>(
     idx: usize,
     slot: Q,
@@ -416,14 +439,14 @@ where
     S: PirScheme,
     Q: Into<S::Query> + Send + 'static,
 {
-    let Ok(_permit) = sem.acquire_owned().await else {
+    let Ok(permit) = sem.acquire_owned().await else {
         return (idx, Err(BatchError::SemaphoreClosed));
     };
-    let join = tokio::task::spawn_blocking(move || {
+    let mut join = tokio::task::spawn_blocking(move || {
         let query = slot.into();
         instance.query_active_tracked_with_snapshot(&snapshot, &query)
     });
-    match tokio::time::timeout(respond_timeout, join).await {
+    match tokio::time::timeout(respond_timeout, &mut join).await {
         Ok(Ok(Ok((_epoch, r)))) => (idx, Ok(r)),
         Ok(Ok(Err(scheme_err @ raven_railgun_core::AdapterError::InvalidQuery(_)))) => (
             idx,
@@ -440,12 +463,15 @@ where
             }),
         ),
         Ok(Err(_)) => (idx, Err(BatchError::WorkerAborted { index: idx })),
-        Err(_elapsed) => (
-            idx,
-            Err(BatchError::Timeout {
-                index: idx,
-                secs: respond_timeout.as_secs(),
-            }),
-        ),
+        Err(_elapsed) => {
+            hold_permit_until_detached(join, permit, "batch");
+            (
+                idx,
+                Err(BatchError::Timeout {
+                    index: idx,
+                    secs: respond_timeout.as_secs(),
+                }),
+            )
+        }
     }
 }

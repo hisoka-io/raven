@@ -12,19 +12,24 @@ use std::sync::Arc;
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_cli::serve_production_multi::{
     compute_effective_start_block, compute_effective_start_block_per_tree,
+    per_tree_recovered_floors,
 };
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{setup_state, LogicalLeafStore};
-use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
+use raven_railgun_engine::orchestrator::{InstanceConfig, PerInstanceHandles};
+use raven_railgun_engine::persistence::{
+    ConsumerEvent, ConsumerMetrics, InspirePersistence, SnapshotPolicy,
+};
 use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
-use raven_railgun_persistence::StoreLayout;
+use raven_railgun_engine::{InstanceRole, PirInstance};
+use raven_railgun_persistence::{StoreLayout, WalEntryPayload};
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-start-block-fallback";
 const ENTRIES_PER_SHARD: u32 = 2048;
 const ENTRY_BYTES: usize = 32;
 
 fn encoder() -> Arc<dyn PirTableEncoder> {
-    EncoderKind::PerLeafBc
+    EncoderKind::PerLeafBc { tree_number: 0 }
         .build(ENTRY_BYTES, ENTRIES_PER_SHARD)
         .expect("build encoder")
 }
@@ -219,5 +224,95 @@ fn two_instances_at_different_heights_yield_per_tree_distinct_floors() {
          a regression that collapsed the per-tree map to a global floor \
          would either replay events in (23M, 25M] against tree-1 (toml=0) \
          or silently skip them (toml=25M)"
+    );
+}
+
+fn canonical_leaf(v: u64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[24..32].copy_from_slice(&v.to_be_bytes());
+    out
+}
+
+fn append_leaf(tree_number: u32, leaf_index: u32) -> WalEntryPayload {
+    WalEntryPayload::AppendLeaf {
+        tree_number,
+        leaf_index,
+        commitment: canonical_leaf(u64::from(leaf_index) + 1),
+    }
+}
+
+/// A reorg lowers the committed manifest marker but `LogicalLeafStore::
+/// last_block_height` is monotone, so a floor that folded the store height in
+/// would resume above the rollback and never re-index the unwound blocks.
+#[tokio::test]
+async fn per_tree_floor_follows_the_manifest_after_a_reorg_rollback() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let params = InspireParams::secure_128_d2048();
+    let db: Vec<u8> = (0..(ENTRIES_PER_SHARD as usize) * ENTRY_BYTES)
+        .map(|i| u8::try_from(i & 0xff).expect("byte"))
+        .collect();
+    let (state, _sk) =
+        setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("setup_state");
+
+    let enc = encoder();
+    let mut store = LogicalLeafStore::new();
+    store
+        .apply(&append_leaf(0, 0), 400, enc.as_ref())
+        .expect("leaf 0 at block 400");
+    store
+        .apply(&append_leaf(0, 1), 500, enc.as_ref())
+        .expect("leaf 1 at block 500");
+    store
+        .apply(&WalEntryPayload::Reorg { height: 450 }, 450, enc.as_ref())
+        .expect("reorg to 450");
+    assert_eq!(
+        store.last_block_height(),
+        500,
+        "store height is monotone: the reorg must not lower it, else this test \
+         proves nothing about the floor"
+    );
+
+    let layout = StoreLayout::open(dir.path()).expect("layout");
+    let opened = InspirePersistence::open(
+        layout,
+        SCHEME_TAG,
+        InstanceId::new("reorg-floor-tree-0"),
+        SnapshotPolicy::default(),
+        encoder(),
+    )
+    .expect("open");
+    let persistence = Arc::new(opened.persistence);
+    persistence
+        .commit_v6(&state, &store, 450)
+        .expect("post-reorg commit at the rolled-back height");
+    assert_eq!(persistence.manifest_block_height(), 450);
+
+    let (sender, _rx) = tokio::sync::mpsc::channel::<ConsumerEvent>(1);
+    let handles = vec![PerInstanceHandles {
+        config: InstanceConfig::commit_tree(
+            "reorg-floor-tree-0",
+            dir.path().to_path_buf(),
+            0,
+            InstanceRole::Live,
+        ),
+        instance: Arc::new(PirInstance::new(
+            InstanceId::new("reorg-floor-tree-0"),
+            InstanceRole::Live,
+            state,
+        )),
+        persistence: Arc::clone(&persistence),
+        consumer: tokio::spawn(async { Ok(()) }),
+        sender,
+        metrics: Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default())),
+        logical_store: Arc::new(parking_lot::Mutex::new(store)),
+    }];
+
+    let floors = per_tree_recovered_floors(&handles);
+    assert_eq!(
+        floors.get(&0),
+        Some(&450),
+        "the manifest marker is authoritative after a reorg; folding in the \
+         monotone store height (500) would skip blocks 451..=500 and leave the \
+         tree permanently one leaf short of chain state"
     );
 }

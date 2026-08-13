@@ -132,7 +132,7 @@ fn build_fresh_state(params: &InspireParams) -> raven_railgun_engine::inspire::I
 }
 
 fn build_encoder() -> Arc<dyn PirTableEncoder> {
-    EncoderKind::PerLeafBc
+    EncoderKind::PerLeafBc { tree_number: 0 }
         .build(TOY_ENTRY_SIZE, ENTRIES_PER_SHARD)
         .expect("build per-leaf-bc encoder")
 }

@@ -17,13 +17,31 @@ use tokio::sync::mpsc;
 pub async fn indexer_to_consumer_bridge(
     mut rx: mpsc::Receiver<IndexerMessage>,
     tx: mpsc::Sender<ConsumerEvent>,
+    chain_tree: Option<u32>,
 ) {
     while let Some(msg) = rx.recv().await {
         let translated = match msg {
             IndexerMessage::Event {
                 event,
                 block_height,
-            } => ConsumerEvent::Chain(event, block_height),
+            } => {
+                // The single-instance path has no route table, so the tree filter lives
+                // here. Without it a store receives every tree, and `per-leaf-bc` indexes
+                // rows by `leaf_index` alone - two trees would write the same row and the
+                // higher one would silently win. `None` means a per-list encoder, which
+                // consumes no chain-tree events by shape.
+                if let (Some(scope), Some(event_tree)) = (chain_tree, event.tree_number()) {
+                    if event_tree != scope {
+                        tracing::trace!(
+                            scope,
+                            event_tree,
+                            "indexer_to_consumer_bridge: dropping an event for another tree"
+                        );
+                        continue;
+                    }
+                }
+                ConsumerEvent::Chain(event, block_height)
+            }
             IndexerMessage::Reorg { height } => ConsumerEvent::Reorg(height),
             IndexerMessage::Heartbeat {
                 chain_head_block,
@@ -196,7 +214,7 @@ pub const fn default_k_for(encoder: super::pir_table::EncoderKind) -> usize {
         | super::pir_table::EncoderKind::PerListPath { .. }
         | super::pir_table::EncoderKind::PerListNode { .. } => 16,
         super::pir_table::EncoderKind::PerLeafPath { .. } => 8,
-        super::pir_table::EncoderKind::PerLeafBc
+        super::pir_table::EncoderKind::PerLeafBc { .. }
         | super::pir_table::EncoderKind::PerListStatus { .. } => 4,
     }
 }
@@ -279,7 +297,11 @@ pub fn bootstrap_railgun_engine(
 
     let indexer_bridge = {
         let cons_tx = sender.clone();
-        tokio::spawn(indexer_to_consumer_bridge(indexer_rx, cons_tx))
+        tokio::spawn(indexer_to_consumer_bridge(
+            indexer_rx,
+            cons_tx,
+            config.encoder.chain_tree_number(),
+        ))
     };
     let mirror_bridge = {
         let cons_tx = sender.clone();

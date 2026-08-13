@@ -59,7 +59,7 @@ async fn adapter_consumes_mock_ppoi_events_and_populates_per_list_imt() {
     });
 
     let mut store = LogicalLeafStore::new();
-    let encoder = PerLeafCommitmentEncoder::new(32, 65_536).expect("encoder");
+    let encoder = PerLeafCommitmentEncoder::new(32, 65_536, 0).expect("encoder");
     let want = corpus_size as usize;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while store.ppoi_count() < want {

@@ -24,7 +24,7 @@ fn canonical(seed: u8) -> [u8; 32] {
 }
 
 fn test_encoder() -> PerLeafEncoder {
-    PerLeafEncoder::new(RECORD_SIZE, ENTRIES_PER_SHARD).expect("valid encoder")
+    PerLeafEncoder::new(RECORD_SIZE, ENTRIES_PER_SHARD, 0).expect("valid encoder")
 }
 
 fn append(tree: u32, leaf: u32, commitment: [u8; 32]) -> WalEntryPayload {
@@ -57,12 +57,12 @@ proptest! {
         insert_count in 0u32..(TOTAL_SHARDS * ENTRIES_PER_SHARD),
     ) {
         let store = build_store_from_pattern(insert_count as usize);
-        let encoder = PerLeafEncoder::new(RECORD_SIZE, ENTRIES_PER_SHARD).expect("valid encoder");
+        let encoder = PerLeafEncoder::new(RECORD_SIZE, ENTRIES_PER_SHARD, 0).expect("valid encoder");
 
         for shard_id in 0..TOTAL_SHARDS {
             let trait_bytes = encoder.materialize_shard(shard_id, &store);
             let direct_bytes =
-                materialize_shard_bytes(&store, shard_id, ENTRIES_PER_SHARD, RECORD_SIZE);
+                materialize_shard_bytes(&store, shard_id, ENTRIES_PER_SHARD, RECORD_SIZE, 0);
             prop_assert_eq!(
                 trait_bytes.len(),
                 direct_bytes.len(),
@@ -88,7 +88,7 @@ proptest! {
         let store = build_store_from_pattern(insert_count as usize);
 
         for shard_id in 0..TOTAL_SHARDS {
-            let bytes = materialize_shard_bytes(&store, shard_id, ENTRIES_PER_SHARD, RECORD_SIZE);
+            let bytes = materialize_shard_bytes(&store, shard_id, ENTRIES_PER_SHARD, RECORD_SIZE, 0);
             prop_assert_eq!(bytes.len(), ENTRIES_PER_SHARD as usize * RECORD_SIZE);
 
             for row in 0..ENTRIES_PER_SHARD {
@@ -122,7 +122,7 @@ proptest! {
                 .apply(&append(0, i, canonical((i % 250) as u8 + 1)), 100 + u64::from(i), &test_encoder())
                 .expect("contiguous insert");
         }
-        let encoder = PerLeafEncoder::new(RECORD_SIZE, ENTRIES_PER_SHARD).expect("valid encoder");
+        let encoder = PerLeafEncoder::new(RECORD_SIZE, ENTRIES_PER_SHARD, 0).expect("valid encoder");
         let dirty_via_trait = encoder.affected_shards_for_leaf(0, leaf_index);
 
         prop_assert_eq!(

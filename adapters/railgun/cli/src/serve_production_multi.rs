@@ -16,7 +16,7 @@ use raven_railgun_engine::inspire::{
 };
 use raven_railgun_engine::orchestrator::{
     bootstrap_railgun_engine_multi, DataSourceFilter, InstanceConfig, MultiOrchestratorHandle,
-    OrchestratorChannels, VerificationMode,
+    OrchestratorChannels, PerInstanceHandles, VerificationMode,
 };
 use raven_railgun_engine::persistence::{ConsumerMetrics, SnapshotPolicy};
 use raven_railgun_engine::pir_table::EncoderKind;
@@ -672,7 +672,7 @@ fn build_encoder_kind(
     list_key: Option<&str>,
 ) -> anyhow::Result<EncoderKind> {
     match kind {
-        EncoderString::PerLeafBc => Ok(EncoderKind::PerLeafBc),
+        EncoderString::PerLeafBc => Ok(EncoderKind::PerLeafBc { tree_number: 0 }),
         EncoderString::PerLeafPath => {
             let t = tree_number
                 .ok_or_else(|| anyhow::anyhow!("per-leaf-path encoder requires `tree_number`"))?;
@@ -743,7 +743,9 @@ fn enforce_encoder_matches_data_source(
 ) -> anyhow::Result<()> {
     match (encoder, data_source) {
         (
-            EncoderKind::PerLeafBc | EncoderKind::PerLeafPath { .. } | EncoderKind::PerNode { .. },
+            EncoderKind::PerLeafBc { .. }
+            | EncoderKind::PerLeafPath { .. }
+            | EncoderKind::PerNode { .. },
             DataSourceFilter::ChainTreeNumber(_),
         )
         | (
@@ -921,20 +923,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         *observer.lock() = Some(view);
     }
 
-    // Per-tree floor; a single global floor would either re-scan below the
-    // recovered prefix or skip events for the lower-height trees.
-    let mut per_tree_recovered: BTreeMap<u32, u64> = BTreeMap::new();
-    for h in &bootstrap.handles.instances {
-        if let DataSourceFilter::ChainTreeNumber(tree) = h.config.data_source {
-            let manifest_height = h.persistence.manifest_block_height();
-            let wal_height = h.logical_store.lock().last_block_height();
-            let height = manifest_height.max(wal_height);
-            per_tree_recovered
-                .entry(tree)
-                .and_modify(|v| *v = (*v).max(height))
-                .or_insert(height);
-        }
-    }
+    let per_tree_recovered = per_tree_recovered_floors(&bootstrap.handles.instances);
     let per_tree_start_blocks =
         compute_effective_start_block_per_tree(opts.start_block, &per_tree_recovered);
     let min_effective_start_block = per_tree_start_blocks
@@ -1451,6 +1440,25 @@ pub fn compute_effective_start_block(
 ) -> u64 {
     let max_recovered = recovered_block_heights.iter().copied().max().unwrap_or(0);
     toml_start_block.max(max_recovered)
+}
+
+/// Recovered indexer floor per chain tree. A single global floor would either
+/// re-scan below the recovered prefix or skip events for the lower-height trees.
+/// The committed manifest marker is the only authority: it rolls back with a
+/// reorg, while `LogicalLeafStore::last_block_height` is monotone.
+#[must_use]
+pub fn per_tree_recovered_floors(instances: &[PerInstanceHandles]) -> BTreeMap<u32, u64> {
+    let mut floors: BTreeMap<u32, u64> = BTreeMap::new();
+    for h in instances {
+        if let DataSourceFilter::ChainTreeNumber(tree) = h.config.data_source {
+            let height = h.persistence.manifest_block_height();
+            floors
+                .entry(tree)
+                .and_modify(|v| *v = (*v).max(height))
+                .or_insert(height);
+        }
+    }
+    floors
 }
 
 /// Per-tree `max(toml_start_block, recovered)`. The single-cursor indexer scans

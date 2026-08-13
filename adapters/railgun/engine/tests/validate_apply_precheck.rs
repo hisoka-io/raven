@@ -36,7 +36,7 @@ fn canonical(seed: u8) -> [u8; 32] {
 }
 
 fn enc() -> PerLeafCommitmentEncoder {
-    PerLeafCommitmentEncoder::new(32, 2048).expect("test encoder")
+    PerLeafCommitmentEncoder::new(32, 2048, 0).expect("test encoder")
 }
 
 fn enc_arc() -> Arc<dyn PirTableEncoder> {
@@ -101,7 +101,8 @@ fn validate_apply_rejects_a_non_canonical_ppoi_blinded_commitment() {
     );
 }
 
-/// Replay soft-skips `InvalidQuery` only; an `Internal` here bricks reopen.
+/// Ingress rejects with `InvalidQuery` so the caller sees a client-side refusal;
+/// replay screens the same value separately and refuses the boot instead.
 #[test]
 fn apply_wal_entry_classifies_a_non_canonical_commitment_as_invalid_query() {
     let mut store = LogicalLeafStore::new();
@@ -109,7 +110,7 @@ fn apply_wal_entry_classifies_a_non_canonical_commitment_as_invalid_query() {
         .expect_err("a commitment at the modulus must not apply");
     assert!(
         matches!(err, AdapterError::InvalidQuery(_)),
-        "expected InvalidQuery so WAL replay can soft-skip, got {err:?}"
+        "expected InvalidQuery, got {err:?}"
     );
 }
 
@@ -141,16 +142,18 @@ fn validate_apply_rejects_a_ppoi_list_index_at_or_past_tree_capacity() {
     );
 }
 
-/// A WAL laid down before the pre-check existed must still reopen. Replay
-/// soft-skips `InvalidQuery` only, so classifying this as `Internal` would
-/// leave the instance permanently unopenable.
+/// A non-canonical leaf can never be encoded, so skipping it on replay leaves
+/// the store leaf count behind: every later entry for that tree then fails the
+/// contiguity arm of the same screen and the whole tail is discarded. The
+/// poisoned entry is laid down FIRST here so a skip would take the three valid
+/// entries behind it with it.
 #[test]
-fn a_wal_already_holding_a_non_canonical_leaf_still_reopens() {
+fn a_wal_holding_a_non_canonical_leaf_refuses_the_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
     let opened = InspirePersistence::open(
         StoreLayout::open(dir.path()).expect("layout"),
         SCHEME_TAG,
-        InstanceId::new("wave2-precheck"),
+        InstanceId::new("precheck-fatal-replay"),
         SnapshotPolicy::default(),
         enc_arc(),
     )
@@ -159,20 +162,30 @@ fn a_wal_already_holding_a_non_canonical_leaf_still_reopens() {
         .persistence
         .apply_event(&append(0, BN254_FR_MODULUS_BE), 100)
         .expect("apply_event writes the WAL without running validate_apply");
+    for leaf_index in 1..4u32 {
+        let seed = u8::try_from(leaf_index).expect("< 4");
+        opened
+            .persistence
+            .apply_event(
+                &append(leaf_index, canonical(seed)),
+                100 + u64::from(leaf_index),
+            )
+            .expect("valid tail entry");
+    }
     drop(opened);
 
-    let reopened = InspirePersistence::open(
+    let err = InspirePersistence::open(
         StoreLayout::open(dir.path()).expect("layout 2"),
         SCHEME_TAG,
-        InstanceId::new("wave2-precheck"),
+        InstanceId::new("precheck-fatal-replay"),
         SnapshotPolicy::default(),
         enc_arc(),
     )
-    .expect("replay must soft-skip the poisoned entry, not brick the open");
-    assert_eq!(
-        reopened.recovered_logical_store.imt_leaf_count_for(0),
-        0,
-        "the poisoned entry must be skipped, not applied"
+    .expect_err("a non-canonical leaf in the WAL must refuse the boot, not skip");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("seq 0") && msg.contains("BN254"),
+        "the refusal must name the offending WAL seq and the reason, got: {msg}"
     );
 }
 

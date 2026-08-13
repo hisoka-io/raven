@@ -61,7 +61,7 @@ async fn populate_from_zero_takes_under_30s_for_1k_events() {
     });
 
     let mut store = LogicalLeafStore::new();
-    let encoder = PerLeafCommitmentEncoder::new(32, 65_536).expect("encoder");
+    let encoder = PerLeafCommitmentEncoder::new(32, 65_536, 0).expect("encoder");
     let want = corpus_size as usize;
     let deadline = started + Duration::from_secs(30);
     while store.ppoi_count() < want {

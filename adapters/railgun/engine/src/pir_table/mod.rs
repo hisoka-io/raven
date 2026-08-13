@@ -33,12 +33,18 @@ pub mod labels {
 
 /// Operator-facing encoder discriminator with its construction config.
 /// Persisted as `encoder_label`; bootstrap rejects a diverging label.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "kind")]
 pub enum EncoderKind {
     /// T1 default: row = 32 B blinded commitment, padded to record_size.
-    #[default]
-    PerLeafBc,
+    ///
+    /// Carries its tree because the row index is tree-LOCAL: `leaf_index` alone. The
+    /// single-instance ingest path applies no tree filter, so without the pin two trees
+    /// would write the same row and the higher one would silently win.
+    PerLeafBc {
+        /// Tree this encoder is pinned to.
+        tree_number: u32,
+    },
     /// T2/T3 path encoder; row = 16 siblings x 32 B = 512 B from per-tree IMT.
     PerLeafPath {
         /// Tree this encoder is pinned to.
@@ -69,12 +75,39 @@ pub enum EncoderKind {
     },
 }
 
+impl Default for EncoderKind {
+    /// `per-leaf-bc` pinned to tree 0, the historical default. Hand-written because
+    /// `#[default]` does not apply to a struct variant.
+    fn default() -> Self {
+        Self::PerLeafBc { tree_number: 0 }
+    }
+}
+
 impl EncoderKind {
+    /// Chain tree this encoder is scoped to, or `None` for the per-list variants.
+    ///
+    /// Every chain-tree encoder now carries its tree, so an ingest path can filter on it
+    /// without a separate config field. That matters because the row layouts differ in how
+    /// they use it - `PerLeafBc` indexes by `leaf_index` alone and filters, the others
+    /// index per-tree - but the FILTER is uniform, and a filter defined for only some
+    /// variants is what let a foreign tree reach a `per-leaf-bc` store.
+    #[must_use]
+    pub const fn chain_tree_number(&self) -> Option<u32> {
+        match self {
+            Self::PerLeafBc { tree_number }
+            | Self::PerLeafPath { tree_number }
+            | Self::PerNode { tree_number } => Some(*tree_number),
+            Self::PerListStatus { .. } | Self::PerListPath { .. } | Self::PerListNode { .. } => {
+                None
+            }
+        }
+    }
+
     /// Stable label matching the resulting encoder's `label()`.
     #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
-            Self::PerLeafBc => labels::PER_LEAF_BC,
+            Self::PerLeafBc { .. } => labels::PER_LEAF_BC,
             Self::PerLeafPath { .. } => labels::PER_LEAF_PATH,
             Self::PerNode { .. } => labels::PER_NODE,
             Self::PerListStatus { .. } => labels::PER_LIST_STATUS,
@@ -90,7 +123,7 @@ impl EncoderKind {
     pub const fn min_total_entries(&self) -> u32 {
         match self {
             Self::PerNode { .. } | Self::PerListNode { .. } => PER_NODE_TOTAL_NODES,
-            Self::PerLeafBc
+            Self::PerLeafBc { .. }
             | Self::PerLeafPath { .. }
             | Self::PerListStatus { .. }
             | Self::PerListPath { .. } => LEAVES_PER_TREE,
@@ -103,7 +136,7 @@ impl EncoderKind {
     pub const fn default_total_entries(&self) -> usize {
         match self {
             Self::PerNode { .. } | Self::PerListNode { .. } => 131_072,
-            Self::PerLeafBc
+            Self::PerLeafBc { .. }
             | Self::PerLeafPath { .. }
             | Self::PerListStatus { .. }
             | Self::PerListPath { .. } => LEAVES_PER_TREE as usize,
@@ -116,7 +149,7 @@ impl EncoderKind {
         match self {
             Self::PerNode { .. } | Self::PerListNode { .. } | Self::PerListPath { .. } => 16,
             Self::PerLeafPath { .. } => 8,
-            Self::PerLeafBc | Self::PerListStatus { .. } => 4,
+            Self::PerLeafBc { .. } | Self::PerListStatus { .. } => 4,
         }
     }
 
@@ -126,7 +159,7 @@ impl EncoderKind {
         match self {
             Self::PerLeafPath { .. } | Self::PerListPath { .. } => Some(PATH_RECORD_BYTES),
             Self::PerNode { .. } | Self::PerListNode { .. } => Some(NODE_HASH_BYTES),
-            Self::PerLeafBc | Self::PerListStatus { .. } => None,
+            Self::PerLeafBc { .. } | Self::PerListStatus { .. } => None,
         }
     }
 
@@ -148,8 +181,9 @@ impl EncoderKind {
         entries_per_shard: u32,
     ) -> Result<Arc<dyn PirTableEncoder>> {
         match self {
-            Self::PerLeafBc => {
-                let enc = PerLeafCommitmentEncoder::new(record_size, entries_per_shard)?;
+            Self::PerLeafBc { tree_number } => {
+                let enc =
+                    PerLeafCommitmentEncoder::new(record_size, entries_per_shard, *tree_number)?;
                 Ok(Arc::new(enc))
             }
             Self::PerLeafPath { tree_number } => {
@@ -371,7 +405,9 @@ pub trait PirTableEncoder: Send + Sync + std::fmt::Debug {
     /// Build the byte buffer for a single shard.
     fn materialize_shard(&self, shard_id: u32, store: &LogicalLeafStore) -> Vec<u8>;
 
-    /// Shard ids whose stored rows must be re-encoded after a leaf insert.
+    /// Shard ids whose stored rows must be re-encoded after a leaf insert. Empty
+    /// when the insert is outside the encoder's row space: an id past the
+    /// allocated cell is unencodable and the commit driver drops it.
     fn affected_shards_for_leaf(&self, tree: u32, leaf_index: u32) -> BTreeSet<u32>;
 
     /// Shard ids dirtied by a per-list leaf insert; no-op for chain-tree encoders.
@@ -419,13 +455,13 @@ mod tests {
 
     #[test]
     fn new_validates_record_size_floor() {
-        let too_small = PerLeafCommitmentEncoder::new(31, 2048);
+        let too_small = PerLeafCommitmentEncoder::new(31, 2048, 0);
         assert!(matches!(too_small, Err(AdapterError::InvalidQuery(_))));
     }
 
     #[test]
     fn new_rejects_zero_entries_per_shard() {
-        assert!(PerLeafCommitmentEncoder::new(32, 0).is_err());
+        assert!(PerLeafCommitmentEncoder::new(32, 0, 0).is_err());
         assert!(PerLeafPathEncoder::new(PATH_RECORD_BYTES, 0, 0).is_err());
         assert!(PerNodeEncoder::new(0, 0).is_err());
     }
@@ -438,7 +474,7 @@ mod tests {
 
     #[test]
     fn record_size_and_shard_width_round_trip() {
-        let bc = PerLeafCommitmentEncoder::new(512, 2048).expect("bc");
+        let bc = PerLeafCommitmentEncoder::new(512, 2048, 0).expect("bc");
         assert_eq!(bc.label(), "per-leaf-bc");
         let path = PerLeafPathEncoder::new(PATH_RECORD_BYTES, 2048, 7).expect("path");
         assert_eq!(path.label(), "per-leaf-path");
@@ -450,7 +486,7 @@ mod tests {
 
     #[test]
     fn per_leaf_bc_affected_shards_returns_single_shard() {
-        let enc = PerLeafCommitmentEncoder::new(32, 2048).expect("valid");
+        let enc = PerLeafCommitmentEncoder::new(32, 2048, 0).expect("valid");
         let dirty = enc.affected_shards_for_leaf(0, 4096);
         assert_eq!(dirty.len(), 1);
         assert!(dirty.contains(&2));
@@ -476,6 +512,116 @@ mod tests {
                 "per-node should dirty exactly 7 shards at entries_per_shard=2048; got != 7 for leaf {leaf}"
             );
         }
+    }
+
+    /// Drives the same path a chain event takes: `LogicalLeafStore::apply` on an
+    /// `AppendLeaf`, against the encoder `EncoderKind::build` returns at bootstrap.
+    #[test]
+    fn per_leaf_bc_dirty_shards_stay_inside_the_cell_it_declares() {
+        // Pinned to tree 1: this test feeds a tree-1 leaf, and an encoder pinned
+        // elsewhere would correctly dirty nothing, making the assertion vacuous.
+        let kind = EncoderKind::PerLeafBc { tree_number: 1 };
+        let entries_per_shard = 2048u32;
+        let encoder = kind.build(32, entries_per_shard).expect("build");
+        let cell_shards =
+            u32::try_from(kind.default_total_entries()).expect("cell fits u32") / entries_per_shard;
+
+        let mut store = LogicalLeafStore::new();
+        store
+            .apply(&append(1, 0, canonical(9)), 100, encoder.as_ref())
+            .expect("apply tree-1 leaf 0");
+
+        assert_eq!(
+            store.dirty_shards().iter().copied().collect::<Vec<u32>>(),
+            vec![0],
+            "a tree-1 leaf at index 0 occupies row 0 of shard 0, exactly as tree 0 does; \
+             the tree is not part of the row index because routing already scoped it"
+        );
+        let past_cell: Vec<u32> = store
+            .dirty_shards()
+            .iter()
+            .copied()
+            .filter(|s| *s >= cell_shards)
+            .collect();
+        assert!(
+            past_cell.is_empty(),
+            "dirty shards {past_cell:?} are past the {cell_shards} shards this encoder's \
+             declared cell holds, so re-encode could not fire for them"
+        );
+    }
+
+    #[test]
+    fn per_leaf_bc_still_dirties_the_shard_holding_its_own_tree() {
+        let encoder = EncoderKind::PerLeafBc { tree_number: 0 }
+            .build(32, 8)
+            .expect("build");
+        let mut store = LogicalLeafStore::new();
+        for leaf in 0..=8u32 {
+            let seed = u8::try_from(leaf).unwrap_or(255).saturating_add(1);
+            store
+                .apply(&append(0, leaf, canonical(seed)), 100, encoder.as_ref())
+                .expect("apply own-tree leaf");
+        }
+        assert_eq!(
+            store.dirty_shards().iter().copied().collect::<Vec<u32>>(),
+            vec![0, 1]
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn per_leaf_bc_dirty_shards_never_leave_the_declared_cell(
+            tree in 0u32..8,
+            leaf in 0u32..=u32::MAX,
+        ) {
+            let entries_per_shard = 2048u32;
+            let encoder = PerLeafCommitmentEncoder::new(32, entries_per_shard, 0).expect("bc");
+            // The bound is one tree's row space, not `default_total_entries` - that is a
+            // documented *recommendation* and `validate_total_entries` enforces it as a
+            // floor only, so using it as a ceiling asserts a limit no code applies.
+            let tree_shards = LEAVES_PER_TREE / entries_per_shard;
+            for shard in encoder.affected_shards_for_leaf(tree, leaf) {
+                proptest::prop_assert!(
+                    shard < tree_shards,
+                    "tree {tree} leaf {leaf} dirtied shard {shard}, outside the \
+                     {tree_shards} shards one tree's row space spans"
+                );
+                proptest::prop_assert_eq!(
+                    shard, leaf / entries_per_shard,
+                    "the row index is the leaf index alone; the tree is not part of it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_chain_tree_encoder_ignores_a_foreign_tree() {
+        // Uniform contract now that all three carry their tree. `per-leaf-bc` used to be
+        // the exception, and that exception WAS the O-011 regression: its rows are indexed
+        // by `leaf_index` alone, so an unfiltered foreign leaf overwrote this tree's row
+        // and the higher tree won.
+        let bc = PerLeafCommitmentEncoder::new(32, 2048, 0).expect("bc");
+        let path = PerLeafPathEncoder::new(PATH_RECORD_BYTES, 2048, 0).expect("path");
+        let node = PerNodeEncoder::new(2048, 0).expect("node");
+        for enc in [
+            &bc as &dyn PirTableEncoder,
+            &path as &dyn PirTableEncoder,
+            &node as &dyn PirTableEncoder,
+        ] {
+            assert!(
+                enc.affected_shards_for_leaf(1, 0).is_empty(),
+                "{} is pinned to tree 0 and must ignore tree 1",
+                enc.label()
+            );
+        }
+        // And the row index stays tree-local: the same leaf maps to the same shard under
+        // a pin to any tree.
+        let bc1 = PerLeafCommitmentEncoder::new(32, 2048, 1).expect("bc1");
+        assert_eq!(
+            bc1.affected_shards_for_leaf(1, 0),
+            bc.affected_shards_for_leaf(0, 0),
+            "the row index is the leaf index alone; only the filter differs"
+        );
     }
 
     #[test]
@@ -570,7 +716,7 @@ mod tests {
     fn per_node_materialize_shard_byte_identical_across_shards_and_levels() {
         let enc = PerNodeEncoder::new(8, 0).expect("valid");
         let mut store = LogicalLeafStore::new();
-        let bc_enc = PerLeafCommitmentEncoder::new(32, 8).expect("seed encoder");
+        let bc_enc = PerLeafCommitmentEncoder::new(32, 8, 0).expect("seed encoder");
         for i in 0..16u32 {
             let seed = u8::try_from(i).unwrap_or(255).saturating_add(1);
             store
@@ -664,7 +810,7 @@ mod tests {
 
     #[test]
     fn default_entries_for_returns_65536_for_leaf_keyed_family() {
-        let bc = EncoderKind::PerLeafBc;
+        let bc = EncoderKind::PerLeafBc { tree_number: 0 };
         let st = EncoderKind::PerListStatus { list_key: [0; 32] };
         let lp = EncoderKind::PerLeafPath { tree_number: 0 };
         let plp = EncoderKind::PerListPath { list_key: [0; 32] };
@@ -686,7 +832,7 @@ mod tests {
 
     #[test]
     fn default_concurrency_for_leaf_keyed_and_path() {
-        let bc = EncoderKind::PerLeafBc;
+        let bc = EncoderKind::PerLeafBc { tree_number: 0 };
         let st = EncoderKind::PerListStatus { list_key: [0; 32] };
         let lp = EncoderKind::PerLeafPath { tree_number: 0 };
         assert_eq!(default_concurrency_for(&bc), 4);
@@ -732,7 +878,7 @@ mod tests {
 
     #[test]
     fn validate_total_entries_accepts_path_family_at_leaves_per_tree() {
-        let bc = EncoderKind::PerLeafBc;
+        let bc = EncoderKind::PerLeafBc { tree_number: 0 };
         let lp = EncoderKind::PerLeafPath { tree_number: 0 };
         let plp = EncoderKind::PerListPath { list_key: [0; 32] };
         let st = EncoderKind::PerListStatus { list_key: [0; 32] };

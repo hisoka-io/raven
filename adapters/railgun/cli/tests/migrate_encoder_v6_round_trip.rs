@@ -37,7 +37,7 @@ fn encoder_for(kind: EncoderKind) -> Arc<dyn PirTableEncoder> {
 #[test]
 fn migrate_encoder_round_trip_preserves_logical_leaf_store() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let from_kind = EncoderKind::PerLeafBc;
+    let from_kind = EncoderKind::PerLeafBc { tree_number: 0 };
     let to_kind = EncoderKind::PerNode {
         tree_number: TREE_NUMBER,
     };

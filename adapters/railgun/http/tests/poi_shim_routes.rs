@@ -67,7 +67,7 @@ impl PirScheme for StubScheme {
 }
 
 fn encoder() -> PerLeafCommitmentEncoder {
-    PerLeafCommitmentEncoder::new(32, ENTRIES_PER_SHARD).expect("encoder")
+    PerLeafCommitmentEncoder::new(32, ENTRIES_PER_SHARD, 0).expect("encoder")
 }
 
 /// Zeroes in the high 16 bytes, `tag` in the low 16; stays below the BN254 field modulus.
@@ -348,6 +348,7 @@ async fn freshness_header_value_format_is_well_formed() {
         commits_fired: 5,
         reorgs_handled: 1,
         consumer_errors: 0,
+        consecutive_event_errors: 0,
     }));
 
     let (store, _) = seeded_store();

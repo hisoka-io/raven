@@ -146,7 +146,7 @@ fn setup_rejection_at_width(entry_size: usize) -> Option<String> {
 /// Evidence for the law. Ten production-parameter setups, minutes of wall time,
 /// so it is gated; the cheap tests above encode its result.
 #[test]
-#[ignore = "ten production-parameter PIR setups (~4 min); nightly production-cell lane runs it with --run-ignored all"]
+#[ignore = "ten production-parameter PIR setups (~4 min); the nightly production-cell-closure job runs it with --run-ignored all"]
 fn production_cell_width_ladder_is_empirically_correct() {
     for width in LEGAL_WIDTHS {
         let worst = worst_mismatch_at_width(width);

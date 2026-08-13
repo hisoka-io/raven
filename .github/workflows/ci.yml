@@ -47,6 +47,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo doc
         run: cargo doc --workspace --no-deps --all-features
+      # `cargo doc` builds examples; it never RUNS them. Doctests executed in no job,
+      # so a `# Errors`/example block could reference an API that no longer compiles
+      # and every lane stayed green. Measured 2026-08-11: root 4, adapter 7.
+      - name: cargo test --doc (root)
+        run: cargo test --workspace --doc
+      - name: cargo test --doc (railgun adapter)
+        run: |
+          cargo test --manifest-path adapters/railgun/Cargo.toml \
+            --workspace --doc --profile ci-test
 
   wasm:
     name: check + clippy (wasm32-unknown-unknown)
@@ -278,6 +287,25 @@ jobs:
             cargo_flags: "--features chaos-tests"
             nextest_profile: ci
             filter: "binary(wal_chaos_layer_b) + binary(snapshot_chaos_save_two_rename)"
+          # The 26 assertion-carrying `#[ignore]`d CLI tests ran in NO lane: the three
+          # `--run-ignored all` filters above are explicit binary lists that never named
+          # these. Measured 2026-08-11 with --no-fail-fast: 26 ignored, 14 green, 12 RED
+          # at HEAD (G-032). The twelve are excluded BY NAME, not by dropping their
+          # binaries, so a fix flips one line here instead of restoring a whole file.
+          # `production_cell_round_trip_and_batch_within_budget` is excluded for a
+          # DIFFERENT reason: it is a wall-clock budget (71.9 ms floor), and it measured
+          # 402 ms under lane load while passing at 19.9 s standalone. A deadline on a
+          # shared runner reds on machine speed, not on code.
+          - name: cli-ignored
+            packages: "-p raven-railgun-cli"
+            cargo_flags: ""
+            nextest_profile: ci
+            filter: "(binary(auto_spawn_shutdown) + binary(bootstrap_from_subsquid) + binary(multi_list_ppoi_dynamic) + binary(production_cell) + binary(serve_production_config_file) + binary(six_instance_integration) + binary(smart_policy_deferred) + binary(smart_policy_lifecycle)) - (test(tree_fill_threshold_pre_spawns_at_95_percent) + test(boundary_repair_three_seed_per_tree_bench) + test(synthetic_upstream_emits_new_list_key_spawns_two_instances) + test(concurrent_list_observed_bursts_dedupe_to_one_spawn_per_template_per_list_key) + test(restart_replay_picks_up_auto_spawned_ppoi_list_instances_from_spawn_log) + test(manifest_label_mismatch_refuses_boot_per_instance) + test(admin_drain_concurrent_with_auto_spawn_routes_consistently) + test(cooldown_seconds_refuses_back_to_back_spawns) + test(max_count_and_cooldown_compose) + test(max_instance_count_4_refuses_5th_spawn_loud) + test(synthetic_chain_drives_template_based_spawn_to_5_trees) + test(auto_spawned_consumers_drain_wal_on_sigterm) + test(production_cell_round_trip_and_batch_within_budget))"
+          - name: engine-ignored
+            packages: "-p raven-railgun-engine"
+            cargo_flags: ""
+            nextest_profile: ci
+            filter: "binary(engine_dedup_extends_to_encoder) + binary(offline_packing_keys_cache) + test(insert_rejects_overflow_past_capacity)"
           - name: closure
             packages: "-p raven-railgun-engine"
             cargo_flags: ""

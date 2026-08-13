@@ -87,7 +87,7 @@ fn build_six_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
         mk(
             "tree-0",
             "tree-0",
-            raven_railgun_engine::pir_table::EncoderKind::PerLeafBc,
+            raven_railgun_engine::pir_table::EncoderKind::PerLeafBc { tree_number: 0 },
             DataSourceFilter::ChainTreeNumber(0),
             VerificationMode::ChainRootHistory,
             InstanceRole::Static,
@@ -95,7 +95,7 @@ fn build_six_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
         mk(
             "tree-1",
             "tree-1",
-            raven_railgun_engine::pir_table::EncoderKind::PerLeafBc,
+            raven_railgun_engine::pir_table::EncoderKind::PerLeafBc { tree_number: 0 },
             DataSourceFilter::ChainTreeNumber(1),
             VerificationMode::ChainRootHistory,
             InstanceRole::Static,
@@ -103,7 +103,7 @@ fn build_six_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
         mk(
             "tree-2",
             "tree-2",
-            raven_railgun_engine::pir_table::EncoderKind::PerLeafBc,
+            raven_railgun_engine::pir_table::EncoderKind::PerLeafBc { tree_number: 0 },
             DataSourceFilter::ChainTreeNumber(2),
             VerificationMode::ChainRootHistory,
             InstanceRole::Static,
@@ -111,7 +111,7 @@ fn build_six_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
         mk(
             "tree-3-live",
             "tree-3",
-            raven_railgun_engine::pir_table::EncoderKind::PerLeafBc,
+            raven_railgun_engine::pir_table::EncoderKind::PerLeafBc { tree_number: 0 },
             DataSourceFilter::ChainTreeNumber(3),
             VerificationMode::ChainRootHistory,
             InstanceRole::Live,
@@ -119,7 +119,7 @@ fn build_six_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
         mk(
             "ppoi-list-a",
             "ppoi-a",
-            raven_railgun_engine::pir_table::EncoderKind::PerLeafBc,
+            raven_railgun_engine::pir_table::EncoderKind::PerLeafBc { tree_number: 0 },
             DataSourceFilter::PpoiList(lk_a),
             VerificationMode::UpstreamSignature,
             InstanceRole::Live,
@@ -127,7 +127,7 @@ fn build_six_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
         mk(
             "ppoi-list-b",
             "ppoi-b",
-            raven_railgun_engine::pir_table::EncoderKind::PerLeafBc,
+            raven_railgun_engine::pir_table::EncoderKind::PerLeafBc { tree_number: 0 },
             DataSourceFilter::PpoiList(lk_b),
             VerificationMode::UpstreamSignature,
             InstanceRole::Live,
