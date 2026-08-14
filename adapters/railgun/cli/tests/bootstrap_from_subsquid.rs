@@ -22,6 +22,7 @@ use raven_railgun_cli::bootstrap_subsquid::{
     PpoiEventsSource, RailwayPpoiClient, StowawayCarry, SubsquidLeavesSource,
 };
 use raven_railgun_engine::imt::Imt;
+use raven_railgun_engine::pir_table::EncoderKind;
 use std::sync::Arc;
 
 /// Covers live byte-identity, static membership, and the pruning branch.
@@ -226,6 +227,9 @@ fn cfg_for(tree_number: u32, dir: std::path::PathBuf) -> BootstrapTreeConfig {
         entries: 16,
         entry_bytes: 32,
         max_wall_mins: 5,
+        // A real caller builds the encoder from the tree it is bootstrapping; inheriting
+        // the default's tree-0 encoder is the mismatch `EncoderTreeMismatch` refuses.
+        encoder_kind: EncoderKind::PerLeafBc { tree_number },
         ..BootstrapTreeConfig::default()
     }
 }
@@ -555,6 +559,7 @@ fn cfg_for_boundary(tree_number: u32, dir: std::path::PathBuf) -> BootstrapTreeC
         max_wall_mins: 5,
         repair_trigger_threshold: 4,
         expected_filled_count: 8,
+        encoder_kind: EncoderKind::PerLeafBc { tree_number },
         ..BootstrapTreeConfig::default()
     }
 }
@@ -952,7 +957,6 @@ fn _arc_keep<T>(_x: Arc<T>) {}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_with_encoder_per_node_writes_correct_manifest_label() {
-    use raven_railgun_engine::pir_table::EncoderKind;
     let (rows, root) = synthetic_leaves(8);
     let leaves = StubLeaves::new(rows);
     let chain = StubChain::new(20_000_000, 99);

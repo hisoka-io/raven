@@ -341,6 +341,14 @@ fn register_prometheus_descriptions() {
         "raven_railgun_consumer_reorgs_handled",
         "Per-instance count of reorgs handled by the consumer"
     );
+    metrics::describe_gauge!(
+        "raven_railgun_consumer_last_applied_leaf_block",
+        "Per-instance height of the last block whose LEAVES were applied. Unlike          last_applied_block this is not advanced by an event that leaves the tree untouched"
+    );
+    metrics::describe_gauge!(
+        "raven_railgun_consumer_consecutive_event_errors",
+        "Per-instance length of the current consumer error run; the value /health/ready gates on"
+    );
     metrics::describe_counter!(
         "raven_railgun_sessions_established_total",
         "Lifetime count of sticky-session establishment events, labelled by instance"

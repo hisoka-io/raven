@@ -1,7 +1,8 @@
 //! Rust half of the cross-language Poseidon KAT.
 //!
-//! `tests/fixtures/poseidon_parity.txt` is the oracle for BOTH languages: this test and
-//! `sdk/tests/poseidon_parity.test.ts` assert against the same bytes, and neither
+//! `tests/fixtures/poseidon_parity.txt` is the ONE oracle for both languages: this test
+//! `include_str!`s it and `sdk/tests/poseidon_parity.test.ts` reads this same path, so
+//! there is no second copy to drift. Neither
 //! regenerates it. A KAT that regenerates on failure re-blesses the divergence it exists
 //! to catch. The TS and Rust Merkle roots must agree bit-for-bit, or a wallet verifies an
 //! auth path against a root the chain never held.

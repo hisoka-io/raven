@@ -629,7 +629,7 @@ fn discover_instances(root: &Path) -> anyhow::Result<Vec<DiscoveredInstance>> {
         let id = entry
             .file_name()
             .into_string()
-            .map_err(|os| anyhow!("non-UTF-8 instance dir name: {os:?}"))?;
+            .map_err(|os| anyhow!("non-UTF-8 instance dir name: {}", os.display()))?;
         if !seen.insert(id.clone()) {
             bail!("duplicate instance id: {id}");
         }
@@ -715,7 +715,7 @@ fn plan_instance(
             let name = e
                 .file_name()
                 .into_string()
-                .map_err(|os| anyhow!("non-UTF-8 archived WAL filename: {os:?}"))?;
+                .map_err(|os| anyhow!("non-UTF-8 archived WAL filename: {}", os.display()))?;
             let rel = format!("{WAL_DIR}/{WAL_ARCHIVED_DIR}/{name}");
             push_file(&mut files, entry, rel)?;
         }

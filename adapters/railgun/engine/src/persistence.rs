@@ -125,13 +125,18 @@ impl InspirePersistence {
     pub fn mark_layer2_divergent(&self) -> Result<()> {
         self::mark_layer2_divergent(self.instance_id.as_str());
         let path = self.layer2_divergent_marker_path();
-        std::fs::write(&path, self.instance_id.as_str()).map_err(|e| {
-            AdapterError::Internal(format!(
-                "layer2 divergence marker write failed at {}: {e}; a restart would \
-                 report ready with the tree still unrepaired",
-                path.display()
-            ))
-        })
+        // The marker's whole job is to survive a crash, and `open` re-reads it with
+        // `Path::exists()`, so what must be durable is the DIRECTORY ENTRY. A bare
+        // `fs::write` fsyncs neither the file nor the parent, so a power cut can lose
+        // the entry that was just reported as written.
+        crate::offline_packing_keys_cache::atomic_write(&path, self.instance_id.as_str().as_bytes())
+            .map_err(|e| {
+                AdapterError::Internal(format!(
+                    "layer2 divergence marker write failed at {}: {e}; a restart would \
+                     report ready with the tree still unrepaired",
+                    path.display()
+                ))
+            })
     }
 
     /// Drop this instance's divergence mark, in memory and on disk.
@@ -724,12 +729,31 @@ impl ConsumerMetrics {
 
     /// Record one successfully applied event: the height, the event count, and
     /// the end of any error run.
+    ///
+    /// Only for an event that MUTATED the tree. Clearing the error run is what
+    /// `/health/ready` gates on, so an event that leaves the tree untouched must use
+    /// [`Self::record_applied_non_tree_event`]: otherwise an unrelated log erases the
+    /// signal that leaf application is stuck, and the stall reads as resolved while
+    /// every later leaf still fails the contiguity guard.
     pub fn record_applied_event(&mut self, height: u64) {
         self.record_applied_block(height);
         self.events_processed = self.events_processed.saturating_add(1);
         self.consecutive_event_errors = 0;
     }
+
+    /// Record an event that advanced the chain cursor without touching the tree.
+    ///
+    /// Counts the event and the height, and deliberately leaves any error run intact.
+    pub fn record_applied_non_tree_event(&mut self, height: u64) {
+        self.record_applied_block(height);
+        self.events_processed = self.events_processed.saturating_add(1);
+    }
 }
+
+/// Bound on republishing a commit that lost the state swap to a concurrent session
+/// eviction. Each attempt is Arc clones plus a CAS, so the bound exists to turn a
+/// pathological ticker into a loud error rather than an unbounded spin.
+const SWAP_RETRY_ATTEMPTS: u32 = 4;
 
 /// Layer 2 verifier wiring threaded into [`run_consumer_task`].
 pub struct Layer2VerifierContext {
@@ -1183,12 +1207,12 @@ pub async fn run_consumer_task(
                     }
                     raven_railgun_core::RailgunEvent::Nullified { .. } => {
                         // No new leaves, so height only; never advances the resume floor.
-                        metrics.lock().record_applied_event(height);
+                        metrics.lock().record_applied_non_tree_event(height);
                         continue;
                     }
                     raven_railgun_core::RailgunEvent::Unshield { .. } => {
                         // Not a tree mutation, so height only.
-                        metrics.lock().record_applied_event(height);
+                        metrics.lock().record_applied_non_tree_event(height);
                         continue;
                     }
                 }
@@ -1475,6 +1499,62 @@ fn ensure_store_not_shorter_than_published(
     Ok(())
 }
 
+/// Publish a re-encoded database, retrying over a concurrent session-store swap.
+///
+/// The re-encode spans the whole per-shard loop while `heartbeat_session_eviction`
+/// publishes on a ticker with a derivation that is only Arc clones, so the eviction
+/// almost always wins and the expensive work is the work discarded. Surfacing that lost
+/// race as a data error abandons the block's remaining leaves, after which the contiguity
+/// guard refuses every later leaf for good.
+///
+/// # Errors
+/// Refuses without retrying when the published database is no longer the one this commit
+/// re-encoded from: another COMMIT won, and republishing these rows would drop its update.
+/// Refuses after [`SWAP_RETRY_ATTEMPTS`] losses to a session-store-only swap.
+fn publish_recommitted_state(
+    instance: &Arc<PirInstance<RavenInspireScheme>>,
+    derived_from: &Arc<super::Snapshot<RavenInspireScheme>>,
+    current: &Arc<super::inspire::InspireServerState>,
+    new_db: &Arc<raven_inspire::EncodedDatabase>,
+    height: u64,
+) -> Result<()> {
+    // `swap_state` takes `new_state` by value and drops it on refusal, so each attempt
+    // rebuilds it around the same `new_db`.
+    let mut published_from = Arc::clone(derived_from);
+    let mut attempt = 0u32;
+    loop {
+        let new_state = super::inspire::InspireServerState {
+            crs: Arc::clone(&published_from.state.crs),
+            encoded_db: Arc::clone(new_db),
+            cache: Arc::clone(&published_from.state.cache),
+            session_store: Arc::clone(&published_from.state.session_store),
+            variant: current.variant,
+            entry_size: current.entry_size,
+        };
+        match instance.swap_state(new_state, published_from.epoch.next()) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let fresh = instance.current_snapshot();
+                if !Arc::ptr_eq(&fresh.state.encoded_db, &current.encoded_db) {
+                    return Err(e);
+                }
+                attempt = attempt.saturating_add(1);
+                if attempt >= SWAP_RETRY_ATTEMPTS {
+                    return Err(AdapterError::Internal(format!(
+                        "commit at height {height} lost the state swap {attempt} times to a \
+                         concurrent publisher that changed only the session store. The \
+                         re-encoded rows are correct but could not be published. Operator: \
+                         a session-eviction ticker is contending with every commit on this \
+                         instance; raise session_eviction_interval_secs or lower the commit \
+                         cadence."
+                    )));
+                }
+                published_from = fresh;
+            }
+        }
+    }
+}
+
 fn drive_commit(
     instance: &Arc<PirInstance<RavenInspireScheme>>,
     persistence: &Arc<InspirePersistence>,
@@ -1515,7 +1595,6 @@ fn drive_commit(
     // second reference. State and epoch come from ONE load so the swap below can
     // refuse a derivation another writer has already superseded.
     let derived_from = instance.current_snapshot();
-    let derived_from_epoch = derived_from.epoch;
     let current = Arc::clone(&derived_from.state);
     let entries_per_shard = u32::try_from(
         current
@@ -1570,18 +1649,7 @@ fn drive_commit(
         }
     }
 
-    let new_state = super::inspire::InspireServerState {
-        crs: Arc::clone(&current.crs),
-        encoded_db: new_db,
-        cache: Arc::clone(&current.cache),
-        session_store: Arc::clone(&current.session_store),
-        variant: current.variant,
-        entry_size: current.entry_size,
-    };
-
-    // Derived from `current`, so the epoch must come from the same load; see
-    // `heartbeat_session_eviction`.
-    instance.swap_state(new_state, derived_from_epoch.next())?;
+    publish_recommitted_state(instance, &derived_from, &current, &new_db, height)?;
 
     let snapshot_state = instance.current_state();
     // Snapshot the store under-lock so it restores atomically with the state.
@@ -1733,6 +1801,89 @@ mod tests {
             snap.consumer_errors,
             u64::MAX,
             "saturating_add must not wrap"
+        );
+    }
+
+    /// Same shape, distinguishable session store, carrying the donor's database by Arc -
+    /// exactly what `heartbeat_session_eviction` publishes.
+    fn evicted_from(donor: &InspireServerState) -> InspireServerState {
+        InspireServerState {
+            crs: Arc::clone(&donor.crs),
+            encoded_db: Arc::clone(&donor.encoded_db),
+            cache: Arc::clone(&donor.cache),
+            session_store: Arc::new(crate::session_pool::BoundedSessionStore::new()),
+            variant: donor.variant,
+            entry_size: donor.entry_size,
+        }
+    }
+
+    /// A commit that loses the swap to a session eviction must republish, not fail.
+    ///
+    /// The re-encode spans the whole per-shard loop while the eviction ticker derives in
+    /// nanoseconds, so the eviction essentially always wins. Surfacing that as an error
+    /// abandons the block's remaining leaves and the contiguity guard then refuses every
+    /// later leaf permanently.
+    #[test]
+    fn a_commit_that_loses_the_swap_to_a_session_eviction_republishes() {
+        let state = build_toy_state().expect("toy state");
+        let inst = Arc::new(PirInstance::<RavenInspireScheme>::new(
+            InstanceId::new("swap-retry"),
+            crate::InstanceRole::Live,
+            state,
+        ));
+
+        // The commit captures its derivation.
+        let derived_from = inst.current_snapshot();
+        let current = Arc::clone(&derived_from.state);
+        let new_db = Arc::clone(&current.encoded_db);
+
+        // The eviction ticker wins the race while the re-encode is still running.
+        inst.swap_state(evicted_from(&current), derived_from.epoch.next())
+            .expect("the eviction publishes first");
+        let after_eviction = inst.current_epoch();
+
+        publish_recommitted_state(&inst, &derived_from, &current, &new_db, 4_242)
+            .expect("a commit that lost only to a session swap must republish");
+
+        assert!(
+            inst.current_epoch() > after_eviction,
+            "the republished commit must advance past the eviction that beat it"
+        );
+    }
+
+    /// But it must NOT republish over another COMMIT. Those rows were re-encoded from a
+    /// database that is no longer published, so republishing them drops that update.
+    #[test]
+    fn a_commit_that_loses_to_another_commit_is_refused_without_retrying() {
+        let state = build_toy_state().expect("toy state");
+        let inst = Arc::new(PirInstance::<RavenInspireScheme>::new(
+            InstanceId::new("swap-refuse"),
+            crate::InstanceRole::Live,
+            state,
+        ));
+
+        let derived_from = inst.current_snapshot();
+        let current = Arc::clone(&derived_from.state);
+        let new_db = Arc::clone(&current.encoded_db);
+
+        // A second commit publishes a DIFFERENT database, not just a new session store.
+        let rival_db = Arc::new((*current.encoded_db).clone());
+        let rival = InspireServerState {
+            crs: Arc::clone(&current.crs),
+            encoded_db: rival_db,
+            cache: Arc::clone(&current.cache),
+            session_store: Arc::clone(&current.session_store),
+            variant: current.variant,
+            entry_size: current.entry_size,
+        };
+        inst.swap_state(rival, derived_from.epoch.next())
+            .expect("the rival commit publishes first");
+
+        let err = publish_recommitted_state(&inst, &derived_from, &current, &new_db, 4_243)
+            .expect_err("republishing over another commit would drop its update");
+        assert!(
+            format!("{err}").contains("stale state swap"),
+            "the refusal must be the staleness one, not the retry-exhausted one; got: {err}"
         );
     }
 

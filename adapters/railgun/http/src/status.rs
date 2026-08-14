@@ -249,9 +249,21 @@ fn emit_instance_consumer_gauges(
     .set(to_f(snap.reorgs_handled));
     metrics::gauge!(
         "raven_railgun_consumer_errors",
-        "instance" => label
+        "instance" => label.clone()
     )
     .set(to_f(snap.consumer_errors));
+    // The two signals that stay honest when leaf application wedges: every other
+    // gauge here is advanced by any event, including ones that never touch the tree.
+    metrics::gauge!(
+        "raven_railgun_consumer_last_applied_leaf_block",
+        "instance" => label.clone()
+    )
+    .set(to_f(snap.last_applied_leaf_block));
+    metrics::gauge!(
+        "raven_railgun_consumer_consecutive_event_errors",
+        "instance" => label
+    )
+    .set(to_f(snap.consecutive_event_errors));
 }
 
 pub(crate) async fn health_live_handler() -> impl IntoResponse {

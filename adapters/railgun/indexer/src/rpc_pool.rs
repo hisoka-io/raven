@@ -148,6 +148,11 @@ pub struct RpcEndpoint {
     state: Mutex<EndpointState>,
     limiter: EndpointLimiter,
     provider: tokio::sync::OnceCell<Arc<dyn alloy::providers::Provider + Send + Sync>>,
+    /// Set once this endpoint has answered `eth_chainId` with the configured chain.
+    /// Per endpoint, not per pool: a pool-wide latch either fails every request when one
+    /// endpoint is unreachable, or latches success and lets that endpoint serve traffic
+    /// later without ever having been checked.
+    chain_id_verified: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for RpcEndpoint {
@@ -183,7 +188,20 @@ impl RpcEndpoint {
             state: Mutex::new(EndpointState::default()),
             limiter: RateLimiter::direct(quota),
             provider: tokio::sync::OnceCell::new(),
+            chain_id_verified: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Whether this endpoint has answered `eth_chainId` with the configured chain.
+    pub fn is_chain_id_verified(&self) -> bool {
+        self.chain_id_verified
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Admit this endpoint to selection. Called only after a matching `eth_chainId`.
+    pub fn mark_chain_id_verified(&self) {
+        self.chain_id_verified
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub fn url(&self) -> &str {
@@ -438,7 +456,6 @@ pub struct PooledRpcChainSource {
     pool: Arc<RpcEndpointPool>,
     railgun_proxy: alloy::primitives::Address,
     chain_id: u64,
-    chain_id_verified: tokio::sync::OnceCell<()>,
 }
 
 impl std::fmt::Debug for PooledRpcChainSource {
@@ -461,7 +478,6 @@ impl PooledRpcChainSource {
             pool,
             railgun_proxy,
             chain_id,
-            chain_id_verified: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -481,29 +497,54 @@ impl PooledRpcChainSource {
         self.pool.pinned_session().map_err(IndexerError::from)
     }
 
-    /// Verify EVERY endpoint's chain id, once.
+    /// Verify every endpoint's chain id before it may serve a request.
     ///
     /// Probing whichever endpoint `select_for_request` happened to return left the
     /// other n-1 unchecked while `run_with_pool` round-robins across all of them, so a
     /// foreign endpoint answered its share of `events_in_range` with `Ok(vec![])` and
     /// the worker advanced its cursor over the skipped range.
+    ///
+    /// A transport failure is NOT a verification failure. Propagating it aborted the whole
+    /// loop, so one unreachable endpoint took the indexer down and bypassed the pool's own
+    /// failover. Such an endpoint is marked errored and left unverified, which keeps it out
+    /// of `select_for_request`; it is re-probed here on a later call and admitted once it
+    /// answers. Only a real chain-id mismatch, or having nothing left to use, is fatal.
     async fn verify_chain_id_once(&self) -> Result<()> {
-        self.chain_id_verified
-            .get_or_try_init(|| async {
-                for endpoint in self.pool.endpoints() {
-                    let actual = self.probe_chain_id(endpoint).await?;
-                    if actual != self.chain_id {
-                        self.pool.mark_endpoint_error(endpoint, ErrorKind::Other);
-                        return Err(IndexerError::ChainIdMismatch {
-                            expected: self.chain_id,
-                            actual,
-                        });
-                    }
+        let mut verified = 0usize;
+        let mut unreachable: Vec<String> = Vec::new();
+        for endpoint in self.pool.endpoints() {
+            if endpoint.is_chain_id_verified() {
+                verified += 1;
+                continue;
+            }
+            match self.probe_chain_id(endpoint).await {
+                Ok(actual) if actual == self.chain_id => {
+                    endpoint.mark_chain_id_verified();
                     self.pool.mark_endpoint_success(endpoint);
+                    verified += 1;
                 }
-                Ok::<(), IndexerError>(())
-            })
-            .await?;
+                Ok(actual) => {
+                    self.pool.mark_endpoint_error(endpoint, ErrorKind::Other);
+                    return Err(IndexerError::ChainIdMismatch {
+                        expected: self.chain_id,
+                        actual,
+                    });
+                }
+                Err(e) => {
+                    self.pool.mark_endpoint_error(endpoint, ErrorKind::Network);
+                    unreachable.push(format!("{}: {e}", redact_url(endpoint.url())));
+                }
+            }
+        }
+        if verified == 0 {
+            return Err(IndexerError::Rpc(format!(
+                "no RPC endpoint could be verified against chain {}; every endpoint failed \
+                 its eth_chainId probe: [{}]. Operator: the pool cannot serve a request \
+                 until at least one endpoint answers with the configured chain id.",
+                self.chain_id,
+                unreachable.join("; ")
+            )));
+        }
         Ok(())
     }
 

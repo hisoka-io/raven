@@ -1,5 +1,7 @@
-# Advisory gate for every Raven workspace. Run per manifest:
-#   cargo deny --manifest-path <manifest> --all-features check -c deny.toml advisories
+# Supply-chain gate for every Raven workspace. Run per manifest:
+#   cargo deny --manifest-path <manifest> --all-features check -c deny.toml
+# No trailing subcommand: naming one restricts the run to it, which left
+# [licenses], [bans] and [sources] enforced by no job.
 #
 # Every `ignore` entry is accepted risk with a named retirement trigger. Adding
 # one is an owner decision, because the alternative - changing a dependency - is
@@ -20,7 +22,11 @@ ignore = [
 ]
 
 [bans]
-multiple-versions = "allow"
+# "allow" made this check a guaranteed pass. At "warn" it reports the current
+# 21 duplicate groups (root 3, adapters/railgun 12, examples/eth-state 6) as a
+# baseline without failing the build; tightening to "deny" needs those resolved
+# first, which is a dependency decision.
+multiple-versions = "warn"
 
 [licenses]
 version = 2
@@ -37,6 +43,14 @@ allow = [
   "CDLA-Permissive-2.0",
   "MPL-2.0",
   "BSL-1.0",
+  # Public-domain dedications, both FSF Free/Libre. Listed explicitly rather than
+  # by widening a wildcard, so a third one is still an owner decision.
+  # CC0-1.0 arrives via tiny-keccak, which raven-inspire uses for the IMT zero
+  # value, so it is on the production path.
+  "CC0-1.0",
+  # Unlicense arrives via ws_stream_wasm / async_io_stream / pharos under
+  # alloy-transport-ws, in the adapter only.
+  "Unlicense",
 ]
 
 [sources]

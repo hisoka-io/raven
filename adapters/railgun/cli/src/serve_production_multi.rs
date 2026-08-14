@@ -672,7 +672,11 @@ fn build_encoder_kind(
     list_key: Option<&str>,
 ) -> anyhow::Result<EncoderKind> {
     match kind {
-        EncoderString::PerLeafBc => Ok(EncoderKind::PerLeafBc { tree_number: 0 }),
+        EncoderString::PerLeafBc => {
+            let t = tree_number
+                .ok_or_else(|| anyhow::anyhow!("per-leaf-bc encoder requires `tree_number`"))?;
+            Ok(EncoderKind::PerLeafBc { tree_number: t })
+        }
         EncoderString::PerLeafPath => {
             let t = tree_number
                 .ok_or_else(|| anyhow::anyhow!("per-leaf-path encoder requires `tree_number`"))?;
@@ -743,12 +747,27 @@ fn enforce_encoder_matches_data_source(
 ) -> anyhow::Result<()> {
     match (encoder, data_source) {
         (
-            EncoderKind::PerLeafBc { .. }
-            | EncoderKind::PerLeafPath { .. }
-            | EncoderKind::PerNode { .. },
-            DataSourceFilter::ChainTreeNumber(_),
-        )
-        | (
+            EncoderKind::PerLeafBc { tree_number }
+            | EncoderKind::PerLeafPath { tree_number }
+            | EncoderKind::PerNode { tree_number },
+            DataSourceFilter::ChainTreeNumber(routed),
+        ) => {
+            // Matching the family alone lets a pin disagree with the routed tree. Every
+            // tree encoder drops foreign-tree events, so the mismatch is silent: the
+            // instance serves its own tree's rows at HTTP 200 and never updates.
+            anyhow::ensure!(
+                tree_number == *routed,
+                "encoder {} is pinned to tree {tree_number} but data_source routes tree \
+                 {routed} to this instance. The encoder drops every event for a tree other \
+                 than its own, so this instance would serve tree {tree_number}'s rows \
+                 unchanged at HTTP 200 while tree {routed} advanced. Operator: set the \
+                 instance's `tree_number` and its `data_source.filter.tree_number` to the \
+                 same tree.",
+                encoder.label()
+            );
+            Ok(())
+        }
+        (
             EncoderKind::PerListStatus { .. }
             | EncoderKind::PerListPath { .. }
             | EncoderKind::PerListNode { .. },
@@ -2286,6 +2305,75 @@ data_source = { kind = "mirror", list_key = "00000000000000000000000000000000000
         ));
     }
 
+    /// A tree-pinned encoder whose pin disagrees with the tree routed to it must be
+    /// refused at parse time. The encoder filters every foreign-tree event, so the
+    /// instance would serve its own tree's rows unchanged at HTTP 200 - no error, no
+    /// empty response, just a permanently stale tree wearing a healthy status.
+    #[test]
+    fn an_encoder_pinned_to_another_tree_than_its_data_source_is_refused() {
+        let body = &tree_mismatch_config(0, 3);
+        let f = write_temp_toml(body);
+        let err = load_options_from_toml(f.path())
+            .expect_err("a tree-0 encoder fed tree-3 events must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("pinned to tree 0") && msg.contains("routes tree 3"),
+            "the refusal must name both trees; got: {msg}"
+        );
+    }
+
+    /// The agreeing case must still parse, so the guard cannot be satisfied by
+    /// refusing every tree-pinned instance.
+    #[test]
+    fn an_encoder_pinned_to_the_tree_it_is_routed_still_parses() {
+        let body = &tree_mismatch_config(3, 3);
+        let f = write_temp_toml(body);
+        let opts = load_options_from_toml(f.path()).expect("matching trees must parse");
+        assert!(matches!(
+            opts.instances[0].encoder,
+            EncoderKind::PerNode { tree_number: 3 }
+        ));
+    }
+
+    /// `per-leaf-bc` indexes rows by `leaf_index` alone, so its pin is what keeps a
+    /// second tree out of the store. It must be validated like every other pinned kind.
+    #[test]
+    fn a_per_leaf_bc_encoder_pinned_to_another_tree_is_refused() {
+        let body = tree_mismatch_config(0, 3).replace("per-node", "per-leaf-bc");
+        let f = write_temp_toml(&body);
+        let err = load_options_from_toml(f.path())
+            .expect_err("a per-leaf-bc encoder pinned to tree 0 fed tree 3 must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("pinned to tree 0") && msg.contains("routes tree 3"),
+            "the refusal must name both trees; got: {msg}"
+        );
+    }
+
+    fn tree_mismatch_config(encoder_tree: u32, routed_tree: u32) -> String {
+        format!(
+            r#"
+[global]
+bind = "127.0.0.1:0"
+token = "test-token-padded-long-enough"
+rpc_url = "http://127.0.0.1:1"
+railgun_proxy = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
+chain_id = 1
+start_block = 0
+mirror_endpoint = "http://127.0.0.1:1"
+
+[[instance]]
+id = "tree-pin"
+role = "static"
+encoder = "per-node"
+tree_number = {encoder_tree}
+data_dir = "/tmp/raven-tree-pin"
+verification_mode = "chain-root-history"
+data_source = {{ kind = "indexer", filter = {{ tree_number = {routed_tree} }} }}
+"#
+        )
+    }
+
     #[test]
     fn placeholder_bearer_token_rejected_at_parse_time() {
         let body = r#"
@@ -2490,6 +2578,7 @@ record_size = 32
 id = "tree-0"
 role = "static"
 encoder = "per-leaf-bc"
+tree_number = 0
 data_dir = "/tmp/raven-tree-0"
 verification_mode = "chain-root-history"
 data_source = { kind = "indexer", filter = { tree_number = 0 } }

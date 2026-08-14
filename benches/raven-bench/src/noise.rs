@@ -246,7 +246,7 @@ mod tests {
     }
     impl NoiseValidatable for EveryNthSilentMismatch {
         fn run_trial(&self, input: TrialInput) -> TrialOutcome {
-            if self.n > 0 && input.trial_idx % self.n == 0 {
+            if self.n > 0 && input.trial_idx.is_multiple_of(self.n) {
                 TrialOutcome::SilentMismatch
             } else {
                 TrialOutcome::Correct

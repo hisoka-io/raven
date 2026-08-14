@@ -3,6 +3,12 @@ name = "eth-state"
 version = "0.1.0"
 edition = "2021"
 publish = false
+# Matches every other manifest in the tree and the root LICENSE. Without it
+# cargo-deny reports error[unlicensed] and this was the one manifest of 26
+# missing the key.
+license = "Apache-2.0"
+# Matches the root workspace floor; this was the only manifest declaring none.
+rust-version = "1.89"
 
 # Detached workspace: kept OUT of the root [members] so the demo's native
 # ingestion deps never enter the wasm-clean client path, and so the demo cannot

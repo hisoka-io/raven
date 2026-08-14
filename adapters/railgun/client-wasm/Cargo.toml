@@ -4,7 +4,9 @@
 name = "raven-inspire-client-wasm"
 version = "0.1.0-alpha.0"
 edition = "2021"
-rust-version = "1.85"
+# 1.89: this tree depends on raven-inspire, which declares that floor, and cargo
+# enforces a dependency's rust-version.
+rust-version = "1.89"
 authors = ["Raven contributors"]
 license = "Apache-2.0"
 publish = false

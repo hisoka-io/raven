@@ -62,6 +62,14 @@ pub enum BootstrapError {
     BigintDecode { index: usize, reason: String },
     #[error("Subsquid pagination produced {observed} leaves; expected {expected}")]
     PartialLeafCount { observed: usize, expected: usize },
+    #[error(
+        "encoder is pinned to tree {encoder_tree} but this bootstrap is for tree {cfg_tree}; \
+         the encoder's tree is stamped into the manifest and decides which rows the \
+         instance serves, so bootstrapping would publish tree {cfg_tree}'s leaves under \
+         tree {encoder_tree}'s identity. Operator: build the encoder from the tree being \
+         bootstrapped."
+    )]
+    EncoderTreeMismatch { encoder_tree: u32, cfg_tree: u32 },
     #[error("RPC unreachable: {0}")]
     RpcUnreachable(String),
     #[error(
@@ -530,12 +538,31 @@ pub async fn bootstrap_one_tree(
 
 /// Bootstrap one tree threading a shared [`StowawayCarry`]. Trees MUST be
 /// visited in ascending order so a stowaway lands before its target tree pages.
+/// Refuse a config whose encoder is pinned to a different tree than the one being
+/// bootstrapped.
+///
+/// `encoder_kind` is stamped into the manifest and `BootstrapTreeConfig` carries the tree
+/// separately, so `{ tree_number: N, ..default() }` silently keeps the default encoder's
+/// tree. Compare rather than derive: deriving would hide the caller's mistake.
+fn ensure_encoder_matches_tree(cfg: &BootstrapTreeConfig) -> Result<(), BootstrapError> {
+    match cfg.encoder_kind.chain_tree_number() {
+        Some(encoder_tree) if encoder_tree != cfg.tree_number => {
+            Err(BootstrapError::EncoderTreeMismatch {
+                encoder_tree,
+                cfg_tree: cfg.tree_number,
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
 pub async fn bootstrap_one_tree_with_carry(
     cfg: &BootstrapTreeConfig,
     leaves_src: &dyn SubsquidLeavesSource,
     chain: &dyn ChainOracle,
     carry: &mut StowawayCarry,
 ) -> Result<BootstrapTreeReport, BootstrapError> {
+    ensure_encoder_matches_tree(cfg)?;
     let started = Instant::now();
     let budget = Duration::from_secs(cfg.max_wall_mins.saturating_mul(60).max(1));
     let head = chain.chain_head().await?;

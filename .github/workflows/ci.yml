@@ -91,9 +91,13 @@ jobs:
         run: adapters/railgun/scripts/check-hygiene.sh
       - name: check-repo-hygiene
         run: scripts/check-repo-hygiene.sh
+      - name: check-layering
+        # Two-repo doctrine: no application vocabulary in crates/, and no framework
+        # crate depending on an adapter. Nothing enforced this before.
+        run: scripts/check-layering.sh
 
   advisories:
-    name: cargo-deny advisories (every workspace)
+    name: cargo-deny full check (every workspace)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -103,14 +107,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-deny
         run: cargo install cargo-deny --version ^0.19 --locked
-      - name: check advisories
+      - name: check advisories, licences, bans and sources
         # detached workspaces are invisible to the root graph, so each manifest
         # is gated separately. deny.toml carries the accepted-risk ignores.
+        # No trailing subcommand: naming one silently drops the other checks.
         run: |
           set -euo pipefail
           for manifest in \
             Cargo.toml \
             adapters/railgun/Cargo.toml \
+            adapters/railgun/client-wasm/Cargo.toml \
             crates/inspire/Cargo.toml \
             crates/isimplepir/Cargo.toml \
             crates/binary-fuse-filter/Cargo.toml \
@@ -120,7 +126,7 @@ jobs:
             tools/bench-compare/Cargo.toml
           do
             echo "::group::cargo-deny $manifest"
-            cargo deny --manifest-path "$manifest" --all-features check -c deny.toml advisories
+            cargo deny --manifest-path "$manifest" --all-features check -c deny.toml
             echo "::endgroup::"
           done
 

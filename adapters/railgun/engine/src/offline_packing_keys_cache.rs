@@ -202,7 +202,8 @@ impl OfflinePackingKeysCache {
             offline_keys: offline_keys.clone(),
         };
         let bytes = bincode::serialize(&file)?;
-        atomic_write(&self.path, &bytes)
+        atomic_write(&self.path, &bytes)?;
+        Ok(())
     }
 
     /// Load, or run `build_fresh` and persist. The flag is `true` on a disk hit.
@@ -249,7 +250,15 @@ pub enum CacheBuildError<E> {
     Cache(#[from] OfflinePackingKeysCacheError),
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), OfflinePackingKeysCacheError> {
+/// Write to `path.tmp`, fsync, rename, fsync parent.
+///
+/// The parent fsync is what makes the rename durable: without it a crash can lose the
+/// directory entry even though the file's own bytes were synced. Callers that only ever
+/// check `Path::exists()` depend on that entry, not on the contents.
+///
+/// # Errors
+/// Any I/O failure while creating, syncing, renaming, or fsyncing the parent.
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cache path has no parent"))?;
@@ -272,15 +281,15 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), OfflinePackingKeysCache
     Ok(())
 }
 
-fn fsync_parent(parent: &Path) -> Result<(), OfflinePackingKeysCacheError> {
+fn fsync_parent(parent: &Path) -> io::Result<()> {
     match File::open(parent) {
         Ok(dir) => match dir.sync_all() {
             Ok(()) => Ok(()),
             Err(err) if err.raw_os_error() == Some(libc_einval()) => Ok(()),
-            Err(err) => Err(OfflinePackingKeysCacheError::Io(err)),
+            Err(err) => Err(err),
         },
         Err(err) if err.kind() == io::ErrorKind::PermissionDenied => Ok(()),
-        Err(err) => Err(OfflinePackingKeysCacheError::Io(err)),
+        Err(err) => Err(err),
     }
 }
 

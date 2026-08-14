@@ -21,7 +21,10 @@ exclude = [
 [workspace.package]
 version = "0.1.0-alpha.0"
 edition = "2021"
-rust-version = "1.85"
+# 1.89, not a lower figure: crates/client depends on raven-inspire, which declares
+# rust-version = "1.89", and cargo enforces a dependency's floor. A lower number here
+# describes a toolchain on which this workspace cannot build.
+rust-version = "1.89"
 authors = ["The Raven Authors"]
 license = "Apache-2.0"
 repository = "https://github.com/hisoka-io/raven"

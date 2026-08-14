@@ -75,7 +75,7 @@ pub struct AutoSpawnRuntime {
 impl AutoSpawnRuntime {
     pub fn resolve_encoder(&self, t: u32) -> anyhow::Result<EncoderKind> {
         match self.encoder.as_str() {
-            "per-leaf-bc" => Ok(EncoderKind::PerLeafBc { tree_number: 0 }),
+            "per-leaf-bc" => Ok(EncoderKind::PerLeafBc { tree_number: t }),
             "per-leaf-path" => Ok(EncoderKind::PerLeafPath { tree_number: t }),
             "per-node" => Ok(EncoderKind::PerNode { tree_number: t }),
             other => anyhow::bail!(

@@ -22,7 +22,7 @@ fn parse_hex(s: &str) -> Vec<u8> {
         return Vec::new();
     }
     assert!(
-        s.len() % 2 == 0,
+        s.len().is_multiple_of(2),
         "hex payload must be even length, got {}",
         s.len()
     );

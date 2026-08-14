@@ -1,9 +1,10 @@
 // TypeScript half of the cross-language Poseidon KAT.
 //
-// `tests/fixtures/poseidon_parity.txt` is the oracle for BOTH languages: this file and
-// `adapters/railgun/poseidon/tests/parity_kat.rs` assert against the same bytes, and
-// neither regenerates it. A KAT that regenerates on failure re-blesses the divergence it
-// exists to catch.
+// The oracle is a SINGLE file, read by both languages from its one canonical location:
+// `adapters/railgun/poseidon/tests/fixtures/poseidon_parity.txt`. This test and
+// `adapters/railgun/poseidon/tests/parity_kat.rs` open the same bytes on disk, and neither
+// regenerates it. A KAT that regenerates on failure re-blesses the divergence it exists to
+// catch, and two copies of the oracle can drift while each side stays green against its own.
 //
 // This matters because the SDK folds auth-path siblings into a root IN TYPESCRIPT and
 // verifies it against a root the CHAIN produced via the Rust IMT. Any divergence means a
@@ -19,7 +20,10 @@ import { describe, expect, it } from "vitest";
 import { foldMerkleRoot, hashLeftRight } from "../src/poseidon";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const FIXTURE = readFileSync(join(HERE, "fixtures", "poseidon_parity.txt"), "utf8");
+const FIXTURE = readFileSync(
+  join(HERE, "..", "..", "poseidon", "tests", "fixtures", "poseidon_parity.txt"),
+  "utf8",
+);
 
 function rows(tag: string): string[][] {
   return FIXTURE.split("\n")

@@ -73,7 +73,7 @@ impl Checkpoint {
 
 fn parse_target(label: &str, tree_number: u32) -> Result<EncoderKind, String> {
     match label {
-        "per-leaf-bc" => Ok(EncoderKind::PerLeafBc { tree_number: 0 }),
+        "per-leaf-bc" => Ok(EncoderKind::PerLeafBc { tree_number }),
         "per-leaf-path" => Ok(EncoderKind::PerLeafPath { tree_number }),
         "per-node" => Ok(EncoderKind::PerNode { tree_number }),
         other => Err(format!("unsupported --target {other}")),

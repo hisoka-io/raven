@@ -115,7 +115,7 @@ enum Commands {
         /// Per-instance encoder label (per-leaf-bc, per-leaf-path, per-node, per-list-status, per-list-path).
         #[arg(long, default_value = "per-leaf-bc")]
         encoder: String,
-        /// Tree number for chain encoders (ignored for per-leaf-bc and per-list-* variants).
+        /// Tree this instance's chain encoder is pinned to (ignored for per-list-* variants).
         #[arg(long, default_value_t = 0)]
         tree_number: u32,
         /// WebSocket RPC URL; overrides the TOML `ws_endpoint`. Multi-instance
@@ -620,7 +620,7 @@ fn parse_encoder_kind(
 ) -> anyhow::Result<raven_railgun_engine::pir_table::EncoderKind> {
     use raven_railgun_engine::pir_table::EncoderKind;
     match encoder {
-        "per-leaf-bc" => Ok(EncoderKind::PerLeafBc { tree_number: 0 }),
+        "per-leaf-bc" => Ok(EncoderKind::PerLeafBc { tree_number }),
         "per-leaf-path" => Ok(EncoderKind::PerLeafPath { tree_number }),
         "per-node" => Ok(EncoderKind::PerNode { tree_number }),
         "per-list-status" => Ok(EncoderKind::PerListStatus {
@@ -759,7 +759,7 @@ impl ChainEncoderFamily {
     fn for_tree(self, tree_number: u32) -> raven_railgun_engine::pir_table::EncoderKind {
         use raven_railgun_engine::pir_table::EncoderKind;
         match self {
-            Self::PerLeafBc => EncoderKind::PerLeafBc { tree_number: 0 },
+            Self::PerLeafBc => EncoderKind::PerLeafBc { tree_number },
             Self::PerLeafPath => EncoderKind::PerLeafPath { tree_number },
             Self::PerNode => EncoderKind::PerNode { tree_number },
         }
