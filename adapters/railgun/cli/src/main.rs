@@ -931,6 +931,7 @@ async fn run_bootstrap_from_subsquid(opts: BootstrapFromSubsquidOptions) -> anyh
                 use raven_railgun_cli::bootstrap_chainalysis::ChainalysisOnChainOracleSource;
                 let chainalysis = ChainalysisOnChainOracleSource::new_live(
                     Arc::clone(&pool),
+                    opts.chain_id,
                     opts.chainalysis_oracle,
                     opts.chainalysis_block_start,
                     None,

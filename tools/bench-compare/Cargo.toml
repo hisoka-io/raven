@@ -11,10 +11,15 @@
 name = "bench-compare"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+# 1.89 because this crate now shares the canonical bench schema with raven-bench,
+# which inherits the workspace floor. One definition beats two plus a parity test.
+rust-version = "1.89"
 license = "Apache-2.0"
 description = "Compare two raven bench JSON outputs and flag regressions."
 publish = false
+
+[dependencies.raven-bench]
+path = "../../benches/raven-bench"
 
 [lib]
 name = "bench_compare"
@@ -30,6 +35,7 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
+serde_json = "1"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"

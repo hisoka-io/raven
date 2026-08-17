@@ -50,6 +50,10 @@ pub struct SyntheticShieldRow {
 #[derive(Clone)]
 pub struct ChainalysisOnChainOracleSource {
     pool: Option<Arc<RpcEndpointPool>>,
+    /// Required in live mode: an endpoint will not hand back a provider without the chain
+    /// it is expected to be on. Carrying it here is what makes verification expressible
+    /// from this path at all.
+    chain_id: u64,
     oracle_addr: Address,
     block_start: u64,
     block_end: Option<u64>,
@@ -78,12 +82,14 @@ impl ChainalysisOnChainOracleSource {
     /// Live-RPC constructor.
     pub fn new_live(
         pool: Arc<RpcEndpointPool>,
+        chain_id: u64,
         oracle_addr: Address,
         block_start: u64,
         block_end: Option<u64>,
     ) -> Self {
         Self {
             pool: Some(pool),
+            chain_id,
             oracle_addr,
             block_start,
             block_end,
@@ -102,6 +108,7 @@ impl ChainalysisOnChainOracleSource {
     ) -> Self {
         Self {
             pool: None,
+            chain_id: 0,
             oracle_addr,
             block_start: 0,
             block_end: None,
@@ -161,7 +168,7 @@ impl ChainalysisOnChainOracleSource {
             .map_err(|e| BootstrapError::PpoiUnreachable(format!("rpc pool pin: {e}")))?;
         let provider = session
             .endpoint()
-            .provider()
+            .verified_provider(self.chain_id)
             .await
             .map_err(|e| BootstrapError::PpoiUnreachable(format!("provider: {e}")))?;
         let last_block = if let Some(b) = self.block_end {

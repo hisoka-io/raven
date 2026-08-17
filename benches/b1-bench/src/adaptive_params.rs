@@ -76,7 +76,7 @@ pub fn derive_medium_payload(inputs: &AdaptiveInputs) -> AdaptiveDerivation {
     let num_tiles_log2 = num_tiles.ceil().log2().ceil() as usize;
 
     let log_factor = inputs.performance_factor.trailing_zeros() as usize;
-    let (nu_1, nu_2) = if num_tiles_log2 % 2 == 0 {
+    let (nu_1, nu_2) = if num_tiles_log2.is_multiple_of(2) {
         (
             (num_tiles_log2 / 2).saturating_add(log_factor),
             (num_tiles_log2 / 2).saturating_sub(log_factor),

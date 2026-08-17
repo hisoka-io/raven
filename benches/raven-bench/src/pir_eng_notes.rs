@@ -141,6 +141,7 @@ mod tests {
             client_ms_median: None,
             throughput_qps_per_core: 793.65,
             measured_queries: 256,
+            samples: crate::BenchSamples::default(),
         }
     }
 

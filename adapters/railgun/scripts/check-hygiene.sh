@@ -27,17 +27,21 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SOURCE_DIRS=(
-  "${ROOT}/core"
-  "${ROOT}/engine"
-  "${ROOT}/persistence"
-  "${ROOT}/indexer"
-  "${ROOT}/ppoi-mirror"
-  "${ROOT}/http"
-  "${ROOT}/cli"
-  "${ROOT}/poseidon"
-  "${ROOT}/client-wasm"
+# Derived from the workspace members, never hand-maintained. The previous literal list had
+# drifted: `mock-ppoi` is a member and is CI-gated (ci.yml:198) yet was never scanned. A gate
+# whose scope is a copy of another file's list stops covering the thing it names.
+mapfile -t SOURCE_DIRS < <(
+  sed -n '/^members = \[/,/\]/p' "${ROOT}/Cargo.toml" \
+    | grep -oE '"[^"]+"' | tr -d '"' | sed "s|^|${ROOT}/|"
 )
+# `client-wasm` declares its own workspace, so it is not a member and must be added by name.
+SOURCE_DIRS+=("${ROOT}/client-wasm")
+
+if [[ ${#SOURCE_DIRS[@]} -lt 2 ]]; then
+  echo "check-hygiene.sh: derived only ${#SOURCE_DIRS[@]} source dir(s) from the workspace members." >&2
+  echo "  An empty or near-empty scope is a broken gate, not a clean tree." >&2
+  exit 2
+fi
 
 # Patterns are intentionally word-boundary-anchored to avoid catching
 # legitimate identifier substrings (e.g. "M19" inside an arbitrary
@@ -61,29 +65,42 @@ CI_PATTERNS=(
 
 found_any=0
 
+# `if matches=$(grep ...)` treats an INVALID PATTERN as "no matches": grep exits 2, the `if` is
+# false, and a broken regex is indistinguishable from a clean tree. Branch on the status
+# instead - 0 is a hit, 1 is clean, anything else is a broken gate.
+scan_dir() { # dir pattern extra-flags
+  local dir="$1" pat="$2" extra="$3" out rc
+  if [[ -n "$extra" ]]; then
+    out="$(grep -rEn "$extra" "$pat" "$dir" --include='*.rs')"
+  else
+    out="$(grep -rEn "$pat" "$dir" --include='*.rs')"
+  fi
+  rc=$?
+  case "$rc" in
+    0)
+      echo "HYGIENE LEAK matching '$pat':"
+      echo "$out"
+      echo
+      return 1
+      ;;
+    1) return 0 ;;
+    *)
+      echo "check-hygiene.sh: grep exited $rc on pattern '$pat' in $dir." >&2
+      echo "  A broken gate is not a clean tree." >&2
+      exit 2
+      ;;
+  esac
+}
+
 for dir in "${SOURCE_DIRS[@]}"; do
   if [[ ! -d "$dir" ]]; then
     continue
   fi
   for pat in "${PATTERNS[@]}"; do
-    if matches=$(grep -rEn "$pat" "$dir" --include='*.rs' 2>/dev/null); then
-      if [[ -n "$matches" ]]; then
-        echo "HYGIENE LEAK matching '$pat':"
-        echo "$matches"
-        echo
-        found_any=1
-      fi
-    fi
+    scan_dir "$dir" "$pat" "" || found_any=1
   done
   for pat in "${CI_PATTERNS[@]}"; do
-    if matches=$(grep -rEni "$pat" "$dir" --include='*.rs' 2>/dev/null); then
-      if [[ -n "$matches" ]]; then
-        echo "HYGIENE LEAK matching '$pat' (case-insensitive):"
-        echo "$matches"
-        echo
-        found_any=1
-      fi
-    fi
+    scan_dir "$dir" "$pat" "-i" || found_any=1
   done
 done
 

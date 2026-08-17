@@ -89,12 +89,16 @@ jobs:
           submodules: recursive
       - name: check-hygiene
         run: adapters/railgun/scripts/check-hygiene.sh
+      - name: adapter hygiene red-proof
+        run: adapters/railgun/scripts/check-hygiene-selftest.sh
       - name: check-repo-hygiene
         run: scripts/check-repo-hygiene.sh
       - name: check-layering
         # Two-repo doctrine: no application vocabulary in crates/, and no framework
         # crate depending on an adapter. Nothing enforced this before.
         run: scripts/check-layering.sh
+      - name: check-layering red-proof
+        run: scripts/check-layering-selftest.sh
 
   advisories:
     name: cargo-deny full check (every workspace)
@@ -581,6 +585,84 @@ jobs:
         run: cargo check --manifest-path tools/bench-compare/Cargo.toml --all-targets
       - name: cargo test
         run: cargo test --manifest-path tools/bench-compare/Cargo.toml
+      # The gate ships with its red-proof. Phase 1 runs --report-only, so CI never
+      # observes the blocking path; without this, the day --report-only is removed is the
+      # first time anyone learns whether the gate can fail at all.
+      - name: bench gate red-proof
+        run: scripts/bench-gate-selftest.sh
+
+  msrv:
+    name: MSRV (declared floor actually builds)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # Pinned, not `stable`. Every other job floats, so a declared `rust-version` was
+      # verified by nothing: the floor could drift below what the code needs and the only
+      # signal would be an external contributor's build failing. It has already bitten in the
+      # other direction - a floor declared BELOW the real one silently suppresses
+      # MSRV-gated clippy lints, and a newer stable then reddens main with lints nobody could
+      # see locally.
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - name: assert every declared floor matches the pinned toolchain
+        run: |
+          set -euo pipefail
+          PINNED=1.89
+          bad=0
+          while IFS= read -r line; do
+            file="${line%%:*}"
+            ver="$(printf '%s' "$line" | grep -oE '"[0-9]+\.[0-9]+(\.[0-9]+)?"' | tr -d '"')"
+            case "$file" in
+              # Genuinely lower: its dependency closure is entirely external.
+              crates/binary-fuse-filter/Cargo.toml) continue ;;
+            esac
+            if [ "$ver" != "$PINNED" ]; then
+              echo "MSRV DRIFT: $file declares $ver, the pinned toolchain is $PINNED"
+              bad=1
+            fi
+          done < <(git grep -n '^rust-version = ' -- '*/Cargo.toml' 'Cargo.toml')
+          [ "$bad" -eq 0 ] || { echo "A declared floor no job builds at is a claim, not a guarantee."; exit 1; }
+          echo "every declared rust-version matches the pinned toolchain"
+      - name: build at the declared floor
+        run: |
+          set -euo pipefail
+          for m in Cargo.toml adapters/railgun/Cargo.toml benches/b1-bench/Cargo.toml \
+                   benches/b2-bench/Cargo.toml crates/isimplepir/Cargo.toml \
+                   examples/eth-state/Cargo.toml tools/bench-compare/Cargo.toml; do
+            echo "::group::cargo check --manifest-path $m"
+            if [ "$m" = "benches/b1-bench/Cargo.toml" ]; then
+              cargo check --manifest-path "$m" --features inspire --all-targets
+            else
+              cargo check --manifest-path "$m" --all-targets
+            fi
+            echo "::endgroup::"
+          done
+
+  bench-gate:
+    name: bench regression gate (report-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Report-only until the runner's own noise floor is measured: the thresholds were
+      # derived on a quiet local machine, and a threshold below the runner's noise floor
+      # flakes on noise while still missing real shifts. DECISIONS.md B-033 carries the
+      # trigger for re-ruling them.
+      - name: run bench gate
+        run: scripts/bench-gate.sh
+      - name: upload bench artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-gate-${{ github.sha }}
+          path: target/bench-gate/**/*.json
+          if-no-files-found: warn
 
   sdk-tests:
     # fresh-clone gate: SDK depends on the gitignored wasm-pack output,

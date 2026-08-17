@@ -3785,6 +3785,7 @@ dependencies = [
  "alloy",
  "async-trait",
  "axum",
+ "futures-util",
  "governor",
  "metrics",
  "metrics-util 0.20.3",
@@ -3797,6 +3798,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
 ]
 

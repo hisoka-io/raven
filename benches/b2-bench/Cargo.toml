@@ -6,7 +6,11 @@
 name = "raven-b2-bench"
 version = "0.1.0-alpha.0"
 edition = "2021"
-rust-version = "1.85"
+# 1.89, not 1.85: this crate depends on raven-bench (workspace floor 1.89) and on
+# raven-isimplepir (1.89), so a 1.85 toolchain cannot resolve it. A declared MSRV below the
+# real one is not merely wrong, it is load-bearing in the wrong direction - clippy is
+# MSRV-aware and silently suppresses lints it thinks the floor cannot express.
+rust-version = "1.89"
 authors = ["The Raven Authors"]
 license = "Apache-2.0"
 description = "Baseline bench harness driving raven-isimplepir against the PSE 3x3 grid."

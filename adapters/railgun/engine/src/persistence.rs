@@ -1534,6 +1534,13 @@ fn publish_recommitted_state(
         match instance.swap_state(new_state, published_from.epoch.next()) {
             Ok(()) => return Ok(()),
             Err(e) => {
+                // Classify by the error, not by pointer identity. `swap_state` refuses a
+                // shape mismatch before its CAS, so nothing swapped and the pointers stay
+                // equal: the identity test reads a geometry refusal as contention and
+                // buries it under retries that cannot help.
+                if matches!(e, AdapterError::StateShapeMismatch { .. }) {
+                    return Err(e);
+                }
                 let fresh = instance.current_snapshot();
                 if !Arc::ptr_eq(&fresh.state.encoded_db, &current.encoded_db) {
                     return Err(e);
@@ -1735,6 +1742,266 @@ mod tests {
         assert_eq!(m.last_applied_leaf_block, 42);
     }
 
+    // The two recorders differ in exactly one observable, and `/health/ready` gates on it.
+    // Held over arbitrary error runs and heights: the defect guarded here is a non-tree
+    // event ending an error run that leaf application is still stuck in, so the stall reads
+    // as resolved while every later leaf fails the contiguity guard.
+    proptest::proptest! {
+        #[test]
+        fn a_non_tree_event_advances_height_without_clearing_the_error_run(
+            errors in 1u64..64,
+            start_height in 0u64..30_000_000,
+            step in 1u64..1_000_000,
+        ) {
+            let height = start_height.saturating_add(step);
+            let base = ConsumerMetrics {
+                last_applied_leaf_block: start_height,
+                consecutive_event_errors: errors,
+                ..ConsumerMetrics::default()
+            };
+
+            let mut non_tree = base;
+            non_tree.record_applied_non_tree_event(height);
+            proptest::prop_assert_eq!(
+                non_tree.last_applied_block, height,
+                "a non-tree event still advances the chain cursor"
+            );
+            proptest::prop_assert_eq!(
+                non_tree.events_processed, base.events_processed + 1,
+                "and is still counted as an applied event"
+            );
+            proptest::prop_assert_eq!(
+                non_tree.last_applied_leaf_block, start_height,
+                "but it must NOT advance the resume floor: no leaves were applied"
+            );
+            proptest::prop_assert_eq!(
+                non_tree.consecutive_event_errors, errors,
+                "and it must NOT clear the error run /health/ready gates on"
+            );
+
+            // The contrast is the whole point: a tree mutation DOES clear it.
+            let mut tree = base;
+            tree.record_applied_event(height);
+            proptest::prop_assert_eq!(
+                tree.consecutive_event_errors, 0,
+                "a real tree mutation ends the error run"
+            );
+            proptest::prop_assert_eq!(
+                tree.last_applied_block, height,
+                "and advances the chain cursor too"
+            );
+        }
+    }
+
+    /// The routing, not the recorders: which arm calls which.
+    ///
+    /// The property test above proves the two recorders differ, and it passes even if the
+    /// `Nullified` arm is rewired to the wrong one - reverting `:1210` leaves all 318
+    /// engine tests green. That is a proxy assertion: it checks the correlate instead of
+    /// the observable. This drives a real `Nullified` through `run_consumer_task` and
+    /// asserts the error run the health gate reads actually survives it.
+    #[tokio::test]
+    async fn a_nullified_event_does_not_clear_a_leaf_stall_through_the_consumer() {
+        const STALLED_RUN: u64 = 3;
+        const NULLIFIED_HEIGHT: u64 = 2_000;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_toy_state().expect("toy state");
+        let layout = StoreLayout::open(dir.path()).expect("layout");
+        let opened = InspirePersistence::open(
+            layout,
+            SCHEME_TAG,
+            InstanceId::new("nullified-routing"),
+            SnapshotPolicy::default(),
+            test_encoder(),
+        )
+        .expect("open");
+        let persistence = Arc::new(opened.persistence);
+
+        let instance = Arc::new(PirInstance::<RavenInspireScheme>::new(
+            InstanceId::new("nullified-routing"),
+            crate::InstanceRole::Live,
+            state,
+        ));
+        let logical_store = Arc::new(parking_lot::Mutex::new(
+            super::super::inspire::LogicalLeafStore::new(),
+        ));
+
+        // A leaf application is already wedged: the health gate is latched open.
+        let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics {
+            consecutive_event_errors: STALLED_RUN,
+            last_applied_leaf_block: 1_000,
+            ..ConsumerMetrics::default()
+        }));
+
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let task = tokio::spawn(run_consumer_task(
+            Arc::clone(&instance),
+            Arc::clone(&persistence),
+            Arc::clone(&logical_store),
+            Arc::clone(&metrics),
+            InspireParams::secure_128_d2048(),
+            test_encoder(),
+            rx,
+            None,
+        ));
+
+        tx.send(ConsumerEvent::Chain(
+            raven_railgun_core::RailgunEvent::Nullified {
+                block_number: NULLIFIED_HEIGHT,
+                tx_hash: [7u8; 32],
+                tree_number: 0,
+                nullifiers: vec![[9u8; 32]],
+            },
+            NULLIFIED_HEIGHT,
+        ))
+        .await
+        .expect("send nullified");
+        tx.send(ConsumerEvent::Shutdown)
+            .await
+            .expect("send shutdown");
+        drop(tx);
+        task.await.expect("join").expect("consumer task");
+
+        let m = metrics.lock();
+        assert_eq!(
+            m.last_applied_block, NULLIFIED_HEIGHT,
+            "the nullifier still advances the chain cursor"
+        );
+        assert_eq!(
+            m.last_applied_leaf_block, 1_000,
+            "but it applied no leaves, so the resume floor must not move"
+        );
+        assert_eq!(
+            m.consecutive_event_errors, STALLED_RUN,
+            "and it must NOT clear the stall /health/ready gates on: leaf application is \
+             still wedged, and a nullifier says nothing about that"
+        );
+    }
+
+    /// Harness for the routing tests: a live consumer over a toy instance, seeded with a
+    /// wedged leaf application so the health signal is observable.
+    async fn drive_consumer(
+        events: Vec<ConsumerEvent>,
+        stalled_run: u64,
+        floor: u64,
+        label: &str,
+    ) -> ConsumerMetrics {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_toy_state().expect("toy state");
+        let layout = StoreLayout::open(dir.path()).expect("layout");
+        let opened = InspirePersistence::open(
+            layout,
+            SCHEME_TAG,
+            InstanceId::new(label),
+            SnapshotPolicy::default(),
+            test_encoder(),
+        )
+        .expect("open");
+        let persistence = Arc::new(opened.persistence);
+        let instance = Arc::new(PirInstance::<RavenInspireScheme>::new(
+            InstanceId::new(label),
+            crate::InstanceRole::Live,
+            state,
+        ));
+        let logical_store = Arc::new(parking_lot::Mutex::new(
+            super::super::inspire::LogicalLeafStore::new(),
+        ));
+        let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics {
+            consecutive_event_errors: stalled_run,
+            last_applied_leaf_block: floor,
+            ..ConsumerMetrics::default()
+        }));
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let task = tokio::spawn(run_consumer_task(
+            Arc::clone(&instance),
+            Arc::clone(&persistence),
+            Arc::clone(&logical_store),
+            Arc::clone(&metrics),
+            InspireParams::secure_128_d2048(),
+            test_encoder(),
+            rx,
+            None,
+        ));
+        for e in events {
+            tx.send(e).await.expect("send");
+        }
+        tx.send(ConsumerEvent::Shutdown).await.expect("shutdown");
+        drop(tx);
+        task.await.expect("join").expect("consumer task");
+        let m = *metrics.lock();
+        m
+    }
+
+    /// `Unshield` moves no leaves, so it must not clear the stall the health gate reads.
+    /// Companion to the `Nullified` routing test: the recorder property test passes even when
+    /// an arm is rewired, so each arm needs its own route asserted.
+    #[tokio::test]
+    async fn an_unshield_event_does_not_clear_a_leaf_stall_through_the_consumer() {
+        const STALL: u64 = 5;
+        const HEIGHT: u64 = 3_000;
+        let m = drive_consumer(
+            vec![ConsumerEvent::Chain(
+                raven_railgun_core::RailgunEvent::Unshield {
+                    block_number: HEIGHT,
+                    tx_hash: [3u8; 32],
+                    to: [4u8; 20],
+                    token: [5u8; 32],
+                    amount: 1,
+                    fee: 0,
+                },
+                HEIGHT,
+            )],
+            STALL,
+            1_000,
+            "unshield-routing",
+        )
+        .await;
+
+        assert_eq!(
+            m.last_applied_block, HEIGHT,
+            "the chain cursor still advances"
+        );
+        assert_eq!(
+            m.last_applied_leaf_block, 1_000,
+            "an unshield applies no leaves, so the resume floor must not move"
+        );
+        assert_eq!(
+            m.consecutive_event_errors, STALL,
+            "and it must NOT clear the stall: leaf application is still wedged"
+        );
+    }
+
+    /// The opposite direction, and it is what makes the pair meaningful. A PPOI list leaf DOES
+    /// grow an IMT, so it MUST clear the error run - a PPOI-only instance, which is the live
+    /// deployment shape, has no other route out of 503.
+    #[tokio::test]
+    async fn a_ppoi_list_leaf_clears_the_error_run_because_it_grows_a_tree() {
+        const STALL: u64 = 4;
+        const HEIGHT: u64 = 4_000;
+        let m = drive_consumer(
+            vec![ConsumerEvent::Ppoi(
+                raven_railgun_persistence::WalEntryPayload::PpoiListLeafAdded {
+                    list_key: [1u8; 32],
+                    list_index: 0,
+                    blinded_commitment: [2u8; 32],
+                    status: 1,
+                },
+                HEIGHT,
+            )],
+            STALL,
+            1_000,
+            "ppoi-leaf-routing",
+        )
+        .await;
+
+        assert_eq!(
+            m.consecutive_event_errors, 0,
+            "a PPOI list leaf grows the PPOI IMT, so it is a tree mutation and must clear the run"
+        );
+    }
+
     #[test]
     fn ppoi_height_zero_cannot_regress_the_applied_pointer() {
         let mut m = ConsumerMetrics {
@@ -1885,6 +2152,68 @@ mod tests {
             format!("{err}").contains("stale state swap"),
             "the refusal must be the staleness one, not the retry-exhausted one; got: {err}"
         );
+    }
+
+    /// A geometry refusal must reach the operator as itself.
+    ///
+    /// `swap_state` refuses a shape mismatch BEFORE its compare-and-swap, so nothing
+    /// swapped and `encoded_db` stays pointer-equal. Classifying by pointer identity
+    /// therefore read a geometry refusal as contention, retried it four times, and told
+    /// the operator to raise `session_eviction_interval_secs` - a ticker that was never
+    /// involved. The safety gate fired correctly and was announced as its opposite.
+    #[test]
+    fn a_shape_mismatch_surfaces_as_itself_and_never_as_internal() {
+        let state = build_toy_state().expect("toy state");
+        let inst = Arc::new(PirInstance::<RavenInspireScheme>::new(
+            InstanceId::new("swap-shape"),
+            crate::InstanceRole::Live,
+            state,
+        ));
+
+        let derived_from = inst.current_snapshot();
+        let current = Arc::clone(&derived_from.state);
+
+        // A database encoded at a different record width: legal bytes, illegal geometry
+        // to publish under live clients whose queries decompose against the old one.
+        let other_width = build_toy_state_with_entry_size(TOY_ENTRY_SIZE / 2)
+            .expect("second toy state at half the record width");
+        let new_db = Arc::clone(&other_width.encoded_db);
+        assert_ne!(
+            new_db.config.entry_size_bytes, current.encoded_db.config.entry_size_bytes,
+            "the fixture must actually differ in shape, or this test proves nothing"
+        );
+
+        let err = publish_recommitted_state(&inst, &derived_from, &current, &new_db, 4_244)
+            .expect_err("publishing a different geometry must be refused");
+
+        assert!(
+            matches!(err, AdapterError::StateShapeMismatch { .. }),
+            "a geometry refusal must keep its type; got: {err:?}"
+        );
+        let text = format!("{err}");
+        assert!(
+            text.contains("state shape mismatch"),
+            "the operator must be told the geometry moved; got: {text}"
+        );
+        assert!(
+            !text.contains("session_eviction_interval_secs"),
+            "and must NOT be sent to tune a ticker that was never involved; got: {text}"
+        );
+    }
+
+    fn build_toy_state_with_entry_size(entry_size: usize) -> Result<InspireServerState> {
+        let params = InspireParams::secure_128_d2048();
+        let entries = 256usize;
+        let db: Vec<u8> = (0..entries)
+            .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
+            .collect();
+        let (state, _sk) = super::super::inspire::setup_state(
+            &params,
+            &db,
+            entry_size,
+            InspireVariant::TwoPacking,
+        )?;
+        Ok(state)
     }
 
     fn build_toy_state() -> Result<InspireServerState> {

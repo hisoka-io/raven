@@ -19,7 +19,7 @@ use raven_inspire::{
 };
 
 use raven_b1_bench::adaptive_params::{derive_medium_payload, fmt_derivation, AdaptiveInputs};
-use raven_bench::{BenchReport, GridCell};
+use raven_bench::{BenchFile, BenchReport, GridCell};
 
 #[derive(Debug, Clone, Copy)]
 struct RoundTrip {
@@ -415,6 +415,9 @@ fn main() {
         let mut server_times_us: Vec<u64> = Vec::new();
         let mut extract_times_us: Vec<u64> = Vec::new();
         let mut total_times_us: Vec<u64> = Vec::new();
+        // Paired at push time: `median_of` sorts in place, so summing the two client
+        // vectors afterwards would add timings from different trials.
+        let mut client_times_us: Vec<u64> = Vec::new();
 
         let bench_total = cli.warmup + cli.measured;
 
@@ -515,6 +518,7 @@ fn main() {
                 server_times_us.push(rt.server_us);
                 extract_times_us.push(rt.extract_us);
                 total_times_us.push(rt.total_us);
+                client_times_us.push(rt.query_gen_us.saturating_add(rt.extract_us));
             }
         }
 
@@ -580,9 +584,15 @@ fn main() {
             client_ms_median: Some((query_gen_median_us + extract_median_us) as f64 / 1000.0),
             throughput_qps_per_core: throughput,
             measured_queries: total_times_us.len() as u64,
+            samples: raven_bench::BenchSamples {
+                query_us: total_times_us.clone(),
+                server_us: server_times_us.clone(),
+                client_us: client_times_us.clone(),
+            },
         };
 
-        let json = serde_json::to_string_pretty(&report).expect("serialize");
+        let json =
+            serde_json::to_string_pretty(&BenchFile::from(report.clone())).expect("serialize");
         File::create(seed_dir.join(format!(
             "cell-2e{}x{}.json",
             cell.entries_log2, cell.record_bytes

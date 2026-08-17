@@ -147,12 +147,11 @@ pub struct RpcEndpoint {
     burst: u32,
     state: Mutex<EndpointState>,
     limiter: EndpointLimiter,
-    provider: tokio::sync::OnceCell<Arc<dyn alloy::providers::Provider + Send + Sync>>,
-    /// Set once this endpoint has answered `eth_chainId` with the configured chain.
-    /// Per endpoint, not per pool: a pool-wide latch either fails every request when one
-    /// endpoint is unreachable, or latches success and lets that endpoint serve traffic
-    /// later without ever having been checked.
-    chain_id_verified: std::sync::atomic::AtomicBool,
+    /// Populated only after `eth_chainId` matched, so holding a provider IS the proof of
+    /// verification. A separate flag beside this cell cannot hold that invariant: an
+    /// unverified initialiser fills the cell and every later verified read then finds it
+    /// populated and skips the probe.
+    provider: tokio::sync::OnceCell<(u64, Arc<dyn alloy::providers::Provider + Send + Sync>)>,
 }
 
 impl std::fmt::Debug for RpcEndpoint {
@@ -188,20 +187,7 @@ impl RpcEndpoint {
             state: Mutex::new(EndpointState::default()),
             limiter: RateLimiter::direct(quota),
             provider: tokio::sync::OnceCell::new(),
-            chain_id_verified: std::sync::atomic::AtomicBool::new(false),
         })
-    }
-
-    /// Whether this endpoint has answered `eth_chainId` with the configured chain.
-    pub fn is_chain_id_verified(&self) -> bool {
-        self.chain_id_verified
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Admit this endpoint to selection. Called only after a matching `eth_chainId`.
-    pub fn mark_chain_id_verified(&self) {
-        self.chain_id_verified
-            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub fn url(&self) -> &str {
@@ -212,21 +198,60 @@ impl RpcEndpoint {
         redact_url(&self.url)
     }
 
-    pub async fn provider(&self) -> Result<&(dyn alloy::providers::Provider + Send + Sync)> {
-        let p = self
+    /// The verified route to this endpoint's provider.
+    ///
+    /// Dials on first use and refuses to hand back a handle until `eth_chainId` answers
+    /// `expected_chain_id`. Verification lives in the connection constructor rather than in
+    /// selection, so it binds to the handle a request will actually run on and cannot be
+    /// bypassed by reaching the endpoint some other way. `select_for_request` knows nothing
+    /// about chain ids and must not: it serves consumers that have no chain source at all.
+    ///
+    /// The cell stores only on success, so a failed dial or a failed probe is retried on the
+    /// next call rather than latched.
+    ///
+    /// # Errors
+    /// [`IndexerError::ChainIdMismatch`] when the endpoint answers with a different chain,
+    /// and the transport error otherwise.
+    pub async fn verified_provider(
+        &self,
+        expected_chain_id: u64,
+    ) -> Result<&(dyn alloy::providers::Provider + Send + Sync)> {
+        let (verified_chain_id, provider) = self
             .provider
             .get_or_try_init(|| async {
                 let url = self
                     .url
                     .parse::<reqwest::Url>()
                     .map_err(|e| IndexerError::Alloy(format!("invalid rpc url: {e}")))?;
-                let provider = alloy::providers::ProviderBuilder::new().connect_http(url);
-                Ok::<_, IndexerError>(
-                    Arc::new(provider) as Arc<dyn alloy::providers::Provider + Send + Sync>
-                )
+                let provider: Arc<dyn alloy::providers::Provider + Send + Sync> =
+                    Arc::new(alloy::providers::ProviderBuilder::new().connect_http(url));
+                // Bounded here, and labelled, because `classify_indexer_error` routes the
+                // timeout text to `ErrorKind::Network` and the hang tests assert on it.
+                let actual = crate::with_rpc_timeout("eth_chainId probe", async {
+                    alloy::providers::Provider::get_chain_id(provider.as_ref())
+                        .await
+                        .map_err(|e| IndexerError::Rpc(format!("eth_chainId: {e}")))
+                })
+                .await?;
+                if actual != expected_chain_id {
+                    return Err(IndexerError::ChainIdMismatch {
+                        expected: expected_chain_id,
+                        actual,
+                    });
+                }
+                Ok::<_, IndexerError>((actual, provider))
             })
             .await?;
-        Ok(p.as_ref())
+        // The cell caches the handle AND the identity it was verified against. Caching the
+        // handle alone would hand a chain-1 provider to a caller asking for chain 137,
+        // because `get_or_try_init` does not re-run its closure once populated.
+        if *verified_chain_id != expected_chain_id {
+            return Err(IndexerError::ChainIdMismatch {
+                expected: expected_chain_id,
+                actual: *verified_chain_id,
+            });
+        }
+        Ok(provider.as_ref())
     }
 
     pub fn health(&self) -> EndpointHealth {
@@ -506,29 +531,26 @@ impl PooledRpcChainSource {
     ///
     /// A transport failure is NOT a verification failure. Propagating it aborted the whole
     /// loop, so one unreachable endpoint took the indexer down and bypassed the pool's own
-    /// failover. Such an endpoint is marked errored and left unverified, which keeps it out
-    /// of `select_for_request`; it is re-probed here on a later call and admitted once it
-    /// answers. Only a real chain-id mismatch, or having nothing left to use, is fatal.
+    /// failover. Such an endpoint is marked errored and re-probed here on a later call.
+    /// Selection knows nothing about chain ids and may still hand it out; the attempt then
+    /// fails closed, because [`RpcEndpoint::verified_provider`] is the only route to a
+    /// provider and it refuses until `eth_chainId` matches. Only a real chain-id mismatch,
+    /// or having nothing left to use, is fatal.
+    ///
+    /// This eager sweep is what makes a foreign endpoint ANYWHERE in the pool fatal at the
+    /// first call rather than whenever round-robin happens to reach it.
     async fn verify_chain_id_once(&self) -> Result<()> {
         let mut verified = 0usize;
         let mut unreachable: Vec<String> = Vec::new();
         for endpoint in self.pool.endpoints() {
-            if endpoint.is_chain_id_verified() {
-                verified += 1;
-                continue;
-            }
-            match self.probe_chain_id(endpoint).await {
-                Ok(actual) if actual == self.chain_id => {
-                    endpoint.mark_chain_id_verified();
+            match endpoint.verified_provider(self.chain_id).await {
+                Ok(_) => {
                     self.pool.mark_endpoint_success(endpoint);
                     verified += 1;
                 }
-                Ok(actual) => {
+                Err(e @ IndexerError::ChainIdMismatch { .. }) => {
                     self.pool.mark_endpoint_error(endpoint, ErrorKind::Other);
-                    return Err(IndexerError::ChainIdMismatch {
-                        expected: self.chain_id,
-                        actual,
-                    });
+                    return Err(e);
                 }
                 Err(e) => {
                     self.pool.mark_endpoint_error(endpoint, ErrorKind::Network);
@@ -546,27 +568,6 @@ impl PooledRpcChainSource {
             )));
         }
         Ok(())
-    }
-
-    /// One `eth_chainId` against a named endpoint.
-    ///
-    /// Deliberately does NOT touch `in_flight`: that counter exists to steer
-    /// `select_for_request`, and this probe bypasses selection to reach a specific
-    /// endpoint. The previous form incremented it via `select_for_request` and released
-    /// it only after two `?`, so either error leaked the count and biased selection away
-    /// from a healthy endpoint forever. Not incrementing it removes the leak by
-    /// construction rather than adding a release the next edit can skip.
-    async fn probe_chain_id(&self, endpoint: &Arc<RpcEndpoint>) -> Result<u64> {
-        // Bounded like every other attempt. This runs BEFORE `run_with_pool` on every
-        // pooled method, so leaving it unbounded left the chokepoint timeout unreachable:
-        // a black-holing endpoint hung here and never got as far as the pooled op.
-        crate::with_rpc_timeout("eth_chainId probe", async {
-            let provider = endpoint.provider().await?;
-            alloy::providers::Provider::get_chain_id(provider)
-                .await
-                .map_err(|e| IndexerError::Rpc(format!("eth_chainId: {e}")))
-        })
-        .await
     }
 }
 
@@ -625,6 +626,11 @@ where
             Err(e) => {
                 let kind = classify_indexer_error(&e);
                 pool.mark_endpoint_error(&endpoint_for_release, kind);
+                // A foreign chain is a misconfiguration, not a flaky endpoint. Retrying
+                // past it would let a neighbour answer and turn a hard error into an Ok.
+                if matches!(e, IndexerError::ChainIdMismatch { .. }) {
+                    return Err(e);
+                }
                 last_err = Some(e);
             }
         }
@@ -661,8 +667,9 @@ where
 impl ChainSource for PooledRpcChainSource {
     async fn latest_block(&self) -> Result<u64> {
         self.verify_chain_id_once().await?;
+        let chain_id = self.chain_id;
         run_with_pool(&self.pool, |endpoint: Arc<RpcEndpoint>| async move {
-            let provider = endpoint.provider().await?;
+            let provider = endpoint.verified_provider(chain_id).await?;
             let block = provider
                 .get_block_by_number(alloy::eips::BlockNumberOrTag::Finalized)
                 .await
@@ -688,9 +695,10 @@ impl ChainSource for PooledRpcChainSource {
             )));
         }
         self.verify_chain_id_once().await?;
+        let chain_id = self.chain_id;
         let proxy = self.railgun_proxy;
         run_with_pool(&self.pool, move |endpoint: Arc<RpcEndpoint>| async move {
-            let provider = endpoint.provider().await?;
+            let provider = endpoint.verified_provider(chain_id).await?;
             use alloy::sol_types::SolEvent;
             let topic0 = [
                 crate::abi::Shield::SIGNATURE_HASH,
@@ -732,9 +740,10 @@ impl ChainSource for PooledRpcChainSource {
         at: Option<alloy::eips::BlockId>,
     ) -> Result<bool> {
         self.verify_chain_id_once().await?;
+        let chain_id = self.chain_id;
         let proxy = self.railgun_proxy;
         let body = move |endpoint: Arc<RpcEndpoint>| async move {
-            let provider = endpoint.provider().await?;
+            let provider = endpoint.verified_provider(chain_id).await?;
             use alloy::sol_types::SolCall;
             let call = crate::abi::rootHistoryCall {
                 tree: alloy::primitives::U256::from(tree_number),
@@ -771,8 +780,9 @@ impl ChainSource for PooledRpcChainSource {
 
     async fn block_hash(&self, block_number: u64) -> Result<[u8; 32]> {
         self.verify_chain_id_once().await?;
+        let chain_id = self.chain_id;
         run_with_pool(&self.pool, move |endpoint: Arc<RpcEndpoint>| async move {
-            let provider = endpoint.provider().await?;
+            let provider = endpoint.verified_provider(chain_id).await?;
             let block = provider
                 .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(block_number))
                 .await
@@ -789,9 +799,10 @@ impl ChainSource for PooledRpcChainSource {
 
     async fn merkle_root(&self, at: Option<alloy::eips::BlockId>) -> Result<[u8; 32]> {
         self.verify_chain_id_once().await?;
+        let chain_id = self.chain_id;
         let proxy = self.railgun_proxy;
         let body = move |endpoint: Arc<RpcEndpoint>| async move {
-            let provider = endpoint.provider().await?;
+            let provider = endpoint.verified_provider(chain_id).await?;
             use alloy::sol_types::SolCall;
             let call = crate::abi::merkleRootCall {};
             let calldata: alloy::primitives::Bytes = call.abi_encode().into();
@@ -825,9 +836,10 @@ impl ChainSource for PooledRpcChainSource {
 
     async fn active_tree_number(&self, at: Option<alloy::eips::BlockId>) -> Result<u32> {
         self.verify_chain_id_once().await?;
+        let chain_id = self.chain_id;
         let proxy = self.railgun_proxy;
         let body = move |endpoint: Arc<RpcEndpoint>| async move {
-            let provider = endpoint.provider().await?;
+            let provider = endpoint.verified_provider(chain_id).await?;
             use alloy::sol_types::SolCall;
             let call = crate::abi::treeNumberCall {};
             let calldata: alloy::primitives::Bytes = call.abi_encode().into();

@@ -31,6 +31,35 @@ pub enum ChainSourceMode {
     Polling,
 }
 
+/// A `WsConnect` that counts dials.
+///
+/// alloy re-dials underneath a live provider handle (`alloy-pubsub` `service.rs:61` calls
+/// `try_reconnect`), and the consumer sees neither an error nor a stream close. A chain-id
+/// check performed once at construction therefore describes the FIRST socket only, and a URL
+/// repointed onto another chain is served unverified from then on. The counter turns that
+/// invisible event into an observable one.
+///
+/// Only `connect` is overridden: `PubSubConnect::try_reconnect` defaults to `self.connect()`,
+/// so the reconnect path runs through this same increment.
+#[derive(Clone, Debug)]
+struct CountedWsConnect {
+    inner: alloy::providers::WsConnect,
+    dials: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl alloy::pubsub::PubSubConnect for CountedWsConnect {
+    fn is_local(&self) -> bool {
+        self.inner.is_local()
+    }
+
+    async fn connect(&self) -> alloy::transports::TransportResult<alloy::pubsub::ConnectionHandle> {
+        // Bumped BEFORE the dial so a failed re-dial still invalidates: a handle whose
+        // socket died is not evidence about the chain behind the URL either.
+        self.dials.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.inner.connect().await
+    }
+}
+
 /// WS-backed chain source wrapping an alloy `connect_ws` provider.
 ///
 /// Currently invokes methods one-shot over WS transport; long-lived subscriptions are handled
@@ -39,7 +68,11 @@ pub struct WsChainSource {
     rpc_url: String,
     railgun_proxy: alloy::primitives::Address,
     chain_id: u64,
-    provider: tokio::sync::OnceCell<Arc<dyn alloy::providers::Provider + Send + Sync>>,
+    /// Dial counter shared with the connector, so a re-dial is visible here.
+    dials: Arc<std::sync::atomic::AtomicU64>,
+    /// The handle and the dial count it was verified at. A `OnceCell` cannot express this:
+    /// it has no way to invalidate, so the verification would outlive its connection.
+    provider: RwLock<Option<(u64, Arc<dyn alloy::providers::Provider + Send + Sync>)>>,
 }
 
 impl std::fmt::Debug for WsChainSource {
@@ -48,7 +81,10 @@ impl std::fmt::Debug for WsChainSource {
             .field("rpc_url", &self.rpc_url)
             .field("railgun_proxy", &self.railgun_proxy)
             .field("chain_id", &self.chain_id)
-            .field("provider_initialized", &self.provider.initialized())
+            .field(
+                "dials",
+                &self.dials.load(std::sync::atomic::Ordering::Acquire),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -64,7 +100,8 @@ impl WsChainSource {
             rpc_url: rpc_url.into(),
             railgun_proxy,
             chain_id,
-            provider: tokio::sync::OnceCell::new(),
+            dials: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            provider: RwLock::new(None),
         }
     }
 
@@ -83,30 +120,64 @@ impl WsChainSource {
         self.chain_id
     }
 
-    async fn provider(&self) -> Result<&(dyn alloy::providers::Provider + Send + Sync)> {
-        let p = self
-            .provider
-            .get_or_try_init(|| async {
-                let connect = alloy::providers::WsConnect::new(self.rpc_url.clone());
-                let provider = alloy::providers::ProviderBuilder::new()
-                    .connect_ws(connect)
-                    .await
-                    .map_err(|e| IndexerError::Alloy(format!("ws connect: {e}")))?;
-                let actual = alloy::providers::Provider::get_chain_id(&provider)
-                    .await
-                    .map_err(|e| IndexerError::Rpc(format!("eth_chainId: {e}")))?;
-                if actual != self.chain_id {
-                    return Err(IndexerError::ChainIdMismatch {
-                        expected: self.chain_id,
-                        actual,
-                    });
-                }
-                Ok::<_, IndexerError>(
-                    Arc::new(provider) as Arc<dyn alloy::providers::Provider + Send + Sync>
+    /// A provider whose chain id was verified for the connection it is currently on.
+    ///
+    /// Re-verifies whenever the dial counter has moved since the handle was checked, which
+    /// is what makes this survive alloy's silent re-dial. The probe runs on the EXISTING
+    /// handle rather than dropping it: alloy has already reconnected and re-subscribed, and
+    /// dropping would kill live subscriptions to prove something a query can prove.
+    async fn verified_provider(&self) -> Result<Arc<dyn alloy::providers::Provider + Send + Sync>> {
+        use std::sync::atomic::Ordering;
+
+        if let Some((seen_at, provider)) = self.provider.read().await.as_ref() {
+            if *seen_at == self.dials.load(Ordering::Acquire) {
+                return Ok(Arc::clone(provider));
+            }
+        }
+
+        let mut slot = self.provider.write().await;
+        // Another task may have refreshed while this one waited for the write lock.
+        if let Some((seen_at, provider)) = slot.as_ref() {
+            if *seen_at == self.dials.load(Ordering::Acquire) {
+                return Ok(Arc::clone(provider));
+            }
+        }
+
+        // A handle already in `slot` means the socket was replaced underneath it, so the
+        // chain behind the URL is re-checked on the handle alloy has already reconnected.
+        let provider: Arc<dyn alloy::providers::Provider + Send + Sync> =
+            if let Some((_, existing)) = slot.take() {
+                existing
+            } else {
+                let connect = CountedWsConnect {
+                    inner: alloy::providers::WsConnect::new(self.rpc_url.clone()),
+                    dials: Arc::clone(&self.dials),
+                };
+                Arc::new(
+                    alloy::providers::ProviderBuilder::new()
+                        .connect_pubsub_with(connect)
+                        .await
+                        .map_err(|e| IndexerError::Alloy(format!("ws connect: {e}")))?,
                 )
-            })
-            .await?;
-        Ok(p.as_ref())
+            };
+
+        let dialled_at = self.dials.load(Ordering::Acquire);
+        let actual = alloy::providers::Provider::get_chain_id(provider.as_ref())
+            .await
+            .map_err(|e| IndexerError::Rpc(format!("eth_chainId: {e}")))?;
+        if actual != self.chain_id {
+            return Err(IndexerError::ChainIdMismatch {
+                expected: self.chain_id,
+                actual,
+            });
+        }
+        // An answer that crossed a re-dial says nothing about the socket now in use, so it
+        // is not stored; the next call re-verifies. `slot` stays None on every failure
+        // path, which is what preserves retry-on-failure against a dead URL.
+        if dialled_at == self.dials.load(Ordering::Acquire) {
+            *slot = Some((dialled_at, Arc::clone(&provider)));
+        }
+        Ok(provider)
     }
 }
 
@@ -116,7 +187,7 @@ impl ChainSource for WsChainSource {
         crate::with_rpc_timeout(
             "ws latest_block",
             Box::pin(async {
-                let p = self.provider().await?;
+                let p = self.verified_provider().await?;
                 let block = p
                     .get_block_by_number(alloy::eips::BlockNumberOrTag::Finalized)
                     .await
@@ -147,7 +218,7 @@ impl ChainSource for WsChainSource {
                         crate::SCAN_CHUNK_BLOCKS
                     )));
                 }
-                let p = self.provider().await?;
+                let p = self.verified_provider().await?;
 
                 use alloy::sol_types::SolEvent;
                 let topic0 = [
@@ -199,7 +270,7 @@ impl ChainSource for WsChainSource {
             "ws root_history",
             Box::pin(async {
                 use alloy::sol_types::SolCall;
-                let p = self.provider().await?;
+                let p = self.verified_provider().await?;
                 let call = crate::abi::rootHistoryCall {
                     tree: alloy::primitives::U256::from(tree_number),
                     root: alloy::primitives::FixedBytes::<32>::from(merkle_root),
@@ -229,7 +300,7 @@ impl ChainSource for WsChainSource {
         crate::with_rpc_timeout(
             "ws block_hash",
             Box::pin(async {
-                let p = self.provider().await?;
+                let p = self.verified_provider().await?;
                 let block = p
                     .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(block_number))
                     .await
@@ -250,7 +321,7 @@ impl ChainSource for WsChainSource {
             "ws merkle_root",
             Box::pin(async {
                 use alloy::sol_types::SolCall;
-                let p = self.provider().await?;
+                let p = self.verified_provider().await?;
                 let call = crate::abi::merkleRootCall {};
                 let calldata: alloy::primitives::Bytes = call.abi_encode().into();
                 let tx = alloy::rpc::types::eth::TransactionRequest {
@@ -278,7 +349,7 @@ impl ChainSource for WsChainSource {
             "ws active_tree_number",
             Box::pin(async {
                 use alloy::sol_types::SolCall;
-                let p = self.provider().await?;
+                let p = self.verified_provider().await?;
                 let call = crate::abi::treeNumberCall {};
                 let calldata: alloy::primitives::Bytes = call.abi_encode().into();
                 let tx = alloy::rpc::types::eth::TransactionRequest {

@@ -146,6 +146,7 @@ pub fn run_cell<S: BenchScheme>(
         client_ms_median: None,
         throughput_qps_per_core: throughput,
         measured_queries: completed,
+        samples: crate::BenchSamples::default(),
     }
 }
 

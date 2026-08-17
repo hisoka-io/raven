@@ -33,3 +33,10 @@ raven-railgun-poseidon = { workspace = true }
 axum = { workspace = true }
 tempfile = "3"
 metrics-util = "0.20"
+# Already in the workspace lock at this exact version via alloy-transport-ws, so this adds
+# no crate and no licence. Chosen over axum's `ws` feature because axum is a PRODUCTION
+# dependency of http/ppoi-mirror/mock-ppoi/cli and feature unification would pull `ws` into
+# their graphs. Test-only: it drives a WS server that swaps the chain behind a live socket.
+tokio-tungstenite = "0.28"
+# Sink/Stream extension traits for driving that WS fixture; already in the lock via alloy.
+futures-util = "0.3"
