@@ -263,3 +263,77 @@ async fn a_refused_endpoint_re_probes_and_recovers_when_it_is_repointed() {
         .expect("usable");
     assert_eq!(block, 0x2710);
 }
+
+/// Verifying a CACHED endpoint is not evidence that it is healthy.
+///
+/// Once the provider cell is populated, `verified_provider` returns from cache without
+/// touching the network. The verification sweep walks EVERY endpoint before every pooled
+/// request, so treating that cached hit as a success promoted endpoints the request never
+/// touched: `consecutive_errors` reset to zero on no evidence, which makes the Other-kind
+/// circuit breaker unreachable, and `Degraded` flipped back to `Healthy`, so `/status`
+/// reported a failing endpoint as good.
+///
+/// The observable has to be an endpoint the request does NOT select. `run_with_pool` marks
+/// the selected endpoint itself, which overwrites the sweep's damage and hides it.
+#[tokio::test]
+async fn the_verification_sweep_does_not_promote_an_endpoint_the_request_never_touched() {
+    use raven_railgun_indexer::rpc_pool::{EndpointHealth, ErrorKind, PooledRpcChainSource};
+    use raven_railgun_indexer::ChainSource;
+
+    // Two honest endpoints. Primary-with-failover always picks index 0, so index 1 is never
+    // selected while index 0 works - it is the endpoint with no evidence about it.
+    let (addr_a, _pa) = spawn_rpc(HONEST_CHAIN).await;
+    let (addr_b, _pb) = spawn_rpc(HONEST_CHAIN).await;
+    let pool = Arc::new(
+        raven_railgun_indexer::rpc_pool::RpcEndpointPool::new(
+            vec![
+                raven_railgun_indexer::rpc_pool::EndpointConfig {
+                    url: format!("http://{addr_a}"),
+                    rps: 1000,
+                    burst: 1000,
+                },
+                raven_railgun_indexer::rpc_pool::EndpointConfig {
+                    url: format!("http://{addr_b}"),
+                    rps: 1000,
+                    burst: 1000,
+                },
+            ],
+            raven_railgun_indexer::rpc_pool::PoolConfig {
+                strategy: raven_railgun_indexer::rpc_pool::PoolStrategy::PrimaryWithFailover,
+                ..raven_railgun_indexer::rpc_pool::PoolConfig::default()
+            },
+        )
+        .expect("pool builds"),
+    );
+
+    let secondary = Arc::clone(&pool.endpoints()[1]);
+    // Populate its provider cell so every later verification of it is a cached hit.
+    secondary
+        .verified_provider(HONEST_CHAIN)
+        .await
+        .expect("dial and verify the secondary");
+
+    // A real call against the secondary failed at some point and degraded it.
+    pool.mark_endpoint_error(&secondary, ErrorKind::Other);
+    assert_eq!(
+        secondary.health(),
+        EndpointHealth::Degraded,
+        "premise: one Other-kind error degrades without tripping the breaker"
+    );
+
+    // Drive a pooled request. It selects the PRIMARY, so nothing legitimate observes the
+    // secondary - but the verification sweep still walks it.
+    let source = PooledRpcChainSource::new(
+        Arc::clone(&pool),
+        alloy::primitives::address!("fa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"),
+        HONEST_CHAIN,
+    );
+    let _ = source.latest_block().await;
+
+    assert_eq!(
+        secondary.health(),
+        EndpointHealth::Degraded,
+        "the sweep read the secondary from cache and learned nothing about it, so it must \
+         not report it recovered"
+    );
+}

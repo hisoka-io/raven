@@ -261,9 +261,14 @@ fn emit_instance_consumer_gauges(
     .set(to_f(snap.last_applied_leaf_block));
     metrics::gauge!(
         "raven_railgun_consumer_consecutive_event_errors",
-        "instance" => label
+        "instance" => label.clone()
     )
     .set(to_f(snap.consecutive_event_errors));
+    metrics::gauge!(
+        "raven_railgun_consumer_unapplied_leaves",
+        "instance" => label
+    )
+    .set(to_f(snap.unapplied_leaves));
 }
 
 pub(crate) async fn health_live_handler() -> impl IntoResponse {
@@ -341,7 +346,23 @@ pub struct RpcEndpointHealthView {
     pub burst: u32,
 }
 
-/// Instances whose consumer has failed every event since its last applied one.
+/// Whether this consumer must be taken out of rotation.
+///
+/// Two conditions, and they answer different questions. `consecutive_event_errors > 0` means
+/// every event since the last applied one has failed; it is self-healing on purpose, because
+/// a single transient failure that the next event fixes is not an outage. `unapplied_leaves > 0`
+/// means a per-leaf loop broke and left leaves behind, so the tree has a contiguity gap that no
+/// unrelated success repairs - only a reorg rewind does.
+///
+/// Neither number is a tuned threshold. One failed event is a real failure and one abandoned
+/// leaf is a real gap, so the comparison is against zero because zero is the whole of the safe
+/// set, not because zero was picked from a range.
+fn consumer_is_stalled(m: &raven_railgun_engine::persistence::ConsumerMetrics) -> bool {
+    m.consecutive_event_errors > 0 || m.unapplied_leaves > 0
+}
+
+/// Instances whose consumer has failed every event since its last applied one, or is carrying
+/// leaves a broken per-leaf loop abandoned.
 ///
 /// Reads the same cells the consumer tasks mutate, with the single-cell fallback
 /// `refresh_dynamic_metrics` uses: a deployment that wires only
@@ -352,7 +373,7 @@ fn stalled_consumer_instances<S: PirScheme>(app: &AppState<S>) -> Vec<String> {
         let Some(cell) = app.consumer_metrics.as_ref().as_ref() else {
             return Vec::new();
         };
-        let stalled = cell.lock().consecutive_event_errors > 0;
+        let stalled = consumer_is_stalled(&cell.lock());
         return match instances.first() {
             Some(first) if stalled => vec![first.id.as_str().to_owned()],
             _ => Vec::new(),
@@ -363,7 +384,7 @@ fn stalled_consumer_instances<S: PirScheme>(app: &AppState<S>) -> Vec<String> {
         .filter(|instance| {
             app.instance_metrics
                 .get(&instance.id)
-                .is_some_and(|cell| cell.lock().consecutive_event_errors > 0)
+                .is_some_and(|cell| consumer_is_stalled(&cell.lock()))
         })
         .map(|instance| instance.id.as_str().to_owned())
         .collect();

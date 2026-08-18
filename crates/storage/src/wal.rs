@@ -234,6 +234,12 @@ impl Wal {
     /// path is refused: renaming onto it would destroy an already-sealed range
     /// with no trace.
     ///
+    /// Occupancy is decided by `symlink_metadata`, which does not follow links.
+    /// `Path::exists()` does follow them, so a DANGLING symlink in the archive slot
+    /// read as free; the rename then had a second way to do nothing at all, because
+    /// `rename(2)` is a documented no-op when both operands resolve to one inode.
+    /// Any entry at the path is a collision, whatever it points at.
+    ///
     /// # Errors
     /// [`PersistenceError::Invariant`] when `wal/archived/` already holds that
     /// range, plus any I/O failure while syncing, renaming, or reopening.
@@ -241,7 +247,7 @@ impl Wal {
         let mut state = self.inner.lock();
         state.file.sync_all()?;
         let target = self.layout.wal_archived_path(from_seq, to_seq);
-        if target.exists() {
+        if std::fs::symlink_metadata(&target).is_ok() {
             return Err(PersistenceError::Invariant(format!(
                 "wal archive refused: seqs {from_seq}..={to_seq} are already sealed at {}, and \
                  sealing them again would rename over that file. Operator: the log and \

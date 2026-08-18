@@ -544,8 +544,15 @@ impl PooledRpcChainSource {
         let mut unreachable: Vec<String> = Vec::new();
         for endpoint in self.pool.endpoints() {
             match endpoint.verified_provider(self.chain_id).await {
+                // Deliberately does NOT mark success. Once the provider cell is populated
+                // this returns from cache without touching the network, so treating it as
+                // evidence of health would reset `consecutive_errors` on every request and
+                // flip a Degraded endpoint back to Healthy with nothing behind it - which
+                // both makes the Other-kind circuit breaker unreachable (`MAX_RETRY_FACTOR`
+                // caps errors at one per call) and lets `/status` report a failing endpoint
+                // as healthy. Health is attributed by the paths that make real calls,
+                // `run_with_pool` and `run_pinned`, which mark both outcomes.
                 Ok(_) => {
-                    self.pool.mark_endpoint_success(endpoint);
                     verified += 1;
                 }
                 Err(e @ IndexerError::ChainIdMismatch { .. }) => {

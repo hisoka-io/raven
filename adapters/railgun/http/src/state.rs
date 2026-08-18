@@ -347,7 +347,11 @@ fn register_prometheus_descriptions() {
     );
     metrics::describe_gauge!(
         "raven_railgun_consumer_consecutive_event_errors",
-        "Per-instance length of the current consumer error run; the value /health/ready gates on"
+        "Per-instance length of the current consumer error run; self-healing, so any applied event clears it"
+    );
+    metrics::describe_gauge!(
+        "raven_railgun_consumer_unapplied_leaves",
+        "Per-instance leaves abandoned by a broken per-leaf loop. Not cleared by an applied event, because a contiguity gap outlives unrelated successes; only a reorg rewind clears it. /health/ready gates on this OR the error run"
     );
     metrics::describe_counter!(
         "raven_railgun_sessions_established_total",

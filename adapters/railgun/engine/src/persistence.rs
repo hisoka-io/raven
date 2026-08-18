@@ -700,6 +700,16 @@ pub struct ConsumerMetrics {
     /// stalled on a repeating failure; the lag gauges cannot say that, because a
     /// heartbeat keeps the scan watermark at the tip while nothing applies.
     pub consecutive_event_errors: u64,
+    /// Leaves abandoned when a per-leaf loop broke, and not yet re-applied.
+    ///
+    /// The error run above is self-healing by design: any applied event clears it, which is
+    /// right for a transient failure and wrong for a contiguity gap. A break in the per-leaf
+    /// loop leaves the rest of that event's leaves unapplied, and every later leaf then fails
+    /// the contiguity guard while unrelated events keep clearing the run. This counter is
+    /// what distinguishes the two, so it is deliberately NOT cleared by
+    /// [`Self::record_applied_event`]. Only a reorg rewind, which is the path that actually
+    /// restores contiguity, clears it.
+    pub unapplied_leaves: u64,
 }
 
 impl ConsumerMetrics {
@@ -739,6 +749,19 @@ impl ConsumerMetrics {
         self.record_applied_block(height);
         self.events_processed = self.events_processed.saturating_add(1);
         self.consecutive_event_errors = 0;
+        // `unapplied_leaves` is deliberately untouched: applying one event says nothing
+        // about leaves a previous event abandoned, and clearing it here would restore the
+        // fail-open this counter exists to close.
+    }
+
+    /// Record leaves abandoned by a break in the per-leaf loop.
+    pub fn record_abandoned_leaves(&mut self, count: u64) {
+        self.unapplied_leaves = self.unapplied_leaves.saturating_add(count);
+    }
+
+    /// Contiguity restored: the reorg rewind re-opens the range those leaves live in.
+    pub fn clear_abandoned_leaves(&mut self) {
+        self.unapplied_leaves = 0;
     }
 
     /// Record an event that advanced the chain cursor without touching the tree.
@@ -1145,7 +1168,7 @@ pub async fn run_consumer_task(
                         ..
                     } => {
                         let mut had_error = false;
-                        for leaf in &leaves {
+                        for (leaf_idx, leaf) in leaves.iter().enumerate() {
                             match replay_disposition(&logical_store, leaf) {
                                 Ok(LeafDisposition::AlreadyApplied) => continue,
                                 Ok(LeafDisposition::Pending) => {}
@@ -1157,6 +1180,12 @@ pub async fn run_consumer_task(
                                         "AppendLeaf replay screen",
                                         height,
                                     );
+                                    // This leaf and every one after it are abandoned. The
+                                    // error run alone cannot say that: an unrelated event
+                                    // clears it while the gap is still there.
+                                    metrics
+                                        .lock()
+                                        .record_abandoned_leaves(abandoned_from(&leaves, leaf_idx));
                                     break;
                                 }
                             }
@@ -1177,6 +1206,9 @@ pub async fn run_consumer_task(
                             ) {
                                 had_error = true;
                                 record_consumer_error(&metrics, &e, "AppendLeaf apply", height);
+                                metrics
+                                    .lock()
+                                    .record_abandoned_leaves(abandoned_from(&leaves, leaf_idx));
                                 break;
                             }
                             if let Some(state) = verifier_state.as_mut() {
@@ -1230,6 +1262,11 @@ pub async fn run_consumer_task(
                     &metrics,
                 ) {
                     record_consumer_error(&metrics, &e, "Reorg apply", height);
+                } else {
+                    // The rewind re-opens the range the abandoned leaves live in, so they
+                    // are no longer a contiguity gap. This is the only healing route: an
+                    // ordinary applied event must not clear it.
+                    metrics.lock().clear_abandoned_leaves();
                 }
                 continue;
             }
@@ -1332,6 +1369,13 @@ fn record_consumer_error(
     let mut m = metrics.lock();
     m.consumer_errors = m.consumer_errors.saturating_add(1);
     m.consecutive_event_errors = m.consecutive_event_errors.saturating_add(1);
+}
+
+/// Leaves from `broke_at` to the end of the event, which the break abandoned.
+///
+/// Counts the failing leaf itself: it did not apply either.
+fn abandoned_from<T>(leaves: &[T], broke_at: usize) -> u64 {
+    u64::try_from(leaves.len().saturating_sub(broke_at)).unwrap_or(u64::MAX)
 }
 
 enum LeafDisposition {

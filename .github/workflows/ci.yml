@@ -689,6 +689,8 @@ jobs:
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       - name: build wasm-pack pkg-node + pkg-bundler + size gate
         run: adapters/railgun/scripts/check-wasm-bundle-size.sh
+      - name: wasm bundle-size red-proof
+        run: adapters/railgun/scripts/check-wasm-bundle-size-selftest.sh
       - name: pnpm install
         run: pnpm install --frozen-lockfile
         working-directory: adapters/railgun/sdk

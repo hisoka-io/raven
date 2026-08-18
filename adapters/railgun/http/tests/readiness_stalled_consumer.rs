@@ -68,6 +68,7 @@ fn caught_up_at_tip() -> MetricsCell {
         commits_fired: 90,
         consumer_errors: 0,
         consecutive_event_errors: 0,
+        unapplied_leaves: 0,
     }))
 }
 
@@ -222,5 +223,93 @@ async fn readiness_stays_ready_without_consumer_metrics() {
         "no consumer wiring means no stall signal, not a refusal"
     );
     assert!(body.stalled_consumer_instances.is_empty());
+    fixture.shutdown().await;
+}
+
+/// The distinction O-016 exists for: a transient error self-heals, a contiguity gap does not.
+///
+/// `consecutive_event_errors` is cleared by ANY applied event, which is correct for a single
+/// failure the next event fixes and wrong for a per-leaf loop that broke and left leaves behind.
+/// Every later leaf then fails the contiguity guard while unrelated events keep clearing the run,
+/// so the tree is wedged and `/health/ready` says 200.
+#[tokio::test]
+async fn abandoned_leaves_keep_an_instance_out_of_rotation_after_the_error_run_clears() {
+    let healthy = caught_up_at_tip();
+    let stalled = caught_up_at_tip();
+    let mut per_instance = HashMap::new();
+    per_instance.insert(InstanceId::new(HEALTHY), Arc::clone(&healthy));
+    per_instance.insert(InstanceId::new(STALLED), Arc::clone(&stalled));
+    let fixture = spawn(&[HEALTHY, STALLED], |state| {
+        state.with_instance_metrics(per_instance)
+    })
+    .await;
+
+    let (code, _) = fixture.probe().await;
+    assert_eq!(code, 200, "both consumers start ready");
+
+    // A per-leaf loop broke: the event errored AND left leaves unapplied.
+    {
+        let mut m = stalled.lock();
+        m.consecutive_event_errors = 1;
+        m.record_abandoned_leaves(4);
+    }
+    let (code, body) = fixture.probe().await;
+    assert_eq!(code, 503, "a contiguity gap must leave rotation");
+    assert_eq!(body.stalled_consumer_instances, vec![STALLED.to_owned()]);
+
+    // An unrelated event applies. This clears the error run - and MUST NOT restore readiness,
+    // because the abandoned leaves are still missing from the tree.
+    stalled.lock().record_applied_event(21_000_002);
+    assert_eq!(
+        stalled.lock().consecutive_event_errors,
+        0,
+        "premise: the applied event really did clear the self-healing signal"
+    );
+    let (code, body) = fixture.probe().await;
+    assert_eq!(
+        code, 503,
+        "an unrelated success does not re-apply the abandoned leaves, so the instance is \
+         still serving a tree with a hole in it"
+    );
+    assert_eq!(body.stalled_consumer_instances, vec![STALLED.to_owned()]);
+
+    // Only restoring contiguity clears it. That is the reorg rewind's job.
+    stalled.lock().clear_abandoned_leaves();
+    let (code, body) = fixture.probe().await;
+    assert_eq!(
+        code, 200,
+        "once the gap is closed the instance returns to rotation"
+    );
+    assert!(body.stalled_consumer_instances.is_empty());
+
+    fixture.shutdown().await;
+}
+
+/// The inverse, so the latch cannot be a permanent 503 dressed up as a guard: a break that
+/// abandoned NOTHING still self-heals on the next applied event.
+#[tokio::test]
+async fn an_error_that_abandoned_no_leaves_still_self_heals() {
+    let healthy = caught_up_at_tip();
+    let stalled = caught_up_at_tip();
+    let mut per_instance = HashMap::new();
+    per_instance.insert(InstanceId::new(HEALTHY), Arc::clone(&healthy));
+    per_instance.insert(InstanceId::new(STALLED), Arc::clone(&stalled));
+    let fixture = spawn(&[HEALTHY, STALLED], |state| {
+        state.with_instance_metrics(per_instance)
+    })
+    .await;
+
+    stalled.lock().consecutive_event_errors = 3;
+    let (code, _) = fixture.probe().await;
+    assert_eq!(code, 503, "a live error run takes the instance out");
+
+    stalled.lock().record_applied_event(21_000_003);
+    let (code, body) = fixture.probe().await;
+    assert_eq!(
+        code, 200,
+        "with no leaves abandoned there is no gap, so the next success must restore readiness"
+    );
+    assert!(body.stalled_consumer_instances.is_empty());
+
     fixture.shutdown().await;
 }

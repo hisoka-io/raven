@@ -7,8 +7,11 @@
 //! # fn main() -> Result<(), Error> {
 //! let store = MemoryStore::new();
 //! let mut txn = store.begin()?;
-//! txn.insert(2, Bytes::from_static(b"beta"))?;
-//! txn.insert(0, Bytes::from_static(b"alpha"))?;
+//! // Inserted scrambled, and deliberately more than a couple of keys: with two, half of
+//! // all orderings are ascending by accident, so the example would demonstrate nothing.
+//! for k in [7u64, 1, 9, 3, 5, 0, 8, 2] {
+//!     txn.insert(k, Bytes::from_static(b"v"))?;
+//! }
 //! txn.commit()?;
 //!
 //! let snap = store.snapshot()?;
@@ -16,7 +19,9 @@
 //! for row in snap.scan() {
 //!     keys.push(row?.0);
 //! }
-//! assert_eq!(keys, vec![0, 2]);
+//! // The contract `scan` owes every backend: each visible key once, strictly ascending,
+//! // whatever order the writes arrived in.
+//! assert_eq!(keys, vec![0, 1, 2, 3, 5, 7, 8, 9]);
 //! # Ok(())
 //! # }
 //! ```

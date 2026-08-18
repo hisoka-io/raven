@@ -258,3 +258,20 @@ proptest! {
         }
     }
 }
+
+/// `#![deny(missing_docs)]` is what keeps the framework's extension point documented, and
+/// nothing observed its presence: deleting the attribute leaves `cargo build` green, and the
+/// docs it protects rot silently from there.
+///
+/// Grep rather than a compile-fail harness, because that would need a dev-dependency to
+/// assert one line. The needle is split so this test is not its own counterexample.
+#[test]
+fn raven_core_still_denies_missing_docs() {
+    const NEEDLE: &str = concat!("#![deny(missing", "_docs)]");
+    let src = include_str!("../src/lib.rs");
+    assert!(
+        src.contains(NEEDLE),
+        "raven-core must keep denying missing docs: it is the framework's central extension \
+         point and its contract lives entirely in prose the types cannot express"
+    );
+}

@@ -2,6 +2,13 @@
 # CI gate: ensure both wasm-pack target outputs (Node + bundler) for
 # raven-inspire-client-wasm stay below the 500 KB gzipped ceiling.
 #
+# Measures the whole shipped surface per target: the .wasm PLUS its JS glue. The two
+# targets emit a byte-identical `_bg.wasm` (verified: same sha256), so measuring only the
+# wasm was one measurement reported twice, and the part that actually differs between the
+# targets - the glue, ~5 KB gzipped each and structured differently - went unmeasured. A
+# consumer ships both files, so both count. `.d.ts` and `package.json` are excluded: they
+# are development-time artifacts and never reach a browser.
+#
 # Builds both targets if the pkg outputs are missing or stale, then
 # fails the build with a non-zero exit code if either exceeds the
 # ceiling. Invoke from anywhere; uses absolute paths so the working
@@ -50,23 +57,40 @@ if (( DO_BUILD == 1 )); then
     }
 fi
 
-WASM_NODE_FILE="${PKG_NODE_DIR}/raven_inspire_client_wasm_bg.wasm"
-WASM_BUNDLER_FILE="${PKG_BUNDLER_DIR}/raven_inspire_client_wasm_bg.wasm"
+# Gzipped total of everything a consumer actually ships from one target dir.
+# Refuses an empty set rather than reporting 0: a directory that produced no shippable
+# file is a broken build, and 0 is under every ceiling.
+shipped_gzip_bytes() { # pkg_dir
+    local dir="$1" total=0 n=0 f sz
+    for f in "${dir}"/*.wasm "${dir}"/*.js; do
+        [[ -f "${f}" ]] || continue
+        sz=$(gzip -c "${f}" | wc -c)
+        total=$(( total + sz ))
+        n=$(( n + 1 ))
+    done
+    if (( n == 0 )); then
+        echo "ERROR: no shippable .wasm or .js under ${dir}" >&2
+        return 3
+    fi
+    echo "${total}"
+}
 
-for f in "${WASM_NODE_FILE}" "${WASM_BUNDLER_FILE}"; do
-    if [[ ! -f "${f}" ]]; then
-        echo "ERROR: missing wasm output ${f}" >&2
+for d in "${PKG_NODE_DIR}" "${PKG_BUNDLER_DIR}"; do
+    if [[ ! -f "${d}/raven_inspire_client_wasm_bg.wasm" ]]; then
+        echo "ERROR: missing wasm output ${d}/raven_inspire_client_wasm_bg.wasm" >&2
         exit 3
     fi
 done
 
-GZ_NODE_BYTES=$(gzip -c "${WASM_NODE_FILE}" | wc -c)
-GZ_BUNDLER_BYTES=$(gzip -c "${WASM_BUNDLER_FILE}" | wc -c)
+GZ_NODE_BYTES=$(shipped_gzip_bytes "${PKG_NODE_DIR}") || exit 3
+GZ_BUNDLER_BYTES=$(shipped_gzip_bytes "${PKG_BUNDLER_DIR}") || exit 3
 
-printf "\n==> WASM bundle sizes (gzipped)\n"
+printf "\n==> Shipped bundle sizes, gzipped (wasm + JS glue)\n"
 printf "  pkg-node    : %s bytes (%.1f KB)\n"  "${GZ_NODE_BYTES}"     "$(echo "${GZ_NODE_BYTES} / 1024" | bc -l)"
 printf "  pkg-bundler : %s bytes (%.1f KB)\n"  "${GZ_BUNDLER_BYTES}"  "$(echo "${GZ_BUNDLER_BYTES} / 1024" | bc -l)"
 printf "  ceiling     : %s bytes (%.1f KB)\n"  "${MAX_GZIP_BYTES}"    "$(echo "${MAX_GZIP_BYTES} / 1024" | bc -l)"
+printf "  margin      : node %s B / bundler %s B remaining\n" \
+    "$(( MAX_GZIP_BYTES - GZ_NODE_BYTES ))" "$(( MAX_GZIP_BYTES - GZ_BUNDLER_BYTES ))"
 
 failed=0
 if (( GZ_NODE_BYTES > MAX_GZIP_BYTES )); then
