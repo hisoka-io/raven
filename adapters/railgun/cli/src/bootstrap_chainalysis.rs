@@ -14,7 +14,8 @@ use alloy::sol_types::SolEvent;
 use async_trait::async_trait;
 
 use crate::bootstrap_subsquid::{BootstrapError, PpoiEventRow, PpoiEventsSource};
-use raven_railgun_indexer::rpc_pool::RpcEndpointPool;
+use raven_railgun_indexer::rpc_pool::{ErrorKind, RpcEndpointPool};
+use raven_railgun_indexer::IndexerError;
 
 sol! {
     #[allow(missing_docs)]
@@ -166,22 +167,40 @@ impl ChainalysisOnChainOracleSource {
         let session = pool
             .pinned_session()
             .map_err(|e| BootstrapError::PpoiUnreachable(format!("rpc pool pin: {e}")))?;
-        let provider = session
-            .endpoint()
-            .verified_provider(self.chain_id)
-            .await
-            .map_err(|e| BootstrapError::PpoiUnreachable(format!("provider: {e}")))?;
+        // This walk drives raw provider calls instead of going through `run_pinned`, so it
+        // owns health attribution for the endpoint it pinned - otherwise ~1.5k failing
+        // `eth_getLogs` round trips teach the pool nothing and the next consumer picks the
+        // same dead endpoint. ERRORS ONLY: an `Ok` from `verified_provider` can come from a
+        // populated cell that touched no network, and attributing health to it makes the
+        // breaker threshold unreachable.
+        let observed_failure = |kind: ErrorKind| pool.mark_endpoint_error(session.endpoint(), kind);
+        let provider = match session.endpoint().verified_provider(self.chain_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                // Same split `verify_chain_id_once` uses: a foreign chain is a
+                // misconfiguration, anything else is the endpoint being unreachable.
+                observed_failure(match e {
+                    IndexerError::ChainIdMismatch { .. } => ErrorKind::Other,
+                    _ => ErrorKind::Network,
+                });
+                return Err(BootstrapError::PpoiUnreachable(format!("provider: {e}")));
+            }
+        };
         let last_block = if let Some(b) = self.block_end {
             b
         } else {
             tokio::time::timeout(PER_CALL_TIMEOUT, provider.get_block_number())
                 .await
                 .map_err(|_| {
+                    observed_failure(ErrorKind::Network);
                     BootstrapError::PpoiUnreachable(
                         "Chainalysis oracle head probe timed out".to_owned(),
                     )
                 })?
-                .map_err(|e| BootstrapError::PpoiUnreachable(format!("get_block_number: {e}")))?
+                .map_err(|e| {
+                    observed_failure(ErrorKind::Other);
+                    BootstrapError::PpoiUnreachable(format!("get_block_number: {e}"))
+                })?
         };
         if last_block < self.block_start {
             return Ok(Vec::new());
@@ -201,11 +220,13 @@ impl ChainalysisOnChainOracleSource {
             let logs = tokio::time::timeout(PER_CALL_TIMEOUT, provider.get_logs(&filter))
                 .await
                 .map_err(|_| {
+                    observed_failure(ErrorKind::Network);
                     BootstrapError::PpoiUnreachable(format!(
                         "Chainalysis eth_getLogs timed out [{from}, {to}]"
                     ))
                 })?
                 .map_err(|e| {
+                    observed_failure(ErrorKind::Other);
                     BootstrapError::PpoiUnreachable(format!(
                         "Chainalysis eth_getLogs [{from}, {to}]: {e}"
                     ))

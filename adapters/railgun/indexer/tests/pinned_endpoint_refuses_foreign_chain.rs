@@ -337,3 +337,149 @@ async fn the_verification_sweep_does_not_promote_an_endpoint_the_request_never_t
          not report it recovered"
     );
 }
+
+const ZERO32: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+/// A minimally-complete block, so `latest_block` DESERIALIZES rather than failing. That
+/// matters here: a failing call retries onto the second endpoint and marks an error there,
+/// which would be the request degrading the observable rather than the sweep.
+fn block_at(number: u64) -> Value {
+    json!({
+        "hash": ZERO32,
+        "parentHash": ZERO32,
+        "sha3Uncles": ZERO32,
+        "miner": "0x0000000000000000000000000000000000000000",
+        "stateRoot": ZERO32,
+        "transactionsRoot": ZERO32,
+        "receiptsRoot": ZERO32,
+        "logsBloom": format!("0x{}", "0".repeat(512)),
+        "difficulty": "0x0",
+        "number": format!("0x{number:x}"),
+        "gasLimit": "0x1c9c380",
+        "gasUsed": "0x0",
+        "timestamp": "0x65000000",
+        "extraData": "0x",
+        "mixHash": ZERO32,
+        "nonce": "0x0000000000000000",
+        "baseFeePerGas": "0x7",
+        "size": "0x220",
+        "transactions": [],
+        "uncles": []
+    })
+}
+
+/// An honest endpoint that also answers `eth_getBlockByNumber`, so a pooled `latest_block`
+/// SUCCEEDS on it.
+async fn spawn_block_rpc(reported_chain_id: u64) -> SocketAddr {
+    let app = Router::new().route(
+        "/",
+        post(move |Json(req): Json<Value>| async move {
+            let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            let id = req.get("id").cloned().unwrap_or(Value::Null);
+            let result = match method {
+                "eth_chainId" => json!(format!("0x{reported_chain_id:x}")),
+                "eth_getBlockByNumber" => block_at(0x2710),
+                _ => json!("0x2710"),
+            };
+            (
+                StatusCode::OK,
+                Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    addr
+}
+
+/// The circuit breaker must survive a pooled request landing between two errors.
+///
+/// This is the HEADLINE of the defect the test above covers, and a strictly stronger
+/// property. That one asserts the `/status` symptom - a `Degraded` endpoint not reported
+/// `Healthy`. This asserts the consequence that costs an operator money:
+/// `mark_endpoint_success` sets `consecutive_errors = 0`, the sweep runs before EVERY
+/// pooled request, and one call contributes at most `MAX_RETRY_FACTOR` errors per endpoint -
+/// so a sweep that attributes health to a cached endpoint makes the Other-kind threshold
+/// unreachable however often that endpoint fails. A dead endpoint is then never cooled
+/// down: it stays in rotation and is retried forever instead of being failed over.
+///
+/// Errors are marked directly rather than provoked: what is under test is whether the count
+/// SURVIVES an intervening request, not how an error is classified. The intervening request is
+/// the load-bearing part - without one between the marks, nothing here can observe the sweep.
+#[tokio::test]
+async fn a_pooled_request_between_errors_does_not_reset_the_circuit_breaker() {
+    use raven_railgun_indexer::rpc_pool::{EndpointHealth, ErrorKind, PooledRpcChainSource};
+    use raven_railgun_indexer::ChainSource;
+
+    const THRESHOLD: u32 = 3;
+
+    let addr_a = spawn_block_rpc(HONEST_CHAIN).await;
+    let addr_b = spawn_block_rpc(HONEST_CHAIN).await;
+    let pool = Arc::new(
+        RpcEndpointPool::new(
+            vec![
+                EndpointConfig {
+                    url: format!("http://{addr_a}"),
+                    rps: 1000,
+                    burst: 1000,
+                },
+                EndpointConfig {
+                    url: format!("http://{addr_b}"),
+                    rps: 1000,
+                    burst: 1000,
+                },
+            ],
+            PoolConfig {
+                strategy: PoolStrategy::PrimaryWithFailover,
+                circuit_breaker_threshold: THRESHOLD,
+                ..PoolConfig::default()
+            },
+        )
+        .expect("pool builds"),
+    );
+
+    let secondary = Arc::clone(&pool.endpoints()[1]);
+    // Populate the cell so every later sweep of it is a cached hit, which is the exact
+    // condition under which the sweep has no evidence to attribute.
+    secondary
+        .verified_provider(HONEST_CHAIN)
+        .await
+        .expect("dial and verify the secondary");
+
+    let source = PooledRpcChainSource::new(
+        Arc::clone(&pool),
+        alloy::primitives::address!("fa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"),
+        HONEST_CHAIN,
+    );
+
+    for i in 1..=THRESHOLD {
+        pool.mark_endpoint_error(&secondary, ErrorKind::Other);
+        // Must SUCCEED, and on the primary: a failure would retry onto the secondary and
+        // mark it, making the request rather than the sweep the thing under test.
+        source
+            .latest_block()
+            .await
+            .expect("the primary answers, so the pooled call never reaches the secondary");
+        if i < THRESHOLD {
+            assert_eq!(
+                secondary.health(),
+                EndpointHealth::Degraded,
+                "below the threshold the endpoint degrades but must not trip yet (error {i})"
+            );
+        }
+    }
+
+    assert!(
+        matches!(secondary.health(), EndpointHealth::CoolingDown { .. }),
+        "after {THRESHOLD} Other-kind errors the breaker must trip even though a pooled \
+         request ran between each of them; got {:?}. A sweep that attributes health to a \
+         cached endpoint resets the count and makes this threshold unreachable, so a dead \
+         endpoint is retried forever instead of cooled down",
+        secondary.health()
+    );
+}

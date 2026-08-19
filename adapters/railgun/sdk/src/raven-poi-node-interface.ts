@@ -14,41 +14,11 @@ import {
   validateTreeNumber,
   TREE_DEPTH,
 } from "./client-pir";
-import { paddedBatchLength } from "./batch-ladder";
+import { drawPaddedSlots } from "./batch-ladder";
 import { ChainRegistry, type ChainRegistryEntry } from "./chain-registry";
 import { RavenError } from "./errors";
 import { ImtCache, imtCacheKey, imtCacheScopeKey } from "./imt-cache";
 import { foldMerkleRoot } from "./poseidon";
-
-/**
- * Uniform integer in `[0, bound)` from Web Crypto, rejection-sampled so the modulus does
- * not bias low values.
- *
- * Used to draw batch pads. `Math.random` would do for a cosmetic shuffle but not here:
- * the draw hides the cache-miss count from a server that sees every `shard_id` in
- * cleartext, so a predictable sequence is a predictable leak.
- */
-function randomBelow(bound: number): number {
-  if (!Number.isInteger(bound) || bound <= 0) {
-    throw RavenError.invalidQuery(`randomBelow: bound must be a positive integer, got ${bound}`);
-  }
-  if (bound === 1) return 0;
-  const c = globalThis.crypto;
-  if (!c || typeof c.getRandomValues !== "function") {
-    throw RavenError.invalidQuery(
-      "randomBelow: globalThis.crypto.getRandomValues is unavailable; batch padding " +
-        "cannot be drawn without a CSPRNG and cycling pads leaks the cache-miss count",
-    );
-  }
-  // Largest multiple of `bound` that fits a u32; draws at or above it are rejected.
-  const limit = Math.floor(0x1_0000_0000 / bound) * bound;
-  const buf = new Uint32Array(1);
-  for (;;) {
-    c.getRandomValues(buf);
-    const v = buf[0];
-    if (v < limit) return v % bound;
-  }
-}
 
 export type POIStatus = "Valid" | "ShieldBlocked" | "ProofSubmitted" | "Missing";
 export type BlindedCommitmentType = "Shield" | "Transact" | "Unshield";
@@ -712,12 +682,7 @@ export class RavenPOINodeInterface {
     // address the identical global index - the server reads the repeat period straight
     // off the shard sequence and recovers the exact miss count, which is the one
     // quantity the ladder exists to hide. Mirrors the Rust `build_padded_batch` fix.
-    const paddedCount = paddedBatchLength(queryLevels.length);
-    const queryBundles = Array.from({ length: paddedCount }, (_unused, slot) => {
-      const level =
-        slot < queryLevels.length
-          ? queryLevels[slot]
-          : queryLevels[randomBelow(queryLevels.length)];
+    const queryBundles = drawPaddedSlots(queryLevels).map((level) => {
       const target = BigInt(indices[level]);
       return decodeClientPirQueryBundle(
         ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, target),

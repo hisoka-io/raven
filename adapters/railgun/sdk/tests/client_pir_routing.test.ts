@@ -182,7 +182,10 @@ describe("client-PIR routing + pre-flight", () => {
   });
 
   it("getPOIsPerList client-PIR fail-soft on Network error only", async () => {
-    // unreachable port: a transient network drop is the only case where Missing is the right substitution
+    // PINS A KNOWN FAIL-OPEN; it is NOT an endorsement. `Missing` is
+    // the non-blocking verdict, so this substitution reports a possibly-ShieldBlocked
+    // commitment as merely unproven. The companion test below asserts the consequence:
+    // the result is indistinguishable from a genuinely absent record.
     const bcPresent = "0000000000000000000000000000000000000000000000000000000000000099";
     const bcMap = new Map<string, number>([[bcPresent, 0]]);
     const sdk = new RavenPOINodeInterface({
@@ -197,6 +200,41 @@ describe("client-PIR routing + pre-flight", () => {
       [{ blindedCommitment: bcPresent, type: "Shield" }],
     );
     expect(got[bcPresent][LIST_KEY_HEX]).toBe("Missing");
+  });
+
+  it("a transport failure is indistinguishable from a genuinely absent record", () => {
+    // CHARACTERIZATION of the fail-open above, so its consequence is a tracked contract
+    // rather than an incidental fact. This is the assertion a fix must INVERT: today the
+    // caller cannot tell "the network broke, this may be ShieldBlocked" from "no such
+    // record exists". A commitment in the map degrades to Missing when the transport
+    // fails; one absent from the map is set to Missing without any query at all. Both
+    // land in the same string-valued field, and `POIStatus` carries no variant, cause or
+    // flag that separates them. Inverting this assertion is what a fix looks like.
+    const bcQueried = "0000000000000000000000000000000000000000000000000000000000000099";
+    const bcAbsent = "00000000000000000000000000000000000000000000000000000000000000aa";
+    const bcMap = new Map<string, number>([[bcQueried, 0]]);
+    const sdk = new RavenPOINodeInterface({
+      endpoint: "http://127.0.0.1:1",
+      bearerToken: TOKEN,
+      useClientPir: true,
+      clientPirContexts: new Map([[`t1Status:${LIST_KEY_HEX}`, stubCtx()]]),
+      bcToIdxMaps: new Map([[LIST_KEY_HEX, bcMap]]),
+    });
+    return sdk
+      .getPOIsPerList(
+        [LIST_KEY_HEX],
+        [
+          { blindedCommitment: bcQueried, type: "Shield" },
+          { blindedCommitment: bcAbsent, type: "Shield" },
+        ],
+      )
+      .then((got) => {
+        const fromBrokenTransport = got[bcQueried][LIST_KEY_HEX];
+        const fromAbsentRecord = got[bcAbsent][LIST_KEY_HEX];
+        expect(fromBrokenTransport).toBe("Missing");
+        expect(fromAbsentRecord).toBe("Missing");
+        expect(fromBrokenTransport).toStrictEqual(fromAbsentRecord);
+      });
   });
 
   it("captured request ring is bounded at 64 entries", async () => {

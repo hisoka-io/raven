@@ -55,6 +55,9 @@ PATTERNS=(
   '\bM0?[0-9]{2,3}\b'
   '\bTier [0-9]+\.[0-9]+\b'
   '\bQ-[0-9]{3}\b'
+  # Hyphenated builder-ledger IDs. The unhyphenated `M0NN` rule above never matched these,
+  # so every `O-NNN` / `B-NNN` / `G-NNN` label passed a scan that exists to catch exactly them.
+  '\b[BDGLMO]-[0-9]{3}[a-z]?\b'
   'no-commit/'
 )
 

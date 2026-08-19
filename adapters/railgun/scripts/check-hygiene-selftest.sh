@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Red-proof for check-hygiene.sh (O-019: a gate ships with proof it can fail).
+# Red-proof for check-hygiene.sh: a gate ships with proof it can fail.
 #
 # The gate had two defects that a passing run could never reveal. Its scope was a literal list
 # that had drifted away from the workspace members, so `mock-ppoi` was CI-gated and unscanned.
@@ -25,7 +25,10 @@ check() { # expected actual name
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-git -C "$ROOT" archive HEAD | tar -x -C "$work"
+# Tracked files at their WORKING-TREE content, not `git archive HEAD`. The gate scans the
+# working tree, so seeding from HEAD gave the selftest a different oracle than the thing it
+# validates: an uncommitted leak read as "clean tree passes" while the real gate refused.
+( cd "$ROOT" && git ls-files -z | tar --null -T - -cf - ) | tar -xf - -C "$work"
 cp "$ROOT/$GATE_REL" "$work/$GATE_REL"
 
 run_gate() { ( cd "$work" && ./"$GATE_REL" >/dev/null 2>&1; echo $?; ); }
@@ -43,6 +46,13 @@ git -C "$work" checkout -- adapters/railgun/core/src/lib.rs 2>/dev/null \
 printf '\n// per B012 the caller retries\n' >> "$work/adapters/railgun/mock-ppoi/src/lib.rs"
 check 1 "$(run_gate)" "a leak in mock-ppoi is refused (the dir the literal list omitted)"
 cp "$ROOT/adapters/railgun/mock-ppoi/src/lib.rs" "$work/adapters/railgun/mock-ppoi/src/lib.rs"
+
+# A hyphenated ledger ID. The unhyphenated rule never matched these, so this class of label
+# shipped into the tree through a gate written to catch it.
+printf '\n// the G-999 distinction: a transient error self-heals\n' >> "$work/adapters/railgun/core/src/lib.rs"
+check 1 "$(run_gate)" "a hyphenated ledger label is refused"
+git -C "$work" checkout -- adapters/railgun/core/src/lib.rs 2>/dev/null \
+  || cp "$ROOT/adapters/railgun/core/src/lib.rs" "$work/adapters/railgun/core/src/lib.rs"
 
 # A broken pattern must fail closed rather than read as clean.
 sed -i "s|^PATTERNS=(|PATTERNS=(\n  'amendment(|" "$work/$GATE_REL"

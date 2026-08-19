@@ -48,8 +48,14 @@ indices that hold no record are zero-filled, and status byte `0` means `Valid`, 
 reads only byte 0 turns an absent record into the verdict that authorises a spend. `getPOIsPerList`
 therefore compares the row's BC tail against the blinded commitment it asked about and raises a
 typed `DecodeError` `RavenError` on any mismatch -- including the all-zero row -- rather than
-returning a status. Only a `Network` failure degrades to `Missing`; every other failure propagates so
-the wallet retries or falls back instead of spending.
+returning a status.
+
+One case does NOT propagate, and it is a known fail-open rather than a design choice: a `Network`
+failure degrades to `Missing`. `Missing` is the non-blocking verdict, so a transport failure tells the
+wallet a possibly-`ShieldBlocked` commitment is merely unproven, and the result is byte-identical to a
+genuinely absent record and to status byte 3 -- nothing on the returned value separates them. It is
+retained because removing it surfaces those as errors, which is correct only once an oversized
+upload reliably receives its 401 rather than a socket reset.
 
 Two limits are worth stating plainly. At the narrowest record width the encoder builds (32 bytes) the
 row has room for `bc[0..31]`, so the binding covers 31 of the 32 BC bytes; a wider record binds all

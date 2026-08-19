@@ -62,12 +62,13 @@ fi
 # file is a broken build, and 0 is under every ceiling.
 shipped_gzip_bytes() { # pkg_dir
     local dir="$1" total=0 n=0 f sz
-    for f in "${dir}"/*.wasm "${dir}"/*.js; do
-        [[ -f "${f}" ]] || continue
+    # Recursive: wasm-pack emits JS snippets under `snippets/<crate>/`, and a flat glob
+    # weighs none of them, so unbounded snippet growth could never fail this gate.
+    while IFS= read -r f; do
         sz=$(gzip -c "${f}" | wc -c)
         total=$(( total + sz ))
         n=$(( n + 1 ))
-    done
+    done < <(find "${dir}" -type f \( -name '*.wasm' -o -name '*.js' \) | sort)
     if (( n == 0 )); then
         echo "ERROR: no shippable .wasm or .js under ${dir}" >&2
         return 3

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Red-proof for the bench gate (O-019). Runs no bench: it drives the differ directly with
-# synthetic artifacts, so it is fast enough to gate every commit.
+# Red-proof for the bench gate: a gate ships with proof it can fail. Runs no bench - it drives
+# the differ directly with synthetic artifacts, so it is fast enough to gate every commit.
 #
 # Phase 1 ships --report-only, which means CI never observes the blocking path. Without
 # this, the day --report-only is removed would be the first time anyone learns whether the

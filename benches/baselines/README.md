@@ -38,4 +38,4 @@ it with a message saying what moved and why.
   outside the seed loop. Sample it per seed and it becomes gateable automatically.
 
 Thresholds and sample count are provisional until the runner's own noise floor is measured.
-See `DECISIONS.md` B-033 for the re-rule trigger.
+Re-ruling them requires a published per-metric CV for the CI runner.

@@ -710,6 +710,13 @@ pub struct ConsumerMetrics {
     /// [`Self::record_applied_event`]. Only a reorg rewind, which is the path that actually
     /// restores contiguity, clears it.
     pub unapplied_leaves: u64,
+    /// Lowest block holding leaves counted by [`Self::unapplied_leaves`], `None` when none are
+    /// outstanding.
+    ///
+    /// The count alone cannot say whether a rewind reaches the gap. The indexer resumes at
+    /// `rewind_height + 1`, so only a rewind strictly BELOW this block redelivers those leaves;
+    /// clearing on a shallower one discards a gap that can never be re-derived.
+    pub first_abandoned_block: Option<u64>,
 }
 
 impl ConsumerMetrics {
@@ -754,14 +761,30 @@ impl ConsumerMetrics {
         // fail-open this counter exists to close.
     }
 
-    /// Record leaves abandoned by a break in the per-leaf loop.
-    pub fn record_abandoned_leaves(&mut self, count: u64) {
+    /// Record leaves abandoned by a break in the per-leaf loop at `block`.
+    pub fn record_abandoned_leaves(&mut self, count: u64, block: u64) {
         self.unapplied_leaves = self.unapplied_leaves.saturating_add(count);
+        self.first_abandoned_block = Some(match self.first_abandoned_block {
+            Some(first) => first.min(block),
+            None => block,
+        });
     }
 
-    /// Contiguity restored: the reorg rewind re-opens the range those leaves live in.
-    pub fn clear_abandoned_leaves(&mut self) {
-        self.unapplied_leaves = 0;
+    /// Contiguity restored: a rewind to `rewound_to` redelivers every abandoned block.
+    ///
+    /// Scoped to the rewind depth deliberately. The indexer sets its cursor to `rewound_to`
+    /// and rescans from `rewound_to + 1`, so a rewind at or above the first abandoned block
+    /// redelivers nothing that is missing, and clearing on it would restore the fail-open
+    /// [`Self::unapplied_leaves`] exists to close - irreversibly, since a zeroed gap cannot
+    /// be re-derived.
+    pub fn clear_abandoned_leaves_reopened_by(&mut self, rewound_to: u64) {
+        if self
+            .first_abandoned_block
+            .is_some_and(|first| rewound_to < first)
+        {
+            self.unapplied_leaves = 0;
+            self.first_abandoned_block = None;
+        }
     }
 
     /// Record an event that advanced the chain cursor without touching the tree.
@@ -1183,9 +1206,10 @@ pub async fn run_consumer_task(
                                     // This leaf and every one after it are abandoned. The
                                     // error run alone cannot say that: an unrelated event
                                     // clears it while the gap is still there.
-                                    metrics
-                                        .lock()
-                                        .record_abandoned_leaves(abandoned_from(&leaves, leaf_idx));
+                                    metrics.lock().record_abandoned_leaves(
+                                        abandoned_from(&leaves, leaf_idx),
+                                        height,
+                                    );
                                     break;
                                 }
                             }
@@ -1206,9 +1230,10 @@ pub async fn run_consumer_task(
                             ) {
                                 had_error = true;
                                 record_consumer_error(&metrics, &e, "AppendLeaf apply", height);
-                                metrics
-                                    .lock()
-                                    .record_abandoned_leaves(abandoned_from(&leaves, leaf_idx));
+                                metrics.lock().record_abandoned_leaves(
+                                    abandoned_from(&leaves, leaf_idx),
+                                    height,
+                                );
                                 break;
                             }
                             if let Some(state) = verifier_state.as_mut() {
@@ -1263,10 +1288,9 @@ pub async fn run_consumer_task(
                 ) {
                     record_consumer_error(&metrics, &e, "Reorg apply", height);
                 } else {
-                    // The rewind re-opens the range the abandoned leaves live in, so they
-                    // are no longer a contiguity gap. This is the only healing route: an
-                    // ordinary applied event must not clear it.
-                    metrics.lock().clear_abandoned_leaves();
+                    // Scoped to the rewind depth: the indexer rescans from `height + 1`, so a
+                    // rewind at or above the abandoned block redelivers none of it.
+                    metrics.lock().clear_abandoned_leaves_reopened_by(height);
                 }
                 continue;
             }
@@ -1337,7 +1361,13 @@ pub async fn run_consumer_task(
             record_consumer_error(&metrics, &e, "Ppoi apply", height);
             continue;
         }
-        metrics.lock().record_applied_event(height);
+        // Per PAYLOAD, not per arm: this arm carries both an IMT append and a status byte, and
+        // only the append can close the contiguity gap the error run stands for.
+        if super::inspire::appends_to_a_tree(&payload) {
+            metrics.lock().record_applied_event(height);
+        } else {
+            metrics.lock().record_applied_non_tree_event(height);
+        }
         if let Some(state) = verifier_state.as_mut() {
             state
                 .maybe_verify_and_act(
@@ -1371,9 +1401,11 @@ fn record_consumer_error(
     m.consecutive_event_errors = m.consecutive_event_errors.saturating_add(1);
 }
 
-/// Leaves from `broke_at` to the end of the event, which the break abandoned.
+/// Leaves from `broke_at` to the end of the event, which the break left unapplied.
 ///
-/// Counts the failing leaf itself: it did not apply either.
+/// An upper bound, not an exact count: `drive_commit` can fail after the leaf at `broke_at`
+/// already reached the WAL and the store. Over-counting holds the readiness gate closed,
+/// which is the safe direction.
 fn abandoned_from<T>(leaves: &[T], broke_at: usize) -> u64 {
     u64::try_from(leaves.len().saturating_sub(broke_at)).unwrap_or(u64::MAX)
 }
@@ -2043,6 +2075,245 @@ mod tests {
         assert_eq!(
             m.consecutive_event_errors, 0,
             "a PPOI list leaf grows the PPOI IMT, so it is a tree mutation and must clear the run"
+        );
+    }
+
+    /// The arm is not homogeneous, and the classification is per PAYLOAD. A status row writes a
+    /// status byte and dirties shards; it never reaches `checked_imt_append`, so it cannot close
+    /// the contiguity gap the error run stands for and must not report the stall resolved.
+    ///
+    /// Companion to `a_ppoi_list_leaf_clears_the_error_run_because_it_grows_a_tree`, which asserts
+    /// the opposite direction on the same arm. Either alone would pass a wholesale conversion.
+    #[tokio::test]
+    async fn a_ppoi_status_row_must_not_clear_a_stall_because_it_appends_to_no_tree() {
+        const STALL: u64 = 6;
+        const HEIGHT: u64 = 5_000;
+        let m = drive_consumer(
+            vec![ConsumerEvent::Ppoi(
+                raven_railgun_persistence::WalEntryPayload::PpoiStatus {
+                    list_key: [1u8; 32],
+                    blinded_commitment: [2u8; 32],
+                    status: 3,
+                },
+                HEIGHT,
+            )],
+            STALL,
+            1_000,
+            "ppoi-status-routing",
+        )
+        .await;
+
+        assert_eq!(
+            m.consecutive_event_errors, STALL,
+            "a status byte appends to no tree, so it must not report the stall resolved"
+        );
+        assert_eq!(
+            m.last_applied_block, HEIGHT,
+            "the chain cursor still advances: the row WAS applied"
+        );
+    }
+
+    /// The partition must not drift from the one `validate_apply` screens: every variant that
+    /// reaches `checked_imt_append` is exactly a variant that may clear the error run.
+    #[test]
+    fn the_tree_append_partition_matches_the_screened_variants() {
+        use raven_railgun_persistence::WalEntryPayload as P;
+        let appends = [
+            P::AppendLeaf {
+                tree_number: 0,
+                leaf_index: 0,
+                commitment: [1u8; 32],
+            },
+            P::PpoiListLeafAdded {
+                list_key: [1u8; 32],
+                list_index: 0,
+                blinded_commitment: [2u8; 32],
+                status: 0,
+            },
+        ];
+        let inert = [
+            P::PpoiStatus {
+                list_key: [1u8; 32],
+                blinded_commitment: [2u8; 32],
+                status: 0,
+            },
+            P::Reorg { height: 1 },
+            P::Heartbeat {
+                wallclock_unix_ms: 0,
+            },
+        ];
+        assert_eq!(
+            appends.len() + inert.len(),
+            5,
+            "every payload variant must be classified; a new one defaults to nothing"
+        );
+        for p in &appends {
+            assert!(
+                super::super::inspire::appends_to_a_tree(p),
+                "{p:?} reaches checked_imt_append and must be allowed to clear the run"
+            );
+        }
+        for p in &inert {
+            assert!(
+                !super::super::inspire::appends_to_a_tree(p),
+                "{p:?} appends to no tree and must not clear the run"
+            );
+        }
+    }
+
+    fn leaf_at(leaf_index: u32, commitment: u8) -> raven_railgun_core::CommitmentLeaf {
+        raven_railgun_core::CommitmentLeaf {
+            tree_number: 0,
+            leaf_index,
+            commitment_hash: [commitment; 32],
+            ciphertext: Vec::new(),
+        }
+    }
+
+    fn shield_at(height: u64, leaves: Vec<raven_railgun_core::CommitmentLeaf>) -> ConsumerEvent {
+        let start_position = leaves.first().map_or(0, |l| l.leaf_index);
+        ConsumerEvent::Chain(
+            raven_railgun_core::RailgunEvent::Shield {
+                block_number: height,
+                tx_hash: [7u8; 32],
+                tree_number: 0,
+                start_position,
+                leaves,
+            },
+            height,
+        )
+    }
+
+    const BREAK_AT: u64 = 5_000;
+
+    /// The apply-stage producer. A gapped leaf fails the contiguity screen inside
+    /// `apply_one_leaf`, and the break must record BOTH the abandoned tail and the block it
+    /// lives in - the count alone cannot tell a later rewind whether it reaches the gap.
+    #[tokio::test]
+    async fn a_gapped_leaf_records_the_abandoned_tail_and_the_block_it_broke_on() {
+        let m = drive_consumer(
+            vec![shield_at(
+                BREAK_AT,
+                vec![leaf_at(3, 0x11), leaf_at(4, 0x12)],
+            )],
+            0,
+            1_000,
+            "abandon-records-block",
+        )
+        .await;
+
+        assert_eq!(
+            m.unapplied_leaves, 2,
+            "the failing leaf and every one after it are unapplied"
+        );
+        assert_eq!(
+            m.first_abandoned_block,
+            Some(BREAK_AT),
+            "the block must survive to the clear site, which is the only thing that can \
+             judge whether a rewind reaches the gap"
+        );
+    }
+
+    /// The replay-screen producer, which is a different break in the same loop: a redelivered
+    /// leaf carrying a divergent commitment. Asserted separately so removing either producer
+    /// alone reddens something.
+    #[tokio::test]
+    async fn a_divergent_redelivery_records_the_abandoned_tail_and_its_block() {
+        let m = drive_consumer(
+            vec![
+                shield_at(BREAK_AT - 100, vec![leaf_at(0, 0x21)]),
+                shield_at(BREAK_AT, vec![leaf_at(0, 0x22), leaf_at(1, 0x23)]),
+            ],
+            0,
+            1_000,
+            "abandon-records-block-replay",
+        )
+        .await;
+
+        assert_eq!(
+            m.unapplied_leaves, 2,
+            "a divergent redelivery abandons the whole tail, not just the divergent leaf"
+        );
+        assert_eq!(m.first_abandoned_block, Some(BREAK_AT));
+    }
+
+    /// The fail-open this closes. The indexer rescans from `rewind_height + 1`, so a rewind AT
+    /// the abandoned block redelivers nothing that is missing. Clearing on it is irreversible:
+    /// a zeroed gap can never be re-derived, and `/health/ready` then returns 200 over a tree
+    /// that fails the contiguity screen for every later leaf.
+    #[tokio::test]
+    async fn a_rewind_at_the_abandoned_block_must_not_clear_the_gap() {
+        let m = drive_consumer(
+            vec![
+                shield_at(BREAK_AT, vec![leaf_at(3, 0x31), leaf_at(4, 0x32)]),
+                ConsumerEvent::Reorg(BREAK_AT),
+            ],
+            0,
+            1_000,
+            "rewind-at-gap",
+        )
+        .await;
+
+        assert_eq!(
+            m.unapplied_leaves, 2,
+            "a rewind that does not reach below the gap must leave the signal standing"
+        );
+        assert_eq!(m.first_abandoned_block, Some(BREAK_AT));
+    }
+
+    /// A rewind ABOVE it is the same case and is the likelier one in production: a tip reorg
+    /// lands far above a gap opened earlier.
+    #[tokio::test]
+    async fn a_rewind_above_the_abandoned_block_must_not_clear_the_gap() {
+        let m = drive_consumer(
+            vec![
+                shield_at(BREAK_AT, vec![leaf_at(3, 0x41), leaf_at(4, 0x42)]),
+                ConsumerEvent::Reorg(BREAK_AT + 250),
+            ],
+            0,
+            1_000,
+            "rewind-above-gap",
+        )
+        .await;
+
+        assert_eq!(
+            m.unapplied_leaves, 2,
+            "a tip reorg above the gap redelivers none of it"
+        );
+        assert_eq!(m.first_abandoned_block, Some(BREAK_AT));
+    }
+
+    /// The inverse, so the guard cannot be a permanent wedge dressed up as a fix: a rewind
+    /// BELOW the abandoned block does redeliver those leaves, and must clear.
+    ///
+    /// A second break AFTER the rewind is what makes this discriminating. Asserting only
+    /// `0`/`None` cannot tell "cleared" from "never recorded", so it passes vacuously when a
+    /// producer is deleted; the follow-on break gives a value only a recorded-then-cleared
+    /// history can produce - 2 leaves at the LATER block, never 4 at the earlier one.
+    #[tokio::test]
+    async fn a_rewind_below_the_abandoned_block_clears_the_gap() {
+        const LATER_BREAK: u64 = BREAK_AT + 500;
+        let m = drive_consumer(
+            vec![
+                shield_at(BREAK_AT, vec![leaf_at(3, 0x51), leaf_at(4, 0x52)]),
+                ConsumerEvent::Reorg(BREAK_AT - 1),
+                shield_at(LATER_BREAK, vec![leaf_at(6, 0x53), leaf_at(7, 0x54)]),
+            ],
+            0,
+            1_000,
+            "rewind-below-gap",
+        )
+        .await;
+
+        assert_eq!(
+            m.unapplied_leaves, 2,
+            "the rewind redelivers the first gap, so only the SECOND break is outstanding; \
+             4 here means the clear never fired"
+        );
+        assert_eq!(
+            m.first_abandoned_block,
+            Some(LATER_BREAK),
+            "the cleared block must not survive as the minimum"
         );
     }
 

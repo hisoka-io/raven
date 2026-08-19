@@ -1292,10 +1292,6 @@ fn is_non_retryable(err: &IndexerError) -> bool {
     false
 }
 
-/// Exponential-backoff retry helper for RPC calls.
-///
-/// Bounded by [`MAX_RPC_RETRIES`] and [`MAX_RPC_TOTAL_ELAPSED_SECS`]. Per-attempt timeout
-/// is [`RPC_TIMEOUT_SECS`]. Non-retryable errors (HTTP 4xx, JSON decode, "method not found")
 /// Bound one RPC attempt by [`RPC_TIMEOUT_SECS`].
 ///
 /// The single-endpoint path has always had this via [`retry_rpc`]; the pooled and WS paths
@@ -1321,6 +1317,10 @@ pub(crate) async fn with_rpc_timeout<T>(
     }
 }
 
+/// Exponential-backoff retry helper for RPC calls.
+///
+/// Bounded by [`MAX_RPC_RETRIES`] and [`MAX_RPC_TOTAL_ELAPSED_SECS`]. Per-attempt timeout
+/// is [`RPC_TIMEOUT_SECS`]. Non-retryable errors (HTTP 4xx, JSON decode, "method not found")
 /// fail-fast without consuming the retry budget.
 async fn retry_rpc<F, Fut, T>(mut op: F) -> Result<T>
 where

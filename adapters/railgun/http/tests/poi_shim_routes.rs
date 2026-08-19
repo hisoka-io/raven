@@ -350,6 +350,7 @@ async fn freshness_header_value_format_is_well_formed() {
         consumer_errors: 0,
         consecutive_event_errors: 0,
         unapplied_leaves: 0,
+        first_abandoned_block: None,
     }));
 
     let (store, _) = seeded_store();

@@ -4,6 +4,8 @@
  * `raven_railgun_core::batch_ladder`; the server refuses off-ladder lengths.
  */
 
+import { RavenError } from "./errors";
+
 /** Permitted batch sizes, ascending. */
 export const BATCH_SIZE_LADDER: readonly number[] = [1, 2, 4, 8, 16, 32];
 
@@ -33,4 +35,48 @@ export function paddedBatchLength(realCount: number): number {
     );
   }
   return step;
+}
+
+/**
+ * Uniform draw below `bound`, rejection-sampled so no residue is favoured.
+ *
+ * Throws rather than degrading: `SeededClientQuery.shard_id` is unencrypted on the wire,
+ * so a pad drawn from a weak or absent CSPRNG is a leak, not a slow path.
+ */
+function randomBelow(bound: number): number {
+  if (!Number.isInteger(bound) || bound <= 0) {
+    throw RavenError.invalidQuery(`randomBelow: bound must be a positive integer, got ${bound}`);
+  }
+  if (bound === 1) return 0;
+  const c = globalThis.crypto;
+  if (!c || typeof c.getRandomValues !== "function") {
+    throw RavenError.invalidQuery(
+      "randomBelow: globalThis.crypto.getRandomValues is unavailable; batch padding " +
+        "cannot be drawn without a CSPRNG and cycling pads leaks the cache-miss count",
+    );
+  }
+  // Largest multiple of `bound` that fits a u32; draws at or above it are rejected.
+  const limit = Math.floor(0x1_0000_0000 / bound) * bound;
+  const buf = new Uint32Array(1);
+  for (;;) {
+    c.getRandomValues(buf);
+    const v = buf[0];
+    if (v < limit) return v % bound;
+  }
+}
+
+/**
+ * Slot plan for one padded batch: the real slots in order, then pad slots drawn at RANDOM
+ * from the real ones.
+ *
+ * Pads are never cycled. `slot % realSlots.length` makes slot j and slot j+len address the
+ * identical global index, so a server reading the cleartext `shard_id` sequence recovers the
+ * repeat period and with it the exact cache-miss count - the one quantity the ladder exists
+ * to hide. Lives here, exported, so the test exercises the shipped draw rather than a copy.
+ */
+export function drawPaddedSlots(realSlots: readonly number[]): number[] {
+  const padded = paddedBatchLength(realSlots.length);
+  return Array.from({ length: padded }, (_unused, slot) =>
+    slot < realSlots.length ? realSlots[slot] : realSlots[randomBelow(realSlots.length)],
+  );
 }

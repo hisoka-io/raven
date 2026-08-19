@@ -377,15 +377,21 @@ fn scan_for_tail(path: &std::path::Path) -> Result<ScanResult> {
 
 #[allow(clippy::too_many_lines)] // single linear frame scanner; splitting hurts readability
 fn scan_full(path: &std::path::Path) -> Result<WalReplay> {
-    if !path.exists() {
-        return Ok(WalReplay {
-            entries: Vec::new(),
-            truncated_at: None,
-            next_seq: 0,
-            last_marker: 0,
-        });
-    }
-    let mut file = File::open(path)?;
+    // Only NotFound is an empty log. `Path::exists()` is false for a permission failure or an
+    // unresolvable link too, and treating those as empty drops every entry the log holds at
+    // `Ok`. Discriminate on the error kind and fail closed.
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WalReplay {
+                entries: Vec::new(),
+                truncated_at: None,
+                next_seq: 0,
+                last_marker: 0,
+            })
+        }
+        Err(e) => return Err(e.into()),
+    };
     let total = file.metadata()?.len();
     let mut entries = Vec::new();
     let mut next_seq: u64 = 0;
@@ -879,6 +885,109 @@ mod tests {
             "current.log holds only what was written after the successful archive"
         );
         assert_eq!(replay.entries.last().expect("two entries").seq, seq);
+    }
+
+    /// Poison means the on-disk extent is no longer known good, so a further append would land
+    /// past a hole `replay` stops at and every entry after it would be fsync-acknowledged and
+    /// unreplayable.
+    ///
+    /// Injected: no deterministic filesystem manipulation drives a rewind failure or a
+    /// post-rename reopen failure, so the assignment sites cannot be reached from a test.
+    #[test]
+    fn a_poisoned_wal_refuses_every_append_until_it_is_reopened() {
+        let (_d, layout) = make_layout();
+        let wal = Wal::open(&layout, None).expect("open");
+        let first = wal.append(&test_payload(0), 1).expect("first");
+
+        wal.inner.lock().poisoned = true;
+
+        let err = wal
+            .append(&test_payload(1), 2)
+            .expect_err("a poisoned WAL must refuse every append");
+        assert!(
+            format!("{err}").contains("poisoned"),
+            "the refusal must name the poison so an operator can act on it, got: {err}"
+        );
+        assert_eq!(
+            wal.next_seq(),
+            first + 1,
+            "a refused append burns no seq: the next successful one reuses it"
+        );
+        assert_eq!(
+            wal.replay().expect("replay").entries.len(),
+            1,
+            "and writes nothing"
+        );
+    }
+
+    /// Reopening is the documented recovery, and a fresh `Wal` must start clean or the
+    /// refusal above becomes permanent.
+    #[test]
+    fn reopening_clears_the_poison_and_restores_appends() {
+        let (_d, layout) = make_layout();
+        {
+            let wal = Wal::open(&layout, None).expect("open");
+            wal.append(&test_payload(0), 1).expect("first");
+            wal.inner.lock().poisoned = true;
+            wal.append(&test_payload(1), 2)
+                .expect_err("refused while poisoned");
+        }
+        let reopened = Wal::open(&layout, None).expect("reopen");
+        assert!(
+            !reopened.inner.lock().poisoned,
+            "a fresh Wal starts unpoisoned; that is the whole recovery route"
+        );
+        reopened
+            .append(&test_payload(1), 2)
+            .expect("appends work again after a reopen");
+        assert_eq!(reopened.replay().expect("replay").entries.len(), 2);
+    }
+
+    /// A log that is present but UNREADABLE must not replay as an empty one. `Path::exists()`
+    /// reports false for an unresolvable link exactly as it does for absence, so the scan
+    /// returned `Ok` with zero entries and the durable log was silently dropped.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_log_fails_closed_instead_of_replaying_as_empty() {
+        let (_d, layout) = make_layout();
+        let path = layout.wal_current_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("wal dir");
+        }
+        // Self-referential link: unresolvable, so `exists()` is false while `open` reports
+        // a loop rather than NotFound.
+        std::os::unix::fs::symlink("current.log", &path).expect("symlink");
+        assert!(
+            !path.exists(),
+            "precondition: exists() cannot see this file"
+        );
+
+        let err = scan_full(&path).expect_err("an unresolvable log must not scan as empty");
+        assert!(
+            matches!(err, PersistenceError::Io(_)),
+            "expected an I/O failure, got: {err}"
+        );
+    }
+
+    /// A successful archive CLEARS the flag, which is the only in-process route out of poison -
+    /// a reopen is the other, and it is a new process. Without it a WAL poisoned by a torn
+    /// append stays refusing every append after a clean seal.
+    #[test]
+    fn a_successful_archive_clears_the_poison() {
+        let (_d, layout) = make_layout();
+        let wal = Wal::open(&layout, None).expect("open");
+        wal.append(&test_payload(0), 1).expect("first");
+        wal.inner.lock().poisoned = true;
+
+        wal.archive(0, 0)
+            .expect("archive seals the log and reopens a fresh one");
+
+        assert!(
+            !wal.inner.lock().poisoned,
+            "a fresh log has no torn tail, so the seal is the recovery"
+        );
+        wal.append(&test_payload(1), 2)
+            .expect("appends must work again once the flag is cleared");
     }
 
     /// A successful archive leaves a fresh, unpoisoned, appendable log.

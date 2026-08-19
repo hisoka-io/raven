@@ -69,6 +69,7 @@ fn caught_up_at_tip() -> MetricsCell {
         consumer_errors: 0,
         consecutive_event_errors: 0,
         unapplied_leaves: 0,
+        first_abandoned_block: None,
     }))
 }
 
@@ -226,7 +227,7 @@ async fn readiness_stays_ready_without_consumer_metrics() {
     fixture.shutdown().await;
 }
 
-/// The distinction O-016 exists for: a transient error self-heals, a contiguity gap does not.
+/// A transient error self-heals; a contiguity gap does not.
 ///
 /// `consecutive_event_errors` is cleared by ANY applied event, which is correct for a single
 /// failure the next event fixes and wrong for a per-leaf loop that broke and left leaves behind.
@@ -234,6 +235,7 @@ async fn readiness_stays_ready_without_consumer_metrics() {
 /// so the tree is wedged and `/health/ready` says 200.
 #[tokio::test]
 async fn abandoned_leaves_keep_an_instance_out_of_rotation_after_the_error_run_clears() {
+    const ABANDONED_AT: u64 = 21_000_050;
     let healthy = caught_up_at_tip();
     let stalled = caught_up_at_tip();
     let mut per_instance = HashMap::new();
@@ -251,7 +253,7 @@ async fn abandoned_leaves_keep_an_instance_out_of_rotation_after_the_error_run_c
     {
         let mut m = stalled.lock();
         m.consecutive_event_errors = 1;
-        m.record_abandoned_leaves(4);
+        m.record_abandoned_leaves(4, ABANDONED_AT);
     }
     let (code, body) = fixture.probe().await;
     assert_eq!(code, 503, "a contiguity gap must leave rotation");
@@ -273,8 +275,22 @@ async fn abandoned_leaves_keep_an_instance_out_of_rotation_after_the_error_run_c
     );
     assert_eq!(body.stalled_consumer_instances, vec![STALLED.to_owned()]);
 
-    // Only restoring contiguity clears it. That is the reorg rewind's job.
-    stalled.lock().clear_abandoned_leaves();
+    // A rewind AT the abandoned block redelivers nothing missing: the indexer rescans from
+    // `height + 1`. Clearing on it would discard a gap that cannot be re-derived.
+    stalled
+        .lock()
+        .clear_abandoned_leaves_reopened_by(ABANDONED_AT);
+    let (code, body) = fixture.probe().await;
+    assert_eq!(
+        code, 503,
+        "a rewind that does not reach below the abandoned block leaves the hole in place"
+    );
+    assert_eq!(body.stalled_consumer_instances, vec![STALLED.to_owned()]);
+
+    // Only a rewind BELOW it redelivers those leaves. That is the reorg rewind's job.
+    stalled
+        .lock()
+        .clear_abandoned_leaves_reopened_by(ABANDONED_AT - 1);
     let (code, body) = fixture.probe().await;
     assert_eq!(
         code, 200,

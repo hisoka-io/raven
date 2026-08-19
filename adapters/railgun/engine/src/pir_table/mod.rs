@@ -596,10 +596,8 @@ mod tests {
 
     #[test]
     fn every_chain_tree_encoder_ignores_a_foreign_tree() {
-        // Uniform contract now that all three carry their tree. `per-leaf-bc` used to be
-        // the exception, and that exception WAS the O-011 regression: its rows are indexed
-        // by `leaf_index` alone, so an unfiltered foreign leaf overwrote this tree's row
-        // and the higher tree won.
+        // All three carry their tree. `per-leaf-bc` rows are indexed by `leaf_index` alone,
+        // so an unfiltered foreign leaf overwrites this tree's row and the higher tree wins.
         let bc = PerLeafCommitmentEncoder::new(32, 2048, 0).expect("bc");
         let path = PerLeafPathEncoder::new(PATH_RECORD_BYTES, 2048, 0).expect("path");
         let node = PerNodeEncoder::new(2048, 0).expect("node");

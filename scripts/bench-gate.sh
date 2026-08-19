@@ -7,7 +7,7 @@
 # mistaken for a clean one.
 #
 # Removing --report-only requires publishing the runner's measured CV per metric and a
-# threshold ruling. See DECISIONS.md B-033.
+# threshold ruling.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

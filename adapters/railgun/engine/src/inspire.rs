@@ -1087,6 +1087,24 @@ pub fn validate_apply(
     Ok(())
 }
 
+/// Whether applying this payload APPENDS to an IMT.
+///
+/// The error run `/health/ready` gates on means leaf application is wedged, and only an IMT
+/// append can close the contiguity gap that wedges it. A payload that mutates other store state
+/// (`PpoiStatus` writes a status byte and dirties shards) says nothing about that gap, so
+/// clearing the run on one reports a wedged tree as healthy.
+///
+/// Deliberately the same partition [`validate_apply`] screens on: these are exactly the variants
+/// that reach `checked_imt_append`, and the two must not drift apart.
+#[must_use]
+pub(crate) fn appends_to_a_tree(payload: &raven_railgun_persistence::WalEntryPayload) -> bool {
+    use raven_railgun_persistence::WalEntryPayload as P;
+    match payload {
+        P::AppendLeaf { .. } | P::PpoiListLeafAdded { .. } => true,
+        P::PpoiStatus { .. } | P::Reorg { .. } | P::Heartbeat { .. } => false,
+    }
+}
+
 #[cfg(test)]
 mod snapshot_v6_tests {
     use super::{

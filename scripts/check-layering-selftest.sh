@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Red-proof for check-layering.sh (O-019: a gate ships with proof it can fail).
+# Red-proof for check-layering.sh: a gate ships with proof it can fail.
 #
 # The gate shipped green and was believed working because it was only ever exercised on
 # the lowercase path. It passed `pub struct Nullifier` and it printed "clean." on an

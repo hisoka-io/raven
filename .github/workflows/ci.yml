@@ -300,7 +300,7 @@ jobs:
           # The 26 assertion-carrying `#[ignore]`d CLI tests ran in NO lane: the three
           # `--run-ignored all` filters above are explicit binary lists that never named
           # these. Measured 2026-08-11 with --no-fail-fast: 26 ignored, 14 green, 12 RED
-          # at HEAD (G-032). The twelve are excluded BY NAME, not by dropping their
+          # at HEAD. The twelve are excluded BY NAME, not by dropping their
           # binaries, so a fix flips one line here instead of restoring a whole file.
           # `production_cell_round_trip_and_batch_within_budget` is excluded for a
           # DIFFERENT reason: it is a wall-clock budget (71.9 ms floor), and it measured
@@ -652,8 +652,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Report-only until the runner's own noise floor is measured: the thresholds were
       # derived on a quiet local machine, and a threshold below the runner's noise floor
-      # flakes on noise while still missing real shifts. DECISIONS.md B-033 carries the
-      # trigger for re-ruling them.
+      # flakes on noise while still missing real shifts. The re-rule trigger is a published
+      # per-metric CV for this runner.
       - name: run bench gate
         run: scripts/bench-gate.sh
       - name: upload bench artifact

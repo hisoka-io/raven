@@ -1,7 +1,7 @@
 //! Round-robin RPC endpoint pool with per-endpoint rate limiting and circuit-breaker cooldowns.
 //!
-//! When `at = Some(block_id)`, [`PooledRpcChainSource`] pins the call to one endpoint via
-//! [`PinnedSession`] so all reads in a Layer 2 verification round observe the same snapshot.
+//! [`PinnedSession`] scopes to a SINGLE call, so its retries cannot straddle two nodes; what
+//! makes a verification round's reads comparable is the shared `block_id`, not endpoint pinning.
 
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 

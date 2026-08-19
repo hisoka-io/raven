@@ -104,6 +104,7 @@ fn with_instance_metrics_builder_round_trips_map() {
         consumer_errors: 0,
         consecutive_event_errors: 0,
         unapplied_leaves: 0,
+        first_abandoned_block: None,
     }));
     let mut map: HashMap<InstanceId, Arc<parking_lot::Mutex<ConsumerMetrics>>> = HashMap::new();
     let id = InstanceId::new("with-instance-metrics-roundtrip");
@@ -259,6 +260,91 @@ async fn metrics_handler_emits_per_instance_engine_gauges() {
     assert!(
         text.contains("raven_railgun_semaphore_permits_available"),
         "scrape must emit process semaphore_permits_available gauge"
+    );
+}
+
+/// The contiguity-gap gauge is the dashboard half of the readiness signal.
+///
+/// Values are pinned and deliberately DIFFERENT from the error-run gauge beside it, so a block
+/// that renders under the right name while reading the neighbouring field is caught too - a
+/// name-only assertion cannot tell those apart.
+#[tokio::test(flavor = "current_thread")]
+async fn metrics_handler_emits_the_unapplied_leaves_gauge_with_its_own_value() {
+    use axum::body::Body;
+    use axum::http::{header, Method, Request, StatusCode};
+    use http_body_util::BodyExt;
+    use raven_railgun_engine::persistence::ConsumerMetrics;
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use tower::ServiceExt;
+
+    const UNAPPLIED: u64 = 7;
+    const ERROR_RUN: u64 = 3;
+    const INSTANCE: &str = "unapplied-leaves-gauge";
+
+    let router = {
+        let _g = APPSTATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let cell = Arc::new(parking_lot::Mutex::new(ConsumerMetrics {
+            consecutive_event_errors: ERROR_RUN,
+            unapplied_leaves: UNAPPLIED,
+            first_abandoned_block: Some(21_000_000),
+            ..ConsumerMetrics::default()
+        }));
+        let mut per_instance = HashMap::new();
+        per_instance.insert(InstanceId::new(INSTANCE), cell);
+
+        // The gauge walk is driven by the ENGINE's instance list, so a metrics cell whose
+        // instance is not registered emits nothing at all.
+        let instance: Arc<PirInstance<EchoScheme>> = Arc::new(PirInstance::new(
+            InstanceId::new(INSTANCE),
+            InstanceRole::Static,
+            EchoState,
+        ));
+        let mut engine: Engine<EchoScheme> = Engine::new();
+        engine
+            .register_instance(Arc::clone(&instance))
+            .expect("register instance");
+
+        let mut cfg = HttpConfig::demo(TOKEN);
+        cfg.metrics_public = true;
+        let app_state = AppState::new(engine, cfg)
+            .expect("appstate")
+            .with_instance_metrics(per_instance);
+        raven_railgun_http::router(app_state).expect("router")
+    };
+
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri("/metrics")
+        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .expect("build req");
+    let peer: SocketAddr = "127.0.0.1:50102".parse().expect("addr");
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(peer));
+
+    let resp = router.oneshot(req).await.expect("oneshot");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.expect("body").to_bytes();
+    let text = String::from_utf8(body.to_vec()).expect("utf8");
+
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("raven_railgun_consumer_unapplied_leaves{"))
+        .unwrap_or_else(|| {
+            panic!("scrape emitted no raven_railgun_consumer_unapplied_leaves row:\n{text}")
+        });
+    assert!(
+        line.contains(&format!("instance=\"{INSTANCE}\"")),
+        "the gauge must carry its instance label, got: {line}"
+    );
+    assert!(
+        line.ends_with(&format!(" {UNAPPLIED}")),
+        "the gauge must render unapplied_leaves ({UNAPPLIED}), not the error run \
+         ({ERROR_RUN}) beside it, got: {line}"
     );
 }
 
