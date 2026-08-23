@@ -73,6 +73,34 @@ pub enum BootstrapError {
     #[error("RPC unreachable: {0}")]
     RpcUnreachable(String),
     #[error(
+        "boundary repair trigger {repair_trigger_threshold} exceeds the tree's capacity \
+         {expected_filled_count}, so it can never be reached and self-healing is off for every \
+         tree. Operator: set --boundary-repair-trigger-threshold at or below the capacity, or \
+         leave it unset for the default."
+    )]
+    RepairThresholdUnreachable {
+        repair_trigger_threshold: usize,
+        expected_filled_count: usize,
+    },
+    #[error(
+        "chain state at block {block} did not decode ({detail}). An eth_call to an address with \
+         no deployed code succeeds and returns empty data, so this is what a block BELOW the \
+         contract's deployment looks like: the endpoint answered correctly. Operator: no RPC \
+         change fixes this - the caller asked about the wrong block."
+    )]
+    ChainStateUndecodable { block: u64, detail: String },
+    #[error(
+        "tree {tree_number}'s rollover search was floored at block {search_lo}, where the active \
+         tree is already {active_at_lo}; tree {tree_number} closed at or below the floor, so the \
+         search cannot bracket its rollover. Refusing rather than reading a root from before this \
+         tree's own leaves."
+    )]
+    RolloverFloorAboveTree {
+        tree_number: u32,
+        search_lo: u64,
+        active_at_lo: u32,
+    },
+    #[error(
         "no archival RPC available for verification at checkpoint block {checkpoint_block}: {actionable}"
     )]
     NoArchivalRpc {
@@ -228,6 +256,56 @@ pub trait ChainOracle: Send + Sync {
         from_block: u64,
         to_block: u64,
     ) -> Result<Vec<(u32, u32, [u8; 32])>, BootstrapError>;
+    /// Root `tree_number` held when it CLOSED, or `None` while it is still the active tree.
+    ///
+    /// `rootHistory` records one entry per BATCH and the IMT is fixed-depth and zero-padded, so
+    /// the root over any batch-boundary prefix of a closed tree is a root the chain holds:
+    /// membership alone cannot tell a complete tree from a prefix-truncated fetch. The chain
+    /// recorded exactly one root at the rollover, and that one can.
+    ///
+    /// A row count cannot substitute. `Commitments.sol` moves an entire overflowing batch to the
+    /// next tree, so a closed tree legitimately holds fewer leaves than capacity.
+    ///
+    /// `search_lo` MUST be a block at which the contract existed and `tree_number` was still
+    /// active. An `eth_call` to an address with no code succeeds returning empty data, so a probe
+    /// below deployment fails in the ABI decoder instead of answering; the caller knows this bound
+    /// from its own rows and the trait cannot. It is validated here, never trusted.
+    ///
+    /// The default body binary-searches the rollover over `[search_lo, search_hi]`, costing
+    /// `log2(search_hi - search_lo)` archival reads, and assumes the active tree number is
+    /// non-decreasing in block height. A source that indexes rollovers should answer directly.
+    async fn tree_final_root(
+        &self,
+        tree_number: u32,
+        search_lo: u64,
+        search_hi: u64,
+    ) -> Result<Option<[u8; 32]>, BootstrapError> {
+        if self.active_tree_number_at(search_hi).await? <= tree_number {
+            return Ok(None);
+        }
+        let active_at_lo = self.active_tree_number_at(search_lo).await?;
+        if active_at_lo > tree_number {
+            return Err(BootstrapError::RolloverFloorAboveTree {
+                tree_number,
+                search_lo,
+                active_at_lo,
+            });
+        }
+        let (mut lo, mut hi) = (search_lo, search_hi);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.active_tree_number_at(mid).await? > tree_number {
+                hi = mid;
+            } else {
+                lo = mid.saturating_add(1);
+            }
+        }
+        // The floor check proved the predicate false at `search_lo`, so `lo > search_lo` and the
+        // read never falls below the caller's bound.
+        let closed_at = lo.saturating_sub(1);
+        Ok(Some(self.merkle_root_at(closed_at).await?))
+    }
+
     /// Succeeds iff some pooled endpoint serves historical state at `block`.
     async fn archival_probe(&self, block: u64) -> Result<(), BootstrapError> {
         match self.merkle_root_at(block).await {
@@ -245,6 +323,24 @@ pub trait ChainOracle: Send + Sync {
             }
             Err(other) => Err(other),
         }
+    }
+}
+
+/// Keeps an undecodable response distinguishable from a transport refusal, and names the block
+/// that was PROBED rather than whichever block a later classifier happens to hold.
+fn chain_read_error(
+    block: u64,
+    method: &str,
+    e: &raven_railgun_indexer::IndexerError,
+) -> BootstrapError {
+    match e {
+        raven_railgun_indexer::IndexerError::Decode(detail) => {
+            BootstrapError::ChainStateUndecodable {
+                block,
+                detail: format!("{method}: {detail}"),
+            }
+        }
+        other => BootstrapError::RpcUnreachable(format!("{method} at block {block}: {other}")),
     }
 }
 
@@ -288,7 +384,13 @@ pub struct BootstrapTreeConfig {
     pub entries: usize,
     pub entry_bytes: usize,
     pub max_wall_mins: u64,
-    /// Row count above which boundary repair gap-walks and chain-backfills.
+    /// Block at which the commitments contract was deployed. Floors the rollover search: an
+    /// `eth_call` to an address with no code succeeds returning empty data, so a probe below this
+    /// fails in the ABI decoder rather than answering.
+    pub contract_start_block: u64,
+    /// Row count above which boundary repair gap-walks and chain-backfills. Tunes self-healing:
+    /// a short tree below it is not repaired, and is then refused once the closing-root
+    /// comparison runs.
     pub repair_trigger_threshold: usize,
     /// Gap-walk visits `0..expected_filled_count`; production pins `TREE_MAX_ITEMS`
     /// per `Commitments.sol::TREE_DEPTH = 16`.
@@ -308,6 +410,7 @@ impl Default for BootstrapTreeConfig {
             entries: 65_536,
             entry_bytes: 512,
             max_wall_mins: DEFAULT_MAX_BOOTSTRAP_WALL_MINS,
+            contract_start_block: COMMITMENTS_PROXY_START_BLOCK,
             repair_trigger_threshold: BOUNDARY_REPAIR_TRIGGER_THRESHOLD,
             expected_filled_count: TREE_MAX_ITEMS,
             encoder_kind: EncoderKind::PerLeafBc { tree_number: 0 },
@@ -324,8 +427,19 @@ pub type StowawayCarry = HashMap<u32, Vec<CommitmentRow>>;
 /// for the rollover transaction, narrow enough for RPC span caps.
 const BOUNDARY_REPAIR_WINDOW_BLOCKS: u64 = 10;
 
-/// Below this row count the static-membership oracle hard-stops instead of
-/// gap-walking; a tree that far from full is a degenerate response, not a gap.
+/// Deployment block of the mainnet commitments proxy, mirroring the indexer's `--start-block`
+/// default and `examples/mainnet-6-instance.toml`. Operator-overridable via
+/// `--contract-start-block`, because it is a per-chain fact rather than a tunable.
+pub const COMMITMENTS_PROXY_START_BLOCK: u64 = 14_737_691;
+
+/// Below this row count boundary repair does not gap-walk: a tree that far from full is a
+/// degenerate response, not a gap worth chain-backfilling.
+///
+/// It decides SELF-HEAL versus REFUSE rather than accept versus refuse, but only once the
+/// closing-root comparison COMPLETES: repair runs before the local root is built, and a closed
+/// tree's root commits to its whole leaf set, so an unrepaired short tree fails that comparison.
+/// A comparison that cannot complete - the rollover search refusing - is also a refusal, never an
+/// accept. The magnitude 16 is not derived from anything in this tree.
 const BOUNDARY_REPAIR_TRIGGER_THRESHOLD: usize = TREE_MAX_ITEMS - 16;
 
 /// Moves `tree_position >= TREE_MAX_ITEMS` rows into `carry[tree_number + 1]`
@@ -387,6 +501,13 @@ async fn repair_boundary_if_needed(
         return Ok(repaired);
     }
     if rows.len() < repair_trigger_threshold {
+        tracing::warn!(
+            tree_number,
+            rows = rows.len(),
+            repair_trigger_threshold,
+            "boundary_repair: below the repair trigger, so no gap-walk; a closed tree that needed \
+             one will be refused by the closing-root comparison"
+        );
         return Ok(repaired);
     }
 
@@ -544,6 +665,18 @@ pub async fn bootstrap_one_tree(
 /// `encoder_kind` is stamped into the manifest and `BootstrapTreeConfig` carries the tree
 /// separately, so `{ tree_number: N, ..default() }` silently keeps the default encoder's
 /// tree. Compare rather than derive: deriving would hide the caller's mistake.
+/// A repair trigger above capacity can never be reached, so it disables self-healing for every
+/// tree while reading like a tuning value. Refused rather than obeyed.
+fn ensure_repair_threshold_reachable(cfg: &BootstrapTreeConfig) -> Result<(), BootstrapError> {
+    if cfg.repair_trigger_threshold > cfg.expected_filled_count {
+        return Err(BootstrapError::RepairThresholdUnreachable {
+            repair_trigger_threshold: cfg.repair_trigger_threshold,
+            expected_filled_count: cfg.expected_filled_count,
+        });
+    }
+    Ok(())
+}
+
 fn ensure_encoder_matches_tree(cfg: &BootstrapTreeConfig) -> Result<(), BootstrapError> {
     match cfg.encoder_kind.chain_tree_number() {
         Some(encoder_tree) if encoder_tree != cfg.tree_number => {
@@ -556,6 +689,82 @@ fn ensure_encoder_matches_tree(cfg: &BootstrapTreeConfig) -> Result<(), Bootstra
     }
 }
 
+/// Both refusals a CLOSED tree can earn, kept together because they are one property in two steps.
+///
+/// Membership is necessary and not sufficient: `rootHistory` records one entry per BATCH over a
+/// fixed-depth zero-padded IMT, so every batch-boundary prefix of a closed tree is a root the chain
+/// genuinely holds and a truncated fetch passes it. Neither step looks at the row count -
+/// `Commitments.sol` moves an entire overflowing batch to the next tree, so a closed tree
+/// legitimately ends short.
+async fn refuse_closed_tree_mismatch(
+    chain: &dyn ChainOracle,
+    tree_number: u32,
+    search_lo: u64,
+    checkpoint_block: u64,
+    local_root: [u8; 32],
+    leaf_count: usize,
+    recorded: bool,
+) -> Result<(), BootstrapError> {
+    if !recorded {
+        return Err(BootstrapError::OracleByteIdentityMismatch {
+            kind: OracleKind::ChainStaticTree,
+            tree_number,
+            expected_hex: to_hex(&local_root),
+            observed_hex: "rootHistory(tree, local_root) == false".to_owned(),
+            first_match_index: leaf_count,
+        });
+    }
+    refuse_unexplained_tail(
+        chain,
+        tree_number,
+        search_lo,
+        checkpoint_block,
+        local_root,
+        leaf_count,
+    )
+    .await
+}
+
+/// A closed tree must match the root it CLOSED at, whatever its row count.
+///
+/// Membership is necessary and not sufficient: `rootHistory` records one entry per BATCH over a
+/// fixed-depth zero-padded IMT, so every batch-boundary prefix of a closed tree is a root the chain
+/// genuinely holds and a truncated fetch passes it. Deliberately says nothing about how many rows
+/// the tree has - `Commitments.sol` moves an entire overflowing batch to the next tree, so a closed
+/// tree legitimately ends short.
+async fn refuse_unexplained_tail(
+    chain: &dyn ChainOracle,
+    tree_number: u32,
+    search_lo: u64,
+    checkpoint_block: u64,
+    local_root: [u8; 32],
+    leaf_count: usize,
+) -> Result<(), BootstrapError> {
+    // Deliberately NOT wrapped in `classify_archival_error`: the search probes many blocks and
+    // that classifier stamps the checkpoint into the message, which would send an operator to fix
+    // archival access at a block that was never read. These errors name the block they probed.
+    let Some(closed_at_root) = chain
+        .tree_final_root(tree_number, search_lo, checkpoint_block)
+        .await?
+    else {
+        return Ok(());
+    };
+    if local_root == closed_at_root {
+        return Ok(());
+    }
+    Err(BootstrapError::OracleByteIdentityMismatch {
+        kind: OracleKind::ChainStaticTree,
+        tree_number,
+        expected_hex: to_hex(&local_root),
+        observed_hex: format!(
+            "tree closed at root {}; the local root is in rootHistory but is a PREFIX of the \
+             closed tree, so the fetch is short",
+            to_hex(&closed_at_root)
+        ),
+        first_match_index: leaf_count,
+    })
+}
+
 pub async fn bootstrap_one_tree_with_carry(
     cfg: &BootstrapTreeConfig,
     leaves_src: &dyn SubsquidLeavesSource,
@@ -563,6 +772,7 @@ pub async fn bootstrap_one_tree_with_carry(
     carry: &mut StowawayCarry,
 ) -> Result<BootstrapTreeReport, BootstrapError> {
     ensure_encoder_matches_tree(cfg)?;
+    ensure_repair_threshold_reachable(cfg)?;
     let started = Instant::now();
     let budget = Duration::from_secs(cfg.max_wall_mins.saturating_mul(60).max(1));
     let head = chain.chain_head().await?;
@@ -639,15 +849,16 @@ pub async fn bootstrap_one_tree_with_carry(
             .await
             .map_err(|e| classify_archival_error(e, checkpoint_block))?;
         chain_static_membership = Some(recorded);
-        if !recorded {
-            return Err(BootstrapError::OracleByteIdentityMismatch {
-                kind: OracleKind::ChainStaticTree,
-                tree_number: cfg.tree_number,
-                expected_hex: to_hex(&local_root),
-                observed_hex: "rootHistory(tree, local_root) == false".to_owned(),
-                first_match_index: leaves.len(),
-            });
-        }
+        refuse_closed_tree_mismatch(
+            chain,
+            cfg.tree_number,
+            cfg.contract_start_block,
+            checkpoint_block,
+            local_root,
+            leaves.len(),
+            recorded,
+        )
+        .await?;
     }
 
     persist_initial_snapshot(cfg, &leaves, checkpoint_block)?;
@@ -1353,7 +1564,7 @@ impl ChainOracle for ChainSourceOracle {
         self.inner
             .active_tree_number(at)
             .await
-            .map_err(|e| BootstrapError::RpcUnreachable(e.to_string()))
+            .map_err(|e| chain_read_error(block, "treeNumber", &e))
     }
     async fn merkle_root_at(&self, block: u64) -> Result<[u8; 32], BootstrapError> {
         let at = Some(alloy::eips::BlockId::Number(
@@ -1362,7 +1573,7 @@ impl ChainOracle for ChainSourceOracle {
         self.inner
             .merkle_root(at)
             .await
-            .map_err(|e| BootstrapError::RpcUnreachable(e.to_string()))
+            .map_err(|e| chain_read_error(block, "merkleRoot", &e))
     }
     async fn root_history_at(
         &self,
@@ -1376,7 +1587,7 @@ impl ChainOracle for ChainSourceOracle {
         self.inner
             .root_history(tree_number, merkle_root, at)
             .await
-            .map_err(|e| BootstrapError::RpcUnreachable(e.to_string()))
+            .map_err(|e| chain_read_error(block, "rootHistory", &e))
     }
     async fn commitment_events_in_range(
         &self,
@@ -1431,6 +1642,44 @@ pub fn modulus_be() -> [u8; 32] {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    /// An undecodable response must not be reported as a transport failure.
+    ///
+    /// The two are fixed by different actions and only one of them is the operator's: a codeless
+    /// address answers `eth_call` with empty data, so a decode failure means the caller asked about
+    /// the wrong block and no endpoint change helps. Collapsing both into `RpcUnreachable` is what
+    /// sent an operator to buy archival coverage they already had.
+    #[test]
+    fn an_undecodable_read_is_typed_apart_from_a_transport_failure_and_names_its_block() {
+        let decode = chain_read_error(
+            12_934_936,
+            "treeNumber",
+            &raven_railgun_indexer::IndexerError::Decode(
+                "ABI decoding failed: buffer overrun while deserializing".to_owned(),
+            ),
+        );
+        match &decode {
+            BootstrapError::ChainStateUndecodable { block, detail } => {
+                assert_eq!(*block, 12_934_936, "the error must name the block PROBED");
+                assert!(detail.contains("treeNumber"), "got: {detail}");
+            }
+            other => panic!("a decode failure must not be a transport error; got: {other}"),
+        }
+        assert!(
+            !looks_like_pruning_error(&decode.to_string()),
+            "an undecodable read must not be mistaken for a pruning refusal"
+        );
+
+        let transport = chain_read_error(
+            999,
+            "treeNumber",
+            &raven_railgun_indexer::IndexerError::Rpc("connection reset".to_owned()),
+        );
+        assert!(
+            matches!(transport, BootstrapError::RpcUnreachable(ref m) if m.contains("block 999")),
+            "a transport failure stays RpcUnreachable and still names its block; got: {transport}"
+        );
+    }
 
     #[test]
     fn decimal_zero_decodes_to_zero_bytes() {

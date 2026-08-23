@@ -170,3 +170,70 @@ fn empty_and_oversized_batches_are_typed_errors() {
         .expect_err("33 exceeds the top ladder step");
     assert!(format!("{err}").contains("split into"), "{err}");
 }
+
+/// The pad draw is RANDOM, and nothing here asserted that.
+///
+/// `shard_id` travels in cleartext, so the batch's index sequence is visible to the server. A
+/// cyclic pad makes slot j and slot j+len address the identical global index, and the repeat
+/// period IS the cache-miss count - the one quantity the ladder exists to hide. Every other test
+/// in this file drives the production builder and passes with the draw reverted to `slot % len`.
+///
+/// The gate is reproducibility, not statistics: `slot % len` is a pure function of its input and
+/// returns the identical sequence on every call, while a random draw does not. `ClientState.index`
+/// is the drawn index, so no decryption is needed to see it.
+#[test]
+fn the_pad_draw_does_not_reproduce_itself_across_calls() {
+    let (params, state, session, _db) = fixture();
+    let indices: Vec<u64> = (0..5).collect();
+
+    let drawn = || -> Vec<u64> {
+        let (states, _q) = build_padded_batch(&session, state.shard_config(), &params, &indices)
+            .expect("pad batch");
+        states.iter().map(|s| s.index).collect()
+    };
+
+    let first = drawn();
+    assert_eq!(
+        first.len(),
+        batch_ladder::padded_len(indices.len()).expect("in ladder range"),
+        "premise: 5 reals pad to a ladder step, so there are pad slots to vary"
+    );
+    let mut differs = false;
+    for _ in 0..64 {
+        if drawn() != first {
+            differs = true;
+            break;
+        }
+    }
+    assert!(
+        differs,
+        "the pad draw reproduced the same index sequence 65 times; a cyclic pad does exactly \
+         that and publishes the real count as the repeat period"
+    );
+}
+
+/// The distribution half, kept separate so nobody mistakes the statistical bound for the gate.
+/// A cyclic pad is periodic in every trial; a uniform one only coincides by chance.
+#[test]
+fn the_pad_draw_does_not_publish_the_real_count_as_a_period() {
+    const TRIALS: usize = 40;
+    let (params, state, session, _db) = fixture();
+    let indices: Vec<u64> = (0..5).collect();
+    let real = indices.len();
+
+    let mut periodic = 0;
+    for _ in 0..TRIALS {
+        let (states, _q) = build_padded_batch(&session, state.shard_config(), &params, &indices)
+            .expect("pad batch");
+        let seq: Vec<u64> = states.iter().map(|s| s.index).collect();
+        let repeats = seq.iter().zip(seq.iter().skip(real)).all(|(a, b)| a == b);
+        if repeats {
+            periodic += 1;
+        }
+    }
+    assert!(
+        periodic < TRIALS / 4,
+        "{periodic}/{TRIALS} batches repeated with period {real}; the cyclic draw does this in \
+         every trial, which is the leak"
+    );
+}

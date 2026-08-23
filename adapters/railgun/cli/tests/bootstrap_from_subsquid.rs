@@ -33,9 +33,23 @@ struct StubChain {
     recorded_roots: Mutex<Vec<(u32, [u8; 32])>>,
     pruning: Mutex<bool>,
     chain_events: Mutex<Vec<ChainEventRow>>,
+    /// Block-indexed chain state, so a ROLLOVER is expressible. Both maps are step functions
+    /// keyed on the first block the value holds from; empty means "constant", which is what
+    /// every pre-existing test wants and gets from the two scalars above.
+    active_tree_from: Mutex<std::collections::BTreeMap<u64, u32>>,
+    root_from: Mutex<std::collections::BTreeMap<u64, [u8; 32]>>,
+    /// Block below which the contract had no code. `eth_call` to a codeless address succeeds
+    /// with empty returndata, so a real node answers such a probe with a DECODE failure, not a
+    /// transport error - and a stub that answers happily at every height cannot see a search
+    /// that reads below deployment.
+    deploy_floor: Mutex<Option<u64>>,
 }
 
 type ChainEventRow = (u64, u32, u32, [u8; 32]);
+
+/// Spacing between synthetic rollovers. Small, so every rollover sits above any fixture's row
+/// block and below the checkpoint.
+const ROLLOVER_STEP_BLOCKS: u64 = 10;
 
 impl StubChain {
     fn new(head: u64, active_tree: u32) -> Self {
@@ -46,7 +60,54 @@ impl StubChain {
             recorded_roots: Mutex::new(Vec::new()),
             pruning: Mutex::new(false),
             chain_events: Mutex::new(Vec::new()),
+            // Rollovers packed just under the checkpoint, so tree 0 spans almost the whole
+            // chain. Two properties the tests depend on: the active tree AT the checkpoint is
+            // `active_tree`, and a closed tree's rollover block is nowhere near its tree NUMBER -
+            // so a search that returned the tree number would read the wrong root and be caught.
+            active_tree_from: Mutex::new(
+                std::iter::once((0u64, 0u32))
+                    .chain((1..=active_tree).map(|k| {
+                        (
+                            head.saturating_sub(64)
+                                - u64::from(active_tree - k) * ROLLOVER_STEP_BLOCKS,
+                            k,
+                        )
+                    }))
+                    .collect(),
+            ),
+            root_from: Mutex::new(std::collections::BTreeMap::new()),
+            deploy_floor: Mutex::new(None),
         }
+    }
+
+    /// Below `block` the contract has no code, so every read there fails to decode.
+    fn set_deploy_floor(&self, block: u64) {
+        *self.deploy_floor.lock() = Some(block);
+    }
+
+    /// REPLACES the ladder. `new`'s default maps tree k to block k, which makes the rollover
+    /// block equal the tree number, so a search that merely returned `tree_number` would agree
+    /// with a correct one on every fixture built from it.
+    fn set_rollover_ladder(&self, entries: &[(u64, u32)]) {
+        let mut ladder = self.active_tree_from.lock();
+        ladder.clear();
+        for (block, tree) in entries {
+            ladder.insert(*block, *tree);
+        }
+    }
+
+    fn undecodable_below_floor(&self, block: u64) -> Option<BootstrapError> {
+        let floor = (*self.deploy_floor.lock())?;
+        (block < floor).then(|| BootstrapError::ChainStateUndecodable {
+            block,
+            detail: "treeNumber: ABI decoding failed: buffer overrun while deserializing"
+                .to_owned(),
+        })
+    }
+
+    /// From `block` onward the chain merkle root is `root`.
+    fn set_root_from(&self, block: u64, root: [u8; 32]) {
+        self.root_from.lock().insert(block, root);
     }
 
     fn set_chain_root(&self, r: [u8; 32]) {
@@ -79,19 +140,53 @@ impl ChainOracle for StubChain {
     async fn chain_head(&self) -> Result<u64, BootstrapError> {
         Ok(self.head)
     }
-    async fn active_tree_number_at(&self, _block: u64) -> Result<u32, BootstrapError> {
+    async fn active_tree_number_at(&self, block: u64) -> Result<u32, BootstrapError> {
         if *self.pruning.lock() {
             return Err(Self::pruning_err());
         }
-        Ok(self.active_tree)
+        if let Some(e) = self.undecodable_below_floor(block) {
+            return Err(e);
+        }
+        Ok(self
+            .active_tree_from
+            .lock()
+            .range(..=block)
+            .next_back()
+            .map_or(self.active_tree, |(_, t)| *t))
     }
-    async fn merkle_root_at(&self, _block: u64) -> Result<[u8; 32], BootstrapError> {
+    async fn merkle_root_at(&self, block: u64) -> Result<[u8; 32], BootstrapError> {
         if *self.pruning.lock() {
             return Err(Self::pruning_err());
         }
-        self.chain_root.lock().ok_or_else(|| {
-            BootstrapError::RpcUnreachable("chain_root unset in StubChain".to_owned())
-        })
+        if let Some(e) = self.undecodable_below_floor(block) {
+            return Err(e);
+        }
+        if let Some((_, r)) = self.root_from.lock().range(..=block).next_back() {
+            return Ok(*r);
+        }
+        if let Some(r) = *self.chain_root.lock() {
+            return Ok(r);
+        }
+        // Fall back to the LAST root rootHistory holds for the tree active at `block`. That is
+        // what a closed tree's closing root is on chain: rootHistory accumulates one entry per
+        // batch, so its final entry for a tree is the root that tree ended at.
+        let active = self
+            .active_tree_from
+            .lock()
+            .range(..=block)
+            .next_back()
+            .map_or(self.active_tree, |(_, t)| *t);
+        self.recorded_roots
+            .lock()
+            .iter()
+            .rev()
+            .find(|(t, _)| *t == active)
+            .map(|(_, r)| *r)
+            .ok_or_else(|| {
+                BootstrapError::RpcUnreachable(format!(
+                    "StubChain has no root for the tree active at block {block}"
+                ))
+            })
     }
     async fn root_history_at(
         &self,
@@ -276,6 +371,208 @@ async fn second_bootstrap_over_a_populated_data_dir_refuses_before_the_wal_grows
         before, after,
         "a refused bootstrap must not have appended to the WAL"
     );
+}
+
+/// The closing root is read at the ROLLOVER, and the rollover is found by search.
+///
+/// The ladder is set explicitly so the rollover block is unrelated to the tree NUMBER and to any
+/// arithmetic in the stub's default. Three distinct roots are seeded, so landing on the wrong block
+/// yields the wrong root rather than a coincidence: what a `closed_at = tree_number` shortcut would
+/// read, the closing root one block below the rollover, and the successor's root at the rollover.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_closing_root_is_read_at_the_rollover_block_not_at_the_tree_number() {
+    const TREE_0_ROLLOVER: u64 = 17_000_000;
+    let (rows, root) = synthetic_leaves(6);
+    let leaves = StubLeaves::new(rows);
+    let chain = StubChain::new(20_000_000, 3);
+    chain.set_rollover_ladder(&[
+        (0, 0),
+        (TREE_0_ROLLOVER, 1),
+        (18_000_000, 2),
+        (19_000_000, 3),
+    ]);
+
+    chain.set_root_from(0, [0xAA; 32]);
+    chain.set_root_from(TREE_0_ROLLOVER - 1, root);
+    chain.set_root_from(TREE_0_ROLLOVER, [0xBB; 32]);
+    chain.record_root(0, root);
+
+    let cfg = cfg_for(0, fresh_data_dir("commit-tree-0-rollover-search"));
+    let report = bootstrap_one_tree(&cfg, &leaves, &chain)
+        .await
+        .expect("the closing root is the one held one block below the rollover");
+    assert_eq!(report.local_root, root);
+    assert_eq!(report.chain_static_membership, Some(true));
+}
+
+/// The rollover search must never probe a block at which the contract had no code.
+///
+/// An `eth_call` to a codeless address SUCCEEDS and returns empty data, so a real node answers such
+/// a probe with an ABI-decode failure, which no pruning heuristic matches and no RPC change fixes.
+/// A search floored at 0 against this head probes ~10M on its first iteration, well below
+/// deployment, so an unfloored search fails here on iteration one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_probe_below_the_contract_deployment_is_never_made() {
+    const TREE_0_ROLLOVER: u64 = 17_000_000;
+    let (rows, root) = synthetic_leaves(6);
+    let leaves = StubLeaves::new(rows);
+    let chain = StubChain::new(20_000_000, 3);
+    chain.set_rollover_ladder(&[
+        (0, 0),
+        (TREE_0_ROLLOVER, 1),
+        (18_000_000, 2),
+        (19_000_000, 3),
+    ]);
+    chain.set_deploy_floor(14_737_691);
+    chain.set_root_from(TREE_0_ROLLOVER - 1, root);
+    chain.record_root(0, root);
+
+    let cfg = cfg_for(0, fresh_data_dir("commit-tree-0-deploy-floor"));
+    assert!(
+        cfg.contract_start_block < TREE_0_ROLLOVER,
+        "premise: the floor is below the rollover, so a floored search can still find it"
+    );
+    assert!(
+        cfg.contract_start_block >= 14_737_691,
+        "premise: the default floor is at or above the stub's deployment block"
+    );
+    let report = bootstrap_one_tree(&cfg, &leaves, &chain)
+        .await
+        .expect("a full-history node answers every probe at or above deployment");
+    assert_eq!(report.local_root, root);
+}
+
+/// A floor above the tree's own rollover is refused, not guessed around.
+///
+/// Reading at `floor - 1` there would return a root from before this tree existed and present it as
+/// the tree's closing root - a wrong answer rather than a refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_search_floor_above_the_trees_own_rollover_is_refused() {
+    let (rows, root) = synthetic_leaves(6);
+    let leaves = StubLeaves::new(rows);
+    let chain = StubChain::new(20_000_000, 3);
+    chain.set_rollover_ladder(&[(0, 0), (17_000_000, 1), (18_000_000, 2), (19_000_000, 3)]);
+    chain.record_root(0, root);
+
+    let cfg = BootstrapTreeConfig {
+        contract_start_block: 18_500_000,
+        ..cfg_for(0, fresh_data_dir("commit-tree-0-floor-too-high"))
+    };
+    let err = bootstrap_one_tree(&cfg, &leaves, &chain)
+        .await
+        .expect_err("a floor past the rollover cannot bracket it");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("closed at or below the floor"),
+        "the refusal must say the floor is the problem; got: {msg}"
+    );
+}
+
+/// A repair trigger above the tree's capacity can never fire, so it is refused rather than obeyed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repair_trigger_above_capacity_is_refused_because_it_can_never_be_reached() {
+    let (rows, root) = synthetic_leaves(6);
+    let leaves = StubLeaves::new(rows);
+    let chain = StubChain::new(20_000_000, 3);
+    chain.record_root(0, root);
+
+    let base = cfg_for(0, fresh_data_dir("commit-tree-0-threshold-unreachable"));
+    let cfg = BootstrapTreeConfig {
+        repair_trigger_threshold: base.expected_filled_count + 1,
+        ..base
+    };
+    let err = bootstrap_one_tree(&cfg, &leaves, &chain)
+        .await
+        .expect_err("an unreachable repair trigger silently disables self-healing");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("can never be reached"),
+        "the refusal must say why the value is illegal; got: {msg}"
+    );
+}
+
+/// The tail must be EXPLAINED, and static membership alone cannot explain it.
+///
+/// `rootHistory` records one entry per BATCH and the IMT is fixed-depth and zero-padded, so the
+/// root over any batch-boundary prefix of a closed tree is a root the chain genuinely holds.
+/// A fetch that stops early therefore passes `rootHistory` and persists a short tree, at `Ok`.
+/// Here the chain holds both the prefix root and the closing root; the local fetch is the
+/// prefix, and it must be refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prefix_truncated_closed_tree_is_refused_even_though_root_history_holds_it() {
+    let (_full_rows, full_root) = synthetic_leaves(8);
+    let (short_rows, short_root) = synthetic_leaves(5);
+    assert_ne!(
+        short_root, full_root,
+        "premise: the prefix has its own root"
+    );
+
+    let leaves = StubLeaves::new(short_rows);
+    let chain = StubChain::new(20_000_000, 99);
+    // The chain holds the prefix root - it was a real batch boundary - and then the root the
+    // tree closed at. Recorded in that order, so the LAST entry is the closing root.
+    chain.record_root(0, short_root);
+    chain.record_root(0, full_root);
+
+    let cfg = cfg_for(0, fresh_data_dir("commit-tree-0-truncated"));
+    let err = bootstrap_one_tree(&cfg, &leaves, &chain)
+        .await
+        .expect_err("a prefix of a closed tree must not bootstrap as the whole tree");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("PREFIX of the closed tree"),
+        "the refusal must say the fetch is short rather than blaming membership; got: {msg}"
+    );
+}
+
+/// The repair threshold can no longer let a short tree through, only decide whether we self-heal.
+///
+/// Below the threshold `repair_boundary_if_needed` returns without gap-walking at all, which is
+/// what made an unprovenanced slack look load-bearing. But repair runs BEFORE the root is computed,
+/// and a closed tree's root is a commitment to its entire leaf set - so an unrepaired tree fails the
+/// closing-root comparison and is refused. The threshold therefore governs self-heal versus refuse,
+/// not accept versus refuse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_short_tree_below_the_repair_threshold_is_refused_not_accepted() {
+    let (_full, full_root) = synthetic_leaves(8);
+    let (short_rows, short_root) = synthetic_leaves(3);
+
+    let leaves = StubLeaves::new(short_rows);
+    let chain = StubChain::new(20_000_000, 99);
+    chain.record_root(0, short_root);
+    chain.record_root(0, full_root);
+
+    let cfg = cfg_for_boundary(0, fresh_data_dir("commit-tree-0-below-threshold"));
+    // premise: 3 rows is below `repair_trigger_threshold: 4`, so no gap-walk runs at all.
+    assert!(3 < cfg.repair_trigger_threshold);
+
+    let err = bootstrap_one_tree(&cfg, &leaves, &chain)
+        .await
+        .expect_err("an unrepaired short tree must be refused, not persisted");
+    assert!(
+        format!("{err}").contains("PREFIX of the closed tree"),
+        "the refusal must come from the closing-root comparison; got: {err}"
+    );
+}
+
+/// The inverse, and it is what keeps this from being a row-count floor: a tree that CLOSED
+/// short of capacity is legitimate. `Commitments.sol` moves an entire overflowing batch to the
+/// next tree, so a closed tree can hold far fewer than 65,536 leaves. What makes it acceptable
+/// is that its root IS the root the chain closed it at - not how many rows it has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_tree_that_legitimately_ended_short_still_bootstraps() {
+    let (rows, root) = synthetic_leaves(5);
+    let leaves = StubLeaves::new(rows);
+    let chain = StubChain::new(20_000_000, 99);
+    chain.record_root(0, root);
+
+    let cfg = cfg_for(0, fresh_data_dir("commit-tree-0-short-but-closed"));
+    let report = bootstrap_one_tree(&cfg, &leaves, &chain)
+        .await
+        .expect("a short tree whose root is its CLOSING root is complete");
+    assert_eq!(report.leaves, 5);
+    assert_eq!(report.local_root, root);
+    assert_eq!(report.chain_static_membership, Some(true));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

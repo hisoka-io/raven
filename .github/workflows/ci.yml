@@ -33,6 +33,14 @@ jobs:
         run: cargo check --workspace --all-targets
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # `mod-switch-response` is default-off and no job compiled it, so a response-encoding
+      # subsystem sat unbuilt behind the flag. Check-only and deliberately not tested: the
+      # subsystem is deferred, and this exists to stop it rotting, not to adopt it. The manifest
+      # is the submodule's because both the feature and every line it gates live there.
+      - name: cargo check (raven-inspire, mod-switch-response)
+        run: |
+          cargo check --manifest-path crates/inspire/Cargo.toml \
+            --features mod-switch-response --all-targets
       - name: cargo test
         run: cargo test --workspace --all-targets
 

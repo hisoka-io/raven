@@ -288,6 +288,16 @@ enum Commands {
         /// Hex-encoded proxy contract address for the chain-side oracle.
         #[arg(long, default_value = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9")]
         railgun_proxy: String,
+        /// Block at which `--railgun-proxy` was deployed. Floors the closed-tree rollover
+        /// search: below it the address has no code, an eth_call returns empty data, and the
+        /// read fails in the ABI decoder rather than answering.
+        #[arg(long, default_value_t = raven_railgun_cli::bootstrap_subsquid::COMMITMENTS_PROXY_START_BLOCK)]
+        contract_start_block: u64,
+        /// Row count above which boundary repair gap-walks. Tunes self-healing only; a tree
+        /// below it is still refused by the closing-root comparison. Must not exceed the
+        /// tree capacity, or it can never be reached.
+        #[arg(long)]
+        boundary_repair_trigger_threshold: Option<usize>,
         /// Encoder family stamped into each tree's manifest `encoder_label`:
         /// `per-leaf-bc`, `per-leaf-path`, or `per-node`.
         #[arg(long, default_value = "per-node")]
@@ -534,6 +544,8 @@ async fn main() -> anyhow::Result<()> {
             strict_oracle_byte_identity,
             max_bootstrap_wall_mins,
             railgun_proxy,
+            contract_start_block,
+            boundary_repair_trigger_threshold,
             encoder,
             ppoi_status_encoder,
             ppoi_path_encoder,
@@ -574,6 +586,8 @@ async fn main() -> anyhow::Result<()> {
                 strict_oracle_byte_identity,
                 max_bootstrap_wall_mins,
                 railgun_proxy,
+                contract_start_block,
+                boundary_repair_trigger_threshold,
                 chain_encoder_family,
                 ppoi_status_family,
                 ppoi_path_family,
@@ -726,6 +740,8 @@ struct BootstrapFromSubsquidOptions {
     strict_oracle_byte_identity: bool,
     max_bootstrap_wall_mins: u64,
     railgun_proxy: String,
+    contract_start_block: u64,
+    boundary_repair_trigger_threshold: Option<usize>,
     chain_encoder_family: ChainEncoderFamily,
     ppoi_status_family: PpoiEncoderFamily,
     ppoi_path_family: PpoiEncoderFamily,
@@ -864,7 +880,7 @@ async fn run_bootstrap_from_subsquid(opts: BootstrapFromSubsquidOptions) -> anyh
         let data_dir = resolve_data_dir_template(&opts.data_dir_template, *tree)
             .map_err(|e| anyhow::anyhow!("data_dir_template: {e}"))?;
         let encoder_kind = opts.chain_encoder_family.for_tree(*tree);
-        let cfg = BootstrapTreeConfig {
+        let mut cfg = BootstrapTreeConfig {
             tree_number: *tree,
             checkpoint_depth: opts.checkpoint_depth,
             data_dir,
@@ -873,9 +889,13 @@ async fn run_bootstrap_from_subsquid(opts: BootstrapFromSubsquidOptions) -> anyh
             entries: opts.entries,
             entry_bytes: opts.entry_bytes,
             max_wall_mins: opts.max_bootstrap_wall_mins,
+            contract_start_block: opts.contract_start_block,
             encoder_kind,
             ..BootstrapTreeConfig::default()
         };
+        if let Some(threshold) = opts.boundary_repair_trigger_threshold {
+            cfg.repair_trigger_threshold = threshold;
+        }
         let report =
             bootstrap_one_tree_with_carry(&cfg, &leaves_src, &chain_oracle, &mut carry).await?;
         tracing::info!(

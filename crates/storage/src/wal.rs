@@ -52,6 +52,14 @@ struct WalState {
     /// fsync-acknowledged entry that a later replay drops is worse than a
     /// refused write.
     poisoned: bool,
+    /// Makes the NEXT frame write fail, so the torn-append recovery has a route.
+    ///
+    /// `#[cfg(test)]` and never a cargo feature: a feature can be switched on in a release
+    /// build, which is exactly how a test door becomes a production door. Scoped to the frame
+    /// write alone - it cannot make the rewind fail, so the poison ASSIGNMENT is reached but
+    /// only in its non-poisoning direction.
+    #[cfg(test)]
+    fail_next_write: bool,
 }
 
 /// One whole frame: header then payload then fsync. Any error leaves the caller
@@ -132,6 +140,8 @@ impl Wal {
                 first_seq: scan.first_seq,
                 last_marker: scan.last_marker,
                 poisoned: false,
+                #[cfg(test)]
+                fail_next_write: false,
             }),
         })
     }
@@ -181,7 +191,17 @@ impl Wal {
         // 0 until the kernel repositions it on the first write, so on the first append after
         // any reopen `stream_position` reports 0 and a rewind to it truncates the whole log.
         let tail = rewind_target(&state.file)?;
-        if let Err(e) = write_frame(&mut state.file, &header, &bincoded) {
+        #[cfg(test)]
+        let frame = if std::mem::replace(&mut state.fail_next_write, false) {
+            Err(PersistenceError::Io(std::io::Error::other(
+                "injected frame-write failure",
+            )))
+        } else {
+            write_frame(&mut state.file, &header, &bincoded)
+        };
+        #[cfg(not(test))]
+        let frame = write_frame(&mut state.file, &header, &bincoded);
+        if let Err(e) = frame {
             let rewound = state
                 .file
                 .set_len(tail)
@@ -885,6 +905,104 @@ mod tests {
             "current.log holds only what was written after the successful archive"
         );
         assert_eq!(replay.entries.last().expect("two entries").seq, seq);
+    }
+
+    /// The same tear on the FIRST append after a REOPEN, which is the D-0 defect exactly.
+    ///
+    /// `O_APPEND` leaves the fd offset at 0 until the kernel repositions it on the first write, so
+    /// on a reopened non-empty log the offset reads 0 while the length is the whole log. A rewind
+    /// to the offset truncates everything, SUCCEEDS, and therefore does not poison - the log then
+    /// replays as clean and empty. Nothing exercised that through `append` before this: the
+    /// standalone test proves only the filesystem fact.
+    #[test]
+    fn a_tear_on_the_first_append_after_a_reopen_does_not_truncate_the_log() {
+        let (_d, layout) = make_layout();
+        {
+            let wal = Wal::open(&layout, None).expect("open");
+            wal.append(&test_payload(0), 1).expect("first");
+            wal.append(&test_payload(1), 2).expect("second");
+        }
+        let len_before = std::fs::metadata(layout.wal_current_path())
+            .expect("metadata")
+            .len();
+        assert!(len_before > 0, "precondition: the log is non-empty on disk");
+
+        let reopened = Wal::open(&layout, None).expect("reopen");
+        reopened.inner.lock().fail_next_write = true;
+        reopened
+            .append(&test_payload(2), 3)
+            .expect_err("the injected failure must surface");
+
+        assert_eq!(
+            std::fs::metadata(layout.wal_current_path())
+                .expect("metadata")
+                .len(),
+            len_before,
+            "rewinding to the fd offset would set_len(0) here and destroy both committed frames"
+        );
+        assert_eq!(
+            reopened.replay().expect("replay").entries.len(),
+            2,
+            "both frames written before the reopen must still replay"
+        );
+        assert!(
+            !reopened.inner.lock().poisoned,
+            "the rewind restored the log, so this tear is recoverable"
+        );
+    }
+
+    /// A torn frame write REWINDS to the log's byte length and does NOT poison.
+    ///
+    /// This is the D-0 defect's actual subject, reached through the production `append` for the
+    /// first time: `wal_rewind_target.rs` proves only the filesystem fact that `O_APPEND` reports
+    /// offset 0 after a reopen, never that `append` rewinds to the right place. Here the write
+    /// fails, the log must come back to exactly its previous length, the earlier entry must still
+    /// replay, and the seq must not be burned.
+    ///
+    /// It must also NOT poison: a recoverable tear that refuses every later append is an outage.
+    #[test]
+    fn a_torn_frame_write_rewinds_to_the_log_length_and_does_not_poison() {
+        let (_d, layout) = make_layout();
+        let wal = Wal::open(&layout, None).expect("open");
+        let first = wal.append(&test_payload(0), 1).expect("first");
+        let len_before = std::fs::metadata(layout.wal_current_path())
+            .expect("metadata")
+            .len();
+
+        wal.inner.lock().fail_next_write = true;
+        let err = wal
+            .append(&test_payload(1), 2)
+            .expect_err("the injected failure must surface");
+        assert!(
+            matches!(err, PersistenceError::Io(_)),
+            "expected the write error to propagate, got: {err}"
+        );
+
+        assert!(
+            !wal.inner.lock().poisoned,
+            "a tear whose rewind restored the log is recoverable; poisoning it is an outage"
+        );
+        assert_eq!(
+            std::fs::metadata(layout.wal_current_path())
+                .expect("metadata")
+                .len(),
+            len_before,
+            "the rewind target is the log LENGTH; anything else truncates committed frames"
+        );
+        assert_eq!(wal.next_seq(), first + 1, "a refused append burns no seq");
+
+        let replay = wal.replay().expect("replay");
+        assert_eq!(
+            replay.entries.len(),
+            1,
+            "the entry written before the tear must survive it"
+        );
+        assert_eq!(replay.entries.first().expect("one entry").seq, first);
+
+        let second = wal
+            .append(&test_payload(1), 2)
+            .expect("the log stays appendable after a recoverable tear");
+        assert_eq!(second, first + 1, "the burned-nothing seq is reused");
     }
 
     /// Poison means the on-disk extent is no longer known good, so a further append would land

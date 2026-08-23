@@ -483,3 +483,104 @@ async fn a_pooled_request_between_errors_does_not_reset_the_circuit_breaker() {
         secondary.health()
     );
 }
+
+/// Half one of two: the sweep SKIPS an endpoint that is cooling down.
+///
+/// It cannot be selected, so probing it buys nothing and costs a full `RPC_TIMEOUT_SECS` on every
+/// pooled call when it is black-holed rather than merely erroring. The observable is the probe
+/// counter, because an endpoint that is never dialled records none.
+#[tokio::test]
+async fn the_sweep_does_not_probe_an_endpoint_that_is_cooling_down() {
+    use raven_railgun_indexer::rpc_pool::{EndpointHealth, ErrorKind, PooledRpcChainSource};
+    use raven_railgun_indexer::ChainSource;
+
+    let addr_a = spawn_block_rpc(HONEST_CHAIN).await;
+    let (addr_b, probes_b) = spawn_rpc(HONEST_CHAIN).await;
+    let pool = Arc::new(
+        RpcEndpointPool::new(
+            vec![
+                EndpointConfig {
+                    url: format!("http://{addr_a}"),
+                    rps: 1000,
+                    burst: 1000,
+                },
+                EndpointConfig {
+                    url: format!("http://{addr_b}"),
+                    rps: 1000,
+                    burst: 1000,
+                },
+            ],
+            PoolConfig {
+                strategy: PoolStrategy::PrimaryWithFailover,
+                ..PoolConfig::default()
+            },
+        )
+        .expect("pool builds"),
+    );
+
+    let secondary = Arc::clone(&pool.endpoints()[1]);
+    // A Network-kind error cools an endpoint immediately, without it ever having been dialled.
+    pool.mark_endpoint_error(&secondary, ErrorKind::Network);
+    assert!(
+        matches!(secondary.health(), EndpointHealth::CoolingDown { .. }),
+        "premise: the secondary is cooling down and cannot be selected"
+    );
+    assert_eq!(
+        probes_b.load(Ordering::SeqCst),
+        0,
+        "premise: it has never been probed"
+    );
+
+    let source = PooledRpcChainSource::new(
+        Arc::clone(&pool),
+        alloy::primitives::address!("fa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"),
+        HONEST_CHAIN,
+    );
+    source.latest_block().await.expect("the primary answers");
+
+    assert_eq!(
+        probes_b.load(Ordering::SeqCst),
+        0,
+        "the sweep must skip a cooling-down endpoint; probing one it cannot select is pure cost"
+    );
+}
+
+/// Half two of two, and it is the half that must never be deleted.
+///
+/// Because the sweep now skips cooling-down endpoints, the sweep is NOT what keeps a foreign chain
+/// out - `verified_provider` is, at the moment of use. It runs the probe inside the cell and
+/// compares the id the cell was verified against, so an endpoint that becomes selectable again is
+/// still refused. Deleting that check on the grounds the sweep already covers it would leave the
+/// pool with no chain-id gate at all, and this test is what stops that.
+#[tokio::test]
+async fn a_foreign_endpoint_the_sweep_skipped_is_still_refused_at_use() {
+    use raven_railgun_indexer::rpc_pool::{EndpointHealth, ErrorKind};
+
+    let (addr, _probes) = spawn_rpc(FOREIGN_CHAIN).await;
+    let pool = Arc::new(
+        RpcEndpointPool::new(
+            vec![EndpointConfig {
+                url: format!("http://{addr}"),
+                rps: 1000,
+                burst: 1000,
+            }],
+            PoolConfig::default(),
+        )
+        .expect("pool builds"),
+    );
+    let endpoint = Arc::clone(&pool.endpoints()[0]);
+    pool.mark_endpoint_error(&endpoint, ErrorKind::Network);
+    assert!(
+        matches!(endpoint.health(), EndpointHealth::CoolingDown { .. }),
+        "premise: the sweep would skip this endpoint"
+    );
+
+    match endpoint.verified_provider(HONEST_CHAIN).await {
+        Err(IndexerError::ChainIdMismatch { .. }) => {}
+        Err(other) => panic!("expected a chain-id mismatch at use, got: {other}"),
+        Ok(_) => panic!(
+            "a foreign chain must be refused at the point of use, sweep or no sweep; the sweep \
+             skips a cooling-down endpoint, so nothing else is guarding this"
+        ),
+    }
+}

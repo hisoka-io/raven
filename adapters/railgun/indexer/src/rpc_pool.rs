@@ -542,7 +542,18 @@ impl PooledRpcChainSource {
     async fn verify_chain_id_once(&self) -> Result<()> {
         let mut verified = 0usize;
         let mut unreachable: Vec<String> = Vec::new();
+        let mut cooling = 0usize;
         for endpoint in self.pool.endpoints() {
+            // A cooling-down endpoint cannot be SELECTED, so probing it buys nothing and costs a
+            // full `RPC_TIMEOUT_SECS` per pooled call when it is black-holed rather than merely
+            // erroring. Skipping is safe because verification is enforced AT USE:
+            // `verified_provider` runs the probe inside the cell and compares the id the cell was
+            // verified against, so an endpoint that becomes selectable is still refused there if
+            // it answers for another chain. This sweep is early detection, not the admission gate.
+            if matches!(endpoint.health(), EndpointHealth::CoolingDown { .. }) {
+                cooling += 1;
+                continue;
+            }
             match endpoint.verified_provider(self.chain_id).await {
                 // Deliberately does NOT mark success. Once the provider cell is populated
                 // this returns from cache without touching the network, so treating it as
@@ -567,10 +578,12 @@ impl PooledRpcChainSource {
         }
         if verified == 0 {
             return Err(IndexerError::Rpc(format!(
-                "no RPC endpoint could be verified against chain {}; every endpoint failed \
-                 its eth_chainId probe: [{}]. Operator: the pool cannot serve a request \
-                 until at least one endpoint answers with the configured chain id.",
+                "no RPC endpoint could be verified against chain {}; {} skipped as cooling down, \
+                 and every endpoint probed failed its eth_chainId check: [{}]. Operator: the pool \
+                 cannot serve a request until at least one endpoint answers with the configured \
+                 chain id.",
                 self.chain_id,
+                cooling,
                 unreachable.join("; ")
             )));
         }
