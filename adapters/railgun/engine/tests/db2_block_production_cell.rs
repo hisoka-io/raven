@@ -100,10 +100,8 @@ fn recompute_subtree(block: &[u8]) -> Vec<Vec<[u8; 32]>> {
     for level in 1..=BLOCK_K {
         let below = levels.get(level - 1).expect("level below present");
         let mut current = Vec::with_capacity(below.len() / 2);
-        for pair in below.chunks_exact(2) {
-            let left = *pair.first().expect("left present");
-            let right = *pair.get(1).expect("right present");
-            current.push(merkle_node(left, right).expect("subtree hash"));
+        for [left, right] in below.as_chunks::<2>().0 {
+            current.push(merkle_node(*left, *right).expect("subtree hash"));
         }
         levels.push(current);
     }

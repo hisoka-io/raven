@@ -67,10 +67,8 @@ pub(crate) fn derive_a_matrix_scalar(
     rng.fill_bytes(&mut bytes);
 
     let mut a = Vec::with_capacity(total_u32);
-    for chunk in bytes.chunks_exact(4) {
-        #[allow(clippy::indexing_slicing)]
-        let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        a.push(word);
+    for chunk in bytes.as_chunks::<4>().0 {
+        a.push(u32::from_le_bytes(*chunk));
     }
     Ok(a)
 }
@@ -106,11 +104,8 @@ pub(crate) fn derive_a_matrix_parallel(
             let byte_len = chunk.len().saturating_mul(4);
             let mut bytes = vec![0u8; byte_len];
             rng.fill_bytes(&mut bytes);
-            for (slot, src) in chunk.iter_mut().zip(bytes.chunks_exact(4)) {
-                #[allow(clippy::indexing_slicing)]
-                {
-                    *slot = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
-                }
+            for (slot, src) in chunk.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                *slot = u32::from_le_bytes(*src);
             }
         });
     Ok(a)
