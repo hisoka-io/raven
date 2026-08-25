@@ -10,8 +10,12 @@
 #   2. No framework crate depends on an adapter crate. The edge runs adapter ->
 #      framework, never back.
 #
-# `crates/inspire` is EXCLUDED: it is a vendored submodule with its own history and
-# its own upstream, corrected through a submodule change rather than here.
+# `crates/inspire` CODE is EXCLUDED: it is a vendored submodule with its own history and
+# its own upstream, corrected through a submodule change rather than here. Its code is gated
+# anyway - the parent's `raven-inspire` job runs fmt, clippy and both test lanes against it.
+# Its PROSE is NOT excluded, and is scanned below: nothing else reads it, and it is the one
+# crate published publicly as a standalone library, so a doctrine leak reaches a public
+# README and survives there.
 # `adapters/`, `examples/` and `benches/` are EXCLUDED by design - the eth-state
 # example is a second adapter and Ethereum vocabulary is correct there.
 #
@@ -88,6 +92,38 @@ case "$dep_rc" in
   1) : ;;
   *) fail "git grep failed with status $dep_rc on the dependency probe" ;;
 esac
+
+# Application vocabulary in the submodule's PUBLIC PROSE.
+#
+# Filesystem `grep`, not `git grep`: `git grep` does not descend into a submodule, and
+# `--recurse-submodules` is rejected outright alongside `--untracked`. Measured - a planted
+# `railgun` in `crates/inspire/PRIVACY.md` returns rc=1 (no match) from `git grep` and rc=0 with
+# the hit from `grep -r`. A scan that cannot see its own target is worse than no scan, because it
+# reports clean.
+#
+# APP_WORDS only, deliberately. The chain and domain patterns above would fire on legitimate
+# prose - a privacy doc explaining what the scheme is agnostic to may reasonably name Ethereum -
+# and a gate that cries wolf on a public crate's documentation gets disabled.
+if [[ ! -d crates/inspire ]]; then
+  # Not a failure - a non-recursive clone legitimately has no submodule and therefore no docs to
+  # leak - but SAID rather than skipped silently, because a scan that quietly does nothing is
+  # indistinguishable from a scan that found nothing.
+  echo "scripts/check-layering.sh: submodule not checked out; its doc scan did NOT run."
+else
+  sub_hits="$(grep -rniE --include='*.md' --exclude-dir=target --exclude-dir=.git \
+    "$APP_WORDS" crates/inspire)"
+  sub_rc=$?
+  case "$sub_rc" in
+    0)
+      echo "$sub_hits"
+      fail "application vocabulary in the submodule's public docs. REMEDY: this file belongs to \
+another repository - commit the fix inside crates/inspire, push it, then bump the gitlink here as \
+its own commit. Editing it from the parent alone will be lost on the next submodule update."
+      ;;
+    1) : ;;
+    *) fail "grep failed with status $sub_rc scanning the submodule docs (a broken scan is not a clean tree)" ;;
+  esac
+fi
 
 if [[ $failed -ne 0 ]]; then
   echo "scripts/check-layering.sh: failed."

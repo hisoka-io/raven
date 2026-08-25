@@ -114,6 +114,43 @@ check 0 "$(run_gate)" "(control) with the dep probe disabled the same plant is m
 git -C "$work" checkout -- crates/core/Cargo.toml
 cp "$GATE" "$work/scripts/check-layering.sh"
 
+# The submodule's PROSE. `git archive HEAD` does not carry submodule contents, so the scratch
+# tree has no `crates/inspire` at all and the scan would be skipped rather than exercised - the
+# directory is created here so the plant has somewhere to live.
+mkdir -p "$work/crates/inspire"
+printf 'The Raven Railgun deployment that consumes this crate.\n' \
+  > "$work/crates/inspire/PRIVACY.md"
+check 1 "$(run_gate)" "an application name in the submodule's public docs is refused"
+
+# The remedy has to name the submodule round trip, or an operator edits a file the parent does
+# not own and loses it on the next update.
+remedy="$( cd "$work" && ./scripts/check-layering.sh 2>&1 )"
+if [[ "$remedy" == *"bump the gitlink"* ]]; then
+  echo "  ok    the refusal tells the operator to commit in the submodule and bump the gitlink"
+else
+  echo "  FAIL  the refusal does not name the submodule remedy"
+  failed=1
+fi
+
+# CONTROL: with the submodule scan removed, the same plant must be MISSED. Without this the
+# case above proves only that SOMETHING refused the tree.
+cp "$GATE" "$work/scripts/check-layering.sh"
+# Disable at the BRANCH, not by cutting the fail message: that message spans a line
+# continuation, and a sed through it leaves a dangling backslash - the control then "passes"
+# on a shell syntax error (exit 2) instead of on the scan being absent.
+sed -i 's|if \[\[ ! -d crates/inspire \]\]; then|if true; then|' \
+  "$work/scripts/check-layering.sh"
+check 0 "$(run_gate)" "(control) with the submodule doc scan disabled the same plant is missed"
+cp "$GATE" "$work/scripts/check-layering.sh"
+rm -rf "$work/crates/inspire"
+
+# A doc that names no application is fine - the scan must not fire on ordinary prose.
+mkdir -p "$work/crates/inspire"
+printf 'The anonymity set is bounded by the ring dimension.\n' \
+  > "$work/crates/inspire/PRIVACY.md"
+check 0 "$(run_gate)" "ordinary prose in the submodule's docs is NOT refused"
+rm -rf "$work/crates/inspire"
+
 if [[ $failed -ne 0 ]]; then
   echo "scripts/check-layering-selftest.sh: FAILED - the gate does not catch what it claims."
   exit 1

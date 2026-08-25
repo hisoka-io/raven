@@ -209,6 +209,52 @@ fn decode_versioned_crs(bytes: &[u8]) -> Result<ServerCrs, WasmClientError> {
     })
 }
 
+/// The cached session must have been derived under the CRS the instance serves NOW.
+///
+/// Packing keys are a function of `w_seed`, and nothing downstream compares them: the server's only
+/// geometry check looks at gamma and key length, which a stale key set satisfies exactly. So a
+/// session reused across a CRS rotation produces a well-formed query, a successful respond and a
+/// successful extract that returns bytes unrelated to the record. The seed is already on the wire -
+/// the published CRS strips `galois_keys` but keeps `inspiring_w_seed` - so both values are in hand
+/// here, which makes this the one place the comparison can happen.
+fn ensure_session_matches_live_crs(
+    session: &ClientSession,
+    crs_bincode: &[u8],
+) -> Result<(), String> {
+    let live = ServerCrs::from_versioned_bytes(crs_bincode).map_err(|e| e.to_string())?;
+    let held = session.crs();
+    if held.inspiring_w_seed != live.inspiring_w_seed {
+        return Err(format!(
+            "deserialize_client_session: this session was derived under CRS w_seed {} but the \
+             instance now serves {}. Packing keys are a function of w_seed and nothing downstream \
+             compares them, so reusing this session would return wrong bytes at HTTP 200. Discard \
+             the cached session and re-run the handshake against the current CRS.",
+            hex8(&held.inspiring_w_seed),
+            hex8(&live.inspiring_w_seed)
+        ));
+    }
+    if held.inspiring_num_columns != live.inspiring_num_columns {
+        return Err(format!(
+            "deserialize_client_session: this session was derived at {} packing columns but the \
+             instance now serves {}. The record width changed, so extraction would reassemble the \
+             wrong number of bytes. Discard the cached session and re-run the handshake.",
+            held.inspiring_num_columns, live.inspiring_num_columns
+        ));
+    }
+    Ok(())
+}
+
+/// First eight bytes, enough to name WHICH seed without printing key-adjacent material in full.
+fn hex8(seed: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(16);
+    for byte in seed.iter().take(8) {
+        for nibble in [byte >> 4, byte & 0x0f] {
+            out.push(char::from_digit(u32::from(nibble), 16).unwrap_or('?'));
+        }
+    }
+    out
+}
+
 /// Opaque handle to an active [`ClientSession`]. Constructed via [`build_client_session`].
 #[wasm_bindgen]
 pub struct ClientSessionHandle {
@@ -502,6 +548,12 @@ pub fn deserialize_client_session(
         }
         .into());
     }
+    ensure_session_matches_live_crs(&inner, crs_bincode).map_err(|detail| {
+        WasmClientError::Decode {
+            what: "client_session",
+            detail,
+        }
+    })?;
     let entry_size_bytes = bundle_entry_size(&bundle.shard_config_bincode, &inspire_params)?;
     Ok(ClientSessionHandle {
         inner,
@@ -592,6 +644,7 @@ pub fn deserialize_client_session_rust(
             inspire_params.ring_dim
         ));
     }
+    ensure_session_matches_live_crs(&inner, crs_bincode)?;
     Ok((inner, inspire_params))
 }
 
