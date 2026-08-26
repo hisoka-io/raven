@@ -16,6 +16,7 @@ pub mod frame;
 pub mod harness;
 pub mod noise;
 pub mod pir_eng_notes;
+pub mod provenance;
 pub mod timing;
 
 use serde::{Deserialize, Serialize};
@@ -244,8 +245,8 @@ impl BenchReport {
 impl From<BenchReport> for BenchFile {
     fn from(report: BenchReport) -> Self {
         Self {
-            hardware: String::new(),
-            captured_at: String::new(),
+            hardware: provenance::hardware(),
+            captured_at: provenance::captured_at(),
             results: report.to_results(),
         }
     }
@@ -300,5 +301,43 @@ mod tests {
             record_bytes: 256,
         };
         assert_eq!(cell.raw_db_bytes(), (1u128 << 20) * 256);
+    }
+
+    fn probe_report() -> BenchReport {
+        BenchReport {
+            scheme: "probe".to_owned(),
+            cell: GridCell {
+                entries_log2: 20,
+                record_bytes: 8,
+            },
+            setup_ms: 1.0,
+            hint_bytes: 0,
+            query_bytes: 2,
+            response_bytes: 3,
+            query_ms_median: 4.0,
+            server_ms_median: None,
+            client_ms_median: None,
+            throughput_qps_per_core: 5.0,
+            measured_queries: 6,
+            samples: BenchSamples::default(),
+        }
+    }
+
+    /// Both bench binaries serialize through this conversion, so it is the only place a
+    /// missing stamp can be caught. Asserting on `provenance::hardware()` directly would
+    /// pass with the conversion still writing an empty string.
+    #[test]
+    fn from_bench_report_stamps_the_machine_class() {
+        assert_eq!(
+            BenchFile::from(probe_report()).hardware,
+            provenance::hardware()
+        );
+    }
+
+    #[test]
+    fn from_bench_report_stamps_the_capture_time() {
+        let stamped = BenchFile::from(probe_report()).captured_at;
+        assert_eq!(stamped.len(), 20, "not RFC 3339 to the second: {stamped}");
+        assert!(stamped.ends_with('Z'), "not UTC: {stamped}");
     }
 }
