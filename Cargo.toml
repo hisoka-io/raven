@@ -12,6 +12,7 @@ members = [
 exclude = [
     "crates/inspire",
     "adapters/railgun",
+    "adapters/howl",
     "adapters/railgun/client-wasm",
     "benches/b1-bench",
     "benches/b2-bench",

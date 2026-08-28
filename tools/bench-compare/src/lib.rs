@@ -452,10 +452,16 @@ pub fn render_human_with_policy(
             .current
             .map(|v| format_value(v, r.unit))
             .unwrap_or_else(na);
-        let delta = r
-            .delta_pct
-            .map(|d| format!("{:+.1}%", d * 100.0))
-            .unwrap_or_else(na);
+        // Bytes are gated exactly, so a percentage is the wrong lens for them: a one-byte
+        // move on a 96 KiB payload rounds to +0.0% and prints beside the verdict REGRESSION,
+        // which reads as a broken gate at the only moment this gate can fail.
+        let delta = match (r.unit, r.baseline, r.current) {
+            (Unit::Bytes, Some(b), Some(c)) => format!("{:+} B", (c - b) as i64),
+            _ => r
+                .delta_pct
+                .map(|d| format!("{:+.1}%", d * 100.0))
+                .unwrap_or_else(na),
+        };
         let sig = r.p_value.map(|p| format!("{p:.3}")).unwrap_or_else(na);
         let verdict = match r.verdict {
             Verdict::UnitMismatch => "UNIT MISMATCH",

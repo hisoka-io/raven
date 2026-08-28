@@ -1,0 +1,87 @@
+{
+  "hardware": "os=linux; arch=x86_64; cpus=4; cpu=AMD EPYC 7763 64-Core Processor; image=ubuntu24",
+  "captured_at": "2026-08-26T13:35:05Z",
+  "results": [
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/setup",
+      "value": 6018905049.0,
+      "unit": "nanoseconds",
+      "samples": []
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/hint_bytes",
+      "value": 0.0,
+      "unit": "bytes",
+      "samples": []
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/query_bytes",
+      "value": 98840.0,
+      "unit": "bytes",
+      "samples": []
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/response_bytes",
+      "value": 32879.0,
+      "unit": "bytes",
+      "samples": []
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/query_median",
+      "value": 25389000.0,
+      "unit": "nanoseconds",
+      "samples": [
+        25174000.0,
+        25211000.0,
+        25211000.0,
+        25229000.0,
+        25239000.0,
+        25389000.0,
+        25391000.0,
+        25395000.0,
+        25666000.0,
+        25683000.0
+      ]
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/throughput",
+      "value": 39.434042620313264,
+      "unit": "queries_per_second",
+      "samples": []
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/server_median",
+      "value": 13801000.0,
+      "unit": "nanoseconds",
+      "samples": [
+        13762000.0,
+        13770000.0,
+        13775000.0,
+        13790000.0,
+        13791000.0,
+        13801000.0,
+        13802000.0,
+        13817000.0,
+        14007000.0,
+        14216000.0
+      ]
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/client_median",
+      "value": 11450000.0,
+      "unit": "nanoseconds",
+      "samples": [
+        11466000.0,
+        11419000.0,
+        11383000.0,
+        11586000.0,
+        11458000.0,
+        11448000.0,
+        11411000.0,
+        11577000.0,
+        11435000.0,
+        11865000.0
+      ]
+    }
+  ]
+}

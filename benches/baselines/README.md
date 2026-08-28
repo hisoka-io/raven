@@ -29,7 +29,11 @@ it with a message saying what moved and why.
 
 - **Byte counts are exact.** Any movement blocks. Measured 0.000% spread across 13 configs
   x 3 seeds and 8 same-producer seeds, and `query_bytes` reproduced byte-identically across
-  four months and different hardware.
+  four months and different hardware. Since 2026-08-27 the stronger form is measured: a
+  baseline produced on the CI runner (4-core AMD EPYC 7763) compared against a run on a
+  16-core AMD Ryzen 7 9800X3D gives **identical `query_bytes` and `response_bytes` while
+  timings move up to -42.5%** on unchanged code. Byte determinism holds ACROSS machine
+  classes; no timing metric does, which is why only bytes block.
 - **Timings block only on a 15% breach that is also significant** (`p < 0.05`, Welch t).
   A breach that cannot be separated from noise prints as unconfirmed and does not block.
 - **Throughput is reported, never blocking.** It is `1/mean(query_latency)` over the same

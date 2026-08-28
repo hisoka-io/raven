@@ -1,0 +1,33 @@
+# Detached workspace: `--workspace` from the repository root does not reach it, so every cargo
+# command here needs `--manifest-path`. Mirrors adapters/railgun for the same reason - an
+# adaptor's dependency graph must not widen the framework's.
+[workspace]
+resolver = "2"
+members = ["poseidon2", "record"]
+
+[workspace.package]
+version = "0.1.0-alpha.0"
+edition = "2021"
+rust-version = "1.89"
+authors = ["The Raven Authors"]
+license = "Apache-2.0"
+repository = "https://github.com/hisoka-io/raven"
+publish = false
+
+[workspace.dependencies]
+ark-bn254 = "0.5"
+ark-ff = "0.5"
+thiserror = "2"
+serde_json = "1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"

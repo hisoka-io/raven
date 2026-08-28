@@ -252,6 +252,43 @@ pub fn build_seeded_query(
     Ok((state, query))
 }
 
+/// Largest multiple of `bound` representable in `u64`. Draws at or above it are rejected,
+/// which is what makes the remainder uniform.
+const fn rejection_limit(bound: u64) -> u64 {
+    (u64::MAX / bound) * bound
+}
+
+/// Uniform draw below `bound`, rejection-sampled to match the SDK's `randomBelow`.
+///
+/// The two implementations of one privacy mechanism should not disagree on their draw: a
+/// reader comparing them has to decide which is right. The bias a bare remainder would leave
+/// is about `bound / 2^64`, unobservable at any batch length this ladder admits, so this is
+/// parity rather than a live leak. The attempt bound exists because an unbounded retry in a
+/// request path is a worse failure than a refusal.
+fn uniform_below(bound: u64) -> Result<u64> {
+    if bound == 0 {
+        return Err(AdapterError::Scheme(
+            "pad draw bound is zero; an empty batch has nothing to draw from".to_owned(),
+        ));
+    }
+    let limit = rejection_limit(bound);
+    for _ in 0..64 {
+        let seed = raven_inspire::math::gaussian::os_seed("batch_pad_index")
+            .map_err(|e| AdapterError::Scheme(format!("pad index entropy: {e}")))?;
+        let draw = u64::from_le_bytes([
+            seed[0], seed[1], seed[2], seed[3], seed[4], seed[5], seed[6], seed[7],
+        ]);
+        if draw < limit {
+            return Ok(draw % bound);
+        }
+    }
+    Err(AdapterError::Scheme(
+        "pad index rejection sampling did not converge in 64 attempts; entropy source is \
+         degenerate and a cycling pad would publish the real query count"
+            .to_owned(),
+    ))
+}
+
 /// Build a batch padded up to the next [`batch_ladder`] step. Slots stay in
 /// `global_indices` order, so `states[i]` decodes `responses[i]`.
 ///
@@ -295,14 +332,9 @@ pub fn build_padded_batch(
         let index = if let Some(real) = global_indices.get(slot) {
             *real
         } else {
-            let draw = raven_inspire::math::gaussian::os_seed("batch_pad_index")
-                .map_err(|e| AdapterError::Scheme(format!("pad index entropy: {e}")))?;
-            let draw64 = u64::from_le_bytes([
-                draw[0], draw[1], draw[2], draw[3], draw[4], draw[5], draw[6], draw[7],
-            ]);
             let len = u64::try_from(global_indices.len())
                 .map_err(|_| AdapterError::Scheme("batch length exceeds u64".to_owned()))?;
-            let pick = usize::try_from(draw64 % len)
+            let pick = usize::try_from(uniform_below(len)?)
                 .map_err(|_| AdapterError::Scheme("pad index exceeds usize".to_owned()))?;
             global_indices
                 .get(pick)
@@ -1734,6 +1766,78 @@ mod re_encode_tests {
         assert!(
             msg.contains("999"),
             "error should name the missing shard id: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pad_draw_tests {
+    use super::{rejection_limit, uniform_below};
+
+    /// `SeededClientQuery.shard_id` travels in cleartext, so a favoured residue is a bias in
+    /// what an operator sees. The bound is the observable: the bias a bare remainder leaves at
+    /// these batch lengths is about `bound / 2^64`, which no statistical test on the draw could
+    /// distinguish, so asserting on samples would prove nothing either way.
+    #[test]
+    fn the_rejection_bound_is_a_whole_number_of_buckets() {
+        for bound in [1_u64, 2, 3, 5, 8, 32, 84, 128, 1000, u64::MAX / 2] {
+            let limit = rejection_limit(bound);
+            assert_eq!(
+                limit % bound,
+                0,
+                "bound {bound}: {limit} is not a multiple, so the remainder is not uniform"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rejection_bound_discards_at_most_one_bucket() {
+        for bound in [3_u64, 7, 32, 84, 1000, 65_537] {
+            let discarded = u64::MAX - rejection_limit(bound) + 1;
+            assert!(
+                discarded <= bound,
+                "bound {bound}: discards {discarded}, more than one bucket"
+            );
+        }
+    }
+
+    /// The excess a bare remainder would leave, stated as arithmetic rather than sampled.
+    #[test]
+    fn the_bound_removes_the_excess_a_bare_remainder_would_leave() {
+        for bound in [3_u64, 7, 84, 1000] {
+            let excess = ((u64::MAX % bound) + 1) % bound;
+            assert_ne!(
+                excess, 0,
+                "bound {bound} divides 2^64; pick one that does not"
+            );
+            assert_eq!(rejection_limit(bound) % bound, 0);
+        }
+    }
+
+    #[test]
+    fn a_zero_bound_is_refused_rather_than_dividing_by_zero() {
+        let err = uniform_below(0).expect_err("a zero bound must not reach the remainder");
+        assert!(
+            format!("{err}").contains("bound is zero"),
+            "the refusal must name the cause; got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_real_draw_lands_in_range_and_is_not_pinned_to_one_value() {
+        // Not a uniformity test - it cannot be one at this bias. It checks the loop returns,
+        // stays in range, and is not stuck, which is what a broken entropy path would show.
+        let draws: Vec<u64> = (0..64)
+            .map(|_| uniform_below(8).expect("entropy available in test"))
+            .collect();
+        assert!(draws.iter().all(|&d| d < 8), "draw out of range: {draws:?}");
+        let distinct = draws
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        assert!(
+            distinct > 1,
+            "every draw returned the same value: {draws:?}"
         );
     }
 }

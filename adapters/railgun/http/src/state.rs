@@ -410,6 +410,14 @@ fn register_prometheus_descriptions() {
     .increment(0);
     metrics::counter!("raven_railgun_indexer_reorg_window_persist_failed_total").increment(0);
     metrics::counter!("raven_railgun_indexer_reorg_window_tip_hash_failed_total").increment(0);
+    // Labelled series materialise per label set, so the zero-init has to name the reason. This
+    // is the only reason the indexer emits today; a new one needs a line here or its series is
+    // absent until the first drop.
+    metrics::counter!(
+        "raven_railgun_indexer_dropped_logs_total",
+        "reason" => "missing_block_number",
+    )
+    .increment(0);
 }
 
 #[cfg(test)]
@@ -417,6 +425,7 @@ mod tests {
     use super::register_prometheus_descriptions;
 
     const TIP_HASH_FAILED: &str = "raven_railgun_indexer_reorg_window_tip_hash_failed_total";
+    const DROPPED_LOGS: &str = "raven_railgun_indexer_dropped_logs_total";
 
     /// A described-but-unfired counter renders nothing, so the operator sees
     /// "no data" where a rate alert needs a zero series.
@@ -434,6 +443,29 @@ mod tests {
         assert!(
             rendered.contains(&format!("{TIP_HASH_FAILED} 0")),
             "counter must scrape as zero before it fires; rendered:\n{rendered}"
+        );
+    }
+
+    /// The labelled sibling. A rate alert on this reads "no data" rather than 0 until the first
+    /// malformed log arrives, which is indistinguishable from the counter not being wired.
+    #[test]
+    fn indexer_dropped_logs_counter_scrapes_zero_for_its_reason_before_it_fires() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, register_prometheus_descriptions);
+        let rendered = handle.render();
+
+        assert!(
+            rendered.contains(&format!("# HELP {DROPPED_LOGS}")),
+            "counter must register HELP text; rendered:\n{rendered}"
+        );
+        // The label must be present: an unlabelled zero series does not answer a query that
+        // filters by reason, which is how the dashboard reads it.
+        assert!(
+            rendered.contains(&format!(
+                "{DROPPED_LOGS}{{reason=\"missing_block_number\"}} 0"
+            )),
+            "counter must scrape as zero for its reason before it fires; rendered:\n{rendered}"
         );
     }
 }

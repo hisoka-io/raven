@@ -152,6 +152,10 @@ fn build_seeded_query_oob_target_idx_panics_caught_by_unwind() {
         build_seeded_query_rust(&session, &params, &encoded_db.config, oob_idx)
     }));
     // Typed Err or caught panic both pass; the requirement is no native abort.
+    #[allow(
+        clippy::single_match,
+        reason = "the arms enumerate all three outcomes; `if let` would drop the one naming which two pass"
+    )]
     match outcome {
         Ok(Ok(_)) => {
             panic!("u64::MAX target_idx must surface as Err or caught panic, not silent Ok");

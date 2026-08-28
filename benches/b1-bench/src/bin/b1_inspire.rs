@@ -118,12 +118,29 @@ fn micros_between(start: Instant, end: Instant) -> u64 {
     u64::try_from(end.saturating_duration_since(start).as_micros()).unwrap_or(u64::MAX)
 }
 
-fn median_of(samples: &mut [u64]) -> u64 {
+/// Copies verbatim: the exported samples are the recorded vectors, and any reordering on this
+/// path republishes trial-order timings in rank order, which is undetectable downstream.
+fn samples_in_trial_order(
+    query_us: &[u64],
+    server_us: &[u64],
+    client_us: &[u64],
+) -> raven_bench::BenchSamples {
+    raven_bench::BenchSamples {
+        query_us: query_us.to_vec(),
+        server_us: server_us.to_vec(),
+        client_us: client_us.to_vec(),
+    }
+}
+
+/// Borrows, because the caller's vector is also the one exported as `samples`, and a
+/// sort in place silently republishes it in rank order instead of trial order.
+fn median_of(samples: &[u64]) -> u64 {
     if samples.is_empty() {
         return 0;
     }
-    samples.sort_unstable();
-    samples[samples.len() / 2]
+    let mut ranked = samples.to_vec();
+    ranked.sort_unstable();
+    ranked[ranked.len() / 2]
 }
 
 #[derive(Debug)]
@@ -415,8 +432,8 @@ fn main() {
         let mut server_times_us: Vec<u64> = Vec::new();
         let mut extract_times_us: Vec<u64> = Vec::new();
         let mut total_times_us: Vec<u64> = Vec::new();
-        // Paired at push time: `median_of` sorts in place, so summing the two client
-        // vectors afterwards would add timings from different trials.
+        // Paired at push time so the sum is per trial; the two source vectors are
+        // separately ordered and zipping them afterwards is not the same thing.
         let mut client_times_us: Vec<u64> = Vec::new();
 
         let bench_total = cli.warmup + cli.measured;
@@ -522,10 +539,10 @@ fn main() {
             }
         }
 
-        let query_gen_median_us = median_of(&mut query_gen_times_us);
-        let server_median_us = median_of(&mut server_times_us);
-        let extract_median_us = median_of(&mut extract_times_us);
-        let total_median_us = median_of(&mut total_times_us);
+        let query_gen_median_us = median_of(&query_gen_times_us);
+        let server_median_us = median_of(&server_times_us);
+        let extract_median_us = median_of(&extract_times_us);
+        let total_median_us = median_of(&total_times_us);
 
         // K=1 reports per-core sustained; K>1 reports concurrent-wall.
         let measured_secs_sum =
@@ -584,11 +601,7 @@ fn main() {
             client_ms_median: Some((query_gen_median_us + extract_median_us) as f64 / 1000.0),
             throughput_qps_per_core: throughput,
             measured_queries: total_times_us.len() as u64,
-            samples: raven_bench::BenchSamples {
-                query_us: total_times_us.clone(),
-                server_us: server_times_us.clone(),
-                client_us: client_times_us.clone(),
-            },
+            samples: samples_in_trial_order(&total_times_us, &server_times_us, &client_times_us),
         };
 
         let json =
@@ -611,5 +624,45 @@ fn main() {
             last_query_bytes,
             last_response_bytes
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{median_of, samples_in_trial_order};
+
+    /// The exported `samples` array IS the caller's vector, so a `median_of` that sorts in
+    /// place republishes trial-order data in rank order. Two of the three arrays shipped
+    /// that way in every artifact CI produced.
+    #[test]
+    fn median_of_leaves_trial_order_intact() {
+        let trials = vec![50_u64, 10, 40, 20, 30];
+        let before = trials.clone();
+        let median = median_of(&trials);
+        assert_eq!(median, 30, "median of 10,20,30,40,50");
+        assert_eq!(
+            trials, before,
+            "median_of reordered its input; the artifact's samples would ship sorted"
+        );
+    }
+
+    #[test]
+    fn median_of_is_empty_safe_and_picks_the_upper_median_on_even_counts() {
+        assert_eq!(median_of(&[]), 0);
+        assert_eq!(median_of(&[7]), 7);
+        assert_eq!(median_of(&[10, 20, 30, 40]), 30);
+    }
+
+    /// M2 in the mutation matrix: with the export written inline, sorting it reddened NOTHING.
+    /// This helper exists so that mutation has a test to kill.
+    #[test]
+    fn the_exported_samples_are_the_recorded_vectors_verbatim() {
+        let query = vec![50_u64, 10, 40];
+        let server = vec![5_u64, 1, 4];
+        let client = vec![45_u64, 9, 36];
+        let out = samples_in_trial_order(&query, &server, &client);
+        assert_eq!(out.query_us, query, "query samples reordered on export");
+        assert_eq!(out.server_us, server, "server samples reordered on export");
+        assert_eq!(out.client_us, client, "client samples reordered on export");
     }
 }

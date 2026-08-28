@@ -318,3 +318,43 @@ fn an_unsampled_run_reports_no_p_value() {
         .expect("query_median row");
     assert_eq!(q.p_value, None, "no samples means no p-value");
 }
+
+/// A one-byte movement BLOCKS the gate, so its row is the only output an operator will ever
+/// see this gate fail on. Rendered as a percentage it read `+0.0%` beside `REGRESSION`, with
+/// baseline and current both rounding to the same `96.52 KiB` and no p-value - every column
+/// saying nothing changed while the verdict disagreed.
+#[test]
+fn a_one_byte_regression_is_legible_in_the_rendered_row() {
+    let baseline = file_of(vec![raven_bench::BenchResult {
+        bench: "s/2e16x32/query_bytes".to_owned(),
+        value: 98_840.0,
+        unit: raven_bench::Unit::Bytes,
+        samples: Vec::new(),
+    }]);
+    let current = file_of(vec![raven_bench::BenchResult {
+        bench: "s/2e16x32/query_bytes".to_owned(),
+        value: 98_841.0,
+        unit: raven_bench::Unit::Bytes,
+        samples: Vec::new(),
+    }]);
+    let rows = bench_compare::compare(&baseline, &current, 0.15);
+    let rendered = bench_compare::render_human_with_policy(
+        "base",
+        "cur",
+        0.15,
+        &rows,
+        &bench_compare::GatePolicy::default(),
+    );
+    assert!(
+        rendered.contains("+1 B"),
+        "the one-byte movement must be visible in the delta column; got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("+0.0%"),
+        "a byte row must not render as a percentage that rounds away the whole change:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("REGRESSION"),
+        "and it must still block:\n{rendered}"
+    );
+}

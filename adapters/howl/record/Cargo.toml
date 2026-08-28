@@ -1,0 +1,21 @@
+[package]
+name = "howl-record"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The howl-note-v1 discovery record: 246 payload bytes inside a 256-byte PIR cell."
+
+[lints]
+workspace = true
+
+[dependencies]
+ark-bn254 = { workspace = true }
+ark-ff = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
