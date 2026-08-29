@@ -212,7 +212,7 @@ pub fn hash_be_bytes(bytes: &[u8]) -> Result<[u8; 32], Poseidon2Error> {
         return Err(Poseidon2Error::NotFieldAligned { len: bytes.len() });
     }
     let mut elements = Vec::with_capacity(bytes.len() / 32);
-    for (index, chunk) in bytes.chunks_exact(32).enumerate() {
+    for (index, chunk) in bytes.as_chunks::<32>().0.iter().enumerate() {
         let fr = Fr::from_be_bytes_mod_order(chunk);
         if fr.into_bigint().to_bytes_be() != chunk {
             return Err(Poseidon2Error::NotCanonical { index });

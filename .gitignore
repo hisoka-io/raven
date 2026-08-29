@@ -15,6 +15,8 @@ no-commit/
 .claude/
 .agent/
 CLAUDE.*
+AGENTS.md
+**/AGENTS.md
 MEMORY.md
 tmp/
 .code-review-graph/
