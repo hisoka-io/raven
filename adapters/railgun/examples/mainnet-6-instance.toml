@@ -38,6 +38,15 @@ scheme_tag = "raven-inspire-twopacking-inspiring-wp3-cache-session"
 use_flock = true
 channel_capacity = 1024
 
+# Tree-rollover protection. When a live commit-tree reaches this fraction of its
+# capacity, pre-spawn the successor so the rollover does not strand events.
+#
+# Leaving this unset is what caused the 2026-08-27 outage: the watcher shipped,
+# the config never enabled it, Railgun rolled to tree 4, and every tree-4 event
+# was dropped under `tracing::trace!` while the image ran at RUST_LOG=info.
+# 0.95 leaves ~3,277 leaves of headroom on a 65,536-leaf tree.
+tree_fill_threshold = 0.95
+
 # Key per-IP rate limiting off X-Forwarded-For / cf-connecting-ip. Enabling it
 # requires naming the peer ranges the proxy connects FROM: a boolean cannot tell
 # "behind a proxy" from "directly reachable", and on an exposed origin anyone can
@@ -49,6 +58,18 @@ trust_proxy_header = false
 
 # rate_limit_rps = 200      # per-IP refill rate (req/s)
 # rate_limit_burst = 400    # per-IP token-bucket capacity
+
+# Where the fill watcher spawns the successor commit-tree. Without this the
+# watcher can see the rollover coming and have nowhere to put the new instance.
+# `data_dir_template` MUST contain {tree_number}, or every spawned tree would
+# share one data dir.
+[auto_spawn]
+enabled = true
+data_dir_template = "/var/lib/raven-railgun/commit-tree-{tree_number}"
+encoder = "per-node"
+scheme_tag = "raven-inspire-twopacking-inspiring-wp3-cache-session"
+max_instance_count = 8
+cooldown_seconds = 300
 
 [[instance]]
 id = "commit-tree-0"

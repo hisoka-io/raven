@@ -29,11 +29,7 @@ fn modulus_minus_one() -> [u8; 32] {
     bytes
 }
 
-fn canonical(seed: u8) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    bytes[31] = seed.max(1);
-    bytes
-}
+use raven_railgun_testkit::canonical;
 
 fn enc() -> PerLeafCommitmentEncoder {
     PerLeafCommitmentEncoder::new(32, 2048, 0).expect("test encoder")

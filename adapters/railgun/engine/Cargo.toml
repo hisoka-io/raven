@@ -29,6 +29,7 @@ metrics = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+raven-railgun-testkit = { workspace = true }
 tempfile = "3"
 rayon = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

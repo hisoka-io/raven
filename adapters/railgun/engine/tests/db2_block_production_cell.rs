@@ -36,11 +36,7 @@ const LEAVES_PRELOADED: u32 = 2_100;
 const FULL_BLOCKS: usize = 2;
 const PARTIAL_BLOCK: usize = 2;
 
-fn canonical(seed: u8) -> [u8; 32] {
-    let mut b = [0u8; 32];
-    b[31] = seed.max(1);
-    b
-}
+use raven_railgun_testkit::canonical;
 
 fn commitment_for(leaf_index: u32) -> [u8; 32] {
     canonical(

@@ -31,9 +31,7 @@ const PROD_ENTRIES: usize = 65_536;
 const PROD_ENTRY_SIZE: usize = 512;
 
 fn build_initial_db_with_size(entries: usize, entry_size: usize) -> Vec<u8> {
-    (0..entries)
-        .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
-        .collect()
+    raven_railgun_testkit::toy_db(entries, entry_size)
 }
 
 fn build_initial_db() -> Vec<u8> {

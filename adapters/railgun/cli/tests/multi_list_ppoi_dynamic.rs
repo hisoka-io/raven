@@ -13,13 +13,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use raven_inspire::params::{InspireParams, InspireVariant};
+use raven_inspire::params::InspireParams;
 use raven_railgun_cli::auto_spawn_driver::{
     replay_ppoi_list_spawn_log, run_ppoi_list_driver, PpoiListSpawnRegistry,
     PpoiListTemplateRuntime,
 };
 use raven_railgun_core::InstanceId;
-use raven_railgun_engine::inspire::{setup_state, InspireServerState, RavenInspireScheme};
+use raven_railgun_engine::inspire::{InspireServerState, RavenInspireScheme};
 use raven_railgun_engine::orchestrator::PpoiListRoutes;
 use raven_railgun_engine::persistence::ConsumerEvent;
 use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
@@ -40,15 +40,7 @@ struct TestHarness {
 }
 
 fn build_toy_state() -> InspireServerState {
-    let params = InspireParams::secure_128_d2048();
-    let db: Vec<u8> = (0..TOY_ENTRIES)
-        .flat_map(|i| {
-            (0..TOY_ENTRY_BYTES).map(move |j| u8::try_from((i + j) % 251).expect("< 251"))
-        })
-        .collect();
-    let (state, _sk) =
-        setup_state(&params, &db, TOY_ENTRY_BYTES, InspireVariant::TwoPacking).expect("toy state");
-    state
+    raven_railgun_testkit::toy_state(TOY_ENTRY_BYTES)
 }
 
 fn fresh_harness(tmp: &std::path::Path) -> TestHarness {

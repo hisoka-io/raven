@@ -1149,7 +1149,9 @@ async fn boundary_repair_post_fix_chain_oracle_byte_identity_passes_all_three_fi
 
 /// 3-seed wall-clock micro-bench at the production cell; run with `--ignored --release`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
+#[ignore = "bench, not a test: reports wall time and asserts no behaviour. Trigger: run with \
+            --ignored --release when changing the bootstrap path's cost. Belongs in benches/ \
+            (W6); it is here because cli has no bench target."]
 async fn bootstrap_three_seed_production_cell_bench() {
     let (rows, root) = synthetic_leaves(64);
     let chain = StubChain::new(20_000_000, 99);
@@ -1185,7 +1187,9 @@ async fn bootstrap_three_seed_production_cell_bench() {
 
 /// 3-seed wall-clock micro-bench for the boundary-repair path on synthetic 8-leaf cells.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
+#[ignore = "bench, not a test: reports per-tree wall time and asserts no behaviour. Trigger: run \
+            with --ignored when changing boundary repair. Also named in ci.yml:324's subtraction \
+            list, so it runs in no lane at all."]
 async fn boundary_repair_three_seed_per_tree_bench() {
     let mut by_tree: Vec<(u32, [f64; 3])> = Vec::new();
     for tree_number in 0u32..3 {

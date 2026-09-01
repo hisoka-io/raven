@@ -21,9 +21,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_core::InstanceId;
-use raven_railgun_engine::inspire::{setup_state, InspireServerState};
+use raven_railgun_engine::inspire::InspireServerState;
 use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
 use raven_railgun_persistence::{
@@ -31,27 +30,16 @@ use raven_railgun_persistence::{
 };
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-real-sigkill-migration";
-const TOY_ENTRIES: usize = 256;
 const TOY_ENTRY_SIZE: usize = 32;
 const ENTRIES_PER_SHARD: u32 = 256;
 const SEED_LEAF_COUNT: u32 = 32;
 const SENTINEL_TIMEOUT: Duration = Duration::from_secs(60);
 const POST_KILL_WAIT: Duration = Duration::from_secs(10);
 
-fn canonical(seed: u8) -> [u8; 32] {
-    let mut b = [0u8; 32];
-    b[31] = seed.max(1);
-    b
-}
+use raven_railgun_testkit::canonical;
 
 fn build_toy_state() -> InspireServerState {
-    let params = InspireParams::secure_128_d2048();
-    let db: Vec<u8> = (0..TOY_ENTRIES)
-        .flat_map(|i| (0..TOY_ENTRY_SIZE).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
-        .collect();
-    let (state, _sk) =
-        setup_state(&params, &db, TOY_ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup_state");
-    state
+    raven_railgun_testkit::toy_state(TOY_ENTRY_SIZE)
 }
 
 fn encoder_arc(kind: EncoderKind) -> Arc<dyn PirTableEncoder> {

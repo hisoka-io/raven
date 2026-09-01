@@ -39,17 +39,11 @@ const ENTRIES_PER_SHARD: u32 = 256;
 const PATH_RECORD_BYTES: usize = 16 * 32;
 const LIST_KEY_OFAC: [u8; 32] = [0xAB; 32];
 
-fn canonical(seed: u8) -> [u8; 32] {
-    let mut b = [0u8; 32];
-    b[31] = seed.max(1);
-    b
-}
+use raven_railgun_testkit::canonical;
 
 fn build_toy_state() -> InspireServerState {
     let params = InspireParams::secure_128_d2048();
-    let db: Vec<u8> = (0..TOY_ENTRIES)
-        .flat_map(|i| (0..TOY_ENTRY_SIZE).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
-        .collect();
+    let db = raven_railgun_testkit::toy_db(TOY_ENTRIES, TOY_ENTRY_SIZE);
     let (state, _sk) =
         setup_state(&params, &db, TOY_ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup_state");
     state
@@ -57,9 +51,7 @@ fn build_toy_state() -> InspireServerState {
 
 fn build_toy_state_with_record_size(record_size: usize) -> InspireServerState {
     let params = InspireParams::secure_128_d2048();
-    let db: Vec<u8> = (0..TOY_ENTRIES)
-        .flat_map(|i| (0..record_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
-        .collect();
+    let db = raven_railgun_testkit::toy_db(TOY_ENTRIES, record_size);
     let (state, _sk) =
         setup_state(&params, &db, record_size, InspireVariant::TwoPacking).expect("setup_state");
     state

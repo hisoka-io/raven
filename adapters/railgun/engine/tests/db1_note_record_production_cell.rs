@@ -45,11 +45,7 @@ const TREE_NUMBER: u32 = 0;
 /// Crosses the shard 0 / shard 1 boundary at 2048 so shard routing is covered.
 const LEAVES_PRELOADED: u32 = 2100;
 
-fn canonical(seed: u8) -> [u8; 32] {
-    let mut b = [0u8; 32];
-    b[31] = seed.max(1);
-    b
-}
+use raven_railgun_testkit::canonical;
 
 fn commitment_for(leaf_index: u32) -> [u8; 32] {
     canonical(

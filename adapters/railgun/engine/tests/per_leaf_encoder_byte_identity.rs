@@ -17,11 +17,7 @@ const ENTRIES_PER_SHARD: u32 = 256;
 const RECORD_SIZE: usize = 32;
 const TOTAL_SHARDS: u32 = 4;
 
-fn canonical(seed: u8) -> [u8; 32] {
-    let mut b = [0u8; 32];
-    b[31] = seed.max(1);
-    b
-}
+use raven_railgun_testkit::canonical;
 
 fn test_encoder() -> PerLeafEncoder {
     PerLeafEncoder::new(RECORD_SIZE, ENTRIES_PER_SHARD, 0).expect("valid encoder")

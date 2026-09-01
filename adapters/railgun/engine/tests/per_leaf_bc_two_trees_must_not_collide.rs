@@ -21,11 +21,7 @@ fn enc_for(tree_number: u32) -> PerLeafCommitmentEncoder {
     PerLeafCommitmentEncoder::new(RECORD, EPS, tree_number).expect("encoder")
 }
 
-fn commitment(seed: u8) -> [u8; 32] {
-    let mut c = [0u8; 32];
-    c[31] = seed;
-    c
-}
+use raven_railgun_testkit::canonical_zeroable as commitment;
 
 fn append(tree: u32, leaf: u32, seed: u8) -> WalEntryPayload {
     WalEntryPayload::AppendLeaf {

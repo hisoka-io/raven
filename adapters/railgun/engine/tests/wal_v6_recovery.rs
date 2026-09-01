@@ -2,11 +2,10 @@
 
 use std::sync::Arc;
 
-use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{
-    apply_wal_entry, restore_inspire_state_v6, setup_state, snapshot_inspire_state,
-    snapshot_inspire_state_v6, InspireServerState, LogicalLeafStore, SNAPSHOT_V6_MAGIC,
+    apply_wal_entry, restore_inspire_state_v6, snapshot_inspire_state, snapshot_inspire_state_v6,
+    InspireServerState, LogicalLeafStore, SNAPSHOT_V6_MAGIC,
 };
 use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
@@ -16,18 +15,11 @@ use raven_railgun_persistence::{
 };
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-wal-v6-recovery";
-const TOY_ENTRIES: usize = 256;
 const TOY_ENTRY_SIZE: usize = 32;
 const ENTRIES_PER_SHARD: u32 = 256;
 
 fn build_toy_state() -> InspireServerState {
-    let params = InspireParams::secure_128_d2048();
-    let db: Vec<u8> = (0..TOY_ENTRIES)
-        .flat_map(|i| (0..TOY_ENTRY_SIZE).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
-        .collect();
-    let (state, _sk) =
-        setup_state(&params, &db, TOY_ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup_state");
-    state
+    raven_railgun_testkit::toy_state(TOY_ENTRY_SIZE)
 }
 
 fn encoder_arc() -> Arc<dyn PirTableEncoder> {
@@ -36,11 +28,7 @@ fn encoder_arc() -> Arc<dyn PirTableEncoder> {
         .expect("build encoder")
 }
 
-fn canonical(seed: u8) -> [u8; 32] {
-    let mut b = [0u8; 32];
-    b[31] = seed.max(1);
-    b
-}
+use raven_railgun_testkit::canonical;
 
 #[test]
 fn bootstrap_then_drive_commit_then_restart_recovers_logical_store() {

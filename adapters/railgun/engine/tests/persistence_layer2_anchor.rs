@@ -15,9 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use raven_inspire::params::{InspireParams, InspireVariant};
+use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
-use raven_railgun_engine::inspire::{setup_state, InspireServerState};
+use raven_railgun_engine::inspire::InspireServerState;
 use raven_railgun_engine::orchestrator::{
     bootstrap_railgun_engine, OrchestratorConfig, VerificationMode,
 };
@@ -98,21 +98,10 @@ impl ChainSource for ScriptedChainSource {
 }
 
 fn build_toy_state() -> raven_railgun_core::Result<InspireServerState> {
-    let params = InspireParams::secure_128_d2048();
-    let entries = 256usize;
-    let db: Vec<u8> = (0..entries)
-        .flat_map(|i| (0..TOY_ENTRY_SIZE).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
-        .collect();
-    let (state, _sk) = setup_state(&params, &db, TOY_ENTRY_SIZE, InspireVariant::TwoPacking)?;
-    Ok(state)
+    raven_railgun_testkit::try_toy_state(TOY_ENTRY_SIZE)
 }
 
-fn canonical_commitment(byte: u8) -> [u8; 32] {
-    let mut b = [0u8; 32];
-    // Keeps the value Fr-canonical for the IMT's Poseidon hash.
-    b[31] = byte;
-    b
-}
+use raven_railgun_testkit::canonical_zeroable as canonical_commitment;
 
 async fn await_rounds(source: &ScriptedChainSource, target: u64, label: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);

@@ -38,11 +38,7 @@ fn test_encoder_arc() -> Arc<dyn PirTableEncoder> {
 }
 
 // Fr-canonical (high byte zero); last byte non-zero so the leaf is non-trivial
-fn canonical_commitment(seed: u8) -> [u8; 32] {
-    let mut b = [0u8; 32];
-    b[31] = seed.max(1);
-    b
-}
+use raven_railgun_testkit::canonical as canonical_commitment;
 
 fn tree_capacity() -> u32 {
     u32::try_from(TREE_MAX_ITEMS).expect("depth-16 capacity fits u32")

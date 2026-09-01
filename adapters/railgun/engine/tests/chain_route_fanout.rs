@@ -6,9 +6,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use raven_inspire::params::{InspireParams, InspireVariant};
+use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, InstanceId, RailgunEvent};
-use raven_railgun_engine::inspire::{setup_state, InspireServerState};
+use raven_railgun_engine::inspire::InspireServerState;
 use raven_railgun_engine::orchestrator::{
     bootstrap_railgun_engine_multi, DataSourceFilter, InstanceConfig, VerificationMode,
 };
@@ -19,18 +19,12 @@ use raven_railgun_indexer::IndexerMessage;
 use tokio::sync::mpsc;
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-chain-fanout-test";
-const TOY_ENTRIES: usize = 256;
 const TOY_ENTRY_SIZE: usize = 256;
 const TOY_ENTRIES_PER_SHARD: u32 = 2048;
 const SHARED_TREE: u32 = 0;
 
 fn build_toy_state() -> raven_railgun_core::Result<InspireServerState> {
-    let params = InspireParams::secure_128_d2048();
-    let db: Vec<u8> = (0..TOY_ENTRIES)
-        .flat_map(|i| (0..TOY_ENTRY_SIZE).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
-        .collect();
-    let (state, _sk) = setup_state(&params, &db, TOY_ENTRY_SIZE, InspireVariant::TwoPacking)?;
-    Ok(state)
+    raven_railgun_testkit::try_toy_state(TOY_ENTRY_SIZE)
 }
 
 fn commit_tree_cfg(id: &str, dir: std::path::PathBuf, tree_number: u32) -> InstanceConfig {

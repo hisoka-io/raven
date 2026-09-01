@@ -28,11 +28,7 @@ fn enc() -> PerListStatusEncoder {
     PerListStatusEncoder::new(RECORD, EPS, LIST_KEY).expect("encoder")
 }
 
-fn bc(seed: u8) -> [u8; 32] {
-    let mut b = [0u8; 32];
-    b[31] = seed.max(1);
-    b
-}
+use raven_railgun_testkit::canonical as bc;
 
 fn status_byte_of_row(store: &LogicalLeafStore, list_index: usize) -> u8 {
     let bytes = enc().materialize_shard(0, store);

@@ -1154,9 +1154,7 @@ mod snapshot_v6_tests {
         let params = InspireParams::secure_128_d2048();
         let entries = 256usize;
         let entry_size = 32usize;
-        let db: Vec<u8> = (0..entries)
-            .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
-            .collect();
+        let db = raven_railgun_testkit::toy_db(entries, entry_size);
         let (state, _sk) =
             setup_state(&params, &db, entry_size, InspireVariant::TwoPacking).expect("setup");
         (state, db)
@@ -1581,9 +1579,7 @@ mod re_encode_tests {
         let params = InspireParams::secure_128_d2048();
         let entries = 256usize;
         let entry_size = 256usize;
-        let db: Vec<u8> = (0..entries)
-            .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
-            .collect();
+        let db = raven_railgun_testkit::toy_db(entries, entry_size);
         let (mut state, _sk) =
             setup_state(&params, &db, entry_size, InspireVariant::TwoPacking).expect("setup_state");
 
@@ -1636,9 +1632,7 @@ mod re_encode_tests {
         let params = InspireParams::secure_128_d2048();
         let entries = 256usize;
         let entry_size = 256usize;
-        let db: Vec<u8> = (0..entries)
-            .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
-            .collect();
+        let db = raven_railgun_testkit::toy_db(entries, entry_size);
         let (mut state, _sk) =
             setup_state(&params, &db, entry_size, InspireVariant::TwoPacking).expect("setup_state");
 
@@ -1690,9 +1684,7 @@ mod re_encode_tests {
         let params = InspireParams::secure_128_d2048();
         let entries = 4096usize; // 2 x ring_dim => 2 shards.
         let entry_size = 32usize;
-        let db: Vec<u8> = (0..entries)
-            .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
-            .collect();
+        let db = raven_railgun_testkit::toy_db(entries, entry_size);
         let (mut state, _sk) =
             setup_state(&params, &db, entry_size, InspireVariant::TwoPacking).expect("setup_state");
 
@@ -1749,9 +1741,7 @@ mod re_encode_tests {
         let params = InspireParams::secure_128_d2048();
         let entries = 256usize;
         let entry_size = 256usize;
-        let db: Vec<u8> = (0..entries)
-            .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
-            .collect();
+        let db = raven_railgun_testkit::toy_db(entries, entry_size);
         let (mut state, _sk) =
             setup_state(&params, &db, entry_size, InspireVariant::TwoPacking).expect("setup_state");
         let err = re_encode_shard(

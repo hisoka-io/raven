@@ -178,11 +178,7 @@ fn parse_hex32(s: &str) -> [u8; 32] {
     out
 }
 
-fn canonical_commit(seed: u8) -> [u8; 32] {
-    let mut b = [0u8; 32];
-    b[31] = seed.max(1);
-    b
-}
+use raven_railgun_testkit::canonical as canonical_commit;
 
 async fn spawn_server(
     opts: MultiServeOptions,

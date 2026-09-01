@@ -21,9 +21,7 @@ const ENTRY_SIZE: usize = 32;
 
 fn instance() -> (PirInstance<RavenInspireScheme>, InspireParams) {
     let params = InspireParams::secure_128_d2048();
-    let db: Vec<u8> = (0..ENTRIES)
-        .flat_map(|i| (0..ENTRY_SIZE).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
-        .collect();
+    let db = raven_railgun_testkit::toy_db(ENTRIES, ENTRY_SIZE);
     let (state, _sk) =
         setup_state(&params, &db, ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup");
     let inst = PirInstance::new(

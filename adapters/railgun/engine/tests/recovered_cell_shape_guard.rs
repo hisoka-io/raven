@@ -37,9 +37,7 @@ fn seed_data_dir(dir: &std::path::Path, instance: &str, stored_width: usize) {
     .expect("fresh open");
 
     let params = InspireParams::secure_128_d2048();
-    let db: Vec<u8> = (0..CELL_ROWS)
-        .flat_map(|i| (0..stored_width).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
-        .collect();
+    let db = raven_railgun_testkit::toy_db(CELL_ROWS, stored_width);
     let (state, _sk) =
         setup_state(&params, &db, stored_width, InspireVariant::TwoPacking).expect("setup_state");
     assert_eq!(state.shard_config().entry_size_bytes, stored_width);

@@ -2,9 +2,9 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use raven_inspire::params::{InspireParams, InspireVariant};
+use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
-use raven_railgun_engine::inspire::{setup_state, InspireServerState};
+use raven_railgun_engine::inspire::InspireServerState;
 use raven_railgun_engine::orchestrator::{bootstrap_railgun_engine, OrchestratorConfig};
 use raven_railgun_engine::persistence::ConsumerEvent;
 use raven_railgun_engine::InstanceRole;
@@ -15,14 +15,7 @@ const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-test";
 const TOY_ENTRY_SIZE: usize = 256;
 
 fn build_toy_state() -> raven_railgun_core::Result<InspireServerState> {
-    let params = InspireParams::secure_128_d2048();
-    let entries = 256usize;
-    let entry_size = TOY_ENTRY_SIZE;
-    let db: Vec<u8> = (0..entries)
-        .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
-        .collect();
-    let (state, _sk) = setup_state(&params, &db, entry_size, InspireVariant::TwoPacking)?;
-    Ok(state)
+    raven_railgun_testkit::try_toy_state(TOY_ENTRY_SIZE)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

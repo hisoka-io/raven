@@ -14,10 +14,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use raven_inspire::params::{InspireParams, InspireVariant};
+use raven_inspire::params::InspireParams;
 use raven_railgun_cli::auto_spawn_driver::{run_driver, AutoSpawnRuntime, SpawnRegistry};
 use raven_railgun_core::InstanceId;
-use raven_railgun_engine::inspire::{setup_state, RavenInspireScheme};
+use raven_railgun_engine::inspire::RavenInspireScheme;
 use raven_railgun_engine::orchestrator::ChainTreeRoutes;
 use raven_railgun_engine::persistence::ConsumerEvent;
 use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
@@ -34,14 +34,7 @@ struct PolicyHarness {
 
 fn build_toy_state() -> raven_railgun_core::Result<raven_railgun_engine::inspire::InspireServerState>
 {
-    let params = InspireParams::secure_128_d2048();
-    let db: Vec<u8> = (0..TOY_ENTRIES)
-        .flat_map(|i| {
-            (0..TOY_ENTRY_BYTES).map(move |j| u8::try_from((i + j) % 251).expect("< 251"))
-        })
-        .collect();
-    let (state, _sk) = setup_state(&params, &db, TOY_ENTRY_BYTES, InspireVariant::TwoPacking)?;
-    Ok(state)
+    raven_railgun_testkit::try_toy_state(TOY_ENTRY_BYTES)
 }
 
 fn fresh_harness(tmp: &std::path::Path) -> PolicyHarness {

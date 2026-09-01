@@ -14,13 +14,12 @@ use raven_railgun_engine::inspire::{
 use raven_railgun_engine::session_pool::BoundedSessionStore;
 use raven_railgun_engine::{inspire, InstanceRole, PirInstance};
 
-const TOY_ENTRIES: usize = 256;
 const TOY_ENTRY_SIZE: usize = 32;
 
 fn build_toy_state(params: &InspireParams) -> InspireServerState {
-    let db: Vec<u8> = (0..TOY_ENTRIES)
-        .flat_map(|i| (0..TOY_ENTRY_SIZE).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
-        .collect();
+    // Uncached deliberately: this file asserts Arc identity and refcount, so it must own its
+    // state outright. Only the DB formula is shared.
+    let db = raven_railgun_testkit::toy_db(raven_railgun_testkit::TOY_ENTRIES, TOY_ENTRY_SIZE);
     let (state, _sk) = setup_state(params, &db, TOY_ENTRY_SIZE, InspireVariant::TwoPacking)
         .expect("toy setup_state");
     state
@@ -30,14 +29,9 @@ fn register_one_session(instance: &Arc<PirInstance<RavenInspireScheme>>, params:
     let snap = instance.current_state();
     let crs_clone = (*snap.crs).clone();
     // The key is independent of state contents, so a sibling setup suffices.
-    let (_off_state, sk) = {
-        let db: Vec<u8> = (0..TOY_ENTRIES)
-            .flat_map(|i| {
-                (0..TOY_ENTRY_SIZE).map(move |j| u8::try_from((i + j) % 251).expect("< 251"))
-            })
-            .collect();
-        setup_state(params, &db, TOY_ENTRY_SIZE, InspireVariant::TwoPacking).expect("sibling")
-    };
+    // Only the key is wanted here; building a whole state to throw it away cost a
+    // full setup. Key generation is milliseconds.
+    let sk = raven_railgun_testkit::toy_secret_key(params);
     let mut session = build_client_session(crs_clone, sk, params).expect("client session");
     register_client_session(&mut session, snap.as_ref()).expect("register session");
 }

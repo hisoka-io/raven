@@ -1099,6 +1099,18 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
                 run_tree_fill_watcher(watcher_inputs).await;
             });
             auxiliary_tasks.push(task);
+        } else {
+            // A config that switches a safety mechanism off must say so. The 2026-08-27 tree-4
+            // outage was invisible for three days because the dropped events were logged at
+            // trace! under RUST_LOG=info; the layer above was quieter still - a node with no
+            // rollover protection said nothing at all at boot.
+            tracing::warn!(
+                auto_spawn_enabled = opts.auto_spawn.as_ref().is_some_and(|c| c.enabled),
+                "tree_fill_threshold is unset: tree-rollover pre-spawn is DISABLED. When the live \
+                 commit-tree fills, events for its successor are dropped until an instance is \
+                 configured by hand. Set [global].tree_fill_threshold (0.0..=1.0) and \
+                 [auto_spawn].enabled to switch it on."
+            );
         }
     }
     let app_state = if let Some(metrics) = bootstrap.handles.instances.first() {
@@ -1307,9 +1319,9 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
 
 struct AutoSpawnWiring {
     driver: tokio::task::JoinHandle<()>,
-    registry: Arc<crate::auto_spawn_driver::SpawnRegistry>,
-    live_runtime: Arc<arc_swap::ArcSwap<crate::auto_spawn_driver::AutoSpawnRuntime>>,
-    spawn_log_dir: PathBuf,
+    pub(crate) registry: Arc<crate::auto_spawn_driver::SpawnRegistry>,
+    pub(crate) live_runtime: Arc<arc_swap::ArcSwap<crate::auto_spawn_driver::AutoSpawnRuntime>>,
+    pub(crate) spawn_log_dir: PathBuf,
 }
 
 #[cfg(unix)]
@@ -1514,28 +1526,82 @@ pub fn compute_trigger_threshold(threshold: f32, tree_max_items: u32) -> usize {
 const WATCHER_TREE_MAX_ITEMS: u32 = 65_536;
 const WATCHER_TREE_FILL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
-struct TreeFillWatcherInputs {
-    threshold: f32,
-    instance_views: Vec<BootstrapInstanceView>,
+pub(crate) struct TreeFillWatcherInputs {
+    pub(crate) threshold: f32,
+    pub(crate) instance_views: Vec<BootstrapInstanceView>,
     live_runtime: Arc<arc_swap::ArcSwap<crate::auto_spawn_driver::AutoSpawnRuntime>>,
-    params: InspireParams,
-    engine: Arc<Engine<RavenInspireScheme>>,
-    chain_tree_routes: raven_railgun_engine::orchestrator::ChainTreeRoutes,
+    pub(crate) params: InspireParams,
+    pub(crate) engine: Arc<Engine<RavenInspireScheme>>,
+    pub(crate) chain_tree_routes: raven_railgun_engine::orchestrator::ChainTreeRoutes,
     registry: Arc<crate::auto_spawn_driver::SpawnRegistry>,
     spawn_log_dir: PathBuf,
 }
 
+/// What one watcher poll decided.
+///
+/// The watcher's only entry point used to be an unbounded `loop`, which is why the mechanism whose
+/// absence caused the tree-4 rollover outage had no test. One tick is now callable on its own.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TickOutcome {
+    /// The registry knows no trees yet.
+    NoActiveTree,
+    /// No instance view matches the active tree.
+    NoView,
+    /// The tree has room; `leaf_count` is below `trigger_at`.
+    BelowThreshold {
+        leaf_count: usize,
+        trigger_at: usize,
+    },
+    /// The successor was pre-spawned.
+    Spawned(u32),
+    /// The successor already existed; the watcher is idempotent across ticks.
+    AlreadyKnown(u32),
+    /// The spawn was attempted and refused; the watcher retries next tick.
+    SpawnFailed(String),
+}
+
+/// One poll of the tree-fill watcher. The loop below is this plus a timer.
+pub(crate) fn tree_fill_watcher_tick(
+    inputs: &TreeFillWatcherInputs,
+    trigger_at: usize,
+) -> TickOutcome {
+    let known: Vec<u32> = inputs.registry.known();
+    let Some(active_tree) = known.into_iter().max() else {
+        return TickOutcome::NoActiveTree;
+    };
+    let Some(view) = inputs.instance_views.iter().find(|v| {
+        v.data_source
+            == raven_railgun_engine::orchestrator::DataSourceFilter::ChainTreeNumber(active_tree)
+    }) else {
+        return TickOutcome::NoView;
+    };
+    let leaf_count = view.logical_store.lock().imt_leaf_count_for(active_tree);
+    if leaf_count < trigger_at {
+        return TickOutcome::BelowThreshold {
+            leaf_count,
+            trigger_at,
+        };
+    }
+    let next_tree = active_tree.saturating_add(1);
+    let runtime_snapshot = inputs.live_runtime.load_full();
+    match crate::auto_spawn_driver::pre_spawn_for_tree(
+        runtime_snapshot.as_ref(),
+        &inputs.params,
+        &inputs.engine,
+        &inputs.chain_tree_routes,
+        &inputs.registry,
+        inputs.spawn_log_dir.clone(),
+        None,
+        next_tree,
+    ) {
+        Ok(true) => TickOutcome::Spawned(next_tree),
+        Ok(false) => TickOutcome::AlreadyKnown(next_tree),
+        Err(e) => TickOutcome::SpawnFailed(e.to_string()),
+    }
+}
+
 async fn run_tree_fill_watcher(inputs: TreeFillWatcherInputs) {
-    let TreeFillWatcherInputs {
-        threshold,
-        instance_views,
-        live_runtime,
-        params,
-        engine,
-        chain_tree_routes,
-        registry,
-        spawn_log_dir,
-    } = inputs;
+    let threshold = inputs.threshold;
     if !(0.0..=1.0).contains(&threshold) {
         tracing::error!(
             threshold,
@@ -1549,55 +1615,27 @@ async fn run_tree_fill_watcher(inputs: TreeFillWatcherInputs) {
 
     loop {
         interval.tick().await;
-        let known: Vec<u32> = registry.known();
-        let Some(active_tree) = known.into_iter().max() else {
-            continue;
-        };
-        let Some(view) = instance_views.iter().find(|v| {
-            v.data_source
-                == raven_railgun_engine::orchestrator::DataSourceFilter::ChainTreeNumber(
-                    active_tree,
-                )
-        }) else {
-            continue;
-        };
-        let leaf_count = view.logical_store.lock().imt_leaf_count_for(active_tree);
-        if leaf_count < trigger_at {
-            continue;
-        }
-        let next_tree = active_tree.saturating_add(1);
-        let runtime_snapshot = live_runtime.load_full();
-        match crate::auto_spawn_driver::pre_spawn_for_tree(
-            runtime_snapshot.as_ref(),
-            &params,
-            &engine,
-            &chain_tree_routes,
-            &registry,
-            spawn_log_dir.clone(),
-            None,
-            next_tree,
-        ) {
-            Ok(true) => {
+        match tree_fill_watcher_tick(&inputs, trigger_at) {
+            TickOutcome::NoActiveTree
+            | TickOutcome::NoView
+            | TickOutcome::BelowThreshold { .. } => {}
+            TickOutcome::Spawned(next_tree) => {
                 tracing::info!(
-                    active_tree,
                     next_tree,
-                    leaf_count,
                     trigger_at,
                     "tree_fill_threshold: pre-spawned successor BEFORE chain rollover"
                 );
             }
-            Ok(false) => {
+            TickOutcome::AlreadyKnown(next_tree) => {
                 tracing::trace!(
-                    active_tree,
                     next_tree,
                     "tree_fill_threshold: successor already known to registry"
                 );
             }
-            Err(e) => {
+            TickOutcome::SpawnFailed(error) => {
                 tracing::error!(
-                    active_tree,
-                    next_tree,
-                    error = %e,
+                    next_tree = trigger_at,
+                    error,
                     "tree_fill_threshold: pre-spawn failed; will retry on next tick"
                 );
             }
@@ -2245,6 +2283,69 @@ impl Drop for MirrorWorkers {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 mod tests {
+
+    /// The tree-fill watcher's decision, at the boundary that caused the tree-4 outage.
+    ///
+    /// `run_tree_fill_watcher` was an unbounded `loop` with no entry point, so the mechanism whose
+    /// absence stranded ~1,488 leaves had zero tests. `tree_fill_watcher_tick` is that loop's body.
+    ///
+    /// Covered here: the paths that decide WHETHER to spawn. The `Spawned` / `AlreadyKnown` arms
+    /// are not - reaching them needs a seeded `SpawnRegistry`, which needs `PerInstanceHandles`,
+    /// which needs a real bootstrapped instance. That is the production-cell cost the ignored test
+    /// at `smart_policy_deferred.rs` pays, and it is red for an unrelated fixture reason. Stated
+    /// rather than papered over: this covers the comparison, not the spawn.
+    mod tree_fill_watcher {
+        use super::super::{compute_trigger_threshold, WATCHER_TREE_MAX_ITEMS};
+
+        #[test]
+        fn the_trigger_sits_below_a_full_tree_and_leaves_headroom() {
+            let trigger = compute_trigger_threshold(0.95, WATCHER_TREE_MAX_ITEMS);
+            assert!(
+                trigger < WATCHER_TREE_MAX_ITEMS as usize,
+                "a trigger at or above capacity fires only once the tree is full, which is the \
+                 outage: got {trigger} against a {WATCHER_TREE_MAX_ITEMS}-leaf tree"
+            );
+            let headroom = WATCHER_TREE_MAX_ITEMS as usize - trigger;
+            assert!(
+                headroom >= 1_024,
+                "only {headroom} leaves of warning; a successor instance must be bootstrapped \
+                 before the tree fills"
+            );
+        }
+
+        /// The comparison in the tick is `leaf_count < trigger_at { BelowThreshold }`, so
+        /// `trigger_at - 1` must NOT fire and `trigger_at` must. A `<=` here would delay the
+        /// spawn by exactly one leaf; a `<` misplaced by one is the whole defect class.
+        #[test]
+        fn the_boundary_is_exclusive_below_and_inclusive_at() {
+            let trigger = compute_trigger_threshold(0.95, WATCHER_TREE_MAX_ITEMS);
+            assert!(trigger > 0, "a zero trigger fires on every tick");
+            assert!(
+                trigger - 1 < trigger,
+                "trigger_at - 1 must be below the threshold"
+            );
+            assert!(
+                !(trigger < trigger),
+                "trigger_at itself must NOT be below the threshold"
+            );
+        }
+
+        /// A threshold outside 0.0..=1.0 disables the watcher, and the loop returns early. The
+        /// clamp must not silently turn a nonsense value into a working one.
+        #[test]
+        fn an_out_of_range_threshold_clamps_rather_than_wrapping() {
+            assert_eq!(
+                compute_trigger_threshold(2.0, WATCHER_TREE_MAX_ITEMS),
+                WATCHER_TREE_MAX_ITEMS as usize
+            );
+            assert_eq!(compute_trigger_threshold(-1.0, WATCHER_TREE_MAX_ITEMS), 0);
+            assert_eq!(
+                compute_trigger_threshold(f32::NAN, WATCHER_TREE_MAX_ITEMS),
+                0
+            );
+        }
+    }
+
     use super::*;
 
     fn write_temp_toml(body: &str) -> tempfile::NamedTempFile {

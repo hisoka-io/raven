@@ -3690,6 +3690,7 @@ dependencies = [
  "raven-railgun-persistence",
  "raven-railgun-poseidon",
  "raven-railgun-ppoi-mirror",
+ "raven-railgun-testkit",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3732,6 +3733,7 @@ dependencies = [
  "raven-railgun-indexer",
  "raven-railgun-persistence",
  "raven-railgun-poseidon",
+ "raven-railgun-testkit",
  "raven-server",
  "rayon",
  "serde",
@@ -3764,6 +3766,7 @@ dependencies = [
  "raven-railgun-engine",
  "raven-railgun-indexer",
  "raven-railgun-persistence",
+ "raven-railgun-testkit",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3864,6 +3867,15 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "raven-railgun-testkit"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "raven-inspire",
+ "raven-railgun-core",
+ "raven-railgun-engine",
 ]
 
 [[package]]

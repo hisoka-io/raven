@@ -10,11 +10,7 @@ use raven_railgun_persistence::{StoreLayout, WalEntryPayload};
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-encoder-recovery";
 const ENTRIES_PER_SHARD: u32 = 2048;
 
-fn canonical(seed: u8) -> [u8; 32] {
-    let mut b = [0u8; 32];
-    b[31] = seed.max(1);
-    b
-}
+use raven_railgun_testkit::canonical;
 
 fn encoder_for(kind: EncoderKind) -> Arc<dyn PirTableEncoder> {
     let record_size = match kind {

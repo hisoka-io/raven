@@ -96,32 +96,22 @@ mod kill_during_spawn {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use raven_inspire::params::{InspireParams, InspireVariant};
     use raven_railgun_cli::auto_spawn::{instance_id_for_tree, load_spawn_log};
     use raven_railgun_core::InstanceId;
-    use raven_railgun_engine::inspire::{setup_state, RavenInspireScheme};
+    use raven_railgun_engine::inspire::RavenInspireScheme;
     use raven_railgun_engine::persistence::{bootstrap_inspire_instance, SnapshotPolicy};
     use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
     use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
     use raven_railgun_persistence::{Manifest, StoreLayout};
 
     const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-auto-spawn-chaos-child";
-    const TOY_ENTRIES: usize = 256;
     const TOY_ENTRY_SIZE: usize = 32;
     const ENTRIES_PER_SHARD: u32 = 256;
     const SENTINEL_TIMEOUT: Duration = Duration::from_secs(120);
     const POST_KILL_WAIT: Duration = Duration::from_secs(10);
 
     fn build_toy_state() -> raven_railgun_engine::inspire::InspireServerState {
-        let params = InspireParams::secure_128_d2048();
-        let db: Vec<u8> = (0..TOY_ENTRIES)
-            .flat_map(|i| {
-                (0..TOY_ENTRY_SIZE).map(move |j| u8::try_from((i + j) % 251).expect("< 251"))
-            })
-            .collect();
-        let (state, _sk) = setup_state(&params, &db, TOY_ENTRY_SIZE, InspireVariant::TwoPacking)
-            .expect("setup_state");
-        state
+        raven_railgun_testkit::toy_state(TOY_ENTRY_SIZE)
     }
 
     fn build_encoder() -> Arc<dyn PirTableEncoder> {
@@ -335,11 +325,7 @@ fn crash_between_append_and_flip_recovers_with_doubly_live_tolerated() {
 
     let build_toy_state = || -> raven_railgun_engine::inspire::InspireServerState {
         let params = InspireParams::secure_128_d2048();
-        let db: Vec<u8> = (0..TOY_ENTRIES)
-            .flat_map(|i| {
-                (0..TOY_ENTRY_SIZE).map(move |j| u8::try_from((i + j) % 251).expect("< 251"))
-            })
-            .collect();
+        let db = raven_railgun_testkit::toy_db(TOY_ENTRIES, TOY_ENTRY_SIZE);
         let (state, _sk) = setup_state(&params, &db, TOY_ENTRY_SIZE, InspireVariant::TwoPacking)
             .expect("setup_state");
         state

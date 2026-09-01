@@ -447,11 +447,7 @@ mod tests {
         }
     }
 
-    fn canonical(seed: u8) -> [u8; 32] {
-        let mut b = [0u8; 32];
-        b[31] = seed.max(1);
-        b
-    }
+    use raven_railgun_testkit::canonical;
 
     #[test]
     fn new_validates_record_size_floor() {

@@ -12,21 +12,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use raven_inspire::params::{InspireParams, InspireVariant};
+use raven_inspire::params::InspireParams;
 use raven_railgun_core::{AdapterError, InstanceId};
-use raven_railgun_engine::inspire::{setup_state, InspireServerState, RavenInspireScheme};
+use raven_railgun_engine::inspire::{InspireServerState, RavenInspireScheme};
 use raven_railgun_engine::{DrainState, Engine, InstanceRole, PirInstance};
 
-const TOY_ENTRIES: usize = 256;
 const TOY_ENTRY_SIZE: usize = 256;
 
 fn build_toy_state() -> raven_railgun_core::Result<InspireServerState> {
-    let params = InspireParams::secure_128_d2048();
-    let db: Vec<u8> = (0..TOY_ENTRIES)
-        .flat_map(|i| (0..TOY_ENTRY_SIZE).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
-        .collect();
-    let (state, _sk) = setup_state(&params, &db, TOY_ENTRY_SIZE, InspireVariant::TwoPacking)?;
-    Ok(state)
+    raven_railgun_testkit::try_toy_state(TOY_ENTRY_SIZE)
 }
 
 fn build_instance(id: &str, role: InstanceRole) -> Arc<PirInstance<RavenInspireScheme>> {
@@ -271,16 +265,9 @@ fn build_real_query(
     };
     let params = InspireParams::secure_128_d2048();
     let snap = inst.current_state();
-    // Only the secret key is taken from this pair; the CRS below is the
-    // snapshot's, so packing keys derive against the same CRS.
-    let (_off_state, sk) = {
-        let db: Vec<u8> = (0..TOY_ENTRIES)
-            .flat_map(|i| {
-                (0..TOY_ENTRY_SIZE).map(move |j| u8::try_from((i + j) % 251).expect("< 251"))
-            })
-            .collect();
-        setup_state(&params, &db, TOY_ENTRY_SIZE, InspireVariant::TwoPacking).expect("toy")
-    };
+    // Only the secret key is wanted; the CRS below is the snapshot's, so packing keys derive
+    // against the same CRS. This used to build a whole server state and discard it.
+    let sk = raven_railgun_testkit::toy_secret_key(&params);
     let crs_clone = (*snap.crs).clone();
     let mut session = build_client_session(crs_clone, sk, &params).expect("client session");
     // Register against the same session store respond() reads (this snapshot).

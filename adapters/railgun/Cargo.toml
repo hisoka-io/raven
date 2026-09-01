@@ -12,6 +12,7 @@ members = [
     "persistence",
     "poseidon",
     "ppoi-mirror",
+    "testkit",
 ]
 
 [workspace.package]
@@ -58,6 +59,7 @@ raven-railgun-indexer = { path = "indexer", version = "0.1.0-alpha.0" }
 raven-railgun-persistence = { path = "persistence", version = "0.1.0-alpha.0" }
 raven-railgun-poseidon = { path = "poseidon", version = "0.1.0-alpha.0" }
 raven-railgun-ppoi-mirror = { path = "ppoi-mirror", version = "0.1.0-alpha.0" }
+raven-railgun-testkit = { path = "testkit", version = "0.1.0-alpha.0" }
 
 # Cross-workspace path dep to the inspire submodule.
 # Server-side: enable the `parallel` (rayon) feature for the respond hot loops.

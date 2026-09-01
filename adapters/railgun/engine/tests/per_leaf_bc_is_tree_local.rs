@@ -21,11 +21,7 @@ fn enc() -> PerLeafCommitmentEncoder {
     enc_for(0)
 }
 
-fn commitment(seed: u8) -> [u8; 32] {
-    let mut c = [0u8; 32];
-    c[31] = seed.max(1);
-    c
-}
+use raven_railgun_testkit::canonical as commitment;
 
 fn store_with(tree: u32, leaves: u32) -> LogicalLeafStore {
     let mut store = LogicalLeafStore::new();

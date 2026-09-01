@@ -2516,12 +2516,16 @@ mod tests {
         );
     }
 
+    // These cannot call `raven_railgun_testkit::try_toy_state`, though the integration tests in
+    // engine/tests/ can. The testkit dev-dependency links its OWN build of this crate, so its
+    // `InspireServerState` is a distinct type from the one these unit tests compile against:
+    // `expected inspire::InspireServerState, found InspireServerState`. Promoting the testkit to a
+    // normal dependency would fix the types and put fixture code in the shipped binary, which is
+    // the worse trade. The DB formula is shared - that is the part that was actually duplicated -
+    // and the four-line wrapper stays local.
     fn build_toy_state_with_entry_size(entry_size: usize) -> Result<InspireServerState> {
         let params = InspireParams::secure_128_d2048();
-        let entries = 256usize;
-        let db: Vec<u8> = (0..entries)
-            .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
-            .collect();
+        let db = raven_railgun_testkit::toy_db(raven_railgun_testkit::TOY_ENTRIES, entry_size);
         let (state, _sk) = super::super::inspire::setup_state(
             &params,
             &db,
@@ -2532,19 +2536,7 @@ mod tests {
     }
 
     fn build_toy_state() -> Result<InspireServerState> {
-        let params = InspireParams::secure_128_d2048();
-        let entries = 256usize;
-        let entry_size = TOY_ENTRY_SIZE;
-        let db: Vec<u8> = (0..entries)
-            .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).expect("< 251")))
-            .collect();
-        let (state, _sk) = super::super::inspire::setup_state(
-            &params,
-            &db,
-            entry_size,
-            InspireVariant::TwoPacking,
-        )?;
-        Ok(state)
+        build_toy_state_with_entry_size(TOY_ENTRY_SIZE)
     }
 
     #[test]

@@ -38,6 +38,7 @@ tokio-stream = { version = "0.1", features = ["time"] }
 async-stream = "0.3"
 
 [dev-dependencies]
+raven-railgun-testkit = { workspace = true }
 tower = { workspace = true }
 proptest = { workspace = true }
 http-body-util = "0.1"

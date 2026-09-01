@@ -23,11 +23,7 @@ const ENTRIES_PER_SHARD: u32 = 2048;
 const ENTRY_BYTES: usize = 32;
 const TREE_NUMBER: u32 = 0;
 
-fn canonical(seed: u8) -> [u8; 32] {
-    let mut b = [0u8; 32];
-    b[31] = seed.max(1);
-    b
-}
+use raven_railgun_testkit::canonical;
 
 fn encoder_for(kind: EncoderKind) -> Arc<dyn PirTableEncoder> {
     kind.build(ENTRY_BYTES, ENTRIES_PER_SHARD)

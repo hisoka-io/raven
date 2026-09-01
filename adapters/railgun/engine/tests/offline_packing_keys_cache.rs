@@ -1,5 +1,9 @@
-//! Disk-backed offline-packing-key cache. One `(PackParams, OfflinePackingKeys)`
-//! per process, cloned per test, to pay the `O(d^3)` build once.
+//! Disk-backed offline-packing-key cache. One `(PackParams, OfflinePackingKeys)` per PROCESS,
+//! cloned per test.
+//!
+//! That does NOT pay the build once, which this header used to claim. `cargo nextest` runs every
+//! test in its own process, so a per-process `OnceLock` amortises only within a single test - this
+//! binary pays the build once per test, not once. Measured 2026-08-31.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::print_stderr)]
 

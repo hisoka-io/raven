@@ -36,11 +36,7 @@ static APPSTATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn build_engine() -> Engine<RavenInspireScheme> {
     let params = InspireParams::secure_128_d2048();
-    let db: Vec<u8> = (0..TOY_ENTRIES)
-        .flat_map(|i| {
-            (0..TOY_ENTRY_BYTES).map(move |j| u8::try_from((i + j) % 251).expect("< 251"))
-        })
-        .collect();
+    let db = raven_railgun_testkit::toy_db(TOY_ENTRIES, TOY_ENTRY_BYTES);
     let (state, _sk) =
         setup_state(&params, &db, TOY_ENTRY_BYTES, InspireVariant::TwoPacking).expect("toy state");
     let mut engine: Engine<RavenInspireScheme> = Engine::new();
