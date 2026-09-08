@@ -161,20 +161,23 @@ fn a_wire_handle_is_translated_to_the_inner_handle_the_store_is_keyed_on() {
         "the translated handle must resolve to the caller's OWN packing keys, not merely to some \
          entry that happens to exist"
     );
-}
 
-#[test]
-fn a_live_session_still_serves_its_own_queries() {
-    let (params, state, mut session, db) = capped_state();
-    register_client_session(&mut session, &state).expect("register");
-    let (client_state, query) =
+    // The in-process wrapper is the other entry point; it bakes the INNER handle into the
+    // session, so it must serve on the same fixture without the explicit substitution above.
+    register_client_session(&mut session, &state).expect("register via the production wrapper");
+    let (wrapped_state, wrapped_query) =
         build_seeded_query(&session, state.shard_config(), 3, &params).expect("build query");
-    let response =
-        <RavenInspireScheme as PirScheme>::respond(&state, &query).expect("live session serves");
-    let plaintext = extract_response(state.crs.as_ref(), &client_state, &response, ENTRY_SIZE)
-        .expect("extract");
+    let wrapped_response = <RavenInspireScheme as PirScheme>::respond(&state, &wrapped_query)
+        .expect("live session serves");
+    let wrapped_plaintext = extract_response(
+        state.crs.as_ref(),
+        &wrapped_state,
+        &wrapped_response,
+        ENTRY_SIZE,
+    )
+    .expect("extract");
     assert_eq!(
-        plaintext,
+        wrapped_plaintext,
         db.get(3 * ENTRY_SIZE..4 * ENTRY_SIZE).expect("record"),
         "bounding must not disturb a live session's answers"
     );

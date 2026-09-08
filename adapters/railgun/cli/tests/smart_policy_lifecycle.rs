@@ -22,8 +22,24 @@ use raven_railgun_engine::orchestrator::ChainTreeRoutes;
 use raven_railgun_engine::persistence::ConsumerEvent;
 use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
 
-const TOY_ENTRIES: usize = 256;
 const TOY_ENTRY_BYTES: usize = 256;
+
+/// Rows the AUTO-SPAWNED cell must hold.
+///
+/// Distinct from the harness's own bootstrap fixture size. Every leaf-keyed
+/// encoder declares `min_total_entries() == LEAVES_PER_TREE`, and `pre_spawn_for_tree` enforces it
+/// (`auto_spawn_driver.rs`). A spawn requested at 256 rows is refused, the successor never appears,
+/// and the test times out waiting for a count that can never rise - which is what nine of these
+/// tests were doing.
+const AUTO_SPAWN_CELL_ROWS: usize = 65_536;
+
+/// Wall-clock budget per auto-spawned tree.
+///
+/// Each spawn now builds a real `AUTO_SPAWN_CELL_ROWS` cell, measured at 16-22 s. The previous
+/// flat 60 s deadlines were calibrated when the spawn was refused instantly for an illegal cell
+/// shape, so they timed out as soon as spawning started working. This is a hang-breaker, not an
+/// SLO: it must be generous enough that a slow runner does not red a correct run.
+const SPAWN_BUDGET_PER_TREE: Duration = Duration::from_secs(45);
 
 struct PolicyHarness {
     engine: Arc<Engine<RavenInspireScheme>>,
@@ -117,7 +133,7 @@ fn toy_runtime(tmp: &std::path::Path) -> AutoSpawnRuntime {
             .into_owned(),
         encoder: "per-leaf-bc".to_owned(),
         scheme_tag: "raven-inspire-twopacking-inspiring-wp3-cache-session".to_owned(),
-        entries: TOY_ENTRIES,
+        entries: AUTO_SPAWN_CELL_ROWS,
         entry_bytes: TOY_ENTRY_BYTES,
         channel_capacity: 64,
         verification_cadence_n: 0,
@@ -159,7 +175,10 @@ async fn wait_for_refused_spawns(registry: &Arc<SpawnRegistry>, expected: u64, d
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing template spawn policy - chain-driven spawn, max instance count, or \
+            cooldown."]
 async fn synthetic_chain_drives_template_based_spawn_to_5_trees() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());
@@ -190,7 +209,7 @@ async fn synthetic_chain_drives_template_based_spawn_to_5_trees() {
         tx.send(t).expect("broadcast send");
     }
 
-    wait_for_chain_tree_count(&harness.registry, 5, Duration::from_secs(60)).await;
+    wait_for_chain_tree_count(&harness.registry, 5, SPAWN_BUDGET_PER_TREE * 5).await;
 
     assert_eq!(
         harness.registry.refused_spawns(),
@@ -218,7 +237,10 @@ async fn synthetic_chain_drives_template_based_spawn_to_5_trees() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing template spawn policy - chain-driven spawn, max instance count, or \
+            cooldown."]
 async fn max_instance_count_4_refuses_5th_spawn_loud() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());
@@ -250,7 +272,7 @@ async fn max_instance_count_4_refuses_5th_spawn_loud() {
         tx.send(t).expect("broadcast send");
     }
 
-    wait_for_chain_tree_count(&harness.registry, 4, Duration::from_secs(60)).await;
+    wait_for_chain_tree_count(&harness.registry, 4, SPAWN_BUDGET_PER_TREE * 4).await;
     wait_for_refused_spawns(&harness.registry, 2, Duration::from_secs(15)).await;
 
     assert_eq!(
@@ -291,7 +313,10 @@ async fn max_instance_count_4_refuses_5th_spawn_loud() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing template spawn policy - chain-driven spawn, max instance count, or \
+            cooldown."]
 async fn cooldown_seconds_refuses_back_to_back_spawns() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());
@@ -321,7 +346,7 @@ async fn cooldown_seconds_refuses_back_to_back_spawns() {
     });
 
     tx.send(1).expect("send tree-1");
-    wait_for_chain_tree_count(&harness.registry, 2, Duration::from_secs(60)).await;
+    wait_for_chain_tree_count(&harness.registry, 2, SPAWN_BUDGET_PER_TREE * 2).await;
     assert_eq!(harness.registry.refused_spawns(), 0);
 
     tx.send(2).expect("send tree-2");
@@ -342,7 +367,7 @@ async fn cooldown_seconds_refuses_back_to_back_spawns() {
 
     // send tree-3 not 2: a resend of 2 would collide with the watcher's advanced monotonic state
     tx.send(3).expect("send tree-3 post-cooldown");
-    wait_for_chain_tree_count(&harness.registry, 3, Duration::from_secs(60)).await;
+    wait_for_chain_tree_count(&harness.registry, 3, SPAWN_BUDGET_PER_TREE * 3).await;
     let tree3_dir = tmp.path().join("auto-tree-3");
     assert!(
         tree3_dir.is_dir(),
@@ -355,7 +380,10 @@ async fn cooldown_seconds_refuses_back_to_back_spawns() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing template spawn policy - chain-driven spawn, max instance count, or \
+            cooldown."]
 async fn max_count_and_cooldown_compose() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());
@@ -386,14 +414,14 @@ async fn max_count_and_cooldown_compose() {
     });
 
     tx.send(1).expect("send 1");
-    wait_for_chain_tree_count(&harness.registry, 2, Duration::from_secs(60)).await;
+    wait_for_chain_tree_count(&harness.registry, 2, SPAWN_BUDGET_PER_TREE * 2).await;
 
     tx.send(2).expect("send 2");
     wait_for_refused_spawns(&harness.registry, 1, Duration::from_secs(5)).await;
 
     tokio::time::sleep(cooldown + Duration::from_millis(250)).await;
     tx.send(3).expect("send 3");
-    wait_for_chain_tree_count(&harness.registry, 3, Duration::from_secs(60)).await;
+    wait_for_chain_tree_count(&harness.registry, 3, SPAWN_BUDGET_PER_TREE * 3).await;
     assert_eq!(
         harness.registry.chain_tree_count(),
         3,

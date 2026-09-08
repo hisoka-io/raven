@@ -26,7 +26,8 @@ const CELLS: &[(u32, usize, &str)] = &[
 const SAMPLES: usize = 5;
 
 #[test]
-#[ignore = "per-shard re-encode bench takes ~5-10 minutes across all cells"]
+#[ignore = "per-shard re-encode across all cell shapes; ~5-10 minutes. Trigger: changing per-shard \
+            re-encode or which shards an insert dirties."]
 fn per_shard_re_encode_cost_per_cell() {
     eprintln!("INSERT_BENCH: starting per-shard re-encode cost sweep");
     eprintln!("INSERT_BENCH: cell = (entries, record_bytes); samples per cell = {SAMPLES}");

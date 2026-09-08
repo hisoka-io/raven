@@ -19,7 +19,7 @@ use raven_railgun_engine::orchestrator::{
 };
 use raven_railgun_engine::persistence::{ConsumerEvent, SnapshotPolicy};
 use raven_railgun_engine::pir_table::EncoderKind;
-use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
+use raven_railgun_engine::{InstanceRole, PirInstance};
 use raven_railgun_indexer::IndexerMessage;
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
@@ -107,8 +107,13 @@ async fn synthetic_chain_drives_auto_spawn_to_tree_n_plus_one() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle.router).await;
 }
 
+/// Named for what it proves: the role flip is performed BY HAND here, and the
+/// static-default policy values are pinned against literals. The spawn-driven
+/// demotion itself (auto_spawn_driver's flip_predecessor_to_static) lives in the
+/// cli crate, which this binary does not link; its coverage is the in-src test
+/// `registry_seed_then_flip_marks_predecessor_static` in the cli package.
 #[tokio::test]
-async fn live_to_static_role_transition_on_next_tree_spawn() {
+async fn manual_role_flip_works_and_static_default_policy_is_pinned() {
     let live_state = build_toy_state().expect("toy");
     let inst = Arc::new(PirInstance::<RavenInspireScheme>::new(
         InstanceId::new("commit-tree-0"),
@@ -136,13 +141,26 @@ async fn live_to_static_role_transition_on_next_tree_spawn() {
     let pers = opened.persistence;
     let before = pers.snapshot_policy();
     assert_eq!(before.max_appends_per_snapshot, 1000);
+    assert_eq!(before.max_seconds_between_snapshots, 300);
+
     pers.set_snapshot_policy(SnapshotPolicy::static_default());
     let after = pers.snapshot_policy();
+    // Pinned against literals, not against `static_default()` itself: comparing the
+    // getter to the same constructor the setter was handed is an oracle the code under
+    // test builds, and any pair of values at all satisfies it.
     assert_eq!(
         after.max_appends_per_snapshot,
-        SnapshotPolicy::static_default().max_appends_per_snapshot,
-        "static_default snapshot cadence is installed"
+        usize::MAX,
+        "a static commit tree must be snapshot-once: an append budget below usize::MAX \
+         puts a sealed tree back on the per-append snapshot cadence"
     );
+    assert_eq!(
+        after.max_seconds_between_snapshots,
+        u64::MAX,
+        "a static commit tree must not snapshot on a timer either"
+    );
+    assert_eq!(after.archived_wals_retain, 4);
+    assert_eq!(after.snapshots_retain, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -199,28 +217,4 @@ async fn five_tree_progression_full_lifecycle() {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h.consumer).await;
     }
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle.router).await;
-}
-
-#[tokio::test]
-async fn auto_spawn_kill_mid_bootstrap_recovers_on_restart() {
-    let state = build_toy_state().expect("toy");
-    let inst1 = Arc::new(PirInstance::<RavenInspireScheme>::new(
-        InstanceId::new("commit-tree-1"),
-        InstanceRole::Live,
-        state,
-    ));
-    let engine: Arc<Engine<RavenInspireScheme>> = Arc::new(Engine::new());
-    engine.add_live(Arc::clone(&inst1)).expect("first add");
-    let state2 = build_toy_state().expect("toy");
-    let inst2 = Arc::new(PirInstance::<RavenInspireScheme>::new(
-        InstanceId::new("commit-tree-1"),
-        InstanceRole::Live,
-        state2,
-    ));
-    let err = engine
-        .add_live(Arc::clone(&inst2))
-        .expect_err("dup must fail");
-    let msg = format!("{err}");
-    assert!(msg.contains("duplicate instance id"), "got: {msg}");
-    assert_eq!(engine.instances().len(), 1);
 }

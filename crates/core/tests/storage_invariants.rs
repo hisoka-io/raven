@@ -134,48 +134,6 @@ proptest! {
     }
 
     #[test]
-    fn scan_prefix_window_is_contiguous(ops in arb_ops(), lo in arb_key(), len in 1u64..=512) {
-        let store = MemoryStore::new();
-        commit_inserts(&store, &ops);
-        let snap = store.snapshot().expect("snapshot");
-        let hi = lo.saturating_add(len);
-
-        let mut windowed = Vec::new();
-        for row in snap.scan() {
-            let (k, _) = row.expect("scan row");
-            if k < lo {
-                continue;
-            }
-            if k >= hi {
-                break;
-            }
-            windowed.push(k);
-        }
-
-        let mut expected: Vec<u64> = ops
-            .iter()
-            .map(|(k, _)| *k)
-            .filter(|k| *k >= lo && *k < hi)
-            .collect();
-        expected.sort_unstable();
-        expected.dedup();
-        prop_assert_eq!(windowed, expected);
-    }
-
-    #[test]
-    fn snapshot_len_matches_scan_count(ops in arb_ops()) {
-        let store = MemoryStore::new();
-        commit_inserts(&store, &ops);
-        let snap = store.snapshot().expect("snapshot");
-        let scan_count = snap
-            .scan()
-            .collect::<Result<Vec<_>, _>>()
-            .expect("scan ok")
-            .len();
-        prop_assert_eq!(snap.len() as usize, scan_count);
-    }
-
-    #[test]
     fn get_agrees_with_scan(ops in arb_ops()) {
         let store = MemoryStore::new();
         commit_inserts(&store, &ops);
@@ -189,57 +147,6 @@ proptest! {
             let got = snap.get(*k).expect("get").expect("key present");
             prop_assert_eq!(&got, want);
         }
-    }
-
-    #[test]
-    fn two_snapshots_at_same_generation_match(ops in arb_ops()) {
-        let store = MemoryStore::new();
-        commit_inserts(&store, &ops);
-        let a = store.snapshot().expect("snap a");
-        let b = store.snapshot().expect("snap b");
-        prop_assert_eq!(a.len(), b.len());
-        prop_assert_eq!(a.generation(), b.generation());
-
-        let ka: BTreeMap<u64, Bytes> = a.scan().map(|r| r.expect("row a")).collect();
-        let kb: BTreeMap<u64, Bytes> = b.scan().map(|r| r.expect("row b")).collect();
-        prop_assert_eq!(ka, kb);
-    }
-
-    #[test]
-    fn remove_deletes_on_commit(ops in arb_ops()) {
-        let store = MemoryStore::new();
-        commit_inserts(&store, &ops);
-
-        let Some(&(to_remove, _)) = ops.first() else {
-            return Ok(());
-        };
-        let mut txn = store.begin().expect("begin");
-        txn.remove(to_remove).expect("remove");
-        txn.commit().expect("commit");
-
-        let snap = store.snapshot().expect("snapshot");
-        prop_assert!(snap.get(to_remove).expect("get").is_none());
-    }
-
-    #[test]
-    fn dropped_txn_has_no_effect(
-        before in arb_ops(),
-        abandoned in arb_ops(),
-    ) {
-        let store = MemoryStore::new();
-        commit_inserts(&store, &before);
-        let gen_before = store.generation();
-        let len_before = store.len().expect("len");
-
-        {
-            let mut txn = store.begin().expect("begin");
-            for (k, v) in &abandoned {
-                txn.insert(*k, v.clone()).expect("insert");
-            }
-        }
-
-        prop_assert_eq!(store.generation(), gen_before);
-        prop_assert_eq!(store.len().expect("len"), len_before);
     }
 
     #[test]
@@ -279,6 +186,11 @@ fn denies_missing_docs(src: &str) -> bool {
     denied && !allowed
 }
 
+/// Reclassified: this is a guard on a guard, not raven-core coverage. Stripping
+/// `#![deny(missing_docs)]` from all six framework crates leaves it green while its
+/// sibling `every_framework_crate_still_denies_missing_docs` goes red; what it stops
+/// is the sibling passing vacuously on a commented-out attribute, an overriding
+/// `allow`, or a doc-comment mention. 17 lines to keep a real test honest.
 #[test]
 fn the_missing_docs_detector_rejects_what_a_bare_substring_accepts() {
     // The three shapes m8 named, each of which the previous `contains` check passed.

@@ -7,6 +7,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { RavenPOINodeInterface, RavenError, decodeClientPirQueryBundle } from "../src/index";
+import { makeRegisterSpy } from "./helpers/register_spy";
 import type { ClientPirContext, RavenInspireWasm } from "../src/index";
 
 import { startMockServer, writeBinary, type MockServer } from "./helpers/mock_server";
@@ -25,7 +26,7 @@ function stubWasm(): RavenInspireWasm {
       return response.length === 0 ? new Uint8Array(0) : new Uint8Array(32);
     },
     build_instance_params_blob: () => new Uint8Array(0),
-    register_client_session: () => {},
+    register_client_session: makeRegisterSpy(),
     path_indices_for_leaf: () => new Uint32Array(16),
     path_indices_for_per_list_leaf: () => new Uint32Array(16),
   };
@@ -178,6 +179,92 @@ describe("error-path + truncated-response handling", () => {
     await expect(
       sdk.getPOIMerkleProofs(LIST_KEY_HEX, ["aa".repeat(32)]),
     ).rejects.toThrow(/decodeBatchBody|too short|truncated/);
+  });
+
+  // -------------------------------------------------------------------------
+  // 404 on an instance route: the client-side half of the tree-4 outage class.
+  // Railgun rolled to a new commit tree, the adapter had no instance for it, and
+  // every instance-route request answered 404. The offline suite covered 5xx on
+  // /query and 404 on bc-to-idx-map, but never 404 on /v1/instance/* — the exact
+  // wire shape a wallet sees during that outage. A 404 carries no
+  // X-Raven-Schema-Version header, so it must surface as ServerError (never
+  // StaleAdapter, never a downgraded Network->Missing verdict).
+  // -------------------------------------------------------------------------
+
+  function mount404Instance(): void {
+    server.route(
+      (req) => req.url?.startsWith("/v1/instance/") ?? false,
+      (_req, _body, res) => {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("no such instance");
+        return true;
+      },
+    );
+  }
+
+  it("T1 getPOIsPerList: 404 from the instance route is a typed ServerError, no verdict fabricated", async () => {
+    mount404Instance();
+    const bcPresent = "aa".repeat(32);
+    const sdk = new RavenPOINodeInterface({
+      endpoint: server.url,
+      bearerToken: TOKEN,
+      useClientPir: true,
+      clientPirContexts: new Map([[`t1Status:${LIST_KEY_HEX}`, stubCtx()]]),
+      bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[bcPresent, 0]])]]),
+    });
+    try {
+      const got = await sdk.getPOIsPerList(
+        [LIST_KEY_HEX],
+        [{ blindedCommitment: bcPresent, type: "Shield" }],
+      );
+      expect.fail(
+        `expected ServerError, got a verdict map: ${JSON.stringify(got)} — ` +
+          "a missing instance answered with a confident verdict is the outage made silent",
+      );
+    } catch (e) {
+      expect(RavenError.is(e, "ServerError"), `wrong kind: ${String(e)}`).toBe(true);
+      expect(RavenError.is(e, "StaleAdapter")).toBe(false);
+      expect(RavenError.is(e, "Network")).toBe(false);
+      expect(String((e as Error).message)).toContain("404");
+    }
+  });
+
+  it("T2 getPOIMerkleProofs: 404 from the instance route is a typed ServerError", async () => {
+    mount404Instance();
+    const bcPresent = "aa".repeat(32);
+    const sdk = new RavenPOINodeInterface({
+      endpoint: server.url,
+      bearerToken: TOKEN,
+      useClientPir: true,
+      clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, stubCtx()]]),
+      bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[bcPresent, 0]])]]),
+    });
+    try {
+      await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [bcPresent]);
+      expect.fail("expected ServerError");
+    } catch (e) {
+      expect(RavenError.is(e, "ServerError"), `wrong kind: ${String(e)}`).toBe(true);
+      expect(String((e as Error).message)).toContain("404");
+    }
+  });
+
+  it("T3 getMerkleProof: 404 from the instance route is a typed ServerError (tree-4 shape)", async () => {
+    mount404Instance();
+    const sdk = new RavenPOINodeInterface({
+      endpoint: server.url,
+      bearerToken: TOKEN,
+      useClientPir: true,
+      clientPirContexts: new Map([["t3CommitTree:4", stubCtx()]]),
+    });
+    // Tree 4 with a context but no server instance: the live incident's exact shape —
+    // the CLIENT is willing, the SERVER has nothing to answer with.
+    try {
+      await sdk.getMerkleProof(4, 0);
+      expect.fail("expected ServerError");
+    } catch (e) {
+      expect(RavenError.is(e, "ServerError"), `wrong kind: ${String(e)}`).toBe(true);
+      expect(String((e as Error).message)).toContain("404");
+    }
   });
 
   it("upstream submitPOI propagates 4xx errors typed", async () => {

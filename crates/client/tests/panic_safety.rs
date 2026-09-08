@@ -2,6 +2,10 @@
 //! caught panic, never as an unhandled WASM trap. Run against the pure-Rust mirrors
 //! since the wasm-bindgen wrappers take `JsValue` and can't run natively.
 
+// `catch_unwind` does not unwind on wasm32-unknown-unknown, and proptest is a
+// cfg(not(wasm32)) dev-dep for the getrandom reason in Cargo.toml, so this file has no
+// wasm32 form. Gated rather than left to fail the wasm32 --all-targets lane.
+#![cfg(not(target_arch = "wasm32"))]
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -11,6 +15,7 @@
 
 use std::panic::{self, AssertUnwindSafe};
 
+use proptest::prelude::*;
 use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::InspireParams;
 use raven_inspire::respond_seeded_inspiring_cached_with_session;
@@ -18,7 +23,10 @@ use raven_inspire::{
     setup as inspire_setup, ClientSession, ServerInspiringCache, ServerSessionStore,
 };
 
-use raven_client::{build_seeded_query_rust, extract_response_rust};
+use raven_client::{
+    build_seeded_query_rust, decode_capped_for_test, deserialize_client_session_rust,
+    extract_response_rust, WASM_BINCODE_DESERIALIZE_LIMIT_BYTES,
+};
 
 fn small_params() -> InspireParams {
     InspireParams {
@@ -40,87 +48,80 @@ fn build_test_db(params: &InspireParams) -> Vec<u8> {
     (0..(n * ENTRY_BYTES)).map(|i| (i % 251) as u8).collect()
 }
 
-#[test]
-fn bincode_decode_of_garbage_bytes_never_panics_and_returns_err() {
-    use raven_inspire::params::ShardConfig;
-    use raven_inspire::rlwe::RlweSecretKey;
-    use raven_inspire::{ClientState, SeededClientQuery, ServerCrs, ServerResponse};
+/// Mirror of the crate-private `WasmInstanceParamsBundle` (same field order; bincode
+/// layout is field-ordered), so the magic-prefix arm below can reach `check_magic`
+/// through the shipped `deserialize_client_session_rust` entry point.
+#[derive(serde::Serialize)]
+#[allow(clippy::struct_field_names)]
+struct ParamsBundleMirror {
+    inspire_params_bincode: Vec<u8>,
+    shard_config_bincode: Vec<u8>,
+    rlwe_secret_key_bincode: Vec<u8>,
+}
 
-    let garbage_inputs: Vec<&[u8]> = vec![
-        &[],
-        &[0xff],
-        &[0x00; 8],
-        &[0xab; 64],
-        b"not a valid bincode payload at all",
-    ];
+fn valid_bundle_bytes() -> &'static [u8] {
+    static BUNDLE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    BUNDLE.get_or_init(|| {
+        let params = bincode::serialize(&small_params()).expect("params");
+        bincode::serialize(&ParamsBundleMirror {
+            inspire_params_bincode: params,
+            shard_config_bincode: Vec::new(),
+            rlwe_secret_key_bincode: Vec::new(),
+        })
+        .expect("bundle")
+    })
+}
 
-    for bytes in garbage_inputs {
-        let crs_result = panic::catch_unwind(AssertUnwindSafe(|| {
-            bincode::deserialize::<ServerCrs>(bytes)
+/// Zero-filled deliberately: if the cap pre-check is ever removed, bincode reads a
+/// zero length prefix and decodes an EMPTY `Vec<u8>` Ok, so the Err assertion below
+/// fails loud instead of a huge length prefix attempting a giant allocation.
+fn over_cap_bytes() -> &'static [u8] {
+    static OVER: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    OVER.get_or_init(|| vec![0u8; WASM_BINCODE_DESERIALIZE_LIMIT_BYTES + 1])
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 32, ..ProptestConfig::default() })]
+
+    /// The SHIPPED decode surface, not raw `bincode::deserialize`: arbitrary bytes
+    /// through the capped decode must never panic; the 64 MiB length-prefix cap must
+    /// hold; and garbage in the versioned-CRS position must fail the magic check as a
+    /// typed Err. The retired example this replaces called `bincode::deserialize`
+    /// directly and stayed green with the cap and CRS-version paths deleted outright.
+    #[test]
+    fn decode_surface_never_panics_prop(bytes in prop::collection::vec(any::<u8>(), 0..2048)) {
+        macro_rules! no_panic_decode {
+            ($t:ty, $what:literal) => {
+                let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                    decode_capped_for_test::<$t>(&bytes, $what)
+                }));
+                prop_assert!(outcome.is_ok(), "capped decode of {} panicked", $what);
+            };
+        }
+        no_panic_decode!(raven_inspire::ServerCrs, "server_crs");
+        no_panic_decode!(raven_inspire::ServerResponse, "server_response");
+        no_panic_decode!(raven_inspire::ClientState, "client_state");
+        no_panic_decode!(raven_inspire::SeededClientQuery, "seeded_client_query");
+        no_panic_decode!(raven_inspire::params::ShardConfig, "shard_config");
+        no_panic_decode!(raven_inspire::rlwe::RlweSecretKey, "rlwe_secret_key");
+        no_panic_decode!(InspireParams, "inspire_params");
+
+        // length-prefix path: one byte past the cap must be refused BY THE CAP
+        match decode_capped_for_test::<Vec<u8>>(over_cap_bytes(), "over_cap") {
+            Ok(v) => prop_assert!(false, "cap+1 bytes decoded Ok ({} elems): the 64 MiB cap is gone", v.len()),
+            Err(err) => prop_assert!(err.contains("size limit reached"), "got: {err}"),
+        }
+
+        // magic-prefix path: arbitrary bytes in the CRS position surface as a typed
+        // Err (Ok would need the version magic AND the 16-byte session stub to decode
+        // as a valid residue) and never as a panic
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            deserialize_client_session_rust(valid_bundle_bytes(), &bytes, &[0u8; 16])
         }));
-        assert!(
-            crs_result.is_ok(),
-            "bincode CRS decode panicked on garbage input ({} bytes)",
-            bytes.len()
-        );
-        assert!(
-            crs_result.expect("not panicked").is_err(),
-            "bincode CRS decode of garbage must Err"
-        );
-
-        let resp_result = panic::catch_unwind(AssertUnwindSafe(|| {
-            bincode::deserialize::<ServerResponse>(bytes)
-        }));
-        assert!(
-            resp_result.is_ok(),
-            "bincode ServerResponse decode panicked on garbage input ({} bytes)",
-            bytes.len()
-        );
-
-        let state_result = panic::catch_unwind(AssertUnwindSafe(|| {
-            bincode::deserialize::<ClientState>(bytes)
-        }));
-        assert!(
-            state_result.is_ok(),
-            "bincode ClientState decode panicked on garbage input ({} bytes)",
-            bytes.len()
-        );
-
-        let query_result = panic::catch_unwind(AssertUnwindSafe(|| {
-            bincode::deserialize::<SeededClientQuery>(bytes)
-        }));
-        assert!(
-            query_result.is_ok(),
-            "bincode SeededClientQuery decode panicked on garbage input ({} bytes)",
-            bytes.len()
-        );
-
-        let shard_result = panic::catch_unwind(AssertUnwindSafe(|| {
-            bincode::deserialize::<ShardConfig>(bytes)
-        }));
-        assert!(
-            shard_result.is_ok(),
-            "bincode ShardConfig decode panicked on garbage input ({} bytes)",
-            bytes.len()
-        );
-
-        let sk_result = panic::catch_unwind(AssertUnwindSafe(|| {
-            bincode::deserialize::<RlweSecretKey>(bytes)
-        }));
-        assert!(
-            sk_result.is_ok(),
-            "bincode RlweSecretKey decode panicked on garbage input ({} bytes)",
-            bytes.len()
-        );
-
-        let params_result = panic::catch_unwind(AssertUnwindSafe(|| {
-            bincode::deserialize::<InspireParams>(bytes)
-        }));
-        assert!(
-            params_result.is_ok(),
-            "bincode InspireParams decode panicked on garbage input ({} bytes)",
-            bytes.len()
-        );
+        match outcome {
+            Ok(inner) => prop_assert!(inner.is_err()),
+            Err(_) => prop_assert!(false, "deserialize_client_session_rust panicked"),
+        }
     }
 }
 

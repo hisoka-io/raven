@@ -1,5 +1,5 @@
-//! `RpcEndpointPool` failure-injection tests: per-endpoint rate limiting, round-robin rotation,
-//! 5xx-triggered cooldown, and recovery after cooldown elapses.
+//! `RpcEndpointPool` failure-injection tests: 5xx-triggered cooldown and recovery
+//! after cooldown elapses.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
@@ -16,75 +16,11 @@ use raven_railgun_indexer::rpc_pool::{
 use raven_railgun_indexer::ChainSource;
 use serde_json::json;
 
-#[test]
-fn rapid_fire_requests_hit_per_endpoint_rate_limit_and_rotate() {
-    let cfgs = vec![
-        EndpointConfig {
-            url: "http://endpoint-0.test/".to_owned(),
-            rps: 50,
-            burst: 50,
-        },
-        EndpointConfig {
-            url: "http://endpoint-1.test/".to_owned(),
-            rps: 50,
-            burst: 50,
-        },
-    ];
-    let pool = RpcEndpointPool::new(
-        cfgs,
-        PoolConfig {
-            strategy: PoolStrategy::RoundRobin,
-            ..PoolConfig::default()
-        },
-    )
-    .expect("pool builds");
-
-    let mut counts = [0u32; 2];
-    let mut exhausted = 0u32;
-    for _ in 0..200 {
-        match pool.select_for_request() {
-            Ok(endpoint) => {
-                for (i, e) in pool.endpoints().iter().enumerate() {
-                    if Arc::ptr_eq(e, &endpoint) {
-                        if let Some(slot) = counts.get_mut(i) {
-                            *slot += 1;
-                        }
-                    }
-                }
-                pool.release_in_flight(&endpoint);
-            }
-            Err(_) => exhausted += 1,
-        }
-    }
-
-    let total = counts[0] + counts[1] + exhausted;
-    assert_eq!(total, 200, "every iteration must be accounted for");
-    assert!(
-        counts[0] >= 1 && counts[1] >= 1,
-        "both endpoints must be selected at least once for rotation \
-         to be observable; counts={counts:?}, exhausted={exhausted}"
-    );
-    assert!(
-        counts[0] <= 50,
-        "endpoint 0 served {} requests, exceeds burst=50",
-        counts[0]
-    );
-    assert!(
-        counts[1] <= 50,
-        "endpoint 1 served {} requests, exceeds burst=50",
-        counts[1]
-    );
-    assert!(
-        exhausted >= 1,
-        "expected at least one Exhausted once both buckets drain; \
-         counts={counts:?}, exhausted={exhausted}"
-    );
-    assert_eq!(
-        u32::from(counts[0] >= 1) + u32::from(counts[1] >= 1),
-        2,
-        "both endpoints must have been hit before exhaustion"
-    );
-}
+// Rotation and burst-cap coverage live in stricter homes: the in-src
+// round_robin_distributes_evenly (exact split) and rpc_pool_concurrency_stress's
+// round-robin/token-bucket tests (exact burst count under contention); both were
+// proven RED under a pinned-rotation mutant and a bypassed-limiter mutant that
+// also killed the looser test this file used to carry.
 
 #[derive(Debug, Clone)]
 struct MockState {

@@ -49,9 +49,9 @@ fn heartbeat_swap_state_drops_inner_session_store() {
     for _ in 0..3 {
         register_one_session(&instance, &params);
     }
-    let pre_len = {
+    let (pre_len, donor_store_ptr): (usize, *const BoundedSessionStore) = {
         let snap = instance.current_state();
-        snap.session_store.len()
+        (snap.session_store.len(), Arc::as_ptr(&snap.session_store))
     };
     assert!(
         pre_len >= 3,
@@ -61,13 +61,20 @@ fn heartbeat_swap_state_drops_inner_session_store() {
 
     heartbeat_session_eviction(&instance).expect("heartbeat");
 
-    let post_len = {
+    let (post_len, post_store_ptr): (usize, *const BoundedSessionStore) = {
         let snap = instance.current_state();
-        snap.session_store.len()
+        (snap.session_store.len(), Arc::as_ptr(&snap.session_store))
     };
     assert_eq!(
         post_len, 0,
         "heartbeat MUST install a fresh empty BoundedSessionStore; got post len={post_len}"
+    );
+    // Reusing the donor's Arc would make eviction a no-op for in-flight queries
+    // still holding it.
+    assert!(
+        !std::ptr::eq(donor_store_ptr, post_store_ptr),
+        "heartbeat MUST install a fresh BoundedSessionStore Arc; the donor's \
+         Arc must not survive into the new state"
     );
 
     assert!(
@@ -104,97 +111,6 @@ fn heartbeat_swap_state_preserves_cache_across_swap() {
          (Arc::clone). A non-equal pointer here means the cache rebuilt - the \
          hourly tick would stall the server for seconds."
     );
-}
-
-#[test]
-fn heartbeat_swap_state_drops_session_store_arc_pointer_too() {
-    // A fresh Arc; reusing the donor's would make eviction a no-op for in-flight
-    // queries still holding it.
-    let params = InspireParams::secure_128_d2048();
-    let initial_state = build_toy_state(&params);
-    let instance: Arc<PirInstance<RavenInspireScheme>> = Arc::new(PirInstance::new(
-        InstanceId::new("heartbeat-fresh-store"),
-        InstanceRole::Live,
-        initial_state,
-    ));
-
-    register_one_session(&instance, &params);
-
-    let donor_store_ptr: *const BoundedSessionStore = {
-        let snap = instance.current_state();
-        Arc::as_ptr(&snap.session_store)
-    };
-
-    heartbeat_session_eviction(&instance).expect("heartbeat");
-
-    let post_store_ptr: *const BoundedSessionStore = {
-        let snap = instance.current_state();
-        Arc::as_ptr(&snap.session_store)
-    };
-    assert!(
-        !std::ptr::eq(donor_store_ptr, post_store_ptr),
-        "heartbeat MUST install a fresh BoundedSessionStore Arc; the donor's \
-         Arc must not survive into the new state"
-    );
-}
-
-/// At `interval == 0` the heartbeat never fires, so the bootstrap Arc persists.
-#[test]
-fn heartbeat_interval_disabled_when_zero() {
-    let params = InspireParams::secure_128_d2048();
-    let initial_state = build_toy_state(&params);
-    let instance: Arc<PirInstance<RavenInspireScheme>> = Arc::new(PirInstance::new(
-        InstanceId::new("heartbeat-disabled-zero"),
-        InstanceRole::Live,
-        initial_state,
-    ));
-
-    let initial_store_ptr: *const BoundedSessionStore = {
-        let snap = instance.current_state();
-        Arc::as_ptr(&snap.session_store)
-    };
-
-    register_one_session(&instance, &params);
-
-    let post_store_ptr: *const BoundedSessionStore = {
-        let snap = instance.current_state();
-        Arc::as_ptr(&snap.session_store)
-    };
-    assert!(
-        std::ptr::eq(initial_store_ptr, post_store_ptr),
-        "with the CLI guard at zero (heartbeat_session_eviction never \
-         called), the donor session_store Arc MUST persist; the test \
-         observed a swap (different Arc) - guard logic regressed?"
-    );
-    assert_eq!(
-        instance.current_epoch(),
-        Epoch::ZERO,
-        "epoch MUST remain at zero when the heartbeat fn is never \
-         called (operator opt-out branch)"
-    );
-}
-
-#[test]
-fn heartbeat_swap_state_metric_increments_per_swap() {
-    let params = InspireParams::secure_128_d2048();
-    let initial_state = build_toy_state(&params);
-    let instance: Arc<PirInstance<RavenInspireScheme>> = Arc::new(PirInstance::new(
-        InstanceId::new("heartbeat-per-call"),
-        InstanceRole::Live,
-        initial_state,
-    ));
-
-    let e0 = instance.current_epoch();
-    heartbeat_session_eviction(&instance).expect("heartbeat 1");
-    let e1 = instance.current_epoch();
-    heartbeat_session_eviction(&instance).expect("heartbeat 2");
-    let e2 = instance.current_epoch();
-    heartbeat_session_eviction(&instance).expect("heartbeat 3");
-    let e3 = instance.current_epoch();
-
-    assert!(e1 > e0, "epoch MUST advance after first heartbeat");
-    assert!(e2 > e1, "epoch MUST advance after second heartbeat");
-    assert!(e3 > e2, "epoch MUST advance after third heartbeat");
 }
 
 // A deep clone per fire is ~128 MiB at production cell and would OOM under
@@ -239,38 +155,6 @@ fn heartbeat_eviction_does_not_clone_encoded_db_under_steady_load() {
          expected <= 2 (current state + the local snap guard). A larger value \
          means heartbeat is leaking Arcs (e.g. forgetting to drop the donor \
          swap-out)."
-    );
-}
-
-/// 1-ms ceiling on the toy cell: absorbs jitter, catches a deep-clone regression.
-#[test]
-fn heartbeat_eviction_arc_clone_constant_time_at_production_cell() {
-    let params = InspireParams::secure_128_d2048();
-    let initial_state = build_toy_state(&params);
-    let instance: Arc<PirInstance<RavenInspireScheme>> = Arc::new(PirInstance::new(
-        InstanceId::new("heartbeat-arc-clone-timing"),
-        InstanceRole::Live,
-        initial_state,
-    ));
-
-    // First fire pays metrics-recorder and arc_swap lazy init.
-    heartbeat_session_eviction(&instance).expect("warmup");
-
-    let mut over_budget = 0usize;
-    for _ in 0..100 {
-        let started = std::time::Instant::now();
-        heartbeat_session_eviction(&instance).expect("sampled fire");
-        let elapsed = started.elapsed();
-        if elapsed > std::time::Duration::from_millis(1) {
-            over_budget = over_budget.saturating_add(1);
-        }
-    }
-
-    assert!(
-        over_budget <= 5,
-        "{over_budget}/100 heartbeat fires exceeded 1 ms. The fix carries \
-         encoded_db via Arc::clone (sub-microsecond); a regression to \
-         Vec memcpy would put every fire over budget."
     );
 }
 

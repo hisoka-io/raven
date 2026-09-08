@@ -1,0 +1,151 @@
+{
+  "generator": "emit_test_fixture",
+  "generator_git_commit": "c17ded52ad902cdc6d3c030f398131b09b06b58f",
+  "generated_unix_ms": 1788705800077,
+  "inspire_params": {
+    "ring_dim": 256,
+    "q": 1152921504606830593,
+    "crt_moduli": [
+      1152921504606830593
+    ],
+    "p": 65537,
+    "sigma": 6.4,
+    "gadget_base": 1048576,
+    "gadget_len": 3,
+    "security_level": "Bits128"
+  },
+  "entry_size": 32,
+  "num_indices": 5,
+  "files": [
+    {
+      "name": "inspire_params.bin",
+      "bytes": 68,
+      "sha256": "7ffb783b674f29fe91801b33464960b6350fa8fee0d9aa8cefbf31a47d5bd821"
+    },
+    {
+      "name": "crs.bin",
+      "bytes": 101100,
+      "sha256": "1878cb7f85df4cbf7481ba369c8283476342693fd8ce4799b8fd50bcd2f06e91"
+    },
+    {
+      "name": "shard_config.bin",
+      "bytes": 24,
+      "sha256": "f939aec5de0237025ac7976005ad1f1483550af94f5dab0bf98178355d151405"
+    },
+    {
+      "name": "params_bundle.bin",
+      "bytes": 2213,
+      "sha256": "7424c718075a2339a7f497c64edd960c68a40d434bcd89ed68c196e4a3b274e3"
+    },
+    {
+      "name": "list_key.bin",
+      "bytes": 32,
+      "sha256": "425ed4e4a36b30ea21b90e21c712c649e8214c29b7eaf68089d1039c6e55384c"
+    },
+    {
+      "name": "fixture.json",
+      "bytes": 548,
+      "sha256": "4a025c36688de42917c71f1df2770a6c28dc061a4da0b63d0b4f86d1d1b84c56"
+    },
+    {
+      "name": "bc_for_idx_0.bin",
+      "bytes": 32,
+      "sha256": "294751b5ccf510a62a2f489b07549cd835dc0a07f05c0de20a1aa61ed5ef5584"
+    },
+    {
+      "name": "client_state_for_idx_0.bin",
+      "bytes": 20,
+      "sha256": "de47c9b27eb8d300dbb5f2c353e632c393262cf06340c4fa7f1b40c4cbd36f90"
+    },
+    {
+      "name": "expected_plain_for_idx_0.bin",
+      "bytes": 32,
+      "sha256": "eecb01e51be5c0bfd051b2b4116f2a096e5d9442b479d00c42b87a4dba622fae"
+    },
+    {
+      "name": "response_for_idx_0.bin",
+      "bytes": 4207,
+      "sha256": "370e54252a3d97305739fc23c82da38380f46d90c75b3b41d6da54a3349999e5"
+    },
+    {
+      "name": "bc_for_idx_1.bin",
+      "bytes": 32,
+      "sha256": "af565641a5df19d8b7f4502fe74f89b562746e76f91662b27c8eaf4cf415e1a7"
+    },
+    {
+      "name": "client_state_for_idx_1.bin",
+      "bytes": 20,
+      "sha256": "09b20a322f90279dec54287a553d4fcbc8b9d1267701dacb68ac8ed5414078f6"
+    },
+    {
+      "name": "expected_plain_for_idx_1.bin",
+      "bytes": 32,
+      "sha256": "34385b266af873b7031973f9ac15b1eb43be2796262c1d9671d88afb4e203c06"
+    },
+    {
+      "name": "response_for_idx_1.bin",
+      "bytes": 4207,
+      "sha256": "0b66980f3a13e1c073db7e114dfd6da2b0de7f24d56d0705504ed703ef732a83"
+    },
+    {
+      "name": "bc_for_idx_2.bin",
+      "bytes": 32,
+      "sha256": "71961022d4212eeb347b446ab08d573998e4e8c4c954fc3e2c9e1f2eb7528fdd"
+    },
+    {
+      "name": "client_state_for_idx_2.bin",
+      "bytes": 20,
+      "sha256": "3a8caa90e9ad1cd42d45d44573dd0e3fc0835e9f75b4f6d473cb369a1807b240"
+    },
+    {
+      "name": "expected_plain_for_idx_2.bin",
+      "bytes": 32,
+      "sha256": "3b5ee0aa040ba192d584651d42d5bf75fab3f01a8fc91b869562c1e4df72e304"
+    },
+    {
+      "name": "response_for_idx_2.bin",
+      "bytes": 4207,
+      "sha256": "f3f2c5eb55caf0938d474b5725ea0ff915b8d68f87e0304386842680fe18a210"
+    },
+    {
+      "name": "bc_for_idx_3.bin",
+      "bytes": 32,
+      "sha256": "f46b93864a47c491e087b10d94687f5307d19611b98689fa319389a903e5f7b0"
+    },
+    {
+      "name": "client_state_for_idx_3.bin",
+      "bytes": 20,
+      "sha256": "bfbc0baa70bb9db6071878221c395bef297cd6b07e1614004d3a68b3fd8cea45"
+    },
+    {
+      "name": "expected_plain_for_idx_3.bin",
+      "bytes": 32,
+      "sha256": "02bba189dfb28dd9b63f9325c06757249dc0bd68999c1cb0ac49bf774097513a"
+    },
+    {
+      "name": "response_for_idx_3.bin",
+      "bytes": 4207,
+      "sha256": "a38b915d3a67f3f57da2ba078603f9f8ca54a9d5e6392ef1aeb3e680d293ff44"
+    },
+    {
+      "name": "bc_for_idx_4.bin",
+      "bytes": 32,
+      "sha256": "e015cc1d7b0a6ec166866717644000a128a5a7baf78c018a50d3c6b57e7f9eec"
+    },
+    {
+      "name": "client_state_for_idx_4.bin",
+      "bytes": 20,
+      "sha256": "e7a13fed8dc6d3e2fcc07a7cfb504cb51cf62002cfe08240e3e9176cf0b818a4"
+    },
+    {
+      "name": "expected_plain_for_idx_4.bin",
+      "bytes": 32,
+      "sha256": "74f74f8350cd5f8d03f6790c4faa8bc0c5a738dcf3ab16021b1950723d96f95a"
+    },
+    {
+      "name": "response_for_idx_4.bin",
+      "bytes": 4207,
+      "sha256": "991b7819f0bc5935c6e4208fbbea9212e9eb8b8e4519696be1b34db88c4db9b0"
+    }
+  ]
+}

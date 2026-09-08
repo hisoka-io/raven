@@ -15,6 +15,11 @@ pub const TREE_DEPTH: usize = 16;
 /// Maximum leaves per tree (`2 ^ TREE_DEPTH = 65,536`).
 pub const TREE_MAX_ITEMS: usize = 1 << TREE_DEPTH;
 
+// `merkle_proof` packs the path bits as `leaf_index & ((1 << TREE_DEPTH) - 1) as u16`.
+// Past depth 16 that cast silently drops the high bits with no panic, so raising
+// TREE_DEPTH (a depth-32 LeanIMT, say) must widen `MerkleProof::indices` first.
+const _: () = assert!(TREE_DEPTH <= 16);
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct ZeroValues {
     /// `ZEROS[0..=TREE_DEPTH]`: empty-subtree hash per level.
@@ -199,6 +204,7 @@ impl Imt {
         }
 
         // bit i = (leaf_index >> i) & 1; TREE_DEPTH bits fit a u16.
+        // Bound pinned at module scope; see the const assert under TREE_MAX_ITEMS.
         let truncated = leaf_index & ((1 << TREE_DEPTH) - 1);
         #[allow(clippy::cast_possible_truncation)]
         let indices = truncated as u16;
@@ -379,7 +385,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "fills full 65,536-leaf tree; ~1M Poseidon hashes; release-only"]
+    #[ignore = "fills the full 65,536-leaf tree, ~1M Poseidon hashes; release-only. Trigger: \
+                changing TREE_MAX_ITEMS, Imt::insert_leaves, or the capacity guard. CI runs it in \
+                the durability + closure engine-ignored lane."]
     fn insert_rejects_overflow_past_capacity() {
         let mut tree = Imt::new().expect("imt build");
         let leaves: Vec<[u8; 32]> = (0..TREE_MAX_ITEMS)

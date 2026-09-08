@@ -199,7 +199,8 @@ fn run_cell(cell: &Cell) {
 }
 
 #[test]
-#[ignore = "production-cell setup is heavy (~12s per encoder x 3 seeds); ~3 minutes total"]
+#[ignore = "production-cell setup is heavy (~12s per encoder x 3 seeds); ~3 minutes total. \
+            Trigger: changing per-insert re-encode cost for any of the six encoders."]
 fn per_insert_wall_time_per_encoder_at_50pct_fill() {
     append_findings_line("");
     append_findings_line(

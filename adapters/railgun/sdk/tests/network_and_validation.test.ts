@@ -62,8 +62,10 @@ describe("per-network deployments + validation", () => {
     });
   }
 
-  it("operator chain-id mismatch surfaces via response inspection (test-side check)", async () => {
-    // Documents that the SDK does not verify chain-id; the wallet must read X-Raven-Chain-Id out-of-band.
+  // CHARACTERIZES a known gap: the SDK never reads X-Raven-Chain-Id, so an operator serving
+  // a different chain than the caller configured is accepted verbatim. The wallet must check
+  // the header out-of-band. Asserting the mismatch is REJECTED is what a fix looks like.
+  it("accepts a response whose chain-id header contradicts the configured chain", async () => {
     server.route(
       (req) => req.url === "/v1/poi/pois-per-list",
       (_req, _body, res) => {
@@ -83,21 +85,35 @@ describe("per-network deployments + validation", () => {
       bearerToken: TOKEN,
       useClientPir: false,
     });
-    await expect(
-      sdk.getPOIsPerList(
-        [LIST_KEY_HEX],
-        [{ blindedCommitment: BC_HEX, type: "Shield" }],
-      ),
-    ).resolves.toBeTruthy();
+    const got = await sdk.getPOIsPerList(
+      [LIST_KEY_HEX],
+      [{ blindedCommitment: BC_HEX, type: "Shield" }],
+    );
+    // Returned verbatim: no chain check ran, and no error names the mismatch.
+    expect(got).toEqual({ [LIST_KEY_HEX]: { [BC_HEX]: "Valid" } });
+    expect(JSON.stringify(got)).not.toContain("999999999");
   });
 
-  it("constructor strips trailing slashes from endpoint", () => {
+  it("constructor strips a trailing slash before the endpoint reaches a URL", async () => {
+    // `expect(() => sdk).not.toThrow()` used to stand here and could not fail: the strip was
+    // removable with the whole suite green. Assert the observable consequence instead.
+    server.route(
+      (req) => req.url === "/v1/poi/pois-per-list",
+      (_req, _body, res) => {
+        writeJson(res, {});
+        return true;
+      },
+    );
     const sdk = new RavenPOINodeInterface({
-      endpoint: "http://localhost:8080/",
+      endpoint: `${server.url}/`,
       bearerToken: TOKEN,
+      useClientPir: false,
     });
-    // endpoint is private; a leaked trailing slash would break path concatenation on use.
-    expect(() => sdk).not.toThrow();
+    await sdk.getPOIsPerList([LIST_KEY_HEX], [{ blindedCommitment: BC_HEX, type: "Shield" }]);
+    const wires = sdk.lastWireRequests();
+    expect(wires.length).toBe(1);
+    expect(wires[0].url).toBe(`${server.url}/v1/poi/pois-per-list`);
+    expect(wires[0].url).not.toContain("//v1/");
   });
 
   it("accepts empty list_keys (server returns empty map)", async () => {

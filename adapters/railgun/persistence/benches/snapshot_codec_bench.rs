@@ -43,7 +43,9 @@ fn median(timings: &mut [Duration]) -> Duration {
 }
 
 #[test]
-#[ignore = "snapshot codec sweep; ~2-3s wall total"]
+#[ignore = "snapshot codec sweep, bincode vs bitcode over 32k AppendLeaf entries; 93 ms wall \
+            measured on a 16-core box under the ci-test profile. Trigger: changing the \
+            WalEntryPayload wire layout or the snapshot codec choice."]
 fn snapshot_codec_bench_bincode_vs_bitcode() {
     eprintln!(
         "snapshot_codec: SEEDS={} PAYLOAD_COUNT={}",

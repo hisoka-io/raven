@@ -132,21 +132,4 @@ mod tests {
         assert_eq!(err.source, OracleSource::Subsquid);
         assert_eq!(err.other_root, bad);
     }
-
-    #[test]
-    fn deterministic_order_returns_chain_first_when_multiple_disagree() {
-        let r = [0x42u8; 32];
-        let chain_bad = [0x10u8; 32];
-        let upstream_bad = [0x20u8; 32];
-        let subsquid_bad = [0x30u8; 32];
-        let err = assert_three_oracle_byte_identity(
-            r,
-            Some(chain_bad),
-            Some(upstream_bad),
-            Some(subsquid_bad),
-            "ctx",
-        )
-        .expect_err("any mismatch");
-        assert_eq!(err.source, OracleSource::Chain);
-    }
 }

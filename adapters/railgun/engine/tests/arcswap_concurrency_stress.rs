@@ -129,71 +129,12 @@ fn query_atomicity_under_100_concurrent_queries_and_swaps() {
     );
 }
 
+/// Named for what it can prove. A refusal followed by a flip back to Active is legal, so
+/// "no phantom guard was issued" is not decidable from outside; what is decidable is that
+/// the gate keeps issuing under rapid transitions and that every guard it issued was
+/// released.
 #[test]
-fn current_snapshot_returns_a_consistent_pair_under_stress() {
-    const N_READERS: usize = 50;
-    const N_WRITERS: usize = 50;
-    const RUN_FOR: Duration = Duration::from_secs(1);
-
-    let inst: Arc<PirInstance<WitnessScheme>> = Arc::new(PirInstance::new(
-        InstanceId::new("witness-snapshot"),
-        raven_railgun_engine::InstanceRole::Live,
-        WitnessState { value: 0 },
-    ));
-    let stop = Arc::new(AtomicBool::new(false));
-    let next_epoch = Arc::new(AtomicU64::new(1));
-    let observed_torn = Arc::new(AtomicU64::new(0));
-
-    let mut handles = Vec::new();
-    for _ in 0..N_READERS {
-        let inst = Arc::clone(&inst);
-        let stop = Arc::clone(&stop);
-        let observed_torn = Arc::clone(&observed_torn);
-        handles.push(std::thread::spawn(move || {
-            while !stop.load(Ordering::Acquire) {
-                let snap = inst.current_snapshot();
-                if snap.epoch.0 != snap.state.value {
-                    observed_torn.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }));
-    }
-    for _ in 0..N_WRITERS {
-        let inst = Arc::clone(&inst);
-        let stop = Arc::clone(&stop);
-        let next_epoch = Arc::clone(&next_epoch);
-        handles.push(std::thread::spawn(move || {
-            while !stop.load(Ordering::Acquire) {
-                // A concurrent writer can publish a higher epoch between this
-                // worker's allocation and its swap. `swap_state` refuses that as
-                // stale rather than overwriting the newer state, so re-derive and
-                // retry - which is what its error tells a real writer to do. The
-                // counter only rises, so a retry always clears the published epoch.
-                loop {
-                    let e = next_epoch.fetch_add(1, Ordering::Relaxed);
-                    if inst.swap_state(WitnessState { value: e }, Epoch(e)).is_ok() {
-                        break;
-                    }
-                }
-            }
-        }));
-    }
-
-    std::thread::sleep(RUN_FOR);
-    stop.store(true, Ordering::Release);
-    for h in handles {
-        h.join().expect("worker joined");
-    }
-    let torn = observed_torn.load(Ordering::Relaxed);
-    assert_eq!(
-        torn, 0,
-        "current_snapshot must return a consistent (epoch, state) pair; \
-         observed {torn} pairs where epoch != state.value"
-    );
-}
-
-#[test]
-fn drainstate_transition_does_not_issue_phantom_inflight_guards() {
+fn rapid_drain_flips_keep_issuing_guards_and_leak_none() {
     const N_ACQUIRERS: usize = 32;
     const RUN_FOR: Duration = Duration::from_millis(500);
 
@@ -253,46 +194,25 @@ fn drainstate_transition_does_not_issue_phantom_inflight_guards() {
          A regression that always refuses (gate stuck closed) \
          would surface here.",
     );
-    let _ = phantom_total;
+    // `phantom_total` is diagnostic only: a flip back to Active between the refusal and
+    // the re-check is legal, so no bound on it is sound. What IS sound is that every
+    // guard the gate issued was released - an increment that outlives its Drop leaks the
+    // counter and wedges drain forever, and only a contended run reaches that path.
+    assert_eq!(
+        inst.in_flight_count(),
+        0,
+        "every one of {issued_total} issued guards must have decremented on drop \
+         (phantom refusals seen: {phantom_total})",
+    );
     inst.set_drain_state(DrainState::Active);
 }
 
-#[test]
-fn in_flight_query_observes_pre_swap_state_even_after_concurrent_swap() {
-    let inst: Arc<PirInstance<WitnessScheme>> = Arc::new(PirInstance::new(
-        InstanceId::new("inflight-stability"),
-        raven_railgun_engine::InstanceRole::Live,
-        WitnessState { value: 1 },
-    ));
-    inst.swap_state(WitnessState { value: 1 }, Epoch(1))
-        .expect("same-shape swap");
-
-    let snap_pre = inst.current_snapshot();
-    assert_eq!(snap_pre.epoch.0, 1);
-    assert_eq!(snap_pre.state.value, 1);
-
-    let inst_for_swap = Arc::clone(&inst);
-    let h = std::thread::spawn(move || {
-        inst_for_swap
-            .swap_state(WitnessState { value: 99 }, Epoch(99))
-            .expect("same-shape swap");
-    });
-    h.join().expect("swap joined");
-
-    assert_eq!(
-        snap_pre.epoch.0, 1,
-        "in-flight snapshot epoch must not be mutated by a concurrent swap"
-    );
-    assert_eq!(
-        snap_pre.state.value, 1,
-        "in-flight snapshot state must not be mutated by a concurrent swap"
-    );
-
-    let snap_post = inst.current_snapshot();
-    assert_eq!(snap_post.epoch.0, 99);
-    assert_eq!(snap_post.state.value, 99);
-}
-
+/// The only cover for `query()`'s OWN drain refusal. It looks like a duplicate of
+/// `query_active_tracked_with_snapshot_refuses_when_drained` and
+/// `drain_state_routing::drain_single_instance_returns_no_active_instance_error`, and is not:
+/// those two refuse via `acquire_in_flight_guard`. Measured both directions — deleting the
+/// guard's refusal REDs them and leaves this green; deleting `query()`'s refusal REDs this and
+/// leaves them green.
 #[test]
 fn query_after_drain_transition_returns_no_active_instance() {
     let inst: Arc<PirInstance<WitnessScheme>> = Arc::new(PirInstance::new(

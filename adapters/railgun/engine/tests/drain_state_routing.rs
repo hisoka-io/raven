@@ -10,7 +10,6 @@
 )]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use raven_inspire::params::InspireParams;
 use raven_railgun_core::{AdapterError, InstanceId};
@@ -30,16 +29,6 @@ fn build_instance(id: &str, role: InstanceRole) -> Arc<PirInstance<RavenInspireS
         role,
         state,
     ))
-}
-
-#[test]
-fn fresh_instance_defaults_to_active_with_zero_in_flight() {
-    let inst = build_instance("toy-default", InstanceRole::Live);
-    assert_eq!(inst.drain_state(), DrainState::Active);
-    assert_eq!(inst.in_flight_count(), 0);
-    assert!(DrainState::Active.is_active());
-    assert!(!DrainState::Draining.is_active());
-    assert!(!DrainState::Drained.is_active());
 }
 
 #[test]
@@ -241,20 +230,6 @@ async fn undrain_active_again_serves_queries() {
         0,
         "guard must be dropped by query_active_tracked completion"
     );
-}
-
-#[tokio::test]
-async fn drain_state_transition_is_idempotent() {
-    let inst = build_instance("commit-tree-noop", InstanceRole::Live);
-    inst.set_drain_state(DrainState::Active);
-    assert_eq!(inst.drain_state(), DrainState::Active);
-    inst.set_drain_state(DrainState::Active);
-    assert_eq!(inst.drain_state(), DrainState::Active);
-    inst.set_drain_state(DrainState::Draining);
-    inst.set_drain_state(DrainState::Draining);
-    assert_eq!(inst.drain_state(), DrainState::Draining);
-    // Let the background tracing sink flush before the runtime shuts down.
-    tokio::time::sleep(Duration::from_millis(10)).await;
 }
 
 fn build_real_query(

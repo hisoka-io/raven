@@ -739,61 +739,12 @@ async fn a_failing_events_fetch_keeps_heartbeating_against_a_held_cursor() {
     );
 }
 
-/// The same catch-all swallows an RPC failure inside the reorg check, which is
-/// the mundane way production reaches it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_rpc_failure_in_the_reorg_check_keeps_heartbeating_and_counts() {
-    let s = snap();
-    let src = Arc::new(WindowSource::with_chain(120));
-    let (tx, mut rx) = mpsc::channel::<IndexerMessage>(256);
-    let worker = IndexerWorker::new(Arc::clone(&src), tx);
-    let cfg = IndexerWorkerConfig {
-        start_block: 0,
-        poll_interval_secs: 1,
-        chunk_blocks: 30,
-        ..IndexerWorkerConfig::default()
-    };
-    let join = tokio::spawn(async move { worker.run(cfg).await });
-
-    let caught_up = drain_while(&mut rx, Duration::from_secs(15), |t| {
-        t.watermarks.contains(&120)
-    })
-    .await;
-    assert!(
-        caught_up.watermarks.contains(&120),
-        "worker must reach the chain tip first; got {:?}",
-        caught_up.watermarks
-    );
-
-    let before = counter_by_name(s, REORG_CHECK_FAILED);
-    src.deny_block_hash_at(120);
-
-    let mut after = before;
-    let denied = drain_while(&mut rx, Duration::from_secs(15), |_| {
-        after = after.max(counter_by_name(s, REORG_CHECK_FAILED));
-        after > before
-    })
-    .await;
-    assert!(
-        after > before,
-        "a failed reorg check must be counted; before={before} after={after}"
-    );
-
-    let still_live = drain_while(&mut rx, Duration::from_secs(15), |t| {
-        t.watermarks.len() >= 2
-    })
-    .await;
-    drop(rx);
-    let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
-
-    assert!(
-        still_live.watermarks.len() >= 2,
-        "the worker must keep heartbeating while the cursor hash is unavailable; \
-         got {:?} after the failure (and {:?} before it)",
-        still_live.watermarks,
-        denied.watermarks
-    );
-}
+// The catch-all that swallows an RPC failure inside the reorg check is held by
+// a_divergence_past_the_walk_back_bound_keeps_heartbeating_and_counts above:
+// same REORG_CHECK_FAILED counter, same heartbeat-liveness assertion, proven RED
+// under a removed-increment mutant that also killed the plain-RPC-failure
+// injection this comment replaces; the liveness half is additionally held by
+// a_failing_events_fetch_keeps_heartbeating_against_a_held_cursor.
 
 /// Clearing the window on an unresolvable miss disables Layer 1 detection until
 /// a fresh tip is cached, and persists that blind state. Refill it instead.

@@ -21,7 +21,9 @@ fn test_encoder() -> Arc<dyn PirTableEncoder> {
 }
 
 #[test]
-#[ignore = "production-cell setup is heavy (~12s); cold-start measurement"]
+#[ignore = "production-cell setup is heavy (11 s measured); measures cold-start \
+            bootstrap-from-disk, which is 5.5 s on a 16-core box under the ci-test profile. \
+            Trigger: changing manifest load, snapshot restore, or cache rebuild."]
 fn recovery_from_production_cell_snapshot_under_5s() {
     let setup_start = Instant::now();
     let params = InspireParams::secure_128_d2048();

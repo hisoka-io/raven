@@ -31,6 +31,14 @@ rand = { version = "0.8", default-features = false, features = ["getrandom"] }
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 
+# NOT an unconditional dev-dep: proptest pulls rand 0.9 -> rand_core 0.9 -> getrandom 0.3, which
+# `compile_error!`s on wasm32-unknown-unknown without the `wasm_js` cfg. ci.yml's
+# `clippy -p raven-client --all-targets --target wasm32-unknown-unknown` compiles dev-deps, so an
+# unconditional entry here fails that lane outright. The only consumer, tests/panic_safety.rs, is
+# native by construction - it drives catch_unwind against the `_rust` mirrors.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+proptest = { workspace = true }
+
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["console"] }

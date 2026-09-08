@@ -1,5 +1,14 @@
-//! Time-to-populate-from-zero for the synthetic mirror. Gated; emits
-//! `corpus_size, wall_secs, throughput_rows_per_sec`.
+//! SLO GATE, not a benchmark: time-to-populate-from-zero for the synthetic
+//! mirror carries a 30 s numeric ceiling (asserted twice — as a live deadline
+//! inside the drain loop and again on the total), so a throughput regression
+//! reds it. It emits `corpus_size, wall_secs, throughput_rows_per_sec` as well,
+//! which is why it reads like a harness; it is not one.
+//!
+//! Because it is an SLO it must never be swept into a lane that only builds
+//! `benches/` opportunistically: a lane without `--all-targets` does not build
+//! bench targets at all, so a filter naming it would match nothing and go
+//! green. It needs a named lane with headroom — see the routing note on the
+//! test below.
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
@@ -17,8 +26,14 @@ use raven_railgun_mock_ppoi::{
 use raven_railgun_persistence::WalEntryPayload;
 use raven_railgun_ppoi_mirror::{MirrorConfig, UpstreamPpoiMirror};
 
+/// SLO gate: the 30 s ceiling is a machine-speed assertion, so it belongs in a
+/// lane with headroom (the nightly production-cell profile's 300 s slow-timeout),
+/// never in a per-push lane where runner variance decides the verdict.
 #[tokio::test]
-#[ignore = "bench harness; run via --ignored --release"]
+#[ignore = "SLO gate (not a bench): asserts mirror population from zero stays under 30 s for a 1k \
+            event corpus. A wall-clock ceiling reds on runner speed, so it runs in the nightly \
+            closure lane, not per push. Trigger: changing the upstream mirror sync loop or the \
+            synthetic corpus generator."]
 async fn populate_from_zero_takes_under_30s_for_1k_events() {
     let _ = tracing_subscriber::fmt::try_init();
 

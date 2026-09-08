@@ -154,7 +154,8 @@ fn run_cell(cell: &CellShape) {
 }
 
 #[test]
-#[ignore = "production-cell setup is heavy (~12s per cell x 3 seeds); 16 spend-leaves x 16 siblings sweep"]
+#[ignore = "production-cell setup is heavy (~12s per cell x 3 seeds); 16 spend-leaves x 16 \
+            siblings sweep. Trigger: changing the spend query path or an encoder record layout."]
 fn end_to_end_spend_latency_per_encoder() {
     eprintln!(
         "spend_bench: SPEND_LEAVES={} TREE_DEPTH={} per-spend-queries={}",

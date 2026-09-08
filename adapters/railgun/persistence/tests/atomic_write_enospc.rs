@@ -1,6 +1,8 @@
 //! Write-failure injection for `atomic_write` / `Manifest::save`. True ENOSPC
 //! needs privileges CI lacks, so EACCES on a read-only parent exercises the same
-//! `create_owner_only` -> `PersistenceError::Io` path.
+//! `create_owner_only` -> `PersistenceError::Io` path. ENOSPC-specific errno
+//! surfacing (errno 28) is kernel behaviour with no in-tree subject; the former
+//! `/dev/full` test here self-skipped silently wherever the device was absent.
 
 #![cfg(unix)]
 #![allow(
@@ -67,35 +69,4 @@ fn manifest_save_under_readonly_parent_propagates_typed_io_error() {
     mutated.save(&layout).expect("post-restore save");
     let observed = Manifest::load(&layout).expect("load").expect("present");
     assert_eq!(observed.current_snapshot_seq, 99);
-}
-
-/// ENOSPC propagation via `/dev/full`; catches a swallowed `write_all` error.
-#[test]
-fn dev_full_write_returns_typed_io_error_documenting_enospc_propagation() {
-    use std::io::Write;
-
-    let mut f = match std::fs::OpenOptions::new().write(true).open("/dev/full") {
-        Ok(f) => f,
-        // Some sandboxes (seccomp) deny access to /dev/full; skip gracefully.
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            eprintln!("skipping /dev/full test: {e}");
-            return;
-        }
-        Err(e) => panic!("unexpected /dev/full open error: {e}"),
-    };
-    let err = f
-        .write_all(b"would-be-snapshot-bytes")
-        .expect_err("/dev/full write must Err");
-    // StorageFull stabilized in 1.83; older toolchains surface errno 28 as Other.
-    let raw = err.raw_os_error();
-    let kind = err.kind();
-    let is_storage_full = matches!(raw, Some(28)) || matches!(kind, std::io::ErrorKind::Other);
-    assert!(is_storage_full, "got kind={kind:?}, raw={raw:?}");
-    let typed: PersistenceError = err.into();
-    assert!(matches!(typed, PersistenceError::Io(_)));
 }

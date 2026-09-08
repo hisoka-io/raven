@@ -260,9 +260,11 @@ async fn empty_pois_per_list_post_returns_client_error_not_server_error() {
         .body(Body::empty())
         .expect("build req");
     let resp = router.oneshot(req).await.expect("dispatch");
-    assert!(
-        resp.status().is_client_error(),
-        "empty body POST must return 4xx, not {}",
-        resp.status()
+    // Exactly 400: `is_client_error()` also accepts the 404/405 a deleted or
+    // renamed route would produce, which is the opposite of route coverage.
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "empty body POST must be refused by the handler with 400"
     );
 }

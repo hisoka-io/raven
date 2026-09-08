@@ -220,58 +220,164 @@ async fn multi_instance_chain_indexer_routes_events_to_correct_tree_from_per_tre
     );
 }
 
-/// Skip semantics: a tree with floor=H must NOT receive events at
-/// heights < H.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn multi_instance_chain_indexer_skips_events_below_per_tree_floor() {
-    let src = Arc::new(PerTreeMockSource::new());
-    for n in 0..=20u64 {
-        src.add_block(n, [u8::try_from(n & 0xff).expect("byte"); 32]);
+// Skip/existence semantics (a tree with floor=H receives nothing below H) live
+// in the floor property below, which was proven RED under both a disabled
+// filter and a boundary off-by-one; the routes test above holds the boundary
+// but its fixture feeds trees 1-2 only above-floor events, so it cannot see a
+// disabled filter.
+
+/// One generated event: `tree: None` is an Unshield (no tree number, never
+/// filtered); heights and floors are drawn from the same small range so the
+/// `height == floor` boundary is hit often.
+#[derive(Debug, Clone)]
+struct GenEvent {
+    tree: Option<u32>,
+    height: u64,
+}
+
+/// The filter law over ARBITRARY floor maps and event sets: the worker delivers
+/// exactly the input events minus tree-carrying events whose tree has a floor
+/// above their height, in source order. A sentinel Unshield at a height past
+/// every generated event is delivered unconditionally, so its arrival proves
+/// the scan completed — no sleep is used as synchronization.
+mod floor_property {
+    use super::*;
+    use proptest::prelude::*;
+
+    const MAX_H: u64 = 12;
+    const SENTINEL_H: u64 = MAX_H + 1;
+
+    fn runtime() -> &'static tokio::runtime::Runtime {
+        static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        RT.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("runtime")
+        })
     }
-    src.add_event(5, shield(0, 5, 0));
-    src.add_event(10, shield(0, 10, 1));
-    src.add_event(15, shield(0, 15, 2));
 
-    let (tx, mut rx) = mpsc::channel::<IndexerMessage>(64);
-    let worker = IndexerWorker::new(Arc::clone(&src), tx);
-
-    let mut per_tree_start: BTreeMap<u32, u64> = BTreeMap::new();
-    per_tree_start.insert(0, 12);
-
-    let cfg = IndexerWorkerConfig {
-        start_block: 0,
-        poll_interval_secs: 1,
-        chunk_blocks: 50,
-        per_tree_start_blocks: per_tree_start,
-        ..IndexerWorkerConfig::default()
-    };
-    let join = tokio::spawn(async move { worker.run(cfg).await });
-
-    let mut received_blocks: Vec<u64> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        if tokio::time::Instant::now() >= deadline || !received_blocks.is_empty() {
-            break;
+    async fn run_case(
+        floors: BTreeMap<u32, u64>,
+        events: Vec<GenEvent>,
+    ) -> Vec<(Option<u32>, u64)> {
+        let src = Arc::new(PerTreeMockSource::new());
+        for n in 0..=SENTINEL_H {
+            src.add_block(n, [u8::try_from(n & 0xff).expect("byte"); 32]);
         }
-        match tokio::time::timeout(Duration::from_millis(1500), rx.recv()).await {
-            Ok(Some(IndexerMessage::Event { event, .. })) => {
-                if let RailgunEvent::Shield { block_number, .. } = event {
-                    received_blocks.push(block_number);
+        for (i, ev) in events.iter().enumerate() {
+            match ev.tree {
+                Some(t) => src.add_event(
+                    ev.height,
+                    shield(t, ev.height, u32::try_from(i).expect("u32")),
+                ),
+                None => src.add_event(ev.height, unshield(ev.height)),
+            }
+        }
+        src.add_event(SENTINEL_H, unshield(SENTINEL_H));
+
+        let (tx, mut rx) = mpsc::channel::<IndexerMessage>(256);
+        let worker = IndexerWorker::new(Arc::clone(&src), tx);
+        let cfg = IndexerWorkerConfig {
+            start_block: 0,
+            poll_interval_secs: 1,
+            chunk_blocks: 50,
+            per_tree_start_blocks: floors,
+            ..IndexerWorkerConfig::default()
+        };
+        let join = tokio::spawn(async move { worker.run(cfg).await });
+
+        let mut received: Vec<(Option<u32>, u64)> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        'collect: loop {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            match tokio::time::timeout(Duration::from_millis(1500), rx.recv()).await {
+                Ok(Some(IndexerMessage::Event { event, .. })) => {
+                    let pair = match event {
+                        RailgunEvent::Shield {
+                            tree_number,
+                            block_number,
+                            ..
+                        } => (Some(tree_number), block_number),
+                        RailgunEvent::Unshield { block_number, .. } => (None, block_number),
+                        _ => continue,
+                    };
+                    if pair == (None, SENTINEL_H) {
+                        break 'collect;
+                    }
+                    received.push(pair);
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), join).await;
+        received
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        #[test]
+        fn per_tree_floor_filter_delivers_exactly_the_at_or_above_floor_events(
+            floors in proptest::collection::btree_map(0u32..4, 0u64..MAX_H, 0..4),
+            // Heights start at 1: the worker's first span is (start_block..],
+            // so with start_block = 0 a height-0 event is out of window by design.
+            events in proptest::collection::vec(
+                (proptest::option::of(0u32..4), 1u64..MAX_H)
+                    .prop_map(|(tree, height)| GenEvent { tree, height }),
+                0..12,
+            ),
+        ) {
+            // Force the boundary class for every mapped tree: an off-by-one in
+            // the floor comparison survived a purely random draw once, so
+            // floor-1 / floor / floor+1 events are injected deterministically.
+            let mut events = events;
+            for (t, f) in &floors {
+                for h in [f.saturating_sub(1), *f, f.saturating_add(1)] {
+                    if (1..=MAX_H).contains(&h) {
+                        events.push(GenEvent {
+                            tree: Some(*t),
+                            height: h,
+                        });
+                    }
                 }
             }
-            Ok(Some(_)) => continue,
-            Ok(None) => break,
-            Err(_) => continue,
+
+            // Independent statement of the law, per-event; source order is
+            // height-major then insertion order, matching the mock's BTreeMap.
+            let mut expected: Vec<(Option<u32>, u64)> = Vec::new();
+            let mut by_height: BTreeMap<u64, Vec<(usize, &GenEvent)>> = BTreeMap::new();
+            for (i, ev) in events.iter().enumerate() {
+                by_height.entry(ev.height).or_default().push((i, ev));
+            }
+            for evs in by_height.values() {
+                for (_, ev) in evs {
+                    let keep = match ev.tree {
+                        None => true,
+                        Some(t) => floors.get(&t).is_none_or(|f| ev.height >= *f),
+                    };
+                    if keep {
+                        expected.push((ev.tree, ev.height));
+                    }
+                }
+            }
+
+            let received = runtime().block_on(run_case(floors.clone(), events.clone()));
+            prop_assert_eq!(
+                received,
+                expected,
+                "floors={:?} events={:?}",
+                floors,
+                events
+            );
         }
     }
-    drop(rx);
-    let _ = tokio::time::timeout(Duration::from_secs(2), join).await;
-
-    assert_eq!(
-        received_blocks,
-        vec![15],
-        "only block-15 event must clear floor=12; got {received_blocks:?}"
-    );
 }
 
 /// Trees NOT in the map (e.g. tree=3 with a per_tree_start_blocks map

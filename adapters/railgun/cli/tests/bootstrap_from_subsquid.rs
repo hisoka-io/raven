@@ -23,7 +23,6 @@ use raven_railgun_cli::bootstrap_subsquid::{
 };
 use raven_railgun_engine::imt::Imt;
 use raven_railgun_engine::pir_table::EncoderKind;
-use std::sync::Arc;
 
 /// Covers live byte-identity, static membership, and the pruning branch.
 struct StubChain {
@@ -1147,114 +1146,163 @@ async fn boundary_repair_post_fix_chain_oracle_byte_identity_passes_all_three_fi
     assert!(carry.is_empty(), "no residue after final tree drains carry");
 }
 
-/// 3-seed wall-clock micro-bench at the production cell; run with `--ignored --release`.
+/// Bootstrap at the locked production cell (65,536 x 512 B) must recover the
+/// exact root the chain recorded, not merely finish.
+///
+/// Formerly three "seeds" that asserted nothing. The three runs shared one
+/// `synthetic_leaves(64)` corpus and one `StubChain` and differed only in their
+/// `data_dir` name, so they were the same bootstrap three times — three full
+/// production-cell bootstraps per push, buying nothing. One run, asserted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "bench, not a test: reports wall time and asserts no behaviour. Trigger: run with \
-            --ignored --release when changing the bootstrap path's cost. Belongs in benches/ \
-            (W6); it is here because cli has no bench target."]
+#[ignore = "one full bootstrap at the 65,536 x 512 B production cell. Trigger: changing the \
+            bootstrap path or the closing-root comparison at production parameters."]
 async fn bootstrap_three_seed_production_cell_bench() {
     let (rows, root) = synthetic_leaves(64);
     let chain = StubChain::new(20_000_000, 99);
     chain.record_root(0, root);
-    let mut walls = Vec::with_capacity(3);
-    for seed in 0..3 {
-        let cfg = BootstrapTreeConfig {
-            tree_number: 0,
-            checkpoint_depth: 64,
-            data_dir: fresh_data_dir(&format!("bench-prod-cell-seed-{seed}")),
-            instance_id: format!("commit-tree-bench-{seed}"),
-            entries: 65_536,
-            entry_bytes: 512,
-            max_wall_mins: 30,
-            ..BootstrapTreeConfig::default()
-        };
-        let leaves = StubLeaves::new(rows.clone());
-        let report = bootstrap_one_tree(&cfg, &leaves, &chain)
-            .await
-            .expect("bench ok");
-        walls.push(report.wall_clock_secs);
-        eprintln!(
-            "seed={seed} tree={} leaves={} wall={:.3}s",
-            report.tree_number, report.leaves, report.wall_clock_secs
-        );
-    }
-    walls.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let cfg = BootstrapTreeConfig {
+        tree_number: 0,
+        checkpoint_depth: 64,
+        data_dir: fresh_data_dir("prod-cell-bootstrap"),
+        instance_id: "commit-tree-prod-cell".to_owned(),
+        entries: 65_536,
+        entry_bytes: 512,
+        max_wall_mins: 30,
+        ..BootstrapTreeConfig::default()
+    };
+    let leaves = StubLeaves::new(rows.clone());
+    let report = bootstrap_one_tree(&cfg, &leaves, &chain)
+        .await
+        .expect("production-cell bootstrap");
+
+    assert_eq!(report.tree_number, 0);
+    assert_eq!(
+        report.leaves,
+        rows.len(),
+        "every fed leaf must land in the tree"
+    );
+    assert_eq!(
+        report.local_root, root,
+        "the rebuilt root must be byte-identical to the one the chain recorded"
+    );
+    assert_eq!(
+        report.chain_static_membership,
+        Some(true),
+        "the closing root must be one rootHistory holds"
+    );
     eprintln!(
-        "3-seed wall-clock at production cell (65536 x 512 B): min={:.3}s median={:.3}s max={:.3}s",
-        walls[0], walls[1], walls[2]
+        "production cell (65536 x 512 B): leaves={} wall={:.3}s",
+        report.leaves, report.wall_clock_secs
     );
 }
 
-/// 3-seed wall-clock micro-bench for the boundary-repair path on synthetic 8-leaf cells.
+/// The three boundary-repair arms on a synthetic 8-leaf cell, each asserted on
+/// its OUTCOME rather than its wall time:
+///
+/// - tree 0, a stowaway at `treePosition` 65,536: dropped into the carry, the
+///   eight real leaves recover and the closing root is one the chain holds.
+/// - tree 1, a FRONT gap (leaf 0 withheld from the feed): gap-walked and
+///   chain-backfilled, so the tree still closes at eight leaves.
+/// - tree 2, a TAIL gap (leaf 7 withheld): `repair_boundary_if_needed`
+///   deliberately does NOT backfill past `max_observed_position` — a batch
+///   never spans two trees, so a position beyond the last observed one means
+///   the tree closed early rather than that a row was lost
+///   (`bootstrap_subsquid.rs`, the tail-gap branch). The tree is therefore
+///   short one leaf, and the closing-root comparison must REFUSE it loudly.
+///   That refusal is the whole point: it is what stops a tail-truncated feed
+///   from publishing a seven-leaf tree as if it were the closed eight-leaf one.
+///
+/// Formerly a `_bench` that ran three identical "seeds" per tree and asserted
+/// nothing. `synthetic_leaves_at_block` takes no seed, so the three runs were
+/// the same computation three times; one run per arm carries the same coverage
+/// at a third of the wall time. The name is retained only so the cli-ignored
+/// lane's subtraction term at ci.yml keeps resolving until that term is
+/// removed — it now asserts and passes, so the subtraction should die.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "bench, not a test: reports per-tree wall time and asserts no behaviour. Trigger: run \
-            with --ignored when changing boundary repair. Also named in ci.yml:324's subtraction \
-            list, so it runs in no lane at all."]
+#[ignore = "~26 s: three full bootstraps over a synthetic 8-leaf cell. Trigger: changing boundary \
+            repair, the tail-gap policy, or the closing-root comparison."]
 async fn boundary_repair_three_seed_per_tree_bench() {
-    let mut by_tree: Vec<(u32, [f64; 3])> = Vec::new();
     for tree_number in 0u32..3 {
-        let mut walls: Vec<f64> = Vec::with_capacity(3);
-        for seed in 0..3 {
-            let (full_rows, root) = synthetic_leaves_at_block(8, 21_332_254);
-            let mut sparse: Vec<CommitmentRow>;
-            let chain = StubChain::new(20_000_000, 99);
-            chain.record_root(tree_number, root);
-            match tree_number {
-                0 => {
-                    let mut rows = full_rows.clone();
-                    let mut stowaway = [0u8; 32];
-                    stowaway[31] = 0xff;
-                    rows.push(CommitmentRow {
-                        tree_position: 65_536,
-                        leaf: stowaway,
-                        block_number: 21_332_254,
-                    });
-                    sparse = rows;
-                }
-                1 => {
-                    let pos0 = full_rows[0].leaf;
-                    sparse = full_rows.iter().skip(1).cloned().collect();
-                    chain.add_chain_event(21_332_254, 1, 0, pos0);
-                }
-                _ => {
-                    let last_idx = full_rows.len() - 1;
-                    let last_leaf = full_rows[last_idx].leaf;
-                    let last_pos = u32::try_from(last_idx).expect("u32");
-                    sparse = full_rows[..last_idx].to_vec();
-                    chain.add_chain_event(21_332_254, tree_number, last_pos, last_leaf);
-                }
+        let (full_rows, root) = synthetic_leaves_at_block(8, 21_332_254);
+        let mut sparse: Vec<CommitmentRow>;
+        let chain = StubChain::new(20_000_000, 99);
+        chain.record_root(tree_number, root);
+        match tree_number {
+            0 => {
+                let mut rows = full_rows.clone();
+                let mut stowaway = [0u8; 32];
+                stowaway[31] = 0xff;
+                rows.push(CommitmentRow {
+                    tree_position: 65_536,
+                    leaf: stowaway,
+                    block_number: 21_332_254,
+                });
+                sparse = rows;
             }
-            sparse.sort_by_key(|r| r.tree_position);
-            let cfg = cfg_for_boundary(
-                tree_number,
-                fresh_data_dir(&format!("bench-boundary-tree{tree_number}-seed{seed}")),
-            );
-            let leaves = StubLeaves::new(sparse);
-            let report = bootstrap_one_tree(&cfg, &leaves, &chain)
-                .await
-                .expect("boundary-repair bench ok");
-            walls.push(report.wall_clock_secs);
-            eprintln!(
-                "tree={tree_number} seed={seed} wall={:.6}s",
-                report.wall_clock_secs
-            );
+            1 => {
+                let pos0 = full_rows[0].leaf;
+                sparse = full_rows.iter().skip(1).cloned().collect();
+                chain.add_chain_event(21_332_254, 1, 0, pos0);
+            }
+            _ => {
+                let last_idx = full_rows.len() - 1;
+                let last_leaf = full_rows[last_idx].leaf;
+                let last_pos = u32::try_from(last_idx).expect("u32");
+                sparse = full_rows[..last_idx].to_vec();
+                chain.add_chain_event(21_332_254, tree_number, last_pos, last_leaf);
+            }
         }
-        walls.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let sorted: [f64; 3] = [walls[0], walls[1], walls[2]];
-        by_tree.push((tree_number, sorted));
-    }
-    for (t, w) in by_tree {
-        eprintln!(
-            "boundary-repair 3-seed per-tree (synthetic 8-leaf cell): tree={t} \
-             min={:.6}s median={:.6}s max={:.6}s",
-            w[0], w[1], w[2]
+        sparse.sort_by_key(|r| r.tree_position);
+        let cfg = cfg_for_boundary(
+            tree_number,
+            fresh_data_dir(&format!("boundary-arm-tree{tree_number}")),
         );
+        let leaves = StubLeaves::new(sparse);
+        let outcome = bootstrap_one_tree(&cfg, &leaves, &chain).await;
+
+        if tree_number == 2 {
+            let err = outcome.expect_err(
+                "a tail-truncated closed tree must be REFUSED: boundary repair does not backfill \
+                 past the last observed position, so the tree is short its final leaf",
+            );
+            match err {
+                BootstrapError::OracleByteIdentityMismatch {
+                    kind,
+                    tree_number: t,
+                    first_match_index,
+                    ..
+                } => {
+                    assert!(matches!(kind, OracleKind::ChainStaticTree), "got {kind:?}");
+                    assert_eq!(t, 2);
+                    // Seven leaves recovered; the refusal names the missing eighth.
+                    assert_eq!(
+                        first_match_index, 7,
+                        "the refusal must name the leaf count it got to"
+                    );
+                }
+                other => panic!("expected a closing-root refusal, got {other:?}"),
+            }
+            continue;
+        }
+
+        let report = outcome.expect("boundary repair must recover a stowaway and a front gap");
+        assert_eq!(
+            report.leaves, 8,
+            "tree {tree_number} must close at all eight leaves after repair"
+        );
+        assert_eq!(
+            report.local_root, root,
+            "tree {tree_number} must rebuild the SAME root the chain recorded, not merely some \
+             root of the right shape"
+        );
+        assert_eq!(
+            report.chain_static_membership,
+            Some(true),
+            "tree {tree_number} closing root must be one rootHistory holds"
+        );
+        assert_eq!(report.tree_number, tree_number);
     }
 }
-
-// keeps the Arc import live when the #[ignore]-gated benches don't use it
-#[allow(dead_code)]
-fn _arc_keep<T>(_x: Arc<T>) {}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_with_encoder_per_node_writes_correct_manifest_label() {

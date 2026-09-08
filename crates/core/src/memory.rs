@@ -232,27 +232,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn mid_txn_snapshot_excludes_uncommitted() -> Result<(), Error> {
-        let store = MemoryStore::new();
-        commit(&store, &[(1, b"alpha")])?;
-
-        let mut txn = store.begin()?;
-        txn.insert(2, b(b"beta"))?;
-        txn.insert(3, b(b"gamma"))?;
-
-        let snap_mid = store.snapshot()?;
-        assert_eq!(snap_mid.len(), 1);
-        assert!(snap_mid.get(2)?.is_none());
-        assert!(snap_mid.get(3)?.is_none());
-
-        txn.commit()?;
-
-        let snap_post = store.snapshot()?;
-        assert_eq!(snap_post.len(), 3);
-        assert!(snap_post.generation() > snap_mid.generation());
-        Ok(())
-    }
+    // A `mid_txn_snapshot_excludes_uncommitted` example stood here; the property version in
+    // tests/storage_invariants.rs (`mid_txn_snapshot_excludes_pending_writes`) covers the same
+    // isolation claim over generated key/value sets, strictly wider than this one fixed pair.
 
     #[test]
     fn get_handles_reverse_insertion_order() -> Result<(), Error> {

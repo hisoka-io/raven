@@ -106,7 +106,9 @@ fn bootstrap_engine_rejects_two_instances_with_identical_data_source_AND_encoder
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "stands up 2 InsPIRe instances; heavy"]
+#[ignore = "stands up 2 InsPIRe instances, ~7 s of setup each. Trigger: changing the bootstrap \
+            dedup key over (DataSourceFilter, encoder_label). CI runs it in the durability + \
+            closure engine-ignored lane."]
 async fn bootstrap_railgun_engine_multi_routes_two_ppoi_instances_with_same_list_key_different_encoder_kinds(
 ) {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -144,44 +146,51 @@ async fn bootstrap_railgun_engine_multi_routes_two_ppoi_instances_with_same_list
     let _ = mh;
 }
 
-/// One list key with two route entries must reach both consumers.
+/// One list key with two route entries must reach both consumers. Drives the REAL
+/// router fan-out (`bootstrap_railgun_engine_multi`'s mirror channel), not a local
+/// restatement of it: the production comment warns that `.find()` would drop events
+/// past the first match, and only the real path can prove that warning is enforced.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ppoi_route_dispatch_does_not_collide_for_status_and_paths_on_same_list_key() {
+    let tmp = tempfile::tempdir().expect("tempdir");
     let lk = ofac_list_key();
+    let cfgs = vec![cfg(
+        "ppoi-fanout-host",
+        "host",
+        tmp.path(),
+        EncoderKind::PerListStatus { list_key: lk },
+        DataSourceFilter::PpoiList(lk),
+    )];
+    let params = InspireParams::secure_128_d2048();
+    let mut handle =
+        bootstrap_railgun_engine_multi(cfgs, params, |_c: &InstanceConfig| build_toy_state())
+            .expect("bootstrap");
+
     let (tx_status, mut rx_status) = mpsc::channel::<ConsumerEvent>(8);
     let (tx_paths, mut rx_paths) = mpsc::channel::<ConsumerEvent>(8);
-    let routes_vec: Vec<([u8; 32], mpsc::Sender<ConsumerEvent>)> =
-        vec![(lk, tx_status), (lk, tx_paths)];
-    let routes = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(routes_vec));
+    handle
+        .ppoi_list_routes
+        .store(std::sync::Arc::new(vec![(lk, tx_status), (lk, tx_paths)]));
 
     let payload = WalEntryPayload::PpoiStatus {
         list_key: lk,
         blinded_commitment: [7u8; 32],
         status: 1,
     };
+    handle
+        .channels
+        .mirror_tx
+        .send((payload.clone(), 100))
+        .await
+        .expect("router mirror inbound open");
 
-    // Mirrors the production fan-out: every sender matching `lk` gets a clone.
-    let loaded = routes.load();
-    let matched: Vec<_> = loaded
-        .iter()
-        .filter(|(k, _)| *k == lk)
-        .map(|(_, s)| s.clone())
-        .collect();
-    assert_eq!(matched.len(), 2, "both entries must match");
-    for sender in matched {
-        sender
-            .send(ConsumerEvent::Ppoi(payload.clone(), 100))
-            .await
-            .expect("send to consumer");
-    }
-
-    let got_status = tokio::time::timeout(Duration::from_millis(500), rx_status.recv())
+    let got_status = tokio::time::timeout(Duration::from_secs(2), rx_status.recv())
         .await
         .expect("status consumer timed out")
         .expect("status channel closed");
-    let got_paths = tokio::time::timeout(Duration::from_millis(500), rx_paths.recv())
+    let got_paths = tokio::time::timeout(Duration::from_secs(2), rx_paths.recv())
         .await
-        .expect("paths consumer timed out")
+        .expect("second route bound to the same list_key never received the payload")
         .expect("paths channel closed");
     match (got_status, got_paths) {
         (ConsumerEvent::Ppoi(p1, h1), ConsumerEvent::Ppoi(p2, h2)) => {
@@ -192,4 +201,11 @@ async fn ppoi_route_dispatch_does_not_collide_for_status_and_paths_on_same_list_
         }
         other => panic!("expected Ppoi events on both consumers, got {other:?}"),
     }
+
+    drop(handle.channels);
+    for h in handle.instances.drain(..) {
+        let _ = h.sender.send(ConsumerEvent::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), h.consumer).await;
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle.router).await;
 }

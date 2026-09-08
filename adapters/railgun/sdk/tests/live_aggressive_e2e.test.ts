@@ -638,6 +638,8 @@ liveDescribe("aggressive E2E (PPOI architecture probe)", () => {
           });
         }
         emitFindings();
+        // Without this the probe records its own failure and still reports green.
+        expect(ppoiRows[ppoiRows.length - 1].passed).toBe(1);
       },
       TEST_TIMEOUT_MS,
     );
@@ -710,6 +712,10 @@ liveDescribe("aggressive E2E (fuzz)", () => {
         }
         fuzzRows.push(row);
         emitFindings();
+        // Same floor as the per-tree block: the live tree's leaf cap is a conservative
+        // under-estimate, so some sampled indices are legitimately unwritten - but a run
+        // where NOTHING folded to an on-chain root is a failure, not a findings row.
+        expect(row.passed).toBeGreaterThan(0);
       },
       TEST_TIMEOUT_MS,
     );
@@ -786,6 +792,9 @@ liveDescribe("aggressive E2E (throughput)", () => {
             errors: totalErrors,
             paramsFetchMs: bundle.fetchMs,
           });
+          // Latency percentiles over a sweep where every query threw are meaningless, and
+          // the row alone reports them as if they were timings.
+          expect(totalErrors).toBeLessThan(THROUGHPUT_SAMPLE * THROUGHPUT_SEEDS);
         }
         // A full Merkle proof is 16 sibling PIR queries via /batch.
         const rng = makeRng(0xbeef + treeNumber);
@@ -806,6 +815,7 @@ liveDescribe("aggressive E2E (throughput)", () => {
           `body=${batchRes.bodyBytes}B response=${batchRes.responseBytes}B`;
         headlineNotes.push(note);
         emitFindings();
+        expect(batchRes.responseBytes).toBeGreaterThan(0);
       },
       TEST_TIMEOUT_MS,
     );

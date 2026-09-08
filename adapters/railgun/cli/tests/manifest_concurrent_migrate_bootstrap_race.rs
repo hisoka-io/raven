@@ -14,7 +14,7 @@ use std::thread;
 use std::time::Duration;
 
 use raven_railgun_engine::pir_table::EncoderKind;
-use raven_railgun_persistence::{Manifest, StoreLayout};
+use raven_railgun_persistence::StoreLayout;
 
 #[test]
 fn migrate_encoder_and_bootstrap_lock_serialize_one_winner_per_round() {
@@ -73,14 +73,35 @@ fn migrate_encoder_and_bootstrap_lock_serialize_one_winner_per_round() {
             .unwrap_or_else(|e| panic!("post-round {round} reacquire failed: {e:?}"));
     }
 
+    // Contention ratios are flaky across CI hardware, so these are captured for the
+    // failure message and not asserted. The sum that used to be asserted here could
+    // not fail: the migrate thread either increments one of the two counters or
+    // panics, and the panic fails join().expect above first. Mutation-proved -
+    // deleting the 20 ms hold above removes the contention window entirely and the
+    // old assertion stayed green (0.466 s -> 0.013 s).
     let mig_lock = migration_lock_errors.load(Ordering::SeqCst);
     let mig_manifest = migration_other_errors.load(Ordering::SeqCst);
-    // contention ratios are flaky across CI hardware; captured, not asserted
-    let _ = bootstrap_lock_errors.load(Ordering::SeqCst);
-    assert_eq!(
-        mig_lock + mig_manifest,
-        ROUNDS,
-        "every round must produce exactly one migrate-side outcome"
+    let boot_lock = bootstrap_lock_errors.load(Ordering::SeqCst);
+
+    // The racing rounds cannot promise WHICH side wins, so none of them observes
+    // exclusion. This round forces it: the lock is held here across the migration,
+    // so a migration that is refused for any reason OTHER than the lock proves the
+    // flock stopped serializing.
+    let (_held_layout, held) =
+        StoreLayout::open_with_lock(&path).expect("hold for the forced round");
+    let forced =
+        raven_railgun_cli::migrate_encoder::run(&path, EncoderKind::PerLeafBc { tree_number: 0 });
+    drop(held);
+    let forced_msg = format!(
+        "{:#}",
+        forced.expect_err("migration against a held data_dir lock must error")
+    )
+    .to_lowercase();
+    assert!(
+        forced_msg.contains("lock"),
+        "a migration started while the data_dir lock is held must fail ON THE LOCK, not on the \
+         missing manifest it would reach past an unheld one; got {forced_msg:?} \
+         (racing rounds: {mig_lock} lock / {mig_manifest} manifest / {boot_lock} bootstrap-lock)"
     );
 }
 
@@ -99,7 +120,14 @@ fn fan_out_migrate_and_bootstrap_against_same_data_dir_yield_no_corruption() {
                 &path,
                 EncoderKind::PerLeafBc { tree_number: 0 },
             );
-            let _ = r.expect_err("fresh dir + migration must error");
+            let msg =
+                format!("{:#}", r.expect_err("fresh dir + migration must error")).to_lowercase();
+            // Same two-outcome classification test 1 makes; discarding the error here
+            // let any new failure mode pass as "it errored, good".
+            assert!(
+                msg.contains("lock") || msg.contains("manifest"),
+                "fan-out migrate must fail on the lock or the missing manifest; got {msg:?}"
+            );
         }));
     }
     for _ in 0..N_BOOTSTRAP {
@@ -120,14 +148,10 @@ fn fan_out_migrate_and_bootstrap_against_same_data_dir_yield_no_corruption() {
         h.join().expect("worker joined");
     }
 
-    let (layout, _lock) = StoreLayout::open_with_lock(&path)
+    let (_layout, _lock) = StoreLayout::open_with_lock(&path)
         .expect("post-fan-out reacquire must succeed; lock leak otherwise");
-    // Atomic-rename contract: any manifest present is well-formed bincode.
-    if let Some(m) = Manifest::load(&layout).expect("manifest load may succeed or be None") {
-        assert_eq!(
-            m.schema_version,
-            raven_railgun_persistence::MANIFEST_SCHEMA_VERSION,
-            "post-fan-out manifest must carry the current schema version"
-        );
-    }
+    // A schema_version check used to sit here. It was unreachable: migrate_encoder::run
+    // bails before writing anything and open_with_lock writes no manifest, so on a fresh
+    // tempdir Manifest::load is always None. Mutation-proved - a panic! planted inside
+    // that branch never fired.
 }

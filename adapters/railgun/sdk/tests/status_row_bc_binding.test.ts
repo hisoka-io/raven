@@ -5,6 +5,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { RavenError, RavenPOINodeInterface, hexToBytes } from "../src/index";
+import { makeRegisterSpy } from "./helpers/register_spy";
 import type { ClientPirContext, POIStatus, RavenInspireWasm } from "../src/index";
 
 import { startMockServer, type MockServer } from "./helpers/mock_server";
@@ -33,7 +34,7 @@ function passthroughWasm(): RavenInspireWasm {
     // Test routes encode the intended plaintext row into the response body directly.
     extract_response: (_session, _crs, _state, response, _entry) => new Uint8Array(response),
     build_instance_params_blob: () => new Uint8Array(0),
-    register_client_session: () => {},
+    register_client_session: makeRegisterSpy(),
     path_indices_for_leaf: () => new Uint32Array(16),
     path_indices_for_per_list_leaf: () => new Uint32Array(16),
   };
@@ -145,6 +146,18 @@ describe("T1 status verdict is bound to the requested blinded commitment", () =>
       mountStatusRoute(server, statusRow(statusByte, BC_AT_IDX_0, STATUS_ROW_BYTES));
       const got = await askStatus(sdkFor(server));
       expect(got[BC_AT_IDX_0][LIST_KEY_HEX]).toBe(expected[statusByte]);
+      server.reset();
+    }
+  });
+
+  // The consequence of the unknown-byte downgrade, at the level a wallet sees it: a row whose
+  // BC tail binds correctly but whose status byte the SDK does not know is answered as though
+  // the record were absent, and nothing in the result says the byte was unrecognised.
+  it("answers an unrecognised status byte as Missing rather than refusing the row", async () => {
+    for (const statusByte of [4, 99, 255]) {
+      mountStatusRoute(server, statusRow(statusByte, BC_AT_IDX_0, STATUS_ROW_BYTES));
+      const got = await askStatus(sdkFor(server));
+      expect(got[BC_AT_IDX_0][LIST_KEY_HEX], `byte ${statusByte}`).toBe("Missing");
       server.reset();
     }
   });

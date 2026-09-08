@@ -1,6 +1,8 @@
-//! Persistence-layer chaos: mid-commit kill isolation, partial snapshot dir on
-//! disk-full, block-height bounding under a feed stall, encoder-label
-//! round-trip, and reorg replay ordering.
+//! Persistence-layer chaos: a partial snapshot dir left by disk-full must not
+//! corrupt recovery. (The former two-instance "kill isolation" test proved
+//! nothing: its instances were two unconnected tempdirs — removed with a
+//! survived-mutation proof; Manifest::load-when-missing and save/load
+//! round-trips live in crates/storage/src/manifest.rs unit tests.)
 
 #![allow(
     clippy::expect_used,
@@ -11,24 +13,11 @@
 )]
 
 use raven_railgun_persistence::{
-    Manifest, PersistenceError, Snapshot, SnapshotId, StoreLayout, Wal, WalEntryPayload,
-    MANIFEST_SCHEMA_VERSION, SNAPSHOT_MAGIC,
+    Manifest, PersistenceError, Snapshot, SnapshotId, StoreLayout, MANIFEST_SCHEMA_VERSION,
+    SNAPSHOT_MAGIC,
 };
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
-
-fn append_leaf(tree: u32, idx: u32, height: u64) -> (WalEntryPayload, u64) {
-    let mut commitment = [0u8; 32];
-    commitment[31] = u8::try_from(idx % 250).unwrap_or(0).saturating_add(1);
-    (
-        WalEntryPayload::AppendLeaf {
-            tree_number: tree,
-            leaf_index: idx,
-            commitment,
-        },
-        height,
-    )
-}
 
 fn manifest_for(instance: &str, encoder_label: &str) -> Manifest {
     Manifest {
@@ -41,48 +30,6 @@ fn manifest_for(instance: &str, encoder_label: &str) -> Manifest {
         encoder_label: encoder_label.to_owned(),
         prev_encoder_label: None,
     }
-}
-
-#[test]
-fn kill_one_instance_mid_commit_does_not_affect_others() {
-    let dir_a = tempfile::tempdir().expect("tempdir A");
-    let dir_b = tempfile::tempdir().expect("tempdir B");
-    let layout_a = StoreLayout::open(dir_a.path()).expect("layout A");
-    let layout_b = StoreLayout::open(dir_b.path()).expect("layout B");
-
-    {
-        let wal_a = Wal::open(&layout_a, None).expect("wal A");
-        let wal_b = Wal::open(&layout_b, None).expect("wal B");
-        for i in 0..5u32 {
-            let (payload, h) = append_leaf(0, i, 100 + u64::from(i));
-            wal_a.append(&payload, h).expect("A append");
-            wal_b.append(&payload, h).expect("B append");
-        }
-        let snap_a = Snapshot::build(b"instance-A pre-kill state".to_vec(), SNAPSHOT_MAGIC);
-        snap_a.save(&layout_a, SnapshotId(1)).expect("A snap.save");
-        let snap_b = Snapshot::build(b"instance-B steady state".to_vec(), SNAPSHOT_MAGIC);
-        snap_b.save(&layout_b, SnapshotId(1)).expect("B snap.save");
-        let manifest_b = manifest_for("instance-b", "per-leaf-bc");
-        manifest_b.save(&layout_b).expect("B manifest.save");
-        // Instance A dropped here, simulating a kill before manifest.save.
-    }
-
-    let layout_b2 = StoreLayout::open(dir_b.path()).expect("layout B reopen");
-    let manifest_b2 = Manifest::load(&layout_b2)
-        .expect("B manifest load")
-        .expect("B manifest present");
-    assert_eq!(manifest_b2.current_snapshot_id, SnapshotId(1));
-    let snap_b2 = Snapshot::load(&layout_b2, SnapshotId(1), SNAPSHOT_MAGIC).expect("B snap reload");
-    assert_eq!(snap_b2.data, b"instance-B steady state");
-    let wal_b2 = Wal::open(&layout_b2, None).expect("B wal reopen");
-    let replay_b = wal_b2.replay().expect("B replay");
-    assert_eq!(replay_b.entries.len(), 5);
-    assert!(replay_b.truncated_at.is_none());
-
-    let layout_a2 = StoreLayout::open(dir_a.path()).expect("layout A reopen");
-    let manifest_a2 = Manifest::load(&layout_a2).expect("A manifest load");
-    // A's manifest never landed; persistence sees a fresh-bootstrap state.
-    assert!(manifest_a2.is_none());
 }
 
 #[test]

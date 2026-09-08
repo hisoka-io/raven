@@ -1,16 +1,22 @@
-//! Runtime twin of the cell-width law: the boot-path gate, not the test-only predicate.
+//! The boot-path cell-width gate: the legal-width ladder, the rejection messages an
+//! operator reads, and the empirical sweep that shows the ladder is the real one.
 //!
-//! The ladder re-asserted below is the one measured in `pir_cell_width_law.rs`. Both
-//! suites pin the same table, so a change to either predicate breaks one of them.
+//! `EncoderKind` width parity moved to `encoder_label_audit.rs` as a property over every
+//! variant; the two examples that lived here tested one requested width, 512.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use raven_inspire::params::InspireParams;
+use raven_inspire::params::{InspireParams, InspireVariant};
+use raven_railgun_engine::inspire::{
+    build_client_session, build_seeded_query, extract_response, register_client_session,
+    setup_state,
+};
 use raven_railgun_engine::pir_table::{
     is_legal_cell_width, next_legal_cell_width, pir_cell_columns, validate_cell_shape,
     validate_cell_width, validate_rows_per_shard, EncoderKind, LEAVES_PER_TREE, NODE_HASH_BYTES,
     PATH_RECORD_BYTES, PER_NODE_TOTAL_NODES,
 };
+use raven_railgun_engine::PirScheme;
 
 const LEGAL_WIDTHS: [usize; 7] = [32, 64, 128, 256, 512, 1024, 2048];
 const ILLEGAL_WIDTHS: [usize; 5] = [328, 640, 4096, 8192, 32768];
@@ -111,55 +117,6 @@ fn next_legal_width_rounds_onto_the_ladder_not_onto_the_predicate() {
 }
 
 #[test]
-fn effective_record_size_predicts_what_build_returns() {
-    let requested = 512usize;
-    for kind in [
-        EncoderKind::PerLeafBc { tree_number: 0 },
-        EncoderKind::PerLeafPath { tree_number: 0 },
-        EncoderKind::PerNode { tree_number: 0 },
-        EncoderKind::PerListStatus { list_key: [0; 32] },
-        EncoderKind::PerListPath { list_key: [0; 32] },
-        EncoderKind::PerListNode { list_key: [0; 32] },
-    ] {
-        let built = kind.build(requested, 2048).expect("build").record_size();
-        assert_eq!(
-            kind.effective_record_size(requested),
-            built,
-            "encoder {} must be able to report the width it will actually use before build",
-            kind.label()
-        );
-    }
-}
-
-#[test]
-fn fixed_layout_variants_report_their_canonical_width() {
-    assert_eq!(
-        EncoderKind::PerLeafBc { tree_number: 0 }.fixed_record_size(),
-        None
-    );
-    assert_eq!(
-        EncoderKind::PerListStatus { list_key: [0; 32] }.fixed_record_size(),
-        None
-    );
-    assert_eq!(
-        EncoderKind::PerLeafPath { tree_number: 0 }.fixed_record_size(),
-        Some(PATH_RECORD_BYTES)
-    );
-    assert_eq!(
-        EncoderKind::PerListPath { list_key: [0; 32] }.fixed_record_size(),
-        Some(PATH_RECORD_BYTES)
-    );
-    assert_eq!(
-        EncoderKind::PerNode { tree_number: 0 }.fixed_record_size(),
-        Some(NODE_HASH_BYTES)
-    );
-    assert_eq!(
-        EncoderKind::PerListNode { list_key: [0; 32] }.fixed_record_size(),
-        Some(NODE_HASH_BYTES)
-    );
-}
-
-#[test]
 fn per_node_rejects_a_record_size_its_layout_will_not_honor() {
     let ring_dim = ring_dim();
     let kind = EncoderKind::PerNode { tree_number: 0 };
@@ -244,4 +201,97 @@ fn cell_shape_still_enforces_the_total_entries_floor() {
         .expect_err("an undersized per-node cell must still be rejected")
         .to_string();
     assert!(err.contains("131071"), "must cite the entry floor: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// The empirical ladder, moved here from pir_cell_width_law.rs so the width
+// table has ONE home. The InspiRING generator `2n / gamma + 1` divides
+// integrally, so an off-law gamma picks the wrong automorphism and decrypts to
+// unrelated bytes; setup refuses an off-law width up front, so the ladder
+// asserts refusal rather than the wrong bytes it used to measure. The cheap
+// tests above encode its result.
+// ---------------------------------------------------------------------------
+
+/// Full PIR round trip at one width; returns the worst per-entry mismatched-byte count.
+fn worst_mismatch_at_width(entry_size: usize) -> usize {
+    let params = InspireParams::secure_128_d2048();
+    let entries = 8usize;
+    let mut db = vec![0u8; entries * entry_size];
+    for (i, byte) in db.iter_mut().enumerate() {
+        *byte = u8::try_from(i % 251).unwrap_or(0);
+    }
+    let (state, secret_key) =
+        setup_state(&params, &db, entry_size, InspireVariant::TwoPacking).expect("setup_state");
+    let mut client_session =
+        build_client_session((*state.crs).clone(), secret_key, &params).expect("client session");
+    register_client_session(&mut client_session, &state).expect("register session");
+
+    let mut worst = 0usize;
+    for entry in 0..entries {
+        let (client_state, query) =
+            build_seeded_query(&client_session, state.shard_config(), entry as u64, &params)
+                .expect("build_seeded_query");
+        let response = <raven_railgun_engine::inspire::RavenInspireScheme as PirScheme>::respond(
+            &state, &query,
+        )
+        .expect("respond");
+        let plaintext =
+            extract_response(&state.crs, &client_state, &response, entry_size).expect("extract");
+        let expected = db
+            .get(entry * entry_size..(entry + 1) * entry_size)
+            .expect("expected entry slice");
+        let recovered = plaintext.get(..entry_size).expect("recovered entry slice");
+        worst = worst.max(
+            recovered
+                .iter()
+                .zip(expected.iter())
+                .filter(|(a, b)| a != b)
+                .count(),
+        );
+    }
+    worst
+}
+
+/// `Some(error)` when setup refuses the width, `None` when it accepts.
+fn setup_rejection_at_width(entry_size: usize) -> Option<String> {
+    let params = InspireParams::secure_128_d2048();
+    let db = vec![0u8; 8 * entry_size];
+    setup_state(&params, &db, entry_size, InspireVariant::TwoPacking)
+        .err()
+        .map(|e| e.to_string())
+}
+
+/// Evidence for the law. Ten production-parameter setups, minutes of wall time,
+/// so it is gated; the cheap tests above encode its result.
+#[test]
+#[ignore = "seven production-parameter setups at d=2048 (~7 s each), plus five widths that setup \
+            refuses before it builds the packing table; ~150 s in CI. Trigger: changing \
+            is_legal_cell_width, the InspiRING generator, or a shipped encoder record width. The \
+            nightly production-cell-closure job runs it with --run-ignored all."]
+fn production_cell_width_ladder_is_empirically_correct() {
+    for width in LEGAL_WIDTHS {
+        let worst = worst_mismatch_at_width(width);
+        assert_eq!(
+            worst,
+            0,
+            "entry_size {width} (num_columns {}) is declared legal but round-tripped \
+             {worst} wrong bytes",
+            pir_cell_columns(width)
+        );
+    }
+    for width in ILLEGAL_WIDTHS {
+        let err = setup_rejection_at_width(width).unwrap_or_else(|| {
+            panic!(
+                "entry_size {width} (num_columns {}) was accepted by setup. The width law is \
+                 derived from this being refused; if the InspiRING packing now supports \
+                 non-power-of-two or gamma >= ring_dim widths, re-derive is_legal_cell_width \
+                 from the current generator formula before relaxing anything",
+                pir_cell_columns(width)
+            )
+        });
+        assert!(
+            err.contains(&width.to_string()),
+            "entry_size {width} was refused, but the error never names the width: {err}"
+        );
+    }
 }

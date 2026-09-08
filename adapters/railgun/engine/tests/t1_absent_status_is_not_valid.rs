@@ -105,26 +105,10 @@ fn a_reorg_that_drops_a_shield_blocked_status_must_not_leave_the_row_reading_val
         "an absent status must encode as Missing, matching what the plaintext shim \
          returns for the same state"
     );
-}
 
-/// The PIR row and the plaintext shim must agree. `poi_shim` maps `None` to Missing;
-/// the encoder must not map it to Valid.
-#[test]
-fn the_encoder_agrees_with_the_plaintext_shim_on_an_absent_status() {
-    let mut store = LogicalLeafStore::new();
-    let commitment = bc(11);
-    apply_wal_entry(
-        &mut store,
-        &WalEntryPayload::PpoiListLeafAdded {
-            list_key: LIST_KEY,
-            list_index: 0,
-            blinded_commitment: commitment,
-            status: SHIELD_BLOCKED,
-        },
-        100,
-        &enc(),
-    )
-    .expect("leaf");
+    // A second reorg BELOW the leaf must clear the leaf itself too — this is the one
+    // assertion the deleted plaintext-shim "agreement" test carried that an all-zeros
+    // encoder could not fake (it reads the store, not the encoder).
     apply_wal_entry(
         &mut store,
         &WalEntryPayload::Reorg { height: 50 },
@@ -132,19 +116,9 @@ fn the_encoder_agrees_with_the_plaintext_shim_on_an_absent_status() {
         &enc(),
     )
     .expect("reorg below the leaf");
-
-    // Both maps cleared here, so no row is encoded at all and the buffer stays zero.
-    // The case that matters is the asymmetric one above; this pins that a fully
-    // unwound list does not resurrect a verdict either.
-    assert_eq!(
-        status_byte_of_row(&store, 0),
-        0,
-        "a row for a leaf that no longer exists is zero-filled, and the client's \
-         BC-tail binding is what rejects it - not the status byte"
-    );
     assert!(
         store.ppoi_bc_at(&LIST_KEY, 0).is_none(),
-        "the leaf itself was rolled back"
+        "a reorg below the leaf must clear ppoi_list_leaf_block_height and drop the leaf"
     );
 }
 

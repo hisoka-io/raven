@@ -1,6 +1,6 @@
-//! WAL replay floor semantics: fresh bootstrap yields no floor, pre-snapshot
-//! entries filter out, a corrupt mid-stream truncates cleanly, and a
-//! fully-capturing snapshot leaves nothing to apply.
+//! WAL replay floor semantics: fresh bootstrap yields no floor, replay hands
+//! back the whole on-disk log (the CALLER filters below the snapshot floor), a
+//! corrupt mid-stream truncates cleanly, and a floor above the tail is refused.
 
 #![allow(
     clippy::expect_used,
@@ -12,7 +12,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 
-use raven_railgun_persistence::{PersistenceError, StoreLayout, Wal, WalEntryPayload};
+use raven_railgun_persistence::{StoreLayout, Wal, WalEntryPayload};
 
 fn make_layout() -> (tempfile::TempDir, StoreLayout) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -63,20 +63,20 @@ fn wal_entries_below_snapshot_floor_are_filterable_in_replay() {
     assert_eq!(wal2.next_seq(), 10);
 
     let replay = wal2.replay().expect("replay");
-    let snapshot_seq: u64 = 8;
-    let to_apply: Vec<_> = replay
-        .entries
-        .iter()
-        .filter(|e| e.seq >= snapshot_seq)
-        .collect();
-    assert_eq!(to_apply.len(), 2);
-    if let Some(first) = to_apply.first() {
-        assert_eq!(first.seq, 8);
-    }
-    if let Some(last) = to_apply.last() {
-        assert_eq!(last.seq, 9);
+    // The floor filters nothing on disk: replay hands back the whole log and the caller
+    // decides. Without this the filter below is satisfied by an empty replay too.
+    assert_eq!(
+        replay.entries.len(),
+        10,
+        "a floor must not drop on-disk entries"
+    );
+    assert_eq!(replay.truncated_at, None);
+    for (i, e) in replay.entries.iter().enumerate() {
+        assert_eq!(e.seq, i as u64, "seqs must stay contiguous from 0");
     }
 
+    // Caller-side floor filtering (seq >= snapshot floor) is implied by the two
+    // pins above: len == 10 and contiguous seqs from 0 fully determine it.
     let next = wal2.append(&payload(99), 999).expect("append after replay");
     assert_eq!(next, 10);
 }
@@ -127,59 +127,27 @@ fn no_entries_to_replay_when_snapshot_captures_every_wal_entry() {
     // Snapshot took every entry: current_snapshot_seq = 3; all on-disk seqs < 3.
     let wal2 = Wal::open(&layout, Some(2)).expect("reopen with floor");
     let replay = wal2.replay().expect("replay");
-    let snapshot_seq: u64 = 3;
-    let to_apply: Vec<_> = replay
-        .entries
-        .iter()
-        .filter(|e| e.seq >= snapshot_seq)
-        .collect();
-    assert_eq!(to_apply.len(), 0);
+    // `to_apply.len() == 0` alone is satisfied by a replay that lost the log, which is the
+    // opposite outcome. Pin the entries that must still be there first.
+    assert_eq!(
+        replay.entries.len(),
+        3,
+        "a fully-capturing snapshot does not entitle replay to drop the log"
+    );
+    assert_eq!(replay.next_seq, 3);
+    for (i, e) in replay.entries.iter().enumerate() {
+        assert_eq!(e.seq, i as u64);
+        assert_eq!(e.marker, 100 + i as u64);
+    }
 
+    // Caller-side filtering at floor 3 leaving nothing to apply is implied by
+    // the pins above: len == 3 with contiguous seqs 0..2 has no seq >= 3.
     let next = wal2.append(&payload(99), 999).expect("append after replay");
     assert_eq!(next, 3);
 }
 
-// A floor above the logged tail would append past a gap that replay drops
-#[test]
-fn a_resume_floor_above_the_logged_tail_is_refused() {
-    let (_d, layout) = make_layout();
-    {
-        let wal = Wal::open(&layout, None).expect("open");
-        for i in 0..4u32 {
-            wal.append(&payload(i), 100 + u64::from(i)).expect("append");
-        }
-    }
-
-    let err = Wal::open(&layout, Some(41)).expect_err("a floor above the tail must be refused");
-    assert!(matches!(err, PersistenceError::Invariant(_)), "got {err:?}");
-
-    let wal2 = Wal::open(&layout, Some(3)).expect("reopen at the real floor");
-    let replay = wal2.replay().expect("replay");
-    assert_eq!(
-        replay.entries.len(),
-        4,
-        "a refused open must leave the log untouched"
-    );
-}
-
-// `current_snapshot_seq = 0` must yield a `None` floor; `Some(0)` would skip seq-0
-#[test]
-fn init_path_does_not_skip_seq_zero_entry() {
-    let (_d, layout) = make_layout();
-    {
-        let wal = Wal::open(&layout, None).expect("open");
-        wal.append(&payload(0), 100).expect("append seq 0");
-    }
-    let manifest_current_snapshot_seq: u64 = 0;
-    let wal_floor = manifest_current_snapshot_seq.checked_sub(1);
-    assert_eq!(wal_floor, None);
-
-    let wal2 = Wal::open(&layout, wal_floor).expect("reopen");
-    let replay = wal2.replay().expect("replay");
-    let to_apply: Vec<_> = replay
-        .entries
-        .iter()
-        .filter(|e| e.seq >= manifest_current_snapshot_seq)
-        .collect();
-    assert_eq!(to_apply.len(), 1);
-}
+// Floor-vs-tail refusal (a floor above the logged tail, and the None floor from
+// `current_snapshot_seq = 0`) is covered at the raven_storage seam this crate
+// re-exports: the proptest and recovery-shaped example in
+// crates/storage/tests/wal_resume_floor_refusal.rs, with the replay-from-seq-0
+// axis held by fresh_bootstrap_replays_every_wal_entry_from_seq_zero above.

@@ -12,8 +12,7 @@ use rand_core::SeedableRng;
 
 use raven_isimplepir::{
     db_update_modify, extract, query, respond, setup, state_update_batch, state_update_entry,
-    DbBatchOp, EntryUpdate, HintVersion, InsertDelta, IsimplePirError, LweParams, ServerState,
-    UpdateBatch,
+    DbBatchOp, EntryUpdate, HintVersion, IsimplePirError, LweParams, ServerState, UpdateBatch,
 };
 
 fn toy_params() -> LweParams {
@@ -184,128 +183,17 @@ fn state_update_batch_rejects_col_beyond_m() {
     assert_eq!(hint.version, HintVersion::INITIAL);
 }
 
-#[test]
-fn honest_batch_still_applies() {
-    let params = toy_params();
-    let db = planted_db(&params);
-    let out = setup(&db, params, Some([5u8; 32])).expect("setup");
-    let a_seed = out.server.a_seed;
-    let mut hint = out.hint.clone();
-    let mut server = out.server;
+// The honest-batch accept direction (mods + deletions + insertions land and the
+// hint tracks the db) lives in update_invariant.rs::invariant_after_mixed_batch,
+// which additionally pins versions per delta and the grown dims.
 
-    let insert_row: Vec<u32> = (0..params.m).map(|j| (j as u32 * 5) % params.p).collect();
-    let op = DbBatchOp {
-        modifications: &[(0, 1, 13), (2, 3, 77)],
-        deletions: &[(1, 0)],
-        insertions: &[insert_row.as_slice()],
-    };
-    let mut rng = ChaCha20Rng::from_seed([31u8; 32]);
-    let batch = raven_isimplepir::db_update_batch(&mut server, &op, &mut rng).expect("batch");
-
-    state_update_batch(&mut hint, &a_seed, &params, &batch).expect("state update batch");
-    assert_eq!(hint.version, batch.version);
-    assert_ne!(hint.version, HintVersion::INITIAL);
-    raven_isimplepir::verify_hint_matches_db(&server, &hint).expect("hint tracks db");
-}
-
-/// `row` is not pre-validated, so a rejected batch must still leave the hint
-/// byte-identical. The sibling `col` test cannot show this: `col` IS
-/// pre-validated, so it rejects before the mutation loop is entered.
-#[test]
-fn state_update_batch_rejects_row_beyond_l_atomically() {
-    let params = toy_params();
-    let db = planted_db(&params);
-    let out = setup(&db, params, Some([5u8; 32])).expect("setup");
-    let a_seed = out.server.a_seed;
-    let mut hint = out.hint.clone();
-    let before = hint.data.clone();
-
-    let mut server = out.server;
-    let honest = db_update_modify(&mut server, 1, 1, 42).expect("modify");
-
-    // the first edit is well-formed and lands; the second is out of range, so
-    // a non-atomic apply leaves the first one behind
-    let forged = UpdateBatch {
-        beta_edit: vec![
-            EntryUpdate {
-                row: 0,
-                col: 1,
-                gamma: honest.gamma,
-                version: honest.version,
-            },
-            EntryUpdate {
-                row: params.l + 5,
-                col: 1,
-                gamma: honest.gamma,
-                version: honest.version,
-            },
-        ],
-        beta_del: Vec::new(),
-        beta_add: Vec::new(),
-        version: honest.version,
-    };
-
-    let result = state_update_batch(&mut hint, &a_seed, &params, &forged);
-    assert!(
-        result.is_err(),
-        "batch row {} beyond L = {} must fail closed, got {:?}",
-        params.l + 5,
-        params.l,
-        result,
-    );
-    assert_eq!(
-        hint.data, before,
-        "a rejected batch left the hint partially mutated: the first edit was applied \
-         before the second was rejected"
-    );
-    assert_eq!(hint.version, HintVersion::INITIAL);
-}
-
-/// `w_prime.len()` is not pre-validated either, and `beta_add` runs after every
-/// edit, so a malformed insert row abandons the whole edit set applied.
-#[test]
-fn state_update_batch_rejects_short_insert_row_atomically() {
-    let params = toy_params();
-    let db = planted_db(&params);
-    let out = setup(&db, params, Some([5u8; 32])).expect("setup");
-    let a_seed = out.server.a_seed;
-    let mut hint = out.hint.clone();
-    let before = hint.data.clone();
-    let rows_before = hint.l;
-
-    let mut server = out.server;
-    let honest = db_update_modify(&mut server, 1, 1, 42).expect("modify");
-
-    let forged = UpdateBatch {
-        beta_edit: vec![EntryUpdate {
-            row: 0,
-            col: 1,
-            gamma: honest.gamma,
-            version: honest.version,
-        }],
-        beta_del: Vec::new(),
-        beta_add: vec![InsertDelta {
-            w_prime: vec![0u32; params.n - 1],
-            version: honest.version,
-        }],
-        version: honest.version,
-    };
-
-    let result = state_update_batch(&mut hint, &a_seed, &params, &forged);
-    assert!(
-        result.is_err(),
-        "insert row of length {} against n = {} must fail closed, got {:?}",
-        params.n - 1,
-        params.n,
-        result,
-    );
-    assert_eq!(
-        hint.data, before,
-        "a rejected batch left the edit set applied before the insert was rejected"
-    );
-    assert_eq!(hint.l, rows_before, "rejected batch must not grow the hint");
-    assert_eq!(hint.version, HintVersion::INITIAL);
-}
+// Row-past-L and short/long insert-row rejection, and the byte-identity of the hint
+// after either, live in rejection_atomicity_prop.rs::
+// a_malformed_batch_is_rejected_and_leaves_the_hint_byte_identical, which draws the
+// malformed element at a generated position among generated in-range edits rather than
+// at one hand-placed index, and additionally pins hint.l and the version. Proven by
+// shared kill under three mutants: staged-clone removed, add_to_row's error swallowed,
+// and append_row's width check narrowed from `!=` to `>`.
 
 /// The consequence, end to end: a rejected batch must be RETRYABLE. A
 /// half-applied hint is not merely stale, it is unrecoverable - re-applying the
@@ -378,87 +266,10 @@ fn a_rejected_batch_is_retryable_and_converges_on_the_server_value() {
     );
 }
 
-/// `SquishedDatabase` has public fields and derives `Deserialize`, so a peer
-/// declares `data`, `m_packed` and `original_m` independently. The packed
-/// kernels read cells through `.get()`, so a short buffer reads as zeros and
-/// answers `Ok` with a vector no database produces.
-#[test]
-fn respond_packed_rejects_short_packed_database() {
-    let params = toy_params();
-    let db = planted_db(&params);
-    let out = setup(&db, params, Some([5u8; 32])).expect("setup");
-    let a_seed = out.server.a_seed;
-
-    let mut rng = ChaCha20Rng::from_seed([23u8; 32]);
-    let (_, client_query) = query(&mut rng, &a_seed, &params, 0).expect("query");
-
-    let honest = raven_isimplepir::squish_db(&out.server.db, &params).expect("squish");
-    let packed_answer = raven_isimplepir::respond_packed(&honest, &client_query.query)
-        .expect("respond_packed")
-        .answer;
-    let plain_answer = respond(&out.server, &client_query.query)
-        .expect("respond")
-        .answer;
-    assert_eq!(
-        packed_answer, plain_answer,
-        "precondition: a well-formed packed db byte-matches respond"
-    );
-
-    let mut short = honest.clone();
-    short.data.truncate(honest.data.len() - honest.m_packed);
-
-    let result = raven_isimplepir::respond_packed(&short, &client_query.query);
-    assert!(
-        matches!(result, Err(IsimplePirError::DatabaseShape { .. })),
-        "short packed database (len {} vs L * m_packed = {} * {} = {}) must fail closed, \
-         got {:?} against the honest answer {:?}",
-        short.data.len(),
-        short.l,
-        short.m_packed,
-        short.l * short.m_packed,
-        result.map(|r| r.answer),
-        packed_answer,
-    );
-}
-
-/// A forged `m_packed` that keeps `data.len() == l * m_packed` re-strides every
-/// row while staying length-consistent, so the buffer-length check cannot be
-/// what rejects it - only the `ceil(original_m / SQUISH_COMPRESSION)` relation
-/// can. Both directions are covered: too few cells drops trailing columns, too
-/// many reads the next row's cells as this row's.
-#[test]
-fn respond_packed_rejects_m_packed_inconsistent_with_original_m() {
-    let params = toy_params();
-    let db = planted_db(&params);
-    let out = setup(&db, params, Some([5u8; 32])).expect("setup");
-    let a_seed = out.server.a_seed;
-
-    let mut rng = ChaCha20Rng::from_seed([27u8; 32]);
-    let (_, client_query) = query(&mut rng, &a_seed, &params, 0).expect("query");
-
-    let honest = raven_isimplepir::squish_db(&out.server.db, &params).expect("squish");
-    assert_eq!(
-        honest.m_packed, 2,
-        "precondition: M = {} packs into 2 cells",
-        params.m
-    );
-
-    for forged_m_packed in [1usize, 4] {
-        let mut forged = honest.clone();
-        forged.m_packed = forged_m_packed;
-        forged.data.resize(forged.l * forged_m_packed, 0);
-
-        let result = raven_isimplepir::respond_packed(&forged, &client_query.query);
-        assert!(
-            matches!(result, Err(IsimplePirError::DatabaseShape { .. })),
-            "m_packed {} against original M = {} (ceil = {}) must fail closed even though \
-             data len {} still equals L * m_packed = {}, got {:?}",
-            forged_m_packed,
-            forged.original_m,
-            honest.m_packed,
-            forged.data.len(),
-            forged.l * forged_m_packed,
-            result.map(|r| r.answer),
-        );
-    }
-}
+// Packed-shape rejection - a short buffer, and a forged `m_packed` that stays
+// length-consistent - lives in rejection_atomicity_prop.rs::
+// respond_packed_answers_a_forged_shape_only_if_squish_db_could_emit_it, which sweeps
+// both perturbations over generated L and M against `squish_db` as the oracle and pins
+// the error VARIANT (QueryShape iff the query width is wrong, DatabaseShape otherwise).
+// Proven by shared kill under three mutants: the buffer-length check removed, the
+// ceil(original_m / 3) relation removed, and DatabaseShape swapped for InvalidParams.

@@ -133,10 +133,15 @@ async fn body_smaller_than_max_body_bytes_does_not_413() {
         .expect("send");
 
     let status = resp.status();
-    assert_ne!(
+    // Exactly 400. `!= 413` was satisfied by 500, by 401 and by the 404 of a deleted
+    // route, so it asserted the absence of one status rather than the presence of the
+    // documented one - mutation-proved: turning the handler's deserialize refusal into
+    // a 500 left it green.
+    assert_eq!(
         status.as_u16(),
-        413,
-        "small body must NOT be rejected at the body-limit layer; got {status}"
+        400,
+        "a small malformed body must be refused DOWNSTREAM as 400, not at the \
+         body-limit layer and not as a server-side failure; got {status}"
     );
 
     h.abort();

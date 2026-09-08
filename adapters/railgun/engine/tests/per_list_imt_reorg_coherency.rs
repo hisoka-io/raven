@@ -9,10 +9,12 @@
     clippy::too_many_lines
 )]
 
+use raven_railgun_core::MerkleProof;
 use raven_railgun_engine::imt::TREE_DEPTH;
 use raven_railgun_engine::inspire::{apply_wal_entry, LogicalLeafStore};
 use raven_railgun_engine::pir_table::{PerListNodeEncoder, PerNodeEncoder, PirTableEncoder};
 use raven_railgun_persistence::WalEntryPayload;
+use raven_railgun_poseidon::merkle_node;
 
 const LIST_KEY: [u8; 32] = [0x77; 32];
 const ENTRIES_PER_SHARD: u32 = 64;
@@ -47,6 +49,22 @@ fn ppoi_payload_with(list_index: u32, bc: [u8; 32]) -> WalEntryPayload {
         blinded_commitment: bc,
         status: 0,
     }
+}
+
+/// Independent oracle: fold the returned siblings with Poseidon rather than reading
+/// `proof.root`, which `Imt::merkle_proof` fills in from `Imt::root()` - the same call the
+/// expected value comes from, so comparing the two proves nothing about the path bytes.
+fn fold_to_root(leaf: [u8; 32], leaf_index: u32, proof: &MerkleProof) -> [u8; 32] {
+    let mut current = leaf;
+    for level in 0..TREE_DEPTH {
+        let sibling = proof.elements[level];
+        current = if (leaf_index >> level) & 1 == 1 {
+            merkle_node(sibling, current).expect("fold right")
+        } else {
+            merkle_node(current, sibling).expect("fold left")
+        };
+    }
+    current
 }
 
 fn read_row(
@@ -93,7 +111,18 @@ fn per_list_imt_reorg_coherency_drops_and_reinserts_without_stale_cache_hits() {
         let proof = store.ppoi_merkle_proof(&LIST_KEY, i).expect("path");
         assert_eq!(
             proof.root, pre_root,
-            "pre-reorg path at idx {i} must reconstruct to pre-reorg root"
+            "pre-reorg path at idx {i} must carry the pre-reorg root"
+        );
+        assert_eq!(
+            u32::from(proof.indices),
+            i,
+            "pre-reorg path at idx {i} must pack the queried index, or the client folds \
+             the siblings the wrong way round"
+        );
+        assert_eq!(
+            fold_to_root(old_bc_for(i), i, &proof),
+            pre_root,
+            "pre-reorg siblings at idx {i} must fold back to the pre-reorg root"
         );
     }
 
@@ -148,7 +177,14 @@ fn per_list_imt_reorg_coherency_drops_and_reinserts_without_stale_cache_hits() {
             .expect("survivor path");
         assert_eq!(
             proof.root, post_reorg_root,
-            "surviving path at idx {i} must reconstruct to post-reorg root"
+            "surviving path at idx {i} must carry the post-reorg root"
+        );
+        // A truncation that left stale ancestors behind reddens here and nowhere else:
+        // root() and merkle_proof() both read the same node maps.
+        assert_eq!(
+            fold_to_root(old_bc_for(i), i, &proof),
+            post_reorg_root,
+            "surviving siblings at idx {i} must fold back to the post-reorg root"
         );
     }
 
@@ -190,7 +226,18 @@ fn per_list_imt_reorg_coherency_drops_and_reinserts_without_stale_cache_hits() {
             .expect("post-reinsert path");
         assert_eq!(
             proof.root, post_reinsert_root,
-            "post-reinsert path at idx {i} must reconstruct to the latest root"
+            "post-reinsert path at idx {i} must carry the latest root"
+        );
+        let expected_leaf = if i < survivors {
+            old_bc_for(i)
+        } else {
+            new_bc_for(i)
+        };
+        assert_eq!(
+            fold_to_root(expected_leaf, i, &proof),
+            post_reinsert_root,
+            "post-reinsert siblings at idx {i} must fold the expected leaf back to the \
+             latest root; a path rebuilt from pre-reorg ancestors folds elsewhere"
         );
         let leaf_bc = store.ppoi_bc_at(&LIST_KEY, i).expect("bc at idx");
         if i < survivors {

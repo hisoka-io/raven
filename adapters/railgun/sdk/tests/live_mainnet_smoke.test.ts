@@ -329,7 +329,9 @@ async function getInstance(instanceId: string): Promise<InstanceBundle> {
 
 describe("live mainnet PIR smoke", () => {
   if (!RUN_LIVE) {
-    it.skip("requires RAVEN_LIVE_URL + RAVEN_LIVE_TOKEN env vars", () => {
+    // RUN_LIVE also requires RAVEN_INFURA_URL; without it the on-chain rootHistory
+    // cross-check has nothing to compare against and the whole block is decoration.
+    it.skip("requires RAVEN_LIVE_URL + RAVEN_LIVE_TOKEN + RAVEN_INFURA_URL", () => {
     });
   }
 

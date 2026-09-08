@@ -113,7 +113,9 @@ async fn off_ladder_lengths_are_refused_and_never_dispatched() {
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/v1/instance/{INSTANCE}/batch");
 
-    for len in [3usize, 5, 6, 7, 9, 15, 17, 31, 33, 64] {
+    // len 0 rides along: a bare 400 could also come from a deserialization
+    // failure, but respond_calls == 0 below is what proves the refusal.
+    for len in [0usize, 3, 5, 6, 7, 9, 15, 17, 31, 33, 64] {
         let resp = client
             .post(&url)
             .bearer_auth(TOKEN)
@@ -187,25 +189,6 @@ async fn every_ladder_step_is_served_in_order() {
         "every slot of a padded batch costs a real respond; skipping one would be \
          a server-side pad distinguisher"
     );
-
-    h.abort();
-    let _ = h.await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_empty_batch_is_still_refused() {
-    let (addr, _instance, h) = spawn_test_server().await;
-    let client = reqwest::Client::new();
-    let url = format!("http://{addr}/v1/instance/{INSTANCE}/batch");
-
-    let resp = client
-        .post(&url)
-        .bearer_auth(TOKEN)
-        .body(batch_of(0))
-        .send()
-        .await
-        .expect("send");
-    assert_eq!(resp.status().as_u16(), 400);
 
     h.abort();
     let _ = h.await;

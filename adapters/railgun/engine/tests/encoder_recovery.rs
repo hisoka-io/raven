@@ -3,12 +3,14 @@
 use std::sync::Arc;
 
 use raven_railgun_core::{AdapterError, InstanceId};
+use raven_railgun_engine::imt::Imt;
 use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
 use raven_railgun_persistence::{StoreLayout, WalEntryPayload};
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-encoder-recovery";
 const ENTRIES_PER_SHARD: u32 = 2048;
+const LEAVES: u32 = 8;
 
 use raven_railgun_testkit::canonical;
 
@@ -38,7 +40,7 @@ fn round_trip(kind: EncoderKind, instance: &str) {
         )
         .expect("fresh open");
 
-        for i in 0..8u32 {
+        for i in 0..LEAVES {
             let payload = WalEntryPayload::AppendLeaf {
                 tree_number: 0,
                 leaf_index: i,
@@ -61,10 +63,37 @@ fn round_trip(kind: EncoderKind, instance: &str) {
     )
     .expect("recovery open");
 
+    let recovered = &opened2.recovered_logical_store;
     assert_eq!(
-        opened2.recovered_logical_store.imt_leaf_count_for(0),
-        8,
-        "{kind:?}: replay must restore 8 leaves into the logical store"
+        recovered.imt_leaf_count_for(0),
+        LEAVES as usize,
+        "{kind:?}: replay must restore {LEAVES} leaves into the logical store"
+    );
+
+    // A count alone passes while replay restores the wrong bytes, which is the
+    // silent-wrong-value failure this suite exists to catch. Compare against the
+    // fixture, not against anything replay produced.
+    for i in 0..LEAVES {
+        let expected = canonical(u8::try_from(i).unwrap_or(0).saturating_add(1));
+        assert_eq!(
+            recovered.leaf(0, i).copied(),
+            Some(expected),
+            "{kind:?}: replayed leaf {i} must byte-equal the commitment that was written"
+        );
+    }
+
+    // The root folds every internal node, so it also catches corruption that never
+    // reaches a leaf slot. Oracle is a standalone Imt over the same fixture.
+    let mut oracle = Imt::new().expect("oracle imt");
+    let leaves: Vec<[u8; 32]> = (0..LEAVES)
+        .map(|i| canonical(u8::try_from(i).unwrap_or(0).saturating_add(1)))
+        .collect();
+    oracle.insert_leaves(0, &leaves).expect("oracle insert");
+    assert_eq!(
+        recovered.imt_root(0),
+        Some(oracle.root()),
+        "{kind:?}: recovered IMT root must equal an independently built tree over the \
+         same commitments"
     );
 }
 

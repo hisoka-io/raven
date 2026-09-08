@@ -11,19 +11,13 @@
 )]
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::{
-    body::Body,
-    extract::ConnectInfo,
-    http::{header, Method, Request, StatusCode},
-};
 use raven_railgun_core::{InstanceId, Result as RailgunResult};
 use raven_railgun_engine::{Engine, InstanceRole, PirInstance, PirScheme};
 use raven_railgun_http::{router, write_versioned, AppState, HttpConfig};
 use serde::{Deserialize, Serialize};
-use tower::ServiceExt;
 
 const TOKEN: &str = "auth-reject-close-token-padded-1234";
 const WRONG_TOKEN: &str = "auth-reject-close-WRONG-padded-1234";
@@ -106,64 +100,9 @@ fn query_body(nonce: u64) -> Vec<u8> {
     write_versioned(&EchoQuery { nonce }).expect("encode versioned query")
 }
 
-fn query_request(token: &str, nonce: u64) -> Request<Body> {
-    let mut req = Request::builder()
-        .method(Method::POST)
-        .uri(format!("/v1/instance/{INSTANCE}/query"))
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(Body::from(query_body(nonce)))
-        .expect("build query req");
-    req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        12_345,
-    )));
-    req
-}
-
-#[tokio::test]
-async fn rejected_bearer_marks_the_connection_unreusable() {
-    let router = build_router();
-
-    let rejected = router
-        .clone()
-        .oneshot(query_request(WRONG_TOKEN, 1))
-        .await
-        .expect("dispatch wrong token");
-    assert_eq!(
-        rejected.status(),
-        StatusCode::UNAUTHORIZED,
-        "a wrong bearer must be refused"
-    );
-    let connection = rejected
-        .headers()
-        .get(header::CONNECTION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    assert!(
-        connection.contains("close"),
-        "the reject path abandons the unread body, so the 401 MUST carry \
-         `Connection: close`; got {connection:?}"
-    );
-
-    let accepted = router
-        .oneshot(query_request(TOKEN, 2))
-        .await
-        .expect("dispatch right token");
-    assert_eq!(
-        accepted.status(),
-        StatusCode::OK,
-        "a valid bearer must still be served"
-    );
-    assert!(
-        accepted.headers().get(header::CONNECTION).is_none(),
-        "an authorized response consumed its body and must stay keep-alive"
-    );
-}
-
-/// `oneshot` never touches hyper's encoder, so the header could be dropped on
-/// the wire without the router test noticing.
+/// `oneshot` never touches hyper's encoder, so a router-level check could pass
+/// while the header is dropped on the wire; both halves (401 closes, 200 stays
+/// keep-alive) are asserted against the live encoder here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_401_carries_connection_close_on_the_wire() {
     let (addr, h) = spawn_server().await;
@@ -201,6 +140,43 @@ async fn the_401_carries_connection_close_on_the_wire() {
         head.contains("connection: close"),
         "hyper must emit `Connection: close` on the reject path so a pooled \
          peer evicts the socket instead of reusing it; got {head:?}"
+    );
+
+    // Keep-alive half: an authorized response consumed its body and must NOT
+    // carry a Connection header on the wire.
+    let body = query_body(8);
+    let ok_head = tokio::task::spawn_blocking(move || {
+        let mut sock = std::net::TcpStream::connect(addr).expect("connect ok");
+        let request = format!(
+            "POST /v1/instance/{INSTANCE}/query HTTP/1.1\r\n\
+             Host: {addr}\r\n\
+             Authorization: Bearer {TOKEN}\r\n\
+             Content-Type: application/octet-stream\r\n\
+             Content-Length: {}\r\n\r\n",
+            body.len()
+        );
+        sock.write_all(request.as_bytes()).expect("write ok head");
+        sock.write_all(&body).expect("write ok body");
+        sock.flush().expect("flush ok");
+        // The server keeps this socket open (that is the property), so read
+        // with a short timeout and take whatever arrived: the head is enough.
+        sock.set_read_timeout(Some(std::time::Duration::from_millis(750)))
+            .expect("set read timeout");
+        let mut raw = Vec::new();
+        let _ = sock.read_to_end(&mut raw);
+        String::from_utf8_lossy(&raw).to_ascii_lowercase()
+    })
+    .await
+    .expect("join authorized raw socket task");
+
+    assert!(
+        ok_head.starts_with("http/1.1 200"),
+        "authorized raw request must answer 200; got {ok_head:?}"
+    );
+    assert!(
+        !ok_head.contains("connection:"),
+        "an authorized response must stay keep-alive (no Connection header \
+         on the wire); got {ok_head:?}"
     );
 
     h.abort();

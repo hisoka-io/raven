@@ -1,5 +1,13 @@
-//! A slow batch worker must surface 503, release its permit, and not block the
-//! next batch.
+//! A slow batch worker must surface 503 promptly, and a subsequent all-fast
+//! batch must still be served correctly while the abandoned worker sleeps on.
+//!
+//! NOT covered here, on purpose: permit release. The timed-out slot HOLDS its
+//! permit until the detached work ends (`hold_permit_until_detached`,
+//! src/batch.rs) and `timeout_detached_respond_holds_permit.rs` asserts that
+//! hold as required behaviour. With `max_concurrent_queries` (16) equal to the
+//! batch width, no assertion in this file can observe a leaked permit —
+//! proven 2026-09-06: both tests stay green with `drop(permit)` replaced by
+//! `std::mem::forget(permit)`.
 
 #![allow(
     dead_code,
@@ -112,60 +120,12 @@ async fn spawn_test_server() -> (
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn batch_with_one_slow_query_returns_503_within_timeout_window() {
-    let (addr, _instance, h) = spawn_test_server().await;
-    let client = reqwest::Client::new();
-    let url = format!("http://{addr}/v1/instance/{INSTANCE}/batch");
-
-    // Index 14 is slow; the dispatcher must 503 at timeout rather than wait.
-    let mut queries: Vec<SlowQuery> = (0..16)
-        .map(|i| SlowQuery {
-            slow: false,
-            tag: i,
-        })
-        .collect();
-    if let Some(slot) = queries.get_mut(14) {
-        slot.slow = true;
-    }
-    let body = raven_railgun_http::write_versioned(&queries).expect("serialize batch");
-
-    let started = Instant::now();
-    let resp = client
-        .post(&url)
-        .bearer_auth(TOKEN)
-        .body(body)
-        .send()
-        .await
-        .expect("send");
-    let elapsed = started.elapsed();
-
-    let status = resp.status();
-    assert_eq!(
-        status.as_u16(),
-        503,
-        "batch with a timeout-class worker MUST surface 503; \
-         see BatchError::status() for the typed mapping. got {status}"
-    );
-
-    let timeout_budget = Duration::from_secs(RESPOND_TIMEOUT_SECS);
-    let upper_bound = timeout_budget + Duration::from_millis(900);
-    assert!(
-        elapsed < upper_bound,
-        "batch must surface timeout response within ~{RESPOND_TIMEOUT_SECS} s \
-         of the configured timeout; took {elapsed:?} \
-         (slow worker sleeps {SLOW_QUERY_BLOCK_MS} ms)"
-    );
-
-    h.abort();
-    let _ = h.await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn subsequent_batch_succeeds_after_a_timeout_race() {
     let (addr, instance, h) = spawn_test_server().await;
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/v1/instance/{INSTANCE}/batch");
 
+    // Index 14 is slow; the dispatcher must 503 at timeout rather than wait.
     let mut queries_first: Vec<SlowQuery> = (0..16)
         .map(|i| SlowQuery {
             slow: false,
@@ -178,6 +138,7 @@ async fn subsequent_batch_succeeds_after_a_timeout_race() {
     let body_first =
         raven_railgun_http::write_versioned(&queries_first).expect("serialize first batch");
 
+    let started = Instant::now();
     let resp1 = client
         .post(&url)
         .bearer_auth(TOKEN)
@@ -185,10 +146,21 @@ async fn subsequent_batch_succeeds_after_a_timeout_race() {
         .send()
         .await
         .expect("send 1");
+    let elapsed_first = started.elapsed();
     assert_eq!(
         resp1.status().as_u16(),
         503,
-        "first batch (with slow worker) must surface 503"
+        "batch with a timeout-class worker MUST surface 503; \
+         see BatchError::status() for the typed mapping"
+    );
+
+    let timeout_budget = Duration::from_secs(RESPOND_TIMEOUT_SECS);
+    let upper_bound = timeout_budget + Duration::from_millis(900);
+    assert!(
+        elapsed_first < upper_bound,
+        "batch must surface timeout response within ~{RESPOND_TIMEOUT_SECS} s \
+         of the configured timeout; took {elapsed_first:?} \
+         (slow worker sleeps {SLOW_QUERY_BLOCK_MS} ms)"
     );
 
     // Must succeed while the first batch's slow worker is still mid-sleep.
@@ -215,16 +187,14 @@ async fn subsequent_batch_succeeds_after_a_timeout_race() {
     assert_eq!(
         status.as_u16(),
         200,
-        "second batch (all fast) must succeed; if not 200, the first batch's \
-         slow worker likely held its semaphore permit past the timeout \
-         (regression in worker timeout-arm permit release). got {status}"
+        "an all-fast batch after a prior batch error must return 200 with 16 \
+         correctly-tagged responses; got {status}"
     );
 
     assert!(
         elapsed < Duration::from_millis(800),
-        "second all-fast batch should complete quickly; took {elapsed:?}. \
-         If close to {SLOW_QUERY_BLOCK_MS} ms, the first batch's slow worker \
-         is still holding its semaphore permit."
+        "second all-fast batch should complete quickly (a prior batch error \
+         must not degrade dispatcher throughput); took {elapsed:?}"
     );
 
     let calls = instance

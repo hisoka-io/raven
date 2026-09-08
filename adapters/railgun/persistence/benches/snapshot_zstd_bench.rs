@@ -48,7 +48,9 @@ fn median(timings: &mut [Duration]) -> Duration {
 }
 
 #[test]
-#[ignore = "snapshot zstd bench; ~3-6s wall total at 170 MiB x 3 seeds"]
+#[ignore = "snapshot zstd bench at 170 MiB x 3 seeds; 27.5 s wall measured on a 16-core box \
+            under the ci-test profile. Trigger: changing the zstd level or the snapshot payload \
+            shape."]
 fn snapshot_zstd_bench_bincode_vs_zstd_l3() {
     eprintln!("snapshot_zstd_bench: SEEDS={} TOTAL_BYTES~170MiB", SEEDS);
 

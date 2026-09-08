@@ -146,7 +146,8 @@ fn dispatch_multi(
 }
 
 #[test]
-#[ignore = "production-cell setup is heavy (~12s x 6 = ~72s); ~3 min total wall"]
+#[ignore = "production-cell setup is heavy (~12s x 6 = ~72s); ~3 min total. Trigger: locating \
+            where six concurrent instances serialize."]
 fn multi_instance_bottleneck_probe() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(8)

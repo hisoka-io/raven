@@ -198,28 +198,101 @@ async fn autofallback_stays_in_subscribe_on_primary_success() {
     assert_eq!(fallback.calls(), 0, "fallback should never be touched");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn autofallback_reconnect_backoff_under_cap() {
-    let primary = Arc::new(FailingPrimary::new(u64::MAX));
+/// Fails only after every participant is parked inside the call, which means
+/// every participant has already passed the Subscribe-mode gate: all `n` calls
+/// record a failure instead of the 2nd..nth being swallowed by the polling
+/// dwell. That makes `reconnect_attempt = n` reachable in-process.
+#[derive(Debug)]
+struct BarrierPrimary {
+    barrier: tokio::sync::Barrier,
+}
+
+impl BarrierPrimary {
+    fn new(parties: usize) -> Self {
+        Self {
+            barrier: tokio::sync::Barrier::new(parties.max(1)),
+        }
+    }
+}
+
+fn transport_err<T>() -> Result<T> {
+    Err(IndexerError::Rpc(
+        "ws connect: connection refused by peer".into(),
+    ))
+}
+
+#[async_trait]
+impl ChainSource for BarrierPrimary {
+    async fn latest_block(&self) -> Result<u64> {
+        self.barrier.wait().await;
+        transport_err()
+    }
+    async fn events_in_range(&self, _from: u64, _to: u64) -> Result<Vec<RailgunEvent>> {
+        transport_err()
+    }
+    async fn root_history(
+        &self,
+        _tree: u32,
+        _root: [u8; 32],
+        _at: Option<alloy::eips::BlockId>,
+    ) -> Result<bool> {
+        transport_err()
+    }
+    async fn block_hash(&self, _n: u64) -> Result<[u8; 32]> {
+        transport_err()
+    }
+    async fn merkle_root(&self, _at: Option<alloy::eips::BlockId>) -> Result<[u8; 32]> {
+        transport_err()
+    }
+    async fn active_tree_number(&self, _at: Option<alloy::eips::BlockId>) -> Result<u32> {
+        transport_err()
+    }
+}
+
+/// Backoff after exactly `failures` recorded WS transport failures.
+async fn backoff_after_failures(failures: u32) -> std::time::Duration {
+    let primary = Arc::new(BarrierPrimary::new(failures as usize));
     let fallback = Arc::new(AlwaysOkFallback::new(1));
-    let wrapper = AutoFallbackChainSource::new(primary, fallback);
+    let wrapper = Arc::new(AutoFallbackChainSource::new(primary, fallback));
 
-    let initial = wrapper.next_reconnect_backoff().await;
-    assert_eq!(
-        initial.as_secs(),
-        1,
-        "before any failure, backoff should be 2^0 = 1s"
-    );
+    let mut handles = Vec::with_capacity(failures as usize);
+    for _ in 0..failures {
+        let w = Arc::clone(&wrapper);
+        handles.push(tokio::spawn(async move {
+            let _ = w.latest_block().await;
+        }));
+    }
+    for h in handles {
+        h.await.expect("failure task joined");
+    }
+    wrapper.next_reconnect_backoff().await
+}
 
-    let _ = wrapper.latest_block().await;
-    let after_one = wrapper.next_reconnect_backoff().await;
+/// Locks the whole curve `min(2^attempt, cap)`, not just its first point: a
+/// removed cap and a frozen (non-doubling) backoff each passed the previous
+/// version of this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autofallback_reconnect_backoff_doubles_then_caps() {
     let cap = raven_railgun_indexer::WS_RECONNECT_CAP_SECS;
-    assert!(
-        after_one.as_secs() <= cap,
-        "backoff must be <= cap={cap}, got {after_one:?}"
-    );
-    assert!(
-        after_one >= initial,
-        "backoff must not decrease after a failure; initial={initial:?}, after={after_one:?}"
+    let mut prev = 0u64;
+    for failures in [0u32, 1, 2, 3, 4, 5, 6, 40] {
+        let expected = (1u64 << failures.min(31)).min(cap);
+        let got = backoff_after_failures(failures).await;
+        assert_eq!(
+            got.as_secs(),
+            expected,
+            "after {failures} failures the backoff must be min(2^{failures}, {cap})s"
+        );
+        assert!(
+            got.as_secs() >= prev,
+            "backoff must never decrease as failures accumulate; \
+             {prev}s -> {got:?} at {failures} failures"
+        );
+        prev = got.as_secs();
+    }
+    assert_eq!(
+        backoff_after_failures(5).await.as_secs(),
+        cap,
+        "2^5 = 32 > {cap}: the cap must clamp from the 5th failure on"
     );
 }

@@ -138,7 +138,8 @@ fn split(mh: raven_railgun_engine::orchestrator::MultiOrchestratorHandle) -> Par
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "stands up 3 InsPIRe instances; ~5s wall on Zen 5"]
+#[ignore = "stands up 3 InsPIRe instances; ~5s wall on Zen 5. Trigger: changing reorg broadcast \
+            routing or leaf truncation. CI runs it in the durability + closure lane."]
 async fn reorg_cascade_truncates_chain_instances_only() {
     let dir = tempfile::tempdir().expect("tempdir");
     let configs = build_three_configs(dir.path());

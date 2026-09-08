@@ -126,6 +126,7 @@ fn per_leaf_path_query_recovers_sibling_walk_and_root_for_target_leaves() {
         // independent oracle: read siblings via Imt::node, bypassing the Imt::merkle_proof the encoder consumes
         let mut path_idx = leaf_idx as usize;
         let mut current = canonical(u8::try_from(leaf_idx % 250).unwrap_or(0).saturating_add(1));
+        let mut pir_siblings = [[0u8; 32]; TREE_DEPTH];
         for level in 0..TREE_DEPTH {
             let sibling_idx_at_level = path_idx ^ 1;
             let bit = path_idx & 1;
@@ -135,6 +136,9 @@ fn per_leaf_path_query_recovers_sibling_walk_and_root_for_target_leaves() {
             let recovered = row
                 .get(level * 32..(level + 1) * 32)
                 .expect("sibling slice present");
+            if let Some(slot) = pir_siblings.get_mut(level) {
+                slot.copy_from_slice(recovered);
+            }
             assert_eq!(
                 recovered, &expected_sibling,
                 "leaf_idx={leaf_idx} level={level}: sibling byte mismatch \
@@ -152,6 +156,15 @@ fn per_leaf_path_query_recovers_sibling_walk_and_root_for_target_leaves() {
         assert_eq!(
             current, expected_root,
             "leaf_idx={leaf_idx}: reconstructed root does not match Imt::root"
+        );
+
+        // Carried over from the deleted t3_commit_tree_path_closure duplicate: the
+        // served row must also byte-equal Imt::merkle_proof().elements — the API the
+        // encoder consumes — so a proof/node divergence inside Imt is caught here.
+        let oracle = imt.merkle_proof(leaf_idx as usize).expect("imt proof");
+        assert_eq!(
+            pir_siblings, oracle.elements,
+            "leaf_idx={leaf_idx}: PIR siblings must byte-equal Imt::merkle_proof.elements"
         );
     }
 }

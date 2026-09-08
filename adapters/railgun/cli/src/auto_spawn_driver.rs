@@ -707,6 +707,9 @@ impl std::fmt::Debug for PpoiListSpawnRegistry {
 struct PpoiListRegistryInner {
     by_pair: std::collections::BTreeMap<(String, [u8; 32]), PpoiListRegistryEntry>,
     auto_spawned: Vec<AutoSpawnedHandle>,
+    /// Bootstrap failures seen by the driver; a list with no instance is invisible otherwise.
+    spawn_failures: u64,
+    last_spawn_failure: Option<String>,
 }
 
 #[derive(Clone)]
@@ -716,12 +719,33 @@ struct PpoiListRegistryEntry {
 }
 
 impl PpoiListSpawnRegistry {
+    /// Record a bootstrap failure so it is observable rather than only logged.
+    pub fn record_spawn_failure(&self, message: &str) {
+        let mut g = self.inner.lock();
+        g.spawn_failures = g.spawn_failures.saturating_add(1);
+        g.last_spawn_failure = Some(message.to_owned());
+    }
+
+    /// How many spawns this driver failed to bootstrap.
+    #[must_use]
+    pub fn spawn_failures(&self) -> u64 {
+        self.inner.lock().spawn_failures
+    }
+
+    /// The most recent bootstrap failure, if any.
+    #[must_use]
+    pub fn last_spawn_failure(&self) -> Option<String> {
+        self.inner.lock().last_spawn_failure.clone()
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
             inner: parking_lot::Mutex::new(PpoiListRegistryInner {
                 by_pair: std::collections::BTreeMap::new(),
                 auto_spawned: Vec::new(),
+                spawn_failures: 0,
+                last_spawn_failure: None,
             }),
         }
     }
@@ -1000,6 +1024,11 @@ pub async fn run_ppoi_list_driver(
                             );
                         }
                         Err(e) => {
+                            // Counted, not just logged. A bootstrap failure here means a PPOI list
+                            // silently has no instance - the same shape as the tree-4 rollover
+                            // outage - and a tracing line is invisible to an operator's alerting
+                            // and to any test that does not install a subscriber.
+                            registry.record_spawn_failure(&format!("{e}"));
                             tracing::error!(
                                 template_id = %tpl.template_id,
                                 list_key = %hex_lower_local(&lk),

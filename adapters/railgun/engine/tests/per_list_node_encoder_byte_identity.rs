@@ -1,5 +1,5 @@
 //! `PerListNodeEncoder` byte identity against an independent `Imt::node` oracle,
-//! plus a cross-encoder migration guard.
+//! plus a cross-encoder migration guard closed by a Poseidon fold.
 
 #![allow(
     clippy::expect_used,
@@ -18,6 +18,7 @@ use raven_railgun_engine::pir_table::{
     PerListNodeEncoder, PerListPathEncoder, PerNodeEncoder, PirTableEncoder,
 };
 use raven_railgun_persistence::WalEntryPayload;
+use raven_railgun_poseidon::merkle_node;
 
 const NODE_BYTES: usize = 32;
 const PATH_RECORD_BYTES: usize = TREE_DEPTH * NODE_BYTES;
@@ -183,6 +184,7 @@ fn per_list_node_and_per_list_path_agree_on_auth_path_bytes() {
     }
 
     let leaves_to_check = [0u32, 1, 7, 17, 64, 128, 200, LEAVES - 1];
+    let list_root = store.ppoi_imt_root(&LIST_KEY).expect("per-list root");
 
     for leaf_idx in leaves_to_check {
         let path_shard_id = leaf_idx / ENTRIES_PER_SHARD;
@@ -211,5 +213,23 @@ fn per_list_node_and_per_list_path_agree_on_auth_path_bytes() {
                 "leaf {leaf_idx} level {level}: per-list-path vs per-list-node sibling byte mismatch"
             );
         }
+
+        // Agreement alone is not correctness: both encoders read the same node maps, so a
+        // tree that is wrong the same way for both passes the comparison above. Folding the
+        // served row with Poseidon is the only assertion here that does not.
+        let mut current = bc_for(leaf_idx);
+        for level in 0..TREE_DEPTH {
+            let sibling = path_siblings[level];
+            current = if (leaf_idx >> level) & 1 == 1 {
+                merkle_node(sibling, current).expect("fold right")
+            } else {
+                merkle_node(current, sibling).expect("fold left")
+            };
+        }
+        assert_eq!(
+            current, list_root,
+            "leaf {leaf_idx}: the per-list-path row served by PIR must fold back to the \
+             per-list IMT root"
+        );
     }
 }

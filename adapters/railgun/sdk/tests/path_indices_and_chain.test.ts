@@ -22,8 +22,12 @@ import {
   type BlindedCommitmentType,
   type RavenErrorKind,
 } from "../src/index";
+import { makeRegisterSpy } from "./helpers/register_spy";
+
+import * as wasmPkg from "raven-inspire-client-wasm";
 
 import { startMockServer, writeJson, type MockServer } from "./helpers/mock_server";
+import { encodeBatchResponse, encodeBatchResponseNodes } from "./helpers/auth_path_stub";
 import { authPathOf, encodedBatchCount } from "./helpers/auth_path_stub";
 
 const TOKEN = "test-token-padded-long-enough-1234";
@@ -65,7 +69,7 @@ function realPathStubWasm(): RavenInspireWasm {
       return new Uint8Array(response);
     },
     build_instance_params_blob: () => new Uint8Array(0),
-    register_client_session: () => {},
+    register_client_session: makeRegisterSpy(),
     path_indices_for_leaf: (_tree: number, leafIdx: number): Uint32Array => {
       const out = new Uint32Array(TREE_DEPTH);
       let walk = leafIdx;
@@ -106,24 +110,9 @@ function mountBatchRoute(server: MockServer, freshness?: { epoch?: number; schem
   server.route(
     (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
     (_req, _body, res) => {
-      const elemCount = 16;
-      const elemBytes = 32;
-      const total = 2 + 8 + elemCount * (8 + elemBytes);
-      const out = new Uint8Array(total);
-      out[0] = 0;
-      out[1] = 1;
-      const dv = new DataView(out.buffer);
-      dv.setUint32(2, elemCount, true);
-      dv.setUint32(6, 0, true);
-      let off = 10;
-      for (let level = 0; level < elemCount; level += 1) {
-        dv.setUint32(off, elemBytes, true);
-        dv.setUint32(off + 4, 0, true);
-        off += 8;
-        out[off] = 0xab;
-        out[off + 31] = level;
-        off += elemBytes;
-      }
+      // 16 synthetic nodes: 0xab marker at byte 0, level at byte 31 — the shared
+      // encoder's (epoch, slot) convention, so the shape has ONE writer.
+      const out = encodeBatchResponse(0xab, 16);
       // `build_response_headers` stamps both on every batch reply, so the mock always does too.
       const headers: Record<string, string> = {
         "content-type": "application/octet-stream",
@@ -196,13 +185,18 @@ function mountSingleQueryRoute(server: MockServer, statusByte: number): void {
   );
 }
 
+// These four ran against `realPathStubWasm()` -- the stub defined in this file -- so they
+// asserted the test's own arithmetic and no change to the shipped wasm could fail them.
+// They drive the real package now, which also makes them the check that the stub every other
+// test in this file relies on actually mirrors the Rust geometry.
 describe("WASM path-indices accessors", () => {
-  const wasm = realPathStubWasm();
+  const wasm = wasmPkg as unknown as RavenInspireWasm;
+  const stub = realPathStubWasm();
 
   it("path_indices_for_leaf returns a Uint32Array of length 16", () => {
     const out = wasm.path_indices_for_leaf(0, 0);
     expect(out).toBeInstanceOf(Uint32Array);
-    expect(out.length).toBe(16);
+    expect(out.length).toBe(TREE_DEPTH);
   });
 
   it("path_indices_for_leaf is deterministic across calls", () => {
@@ -225,6 +219,22 @@ describe("WASM path-indices accessors", () => {
     const listKey = new Uint8Array(32).fill(0xab);
     const list = wasm.path_indices_for_per_list_leaf(listKey, 4242);
     expect(Array.from(tree)).toEqual(Array.from(list));
+  });
+
+  // Everything else in this file reads batch slot counts and cache hit/miss through the stub,
+  // so a stub that drifted from the shipped geometry would make those conclusions wrong.
+  it("the in-file stub reproduces the real wasm path indices at every level", () => {
+    const listKey = new Uint8Array(32).fill(0xab);
+    for (const leaf of [0, 1, 7, 1234, 1234 ^ 0b111, 4096, 65_535]) {
+      expect(
+        Array.from(stub.path_indices_for_leaf(0, leaf)),
+        `tree path for leaf ${leaf}`,
+      ).toEqual(Array.from(wasm.path_indices_for_leaf(0, leaf)));
+      expect(
+        Array.from(stub.path_indices_for_per_list_leaf(listKey, leaf)),
+        `per-list path for leaf ${leaf}`,
+      ).toEqual(Array.from(wasm.path_indices_for_per_list_leaf(listKey, leaf)));
+    }
   });
 
   it("pathIndicesForLeaf wrapper returns plain number[]", () => {
@@ -316,21 +326,10 @@ describe("client-PIR auth-path reconstruction (T2/T3)", () => {
     server.route(
       (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
       (_req, _body, res) => {
-        const elemCount = 8;
-        const elemBytes = 32;
-        const total = 2 + 8 + elemCount * (8 + elemBytes);
-        const out = new Uint8Array(total);
-        out[0] = 0;
-        out[1] = 1;
-        const dv = new DataView(out.buffer);
-        dv.setUint32(2, elemCount, true);
-        dv.setUint32(6, 0, true);
-        let off = 10;
-        for (let i = 0; i < elemCount; i += 1) {
-          dv.setUint32(off, elemBytes, true);
-          dv.setUint32(off + 4, 0, true);
-          off += 8 + elemBytes;
-        }
+        // 8 zero nodes where 16 were requested: the wrong-count reply.
+        const out = encodeBatchResponseNodes(
+          Array.from({ length: 8 }, () => new Uint8Array(32)),
+        );
         res.writeHead(200, {
           "content-type": "application/octet-stream",
           "x-raven-epoch": String(MOCK_EPOCH),

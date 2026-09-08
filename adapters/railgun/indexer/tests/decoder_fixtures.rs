@@ -8,7 +8,9 @@
     clippy::indexing_slicing,
     clippy::doc_lazy_continuation,
     clippy::items_after_statements,
-    clippy::print_stderr
+    clippy::print_stderr,
+    clippy::needless_continue,
+    clippy::match_same_arms
 )]
 
 use alloy::primitives::{Address, B256, U256};
@@ -225,9 +227,82 @@ fn transact_decodes_round_trip() {
     assert_eq!(got_ct.memo.as_ref(), ct.memo.as_ref());
 }
 
-#[test]
-fn shield_decoder_commitment_hash_matches_poseidon_helper() {
+/// One-shot streamer feeding a single scripted Shield log into the ingest path.
+#[derive(Debug)]
+struct OneShotShieldStreamer {
+    log: std::sync::Mutex<Option<alloy::rpc::types::eth::Log>>,
+    logs_tx:
+        std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Result<alloy::rpc::types::eth::Log>>>>,
+}
+
+#[async_trait::async_trait]
+impl raven_railgun_indexer::LogStreamer for OneShotShieldStreamer {
+    async fn open(&self) -> Result<raven_railgun_indexer::SubscribeStreams> {
+        let (heads_tx, heads_rx) = tokio::sync::mpsc::channel(1);
+        let (logs_tx, logs_rx) = tokio::sync::mpsc::channel(2);
+        if let Some(log) = self.log.lock().expect("poison").take() {
+            logs_tx.try_send(Ok(log)).expect("scripted log fits");
+        }
+        // Keep both senders alive so the streams stay open until the
+        // worker's heartbeat window closes the connection.
+        drop(heads_tx.try_send(Ok(100u64)));
+        *self.logs_tx.lock().expect("poison") = Some(logs_tx);
+        drop(heads_tx);
+        Ok(raven_railgun_indexer::SubscribeStreams {
+            heads: heads_rx,
+            logs: logs_rx,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct StaticFallback(u64);
+
+#[async_trait::async_trait]
+impl raven_railgun_indexer::ChainSource for StaticFallback {
+    async fn latest_block(&self) -> Result<u64> {
+        Ok(self.0)
+    }
+    async fn events_in_range(
+        &self,
+        _from: u64,
+        _to: u64,
+    ) -> Result<Vec<raven_railgun_core::RailgunEvent>> {
+        Ok(Vec::new())
+    }
+    async fn root_history(
+        &self,
+        _tree: u32,
+        _root: [u8; 32],
+        _at: Option<alloy::eips::BlockId>,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+    async fn block_hash(&self, _n: u64) -> Result<[u8; 32]> {
+        Ok([0u8; 32])
+    }
+    async fn merkle_root(&self, _at: Option<alloy::eips::BlockId>) -> Result<[u8; 32]> {
+        Ok([0u8; 32])
+    }
+    async fn active_tree_number(&self, _at: Option<alloy::eips::BlockId>) -> Result<u32> {
+        Ok(0)
+    }
+}
+
+use raven_railgun_indexer::Result;
+
+/// The DECODER's Shield commitment hash, observed through the public ingest
+/// path (`SubscribeWorker`), must equal an independently computed
+/// `Poseidon(npk, tokenHash, value)`. The previous version of this test
+/// compared the helper against itself and stayed green with the decoder's
+/// hash inputs swapped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shield_decoder_commitment_hash_matches_poseidon_helper() {
     use alloy::primitives::Address as AlloyAddress;
+    use alloy::sol_types::SolEvent;
+    use raven_railgun_core::RailgunEvent;
+    use std::sync::Arc;
+
     let tree = U256::from(0u64);
     let start = U256::from(7u64);
     let token_address: [u8; 20] = [0x42; 20];
@@ -238,11 +313,10 @@ fn shield_decoder_commitment_hash_matches_poseidon_helper() {
     };
     let mut npk_be = [0u8; 32];
     npk_be[24..].copy_from_slice(&0x1234_5678_u64.to_be_bytes());
-    let npk_b256 = B256::from(npk_be);
     let value_u120 = 1_000_000u64;
     let commitments = vec![abi::CommitmentPreimage {
-        npk: npk_b256,
-        token: token.clone(),
+        npk: B256::from(npk_be),
+        token,
         value: alloy::primitives::Uint::<120, 2>::from(value_u120),
     }];
     let shield_ct = vec![abi::ShieldCiphertext {
@@ -250,33 +324,76 @@ fn shield_decoder_commitment_hash_matches_poseidon_helper() {
         shieldKey: B256::ZERO,
     }];
     let fees: Vec<U256> = vec![U256::from(0u64)];
-
     let data = (tree, start, commitments, shield_ct, fees).abi_encode_params();
-    let log_data =
-        alloy::primitives::LogData::new_unchecked(vec![abi::Shield::SIGNATURE_HASH], data.into());
+    let log = alloy::rpc::types::eth::Log {
+        inner: alloy::primitives::Log {
+            address: AlloyAddress::ZERO,
+            data: alloy::primitives::LogData::new_unchecked(
+                vec![abi::Shield::SIGNATURE_HASH],
+                data.into(),
+            ),
+        },
+        block_number: Some(100),
+        transaction_hash: Some(B256::ZERO),
+        ..Default::default()
+    };
 
-    use alloy::sol_types::SolEvent;
-    let decoded = abi::Shield::decode_log_data(&log_data).expect("decode");
-    let preimage = decoded.commitments.first().expect("commitment present");
+    let streamer = Arc::new(OneShotShieldStreamer {
+        log: std::sync::Mutex::new(Some(log)),
+        logs_tx: std::sync::Mutex::new(None),
+    });
+    let fallback = Arc::new(StaticFallback(100));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let worker = raven_railgun_indexer::SubscribeWorker::new(streamer, fallback, tx);
+    let cfg = raven_railgun_indexer::SubscribeWorkerConfig {
+        heartbeat_secs: 1,
+        reconnect_total_secs: 1,
+        polling_dwell: std::time::Duration::from_millis(100),
+    };
+    let join = tokio::spawn(async move { worker.run(cfg).await });
 
-    let npk_bytes = preimage.npk.0;
+    let mut decoded_leaves = None;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline && decoded_leaves.is_none() {
+        match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(raven_railgun_indexer::IndexerMessage::Event { event, .. })) => match event {
+                RailgunEvent::Shield {
+                    tree_number,
+                    start_position,
+                    leaves,
+                    ..
+                } => {
+                    assert_eq!(tree_number, 0);
+                    assert_eq!(start_position, 7);
+                    decoded_leaves = Some(leaves);
+                }
+                other => panic!("scripted a Shield log; decoder produced {other:?}"),
+            },
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    drop(rx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), join).await;
+
+    let leaves = decoded_leaves.expect("decoder must surface the Shield event");
+    assert_eq!(leaves.len(), 1, "one commitment => one leaf");
+    let leaf = leaves.first().expect("leaf present");
+    assert_eq!(leaf.leaf_index, 7, "leaf_index = startPosition + i");
+
     let token_hash = raven_railgun_poseidon::token_data_hash_erc20(token_address);
-    let value_u256 = alloy::primitives::U256::from(preimage.value);
-    let value_be = value_u256.to_be_bytes::<32>();
+    let value_be = U256::from(value_u120).to_be_bytes::<32>();
     let expected_hash =
-        raven_railgun_poseidon::shield_commitment_hash(npk_bytes, token_hash, value_be)
+        raven_railgun_poseidon::shield_commitment_hash(npk_be, token_hash, value_be)
             .expect("poseidon");
-
     assert!(
         expected_hash.iter().any(|&b| b != 0),
         "commitment_hash should be non-zero"
     );
-
-    let recompute = raven_railgun_poseidon::shield_commitment_hash(npk_bytes, token_hash, value_be)
-        .expect("recompute");
     assert_eq!(
-        expected_hash, recompute,
-        "Poseidon must be deterministic on identical inputs"
+        leaf.commitment_hash, expected_hash,
+        "decoder's commitment_hash must equal Poseidon(npk, tokenHash, value)"
     );
 }
 

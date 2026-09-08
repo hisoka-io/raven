@@ -52,7 +52,9 @@ fn rewrite_to_tempdir(src: &Path, tmp: &Path, bind: SocketAddr, token: &str) -> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing multi-instance config-file boot or the status listing."]
 async fn six_instance_config_file_boots_and_status_lists_all() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let bind: SocketAddr = "127.0.0.1:0".parse().expect("addr");

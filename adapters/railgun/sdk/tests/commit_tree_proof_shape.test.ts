@@ -6,6 +6,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { RavenPOINodeInterface } from "../src/index";
+import { makeRegisterSpy } from "./helpers/register_spy";
 import type { ClientPirContext, RavenInspireWasm } from "../src/index";
 
 import { startMockServer, writeJson, type MockServer } from "./helpers/mock_server";
@@ -23,7 +24,7 @@ function stubWasm(): RavenInspireWasm {
     build_seeded_query: () => new Uint8Array(16),
     extract_response: (_session, _crs, _state, response, _entry) => new Uint8Array(response),
     build_instance_params_blob: () => new Uint8Array(0),
-    register_client_session: () => {},
+    register_client_session: makeRegisterSpy(),
     path_indices_for_leaf: () => new Uint32Array(16),
     path_indices_for_per_list_leaf: () => new Uint32Array(16),
   };

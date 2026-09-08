@@ -119,7 +119,9 @@ fn reconstruct_root(leaf: [u8; 32], leaf_index: u32, path: &MerkleProof) -> [u8;
 }
 
 #[test]
-#[ignore = "production-cell setup is heavy (~12s); T2 path PIR closure"]
+#[ignore = "production-cell setup is heavy (~12s); T2 path PIR closure. Trigger: changing the \
+            per-list auth-path encoder or ppoi_merkle_proof. CI runs it in the durability + \
+            closure lane."]
 fn t2_pir_query_recovers_auth_path_byte_identical_and_root_reconstructs() {
     let (live_state, client_session, store, params) = build_state_session();
 

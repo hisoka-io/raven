@@ -72,6 +72,7 @@ fn commit_v6_then_reopen_preserves_logical_leaf_store() {
             .expect("stage append_leaf");
     }
     assert_eq!(staged.imt_leaf_count_for(TREE_NUMBER), 5);
+    let staged_root = staged.imt_root(TREE_NUMBER).expect("staged tree root");
 
     let _new_id = opened
         .persistence
@@ -103,5 +104,25 @@ fn commit_v6_then_reopen_preserves_logical_leaf_store() {
          fails, persistence.rs:170 has reverted to the legacy \
          `restore_inspire_state` (V5-only) reader, OR commit_v6 lost the \
          store field at write time"
+    );
+
+    // A count survives a codec that restores the right number of leaves carrying the
+    // wrong bytes, which is the silent-wrong shape this cell exists to refuse.
+    for i in 0..5u32 {
+        let want = canonical(u8::try_from(i).unwrap_or(0).saturating_add(1));
+        assert_eq!(
+            opened2
+                .recovered_logical_store
+                .leaf(TREE_NUMBER, i)
+                .copied(),
+            Some(want),
+            "leaf {i} must byte-equal the commitment commit_v6 embedded"
+        );
+    }
+    assert_eq!(
+        opened2.recovered_logical_store.imt_root(TREE_NUMBER),
+        Some(staged_root),
+        "the recovered IMT root must equal the staged tree's root, so corruption that \
+         never reaches a leaf slot is caught too"
     );
 }

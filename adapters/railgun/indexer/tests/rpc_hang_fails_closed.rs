@@ -76,23 +76,11 @@ fn ceiling() -> Duration {
     Duration::from_secs(RPC_TIMEOUT_SECS * 12 + 20)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_pooled_call_against_a_black_hole_returns_an_error() {
-    let addr = spawn_black_hole().await;
-    let src = pooled(addr);
-    let started = Instant::now();
-    let out = tokio::time::timeout(ceiling(), src.latest_block()).await;
-    let elapsed = started.elapsed();
-    let inner = out.unwrap_or_else(|_| {
-        panic!("latest_block never returned within {elapsed:?}; the hang is unfixed")
-    });
-    let err = inner.expect_err("a black-holing endpoint cannot produce a block number");
-    assert!(
-        format!("{err}").to_lowercase().contains("timeout"),
-        "the error must say timeout so classify_indexer_error routes it to Network and the \
-         pool cools the endpoint down; got: {err}"
-    );
-}
+// The single-call latest_block case is subsumed: every_pooled_chain_source_method
+// below calls latest_block first and its macro asserts the same timeout wording
+// (which classify_indexer_error routes on), and the chain-id-then-black-hole test
+// asserts it through the discriminating fixture. Both proven RED under a mutant
+// that reworded the timeout error.
 
 /// Every ChainSource method, not just the one that is easy to call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -120,7 +108,24 @@ async fn every_pooled_chain_source_method_fails_closed_against_a_black_hole() {
         }};
     }
 
-    must_return!("latest_block", src.latest_block());
+    // The FIRST failure must carry the timeout wording: classify_indexer_error
+    // routes on it to pick Network over fatal, and the pool cooldown depends on
+    // that routing. Later calls see the pool-level cooling-down error instead,
+    // which is why the macro cannot assert the substring for every method.
+    {
+        let started = Instant::now();
+        let out = tokio::time::timeout(c, src.latest_block()).await;
+        let elapsed = started.elapsed();
+        let inner = out.unwrap_or_else(|_| {
+            panic!("latest_block never returned within {elapsed:?}; the hang is unfixed")
+        });
+        let err = inner.expect_err("a black-holing endpoint cannot produce a block number");
+        assert!(
+            format!("{err}").to_lowercase().contains("timeout"),
+            "the first error must say timeout so classify_indexer_error routes it to Network \
+             and the pool cools the endpoint down; got: {err}"
+        );
+    }
     must_return!("events_in_range", src.events_in_range(1, 2));
     must_return!("block_hash", src.block_hash(1));
     must_return!("merkle_root", src.merkle_root(None));

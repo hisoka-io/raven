@@ -1,7 +1,10 @@
-//! Crash-recovery, idempotency, and per-list-node migration for `migrate-encoder`.
+//! Idempotency, byte-identity, and encoder-label refusal for `migrate-encoder`.
 //!
-//! Crashes are simulated in-process: every migration step lands on disk before
-//! returning.
+//! Crash coverage lives in `migrate_encoder_real_sigkill.rs` (real SIGKILL at
+//! parked checkpoints); the in-process crash simulations that used to live here
+//! asserted the behaviour of their own step copies and were deleted after a
+//! mutation proof (V5-writer defect reintroduced at migrate_encoder.rs:143:
+//! both stayed green; migrate_encoder_v6_round_trip is the honest guard).
 
 #![cfg_attr(
     test,
@@ -20,16 +23,14 @@ use std::sync::Arc;
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_core::{AdapterError, InstanceId};
 use raven_railgun_engine::inspire::{
-    apply_wal_entry, re_encode_shard, restore_inspire_state, setup_state, snapshot_inspire_state,
-    InspireServerState, LogicalLeafStore,
+    apply_wal_entry, setup_state, InspireServerState, LogicalLeafStore,
 };
 use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{
     EncoderKind, PerLeafCommitmentEncoder, PerListNodeEncoder, PerListPathEncoder, PirTableEncoder,
 };
 use raven_railgun_persistence::{
-    Manifest, Snapshot, SnapshotId, StoreLayout, Wal, WalEntryPayload, MANIFEST_SCHEMA_VERSION,
-    SNAPSHOT_MAGIC,
+    Manifest, Snapshot, SnapshotId, StoreLayout, Wal, WalEntryPayload, SNAPSHOT_MAGIC,
 };
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-kill-during-migration";
@@ -166,106 +167,11 @@ fn replay_wal_into_logical_store(layout: &StoreLayout, manifest: &Manifest) -> L
     logical_store
 }
 
-struct PreparedMigration {
-    layout: StoreLayout,
-    manifest: Manifest,
-    state: InspireServerState,
-    logical_store: LogicalLeafStore,
-    encoder: Arc<dyn PirTableEncoder>,
-    new_label: &'static str,
-    old_label: String,
-}
-
-fn prepare_migration(dir_path: &Path, target: EncoderKind) -> PreparedMigration {
-    let layout = StoreLayout::open(dir_path).expect("layout");
-    let manifest = Manifest::load(&layout)
-        .expect("manifest load")
-        .expect("manifest present");
-    let old_label = manifest.encoder_label.clone();
-    let new_label = target.label();
-    assert_ne!(
-        old_label, new_label,
-        "prepare_migration called with target == current encoder; \
-         caller must guard idempotency separately"
-    );
-    assert_ne!(
-        manifest.current_snapshot_id,
-        SnapshotId(0),
-        "prepare_migration requires a committed snapshot"
-    );
-
-    let snap =
-        Snapshot::load(&layout, manifest.current_snapshot_id, SNAPSHOT_MAGIC).expect("snap load");
-    let state = restore_inspire_state(&snap.data).expect("restore state");
-    let logical_store = replay_wal_into_logical_store(&layout, &manifest);
-
-    let entries_per_shard = u32::try_from(
-        state
-            .encoded_db
-            .config
-            .entries_per_shard()
-            .min(u64::from(u32::MAX)),
-    )
-    .unwrap_or(u32::MAX);
-    let encoder = target
-        .build(state.entry_size, entries_per_shard)
-        .expect("build target encoder");
-
-    PreparedMigration {
-        layout,
-        manifest,
-        state,
-        logical_store,
-        encoder,
-        new_label,
-        old_label,
-    }
-}
-
-fn re_encode_all_shards(prep: &mut PreparedMigration) {
-    let shard_count = prep.state.encoded_db.shards.len();
-    for shard_id in 0..u32::try_from(shard_count).unwrap_or(u32::MAX) {
-        let shard_bytes = prep
-            .encoder
-            .materialize_shard(shard_id, &prep.logical_store);
-        re_encode_shard(
-            Arc::make_mut(&mut prep.state.encoded_db),
-            &prep.state.crs.params,
-            shard_id,
-            &shard_bytes,
-            prep.state.entry_size,
-        )
-        .expect("re_encode_shard");
-    }
-}
-
-fn save_re_encoded_snapshot(prep: &PreparedMigration) -> SnapshotId {
-    let bundle = snapshot_inspire_state(&prep.state).expect("snapshot_inspire_state");
-    let new_snap = Snapshot::build(bundle, SNAPSHOT_MAGIC);
-    let new_id = prep.manifest.current_snapshot_id.next();
-    new_snap.save(&prep.layout, new_id).expect("snapshot save");
-    new_id
-}
-
-fn bump_manifest(prep: &PreparedMigration, new_id: SnapshotId) {
-    let new_manifest = Manifest {
-        schema_version: MANIFEST_SCHEMA_VERSION,
-        scheme_tag: prep.manifest.scheme_tag.clone(),
-        instance_id: prep.manifest.instance_id.clone(),
-        current_snapshot_id: new_id,
-        current_snapshot_seq: prep.manifest.current_snapshot_seq,
-        current_marker: prep.manifest.current_marker,
-        encoder_label: prep.new_label.to_owned(),
-        prev_encoder_label: Some(prep.old_label.clone()),
-    };
-    new_manifest.save(&prep.layout).expect("manifest save");
-}
-
+/// Drives the REAL production migration. The in-process step copies that used
+/// to live here diverged from migrate_encoder.rs (V5 reader vs V6); asserting
+/// on the real path is the only form that can catch a production regression.
 fn run_full_migration(dir_path: &Path, target: EncoderKind) {
-    let mut prep = prepare_migration(dir_path, target);
-    re_encode_all_shards(&mut prep);
-    let new_id = save_re_encoded_snapshot(&prep);
-    bump_manifest(&prep, new_id);
+    raven_railgun_cli::migrate_encoder::run(dir_path, target).expect("migrate-encoder run");
 }
 
 fn read_manifest(dir_path: &Path) -> Manifest {
@@ -287,45 +193,16 @@ fn snapshot_bytes(dir_path: &Path, id: SnapshotId) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
-fn kill_during_after_pre_snapshot_before_re_encode_recovers_via_old_encoder_and_resumes() {
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing InspirePersistence::open's encoder_label refusal. CI runs it in \
+            the durability + closure crash-safety lane."]
+fn encoder_label_mismatch_refuses_open_until_migration_completes() {
     let dir = tempfile::tempdir().expect("tempdir");
-
     seed_with_committed_snapshot(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 }, 50);
-    let manifest_pre = read_manifest(dir.path());
-    let pre_snap_bytes = snapshot_bytes(dir.path(), manifest_pre.current_snapshot_id);
-    let pre_manifest_raw = manifest_bytes(dir.path());
 
-    // simulate crash: re-encode in memory, drop before any disk write
-    {
-        let mut prep = prepare_migration(dir.path(), EncoderKind::PerNode { tree_number: 0 });
-        re_encode_all_shards(&mut prep);
-    }
-
-    let manifest_post_crash = read_manifest(dir.path());
-    assert_eq!(
-        manifest_post_crash, manifest_pre,
-        "post-crash manifest must equal pre-crash manifest (no bump occurred)"
-    );
-    assert_eq!(
-        manifest_bytes(dir.path()),
-        pre_manifest_raw,
-        "manifest bytes must be byte-identical (atomic-rename was never invoked)"
-    );
-    assert_eq!(
-        snapshot_bytes(dir.path(), manifest_post_crash.current_snapshot_id),
-        pre_snap_bytes,
-        "pre-crash snapshot bytes must survive untouched"
-    );
-    assert_eq!(
-        manifest_post_crash.encoder_label, "per-leaf-bc",
-        "encoder_label must still be the prior encoder after partial crash"
-    );
-    assert_eq!(
-        manifest_post_crash.prev_encoder_label, None,
-        "prev_encoder_label must remain None - no manifest bump fired"
-    );
-
+    // Mid-migration reopen under the not-yet-stamped target label must refuse,
+    // not silently serve rows encoded under the other layout.
     let layout_new = StoreLayout::open(dir.path()).expect("layout");
     let err_new = InspirePersistence::open(
         layout_new,
@@ -345,6 +222,7 @@ fn kill_during_after_pre_snapshot_before_re_encode_recovers_via_old_encoder_and_
         "must be Internal-class for operator-visible refusal"
     );
 
+    // The matching label still opens and recovers every leaf.
     let layout_old = StoreLayout::open(dir.path()).expect("layout");
     let opened_old = InspirePersistence::open(
         layout_old,
@@ -359,121 +237,13 @@ fn kill_during_after_pre_snapshot_before_re_encode_recovers_via_old_encoder_and_
         50,
         "WAL replay must restore all 50 leaves"
     );
-    drop(opened_old);
-
-    run_full_migration(dir.path(), EncoderKind::PerNode { tree_number: 0 });
-    let manifest_resumed = read_manifest(dir.path());
-    assert_eq!(manifest_resumed.encoder_label, "per-node");
-    assert_eq!(
-        manifest_resumed.prev_encoder_label,
-        Some("per-leaf-bc".to_owned())
-    );
-    assert_eq!(
-        manifest_resumed.current_snapshot_id,
-        manifest_pre.current_snapshot_id.next(),
-        "snapshot id must be bumped by exactly 1 after the resumed run"
-    );
 }
 
 #[test]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
-fn kill_during_after_re_encode_before_manifest_bump_recovers_idempotently() {
-    let dir = tempfile::tempdir().expect("tempdir");
-
-    let pre_id =
-        seed_with_committed_snapshot(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 }, 32);
-    let manifest_pre = read_manifest(dir.path());
-    let pre_manifest_raw = manifest_bytes(dir.path());
-
-    let staged_id;
-    {
-        let mut prep = prepare_migration(dir.path(), EncoderKind::PerNode { tree_number: 0 });
-        re_encode_all_shards(&mut prep);
-        staged_id = save_re_encoded_snapshot(&prep);
-        // crash: drop before bump_manifest
-    }
-
-    let manifest_post_crash = read_manifest(dir.path());
-    assert_eq!(
-        manifest_bytes(dir.path()),
-        pre_manifest_raw,
-        "manifest bytes unchanged - bump never landed"
-    );
-    assert_eq!(
-        manifest_post_crash.current_snapshot_id, pre_id,
-        "manifest must still reference the pre-migration snapshot"
-    );
-    assert_eq!(manifest_post_crash.encoder_label, "per-leaf-bc");
-    assert_ne!(
-        staged_id, manifest_post_crash.current_snapshot_id,
-        "the staged new snapshot lives at a higher id than the live one"
-    );
-
-    {
-        let layout = StoreLayout::open(dir.path()).expect("layout");
-        let opened = InspirePersistence::open(
-            layout,
-            SCHEME_TAG,
-            InstanceId::new("kill-during-migrate"),
-            SnapshotPolicy::default(),
-            encoder_arc(EncoderKind::PerLeafBc { tree_number: 0 }),
-        )
-        .expect("reopen with old encoder");
-        assert_eq!(
-            opened.recovered_logical_store.imt_leaf_count_for(0),
-            32,
-            "WAL replay must restore all leaves"
-        );
-    }
-
-    run_full_migration(dir.path(), EncoderKind::PerNode { tree_number: 0 });
-    let manifest_resumed_a = read_manifest(dir.path());
-    let snapshot_after_first_resume =
-        snapshot_bytes(dir.path(), manifest_resumed_a.current_snapshot_id);
-    let manifest_after_first_resume = manifest_bytes(dir.path());
-
-    // Save-only must not touch the live manifest or live-id snapshot bytes.
-    {
-        let prep = prepare_migration(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 });
-        let mut prep_mut = prep;
-        re_encode_all_shards(&mut prep_mut);
-        let id_extra = save_re_encoded_snapshot(&prep_mut);
-        assert_ne!(
-            id_extra, manifest_resumed_a.current_snapshot_id,
-            "staged snapshot for would-be reverse migration must not overwrite live id"
-        );
-    }
-    let manifest_after_extra = read_manifest(dir.path());
-    let snapshot_after_extra = snapshot_bytes(dir.path(), manifest_after_extra.current_snapshot_id);
-    assert_eq!(
-        manifest_after_extra, manifest_resumed_a,
-        "manifest must be unchanged by save-only operations"
-    );
-    assert_eq!(
-        manifest_bytes(dir.path()),
-        manifest_after_first_resume,
-        "manifest bytes must be stable across save-only operations"
-    );
-    assert_eq!(
-        snapshot_after_extra, snapshot_after_first_resume,
-        "snapshot bytes at the live id must be byte-stable"
-    );
-    assert_eq!(
-        manifest_after_extra.encoder_label, "per-node",
-        "encoder_label must remain at the migrated value"
-    );
-    assert_eq!(
-        manifest_after_extra.prev_encoder_label,
-        Some("per-leaf-bc".to_owned())
-    );
-    assert_eq!(
-        manifest_after_extra.current_snapshot_id,
-        manifest_pre.current_snapshot_id.next()
-    );
-}
-
-#[test]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing the encoder-migration step order (pre-snapshot, re-encode, manifest \
+            bump) or its idempotence. CI runs it in the durability + closure crash-safety lane."]
 fn migration_repeated_three_times_on_same_data_dir_is_byte_identical() {
     let dir = tempfile::tempdir().expect("tempdir");
     seed_with_committed_snapshot(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 }, 16);
@@ -515,8 +285,11 @@ fn migration_repeated_three_times_on_same_data_dir_is_byte_identical() {
 }
 
 #[test]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
-fn per_list_node_migration_byte_identity_at_levels_0_1_8() {
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing the per-list encoder row layouts or the migrate-encoder width \
+            refusal. CI runs it in the durability + closure crash-safety lane."]
+fn per_list_node_byte_identity_at_levels_0_1_8_and_width_migration_refusal() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     seed_ppoi_list_with_committed_snapshot(
@@ -543,22 +316,27 @@ fn per_list_node_migration_byte_identity_at_levels_0_1_8() {
         "oracle imt must hold all seeded leaves"
     );
 
-    run_full_migration(
+    // Production REFUSES this migration: per-list-node emits 32-byte rows and the
+    // stored per-list-path cell is 512 bytes wide. The deleted in-process copy
+    // performed it anyway and asserted the labels of a migration that can never
+    // happen; the refusal is the real contract.
+    let err = raven_railgun_cli::migrate_encoder::run(
         dir.path(),
         EncoderKind::PerListNode {
             list_key: LIST_KEY_OFAC,
         },
+    )
+    .expect_err("width-changing migration must be refused");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("32") && msg.contains("512"),
+        "refusal must name both widths; got: {msg}"
     );
 
     let manifest_post = read_manifest(dir.path());
-    assert_eq!(manifest_post.encoder_label, "per-list-node");
     assert_eq!(
-        manifest_post.prev_encoder_label,
-        Some("per-list-path".to_owned())
-    );
-    assert_eq!(
-        manifest_post.current_snapshot_id,
-        manifest_pre.current_snapshot_id.next()
+        manifest_post, manifest_pre,
+        "refused migration must leave the manifest untouched"
     );
 
     // PerListNode shares PerNode's flat-global-index layout: leaves, level 1, ..., root.

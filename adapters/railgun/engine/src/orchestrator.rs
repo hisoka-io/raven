@@ -702,6 +702,30 @@ where
     })
 }
 
+fn count_router_drop(reason: &'static str) {
+    metrics::counter!(ROUTER_DROPPED, "reason" => reason).increment(1);
+}
+
+/// Router drops are silent by construction: an event for a tree no instance routes,
+/// or a consumer whose channel has closed, leaves no trace a test or an operator can
+/// see. That is the shape of the tree-4 outage. Counted here so it is assertable.
+const ROUTER_DROPPED: &str = "raven_railgun_router_dropped_events_total";
+
+fn ensure_router_metrics_described() {
+    metrics::describe_counter!(
+        ROUTER_DROPPED,
+        metrics::Unit::Count,
+        "Count of indexer/mirror events the multi-instance router discarded. \
+         `reason=no_route`: no instance is bound to the event's tree number or \
+         list key, so the event is lost and that tree falls behind the chain. \
+         `reason=consumer_channel_closed`: the bound consumer task is gone. \
+         Both must stay at 0 in a healthy deployment; non-zero means events \
+         are being dropped on the floor."
+    );
+    metrics::counter!(ROUTER_DROPPED, "reason" => "no_route").increment(0);
+    metrics::counter!(ROUTER_DROPPED, "reason" => "consumer_channel_closed").increment(0);
+}
+
 /// Fan indexer and mirror events to per-instance consumers by `data_source`.
 /// Returns once both inbound channels close.
 async fn multi_instance_router(
@@ -712,6 +736,7 @@ async fn multi_instance_router(
     tree_observed: tokio::sync::broadcast::Sender<u32>,
     list_observed: tokio::sync::broadcast::Sender<[u8; 32]>,
 ) {
+    ensure_router_metrics_described();
     let mut indexer_open = true;
     let mut mirror_open = true;
     loop {
@@ -777,13 +802,39 @@ async fn forward_indexer_message(
                 // Last recipient takes ownership, so the common single-route case never clones.
                 if let Some((last, rest)) = matched.split_last() {
                     for tx in rest {
-                        let _ = tx
+                        if tx
                             .send(ConsumerEvent::Chain(event.clone(), block_height))
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            count_router_drop("consumer_channel_closed");
+                            tracing::warn!(
+                                tree_number = t,
+                                block_height,
+                                "consumer channel closed; chain event dropped"
+                            );
+                        }
                     }
-                    let _ = last.send(ConsumerEvent::Chain(event, block_height)).await;
+                    if last
+                        .send(ConsumerEvent::Chain(event, block_height))
+                        .await
+                        .is_err()
+                    {
+                        count_router_drop("consumer_channel_closed");
+                        tracing::warn!(
+                            tree_number = t,
+                            block_height,
+                            "consumer channel closed; chain event dropped"
+                        );
+                    }
                 } else {
-                    tracing::trace!(tree_number = t, "no instance routes tree; dropping event");
+                    count_router_drop("no_route");
+                    tracing::warn!(
+                        tree_number = t,
+                        block_height,
+                        "no instance routes tree; event dropped and that tree now \
+                         trails the chain"
+                    );
                 }
             }
         }
@@ -840,11 +891,30 @@ async fn forward_mirror_payload(
         .collect();
     // Last recipient takes ownership, so the common single-route case never clones.
     let Some((last, rest)) = matched.split_last() else {
-        tracing::trace!("no instance routes list_key; dropping mirror payload");
+        count_router_drop("no_route");
+        tracing::warn!(
+            height,
+            "no instance routes list_key; mirror payload dropped and that list now \
+             trails the mirror"
+        );
         return;
     };
     for tx in rest {
-        let _ = tx.send(ConsumerEvent::Ppoi(payload.clone(), height)).await;
+        if tx
+            .send(ConsumerEvent::Ppoi(payload.clone(), height))
+            .await
+            .is_err()
+        {
+            count_router_drop("consumer_channel_closed");
+            tracing::warn!(height, "consumer channel closed; mirror payload dropped");
+        }
     }
-    let _ = last.send(ConsumerEvent::Ppoi(payload, height)).await;
+    if last
+        .send(ConsumerEvent::Ppoi(payload, height))
+        .await
+        .is_err()
+    {
+        count_router_drop("consumer_channel_closed");
+        tracing::warn!(height, "consumer channel closed; mirror payload dropped");
+    }
 }

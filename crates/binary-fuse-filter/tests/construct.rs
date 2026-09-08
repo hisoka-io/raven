@@ -36,35 +36,6 @@ fn db_refs(owned: &[(Vec<u8>, Vec<u8>)]) -> HashMap<&[u8], &[u8]> {
 }
 
 #[test]
-fn construct_3_wise_smoke_small() {
-    let owned = make_random_db(64, 0xC0FFEE);
-    let db = db_refs(&owned);
-    let (filter, reverse_order, reverse_h, hash_to_key) =
-        BinaryFuseFilter::construct_3_wise(&db, 8, 100).expect("construct 3-wise");
-    assert_eq!(filter.arity, 3);
-    assert_eq!(filter.filter_size, 64);
-    assert_eq!(filter.mat_elem_bit_len, 8);
-    assert_eq!(reverse_h.len(), 64);
-    // db.len() + 1 (last entry is the sentinel `1`).
-    assert_eq!(reverse_order.len(), 65);
-    assert_eq!(hash_to_key.len(), 64);
-}
-
-#[test]
-fn construct_4_wise_smoke_small() {
-    let owned = make_random_db(128, 0xBADBEEF);
-    let db = db_refs(&owned);
-    let (filter, reverse_order, reverse_h, hash_to_key) =
-        BinaryFuseFilter::construct_4_wise(&db, 12, 100).expect("construct 4-wise");
-    assert_eq!(filter.arity, 4);
-    assert_eq!(filter.filter_size, 128);
-    assert_eq!(filter.mat_elem_bit_len, 12);
-    assert_eq!(reverse_h.len(), 128);
-    assert_eq!(reverse_order.len(), 129);
-    assert_eq!(hash_to_key.len(), 128);
-}
-
-#[test]
 fn construct_errors_on_empty_db() {
     let db: HashMap<&[u8], &[u8]> = HashMap::new();
     match BinaryFuseFilter::construct_3_wise(&db, 8, 100) {
@@ -75,16 +46,6 @@ fn construct_errors_on_empty_db() {
         Err(BffError::EmptyKeyValueDatabase) => {}
         other => panic!("expected EmptyKeyValueDatabase, got {other:?}"),
     }
-}
-
-#[test]
-fn serialize_roundtrip_3_wise() {
-    let owned = make_random_db(32, 0xABC123);
-    let db = db_refs(&owned);
-    let (filter, _, _, _) = BinaryFuseFilter::construct_3_wise(&db, 10, 50).expect("construct");
-    let bytes = filter.to_bytes();
-    let parsed = BinaryFuseFilter::from_bytes(&bytes).expect("from_bytes");
-    assert_eq!(filter, parsed);
 }
 
 #[test]
@@ -112,6 +73,19 @@ fn bits_per_entry_positive_for_nonempty_filter() {
     let db = db_refs(&owned);
     let (filter, _, _, _) = BinaryFuseFilter::construct_3_wise(&db, 8, 50).expect("construct");
     let bpe = filter.bits_per_entry();
+    // bits_per_entry is the filter's size accounting; pin it to the formula recomputed
+    // from the filter's own fields, since a bare (0, 64) range check admits a swapped
+    // numerator/denominator and two constant-valued implementations.
+    assert_ne!(
+        filter.num_fingerprints, filter.filter_size,
+        "fixture must keep numerator and denominator distinguishable"
+    );
+    let expected = (filter.num_fingerprints as f64) * (filter.mat_elem_bit_len as f64)
+        / (filter.filter_size as f64);
+    assert!(
+        (bpe - expected).abs() < 1e-9,
+        "bits_per_entry {bpe} != num_fingerprints*mat_elem_bit_len/filter_size {expected}"
+    );
     assert!(bpe > 0.0, "bits_per_entry should be positive");
     assert!(bpe < 64.0, "bits_per_entry suspiciously large: {bpe}");
 }
@@ -150,6 +124,7 @@ proptest! {
             reverse_order.len(), actual_db_len, n, seed, filter.filter_size, filter.num_fingerprints);
         prop_assert_eq!(hash_to_key.len(), actual_db_len);
         prop_assert_eq!(filter.mat_elem_bit_len, mat_bits);
+        prop_assert_eq!(filter.arity, 3);
     }
 
     #[test]
@@ -163,9 +138,14 @@ proptest! {
         prop_assume!(db.len() == n);
         let result = BinaryFuseFilter::construct_4_wise(&db, mat_bits, 100);
         prop_assert!(result.is_ok(), "construct failed for n={n} seed={seed:x}: {result:?}");
-        let (filter, _, _, hash_to_key) = result.unwrap();
+        let (filter, reverse_order, reverse_h, hash_to_key) = result.unwrap();
         prop_assert_eq!(filter.filter_size, n);
         prop_assert_eq!(hash_to_key.len(), n);
+        // folded from the retired 4-wise smoke example, matching the 3-wise sibling
+        prop_assert_eq!(filter.arity, 4);
+        prop_assert_eq!(filter.mat_elem_bit_len, mat_bits);
+        prop_assert_eq!(reverse_h.len(), n);
+        prop_assert_eq!(reverse_order.len(), n + 1);
     }
 
     #[test]

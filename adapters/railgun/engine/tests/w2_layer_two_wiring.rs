@@ -195,9 +195,11 @@ async fn layer2_verifier_fires_per_commit_and_cascades_reorg_on_out_of_sync() {
         "post-cascade leaf_count must be <= 5 (the flip-window survivor); got {post_cascade_count}"
     );
 
-    assert!(
-        handle.logical_store.lock().leaf(0, 0).is_some(),
-        "leaf at index 0 must survive the cascade",
+    assert_eq!(
+        handle.logical_store.lock().leaf(0, 0).copied(),
+        Some(canonical_commitment(0x01)),
+        "leaf 0 must survive the cascade with its bytes: `leaf()` is a BTreeMap probe, \
+         so `is_some()` also holds for a row the cascade rewrote",
     );
 
     // One root_history call per verify cycle guards the shared anchor.
@@ -294,9 +296,10 @@ async fn layer2_first_verdict_out_of_sync_must_not_truncate_to_genesis() {
         leaf_count > 0,
         "an anchorless OutOfSync must not truncate the tree to genesis; leaf_count = {leaf_count}"
     );
-    assert!(
-        handle.logical_store.lock().leaf(0, 0).is_some(),
-        "leaf at index 0 must survive an anchorless OutOfSync verdict",
+    assert_eq!(
+        handle.logical_store.lock().leaf(0, 0).copied(),
+        Some(canonical_commitment(0x20)),
+        "leaf 0 must survive an anchorless OutOfSync verdict with its bytes intact",
     );
 
     let metrics = *handle.metrics.lock();

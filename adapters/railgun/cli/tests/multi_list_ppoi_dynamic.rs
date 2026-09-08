@@ -24,8 +24,36 @@ use raven_railgun_engine::orchestrator::PpoiListRoutes;
 use raven_railgun_engine::persistence::ConsumerEvent;
 use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
 
-const TOY_ENTRIES: usize = 256;
 const TOY_ENTRY_BYTES: usize = 256;
+
+/// Legal row count for `encoder`, which is NOT the same for every encoder.
+///
+/// `min_total_entries()` is `PER_NODE_TOTAL_NODES` for the node-keyed encoders and
+/// `LEAVES_PER_TREE` for the leaf-keyed ones. A single shared constant silently starves whichever
+/// template needs the larger cell - here `per-list-node` - and the burst then dedupes to one pair
+/// instead of two while the test blames dedup.
+fn legal_cell_rows(encoder: &str) -> usize {
+    match encoder {
+        "per-node" | "per-list-node" => 131_072,
+        _ => AUTO_SPAWN_CELL_ROWS,
+    }
+}
+
+/// Rows the leaf-keyed auto-spawned cells must hold.
+///
+/// Distinct from the harness's own bootstrap fixture size. Every leaf-keyed
+/// encoder declares `min_total_entries() == LEAVES_PER_TREE`, and `pre_spawn_for_tree` enforces it
+/// (`auto_spawn_driver.rs`). A spawn requested at 256 rows is refused, the successor never appears,
+/// and the test times out waiting for a count that can never rise - which is what nine of these
+/// tests were doing.
+const AUTO_SPAWN_CELL_ROWS: usize = 65_536;
+
+/// Wall-clock budget per auto-spawned PPOI list instance.
+///
+/// Each spawn now builds a real `AUTO_SPAWN_CELL_ROWS` cell, measured at 16-22 s. The previous
+/// flat 60 s deadline was calibrated when the spawn was refused instantly for an illegal cell
+/// shape. This is a hang-breaker, not an SLO.
+const SPAWN_BUDGET_PER_TREE: Duration = Duration::from_secs(75);
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
 
 const TEST_LIST_KEY: [u8; 32] = [
@@ -79,7 +107,7 @@ fn template_runtime(
             .join(format!("ppoi-{template_id}-{{list_key}}"))
             .to_string_lossy()
             .into_owned(),
-        entries: TOY_ENTRIES,
+        entries: legal_cell_rows(encoder),
         entry_bytes: TOY_ENTRY_BYTES,
         channel_capacity: 64,
     }
@@ -98,13 +126,18 @@ async fn wait_for_pair_count(
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!(
-        "timed out waiting for ppoi pair_count >= {expected}; got {}",
-        registry.pair_count()
+        "timed out waiting for ppoi pair_count >= {expected}; got {} (driver spawn_failures={}, last={:?})",
+        registry.pair_count(),
+        registry.spawn_failures(),
+        registry.last_spawn_failure()
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing PPOI list-key auto-spawn, its per-template dedupe, or spawn-log \
+            restart replay."]
 async fn synthetic_upstream_emits_new_list_key_spawns_two_instances() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());
@@ -137,7 +170,7 @@ async fn synthetic_upstream_emits_new_list_key_spawns_two_instances() {
 
     tx.send(TEST_LIST_KEY).expect("broadcast list_key");
 
-    wait_for_pair_count(&registry, 2, Duration::from_secs(60)).await;
+    wait_for_pair_count(&registry, 2, SPAWN_BUDGET_PER_TREE * 2).await;
 
     let known = registry.known_pairs();
     assert_eq!(known.len(), 2, "expected exactly 2 spawned pairs");
@@ -183,7 +216,10 @@ async fn synthetic_upstream_emits_new_list_key_spawns_two_instances() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing PPOI list-key auto-spawn, its per-template dedupe, or spawn-log \
+            restart replay."]
 async fn concurrent_list_observed_bursts_dedupe_to_one_spawn_per_template_per_list_key() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());
@@ -226,10 +262,18 @@ async fn concurrent_list_observed_bursts_dedupe_to_one_spawn_per_template_per_li
         jh.await.expect("burst sender join");
     }
 
-    wait_for_pair_count(&registry, 2, Duration::from_secs(60)).await;
+    wait_for_pair_count(&registry, 2, SPAWN_BUDGET_PER_TREE * 2).await;
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
+    // A driver bootstrap failure used to reach only `tracing::error!`, so a missing pair looked
+    // like over-eager dedup. Name the real cause before blaming dedup.
+    assert_eq!(
+        registry.spawn_failures(),
+        0,
+        "the ppoi_list driver failed to bootstrap an instance: {:?}",
+        registry.last_spawn_failure()
+    );
     assert_eq!(
         registry.pair_count(),
         2,
@@ -255,7 +299,10 @@ async fn concurrent_list_observed_bursts_dedupe_to_one_spawn_per_template_per_li
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing PPOI list-key auto-spawn, its per-template dedupe, or spawn-log \
+            restart replay."]
 async fn restart_replay_picks_up_auto_spawned_ppoi_list_instances_from_spawn_log() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());

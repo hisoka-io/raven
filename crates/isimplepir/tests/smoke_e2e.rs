@@ -7,6 +7,7 @@
 //! End-to-end correctness smoke: setup, query, respond, extract recovers the
 //! planted byte at known indices.
 
+use proptest::prelude::*;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 
@@ -85,5 +86,39 @@ fn smoke_e2e_three_indices_three_seeds() {
                 idx, seed_idx, recovered, db[idx],
             );
         }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Both examples above are square, and `idx / M` is indistinguishable from
+    /// `idx / L` when L == M. Generated non-square shapes separate them: a
+    /// mutation swapping the two left every test in this file green and was
+    /// caught only, and incidentally, by the packed-path tests in
+    /// `squish_equivalence`. Shape and index are generated so the plain path
+    /// stands on its own.
+    #[test]
+    fn e2e_recovers_the_planted_value_at_any_shape_and_index(
+        l in 2usize..7,
+        m in 2usize..7,
+        idx_pick in 0usize..64,
+        rng_seed in any::<u8>(),
+    ) {
+        let params = toy_params(l, m);
+        let db: Vec<u32> = (0..l * m).map(|i| ((i * 13 + 1) as u32) % params.p).collect();
+        let out = setup(&db, params, Some([42u8; 32])).expect("setup");
+        let idx = idx_pick % (l * m);
+
+        let mut rng = ChaCha20Rng::from_seed([rng_seed; 32]);
+        let (state, q) =
+            query(&mut rng, &out.server.a_seed, &out.server.params, idx).expect("query");
+        let response = respond(&out.server, &q.query).expect("respond");
+        let recovered = extract(&out.server.params, &out.hint, &state, &response).expect("extract");
+
+        prop_assert_eq!(
+            recovered, db[idx],
+            "L {} M {} idx {} (row {}, col {})", l, m, idx, idx / m, idx % m
+        );
     }
 }

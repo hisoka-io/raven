@@ -83,52 +83,6 @@ fn wait_for_marker(reader: &mut BufReader<ChildStdout>, target: &str) -> Result<
 }
 
 #[test]
-fn kill_between_step_1_and_step_2_load_recovers_base_payload() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let (mut child, mut reader) = spawn_child(dir.path());
-
-    wait_for_marker(&mut reader, "AFTER_STEP_1").expect("AFTER_STEP_1");
-    let _ = child.kill();
-    let _ = child.wait();
-
-    let layout = StoreLayout::open(dir.path()).expect("open layout");
-    let final_dir = layout.snapshot_dir(SnapshotId(SNAP_ID));
-    let old_tmp = final_dir.with_extension("old.tmp");
-    assert!(old_tmp.is_dir(), "post-kill: `.old.tmp` must exist");
-    assert!(!final_dir.is_dir(), "post-kill: `final_dir` must be absent");
-
-    let loaded =
-        Snapshot::load(&layout, SnapshotId(SNAP_ID), SNAPSHOT_MAGIC).expect("load with recovery");
-    assert_eq!(loaded.data, BASE_PAYLOAD);
-    assert!(final_dir.is_dir());
-    assert!(!old_tmp.exists());
-}
-
-#[test]
-fn kill_between_step_2_and_step_3_load_picks_final_dir_and_cleans_up() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let (mut child, mut reader) = spawn_child(dir.path());
-
-    wait_for_marker(&mut reader, "AFTER_STEP_2").expect("AFTER_STEP_2");
-    let _ = child.kill();
-    let _ = child.wait();
-
-    let layout = StoreLayout::open(dir.path()).expect("open layout");
-    let final_dir = layout.snapshot_dir(SnapshotId(SNAP_ID));
-    let old_tmp = final_dir.with_extension("old.tmp");
-    assert!(final_dir.is_dir(), "post-kill: `final_dir` must exist");
-    assert!(
-        old_tmp.is_dir(),
-        "post-kill: `.old.tmp` must still be present"
-    );
-
-    let loaded = Snapshot::load(&layout, SnapshotId(SNAP_ID), SNAPSHOT_MAGIC)
-        .expect("load with both present");
-    assert_eq!(loaded.data, NEW_PAYLOAD);
-    assert!(!old_tmp.exists());
-}
-
-#[test]
 fn round_trip_save_kill_load_never_loses_data_at_any_step() {
     let kill_targets = [
         "READY_FOR_CHAOS",
@@ -148,6 +102,28 @@ fn round_trip_save_kill_load_never_loses_data_at_any_step() {
         let _ = child.wait();
 
         let layout = StoreLayout::open(dir.path()).expect("open layout");
+
+        // Pre-load on-disk directory state pins the two-rename ORDER; a load
+        // may repair it, so these must be asserted before `Snapshot::load`.
+        {
+            let final_dir = layout.snapshot_dir(SnapshotId(SNAP_ID));
+            let old_tmp = final_dir.with_extension("old.tmp");
+            match target {
+                "AFTER_STEP_1" => {
+                    assert!(old_tmp.is_dir(), "post-kill: `.old.tmp` must exist");
+                    assert!(!final_dir.is_dir(), "post-kill: `final_dir` must be absent");
+                }
+                "AFTER_STEP_2" => {
+                    assert!(final_dir.is_dir(), "post-kill: `final_dir` must exist");
+                    assert!(
+                        old_tmp.is_dir(),
+                        "post-kill: `.old.tmp` must still be present"
+                    );
+                }
+                _ => {}
+            }
+        }
+
         let loaded =
             Snapshot::load(&layout, SnapshotId(SNAP_ID), SNAPSHOT_MAGIC).unwrap_or_else(|e| {
                 panic!("post-kill load at marker `{target}` must succeed; got {e:?}")

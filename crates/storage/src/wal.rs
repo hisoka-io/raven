@@ -954,8 +954,9 @@ mod tests {
     /// A torn frame write REWINDS to the log's byte length and does NOT poison.
     ///
     /// This is the D-0 defect's actual subject, reached through the production `append` for the
-    /// first time: `wal_rewind_target.rs` proves only the filesystem fact that `O_APPEND` reports
-    /// offset 0 after a reopen, never that `append` rewinds to the right place. Here the write
+    /// first time. The old standalone rewind test proved only the filesystem fact that `O_APPEND`
+    /// reports offset 0 after a reopen — never that `append` rewinds to the right place — and was
+    /// deleted once mutation testing showed it vacuous. Here the write
     /// fails, the log must come back to exactly its previous length, the earlier entry must still
     /// replay, and the seq must not be burned.
     ///

@@ -209,20 +209,27 @@ fn collect_capturable_bytes(dir: &Path) -> BTreeMap<String, Vec<u8>> {
     all
 }
 
+/// Tamper-refusal TOTALITY: for ANY offset past the zstd frame header and ANY
+/// non-zero xor mask, import must refuse with a TYPED error and leave no
+/// partial data dir. Replaces the two former single-offset examples (mid-file
+/// and offset-256): two lucky offsets usually land in the zstd entropy stream
+/// and prove only that zstd notices, while a flip inside a stored (raw) block
+/// of high-entropy CRS bytes decompresses cleanly and reaches the manifest
+/// checksum layer — the layer that actually guards silent-wrong-bytes.
 #[test]
-fn tampered_tarball_refused_at_checksum_check() {
+fn tamper_refusal_is_total_over_the_byte_range() {
+    use proptest::prelude::{Strategy, TestCaseError};
+    use proptest::test_runner::{Config as PropConfig, TestRunner};
+
     let scratch = tempfile::tempdir().expect("scratch");
     let src_root = scratch.path().join("src");
     std::fs::create_dir_all(&src_root).expect("mkdir");
-    bootstrap_instance(
-        &src_root,
-        "alpha",
-        "per-leaf-bc",
-        SCHEME_TAG_A,
-        b"hello world",
-        2,
-    );
+    let payload: Vec<u8> = (0..16_384u32)
+        .map(|i| u8::try_from(i & 0xFF).expect("byte"))
+        .collect();
+    bootstrap_instance(&src_root, "alpha", "per-leaf-bc", SCHEME_TAG_A, &payload, 4);
 
+    // Export ONCE; every case copies and tampers these bytes.
     let tarball = scratch.path().join("export.tar.zst");
     run_export(ExportOptions {
         data_dir: src_root,
@@ -232,31 +239,71 @@ fn tampered_tarball_refused_at_checksum_check() {
         keep_snapshots: 0,
     })
     .expect("export");
-
-    let mut bytes = std::fs::read(&tarball).expect("read");
-    let mid = bytes.len() / 2;
-    bytes[mid] ^= 0xFF;
-    std::fs::write(&tarball, &bytes).expect("write tampered");
-
-    let dst_root = scratch.path().join("dst");
-    let err = run_import(ImportOptions {
-        input: tarball,
-        data_dir: dst_root,
-        verifying_key: None,
-        allow_overwrite: false,
-        unsafe_no_verify: true,
-    })
-    .expect_err("tampered tarball must refuse");
-    let typed = err
-        .downcast_ref::<SnapshotPortError>()
-        .expect("typed SnapshotPortError");
+    let pristine = std::fs::read(&tarball).expect("read pristine tarball");
+    let len = pristine.len();
     assert!(
-        matches!(
-            typed,
-            SnapshotPortError::TarballParse { .. } | SnapshotPortError::ChecksumMismatch { .. }
-        ),
-        "expected TarballParse or ChecksumMismatch, got: {typed:?}"
+        len > 64,
+        "tarball ({len} bytes) too small to tamper past the header"
     );
+
+    let mut runner = TestRunner::new(PropConfig {
+        cases: 32,
+        failure_persistence: None,
+        ..PropConfig::default()
+    });
+    let case_no = std::cell::Cell::new(0usize);
+    runner
+        .run(
+            &(64..len, 1u8..=255u8).prop_map(|(o, m)| (o, m)),
+            |(offset, mask)| {
+                let i = case_no.get();
+                case_no.set(i + 1);
+
+                let mut bytes = pristine.clone();
+                bytes[offset] ^= mask;
+                let tampered = scratch.path().join(format!("tampered-{i}.tar.zst"));
+                std::fs::write(&tampered, &bytes)
+                    .map_err(|e| TestCaseError::fail(format!("write tampered copy: {e}")))?;
+
+                let dst_root = scratch.path().join(format!("dst-{i}"));
+                let result = run_import(ImportOptions {
+                    input: tampered,
+                    data_dir: dst_root.clone(),
+                    verifying_key: None,
+                    allow_overwrite: false,
+                    unsafe_no_verify: true,
+                });
+                let Err(err) = result else {
+                    return Err(TestCaseError::fail(format!(
+                        "flip at offset {offset} mask {mask:#04x} imported CLEANLY"
+                    )));
+                };
+                let Some(typed) = err.downcast_ref::<SnapshotPortError>() else {
+                    return Err(TestCaseError::fail(format!(
+                        "flip at offset {offset} mask {mask:#04x}: untyped error {err:?}"
+                    )));
+                };
+                if !matches!(
+                    typed,
+                    SnapshotPortError::TarballParse { .. }
+                        | SnapshotPortError::ChecksumMismatch { .. }
+                        | SnapshotPortError::ContentHashMismatch
+                ) {
+                    return Err(TestCaseError::fail(format!(
+                        "flip at offset {offset} mask {mask:#04x}: wrong error class {typed:?}"
+                    )));
+                }
+                let dst_populated = dst_root.exists()
+                    && std::fs::read_dir(&dst_root).map_or(0, std::iter::Iterator::count) > 0;
+                if dst_populated {
+                    return Err(TestCaseError::fail(format!(
+                        "flip at offset {offset} mask {mask:#04x}: partial data dir left behind"
+                    )));
+                }
+                Ok(())
+            },
+        )
+        .expect("tamper-refusal property");
 }
 
 #[test]
@@ -395,7 +442,7 @@ fn signed_export_verifies_with_correct_pubkey() {
         data_dir: dst_root,
         verifying_key: Some(verifying_path),
         allow_overwrite: false,
-        unsafe_no_verify: true,
+        unsafe_no_verify: false,
     })
     .expect("import with matching pubkey");
 }
@@ -437,7 +484,7 @@ fn signed_export_refused_with_wrong_pubkey() {
         data_dir: dst_root,
         verifying_key: Some(wrong_pub),
         allow_overwrite: false,
-        unsafe_no_verify: true,
+        unsafe_no_verify: false,
     })
     .expect_err("wrong pubkey must refuse");
     let typed = err
@@ -631,67 +678,6 @@ fn distinct_scheme_tags_get_distinct_shared_crs_entries() {
 }
 
 #[test]
-fn import_refuses_tampered_tarball_byte_in_middle_with_specific_offset() {
-    let scratch = tempfile::tempdir().expect("scratch");
-    let src_root = scratch.path().join("src");
-    std::fs::create_dir_all(&src_root).expect("mkdir");
-    let payload: Vec<u8> = (0..16_384u32)
-        .map(|i| u8::try_from(i & 0xFF).expect("byte"))
-        .collect();
-    bootstrap_instance(&src_root, "alpha", "per-leaf-bc", SCHEME_TAG_A, &payload, 4);
-
-    let tarball = scratch.path().join("export.tar.zst");
-    run_export(ExportOptions {
-        data_dir: src_root,
-        output: tarball.clone(),
-        signing_key: None,
-        include_current_wal: false,
-        keep_snapshots: 0,
-    })
-    .expect("export");
-
-    let mut bytes = std::fs::read(&tarball).expect("read");
-    // offset 256 is past the zstd magic + frame header, so a flip corrupts a real frame byte
-    let target_offset = 256usize;
-    assert!(
-        bytes.len() > target_offset,
-        "tarball ({} bytes) too small for offset {}",
-        bytes.len(),
-        target_offset
-    );
-    let original = bytes[target_offset];
-    bytes[target_offset] = original ^ 0xA5;
-    std::fs::write(&tarball, &bytes).expect("write tampered");
-
-    let dst_root = scratch.path().join("dst");
-    let err = run_import(ImportOptions {
-        input: tarball,
-        data_dir: dst_root.clone(),
-        verifying_key: None,
-        allow_overwrite: false,
-        unsafe_no_verify: true,
-    })
-    .expect_err("tampered tarball at fixed offset must refuse");
-    let typed = err
-        .downcast_ref::<SnapshotPortError>()
-        .expect("typed SnapshotPortError");
-    assert!(
-        matches!(
-            typed,
-            SnapshotPortError::TarballParse { .. }
-                | SnapshotPortError::ChecksumMismatch { .. }
-                | SnapshotPortError::ContentHashMismatch
-        ),
-        "expected TarballParse / ChecksumMismatch / ContentHashMismatch, got: {typed:?}"
-    );
-    assert!(
-        !dst_root.exists()
-            || std::fs::read_dir(&dst_root).map_or(0, std::iter::Iterator::count) == 0,
-        "destination must remain empty when tampering is detected"
-    );
-}
-
-#[test]
 fn import_refuses_tampered_signature_file_with_actionable_error() {
     let scratch = tempfile::tempdir().expect("scratch");
     let src_root = scratch.path().join("src");
@@ -750,7 +736,7 @@ fn import_refuses_tampered_signature_file_with_actionable_error() {
         data_dir: dst_root.clone(),
         verifying_key: Some(verifying_path),
         allow_overwrite: false,
-        unsafe_no_verify: true,
+        unsafe_no_verify: false,
     })
     .expect_err("tampered signature must refuse with mandatory verification");
     let typed = err

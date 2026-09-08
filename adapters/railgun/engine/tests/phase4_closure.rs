@@ -249,7 +249,9 @@ async fn resume_floor_is_last_leaf_block_not_chain_head() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "production cell ~17s; runs alongside production_cell.rs"]
+#[ignore = "production cell ~17s; runs alongside production_cell.rs. Trigger: changing chain-event \
+            apply, re-encode at commit, or swap_state. CI runs it in the durability + closure \
+            lane."]
 #[allow(clippy::too_many_lines)]
 async fn phase4_chain_event_propagates_to_pir_response_at_production_cell() {
     let dir = tempfile::tempdir().expect("tempdir");

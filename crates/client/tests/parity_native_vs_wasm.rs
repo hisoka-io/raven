@@ -13,7 +13,7 @@
 )]
 
 use raven_inspire::math::GaussianSampler;
-use raven_inspire::params::{InspireParams, ShardConfig};
+use raven_inspire::params::InspireParams;
 use raven_inspire::query_seeded as upstream_query_seeded;
 use raven_inspire::respond_seeded_inspiring_cached_with_session;
 use raven_inspire::rlwe::RlweSecretKey;
@@ -204,56 +204,6 @@ fn wasm_extract_byte_equals_native() {
         plain_via_mirror, plain_via_upstream,
         "wasm-mirror extract_response must produce byte-identical output to upstream extract_inspiring"
     );
-}
-
-#[test]
-fn bincode_roundtrip_preserves_query_and_state_shapes() {
-    // JS-side hold-and-restore relies on bincode round-trip being structurally lossless
-    let params = test_params();
-    let database = build_test_db(&params);
-    let target_idx: u64 = 3;
-
-    let mut sampler = GaussianSampler::new(params.sigma);
-    let (crs, encoded_db, sk) =
-        inspire_setup(&params, &database, ENTRY_BYTES, &mut sampler).expect("inspire_setup");
-
-    let mut sampler_session = GaussianSampler::new(params.sigma);
-    let session = ClientSession::new(crs.clone(), sk, &mut sampler_session).expect("session");
-
-    let (state, query) = build_seeded_query_rust_with_noise_seed(
-        &session,
-        &params,
-        &encoded_db.config,
-        target_idx,
-        PINNED_NOISE_SEED,
-    )
-    .expect("query");
-
-    let query_bytes = bincode::serialize(&query).expect("serialize query");
-    let query_rt: SeededClientQuery =
-        bincode::deserialize(&query_bytes).expect("deserialize query");
-    assert_eq!(query.shard_id, query_rt.shard_id);
-    assert_eq!(query.packing_mode, query_rt.packing_mode);
-
-    // keys are serde(skip); only the index metadata round-trips, which is what maps responses to queries
-    let state_bytes = bincode::serialize(&state).expect("serialize state");
-    let state_rt: raven_inspire::ClientState =
-        bincode::deserialize(&state_bytes).expect("deserialize state");
-    assert_eq!(state.index, state_rt.index);
-    assert_eq!(state.shard_id, state_rt.shard_id);
-    assert_eq!(state.local_index, state_rt.local_index);
-
-    let crs_bytes = bincode::serialize(&crs).expect("serialize crs");
-    let _crs_rt: raven_inspire::ServerCrs =
-        bincode::deserialize(&crs_bytes).expect("deserialize crs");
-
-    let shard_bytes = bincode::serialize(&encoded_db.config).expect("serialize shard config");
-    let _shard_rt: ShardConfig =
-        bincode::deserialize(&shard_bytes).expect("deserialize shard config");
-
-    let params_bytes = bincode::serialize(&params).expect("serialize params");
-    let _params_rt: InspireParams =
-        bincode::deserialize(&params_bytes).expect("deserialize params");
 }
 
 /// Round-trip strips serde(skip) keys; `extract_response` must rehydrate

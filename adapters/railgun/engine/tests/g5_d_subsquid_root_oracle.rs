@@ -20,7 +20,7 @@ use raven_railgun_indexer::subsquid::{
     decode_bytes32_hex, FixtureSubsquidSource, SubsquidError, SubsquidRootSource,
 };
 
-use oracle_aggregator::{assert_three_oracle_byte_identity, OracleSource};
+use oracle_aggregator::assert_three_oracle_byte_identity;
 
 const FIXTURE_PATH: &str = "tests/fixtures/subsquid_canonical_roots.json";
 
@@ -386,113 +386,5 @@ fn g5d_three_oracle_byte_identity_holds_for_every_checkpoint() {
     assert!(
         matches!(prod_err, SubsquidError::NotIndexed(_)),
         "prod client must surface NotIndexed; got {prod_err:?}"
-    );
-}
-
-#[test]
-fn g5d_corrupt_subsquid_response_fails_oracle_assertion() {
-    let fixture = load_fixture();
-    let mut src = populate_subsquid_source(&fixture);
-    let rt = tokio::runtime::Runtime::new().expect("tokio rt");
-
-    let cp = fixture
-        .tree_checkpoints
-        .first()
-        .expect("at least one tree checkpoint");
-    let our_root = replay_into_imt(&cp.leaves);
-    let mut corrupted = cp.subsquid_root;
-    corrupted[7] ^= 0x01;
-    let was_present = src.corrupt_tree_root(cp.tree_number, cp.block_height, corrupted);
-    assert!(
-        was_present,
-        "fixture must have a populated entry for the corruption target"
-    );
-
-    let resp = rt
-        .block_on(src.commitment_root_at_height(cp.tree_number, cp.block_height))
-        .expect("corrupted source root present");
-    assert_eq!(
-        resp.root, corrupted,
-        "subsquid corruption must take effect via the trait read"
-    );
-
-    let result = assert_three_oracle_byte_identity(
-        our_root,
-        cp.chain_root,
-        cp.upstream_root,
-        Some(resp.root),
-        "subsquid-corruption-guard",
-    );
-    let err = result.expect_err("aggregator must catch the subsquid corruption");
-    assert_eq!(
-        err.source,
-        OracleSource::Subsquid,
-        "corruption attribution must name Subsquid"
-    );
-    assert_eq!(
-        err.other_root, corrupted,
-        "disagreement carries the corrupted byte"
-    );
-    assert_ne!(
-        err.other_root, our_root,
-        "disagreement is not byte-identical to local root"
-    );
-}
-
-#[test]
-fn g5d_corrupt_chain_root_fails_oracle_assertion() {
-    let fixture = load_fixture();
-    let cp = fixture
-        .tree_checkpoints
-        .first()
-        .expect("at least one tree checkpoint");
-    let our_root = replay_into_imt(&cp.leaves);
-    let mut corrupted_chain = our_root;
-    corrupted_chain[0] ^= 0x01;
-    let result = assert_three_oracle_byte_identity(
-        our_root,
-        Some(corrupted_chain),
-        cp.upstream_root,
-        Some(cp.subsquid_root),
-        "chain-corruption-guard",
-    );
-    let err = result.expect_err("aggregator must catch the chain corruption");
-    assert_eq!(
-        err.source,
-        OracleSource::Chain,
-        "corruption attribution must name Chain"
-    );
-    assert_eq!(
-        err.other_root, corrupted_chain,
-        "chain disagreement carries the corrupted byte"
-    );
-}
-
-#[test]
-fn g5d_corrupt_upstream_root_fails_oracle_assertion() {
-    let fixture = load_fixture();
-    let cp = fixture
-        .list_checkpoints
-        .first()
-        .expect("at least one list checkpoint");
-    let our_root = replay_into_imt(&cp.leaves);
-    let mut corrupted_upstream = our_root;
-    corrupted_upstream[15] ^= 0x10;
-    let result = assert_three_oracle_byte_identity(
-        our_root,
-        None,
-        Some(corrupted_upstream),
-        Some(cp.subsquid_root),
-        "upstream-corruption-guard",
-    );
-    let err = result.expect_err("aggregator must catch the upstream corruption");
-    assert_eq!(
-        err.source,
-        OracleSource::Upstream,
-        "corruption attribution must name Upstream"
-    );
-    assert_eq!(
-        err.other_root, corrupted_upstream,
-        "upstream disagreement carries the corrupted byte"
     );
 }

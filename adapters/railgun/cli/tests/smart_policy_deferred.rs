@@ -27,8 +27,24 @@ use raven_railgun_engine::orchestrator::ChainTreeRoutes;
 use raven_railgun_engine::persistence::ConsumerEvent;
 use raven_railgun_engine::{DrainState, Engine, InstanceRole, PirInstance};
 
-const TOY_ENTRIES: usize = 256;
 const TOY_ENTRY_BYTES: usize = 256;
+
+/// Rows the AUTO-SPAWNED cell must hold.
+///
+/// Distinct from the harness's own bootstrap fixture size. Every leaf-keyed
+/// encoder declares `min_total_entries() == LEAVES_PER_TREE`, and `pre_spawn_for_tree` enforces it
+/// (`auto_spawn_driver.rs`). A spawn requested at 256 rows is refused, the successor never appears,
+/// and the test times out waiting for a count that can never rise - which is what nine of these
+/// tests were doing.
+const AUTO_SPAWN_CELL_ROWS: usize = 65_536;
+
+/// Wall-clock budget per auto-spawned tree.
+///
+/// Each spawn now builds a real `AUTO_SPAWN_CELL_ROWS` cell, measured at 16-22 s. The previous
+/// flat 60 s deadlines were calibrated when the spawn was refused instantly for an illegal cell
+/// shape, so they timed out as soon as spawning started working. This is a hang-breaker, not an
+/// SLO: it must be generous enough that a slow runner does not red a correct run.
+const SPAWN_BUDGET_PER_TREE: Duration = Duration::from_secs(45);
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
 
 struct TestHarness {
@@ -122,7 +138,7 @@ fn toy_runtime(tmp: &Path) -> AutoSpawnRuntime {
             .into_owned(),
         encoder: "per-leaf-bc".to_owned(),
         scheme_tag: SCHEME_TAG.to_owned(),
-        entries: TOY_ENTRIES,
+        entries: AUTO_SPAWN_CELL_ROWS,
         entry_bytes: TOY_ENTRY_BYTES,
         channel_capacity: 64,
         verification_cadence_n: 0,
@@ -151,7 +167,10 @@ async fn wait_for_chain_tree_count(
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing SIGHUP template reload, fill-threshold pre-spawn, or admin drain \
+            during auto-spawn."]
 async fn sighup_reload_hot_adds_new_template() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
@@ -204,7 +223,7 @@ data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
         data_dir_template: template_a.clone(),
         encoder: "per-leaf-bc".to_owned(),
         scheme_tag: SCHEME_TAG.to_owned(),
-        entries: TOY_ENTRIES,
+        entries: AUTO_SPAWN_CELL_ROWS,
         entry_bytes: TOY_ENTRY_BYTES,
         channel_capacity: 64,
         verification_cadence_n: 0,
@@ -263,7 +282,7 @@ data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
                         data_dir_template: tpl.data_dir_template.clone(),
                         encoder: tpl.encoder.clone(),
                         scheme_tag: SCHEME_TAG.to_owned(),
-                        entries: TOY_ENTRIES,
+                        entries: AUTO_SPAWN_CELL_ROWS,
                         entry_bytes: TOY_ENTRY_BYTES,
                         channel_capacity: 64,
                         verification_cadence_n: 0,
@@ -342,7 +361,10 @@ data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing SIGHUP template reload, fill-threshold pre-spawn, or admin drain \
+            during auto-spawn."]
 async fn sighup_reload_applies_all_chain_tree_templates_not_just_first() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
@@ -401,7 +423,7 @@ data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
         data_dir_template: template_a.clone(),
         encoder: "per-leaf-bc".to_owned(),
         scheme_tag: SCHEME_TAG.to_owned(),
-        entries: TOY_ENTRIES,
+        entries: AUTO_SPAWN_CELL_ROWS,
         entry_bytes: TOY_ENTRY_BYTES,
         channel_capacity: 64,
         verification_cadence_n: 0,
@@ -466,7 +488,7 @@ data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
                         data_dir_template: tpl.data_dir_template.clone(),
                         encoder: tpl.encoder.clone(),
                         scheme_tag: SCHEME_TAG.to_owned(),
-                        entries: TOY_ENTRIES,
+                        entries: AUTO_SPAWN_CELL_ROWS,
                         entry_bytes: TOY_ENTRY_BYTES,
                         channel_capacity: 64,
                         verification_cadence_n: 0,
@@ -694,7 +716,10 @@ data_source = { kind = "indexer", filter = { tree_number = 0 } }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing SIGHUP template reload, fill-threshold pre-spawn, or admin drain \
+            during auto-spawn."]
 async fn tree_fill_threshold_pre_spawns_at_95_percent() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());
@@ -763,7 +788,10 @@ async fn tree_fill_threshold_pre_spawns_at_95_percent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing SIGHUP template reload, fill-threshold pre-spawn, or admin drain \
+            during auto-spawn."]
 async fn admin_drain_concurrent_with_auto_spawn_routes_consistently() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());
@@ -801,7 +829,7 @@ async fn admin_drain_concurrent_with_auto_spawn_routes_consistently() {
     });
 
     tx.send(1u32).expect("broadcast tree-1");
-    wait_for_chain_tree_count(&harness.registry, 2, Duration::from_secs(60)).await;
+    wait_for_chain_tree_count(&harness.registry, 2, SPAWN_BUDGET_PER_TREE * 2).await;
 
     let successor = harness
         .engine

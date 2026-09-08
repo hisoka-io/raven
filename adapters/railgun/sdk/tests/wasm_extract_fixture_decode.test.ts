@@ -1,19 +1,25 @@
-// Asserts the WASM `extract_response` recovers byte-identical leaf bytes to native Rust,
-// against a deterministic captured fixture so any divergence is in the wasm-bindgen /
-// bincode layer, not network noise. Gated on RAVEN_FIXTURE_DIR; skipped when unset.
+// WASM `extract_response` against the Rust-emitted fixture under `tests/fixtures/`, so any
+// divergence is in the wasm-bindgen / bincode layer rather than in network noise.
+//
+// This ran against nothing for as long as it existed: it was gated on `RAVEN_FIXTURE_DIR`
+// pointing at a `capture_live_fixture` output, and no such generator is in the tree - the
+// directory it wanted (`client_state.bin`, `response_inner.bin`, `expected_leaf_hex.txt`,
+// `entry_size.txt`, `secret_key.bin`) is emitted by no example, script or CI job. The
+// checked-in fixture carries the same secret key inside `params_bundle.bin`, so a session
+// rebuilt from it decrypts the recorded responses byte-exactly and the gate is unnecessary.
 
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterAll, describe, expect, it } from "vitest";
 
 import * as wasmPkg from "raven-inspire-client-wasm";
 
-import type { RavenInspireWasm } from "../src/index";
+import { decodeClientPirQueryBundle } from "../src/index";
+import type { RavenInspireClientSession, RavenInspireWasm } from "../src/index";
 
-const FIXTURE_DIR = process.env.RAVEN_FIXTURE_DIR;
-const RUN = FIXTURE_DIR !== undefined;
-const fixtureIt = RUN ? it : it.skip;
+const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 
 const wasm = wasmPkg as unknown as RavenInspireWasm;
 const wasmInit = wasmPkg as unknown as { init_panic_hook?: () => void };
@@ -21,161 +27,202 @@ if (typeof wasmInit.init_panic_hook === "function") {
   wasmInit.init_panic_hook();
 }
 
-interface Fixture {
-  paramsBundle: Uint8Array;
-  crsBincode: Uint8Array;
-  shardConfigBincode: Uint8Array;
-  inspireParamsBincode: Uint8Array;
-  clientStateBincode: Uint8Array;
-  responseInner: Uint8Array;
-  expectedLeafHex: string;
-  entrySize: number;
-}
-
-function read(dir: string, name: string): Uint8Array {
-  return new Uint8Array(readFileSync(join(dir, name)));
-}
-
-function readText(dir: string, name: string): string {
-  return readFileSync(join(dir, name), "utf-8").trim();
-}
-
-function loadFixture(dir: string): Fixture {
-  const inspireParamsBincode = read(dir, "inspire_params.bin");
-  const shardConfigBincode = read(dir, "shard_config.bin");
-  const paramsBundle = wasm.build_instance_params_blob(
-    inspireParamsBincode,
-    shardConfigBincode,
-  );
-  return {
-    paramsBundle,
-    crsBincode: read(dir, "crs.bin"),
-    shardConfigBincode,
-    inspireParamsBincode,
-    clientStateBincode: read(dir, "client_state.bin"),
-    responseInner: read(dir, "response_inner.bin"),
-    expectedLeafHex: readText(dir, "expected_leaf_hex.txt"),
-    entrySize: Number.parseInt(readText(dir, "entry_size.txt"), 10),
-  };
-}
-
-describe("wasm extract_response against captured live fixture", () => {
-  if (!RUN) {
-    it.skip("requires RAVEN_FIXTURE_DIR pointing at a capture_live_fixture output", () => {});
-  }
-
-  const sessions: Array<{ free: () => void }> = [];
-  afterAll(() => {
-    for (const s of sessions) s.free();
-  });
-
-  fixtureIt(
-    "wasm_extract_response_against_captured_live_fixture_byte_identical_to_native",
-    () => {
-      if (!FIXTURE_DIR) throw new Error("env guard");
-      const fx = loadFixture(FIXTURE_DIR);
-
-      // Rebuild the exact session that produced the response by injecting the captured SK.
-      const secretKeyBincode = new Uint8Array(
-        readFileSync(join(FIXTURE_DIR, "secret_key.bin")),
-      );
-      const paramsBundle = buildParamsBundleFromCapturedKey(
-        fx.inspireParamsBincode,
-        fx.shardConfigBincode,
-        secretKeyBincode,
-      );
-      const session = wasm.build_client_session(paramsBundle, fx.crsBincode);
-      sessions.push(session);
-
-      const plaintext = wasm.extract_response(
-        session,
-        fx.crsBincode,
-        fx.clientStateBincode,
-        fx.responseInner,
-        fx.entrySize,
-      );
-      expect(plaintext.length).toBeGreaterThanOrEqual(32);
-      const leafHex = bytesToHexNoPrefix(plaintext.subarray(0, 32));
-      expect(leafHex).toBe(fx.expectedLeafHex);
-    },
-  );
-
-  fixtureIt(
-    "wasm_extract_response_panics_with_typed_error_on_truncated_response",
-    () => {
-      if (!FIXTURE_DIR) throw new Error("env guard");
-      const fx = loadFixture(FIXTURE_DIR);
-      const secretKeyBincode = new Uint8Array(
-        readFileSync(join(FIXTURE_DIR, "secret_key.bin")),
-      );
-      const paramsBundle = buildParamsBundleFromCapturedKey(
-        fx.inspireParamsBincode,
-        fx.shardConfigBincode,
-        secretKeyBincode,
-      );
-      const session = wasm.build_client_session(paramsBundle, fx.crsBincode);
-      sessions.push(session);
-
-      // Half the bytes force a bincode decode failure that must surface as a typed error, not an unreachable trap.
-      const truncated = fx.responseInner.subarray(
-        0,
-        Math.floor(fx.responseInner.length / 2),
-      );
-      let threw = false;
-      try {
-        wasm.extract_response(
-          session,
-          fx.crsBincode,
-          fx.clientStateBincode,
-          truncated,
-          fx.entrySize,
-        );
-      } catch (e) {
-        threw = true;
-        const msg = String(e);
-        expect(msg.length).toBeGreaterThan(0);
-        expect(msg.includes("unreachable")).toBe(false);
-      }
-      expect(threw).toBe(true);
-    },
-  );
-});
-
 /**
- * Mirrors the bincode `WasmInstanceParamsBundle` shape so the captured SK can be
- * injected (build_instance_params_blob otherwise generates a fresh one).
- * Wire shape (bincode v1, fixint LE): three (u64 LE len, bytes) vecs in order
- * inspire_params, shard_config, rlwe_secret_key.
+ * Rows `adapters/railgun/client-wasm/examples/emit_test_fixture.rs` encoded:
+ * `[status = idx % 4, bc[0..31]]` over a 32-byte cell — the production
+ * `PerListStatusEncoder` shape (engine/src/pir_table/list.rs). Pinned rather than
+ * recomputed so a regenerated fixture that changes the row shape reddens instead of
+ * agreeing with itself; that pin is exactly what caught the first-cut emitter
+ * writing `bc[1..32]` and shipping rows production would never serve.
  */
-function buildParamsBundleFromCapturedKey(
-  inspireParamsBincode: Uint8Array,
-  shardConfigBincode: Uint8Array,
-  rlweSecretKeyBincode: Uint8Array,
-): Uint8Array {
-  const total =
-    8 + inspireParamsBincode.length +
-    8 + shardConfigBincode.length +
-    8 + rlweSecretKeyBincode.length;
-  const out = new Uint8Array(total);
-  const view = new DataView(out.buffer);
-  let off = 0;
-  const writeVec = (bytes: Uint8Array): void => {
-    view.setUint32(off, bytes.length, true);
-    view.setUint32(off + 4, 0, true); // hi=0; payload sizes always fit u32 in practice.
-    off += 8;
-    out.set(bytes, off);
-    off += bytes.length;
-  };
-  writeVec(inspireParamsBincode);
-  writeVec(shardConfigBincode);
-  writeVec(rlweSecretKeyBincode);
+const EXPECTED_ROW_HEX: Record<number, string> = {
+  0: "00bc000000000000000000000000000000000000000000000000000000000000",
+  1: "01bc000000000000000000000000000000000000000000000000000000010000",
+  2: "02bc000000000000000000000000000000000000000000000000000000020000",
+  3: "03bc000000000000000000000000000000000000000000000000000000030000",
+  4: "00bc000000000000000000000000000000000000000000000000000000040000",
+};
+
+interface FixtureMeta {
+  entry_size: number;
+  list_key_hex: string;
+  target_indices: number[];
+  bcs_hex: string[];
+}
+
+function read(name: string): Uint8Array {
+  return new Uint8Array(readFileSync(join(FIXTURES_DIR, name)));
+}
+
+const meta = JSON.parse(
+  readFileSync(join(FIXTURES_DIR, "fixture.json"), "utf-8"),
+) as FixtureMeta;
+const paramsBundle = read("params_bundle.bin");
+const crsBincode = read("crs.bin");
+const shardConfigBincode = read("shard_config.bin");
+
+const sessions: RavenInspireClientSession[] = [];
+
+/** A session over the fixture's own secret key, which `params_bundle.bin` carries. */
+function newSession(): RavenInspireClientSession {
+  const session = wasm.build_client_session(paramsBundle, crsBincode);
+  sessions.push(session);
+  return session;
+}
+
+/** Per-query state for `targetIdx`; the query bytes go to a server, this half never does. */
+function clientStateFor(session: RavenInspireClientSession, targetIdx: number): Uint8Array {
+  return decodeClientPirQueryBundle(
+    wasm.build_seeded_query(session, shardConfigBincode, BigInt(targetIdx)),
+  ).clientStateBincode;
+}
+
+function hex(bytes: Uint8Array): string {
+  let out = "";
+  for (const b of bytes) out += b.toString(16).padStart(2, "0");
   return out;
 }
 
-function bytesToHexNoPrefix(bytes: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < bytes.length; i += 1) {
-    s += bytes[i].toString(16).padStart(2, "0");
-  }
-  return s;
-}
+describe("wasm extract_response against the checked-in Rust-emitted fixture", () => {
+  afterAll(() => {
+    for (const s of sessions) s.free();
+    sessions.length = 0;
+  });
+
+  it("recovers the row native Rust encoded, byte for byte, at every fixture index", () => {
+    expect(meta.target_indices).toEqual([0, 1, 2, 3, 4]);
+    const session = newSession();
+    for (const idx of meta.target_indices) {
+      const plaintext = wasm.extract_response(
+        session,
+        crsBincode,
+        clientStateFor(session, idx),
+        read(`response_for_idx_${idx}.bin`),
+        meta.entry_size,
+      );
+      expect(plaintext.length, `idx ${idx} plaintext length`).toBe(meta.entry_size);
+      expect(hex(plaintext), `idx ${idx} row`).toBe(EXPECTED_ROW_HEX[idx]);
+      // The row is [status, bc[0..31]]; the tail is the first 31 bytes of the fixture's own BC.
+      expect(hex(plaintext.subarray(1)), `idx ${idx} bc tail`).toBe(
+        meta.bcs_hex[idx].slice(0, 62),
+      );
+      // Cross-check against the plaintext native Rust recorded IN the fixture run, so the
+      // pin above and the generator can never drift apart silently.
+      expect(hex(plaintext), `idx ${idx} vs recorded expected_plain`).toBe(
+        hex(read(`expected_plain_for_idx_${idx}.bin`)),
+      );
+    }
+  });
+
+  it("decodes with the RECORDED client state, so the fixture is self-contained", () => {
+    // Before the generator wrote client_state_for_idx_*, extraction was only possible by
+    // rebuilding a state from the shipped secret key; the recorded state removes even that
+    // dependency and pins the exact (state, response, plaintext) triple one run produced.
+    const session = newSession();
+    for (const idx of meta.target_indices) {
+      const plaintext = wasm.extract_response(
+        session,
+        crsBincode,
+        read(`client_state_for_idx_${idx}.bin`),
+        read(`response_for_idx_${idx}.bin`),
+        meta.entry_size,
+      );
+      expect(hex(plaintext), `idx ${idx} via recorded state`).toBe(
+        hex(read(`expected_plain_for_idx_${idx}.bin`)),
+      );
+    }
+  });
+
+  it("surfaces a truncated response as a typed decode error, not a wasm trap", () => {
+    const session = newSession();
+    const state = clientStateFor(session, 0);
+    const full = read("response_for_idx_0.bin");
+
+    let message = "";
+    try {
+      wasm.extract_response(
+        session,
+        crsBincode,
+        state,
+        full.subarray(0, Math.floor(full.length / 2)),
+        meta.entry_size,
+      );
+      expect.fail("a half-length response must not decode");
+    } catch (e) {
+      message = String(e);
+    }
+    // A wasm `unreachable` trap reaches JS as an opaque RuntimeError with no operand name,
+    // which is what the panic hook and the typed WasmClientError exist to prevent.
+    expect(message).toContain("server_response");
+    expect(message.toLowerCase()).not.toContain("unreachable");
+  });
+
+  it("surfaces a 1-byte response as a typed decode error, not a wasm trap", () => {
+    const session = newSession();
+    const state = clientStateFor(session, 0);
+    const full = read("response_for_idx_0.bin");
+
+    let message = "";
+    let returned: Uint8Array | null = null;
+    try {
+      returned = wasm.extract_response(
+        session,
+        crsBincode,
+        state,
+        full.subarray(0, 1),
+        meta.entry_size,
+      );
+    } catch (e) {
+      message = String(e);
+    }
+    expect(returned, "a 1-byte response must not decode").toBeNull();
+    expect(message).toContain("server_response");
+    expect(message.toLowerCase()).not.toContain("unreachable");
+  });
+
+  it("surfaces a zero-length response as a typed decode error, never a fabricated record", () => {
+    // Targets the extract() fabrication class (crates/inspire/src/pir/extract.rs): an empty
+    // column_ciphertexts once decrypted a single value and pushed it num_columns times,
+    // returning a well-formed all-equal record with Ok(()). The proof standard here is that
+    // NOTHING comes back: a returned Uint8Array of any shape is the defect, not a soft-fail.
+    const session = newSession();
+    const state = clientStateFor(session, 0);
+
+    let message = "";
+    let returned: Uint8Array | null = null;
+    try {
+      returned = wasm.extract_response(
+        session,
+        crsBincode,
+        state,
+        new Uint8Array(0),
+        meta.entry_size,
+      );
+    } catch (e) {
+      message = String(e);
+    }
+    expect(returned, "an empty response must not decode to a record").toBeNull();
+    expect(message).toContain("server_response");
+    expect(message.toLowerCase()).not.toContain("unreachable");
+  });
+
+  it("does NOT bind the recovered row to the index the caller asked for", () => {
+    // CHARACTERIZATION, not an endorsement. A server that answers row M to a query for row
+    // N returns a well-formed 32-byte plaintext and no error, so the substitution has to be
+    // caught above the ciphertext: T1 re-checks the row's own BC against the one requested
+    // (status_row_bc_binding), and T2/T3 catch it only when the folded root fails to verify.
+    const session = newSession();
+    const stateForZero = clientStateFor(session, 0);
+
+    const substituted = wasm.extract_response(
+      session,
+      crsBincode,
+      stateForZero,
+      read("response_for_idx_3.bin"),
+      meta.entry_size,
+    );
+
+    expect(hex(substituted)).toBe(EXPECTED_ROW_HEX[3]);
+    expect(hex(substituted)).not.toBe(EXPECTED_ROW_HEX[0]);
+  });
+});

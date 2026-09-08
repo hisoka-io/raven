@@ -14,6 +14,16 @@ const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-test";
 /// Row width of [`build_toy_state`]'s cell; the configured encoder must emit it.
 const TOY_ENTRY_SIZE: usize = 256;
 
+/// Distinct per leaf, and never the all-zero empty-leaf sentinel: the fixture used to
+/// hand leaf 0 `[0u8; 32]`, so leaf 0 never exercised the occupied-leaf path at all.
+fn leaf_commitment(leaf_index: u32) -> [u8; 32] {
+    raven_railgun_testkit::canonical(
+        u8::try_from(leaf_index & 0x7f)
+            .expect("low byte")
+            .saturating_add(1),
+    )
+}
+
 fn build_toy_state() -> raven_railgun_core::Result<InspireServerState> {
     raven_railgun_testkit::try_toy_state(TOY_ENTRY_SIZE)
 }
@@ -40,7 +50,7 @@ async fn orchestrator_bootstraps_and_consumer_applies_events() {
             leaves: vec![CommitmentLeaf {
                 tree_number: 0,
                 leaf_index: i,
-                commitment_hash: [u8::try_from(i & 0xff).expect("low byte"); 32],
+                commitment_hash: leaf_commitment(i),
                 ciphertext: vec![],
             }],
         };
@@ -99,26 +109,33 @@ async fn orchestrator_bootstraps_and_consumer_applies_events() {
     );
 
     // snapshot fields out: don't hold the parking_lot guard across the await below
-    let (count, has_0, has_1, has_2) = {
+    let (count, applied) = {
         let store = handle.logical_store.lock();
-        (
-            store.leaf_count(),
-            store.leaf(0, 0).is_some(),
-            store.leaf(0, 1).is_some(),
-            store.leaf(0, 2).is_some(),
-        )
+        let applied: Vec<Option<[u8; 32]>> = (0..3u32).map(|i| store.leaf(0, i).copied()).collect();
+        (store.leaf_count(), applied)
     };
     assert_eq!(count, 3, "3 single-leaf Transacts -> 3 leaves");
-    assert!(has_0 && has_1 && has_2);
+    // `leaf()` is a BTreeMap probe: `is_some()` proves the KEY landed and says nothing
+    // about the value, so a consumer that applies every leaf as zeros passes it.
+    for (i, got) in applied.iter().enumerate() {
+        let leaf_index = u32::try_from(i).expect("index fits u32");
+        assert_eq!(
+            *got,
+            Some(leaf_commitment(leaf_index)),
+            "leaf {leaf_index} must carry the commitment the chain event delivered"
+        );
+    }
 
     handle
         .sender
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("send shutdown");
-    let join_result = tokio::time::timeout(Duration::from_secs(5), handle.consumer)
+    // 5 s reddened here purely from sibling load; every other shutdown join in this
+    // suite allows 30 s and the property asserted is that it exits at all.
+    let join_result = tokio::time::timeout(Duration::from_secs(30), handle.consumer)
         .await
-        .expect("consumer task did not exit within 5s")
+        .expect("consumer task did not exit within 30s")
         .expect("join");
     assert!(
         join_result.is_ok(),
@@ -145,7 +162,7 @@ async fn orchestrator_reorg_truncates_leaves_past_height() {
             leaves: vec![CommitmentLeaf {
                 tree_number: 0,
                 leaf_index: i,
-                commitment_hash: [u8::try_from(i & 0xff).expect("low byte"); 32],
+                commitment_hash: leaf_commitment(i),
                 ciphertext: vec![],
             }],
         };
@@ -156,7 +173,9 @@ async fn orchestrator_reorg_truncates_leaves_past_height() {
             .expect("send");
     }
     // poll the store, not a fixed sleep: default policy yields no commit_notify at 3 events, and a sleep races the consumer under load
-    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // 30 s, matching the sibling suites: this is a deadlock detector, and a 5 s budget
+    // reds on how many other test binaries share the box.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let count = handle.logical_store.lock().leaf_count();
         if count == 3 {
@@ -164,7 +183,7 @@ async fn orchestrator_reorg_truncates_leaves_past_height() {
         }
         assert!(
             tokio::time::Instant::now() < drain_deadline,
-            "consumer did not drain 3 events within 5 s (count = {count})"
+            "consumer did not drain 3 events within 30 s (count = {count})"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -178,16 +197,16 @@ async fn orchestrator_reorg_truncates_leaves_past_height() {
         .send(ConsumerEvent::Reorg(100))
         .await
         .expect("send reorg");
-    tokio::time::timeout(Duration::from_secs(5), commit_fut)
+    tokio::time::timeout(Duration::from_secs(30), commit_fut)
         .await
-        .expect("reorg-driven commit did not fire within 5s");
+        .expect("reorg-driven commit did not fire within 30s");
 
     // snapshot fields out: don't hold the parking_lot guards across the await below
-    let (count, has_0, has_1, has_2) = {
+    let (count, leaf_0, has_1, has_2) = {
         let store = handle.logical_store.lock();
         (
             store.leaf_count(),
-            store.leaf(0, 0).is_some(),
+            store.leaf(0, 0).copied(),
             store.leaf(0, 1).is_some(),
             store.leaf(0, 2).is_some(),
         )
@@ -196,7 +215,12 @@ async fn orchestrator_reorg_truncates_leaves_past_height() {
         count, 1,
         "after reorg(100), only the leaf at block 100 should survive"
     );
-    assert!(has_0);
+    assert_eq!(
+        leaf_0,
+        Some(leaf_commitment(0)),
+        "the survivor must keep its commitment bytes; a rewritten row still \
+         satisfies `is_some`"
+    );
     assert!(!has_1);
     assert!(!has_2);
 

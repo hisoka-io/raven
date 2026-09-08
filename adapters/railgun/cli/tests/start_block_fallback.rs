@@ -9,6 +9,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use proptest::prelude::*;
+use proptest::test_runner::TestCaseError;
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_cli::serve_production_multi::{
     compute_effective_start_block, compute_effective_start_block_per_tree,
@@ -34,68 +36,119 @@ fn encoder() -> Arc<dyn PirTableEncoder> {
         .expect("build encoder")
 }
 
-#[test]
-fn indexer_resume_uses_manifest_block_height_when_higher_than_toml_start_block() {
-    let recovered = [100u64];
-    assert_eq!(compute_effective_start_block(50, &recovered), 100);
+/// Independent oracle for the global floor: an explicit scan, not the subject's
+/// `max().unwrap_or(0).max()` restated. The empty slice needs no special case
+/// here, which is what makes it an oracle for the fresh-bootstrap arm rather
+/// than a copy of the code under test.
+fn expected_global_floor(toml_start_block: u64, recovered: &[u64]) -> u64 {
+    let mut floor = toml_start_block;
+    for &height in recovered {
+        if height > floor {
+            floor = height;
+        }
+    }
+    floor
 }
 
-#[test]
-fn indexer_fresh_bootstrap_uses_toml_start_block_when_no_manifest() {
-    let recovered: Vec<u64> = Vec::new();
-    assert_eq!(
-        compute_effective_start_block(25_030_578, &recovered),
-        25_030_578
+fn check_global_floor(toml_start_block: u64, recovered: &[u64]) -> Result<(), TestCaseError> {
+    prop_assert_eq!(
+        compute_effective_start_block(toml_start_block, recovered),
+        expected_global_floor(toml_start_block, recovered),
+        "global floor for toml={} recovered={:?}",
+        toml_start_block,
+        recovered
     );
-    let zero_recovered = [0u64, 0u64, 0u64];
-    assert_eq!(
-        compute_effective_start_block(25_030_578, &zero_recovered),
-        25_030_578
+    Ok(())
+}
+
+fn check_per_tree_floor(
+    toml_start_block: u64,
+    recovered: &BTreeMap<u32, u64>,
+) -> Result<(), TestCaseError> {
+    let got = compute_effective_start_block_per_tree(toml_start_block, recovered);
+    // Key set, not just length: a map that dropped a tree and invented another
+    // would keep the count.
+    prop_assert!(
+        got.keys().eq(recovered.keys()),
+        "per-tree floors must cover exactly the recovered trees; got {:?} for {:?}",
+        got.keys().collect::<Vec<_>>(),
+        recovered.keys().collect::<Vec<_>>()
     );
+    for (&tree, &recovered_height) in recovered {
+        let Some(&floor) = got.get(&tree) else {
+            return Err(TestCaseError::fail(format!(
+                "tree {tree} missing from the floors map"
+            )));
+        };
+        // "at least both, and equal to one of them" characterises max without
+        // restating it, so a global collapse (every key the same value) fails
+        // the second half on any tree whose own height is not that value.
+        prop_assert!(
+            floor >= toml_start_block && floor >= recovered_height,
+            "tree {} floor {} must not sit below toml {} or recovered {}",
+            tree,
+            floor,
+            toml_start_block,
+            recovered_height
+        );
+        prop_assert!(
+            floor == toml_start_block || floor == recovered_height,
+            "tree {} floor {} must be one of toml {} / recovered {}, not a derived value",
+            tree,
+            floor,
+            toml_start_block,
+            recovered_height
+        );
+    }
+    Ok(())
 }
 
-#[test]
-fn indexer_resume_uses_toml_start_block_when_higher_than_manifest_height() {
-    // operator-advanced floor past the recovered baseline must win
-    let recovered = [50u64, 75u64];
-    assert_eq!(compute_effective_start_block(100, &recovered), 100);
-}
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
 
-#[test]
-fn effective_start_block_takes_max_across_instances() {
-    let recovered = [10u64, 200u64, 50u64];
-    assert_eq!(compute_effective_start_block(0, &recovered), 200);
-}
+    /// Replaces four hand-written examples: recovered-above-toml, toml-above-recovered,
+    /// max-across-instances, and the fresh-bootstrap pair (no manifest / all-zero
+    /// manifests). The last two are not left to the generator - every case re-runs the
+    /// drawn `toml` against the empty slice and against an all-zero slice.
+    #[test]
+    fn effective_start_block_is_the_highest_of_toml_and_every_recovered_height(
+        toml_start_block in prop_oneof![
+            Just(0u64),
+            Just(25_030_578u64),
+            Just(u64::MAX),
+            any::<u64>(),
+        ],
+        recovered in prop::collection::vec(
+            prop_oneof![Just(0u64), Just(u64::MAX), 0u64..30_000_000, any::<u64>()],
+            0..8,
+        ),
+    ) {
+        check_global_floor(toml_start_block, &recovered)?;
+        check_global_floor(toml_start_block, &[])?;
+        check_global_floor(toml_start_block, &vec![0u64; recovered.len()])?;
+    }
 
-#[test]
-fn effective_start_block_per_tree_uses_max_of_toml_and_recovered_per_instance() {
-    let mut recovered: BTreeMap<u32, u64> = BTreeMap::new();
-    recovered.insert(0, 25_000_000);
-    recovered.insert(1, 24_000_000);
-    recovered.insert(2, 23_000_000);
-    let result = compute_effective_start_block_per_tree(0, &recovered);
-    assert_eq!(result.get(&0), Some(&25_000_000));
-    assert_eq!(result.get(&1), Some(&24_000_000));
-    assert_eq!(result.get(&2), Some(&23_000_000));
-
-    let toml_above = compute_effective_start_block_per_tree(25_500_000, &recovered);
-    assert_eq!(toml_above.get(&0), Some(&25_500_000));
-    assert_eq!(toml_above.get(&1), Some(&25_500_000));
-    assert_eq!(toml_above.get(&2), Some(&25_500_000));
-}
-
-#[test]
-fn effective_start_block_per_tree_falls_back_to_toml_when_no_recovered_height() {
-    let mut recovered: BTreeMap<u32, u64> = BTreeMap::new();
-    recovered.insert(0, 0);
-    recovered.insert(1, 0);
-    let result = compute_effective_start_block_per_tree(25_030_578, &recovered);
-    assert_eq!(result.get(&0), Some(&25_030_578));
-    assert_eq!(result.get(&1), Some(&25_030_578));
-
-    let empty: BTreeMap<u32, u64> = BTreeMap::new();
-    let result_empty = compute_effective_start_block_per_tree(100, &empty);
-    assert!(result_empty.is_empty());
+    /// Replaces the two per-tree examples. Same deterministic boundary treatment:
+    /// the empty map and the all-zero map are re-checked in every case.
+    #[test]
+    fn effective_start_block_per_tree_lifts_each_tree_to_its_own_floor(
+        toml_start_block in prop_oneof![
+            Just(0u64),
+            Just(25_030_578u64),
+            Just(u64::MAX),
+            any::<u64>(),
+        ],
+        recovered in prop::collection::btree_map(
+            0u32..6,
+            prop_oneof![Just(0u64), Just(u64::MAX), 0u64..30_000_000, any::<u64>()],
+            0..6,
+        ),
+    ) {
+        check_per_tree_floor(toml_start_block, &recovered)?;
+        check_per_tree_floor(toml_start_block, &BTreeMap::new())?;
+        let zeroed: BTreeMap<u32, u64> = recovered.keys().map(|&t| (t, 0u64)).collect();
+        check_per_tree_floor(toml_start_block, &zeroed)?;
+    }
 }
 
 /// `manifest_block_height()` must return the committed height after reopen;

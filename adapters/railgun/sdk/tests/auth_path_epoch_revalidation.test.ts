@@ -3,59 +3,22 @@
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import {
-  ImtCache,
-  RavenError,
-  RavenPOINodeInterface,
-  TREE_DEPTH,
-  type ClientPirContext,
-  type RavenInspireWasm,
-} from "../src/index";
+import { ImtCache, RavenError, RavenPOINodeInterface } from "../src/index";
 
 import { startMockServer, writeJson, type MockServer } from "./helpers/mock_server";
-import { authPathOf, epochMarkers } from "./helpers/auth_path_stub";
+import {
+  authPathOf,
+  encodeBatchResponse,
+  encodedBatchCount,
+  epochMarkers,
+  stubCtx,
+} from "./helpers/auth_path_stub";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const TREE_NUMBER = 0;
 const INSTANCE_ID = `commit-tree-${TREE_NUMBER}`;
 const SCHEMA_VERSION = 1;
-const NODE_BYTES = 32;
 
-function stubWasm(): RavenInspireWasm {
-  function flatIndex(level: number, idxAtLevel: number): number {
-    const total = 1 << (TREE_DEPTH + 1);
-    return total - (1 << (TREE_DEPTH + 1 - level)) + idxAtLevel;
-  }
-  function siblingPath(leafIdx: number): Uint32Array {
-    const out = new Uint32Array(TREE_DEPTH);
-    let walk = leafIdx;
-    for (let i = 0; i < TREE_DEPTH; i += 1) {
-      out[i] = flatIndex(i, walk ^ 1);
-      walk = walk >>> 1;
-    }
-    return out;
-  }
-  return {
-    build_client_session: () => ({ free: () => undefined }),
-    build_seeded_query: () => new Uint8Array(16),
-    extract_response: (_session, _crs, _state, response, _entry) => new Uint8Array(response),
-    build_instance_params_blob: () => new Uint8Array(0),
-    register_client_session: () => {},
-    path_indices_for_leaf: (_tree: number, leafIdx: number): Uint32Array => siblingPath(leafIdx),
-    path_indices_for_per_list_leaf: (_listKey: Uint8Array, idx: number): Uint32Array =>
-      siblingPath(idx),
-  };
-}
-
-function stubCtx(): ClientPirContext {
-  return {
-    wasm: stubWasm(),
-    session: { free: () => undefined },
-    crsBincode: new Uint8Array(0),
-    shardConfigBincode: new Uint8Array(0),
-    entrySize: NODE_BYTES,
-  };
-}
 
 interface AdapterState {
   epoch: number;
@@ -64,27 +27,6 @@ interface AdapterState {
   statusHits: number;
 }
 
-// Every node byte 0 carries the serving epoch, so a mixed-epoch fold is visible in `elements`.
-function encodeBatchResponse(epoch: number, slots: number): Uint8Array {
-  const out = new Uint8Array(2 + 8 + slots * (8 + NODE_BYTES));
-  out[1] = 1;
-  const dv = new DataView(out.buffer);
-  dv.setUint32(2, slots, true);
-  let off = 10;
-  for (let level = 0; level < slots; level += 1) {
-    dv.setUint32(off, NODE_BYTES, true);
-    off += 8;
-    out[off] = epoch;
-    out[off + NODE_BYTES - 1] = level;
-    off += NODE_BYTES;
-  }
-  return out;
-}
-
-function requestedSlots(body: Uint8Array): number {
-  const dv = new DataView(body.buffer, body.byteOffset, body.byteLength);
-  return dv.getUint32(2, true);
-}
 
 function mountAdapter(server: MockServer, state: AdapterState): void {
   server.route(
@@ -101,7 +43,7 @@ function mountAdapter(server: MockServer, state: AdapterState): void {
         "x-raven-epoch": String(state.epoch),
         "x-raven-schema-version": String(SCHEMA_VERSION),
       });
-      res.end(Buffer.from(encodeBatchResponse(state.epoch, requestedSlots(body))));
+      res.end(Buffer.from(encodeBatchResponse(state.epoch, encodedBatchCount(body))));
       return true;
     },
   );

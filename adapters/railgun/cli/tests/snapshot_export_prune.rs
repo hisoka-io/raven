@@ -188,46 +188,9 @@ fn prune_snapshots_subcommand_removes_oldest_tarballs() {
     );
 }
 
-#[test]
-fn prune_snapshots_keeps_paired_sig_sidecars_with_kept_tarballs() {
-    let scratch = tempfile::tempdir().expect("tempdir");
-    let dir = scratch.path();
-    let now = SystemTime::now();
-    let names = ["a.tar.zst", "b.tar.zst", "c.tar.zst"];
-    for (i, n) in names.iter().enumerate() {
-        let mtime = now - Duration::from_secs(u64::try_from((2 - i) * 60).unwrap());
-        let tar = dir.join(n);
-        write_with_mtime(&tar, b"tarball", mtime);
-        let mut sig_path = tar.as_os_str().to_owned();
-        sig_path.push(".sig");
-        write_with_mtime(&PathBuf::from(sig_path), b"sig", mtime);
-    }
-
-    run_prune(PruneOptions {
-        data_dir: dir.to_path_buf(),
-        keep_snapshots: 2,
-    })
-    .expect("run_prune");
-
-    assert!(
-        !dir.join("a.tar.zst").exists(),
-        "oldest tarball must be pruned"
-    );
-    assert!(
-        !dir.join("a.tar.zst.sig").exists(),
-        "oldest tarball's paired .sig sidecar must be pruned"
-    );
-    assert!(dir.join("b.tar.zst").exists());
-    assert!(
-        dir.join("b.tar.zst.sig").exists(),
-        "kept tarball's paired .sig sidecar must survive"
-    );
-    assert!(dir.join("c.tar.zst").exists());
-    assert!(
-        dir.join("c.tar.zst.sig").exists(),
-        "kept tarball's paired .sig sidecar must survive"
-    );
-}
+// Sidecar pairing through `run_prune` needs no separate test: run_prune is
+// prune_old_export_tarballs plus one tracing::info (snapshot_port.rs:397-406),
+// and the sidecar property is pinned at the lib seam above.
 
 #[test]
 fn prune_snapshots_zero_when_count_below_keep() {

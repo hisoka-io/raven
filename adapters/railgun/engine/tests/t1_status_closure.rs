@@ -94,7 +94,9 @@ fn build_state_session() -> (
 }
 
 #[test]
-#[ignore = "production-cell setup is heavy (~12s); T1 status PIR closure"]
+#[ignore = "production-cell setup is heavy (~12s); T1 status PIR closure. Trigger: changing the \
+            PPOI status encoder or LogicalLeafStore::ppoi_status. CI runs it in the durability + \
+            closure lane."]
 fn t1_pir_query_recovers_status_byte_byte_identical_to_logical_store() {
     let (live_state, client_session, store, params) = build_state_session();
 

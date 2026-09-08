@@ -12,6 +12,41 @@ use raven_client::{
     WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES,
 };
 
+/// The cap VALUES, pinned to literals. This is the only assertion in the tree that fails if
+/// someone widens the ceiling.
+///
+/// Every other test in this file and in `panic_safety.rs` derives its fixture FROM the constants
+/// (`LIMIT + 1`, `LIMIT - 16`), so they all follow the cap wherever it moves: raising the
+/// untrusted limit to 128 MiB leaves the entire suite green while doubling how much attacker-
+/// supplied input the WASM client will allocate before refusing. The boundary tests prove the
+/// mechanism works AT the cap; only this one says what the cap is.
+///
+/// It exists because two separately-correct decisions cancelled out — one task deferred the
+/// deletion of a weaker test until this pin was added, another deleted that test as a genuine
+/// duplicate, and the pin was never written. Changing either number should require editing this
+/// line and saying why.
+#[test]
+fn the_wasm_deserialize_caps_are_the_values_the_threat_model_assumes() {
+    assert_eq!(
+        WASM_BINCODE_DESERIALIZE_LIMIT_BYTES,
+        64 * 1024 * 1024,
+        "the UNTRUSTED bincode cap moved. This bounds what a hostile server can make the WASM \
+         client allocate; raising it is a threat-model change, not a tuning knob."
+    );
+    assert_eq!(
+        WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES,
+        32 * 1024 * 1024,
+        "the TRUSTED (self-authored session residue) cap moved; it must stay at or below the \
+         untrusted cap and is deliberately half of it."
+    );
+}
+
+/// The trusted cap must never exceed the untrusted one. Both sides are `const`, so this is a
+/// COMPILE-time assertion rather than a runtime one: written as `assert!` inside the test above it
+/// is a constant expression, which clippy correctly refuses as an assertion that cannot fail at
+/// runtime — the very defect class this suite exists to remove. Violating it fails the build.
+const _: () = assert!(WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES <= WASM_BINCODE_DESERIALIZE_LIMIT_BYTES);
+
 #[test]
 fn wasm_bincode_decode_rejects_payload_above_64mib_with_typed_error() {
     // contents immaterial: the length pre-check fires before bincode runs
@@ -27,31 +62,6 @@ fn wasm_bincode_decode_rejects_payload_above_64mib_with_typed_error() {
     assert!(
         err.contains("size limit reached"),
         "expected the cap-rejection wording 'size limit reached', got: {err}"
-    );
-}
-
-#[test]
-fn wasm_bincode_decode_accepts_oversize_payload_under_64mib_cap() {
-    // oversize-payload proxy for the 64 MiB cap; an arbitrary large body under the cap
-    const OVERSIZE_PAYLOAD_BYTES: usize = 35 * 1024 * 1024;
-    const _: () = assert!(
-        OVERSIZE_PAYLOAD_BYTES <= WASM_BINCODE_DESERIALIZE_LIMIT_BYTES,
-        "fixture invariant: the oversize-payload proxy must fit under the 64 MiB cap"
-    );
-
-    let body = vec![0xc7u8; OVERSIZE_PAYLOAD_BYTES];
-    let bytes = bincode::serialize(&body).expect("bincode serialize oversize payload");
-    assert!(
-        bytes.len() <= WASM_BINCODE_DESERIALIZE_LIMIT_BYTES,
-        "the bincoded oversize Vec<u8> must fit under the WASM cap"
-    );
-
-    let decoded: Vec<u8> = decode_capped_for_test(&bytes, "oversize_payload")
-        .expect("an oversize payload must decode under the 64 MiB cap");
-    assert_eq!(
-        decoded.len(),
-        OVERSIZE_PAYLOAD_BYTES,
-        "the decoded oversize payload must round-trip"
     );
 }
 

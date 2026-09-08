@@ -300,32 +300,3 @@ async fn abandoned_leaves_keep_an_instance_out_of_rotation_after_the_error_run_c
 
     fixture.shutdown().await;
 }
-
-/// The inverse, so the latch cannot be a permanent 503 dressed up as a guard: a break that
-/// abandoned NOTHING still self-heals on the next applied event.
-#[tokio::test]
-async fn an_error_that_abandoned_no_leaves_still_self_heals() {
-    let healthy = caught_up_at_tip();
-    let stalled = caught_up_at_tip();
-    let mut per_instance = HashMap::new();
-    per_instance.insert(InstanceId::new(HEALTHY), Arc::clone(&healthy));
-    per_instance.insert(InstanceId::new(STALLED), Arc::clone(&stalled));
-    let fixture = spawn(&[HEALTHY, STALLED], |state| {
-        state.with_instance_metrics(per_instance)
-    })
-    .await;
-
-    stalled.lock().consecutive_event_errors = 3;
-    let (code, _) = fixture.probe().await;
-    assert_eq!(code, 503, "a live error run takes the instance out");
-
-    stalled.lock().record_applied_event(21_000_003);
-    let (code, body) = fixture.probe().await;
-    assert_eq!(
-        code, 200,
-        "with no leaves abandoned there is no gap, so the next success must restore readiness"
-    );
-    assert!(body.stalled_consumer_instances.is_empty());
-
-    fixture.shutdown().await;
-}

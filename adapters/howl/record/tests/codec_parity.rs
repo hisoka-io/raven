@@ -164,8 +164,12 @@ fn a_non_canonical_field_is_refused_rather_than_reduced() {
     );
 }
 
+/// Fixture-coverage guard, not codec coverage: it reads `record.json` and never calls
+/// `decode` (proven: it stays green with the codec gutted). What it protects is
+/// `decode_round_trips_every_vector`'s claim to cover both kinds — a regenerated
+/// fixture that dropped one kind would silently narrow that test without this check.
 #[test]
-fn both_record_kinds_decode() {
+fn the_fixture_covers_both_record_kinds() {
     let doc = vectors();
     let kinds: Vec<u8> = doc["vectors"]
         .as_array()

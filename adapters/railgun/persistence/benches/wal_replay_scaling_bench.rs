@@ -54,7 +54,10 @@ fn median(timings: &mut [Duration]) -> Duration {
 }
 
 #[test]
-#[ignore = "WAL replay scaling sweep; ~10s wall at 100k entries x 3 seeds"]
+#[ignore = "~20 min wall (1215 s measured on a 16-core box; ~10 min on an idle one): the cost is \
+            the 333k fsynced WAL appends that seed the sweep, not the replay it measures, which is \
+            110 ms at 100k as a 3-seed median. Trigger: changing Wal::replay or the WAL frame \
+            layout."]
 fn wal_replay_scales_linearly_at_1k_10k_100k() {
     eprintln!(
         "wal_replay_scaling: SEEDS={} ENTRY_COUNTS={:?}",

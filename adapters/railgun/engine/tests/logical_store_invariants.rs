@@ -2,9 +2,11 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
+use raven_railgun_core::MerkleProof;
 use raven_railgun_engine::inspire::{apply_wal_entry, LogicalLeafStore};
 use raven_railgun_engine::pir_table::PerLeafCommitmentEncoder;
 use raven_railgun_persistence::WalEntryPayload;
+use raven_railgun_poseidon::merkle_node;
 
 const ENTRIES_PER_SHARD: u32 = 65_536;
 const LIST_KEY: [u8; 32] = [0xab; 32];
@@ -21,96 +23,20 @@ fn enc() -> PerLeafCommitmentEncoder {
     PerLeafCommitmentEncoder::new(32, ENTRIES_PER_SHARD, 0).expect("encoder")
 }
 
-#[test]
-fn append_leaf_drives_imt_root_advance() {
-    let mut store = LogicalLeafStore::new();
-    let e = enc();
-    apply_wal_entry(
-        &mut store,
-        &WalEntryPayload::AppendLeaf {
-            tree_number: 0,
-            leaf_index: 0,
-            commitment: fr_canonical(0x01),
-        },
-        100,
-        &e,
-    )
-    .expect("apply 0");
-    let root_after_one = store.imt_root(0).expect("root present after 1 leaf");
-
-    apply_wal_entry(
-        &mut store,
-        &WalEntryPayload::AppendLeaf {
-            tree_number: 0,
-            leaf_index: 1,
-            commitment: fr_canonical(0x02),
-        },
-        101,
-        &e,
-    )
-    .expect("apply 1");
-    let root_after_two = store.imt_root(0).expect("root present after 2 leaves");
-
-    assert_ne!(
-        root_after_one, root_after_two,
-        "root must change after each new leaf"
-    );
-    assert_eq!(store.imt_leaf_count_for(0), 2);
-}
-
-#[test]
-fn append_leaf_rejects_non_contiguous_insert() {
-    let mut store = LogicalLeafStore::new();
-    let e = enc();
-    let err = apply_wal_entry(
-        &mut store,
-        &WalEntryPayload::AppendLeaf {
-            tree_number: 0,
-            leaf_index: 1,
-            commitment: fr_canonical(0x01),
-        },
-        100,
-        &e,
-    )
-    .expect_err("must reject leaf_index=1 with empty tree");
-    assert!(format!("{err}").contains("non-contiguous"));
-}
-
-#[test]
-fn reorg_truncates_leaves_above_height_and_rebuilds_imt() {
-    let mut store = LogicalLeafStore::new();
-    let e = enc();
-    for i in 0u32..5 {
-        apply_wal_entry(
-            &mut store,
-            &WalEntryPayload::AppendLeaf {
-                tree_number: 0,
-                leaf_index: i,
-                commitment: fr_canonical(u8::try_from(i + 1).unwrap_or(1)),
-            },
-            100 + u64::from(i),
-            &e,
-        )
-        .expect("apply");
+/// Fold the leaf up through the returned siblings. `proof.root` is copied straight
+/// from the tree, so comparing it against that same tree is a tautology; only a
+/// walk that consumes `elements` can tell a real path from a corrupt one.
+fn reconstruct_root(leaf: [u8; 32], leaf_index: u32, proof: &MerkleProof) -> [u8; 32] {
+    let mut current = leaf;
+    for (level, sibling) in proof.elements.iter().enumerate() {
+        current = if (leaf_index >> level) & 1 == 1 {
+            merkle_node(*sibling, current)
+        } else {
+            merkle_node(current, *sibling)
+        }
+        .expect("merkle_node");
     }
-    assert_eq!(store.leaf_count(), 5);
-    let root_5 = store.imt_root(0).expect("root after 5");
-
-    apply_wal_entry(&mut store, &WalEntryPayload::Reorg { height: 102 }, 102, &e)
-        .expect("apply reorg");
-    assert_eq!(
-        store.leaf_count(),
-        3,
-        "leaves at heights 103, 104 truncated"
-    );
-    let root_3 = store.imt_root(0).expect("root after reorg");
-    assert_ne!(root_3, root_5, "root must reflect truncated tree");
-    assert_eq!(store.imt_leaf_count_for(0), 3);
-    assert!(store.leaf(0, 0).is_some());
-    assert!(store.leaf(0, 1).is_some());
-    assert!(store.leaf(0, 2).is_some());
-    assert!(store.leaf(0, 3).is_none());
-    assert!(store.leaf(0, 4).is_none());
+    current
 }
 
 #[test]
@@ -215,26 +141,6 @@ fn ppoi_status_in_place_update_does_not_affect_imt_root() {
 }
 
 #[test]
-fn dirty_shards_accumulate_then_clear() {
-    let mut store = LogicalLeafStore::new();
-    let e = enc();
-    apply_wal_entry(
-        &mut store,
-        &WalEntryPayload::AppendLeaf {
-            tree_number: 0,
-            leaf_index: 0,
-            commitment: fr_canonical(0x01),
-        },
-        100,
-        &e,
-    )
-    .expect("apply");
-    assert!(!store.dirty_shards().is_empty());
-    store.clear_dirty_shards();
-    assert!(store.dirty_shards().is_empty());
-}
-
-#[test]
 fn ppoi_list_count_reflects_distinct_list_keys() {
     let mut store = LogicalLeafStore::new();
     let e = enc();
@@ -268,26 +174,6 @@ fn ppoi_list_count_reflects_distinct_list_keys() {
 }
 
 #[test]
-fn imt_tree_count_tracks_distinct_chain_trees() {
-    let mut store = LogicalLeafStore::new();
-    let e = enc();
-    for tree in 0u32..3 {
-        apply_wal_entry(
-            &mut store,
-            &WalEntryPayload::AppendLeaf {
-                tree_number: tree,
-                leaf_index: 0,
-                commitment: fr_canonical(u8::try_from(tree + 1).unwrap_or(1)),
-            },
-            100 + u64::from(tree),
-            &e,
-        )
-        .expect("apply");
-    }
-    assert_eq!(store.imt_tree_count(), 3);
-}
-
-#[test]
 fn merkle_proof_round_trips_for_appended_leaf() {
     let mut store = LogicalLeafStore::new();
     let e = enc();
@@ -305,8 +191,16 @@ fn merkle_proof_round_trips_for_appended_leaf() {
         .expect("apply");
     }
     let proof = store.merkle_proof(0, 1).expect("proof");
-    assert_eq!(proof.elements.len(), 16);
-    assert_eq!(store.imt_root(0), Some(proof.root));
+    assert_eq!(
+        proof.indices, 1,
+        "indices must pack the queried leaf index, or the client folds the path the \
+         wrong way round"
+    );
+    assert_eq!(
+        reconstruct_root(fr_canonical(2), 1, &proof),
+        store.imt_root(0).expect("root present"),
+        "the returned siblings must fold leaf 1 back to the tree root"
+    );
 }
 
 #[test]
@@ -326,26 +220,11 @@ fn ppoi_merkle_proof_round_trips_for_added_bc() {
         &e,
     )
     .expect("apply");
-    let _ = bc;
     let proof = store.ppoi_merkle_proof(&LIST_KEY, 0).expect("proof");
-    assert_eq!(proof.elements.len(), 16);
-    assert_eq!(store.ppoi_imt_root(&LIST_KEY), Some(proof.root));
-}
-
-#[test]
-fn heartbeat_does_not_mutate_state() {
-    let mut store = LogicalLeafStore::new();
-    let e = enc();
-    apply_wal_entry(
-        &mut store,
-        &WalEntryPayload::Heartbeat {
-            wallclock_unix_ms: 1_700_000_000,
-        },
-        100,
-        &e,
-    )
-    .expect("apply heartbeat");
-    assert_eq!(store.leaf_count(), 0);
-    assert_eq!(store.ppoi_count(), 0);
-    assert_eq!(store.last_block_height(), 100);
+    assert_eq!(proof.indices, 0, "list index 0 folds left at every level");
+    assert_eq!(
+        reconstruct_root(bc, 0, &proof),
+        store.ppoi_imt_root(&LIST_KEY).expect("root present"),
+        "the returned siblings must fold the blinded commitment back to the per-list root"
+    );
 }

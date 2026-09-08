@@ -10,7 +10,9 @@ import {
   hashLeftRight,
   foldMerkleRoot,
 } from "../src/index";
-import { startMockServer, writeJson, type MockServer } from "./helpers/mock_server";
+import { makeRegisterSpy } from "./helpers/register_spy";
+import { startMockServer, writeBinary, writeJson, type MockServer } from "./helpers/mock_server";
+import { encodeBatchResponse, encodedBatchCount, stubCtx as pathStubCtx } from "./helpers/auth_path_stub";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX =
@@ -80,6 +82,20 @@ describe("wire parity: C3 — Poseidon hashLeftRight matches upstream", () => {
   });
 });
 
+/** Echoes one 32 B node per requested slot, stamped with the headers a real batch reply carries. */
+function mountNodeBatchRoute(server: MockServer): void {
+  server.route(
+    (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
+    (_req, body, res) => {
+      writeBinary(res, encodeBatchResponse(1, encodedBatchCount(body)), {
+        "x-raven-epoch": "1",
+        "x-raven-schema-version": "1",
+      });
+      return true;
+    },
+  );
+}
+
 describe("wire parity: C1 — PoisPerListResponse outer key is BC (NOT listKey)", () => {
   let server: MockServer;
   beforeAll(async () => {
@@ -125,14 +141,45 @@ describe("wire parity: C1 — PoisPerListResponse outer key is BC (NOT listKey)"
 });
 
 describe("wire parity: C4 — MerkleProof.indices is uint256 (64 hex chars)", () => {
-  it("MerkleProof type carries 64-char no-prefix hex indices", () => {
-    // Upstream nToHex(index, UINT_256) -> 64 hex chars, no prefix (merkletree.ts).
-    const proof: import("../src/index").MerkleProof = {
-      leaf: "0".repeat(64),
-      elements: [],
-      indices: "0".repeat(64),
-      root: "0".repeat(64),
-    };
+  // This block used to build its own object literal and assert on it, which no change to the
+  // SDK could ever fail. Drive the SDK instead: both client-PIR arms mint `indices` themselves.
+  let server: MockServer;
+  beforeAll(async () => {
+    server = await startMockServer();
+    mountNodeBatchRoute(server);
+  });
+  afterAll(async () => {
+    await server.close();
+  });
+
+  const LEAF_INDEX = 1234;
+  // Upstream nToHex(index, UINT_256) -> 64 hex chars, no prefix (merkletree.ts).
+  const EXPECTED = LEAF_INDEX.toString(16).padStart(64, "0");
+
+  it("the T3 commit-tree auth path carries 64-char no-prefix hex indices", async () => {
+    const sdk = new RavenPOINodeInterface({
+      endpoint: server.url,
+      bearerToken: TOKEN,
+      useClientPir: true,
+      clientPirContexts: new Map([["t3CommitTree:0", pathStubCtx()]]),
+    });
+    const got = await sdk.getMerkleProof(0, LEAF_INDEX);
+    if (got.kind !== "authPath") throw new Error(`expected authPath, got ${got.kind}`);
+    expect(got.indices).toBe(EXPECTED);
+    expect(got.indices.length).toBe(64);
+    expect(got.indices.startsWith("0x")).toBe(false);
+  });
+
+  it("the T2 per-list proof carries 64-char no-prefix hex indices", async () => {
+    const sdk = new RavenPOINodeInterface({
+      endpoint: server.url,
+      bearerToken: TOKEN,
+      useClientPir: true,
+      clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, pathStubCtx()]]),
+      bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX_A, LEAF_INDEX]])]]),
+    });
+    const [proof] = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX_A]);
+    expect(proof.indices).toBe(EXPECTED);
     expect(proof.indices.length).toBe(64);
     expect(proof.indices.startsWith("0x")).toBe(false);
   });
@@ -157,7 +204,7 @@ describe("wire parity: H3 — Error-class discrimination on T1 client-PIR", () =
         build_seeded_query: () => new Uint8Array(16),
         extract_response: () => new Uint8Array(32),
         build_instance_params_blob: () => new Uint8Array(0),
-        register_client_session: () => {},
+        register_client_session: makeRegisterSpy(),
         path_indices_for_leaf: () => new Uint32Array(16),
         path_indices_for_per_list_leaf: () => new Uint32Array(16),
       },

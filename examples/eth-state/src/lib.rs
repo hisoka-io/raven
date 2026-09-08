@@ -149,6 +149,18 @@ pub fn build_flat_state(
     entry_size: usize,
     seed: u64,
 ) -> Result<(FlatServerState, RlweSecretKey), EthStateError> {
+    // Leaf assignment (shard = flat_index / ENTRIES_PER_SHARD) and the encoder's
+    // rows-per-shard both must equal ring_dim; a mismatch builds engines whose
+    // declared and actual geometry disagree, and reads return wrong bytes as Ok.
+    if params.ring_dim != ENTRIES_PER_SHARD {
+        return Err(EthStateError::Setup(format!(
+            "shard geometry mismatch: params.ring_dim {} != ENTRIES_PER_SHARD {}; \
+             every entry-to-shard assignment in this demo divides by ENTRIES_PER_SHARD \
+             while the encoder packs ring_dim rows per shard, so building at this \
+             ring_dim would serve wrong bytes with no error",
+            params.ring_dim, ENTRIES_PER_SHARD
+        )));
+    }
     let mut sampler = GaussianSampler::with_seed(params.sigma, seed);
     let mut rng = ChaCha20Rng::seed_from_u64(seed);
     let (crs, encoded_db, rlwe_sk) =

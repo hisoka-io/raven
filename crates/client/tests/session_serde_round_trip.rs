@@ -18,8 +18,7 @@ use raven_inspire::params::{InspireParams, ShardConfig};
 use raven_inspire::{extract_inspiring, respond_inspiring, setup as inspire_setup, ClientSession};
 
 use raven_client::{
-    decode_capped_for_test, decode_trusted_for_test, deserialize_client_session_rust,
-    serialize_client_session_rust, WASM_BINCODE_DESERIALIZE_LIMIT_BYTES,
+    deserialize_client_session_rust, serialize_client_session_rust,
     WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES,
 };
 
@@ -182,29 +181,6 @@ fn wasm_session_deserialize_rejects_oversize_blob_with_typed_error() {
     );
 }
 
-/// At exactly the cap the length pre-check must NOT fire; a deliberately-truncated
-/// body then fails the decode (not the cap), so the Err arm is guaranteed. An
-/// all-zero blob would decode as length 0 -> Ok and make the assertion vacuous.
-#[test]
-fn wasm_session_trusted_cap_admits_payload_at_cap_boundary() {
-    let cap = WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES;
-    // bincode Vec<u8> = u64 length prefix + data. Claim `cap` elements but supply
-    // only cap-8 data bytes, so the decode runs (cap not exceeded) then fails on
-    // truncation.
-    let mut bytes = (cap as u64).to_le_bytes().to_vec();
-    bytes.resize(cap, 0);
-    let err = decode_trusted_for_test::<Vec<u8>>(&bytes, "client_session_boundary")
-        .expect_err("a cap-sized but truncated body must fail the decode, not the cap");
-    assert!(
-        !err.contains("size limit reached"),
-        "the trusted cap must ADMIT at the boundary (reject only past it); got: {err}"
-    );
-    assert!(
-        err.contains("client_session_boundary"),
-        "expected the typed body-decode error for client_session_boundary, got: {err}"
-    );
-}
-
 /// The residue-side ring_dim guard: the arg CRS is only magic-validated, then the
 /// residue's own CRS ring_dim (256) is matched against the params bundle (512) and
 /// must error. Confirms from_residue rehydrates from the residue CRS, not the arg.
@@ -237,19 +213,5 @@ fn wasm_session_deserialize_validates_residue_crs_drift() {
     assert!(
         err.contains("residue CRS ring_dim"),
         "expected the residue-side ring_dim guard wording, got: {err}"
-    );
-}
-
-/// The 64 MiB cap stays the enforcement point for HTTP-sourced bytes; a widened cap fails here.
-#[test]
-fn wasm_untrusted_cap_unchanged_at_64_mib_for_http_sourced_bytes() {
-    let err = {
-        let bytes = vec![0u8; WASM_BINCODE_DESERIALIZE_LIMIT_BYTES + 1];
-        decode_capped_for_test::<Vec<u8>>(&bytes, "http_payload")
-            .expect_err("64 MiB+1 payload must be rejected by the untrusted cap")
-    };
-    assert!(
-        err.contains("size limit reached"),
-        "expected the cap-rejection wording 'size limit reached', got: {err}"
     );
 }

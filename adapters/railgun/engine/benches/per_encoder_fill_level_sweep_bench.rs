@@ -197,7 +197,8 @@ fn run_cell_at_fill(cell: &Cell, fill_label: &str, preload_to: u32) {
 }
 
 #[test]
-#[ignore = "6 encoders x 4 fills x 3 seeds = 72 setup_state calls (~12s each); ~14 min total"]
+#[ignore = "6 encoders x 4 fills x 3 seeds = 72 setup_state calls (~12s each); ~14 min total. \
+            Trigger: adding an encoder or changing how fill level drives re-encode cost."]
 fn per_insert_wall_time_per_encoder_at_fill_levels() {
     append_findings_line("");
     append_findings_line(

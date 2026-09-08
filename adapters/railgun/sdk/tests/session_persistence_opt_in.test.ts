@@ -5,6 +5,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { idbClear, loadClientPirContext } from "../src/index";
+import { makeRegisterSpy } from "./helpers/register_spy";
 import type { RavenInspireClientSession, RavenInspireWasm } from "../src/index";
 
 const INSTANCE_ID = "t1Status-persistence";
@@ -32,7 +33,7 @@ function spyWasm(): PersistenceSpy {
       build_seeded_query: () => new Uint8Array(16),
       extract_response: () => new Uint8Array(32),
       build_instance_params_blob: () => new Uint8Array([9, 9]),
-      register_client_session: () => {},
+      register_client_session: makeRegisterSpy(),
       path_indices_for_leaf: () => new Uint32Array(16),
       path_indices_for_per_list_leaf: () => new Uint32Array(16),
       serialize_client_session: () => {

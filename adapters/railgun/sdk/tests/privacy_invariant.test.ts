@@ -152,7 +152,7 @@ describe("RavenPOINodeInterface privacy invariant", () => {
     if (ctx) ctx.session.free();
   });
 
-  it("getPOIsPerList does not leak BC bytes when useClientPir=true", async () => {
+  it("getPOIsPerList (all-members fixture) does not leak BC bytes when useClientPir=true", async () => {
     const sdk = new RavenPOINodeInterface({
       endpoint: mock.url,
       bearerToken: "test-token-must-be-at-least-16",
@@ -167,8 +167,13 @@ describe("RavenPOINodeInterface privacy invariant", () => {
     });
 
     const queriedBcs = fixture.meta.target_indices.map((idx) => fixture.meta.bcs_hex[idx]);
-    // extract_response throws here (fixture entropy differs from this session); decode correctness is
-    // covered by parity_native_vs_wasm.rs. One call per BC so each outbound query fires before a strict-error abort.
+    // Each call throws on the RESPONSE, but not on the crypto: the session holds the
+    // fixture's own key and decrypts it byte-exactly (wasm_extract_fixture_decode). It
+    // throws because this mock omits the `[u16 BE schema]` envelope the server sends.
+    // (The emitter's old `bc[1..32]` row-shape divergence from `PerListStatusEncoder` is
+    // fixed; t1_end_to_end_real_decode covers the enveloped happy path.) The throw never
+    // reaches what is asserted here, which is the OUTBOUND direction; one call per BC so
+    // each query fires first.
     for (const bc of queriedBcs) {
       try {
         await sdk.getPOIsPerList(
@@ -183,6 +188,13 @@ describe("RavenPOINodeInterface privacy invariant", () => {
     expect(wireRequests.length).toBeGreaterThanOrEqual(queriedBcs.length);
 
     // Encrypted query bodies are KB-scale; legacy plaintext bodies were ~80 B per BC.
+    // SCOPE OF THE EQUALITY BELOW: the fixture supplies ONLY list-member BCs (every
+    // queried BC is in the bc-to-idx map), so one query per BC is trivially true here.
+    // It does NOT hold for mixed membership — a non-member produces ZERO queries, which
+    // is the D4 request-count oracle pinned RED in privacy_all_paths.test.ts ("T1
+    // outbound request count is independent of list membership"). When T1 padding lands,
+    // THIS all-members equality may legitimately change (e.g. to a ladder step) — that
+    // red is the fix arriving, not a regression.
     const queryRequests = wireRequests.filter((r) => r.url.includes("/v1/instance/"));
     expect(queryRequests.length).toBe(queriedBcs.length);
     for (const req of queryRequests) {
@@ -222,6 +234,63 @@ describe("RavenPOINodeInterface privacy invariant", () => {
         expect(
           containsByteSequence(recv.body, bcAsciiHex),
           `server-side received body for ${recv.url} contains hex-ASCII BC for ${bcHex}`,
+        ).toBe(false);
+      }
+    }
+  });
+
+  it("mixed membership: no BC bytes leak, but the request count still tracks membership (D4)", async () => {
+    // The mixed-membership case the file's name promises. The byte-content invariant
+    // holds for members and non-members alike; the COUNT line below is a
+    // CHARACTERIZATION of the open D4 leak (queries == member count, because a
+    // non-member short-circuits before any wire call) — cross-reference the RED pin in
+    // privacy_all_paths.test.ts "T1 outbound request count is independent of list
+    // membership (D4 / DH-L0-6)", which is the assertion a fix must satisfy. When that
+    // pin flips, replace the equality below with the padded relation.
+    const sdk = new RavenPOINodeInterface({
+      endpoint: mock.url,
+      bearerToken: "test-token-must-be-at-least-16",
+      useClientPir: true,
+      clientPirContexts: new Map([[`t1Status:${fixture.meta.list_key_hex}`, ctx]]),
+      bcToIdxMaps: new Map([
+        [
+          fixture.meta.list_key_hex,
+          new Map(fixture.meta.target_indices.map((idx) => [fixture.meta.bcs_hex[idx], idx])),
+        ],
+      ]),
+    });
+
+    const memberBcs = fixture.meta.target_indices
+      .slice(0, 2)
+      .map((idx) => fixture.meta.bcs_hex[idx]);
+    const nonMemberBcs = ["66".repeat(32), "77".repeat(32)];
+    const allBcs = [...memberBcs, ...nonMemberBcs];
+    for (const bc of allBcs) {
+      try {
+        await sdk.getPOIsPerList(
+          [fixture.meta.list_key_hex],
+          [{ blindedCommitment: bc, type: "Shield" as const }],
+        );
+      } catch {
+      }
+    }
+
+    const wireRequests = sdk.lastWireRequests();
+    const queryRequests = wireRequests.filter((r) => r.url.includes("/v1/instance/"));
+    // D4 characterization: 2 members + 2 non-members -> exactly 2 queries.
+    expect(queryRequests.length).toBe(memberBcs.length);
+
+    for (const bcHex of allBcs) {
+      const bcBytes = hexToBytes(bcHex);
+      const bcAsciiHex = new TextEncoder().encode(bcHex);
+      for (const req of wireRequests) {
+        expect(
+          containsByteSequence(req.body, bcBytes),
+          `wire body for ${req.url} contains raw BC bytes for ${bcHex}`,
+        ).toBe(false);
+        expect(
+          containsByteSequence(req.body, bcAsciiHex),
+          `wire body for ${req.url} contains hex-ASCII BC for ${bcHex}`,
         ).toBe(false);
       }
     }

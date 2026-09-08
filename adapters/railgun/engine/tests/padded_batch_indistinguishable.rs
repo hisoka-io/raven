@@ -210,30 +210,24 @@ fn the_pad_draw_does_not_reproduce_itself_across_calls() {
         "the pad draw reproduced the same index sequence 65 times; a cyclic pad does exactly \
          that and publishes the real count as the repeat period"
     );
-}
 
-/// The distribution half, kept separate so nobody mistakes the statistical bound for the gate.
-/// A cyclic pad is periodic in every trial; a uniform one only coincides by chance.
-#[test]
-fn the_pad_draw_does_not_publish_the_real_count_as_a_period() {
-    const TRIALS: usize = 40;
-    let (params, state, session, _db) = fixture();
-    let indices: Vec<u64> = (0..5).collect();
+    // The distribution half, on the same fixture: a cyclic pad is periodic in EVERY trial,
+    // a uniform one only coincides by chance. Kept distinct from the gate above so nobody
+    // mistakes the statistical bound for the deterministic check.
+    let trials = 40usize;
     let real = indices.len();
-
     let mut periodic = 0;
-    for _ in 0..TRIALS {
+    for _ in 0..trials {
         let (states, _q) = build_padded_batch(&session, state.shard_config(), &params, &indices)
             .expect("pad batch");
         let seq: Vec<u64> = states.iter().map(|s| s.index).collect();
-        let repeats = seq.iter().zip(seq.iter().skip(real)).all(|(a, b)| a == b);
-        if repeats {
+        if seq.iter().zip(seq.iter().skip(real)).all(|(a, b)| a == b) {
             periodic += 1;
         }
     }
     assert!(
-        periodic < TRIALS / 4,
-        "{periodic}/{TRIALS} batches repeated with period {real}; the cyclic draw does this in \
+        periodic < trials / 4,
+        "{periodic}/{trials} batches repeated with period {real}; the cyclic draw does this in \
          every trial, which is the leak"
     );
 }

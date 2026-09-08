@@ -1,5 +1,6 @@
 //! The cached respond path must be byte-identical to the non-cached one at the serialized
-//! level, and much faster. Both are called directly, independent of the crate feature.
+//! level, and must actually READ its cache (poisoned-cache guard below). The latency table
+//! lives in `benches/`.
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -7,8 +8,6 @@
     clippy::print_stdout,
     clippy::print_stderr
 )]
-
-use std::time::Instant;
 
 use eth_state::ingest::normalize_balance_be;
 use eth_state::{build_flat_state, build_session, ENTRY_SIZE};
@@ -54,54 +53,57 @@ fn cached_respond_kat() {
     );
 }
 
+/// Non-timing cache-use guard: a cache poisoned through the public `from_parts`
+/// seam must change (or refuse) the response served through the scheme's respond.
+/// The cached and uncached paths are byte-identical by design, so the ONLY way
+/// poisoned bytes can equal the honest bytes is a respond that never read the
+/// cache it was handed — the silent-fallback regression this test exists to catch.
+#[cfg(feature = "cached-respond")]
 #[test]
 #[serial]
-fn cached_vs_noncached_latency() {
+fn cached_respond_actually_uses_the_cache() {
+    use std::sync::Arc;
+
+    use eth_state::FlatBalanceScheme;
+    use raven_inspire::inspiring::OfflinePackingKeys;
+    use raven_server::PirScheme;
+
     let params = InspireParams::secure_128_d2048();
-    let seed = 0x0000_CB00u64;
-    let db = build_corpus(ENTRIES_PER_SHARD);
-    let (state, sk) = build_flat_state(&params, &db, ENTRY_SIZE, seed).expect("state");
-    let cache = ServerInspiringCache::new(&state.crs, &state.encoded_db).expect("cache");
+    let seed = 0x0000_CC00u64;
+    let db = build_corpus(8);
+    let (mut state, sk) = build_flat_state(&params, &db, ENTRY_SIZE, seed).expect("state");
     let session =
         build_session(&state.crs, sk, params.sigma, seed.wrapping_add(1)).expect("session");
     let shard_cfg = state.encoded_db.config.clone();
-    let (_qs, query) = build_seeded_query_rust(&session, &params, &shard_cfg, 1000).expect("query");
+    let (_qs, query) = build_seeded_query_rust(&session, &params, &shard_cfg, 3).expect("query");
 
-    // Non-cached rebuilds the packing keys per call, seconds each, so sample it sparingly.
-    let nc_samples = 2usize;
-    let t = Instant::now();
-    for _ in 0..nc_samples {
-        respond_seeded_inspiring(&state.crs, &state.encoded_db, &query).expect("nc");
+    let honest = respond_seeded_inspiring(&state.crs, &state.encoded_db, &query)
+        .expect("noncached respond")
+        .to_binary()
+        .expect("honest bytes");
+
+    let poison_seed = [0xA5u8; 32];
+    assert_ne!(
+        state.crs.inspiring_w_seed, poison_seed,
+        "precondition: the poison seed must differ from the CRS w-seed"
+    );
+    let pack_params = state.cache.pack_params().clone();
+    let poisoned_keys = OfflinePackingKeys::generate(&pack_params, poison_seed);
+    state.cache = Arc::new(ServerInspiringCache::from_parts(pack_params, poisoned_keys));
+
+    match FlatBalanceScheme::respond(&state, &query) {
+        // Refusing a mismatched cache also proves the cache was read.
+        Err(_) => {}
+        Ok(resp) => {
+            let bytes = resp.to_binary().expect("poisoned bytes");
+            assert_ne!(
+                bytes, honest,
+                "a poisoned cache produced the honest bytes: the cached respond path \
+                 never read the cache it was handed (silent fallback to the uncached path)"
+            );
+        }
     }
-    let noncached_ms = t.elapsed().as_secs_f64() * 1000.0 / nc_samples as f64;
-
-    let c_samples = 20usize;
-    let t = Instant::now();
-    for _ in 0..c_samples {
-        respond_seeded_inspiring_cached(&state.crs, &state.encoded_db, &query, &cache).expect("c");
-    }
-    let cached_ms = t.elapsed().as_secs_f64() * 1000.0 / c_samples as f64;
-
-    let speedup = noncached_ms / cached_ms;
-    eprintln!(
-        "{{\"bench\":\"cached_vs_noncached\",\"cell\":{{\"entry_size_bytes\":{},\"gamma\":{}}},\"noncached_ms\":{:.3},\"cached_ms\":{:.3},\"speedup\":{:.1},\"cached_qps_per_core\":{:.1}}}",
-        ENTRY_SIZE,
-        ENTRY_SIZE / 2,
-        noncached_ms,
-        cached_ms,
-        speedup,
-        1000.0 / cached_ms
-    );
-
-    assert!(
-        cached_ms < noncached_ms,
-        "cached ({cached_ms:.3} ms) must be faster than non-cached ({noncached_ms:.3} ms)"
-    );
-    // Measured win is 300x+; the 100x floor catches a bypassed cache without flaking.
-    assert!(
-        speedup > 100.0,
-        "cached respond speedup must be large; got {speedup:.1}x"
-    );
 }
 
-const ENTRIES_PER_SHARD: usize = 2048;
+// The latency table (100x floor) lives in benches/cached_respond_latency_bench.rs;
+// the cache-USE guard here is non-timing, so it holds in every lane and under load.

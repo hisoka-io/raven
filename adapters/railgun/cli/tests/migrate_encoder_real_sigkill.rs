@@ -184,7 +184,10 @@ fn assert_old_encoder_recovers(dir_path: &Path) {
 }
 
 #[test]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing what encoder migration mutates on disk before each kill point, or \
+            the resume path. CI runs it in the durability + closure crash-safety lane."]
 fn real_sigkill_at_pre_re_encode_no_disk_mutation_then_resume_succeeds() {
     let dir = tempfile::tempdir().expect("tempdir");
     seed_dir(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 });
@@ -224,7 +227,10 @@ fn real_sigkill_at_pre_re_encode_no_disk_mutation_then_resume_succeeds() {
 }
 
 #[test]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing what encoder migration mutates on disk before each kill point, or \
+            the resume path. CI runs it in the durability + closure crash-safety lane."]
 fn real_sigkill_at_post_re_encode_no_disk_mutation_then_resume_succeeds() {
     let dir = tempfile::tempdir().expect("tempdir");
     seed_dir(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 });
@@ -264,7 +270,10 @@ fn real_sigkill_at_post_re_encode_no_disk_mutation_then_resume_succeeds() {
 }
 
 #[test]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing what encoder migration mutates on disk before each kill point, or \
+            the resume path. CI runs it in the durability + closure crash-safety lane."]
 fn real_sigkill_at_pre_snapshot_no_disk_mutation_then_resume_succeeds() {
     let dir = tempfile::tempdir().expect("tempdir");
     seed_dir(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 });
@@ -294,7 +303,10 @@ fn real_sigkill_at_pre_snapshot_no_disk_mutation_then_resume_succeeds() {
 }
 
 #[test]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing what encoder migration mutates on disk before each kill point, or \
+            the resume path. CI runs it in the durability + closure crash-safety lane."]
 fn real_sigkill_at_post_snapshot_keeps_old_manifest_then_resume_succeeds() {
     let dir = tempfile::tempdir().expect("tempdir");
     seed_dir(dir.path(), EncoderKind::PerLeafBc { tree_number: 0 });
@@ -332,7 +344,10 @@ fn real_sigkill_at_post_snapshot_keeps_old_manifest_then_resume_succeeds() {
 }
 
 #[test]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing what encoder migration mutates on disk before each kill point, or \
+            the resume path. CI runs it in the durability + closure crash-safety lane."]
 fn real_sigkill_at_pre_manifest_bump_keeps_old_manifest_then_resume_succeeds() {
     // Aliases post-snapshot on disk; kept distinct for intent.
     let dir = tempfile::tempdir().expect("tempdir");
@@ -366,7 +381,10 @@ fn real_sigkill_at_pre_manifest_bump_keeps_old_manifest_then_resume_succeeds() {
 }
 
 #[test]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing what encoder migration mutates on disk before each kill point, or \
+            the resume path. CI runs it in the durability + closure crash-safety lane."]
 fn real_sigkill_at_post_manifest_bump_yields_fully_migrated_state() {
     // The kill lands post-migration, so the re-run must hit the idempotency guard.
     let dir = tempfile::tempdir().expect("tempdir");

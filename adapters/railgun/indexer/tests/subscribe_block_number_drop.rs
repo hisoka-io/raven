@@ -45,9 +45,17 @@ use serde_json::json;
 use std::sync::OnceLock;
 use tokio::sync::mpsc;
 
+/// Serializes every test in this binary under plain `cargo test`, where all
+/// tests share one process: `snapshot()` CONSUMES what it reports, so a
+/// parallel sibling's read steals this test's increment (measured 2/6 RED).
+/// nextest is immune (process per test) but must not be the only safe runner.
+/// A new test in this binary MUST take this lock first for the same reason.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Single global snapshotter shared across every test in this binary:
 /// `metrics::set_global_recorder` rejects the second installation, so
 /// attempting it per-test silently leaves the counter unobservable.
+/// Reads race across tests — hold `SERIAL` for the whole test body.
 fn snap() -> &'static Snapshotter {
     static SNAP: OnceLock<Snapshotter> = OnceLock::new();
     SNAP.get_or_init(|| {
@@ -278,6 +286,7 @@ async fn dropped_counter_above(snap: &Snapshotter, floor: u64, budget: Duration)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subscribe_handle_log_drops_log_when_block_number_none() {
+    let _serial = SERIAL.lock().await;
     let _ = snap();
 
     // Three logs: one valid + one with block_number = None + one valid.
@@ -331,6 +340,7 @@ async fn subscribe_handle_log_drops_log_when_block_number_none() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subscribe_dropped_logs_metric_increments_on_drop() {
+    let _serial = SERIAL.lock().await;
     let s = snap();
 
     let before = dropped_counter_by_name(s);
@@ -375,42 +385,10 @@ async fn subscribe_dropped_logs_metric_increments_on_drop() {
     assert_eq!(events.len(), 1, "exactly one valid event must survive");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn subscribe_handle_log_succeeds_when_block_number_present() {
-    let _ = snap();
-
-    let logs = vec![synthetic_shield_log(Some(200), 0)];
-    let streamer = Arc::new(ScriptedStreamer::new(vec![1], logs));
-    let fallback = Arc::new(StaticFallback(2_000));
-    let (tx, mut rx) = mpsc::channel::<IndexerMessage>(256);
-
-    let worker = Arc::new(SubscribeWorker::new(
-        Arc::clone(&streamer),
-        Arc::clone(&fallback),
-        tx,
-    ));
-    let cfg = SubscribeWorkerConfig {
-        heartbeat_secs: 4,
-        reconnect_total_secs: 6,
-        polling_dwell: Duration::from_millis(500),
-    };
-    let handle = {
-        let w = Arc::clone(&worker);
-        tokio::spawn(async move { w.run(cfg).await })
-    };
-
-    let events = collect_events(&mut rx, 1, 6).await;
-    drop(rx);
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
-
-    assert_eq!(events.len(), 1);
-    match &events[0] {
-        RailgunEvent::Shield { block_number, .. } => {
-            assert_eq!(*block_number, 200);
-        }
-        other => panic!("expected Shield; got {other:?}"),
-    }
-}
+// The valid-log accept direction lives in
+// subscribe_handle_log_drops_log_when_block_number_none above, which feeds valid
+// logs at heights 100 and 102 through the same SubscribeWorker path and asserts
+// both surface as Shield events with concrete heights.
 
 const MOCK_CHAIN_ID: u64 = 1;
 
@@ -488,8 +466,11 @@ async fn spawn_logs_mock(logs: Vec<serde_json::Value>) -> (String, tokio::task::
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn polling_events_in_range_drops_log_when_block_number_none() {
+    let _serial = SERIAL.lock().await;
     let s = snap();
-    let before = dropped_counter_by_name(s);
+    // Drain increments left by earlier (serialized) tests: snapshot() consumes,
+    // so the next read returns only THIS test's drops.
+    let _ = dropped_counter_by_name(s);
 
     let (url, _server) = spawn_logs_mock(vec![
         shield_log_json(Some(100)),
@@ -514,17 +495,20 @@ async fn polling_events_in_range_drops_log_when_block_number_none() {
         vec![100, 102],
         "the heightless log must be dropped, not fabricated at 0"
     );
-    let after = dropped_counter_by_name(s);
+    let dropped = dropped_counter_by_name(s);
     assert!(
-        after > before,
-        "drop counter must advance; before={before} after={after}"
+        dropped > 0,
+        "the heightless log's drop must be counted; read {dropped} new increments"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pooled_events_in_range_drops_log_when_block_number_none() {
+    let _serial = SERIAL.lock().await;
     let s = snap();
-    let before = dropped_counter_by_name(s);
+    // Drain increments left by earlier (serialized) tests: snapshot() consumes,
+    // so the next read returns only THIS test's drops.
+    let _ = dropped_counter_by_name(s);
 
     let (url, _server) = spawn_logs_mock(vec![
         shield_log_json(Some(300)),
@@ -563,9 +547,9 @@ async fn pooled_events_in_range_drops_log_when_block_number_none() {
         vec![300, 301],
         "the heightless log must be dropped, not fabricated at 0"
     );
-    let after = dropped_counter_by_name(s);
+    let dropped = dropped_counter_by_name(s);
     assert!(
-        after > before,
-        "drop counter must advance; before={before} after={after}"
+        dropped > 0,
+        "the heightless log's drop must be counted; read {dropped} new increments"
     );
 }

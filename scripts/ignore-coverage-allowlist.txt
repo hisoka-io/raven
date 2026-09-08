@@ -1,0 +1,56 @@
+# Ignored tests that run in NO CI lane. Frozen 2026-09-01. Was 42; 11 tests gained a lane when their by-name CI exclusions were removed.
+# scripts/check-ignore-coverage.sh fails if a NEW one appears that is not listed here.
+# Removing a line is always allowed - that means the test gained a lane.
+# Format: <file>::<fn>
+adapters/railgun/engine/benches/cache_carry_bench.rs::swap_state_with_matching_seed_carries_cache_under_50ms
+adapters/railgun/engine/benches/cache_carry_bench.rs::swap_state_with_mismatched_seed_rebuilds_cache_above_baseline
+adapters/railgun/engine/benches/end_to_end_spend_bench.rs::end_to_end_spend_latency_per_encoder
+adapters/railgun/engine/benches/insert_cost_bench.rs::per_shard_re_encode_cost_per_cell
+adapters/railgun/engine/benches/k4_dispatcher_bench.rs::k4_dispatcher_strategy_comparison
+adapters/railgun/engine/benches/k_widening_bench.rs::k_widening_at_two_cells
+adapters/railgun/engine/benches/multi_instance_bottleneck_probe.rs::multi_instance_bottleneck_probe
+adapters/railgun/engine/benches/multi_instance_throughput_bench.rs::multi_instance_throughput_at_production_cell
+adapters/railgun/engine/benches/offline_packing_keys_cold_vs_warm_bench.rs::production_cell_three_seed_cold_vs_warm
+adapters/railgun/engine/benches/per_encoder_fill_level_sweep_bench.rs::per_insert_wall_time_per_encoder_at_fill_levels
+adapters/railgun/engine/benches/per_insert_wall_time_bench.rs::per_insert_wall_time_per_encoder_at_50pct_fill
+adapters/railgun/engine/benches/recovery_latency_bench.rs::recovery_from_production_cell_snapshot_under_5s
+adapters/railgun/engine/benches/snapshot_codec_acceleration_bench.rs::snapshot_codec_acceleration_at_production_cell
+adapters/railgun/engine/src/imt.rs::insert_rejects_overflow_past_capacity
+adapters/railgun/persistence/benches/snapshot_codec_bench.rs::snapshot_codec_bench_bincode_vs_bitcode
+adapters/railgun/persistence/benches/snapshot_zstd_bench.rs::snapshot_zstd_bench_bincode_vs_zstd_l3
+adapters/railgun/persistence/benches/wal_replay_scaling_bench.rs::wal_replay_scales_linearly_at_1k_10k_100k
+crates/inspire/src/pir/mod_switch.rs::production_45bit_mod_switch_roundtrip
+crates/inspire/src/pir/respond.rs::test_respond_one_packing_correctness
+crates/inspire/src/pir/respond.rs::test_respond_one_packing_small_values
+crates/inspire/tests/e2e_pir.rs::test_e2e_variant_one_packing
+crates/inspire/tests/e2e_pir.rs::test_e2e_variant_two_packing
+crates/inspire/tests/packing_offline_simd_bench.rs::bench_prod_cell_131072x32
+crates/inspire/tests/packing_offline_simd_bench.rs::bench_prod_cell_65536x512
+crates/inspire/tests/raven_local_patches.rs::commit_d_preset_default_q_passes_smoke_at_2_20_x_256b
+crates/inspire/tests/respond_latency_bench.rs::respond_latency_baseline
+crates/isimplepir/tests/kat_fixtures.rs::update_fixtures
+crates/isimplepir/tests/kat_fixtures.rs::update_row_update_fixtures
+
+# --- 2026-09-06: made visible by teaching the census to see untracked files ---
+# These seven were ALWAYS uncovered; a tracked-only census could not see them because they
+# live in files this build created and has not committed. The debt did not grow here, the
+# accounting got honest. Each carries a written trigger in its own #[ignore] reason.
+#
+# Red-with-trigger defect pins: deliberately FAILING today. They must NOT gain a lane until
+# the src defect each names is fixed; that is what makes them acceptance tests.
+adapters/railgun/indexer/tests/subscribe_src_defect_pins.rs::removed_log_frame_is_not_forwarded_as_an_event
+adapters/railgun/indexer/tests/subscribe_src_defect_pins.rs::events_missed_between_stream_close_and_reopen_are_backfilled
+crates/inspire/tests/extract_response_length_validation.rs::a_truncated_response_must_not_decode_to_a_zero_tail_record
+crates/inspire/tests/extract_response_length_validation.rs::an_empty_column_list_must_not_decode_to_a_repeated_column_record
+crates/inspire/tests/extract_response_length_validation.rs::an_over_length_response_must_not_be_silently_accepted
+# Timing harnesses moved out of tests/ into benches/, correctness left behind in a lane that runs:
+# the client bench's wasm round trip stayed in tests/wasm_client_roundtrip.rs, and the eth-state
+# cache guard stayed in tests/cached_respond_kat.rs as a non-timing poisoned-cache observable.
+crates/client/benches/wasm_client_native_bench.rs::wasm_client_bench_native_per_cell
+examples/eth-state/benches/cached_respond_latency_bench.rs::cached_vs_noncached_latency
+
+# --- 2026-09-07: two more red-with-trigger defect pins ---
+# Both FAIL today by design. They must NOT gain a CI lane until the defect each names is fixed;
+# that is what makes them acceptance tests rather than noise.
+adapters/railgun/engine/tests/concurrent_commit_overwrite.rs::two_concurrent_commits_on_one_handle_do_not_publish_each_others_bytes
+adapters/railgun/http/tests/session_route.rs::an_epoch_swap_inside_register_still_returns_200_with_a_dead_handle

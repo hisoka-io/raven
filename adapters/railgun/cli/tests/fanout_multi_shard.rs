@@ -281,11 +281,28 @@ async fn fanout_returns_responses_in_request_order() {
     fixture.shutdown().await;
 }
 
+/// Every `FanoutError` refusal reason must reach the WIRE as 400, and a request
+/// exactly at the cap must still be served.
+///
+/// Merged from three tests that each stood up their own multi-shard PIR server
+/// (~13 s apiece) to probe one reason. The reasons themselves — which
+/// `(shard_ids, shard_count, cap)` triples `expand_fanout` accepts, and that an
+/// out-of-range id carries class `shard_out_of_range` with a BAD_REQUEST status
+/// — are characterized totally by the proptests in `http/src/fanout.rs`, so
+/// what is left to test here is the part those cannot see: that the HANDLER
+/// actually surfaces `FanoutError::status()` rather than mapping refusals to
+/// some status of its own. One fixture is enough for that, and it is proven
+/// enough: with `FanoutError::status()` returning 500 instead of BAD_REQUEST,
+/// this test and the in-src `expand_fanout_rejects_every_id_at_or_past_the_shard_count`
+/// go red together (2026-09-06).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fanout_rejects_out_of_range_shard_id() {
+async fn fanout_refusal_reasons_reach_the_wire_as_400_and_the_cap_is_inclusive() {
     let fixture = spawn_multi_shard_server().await;
     let client = reqwest::Client::new();
     let (_client_state, query) = fixture.build_query();
+
+    let (status, _, _) = post_fanout(&client, &fixture, &query, Vec::new()).await;
+    assert_eq!(status, 400, "empty shard_ids must be rejected");
 
     let out_of_range = SHARD_COUNT as u32;
     let (status, body, _) = post_fanout(&client, &fixture, &query, vec![0, out_of_range]).await;
@@ -305,27 +322,6 @@ async fn fanout_rejects_out_of_range_shard_id() {
     let (status_far, _, _) = post_fanout(&client, &fixture, &query, vec![u32::MAX]).await;
     assert_eq!(status_far, 400, "u32::MAX shard id must be rejected");
 
-    fixture.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fanout_rejects_empty_shard_id_list() {
-    let fixture = spawn_multi_shard_server().await;
-    let client = reqwest::Client::new();
-    let (_client_state, query) = fixture.build_query();
-
-    let (status, _, _) = post_fanout(&client, &fixture, &query, Vec::new()).await;
-    assert_eq!(status, 400, "empty shard_ids must be rejected");
-
-    fixture.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fanout_rejects_list_longer_than_cap() {
-    let fixture = spawn_multi_shard_server().await;
-    let client = reqwest::Client::new();
-    let (_client_state, query) = fixture.build_query();
-
     let cap = fixture.pieces.app_state.config.max_fanout_shards;
     let over_cap: Vec<u32> = vec![0; cap + 1];
     let (status, body, _) = post_fanout(&client, &fixture, &query, over_cap).await;
@@ -341,6 +337,9 @@ async fn fanout_rejects_list_longer_than_cap() {
         "the running server must name the requested width and the cap: {detail:?}"
     );
 
+    // The cap is INCLUSIVE, and a cap-width fanout is really served — the one
+    // claim here no in-src test makes, since `expand_fanout` only reports
+    // `is_ok()` and never dispatches.
     let at_cap: Vec<u32> = vec![0; cap];
     let (status_at_cap, _, _) = post_fanout(&client, &fixture, &query, at_cap).await;
     assert_eq!(

@@ -27,8 +27,16 @@ use raven_railgun_persistence::{Manifest, SnapshotId, StoreLayout};
 use tokio::sync::oneshot;
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
-const TOY_ENTRIES: usize = 256;
 const TOY_ENTRY_BYTES: usize = 256;
+
+/// Rows every per-leaf-bc cell here must hold - the bootstrap instance as well as the spawned one.
+///
+/// Distinct from the harness's own bootstrap fixture size. Every leaf-keyed
+/// encoder declares `min_total_entries() == LEAVES_PER_TREE`, and `pre_spawn_for_tree` enforces it
+/// (`auto_spawn_driver.rs`). A spawn requested at 256 rows is refused, the successor never appears,
+/// and the test times out waiting for a count that can never rise - which is what nine of these
+/// tests were doing.
+const AUTO_SPAWN_CELL_ROWS: usize = 65_536;
 
 fn shield_event(tree: u32, leaf: u32, height: u64) -> IndexerMessage {
     let mut commitment = [0u8; 32];
@@ -58,7 +66,9 @@ fn bootstrap_tree_zero_cfg(data_dir: PathBuf) -> InstanceConfig {
         data_dir,
         encoder: EncoderKind::PerLeafBc { tree_number: 0 },
         record_size: TOY_ENTRY_BYTES,
-        entries_per_shard: 256,
+        // Must equal ring_dim: one entry per ring coefficient is the shard geometry the PIR
+        // scheme assumes, and 65_536 / 2_048 = 32 shards.
+        entries_per_shard: 2_048,
         verification_mode: VerificationMode::ChainRootHistory,
         data_source: DataSourceFilter::ChainTreeNumber(0),
         use_flock: false,
@@ -71,15 +81,38 @@ fn bootstrap_tree_zero_cfg(data_dir: PathBuf) -> InstanceConfig {
     }
 }
 
-async fn wait_for_observer(observer: &BootstrapObserver) -> BootstrapView {
-    // 180s: cold-start PIR setup balloons under parallel 2-core CI contention
+/// Wait for bootstrap, and surface the server's error instead of a timeout if it failed.
+///
+/// The observer is populated immediately after `bootstrap_instances(..)?` and is not gated by
+/// `skip_chain_workers`, so "never populated" means bootstrap RETURNED AN ERROR - and the server
+/// runs in a spawned task whose `Result` nothing reads. The previous version polled for 180 s and
+/// then reported the empty observer, discarding the cause. That is a symptom masking a diagnosis:
+/// the run takes three minutes to tell you nothing.
+async fn wait_for_observer(
+    observer: &BootstrapObserver,
+    server: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> BootstrapView {
     for _ in 0..3600u32 {
         if let Some(view) = observer.lock().clone() {
             return view;
         }
+        // If the server has already finished, bootstrap failed. Say what it said.
+        if server.is_finished() {
+            match server.await {
+                Ok(Ok(())) => panic!(
+                    "server returned Ok before the bootstrap observer was populated; \
+                     bootstrap completed without publishing a view"
+                ),
+                Ok(Err(e)) => panic!("bootstrap failed: {e:#}"),
+                Err(join) => panic!("server task panicked during bootstrap: {join}"),
+            }
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("bootstrap observer never populated within 180s");
+    panic!(
+        "bootstrap observer never populated within 180s and the server is still running; \
+         bootstrap is hung rather than failed"
+    );
 }
 
 async fn wait_for_data_dir(path: &std::path::Path, deadline: Duration) {
@@ -133,7 +166,9 @@ fn count_snapshots(data_dir: &std::path::Path) -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "slow: cold-start PIR keygen; run with --ignored"]
+#[ignore = "~7 s per PIR instance stood up, ~99% of it PackParams::try_new (the deterministic \
+            d=2048 packing table) built twice per setup_state; the keygen proper is ~60 ms. \
+            Trigger: changing SIGTERM drain for auto-spawned consumers."]
 async fn auto_spawned_consumers_drain_wal_on_sigterm() {
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
@@ -168,7 +203,7 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
         instances: vec![bootstrap_tree_zero_cfg(bootstrap_dir)],
         skip_chain_workers: true,
         skip_mirror_workers: true,
-        entries: TOY_ENTRIES,
+        entries: AUTO_SPAWN_CELL_ROWS,
         instance_entries: std::collections::HashMap::new(),
         bootstrap_observer: Some(Arc::clone(&observer)),
         auto_spawn: Some(AutoSpawnConfigToml {
@@ -176,7 +211,7 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
             data_dir_template: auto_spawn_template,
             encoder: "per-leaf-bc".to_owned(),
             scheme_tag: SCHEME_TAG.to_owned(),
-            entries: TOY_ENTRIES,
+            entries: AUTO_SPAWN_CELL_ROWS,
             entry_bytes: TOY_ENTRY_BYTES,
             max_instance_count: None,
             cooldown_seconds: None,
@@ -198,14 +233,14 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
     };
 
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn(async move {
+    let mut server = tokio::spawn(async move {
         run_with_listener(opts, listener, async move {
             let _ = stop_rx.await;
         })
         .await
     });
 
-    let view = wait_for_observer(&observer).await;
+    let view = wait_for_observer(&observer, &mut server).await;
     let chain = view.channels.indexer_tx.clone();
 
     // gate on snap-000001 before the next tree: data_dir alone races the

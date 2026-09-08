@@ -40,7 +40,9 @@ fn build_donor_state(params: &InspireParams) -> PirInstance<inspire::RavenInspir
 }
 
 #[test]
-#[ignore = "production-cell setup is heavy (~12s); cache-carry latency measurement"]
+#[ignore = "production-cell setup is heavy (~12s); measures swap_state cache-carry latency against \
+            a 50 ms median bound. Trigger: changing CacheFingerprint or ServerInspiringCache reuse \
+            in swap_state."]
 fn swap_state_with_matching_seed_carries_cache_under_50ms() {
     let setup_start = Instant::now();
     let params = InspireParams::secure_128_d2048();
@@ -85,7 +87,9 @@ fn swap_state_with_matching_seed_carries_cache_under_50ms() {
 }
 
 #[test]
-#[ignore = "production-cell setup is heavy (~12s); rebuild-path regression guard"]
+#[ignore = "production-cell setup is heavy (~12s); guards the rebuild path with a 1 s median floor \
+            so an always-carry bug cannot pass. Trigger: changing CacheFingerprint or \
+            ServerInspiringCache reuse in swap_state."]
 fn swap_state_with_mismatched_seed_rebuilds_cache_above_baseline() {
     let setup_start = Instant::now();
     let params = InspireParams::secure_128_d2048();

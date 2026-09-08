@@ -28,6 +28,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// One recorded RPC call; the order distinguishes "consulted the loaded
+/// window before scanning" from "started cold".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MockOp {
+    LatestBlock,
+    BlockHash(u64),
+}
+
 #[derive(Debug, Default)]
 struct WindowMockSource {
     inner: Mutex<MockInner>,
@@ -37,6 +45,7 @@ struct WindowMockSource {
 struct MockInner {
     chain: BTreeMap<u64, [u8; 32]>,
     latest: u64,
+    ops: Vec<MockOp>,
 }
 
 impl WindowMockSource {
@@ -54,12 +63,20 @@ impl WindowMockSource {
             g.chain.insert(n, new_hash);
         }
     }
+    fn clear_ops(&self) {
+        self.inner.lock().expect("lock").ops.clear();
+    }
+    fn ops(&self) -> Vec<MockOp> {
+        self.inner.lock().expect("lock").ops.clone()
+    }
 }
 
 #[async_trait]
 impl ChainSource for WindowMockSource {
     async fn latest_block(&self) -> Result<u64> {
-        Ok(self.inner.lock().expect("lock").latest)
+        let mut g = self.inner.lock().expect("lock");
+        g.ops.push(MockOp::LatestBlock);
+        Ok(g.latest)
     }
     async fn events_in_range(&self, _from: u64, _to: u64) -> Result<Vec<RailgunEvent>> {
         Ok(Vec::new())
@@ -73,10 +90,9 @@ impl ChainSource for WindowMockSource {
         Ok(true)
     }
     async fn block_hash(&self, n: u64) -> Result<[u8; 32]> {
-        self.inner
-            .lock()
-            .expect("lock")
-            .chain
+        let mut g = self.inner.lock().expect("lock");
+        g.ops.push(MockOp::BlockHash(n));
+        g.chain
             .get(&n)
             .copied()
             .ok_or_else(|| IndexerError::Rpc(format!("block {n} not in mock chain")))
@@ -200,9 +216,35 @@ fn reorg_window_load_returns_empty_for_missing_file() {
     assert!(loaded.is_empty());
 }
 
-/// Drive a worker run to populate the sidecar, then restart with a
-/// fresh worker against the same chain and confirm the sidecar
-/// survives the round-trip.
+/// Wait until a heartbeat reports `scanned_through_block >= watermark`.
+/// The persist of a chunk tip happens before the heartbeat that announces it,
+/// so a satisfied wait means the sidecar for that tip is already on disk.
+async fn wait_for_watermark(
+    rx: &mut mpsc::Receiver<IndexerMessage>,
+    watermark: u64,
+    budget: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + budget;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(IndexerMessage::Heartbeat {
+                scanned_through_block,
+                ..
+            })) if scanned_through_block >= watermark => return true,
+            Ok(Some(_)) => continue,
+            Ok(None) => return false,
+            Err(_) => continue,
+        }
+    }
+    false
+}
+
+/// Drive a worker run to populate the sidecar, then restart against the same
+/// chain: the persisted window must carry the exact chunk-tip hashes, and the
+/// restarted worker must consult that loaded window (stale-check on its top)
+/// before it does anything else. "Emits something after restart" proves
+/// neither; a build with the sidecar load deleted passed the previous
+/// version of this test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn indexer_reorg_window_persists_across_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -224,33 +266,24 @@ async fn indexer_reorg_window_persists_across_restart() {
         ..IndexerWorkerConfig::default()
     };
     let join = tokio::spawn(async move { worker.run(cfg).await });
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let mut got_heartbeat = false;
-    while tokio::time::Instant::now() < deadline && !got_heartbeat {
-        match tokio::time::timeout(Duration::from_millis(1500), rx.recv()).await {
-            Ok(Some(IndexerMessage::Heartbeat { .. })) => got_heartbeat = true,
-            Ok(Some(_)) => continue,
-            Ok(None) => break,
-            Err(_) => continue,
-        }
-    }
-    assert!(got_heartbeat, "worker must emit at least one heartbeat");
+    assert!(
+        wait_for_watermark(&mut rx, 50, Duration::from_secs(10)).await,
+        "first run must scan through the chain tip"
+    );
     drop(rx);
     let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
 
-    assert!(
-        path.is_file(),
-        "reorg-window sidecar must exist on disk: {}",
-        path.display()
+    // Exact bytes, not just presence: chunk tips 49 and 50 with the mock hashes.
+    let expected: BTreeMap<u64, [u8; 32]> = [(49u64, [49u8; 32]), (50u64, [50u8; 32])]
+        .into_iter()
+        .collect();
+    let persisted = load_reorg_window(&path).expect("first-run sidecar loads");
+    assert_eq!(
+        persisted, expected,
+        "sidecar must hold exactly the scanned chunk-tip hashes"
     );
-    let bytes = std::fs::read(&path).expect("read sidecar");
-    assert!(
-        bytes.len() >= 8 + 2 + 4 + 4,
-        "sidecar must carry magic + version + count + crc"
-    );
-    assert_eq!(&bytes[..8], &REORG_WINDOW_MAGIC, "magic mismatch");
 
+    src.clear_ops();
     let (tx2, mut rx2) = mpsc::channel::<IndexerMessage>(256);
     let worker2 = IndexerWorker::new(Arc::clone(&src), tx2);
     let cfg2 = IndexerWorkerConfig {
@@ -262,23 +295,28 @@ async fn indexer_reorg_window_persists_across_restart() {
         ..IndexerWorkerConfig::default()
     };
     let join2 = tokio::spawn(async move { worker2.run(cfg2).await });
-
-    let deadline2 = tokio::time::Instant::now() + Duration::from_secs(10);
-    let mut got_post = false;
-    while tokio::time::Instant::now() < deadline2 && !got_post {
-        match tokio::time::timeout(Duration::from_millis(1500), rx2.recv()).await {
-            Ok(Some(_)) => got_post = true,
-            Ok(None) => break,
-            Err(_) => continue,
-        }
-    }
-    assert!(got_post, "post-restart worker must continue emitting");
+    assert!(
+        wait_for_watermark(&mut rx2, 50, Duration::from_secs(10)).await,
+        "post-restart worker must scan back to the tip"
+    );
     drop(rx2);
     let _ = tokio::time::timeout(Duration::from_secs(5), join2).await;
+
+    // The startup stale-check runs before the first poll tick, so the first
+    // recorded RPC call proves the persisted window top (50) was loaded and
+    // consulted; a cold start opens with `latest_block` instead.
+    let ops = src.ops();
+    assert_eq!(
+        ops.first(),
+        Some(&MockOp::BlockHash(50)),
+        "restart must verify the loaded window top before scanning; ops={ops:?}"
+    );
 }
 
-/// Reorg-while-down: the persisted top hash no longer matches the
-/// canonical chain; the worker must rebuild from RPC at startup.
+/// Reorg-while-down: the persisted top hash no longer matches the canonical
+/// chain; the worker must rebuild from RPC at startup and persist the rebuilt
+/// window. Only the sidecar's post-restart CONTENT can prove that: a build
+/// with the rebuild branch disabled passed the previous version of this test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn indexer_reorg_window_rebuilds_when_chain_advanced_past_cache() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -300,19 +338,19 @@ async fn indexer_reorg_window_rebuilds_when_chain_advanced_past_cache() {
         ..IndexerWorkerConfig::default()
     };
     let join = tokio::spawn(async move { worker.run(cfg).await });
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(800), rx.recv()).await {
-            Ok(Some(IndexerMessage::Heartbeat { .. })) => break,
-            Ok(Some(_)) => continue,
-            Ok(None) => break,
-            Err(_) => continue,
-        }
-    }
+    assert!(
+        wait_for_watermark(&mut rx, 20, Duration::from_secs(8)).await,
+        "first run must scan through the chain tip"
+    );
     drop(rx);
     let _ = tokio::time::timeout(Duration::from_secs(3), join).await;
 
-    assert!(path.is_file(), "first run must persist sidecar");
+    let stale = load_reorg_window(&path).expect("first-run sidecar loads");
+    assert_eq!(
+        stale.get(&20),
+        Some(&[20u8; 32]),
+        "first run must persist the pre-reorg tip hash"
+    );
 
     src.rewrite(0, 20, [0xff; 32]);
 
@@ -340,57 +378,27 @@ async fn indexer_reorg_window_rebuilds_when_chain_advanced_past_cache() {
     drop(rx2);
     let _ = tokio::time::timeout(Duration::from_secs(3), join2).await;
 
-    let bytes = std::fs::read(&path).expect("read sidecar");
-    assert!(bytes.len() >= 18, "sidecar must persist post-rebuild");
-    assert_eq!(&bytes[..8], &REORG_WINDOW_MAGIC);
-}
-
-/// Fresh-start path: missing sidecar boots an empty cache without
-/// erroring.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn indexer_reorg_window_falls_back_to_empty_on_missing_sidecar() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("nonexistent_reorg_window.bin");
-    assert!(
-        !path.exists(),
-        "sidecar must NOT exist for fresh-start path"
+    let rebuilt = load_reorg_window(&path).expect("post-rebuild sidecar loads");
+    assert_eq!(
+        rebuilt.get(&20),
+        Some(&[0xff_u8; 32]),
+        "the stale top must be replaced by the post-reorg canonical hash; \
+         sidecar still carries {:?}",
+        rebuilt.get(&20)
     );
-
-    let src = Arc::new(WindowMockSource::new());
-    for n in 0..=10u64 {
-        src.set_block(n, [u8::try_from(n & 0xff).expect("byte"); 32]);
-    }
-
-    let (tx, mut rx) = mpsc::channel::<IndexerMessage>(64);
-    let worker = IndexerWorker::new(Arc::clone(&src), tx);
-    let cfg = IndexerWorkerConfig {
-        start_block: 0,
-        poll_interval_secs: 1,
-        chunk_blocks: 9,
-        reorg_window_path: Some(path.clone()),
-        reorg_window_entries: 16,
-        ..IndexerWorkerConfig::default()
-    };
-    let join = tokio::spawn(async move { worker.run(cfg).await });
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    let mut got = false;
-    while tokio::time::Instant::now() < deadline && !got {
-        match tokio::time::timeout(Duration::from_millis(800), rx.recv()).await {
-            Ok(Some(_)) => got = true,
-            Ok(None) => break,
-            Err(_) => continue,
-        }
-    }
-    assert!(got, "empty-cache worker must still emit");
-    drop(rx);
-    let _ = tokio::time::timeout(Duration::from_secs(3), join).await;
-
     assert!(
-        path.is_file(),
-        "fresh sidecar must be persisted after first tip advance"
+        rebuilt.len() >= 2 && rebuilt.values().all(|h| *h == [0xff_u8; 32]),
+        "the rebuilt window must span below the top with canonical hashes; got {} entries",
+        rebuilt.len()
     );
 }
+
+// Deleted here: indexer_reorg_window_falls_back_to_empty_on_missing_sidecar.
+// The fresh-boot half (no sidecar: worker still scans, persists a canonical
+// fresh sidecar) is held by indexer_reorg_window_persists_across_restart, whose
+// first leg asserts the exact persisted map; the empty-load half is held by
+// reorg_window_load_returns_empty_for_missing_file. Both proven RED under a
+// persist-no-op mutant that also killed the test this comment replaces.
 
 /// Local CRC32 (IEEE polynomial) used by the wrong-version test to
 /// recompute the CRC over a hand-crafted body. Mirrors the crate's

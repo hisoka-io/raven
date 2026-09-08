@@ -6,6 +6,8 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+use std::collections::BTreeSet;
+
 use raven_railgun_engine::inspire::{apply_wal_entry, LogicalLeafStore};
 use raven_railgun_engine::pir_table::{PerLeafCommitmentEncoder, PirTableEncoder, LEAVES_PER_TREE};
 use raven_railgun_persistence::WalEntryPayload;
@@ -105,28 +107,70 @@ fn tree_zero_shard_bytes_are_unchanged_by_the_tree_local_index() {
 }
 
 /// Dirty set and materialized bytes must name the same shard, or a commit re-encodes
-/// a shard whose rows did not change and leaves the one that did.
+/// a shard whose rows did not change and leaves the one that did. Comparing the dirty
+/// set against `leaf_index / entries_per_shard` restates the encoder's own arithmetic;
+/// only the bytes decide which shard actually moved.
 #[test]
 fn the_dirty_shard_is_the_shard_whose_bytes_changed() {
-    fn encoder_for_tree_under_test(t: u32) -> PerLeafCommitmentEncoder {
-        PerLeafCommitmentEncoder::new(RECORD, EPS, t).expect("encoder")
+    // Narrow shards so a handful of appends still spans several of them.
+    const SMALL_EPS: u32 = 8;
+    const SHARDS: u32 = 4;
+    const APPENDED: u32 = 20;
+
+    let encoder = PerLeafCommitmentEncoder::new(RECORD, SMALL_EPS, 0).expect("encoder");
+    let mut store = LogicalLeafStore::new();
+    for leaf_index in 0..APPENDED {
+        let seed = u8::try_from(leaf_index % 250).expect("< 250");
+        apply_wal_entry(
+            &mut store,
+            &WalEntryPayload::AppendLeaf {
+                tree_number: 0,
+                leaf_index,
+                commitment: commitment(seed),
+            },
+            100 + u64::from(leaf_index),
+            &encoder,
+        )
+        .expect("leaf applies");
     }
-    let encoder = enc();
-    for tree in [0u32, 1, 3] {
-        for leaf_index in [0u32, 1, EPS - 1, EPS, EPS * 3 + 5] {
-            let dirty = encoder.affected_shards_for_leaf(tree, leaf_index);
-            let expected_shard = leaf_index / EPS;
-            assert_eq!(
-                encoder_for_tree_under_test(tree)
-                    .affected_shards_for_leaf(tree, leaf_index)
-                    .into_iter()
-                    .collect::<Vec<_>>(),
-                vec![expected_shard],
-                "tree {tree} leaf {leaf_index} belongs to shard {expected_shard}"
-            );
-            let _ = dirty;
-        }
-    }
+
+    let snapshot = |store: &LogicalLeafStore| -> Vec<Vec<u8>> {
+        (0..SHARDS)
+            .map(|shard| encoder.materialize_shard(shard, store))
+            .collect()
+    };
+
+    let before = snapshot(&store);
+    apply_wal_entry(
+        &mut store,
+        &WalEntryPayload::AppendLeaf {
+            tree_number: 0,
+            leaf_index: APPENDED,
+            commitment: commitment(0xEE),
+        },
+        1_000,
+        &encoder,
+    )
+    .expect("leaf applies");
+    let after = snapshot(&store);
+
+    let changed: BTreeSet<u32> = before
+        .iter()
+        .zip(after.iter())
+        .enumerate()
+        .filter(|(_, (b, a))| b != a)
+        .map(|(i, _)| u32::try_from(i).expect("shard id fits u32"))
+        .collect();
+    let dirty = encoder.affected_shards_for_leaf(0, APPENDED);
+
+    assert!(
+        !changed.is_empty(),
+        "premise: appending leaf {APPENDED} must change some shard's bytes"
+    );
+    assert_eq!(
+        changed, dirty,
+        "shards whose bytes changed and shards marked dirty must be the same set; a shard          that changed without being marked keeps serving its pre-insert rows after commit"
+    );
 }
 
 /// The one bound that survives: a leaf index past a tree's own capacity is a real

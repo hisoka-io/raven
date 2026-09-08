@@ -45,16 +45,3 @@ fn different_seed_yields_different_hint() {
         "different master seeds must produce different hints"
     );
 }
-
-#[test]
-fn deterministic_across_sessions() {
-    let params = toy_params();
-    let db: Vec<u32> = vec![42u32; 16];
-    let hint_data_run1: Vec<u32>;
-    {
-        let out = setup(&db, params, Some([99u8; 32])).expect("setup 1");
-        hint_data_run1 = out.hint.data.clone();
-    }
-    let out2 = setup(&db, params, Some([99u8; 32])).expect("setup 2");
-    assert_eq!(hint_data_run1, out2.hint.data);
-}

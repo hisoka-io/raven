@@ -28,6 +28,7 @@ metrics = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+proptest = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 raven-railgun-poseidon = { workspace = true }
 axum = { workspace = true }

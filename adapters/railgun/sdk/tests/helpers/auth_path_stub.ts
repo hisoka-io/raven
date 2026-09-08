@@ -7,6 +7,7 @@ import {
   type CommitTreeProof,
   type RavenInspireWasm,
 } from "../../src/index";
+import { makeRegisterSpy } from "./register_spy";
 
 export const TOKEN = "test-token-padded-long-enough-1234";
 export const NODE_BYTES = 32;
@@ -32,7 +33,7 @@ export function stubWasm(): RavenInspireWasm {
     build_seeded_query: () => new Uint8Array(16),
     extract_response: (_session, _crs, _state, response, _entry) => new Uint8Array(response),
     build_instance_params_blob: () => new Uint8Array(0),
-    register_client_session: () => {},
+    register_client_session: makeRegisterSpy(),
     path_indices_for_leaf: (_tree: number, leafIdx: number): Uint32Array => siblingPath(leafIdx),
     path_indices_for_per_list_leaf: (listKey: Uint8Array, idx: number): Uint32Array => {
       if (listKey.length !== 32) {
@@ -53,21 +54,46 @@ export function stubCtx(): ClientPirContext {
   };
 }
 
-/** Byte 0 of every node carries the serving epoch, so a mixed-epoch fold shows up in `elements`. */
-export function encodeBatchResponse(epoch: number, slots: number): Uint8Array {
-  const out = new Uint8Array(2 + 8 + slots * (8 + NODE_BYTES));
+/**
+ * The ONE test-side writer of the batch-response envelope
+ * `[u16 BE version = 1][u64 LE count][{u64 LE len, bytes}*]` that
+ * `decodeBatchBody` (src/raven-poi-node-interface.ts) reads. Six hand-rolled copies of
+ * this shape used to live across the suite; a wire change would have left five of them
+ * silently asserting a format the server no longer speaks. auth_path_stub_parity.test.ts
+ * round-trips this encoder through the SDK's own decode path to pin it to the real shape.
+ */
+export function encodeBatchResponseNodes(nodes: readonly Uint8Array[]): Uint8Array {
+  let total = 2 + 8;
+  for (const n of nodes) {
+    total += 8 + n.length;
+  }
+  const out = new Uint8Array(total);
+  out[0] = 0;
   out[1] = 1;
   const dv = new DataView(out.buffer);
-  dv.setUint32(2, slots, true);
+  dv.setUint32(2, nodes.length, true);
+  dv.setUint32(6, 0, true);
   let off = 10;
-  for (let slot = 0; slot < slots; slot += 1) {
-    dv.setUint32(off, NODE_BYTES, true);
+  for (const n of nodes) {
+    dv.setUint32(off, n.length, true);
+    dv.setUint32(off + 4, 0, true);
     off += 8;
-    out[off] = epoch;
-    out[off + NODE_BYTES - 1] = slot;
-    off += NODE_BYTES;
+    out.set(n, off);
+    off += n.length;
   }
   return out;
+}
+
+/** Byte 0 of every node carries the serving epoch, so a mixed-epoch fold shows up in `elements`. */
+export function encodeBatchResponse(epoch: number, slots: number): Uint8Array {
+  const nodes: Uint8Array[] = [];
+  for (let slot = 0; slot < slots; slot += 1) {
+    const node = new Uint8Array(NODE_BYTES);
+    node[0] = epoch;
+    node[NODE_BYTES - 1] = slot;
+    nodes.push(node);
+  }
+  return encodeBatchResponseNodes(nodes);
 }
 
 /** Slot count encoded in a `[u16 BE version][u64 LE count][...]` batch body. */

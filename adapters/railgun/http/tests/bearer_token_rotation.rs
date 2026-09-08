@@ -175,46 +175,10 @@ async fn bearer_rotation_observable_on_status_route() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bearer_rotation_old_succeeds_before_and_new_succeeds_after_with_inflight_survival() {
-    let state = Arc::new(SleepyState::default());
-    let (app_state, router) = build_state_and_router(state);
-
-    for nonce in 0u64..5 {
-        let req = build_query_request(OLD_TOKEN, nonce);
-        let resp = router.clone().oneshot(req).await.expect("dispatch");
-        assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "pre-rotation OLD-token query #{nonce} must succeed"
-        );
-        let bytes = body_bytes(resp).await;
-        let decoded: SleepyResponse =
-            raven_railgun_http::read_versioned(&bytes).expect("decode versioned response");
-        assert_eq!(decoded.echo_nonce, nonce, "echo nonce must round-trip");
-    }
-
-    app_state.set_read_token(NEW_TOKEN);
-
-    let req_old = build_query_request(OLD_TOKEN, 100);
-    let resp_old = router.clone().oneshot(req_old).await.expect("dispatch old");
-    assert_eq!(
-        resp_old.status(),
-        StatusCode::UNAUTHORIZED,
-        "post-rotation OLD-token query must be 401, not {}",
-        resp_old.status()
-    );
-
-    let req_new = build_query_request(NEW_TOKEN, 101);
-    let resp_new = router.clone().oneshot(req_new).await.expect("dispatch new");
-    assert_eq!(
-        resp_new.status(),
-        StatusCode::OK,
-        "post-rotation NEW-token query must succeed, not {}",
-        resp_new.status()
-    );
-}
-
+// The rotation 401/200 property on the query route restated what
+// `bearer_rotation_observable_on_status_route` proves: `router()` installs ONE
+// auth_layer cloned across both route groups (src/lib.rs), and a no-op
+// `set_read_token` mutation reds both routes identically (proved 2026-09-06).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bearer_rotation_does_not_kill_inflight_query_started_under_old_token() {
     let sleepy = Arc::new(SleepyState {

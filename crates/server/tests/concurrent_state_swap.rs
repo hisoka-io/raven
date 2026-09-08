@@ -226,6 +226,12 @@ fn a_writer_that_derived_from_a_superseded_snapshot_is_refused() {
         message.contains("published epoch 1") && message.contains("attempted epoch 1"),
         "refusal must name both epochs; got {message}"
     );
+    // Substring claim carried over from the deleted engine-side duplicate
+    // (stale_derivation_is_refused.rs): the refusal must name the staleness.
+    assert!(
+        message.contains("stale state swap"),
+        "refusal must name the staleness; got {message}"
+    );
 
     let snap = inst.current_snapshot();
     assert_eq!(snap.epoch, Epoch(1));

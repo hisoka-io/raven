@@ -1,0 +1,20 @@
+# Expected test count per filtered CI lane. Regenerate: scripts/assert-lane-counts.sh --update
+# A lane may GROW silently; a DROP is a hard failure and must be explained by editing
+# this file in the same change that removes the tests.
+durability-and-closure/crash-safety	14
+durability-and-closure/wal-and-snapshot-chaos	3
+durability-and-closure/cli-ignored	65
+# 9, not 8: this lane's filter carries a bare `test(insert_rejects_overflow_past_capacity)` that
+# resolves to an in-src lib test. The original anchor here counted only `pkg::binary test` rows,
+# so it silently dropped every in-src test — undercounting the one lane whose filter depends on one.
+durability-and-closure/engine-ignored	9
+durability-and-closure/closure	8
+# 2026-09-07: was 21 before wave 5. binary(db2_block_production_cell) lost
+# block_exponent_and_payload_are_pinned_to_the_read_path_design, which asserted BLOCK_K == 10
+# against a `const BLOCK_K: usize = 10` three lines above it in the same test file; verified no
+# production symbol carries BLOCK_K, so no shipped-code change could ever red it. A sibling test
+# was FOLDED (its subtree-root assert moved into the splice loop, which visits all three block
+# indices). The count also moved because this gate's row anchor was corrected the same day: it
+# had missed nextest's lib-target rows (`pkg imt::tests::x`, no `::` before the space) and then,
+# briefly, its bench rows (`pkg::bench/name x`, a slash in the binary segment).
+production-cell-closure/inline	20

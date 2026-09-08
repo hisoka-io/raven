@@ -11,7 +11,8 @@
 //! blocks per commit.
 //!
 //! The number this pins is dominated by a design fact, not by noise: `register_client_session`
-//! (`crates/client/src/lib.rs:263-279`) validates parameter drift and never sets a session
+//! (`crates/client/src/lib.rs:309-325`, exercised by `tests/session_params_drift.rs`) validates
+//! parameter drift and never sets a session
 //! handle, so `query_seeded` takes its `None` branch (`crates/inspire/src/pir/session.rs:223-226`)
 //! and inlines the full `ClientPackingKeys` into EVERY query, forever. Shipping the client
 //! half of the session handshake is what moves this number, and when it does, this test is

@@ -48,6 +48,7 @@ thiserror = { workspace = true }
 metrics = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }
 raven-railgun-testkit = { workspace = true }
 reqwest = { workspace = true }
 bincode = { workspace = true }

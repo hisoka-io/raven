@@ -49,7 +49,6 @@ struct InstanceJson {
     #[serde(default)]
     #[allow(dead_code)]
     epoch: u64,
-    #[allow(dead_code)]
     active_k_concurrency: u32,
 }
 
@@ -58,6 +57,9 @@ struct InstanceJson {
 struct SyntheticChainSource {
     verify_calls: AtomicU64,
     last_seen_root: parking_lot::Mutex<[u8; 32]>,
+    /// When set, `root_history` answers `true` ONLY for this root, so a
+    /// verifier handed a stale or zeroed root has a real failure path.
+    expected_root: parking_lot::Mutex<Option<[u8; 32]>>,
 }
 
 impl SyntheticChainSource {
@@ -65,11 +67,20 @@ impl SyntheticChainSource {
         Self {
             verify_calls: AtomicU64::new(0),
             last_seen_root: parking_lot::Mutex::new([0u8; 32]),
+            expected_root: parking_lot::Mutex::new(None),
         }
     }
 
     fn verify_count(&self) -> u64 {
         self.verify_calls.load(Ordering::SeqCst)
+    }
+
+    fn set_expected_root(&self, root: [u8; 32]) {
+        *self.expected_root.lock() = Some(root);
+    }
+
+    fn last_seen_root(&self) -> [u8; 32] {
+        *self.last_seen_root.lock()
     }
 }
 
@@ -93,7 +104,10 @@ impl ChainSource for SyntheticChainSource {
     ) -> IndexerResult<bool> {
         self.verify_calls.fetch_add(1, Ordering::SeqCst);
         *self.last_seen_root.lock() = merkle_root;
-        Ok(true)
+        Ok(match *self.expected_root.lock() {
+            Some(expected) => merkle_root == expected,
+            None => true,
+        })
     }
     async fn block_hash(&self, _block_number: u64) -> IndexerResult<[u8; 32]> {
         Err(IndexerError::Rpc("synthetic: block_hash".into()))
@@ -432,7 +446,9 @@ fn find_inst<'a>(view: &'a BootstrapView, id: &str) -> &'a BootstrapInstanceView
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "stands up 6 InsPIRe instances; ~10 s wall on Zen 5"]
+#[ignore = "stands up 6 InsPIRe instances; ~10 s wall on Zen 5. Trigger: changing per-instance \
+            bootstrap or the status endpoint. CI runs it in the durability + closure cli-ignored \
+            lane."]
 async fn six_instance_bootstrap_serves_status_for_all_six() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let bind: SocketAddr = "127.0.0.1:0".parse().expect("addr");
@@ -466,6 +482,22 @@ async fn six_instance_bootstrap_serves_status_for_all_six() {
         );
     }
 
+    // End-to-end status-wire pin of the resolved per-encoder k defaults:
+    // PerNode -> 16, PerListStatus -> 4, PerListNode -> 16.
+    let k_for = |id: &str| {
+        body.instances
+            .iter()
+            .find(|i| i.id == id)
+            .unwrap_or_else(|| panic!("no instance {id} in status body"))
+            .active_k_concurrency
+    };
+    assert_eq!(k_for("commit-tree-0"), 16);
+    assert_eq!(k_for("commit-tree-1"), 16);
+    assert_eq!(k_for("commit-tree-2"), 16);
+    assert_eq!(k_for("commit-tree-3"), 16);
+    assert_eq!(k_for("ppoi-status-ofac"), 4);
+    assert_eq!(k_for("ppoi-paths-ofac"), 16);
+
     assert_eq!(view.instances.len(), 6);
     let label_for = |id: &str| find_inst(&view, id).encoder_label;
     assert_eq!(label_for("commit-tree-0"), "per-node");
@@ -479,7 +511,8 @@ async fn six_instance_bootstrap_serves_status_for_all_six() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "stands up 6 InsPIRe instances; drives 4 chain events; ~12 s wall on Zen 5"]
+#[ignore = "stands up 6 InsPIRe instances and drives 4 chain events; ~12 s wall on Zen 5. Trigger: \
+            changing chain-event routing to commit-tree instances."]
 async fn chain_events_route_to_correct_commit_tree_instance() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let bind: SocketAddr = "127.0.0.1:0".parse().expect("addr");
@@ -578,7 +611,8 @@ async fn chain_events_route_to_correct_commit_tree_instance() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "stands up 6 InsPIRe instances; drives 4 PPOI events; ~12 s wall on Zen 5"]
+#[ignore = "stands up 6 InsPIRe instances and drives 4 PPOI events; ~12 s wall on Zen 5. Trigger: \
+            changing PPOI-event routing to list instances."]
 async fn ppoi_events_route_to_correct_list_instance() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let bind: SocketAddr = "127.0.0.1:0".parse().expect("addr");
@@ -652,7 +686,8 @@ async fn ppoi_events_route_to_correct_list_instance() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "stands up 6 InsPIRe instances; drives 4 chain events + asserts L2 cadence; ~14 s wall"]
+#[ignore = "stands up 6 InsPIRe instances and drives 4 chain events; ~14 s wall. Trigger: changing \
+            Layer-2 cadence or which instance roles fire it."]
 async fn layer2_fires_only_on_commit_tree_instances() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let bind: SocketAddr = "127.0.0.1:0".parse().expect("addr");
@@ -670,6 +705,18 @@ async fn layer2_fires_only_on_commit_tree_instances() {
 
     let (_local_addr, server, stop) = spawn_server(opts).await;
     let view = wait_for_observer(&observer).await;
+
+    // The root the verifier MUST be handed: the IMT root of exactly the one
+    // leaf this test commits, computed independently before the event is sent.
+    // With it armed, root_history answers true for this root ONLY, so a
+    // verifier fed a stale or zeroed root has a live failure path.
+    let expected_root = {
+        let mut imt = raven_railgun_engine::imt::Imt::new().expect("imt");
+        imt.insert_leaves(0, &[canonical_commit(0xA0)])
+            .expect("insert");
+        imt.root()
+    };
+    chain_sources[0].set_expected_root(expected_root);
 
     // The toy cell fits only tree-0 into shard 0, so one commit-tree covers the arm.
     view.channels
@@ -717,6 +764,25 @@ async fn layer2_fires_only_on_commit_tree_instances() {
         chain_sources[0].verify_count(),
     );
 
+    // Content, not just cadence: the verifier must have been handed THE root
+    // the commit produced. A verifier querying [0;32] or a stale root would
+    // still bump verify_count; these pins are what make it a verifier.
+    let store_root = tree0
+        .logical_store
+        .lock()
+        .imt_root(0)
+        .expect("tree-0 store must have a root after its commit");
+    assert_eq!(
+        store_root, expected_root,
+        "store root must equal the independently computed 1-leaf IMT root"
+    );
+    assert_eq!(
+        chain_sources[0].last_seen_root(),
+        expected_root,
+        "layer-2 verifier must be handed the committed tree-0 root, not a \
+         stale or zeroed one"
+    );
+
     // PPOI instances have no chain_source and no routed events: 0 reorgs/commits
     for inst in &view.instances {
         if matches!(inst.data_source, DataSourceFilter::PpoiList(_)) {
@@ -738,7 +804,8 @@ async fn layer2_fires_only_on_commit_tree_instances() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "stands up 6 InsPIRe instances twice (kill + restart cycle); ~25 s wall on Zen 5"]
+#[ignore = "stands up 6 InsPIRe instances twice (kill plus restart cycle); ~25 s wall on Zen 5. \
+            Trigger: changing per-instance state persistence across restart."]
 async fn kill_restart_preserves_per_instance_state() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let bind: SocketAddr = "127.0.0.1:0".parse().expect("addr");
@@ -826,7 +893,8 @@ async fn kill_restart_preserves_per_instance_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "stands up 6 InsPIRe instances once + retries one with mismatched encoder; ~14 s wall"]
+#[ignore = "stands up 6 InsPIRe instances once, then retries one with a mismatched encoder; ~14 s \
+            wall. Trigger: changing the manifest encoder label or the per-instance boot refusal."]
 async fn manifest_label_mismatch_refuses_boot_per_instance() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let bind: SocketAddr = "127.0.0.1:0".parse().expect("addr");
@@ -844,7 +912,11 @@ async fn manifest_label_mismatch_refuses_boot_per_instance() {
     let _view1 = wait_for_observer(&observer1).await;
     shutdown(stop1, server1).await.expect("first shutdown");
 
-    // Both encoders are valid; only the manifest verifier rejects the mismatch.
+    // Both encoders are valid AND cell-shape compatible; only the manifest verifier rejects the
+    // mismatch. The swap must keep the row width: PerNode and PerListNode both pin
+    // NODE_HASH_BYTES, so `validate_cell_shape` passes and the label check is what fires. Swapping
+    // to a 512-byte path encoder instead makes the shape guard reject first, and the test then
+    // passes or fails on the wrong guard - which is what it was doing.
     let observer2: BootstrapObserver = Arc::new(parking_lot::Mutex::new(None));
     let chain_sources2 = six_synthetic_sources();
     let mut opts2 = build_opts(
@@ -856,7 +928,9 @@ async fn manifest_label_mismatch_refuses_boot_per_instance() {
     );
     for inst in &mut opts2.instances {
         if inst.instance_id.as_str() == "commit-tree-0" {
-            inst.encoder = EncoderKind::PerLeafPath { tree_number: 0 };
+            inst.encoder = EncoderKind::PerListNode {
+                list_key: [0x5a; 32],
+            };
         }
     }
 

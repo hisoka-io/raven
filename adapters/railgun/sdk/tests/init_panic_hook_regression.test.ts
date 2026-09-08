@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import * as wasmPkg from "raven-inspire-client-wasm";
 
 import { installPanicHook } from "../src/index";
+import { makeRegisterSpy } from "./helpers/register_spy";
 import type { RavenInspireWasm } from "../src/index";
 
 describe("init_panic_hook regression-guard", () => {
@@ -21,7 +22,7 @@ describe("init_panic_hook regression-guard", () => {
   it("installPanicHook returns false when the wasm shim lacks the symbol", () => {
     // older bundles omit the export; contract is no-op + return false
     const stub: RavenInspireWasm = {
-      register_client_session: () => {},
+      register_client_session: makeRegisterSpy(),
       build_client_session: () => ({ free: () => undefined }),
       build_seeded_query: () => new Uint8Array(0),
       extract_response: () => new Uint8Array(0),

@@ -7,14 +7,22 @@ import { RavenPOINodeInterface, containsByteSequence, hexToBytes } from "../src/
 import type { ClientPirContext } from "../src/index";
 
 import { loadFixture, makeClientPirContext } from "./helpers/fixture";
+import { encodeBatchResponseNodes } from "./helpers/auth_path_stub";
 import { startMockServer, writeBinary, writeJson, type MockServer } from "./helpers/mock_server";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 
+/** A leak check over zero bodies proves nothing, so the caller must say what it expects. */
 function assertNoBcLeaked(
   bodies: { url: string; body: Uint8Array }[],
   bcsHex: string[],
+  minQueryBodies: number,
 ): void {
+  const queries = bodies.filter((b) => b.url.includes("/v1/instance/"));
+  expect(
+    queries.length,
+    "no PIR request left the SDK, so the leak check below inspected nothing",
+  ).toBeGreaterThanOrEqual(minQueryBodies);
   for (const bcHex of bcsHex) {
     const bcBytes = hexToBytes(bcHex);
     const bcAscii = new TextEncoder().encode(bcHex);
@@ -82,25 +90,9 @@ describe("privacy across every SDK call path", () => {
       (req) => /^\/v1\/instance\/[^/]+\/(query|batch)$/.test(req.url ?? ""),
       (req, _body, res) => {
         if ((req.url ?? "").endsWith("/batch")) {
-          const elemCount = 16;
           const r = responses[cursor % responses.length];
           cursor += 1;
-          const total = 2 + 8 + elemCount * (8 + r.length);
-          const out = new Uint8Array(total);
-          out[0] = 0;
-          out[1] = 1;
-          const dv = new DataView(out.buffer);
-          dv.setUint32(2, elemCount, true);
-          dv.setUint32(6, 0, true);
-          let off = 10;
-          for (let i = 0; i < elemCount; i += 1) {
-            dv.setUint32(off, r.length, true);
-            dv.setUint32(off + 4, 0, true);
-            off += 8;
-            out.set(r, off);
-            off += r.length;
-          }
-          writeBinary(res, out);
+          writeBinary(res, encodeBatchResponseNodes(new Array<Uint8Array>(16).fill(r)));
           return true;
         }
         const r = responses[cursor % responses.length];
@@ -127,10 +119,11 @@ describe("privacy across every SDK call path", () => {
       );
     } catch {
     }
-    assertNoBcLeaked(sdk.lastWireRequests(), queriedBcs);
+    assertNoBcLeaked(sdk.lastWireRequests(), queriedBcs, 1);
     assertNoBcLeaked(
       server.requests.map((r) => ({ url: r.url, body: r.body })),
       queriedBcs,
+      1,
     );
   });
 
@@ -141,25 +134,9 @@ describe("privacy across every SDK call path", () => {
       (req) => /^\/v1\/instance\/[^/]+\/(query|batch)$/.test(req.url ?? ""),
       (req, _body, res) => {
         if ((req.url ?? "").endsWith("/batch")) {
-          const elemCount = 16;
           const r = responses[cursor % responses.length];
           cursor += 1;
-          const total = 2 + 8 + elemCount * (8 + r.length);
-          const out = new Uint8Array(total);
-          out[0] = 0;
-          out[1] = 1;
-          const dv = new DataView(out.buffer);
-          dv.setUint32(2, elemCount, true);
-          dv.setUint32(6, 0, true);
-          let off = 10;
-          for (let i = 0; i < elemCount; i += 1) {
-            dv.setUint32(off, r.length, true);
-            dv.setUint32(off + 4, 0, true);
-            off += 8;
-            out.set(r, off);
-            off += r.length;
-          }
-          writeBinary(res, out);
+          writeBinary(res, encodeBatchResponseNodes(new Array<Uint8Array>(16).fill(r)));
           return true;
         }
         const r = responses[cursor % responses.length];
@@ -183,10 +160,11 @@ describe("privacy across every SDK call path", () => {
       await sdk.getPOIMerkleProofs(fixture.meta.list_key_hex, queriedBcs);
     } catch {
     }
-    assertNoBcLeaked(sdk.lastWireRequests(), queriedBcs);
+    assertNoBcLeaked(sdk.lastWireRequests(), queriedBcs, 1);
     assertNoBcLeaked(
       server.requests.map((r) => ({ url: r.url, body: r.body })),
       queriedBcs,
+      1,
     );
   });
 
@@ -197,25 +175,9 @@ describe("privacy across every SDK call path", () => {
       (req) => /^\/v1\/instance\/[^/]+\/(query|batch)$/.test(req.url ?? ""),
       (req, _body, res) => {
         if ((req.url ?? "").endsWith("/batch")) {
-          const elemCount = 16;
           const r = responses[cursor % responses.length];
           cursor += 1;
-          const total = 2 + 8 + elemCount * (8 + r.length);
-          const out = new Uint8Array(total);
-          out[0] = 0;
-          out[1] = 1;
-          const dv = new DataView(out.buffer);
-          dv.setUint32(2, elemCount, true);
-          dv.setUint32(6, 0, true);
-          let off = 10;
-          for (let i = 0; i < elemCount; i += 1) {
-            dv.setUint32(off, r.length, true);
-            dv.setUint32(off + 4, 0, true);
-            off += 8;
-            out.set(r, off);
-            off += r.length;
-          }
-          writeBinary(res, out);
+          writeBinary(res, encodeBatchResponseNodes(new Array<Uint8Array>(16).fill(r)));
           return true;
         }
         const r = responses[cursor % responses.length];
@@ -254,6 +216,78 @@ describe("privacy across every SDK call path", () => {
       ).toBe(false);
     }
   });
+
+  // D4 / DH-L0-6: a non-member short-circuits to `Missing` with `continue` BEFORE any
+  // query fires (src/raven-poi-node-interface.ts getPOIsPerListClientPir), so the
+  // observable count of /v1/instance/ POSTs tracks list membership 1:1 — a
+  // list-membership oracle for anyone who can count requests. drawPaddedSlots exists
+  // and is applied to exactly ONE call site (assembleAuthPath); the T1 loop has no
+  // padding. RED-by-design: un-mark when getPOIsPerListClientPir applies the batch
+  // ladder (or equivalent padding) to the T1 path. Probe capture (as a plain `it`):
+  // "expected 3 to be +0 // Object.is equality" at the count assertion below.
+  it.fails(
+    "T1 outbound request count is independent of list membership (D4 / DH-L0-6)",
+    async () => {
+      const lk = fixture.meta.list_key_hex;
+      const memberBcs = fixture.meta.target_indices
+        .slice(0, 3)
+        .map((idx) => fixture.meta.bcs_hex[idx]);
+      const nonMemberBcs = ["77".repeat(32), "88".repeat(32), "99".repeat(32)];
+      const served = fixture.meta.target_indices.slice(0, 3);
+      let cursor = 0;
+      server.route(
+        (req) => /^\/v1\/instance\/[^/]+\/query$/.test(req.url ?? ""),
+        (_req, _body, res) => {
+          const idx = served[cursor % served.length];
+          cursor += 1;
+          const body = fixture.responsesByIdx.get(idx)!;
+          const out = new Uint8Array(2 + body.length);
+          out[1] = 1;
+          out.set(body, 2);
+          writeBinary(res, out);
+          return true;
+        },
+      );
+
+      const countQueries = (sdk: RavenPOINodeInterface): number =>
+        sdk.lastWireRequests().filter((r) => r.url.includes("/v1/instance/")).length;
+
+      const { ctxs, bcMaps } = makeMaps(fixture, ctx);
+      const sdk0 = new RavenPOINodeInterface({
+        endpoint: server.url,
+        bearerToken: TOKEN,
+        useClientPir: true,
+        clientPirContexts: ctxs,
+        bcToIdxMaps: bcMaps,
+      });
+      await sdk0.getPOIsPerList(
+        [lk],
+        nonMemberBcs.map((bc) => ({ blindedCommitment: bc, type: "Shield" as const })),
+      );
+      const countZeroMembers = countQueries(sdk0);
+
+      const sdk3 = new RavenPOINodeInterface({
+        endpoint: server.url,
+        bearerToken: TOKEN,
+        useClientPir: true,
+        clientPirContexts: ctxs,
+        bcToIdxMaps: bcMaps,
+      });
+      await sdk3.getPOIsPerList(
+        [lk],
+        [...memberBcs, ...nonMemberBcs].map((bc) => ({
+          blindedCommitment: bc,
+          type: "Shield" as const,
+        })),
+      );
+      const countThreeMembers = countQueries(sdk3);
+
+      expect(
+        countThreeMembers,
+        "same N, different M must produce the same request count or the count is an oracle",
+      ).toBe(countZeroMembers);
+    },
+  );
 
   it("bc-to-idx-map publishing channel emits a GET with no body", async () => {
     server.route(

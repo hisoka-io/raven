@@ -77,10 +77,31 @@ jobs:
           targets: wasm32-unknown-unknown
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       - name: cargo check (wasm32, raven-client)
         run: cargo check -p raven-client --target wasm32-unknown-unknown
       - name: cargo clippy (wasm32, raven-client)
         run: cargo clippy -p raven-client --all-targets --target wasm32-unknown-unknown -- -D warnings
+      # The tree's ONLY #[wasm_bindgen_test]. The clippy step above COMPILES it for wasm32 and
+      # always has; nothing had ever EXECUTED it. When it was first run (2026-09-07) it FAILED:
+      # it asked inspire_setup for a 512-byte record at ring_dim 256, where InspiRING width
+      # ceil(512/2) = 256 is outside the legal [1, 128] power-of-two range. A test that has
+      # never run is not a passing test. Fixed to the widest legal record at that ring in the
+      # same change that added this step; the real 512-byte path record is covered at
+      # ring_dim 2048 by the adapter's production-cell lane.
+      - name: wasm-pack test --node (raven-client)
+        # Each wasm test target is named explicitly: a filter-less `wasm-pack test --node
+        # crates/client` was measured to stop after the first target that reports "no tests to
+        # run!", so it does NOT run everything. scripts/check-wasm-test-coverage.sh fails the
+        # build if a file carrying #[wasm_bindgen_test] is missing from this list, which is the
+        # only thing keeping the list honest as files are added.
+        run: |
+          wasm-pack test --node crates/client --test wasm_client_roundtrip
+          wasm-pack test --node crates/client --test session_params_drift
       - name: cargo fmt (raven-inspire-client-wasm)
         run: cargo fmt --manifest-path adapters/railgun/client-wasm/Cargo.toml -- --check
       - name: cargo check (wasm32, raven-inspire-client-wasm)
@@ -103,6 +124,25 @@ jobs:
         run: scripts/check-repo-hygiene.sh
       - name: check-repo-hygiene red-proof
         run: scripts/check-repo-hygiene-selftest.sh
+      # A `test()` term naming a nonexistent test exits 0 and silently shrinks its lane, and both
+      # the fmt step and the test shards enumerate packages by hand - a new member is uncovered
+      # until someone notices. Both have happened; this makes them build failures.
+      - name: check-ci-filter-names
+        run: scripts/check-ci-filter-names.sh
+      - name: check-ci-filter-names red-proof
+        run: scripts/check-ci-filter-names-selftest.sh
+      # An #[ignore]d test no lane selects runs nowhere. 42 of 72 were in that state; this freezes
+      # that set and fails when a NEW one appears. Debt can shrink freely, not grow silently.
+      - name: check-ignore-coverage
+        run: scripts/check-ignore-coverage.sh
+      - name: check-ignore-coverage red-proof
+        run: scripts/check-ignore-coverage-selftest.sh
+      # A wasm test named by no job is compiled and never executed - the shape that let the
+      # tree's only wasm test sit broken and green until it was finally run.
+      - name: check-wasm-test-coverage
+        run: scripts/check-wasm-test-coverage.sh
+      - name: check-wasm-test-coverage red-proof
+        run: scripts/check-wasm-test-coverage-selftest.sh
       - name: check-layering
         # Two-repo doctrine: no application vocabulary in crates/, and no framework
         # crate depending on an adapter. Nothing enforced this before.
@@ -275,12 +315,58 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: cargo nextest (ci-test profile)
         run: |
+          # --no-tests=fail pins nextest's zero-match behavior regardless of the
+          # installed release. It does NOT cover a union filter where only one term
+          # goes dead (the rest still run, green); check-ci-filter-names.sh covers
+          # that direction - the two guards land together, never one instead.
           cargo nextest run \
             --manifest-path adapters/railgun/Cargo.toml \
             ${{ matrix.shard.packages }} \
             --all-targets \
+            --no-tests=fail \
             --cargo-profile ci-test \
             --profile ci
+      - name: sccache stats
+        run: sccache --show-stats
+        if: always()
+
+  lane-counts:
+    # Every filtered lane must still select the number of tests it is supposed to.
+    #
+    # check-ci-filter-names.sh (hygiene job) catches a filter term that resolves to NOTHING.
+    # It cannot catch the quieter half: a lane that still resolves but now runs 12 tests where
+    # it ran 65, because a file was deleted or a test renamed. Both shapes occurred here inside
+    # one week, and a shrunken lane reports success the whole time.
+    #
+    # This needs the adapter's test binaries built, so it is its own job rather than a step in
+    # the cheap hygiene job — that build is the honest price of the check. The expectations in
+    # .github/expected-lane-counts.tsv are a RATCHET: a lane may grow silently, a drop fails and
+    # must be explained by updating that file in the same change.
+    name: lane counts (no filter may silently shrink)
+    needs: railgun-static
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=lld"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "railgun"
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: taiki-e/install-action@nextest
+      - name: assert every filtered lane still selects its tests
+        run: scripts/assert-lane-counts.sh
+      # The gate shipped with two counting bugs that its prose red-proof missed, both found by
+      # reading its source rather than running it. This runs here rather than in the cheap hygiene
+      # job because it invokes the gate, which needs the test binaries this job already builds.
+      - name: lane-count red-proof
+        run: scripts/assert-lane-counts-selftest.sh
       - name: sccache stats
         run: sccache --show-stats
         if: always()
@@ -310,20 +396,32 @@ jobs:
             cargo_flags: "--features chaos-tests"
             nextest_profile: ci
             filter: "binary(wal_chaos_layer_b) + binary(snapshot_chaos_save_two_rename)"
-          # The 26 assertion-carrying `#[ignore]`d CLI tests ran in NO lane: the three
-          # `--run-ignored all` filters above are explicit binary lists that never named
-          # these. Measured 2026-08-11 with --no-fail-fast: 26 ignored, 14 green, 12 RED
-          # at HEAD. The twelve are excluded BY NAME, not by dropping their
-          # binaries, so a fix flips one line here instead of restoring a whole file.
-          # `production_cell_round_trip_and_batch_within_budget` is excluded for a
-          # DIFFERENT reason: it is a wall-clock budget (71.9 ms floor), and it measured
-          # 402 ms under lane load while passing at 19.9 s standalone. A deadline on a
-          # shared runner reds on machine speed, not on code.
+          # This lane runs the assertion-carrying `#[ignore]`d CLI tests that once ran
+          # in NO lane. The 2026-08-11 measurement found 12 RED and 13 names were
+          # subtracted by hand; the shared fixture defect behind eleven of them (a
+          # 256-entry cell against encoders whose minimum is 65,536) was repaired
+          # 2026-09-01, and the last two subtractions died 2026-09-06 exactly as the
+          # text here anticipated. The clause is now GONE, not shortened:
+          #   - `production_cell_round_trip_and_batch_within_budget` was a wall-clock
+          #     budget that measured 402 ms under lane load while passing standalone.
+          #     It was SPLIT: the byte-identity half runs here as
+          #     `production_cell_round_trip_byte_identity` (11.9 s), and the two
+          #     deadlines moved to benches/production_cell_budget_bench.rs, which the
+          #     nightly production-cell job runs where a machine-speed assertion can
+          #     survive. This lane therefore went from running ZERO tests out of
+          #     binary(production_cell) to running a full production-parameter round trip.
+          #   - `boundary_repair_three_seed_per_tree_bench` was excluded as a timing
+          #     harness with no assertions. It now asserts the recovered root, the leaf
+          #     count and the tail-gap refusal per arm, and passes in 25.1 s.
+          # The lane selects 65 tests. Two gates keep this honest: check-ci-filter-names.sh
+          # fails the build when a filter term stops resolving (it caught the dead
+          # subtraction term above), and check-ignore-coverage.sh fails when a new
+          # ignored test lands with no lane and no allowlist entry.
           - name: cli-ignored
             packages: "-p raven-railgun-cli"
             cargo_flags: ""
             nextest_profile: ci
-            filter: "(binary(auto_spawn_shutdown) + binary(bootstrap_from_subsquid) + binary(multi_list_ppoi_dynamic) + binary(production_cell) + binary(serve_production_config_file) + binary(six_instance_integration) + binary(smart_policy_deferred) + binary(smart_policy_lifecycle)) - (test(tree_fill_threshold_pre_spawns_at_95_percent) + test(boundary_repair_three_seed_per_tree_bench) + test(synthetic_upstream_emits_new_list_key_spawns_two_instances) + test(concurrent_list_observed_bursts_dedupe_to_one_spawn_per_template_per_list_key) + test(restart_replay_picks_up_auto_spawned_ppoi_list_instances_from_spawn_log) + test(manifest_label_mismatch_refuses_boot_per_instance) + test(admin_drain_concurrent_with_auto_spawn_routes_consistently) + test(cooldown_seconds_refuses_back_to_back_spawns) + test(max_count_and_cooldown_compose) + test(max_instance_count_4_refuses_5th_spawn_loud) + test(synthetic_chain_drives_template_based_spawn_to_5_trees) + test(auto_spawned_consumers_drain_wal_on_sigterm) + test(production_cell_round_trip_and_batch_within_budget))"
+            filter: "binary(auto_spawn_shutdown) + binary(bootstrap_from_subsquid) + binary(multi_list_ppoi_dynamic) + binary(production_cell) + binary(serve_production_config_file) + binary(six_instance_integration) + binary(smart_policy_deferred) + binary(smart_policy_lifecycle)"
           - name: engine-ignored
             packages: "-p raven-railgun-engine"
             cargo_flags: ""
@@ -336,7 +434,10 @@ jobs:
             # measures 113 s on a 16-core box and would trip ci's 120 s x 3 cap
             # on a 4-vCPU runner
             nextest_profile: production-cell
-            filter: "binary(t1_status_closure) + binary(t2_path_closure) + binary(t3_commit_tree_path_closure) + binary(phase4_closure) + binary(multi_instance_recovery) + binary(multi_instance_reorg_cascade)"
+            # t3_commit_tree_path_closure was deleted with proof that the closure it
+            # asserted is carried by per_leaf_path_production_cell (nightly) and the
+            # per-commit path oracle; its term went with the file, in this same change.
+            filter: "binary(t1_status_closure) + binary(t2_path_closure) + binary(phase4_closure) + binary(multi_instance_recovery) + binary(multi_instance_reorg_cascade)"
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
@@ -367,6 +468,7 @@ jobs:
             --manifest-path adapters/railgun/Cargo.toml \
             ${{ matrix.lane.packages }} \
             ${{ matrix.lane.cargo_flags }} \
+            --no-tests=fail \
             --cargo-profile ci-test \
             --profile ${{ matrix.lane.nextest_profile }} \
             --run-ignored all \
@@ -386,9 +488,18 @@ jobs:
     # ladder, which performs ten full production-parameter setups (~150 s) and is
     # the evidence the width law is derived from.
     #
-    # The filter is an explicit binary list, not `-p raven-railgun-engine`:
+    # The filter is an explicit binary list, not a bare package selection:
     # --run-ignored all over the whole package would also start the remaining
     # ignored heavy tests, which run for tens of minutes.
+    #
+    # It also carries the SLO gates — assertions whose subject IS a wall clock, so
+    # they red on machine speed rather than on code and cannot live in a per-push
+    # lane. The production-cell nextest profile's 300 s slow-timeout is the only
+    # budget they survive. Today: production_cell_budget_bench (300 ms single-query
+    # and 3 s batch ceilings, split off the cli round-trip test) and populate_bench
+    # (30 s for 1k events). A timing harness with NO ceiling stays out of every lane
+    # and sits in scripts/ignore-coverage-allowlist.txt instead — a measurement is
+    # not a gate, and enrolling one buys nightly minutes and no signal.
     name: production-cell closure (d=2048, --run-ignored all)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -420,13 +531,21 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: cargo nextest (production-cell closure, ignored included)
         run: |
+          # --all-targets is REQUIRED, not cosmetic: without it cargo does not build
+          # bench targets at all, the two bench binary() terms below would match
+          # nothing, and the SLO gates would report green while asserting nothing —
+          # the exact failure this lane exists to prevent. The `-E` list keeps the
+          # run scoped despite --all-targets, so the remaining tens-of-minutes
+          # ignored benches still do not start.
           cargo nextest run \
             --manifest-path adapters/railgun/Cargo.toml \
-            -p raven-railgun-engine \
+            -p raven-railgun-engine -p raven-railgun-cli -p raven-railgun-mock-ppoi \
+            --all-targets \
+            --no-tests=fail \
             --cargo-profile ci-test \
             --profile production-cell \
             --run-ignored all \
-            -E 'binary(db1_note_record_production_cell) + binary(db2_block_production_cell) + binary(pir_cell_width_law) + binary(per_leaf_path_production_cell) + binary(per_node_production_cell)'
+            -E 'binary(db1_note_record_production_cell) + binary(db2_block_production_cell) + binary(cell_width_runtime_gate) + binary(per_leaf_path_production_cell) + binary(per_node_production_cell) + binary(production_cell_budget_bench) + binary(populate_bench)'
       - name: sccache stats
         run: sccache --show-stats
         if: always()
@@ -506,11 +625,29 @@ jobs:
         run: cargo fmt --manifest-path crates/inspire/Cargo.toml -- --check
       - name: cargo clippy
         run: cargo clippy --manifest-path crates/inspire/Cargo.toml --all-targets -- -D warnings
+      - name: record runner SIMD capability
+        # RAVEN_REQUIRE_AVX512=1 turns the SIMD tests' capability skips into failures.
+        # Arm it only when the runner really has the flags, so the lane is honest on
+        # either kind of runner and the measured answer lands in the log.
+        run: |
+          flags=$(grep -o 'avx512[a-z0-9_]*' /proc/cpuinfo | sort -u | tr '\n' ' ') || flags=""
+          echo "runner avx512 flags: ${flags:-none}"
+          if grep -qw avx512ifma /proc/cpuinfo && grep -qw avx512f /proc/cpuinfo; then
+            echo "RAVEN_REQUIRE_AVX512=1" >> "$GITHUB_ENV"
+            echo "runner HAS avx512ifma - the SIMD kernels are REQUIRED to run"
+          else
+            echo "runner LACKS avx512ifma - the SIMD differential halves will loud-skip by name"
+          fi
       - name: cargo test (default)
         run: cargo test --manifest-path crates/inspire/Cargo.toml --release
       - name: cargo test (parallel feature)
         # re-runs the byte-identity KAT under the rayon path so it cannot regress undetected
         run: cargo test --manifest-path crates/inspire/Cargo.toml --release --features parallel
+      - name: cargo test (simd-packing-offline feature)
+        # Without this feature the packing dispatch under test IS the scalar reference, so the
+        # differential compares a loop with itself. Nothing in CI built it until now, which is
+        # why simd_packing_offline_kat was green-vacuous on every run it ever made.
+        run: cargo test --manifest-path crates/inspire/Cargo.toml --release --features simd-packing-offline --test simd_packing_offline_kat
       - name: cargo check (wasm32, client-clean / no rayon)
         run: cargo check --manifest-path crates/inspire/Cargo.toml --target wasm32-unknown-unknown --no-default-features
       - name: sccache stats
@@ -748,3 +885,22 @@ jobs:
       - name: pnpm test
         run: pnpm test
         working-directory: adapters/railgun/sdk
+      # The suite passing is not the same as the suite being able to fail. Four gates,
+      # each shipped with its own red-proof:
+      #   - export coverage: a public export with zero test references is caught here,
+      #     not discovered months later (three were dark: subscribeRavenEvents,
+      #     sha256Hex, PATH_RECORD_BYTES).
+      #   - constant parity: five values are duplicated between Rust and TypeScript and
+      #     nothing tied them together; a drift in either direction now fails.
+      #   - suite red-proof: deletes the schema-envelope guard in a scratch COPY and
+      #     requires the suite to redden for the RIGHT reason.
+      #   - test count: a silently-vanishing test (a bad glob, a dropped file) is a
+      #     green suite otherwise. Skips are pinned exactly; the live tier is 21.
+      - name: sdk export coverage
+        run: adapters/railgun/scripts/check-sdk-export-coverage.sh
+      - name: sdk rust/ts constant parity
+        run: adapters/railgun/scripts/check-sdk-constant-parity.sh
+      - name: sdk test-count pin
+        run: adapters/railgun/scripts/check-sdk-test-count.sh
+      - name: sdk suite red-proof
+        run: adapters/railgun/scripts/check-sdk-suite-selftest.sh

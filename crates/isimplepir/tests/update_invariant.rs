@@ -8,6 +8,7 @@
 //! byte-identical to a full `H' = D' * A` recomputation after any update sequence.
 //! eprint 2026/030 sec 4.1 p.14 Theorem 3.
 
+use proptest::prelude::*;
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
 
@@ -92,21 +93,96 @@ fn run_k_updates(k: usize, seed: [u8; 32]) {
         .unwrap_or_else(|err| panic!("Theorem 3 invariant violated after {k} updates: {err}"));
 }
 
-#[test]
-fn invariant_after_1_update() {
-    run_k_updates(1, [0u8; 32]);
+/// One generated op. Raw indices are reduced against the CURRENT dims inside the
+/// body, because inserts grow `l` as the sequence runs.
+#[derive(Debug, Clone)]
+enum ArbOp {
+    Modify { row: usize, col: usize, val: u32 },
+    Insert { fill: u32 },
+    Delete { row: usize, col: usize },
 }
 
-#[test]
-fn invariant_after_10_updates() {
-    run_k_updates(10, [0u8; 32]);
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// Theorem 3 under ARBITRARY update sequences. `run_k_updates` cycles ops
+    /// deterministically (`step % 3`) with fixed strides, so two consecutive
+    /// deletes on one row, or a delete of a just-inserted row, never occur at
+    /// any k; this generator reaches them.
+    #[test]
+    fn hint_matches_db_under_arbitrary_updates(
+        ops in proptest::collection::vec(
+            prop_oneof![
+                (0usize..1024, 0usize..1024, 0u32..u32::MAX)
+                    .prop_map(|(row, col, val)| ArbOp::Modify { row, col, val }),
+                (0u32..u32::MAX).prop_map(|fill| ArbOp::Insert { fill }),
+                (0usize..1024, 0usize..1024).prop_map(|(row, col)| ArbOp::Delete { row, col }),
+            ],
+            0..64,
+        ),
+    ) {
+        let params = toy_params(4, 4);
+        let mut rng = ChaCha20Rng::from_seed([21u8; 32]);
+        let mut db_init = vec![0u32; 16];
+        for slot in db_init.iter_mut() {
+            *slot = random_value_below_p(&mut rng, params.p);
+        }
+        let out = setup(&db_init, params, Some([1u8; 32])).expect("setup");
+        let mut hint = out.hint.clone();
+        let mut state = out.server;
+
+        let mut touched_rows = std::collections::BTreeSet::new();
+        for op in &ops {
+            match *op {
+                ArbOp::Modify { row, col, val } => {
+                    let row = row % state.params.l;
+                    let col = col % state.params.m;
+                    let val = val % state.params.p;
+                    touched_rows.insert(row);
+                    let delta = db_update_modify(&mut state, row, col, val).expect("modify");
+                    state_update_entry(&mut hint, &state.a_seed, &state.params, &delta)
+                        .expect("state_update modify");
+                }
+                ArbOp::Insert { fill } => {
+                    let new_row: Vec<u32> = (0..state.params.m)
+                        .map(|j| fill.wrapping_add(j as u32) % state.params.p)
+                        .collect();
+                    let delta = db_update_insert(&mut state, &new_row).expect("insert");
+                    state_update_insert(&mut hint, &delta).expect("state_update insert");
+                }
+                ArbOp::Delete { row, col } => {
+                    let row = row % state.params.l;
+                    let col = col % state.params.m;
+                    touched_rows.insert(row);
+                    let delta = db_update_delete(&mut state, row, col, &mut rng).expect("delete");
+                    state_update_entry(&mut hint, &state.a_seed, &state.params, &delta)
+                        .expect("state_update delete");
+                }
+            }
+        }
+
+        // Degeneracy guard: `l` never shrinks (no row-deletion op), so reduction
+        // mod current dims cannot collapse onto row 0 — but a freak all-one-row
+        // draw must be discarded, not allowed to stand in for coverage.
+        let targeted = ops
+            .iter()
+            .filter(|op| !matches!(op, ArbOp::Insert { .. }))
+            .count();
+        prop_assume!(targeted < 8 || touched_rows.len() >= 2);
+
+        prop_assert_eq!(hint.version, state.version);
+        if let Err(err) = verify_hint_matches_db(&state, &hint) {
+            return Err(TestCaseError::fail(format!(
+                "Theorem 3 invariant violated after {} arbitrary ops: {err}",
+                ops.len()
+            )));
+        }
+    }
 }
 
-#[test]
-fn invariant_after_100_updates() {
-    run_k_updates(100, [0u8; 32]);
-}
-
+// Scale case kept as a plain #[test]: 1024 ops through the deterministic cycle
+// costs what a single proptest case may not; the generated property above holds
+// the arbitrary-sequence axis.
 #[test]
 fn invariant_after_1024_updates() {
     run_k_updates(1024, [42u8; 32]);

@@ -22,7 +22,13 @@ use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
 use raven_railgun_persistence::WalEntryPayload;
 use raven_railgun_poseidon::{merkle_node, railgun_merkle_zero_value};
 
-/// Block exponent from the read-path design.
+/// Block exponent from the read-path design. `BLOCK_K = 10` is a wire-format parameter
+/// and an owner decision, not a tunable: changing it resizes every fetched block
+/// (2^10 leaf commitments = 32 KB payload, anonymity set 1,024) and the public upper
+/// tree. The structural tests in this file derive boundaries from it on both sides and
+/// stay green at any `k` — re-derive the payload and anonymity-set figures before
+/// editing this constant. (This text replaced a #[test] that could only compare these
+/// same-file constants to their own literals; no production symbol carries `BLOCK_K`.)
 const BLOCK_K: usize = 10;
 /// Leaf commitments per block.
 const BLOCK_LEAVES: usize = 1 << BLOCK_K;
@@ -130,26 +136,6 @@ fn block_bytes_are_byte_identical_to_the_imt_node_oracle() {
 }
 
 #[test]
-fn recomputed_subtree_root_matches_the_upper_tree_node() {
-    let store = seed_store(LEAVES_PRELOADED);
-    let imt = store.imt(TREE_NUMBER).expect("tree present");
-
-    for block_index in 0..=PARTIAL_BLOCK {
-        let block = materialize_block(&store, block_index);
-        let levels = recompute_subtree(&block);
-        let roots = levels.get(BLOCK_K).expect("subtree root level present");
-        assert_eq!(roots.len(), 1, "block subtree must collapse to one root");
-        let recomputed = *roots.first().expect("subtree root present");
-        assert_eq!(
-            recomputed,
-            imt.node(BLOCK_K, block_index),
-            "block {block_index}: subtree recomputed from the fetched bytes must equal \
-             Imt::node({BLOCK_K}, {block_index})"
-        );
-    }
-}
-
-#[test]
 fn spliced_path_is_byte_identical_to_the_merkle_proof_oracle() {
     let store = seed_store(LEAVES_PRELOADED);
     let imt = store.imt(TREE_NUMBER).expect("tree present");
@@ -159,6 +145,16 @@ fn spliced_path_is_byte_identical_to_the_merkle_proof_oracle() {
         let block_index = leaf_index as usize / BLOCK_LEAVES;
         let block = materialize_block(&store, block_index);
         let levels = recompute_subtree(&block);
+
+        // The chosen leaves visit every block, 0..=PARTIAL_BLOCK.
+        let roots = levels.get(BLOCK_K).expect("subtree root level present");
+        assert_eq!(roots.len(), 1, "block subtree must collapse to one root");
+        assert_eq!(
+            *roots.first().expect("subtree root present"),
+            imt.node(BLOCK_K, block_index),
+            "block {block_index}: subtree recomputed from the fetched bytes must equal \
+             Imt::node({BLOCK_K}, {block_index})"
+        );
 
         let mut spliced = [[0u8; 32]; TREE_DEPTH];
         let mut idx_in_block = leaf_index as usize % BLOCK_LEAVES;
@@ -227,28 +223,6 @@ fn full_blocks_freeze_and_only_the_tail_block_changes_on_append() {
         materialize_block(&after, PARTIAL_BLOCK),
         "the rightmost partial block must change when leaves are appended; \
          if it does not, the fixture is not exercising the dirty tail"
-    );
-}
-
-/// Pin `BLOCK_K` itself: the structural tests derive boundaries from it on both
-/// sides and stay green at any `k`, but it is a wire-format parameter that
-/// changes the bytes every client fetches.
-#[test]
-fn block_exponent_and_payload_are_pinned_to_the_read_path_design() {
-    assert_eq!(
-        BLOCK_K, 10,
-        "the block exponent is a wire-format parameter and an owner decision, not a \
-         tunable. Changing it resizes every fetched block and the public upper tree. \
-         The structural tests in this file will NOT catch the change; re-derive the \
-         payload and anonymity-set figures before editing this pin"
-    );
-    assert_eq!(
-        BLOCK_LEAVES, 1_024,
-        "block must carry 2^10 leaf commitments (anonymity set 1,024)"
-    );
-    assert_eq!(
-        BLOCK_BYTES, 32_768,
-        "block payload must be 32 KB: 1,024 commitments at 32 bytes"
     );
 }
 

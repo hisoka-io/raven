@@ -17,7 +17,6 @@ use axum::{
     Router,
 };
 use http_body_util::BodyExt;
-use raven_railgun_core::{InstanceId, PoiStatusRow};
 use raven_railgun_engine::inspire::{apply_wal_entry, LogicalLeafStore};
 use raven_railgun_engine::pir_table::PerLeafCommitmentEncoder;
 use raven_railgun_engine::{Engine, PirScheme};
@@ -128,6 +127,13 @@ fn seeded_store() -> (LogicalLeafStore, [u8; 32]) {
 }
 
 fn build_router() -> (Router, [u8; 32]) {
+    let (routes, list_key, _store) = build_router_with_store();
+    (routes, list_key)
+}
+
+/// Variant that also hands back the store behind the router, so proof-serving
+/// tests can compare served content against the store's own proof.
+fn build_router_with_store() -> (Router, [u8; 32], Arc<parking_lot::Mutex<LogicalLeafStore>>) {
     let (store, list_key) = seeded_store();
     let store_arc = Arc::new(parking_lot::Mutex::new(store));
     let engine: Engine<StubScheme> = Engine::new();
@@ -138,7 +144,30 @@ fn build_router() -> (Router, [u8; 32]) {
     }
     .with_logical_store(Arc::clone(&store_arc));
     let routes = poi_shim::poi_shim_routes(state);
-    (routes, list_key)
+    (routes, list_key, store_arc)
+}
+
+/// A proof of the right SHAPE with the wrong CONTENT is the failure mode that
+/// matters here (the proofs are consumed off-tree): pin every serialized field
+/// of the served proof to the store's own proof for that slot.
+fn assert_served_proof_matches_store(
+    entry: &serde_json::Value,
+    core: &raven_railgun_core::MerkleProof,
+) {
+    let elements = entry["elements"].as_array().expect("elements array");
+    assert_eq!(elements.len(), 16, "Merkle proof must have 16 siblings");
+    for (level, (served, expected)) in elements.iter().zip(core.elements.iter()).enumerate() {
+        assert_eq!(
+            served.as_str().expect("element hex"),
+            hex_encode_bytes(expected),
+            "sibling at level {level} must be the store's sibling, not filler"
+        );
+    }
+    assert_eq!(
+        entry["root"].as_str().expect("root hex"),
+        hex_encode_bytes(&core.root),
+        "served root must be the store's root"
+    );
 }
 
 fn hex_encode_bytes(bytes: &[u8]) -> String {
@@ -198,9 +227,10 @@ async fn pois_per_list_returns_pascal_case_status_per_bc_per_list() {
 
 #[tokio::test]
 async fn merkle_proofs_route_returns_proof_per_blinded_commitment() {
-    let (router, list_key) = build_router();
+    let (router, list_key, store) = build_router_with_store();
     let lk_hex = hex_encode_bytes(&list_key);
-    let bc_hex = hex_encode_bytes(&fr_canonical(0x22));
+    let bc = fr_canonical(0x22);
+    let bc_hex = hex_encode_bytes(&bc);
     let payload = serde_json::json!({
         "listKey": lk_hex,
         "blindedCommitments": [bc_hex],
@@ -218,10 +248,19 @@ async fn merkle_proofs_route_returns_proof_per_blinded_commitment() {
     let arr = json.as_array().expect("array");
     assert_eq!(arr.len(), 1);
     let entry = &arr[0];
-    let elements = entry["elements"].as_array().expect("elements array");
-    assert_eq!(elements.len(), 16, "Merkle proof must have 16 siblings");
-    assert!(entry["root"].is_string());
     assert_eq!(entry["leaf"].as_str(), Some(bc_hex.as_str()));
+
+    let expected = {
+        let guard = store.lock();
+        let idx = guard
+            .ppoi_index_of(&list_key, &bc)
+            .expect("seeded bc must have an index");
+        assert_eq!(idx, 1, "0x22 was seeded at list index 1");
+        guard
+            .ppoi_merkle_proof(&list_key, idx)
+            .expect("store proof for seeded slot")
+    };
+    assert_served_proof_matches_store(entry, &expected);
 }
 
 #[tokio::test]
@@ -245,7 +284,7 @@ async fn merkle_proofs_route_404s_unknown_blinded_commitment() {
 
 #[tokio::test]
 async fn commit_tree_merkle_proof_route_returns_path() {
-    let (router, _) = build_router();
+    let (router, _list_key, store) = build_router_with_store();
     let payload = serde_json::json!({ "leafIndex": 0u32 });
     let req = Request::builder()
         .method(Method::POST)
@@ -257,12 +296,19 @@ async fn commit_tree_merkle_proof_route_returns_path() {
     assert_eq!(resp.status(), StatusCode::OK);
     let bytes = body_bytes(resp).await;
     let json: serde_json::Value = serde_json::from_slice(&bytes).expect("decode");
-    assert_eq!(
-        json["elements"].as_array().expect("elements").len(),
-        16,
-        "commit-tree proof must have 16 siblings"
-    );
-    assert!(json["root"].is_string());
+
+    let expected = {
+        let guard = store.lock();
+        assert_eq!(
+            guard.leaf(0, 0),
+            Some(&fr_canonical(0x01)),
+            "leaf 0 of tree 0 was seeded as 0x01"
+        );
+        guard
+            .merkle_proof(0, 0)
+            .expect("store proof for seeded leaf")
+    };
+    assert_served_proof_matches_store(&json, &expected);
 }
 
 #[tokio::test]
@@ -327,47 +373,6 @@ async fn status_header_partitions_blocked_and_pending_bcs() {
         pending.iter().any(|v| v.as_str() == Some(&bc_pending_hex)),
         "ProofSubmitted BC missing from pendingBcs"
     );
-}
-
-// Compile-time trip-wire on PoiStatusRow + InstanceId.
-#[test]
-fn poi_status_row_remains_in_workspace() {
-    let _ = std::any::type_name::<PoiStatusRow>();
-    let _ = std::any::type_name::<InstanceId>();
-}
-
-#[tokio::test]
-async fn freshness_header_value_format_is_well_formed() {
-    use raven_railgun_engine::persistence::ConsumerMetrics;
-    let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics {
-        last_applied_block: 1000,
-        last_scanned_block: 1000,
-        last_applied_leaf_block: 1000,
-        last_known_chain_head: 1010,
-        events_processed: 42,
-        commits_fired: 5,
-        reorgs_handled: 1,
-        consumer_errors: 0,
-        consecutive_event_errors: 0,
-        unapplied_leaves: 0,
-        first_abandoned_block: None,
-    }));
-
-    let (store, _) = seeded_store();
-    let store_arc = Arc::new(parking_lot::Mutex::new(store));
-    let cfg = HttpConfig::demo(TOKEN);
-    let engine: Engine<StubScheme> = Engine::new();
-    let _state = {
-        let _g = APPSTATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        AppState::new(engine, cfg).expect("appstate")
-    }
-    .with_logical_store(Arc::clone(&store_arc))
-    .with_consumer_metrics(Arc::clone(&metrics));
-
-    let snap = *metrics.lock();
-    let lag = snap.indexer_lag_blocks();
-    assert_eq!(lag, 10);
-    assert_eq!(snap.last_applied_block, 1000);
 }
 
 // ETag must equal SHA-256(body)[..16] hex for every response, even under concurrent writes.

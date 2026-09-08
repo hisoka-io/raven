@@ -1,0 +1,19 @@
+# Production source files this build intentionally changes. Everything else showing an uncommitted
+# diff under */src/ is treated as mutation residue by check-no-mutation-residue.sh.
+adapters/railgun/cli/src/auto_spawn_driver.rs
+adapters/railgun/cli/src/serve_production_multi.rs
+adapters/railgun/engine/src/imt.rs
+adapters/railgun/engine/src/inspire.rs
+adapters/railgun/engine/src/lib.rs
+adapters/railgun/engine/src/persistence.rs
+adapters/railgun/engine/src/pir_table/mod.rs
+adapters/railgun/testkit/src/lib.rs
+crates/core/src/memory.rs
+crates/inspire/src/pir/mod_switch.rs
+crates/storage/src/wal.rs
+crates/inspire/src/pir/respond.rs
+crates/inspire/src/pir/mod.rs
+examples/eth-state/src/lib.rs
+crates/inspire/src/params.rs
+adapters/railgun/engine/src/orchestrator.rs
+crates/inspire/src/cost.rs

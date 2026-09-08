@@ -138,7 +138,8 @@ async fn shutdown_all(handles: Vec<PerInstanceHandles>, channels: OrchestratorCh
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "stands up 6 InsPIRe instances; ~7s wall on Zen 5"]
+#[ignore = "stands up 6 InsPIRe instances; ~7s wall on Zen 5. Trigger: changing per-instance \
+            bootstrap routing. CI runs it in the durability + closure lane."]
 async fn multi_instance_bootstrap_routes_events_per_instance() {
     let dir = tempfile::tempdir().expect("tempdir");
     let configs = build_six_configs(dir.path());
@@ -252,7 +253,9 @@ async fn multi_instance_bootstrap_routes_events_per_instance() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "6 instances + restart cycle; ~14s wall on Zen 5"]
+#[ignore = "6 instances plus a restart cycle; 113 s on a 16-core box, which is why the closure \
+            lane runs this binary under the production-cell nextest profile rather than ci. \
+            Trigger: changing per-instance recovery or byte identity across restart."]
 async fn multi_instance_recovery_byte_identity() {
     let dir = tempfile::tempdir().expect("tempdir");
     let lk_a = list_key(0xA1);

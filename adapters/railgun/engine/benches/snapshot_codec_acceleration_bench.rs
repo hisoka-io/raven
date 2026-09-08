@@ -1,6 +1,10 @@
 //! Snapshot codec acceleration bench (`#[ignore]`-gated): compares
 //! bincode, bitcode, and zstd-on-bincode at the production cell, 3-seed
 //! median per (codec, op). borsh is absent: no serde auto-derive for the upstream types.
+//!
+//! The byte-identity assertions below are measurements' passengers, not the guard: nothing
+//! runs this target, so they proved nothing. `tests/snapshot_codec_round_trip.rs` asserts the
+//! same three properties at a toy cell inside the per-commit lane. Keep them in step.
 
 #![allow(
     clippy::expect_used,
@@ -48,7 +52,8 @@ fn fmt_us(d: Duration) -> String {
 }
 
 #[test]
-#[ignore = "production-cell setup is heavy (~12 s/seed); snapshot codec acceleration sweep"]
+#[ignore = "production-cell setup is heavy (~12 s/seed); sweeps bincode, bitcode and \
+            zstd-on-bincode. Trigger: changing the snapshot codec or its zstd wrap."]
 fn snapshot_codec_acceleration_at_production_cell() {
     eprintln!(
         "snapshot_codec_acceleration: cell=65536x{} SEEDS={} variant=TwoPacking d=2048 zstd_level={}",

@@ -45,7 +45,8 @@ fn median_of_three(timings: &[Duration]) -> Duration {
 }
 
 #[test]
-#[ignore = "production-cell setup is heavy (~12s); K=4 dispatcher comparison"]
+#[ignore = "production-cell setup is heavy (~12s); compares four K=4 dispatch strategies. Trigger: \
+            changing the cross-query dispatch strategy or its thread pool."]
 #[allow(clippy::too_many_lines)]
 fn k4_dispatcher_strategy_comparison() {
     let setup_start = Instant::now();

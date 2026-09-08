@@ -232,6 +232,17 @@ fn wal_replay_drops_entries_already_in_snapshot_at_v6() {
         "post-multi-commit recovery must surface every leaf exactly once \
          (no double-apply across the WAL replay floor)"
     );
+    // The floor decides WHICH entries replay; a count alone cannot tell a correct
+    // floor from one that replayed the wrong cycle's bytes into the right slots.
+    for i in 0..12u32 {
+        let want = canonical(u8::try_from(i).unwrap_or(0).saturating_add(1));
+        let got = opened2
+            .recovered_logical_store
+            .leaf(0, i)
+            .copied()
+            .expect("leaf present after multi-commit recovery");
+        assert_eq!(got, want, "leaf {i} must byte-equal the commitment written");
+    }
 }
 
 #[test]
@@ -328,20 +339,6 @@ fn snapshot_v6_envelope_roundtrips_in_isolation() {
 }
 
 #[test]
-fn v5_bytes_decoded_by_v6_reader_yields_empty_store() {
-    let state = build_toy_state();
-    let v5_bytes = snapshot_inspire_state(&state).expect("v5 ser");
-    let (back_state, back_store) =
-        restore_inspire_state_v6(&v5_bytes).expect("v6 restore on v5 bytes");
-    assert_eq!(back_state.entry_size, state.entry_size);
-    assert_eq!(
-        back_store.leaf_count(),
-        0,
-        "V5 fallback path must yield an empty store"
-    );
-}
-
-#[test]
 fn drive_commit_truncates_wal_yet_v6_recovery_is_complete() {
     // commit_v6 archives the WAL, so reopen reads zero entries from current.log; the V6 snapshot must still recover every leaf
     let dir = tempfile::tempdir().expect("tempdir");
@@ -406,4 +403,15 @@ fn drive_commit_truncates_wal_yet_v6_recovery_is_complete() {
         "Even with empty current.log post-archive, the V6 snapshot must \
          carry every applied leaf back into the recovered store"
     );
+    // "carry every applied leaf" is a claim about bytes; the count above holds for a
+    // snapshot that carried five leaves and lost their commitments.
+    for i in 0..5u32 {
+        let want = canonical(u8::try_from(i).unwrap_or(0).saturating_add(1));
+        let got = opened2
+            .recovered_logical_store
+            .leaf(0, i)
+            .copied()
+            .expect("leaf present after post-archive recovery");
+        assert_eq!(got, want, "leaf {i} must byte-equal the commitment written");
+    }
 }

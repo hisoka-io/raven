@@ -40,7 +40,20 @@ export async function startMockServer(): Promise<MockServer> {
       });
       for (const { match, handler } of handlers) {
         if (!match(req)) continue;
-        const claimed = await handler(req, body, res);
+        let claimed: boolean;
+        try {
+          claimed = await handler(req, body, res);
+        } catch (err) {
+          // Several routes assert on the request body. A throw there used to leave the
+          // response unwritten, so the SDK's fetch hung to the 60 s test timeout and the
+          // failure surfaced as a timeout rather than the assertion. Answer, then rethrow
+          // so the assertion still reaches the runner.
+          if (!res.headersSent) {
+            res.writeHead(500, { "content-type": "text/plain" });
+            res.end(`mock route threw: ${String(err)}`);
+          }
+          throw err;
+        }
         if (claimed) return;
       }
       res.writeHead(404, { "content-type": "text/plain" });

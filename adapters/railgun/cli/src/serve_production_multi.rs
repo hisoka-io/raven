@@ -2313,21 +2313,39 @@ mod tests {
             );
         }
 
-        /// The comparison in the tick is `leaf_count < trigger_at { BelowThreshold }`, so
-        /// `trigger_at - 1` must NOT fire and `trigger_at` must. A `<=` here would delay the
-        /// spawn by exactly one leaf; a `<` misplaced by one is the whole defect class.
+        /// The trigger must land where the fraction says, and must move when the fraction moves.
+        ///
+        /// The first draft of this test asserted `trigger - 1 < trigger` and `!(trigger < trigger)`.
+        /// Both are true for every integer, so they tested nothing - a tautology dressed as a
+        /// boundary check, which clippy caught. These assertions can fail: a rounding change, an
+        /// off-by-one, or a clamp applied to the wrong operand all move at least one of them.
         #[test]
-        fn the_boundary_is_exclusive_below_and_inclusive_at() {
-            let trigger = compute_trigger_threshold(0.95, WATCHER_TREE_MAX_ITEMS);
-            assert!(trigger > 0, "a zero trigger fires on every tick");
-            assert!(
-                trigger - 1 < trigger,
-                "trigger_at - 1 must be below the threshold"
+        fn the_trigger_tracks_the_fraction_and_is_strictly_monotonic() {
+            assert_eq!(
+                compute_trigger_threshold(0.95, WATCHER_TREE_MAX_ITEMS),
+                62_259,
+                "0.95 of a 65,536-leaf tree"
             );
-            assert!(
-                !(trigger < trigger),
-                "trigger_at itself must NOT be below the threshold"
+            assert_eq!(
+                compute_trigger_threshold(0.5, WATCHER_TREE_MAX_ITEMS),
+                32_768
             );
+
+            let mut previous = 0usize;
+            for step in 1..=19u32 {
+                let fraction = f32::from(u16::try_from(step).expect("< 20")) / 20.0;
+                let trigger = compute_trigger_threshold(fraction, WATCHER_TREE_MAX_ITEMS);
+                assert!(
+                    trigger > previous,
+                    "raising the fraction to {fraction} must raise the trigger: \
+                     got {trigger} after {previous}"
+                );
+                assert!(
+                    trigger < WATCHER_TREE_MAX_ITEMS as usize,
+                    "a fraction below 1.0 must leave headroom; {fraction} gave {trigger}"
+                );
+                previous = trigger;
+            }
         }
 
         /// A threshold outside 0.0..=1.0 disables the watcher, and the loop returns early. The

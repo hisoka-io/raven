@@ -128,7 +128,8 @@ fn dispatch_at_k(
 }
 
 #[test]
-#[ignore = "production-cell K-widening sweep; ~60-90s wall (heavy setup x 2 cells x 3 seeds)"]
+#[ignore = "production-cell K-widening sweep; ~60-90s wall (heavy setup x 2 cells x 3 seeds). \
+            Trigger: changing dispatcher width or its thread-pool sizing."]
 fn k_widening_at_two_cells() {
     let cores = std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get);
     eprintln!("k_widening: available_parallelism = {cores}");

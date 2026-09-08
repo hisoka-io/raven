@@ -84,46 +84,12 @@ async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
         .to_vec()
 }
 
-/// Positive: the response envelope decodes to an `InstanceParams`
-/// whose `inspire_params_bincode` field carries non-empty bytes and
-/// whose schema version matches `WIRE_SCHEMA_VERSION`.
-#[tokio::test]
-async fn instance_params_response_includes_inspire_params_bincode_v2() {
-    let params = InspireParams::secure_128_d2048();
-    let engine = build_engine_with_one_instance(&params);
-    let router = build_router_with_engine(engine);
-
-    let resp = router
-        .clone()
-        .oneshot(build_params_request(READ_TOKEN))
-        .await
-        .expect("oneshot");
-    assert_eq!(resp.status(), StatusCode::OK, "params endpoint must 200");
-    let bytes = body_bytes(resp).await;
-
-    let decoded: InstanceParams = read_versioned(&bytes).expect("decode versioned InstanceParams");
-    assert_eq!(
-        decoded.wire_schema_version, WIRE_SCHEMA_VERSION,
-        "wire schema must remain v{WIRE_SCHEMA_VERSION}"
-    );
-    assert!(
-        !decoded.crs_bincode.is_empty(),
-        "crs_bincode must be populated"
-    );
-    assert!(
-        !decoded.shard_config_bincode.is_empty(),
-        "shard_config_bincode must be populated"
-    );
-    assert!(
-        !decoded.inspire_params_bincode.is_empty(),
-        "inspire_params_bincode must be populated for self-bootstrap"
-    );
-    assert_eq!(decoded.entry_size, TOY_ENTRY_BYTES);
-}
-
 /// Round-trip: the `inspire_params_bincode` bytes decode into a
 /// `raven_inspire::params::InspireParams` value byte-equal to the
 /// preset the engine was bootstrapped with (`secure_128_d2048`).
+/// Decoding all three bincode fields strictly dominates the former
+/// non-empty smoke checks (a wrong-preset mutation left those green);
+/// the envelope pins (schema version, entry_size) live here too.
 #[tokio::test]
 async fn instance_params_inspire_params_decodes_to_secure_128_d2048() {
     let params = InspireParams::secure_128_d2048();
@@ -134,10 +100,15 @@ async fn instance_params_inspire_params_decodes_to_secure_128_d2048() {
         .oneshot(build_params_request(READ_TOKEN))
         .await
         .expect("oneshot");
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::OK, "params endpoint must 200");
     let bytes = body_bytes(resp).await;
 
     let decoded: InstanceParams = read_versioned(&bytes).expect("decode envelope");
+    assert_eq!(
+        decoded.wire_schema_version, WIRE_SCHEMA_VERSION,
+        "wire schema must remain v{WIRE_SCHEMA_VERSION}"
+    );
+    assert_eq!(decoded.entry_size, TOY_ENTRY_BYTES);
     let recovered_params: InspireParams =
         bincode::deserialize(&decoded.inspire_params_bincode).expect("decode InspireParams");
     let expected = InspireParams::secure_128_d2048();

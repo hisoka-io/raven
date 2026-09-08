@@ -20,9 +20,10 @@ use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_core::{Epoch, InstanceId};
 use raven_railgun_engine::inspire::{setup_state, RavenInspireScheme};
 use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
-use raven_railgun_http::{AppState, HttpConfig};
+use raven_railgun_http::{read_versioned, AppState, HttpConfig, InstanceParams};
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tower::ServiceExt;
 
 const READ_TOKEN: &str = "BEARER-PARAMS-CACHE-padded-min-len-aabb";
@@ -53,6 +54,33 @@ fn build_app_state() -> AppState<RavenInspireScheme> {
 
 fn build_router(app_state: AppState<RavenInspireScheme>) -> axum::Router {
     raven_railgun_http::inspire_router(app_state).expect("router build")
+}
+
+/// One instance, so two `AppState`s serve byte-identical `/params` bodies while
+/// holding independent ETag caches.
+fn build_shared_instance() -> Arc<PirInstance<RavenInspireScheme>> {
+    let params = InspireParams::secure_128_d2048();
+    let db = raven_railgun_testkit::toy_db(TOY_ENTRIES, TOY_ENTRY_BYTES);
+    let (state, _sk) =
+        setup_state(&params, &db, TOY_ENTRY_BYTES, InspireVariant::TwoPacking).expect("toy state");
+    Arc::new(PirInstance::new(
+        InstanceId::new(INSTANCE_ID),
+        InstanceRole::Live,
+        state,
+    ))
+}
+
+fn router_over(instance: &Arc<PirInstance<RavenInspireScheme>>) -> axum::Router {
+    let mut engine: Engine<RavenInspireScheme> = Engine::new();
+    engine
+        .register_instance(Arc::clone(instance))
+        .expect("register instance");
+    let cfg = HttpConfig::demo(READ_TOKEN);
+    let app_state = {
+        let _g = APPSTATE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        AppState::new(engine, cfg).expect("appstate")
+    };
+    build_router(app_state)
 }
 
 /// `PeerIpKeyExtractor` (governor) requires `ConnectInfo<SocketAddr>`;
@@ -262,13 +290,21 @@ async fn params_handler_invalidates_etag_on_epoch_bump() {
         .expect("ascii")
         .to_owned();
 
-    // Different DB contents, so the body bytes and their SHA-256 must differ.
+    // What forces a distinct digest is the `epoch` field inside the body, not this DB:
+    // `swap_state` refuses any epoch that does not advance, so one (instance, epoch) key
+    // can only ever name one body. The DB differs so the swapped-in state is genuinely a
+    // different state, but the assertion below does not rest on that.
     let params = InspireParams::secure_128_d2048();
     let db_v2: Vec<u8> = (0..TOY_ENTRIES)
         .flat_map(|i| {
             (0..TOY_ENTRY_BYTES).map(move |j| u8::try_from((i + j + 7) % 251).expect("< 251"))
         })
         .collect();
+    assert_ne!(
+        db_v2,
+        raven_railgun_testkit::toy_db(TOY_ENTRIES, TOY_ENTRY_BYTES),
+        "fixture: v2 DB must differ from the testkit DB or the swap stops swapping state"
+    );
     let (new_state, _sk) =
         setup_state(&params, &db_v2, TOY_ENTRY_BYTES, InspireVariant::TwoPacking)
             .expect("toy state v2");
@@ -311,4 +347,63 @@ async fn params_handler_invalidates_etag_on_epoch_bump() {
         .to_str()
         .expect("ascii");
     assert_eq!(epoch_hdr, next_epoch.0.to_string());
+
+    // The body's own epoch is what makes the (instance, epoch) cache key sound; a header
+    // that advances over a body that did not would hand every client a stale digest to
+    // cache under the new epoch.
+    let decoded: InstanceParams = read_versioned(&body_bytes(resp2).await).expect("decode body");
+    assert_eq!(
+        decoded.epoch, next_epoch.0,
+        "the served params body must carry the advanced epoch"
+    );
+}
+
+/// A 304 must not need a warm per-process ETag cache. A client that kept a valid ETag
+/// across a restart reaches the recompute path instead, where the comparison is made
+/// against a freshly hashed body; without it every such client re-downloads the CRS.
+///
+/// Two `AppState`s over ONE `PirInstance`: byte-identical bodies, independent caches.
+#[tokio::test]
+async fn cold_etag_cache_still_serves_304_for_a_matching_if_none_match() {
+    let instance = build_shared_instance();
+    let warm = router_over(&instance);
+    let cold = router_over(&instance);
+
+    let resp1 = warm
+        .oneshot(build_params_request(READ_TOKEN))
+        .await
+        .expect("oneshot warm");
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let etag = resp1
+        .headers()
+        .get(header::ETAG)
+        .expect("etag")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+
+    let resp2 = cold
+        .oneshot(build_params_request_inm(READ_TOKEN, &etag))
+        .await
+        .expect("oneshot cold");
+    assert_eq!(
+        resp2.status(),
+        StatusCode::NOT_MODIFIED,
+        "a matching If-None-Match must 304 even when this process has never \
+         hashed this body before"
+    );
+    let etag2 = resp2
+        .headers()
+        .get(header::ETAG)
+        .expect("etag on cold 304")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    // Recomputed from the cold router's own body, so equality is also the proof that the
+    // two states really do serialize identically and the 304 is not an accident.
+    assert_eq!(etag2, etag, "the cold 304 must echo the same ETag");
+    assert!(
+        body_bytes(resp2).await.is_empty(),
+        "a 304 must carry no body"
+    );
 }

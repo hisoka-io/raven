@@ -3,6 +3,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { RavenError, RavenPOINodeInterface } from "../src/index";
+import { makeRegisterSpy } from "./helpers/register_spy";
 import type { ClientPirContext, RavenInspireWasm } from "../src/index";
 
 import { startMockServer, type MockServer } from "./helpers/mock_server";
@@ -22,7 +23,7 @@ function stubWasm(): RavenInspireWasm {
     },
     extract_response: () => new Uint8Array(0),
     build_instance_params_blob: (_a, _b) => new Uint8Array(0),
-    register_client_session: () => {},
+    register_client_session: makeRegisterSpy(),
     path_indices_for_leaf: () => new Uint32Array(16),
     path_indices_for_per_list_leaf: () => new Uint32Array(16),
   };
@@ -110,6 +111,9 @@ describe("client-PIR routing + pre-flight", () => {
     await expect(
       sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]),
     ).rejects.toThrow(/idx unknown/);
+    // The throw has to come BEFORE any wire call: a query for a BC the client cannot place
+    // in the list would publish the lookup to the server the PIR path exists to blind.
+    expect(sdk.lastWireRequests().length).toBe(0);
   });
 
   it("getMerkleProof client-PIR mode missing context throws", async () => {
@@ -237,7 +241,7 @@ describe("client-PIR routing + pre-flight", () => {
       });
   });
 
-  it("captured request ring is bounded at 64 entries", async () => {
+  it("captured request ring is bounded at exactly the 64-entry cap", async () => {
     server.route(
       () => true,
       (_req, _body, res) => {
@@ -251,15 +255,22 @@ describe("client-PIR routing + pre-flight", () => {
       bearerToken: TOKEN,
       useClientPir: true,
     });
+    // Mirrors the cap literal in captureRequest (src/raven-poi-node-interface.ts); the ring
+    // retains ~19 KB per slot including plaintext blinded commitments on the passthrough
+    // routes, so its size is a security-relevant quantity, not a nicety.
+    const WIRE_RING_CAP = 64;
     // each fetch 404s but records into the ring first; 70 > the 64 cap
-    for (let i = 0; i < 70; i += 1) {
+    for (let i = 0; i < WIRE_RING_CAP + 6; i += 1) {
       try {
         await sdk.fetchBcToIdxMap(LIST_KEY_HEX);
       } catch {
       }
     }
+    // toBe, not toBeLessThanOrEqual: zero satisfied the old bound, so the test stayed
+    // green with capture deleted outright (mutation M4, w4d-sdk). Equality is the only
+    // form that both catches unbounded growth AND proves capture still happens.
     const wires = sdk.lastWireRequests();
-    expect(wires.length).toBeLessThanOrEqual(64);
+    expect(wires.length).toBe(WIRE_RING_CAP);
   });
 
   it("resetWireCapture clears the ring", async () => {
@@ -285,7 +296,7 @@ describe("client-PIR routing + pre-flight", () => {
     expect(sdk.lastWireRequests().length).toBe(0);
   });
 
-  it("lastWireRequests returns a defensive copy (cannot mutate the ring)", async () => {
+  it("lastWireRequests returns a fresh array (pushes cannot grow the ring)", async () => {
     server.route(
       () => true,
       (_req, _body, res) => {
@@ -304,8 +315,50 @@ describe("client-PIR routing + pre-flight", () => {
     }
     const ring1 = sdk.lastWireRequests();
     const len1 = ring1.length;
+    expect(len1).toBeGreaterThan(0);
     ring1.push({ url: "evil", method: "POST", body: new Uint8Array(0) });
     const ring2 = sdk.lastWireRequests();
     expect(ring2.length).toBe(len1);
+  });
+
+  it("PINS A LIVE ALIASING HAZARD: lastWireRequests bodies alias the retained ring buffers", async () => {
+    // CHARACTERIZATION, not an endorsement. `.map()` makes the ARRAY fresh
+    // unconditionally (the test above cannot fail for any implementation), but the copy
+    // is shallow: `body: r.body` passes the retained buffer by reference
+    // (src/raven-poi-node-interface.ts lastWireRequests). Those buffers carry plaintext
+    // blinded commitments on the passthrough routes, so a caller handing the snapshot to
+    // a logger that normalises in place corrupts the SDK's own retained state. The
+    // one-line fix a repair must make is `body: new Uint8Array(r.body)` — and it must
+    // INVERT this assertion (owner-side src change; this lane's src surface is frozen).
+    server.route(
+      () => true,
+      (_req, _body, res) => {
+        res.writeHead(404);
+        res.end();
+        return true;
+      },
+    );
+    const sdk = new RavenPOINodeInterface({
+      endpoint: server.url,
+      bearerToken: TOKEN,
+      useClientPir: false,
+    });
+    try {
+      // Legacy JSON path: captureRequest records a NON-EMPTY body before the fetch 404s.
+      await sdk.getPOIsPerList(
+        [LIST_KEY_HEX],
+        [{ blindedCommitment: BC_HEX, type: "Shield" }],
+      );
+    } catch {
+    }
+    const ring1 = sdk.lastWireRequests();
+    expect(ring1.length).toBeGreaterThan(0);
+    expect(ring1[0].body.length).toBeGreaterThan(0);
+    const before = sdk.lastWireRequests()[0].body[0];
+    ring1[0].body[0] = before ^ 0xff;
+    const after = sdk.lastWireRequests()[0].body[0];
+    expect(after, "bodies are currently ALIASED; a defensive copy flips this to before").toBe(
+      before ^ 0xff,
+    );
   });
 });

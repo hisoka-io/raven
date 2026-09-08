@@ -175,7 +175,8 @@ fn dispatch_sweep(
 }
 
 #[test]
-#[ignore = "multi-instance setup is heavy (~7s x 6 = ~45s); ~120s total wall"]
+#[ignore = "multi-instance setup is heavy (~7s x 6 = ~45s); ~120s total. Trigger: changing \
+            per-instance isolation or the shared thread pool."]
 fn multi_instance_throughput_at_production_cell() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(8)

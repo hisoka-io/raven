@@ -11,7 +11,8 @@
     clippy::format_push_string,
     clippy::cast_possible_truncation,
     clippy::manual_assert,
-    clippy::used_underscore_items
+    clippy::used_underscore_items,
+    clippy::too_many_lines
 )]
 
 use std::fs;
@@ -54,6 +55,56 @@ struct FixtureMeta {
     bcs_hex: Vec<String>,
 }
 
+#[derive(serde::Serialize)]
+struct ManifestFile {
+    name: String,
+    bytes: u64,
+    sha256: String,
+}
+
+/// One-run provenance stamp. The pre-manifest fixture was assembled across two
+/// runs (mixed mtimes), which is undetectable without this.
+#[derive(serde::Serialize)]
+struct FixtureManifest {
+    generator: &'static str,
+    generator_git_commit: String,
+    generated_unix_ms: u128,
+    inspire_params: raven_inspire::params::InspireParams,
+    entry_size: usize,
+    num_indices: u32,
+    files: Vec<ManifestFile>,
+}
+
+fn git_commit() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map_or_else(
+            || "unknown".to_string(),
+            |o| String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        )
+}
+
+/// sha256 via coreutils, so the manifest needs no new crate in this workspace.
+fn sha256_file(path: &Path) -> String {
+    let out = std::process::Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .expect("run sha256sum (coreutils)");
+    assert!(
+        out.status.success(),
+        "sha256sum failed for {}",
+        path.display()
+    );
+    let text = String::from_utf8(out.stdout).expect("sha256sum utf-8");
+    text.split_whitespace()
+        .next()
+        .expect("sha256sum output shape")
+        .to_string()
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -64,7 +115,10 @@ fn main() {
 
     let params = test_params();
 
-    // Row shape [status, bc[1..32]] mirrors the PerListStatus encoder.
+    // Row shape [status, bc[0..31]] mirrors PerListStatusEncoder::materialize_shard
+    // (engine/src/pir_table/list.rs): status byte, then the FIRST record_size-1 BC
+    // bytes. The first cut of this file wrote bc[1..32] and shipped a fixture whose
+    // rows disagreed with production, so decodeStatusRow could never pass on it.
     let num_entries = params.ring_dim;
     let mut db = vec![0u8; num_entries * ENTRY_BYTES];
     for idx in 0..(num_entries as u32) {
@@ -73,7 +127,7 @@ fn main() {
         let row_end = row_start + ENTRY_BYTES;
         let row = &mut db[row_start..row_end];
         row[0] = (idx % 4) as u8;
-        row[1..32].copy_from_slice(&bc[1..32]);
+        row[1..32].copy_from_slice(&bc[0..31]);
     }
 
     let mut sampler = GaussianSampler::new(params.sigma);
@@ -127,6 +181,26 @@ fn main() {
             (idx % 4) as u8,
             "status byte mismatch at idx {idx}"
         );
+        assert_eq!(
+            &plain[1..32],
+            &bc[0..31],
+            "row BC tail disagrees with the production encoder shape at idx {idx}"
+        );
+
+        // The state and plaintext were always computed here and then discarded, which
+        // is why the offline TS suite could never run the real decode: the responses
+        // shipped without the client state that produced them.
+        let state_bin = bincode::serialize(&state).expect("serialize state");
+        fs::write(
+            out.join(format!("client_state_for_idx_{idx}.bin")),
+            state_bin,
+        )
+        .expect("write state");
+        fs::write(
+            out.join(format!("expected_plain_for_idx_{idx}.bin")),
+            &plain,
+        )
+        .expect("write plain");
 
         let resp_bin = bincode::serialize(&resp).expect("serialize response");
         fs::write(out.join(format!("response_for_idx_{idx}.bin")), resp_bin).expect("write resp");
@@ -140,6 +214,48 @@ fn main() {
     };
     let meta_json = serde_json::to_vec_pretty(&meta).expect("serialize meta");
     fs::write(out.join("fixture.json"), meta_json).expect("write meta");
+
+    let mut file_names: Vec<String> = vec![
+        "inspire_params.bin".into(),
+        "crs.bin".into(),
+        "shard_config.bin".into(),
+        "params_bundle.bin".into(),
+        "list_key.bin".into(),
+        "fixture.json".into(),
+    ];
+    for idx in 0..NUM_FIXTURE_INDICES {
+        file_names.push(format!("bc_for_idx_{idx}.bin"));
+        file_names.push(format!("client_state_for_idx_{idx}.bin"));
+        file_names.push(format!("expected_plain_for_idx_{idx}.bin"));
+        file_names.push(format!("response_for_idx_{idx}.bin"));
+    }
+    let files = file_names
+        .into_iter()
+        .map(|name| {
+            let path = out.join(&name);
+            let bytes = fs::metadata(&path).expect("stat emitted file").len();
+            let sha256 = sha256_file(&path);
+            ManifestFile {
+                name,
+                bytes,
+                sha256,
+            }
+        })
+        .collect();
+    let manifest = FixtureManifest {
+        generator: "emit_test_fixture",
+        generator_git_commit: git_commit(),
+        generated_unix_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis(),
+        inspire_params: params.clone(),
+        entry_size: ENTRY_BYTES,
+        num_indices: NUM_FIXTURE_INDICES,
+        files,
+    };
+    let manifest_json = serde_json::to_vec_pretty(&manifest).expect("serialize manifest");
+    fs::write(out.join("fixture_manifest.json"), manifest_json).expect("write manifest");
 
     drop(_unused_witness((crs, encoded_db)));
     let _ = RlweSecretKey::clone(&sk);

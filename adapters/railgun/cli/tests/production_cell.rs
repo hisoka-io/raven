@@ -1,6 +1,21 @@
-//! Production-cell integration test (`#[ignore]`-gated).
-//! Exercises the full HTTP stack against the locked T2/T3 production
+//! Production-cell BYTE IDENTITY over the full HTTP stack, at the locked T2/T3
 //! cell: 65,536 entries x 512 B records (16 x 32 B Merkle siblings).
+//!
+//! This half carries NO wall-clock assertion. It used to: the same function
+//! asserted a 300 ms single-query ceiling and a 3 s batch ceiling, and those
+//! deadlines are why the durability lane excluded it by name — it measured
+//! 402 ms under lane load while passing at 19.9 s standalone, i.e. it red on
+//! machine speed rather than on code. The consequence was that the lane named
+//! `binary(production_cell)` and ran ZERO tests from it, so the byte-identity
+//! assertions — the ones that catch silent-wrong-bytes at production
+//! parameters — were reachable by nobody.
+//!
+//! The deadlines now live in `benches/production_cell_budget_bench.rs` as an
+//! SLO gate. Nothing is lost by the split: a deadline could only ever fail on
+//! runner speed, and the assertions kept here are the ones that fail on wrong
+//! bytes. Note that the b1 bench baseline is 2^16 x 32 B while this cell is
+//! 2^16 x 512 B, so the baseline does NOT cover this shape and must not be
+//! cited as if it did.
 
 #![allow(
     clippy::expect_used,
@@ -9,214 +24,72 @@
     clippy::print_stderr
 )]
 
-use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use raven_inspire::ServerResponse;
 
-use raven_inspire::params::{InspireParams, InspireVariant};
-use raven_inspire::{ServerResponse, ServerSessionHandle};
-use raven_railgun_core::InstanceId;
-use raven_railgun_engine::inspire::{
-    build_client_session, build_seeded_query, extract_response, register_client_session,
-    setup_state, RavenInspireScheme,
-};
-use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
-use raven_railgun_http::{inspire_router, AppState, HttpConfig};
-use tokio::sync::oneshot;
+#[path = "support/production_cell.rs"]
+mod support;
 
-const BEARER_TOKEN: &str = "production-cell-test-token";
-const PRODUCTION_INSTANCE_ID: &str = "ppoi-paths-ofac";
-const ENTRIES_LOG2: usize = 16;
-/// 16 siblings x 32 B per Merkle path.
-const ENTRY_BYTES: usize = 512;
-
-fn entries() -> usize {
-    1usize << ENTRIES_LOG2
-}
-
-#[allow(clippy::cast_possible_truncation)]
-fn build_synthetic_db(n_entries: usize, entry_bytes: usize) -> Vec<u8> {
-    (0..n_entries)
-        .flat_map(|i| (0..entry_bytes).map(move |j| ((i * 31 + j * 17) % 251) as u8))
-        .collect()
-}
+use support::{ProductionCell, BATCH_WIDTH, BEARER_TOKEN, ENTRY_BYTES};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "production-cell setup is heavy (~4-8s) and exercises the full stack"]
-#[allow(clippy::too_many_lines)]
-async fn production_cell_round_trip_and_batch_within_budget() {
-    let setup_start = Instant::now();
-    let params = InspireParams::secure_128_d2048();
-    let db = build_synthetic_db(entries(), ENTRY_BYTES);
-    let (server_state, secret_key) =
-        setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("setup_state");
-    let mut client_session =
-        build_client_session((*server_state.crs).clone(), secret_key.clone(), &params)
-            .expect("build_client_session");
-    let session_handle: ServerSessionHandle = {
-        register_client_session(&mut client_session, &server_state).expect("register session");
-        client_session
-            .session_handle()
-            .expect("session_handle was set by register_client_session")
-    };
-
-    let mut engine: Engine<RavenInspireScheme> = Engine::new();
-    engine
-        .add_instance(PirInstance::new(
-            InstanceId::new(PRODUCTION_INSTANCE_ID),
-            InstanceRole::Live,
-            server_state,
-        ))
-        .expect("add instance");
-
-    let mut http_config = HttpConfig::demo(BEARER_TOKEN.to_owned());
-    http_config.max_concurrent_queries = 4;
-    let app_state = AppState::new(engine, http_config).expect("AppState init");
-    let setup_elapsed = setup_start.elapsed();
-    eprintln!("production_cell: setup elapsed = {setup_elapsed:?}");
-
-    let server_state_arc = app_state
-        .engine
-        .instance(&InstanceId::new(PRODUCTION_INSTANCE_ID))
-        .expect("instance present")
-        .current_state();
-
-    let router = inspire_router(app_state.clone()).expect("router");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind loopback");
-    let addr = listener.local_addr().expect("local addr");
-    let (ready_tx, ready_rx) = oneshot::channel::<()>();
-    let server_handle = tokio::spawn(async move {
-        let _ = ready_tx.send(());
-        let _ = axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await;
-    });
-    ready_rx.await.expect("server ready");
-
-    let _ = session_handle; // registered in-process; HTTP queries use it
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .expect("reqwest client");
+#[ignore = "~12 s of setup_state at the 65,536 x 512 B cell plus a full HTTP round trip. Trigger: \
+            changing the HTTP query or batch path, the two-packing extract, or the cell shape. \
+            Runs in the durability + closure cli-ignored lane."]
+async fn production_cell_round_trip_byte_identity() {
+    let cell = ProductionCell::spawn().await;
+    eprintln!("production_cell: setup elapsed = {:?}", cell.setup_elapsed);
+    let client = ProductionCell::client();
 
     let target_index: u64 = 31_415;
-    let (client_state, query) = build_seeded_query(
-        &client_session,
-        server_state_arc.shard_config(),
-        target_index,
-        &params,
-    )
-    .expect("build_seeded_query");
-    let query_bytes =
-        raven_railgun_http::write_versioned(&query).expect("serialize query (versioned)");
-
-    let url = format!("http://{addr}/v1/instance/{PRODUCTION_INSTANCE_ID}/query");
-    let single_start = Instant::now();
+    let (client_state, query_bytes) = cell.seeded_query(target_index);
     let response = client
-        .post(&url)
+        .post(cell.query_url())
         .bearer_auth(BEARER_TOKEN)
         .body(query_bytes)
         .send()
         .await
         .expect("POST query");
     assert_eq!(response.status(), 200, "HTTP status");
-    let single_total = single_start.elapsed();
-    eprintln!("production_cell: single-query total = {single_total:?}");
 
     let body = response.bytes().await.expect("body bytes");
     let server_response: ServerResponse =
         raven_railgun_http::read_versioned(&body).expect("deserialize ServerResponse (versioned)");
-    let plaintext = extract_response(
-        &server_state_arc.crs,
-        &client_state,
-        &server_response,
-        ENTRY_BYTES,
-    )
-    .expect("extract");
-
-    let target_idx_usize = usize::try_from(target_index).expect("fits in usize");
-    let expected = db
-        .get(target_idx_usize * ENTRY_BYTES..(target_idx_usize + 1) * ENTRY_BYTES)
-        .expect("planted slice in range");
+    let plaintext = cell.decode(&client_state, &server_response);
     assert_eq!(
         plaintext.get(..ENTRY_BYTES),
-        Some(expected),
+        Some(cell.planted(target_index)),
         "single-query byte equality"
     );
 
-    // 300ms ceiling leaves headroom over the ~72ms floor for HTTP/serde/host noise
-    assert!(
-        single_total < Duration::from_millis(300),
-        "single query total RT regressed: {single_total:?} (production floor 71.9 ms total)"
-    );
-
-    let mut batch_queries = Vec::with_capacity(16);
-    let mut client_states = Vec::with_capacity(16);
-    let mut targets = Vec::with_capacity(16);
-    for k in 0..16u64 {
-        let idx = target_index.wrapping_add(k * 911) % (entries() as u64);
-        targets.push(idx);
-        let (cs, q) = build_seeded_query(
-            &client_session,
-            server_state_arc.shard_config(),
-            idx,
-            &params,
-        )
-        .expect("build_seeded_query");
-        client_states.push(cs);
-        batch_queries.push(q);
-    }
-    let batch_bytes =
-        raven_railgun_http::write_versioned(&batch_queries).expect("serialize batch (versioned)");
-
-    let batch_url = format!("http://{addr}/v1/instance/{PRODUCTION_INSTANCE_ID}/batch");
-    let batch_start = Instant::now();
+    let (client_states, targets, batch_bytes) = cell.seeded_batch(target_index);
     let batch_response = client
-        .post(&batch_url)
+        .post(cell.batch_url())
         .bearer_auth(BEARER_TOKEN)
         .body(batch_bytes)
         .send()
         .await
         .expect("POST batch");
     assert_eq!(batch_response.status(), 200, "batch HTTP status");
-    let batch_total = batch_start.elapsed();
-    eprintln!("production_cell: batch (16 queries) total = {batch_total:?}");
 
     let batch_body = batch_response.bytes().await.expect("batch body");
     let responses: Vec<ServerResponse> =
         raven_railgun_http::read_batch_response_versioned(&batch_body)
             .expect("deserialize batch (versioned)");
-    assert_eq!(responses.len(), 16, "batch returned 16 responses");
+    assert_eq!(
+        responses.len(),
+        BATCH_WIDTH,
+        "batch returned every response"
+    );
 
     for (k, (cs, response)) in client_states.iter().zip(responses.iter()).enumerate() {
         let idx = *targets.get(k).expect("target idx in range");
-        let plaintext =
-            extract_response(&server_state_arc.crs, cs, response, ENTRY_BYTES).expect("extract");
-        let expected = db
-            .get(
-                usize::try_from(idx).expect("fits in usize") * ENTRY_BYTES
-                    ..(usize::try_from(idx).expect("fits in usize") + 1) * ENTRY_BYTES,
-            )
-            .expect("planted slice in range");
+        let plaintext = cell.decode(cs, response);
         assert_eq!(
             plaintext.get(..ENTRY_BYTES),
-            Some(expected),
+            Some(cell.planted(idx)),
             "batch byte equality at k={k}, idx={idx}"
         );
     }
 
-    // /batch runs queries serially; each already saturates rayon per-shard, so
-    // par_iter would thrash the global pool. Floor 16 x ~75ms = ~1.2s; 3s budget
-    // absorbs HTTP + WSL2 variance.
-    assert!(
-        batch_total < Duration::from_secs(3),
-        "batch total RT regressed: {batch_total:?} (sequential floor ~1.2 s)"
-    );
-
-    server_handle.abort();
-    let _ = server_handle.await;
+    cell.shutdown().await;
 }

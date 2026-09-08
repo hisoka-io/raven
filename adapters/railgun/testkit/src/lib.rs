@@ -6,8 +6,8 @@
 //!
 //! The crate exists for three things: ONE definition of the toy database formula, ONE clamping
 //! and ONE zero-admitting commitment helper (they are not interchangeable - see [`canonical`]),
-//! and [`toy_state_with_key`], which removes the pattern of building a second throwaway state
-//! purely to obtain a secret key.
+//! and [`toy_secret_key`], which removes the pattern of building a whole server state and
+//! discarding it just to obtain a key.
 //!
 //! It is NOT a wall-time mechanism. See [`cached_toy_state`] for why, and what was measured.
 //!

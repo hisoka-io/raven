@@ -375,22 +375,8 @@ async fn mirror_emits_ppoi_list_leaf_added_for_each_event() {
     server_handle.abort();
 }
 
-/// `/pois-per-blinded-commitment` is status-only and must contribute no
-/// IMT-growth events; `fetch_status_typed` has no `WalEntryPayload` channel.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mirror_pois_per_blinded_commitment_only_emits_status_no_imt_grow() {
-    let (url, _state, server_handle) = start_mock().await;
-    let mirror = build_mirror(url);
-    let list = ListKey([0; 32]);
-    let bc = BlindedCommitment::from_bytes([0x77; 32]);
-
-    let got = mirror
-        .fetch_status_typed(&list, &bc, BlindedCommitmentType::Shield)
-        .await
-        .expect("fetch_status_typed");
-    assert_eq!(got, POIStatus::Valid);
-    // Structural, not runtime: `run_worker_with_cursor` is the only payload
-    // emitter, so a side-channel would have to change this trait signature.
-    let _: POIStatus = got;
-    server_handle.abort();
-}
+// A `mirror_pois_per_blinded_commitment_only_emits_status_no_imt_grow` test stood here. Its only
+// runtime assertion duplicated `fetch_status_typed_posts_correct_body_and_decodes_each_status`
+// above verbatim, and its named no-IMT-growth property is enforced by the `fetch_status_typed`
+// signature itself (no payload channel), so no runtime assertion for it can exist: any mutation
+// that could red it must red the line-211 test first.

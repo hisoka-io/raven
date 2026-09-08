@@ -1,4 +1,4 @@
-//! Kill-mid-fold recovery, append past a shard boundary, and fold-while-serving.
+//! Kill-mid-fold recovery, and folding past a shard boundary while serving.
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -86,6 +86,15 @@ fn append_past_shard_boundary() {
     );
 
     demo.fold().expect("fold");
+
+    // An account the block never touched must survive the fold byte-identically. Absorbed from
+    // fold_while_serving, whose Sidecar-then-Main half this test already asserted verbatim
+    // (shared kill proven: forcing the sidecar leg to win reds both at their post-fold read).
+    // Asserted here, where the fold also grew a shard, rather than over a plain fold.
+    let untouched = demo.accounts[200];
+    let (ok_u, _) = demo.read_verify(&untouched).expect("untouched read");
+    assert!(ok_u, "untouched account byte-identical across the fold");
+
     let (ok, eng) = demo.read_verify(&newaddr).expect("post-fold read appended");
     assert!(
         ok,
@@ -120,35 +129,4 @@ fn zero_balance_heals_via_tag() {
     demo.fold().expect("fold");
     let (ok_post, _eng) = demo.read_verify(&addr).expect("post-fold read");
     assert!(ok_post, "still correct after the fold");
-}
-
-#[test]
-#[serial]
-fn fold_while_serving() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut demo = Demo::new(3000, 1_000_000, dir.path(), 0x0000_F01D).expect("demo");
-    let addr = demo.accounts[123];
-    demo.apply_block(1, &[(addr, 555_555)]).expect("apply");
-
-    let (ok_pre, eng_pre) = demo.read_verify(&addr).expect("pre-fold read");
-    assert!(ok_pre, "pre-fold read byte-identical");
-    assert_eq!(
-        eng_pre,
-        AnsweringEngine::Sidecar,
-        "pre-fold: sidecar serves the fresh value"
-    );
-
-    demo.fold().expect("fold");
-
-    let (ok_post, eng_post) = demo.read_verify(&addr).expect("post-fold read");
-    assert!(ok_post, "post-fold read byte-identical");
-    assert_eq!(
-        eng_post,
-        AnsweringEngine::Main,
-        "post-fold: main serves the folded value"
-    );
-
-    let untouched = demo.accounts[200];
-    let (ok_u, _) = demo.read_verify(&untouched).expect("untouched read");
-    assert!(ok_u, "untouched account byte-identical across the fold");
 }

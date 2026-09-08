@@ -58,9 +58,9 @@ impl PirScheme for EchoScheme {
     }
 }
 
-fn build_state() -> AppState<EchoScheme> {
+fn try_build_state(instance_id: &str) -> Result<AppState<EchoScheme>, String> {
     let instance: Arc<PirInstance<EchoScheme>> = Arc::new(PirInstance::new(
-        InstanceId::new(INSTANCE),
+        InstanceId::new(instance_id),
         InstanceRole::Static,
         EchoState,
     ));
@@ -79,20 +79,41 @@ fn build_state() -> AppState<EchoScheme> {
     let _g = APPSTATE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    AppState::new(engine, cfg).expect("appstate")
+    AppState::new(engine, cfg)
 }
 
+fn build_state() -> AppState<EchoScheme> {
+    try_build_state(INSTANCE).expect("appstate")
+}
+
+/// `AppState::new` installs a PROCESS-global Prometheus recorder, and the second install
+/// is the one that fails. Serving two schemes, or rebuilding state on a config reload,
+/// both do this - so the second call is asserted directly rather than through a helper's
+/// `expect`, which reads as setup rather than as the property.
+///
+/// Not redundant with the other tests in this file, though it looks it: nextest runs one
+/// PROCESS PER TEST, so every other test here is the FIRST caller in its own process and
+/// never reaches the reuse path. Mutation-proved - severing both reuse paths in
+/// `global_prometheus_handle` reds this test and only this test.
 #[test]
 fn appstate_new_is_idempotent_for_describe_prometheus_metrics() {
-    let s1 = build_state();
-    let s2 = build_state();
-    drop(s1);
-    drop(s2);
+    let first = try_build_state("idempotent-first").expect("first AppState::new");
+    let second = try_build_state("idempotent-second");
+    assert!(
+        second.is_ok(),
+        "a second AppState::new in one process must not fail on the global recorder: {:?}",
+        second.err()
+    );
+    drop(first);
+    drop(second);
 }
 
+/// `Clone` must stay O(1). Retention of the map is covered end-to-end by the scrape and
+/// readiness tests; what only a strong-count can see is a `Clone` that deep-copies the
+/// HashMap, because every rendered value stays correct while axum pays for a copy of it
+/// on every request.
 #[test]
 fn with_instance_metrics_builder_round_trips_map() {
-    // The handler clones state per scrape; a dropped Arc loses the gauges.
     let cell = Arc::new(parking_lot::Mutex::new(ConsumerMetrics {
         last_applied_block: 12_345_678,
         last_scanned_block: 12_345_678,
@@ -127,7 +148,8 @@ fn with_instance_metrics_builder_round_trips_map() {
     assert_eq!(
         Arc::strong_count(&cell),
         2,
-        "Clone must NOT deep-clone the map; per-entry Arcs stay at strong-count 2"
+        "Clone must NOT deep-clone the map; a deep copy bumps this to 3 and is invisible \
+         in every rendered gauge"
     );
 
     drop(state);
@@ -157,11 +179,77 @@ fn with_instance_metrics_builder_round_trips_map() {
     );
 }
 
-#[test]
-fn with_instance_metrics_empty_map_is_legal_default() {
+/// An empty per-instance map is the single-consumer deployment, and it is not a no-op: the
+/// scrape falls back to the one `with_consumer_metrics` cell and labels it with the first
+/// registered instance. Without that branch a single-instance operator's consumer gauges
+/// vanish from the dashboard while `/metrics` still answers 200 with every other row.
+///
+/// `/v1/health/ready` has the same fallback and its own test; this is the `/metrics` half.
+#[tokio::test(flavor = "current_thread")]
+async fn empty_instance_metrics_map_falls_back_to_the_single_consumer_cell() {
+    use axum::body::Body;
+    use axum::http::{header, Method, Request, StatusCode};
+    use http_body_util::BodyExt;
+    use std::net::SocketAddr;
+    use tower::ServiceExt;
+
+    const FALLBACK_INSTANCE: &str = "single-cell-fallback";
+    const APPLIED: u64 = 19_000_007;
+    const SCANNED: u64 = 19_000_009;
+
+    let cell = Arc::new(parking_lot::Mutex::new(ConsumerMetrics {
+        last_applied_block: APPLIED,
+        last_scanned_block: SCANNED,
+        ..ConsumerMetrics::default()
+    }));
     let empty: HashMap<InstanceId, Arc<parking_lot::Mutex<ConsumerMetrics>>> = HashMap::new();
-    let state = build_state().with_instance_metrics(empty);
-    let _cloned = state.clone();
+
+    let router = {
+        let state = try_build_state(FALLBACK_INSTANCE)
+            .expect("appstate")
+            .with_consumer_metrics(Arc::clone(&cell))
+            .with_instance_metrics(empty);
+        // Clone is what axum stores per route; the fallback must survive it.
+        let state = state.clone();
+        raven_railgun_http::router::<EchoScheme>(state).expect("router")
+    };
+
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri("/metrics")
+        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .expect("build req");
+    let peer: SocketAddr = "127.0.0.1:50104".parse().expect("addr");
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(peer));
+
+    let resp = router.oneshot(req).await.expect("oneshot");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.expect("body").to_bytes();
+    let text = String::from_utf8(body.to_vec()).expect("utf8");
+
+    // Name AND label together: a `contains` over the whole scrape is satisfied by any other
+    // gauge's instance label, which is exactly the regression this is aimed at.
+    let want = format!("instance=\"{FALLBACK_INSTANCE}\"");
+    let gauge = |name: &str| -> String {
+        text.lines()
+            .find(|l| l.starts_with(&format!("{name}{{")) && l.contains(&want))
+            .unwrap_or_else(|| panic!("scrape emitted no {name} row carrying {want}:\n{text}"))
+            .to_owned()
+    };
+
+    // Values differ between the two gauges so a block reading the neighbouring field is caught.
+    let applied = gauge("raven_railgun_consumer_last_applied_block");
+    assert!(
+        applied.ends_with(&format!(" {APPLIED}")),
+        "the fallback must render the cell's applied height; got: {applied}"
+    );
+    let scanned = gauge("raven_railgun_consumer_last_scanned_block");
+    assert!(
+        scanned.ends_with(&format!(" {SCANNED}")),
+        "the fallback must render the cell's scanned height, not the applied one; got: {scanned}"
+    );
 }
 
 /// Sentinel: the `inspire_router` `/metrics` handler renders the
@@ -170,10 +258,10 @@ fn with_instance_metrics_empty_map_is_legal_default() {
 /// `refresh_dynamic_metrics::engine.instances()` walk these names are
 /// described but never `.set()`, so dashboards see no data row.
 ///
-/// This is a thin smoke test: it asserts the metric names appear
-/// SOMEWHERE in the scrape output with the `instance=...` label. It
-/// does NOT pin specific values (those depend on the engine state
-/// which has no test fixture).
+/// Each gauge is selected by NAME AND `instance` label together, then its value is
+/// pinned. Two `contains` over the whole scrape do not compose into that: the label
+/// half is satisfied by any other gauge's row, so a gauge that lost its `instance`
+/// label - the exact regression named above - still passes.
 #[tokio::test(flavor = "current_thread")]
 async fn metrics_handler_emits_per_instance_engine_gauges() {
     use axum::body::Body;
@@ -229,26 +317,42 @@ async fn metrics_handler_emits_per_instance_engine_gauges() {
     let body = resp.into_body().collect().await.expect("body").to_bytes();
     let text = String::from_utf8(body.to_vec()).expect("utf8");
 
+    // A fresh `PirInstance` fixes every one of these: Epoch::ZERO, Active, Live, nothing
+    // in flight. Pinning them also separates the four gauges from each other, which a
+    // name-only assertion cannot do.
+    let gauge = |name: &str| -> String {
+        let want = "instance=\"metrics-scrape-instance\"";
+        text.lines()
+            .find(|l| l.starts_with(&format!("{name}{{")) && l.contains(want))
+            .unwrap_or_else(|| panic!("scrape emitted no {name} row carrying {want}:\n{text}"))
+            .to_owned()
+    };
+
+    let drain = gauge("raven_railgun_drain_state");
+    assert!(drain.contains("label=\"active\""), "got: {drain}");
     assert!(
-        text.contains("raven_railgun_drain_state{")
-            && text.contains("instance=\"metrics-scrape-instance\""),
-        "scrape must emit per-instance drain_state gauge"
+        drain.ends_with(" 1"),
+        "a fresh instance is active; got: {drain}"
     );
+
+    let in_flight = gauge("raven_railgun_in_flight");
     assert!(
-        text.contains("raven_railgun_in_flight{")
-            && text.contains("instance=\"metrics-scrape-instance\""),
-        "scrape must emit per-instance in_flight gauge"
+        in_flight.ends_with(" 0"),
+        "nothing is in flight at scrape time; got: {in_flight}"
     );
+
+    let epoch = gauge("raven_railgun_epoch");
     assert!(
-        text.contains("raven_railgun_epoch{")
-            && text.contains("instance=\"metrics-scrape-instance\""),
-        "scrape must emit per-instance epoch gauge"
+        epoch.ends_with(" 0"),
+        "an instance that never swapped state is at Epoch::ZERO; got: {epoch}"
     );
+
+    let role = gauge("raven_railgun_role");
     assert!(
-        text.contains("raven_railgun_role{")
-            && text.contains("instance=\"metrics-scrape-instance\""),
-        "scrape must emit per-instance role gauge"
+        role.contains("label=\"live\""),
+        "the fixture registers a Live instance; got: {role}"
     );
+    assert!(role.ends_with(" 1"), "got: {role}");
     assert!(
         text.contains("raven_railgun_uptime_seconds"),
         "scrape must emit process uptime gauge"

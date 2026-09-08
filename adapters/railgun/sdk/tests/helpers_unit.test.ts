@@ -8,6 +8,8 @@ import {
   bytesToHex,
   decodeClientPirQueryBundle,
   statusByteToPOIStatus,
+  PATH_RECORD_BYTES,
+  TREE_DEPTH,
 } from "../src/index";
 
 describe("hex helpers", () => {
@@ -38,6 +40,70 @@ describe("hex helpers", () => {
 
   it("bytesToHex emits lowercase only", () => {
     expect(bytesToHex(new Uint8Array([0xab, 0xcd, 0xef]))).toBe("abcdef");
+  });
+});
+
+describe("hexToBytes DEFECT DH-L0-8: non-hex input is silently accepted and mangled", () => {
+  // CHARACTERIZATION PINS, not endorsements. `Number.parseInt(pair, 16)` returns a
+  // number (not NaN) for any pair whose FIRST character parses — so only the
+  // both-chars-invalid class ('zz', the single case the old test covered) is refused.
+  // hexToBytes is the front door for every blinded commitment the wallet supplies
+  // (client-pir.ts decodeStatusRow BC binding): a typo'd BC does not error, it decodes
+  // to DIFFERENT bytes, the SDK looks up a different index, and a confident verdict
+  // about the wrong commitment comes back. THE INVERSION A FIX MUST MAKE: every case
+  // below must THROW (e.g. validate with /^[0-9a-fA-F]*$/ before decoding) — see the
+  // it.fails trigger test underneath. Fix is owner-reserved (public-API throw surface).
+  it("DEFECT: '4z' decodes to [0x04] instead of throwing", () => {
+    expect(Array.from(hexToBytes("4z"))).toEqual([0x04]);
+  });
+
+  it("DEFECT: '1g2h' decodes to [0x01, 0x02] instead of throwing", () => {
+    expect(Array.from(hexToBytes("1g2h"))).toEqual([0x01, 0x02]);
+  });
+
+  it("DEFECT: '+1' decodes to [0x01] — parseInt accepts a sign", () => {
+    expect(Array.from(hexToBytes("+1"))).toEqual([0x01]);
+  });
+
+  it("DEFECT: ' 1' decodes to [0x01] — parseInt accepts leading whitespace", () => {
+    expect(Array.from(hexToBytes(" 1"))).toEqual([0x01]);
+  });
+
+  // RED until the DH-L0-8 fix lands in src/client-pir.ts hexToBytes. Trigger: when
+  // hexToBytes validates its input (owner ruling on refusal semantics), this flips from
+  // expected-fail to fail and forces the un-marking plus deletion of the pins above.
+  it.fails("hexToBytes rejects every string containing a non-hex character", () => {
+    for (const bad of ["4z", "1g2h", "+1", " 1"]) {
+      expect(() => hexToBytes(bad), `input ${JSON.stringify(bad)}`).toThrow(/invalid hex/);
+    }
+    // Seeded xorshift32 sweep: even-length strings over a mixed alphabet; any string
+    // with a character outside [0-9a-fA-F] must throw. No new devDependency.
+    const alphabet = "0123456789abcdefABCDEFghzZ+ .-_!";
+    let s = 0x9e3779b9 | 0;
+    const next = (): number => {
+      s ^= s << 13;
+      s ^= s >>> 17;
+      s ^= s << 5;
+      return (s >>> 0) % alphabet.length;
+    };
+    for (let i = 0; i < 512; i += 1) {
+      const len = 2 * (1 + ((next() >>> 0) % 4));
+      let str = "";
+      for (let j = 0; j < len; j += 1) {
+        str += alphabet[next()];
+      }
+      if (/^[0-9a-fA-F]*$/.test(str)) continue;
+      expect(() => hexToBytes(str), `input ${JSON.stringify(str)}`).toThrow(/invalid hex/);
+    }
+  });
+});
+
+describe("path record constants", () => {
+  it("PATH_RECORD_BYTES pins the per-leaf path record to 16 levels x 32 B = 512", () => {
+    // Wire-relevant: PerLeafPath/PerListPath PIR cells are exactly this many bytes
+    // (engine pir_table PATH_RECORD_BYTES); a drift silently misaligns every path row.
+    expect(PATH_RECORD_BYTES).toBe(512);
+    expect(PATH_RECORD_BYTES).toBe(TREE_DEPTH * 32);
   });
 });
 
@@ -104,9 +170,14 @@ describe("statusByteToPOIStatus", () => {
   it("maps 3 -> Missing", () => {
     expect(statusByteToPOIStatus(3)).toBe("Missing");
   });
-  it("maps unknown -> Missing (defensive)", () => {
-    expect(statusByteToPOIStatus(99)).toBe("Missing");
-    expect(statusByteToPOIStatus(255)).toBe("Missing");
+  // PINS A SILENT DOWNGRADE, not a design choice. Any byte outside 0..3 is a row the SDK
+  // does not understand, and it is answered with a real verdict instead of an error. A future
+  // status the server adds -- or a corrupted byte a shorter row cannot bind -- reads as
+  // "no record", which is the non-blocking answer. Raising a DecodeError here is the fix.
+  it("maps every unknown byte to Missing instead of refusing the row", () => {
+    for (const b of [4, 5, 99, 128, 255]) {
+      expect(statusByteToPOIStatus(b), `byte ${b}`).toBe("Missing");
+    }
   });
 });
 
