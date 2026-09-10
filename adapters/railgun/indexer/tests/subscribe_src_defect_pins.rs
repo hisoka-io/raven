@@ -1,14 +1,4 @@
-//! RED pins for two KNOWN `subscribe.rs` defects, kept `#[ignore]`d so CI
-//! stays green until the fixes land. Run with `--run-ignored` to see them red.
-//!
-//! 1. `handle_log_frame` never reads `log.removed`: a reorged-out log
-//!    (`removed: true`) is forwarded as a fresh `Event`, re-applying a leaf
-//!    the chain has withdrawn. Trigger: any WS `logs` subscription frame with
-//!    `removed: true` (Geth/Erigon emit these on reorg).
-//! 2. `SubscribeWorker::run` has no gap backfill: events landing between a
-//!    stream close and the next successful open are never delivered. The
-//!    fallback `ChainSource` can serve them via `events_in_range`, but the
-//!    worker never asks. Trigger: any WS reconnect while the chain advances.
+//! Reorg-fence and reconnect-backfill coverage for the subscription worker.
 
 #![allow(
     clippy::expect_used,
@@ -29,8 +19,8 @@ use alloy::sol_types::{SolEvent, SolValue};
 use async_trait::async_trait;
 use raven_railgun_core::RailgunEvent;
 use raven_railgun_indexer::{
-    abi, ChainSource, IndexerMessage, LogStreamer, Result, SubscribeStreams, SubscribeWorker,
-    SubscribeWorkerConfig,
+    abi, ChainSource, IndexerError, IndexerMessage, LogStreamer, Result, SubscribeStreams,
+    SubscribeWorker, SubscribeWorkerConfig,
 };
 use tokio::sync::mpsc;
 
@@ -72,25 +62,48 @@ fn shield_log(block_number: u64, removed: bool) -> alloy::rpc::types::eth::Log {
     }
 }
 
+fn malformed_shield_log(block_number: u64) -> alloy::rpc::types::eth::Log {
+    let mut log = shield_log(block_number, false);
+    log.inner.data = alloy::primitives::LogData::new_unchecked(
+        vec![abi::Shield::SIGNATURE_HASH],
+        Vec::new().into(),
+    );
+    log
+}
+
 /// Serves a per-open script of (heads, logs); each open consumes one script
 /// entry, then the streams close so the worker cycles into its next open.
 #[derive(Debug)]
 struct ScriptedOpens {
-    scripts: Mutex<Vec<(Vec<u64>, Vec<alloy::rpc::types::eth::Log>)>>,
+    scripts: Mutex<Vec<OpenScript>>,
     opens: AtomicU64,
+}
+
+#[derive(Debug)]
+enum OpenScript {
+    Fail,
+    Frames(Vec<u64>, Vec<alloy::rpc::types::eth::Log>),
+    HeldFrames(Vec<u64>, Vec<alloy::rpc::types::eth::Log>, Duration),
 }
 
 #[async_trait]
 impl LogStreamer for ScriptedOpens {
     async fn open(&self) -> Result<SubscribeStreams> {
         self.opens.fetch_add(1, Ordering::SeqCst);
-        let (heads, logs) = {
+        let script = {
             let mut g = self.scripts.lock().expect("poison");
             if g.is_empty() {
-                (Vec::new(), Vec::new())
+                OpenScript::Frames(Vec::new(), Vec::new())
             } else {
                 g.remove(0)
             }
+        };
+        let (heads, logs, hold_open) = match script {
+            OpenScript::Fail => {
+                return Err(IndexerError::Rpc("scripted open failure".into()));
+            }
+            OpenScript::Frames(heads, logs) => (heads, logs, None),
+            OpenScript::HeldFrames(heads, logs, duration) => (heads, logs, Some(duration)),
         };
         let (heads_tx, heads_rx) = mpsc::channel(heads.len() + 1);
         let (logs_tx, logs_rx) = mpsc::channel(logs.len() + 1);
@@ -99,6 +112,12 @@ impl LogStreamer for ScriptedOpens {
         }
         for log in logs {
             logs_tx.try_send(Ok(log)).expect("logs script fits");
+        }
+        if let Some(duration) = hold_open {
+            tokio::spawn(async move {
+                tokio::time::sleep(duration).await;
+                drop((heads_tx, logs_tx));
+            });
         }
         // Both senders drop here: the streams close once drained, forcing the
         // reconnect path under test.
@@ -112,18 +131,28 @@ impl LogStreamer for ScriptedOpens {
 /// Fallback that can serve real events for the gap the stream missed.
 #[derive(Debug)]
 struct BackfillFallback {
-    tip: u64,
+    tips: Mutex<Vec<u64>>,
+    steady_tip: u64,
     events: Vec<RailgunEvent>,
+    latest_calls: AtomicU64,
     range_calls: AtomicU64,
+    ranges: Mutex<Vec<(u64, u64)>>,
 }
 
 #[async_trait]
 impl ChainSource for BackfillFallback {
     async fn latest_block(&self) -> Result<u64> {
-        Ok(self.tip)
+        self.latest_calls.fetch_add(1, Ordering::SeqCst);
+        let mut tips = self.tips.lock().expect("tips lock");
+        Ok(if tips.is_empty() {
+            self.steady_tip
+        } else {
+            tips.remove(0)
+        })
     }
     async fn events_in_range(&self, from: u64, to: u64) -> Result<Vec<RailgunEvent>> {
         self.range_calls.fetch_add(1, Ordering::SeqCst);
+        self.ranges.lock().expect("ranges lock").push((from, to));
         Ok(self
             .events
             .iter()
@@ -158,6 +187,49 @@ impl ChainSource for BackfillFallback {
     }
 }
 
+#[derive(Debug)]
+struct InitialTipFailureFallback {
+    latest_calls: AtomicU64,
+    range_calls: AtomicU64,
+}
+
+#[async_trait]
+impl ChainSource for InitialTipFailureFallback {
+    async fn latest_block(&self) -> Result<u64> {
+        if self.latest_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(IndexerError::Rpc("initial tip unavailable".into()))
+        } else {
+            Ok(100)
+        }
+    }
+
+    async fn events_in_range(&self, _from: u64, _to: u64) -> Result<Vec<RailgunEvent>> {
+        self.range_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::new())
+    }
+
+    async fn root_history(
+        &self,
+        _tree: u32,
+        _root: [u8; 32],
+        _at: Option<alloy::eips::BlockId>,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn block_hash(&self, _n: u64) -> Result<[u8; 32]> {
+        Ok([0; 32])
+    }
+
+    async fn merkle_root(&self, _at: Option<alloy::eips::BlockId>) -> Result<[u8; 32]> {
+        Ok([0; 32])
+    }
+
+    async fn active_tree_number(&self, _at: Option<alloy::eips::BlockId>) -> Result<u32> {
+        Ok(0)
+    }
+}
+
 async fn collect_event_heights(rx: &mut mpsc::Receiver<IndexerMessage>, for_secs: u64) -> Vec<u64> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(for_secs);
     let mut heights = Vec::new();
@@ -172,20 +244,22 @@ async fn collect_event_heights(rx: &mut mpsc::Receiver<IndexerMessage>, for_secs
     heights
 }
 
-/// DEFECT PIN (red today): a `removed: true` log frame must NOT be forwarded
-/// as a fresh event. `handle_log_frame` ignores the flag, so the withdrawn
-/// leaf is re-applied downstream with no `Reorg` fence.
-#[ignore = "pins subscribe.rs defect: log.removed is ignored and replayed as an insert"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn removed_log_frame_is_not_forwarded_as_an_event() {
+async fn removed_log_frame_emits_a_reorg_fence_instead_of_an_event() {
     let streamer = Arc::new(ScriptedOpens {
-        scripts: Mutex::new(vec![(vec![100], vec![shield_log(100, true)])]),
+        scripts: Mutex::new(vec![OpenScript::Frames(
+            vec![100],
+            vec![shield_log(100, true)],
+        )]),
         opens: AtomicU64::new(0),
     });
     let fallback = Arc::new(BackfillFallback {
-        tip: 100,
+        tips: Mutex::new(vec![99, 99]),
+        steady_tip: 99,
         events: Vec::new(),
+        latest_calls: AtomicU64::new(0),
         range_calls: AtomicU64::new(0),
+        ranges: Mutex::new(Vec::new()),
     });
     let (tx, mut rx) = mpsc::channel(16);
     let worker = SubscribeWorker::new(streamer, fallback, tx);
@@ -196,44 +270,54 @@ async fn removed_log_frame_is_not_forwarded_as_an_event() {
     };
     let join = tokio::spawn(async move { worker.run(cfg).await });
 
-    let heights = collect_event_heights(&mut rx, 4).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    let mut event_heights = Vec::new();
+    let mut reorg_heights = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(300), rx.recv()).await {
+            Ok(Some(IndexerMessage::Event { block_height, .. })) => {
+                event_heights.push(block_height);
+            }
+            Ok(Some(IndexerMessage::Reorg { height })) => reorg_heights.push(height),
+            Ok(Some(_)) | Err(_) => continue,
+            Ok(None) => break,
+        }
+    }
     drop(rx);
     let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
 
     assert!(
-        heights.is_empty(),
-        "a removed (reorged-out) log must not surface as an Event; got heights {heights:?}"
+        event_heights.is_empty(),
+        "removed log events: {event_heights:?}"
     );
+    assert_eq!(reorg_heights, [99]);
 }
 
-/// DEFECT PIN (red today): events landing while the stream was down must be
-/// backfilled on reconnect. The worker inherits only a watermark across the
-/// dwell and never asks the fallback for the missed range, so block 101's
-/// Shield leaf is silently lost.
-#[ignore = "pins subscribe.rs defect: no gap backfill across reconnect"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn events_missed_between_stream_close_and_reopen_are_backfilled() {
-    // Open 1 sees block 100; the gap event lands at 101 while the stream is
-    // down; open 2 resumes at 102 without replaying 101.
+async fn events_finalized_between_initial_tip_and_first_open_are_backfilled() {
     let streamer = Arc::new(ScriptedOpens {
-        scripts: Mutex::new(vec![
-            (vec![100], vec![shield_log(100, false)]),
-            (vec![102], vec![shield_log(102, false)]),
-        ]),
+        scripts: Mutex::new(vec![OpenScript::HeldFrames(
+            vec![102],
+            vec![shield_log(102, false)],
+            Duration::from_secs(2),
+        )]),
         opens: AtomicU64::new(0),
     });
-    let missed = RailgunEvent::Unshield {
-        block_number: 101,
-        tx_hash: [0xab; 32],
+    let event_at = |block_number| RailgunEvent::Unshield {
+        block_number,
+        tx_hash: [0x33; 32],
         to: [0x11; 20],
         token: [0x22; 32],
         amount: 1,
         fee: 0,
     };
     let fallback = Arc::new(BackfillFallback {
-        tip: 102,
-        events: vec![missed],
+        tips: Mutex::new(vec![100, 102]),
+        steady_tip: 102,
+        events: vec![event_at(101), event_at(102)],
+        latest_calls: AtomicU64::new(0),
         range_calls: AtomicU64::new(0),
+        ranges: Mutex::new(Vec::new()),
     });
     let (tx, mut rx) = mpsc::channel(64);
     let worker = SubscribeWorker::new(streamer, fallback, tx);
@@ -244,7 +328,7 @@ async fn events_missed_between_stream_close_and_reopen_are_backfilled() {
     };
     let join = tokio::spawn(async move { worker.run(cfg).await });
 
-    let heights = collect_event_heights(&mut rx, 8).await;
+    let heights = collect_event_heights(&mut rx, 1).await;
     drop(rx);
     let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
 
@@ -253,4 +337,369 @@ async fn events_missed_between_stream_close_and_reopen_are_backfilled() {
         "the event that landed during the reconnect gap must be delivered \
          (backfilled from the fallback); got heights {heights:?}"
     );
+    assert_eq!(heights.iter().filter(|height| **height == 102).count(), 1);
+}
+
+fn unshield(block_number: u64) -> RailgunEvent {
+    RailgunEvent::Unshield {
+        block_number,
+        tx_hash: [0x33; 32],
+        to: [0x11; 20],
+        token: [0x22; 32],
+        amount: 1,
+        fee: 0,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_first_open_does_not_lose_polling_gap_events() {
+    let streamer = Arc::new(ScriptedOpens {
+        scripts: Mutex::new(vec![
+            OpenScript::Fail,
+            OpenScript::HeldFrames(vec![102], Vec::new(), Duration::from_secs(2)),
+        ]),
+        opens: AtomicU64::new(0),
+    });
+    let fallback = Arc::new(BackfillFallback {
+        tips: Mutex::new(vec![100, 102]),
+        steady_tip: 102,
+        events: vec![unshield(101), unshield(102)],
+        latest_calls: AtomicU64::new(0),
+        range_calls: AtomicU64::new(0),
+        ranges: Mutex::new(Vec::new()),
+    });
+    let (tx, mut rx) = mpsc::channel(64);
+    let observed_streamer = Arc::clone(&streamer);
+    let worker = SubscribeWorker::new(streamer, fallback, tx);
+    let join = tokio::spawn(async move {
+        worker
+            .run(SubscribeWorkerConfig {
+                heartbeat_secs: 1,
+                reconnect_total_secs: 2,
+                polling_dwell: Duration::from_millis(500),
+            })
+            .await
+    });
+
+    let first = tokio::time::timeout(Duration::from_millis(300), async {
+        loop {
+            if let Some(IndexerMessage::Event { block_height, .. }) = rx.recv().await {
+                break block_height;
+            }
+        }
+    })
+    .await
+    .expect("polling dwell must deliver before reopen");
+    let opens_at_delivery = observed_streamer.opens.load(Ordering::SeqCst);
+    drop(rx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
+    assert_eq!(first, 101);
+    assert_eq!(opens_at_delivery, 1, "delivery waited for a second WS open");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_removed_frame_is_suppressed_before_reorg_interpretation() {
+    let streamer = Arc::new(ScriptedOpens {
+        scripts: Mutex::new(vec![
+            OpenScript::Frames(vec![100], Vec::new()),
+            OpenScript::Frames(
+                vec![102],
+                vec![shield_log(102, true), shield_log(102, false)],
+            ),
+        ]),
+        opens: AtomicU64::new(0),
+    });
+    let fallback = Arc::new(BackfillFallback {
+        tips: Mutex::new(vec![100, 100, 102]),
+        steady_tip: 102,
+        events: vec![unshield(101), unshield(102)],
+        latest_calls: AtomicU64::new(0),
+        range_calls: AtomicU64::new(0),
+        ranges: Mutex::new(Vec::new()),
+    });
+    let (tx, mut rx) = mpsc::channel(64);
+    let worker = SubscribeWorker::new(streamer, fallback, tx);
+    let join = tokio::spawn(async move {
+        worker
+            .run(SubscribeWorkerConfig {
+                heartbeat_secs: 1,
+                reconnect_total_secs: 2,
+                polling_dwell: Duration::from_millis(100),
+            })
+            .await
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut reorgs = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            Ok(Some(IndexerMessage::Reorg { height })) => reorgs.push(height),
+            Ok(Some(_)) | Err(_) => {}
+            Ok(None) => break,
+        }
+    }
+    drop(rx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
+    assert!(
+        reorgs.is_empty(),
+        "backfill-owned removed frame emitted {reorgs:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removed_then_close_backfills_from_the_reorg_fence() {
+    let streamer = Arc::new(ScriptedOpens {
+        scripts: Mutex::new(vec![
+            OpenScript::Frames(vec![102], vec![shield_log(102, true)]),
+            OpenScript::Frames(vec![103], Vec::new()),
+        ]),
+        opens: AtomicU64::new(0),
+    });
+    let fallback = Arc::new(BackfillFallback {
+        tips: Mutex::new(vec![100, 100]),
+        steady_tip: 103,
+        events: vec![unshield(102), unshield(103)],
+        latest_calls: AtomicU64::new(0),
+        range_calls: AtomicU64::new(0),
+        ranges: Mutex::new(Vec::new()),
+    });
+    let (tx, mut rx) = mpsc::channel(64);
+    let worker = SubscribeWorker::new(streamer, fallback, tx);
+    let join = tokio::spawn(async move {
+        worker
+            .run(SubscribeWorkerConfig {
+                heartbeat_secs: 1,
+                reconnect_total_secs: 2,
+                polling_dwell: Duration::from_millis(100),
+            })
+            .await
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut heights = Vec::new();
+    let mut reorgs = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            Ok(Some(IndexerMessage::Event { block_height, .. })) => heights.push(block_height),
+            Ok(Some(IndexerMessage::Reorg { height })) => reorgs.push(height),
+            Ok(Some(IndexerMessage::ReorgBarrier { height, .. })) => {
+                panic!("subscribe worker cannot emit startup Reorg({height})")
+            }
+            Ok(Some(_)) | Err(_) => {}
+            Ok(None) => break,
+        }
+    }
+    drop(rx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
+    assert!(
+        heights.contains(&102),
+        "replacement was not reapplied: {heights:?}"
+    );
+    assert!(
+        reorgs.contains(&100),
+        "missing canonical rewind: {reorgs:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn log_without_head_is_reconciled_from_the_canonical_watermark() {
+    let streamer = Arc::new(ScriptedOpens {
+        scripts: Mutex::new(vec![
+            OpenScript::Frames(Vec::new(), vec![shield_log(101, false)]),
+            OpenScript::Frames(Vec::new(), Vec::new()),
+        ]),
+        opens: AtomicU64::new(0),
+    });
+    let fallback = Arc::new(BackfillFallback {
+        tips: Mutex::new(vec![100, 100]),
+        steady_tip: 101,
+        events: vec![unshield(101)],
+        latest_calls: AtomicU64::new(0),
+        range_calls: AtomicU64::new(0),
+        ranges: Mutex::new(Vec::new()),
+    });
+    let (tx, mut rx) = mpsc::channel(64);
+    let worker = SubscribeWorker::new(streamer, fallback, tx);
+    let join = tokio::spawn(async move {
+        worker
+            .run(SubscribeWorkerConfig {
+                heartbeat_secs: 1,
+                reconnect_total_secs: 2,
+                polling_dwell: Duration::from_millis(100),
+            })
+            .await
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut heights = Vec::new();
+    let mut reorgs = Vec::new();
+    let mut scanned = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            Ok(Some(IndexerMessage::Event { block_height, .. })) => heights.push(block_height),
+            Ok(Some(IndexerMessage::Reorg { height })) => reorgs.push(height),
+            Ok(Some(IndexerMessage::ReorgBarrier { height, .. })) => {
+                panic!("subscribe worker cannot emit startup Reorg({height})")
+            }
+            Ok(Some(IndexerMessage::Heartbeat {
+                scanned_through_block,
+                ..
+            })) => scanned.push(scanned_through_block),
+            Err(_) => {}
+            Ok(None) => break,
+        }
+    }
+    drop(rx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
+    assert_eq!(heights.iter().filter(|height| **height == 101).count(), 2);
+    assert!(reorgs.contains(&100), "missing overlay rewind: {reorgs:?}");
+    assert!(
+        scanned.contains(&100),
+        "stream head became scan proof: {scanned:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exhausted_reconnect_budget_keeps_ingesting_via_polling() {
+    let streamer = Arc::new(ScriptedOpens {
+        scripts: Mutex::new(vec![OpenScript::Fail]),
+        opens: AtomicU64::new(0),
+    });
+    let fallback = Arc::new(BackfillFallback {
+        tips: Mutex::new(vec![100, 101]),
+        steady_tip: 101,
+        events: vec![unshield(101)],
+        latest_calls: AtomicU64::new(0),
+        range_calls: AtomicU64::new(0),
+        ranges: Mutex::new(Vec::new()),
+    });
+    let (tx, mut rx) = mpsc::channel(16);
+    let worker = SubscribeWorker::new(streamer, fallback, tx);
+    let join = tokio::spawn(async move {
+        worker
+            .run(SubscribeWorkerConfig {
+                heartbeat_secs: 1,
+                reconnect_total_secs: 0,
+                polling_dwell: Duration::ZERO,
+            })
+            .await
+    });
+
+    let heights = collect_event_heights(&mut rx, 2).await;
+    drop(rx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
+    assert!(
+        heights.contains(&101),
+        "polling lost event 101: {heights:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_backfill_obeys_the_chain_source_chunk_limit() {
+    let streamer = Arc::new(ScriptedOpens {
+        scripts: Mutex::new(vec![OpenScript::Frames(Vec::new(), Vec::new())]),
+        opens: AtomicU64::new(0),
+    });
+    let fallback = Arc::new(BackfillFallback {
+        tips: Mutex::new(vec![100, 1_100]),
+        steady_tip: 1_100,
+        events: Vec::new(),
+        latest_calls: AtomicU64::new(0),
+        range_calls: AtomicU64::new(0),
+        ranges: Mutex::new(Vec::new()),
+    });
+    let observed = Arc::clone(&fallback);
+    let (tx, rx) = mpsc::channel(32);
+    let worker = SubscribeWorker::new(streamer, fallback, tx);
+    let join = tokio::spawn(async move {
+        worker
+            .run(SubscribeWorkerConfig {
+                heartbeat_secs: 1,
+                reconnect_total_secs: 1,
+                polling_dwell: Duration::ZERO,
+            })
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if observed.range_calls.load(Ordering::SeqCst) >= 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("three bounded range calls");
+    drop(rx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
+    let ranges = observed.ranges.lock().expect("ranges lock").clone();
+    assert_eq!(ranges, [(101, 599), (600, 1_098), (1_099, 1_100)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_initial_watermark_fails_closed_without_historical_replay() {
+    let streamer = Arc::new(ScriptedOpens {
+        scripts: Mutex::new(vec![OpenScript::Frames(Vec::new(), Vec::new())]),
+        opens: AtomicU64::new(0),
+    });
+    let fallback = Arc::new(InitialTipFailureFallback {
+        latest_calls: AtomicU64::new(0),
+        range_calls: AtomicU64::new(0),
+    });
+    let observed_streamer = Arc::clone(&streamer);
+    let observed_fallback = Arc::clone(&fallback);
+    let (tx, _rx) = mpsc::channel(8);
+    let worker = SubscribeWorker::new(streamer, fallback, tx);
+
+    let error = tokio::time::timeout(
+        Duration::from_millis(300),
+        worker.run(SubscribeWorkerConfig::default()),
+    )
+    .await
+    .expect("initial tip failure must stop before opening a stream")
+    .expect_err("unknown live-tail boundary must fail closed");
+    assert!(error.to_string().contains("initial tip unavailable"));
+    assert_eq!(observed_streamer.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(observed_fallback.range_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn decode_error_fences_an_already_forwarded_overlay() {
+    let streamer = Arc::new(ScriptedOpens {
+        scripts: Mutex::new(vec![OpenScript::Frames(
+            Vec::new(),
+            vec![shield_log(101, false), malformed_shield_log(102)],
+        )]),
+        opens: AtomicU64::new(0),
+    });
+    let fallback = Arc::new(BackfillFallback {
+        tips: Mutex::new(vec![100, 100]),
+        steady_tip: 100,
+        events: Vec::new(),
+        latest_calls: AtomicU64::new(0),
+        range_calls: AtomicU64::new(0),
+        ranges: Mutex::new(Vec::new()),
+    });
+    let (tx, mut rx) = mpsc::channel(16);
+    let worker = SubscribeWorker::new(streamer, fallback, tx);
+    let join = tokio::spawn(async move { worker.run(SubscribeWorkerConfig::default()).await });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("worker exits on decode error")
+        .expect("worker join");
+    assert!(outcome.is_err(), "malformed known event must fail");
+    let mut sequence = Vec::new();
+    while let Ok(message) = rx.try_recv() {
+        match message {
+            IndexerMessage::Event { block_height, .. } => sequence.push(("event", block_height)),
+            IndexerMessage::Reorg { height } => sequence.push(("reorg", height)),
+            IndexerMessage::ReorgBarrier { height, .. } => {
+                panic!("subscribe worker cannot emit startup Reorg({height})")
+            }
+            IndexerMessage::Heartbeat { .. } => {}
+        }
+    }
+    assert_eq!(sequence, [("event", 101), ("reorg", 100)]);
 }

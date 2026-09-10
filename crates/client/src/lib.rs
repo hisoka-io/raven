@@ -223,6 +223,8 @@ fn ensure_session_matches_live_crs(
 ) -> Result<(), String> {
     let live = ServerCrs::from_versioned_bytes(crs_bincode).map_err(|e| e.to_string())?;
     let held = session.crs();
+    ensure_session_params_match(&held.params, &live.params)
+        .map_err(|detail| format!("deserialize_client_session: live CRS {detail}"))?;
     if held.inspiring_w_seed != live.inspiring_w_seed {
         return Err(format!(
             "deserialize_client_session: this session was derived under CRS w_seed {} but the \
@@ -240,6 +242,24 @@ fn ensure_session_matches_live_crs(
              wrong number of bytes. Discard the cached session and re-run the handshake.",
             held.inspiring_num_columns, live.inspiring_num_columns
         ));
+    }
+    Ok(())
+}
+
+fn ensure_session_params_match(
+    held: &InspireParams,
+    current: &InspireParams,
+) -> Result<(), String> {
+    if current.ring_dim != held.ring_dim
+        || current.q != held.q
+        || current.p != held.p
+        || current.sigma.to_bits() != held.sigma.to_bits()
+    {
+        return Err(
+            "session parameters drifted from the live ring_dim/q/p/sigma; discard the cached \
+             session and rebuild it from one consistent params/CRS response"
+                .to_owned(),
+        );
     }
     Ok(())
 }
@@ -312,15 +332,8 @@ pub fn register_client_session(
 ) -> Result<(), JsValue> {
     let bundle: WasmInstanceParamsBundle = decode(instance_params_bincode, "params_bundle")?;
     let inspire_params = decode_validated_params(&bundle.inspire_params_bincode, "inspire_params")?;
-    if inspire_params.ring_dim != session.params.ring_dim
-        || inspire_params.q != session.params.q
-        || inspire_params.p != session.params.p
-        || inspire_params.sigma.to_bits() != session.params.sigma.to_bits()
-    {
-        return Err(JsValue::from_str(
-            "register_client_session: instance params drift detected (ring_dim/q/p/sigma mismatch with session)",
-        ));
-    }
+    ensure_session_params_match(&session.inner.crs().params, &inspire_params)
+        .map_err(|detail| JsValue::from_str(&format!("register_client_session: {detail}")))?;
     Ok(())
 }
 
@@ -512,10 +525,8 @@ pub fn serialize_client_session(session: &ClientSessionHandle) -> Result<Vec<u8>
 /// Reconstitute a [`ClientSessionHandle`] from a [`serialize_client_session`] blob.
 ///
 /// Decodes the session residue under [`WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES`]
-/// and rehydrates without rebuilding the automorph tables. `crs_bincode` is
-/// validated only for its [`ServerCrs::MAGIC`] version prefix (cheap, no full
-/// decode); the residue carries the authoritative CRS that serves queries. The
-/// rehydrated CRS ring_dim is checked against the params bundle so a CRS rotation
+/// and rehydrates without rebuilding the automorph tables. The residue's CRS is
+/// checked against both the current parameters and current CRS so a rotation
 /// surfaces as a typed error, not a silently wrong query.
 #[wasm_bindgen]
 pub fn deserialize_client_session(
@@ -534,20 +545,12 @@ pub fn deserialize_client_session(
         op: "ClientSession::from_residue",
         detail: e.to_string(),
     })?;
-    // the residue CRS (not the bundle) drives all query crypto; ring_dim is the only
-    // load-bearing match (q/p drift in the bundle is inert), and from_residue already
-    // proved the residue's own crs/key ring_dim+modulus agree
-    if inner.crs().ring_dim() != inspire_params.ring_dim {
-        return Err(WasmClientError::Decode {
+    ensure_session_params_match(&inner.crs().params, &inspire_params).map_err(|detail| {
+        WasmClientError::Decode {
             what: "client_session",
-            detail: format!(
-                "deserialize_client_session: residue CRS ring_dim {} does not match params-bundle InspireParams ring_dim {}",
-                inner.crs().ring_dim(),
-                inspire_params.ring_dim
-            ),
+            detail,
         }
-        .into());
-    }
+    })?;
     ensure_session_matches_live_crs(&inner, crs_bincode).map_err(|detail| {
         WasmClientError::Decode {
             what: "client_session",
@@ -637,13 +640,7 @@ pub fn deserialize_client_session_rust(
     let residue: SessionResidue =
         bincode::deserialize(session_bincode).map_err(|e| e.to_string())?;
     let inner = ClientSession::from_residue(residue).map_err(|e| e.to_string())?;
-    if inner.crs().ring_dim() != inspire_params.ring_dim {
-        return Err(format!(
-            "deserialize_client_session: residue CRS ring_dim {} does not match params-bundle InspireParams ring_dim {}",
-            inner.crs().ring_dim(),
-            inspire_params.ring_dim
-        ));
-    }
+    ensure_session_params_match(&inner.crs().params, &inspire_params)?;
     ensure_session_matches_live_crs(&inner, crs_bincode)?;
     Ok((inner, inspire_params))
 }

@@ -943,6 +943,8 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     }
 
     let per_tree_recovered = per_tree_recovered_floors(&bootstrap.handles.instances);
+    let (reorg_window_required, recovered_block_height) =
+        recovered_chain_window_requirement(&bootstrap.handles.instances);
     let per_tree_start_blocks =
         compute_effective_start_block_per_tree(opts.start_block, &per_tree_recovered);
     let min_effective_start_block = per_tree_start_blocks
@@ -978,6 +980,8 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
             spawn_chain_indexer(
                 &opts,
                 min_effective_start_block,
+                recovered_block_height,
+                reorg_window_required,
                 per_tree_start_blocks.clone(),
                 resolved_reorg_window_path.clone(),
                 bootstrap.handles.channels.indexer_tx.clone(),
@@ -1075,7 +1079,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
                 let live_runtime = Arc::clone(&wiring.live_runtime);
                 let entries_default = opts.entries;
                 let task = tokio::spawn(async move {
-                    run_sighup_reload_loop(reload_path, live_runtime, entries_default).await;
+                    run_sighup_reload_loop(reload_path, live_runtime, entries_default, None).await;
                 });
                 auxiliary_tasks.push(task);
             }
@@ -1329,6 +1333,7 @@ async fn run_sighup_reload_loop(
     config_path: PathBuf,
     live_runtime: Arc<arc_swap::ArcSwap<crate::auto_spawn_driver::AutoSpawnRuntime>>,
     entries_default: usize,
+    applied_observer: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) {
     use tokio::signal::unix::{signal, SignalKind};
 
@@ -1443,6 +1448,9 @@ async fn run_sighup_reload_loop(
                 };
                 let runtime = runtime_from_auto_spawn_section(&synthesized, entries_default);
                 live_runtime.store(Arc::new(runtime));
+                if let Some(observer) = &applied_observer {
+                    let _ = observer.send(tpl.template_id.clone());
+                }
                 tracing::debug!(
                     template_id = %tpl.template_id,
                     encoder = %tpl.encoder,
@@ -1490,6 +1498,25 @@ pub fn per_tree_recovered_floors(instances: &[PerInstanceHandles]) -> BTreeMap<u
         }
     }
     floors
+}
+
+fn recovered_chain_window_requirement(instances: &[PerInstanceHandles]) -> (bool, u64) {
+    let mut required = false;
+    let mut high_water = 0u64;
+    for handle in instances {
+        if !matches!(
+            handle.config.data_source,
+            DataSourceFilter::ChainTreeNumber(_)
+        ) {
+            continue;
+        }
+        let manifest_height = handle.persistence.manifest_block_height();
+        let store = handle.logical_store.lock();
+        let store_height = store.last_block_height();
+        required |= manifest_height > 0 || store_height > 0 || store.leaf_count() > 0;
+        high_water = high_water.max(manifest_height).max(store_height);
+    }
+    (required, high_water)
 }
 
 /// Per-tree `max(toml_start_block, recovered)`. The single-cursor indexer scans
@@ -1966,6 +1993,8 @@ struct ChainWorkers {
 async fn spawn_chain_indexer(
     opts: &MultiServeOptions,
     min_effective_start_block: u64,
+    recovered_block_height: u64,
+    reorg_window_required: bool,
     per_tree_start_blocks: BTreeMap<u32, u64>,
     resolved_reorg_window_path: Option<PathBuf>,
     indexer_tx: tokio::sync::mpsc::Sender<raven_railgun_indexer::IndexerMessage>,
@@ -2015,7 +2044,7 @@ async fn spawn_chain_indexer(
 
     let (mode_mirror_shutdown_tx, mode_mirror_shutdown_rx) = tokio::sync::watch::channel(false);
 
-    let (chain_source, rpc_pool, chain_source_mode, mode_mirror) =
+    let (chain_source, rpc_pool, chain_source_mode) =
         match (opts.ws_endpoint.as_deref(), opts.rpc_pool.as_ref()) {
             (Some(ws_url), Some(pool_cfg)) if pool_cfg.urls.len() >= 2 => {
                 let pool = build_pool(pool_cfg)?;
@@ -2027,16 +2056,10 @@ async fn spawn_chain_indexer(
                 let ws = Arc::new(WsChainSource::new(ws_url, proxy_addr, opts.chain_id));
                 let auto = Arc::new(AutoFallbackChainSource::new(ws, pooled));
                 let mode_flag = Arc::new(ModeFlag::default());
-                let mirror = spawn_mode_mirror_pooled(
-                    Arc::clone(&auto),
-                    Arc::clone(&mode_flag),
-                    mode_mirror_shutdown_rx,
-                );
                 (
                     DynChainSource::AutoFallbackPooled(auto),
                     Some(pool),
                     Some(mode_flag),
-                    Some(mirror),
                 )
             }
             (Some(ws_url), _) => {
@@ -2054,16 +2077,10 @@ async fn spawn_chain_indexer(
                 let ws = Arc::new(WsChainSource::new(ws_url, proxy_addr, opts.chain_id));
                 let auto = Arc::new(AutoFallbackChainSource::new(ws, single));
                 let mode_flag = Arc::new(ModeFlag::default());
-                let mirror = spawn_mode_mirror_single(
-                    Arc::clone(&auto),
-                    Arc::clone(&mode_flag),
-                    mode_mirror_shutdown_rx,
-                );
                 (
                     DynChainSource::AutoFallbackSingle(auto),
                     None,
                     Some(mode_flag),
-                    Some(mirror),
                 )
             }
             (None, Some(pool_cfg)) if pool_cfg.urls.len() >= 2 => {
@@ -2073,7 +2090,7 @@ async fn spawn_chain_indexer(
                     proxy_addr,
                     opts.chain_id,
                 ));
-                (DynChainSource::Pooled(pooled), Some(pool), None, None)
+                (DynChainSource::Pooled(pooled), Some(pool), None)
             }
             _ => {
                 let url = opts
@@ -2087,10 +2104,11 @@ async fn spawn_chain_indexer(
                     opts.start_block,
                     opts.chain_id,
                 ));
-                (DynChainSource::Single(single), None, None, None)
+                (DynChainSource::Single(single), None, None)
             }
         };
 
+    let chain_source = Arc::new(chain_source);
     let head = chain_source
         .latest_block()
         .await
@@ -2101,19 +2119,34 @@ async fn spawn_chain_indexer(
         ws_endpoint = opts.ws_endpoint.as_deref().unwrap_or(""),
         "chain RPC reachable"
     );
-    let worker = IndexerWorker::new(Arc::new(chain_source), indexer_tx);
+    let worker = IndexerWorker::new(Arc::clone(&chain_source), indexer_tx);
     let worker_config = IndexerWorkerConfig {
         start_block: min_effective_start_block,
+        configured_start_block: opts.start_block,
+        recovered_block_height,
+        reorg_window_required,
         poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
         reorg_window_path: resolved_reorg_window_path,
         per_tree_start_blocks,
         ..IndexerWorkerConfig::default()
     };
-    let handle = tokio::spawn(async move {
-        if let Err(e) = worker.run(worker_config).await {
-            tracing::error!(error = %e, "chain indexer worker exiting");
-        }
-    });
+    let handle = worker
+        .spawn_reconciled(worker_config)
+        .await
+        .map_err(|error| anyhow::anyhow!("chain indexer startup reconciliation: {error}"))?;
+    let mode_mirror = match (chain_source.as_ref(), chain_source_mode.as_ref()) {
+        (DynChainSource::AutoFallbackSingle(source), Some(mode)) => Some(spawn_mode_mirror_single(
+            Arc::clone(source),
+            Arc::clone(mode),
+            mode_mirror_shutdown_rx,
+        )),
+        (DynChainSource::AutoFallbackPooled(source), Some(mode)) => Some(spawn_mode_mirror_pooled(
+            Arc::clone(source),
+            Arc::clone(mode),
+            mode_mirror_shutdown_rx,
+        )),
+        _ => None,
+    };
     Ok(ChainWorkers {
         handle,
         rpc_pool,
@@ -3123,5 +3156,137 @@ data_source = { kind = "indexer", filter = { tree_number = 0 } }
         let opts = load_options_from_toml(f.path()).expect("parse");
         assert!(opts.rpc_pool.is_none(), "absent section should be None");
         assert_eq!(opts.rpc_url, "http://127.0.0.1:1");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn sighup_loop_applies_every_new_chain_template_in_order() {
+        static SIGNAL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _signal_guard = SIGNAL_LOCK.lock().await;
+        let config = write_temp_toml(
+            r#"
+[global]
+bind = "127.0.0.1:0"
+token = "sighup-source-test-token-padded"
+rpc_url = "http://127.0.0.1:1"
+railgun_proxy = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
+chain_id = 1
+start_block = 0
+mirror_endpoint = "http://127.0.0.1:1"
+
+[[instance_template]]
+template_id = "tree-template-A"
+encoder = "per-leaf-bc"
+data_dir_template = "/tmp/raven-sighup-a-{tree_number}"
+
+[[instance]]
+id = "commit-tree-0"
+role = "static"
+encoder = "per-leaf-bc"
+tree_number = 0
+data_dir = "/tmp/raven-sighup-tree-0"
+verification_mode = "chain-root-history"
+data_source = { kind = "indexer", filter = { tree_number = 0 } }
+"#,
+        );
+        let initial_runtime = crate::auto_spawn_driver::AutoSpawnRuntime {
+            data_dir_template: "/tmp/raven-sighup-a-{tree_number}".to_owned(),
+            encoder: "per-leaf-bc".to_owned(),
+            scheme_tag: SCHEME_TAG_DEFAULT.to_owned(),
+            entries: DEFAULT_PRODUCTION_ENTRIES,
+            entry_bytes: 16 * 32,
+            channel_capacity: 64,
+            verification_cadence_n: 0,
+            max_instance_count: None,
+            cooldown: None,
+        };
+        let runtime = Arc::new(arc_swap::ArcSwap::from_pointee(initial_runtime));
+        let (applied_tx, mut applied_rx) = tokio::sync::mpsc::unbounded_channel();
+        let reload = tokio::spawn(run_sighup_reload_loop(
+            config.path().to_owned(),
+            Arc::clone(&runtime),
+            DEFAULT_PRODUCTION_ENTRIES,
+            Some(applied_tx),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        std::fs::write(
+            config.path(),
+            r#"
+[global]
+bind = "127.0.0.1:0"
+token = "sighup-source-test-token-padded"
+rpc_url = "http://127.0.0.1:1"
+railgun_proxy = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
+chain_id = 1
+start_block = 0
+mirror_endpoint = "http://127.0.0.1:1"
+
+[[instance_template]]
+template_id = "tree-template-A"
+encoder = "per-leaf-bc"
+data_dir_template = "/tmp/raven-sighup-a-{tree_number}"
+
+[[instance_template]]
+template_id = "tree-template-B"
+encoder = "per-node"
+data_dir_template = "/tmp/raven-sighup-b-{tree_number}"
+
+[[instance_template]]
+template_id = "tree-template-C"
+encoder = "per-leaf-path"
+data_dir_template = "/tmp/raven-sighup-c-{tree_number}"
+
+[[instance_template]]
+template_id = "tree-template-D"
+encoder = "per-leaf-bc"
+data_dir_template = "/tmp/raven-sighup-d-{tree_number}"
+
+[[instance]]
+id = "commit-tree-0"
+role = "static"
+encoder = "per-leaf-bc"
+tree_number = 0
+data_dir = "/tmp/raven-sighup-tree-0"
+verification_mode = "chain-root-history"
+data_source = { kind = "indexer", filter = { tree_number = 0 } }
+"#,
+        )
+        .expect("rewrite config");
+
+        let signal_status = std::process::Command::new("kill")
+            .args(["-HUP", &std::process::id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(signal_status.success());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let current = runtime.load();
+            if current.data_dir_template == "/tmp/raven-sighup-d-{tree_number}"
+                && current.encoder == "per-leaf-bc"
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "last template was not applied"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let mut applied = Vec::new();
+        while let Ok(template_id) = applied_rx.try_recv() {
+            applied.push(template_id);
+        }
+        assert_eq!(
+            applied,
+            vec![
+                "tree-template-B".to_owned(),
+                "tree-template-C".to_owned(),
+                "tree-template-D".to_owned(),
+            ]
+        );
+
+        reload.abort();
+        let _ = reload.await;
     }
 }

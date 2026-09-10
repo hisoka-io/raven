@@ -167,10 +167,14 @@ pub fn build_flat_state(
         setup_with_rng(params, database, entry_size, &mut sampler, &mut rng)
             .map_err(|e| EthStateError::Setup(e.to_string()))?;
     #[cfg(feature = "cached-respond")]
-    let cache = Arc::new(
-        ServerInspiringCache::new(&crs, &encoded_db)
-            .map_err(|e| EthStateError::Setup(format!("inspiring cache build failed: {e}")))?,
-    );
+    let (crs, cache) = {
+        let mut crs = crs;
+        let cache = Arc::new(
+            ServerInspiringCache::from_setup(&mut crs, &encoded_db)
+                .map_err(|e| EthStateError::Setup(format!("inspiring cache build failed: {e}")))?,
+        );
+        (crs, cache)
+    };
     Ok((
         FlatServerState {
             crs,

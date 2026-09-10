@@ -298,7 +298,7 @@ async fn subscribe_handle_log_drops_log_when_block_number_none() {
         synthetic_shield_log(Some(102), 2),
     ];
     let streamer = Arc::new(ScriptedStreamer::new(vec![1, 2, 3], logs));
-    let fallback = Arc::new(StaticFallback(2_000));
+    let fallback = Arc::new(StaticFallback(99));
     let (tx, mut rx) = mpsc::channel::<IndexerMessage>(256);
 
     let worker = Arc::new(SubscribeWorker::new(
@@ -353,7 +353,7 @@ async fn subscribe_dropped_logs_metric_increments_on_drop() {
         vec![synthetic_shield_log(None, 1)],
         Duration::from_millis(300),
     ));
-    let fallback = Arc::new(StaticFallback(2_000));
+    let fallback = Arc::new(StaticFallback(49));
     let (tx, mut rx) = mpsc::channel::<IndexerMessage>(256);
 
     let worker = Arc::new(SubscribeWorker::new(

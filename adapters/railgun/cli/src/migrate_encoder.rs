@@ -17,8 +17,58 @@ use raven_railgun_persistence::{
     Manifest, Snapshot, SnapshotId, StoreLayout, Wal, WalEntryPayload, SNAPSHOT_MAGIC,
 };
 
+/// Observable boundaries in the real encoder migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationCheckpoint {
+    /// Before any shard is re-encoded.
+    PreReEncode,
+    /// After every shard is re-encoded.
+    PostReEncode,
+    /// Before the replacement snapshot is built.
+    PreSnapshot,
+    /// After the replacement snapshot is durable.
+    PostSnapshot,
+    /// Before the manifest points at the replacement snapshot.
+    PreManifestBump,
+    /// After the manifest update is durable.
+    PostManifestBump,
+}
+
+impl MigrationCheckpoint {
+    /// Stable name used by subprocess fault-injection tests.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PreReEncode => "pre-re-encode",
+            Self::PostReEncode => "post-re-encode",
+            Self::PreSnapshot => "pre-snapshot",
+            Self::PostSnapshot => "post-snapshot",
+            Self::PreManifestBump => "pre-manifest-bump",
+            Self::PostManifestBump => "post-manifest-bump",
+        }
+    }
+}
+
+/// Run an offline encoder migration.
+///
+/// # Errors
+///
+/// Returns an actionable error when recovery, re-encoding, persistence, or locking fails.
 #[allow(clippy::too_many_lines)]
 pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
+    run_with_checkpoint(data_dir, target, |_| {})
+}
+
+/// Run the real migration while observing its durability boundaries.
+///
+/// # Errors
+///
+/// Returns an actionable migration error.
+#[allow(clippy::too_many_lines)]
+pub fn run_with_checkpoint(
+    data_dir: &Path,
+    target: EncoderKind,
+    mut checkpoint: impl FnMut(MigrationCheckpoint),
+) -> anyhow::Result<()> {
     // Exclusive flock held for the function lifetime; LockHeld if a live server holds the data_dir.
     let (layout, _data_dir_lock) = StoreLayout::open_with_lock(data_dir).map_err(|e| {
         anyhow::anyhow!(
@@ -126,6 +176,7 @@ pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
     let shard_count = state.encoded_db.shards.len();
     let t_start = Instant::now();
 
+    checkpoint(MigrationCheckpoint::PreReEncode);
     for shard_id in 0..u32::try_from(shard_count).unwrap_or(u32::MAX) {
         let shard_bytes = encoder.materialize_shard(shard_id, &logical_store);
         re_encode_shard(
@@ -137,7 +188,9 @@ pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("re_encode_shard {shard_id}: {e}"))?;
     }
+    checkpoint(MigrationCheckpoint::PostReEncode);
 
+    checkpoint(MigrationCheckpoint::PreSnapshot);
     // Keeps the V6 body consistent with the manifest stamped below; without it opens
     // recover an empty store and chain events land against nothing.
     let bundle = snapshot_inspire_state_v6(&state, &logical_store)
@@ -147,7 +200,9 @@ pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
     new_snap
         .save(&layout, new_id)
         .map_err(|e| anyhow::anyhow!("snapshot save: {e}"))?;
+    checkpoint(MigrationCheckpoint::PostSnapshot);
 
+    checkpoint(MigrationCheckpoint::PreManifestBump);
     let new_manifest = Manifest {
         schema_version: raven_railgun_persistence::MANIFEST_SCHEMA_VERSION,
         scheme_tag: manifest.scheme_tag.clone(),
@@ -161,6 +216,7 @@ pub fn run(data_dir: &Path, target: EncoderKind) -> anyhow::Result<()> {
     new_manifest
         .save(&layout)
         .map_err(|e| anyhow::anyhow!("manifest save: {e}"))?;
+    checkpoint(MigrationCheckpoint::PostManifestBump);
 
     let elapsed_ms = t_start.elapsed().as_millis();
     let data_dir_display = data_dir.display();

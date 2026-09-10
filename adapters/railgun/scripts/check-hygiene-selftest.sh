@@ -28,7 +28,11 @@ trap 'rm -rf "$work"' EXIT
 # Tracked files at their WORKING-TREE content, not `git archive HEAD`. The gate scans the
 # working tree, so seeding from HEAD gave the selftest a different oracle than the thing it
 # validates: an uncommitted leak read as "clean tree passes" while the real gate refused.
-( cd "$ROOT" && git ls-files -z | tar --null -T - -cf - ) | tar -xf - -C "$work"
+( cd "$ROOT" && git ls-files -z | while IFS= read -r -d '' tracked_file; do
+    if [[ -e "$tracked_file" || -L "$tracked_file" ]]; then
+      printf '%s\0' "$tracked_file"
+    fi
+  done | tar --null -T - -cf - ) | tar -xf - -C "$work"
 cp "$ROOT/$GATE_REL" "$work/$GATE_REL"
 
 run_gate() { ( cd "$work" && ./"$GATE_REL" >/dev/null 2>&1; echo $?; ); }

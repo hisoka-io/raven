@@ -1,7 +1,13 @@
 //! Cold-start bootstrap-from-disk latency at the production cell shape; target
 //! is 1 s for manifest load, snapshot restore and cache rebuild.
 
-#![allow(clippy::expect_used, clippy::print_stderr)]
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::print_stderr,
+    reason = "benchmark fixtures abort on invalid setup before measuring"
+)]
 
 use std::time::{Duration, Instant};
 
@@ -10,6 +16,9 @@ use std::sync::Arc;
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire;
+use raven_railgun_engine::offline_packing_keys_cache::{
+    CacheLoad, CellShape, OfflinePackingKeysCache,
+};
 use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{PerLeafCommitmentEncoder, PirTableEncoder};
 use raven_railgun_persistence::StoreLayout;
@@ -37,6 +46,15 @@ fn recovery_from_production_cell_snapshot_under_5s() {
         .expect("setup_state");
     let setup_elapsed = setup_start.elapsed();
     eprintln!("recovery_bench: setup elapsed = {setup_elapsed:?}");
+    eprintln!(
+        "recovery_bench: pack params bytes = {}, offline keys bytes = {}",
+        bincode::serialize(state.cache.pack_params())
+            .expect("serialize pack params")
+            .len(),
+        bincode::serialize(state.cache.offline_keys())
+            .expect("serialize offline keys")
+            .len()
+    );
 
     let dir = tempfile::tempdir().expect("tempdir");
     {
@@ -49,7 +67,33 @@ fn recovery_from_production_cell_snapshot_under_5s() {
             test_encoder(),
         )
         .expect("open");
+        let first_commit_start = Instant::now();
         opened.persistence.commit(&state, 0).expect("commit");
+        let first_commit_elapsed = first_commit_start.elapsed();
+        let repeated_commit_start = Instant::now();
+        opened
+            .persistence
+            .commit(&state, 1)
+            .expect("repeated commit");
+        let repeated_commit_elapsed = repeated_commit_start.elapsed();
+        eprintln!(
+            "recovery_bench: first commit = {first_commit_elapsed:?}, repeated commit = \
+             {repeated_commit_elapsed:?}, repeated cache bytes written = 0"
+        );
+        let columns = state.encoded_db.shards[0].polynomials.len();
+        let identity =
+            CellShape::for_inspiring(&state.crs.params, columns, state.crs.inspiring_w_seed);
+        let cache = OfflinePackingKeysCache::new(dir.path());
+        match cache.load(&identity) {
+            CacheLoad::Hit(_) => {}
+            CacheLoad::Miss(error) => panic!("cache must load after commit: {error}"),
+        }
+        eprintln!(
+            "recovery_bench: cache bytes = {}",
+            std::fs::metadata(cache.path())
+                .expect("cache metadata")
+                .len()
+        );
     }
 
     let layout2 = StoreLayout::open(dir.path()).expect("layout 2");
@@ -64,6 +108,10 @@ fn recovery_from_production_cell_snapshot_under_5s() {
     .expect("recovery open");
     let recovery_elapsed = recovery_start.elapsed();
     eprintln!("recovery_bench: recovery elapsed = {recovery_elapsed:?}");
+    assert!(
+        opened.recovered_cache_hit,
+        "recovery must use the validated sidecar cache"
+    );
 
     let recovered = opened.recovered_state.expect("recovered some");
     assert_eq!(recovered.entry_size, entry_size);

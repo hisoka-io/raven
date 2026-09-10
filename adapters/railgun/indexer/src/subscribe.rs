@@ -12,11 +12,12 @@ use std::{
 };
 
 use async_trait::async_trait;
+use raven_railgun_core::RailgunEvent;
 use tokio::sync::mpsc;
 
 use crate::{
     decode_log_to_railgun_event, ChainSource, ChainSourceMode, IndexerError, IndexerMessage,
-    Result, MAX_RPC_TOTAL_ELAPSED_SECS, MIN_POLLING_DURATION,
+    Result, MAX_RPC_TOTAL_ELAPSED_SECS, MIN_POLLING_DURATION, SCAN_CHUNK_BLOCKS,
 };
 
 /// Heartbeat window; if no frame crosses the listener within this interval, fall back to polling.
@@ -305,13 +306,11 @@ where
         // start height, so a failed first open would otherwise report the whole
         // chain as lag. Frozen across a polling dwell on purpose - that mode
         // consumes no logs, so the watermark genuinely stops and lag must grow.
-        let mut scanned_through = match self.fallback.latest_block().await {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(error = %e, "no tip for the scan-watermark floor; starting at 0");
-                0
-            }
-        };
+        let mut scanned_through = self
+            .fallback
+            .latest_block()
+            .await
+            .map_err(|error| IndexerError::Rpc(format!("initial scan watermark: {error}")))?;
         loop {
             if self.sender.is_closed() {
                 tracing::info!("subscribe worker exiting; outbound channel closed");
@@ -324,8 +323,12 @@ where
             match self.streamer.open().await {
                 Ok(streams) => {
                     tracing::info!("WS subscription opened");
-                    let streamed_head = self.drain_streams(streams, &config).await?;
-                    scanned_through = scanned_through.max(streamed_head);
+                    let captured_tip = self.fallback.latest_block().await?;
+                    scanned_through = self
+                        .backfill_reconnect_gap(scanned_through, captured_tip)
+                        .await?;
+                    self.drain_streams(streams, &config, scanned_through, captured_tip)
+                        .await?;
                     tracing::warn!("WS subscription closed; entering polling dwell");
                 }
                 Err(e) => {
@@ -344,7 +347,8 @@ where
             self.mode.set(ChainSourceMode::Polling);
             let polling_started = Instant::now();
             let dwell = config.polling_dwell;
-            self.run_polling(polling_started, dwell, scanned_through)
+            scanned_through = self
+                .run_polling(polling_started, dwell, scanned_through)
                 .await?;
 
             if self.sender.is_closed() {
@@ -363,20 +367,22 @@ where
         }
     }
 
-    /// Returns the highest head observed on this connection: the scan
-    /// watermark the polling dwell inherits.
     async fn drain_streams(
         &self,
         streams: SubscribeStreams,
         config: &SubscribeWorkerConfig,
-    ) -> Result<u64> {
+        canonical_through: u64,
+        suppress_through: u64,
+    ) -> Result<()> {
         let SubscribeStreams {
             mut heads,
             mut logs,
         } = streams;
         let heartbeat = Duration::from_secs(config.heartbeat_secs.max(1));
-        let mut last_chain_head: u64 = 0;
+        let mut observed_head = suppress_through;
         let mut last_frame_at = Instant::now();
+        let mut overlay_sent = false;
+        let mut reorg_sent = false;
 
         loop {
             let since_last = last_frame_at.elapsed();
@@ -386,30 +392,26 @@ where
                     window_secs = heartbeat.as_secs(),
                     "WS heartbeat window expired without frames"
                 );
-                return Ok(last_chain_head);
+                break;
             }
 
             tokio::select! {
                 biased;
 
                 () = self.sender.closed() => {
-                    return Ok(last_chain_head);
+                    return Ok(());
                 }
 
                 head_frame = async { heads.recv().await } => {
                     match head_frame {
                         Some(Ok(n)) => {
-                            last_chain_head = n;
+                            observed_head = observed_head.max(n);
                             last_frame_at = Instant::now();
-                            // Optimistic watermark: newHeads and logs are independent
-                            // subscriptions with no ordering guarantee, so a log for n may
-                            // land after this beat. It is applied at its own height either
-                            // way; the cost is that lag under-reports across that window.
-                            self.send_heartbeat(n, n);
+                            self.send_heartbeat(observed_head, canonical_through);
                         }
                         Some(Err(e)) => {
                             tracing::warn!(error = %e, "WS newHeads error frame");
-                            return Ok(last_chain_head);
+                            break;
                         }
                         None => {
                             tracing::warn!("WS newHeads stream closed; reconnecting");
@@ -422,11 +424,30 @@ where
                     match log_frame {
                         Some(Ok(log)) => {
                             last_frame_at = Instant::now();
-                            self.handle_log_frame(log, last_chain_head).await?;
+                            if let Some(block_number) = log.block_number {
+                                observed_head = observed_head.max(block_number);
+                                self.send_heartbeat(observed_head, canonical_through);
+                            }
+                            match self
+                                .handle_log_with_overlay_fence(
+                                    log,
+                                    canonical_through,
+                                    suppress_through,
+                                    overlay_sent,
+                                )
+                                .await?
+                            {
+                                LogDisposition::Ignored => {}
+                                LogDisposition::Event => overlay_sent = true,
+                                LogDisposition::Rewind => {
+                                    reorg_sent = true;
+                                    break;
+                                }
+                            }
                         }
                         Some(Err(e)) => {
                             tracing::warn!(error = %e, "WS logs error frame");
-                            return Ok(last_chain_head);
+                            break;
                         }
                         // Surviving on one stream reports health it does not have: heads keep
                         // refreshing last_frame_at so the heartbeat never fires, while lag
@@ -443,32 +464,92 @@ where
                         window_secs = heartbeat.as_secs(),
                         "WS heartbeat missed; treating as transport break"
                     );
-                    return Ok(last_chain_head);
+                    break;
                 }
             }
         }
 
-        // Frames already queued when the peer closed are still ours to apply;
-        // dropping them would lose events the reconnect will not replay.
-        while let Ok(Ok(n)) = heads.try_recv() {
-            last_chain_head = n;
-            self.send_heartbeat(n, n);
+        if !reorg_sent {
+            while let Ok(Ok(n)) = heads.try_recv() {
+                observed_head = observed_head.max(n);
+                self.send_heartbeat(observed_head, canonical_through);
+            }
+            while let Ok(Ok(log)) = logs.try_recv() {
+                if let Some(block_number) = log.block_number {
+                    observed_head = observed_head.max(block_number);
+                    self.send_heartbeat(observed_head, canonical_through);
+                }
+                match self
+                    .handle_log_with_overlay_fence(
+                        log,
+                        canonical_through,
+                        suppress_through,
+                        overlay_sent,
+                    )
+                    .await?
+                {
+                    LogDisposition::Ignored => {}
+                    LogDisposition::Event => overlay_sent = true,
+                    LogDisposition::Rewind => {
+                        reorg_sent = true;
+                        break;
+                    }
+                }
+            }
         }
-        while let Ok(Ok(log)) = logs.try_recv() {
-            self.handle_log_frame(log, last_chain_head).await?;
+        if overlay_sent && !reorg_sent {
+            let _ = self
+                .sender
+                .send(IndexerMessage::Reorg {
+                    height: canonical_through,
+                })
+                .await;
         }
-        Ok(last_chain_head)
+        Ok(())
+    }
+
+    async fn backfill_reconnect_gap(
+        &self,
+        mut scanned_through: u64,
+        captured_tip: u64,
+    ) -> Result<u64> {
+        while scanned_through < captured_tip {
+            let to = scanned_through
+                .saturating_add(SCAN_CHUNK_BLOCKS)
+                .min(captured_tip);
+            let events = self
+                .fallback
+                .events_in_range(scanned_through.saturating_add(1), to)
+                .await?;
+            for event in events {
+                let block_height = event_block_number(&event);
+                if self
+                    .sender
+                    .send(IndexerMessage::Event {
+                        event,
+                        block_height,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return Ok(scanned_through);
+                }
+            }
+            scanned_through = to;
+            self.send_heartbeat(captured_tip, scanned_through);
+        }
+        Ok(scanned_through)
     }
 
     async fn handle_log_frame(
         &self,
         log: alloy::rpc::types::eth::Log,
-        observed_head: u64,
-    ) -> Result<()> {
+        canonical_through: u64,
+        suppress_through: u64,
+    ) -> Result<LogDisposition> {
         // Drop logs missing `block_number` rather than fabricate a height from the observed
         // head - a wrong height breaks `Reorg(h)` truncate semantics. Counted by
         // `raven_railgun_indexer_dropped_logs_total`.
-        let _ = observed_head;
         let Some(block_number) = log.block_number else {
             metrics::counter!(
                 "raven_railgun_indexer_dropped_logs_total",
@@ -480,8 +561,20 @@ where
                 topic0 = ?log.topic0(),
                 "dropping log with missing block_number"
             );
-            return Ok(());
+            return Ok(LogDisposition::Ignored);
         };
+        if block_number <= suppress_through {
+            return Ok(LogDisposition::Ignored);
+        }
+        if log.removed {
+            let _ = self
+                .sender
+                .send(IndexerMessage::Reorg {
+                    height: canonical_through,
+                })
+                .await;
+            return Ok(LogDisposition::Rewind);
+        }
         let tx_hash = log.transaction_hash.map_or([0u8; 32], |h| h.0);
         let topic0 = log.topic0().copied().unwrap_or_default();
         let event = decode_log_to_railgun_event(topic0, &log, block_number, tx_hash)?;
@@ -492,9 +585,37 @@ where
             };
             if self.sender.send(msg).await.is_err() {
                 tracing::info!("downstream consumer dropped channel; exiting");
+                return Ok(LogDisposition::Ignored);
+            }
+            return Ok(LogDisposition::Event);
+        }
+        Ok(LogDisposition::Ignored)
+    }
+
+    async fn handle_log_with_overlay_fence(
+        &self,
+        log: alloy::rpc::types::eth::Log,
+        canonical_through: u64,
+        suppress_through: u64,
+        overlay_sent: bool,
+    ) -> Result<LogDisposition> {
+        match self
+            .handle_log_frame(log, canonical_through, suppress_through)
+            .await
+        {
+            Ok(disposition) => Ok(disposition),
+            Err(error) => {
+                if overlay_sent {
+                    let _ = self
+                        .sender
+                        .send(IndexerMessage::Reorg {
+                            height: canonical_through,
+                        })
+                        .await;
+                }
+                Err(error)
             }
         }
-        Ok(())
     }
 
     fn send_heartbeat(&self, chain_head_block: u64, scanned_through_block: u64) {
@@ -514,18 +635,20 @@ where
         started: Instant,
         dwell: Duration,
         scanned_through: u64,
-    ) -> Result<()> {
+    ) -> Result<u64> {
+        let mut scanned_through = scanned_through;
         let base_tick = Duration::from_secs(crate::DEFAULT_POLL_INTERVAL_SECS.max(1));
         let tick = base_tick.min(dwell.max(Duration::from_millis(1)));
         loop {
             if self.sender.is_closed() {
-                return Ok(());
+                return Ok(scanned_through);
             }
             if started.elapsed() >= dwell {
-                return Ok(());
+                return Ok(scanned_through);
             }
             match self.fallback.latest_block().await {
                 Ok(n) => {
+                    scanned_through = self.backfill_reconnect_gap(scanned_through, n).await?;
                     self.send_heartbeat(n, scanned_through);
                 }
                 Err(e) => {
@@ -537,10 +660,12 @@ where
     }
 
     async fn run_polling_indefinitely(&self, scanned_through: u64) -> Result<()> {
+        let mut scanned_through = scanned_through;
         let tick = Duration::from_secs(crate::DEFAULT_POLL_INTERVAL_SECS.max(1));
         while !self.sender.is_closed() {
             match self.fallback.latest_block().await {
                 Ok(n) => {
+                    scanned_through = self.backfill_reconnect_gap(scanned_through, n).await?;
                     self.send_heartbeat(n, scanned_through);
                 }
                 Err(e) => {
@@ -550,6 +675,21 @@ where
             tokio::time::sleep(tick).await;
         }
         Ok(())
+    }
+}
+
+enum LogDisposition {
+    Ignored,
+    Event,
+    Rewind,
+}
+
+fn event_block_number(event: &RailgunEvent) -> u64 {
+    match event {
+        RailgunEvent::Shield { block_number, .. }
+        | RailgunEvent::Transact { block_number, .. }
+        | RailgunEvent::Nullified { block_number, .. }
+        | RailgunEvent::Unshield { block_number, .. } => *block_number,
     }
 }
 

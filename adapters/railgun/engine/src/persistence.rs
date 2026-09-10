@@ -78,6 +78,7 @@ pub struct InspirePersistence {
     scheme_tag: String,
     instance_id: InstanceId,
     commit_notify: tokio::sync::Notify,
+    persisted_cache_fingerprint: Mutex<Option<super::inspire::CacheFingerprint>>,
     /// Leaf count of the store the published snapshot carries. The commit driver
     /// refuses to publish a store below it without a dirty shard to explain the
     /// drop.
@@ -171,6 +172,25 @@ impl InspirePersistence {
     fn layer2_divergent_marker_path(&self) -> std::path::PathBuf {
         self.layout.root().join(LAYER2_DIVERGENT_MARKER)
     }
+
+    fn persist_cache_if_changed(&self, state: &InspireServerState) -> Result<bool> {
+        let fingerprint = state.cache_fingerprint();
+        let mut persisted = self.persisted_cache_fingerprint.lock();
+        if persisted.as_ref() == Some(&fingerprint) {
+            return Ok(false);
+        }
+        state
+            .cache
+            .validate_for(&state.crs, &state.encoded_db)
+            .map_err(|error| {
+                AdapterError::Internal(format!(
+                    "offline packing cache validation before store: {error}"
+                ))
+            })?;
+        super::inspire::persist_inspiring_cache(self.layout.root(), state)?;
+        *persisted = Some(fingerprint);
+        Ok(true)
+    }
 }
 
 /// Store-root file whose presence re-marks an instance divergent on open. A
@@ -186,6 +206,8 @@ pub struct OpenedInstance {
     pub recovered_state: Option<InspireServerState>,
     /// Logical leaf store rebuilt from WAL replay. Empty on fresh bootstrap.
     pub recovered_logical_store: super::inspire::LogicalLeafStore,
+    /// True when recovery reused the validated on-disk packing cache.
+    pub recovered_cache_hit: bool,
 }
 
 /// Reject an encoder whose row width diverges from the recovered cell's;
@@ -274,23 +296,34 @@ impl InspirePersistence {
             }
             // SnapshotId(0) means no commit yet. V6 seeds the replay base with its
             // embedded store; V5 starts empty and relies wholly on WAL replay.
-            let (recovered_state, recovered_seed_store, entries_per_shard) =
-                if manifest.current_snapshot_id == SnapshotId(0) {
-                    (None, super::inspire::LogicalLeafStore::new(), u32::MAX)
-                } else {
-                    let snap =
-                        Snapshot::load(&layout, manifest.current_snapshot_id, SNAPSHOT_MAGIC)
-                            .map_err(|e| AdapterError::Internal(format!("snapshot load: {e}")))?;
-                    let (s, store) = super::inspire::restore_inspire_state_v6(&snap.data)?;
-                    let eps = u32::try_from(
-                        s.encoded_db
-                            .config
-                            .entries_per_shard()
-                            .min(u64::from(u32::MAX)),
-                    )
-                    .unwrap_or(u32::MAX);
-                    (Some(s), store, eps)
-                };
+            let (
+                recovered_state,
+                recovered_seed_store,
+                entries_per_shard,
+                recovered_cache_hit,
+                recovered_cache_persisted,
+            ) = if manifest.current_snapshot_id == SnapshotId(0) {
+                (
+                    None,
+                    super::inspire::LogicalLeafStore::new(),
+                    u32::MAX,
+                    false,
+                    false,
+                )
+            } else {
+                let snap = Snapshot::load(&layout, manifest.current_snapshot_id, SNAPSHOT_MAGIC)
+                    .map_err(|e| AdapterError::Internal(format!("snapshot load: {e}")))?;
+                let (s, store, cache_hit, cache_persisted) =
+                    super::inspire::restore_inspire_state_v6_cached(&snap.data, layout.root())?;
+                let eps = u32::try_from(
+                    s.encoded_db
+                        .config
+                        .entries_per_shard()
+                        .min(u64::from(u32::MAX)),
+                )
+                .unwrap_or(u32::MAX);
+                (Some(s), store, eps, cache_hit, cache_persisted)
+            };
             if let Some(state) = recovered_state.as_ref() {
                 ensure_encoder_matches_stored_cell(
                     state.shard_config(),
@@ -298,6 +331,10 @@ impl InspirePersistence {
                     encoder.as_ref(),
                 )?;
             }
+            let persisted_cache_fingerprint = recovered_state
+                .as_ref()
+                .filter(|_| recovered_cache_persisted)
+                .map(InspireServerState::cache_fingerprint);
             let wal_floor = manifest.current_snapshot_seq.checked_sub(1);
             let wal = Wal::open(&layout, wal_floor)
                 .map_err(|e| AdapterError::Internal(format!("wal open: {e}")))?;
@@ -370,12 +407,14 @@ impl InspirePersistence {
                     scheme_tag,
                     instance_id,
                     commit_notify: tokio::sync::Notify::new(),
+                    persisted_cache_fingerprint: Mutex::new(persisted_cache_fingerprint),
                     committed_leaf_count: std::sync::atomic::AtomicUsize::new(
                         logical_store.leaf_count(),
                     ),
                 },
                 recovered_state,
                 recovered_logical_store: logical_store,
+                recovered_cache_hit,
             })
         } else {
             // No manifest plus a non-empty WAL means ghost entries from a failed bootstrap.
@@ -423,10 +462,12 @@ impl InspirePersistence {
                     scheme_tag,
                     instance_id,
                     commit_notify: tokio::sync::Notify::new(),
+                    persisted_cache_fingerprint: Mutex::new(None),
                     committed_leaf_count: std::sync::atomic::AtomicUsize::new(0),
                 },
                 recovered_state: None,
                 recovered_logical_store: super::inspire::LogicalLeafStore::new(),
+                recovered_cache_hit: false,
             })
         }
     }
@@ -439,7 +480,11 @@ impl InspirePersistence {
         current_block_height: u64,
     ) -> Result<SnapshotId> {
         let bundle = snapshot_inspire_state(state)?;
-        self.commit_serialized_bundle(bundle, current_block_height)
+        let id = self.commit_serialized_bundle(bundle, current_block_height)?;
+        if let Err(error) = self.persist_cache_if_changed(state) {
+            tracing::warn!(error = %error, "offline packing cache store failed after commit");
+        }
+        Ok(id)
     }
 
     /// V6 commit: snapshot `(state, store)`, archive WAL, bump manifest atomically.
@@ -451,6 +496,9 @@ impl InspirePersistence {
     ) -> Result<SnapshotId> {
         let bundle = super::inspire::snapshot_inspire_state_v6(state, store)?;
         let id = self.commit_serialized_bundle(bundle, current_block_height)?;
+        if let Err(error) = self.persist_cache_if_changed(state) {
+            tracing::warn!(error = %error, "offline packing cache store failed after commit");
+        }
         self.committed_leaf_count
             .store(store.leaf_count(), std::sync::atomic::Ordering::Release);
         Ok(id)
@@ -660,6 +708,13 @@ pub enum ConsumerEvent {
     Chain(raven_railgun_core::RailgunEvent, u64),
     /// A reorg fence.
     Reorg(u64),
+    /// A startup fence acknowledged only after its durable commit.
+    ReorgBarrier {
+        /// Highest block that survives the rewind.
+        height: u64,
+        /// Receives the durable-commit outcome.
+        completion: tokio::sync::mpsc::Sender<std::result::Result<(), String>>,
+    },
     /// A PPOI status row from the upstream mirror.
     Ppoi(raven_railgun_persistence::WalEntryPayload, u64),
     /// Heartbeat carrying the chain head and the indexer's scan watermark.
@@ -1275,9 +1330,7 @@ pub async fn run_consumer_task(
                 }
             }
             ConsumerEvent::Reorg(height) => {
-                let p = WalEntryPayload::Reorg { height };
-                if let Err(e) = apply_reorg(
-                    &p,
+                if let Err(e) = apply_indexer_reorg(
                     height,
                     &instance,
                     &persistence,
@@ -1287,11 +1340,25 @@ pub async fn run_consumer_task(
                     &metrics,
                 ) {
                     record_consumer_error(&metrics, &e, "Reorg apply", height);
-                } else {
-                    // Scoped to the rewind depth: the indexer rescans from `height + 1`, so a
-                    // rewind at or above the abandoned block redelivers none of it.
-                    metrics.lock().clear_abandoned_leaves_reopened_by(height);
                 }
+                continue;
+            }
+            ConsumerEvent::ReorgBarrier { height, completion } => {
+                let outcome = apply_indexer_reorg(
+                    height,
+                    &instance,
+                    &persistence,
+                    &logical_store,
+                    &params,
+                    encoder.as_ref(),
+                    &metrics,
+                );
+                if let Err(error) = &outcome {
+                    record_consumer_error(&metrics, error, "Startup reorg apply", height);
+                }
+                let _ = completion
+                    .send(outcome.map_err(|error| error.to_string()))
+                    .await;
                 continue;
             }
             ConsumerEvent::Ppoi(payload, height) => (payload, height),
@@ -1474,6 +1541,32 @@ fn apply_one_leaf(
             metrics,
         )?;
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_indexer_reorg(
+    height: u64,
+    instance: &Arc<PirInstance<RavenInspireScheme>>,
+    persistence: &Arc<InspirePersistence>,
+    logical_store: &Arc<parking_lot::Mutex<super::inspire::LogicalLeafStore>>,
+    params: &raven_inspire::params::InspireParams,
+    encoder: &dyn super::pir_table::PirTableEncoder,
+    metrics: &Arc<parking_lot::Mutex<ConsumerMetrics>>,
+) -> Result<()> {
+    let payload = raven_railgun_persistence::WalEntryPayload::Reorg { height };
+    apply_reorg(
+        &payload,
+        height,
+        instance,
+        persistence,
+        logical_store,
+        params,
+        encoder,
+        metrics,
+    )?;
+    // Only replacement blocks above the fence can heal an abandoned suffix.
+    metrics.lock().clear_abandoned_leaves_reopened_by(height);
     Ok(())
 }
 
@@ -2539,6 +2632,34 @@ mod tests {
         build_toy_state_with_entry_size(TOY_ENTRY_SIZE)
     }
 
+    fn small_params() -> InspireParams {
+        InspireParams {
+            ring_dim: 256,
+            q: 1_152_921_504_606_830_593,
+            crt_moduli: vec![1_152_921_504_606_830_593],
+            p: 65_537,
+            sigma: 6.4,
+            gadget_base: 1 << 20,
+            gadget_len: 3,
+            security_level: raven_inspire::params::SecurityLevel::Bits128,
+        }
+    }
+
+    fn build_small_cache_state_with_key(
+    ) -> Result<(InspireServerState, raven_inspire::rlwe::RlweSecretKey)> {
+        let params = small_params();
+        let db = raven_railgun_testkit::toy_db(256, 32);
+        super::super::inspire::setup_state(&params, &db, 32, InspireVariant::TwoPacking)
+    }
+
+    fn build_small_cache_state() -> Result<InspireServerState> {
+        build_small_cache_state_with_key().map(|(state, _)| state)
+    }
+
+    fn small_cache_encoder() -> Arc<dyn PirTableEncoder> {
+        Arc::new(PerLeafCommitmentEncoder::new(32, 256, 0).expect("small encoder"))
+    }
+
     #[test]
     fn fresh_open_returns_no_recovered_state() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2588,6 +2709,131 @@ mod tests {
         let recovered = opened2.recovered_state.expect("recovered some");
         assert_eq!(recovered.entry_size, state.entry_size);
         assert_eq!(recovered.variant, state.variant);
+    }
+
+    #[test]
+    fn unchanged_commit_skips_cache_rewrite_and_recovery_repairs_corruption() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_small_cache_state().expect("state");
+        let encoded_before = bincode::serialize(&*state.encoded_db).expect("encoded db");
+        let cache_path = dir
+            .path()
+            .join(crate::offline_packing_keys_cache::CACHE_RELATIVE_PATH);
+
+        {
+            let opened = InspirePersistence::open(
+                StoreLayout::open(dir.path()).expect("layout"),
+                SCHEME_TAG,
+                InstanceId::new("cache-skip"),
+                SnapshotPolicy::default(),
+                small_cache_encoder(),
+            )
+            .expect("open");
+            opened
+                .persistence
+                .commit(&state, 100)
+                .expect("first commit");
+            let mut corrupted = std::fs::read(&cache_path).expect("cache bytes");
+            *corrupted.last_mut().expect("nonempty cache") ^= 1;
+            std::fs::write(&cache_path, &corrupted).expect("corrupt cache body");
+
+            opened
+                .persistence
+                .commit(&state, 101)
+                .expect("second commit");
+            assert!(
+                std::fs::read(&cache_path).expect("cache after second commit") == corrupted,
+                "same-identity commit rewrote the cache"
+            );
+        }
+
+        let reopened = InspirePersistence::open(
+            StoreLayout::open(dir.path()).expect("reopen layout"),
+            SCHEME_TAG,
+            InstanceId::new("cache-skip"),
+            SnapshotPolicy::default(),
+            small_cache_encoder(),
+        )
+        .expect("reopen");
+        assert!(!reopened.recovered_cache_hit);
+        let recovered = reopened.recovered_state.expect("recovered state");
+        assert_eq!(
+            bincode::serialize(&*recovered.encoded_db).expect("recovered encoded db"),
+            encoded_before
+        );
+        let columns = recovered
+            .encoded_db
+            .shards
+            .first()
+            .expect("recovered shard")
+            .polynomials
+            .len();
+        let identity = crate::offline_packing_keys_cache::CellShape::for_inspiring(
+            &recovered.crs.params,
+            columns,
+            recovered.crs.inspiring_w_seed,
+        );
+        assert!(matches!(
+            crate::offline_packing_keys_cache::OfflinePackingKeysCache::new(dir.path())
+                .load(&identity),
+            crate::offline_packing_keys_cache::CacheLoad::Hit(_)
+        ));
+        let mut corrupted_again = std::fs::read(&cache_path).expect("repaired cache bytes");
+        *corrupted_again.last_mut().expect("nonempty repaired cache") ^= 1;
+        std::fs::write(&cache_path, &corrupted_again).expect("corrupt repaired cache");
+        reopened
+            .persistence
+            .commit(&recovered, 102)
+            .expect("post-recovery commit");
+        assert!(
+            std::fs::read(&cache_path).expect("cache after post-recovery commit")
+                == corrupted_again,
+            "first post-recovery commit rewrote a successfully repaired cache"
+        );
+    }
+
+    #[test]
+    fn failed_cache_store_is_retried_by_the_next_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_small_cache_state().expect("state");
+        let cache_dir = dir.path().join("cache");
+        std::fs::write(&cache_dir, b"blocks directory creation").expect("cache blocker");
+        let opened = InspirePersistence::open(
+            StoreLayout::open(dir.path()).expect("layout"),
+            SCHEME_TAG,
+            InstanceId::new("cache-retry"),
+            SnapshotPolicy::default(),
+            small_cache_encoder(),
+        )
+        .expect("open");
+
+        opened
+            .persistence
+            .commit(&state, 100)
+            .expect("first commit");
+        std::fs::remove_file(&cache_dir).expect("remove cache blocker");
+        opened
+            .persistence
+            .commit(&state, 101)
+            .expect("retry commit");
+
+        let columns = state
+            .encoded_db
+            .shards
+            .first()
+            .expect("setup shard")
+            .polynomials
+            .len();
+        let identity = crate::offline_packing_keys_cache::CellShape::for_inspiring(
+            &state.crs.params,
+            columns,
+            state.crs.inspiring_w_seed,
+        );
+        assert!(matches!(
+            crate::offline_packing_keys_cache::OfflinePackingKeysCache::new(dir.path())
+                .load(&identity),
+            crate::offline_packing_keys_cache::CacheLoad::Hit(_)
+        ));
     }
 
     /// Fresh-bootstrap replay must include seq 0 inclusive.
@@ -3129,7 +3375,7 @@ mod tests {
         persistence
             .commit_v6(&state, &empty_store, 0)
             .expect("initial commit");
-        let instance = Arc::new(PirInstance::new(
+        let instance: Arc<PirInstance<RavenInspireScheme>> = Arc::new(PirInstance::new(
             InstanceId::new("unsat-shard-fixtures"),
             InstanceRole::Live,
             state,
@@ -3231,6 +3477,96 @@ mod tests {
             "unsatisfiable shard {unsat_id} must be dropped from dirty_shards \
              so subsequent commits do not retry it"
         );
+    }
+
+    #[test]
+    fn drive_commit_carries_sessions_and_copies_the_database_once() {
+        use crate::{InstanceRole, PirInstance};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, secret_key) = build_small_cache_state_with_key().expect("state");
+        let params = small_params();
+        let encoder = small_cache_encoder();
+        let opened = InspirePersistence::open(
+            StoreLayout::open(dir.path()).expect("layout"),
+            SCHEME_TAG,
+            InstanceId::new("drive-commit-contract"),
+            SnapshotPolicy::default(),
+            Arc::clone(&encoder),
+        )
+        .expect("open");
+        let persistence = Arc::new(opened.persistence);
+        let logical_store = Arc::new(parking_lot::Mutex::new(
+            super::super::inspire::LogicalLeafStore::new(),
+        ));
+        persistence
+            .commit_v6(&state, &logical_store.lock(), 0)
+            .expect("initial commit");
+        let instance: Arc<PirInstance<RavenInspireScheme>> = Arc::new(PirInstance::new(
+            InstanceId::new("drive-commit-contract"),
+            InstanceRole::Live,
+            state,
+        ));
+        let registered_state = instance.current_state();
+        let mut client = super::super::inspire::build_client_session(
+            (*registered_state.crs).clone(),
+            secret_key,
+            &params,
+        )
+        .expect("client");
+        super::super::inspire::register_client_session(&mut client, registered_state.as_ref())
+            .expect("register session");
+
+        let donor = instance.current_snapshot();
+        let donor_db_bytes = bincode::serialize(&*donor.state.encoded_db).expect("donor db");
+        let donor_session_store = Arc::clone(&donor.state.session_store);
+        logical_store
+            .lock()
+            .apply(
+                &WalEntryPayload::AppendLeaf {
+                    tree_number: 0,
+                    leaf_index: 0,
+                    commitment: [7; 32],
+                },
+                1,
+                encoder.as_ref(),
+            )
+            .expect("apply leaf");
+        assert_eq!(logical_store.lock().dirty_shards().len(), 1);
+        assert!(logical_store.lock().dirty_shards().contains(&0));
+        let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default()));
+
+        super::drive_commit(
+            &instance,
+            &persistence,
+            &logical_store,
+            &params,
+            encoder.as_ref(),
+            1,
+            &metrics,
+        )
+        .expect("drive commit");
+
+        let published = instance.current_snapshot();
+        assert!(published.epoch > donor.epoch);
+        assert!(logical_store.lock().dirty_shards().is_empty());
+        assert!(!Arc::ptr_eq(
+            &published.state.encoded_db,
+            &donor.state.encoded_db
+        ));
+        assert!(
+            bincode::serialize(&*published.state.encoded_db).expect("published db")
+                != donor_db_bytes
+        );
+        assert_eq!(
+            bincode::serialize(&*donor.state.encoded_db).expect("held donor db"),
+            donor_db_bytes
+        );
+        assert!(Arc::ptr_eq(
+            &published.state.session_store,
+            &donor_session_store
+        ));
+        assert_eq!(published.state.session_store.len(), 1);
     }
 
     /// The empty-dirty branch commits the store verbatim and archives the WAL

@@ -4,8 +4,8 @@
  * Twelve test files used to stub the geometry guard as `() => {}` — a no-op that made
  * the guard invisible: deleting `register_client_session` from the SDK entirely left the
  * whole suite green (D3). This spy records every call and enforces the argument contract,
- * so the guard's call site is at least observable from every stubbed suite, and the D3
- * pin in session_cache.test.ts can assert WHICH bundle the SDK hands it.
+ * so the cold-path call site remains observable from every stubbed suite. The Rust guard
+ * compares that bundle with the session's retained CRS; this spy does not model the comparison.
  */
 
 import type { RavenInspireClientSession } from "../../src/index";

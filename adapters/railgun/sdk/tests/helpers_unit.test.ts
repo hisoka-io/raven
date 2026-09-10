@@ -43,41 +43,24 @@ describe("hex helpers", () => {
   });
 });
 
-describe("hexToBytes DEFECT DH-L0-8: non-hex input is silently accepted and mangled", () => {
-  // CHARACTERIZATION PINS, not endorsements. `Number.parseInt(pair, 16)` returns a
-  // number (not NaN) for any pair whose FIRST character parses — so only the
-  // both-chars-invalid class ('zz', the single case the old test covered) is refused.
-  // hexToBytes is the front door for every blinded commitment the wallet supplies
-  // (client-pir.ts decodeStatusRow BC binding): a typo'd BC does not error, it decodes
-  // to DIFFERENT bytes, the SDK looks up a different index, and a confident verdict
-  // about the wrong commitment comes back. THE INVERSION A FIX MUST MAKE: every case
-  // below must THROW (e.g. validate with /^[0-9a-fA-F]*$/ before decoding) — see the
-  // it.fails trigger test underneath. Fix is owner-reserved (public-API throw surface).
-  it("DEFECT: '4z' decodes to [0x04] instead of throwing", () => {
-    expect(Array.from(hexToBytes("4z"))).toEqual([0x04]);
+describe("hexToBytes validation", () => {
+  it("rejects a partially valid pair", () => {
+    expect(() => hexToBytes("4z")).toThrow(/invalid hex/);
   });
 
-  it("DEFECT: '1g2h' decodes to [0x01, 0x02] instead of throwing", () => {
-    expect(Array.from(hexToBytes("1g2h"))).toEqual([0x01, 0x02]);
+  it("rejects invalid characters across multiple pairs", () => {
+    expect(() => hexToBytes("1g2h")).toThrow(/invalid hex/);
   });
 
-  it("DEFECT: '+1' decodes to [0x01] — parseInt accepts a sign", () => {
-    expect(Array.from(hexToBytes("+1"))).toEqual([0x01]);
+  it("rejects a numeric sign", () => {
+    expect(() => hexToBytes("+1")).toThrow(/invalid hex/);
   });
 
-  it("DEFECT: ' 1' decodes to [0x01] — parseInt accepts leading whitespace", () => {
-    expect(Array.from(hexToBytes(" 1"))).toEqual([0x01]);
+  it("rejects leading whitespace", () => {
+    expect(() => hexToBytes(" 1")).toThrow(/invalid hex/);
   });
 
-  // RED until the DH-L0-8 fix lands in src/client-pir.ts hexToBytes. Trigger: when
-  // hexToBytes validates its input (owner ruling on refusal semantics), this flips from
-  // expected-fail to fail and forces the un-marking plus deletion of the pins above.
-  it.fails("hexToBytes rejects every string containing a non-hex character", () => {
-    for (const bad of ["4z", "1g2h", "+1", " 1"]) {
-      expect(() => hexToBytes(bad), `input ${JSON.stringify(bad)}`).toThrow(/invalid hex/);
-    }
-    // Seeded xorshift32 sweep: even-length strings over a mixed alphabet; any string
-    // with a character outside [0-9a-fA-F] must throw. No new devDependency.
+  it("rejects generated strings containing a non-hex character", () => {
     const alphabet = "0123456789abcdefABCDEFghzZ+ .-_!";
     let s = 0x9e3779b9 | 0;
     const next = (): number => {
@@ -170,13 +153,9 @@ describe("statusByteToPOIStatus", () => {
   it("maps 3 -> Missing", () => {
     expect(statusByteToPOIStatus(3)).toBe("Missing");
   });
-  // PINS A SILENT DOWNGRADE, not a design choice. Any byte outside 0..3 is a row the SDK
-  // does not understand, and it is answered with a real verdict instead of an error. A future
-  // status the server adds -- or a corrupted byte a shorter row cannot bind -- reads as
-  // "no record", which is the non-blocking answer. Raising a DecodeError here is the fix.
-  it("maps every unknown byte to Missing instead of refusing the row", () => {
+  it("refuses every unknown status byte", () => {
     for (const b of [4, 5, 99, 128, 255]) {
-      expect(statusByteToPOIStatus(b), `byte ${b}`).toBe("Missing");
+      expect(() => statusByteToPOIStatus(b), `byte ${b}`).toThrow(/unknown POI status byte/);
     }
   });
 });

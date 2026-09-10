@@ -106,8 +106,8 @@ fn decode_round_trips_every_vector() {
     }
 }
 
-/// The tail is contract, not slack. This is the check that collides with a design that wants
-/// to put a field there; see `docs/OCCURRENCE-COUNT.md` in this crate.
+/// The tail is contract, not slack. This is the check an `occurrence_count` at offset 246
+/// would collide with; see `RecordError::NonZeroPadding`.
 #[test]
 fn a_non_zero_tail_is_refused_at_every_pad_byte() {
     let base = unhex(vectors()["vectors"][0]["cell"].as_str().expect("cell"));

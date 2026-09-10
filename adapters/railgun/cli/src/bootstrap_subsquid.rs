@@ -381,8 +381,6 @@ pub struct BootstrapTreeConfig {
     pub data_dir: PathBuf,
     pub instance_id: String,
     pub scheme_tag: String,
-    pub entries: usize,
-    pub entry_bytes: usize,
     pub max_wall_mins: u64,
     /// Block at which the commitments contract was deployed. Floors the rollover search: an
     /// `eth_call` to an address with no code succeeds returning empty data, so a probe below this
@@ -407,8 +405,6 @@ impl Default for BootstrapTreeConfig {
             data_dir: PathBuf::new(),
             instance_id: "commit-tree-bootstrap".to_owned(),
             scheme_tag: "raven-inspire-twopacking-inspiring-wp3-cache-session".to_owned(),
-            entries: 65_536,
-            entry_bytes: 512,
             max_wall_mins: DEFAULT_MAX_BOOTSTRAP_WALL_MINS,
             contract_start_block: COMMITMENTS_PROXY_START_BLOCK,
             repair_trigger_threshold: BOUNDARY_REPAIR_TRIGGER_THRESHOLD,

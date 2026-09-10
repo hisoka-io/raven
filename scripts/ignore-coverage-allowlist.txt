@@ -13,7 +13,6 @@ adapters/railgun/engine/benches/multi_instance_throughput_bench.rs::multi_instan
 adapters/railgun/engine/benches/offline_packing_keys_cold_vs_warm_bench.rs::production_cell_three_seed_cold_vs_warm
 adapters/railgun/engine/benches/per_encoder_fill_level_sweep_bench.rs::per_insert_wall_time_per_encoder_at_fill_levels
 adapters/railgun/engine/benches/per_insert_wall_time_bench.rs::per_insert_wall_time_per_encoder_at_50pct_fill
-adapters/railgun/engine/benches/recovery_latency_bench.rs::recovery_from_production_cell_snapshot_under_5s
 adapters/railgun/engine/benches/snapshot_codec_acceleration_bench.rs::snapshot_codec_acceleration_at_production_cell
 adapters/railgun/engine/src/imt.rs::insert_rejects_overflow_past_capacity
 adapters/railgun/persistence/benches/snapshot_codec_bench.rs::snapshot_codec_bench_bincode_vs_bitcode
@@ -24,10 +23,7 @@ crates/inspire/src/pir/respond.rs::test_respond_one_packing_correctness
 crates/inspire/src/pir/respond.rs::test_respond_one_packing_small_values
 crates/inspire/tests/e2e_pir.rs::test_e2e_variant_one_packing
 crates/inspire/tests/e2e_pir.rs::test_e2e_variant_two_packing
-crates/inspire/tests/packing_offline_simd_bench.rs::bench_prod_cell_131072x32
-crates/inspire/tests/packing_offline_simd_bench.rs::bench_prod_cell_65536x512
 crates/inspire/tests/raven_local_patches.rs::commit_d_preset_default_q_passes_smoke_at_2_20_x_256b
-crates/inspire/tests/respond_latency_bench.rs::respond_latency_baseline
 crates/isimplepir/tests/kat_fixtures.rs::update_fixtures
 crates/isimplepir/tests/kat_fixtures.rs::update_row_update_fixtures
 
@@ -38,11 +34,6 @@ crates/isimplepir/tests/kat_fixtures.rs::update_row_update_fixtures
 #
 # Red-with-trigger defect pins: deliberately FAILING today. They must NOT gain a lane until
 # the src defect each names is fixed; that is what makes them acceptance tests.
-adapters/railgun/indexer/tests/subscribe_src_defect_pins.rs::removed_log_frame_is_not_forwarded_as_an_event
-adapters/railgun/indexer/tests/subscribe_src_defect_pins.rs::events_missed_between_stream_close_and_reopen_are_backfilled
-crates/inspire/tests/extract_response_length_validation.rs::a_truncated_response_must_not_decode_to_a_zero_tail_record
-crates/inspire/tests/extract_response_length_validation.rs::an_empty_column_list_must_not_decode_to_a_repeated_column_record
-crates/inspire/tests/extract_response_length_validation.rs::an_over_length_response_must_not_be_silently_accepted
 # Timing harnesses moved out of tests/ into benches/, correctness left behind in a lane that runs:
 # the client bench's wasm round trip stayed in tests/wasm_client_roundtrip.rs, and the eth-state
 # cache guard stayed in tests/cached_respond_kat.rs as a non-timing poisoned-cache observable.
@@ -54,3 +45,13 @@ examples/eth-state/benches/cached_respond_latency_bench.rs::cached_vs_noncached_
 # that is what makes them acceptance tests rather than noise.
 adapters/railgun/engine/tests/concurrent_commit_overwrite.rs::two_concurrent_commits_on_one_handle_do_not_publish_each_others_bytes
 adapters/railgun/http/tests/session_route.rs::an_epoch_swap_inside_register_still_returns_200_with_a_dead_handle
+crates/inspire/benches/ifma52_throughput_probe.rs::ifma52_madd_throughput_probe
+crates/inspire/benches/ifma52_throughput_probe.rs::scalar_mulx_throughput_probe
+crates/inspire/benches/packing_offline_simd_bench.rs::bench_prod_cell_131072x32
+crates/inspire/benches/packing_offline_simd_bench.rs::bench_prod_cell_65536x512
+crates/inspire/benches/respond_latency_bench.rs::respond_latency_baseline
+crates/inspire/benches/shoup_microbench.rs::microbench_shoup_pointwise_vs_montgomery
+crates/inspire/benches/shoup_microbench.rs::microbench_shoup_vs_montgomery_forward
+crates/inspire/benches/shoup_microbench.rs::microbench_shoup_vs_montgomery_inverse
+crates/inspire/benches/solinas_microbench.rs::microbench_solinas_forward_inverse_ntt
+crates/inspire/benches/solinas_microbench.rs::microbench_solinas_pointwise_all_variants

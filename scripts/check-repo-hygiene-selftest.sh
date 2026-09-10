@@ -35,7 +35,11 @@ trap 'rm -rf "$work"' EXIT
 # than the thing it validates: an uncommitted leak reads here as "a clean tree passes" while
 # the real gate refuses. Measured before the fix - the gate exited 1 on a working-tree label
 # and this file still reported every case green.
-( cd "$ROOT" && git ls-files -z | tar --null -T - -cf - ) | tar -xf - -C "$work"
+( cd "$ROOT" && git ls-files -z | while IFS= read -r -d '' tracked_file; do
+    if [[ -e "$tracked_file" || -L "$tracked_file" ]]; then
+      printf '%s\0' "$tracked_file"
+    fi
+  done | tar --null -T - -cf - ) | tar -xf - -C "$work"
 git -C "$work" init -q .
 git -C "$work" add -A >/dev/null 2>&1
 cp "$GATE" "$work/scripts/check-repo-hygiene.sh"

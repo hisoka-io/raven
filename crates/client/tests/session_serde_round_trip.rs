@@ -181,9 +181,7 @@ fn wasm_session_deserialize_rejects_oversize_blob_with_typed_error() {
     );
 }
 
-/// The residue-side ring_dim guard: the arg CRS is only magic-validated, then the
-/// residue's own CRS ring_dim (256) is matched against the params bundle (512) and
-/// must error. Confirms from_residue rehydrates from the residue CRS, not the arg.
+/// The residue-side params guard compares the retained session CRS with the live bundle.
 #[test]
 fn wasm_session_deserialize_validates_residue_crs_drift() {
     let params = test_params();
@@ -211,7 +209,53 @@ fn wasm_session_deserialize_validates_residue_crs_drift() {
     let err = deserialize_client_session_rust(&drifted_bundle_bytes, &arg_crs_bytes, &blob)
         .expect_err("residue CRS ring_dim 256 vs bundle 512 must error");
     assert!(
-        err.contains("residue CRS ring_dim"),
-        "expected the residue-side ring_dim guard wording, got: {err}"
+        err.contains("parameters drifted"),
+        "expected the residue-side params guard wording, got: {err}"
     );
+}
+
+#[test]
+fn warm_restore_refuses_p_drift_between_the_residue_and_live_response() {
+    let params = test_params();
+    let database = build_test_db(&params);
+    let mut sampler = GaussianSampler::with_seed(params.sigma, 71);
+    let (crs, encoded_db, secret_key) =
+        inspire_setup(&params, &database, ENTRY_BYTES, &mut sampler).expect("setup");
+    let mut session_sampler = GaussianSampler::with_seed(params.sigma, 72);
+    let session =
+        ClientSession::new(crs.clone(), secret_key.clone(), &mut session_sampler).expect("session");
+    let blob = serialize_client_session_rust(&session).expect("serialize residue");
+
+    let mut live_params = params;
+    live_params.p = 65_539;
+    let mut live_crs = crs;
+    live_crs.params = live_params.clone();
+    let bundle = make_params_bundle(&live_params, &encoded_db.config, &secret_key);
+    let crs_bytes = live_crs.to_versioned_bytes().expect("live CRS");
+
+    let error = deserialize_client_session_rust(&bundle, &crs_bytes, &blob)
+        .expect_err("warm residue from another parameter epoch must fail");
+    assert!(error.contains("parameters drifted"), "{error}");
+}
+
+#[test]
+fn warm_restore_refuses_p_drift_in_the_live_crs_alone() {
+    let params = test_params();
+    let database = build_test_db(&params);
+    let mut sampler = GaussianSampler::with_seed(params.sigma, 81);
+    let (crs, encoded_db, secret_key) =
+        inspire_setup(&params, &database, ENTRY_BYTES, &mut sampler).expect("setup");
+    let mut session_sampler = GaussianSampler::with_seed(params.sigma, 82);
+    let session =
+        ClientSession::new(crs.clone(), secret_key.clone(), &mut session_sampler).expect("session");
+    let blob = serialize_client_session_rust(&session).expect("serialize residue");
+    let bundle = make_params_bundle(&params, &encoded_db.config, &secret_key);
+
+    let mut live_crs = crs;
+    live_crs.params.p = 65_539;
+    let live_crs_bytes = live_crs.to_versioned_bytes().expect("live CRS");
+
+    let error = deserialize_client_session_rust(&bundle, &live_crs_bytes, &blob)
+        .expect_err("live CRS from another parameter epoch must fail");
+    assert!(error.contains("live CRS"), "{error}");
 }

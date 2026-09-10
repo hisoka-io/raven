@@ -312,6 +312,9 @@ async fn drain_until_heartbeats(
             Ok(Some(IndexerMessage::Reorg { height })) => {
                 panic!("no reorg expected in this fixture; got Reorg({height})")
             }
+            Ok(Some(IndexerMessage::ReorgBarrier { height, .. })) => {
+                panic!("no startup reorg expected in this fixture; got Reorg({height})")
+            }
             Ok(None) => break,
             Err(_) => continue,
         }
@@ -430,12 +433,9 @@ async fn walk_back_accepts_a_surviving_tip_inside_the_block_depth_bound() {
     );
 }
 
-/// The worker must be able to REACH the window miss. Guarding the walk-back on
-/// `contains_key(cursor)` skips the check exactly when the window cannot vouch
-/// for the cursor, so a reorg-while-down above the window top is scanned across
-/// in silence.
+/// A recovered cursor above the verified window must rewind before scanning.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn worker_rewinds_to_the_newest_verifiable_height_on_a_window_miss() {
+async fn startup_rewinds_when_the_recovered_cursor_exceeds_the_window() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("window_miss.bin");
     let seeded: BTreeMap<u64, [u8; 32]> = [30_u64, 60, 90]
@@ -454,6 +454,7 @@ async fn worker_rewinds_to_the_newest_verifiable_height_on_a_window_miss() {
     let cfg = IndexerWorkerConfig {
         // Engine watermark ahead of every cached boundary: the hole.
         start_block: 100,
+        recovered_block_height: 100,
         poll_interval_secs: 1,
         chunk_blocks: 30,
         reorg_window_path: Some(path.clone()),
@@ -467,6 +468,15 @@ async fn worker_rewinds_to_the_newest_verifiable_height_on_a_window_miss() {
     while tokio::time::Instant::now() < deadline && marks_after_reorg.len() < 3 {
         match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
             Ok(Some(IndexerMessage::Reorg { height })) => got_reorg = Some(height),
+            Ok(Some(IndexerMessage::ReorgBarrier {
+                height, completion, ..
+            })) => {
+                got_reorg = Some(height);
+                completion
+                    .send(Ok(()))
+                    .await
+                    .expect("startup reorg acknowledgement");
+            }
             Ok(Some(IndexerMessage::Heartbeat {
                 scanned_through_block,
                 ..
@@ -488,8 +498,7 @@ async fn worker_rewinds_to_the_newest_verifiable_height_on_a_window_miss() {
     assert_eq!(
         got_reorg,
         Some(90),
-        "a cursor the window cannot vouch for must rewind to the newest cached \
-         height below it, not scan across the gap"
+        "startup must rewind to the newest verified height, not scan across the gap"
     );
     assert!(
         marks_after_reorg.iter().any(|&w| w > 90),
@@ -497,11 +506,10 @@ async fn worker_rewinds_to_the_newest_verifiable_height_on_a_window_miss() {
     );
 }
 
-/// The restart rebuild walks one entry per block, so it is bounded by BOTH the
-/// depth bound and the entry cap. Spending the depth bound in RPC calls when the
-/// cap will evict all but a handful is restart amplification against the node.
+/// A lone stale tip contains no verified ancestor and must fail before any
+/// attempt to synthesize one from the new chain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restart_rebuild_never_reaches_below_the_entry_cap() {
+async fn restart_without_a_surviving_ancestor_refuses_without_rebuilding() {
     const ENTRY_CAP: usize = 4;
     const TOP: u64 = 1_000;
 
@@ -524,28 +532,23 @@ async fn restart_rebuild_never_reaches_below_the_entry_cap() {
         ..IndexerWorkerConfig::default()
     };
     let join = tokio::spawn(async move { worker.run(cfg).await });
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let mut heartbeats = 0_u32;
-    while tokio::time::Instant::now() < deadline && heartbeats < 2 {
-        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
-            Ok(Some(IndexerMessage::Heartbeat { .. })) => heartbeats += 1,
-            Ok(Some(_)) => continue,
-            Ok(None) => break,
-            Err(_) => continue,
-        }
-    }
-    drop(rx);
-    let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
-
-    assert!(heartbeats >= 2, "worker must run past the restart rebuild");
-    let floor = TOP - ENTRY_CAP as u64;
+    let error = tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("startup must refuse promptly")
+        .expect("worker join")
+        .expect_err("a stale tip alone cannot prove an ancestor");
+    assert!(
+        matches!(error, IndexerError::ReorgTooDeep(TOP)),
+        "unexpected startup error: {error}"
+    );
+    assert!(
+        rx.recv().await.is_none(),
+        "a refused startup must emit nothing"
+    );
     assert_eq!(
         src.lowest_block_hash_queried(),
-        Some(floor),
-        "the rebuild must stop at the entry cap ({ENTRY_CAP} entries below {TOP}), \
-         not spend the {}-block depth bound on hashes the cap evicts",
-        64
+        Some(TOP),
+        "startup must inspect only persisted evidence, not manufacture an ancestor"
     );
 }
 
@@ -572,6 +575,15 @@ async fn drain_while(
         }
         match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
             Ok(Some(IndexerMessage::Reorg { height })) => seen.reorgs.push(height),
+            Ok(Some(IndexerMessage::ReorgBarrier {
+                height, completion, ..
+            })) => {
+                seen.reorgs.push(height);
+                completion
+                    .send(Ok(()))
+                    .await
+                    .expect("startup reorg acknowledgement");
+            }
             Ok(Some(IndexerMessage::Heartbeat {
                 scanned_through_block,
                 ..

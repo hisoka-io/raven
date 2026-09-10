@@ -266,6 +266,9 @@ async fn collect_messages(
                 chain_head_block, ..
             })) => heartbeats.push(chain_head_block),
             Ok(Some(IndexerMessage::Reorg { height })) => reorgs.push(height),
+            Ok(Some(IndexerMessage::ReorgBarrier { height, .. })) => {
+                panic!("subscribe worker cannot emit startup Reorg({height})")
+            }
             Ok(None) => break,
             Err(_) => break,
         }
@@ -284,7 +287,7 @@ async fn happy_path_emits_events_and_heartbeats_then_falls_back() {
         .collect();
 
     let streamer = Arc::new(ScriptedStreamer::new(heads, logs));
-    let fallback = Arc::new(StaticFallback(2_000));
+    let fallback = Arc::new(StaticFallback(99));
     let (tx, mut rx) = mpsc::channel(256);
 
     let worker = Arc::new(SubscribeWorker::new(
@@ -321,7 +324,7 @@ async fn happy_path_emits_events_and_heartbeats_then_falls_back() {
         "expected at least N={N_HEADS} heartbeats from heads, got {}",
         heartbeats.len()
     );
-    assert!(reorgs.is_empty(), "no reorgs expected; got {reorgs:?}");
+    assert_eq!(reorgs, [99], "stream loss must fence the live overlay");
 
     for ev in &events {
         match ev {

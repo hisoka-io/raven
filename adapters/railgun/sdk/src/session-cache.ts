@@ -11,9 +11,10 @@ const STORE = "sessions";
 const KEY_VERSION = 2;
 const CHUNK_SIZE = 32 * 1024 * 1024;
 
-interface CacheBackend {
+export interface SessionCacheStorageForTests {
   get(key: string): Promise<Uint8Array | null>;
-  put(key: string, blob: Uint8Array): Promise<void>;
+  put(records: ReadonlyArray<readonly [string, Uint8Array]>): Promise<void>;
+  deletePrefix(key: string): Promise<void>;
   clear(): Promise<void>;
 }
 
@@ -23,7 +24,7 @@ interface ChunkMeta {
   sha256: string;
 }
 
-let backend: CacheBackend | null = null;
+let backend: IntegrityCache | null = null;
 
 function makeKey(instanceId: string, crsHash: string): string {
   return `v${KEY_VERSION}:${instanceId}:${crsHash}`;
@@ -95,73 +96,83 @@ function planChunks(blobLen: number): { chunkCount: number; ranges: Array<[numbe
   return { chunkCount: ranges.length, ranges };
 }
 
-class MemoryBackend implements CacheBackend {
-  readonly map = new Map<string, Uint8Array>();
+class IntegrityCache {
+  constructor(private readonly storage: SessionCacheStorageForTests) {}
 
   async get(key: string): Promise<Uint8Array | null> {
-    const metaBytes = this.map.get(metaKey(key));
+    const metaBytes = await this.storage.get(metaKey(key));
     if (!metaBytes) return null;
     const meta = decodeMeta(metaBytes);
     if (!meta) {
-      await this.evict(key, 0);
+      await this.storage.deletePrefix(key);
       return null;
     }
     const out = new Uint8Array(meta.totalLen);
-    let off = 0;
-    for (let i = 0; i < meta.chunkCount; i += 1) {
-      const chunk = this.map.get(chunkKey(key, i));
-      if (!chunk || off + chunk.length > meta.totalLen) {
-        await this.evict(key, meta.chunkCount);
+    let offset = 0;
+    for (let index = 0; index < meta.chunkCount; index += 1) {
+      const chunk = await this.storage.get(chunkKey(key, index));
+      if (!chunk || offset + chunk.length > meta.totalLen) {
+        await this.storage.deletePrefix(key);
         return null;
       }
-      out.set(chunk, off);
-      off += chunk.length;
+      out.set(chunk, offset);
+      offset += chunk.length;
     }
-    if (off !== meta.totalLen) {
-      await this.evict(key, meta.chunkCount);
-      return null;
-    }
-    const observed = await sha256Hex(out);
-    if (observed !== meta.sha256) {
-      await this.evict(key, meta.chunkCount);
+    if (offset !== meta.totalLen || (await sha256Hex(out)) !== meta.sha256) {
+      await this.storage.deletePrefix(key);
       return null;
     }
     return out;
   }
 
   async put(key: string, blob: Uint8Array): Promise<void> {
-    const sha = await sha256Hex(blob);
+    const sha256 = await sha256Hex(blob);
     const { chunkCount, ranges } = planChunks(blob.length);
-    // Evict first, else stale chunks survive a shape change.
-    await this.evict(key, chunkCount);
-    for (let i = 0; i < ranges.length; i += 1) {
-      const [start, end] = ranges[i];
-      const piece = new Uint8Array(end - start);
-      piece.set(blob.subarray(start, end));
-      this.map.set(chunkKey(key, i), piece);
+    const records: Array<readonly [string, Uint8Array]> = ranges.map(([start, end], index) => {
+      const chunk = new Uint8Array(end - start);
+      chunk.set(blob.subarray(start, end));
+      return [chunkKey(key, index), chunk] as const;
+    });
+    records.push([
+      metaKey(key),
+      encodeMeta({ chunkCount, totalLen: blob.length, sha256 }),
+    ]);
+    await this.storage.deletePrefix(key);
+    await this.storage.put(records);
+  }
+
+  async clear(): Promise<void> {
+    await this.storage.clear();
+  }
+}
+
+class MemoryStorage implements SessionCacheStorageForTests {
+  readonly map = new Map<string, Uint8Array>();
+
+  async get(key: string): Promise<Uint8Array | null> {
+    return this.map.get(key) ?? null;
+  }
+
+  async put(records: ReadonlyArray<readonly [string, Uint8Array]>): Promise<void> {
+    for (const [key, value] of records) {
+      this.map.set(key, value);
     }
-    const meta: ChunkMeta = { chunkCount, totalLen: blob.length, sha256: sha };
-    this.map.set(metaKey(key), encodeMeta(meta));
+  }
+
+  async deletePrefix(key: string): Promise<void> {
+    for (const storedKey of this.map.keys()) {
+      if (storedKey === key || storedKey.startsWith(`${key}#`)) {
+        this.map.delete(storedKey);
+      }
+    }
   }
 
   async clear(): Promise<void> {
     this.map.clear();
   }
-
-  private async evict(key: string, knownChunkCount: number): Promise<void> {
-    this.map.delete(metaKey(key));
-    this.map.delete(key);
-    const limit = Math.max(knownChunkCount, 1);
-    for (let i = 0; i < limit; i += 1) {
-      this.map.delete(chunkKey(key, i));
-    }
-    for (const k of Array.from(this.map.keys())) {
-      if (k.startsWith(`${key}#chunk-`)) this.map.delete(k);
-    }
-  }
 }
 
-class IndexedDbBackend implements CacheBackend {
+class IndexedDbStorage implements SessionCacheStorageForTests {
   private dbPromise: Promise<IDBDatabase> | null = null;
 
   private openDb(): Promise<IDBDatabase> {
@@ -191,52 +202,30 @@ class IndexedDbBackend implements CacheBackend {
 
   async get(key: string): Promise<Uint8Array | null> {
     const db = await this.openDb();
-    const meta = await this.readMeta(db, key);
-    if (!meta) return null;
-    const chunks = await this.readChunks(db, key, meta.chunkCount);
-    if (!chunks) {
-      await this.evict(key, meta.chunkCount);
-      return null;
-    }
-    const out = new Uint8Array(meta.totalLen);
-    let off = 0;
-    for (const c of chunks) {
-      if (off + c.length > meta.totalLen) {
-        await this.evict(key, meta.chunkCount);
-        return null;
-      }
-      out.set(c, off);
-      off += c.length;
-    }
-    if (off !== meta.totalLen) {
-      await this.evict(key, meta.chunkCount);
-      return null;
-    }
-    const observed = await sha256Hex(out);
-    if (observed !== meta.sha256) {
-      await this.evict(key, meta.chunkCount);
-      return null;
-    }
-    return out;
+    const raw = await new Promise<unknown>((resolve, reject) => {
+      const tx = db.transaction(STORE, "readonly");
+      const request = tx.objectStore(STORE).get(key);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () =>
+        reject(
+          RavenError.decodeError(
+            `session-cache: idb.get failed for ${key}: ${request.error?.message ?? "unknown"}`,
+          ),
+        );
+    });
+    if (raw instanceof Uint8Array) return raw;
+    if (raw instanceof ArrayBuffer) return new Uint8Array(raw);
+    return null;
   }
 
-  async put(key: string, blob: Uint8Array): Promise<void> {
+  async put(records: ReadonlyArray<readonly [string, Uint8Array]>): Promise<void> {
     const db = await this.openDb();
-    const sha = await sha256Hex(blob);
-    const { chunkCount, ranges } = planChunks(blob.length);
-    // Drop any prior shape first so stale chunks cannot linger.
-    await this.evict(key, Number.MAX_SAFE_INTEGER);
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE, "readwrite");
       const store = tx.objectStore(STORE);
-      for (let i = 0; i < ranges.length; i += 1) {
-        const [start, end] = ranges[i];
-        const piece = new Uint8Array(end - start);
-        piece.set(blob.subarray(start, end));
-        store.put(piece, chunkKey(key, i));
+      for (const [key, value] of records) {
+        store.put(value, key);
       }
-      const meta: ChunkMeta = { chunkCount, totalLen: blob.length, sha256: sha };
-      store.put(encodeMeta(meta), metaKey(key));
       tx.oncomplete = () => resolve();
       tx.onerror = () =>
         reject(
@@ -248,6 +237,44 @@ class IndexedDbBackend implements CacheBackend {
         reject(
           RavenError.decodeError(
             `session-cache: idb.put tx aborted: ${tx.error?.message ?? "unknown"}`,
+          ),
+        );
+    });
+  }
+
+  async deletePrefix(key: string): Promise<void> {
+    const db = await this.openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, "readwrite");
+      const store = tx.objectStore(STORE);
+      store.delete(key);
+      const prefix = `${key}#`;
+      const request = store.openCursor();
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return;
+        if (typeof cursor.key === "string" && cursor.key.startsWith(prefix)) {
+          cursor.delete();
+        }
+        cursor.continue();
+      };
+      request.onerror = () =>
+        reject(
+          RavenError.decodeError(
+            `session-cache: idb.deletePrefix failed: ${request.error?.message ?? "unknown"}`,
+          ),
+        );
+      tx.oncomplete = () => resolve();
+      tx.onerror = () =>
+        reject(
+          RavenError.decodeError(
+            `session-cache: idb.deletePrefix tx failed: ${tx.error?.message ?? "unknown"}`,
+          ),
+        );
+      tx.onabort = () =>
+        reject(
+          RavenError.decodeError(
+            `session-cache: idb.deletePrefix tx aborted: ${tx.error?.message ?? "unknown"}`,
           ),
         );
     });
@@ -268,126 +295,18 @@ class IndexedDbBackend implements CacheBackend {
     });
   }
 
-  private async readMeta(db: IDBDatabase, key: string): Promise<ChunkMeta | null> {
-    const raw = await new Promise<unknown>((resolve, reject) => {
-      const tx = db.transaction(STORE, "readonly");
-      const req = tx.objectStore(STORE).get(metaKey(key));
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () =>
-        reject(
-          RavenError.decodeError(
-            `session-cache: idb.get(meta) failed: ${req.error?.message ?? "unknown"}`,
-          ),
-        );
-    });
-    if (raw == null) return null;
-    let bytes: Uint8Array | null = null;
-    if (raw instanceof Uint8Array) bytes = raw;
-    else if (raw instanceof ArrayBuffer) bytes = new Uint8Array(raw);
-    if (!bytes) return null;
-    return decodeMeta(bytes);
-  }
-
-  private async readChunks(
-    db: IDBDatabase,
-    key: string,
-    chunkCount: number,
-  ): Promise<Uint8Array[] | null> {
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, "readonly");
-      const store = tx.objectStore(STORE);
-      const out: Array<Uint8Array | null> = new Array(chunkCount).fill(null);
-      let pending = chunkCount;
-      if (chunkCount === 0) return resolve([]);
-      let failed = false;
-      for (let i = 0; i < chunkCount; i += 1) {
-        const req = store.get(chunkKey(key, i));
-        const idx = i;
-        req.onsuccess = () => {
-          if (failed) return;
-          const v = req.result;
-          if (v instanceof Uint8Array) out[idx] = v;
-          else if (v instanceof ArrayBuffer) out[idx] = new Uint8Array(v);
-          else {
-            failed = true;
-            return resolve(null);
-          }
-          pending -= 1;
-          if (pending === 0 && !failed) {
-            resolve(out as Uint8Array[]);
-          }
-        };
-        req.onerror = () => {
-          if (failed) return;
-          failed = true;
-          reject(
-            RavenError.decodeError(
-              `session-cache: idb.get(chunk ${idx}) failed: ${req.error?.message ?? "unknown"}`,
-            ),
-          );
-        };
-      }
-    });
-  }
-
-  private async evict(key: string, knownChunkCount: number): Promise<void> {
-    const db = await this.openDb();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, "readwrite");
-      const store = tx.objectStore(STORE);
-      store.delete(metaKey(key));
-      store.delete(key);
-      const limit =
-        knownChunkCount === Number.MAX_SAFE_INTEGER ? 0 : Math.max(knownChunkCount, 0);
-      for (let i = 0; i < limit; i += 1) {
-        store.delete(chunkKey(key, i));
-      }
-      // Unknown-upper-bound path: sweep straggler chunk records via cursor.
-      if (knownChunkCount === Number.MAX_SAFE_INTEGER) {
-        const prefix = `${key}#chunk-`;
-        const req = store.openCursor();
-        req.onsuccess = () => {
-          const cursor = req.result;
-          if (!cursor) return;
-          if (typeof cursor.key === "string" && cursor.key.startsWith(prefix)) {
-            cursor.delete();
-          }
-          cursor.continue();
-        };
-        req.onerror = () =>
-          reject(
-            RavenError.decodeError(
-              `session-cache: idb.evict cursor failed: ${req.error?.message ?? "unknown"}`,
-            ),
-          );
-      }
-      tx.oncomplete = () => resolve();
-      tx.onerror = () =>
-        reject(
-          RavenError.decodeError(
-            `session-cache: idb.evict tx failed: ${tx.error?.message ?? "unknown"}`,
-          ),
-        );
-      tx.onabort = () =>
-        reject(
-          RavenError.decodeError(
-            `session-cache: idb.evict tx aborted: ${tx.error?.message ?? "unknown"}`,
-          ),
-        );
-    });
-  }
 }
 
-function ensureBackend(): CacheBackend {
+function ensureBackend(): IntegrityCache {
   if (backend) return backend;
   const idb = (globalThis as { indexedDB?: IDBFactory }).indexedDB;
-  backend = idb ? new IndexedDbBackend() : new MemoryBackend();
+  backend = new IntegrityCache(idb ? new IndexedDbStorage() : new MemoryStorage());
   return backend;
 }
 
-/** Replace the active backend. Test-only seam. */
-export function _setBackendForTests(b: CacheBackend | null): void {
-  backend = b;
+/** Replace only raw storage beneath the production integrity layer. */
+export function _setStorageForTests(storage: SessionCacheStorageForTests | null): void {
+  backend = storage ? new IntegrityCache(storage) : null;
 }
 
 /** Lookup a cached session blob; storage/integrity failures degrade to `null` so a backend issue never breaks query construction. */

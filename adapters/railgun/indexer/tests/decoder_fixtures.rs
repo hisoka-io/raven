@@ -342,7 +342,7 @@ async fn shield_decoder_commitment_hash_matches_poseidon_helper() {
         log: std::sync::Mutex::new(Some(log)),
         logs_tx: std::sync::Mutex::new(None),
     });
-    let fallback = Arc::new(StaticFallback(100));
+    let fallback = Arc::new(StaticFallback(99));
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
     let worker = raven_railgun_indexer::SubscribeWorker::new(streamer, fallback, tx);
     let cfg = raven_railgun_indexer::SubscribeWorkerConfig {

@@ -38,8 +38,15 @@ pub enum IndexerError {
     Rpc(String),
     #[error("decode error: {0}")]
     Decode(String),
-    #[error("reorg detected at depth {0}")]
+    #[error(
+        "reorg at cursor {0} has no verified common ancestor within the configured window; \
+         refusing to continue"
+    )]
     ReorgTooDeep(u64),
+    #[error("startup reorg fence at block {height} failed: {reason}")]
+    ReorgFence { height: u64, reason: String },
+    #[error("indexer startup failed before reconciliation: {0}")]
+    Startup(String),
     #[error("source closed")]
     Closed,
     #[error("alloy error: {0}")]
@@ -112,6 +119,9 @@ const _: () = assert!(
 /// reorg detection. Not a block distance: one entry per tick covers a whole
 /// [`SCAN_CHUNK_BLOCKS`] chunk, so N entries span up to N chunks of blocks.
 pub const REORG_WINDOW_ENTRIES: usize = 256;
+
+/// Maximum startup wait for every consumer to durably commit a reorg fence.
+pub const DEFAULT_REORG_BARRIER_TIMEOUT_SECS: u64 = 300;
 
 /// A source of decoded Railgun chain events, ordered by block.
 ///
@@ -608,6 +618,15 @@ pub enum IndexerMessage {
     },
     /// Reorg fence: surviving entries have `block_height <= height`.
     Reorg { height: u64 },
+    /// Startup reorg fence whose completion follows the consumer's durable commit.
+    ReorgBarrier {
+        /// Highest block that survives the rewind.
+        height: u64,
+        /// Receives the aggregate durable-commit outcome.
+        completion: tokio::sync::mpsc::Sender<std::result::Result<(), String>>,
+        /// Total wait allowed for durable consumer acknowledgements.
+        timeout_secs: u64,
+    },
     /// Heartbeat for liveness and lag-tracking.
     ///
     /// `scanned_through_block` is the worker's scan watermark, NOT the chain
@@ -626,6 +645,12 @@ pub enum IndexerMessage {
 pub struct IndexerWorkerConfig {
     /// Block to start scanning from (resume point).
     pub start_block: u64,
+    /// Operator-configured historical scan floor, separate from recovered state.
+    pub configured_start_block: u64,
+    /// Highest block durably recovered by a consumer at startup.
+    pub recovered_block_height: u64,
+    /// Require a valid nonempty window before serving recovered chain state.
+    pub reorg_window_required: bool,
     /// Polling cadence between calls to `latest_block`.
     pub poll_interval_secs: u64,
     /// Maximum span to fetch per `events_in_range` call.
@@ -639,18 +664,24 @@ pub struct IndexerWorkerConfig {
     pub reorg_window_entries: usize,
     /// Block distance a walk-back may travel below the cursor. Defaults to [`MAX_REORG_BLOCKS`].
     pub reorg_max_depth_blocks: u64,
+    /// Startup durable-fence timeout. Defaults to [`DEFAULT_REORG_BARRIER_TIMEOUT_SECS`].
+    pub reorg_barrier_timeout_secs: u64,
 }
 
 impl Default for IndexerWorkerConfig {
     fn default() -> Self {
         Self {
             start_block: 0,
+            configured_start_block: 0,
+            recovered_block_height: 0,
+            reorg_window_required: false,
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
             chunk_blocks: SCAN_CHUNK_BLOCKS,
             per_tree_start_blocks: std::collections::BTreeMap::new(),
             reorg_window_path: None,
             reorg_window_entries: REORG_WINDOW_ENTRIES,
             reorg_max_depth_blocks: MAX_REORG_BLOCKS,
+            reorg_barrier_timeout_secs: DEFAULT_REORG_BARRIER_TIMEOUT_SECS,
         }
     }
 }
@@ -665,6 +696,15 @@ pub struct IndexerWorker<S: ChainSource + std::fmt::Debug> {
     sender: tokio::sync::mpsc::Sender<IndexerMessage>,
 }
 
+impl<S: ChainSource + std::fmt::Debug> Clone for IndexerWorker<S> {
+    fn clone(&self) -> Self {
+        Self {
+            source: std::sync::Arc::clone(&self.source),
+            sender: self.sender.clone(),
+        }
+    }
+}
+
 impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
     pub fn new(
         source: std::sync::Arc<S>,
@@ -675,6 +715,40 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
 
     /// Run the worker loop until the channel closes or an unrecoverable RPC error fires.
     pub async fn run(&self, config: IndexerWorkerConfig) -> Result<u64> {
+        self.run_with_startup_signal(config, None).await
+    }
+
+    /// Reconcile persisted reorg state before returning a live worker task.
+    pub async fn spawn_reconciled(
+        &self,
+        config: IndexerWorkerConfig,
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        let worker = self.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let handle =
+            tokio::spawn(
+                async move { worker.run_with_startup_signal(config, Some(ready_tx)).await },
+            );
+        let abort_guard = IndexerTaskAbortGuard(handle.abort_handle());
+        if ready_rx.await.is_ok() {
+            return Ok(tokio::spawn(supervise_indexer_task(handle, abort_guard)));
+        }
+        match handle.await {
+            Ok(Err(error)) => Err(error),
+            Ok(Ok(cursor)) => Err(IndexerError::Startup(format!(
+                "worker exited at block {cursor} before signalling readiness"
+            ))),
+            Err(error) => Err(IndexerError::Startup(format!(
+                "worker task join failed: {error}"
+            ))),
+        }
+    }
+
+    async fn run_with_startup_signal(
+        &self,
+        mut config: IndexerWorkerConfig,
+        startup_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<u64> {
         use tokio::time::{interval, Duration, MissedTickBehavior};
         let mut tick = interval(Duration::from_secs(config.poll_interval_secs.max(1)));
         // `Delay` prevents burst catch-up ticks after a stalled scan from hammering the RPC.
@@ -682,11 +756,19 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
         let mut cursor = config.start_block;
         let entry_cap = config.reorg_window_entries.max(1);
         let max_depth_blocks = config.reorg_max_depth_blocks.max(1);
+        let require_startup_evidence = startup_ready.is_some() && config.reorg_window_required;
         // bootstrap from sidecar so a reorg-while-down is detectable on resume.
         let mut hash_cache: std::collections::BTreeMap<u64, [u8; 32]> =
             match config.reorg_window_path.as_ref() {
                 Some(path) => match load_reorg_window(path) {
                     Ok(map) => map,
+                    Err(error) if require_startup_evidence => {
+                        return Err(IndexerError::Startup(format!(
+                            "recovered block {} requires a valid reorg window at {}: {error}",
+                            config.recovered_block_height,
+                            path.display()
+                        )));
+                    }
                     Err(e) => {
                         tracing::warn!(
                             path = %path.display(),
@@ -696,55 +778,72 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
                         std::collections::BTreeMap::new()
                     }
                 },
+                None if require_startup_evidence => {
+                    return Err(IndexerError::Startup(format!(
+                        "recovered block {} has no configured reorg-window sidecar",
+                        config.recovered_block_height
+                    )));
+                }
                 None => std::collections::BTreeMap::new(),
             };
-        // stale top hash means reorg-while-down: refill from RPC so the window
-        // carries a canonical baseline again.
+        if require_startup_evidence && hash_cache.is_empty() {
+            return Err(IndexerError::Startup(format!(
+                "recovered block {} has an empty reorg-window sidecar",
+                config.recovered_block_height
+            )));
+        }
         if let Some(path) = config.reorg_window_path.as_ref() {
-            if let Some((&top_height, &top_hash)) = hash_cache.iter().next_back() {
-                match self.source.block_hash(top_height).await {
-                    Ok(observed) if observed != top_hash => {
-                        tracing::warn!(
-                            top_height,
-                            "indexer reorg-window stale at restart; rebuilding from RPC"
-                        );
-                        hash_cache = self
-                            .rebuild_reorg_window(top_height, max_depth_blocks, entry_cap)
-                            .await;
-                        persist_reorg_window_best_effort(path, &hash_cache);
+            if let Some((&top_height, _)) = hash_cache.iter().next_back() {
+                // Old hashes prove the fence; canonicalizing first preserves orphan rows.
+                let state_horizon = top_height.max(config.recovered_block_height);
+                let mut rewind_to =
+                    detect_reorg_layer1(&*self.source, &hash_cache, top_height, max_depth_blocks)
+                        .await?;
+                if rewind_to.is_none() && config.recovered_block_height > top_height {
+                    rewind_to = Some(top_height);
+                }
+                if let Some(height) = rewind_to {
+                    if state_horizon.saturating_sub(height) > max_depth_blocks {
+                        return Err(IndexerError::ReorgTooDeep(state_horizon));
                     }
-                    // A restart resumes mid-chunk while the window holds only
-                    // chunk tips. A canonical top vouches for every height below
-                    // it, so seed the cursor instead of reading its absence as a
-                    // divergence. Above the top nothing vouches for it.
-                    Ok(_) => {
-                        if cursor > 0 && cursor < top_height && !hash_cache.contains_key(&cursor) {
-                            match self.source.block_hash(cursor).await {
-                                Ok(cursor_hash) => {
-                                    hash_cache.insert(cursor, cursor_hash);
-                                    persist_reorg_window_best_effort(path, &hash_cache);
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        cursor,
-                                        error = %e,
-                                        "indexer resume-cursor hash unavailable; the window \
-                                         cannot vouch for the cursor this tick"
-                                    );
-                                }
-                            }
+                    self.send_startup_reorg(height, config.reorg_barrier_timeout_secs)
+                        .await?;
+                    hash_cache.retain(|&block, _| block <= height);
+                    cursor = config.configured_start_block.max(cursor.min(height));
+                    let first_replayed = height.saturating_add(1);
+                    for floor in config.per_tree_start_blocks.values_mut() {
+                        *floor = config
+                            .configured_start_block
+                            .max((*floor).min(first_replayed));
+                    }
+                    persist_reorg_window_best_effort(path, &hash_cache);
+                }
+                // A missing resume hash would defer reconciliation until after serving starts.
+                if cursor > 0 && !hash_cache.contains_key(&cursor) {
+                    match self.source.block_hash(cursor).await {
+                        Ok(cursor_hash) => {
+                            hash_cache.insert(cursor, cursor_hash);
+                            persist_reorg_window_best_effort(path, &hash_cache);
                         }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            top_height,
-                            error = %e,
-                            "indexer reorg-window stale-check RPC failed; \
-                             keeping in-memory cache"
-                        );
+                        Err(error) if startup_ready.is_some() => return Err(error),
+                        Err(e) => {
+                            tracing::warn!(
+                                cursor,
+                                error = %e,
+                                "indexer resume-cursor hash unavailable; the window \
+                                 cannot vouch for the cursor this tick"
+                            );
+                        }
                     }
                 }
             }
+        }
+        if let Some(ready) = startup_ready {
+            ready.send(()).map_err(|()| {
+                IndexerError::Startup(
+                    "startup observer closed before reconciliation completed".to_owned(),
+                )
+            })?;
         }
         loop {
             tick.tick().await;
@@ -919,9 +1018,40 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
         }
     }
 
-    /// Rebuild the reorg-window cache from RPC below `top_height`. Used when a
-    /// sidecar load detects a chain reorg deeper than the persisted window
-    /// (e.g. reorged-while-down).
+    async fn send_startup_reorg(&self, height: u64, timeout_secs: u64) -> Result<()> {
+        let (completion, mut completed) = tokio::sync::mpsc::channel(1);
+        let timeout_secs = timeout_secs.max(1);
+        self.sender
+            .send(IndexerMessage::ReorgBarrier {
+                height,
+                completion,
+                timeout_secs,
+            })
+            .await
+            .map_err(|_| IndexerError::ReorgFence {
+                height,
+                reason: "engine bridge channel closed before enqueue".to_owned(),
+            })?;
+        match tokio::time::timeout(
+            tokio::time::Duration::from_secs(timeout_secs),
+            completed.recv(),
+        )
+        .await
+        {
+            Ok(Some(Ok(()))) => Ok(()),
+            Ok(Some(Err(reason))) => Err(IndexerError::ReorgFence { height, reason }),
+            Ok(None) => Err(IndexerError::ReorgFence {
+                height,
+                reason: "completion channel closed before the durable commit".to_owned(),
+            }),
+            Err(_) => Err(IndexerError::ReorgFence {
+                height,
+                reason: format!("durable consumer commit exceeded {timeout_secs}s"),
+            }),
+        }
+    }
+
+    /// Rebuild the cache below a cursor that has no verifiable predecessor.
     ///
     /// Bounded by both inputs, which are different units: walking deeper than
     /// `depth_blocks` outruns what the walk-back can use, and walking further
@@ -972,6 +1102,26 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
             Ok(()) => Ok(()),
             Err(_) => Err(()),
         }
+    }
+}
+
+struct IndexerTaskAbortGuard(tokio::task::AbortHandle);
+
+impl Drop for IndexerTaskAbortGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn supervise_indexer_task(
+    handle: tokio::task::JoinHandle<Result<u64>>,
+    _abort_guard: IndexerTaskAbortGuard,
+) {
+    match handle.await {
+        Ok(Ok(cursor)) => tracing::info!(cursor, "chain indexer worker exited"),
+        Ok(Err(error)) => tracing::error!(error = %error, "chain indexer worker exiting"),
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => tracing::error!(error = %error, "chain indexer worker task failed"),
     }
 }
 

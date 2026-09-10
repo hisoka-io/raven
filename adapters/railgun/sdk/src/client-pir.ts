@@ -253,7 +253,7 @@ export function statusByteToPOIStatus(b: number): POIStatus {
     case 3:
       return "Missing";
     default:
-      return "Missing";
+      throw RavenError.decodeError(`statusByteToPOIStatus: unknown POI status byte ${b}`);
   }
 }
 
@@ -279,13 +279,15 @@ export function hexToBytes(hex: string): Uint8Array {
   if (stripped.length % 2 !== 0) {
     throw RavenError.invalidQuery(`hexToBytes: odd-length input (${stripped.length})`);
   }
+  const invalidOffset = stripped.search(/[^0-9a-fA-F]/);
+  if (invalidOffset !== -1) {
+    throw RavenError.invalidQuery(
+      `hexToBytes: invalid hex pair at offset ${invalidOffset - (invalidOffset % 2)}`,
+    );
+  }
   const out = new Uint8Array(stripped.length / 2);
   for (let i = 0; i < out.length; i += 1) {
-    const byte = Number.parseInt(stripped.slice(i * 2, i * 2 + 2), 16);
-    if (Number.isNaN(byte)) {
-      throw RavenError.invalidQuery(`hexToBytes: invalid hex pair at offset ${i * 2}`);
-    }
-    out[i] = byte;
+    out[i] = Number.parseInt(stripped.slice(i * 2, i * 2 + 2), 16);
   }
   return out;
 }
@@ -428,4 +430,3 @@ export function pathIndicesForPerListLeaf(
   }
   return out;
 }
-

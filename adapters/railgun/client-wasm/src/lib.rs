@@ -26,85 +26,54 @@ fn flat_index_for(level: u32, idx_at_level: u32) -> u32 {
 /// `PerNodeEncoder` layout; one PIR query per index, reconstructed client-side.
 #[wasm_bindgen]
 pub fn path_indices_for_leaf(tree_number: u32, leaf_idx: u32) -> Result<Vec<u32>, JsValue> {
-    let _ = tree_number;
-    if leaf_idx >= PATH_INDEX_LEAVES_PER_TREE {
-        return Err(JsValue::from_str(&format!(
-            "path_indices_for_leaf: leaf_idx {leaf_idx} >= 2^TREE_DEPTH ({PATH_INDEX_LEAVES_PER_TREE})"
-        )));
-    }
-    let mut out = Vec::with_capacity(PATH_INDICES_LEN);
-    let mut idx = leaf_idx;
-    for level in 0..PATH_INDEX_TREE_DEPTH {
-        let sibling_idx = idx ^ 1;
-        out.push(flat_index_for(level, sibling_idx));
-        idx >>= 1;
-    }
-    Ok(out)
+    path_indices_for_leaf_impl(tree_number, leaf_idx).map_err(|error| JsValue::from_str(&error))
 }
 
 /// [`path_indices_for_leaf`] under `PerListNodeEncoder`, keyed on `list_key`.
 #[wasm_bindgen]
 pub fn path_indices_for_per_list_leaf(list_key: &[u8], idx: u32) -> Result<Vec<u32>, JsValue> {
-    if list_key.len() != 32 {
-        return Err(JsValue::from_str(&format!(
-            "path_indices_for_per_list_leaf: list_key length {} must be 32",
-            list_key.len()
-        )));
-    }
+    path_indices_for_per_list_leaf_impl(list_key, idx).map_err(|error| JsValue::from_str(&error))
+}
+
+fn path_indices(operation: &str, index_name: &str, idx: u32) -> Result<Vec<u32>, String> {
     if idx >= PATH_INDEX_LEAVES_PER_TREE {
-        return Err(JsValue::from_str(&format!(
-            "path_indices_for_per_list_leaf: idx {idx} >= 2^TREE_DEPTH ({PATH_INDEX_LEAVES_PER_TREE})"
-        )));
+        return Err(format!(
+            "{operation}: {index_name} {idx} >= 2^TREE_DEPTH ({PATH_INDEX_LEAVES_PER_TREE})"
+        ));
     }
-    let mut out = Vec::with_capacity(PATH_INDICES_LEN);
+    let mut indices = Vec::with_capacity(PATH_INDICES_LEN);
     let mut walk = idx;
     for level in 0..PATH_INDEX_TREE_DEPTH {
         let sibling_idx = walk ^ 1;
-        out.push(flat_index_for(level, sibling_idx));
+        indices.push(flat_index_for(level, sibling_idx));
         walk >>= 1;
     }
-    Ok(out)
+    Ok(indices)
+}
+
+fn path_indices_for_leaf_impl(tree_number: u32, leaf_idx: u32) -> Result<Vec<u32>, String> {
+    let _ = tree_number;
+    path_indices("path_indices_for_leaf", "leaf_idx", leaf_idx)
+}
+
+fn path_indices_for_per_list_leaf_impl(list_key: &[u8], idx: u32) -> Result<Vec<u32>, String> {
+    if list_key.len() != 32 {
+        return Err(format!(
+            "path_indices_for_per_list_leaf: list_key length {} must be 32",
+            list_key.len()
+        ));
+    }
+    path_indices("path_indices_for_per_list_leaf", "idx", idx)
 }
 
 /// Rust-native mirror of [`path_indices_for_leaf`].
 pub fn path_indices_for_leaf_rust(tree_number: u32, leaf_idx: u32) -> Result<Vec<u32>, String> {
-    let _ = tree_number;
-    if leaf_idx >= PATH_INDEX_LEAVES_PER_TREE {
-        return Err(format!(
-            "path_indices_for_leaf: leaf_idx {leaf_idx} >= 2^TREE_DEPTH ({PATH_INDEX_LEAVES_PER_TREE})"
-        ));
-    }
-    let mut out = Vec::with_capacity(PATH_INDICES_LEN);
-    let mut idx = leaf_idx;
-    for level in 0..PATH_INDEX_TREE_DEPTH {
-        let sibling_idx = idx ^ 1;
-        out.push(flat_index_for(level, sibling_idx));
-        idx >>= 1;
-    }
-    Ok(out)
+    path_indices_for_leaf_impl(tree_number, leaf_idx)
 }
 
 /// Rust-native mirror of [`path_indices_for_per_list_leaf`].
 pub fn path_indices_for_per_list_leaf_rust(list_key: &[u8], idx: u32) -> Result<Vec<u32>, String> {
-    if list_key.len() != 32 {
-        return Err(format!(
-            "path_indices_for_per_list_leaf: list_key length {} must be 32",
-            list_key.len()
-        ));
-    }
-    if idx >= PATH_INDEX_LEAVES_PER_TREE {
-        return Err(format!(
-            "path_indices_for_per_list_leaf: idx {idx} >= 2^TREE_DEPTH ({PATH_INDEX_LEAVES_PER_TREE})"
-        ));
-    }
-    let mut out = Vec::with_capacity(PATH_INDICES_LEN);
-    let mut walk = idx;
-    for level in 0..PATH_INDEX_TREE_DEPTH {
-        let sibling_idx = walk ^ 1;
-        out.push(flat_index_for(level, sibling_idx));
-        walk >>= 1;
-    }
-    Ok(out)
+    path_indices_for_per_list_leaf_impl(list_key, idx)
 }
 
 #[cfg(test)]

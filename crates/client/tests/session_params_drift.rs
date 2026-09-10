@@ -1,15 +1,9 @@
 //! `register_client_session`'s drift guard, driven on the shipped `#[wasm_bindgen]`
 //! export rather than a mirror.
 //!
-//! The guard (`src/lib.rs:315-323`) is the whole value of the function: it writes
-//! nothing, so if its `Err` arm never fires the call is a no-op with a docstring.
-//! Both known downstream call sites pass the same params bundle that
-//! `build_client_session` consumed one line earlier, so in the shipped flow the
-//! comparison is a value against itself and the arm had never executed. These tests
-//! are the only thing that executes it. (The call sites live in a consumer outside
-//! this workspace; naming them here would put application vocabulary in `crates/`,
-//! which `scripts/check-layering.sh` refuses — it caught exactly that in this file.
-//! The consumer-side detail is recorded in the builder's gap ledger instead.)
+//! The comparison authority is the session's retained CRS, not the params field
+//! populated from the current bundle. This makes the same guard live on cold build
+//! and warm residue restore without changing the residue format.
 //!
 //! WHY THE ERR CASES ARE wasm32-ONLY. The arm's sole effect is `JsValue::from_str`,
 //! and on a non-wasm target that call panics inside an `extern` shim that cannot
@@ -31,8 +25,8 @@
 #[cfg(target_arch = "wasm32")]
 mod wasm_only {
     use raven_client::{
-        build_client_session, build_instance_params_blob, register_client_session,
-        ClientSessionHandle,
+        build_client_session, build_instance_params_blob, deserialize_client_session,
+        register_client_session, serialize_client_session, ClientSessionHandle,
     };
     use raven_inspire::math::GaussianSampler;
     use raven_inspire::params::{InspireParams, SecurityLevel, ShardConfig};
@@ -108,7 +102,7 @@ mod wasm_only {
         };
         let message = err.as_string().unwrap_or_default();
         assert!(
-            message.contains("instance params drift detected"),
+            message.contains("parameters drifted"),
             "drifting {field} produced the wrong error; the guard must be what rejected \
              it, not an incidental decode failure. got: {message}"
         );
@@ -141,6 +135,78 @@ mod wasm_only {
     #[wasm_bindgen_test]
     fn drift_in_sigma_is_rejected() {
         assert_drift_rejected("sigma", |p| p.sigma = 6.5);
+    }
+
+    #[wasm_bindgen_test]
+    fn registration_compares_the_bundle_to_the_session_crs() {
+        let params = base_params();
+        let bundle = bundle_for(&params);
+        let mut crs_params = params;
+        crs_params.p = 65_539;
+        let database = build_db(&crs_params);
+        let mut sampler = GaussianSampler::new(crs_params.sigma);
+        let (crs, _, _) =
+            inspire_setup(&crs_params, &database, ENTRY_BYTES, &mut sampler).expect("drifted CRS");
+        let crs_bincode = crs.to_versioned_bytes().expect("versioned CRS");
+        let mut session = build_client_session(&bundle, &crs_bincode).expect("session");
+
+        let Err(error) = register_client_session(&mut session, &bundle) else {
+            panic!("bundle/session-CRS drift was accepted");
+        };
+        assert!(error
+            .as_string()
+            .unwrap_or_default()
+            .contains("parameters drifted"));
+    }
+
+    #[wasm_bindgen_test]
+    fn warm_restore_compares_the_residue_to_live_params() {
+        let params = base_params();
+        let database = build_db(&params);
+        let mut sampler = GaussianSampler::new(params.sigma);
+        let (crs, _, _) =
+            inspire_setup(&params, &database, ENTRY_BYTES, &mut sampler).expect("base CRS");
+        let base_bundle = bundle_for(&params);
+        let base_crs_bytes = crs.to_versioned_bytes().expect("base CRS bytes");
+        let session = build_client_session(&base_bundle, &base_crs_bytes).expect("session");
+        let residue = serialize_client_session(&session).expect("residue");
+
+        let mut live_params = params;
+        live_params.p = 65_539;
+        let live_bundle = bundle_for(&live_params);
+        let mut live_crs = crs;
+        live_crs.params = live_params;
+        let live_crs_bytes = live_crs.to_versioned_bytes().expect("live CRS bytes");
+
+        let Err(error) = deserialize_client_session(&live_bundle, &live_crs_bytes, &residue) else {
+            panic!("drifted warm residue was accepted");
+        };
+        assert!(error
+            .as_string()
+            .unwrap_or_default()
+            .contains("parameters drifted"));
+    }
+
+    #[wasm_bindgen_test]
+    fn warm_restore_compares_the_residue_to_the_live_crs() {
+        let params = base_params();
+        let database = build_db(&params);
+        let mut sampler = GaussianSampler::new(params.sigma);
+        let (crs, _, _) =
+            inspire_setup(&params, &database, ENTRY_BYTES, &mut sampler).expect("base CRS");
+        let bundle = bundle_for(&params);
+        let crs_bytes = crs.to_versioned_bytes().expect("base CRS bytes");
+        let session = build_client_session(&bundle, &crs_bytes).expect("session");
+        let residue = serialize_client_session(&session).expect("residue");
+
+        let mut live_crs = crs;
+        live_crs.params.p = 65_539;
+        let live_crs_bytes = live_crs.to_versioned_bytes().expect("live CRS bytes");
+
+        let Err(error) = deserialize_client_session(&bundle, &live_crs_bytes, &residue) else {
+            panic!("live-CRS drifted warm residue was accepted");
+        };
+        assert!(error.as_string().unwrap_or_default().contains("live CRS"));
     }
 
     /// The no-false-positive half: the bundle the session was built from must be

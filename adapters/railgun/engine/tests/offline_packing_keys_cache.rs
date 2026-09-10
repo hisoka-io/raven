@@ -22,8 +22,8 @@ const TEST_ENTRY_BYTES: usize = 32;
 const SCHEME_TAG: &[u8] = b"raven-inspire-twopacking-wp3-v1";
 const PACKING_PARAM_ID: &[u8] = b"InspireParams::secure_128_d2048";
 
-fn shared_parts() -> &'static (PackParams, OfflinePackingKeys) {
-    static PARTS: OnceLock<(PackParams, OfflinePackingKeys)> = OnceLock::new();
+fn shared_parts() -> &'static (PackParams, OfflinePackingKeys, bool) {
+    static PARTS: OnceLock<(PackParams, OfflinePackingKeys, bool)> = OnceLock::new();
     PARTS.get_or_init(|| {
         let params = InspireParams::secure_128_d2048();
         let db = synthetic_db(TEST_ENTRIES, TEST_ENTRY_BYTES);
@@ -32,8 +32,18 @@ fn shared_parts() -> &'static (PackParams, OfflinePackingKeys) {
                 .expect("offline_packing_keys_cache: setup_state");
         let pp = state.cache.pack_params().clone();
         let ok = state.cache.offline_keys().clone();
-        (pp, ok)
+        let setup_fields_consumed =
+            state.crs.inspiring_pack_params.is_none() && state.crs.inspiring_packing_key.is_none();
+        (pp, ok, setup_fields_consumed)
     })
+}
+
+#[test]
+fn production_setup_consumes_the_setup_cache_parts() {
+    assert!(
+        shared_parts().2,
+        "setup_state rebuilt the cache instead of consuming setup output"
+    );
 }
 
 fn synthetic_db(entries: usize, entry_bytes: usize) -> Vec<u8> {
@@ -50,6 +60,14 @@ fn test_cell() -> CellShape {
         entry_bytes: TEST_ENTRY_BYTES as u64,
         packing_param_id: PACKING_PARAM_ID.to_vec(),
     }
+}
+
+#[test]
+fn inspiring_seed_change_invalidates_the_cache_identity() {
+    let params = InspireParams::secure_128_d2048();
+    let first = CellShape::for_inspiring(&params, 16, [1; 32]);
+    let second = CellShape::for_inspiring(&params, 16, [2; 32]);
+    assert_ne!(first.fingerprint(), second.fingerprint());
 }
 
 #[test]
@@ -83,6 +101,14 @@ fn cold_load_writes_cache_then_warm_load_skips_offline_phase() {
         warm_cache.pack_params().num_to_pack,
         parts.0.num_to_pack,
         "warm cache pack_params must round-trip"
+    );
+    assert_eq!(
+        bincode::serialize(warm_cache.pack_params()).expect("serialize warm params"),
+        bincode::serialize(&parts.0).expect("serialize source params")
+    );
+    assert_eq!(
+        bincode::serialize(warm_cache.offline_keys()).expect("serialize warm keys"),
+        bincode::serialize(&parts.1).expect("serialize source keys")
     );
 
     eprintln!(
@@ -223,6 +249,24 @@ fn corrupt_cache_file_falls_through_cleanly_then_overwrites() {
     match cache.load(&cell) {
         CacheLoad::Hit(_) => {}
         CacheLoad::Miss(err) => panic!("expected Hit after overwrite, got Miss({err:?})"),
+    }
+}
+
+#[test]
+fn body_hash_rejects_a_validly_decoded_mutation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cache = OfflinePackingKeysCache::new(dir.path());
+    let cell = test_cell();
+    let parts = shared_parts();
+    cache.store(&cell, &parts.0, &parts.1).expect("store");
+    let mut bytes = std::fs::read(cache.path()).expect("read cache");
+    let last = bytes.last_mut().expect("non-empty cache");
+    *last ^= 1;
+    std::fs::write(cache.path(), bytes).expect("write mutation");
+
+    match cache.load(&cell) {
+        CacheLoad::Miss(OfflinePackingKeysCacheError::BodyHashMismatch { .. }) => {}
+        other => panic!("expected BodyHashMismatch, got {other:?}"),
     }
 }
 

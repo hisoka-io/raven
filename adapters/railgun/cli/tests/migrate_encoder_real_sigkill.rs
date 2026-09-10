@@ -112,28 +112,26 @@ fn spawn_park_kill(dir_path: &Path, target: &str, checkpoint: &str) -> String {
         .expect("spawn migrate_chaos_child");
 
     let stdout = child.stdout.take().expect("captured stdout");
-    let mut reader = BufReader::new(stdout);
-
-    let deadline = Instant::now() + SENTINEL_TIMEOUT;
-    let mut found = String::new();
-    let mut line = String::new();
-    while Instant::now() < deadline {
-        line.clear();
-        let n = reader.read_line(&mut line).expect("read child stdout");
-        if n == 0 {
-            break; // EOF before sentinel: child exited unexpectedly
+    let (sentinel_tx, sentinel_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let line = line.expect("read child stdout");
+            if line.contains("\"checkpoint\"") {
+                let _ = sentinel_tx.send(line);
+                return;
+            }
         }
-        let trimmed = line.trim();
-        if trimmed.contains("\"checkpoint\"") {
-            found = trimmed.to_owned();
-            break;
-        }
-    }
-
-    assert!(
-        !found.is_empty(),
-        "child did not emit checkpoint sentinel within {SENTINEL_TIMEOUT:?} for checkpoint={checkpoint}"
-    );
+    });
+    let Ok(found) = sentinel_rx.recv_timeout(SENTINEL_TIMEOUT) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        reader.join().expect("join stdout reader");
+        panic!(
+            "child did not emit checkpoint sentinel within {SENTINEL_TIMEOUT:?} \
+             for checkpoint={checkpoint}"
+        );
+    };
+    reader.join().expect("join stdout reader");
     let expected_fragment = format!("\"checkpoint\":\"{checkpoint}\"");
     assert!(
         found.contains(&expected_fragment),

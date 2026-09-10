@@ -1,7 +1,7 @@
 //! Multi-instance reorg cascade closure.
 //!
-//! Verifies broadcast routing: chain-tree instances see `Reorg` and
-//! truncate leaves; PPOI instances are unaffected.
+//! Verifies acknowledged broadcast routing: chain-tree instances durably
+//! truncate leaves before completion; PPOI instances are unaffected.
 
 #![allow(
     clippy::expect_used,
@@ -102,8 +102,31 @@ fn build_three_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
     ]
 }
 
-async fn drain_for_apply() {
-    tokio::time::sleep(Duration::from_millis(400)).await;
+async fn wait_until_seeded(instances: &[PerInstanceHandles], list_key: &[u8; 32]) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut chain_ready = 0usize;
+        let mut ppoi_ready = false;
+        for handle in instances {
+            let store = handle.logical_store.lock();
+            match handle.config.data_source {
+                DataSourceFilter::ChainTreeNumber(tree) => {
+                    chain_ready += usize::from(store.imt_leaf_count_for(tree) == 5);
+                }
+                DataSourceFilter::PpoiList(_) => {
+                    ppoi_ready = store.ppoi_list_leaves_iter(list_key).count() == 3;
+                }
+            }
+        }
+        if chain_ready == 2 && ppoi_ready {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "three-instance seed did not apply before the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 async fn shutdown_all(handles: Vec<PerInstanceHandles>, channels: OrchestratorChannels) {
@@ -195,7 +218,7 @@ async fn reorg_cascade_truncates_chain_instances_only() {
             .expect("send mirror event");
     }
 
-    drain_for_apply().await;
+    wait_until_seeded(&mh.instances, &lk_a).await;
 
     let mut pre_chain: Vec<(u32, usize)> = Vec::new();
     let mut pre_ppoi: usize = 0;
@@ -216,18 +239,31 @@ async fn reorg_cascade_truncates_chain_instances_only() {
         assert_eq!(*count, 5, "each chain tree should hold 5 leaves pre-reorg");
     }
 
+    let (completion, mut completed) = tokio::sync::mpsc::channel(1);
     mh.channels
         .indexer_tx
-        .send(IndexerMessage::Reorg { height: 102 })
+        .send(IndexerMessage::ReorgBarrier {
+            height: 102,
+            completion,
+            timeout_secs: 60,
+        })
         .await
         .expect("send reorg");
-
-    drain_for_apply().await;
+    tokio::time::timeout(Duration::from_secs(60), completed.recv())
+        .await
+        .expect("reorg barrier timeout")
+        .expect("reorg barrier channel")
+        .expect("every chain consumer must commit the reorg");
 
     for h in &mh.instances {
         let store = h.logical_store.lock();
         match h.config.data_source {
             DataSourceFilter::ChainTreeNumber(t) => {
+                assert_eq!(
+                    h.persistence.manifest_block_height(),
+                    102,
+                    "tree-{t} acknowledgement must follow its durable marker"
+                );
                 let post = store.imt_leaf_count_for(t);
                 assert_eq!(
                     post, 3,
@@ -246,10 +282,45 @@ async fn reorg_cascade_truncates_chain_instances_only() {
     }
 
     let Parts {
-        instances,
+        mut instances,
         channels,
         router,
     } = split(mh);
+    let dead_index = instances
+        .iter()
+        .position(|handle| {
+            matches!(
+                handle.config.data_source,
+                DataSourceFilter::ChainTreeNumber(0)
+            )
+        })
+        .expect("tree-0 handle");
+    let dead = instances.remove(dead_index);
+    dead.consumer.abort();
+    assert!(dead
+        .consumer
+        .await
+        .expect_err("aborted consumer must not complete")
+        .is_cancelled());
+    let (failure_completion, mut failed) = tokio::sync::mpsc::channel(1);
+    channels
+        .indexer_tx
+        .send(IndexerMessage::ReorgBarrier {
+            height: 101,
+            completion: failure_completion,
+            timeout_secs: 60,
+        })
+        .await
+        .expect("send failure probe");
+    let failure = tokio::time::timeout(Duration::from_secs(60), failed.recv())
+        .await
+        .expect("failure barrier timeout")
+        .expect("failure barrier channel")
+        .expect_err("a closed chain consumer must fail the aggregate barrier");
+    assert!(
+        failure.contains("consumer channel closed"),
+        "unexpected aggregate failure: {failure}"
+    );
     shutdown_all(instances, channels).await;
     router.abort();
 }

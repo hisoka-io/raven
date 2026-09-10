@@ -28,6 +28,15 @@ EXPECTED=.github/expected-lane-counts.tsv
 MANIFEST=adapters/railgun/Cargo.toml
 MODE="${1:-check}"
 
+count_nextest_rows() {
+  /usr/bin/grep -cE '^[A-Za-z0-9_-]+(::[A-Za-z0-9_/-]+)? ' || true
+}
+
+if [ "$MODE" = "--count-fixture" ]; then
+  count_nextest_rows
+  exit 0
+fi
+
 # Emit one TSV row per filtered lane: name, packages, cargo flags, extra flags, filter.
 # Sourced from ci.yml itself so a new lane cannot be added without this gate seeing it.
 lanes=$(python3 - "$CI" <<'PY'
@@ -112,7 +121,7 @@ while IFS=$'\t' read -r -u 3 name pkgs flags extra filter; do
   # `raven-railgun-cli::bench/production_cell_budget_bench <test>` — so `/` belongs in the class.
   # Omitting it silently dropped exactly the two SLO benches this build enrolled in the nightly
   # lane, i.e. the check would have gone quiet about the tests it was added to protect.
-  count=$(printf '%s\n' "$out" | /usr/bin/grep -cE '^[A-Za-z0-9_-]+(::[A-Za-z0-9_/-]+)? ')
+  count=$(printf '%s\n' "$out" | count_nextest_rows)
   printf '%s\t%s\n' "$name" "$count" >> "$tmp"
 done 3<<< "$lanes"
 

@@ -188,9 +188,18 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         handle.channels.indexer_tx.clone(),
     );
     // Below the recovered manifest height the indexer re-scans a duplicate prefix.
-    let recovered_floor = opts
-        .start_block
-        .max(handle.persistence.manifest_block_height());
+    let manifest_block_height = handle.persistence.manifest_block_height();
+    let recovered_floor = opts.start_block.max(manifest_block_height);
+    let chain_backed = opts.encoder.chain_tree_number().is_some();
+    let (recovered_block_height, reorg_window_required) = if chain_backed {
+        let store = handle.logical_store.lock();
+        (
+            manifest_block_height.max(store.last_block_height()),
+            manifest_block_height > 0 || store.last_block_height() > 0 || store.leaf_count() > 0,
+        )
+    } else {
+        (0, false)
+    };
     if recovered_floor > opts.start_block {
         tracing::info!(
             toml_start_block = opts.start_block,
@@ -200,10 +209,18 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     }
     let worker_config = IndexerWorkerConfig {
         start_block: recovered_floor,
+        configured_start_block: opts.start_block,
+        recovered_block_height,
+        reorg_window_required,
         poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
+        reorg_window_path: chain_backed.then(|| opts.data_dir.join("indexer_reorg_window.bin")),
         ..IndexerWorkerConfig::default()
     };
-    let indexer_handle = tokio::spawn(async move { worker.run(worker_config).await.map(|_| ()) });
+    let indexer_handle = worker
+        .spawn_reconciled(worker_config)
+        .await
+        .map_err(|error| anyhow::anyhow!("chain indexer startup reconciliation: {error}"))?;
+    let mut indexer_task = AbortOnDropTask::new(indexer_handle);
 
     let mirror_config = MirrorConfig {
         endpoint: opts.mirror_endpoint.clone(),
@@ -235,6 +252,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
             tracing::error!(error = %e, "ppoi mirror worker exiting");
         }
     });
+    let mut mirror_task = AbortOnDropTask::new(mirror_handle);
 
     let mut http_config = HttpConfig::demo(opts.token.clone());
     http_config.max_concurrent_queries = opts.max_concurrent_queries;
@@ -317,6 +335,12 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
 
     // Shutdown -> consumer final drive_commit -> receiver drop closes the bridges ->
     // workers exit. abort_handle is captured before the timeout consumes the JoinHandle.
+    let indexer_handle = indexer_task
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("indexer task handle missing during shutdown"))?;
+    let mirror_handle = mirror_task
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("PPOI mirror task handle missing during shutdown"))?;
     let indexer_abort = indexer_handle.abort_handle();
     let mirror_abort = mirror_handle.abort_handle();
     let _ = handle
@@ -354,6 +378,30 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     }
 
     Ok(())
+}
+
+struct AbortOnDropTask<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropTask<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn take(&mut self) -> Option<tokio::task::JoinHandle<T>> {
+        self.handle.take()
+    }
+}
+
+impl<T> Drop for AbortOnDropTask<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 /// Wait `drain_deadline`, then `abort()` and wait `abort_await_deadline` for

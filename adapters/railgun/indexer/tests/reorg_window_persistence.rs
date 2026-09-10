@@ -313,12 +313,9 @@ async fn indexer_reorg_window_persists_across_restart() {
     );
 }
 
-/// Reorg-while-down: the persisted top hash no longer matches the canonical
-/// chain; the worker must rebuild from RPC at startup and persist the rebuilt
-/// window. Only the sidecar's post-restart CONTENT can prove that: a build
-/// with the rebuild branch disabled passed the previous version of this test.
+/// A restart cannot derive a safe fence when every persisted hash diverges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn indexer_reorg_window_rebuilds_when_chain_advanced_past_cache() {
+async fn indexer_reorg_window_refuses_when_no_ancestor_survives() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("indexer_reorg_window.bin");
 
@@ -365,31 +362,23 @@ async fn indexer_reorg_window_rebuilds_when_chain_advanced_past_cache() {
         ..IndexerWorkerConfig::default()
     };
     let join2 = tokio::spawn(async move { worker2.run(cfg2).await });
-    let deadline2 = tokio::time::Instant::now() + Duration::from_secs(8);
-    let mut got_post = false;
-    while tokio::time::Instant::now() < deadline2 && !got_post {
-        match tokio::time::timeout(Duration::from_millis(800), rx2.recv()).await {
-            Ok(Some(_)) => got_post = true,
-            Ok(None) => break,
-            Err(_) => continue,
-        }
-    }
-    assert!(got_post, "post-rebuild worker must continue emitting");
-    drop(rx2);
-    let _ = tokio::time::timeout(Duration::from_secs(3), join2).await;
-
-    let rebuilt = load_reorg_window(&path).expect("post-rebuild sidecar loads");
-    assert_eq!(
-        rebuilt.get(&20),
-        Some(&[0xff_u8; 32]),
-        "the stale top must be replaced by the post-reorg canonical hash; \
-         sidecar still carries {:?}",
-        rebuilt.get(&20)
+    let error = tokio::time::timeout(Duration::from_secs(3), join2)
+        .await
+        .expect("startup must refuse promptly")
+        .expect("worker join")
+        .expect_err("no persisted common ancestor may be guessed");
+    assert!(
+        matches!(error, IndexerError::ReorgTooDeep(20)),
+        "unexpected startup error: {error}"
     );
     assert!(
-        rebuilt.len() >= 2 && rebuilt.values().all(|h| *h == [0xff_u8; 32]),
-        "the rebuilt window must span below the top with canonical hashes; got {} entries",
-        rebuilt.len()
+        rx2.recv().await.is_none(),
+        "a refused startup must emit nothing"
+    );
+    assert_eq!(
+        load_reorg_window(&path).expect("refused sidecar loads"),
+        stale,
+        "refusal must preserve the old evidence for operator recovery"
     );
 }
 

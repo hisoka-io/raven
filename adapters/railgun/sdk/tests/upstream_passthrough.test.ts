@@ -26,18 +26,14 @@ describe("upstream-passthrough endpoints", () => {
     server.reset();
   });
 
-  // PINS A KNOWN FAIL-OPEN, not an endorsement. With no upstream configured the SDK
-  // answers `true` -- "these roots are valid" -- without asking anyone, so a wallet that
-  // never sets upstreamFallbackEndpoint gets an unconditional yes on every root it holds.
-  // Changing the answer is a public-API contract change; until then this is the assertion
-  // a fix must INVERT.
-  it("answers true without asking anyone when no upstream is configured (fail-open)", async () => {
+  it("refuses validation when no upstream is configured", async () => {
     const sdk = new RavenPOINodeInterface({
       endpoint: server.url,
       bearerToken: TOKEN,
     });
-    const got = await sdk.validatePOIMerkleroots(LIST_KEY_HEX, [ROOT_A, ROOT_B]);
-    expect(got).toBe(true);
+    await expect(
+      sdk.validatePOIMerkleroots(LIST_KEY_HEX, [ROOT_A, ROOT_B]),
+    ).rejects.toThrow(/requires upstreamFallbackEndpoint/);
     expect(sdk.lastWireRequests().length).toBe(0);
   });
 
@@ -59,11 +55,7 @@ describe("upstream-passthrough endpoints", () => {
     expect(await sdk.validatePOIMerkleroots(LIST_KEY_HEX, [ROOT_A])).toBe(false);
   });
 
-  // CHARACTERIZES the unchecked `as boolean` on the upstream body: the JSON is cast, never
-  // parsed, so any truthy shape reads as "valid". `{"ok":"yes"}` is not `true` and is not a
-  // verdict, yet every `if (await validatePOIMerkleroots(...))` caller takes the valid branch.
-  // Inverting this -- rejecting a non-boolean body -- is what a fix looks like.
-  it("passes a non-boolean upstream body straight through as a truthy verdict", async () => {
+  it("refuses a non-boolean upstream verdict", async () => {
     server.route(
       (req) => req.url === "/validate-poi-merkleroots/0/1",
       (_req, _body, res) => {
@@ -76,11 +68,9 @@ describe("upstream-passthrough endpoints", () => {
       bearerToken: TOKEN,
       upstreamFallbackEndpoint: server.url,
     });
-    const got = await sdk.validatePOIMerkleroots(LIST_KEY_HEX, [ROOT_A]);
-    expect(got).not.toBe(true);
-    expect(got).toEqual({ ok: "yes" } as unknown as boolean);
-    // The consequence: a caller branching on the return value cannot tell this from a verdict.
-    expect(Boolean(got)).toBe(true);
+    await expect(sdk.validatePOIMerkleroots(LIST_KEY_HEX, [ROOT_A])).rejects.toThrow(
+      /boolean verdict/,
+    );
   });
 
   it("validatePOIMerkleroots posts the correct shape to upstream", async () => {

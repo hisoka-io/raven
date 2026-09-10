@@ -321,15 +321,7 @@ describe("client-PIR routing + pre-flight", () => {
     expect(ring2.length).toBe(len1);
   });
 
-  it("PINS A LIVE ALIASING HAZARD: lastWireRequests bodies alias the retained ring buffers", async () => {
-    // CHARACTERIZATION, not an endorsement. `.map()` makes the ARRAY fresh
-    // unconditionally (the test above cannot fail for any implementation), but the copy
-    // is shallow: `body: r.body` passes the retained buffer by reference
-    // (src/raven-poi-node-interface.ts lastWireRequests). Those buffers carry plaintext
-    // blinded commitments on the passthrough routes, so a caller handing the snapshot to
-    // a logger that normalises in place corrupts the SDK's own retained state. The
-    // one-line fix a repair must make is `body: new Uint8Array(r.body)` — and it must
-    // INVERT this assertion (owner-side src change; this lane's src surface is frozen).
+  it("lastWireRequests deep-clones retained request bodies", async () => {
     server.route(
       () => true,
       (_req, _body, res) => {
@@ -357,8 +349,6 @@ describe("client-PIR routing + pre-flight", () => {
     const before = sdk.lastWireRequests()[0].body[0];
     ring1[0].body[0] = before ^ 0xff;
     const after = sdk.lastWireRequests()[0].body[0];
-    expect(after, "bodies are currently ALIASED; a defensive copy flips this to before").toBe(
-      before ^ 0xff,
-    );
+    expect(after).toBe(before);
   });
 });

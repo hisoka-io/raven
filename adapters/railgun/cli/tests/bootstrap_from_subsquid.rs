@@ -317,9 +317,6 @@ fn cfg_for(tree_number: u32, dir: std::path::PathBuf) -> BootstrapTreeConfig {
         checkpoint_depth: 64,
         data_dir: dir,
         instance_id: format!("commit-tree-{tree_number}"),
-        // tiny cell so tests run in seconds; production cell lives behind #[ignore] benches
-        entries: 16,
-        entry_bytes: 32,
         max_wall_mins: 5,
         // A real caller builds the encoder from the tree it is bootstrapping; inheriting
         // the default's tree-0 encoder is the mismatch `EncoderTreeMismatch` refuses.
@@ -850,8 +847,6 @@ fn cfg_for_boundary(tree_number: u32, dir: std::path::PathBuf) -> BootstrapTreeC
         checkpoint_depth: 64,
         data_dir: dir,
         instance_id: format!("commit-tree-boundary-{tree_number}"),
-        entries: 16,
-        entry_bytes: 32,
         max_wall_mins: 5,
         repair_trigger_threshold: 4,
         expected_filled_count: 8,
@@ -977,8 +972,6 @@ async fn boundary_repair_recovers_missing_position_0_in_tree_1_via_carry_with_ta
         checkpoint_depth: 64,
         data_dir: fresh_data_dir("recover-tree-0"),
         instance_id: "commit-tree-0-recover".to_owned(),
-        entries: 16,
-        entry_bytes: 32,
         max_wall_mins: 5,
         repair_trigger_threshold: 4,
         expected_filled_count: 4,
@@ -1146,7 +1139,7 @@ async fn boundary_repair_post_fix_chain_oracle_byte_identity_passes_all_three_fi
     assert!(carry.is_empty(), "no residue after final tree drains carry");
 }
 
-/// Bootstrap at the locked production cell (65,536 x 512 B) must recover the
+/// Bootstrap at the encoder-derived production cell (65,536 x 32 B) must recover the
 /// exact root the chain recorded, not merely finish.
 ///
 /// Formerly three "seeds" that asserted nothing. The three runs shared one
@@ -1154,7 +1147,7 @@ async fn boundary_repair_post_fix_chain_oracle_byte_identity_passes_all_three_fi
 /// `data_dir` name, so they were the same bootstrap three times — three full
 /// production-cell bootstraps per push, buying nothing. One run, asserted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "one full bootstrap at the 65,536 x 512 B production cell. Trigger: changing the \
+#[ignore = "one full bootstrap at the 65,536 x 32 B production cell. Trigger: changing the \
             bootstrap path or the closing-root comparison at production parameters."]
 async fn bootstrap_three_seed_production_cell_bench() {
     let (rows, root) = synthetic_leaves(64);
@@ -1165,8 +1158,6 @@ async fn bootstrap_three_seed_production_cell_bench() {
         checkpoint_depth: 64,
         data_dir: fresh_data_dir("prod-cell-bootstrap"),
         instance_id: "commit-tree-prod-cell".to_owned(),
-        entries: 65_536,
-        entry_bytes: 512,
         max_wall_mins: 30,
         ..BootstrapTreeConfig::default()
     };
@@ -1191,7 +1182,7 @@ async fn bootstrap_three_seed_production_cell_bench() {
         "the closing root must be one rootHistory holds"
     );
     eprintln!(
-        "production cell (65536 x 512 B): leaves={} wall={:.3}s",
+        "production cell (65536 x 32 B): leaves={} wall={:.3}s",
         report.leaves, report.wall_clock_secs
     );
 }
@@ -1358,7 +1349,6 @@ async fn bootstrap_with_encoder_per_leaf_path_writes_correct_manifest_label() {
     let dir = fresh_data_dir("commit-tree-0-encoder-per-leaf-path");
     let mut cfg = cfg_for(0, dir.clone());
     cfg.encoder_kind = EncoderKind::PerLeafPath { tree_number: 0 };
-    cfg.entry_bytes = 512;
     bootstrap_one_tree(&cfg, &leaves, &chain)
         .await
         .expect("bootstrap with per-leaf-path encoder ok");

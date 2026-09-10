@@ -11,7 +11,8 @@ use raven_inspire::ServerInspiringCache;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const CACHE_MAGIC: [u8; 8] = *b"RVN_OPK1";
+const CACHE_MAGIC: [u8; 8] = *b"RVN_OPK2";
+const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Standard relative path under `<data_dir>`.
 pub const CACHE_RELATIVE_PATH: &str = "cache/offline_packing_keys.bin";
@@ -41,6 +42,22 @@ pub enum OfflinePackingKeysCacheError {
         /// Hex of on-disk fingerprint.
         found: String,
     },
+    /// Decoded cache parts do not match their stored digest.
+    #[error("body hash mismatch: expected {expected}, found {found}")]
+    BodyHashMismatch {
+        /// Digest stored beside the body.
+        expected: String,
+        /// Digest recomputed from the decoded body.
+        found: String,
+    },
+    /// Cache file exceeds the local sidecar allocation bound.
+    #[error("cache file too large: {actual} bytes exceeds {limit} byte limit")]
+    TooLarge {
+        /// Observed or encoded file size.
+        actual: u64,
+        /// Maximum accepted sidecar size.
+        limit: u64,
+    },
     /// Cache was produced by a different scheme.
     #[error("scheme mismatch: expected {expected:?}, found {found:?}")]
     SchemeMismatch {
@@ -65,6 +82,38 @@ pub struct CellShape {
 }
 
 impl CellShape {
+    /// Exact InspiRING cache identity: params, packing width, and public seed.
+    #[must_use]
+    pub fn for_inspiring(
+        params: &raven_inspire::params::InspireParams,
+        num_columns: usize,
+        inspiring_w_seed: [u8; 32],
+    ) -> Self {
+        let mut identity = Vec::new();
+        identity.extend_from_slice(&(params.ring_dim as u64).to_le_bytes());
+        identity.extend_from_slice(&params.q.to_le_bytes());
+        identity.extend_from_slice(&params.p.to_le_bytes());
+        identity.extend_from_slice(&params.sigma.to_bits().to_le_bytes());
+        identity.extend_from_slice(&params.gadget_base.to_le_bytes());
+        identity.extend_from_slice(&(params.gadget_len as u64).to_le_bytes());
+        identity.push(match params.security_level {
+            raven_inspire::params::SecurityLevel::Bits128 => 0,
+            raven_inspire::params::SecurityLevel::Bits256 => 1,
+        });
+        identity.extend_from_slice(&(params.crt_moduli.len() as u64).to_le_bytes());
+        for modulus in &params.crt_moduli {
+            identity.extend_from_slice(&modulus.to_le_bytes());
+        }
+        identity.extend_from_slice(&(num_columns as u64).to_le_bytes());
+        identity.extend_from_slice(&inspiring_w_seed);
+        Self {
+            scheme_tag: b"raven-inspire-cache-v2".to_vec(),
+            entries: 0,
+            entry_bytes: 0,
+            packing_param_id: identity,
+        }
+    }
+
     /// SHA-256 fingerprint of this cell shape.
     #[must_use]
     pub fn fingerprint(&self) -> [u8; 32] {
@@ -91,6 +140,7 @@ struct CacheFile {
     scheme_tag: Vec<u8>,
     entries: u64,
     entry_bytes: u64,
+    body_hash: [u8; 32],
     pack_params: PackParams,
     offline_keys: OfflinePackingKeys,
 }
@@ -152,6 +202,13 @@ impl OfflinePackingKeysCache {
     }
 
     fn try_load(&self, cell: &CellShape) -> Result<CacheLoad, OfflinePackingKeysCacheError> {
+        let file_len = fs::metadata(&self.path)?.len();
+        if file_len > MAX_CACHE_FILE_BYTES {
+            return Err(OfflinePackingKeysCacheError::TooLarge {
+                actual: file_len,
+                limit: MAX_CACHE_FILE_BYTES,
+            });
+        }
         let bytes = fs::read(&self.path)?;
         let file: CacheFile = bincode::deserialize(&bytes)?;
         if file.magic != CACHE_MAGIC {
@@ -176,6 +233,13 @@ impl OfflinePackingKeysCache {
                 found: hex_encode(&file.fingerprint),
             });
         }
+        let observed_body_hash = cache_body_hash(&file.pack_params, &file.offline_keys)?;
+        if file.body_hash != observed_body_hash {
+            return Err(OfflinePackingKeysCacheError::BodyHashMismatch {
+                expected: hex_encode(&file.body_hash),
+                found: hex_encode(&observed_body_hash),
+            });
+        }
         Ok(CacheLoad::Hit(Box::new(CacheParts {
             pack_params: file.pack_params,
             offline_keys: file.offline_keys,
@@ -198,10 +262,17 @@ impl OfflinePackingKeysCache {
             scheme_tag: cell.scheme_tag.clone(),
             entries: cell.entries,
             entry_bytes: cell.entry_bytes,
+            body_hash: cache_body_hash(pack_params, offline_keys)?,
             pack_params: pack_params.clone(),
             offline_keys: offline_keys.clone(),
         };
         let bytes = bincode::serialize(&file)?;
+        if bytes.len() as u64 > MAX_CACHE_FILE_BYTES {
+            return Err(OfflinePackingKeysCacheError::TooLarge {
+                actual: bytes.len() as u64,
+                limit: MAX_CACHE_FILE_BYTES,
+            });
+        }
         atomic_write(&self.path, &bytes)?;
         Ok(())
     }
@@ -237,6 +308,14 @@ impl OfflinePackingKeysCache {
             }
         }
     }
+}
+
+fn cache_body_hash(
+    pack_params: &PackParams,
+    offline_keys: &OfflinePackingKeys,
+) -> Result<[u8; 32], OfflinePackingKeysCacheError> {
+    let bytes = bincode::serialize(&(pack_params, offline_keys))?;
+    Ok(Sha256::digest(bytes).into())
 }
 
 /// Composite error from [`OfflinePackingKeysCache::load_or_build`].

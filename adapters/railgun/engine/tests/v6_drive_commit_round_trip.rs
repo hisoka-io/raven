@@ -1,6 +1,5 @@
-//! Regression guard for the V6 snapshot envelope across the open path
-//! and every `drive_commit` exit site: a `commit_v6` snapshot whose
-//! store carries 5 leaves must reopen with those leaves intact. A writer
+//! Regression guard for the V6 snapshot envelope across `commit_v6` and open:
+//! a snapshot whose store carries 5 leaves must reopen with those leaves intact. A writer
 //! dropping the store, or a reader on the V5 codec, recovers an empty store and fails here.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]

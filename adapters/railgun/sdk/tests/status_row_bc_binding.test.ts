@@ -150,14 +150,12 @@ describe("T1 status verdict is bound to the requested blinded commitment", () =>
     }
   });
 
-  // The consequence of the unknown-byte downgrade, at the level a wallet sees it: a row whose
-  // BC tail binds correctly but whose status byte the SDK does not know is answered as though
-  // the record were absent, and nothing in the result says the byte was unrecognised.
-  it("answers an unrecognised status byte as Missing rather than refusing the row", async () => {
+  it("refuses an unrecognised status byte after binding the row", async () => {
     for (const statusByte of [4, 99, 255]) {
       mountStatusRoute(server, statusRow(statusByte, BC_AT_IDX_0, STATUS_ROW_BYTES));
-      const got = await askStatus(sdkFor(server));
-      expect(got[BC_AT_IDX_0][LIST_KEY_HEX], `byte ${statusByte}`).toBe("Missing");
+      await expect(askStatus(sdkFor(server)), `byte ${statusByte}`).rejects.toThrow(
+        /unknown POI status byte/,
+      );
       server.reset();
     }
   });

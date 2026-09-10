@@ -104,6 +104,8 @@ jobs:
           wasm-pack test --node crates/client --test session_params_drift
       - name: cargo fmt (raven-inspire-client-wasm)
         run: cargo fmt --manifest-path adapters/railgun/client-wasm/Cargo.toml -- --check
+      - name: cargo test (native, raven-inspire-client-wasm)
+        run: cargo test --manifest-path adapters/railgun/client-wasm/Cargo.toml
       - name: cargo check (wasm32, raven-inspire-client-wasm)
         run: cargo check --manifest-path adapters/railgun/client-wasm/Cargo.toml --target wasm32-unknown-unknown
       - name: cargo clippy (wasm32, raven-inspire-client-wasm)
@@ -413,7 +415,7 @@ jobs:
           #   - `boundary_repair_three_seed_per_tree_bench` was excluded as a timing
           #     harness with no assertions. It now asserts the recovered root, the leaf
           #     count and the tail-gap refusal per arm, and passes in 25.1 s.
-          # The lane selects 65 tests. Two gates keep this honest: check-ci-filter-names.sh
+          # The lane selects 63 tests. Two gates keep this honest: check-ci-filter-names.sh
           # fails the build when a filter term stops resolving (it caught the dead
           # subtraction term above), and check-ignore-coverage.sh fails when a new
           # ignored test lands with no lane and no allowlist entry.
@@ -532,7 +534,7 @@ jobs:
       - name: cargo nextest (production-cell closure, ignored included)
         run: |
           # --all-targets is REQUIRED, not cosmetic: without it cargo does not build
-          # bench targets at all, the two bench binary() terms below would match
+          # bench targets at all, the three bench binary() terms below would match
           # nothing, and the SLO gates would report green while asserting nothing —
           # the exact failure this lane exists to prevent. The `-E` list keeps the
           # run scoped despite --all-targets, so the remaining tens-of-minutes
@@ -545,7 +547,7 @@ jobs:
             --cargo-profile ci-test \
             --profile production-cell \
             --run-ignored all \
-            -E 'binary(db1_note_record_production_cell) + binary(db2_block_production_cell) + binary(cell_width_runtime_gate) + binary(per_leaf_path_production_cell) + binary(per_node_production_cell) + binary(production_cell_budget_bench) + binary(populate_bench)'
+            -E 'binary(db1_note_record_production_cell) + binary(db2_block_production_cell) + binary(cell_width_runtime_gate) + binary(per_leaf_path_production_cell) + binary(per_node_production_cell) + binary(production_cell_budget_bench) + binary(populate_bench) + binary(recovery_latency_bench)'
       - name: sccache stats
         run: sccache --show-stats
         if: always()
@@ -639,10 +641,21 @@ jobs:
             echo "runner LACKS avx512ifma - the SIMD differential halves will loud-skip by name"
           fi
       - name: cargo test (default)
+        # Five timing harnesses (10 tests) live under benches/ and run only by hand;
+        # the all-target clippy step above still compiles them on every push.
         run: cargo test --manifest-path crates/inspire/Cargo.toml --release
       - name: cargo test (parallel feature)
         # re-runs the byte-identity KAT under the rayon path so it cannot regress undetected
         run: cargo test --manifest-path crates/inspire/Cargo.toml --release --features parallel
+      - name: cargo test (mod-switch response contract)
+        run: |
+          test_name=tree_responder_round_trips_through_the_existing_rims_byte_two_decoder
+          listed=$(cargo test --manifest-path crates/inspire/Cargo.toml --release \
+            --features mod-switch-response --test response_mode_contract -- --list)
+          /usr/bin/grep -Fxq "$test_name: test" <<< "$listed"
+          cargo test --manifest-path crates/inspire/Cargo.toml --release \
+            --features mod-switch-response --test response_mode_contract \
+            "$test_name" -- --exact
       - name: cargo test (simd-packing-offline feature)
         # Without this feature the packing dispatch under test IS the scalar reference, so the
         # differential compares a loop with itself. Nothing in CI built it until now, which is

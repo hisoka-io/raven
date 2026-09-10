@@ -233,7 +233,7 @@ export class RavenPOINodeInterface {
     return this.capturedRequests.map((r) => ({
       url: r.url,
       method: r.method,
-      body: r.body,
+      body: new Uint8Array(r.body),
     }));
   }
 
@@ -317,7 +317,11 @@ export class RavenPOINodeInterface {
     listKey: string,
     poiMerkleroots: string[],
   ): Promise<boolean> {
-    if (!this.upstream) return true;
+    if (!this.upstream) {
+      throw RavenError.invalidQuery(
+        "validatePOIMerkleroots requires upstreamFallbackEndpoint",
+      );
+    }
     const body = JSON.stringify({
       chainType: String(this.chainType),
       chainID: String(this.chainId),
@@ -343,7 +347,14 @@ export class RavenPOINodeInterface {
         status: res.status,
       });
     }
-    return (await res.json()) as boolean;
+    const verdict: unknown = await res.json();
+    if (typeof verdict !== "boolean") {
+      throw RavenError.decodeError(
+        `validatePOIMerkleroots: upstream response must be a boolean verdict, got ${typeof verdict}`,
+        { url },
+      );
+    }
+    return verdict;
   }
 
   // `POINodeInterface.submitPOI` (engine/src/poi/poi-node-interface.ts:37-47);

@@ -1,14 +1,11 @@
 //! A cached session must be refused against a CRS it was not derived under.
 //!
-//! Packing keys depend on `(CRS, rlwe_sk, w_seed)` - the scheme crate says so in its own module
-//! doc - and nothing in the Rust layers enforces it. `ClientPackingKeys` carries no seed field, and
-//! the server's only geometry check compares gamma and the key material's length, both of which a
-//! stale key set satisfies exactly. So a session cached under one CRS and reused after the server
-//! re-ran setup produces a well-formed query, a successful respond, and a successful extract that
-//! returns bytes unrelated to the record.
+//! Packing keys depend on `(CRS, rlwe_sk, w_seed)`. The warm-session loader is the Rust layer that
+//! binds the retained session CRS to the current one; bypassing it leaves a stale key set with valid
+//! geometry and produces a successful response containing unrelated bytes.
 //!
 //! The seed needed to catch it is already on the wire: the server strips `galois_keys` from the CRS
-//! it publishes but keeps `inspiring_w_seed`, so the client holds both values and compares neither.
+//! it publishes but keeps `inspiring_w_seed`, so the loader can compare both values.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 

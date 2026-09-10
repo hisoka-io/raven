@@ -14,6 +14,8 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use proptest::prelude::*;
+use proptest::test_runner::{Config as ProptestConfig, TestRunner};
 use raven_railgun_core::{InstanceId, Result as RailgunResult};
 use raven_railgun_engine::{Engine, InstanceRole, PirInstance, PirScheme};
 use raven_railgun_http::{router, write_versioned, AppState, HttpConfig};
@@ -98,6 +100,71 @@ async fn spawn_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
 
 fn query_body(nonce: u64) -> Vec<u8> {
     write_versioned(&EchoQuery { nonce }).expect("encode versioned query")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_non_exact_authorization_value_returns_401() {
+    let (addr, handle) = spawn_server().await;
+    let url = format!("http://{addr}/v1/instance/{INSTANCE}/query");
+    let exact = format!("Bearer {TOKEN}");
+    let strategy = proptest::collection::vec(0x21u8..=0x7e, 0..128)
+        .prop_map(|bytes| String::from_utf8(bytes).expect("printable ASCII"))
+        .prop_filter("exclude the exact credential", {
+            let exact = exact.clone();
+            move |candidate| candidate != &exact
+        });
+    let generated = std::cell::RefCell::new(Vec::new());
+    let mut runner = TestRunner::new(ProptestConfig {
+        cases: 256,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    });
+    runner
+        .run(&strategy, |candidate| {
+            generated.borrow_mut().push(Some(candidate));
+            Ok(())
+        })
+        .expect("authorization strategy");
+    let mut generated = generated.into_inner();
+    generated.extend([
+        None,
+        Some(format!("bearer {TOKEN}")),
+        Some(format!("BEARER {TOKEN}")),
+        Some(format!("Bearer  {TOKEN}")),
+        Some(format!("Bearer {TOKEN}x")),
+        Some(format!("xBearer {TOKEN}")),
+        Some(format!("Bearer {}", TOKEN.to_ascii_uppercase())),
+        Some(format!("Basic {TOKEN}")),
+    ]);
+
+    let client = reqwest::Client::new();
+    for authorization in generated {
+        let mut request = client.post(&url).body(query_body(9));
+        if let Some(value) = &authorization {
+            request = request.header(http::header::AUTHORIZATION, value);
+        }
+        let response = request
+            .send()
+            .await
+            .expect("rejection must complete over HTTP");
+        assert_eq!(
+            response.status().as_u16(),
+            401,
+            "authorization={authorization:?}"
+        );
+    }
+
+    let accepted = client
+        .post(&url)
+        .header(http::header::AUTHORIZATION, exact)
+        .body(query_body(10))
+        .send()
+        .await
+        .expect("exact credential request");
+    assert_eq!(accepted.status().as_u16(), 200);
+
+    handle.abort();
+    let _ = handle.await;
 }
 
 /// `oneshot` never touches hyper's encoder, so a router-level check could pass

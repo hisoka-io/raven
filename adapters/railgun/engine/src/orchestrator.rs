@@ -43,6 +43,11 @@ pub async fn indexer_to_consumer_bridge(
                 ConsumerEvent::Chain(event, block_height)
             }
             IndexerMessage::Reorg { height } => ConsumerEvent::Reorg(height),
+            IndexerMessage::ReorgBarrier {
+                height,
+                completion,
+                timeout_secs: _,
+            } => ConsumerEvent::ReorgBarrier { height, completion },
             IndexerMessage::Heartbeat {
                 chain_head_block,
                 scanned_through_block,
@@ -844,6 +849,13 @@ async fn forward_indexer_message(
                 let _ = tx.send(ConsumerEvent::Reorg(height)).await;
             }
         }
+        IndexerMessage::ReorgBarrier {
+            height,
+            completion,
+            timeout_secs,
+        } => {
+            forward_reorg_barrier(height, completion, timeout_secs, chain_tree_routes).await;
+        }
         IndexerMessage::Heartbeat {
             chain_head_block,
             scanned_through_block,
@@ -860,6 +872,77 @@ async fn forward_indexer_message(
             }
         }
     }
+}
+
+async fn forward_reorg_barrier(
+    height: u64,
+    completion: mpsc::Sender<std::result::Result<(), String>>,
+    timeout_secs: u64,
+    chain_tree_routes: &arc_swap::ArcSwap<Vec<(u32, mpsc::Sender<ConsumerEvent>)>>,
+) {
+    let consumers: Vec<mpsc::Sender<ConsumerEvent>> = chain_tree_routes
+        .load()
+        .iter()
+        .map(|(_, sender)| sender.clone())
+        .collect();
+    if consumers.is_empty() {
+        let _ = completion.send(Ok(())).await;
+        return;
+    }
+    let (consumer_completion, mut completed) = mpsc::channel(consumers.len().max(1));
+    let mut failures = Vec::new();
+    let mut expected = 0usize;
+    for sender in consumers {
+        if sender
+            .send(ConsumerEvent::ReorgBarrier {
+                height,
+                completion: consumer_completion.clone(),
+            })
+            .await
+            .is_err()
+        {
+            failures.push("consumer channel closed".to_owned());
+        } else {
+            expected = expected.saturating_add(1);
+        }
+    }
+    drop(consumer_completion);
+    let mut received = 0usize;
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.max(1));
+    while received < expected {
+        match tokio::time::timeout_at(deadline, completed.recv()).await {
+            Ok(Some(outcome)) => {
+                received = received.saturating_add(1);
+                if let Err(reason) = outcome {
+                    failures.push(reason);
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                failures.push(format!(
+                    "durable acknowledgement timed out after {}s",
+                    timeout_secs.max(1)
+                ));
+                break;
+            }
+        }
+    }
+    if received != expected {
+        failures.push(format!(
+            "received {received} durable acknowledgement(s), expected {expected}"
+        ));
+    }
+    let aggregate = if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} chain consumer(s) failed: {}",
+            failures.len(),
+            failures.join("; ")
+        ))
+    };
+    let _ = completion.send(aggregate).await;
 }
 
 async fn forward_mirror_payload(

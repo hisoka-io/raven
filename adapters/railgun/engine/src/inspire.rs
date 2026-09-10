@@ -102,10 +102,10 @@ pub fn setup_state(
     variant: InspireVariant,
 ) -> Result<(InspireServerState, RlweSecretKey)> {
     let mut sampler = GaussianSampler::new(params.sigma);
-    let (crs, encoded_db, sk) = inspire_setup(params, database, entry_size, &mut sampler)
+    let (mut crs, encoded_db, sk) = inspire_setup(params, database, entry_size, &mut sampler)
         .map_err(|e| AdapterError::Scheme(format!("inspire setup: {e}")))?;
-    let cache = ServerInspiringCache::new(&crs, &encoded_db)
-        .map_err(|e| AdapterError::Scheme(format!("inspire cache build: {e}")))?;
+    let cache = ServerInspiringCache::from_setup(&mut crs, &encoded_db)
+        .map_err(|e| AdapterError::Scheme(format!("inspire setup cache: {e}")))?;
     Ok((
         InspireServerState {
             crs: Arc::new(crs),
@@ -468,6 +468,66 @@ fn bundle_to_state(bundle: PersistedInspireState) -> Result<InspireServerState> 
     })
 }
 
+fn cache_identity(
+    crs: &ServerCrs,
+    encoded_db: &EncodedDatabase,
+) -> super::offline_packing_keys_cache::CellShape {
+    let num_columns = encoded_db
+        .shards
+        .first()
+        .map_or(0, |shard| shard.polynomials.len());
+    super::offline_packing_keys_cache::CellShape::for_inspiring(
+        &crs.params,
+        num_columns,
+        crs.inspiring_w_seed,
+    )
+}
+
+fn cache_for_recovery(
+    data_dir: &std::path::Path,
+    crs: &ServerCrs,
+    encoded_db: &EncodedDatabase,
+) -> Result<(ServerInspiringCache, bool, bool)> {
+    use super::offline_packing_keys_cache::{CacheLoad, OfflinePackingKeysCache};
+
+    let identity = cache_identity(crs, encoded_db);
+    let disk = OfflinePackingKeysCache::new(data_dir);
+    if let CacheLoad::Hit(parts) = disk.load(&identity) {
+        let cache = ServerInspiringCache::from_parts(parts.pack_params, parts.offline_keys);
+        match cache.validate_for(crs, encoded_db) {
+            Ok(()) => return Ok((cache, true, true)),
+            Err(error) => {
+                tracing::warn!(%error, "offline packing cache failed validation; rebuilding");
+            }
+        }
+    }
+
+    let cache = ServerInspiringCache::new(crs, encoded_db)
+        .map_err(|e| AdapterError::Scheme(format!("restore cache build: {e}")))?;
+    let persisted = match disk.store(&identity, cache.pack_params(), cache.offline_keys()) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(error = %error, "offline packing cache store failed; recovery remains correct");
+            false
+        }
+    };
+    Ok((cache, false, persisted))
+}
+
+pub(crate) fn persist_inspiring_cache(
+    data_dir: &std::path::Path,
+    state: &InspireServerState,
+) -> Result<()> {
+    let identity = cache_identity(&state.crs, &state.encoded_db);
+    super::offline_packing_keys_cache::OfflinePackingKeysCache::new(data_dir)
+        .store(
+            &identity,
+            state.cache.pack_params(),
+            state.cache.offline_keys(),
+        )
+        .map_err(|e| AdapterError::Internal(format!("offline packing cache store: {e}")))
+}
+
 /// Reconstruct `(InspireServerState, LogicalLeafStore)`, dispatching on
 /// [`SNAPSHOT_V6_MAGIC`]. V5 yields an empty store that WAL replay refills.
 pub fn restore_inspire_state_v6(bytes: &[u8]) -> Result<(InspireServerState, LogicalLeafStore)> {
@@ -484,6 +544,46 @@ pub fn restore_inspire_state_v6(bytes: &[u8]) -> Result<(InspireServerState, Log
         );
         let state = restore_inspire_state(bytes)?;
         Ok((state, LogicalLeafStore::default()))
+    }
+}
+
+pub(crate) fn restore_inspire_state_v6_cached(
+    bytes: &[u8],
+    data_dir: &std::path::Path,
+) -> Result<(InspireServerState, LogicalLeafStore, bool, bool)> {
+    if let Some(body) = bytes.strip_prefix(SNAPSHOT_V6_MAGIC.as_slice()) {
+        let bundle: PersistedInspireStateV6 = bincode::deserialize(body)
+            .map_err(|e| AdapterError::Serialization(format!("v6 snapshot deserialize: {e}")))?;
+        let (cache, hit, persisted) =
+            cache_for_recovery(data_dir, &bundle.state.crs, &bundle.state.encoded_db)?;
+        let state = InspireServerState {
+            crs: Arc::new(bundle.state.crs),
+            encoded_db: Arc::new(bundle.state.encoded_db),
+            cache: Arc::new(cache),
+            session_store: Arc::new(BoundedSessionStore::new()),
+            variant: bundle.state.variant,
+            entry_size: bundle.state.entry_size,
+        };
+        Ok((state, bundle.store, hit, persisted))
+    } else {
+        tracing::warn!(
+            target = "raven::engine::snapshot",
+            "legacy V5 snapshot (no V6 magic prefix); LogicalLeafStore starts empty and will \
+             be repopulated from WAL replay if WAL bytes are still present"
+        );
+        let bundle: PersistedInspireState = bincode::deserialize(bytes)
+            .map_err(|e| AdapterError::Serialization(format!("snapshot deserialize: {e}")))?;
+        let (cache, hit, persisted) =
+            cache_for_recovery(data_dir, &bundle.crs, &bundle.encoded_db)?;
+        let state = InspireServerState {
+            crs: Arc::new(bundle.crs),
+            encoded_db: Arc::new(bundle.encoded_db),
+            cache: Arc::new(cache),
+            session_store: Arc::new(BoundedSessionStore::new()),
+            variant: bundle.variant,
+            entry_size: bundle.entry_size,
+        };
+        Ok((state, LogicalLeafStore::default(), hit, persisted))
     }
 }
 

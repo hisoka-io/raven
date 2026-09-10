@@ -1,5 +1,5 @@
 // Warm-cache path for loadClientPirContext. Node test env has no IndexedDB, so the
-// cache falls through to the in-memory MemoryBackend.
+// cache falls through to in-memory storage under the shared integrity layer.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   loadClientPirContext,
@@ -10,8 +10,11 @@ import {
   type RavenInspireClientSession,
   type RavenInspireWasm,
 } from "../src/index";
-import { makeRegisterSpy, type RegisterClientSessionSpy } from "./helpers/register_spy";
-import { _setBackendForTests } from "../src/session-cache";
+import { makeRegisterSpy } from "./helpers/register_spy";
+import {
+  _setStorageForTests,
+  type SessionCacheStorageForTests,
+} from "../src/session-cache";
 
 interface SpyWasm extends RavenInspireWasm {
   build_count: number;
@@ -66,20 +69,15 @@ function makeSpyWasm(): SpyWasm {
 afterEach(async () => {
   await idbClear();
   vi.unstubAllGlobals();
-  _setBackendForTests(null);
+  _setStorageForTests(null);
   vi.restoreAllMocks();
 });
 
 // ---------------------------------------------------------------------------
 // A DUMB fake IndexedDB: stores exactly what it is told, verifies NOTHING.
 //
-// Its predecessor (`ProbeBackend`) replaced the whole storage layer via
-// `_setBackendForTests` and reimplemented the sha256 integrity check inside the
-// test file — so deleting the SDK's own check (both copies) left this file 7/7
-// green (mutation M1, w4d-sdk). All integrity behaviour must come from
-// `IndexedDbBackend`/`MemoryBackend` in src/session-cache.ts; the fake's one job
-// is to let the real IndexedDbBackend run under node and to expose the record
-// map so a test can corrupt a chunk at rest.
+// The fake implements raw IndexedDB only. Chunk assembly and integrity remain
+// in the shared production layer, so the fake cannot make a deleted check pass.
 // ---------------------------------------------------------------------------
 
 class FakeIdbRequest<T = unknown> {
@@ -229,12 +227,12 @@ class FakeIdbFactory {
   }
 }
 
-/** Route the module through the REAL IndexedDbBackend over a dumb fake store. */
+/** Route the module through real IndexedDB storage over a dumb fake database. */
 function installFakeIndexedDb(): FakeIdbDatabase {
   const factory = new FakeIdbFactory();
   vi.stubGlobal("indexedDB", factory as unknown as IDBFactory);
-  // Reset the module-level backend so ensureBackend re-selects IndexedDbBackend.
-  _setBackendForTests(null);
+  // Reset the module-level cache so ensureBackend re-selects IndexedDB storage.
+  _setStorageForTests(null);
   return factory.db;
 }
 
@@ -250,6 +248,30 @@ function deterministicBlob(len: number, seed: number): Uint8Array {
     out[i] = s & 0xff;
   }
   return out;
+}
+
+class InspectableStorage implements SessionCacheStorageForTests {
+  readonly records = new Map<string, Uint8Array>();
+
+  async get(key: string): Promise<Uint8Array | null> {
+    return this.records.get(key) ?? null;
+  }
+
+  async put(records: ReadonlyArray<readonly [string, Uint8Array]>): Promise<void> {
+    for (const [key, value] of records) this.records.set(key, value);
+  }
+
+  async deletePrefix(key: string): Promise<void> {
+    for (const storedKey of this.records.keys()) {
+      if (storedKey === key || storedKey.startsWith(`${key}#`)) {
+        this.records.delete(storedKey);
+      }
+    }
+  }
+
+  async clear(): Promise<void> {
+    this.records.clear();
+  }
 }
 
 describe("loadClientPirContext warm-cache", () => {
@@ -398,36 +420,27 @@ describe("loadClientPirContext warm-cache", () => {
     expect(wasm.build_count).toBe(2);
   });
 
-  // D3 (client-pir.ts:182/:198): register_client_session exists to catch the session
-  // drifting from the SERVER's instance params, but the SDK hands it the bundle
-  // build_client_session just consumed — locally rebuilt from the same inputs — so the
-  // guard compares a value against itself and its Err branch is unreachable in
-  // production. RED-by-design until the SDK passes the server-supplied bundle; when that
-  // fix lands this flips to a real failure and forces the un-marking.
-  it.fails(
-    "D3: the bundle handed to register_client_session is the server's, not the locally rebuilt one",
-    async () => {
-      const wasm = makeSpyWasm();
-      const spy = wasm.register_client_session as RegisterClientSessionSpy;
-      await loadClientPirContext({
-        wasm,
-        instanceId: "commit-tree-3",
-        crsBincode: new Uint8Array([1, 2, 3]),
-        shardConfigBincode: new Uint8Array([0xde, 0xad]),
-        inspireParamsBincode: new Uint8Array([0xbe, 0xef]),
-        entrySize: 32,
-      });
-      const locallyBuilt = wasm.build_instance_params_blob(
-        new Uint8Array([0xbe, 0xef]),
-        new Uint8Array([0xde, 0xad]),
-      );
-      expect(spy.calls.length).toBeGreaterThan(0);
-      expect(Array.from(spy.calls[0].bundle)).not.toEqual(Array.from(locallyBuilt));
-    },
-  );
 });
 
 describe("idb chunked + integrity-verified storage", () => {
+  it("keeps integrity verification above the replaceable storage seam", async () => {
+    const storage = new InspectableStorage();
+    _setStorageForTests(storage);
+    const blob = deterministicBlob(1024, 0x51de);
+    await idbPut("seam", "ab".repeat(32), blob);
+    const chunkKey = Array.from(storage.records.keys()).find((key) => key.includes("#chunk-"));
+    expect(chunkKey).toBeDefined();
+    if (!chunkKey) return;
+    const corrupted = storage.records.get(chunkKey);
+    expect(corrupted).toBeDefined();
+    if (!corrupted) return;
+    corrupted[0] ^= 0xff;
+
+    const loaded = await idbGet("seam", "ab".repeat(32));
+    expect(loaded === null, "corrupted bytes must not cross the storage seam").toBe(true);
+    expect(storage.records.size).toBe(0);
+  });
+
   it("round-trips an 80 MiB blob across multiple chunks", async () => {
     const instanceId = "test";
     const crsHash = "deadbeef".repeat(8);
@@ -454,7 +467,7 @@ describe("idb chunked + integrity-verified storage", () => {
 
   it("stores ceil(len / CHUNK_SIZE) chunks — chunking observably happened", async () => {
     // KILLS mutation M2 (CHUNK_SIZE -> 1 GiB left this file green): the chunk count is
-    // read from what the real IndexedDbBackend put at rest, and the chunk size is
+    // read from what real IndexedDB storage put at rest, and the chunk size is
     // DERIVED from the stored chunk 0 rather than duplicated as a second literal the
     // real constant can drift away from. If CHUNK_SIZE ever grows past this blob, the
     // multi-chunk path has lost its only coverage and this red is the alarm.
@@ -491,8 +504,7 @@ describe("idb chunked + integrity-verified storage", () => {
 
   it("evicts and returns null when a chunk is corrupted (the SDK's own check)", async () => {
     // KILLS mutation M1: the corruption is planted in the dumb store and the verdict
-    // comes from IndexedDbBackend.get's sha256 branch in src/session-cache.ts — delete
-    // that branch and the corrupted bytes come back non-null here.
+    // comes from the shared sha256 branch in src/session-cache.ts.
     const db = installFakeIndexedDb();
 
     const instanceId = "test";
@@ -540,7 +552,7 @@ describe("idb chunked + integrity-verified storage", () => {
     expect(got).toBeNull();
   });
 
-  it("idbClear empties the store through the real IndexedDbBackend", async () => {
+  it("idbClear empties the store through real IndexedDB storage", async () => {
     const db = installFakeIndexedDb();
     await idbPut("test", "ab".repeat(32), deterministicBlob(1024, 7));
     expect(db.records.size).toBeGreaterThan(0);

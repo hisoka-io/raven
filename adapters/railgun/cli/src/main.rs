@@ -273,12 +273,12 @@ enum Commands {
             default_value = "raven-inspire-twopacking-inspiring-wp3-cache-session"
         )]
         scheme_tag: String,
-        /// PIR cell entry count (production cell default).
-        #[arg(long, default_value_t = raven_railgun_cli::serve_production::DEFAULT_PRODUCTION_ENTRIES)]
-        entries: usize,
-        /// PIR cell entry size in bytes.
-        #[arg(long, default_value_t = raven_railgun_cli::serve_production::DEFAULT_PRODUCTION_ENTRY_BYTES)]
-        entry_bytes: usize,
+        /// Removed: the encoder determines bootstrap cell rows.
+        #[arg(long, value_parser = removed_bootstrap_entries)]
+        entries: Option<usize>,
+        /// Removed: the encoder determines bootstrap row width.
+        #[arg(long, value_parser = removed_bootstrap_entry_bytes)]
+        entry_bytes: Option<usize>,
         /// Strict 2/3-oracle byte-identity gate.
         #[arg(long, default_value_t = true)]
         strict_oracle_byte_identity: bool,
@@ -539,8 +539,8 @@ async fn main() -> anyhow::Result<()> {
             chain_id,
             chain_type,
             scheme_tag,
-            entries,
-            entry_bytes,
+            entries: _,
+            entry_bytes: _,
             strict_oracle_byte_identity,
             max_bootstrap_wall_mins,
             railgun_proxy,
@@ -581,8 +581,6 @@ async fn main() -> anyhow::Result<()> {
                 chain_id,
                 chain_type,
                 scheme_tag,
-                entries,
-                entry_bytes,
                 strict_oracle_byte_identity,
                 max_bootstrap_wall_mins,
                 railgun_proxy,
@@ -735,8 +733,6 @@ struct BootstrapFromSubsquidOptions {
     chain_id: u64,
     chain_type: u32,
     scheme_tag: String,
-    entries: usize,
-    entry_bytes: usize,
     strict_oracle_byte_identity: bool,
     max_bootstrap_wall_mins: u64,
     railgun_proxy: String,
@@ -761,6 +757,14 @@ fn parse_ppoi_source(s: &str) -> Result<PpoiSourceKind, String> {
             "unknown ppoi-source {other}; expected one of railway | chainalysis-oracle"
         )),
     }
+}
+
+fn removed_bootstrap_entries(_: &str) -> Result<usize, String> {
+    Err("--entries was removed; bootstrap cell rows are derived from the encoder".to_owned())
+}
+
+fn removed_bootstrap_entry_bytes(_: &str) -> Result<usize, String> {
+    Err("--entry-bytes was removed; bootstrap row width is derived from the encoder".to_owned())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -886,8 +890,6 @@ async fn run_bootstrap_from_subsquid(opts: BootstrapFromSubsquidOptions) -> anyh
             data_dir,
             instance_id: format!("commit-tree-{tree}"),
             scheme_tag: opts.scheme_tag.clone(),
-            entries: opts.entries,
-            entry_bytes: opts.entry_bytes,
             max_wall_mins: opts.max_bootstrap_wall_mins,
             contract_start_block: opts.contract_start_block,
             encoder_kind,
