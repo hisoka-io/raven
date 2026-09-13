@@ -38,6 +38,8 @@ fn bootstrap_minimal_instance(root: &Path, instance_id: &str, payload: &[u8]) {
         current_marker: 100,
         encoder_label: "per-leaf-bc".to_owned(),
         prev_encoder_label: None,
+        entry_size_bytes: Some(32),
+        rows_per_shard: Some(2048),
     };
     manifest.save(&layout).expect("manifest save");
 }

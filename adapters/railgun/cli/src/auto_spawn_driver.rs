@@ -1235,7 +1235,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let layout = StoreLayout::open(tmp.path()).expect("layout");
         let encoder: Arc<dyn PirTableEncoder> = EncoderKind::PerLeafBc { tree_number: 0 }
-            .build(entry_size, 256)
+            .build(entry_size, 2048)
             .expect("encoder");
         let opened = InspirePersistence::open(
             layout,

@@ -4,10 +4,13 @@
 use super::inspire::{snapshot_inspire_state, InspireServerState, RavenInspireScheme};
 use super::{InstanceRole, PirInstance};
 use parking_lot::Mutex;
+use raven_inspire::params::rows_per_shard_match_ring_dim;
 use raven_railgun_core::{AdapterError, Epoch, InstanceId, Result};
+pub use raven_railgun_persistence::RetentionPolicy;
 use raven_railgun_persistence::{
-    advance_manifest_and_archive, Manifest, Snapshot, SnapshotId, StoreLayout, Wal,
-    WalEntryPayload, MANIFEST_SCHEMA_VERSION, SNAPSHOT_MAGIC,
+    advance_manifest_and_archive, apply_retention, open_recovery, Manifest, ManifestShape,
+    Snapshot, SnapshotId, StoreLayout, Wal, WalEntryPayload, MANIFEST_SCHEMA_VERSION,
+    SNAPSHOT_MAGIC,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,10 +36,8 @@ pub struct SnapshotPolicy {
     pub max_appends_per_snapshot: usize,
     /// Seconds since last snapshot before triggering.
     pub max_seconds_between_snapshots: u64,
-    /// Sealed WAL file retention count.
-    pub archived_wals_retain: usize,
-    /// `snap-NNNNNN/` directory retention count. The live snapshot is never deleted.
-    pub snapshots_retain: usize,
+    /// Raven-owned durability retention policy.
+    pub retention: RetentionPolicy,
 }
 
 impl Default for SnapshotPolicy {
@@ -44,8 +45,7 @@ impl Default for SnapshotPolicy {
         Self {
             max_appends_per_snapshot: 1000,
             max_seconds_between_snapshots: 300,
-            archived_wals_retain: 16,
-            snapshots_retain: 4,
+            retention: RetentionPolicy::default(),
         }
     }
 }
@@ -56,8 +56,10 @@ impl SnapshotPolicy {
         Self {
             max_appends_per_snapshot: usize::MAX,
             max_seconds_between_snapshots: u64::MAX,
-            archived_wals_retain: 4,
-            snapshots_retain: 2,
+            retention: RetentionPolicy {
+                archived_wals_retain: 4,
+                snapshots_retain: 2,
+            },
         }
     }
 }
@@ -130,7 +132,7 @@ impl InspirePersistence {
         // `Path::exists()`, so what must be durable is the DIRECTORY ENTRY. A bare
         // `fs::write` fsyncs neither the file nor the parent, so a power cut can lose
         // the entry that was just reported as written.
-        crate::offline_packing_keys_cache::atomic_write(&path, self.instance_id.as_str().as_bytes())
+        raven_railgun_persistence::atomic_write(&path, self.instance_id.as_str().as_bytes())
             .map_err(|e| {
                 AdapterError::Internal(format!(
                     "layer2 divergence marker write failed at {}: {e}; a restart would \
@@ -210,13 +212,11 @@ pub struct OpenedInstance {
     pub recovered_cache_hit: bool,
 }
 
-/// Reject an encoder whose row width diverges from the recovered cell's;
-/// `encoder_label` is stable across operator-supplied widths so it cannot
-/// catch a width swap on its own.
+/// Reject an encoder whose row width or row window diverges from the recovered cell's;
+/// `encoder_label` is stable across operator-supplied shapes so it cannot catch either.
 ///
 /// # Errors
-/// [`AdapterError::Internal`] when `encoder.record_size()` differs from the
-/// stored `entry_size_bytes`.
+/// [`AdapterError::Internal`] when the encoder's row width or rows per shard differ from storage.
 fn ensure_encoder_matches_stored_cell(
     stored: &raven_inspire::params::ShardConfig,
     stored_rows_per_shard: u32,
@@ -236,26 +236,46 @@ fn ensure_encoder_matches_stored_cell(
             label = encoder.label(),
         )));
     }
-    // Warn, not reject: `pir_table::validate_rows_per_shard` already rejects this
-    // at boot, and refusing here would refuse an existing data_dir.
     let encoder_rows = encoder.entries_per_shard();
-    if encoder_rows != stored_rows_per_shard {
-        tracing::warn!(
-            encoder_label = encoder.label(),
-            stored_rows_per_shard,
-            encoder_rows_per_shard = encoder_rows,
+    if !rows_per_shard_match_ring_dim(u64::from(encoder_rows), stored_rows_per_shard as usize) {
+        return Err(AdapterError::Internal(format!(
             "recovered cell holds {stored_rows_per_shard} rows per shard but the configured \
-             encoder materializes {encoder_rows}; every shard id above 0 is re-encoded from \
-             the wrong row window"
-        );
+             encoder {label} materializes {encoder_rows}; every shard id above 0 is re-encoded \
+             from the wrong row window. The data_dir must be re-bootstrapped at \
+             {encoder_rows} rows per shard OR the encoder configuration restored to \
+             {stored_rows_per_shard} rows per shard",
+            label = encoder.label(),
+        )));
     }
     Ok(())
 }
 
+fn encoder_manifest_shape(encoder: &dyn super::pir_table::PirTableEncoder) -> ManifestShape {
+    ManifestShape {
+        entry_size_bytes: encoder.record_size(),
+        rows_per_shard: u64::from(encoder.entries_per_shard()),
+    }
+}
+
+fn recovered_manifest_shape(state: &InspireServerState) -> ManifestShape {
+    let config = state.shard_config();
+    ManifestShape {
+        entry_size_bytes: config.entry_size_bytes,
+        rows_per_shard: config.entries_per_shard(),
+    }
+}
+
+fn manifest_shape_error(
+    context: &str,
+    error: raven_railgun_persistence::PersistenceError,
+) -> AdapterError {
+    AdapterError::Internal(format!("manifest cell shape {context}: {error}"))
+}
+
 impl InspirePersistence {
     /// Open at `layout`, recovering from an existing manifest or initializing
-    /// fresh. Rejects an encoder whose label or row width diverges from the
-    /// recovered cell.
+    /// fresh. Rejects an encoder whose label, row width, or row window diverges
+    /// from the recovered cell.
     #[allow(clippy::too_many_lines)]
     pub fn open(
         layout: StoreLayout,
@@ -270,30 +290,19 @@ impl InspirePersistence {
         }
         let scheme_tag = scheme_tag.into();
         let encoder_label = encoder.label();
-        if let Some(manifest) = Manifest::load(&layout)
-            .map_err(|e| AdapterError::Internal(format!("manifest load: {e}")))?
-        {
-            if manifest.scheme_tag != scheme_tag {
-                return Err(AdapterError::Internal(format!(
-                    "manifest scheme_tag mismatch: stored {} != configured {}",
-                    manifest.scheme_tag, scheme_tag
-                )));
+        let configured_shape = encoder_manifest_shape(encoder.as_ref());
+        let recovered = open_recovery(&layout, SNAPSHOT_MAGIC, |manifest| {
+            manifest.validate_identity(&scheme_tag, instance_id.as_str(), encoder_label)?;
+            if manifest.cell_shape()?.is_some() {
+                manifest.validate_shape(configured_shape)?;
             }
-            if manifest.instance_id != instance_id.to_string() {
-                return Err(AdapterError::Internal(format!(
-                    "manifest instance_id mismatch: stored {} != configured {}",
-                    manifest.instance_id, instance_id
-                )));
-            }
-            if manifest.encoder_label != encoder_label {
-                return Err(AdapterError::Internal(format!(
-                    "manifest encoder_label mismatch: stored {} != configured {}; \
-                     on-disk encoded DB was built with a different encoder shape, \
-                     operator must reconcile (clear data_dir + restart with the new \
-                     encoder, OR revert config to the on-disk encoder)",
-                    manifest.encoder_label, encoder_label
-                )));
-            }
+            Ok(())
+        })
+        .map_err(|e| {
+            AdapterError::Internal(format!("recovery open for encoder {encoder_label}: {e}"))
+        })?;
+        if let Some(recovery) = recovered {
+            let mut manifest = recovery.manifest;
             // SnapshotId(0) means no commit yet. V6 seeds the replay base with its
             // embedded store; V5 starts empty and relies wholly on WAL replay.
             let (
@@ -302,17 +311,7 @@ impl InspirePersistence {
                 entries_per_shard,
                 recovered_cache_hit,
                 recovered_cache_persisted,
-            ) = if manifest.current_snapshot_id == SnapshotId(0) {
-                (
-                    None,
-                    super::inspire::LogicalLeafStore::new(),
-                    u32::MAX,
-                    false,
-                    false,
-                )
-            } else {
-                let snap = Snapshot::load(&layout, manifest.current_snapshot_id, SNAPSHOT_MAGIC)
-                    .map_err(|e| AdapterError::Internal(format!("snapshot load: {e}")))?;
+            ) = if let Some(snap) = recovery.snapshot.as_ref() {
                 let (s, store, cache_hit, cache_persisted) =
                     super::inspire::restore_inspire_state_v6_cached(&snap.data, layout.root())?;
                 let eps = u32::try_from(
@@ -323,33 +322,49 @@ impl InspirePersistence {
                 )
                 .unwrap_or(u32::MAX);
                 (Some(s), store, eps, cache_hit, cache_persisted)
+            } else {
+                manifest
+                    .require_shape()
+                    .map_err(|error| manifest_shape_error("without snapshot", error))?;
+                (
+                    None,
+                    super::inspire::LogicalLeafStore::new(),
+                    u32::MAX,
+                    false,
+                    false,
+                )
             };
             if let Some(state) = recovered_state.as_ref() {
+                let recovered_shape = recovered_manifest_shape(state);
+                let migrated = manifest
+                    .migrate_shape_from_snapshot(recovered_shape)
+                    .map_err(|error| manifest_shape_error("vs recovered snapshot", error))?;
+                manifest.validate_shape(configured_shape).map_err(|error| {
+                    manifest_shape_error(&format!("vs configured encoder {encoder_label}"), error)
+                })?;
                 ensure_encoder_matches_stored_cell(
                     state.shard_config(),
                     entries_per_shard,
                     encoder.as_ref(),
                 )?;
+                if migrated {
+                    manifest.save(&layout).map_err(|error| {
+                        AdapterError::Internal(format!("manifest shape migration save: {error}"))
+                    })?;
+                }
             }
             let persisted_cache_fingerprint = recovered_state
                 .as_ref()
                 .filter(|_| recovered_cache_persisted)
                 .map(InspireServerState::cache_fingerprint);
-            let wal_floor = manifest.current_snapshot_seq.checked_sub(1);
-            let wal = Wal::open(&layout, wal_floor)
-                .map_err(|e| AdapterError::Internal(format!("wal open: {e}")))?;
+            let wal = recovery.wal;
             let mut logical_store = recovered_seed_store;
-            let replay = wal
-                .replay()
-                .map_err(|e| AdapterError::Internal(format!("wal replay: {e}")))?;
+            let replay = recovery.replay;
             // An unencodable leaf is replay-fatal; every other `InvalidQuery`
             // soft-skips, and Internal/Serialization bubble.
             let mut replay_skipped: u64 = 0;
             let replay_encoder = encoder.as_ref();
             for entry in &replay.entries {
-                if entry.seq < manifest.current_snapshot_seq {
-                    continue;
-                }
                 let payload: WalEntryPayload = bincode::deserialize(&entry.payload)
                     .map_err(|e| AdapterError::Serialization(format!("wal payload: {e}")))?;
                 super::inspire::ensure_canonical_leaf(&payload).map_err(|e| {
@@ -444,6 +459,8 @@ impl InspirePersistence {
                 current_marker: 0,
                 encoder_label: encoder_label.to_owned(),
                 prev_encoder_label: None,
+                entry_size_bytes: Some(encoder_manifest_shape(encoder.as_ref()).entry_size_bytes),
+                rows_per_shard: Some(encoder_manifest_shape(encoder.as_ref()).rows_per_shard),
             };
             // Persist the manifest first so a failed commit() still lands in recovery.
             manifest
@@ -479,6 +496,7 @@ impl InspirePersistence {
         state: &InspireServerState,
         current_block_height: u64,
     ) -> Result<SnapshotId> {
+        self.validate_commit_shape(state)?;
         let bundle = snapshot_inspire_state(state)?;
         let id = self.commit_serialized_bundle(bundle, current_block_height)?;
         if let Err(error) = self.persist_cache_if_changed(state) {
@@ -494,6 +512,7 @@ impl InspirePersistence {
         store: &super::inspire::LogicalLeafStore,
         current_block_height: u64,
     ) -> Result<SnapshotId> {
+        self.validate_commit_shape(state)?;
         let bundle = super::inspire::snapshot_inspire_state_v6(state, store)?;
         let id = self.commit_serialized_bundle(bundle, current_block_height)?;
         if let Err(error) = self.persist_cache_if_changed(state) {
@@ -552,10 +571,18 @@ impl InspirePersistence {
         }
 
         drop(m);
-        self.cleanup_archived_wals()?;
-        self.cleanup_old_snapshots()?;
+        let retention = self.policy.read().retention;
+        apply_retention(&self.layout, next_id, retention)
+            .map_err(|error| AdapterError::Internal(format!("snapshot retention: {error}")))?;
 
         Ok(next_id)
+    }
+
+    fn validate_commit_shape(&self, state: &InspireServerState) -> Result<()> {
+        self.manifest
+            .lock()
+            .validate_shape(recovered_manifest_shape(state))
+            .map_err(|error| manifest_shape_error("before snapshot commit", error))
     }
 
     /// Notify primitive fired after every successful `commit()`.
@@ -606,60 +633,6 @@ impl InspirePersistence {
         let (seq, _) = self.apply_event(&payload, height)?;
         Ok(seq)
     }
-
-    fn cleanup_archived_wals(&self) -> Result<()> {
-        let retain = self.policy.read().archived_wals_retain;
-        if retain == usize::MAX {
-            return Ok(());
-        }
-        let archive_dir = self.layout.root().join("wal").join("archived");
-        if !archive_dir.is_dir() {
-            return Ok(());
-        }
-        let mut entries: Vec<_> = std::fs::read_dir(&archive_dir)
-            .map_err(|e| AdapterError::Internal(format!("read archive dir: {e}")))?
-            .filter_map(std::result::Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().starts_with("seq-"))
-            .collect();
-        // Filenames are zero-padded, so lexical order equals numeric order.
-        entries.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
-        for old in entries.into_iter().skip(retain) {
-            let _ = std::fs::remove_file(old.path());
-        }
-        Ok(())
-    }
-
-    fn cleanup_old_snapshots(&self) -> Result<()> {
-        let retain = self.policy.read().snapshots_retain;
-        if retain == usize::MAX {
-            return Ok(());
-        }
-        let snap_dir = self.layout.root().join("snapshots");
-        if !snap_dir.is_dir() {
-            return Ok(());
-        }
-        let live_id = self.manifest.lock().current_snapshot_id;
-        let mut entries: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(&snap_dir)
-            .map_err(|e| AdapterError::Internal(format!("read snapshots dir: {e}")))?
-            .filter_map(std::result::Result::ok)
-            .filter_map(|de| {
-                let name = de.file_name();
-                let s = name.to_string_lossy();
-                let num = s.strip_prefix("snap-")?.parse::<u64>().ok()?;
-                Some((num, de.path()))
-            })
-            .collect();
-        // Newest first by id.
-        entries.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
-        for (id, path) in entries.into_iter().skip(retain) {
-            if id == live_id.0 {
-                // The live snapshot is never deleted, retain window notwithstanding.
-                continue;
-            }
-            let _ = std::fs::remove_dir_all(&path);
-        }
-        Ok(())
-    }
 }
 
 /// Construct a [`PirInstance<RavenInspireScheme>`] tied to a persistence handle,
@@ -681,11 +654,14 @@ pub fn bootstrap_inspire_instance(
     Arc<InspirePersistence>,
     super::inspire::LogicalLeafStore,
 )> {
+    let session_store = Arc::new(super::session_pool::BoundedSessionStore::open(
+        layout.root(),
+    )?);
     let opened =
         InspirePersistence::open(layout, scheme_tag, instance_id.clone(), policy, encoder)?;
     let persistence = Arc::new(opened.persistence);
     let recovered_store = opened.recovered_logical_store;
-    let state = if let Some(s) = opened.recovered_state {
+    let mut state = if let Some(s) = opened.recovered_state {
         s
     } else {
         // V6 first commit ships the store with the snapshot; notify so observers
@@ -696,6 +672,7 @@ pub fn bootstrap_inspire_instance(
         persistence.commit_notify().notify_waiters();
         s
     };
+    state.session_store = session_store;
     let instance = PirInstance::new(instance_id, role, state);
     let _ = Epoch::ZERO;
     Ok((instance, persistence, recovered_store))
@@ -3033,8 +3010,10 @@ mod tests {
         let policy = SnapshotPolicy {
             max_appends_per_snapshot: 3,
             max_seconds_between_snapshots: u64::MAX,
-            archived_wals_retain: 4,
-            snapshots_retain: 4,
+            retention: RetentionPolicy {
+                archived_wals_retain: 4,
+                snapshots_retain: 4,
+            },
         };
         let opened = InspirePersistence::open(
             layout,
@@ -3118,8 +3097,10 @@ mod tests {
         let policy = SnapshotPolicy {
             max_appends_per_snapshot: usize::MAX,
             max_seconds_between_snapshots: u64::MAX,
-            archived_wals_retain: 2,
-            snapshots_retain: usize::MAX,
+            retention: RetentionPolicy {
+                archived_wals_retain: 2,
+                snapshots_retain: usize::MAX,
+            },
         };
         let opened = InspirePersistence::open(
             layout,
@@ -3150,8 +3131,10 @@ mod tests {
         let policy = SnapshotPolicy {
             max_appends_per_snapshot: usize::MAX,
             max_seconds_between_snapshots: u64::MAX,
-            archived_wals_retain: usize::MAX,
-            snapshots_retain: 2,
+            retention: RetentionPolicy {
+                archived_wals_retain: usize::MAX,
+                snapshots_retain: 2,
+            },
         };
         let opened = InspirePersistence::open(
             layout,
@@ -3196,8 +3179,10 @@ mod tests {
         let policy = SnapshotPolicy {
             max_appends_per_snapshot: usize::MAX,
             max_seconds_between_snapshots: u64::MAX,
-            archived_wals_retain: usize::MAX,
-            snapshots_retain: usize::MAX,
+            retention: RetentionPolicy {
+                archived_wals_retain: usize::MAX,
+                snapshots_retain: usize::MAX,
+            },
         };
         let opened = InspirePersistence::open(
             layout,
@@ -3223,8 +3208,10 @@ mod tests {
         let policy = SnapshotPolicy {
             max_appends_per_snapshot: usize::MAX,
             max_seconds_between_snapshots: u64::MAX,
-            archived_wals_retain: usize::MAX,
-            snapshots_retain: 1,
+            retention: RetentionPolicy {
+                archived_wals_retain: usize::MAX,
+                snapshots_retain: 1,
+            },
         };
         let opened = InspirePersistence::open(
             layout,
@@ -3342,6 +3329,36 @@ mod tests {
         )
         .expect_err("mismatch should reject");
         assert!(matches!(err, AdapterError::Internal(_)));
+    }
+
+    #[test]
+    fn instance_id_mismatch_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_toy_state().expect("state");
+        {
+            let layout = StoreLayout::open(dir.path()).expect("layout");
+            let opened = InspirePersistence::open(
+                layout,
+                SCHEME_TAG,
+                InstanceId::new("toy-a"),
+                SnapshotPolicy::default(),
+                test_encoder(),
+            )
+            .expect("open");
+            opened.persistence.commit(&state, 0).expect("commit");
+        }
+        let layout = StoreLayout::open(dir.path()).expect("layout 2");
+        let err = InspirePersistence::open(
+            layout,
+            SCHEME_TAG,
+            InstanceId::new("toy-b"),
+            SnapshotPolicy::default(),
+            test_encoder(),
+        )
+        .expect_err("mismatch should reject");
+        let message = err.to_string();
+        assert!(matches!(err, AdapterError::Internal(_)));
+        assert!(message.contains("instance_id mismatch"), "{message}");
     }
 
     type UnsatShardFixtures = (
@@ -3554,9 +3571,9 @@ mod tests {
             &published.state.encoded_db,
             &donor.state.encoded_db
         ));
-        assert!(
-            bincode::serialize(&*published.state.encoded_db).expect("published db")
-                != donor_db_bytes
+        assert_ne!(
+            bincode::serialize(&*published.state.encoded_db).expect("published db"),
+            donor_db_bytes
         );
         assert_eq!(
             bincode::serialize(&*donor.state.encoded_db).expect("held donor db"),

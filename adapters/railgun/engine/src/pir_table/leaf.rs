@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 use raven_railgun_core::{AdapterError, Result};
 
 use super::{
-    labels, PirTableEncoder, LEAVES_PER_TREE, MIN_RECORD_SIZE, NODE_HASH_BYTES, PATH_RECORD_BYTES,
-    PER_NODE_TOTAL_NODES,
+    labels, materialize_node_shard, materialize_path_shard, node_affected_shards, PirTableEncoder,
+    LEAVES_PER_TREE, MIN_RECORD_SIZE, NODE_HASH_BYTES, PATH_RECORD_BYTES,
 };
 use crate::imt::TREE_DEPTH;
 use crate::inspire::{materialize_shard_bytes, LogicalLeafStore};
@@ -142,31 +142,12 @@ impl PirTableEncoder for PerLeafPathEncoder {
     }
 
     fn materialize_shard(&self, shard_id: u32, store: &LogicalLeafStore) -> Vec<u8> {
-        let eps = self.entries_per_shard as usize;
-        let mut buf = vec![0u8; eps.saturating_mul(self.record_size)];
-        let Some(imt) = store.imt(self.tree_number) else {
-            return buf;
-        };
-        let leaf_count = imt.leaf_count();
-        let row_start = (shard_id as usize).saturating_mul(eps);
-        for row_offset in 0..eps {
-            let leaf_idx = row_start + row_offset;
-            if leaf_idx >= leaf_count {
-                break;
-            }
-            let Ok(proof) = imt.merkle_proof(leaf_idx) else {
-                continue;
-            };
-            let row_byte_start = row_offset * self.record_size;
-            for (sib_idx, sibling) in proof.elements.iter().enumerate() {
-                let sib_byte_start = row_byte_start + sib_idx * NODE_HASH_BYTES;
-                let sib_byte_end = sib_byte_start + NODE_HASH_BYTES;
-                if let Some(dst) = buf.get_mut(sib_byte_start..sib_byte_end) {
-                    dst.copy_from_slice(sibling);
-                }
-            }
-        }
-        buf
+        materialize_path_shard(
+            store.imt(self.tree_number),
+            shard_id,
+            self.entries_per_shard,
+            self.record_size,
+        )
     }
 
     fn affected_shards_for_leaf(&self, tree: u32, leaf_index: u32) -> BTreeSet<u32> {
@@ -223,24 +204,13 @@ impl PerNodeEncoder {
     /// `[0, 2^TREE_DEPTH)` and higher levels follow in order.
     pub fn flat_index(level: u32, idx_at_level: u32) -> u32 {
         let depth = u32::try_from(TREE_DEPTH).unwrap_or(u32::MAX);
-        let total = 1u32 << (depth + 1);
-        let level_offset = total - (1u32 << (depth + 1 - level));
-        level_offset + idx_at_level
+        raven_railgun_core::tree_layout::flat_index(depth, level, idx_at_level)
     }
 
     /// Inverse of [`Self::flat_index`].
     pub fn level_and_offset(flat: u32) -> (u32, u32) {
         let depth = u32::try_from(TREE_DEPTH).unwrap_or(u32::MAX);
-        let total = 1u32 << (depth + 1);
-        let mut cursor = 0u32;
-        for level in 0..=depth {
-            let span = total >> (level + 1);
-            if flat < cursor.saturating_add(span.max(1)) {
-                return (level, flat - cursor);
-            }
-            cursor = cursor.saturating_add(span.max(1));
-        }
-        (depth, 0)
+        raven_railgun_core::tree_layout::level_and_offset(depth, flat)
     }
 }
 
@@ -254,29 +224,14 @@ impl PirTableEncoder for PerNodeEncoder {
     }
 
     fn materialize_shard(&self, shard_id: u32, store: &LogicalLeafStore) -> Vec<u8> {
-        let eps = self.entries_per_shard as usize;
-        let mut buf = vec![0u8; eps.saturating_mul(NODE_HASH_BYTES)];
-        let imt = store.imt(self.tree_number);
-        let row_start_global = u64::from(shard_id) * u64::from(self.entries_per_shard);
-        for row_offset in 0..eps {
-            let flat = row_start_global + u64::try_from(row_offset).unwrap_or(u64::MAX);
-            if flat >= u64::from(PER_NODE_TOTAL_NODES) {
-                break;
-            }
-            let flat_u32 = u32::try_from(flat).unwrap_or(u32::MAX);
-            let (level, idx_at_level) = Self::level_and_offset(flat_u32);
-            let hash = imt.map_or([0u8; 32], |i| i.node(level as usize, idx_at_level as usize));
-            let byte_start = row_offset * NODE_HASH_BYTES;
-            let byte_end = byte_start + NODE_HASH_BYTES;
-            if let Some(dst) = buf.get_mut(byte_start..byte_end) {
-                dst.copy_from_slice(&hash);
-            }
-        }
-        buf
+        materialize_node_shard(
+            store.imt(self.tree_number),
+            shard_id,
+            self.entries_per_shard,
+        )
     }
 
     fn affected_shards_for_leaf(&self, tree: u32, leaf_index: u32) -> BTreeSet<u32> {
-        let mut dirty = BTreeSet::new();
         if tree != self.tree_number {
             tracing::warn!(
                 target = "raven::pir_table",
@@ -288,16 +243,9 @@ impl PirTableEncoder for PerNodeEncoder {
                  dirty-shard set will be empty so re-encode never fires for \
                  this event. Misconfigured deployment?"
             );
-            return dirty;
+            return BTreeSet::new();
         }
-        let depth = u32::try_from(TREE_DEPTH).unwrap_or(u32::MAX);
-        let mut idx = leaf_index;
-        for level in 0..=depth {
-            let flat = Self::flat_index(level, idx);
-            dirty.insert(flat / self.entries_per_shard);
-            idx >>= 1;
-        }
-        dirty
+        node_affected_shards(self.entries_per_shard, leaf_index)
     }
 
     fn label(&self) -> &'static str {

@@ -1,8 +1,9 @@
 //! PIR-table encoders. Pure functions over `(LogicalLeafStore, shard_id)` and
 //! reconstructible from CRS + cell shape, so encoder state is never persisted.
 
-use crate::imt::TREE_DEPTH;
+use crate::imt::{Imt, TREE_DEPTH};
 use crate::inspire::LogicalLeafStore;
+use raven_inspire::{inspiring::PackParams, params::rows_per_shard_match_ring_dim};
 use raven_railgun_core::{AdapterError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -257,17 +258,17 @@ pub fn validate_total_entries(encoder: &EncoderKind, total_entries: usize) -> Re
 /// Column count `entry_size` induces in the InspiRING packing.
 #[must_use]
 pub fn pir_cell_columns(entry_size: usize) -> usize {
-    entry_size.div_ceil(2).max(1)
+    raven_inspire::num_columns(entry_size)
 }
 
 /// Whether `entry_size` is a legal cell width at `ring_dim`. The packing
 /// generator is `2n / gamma + 1` under integer division, so an off-law column
 /// count picks the wrong automorphism and silently decrypts to unrelated bytes.
-/// Measured ladder: `engine/tests/pir_cell_width_law.rs`.
+/// Measured by the production cell-width ladder test.
 #[must_use]
 pub fn is_legal_cell_width(entry_size: usize, ring_dim: usize) -> bool {
     let cols = pir_cell_columns(entry_size);
-    entry_size > 0 && cols.is_power_of_two() && cols <= ring_dim / 2
+    entry_size > 0 && PackParams::is_legal_width(ring_dim, cols)
 }
 
 /// `entry_size` rounded up to the next power-of-two ladder width, or `None`
@@ -352,7 +353,7 @@ pub fn validate_cell_shape(
 /// # Errors
 /// [`AdapterError::InvalidQuery`] unless `entries_per_shard == ring_dim`.
 pub fn validate_rows_per_shard(entries_per_shard: u32, ring_dim: usize) -> Result<()> {
-    if entries_per_shard as usize == ring_dim {
+    if rows_per_shard_match_ring_dim(u64::from(entries_per_shard), ring_dim) {
         return Ok(());
     }
     Err(AdapterError::InvalidQuery(format!(
@@ -363,6 +364,74 @@ pub fn validate_rows_per_shard(entries_per_shard: u32, ring_dim: usize) -> Resul
          shard holding the rows starting at s * {ring_dim}, and neither the re-encode nor the \
          query path returns an error. Configure rows per shard {ring_dim}."
     )))
+}
+
+fn materialize_path_shard(
+    imt: Option<&Imt>,
+    shard_id: u32,
+    entries_per_shard: u32,
+    record_size: usize,
+) -> Vec<u8> {
+    let eps = entries_per_shard as usize;
+    let mut buf = vec![0u8; eps.saturating_mul(record_size)];
+    let Some(imt) = imt else {
+        return buf;
+    };
+    let leaf_count = imt.leaf_count();
+    let row_start = (shard_id as usize).saturating_mul(eps);
+    for row_offset in 0..eps {
+        let leaf_idx = row_start + row_offset;
+        if leaf_idx >= leaf_count {
+            break;
+        }
+        let Ok(proof) = imt.merkle_proof(leaf_idx) else {
+            continue;
+        };
+        let row_byte_start = row_offset * record_size;
+        for (sib_idx, sibling) in proof.elements.iter().enumerate() {
+            let sib_byte_start = row_byte_start + sib_idx * NODE_HASH_BYTES;
+            let sib_byte_end = sib_byte_start + NODE_HASH_BYTES;
+            if let Some(dst) = buf.get_mut(sib_byte_start..sib_byte_end) {
+                dst.copy_from_slice(sibling);
+            }
+        }
+    }
+    buf
+}
+
+fn materialize_node_shard(imt: Option<&Imt>, shard_id: u32, entries_per_shard: u32) -> Vec<u8> {
+    let eps = entries_per_shard as usize;
+    let mut buf = vec![0u8; eps.saturating_mul(NODE_HASH_BYTES)];
+    let row_start_global = u64::from(shard_id) * u64::from(entries_per_shard);
+    let depth = u32::try_from(TREE_DEPTH).unwrap_or(u32::MAX);
+    for row_offset in 0..eps {
+        let flat = row_start_global + u64::try_from(row_offset).unwrap_or(u64::MAX);
+        if flat >= u64::from(PER_NODE_TOTAL_NODES) {
+            break;
+        }
+        let flat_u32 = u32::try_from(flat).unwrap_or(u32::MAX);
+        let (level, idx_at_level) =
+            raven_railgun_core::tree_layout::level_and_offset(depth, flat_u32);
+        let hash = imt.map_or([0u8; 32], |i| i.node(level as usize, idx_at_level as usize));
+        let byte_start = row_offset * NODE_HASH_BYTES;
+        let byte_end = byte_start + NODE_HASH_BYTES;
+        if let Some(dst) = buf.get_mut(byte_start..byte_end) {
+            dst.copy_from_slice(&hash);
+        }
+    }
+    buf
+}
+
+fn node_affected_shards(entries_per_shard: u32, leaf_index: u32) -> BTreeSet<u32> {
+    let mut dirty = BTreeSet::new();
+    let depth = u32::try_from(TREE_DEPTH).unwrap_or(u32::MAX);
+    let mut idx = leaf_index;
+    for level in 0..=depth {
+        let flat = raven_railgun_core::tree_layout::flat_index(depth, level, idx);
+        dirty.insert(flat / entries_per_shard);
+        idx >>= 1;
+    }
+    dirty
 }
 
 /// Shard-dirty walk for the path encoders. Inserting `leaf_index` invalidates
@@ -415,15 +484,6 @@ pub trait PirTableEncoder: Send + Sync + std::fmt::Debug {
         &self,
         _list_key: &[u8; 32],
         _list_index: u32,
-    ) -> BTreeSet<u32> {
-        BTreeSet::new()
-    }
-
-    /// Shard ids dirtied by a per-list status update; no-op for chain-tree encoders.
-    fn affected_shards_for_ppoi_status(
-        &self,
-        _list_key: &[u8; 32],
-        _blinded_commitment: &[u8; 32],
     ) -> BTreeSet<u32> {
         BTreeSet::new()
     }

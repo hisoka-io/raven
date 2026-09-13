@@ -11,6 +11,15 @@
 
 use raven_railgun_poseidon::hash_n;
 
+fn bytes32(hex: &str) -> [u8; 32] {
+    assert_eq!(hex.len(), 64, "field element must have 64 hex digits");
+    let mut out = [0u8; 32];
+    for (index, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).expect("hex byte");
+    }
+    out
+}
+
 fn fr_be_from_decimal(s: &str) -> [u8; 32] {
     use ark_ff::{BigInteger, PrimeField};
     let fr: ark_bn254::Fr = s.parse().expect("decimal parses to BN254 Fr");
@@ -112,6 +121,11 @@ fn token_data_hash_nft_keccak_then_mod_snark_prime() {
     expected[32 - copy_len..].copy_from_slice(&bytes[..copy_len]);
 
     let got = raven_railgun_poseidon::token_data_hash_nft(1, token_address, token_sub_id);
+    assert_eq!(
+        got,
+        bytes32("160b42fd1237a82af2e72cf11c10dd762cd8e884314f2f3f397319789dd98b64"),
+        "NFT tokenHash bytes are a wire compatibility pin"
+    );
     assert_eq!(
         got, expected,
         "NFT tokenHash must be keccak256(type||addr||subid) mod SNARK_PRIME"

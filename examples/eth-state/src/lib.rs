@@ -16,7 +16,7 @@ use rand_chacha::ChaCha20Rng;
 use raven_core::server_error::Result as SchemeResult;
 use raven_core::ServerError;
 use raven_inspire::math::GaussianSampler;
-use raven_inspire::params::{InspireParams, ShardConfig};
+use raven_inspire::params::{rows_per_shard_match_ring_dim, InspireParams, ShardConfig};
 #[cfg(not(feature = "cached-respond"))]
 use raven_inspire::respond_seeded_inspiring;
 use raven_inspire::rlwe::RlweSecretKey;
@@ -152,7 +152,7 @@ pub fn build_flat_state(
     // Leaf assignment (shard = flat_index / ENTRIES_PER_SHARD) and the encoder's
     // rows-per-shard both must equal ring_dim; a mismatch builds engines whose
     // declared and actual geometry disagree, and reads return wrong bytes as Ok.
-    if params.ring_dim != ENTRIES_PER_SHARD {
+    if !rows_per_shard_match_ring_dim(ENTRIES_PER_SHARD as u64, params.ring_dim) {
         return Err(EthStateError::Setup(format!(
             "shard geometry mismatch: params.ring_dim {} != ENTRIES_PER_SHARD {}; \
              every entry-to-shard assignment in this demo divides by ENTRIES_PER_SHARD \

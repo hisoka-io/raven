@@ -1,6 +1,5 @@
-//! The u16 wire-schema prefix is the only thing standing between a future client's body
-//! and a v1 decode of it. bincode accepts trailing bytes, so a body that skipped the
-//! guard does not fail loudly - it decodes into whatever the old struct layout says.
+//! The u16 wire-schema prefix prevents previous and future response layouts from reaching
+//! the wrong decoder. Frozen v2 and current v3 bodies prove both refusal directions.
 
 #![allow(
     dead_code,
@@ -18,6 +17,9 @@ use axum::{
     extract::ConnectInfo,
     http::{header, Method, Request, StatusCode},
 };
+use raven_inspire::math::Poly;
+use raven_inspire::pir::{PackingMode, ServerResponse};
+use raven_inspire::rlwe::RlweCiphertext;
 use raven_railgun_core::{InstanceId, Result as RailgunResult};
 use raven_railgun_engine::{Engine, InstanceRole, PirInstance, PirScheme};
 use raven_railgun_http::{
@@ -29,6 +31,7 @@ use tower::ServiceExt;
 
 const TOKEN: &str = "schema-version-guard-token-1234567";
 const INSTANCE: &str = "schema-version-instance";
+const PREVIOUS_WIRE_SCHEMA_VERSION: u16 = 2;
 
 static APPSTATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -46,6 +49,13 @@ struct EchoQuery {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 struct EchoResponse {
     tag: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct FrozenV2ServerResponse {
+    ciphertext: RlweCiphertext,
+    column_ciphertexts: Vec<RlweCiphertext>,
+    packing_mode: Option<PackingMode>,
 }
 
 impl PirScheme for EchoScheme {
@@ -100,14 +110,174 @@ fn request(route: &str, body: Vec<u8>) -> Request<Body> {
     req
 }
 
-/// Everything after the prefix stays a valid v1 body, so a server that skipped the
-/// version check serves 200 rather than failing to decode.
+/// Everything after the prefix stays a valid current body, isolating the version guard.
 fn with_next_schema_version(mut body: Vec<u8>) -> Vec<u8> {
     let next = WIRE_SCHEMA_VERSION
         .checked_add(1)
         .expect("version headroom");
     body[..WIRE_SCHEMA_PREFIX_LEN].copy_from_slice(&next.to_be_bytes());
     body
+}
+
+fn with_schema_version(mut body: Vec<u8>, version: u16) -> Vec<u8> {
+    body[..WIRE_SCHEMA_PREFIX_LEN].copy_from_slice(&version.to_be_bytes());
+    body
+}
+
+fn response_layouts() -> (FrozenV2ServerResponse, ServerResponse) {
+    let modulus = 65_537;
+    let ciphertext = RlweCiphertext::from_parts(
+        Poly::from_coeffs(vec![1, 2, 3, 4], modulus),
+        Poly::from_coeffs(vec![5, 6, 7, 8], modulus),
+    );
+    (
+        FrozenV2ServerResponse {
+            ciphertext: ciphertext.clone(),
+            column_ciphertexts: vec![],
+            packing_mode: Some(PackingMode::Inspiring),
+        },
+        ServerResponse {
+            ciphertext,
+            column_ciphertexts: vec![],
+            packing_mode: Some(PackingMode::Inspiring),
+            packed_coefficients: Some(2),
+        },
+    )
+}
+
+fn write_at_schema<T: Serialize>(value: &T, version: u16) -> Vec<u8> {
+    let mut out = version.to_be_bytes().to_vec();
+    out.extend_from_slice(&bincode::serialize(value).expect("encode frozen schema body"));
+    out
+}
+
+fn write_batch_at_schema<T: Serialize>(values: &[T], version: u16) -> Vec<u8> {
+    let mut out = version.to_be_bytes().to_vec();
+    out.extend_from_slice(
+        &u64::try_from(values.len())
+            .expect("batch count fits u64")
+            .to_le_bytes(),
+    );
+    for value in values {
+        let body = bincode::serialize(value).expect("encode frozen batch element");
+        out.extend_from_slice(
+            &u64::try_from(body.len())
+                .expect("batch element length fits u64")
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&body);
+    }
+    out
+}
+
+fn read_at_schema<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    expected: u16,
+) -> Result<T, String> {
+    let prefix = bytes
+        .get(..WIRE_SCHEMA_PREFIX_LEN)
+        .ok_or_else(|| "short schema prefix".to_owned())?;
+    let version = u16::from_be_bytes([prefix[0], prefix[1]]);
+    if version != expected {
+        return Err(format!(
+            "schema version mismatch: expected v{expected}, got v{version}"
+        ));
+    }
+    bincode::deserialize(
+        bytes
+            .get(WIRE_SCHEMA_PREFIX_LEN..)
+            .ok_or_else(|| "short schema body".to_owned())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn read_batch_at_schema<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    expected: u16,
+) -> Result<Vec<T>, String> {
+    let prefix = bytes
+        .get(..WIRE_SCHEMA_PREFIX_LEN)
+        .ok_or_else(|| "short schema prefix".to_owned())?;
+    let version = u16::from_be_bytes([prefix[0], prefix[1]]);
+    if version != expected {
+        return Err(format!(
+            "schema version mismatch: expected v{expected}, got v{version}"
+        ));
+    }
+    let mut offset = WIRE_SCHEMA_PREFIX_LEN;
+    let count_end = offset + 8;
+    let count_bytes = bytes
+        .get(offset..count_end)
+        .ok_or_else(|| "short batch count".to_owned())?;
+    let count = usize::try_from(u64::from_le_bytes(
+        count_bytes.try_into().expect("eight-byte count"),
+    ))
+    .map_err(|_| "batch count exceeds usize".to_owned())?;
+    offset = count_end;
+    let mut values = Vec::with_capacity(count);
+    for index in 0..count {
+        let length_end = offset + 8;
+        let length_bytes = bytes
+            .get(offset..length_end)
+            .ok_or_else(|| format!("short element {index} length"))?;
+        let length = usize::try_from(u64::from_le_bytes(
+            length_bytes.try_into().expect("eight-byte element length"),
+        ))
+        .map_err(|_| format!("element {index} length exceeds usize"))?;
+        offset = length_end;
+        let element_end = offset
+            .checked_add(length)
+            .ok_or_else(|| format!("element {index} length overflow"))?;
+        let element = bytes
+            .get(offset..element_end)
+            .ok_or_else(|| format!("short element {index} body"))?;
+        values.push(bincode::deserialize(element).map_err(|error| error.to_string())?);
+        offset = element_end;
+    }
+    Ok(values)
+}
+
+#[test]
+fn real_v2_and_v3_single_response_layouts_refuse_each_other() {
+    assert_eq!(WIRE_SCHEMA_VERSION, 3, "R1 changes the response layout");
+    let (v2_response, v3_response) = response_layouts();
+    let old = write_at_schema(&v2_response, PREVIOUS_WIRE_SCHEMA_VERSION);
+    let current = write_versioned(&v3_response).expect("encode current response layout");
+    assert_ne!(
+        &old[WIRE_SCHEMA_PREFIX_LEN..],
+        &current[WIRE_SCHEMA_PREFIX_LEN..],
+        "the frozen v2 body must not be a relabeled v3 body"
+    );
+
+    let current_error = raven_railgun_http::read_versioned::<ServerResponse>(&old)
+        .expect_err("v3 reader must refuse a real v2 response");
+    assert!(current_error.to_string().contains("expects v3"));
+    assert!(current_error.to_string().contains("sent v2"));
+    let old_error =
+        read_at_schema::<FrozenV2ServerResponse>(&current, PREVIOUS_WIRE_SCHEMA_VERSION)
+            .expect_err("v2 reader must refuse a real v3 response");
+    assert!(old_error.contains("expected v2, got v3"));
+}
+
+#[test]
+fn real_v2_and_v3_batch_response_layouts_refuse_each_other() {
+    let (v2_response, v3_response) = response_layouts();
+    let old = write_batch_at_schema(&[v2_response], PREVIOUS_WIRE_SCHEMA_VERSION);
+    let current = write_batch_response_versioned(&[v3_response]).expect("encode v3 batch");
+    assert_ne!(
+        &old[WIRE_SCHEMA_PREFIX_LEN + 16..],
+        &current[WIRE_SCHEMA_PREFIX_LEN + 16..],
+        "the frozen v2 element must not be a relabeled v3 element"
+    );
+    let current_error = read_batch_response_versioned::<ServerResponse>(&old)
+        .expect_err("v3 batch reader must refuse a real v2 response");
+    assert!(current_error.to_string().contains("expects v3"));
+    assert!(current_error.to_string().contains("sent v2"));
+
+    let old_error =
+        read_batch_at_schema::<FrozenV2ServerResponse>(&current, PREVIOUS_WIRE_SCHEMA_VERSION)
+            .expect_err("v2 batch reader must refuse a real v3 response");
+    assert!(old_error.contains("expected v2, got v3"));
 }
 
 async fn status_of(route: &str, body: Vec<u8>) -> StatusCode {
@@ -126,6 +296,25 @@ async fn single_query_refuses_a_body_from_a_future_schema_version() {
         StatusCode::BAD_REQUEST,
         "a v{}-prefixed body must be refused, not decoded as v{WIRE_SCHEMA_VERSION}",
         WIRE_SCHEMA_VERSION + 1
+    );
+}
+
+#[tokio::test]
+async fn previous_schema_rejection_advertises_the_current_version() {
+    let current = write_versioned(&EchoQuery { tag: 7 }).expect("encode current");
+    let old = with_schema_version(current, PREVIOUS_WIRE_SCHEMA_VERSION);
+    let response = build_router()
+        .oneshot(request("query", old))
+        .await
+        .expect("dispatch old body");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response
+            .headers()
+            .get(X_RAVEN_SCHEMA_VERSION.to_ascii_lowercase())
+            .expect("schema mismatch must advertise the accepted version"),
+        "3"
     );
 }
 

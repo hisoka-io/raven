@@ -3,49 +3,18 @@
 
 import { afterEach, beforeAll, describe, expect, it, afterAll } from "vitest";
 
-import { RavenPOINodeInterface, containsByteSequence, hexToBytes } from "../src/index";
+import { RavenPOINodeInterface, containsByteSequence } from "../src/index";
 import type { ClientPirContext } from "../src/index";
 
 import { loadFixture, makeClientPirContext } from "./helpers/fixture";
-import { encodeBatchResponseNodes } from "./helpers/auth_path_stub";
+import { encodeBatchResponseNodes, encodedBatchCount } from "./helpers/auth_path_stub";
 import { startMockServer, writeBinary, writeJson, type MockServer } from "./helpers/mock_server";
+import {
+  assertNoCommitmentsInPirRequests,
+  inspectPirDataPosts,
+} from "./helpers/private_wire";
 
 const TOKEN = "test-token-padded-long-enough-1234";
-
-/** A leak check over zero bodies proves nothing, so the caller must say what it expects. */
-function assertNoBcLeaked(
-  bodies: { url: string; body: Uint8Array }[],
-  bcsHex: string[],
-  minQueryBodies: number,
-): void {
-  const queries = bodies.filter((b) => b.url.includes("/v1/instance/"));
-  expect(
-    queries.length,
-    "no PIR request left the SDK, so the leak check below inspected nothing",
-  ).toBeGreaterThanOrEqual(minQueryBodies);
-  for (const bcHex of bcsHex) {
-    const bcBytes = hexToBytes(bcHex);
-    const bcAscii = new TextEncoder().encode(bcHex);
-    const bcAscii0x = new TextEncoder().encode(`0x${bcHex}`);
-    for (const b of bodies) {
-      // bc-to-idx-map and status-header are public ordering oracles that publish BCs in plaintext by design.
-      if (b.url.includes("bc-to-idx-map")) continue;
-      if (b.url.includes("status-header")) continue;
-      expect(
-        containsByteSequence(b.body, bcBytes),
-        `body for ${b.url} contains raw BC bytes ${bcHex}`,
-      ).toBe(false);
-      expect(
-        containsByteSequence(b.body, bcAscii),
-        `body for ${b.url} contains hex-ASCII BC ${bcHex}`,
-      ).toBe(false);
-      expect(
-        containsByteSequence(b.body, bcAscii0x),
-        `body for ${b.url} contains 0x-prefixed BC ${bcHex}`,
-      ).toBe(false);
-    }
-  }
-}
 
 function makeMaps(fixture: ReturnType<typeof loadFixture>, ctx: ClientPirContext) {
   const lk = fixture.meta.list_key_hex;
@@ -119,12 +88,23 @@ describe("privacy across every SDK call path", () => {
       );
     } catch {
     }
-    assertNoBcLeaked(sdk.lastWireRequests(), queriedBcs, 1);
-    assertNoBcLeaked(
-      server.requests.map((r) => ({ url: r.url, body: r.body })),
-      queriedBcs,
-      1,
-    );
+    expect(
+      assertNoCommitmentsInPirRequests(sdk.lastWireRequests(), queriedBcs, {
+        expectedQueryCount: 8,
+      }),
+    ).toHaveLength(1);
+    expect(
+      assertNoCommitmentsInPirRequests(server.requests, queriedBcs, {
+        expectedQueryCount: 8,
+      }),
+    ).toHaveLength(1);
+    const sessionOnly = server.requests.filter((request) => request.url.endsWith("/session"));
+    expect(sessionOnly).toHaveLength(1);
+    expect(() =>
+      assertNoCommitmentsInPirRequests(sessionOnly, queriedBcs, {
+        expectedQueryCount: 8,
+      }),
+    ).toThrow(/selected no POST query\/batch\/fanout requests/);
   });
 
   it("getPOIMerkleProofs client-PIR path leaks no BC bytes", async () => {
@@ -160,12 +140,16 @@ describe("privacy across every SDK call path", () => {
       await sdk.getPOIMerkleProofs(fixture.meta.list_key_hex, queriedBcs);
     } catch {
     }
-    assertNoBcLeaked(sdk.lastWireRequests(), queriedBcs, 1);
-    assertNoBcLeaked(
-      server.requests.map((r) => ({ url: r.url, body: r.body })),
-      queriedBcs,
-      1,
-    );
+    expect(
+      assertNoCommitmentsInPirRequests(sdk.lastWireRequests(), queriedBcs, {
+        expectedQueryCount: 16,
+      }),
+    ).toHaveLength(1);
+    expect(
+      assertNoCommitmentsInPirRequests(server.requests, queriedBcs, {
+        expectedQueryCount: 16,
+      }),
+    ).toHaveLength(1);
   });
 
   it("getMerkleProof (T3 commit-tree) client-PIR path leaks no BC bytes", async () => {
@@ -201,11 +185,13 @@ describe("privacy across every SDK call path", () => {
     } catch {
     }
 
-    const wires = sdk.lastWireRequests();
-    expect(wires.length).toBeGreaterThan(0);
+    const inspected = inspectPirDataPosts(sdk.lastWireRequests(), {
+      expectedQueryCount: 16,
+    });
+    expect(inspected).toHaveLength(1);
     const ascii = new TextEncoder().encode("1234");
     const raw = new Uint8Array([0xd2, 0x04, 0x00, 0x00]); // 1234 LE u32
-    for (const w of wires) {
+    for (const { request: w } of inspected) {
       expect(
         containsByteSequence(w.body, raw),
         `body for ${w.url} contains raw u32 LE leafIndex`,
@@ -217,15 +203,9 @@ describe("privacy across every SDK call path", () => {
     }
   });
 
-  // D4 / DH-L0-6: a non-member short-circuits to `Missing` with `continue` BEFORE any
-  // query fires (src/raven-poi-node-interface.ts getPOIsPerListClientPir), so the
-  // observable count of /v1/instance/ POSTs tracks list membership 1:1 — a
-  // list-membership oracle for anyone who can count requests. drawPaddedSlots exists
-  // and is applied to exactly ONE call site (assembleAuthPath); the T1 loop has no
-  // padding. RED-by-design: un-mark when getPOIsPerListClientPir applies the batch
-  // ladder (or equivalent padding) to the T1 path. Probe capture (as a plain `it`):
-  // "expected 3 to be +0 // Object.is equality" at the count assertion below.
-  it.fails(
+  // D4 / DH-L0-6: the number of request envelopes must not reveal how many supplied
+  // commitments are members of the list.
+  it(
     "T1 outbound request count is independent of list membership (D4 / DH-L0-6)",
     async () => {
       const lk = fixture.meta.list_key_hex;
@@ -234,17 +214,20 @@ describe("privacy across every SDK call path", () => {
         .map((idx) => fixture.meta.bcs_hex[idx]);
       const nonMemberBcs = ["77".repeat(32), "88".repeat(32), "99".repeat(32)];
       const served = fixture.meta.target_indices.slice(0, 3);
-      let cursor = 0;
+      let batchNumber = 0;
       server.route(
-        (req) => /^\/v1\/instance\/[^/]+\/query$/.test(req.url ?? ""),
-        (_req, _body, res) => {
-          const idx = served[cursor % served.length];
-          cursor += 1;
-          const body = fixture.responsesByIdx.get(idx)!;
-          const out = new Uint8Array(2 + body.length);
-          out[1] = 1;
-          out.set(body, 2);
-          writeBinary(res, out);
+        (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
+        (_req, body, res) => {
+          const count = encodedBatchCount(body);
+          const real =
+            batchNumber === 0
+              ? [fixture.responsesByIdx.get(served[0])!]
+              : served.map((idx) => fixture.responsesByIdx.get(idx)!);
+          batchNumber += 1;
+          const responses = Array.from({ length: count }, (_unused, slot) =>
+            slot < real.length ? real[slot] : real[0],
+          );
+          writeBinary(res, encodeBatchResponseNodes(responses));
           return true;
         },
       );
@@ -265,6 +248,7 @@ describe("privacy across every SDK call path", () => {
         nonMemberBcs.map((bc) => ({ blindedCommitment: bc, type: "Shield" as const })),
       );
       const countZeroMembers = countQueries(sdk0);
+      expect(encodedBatchCount(sdk0.lastWireRequests()[0].body)).toBe(1);
 
       const sdk3 = new RavenPOINodeInterface({
         endpoint: server.url,
@@ -281,6 +265,7 @@ describe("privacy across every SDK call path", () => {
         })),
       );
       const countThreeMembers = countQueries(sdk3);
+      expect(encodedBatchCount(sdk3.lastWireRequests()[0].body)).toBe(4);
 
       expect(
         countThreeMembers,
@@ -288,6 +273,64 @@ describe("privacy across every SDK call path", () => {
       ).toBe(countZeroMembers);
     },
   );
+
+  it("privacy assertion refuses empty and malformed request sets", () => {
+    expect(() =>
+      assertNoCommitmentsInPirRequests([], ["11".repeat(32)], {
+        expectedQueryCount: 1,
+      }),
+    ).toThrow(/selected no POST query\/batch\/fanout requests/);
+
+    const shortBatch = new Uint8Array(9);
+    shortBatch.set([0, 3]);
+    expect(() =>
+      assertNoCommitmentsInPirRequests(
+        [{ url: "/v1/instance/test/batch", method: "POST", body: shortBatch }],
+        ["11".repeat(32)],
+        { expectedQueryCount: 1 },
+      ),
+    ).toThrow(/shorter than 10-byte header/);
+
+    expect(() =>
+      assertNoCommitmentsInPirRequests(
+        [{ url: "/v1/instance/test/batch", method: "POST", body: new Uint8Array(10) }],
+        ["11".repeat(32)],
+        { expectedQueryCount: 1 },
+      ),
+    ).toThrow(/schema prefix.*expected \[0, 3\]/);
+
+    const zeroCountBatch = new Uint8Array(10);
+    zeroCountBatch.set([0, 3]);
+    expect(() =>
+      assertNoCommitmentsInPirRequests(
+        [{ url: "/v1/instance/test/batch", method: "POST", body: zeroCountBatch }],
+        ["11".repeat(32)],
+        { expectedQueryCount: 1 },
+      ),
+    ).toThrow(/invalid batch query count 0/);
+
+    const undersizedBatch = new Uint8Array(10 + 31);
+    undersizedBatch.set([0, 3]);
+    new DataView(undersizedBatch.buffer).setBigUint64(2, 1n, true);
+    expect(() =>
+      assertNoCommitmentsInPirRequests(
+        [{ url: "/v1/instance/test/batch", method: "POST", body: undersizedBatch }],
+        ["11".repeat(32)],
+        { expectedQueryCount: 1 },
+      ),
+    ).toThrow(/query payload is 31 bytes/);
+
+    const unevenBatch = new Uint8Array(10 + 65);
+    unevenBatch.set([0, 3]);
+    new DataView(unevenBatch.buffer).setBigUint64(2, 2n, true);
+    expect(() =>
+      assertNoCommitmentsInPirRequests(
+        [{ url: "/v1/instance/test/batch", method: "POST", body: unevenBatch }],
+        ["11".repeat(32)],
+        { expectedQueryCount: 2 },
+      ),
+    ).toThrow(/payload bytes do not divide/);
+  });
 
   it("bc-to-idx-map publishing channel emits a GET with no body", async () => {
     server.route(

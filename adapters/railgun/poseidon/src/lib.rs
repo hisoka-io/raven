@@ -91,17 +91,8 @@ pub fn railgun_merkle_zero_value() -> [u8; 32] {
     let mut digest = [0u8; 32];
     hasher.finalize(&mut digest);
 
-    use ark_ff::{BigInteger, PrimeField};
     let fr = Fr::from_be_bytes_mod_order(&digest);
-    let bytes = fr.into_bigint().to_bytes_be();
-    let mut out = [0u8; 32];
-    let copy_len = bytes.len().min(32);
-    if let Some(dst) = out.get_mut(32 - copy_len..) {
-        if let Some(src) = bytes.get(..copy_len) {
-            dst.copy_from_slice(src);
-        }
-    }
-    out
+    fr_to_be_bytes(fr)
 }
 
 /// ERC-20 `tokenHash`: the 20-byte address left-zero-padded to 32 bytes (no hash).
@@ -138,17 +129,8 @@ pub fn token_data_hash_nft(
     let mut digest = [0u8; 32];
     hasher.finalize(&mut digest);
 
-    use ark_ff::{BigInteger, PrimeField};
-    let fr = ark_bn254::Fr::from_be_bytes_mod_order(&digest);
-    let bytes = fr.into_bigint().to_bytes_be();
-    let mut out = [0u8; 32];
-    let copy_len = bytes.len().min(32);
-    if let Some(dst) = out.get_mut(32 - copy_len..) {
-        if let Some(src) = bytes.get(..copy_len) {
-            dst.copy_from_slice(src);
-        }
-    }
-    out
+    let fr = Fr::from_be_bytes_mod_order(&digest);
+    fr_to_be_bytes(fr)
 }
 
 /// `TokenType` discriminant per upstream `src/models/formatted-types.ts`.

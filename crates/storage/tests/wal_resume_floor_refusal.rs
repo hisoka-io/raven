@@ -21,6 +21,8 @@ fn fresh_manifest() -> Manifest {
         current_marker: 0,
         encoder_label: "test-encoder".to_owned(),
         prev_encoder_label: None,
+        entry_size_bytes: Some(32),
+        rows_per_shard: Some(2048),
     }
 }
 

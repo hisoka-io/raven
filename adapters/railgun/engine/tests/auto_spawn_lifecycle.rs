@@ -159,8 +159,8 @@ async fn manual_role_flip_works_and_static_default_policy_is_pinned() {
         u64::MAX,
         "a static commit tree must not snapshot on a timer either"
     );
-    assert_eq!(after.archived_wals_retain, 4);
-    assert_eq!(after.snapshots_retain, 2);
+    assert_eq!(after.retention.archived_wals_retain, 4);
+    assert_eq!(after.retention.snapshots_retain, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

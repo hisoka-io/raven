@@ -108,7 +108,7 @@ function decodeInstanceParams(buf: Uint8Array): DecodedInstanceParams {
   }
   const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   const envelope = (view.getUint8(0) << 8) | view.getUint8(1);
-  if (envelope !== 1) {
+  if (envelope !== 2) {
     throw new Error(`decodeInstanceParams: unexpected envelope version ${envelope}`);
   }
   let off = 2;

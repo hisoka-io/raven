@@ -1,6 +1,8 @@
+// Railgun POI facade and domain-shaped wire helpers.
 export {
   RavenPOINodeInterface,
   type RavenConfig,
+  type PrivateStalePolicy,
   type POIStatus,
   type BlindedCommitmentType,
   type StatusHeader,
@@ -21,8 +23,8 @@ export {
 
 export { hashLeftRight, foldMerkleRoot } from "./poseidon";
 
+// Generic PIR session bootstrap and query-bundle handling.
 export type {
-  BcToIdxMap,
   ClientPirContext,
   RavenInspireWasm,
   RavenInspireClientSession,
@@ -35,13 +37,20 @@ export {
   decodeClientPirQueryBundle,
   installPanicHook,
   loadClientPirContext,
+} from "./client-pir";
+
+// Railgun POI decoding and Merkle addressing.
+export type { BcToIdxMap, RavenPOIPathWasm } from "./poi-pir";
+
+export {
   statusByteToPOIStatus,
   validateBcHex,
   validateLeafIndex,
   validateListKeyHex,
   validateTreeNumber,
-} from "./client-pir";
+} from "./poi-pir";
 
+// Generic client-side session persistence.
 export {
   idbGet,
   idbPut,
@@ -49,6 +58,7 @@ export {
   sha256Hex,
 } from "./session-cache";
 
+// Railgun deployment routing, freshness caching, and event/status surfaces.
 export { ChainRegistry, type ChainRegistryEntry } from "./chain-registry";
 
 export {
@@ -58,7 +68,14 @@ export {
   type ImtCacheConfig,
 } from "./imt-cache";
 
-export { RavenError, type RavenErrorKind, type RavenErrorContext } from "./errors";
+export {
+  RavenError,
+  type RavenErrorKind,
+  type RavenErrorContext,
+  type RavenErrorByKind,
+  type StaleDataContext,
+  type StaleDataError,
+} from "./errors";
 
 export {
   subscribeRavenEvents,

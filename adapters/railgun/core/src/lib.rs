@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod batch_ladder;
+pub mod tree_layout;
 
 /// Server-runtime identity and error types, re-exported from `raven-core`.
 pub use raven_core::{Epoch, InstanceId, ServerError as AdapterError};
@@ -75,6 +76,18 @@ pub enum POIStatus {
     ProofSubmitted,
     /// No PPOI association recorded for this BC.
     Missing,
+}
+
+impl POIStatus {
+    /// Byte stored in PIR status rows and plaintext compatibility responses.
+    pub const fn wire_byte(self) -> u8 {
+        match self {
+            Self::Valid => 0,
+            Self::ShieldBlocked => 1,
+            Self::ProofSubmitted => 2,
+            Self::Missing => 3,
+        }
+    }
 }
 
 /// Merkle authentication path: 16 Poseidon BN254 siblings, their root, and the
@@ -209,6 +222,14 @@ mod tests {
         assert_eq!(s, "\"Valid\"");
         let s = serde_json::to_string(&POIStatus::ShieldBlocked).expect("serialize");
         assert_eq!(s, "\"ShieldBlocked\"");
+    }
+
+    #[test]
+    fn poi_status_bytes_are_exhaustive_and_fail_closed() {
+        assert_eq!(POIStatus::Valid.wire_byte(), 0);
+        assert_eq!(POIStatus::ShieldBlocked.wire_byte(), 1);
+        assert_eq!(POIStatus::ProofSubmitted.wire_byte(), 2);
+        assert_eq!(POIStatus::Missing.wire_byte(), 3);
     }
 
     #[test]

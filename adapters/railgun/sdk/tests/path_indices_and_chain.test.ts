@@ -22,7 +22,7 @@ import {
   type BlindedCommitmentType,
   type RavenErrorKind,
 } from "../src/index";
-import { makeRegisterSpy } from "./helpers/register_spy";
+import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
 
 import * as wasmPkg from "raven-inspire-client-wasm";
 
@@ -32,7 +32,7 @@ import { authPathOf, encodedBatchCount } from "./helpers/auth_path_stub";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const MOCK_EPOCH = 1;
-const MOCK_SCHEMA_VERSION = 1;
+const MOCK_SCHEMA_VERSION = 3;
 const LIST_KEY_HEX = "abababababababababababababababababababababababababababababababab";
 // Non-zero in its leading bytes so a status row's BC tail cannot match by accident.
 const BC_HEX = "9f3c17aa04e1b28d6605c9713fe82b40d1a7c35e96280bf4517ade0c2b6d8391";
@@ -61,6 +61,7 @@ function realPathStubWasm(): RavenInspireWasm {
     return levelOffset + idxAtLevel;
   }
   return {
+    ...stubRemoteSessionExports(),
     build_client_session: () => ({ free: () => undefined }),
     build_seeded_query: () => new Uint8Array(16),
     extract_response: (_session, _crs, _state, response, _entry) => {
@@ -118,6 +119,7 @@ function mountBatchRoute(server: MockServer, freshness?: { epoch?: number; schem
         "content-type": "application/octet-stream",
         "x-raven-epoch": String(freshness?.epoch ?? MOCK_EPOCH),
         "x-raven-schema-version": String(freshness?.schemaVersion ?? MOCK_SCHEMA_VERSION),
+        "x-raven-freshness": "lag_blocks=0 applied_height=0 epoch=1 confidence=1",
       };
       res.writeHead(200, headers);
       res.end(Buffer.from(out));
@@ -139,7 +141,7 @@ function mountEchoingBatchRoute(
       const slots = encodedBatchCount(body);
       const elemBytes = 32;
       const out = new Uint8Array(2 + 8 + slots * (8 + elemBytes));
-      out[1] = 1;
+      out[1] = 3;
       const dv = new DataView(out.buffer);
       dv.setUint32(2, slots, true);
       let off = 10;
@@ -155,6 +157,7 @@ function mountEchoingBatchRoute(
         "content-type": "application/octet-stream",
         "x-raven-epoch": String(tags.epoch),
         "x-raven-schema-version": String(tags.schemaVersion),
+        "x-raven-freshness": "lag_blocks=0 applied_height=0 epoch=1 confidence=1",
       });
       res.end(Buffer.from(out));
       return true;
@@ -164,17 +167,14 @@ function mountEchoingBatchRoute(
 
 function mountSingleQueryRoute(server: MockServer, statusByte: number): void {
   server.route(
-    (req) => /^\/v1\/instance\/[^/]+\/query$/.test(req.url ?? ""),
-    (_req, _body, res) => {
-      // SDK strips the `[u16 BE schema][bincode]` envelope, so the mock must prepend it.
-      // Row `[status, bc[0..31]]` mirrors the Rust status encoder at a 32 B record.
+    (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
+    (_req, body, res) => {
       const inner = new Uint8Array(32);
       inner[0] = statusByte;
       inner.set(hexToBytes(BC_HEX).subarray(0, 31), 1);
-      const out = new Uint8Array(2 + inner.length);
-      out[0] = 0;
-      out[1] = 1;
-      out.set(inner, 2);
+      const out = encodeBatchResponseNodes(
+        Array.from({ length: encodedBatchCount(body) }, () => inner),
+      );
       res.writeHead(200, {
         "content-type": "application/octet-stream",
         "x-raven-freshness": "lag_blocks=1 applied_height=10 epoch=1 confidence=0.99",
@@ -375,6 +375,7 @@ describe("client-PIR auth-path reconstruction (T2/T3)", () => {
       expect(RavenError.is(e, "StaleAdapter")).toBe(true);
       if (RavenError.is(e, "StaleAdapter")) {
         expect(e.context.serverWireSchemaVersion).toBe(2);
+        expect(e.context.clientWireSchemaVersion).toBe(3);
       }
     }
   });
@@ -453,7 +454,7 @@ describe("client-side IMT cache hit / miss", () => {
   });
 
   it("a schema-version advance drops the cached levels", async () => {
-    let schemaVersion = 1;
+    let schemaVersion = 3;
     mountEchoingBatchRoute(server, undefined, () => ({
       epoch: MOCK_EPOCH,
       schemaVersion,
@@ -472,7 +473,7 @@ describe("client-side IMT cache hit / miss", () => {
     await sdk.getMerkleProof(0, 1234 ^ 0b111);
     expect(encodedBatchCount(sdk.lastWireRequests()[0].body)).toBe(4);
 
-    schemaVersion = 2;
+    schemaVersion = 4;
     await sdk.getMerkleProof(0, 1234 ^ 0b111);
     sdk.resetWireCapture();
     await sdk.getMerkleProof(0, 1234 ^ 0b111);

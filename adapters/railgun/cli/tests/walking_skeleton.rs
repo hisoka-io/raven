@@ -10,11 +10,12 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 const BEARER_TOKEN: &str = "walking-skeleton-test-token";
+const CLIENT_ID: &str = "00112233445566778899aabbccddeeff";
 
 #[tokio::test(flavor = "current_thread")]
 #[allow(clippy::too_many_lines)]
 async fn pir_query_round_trip_recovers_planted_row() {
-    let pieces = build_toy_pieces(BEARER_TOKEN.to_owned(), ToyDbConfig::default())
+    let mut pieces = build_toy_pieces(BEARER_TOKEN.to_owned(), ToyDbConfig::default())
         .expect("toy stack should build");
 
     let server_state_arc: Arc<InspireServerState> = pieces
@@ -41,6 +42,30 @@ async fn pir_query_round_trip_recovers_planted_row() {
     });
     ready_rx.await.expect("server ready signal");
 
+    let client = reqwest::Client::new();
+    let session_response = client
+        .post(format!(
+            "http://{addr}/v1/instance/{TOY_INSTANCE_ID}/session"
+        ))
+        .bearer_auth(BEARER_TOKEN)
+        .header("x-raven-client-id", CLIENT_ID)
+        .body(pieces.session_registration_body.clone())
+        .send()
+        .await
+        .expect("POST session");
+    assert_eq!(session_response.status(), 200, "session establish");
+    let handle = session_response
+        .headers()
+        .get("x-raven-session")
+        .and_then(|value| value.to_str().ok())
+        .expect("x-raven-session")
+        .parse()
+        .expect("decimal session handle");
+    pieces
+        .client_session
+        .install_server_session_handle(raven_inspire::ServerSessionHandle(handle))
+        .expect("install HTTP session handle");
+
     let target_index: u64 = 42;
     let (client_state, query) = build_seeded_query(
         &pieces.client_session,
@@ -52,11 +77,11 @@ async fn pir_query_round_trip_recovers_planted_row() {
     let query_bytes = raven_railgun_http::write_versioned(&query)
         .expect("serialize SeededClientQuery (versioned)");
 
-    let client = reqwest::Client::new();
     let url = format!("http://{addr}/v1/instance/{TOY_INSTANCE_ID}/query");
     let response = client
         .post(&url)
         .bearer_auth(BEARER_TOKEN)
+        .header("x-raven-client-id", CLIENT_ID)
         .body(query_bytes)
         .send()
         .await
@@ -129,6 +154,7 @@ async fn pir_query_round_trip_recovers_planted_row() {
 
     let no_auth_resp = client
         .post(&url)
+        .header("x-raven-client-id", CLIENT_ID)
         .body(Vec::<u8>::new())
         .send()
         .await

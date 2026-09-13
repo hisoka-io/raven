@@ -70,7 +70,7 @@ use crate::admin::{
     admin_drain_handler, admin_undrain_handler, params_handler, session_establish_handler,
 };
 use crate::auth::bearer_auth;
-use crate::batch::{batch_handler, query_handler};
+use crate::batch::{batch_handler, inspire_batch_handler, inspire_query_handler, query_handler};
 use crate::events::{cf_connecting_ip_to_xff, events_handler};
 use crate::fanout::fanout_handler;
 use crate::status::{health_live_handler, health_ready_handler, metrics_handler, status_handler};
@@ -142,23 +142,25 @@ pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
         base
     };
 
-    Ok(with_cors.layer(
-        TraceLayer::new_for_http()
-            .make_span_with(|request: &Request<Body>| {
-                tracing::info_span!(
-                    "http_request",
-                    method = %request.method(),
-                    uri = %request.uri(),
-                    status = tracing::field::Empty,
-                    latency_us = tracing::field::Empty,
-                )
-            })
-            .on_response(|response: &Response, latency: Duration, span: &Span| {
-                span.record("status", response.status().as_u16());
-                let micros = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
-                span.record("latency_us", micros);
-            }),
-    ))
+    Ok(with_cors
+        .layer(middleware::from_fn(advertise_wire_schema))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &Request<Body>| {
+                    tracing::info_span!(
+                        "http_request",
+                        method = %request.method(),
+                        uri = %request.uri(),
+                        status = tracing::field::Empty,
+                        latency_us = tracing::field::Empty,
+                    )
+                })
+                .on_response(|response: &Response, latency: Duration, span: &Span| {
+                    span.record("status", response.status().as_u16());
+                    let micros = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
+                    span.record("latency_us", micros);
+                }),
+        ))
 }
 
 /// Inspire router; adds `/session` and `/params`. Splits into a Governor-limited
@@ -181,14 +183,8 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
 
     let rate_limited = Router::new()
         .route("/v1/status", get(status_handler::<RavenInspireScheme>))
-        .route(
-            "/v1/instance/:id/query",
-            post(query_handler::<RavenInspireScheme>),
-        )
-        .route(
-            "/v1/instance/:id/batch",
-            post(batch_handler::<RavenInspireScheme>),
-        )
+        .route("/v1/instance/:id/query", post(inspire_query_handler))
+        .route("/v1/instance/:id/batch", post(inspire_batch_handler))
         .route(
             "/v1/admin/instances/drain/:id",
             post(admin_drain_handler::<RavenInspireScheme>),
@@ -247,23 +243,36 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
         base
     };
 
-    Ok(with_cors.layer(
-        TraceLayer::new_for_http()
-            .make_span_with(|request: &Request<Body>| {
-                tracing::info_span!(
-                    "http_request",
-                    method = %request.method(),
-                    uri = %request.uri(),
-                    status = tracing::field::Empty,
-                    latency_us = tracing::field::Empty,
-                )
-            })
-            .on_response(|response: &Response, latency: Duration, span: &Span| {
-                span.record("status", response.status().as_u16());
-                let micros = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
-                span.record("latency_us", micros);
-            }),
-    ))
+    Ok(with_cors
+        .layer(middleware::from_fn(advertise_wire_schema))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &Request<Body>| {
+                    tracing::info_span!(
+                        "http_request",
+                        method = %request.method(),
+                        uri = %request.uri(),
+                        status = tracing::field::Empty,
+                        latency_us = tracing::field::Empty,
+                    )
+                })
+                .on_response(|response: &Response, latency: Duration, span: &Span| {
+                    span.record("status", response.status().as_u16());
+                    let micros = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
+                    span.record("latency_us", micros);
+                }),
+        ))
+}
+
+async fn advertise_wire_schema(request: Request<Body>, next: middleware::Next) -> Response {
+    let mut response = next.run(request).await;
+    if let Ok(value) = HeaderValue::from_str(&WIRE_SCHEMA_VERSION.to_string()) {
+        response.headers_mut().insert(
+            HeaderName::from_static(X_RAVEN_SCHEMA_VERSION_HEADER),
+            value,
+        );
+    }
+    response
 }
 
 type RavenGovernorLayerPeer = tower_governor::GovernorLayer<
@@ -334,6 +343,7 @@ fn build_governor_layer_trusted(
 /// CORS layer exposing `X-Raven-*` over GET + POST; `None` when no origins are set.
 fn build_cors_layer(allowed_origins: &[String]) -> Option<CorsLayer> {
     use http::header::{AUTHORIZATION, CONTENT_TYPE};
+    use http::HeaderName;
     use http::HeaderValue;
     use http::Method;
     if allowed_origins.is_empty() {
@@ -350,7 +360,11 @@ fn build_cors_layer(allowed_origins: &[String]) -> Option<CorsLayer> {
         CorsLayer::new()
             .allow_origin(AllowOrigin::list(parsed))
             .allow_methods([Method::GET, Method::POST])
-            .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+            .allow_headers([
+                AUTHORIZATION,
+                CONTENT_TYPE,
+                HeaderName::from_static("x-raven-client-id"),
+            ])
             .expose_headers([
                 http::HeaderName::from_static("x-raven-epoch"),
                 http::HeaderName::from_static("x-raven-scheme"),
@@ -720,7 +734,7 @@ mod tests {
     async fn cors_layer_accepts_allowed_origin_and_rejects_others() {
         use axum::body::Body;
         use axum::http::{Method, Request, StatusCode};
-        use axum::routing::get;
+        use axum::routing::post;
         use axum::Router;
         use tower::ServiceExt;
 
@@ -728,14 +742,18 @@ mod tests {
         let cors = super::build_cors_layer(&[allowed.to_owned()])
             .expect("CorsLayer expected for non-empty allowlist");
         let app: Router = Router::new()
-            .route("/v1/status", get(|| async { "ok" }))
+            .route("/v1/status", post(|| async { "ok" }))
             .layer(cors);
 
         let allowed_req = Request::builder()
             .method(Method::OPTIONS)
             .uri("/v1/status")
             .header("Origin", allowed)
-            .header("Access-Control-Request-Method", "GET")
+            .header("Access-Control-Request-Method", "POST")
+            .header(
+                "Access-Control-Request-Headers",
+                "authorization,content-type,x-raven-client-id",
+            )
             .body(Body::empty())
             .expect("build allowed preflight");
         let resp = app
@@ -758,13 +776,38 @@ mod tests {
             Some(allowed),
             "preflight from allowed origin must echo Access-Control-Allow-Origin"
         );
+        let allow_headers = resp
+            .headers()
+            .get("access-control-allow-headers")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            allow_headers
+                .to_ascii_lowercase()
+                .split(',')
+                .map(str::trim)
+                .any(|name| name == "x-raven-client-id"),
+            "client session binding header must pass browser preflight: {allow_headers}"
+        );
+        let allow_methods = resp
+            .headers()
+            .get("access-control-allow-methods")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            allow_methods
+                .split(',')
+                .map(str::trim)
+                .any(|method| method == "POST"),
+            "client session binding POST must pass browser preflight: {allow_methods}"
+        );
 
         // CORS reject is enforced by the browser via header absence, not HTTP status.
         let evil_req = Request::builder()
             .method(Method::OPTIONS)
             .uri("/v1/status")
             .header("Origin", "https://evil.example.com")
-            .header("Access-Control-Request-Method", "GET")
+            .header("Access-Control-Request-Method", "POST")
             .body(Body::empty())
             .expect("build evil preflight");
         let evil_resp = app.oneshot(evil_req).await.expect("evil preflight");

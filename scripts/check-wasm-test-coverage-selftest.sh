@@ -3,7 +3,7 @@
 #
 # That gate exists because the tree's only #[wasm_bindgen_test] was compiled on every push,
 # executed by nothing, and WRONG when finally run — then a second wasm file landed the same day
-# and was invisible for the same reason. Both cases below are that shape: a wasm test present in
+# and was invisible for the same reason. The cases below are that shape: a wasm test present in
 # the tree that no CI job names.
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -29,7 +29,7 @@ expect() {  # expect <want-nonzero:0|1> <label>
   cp "$BC" "$CI"; rm -f "$NEWFILE"
 }
 
-echo "check-wasm-test-coverage-selftest.sh: two ways a wasm test goes unrun, plus the control"
+echo "check-wasm-test-coverage-selftest.sh: three ways a wasm test goes unrun, plus the control"
 
 bash "$GATE" > /dev/null 2>&1
 if [ $? -ne 0 ]; then
@@ -47,7 +47,15 @@ fn zz_selftest_probe() {}
 RS
 expect 1 "a new #[wasm_bindgen_test] file named by no CI step"
 
-# 2. An EXISTING wasm target dropped from the CI step - the list rotting rather than the tree
+# 2. The cfg_attr spelling used by dual native/browser test targets must be discovered too.
+cat > "$NEWFILE" <<'RS'
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn zz_selftest_cfg_attr_probe() {}
+RS
+expect 1 "a new cfg_attr wasm_bindgen_test file named by no CI step"
+
+# 3. An EXISTING wasm target dropped from the CI step - the list rotting rather than the tree
 #    growing. Anchored on the target name, and asserted to have applied so a rename upstream
 #    cannot turn this case into a silent no-op.
 sed -i '/--test session_params_drift/d' "$CI"

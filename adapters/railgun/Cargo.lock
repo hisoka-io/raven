@@ -3667,6 +3667,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "raven-inspire-cache"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "bincode",
+ "raven-inspire",
+ "raven-storage",
+ "serde",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "raven-inspire-session"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "parking_lot",
+ "raven-inspire",
+ "raven-storage",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "raven-railgun-cli"
 version = "0.1.0-alpha.0"
 dependencies = [
@@ -3730,6 +3753,8 @@ dependencies = [
  "parking_lot",
  "proptest",
  "raven-inspire",
+ "raven-inspire-cache",
+ "raven-inspire-session",
  "raven-railgun-core",
  "raven-railgun-indexer",
  "raven-railgun-persistence",

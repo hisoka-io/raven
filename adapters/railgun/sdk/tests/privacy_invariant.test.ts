@@ -2,17 +2,22 @@
 // useClientPir is true, no plaintext BC bytes appear in any outbound body, and the
 // encrypted query payload is non-trivial (>8 KB) to rule out a degenerate passthrough.
 
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { RavenPOINodeInterface, containsByteSequence, hexToBytes } from "../src/index";
+import { RavenPOINodeInterface, containsByteSequence } from "../src/index";
 import type { ClientPirContext, RavenInspireWasm } from "../src/index";
 
 import * as wasmPkg from "raven-inspire-client-wasm";
+import { encodeBatchResponseNodes, encodedBatchCount } from "./helpers/auth_path_stub";
+import {
+  assertNoCommitmentsInPirRequests,
+  injectCommitment,
+} from "./helpers/private_wire";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = join(__dirname, "fixtures");
@@ -49,17 +54,15 @@ interface MockServerHandle {
   server: Server;
   url: string;
   // Server-side view of every received body, cross-checked against the SDK-side capture.
-  receivedBodies: { url: string; body: Uint8Array }[];
+  receivedBodies: { url: string; method: string; body: Uint8Array }[];
 }
 
 async function startMockServer(
   meta: FixtureMeta,
   responsesByIdx: Map<number, Uint8Array>,
 ): Promise<MockServerHandle> {
-  const receivedBodies: { url: string; body: Uint8Array }[] = [];
+  const receivedBodies: { url: string; method: string; body: Uint8Array }[] = [];
 
-  // SDK iterates BCs in supplied order, so the mock replies by request order.
-  let responseCursor = 0;
   const responseSequence = meta.target_indices;
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -67,9 +70,22 @@ async function startMockServer(
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", () => {
       const body = Buffer.concat(chunks);
-      receivedBodies.push({ url: req.url ?? "", body: new Uint8Array(body) });
+      receivedBodies.push({
+        url: req.url ?? "",
+        method: req.method ?? "GET",
+        body: new Uint8Array(body),
+      });
 
       const url = req.url ?? "";
+
+      if (url.endsWith("/session")) {
+        res.writeHead(200, {
+          "content-type": "application/json",
+          "x-raven-session": "1",
+        });
+        res.end(JSON.stringify({ handle: 1, expires_at_unix_secs: 1 }));
+        return;
+      }
 
       if (url.startsWith("/v1/poi/") && url.endsWith("/bc-to-idx-map")) {
         const entries = meta.target_indices.map((idx) => ({
@@ -86,20 +102,15 @@ async function startMockServer(
         return;
       }
 
-      if (url.match(/^\/v1\/instance\/[^/]+\/query$/)) {
-        const idx = responseSequence[responseCursor];
-        responseCursor = (responseCursor + 1) % responseSequence.length;
-        const respBytes = responsesByIdx.get(idx);
-        if (!respBytes) {
-          res.writeHead(500);
-          res.end();
-          return;
-        }
+      if (url.match(/^\/v1\/instance\/[^/]+\/batch$/)) {
+        const responses = Array.from({ length: encodedBatchCount(body) }, (_unused, slot) =>
+          responsesByIdx.get(responseSequence[slot % responseSequence.length])!,
+        );
         res.writeHead(200, {
           "content-type": "application/octet-stream",
           "x-raven-freshness": "lag_blocks=1 applied_height=100 epoch=1 confidence=0.99",
         });
-        res.end(Buffer.from(respBytes));
+        res.end(Buffer.from(encodeBatchResponseNodes(responses)));
         return;
       }
 
@@ -152,6 +163,10 @@ describe("RavenPOINodeInterface privacy invariant", () => {
     if (ctx) ctx.session.free();
   });
 
+  beforeEach(() => {
+    mock.receivedBodies.length = 0;
+  });
+
   it("getPOIsPerList (all-members fixture) does not leak BC bytes when useClientPir=true", async () => {
     const sdk = new RavenPOINodeInterface({
       endpoint: mock.url,
@@ -167,86 +182,44 @@ describe("RavenPOINodeInterface privacy invariant", () => {
     });
 
     const queriedBcs = fixture.meta.target_indices.map((idx) => fixture.meta.bcs_hex[idx]);
-    // Each call throws on the RESPONSE, but not on the crypto: the session holds the
-    // fixture's own key and decrypts it byte-exactly (wasm_extract_fixture_decode). It
-    // throws because this mock omits the `[u16 BE schema]` envelope the server sends.
-    // (The emitter's old `bc[1..32]` row-shape divergence from `PerListStatusEncoder` is
-    // fixed; t1_end_to_end_real_decode covers the enveloped happy path.) The throw never
-    // reaches what is asserted here, which is the OUTBOUND direction; one call per BC so
-    // each query fires first.
-    for (const bc of queriedBcs) {
-      try {
-        await sdk.getPOIsPerList(
-          [fixture.meta.list_key_hex],
-          [{ blindedCommitment: bc, type: "Shield" as const }],
-        );
-      } catch {
-        }
-    }
+    await sdk.getPOIsPerList(
+      [fixture.meta.list_key_hex],
+      queriedBcs.map((blindedCommitment) => ({
+        blindedCommitment,
+        type: "Shield" as const,
+      })),
+    );
 
     const wireRequests = sdk.lastWireRequests();
-    expect(wireRequests.length).toBeGreaterThanOrEqual(queriedBcs.length);
+    expect(wireRequests.length).toBe(1);
 
-    // Encrypted query bodies are KB-scale; legacy plaintext bodies were ~80 B per BC.
-    // SCOPE OF THE EQUALITY BELOW: the fixture supplies ONLY list-member BCs (every
-    // queried BC is in the bc-to-idx map), so one query per BC is trivially true here.
-    // It does NOT hold for mixed membership — a non-member produces ZERO queries, which
-    // is the D4 request-count oracle pinned RED in privacy_all_paths.test.ts ("T1
-    // outbound request count is independent of list membership"). When T1 padding lands,
-    // THIS all-members equality may legitimately change (e.g. to a ladder step) — that
-    // red is the fix arriving, not a regression.
-    const queryRequests = wireRequests.filter((r) => r.url.includes("/v1/instance/"));
-    expect(queryRequests.length).toBe(queriedBcs.length);
-    for (const req of queryRequests) {
-      expect(req.body.length).toBeGreaterThan(8 * 1024);
-    }
-
-    for (const bcHex of queriedBcs) {
-      const bcBytes = hexToBytes(bcHex);
-      const bcAsciiHex = new TextEncoder().encode(bcHex);
-      const bcAsciiHex0x = new TextEncoder().encode(`0x${bcHex}`);
-      for (const req of wireRequests) {
-        expect(
-          containsByteSequence(req.body, bcBytes),
-          `wire body for ${req.url} contains raw BC bytes for ${bcHex}`,
-        ).toBe(false);
-        expect(
-          containsByteSequence(req.body, bcAsciiHex),
-          `wire body for ${req.url} contains hex-ASCII BC for ${bcHex}`,
-        ).toBe(false);
-        expect(
-          containsByteSequence(req.body, bcAsciiHex0x),
-          `wire body for ${req.url} contains 0x-prefixed hex-ASCII BC for ${bcHex}`,
-        ).toBe(false);
-      }
-    }
+    // Both private bodies are KB-scale; legacy plaintext bodies were ~80 B per BC.
+    const inspected = assertNoCommitmentsInPirRequests(wireRequests, queriedBcs, {
+      expectedQueryCount: 8,
+    });
+    expect(inspected).toHaveLength(1);
+    expect(inspected[0].request.body.length).toBeGreaterThan(8 * 1024);
+    expect(wireRequests.some((request) => request.url.endsWith("/session"))).toBe(false);
+    const registration = mock.receivedBodies.find((request) => request.url.endsWith("/session"));
+    expect(registration!.body.length).toBeGreaterThan(1024);
+    expect(registration!.body.subarray(0, 2)).toEqual(new Uint8Array([0, 3]));
 
     // Server-side cross-check guards against the SDK capturing the wrong body.
-    for (const bcHex of queriedBcs) {
-      const bcBytes = hexToBytes(bcHex);
-      const bcAsciiHex = new TextEncoder().encode(bcHex);
-      for (const recv of mock.receivedBodies) {
-        if (recv.url.includes("/bc-to-idx-map")) continue;
-        expect(
-          containsByteSequence(recv.body, bcBytes),
-          `server-side received body for ${recv.url} contains raw BC bytes for ${bcHex}`,
-        ).toBe(false);
-        expect(
-          containsByteSequence(recv.body, bcAsciiHex),
-          `server-side received body for ${recv.url} contains hex-ASCII BC for ${bcHex}`,
-        ).toBe(false);
-      }
-    }
+    expect(
+      assertNoCommitmentsInPirRequests(mock.receivedBodies, queriedBcs, {
+        expectedQueryCount: 8,
+      }),
+    ).toHaveLength(1);
+
+    const prefixedLeak = injectCommitment(inspected[0], queriedBcs[0], "prefixed-ascii");
+    expect(() =>
+      assertNoCommitmentsInPirRequests([prefixedLeak], queriedBcs, {
+        expectedQueryCount: 8,
+      }),
+    ).toThrow(/contains 0x-prefixed ASCII blinded commitment/);
   });
 
-  it("mixed membership: no BC bytes leak, but the request count still tracks membership (D4)", async () => {
-    // The mixed-membership case the file's name promises. The byte-content invariant
-    // holds for members and non-members alike; the COUNT line below is a
-    // CHARACTERIZATION of the open D4 leak (queries == member count, because a
-    // non-member short-circuits before any wire call) — cross-reference the RED pin in
-    // privacy_all_paths.test.ts "T1 outbound request count is independent of list
-    // membership (D4 / DH-L0-6)", which is the assertion a fix must satisfy. When that
-    // pin flips, replace the equality below with the padded relation.
+  it("mixed membership: no BC bytes leak and one padded request hides member count", async () => {
     const sdk = new RavenPOINodeInterface({
       endpoint: mock.url,
       bearerToken: "test-token-must-be-at-least-16",
@@ -265,35 +238,25 @@ describe("RavenPOINodeInterface privacy invariant", () => {
       .map((idx) => fixture.meta.bcs_hex[idx]);
     const nonMemberBcs = ["66".repeat(32), "77".repeat(32)];
     const allBcs = [...memberBcs, ...nonMemberBcs];
-    for (const bc of allBcs) {
-      try {
-        await sdk.getPOIsPerList(
-          [fixture.meta.list_key_hex],
-          [{ blindedCommitment: bc, type: "Shield" as const }],
-        );
-      } catch {
-      }
-    }
+    await sdk.getPOIsPerList(
+      [fixture.meta.list_key_hex],
+      allBcs.map((blindedCommitment) => ({
+        blindedCommitment,
+        type: "Shield" as const,
+      })),
+    );
 
     const wireRequests = sdk.lastWireRequests();
-    const queryRequests = wireRequests.filter((r) => r.url.includes("/v1/instance/"));
-    // D4 characterization: 2 members + 2 non-members -> exactly 2 queries.
-    expect(queryRequests.length).toBe(memberBcs.length);
-
-    for (const bcHex of allBcs) {
-      const bcBytes = hexToBytes(bcHex);
-      const bcAsciiHex = new TextEncoder().encode(bcHex);
-      for (const req of wireRequests) {
-        expect(
-          containsByteSequence(req.body, bcBytes),
-          `wire body for ${req.url} contains raw BC bytes for ${bcHex}`,
-        ).toBe(false);
-        expect(
-          containsByteSequence(req.body, bcAsciiHex),
-          `wire body for ${req.url} contains hex-ASCII BC for ${bcHex}`,
-        ).toBe(false);
-      }
-    }
+    expect(
+      assertNoCommitmentsInPirRequests(wireRequests, allBcs, {
+        expectedQueryCount: 2,
+      }),
+    ).toHaveLength(1);
+    expect(
+      assertNoCommitmentsInPirRequests(mock.receivedBodies, allBcs, {
+        expectedQueryCount: 2,
+      }),
+    ).toHaveLength(1);
   });
 
   it("legacy plaintext mode (useClientPir=false) DOES leak BC bytes (regression guard)", async () => {

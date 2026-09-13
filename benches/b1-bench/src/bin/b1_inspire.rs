@@ -143,6 +143,15 @@ fn median_of(samples: &[u64]) -> u64 {
     ranked[ranked.len() / 2]
 }
 
+fn trial_bounds(total: usize, per_thread: usize, thread: usize) -> (usize, usize) {
+    let start = thread.saturating_mul(per_thread).min(total);
+    let end = thread
+        .saturating_add(1)
+        .saturating_mul(per_thread)
+        .min(total);
+    (start, end)
+}
+
 #[derive(Debug)]
 struct CliArgs {
     entries_log2: u8,
@@ -477,8 +486,7 @@ fn main() {
                     let variant = cli.variant;
                     let record_bytes = cli.record_bytes;
                     let handle = s.spawn(move || {
-                        let start = tid * per_thread;
-                        let end = ((tid + 1) * per_thread).min(bench_total as usize);
+                        let (start, end) = trial_bounds(bench_total as usize, per_thread, tid);
                         let mut local = Vec::with_capacity(end - start);
                         for i in start..end {
                             let trial = i as u64;
@@ -629,7 +637,26 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{median_of, samples_in_trial_order};
+    use super::{median_of, samples_in_trial_order, trial_bounds};
+
+    #[test]
+    fn concurrent_partitions_cover_every_trial_once_without_reversed_bounds() {
+        for total in 0_usize..=64 {
+            for threads in 1_usize..=16 {
+                let per_thread = total.div_ceil(threads);
+                let mut covered = Vec::new();
+                for thread in 0..threads {
+                    let (start, end) = trial_bounds(total, per_thread, thread);
+                    assert!(
+                        start <= end,
+                        "total={total} threads={threads} thread={thread}"
+                    );
+                    covered.extend(start..end);
+                }
+                assert_eq!(covered, (0..total).collect::<Vec<_>>());
+            }
+        }
+    }
 
     /// The exported `samples` array IS the caller's vector, so a `median_of` that sorts in
     /// place republishes trial-order data in rank order. Two of the three arrays shipped

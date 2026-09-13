@@ -12,6 +12,7 @@ import { RavenPOINodeInterface } from "@raven/railgun-poi-node-interface";
 const poi = new RavenPOINodeInterface({
   endpoint: "https://raven.example.com",
   bearerToken: process.env.RAVEN_BEARER_TOKEN!,
+  // Used by validation/submission; private stale reads still refuse by default.
   upstreamFallbackEndpoint: "https://poi.us.proxy.railwayapi.xyz",
 });
 ```
@@ -41,6 +42,22 @@ Public-info channels (cacheable, no per-BC leak):
 | `fetchBcToIdxMap`    | `GET /v1/poi/:list/bc-to-idx-map`  |
 | `fetchStatusHeader`  | `GET /v1/poi/:list/status-header`  |
 
+## One-query cover fanout
+
+`queryClientPirFanout(instanceId, context, targetIndex, realShardIds, shardCount)` sends one
+encrypted local-index query to `POST /v1/instance/:id/fanout`. It pads the shard list to the same
+dyadic ladder used by batches, adds distinct complement shards with browser CSPRNG draws, shuffles
+all slots, and restores decrypted real rows to caller shard order.
+
+The serialized query also contains a clear shard selector even though the fanout server overrides
+it per slot. The SDK retargets that field through the typed Rust/WASM decoder to an independently
+sampled member of the shuffled list, so it cannot remain an original-target marker. Low-level cover
+plans are runtime-issued, immutable, capped at 32 slots and rejected if forged.
+
+The adapter operator must enable the fanout route and configure `max_fanout_shards` for the ladder
+step the client will use. Private freshness remains fail-closed; fanout has no plaintext upstream
+fallback.
+
 ## PPOI status verdicts are bound to the blinded commitment
 
 A T1 status row is `[status_byte, blinded_commitment[0..min(recordSize - 1, 32)]]`. Rows for list
@@ -50,21 +67,41 @@ therefore compares the row's BC tail against the blinded commitment it asked abo
 typed `DecodeError` `RavenError` on any mismatch -- including the all-zero row -- rather than
 returning a status.
 
-One case does NOT propagate, and it is a known fail-open rather than a design choice: a `Network`
-failure degrades to `Missing`. `Missing` is the non-blocking verdict, so a transport failure tells the
-wallet a possibly-`ShieldBlocked` commitment is merely unproven, and the result is byte-identical to a
-genuinely absent record and to status byte 3 -- nothing on the returned value separates them. It is
-retained because removing it surfaces those as errors, which is correct only once an oversized
-upload reliably receives its 401 rather than a socket reset.
+A `Network` failure returns the SDK-local `Unreachable` verdict. It never degrades to the adapter's
+non-blocking `Missing` verdict, so callers can distinguish an absent PPOI record from a request that
+never reached the adapter.
 
 Two limits are worth stating plainly. At the narrowest record width the encoder builds (32 bytes) the
 row has room for `bc[0..31]`, so the binding covers 31 of the 32 BC bytes; a wider record binds all
 32. And the row's status byte is only as trustworthy as the adapter that wrote it: this check proves
 the row describes *your* BC, not that the verdict inside it is correct.
 
-## Freshness fallback
+## Private freshness policy
 
-Every PIR response carries `X-Raven-Freshness: lag_blocks=N applied_height=M epoch=E confidence=0.X`. If `confidence` falls below `freshnessConfidenceFloor` (default 0.5) and an `upstreamFallbackEndpoint` is configured, the wallet falls back to the upstream PPOI service for that call.
+Every PIR response carries
+`X-Raven-Freshness: lag_blocks=N applied_height=M epoch=E confidence=0.X`. In client-PIR mode,
+confidence below `freshnessConfidenceFloor` (default 0.5) raises a typed `StaleData` error even when
+`upstreamFallbackEndpoint` is configured. The error carries the public freshness values but no
+blinded commitment, list key, token, or URL.
+
+`freshnessConfidenceFloor` must be finite and within `[0,1]`; invalid values are rejected with
+`InvalidQuery` during construction. A missing private freshness header raises `StaleAdapter`, and a
+malformed one raises `DecodeError`, because neither can supply the fields required by `StaleData`.
+
+Falling back upstream sends the exact commitment and list in plaintext. Callers who deliberately
+choose freshness over query privacy must opt in:
+
+```ts
+const poi = new RavenPOINodeInterface({
+  endpoint: "https://raven.example.com",
+  bearerToken: process.env.RAVEN_BEARER_TOKEN!,
+  upstreamFallbackEndpoint: "https://poi.us.proxy.railwayapi.xyz",
+  privateStalePolicy: "allow-upstream-disclosure",
+});
+```
+
+Fresh private responses remain private under either policy. Plaintext mode retains its existing
+fallback because contacting upstream discloses nothing beyond the plaintext request already sent.
 
 ## IMT cache layers
 

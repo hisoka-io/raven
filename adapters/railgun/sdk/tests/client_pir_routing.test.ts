@@ -1,12 +1,16 @@
 /** Client-PIR pre-flight routing tests against a stub WASM (no real PIR). */
 
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { RavenError, RavenPOINodeInterface } from "../src/index";
-import { makeRegisterSpy } from "./helpers/register_spy";
+import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
 import type { ClientPirContext, RavenInspireWasm } from "../src/index";
 
 import { startMockServer, type MockServer } from "./helpers/mock_server";
+import {
+  encodeBatchResponseNodes,
+  encodedBatchCount,
+} from "./helpers/auth_path_stub";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX = "abababababababababababababababababababababababababababababababab";
@@ -15,6 +19,7 @@ const BC_HEX = "0000000000000000000000000000000000000000000000000000000000000001
 /** Stub WASM impl that returns minimal bincode-prefixed payloads. */
 function stubWasm(): RavenInspireWasm {
   return {
+    ...stubRemoteSessionExports(),
     build_client_session: () => ({ free: () => undefined }),
     build_seeded_query: (_session, _shard, _idx) => {
       // empty (client_state, query_bytes): 8 + 0 + 8 + 0 = 16 zero bytes
@@ -40,6 +45,24 @@ function stubCtx(): ClientPirContext {
   };
 }
 
+function mountDecoyBatchRoute(server: MockServer): void {
+  server.route(
+    (req) => req.url?.endsWith("/batch") ?? false,
+    (_req, body, res) => {
+      const responses = Array.from(
+        { length: encodedBatchCount(body) },
+        () => new Uint8Array(0),
+      );
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "x-raven-freshness": "lag_blocks=0 applied_height=0 epoch=1 confidence=1",
+      });
+      res.end(Buffer.from(encodeBatchResponseNodes(responses)));
+      return true;
+    },
+  );
+}
+
 describe("client-PIR routing + pre-flight", () => {
   let server: MockServer;
 
@@ -49,6 +72,10 @@ describe("client-PIR routing + pre-flight", () => {
 
   afterAll(async () => {
     await server.close();
+  });
+
+  afterEach(() => {
+    server.reset();
   });
 
   it("getPOIsPerList client-PIR mode missing context throws", async () => {
@@ -85,6 +112,7 @@ describe("client-PIR routing + pre-flight", () => {
   });
 
   it("getPOIsPerList client-PIR mode unknown BC returns Missing", async () => {
+    mountDecoyBatchRoute(server);
     const sdk = new RavenPOINodeInterface({
       endpoint: server.url,
       bearerToken: TOKEN,
@@ -97,7 +125,8 @@ describe("client-PIR routing + pre-flight", () => {
       [{ blindedCommitment: BC_HEX, type: "Shield" }],
     );
     expect(got[BC_HEX][LIST_KEY_HEX]).toBe("Missing");
-    expect(sdk.lastWireRequests().length).toBe(0);
+    expect(sdk.lastWireRequests()).toHaveLength(1);
+    expect(encodedBatchCount(sdk.lastWireRequests()[0].body)).toBe(1);
   });
 
   it("getPOIMerkleProofs client-PIR mode unknown BC throws", async () => {
@@ -127,6 +156,7 @@ describe("client-PIR routing + pre-flight", () => {
   });
 
   it("getPOIsPerList surfaces every (BC, listKey) cell across multiple lists", async () => {
+    mountDecoyBatchRoute(server);
     // outer key BC, inner list-key: upstream POIsPerListMap shape (shared-models proof-of-innocence.ts)
     const lkA = "11".repeat(32);
     const lkB = "22".repeat(32);
@@ -185,11 +215,7 @@ describe("client-PIR routing + pre-flight", () => {
     }
   });
 
-  it("getPOIsPerList client-PIR fail-soft on Network error only", async () => {
-    // PINS A KNOWN FAIL-OPEN; it is NOT an endorsement. `Missing` is
-    // the non-blocking verdict, so this substitution reports a possibly-ShieldBlocked
-    // commitment as merely unproven. The companion test below asserts the consequence:
-    // the result is indistinguishable from a genuinely absent record.
+  it("getPOIsPerList client-PIR returns Unreachable on a Network error", async () => {
     const bcPresent = "0000000000000000000000000000000000000000000000000000000000000099";
     const bcMap = new Map<string, number>([[bcPresent, 0]]);
     const sdk = new RavenPOINodeInterface({
@@ -203,17 +229,10 @@ describe("client-PIR routing + pre-flight", () => {
       [LIST_KEY_HEX],
       [{ blindedCommitment: bcPresent, type: "Shield" }],
     );
-    expect(got[bcPresent][LIST_KEY_HEX]).toBe("Missing");
+    expect(got[bcPresent][LIST_KEY_HEX]).toBe("Unreachable");
   });
 
-  it("a transport failure is indistinguishable from a genuinely absent record", () => {
-    // CHARACTERIZATION of the fail-open above, so its consequence is a tracked contract
-    // rather than an incidental fact. This is the assertion a fix must INVERT: today the
-    // caller cannot tell "the network broke, this may be ShieldBlocked" from "no such
-    // record exists". A commitment in the map degrades to Missing when the transport
-    // fails; one absent from the map is set to Missing without any query at all. Both
-    // land in the same string-valued field, and `POIStatus` carries no variant, cause or
-    // flag that separates them. Inverting this assertion is what a fix looks like.
+  it("a transport failure is distinguishable from a genuinely absent record", async () => {
     const bcQueried = "0000000000000000000000000000000000000000000000000000000000000099";
     const bcAbsent = "00000000000000000000000000000000000000000000000000000000000000aa";
     const bcMap = new Map<string, number>([[bcQueried, 0]]);
@@ -224,21 +243,48 @@ describe("client-PIR routing + pre-flight", () => {
       clientPirContexts: new Map([[`t1Status:${LIST_KEY_HEX}`, stubCtx()]]),
       bcToIdxMaps: new Map([[LIST_KEY_HEX, bcMap]]),
     });
-    return sdk
-      .getPOIsPerList(
-        [LIST_KEY_HEX],
-        [
-          { blindedCommitment: bcQueried, type: "Shield" },
-          { blindedCommitment: bcAbsent, type: "Shield" },
-        ],
-      )
-      .then((got) => {
-        const fromBrokenTransport = got[bcQueried][LIST_KEY_HEX];
-        const fromAbsentRecord = got[bcAbsent][LIST_KEY_HEX];
-        expect(fromBrokenTransport).toBe("Missing");
-        expect(fromAbsentRecord).toBe("Missing");
-        expect(fromBrokenTransport).toStrictEqual(fromAbsentRecord);
+    const got = await sdk.getPOIsPerList(
+      [LIST_KEY_HEX],
+      [
+        { blindedCommitment: bcQueried, type: "Shield" },
+        { blindedCommitment: bcAbsent, type: "Shield" },
+      ],
+    );
+    const fromBrokenTransport = got[bcQueried][LIST_KEY_HEX];
+    const fromAbsentRecord = got[bcAbsent][LIST_KEY_HEX];
+    expect(fromBrokenTransport).toBe("Unreachable");
+    expect(fromAbsentRecord).toBe("Missing");
+    expect(fromBrokenTransport).not.toBe(fromAbsentRecord);
+  });
+
+  it("a socket destroyed mid-query returns Unreachable", async () => {
+    const bcQueried = "0000000000000000000000000000000000000000000000000000000000000099";
+    const brokenServer = await startMockServer();
+    try {
+      brokenServer.route(
+        (req) => req.url?.endsWith("/batch") ?? false,
+        (_req, _body, res) => {
+          res.socket?.destroy();
+          return true;
+        },
+      );
+      const sdk = new RavenPOINodeInterface({
+        endpoint: brokenServer.url,
+        bearerToken: TOKEN,
+        useClientPir: true,
+        clientPirContexts: new Map([[`t1Status:${LIST_KEY_HEX}`, stubCtx()]]),
+        bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[bcQueried, 0]])]]),
       });
+
+      const got = await sdk.getPOIsPerList(
+        [LIST_KEY_HEX],
+        [{ blindedCommitment: bcQueried, type: "Shield" }],
+      );
+
+      expect(got[bcQueried][LIST_KEY_HEX]).toBe("Unreachable");
+    } finally {
+      await brokenServer.close();
+    }
   });
 
   it("captured request ring is bounded at exactly the 64-entry cap", async () => {

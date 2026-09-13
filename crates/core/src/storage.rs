@@ -65,4 +65,12 @@ pub trait Snapshot: Send + Sync {
 
     /// Every visible row in strictly ascending key order, per the module contract.
     fn scan<'a>(&'a self) -> Box<dyn Iterator<Item = Result<Row, Error>> + 'a>;
+
+    /// Visible rows whose keys are in the half-open `range`, in strictly
+    /// ascending order. Implementations must seek to `range.start` rather than
+    /// consuming the prefix returned by [`Snapshot::scan`].
+    fn scan_range<'a>(
+        &'a self,
+        range: core::ops::Range<u64>,
+    ) -> Box<dyn Iterator<Item = Result<Row, Error>> + 'a>;
 }

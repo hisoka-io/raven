@@ -14,9 +14,14 @@ ALLOW=scripts/ignore-coverage-allowlist.txt
 [ -f "$ALLOW" ] || { echo "missing ${ALLOW}" >&2; exit 1; }
 
 current=$(python3 - <<'PY'
-import re, subprocess, pathlib
+import re, subprocess, pathlib, sys
 def ignores():
     out = []
+    invalid = []
+    trigger = re.compile(
+        r'(?i)(trigger\s*:|run manually after|run (?:this )?by hand|run with\b|red until|until\b|'
+        r'compiles only under|changing\b|when\b|after intentional|un-?ignore|once\b)'
+    )
     for repo, prefix in ((None, ''), ('crates/inspire', 'crates/inspire/')):
         # --untracked: an ignored test MOVED into a new, not-yet-committed file is invisible to a
         # tracked-only census, so the debt figure silently under-reports and a genuinely uncovered
@@ -26,7 +31,26 @@ def ignores():
         r = subprocess.run(cmd, capture_output=True, text=True)
         for line in r.stdout.splitlines():
             path, ln, _ = line.split(':', 2)
-            out.append((prefix + path, int(ln)))
+            ln = int(ln)
+            lines = pathlib.Path(prefix + path).read_text().splitlines()
+            raw = '\n'.join(lines[ln - 1:ln + 15])
+            attr = re.match(
+                r'\s*#\[ignore(?:\s*=\s*"((?:\\.|[^"\\])*)")?\s*\]',
+                raw,
+                re.DOTALL,
+            )
+            reason = attr.group(1) if attr else None
+            label = f'{prefix}{path}:{ln}'
+            if reason is None or not reason.strip():
+                invalid.append(f'{label}: bare #[ignore]')
+            elif not trigger.search(reason):
+                invalid.append(f'{label}: reason has no citable trigger: {reason!r}')
+            out.append((prefix + path, ln))
+    if invalid:
+        print('INVALID IGNORE REASON:', file=sys.stderr)
+        for problem in invalid:
+            print(f'  {problem}', file=sys.stderr)
+        sys.exit(1)
     return out
 
 ci = pathlib.Path('.github/workflows/ci.yml').read_text()

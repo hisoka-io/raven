@@ -10,7 +10,7 @@ import {
   hashLeftRight,
   foldMerkleRoot,
 } from "../src/index";
-import { makeRegisterSpy } from "./helpers/register_spy";
+import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
 import { startMockServer, writeBinary, writeJson, type MockServer } from "./helpers/mock_server";
 import { encodeBatchResponse, encodedBatchCount, stubCtx as pathStubCtx } from "./helpers/auth_path_stub";
 
@@ -89,7 +89,7 @@ function mountNodeBatchRoute(server: MockServer): void {
     (_req, body, res) => {
       writeBinary(res, encodeBatchResponse(1, encodedBatchCount(body)), {
         "x-raven-epoch": "1",
-        "x-raven-schema-version": "1",
+        "x-raven-schema-version": "3",
       });
       return true;
     },
@@ -200,6 +200,7 @@ describe("wire parity: H3 — Error-class discrimination on T1 client-PIR", () =
   function stubCtx(): import("../src/index").ClientPirContext {
     return {
       wasm: {
+        ...stubRemoteSessionExports(),
         build_client_session: () => ({ free: () => undefined }),
         build_seeded_query: () => new Uint8Array(16),
         extract_response: () => new Uint8Array(32),
@@ -269,7 +270,7 @@ describe("wire parity: H3 — Error-class discrimination on T1 client-PIR", () =
     }
   });
 
-  it("Network failure (unreachable port) substitutes Missing per BC", async () => {
+  it("Network failure (unreachable port) returns Unreachable per BC", async () => {
     const sdk = new RavenPOINodeInterface({
       endpoint: "http://127.0.0.1:1",
       bearerToken: TOKEN,
@@ -281,7 +282,7 @@ describe("wire parity: H3 — Error-class discrimination on T1 client-PIR", () =
       [LIST_KEY_HEX],
       [{ blindedCommitment: BC_HEX_A, type: "Shield" }],
     );
-    expect(got[BC_HEX_A][LIST_KEY_HEX]).toBe("Missing");
+    expect(got[BC_HEX_A][LIST_KEY_HEX]).toBe("Unreachable");
   });
 });
 

@@ -1,5 +1,5 @@
 // First offline T1 end-to-end over REAL wasm-decrypted bytes: getPOIsPerList drives
-// build_seeded_query -> POST -> stripSchemaEnvelope -> extract_response -> decodeStatusRow
+// build_seeded_query -> padded batch POST -> extract_response -> decodeStatusRow
 // against the Rust-emitted fixture, and the verdicts are the ones native Rust encoded.
 // Every other offline T1 test stubs extract_response; until the fixture generator wrote
 // production-shaped rows ([status, bc[0..31]]) this path could not run at all.
@@ -10,18 +10,10 @@ import { RavenPOINodeInterface, RavenError, type POIStatus } from "../src/index"
 import type { ClientPirContext } from "../src/index";
 
 import { loadFixture, makeClientPirContext, type LoadedFixture } from "./helpers/fixture";
+import { encodeBatchResponseNodes, encodedBatchCount } from "./helpers/auth_path_stub";
 import { startMockServer, writeBinary, type MockServer } from "./helpers/mock_server";
 
 const TOKEN = "test-token-padded-long-enough-1234";
-
-/** The `[u16 BE version = 1][body]` envelope the production server wraps responses in. */
-function withSchemaEnvelope(body: Uint8Array): Uint8Array {
-  const out = new Uint8Array(2 + body.length);
-  out[0] = 0;
-  out[1] = 1;
-  out.set(body, 2);
-  return out;
-}
 
 /** Verdict the fixture generator encoded for `idx`: status byte `idx % 4`. */
 function expectedStatus(idx: number): POIStatus {
@@ -58,16 +50,16 @@ describe("T1 end-to-end: real PIR decode from wire bytes to verdicts", () => {
   }
 
   it("returns the verdicts native Rust encoded, decoded from real responses", async () => {
-    // The SDK queries BCs in supplied order; serve the recorded response for each in turn.
+    // The batch's real prefix keeps supplied order; padding follows it.
     const sequence = [...fixture.meta.target_indices];
-    let cursor = 0;
     server.reset();
     server.route(
-      (req) => /^\/v1\/instance\/[^/]+\/query$/.test(req.url ?? ""),
-      (_req, _body, res) => {
-        const idx = sequence[cursor % sequence.length];
-        cursor += 1;
-        writeBinary(res, withSchemaEnvelope(fixture.responsesByIdx.get(idx)!));
+      (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
+      (_req, body, res) => {
+        const responses = Array.from({ length: encodedBatchCount(body) }, (_unused, slot) =>
+          fixture.responsesByIdx.get(sequence[slot % sequence.length])!,
+        );
+        writeBinary(res, encodeBatchResponseNodes(responses));
         return true;
       },
     );
@@ -92,9 +84,13 @@ describe("T1 end-to-end: real PIR decode from wire bytes to verdicts", () => {
     // tail names the WRONG commitment; decodeStatusRow must refuse it above the ciphertext.
     server.reset();
     server.route(
-      (req) => /^\/v1\/instance\/[^/]+\/query$/.test(req.url ?? ""),
-      (_req, _body, res) => {
-        writeBinary(res, withSchemaEnvelope(fixture.responsesByIdx.get(3)!));
+      (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
+      (_req, body, res) => {
+        const responses = Array.from(
+          { length: encodedBatchCount(body) },
+          () => fixture.responsesByIdx.get(3)!,
+        );
+        writeBinary(res, encodeBatchResponseNodes(responses));
         return true;
       },
     );
@@ -111,19 +107,19 @@ describe("T1 end-to-end: real PIR decode from wire bytes to verdicts", () => {
 
   it("refuses an unknown schema envelope version instead of eating two payload bytes", async () => {
     // The discriminating test for the envelope guard (raven-poi-node-interface.ts
-    // stripSchemaEnvelope): before this test, deleting the `envelope !== 1` branch left the
+    // stripSchemaEnvelope): before this test, deleting the version branch left the
     // ENTIRE suite green (mutation M3, w4d-sdk). The message match is what discriminates —
     // with the guard deleted the misaligned body still dies later, but inside wasm with a
     // different error.
     server.reset();
     server.route(
-      (req) => /^\/v1\/instance\/[^/]+\/query$/.test(req.url ?? ""),
-      (_req, _body, res) => {
-        const body = fixture.responsesByIdx.get(0)!;
-        const out = new Uint8Array(2 + body.length);
-        out[0] = 0;
-        out[1] = 2; // a future/wrong version the client does not speak
-        out.set(body, 2);
+      (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
+      (_req, requestBody, res) => {
+        const response = fixture.responsesByIdx.get(0)!;
+        const out = encodeBatchResponseNodes(
+          Array.from({ length: encodedBatchCount(requestBody) }, () => response),
+        );
+        out[1] = 4;
         writeBinary(res, out);
         return true;
       },
@@ -139,20 +135,97 @@ describe("T1 end-to-end: real PIR decode from wire bytes to verdicts", () => {
       expect.fail("an unknown envelope version must not decode");
     } catch (e) {
       expect(RavenError.is(e, "DecodeError")).toBe(true);
-      expect(String((e as Error).message)).toMatch(/unexpected schema envelope version 2/);
+      expect(String((e as Error).message)).toMatch(/unexpected schema envelope version 4/);
     }
   });
 
-  it("still fails closed when the envelope is stripped entirely (version-byte collision)", async () => {
-    // CHARACTERIZATION: this fixture's raw bincode response begins `00 01` (a leading
-    // Vec of length ring_dim = 256, LE u64), which is byte-identical to the BE u16
-    // envelope version 1 — so stripSchemaEnvelope cannot tell a stripped d=256 response
-    // from a wrapped one, and the misaligned payload is caught one layer down by the wasm
-    // decode instead. At production geometry (d=2048, prefix `00 08`) the guard itself
-    // fires. Either way nothing decodes; this pins that no layer fabricates a record.
+  it("refuses a previous-schema prefix before WASM extraction", async () => {
     server.reset();
     server.route(
-      (req) => /^\/v1\/instance\/[^/]+\/query$/.test(req.url ?? ""),
+      (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
+      (_req, requestBody, res) => {
+        const response = fixture.responsesByIdx.get(0)!;
+        const out = encodeBatchResponseNodes(
+          Array.from({ length: encodedBatchCount(requestBody) }, () => response),
+        );
+        out[1] = 2;
+        writeBinary(res, out);
+        return true;
+      },
+    );
+
+    const sdk = makeSdk();
+    const bc0 = fixture.meta.bcs_hex[0];
+    await expect(
+      sdk.getPOIsPerList(
+        [fixture.meta.list_key_hex],
+        [{ blindedCommitment: bc0, type: "Shield" as const }],
+      ),
+    ).rejects.toThrow(/unexpected schema envelope version 2/);
+  });
+
+  it("refuses trailing bytes after a complete batch response", async () => {
+    server.reset();
+    server.route(
+      (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
+      (_req, requestBody, res) => {
+        const response = fixture.responsesByIdx.get(0)!;
+        const batch = encodeBatchResponseNodes(
+          Array.from({ length: encodedBatchCount(requestBody) }, () => response),
+        );
+        const overlong = new Uint8Array(batch.length + 1);
+        overlong.set(batch);
+        overlong[overlong.length - 1] = 0xa5;
+        writeBinary(res, overlong);
+        return true;
+      },
+    );
+
+    const sdk = makeSdk();
+    const bc0 = fixture.meta.bcs_hex[0];
+    await expect(
+      sdk.getPOIsPerList(
+        [fixture.meta.list_key_hex],
+        [{ blindedCommitment: bc0, type: "Shield" as const }],
+      ),
+    ).rejects.toThrow(/trailing bytes/);
+  });
+
+  it("refuses trailing bytes inside a length-delimited response element", async () => {
+    server.reset();
+    server.route(
+      (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
+      (_req, requestBody, res) => {
+        const response = fixture.responsesByIdx.get(0)!;
+        const overlong = new Uint8Array(response.length + 1);
+        overlong.set(response);
+        overlong[overlong.length - 1] = 0xa5;
+        writeBinary(
+          res,
+          encodeBatchResponseNodes(
+            Array.from({ length: encodedBatchCount(requestBody) }, () => overlong),
+          ),
+        );
+        return true;
+      },
+    );
+
+    const sdk = makeSdk();
+    const bc0 = fixture.meta.bcs_hex[0];
+    await expect(
+      sdk.getPOIsPerList(
+        [fixture.meta.list_key_hex],
+        [{ blindedCommitment: bc0, type: "Shield" as const }],
+      ),
+    ).rejects.toThrow(/bytes remaining/);
+  });
+
+  it("still fails closed when the envelope is stripped entirely (version-byte collision)", async () => {
+    // A raw bincode body has no v3 prefix. Either the envelope guard or the strict wasm
+    // decoder refuses it; neither layer may fabricate a record from misaligned bytes.
+    server.reset();
+    server.route(
+      (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
       (_req, _body, res) => {
         writeBinary(res, fixture.responsesByIdx.get(0)!);
         return true;

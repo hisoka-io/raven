@@ -26,6 +26,7 @@ crates/inspire/tests/e2e_pir.rs::test_e2e_variant_two_packing
 crates/inspire/tests/raven_local_patches.rs::commit_d_preset_default_q_passes_smoke_at_2_20_x_256b
 crates/isimplepir/tests/kat_fixtures.rs::update_fixtures
 crates/isimplepir/tests/kat_fixtures.rs::update_row_update_fixtures
+crates/inspire/tests/query_indistinguishability_oracle.rs::same_shard_query_transcript_research_oracle
 
 # --- 2026-09-06: made visible by teaching the census to see untracked files ---
 # These seven were ALWAYS uncovered; a tracked-only census could not see them because they
@@ -44,7 +45,6 @@ examples/eth-state/benches/cached_respond_latency_bench.rs::cached_vs_noncached_
 # Both FAIL today by design. They must NOT gain a CI lane until the defect each names is fixed;
 # that is what makes them acceptance tests rather than noise.
 adapters/railgun/engine/tests/concurrent_commit_overwrite.rs::two_concurrent_commits_on_one_handle_do_not_publish_each_others_bytes
-adapters/railgun/http/tests/session_route.rs::an_epoch_swap_inside_register_still_returns_200_with_a_dead_handle
 crates/inspire/benches/ifma52_throughput_probe.rs::ifma52_madd_throughput_probe
 crates/inspire/benches/ifma52_throughput_probe.rs::scalar_mulx_throughput_probe
 crates/inspire/benches/packing_offline_simd_bench.rs::bench_prod_cell_131072x32

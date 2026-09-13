@@ -33,7 +33,8 @@ function mountBatchRoute(server: MockServer, epoch: number): void {
       res.writeHead(200, {
         "content-type": "application/octet-stream",
         "x-raven-epoch": String(epoch),
-        "x-raven-schema-version": "1",
+        "x-raven-schema-version": "3",
+        "x-raven-freshness": "lag_blocks=0 applied_height=0 epoch=1 confidence=1",
       });
       res.end(Buffer.from(encodeBatchResponse(epoch, encodedBatchCount(body))));
       return true;

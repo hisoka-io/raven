@@ -7,7 +7,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { RavenPOINodeInterface, RavenError, decodeClientPirQueryBundle } from "../src/index";
-import { makeRegisterSpy } from "./helpers/register_spy";
+import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
 import type { ClientPirContext, RavenInspireWasm } from "../src/index";
 
 import { startMockServer, writeBinary, type MockServer } from "./helpers/mock_server";
@@ -17,6 +17,7 @@ const LIST_KEY_HEX = "ababababababababababababababababababababababababababababab
 
 function stubWasm(): RavenInspireWasm {
   return {
+    ...stubRemoteSessionExports(),
     build_client_session: () => ({ free: () => undefined }),
     build_seeded_query: () => {
       return new Uint8Array(16);
@@ -163,7 +164,7 @@ describe("error-path + truncated-response handling", () => {
       (_req, _body, res) => {
         writeBinary(res, new Uint8Array(0), {
           "x-raven-epoch": "1",
-          "x-raven-schema-version": "1",
+          "x-raven-schema-version": "3",
         });
         return true;
       },

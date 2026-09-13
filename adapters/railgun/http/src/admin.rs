@@ -15,7 +15,7 @@ use raven_railgun_engine::inspire::{InspireServerState, RavenInspireScheme};
 use raven_railgun_engine::{DrainState, PirScheme};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{ct_eq_str, parse_client_id_header, EvictionOutcome, SessionKey};
+use crate::auth::{ct_eq_str, require_client_id_header, EvictionOutcome, SessionKey};
 use crate::state::AppState;
 use crate::versioned::{read_versioned, write_versioned, WIRE_SCHEMA_VERSION};
 use crate::{X_RAVEN_EPOCH, X_RAVEN_SCHEME, X_RAVEN_SESSION};
@@ -168,14 +168,15 @@ pub(crate) async fn session_establish_handler(
         .engine
         .instance(&instance_id)
         .ok_or(StatusCode::NOT_FOUND)?;
-    let state = instance.current_state();
-    let state: &InspireServerState = state.as_ref();
+    let snapshot = instance.current_snapshot();
+    let state: &InspireServerState = snapshot.state.as_ref();
 
     let token = headers_in
         .get(http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|h| h.strip_prefix("Bearer "))
         .ok_or(StatusCode::UNAUTHORIZED)?;
+    let client_id = require_client_id_header(&headers_in).map_err(|()| StatusCode::BAD_REQUEST)?;
 
     let keys: ClientPackingKeys = read_versioned(&body).map_err(|err| {
         tracing::warn!(
@@ -190,8 +191,11 @@ pub(crate) async fn session_establish_handler(
         .session_store
         .register_server_side(keys, pack_params, &ctx)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if instance.current_epoch() != snapshot.epoch {
+        state.session_store.remove(handle);
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
 
-    let client_id = parse_client_id_header(&headers_in);
     let session_key = SessionKey::new(token, instance_id.clone(), client_id);
     let ttl = Duration::from_secs(app.config.session_ttl_secs);
     let now = Instant::now();

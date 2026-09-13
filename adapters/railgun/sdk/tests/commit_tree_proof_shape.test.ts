@@ -6,7 +6,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { RavenPOINodeInterface } from "../src/index";
-import { makeRegisterSpy } from "./helpers/register_spy";
+import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
 import type { ClientPirContext, RavenInspireWasm } from "../src/index";
 
 import { startMockServer, writeJson, type MockServer } from "./helpers/mock_server";
@@ -16,10 +16,11 @@ const TREE_NUMBER = 0;
 const LEAF = 1234;
 const NODE_BYTES = 32;
 const MOCK_EPOCH = 1;
-const MOCK_SCHEMA_VERSION = 1;
+const MOCK_SCHEMA_VERSION = 3;
 
 function stubWasm(): RavenInspireWasm {
   return {
+    ...stubRemoteSessionExports(),
     build_client_session: () => ({ free: () => undefined }),
     build_seeded_query: () => new Uint8Array(16),
     extract_response: (_session, _crs, _state, response, _entry) => new Uint8Array(response),
@@ -46,7 +47,7 @@ function mountBatchRoute(server: MockServer): void {
     (_req, _body, res) => {
       const slots = 16;
       const out = new Uint8Array(2 + 8 + slots * (8 + NODE_BYTES));
-      out[1] = 1;
+      out[1] = 3;
       const dv = new DataView(out.buffer);
       dv.setUint32(2, slots, true);
       let off = 10;

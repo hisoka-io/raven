@@ -18,9 +18,8 @@ members = [
 [workspace.package]
 version = "0.1.0-alpha.0"
 edition = "2021"
-# 1.89: this tree depends on raven-inspire, which declares that floor, and cargo
-# enforces a dependency's rust-version.
-rust-version = "1.89"
+# 1.91: the committed Alloy 1.8 dependency graph declares this floor.
+rust-version = "1.91"
 authors = ["Raven contributors"]
 license = "Apache-2.0"
 publish = false

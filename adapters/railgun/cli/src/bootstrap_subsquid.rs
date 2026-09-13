@@ -1380,18 +1380,20 @@ impl std::fmt::Debug for SubsquidLeavesClient {
     }
 }
 
-/// Per-page timeout: the wall budget is only checked between pages, so a stalled
-/// request would otherwise hang forever.
-const SUBSQUID_PER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Retries on transient Subsquid failures; backoff 2s, 4s, 8s.
-const SUBSQUID_MAX_RETRIES: u32 = 3;
+const SUBSQUID_RETRY_POLICY: raven_railgun_indexer::RetryPolicy =
+    raven_railgun_indexer::RetryPolicy::exponential(
+        4,
+        Duration::from_secs(30),
+        Duration::from_secs(2),
+        Duration::from_secs(8),
+        None,
+    );
 
 impl SubsquidLeavesClient {
     pub fn new(endpoint: impl Into<String>) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(SUBSQUID_PER_REQUEST_TIMEOUT)
-            .connect_timeout(SUBSQUID_PER_REQUEST_TIMEOUT)
+            .timeout(SUBSQUID_RETRY_POLICY.attempt_timeout())
+            .connect_timeout(SUBSQUID_RETRY_POLICY.attempt_timeout())
             .build()
             .unwrap_or_else(|e| {
                 tracing::warn!(
@@ -1442,16 +1444,15 @@ impl SubsquidLeavesSource for SubsquidLeavesClient {
         });
         let mut last_err: Option<BootstrapError> = None;
         let mut response_body: Option<serde_json::Value> = None;
-        for attempt in 0..=SUBSQUID_MAX_RETRIES {
-            if attempt > 0 {
-                let backoff_secs = 2u64.saturating_pow(attempt);
+        for attempt in 0..SUBSQUID_RETRY_POLICY.max_attempts() {
+            if let Some(backoff) = SUBSQUID_RETRY_POLICY.backoff_before_attempt(attempt) {
                 tracing::warn!(
                     attempt,
-                    backoff_secs,
+                    backoff_secs = backoff.as_secs(),
                     last_err = ?last_err,
                     "subsquid page request failed; retrying with backoff"
                 );
-                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                tokio::time::sleep(backoff).await;
             }
             let send_result = self.http.post(&self.endpoint).json(&body).send().await;
             let resp = match send_result {
@@ -1638,6 +1639,28 @@ pub fn modulus_be() -> [u8; 32] {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    #[test]
+    fn subsquid_retry_attempts_and_backoff_schedule_are_pinned() {
+        let schedule = (0..SUBSQUID_RETRY_POLICY.max_attempts())
+            .map(|attempt| SUBSQUID_RETRY_POLICY.backoff_before_attempt(attempt))
+            .collect::<Vec<_>>();
+        assert_eq!(SUBSQUID_RETRY_POLICY.max_attempts(), 4);
+        assert_eq!(
+            schedule,
+            vec![
+                None,
+                Some(Duration::from_secs(2)),
+                Some(Duration::from_secs(4)),
+                Some(Duration::from_secs(8)),
+            ]
+        );
+        assert_eq!(
+            SUBSQUID_RETRY_POLICY.attempt_timeout(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(SUBSQUID_RETRY_POLICY.total_timeout(), None);
+    }
 
     /// An undecodable response must not be reported as a transport failure.
     ///

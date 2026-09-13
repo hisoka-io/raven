@@ -6,7 +6,7 @@ use std::time::Instant;
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -58,24 +58,27 @@ pub const X_RAVEN_CLIENT_ID: &str = "X-Raven-Client-Id";
 /// Accepts `[0-9a-fA-F]{32}` with optional `-` separators (UUID shape);
 /// returns the all-zero id when the header is absent or malformed.
 pub fn parse_client_id_header(headers: &http::HeaderMap) -> [u8; 16] {
-    let Some(raw) = headers.get(X_RAVEN_CLIENT_ID).and_then(|v| v.to_str().ok()) else {
-        return [0u8; 16];
-    };
+    decode_client_id_header(headers).unwrap_or([0u8; 16])
+}
+
+pub(crate) fn require_client_id_header(headers: &http::HeaderMap) -> Result<[u8; 16], ()> {
+    decode_client_id_header(headers).ok_or(())
+}
+
+fn decode_client_id_header(headers: &http::HeaderMap) -> Option<[u8; 16]> {
+    let raw = headers
+        .get(X_RAVEN_CLIENT_ID)
+        .and_then(|v| v.to_str().ok())?;
     let stripped: String = raw.chars().filter(|c| *c != '-').collect();
     if stripped.len() != 32 {
-        return [0u8; 16];
+        return None;
     }
     let mut out = [0u8; 16];
     for (i, slot) in out.iter_mut().enumerate() {
-        let Some(byte_str) = stripped.get(i * 2..i * 2 + 2) else {
-            return [0u8; 16];
-        };
-        let Ok(byte) = u8::from_str_radix(byte_str, 16) else {
-            return [0u8; 16];
-        };
-        *slot = byte;
+        let byte_str = stripped.get(i * 2..i * 2 + 2)?;
+        *slot = u8::from_str_radix(byte_str, 16).ok()?;
     }
-    out
+    Some(out)
 }
 
 /// SHA-256-derived 64-bit hash; deterministic unlike `RandomState` (which seeds per call).
@@ -107,7 +110,6 @@ impl SessionMap {
         Self::default()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn get(&self, key: &SessionKey, now: Instant) -> Option<ServerSessionHandle> {
         let mut guard = self.inner.lock();
         let entry = guard.get(key)?;
@@ -160,6 +162,29 @@ impl SessionMap {
         let before = guard.len();
         guard.retain(|_, v| v.expires_at > now);
         before - guard.len()
+    }
+}
+
+pub(crate) fn validate_session_binding(
+    headers: &HeaderMap,
+    sessions: &SessionMap,
+    instance_id: &InstanceId,
+    handle: Option<ServerSessionHandle>,
+) -> Result<(), StatusCode> {
+    let Some(handle) = handle else {
+        return Ok(());
+    };
+    let client_id = require_client_id_header(headers).map_err(|()| StatusCode::BAD_REQUEST)?;
+    let token = headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let key = SessionKey::new(token, instance_id.clone(), client_id);
+    if sessions.get(&key, Instant::now()) == Some(handle) {
+        Ok(())
+    } else {
+        Err(StatusCode::CONFLICT)
     }
 }
 
@@ -371,6 +396,53 @@ mod tests {
         assert_eq!(
             legacy_a, legacy_b,
             "absent-header back-compat must collapse to the same key"
+        );
+    }
+
+    #[test]
+    fn equal_numeric_handles_are_scoped_to_their_instance() {
+        let map = SessionMap::new();
+        let now = Instant::now();
+        let handle = ServerSessionHandle(7);
+        let client_id = [0x44; 16];
+        let first = InstanceId::new("first");
+        let second = InstanceId::new("second");
+        let key = SessionKey::new("shared-bearer", first.clone(), client_id);
+        map.upsert(key, handle, now + Duration::from_secs(60), 8, now);
+        map.upsert(
+            SessionKey::new("shared-bearer", second.clone(), [0x55; 16]),
+            handle,
+            now + Duration::from_secs(60),
+            8,
+            now,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer shared-bearer"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-raven-client-id"),
+            HeaderValue::from_static("44444444444444444444444444444444"),
+        );
+
+        assert_eq!(
+            validate_session_binding(&headers, &map, &first, Some(handle)),
+            Ok(())
+        );
+        assert_eq!(
+            validate_session_binding(&headers, &map, &second, Some(handle)),
+            Err(StatusCode::CONFLICT),
+            "the same bare handle on another instance must not authorize"
+        );
+        headers.insert(
+            HeaderName::from_static("x-raven-client-id"),
+            HeaderValue::from_static("55555555555555555555555555555555"),
+        );
+        assert_eq!(
+            validate_session_binding(&headers, &map, &second, Some(handle)),
+            Ok(()),
+            "the equal handle must serve its own instance and client"
         );
     }
 

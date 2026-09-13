@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
       - name: cargo doc
         run: cargo doc --workspace --no-deps --all-features
@@ -72,7 +72,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: wasm32-unknown-unknown
           components: clippy, rustfmt
@@ -86,7 +86,7 @@ jobs:
         run: cargo check -p raven-client --target wasm32-unknown-unknown
       - name: cargo clippy (wasm32, raven-client)
         run: cargo clippy -p raven-client --all-targets --target wasm32-unknown-unknown -- -D warnings
-      # The tree's ONLY #[wasm_bindgen_test]. The clippy step above COMPILES it for wasm32 and
+      # The original #[wasm_bindgen_test]. The clippy step above COMPILES it for wasm32 and
       # always has; nothing had ever EXECUTED it. When it was first run (2026-09-07) it FAILED:
       # it asked inspire_setup for a 512-byte record at ring_dim 256, where InspiRING width
       # ceil(512/2) = 256 is outside the legal [1, 128] power-of-two range. A test that has
@@ -97,11 +97,12 @@ jobs:
         # Each wasm test target is named explicitly: a filter-less `wasm-pack test --node
         # crates/client` was measured to stop after the first target that reports "no tests to
         # run!", so it does NOT run everything. scripts/check-wasm-test-coverage.sh fails the
-        # build if a file carrying #[wasm_bindgen_test] is missing from this list, which is the
-        # only thing keeping the list honest as files are added.
+        # build if a file carrying a wasm_bindgen_test attribute is missing from this list,
+        # which is the only thing keeping the list honest as files are added.
         run: |
           wasm-pack test --node crates/client --test wasm_client_roundtrip
           wasm-pack test --node crates/client --test session_params_drift
+          wasm-pack test --node crates/client --test session_handshake
       - name: cargo fmt (raven-inspire-client-wasm)
         run: cargo fmt --manifest-path adapters/railgun/client-wasm/Cargo.toml -- --check
       - name: cargo test (native, raven-inspire-client-wasm)
@@ -151,6 +152,10 @@ jobs:
         run: scripts/check-layering.sh
       - name: check-layering red-proof
         run: scripts/check-layering-selftest.sh
+      - name: check-rust-toolchain-pin
+        run: scripts/check-rust-toolchain-pin.sh
+      - name: toolchain-pin red-proof
+        run: scripts/check-rust-toolchain-pin-selftest.sh
 
   advisories:
     name: cargo-deny full check (every workspace)
@@ -159,7 +164,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-deny
         run: cargo install cargo-deny --version ^0.19 --locked
@@ -236,7 +241,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -304,7 +309,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - name: install lld linker
         run: sudo apt-get update && sudo apt-get install -y lld
       - name: install sccache
@@ -356,7 +361,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "railgun"
@@ -456,7 +461,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - name: install lld linker
         run: sudo apt-get update && sudo apt-get install -y lld
       - uses: mozilla-actions/sccache-action@v0.0.10
@@ -523,7 +528,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - name: install lld linker
         run: sudo apt-get update && sudo apt-get install -y lld
       - uses: mozilla-actions/sccache-action@v0.0.10
@@ -559,7 +564,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: wasm32-unknown-unknown
           components: clippy, rustfmt
@@ -580,7 +585,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: wasm32-unknown-unknown
           components: clippy, rustfmt
@@ -613,7 +618,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: wasm32-unknown-unknown
           components: clippy, rustfmt
@@ -675,7 +680,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -698,7 +703,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -718,7 +723,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -736,7 +741,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -753,52 +758,98 @@ jobs:
       - name: bench gate red-proof
         run: scripts/bench-gate-selftest.sh
 
-  msrv:
-    name: MSRV (declared floor actually builds)
+  msrv-1-89:
+    name: MSRV 1.89 (framework and independent workspaces)
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.89"
+      MSRV_MANIFESTS: "Cargo.toml|adapters/howl/Cargo.toml|adapters/railgun/client-wasm/Cargo.toml|benches/b1-bench/Cargo.toml|benches/b2-bench/Cargo.toml|crates/inspire/Cargo.toml|crates/isimplepir/Cargo.toml|tools/bench-compare/Cargo.toml"
+      MSRV_PACKAGES: "bench-compare,howl-poseidon2,howl-record,raven-b1-bench,raven-b2-bench,raven-bench,raven-client,raven-core,raven-crypto-primitives,raven-indexer,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-isimplepir,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage"
+      MSRV_EXTRA_PACKAGES: "raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror"
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      # Pinned, not `stable`. Every other job floats, so a declared `rust-version` was
-      # verified by nothing: the floor could drift below what the code needs and the only
-      # signal would be an external contributor's build failing. It has already bitten in the
-      # other direction - a floor declared BELOW the real one silently suppresses
-      # MSRV-gated clippy lints, and a newer stable then reddens main with lints nobody could
-      # see locally.
       - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
-      - name: assert every declared floor matches the pinned toolchain
+      - name: verify and build the exact 1.89 package set
         run: |
           set -euo pipefail
-          PINNED=1.89
-          bad=0
-          while IFS= read -r line; do
-            file="${line%%:*}"
-            ver="$(printf '%s' "$line" | grep -oE '"[0-9]+\.[0-9]+(\.[0-9]+)?"' | tr -d '"')"
-            case "$file" in
-              # Genuinely lower: its dependency closure is entirely external.
-              crates/binary-fuse-filter/Cargo.toml) continue ;;
+          IFS='|' read -r -a manifests <<< "$MSRV_MANIFESTS"
+          actual_packages="$({
+            for manifest in "${manifests[@]}"; do
+              cargo metadata --manifest-path "$manifest" --format-version 1 --no-deps \
+                | jq -r '.workspace_members[] as $id | .packages[] | select(.id == $id) | .name'
+            done
+            tr ',' '\n' <<< "$MSRV_EXTRA_PACKAGES"
+          } | sort -u | paste -sd, -)"
+          if [ "$actual_packages" != "$MSRV_PACKAGES" ]; then
+            echo "MSRV 1.89 PACKAGE DRIFT: selected '$actual_packages'"
+            echo "expected '$MSRV_PACKAGES'"
+            exit 1
+          fi
+          IFS=',' read -r -a package_names <<< "$actual_packages"
+          echo "MSRV 1.89 exact package set (${#package_names[@]}): $actual_packages"
+          for manifest in "${manifests[@]}"; do
+            echo "::group::cargo check --manifest-path $manifest"
+            case "$manifest" in
+              Cargo.toml)
+                cargo check --manifest-path "$manifest" --workspace --all-features --all-targets ;;
+              adapters/howl/Cargo.toml)
+                cargo check --manifest-path "$manifest" --workspace --all-targets ;;
+              benches/b1-bench/Cargo.toml)
+                cargo check --manifest-path "$manifest" --features inspire --all-targets ;;
+              crates/inspire/Cargo.toml|crates/isimplepir/Cargo.toml)
+                cargo check --manifest-path "$manifest" --all-features --all-targets ;;
+              *)
+                cargo check --manifest-path "$manifest" --all-targets ;;
             esac
-            if [ "$ver" != "$PINNED" ]; then
-              echo "MSRV DRIFT: $file declares $ver, the pinned toolchain is $PINNED"
-              bad=1
-            fi
-          done < <(git grep -n '^rust-version = ' -- '*/Cargo.toml' 'Cargo.toml')
-          [ "$bad" -eq 0 ] || { echo "A declared floor no job builds at is a claim, not a guarantee."; exit 1; }
-          echo "every declared rust-version matches the pinned toolchain"
-      - name: build at the declared floor
+            echo "::endgroup::"
+          done
+          cargo check --manifest-path adapters/railgun/Cargo.toml --all-features --all-targets \
+            -p raven-railgun-core \
+            -p raven-railgun-persistence \
+            -p raven-railgun-poseidon \
+            -p raven-railgun-ppoi-mirror
+
+  msrv-1-91:
+    name: MSRV 1.91 (Railgun and eth-state native graphs)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.91"
+      MSRV_MANIFESTS: "adapters/railgun/Cargo.toml|examples/eth-state/Cargo.toml"
+      MSRV_PACKAGES: "eth-state,raven-railgun-cli,raven-railgun-core,raven-railgun-engine,raven-railgun-http,raven-railgun-indexer,raven-railgun-mock-ppoi,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-railgun-testkit"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@1.91
+      - uses: Swatinem/rust-cache@v2
+      - name: verify and build the exact 1.91 package set
         run: |
           set -euo pipefail
-          for m in Cargo.toml adapters/railgun/Cargo.toml benches/b1-bench/Cargo.toml \
-                   benches/b2-bench/Cargo.toml crates/isimplepir/Cargo.toml \
-                   examples/eth-state/Cargo.toml tools/bench-compare/Cargo.toml; do
-            echo "::group::cargo check --manifest-path $m"
-            if [ "$m" = "benches/b1-bench/Cargo.toml" ]; then
-              cargo check --manifest-path "$m" --features inspire --all-targets
-            else
-              cargo check --manifest-path "$m" --all-targets
-            fi
+          IFS='|' read -r -a manifests <<< "$MSRV_MANIFESTS"
+          actual_packages="$({
+            for manifest in "${manifests[@]}"; do
+              cargo metadata --manifest-path "$manifest" --format-version 1 --no-deps \
+                | jq -r '.workspace_members[] as $id | .packages[] | select(.id == $id) | .name'
+            done
+          } | sort -u | paste -sd, -)"
+          if [ "$actual_packages" != "$MSRV_PACKAGES" ]; then
+            echo "MSRV 1.91 PACKAGE DRIFT: selected '$actual_packages'"
+            echo "expected '$MSRV_PACKAGES'"
+            exit 1
+          fi
+          IFS=',' read -r -a package_names <<< "$actual_packages"
+          echo "MSRV 1.91 exact package set (${#package_names[@]}): $actual_packages"
+          for manifest in "${manifests[@]}"; do
+            echo "::group::cargo check --manifest-path $manifest"
+            case "$manifest" in
+              adapters/railgun/Cargo.toml)
+                cargo check --manifest-path "$manifest" --workspace --all-features --all-targets ;;
+              examples/eth-state/Cargo.toml)
+                cargo check --manifest-path "$manifest" --all-features --all-targets ;;
+            esac
             echo "::endgroup::"
           done
 
@@ -810,7 +861,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
       # The re-rule trigger this job carried - a published per-metric CV for this runner -
       # has fired, and the answer split the two metric families rather than setting one
@@ -841,10 +892,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: verify Poseidon2 provenance
+        run: adapters/howl/poseidon2/check-provenance.sh
+      - name: Poseidon2 provenance red-proof
+        run: adapters/howl/poseidon2/check-provenance-selftest.sh
       - name: cargo fmt
         run: cargo fmt --manifest-path adapters/howl/Cargo.toml --all -- --check
       - name: cargo clippy
@@ -869,7 +927,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2

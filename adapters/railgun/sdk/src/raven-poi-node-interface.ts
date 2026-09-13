@@ -1,9 +1,12 @@
 import {
-  type BcToIdxMap,
   type ClientPirContext,
+  decodeClientPirQueryBundle,
+} from "./client-pir";
+import {
+  type BcToIdxMap,
+  type POIStatus,
   bytesToHex,
   containsByteSequence,
-  decodeClientPirQueryBundle,
   decodeStatusRow,
   hexToBytes,
   pathIndicesForLeaf,
@@ -13,14 +16,18 @@ import {
   validateListKeyHex,
   validateTreeNumber,
   TREE_DEPTH,
-} from "./client-pir";
-import { drawPaddedSlots } from "./batch-ladder";
+} from "./poi-pir";
+import { drawPaddedSlots, MAX_BATCH_SIZE } from "./batch-ladder";
+import {
+  buildFanoutCoverPlan,
+  recoverRealFanoutResponses,
+  type FanoutCoverPlan,
+} from "./fanout-cover";
 import { ChainRegistry, type ChainRegistryEntry } from "./chain-registry";
-import { RavenError } from "./errors";
+import { RavenError, type StaleDataContext } from "./errors";
 import { ImtCache, imtCacheKey, imtCacheScopeKey } from "./imt-cache";
 import { foldMerkleRoot } from "./poseidon";
 
-export type POIStatus = "Valid" | "ShieldBlocked" | "ProofSubmitted" | "Missing";
 export type BlindedCommitmentType = "Shield" | "Transact" | "Unshield";
 
 /**
@@ -113,8 +120,7 @@ export interface Proof {
   pi_c: [string, string];
 }
 
-/** SDK constructor options; a supplied `chainRegistry` takes precedence over the single-chain `endpoint`/`bearerToken`/`chainId`. */
-export interface RavenConfig {
+interface RavenConfigBase {
   endpoint: string;
   bearerToken: string;
   /** EVM chain id this adapter serves; defaults to 1 (mainnet). */
@@ -123,7 +129,6 @@ export interface RavenConfig {
   chainType?: number;
   /** Multi-chain routing table; when omitted an internal one-entry registry is built. */
   chainRegistry?: ChainRegistry;
-  upstreamFallbackEndpoint?: string;
   txidVersion?: string;
   fetchImpl?: typeof fetch;
   freshnessConfidenceFloor?: number;
@@ -137,6 +142,20 @@ export interface RavenConfig {
   /** IMT cache for auth-path reconstruction; defaults to in-memory 1024 entries plus IndexedDB when available. */
   imtCache?: ImtCache;
 }
+
+/** Private stale-response policy; upstream disclosure is explicit and requires an endpoint. */
+export type PrivateStalePolicy =
+  | {
+      readonly privateStalePolicy?: "refuse";
+      readonly upstreamFallbackEndpoint?: string;
+    }
+  | {
+      readonly privateStalePolicy: "allow-upstream-disclosure";
+      readonly upstreamFallbackEndpoint: string;
+    };
+
+/** SDK constructor options; omitted private-stale policy fails closed. */
+export type RavenConfig = RavenConfigBase & PrivateStalePolicy;
 
 interface BlindedCommitmentData {
   blindedCommitment: string;
@@ -156,6 +175,32 @@ interface FreshnessHeader {
   confidence: number;
 }
 
+type PrivateFreshness =
+  | { readonly kind: "valid"; readonly value: FreshnessHeader }
+  | { readonly kind: "absent" }
+  | { readonly kind: "malformed" };
+
+interface PrivateQueryBatchResult {
+  plaintexts: Uint8Array[];
+  freshness: PrivateFreshness;
+}
+
+interface AuthPathResult {
+  nodes: Uint8Array[];
+  freshness: PrivateFreshness;
+}
+
+interface SessionLease {
+  readonly key: string;
+  readonly handshake: Promise<bigint>;
+}
+
+class SessionHandleRefused extends Error {
+  constructor(readonly url: string) {
+    super("server refused the installed session handle");
+  }
+}
+
 /** Captured outbound HTTP request; the privacy-invariant test harness asserts no BC bytes appear in any body. */
 export interface CapturedWireRequest {
   url: string;
@@ -167,6 +212,8 @@ export interface CapturedWireRequest {
 const X_RAVEN_FRESHNESS = "x-raven-freshness";
 const X_RAVEN_EPOCH = "x-raven-epoch";
 const X_RAVEN_SCHEMA_VERSION = "x-raven-schema-version";
+const WIRE_SCHEMA_VERSION = 3;
+const MAX_FANOUT_BODY_BYTES = 8 * 1024 * 1024;
 const DEFAULT_TXID_VERSION = "V2_PoseidonMerkle";
 const DEFAULT_CONFIDENCE_FLOOR = 0.5;
 const DEFAULT_CHAIN_ID = 1;
@@ -176,12 +223,14 @@ const PATH_RECORD_BYTES = TREE_DEPTH * NODE_HASH_BYTES;
 /** Epoch tag before the instance has ever reported one; never collides with a real epoch. */
 const UNOBSERVED_EPOCH = "";
 const AUTH_PATH_ATTEMPTS = 2;
+const SESSION_QUERY_ATTEMPTS = 2;
 
 export class RavenPOINodeInterface {
   private readonly chainId: number;
   private readonly chainType: number;
   private readonly registry: ChainRegistry;
   private readonly upstream: string | undefined;
+  private readonly privateStalePolicy: "refuse" | "allow-upstream-disclosure";
   private readonly txidVersion: string;
   private readonly fetchImpl: typeof fetch;
   private readonly confidenceFloor: number;
@@ -194,18 +243,44 @@ export class RavenPOINodeInterface {
 
   // Bounded ring for the privacy-invariant test harness.
   private readonly capturedRequests: CapturedWireRequest[] = [];
+  private readonly sessionHandshakes = new Map<string, Promise<bigint>>();
+  private readonly clientPirIds = new Map<string, string>();
 
   constructor(config: RavenConfig) {
     this.chainId = config.chainId ?? DEFAULT_CHAIN_ID;
     this.chainType = config.chainType ?? DEFAULT_CHAIN_TYPE;
     this.upstream = config.upstreamFallbackEndpoint?.replace(/\/$/, "");
+    this.privateStalePolicy = config.privateStalePolicy ?? "refuse";
     this.txidVersion = config.txidVersion ?? DEFAULT_TXID_VERSION;
     this.fetchImpl = config.fetchImpl ?? fetch;
     this.confidenceFloor = config.freshnessConfidenceFloor ?? DEFAULT_CONFIDENCE_FLOOR;
+    if (
+      !Number.isFinite(this.confidenceFloor) ||
+      this.confidenceFloor < 0 ||
+      this.confidenceFloor > 1
+    ) {
+      throw RavenError.invalidQuery(
+        `freshnessConfidenceFloor must be finite and within [0,1], got ${this.confidenceFloor}`,
+      );
+    }
     this.useClientPir = config.useClientPir ?? true;
     this.clientPirContexts = config.clientPirContexts ?? new Map();
     this.bcToIdxMaps = config.bcToIdxMaps ?? new Map();
     this.cache = config.imtCache ?? new ImtCache();
+
+    if (
+      this.privateStalePolicy !== "refuse" &&
+      this.privateStalePolicy !== "allow-upstream-disclosure"
+    ) {
+      throw RavenError.invalidQuery(
+        `privateStalePolicy must be "refuse" or "allow-upstream-disclosure"`,
+      );
+    }
+    if (this.privateStalePolicy === "allow-upstream-disclosure" && !this.upstream) {
+      throw RavenError.invalidQuery(
+        "privateStalePolicy allow-upstream-disclosure requires upstreamFallbackEndpoint",
+      );
+    }
 
     if (config.chainRegistry) {
       this.registry = config.chainRegistry;
@@ -240,6 +315,82 @@ export class RavenPOINodeInterface {
   /** Reset the captured wire-request ring. */
   resetWireCapture(): void {
     this.capturedRequests.length = 0;
+  }
+
+  /** Query one encrypted local index across real and cover shards.
+   *
+   * The request uploads one seeded query, retargets its clear shard marker to an independently
+   * sampled wire slot, and returns only caller-real plaintext rows in caller shard order.
+   */
+  async queryClientPirFanout(
+    instanceLabel: string,
+    ctx: ClientPirContext,
+    targetIndex: bigint,
+    realShardIds: readonly number[],
+    shardCount: number,
+  ): Promise<Uint8Array[]> {
+    if (instanceLabel.length === 0) {
+      throw RavenError.invalidQuery("client-PIR fanout instance label must not be empty");
+    }
+    if (
+      typeof targetIndex !== "bigint" ||
+      targetIndex < 0n ||
+      targetIndex > 0xffff_ffff_ffff_ffffn
+    ) {
+      throw RavenError.invalidQuery(`client-PIR fanout target index is not a u64: ${targetIndex}`);
+    }
+    return this.withClientPirSessionRetry(
+      instanceLabel,
+      ctx,
+      async () => {
+        const plan = buildFanoutCoverPlan(realShardIds, shardCount, MAX_BATCH_SIZE);
+        const queryBundle = decodeClientPirQueryBundle(
+          ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, targetIndex),
+        );
+        if (typeof ctx.wasm.retarget_seeded_query_shard !== "function") {
+          throw RavenError.staleAdapter(
+            "client-PIR fanout requires a WASM build with typed seeded-query retargeting",
+          );
+        }
+        const queryBytes = ctx.wasm.retarget_seeded_query_shard(
+          queryBundle.queryBytes,
+          plan.nominalShardId,
+        );
+        const requestBody = encodeFanoutRequest(queryBytes, plan);
+        const route = this.route();
+        const url = `${route.endpoint}/v1/instance/${encodeURIComponent(instanceLabel)}/fanout`;
+        this.captureRequest(url, "POST", requestBody);
+        const response = await this.postClientPirRequest(
+          instanceLabel,
+          url,
+          requestBody,
+          "fanout",
+        );
+        const freshness = parsePrivateFreshnessHeader(response.headers.get(X_RAVEN_FRESHNESS));
+        void this.privateFreshnessAction(freshness, "fanout");
+        const responseBytes = new Uint8Array(await response.arrayBuffer());
+        void stripSchemaEnvelope(responseBytes, instanceLabel);
+        const wireResponses = decodeBatchBody(responseBytes);
+        const realResponses = recoverRealFanoutResponses(plan, wireResponses);
+        return realResponses.map((serverResponse, realPosition) => {
+          try {
+            return ctx.wasm.extract_response(
+              ctx.session,
+              ctx.crsBincode,
+              queryBundle.clientStateBincode,
+              serverResponse,
+              ctx.entrySize,
+            );
+          } catch (cause) {
+            throw RavenError.decodeError(
+              `client-PIR fanout ${instanceLabel}: extract_response failed at real position ${realPosition}`,
+              { url, cause: String(cause) },
+            );
+          }
+        });
+      },
+      "fanout",
+    );
   }
 
   async getPOIsPerList(
@@ -521,31 +672,69 @@ export class RavenPOINodeInterface {
             "preload via loadClientPirContext + fetchBcToIdxMap before calling getPOIsPerList",
         );
       }
-      for (const { blindedCommitment } of blindedCommitmentDatas) {
-        const bcHex = normalizeHex(blindedCommitment);
+      const members: {
+        commitmentData: BlindedCommitmentData;
+        bcHex: string;
+        idx: number;
+      }[] = [];
+      for (const commitmentData of blindedCommitmentDatas) {
+        const bcHex = normalizeHex(commitmentData.blindedCommitment);
         const idx = bcMap.get(bcHex);
         if (idx === undefined) {
           out[bcHex][lkHex] = "Missing";
-          continue;
+        } else {
+          members.push({ commitmentData, bcHex, idx });
         }
-        let status: POIStatus;
+      }
+
+      const chunkCount = Math.max(1, Math.ceil(members.length / MAX_BATCH_SIZE));
+      for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+        const chunk = members.slice(
+          chunkIndex * MAX_BATCH_SIZE,
+          (chunkIndex + 1) * MAX_BATCH_SIZE,
+        );
         try {
-          const label = `client-PIR t1Status-${lkHex} idx ${idx}`;
-          const plaintext = await this.runClientPirQuery(`t1Status-${lkHex}`, ctx, BigInt(idx));
-          status = decodeStatusRow(plaintext, bcHex, label);
+          const privateReply = await this.runClientPirQueryBatch(
+            `t1Status-${lkHex}`,
+            ctx,
+            chunk.map(({ idx }) => idx),
+          );
+          if (this.privateFreshnessAction(privateReply.freshness, "t1-status") === "fallback") {
+            // This deliberately reveals the exact BC/list to upstream. Returning a stale
+            // spend-authorizing verdict would preserve lookup privacy at the cost of correctness.
+            const fallback = await this.passthroughPoisPerList(
+              [listKey],
+              chunk.map(({ commitmentData }) => commitmentData),
+            );
+            for (const { bcHex } of chunk) {
+              const fallbackStatus = fallback[bcHex]?.[lkHex];
+              if (!fallbackStatus) {
+                throw RavenError.decodeError(
+                  `upstream pois-per-list omitted BC ${bcHex} on list ${lkHex}`,
+                );
+              }
+              out[bcHex][lkHex] = fallbackStatus;
+            }
+          } else {
+            for (let slot = 0; slot < chunk.length; slot += 1) {
+              const { bcHex, idx } = chunk[slot];
+              const label = `client-PIR t1Status-${lkHex} idx ${idx}`;
+              out[bcHex][lkHex] = decodeStatusRow(
+                privateReply.plaintexts[slot],
+                bcHex,
+                label,
+              );
+            }
+          }
         } catch (cause) {
-          // KNOWN FAIL-OPEN, retained deliberately pending an owner ruling. `Missing` is
-          // the NON-blocking verdict, so degrading a transport failure to it tells the
-          // wallet a possibly-ShieldBlocked commitment is merely unproven. Removing the
-          // downgrade surfaces those as errors, which is correct only once an oversized
-          // upload reliably receives its 401 rather than a socket reset.
           if (cause instanceof RavenError && cause.kind === "Network") {
-            status = "Missing";
+            for (const { bcHex } of chunk) {
+              out[bcHex][lkHex] = "Unreachable";
+            }
           } else {
             throw cause;
           }
         }
-        out[bcHex][lkHex] = status;
       }
     }
     return out;
@@ -575,13 +764,26 @@ export class RavenPOINodeInterface {
       }
       // The leaf index never crosses the wire, only encrypted row queries.
       const indices = pathIndicesForPerListLeaf(ctx.wasm, lkHex, idx);
-      const siblings = await this.fetchAuthPathNodes(
+      const privateReply = await this.fetchAuthPathNodes(
         `t2Path-${lkHex}`,
         ctx,
         indices,
         `list-${lkHex}`,
       );
-      out.push(buildMerkleProof(idx, bcHex, siblings));
+      if (this.privateFreshnessAction(privateReply.freshness, "t2-auth-path") === "fallback") {
+        // This deliberately reveals the exact BC/list to upstream. The alternative is to
+        // return an auth path whose freshness is below the operator-selected confidence floor.
+        const fallback = await this.passthroughMerkleProofs(listKey, [bc]);
+        const proof = fallback[0];
+        if (!proof) {
+          throw RavenError.decodeError(
+            `upstream merkle-proofs omitted BC ${bcHex} on list ${lkHex}`,
+          );
+        }
+        out.push(proof);
+      } else {
+        out.push(buildMerkleProof(idx, bcHex, privateReply.nodes));
+      }
     }
     return out;
   }
@@ -598,7 +800,7 @@ export class RavenPOINodeInterface {
       );
     }
     const indices = pathIndicesForLeaf(ctx.wasm, treeNumber, leafIndex);
-    const siblings = await this.fetchAuthPathNodes(
+    const { nodes: siblings } = await this.fetchAuthPathNodes(
       `commit-tree-${treeNumber}`,
       ctx,
       indices,
@@ -618,15 +820,17 @@ export class RavenPOINodeInterface {
     ctx: ClientPirContext,
     indices: number[],
     cacheScope: string,
-  ): Promise<Uint8Array[]> {
+  ): Promise<AuthPathResult> {
     if (indices.length !== TREE_DEPTH) {
       throw RavenError.batchMismatch(
         `fetchAuthPathNodes: expected ${TREE_DEPTH} indices, got ${indices.length}`,
       );
     }
     for (let attempt = 0; attempt < AUTH_PATH_ATTEMPTS; attempt += 1) {
-      const nodes = await this.assembleAuthPath(instanceLabel, ctx, indices, cacheScope);
-      if (nodes) return nodes;
+      const assembled = await this.withClientPirSessionRetry(instanceLabel, ctx, () =>
+        this.assembleAuthPath(instanceLabel, ctx, indices, cacheScope),
+      );
+      if (assembled) return assembled;
     }
     throw RavenError.staleAdapter(
       `client-PIR ${instanceLabel}: snapshot epoch advanced on all ${AUTH_PATH_ATTEMPTS} ` +
@@ -642,7 +846,7 @@ export class RavenPOINodeInterface {
     ctx: ClientPirContext,
     indices: number[],
     cacheScope: string,
-  ): Promise<Uint8Array[] | undefined> {
+  ): Promise<AuthPathResult | undefined> {
     const route = this.route();
     const out: (Uint8Array | undefined)[] = new Array(indices.length).fill(undefined);
     const missing: number[] = [];
@@ -702,39 +906,8 @@ export class RavenPOINodeInterface {
     const batchBody = encodeBatchBody(queryBundles.map((b) => b.queryBytes));
     const url = `${route.endpoint}/v1/instance/${encodeURIComponent(instanceLabel)}/batch`;
     this.captureRequest(url, "POST", batchBody);
-    let res: Response;
-    try {
-      res = await this.fetchImpl(url, {
-        method: "POST",
-        headers: {
-          "content-type": "application/octet-stream",
-          authorization: `Bearer ${route.bearerToken}`,
-        },
-        body: copyForBody(batchBody),
-      });
-    } catch (cause) {
-      throw RavenError.network(`client-PIR batch ${instanceLabel}`, {
-        url,
-        cause: String(cause),
-      });
-    }
-    if (res.status === 400) {
-      const sv = res.headers.get(X_RAVEN_SCHEMA_VERSION);
-      if (sv) {
-        throw RavenError.staleAdapter(`client-PIR batch ${instanceLabel}: schema mismatch`, {
-          url,
-          status: 400,
-          serverWireSchemaVersion: parseSchemaVersion(sv) ?? undefined,
-          clientWireSchemaVersion: schemaVersion,
-        });
-      }
-    }
-    if (!res.ok) {
-      throw RavenError.serverError(`client-PIR batch ${instanceLabel}: ${res.status}`, {
-        url,
-        status: res.status,
-      });
-    }
+    const res = await this.postClientPirRequest(instanceLabel, url, batchBody, "batch");
+    const freshness = parsePrivateFreshnessHeader(res.headers.get(X_RAVEN_FRESHNESS));
     // Header absent and header empty both arrive as UNOBSERVED_EPOCH, which would re-key
     // every node as never-observed and silently defeat the epoch tag.
     const servedEpoch = res.headers.get(X_RAVEN_EPOCH) ?? UNOBSERVED_EPOCH;
@@ -754,7 +927,7 @@ export class RavenPOINodeInterface {
       throw RavenError.staleAdapter(
         `client-PIR batch ${instanceLabel}: ${X_RAVEN_SCHEMA_VERSION} is "${serverSchemaRaw}", ` +
           "not a decimal non-negative integer, so the reply cannot be pinned to a wire schema",
-        { url, status: res.status, clientWireSchemaVersion: schemaVersion },
+        { url, status: res.status, clientWireSchemaVersion: WIRE_SCHEMA_VERSION },
       );
     }
     this.cache.noteFreshness(scopeKey, servedEpoch, serverSchema);
@@ -768,6 +941,7 @@ export class RavenPOINodeInterface {
     }
 
     const bytes = new Uint8Array(await res.arrayBuffer());
+    void stripSchemaEnvelope(bytes, instanceLabel);
     const responses = decodeBatchBody(bytes);
     if (responses.length !== queryBundles.length) {
       throw RavenError.batchMismatch(
@@ -804,67 +978,222 @@ export class RavenPOINodeInterface {
       this.cache.set(keyAt(level, servedEpoch), cached);
     }
 
-    return collectAuthPath(out);
+    return { nodes: collectAuthPath(out), freshness };
   }
 
-  /** Single-query path (T1 status): build query, POST to `/v1/instance/:id/query`, decrypt the response. */
-  private async runClientPirQuery(
+  /** T1 status path: build, pad, and decrypt one `/batch` request. */
+  private async runClientPirQueryBatch(
     instanceLabel: string,
     ctx: ClientPirContext,
-    targetIdx: bigint,
-  ): Promise<Uint8Array> {
-    const route = this.route();
-    const queryBundle = decodeClientPirQueryBundle(
-      ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, targetIdx),
+    targetIndices: readonly number[],
+  ): Promise<PrivateQueryBatchResult> {
+    return this.withClientPirSessionRetry(instanceLabel, ctx, async () => {
+      const route = this.route();
+      const realTargets = targetIndices.length > 0 ? targetIndices : [0];
+      const queryBundles = drawPaddedSlots(realTargets).map((targetIdx) =>
+        decodeClientPirQueryBundle(
+          ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, BigInt(targetIdx)),
+        ),
+      );
+      const batchBody = encodeBatchBody(queryBundles.map(({ queryBytes }) => queryBytes));
+      const url = `${route.endpoint}/v1/instance/${encodeURIComponent(instanceLabel)}/batch`;
+      this.captureRequest(url, "POST", batchBody);
+      const res = await this.postClientPirRequest(instanceLabel, url, batchBody, "batch");
+      const freshness = parsePrivateFreshnessHeader(res.headers.get(X_RAVEN_FRESHNESS));
+      const responseBytes = new Uint8Array(await res.arrayBuffer());
+      void stripSchemaEnvelope(responseBytes, instanceLabel);
+      const responses = decodeBatchBody(responseBytes);
+      if (responses.length !== queryBundles.length) {
+        throw RavenError.batchMismatch(
+          `client-PIR batch ${instanceLabel}: expected ${queryBundles.length} responses, got ${responses.length}`,
+          { url },
+        );
+      }
+      const plaintexts = realTargets.map((_targetIdx, slot) =>
+        ctx.wasm.extract_response(
+          ctx.session,
+          ctx.crsBincode,
+          queryBundles[slot].clientStateBincode,
+          responses[slot],
+          ctx.entrySize,
+        ),
+      );
+      return { plaintexts, freshness };
+    });
+  }
+
+  private async withClientPirSessionRetry<T>(
+    instanceLabel: string,
+    ctx: ClientPirContext,
+    query: () => Promise<T>,
+    operation: "batch" | "fanout" = "batch",
+  ): Promise<T> {
+    for (let attempt = 0; attempt < SESSION_QUERY_ATTEMPTS; attempt += 1) {
+      const lease = await this.ensureClientPirSession(instanceLabel, ctx);
+      try {
+        return await query();
+      } catch (cause) {
+        if (!(cause instanceof SessionHandleRefused)) throw cause;
+        this.invalidateClientPirSession(lease);
+        if (attempt + 1 === SESSION_QUERY_ATTEMPTS) {
+          throw RavenError.serverError(
+            `client-PIR ${operation} ${instanceLabel}: replacement session handle was refused`,
+            { url: cause.url, status: 409 },
+          );
+        }
+      }
+    }
+    throw RavenError.serverError(
+      `client-PIR ${operation} ${instanceLabel}: session retry exhausted`,
+      { status: 409 },
     );
-    const url = `${route.endpoint}/v1/instance/${encodeURIComponent(instanceLabel)}/query`;
-    // `[u16 BE schema_version][bincode]`, matching server-side read_versioned.
-    const wirePayload = wrapWithSchemaEnvelope(queryBundle.queryBytes);
-    this.captureRequest(url, "POST", wirePayload);
-    let res: Response;
+  }
+
+  private async postClientPirRequest(
+    instanceLabel: string,
+    url: string,
+    requestBody: Uint8Array,
+    operation: "batch" | "fanout",
+  ): Promise<Response> {
+    const route = this.route();
+    const clientId = this.clientPirClientId(instanceLabel);
+    let response: Response;
     try {
-      res = await this.fetchImpl(url, {
+      response = await this.fetchImpl(url, {
         method: "POST",
         headers: {
           "content-type": "application/octet-stream",
           authorization: `Bearer ${route.bearerToken}`,
+          "x-raven-client-id": clientId,
         },
-        body: copyForBody(wirePayload),
+        body: copyForBody(requestBody),
       });
     } catch (cause) {
-      throw RavenError.network(`client-PIR query ${instanceLabel}`, {
+      throw RavenError.network(`client-PIR ${operation} ${instanceLabel}`, {
         url,
         cause: String(cause),
       });
     }
-    if (res.status === 400) {
-      const sv = res.headers.get(X_RAVEN_SCHEMA_VERSION);
-      if (sv) {
-        throw RavenError.staleAdapter(`client-PIR query ${instanceLabel}: schema mismatch`, {
+    if (response.status === 409) {
+      throw new SessionHandleRefused(url);
+    }
+    if (response.status === 400) {
+      const serverVersion = parseSchemaVersion(
+        response.headers.get(X_RAVEN_SCHEMA_VERSION)?.trim() ?? "",
+      );
+      if (
+        response.headers.has(X_RAVEN_SCHEMA_VERSION) &&
+        serverVersion !== WIRE_SCHEMA_VERSION
+      ) {
+        throw RavenError.staleAdapter(`client-PIR ${operation} ${instanceLabel}: schema mismatch`, {
           url,
           status: 400,
-          serverWireSchemaVersion: parseSchemaVersion(sv) ?? undefined,
-          clientWireSchemaVersion: route.schemaVersion ?? 0,
+          serverWireSchemaVersion: serverVersion ?? undefined,
+          clientWireSchemaVersion: WIRE_SCHEMA_VERSION,
         });
       }
     }
-    if (!res.ok) {
-      throw RavenError.serverError(`client-PIR query ${instanceLabel}: ${res.status}`, {
+    if (!response.ok) {
+      throw RavenError.serverError(`client-PIR ${operation} ${instanceLabel}: ${response.status}`, {
         url,
-        status: res.status,
+        status: response.status,
       });
     }
-    // extract_response expects bincode-only.
-    const envelopedBytes = new Uint8Array(await res.arrayBuffer());
-    const responseBytes = stripSchemaEnvelope(envelopedBytes, instanceLabel);
-    const plaintext = ctx.wasm.extract_response(
-      ctx.session,
-      ctx.crsBincode,
-      queryBundle.clientStateBincode,
-      responseBytes,
-      ctx.entrySize,
-    );
-    return plaintext;
+    return response;
+  }
+
+  private async ensureClientPirSession(
+    instanceLabel: string,
+    ctx: ClientPirContext,
+  ): Promise<SessionLease> {
+    const route = this.route();
+    const handshakeKey = this.clientPirSessionKey(instanceLabel, route.endpoint);
+    let handshake = this.sessionHandshakes.get(handshakeKey);
+    if (!handshake) {
+      handshake = this.establishClientPirSession(instanceLabel, ctx);
+      this.sessionHandshakes.set(handshakeKey, handshake);
+    }
+    try {
+      const handle = await handshake;
+      ctx.wasm.install_server_session_handle(ctx.session, handle);
+    } catch (cause) {
+      if (this.sessionHandshakes.get(handshakeKey) === handshake) {
+        this.sessionHandshakes.delete(handshakeKey);
+      }
+      throw cause;
+    }
+    return { key: handshakeKey, handshake };
+  }
+
+  private invalidateClientPirSession(lease: SessionLease): void {
+    if (this.sessionHandshakes.get(lease.key) === lease.handshake) {
+      this.sessionHandshakes.delete(lease.key);
+    }
+  }
+
+  private async establishClientPirSession(
+    instanceLabel: string,
+    ctx: ClientPirContext,
+  ): Promise<bigint> {
+    if (
+      typeof ctx.wasm.client_packing_keys_versioned !== "function" ||
+      typeof ctx.wasm.install_server_session_handle !== "function"
+    ) {
+      throw RavenError.staleAdapter(
+        `client-PIR ${instanceLabel}: WASM lacks the remote-session exports; rebuild ` +
+          "raven-inspire-client-wasm before querying",
+      );
+    }
+    const route = this.route();
+    const clientId = this.clientPirClientId(instanceLabel);
+    const body = ctx.wasm.client_packing_keys_versioned(ctx.session);
+    const url = `${route.endpoint}/v1/instance/${encodeURIComponent(instanceLabel)}/session`;
+    let response: Response;
+    try {
+      response = await this.fetchImpl(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/octet-stream",
+          authorization: `Bearer ${route.bearerToken}`,
+          "x-raven-client-id": clientId,
+        },
+        body: copyForBody(body),
+      });
+    } catch (cause) {
+      throw RavenError.network(`client-PIR session ${instanceLabel}`, {
+        url,
+        cause: String(cause),
+      });
+    }
+    if (!response.ok) {
+      throw RavenError.serverError(
+        `client-PIR session ${instanceLabel}: ${response.status}`,
+        { url, status: response.status },
+      );
+    }
+    const handle = parseSessionHandle(response.headers.get("x-raven-session"), instanceLabel);
+    return handle;
+  }
+
+  private clientPirClientId(instanceLabel: string): string {
+    const key = this.clientPirSessionKey(instanceLabel, this.route().endpoint);
+    const existing = this.clientPirIds.get(key);
+    if (existing) return existing;
+    const cryptoApi = globalThis.crypto;
+    if (!cryptoApi || typeof cryptoApi.getRandomValues !== "function") {
+      throw RavenError.serverError(
+        "client-PIR session: crypto.getRandomValues is unavailable for client binding",
+      );
+    }
+    const bytes = new Uint8Array(16);
+    cryptoApi.getRandomValues(bytes);
+    const clientId = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    this.clientPirIds.set(key, clientId);
+    return clientId;
+  }
+
+  private clientPirSessionKey(instanceLabel: string, endpoint: string): string {
+    return `${this.chainId}\u0000${endpoint}\u0000${instanceLabel}`;
   }
 
   private async postJson<T>(
@@ -907,6 +1236,43 @@ export class RavenPOINodeInterface {
   private shouldFallback(freshness: FreshnessHeader | null): boolean {
     if (!freshness) return false;
     return freshness.confidence < this.confidenceFloor;
+  }
+
+  private privateFreshnessAction(
+    privateFreshness: PrivateFreshness,
+    operation: StaleDataContext["operation"],
+  ): "accept" | "fallback" {
+    if (privateFreshness.kind === "absent") {
+      throw RavenError.staleAdapter(
+        `private ${operation} response has no ${X_RAVEN_FRESHNESS}; freshness cannot be verified`,
+      );
+    }
+    if (privateFreshness.kind === "malformed") {
+      throw RavenError.decodeError(
+        `private ${operation} response has malformed ${X_RAVEN_FRESHNESS}`,
+      );
+    }
+    const freshness = privateFreshness.value;
+    if (!this.shouldFallback(freshness)) return "accept";
+    if (this.privateStalePolicy === "allow-upstream-disclosure" && operation !== "fanout") {
+      return "fallback";
+    }
+    throw RavenError.staleData(
+      `private ${operation} response is stale: confidence ${freshness.confidence} < floor ` +
+        `${this.confidenceFloor} (lag_blocks=${freshness.lagBlocks}, ` +
+        `applied_height=${freshness.appliedHeight}, epoch=${freshness.epoch}); ` +
+        (operation === "fanout"
+          ? "fanout has no plaintext upstream fallback"
+          : "upstream disclosure is disabled"),
+      {
+        operation,
+        lagBlocks: freshness.lagBlocks,
+        appliedHeight: freshness.appliedHeight,
+        epoch: freshness.epoch,
+        confidence: freshness.confidence,
+        confidenceFloor: this.confidenceFloor,
+      },
+    );
   }
 
   private async passthroughPoisPerList(
@@ -1003,16 +1369,7 @@ function collectAuthPath(levels: (Uint8Array | undefined)[]): Uint8Array[] {
   return out;
 }
 
-/** Wrap a bincode body in the read_versioned envelope `[u16 BE version][body]`. */
-function wrapWithSchemaEnvelope(body: Uint8Array): Uint8Array {
-  const out = new Uint8Array(2 + body.length);
-  out[0] = 0;
-  out[1] = 1;
-  out.set(body, 2);
-  return out;
-}
-
-/** Inverse of `wrapWithSchemaEnvelope`; validates the prefix and throws a typed error on a missing/unexpected envelope. */
+/** Validate a response's `[u16 BE version]` prefix. */
 function stripSchemaEnvelope(buf: Uint8Array, label: string): Uint8Array {
   if (buf.length < 2) {
     throw RavenError.decodeError(
@@ -1020,7 +1377,7 @@ function stripSchemaEnvelope(buf: Uint8Array, label: string): Uint8Array {
     );
   }
   const envelope = (buf[0] << 8) | buf[1];
-  if (envelope !== 1) {
+  if (envelope !== WIRE_SCHEMA_VERSION) {
     throw RavenError.decodeError(
       `${label}: unexpected schema envelope version ${envelope}`,
     );
@@ -1031,7 +1388,10 @@ function stripSchemaEnvelope(buf: Uint8Array, label: string): Uint8Array {
 /** Encode the `Vec<SeededClientQuery>` shape `dispatch_batch` expects:
  * `[u16 BE version][u64 LE count][concatenated per-query bincode]`. */
 function encodeBatchBody(queries: Uint8Array[]): Uint8Array {
-  const schemaPrefix = new Uint8Array([0, 1]);
+  const schemaPrefix = new Uint8Array([
+    (WIRE_SCHEMA_VERSION >>> 8) & 0xff,
+    WIRE_SCHEMA_VERSION & 0xff,
+  ]);
   let bodyBytes = 8;
   for (const q of queries) {
     bodyBytes += q.length;
@@ -1045,6 +1405,32 @@ function encodeBatchBody(queries: Uint8Array[]): Uint8Array {
   for (const q of queries) {
     out.set(q, offset);
     offset += q.length;
+  }
+  return out;
+}
+
+function encodeFanoutRequest(queryBytes: Uint8Array, plan: FanoutCoverPlan): Uint8Array {
+  if (queryBytes.length === 0) {
+    throw RavenError.invalidQuery("fanout cover: query bytes must not be empty");
+  }
+  const total = 2 + queryBytes.length + 8 + plan.wireShardIds.length * 4;
+  if (!Number.isSafeInteger(total) || total > MAX_FANOUT_BODY_BYTES) {
+    throw RavenError.invalidQuery(
+      `fanout cover: encoded request length ${total} exceeds body cap ${MAX_FANOUT_BODY_BYTES}`,
+    );
+  }
+
+  const out = new Uint8Array(total);
+  const view = new DataView(out.buffer);
+  view.setUint16(0, WIRE_SCHEMA_VERSION, false);
+  out.set(queryBytes, 2);
+  let offset = 2 + queryBytes.length;
+  view.setUint32(offset, plan.wireShardIds.length, true);
+  view.setUint32(offset + 4, 0, true);
+  offset += 8;
+  for (const shardId of plan.wireShardIds) {
+    view.setUint32(offset, shardId, true);
+    offset += 4;
   }
   return out;
 }
@@ -1084,6 +1470,11 @@ function decodeBatchBody(buf: Uint8Array): Uint8Array[] {
     }
     out.push(new Uint8Array(buf.subarray(offset, offset + elemLenLo)));
     offset += elemLenLo;
+  }
+  if (offset !== buf.length) {
+    throw RavenError.decodeError(
+      `decodeBatchBody: ${buf.length - offset} trailing bytes after ${lenLo} elements`,
+    );
   }
   return out;
 }
@@ -1141,6 +1532,21 @@ function parseSchemaVersion(raw: string): number | null {
   return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
+function parseSessionHandle(raw: string | null, instanceLabel: string): bigint {
+  if (raw === null || !/^[0-9]+$/.test(raw)) {
+    throw RavenError.decodeError(
+      `client-PIR session ${instanceLabel}: x-raven-session must be a decimal u64`,
+    );
+  }
+  const handle = BigInt(raw);
+  if (handle > 0xffffffffffffffffn) {
+    throw RavenError.decodeError(
+      `client-PIR session ${instanceLabel}: x-raven-session exceeds u64`,
+    );
+  }
+  return handle;
+}
+
 function parseFreshnessHeader(value: string | null): FreshnessHeader | null {
   if (!value) return null;
   const out: Partial<FreshnessHeader> = {};
@@ -1165,6 +1571,12 @@ function parseFreshnessHeader(value: string | null): FreshnessHeader | null {
   return out as FreshnessHeader;
 }
 
+function parsePrivateFreshnessHeader(value: string | null): PrivateFreshness {
+  if (value === null) return { kind: "absent" };
+  const parsed = parseFreshnessHeader(value);
+  return parsed ? { kind: "valid", value: parsed } : { kind: "malformed" };
+}
+
 export {
   containsByteSequence,
   hexToBytes,
@@ -1175,9 +1587,9 @@ export {
   PATH_RECORD_BYTES,
 };
 export type {
-  BcToIdxMap,
   ClientPirContext,
   RavenInspireWasm,
   RavenInspireClientSession,
   ClientPirQueryBundle,
 } from "./client-pir";
+export type { BcToIdxMap, POIStatus, RavenPOIPathWasm } from "./poi-pir";

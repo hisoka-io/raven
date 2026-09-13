@@ -2,14 +2,12 @@
 
 use std::collections::BTreeSet;
 
-use raven_railgun_core::{AdapterError, Result};
+use raven_railgun_core::{AdapterError, POIStatus, Result};
 
-use super::leaf::PerNodeEncoder;
 use super::{
-    labels, PirTableEncoder, LEAVES_PER_TREE, MIN_RECORD_SIZE, NODE_HASH_BYTES, PATH_RECORD_BYTES,
-    PER_NODE_TOTAL_NODES,
+    labels, materialize_node_shard, materialize_path_shard, node_affected_shards, PirTableEncoder,
+    LEAVES_PER_TREE, MIN_RECORD_SIZE, NODE_HASH_BYTES, PATH_RECORD_BYTES,
 };
-use crate::imt::TREE_DEPTH;
 use crate::inspire::LogicalLeafStore;
 
 /// Status byte for a leaf whose status row is absent.
@@ -17,7 +15,7 @@ use crate::inspire::LogicalLeafStore;
 /// Must not be 0: 0 is `Valid`, the verdict that authorizes a spend, so defaulting to
 /// it fails open. Matches what the plaintext shim returns for the same state
 /// (`poi_shim.rs` maps `None` to `Missing`).
-pub const ABSENT_STATUS_BYTE: u8 = 3;
+pub const ABSENT_STATUS_BYTE: u8 = POIStatus::Missing.wire_byte();
 
 /// Status encoder: row at `list_index` is `[status_byte, bc[0..31]]` padded to
 /// `record_size`. The BC tail lets one query recover verdict and canonical bytes.
@@ -122,20 +120,6 @@ impl PirTableEncoder for PerListStatusEncoder {
         dirty
     }
 
-    fn affected_shards_for_ppoi_status(
-        &self,
-        list_key: &[u8; 32],
-        blinded_commitment: &[u8; 32],
-    ) -> BTreeSet<u32> {
-        let _ = blinded_commitment;
-        if list_key != &self.list_key {
-            return BTreeSet::new();
-        }
-        // Empty is safe: the apply path resolves BC -> idx and calls
-        // `affected_shards_for_ppoi_leaf` itself, which this trait cannot reach.
-        BTreeSet::new()
-    }
-
     fn label(&self) -> &'static str {
         labels::PER_LIST_STATUS
     }
@@ -187,31 +171,12 @@ impl PirTableEncoder for PerListPathEncoder {
     }
 
     fn materialize_shard(&self, shard_id: u32, store: &LogicalLeafStore) -> Vec<u8> {
-        let eps = self.entries_per_shard as usize;
-        let mut buf = vec![0u8; eps.saturating_mul(self.record_size)];
-        let Some(imt) = store.ppoi_imt(&self.list_key) else {
-            return buf;
-        };
-        let leaf_count = imt.leaf_count();
-        let row_start = (shard_id as usize).saturating_mul(eps);
-        for row_offset in 0..eps {
-            let leaf_idx = row_start + row_offset;
-            if leaf_idx >= leaf_count {
-                break;
-            }
-            let Ok(proof) = imt.merkle_proof(leaf_idx) else {
-                continue;
-            };
-            let row_byte_start = row_offset * self.record_size;
-            for (sib_idx, sibling) in proof.elements.iter().enumerate() {
-                let sib_byte_start = row_byte_start + sib_idx * NODE_HASH_BYTES;
-                let sib_byte_end = sib_byte_start + NODE_HASH_BYTES;
-                if let Some(dst) = buf.get_mut(sib_byte_start..sib_byte_end) {
-                    dst.copy_from_slice(sibling);
-                }
-            }
-        }
-        buf
+        materialize_path_shard(
+            store.ppoi_imt(&self.list_key),
+            shard_id,
+            self.entries_per_shard,
+            self.record_size,
+        )
     }
 
     fn affected_shards_for_leaf(&self, _tree: u32, _leaf_index: u32) -> BTreeSet<u32> {
@@ -240,8 +205,8 @@ impl PirTableEncoder for PerListPathEncoder {
     }
 }
 
-/// Per-list node encoder: [`PerNodeEncoder`]'s flat-global-index layout over
-/// the per-list IMT. A leaf insert dirties at most `TREE_DEPTH + 1` rows.
+/// Per-list node encoder using flat-global-index layout over the per-list IMT.
+/// A leaf insert dirties at most `TREE_DEPTH + 1` rows.
 #[derive(Debug, Clone)]
 pub struct PerListNodeEncoder {
     entries_per_shard: u32,
@@ -279,25 +244,11 @@ impl PirTableEncoder for PerListNodeEncoder {
     }
 
     fn materialize_shard(&self, shard_id: u32, store: &LogicalLeafStore) -> Vec<u8> {
-        let eps = self.entries_per_shard as usize;
-        let mut buf = vec![0u8; eps.saturating_mul(NODE_HASH_BYTES)];
-        let imt = store.ppoi_imt(&self.list_key);
-        let row_start_global = u64::from(shard_id) * u64::from(self.entries_per_shard);
-        for row_offset in 0..eps {
-            let flat = row_start_global + u64::try_from(row_offset).unwrap_or(u64::MAX);
-            if flat >= u64::from(PER_NODE_TOTAL_NODES) {
-                break;
-            }
-            let flat_u32 = u32::try_from(flat).unwrap_or(u32::MAX);
-            let (level, idx_at_level) = PerNodeEncoder::level_and_offset(flat_u32);
-            let hash = imt.map_or([0u8; 32], |i| i.node(level as usize, idx_at_level as usize));
-            let byte_start = row_offset * NODE_HASH_BYTES;
-            let byte_end = byte_start + NODE_HASH_BYTES;
-            if let Some(dst) = buf.get_mut(byte_start..byte_end) {
-                dst.copy_from_slice(&hash);
-            }
-        }
-        buf
+        materialize_node_shard(
+            store.ppoi_imt(&self.list_key),
+            shard_id,
+            self.entries_per_shard,
+        )
     }
 
     fn affected_shards_for_leaf(&self, _tree: u32, _leaf_index: u32) -> BTreeSet<u32> {
@@ -305,23 +256,15 @@ impl PirTableEncoder for PerListNodeEncoder {
     }
 
     fn affected_shards_for_ppoi_leaf(&self, list_key: &[u8; 32], list_index: u32) -> BTreeSet<u32> {
-        let mut dirty = BTreeSet::new();
         if list_key != &self.list_key {
             tracing::warn!(
                 target = "raven::pir_table",
                 encoder = "per-list-node",
                 "PerListNodeEncoder received insert for a different list_key; dropped"
             );
-            return dirty;
+            return BTreeSet::new();
         }
-        let depth = u32::try_from(TREE_DEPTH).unwrap_or(u32::MAX);
-        let mut idx = list_index;
-        for level in 0..=depth {
-            let flat = PerNodeEncoder::flat_index(level, idx);
-            dirty.insert(flat / self.entries_per_shard);
-            idx >>= 1;
-        }
-        dirty
+        node_affected_shards(self.entries_per_shard, list_index)
     }
 
     fn label(&self) -> &'static str {

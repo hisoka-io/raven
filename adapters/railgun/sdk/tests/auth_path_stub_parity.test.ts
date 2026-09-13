@@ -71,7 +71,7 @@ describe("shared batch-response encoder round-trips through the SDK's own decode
           res.writeHead(200, {
             "content-type": "application/octet-stream",
             "x-raven-epoch": "1",
-            "x-raven-schema-version": "1",
+            "x-raven-schema-version": "3",
           });
           res.end(Buffer.from(encodeBatchResponseNodes(nodes)));
           return true;

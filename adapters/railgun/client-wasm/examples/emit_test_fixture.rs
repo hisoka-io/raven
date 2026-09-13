@@ -175,6 +175,10 @@ fn main() {
         )
         .expect("respond");
 
+        let resp_bin = resp.to_binary().expect("serialize response");
+        let resp = raven_inspire::ServerResponse::from_binary(&resp_bin)
+            .expect("deserialize response wire");
+
         let plain = extract_response_rust(&crs, &state, &resp, ENTRY_BYTES).expect("extract");
         assert_eq!(
             plain[0],
@@ -202,7 +206,6 @@ fn main() {
         )
         .expect("write plain");
 
-        let resp_bin = bincode::serialize(&resp).expect("serialize response");
         fs::write(out.join(format!("response_for_idx_{idx}.bin")), resp_bin).expect("write resp");
     }
 

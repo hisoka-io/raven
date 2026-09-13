@@ -28,7 +28,7 @@ use raven_railgun_persistence::StoreLayout;
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-auto-spawn-chaos-child";
 const TOY_ENTRIES: usize = 256;
 const TOY_ENTRY_SIZE: usize = 32;
-const ENTRIES_PER_SHARD: u32 = 256;
+const ENTRIES_PER_SHARD: u32 = 2048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PausePoint {

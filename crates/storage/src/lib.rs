@@ -7,13 +7,19 @@
 #![deny(missing_docs)]
 
 pub mod manifest;
+pub mod recovery;
+pub mod retention;
 pub mod snapshot;
 pub mod wal;
 
 use raven_core::InstanceId;
 use std::path::PathBuf;
 
-pub use manifest::{Manifest, MANIFEST_SCHEMA_VERSION, MIN_READABLE_MANIFEST_SCHEMA_VERSION};
+pub use manifest::{
+    Manifest, ManifestShape, MANIFEST_SCHEMA_VERSION, MIN_READABLE_MANIFEST_SCHEMA_VERSION,
+};
+pub use recovery::{open_recovery, StoreRecovery};
+pub use retention::{apply_retention, RetentionPolicy, RetentionReport};
 pub use snapshot::{SnapshotFile, SnapshotHeader, SnapshotId};
 pub use wal::{Wal, WalEntry, WalReplay, WAL_MAX_PAYLOAD_BYTES};
 
@@ -59,6 +65,60 @@ pub enum PersistenceError {
     /// Another process holds `data_dir/.lock`.
     #[error("data_dir is locked by another process: {0}")]
     LockHeld(String),
+
+    /// Current manifest bytes omit the required cell geometry.
+    #[error(
+        "manifest schema v{schema_version} has no cell shape; recover geometry from the owning \
+         snapshot and migrate the manifest, or restore/re-bootstrap this data_dir"
+    )]
+    ManifestShapeMissing {
+        /// Schema version that omitted the shape.
+        schema_version: u32,
+    },
+
+    /// Manifest cell geometry is partial or contains a zero dimension.
+    #[error(
+        "manifest schema v{schema_version} has invalid cell shape: entry_size_bytes={entry_size_bytes:?}, \
+         rows_per_shard={rows_per_shard:?}; both fields must be present and nonzero"
+    )]
+    ManifestShapeInvalid {
+        /// Schema version carrying the invalid shape.
+        schema_version: u32,
+        /// Stored record width, when present.
+        entry_size_bytes: Option<usize>,
+        /// Stored shard row count, when present.
+        rows_per_shard: Option<u64>,
+    },
+
+    /// Persisted and configured/recovered cell geometry disagree.
+    #[error(
+        "manifest cell shape mismatch: stored entry_size_bytes={stored_entry_size_bytes}, \
+         rows_per_shard={stored_rows_per_shard}; configured/recovered entry_size_bytes={configured_entry_size_bytes}, \
+         rows_per_shard={configured_rows_per_shard}. Restore the configuration that created this \
+         data_dir or have it re-bootstrapped; changing geometry does not migrate encoded rows"
+    )]
+    ManifestShapeMismatch {
+        /// Persisted record width.
+        stored_entry_size_bytes: usize,
+        /// Persisted rows per shard.
+        stored_rows_per_shard: u64,
+        /// Configured or snapshot-derived record width.
+        configured_entry_size_bytes: usize,
+        /// Configured or snapshot-derived rows per shard.
+        configured_rows_per_shard: u64,
+    },
+
+    /// Retention could not inspect or remove an owned path.
+    #[error("retention {operation} failed for {}: {source}", path.display())]
+    RetentionIo {
+        /// Operation being attempted.
+        operation: &'static str,
+        /// Path the operation targeted.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl From<bincode::Error> for PersistenceError {
@@ -84,14 +144,33 @@ pub struct StoreLayout {
 }
 
 impl StoreLayout {
+    /// Compute all store paths without reading or creating the root.
+    ///
+    /// Use this for inspection/export. Passing the returned layout to a writer
+    /// still performs that writer's documented filesystem operations.
+    ///
+    /// ```
+    /// use raven_storage::StoreLayout;
+    /// let dir = tempfile::tempdir()?;
+    /// let missing = dir.path().join("missing");
+    /// let layout = StoreLayout::inspect(&missing);
+    /// assert!(!layout.root().exists());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn inspect(data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+        }
+    }
+
     /// Creates subdirs if absent. Takes no lock, so concurrent writers can
     /// corrupt the WAL; prefer [`StoreLayout::open_with_lock`].
     pub fn open(data_dir: impl Into<PathBuf>) -> Result<Self> {
-        let data_dir = data_dir.into();
-        std::fs::create_dir_all(&data_dir)?;
-        std::fs::create_dir_all(data_dir.join("snapshots"))?;
-        std::fs::create_dir_all(data_dir.join("wal").join("archived"))?;
-        Ok(Self { data_dir })
+        let layout = Self::inspect(data_dir);
+        std::fs::create_dir_all(layout.root())?;
+        std::fs::create_dir_all(layout.snapshots_dir())?;
+        std::fs::create_dir_all(layout.archived_wals_dir())?;
+        Ok(layout)
     }
 
     /// As [`StoreLayout::open`], plus an exclusive advisory lock released on
@@ -112,31 +191,85 @@ impl StoreLayout {
         self.data_dir.join("manifest.json")
     }
 
+    /// `data_dir/snapshots`.
+    pub fn snapshots_dir(&self) -> PathBuf {
+        self.data_dir.join("snapshots")
+    }
+
+    /// `data_dir/wal`.
+    pub fn wal_dir(&self) -> PathBuf {
+        self.data_dir.join("wal")
+    }
+
+    /// `data_dir/wal/archived`.
+    pub fn archived_wals_dir(&self) -> PathBuf {
+        self.wal_dir().join("archived")
+    }
+
     /// `data_dir/wal/current.log`.
     pub fn wal_current_path(&self) -> PathBuf {
-        self.data_dir.join("wal").join("current.log")
+        self.wal_dir().join("current.log")
     }
 
     /// Archived WAL path for the sealed seq range `[from_seq, to_seq]`.
     pub fn wal_archived_path(&self, from_seq: u64, to_seq: u64) -> PathBuf {
-        self.data_dir
-            .join("wal")
-            .join("archived")
+        self.archived_wals_dir()
             .join(format!("seq-{from_seq:020}-{to_seq:020}.log"))
     }
 
     /// Snapshot directory for the given id.
     pub fn snapshot_dir(&self, id: SnapshotId) -> PathBuf {
-        self.data_dir
-            .join("snapshots")
-            .join(format!("snap-{:06}", id.0))
+        self.snapshots_dir().join(format!("snap-{:06}", id.0))
+    }
+
+    /// Header file for a snapshot id.
+    pub fn snapshot_header_path(&self, id: SnapshotId) -> PathBuf {
+        self.snapshot_dir(id).join("header.bin")
+    }
+
+    /// Payload file for a snapshot id.
+    pub fn snapshot_data_path(&self, id: SnapshotId) -> PathBuf {
+        self.snapshot_dir(id).join("data.bincode")
     }
 }
 
-/// Write to `path.tmp`, fsync, rename, fsync parent. The parent fsync is what
-/// makes the same-fs atomic rename durable across a crash.
-pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+/// Atomically replaces a file and durably publishes its directory entry.
+///
+/// Missing parent directories are created. The sibling scratch file uses a
+/// process-and-sequence suffix and mode `0o600` on Unix.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error from directory creation, writing, syncing,
+/// or renaming.
+///
+/// # Examples
+///
+/// ```
+/// let dir = tempfile::tempdir()?;
+/// let path = dir.path().join("nested").join("state.bin");
+/// raven_storage::atomic_write(&path, b"state")?;
+/// assert_eq!(std::fs::read(path)?, b"state");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "write path has no parent")
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "write path has no file name",
+        )
+    })?;
+    let mut tmp_name = file_name.to_owned();
+    tmp_name.push(format!(
+        ".tmp.{:x}.{}",
+        std::process::id(),
+        next_atomic_write_seq()
+    ));
+    let tmp = path.with_file_name(tmp_name);
     {
         use std::io::Write;
         let mut f = create_owner_only(&tmp)?;
@@ -144,28 +277,32 @@ pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
-    if let Some(parent) = path.parent() {
-        fsync_parent_dir(parent)?;
-    }
+    fsync_parent_dir(parent)?;
     Ok(())
+}
+
+fn next_atomic_write_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Mode 0o600 on Unix, blocking local tampering between fsync and restart on
 /// multi-tenant hosts. Elsewhere the parent directory's ACLs apply.
-pub(crate) fn create_owner_only(path: &std::path::Path) -> Result<std::fs::File> {
+pub(crate) fn create_owner_only(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        Ok(std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(path)?)
+            .open(path)
     }
     #[cfg(not(unix))]
     {
-        Ok(std::fs::File::create(path)?)
+        std::fs::File::create(path)
     }
 }
 
@@ -212,22 +349,42 @@ impl ExclusiveLock {
     }
 }
 
-/// Tolerates EINVAL (FSes that disallow dir fsync), `Unsupported`
-/// (WSL2/virtio-fs) and `PermissionDenied`; propagates everything else.
-pub(crate) fn fsync_parent_dir(parent: &std::path::Path) -> Result<()> {
+/// Syncs a directory after creating, renaming, or removing one of its entries.
+///
+/// `EINVAL`, [`std::io::ErrorKind::Unsupported`], and failure to open the
+/// directory due to [`std::io::ErrorKind::PermissionDenied`] are tolerated for
+/// filesystems that do not permit directory syncing.
+///
+/// # Errors
+///
+/// Returns any other error from opening or syncing the directory.
+///
+/// # Examples
+///
+/// ```
+/// let dir = tempfile::tempdir()?;
+/// std::fs::write(dir.path().join("state.bin"), b"state")?;
+/// raven_storage::fsync_parent_dir(dir.path())?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn fsync_parent_dir(parent: &std::path::Path) -> std::io::Result<()> {
     match std::fs::File::open(parent) {
-        Ok(dir) => match dir.sync_all() {
-            Ok(()) => Ok(()),
-            Err(e)
-                if matches!(e.raw_os_error(), Some(22))
-                    || matches!(e.kind(), std::io::ErrorKind::Unsupported) =>
-            {
-                Ok(())
-            }
-            Err(e) => Err(PersistenceError::Io(e)),
-        },
+        Ok(dir) => normalize_parent_sync_result(dir.sync_all()),
         Err(e) if matches!(e.kind(), std::io::ErrorKind::PermissionDenied) => Ok(()),
-        Err(e) => Err(PersistenceError::Io(e)),
+        Err(e) => Err(e),
+    }
+}
+
+fn normalize_parent_sync_result(sync_result: std::io::Result<()>) -> std::io::Result<()> {
+    match sync_result {
+        Ok(()) => Ok(()),
+        Err(e)
+            if matches!(e.raw_os_error(), Some(22))
+                || matches!(e.kind(), std::io::ErrorKind::Unsupported) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -344,6 +501,36 @@ mod tests {
         assert_eq!(read, b"second");
     }
 
+    #[test]
+    fn atomic_write_ignores_legacy_fixed_tmp_collision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("manifest.json");
+        let fixed_tmp = path.with_extension("tmp");
+        std::fs::create_dir(&fixed_tmp).expect("reserve fixed tmp path");
+
+        atomic_write(&path, b"new manifest").expect("unique tmp path must avoid collision");
+
+        assert_eq!(std::fs::read(&path).expect("read final"), b"new manifest");
+        assert!(fixed_tmp.is_dir(), "fixed tmp sentinel must be untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("secret.bin");
+        atomic_write(&path, b"secret").expect("write");
+
+        let mode = std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
     fn publish_fixture() -> (tempfile::TempDir, StoreLayout, Wal, Manifest) {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = StoreLayout::open(dir.path()).expect("open");
@@ -360,6 +547,8 @@ mod tests {
             current_marker: 0,
             encoder_label: "test-encoder".to_owned(),
             prev_encoder_label: None,
+            entry_size_bytes: Some(32),
+            rows_per_shard: Some(2048),
         };
         (dir, layout, wal, manifest)
     }
@@ -556,25 +745,25 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("does-not-exist");
         let err = fsync_parent_dir(&missing).expect_err("missing parent must error");
-        match err {
-            PersistenceError::Io(io_err) => {
-                assert_eq!(io_err.kind(), std::io::ErrorKind::NotFound);
-            }
-            other => panic!("expected PersistenceError::Io, got {other:?}"),
-        }
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
-    fn atomic_write_errors_on_missing_grandparent() {
+    fn unsupported_parent_sync_is_tolerated() {
+        let unsupported = std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "directory fsync unsupported",
+        );
+        normalize_parent_sync_result(Err(unsupported))
+            .expect("unsupported directory fsync must be tolerated");
+    }
+
+    #[test]
+    fn atomic_write_creates_missing_parent_directories() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("does-not-exist").join("file.bin");
-        let err = atomic_write(&path, b"payload").expect_err("missing grandparent must error");
-        match err {
-            PersistenceError::Io(io_err) => {
-                assert_eq!(io_err.kind(), std::io::ErrorKind::NotFound);
-            }
-            other => panic!("expected Io, got {other:?}"),
-        }
+        atomic_write(&path, b"payload").expect("missing parents must be created");
+        assert_eq!(std::fs::read(path).expect("read final"), b"payload");
     }
 
     #[test]

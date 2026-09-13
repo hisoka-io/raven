@@ -31,9 +31,30 @@ pub use ws::{
 pub use alloy::eips::BlockId;
 pub use alloy::eips::BlockNumberOrTag;
 
+/// Subscription stream whose receiver stopped or lost buffered frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SubscriptionStream {
+    /// `eth_subscribe(newHeads)` frames.
+    Heads,
+    /// `eth_subscribe(logs)` frames.
+    Logs,
+}
+
+impl std::fmt::Display for SubscriptionStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Heads => f.write_str("newHeads"),
+            Self::Logs => f.write_str("logs"),
+        }
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum IndexerError {
+    /// Legacy opaque RPC error. New provider boundaries retain their typed source in
+    /// [`Provider`](Self::Provider).
     #[error("rpc error: {0}")]
     Rpc(String),
     #[error("decode error: {0}")]
@@ -49,8 +70,70 @@ pub enum IndexerError {
     Startup(String),
     #[error("source closed")]
     Closed,
+    /// Legacy opaque Alloy error. New URL and provider failures use dedicated variants.
     #[error("alloy error: {0}")]
     Alloy(String),
+    /// Typed Alloy provider failure with operation context.
+    #[error("provider error during {operation}: {source}")]
+    Provider {
+        /// RPC operation that failed.
+        operation: &'static str,
+        /// Structured Alloy JSON-RPC or transport error.
+        #[source]
+        source: alloy::transports::TransportError,
+    },
+    /// An RPC operation exceeded Raven's bounded attempt duration.
+    #[error(
+        "RPC timeout during {operation}; endpoint accepted the connection but did not answer \
+         before the configured deadline"
+    )]
+    Timeout {
+        /// RPC operation that timed out.
+        operation: &'static str,
+    },
+    /// A subscription channel closed and cannot yield more frames.
+    #[error("{stream} subscription closed")]
+    SubscriptionClosed {
+        /// Stream that closed.
+        stream: SubscriptionStream,
+    },
+    /// A subscription receiver lagged and lost buffered frames.
+    #[error("{stream} subscription lagged by {skipped} frames")]
+    SubscriptionLagged {
+        /// Stream that lost frames.
+        stream: SubscriptionStream,
+        /// Number of frames reported lost by the broadcast receiver.
+        skipped: u64,
+    },
+    /// A valid RPC response did not contain the requested chain object yet.
+    #[error("{operation}: RPC value unavailable")]
+    Unavailable {
+        /// Operation whose value was absent.
+        operation: String,
+    },
+    /// A local caller violated a `ChainSource` input contract.
+    #[error("contract violation during {operation}: {reason}")]
+    ContractViolation {
+        /// Operation whose precondition was violated.
+        operation: &'static str,
+        /// Actionable description of the invalid input.
+        reason: String,
+    },
+    /// Operator-supplied RPC URL failed to parse.
+    #[error("invalid RPC URL: {0}")]
+    InvalidRpcUrl(String),
+    /// RPC endpoint pool could not supply a usable endpoint.
+    #[error(transparent)]
+    Pool(rpc_pool::PoolError),
+    /// Operation context that preserves the underlying typed classification.
+    #[error("{operation}: {source}")]
+    Context {
+        /// Higher-level operation that was in progress.
+        operation: &'static str,
+        /// Typed underlying error.
+        #[source]
+        source: Box<IndexerError>,
+    },
     #[error(
         "chain id mismatch: configured {expected}, RPC reports {actual}; \
          operator pointed adapter at the wrong network"
@@ -78,7 +161,189 @@ pub enum IndexerError {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexerFailureClass {
+    RateLimited,
+    RemoteTransient,
+    RemoteServer,
+    Transport,
+    UnsupportedCapability,
+    InvalidRequest,
+    ProtocolDecode,
+    RemoteMalformedResponse,
+    Unavailable,
+    LocalConfiguration,
+    LocalContract,
+    ChainMismatch,
+    Integrity,
+    Closed,
+    RemoteOther,
+    LegacyOpaque,
+}
+
+impl IndexerError {
+    pub(crate) fn provider(
+        operation: &'static str,
+        source: alloy::transports::TransportError,
+    ) -> Self {
+        Self::Provider { operation, source }
+    }
+
+    pub(crate) fn context(operation: &'static str, source: Self) -> Self {
+        Self::Context {
+            operation,
+            source: Box::new(source),
+        }
+    }
+
+    pub(crate) fn failure_class(&self) -> IndexerFailureClass {
+        use alloy::transports::{RpcError, TransportErrorKind};
+        use IndexerFailureClass as C;
+
+        match self {
+            Self::Rpc(_) | Self::Alloy(_) => C::LegacyOpaque,
+            Self::Decode(_) => C::ProtocolDecode,
+            Self::Provider { source, .. } => match source {
+                RpcError::ErrorResp(payload) => classify_error_response(payload.code),
+                RpcError::NullResp => C::Unavailable,
+                RpcError::UnsupportedFeature(_) => C::UnsupportedCapability,
+                RpcError::LocalUsageError(_) | RpcError::SerError(_) => C::LocalContract,
+                RpcError::DeserError { .. } => C::RemoteMalformedResponse,
+                RpcError::Transport(kind) => match kind {
+                    TransportErrorKind::MissingBatchResponse(_) => C::Unavailable,
+                    TransportErrorKind::BackendGone | TransportErrorKind::Custom(_) => C::Transport,
+                    TransportErrorKind::PubsubUnavailable => C::UnsupportedCapability,
+                    TransportErrorKind::HttpError(error) => classify_http_status(error.status),
+                    _ => C::RemoteOther,
+                },
+            },
+            Self::Timeout { .. }
+            | Self::SubscriptionClosed { .. }
+            | Self::SubscriptionLagged { .. } => C::Transport,
+            Self::Unavailable { .. } => C::Unavailable,
+            Self::ContractViolation { .. } => C::LocalContract,
+            Self::InvalidRpcUrl(_) => C::LocalConfiguration,
+            Self::Pool(error) => match error {
+                rpc_pool::PoolError::Exhausted => C::Unavailable,
+                rpc_pool::PoolError::Empty
+                | rpc_pool::PoolError::InvalidEndpointConfig { .. }
+                | rpc_pool::PoolError::DuplicateEndpoint { .. } => C::LocalConfiguration,
+            },
+            Self::Context { source, .. } => source.failure_class(),
+            Self::ChainIdMismatch { .. } => C::ChainMismatch,
+            Self::ReorgTooDeep(_)
+            | Self::ReorgFence { .. }
+            | Self::Startup(_)
+            | Self::ReorgWindowMiss { .. } => C::Integrity,
+            Self::Closed => C::Closed,
+        }
+    }
+}
+
+fn classify_http_status(status: u16) -> IndexerFailureClass {
+    use IndexerFailureClass as C;
+    match status {
+        429 => C::RateLimited,
+        408 | 425 => C::RemoteTransient,
+        500..=599 => C::RemoteServer,
+        400..=499 => C::InvalidRequest,
+        _ => C::RemoteOther,
+    }
+}
+
+fn classify_error_response(code: i64) -> IndexerFailureClass {
+    use IndexerFailureClass as C;
+    match code {
+        429 | -32005 | -32016 | -32012 | -32007 | 1008 | -32055 => C::RateLimited,
+        408 | 425 => C::RemoteTransient,
+        500..=599 | -32603 | -32099..=-32000 => C::RemoteServer,
+        -32601 => C::UnsupportedCapability,
+        -32700 | -32600 | -32602 => C::InvalidRequest,
+        _ => C::RemoteOther,
+    }
+}
+
 pub type Result<T, E = IndexerError> = core::result::Result<T, E>;
+
+/// Exponential retry schedule shared by adapter network clients.
+///
+/// The caller keeps ownership of error classification and decides whether the delay is
+/// applied before a retry or after a failed attempt.
+///
+/// ```
+/// use std::time::Duration;
+/// use raven_railgun_indexer::RetryPolicy;
+///
+/// let policy = RetryPolicy::exponential(
+///     4,
+///     Duration::from_secs(30),
+///     Duration::from_secs(2),
+///     Duration::from_secs(8),
+///     None,
+/// );
+/// assert_eq!(policy.backoff_before_attempt(2), Some(Duration::from_secs(4)));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    max_attempts: u32,
+    attempt_timeout: std::time::Duration,
+    initial_backoff: std::time::Duration,
+    max_backoff: std::time::Duration,
+    total_timeout: Option<std::time::Duration>,
+}
+
+impl RetryPolicy {
+    /// Construct a capped exponential policy.
+    #[must_use]
+    pub const fn exponential(
+        max_attempts: u32,
+        attempt_timeout: std::time::Duration,
+        initial_backoff: std::time::Duration,
+        max_backoff: std::time::Duration,
+        total_timeout: Option<std::time::Duration>,
+    ) -> Self {
+        Self {
+            max_attempts,
+            attempt_timeout,
+            initial_backoff,
+            max_backoff,
+            total_timeout,
+        }
+    }
+
+    /// Number of calls permitted, including the first call.
+    #[must_use]
+    pub const fn max_attempts(self) -> u32 {
+        self.max_attempts
+    }
+
+    /// Bound applied to one network call.
+    #[must_use]
+    pub const fn attempt_timeout(self) -> std::time::Duration {
+        self.attempt_timeout
+    }
+
+    /// Optional wall-clock bound across all attempts and delays.
+    #[must_use]
+    pub const fn total_timeout(self) -> Option<std::time::Duration> {
+        self.total_timeout
+    }
+
+    /// Delay after a zero-based failed attempt.
+    #[must_use]
+    pub fn backoff_after_failure(self, attempt: u32) -> std::time::Duration {
+        let multiplier = 1u32 << attempt.min(31);
+        self.initial_backoff
+            .saturating_mul(multiplier)
+            .min(self.max_backoff)
+    }
+
+    /// Delay before a zero-based attempt; the first attempt has no delay.
+    #[must_use]
+    pub fn backoff_before_attempt(self, attempt: u32) -> Option<std::time::Duration> {
+        (attempt > 0).then(|| self.backoff_after_failure(attempt - 1))
+    }
+}
 
 /// Maximum blocks per `eth_getLogs` chunk. Mirrors Railgun TS engine's `SCAN_CHUNKS = 499`.
 pub const SCAN_CHUNK_BLOCKS: u64 = 499;
@@ -92,6 +357,14 @@ pub const RPC_TIMEOUT_SECS: u64 = 5;
 
 /// Maximum cumulative retry elapsed time (seconds) before surfacing the last error.
 pub const MAX_RPC_TOTAL_ELAPSED_SECS: u64 = 90;
+
+const RPC_RETRY_POLICY: RetryPolicy = RetryPolicy::exponential(
+    MAX_RPC_RETRIES,
+    std::time::Duration::from_secs(RPC_TIMEOUT_SECS),
+    std::time::Duration::from_millis(100),
+    std::time::Duration::from_secs(30),
+    Some(std::time::Duration::from_secs(MAX_RPC_TOTAL_ELAPSED_SECS)),
+);
 
 /// Default polling cadence (seconds).
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 10;
@@ -224,11 +497,11 @@ impl RpcChainSource {
                 let url = self
                     .rpc_url
                     .parse::<reqwest::Url>()
-                    .map_err(|e| IndexerError::Alloy(format!("invalid rpc_url: {e}")))?;
+                    .map_err(|e| IndexerError::InvalidRpcUrl(e.to_string()))?;
                 let provider = alloy::providers::ProviderBuilder::new().connect_http(url);
                 let actual = alloy::providers::Provider::get_chain_id(&provider)
                     .await
-                    .map_err(|e| IndexerError::Rpc(format!("eth_chainId: {e}")))?;
+                    .map_err(|e| IndexerError::provider("eth_chainId", e))?;
                 if actual != self.chain_id {
                     return Err(IndexerError::ChainIdMismatch {
                         expected: self.chain_id,
@@ -243,6 +516,76 @@ impl RpcChainSource {
     }
 }
 
+fn event_filter(
+    railgun_proxy: alloy::primitives::Address,
+    from_block: u64,
+    to_block: u64,
+) -> Result<alloy::rpc::types::eth::Filter> {
+    if to_block < from_block {
+        return Ok(alloy::rpc::types::eth::Filter::new()
+            .address(railgun_proxy)
+            .from_block(from_block)
+            .to_block(to_block));
+    }
+    let span = to_block.saturating_sub(from_block).saturating_add(1);
+    if span > SCAN_CHUNK_BLOCKS {
+        return Err(IndexerError::ContractViolation {
+            operation: "events_in_range",
+            reason: format!(
+                "span={span} blocks; caller must chunk to <= \
+                 SCAN_CHUNK_BLOCKS={SCAN_CHUNK_BLOCKS} per the trait contract"
+            ),
+        });
+    }
+
+    use alloy::sol_types::SolEvent;
+    let topic0 = [
+        abi::Shield::SIGNATURE_HASH,
+        abi::Transact::SIGNATURE_HASH,
+        abi::Unshield::SIGNATURE_HASH,
+        abi::Nullified::SIGNATURE_HASH,
+    ];
+    Ok(alloy::rpc::types::eth::Filter::new()
+        .address(railgun_proxy)
+        .from_block(from_block)
+        .to_block(to_block)
+        .event_signature(topic0.to_vec()))
+}
+
+fn decode_logs(logs: Vec<alloy::rpc::types::eth::Log>) -> Result<Vec<RailgunEvent>> {
+    let mut events = Vec::with_capacity(logs.len());
+    for log in logs {
+        let Some(block_number) = block_number_or_drop(&log) else {
+            continue;
+        };
+        let tx_hash = log.transaction_hash.map_or([0u8; 32], |hash| hash.0);
+        let primary_topic = log.topic0().copied().unwrap_or_default();
+        if let Some(event) =
+            decode_log_to_railgun_event(primary_topic, &log, block_number, tx_hash)?
+        {
+            events.push(event);
+        }
+    }
+    Ok(events)
+}
+
+async fn fetch_events_in_range<F, Fut>(
+    railgun_proxy: alloy::primitives::Address,
+    from_block: u64,
+    to_block: u64,
+    fetch_logs: F,
+) -> Result<Vec<RailgunEvent>>
+where
+    F: FnOnce(alloy::rpc::types::eth::Filter) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<alloy::rpc::types::eth::Log>>>,
+{
+    if to_block < from_block {
+        return Ok(Vec::new());
+    }
+    let filter = event_filter(railgun_proxy, from_block, to_block)?;
+    decode_logs(fetch_logs(filter).await?)
+}
+
 #[async_trait]
 impl ChainSource for RpcChainSource {
     async fn latest_block(&self) -> Result<u64> {
@@ -250,61 +593,32 @@ impl ChainSource for RpcChainSource {
         let block = retry_rpc(|| async {
             p.get_block_by_number(alloy::eips::BlockNumberOrTag::Finalized)
                 .await
-                .map_err(|e| IndexerError::Rpc(format!("get_block_by_number(finalized): {e}")))
+                .map_err(|e| IndexerError::provider("get_block_by_number(finalized)", e))
         })
         .await?;
-        let block = block.ok_or_else(|| {
-            IndexerError::Rpc("finalized block not yet available; chain too young".into())
+        let block = block.ok_or(IndexerError::Unavailable {
+            operation: "get_block_by_number(finalized): chain may be too young".into(),
         })?;
         Ok(block.header.number)
     }
 
     async fn events_in_range(&self, from_block: u64, to_block: u64) -> Result<Vec<RailgunEvent>> {
-        if to_block < from_block {
-            return Ok(Vec::new());
-        }
-        let span = to_block.saturating_sub(from_block).saturating_add(1);
-        if span > SCAN_CHUNK_BLOCKS {
-            return Err(IndexerError::Rpc(format!(
-                "events_in_range called with span={span} blocks; caller must chunk \
-                 to <= SCAN_CHUNK_BLOCKS={SCAN_CHUNK_BLOCKS} per the trait contract"
-            )));
-        }
-        let p = self.provider().await?;
-
-        use alloy::sol_types::SolEvent;
-        let topic0 = [
-            abi::Shield::SIGNATURE_HASH,
-            abi::Transact::SIGNATURE_HASH,
-            abi::Unshield::SIGNATURE_HASH,
-            abi::Nullified::SIGNATURE_HASH,
-        ];
-        let filter = alloy::rpc::types::eth::Filter::new()
-            .address(self.railgun_proxy)
-            .from_block(from_block)
-            .to_block(to_block)
-            .event_signature(topic0.to_vec());
-
-        let logs = retry_rpc(|| async {
-            p.get_logs(&filter)
+        fetch_events_in_range(
+            self.railgun_proxy,
+            from_block,
+            to_block,
+            |filter| async move {
+                let provider = self.provider().await?;
+                retry_rpc(|| async {
+                    provider
+                        .get_logs(&filter)
+                        .await
+                        .map_err(|error| IndexerError::provider("get_logs", error))
+                })
                 .await
-                .map_err(|e| IndexerError::Rpc(format!("get_logs: {e}")))
-        })
-        .await?;
-
-        let mut events = Vec::with_capacity(logs.len());
-        for log in logs {
-            let Some(block_number) = block_number_or_drop(&log) else {
-                continue;
-            };
-            let tx_hash = log.transaction_hash.map_or([0u8; 32], |h| h.0);
-            let primary_topic = log.topic0().copied().unwrap_or_default();
-            let event = decode_log_to_railgun_event(primary_topic, &log, block_number, tx_hash)?;
-            if let Some(e) = event {
-                events.push(e);
-            }
-        }
-        Ok(events)
+            },
+        )
+        .await
     }
 
     async fn root_history(
@@ -332,7 +646,7 @@ impl ChainSource for RpcChainSource {
             }
             call_builder
                 .await
-                .map_err(|e| IndexerError::Rpc(format!("eth_call rootHistory: {e}")))
+                .map_err(|e| IndexerError::provider("eth_call rootHistory", e))
         })
         .await?;
         let decoded = abi::rootHistoryCall::abi_decode_returns(&result_bytes)
@@ -345,11 +659,12 @@ impl ChainSource for RpcChainSource {
         let block = retry_rpc(|| async {
             p.get_block_by_number(alloy::eips::BlockNumberOrTag::Number(block_number))
                 .await
-                .map_err(|e| IndexerError::Rpc(format!("get_block_by_number({block_number}): {e}")))
+                .map_err(|e| IndexerError::provider("get_block_by_number(number)", e))
         })
         .await?;
-        let block = block
-            .ok_or_else(|| IndexerError::Rpc(format!("block {block_number} not yet available")))?;
+        let block = block.ok_or(IndexerError::Unavailable {
+            operation: format!("get_block_by_number({block_number})"),
+        })?;
         Ok(block.header.hash.0)
     }
 
@@ -370,7 +685,7 @@ impl ChainSource for RpcChainSource {
             }
             call_builder
                 .await
-                .map_err(|e| IndexerError::Rpc(format!("eth_call merkleRoot: {e}")))
+                .map_err(|e| IndexerError::provider("eth_call merkleRoot", e))
         })
         .await?;
         let decoded = abi::merkleRootCall::abi_decode_returns(&result_bytes)
@@ -395,7 +710,7 @@ impl ChainSource for RpcChainSource {
             }
             call_builder
                 .await
-                .map_err(|e| IndexerError::Rpc(format!("eth_call treeNumber: {e}")))
+                .map_err(|e| IndexerError::provider("eth_call treeNumber", e))
         })
         .await?;
         let decoded = abi::treeNumberCall::abi_decode_returns(&result_bytes)
@@ -1413,33 +1728,19 @@ pub async fn detect_reorg_layer1<S: ChainSource + ?Sized>(
     Err(IndexerError::ReorgTooDeep(cursor))
 }
 
-/// Returns true if an `IndexerError` should NOT be retried.
-///
-/// HTTP 4xx (non-transient), "method not found", and JSON decode errors are
-/// operator-visible misconfigurations that retrying only delays surfacing.
+/// Returns true when repeating the same endpoint cannot add evidence.
 fn is_non_retryable(err: &IndexerError) -> bool {
-    let s = format!("{err}");
-    let lower = s.to_lowercase();
-    let four_xx_transient = ["408", "425", "429"];
-    let is_4xx = (400..500).any(|code| {
-        lower.contains(&format!(" {code}"))
-            || lower.contains(&format!("status {code}"))
-            || lower.contains(&format!("status: {code}"))
-    });
-    let is_transient_4xx = four_xx_transient.iter().any(|c| lower.contains(c));
-    if is_4xx && !is_transient_4xx {
-        return true;
-    }
-    if lower.contains("method not supported")
-        || lower.contains("method not found")
-        || lower.contains("unsupported method")
-    {
-        return true;
-    }
-    if lower.contains("decode") && lower.contains("json") {
-        return true;
-    }
-    false
+    matches!(
+        err.failure_class(),
+        IndexerFailureClass::UnsupportedCapability
+            | IndexerFailureClass::InvalidRequest
+            | IndexerFailureClass::ProtocolDecode
+            | IndexerFailureClass::LocalConfiguration
+            | IndexerFailureClass::LocalContract
+            | IndexerFailureClass::ChainMismatch
+            | IndexerFailureClass::Integrity
+            | IndexerFailureClass::Closed
+    )
 }
 
 /// Bound one RPC attempt by [`RPC_TIMEOUT_SECS`].
@@ -1451,27 +1752,23 @@ fn is_non_retryable(err: &IndexerError) -> bool {
 /// `indexer_lag_blocks`, the gauge FROZE at its last healthy value instead of growing -
 /// ingestion dead, every operator signal green.
 ///
-/// The message contains "timeout", which both existing classifiers already match
-/// (`classify_indexer_error` -> `ErrorKind::Network`, `is_ws_transport_error` -> true), so
-/// failover and cooldown work without touching either.
+/// The typed timeout class drives retry, pool cooldown and WS fallback without
+/// depending on rendered error text.
 pub(crate) async fn with_rpc_timeout<T>(
-    label: &str,
+    label: &'static str,
     fut: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     match tokio::time::timeout(std::time::Duration::from_secs(RPC_TIMEOUT_SECS), fut).await {
         Ok(r) => r,
-        Err(_) => Err(IndexerError::Rpc(format!(
-            "timeout after {RPC_TIMEOUT_SECS}s on {label}; the endpoint accepted the \
-             connection and never answered"
-        ))),
+        Err(_) => Err(IndexerError::Timeout { operation: label }),
     }
 }
 
 /// Exponential-backoff retry helper for RPC calls.
 ///
 /// Bounded by [`MAX_RPC_RETRIES`] and [`MAX_RPC_TOTAL_ELAPSED_SECS`]. Per-attempt timeout
-/// is [`RPC_TIMEOUT_SECS`]. Non-retryable errors (HTTP 4xx, JSON decode, "method not found")
-/// fail-fast without consuming the retry budget.
+/// is [`RPC_TIMEOUT_SECS`]. Invalid requests and application decode failures fail fast;
+/// incomplete provider responses retain the bounded retry path.
 async fn retry_rpc<F, Fut, T>(mut op: F) -> Result<T>
 where
     F: FnMut() -> Fut,
@@ -1479,10 +1776,11 @@ where
 {
     use tokio::time::{sleep, timeout, Duration};
     let started = std::time::Instant::now();
-    let total_cap = Duration::from_secs(MAX_RPC_TOTAL_ELAPSED_SECS);
+    let policy = RPC_RETRY_POLICY;
+    let total_cap = policy.total_timeout().unwrap_or(Duration::MAX);
     let mut last_err: Option<IndexerError> = None;
-    for attempt in 0..MAX_RPC_RETRIES {
-        match timeout(Duration::from_secs(RPC_TIMEOUT_SECS), op()).await {
+    for attempt in 0..policy.max_attempts() {
+        match timeout(policy.attempt_timeout(), op()).await {
             Ok(Ok(v)) => return Ok(v),
             Ok(Err(e)) => {
                 tracing::warn!(attempt, error = %e, "RPC attempt failed");
@@ -1494,9 +1792,9 @@ where
             }
             Err(_) => {
                 tracing::warn!(attempt, "RPC attempt timed out");
-                last_err = Some(IndexerError::Rpc(format!(
-                    "timeout after {RPC_TIMEOUT_SECS}s on attempt {attempt}"
-                )));
+                last_err = Some(IndexerError::Timeout {
+                    operation: "single-endpoint RPC attempt",
+                });
             }
         }
         if started.elapsed() >= total_cap {
@@ -1506,12 +1804,13 @@ where
             );
             break;
         }
-        let backoff_ms = 100u64.saturating_mul(1u64 << attempt.min(8));
-        let backoff = Duration::from_millis(backoff_ms.min(30_000));
+        let backoff = policy.backoff_after_failure(attempt);
         let remaining = total_cap.saturating_sub(started.elapsed());
         sleep(backoff.min(remaining)).await;
     }
-    Err(last_err.unwrap_or_else(|| IndexerError::Rpc("retry exhausted".into())))
+    Err(last_err.unwrap_or(IndexerError::Unavailable {
+        operation: "single-endpoint retry chain".into(),
+    }))
 }
 
 /// Alloy `sol!`-generated types for Railgun's V2 contract events and supporting structs.
@@ -1591,6 +1890,61 @@ mod tests {
         assert_eq!(src.rpc_url(), "https://eth.example/v1");
         assert_eq!(src.railgun_proxy(), &proxy);
         assert_eq!(src.chain_id(), 1);
+    }
+
+    #[test]
+    fn rpc_retry_attempts_and_backoff_schedule_are_pinned() {
+        let delays = (0..RPC_RETRY_POLICY.max_attempts())
+            .map(|attempt| RPC_RETRY_POLICY.backoff_after_failure(attempt))
+            .collect::<Vec<_>>();
+        assert_eq!(RPC_RETRY_POLICY.max_attempts(), 6);
+        assert_eq!(
+            delays,
+            [100, 200, 400, 800, 1_600, 3_200].map(std::time::Duration::from_millis)
+        );
+        assert_eq!(
+            RPC_RETRY_POLICY.attempt_timeout(),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            RPC_RETRY_POLICY.total_timeout(),
+            Some(std::time::Duration::from_secs(90))
+        );
+    }
+
+    #[test]
+    fn single_endpoint_policy_distinguishes_remote_and_application_decode() {
+        let parse_error = serde_json::from_str::<serde_json::Value>("{")
+            .expect_err("the malformed control must fail JSON decoding");
+        let remote = IndexerError::provider(
+            "test response",
+            alloy::transports::TransportError::deser_err(parse_error, "{"),
+        );
+        let application = IndexerError::Decode("malformed event".into());
+
+        assert!(
+            !is_non_retryable(&remote),
+            "an incomplete provider response must retain the bounded retry path"
+        );
+        assert!(
+            is_non_retryable(&application),
+            "repeating protocol-invalid bytes against the same endpoint cannot add evidence"
+        );
+    }
+
+    #[test]
+    fn json_rpc_parse_error_is_an_invalid_request_not_a_response_decode() {
+        let error = IndexerError::provider(
+            "test request",
+            alloy::transports::TransportError::deser_err(
+                serde_json::from_str::<serde_json::Value>("{")
+                    .expect_err("the malformed control must fail JSON decoding"),
+                r#"{"code":-32700,"message":"Parse error"}"#,
+            ),
+        );
+
+        assert_eq!(error.failure_class(), IndexerFailureClass::InvalidRequest);
+        assert!(is_non_retryable(&error));
     }
 
     #[test]

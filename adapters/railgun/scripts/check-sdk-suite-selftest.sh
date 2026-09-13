@@ -38,16 +38,30 @@ if [[ ! -d "${SDK}/node_modules" ]]; then
 fi
 
 work="${SCRATCH}/copy-$$"
+fanout_work="${SCRATCH}/fanout-copy-$$"
+pristine_json="${SCRATCH}/pristine-$$.json"
+pristine_err="${SCRATCH}/pristine-$$.err"
+fanout_green_json="${SCRATCH}/fanout-green-$$.json"
+fanout_green_err="${SCRATCH}/fanout-green-$$.err"
+fanout_red_json="${SCRATCH}/fanout-red-$$.json"
+fanout_red_err="${SCRATCH}/fanout-red-$$.err"
+schema_json="${SCRATCH}/schema-red-$$.json"
+schema_err="${SCRATCH}/schema-red-$$.err"
 mkdir -p "$work"
 cleanup() {
-  rm -rf "$work" "${SCRATCH}/poseidon"
+  rm -rf "$work" "$fanout_work" "${SCRATCH}/poseidon"
+  rm -f "$pristine_json" "$pristine_err" "$fanout_green_json" "$fanout_green_err" \
+    "$fanout_red_json" "$fanout_red_err" "$schema_json" "$schema_err"
   if [[ "$owns_scratch" -eq 1 ]]; then rm -rf "$SCRATCH"; fi
 }
 trap cleanup EXIT
 
-# Copy sources and tests; link dependencies. cp -a nothing that contains a target/.
-cp -a "${SDK}/src" "${SDK}/tests" "${SDK}/tsconfig.json" "${SDK}/package.json" "$work/"
-ln -s "${SDK}/node_modules" "$work/node_modules"
+# Copy every package file that affects `npm pack`. Keep node_modules local so the packed fanout
+# probe can create its scratch directory without writing through a symlink into the real SDK.
+cp -a "${SDK}/src" "${SDK}/tests" "${SDK}/tsconfig.json" "${SDK}/package.json" \
+  "${SDK}/README.md" "${SDK}/pnpm-lock.yaml" "${SDK}/.gitignore" "$work/"
+mkdir -p "$work/node_modules"
+cp -as "${SDK}/node_modules/." "$work/node_modules/"
 
 # tests/poseidon_parity.test.ts reads the Rust-emitted KAT from a SIBLING package,
 # ../../poseidon/tests/fixtures/. Without it the copy reds with an ENOENT that has
@@ -61,8 +75,118 @@ fi
 mkdir -p "${SCRATCH}/poseidon/tests"
 cp -a "$POSEIDON_FIXTURES" "${SCRATCH}/poseidon/tests/"
 
+json_line() { # report
+  node -e '
+const fs = require("fs");
+const line = fs.readFileSync(process.argv[1], "utf8")
+  .split("\n").find((candidate) => candidate.trimStart().startsWith("{"));
+if (!line) process.exit(3);
+process.stdout.write(line);
+' "$1"
+}
+
+check_named_report() { # report title status failed_count
+  local report="$1" title="$2" status="$3" failed_count="$4" raw
+  raw="$(json_line "$report")" || {
+    echo "check-sdk-suite-selftest: no JSON report in ${report}" >&2
+    return 1
+  }
+  node -e '
+const report = JSON.parse(process.argv[1]);
+const title = process.argv[2];
+const status = process.argv[3];
+const failed = Number(process.argv[4]);
+const assertions = (report.testResults ?? []).flatMap((file) => file.assertionResults ?? []);
+const hits = assertions.filter((test) => test.title === title);
+if (hits.length !== 1 || hits[0].status !== status || report.numFailedTests !== failed) {
+  console.error(`named test mismatch: title=${title} hits=${hits.length} status=${hits[0]?.status} failed=${report.numFailedTests}`);
+  process.exit(1);
+}
+' "$raw" "$title" "$status" "$failed_count"
+}
+
+echo "check-sdk-suite-selftest: verifying the unmutated scratch suite"
+( cd "$work" && NO_COLOR=1 ./node_modules/.bin/vitest run \
+    --config tests/vitest.config.ts --reporter=json >"$pristine_json" 2>"$pristine_err" )
+pristine_exit=$?
+if [[ "$pristine_exit" -ne 0 ]]; then
+  echo "check-sdk-suite-selftest: unmutated scratch suite failed (exit ${pristine_exit})" >&2
+  tail -n 20 -- "$pristine_err" "$pristine_json" >&2
+  exit 1
+fi
+pristine_report="$(json_line "$pristine_json")" || {
+  echo "check-sdk-suite-selftest: unmutated scratch emitted no JSON report" >&2
+  exit 1
+}
+node -e '
+const fs = require("fs");
+const report = JSON.parse(process.argv[1]);
+const expected = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const files = report.testResults ?? [];
+const skipped = report.numPendingTests + (report.numTodoTests ?? 0);
+const skippedFiles = files.filter((file) => {
+  const tests = file.assertionResults ?? [];
+  return tests.length > 0 && tests.every((test) => ["pending", "skipped", "todo"].includes(test.status));
+}).length;
+if (files.length !== expected.testFiles || skippedFiles !== expected.skippedFiles ||
+    report.numPassedTests < expected.passed || skipped !== expected.skipped) {
+  console.error(`unmutated scratch counts: passed=${report.numPassedTests} skipped=${skipped} files=${files.length} skipped_files=${skippedFiles}`);
+  process.exit(1);
+}
+console.log(`  unmutated scratch: ${report.numPassedTests} passed / ${skipped} skipped across ${files.length} files`);
+' "$pristine_report" "$work/tests/EXPECTED_COUNTS.json" || exit 1
+
+fanout_title='refuses the packed deep import that can emit a real unretargeted query'
+( cd "$work" && NO_COLOR=1 ./node_modules/.bin/vitest run \
+    --config tests/vitest.config.ts tests/fanout_cover.test.ts -t "$fanout_title" \
+    --reporter=json >"$fanout_green_json" 2>"$fanout_green_err" )
+fanout_green_exit=$?
+if [[ "$fanout_green_exit" -ne 0 ]] \
+  || ! check_named_report "$fanout_green_json" "$fanout_title" passed 0; then
+  echo "check-sdk-suite-selftest: packed fanout boundary is not live in the pristine scratch" >&2
+  tail -n 20 -- "$fanout_green_err" "$fanout_green_json" >&2
+  exit 1
+fi
+echo "  packed fanout boundary: named test passed in pristine scratch"
+
+cp -a "$work" "$fanout_work"
+python3 - "$fanout_work/src/fanout-cover.ts" <<'PYEOF'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+needle = "export function encodeFanoutRequest("
+if needle in s:
+    raise SystemExit("dummy fanout mutation already present")
+s += """
+export function encodeFanoutRequest(
+  _queryBytes: Uint8Array,
+  _plan: FanoutCoverPlan,
+  _wireSchemaVersion: number,
+): Uint8Array {
+  return new Uint8Array();
+}
+"""
+io.open(p, "w", encoding="utf-8").write(s)
+PYEOF
+/usr/bin/grep -q '^export function encodeFanoutRequest(' \
+  "$fanout_work/src/fanout-cover.ts" || {
+  echo "check-sdk-suite-selftest: dummy fanout export mutation did not apply" >&2
+  exit 3
+}
+( cd "$fanout_work" && NO_COLOR=1 ./node_modules/.bin/vitest run \
+    --config tests/vitest.config.ts tests/fanout_cover.test.ts -t "$fanout_title" \
+    --reporter=json >"$fanout_red_json" 2>"$fanout_red_err" )
+fanout_red_exit=$?
+if [[ "$fanout_red_exit" -eq 0 ]] \
+  || ! check_named_report "$fanout_red_json" "$fanout_title" failed 1; then
+  echo "check-sdk-suite-selftest: packed fanout boundary did not reject a deep encoder export" >&2
+  tail -n 20 -- "$fanout_red_err" "$fanout_red_json" >&2
+  exit 1
+fi
+echo "  packed fanout boundary: dummy encoder export killed the named test"
+
 MUT_FILE="$work/src/raven-poi-node-interface.ts"
-NEEDLE='if (envelope !== 1) {'
+NEEDLE='if (envelope !== WIRE_SCHEMA_VERSION) {'
 count="$(/usr/bin/grep -c "$NEEDLE" "$MUT_FILE" || true)"
 if [[ "$count" -ne 1 ]]; then
   echo "check-sdk-suite-selftest: expected exactly 1 envelope-guard site, found ${count} — the mutation no longer applies; update this selftest" >&2
@@ -74,7 +198,7 @@ python3 - "$MUT_FILE" <<'PYEOF'
 import io, sys
 p = sys.argv[1]
 s = io.open(p, encoding="utf-8").read()
-needle = """  if (envelope !== 1) {
+needle = """  if (envelope !== WIRE_SCHEMA_VERSION) {
     throw RavenError.decodeError(
       `${label}: unexpected schema envelope version ${envelope}`,
     );
@@ -92,33 +216,44 @@ else
   exit 3
 fi
 
-out="$work/vitest-out.txt"
-( cd "$work" && ./node_modules/.bin/vitest run --config tests/vitest.config.ts >"$out" 2>&1 )
+( cd "$work" && NO_COLOR=1 ./node_modules/.bin/vitest run \
+    --config tests/vitest.config.ts --reporter=json >"$schema_json" 2>"$schema_err" )
 suite_exit=$?
 
 if [[ "$suite_exit" -eq 0 ]]; then
   echo "check-sdk-suite-selftest: FAILED - the suite stayed GREEN with the envelope guard deleted; the lane cannot detect the silent-wrong-bytes class it exists for." >&2
-  tail -5 "$out" >&2
+  tail -n 5 -- "$schema_err" "$schema_json" >&2
   exit 1
 fi
-# Match the FAILING-test marker, not the file name. A bare filename grep is satisfied by
-# the reporter's line for a file that PASSED, so it would accept a red caused by anything
-# at all - a vacuous check inside the anti-vacuity script.
-if ! /usr/bin/grep -qE '^ *(×|✗|FAIL).*refuses an unknown schema envelope version' "$out"; then
-  echo "check-sdk-suite-selftest: FAILED - the suite went red but NOT via the discriminating envelope test; the red is for the wrong reason." >&2
-  tail -20 "$out" >&2
+schema_report="$(json_line "$schema_json")" || {
+  echo "check-sdk-suite-selftest: schema mutation emitted no JSON report" >&2
   exit 1
-fi
-# And it must be the ONLY red: an unrelated failure alongside it would still satisfy the
-# check above while meaning the copy, not the mutation, is what broke. BOTH lines are
-# required - a file that throws while COLLECTING (a fixture the copy did not bring along)
-# raises `Test Files N failed` but adds NO failed test, so the `Tests` line alone reads
-# clean while a whole file never ran. Measured: that exact hole hid a missing
-# poseidon_parity fixture behind a green selftest.
-if ! /usr/bin/grep -qE '^ *Tests +1 failed' "$out" \
-  || ! /usr/bin/grep -qE '^ *Test Files +1 failed' "$out"; then
-  echo "check-sdk-suite-selftest: FAILED - something beyond the envelope test reddened or failed to collect; the scratch copy is not a faithful copy." >&2
-  /usr/bin/grep -E '^ *(×|Tests |Test Files)' "$out" >&2
+}
+node -e '
+const fs = require("fs");
+const report = JSON.parse(process.argv[1]);
+const expected = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const fanoutTitle = process.argv[3];
+const wantedFailures = new Set([
+  "refuses an unknown schema envelope version instead of eating two payload bytes",
+  "refuses a previous-schema prefix before WASM extraction",
+]);
+const files = report.testResults ?? [];
+const assertions = files.flatMap((file) => file.assertionResults ?? []);
+const failures = assertions.filter((test) => test.status === "failed");
+const failureTitles = new Set(failures.map((test) => test.title));
+const fanout = assertions.filter((test) => test.title === fanoutTitle);
+const skipped = report.numPendingTests + (report.numTodoTests ?? 0);
+if (failures.length !== 2 || report.numFailedTests !== 2 || failureTitles.size !== 2 ||
+    [...wantedFailures].some((title) => !failureTitles.has(title)) ||
+    fanout.length !== 1 || fanout[0].status !== "passed" ||
+    files.length !== expected.testFiles || skipped !== expected.skipped ||
+    report.numPassedTests + report.numFailedTests < expected.passed) {
+  console.error(`schema mutation mismatch: failures=${failures.map((test) => test.title).join(" | ")} fanout=${fanout[0]?.status} passed=${report.numPassedTests} skipped=${skipped} files=${files.length}`);
+  process.exit(1);
+}
+' "$schema_report" "$work/tests/EXPECTED_COUNTS.json" "$fanout_title" || {
+  tail -n 20 -- "$schema_err" "$schema_json" >&2
   exit 1
-fi
-echo "check-sdk-suite-selftest: the suite goes red under the envelope-guard deletion (exit ${suite_exit}), via exactly the discriminating test."
+}
+echo "check-sdk-suite-selftest: schema guard deletion failed exactly both version tests; packed fanout stayed green."

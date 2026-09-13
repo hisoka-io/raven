@@ -16,7 +16,7 @@ use raven_railgun_persistence::{
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-wal-v6-recovery";
 const TOY_ENTRY_SIZE: usize = 32;
-const ENTRIES_PER_SHARD: u32 = 256;
+const ENTRIES_PER_SHARD: u32 = 2048;
 
 fn build_toy_state() -> InspireServerState {
     raven_railgun_testkit::toy_state(TOY_ENTRY_SIZE)
@@ -271,6 +271,8 @@ fn manifest_v5_compatibility_on_open_existing_data() {
         current_marker: 0,
         encoder_label: encoder_arc().label().to_owned(),
         prev_encoder_label: None,
+        entry_size_bytes: None,
+        rows_per_shard: None,
     };
     manifest.save(&layout).expect("save v5 manifest");
 
@@ -282,7 +284,14 @@ fn manifest_v5_compatibility_on_open_existing_data() {
         SnapshotPolicy::default(),
         encoder_arc(),
     )
-    .expect("V5 manifest must load under the V6-capable engine");
+    .expect("V5 manifest must load under the V7-capable engine");
+
+    let migrated = Manifest::load(&layout)
+        .expect("migrated manifest reread")
+        .expect("migrated manifest present");
+    assert_eq!(migrated.schema_version, MANIFEST_SCHEMA_VERSION);
+    assert_eq!(migrated.entry_size_bytes, Some(32));
+    assert_eq!(migrated.rows_per_shard, Some(2048));
 
     assert_eq!(
         opened.recovered_logical_store.leaf_count(),
@@ -295,14 +304,14 @@ fn manifest_v5_compatibility_on_open_existing_data() {
     opened
         .persistence
         .commit_v6(&state_after, &store, 1)
-        .expect("upgrade commit must succeed and bump manifest to V6");
+        .expect("post-migration V7 commit must succeed");
 
     let m_after = Manifest::load(&layout)
         .expect("manifest reread")
         .expect("present");
     assert_eq!(
         m_after.schema_version, MANIFEST_SCHEMA_VERSION,
-        "after a V6 commit the on-disk manifest must report the current schema"
+        "after a V7 commit the on-disk manifest must report the current schema"
     );
 }
 

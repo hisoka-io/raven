@@ -29,6 +29,8 @@ fn manifest_for(instance: &str, encoder_label: &str) -> Manifest {
         current_marker: 0,
         encoder_label: encoder_label.to_owned(),
         prev_encoder_label: None,
+        entry_size_bytes: Some(32),
+        rows_per_shard: Some(2048),
     }
 }
 

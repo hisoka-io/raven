@@ -19,6 +19,8 @@ export interface MockServer {
   requests: RecordedRequest[];
   /** Register a handler; tried in order, first to return `true` claims the request, else 404. */
   route(matcher: (req: IncomingMessage) => boolean, handler: RouteHandler): void;
+  /** Override the otherwise automatic successful session-handshake response. */
+  routeSession(handler: RouteHandler): void;
   reset(): void;
   close(): Promise<void>;
 }
@@ -26,6 +28,7 @@ export interface MockServer {
 export async function startMockServer(): Promise<MockServer> {
   const requests: RecordedRequest[] = [];
   const handlers: { match: (req: IncomingMessage) => boolean; handler: RouteHandler }[] = [];
+  let sessionHandler: RouteHandler | undefined;
 
   const server: Server = createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -38,6 +41,18 @@ export async function startMockServer(): Promise<MockServer> {
         body,
         headers: { ...req.headers },
       });
+      if ((req.url ?? "").endsWith("/session")) {
+        if (sessionHandler) {
+          await sessionHandler(req, body, res);
+        } else {
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "x-raven-session": "1",
+          });
+          res.end(JSON.stringify({ handle: 1, expires_at_unix_secs: 1 }));
+        }
+        return;
+      }
       for (const { match, handler } of handlers) {
         if (!match(req)) continue;
         let claimed: boolean;
@@ -84,9 +99,13 @@ export async function startMockServer(): Promise<MockServer> {
     route(match, handler) {
       handlers.push({ match, handler });
     },
+    routeSession(handler) {
+      sessionHandler = handler;
+    },
     reset() {
       requests.length = 0;
       handlers.length = 0;
+      sessionHandler = undefined;
     },
     async close() {
       await new Promise<void>((resolve, reject) =>
@@ -117,6 +136,7 @@ export function writeBinary(
 ): void {
   res.writeHead(200, {
     "content-type": "application/octet-stream",
+    "x-raven-freshness": "lag_blocks=0 applied_height=0 epoch=1 confidence=1",
     ...extraHeaders,
   });
   res.end(Buffer.from(bytes));

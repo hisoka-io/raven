@@ -11,7 +11,7 @@ use raven_railgun_core::{AdapterError, InstanceId};
 use raven_railgun_engine::inspire::{setup_state, LogicalLeafStore};
 use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
-use raven_railgun_persistence::StoreLayout;
+use raven_railgun_persistence::{Manifest, ManifestShape, StoreLayout, MANIFEST_SCHEMA_VERSION};
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-cell-shape-guard";
 const ENTRIES_PER_SHARD: u32 = 2048;
@@ -20,8 +20,12 @@ const NARROW_WIDTH: usize = 32;
 const CELL_ROWS: usize = 64;
 
 fn encoder_at(width: usize) -> Arc<dyn PirTableEncoder> {
+    encoder_with_rows(width, ENTRIES_PER_SHARD)
+}
+
+fn encoder_with_rows(width: usize, entries_per_shard: u32) -> Arc<dyn PirTableEncoder> {
     EncoderKind::PerLeafBc { tree_number: 0 }
-        .build(width, ENTRIES_PER_SHARD)
+        .build(width, entries_per_shard)
         .expect("build per-leaf-bc encoder")
 }
 
@@ -128,4 +132,165 @@ fn matching_width_still_reopens() {
         .recovered_state
         .expect("post-commit reopen must surface recovered_state");
     assert_eq!(recovered.shard_config().entry_size_bytes, STORED_WIDTH);
+}
+
+#[test]
+fn mismatched_rows_per_shard_are_refused_during_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    seed_data_dir(dir.path(), "row-mismatch", STORED_WIDTH);
+
+    let layout = StoreLayout::open(dir.path()).expect("layout reopen");
+    let error = InspirePersistence::open(
+        layout,
+        SCHEME_TAG,
+        InstanceId::new("row-mismatch"),
+        SnapshotPolicy::default(),
+        encoder_with_rows(STORED_WIDTH, ENTRIES_PER_SHARD / 2),
+    )
+    .expect_err("recovery must not continue with a different row window");
+
+    let message = error.to_string();
+    for needle in ["per-leaf-bc", "2048", "1024", "re-bootstrapped"] {
+        assert!(message.contains(needle), "missing {needle}: {message}");
+    }
+}
+
+#[test]
+fn legacy_v6_manifest_migrates_shape_from_its_snapshot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    seed_data_dir(dir.path(), "legacy-shape-migration", STORED_WIDTH);
+    let layout = StoreLayout::open(dir.path()).expect("layout");
+    let mut manifest = Manifest::load(&layout)
+        .expect("manifest load")
+        .expect("manifest present");
+    manifest.schema_version = 6;
+    manifest.entry_size_bytes = None;
+    manifest.rows_per_shard = None;
+    manifest.save(&layout).expect("save exact legacy shape");
+
+    reopen(dir.path(), "legacy-shape-migration", STORED_WIDTH)
+        .expect("snapshot-derived legacy migration");
+
+    let migrated = Manifest::load(&layout)
+        .expect("migrated manifest load")
+        .expect("migrated manifest present");
+    assert_eq!(migrated.schema_version, MANIFEST_SCHEMA_VERSION);
+    assert_eq!(
+        migrated.require_shape().expect("migrated shape"),
+        ManifestShape {
+            entry_size_bytes: STORED_WIDTH,
+            rows_per_shard: u64::from(ENTRIES_PER_SHARD),
+        }
+    );
+}
+
+#[test]
+fn legacy_manifest_without_a_snapshot_refuses_instead_of_inventing_shape() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let layout = StoreLayout::open(dir.path()).expect("layout");
+    let opened = InspirePersistence::open(
+        layout.clone(),
+        SCHEME_TAG,
+        InstanceId::new("legacy-no-snapshot"),
+        SnapshotPolicy::default(),
+        encoder_at(STORED_WIDTH),
+    )
+    .expect("fresh open");
+    drop(opened);
+    let mut manifest = Manifest::load(&layout)
+        .expect("manifest load")
+        .expect("manifest present");
+    manifest.schema_version = 6;
+    manifest.entry_size_bytes = None;
+    manifest.rows_per_shard = None;
+    manifest.save(&layout).expect("save legacy manifest");
+
+    let error = reopen(dir.path(), "legacy-no-snapshot", STORED_WIDTH)
+        .expect_err("no persisted bytes can establish geometry");
+    let message = error.to_string();
+    assert!(message.contains("no cell shape"), "{message}");
+    assert!(message.contains("snapshot"), "{message}");
+    assert!(message.contains("re-bootstrap"), "{message}");
+}
+
+#[test]
+fn fresh_manifest_refuses_a_different_configured_shape_without_a_snapshot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let layout = StoreLayout::open(dir.path()).expect("layout");
+    let opened = InspirePersistence::open(
+        layout,
+        SCHEME_TAG,
+        InstanceId::new("fresh-config-mismatch"),
+        SnapshotPolicy::default(),
+        encoder_at(STORED_WIDTH),
+    )
+    .expect("fresh open");
+    drop(opened);
+
+    let error = reopen(dir.path(), "fresh-config-mismatch", NARROW_WIDTH)
+        .expect_err("manifest shape is authoritative before the first snapshot");
+    let message = error.to_string();
+    for needle in ["manifest cell shape mismatch", "32", "512", "per-leaf-bc"] {
+        assert!(message.contains(needle), "missing {needle}: {message}");
+    }
+}
+
+#[test]
+fn manifest_shape_that_disagrees_with_snapshot_refuses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    seed_data_dir(dir.path(), "manifest-vs-snapshot", STORED_WIDTH);
+    let layout = StoreLayout::open(dir.path()).expect("layout");
+    let mut manifest = Manifest::load(&layout)
+        .expect("manifest load")
+        .expect("manifest present");
+    manifest.entry_size_bytes = Some(NARROW_WIDTH);
+    manifest.save(&layout).expect("save forged shape");
+
+    let error = reopen(dir.path(), "manifest-vs-snapshot", NARROW_WIDTH)
+        .expect_err("manifest and recovered snapshot must agree");
+    let message = error.to_string();
+    for needle in ["manifest cell shape mismatch", "32", "512", "re-bootstrap"] {
+        assert!(message.contains(needle), "missing {needle}: {message}");
+    }
+}
+
+#[test]
+fn commit_refuses_a_state_that_disagrees_with_the_manifest_shape() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let layout = StoreLayout::open(dir.path()).expect("layout");
+    let opened = InspirePersistence::open(
+        layout.clone(),
+        SCHEME_TAG,
+        InstanceId::new("commit-shape-mismatch"),
+        SnapshotPolicy::default(),
+        encoder_at(NARROW_WIDTH),
+    )
+    .expect("fresh open");
+    let params = InspireParams::secure_128_d2048();
+    let database = raven_railgun_testkit::toy_db(CELL_ROWS, STORED_WIDTH);
+    let (wrong_state, _secret) =
+        setup_state(&params, &database, STORED_WIDTH, InspireVariant::TwoPacking)
+            .expect("wrong-width state");
+
+    let error = opened
+        .persistence
+        .commit_v6(&wrong_state, &LogicalLeafStore::new(), 100)
+        .expect_err("commit must not publish a snapshot at another shape");
+    let message = error.to_string();
+    for needle in [
+        "manifest cell shape mismatch",
+        "32",
+        "512",
+        "re-bootstrapped",
+    ] {
+        assert!(message.contains(needle), "missing {needle}: {message}");
+    }
+    let manifest = Manifest::load(&layout)
+        .expect("manifest load")
+        .expect("manifest present");
+    assert_eq!(
+        manifest.current_snapshot_id,
+        raven_railgun_persistence::SnapshotId(0),
+        "a refused shape must not advance the persisted snapshot"
+    );
 }

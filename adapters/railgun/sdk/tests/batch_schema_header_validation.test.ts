@@ -67,6 +67,33 @@ describe("batch schema-version header validation", () => {
     expect(RavenError.is(thrown, "StaleAdapter")).toBe(true);
   });
 
+  it("sends v3 and classifies an old v2 server refusal with both versions", async () => {
+    let requestPrefix: number[] = [];
+    server.route(
+      (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
+      (_req, body, res) => {
+        requestPrefix = Array.from(body.subarray(0, 2));
+        res.writeHead(400, { "x-raven-schema-version": "2" });
+        res.end();
+        return true;
+      },
+    );
+    const sdk = newSdk(server, new ImtCache({ disableIndexedDb: true }));
+    let thrown: unknown;
+    try {
+      await sdk.getMerkleProof(TREE_NUMBER, LEAF);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(requestPrefix).toEqual([0, 3]);
+    expect(RavenError.is(thrown, "StaleAdapter")).toBe(true);
+    if (RavenError.is(thrown, "StaleAdapter")) {
+      expect(thrown.context.clientWireSchemaVersion).toBe(3);
+      expect(thrown.context.serverWireSchemaVersion).toBe(2);
+    }
+  });
+
   it("refuses a fractional or negative schema-version header", async () => {
     for (const raw of ["1.5", "-1", "0x2", "NaN"]) {
       mountBatchRoute(server, raw);

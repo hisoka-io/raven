@@ -34,7 +34,7 @@ function mountAdapter(server: MockServer): Adapter {
       res.writeHead(200, {
         "content-type": "application/octet-stream",
         "x-raven-epoch": String(EPOCH),
-        "x-raven-schema-version": "1",
+        "x-raven-schema-version": "3",
       });
       res.end(Buffer.from(encodeBatchResponse(EPOCH, encodedBatchCount(body))));
       return true;

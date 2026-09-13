@@ -16,10 +16,10 @@ use bytes::Bytes;
 use raven_inspire::SeededClientQuery;
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::RavenInspireScheme;
-use raven_railgun_engine::DrainState;
 use serde::{Deserialize, Serialize};
 
-use crate::batch::{dispatch_batch, BatchError};
+use crate::auth::validate_session_binding;
+use crate::batch::{admit_instance, dispatch_batch, BatchError};
 use crate::state::AppState;
 use crate::versioned::{read_versioned, write_batch_response_versioned};
 use crate::{attach_freshness_header, build_response_headers};
@@ -211,24 +211,12 @@ fn reject(err: &FanoutError) -> (StatusCode, String) {
 pub(crate) async fn fanout_handler(
     State(app): State<AppState<RavenInspireScheme>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, HeaderMap, Bytes), (StatusCode, String)> {
     let instance_id = InstanceId::new(id);
-    let instance = app
-        .engine
-        .instance(&instance_id)
-        .ok_or((StatusCode::NOT_FOUND, "unknown instance".to_owned()))?;
-    if instance.drain_state() != DrainState::Active {
-        tracing::info!(
-            instance_id = %instance.id,
-            drain_state = instance.drain_state().label(),
-            "fanout refused: instance is not active"
-        );
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("instance is {}", instance.drain_state().label()),
-        ));
-    }
+    let instance = admit_instance(&app.engine, &instance_id, "fanout")
+        .map_err(|refusal| (refusal.status(), refusal.detail()))?;
 
     let FanoutRequest { query, shard_ids } =
         read_versioned::<FanoutRequest>(&body).map_err(|err| {
@@ -238,6 +226,19 @@ pub(crate) async fn fanout_handler(
                 "fanout request decode failed".to_owned(),
             )
         })?;
+
+    validate_session_binding(
+        &headers,
+        app.sessions.as_ref(),
+        &instance_id,
+        query.session_handle,
+    )
+    .map_err(|status| {
+        (
+            status,
+            "session handle is not bound to this client".to_owned(),
+        )
+    })?;
 
     let started = Instant::now();
     // Captured ONCE so validation and every worker read the same snapshot.

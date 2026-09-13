@@ -52,14 +52,17 @@ struct WalState {
     /// fsync-acknowledged entry that a later replay drops is worse than a
     /// refused write.
     poisoned: bool,
-    /// Makes the NEXT frame write fail, so the torn-append recovery has a route.
-    ///
-    /// `#[cfg(test)]` and never a cargo feature: a feature can be switched on in a release
-    /// build, which is exactly how a test door becomes a production door. Scoped to the frame
-    /// write alone - it cannot make the rewind fail, so the poison ASSIGNMENT is reached but
-    /// only in its non-poisoning direction.
+    /// One-shot fault points; `cfg(test)` prevents a production test door.
     #[cfg(test)]
-    fail_next_write: bool,
+    faults: WalFaults,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct WalFaults {
+    frame_write: bool,
+    rewind: bool,
+    archive_reopen: bool,
 }
 
 /// One whole frame: header then payload then fsync. Any error leaves the caller
@@ -141,7 +144,7 @@ impl Wal {
                 last_marker: scan.last_marker,
                 poisoned: false,
                 #[cfg(test)]
-                fail_next_write: false,
+                faults: WalFaults::default(),
             }),
         })
     }
@@ -192,7 +195,7 @@ impl Wal {
         // any reopen `stream_position` reports 0 and a rewind to it truncates the whole log.
         let tail = rewind_target(&state.file)?;
         #[cfg(test)]
-        let frame = if std::mem::replace(&mut state.fail_next_write, false) {
+        let frame = if std::mem::replace(&mut state.faults.frame_write, false) {
             Err(PersistenceError::Io(std::io::Error::other(
                 "injected frame-write failure",
             )))
@@ -202,6 +205,17 @@ impl Wal {
         #[cfg(not(test))]
         let frame = write_frame(&mut state.file, &header, &bincoded);
         if let Err(e) = frame {
+            #[cfg(test)]
+            let rewound = if std::mem::replace(&mut state.faults.rewind, false) {
+                Err(std::io::Error::other("injected rewind failure"))
+            } else {
+                state
+                    .file
+                    .set_len(tail)
+                    .and_then(|()| state.file.sync_all())
+                    .and_then(|()| state.file.seek(SeekFrom::Start(tail)).map(|_| ()))
+            };
+            #[cfg(not(test))]
             let rewound = state
                 .file
                 .set_len(tail)
@@ -295,7 +309,17 @@ impl Wal {
         // into a file `replay()` never opens - it resolves `current.log` by path - so
         // every fsync-acknowledged entry after it would be silently unreplayable.
         // Poison instead: a refused write beats an acknowledged one that is lost.
-        match reopen_current_after_archive(&current, &archive_parent) {
+        #[cfg(test)]
+        let reopened = if std::mem::replace(&mut state.faults.archive_reopen, false) {
+            Err(PersistenceError::Io(std::io::Error::other(
+                "injected post-archive reopen failure",
+            )))
+        } else {
+            reopen_current_after_archive(&current, &archive_parent)
+        };
+        #[cfg(not(test))]
+        let reopened = reopen_current_after_archive(&current, &archive_parent);
+        match reopened {
             Ok(new_file) => {
                 state.file = new_file;
                 state.first_seq = None;
@@ -729,6 +753,8 @@ mod tests {
             current_marker: 0,
             encoder_label: "test-encoder".to_owned(),
             prev_encoder_label: None,
+            entry_size_bytes: Some(32),
+            rows_per_shard: Some(2048),
         }
         .save(layout)
         .expect("manifest save");
@@ -928,7 +954,7 @@ mod tests {
         assert!(len_before > 0, "precondition: the log is non-empty on disk");
 
         let reopened = Wal::open(&layout, None).expect("reopen");
-        reopened.inner.lock().fail_next_write = true;
+        reopened.inner.lock().faults.frame_write = true;
         reopened
             .append(&test_payload(2), 3)
             .expect_err("the injected failure must surface");
@@ -970,7 +996,7 @@ mod tests {
             .expect("metadata")
             .len();
 
-        wal.inner.lock().fail_next_write = true;
+        wal.inner.lock().faults.frame_write = true;
         let err = wal
             .append(&test_payload(1), 2)
             .expect_err("the injected failure must surface");
@@ -1006,12 +1032,85 @@ mod tests {
         assert_eq!(second, first + 1, "the burned-nothing seq is reused");
     }
 
+    #[test]
+    fn rewind_failure_poison_prevents_unreplayable_followup() {
+        let (_d, layout) = make_layout();
+        let wal = Wal::open(&layout, None).expect("open");
+        wal.append(&test_payload(0), 1).expect("first");
+        let next_seq = wal.next_seq();
+        let len_before = std::fs::metadata(layout.wal_current_path())
+            .expect("metadata")
+            .len();
+
+        {
+            let mut state = wal.inner.lock();
+            state.faults.frame_write = true;
+            state.faults.rewind = true;
+        }
+        let err = wal
+            .append(&test_payload(1), 2)
+            .expect_err("the injected frame-write failure must surface");
+        assert!(matches!(err, PersistenceError::Io(_)), "got {err:?}");
+        assert!(
+            wal.inner.lock().poisoned,
+            "a failed rewind leaves the on-disk extent unknown"
+        );
+
+        let refused = wal
+            .append(&test_payload(2), 3)
+            .expect_err("poison must refuse a followup append");
+        assert!(format!("{refused}").contains("poisoned"), "got {refused}");
+        assert_eq!(wal.next_seq(), next_seq, "both failed appends burn no seq");
+        assert_eq!(
+            std::fs::metadata(layout.wal_current_path())
+                .expect("metadata")
+                .len(),
+            len_before,
+            "a refused followup must not advance the log"
+        );
+    }
+
+    #[test]
+    fn post_archive_reopen_failure_poison_prevents_sealed_inode_append() {
+        let (_d, layout) = make_layout();
+        let wal = Wal::open(&layout, None).expect("open");
+        wal.append(&test_payload(0), 1).expect("first");
+        let next_seq = wal.next_seq();
+        let current = layout.wal_current_path();
+        let archived = layout.wal_archived_path(0, 0);
+        let sealed_bytes = std::fs::read(&current).expect("read current");
+
+        wal.inner.lock().faults.archive_reopen = true;
+        let err = wal
+            .archive(0, 0)
+            .expect_err("the injected post-rename reopen failure must surface");
+        assert!(matches!(err, PersistenceError::Io(_)), "got {err:?}");
+        assert!(
+            wal.inner.lock().poisoned,
+            "a failed post-rename reopen leaves the handle on the sealed inode"
+        );
+
+        let refused = wal
+            .append(&test_payload(1), 2)
+            .expect_err("poison must refuse writes through the sealed inode");
+        assert!(format!("{refused}").contains("poisoned"), "got {refused}");
+        assert_eq!(wal.next_seq(), next_seq, "the refused append burns no seq");
+        assert!(
+            !current.exists(),
+            "the injected reopen did not create a misleading current.log"
+        );
+        assert_eq!(
+            std::fs::read(&archived).expect("read archive"),
+            sealed_bytes,
+            "the refused append must not advance the sealed inode"
+        );
+    }
+
     /// Poison means the on-disk extent is no longer known good, so a further append would land
     /// past a hole `replay` stops at and every entry after it would be fsync-acknowledged and
     /// unreplayable.
     ///
-    /// Injected: no deterministic filesystem manipulation drives a rewind failure or a
-    /// post-rename reopen failure, so the assignment sites cannot be reached from a test.
+    /// Direct injection isolates this honour guard from the fault-point tests above.
     #[test]
     fn a_poisoned_wal_refuses_every_append_until_it_is_reopened() {
         let (_d, layout) = make_layout();

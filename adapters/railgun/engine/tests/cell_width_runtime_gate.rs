@@ -6,6 +6,7 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+use raven_inspire::inspiring::PackParams;
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_engine::inspire::{
     build_client_session, build_seeded_query, extract_response, register_client_session,
@@ -24,6 +25,20 @@ const NOTE_RECORD_BYTES: usize = 328;
 
 fn ring_dim() -> usize {
     InspireParams::secure_128_d2048().ring_dim
+}
+
+#[test]
+fn adapter_width_predicate_matches_inspire_for_every_ring_shape() {
+    for ring_dim in 0usize..=4096 {
+        for columns in (0..=11).map(|shift| 1usize << shift) {
+            let entry_size = columns * 2;
+            assert_eq!(
+                is_legal_cell_width(entry_size, ring_dim),
+                PackParams::is_legal_width(ring_dim, columns),
+                "predicate drift at ring_dim {ring_dim}, entry_size {entry_size}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -74,6 +89,14 @@ fn zero_width_is_rejected_with_its_own_reason() {
         err.contains("must be > 0"),
         "zero width needs its own reason, not a column-count one: {err}"
     );
+}
+
+#[test]
+fn odd_entry_widths_round_up_before_the_law_is_checked() {
+    assert_eq!(pir_cell_columns(3), 2);
+    assert!(is_legal_cell_width(3, ring_dim()));
+    assert_eq!(pir_cell_columns(5), 3);
+    assert!(!is_legal_cell_width(5, ring_dim()));
 }
 
 #[test]
@@ -261,8 +284,8 @@ fn setup_rejection_at_width(entry_size: usize) -> Option<String> {
         .map(|e| e.to_string())
 }
 
-/// Evidence for the law. Ten production-parameter setups, minutes of wall time,
-/// so it is gated; the cheap tests above encode its result.
+/// Evidence for the law. Seven production-parameter round trips plus five early
+/// refusals take minutes, so the cheap tests above encode the result.
 #[test]
 #[ignore = "seven production-parameter setups at d=2048 (~7 s each), plus five widths that setup \
             refuses before it builds the packing table; ~150 s in CI. Trigger: changing \

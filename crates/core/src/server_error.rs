@@ -38,6 +38,13 @@ pub enum ServerError {
     #[error("invalid query: {0}")]
     InvalidQuery(String),
 
+    /// A query referenced a session handle this instance no longer serves.
+    #[error("invalid query: {detail}")]
+    SessionHandleRejected {
+        /// Actionable reason the client must establish a replacement session.
+        detail: String,
+    },
+
     /// Internal post-condition violation.
     #[error("internal error: {0}")]
     Internal(String),

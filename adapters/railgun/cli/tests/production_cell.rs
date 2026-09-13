@@ -24,12 +24,85 @@
     clippy::print_stderr
 )]
 
-use raven_inspire::ServerResponse;
+use raven_inspire::{SeededClientQuery, ServerResponse};
+use serde::Deserialize;
 
 #[path = "support/production_cell.rs"]
 mod support;
 
-use support::{ProductionCell, BATCH_WIDTH, BEARER_TOKEN, ENTRY_BYTES};
+use support::{ProductionCell, BATCH_WIDTH, BEARER_TOKEN, CLIENT_ID, ENTRY_BYTES};
+
+#[derive(Deserialize)]
+struct BatchCapacityEvidence {
+    #[serde(rename = "serializedQueryBytes")]
+    serialized_query: usize,
+    #[serde(rename = "batchFrameBytes")]
+    batch_frame: usize,
+    #[serde(rename = "defaultBodyCapBytes")]
+    default_body_cap: usize,
+}
+
+async fn assert_batch_capacity_boundary(
+    cell: &ProductionCell,
+    client: &reqwest::Client,
+    target_index: u64,
+) {
+    let (_, handled_query) = cell.handled_query(target_index);
+    let serialized_query = bincode::serialize(&handled_query).expect("serialize handled query");
+    let fixture_query_bytes =
+        hex::decode(include_str!("../../sdk/tests/fixtures/production_handled_query.hex").trim())
+            .expect("production query fixture is hex");
+    let fixture_query: SeededClientQuery =
+        bincode::deserialize(&fixture_query_bytes).expect("fixture is a handled query");
+    assert!(fixture_query.inspiring_packing_keys.is_none());
+    assert!(fixture_query.session_handle.is_some());
+    assert!(handled_query.inspiring_packing_keys.is_none());
+    assert!(handled_query.session_handle.is_some());
+    assert_eq!(serialized_query.len(), fixture_query_bytes.len());
+    let evidence: BatchCapacityEvidence = serde_json::from_str(include_str!(
+        "../../sdk/tests/fixtures/production_batch_capacity.json"
+    ))
+    .expect("production capacity evidence is JSON");
+    let empty_batch = raven_railgun_http::write_versioned(&Vec::<SeededClientQuery>::new())
+        .expect("serialize empty batch");
+    let frame_bytes = empty_batch.len();
+    let raw_capacity = (cell.max_body_bytes - frame_bytes) / serialized_query.len();
+    assert_eq!(serialized_query.len(), evidence.serialized_query);
+    assert_eq!(frame_bytes, evidence.batch_frame);
+    assert_eq!(cell.max_body_bytes, evidence.default_body_cap);
+    assert_eq!(serialized_query.len(), 49_445, "handled query bytes");
+    assert_eq!(frame_bytes, 10, "version plus Vec length frame");
+    assert_eq!(cell.max_body_bytes, 8 * 1024 * 1024, "HTTP body cap");
+    assert_eq!(raw_capacity, 169, "raw query capacity");
+    let admitted = raven_railgun_http::write_versioned(&vec![handled_query.clone(); raw_capacity])
+        .expect("serialize admitted body");
+    let refused = raven_railgun_http::write_versioned(&vec![handled_query; raw_capacity + 1])
+        .expect("serialize refused body");
+    assert_eq!(admitted.len(), 8_356_215);
+    assert_eq!(refused.len(), 8_405_660);
+    assert!(admitted.len() <= cell.max_body_bytes);
+    assert!(refused.len() > cell.max_body_bytes);
+    let admitted_status = client
+        .post(cell.batch_url())
+        .bearer_auth(BEARER_TOKEN)
+        .header("x-raven-client-id", CLIENT_ID)
+        .body(admitted)
+        .send()
+        .await
+        .expect("POST body within cap")
+        .status();
+    assert_eq!(admitted_status, 400, "169 reaches the off-step guard");
+    let refused_status = client
+        .post(cell.batch_url())
+        .bearer_auth(BEARER_TOKEN)
+        .header("x-raven-client-id", CLIENT_ID)
+        .body(refused)
+        .send()
+        .await
+        .expect("POST body above cap")
+        .status();
+    assert_eq!(refused_status, 413, "170 exceeds the body cap");
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "~12 s of setup_state at the 65,536 x 512 B cell plus a full HTTP round trip. Trigger: \
@@ -41,10 +114,13 @@ async fn production_cell_round_trip_byte_identity() {
     let client = ProductionCell::client();
 
     let target_index: u64 = 31_415;
+    assert_batch_capacity_boundary(&cell, &client, target_index).await;
+
     let (client_state, query_bytes) = cell.seeded_query(target_index);
     let response = client
         .post(cell.query_url())
         .bearer_auth(BEARER_TOKEN)
+        .header("x-raven-client-id", CLIENT_ID)
         .body(query_bytes)
         .send()
         .await
@@ -65,6 +141,7 @@ async fn production_cell_round_trip_byte_identity() {
     let batch_response = client
         .post(cell.batch_url())
         .bearer_auth(BEARER_TOKEN)
+        .header("x-raven-client-id", CLIENT_ID)
         .body(batch_bytes)
         .send()
         .await

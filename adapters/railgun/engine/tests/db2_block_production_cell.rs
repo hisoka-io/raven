@@ -1,6 +1,6 @@
 //! End-to-end block test: `2^BLOCK_K` commitments at 32 bytes, served by plain
 //! indexed fetch rather than PIR because the resulting record is far outside the
-//! legal cell widths (see `pir_cell_width_law.rs`).
+//! legal cell widths (see `cell_width_runtime_gate.rs`).
 //!
 //! Covers the bytes a client fetches, the subtree it recomputes, and the path it
 //! splices onto the public upper tree. The oracle is independent of the block
@@ -229,7 +229,7 @@ fn full_blocks_freeze_and_only_the_tail_block_changes_on_append() {
 #[test]
 fn db2_block_is_outside_the_pir_cell_width_range() {
     let ring_dim = InspireParams::secure_128_d2048().ring_dim;
-    let num_columns = BLOCK_BYTES.div_ceil(2);
+    let num_columns = raven_inspire::num_columns(BLOCK_BYTES);
     assert!(
         num_columns > ring_dim,
         "a {BLOCK_BYTES}-byte block induces {num_columns} InspiRING columns against a \

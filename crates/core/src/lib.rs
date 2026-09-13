@@ -28,6 +28,7 @@
 
 #![deny(missing_docs)]
 
+pub mod batch_ladder;
 pub mod error;
 pub mod instance;
 pub mod memory;

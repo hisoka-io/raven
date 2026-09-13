@@ -16,6 +16,7 @@ use raven_core::storage::StorageBackend as _;
 use raven_core::MemoryStore;
 use raven_inspire::params::InspireParams;
 use raven_inspire::rlwe::RlweSecretKey;
+use raven_storage::{Manifest, StoreLayout};
 use serial_test::serial;
 
 fn rec(bal: u128) -> Bytes {
@@ -139,6 +140,90 @@ fn wal_archive_after_fold_recover() {
         &rec(555_555)[..],
         "post-archive update recovered byte-identically"
     );
+}
+
+#[test]
+#[serial]
+fn recover_rejects_manifest_identity_mismatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let params = InspireParams::secure_128_d2048();
+    let db = vec![0u8; 64 * ENTRY_SIZE];
+    let seed = 0x0000_1D00u64;
+    let (main_sidecar, _main_key, _sidecar_key) =
+        MainSidecar::seed(&params, &db, ENTRY_SIZE, dir.path(), seed).expect("seed");
+    drop(main_sidecar);
+
+    let layout = StoreLayout::open(dir.path()).expect("layout");
+    let mut manifest = Manifest::load(&layout)
+        .expect("manifest load")
+        .expect("manifest present");
+    manifest.scheme_tag = "wrong-scheme".to_owned();
+    manifest.save(&layout).expect("save mismatched manifest");
+
+    let Err(error) = MainSidecar::recover(&params, ENTRY_SIZE, dir.path(), seed) else {
+        panic!("manifest identity mismatch must fail closed");
+    };
+    assert!(error.to_string().contains("scheme_tag mismatch"), "{error}");
+}
+
+#[test]
+#[serial]
+fn recover_rejects_manifest_cell_shape_mismatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let params = InspireParams::secure_128_d2048();
+    let db = vec![0u8; 64 * ENTRY_SIZE];
+    let seed = 0x0000_1D01u64;
+    let (main_sidecar, _main_key, _sidecar_key) =
+        MainSidecar::seed(&params, &db, ENTRY_SIZE, dir.path(), seed).expect("seed");
+    drop(main_sidecar);
+
+    let layout = StoreLayout::open(dir.path()).expect("layout");
+    let mut manifest = Manifest::load(&layout)
+        .expect("manifest load")
+        .expect("manifest present");
+    manifest.entry_size_bytes = Some(ENTRY_SIZE * 2);
+    manifest.save(&layout).expect("save mismatched shape");
+
+    let Err(error) = MainSidecar::recover(&params, ENTRY_SIZE, dir.path(), seed) else {
+        panic!("manifest shape mismatch must fail closed");
+    };
+    let message = error.to_string();
+    for needle in [
+        "manifest cell shape mismatch",
+        "32",
+        "64",
+        "re-bootstrapped",
+    ] {
+        assert!(message.contains(needle), "missing {needle}: {message}");
+    }
+}
+
+#[test]
+#[serial]
+fn recover_refuses_legacy_manifest_when_rows_per_shard_cannot_be_derived() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let params = InspireParams::secure_128_d2048();
+    let db = vec![0u8; 64 * ENTRY_SIZE];
+    let seed = 0x0000_1D02u64;
+    let (main_sidecar, _main_key, _sidecar_key) =
+        MainSidecar::seed(&params, &db, ENTRY_SIZE, dir.path(), seed).expect("seed");
+    drop(main_sidecar);
+
+    let layout = StoreLayout::open(dir.path()).expect("layout");
+    let mut manifest = Manifest::load(&layout)
+        .expect("manifest load")
+        .expect("manifest present");
+    manifest.schema_version = 6;
+    manifest.entry_size_bytes = None;
+    manifest.rows_per_shard = None;
+    manifest.save(&layout).expect("save legacy manifest");
+
+    let Err(error) = MainSidecar::recover(&params, ENTRY_SIZE, dir.path(), seed) else {
+        panic!("legacy rows_per_shard absence must not copy configuration");
+    };
+    let message = error.to_string();
+    assert!(message.contains("no cell shape"), "{message}");
+    assert!(message.contains("re-bootstrap"), "{message}");
 }
 
 /// Shard growth path, which the cache-equivalence KAT does not reach.

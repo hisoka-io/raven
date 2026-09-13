@@ -588,6 +588,9 @@ where
         let encoder: Arc<dyn super::pir_table::PirTableEncoder> =
             cfg.encoder.build(cfg.record_size, cfg.entries_per_shard)?;
 
+        let session_store = Arc::new(crate::session_pool::BoundedSessionStore::open(
+            layout.root(),
+        )?);
         let opened = InspirePersistence::open(
             layout,
             cfg.scheme_tag.clone(),
@@ -597,7 +600,7 @@ where
         )?;
         let persistence = Arc::new(opened.persistence);
         let recovered_store = opened.recovered_logical_store;
-        let state = if let Some(s) = opened.recovered_state {
+        let mut state = if let Some(s) = opened.recovered_state {
             s
         } else {
             let s = fresh_state_factory(&cfg)?;
@@ -607,6 +610,7 @@ where
             persistence.commit_notify().notify_waiters();
             s
         };
+        state.session_store = session_store;
         let instance = PirInstance::new(cfg.instance_id.clone(), cfg.role, state);
         let instance_arc: Arc<PirInstance<RavenInspireScheme>> = Arc::new(instance);
 

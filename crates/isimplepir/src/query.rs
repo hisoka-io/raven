@@ -1,5 +1,7 @@
 //! Client query: `q = A . s + e`; `q[col] += delta`. Client
 //! retains `s` for `Extract`.
+//! Delta placement scans all public `M` slots to avoid a secret-offset store.
+//! Query generation as a whole is not claimed to be constant-time.
 
 use rand_core::{RngCore, TryRngCore};
 use serde::{Deserialize, Serialize};
@@ -207,6 +209,16 @@ fn compute_query_vec(
     }
 }
 
+#[inline(never)]
+fn add_delta_by_scan(query_vec: &mut [u32], col: usize, delta: u32) {
+    let selected_col = col as u64;
+    for (candidate_col, slot) in query_vec.iter_mut().enumerate() {
+        let adjusted = slot.wrapping_add(delta);
+        *slot =
+            u32::conditional_select(slot, &adjusted, (candidate_col as u64).ct_eq(&selected_col));
+    }
+}
+
 /// Scalar reference / wasm32 fallback.
 #[allow(dead_code)]
 fn compute_query_vec_scalar(
@@ -311,9 +323,7 @@ pub fn query<R: RngCore>(
 
     let delta = params.delta();
     let mut query_vec = query_vec;
-    if let Some(slot) = query_vec.get_mut(col) {
-        *slot = slot.wrapping_add(delta);
-    }
+    add_delta_by_scan(&mut query_vec, col, delta);
 
     Ok((
         ClientState {
@@ -329,6 +339,7 @@ pub fn query<R: RngCore>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use rand_chacha::ChaCha20Rng;
     use rand_core::SeedableRng;
 
@@ -377,6 +388,33 @@ mod tests {
         let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
         let result = query(&mut rng, &[0u8; 32], &params, 9999);
         assert!(matches!(result, Err(IsimplePirError::QueryShape { .. })));
+    }
+
+    #[test]
+    fn delta_scan_matches_direct_index_at_boundaries() {
+        let original = vec![u32::MAX, 7, 19, 41];
+        for col in [0, original.len() - 1] {
+            let mut expected = original.clone();
+            expected[col] = expected[col].wrapping_add(23);
+            let mut actual = original.clone();
+            add_delta_by_scan(&mut actual, col, 23);
+            assert_eq!(actual, expected, "column {col}");
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn delta_scan_matches_direct_index(
+            mut actual in prop::collection::vec(any::<u32>(), 1..128),
+            col_seed in any::<usize>(),
+            delta in any::<u32>(),
+        ) {
+            let col = col_seed % actual.len();
+            let mut expected = actual.clone();
+            expected[col] = expected[col].wrapping_add(delta);
+            add_delta_by_scan(&mut actual, col, delta);
+            prop_assert_eq!(actual, expected);
+        }
     }
 
     #[test]

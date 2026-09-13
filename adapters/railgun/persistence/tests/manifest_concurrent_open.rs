@@ -26,6 +26,8 @@ fn sample_manifest(id: u32, seq: u64) -> Manifest {
         current_marker: 24_000_000,
         encoder_label: "per-leaf-bc".to_owned(),
         prev_encoder_label: None,
+        entry_size_bytes: Some(32),
+        rows_per_shard: Some(2048),
     }
 }
 

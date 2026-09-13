@@ -361,12 +361,7 @@ pub(crate) async fn status_header_handler<S: PirScheme>(
 }
 
 fn poi_status_byte(s: POIStatus) -> u8 {
-    match s {
-        POIStatus::Valid => 0,
-        POIStatus::ShieldBlocked => 1,
-        POIStatus::ProofSubmitted => 2,
-        POIStatus::Missing => 3,
-    }
+    s.wire_byte()
 }
 
 /// ETag + 304 short-circuit for publishing channels; ETag = SHA-256(body)[..16] hex.

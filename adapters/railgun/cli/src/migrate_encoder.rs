@@ -14,7 +14,8 @@ use raven_railgun_engine::inspire::{
 };
 use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
 use raven_railgun_persistence::{
-    Manifest, Snapshot, SnapshotId, StoreLayout, Wal, WalEntryPayload, SNAPSHOT_MAGIC,
+    open_recovery, Manifest, ManifestShape, PersistenceError, Snapshot, SnapshotId, StoreLayout,
+    WalEntryPayload, SNAPSHOT_MAGIC,
 };
 
 /// Observable boundaries in the real encoder migration.
@@ -79,35 +80,41 @@ pub fn run_with_checkpoint(
         )
     })?;
 
-    let manifest = Manifest::load(&layout)
-        .map_err(|e| anyhow::anyhow!("manifest load: {e}"))?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no manifest at {}; data_dir is empty or uninitialized",
-                data_dir.display()
-            )
-        })?;
-
-    let old_label = manifest.encoder_label.clone();
     let new_label = target.label();
-
-    if old_label == new_label {
-        anyhow::bail!(
-            "encoder is already '{new_label}'; nothing to migrate \
-             (data_dir: {})",
+    let recovery = open_recovery(&layout, SNAPSHOT_MAGIC, |manifest| {
+        if manifest.encoder_label == new_label {
+            let provenance = manifest
+                .prev_encoder_label
+                .as_deref()
+                .map_or_else(String::new, |previous| {
+                    format!("; last completed migration was '{previous}' -> '{new_label}'")
+                });
+            return Err(PersistenceError::Invariant(format!(
+                "encoder is already '{new_label}'; nothing to migrate{provenance}"
+            )));
+        }
+        if manifest.current_snapshot_id == SnapshotId(0) {
+            return Err(PersistenceError::Invariant(
+                "manifest current_snapshot_id is 0 (no committed snapshot yet); boot the server \
+                 once to take the initial snapshot before migrating"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    })
+    .map_err(|e| anyhow::anyhow!("recovery open: {e}"))?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "no manifest at {}; data_dir is empty or uninitialized",
             data_dir.display()
-        );
-    }
+        )
+    })?;
 
-    if manifest.current_snapshot_id == SnapshotId(0) {
-        anyhow::bail!(
-            "manifest current_snapshot_id is 0 (no committed snapshot yet); \
-             boot the server once to take the initial snapshot before migrating"
-        );
-    }
-
-    let snap = Snapshot::load(&layout, manifest.current_snapshot_id, SNAPSHOT_MAGIC)
-        .map_err(|e| anyhow::anyhow!("snapshot load: {e}"))?;
+    let mut manifest = recovery.manifest;
+    let old_label = manifest.encoder_label.clone();
+    let snap = recovery.snapshot.ok_or_else(|| {
+        anyhow::anyhow!("recovery returned no snapshot for nonzero current_snapshot_id")
+    })?;
 
     // Seeds the WAL replay base, default-empty for legacy V5.
     let (mut state, recovered_seed_store) = restore_inspire_state_v6(&snap.data)
@@ -122,17 +129,11 @@ pub fn run_with_checkpoint(
         )
     };
 
-    let wal_floor = manifest.current_snapshot_seq.checked_sub(1);
-    let wal = Wal::open(&layout, wal_floor).map_err(|e| anyhow::anyhow!("wal open: {e}"))?;
-    let replay = wal
-        .replay()
-        .map_err(|e| anyhow::anyhow!("wal replay: {e}"))?;
+    let _wal = recovery.wal;
+    let replay = recovery.replay;
 
     let mut logical_store = recovered_seed_store;
     for entry in &replay.entries {
-        if entry.seq < manifest.current_snapshot_seq {
-            continue;
-        }
         let payload: WalEntryPayload = bincode::deserialize(&entry.payload)
             .map_err(|e| anyhow::anyhow!("wal payload deserialize at seq {}: {e}", entry.seq))?;
         if let Err(AdapterError::InvalidQuery(msg)) = apply_wal_entry(
@@ -157,6 +158,12 @@ pub fn run_with_checkpoint(
     )
     .unwrap_or(u32::MAX);
     let entry_size = state.entry_size;
+    manifest
+        .migrate_shape_from_snapshot(ManifestShape {
+            entry_size_bytes: state.encoded_db.config.entry_size_bytes,
+            rows_per_shard: state.encoded_db.config.entries_per_shard(),
+        })
+        .map_err(|error| anyhow::anyhow!("source manifest cell shape: {error}"))?;
     if let Some(fixed) = target.fixed_record_size() {
         if fixed != entry_size {
             anyhow::bail!(
@@ -212,6 +219,8 @@ pub fn run_with_checkpoint(
         current_marker: manifest.current_marker,
         encoder_label: new_label.to_owned(),
         prev_encoder_label: Some(old_label.clone()),
+        entry_size_bytes: Some(entry_size),
+        rows_per_shard: Some(u64::from(entries_per_shard)),
     };
     new_manifest
         .save(&layout)

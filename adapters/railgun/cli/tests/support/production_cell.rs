@@ -29,7 +29,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use raven_inspire::params::{InspireParams, InspireVariant};
-use raven_inspire::{ClientSession, ClientState, ServerResponse, ServerSessionHandle};
+use raven_inspire::{
+    ClientSession, ClientState, SeededClientQuery, ServerResponse, ServerSessionHandle,
+};
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{
     build_client_session, build_seeded_query, extract_response, register_client_session,
@@ -40,6 +42,7 @@ use raven_railgun_http::{inspire_router, AppState, HttpConfig};
 use tokio::sync::oneshot;
 
 pub const BEARER_TOKEN: &str = "production-cell-test-token";
+pub const CLIENT_ID: &str = "00112233445566778899aabbccddeeff";
 pub const PRODUCTION_INSTANCE_ID: &str = "ppoi-paths-ofac";
 const ENTRIES_LOG2: usize = 16;
 /// 16 siblings x 32 B per Merkle path.
@@ -66,6 +69,7 @@ pub struct ProductionCell {
     pub client_session: ClientSession,
     pub server_state: Arc<InspireServerState>,
     pub setup_elapsed: Duration,
+    pub max_body_bytes: usize,
     server_handle: tokio::task::JoinHandle<()>,
     /// Registered in-process; HTTP queries ride the same session.
     _session_handle: ServerSessionHandle,
@@ -83,6 +87,14 @@ impl ProductionCell {
         let mut client_session =
             build_client_session((*server_state.crs).clone(), secret_key.clone(), &params)
                 .expect("build_client_session");
+        let (_, registration_query) =
+            build_seeded_query(&client_session, server_state.shard_config(), 0, &params)
+                .expect("build registration query");
+        let registration_keys = registration_query
+            .inspiring_packing_keys
+            .expect("unregistered query carries packing keys");
+        let registration_body =
+            raven_railgun_http::write_versioned(&registration_keys).expect("serialize keys");
         let session_handle: ServerSessionHandle = {
             register_client_session(&mut client_session, &server_state).expect("register session");
             client_session
@@ -101,6 +113,7 @@ impl ProductionCell {
 
         let mut http_config = HttpConfig::demo(BEARER_TOKEN.to_owned());
         http_config.max_concurrent_queries = 4;
+        let max_body_bytes = http_config.max_body_bytes;
         let app_state = AppState::new(engine, http_config).expect("AppState init");
         let setup_elapsed = setup_start.elapsed();
 
@@ -126,6 +139,28 @@ impl ProductionCell {
         });
         ready_rx.await.expect("server ready");
 
+        let session_response = Self::client()
+            .post(format!(
+                "http://{addr}/v1/instance/{PRODUCTION_INSTANCE_ID}/session"
+            ))
+            .bearer_auth(BEARER_TOKEN)
+            .header("x-raven-client-id", CLIENT_ID)
+            .body(registration_body)
+            .send()
+            .await
+            .expect("POST session");
+        assert_eq!(session_response.status(), 200, "session establish");
+        let remote_handle = session_response
+            .headers()
+            .get("x-raven-session")
+            .and_then(|value| value.to_str().ok())
+            .expect("session response carries x-raven-session")
+            .parse()
+            .expect("session handle is a decimal u64");
+        client_session
+            .install_server_session_handle(ServerSessionHandle(remote_handle))
+            .expect("install HTTP session handle");
+
         Self {
             addr,
             db,
@@ -133,6 +168,7 @@ impl ProductionCell {
             client_session,
             server_state: server_state_arc,
             setup_elapsed,
+            max_body_bytes,
             server_handle,
             _session_handle: session_handle,
         }
@@ -157,15 +193,19 @@ impl ProductionCell {
 
     /// Serialized single query for `target_index`, plus the client state that decodes it.
     pub fn seeded_query(&self, target_index: u64) -> (ClientState, Vec<u8>) {
-        let (client_state, query) = build_seeded_query(
+        let (client_state, query) = self.handled_query(target_index);
+        let bytes = raven_railgun_http::write_versioned(&query).expect("serialize query");
+        (client_state, bytes)
+    }
+
+    pub fn handled_query(&self, target_index: u64) -> (ClientState, SeededClientQuery) {
+        build_seeded_query(
             &self.client_session,
             self.server_state.shard_config(),
             target_index,
             &self.params,
         )
-        .expect("build_seeded_query");
-        let bytes = raven_railgun_http::write_versioned(&query).expect("serialize query");
-        (client_state, bytes)
+        .expect("build_seeded_query")
     }
 
     /// The `BATCH_WIDTH` indices both halves use, with their serialized batch body.

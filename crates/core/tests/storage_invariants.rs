@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use proptest::prelude::*;
-use raven_core::{MemoryStore, StorageBackend};
+use raven_core::{MemoryStore, Snapshot as _, StorageBackend};
 
 fn arb_key() -> impl Strategy<Value = u64> {
     0u64..=0xFFFF
@@ -163,6 +163,32 @@ proptest! {
         } else {
             prop_assert!(snap.get(probe).expect("get").is_none());
         }
+    }
+
+    #[test]
+    fn range_scan_matches_btree_half_open_window(
+        ops in arb_ops(),
+        first in arb_key(),
+        second in arb_key(),
+    ) {
+        let store = MemoryStore::new();
+        commit_inserts(&store, &ops);
+        let snapshot = store.snapshot_concrete().expect("snapshot");
+        let start = first.min(second);
+        let end = first.max(second);
+        let expected = ops.iter().fold(BTreeMap::new(), |mut rows, (key, value)| {
+            rows.insert(*key, value.clone());
+            rows
+        });
+        let expected = expected
+            .range(start..end)
+            .map(|(key, value)| (*key, value.clone()))
+            .collect::<Vec<_>>();
+        let actual = snapshot
+            .scan_range(start..end)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("range scan");
+        prop_assert_eq!(actual, expected);
     }
 }
 

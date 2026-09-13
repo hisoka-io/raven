@@ -4,16 +4,28 @@
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { RavenError, RavenPOINodeInterface, hexToBytes } from "../src/index";
-import { makeRegisterSpy } from "./helpers/register_spy";
+import {
+  RavenError,
+  RavenPOINodeInterface,
+  hexToBytes,
+} from "../src/index";
+import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
 import type { ClientPirContext, POIStatus, RavenInspireWasm } from "../src/index";
 
-import { startMockServer, type MockServer } from "./helpers/mock_server";
+import { encodeBatchResponseNodes, encodedBatchCount } from "./helpers/auth_path_stub";
+import { startMockServer, writeBinary, type MockServer } from "./helpers/mock_server";
+import {
+  assertNoCommitmentsInPirRequests,
+  injectCommitment,
+  STUB_QUERY_BYTES,
+  stubQueryBundle,
+} from "./helpers/private_wire";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX = "abababababababababababababababababababababababababababababababab";
 const BC_AT_IDX_0 = "bc00112233445566778899aabbccddeeff00112233445566778899aabbccdd01";
 const BC_AT_IDX_1 = "7f00112233445566778899aabbccddeeff00112233445566778899aabbccdd01";
+const BC_AT_IDX_2 = "5a00112233445566778899aabbccddeeff00112233445566778899aabbccdd01";
 /** Same BC as index 0 except in its final byte, which a 32 B row has no space for. */
 const BC_LAST_BYTE_TWIN = "bc00112233445566778899aabbccddeeff00112233445566778899aabbccdd02";
 const STATUS_ROW_BYTES = 32;
@@ -29,8 +41,9 @@ function statusRow(statusByte: number, bcHex: string, rowBytes: number): Uint8Ar
 
 function passthroughWasm(): RavenInspireWasm {
   return {
+    ...stubRemoteSessionExports(),
     build_client_session: () => ({ free: () => undefined }),
-    build_seeded_query: () => new Uint8Array(16),
+    build_seeded_query: () => stubQueryBundle(),
     // Test routes encode the intended plaintext row into the response body directly.
     extract_response: (_session, _crs, _state, response, _entry) => new Uint8Array(response),
     build_instance_params_blob: () => new Uint8Array(0),
@@ -50,19 +63,22 @@ function stubCtx(entrySize: number = STATUS_ROW_BYTES): ClientPirContext {
   };
 }
 
-/** Serve `row` from `POST /v1/instance/:id/query` under the `[u16 BE schema][body]` envelope. */
-function mountStatusRoute(server: MockServer, row: Uint8Array): void {
+function mountStatusRows(server: MockServer, rows: readonly Uint8Array[]): void {
   server.route(
-    (req) => /^\/v1\/instance\/[^/]+\/query$/.test(req.url ?? ""),
-    (_req, _body, res) => {
-      const out = new Uint8Array(2 + row.length);
-      out[1] = 1;
-      out.set(row, 2);
-      res.writeHead(200, { "content-type": "application/octet-stream" });
-      res.end(Buffer.from(out));
+    (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
+    (_req, body, res) => {
+      const count = encodedBatchCount(body);
+      const responses = Array.from({ length: count }, (_unused, slot) =>
+        slot < rows.length ? rows[slot] : rows[0],
+      );
+      writeBinary(res, encodeBatchResponseNodes(responses));
       return true;
     },
   );
+}
+
+function mountStatusRoute(server: MockServer, row: Uint8Array): void {
+  mountStatusRows(server, [row]);
 }
 
 function sdkFor(server: MockServer, entrySize: number = STATUS_ROW_BYTES): RavenPOINodeInterface {
@@ -148,6 +164,69 @@ describe("T1 status verdict is bound to the requested blinded commitment", () =>
       expect(got[BC_AT_IDX_0][LIST_KEY_HEX]).toBe(expected[statusByte]);
       server.reset();
     }
+  });
+
+  it("batches three statuses in order, pads to four, and sends no BC bytes", async () => {
+    const rows = [
+      statusRow(0, BC_AT_IDX_0, STATUS_ROW_BYTES),
+      statusRow(1, BC_AT_IDX_1, STATUS_ROW_BYTES),
+      statusRow(2, BC_AT_IDX_2, STATUS_ROW_BYTES),
+    ];
+    mountStatusRows(server, rows);
+    const sdk = new RavenPOINodeInterface({
+      endpoint: server.url,
+      bearerToken: TOKEN,
+      useClientPir: true,
+      clientPirContexts: new Map([[`t1Status:${LIST_KEY_HEX}`, stubCtx()]]),
+      bcToIdxMaps: new Map([
+        [
+          LIST_KEY_HEX,
+          new Map([
+            [BC_AT_IDX_0, 0],
+            [BC_AT_IDX_1, 1],
+            [BC_AT_IDX_2, 2],
+          ]),
+        ],
+      ]),
+    });
+
+    const got = await sdk.getPOIsPerList(
+      [LIST_KEY_HEX],
+      [BC_AT_IDX_0, BC_AT_IDX_1, BC_AT_IDX_2].map((blindedCommitment) => ({
+        blindedCommitment,
+        type: "Shield" as const,
+      })),
+    );
+
+    expect([
+      got[BC_AT_IDX_0][LIST_KEY_HEX],
+      got[BC_AT_IDX_1][LIST_KEY_HEX],
+      got[BC_AT_IDX_2][LIST_KEY_HEX],
+    ]).toEqual(["Valid", "ShieldBlocked", "ProofSubmitted"]);
+    const requests = sdk.lastWireRequests();
+    expect(requests).toHaveLength(1);
+    const commitments = [BC_AT_IDX_0, BC_AT_IDX_1, BC_AT_IDX_2];
+    const inspected = assertNoCommitmentsInPirRequests(requests, commitments, {
+      expectedQueryCount: 4,
+      expectedQueryBytes: STUB_QUERY_BYTES,
+    });
+    expect(inspected).toHaveLength(1);
+
+    const injected = injectCommitment(inspected[0], BC_AT_IDX_0);
+    expect(() =>
+      assertNoCommitmentsInPirRequests([injected], commitments, {
+        expectedQueryCount: 4,
+        expectedQueryBytes: STUB_QUERY_BYTES,
+      }),
+    ).toThrow(/contains raw blinded commitment/);
+
+    const asciiInjected = injectCommitment(inspected[0], BC_AT_IDX_0, "ascii");
+    expect(() =>
+      assertNoCommitmentsInPirRequests([asciiInjected], commitments, {
+        expectedQueryCount: 4,
+        expectedQueryBytes: STUB_QUERY_BYTES,
+      }),
+    ).toThrow(/contains ASCII blinded commitment/);
   });
 
   it("refuses an unrecognised status byte after binding the row", async () => {

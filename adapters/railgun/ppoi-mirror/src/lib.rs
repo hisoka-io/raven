@@ -436,12 +436,7 @@ struct IndexedPoiEvent {
 /// Encode [`POIStatus`] as a WAL byte (Valid=0, ShieldBlocked=1, ProofSubmitted=2, Missing=3).
 #[must_use]
 pub fn poi_status_to_byte(s: POIStatus) -> u8 {
-    match s {
-        POIStatus::Valid => 0,
-        POIStatus::ShieldBlocked => 1,
-        POIStatus::ProofSubmitted => 2,
-        POIStatus::Missing => 3,
-    }
+    s.wire_byte()
 }
 
 /// Decode a WAL byte back to [`POIStatus`]; returns `None` for unknown values.

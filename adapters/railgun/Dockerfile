@@ -2,7 +2,7 @@
 # root, since the adapter path-depends on crates/ outside its own workspace:
 #   docker build -t raven-railgun -f adapters/railgun/Dockerfile .
 
-FROM rust:1.85-slim-bookworm AS build
+FROM rust:1.98.0-slim-bookworm AS build
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         pkg-config libssl-dev clang lld git ca-certificates \

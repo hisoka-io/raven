@@ -48,6 +48,8 @@ async fn production_cell_zero_dimension_bails_regression() {
             encoder: EncoderKind::PerLeafBc { tree_number: 0 },
             session_eviction_interval_secs: 0,
             metrics_public: false,
+            enable_fanout: false,
+            max_fanout_shards: 16,
         }
     }
 

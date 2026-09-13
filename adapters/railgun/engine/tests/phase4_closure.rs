@@ -61,7 +61,7 @@ async fn phase4_chain_event_propagates_to_pir_response() {
     config.role = InstanceRole::Live;
     config.scheme_tag = SCHEME_TAG.to_owned();
     config.record_size = TOY_ENTRY_SIZE;
-    config.entries_per_shard = u32::try_from(TOY_ENTRIES).expect("toy entries fits u32");
+    config.entries_per_shard = u32::try_from(params.ring_dim).expect("ring_dim fits u32");
 
     let handle = bootstrap_railgun_engine(config, params.clone(), factory).expect("bootstrap");
 
@@ -194,7 +194,7 @@ async fn resume_floor_is_last_leaf_block_not_chain_head() {
     config.role = InstanceRole::Live;
     config.scheme_tag = SCHEME_TAG.to_owned();
     config.record_size = TOY_ENTRY_SIZE;
-    config.entries_per_shard = u32::try_from(TOY_ENTRIES).expect("toy entries fits u32");
+    config.entries_per_shard = u32::try_from(params.ring_dim).expect("ring_dim fits u32");
     let handle = bootstrap_railgun_engine(config, params, factory).expect("bootstrap");
 
     const LEAF_BLOCK: u64 = 100;

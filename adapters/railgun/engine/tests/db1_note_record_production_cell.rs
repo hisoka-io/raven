@@ -1,7 +1,7 @@
 //! End-to-end note-record test at `ring_dim = 2048`, `entries_per_shard = 2048`,
 //! `entry_size = 512` holding a 328-byte record.
 //!
-//! 328 is not a legal cell width (see `pir_cell_width_law.rs`), so the record
+//! 328 is not a legal cell width (see `cell_width_runtime_gate.rs`), so the record
 //! runs at the smallest legal width above it. The oracle is independent of the
 //! encoder: fields are checked against `Imt::node`, never against the row that
 //! produced them.

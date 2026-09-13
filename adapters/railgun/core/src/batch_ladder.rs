@@ -1,175 +1,107 @@
-//! Fixed-size ladder for batched PIR requests. An unpadded batch publishes
-//! `|batch|` in the clear; padding to a dyadic ladder leaks only the bucket, at
-//! under 2x worst-case slot overhead.
+//! Railgun batch-padding policy over Raven's generic dyadic arithmetic.
 
-use serde::{Deserialize, Serialize};
+pub use raven_core::batch_ladder::LadderViolation;
 
-/// Permitted batch sizes, ascending. Dyadic to cap padding overhead at 2x, and
-/// stopping at 32 because 64 slots exceed the 8 MiB default body cap at the
-/// measured 98,840 B/query.
+/// Railgun's permitted batch sizes, mirrored by the TypeScript SDK.
 pub const BATCH_SIZE_LADDER: [usize; 6] = [1, 2, 4, 8, 16, 32];
 
-/// Largest batch the ladder admits.
+/// Railgun's current deployment ceiling.
+pub const MAX_BATCH_SIZE: usize = 32;
+
+/// Largest batch the Railgun policy admits.
 #[must_use]
 pub const fn max_batch_size() -> usize {
-    32
+    MAX_BATCH_SIZE
 }
 
-/// Whether `len` is a ladder step.
+/// Whether `len` is a Railgun ladder step.
 #[must_use]
-pub fn is_on_ladder(len: usize) -> bool {
-    BATCH_SIZE_LADDER.contains(&len)
+pub const fn is_on_ladder(len: usize) -> bool {
+    raven_core::batch_ladder::is_on_ladder(len, MAX_BATCH_SIZE)
 }
 
-/// Smallest ladder step fitting `len` real queries; `None` when empty or above
-/// [`max_batch_size`], where the caller must split into independently-padded
-/// batches.
+/// Smallest Railgun ladder step fitting `len`, or `None` above the deployment ceiling.
+///
+/// Empty input retains the adapter's existing `Some(1)` convention so callers can issue their
+/// own domain-specific empty-batch error after sizing.
 #[must_use]
 pub fn padded_len(len: usize) -> Option<usize> {
-    BATCH_SIZE_LADDER.iter().copied().find(|step| *step >= len)
-}
-
-/// Rejection reason for an off-ladder batch length.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LadderViolation {
-    /// Zero-length batch.
-    Empty,
-    /// Above [`max_batch_size`].
-    TooLarge {
-        /// Received length.
-        len: usize,
-    },
-    /// Between two steps, so the true count leaks.
-    OffStep {
-        /// Received length.
-        len: usize,
-        /// Step the client should have padded to.
-        expected: usize,
-    },
-}
-
-impl std::fmt::Display for LadderViolation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Empty => write!(
-                f,
-                "batch length 0 is off the fixed-size ladder {BATCH_SIZE_LADDER:?}"
-            ),
-            Self::TooLarge { len } => write!(
-                f,
-                "batch length {len} exceeds the fixed-size ladder maximum {}; \
-                 split into several batches and pad each",
-                max_batch_size()
-            ),
-            Self::OffStep { len, expected } => write!(
-                f,
-                "batch length {len} is off the fixed-size ladder {BATCH_SIZE_LADDER:?}; \
-                 pad to {expected} before sending, otherwise the batch length \
-                 publishes the exact query count"
-            ),
-        }
+    if len == 0 {
+        return Some(1);
     }
+    raven_core::batch_ladder::padded_len(len, MAX_BATCH_SIZE).ok()
 }
 
-impl std::error::Error for LadderViolation {}
-
-/// Accept `len` only if it is a ladder step.
+/// Accept `len` only when it is a Railgun ladder step.
 ///
 /// # Errors
-/// A [`LadderViolation`] naming the step the caller should have used.
+/// Returns a [`LadderViolation`] naming the required step or current deployment ceiling.
 pub fn check_batch_len(len: usize) -> Result<(), LadderViolation> {
-    if len == 0 {
-        return Err(LadderViolation::Empty);
-    }
-    match padded_len(len) {
-        None => Err(LadderViolation::TooLarge { len }),
-        Some(step) if step == len => Ok(()),
-        Some(expected) => Err(LadderViolation::OffStep { len, expected }),
-    }
+    raven_core::batch_ladder::check_batch_len(len, MAX_BATCH_SIZE)
 }
 
 #[cfg(test)]
 mod tests {
+    use serde::Deserialize;
+
     use super::{
-        check_batch_len, is_on_ladder, max_batch_size, padded_len, LadderViolation,
-        BATCH_SIZE_LADDER,
+        check_batch_len, is_on_ladder, max_batch_size, padded_len, BATCH_SIZE_LADDER,
+        MAX_BATCH_SIZE,
     };
 
-    #[test]
-    fn ladder_is_ascending_and_dyadic() {
-        for pair in BATCH_SIZE_LADDER.windows(2) {
-            let (Some(lo), Some(hi)) = (pair.first().copied(), pair.last().copied()) else {
-                panic!("windows(2) always yields two elements");
-            };
-            assert!(hi > lo, "ladder must ascend: {lo} then {hi}");
-            assert_eq!(hi, lo * 2, "ladder must be dyadic: {lo} then {hi}");
-        }
-        assert_eq!(
-            BATCH_SIZE_LADDER.last().copied(),
-            Some(max_batch_size()),
-            "max_batch_size must track the top ladder step"
-        );
+    #[derive(Deserialize)]
+    struct BatchCapacityEvidence {
+        #[serde(rename = "serializedQueryBytes")]
+        query_len: usize,
+        #[serde(rename = "batchFrameBytes")]
+        frame_len: usize,
+        #[serde(rename = "defaultBodyCapBytes")]
+        body_cap: usize,
     }
 
     #[test]
-    fn padded_len_lands_on_a_step_and_never_shrinks() {
-        for len in 1..=max_batch_size() {
-            let padded = padded_len(len).expect("in range");
-            assert!(
-                is_on_ladder(padded),
-                "padded {len} -> {padded} is off-ladder"
-            );
-            assert!(
-                padded >= len,
-                "padding must not drop queries: {len} -> {padded}"
-            );
-            assert!(
-                padded < len * 2,
-                "dyadic ladder must keep overhead under 2x: {len} -> {padded}"
-            );
-        }
-    }
-
-    #[test]
-    fn empty_and_oversized_batches_are_rejected() {
-        assert_eq!(check_batch_len(0), Err(LadderViolation::Empty));
-        assert_eq!(padded_len(0), Some(1));
-        assert_eq!(padded_len(max_batch_size() + 1), None);
+    fn policy_matches_the_existing_six_steps() {
+        assert_eq!(BATCH_SIZE_LADDER, [1, 2, 4, 8, 16, 32]);
+        assert_eq!(max_batch_size(), MAX_BATCH_SIZE);
+        let query_hex =
+            include_str!("../../sdk/tests/fixtures/production_handled_query.hex").trim();
         assert_eq!(
-            check_batch_len(33),
-            Err(LadderViolation::TooLarge { len: 33 })
+            query_hex.len() % 2,
+            0,
+            "query fixture must contain whole bytes"
         );
-    }
-
-    #[test]
-    fn off_step_lengths_name_the_step_they_should_have_used() {
+        let capacity_evidence: BatchCapacityEvidence = serde_json::from_str(include_str!(
+            "../../sdk/tests/fixtures/production_batch_capacity.json"
+        ))
+        .expect("production capacity evidence is JSON");
+        let serialized_query_bytes = query_hex.len() / 2;
+        let frame_bytes = capacity_evidence.frame_len;
+        let body_cap_bytes = capacity_evidence.body_cap;
+        let raw_capacity = (body_cap_bytes - frame_bytes) / serialized_query_bytes;
+        let admitted_body_bytes = frame_bytes + raw_capacity * serialized_query_bytes;
+        let refused_body_bytes = frame_bytes + (raw_capacity + 1) * serialized_query_bytes;
+        assert_eq!(serialized_query_bytes, capacity_evidence.query_len);
+        assert_eq!(serialized_query_bytes, 49_445);
+        assert_eq!(raw_capacity, 169);
+        assert!(admitted_body_bytes <= body_cap_bytes);
+        assert!(refused_body_bytes > body_cap_bytes);
         assert_eq!(
-            check_batch_len(3),
-            Err(LadderViolation::OffStep {
-                len: 3,
-                expected: 4
-            })
-        );
-        assert_eq!(
-            check_batch_len(17),
-            Err(LadderViolation::OffStep {
-                len: 17,
-                expected: 32
-            })
+            raven_core::batch_ladder::largest_dyadic_step(raw_capacity),
+            Ok(128),
+            "the production wire capacity exposes 128 without changing adapter policy"
         );
         for step in BATCH_SIZE_LADDER {
-            check_batch_len(step).expect("every ladder step is accepted");
+            assert!(is_on_ladder(step));
+            check_batch_len(step).expect("policy step must pass");
         }
     }
 
     #[test]
-    fn violation_text_names_the_ladder() {
-        let msg = LadderViolation::OffStep {
-            len: 5,
-            expected: 8,
-        }
-        .to_string();
-        assert!(msg.contains('5') && msg.contains('8'), "{msg}");
-        assert!(msg.contains("publishes the exact query count"), "{msg}");
+    fn compatibility_wrapper_preserves_sizing_behavior() {
+        assert_eq!(padded_len(0), Some(1));
+        assert_eq!(padded_len(3), Some(4));
+        assert_eq!(padded_len(17), Some(32));
+        assert_eq!(padded_len(33), None);
+        assert!(check_batch_len(3).is_err());
     }
 }

@@ -28,14 +28,11 @@ fn parse_hex(s: &str) -> Vec<u8> {
     );
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(s.len() / 2);
-    let mut chunks = bytes.chunks_exact(2);
-    for chunk in chunks.by_ref() {
-        match chunk {
-            [hi, lo] => out.push((decode_hex_nibble(*hi) << 4) | decode_hex_nibble(*lo)),
-            _ => unreachable!("chunks_exact(2) yields only 2-element slices"),
-        }
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    for [hi, lo] in pairs {
+        out.push((decode_hex_nibble(*hi) << 4) | decode_hex_nibble(*lo));
     }
-    assert!(chunks.remainder().is_empty());
+    assert!(remainder.is_empty());
     out
 }
 

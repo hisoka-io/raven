@@ -18,6 +18,8 @@ raven-railgun-persistence = { workspace = true }
 raven-railgun-indexer = { workspace = true }
 raven-railgun-poseidon = { workspace = true }
 raven-inspire = { workspace = true }
+raven-inspire-cache = { path = "../../../crates/inspire-cache" }
+raven-inspire-session = { path = "../../../crates/inspire-session" }
 arc-swap = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

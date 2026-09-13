@@ -12,7 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use raven_railgun_persistence::{Manifest, MANIFEST_SCHEMA_VERSION};
+use raven_railgun_persistence::{
+    atomic_write, fsync_parent_dir, Manifest, StoreLayout, MANIFEST_SCHEMA_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -62,11 +64,6 @@ const EXPORT_SCHEMA_VERSION: u32 = 1;
 const EXPORT_KIND: &str = "raven-railgun-export/v1";
 const SHARED_CRS_DIR: &str = "shared/crs/";
 const INSTANCES_PREFIX: &str = "instances/";
-const PER_INSTANCE_MANIFEST: &str = "manifest.json";
-const SNAPSHOTS_DIR: &str = "snapshots";
-const WAL_DIR: &str = "wal";
-const WAL_ARCHIVED_DIR: &str = "archived";
-const WAL_CURRENT_FILE: &str = "current.log";
 const STAGING_PREFIX: &str = ".staging.";
 const BACKUP_PREFIX: &str = ".pre-import.";
 const ED25519_SEED_LEN: usize = 32;
@@ -258,7 +255,8 @@ pub fn run_export(opts: ExportOptions) -> anyhow::Result<()> {
     fsync_file(&opts.output)?;
     if let Some(parent) = opts.output.parent() {
         if !parent.as_os_str().is_empty() {
-            fsync_dir(parent)?;
+            fsync_parent_dir(parent)
+                .with_context(|| format!("fsync export directory {}", parent.display()))?;
         }
     }
 
@@ -274,11 +272,13 @@ pub fn run_export(opts: ExportOptions) -> anyhow::Result<()> {
         };
         let bytes = serde_json::to_vec_pretty(&detached)?;
         let sig_path = sig_sidecar_path(&opts.output);
-        atomic_write_file(&sig_path, &bytes)?;
+        atomic_write(&sig_path, &bytes)
+            .with_context(|| format!("write signature sidecar {}", sig_path.display()))?;
         fsync_file(&sig_path)?;
         if let Some(parent) = sig_path.parent() {
             if !parent.as_os_str().is_empty() {
-                fsync_dir(parent)?;
+                fsync_parent_dir(parent)
+                    .with_context(|| format!("fsync signature directory {}", parent.display()))?;
             }
         }
     }
@@ -525,7 +525,8 @@ pub fn run_import(opts: ImportOptions) -> anyhow::Result<()> {
         })?;
         if let Some(parent) = dest_root.parent() {
             if !parent.as_os_str().is_empty() {
-                fsync_dir(parent)?;
+                fsync_parent_dir(parent)
+                    .with_context(|| format!("fsync backup directory {}", parent.display()))?;
             }
         }
         Some(path)
@@ -549,14 +550,15 @@ pub fn run_import(opts: ImportOptions) -> anyhow::Result<()> {
     }
     if let Some(parent) = dest_root.parent() {
         if !parent.as_os_str().is_empty() {
-            fsync_dir(parent)?;
+            fsync_parent_dir(parent)
+                .with_context(|| format!("fsync import directory {}", parent.display()))?;
         }
     }
 
     let mut imported_ids: BTreeSet<String> = BTreeSet::new();
     for inst in &manifest.instances {
         let dir = dest_root.join(&inst.id);
-        let manifest_path = dir.join(PER_INSTANCE_MANIFEST);
+        let manifest_path = StoreLayout::inspect(&dir).manifest_path();
         let bytes = fs::read(&manifest_path).with_context(|| {
             format!(
                 "post-import: read recovered manifest at {}",
@@ -604,7 +606,7 @@ fn discover_instances(root: &Path) -> anyhow::Result<Vec<DiscoveredInstance>> {
     }
     let mut out: Vec<DiscoveredInstance> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    if root.join(PER_INSTANCE_MANIFEST).is_file() {
+    if StoreLayout::inspect(root).manifest_path().is_file() {
         let id = root
             .file_name()
             .and_then(|n| n.to_str())
@@ -623,7 +625,7 @@ fn discover_instances(root: &Path) -> anyhow::Result<Vec<DiscoveredInstance>> {
         if !path.is_dir() {
             continue;
         }
-        if !path.join(PER_INSTANCE_MANIFEST).is_file() {
+        if !StoreLayout::inspect(&path).manifest_path().is_file() {
             continue;
         }
         let id = entry
@@ -658,9 +660,15 @@ fn plan_instance(
     entry: &DiscoveredInstance,
     include_current_wal: bool,
 ) -> anyhow::Result<PlannedInstance> {
-    let manifest_bytes = fs::read(entry.dir.join(PER_INSTANCE_MANIFEST))?;
-    let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| anyhow!("parse manifest for {}: {e}", entry.id))?;
+    let layout = StoreLayout::inspect(&entry.dir);
+    let manifest = Manifest::load(&layout)
+        .map_err(|e| anyhow!("read manifest for {}: {e}", entry.id))?
+        .ok_or_else(|| {
+            anyhow!(
+                "manifest disappeared while planning export for {}",
+                entry.id
+            )
+        })?;
     if manifest.schema_version != MANIFEST_SCHEMA_VERSION {
         bail!(
             "instance {}: manifest schema_version {} != supported {}",
@@ -671,40 +679,28 @@ fn plan_instance(
     }
 
     let mut files: Vec<PlannedFile> = Vec::new();
-    push_file(&mut files, entry, PER_INSTANCE_MANIFEST.to_owned())?;
+    push_file(&mut files, entry, layout.manifest_path())?;
 
-    let snap_dir = entry
-        .dir
-        .join(SNAPSHOTS_DIR)
-        .join(format!("snap-{:06}", manifest.current_snapshot_id.0));
+    let snap_dir = layout.snapshot_dir(manifest.current_snapshot_id);
     if snap_dir.is_dir() {
-        let header = snap_dir.join("header.bin");
+        let header = layout.snapshot_header_path(manifest.current_snapshot_id);
         if header.is_file() {
-            let rel = format!(
-                "{SNAPSHOTS_DIR}/snap-{:06}/header.bin",
-                manifest.current_snapshot_id.0
-            );
-            push_file(&mut files, entry, rel)?;
+            push_file(&mut files, entry, header)?;
         }
-        let data = snap_dir.join("data.bincode");
+        let data = layout.snapshot_data_path(manifest.current_snapshot_id);
         if data.is_file() {
-            let rel = format!(
-                "{SNAPSHOTS_DIR}/snap-{:06}/data.bincode",
-                manifest.current_snapshot_id.0
-            );
-            push_file(&mut files, entry, rel)?;
+            push_file(&mut files, entry, data)?;
         }
     }
 
     if include_current_wal {
-        let current = entry.dir.join(WAL_DIR).join(WAL_CURRENT_FILE);
+        let current = layout.wal_current_path();
         if current.is_file() {
-            let rel = format!("{WAL_DIR}/{WAL_CURRENT_FILE}");
-            push_file(&mut files, entry, rel)?;
+            push_file(&mut files, entry, current)?;
         }
     }
 
-    let archived_dir = entry.dir.join(WAL_DIR).join(WAL_ARCHIVED_DIR);
+    let archived_dir = layout.archived_wals_dir();
     if archived_dir.is_dir() {
         let mut entries: Vec<_> = fs::read_dir(&archived_dir)?
             .filter_map(std::result::Result::ok)
@@ -712,12 +708,7 @@ fn plan_instance(
             .collect();
         entries.sort_by_key(std::fs::DirEntry::file_name);
         for e in entries {
-            let name = e
-                .file_name()
-                .into_string()
-                .map_err(|os| anyhow!("non-UTF-8 archived WAL filename: {}", os.display()))?;
-            let rel = format!("{WAL_DIR}/{WAL_ARCHIVED_DIR}/{name}");
-            push_file(&mut files, entry, rel)?;
+            push_file(&mut files, entry, e.path())?;
         }
     }
 
@@ -732,9 +723,21 @@ fn plan_instance(
 fn push_file(
     out: &mut Vec<PlannedFile>,
     entry: &DiscoveredInstance,
-    rel: String,
+    abs: PathBuf,
 ) -> anyhow::Result<()> {
-    let abs = entry.dir.join(&rel);
+    let relative = abs.strip_prefix(&entry.dir).map_err(|error| {
+        anyhow!(
+            "planned path {} escapes instance {}: {error}",
+            abs.display(),
+            entry.id
+        )
+    })?;
+    let rel = relative
+        .components()
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| anyhow!("non-UTF-8 planned path: {}", abs.display()))?
+        .join("/");
     let bytes =
         fs::read(&abs).with_context(|| format!("read planned file {} for {}", rel, entry.id))?;
     let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
@@ -1000,13 +1003,15 @@ fn extract_instances(parsed: &ParsedTarball, staging_root: &Path) -> anyhow::Res
                 .files
                 .get(&key)
                 .ok_or_else(|| anyhow!("missing tarball entry {key}"))?;
-            atomic_write_file(&dst, bytes)?;
+            atomic_write(&dst, bytes)
+                .with_context(|| format!("extract tarball entry {key} to {}", dst.display()))?;
         }
-        let snap_dir = inst_root.join(SNAPSHOTS_DIR);
+        let layout = StoreLayout::inspect(&inst_root);
+        let snap_dir = layout.snapshots_dir();
         if !snap_dir.is_dir() {
             fs::create_dir_all(&snap_dir)?;
         }
-        let wal_archived = inst_root.join(WAL_DIR).join(WAL_ARCHIVED_DIR);
+        let wal_archived = layout.archived_wals_dir();
         if !wal_archived.is_dir() {
             fs::create_dir_all(&wal_archived)?;
         }
@@ -1024,12 +1029,12 @@ fn root_has_instances(root: &Path) -> anyhow::Result<bool> {
             root.display()
         );
     }
-    if root.join(PER_INSTANCE_MANIFEST).is_file() {
+    if StoreLayout::inspect(root).manifest_path().is_file() {
         return Ok(true);
     }
     for child in fs::read_dir(root)? {
         let entry = child?;
-        if entry.path().join(PER_INSTANCE_MANIFEST).is_file() {
+        if StoreLayout::inspect(entry.path()).manifest_path().is_file() {
             return Ok(true);
         }
     }
@@ -1046,48 +1051,6 @@ fn sibling_with_suffix(dest: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
     let mut new_name = name.to_owned();
     new_name.push(suffix);
     Ok(parent.join(new_name))
-}
-
-fn atomic_write_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("import-tmp");
-    {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    if let Some(parent) = path.parent() {
-        fsync_dir(parent)?;
-    }
-    Ok(())
-}
-
-/// Tolerates EINVAL (dirs that disallow fsync), `Unsupported` (WSL2/virtio-fs), and
-/// `PermissionDenied` (sandboxed envs). All other errors propagate so ENOSPC/EIO surface.
-fn fsync_dir(parent: &Path) -> anyhow::Result<()> {
-    match fs::File::open(parent) {
-        Ok(dir) => match dir.sync_all() {
-            Ok(()) => Ok(()),
-            Err(e)
-                if matches!(e.raw_os_error(), Some(22))
-                    || matches!(e.kind(), std::io::ErrorKind::Unsupported) =>
-            {
-                Ok(())
-            }
-            Err(e) => Err(anyhow::Error::from(e))
-                .with_context(|| format!("fsync directory {}", parent.display())),
-        },
-        Err(e) if matches!(e.kind(), std::io::ErrorKind::PermissionDenied) => Ok(()),
-        Err(e) => Err(anyhow::Error::from(e))
-            .with_context(|| format!("open directory {} for fsync", parent.display())),
-    }
 }
 
 fn fsync_file(path: &Path) -> anyhow::Result<()> {

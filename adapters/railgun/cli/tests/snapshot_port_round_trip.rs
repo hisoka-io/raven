@@ -59,6 +59,8 @@ fn bootstrap_instance(
         current_marker: 12_345_678,
         encoder_label: encoder_label.to_owned(),
         prev_encoder_label: None,
+        entry_size_bytes: Some(32),
+        rows_per_shard: Some(2048),
     };
     manifest.save(&layout).expect("manifest save");
     inst_dir
@@ -201,6 +203,70 @@ fn export_then_import_round_trip_preserves_byte_identity() {
     let restored_beta = collect_capturable_bytes(&dst_root.join("beta"));
     assert_eq!(restored_alpha, original_alpha, "alpha byte-identity");
     assert_eq!(restored_beta, original_beta, "beta byte-identity");
+}
+
+#[test]
+fn export_inspection_does_not_create_layout_under_non_instance_candidates() {
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let root = scratch.path().join("instances");
+    std::fs::create_dir_all(&root).expect("root");
+    bootstrap_instance(&root, "live", "per-leaf-bc", SCHEME_TAG_A, b"snapshot", 0);
+    let candidate = root.join("candidate");
+    std::fs::create_dir(&candidate).expect("candidate");
+    let tarball = scratch.path().join("export.tar.zst");
+
+    run_export(ExportOptions {
+        data_dir: root,
+        output: tarball,
+        signing_key: None,
+        include_current_wal: false,
+        keep_snapshots: 0,
+    })
+    .expect("export");
+
+    assert_eq!(
+        std::fs::read_dir(&candidate)
+            .expect("candidate read")
+            .count(),
+        0,
+        "read-only candidate inspection must not create manifest, snapshots, or WAL paths"
+    );
+}
+
+#[test]
+fn signed_export_ignores_legacy_fixed_tmp_collision() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let src_root = scratch.path().join("src");
+    std::fs::create_dir_all(&src_root).expect("mkdir src");
+    bootstrap_instance(
+        &src_root,
+        "alpha",
+        "per-leaf-bc",
+        SCHEME_TAG_A,
+        b"snapshot payload",
+        1,
+    );
+
+    let signing_path = scratch.path().join("signing.key");
+    write_signing_key(&signing_path, &deterministic_signing_key(41));
+    let tarball = scratch.path().join("export.tar.zst");
+    let mut sig_name = tarball.as_os_str().to_owned();
+    sig_name.push(".sig");
+    let sig_path = PathBuf::from(sig_name);
+    let fixed_tmp = sig_path.with_extension("import-tmp");
+    std::fs::create_dir(&fixed_tmp).expect("reserve legacy fixed tmp path");
+
+    run_export(ExportOptions {
+        data_dir: src_root,
+        output: tarball,
+        signing_key: Some(signing_path),
+        include_current_wal: false,
+        keep_snapshots: 0,
+    })
+    .expect("shared atomic write must ignore legacy fixed tmp collision");
+
+    assert!(sig_path.is_file(), "signature sidecar must be published");
+    assert!(fixed_tmp.is_dir(), "legacy tmp sentinel must be untouched");
 }
 
 fn collect_capturable_bytes(dir: &Path) -> BTreeMap<String, Vec<u8>> {

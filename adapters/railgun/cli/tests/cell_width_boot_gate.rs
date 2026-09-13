@@ -39,6 +39,8 @@ fn opts_with(
         encoder,
         session_eviction_interval_secs: 0,
         metrics_public: false,
+        enable_fanout: false,
+        max_fanout_shards: 16,
     }
 }
 

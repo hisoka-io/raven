@@ -193,6 +193,48 @@ struct InitialTipFailureFallback {
     range_calls: AtomicU64,
 }
 
+#[derive(Debug)]
+struct DecodeFailingBackfill {
+    latest_calls: AtomicU64,
+    range_calls: AtomicU64,
+}
+
+#[async_trait]
+impl ChainSource for DecodeFailingBackfill {
+    async fn latest_block(&self) -> Result<u64> {
+        let attempt = self.latest_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(if attempt < 2 { 100 } else { 102 })
+    }
+
+    async fn events_in_range(&self, _from: u64, _to: u64) -> Result<Vec<RailgunEvent>> {
+        self.range_calls.fetch_add(1, Ordering::SeqCst);
+        Err(IndexerError::Decode(
+            "polling endpoint repeated malformed event".into(),
+        ))
+    }
+
+    async fn root_history(
+        &self,
+        _tree: u32,
+        _root: [u8; 32],
+        _at: Option<alloy::eips::BlockId>,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn block_hash(&self, _n: u64) -> Result<[u8; 32]> {
+        Ok([0; 32])
+    }
+
+    async fn merkle_root(&self, _at: Option<alloy::eips::BlockId>) -> Result<[u8; 32]> {
+        Ok([0; 32])
+    }
+
+    async fn active_tree_number(&self, _at: Option<alloy::eips::BlockId>) -> Result<u32> {
+        Ok(0)
+    }
+}
+
 #[async_trait]
 impl ChainSource for InitialTipFailureFallback {
     async fn latest_block(&self) -> Result<u64> {
@@ -665,31 +707,116 @@ async fn unknown_initial_watermark_fails_closed_without_historical_replay() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn decode_error_fences_an_already_forwarded_overlay() {
+async fn decode_error_fences_the_overlay_then_recovers_from_polling() {
     let streamer = Arc::new(ScriptedOpens {
-        scripts: Mutex::new(vec![OpenScript::Frames(
+        scripts: Mutex::new(vec![OpenScript::HeldFrames(
             Vec::new(),
             vec![shield_log(101, false), malformed_shield_log(102)],
+            Duration::from_secs(2),
         )]),
         opens: AtomicU64::new(0),
     });
     let fallback = Arc::new(BackfillFallback {
         tips: Mutex::new(vec![100, 100]),
-        steady_tip: 100,
-        events: Vec::new(),
+        steady_tip: 102,
+        events: [101, 102]
+            .map(|block_number| RailgunEvent::Shield {
+                block_number,
+                tx_hash: [0; 32],
+                tree_number: 0,
+                start_position: 0,
+                leaves: Vec::new(),
+            })
+            .to_vec(),
         latest_calls: AtomicU64::new(0),
         range_calls: AtomicU64::new(0),
         ranges: Mutex::new(Vec::new()),
     });
     let (tx, mut rx) = mpsc::channel(16);
     let worker = SubscribeWorker::new(streamer, fallback, tx);
-    let join = tokio::spawn(async move { worker.run(SubscribeWorkerConfig::default()).await });
+    let join = tokio::spawn(async move {
+        worker
+            .run(SubscribeWorkerConfig {
+                heartbeat_secs: 1,
+                reconnect_total_secs: 1,
+                polling_dwell: Duration::from_millis(50),
+            })
+            .await
+    });
+
+    let mut sequence = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while sequence.len() < 4 && tokio::time::Instant::now() < deadline {
+        let Some(message) = tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .ok()
+            .flatten()
+        else {
+            continue;
+        };
+        match message {
+            IndexerMessage::Event { block_height, .. } => sequence.push(("event", block_height)),
+            IndexerMessage::Reorg { height } => sequence.push(("reorg", height)),
+            IndexerMessage::ReorgBarrier { height, .. } => {
+                panic!("subscribe worker cannot emit startup Reorg({height})")
+            }
+            IndexerMessage::Heartbeat { .. } => {}
+        }
+    }
+    assert_eq!(
+        sequence,
+        [
+            ("event", 101),
+            ("reorg", 100),
+            ("event", 101),
+            ("event", 102)
+        ]
+    );
+    drop(rx);
+    let outcome = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("worker exits after its consumer closes")
+        .expect("worker join");
+    assert!(
+        outcome.is_ok(),
+        "polling recovery must keep the worker alive"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_decode_error_keeps_the_fence_and_fails_closed() {
+    let streamer = Arc::new(ScriptedOpens {
+        scripts: Mutex::new(vec![OpenScript::HeldFrames(
+            Vec::new(),
+            vec![shield_log(101, false), malformed_shield_log(102)],
+            Duration::from_secs(2),
+        )]),
+        opens: AtomicU64::new(0),
+    });
+    let fallback = Arc::new(DecodeFailingBackfill {
+        latest_calls: AtomicU64::new(0),
+        range_calls: AtomicU64::new(0),
+    });
+    let observed_fallback = Arc::clone(&fallback);
+    let (tx, mut rx) = mpsc::channel(16);
+    let worker = SubscribeWorker::new(streamer, fallback, tx);
+    let join = tokio::spawn(async move {
+        worker
+            .run(SubscribeWorkerConfig {
+                heartbeat_secs: 1,
+                reconnect_total_secs: 1,
+                polling_dwell: Duration::from_millis(50),
+            })
+            .await
+    });
 
     let outcome = tokio::time::timeout(Duration::from_secs(2), join)
         .await
-        .expect("worker exits on decode error")
+        .expect("repeated polling decode must stop the worker")
         .expect("worker join");
-    assert!(outcome.is_err(), "malformed known event must fail");
+    assert!(matches!(outcome, Err(IndexerError::Decode(_))));
+    assert_eq!(observed_fallback.range_calls.load(Ordering::SeqCst), 1);
+
     let mut sequence = Vec::new();
     while let Ok(message) = rx.try_recv() {
         match message {

@@ -89,6 +89,18 @@ describe("wasm extract_response against the checked-in Rust-emitted fixture", ()
     sessions.length = 0;
   });
 
+  it("exports the typed fanout shard retarget without changing encrypted query bytes", () => {
+    const session = newSession();
+    const original = decodeClientPirQueryBundle(
+      wasm.build_seeded_query(session, shardConfigBincode, 0n),
+    ).queryBytes;
+    const retargeted = wasm.retarget_seeded_query_shard(original, 23);
+
+    expect(new DataView(original.buffer, original.byteOffset).getUint32(0, true)).toBe(0);
+    expect(new DataView(retargeted.buffer, retargeted.byteOffset).getUint32(0, true)).toBe(23);
+    expect(retargeted.subarray(4)).toEqual(original.subarray(4));
+  });
+
   it("recovers the row native Rust encoded, byte for byte, at every fixture index", () => {
     expect(meta.target_indices).toEqual([0, 1, 2, 3, 4]);
     const session = newSession();

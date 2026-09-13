@@ -4,6 +4,7 @@ export type RavenErrorKind =
   | "Network"
   | "InvalidQuery"
   | "StaleAdapter"
+  | "StaleData"
   | "ServerError"
   | "DecodeError"
   | "BatchMismatch";
@@ -21,12 +22,33 @@ export interface RavenErrorContext {
   readonly cause?: string;
 }
 
-/** Error class with a discriminated `kind` field; narrow via `RavenError.is`. */
-export class RavenError extends Error {
-  public readonly kind: RavenErrorKind;
-  public readonly context: RavenErrorContext;
+/** Public freshness values carried by a private stale-data refusal. */
+export interface StaleDataContext {
+  readonly operation: "t1-status" | "t2-auth-path" | "fanout";
+  readonly lagBlocks: number;
+  readonly appliedHeight: number;
+  readonly epoch: number;
+  readonly confidence: number;
+  readonly confidenceFloor: number;
+}
 
-  private constructor(kind: RavenErrorKind, message: string, context: RavenErrorContext) {
+/** A private response refused because its confidence is below the configured floor. */
+export type StaleDataError = RavenError<StaleDataContext> & {
+  readonly kind: "StaleData";
+  readonly context: StaleDataContext;
+};
+
+/** Kind-specific Raven error type returned by [`RavenError.is`]. */
+export type RavenErrorByKind<K extends RavenErrorKind> = K extends "StaleData"
+  ? StaleDataError
+  : RavenError & { readonly kind: K };
+
+/** Error class with a discriminated `kind` field; narrow via `RavenError.is`. */
+export class RavenError<C = RavenErrorContext> extends Error {
+  public readonly kind: RavenErrorKind;
+  public readonly context: C;
+
+  private constructor(kind: RavenErrorKind, message: string, context: C) {
     super(message);
     this.name = "RavenError";
     this.kind = kind;
@@ -50,6 +72,11 @@ export class RavenError extends Error {
     return new RavenError("StaleAdapter", message, context);
   }
 
+  /** Private data below the caller's confidence floor; fail closed by default. */
+  static staleData(message: string, context: StaleDataContext): StaleDataError {
+    return new RavenError("StaleData", message, context) as StaleDataError;
+  }
+
   /** Server 4xx/5xx (except the 400 stale-schema path); `status` carries the code. */
   static serverError(message: string, context: RavenErrorContext = {}): RavenError {
     return new RavenError("ServerError", message, context);
@@ -66,7 +93,7 @@ export class RavenError extends Error {
   }
 
   /** Type-narrow predicate: true iff `err` is a `RavenError` of `kind`. */
-  static is<K extends RavenErrorKind>(err: unknown, kind: K): err is RavenError & { kind: K } {
+  static is<K extends RavenErrorKind>(err: unknown, kind: K): err is RavenErrorByKind<K> {
     return err instanceof RavenError && err.kind === kind;
   }
 }

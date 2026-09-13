@@ -229,6 +229,8 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
         trusted_proxy_cidrs: None,
         metrics_public: None,
         session_eviction_interval_secs: None,
+        enable_fanout: None,
+        max_fanout_shards: None,
         reorg_window_path: None,
     };
 

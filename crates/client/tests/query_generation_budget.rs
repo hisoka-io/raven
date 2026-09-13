@@ -10,13 +10,9 @@
 //! flakes on shared CI; a serialized length is platform-invariant, so this runs natively and
 //! blocks per commit.
 //!
-//! The number this pins is dominated by a design fact, not by noise: `register_client_session`
-//! (`crates/client/src/lib.rs:309-325`, exercised by `tests/session_params_drift.rs`) validates
-//! parameter drift and never sets a session
-//! handle, so `query_seeded` takes its `None` branch (`crates/inspire/src/pir/session.rs:223-226`)
-//! and inlines the full `ClientPackingKeys` into EVERY query, forever. Shipping the client
-//! half of the session handshake is what moves this number, and when it does, this test is
-//! where the win is recorded.
+//! The number this pins is dominated by the session handshake: after the client uploads its
+//! packing keys once, `query_seeded` carries only the returned handle. This test is where that
+//! per-query bandwidth win stays locked.
 
 #![allow(
     clippy::expect_used,
@@ -28,7 +24,7 @@
 use raven_client::build_seeded_query_rust_with_noise_seed;
 use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::InspireParams;
-use raven_inspire::{setup as inspire_setup, ClientSession};
+use raven_inspire::{setup as inspire_setup, ClientSession, ServerSessionHandle};
 
 const ENTRY_BYTES: usize = 32;
 const PINNED_NOISE_SEED: [u8; 32] = [0x5a; 32];
@@ -53,7 +49,7 @@ fn test_params() -> InspireParams {
 ///
 /// `Poly{coeffs: Vec<u64>, moduli: Vec<u64>, q, dim, crt_q0_inv_mod_q1, is_ntt}`
 /// (`crates/inspire/src/math/poly.rs:48-55`) is `8*d*k + 8*k + 41`; a seeded RLWE row adds its
-/// 32-byte seed; a seeded RGSW carries `2*ell` rows; `ClientPackingKeys` is `ell` polynomials plus
+/// 32-byte seed; a seeded RGSW carries `ell` rows; `ClientPackingKeys` is `ell` polynomials plus
 /// a header, because `z_body` ships empty and `full_key` is false
 /// (`inspiring2.rs:604-629`, `:684-690`). Derivation recorded at `ORCH-JOURNAL.md:2104-2121`.
 ///
@@ -76,10 +72,10 @@ const fn packing_key_bytes(ring_dim: usize, crt_limbs: usize, gadget_len: usize)
 }
 
 const fn rgsw_bytes(ring_dim: usize, crt_limbs: usize, gadget_len: usize) -> usize {
-    8 + 2 * gadget_len * (32 + poly_bytes(ring_dim, crt_limbs)) + 24
+    8 + gadget_len * (32 + poly_bytes(ring_dim, crt_limbs)) + 24
 }
 
-/// What the shipped client uploads: no session handle, so the keys ride along.
+/// Legacy pre-handshake query shape, retained to state the removed cost.
 const fn query_bytes_with_inlined_keys(d: usize, k: usize, ell: usize) -> usize {
     4 + rgsw_bytes(d, k, ell) + 4 + (1 + packing_key_bytes(d, k, ell)) + 1
 }
@@ -89,26 +85,23 @@ const fn query_bytes_with_session_handle(d: usize, k: usize, ell: usize) -> usiz
     4 + rgsw_bytes(d, k, ell) + 4 + 1 + 9
 }
 
-/// Anchored to production, not to itself. 98,840 B is the `query_bytes` every real artifact reports
-/// at the shipped `ring_dim = 2048`, single CRT limb, `gadget_len = 3` - reproduced byte-identically
-/// across a 16x entries range, a 16x width range, four months and two machines. The same closed form
-/// predicts `response_bytes = 32,879`, which matches every artifact too.
+/// Anchored to the current 49,445 B query at `ring_dim = 2048`, one CRT limb, and `gadget_len = 3`.
 #[test]
 fn the_size_model_predicts_the_shipped_query_exactly() {
     assert_eq!(
         query_bytes_with_session_handle(2048, 1, 3),
-        98_840,
+        49_445,
         "the model must reproduce the production query size measured on the wire"
     );
     assert_eq!(
         packing_key_bytes(2048, 1, 3),
         49_324,
-        "and the keys the shipped client inlines on top of it"
+        "and the keys the shipped client uploads once before it"
     );
     assert_eq!(
         query_bytes_with_inlined_keys(2048, 1, 3),
-        148_156,
-        "so a real browser query is 1.4989x what the bench harness measures"
+        98_761,
+        "so skipping the handshake would make every browser query 1.4989x the measured shape"
     );
 }
 
@@ -130,7 +123,10 @@ fn measured_query_bytes_at(ring_dim: usize, gadget_len: usize) -> usize {
     let (crs, encoded_db, sk) =
         inspire_setup(&params, &db, ENTRY_BYTES, &mut sampler).expect("setup");
     let mut session_sampler = GaussianSampler::new(params.sigma);
-    let session = ClientSession::new(crs, sk, &mut session_sampler).expect("session");
+    let mut session = ClientSession::new(crs, sk, &mut session_sampler).expect("session");
+    session
+        .install_server_session_handle(ServerSessionHandle(7))
+        .expect("install remote handle");
 
     let (_state, query) = build_seeded_query_rust_with_noise_seed(
         &session,
@@ -147,10 +143,10 @@ fn measured_query_bytes_at(ring_dim: usize, gadget_len: usize) -> usize {
 /// The budget. A change that moves the per-query upload must move this line, which makes
 /// the cost visible in review rather than discovered by a user on a phone.
 ///
-/// Derived by measurement at `ring_dim = 256`, not by arithmetic: 19,132 B. bincode writes
+/// Derived by measurement at `ring_dim = 256`, not by arithmetic: 6,437 B. bincode writes
 /// fixed-width fields over fixed-length vectors, so the length does not vary with the random
 /// values in the query and this is a stable number, not a sample.
-const QUERY_UPLOAD_BUDGET_BYTES: usize = 19_132;
+const QUERY_UPLOAD_BUDGET_BYTES: usize = 6_437;
 
 #[test]
 fn one_query_upload_stays_within_its_budget() {
@@ -177,15 +173,10 @@ fn the_budget_still_tracks_the_real_cost() {
     );
 }
 
-/// Names WHY the budget is what it is: the shipped client has no session handle, so every
-/// query carries a full copy of the packing keys. That is the cost the server-side handshake
-/// already at `POST /v1/instance/:id/session` would remove, and it currently has no client.
-///
-/// Asserts presence and share, not dominance: the keys' fraction of a query is a function of
-/// `ring_dim` (6,316 of 19,132 B here at 256; the production ring is 2048), so a dominance
-/// claim would be an arithmetic accident of the fixture rather than a property.
+/// The shipped client installs the remote handle before emitting a query, so inline keys and
+/// a handle are mutually exclusive on the wire.
 #[test]
-fn every_query_carries_a_full_copy_of_the_packing_keys() {
+fn registered_query_carries_the_handle_and_no_inline_packing_keys() {
     let params = test_params();
     let db: Vec<u8> = (0..params.ring_dim * ENTRY_BYTES)
         .map(|i| u8::try_from(i % 251).expect("< 251"))
@@ -194,7 +185,11 @@ fn every_query_carries_a_full_copy_of_the_packing_keys() {
     let (crs, encoded_db, sk) =
         inspire_setup(&params, &db, ENTRY_BYTES, &mut sampler).expect("setup");
     let mut session_sampler = GaussianSampler::new(params.sigma);
-    let session = ClientSession::new(crs, sk, &mut session_sampler).expect("session");
+    let mut session = ClientSession::new(crs, sk, &mut session_sampler).expect("session");
+    let handle = ServerSessionHandle((1u64 << 32) + 91);
+    session
+        .install_server_session_handle(handle)
+        .expect("install remote handle");
     let (_state, query) = build_seeded_query_rust_with_noise_seed(
         &session,
         &params,
@@ -204,22 +199,15 @@ fn every_query_carries_a_full_copy_of_the_packing_keys() {
     )
     .expect("query");
 
-    let keys = query
-        .inspiring_packing_keys
-        .as_ref()
-        .expect("the shipped client inlines packing keys because no session handle is set");
-    let key_bytes = bincode::serialize(keys).expect("serialize keys").len();
     let total = bincode::serialize(&query).expect("serialize").len();
 
-    assert!(
-        query.session_handle.is_none(),
-        "no client sets a session handle today; if one does, this budget must be re-derived \
-         downward because the keys stop being inlined"
-    );
-    assert!(
-        key_bytes > 0 && key_bytes < total,
-        "the packing keys ({key_bytes} B) are inlined into every {total} B query and are the \
-         cost the session handshake would remove"
+    assert_eq!(query.session_handle, Some(handle));
+    assert!(query.inspiring_packing_keys.is_none());
+    assert_eq!(total, query_bytes_with_session_handle(256, 1, 3));
+    assert_eq!(
+        query_bytes_with_inlined_keys(256, 1, 3) - total,
+        6_308,
+        "the one-time upload must remove the full inline-key option from each later query"
     );
 }
 
@@ -231,7 +219,7 @@ fn every_query_carries_a_full_copy_of_the_packing_keys() {
 fn the_model_predicts_a_wider_ring() {
     assert_eq!(
         measured_query_bytes_at(512, 3),
-        query_bytes_with_inlined_keys(512, 1, 3),
+        query_bytes_with_session_handle(512, 1, 3),
         "doubling the ring must move the query by exactly the modelled amount"
     );
 }
@@ -240,8 +228,8 @@ fn the_model_predicts_a_wider_ring() {
 fn the_model_predicts_a_wider_gadget() {
     assert_eq!(
         measured_query_bytes_at(256, 4),
-        query_bytes_with_inlined_keys(256, 1, 4),
-        "a fourth gadget digit adds two RGSW rows and one packing-key poly, and nothing else"
+        query_bytes_with_session_handle(256, 1, 4),
+        "a fourth gadget digit adds two RGSW rows and nothing else after registration"
     );
 }
 
@@ -250,6 +238,6 @@ fn the_model_predicts_a_wider_gadget() {
 fn the_model_predicts_the_fixture_query() {
     assert_eq!(
         measured_query_bytes(),
-        query_bytes_with_inlined_keys(256, 1, 3)
+        query_bytes_with_session_handle(256, 1, 3)
     );
 }

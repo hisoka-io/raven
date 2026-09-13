@@ -61,6 +61,7 @@ enum Commands {
             "rpc_url", "data_dir", "instance_id", "encoder",
             "list_key", "tree_number", "entries", "entry_bytes",
             "respond_timeout_secs", "max_concurrent_queries",
+            "enable_fanout", "max_fanout_shards",
             "railgun_proxy", "chain_id", "start_block", "mirror_endpoint",
             "token", "bind",
         ])]
@@ -131,6 +132,12 @@ enum Commands {
         /// live sessions.
         #[arg(long, default_value_t = 3600)]
         session_eviction_interval_secs: u64,
+        /// Mount one-query multi-shard fanout. Disabled by default.
+        #[arg(long, default_value_t = false)]
+        enable_fanout: bool,
+        /// Maximum shard ids accepted by one fanout request.
+        #[arg(long, default_value_t = 16)]
+        max_fanout_shards: usize,
     },
     /// Print engine status by curling /v1/status against a running server.
     Status {
@@ -380,6 +387,8 @@ async fn main() -> anyhow::Result<()> {
             ws_endpoint,
             metrics_public,
             session_eviction_interval_secs,
+            enable_fanout,
+            max_fanout_shards,
         } => {
             if let Some(path) = config {
                 let mut opts =
@@ -429,6 +438,8 @@ async fn main() -> anyhow::Result<()> {
                 encoder: encoder_kind,
                 session_eviction_interval_secs,
                 metrics_public,
+                enable_fanout,
+                max_fanout_shards,
             };
             raven_railgun_cli::serve_production::run(opts).await
         }

@@ -227,6 +227,12 @@ struct GlobalSection {
     /// Heartbeat session-eviction interval (seconds); `0` disables.
     #[serde(default)]
     session_eviction_interval_secs: Option<u64>,
+    /// Mount one-query multi-shard fanout. Absent keeps the disabled default.
+    #[serde(default)]
+    enable_fanout: Option<bool>,
+    /// Maximum shard ids accepted by one fanout request.
+    #[serde(default)]
+    max_fanout_shards: Option<usize>,
     /// Layer 1 reorg-window cache sidecar; absent = ephemeral (rebuilt from RPC).
     #[serde(default)]
     reorg_window_path: Option<PathBuf>,
@@ -364,6 +370,10 @@ pub struct MultiServeOptions {
     pub metrics_public: Option<bool>,
     /// `HttpConfig.session_eviction_interval_secs` override; drives the per-instance ticker.
     pub session_eviction_interval_secs: Option<u64>,
+    /// `HttpConfig.enable_fanout` override; absent keeps fanout disabled.
+    pub enable_fanout: Option<bool>,
+    /// `HttpConfig.max_fanout_shards` override.
+    pub max_fanout_shards: Option<usize>,
     /// Indexer Layer 1 reorg-window cache path; absent = ephemeral.
     pub reorg_window_path: Option<PathBuf>,
 }
@@ -662,8 +672,46 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         trusted_proxy_cidrs: parsed.global.trusted_proxy_cidrs,
         metrics_public: parsed.global.metrics_public,
         session_eviction_interval_secs: parsed.global.session_eviction_interval_secs,
+        enable_fanout: parsed.global.enable_fanout,
+        max_fanout_shards: parsed.global.max_fanout_shards,
         reorg_window_path: parsed.global.reorg_window_path,
     })
+}
+
+/// Build the HTTP configuration used by the multi-instance production path.
+#[must_use]
+pub fn build_http_config(opts: &MultiServeOptions) -> HttpConfig {
+    let mut config = HttpConfig::demo(opts.token.clone());
+    config.max_concurrent_queries = opts.max_concurrent_queries.max(1);
+    config.respond_timeout_secs = opts.respond_timeout_secs;
+    if let Some(rps) = opts.rate_limit_rps {
+        config.rate_limit_rps = rps;
+    }
+    if let Some(burst) = opts.rate_limit_burst {
+        config.rate_limit_burst = burst;
+    }
+    if let Some(origins) = opts.cors_allowed_origins.clone() {
+        config.cors_allowed_origins = origins;
+    }
+    if let Some(trust) = opts.trust_proxy_header {
+        config.trust_proxy_header = trust;
+    }
+    if let Some(cidrs) = opts.trusted_proxy_cidrs.clone() {
+        config.trusted_proxy_cidrs = cidrs;
+    }
+    if let Some(public) = opts.metrics_public {
+        config.metrics_public = public;
+    }
+    if let Some(secs) = opts.session_eviction_interval_secs {
+        config.session_eviction_interval_secs = secs;
+    }
+    if let Some(enable) = opts.enable_fanout {
+        config.enable_fanout = enable;
+    }
+    if let Some(max) = opts.max_fanout_shards {
+        config.max_fanout_shards = max;
+    }
+    config
 }
 
 fn build_encoder_kind(
@@ -995,30 +1043,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         Some(spawn_mirror_workers(&opts, &bootstrap.handles)?)
     };
 
-    let mut http_config = HttpConfig::demo(opts.token.clone());
-    http_config.max_concurrent_queries = opts.max_concurrent_queries.max(1);
-    http_config.respond_timeout_secs = opts.respond_timeout_secs;
-    if let Some(rps) = opts.rate_limit_rps {
-        http_config.rate_limit_rps = rps;
-    }
-    if let Some(burst) = opts.rate_limit_burst {
-        http_config.rate_limit_burst = burst;
-    }
-    if let Some(origins) = opts.cors_allowed_origins.clone() {
-        http_config.cors_allowed_origins = origins;
-    }
-    if let Some(trust) = opts.trust_proxy_header {
-        http_config.trust_proxy_header = trust;
-    }
-    if let Some(cidrs) = opts.trusted_proxy_cidrs.clone() {
-        http_config.trusted_proxy_cidrs = cidrs;
-    }
-    if let Some(public) = opts.metrics_public {
-        http_config.metrics_public = public;
-    }
-    if let Some(secs) = opts.session_eviction_interval_secs {
-        http_config.session_eviction_interval_secs = secs;
-    }
+    let http_config = build_http_config(&opts);
 
     let app_state =
         AppState::new(engine, http_config).map_err(|e| anyhow::anyhow!("AppState::new: {e}"))?;

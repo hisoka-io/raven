@@ -8,14 +8,63 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use bytes::Bytes;
+use raven_inspire::SeededClientQuery;
 use raven_railgun_core::batch_ladder::check_batch_len;
 use raven_railgun_core::InstanceId;
-use raven_railgun_engine::{DrainState, PirInstance, PirScheme, Snapshot};
+use raven_railgun_engine::{Engine, PirInstance, PirScheme, Snapshot};
 use tokio::sync::Semaphore;
 
+use crate::auth::validate_session_binding;
 use crate::state::AppState;
 use crate::versioned::{read_versioned, write_batch_response_versioned, write_versioned};
 use crate::{attach_freshness_header, build_response_headers};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmissionRefusal {
+    Missing,
+    Drained(raven_railgun_engine::DrainState),
+    Unavailable,
+}
+
+impl AdmissionRefusal {
+    pub(crate) const fn status(self) -> StatusCode {
+        match self {
+            Self::Missing => StatusCode::NOT_FOUND,
+            Self::Drained(_) | Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    pub(crate) fn detail(self) -> String {
+        match self {
+            Self::Missing => "unknown instance".to_owned(),
+            Self::Drained(state) => format!("instance is {}", state.label()),
+            Self::Unavailable => "instance stopped serving during admission".to_owned(),
+        }
+    }
+}
+
+pub(crate) fn admit_instance<S: PirScheme>(
+    engine: &Engine<S>,
+    instance_id: &InstanceId,
+    operation: &'static str,
+) -> Result<Arc<PirInstance<S>>, AdmissionRefusal> {
+    let serving = engine.serving_instance(instance_id);
+    if serving.is_missing() {
+        return Err(AdmissionRefusal::Missing);
+    }
+    if let Some(state) = serving.drain_state() {
+        tracing::info!(
+            %operation,
+            instance_id = %instance_id,
+            drain_state = state.label(),
+            "request refused: instance is not active"
+        );
+        return Err(AdmissionRefusal::Drained(state));
+    }
+    serving
+        .into_available()
+        .ok_or(AdmissionRefusal::Unavailable)
+}
 
 pub(crate) async fn query_handler<S: PirScheme>(
     State(app): State<AppState<S>>,
@@ -23,18 +72,8 @@ pub(crate) async fn query_handler<S: PirScheme>(
     body: Bytes,
 ) -> Result<(StatusCode, HeaderMap, Bytes), StatusCode> {
     let instance_id = InstanceId::new(id);
-    let instance = app
-        .engine
-        .instance(&instance_id)
-        .ok_or(StatusCode::NOT_FOUND)?;
-    if instance.drain_state() != DrainState::Active {
-        tracing::info!(
-            instance_id = %instance.id,
-            drain_state = instance.drain_state().label(),
-            "query refused: instance is not active"
-        );
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
+    let instance =
+        admit_instance(&app.engine, &instance_id, "query").map_err(AdmissionRefusal::status)?;
 
     let permit = app
         .semaphore
@@ -59,6 +98,10 @@ pub(crate) async fn query_handler<S: PirScheme>(
                 "single-query refused: instance drained mid-acquire"
             );
             return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Ok(Ok(Err(err @ raven_railgun_core::AdapterError::SessionHandleRejected { .. }))) => {
+            tracing::info!(%err, "single-query refused: session handle is stale");
+            return Err(StatusCode::CONFLICT);
         }
         Ok(Ok(Err(err @ raven_railgun_core::AdapterError::InvalidQuery(_)))) => {
             tracing::info!(%err, "single-query refused: caller-side defect");
@@ -108,24 +151,32 @@ pub(crate) async fn query_handler<S: PirScheme>(
     Ok((StatusCode::OK, headers, body_bytes.into()))
 }
 
+pub(crate) async fn inspire_query_handler(
+    State(app): State<AppState<raven_railgun_engine::inspire::RavenInspireScheme>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, HeaderMap, Bytes), StatusCode> {
+    let instance_id = InstanceId::new(id.clone());
+    admit_instance(&app.engine, &instance_id, "query").map_err(AdmissionRefusal::status)?;
+    let query: SeededClientQuery = read_versioned(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    validate_session_binding(
+        &headers,
+        app.sessions.as_ref(),
+        &instance_id,
+        query.session_handle,
+    )?;
+    query_handler(State(app), Path(id), body).await
+}
+
 pub(crate) async fn batch_handler<S: PirScheme>(
     State(app): State<AppState<S>>,
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<(StatusCode, HeaderMap, Bytes), StatusCode> {
     let instance_id = InstanceId::new(id);
-    let instance = app
-        .engine
-        .instance(&instance_id)
-        .ok_or(StatusCode::NOT_FOUND)?;
-    if instance.drain_state() != DrainState::Active {
-        tracing::info!(
-            instance_id = %instance.id,
-            drain_state = instance.drain_state().label(),
-            "batch refused: instance is not active"
-        );
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
+    let instance =
+        admit_instance(&app.engine, &instance_id, "batch").map_err(AdmissionRefusal::status)?;
 
     let queries: Vec<S::Query> = read_versioned(&body).map_err(|err| {
         tracing::warn!(?err, "batch versioned-bincode deserialize failed");
@@ -203,6 +254,22 @@ pub(crate) async fn batch_handler<S: PirScheme>(
     Ok((StatusCode::OK, headers, body_bytes.into()))
 }
 
+pub(crate) async fn inspire_batch_handler(
+    State(app): State<AppState<raven_railgun_engine::inspire::RavenInspireScheme>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, HeaderMap, Bytes), StatusCode> {
+    let instance_id = InstanceId::new(id.clone());
+    admit_instance(&app.engine, &instance_id, "batch").map_err(AdmissionRefusal::status)?;
+    let queries: Vec<SeededClientQuery> =
+        read_versioned(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    for handle in queries.iter().filter_map(|query| query.session_handle) {
+        validate_session_binding(&headers, app.sessions.as_ref(), &instance_id, Some(handle))?;
+    }
+    batch_handler(State(app), Path(id), body).await
+}
+
 /// Keep the concurrency permit with the work, not with the request.
 ///
 /// A timeout only drops the `JoinHandle`; `spawn_blocking` has no cancellation,
@@ -244,6 +311,12 @@ pub enum BatchError {
         /// Display-formatted scheme error.
         detail: String,
     },
+    /// The slot referenced a session handle the current instance no longer serves.
+    #[error("slot {index} referenced a stale session handle")]
+    SessionHandleRejected {
+        /// 0-based slot index.
+        index: usize,
+    },
     /// Per-query timeout fired; permits are released on `Elapsed`.
     #[error("respond timed out at index {index} after {secs}s")]
     Timeout {
@@ -267,13 +340,14 @@ pub enum BatchError {
 }
 
 impl BatchError {
-    /// Map to HTTP status: `Respond`/`Invariant` -> 500; others -> 503.
+    /// Map typed failures to their wire status.
     pub fn status(&self) -> StatusCode {
         match self {
             BatchError::Respond { .. } | BatchError::Invariant(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             BatchError::InvalidSlot { .. } => StatusCode::BAD_REQUEST,
+            BatchError::SessionHandleRejected { .. } => StatusCode::CONFLICT,
             BatchError::WorkerAborted { .. }
             | BatchError::SemaphoreClosed
             | BatchError::Timeout { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -286,6 +360,7 @@ impl BatchError {
         match self {
             BatchError::Respond { index, .. }
             | BatchError::InvalidSlot { index, .. }
+            | BatchError::SessionHandleRejected { index }
             | BatchError::Timeout { index, .. }
             | BatchError::WorkerAborted { index } => {
                 if *index == usize::MAX {
@@ -303,6 +378,7 @@ impl BatchError {
         match self {
             BatchError::Respond { .. } => "respond",
             BatchError::InvalidSlot { .. } => "invalid_slot",
+            BatchError::SessionHandleRejected { .. } => "session_handle_rejected",
             BatchError::Timeout { .. } => "timeout",
             BatchError::WorkerAborted { .. } => "worker_aborted",
             BatchError::SemaphoreClosed => "semaphore_closed",
@@ -448,6 +524,9 @@ where
     });
     match tokio::time::timeout(respond_timeout, &mut join).await {
         Ok(Ok(Ok((_epoch, r)))) => (idx, Ok(r)),
+        Ok(Ok(Err(raven_railgun_core::AdapterError::SessionHandleRejected { .. }))) => {
+            (idx, Err(BatchError::SessionHandleRejected { index: idx }))
+        }
         Ok(Ok(Err(scheme_err @ raven_railgun_core::AdapterError::InvalidQuery(_)))) => (
             idx,
             Err(BatchError::InvalidSlot {

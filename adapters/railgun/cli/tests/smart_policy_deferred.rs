@@ -90,7 +90,7 @@ fn fresh_harness(tmp: &Path) -> TestHarness {
 
         let layout = StoreLayout::open(&bootstrap_dir).expect("layout");
         let encoder: Arc<dyn PirTableEncoder> = EncoderKind::PerLeafBc { tree_number: 0 }
-            .build(TOY_ENTRY_BYTES, 256)
+            .build(TOY_ENTRY_BYTES, 2048)
             .expect("build encoder");
         let opened = InspirePersistence::open(
             layout,

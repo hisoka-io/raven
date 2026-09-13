@@ -174,7 +174,7 @@ impl SnapshotFile {
         if !dir.is_dir() {
             return Err(PersistenceError::SnapshotNotFound(id));
         }
-        let header_bytes = std::fs::read(dir.join("header.bin"))?;
+        let header_bytes = std::fs::read(layout.snapshot_header_path(id))?;
         let header: SnapshotHeader = bincode::deserialize(&header_bytes)?;
         if header.magic != expected_magic {
             return Err(PersistenceError::SnapshotCorrupt(format!(
@@ -182,7 +182,7 @@ impl SnapshotFile {
                 id.0
             )));
         }
-        let raw = std::fs::read(dir.join("data.bincode"))?;
+        let raw = std::fs::read(layout.snapshot_data_path(id))?;
         let data = unwrap_from_disk(&raw, id)?;
         if u64::try_from(data.len()).unwrap_or(u64::MAX) != header.data_len {
             return Err(PersistenceError::SnapshotCorrupt(format!(

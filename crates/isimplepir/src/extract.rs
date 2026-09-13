@@ -1,12 +1,31 @@
 //! `Recover`: `result = round((ans[row] - H[row, :] . s) / delta) mod p`.
 //! DB stays in `[0, p)` end-to-end (Go reference's `+p/2` recentering
 //! omitted; byte-level fixtures differ).
+//! The answer selection scans all public `L` rows. The hint-row read remains
+//! directly addressed: making it constant-time would cost a scan of all `L*n`
+//! hint entries, which is an accepted tradeoff.
+
+use subtle::{ConditionallySelectable, ConstantTimeEq};
 
 use crate::error::{IsimplePirError, Result};
 use crate::hint::ClientHint;
 use crate::params::LweParams;
 use crate::query::ClientState;
 use crate::respond::ServerResponse;
+
+#[inline(never)]
+fn select_answer_by_scan(answer: &[u32], row: usize) -> u32 {
+    let selected_row = row as u64;
+    let mut selected = 0u32;
+    for (candidate_row, &value) in answer.iter().enumerate() {
+        selected = u32::conditional_select(
+            &selected,
+            &value,
+            (candidate_row as u64).ct_eq(&selected_row),
+        );
+    }
+    selected
+}
 
 pub fn extract(
     params: &LweParams,
@@ -68,11 +87,7 @@ pub fn extract(
         interm = interm.wrapping_add(h_ij.wrapping_mul(s_j));
     }
 
-    let Some(&ans_row) = response.answer.get(state.row) else {
-        return Err(IsimplePirError::ResponseShape {
-            reason: format!("response row {} out of bounds", state.row),
-        });
-    };
+    let ans_row = select_answer_by_scan(&response.answer, state.row);
     let noised = ans_row.wrapping_sub(interm);
 
     let delta = params.delta();
@@ -94,6 +109,7 @@ mod tests {
     use crate::query::ClientState;
     use crate::respond::ServerResponse;
     use crate::version::HintVersion;
+    use proptest::prelude::*;
 
     fn toy_params() -> LweParams {
         LweParams {
@@ -141,6 +157,29 @@ mod tests {
         };
         let result = extract(&params, &h, &bad_s, &r);
         assert!(matches!(result, Err(IsimplePirError::QueryShape { .. })));
+    }
+
+    #[test]
+    fn answer_scan_matches_direct_index_at_boundaries() {
+        let answer = vec![u32::MAX, 7, 19, 41];
+        for row in [0, answer.len() - 1] {
+            assert_eq!(
+                select_answer_by_scan(&answer, row),
+                answer[row],
+                "row {row}"
+            );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn answer_scan_matches_direct_index(
+            answer in prop::collection::vec(any::<u32>(), 1..128),
+            row_seed in any::<usize>(),
+        ) {
+            let row = row_seed % answer.len();
+            prop_assert_eq!(select_answer_by_scan(&answer, row), answer[row]);
+        }
     }
 
     /// Every row carries a delta-scale ramp, so reading a neighbouring row - or stopping the

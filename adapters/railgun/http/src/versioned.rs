@@ -1,13 +1,27 @@
-//! Versioned bincode wire format helpers.
+//! Railgun HTTP bincode envelopes.
+//!
+//! Request and response bodies use a two-byte big-endian schema because the browser SDK and HTTP
+//! router share one cross-language wire version, and mismatch responses advertise it in a header.
+//! This remains adapter-owned transport policy. It is distinct from the self-identifying CRS
+//! artifact magic and from the client's raw JS-to-Wasm bincode allocation boundaries.
 
-/// Bincode allocation cap per deserialize; blocks a crafted length prefix from
-/// triggering `Vec::with_capacity(2^48)`.
+/// Payload cap per decoded bincode value.
+///
+/// This is independent of the configurable HTTP body ceiling. The explicit slice-length check is
+/// required because bincode 1.3 replaces `with_limit` with an infinite limit on slice decoding.
 pub(crate) const BINCODE_DESERIALIZE_LIMIT: u64 = 8 * 1024 * 1024;
 
 pub(crate) fn bincode_deserialize_capped<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> bincode::Result<T> {
     use bincode::Options;
+
+    if u64::try_from(bytes.len()).map_or(true, |len| len > BINCODE_DESERIALIZE_LIMIT) {
+        return Err(Box::new(bincode::ErrorKind::Custom(format!(
+            "size limit reached: payload {} bytes exceeds cap {BINCODE_DESERIALIZE_LIMIT}",
+            bytes.len()
+        ))));
+    }
     bincode::DefaultOptions::new()
         .with_limit(BINCODE_DESERIALIZE_LIMIT)
         .with_fixint_encoding()
@@ -17,7 +31,7 @@ pub(crate) fn bincode_deserialize_capped<T: serde::de::DeserializeOwned>(
 
 /// Wire-protocol schema version; u16 BE prefix on every bincode body. A bump is a
 /// structural break requiring every client to upgrade.
-pub const WIRE_SCHEMA_VERSION: u16 = 1;
+pub const WIRE_SCHEMA_VERSION: u16 = 3;
 
 /// Length of the [`WIRE_SCHEMA_VERSION`] prefix in bytes.
 pub const WIRE_SCHEMA_PREFIX_LEN: usize = 2;
@@ -196,4 +210,48 @@ pub enum VersionedDecodeError {
     /// Bincode deserialize failed after version prefix was accepted.
     #[error("bincode decode: {0}")]
     Bincode(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn versioned_byte_vec_with_payload_len(payload_len: usize) -> Vec<u8> {
+        let value_len = payload_len
+            .checked_sub(8)
+            .expect("bincode Vec<u8> carries an eight-byte fixint length");
+        let mut bytes = WIRE_SCHEMA_VERSION.to_be_bytes().to_vec();
+        bytes.extend_from_slice(
+            &bincode::serialize(&vec![0x5au8; value_len]).expect("serialize vec"),
+        );
+        assert_eq!(bytes.len() - WIRE_SCHEMA_PREFIX_LEN, payload_len);
+        bytes
+    }
+
+    #[test]
+    fn deserialize_cap_admits_an_exactly_eight_mib_payload() {
+        let cap = usize::try_from(BINCODE_DESERIALIZE_LIMIT).expect("eight MiB fits usize");
+        let bytes = versioned_byte_vec_with_payload_len(cap);
+        let decoded: Vec<u8> = read_versioned(&bytes).expect("the cap is inclusive");
+        assert_eq!(decoded.len(), cap - 8);
+    }
+
+    #[test]
+    fn deserialize_cap_refuses_an_eight_mib_plus_one_payload() {
+        let cap = usize::try_from(BINCODE_DESERIALIZE_LIMIT).expect("eight MiB fits usize");
+        let bytes = versioned_byte_vec_with_payload_len(cap + 1);
+        let Err(error) = read_versioned::<Vec<u8>>(&bytes) else {
+            panic!("the cap must reject cap + 1");
+        };
+        let VersionedDecodeError::Bincode(detail) = error else {
+            panic!("cap + 1 must return the typed bincode refusal");
+        };
+        assert_eq!(
+            detail,
+            format!(
+                "size limit reached: payload {} bytes exceeds cap {BINCODE_DESERIALIZE_LIMIT}",
+                cap + 1
+            )
+        );
+    }
 }

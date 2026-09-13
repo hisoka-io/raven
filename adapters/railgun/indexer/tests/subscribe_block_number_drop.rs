@@ -414,6 +414,7 @@ fn shield_log_json(block_number: Option<u64>) -> serde_json::Value {
 #[derive(Clone, Debug)]
 struct LogsMockState {
     logs: Arc<Vec<serde_json::Value>>,
+    requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -421,6 +422,8 @@ struct JsonRpcRequest {
     method: String,
     #[serde(default)]
     id: serde_json::Value,
+    #[serde(default)]
+    params: serde_json::Value,
 }
 
 async fn logs_mock_handler(
@@ -429,7 +432,14 @@ async fn logs_mock_handler(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let result = match req.method.as_str() {
         "eth_chainId" => json!(format!("0x{MOCK_CHAIN_ID:x}")),
-        "eth_getLogs" => serde_json::Value::Array(state.logs.as_ref().clone()),
+        "eth_getLogs" => {
+            state
+                .requests
+                .lock()
+                .expect("request lock")
+                .push(req.params);
+            serde_json::Value::Array(state.logs.as_ref().clone())
+        }
         other => {
             return (
                 StatusCode::OK,
@@ -447,9 +457,17 @@ async fn logs_mock_handler(
     )
 }
 
-async fn spawn_logs_mock(logs: Vec<serde_json::Value>) -> (String, tokio::task::JoinHandle<()>) {
+async fn spawn_logs_mock(
+    logs: Vec<serde_json::Value>,
+) -> (
+    String,
+    Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
     let state = LogsMockState {
         logs: Arc::new(logs),
+        requests: Arc::clone(&requests),
     };
     let app = Router::new()
         .route("/", post(logs_mock_handler))
@@ -461,7 +479,43 @@ async fn spawn_logs_mock(logs: Vec<serde_json::Value>) -> (String, tokio::task::
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    (format!("http://{addr}/"), handle)
+    (format!("http://{addr}/"), requests, handle)
+}
+
+fn assert_get_logs_filter(
+    requests: &std::sync::Mutex<Vec<serde_json::Value>>,
+    proxy: AlloyAddress,
+    from_block: u64,
+    to_block: u64,
+) {
+    use alloy::sol_types::SolEvent;
+
+    let requests = requests.lock().expect("request lock");
+    assert_eq!(requests.len(), 1, "one eth_getLogs request expected");
+    let filter = &requests[0][0];
+    assert_eq!(filter["address"], format!("{proxy:#x}"));
+    assert_eq!(filter["fromBlock"], format!("0x{from_block:x}"));
+    assert_eq!(filter["toBlock"], format!("0x{to_block:x}"));
+    let mut topics = filter["topics"][0]
+        .as_array()
+        .expect("topic0 array")
+        .iter()
+        .map(|topic| topic.as_str().expect("topic string"))
+        .collect::<Vec<_>>();
+    let mut expected = [
+        abi::Shield::SIGNATURE_HASH,
+        abi::Transact::SIGNATURE_HASH,
+        abi::Unshield::SIGNATURE_HASH,
+        abi::Nullified::SIGNATURE_HASH,
+    ]
+    .map(|topic| format!("{topic:#x}"))
+    .to_vec();
+    topics.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(
+        topics, expected,
+        "the polling filter must request exactly the four supported event signatures"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -472,7 +526,7 @@ async fn polling_events_in_range_drops_log_when_block_number_none() {
     // so the next read returns only THIS test's drops.
     let _ = dropped_counter_by_name(s);
 
-    let (url, _server) = spawn_logs_mock(vec![
+    let (url, requests, _server) = spawn_logs_mock(vec![
         shield_log_json(Some(100)),
         shield_log_json(None),
         shield_log_json(Some(102)),
@@ -482,6 +536,7 @@ async fn polling_events_in_range_drops_log_when_block_number_none() {
     let proxy = address!("fa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9");
     let source = RpcChainSource::new(url, proxy, 0, MOCK_CHAIN_ID);
     let events = source.events_in_range(1, 200).await.expect("events");
+    assert_get_logs_filter(&requests, proxy, 1, 200);
 
     let heights: Vec<u64> = events
         .iter()
@@ -510,7 +565,7 @@ async fn pooled_events_in_range_drops_log_when_block_number_none() {
     // so the next read returns only THIS test's drops.
     let _ = dropped_counter_by_name(s);
 
-    let (url, _server) = spawn_logs_mock(vec![
+    let (url, requests, _server) = spawn_logs_mock(vec![
         shield_log_json(Some(300)),
         shield_log_json(None),
         shield_log_json(Some(301)),
@@ -534,6 +589,7 @@ async fn pooled_events_in_range_drops_log_when_block_number_none() {
     let proxy = address!("fa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9");
     let source = PooledRpcChainSource::new(Arc::clone(&pool), proxy, MOCK_CHAIN_ID);
     let events = source.events_in_range(1, 400).await.expect("events");
+    assert_get_logs_filter(&requests, proxy, 1, 400);
 
     let heights: Vec<u64> = events
         .iter()
@@ -552,4 +608,88 @@ async fn pooled_events_in_range_drops_log_when_block_number_none() {
         dropped > 0,
         "the heightless log's drop must be counted; read {dropped} new increments"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pooled_events_retry_protocol_decode_on_an_independent_endpoint() {
+    let mut malformed = shield_log_json(Some(300));
+    malformed["data"] = json!("0x");
+    let (bad_url, bad_requests, _bad_server) = spawn_logs_mock(vec![malformed]).await;
+    let (good_url, good_requests, _good_server) =
+        spawn_logs_mock(vec![shield_log_json(Some(301))]).await;
+
+    let pool = Arc::new(
+        RpcEndpointPool::new(
+            vec![
+                EndpointConfig {
+                    url: bad_url,
+                    rps: 100,
+                    burst: 100,
+                },
+                EndpointConfig {
+                    url: good_url,
+                    rps: 100,
+                    burst: 100,
+                },
+            ],
+            PoolConfig {
+                strategy: PoolStrategy::RoundRobin,
+                ..PoolConfig::default()
+            },
+        )
+        .expect("pool builds"),
+    );
+    let proxy = address!("fa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9");
+    let source = PooledRpcChainSource::new(pool, proxy, MOCK_CHAIN_ID);
+
+    let events = source
+        .events_in_range(1, 400)
+        .await
+        .expect("the independent endpoint must recover the malformed provider result");
+    let heights = events
+        .iter()
+        .map(|event| match event {
+            RailgunEvent::Shield { block_number, .. } => *block_number,
+            other => panic!("expected Shield; got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(heights, [301]);
+    assert_eq!(bad_requests.lock().expect("bad requests").len(), 1);
+    assert_eq!(good_requests.lock().expect("good requests").len(), 1);
+}
+
+#[tokio::test]
+async fn polling_and_pooled_sources_report_the_same_actionable_range_violation() {
+    let proxy = address!("fa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9");
+    let rpc = RpcChainSource::new("not a URL", proxy, 0, MOCK_CHAIN_ID);
+    let pool = Arc::new(
+        RpcEndpointPool::new(
+            vec![EndpointConfig {
+                url: "http://127.0.0.1:1".to_owned(),
+                rps: 1,
+                burst: 1,
+            }],
+            PoolConfig::default(),
+        )
+        .expect("pool builds"),
+    );
+    let pooled = PooledRpcChainSource::new(pool, proxy, MOCK_CHAIN_ID);
+    let to_block = raven_railgun_indexer::SCAN_CHUNK_BLOCKS;
+    let expected = format!(
+        "contract violation during events_in_range: span={} blocks; caller must chunk to <= \
+         SCAN_CHUNK_BLOCKS={} per the trait contract",
+        to_block + 1,
+        raven_railgun_indexer::SCAN_CHUNK_BLOCKS
+    );
+
+    let rpc_error = rpc
+        .events_in_range(0, to_block)
+        .await
+        .expect_err("oversized range must fail before provider access");
+    let pooled_error = pooled
+        .events_in_range(0, to_block)
+        .await
+        .expect_err("oversized range must fail before pool access");
+    assert_eq!(rpc_error.to_string(), expected);
+    assert_eq!(pooled_error.to_string(), expected);
 }

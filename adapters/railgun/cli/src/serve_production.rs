@@ -38,6 +38,10 @@ pub struct ProductionServeOptions {
     pub session_eviction_interval_secs: u64,
     /// Expose `/metrics` without bearer auth; only safe behind a private firewall.
     pub metrics_public: bool,
+    /// Mount one-query multi-shard fanout. Disabled unless explicitly enabled.
+    pub enable_fanout: bool,
+    /// Maximum shard ids accepted by one fanout request.
+    pub max_fanout_shards: usize,
 }
 
 /// Per-leaf cell: 65,536 rows x 512 B (16 siblings x 32 B). Per-node encoders
@@ -46,6 +50,19 @@ pub const DEFAULT_PRODUCTION_ENTRIES: usize = 65_536;
 pub const DEFAULT_PRODUCTION_ENTRY_BYTES: usize = 512;
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
+
+/// Build the HTTP configuration used by the single-instance production path.
+#[must_use]
+pub fn build_http_config(opts: &ProductionServeOptions) -> HttpConfig {
+    let mut config = HttpConfig::demo(opts.token.clone());
+    config.max_concurrent_queries = opts.max_concurrent_queries;
+    config.respond_timeout_secs = opts.respond_timeout_secs;
+    config.metrics_public = opts.metrics_public;
+    config.session_eviction_interval_secs = opts.session_eviction_interval_secs;
+    config.enable_fanout = opts.enable_fanout;
+    config.max_fanout_shards = opts.max_fanout_shards;
+    config
+}
 
 pub async fn run(opts: ProductionServeOptions) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(opts.bind)
@@ -254,11 +271,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     });
     let mut mirror_task = AbortOnDropTask::new(mirror_handle);
 
-    let mut http_config = HttpConfig::demo(opts.token.clone());
-    http_config.max_concurrent_queries = opts.max_concurrent_queries;
-    http_config.respond_timeout_secs = opts.respond_timeout_secs;
-    http_config.metrics_public = opts.metrics_public;
-    http_config.session_eviction_interval_secs = opts.session_eviction_interval_secs;
+    let http_config = build_http_config(&opts);
 
     let mut engine: Engine<raven_railgun_engine::inspire::RavenInspireScheme> = Engine::new();
     engine

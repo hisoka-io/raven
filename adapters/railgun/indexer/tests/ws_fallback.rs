@@ -38,9 +38,7 @@ impl FailingPrimary {
     fn maybe_fail(&self) -> Result<()> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         if n < self.fail_for {
-            Err(IndexerError::Rpc(
-                "ws connect: connection refused by peer".into(),
-            ))
+            transport_err()
         } else {
             Ok(())
         }
@@ -216,9 +214,213 @@ impl BarrierPrimary {
 }
 
 fn transport_err<T>() -> Result<T> {
-    Err(IndexerError::Rpc(
-        "ws connect: connection refused by peer".into(),
-    ))
+    Err(IndexerError::Provider {
+        operation: "test WS transport",
+        source: alloy::transports::TransportErrorKind::custom_str("connection refused by peer"),
+    })
+}
+
+fn method_missing<T>() -> Result<T> {
+    let source = alloy::transports::TransportError::deser_err(
+        serde_json::from_str::<serde_json::Value>("{")
+            .expect_err("the malformed control must fail JSON decoding"),
+        r#"{"code":-32601,"message":"Method not found"}"#,
+    );
+    Err(IndexerError::Provider {
+        operation: "test WS method",
+        source,
+    })
+}
+
+fn parse_error<T>() -> Result<T> {
+    let source = alloy::transports::TransportError::deser_err(
+        serde_json::from_str::<serde_json::Value>("{")
+            .expect_err("the malformed control must fail JSON decoding"),
+        r#"{"code":-32700,"message":"Parse error"}"#,
+    );
+    Err(IndexerError::Provider {
+        operation: "test invalid request",
+        source,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DecodeFailure {
+    Application,
+    RemoteResponse,
+}
+
+#[derive(Debug)]
+struct DecodeFailingPrimary(DecodeFailure);
+
+impl DecodeFailingPrimary {
+    fn fail<T>(&self) -> Result<T> {
+        match self.0 {
+            DecodeFailure::Application => Err(IndexerError::Decode("malformed event".into())),
+            DecodeFailure::RemoteResponse => {
+                let parse_error = serde_json::from_str::<serde_json::Value>("{")
+                    .expect_err("the malformed control must fail JSON decoding");
+                Err(IndexerError::Provider {
+                    operation: "test WS response",
+                    source: alloy::transports::TransportError::deser_err(parse_error, "{"),
+                })
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl ChainSource for DecodeFailingPrimary {
+    async fn latest_block(&self) -> Result<u64> {
+        self.fail()
+    }
+
+    async fn events_in_range(&self, _from: u64, _to: u64) -> Result<Vec<RailgunEvent>> {
+        self.fail()
+    }
+
+    async fn root_history(
+        &self,
+        _tree: u32,
+        _root: [u8; 32],
+        _at: Option<alloy::eips::BlockId>,
+    ) -> Result<bool> {
+        self.fail()
+    }
+
+    async fn block_hash(&self, _n: u64) -> Result<[u8; 32]> {
+        self.fail()
+    }
+
+    async fn merkle_root(&self, _at: Option<alloy::eips::BlockId>) -> Result<[u8; 32]> {
+        self.fail()
+    }
+
+    async fn active_tree_number(&self, _at: Option<alloy::eips::BlockId>) -> Result<u32> {
+        self.fail()
+    }
+}
+
+async fn assert_decode_uses_http_fallback(failure: DecodeFailure) {
+    let primary = Arc::new(DecodeFailingPrimary(failure));
+    let fallback = Arc::new(AlwaysOkFallback::new(1_337));
+    let wrapper = AutoFallbackChainSource::new(primary, Arc::clone(&fallback));
+
+    assert_eq!(wrapper.latest_block().await.expect("HTTP fallback"), 1_337);
+    assert_eq!(wrapper.mode().await, ChainSourceMode::Polling);
+    assert_eq!(fallback.calls(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn application_decode_uses_an_independent_http_fallback() {
+    assert_decode_uses_http_fallback(DecodeFailure::Application).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_response_decode_uses_http_fallback() {
+    assert_decode_uses_http_fallback(DecodeFailure::RemoteResponse).await;
+}
+
+#[derive(Debug)]
+struct MethodMissingPrimary;
+
+#[async_trait]
+impl ChainSource for MethodMissingPrimary {
+    async fn latest_block(&self) -> Result<u64> {
+        method_missing()
+    }
+
+    async fn events_in_range(&self, _from: u64, _to: u64) -> Result<Vec<RailgunEvent>> {
+        method_missing()
+    }
+
+    async fn root_history(
+        &self,
+        _tree: u32,
+        _root: [u8; 32],
+        _at: Option<alloy::eips::BlockId>,
+    ) -> Result<bool> {
+        method_missing()
+    }
+
+    async fn block_hash(&self, _n: u64) -> Result<[u8; 32]> {
+        method_missing()
+    }
+
+    async fn merkle_root(&self, _at: Option<alloy::eips::BlockId>) -> Result<[u8; 32]> {
+        method_missing()
+    }
+
+    async fn active_tree_number(&self, _at: Option<alloy::eips::BlockId>) -> Result<u32> {
+        method_missing()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typed_method_not_found_fails_fast_but_ws_falls_back_to_polling() {
+    let primary = Arc::new(MethodMissingPrimary);
+    let fallback = Arc::new(AlwaysOkFallback::new(1_337));
+    let wrapper = AutoFallbackChainSource::new(primary, Arc::clone(&fallback));
+
+    assert_eq!(wrapper.latest_block().await.expect("HTTP fallback"), 1_337);
+    assert_eq!(wrapper.mode().await, ChainSourceMode::Polling);
+    assert_eq!(fallback.calls(), 1);
+}
+
+#[derive(Debug)]
+struct ParseErrorPrimary;
+
+#[async_trait]
+impl ChainSource for ParseErrorPrimary {
+    async fn latest_block(&self) -> Result<u64> {
+        parse_error()
+    }
+
+    async fn events_in_range(&self, _from: u64, _to: u64) -> Result<Vec<RailgunEvent>> {
+        parse_error()
+    }
+
+    async fn root_history(
+        &self,
+        _tree: u32,
+        _root: [u8; 32],
+        _at: Option<alloy::eips::BlockId>,
+    ) -> Result<bool> {
+        parse_error()
+    }
+
+    async fn block_hash(&self, _n: u64) -> Result<[u8; 32]> {
+        parse_error()
+    }
+
+    async fn merkle_root(&self, _at: Option<alloy::eips::BlockId>) -> Result<[u8; 32]> {
+        parse_error()
+    }
+
+    async fn active_tree_number(&self, _at: Option<alloy::eips::BlockId>) -> Result<u32> {
+        parse_error()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn json_rpc_parse_error_never_uses_http_fallback() {
+    let primary = Arc::new(ParseErrorPrimary);
+    let fallback = Arc::new(AlwaysOkFallback::new(1_337));
+    let wrapper = AutoFallbackChainSource::new(primary, Arc::clone(&fallback));
+
+    let error = wrapper
+        .latest_block()
+        .await
+        .expect_err("JSON-RPC parse error must fail fast");
+    assert!(matches!(
+        error,
+        IndexerError::Provider {
+            source: alloy::transports::RpcError::ErrorResp(payload),
+            ..
+        } if payload.code == -32700
+    ));
+    assert_eq!(wrapper.mode().await, ChainSourceMode::Subscribe);
+    assert_eq!(fallback.calls(), 0);
 }
 
 #[async_trait]

@@ -32,7 +32,8 @@ function mountBatchRoute(server: MockServer): void {
       res.writeHead(200, {
         "content-type": "application/octet-stream",
         "x-raven-epoch": String(epoch),
-        "x-raven-schema-version": "1",
+        "x-raven-schema-version": "3",
+        "x-raven-freshness": "lag_blocks=0 applied_height=0 epoch=1 confidence=1",
       });
       res.end(Buffer.from(encodeBatchResponse(epoch, encodedBatchCount(body))));
       return true;
@@ -125,7 +126,7 @@ describe("ImtCache.noteFreshness evicts one scope", () => {
     level: 0,
     idxAtLevel: 5,
     epochTag: "7",
-    schemaVersion: 1,
+    schemaVersion: 2,
   });
   const listKey = imtCacheKey({
     chainId: 1,
@@ -133,7 +134,7 @@ describe("ImtCache.noteFreshness evicts one scope", () => {
     level: 0,
     idxAtLevel: 5,
     epochTag: "9",
-    schemaVersion: 1,
+    schemaVersion: 2,
   });
   const otherChainKey = imtCacheKey({
     chainId: 11_155_111,
@@ -141,7 +142,7 @@ describe("ImtCache.noteFreshness evicts one scope", () => {
     level: 0,
     idxAtLevel: 5,
     epochTag: "7",
-    schemaVersion: 1,
+    schemaVersion: 2,
   });
 
   // Every scope is recorded before its nodes go in, so any later eviction is caused by the

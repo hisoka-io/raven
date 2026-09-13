@@ -10,8 +10,8 @@
     "live_latency_bench.test.ts (1); CI sets none of their RAVEN_LIVE_* env vars.",
     "Anything else skipped is a regression, not a policy."
   ],
-  "testFiles": 35,
+  "testFiles": 38,
   "skippedFiles": 3,
-  "passed": 300,
+  "passed": 360,
   "skipped": 21
 }

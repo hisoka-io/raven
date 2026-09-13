@@ -16,7 +16,8 @@ use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::{encode_database, EncodedDatabase, ShardData};
 use raven_server::{InstanceRole, PirInstance};
 use raven_storage::{
-    Manifest, SnapshotFile, SnapshotId, StoreLayout, Wal, MANIFEST_SCHEMA_VERSION,
+    apply_retention, open_recovery, Manifest, ManifestShape, RetentionPolicy, SnapshotId,
+    StoreLayout, Wal, MANIFEST_SCHEMA_VERSION,
 };
 
 use crate::ingest::BalanceWalPayload;
@@ -35,6 +36,15 @@ fn swap_failed(e: raven_core::ServerError) -> EthStateError {
 const SCHEME_TAG: &str = "inspire-flat-balance";
 const ENCODER_LABEL: &str = "flat-balance-v1";
 const INSTANCE_ID: &str = "eth-state";
+
+fn validate_entry_size(entry_size: usize) -> Result<(), EthStateError> {
+    if entry_size != ENTRY_SIZE {
+        return Err(EthStateError::Setup(format!(
+            "eth-state entry width mismatch: expected {ENTRY_SIZE} bytes, got {entry_size} bytes"
+        )));
+    }
+    Ok(())
+}
 
 /// `shard_id` for a flat leaf index.
 ///
@@ -67,7 +77,7 @@ pub struct MainSidecar {
 
 impl MainSidecar {
     /// Seed a Live main from a flat record buffer plus an empty sidecar, opening the store
-    /// layout under `data_dir`.
+    /// layout under `data_dir`. Refuses widths other than [`ENTRY_SIZE`] before opening it.
     pub fn seed(
         params: &InspireParams,
         database: &[u8],
@@ -75,6 +85,7 @@ impl MainSidecar {
         data_dir: impl Into<std::path::PathBuf>,
         seed: u64,
     ) -> Result<(Self, RlweSecretKey, RlweSecretKey), EthStateError> {
+        validate_entry_size(entry_size)?;
         let layout = StoreLayout::open(data_dir.into())
             .map_err(|e| EthStateError::Setup(format!("store layout open: {e}")))?;
 
@@ -124,7 +135,7 @@ impl MainSidecar {
             re_encode_count: 0,
             layout,
             wal,
-            next_snapshot_id: 0,
+            next_snapshot_id: 1,
             marker: 0,
         };
         // Base snapshot so a later recover() has something to load.
@@ -407,6 +418,8 @@ impl MainSidecar {
             current_marker: self.marker,
             encoder_label: ENCODER_LABEL.to_string(),
             prev_encoder_label: None,
+            entry_size_bytes: Some(ENTRY_SIZE),
+            rows_per_shard: Some(ENTRIES_PER_SHARD as u64),
         };
         raven_storage::publish_snapshot(
             &self.layout,
@@ -422,23 +435,38 @@ impl MainSidecar {
         )
         .map_err(|e| EthStateError::Setup(format!("publish snapshot: {e}")))?;
         self.next_snapshot_id += 1;
+        apply_retention(&self.layout, snap_id, RetentionPolicy::default())
+            .map_err(|e| EthStateError::Setup(format!("snapshot retention: {e}")))?;
         Ok(())
     }
 
     /// Rebuild the store rows and the main engine from the latest snapshot plus WAL replay.
+    /// Refuses widths other than [`ENTRY_SIZE`] before opening the store layout.
     pub fn recover(
         params: &InspireParams,
         entry_size: usize,
         data_dir: impl Into<std::path::PathBuf>,
         seed: u64,
     ) -> Result<(Self, RlweSecretKey, RlweSecretKey), EthStateError> {
+        validate_entry_size(entry_size)?;
         let layout = StoreLayout::open(data_dir.into())
             .map_err(|e| EthStateError::Setup(format!("store layout open: {e}")))?;
-        let manifest = Manifest::load(&layout)
-            .map_err(|e| EthStateError::Setup(format!("manifest load: {e}")))?
-            .ok_or_else(|| EthStateError::Setup("no manifest to recover from".to_string()))?;
-        let snap = SnapshotFile::load(&layout, manifest.current_snapshot_id, SNAPSHOT_MAGIC)
-            .map_err(|e| EthStateError::Setup(format!("snapshot load: {e}")))?;
+        let recovery = open_recovery(&layout, SNAPSHOT_MAGIC, |manifest| {
+            manifest.validate_identity(SCHEME_TAG, INSTANCE_ID, ENCODER_LABEL)?;
+            manifest.validate_shape(ManifestShape {
+                entry_size_bytes: entry_size,
+                rows_per_shard: ENTRIES_PER_SHARD as u64,
+            })
+        })
+        .map_err(|e| EthStateError::Setup(format!("recovery open: {e}")))?
+        .ok_or_else(|| EthStateError::Setup("no manifest to recover from".to_string()))?;
+        let manifest = recovery.manifest;
+        let snap = recovery.snapshot.ok_or_else(|| {
+            EthStateError::Setup(
+                "manifest snapshot id 0 denotes no committed snapshot; re-seed this data_dir"
+                    .to_owned(),
+            )
+        })?;
         let snapshot_rows: Vec<(u64, Vec<u8>)> = bincode::deserialize(&snap.data)
             .map_err(|e| EthStateError::Setup(format!("snapshot decode: {e}")))?;
 
@@ -452,11 +480,8 @@ impl MainSidecar {
         }
         // Open at last-committed-seq so post-recovery appends stay monotonic above any archived
         // range; None at seq 0 means a fresh WAL.
-        let wal = Wal::open(&layout, manifest.current_snapshot_seq.checked_sub(1))
-            .map_err(|e| EthStateError::Setup(format!("wal open: {e}")))?;
-        let replay = wal
-            .replay()
-            .map_err(|e| EthStateError::Setup(format!("wal replay: {e}")))?;
+        let wal = recovery.wal;
+        let replay = recovery.replay;
         for entry in replay.entries {
             let payload: BalanceWalPayload = bincode::deserialize(&entry.payload)
                 .map_err(|e| EthStateError::Setup(format!("wal payload decode: {e}")))?;
@@ -521,24 +546,17 @@ impl MainSidecar {
     }
 }
 
-/// One shard's flat bytes, zero-padded in empty slots. The scan early-breaks at `shard_end`;
-/// skipping the `[0, shard_start)` prefix too would need a `scan_from` seek on `Snapshot`.
+/// One shard's flat bytes, zero-padded in empty slots.
 pub fn materialize_shard_bytes(
-    snap: &raven_core::MemorySnapshot,
+    snap: &dyn raven_core::storage::Snapshot,
     shard_id: u32,
     entry_size: usize,
 ) -> Result<Vec<u8>, EthStateError> {
     let shard_start = shard_id as u64 * ENTRIES_PER_SHARD as u64;
     let shard_end = shard_start + ENTRIES_PER_SHARD as u64;
     let mut buf = vec![0u8; ENTRIES_PER_SHARD * entry_size];
-    for row in snap.scan() {
+    for row in snap.scan_range(shard_start..shard_end) {
         let (k, v) = row.map_err(|e| EthStateError::Setup(format!("store scan: {e}")))?;
-        if k < shard_start {
-            continue;
-        }
-        if k >= shard_end {
-            break;
-        }
         let off = (k - shard_start) as usize * entry_size;
         let n = v.len().min(entry_size);
         buf[off..off + n].copy_from_slice(&v[..n]);
@@ -607,6 +625,74 @@ fn set_shard_slot(encoded: &mut EncodedDatabase, shard: ShardData) {
     } else {
         encoded.shards.push(shard);
         encoded.shards.sort_by_key(|s| s.id);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod entry_size_gate {
+    use super::MainSidecar;
+    use crate::ENTRY_SIZE;
+    use raven_inspire::params::InspireParams;
+
+    const LEGAL_UNSUPPORTED_ENTRY_SIZE: usize = 64;
+
+    fn assert_width_refusal(error: &crate::EthStateError) {
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "flat-state setup failed: eth-state entry width mismatch: expected {ENTRY_SIZE} \
+                 bytes, got {LEGAL_UNSUPPORTED_ENTRY_SIZE} bytes"
+            )
+        );
+    }
+
+    #[test]
+    fn seed_refuses_unsupported_legal_width_before_store_publication() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let store_path = parent.path().join("seed-store");
+        let params = InspireParams::secure_128_d2048();
+        let database = vec![0u8; LEGAL_UNSUPPORTED_ENTRY_SIZE];
+
+        let outcome = MainSidecar::seed(
+            &params,
+            &database,
+            LEGAL_UNSUPPORTED_ENTRY_SIZE,
+            &store_path,
+            0x0000_6401,
+        );
+
+        assert!(
+            !store_path.exists(),
+            "unsupported width must refuse before creating the store layout"
+        );
+        let error = outcome
+            .err()
+            .expect("a legal PIR width unsupported by the fixed record codec must refuse");
+        assert_width_refusal(&error);
+    }
+
+    #[test]
+    fn recover_refuses_unsupported_legal_width_before_store_open() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let store_path = parent.path().join("recover-store");
+        let params = InspireParams::secure_128_d2048();
+
+        let outcome = MainSidecar::recover(
+            &params,
+            LEGAL_UNSUPPORTED_ENTRY_SIZE,
+            &store_path,
+            0x0000_6402,
+        );
+
+        assert!(
+            !store_path.exists(),
+            "unsupported width must refuse before opening the store layout"
+        );
+        let error = outcome
+            .err()
+            .expect("recover must reject a width the snapshot codec cannot represent");
+        assert_width_refusal(&error);
     }
 }
 
@@ -720,6 +806,38 @@ mod wal_floor {
             published_floor(&ms),
             ms.wal.next_seq(),
             "commit_v6 must seal through the log head"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn commit_v6_applies_raven_snapshot_retention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let params = InspireParams::secure_128_d2048();
+        let database = vec![0u8; 64 * ENTRY_SIZE];
+        let (mut main_sidecar, _main_key, _sidecar_key) =
+            MainSidecar::seed(&params, &database, ENTRY_SIZE, dir.path(), 0x0000_A5F1)
+                .expect("seed");
+
+        for _ in 0..6 {
+            main_sidecar.commit_v6().expect("commit");
+        }
+
+        let mut snapshot_names = std::fs::read_dir(main_sidecar.layout.snapshots_dir())
+            .expect("read snapshots")
+            .map(|entry| {
+                entry
+                    .expect("snapshot entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        snapshot_names.sort();
+        assert_eq!(
+            snapshot_names,
+            ["snap-000004", "snap-000005", "snap-000006", "snap-000007"],
+            "eth-state must delegate its default four-snapshot retention to raven-storage"
         );
     }
 }

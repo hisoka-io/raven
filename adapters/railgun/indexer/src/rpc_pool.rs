@@ -65,6 +65,15 @@ pub enum PoolError {
     Empty,
     #[error("rpc endpoint config: {url} has invalid rps={rps} burst={burst}; both must be >= 1")]
     InvalidEndpointConfig { url: String, rps: u32, burst: u32 },
+    #[error(
+        "rpc endpoint pool entries {first_index} and {duplicate_index} resolve to the same endpoint \
+         {url_redacted}; remove the duplicate so failover uses independent providers"
+    )]
+    DuplicateEndpoint {
+        first_index: usize,
+        duplicate_index: usize,
+        url_redacted: String,
+    },
 }
 
 impl EndpointConfig {
@@ -77,20 +86,27 @@ impl EndpointConfig {
                 burst: self.burst,
             });
         }
-        if let Err(e) = self.url.parse::<reqwest::Url>() {
-            return Err(PoolError::InvalidEndpointConfig {
-                url: format!("{} (parse error: {e})", self.url),
-                rps: self.rps,
-                burst: self.burst,
-            });
-        }
+        self.canonical_url()?;
         Ok(())
+    }
+
+    fn canonical_url(&self) -> std::result::Result<reqwest::Url, PoolError> {
+        let mut url =
+            self.url
+                .parse::<reqwest::Url>()
+                .map_err(|error| PoolError::InvalidEndpointConfig {
+                    url: format!("{} (parse error: {error})", self.url),
+                    rps: self.rps,
+                    burst: self.burst,
+                })?;
+        url.set_fragment(None);
+        Ok(url)
     }
 }
 
 impl From<PoolError> for IndexerError {
     fn from(e: PoolError) -> Self {
-        IndexerError::Rpc(e.to_string())
+        IndexerError::Pool(e)
     }
 }
 
@@ -222,15 +238,15 @@ impl RpcEndpoint {
                 let url = self
                     .url
                     .parse::<reqwest::Url>()
-                    .map_err(|e| IndexerError::Alloy(format!("invalid rpc url: {e}")))?;
+                    .map_err(|e| IndexerError::InvalidRpcUrl(e.to_string()))?;
                 let provider: Arc<dyn alloy::providers::Provider + Send + Sync> =
                     Arc::new(alloy::providers::ProviderBuilder::new().connect_http(url));
-                // Bounded here, and labelled, because `classify_indexer_error` routes the
-                // timeout text to `ErrorKind::Network` and the hang tests assert on it.
+                // Bounded here, and labelled, because the typed timeout class drives
+                // immediate endpoint cooldown and the hang tests assert the refusal.
                 let actual = crate::with_rpc_timeout("eth_chainId probe", async {
                     alloy::providers::Provider::get_chain_id(provider.as_ref())
                         .await
-                        .map_err(|e| IndexerError::Rpc(format!("eth_chainId: {e}")))
+                        .map_err(|e| IndexerError::provider("eth_chainId", e))
                 })
                 .await?;
                 if actual != expected_chain_id {
@@ -309,6 +325,22 @@ impl RpcEndpointPool {
         if endpoint_configs.is_empty() {
             return Err(PoolError::Empty);
         }
+        let mut canonical_urls = Vec::with_capacity(endpoint_configs.len());
+        for (duplicate_index, endpoint_config) in endpoint_configs.iter().enumerate() {
+            endpoint_config.validate()?;
+            let canonical_url = endpoint_config.canonical_url()?;
+            if let Some(first_index) = canonical_urls
+                .iter()
+                .position(|seen: &reqwest::Url| seen == &canonical_url)
+            {
+                return Err(PoolError::DuplicateEndpoint {
+                    first_index,
+                    duplicate_index,
+                    url_redacted: redact_url(canonical_url.as_str()),
+                });
+            }
+            canonical_urls.push(canonical_url);
+        }
         let endpoints: std::result::Result<Vec<_>, PoolError> = endpoint_configs
             .into_iter()
             .map(|c| RpcEndpoint::new(c).map(Arc::new))
@@ -339,6 +371,13 @@ impl RpcEndpointPool {
 
     /// Select an endpoint, skipping those in cooldown or with an exhausted token bucket.
     pub fn select_for_request(&self) -> std::result::Result<Arc<RpcEndpoint>, PoolError> {
+        self.select_for_request_excluding(&[])
+    }
+
+    fn select_for_request_excluding(
+        &self,
+        attempted: &[Arc<RpcEndpoint>],
+    ) -> std::result::Result<Arc<RpcEndpoint>, PoolError> {
         let n = self.endpoints.len();
         let now = Instant::now();
         match self.config.strategy {
@@ -349,6 +388,9 @@ impl RpcEndpointPool {
                         Some(e) => Arc::clone(e),
                         None => continue,
                     };
+                    if Self::was_attempted(&endpoint, attempted) {
+                        continue;
+                    }
                     if Self::try_acquire(&endpoint, now) {
                         return Ok(endpoint);
                     }
@@ -361,6 +403,9 @@ impl RpcEndpointPool {
                         Some(e) => Arc::clone(e),
                         None => continue,
                     };
+                    if Self::was_attempted(&endpoint, attempted) {
+                        continue;
+                    }
                     if Self::try_acquire(&endpoint, now) {
                         return Ok(endpoint);
                     }
@@ -368,6 +413,12 @@ impl RpcEndpointPool {
                 Err(PoolError::Exhausted)
             }
         }
+    }
+
+    fn was_attempted(endpoint: &Arc<RpcEndpoint>, attempted: &[Arc<RpcEndpoint>]) -> bool {
+        attempted
+            .iter()
+            .any(|previous| Arc::ptr_eq(previous, endpoint))
     }
 
     fn try_acquire(endpoint: &Arc<RpcEndpoint>, now: Instant) -> bool {
@@ -577,45 +628,60 @@ impl PooledRpcChainSource {
             }
         }
         if verified == 0 {
-            return Err(IndexerError::Rpc(format!(
-                "no RPC endpoint could be verified against chain {}; {} skipped as cooling down, \
-                 and every endpoint probed failed its eth_chainId check: [{}]. Operator: the pool \
-                 cannot serve a request until at least one endpoint answers with the configured \
-                 chain id.",
-                self.chain_id,
-                cooling,
-                unreachable.join("; ")
-            )));
+            return Err(IndexerError::Unavailable {
+                operation: format!(
+                    "no RPC endpoint could be verified against chain {}; {cooling} skipped as \
+                     cooling down, and every endpoint probed failed its eth_chainId check: [{}]. \
+                     Add or restore an endpoint that answers with the configured chain id",
+                    self.chain_id,
+                    unreachable.join("; ")
+                ),
+            });
         }
         Ok(())
     }
 }
 
-fn classify_indexer_error(err: &IndexerError) -> ErrorKind {
-    let s = format!("{err}").to_lowercase();
-    if s.contains("429") || s.contains("rate limit") || s.contains("too many requests") {
-        return ErrorKind::RateLimited;
+pub(crate) fn classify_indexer_error(err: &IndexerError) -> ErrorKind {
+    match err.failure_class() {
+        crate::IndexerFailureClass::RateLimited => ErrorKind::RateLimited,
+        crate::IndexerFailureClass::RemoteTransient
+        | crate::IndexerFailureClass::RemoteServer
+        | crate::IndexerFailureClass::RemoteMalformedResponse
+        | crate::IndexerFailureClass::Unavailable => ErrorKind::ServerError,
+        crate::IndexerFailureClass::Transport => ErrorKind::Network,
+        crate::IndexerFailureClass::UnsupportedCapability
+        | crate::IndexerFailureClass::InvalidRequest
+        | crate::IndexerFailureClass::ProtocolDecode
+        | crate::IndexerFailureClass::LocalConfiguration
+        | crate::IndexerFailureClass::LocalContract
+        | crate::IndexerFailureClass::ChainMismatch
+        | crate::IndexerFailureClass::Integrity
+        | crate::IndexerFailureClass::Closed
+        | crate::IndexerFailureClass::RemoteOther
+        | crate::IndexerFailureClass::LegacyOpaque => ErrorKind::Other,
     }
-    if s.contains(" 500")
-        || s.contains(" 502")
-        || s.contains(" 503")
-        || s.contains(" 504")
-        || s.contains("status: 500")
-        || s.contains("status: 502")
-        || s.contains("status: 503")
-        || s.contains("status: 504")
-    {
-        return ErrorKind::ServerError;
+}
+
+fn can_failover_to_distinct_endpoint(err: &IndexerError) -> bool {
+    match err.failure_class() {
+        crate::IndexerFailureClass::InvalidRequest
+        | crate::IndexerFailureClass::LocalConfiguration
+        | crate::IndexerFailureClass::LocalContract
+        | crate::IndexerFailureClass::ChainMismatch
+        | crate::IndexerFailureClass::Integrity
+        | crate::IndexerFailureClass::Closed => false,
+        crate::IndexerFailureClass::RateLimited
+        | crate::IndexerFailureClass::RemoteTransient
+        | crate::IndexerFailureClass::RemoteServer
+        | crate::IndexerFailureClass::Transport
+        | crate::IndexerFailureClass::UnsupportedCapability
+        | crate::IndexerFailureClass::ProtocolDecode
+        | crate::IndexerFailureClass::RemoteMalformedResponse
+        | crate::IndexerFailureClass::Unavailable
+        | crate::IndexerFailureClass::RemoteOther
+        | crate::IndexerFailureClass::LegacyOpaque => true,
     }
-    if s.contains("connection")
-        || s.contains("timeout")
-        || s.contains("tls")
-        || s.contains("dns")
-        || s.contains("network")
-    {
-        return ErrorKind::Network;
-    }
-    ErrorKind::Other
 }
 
 async fn run_with_pool<F, Fut, T>(pool: &Arc<RpcEndpointPool>, mut op: F) -> Result<T>
@@ -625,11 +691,14 @@ where
 {
     let attempts = pool.len() * MAX_RETRY_FACTOR;
     let mut last_err: Option<IndexerError> = None;
+    let mut attempted = Vec::with_capacity(attempts);
     for _ in 0..attempts {
-        let endpoint = match pool.select_for_request() {
+        let endpoint = match pool.select_for_request_excluding(&attempted) {
             Ok(e) => e,
             Err(e) => {
-                last_err = Some(IndexerError::from(e));
+                if last_err.is_none() {
+                    last_err = Some(IndexerError::from(e));
+                }
                 break;
             }
         };
@@ -646,16 +715,17 @@ where
             Err(e) => {
                 let kind = classify_indexer_error(&e);
                 pool.mark_endpoint_error(&endpoint_for_release, kind);
-                // A foreign chain is a misconfiguration, not a flaky endpoint. Retrying
-                // past it would let a neighbour answer and turn a hard error into an Ok.
-                if matches!(e, IndexerError::ChainIdMismatch { .. }) {
+                attempted.push(endpoint_for_release);
+                if !can_failover_to_distinct_endpoint(&e) {
                     return Err(e);
                 }
                 last_err = Some(e);
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| IndexerError::Rpc("pool retry chain exhausted".into())))
+    Err(last_err.unwrap_or(IndexerError::Unavailable {
+        operation: "RPC endpoint pool retry chain".into(),
+    }))
 }
 
 async fn run_pinned<F, Fut, T>(
@@ -693,9 +763,9 @@ impl ChainSource for PooledRpcChainSource {
             let block = provider
                 .get_block_by_number(alloy::eips::BlockNumberOrTag::Finalized)
                 .await
-                .map_err(|e| IndexerError::Rpc(format!("get_block_by_number(finalized): {e}")))?;
-            let block = block.ok_or_else(|| {
-                IndexerError::Rpc("finalized block not yet available; chain too young".into())
+                .map_err(|e| IndexerError::provider("get_block_by_number(finalized)", e))?;
+            let block = block.ok_or(IndexerError::Unavailable {
+                operation: "get_block_by_number(finalized): chain may be too young".into(),
             })?;
             Ok(block.header.number)
         })
@@ -703,52 +773,23 @@ impl ChainSource for PooledRpcChainSource {
     }
 
     async fn events_in_range(&self, from_block: u64, to_block: u64) -> Result<Vec<RailgunEvent>> {
+        let proxy = self.railgun_proxy;
         if to_block < from_block {
             return Ok(Vec::new());
         }
-        let span = to_block.saturating_sub(from_block).saturating_add(1);
-        if span > crate::SCAN_CHUNK_BLOCKS {
-            return Err(IndexerError::Rpc(format!(
-                "events_in_range called with span={span} blocks; caller must chunk \
-                 to <= SCAN_CHUNK_BLOCKS={}",
-                crate::SCAN_CHUNK_BLOCKS
-            )));
-        }
+        let filter = crate::event_filter(proxy, from_block, to_block)?;
         self.verify_chain_id_once().await?;
         let chain_id = self.chain_id;
-        let proxy = self.railgun_proxy;
-        run_with_pool(&self.pool, move |endpoint: Arc<RpcEndpoint>| async move {
-            let provider = endpoint.verified_provider(chain_id).await?;
-            use alloy::sol_types::SolEvent;
-            let topic0 = [
-                crate::abi::Shield::SIGNATURE_HASH,
-                crate::abi::Transact::SIGNATURE_HASH,
-                crate::abi::Unshield::SIGNATURE_HASH,
-                crate::abi::Nullified::SIGNATURE_HASH,
-            ];
-            let filter = alloy::rpc::types::eth::Filter::new()
-                .address(proxy)
-                .from_block(from_block)
-                .to_block(to_block)
-                .event_signature(topic0.to_vec());
-            let logs = provider
-                .get_logs(&filter)
-                .await
-                .map_err(|e| IndexerError::Rpc(format!("get_logs: {e}")))?;
-            let mut events = Vec::with_capacity(logs.len());
-            for log in logs {
-                let Some(block_number) = crate::block_number_or_drop(&log) else {
-                    continue;
-                };
-                let tx_hash = log.transaction_hash.map_or([0u8; 32], |h| h.0);
-                let primary_topic = log.topic0().copied().unwrap_or_default();
-                if let Some(e) =
-                    crate::decode_log_to_railgun_event(primary_topic, &log, block_number, tx_hash)?
-                {
-                    events.push(e);
-                }
+        run_with_pool(&self.pool, move |endpoint: Arc<RpcEndpoint>| {
+            let filter = filter.clone();
+            async move {
+                let provider = endpoint.verified_provider(chain_id).await?;
+                let logs = provider
+                    .get_logs(&filter)
+                    .await
+                    .map_err(|error| IndexerError::provider("get_logs", error))?;
+                crate::decode_logs(logs)
             }
-            Ok(events)
         })
         .await
     }
@@ -781,7 +822,7 @@ impl ChainSource for PooledRpcChainSource {
             }
             let result_bytes: alloy::primitives::Bytes = call_builder
                 .await
-                .map_err(|e| IndexerError::Rpc(format!("eth_call rootHistory: {e}")))?;
+                .map_err(|e| IndexerError::provider("eth_call rootHistory", e))?;
             let decoded = crate::abi::rootHistoryCall::abi_decode_returns(&result_bytes)
                 .map_err(|e| IndexerError::Decode(format!("rootHistory decode: {e}")))?;
             Ok(decoded)
@@ -806,11 +847,9 @@ impl ChainSource for PooledRpcChainSource {
             let block = provider
                 .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(block_number))
                 .await
-                .map_err(|e| {
-                    IndexerError::Rpc(format!("get_block_by_number({block_number}): {e}"))
-                })?;
-            let block = block.ok_or_else(|| {
-                IndexerError::Rpc(format!("block {block_number} not yet available"))
+                .map_err(|e| IndexerError::provider("get_block_by_number(number)", e))?;
+            let block = block.ok_or(IndexerError::Unavailable {
+                operation: format!("get_block_by_number({block_number})"),
             })?;
             Ok(block.header.hash.0)
         })
@@ -837,7 +876,7 @@ impl ChainSource for PooledRpcChainSource {
             }
             let result_bytes: alloy::primitives::Bytes = call_builder
                 .await
-                .map_err(|e| IndexerError::Rpc(format!("eth_call merkleRoot: {e}")))?;
+                .map_err(|e| IndexerError::provider("eth_call merkleRoot", e))?;
             let decoded = crate::abi::merkleRootCall::abi_decode_returns(&result_bytes)
                 .map_err(|e| IndexerError::Decode(format!("merkleRoot decode: {e}")))?;
             Ok(decoded.0)
@@ -874,7 +913,7 @@ impl ChainSource for PooledRpcChainSource {
             }
             let result_bytes: alloy::primitives::Bytes = call_builder
                 .await
-                .map_err(|e| IndexerError::Rpc(format!("eth_call treeNumber: {e}")))?;
+                .map_err(|e| IndexerError::provider("eth_call treeNumber", e))?;
             let decoded = crate::abi::treeNumberCall::abi_decode_returns(&result_bytes)
                 .map_err(|e| IndexerError::Decode(format!("treeNumber decode: {e}")))?;
             Ok(u32::try_from(decoded).unwrap_or(u32::MAX))
@@ -1049,6 +1088,75 @@ mod tests {
     }
 
     #[test]
+    fn pool_rejects_an_exact_duplicate_endpoint() {
+        let url = "https://rpc.example/v1".to_owned();
+        let error = RpcEndpointPool::new(
+            vec![
+                EndpointConfig {
+                    url: url.clone(),
+                    rps: 10,
+                    burst: 10,
+                },
+                EndpointConfig {
+                    url,
+                    rps: 20,
+                    burst: 20,
+                },
+            ],
+            PoolConfig::default(),
+        )
+        .expect_err("one physical provider must not occupy two retry slots");
+        assert!(
+            error.to_string().contains("remove the duplicate"),
+            "duplicate error must name the operator action: {error}"
+        );
+
+        match error {
+            PoolError::DuplicateEndpoint {
+                first_index,
+                duplicate_index,
+                url_redacted,
+            } => {
+                assert_eq!((first_index, duplicate_index), (0, 1));
+                assert_eq!(url_redacted, "https://rpc.example");
+            }
+            other => panic!("expected DuplicateEndpoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pool_rejects_urls_the_parser_normalizes_to_one_endpoint() {
+        let first = "HTTP://RPC.EXAMPLE:80/a/../v1";
+        let second = "http://rpc.example/v1";
+        assert_eq!(
+            first.parse::<reqwest::Url>().expect("first URL"),
+            second.parse::<reqwest::Url>().expect("second URL"),
+            "fixture must be equivalent under the production URL parser"
+        );
+
+        let error = RpcEndpointPool::new(
+            [first, second]
+                .map(|url| EndpointConfig {
+                    url: url.to_owned(),
+                    rps: 10,
+                    burst: 10,
+                })
+                .to_vec(),
+            PoolConfig::default(),
+        )
+        .expect_err("parser-equivalent URLs must not create distinct retry slots");
+
+        assert!(matches!(
+            error,
+            PoolError::DuplicateEndpoint {
+                first_index: 0,
+                duplicate_index: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn round_robin_distributes_evenly() {
         let pool = make_pool(3, PoolStrategy::RoundRobin);
         let mut counts = [0u32; 3];
@@ -1080,8 +1188,27 @@ mod tests {
     }
 
     #[test]
+    fn both_strategies_exclude_an_endpoint_already_tried_by_the_operation() {
+        for strategy in [PoolStrategy::RoundRobin, PoolStrategy::PrimaryWithFailover] {
+            let pool = make_pool(3, strategy);
+            let first = pool.select_for_request().expect("first endpoint");
+            pool.release_in_flight(&first);
+            pool.next_idx.store(0, Ordering::Relaxed);
+
+            let alternate = pool
+                .select_for_request_excluding(&[Arc::clone(&first)])
+                .expect("distinct alternate");
+            assert!(!Arc::ptr_eq(&first, &alternate), "strategy={strategy:?}");
+            pool.release_in_flight(&alternate);
+        }
+    }
+
+    #[test]
     fn classification_picks_rate_limited_for_429() {
-        let err = IndexerError::Rpc("server returned 429 too many requests".into());
+        let err = IndexerError::provider(
+            "test",
+            alloy::transports::TransportErrorKind::http_error(429, String::new()),
+        );
         assert!(matches!(
             classify_indexer_error(&err),
             ErrorKind::RateLimited
@@ -1090,7 +1217,10 @@ mod tests {
 
     #[test]
     fn classification_picks_server_error_for_5xx() {
-        let err = IndexerError::Rpc("upstream status: 503 service unavailable".into());
+        let err = IndexerError::provider(
+            "test",
+            alloy::transports::TransportErrorKind::http_error(503, String::new()),
+        );
         assert!(matches!(
             classify_indexer_error(&err),
             ErrorKind::ServerError
@@ -1099,7 +1229,7 @@ mod tests {
 
     #[test]
     fn classification_picks_network_for_timeout() {
-        let err = IndexerError::Rpc("hyper connection timeout while dialing".into());
+        let err = IndexerError::Timeout { operation: "test" };
         assert!(matches!(classify_indexer_error(&err), ErrorKind::Network));
     }
 

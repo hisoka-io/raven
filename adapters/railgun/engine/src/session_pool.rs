@@ -1,120 +1,35 @@
-//! Occupancy-bounded wrapper around [`ServerSessionStore`].
-//!
-//! The inner store has no per-entry removal, so bounding is two layers: TTL
-//! bookkeeping decides which handles stay serviceable, and a backstop flush -
-//! gated on the inner length, never the serviceable count - reclaims bytes.
+//! Railgun metric facade over the bounded InsPIRe session mechanism.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use parking_lot::RwLock;
+use parking_lot::Mutex;
 use raven_inspire::inspiring::{ClientPackingKeys, PackParams};
 use raven_inspire::math::NttContext;
 use raven_inspire::{ClientSession, ServerSessionHandle, ServerSessionStore};
+use raven_inspire_session::{
+    Observed, SessionObservation, SessionStoreError, SessionStoreErrorClass, SessionWarning,
+};
 use raven_railgun_core::AdapterError;
 
 use super::Result;
 
-/// Session ceiling before the backstop flush fires. A memory ceiling in
-/// disguise: packing keys cost 11.94 MiB per session at gamma=128, so this is
-/// deliberately far below the HTTP layer's `session_lru_cap`, which bounds only
-/// handles.
-pub const DEFAULT_MAX_SESSIONS: usize = 64;
+pub use raven_inspire_session::{SessionStoreLimits, DEFAULT_MAX_SESSIONS, DEFAULT_SESSION_TTL};
 
-/// Serviceable lifetime of a registered session.
-pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(3600);
-
-/// Occupancy and lifetime bounds for a [`BoundedSessionStore`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SessionStoreLimits {
-    /// Inner-store length at which the backstop flush fires.
-    pub max_sessions: usize,
-    /// How long a handle stays serviceable after registration.
-    pub ttl: Duration,
-}
-
-impl Default for SessionStoreLimits {
-    fn default() -> Self {
-        Self {
-            max_sessions: DEFAULT_MAX_SESSIONS,
-            ttl: DEFAULT_SESSION_TTL,
-        }
-    }
-}
-
-/// Externally-visible handles are never reused for the life of the process.
+/// Occupancy-bounded InsPIRe sessions with Railgun's operator metrics.
 ///
-/// The inner store has no way to seed or offset its allocator, so every fresh generation numbers
-/// from zero and a stale handle would otherwise collide with a live one. Reserving a disjoint
-/// external range per generation makes a retired handle smaller than the current base, which is a
-/// property arithmetic can decide - and the client still holds one flat opaque u64.
-///
-/// Process-global rather than per-store because several sites build a whole new
-/// `BoundedSessionStore`, so a per-store counter would restart with it.
-///
-/// External ids start above [`EXTERNAL_HANDLE_BASE`] so they are DISJOINT from inner ids, which the
-/// occupancy cap keeps in the tens. `resolve` therefore reads which namespace it was handed instead
-/// of inferring it: the wire path presents an external id and gets the never-reused guarantee, while
-/// the in-process helper presents the inner id its `ClientSession` baked in and keeps today's
-/// semantics.
-static EXTERNAL_HANDLE_FLOOR: AtomicU64 = AtomicU64::new(EXTERNAL_HANDLE_BASE);
-
-/// Floor of the external handle namespace. Far above any inner id: the inner allocator is bounded
-/// by [`SessionStoreLimits::max_sessions`], a memory ceiling measured in tens of sessions because
-/// one session's packing keys cost ~11.94 MiB.
-const EXTERNAL_HANDLE_BASE: u64 = 1 << 32;
-
-struct Generation {
-    store: Arc<ServerSessionStore>,
-    /// Keyed by EXTERNAL handle; the value carries the inner handle to translate back to.
-    expiry: HashMap<u64, (ServerSessionHandle, Instant)>,
-    /// External handles in this generation are `base + inner`.
-    base: u64,
-}
-
-impl Generation {
-    fn fresh(reserve: u64) -> Self {
-        Self {
-            store: Arc::new(ServerSessionStore::new()),
-            expiry: HashMap::new(),
-            // Saturating, so an exhausted space stops advancing rather than wrapping onto a live
-            // range. At that point every later handle collides within one generation, which the
-            // inner allocator already permits, and no reuse across generations is introduced.
-            base: EXTERNAL_HANDLE_FLOOR.fetch_add(reserve.max(1), Ordering::Relaxed),
-        }
-    }
-
-    fn external(&self, inner: ServerSessionHandle) -> ServerSessionHandle {
-        ServerSessionHandle(self.base.saturating_add(inner.0))
-    }
-}
-
-/// Bounded, metered session store. Unknown, removed, and expired handles fail
-/// closed in [`resolve`](Self::resolve) rather than reaching the inner store.
-///
-/// Reclamation is a whole-generation flush; in-flight requests are unaffected
-/// because `resolve` returns an `Arc` pinning the pre-flush generation. Handle
-/// numbering restarts at zero, so a stale client presenting a reissued handle
-/// is answered under keys it cannot decrypt - a denial of useful response, not
-/// a key disclosure.
+/// State, durability, and handle binding live in `raven-inspire-session`. This facade maps its
+/// typed errors into the adapter error contract and emits the existing `raven_railgun_*` series.
 pub struct BoundedSessionStore {
-    limits: SessionStoreLimits,
-    current: RwLock<Generation>,
-    evicted_total: AtomicU64,
-    flushes_total: AtomicU64,
+    inner: raven_inspire_session::BoundedSessionStore,
+    metric_sequence: Arc<Mutex<u64>>,
 }
 
 impl std::fmt::Debug for BoundedSessionStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BoundedSessionStore")
-            .field("max_sessions", &self.limits.max_sessions)
-            .field("ttl_secs", &self.limits.ttl.as_secs())
-            .field("len", &self.len())
-            .field("serviceable", &self.serviceable_len())
-            .field("evicted_total", &self.evicted_total())
-            .field("flushes_total", &self.flushes_total())
+            .field("inner", &self.inner)
             .finish_non_exhaustive()
     }
 }
@@ -126,426 +41,539 @@ impl Default for BoundedSessionStore {
 }
 
 impl BoundedSessionStore {
-    /// Build an empty store with [`SessionStoreLimits::default`].
+    /// Build an empty in-memory store with default limits.
     #[must_use]
     pub fn new() -> Self {
         Self::with_limits(SessionStoreLimits::default())
     }
 
-    /// Build an empty store with operator-chosen limits.
+    /// Build an empty in-memory store with caller-selected limits.
     #[must_use]
     pub fn with_limits(limits: SessionStoreLimits) -> Self {
-        Self {
+        Self::from_inner(raven_inspire_session::BoundedSessionStore::with_limits(
             limits,
-            current: RwLock::new(Generation::fresh(limits.max_sessions as u64)),
-            evicted_total: AtomicU64::new(0),
-            flushes_total: AtomicU64::new(0),
+        ))
+    }
+
+    /// Open a restart-safe store with default limits.
+    ///
+    /// # Errors
+    ///
+    /// [`AdapterError::Internal`] when the durable floor cannot prove handle non-reuse.
+    pub fn open(data_dir: &Path) -> Result<Self> {
+        raven_inspire_session::BoundedSessionStore::open(data_dir)
+            .map(Self::from_inner)
+            .map_err(map_error)
+    }
+
+    /// Open a restart-safe store with caller-selected limits.
+    ///
+    /// # Errors
+    ///
+    /// [`AdapterError::Internal`] when the durable floor cannot prove handle non-reuse.
+    pub fn open_with_limits(data_dir: &Path, limits: SessionStoreLimits) -> Result<Self> {
+        raven_inspire_session::BoundedSessionStore::open_with_limits(data_dir, limits)
+            .map(Self::from_inner)
+            .map_err(map_error)
+    }
+
+    fn from_inner(inner: raven_inspire_session::BoundedSessionStore) -> Self {
+        Self {
+            inner,
+            metric_sequence: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    pub(crate) fn empty_successor(&self) -> Self {
+        Self {
+            inner: self.inner.empty_successor(),
+            metric_sequence: Arc::clone(&self.metric_sequence),
         }
     }
 
     /// Configured bounds.
     #[must_use]
     pub fn limits(&self) -> SessionStoreLimits {
-        self.limits
+        self.inner.limits()
     }
 
-    /// Packing-key sets held by the inner store; the memory-occupancy figure.
+    /// Packing-key sets resident in the mechanism.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.current.read().store.len()
+        self.inner.len()
     }
 
-    /// Whether the inner store holds no packing keys.
+    /// Whether the mechanism holds no packing-key sets.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.inner.is_empty()
     }
 
-    /// Handles that [`resolve`](Self::resolve) would still accept, ignoring TTL.
+    /// Handles currently present in the external-to-inner binding map.
     #[must_use]
     pub fn serviceable_len(&self) -> usize {
-        self.current.read().expiry.len()
+        self.inner.serviceable_len()
     }
 
-    /// Sessions dropped by expiry, explicit removal, or flush.
+    /// Packing-key sets removed by expiry, explicit removal, or flush.
     #[must_use]
     pub fn evicted_total(&self) -> u64 {
-        self.evicted_total.load(Ordering::Relaxed)
+        self.inner.evicted_total()
     }
 
-    /// Backstop flushes performed.
+    /// Cap-triggered generation flushes.
     #[must_use]
     pub fn flushes_total(&self) -> u64 {
-        self.flushes_total.load(Ordering::Relaxed)
+        self.inner.flushes_total()
     }
 
-    /// Register wire-delivered packing keys, deriving the server-side NTT form.
+    /// Register wire-delivered packing keys, deriving the server-side representation.
     ///
     /// # Errors
-    /// [`AdapterError::Scheme`] on a poisoned lock or rejected derivation.
+    ///
+    /// Returns an actionable adapter error when durability or InsPIRe rejects registration.
     pub fn register_server_side(
         &self,
         keys: ClientPackingKeys,
         pack_params: &PackParams,
-        ctx: &NttContext,
+        context: &NttContext,
     ) -> Result<ServerSessionHandle> {
-        self.register_server_side_at(keys, pack_params, ctx, Instant::now())
+        self.finish(self.inner.register_server_side(keys, pack_params, context))
     }
 
-    /// [`register_server_side`](Self::register_server_side) against an explicit clock.
+    /// Register wire-delivered packing keys against an explicit clock.
     ///
     /// # Errors
-    /// [`AdapterError::Scheme`] on a poisoned lock or rejected derivation.
+    ///
+    /// Returns an actionable adapter error when durability or InsPIRe rejects registration.
     pub fn register_server_side_at(
         &self,
         keys: ClientPackingKeys,
         pack_params: &PackParams,
-        ctx: &NttContext,
+        context: &NttContext,
         now: Instant,
     ) -> Result<ServerSessionHandle> {
-        let expires_at = now + self.limits.ttl;
-        let mut gen = self.current.write();
-        self.make_room(&mut gen, now);
-        let inner = gen
-            .store
-            .register_server_side(keys, pack_params, ctx)
-            .map_err(|e| AdapterError::Scheme(format!("session register_server_side: {e}")))?;
-        let external = gen.external(inner);
-        gen.expiry.insert(external.0, (inner, expires_at));
-        Self::publish_occupancy(&gen);
-        Ok(external)
+        self.finish(
+            self.inner
+                .register_server_side_at(keys, pack_params, context, now),
+        )
     }
 
-    /// Register an in-process [`ClientSession`]; `Ok(None)` when it carries no
-    /// packing keys.
+    /// Register an in-process client session and install its external handle.
     ///
     /// # Errors
-    /// [`AdapterError::Scheme`] if the inner store rejects the keys.
+    ///
+    /// Returns [`AdapterError::Scheme`] when InsPIRe rejects registration or installation.
     pub fn register_client_session_at(
         &self,
         session: &mut ClientSession,
         now: Instant,
     ) -> Result<Option<ServerSessionHandle>> {
-        let expires_at = now + self.limits.ttl;
-        let mut gen = self.current.write();
-        self.make_room(&mut gen, now);
-        // The in-process helper is registered under BOTH names: `ClientSession` bakes the inner
-        // handle in and its field is private in the submodule, so a query built from that session
-        // presents the inner value. Registering the external one too keeps the wire path's
-        // never-reused guarantee while leaving this path exactly as it behaves today.
-        let inner = session
-            .register_with_server_derivation(gen.store.as_ref())
-            .map_err(|e| AdapterError::Scheme(format!("session register: {e}")))?;
-        let external = inner.map(|h| gen.external(h));
-        if let (Some(i), Some(e)) = (inner, external) {
-            gen.expiry.insert(e.0, (i, expires_at));
-            if e.0 != i.0 {
-                gen.expiry.insert(i.0, (i, expires_at));
-            }
-        }
-        Self::publish_occupancy(&gen);
-        Ok(external)
+        self.finish(self.inner.register_client_session_at(session, now))
     }
 
-    /// Store a respond call should read `handle` from. `None` skips the
-    /// serviceability check; the inline-packing-keys path never consults it.
+    /// Resolve an external handle into the generation and inner handle used by the responder.
     ///
     /// # Errors
-    /// [`AdapterError::InvalidQuery`] when the handle is unknown, removed, or
-    /// past its TTL.
+    ///
+    /// Returns [`AdapterError::SessionHandleRejected`] for absent, removed, or expired handles.
     pub fn resolve(
         &self,
         handle: Option<ServerSessionHandle>,
         now: Instant,
-    ) -> Result<(Arc<ServerSessionStore>, Option<ServerSessionHandle>)> {
-        let gen = self.current.read();
-        let Some(h) = handle else {
-            return Ok((Arc::clone(&gen.store), None));
-        };
-        // An EXTERNAL handle below this generation's base was minted by a retired one. Refusing it
-        // by arithmetic is what makes reissue fail CLOSED: without it the value collides with a live
-        // handle and the respond path serves another caller's packing keys at HTTP 200. The bound
-        // check is what distinguishes a wire handle from an in-process one, whose id is an inner
-        // value below the namespace floor and is looked up directly.
-        if h.0 >= EXTERNAL_HANDLE_BASE && h.0 < gen.base {
-            return Err(AdapterError::InvalidQuery(format!(
-                "session handle {} was issued by a retired session generation (current range \
-                 starts at {}, {} flushes since start); re-run the session handshake",
-                h.0,
-                gen.base,
-                self.flushes_total()
-            )));
-        }
-        match gen.expiry.get(&h.0) {
-            Some((inner, expires_at)) if *expires_at > now => {
-                Ok((Arc::clone(&gen.store), Some(*inner)))
-            }
-            Some(_) => Err(AdapterError::InvalidQuery(format!(
-                "session handle {} expired (ttl {}s); re-run the session handshake",
-                h.0,
-                self.limits.ttl.as_secs()
-            ))),
-            None => Err(AdapterError::InvalidQuery(format!(
-                "session handle {} is not registered on this instance ({} serviceable, \
-                 {} evicted since start); re-run the session handshake",
-                h.0,
-                gen.expiry.len(),
-                self.evicted_total()
-            ))),
-        }
+    ) -> Result<(
+        std::sync::Arc<ServerSessionStore>,
+        Option<ServerSessionHandle>,
+    )> {
+        self.inner.resolve(handle, now).map_err(map_error)
     }
 
-    /// Stop serving `handle`. Keys stay resident until the next flush - the
-    /// inner store has no per-entry removal.
+    /// Stop serving `handle` and free its packing keys.
     pub fn remove(&self, handle: ServerSessionHandle) -> bool {
-        let mut gen = self.current.write();
-        let removed = gen.expiry.remove(&handle.0).is_some();
-        if removed {
-            self.evicted_total.fetch_add(1, Ordering::Relaxed);
-            metrics::counter!("raven_railgun_session_evictions_total", "reason" => "removed")
-                .increment(1);
-        }
-        Self::publish_occupancy(&gen);
-        removed
+        let (outcome, observation, warnings) = self.inner.remove(handle).into_parts();
+        self.emit(observation, warnings);
+        outcome.unwrap_or_else(|error| {
+            tracing::error!(%error, handle = handle.0, "session key removal failed");
+            false
+        })
     }
 
-    /// Drop every handle whose TTL elapsed at or before `now`, returning the count.
+    /// Drop every handle whose TTL elapsed at or before `now`.
     pub fn sweep_expired(&self, now: Instant) -> usize {
-        let mut gen = self.current.write();
-        let swept = Self::sweep_locked(&mut gen, now);
-        if swept > 0 {
-            self.evicted_total
-                .fetch_add(swept as u64, Ordering::Relaxed);
-            metrics::counter!("raven_railgun_session_evictions_total", "reason" => "expired")
-                .increment(swept as u64);
-        }
-        Self::publish_occupancy(&gen);
-        swept
+        let (outcome, observation, warnings) = self.inner.sweep_expired(now).into_parts();
+        self.emit(observation, warnings);
+        outcome.unwrap_or_else(|error| {
+            tracing::error!(%error, "expired session sweep failed");
+            0
+        })
     }
 
-    fn sweep_locked(gen: &mut Generation, now: Instant) -> usize {
-        let before = gen.expiry.len();
-        gen.expiry.retain(|_, (_, expires_at)| *expires_at > now);
-        before - gen.expiry.len()
+    fn finish<T>(&self, observed: Observed<T>) -> Result<T> {
+        let (outcome, observation, warnings) = observed.into_parts();
+        self.emit(observation, warnings);
+        outcome.map_err(map_error)
     }
 
-    /// Reclaim when the inner store is at the cap. Gating on `store.len()` is
-    /// load-bearing: expired handles leave the map but their keys stay
-    /// resident, so a serviceable-count gate grows without bound.
-    fn make_room(&self, gen: &mut Generation, now: Instant) {
-        let swept = Self::sweep_locked(gen, now);
-        if swept > 0 {
-            self.evicted_total
-                .fetch_add(swept as u64, Ordering::Relaxed);
-            metrics::counter!("raven_railgun_session_evictions_total", "reason" => "expired")
-                .increment(swept as u64);
+    fn emit(&self, observation: SessionObservation, warnings: Vec<SessionWarning>) {
+        for warning in warnings {
+            tracing::error!(%warning, "session store recovered from an inner removal failure");
         }
-        if gen.store.len() < self.limits.max_sessions {
+        increment_evictions("removed", observation.evictions.removed);
+        increment_evictions("expired", observation.evictions.expired);
+        increment_evictions("flushed", observation.evictions.flushed);
+        if observation.flushes > 0 {
+            metrics::counter!("raven_railgun_session_store_flushes_total")
+                .increment(observation.flushes);
+            tracing::warn!(
+                dropped = observation.evictions.flushed,
+                max_sessions = self.limits().max_sessions,
+                "session store hit its occupancy cap; flushed every registered session"
+            );
+        }
+        let Some(counts) = observation.counts else {
+            return;
+        };
+        let mut published = self.metric_sequence.lock();
+        if observation.sequence <= *published {
             return;
         }
-        let dropped = gen.store.len() as u64;
-        *gen = Generation::fresh(self.limits.max_sessions as u64);
-        self.evicted_total.fetch_add(dropped, Ordering::Relaxed);
-        self.flushes_total.fetch_add(1, Ordering::Relaxed);
-        metrics::counter!("raven_railgun_session_evictions_total", "reason" => "flushed")
-            .increment(dropped);
-        metrics::counter!("raven_railgun_session_store_flushes_total").increment(1);
-        tracing::warn!(
-            dropped,
-            max_sessions = self.limits.max_sessions,
-            "session store hit its occupancy cap; flushed every registered session"
-        );
+        #[allow(clippy::cast_precision_loss)]
+        metrics::gauge!("raven_railgun_session_store_occupancy").set(counts.occupancy as f64);
+        #[allow(clippy::cast_precision_loss)]
+        metrics::gauge!("raven_railgun_session_store_serviceable").set(counts.serviceable as f64);
+        *published = observation.sequence;
     }
+}
 
-    #[allow(clippy::cast_precision_loss)]
-    fn publish_occupancy(gen: &Generation) {
-        metrics::gauge!("raven_railgun_session_store_occupancy").set(gen.store.len() as f64);
-        metrics::gauge!("raven_railgun_session_store_serviceable").set(gen.expiry.len() as f64);
+fn increment_evictions(reason: &'static str, count: u64) {
+    if count > 0 {
+        metrics::counter!("raven_railgun_session_evictions_total", "reason" => reason)
+            .increment(count);
+    }
+}
+
+fn map_error(error: SessionStoreError) -> AdapterError {
+    match error.class() {
+        SessionStoreErrorClass::Durability | SessionStoreErrorClass::Configuration => {
+            AdapterError::Internal(error.to_string())
+        }
+        SessionStoreErrorClass::Inspire => AdapterError::Scheme(error.to_string()),
+        SessionStoreErrorClass::HandleRejected => AdapterError::SessionHandleRejected {
+            detail: error
+                .handle_rejection_detail()
+                .map_or_else(|| error.to_string(), str::to_owned),
+        },
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::{BoundedSessionStore, SessionStoreLimits};
-    use raven_inspire::inspiring::ClientPackingKeys;
-    use raven_inspire::ServerSessionHandle;
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use super::{
+        map_error, AdapterError, BoundedSessionStore, SessionStoreError, SessionStoreLimits,
+        DEFAULT_SESSION_TTL,
+    };
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use raven_inspire::inspiring::{ClientPackingKeys, PackParams};
+    use raven_inspire::math::GaussianSampler;
+    use raven_inspire::params::InspireParams;
+    use raven_inspire::setup;
+    use raven_inspire_session::{SessionCounts, SessionEvictions, SessionObservation};
+    use std::time::Instant;
 
-    /// Empty keys; the store never inspects them and 11.94 MiB each would make
-    /// cap tests unaffordable.
-    fn keys() -> ClientPackingKeys {
-        ClientPackingKeys {
-            y_body: Vec::new(),
-            z_body: Vec::new(),
-            y_all: Vec::new(),
-            y_all_ntt: Vec::new(),
-            y_bar_all: Vec::new(),
-            y_bar_all_ntt: Vec::new(),
-            full_key: false,
-            num_to_pack: 1,
+    #[test]
+    fn typed_handle_refusal_maps_without_parsing_display_text() {
+        let error = SessionStoreError::HandleRejected {
+            detail: "replace this session".to_owned(),
+        };
+        assert!(matches!(
+            map_error(error),
+            AdapterError::SessionHandleRejected { detail } if detail == "replace this session"
+        ));
+    }
+
+    fn metric_value<'a>(
+        snapshot: &'a [(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            DebugValue,
+        )],
+        name: &str,
+        reason: Option<&str>,
+    ) -> &'a DebugValue {
+        snapshot
+            .iter()
+            .find_map(|(key, _unit, _description, value)| {
+                let same_reason = reason.is_none_or(|expected| {
+                    key.key()
+                        .labels()
+                        .any(|label| label.key() == "reason" && label.value() == expected)
+                });
+                (key.key().name() == name && same_reason).then_some(value)
+            })
+            .unwrap_or_else(|| panic!("missing metric {name} with reason {reason:?}"))
+    }
+
+    fn assert_gauge(value: &DebugValue, expected: f64) {
+        match value {
+            DebugValue::Gauge(actual) => {
+                assert_eq!(actual.into_inner().to_bits(), expected.to_bits());
+            }
+            other => panic!("expected gauge {expected}, got {other:?}"),
         }
     }
 
-    fn store(max_sessions: usize) -> BoundedSessionStore {
-        BoundedSessionStore::with_limits(SessionStoreLimits {
-            max_sessions,
-            ttl: Duration::from_secs(3600),
-        })
-    }
-
-    /// Returns the EXTERNAL handle, which is what a caller holds.
-    fn register(s: &BoundedSessionStore, now: Instant) -> ServerSessionHandle {
-        let mut gen = s.current.write();
-        s.make_room(&mut gen, now);
-        let inner = gen.store.register(keys()).expect("register");
-        let external = gen.external(inner);
-        gen.expiry.insert(external.0, (inner, now + s.limits.ttl));
-        external
+    fn real_registration_material() -> (
+        ClientPackingKeys,
+        PackParams,
+        raven_inspire::math::NttContext,
+    ) {
+        let params = InspireParams::secure_128_d2048();
+        let database = vec![0u8; params.ring_dim * 32];
+        let mut sampler = GaussianSampler::with_seed(params.sigma, 118);
+        let (crs, _encoded, secret_key) =
+            setup(&params, &database, 32, &mut sampler).expect("setup");
+        let pack_params = PackParams::try_new(&params, 16).expect("pack params");
+        let keys = ClientPackingKeys::generate(
+            &secret_key,
+            &pack_params,
+            crs.inspiring_w_seed,
+            &mut sampler,
+        );
+        (keys, pack_params, params.ntt_context())
     }
 
     #[test]
-    fn occupancy_never_exceeds_the_cap_under_churn() {
-        let s = store(8);
-        let t0 = Instant::now();
-        for i in 0..200u32 {
-            register(&s, t0 + Duration::from_millis(u64::from(i)));
-            assert!(
-                s.len() <= 8,
-                "inner occupancy {} exceeded cap 8 after {i} registrations",
-                s.len()
+    fn typed_observation_emits_each_existing_series_once() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let store = BoundedSessionStore::new();
+        metrics::with_local_recorder(&recorder, || {
+            store.emit(
+                SessionObservation {
+                    sequence: 1,
+                    evictions: SessionEvictions {
+                        removed: 2,
+                        expired: 3,
+                        flushed: 4,
+                    },
+                    flushes: 1,
+                    counts: Some(SessionCounts {
+                        occupancy: 5,
+                        serviceable: 6,
+                    }),
+                },
+                Vec::new(),
             );
-        }
-        assert!(
-            s.flushes_total() >= 24,
-            "200 registrations at cap 8 must flush repeatedly; got {}",
-            s.flushes_total()
-        );
-    }
-
-    #[test]
-    fn flush_frees_the_packing_keys_it_evicted() {
-        let s = store(4);
-        let t0 = Instant::now();
-        let h = register(&s, t0);
-        let (inner_store, inner_h) = s.resolve(Some(h), t0).expect("resolve");
-        let held = inner_store
-            .get(inner_h.expect("a resolved handle translates"))
-            .expect("get")
-            .expect("present");
-        assert_eq!(Arc::strong_count(&held), 2, "store + local clone");
-
-        for i in 1..8u32 {
-            register(&s, t0 + Duration::from_millis(u64::from(i)));
-        }
-        assert!(s.flushes_total() >= 1, "cap 4 must have flushed");
-        drop(inner_store);
-        assert_eq!(
-            Arc::strong_count(&held),
-            1,
-            "flushed generation must be the last owner of the evicted keys"
-        );
-    }
-
-    /// A flushed handle is refused for HAVING BEEN flushed, not merely for being absent.
-    ///
-    /// The distinction is the whole property. An absent-handle message also appears for a handle
-    /// that was never issued at all, so asserting only that a refusal happened cannot tell a
-    /// working guard from a coincidence.
-    ///
-    /// This test previously checked only the highest handle, because numbering restarted and the
-    /// lower ones were reissued to later callers. External ids are never reused now, so EVERY
-    /// flushed handle is provably gone and all four are asserted.
-    #[test]
-    fn evicted_handles_fail_closed_instead_of_resolving() {
-        let s = store(4);
-        let t0 = Instant::now();
-        let mut flushed = Vec::new();
-        for i in 0..4u32 {
-            flushed.push(register(&s, t0 + Duration::from_millis(u64::from(i))));
-        }
-        let survivor = register(&s, t0 + Duration::from_millis(4));
-        assert_eq!(s.flushes_total(), 1);
-        assert_eq!(
-            s.len(),
-            1,
-            "the fresh generation holds only the newest session"
-        );
-
-        for h in &flushed {
-            let err = s
-                .resolve(Some(*h), t0 + Duration::from_secs(1))
-                .expect_err("every flushed handle must fail closed");
-            assert!(
-                format!("{err}").contains("retired session generation"),
-                "the refusal must name the RETIRED GENERATION rather than a missing \
-                 registration, which is also what an id that was never issued would report: {err}"
-            );
-            assert_ne!(
-                h.0, survivor.0,
-                "a flushed id must never be reissued to the session that replaced it"
-            );
-        }
-
-        assert!(
-            s.resolve(Some(survivor), t0 + Duration::from_secs(1)).is_ok(),
-            "the surviving session must still resolve; a guard that refuses everything is not a guard"
-        );
-    }
-
-    #[test]
-    fn remove_stops_service_and_counts_an_eviction() {
-        let s = store(64);
-        let t0 = Instant::now();
-        let h = register(&s, t0);
-        assert!(s.resolve(Some(h), t0).is_ok());
-        assert!(s.remove(h), "first remove reports the handle was present");
-        assert!(!s.remove(h), "second remove is a no-op");
-        assert_eq!(s.evicted_total(), 1);
-        assert!(
-            s.resolve(Some(h), t0).is_err(),
-            "removed handle fails closed"
-        );
-    }
-
-    #[test]
-    fn ttl_expiry_stops_service_and_sweeps() {
-        let s = BoundedSessionStore::with_limits(SessionStoreLimits {
-            max_sessions: 64,
-            ttl: Duration::from_secs(10),
         });
-        let t0 = Instant::now();
-        let h = register(&s, t0);
-        assert!(s.resolve(Some(h), t0 + Duration::from_secs(9)).is_ok());
-        assert!(
-            s.resolve(Some(h), t0 + Duration::from_secs(11)).is_err(),
-            "past-TTL handle must fail closed"
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            metric_value(
+                &snapshot,
+                "raven_railgun_session_evictions_total",
+                Some("removed")
+            ),
+            &DebugValue::Counter(2)
         );
-        assert_eq!(s.sweep_expired(t0 + Duration::from_secs(11)), 1);
-        assert_eq!(s.serviceable_len(), 0);
+        assert_eq!(
+            metric_value(
+                &snapshot,
+                "raven_railgun_session_evictions_total",
+                Some("expired")
+            ),
+            &DebugValue::Counter(3)
+        );
+        assert_eq!(
+            metric_value(
+                &snapshot,
+                "raven_railgun_session_evictions_total",
+                Some("flushed")
+            ),
+            &DebugValue::Counter(4)
+        );
+        assert_eq!(
+            metric_value(&snapshot, "raven_railgun_session_store_flushes_total", None),
+            &DebugValue::Counter(1)
+        );
+        assert_gauge(
+            metric_value(&snapshot, "raven_railgun_session_store_occupancy", None),
+            5.0,
+        );
+        assert_gauge(
+            metric_value(&snapshot, "raven_railgun_session_store_serviceable", None),
+            6.0,
+        );
     }
 
     #[test]
-    fn an_in_flight_resolve_survives_a_concurrent_flush() {
-        let s = store(4);
-        let t0 = Instant::now();
-        let h = register(&s, t0);
-        let (in_flight, in_flight_h) = s.resolve(Some(h), t0).expect("resolve before flush");
-        for i in 1..8u32 {
-            register(&s, t0 + Duration::from_millis(u64::from(i)));
-        }
-        assert!(s.flushes_total() >= 1);
-        let keys = in_flight
-            .get(in_flight_h.expect("a resolved handle translates"))
-            .expect("lock")
-            .expect("in-flight request must still see its own session after a flush");
-        assert_eq!(keys.num_to_pack, 1);
+    fn late_observation_keeps_its_counter_delta_without_overwriting_newer_gauges() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let store = BoundedSessionStore::new();
+        metrics::with_local_recorder(&recorder, || {
+            store.emit(
+                SessionObservation {
+                    sequence: 2,
+                    evictions: SessionEvictions {
+                        expired: 2,
+                        ..SessionEvictions::default()
+                    },
+                    flushes: 0,
+                    counts: Some(SessionCounts {
+                        occupancy: 2,
+                        serviceable: 2,
+                    }),
+                },
+                Vec::new(),
+            );
+            store.emit(
+                SessionObservation {
+                    sequence: 1,
+                    evictions: SessionEvictions {
+                        removed: 3,
+                        ..SessionEvictions::default()
+                    },
+                    flushes: 0,
+                    counts: Some(SessionCounts {
+                        occupancy: 9,
+                        serviceable: 9,
+                    }),
+                },
+                Vec::new(),
+            );
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            metric_value(
+                &snapshot,
+                "raven_railgun_session_evictions_total",
+                Some("expired")
+            ),
+            &DebugValue::Counter(2)
+        );
+        assert_eq!(
+            metric_value(
+                &snapshot,
+                "raven_railgun_session_evictions_total",
+                Some("removed")
+            ),
+            &DebugValue::Counter(3)
+        );
+        assert_gauge(
+            metric_value(&snapshot, "raven_railgun_session_store_occupancy", None),
+            2.0,
+        );
+        assert_gauge(
+            metric_value(&snapshot, "raven_railgun_session_store_serviceable", None),
+            2.0,
+        );
     }
 
     #[test]
-    fn no_handle_resolves_without_a_serviceability_check() {
-        let s = store(4);
-        s.resolve(None, Instant::now())
-            .expect("the inline-keys path never consults the bookkeeping map");
+    fn successor_shares_the_gauge_publication_cursor() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let store = BoundedSessionStore::new();
+        let successor = store.empty_successor();
+        metrics::with_local_recorder(&recorder, || {
+            successor.emit(
+                SessionObservation {
+                    sequence: 2,
+                    counts: Some(SessionCounts {
+                        occupancy: 2,
+                        serviceable: 2,
+                    }),
+                    ..SessionObservation::default()
+                },
+                Vec::new(),
+            );
+            store.emit(
+                SessionObservation {
+                    sequence: 1,
+                    counts: Some(SessionCounts {
+                        occupancy: 9,
+                        serviceable: 9,
+                    }),
+                    ..SessionObservation::default()
+                },
+                Vec::new(),
+            );
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_gauge(
+            metric_value(&snapshot, "raven_railgun_session_store_occupancy", None),
+            2.0,
+        );
+        assert_gauge(
+            metric_value(&snapshot, "raven_railgun_session_store_serviceable", None),
+            2.0,
+        );
+    }
+
+    #[test]
+    fn missing_remove_publishes_zero_counts_without_an_eviction() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let store = BoundedSessionStore::new();
+        metrics::with_local_recorder(&recorder, || {
+            assert!(!store.remove(raven_inspire::ServerSessionHandle(77)));
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_gauge(
+            metric_value(&snapshot, "raven_railgun_session_store_occupancy", None),
+            0.0,
+        );
+        assert_gauge(
+            metric_value(&snapshot, "raven_railgun_session_store_serviceable", None),
+            0.0,
+        );
+        assert!(snapshot
+            .iter()
+            .all(|(key, _, _, _)| { key.key().name() != "raven_railgun_session_evictions_total" }));
+    }
+
+    #[test]
+    fn failed_registration_after_flush_publishes_zero_gauges_and_one_flush() {
+        let (keys, pack_params, context) = real_registration_material();
+        let store = BoundedSessionStore::with_limits(SessionStoreLimits {
+            max_sessions: 1,
+            ttl: DEFAULT_SESSION_TTL,
+        });
+        store
+            .register_server_side_at(keys.clone(), &pack_params, &context, Instant::now())
+            .expect("first registration");
+        let mut invalid = keys;
+        invalid.y_body.pop();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            assert!(store
+                .register_server_side_at(invalid, &pack_params, &context, Instant::now())
+                .is_err());
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            metric_value(&snapshot, "raven_railgun_session_store_flushes_total", None),
+            &DebugValue::Counter(1)
+        );
+        assert_eq!(
+            metric_value(
+                &snapshot,
+                "raven_railgun_session_evictions_total",
+                Some("flushed")
+            ),
+            &DebugValue::Counter(1)
+        );
+        assert_gauge(
+            metric_value(&snapshot, "raven_railgun_session_store_occupancy", None),
+            0.0,
+        );
+        assert_gauge(
+            metric_value(&snapshot, "raven_railgun_session_store_serviceable", None),
+            0.0,
+        );
     }
 }

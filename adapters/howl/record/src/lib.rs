@@ -24,6 +24,8 @@ pub const RECORD_BYTES: usize = 246;
 /// Full PIR cell width. The gap to [`RECORD_BYTES`] is zero padding, not payload.
 pub const CELL_BYTES: usize = 256;
 
+const _: () = assert!(CELL_BYTES.div_ceil(2).is_power_of_two() && CELL_BYTES.div_ceil(2) <= 1024);
+
 /// Bytes of the note commitment carried for local false-hit rejection.
 pub const COMMITMENT_PREFIX_BYTES: usize = 16;
 

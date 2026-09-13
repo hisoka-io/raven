@@ -1,0 +1,6 @@
+{
+  "generator": "raven-railgun-cli production_cell",
+  "serializedQueryBytes": 49445,
+  "batchFrameBytes": 10,
+  "defaultBodyCapBytes": 8388608
+}

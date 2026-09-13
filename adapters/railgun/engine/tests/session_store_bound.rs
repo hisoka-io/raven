@@ -86,8 +86,7 @@ fn a_retired_handle_is_refused_instead_of_served() {
     register_client_session(&mut session, &state).expect("register 2");
     let retired = session.session_handle().expect("handle after register 2");
 
-    // Third registration trips the backstop; the fresh generation restarts
-    // numbering, so only the lowest handle is reissued.
+    // Third registration trips the backstop; core handle allocation remains monotonic.
     register_client_session(&mut session, &state).expect("register 3");
     assert!(state.session_store.flushes_total() >= 1);
     assert!(
@@ -117,24 +116,19 @@ fn an_unknown_handle_never_reaches_the_inner_store() {
     let err = <RavenInspireScheme as PirScheme>::respond(&state, &query)
         .expect_err("unknown handle must be refused");
     assert!(
-        matches!(err, raven_railgun_core::AdapterError::InvalidQuery(_)),
-        "an unknown handle is a caller defect, not a scheme failure: {err:?}"
+        matches!(
+            err,
+            raven_railgun_core::AdapterError::SessionHandleRejected { .. }
+        ),
+        "an unknown handle must retain its typed session refusal: {err:?}"
     );
 }
 
-/// A handle as a WIRE client holds it must serve, which means the translation is exercised where it
-/// is NOT the identity.
-///
-/// The external namespace starts far above the inner one, so every registration mints an external id
-/// that differs from the inner key the store is keyed on. Without that gap this test would pass
-/// against an implementation that never translated at all - which is exactly the state the suite was
-/// in before: nothing outside `src/` called `register_server_side`, so no test ever presented a
-/// handle whose external and inner values differed, and returning the wrong one of the two reddened
-/// nothing.
+/// A wire client holds the same process-global handle that keys the core store.
 #[test]
-fn a_wire_handle_is_translated_to_the_inner_handle_the_store_is_keyed_on() {
+fn a_wire_handle_is_the_core_handle_the_store_is_keyed_on() {
     let (params, state, mut session, db) = capped_state();
-    let external = state
+    let wire_handle = state
         .session_store
         .register_client_session_at(&mut session, std::time::Instant::now())
         .expect("register")
@@ -142,15 +136,14 @@ fn a_wire_handle_is_translated_to_the_inner_handle_the_store_is_keyed_on() {
     let inner = session
         .session_handle()
         .expect("the session baked a handle");
-    assert_ne!(
-        external.0, inner.0,
-        "premise: the external namespace is disjoint from the inner one, so a missing translation \
-         cannot pass by coincidence"
+    assert_eq!(
+        wire_handle.0, inner.0,
+        "the adapter must not translate the process-global core handle into another namespace"
     );
 
     let (client_state, mut query) =
         build_seeded_query(&session, state.shard_config(), 3, &params).expect("build query");
-    query.session_handle = Some(external);
+    query.session_handle = Some(wire_handle);
     let response = <RavenInspireScheme as PirScheme>::respond(&state, &query)
         .expect("a handle in the form a wire client holds must serve");
     let plaintext = extract_response(state.crs.as_ref(), &client_state, &response, ENTRY_SIZE)
@@ -158,12 +151,11 @@ fn a_wire_handle_is_translated_to_the_inner_handle_the_store_is_keyed_on() {
     assert_eq!(
         plaintext,
         db.get(3 * ENTRY_SIZE..4 * ENTRY_SIZE).expect("record"),
-        "the translated handle must resolve to the caller's OWN packing keys, not merely to some \
+        "the handle must resolve to the caller's OWN packing keys, not merely to some \
          entry that happens to exist"
     );
 
-    // The in-process wrapper is the other entry point; it bakes the INNER handle into the
-    // session, so it must serve on the same fixture without the explicit substitution above.
+    // The in-process wrapper installs the same core-issued handle.
     register_client_session(&mut session, &state).expect("register via the production wrapper");
     let (wrapped_state, wrapped_query) =
         build_seeded_query(&session, state.shard_config(), 3, &params).expect("build query");
@@ -183,21 +175,9 @@ fn a_wire_handle_is_translated_to_the_inner_handle_the_store_is_keyed_on() {
     );
 }
 
-/// INVERTED IN PLACE on 2026-08-19. This test asserted the defect; it now asserts the fix.
-///
-/// The defect: a backstop flush installed a fresh inner store whose handle numbering restarted at
-/// zero, so a client whose session was flushed held a handle a LATER client was then issued.
-/// Presenting it did not fail closed - it resolved, and the respond path served that later client's
-/// packing keys under it. For the presenter that was a denial of useful response rather than a key
-/// disclosure, since it cannot decrypt under keys it does not hold; what it was NOT is fail-closed,
-/// and which caller got served was decided by arithmetic rather than authorisation.
-///
-/// The fix reserves a disjoint EXTERNAL handle range per generation, so a value is never reused for
-/// the life of the process. Two properties, and the second is the one that matters: the handles must
-/// not collide, and a retired handle must be REFUSED for being retired rather than merely being
-/// absent from a map.
+/// A flushed handle stays unique because allocation is process-global in the core store.
 #[test]
-fn a_flushed_handle_is_refused_because_it_was_issued_by_a_retired_generation() {
+fn a_flushed_core_handle_is_refused_and_never_reissued() {
     let (_params, state, mut session, _db) = capped_state();
     let now = std::time::Instant::now();
 
@@ -207,7 +187,7 @@ fn a_flushed_handle_is_refused_because_it_was_issued_by_a_retired_generation() {
         .expect("first registration")
         .expect("the session carries packing keys");
 
-    // Fill to the cap so the backstop flushes and the inner allocator restarts.
+    // Fill to the cap so the backstop replaces the store.
     for _ in 0..=CAP {
         let _ = state
             .session_store
@@ -226,7 +206,7 @@ fn a_flushed_handle_is_refused_because_it_was_issued_by_a_retired_generation() {
     );
     assert_ne!(
         stale.0, reissued.0,
-        "an external handle must never be reused, however many times the inner store restarts"
+        "a core handle must never be reused when the bounded store is replaced"
     );
 
     let err = state
@@ -235,9 +215,8 @@ fn a_flushed_handle_is_refused_because_it_was_issued_by_a_retired_generation() {
         .expect_err("a handle from a superseded generation must fail closed");
     let msg = err.to_string();
     assert!(
-        msg.contains("retired session generation"),
-        "it must be refused for being RETIRED, not merely for being absent - an absent-handle \
-         message would also appear for a handle that was never issued at all; got: {msg}"
+        msg.contains("not registered"),
+        "the replacement store must not contain the flushed core handle; got: {msg}"
     );
 
     let (_store, inner) = state
@@ -246,6 +225,6 @@ fn a_flushed_handle_is_refused_because_it_was_issued_by_a_retired_generation() {
         .expect("the live handle still resolves");
     assert!(
         inner.is_some(),
-        "a resolved external handle must translate to the inner one the respond path reads"
+        "a resolved wire handle must reach the core store"
     );
 }

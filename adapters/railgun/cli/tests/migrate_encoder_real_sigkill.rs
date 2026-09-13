@@ -31,7 +31,7 @@ use raven_railgun_persistence::{
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-real-sigkill-migration";
 const TOY_ENTRY_SIZE: usize = 32;
-const ENTRIES_PER_SHARD: u32 = 256;
+const ENTRIES_PER_SHARD: u32 = 2048;
 const SEED_LEAF_COUNT: u32 = 32;
 const SENTINEL_TIMEOUT: Duration = Duration::from_secs(60);
 const POST_KILL_WAIT: Duration = Duration::from_secs(10);
@@ -413,6 +413,10 @@ fn real_sigkill_at_post_manifest_bump_yields_fully_migrated_state() {
     assert!(
         msg.contains("already") || msg.contains("nothing to migrate"),
         "error must surface idempotency guard; got: {msg}"
+    );
+    assert!(
+        msg.contains("per-leaf-bc"),
+        "idempotency error must report the completed migration's source encoder: {msg}"
     );
 
     let manifest_after_attempt = read_manifest(dir.path());

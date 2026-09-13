@@ -153,7 +153,7 @@ function decodeInstanceParams(buf: Uint8Array): DecodedParams {
   if (buf.length < 4) throw new Error(`/params body too short: ${buf.length}`);
   const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   const envelope = (view.getUint8(0) << 8) | view.getUint8(1);
-  if (envelope !== 1) throw new Error(`unexpected envelope=${envelope}`);
+  if (envelope !== 2) throw new Error(`unexpected envelope=${envelope}`);
   let off = 2;
   const wireSchemaVersion = view.getUint16(off, true);
   off += 2;

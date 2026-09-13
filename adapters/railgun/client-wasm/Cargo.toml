@@ -39,6 +39,7 @@ doc_markdown = "allow"
 
 [dependencies]
 raven-client = { path = "../../../crates/client" }
+raven-railgun-core = { path = "../core" }
 wasm-bindgen = "0.2"
 
 [dev-dependencies]

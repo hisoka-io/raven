@@ -263,6 +263,61 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used, clippy::indexing_slicing)]
+    fn constant_schedule_matches_committed_yul_source() {
+        let source: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/generators/yul-constants.json"))
+                .expect("committed Yul constant source parses");
+        assert_eq!(
+            source["modulus"].as_str(),
+            Some("0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001")
+        );
+
+        for (label, source_key, transcribed) in [
+            (
+                "round",
+                "round_constants_in_order",
+                constants::ROUND_CONSTANTS.as_slice(),
+            ),
+            (
+                "diagonal",
+                "repeated",
+                constants::INTERNAL_DIAGONAL.as_slice(),
+            ),
+        ] {
+            let source_constants = source[source_key]
+                .as_array()
+                .expect("constant source is an array");
+            assert_eq!(
+                source_constants.len(),
+                transcribed.len(),
+                "{label} constant count"
+            );
+            for (index, (source_constant, rust_constant)) in
+                source_constants.iter().zip(transcribed).enumerate()
+            {
+                let digits = source_constant
+                    .as_str()
+                    .and_then(|value| value.strip_prefix("0x"))
+                    .expect("source constant is 0x-prefixed hex");
+                assert!(
+                    digits.len() <= 64,
+                    "{label} constant {index} exceeds 32 bytes"
+                );
+                assert!(
+                    digits.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "{label} constant {index} is not hex"
+                );
+                assert_eq!(
+                    *rust_constant,
+                    format!("0x{digits:0>64}"),
+                    "{label} constant {index} differs from the source ordering or value"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_schedule_is_the_t4_shape() {
         assert_eq!(
             constants::ROUND_CONSTANTS.len(),

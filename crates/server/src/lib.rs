@@ -74,14 +74,17 @@ pub trait PirScheme: Send + Sync + 'static {
     fn state_shape(state: &Self::ServerState) -> StateShape;
 }
 
-/// Informs the orchestrator's re-preprocess schedule.
+/// Classifies an instance for adapter-owned lifecycle policy.
+///
+/// Raven stores and exposes the role. Adapters schedule preprocessing and orchestrate
+/// sidecar updates and folds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstanceRole {
-    /// Filled and immutable.
+    /// The adapter treats the instance as filled and immutable.
     Static,
-    /// Still filling; re-preprocessed on a schedule.
+    /// The adapter treats the instance as still filling and owns its preprocessing cadence.
     Live,
-    /// Sidecar for incremental schemes.
+    /// The adapter uses the instance as a sidecar and owns update and fold orchestration.
     Sidecar,
 }
 
@@ -371,6 +374,55 @@ impl<S: PirScheme> Drop for InFlightGuard<S> {
     }
 }
 
+/// Result of resolving an instance for a new serving request.
+pub enum ServingInstance<S: PirScheme> {
+    /// Instance exists and accepted new work when observed.
+    Available(Arc<PirInstance<S>>),
+    /// No instance is registered under the requested id.
+    Missing,
+    /// Instance exists but is not accepting new work.
+    Drained {
+        /// Drain state observed by the registry accessor.
+        state: DrainState,
+    },
+}
+
+impl<S: PirScheme> std::fmt::Debug for ServingInstance<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Available(instance) => f.debug_tuple("Available").field(&instance.id).finish(),
+            Self::Missing => f.write_str("Missing"),
+            Self::Drained { state } => f.debug_struct("Drained").field("state", state).finish(),
+        }
+    }
+}
+
+impl<S: PirScheme> ServingInstance<S> {
+    /// Whether no instance was registered under the requested id.
+    #[must_use]
+    pub fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
+    /// Observed non-active drain state, if the instance exists but cannot serve.
+    #[must_use]
+    pub fn drain_state(&self) -> Option<DrainState> {
+        match self {
+            Self::Drained { state } => Some(*state),
+            Self::Available(_) | Self::Missing => None,
+        }
+    }
+
+    /// Take the available instance; other outcomes return `None`.
+    #[must_use]
+    pub fn into_available(self) -> Option<Arc<PirInstance<S>>> {
+        match self {
+            Self::Available(instance) => Some(instance),
+            Self::Missing | Self::Drained { .. } => None,
+        }
+    }
+}
+
 /// Instance registry, looked up by [`InstanceId`].
 pub struct Engine<S: PirScheme> {
     instances: arc_swap::ArcSwap<Vec<Arc<PirInstance<S>>>>,
@@ -440,10 +492,65 @@ impl<S: PirScheme> Engine<S> {
             .map(Arc::clone)
     }
 
+    /// Resolve an id for serving without collapsing missing and drained instances.
+    ///
+    /// The drain state is a point-in-time admission check. A concurrent drain after
+    /// [`ServingInstance::Available`] is still refused by
+    /// [`PirInstance::query_active_tracked`].
+    ///
+    /// ```
+    /// use raven_core::server_error::Result;
+    /// use raven_core::{InstanceId, ServerError};
+    /// use raven_server::{
+    ///     Engine, InstanceRole, PirInstance, PirScheme, ServingInstance, StateShape,
+    /// };
+    ///
+    /// struct Echo;
+    /// impl PirScheme for Echo {
+    ///     type ServerState = Vec<u8>;
+    ///     type Query = usize;
+    ///     type Response = u8;
+    ///     fn respond(state: &Vec<u8>, query: &usize) -> Result<u8> {
+    ///         state.get(*query).copied().ok_or_else(|| {
+    ///             ServerError::InvalidQuery(format!("index {query} out of bounds"))
+    ///         })
+    ///     }
+    ///     fn state_shape(_state: &Vec<u8>) -> StateShape {
+    ///         StateShape { entry_size_bytes: 1, rows_per_shard: u64::MAX }
+    ///     }
+    /// }
+    ///
+    /// let mut engine = Engine::<Echo>::new();
+    /// engine.add_instance(PirInstance::new(
+    ///     InstanceId::new("echo"), InstanceRole::Static, vec![7],
+    /// )).unwrap();
+    /// assert!(matches!(
+    ///     engine.serving_instance(&InstanceId::new("echo")),
+    ///     ServingInstance::Available(_)
+    /// ));
+    /// assert!(matches!(
+    ///     engine.serving_instance(&InstanceId::new("missing")),
+    ///     ServingInstance::Missing
+    /// ));
+    /// ```
+    #[must_use]
+    pub fn serving_instance(&self, id: &InstanceId) -> ServingInstance<S> {
+        let instances = self.instances.load();
+        let Some(instance) = instances.iter().find(|instance| &instance.id == id) else {
+            return ServingInstance::Missing;
+        };
+        let instance = Arc::clone(instance);
+        let state = instance.drain_state();
+        if state.is_active() {
+            ServingInstance::Available(instance)
+        } else {
+            ServingInstance::Drained { state }
+        }
+    }
+
     /// Only if [`DrainState::Active`].
     pub fn active_instance(&self, id: &InstanceId) -> Option<Arc<PirInstance<S>>> {
-        self.instance(id)
-            .filter(|inst| inst.drain_state() == DrainState::Active)
+        self.serving_instance(id).into_available()
     }
 
     /// Every registered instance.
@@ -631,6 +738,44 @@ mod tests {
             .expect("add");
         assert!(engine.instance(&InstanceId::new("a")).is_some());
         assert!(engine.instance(&InstanceId::new("b")).is_none());
+    }
+
+    #[test]
+    fn serving_instance_distinguishes_available_missing_and_drained() {
+        let mut engine: Engine<EchoScheme> = Engine::new();
+        engine
+            .add_instance(PirInstance::new(
+                InstanceId::new("serving"),
+                InstanceRole::Static,
+                vec![1],
+            ))
+            .expect("add");
+
+        let id = InstanceId::new("serving");
+        let available = match engine.serving_instance(&id) {
+            ServingInstance::Available(instance) => instance,
+            other => panic!("active instance must be available, got {other:?}"),
+        };
+        assert!(matches!(
+            engine.serving_instance(&InstanceId::new("missing")),
+            ServingInstance::Missing
+        ));
+
+        available.set_drain_state(DrainState::Draining);
+        assert!(matches!(
+            engine.serving_instance(&id),
+            ServingInstance::Drained {
+                state: DrainState::Draining
+            }
+        ));
+
+        available.set_drain_state(DrainState::Drained);
+        assert!(matches!(
+            engine.serving_instance(&id),
+            ServingInstance::Drained {
+                state: DrainState::Drained
+            }
+        ));
     }
 
     #[test]

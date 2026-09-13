@@ -721,6 +721,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "raven-inspire-cache"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "bincode",
+ "proptest",
+ "raven-inspire",
+ "raven-storage",
+ "serde",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "raven-inspire-session"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "parking_lot",
+ "raven-inspire",
+ "raven-storage",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "raven-server"
 version = "0.1.0-alpha.0"
 dependencies = [

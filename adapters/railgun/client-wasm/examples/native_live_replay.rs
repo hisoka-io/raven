@@ -38,7 +38,7 @@ use raven_inspire::{
 };
 
 const WIRE_SCHEMA_PREFIX_LEN: usize = 2;
-const WIRE_SCHEMA_VERSION: u16 = 1;
+const WIRE_SCHEMA_VERSION: u16 = 3;
 const KEY_SEED: [u8; 32] = *b"raven-native-live-replay-key-001";
 const NOISE_SEED: [u8; 32] = *b"raven-native-live-replay-noise01";
 
@@ -153,14 +153,20 @@ fn extract(work_dir: &Path, response_path: &Path) {
 
     let raw =
         fs::read(response_path).unwrap_or_else(|e| panic!("read {}: {e}", response_path.display()));
-    let response: ServerResponse =
-        bincode::deserialize(&strip_envelope(&raw, "response")).expect("decode ServerResponse");
+    let response_body = strip_envelope(&raw, "response");
+    let response = ServerResponse::from_binary(&response_body).expect("decode ServerResponse");
     let crs = ServerCrs::from_versioned_bytes(&params.crs_bincode).expect("decode wire CRS");
 
-    let row = extract_response(&crs, &client_state, &response, params.entry_size);
-    println!("row_bytes={}", row.len());
-    println!("leaf_hex={}", hex_lower(&row[..row.len().min(32)]));
-    println!("row_sha256_prefix={}", hex_lower(&row[..row.len().min(64)]));
+    let plaintext = extract_response(&crs, &client_state, &response, params.entry_size);
+    println!("row_bytes={}", plaintext.len());
+    println!(
+        "leaf_hex={}",
+        hex_lower(&plaintext[..plaintext.len().min(32)])
+    );
+    println!(
+        "row_sha256_prefix={}",
+        hex_lower(&plaintext[..plaintext.len().min(64)])
+    );
 }
 
 fn extract_response(

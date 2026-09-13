@@ -5,7 +5,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { idbClear, loadClientPirContext } from "../src/index";
-import { makeRegisterSpy } from "./helpers/register_spy";
+import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
 import type { RavenInspireClientSession, RavenInspireWasm } from "../src/index";
 
 const INSTANCE_ID = "t1Status-persistence";
@@ -26,6 +26,7 @@ function spyWasm(): PersistenceSpy {
     deserializeCalls: 0,
     buildCalls: 0,
     wasm: {
+      ...stubRemoteSessionExports(),
       build_client_session: () => {
         spy.buildCalls += 1;
         return session;

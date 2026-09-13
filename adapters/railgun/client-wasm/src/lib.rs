@@ -13,15 +13,6 @@ const PATH_INDEX_TREE_DEPTH: u32 = 16;
 const PATH_INDEX_LEAVES_PER_TREE: u32 = 1u32 << PATH_INDEX_TREE_DEPTH;
 const PATH_INDICES_LEN: usize = PATH_INDEX_TREE_DEPTH as usize;
 
-/// Flat-global index for `(level, idx_at_level)`: leaves in `[0, 2^D)`, root at
-/// `2^(D+1) - 2`. Mirrors `PerNodeEncoder::flat_index` in `raven-railgun-engine`.
-fn flat_index_for(level: u32, idx_at_level: u32) -> u32 {
-    let depth = PATH_INDEX_TREE_DEPTH;
-    let total = 1u32 << (depth + 1);
-    let level_offset = total - (1u32 << (depth + 1 - level));
-    level_offset + idx_at_level
-}
-
 /// 16 flat-global row indices for the auth path of `leaf_idx` under the
 /// `PerNodeEncoder` layout; one PIR query per index, reconstructed client-side.
 #[wasm_bindgen]
@@ -45,7 +36,11 @@ fn path_indices(operation: &str, index_name: &str, idx: u32) -> Result<Vec<u32>,
     let mut walk = idx;
     for level in 0..PATH_INDEX_TREE_DEPTH {
         let sibling_idx = walk ^ 1;
-        indices.push(flat_index_for(level, sibling_idx));
+        indices.push(raven_railgun_core::tree_layout::flat_index(
+            PATH_INDEX_TREE_DEPTH,
+            level,
+            sibling_idx,
+        ));
         walk >>= 1;
     }
     Ok(indices)
@@ -100,7 +95,7 @@ mod path_indices_tests {
     fn flat_index_root_is_total_minus_two() {
         let depth = PATH_INDEX_TREE_DEPTH;
         let total = 1u32 << (depth + 1);
-        let root = flat_index_for(depth, 0);
+        let root = raven_railgun_core::tree_layout::flat_index(depth, depth, 0);
         assert_eq!(root, total - 2);
     }
 }

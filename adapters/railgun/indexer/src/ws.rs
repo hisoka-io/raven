@@ -157,14 +157,14 @@ impl WsChainSource {
                     alloy::providers::ProviderBuilder::new()
                         .connect_pubsub_with(connect)
                         .await
-                        .map_err(|e| IndexerError::Alloy(format!("ws connect: {e}")))?,
+                        .map_err(|e| IndexerError::provider("WS connect", e))?,
                 )
             };
 
         let dialled_at = self.dials.load(Ordering::Acquire);
         let actual = alloy::providers::Provider::get_chain_id(provider.as_ref())
             .await
-            .map_err(|e| IndexerError::Rpc(format!("eth_chainId: {e}")))?;
+            .map_err(|e| IndexerError::provider("eth_chainId", e))?;
         if actual != self.chain_id {
             return Err(IndexerError::ChainIdMismatch {
                 expected: self.chain_id,
@@ -191,11 +191,9 @@ impl ChainSource for WsChainSource {
                 let block = p
                     .get_block_by_number(alloy::eips::BlockNumberOrTag::Finalized)
                     .await
-                    .map_err(|e| {
-                        IndexerError::Rpc(format!("get_block_by_number(finalized): {e}"))
-                    })?;
-                let block = block.ok_or_else(|| {
-                    IndexerError::Rpc("finalized block not yet available; chain too young".into())
+                    .map_err(|e| IndexerError::provider("get_block_by_number(finalized)", e))?;
+                let block = block.ok_or(IndexerError::Unavailable {
+                    operation: "get_block_by_number(finalized): chain may be too young".into(),
                 })?;
                 Ok(block.header.number)
             }),
@@ -207,54 +205,19 @@ impl ChainSource for WsChainSource {
         crate::with_rpc_timeout(
             "ws events_in_range",
             Box::pin(async {
-                if to_block < from_block {
-                    return Ok(Vec::new());
-                }
-                let span = to_block.saturating_sub(from_block).saturating_add(1);
-                if span > crate::SCAN_CHUNK_BLOCKS {
-                    return Err(IndexerError::Rpc(format!(
-                        "events_in_range called with span={span} blocks; caller must chunk \
-                     to <= SCAN_CHUNK_BLOCKS={} per the trait contract",
-                        crate::SCAN_CHUNK_BLOCKS
-                    )));
-                }
-                let p = self.verified_provider().await?;
-
-                use alloy::sol_types::SolEvent;
-                let topic0 = [
-                    crate::abi::Shield::SIGNATURE_HASH,
-                    crate::abi::Transact::SIGNATURE_HASH,
-                    crate::abi::Unshield::SIGNATURE_HASH,
-                    crate::abi::Nullified::SIGNATURE_HASH,
-                ];
-                let filter = alloy::rpc::types::eth::Filter::new()
-                    .address(self.railgun_proxy)
-                    .from_block(from_block)
-                    .to_block(to_block)
-                    .event_signature(topic0.to_vec());
-
-                let logs = p
-                    .get_logs(&filter)
-                    .await
-                    .map_err(|e| IndexerError::Rpc(format!("get_logs: {e}")))?;
-
-                let mut events = Vec::with_capacity(logs.len());
-                for log in logs {
-                    let Some(block_number) = crate::block_number_or_drop(&log) else {
-                        continue;
-                    };
-                    let tx_hash = log.transaction_hash.map_or([0u8; 32], |h| h.0);
-                    let primary_topic = log.topic0().copied().unwrap_or_default();
-                    if let Some(e) = crate::decode_log_to_railgun_event(
-                        primary_topic,
-                        &log,
-                        block_number,
-                        tx_hash,
-                    )? {
-                        events.push(e);
-                    }
-                }
-                Ok(events)
+                crate::fetch_events_in_range(
+                    self.railgun_proxy,
+                    from_block,
+                    to_block,
+                    |filter| async move {
+                        let provider = self.verified_provider().await?;
+                        provider
+                            .get_logs(&filter)
+                            .await
+                            .map_err(|error| IndexerError::provider("get_logs", error))
+                    },
+                )
+                .await
             }),
         )
         .await
@@ -287,7 +250,7 @@ impl ChainSource for WsChainSource {
                 }
                 let result_bytes: alloy::primitives::Bytes = call_builder
                     .await
-                    .map_err(|e| IndexerError::Rpc(format!("eth_call rootHistory: {e}")))?;
+                    .map_err(|e| IndexerError::provider("eth_call rootHistory", e))?;
                 let decoded = crate::abi::rootHistoryCall::abi_decode_returns(&result_bytes)
                     .map_err(|e| IndexerError::Decode(format!("rootHistory decode: {e}")))?;
                 Ok(decoded)
@@ -304,11 +267,9 @@ impl ChainSource for WsChainSource {
                 let block = p
                     .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(block_number))
                     .await
-                    .map_err(|e| {
-                        IndexerError::Rpc(format!("get_block_by_number({block_number}): {e}"))
-                    })?;
-                let block = block.ok_or_else(|| {
-                    IndexerError::Rpc(format!("block {block_number} not yet available"))
+                    .map_err(|e| IndexerError::provider("get_block_by_number(number)", e))?;
+                let block = block.ok_or(IndexerError::Unavailable {
+                    operation: format!("get_block_by_number({block_number})"),
                 })?;
                 Ok(block.header.hash.0)
             }),
@@ -335,7 +296,7 @@ impl ChainSource for WsChainSource {
                 }
                 let result_bytes: alloy::primitives::Bytes = call_builder
                     .await
-                    .map_err(|e| IndexerError::Rpc(format!("eth_call merkleRoot: {e}")))?;
+                    .map_err(|e| IndexerError::provider("eth_call merkleRoot", e))?;
                 let decoded = crate::abi::merkleRootCall::abi_decode_returns(&result_bytes)
                     .map_err(|e| IndexerError::Decode(format!("merkleRoot decode: {e}")))?;
                 Ok(decoded.0)
@@ -363,7 +324,7 @@ impl ChainSource for WsChainSource {
                 }
                 let result_bytes: alloy::primitives::Bytes = call_builder
                     .await
-                    .map_err(|e| IndexerError::Rpc(format!("eth_call treeNumber: {e}")))?;
+                    .map_err(|e| IndexerError::provider("eth_call treeNumber", e))?;
                 let decoded = crate::abi::treeNumberCall::abi_decode_returns(&result_bytes)
                     .map_err(|e| IndexerError::Decode(format!("treeNumber decode: {e}")))?;
                 let tree_u32 = u32::try_from(decoded).unwrap_or(u32::MAX);
@@ -469,21 +430,14 @@ where
     }
 }
 
-fn is_ws_transport_error(err: &IndexerError) -> bool {
-    let msg = format!("{err}").to_lowercase();
-    msg.contains("ws connect:")
-        || msg.contains("websocket")
-        || msg.contains("connection closed")
-        || msg.contains("connection refused")
-        || msg.contains("connection reset")
-        || msg.contains("connection aborted")
-        || msg.contains("broken pipe")
-        || msg.contains("eof")
-        || msg.contains("timed out")
-        || msg.contains("timeout")
-        || msg.contains("method not supported")
-        || msg.contains("method not found")
-        || msg.contains("unsupported method")
+pub(crate) fn is_ws_fallback_error(err: &IndexerError) -> bool {
+    matches!(
+        err.failure_class(),
+        crate::IndexerFailureClass::Transport
+            | crate::IndexerFailureClass::UnsupportedCapability
+            | crate::IndexerFailureClass::ProtocolDecode
+            | crate::IndexerFailureClass::RemoteMalformedResponse
+    )
 }
 
 #[async_trait]
@@ -499,8 +453,8 @@ where
                     self.record_ws_success().await;
                     return Ok(v);
                 }
-                Err(e) if is_ws_transport_error(&e) => {
-                    tracing::warn!(error = %e, "WS latest_block transport error; falling back");
+                Err(e) if is_ws_fallback_error(&e) => {
+                    tracing::warn!(error = %e, "WS latest_block failed; falling back");
                     self.record_ws_failure().await;
                 }
                 Err(e) => return Err(e),
@@ -516,8 +470,8 @@ where
                     self.record_ws_success().await;
                     return Ok(v);
                 }
-                Err(e) if is_ws_transport_error(&e) => {
-                    tracing::warn!(error = %e, "WS events_in_range transport error; falling back");
+                Err(e) if is_ws_fallback_error(&e) => {
+                    tracing::warn!(error = %e, "WS events_in_range failed; falling back");
                     self.record_ws_failure().await;
                 }
                 Err(e) => return Err(e),
@@ -542,8 +496,8 @@ where
                     self.record_ws_success().await;
                     return Ok(v);
                 }
-                Err(e) if is_ws_transport_error(&e) => {
-                    tracing::warn!(error = %e, "WS root_history transport error; falling back");
+                Err(e) if is_ws_fallback_error(&e) => {
+                    tracing::warn!(error = %e, "WS root_history failed; falling back");
                     self.record_ws_failure().await;
                 }
                 Err(e) => return Err(e),
@@ -561,8 +515,8 @@ where
                     self.record_ws_success().await;
                     return Ok(v);
                 }
-                Err(e) if is_ws_transport_error(&e) => {
-                    tracing::warn!(error = %e, "WS block_hash transport error; falling back");
+                Err(e) if is_ws_fallback_error(&e) => {
+                    tracing::warn!(error = %e, "WS block_hash failed; falling back");
                     self.record_ws_failure().await;
                 }
                 Err(e) => return Err(e),
@@ -578,8 +532,8 @@ where
                     self.record_ws_success().await;
                     return Ok(v);
                 }
-                Err(e) if is_ws_transport_error(&e) => {
-                    tracing::warn!(error = %e, "WS merkle_root transport error; falling back");
+                Err(e) if is_ws_fallback_error(&e) => {
+                    tracing::warn!(error = %e, "WS merkle_root failed; falling back");
                     self.record_ws_failure().await;
                 }
                 Err(e) => return Err(e),
@@ -595,10 +549,10 @@ where
                     self.record_ws_success().await;
                     return Ok(v);
                 }
-                Err(e) if is_ws_transport_error(&e) => {
+                Err(e) if is_ws_fallback_error(&e) => {
                     tracing::warn!(
                         error = %e,
-                        "WS active_tree_number transport error; falling back"
+                        "WS active_tree_number failed; falling back"
                     );
                     self.record_ws_failure().await;
                 }
@@ -631,6 +585,405 @@ pub fn ws_with_rpc_fallback(
 mod tests {
     use super::*;
 
+    fn provider_error(source: alloy::transports::TransportError) -> IndexerError {
+        IndexerError::Provider {
+            operation: "policy table",
+            source,
+        }
+    }
+
+    fn error_response(code: i64, message: &'static str) -> alloy::transports::TransportError {
+        let parse_error = serde_json::from_str::<serde_json::Value>("{")
+            .expect_err("the malformed control must fail JSON decoding");
+        alloy::transports::TransportError::deser_err(
+            parse_error,
+            format!(r#"{{"code":{code},"message":"{message}"}}"#),
+        )
+    }
+
+    fn assert_policy(
+        label: &str,
+        error: IndexerError,
+        class: crate::IndexerFailureClass,
+        non_retryable: bool,
+        pool_kind: crate::rpc_pool::ErrorKind,
+        ws_fallback: bool,
+    ) {
+        assert_eq!(error.failure_class(), class, "{label}: factual class");
+        assert_eq!(
+            crate::is_non_retryable(&error),
+            non_retryable,
+            "{label}: single-endpoint retry policy"
+        );
+        assert_eq!(
+            std::mem::discriminant(&crate::rpc_pool::classify_indexer_error(&error)),
+            std::mem::discriminant(&pool_kind),
+            "{label}: pool health policy"
+        );
+        assert_eq!(
+            is_ws_fallback_error(&error),
+            ws_fallback,
+            "{label}: WS fallback policy"
+        );
+    }
+
+    #[test]
+    fn every_indexer_and_alloy_error_variant_has_an_explicit_layer_policy() {
+        use crate::rpc_pool::{ErrorKind, PoolError};
+        use crate::{IndexerFailureClass as C, SubscriptionStream};
+        use alloy::transports::{RpcError, TransportErrorKind};
+
+        let cases = [
+            (
+                "legacy rpc",
+                IndexerError::Rpc("opaque".into()),
+                C::LegacyOpaque,
+                false,
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "legacy alloy",
+                IndexerError::Alloy("opaque".into()),
+                C::LegacyOpaque,
+                false,
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "application decode",
+                IndexerError::Decode("malformed event".into()),
+                C::ProtocolDecode,
+                true,
+                ErrorKind::Other,
+                true,
+            ),
+            (
+                "timeout",
+                IndexerError::Timeout {
+                    operation: "eth_getLogs",
+                },
+                C::Transport,
+                false,
+                ErrorKind::Network,
+                true,
+            ),
+            (
+                "subscription closed",
+                IndexerError::SubscriptionClosed {
+                    stream: SubscriptionStream::Logs,
+                },
+                C::Transport,
+                false,
+                ErrorKind::Network,
+                true,
+            ),
+            (
+                "subscription lagged",
+                IndexerError::SubscriptionLagged {
+                    stream: SubscriptionStream::Heads,
+                    skipped: 3,
+                },
+                C::Transport,
+                false,
+                ErrorKind::Network,
+                true,
+            ),
+            (
+                "unavailable",
+                IndexerError::Unavailable {
+                    operation: "finalized block".into(),
+                },
+                C::Unavailable,
+                false,
+                ErrorKind::ServerError,
+                false,
+            ),
+            (
+                "contract violation",
+                IndexerError::ContractViolation {
+                    operation: "events_in_range",
+                    reason: "range too wide".into(),
+                },
+                C::LocalContract,
+                true,
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "invalid url",
+                IndexerError::InvalidRpcUrl("relative URL without a base".into()),
+                C::LocalConfiguration,
+                true,
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "pool exhausted",
+                IndexerError::Pool(PoolError::Exhausted),
+                C::Unavailable,
+                false,
+                ErrorKind::ServerError,
+                false,
+            ),
+            (
+                "pool empty",
+                IndexerError::Pool(PoolError::Empty),
+                C::LocalConfiguration,
+                true,
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "pool config invalid",
+                IndexerError::Pool(PoolError::InvalidEndpointConfig {
+                    url: "invalid".into(),
+                    rps: 0,
+                    burst: 0,
+                }),
+                C::LocalConfiguration,
+                true,
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "pool endpoint duplicate",
+                IndexerError::Pool(PoolError::DuplicateEndpoint {
+                    first_index: 0,
+                    duplicate_index: 1,
+                    url_redacted: "https://rpc.example".into(),
+                }),
+                C::LocalConfiguration,
+                true,
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "chain mismatch",
+                IndexerError::ChainIdMismatch {
+                    expected: 1,
+                    actual: 2,
+                },
+                C::ChainMismatch,
+                true,
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "reorg too deep",
+                IndexerError::ReorgTooDeep(7),
+                C::Integrity,
+                true,
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "reorg fence",
+                IndexerError::ReorgFence {
+                    height: 7,
+                    reason: "consumer closed".into(),
+                },
+                C::Integrity,
+                true,
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "reorg window miss",
+                IndexerError::ReorgWindowMiss {
+                    cursor: 7,
+                    window_len: 0,
+                    window_oldest: None,
+                    window_newest: None,
+                },
+                C::Integrity,
+                true,
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "startup",
+                IndexerError::Startup("window corrupt".into()),
+                C::Integrity,
+                true,
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "closed",
+                IndexerError::Closed,
+                C::Closed,
+                true,
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "JSON-RPC method not found",
+                provider_error(error_response(-32601, "Method not found")),
+                C::UnsupportedCapability,
+                true,
+                ErrorKind::Other,
+                true,
+            ),
+            (
+                "JSON-RPC rate limited",
+                provider_error(error_response(429, "Too Many Requests")),
+                C::RateLimited,
+                false,
+                ErrorKind::RateLimited,
+                false,
+            ),
+            (
+                "JSON-RPC internal",
+                provider_error(error_response(-32603, "Internal error")),
+                C::RemoteServer,
+                false,
+                ErrorKind::ServerError,
+                false,
+            ),
+            (
+                "JSON-RPC parse error",
+                provider_error(error_response(-32700, "Parse error")),
+                C::InvalidRequest,
+                true,
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "JSON-RPC invalid request",
+                provider_error(error_response(-32600, "Invalid request")),
+                C::InvalidRequest,
+                true,
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "null response",
+                provider_error(RpcError::NullResp),
+                C::Unavailable,
+                false,
+                ErrorKind::ServerError,
+                false,
+            ),
+            (
+                "unsupported feature",
+                provider_error(RpcError::UnsupportedFeature("batching")),
+                C::UnsupportedCapability,
+                true,
+                ErrorKind::Other,
+                true,
+            ),
+            (
+                "local usage",
+                provider_error(RpcError::local_usage(std::io::Error::other("bad request"))),
+                C::LocalContract,
+                true,
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "serialization",
+                provider_error(RpcError::ser_err(
+                    serde_json::from_str::<serde_json::Value>("{").expect_err("invalid JSON"),
+                )),
+                C::LocalContract,
+                true,
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "deserialization",
+                provider_error(RpcError::DeserError {
+                    err: serde_json::from_str::<serde_json::Value>("{").expect_err("invalid JSON"),
+                    text: "{".into(),
+                }),
+                C::RemoteMalformedResponse,
+                false,
+                ErrorKind::ServerError,
+                true,
+            ),
+            (
+                "missing batch response",
+                provider_error(TransportErrorKind::missing_batch_response(1u64.into())),
+                C::Unavailable,
+                false,
+                ErrorKind::ServerError,
+                false,
+            ),
+            (
+                "backend gone",
+                provider_error(TransportErrorKind::backend_gone()),
+                C::Transport,
+                false,
+                ErrorKind::Network,
+                true,
+            ),
+            (
+                "pubsub unavailable",
+                provider_error(TransportErrorKind::pubsub_unavailable()),
+                C::UnsupportedCapability,
+                true,
+                ErrorKind::Other,
+                true,
+            ),
+            (
+                "HTTP rate limited",
+                provider_error(TransportErrorKind::http_error(429, String::new())),
+                C::RateLimited,
+                false,
+                ErrorKind::RateLimited,
+                false,
+            ),
+            (
+                "HTTP transient",
+                provider_error(TransportErrorKind::http_error(408, String::new())),
+                C::RemoteTransient,
+                false,
+                ErrorKind::ServerError,
+                false,
+            ),
+            (
+                "HTTP server",
+                provider_error(TransportErrorKind::http_error(503, String::new())),
+                C::RemoteServer,
+                false,
+                ErrorKind::ServerError,
+                false,
+            ),
+            (
+                "HTTP client",
+                provider_error(TransportErrorKind::http_error(401, String::new())),
+                C::InvalidRequest,
+                true,
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "custom transport",
+                provider_error(TransportErrorKind::custom_str("socket unavailable")),
+                C::Transport,
+                false,
+                ErrorKind::Network,
+                true,
+            ),
+            (
+                "context preserves class",
+                IndexerError::Context {
+                    operation: "initial scan watermark",
+                    source: Box::new(provider_error(error_response(-32601, "Method not found"))),
+                },
+                C::UnsupportedCapability,
+                true,
+                ErrorKind::Other,
+                true,
+            ),
+        ];
+
+        for (label, error, class, non_retryable, pool_kind, ws_fallback) in cases {
+            assert_policy(label, error, class, non_retryable, pool_kind, ws_fallback);
+        }
+    }
+
     #[test]
     fn ws_chain_source_constructor_round_trips() {
         let proxy = alloy::primitives::address!("fa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9");
@@ -640,8 +993,28 @@ mod tests {
         assert_eq!(src.chain_id(), 1);
     }
 
+    #[tokio::test]
+    async fn ws_source_uses_the_shared_actionable_range_contract() {
+        let proxy = alloy::primitives::address!("fa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9");
+        let source = WsChainSource::new("not a URL", proxy, 1);
+        let to_block = crate::SCAN_CHUNK_BLOCKS;
+        let error = source
+            .events_in_range(0, to_block)
+            .await
+            .expect_err("oversized range must fail before dialing");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "contract violation during events_in_range: span={} blocks; caller must chunk to \
+                 <= SCAN_CHUNK_BLOCKS={} per the trait contract",
+                to_block + 1,
+                crate::SCAN_CHUNK_BLOCKS
+            )
+        );
+    }
+
     #[test]
-    fn ws_transport_error_classifier_matches_expected_substrings() {
+    fn opaque_error_text_never_steers_ws_fallback() {
         for s in [
             "ws connect: handshake failed",
             "websocket dropped",
@@ -651,9 +1024,9 @@ mod tests {
             "method not supported by node",
         ] {
             let e = IndexerError::Rpc(s.into());
-            assert!(is_ws_transport_error(&e), "should match: {s}");
+            assert!(!is_ws_fallback_error(&e), "opaque text steered policy: {s}");
         }
         let proto = IndexerError::Decode("malformed bytes32".into());
-        assert!(!is_ws_transport_error(&proto));
+        assert!(is_ws_fallback_error(&proto));
     }
 }

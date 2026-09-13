@@ -11,10 +11,13 @@ use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::ClientSession;
 use raven_railgun_core::{AdapterError, InstanceId, Result};
 use raven_railgun_engine::{
-    inspire::{build_client_session, register_client_session, setup_state, RavenInspireScheme},
+    inspire::{
+        build_client_session, build_seeded_query, register_client_session, setup_state,
+        RavenInspireScheme,
+    },
     Engine, InstanceRole, PirInstance,
 };
-use raven_railgun_http::{AppState, HttpConfig};
+use raven_railgun_http::{write_versioned, AppState, HttpConfig};
 
 pub const TOY_DB_ENTRIES: usize = 256;
 pub const TOY_ENTRY_BYTES: usize = 256;
@@ -48,6 +51,7 @@ pub fn build_toy_database(entries: usize, entry_bytes: usize) -> Vec<u8> {
 pub struct ToyPieces {
     pub app_state: AppState<RavenInspireScheme>,
     pub client_session: ClientSession,
+    pub session_registration_body: Vec<u8>,
     pub secret_key: RlweSecretKey,
     pub params: InspireParams,
     pub config: ToyDbConfig,
@@ -71,6 +75,16 @@ pub fn build_toy_pieces(token: String, config: ToyDbConfig) -> Result<ToyPieces>
 
     let mut client_session =
         build_client_session((*server_state.crs).clone(), secret_key.clone(), &params)?;
+    let (_, registration_query) =
+        build_seeded_query(&client_session, server_state.shard_config(), 0, &params)?;
+    let registration_keys = registration_query.inspiring_packing_keys.ok_or_else(|| {
+        AdapterError::Internal(
+            "toy client session produced no packing keys for HTTP registration".to_owned(),
+        )
+    })?;
+    let session_registration_body = write_versioned(&registration_keys).map_err(|error| {
+        AdapterError::Internal(format!("toy session registration wire: {error}"))
+    })?;
     register_client_session(&mut client_session, &server_state)?;
 
     let mut engine: Engine<RavenInspireScheme> = Engine::new();
@@ -88,6 +102,7 @@ pub fn build_toy_pieces(token: String, config: ToyDbConfig) -> Result<ToyPieces>
     Ok(ToyPieces {
         app_state,
         client_session,
+        session_registration_body,
         secret_key,
         params,
         config,

@@ -6,7 +6,7 @@ use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
 use raven_railgun_engine::inspire::InspireServerState;
 use raven_railgun_engine::orchestrator::{bootstrap_railgun_engine, OrchestratorConfig};
-use raven_railgun_engine::persistence::ConsumerEvent;
+use raven_railgun_engine::persistence::{ConsumerEvent, ConsumerMetrics};
 use raven_railgun_engine::InstanceRole;
 use std::time::Duration;
 
@@ -26,6 +26,32 @@ fn leaf_commitment(leaf_index: u32) -> [u8; 32] {
 
 fn build_toy_state() -> raven_railgun_core::Result<InspireServerState> {
     raven_railgun_testkit::try_toy_state(TOY_ENTRY_SIZE)
+}
+
+async fn wait_for_consumer_progress(
+    metrics: &parking_lot::Mutex<ConsumerMetrics>,
+    min_events: u64,
+    scanned_through: u64,
+) {
+    let observed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let ready = {
+                let current = *metrics.lock();
+                current.events_processed >= min_events
+                    && current.last_known_chain_head == scanned_through
+                    && current.last_scanned_block == scanned_through
+            };
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        observed.is_ok(),
+        "consumer did not reach head/scan {scanned_through} with {min_events} events within 30s"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -70,7 +96,7 @@ async fn orchestrator_bootstraps_and_consumer_applies_events() {
         .await
         .expect("send heartbeat");
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_consumer_progress(&handle.metrics, 3, 200).await;
 
     let m = *handle.metrics.lock();
     assert!(
@@ -98,7 +124,7 @@ async fn orchestrator_bootstraps_and_consumer_applies_events() {
         })
         .await
         .expect("send quiet heartbeat");
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_consumer_progress(&handle.metrics, 3, 298).await;
 
     let quiet = *handle.metrics.lock();
     assert_eq!(quiet.indexer_lag_blocks(), 0);

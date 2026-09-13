@@ -36,7 +36,7 @@ use raven_railgun_persistence::{
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-kill-during-migration";
 const TOY_ENTRIES: usize = 256;
 const TOY_ENTRY_SIZE: usize = 32;
-const ENTRIES_PER_SHARD: u32 = 256;
+const ENTRIES_PER_SHARD: u32 = 2048;
 const PATH_RECORD_BYTES: usize = 16 * 32;
 const LIST_KEY_OFAC: [u8; 32] = [0xAB; 32];
 

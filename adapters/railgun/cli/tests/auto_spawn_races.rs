@@ -90,7 +90,7 @@ fn spawn_log_jsonl_atomicity_under_torn_write() {
 
 #[cfg(unix)]
 mod kill_during_spawn {
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Read};
     use std::path::Path;
     use std::process::{Child, Command, Stdio};
     use std::sync::Arc;
@@ -106,7 +106,7 @@ mod kill_during_spawn {
 
     const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-auto-spawn-chaos-child";
     const TOY_ENTRY_SIZE: usize = 32;
-    const ENTRIES_PER_SHARD: u32 = 256;
+    const ENTRIES_PER_SHARD: u32 = 2048;
     const SENTINEL_TIMEOUT: Duration = Duration::from_secs(120);
     const POST_KILL_WAIT: Duration = Duration::from_secs(10);
 
@@ -160,10 +160,19 @@ mod kill_during_spawn {
             }
         }
 
-        assert!(
-            !found.is_empty(),
-            "child did not emit paused_at sentinel within {SENTINEL_TIMEOUT:?} for pause_at={pause_at}"
-        );
+        if found.is_empty() {
+            let status = child.try_wait().expect("query child status");
+            let mut stderr = String::new();
+            if let Some(mut captured) = child.stderr.take() {
+                captured
+                    .read_to_string(&mut stderr)
+                    .expect("read child stderr");
+            }
+            panic!(
+                "child did not emit paused_at sentinel within {SENTINEL_TIMEOUT:?} for \
+                 pause_at={pause_at}; status={status:?}; stderr={stderr}"
+            );
+        }
         let expected_fragment = format!("\"paused_at\":\"{pause_at}\"");
         assert!(
             found.contains(&expected_fragment),

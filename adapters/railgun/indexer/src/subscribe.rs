@@ -17,7 +17,8 @@ use tokio::sync::mpsc;
 
 use crate::{
     decode_log_to_railgun_event, ChainSource, ChainSourceMode, IndexerError, IndexerMessage,
-    Result, MAX_RPC_TOTAL_ELAPSED_SECS, MIN_POLLING_DURATION, SCAN_CHUNK_BLOCKS,
+    Result, SubscriptionStream, MAX_RPC_TOTAL_ELAPSED_SECS, MIN_POLLING_DURATION,
+    SCAN_CHUNK_BLOCKS,
 };
 
 /// Heartbeat window; if no frame crosses the listener within this interval, fall back to polling.
@@ -82,11 +83,11 @@ impl LogStreamer for AlloyWsLogStreamer {
         let provider = alloy::providers::ProviderBuilder::new()
             .connect_ws(connect)
             .await
-            .map_err(|e| IndexerError::Alloy(format!("ws connect: {e}")))?;
+            .map_err(|e| IndexerError::provider("WS connect", e))?;
 
         let actual = alloy::providers::Provider::get_chain_id(&provider)
             .await
-            .map_err(|e| IndexerError::Rpc(format!("eth_chainId: {e}")))?;
+            .map_err(|e| IndexerError::provider("eth_chainId", e))?;
         if actual != self.chain_id {
             return Err(IndexerError::ChainIdMismatch {
                 expected: self.chain_id,
@@ -106,10 +107,10 @@ impl LogStreamer for AlloyWsLogStreamer {
 
         let head_sub = alloy::providers::Provider::subscribe_blocks(&provider)
             .await
-            .map_err(|e| IndexerError::Rpc(format!("eth_subscribe newHeads: {e}")))?;
+            .map_err(|e| IndexerError::provider("eth_subscribe newHeads", e))?;
         let log_sub = alloy::providers::Provider::subscribe_logs(&provider, &filter)
             .await
-            .map_err(|e| IndexerError::Rpc(format!("eth_subscribe logs: {e}")))?;
+            .map_err(|e| IndexerError::provider("eth_subscribe logs", e))?;
 
         let (heads_tx, heads_rx) = mpsc::channel(self.channel_capacity);
         let (logs_tx, logs_rx) = mpsc::channel(self.channel_capacity);
@@ -126,9 +127,20 @@ impl LogStreamer for AlloyWsLogStreamer {
                         }
                     }
                     Err(e) => {
-                        let _ = heads_tx
-                            .send(Err(IndexerError::Rpc(format!("newHeads stream: {e}"))))
-                            .await;
+                        let error = match e {
+                            tokio::sync::broadcast::error::RecvError::Closed => {
+                                IndexerError::SubscriptionClosed {
+                                    stream: SubscriptionStream::Heads,
+                                }
+                            }
+                            tokio::sync::broadcast::error::RecvError::Lagged(skipped) => {
+                                IndexerError::SubscriptionLagged {
+                                    stream: SubscriptionStream::Heads,
+                                    skipped,
+                                }
+                            }
+                        };
+                        let _ = heads_tx.send(Err(error)).await;
                         break;
                     }
                 }
@@ -145,9 +157,20 @@ impl LogStreamer for AlloyWsLogStreamer {
                         }
                     }
                     Err(e) => {
-                        let _ = logs_tx
-                            .send(Err(IndexerError::Rpc(format!("logs stream: {e}"))))
-                            .await;
+                        let error = match e {
+                            tokio::sync::broadcast::error::RecvError::Closed => {
+                                IndexerError::SubscriptionClosed {
+                                    stream: SubscriptionStream::Logs,
+                                }
+                            }
+                            tokio::sync::broadcast::error::RecvError::Lagged(skipped) => {
+                                IndexerError::SubscriptionLagged {
+                                    stream: SubscriptionStream::Logs,
+                                    skipped,
+                                }
+                            }
+                        };
+                        let _ = logs_tx.send(Err(error)).await;
                         break;
                     }
                 }
@@ -310,7 +333,7 @@ where
             .fallback
             .latest_block()
             .await
-            .map_err(|error| IndexerError::Rpc(format!("initial scan watermark: {error}")))?;
+            .map_err(|error| IndexerError::context("initial scan watermark", error))?;
         loop {
             if self.sender.is_closed() {
                 tracing::info!("subscribe worker exiting; outbound channel closed");
@@ -428,15 +451,29 @@ where
                                 observed_head = observed_head.max(block_number);
                                 self.send_heartbeat(observed_head, canonical_through);
                             }
-                            match self
+                            let disposition = match self
                                 .handle_log_with_overlay_fence(
                                     log,
                                     canonical_through,
                                     suppress_through,
                                     overlay_sent,
                                 )
-                                .await?
+                                .await
                             {
+                                Ok(disposition) => disposition,
+                                Err(error)
+                                    if matches!(
+                                        error.failure_class(),
+                                        crate::IndexerFailureClass::ProtocolDecode
+                                    ) =>
+                                {
+                                    tracing::warn!(error = %error, "WS log decode failed; polling canonical range");
+                                    reorg_sent = overlay_sent;
+                                    break;
+                                }
+                                Err(error) => return Err(error),
+                            };
+                            match disposition {
                                 LogDisposition::Ignored => {}
                                 LogDisposition::Event => overlay_sent = true,
                                 LogDisposition::Rewind => {
@@ -479,15 +516,29 @@ where
                     observed_head = observed_head.max(block_number);
                     self.send_heartbeat(observed_head, canonical_through);
                 }
-                match self
+                let disposition = match self
                     .handle_log_with_overlay_fence(
                         log,
                         canonical_through,
                         suppress_through,
                         overlay_sent,
                     )
-                    .await?
+                    .await
                 {
+                    Ok(disposition) => disposition,
+                    Err(error)
+                        if matches!(
+                            error.failure_class(),
+                            crate::IndexerFailureClass::ProtocolDecode
+                        ) =>
+                    {
+                        tracing::warn!(error = %error, "queued WS log decode failed; polling canonical range");
+                        reorg_sent = overlay_sent;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                match disposition {
                     LogDisposition::Ignored => {}
                     LogDisposition::Event => overlay_sent = true,
                     LogDisposition::Rewind => {

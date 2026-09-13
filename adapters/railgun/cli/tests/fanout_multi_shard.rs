@@ -22,6 +22,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 const BEARER_TOKEN: &str = "fanout-multi-shard-test-token";
+const CLIENT_ID: &str = "00112233445566778899aabbccddeeff";
 const SHARD_COUNT: usize = 3;
 const ENTRY_BYTES: usize = 256;
 /// Global index inside shard 0; every fanned-out shard reuses its local offset.
@@ -93,6 +94,28 @@ async fn spawn_fanout_server(entries: usize) -> FanoutFixture {
         .await;
     });
     ready_rx.await.expect("server ready");
+    let session_response = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/v1/instance/{TOY_INSTANCE_ID}/session"
+        ))
+        .bearer_auth(BEARER_TOKEN)
+        .header("x-raven-client-id", CLIENT_ID)
+        .body(pieces.session_registration_body.clone())
+        .send()
+        .await
+        .expect("establish HTTP session");
+    assert_eq!(session_response.status(), 200, "session establish");
+    let handle = session_response
+        .headers()
+        .get("x-raven-session")
+        .and_then(|value| value.to_str().ok())
+        .expect("x-raven-session")
+        .parse()
+        .expect("decimal session handle");
+    pieces
+        .client_session
+        .install_server_session_handle(raven_inspire::ServerSessionHandle(handle))
+        .expect("install HTTP session handle");
     FanoutFixture {
         addr,
         server,
@@ -142,6 +165,7 @@ async fn post_fanout(
     let resp = client
         .post(fixture.fanout_url())
         .bearer_auth(BEARER_TOKEN)
+        .header("x-raven-client-id", CLIENT_ID)
         .body(body)
         .send()
         .await
@@ -164,6 +188,7 @@ async fn post_single_shard(
     let resp = client
         .post(fixture.query_url())
         .bearer_auth(BEARER_TOKEN)
+        .header("x-raven-client-id", CLIENT_ID)
         .body(body)
         .send()
         .await
@@ -371,6 +396,7 @@ async fn fanout_requires_a_valid_bearer_token() {
 
     let no_auth = client
         .post(fixture.fanout_url())
+        .header("x-raven-client-id", CLIENT_ID)
         .body(body.clone())
         .send()
         .await
@@ -389,6 +415,7 @@ async fn fanout_requires_a_valid_bearer_token() {
     let wrong_token = client
         .post(fixture.fanout_url())
         .bearer_auth("not-the-fanout-multi-shard-test-token")
+        .header("x-raven-client-id", CLIENT_ID)
         .body(body)
         .send()
         .await

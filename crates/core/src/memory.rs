@@ -150,6 +150,17 @@ impl Snapshot for MemorySnapshot {
     fn scan<'a>(&'a self) -> Box<dyn Iterator<Item = Result<Row, Error>> + 'a> {
         Box::new(self.rows.iter().cloned().map(Ok))
     }
+
+    fn scan_range<'a>(
+        &'a self,
+        range: core::ops::Range<u64>,
+    ) -> Box<dyn Iterator<Item = Result<Row, Error>> + 'a> {
+        let start = self.rows.partition_point(|(key, _)| *key < range.start);
+        let tail = self.rows.get(start..).map_or(&[][..], |rows| rows);
+        let end = start + tail.partition_point(|(key, _)| *key < range.end);
+        let rows = self.rows.get(start..end).map_or(&[][..], |rows| rows);
+        Box::new(rows.iter().cloned().map(Ok))
+    }
 }
 
 #[cfg(test)]

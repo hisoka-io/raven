@@ -7,8 +7,8 @@ publish = false
 # cargo-deny reports error[unlicensed] and this was the one manifest of 26
 # missing the key.
 license = "Apache-2.0"
-# Matches the root workspace floor; this was the only manifest declaring none.
-rust-version = "1.89"
+# The optional anvil-e2e Alloy graph declares this floor.
+rust-version = "1.91"
 
 # Detached workspace: kept OUT of the root [members] so the demo's native
 # ingestion deps never enter the wasm-clean client path, and so the demo cannot

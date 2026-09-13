@@ -29,7 +29,7 @@ use raven_railgun_testkit::canonical;
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-concurrent-commit";
 const TOY_ENTRY_SIZE: usize = 32;
-const ENTRIES_PER_SHARD: u32 = 256;
+const ENTRIES_PER_SHARD: u32 = 2048;
 
 const A_LEAVES: u32 = 3;
 const B_LEAVES: u32 = 11;
@@ -119,10 +119,23 @@ fn two_concurrent_commits_on_one_handle_do_not_publish_each_others_bytes() {
             .collect();
 
         let layout = StoreLayout::open(dir.path()).expect("layout reopen");
+        let mut published_commits = 0usize;
         for (tag, leaves, outcome) in results {
-            let Ok(id) = outcome else {
-                // A refusal is the CORRECT behaviour; this writer is not the defect.
-                continue;
+            let id = match outcome {
+                Ok(id) => {
+                    published_commits += 1;
+                    id
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    if message.contains("cell shape") {
+                        violations.push(format!(
+                            "round {round}: writer {tag} hit a shape refusal before commit \
+                             publication: {message}"
+                        ));
+                    }
+                    continue;
+                }
             };
             // Two failure shapes, both from the same unlocked window, and which one you
             // get depends on the interleaving: a TORN snapshot (both writers wrote
@@ -153,6 +166,11 @@ fn two_concurrent_commits_on_one_handle_do_not_publish_each_others_bytes() {
                     }
                 },
             }
+        }
+        if published_commits == 0 {
+            violations.push(format!(
+                "round {round}: neither writer reached commit publication"
+            ));
         }
     }
 

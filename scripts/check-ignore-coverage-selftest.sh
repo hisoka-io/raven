@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Red-proof for check-ignore-coverage.sh. Four cases it must fail on, plus the control.
+# Red-proof for check-ignore-coverage.sh. Six cases it must fail on, plus the control.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 ALLOW=scripts/ignore-coverage-allowlist.txt
@@ -44,19 +44,35 @@ expect() {  # expect <want-exit-nonzero:0|1> <label>
 
 echo "check-ignore-coverage-selftest.sh:"
 
-# 1. A brand-new ignored test in a binary no lane selects.
+# 1. A bare ignore is invalid even before coverage is considered.
 python3 - <<'PYEOF'
 import pathlib
 p = pathlib.Path('crates/isimplepir/tests/deterministic_a.rs')
-p.write_text(p.read_text() + '\n#[test]\n#[ignore = "selftest fixture"]\nfn a_selftest_only_uncovered_ignore() {}\n')
+p.write_text(p.read_text() + '\n#[test]\n#[ignore]\nfn a_selftest_bare_ignore() {}\n')
 PYEOF
-expect 1 "a new ignored test in an unselected binary"
+expect 1 "a bare ignore"
 
-# 2. Dropping a lane's binary from ci.yml orphans every ignored test in it.
+# 2. A reason with no citable trigger is incomplete or stale.
+python3 - <<'PYEOF'
+import pathlib
+p = pathlib.Path('crates/isimplepir/tests/deterministic_a.rs')
+p.write_text(p.read_text() + '\n#[test]\n#[ignore = "selftest stale reason"]\nfn a_selftest_stale_reason() {}\n')
+PYEOF
+expect 1 "a false or stale reason without a citable trigger"
+
+# 3. A fully reasoned ignore still needs a coverage lane or allowlist entry.
+python3 - <<'PYEOF'
+import pathlib
+p = pathlib.Path('crates/isimplepir/tests/deterministic_a.rs')
+p.write_text(p.read_text() + '\n#[test]\n#[ignore = "1 ms. Trigger: selftest missing allowlist entry."]\nfn a_selftest_only_uncovered_ignore() {}\n')
+PYEOF
+expect 1 "a new reasoned ignore missing from the allowlist"
+
+# 4. Dropping a lane's binary from ci.yml orphans every ignored test in it.
 sed -i 's/binary(migrate_encoder_real_sigkill) + //' "$CI"
 expect 1 "a lane losing a binary that carried ignored tests"
 
-# 3. Subtracting a name by hand removes that test's only lane. W3-27 emptied the subtraction
+# 5. Subtracting a name by hand removes that test's only lane. W3-27 emptied the subtraction
 # clause entirely, so this case now INTRODUCES one rather than editing one - which is the shape
 # a future regression would actually take, and it no longer depends on a clause existing.
 # The victim must be an #[ignore]d test the cli-ignored filter currently runs.
@@ -67,7 +83,7 @@ else
   cp "$BA" "$ALLOW"; cp "$BC" "$CI"; cp "$BV" "$VICTIM"
 fi
 
-# 4. Emptying the allowlist must fail: 42 entries become unexplained.
+# 6. Emptying the allowlist must fail: every uncovered entry becomes unexplained.
 : > "$ALLOW"
 expect 1 "an emptied allowlist"
 

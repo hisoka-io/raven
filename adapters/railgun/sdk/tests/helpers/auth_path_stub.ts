@@ -7,7 +7,8 @@ import {
   type CommitTreeProof,
   type RavenInspireWasm,
 } from "../../src/index";
-import { makeRegisterSpy } from "./register_spy";
+import { makeRegisterSpy, stubRemoteSessionExports } from "./register_spy";
+import { stubQueryBundle } from "./private_wire";
 
 export const TOKEN = "test-token-padded-long-enough-1234";
 export const NODE_BYTES = 32;
@@ -27,10 +28,11 @@ function siblingPath(leafIdx: number): Uint32Array {
   return out;
 }
 
-export function stubWasm(): RavenInspireWasm {
+export function stubWasm(queryBytes?: Uint8Array): RavenInspireWasm {
   return {
+    ...stubRemoteSessionExports(),
     build_client_session: () => ({ free: () => undefined }),
-    build_seeded_query: () => new Uint8Array(16),
+    build_seeded_query: () => stubQueryBundle(queryBytes),
     extract_response: (_session, _crs, _state, response, _entry) => new Uint8Array(response),
     build_instance_params_blob: () => new Uint8Array(0),
     register_client_session: makeRegisterSpy(),
@@ -44,9 +46,9 @@ export function stubWasm(): RavenInspireWasm {
   };
 }
 
-export function stubCtx(): ClientPirContext {
+export function stubCtx(queryBytes?: Uint8Array): ClientPirContext {
   return {
-    wasm: stubWasm(),
+    wasm: stubWasm(queryBytes),
     session: { free: () => undefined },
     crsBincode: new Uint8Array(0),
     shardConfigBincode: new Uint8Array(0),
@@ -56,7 +58,7 @@ export function stubCtx(): ClientPirContext {
 
 /**
  * The ONE test-side writer of the batch-response envelope
- * `[u16 BE version = 1][u64 LE count][{u64 LE len, bytes}*]` that
+ * `[u16 BE version = 3][u64 LE count][{u64 LE len, bytes}*]` that
  * `decodeBatchBody` (src/raven-poi-node-interface.ts) reads. Six hand-rolled copies of
  * this shape used to live across the suite; a wire change would have left five of them
  * silently asserting a format the server no longer speaks. auth_path_stub_parity.test.ts
@@ -69,7 +71,7 @@ export function encodeBatchResponseNodes(nodes: readonly Uint8Array[]): Uint8Arr
   }
   const out = new Uint8Array(total);
   out[0] = 0;
-  out[1] = 1;
+  out[1] = 3;
   const dv = new DataView(out.buffer);
   dv.setUint32(2, nodes.length, true);
   dv.setUint32(6, 0, true);

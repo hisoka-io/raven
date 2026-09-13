@@ -5,6 +5,8 @@ members = [
     "crates/crypto-primitives",
     "crates/indexer",
     "crates/client",
+    "crates/inspire-cache",
+    "crates/inspire-session",
     "crates/storage",
     "crates/server",
     "benches/raven-bench",

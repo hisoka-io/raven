@@ -1,7 +1,7 @@
 //! Cross-language parity against Barretenberg, which is what Howl's generator wraps.
 //!
 //! The vectors in `tests/vectors/` were produced by running Aztec's own exported functions. The
-//! generators are retained out of tree with the project's working notes. The sponge file is
+//! generators are retained in `tests/generators/`. The sponge file is
 //! cross-verified against a value the Howl repository COMMITS and calls "the published test
 //! vector", so these pin the same function Howl ships against rather than one with the same
 //! name.

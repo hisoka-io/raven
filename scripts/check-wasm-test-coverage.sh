@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Every file carrying #[wasm_bindgen_test] must be named in ci.yml's wasm-pack step.
+# Every file carrying a wasm_bindgen_test attribute must be named in ci.yml's wasm-pack step.
 #
 # `wasm-pack test --node <crate>` without `--test` was measured (2026-09-07) to stop after the
 # first target reporting "no tests to run!", so the CI step names each target explicitly. That
@@ -18,12 +18,12 @@ while IFS= read -r f; do
   stem=$(basename "$f" .rs)
   if ! /usr/bin/grep -q -- "--test ${stem}" "$CI"; then
     echo "WASM TEST NOT RUN BY CI: ${f}" >&2
-    echo "  It carries #[wasm_bindgen_test] but no '--test ${stem}' appears in ${CI}." >&2
+    echo "  It carries a wasm_bindgen_test attribute but no '--test ${stem}' appears in ${CI}." >&2
     echo "  A wasm test no job names is compiled and never executed - which is how the only" >&2
     echo "  other one in this tree stayed broken and green." >&2
     fail=1
   fi
-done < <(git grep -l --untracked '#\[wasm_bindgen_test\]' -- '*/tests/*.rs' 2>/dev/null | sort -u)
+done < <(git grep -l --untracked -E '#\[(wasm_bindgen_test|cfg_attr\([^]]*wasm_bindgen_test[^]]*\))\]' -- '*/tests/*.rs' 2>/dev/null | sort -u)
 
 if [ "$fail" -ne 0 ]; then
   echo "scripts/check-wasm-test-coverage.sh: a wasm test runs in no lane." >&2
