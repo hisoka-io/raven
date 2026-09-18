@@ -16,8 +16,6 @@ use raven_railgun_engine::inspire;
 use raven_railgun_engine::offline_packing_keys_cache::{
     CacheLoad, CellShape, OfflinePackingKeysCache, OfflinePackingKeysCacheError,
 };
-use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 const TEST_ENTRIES: usize = 256;
 const TEST_ENTRY_BYTES: usize = 32;
@@ -64,27 +62,6 @@ fn test_cell() -> CellShape {
     }
 }
 
-fn legacy_fingerprint(cell: &CellShape) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(&cell.scheme_tag);
-    hasher.update(cell.entries.to_le_bytes());
-    hasher.update(cell.entry_bytes.to_le_bytes());
-    hasher.update(&cell.packing_param_id);
-    hasher.finalize().into()
-}
-
-#[derive(Serialize)]
-struct LegacyCacheFile<'a> {
-    magic: [u8; 8],
-    fingerprint: [u8; 32],
-    scheme_tag: &'a Vec<u8>,
-    entries: u64,
-    entry_bytes: u64,
-    body_hash: [u8; 32],
-    pack_params: &'a PackParams,
-    offline_keys: &'a OfflinePackingKeys,
-}
-
 #[test]
 fn inspiring_seed_change_invalidates_the_cache_identity() {
     let params = InspireParams::secure_128_d2048();
@@ -94,34 +71,27 @@ fn inspiring_seed_change_invalidates_the_cache_identity() {
 }
 
 #[test]
-fn raven_cache_bytes_match_the_legacy_railgun_envelope() {
+fn cache_uses_v3_magic_and_refuses_v2_before_body_decode() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = OfflinePackingKeysCache::new(dir.path());
     let cell = test_cell();
     let parts = shared_parts();
     cache.store(&cell, &parts.0, &parts.1).expect("store");
 
-    let body = bincode::serialize(&(&parts.0, &parts.1)).expect("legacy body");
-    let expected = bincode::serialize(&LegacyCacheFile {
-        magic: *b"RVN_OPK2",
-        fingerprint: legacy_fingerprint(&cell),
-        scheme_tag: &cell.scheme_tag,
-        entries: cell.entries,
-        entry_bytes: cell.entry_bytes,
-        body_hash: Sha256::digest(body).into(),
-        pack_params: &parts.0,
-        offline_keys: &parts.1,
-    })
-    .expect("legacy envelope");
-    let actual = std::fs::read(cache.path()).expect("new cache bytes");
-    assert!(
-        actual == expected,
-        "hoist altered persisted bytes: actual len/hash {}/{:?}, expected len/hash {}/{:?}",
-        actual.len(),
-        Sha256::digest(&actual),
-        expected.len(),
-        Sha256::digest(&expected)
-    );
+    let mut bytes = std::fs::read(cache.path()).expect("new cache bytes");
+    assert_eq!(bytes.get(..8), Some(b"RVN_OPK3".as_slice()));
+    bytes
+        .get_mut(..8)
+        .expect("magic prefix")
+        .copy_from_slice(b"RVN_OPK2");
+    std::fs::write(cache.path(), bytes).expect("write old epoch");
+    match cache.load(&cell) {
+        CacheLoad::Miss(OfflinePackingKeysCacheError::BadMagic { expected, found }) => {
+            assert_eq!(expected, *b"RVN_OPK3");
+            assert_eq!(found, *b"RVN_OPK2");
+        }
+        other => panic!("expected v2 BadMagic miss, got {other:?}"),
+    }
 }
 
 #[test]
@@ -137,7 +107,7 @@ fn bad_magic_is_a_typed_miss() {
 
     match cache.load(&cell) {
         CacheLoad::Miss(OfflinePackingKeysCacheError::BadMagic { expected, found }) => {
-            assert_eq!(expected, *b"RVN_OPK2");
+            assert_eq!(expected, *b"RVN_OPK3");
             assert_ne!(found, expected);
         }
         other => panic!("expected BadMagic miss, got {other:?}"),

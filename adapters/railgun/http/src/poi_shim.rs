@@ -276,6 +276,38 @@ pub struct BcIdxEntry {
     pub idx: u32,
 }
 
+/// Prefix width for the default-off binary index channel.
+pub const BC_INDEX_PREFIX_BYTES: usize = 6;
+
+#[cfg(feature = "prefix-index-channel")]
+pub(crate) async fn bc_prefix_array_handler<S: PirScheme>(
+    State(app): State<AppState<S>>,
+    Path(list_key_hex): Path<String>,
+    headers_in: HeaderMap,
+) -> Result<axum::response::Response, StatusCode> {
+    let store = app
+        .logical_store
+        .as_ref()
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let list_key = hex_decode_32(&list_key_hex).ok_or(StatusCode::BAD_REQUEST)?;
+    let (body, epoch) = {
+        let store = store.lock();
+        let rows = store.ppoi_list_leaves_iter(&list_key).count();
+        let mut body = Vec::with_capacity(rows.saturating_mul(BC_INDEX_PREFIX_BYTES));
+        for (_, commitment) in store.ppoi_list_leaves_iter(&list_key) {
+            body.extend(commitment.iter().copied().take(BC_INDEX_PREFIX_BYTES));
+        }
+        (body, store.last_block_height())
+    };
+    Ok(serve_publishing_bytes(
+        body,
+        epoch,
+        &headers_in,
+        HeaderValue::from_static("application/octet-stream"),
+    ))
+}
+
 /// JSON shape returned by `GET /v1/poi/:list_key_hex/status-header`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -371,8 +403,22 @@ fn serve_publishing_channel<T: Serialize>(
     headers_in: &HeaderMap,
 ) -> Result<axum::response::Response, StatusCode> {
     let json = serde_json::to_vec(body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(serve_publishing_bytes(
+        json,
+        epoch,
+        headers_in,
+        HeaderValue::from_static("application/json"),
+    ))
+}
+
+fn serve_publishing_bytes(
+    body: Vec<u8>,
+    epoch: u64,
+    headers_in: &HeaderMap,
+    content_type: HeaderValue,
+) -> axum::response::Response {
     let mut hasher = Sha256::new();
-    hasher.update(&json);
+    hasher.update(&body);
     let digest = hasher.finalize();
     let etag = {
         use std::fmt::Write as _;
@@ -395,14 +441,11 @@ fn serve_publishing_channel<T: Serialize>(
         if let Ok(v) = HeaderValue::from_str(&etag) {
             hdrs.insert(ETAG_HEADER, v);
         }
-        return Ok((StatusCode::NOT_MODIFIED, hdrs).into_response());
+        return (StatusCode::NOT_MODIFIED, hdrs).into_response();
     }
 
     let mut hdrs = HeaderMap::new();
-    hdrs.insert(
-        axum::http::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
+    hdrs.insert(axum::http::header::CONTENT_TYPE, content_type);
     if let Ok(v) = HeaderValue::from_str(&etag) {
         hdrs.insert(ETAG_HEADER, v);
     }
@@ -413,13 +456,13 @@ fn serve_publishing_channel<T: Serialize>(
         CACHE_CONTROL_HEADER,
         HeaderValue::from_static("public, max-age=15, must-revalidate"),
     );
-    Ok((StatusCode::OK, hdrs, json).into_response())
+    (StatusCode::OK, hdrs, body).into_response()
 }
 
 /// Build the wallet-shim + publishing-channel router.
 pub fn poi_shim_routes<S: PirScheme>(state: AppState<S>) -> axum::Router {
     use axum::routing::{get, post};
-    axum::Router::new()
+    let router = axum::Router::new()
         .route("/v1/poi/pois-per-list", post(pois_per_list_handler::<S>))
         .route("/v1/poi/merkle-proofs", post(merkle_proofs_handler::<S>))
         .route(
@@ -433,8 +476,13 @@ pub fn poi_shim_routes<S: PirScheme>(state: AppState<S>) -> axum::Router {
         .route(
             "/v1/poi/:list_key_hex/status-header",
             get(status_header_handler::<S>),
-        )
-        .with_state(state)
+        );
+    #[cfg(feature = "prefix-index-channel")]
+    let router = router.route(
+        "/v1/poi/:list_key_hex/bc-prefixes",
+        get(bc_prefix_array_handler::<S>),
+    );
+    router.with_state(state)
 }
 
 /// Re-exported so fixtures can seed a [`LogicalLeafStore`].

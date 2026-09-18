@@ -572,8 +572,13 @@ impl InspirePersistence {
 
         drop(m);
         let retention = self.policy.read().retention;
-        apply_retention(&self.layout, next_id, retention)
-            .map_err(|error| AdapterError::Internal(format!("snapshot retention: {error}")))?;
+        if let Err(error) = apply_retention(&self.layout, next_id, retention) {
+            tracing::warn!(
+                snapshot_id = next_id.0,
+                error = %error,
+                "snapshot committed, but retention housekeeping failed"
+            );
+        }
 
         Ok(next_id)
     }
@@ -2617,7 +2622,8 @@ mod tests {
             p: 65_537,
             sigma: 6.4,
             gadget_base: 1 << 20,
-            gadget_len: 3,
+            query_gadget_len: 3,
+            packing_gadget_len: 3,
             security_level: raven_inspire::params::SecurityLevel::Bits128,
         }
     }
@@ -3169,6 +3175,68 @@ mod tests {
             surviving.contains(&live_id),
             "live snapshot id {live_id} missing from survivors {surviving:?}"
         );
+    }
+
+    #[test]
+    fn retention_failure_after_publish_does_not_report_commit_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_toy_state().expect("state");
+        let layout = StoreLayout::open(dir.path()).expect("layout");
+        let policy = SnapshotPolicy {
+            max_appends_per_snapshot: usize::MAX,
+            max_seconds_between_snapshots: u64::MAX,
+            retention: RetentionPolicy {
+                archived_wals_retain: usize::MAX,
+                snapshots_retain: 0,
+            },
+        };
+        let opened = InspirePersistence::open(
+            layout,
+            SCHEME_TAG,
+            InstanceId::new("retention-failure-after-publish"),
+            policy,
+            test_encoder(),
+        )
+        .expect("open");
+        let wrong_type = opened
+            .persistence
+            .layout()
+            .root()
+            .join("snapshots")
+            .join("snap-999999");
+        std::fs::write(&wrong_type, b"not a snapshot directory").expect("plant wrong type");
+
+        let id = opened
+            .persistence
+            .commit_v6(&state, &crate::inspire::LogicalLeafStore::new(), 100)
+            .expect("retention housekeeping must not turn a durable commit into failure");
+        assert_eq!(opened.persistence.current_snapshot_id(), id);
+        assert!(
+            opened
+                .persistence
+                .layout()
+                .root()
+                .join("snapshots")
+                .join(format!("snap-{:06}", id.0))
+                .is_dir(),
+            "published snapshot must remain durable after retention refusal"
+        );
+        assert!(
+            wrong_type.is_file(),
+            "failed retention must leave the obstacle intact"
+        );
+        drop(opened);
+
+        let reopened = InspirePersistence::open(
+            StoreLayout::open(dir.path()).expect("reopen layout"),
+            SCHEME_TAG,
+            InstanceId::new("retention-failure-after-publish"),
+            policy,
+            test_encoder(),
+        )
+        .expect("reopen committed snapshot");
+        assert_eq!(reopened.persistence.current_snapshot_id(), id);
+        assert!(reopened.recovered_state.is_some());
     }
 
     #[test]

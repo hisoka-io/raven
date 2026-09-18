@@ -11,6 +11,10 @@ pub(crate) const HTTP_MAX_BODY_CEILING: usize = 64 * 1024 * 1024;
 /// amplification, since one request costs k respond operations.
 pub(crate) const HTTP_MAX_FANOUT_CEILING: usize = 128;
 
+/// Default session lifetime and eviction cadence in seconds.
+pub const DEFAULT_SESSION_TTL_SECS: u64 =
+    raven_railgun_engine::session_pool::DEFAULT_SESSION_TTL.as_secs();
+
 /// HTTP layer configuration; all knobs are tunable without recompiling.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HttpConfig {
@@ -61,7 +65,7 @@ pub struct HttpConfig {
 }
 
 fn default_session_eviction_interval_secs() -> u64 {
-    3600
+    DEFAULT_SESSION_TTL_SECS
 }
 
 fn default_max_fanout_shards() -> usize {
@@ -81,7 +85,7 @@ impl HttpConfig {
             rate_limit_rps: 200,
             rate_limit_burst: 400,
             max_concurrent_queries: 4,
-            session_ttl_secs: 60 * 60,
+            session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
             session_lru_cap: 10_000,
             scheme_name: "raven-inspire".to_owned(),
             respond_timeout_secs: 30,
@@ -89,7 +93,7 @@ impl HttpConfig {
             trusted_proxy_cidrs: Vec::new(),
             cors_allowed_origins: Vec::new(),
             metrics_public: false,
-            session_eviction_interval_secs: 3600,
+            session_eviction_interval_secs: DEFAULT_SESSION_TTL_SECS,
             enable_fanout: false,
             max_fanout_shards: default_max_fanout_shards(),
         }

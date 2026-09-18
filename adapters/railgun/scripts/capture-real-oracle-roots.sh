@@ -11,8 +11,8 @@
 #   1. cast call merkleRoot()(bytes32) at the documented capture block
 #      against the configured Sepolia RPC -> writes `chain_root` +
 #      `_chain_root_capture` (the cast invocation that produced it).
-#   2. HTTP POST Railway upstream PPOI `/poi-events/{chainType}/{chainID}`
-#      with txidVersion + listKey + startIndex/endIndex -> extracts
+#   2. JSON-RPC POST upstream PPOI `ppoi_poi_events`
+#      with chain, txidVersion, listKey and the final index -> extracts
 #      `validatedMerkleroot` -> writes `upstream_root` +
 #      `_upstream_root_capture` (the HTTP invocation).
 #   3. HTTP POST Subsquid GraphQL `Transaction.merkleRoot` query for
@@ -38,7 +38,7 @@
 #
 # ENV VARS (override defaults):
 #   RAVEN_SEPOLIA_RPC      Sepolia JSON-RPC URL (default: ethereum-sepolia-rpc.publicnode.com).
-#   RAVEN_RAILWAY_ENDPOINT Railway upstream base (default: https://ppoi-node.example.io).
+#   RAVEN_RAILWAY_ENDPOINT PPOI JSON-RPC endpoint (default: https://ppoi.fdi.network).
 #   RAVEN_SUBSQUID_GRAPHQL Subsquid GraphQL endpoint (default: https://squid.example.io/graphql).
 #
 # USAGE:
@@ -62,7 +62,7 @@ if [[ "${1:-}" == "--dry-run" ]]; then
 fi
 
 SEPOLIA_RPC="${RAVEN_SEPOLIA_RPC:-https://ethereum-sepolia-rpc.publicnode.com}"
-RAILWAY_ENDPOINT="${RAVEN_RAILWAY_ENDPOINT:-https://ppoi-node.example.io}"
+RAILWAY_ENDPOINT="${RAVEN_RAILWAY_ENDPOINT:-https://ppoi.fdi.network}"
 SUBSQUID_GRAPHQL="${RAVEN_SUBSQUID_GRAPHQL:-https://squid.example.io/graphql}"
 
 # Sepolia chain id for the Railway endpoint path. Source-of-truth:
@@ -152,27 +152,23 @@ for ((i = 0; i < TREE_COUNT; i++)); do
     fi
   fi
 
-  # ---- Step 2: upstream_root via Railway POST ----
+  # ---- Step 2: upstream_root via JSON-RPC ----
   # Source-of-truth for endpoint shape:
   #   private-proof-of-innocence/packages/node/src/api/schemas.ts:20-29
   #     - GetPOIListEventRangeBodySchema requires:
   #       txidVersion, startIndex, endIndex, listKey
-  RAILWAY_URL="$RAILWAY_ENDPOINT/poi-events/$SEPOLIA_CHAIN_TYPE/$SEPOLIA_CHAIN_ID"
-  END_INDEX=$((LEAF_COUNT))
+  RAILWAY_URL="$RAILWAY_ENDPOINT"
+  LAST=$((LEAF_COUNT - 1))
   RAILWAY_BODY=$(cat <<EOF
-{"txidVersion":"V2_PoseidonMerkle","listKey":"$LIST_KEY_HEX","startIndex":0,"endIndex":$END_INDEX}
+{"jsonrpc":"2.0","method":"ppoi_poi_events","params":{"chainType":"$SEPOLIA_CHAIN_TYPE","chainID":"$SEPOLIA_CHAIN_ID","txidVersion":"V2_PoseidonMerkle","listKey":"$LIST_KEY_HEX","startIndex":$LAST,"endIndex":$LAST},"id":1}
 EOF
 )
   RAILWAY_INVOCATION="curl -X POST -H 'Content-Type: application/json' -d '$RAILWAY_BODY' $RAILWAY_URL"
   echo "  [upstream_root] intended: $RAILWAY_INVOCATION"
   if [[ "$DRY_RUN" -eq 0 ]]; then
     if UPSTREAM_RESP=$(curl -sS -X POST -H 'Content-Type: application/json' -d "$RAILWAY_BODY" "$RAILWAY_URL" 2>/dev/null); then
-      # The upstream response carries one signedPOIEvent per index;
-      # we want the validatedMerkleroot at index = leaf_count - 1
-      # (the last event in the captured range).
-      LAST=$((LEAF_COUNT - 1))
-      UPSTREAM_ROOT=$(echo "$UPSTREAM_RESP" | jq -r --argjson idx "$LAST" \
-        '[.[] | .validatedMerkleroot // .validated_merkleroot // empty][$idx] // empty')
+      UPSTREAM_ROOT=$(echo "$UPSTREAM_RESP" | jq -r \
+        '.result[0] | .validatedMerkleroot // .validated_merkleroot // empty')
       if [[ -n "$UPSTREAM_ROOT" && "$UPSTREAM_ROOT" != "null" ]]; then
         if [[ "$UPSTREAM_ROOT" != 0x* ]]; then
           UPSTREAM_ROOT="0x$UPSTREAM_ROOT"

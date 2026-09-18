@@ -21,7 +21,7 @@ write_manifest() {
 }
 
 mkdir -p "$FIXTURE_ROOT/.github/workflows" "$FIXTURE_ROOT/crates/inspire/.github/workflows" \
-  "$FIXTURE_ROOT/adapters/railgun"
+  "$FIXTURE_ROOT/adapters/railgun" "$FIXTURE_ROOT/scripts"
 printf '[toolchain]\nchannel = "1.98.0"\n' > "$FIXTURE_ROOT/rust-toolchain.toml"
 IFS='|' read -r -a floor_189_manifests <<< "$MSRV_189_MANIFESTS"
 for manifest in "${floor_189_manifests[@]}"; do write_manifest "$manifest" "1.89"; done
@@ -44,6 +44,8 @@ jobs:
       MSRV_EXTRA_PACKAGES: "$MSRV_189_EXTRA_PACKAGES"
     steps:
       - uses: dtolnay/rust-toolchain@1.89
+        with:
+          components: clippy
       - run: |
           actual_packages="selected"
           cargo metadata --manifest-path "\$manifest"
@@ -53,6 +55,8 @@ jobs:
           cargo check -p raven-railgun-persistence
           cargo check -p raven-railgun-poseidon
           cargo check -p raven-railgun-ppoi-mirror
+          cargo clippy --manifest-path "\$manifest" --all-targets -- -D warnings
+          cargo clippy --all-targets -p raven-railgun-core -p raven-railgun-persistence -p raven-railgun-poseidon -p raven-railgun-ppoi-mirror -- -D warnings
   msrv-1-91:
     env:
       RUSTUP_TOOLCHAIN: "1.91"
@@ -60,11 +64,14 @@ jobs:
       MSRV_PACKAGES: "$MSRV_191_PACKAGES"
     steps:
       - uses: dtolnay/rust-toolchain@1.91
+        with:
+          components: clippy
       - run: |
           actual_packages="selected"
           cargo metadata --manifest-path "\$manifest"
           if [ "\$actual_packages" != "\$MSRV_PACKAGES" ]; then exit 1; fi
           cargo check --manifest-path "\$manifest"
+          cargo clippy --manifest-path "\$manifest" --all-targets -- -D warnings
 EOF
 printf '%s\n' \
   'jobs:' \
@@ -92,6 +99,10 @@ expect_rejection() {
   fi
 }
 
+sed -i 's/channel = "1.98.0"/channel = "stable"/' "$FIXTURE_ROOT/rust-toolchain.toml"
+expect_rejection "channel is 'stable', expected '1.98.0'" "floating rust-toolchain channel"
+printf '[toolchain]\nchannel = "1.98.0"\n' > "$FIXTURE_ROOT/rust-toolchain.toml"
+
 printf '%s\n' \
   'jobs:' \
   '  planted-float:' \
@@ -101,12 +112,41 @@ printf '%s\n' \
 expect_rejection "floating or divergent Rust selector 'stable'" "planted @stable selector"
 rm "$FIXTURE_ROOT/.github/workflows/planted.yml"
 
+printf 'cargo +nightly check\n' > "$FIXTURE_ROOT/scripts/planted.sh"
+expect_rejection "invokes floating cargo +nightly" "planted shell selector"
+rm "$FIXTURE_ROOT/scripts/planted.sh"
+
+sed -i 's/rust:1.98.0-slim-bookworm/rust:latest/' "$FIXTURE_ROOT/adapters/railgun/Dockerfile"
+expect_rejection "uses rust:latest, expected rust:1.98.0-slim-bookworm" \
+  "floating Docker builder tag"
+printf 'FROM rust:1.98.0-slim-bookworm AS build\n' > "$FIXTURE_ROOT/adapters/railgun/Dockerfile"
+
 sed -i 's/,raven-inspire-session//' "$FIXTURE_ROOT/.github/workflows/ci.yml"
 expect_rejection "MSRV 1.89 package set" "missing new raven-inspire-session package"
 cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
 
 sed -i '/cargo check --manifest-path "\$manifest"/d' "$FIXTURE_ROOT/.github/workflows/ci.yml"
 expect_rejection "MSRV 1.89 job does not compile every manifest" "vacuous floor job"
+cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
+
+sed -i '/^  msrv-1-89:/,/^  msrv-1-91:/ {/cargo clippy/d;}' \
+  "$FIXTURE_ROOT/.github/workflows/ci.yml"
+expect_rejection "MSRV 1.89 job does not lint every manifest" "clippy-free 1.89 floor job"
+cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
+
+sed -i '/^  msrv-1-91:/,$ {/cargo clippy/d;}' "$FIXTURE_ROOT/.github/workflows/ci.yml"
+expect_rejection "MSRV 1.91 job does not lint every manifest" "clippy-free 1.91 floor job"
+cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
+
+sed -i '/cargo clippy --all-targets/s/ -p raven-railgun-core//' \
+  "$FIXTURE_ROOT/.github/workflows/ci.yml"
+expect_rejection "does not compile and lint it explicitly" "unlinted 1.89 leaf package"
+cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
+
+sed -i '/^  msrv-1-91:/,$ {/cargo clippy/s/ -- -D warnings//;}' \
+  "$FIXTURE_ROOT/.github/workflows/ci.yml"
+expect_rejection "clippy command lacks --all-targets -- -D warnings" \
+  "warning-tolerant 1.91 clippy"
 cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
 
 sed -i 's/rust-version = "1.91"/rust-version = "1.89"/' \
@@ -143,4 +183,4 @@ cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
 sed -i '/RUSTUP_TOOLCHAIN: "1.91"/d' "$FIXTURE_ROOT/.github/workflows/ci.yml"
 expect_rejection "MSRV 1.91 override" "shadowed 1.91 floor"
 
-printf 'toolchain pin selftest: floating selector, new-member removal, missing job, floor mismatch, bad/untracked floor, 1.98-only floor, and both shadowed MSRV lanes rejected\n'
+printf 'toolchain pin selftest: all five scan families and MSRV job invariants rejected their mutations\n'

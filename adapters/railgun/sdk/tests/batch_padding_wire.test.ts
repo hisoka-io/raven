@@ -23,7 +23,7 @@ function mountEchoingBatchRoute(server: MockServer): void {
       res.writeHead(200, {
         "content-type": "application/octet-stream",
         "x-raven-epoch": "1",
-        "x-raven-schema-version": "3",
+        "x-raven-schema-version": "6",
       });
       res.end(Buffer.from(out));
       return true;

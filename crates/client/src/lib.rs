@@ -307,7 +307,7 @@ fn decode_validated_shard_config(
 }
 
 // Adapter HTTP envelope version; parity-gated here to avoid a framework-to-transport dependency.
-const SESSION_WIRE_SCHEMA_VERSION: u16 = 3;
+const SESSION_WIRE_SCHEMA_VERSION: u16 = 6;
 
 fn decode<T: for<'de> Deserialize<'de>>(
     bytes: &[u8],
@@ -428,12 +428,16 @@ fn ensure_session_params_match(
 ) -> Result<(), String> {
     if current.ring_dim != held.ring_dim
         || current.q != held.q
+        || current.crt_moduli != held.crt_moduli
         || current.p != held.p
         || current.sigma.to_bits() != held.sigma.to_bits()
+        || current.gadget_base != held.gadget_base
+        || current.query_gadget_len != held.query_gadget_len
+        || current.packing_gadget_len != held.packing_gadget_len
     {
         return Err(
-            "session parameters drifted from the live ring_dim/q/p/sigma; discard the cached \
-             session and rebuild it from one consistent params/CRS response"
+            "ring_dim/q/p/sigma mismatch or CRT/gadget drift: session parameters drifted from the \
+             live tuple; discard the cached session and rebuild it from one consistent params/CRS response"
                 .to_owned(),
         );
     }
@@ -1162,8 +1166,7 @@ fn build_remaining_batch_slots(
     mut slots: Vec<BatchSlot>,
     builder: &mut CheckedBatchQueryBuilder<'_>,
     global_indices: &[u64],
-    padded_len: usize,
-    layout_rng: &mut impl RngCore,
+    cover_targets: &[u64],
 ) -> Result<Vec<BatchSlot>, PaddedBatchError> {
     for (caller_index, target_idx) in global_indices.iter().copied().enumerate().skip(1) {
         let (state, query) = builder.build(target_idx, caller_index)?;
@@ -1173,15 +1176,8 @@ fn build_remaining_batch_slots(
             real: Some((caller_index, state)),
         });
     }
-    while slots.len() < padded_len {
+    for target_idx in cover_targets.iter().copied() {
         let slot = slots.len();
-        let cover_index = uniform_below(layout_rng, global_indices.len())?;
-        let target_idx = global_indices.get(cover_index).copied().ok_or(
-            PaddedBatchError::ImpossiblePadding {
-                real_count: global_indices.len(),
-                max_slots: padded_len,
-            },
-        )?;
         let (_state, query) = builder.build(target_idx, slot)?;
         slots.push(BatchSlot {
             target_idx,
@@ -1190,6 +1186,87 @@ fn build_remaining_batch_slots(
         });
     }
     Ok(slots)
+}
+
+fn draw_distinct_cover_targets(
+    shard_config: &ShardConfig,
+    global_indices: &[u64],
+    cover_count: usize,
+    layout_rng: &mut impl RngCore,
+) -> Result<Vec<u64>, PaddedBatchError> {
+    let mut occupied_shards = Vec::with_capacity(global_indices.len() + cover_count);
+    for (caller_slot, target_idx) in global_indices.iter().copied().enumerate() {
+        if target_idx >= shard_config.total_entries {
+            return Err(PaddedBatchError::Configuration {
+                detail: format!(
+                    "real target {target_idx} at caller slot {caller_slot} is outside total_entries {}",
+                    shard_config.total_entries
+                ),
+            });
+        }
+        let (shard_id, _) = shard_config
+            .try_index_to_shard(target_idx)
+            .map_err(|detail| PaddedBatchError::Configuration {
+                detail: format!("real target {target_idx} has invalid shard geometry: {detail}"),
+            })?;
+        let shard_id =
+            usize::try_from(shard_id).map_err(|_| PaddedBatchError::ArithmeticOverflow {
+                operation: "real shard id",
+            })?;
+        if let Err(insert_at) = occupied_shards.binary_search(&shard_id) {
+            occupied_shards.insert(insert_at, shard_id);
+        }
+    }
+
+    let num_shards = usize::try_from(shard_config.num_shards()).map_err(|_| {
+        PaddedBatchError::ArithmeticOverflow {
+            operation: "validated shard count",
+        }
+    })?;
+    let available_covers = num_shards.checked_sub(occupied_shards.len()).ok_or_else(|| {
+        PaddedBatchError::Configuration {
+            detail: format!(
+                "validated geometry has {num_shards} shards but real targets occupy {} distinct shards",
+                occupied_shards.len()
+            ),
+        }
+    })?;
+    if cover_count > available_covers {
+        return Err(PaddedBatchError::Configuration {
+            detail: format!(
+                "padded batch requires {cover_count} distinct cover shards outside {} real shards, but validated geometry has only {available_covers} available",
+                occupied_shards.len()
+            ),
+        });
+    }
+
+    let mut cover_targets = Vec::with_capacity(cover_count);
+    for _ in 0..cover_count {
+        let rank = uniform_below(layout_rng, num_shards - occupied_shards.len())?;
+        let mut shard_id = rank;
+        for occupied in occupied_shards.iter().copied() {
+            if occupied > shard_id {
+                break;
+            }
+            shard_id = shard_id
+                .checked_add(1)
+                .ok_or(PaddedBatchError::ArithmeticOverflow {
+                    operation: "cover shard rank",
+                })?;
+        }
+        let Err(insert_at) = occupied_shards.binary_search(&shard_id) else {
+            return Err(PaddedBatchError::Configuration {
+                detail: format!("cover shard selection repeated occupied shard {shard_id}"),
+            });
+        };
+        occupied_shards.insert(insert_at, shard_id);
+        let shard_id =
+            u32::try_from(shard_id).map_err(|_| PaddedBatchError::ArithmeticOverflow {
+                operation: "cover shard id",
+            })?;
+        cover_targets.push(shard_config.shard_to_index(shard_id, 0));
+    }
+    Ok(cover_targets)
 }
 
 fn finish_padded_batch(
@@ -1278,6 +1355,9 @@ fn build_padded_batch_with_randomness(
             max_slots,
         });
     }
+    let cover_count = padded_len - global_indices.len();
+    let cover_targets =
+        draw_distinct_cover_targets(shard_config, global_indices, cover_count, layout_rng)?;
 
     let slots = vec![BatchSlot {
         target_idx: first_target,
@@ -1291,7 +1371,7 @@ fn build_padded_batch_with_randomness(
         serialized_query_bytes,
     };
     let mut slots =
-        build_remaining_batch_slots(slots, &mut builder, global_indices, padded_len, layout_rng)?;
+        build_remaining_batch_slots(slots, &mut builder, global_indices, &cover_targets)?;
 
     for remaining in (2..=slots.len()).rev() {
         let swap_with = uniform_below(layout_rng, remaining)?;
@@ -1324,7 +1404,8 @@ fn build_padded_batch_with_randomness(
 ///     p: 65_537,
 ///     sigma: 6.4,
 ///     gadget_base: 1 << 20,
-///     gadget_len: 3,
+///     query_gadget_len: 3,
+///     packing_gadget_len: 3,
 ///     security_level: SecurityLevel::Bits128,
 /// };
 /// let database = vec![0u8; params.ring_dim * 32];
@@ -1347,7 +1428,8 @@ fn build_padded_batch_with_randomness(
 ///
 /// # Errors
 /// Returns [`PaddedBatchError`] when the input is empty, sizing overflows, the cap admits no legal
-/// ladder step, entropy is unavailable, or InsPIRe cannot construct a query.
+/// ladder step, the validated geometry cannot supply distinct cover shards, entropy is unavailable,
+/// or InsPIRe cannot construct a query.
 pub fn build_padded_batch_rust(
     session: &ClientSession,
     params: &InspireParams,
@@ -1434,4 +1516,66 @@ pub fn extract_response_rust(
 ) -> Result<Vec<u8>, String> {
     let entry_size = checked_entry_size(entry_size, crs.ring_dim()).map_err(|e| e.to_string())?;
     extract_two_packing(crs, client_state, response, entry_size).map_err(|e| e.to_string())
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use proptest::{prop_assert, prop_assert_eq, proptest};
+
+    struct ZeroRng;
+
+    impl rand::RngCore for ZeroRng {
+        fn next_u32(&mut self) -> u32 {
+            0
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            0
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            dest.fill(0);
+        }
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn distinct_cover_draws_fill_the_real_shard_complement(
+            real_count in 1usize..32,
+            cover_count in 0usize..32,
+            spare_shards in 0usize..32,
+        ) {
+            let num_shards = real_count + cover_count + spare_shards;
+            let total_entries = u64::try_from(num_shards * 256).expect("bounded shard count");
+            let shard_config = ShardConfig::for_ring_dim(256, 32, total_entries)
+                .expect("valid generated geometry");
+            let global_indices = (0..real_count)
+                .map(|shard_id| u64::try_from(shard_id * 256 + shard_id).expect("bounded target"))
+                .collect::<Vec<_>>();
+
+            let cover_targets = draw_distinct_cover_targets(
+                &shard_config,
+                &global_indices,
+                cover_count,
+                &mut ZeroRng,
+            ).expect("generated geometry has enough covers");
+            let real_shards = global_indices.iter().map(|target_idx| {
+                shard_config.try_index_to_shard(*target_idx).expect("valid target").0
+            }).collect::<std::collections::BTreeSet<_>>();
+            let cover_shards = cover_targets.iter().map(|target_idx| {
+                shard_config.try_index_to_shard(*target_idx).expect("valid cover").0
+            }).collect::<std::collections::BTreeSet<_>>();
+
+            prop_assert_eq!(cover_targets.len(), cover_count);
+            prop_assert_eq!(cover_shards.len(), cover_count);
+            prop_assert!(cover_shards.is_disjoint(&real_shards));
+            prop_assert!(cover_targets.iter().all(|target_idx| *target_idx < total_entries));
+        }
+    }
 }

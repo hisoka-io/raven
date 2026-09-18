@@ -8,7 +8,7 @@ durability-and-closure/cli-ignored	63
 # bare `test(insert_rejects_overflow_past_capacity)` that
 # resolves to an in-src lib test. The original anchor here counted only `pkg::binary test` rows,
 # so it silently dropped every in-src test — undercounting the one lane whose filter depends on one.
-durability-and-closure/engine-ignored	12
+durability-and-closure/engine-ignored	15
 durability-and-closure/closure	8
 # 2026-09-07: was 21 before wave 5. binary(db2_block_production_cell) lost
 # block_exponent_and_payload_are_pinned_to_the_read_path_design, which asserted BLOCK_K == 10

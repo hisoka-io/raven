@@ -1,7 +1,7 @@
 // Raw permutation vectors from Barretenberg. Deterministic and independent of the sponge, so a
 // failure localises to the constants or the linear layers.
-import { poseidon2Permutation } from "/home/dimeb/projects/darkpool-new/darkpool-v2/node_modules/.pnpm/@aztec+foundation@2.1.11/node_modules/@aztec/foundation/dest/crypto/index.js";
-import { Fr } from "/home/dimeb/projects/darkpool-new/darkpool-v2/node_modules/.pnpm/@aztec+foundation@2.1.11/node_modules/@aztec/foundation/dest/fields/index.js";
+import { loadAztecFoundation } from "./aztec-foundation.mjs";
+const { poseidon2Permutation, Fr } = await loadAztecFoundation();
 
 const P = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
 const hex = (fr) => "0x" + fr.toBuffer().toString("hex");

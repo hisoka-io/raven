@@ -32,9 +32,39 @@ count_nextest_rows() {
   /usr/bin/grep -cE '^[A-Za-z0-9_-]+(::[A-Za-z0-9_/-]+)? ' || true
 }
 
+check_lane_name_completeness() {
+  local expected_file="$1" current_file="$2" missing=0 name count
+
+  while IFS=$'\t' read -r name count; do
+    case "$name" in
+      ""|'#'*) continue ;;
+    esac
+    if ! /usr/bin/grep -Fqx -- "$name" "$current_file"; then
+      echo "LANE ${name}: expected count is recorded, but the lane is absent from ${CI}." >&2
+      missing=1
+    fi
+  done < "$expected_file"
+
+  while IFS= read -r name; do
+    [ -z "$name" ] && continue
+    if ! awk -F'\t' -v lane="$name" '$1 == lane { found=1 } END { exit !found }' "$expected_file"; then
+      echo "LANE ${name}: no expected count recorded. Add it to ${EXPECTED}." >&2
+      missing=1
+    fi
+  done < "$current_file"
+
+  return "$missing"
+}
+
 if [ "$MODE" = "--count-fixture" ]; then
   count_nextest_rows
   exit 0
+fi
+
+if [ "$MODE" = "--check-name-fixture" ]; then
+  [ "$#" -eq 3 ] || { echo "usage: $0 --check-name-fixture EXPECTED CURRENT" >&2; exit 2; }
+  check_lane_name_completeness "$2" "$3"
+  exit $?
 fi
 
 # Emit one TSV row per filtered lane: name, packages, cargo flags, extra flags, filter.
@@ -86,8 +116,20 @@ PY
 [ -n "$lanes" ] || { echo "assert-lane-counts.sh: no filtered lanes found - parser drift?" >&2; exit 1; }
 
 tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT
+lane_names=$(mktemp)
+trap 'rm -f "$tmp" "$lane_names"' EXIT
 fail=0
+
+while IFS=$'\t' read -r -u 3 name _rest; do
+  [ -z "$name" ] || printf '%s\n' "$name" >> "$lane_names"
+done 3<<< "$lanes"
+
+if [ "$MODE" != "--update" ]; then
+  [ -f "$EXPECTED" ] || { echo "assert-lane-counts.sh: missing ${EXPECTED}; run with --update" >&2; exit 1; }
+  if ! check_lane_name_completeness "$EXPECTED" "$lane_names"; then
+    fail=1
+  fi
+fi
 
 # The lane list is fed on FD 3 and cargo's stdin is closed. Both matter: cargo reads stdin, and
 # on the first version of this script it swallowed the rest of the here-string, so every lane
@@ -136,8 +178,6 @@ if [ "$MODE" = "--update" ]; then
   cat "$tmp"
   exit 0
 fi
-
-[ -f "$EXPECTED" ] || { echo "assert-lane-counts.sh: missing ${EXPECTED}; run with --update" >&2; exit 1; }
 
 while IFS=$'\t' read -r name count; do
   want=$(/usr/bin/grep -P "^\Q${name}\E\t" "$EXPECTED" | cut -f2)

@@ -30,7 +30,7 @@ expect_fail() {
   cp "$BAK" "$CI"
 }
 
-echo "check-ci-filter-names-selftest.sh: five cases the gate must fail on"
+echo "check-ci-filter-names-selftest.sh: six cases the gate must fail on"
 
 sed -i 's/test(insert_rejects_overflow_past_capacity)/test(insert_rejects_overflow_past_capacity_RENAMED)/' "$CI"
 expect_fail "a test() term renamed to a nonexistent test (uppercase in the name)"
@@ -44,7 +44,10 @@ expect_fail "a binary() term naming a deleted target"
 sed -i '/-p raven-railgun-testkit/d' "$CI"
 expect_fail "a workspace member dropped from every -p list"
 
-# Case 5: the file a binary() names is deleted in the WORKING TREE but still in the index -
+cp scripts/fixtures/check-ci-filter-names/workspace-member-outside-lanes.yml "$CI"
+expect_fail "a workspace member named only outside the fmt and test jobs"
+
+# Case 6: the file a binary() names is deleted in the WORKING TREE but still in the index -
 # exactly what an uncommitted lane deletion looks like. The gate's first version resolved
 # names with `git ls-files`, which answers from the index, so it stayed green while the
 # nightly lane would have died at nextest exit 94. ci.yml is untouched here on purpose:

@@ -23,12 +23,13 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use bincode::Options;
 use raven_inspire::inspiring::{OfflinePackingKeys, PackParams};
 use raven_inspire::ServerInspiringCache;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const CACHE_MAGIC: [u8; 8] = *b"RVN_OPK2";
+const CACHE_MAGIC: [u8; 8] = *b"RVN_OPK3";
 const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Standard relative path under a caller-owned data directory.
@@ -112,7 +113,7 @@ impl CellShape {
         identity.extend_from_slice(&params.p.to_le_bytes());
         identity.extend_from_slice(&params.sigma.to_bits().to_le_bytes());
         identity.extend_from_slice(&params.gadget_base.to_le_bytes());
-        identity.extend_from_slice(&(params.gadget_len as u64).to_le_bytes());
+        identity.extend_from_slice(&(params.packing_gadget_len as u64).to_le_bytes());
         identity.push(match params.security_level {
             raven_inspire::params::SecurityLevel::Bits128 => 0,
             raven_inspire::params::SecurityLevel::Bits256 => 1,
@@ -124,7 +125,7 @@ impl CellShape {
         identity.extend_from_slice(&(num_columns as u64).to_le_bytes());
         identity.extend_from_slice(&inspiring_w_seed);
         Self {
-            scheme_tag: b"raven-inspire-cache-v2".to_vec(),
+            scheme_tag: b"raven-inspire-cache-v3".to_vec(),
             entries: 0,
             entry_bytes: 0,
             packing_param_id: identity,
@@ -226,13 +227,21 @@ impl OfflinePackingKeysCache {
             });
         }
         let bytes = fs::read(&self.path)?;
-        let file: CacheFile = bincode::deserialize(&bytes)?;
-        if file.magic != CACHE_MAGIC {
+        let mut found_magic = [0u8; 8];
+        for (destination, source) in found_magic.iter_mut().zip(bytes.iter()) {
+            *destination = *source;
+        }
+        if found_magic != CACHE_MAGIC {
             return Err(OfflinePackingKeysCacheError::BadMagic {
                 expected: CACHE_MAGIC,
-                found: file.magic,
+                found: found_magic,
             });
         }
+        let file: CacheFile = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(MAX_CACHE_FILE_BYTES)
+            .reject_trailing_bytes()
+            .deserialize(&bytes)?;
         if file.scheme_tag != cell.scheme_tag {
             return Err(OfflinePackingKeysCacheError::SchemeMismatch {
                 expected: cell.scheme_tag.clone(),
@@ -445,7 +454,13 @@ mod tests {
         changed.gadget_base += 1;
         assert_params_change(&changed);
         changed = baseline_params.clone();
-        changed.gadget_len += 1;
+        changed.query_gadget_len += 1;
+        assert_eq!(
+            CellShape::for_inspiring(&changed, 16, [7; 32]).packing_param_id,
+            baseline.packing_param_id
+        );
+        changed = baseline_params.clone();
+        changed.packing_gadget_len += 1;
         assert_params_change(&changed);
         changed = baseline_params.clone();
         changed.security_level = SecurityLevel::Bits256;

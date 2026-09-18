@@ -13,7 +13,7 @@
     clippy::too_many_lines
 )]
 
-use axum::extract::{Json, Path};
+use axum::extract::Json;
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::Router;
@@ -38,10 +38,10 @@ struct MockState {
 }
 
 async fn poi_events_handler(
-    Path((_chain_type, _chain_id)): Path<(String, String)>,
     axum::extract::State(state): axum::extract::State<Arc<MockState>>,
-    Json(body): Json<serde_json::Value>,
+    Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let body = request.get("params").ok_or(StatusCode::BAD_REQUEST)?;
     let start = body
         .get("startIndex")
         .and_then(serde_json::Value::as_u64)
@@ -55,33 +55,23 @@ async fn poi_events_handler(
             "signedPOIEvent": {
                 "index": idx,
                 "blindedCommitment": bc,
-                "signature": "0xdead",
+                "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
                 "type": "Shield",
             },
-            "validatedMerkleroot": "0x00",
+            "validatedMerkleroot": "0000000000000000000000000000000000000000000000000000000000000000",
         }));
     }
-    Ok(Json(serde_json::Value::Array(events)))
-}
-
-async fn pois_per_bc_handler(
-    Path((_chain_type, _chain_id)): Path<(String, String)>,
-    Json(_body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    Json(serde_json::json!({}))
+    Ok(Json(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request["id"],
+        "result": events
+    })))
 }
 
 async fn start_mock() -> (String, Arc<MockState>, tokio::task::JoinHandle<()>) {
     let state = Arc::new(MockState::default());
     let app = Router::new()
-        .route(
-            "/poi-events/:chain_type/:chain_id",
-            post(poi_events_handler),
-        )
-        .route(
-            "/pois-per-blinded-commitment/:chain_type/:chain_id",
-            post(pois_per_bc_handler),
-        )
+        .route("/", post(poi_events_handler))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

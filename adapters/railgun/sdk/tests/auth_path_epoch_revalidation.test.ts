@@ -17,7 +17,7 @@ import {
 const TOKEN = "test-token-padded-long-enough-1234";
 const TREE_NUMBER = 0;
 const INSTANCE_ID = `commit-tree-${TREE_NUMBER}`;
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 6;
 
 
 interface AdapterState {

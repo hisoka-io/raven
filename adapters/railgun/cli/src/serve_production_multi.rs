@@ -1045,8 +1045,9 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
 
     let http_config = build_http_config(&opts);
 
-    let app_state =
-        AppState::new(engine, http_config).map_err(|e| anyhow::anyhow!("AppState::new: {e}"))?;
+    let app_state = AppState::new(engine, http_config)
+        .map_err(|e| anyhow::anyhow!("AppState::new: {e}"))?
+        .require_consumer_metrics();
 
     // Retained so shutdown can drain auto-spawned consumers; else they skip the
     // final WAL flush.

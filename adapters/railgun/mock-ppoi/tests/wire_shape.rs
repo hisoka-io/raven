@@ -70,12 +70,19 @@ async fn mock_ppoi_serves_poi_events_route_with_synthetic_corpus() {
     let (addr, handle) = spawn_with_corpus(corpus).await;
 
     let client = reqwest::Client::new();
-    let url = format!("http://{addr}/poi-events/0/1");
+    let url = format!("http://{addr}/");
     let body = serde_json::json!({
-        "txidVersion": "V2_PoseidonMerkle",
-        "listKey": DEFAULT_LIST_KEY_HEX,
-        "startIndex": 0,
-        "endIndex": 10,
+        "jsonrpc": "2.0",
+        "method": "ppoi_poi_events",
+        "params": {
+            "chainType": "0",
+            "chainID": "1",
+            "txidVersion": "V2_PoseidonMerkle",
+            "listKey": DEFAULT_LIST_KEY_HEX,
+            "startIndex": 0,
+            "endIndex": 10,
+        },
+        "id": 7,
     });
     let resp = client
         .post(&url)
@@ -86,8 +93,13 @@ async fn mock_ppoi_serves_poi_events_route_with_synthetic_corpus() {
         .json::<Value>()
         .await
         .expect("json");
-    let arr = resp.as_array().expect("array");
-    assert_eq!(arr.len(), 10, "10 events requested");
+    assert_eq!(resp.get("jsonrpc"), Some(&serde_json::json!("2.0")));
+    assert_eq!(resp.get("id"), Some(&serde_json::json!(7)));
+    let arr = resp
+        .get("result")
+        .and_then(Value::as_array)
+        .expect("result array");
+    assert_eq!(arr.len(), 11, "inclusive indices 0 through 10 requested");
     for (i, ev) in arr.iter().enumerate() {
         let expected = reference.events_view().get(i).expect("reference event");
         let signed = ev.get("signedPOIEvent").expect("signedPOIEvent field");
@@ -122,6 +134,32 @@ async fn mock_ppoi_serves_poi_events_route_with_synthetic_corpus() {
         );
     }
 
+    handle.abort();
+}
+
+#[tokio::test]
+async fn mock_json_rpc_rejects_a_502_row_event_range() {
+    let corpus = fixture_corpus(20, Vec::new());
+    let (addr, handle) = spawn_with_corpus(corpus).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/"))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "ppoi_poi_events",
+            "params": {
+                "chainType": "0",
+                "chainID": "1",
+                "txidVersion": "V2_PoseidonMerkle",
+                "listKey": DEFAULT_LIST_KEY_HEX,
+                "startIndex": 0,
+                "endIndex": 501,
+            },
+            "id": 8,
+        }))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
     handle.abort();
 }
 

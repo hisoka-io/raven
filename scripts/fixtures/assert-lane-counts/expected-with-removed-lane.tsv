@@ -1,0 +1,3 @@
+# Expected test count per filtered CI lane.
+durability-and-closure/cli-ignored	63
+durability-and-closure/removed-lane	4

@@ -20,9 +20,9 @@ use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 
 use raven_isimplepir::{
-    db_update_batch, respond, respond_packed, setup, squish_db, state_update_batch, unsquish_db,
-    verify_hint_matches_db, DbBatchOp, EntryUpdate, HintVersion, InsertDelta, IsimplePirError,
-    LweParams, ServerState, SquishedDatabase, UpdateBatch,
+    db_update_batch, db_update_insert, respond, respond_packed, setup, squish_db,
+    state_update_batch, unsquish_db, verify_hint_matches_db, DbBatchOp, EntryUpdate, HintVersion,
+    InsertDelta, IsimplePirError, LweParams, ServerState, SquishedDatabase, UpdateBatch,
 };
 
 /// Batch generators below index rows and columns directly, so they must track these.
@@ -38,6 +38,41 @@ fn toy_params() -> LweParams {
         l: L,
         m: M,
         bits_per_element: 9,
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn insert_rejects_every_generated_eq2_crossing_before_mutation(p in 6_500u32..6_675) {
+        let params = LweParams {
+            n: 8,
+            log2_q: 32,
+            p,
+            l: 4,
+            m: 4,
+            bits_per_element: 12,
+        };
+        prop_assert!(params.validate().is_ok());
+        prop_assert!(
+            LweParams { l: 5, ..params }.validate().is_err(),
+            "generated fifth row must cross Eq. (2)"
+        );
+
+        let database = vec![0u32; params.l * params.m];
+        let mut state = setup(&database, params, Some([0u8; 32]))
+            .expect("generated four-row state validates")
+            .server;
+        let original_version = state.version;
+        let outcome = db_update_insert(&mut state, &vec![1u32; params.m]);
+        prop_assert!(
+            matches!(outcome, Err(IsimplePirError::InvalidParams { .. })),
+            "insert must refuse invalid next parameters"
+        );
+        prop_assert_eq!(&state.db, &database);
+        prop_assert_eq!(state.params, params);
+        prop_assert_eq!(state.version, original_version);
     }
 }
 

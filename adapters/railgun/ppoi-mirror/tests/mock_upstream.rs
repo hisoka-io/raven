@@ -12,7 +12,7 @@
     clippy::too_many_lines
 )]
 
-use axum::extract::{Json, Path};
+use axum::extract::Json;
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::Router;
@@ -62,11 +62,10 @@ struct MockState {
     fail_with_500: parking_lot::Mutex<bool>,
 }
 
-async fn poi_events_handler(
-    Path((_chain_type, _chain_id)): Path<(String, String)>,
-    axum::extract::State(state): axum::extract::State<Arc<MockState>>,
-    Json(body): Json<PoiEventsBody>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+fn poi_events_result(
+    state: &MockState,
+    body: PoiEventsBody,
+) -> Result<serde_json::Value, StatusCode> {
     if *state.fail_with_500.lock() {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -83,7 +82,7 @@ async fn poi_events_handler(
             "signedPOIEvent": {
                 "index": body.start_index,
                 "blindedCommitment": bc1,
-                "signature": "0xdeadbeef",
+                "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
                 "type": "Shield",
             },
             "validatedMerkleroot": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -92,20 +91,19 @@ async fn poi_events_handler(
             "signedPOIEvent": {
                 "index": body.start_index + 1,
                 "blindedCommitment": bc2,
-                "signature": "0xcafebabe",
+                "signature": "11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
                 "type": "Transact",
             },
             "validatedMerkleroot": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         }
     ]);
-    Ok(Json(resp))
+    Ok(resp)
 }
 
-async fn pois_per_bc_handler(
-    Path((_chain_type, _chain_id)): Path<(String, String)>,
-    axum::extract::State(state): axum::extract::State<Arc<MockState>>,
-    Json(body): Json<PoisPerBcBody>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+fn pois_per_bc_result(
+    state: &MockState,
+    body: PoisPerBcBody,
+) -> Result<serde_json::Value, StatusCode> {
     if *state.fail_with_500.lock() {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -122,7 +120,7 @@ async fn pois_per_bc_handler(
             .collect(),
     });
     if *state.pois_per_bc_force_empty.lock() {
-        return Ok(Json(serde_json::json!({})));
+        return Ok(serde_json::json!({}));
     }
     let mut response_map = serde_json::Map::new();
     let override_map = state.pois_per_bc_response.lock().clone();
@@ -142,20 +140,43 @@ async fn pois_per_bc_handler(
             serde_json::Value::String(status_str.to_owned()),
         );
     }
-    Ok(Json(serde_json::Value::Object(response_map)))
+    Ok(serde_json::Value::Object(response_map))
+}
+
+async fn json_rpc_handler(
+    axum::extract::State(state): axum::extract::State<Arc<MockState>>,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let method = request
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let params = request
+        .get("params")
+        .cloned()
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let result = match method {
+        "ppoi_poi_events" => poi_events_result(
+            state.as_ref(),
+            serde_json::from_value(params).map_err(|_| StatusCode::BAD_REQUEST)?,
+        )?,
+        "ppoi_pois_per_blinded_commitment" => pois_per_bc_result(
+            state.as_ref(),
+            serde_json::from_value(params).map_err(|_| StatusCode::BAD_REQUEST)?,
+        )?,
+        _ => return Err(StatusCode::NOT_FOUND),
+    };
+    Ok(Json(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request["id"],
+        "result": result
+    })))
 }
 
 async fn start_mock() -> (String, Arc<MockState>, tokio::task::JoinHandle<()>) {
     let state = Arc::new(MockState::default());
     let app = Router::new()
-        .route(
-            "/poi-events/:chain_type/:chain_id",
-            post(poi_events_handler),
-        )
-        .route(
-            "/pois-per-blinded-commitment/:chain_type/:chain_id",
-            post(pois_per_bc_handler),
-        )
+        .route("/", post(json_rpc_handler))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -213,7 +234,7 @@ async fn fetch_status_typed_posts_correct_body_and_decodes_each_status() {
     let mirror = build_mirror(url);
     let list = ListKey([0xab; 32]);
     let bc = BlindedCommitment::from_bytes([0xcd; 32]);
-    let bc_hex = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+    let bc_hex = "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
     let status = mirror
         .fetch_status_typed(&list, &bc, BlindedCommitmentType::Shield)

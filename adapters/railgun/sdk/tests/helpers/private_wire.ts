@@ -38,8 +38,8 @@ function inspectPirRequest(
   if (request.body.length < headerBytes) {
     fail(request, `body is ${request.body.length} bytes, shorter than ${headerBytes}-byte header`);
   }
-  if (request.body[0] !== 0 || request.body[1] !== 3) {
-    fail(request, `schema prefix is [${request.body[0]}, ${request.body[1]}], expected [0, 3]`);
+  if (request.body[0] !== 0 || request.body[1] !== 6) {
+    fail(request, `schema prefix is [${request.body[0]}, ${request.body[1]}], expected [0, 6]`);
   }
 
   let queryCount = 1;

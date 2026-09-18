@@ -265,7 +265,7 @@ async fn a_pooled_client_sees_401_then_serves_the_next_request() {
             // Must exceed the socket buffer, or the body is fully written before the
             // server can reject and the race this test names never opens. Auth runs
             // as a layer above the handler, so the bytes are never decoded. 256 KiB
-            // against a reported production query of ~148 KB, under the 8 MiB cap.
+            // against the 15,491-byte production query, under the 8 MiB cap.
             .body(vec![0u8; 256 * 1024])
             .send()
             .await

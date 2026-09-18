@@ -54,6 +54,21 @@ pub enum OracleKind {
 pub enum BootstrapError {
     #[error("invalid pool config: {0}")]
     PoolConfig(String),
+    #[error("{client} HTTP client configuration failed: {reason}; fix the URL, proxy or TLS environment before retrying")]
+    /// Bounded HTTP client construction failed before a request was sent.
+    ///
+    /// ```
+    /// use raven_railgun_cli::bootstrap_subsquid::BootstrapError;
+    /// let error = BootstrapError::ClientConfig {
+    ///     client: "SubsquidLeavesClient",
+    ///     reason: "invalid proxy".to_owned(),
+    /// };
+    /// assert!(error.to_string().contains("SubsquidLeavesClient"));
+    /// ```
+    ClientConfig {
+        client: &'static str,
+        reason: String,
+    },
     #[error("Subsquid endpoint unreachable: {0}")]
     SubsquidUnreachable(String),
     #[error("Subsquid response decode: {0}")]
@@ -1193,11 +1208,18 @@ pub async fn bootstrap_one_list_with_mode(
 const RAILWAY_PER_URL_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Default bases for `--ppoi-endpoint`; order is priority, first reachable wins.
-pub const DEFAULT_RAILWAY_BASES: &[&str] = &[
-    "https://poi.us.proxy.railwayapi.xyz",
-    "https://poi-lb.us.proxy.railwayapi.xyz",
-    "https://ppoi-agg.horsewithsixlegs.xyz",
-];
+pub const DEFAULT_RAILWAY_BASES: &[&str] = &["https://ppoi.fdi.network"];
+
+fn bounded_http_client(
+    client: &'static str,
+    timeout: Duration,
+    build: impl FnOnce(reqwest::ClientBuilder) -> Result<reqwest::Client, String>,
+) -> Result<reqwest::Client, BootstrapError> {
+    let builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(timeout);
+    build(builder).map_err(|reason| BootstrapError::ClientConfig { client, reason })
+}
 
 /// Live client over the upstream PPOI events feed. Walks the bases in order and
 /// only reports `PpoiUnreachable` once every base has failed.
@@ -1219,35 +1241,57 @@ impl std::fmt::Debug for RailwayPpoiClient {
 }
 
 impl RailwayPpoiClient {
-    /// Errors when `base` is empty after trimming.
-    pub fn new(base: impl Into<String>, chain_type: u32, chain_id: u64) -> Self {
-        let s: String = base.into();
-        if let Ok(c) = Self::new_multi(vec![s.clone()], chain_type, chain_id) {
-            return c;
-        }
-        let http = reqwest::Client::builder()
-            .timeout(RAILWAY_PER_URL_TIMEOUT)
-            .connect_timeout(RAILWAY_PER_URL_TIMEOUT)
-            .build()
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    error = %e,
-                    "reqwest builder failed for RailwayPpoiClient; falling back to Client::new() (no timeout)"
-                );
-                reqwest::Client::new()
-            });
-        Self {
-            bases: vec![s],
-            chain_type,
-            chain_id,
-            http,
-        }
+    /// Build a bounded single-base PPOI client.
+    ///
+    /// # Errors
+    /// Returns [`BootstrapError::ClientConfig`] for an empty base or client build failure.
+    ///
+    /// ```
+    /// use raven_railgun_cli::bootstrap_subsquid::RailwayPpoiClient;
+    /// let client = RailwayPpoiClient::new("https://example.com", 0, 1)?;
+    /// assert_eq!(client.bases(), &["https://example.com"]);
+    /// # Ok::<(), raven_railgun_cli::bootstrap_subsquid::BootstrapError>(())
+    /// ```
+    pub fn new(
+        base: impl Into<String>,
+        chain_type: u32,
+        chain_id: u64,
+    ) -> Result<Self, BootstrapError> {
+        Self::new_multi(vec![base.into()], chain_type, chain_id)
     }
 
-    /// Errors when the base list is empty.
-    pub fn new_multi(bases: Vec<String>, chain_type: u32, chain_id: u64) -> Result<Self, String> {
+    /// Build a bounded client that tries bases in order.
+    ///
+    /// # Errors
+    /// Returns [`BootstrapError::ClientConfig`] for no usable base or client build failure.
+    ///
+    /// ```
+    /// use raven_railgun_cli::bootstrap_subsquid::RailwayPpoiClient;
+    /// let client = RailwayPpoiClient::new_multi(vec!["https://example.com".to_owned()], 0, 1)?;
+    /// assert_eq!(client.bases().len(), 1);
+    /// # Ok::<(), raven_railgun_cli::bootstrap_subsquid::BootstrapError>(())
+    /// ```
+    pub fn new_multi(
+        bases: Vec<String>,
+        chain_type: u32,
+        chain_id: u64,
+    ) -> Result<Self, BootstrapError> {
+        Self::new_multi_with_build(bases, chain_type, chain_id, |builder| {
+            builder.build().map_err(|error| error.to_string())
+        })
+    }
+
+    fn new_multi_with_build(
+        bases: Vec<String>,
+        chain_type: u32,
+        chain_id: u64,
+        build: impl FnOnce(reqwest::ClientBuilder) -> Result<reqwest::Client, String>,
+    ) -> Result<Self, BootstrapError> {
         if bases.is_empty() {
-            return Err("RailwayPpoiClient: at least one base URL is required".to_owned());
+            return Err(BootstrapError::ClientConfig {
+                client: "RailwayPpoiClient",
+                reason: "at least one base URL is required".to_owned(),
+            });
         }
         let cleaned: Vec<String> = bases
             .into_iter()
@@ -1255,13 +1299,12 @@ impl RailwayPpoiClient {
             .filter(|s| !s.is_empty())
             .collect();
         if cleaned.is_empty() {
-            return Err("RailwayPpoiClient: every supplied base URL was empty".to_owned());
+            return Err(BootstrapError::ClientConfig {
+                client: "RailwayPpoiClient",
+                reason: "every supplied base URL was empty".to_owned(),
+            });
         }
-        let http = reqwest::Client::builder()
-            .timeout(RAILWAY_PER_URL_TIMEOUT)
-            .connect_timeout(RAILWAY_PER_URL_TIMEOUT)
-            .build()
-            .map_err(|e| format!("reqwest builder: {e}"))?;
+        let http = bounded_http_client("RailwayPpoiClient", RAILWAY_PER_URL_TIMEOUT, build)?;
         Ok(Self {
             bases: cleaned,
             chain_type,
@@ -1280,6 +1323,9 @@ struct WireSignedPoiEvent {
     index: u64,
     #[serde(rename = "blindedCommitment")]
     blinded_commitment: String,
+    signature: String,
+    #[serde(rename = "type")]
+    event_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1290,59 +1336,163 @@ struct WirePoiEventEntry {
     validated_merkleroot: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct RailwayJsonRpcResponse<T> {
+    jsonrpc: String,
+    id: u64,
+    result: Option<T>,
+    error: Option<RailwayJsonRpcError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RailwayJsonRpcError {
+    code: i64,
+    message: String,
+}
+
+const PPOI_EVENT_PAGE_ROWS: u64 = 501;
+
 #[async_trait]
 impl PpoiEventsSource for RailwayPpoiClient {
+    #[allow(clippy::too_many_lines)]
     async fn fetch_all_events(
         &self,
         list_key: [u8; 32],
     ) -> Result<Vec<PpoiEventRow>, BootstrapError> {
-        let body = serde_json::json!({
-            "txidVersion": "V2_PoseidonMerkle",
-            "listKey": to_hex(&list_key),
-            "startIndex": 0u64,
-            "endIndex": u64::from(u32::MAX),
-        });
         let mut last_err = String::from("(no bases attempted)");
         for base in &self.bases {
-            let url = format!("{}/poi-events/{}/{}", base, self.chain_type, self.chain_id);
-            let resp = match self.http.post(&url).json(&body).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    let msg = format!("{base}: {e}");
-                    tracing::warn!(base = %base, error = %e, "Railway PPOI base unreachable; trying next");
-                    last_err = msg;
-                    continue;
-                }
-            };
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let msg = format!("{base}: HTTP {status}");
-                tracing::warn!(base = %base, status = %status, "Railway PPOI base non-2xx; trying next");
-                last_err = msg;
-                continue;
-            }
-            let parsed: Vec<WirePoiEventEntry> = match resp.json().await {
-                Ok(v) => v,
-                Err(e) => {
-                    let msg = format!("{base}: decode {e}");
-                    tracing::warn!(base = %base, error = %e, "Railway PPOI base body decode failed; trying next");
-                    last_err = msg;
-                    continue;
-                }
-            };
-            let mut out = Vec::with_capacity(parsed.len());
-            for entry in parsed {
-                let leaf = parse_hex32(&entry.signed_event.blinded_commitment)
-                    .map_err(|e| BootstrapError::PpoiDecode(format!("blindedCommitment: {e}")))?;
-                let root = parse_hex32(&entry.validated_merkleroot)
-                    .map_err(|e| BootstrapError::PpoiDecode(format!("validatedMerkleroot: {e}")))?;
-                out.push(PpoiEventRow {
-                    index: entry.signed_event.index,
-                    leaf,
-                    validated_merkleroot: root,
+            let mut out = Vec::new();
+            let mut start_index = 0u64;
+            let base_outcome = loop {
+                let Some(end_index) = start_index.checked_add(PPOI_EVENT_PAGE_ROWS - 1) else {
+                    break Err(format!(
+                        "{base}: PPOI page starting at {start_index} overflows u64"
+                    ));
+                };
+                let request = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "ppoi_poi_events",
+                    "params": {
+                        "chainType": self.chain_type.to_string(),
+                        "chainID": self.chain_id.to_string(),
+                        "txidVersion": "V2_PoseidonMerkle",
+                        "listKey": to_hex(&list_key),
+                        "startIndex": start_index,
+                        "endIndex": end_index,
+                    },
+                    "id": 1u64,
                 });
+                let response = match self.http.post(base).json(&request).send().await {
+                    Ok(response) => response,
+                    Err(error) => break Err(format!("{base}: {error}")),
+                };
+                if !response.status().is_success() {
+                    break Err(format!("{base}: HTTP {}", response.status()));
+                }
+                let response: RailwayJsonRpcResponse<Vec<WirePoiEventEntry>> =
+                    match response.json().await {
+                        Ok(response) => response,
+                        Err(error) => break Err(format!("{base}: decode {error}")),
+                    };
+                if response.jsonrpc != "2.0" || response.id != 1 {
+                    break Err(format!(
+                        "{base}: JSON-RPC envelope mismatch: version {}, id {}",
+                        response.jsonrpc, response.id
+                    ));
+                }
+                let parsed = match (response.result, response.error) {
+                    (Some(result), None) => result,
+                    (None, Some(error)) => {
+                        break Err(format!(
+                            "{base}: JSON-RPC error {}: {}",
+                            error.code, error.message
+                        ))
+                    }
+                    (Some(_), Some(_)) => {
+                        break Err(format!("{base}: JSON-RPC result and error both present"));
+                    }
+                    (None, None) => {
+                        break Err(format!("{base}: JSON-RPC result and error both absent"));
+                    }
+                };
+                let page_len = parsed.len();
+                if page_len == 0 {
+                    break Ok(());
+                }
+                let mut page = Vec::with_capacity(page_len);
+                let mut previous = None;
+                let mut page_error = None;
+                for entry in parsed {
+                    let index = entry.signed_event.index;
+                    if !(start_index..=end_index).contains(&index)
+                        || previous.is_some_and(|prior| index <= prior)
+                    {
+                        page_error = Some(format!(
+                            "{base}: PPOI response index {index} is outside or non-monotone for {start_index}..={end_index}"
+                        ));
+                        break;
+                    }
+                    previous = Some(index);
+                    if parse_hex64(&entry.signed_event.signature).is_err() {
+                        page_error = Some(format!(
+                            "{base}: signature at index {index} is not 64-byte hex"
+                        ));
+                        break;
+                    }
+                    if !matches!(
+                        entry.signed_event.event_type.as_str(),
+                        "Shield" | "Transact" | "Unshield" | "LegacyTransact"
+                    ) {
+                        page_error = Some(format!(
+                            "{base}: unknown PPOI event type {} at index {index}",
+                            entry.signed_event.event_type
+                        ));
+                        break;
+                    }
+                    let leaf = match parse_hex32(&entry.signed_event.blinded_commitment) {
+                        Ok(leaf) => leaf,
+                        Err(error) => {
+                            page_error = Some(format!(
+                                "{base}: blindedCommitment at index {index}: {error}"
+                            ));
+                            break;
+                        }
+                    };
+                    let root = match parse_hex32(&entry.validated_merkleroot) {
+                        Ok(root) => root,
+                        Err(error) => {
+                            page_error = Some(format!(
+                                "{base}: validatedMerkleroot at index {index}: {error}"
+                            ));
+                            break;
+                        }
+                    };
+                    page.push(PpoiEventRow {
+                        index,
+                        leaf,
+                        validated_merkleroot: root,
+                    });
+                }
+                if let Some(error) = page_error {
+                    break Err(error);
+                }
+                out.extend(page);
+                start_index = match end_index.checked_add(1) {
+                    Some(next) => next,
+                    _ => {
+                        break Err(format!(
+                            "{base}: PPOI cursor cannot advance past inclusive end {end_index}"
+                        ))
+                    }
+                };
+            };
+            match base_outcome {
+                Ok(()) => return Ok(out),
+                Err(error) => {
+                    tracing::warn!(base = %base, error = %error, "Railway PPOI base failed; trying next");
+                    last_err = error;
+                }
             }
-            return Ok(out);
         }
         Err(BootstrapError::PpoiUnreachable(format!(
             "all {} Railway base(s) failed; last error: {last_err}",
@@ -1362,6 +1512,21 @@ fn parse_hex32(s: &str) -> Result<[u8; 32], String> {
             .get(i * 2..i * 2 + 2)
             .ok_or_else(|| format!("range at {i}"))?;
         *slot = u8::from_str_radix(pair, 16).map_err(|e| format!("byte {i}: {e}"))?;
+    }
+    Ok(out)
+}
+
+fn parse_hex64(s: &str) -> Result<[u8; 64], String> {
+    let trimmed = s.strip_prefix("0x").unwrap_or(s);
+    if trimmed.len() != 128 {
+        return Err(format!("expected 128 hex chars, got {}", trimmed.len()));
+    }
+    let mut out = [0u8; 64];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let pair = trimmed
+            .get(i * 2..i * 2 + 2)
+            .ok_or_else(|| format!("range at {i}"))?;
+        *slot = u8::from_str_radix(pair, 16).map_err(|error| format!("byte {i}: {error}"))?;
     }
     Ok(out)
 }
@@ -1390,22 +1555,35 @@ const SUBSQUID_RETRY_POLICY: raven_railgun_indexer::RetryPolicy =
     );
 
 impl SubsquidLeavesClient {
-    pub fn new(endpoint: impl Into<String>) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(SUBSQUID_RETRY_POLICY.attempt_timeout())
-            .connect_timeout(SUBSQUID_RETRY_POLICY.attempt_timeout())
-            .build()
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    error = %e,
-                    "reqwest builder failed for SubsquidLeavesClient; falling back to Client::new() (no timeout)"
-                );
-                reqwest::Client::new()
-            });
-        Self {
+    /// Build a bounded Subsquid GraphQL client.
+    ///
+    /// # Errors
+    /// Returns [`BootstrapError::ClientConfig`] if reqwest cannot build the timed client.
+    ///
+    /// ```
+    /// use raven_railgun_cli::bootstrap_subsquid::SubsquidLeavesClient;
+    /// let _client = SubsquidLeavesClient::new("https://example.com/graphql")?;
+    /// # Ok::<(), raven_railgun_cli::bootstrap_subsquid::BootstrapError>(())
+    /// ```
+    pub fn new(endpoint: impl Into<String>) -> Result<Self, BootstrapError> {
+        Self::new_with_build(endpoint, |builder| {
+            builder.build().map_err(|error| error.to_string())
+        })
+    }
+
+    fn new_with_build(
+        endpoint: impl Into<String>,
+        build: impl FnOnce(reqwest::ClientBuilder) -> Result<reqwest::Client, String>,
+    ) -> Result<Self, BootstrapError> {
+        let http = bounded_http_client(
+            "SubsquidLeavesClient",
+            SUBSQUID_RETRY_POLICY.attempt_timeout(),
+            build,
+        )?;
+        Ok(Self {
             endpoint: endpoint.into(),
             http,
-        }
+        })
     }
 }
 
@@ -1639,6 +1817,52 @@ pub fn modulus_be() -> [u8; 32] {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    #[test]
+    fn default_railway_base_is_the_published_live_aggregator() {
+        assert_eq!(DEFAULT_RAILWAY_BASES, &["https://ppoi.fdi.network"]);
+    }
+
+    #[test]
+    fn railway_single_base_refuses_an_empty_url() {
+        let Err(BootstrapError::ClientConfig { client, reason }) =
+            RailwayPpoiClient::new("   ", 0, 1)
+        else {
+            panic!("an empty base must fail construction before any request");
+        };
+        assert_eq!(client, "RailwayPpoiClient");
+        assert!(reason.contains("empty"), "{reason}");
+    }
+
+    fn assert_bounded_client_build_failure(
+        outcome: Result<(), BootstrapError>,
+        client_name: &'static str,
+    ) {
+        let Err(BootstrapError::ClientConfig { client, reason }) = outcome else {
+            panic!("{client_name} must not fall back to an unbounded client");
+        };
+        assert_eq!(client, client_name);
+        assert!(reason.contains("synthetic reqwest build failure"));
+    }
+
+    #[test]
+    fn railway_timeout_client_build_failure_is_typed() {
+        let outcome = RailwayPpoiClient::new_multi_with_build(
+            vec!["https://example.com".to_owned()],
+            0,
+            1,
+            |_| Err("synthetic reqwest build failure".to_owned()),
+        );
+        assert_bounded_client_build_failure(outcome.map(|_| ()), "RailwayPpoiClient");
+    }
+
+    #[test]
+    fn subsquid_timeout_client_build_failure_is_typed() {
+        let outcome = SubsquidLeavesClient::new_with_build("https://example.com", |_| {
+            Err("synthetic reqwest build failure".to_owned())
+        });
+        assert_bounded_client_build_failure(outcome.map(|_| ()), "SubsquidLeavesClient");
+    }
 
     #[test]
     fn subsquid_retry_attempts_and_backoff_schedule_are_pinned() {

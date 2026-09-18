@@ -1,5 +1,5 @@
 //! The u16 wire-schema prefix prevents previous and future response layouts from reaching
-//! the wrong decoder. Frozen v2 and current v3 bodies prove both refusal directions.
+//! the wrong decoder. Frozen v2 and current bodies prove both refusal directions.
 
 #![allow(
     dead_code,
@@ -31,7 +31,7 @@ use tower::ServiceExt;
 
 const TOKEN: &str = "schema-version-guard-token-1234567";
 const INSTANCE: &str = "schema-version-instance";
-const PREVIOUS_WIRE_SCHEMA_VERSION: u16 = 2;
+const PREVIOUS_WIRE_SCHEMA_VERSION: u16 = 5;
 
 static APPSTATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -238,46 +238,50 @@ fn read_batch_at_schema<T: serde::de::DeserializeOwned>(
 }
 
 #[test]
-fn real_v2_and_v3_single_response_layouts_refuse_each_other() {
-    assert_eq!(WIRE_SCHEMA_VERSION, 3, "R1 changes the response layout");
-    let (v2_response, v3_response) = response_layouts();
+fn previous_and_current_single_response_layouts_refuse_each_other() {
+    assert_eq!(
+        WIRE_SCHEMA_VERSION, 6,
+        "tight 60-bit coefficients change query and response bytes"
+    );
+    let (v2_response, current_response) = response_layouts();
     let old = write_at_schema(&v2_response, PREVIOUS_WIRE_SCHEMA_VERSION);
-    let current = write_versioned(&v3_response).expect("encode current response layout");
+    let current = write_versioned(&current_response).expect("encode current response layout");
     assert_ne!(
         &old[WIRE_SCHEMA_PREFIX_LEN..],
         &current[WIRE_SCHEMA_PREFIX_LEN..],
-        "the frozen v2 body must not be a relabeled v3 body"
+        "the frozen v2 body must not be a relabeled current body"
     );
 
     let current_error = raven_railgun_http::read_versioned::<ServerResponse>(&old)
-        .expect_err("v3 reader must refuse a real v2 response");
-    assert!(current_error.to_string().contains("expects v3"));
-    assert!(current_error.to_string().contains("sent v2"));
+        .expect_err("current reader must refuse a real v2 response");
+    assert!(current_error.to_string().contains("expects v6"));
+    assert!(current_error.to_string().contains("sent v5"));
     let old_error =
         read_at_schema::<FrozenV2ServerResponse>(&current, PREVIOUS_WIRE_SCHEMA_VERSION)
-            .expect_err("v2 reader must refuse a real v3 response");
-    assert!(old_error.contains("expected v2, got v3"));
+            .expect_err("previous reader must refuse a real current response");
+    assert!(old_error.contains("expected v5, got v6"));
 }
 
 #[test]
-fn real_v2_and_v3_batch_response_layouts_refuse_each_other() {
-    let (v2_response, v3_response) = response_layouts();
+fn previous_and_current_batch_response_layouts_refuse_each_other() {
+    let (v2_response, current_response) = response_layouts();
     let old = write_batch_at_schema(&[v2_response], PREVIOUS_WIRE_SCHEMA_VERSION);
-    let current = write_batch_response_versioned(&[v3_response]).expect("encode v3 batch");
+    let current =
+        write_batch_response_versioned(&[current_response]).expect("encode current batch");
     assert_ne!(
         &old[WIRE_SCHEMA_PREFIX_LEN + 16..],
         &current[WIRE_SCHEMA_PREFIX_LEN + 16..],
-        "the frozen v2 element must not be a relabeled v3 element"
+        "the frozen v2 element must not be a relabeled current element"
     );
     let current_error = read_batch_response_versioned::<ServerResponse>(&old)
-        .expect_err("v3 batch reader must refuse a real v2 response");
-    assert!(current_error.to_string().contains("expects v3"));
-    assert!(current_error.to_string().contains("sent v2"));
+        .expect_err("current batch reader must refuse a real v2 response");
+    assert!(current_error.to_string().contains("expects v6"));
+    assert!(current_error.to_string().contains("sent v5"));
 
     let old_error =
         read_batch_at_schema::<FrozenV2ServerResponse>(&current, PREVIOUS_WIRE_SCHEMA_VERSION)
-            .expect_err("v2 batch reader must refuse a real v3 response");
-    assert!(old_error.contains("expected v2, got v3"));
+            .expect_err("previous batch reader must refuse a real current response");
+    assert!(old_error.contains("expected v5, got v6"));
 }
 
 async fn status_of(route: &str, body: Vec<u8>) -> StatusCode {
@@ -314,7 +318,7 @@ async fn previous_schema_rejection_advertises_the_current_version() {
             .headers()
             .get(X_RAVEN_SCHEMA_VERSION.to_ascii_lowercase())
             .expect("schema mismatch must advertise the accepted version"),
-        "3"
+        "6"
     );
 }
 

@@ -202,7 +202,7 @@ describe("RavenPOINodeInterface privacy invariant", () => {
     expect(wireRequests.some((request) => request.url.endsWith("/session"))).toBe(false);
     const registration = mock.receivedBodies.find((request) => request.url.endsWith("/session"));
     expect(registration!.body.length).toBeGreaterThan(1024);
-    expect(registration!.body.subarray(0, 2)).toEqual(new Uint8Array([0, 3]));
+    expect(registration!.body.subarray(0, 2)).toEqual(new Uint8Array([0, 6]));
 
     // Server-side cross-check guards against the SDK capturing the wrong body.
     expect(

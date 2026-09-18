@@ -42,7 +42,7 @@ export function stubRemoteSessionExports(): Pick<
   | "retarget_seeded_query_shard"
 > {
   return {
-    client_packing_keys_versioned: () => new Uint8Array([0, 3]),
+    client_packing_keys_versioned: () => new Uint8Array([0, 6]),
     install_server_session_handle: () => undefined,
     retarget_seeded_query_shard: (query, nominalShardId) => {
       if (query.length < 4) throw new Error("stub seeded query is shorter than shard_id");

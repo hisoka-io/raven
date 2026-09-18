@@ -16,7 +16,13 @@ import {
   stubCtx as authPathContext,
 } from "./helpers/auth_path_stub";
 import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
-import { startMockServer, writeBinary, writeJson, type MockServer } from "./helpers/mock_server";
+import {
+  readJsonRpcRequest,
+  startMockServer,
+  writeBinary,
+  writeJsonRpcResult,
+  type MockServer,
+} from "./helpers/mock_server";
 import {
   assertNoCommitmentsInPirRequests,
   STUB_QUERY_BYTES,
@@ -235,9 +241,14 @@ describe("private response freshness fallback", () => {
       },
     );
     upstream.route(
-      (req) => req.url === "/pois-per-list/0/1",
-      (_req, _body, res) => {
-        writeJson(res, { [BC_HEX]: { [LIST_KEY_HEX]: "ShieldBlocked" } });
+      (req) => req.url === "/",
+      (_req, body, res) => {
+        const request = writeJsonRpcResult(
+          body,
+          res,
+          { [BC_HEX]: { [LIST_KEY_HEX]: "ShieldBlocked" } },
+        );
+        expect(request.method).toBe("ppoi_pois_per_list");
         return true;
       },
     );
@@ -277,7 +288,7 @@ describe("private response freshness fallback", () => {
       (_req, body, res) => {
         writeBinary(res, encodeBatchResponse(1, encodedBatchCount(body)), {
           "x-raven-epoch": "1",
-          "x-raven-schema-version": "3",
+          "x-raven-schema-version": "6",
           "x-raven-freshness": STALE_FRESHNESS,
         });
         return true;
@@ -290,9 +301,10 @@ describe("private response freshness fallback", () => {
       root: "22".repeat(32),
     };
     upstream.route(
-      (req) => req.url === "/merkle-proofs/0/1",
-      (_req, _body, res) => {
-        writeJson(res, [upstreamProof]);
+      (req) => req.url === "/",
+      (_req, body, res) => {
+        const request = writeJsonRpcResult(body, res, [upstreamProof]);
+        expect(request.method).toBe("ppoi_merkle_proofs");
         return true;
       },
     );
@@ -332,7 +344,7 @@ describe("private response freshness fallback", () => {
         (_req, body, res) => {
           writeBinary(res, encodeBatchResponse(1, encodedBatchCount(body)), {
             "x-raven-epoch": "1",
-            "x-raven-schema-version": "3",
+            "x-raven-schema-version": "6",
             "x-raven-freshness": freshness,
           });
           return true;
@@ -345,16 +357,13 @@ describe("private response freshness fallback", () => {
         root: "22".repeat(32),
       };
       upstream.route(
-        (req) => req.url === "/pois-per-list/0/1",
-        (_req, _body, res) => {
-          writeJson(res, { [BC_HEX]: { [LIST_KEY_HEX]: "ShieldBlocked" } });
-          return true;
-        },
-      );
-      upstream.route(
-        (req) => req.url === "/merkle-proofs/0/1",
-        (_req, _body, res) => {
-          writeJson(res, [upstreamProof]);
+        (req) => req.url === "/",
+        (_req, body, res) => {
+          const request = readJsonRpcRequest(body);
+          const result = request.method === "ppoi_pois_per_list"
+            ? { [BC_HEX]: { [LIST_KEY_HEX]: "ShieldBlocked" } }
+            : [upstreamProof];
+          writeJsonRpcResult(body, res, result);
           return true;
         },
       );
@@ -430,16 +439,16 @@ describe("private response freshness fallback", () => {
       }
 
       const upstreamRequests = upstream.requests.filter((request) =>
-        request.url === (operation === "t1-status" ? "/pois-per-list/0/1" : "/merkle-proofs/0/1")
+        request.url === "/"
       );
       expect(upstreamRequests).toHaveLength(row.verdict === "fallback" ? 1 : 0);
       if (row.verdict === "fallback") {
         const body = JSON.parse(new TextDecoder().decode(upstreamRequests[0].body));
-        expect(body.listKeys ?? [body.listKey]).toEqual([LIST_KEY_HEX]);
+        expect(body.params.listKeys ?? [body.params.listKey]).toEqual([LIST_KEY_HEX]);
         expect(
-          body.blindedCommitmentDatas?.map(
+          body.params.blindedCommitmentDatas?.map(
             (commitment: { blindedCommitment: string }) => commitment.blindedCommitment,
-          ) ?? body.blindedCommitments,
+          ) ?? body.params.blindedCommitments,
         ).toEqual([BC_HEX]);
       }
       expect(
@@ -471,7 +480,7 @@ describe("private response freshness fallback", () => {
           const headers: Record<string, string> = {
             "content-type": "application/octet-stream",
             "x-raven-epoch": "1",
-            "x-raven-schema-version": "3",
+            "x-raven-schema-version": "6",
           };
           if (header !== null) headers["x-raven-freshness"] = header;
           res.writeHead(200, headers);

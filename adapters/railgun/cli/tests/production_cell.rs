@@ -70,16 +70,16 @@ async fn assert_batch_capacity_boundary(
     assert_eq!(serialized_query.len(), evidence.serialized_query);
     assert_eq!(frame_bytes, evidence.batch_frame);
     assert_eq!(cell.max_body_bytes, evidence.default_body_cap);
-    assert_eq!(serialized_query.len(), 49_445, "handled query bytes");
+    assert_eq!(serialized_query.len(), 15_491, "handled query bytes");
     assert_eq!(frame_bytes, 10, "version plus Vec length frame");
     assert_eq!(cell.max_body_bytes, 8 * 1024 * 1024, "HTTP body cap");
-    assert_eq!(raw_capacity, 169, "raw query capacity");
+    assert_eq!(raw_capacity, 541, "raw query capacity");
     let admitted = raven_railgun_http::write_versioned(&vec![handled_query.clone(); raw_capacity])
         .expect("serialize admitted body");
     let refused = raven_railgun_http::write_versioned(&vec![handled_query; raw_capacity + 1])
         .expect("serialize refused body");
-    assert_eq!(admitted.len(), 8_356_215);
-    assert_eq!(refused.len(), 8_405_660);
+    assert_eq!(admitted.len(), 8_380_641);
+    assert_eq!(refused.len(), 8_396_132);
     assert!(admitted.len() <= cell.max_body_bytes);
     assert!(refused.len() > cell.max_body_bytes);
     let admitted_status = client
@@ -91,7 +91,7 @@ async fn assert_batch_capacity_boundary(
         .await
         .expect("POST body within cap")
         .status();
-    assert_eq!(admitted_status, 400, "169 reaches the off-step guard");
+    assert_eq!(admitted_status, 400, "541 reaches the off-step guard");
     let refused_status = client
         .post(cell.batch_url())
         .bearer_auth(BEARER_TOKEN)
@@ -101,7 +101,7 @@ async fn assert_batch_capacity_boundary(
         .await
         .expect("POST body above cap")
         .status();
-    assert_eq!(refused_status, 413, "170 exceeds the body cap");
+    assert_eq!(refused_status, 413, "542 exceeds the body cap");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -128,8 +128,17 @@ async fn production_cell_round_trip_byte_identity() {
     assert_eq!(response.status(), 200, "HTTP status");
 
     let body = response.bytes().await.expect("body bytes");
+    assert_eq!(body.len(), 17_360, "versioned tight response bytes");
     let server_response: ServerResponse =
         raven_railgun_http::read_versioned(&body).expect("deserialize ServerResponse (versioned)");
+    assert_eq!(
+        server_response
+            .to_binary()
+            .expect("tight response body")
+            .len(),
+        17_358,
+        "tight response saves exactly 1,152 bytes from the 18,510-byte body"
+    );
     let plaintext = cell.decode(&client_state, &server_response);
     assert_eq!(
         plaintext.get(..ENTRY_BYTES),

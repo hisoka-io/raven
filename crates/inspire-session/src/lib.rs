@@ -735,6 +735,36 @@ impl BoundedSessionStore {
         let mut generation = self.current.write();
         let mut observation = SessionObservation::default();
         let mut warnings = Vec::new();
+        if Self::would_flush_after_sweep(&generation, now, self.limits.max_sessions) {
+            let replacement = Arc::new(ServerSessionStore::new());
+            let outcome = replacement
+                .register_server_side(keys, pack_params, context)
+                .map_err(|source| SessionStoreError::Inspire {
+                    operation: "session register_server_side",
+                    source: Box::new(source),
+                })
+                .and_then(|inner| {
+                    let external = self
+                        .durable_handles
+                        .as_ref()
+                        .map(|allocator| allocator.allocate())
+                        .transpose()?;
+                    self.make_room(&mut generation, now, &mut observation, &mut warnings);
+                    generation.store = replacement;
+                    let handle = external.unwrap_or(inner);
+                    generation
+                        .expiry
+                        .insert(handle.0, SessionEntry { inner, expires_at });
+                    Ok(handle)
+                });
+            observation.counts = Some(generation.counts());
+            self.finish_observation(&mut observation);
+            return Observed {
+                outcome,
+                observation,
+                warnings,
+            };
+        }
         self.make_room(&mut generation, now, &mut observation, &mut warnings);
         let outcome = (|| {
             let external = self
@@ -780,6 +810,50 @@ impl BoundedSessionStore {
         let mut generation = self.current.write();
         let mut observation = SessionObservation::default();
         let mut warnings = Vec::new();
+        if Self::would_flush_after_sweep(&generation, now, self.limits.max_sessions) {
+            let outcome = (|| {
+                let external = self
+                    .durable_handles
+                    .as_ref()
+                    .map(|allocator| allocator.allocate())
+                    .transpose()?;
+                let replacement = Arc::new(ServerSessionStore::new());
+                let inner = session
+                    .register_with_server_derivation(replacement.as_ref())
+                    .map_err(|source| SessionStoreError::Inspire {
+                        operation: "session register",
+                        source: Box::new(source),
+                    })?;
+                let binding = match (inner, external) {
+                    (Some(inner), Some(external)) => {
+                        session
+                            .install_server_session_handle(external)
+                            .map_err(|source| SessionStoreError::Inspire {
+                                operation: "session handle install",
+                                source: Box::new(source),
+                            })?;
+                        Some((external, inner))
+                    }
+                    (Some(inner), None) => Some((inner, inner)),
+                    (None, Some(_) | None) => None,
+                };
+                if let Some((external, inner)) = binding {
+                    self.make_room(&mut generation, now, &mut observation, &mut warnings);
+                    generation.store = replacement;
+                    generation
+                        .expiry
+                        .insert(external.0, SessionEntry { inner, expires_at });
+                }
+                Ok(binding.map(|(external, _inner)| external))
+            })();
+            observation.counts = Some(generation.counts());
+            self.finish_observation(&mut observation);
+            return Observed {
+                outcome,
+                observation,
+                warnings,
+            };
+        }
         self.make_room(&mut generation, now, &mut observation, &mut warnings);
         let outcome = (|| {
             let external = self
@@ -987,6 +1061,22 @@ impl BoundedSessionStore {
         self.flushes_total.fetch_add(1, Ordering::Relaxed);
         observation.evictions.flushed = dropped;
         observation.flushes = 1;
+    }
+
+    fn would_flush_after_sweep(generation: &Generation, now: Instant, max_sessions: usize) -> bool {
+        let mut occupancy_after_sweep = generation.store.len();
+        for entry in generation
+            .expiry
+            .values()
+            .filter(|entry| entry.expires_at <= now)
+        {
+            match generation.store.get(entry.inner) {
+                Ok(Some(_)) => occupancy_after_sweep = occupancy_after_sweep.saturating_sub(1),
+                Ok(None) => {}
+                Err(_) => return true,
+            }
+        }
+        occupancy_after_sweep >= max_sessions
     }
 
     fn finish_observation(&self, observation: &mut SessionObservation) {
@@ -1313,14 +1403,14 @@ mod tests {
     }
 
     #[test]
-    fn failed_registration_after_flush_reports_the_empty_generation_counts() {
+    fn refused_registration_at_capacity_preserves_the_live_session() {
         let (keys, pack_params, context) = real_registration_material();
         let store = store(1);
         let now = Instant::now();
         let (first, _, _) = store
             .register_server_side_at(keys.clone(), &pack_params, &context, now)
             .into_parts();
-        first.expect("first registration");
+        let first = first.expect("first registration");
         let mut invalid = keys;
         invalid.y_body.pop();
 
@@ -1330,19 +1420,24 @@ mod tests {
 
         assert!(second.is_err());
         assert!(warnings.is_empty());
-        assert_eq!(observation.evictions.flushed, 1);
-        assert_eq!(observation.flushes, 1);
+        assert_eq!(observation.evictions, super::SessionEvictions::default());
+        assert_eq!(observation.flushes, 0);
         assert_eq!(
             observation.counts,
             Some(super::SessionCounts {
-                occupancy: 0,
-                serviceable: 0,
+                occupancy: 1,
+                serviceable: 1,
             })
         );
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.serviceable_len(), 1);
+        assert_eq!(store.evicted_total(), 0);
+        assert_eq!(store.flushes_total(), 0);
+        assert!(store.resolve(Some(first), now).is_ok());
     }
 
     #[test]
-    fn failed_client_registration_after_flush_reports_the_empty_generation_counts() {
+    fn refused_client_registration_at_capacity_preserves_the_live_session() {
         let params = InspireParams::secure_128_d2048();
         let database = vec![0u8; params.ring_dim * 32];
         let mut sampler = GaussianSampler::with_seed(params.sigma, 119);
@@ -1359,7 +1454,7 @@ mod tests {
         )
         .expect("durable store");
         let now = Instant::now();
-        register(&store, now);
+        let first = register(&store, now).0;
         let allocator = store.durable_handles.as_ref().expect("durable allocator");
         allocator.next.store(
             allocator.end.load(std::sync::atomic::Ordering::Acquire),
@@ -1377,17 +1472,20 @@ mod tests {
             Err(super::SessionStoreError::FloorLength { .. })
         ));
         assert!(warnings.is_empty());
-        assert_eq!(observation.evictions.flushed, 1);
-        assert_eq!(observation.flushes, 1);
+        assert_eq!(observation.evictions, super::SessionEvictions::default());
+        assert_eq!(observation.flushes, 0);
         assert_eq!(
             observation.counts,
             Some(super::SessionCounts {
-                occupancy: 0,
-                serviceable: 0,
+                occupancy: 1,
+                serviceable: 1,
             })
         );
-        assert_eq!(store.len(), 0);
-        assert_eq!(store.serviceable_len(), 0);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.serviceable_len(), 1);
+        assert_eq!(store.evicted_total(), 0);
+        assert_eq!(store.flushes_total(), 0);
+        assert!(store.resolve(Some(first), now).is_ok());
         assert_eq!(client.session_handle(), None);
     }
 

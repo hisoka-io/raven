@@ -534,13 +534,13 @@ mod tests {
     }
 
     #[test]
-    fn failed_registration_after_flush_publishes_zero_gauges_and_one_flush() {
+    fn failed_registration_at_capacity_preserves_live_gauges_without_flush() {
         let (keys, pack_params, context) = real_registration_material();
         let store = BoundedSessionStore::with_limits(SessionStoreLimits {
             max_sessions: 1,
             ttl: DEFAULT_SESSION_TTL,
         });
-        store
+        let first = store
             .register_server_side_at(keys.clone(), &pack_params, &context, Instant::now())
             .expect("first registration");
         let mut invalid = keys;
@@ -555,25 +555,21 @@ mod tests {
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
-        assert_eq!(
-            metric_value(&snapshot, "raven_railgun_session_store_flushes_total", None),
-            &DebugValue::Counter(1)
-        );
-        assert_eq!(
-            metric_value(
-                &snapshot,
-                "raven_railgun_session_evictions_total",
-                Some("flushed")
-            ),
-            &DebugValue::Counter(1)
-        );
+        assert!(snapshot.iter().all(|(key, _, _, _)| {
+            !matches!(
+                key.key().name(),
+                "raven_railgun_session_store_flushes_total"
+                    | "raven_railgun_session_evictions_total"
+            )
+        }));
         assert_gauge(
             metric_value(&snapshot, "raven_railgun_session_store_occupancy", None),
-            0.0,
+            1.0,
         );
         assert_gauge(
             metric_value(&snapshot, "raven_railgun_session_store_serviceable", None),
-            0.0,
+            1.0,
         );
+        assert!(store.resolve(Some(first), Instant::now()).is_ok());
     }
 }

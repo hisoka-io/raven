@@ -9,6 +9,13 @@ export interface RecordedRequest {
   headers: Record<string, string | string[] | undefined>;
 }
 
+export interface JsonRpcRequest {
+  jsonrpc: string;
+  method: string;
+  params: Record<string, unknown>;
+  id: number;
+}
+
 export interface RouteHandler {
   (req: IncomingMessage, body: Uint8Array, res: ServerResponse): boolean | Promise<boolean>;
 }
@@ -126,6 +133,20 @@ export function writeJson(
     ...extraHeaders,
   });
   res.end(JSON.stringify(payload));
+}
+
+export function readJsonRpcRequest(body: Uint8Array): JsonRpcRequest {
+  return JSON.parse(new TextDecoder().decode(body)) as JsonRpcRequest;
+}
+
+export function writeJsonRpcResult(
+  body: Uint8Array,
+  res: ServerResponse,
+  result: unknown,
+): JsonRpcRequest {
+  const request = readJsonRpcRequest(body);
+  writeJson(res, { jsonrpc: "2.0", id: request.id, result });
+  return request;
 }
 
 /** Write an octet-stream 200 response with optional extra headers. */

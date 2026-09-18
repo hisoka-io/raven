@@ -18,6 +18,7 @@ cd "$(dirname "$0")/.."
 
 GATE=scripts/assert-lane-counts.sh
 EXPECTED=.github/expected-lane-counts.tsv
+FIXTURES=scripts/fixtures/assert-lane-counts
 [ -f "$EXPECTED" ] || { echo "missing ${EXPECTED}; run ${GATE} --update" >&2; exit 1; }
 
 BE=$(mktemp)
@@ -70,6 +71,16 @@ for marker in integration_target ' in_src::' bench/latency_bench; do
   fi
   echo "  ok: dropping ${marker} changes the parser count 3 -> 2"
 done
+
+bash "$GATE" --check-name-fixture \
+  "$FIXTURES/expected-with-removed-lane.tsv" "$FIXTURES/current-lanes.tsv" \
+  > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+  echo "SELFTEST FAIL: an expectation for a lane removed from ci.yml did not trip the gate" >&2
+  fails=1
+else
+  echo "  ok: a recorded lane absent from ci.yml trips the gate"
+fi
 
 bash "$GATE" > /dev/null 2>&1
 if [ $? -ne 0 ]; then

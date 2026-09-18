@@ -81,14 +81,14 @@ mod tests {
         let admitted_body_bytes = frame_bytes + raw_capacity * serialized_query_bytes;
         let refused_body_bytes = frame_bytes + (raw_capacity + 1) * serialized_query_bytes;
         assert_eq!(serialized_query_bytes, capacity_evidence.query_len);
-        assert_eq!(serialized_query_bytes, 49_445);
-        assert_eq!(raw_capacity, 169);
+        assert_eq!(serialized_query_bytes, 15_491);
+        assert_eq!(raw_capacity, 541);
         assert!(admitted_body_bytes <= body_cap_bytes);
         assert!(refused_body_bytes > body_cap_bytes);
         assert_eq!(
             raven_core::batch_ladder::largest_dyadic_step(raw_capacity),
-            Ok(128),
-            "the production wire capacity exposes 128 without changing adapter policy"
+            Ok(512),
+            "the production wire capacity exposes 512 without changing adapter policy"
         );
         for step in BATCH_SIZE_LADDER {
             assert!(is_on_ladder(step));

@@ -1450,7 +1450,7 @@ mod ppoi_resilience {
         let addr = listener.local_addr().expect("local addr");
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let app = Router::new().route(
-            "/poi-events/:ct/:cid",
+            "/",
             post(move |Json(body): Json<serde_json::Value>| {
                 let h = StdArc::clone(&handler);
                 async move { h(body).await }
@@ -1467,23 +1467,37 @@ mod ppoi_resilience {
     }
 
     fn ok_body_one_event() -> StubFn {
-        StdArc::new(|_body: serde_json::Value| {
+        StdArc::new(|request: serde_json::Value| {
             Box::pin(async move {
                 let mut imt = Imt::new().expect("imt");
                 let mut leaf = [0u8; 32];
                 leaf[31] = 0x01;
                 imt.insert_leaves(0, &[leaf]).expect("insert");
                 let root = imt.root();
-                let body = serde_json::json!([{
-                    "signedPOIEvent": {
-                        "index": 0u64,
-                        "blindedCommitment": format!("0x{}", hex_lower(&leaf)),
-                    },
-                    "validatedMerkleroot": format!("0x{}", hex_lower(&root)),
-                }]);
+                let start = request["params"]["startIndex"]
+                    .as_u64()
+                    .expect("startIndex");
+                let result = if start == 0 {
+                    serde_json::json!([{
+                        "signedPOIEvent": {
+                            "index": 0u64,
+                            "blindedCommitment": format!("0x{}", hex_lower(&leaf)),
+                            "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                            "type": "Shield",
+                        },
+                        "validatedMerkleroot": format!("0x{}", hex_lower(&root)),
+                    }])
+                } else {
+                    serde_json::json!([])
+                };
                 (
                     axum::http::StatusCode::OK,
-                    serde_json::to_string(&body).expect("ser"),
+                    serde_json::to_string(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": result,
+                    }))
+                    .expect("ser"),
                 )
             })
         })
@@ -1541,6 +1555,110 @@ mod ppoi_resilience {
         fn make_writer(&'a self) -> Self::Writer {
             LogCapture(StdArc::clone(&self.0))
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ppoi_bootstrap_paginates_the_inclusive_501_row_limit() {
+        let mut imt = Imt::new().expect("imt");
+        let mut events = Vec::new();
+        for index in 0..502usize {
+            let index_u64 = u64::try_from(index).expect("index fits u64");
+            let mut leaf = [0u8; 32];
+            leaf[24..].copy_from_slice(&(index_u64 + 1).to_be_bytes());
+            imt.insert_leaves(index, &[leaf]).expect("insert");
+            events.push(serde_json::json!({
+                "signedPOIEvent": {
+                    "index": index_u64,
+                    "blindedCommitment": format!("0x{}", hex_lower(&leaf)),
+                    "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                    "type": "Shield",
+                },
+                "validatedMerkleroot": format!("0x{}", hex_lower(&imt.root())),
+            }));
+        }
+        let events = StdArc::new(events);
+        let spans = StdArc::new(PMutex::new(Vec::new()));
+        let handler: StubFn = StdArc::new({
+            let events = StdArc::clone(&events);
+            let spans = StdArc::clone(&spans);
+            move |request: serde_json::Value| {
+                let events = StdArc::clone(&events);
+                let spans = StdArc::clone(&spans);
+                Box::pin(async move {
+                    assert_eq!(request.get("jsonrpc"), Some(&serde_json::json!("2.0")));
+                    assert_eq!(
+                        request.get("method"),
+                        Some(&serde_json::json!("ppoi_poi_events"))
+                    );
+                    let params = &request["params"];
+                    assert_eq!(params.get("chainType"), Some(&serde_json::json!("0")));
+                    assert_eq!(params.get("chainID"), Some(&serde_json::json!("1")));
+                    let start = params["startIndex"].as_u64().expect("startIndex");
+                    let end = params["endIndex"].as_u64().expect("endIndex");
+                    spans.lock().push((start, end));
+                    let page = events
+                        .iter()
+                        .filter(|event| {
+                            let index = event["signedPOIEvent"]["index"].as_u64().expect("index");
+                            index != 250 && (start..=end).contains(&index)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let body = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": page,
+                    });
+                    (
+                        axum::http::StatusCode::OK,
+                        serde_json::to_string(&body).expect("serialize"),
+                    )
+                })
+            }
+        });
+        let (endpoint, shutdown) = spawn_ppoi_stub(handler).await;
+        let client = RailwayPpoiClient::new(endpoint, 0, 1).expect("client");
+
+        let rows = client
+            .fetch_all_events([0xab; 32])
+            .await
+            .expect("paginated fetch");
+
+        assert_eq!(rows.len(), 501);
+        assert_eq!(*spans.lock(), vec![(0, 500), (501, 1001), (1002, 1502)]);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ppoi_bootstrap_falls_back_after_semantically_invalid_rows() {
+        let malformed: StubFn = StdArc::new(|request: serde_json::Value| {
+            Box::pin(async move {
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": [{
+                        "signedPOIEvent": {"index": 0, "blindedCommitment": "not-hex"},
+                        "validatedMerkleroot": "00"
+                    }],
+                });
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::to_string(&body).expect("serialize"),
+                )
+            })
+        });
+        let (bad, bad_shutdown) = spawn_ppoi_stub(malformed).await;
+        let (good, good_shutdown) = spawn_ppoi_stub(ok_body_one_event()).await;
+        let client = RailwayPpoiClient::new_multi(vec![bad, good], 0, 1).expect("client");
+
+        let rows = client
+            .fetch_all_events([0xab; 32])
+            .await
+            .expect("healthy second base wins");
+
+        assert_eq!(rows.len(), 1);
+        let _ = bad_shutdown.send(());
+        let _ = good_shutdown.send(());
     }
 
     /// Multi-URL walker skips two dead bases (sealed + 503) and serves from the third.
@@ -1661,10 +1779,10 @@ mod ppoi_resilience {
     #[test]
     fn railway_ppoi_client_rejects_empty_base_list() {
         let err = RailwayPpoiClient::new_multi(vec![], 0, 1).expect_err("empty list rejected");
-        assert!(err.contains("at least one"), "{err}");
+        assert!(err.to_string().contains("at least one"), "{err}");
         let err2 = RailwayPpoiClient::new_multi(vec!["   ".to_owned()], 0, 1)
             .expect_err("whitespace-only rejected");
-        assert!(err2.contains("empty"), "{err2}");
+        assert!(err2.to_string().contains("empty"), "{err2}");
     }
 
     /// Single-base `RailwayPpoiClient::new` must enforce a per-URL timeout against a
@@ -1687,7 +1805,7 @@ mod ppoi_resilience {
             }
         });
         let url = format!("http://{addr}");
-        let client = RailwayPpoiClient::new(url, 0, 1);
+        let client = RailwayPpoiClient::new(url, 0, 1).expect("bounded client");
 
         // 60s outer bracket so a missing per-URL timeout fails fast instead of hanging
         let started = std::time::Instant::now();

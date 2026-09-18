@@ -171,7 +171,9 @@ check_msrv_job() {
   local actual_manifests
   local actual_packages
   local actual_extra_packages
+  local clippy_commands=""
   local extra_packages
+  local line
   block="$(awk -v header="  $job:" '
     $0 == header { inside = 1 }
     inside && $0 ~ /^  [[:alnum:]_-]+:$/ && $0 != header { exit }
@@ -201,6 +203,20 @@ check_msrv_job() {
   if [[ "$block" != *'cargo check --manifest-path "$manifest"'* ]]; then
     fail "MSRV $floor job does not compile every manifest in its inventory"
   fi
+  if [[ "$block" != *'components: clippy'* ]]; then
+    fail "MSRV $floor job does not install clippy"
+  fi
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*cargo[[:space:]]+clippy([[:space:]]|$) ]]; then
+      clippy_commands+="$line"$'\n'
+      if [[ "$line" != *'--all-targets'* || "$line" != *'-- -D warnings'* ]]; then
+        fail "MSRV $floor clippy command lacks --all-targets -- -D warnings: $line"
+      fi
+    fi
+  done <<< "$block"
+  if [[ "$clippy_commands" != *'cargo clippy --manifest-path "$manifest"'* ]]; then
+    fail "MSRV $floor job does not lint every manifest"
+  fi
   if [[ -n "$expected_extra_packages" ]]; then
     local package
     local without_package
@@ -209,8 +225,8 @@ check_msrv_job() {
     for package in "${extra_packages[@]}"; do
       without_package="${block//"$package"/}"
       occurrences=$(((${#block} - ${#without_package}) / ${#package}))
-      if [[ "$occurrences" -lt 3 ]]; then
-        fail "MSRV $floor job names $package in its inventory but does not compile it explicitly"
+      if [[ "$occurrences" -lt 4 || "$clippy_commands" != *"-p $package"* ]]; then
+        fail "MSRV $floor job names $package in its inventory but does not compile and lint it explicitly"
       fi
     done
   fi

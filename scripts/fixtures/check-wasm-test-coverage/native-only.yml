@@ -1,0 +1,5 @@
+jobs:
+  native:
+    steps:
+      - run: |
+          cargo test --manifest-path crates/client/Cargo.toml --test exact_target

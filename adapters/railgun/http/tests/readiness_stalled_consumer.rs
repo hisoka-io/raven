@@ -227,6 +227,47 @@ async fn readiness_stays_ready_without_consumer_metrics() {
     fixture.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn production_mode_refuses_missing_consumer_metrics() {
+    let fixture = spawn(
+        &[HEALTHY],
+        raven_railgun_http::AppState::require_consumer_metrics,
+    )
+    .await;
+    let (code, body) = fixture.probe().await;
+    assert_eq!(code, 503);
+    assert_eq!(body.stalled_consumer_instances, vec![HEALTHY.to_owned()]);
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn readiness_fails_closed_when_indexer_lag_reaches_zero_confidence() {
+    let cell = caught_up_at_tip();
+    {
+        let mut metrics = cell.lock();
+        metrics.last_applied_block = 20_999_745;
+        metrics.last_scanned_block = 20_999_745;
+    }
+    let fixture = spawn(&[HEALTHY], |state| {
+        state.with_consumer_metrics(Arc::clone(&cell))
+    })
+    .await;
+
+    let (code, _) = fixture.probe().await;
+    assert_eq!(code, 200, "255 blocks of lag stays inside the horizon");
+    {
+        let mut metrics = cell.lock();
+        metrics.last_applied_block -= 1;
+        metrics.last_scanned_block -= 1;
+    }
+    let (code, body) = fixture.probe().await;
+
+    assert_eq!(code, 503, "confidence-zero lag must leave rotation");
+    assert_eq!(body.status, "not_ready");
+    assert_eq!(body.stalled_consumer_instances, vec![HEALTHY.to_owned()]);
+    fixture.shutdown().await;
+}
+
 /// A transient error self-heals; a contiguity gap does not.
 ///
 /// `consecutive_event_errors` is cleared by ANY applied event, which is correct for a single

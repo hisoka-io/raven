@@ -18,7 +18,6 @@ adapters/railgun/engine/src/imt.rs::insert_rejects_overflow_past_capacity
 adapters/railgun/persistence/benches/snapshot_codec_bench.rs::snapshot_codec_bench_bincode_vs_bitcode
 adapters/railgun/persistence/benches/snapshot_zstd_bench.rs::snapshot_zstd_bench_bincode_vs_zstd_l3
 adapters/railgun/persistence/benches/wal_replay_scaling_bench.rs::wal_replay_scales_linearly_at_1k_10k_100k
-crates/inspire/src/pir/mod_switch.rs::production_45bit_mod_switch_roundtrip
 crates/inspire/src/pir/respond.rs::test_respond_one_packing_correctness
 crates/inspire/src/pir/respond.rs::test_respond_one_packing_small_values
 crates/inspire/tests/e2e_pir.rs::test_e2e_variant_one_packing
@@ -49,6 +48,7 @@ crates/inspire/benches/ifma52_throughput_probe.rs::ifma52_madd_throughput_probe
 crates/inspire/benches/ifma52_throughput_probe.rs::scalar_mulx_throughput_probe
 crates/inspire/benches/packing_offline_simd_bench.rs::bench_prod_cell_131072x32
 crates/inspire/benches/packing_offline_simd_bench.rs::bench_prod_cell_65536x512
+crates/inspire/benches/packing_noise_measurement.rs::packing_noise_distribution
 crates/inspire/benches/respond_latency_bench.rs::respond_latency_baseline
 crates/inspire/benches/shoup_microbench.rs::microbench_shoup_pointwise_vs_montgomery
 crates/inspire/benches/shoup_microbench.rs::microbench_shoup_vs_montgomery_forward

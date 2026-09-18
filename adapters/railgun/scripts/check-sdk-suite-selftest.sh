@@ -225,13 +225,12 @@ if [[ "$suite_exit" -eq 0 ]]; then
   tail -n 5 -- "$schema_err" "$schema_json" >&2
   exit 1
 fi
-schema_report="$(json_line "$schema_json")" || {
-  echo "check-sdk-suite-selftest: schema mutation emitted no JSON report" >&2
-  exit 1
-}
 node -e '
 const fs = require("fs");
-const report = JSON.parse(process.argv[1]);
+const line = fs.readFileSync(process.argv[1], "utf8")
+  .split("\n").find((candidate) => candidate.trimStart().startsWith("{"));
+if (!line) { console.error("schema mutation emitted no JSON report"); process.exit(1); }
+const report = JSON.parse(line);
 const expected = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
 const fanoutTitle = process.argv[3];
 const wantedFailures = new Set([
@@ -252,7 +251,7 @@ if (failures.length !== 2 || report.numFailedTests !== 2 || failureTitles.size !
   console.error(`schema mutation mismatch: failures=${failures.map((test) => test.title).join(" | ")} fanout=${fanout[0]?.status} passed=${report.numPassedTests} skipped=${skipped} files=${files.length}`);
   process.exit(1);
 }
-' "$schema_report" "$work/tests/EXPECTED_COUNTS.json" "$fanout_title" || {
+' "$schema_json" "$work/tests/EXPECTED_COUNTS.json" "$fanout_title" || {
   tail -n 20 -- "$schema_err" "$schema_json" >&2
   exit 1
 }

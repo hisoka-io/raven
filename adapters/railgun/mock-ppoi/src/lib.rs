@@ -153,15 +153,18 @@ impl Corpus {
         })
     }
 
-    /// Return the events in `[start, end)` clamped to the corpus span.
+    /// Return the events in inclusive `[start, end]`, clamped to the corpus span.
     fn events_range(&self, start: u32, end: u32) -> &[SyntheticEvent] {
         let len = self.events.len();
         let start_us = usize::try_from(start).unwrap_or(usize::MAX).min(len);
-        let end_us = usize::try_from(end).unwrap_or(usize::MAX).min(len);
-        if end_us <= start_us {
+        let end_exclusive = usize::try_from(end)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1)
+            .min(len);
+        if end_exclusive <= start_us {
             return &[];
         }
-        self.events.get(start_us..end_us).unwrap_or(&[])
+        self.events.get(start_us..end_exclusive).unwrap_or(&[])
     }
 
     /// Status of one blinded commitment; `Missing` when absent.
@@ -250,6 +253,7 @@ impl AppState {
 /// Build the axum router serving the upstream PPOI surface.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
+        .route("/", post(handle_json_rpc))
         .route("/poi-events/:chain_type/:chain_id", post(handle_poi_events))
         .route(
             "/pois-per-blinded-commitment/:chain_type/:chain_id",
@@ -335,11 +339,7 @@ struct WirePoiSyncedListEvent {
     validated_merkleroot: String,
 }
 
-async fn handle_poi_events(
-    AxumPath((_chain_type, _chain_id)): AxumPath<(String, String)>,
-    State(state): State<AppState>,
-    Json(body): Json<PoiEventsRequestBody>,
-) -> impl IntoResponse {
+fn poi_events_result(state: &AppState, body: &PoiEventsRequestBody) -> Vec<WirePoiSyncedListEvent> {
     let corpus = state.inner.corpus.read().clone();
     let list_matches = body.list_key.eq_ignore_ascii_case(&corpus.list_key_hex)
         || body
@@ -352,10 +352,10 @@ async fn handle_poi_events(
             corpus_list = %corpus.list_key_hex,
             "poi-events list_key mismatch; returning empty event vector"
         );
-        return Json(Vec::<WirePoiSyncedListEvent>::new()).into_response();
+        return Vec::new();
     }
-    let events = corpus.events_range(body.start_index, body.end_index);
-    let wire: Vec<WirePoiSyncedListEvent> = events
+    corpus
+        .events_range(body.start_index, body.end_index)
         .iter()
         .map(|event| WirePoiSyncedListEvent {
             signed_event: WireSignedPoiEvent {
@@ -366,8 +366,15 @@ async fn handle_poi_events(
             },
             validated_merkleroot: hex_lower(&event.validated_merkleroot),
         })
-        .collect();
-    Json(wire).into_response()
+        .collect()
+}
+
+async fn handle_poi_events(
+    AxumPath((_chain_type, _chain_id)): AxumPath<(String, String)>,
+    State(state): State<AppState>,
+    Json(body): Json<PoiEventsRequestBody>,
+) -> impl IntoResponse {
+    Json(poi_events_result(&state, &body)).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -388,11 +395,10 @@ struct PoisPerBlindedCommitmentBody {
     blinded_commitment_datas: Vec<WireBlindedCommitmentData>,
 }
 
-async fn handle_pois_per_blinded_commitment(
-    AxumPath((_chain_type, _chain_id)): AxumPath<(String, String)>,
-    State(state): State<AppState>,
-    Json(body): Json<PoisPerBlindedCommitmentBody>,
-) -> impl IntoResponse {
+fn pois_per_blinded_commitment_result(
+    state: &AppState,
+    body: PoisPerBlindedCommitmentBody,
+) -> BTreeMap<String, POIStatus> {
     let corpus = state.inner.corpus.read().clone();
     let list_matches = body.list_key.eq_ignore_ascii_case(&corpus.list_key_hex)
         || body
@@ -400,25 +406,117 @@ async fn handle_pois_per_blinded_commitment(
             .strip_prefix("0x")
             .is_some_and(|rest| rest.eq_ignore_ascii_case(&corpus.list_key_hex));
     if !list_matches {
-        let map: BTreeMap<String, POIStatus> = body
+        return body
             .blinded_commitment_datas
             .into_iter()
             .map(|bc_data| (bc_data.blinded_commitment, POIStatus::Missing))
             .collect();
-        return Json(map).into_response();
     }
-    let mut map: BTreeMap<String, POIStatus> = BTreeMap::new();
-    for bc_data in body.blinded_commitment_datas {
-        let bc_hex = bc_data
-            .blinded_commitment
-            .strip_prefix("0x")
-            .unwrap_or(&bc_data.blinded_commitment)
-            .to_owned();
-        let status =
-            decode_hex32(&bc_hex).map_or(POIStatus::Missing, |bytes| corpus.status_for(&bytes));
-        map.insert(bc_data.blinded_commitment, status);
+    body.blinded_commitment_datas
+        .into_iter()
+        .map(|bc_data| {
+            let bc_hex = bc_data
+                .blinded_commitment
+                .strip_prefix("0x")
+                .unwrap_or(&bc_data.blinded_commitment)
+                .to_owned();
+            let status =
+                decode_hex32(&bc_hex).map_or(POIStatus::Missing, |bytes| corpus.status_for(&bytes));
+            (bc_data.blinded_commitment, status)
+        })
+        .collect()
+}
+
+async fn handle_pois_per_blinded_commitment(
+    AxumPath((_chain_type, _chain_id)): AxumPath<(String, String)>,
+    State(state): State<AppState>,
+    Json(body): Json<PoisPerBlindedCommitmentBody>,
+) -> impl IntoResponse {
+    Json(pois_per_blinded_commitment_result(&state, body)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcRequest {
+    jsonrpc: String,
+    method: String,
+    params: serde_json::Value,
+    id: serde_json::Value,
+}
+
+async fn handle_json_rpc(
+    State(state): State<AppState>,
+    Json(request): Json<JsonRpcRequest>,
+) -> impl IntoResponse {
+    let chain_matches = request
+        .params
+        .get("chainType")
+        .and_then(serde_json::Value::as_str)
+        == Some("0")
+        && request
+            .params
+            .get("chainID")
+            .and_then(serde_json::Value::as_str)
+            == Some("1");
+    let range_matches = request.method != "ppoi_poi_events"
+        || request
+            .params
+            .get("endIndex")
+            .and_then(serde_json::Value::as_u64)
+            .zip(
+                request
+                    .params
+                    .get("startIndex")
+                    .and_then(serde_json::Value::as_u64),
+            )
+            .is_some_and(|(end, start)| end >= start && end - start <= 500);
+    if request.jsonrpc != "2.0" || !chain_matches || !range_matches {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request.id,
+                "error": {"code": -32602, "message": "Invalid params"},
+            })),
+        )
+            .into_response();
     }
-    Json(map).into_response()
+    let result = match request.method.as_str() {
+        "ppoi_poi_events" => serde_json::from_value::<PoiEventsRequestBody>(request.params)
+            .and_then(|params| serde_json::to_value(poi_events_result(&state, &params))),
+        "ppoi_pois_per_blinded_commitment" => {
+            serde_json::from_value::<PoisPerBlindedCommitmentBody>(request.params).and_then(
+                |params| serde_json::to_value(pois_per_blinded_commitment_result(&state, params)),
+            )
+        }
+        _ => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request.id,
+                    "error": {"code": -32601, "message": "Method not found"},
+                })),
+            )
+                .into_response();
+        }
+    };
+    match result {
+        Ok(result) => Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "result": result,
+        }))
+        .into_response(),
+        Err(error) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request.id,
+                "error": {"code": -32602, "message": error.to_string()},
+            })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug, Serialize)]

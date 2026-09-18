@@ -308,8 +308,8 @@ fn tamper_refusal_is_total_over_the_byte_range() {
     let pristine = std::fs::read(&tarball).expect("read pristine tarball");
     let len = pristine.len();
     assert!(
-        len > 64,
-        "tarball ({len} bytes) too small to tamper past the header"
+        len > 222,
+        "tarball ({len} bytes) too small to reach the stored kind field"
     );
 
     let mut runner = TestRunner::new(PropConfig {
@@ -324,6 +324,7 @@ fn tamper_refusal_is_total_over_the_byte_range() {
             |(offset, mask)| {
                 let i = case_no.get();
                 case_no.set(i + 1);
+                let (offset, mask) = if i == 0 { (222, 1) } else { (offset, mask) };
 
                 let mut bytes = pristine.clone();
                 bytes[offset] ^= mask;
@@ -349,11 +350,17 @@ fn tamper_refusal_is_total_over_the_byte_range() {
                         "flip at offset {offset} mask {mask:#04x}: untyped error {err:?}"
                     )));
                 };
+                if i == 0 && !matches!(typed, SnapshotPortError::KindMismatch { .. }) {
+                    return Err(TestCaseError::fail(format!(
+                        "stored kind-field flip must be a typed KindMismatch, got {typed:?}"
+                    )));
+                }
                 if !matches!(
                     typed,
                     SnapshotPortError::TarballParse { .. }
                         | SnapshotPortError::ChecksumMismatch { .. }
                         | SnapshotPortError::ContentHashMismatch
+                        | SnapshotPortError::KindMismatch { .. }
                 ) {
                     return Err(TestCaseError::fail(format!(
                         "flip at offset {offset} mask {mask:#04x}: wrong error class {typed:?}"

@@ -8,7 +8,13 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { RavenPOINodeInterface } from "../src/index";
 
-import { startMockServer, writeJson, type MockServer } from "./helpers/mock_server";
+import {
+  readJsonRpcRequest,
+  startMockServer,
+  writeJson,
+  writeJsonRpcResult,
+  type MockServer,
+} from "./helpers/mock_server";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX =
@@ -208,11 +214,15 @@ describe("legacy plaintext fallback paths", () => {
         return true;
       },
     );
-    // upstream /pois-per-list/<chainType>/<chainID> (private-proof-of-innocence node api.ts)
     server.route(
-      (req) => req.url === "/pois-per-list/0/1",
-      (_req, _body, res) => {
-        writeJson(res, { [BC_VALID]: { [LIST_KEY_HEX]: "Valid" } });
+      (req) => req.url === "/",
+      (_req, body, res) => {
+        const request = writeJsonRpcResult(
+          body,
+          res,
+          { [BC_VALID]: { [LIST_KEY_HEX]: "Valid" } },
+        );
+        expect(request.method).toBe("ppoi_pois_per_list");
         return true;
       },
     );
@@ -240,8 +250,9 @@ describe("legacy plaintext fallback paths", () => {
       },
     );
     server.route(
-      (req) => req.url === "/pois-per-list/0/1",
-      (_req, _body, _res) => {
+      (req) => req.url === "/",
+      (_req, body, _res) => {
+        expect(readJsonRpcRequest(body).method).toBe("ppoi_pois_per_list");
         throw new Error("upstream passthrough unexpectedly invoked");
       },
     );
@@ -269,11 +280,10 @@ describe("legacy plaintext fallback paths", () => {
         return true;
       },
     );
-    // upstream /merkle-proofs/<chainType>/<chainID> (private-proof-of-innocence node api.ts)
     server.route(
-      (req) => req.url === "/merkle-proofs/0/1",
-      (_req, _body, res) => {
-        writeJson(res, [
+      (req) => req.url === "/",
+      (_req, body, res) => {
+        const request = writeJsonRpcResult(body, res, [
           {
             leaf: BC_VALID,
             elements: Array.from({ length: 16 }, () => "00".repeat(32)),
@@ -281,6 +291,7 @@ describe("legacy plaintext fallback paths", () => {
             root: "ff".repeat(32),
           },
         ]);
+        expect(request.method).toBe("ppoi_merkle_proofs");
         return true;
       },
     );

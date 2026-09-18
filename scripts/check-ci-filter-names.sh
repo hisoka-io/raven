@@ -52,18 +52,80 @@ while IFS= read -r name; do
   fi
 done < <(/usr/bin/grep -oE 'binary\([A-Za-z_0-9]+\)' "$CI" | sed -E 's/binary\((.*)\)/\1/' | sort -u)
 
-# Every workspace member must appear in the fmt list and in a test shard - both are enumerated
-# by hand with -p, and a new member is silently uncovered. That already happened once.
+# Every workspace member must appear in the fmt run block and in a test shard - both are
+# enumerated by hand with -p, and a new member is silently uncovered. That already happened once.
 members=$(python3 - <<'PY'
 import re, pathlib
 m = re.search(r'members = \[(.*?)\]', pathlib.Path('adapters/railgun/Cargo.toml').read_text(), re.S)
 print('\n'.join('raven-railgun-' + x.strip().strip('"') for x in m.group(1).split(',') if x.strip()))
 PY
 )
+
+fmt_run=$(awk '
+  $0 == "  railgun-static:" { in_job = 1; next }
+  in_job && /^  [A-Za-z0-9_-]+:$/ { exit }
+  in_job && $0 == "      - name: cargo fmt" { in_step = 1; next }
+  in_step && /^      - / { exit }
+  in_step && /^        run:/ {
+    in_run = 1
+    sub(/^        run:[[:space:]]*/, "")
+    if ($0 != "|") print
+    next
+  }
+  in_run {
+    if ($0 != "" && $0 !~ /^          /) exit
+    print
+  }
+' "$CI")
+
+test_packages=$(awk '
+  $0 == "  railgun-tests:" { in_job = 1; next }
+  in_job && /^  [A-Za-z0-9_-]+:$/ { exit }
+  in_job && /^            packages:/ {
+    in_packages = 1
+    line = $0
+    sub(/^            packages:[[:space:]]*/, "", line)
+    print line
+    next
+  }
+  in_packages {
+    if ($0 != "" && $0 !~ /^              /) in_packages = 0
+    if (in_packages) print
+  }
+' "$CI")
+
+test_run=$(awk '
+  $0 == "  railgun-tests:" { in_job = 1; next }
+  in_job && /^  [A-Za-z0-9_-]+:$/ { exit }
+  in_job && /^        run:/ {
+    in_run = 1
+    line = $0
+    sub(/^        run:[[:space:]]*/, "", line)
+    if (line != "|") print line
+    next
+  }
+  in_run {
+    if ($0 != "" && $0 !~ /^          /) in_run = 0
+    if (in_run) print
+  }
+' "$CI")
+
+if [ -z "$fmt_run" ]; then
+  echo "CI COVERAGE LEAK: railgun-static has no cargo fmt run block in ${CI}." >&2
+  fail=1
+fi
+if [ -z "$test_packages" ] || ! /usr/bin/grep -Fq '${{ matrix.shard.packages }}' <<< "$test_run"; then
+  echo "CI COVERAGE LEAK: railgun-tests does not execute its package shards in ${CI}." >&2
+  fail=1
+fi
+
 for pkg in $members; do
-  if ! /usr/bin/grep -q -- "-p ${pkg}" "$CI"; then
-    echo "CI COVERAGE LEAK: workspace member ${pkg} is named by no -p flag in ${CI}." >&2
-    echo "  The fmt step and the test shards both enumerate packages by hand." >&2
+  if ! /usr/bin/grep -Fq -- "-p ${pkg}" <<< "$fmt_run"; then
+    echo "CI COVERAGE LEAK: workspace member ${pkg} is absent from the railgun-static fmt run block." >&2
+    fail=1
+  fi
+  if ! /usr/bin/grep -Fq -- "-p ${pkg}" <<< "$test_packages"; then
+    echo "CI COVERAGE LEAK: workspace member ${pkg} is absent from the railgun-tests package shards." >&2
     fail=1
   fi
 done

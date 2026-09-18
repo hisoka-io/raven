@@ -26,14 +26,15 @@ fn params() -> InspireParams {
         p: 65_537,
         sigma: 6.4,
         gadget_base: 1 << 20,
-        gadget_len: 3,
+        query_gadget_len: 3,
+        packing_gadget_len: 3,
         security_level: SecurityLevel::Bits128,
     }
 }
 
 fn session_fixture() -> (raven_client::ClientSessionHandle, ShardConfig) {
     let params = params();
-    let database = vec![7u8; params.ring_dim * ENTRY_BYTES];
+    let database = vec![7u8; 2 * params.ring_dim * ENTRY_BYTES];
     let mut sampler = GaussianSampler::with_seed(params.sigma, 19);
     let (crs, encoded, _secret_key) =
         setup(&params, &database, ENTRY_BYTES, &mut sampler).expect("setup");
@@ -51,7 +52,7 @@ fn wasm_exports_upload_versioned_keys_then_install_the_returned_handle() {
     let (mut session, shard_config) = session_fixture();
 
     let registration = client_packing_keys_versioned(&session).expect("registration body");
-    assert_eq!(registration.get(..2), Some([0, 3].as_slice()));
+    assert_eq!(registration.get(..2), Some([0, 6].as_slice()));
     let keys: ClientPackingKeys =
         bincode::deserialize(registration.get(2..).expect("versioned body")).expect("packing keys");
     assert!(
@@ -112,7 +113,7 @@ fn wasm_padded_batch_is_ready_to_post_and_keeps_caller_order_metadata() {
     let encoded = build_padded_batch(&session, &shard_bincode, &targets_bincode, 1_000_000)
         .expect("padded batch");
     let output: WasmPaddedBatchOutput = bincode::deserialize(&encoded).expect("decode output");
-    assert_eq!(output.query_batch_bytes.get(..2), Some([0, 3].as_slice()));
+    assert_eq!(output.query_batch_bytes.get(..2), Some([0, 6].as_slice()));
     let queries: Vec<SeededClientQuery> = bincode::deserialize(
         output
             .query_batch_bytes

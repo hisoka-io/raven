@@ -1,0 +1,5 @@
+jobs:
+  wasm:
+    steps:
+      - run: |
+          wasm-pack test --node crates/client --test exact_target_longer

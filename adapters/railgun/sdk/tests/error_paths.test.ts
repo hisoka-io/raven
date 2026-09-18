@@ -10,7 +10,12 @@ import { RavenPOINodeInterface, RavenError, decodeClientPirQueryBundle } from ".
 import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
 import type { ClientPirContext, RavenInspireWasm } from "../src/index";
 
-import { startMockServer, writeBinary, type MockServer } from "./helpers/mock_server";
+import {
+  readJsonRpcRequest,
+  startMockServer,
+  writeBinary,
+  type MockServer,
+} from "./helpers/mock_server";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX = "abababababababababababababababababababababababababababababababab";
@@ -164,7 +169,7 @@ describe("error-path + truncated-response handling", () => {
       (_req, _body, res) => {
         writeBinary(res, new Uint8Array(0), {
           "x-raven-epoch": "1",
-          "x-raven-schema-version": "3",
+          "x-raven-schema-version": "6",
         });
         return true;
       },
@@ -270,10 +275,15 @@ describe("error-path + truncated-response handling", () => {
 
   it("upstream submitPOI propagates 4xx errors typed", async () => {
     server.route(
-      (req) => req.url === "/submit-transact-proof/0/1",
-      (_req, _body, res) => {
-        res.writeHead(401);
-        res.end();
+      (req) => req.url === "/",
+      (_req, body, res) => {
+        const request = readJsonRpcRequest(body);
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          id: request.id,
+          error: { code: -32603, message: "unauthorized" },
+        }));
         return true;
       },
     );
@@ -299,7 +309,7 @@ describe("error-path + truncated-response handling", () => {
         [],
         "",
       ),
-    ).rejects.toThrow(/401/);
+    ).rejects.toThrow(/-32603: unauthorized/);
   });
 
   it("fetchBcToIdxMap throws on non-200", async () => {

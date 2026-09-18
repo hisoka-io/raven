@@ -280,7 +280,9 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
 
     let app_state =
         AppState::new(engine, http_config).map_err(|e| anyhow::anyhow!("AppState::new: {e}"))?;
-    let app_state = app_state.with_consumer_metrics(Arc::clone(&handle.metrics));
+    let app_state = app_state
+        .require_consumer_metrics()
+        .with_consumer_metrics(Arc::clone(&handle.metrics));
     let mut k_map: std::collections::HashMap<raven_railgun_core::InstanceId, u32> =
         std::collections::HashMap::new();
     k_map.insert(handle.instance.id.clone(), resolved_k);

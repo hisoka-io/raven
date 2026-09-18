@@ -26,13 +26,18 @@ import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_sp
 
 import * as wasmPkg from "raven-inspire-client-wasm";
 
-import { startMockServer, writeJson, type MockServer } from "./helpers/mock_server";
+import {
+  startMockServer,
+  writeJson,
+  writeJsonRpcResult,
+  type MockServer,
+} from "./helpers/mock_server";
 import { encodeBatchResponse, encodeBatchResponseNodes } from "./helpers/auth_path_stub";
 import { authPathOf, encodedBatchCount } from "./helpers/auth_path_stub";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const MOCK_EPOCH = 1;
-const MOCK_SCHEMA_VERSION = 3;
+const MOCK_SCHEMA_VERSION = 6;
 const LIST_KEY_HEX = "abababababababababababababababababababababababababababababababab";
 // Non-zero in its leading bytes so a status row's BC tail cannot match by accident.
 const BC_HEX = "9f3c17aa04e1b28d6605c9713fe82b40d1a7c35e96280bf4517ade0c2b6d8391";
@@ -141,7 +146,7 @@ function mountEchoingBatchRoute(
       const slots = encodedBatchCount(body);
       const elemBytes = 32;
       const out = new Uint8Array(2 + 8 + slots * (8 + elemBytes));
-      out[1] = 3;
+      out[1] = 6;
       const dv = new DataView(out.buffer);
       dv.setUint32(2, slots, true);
       let off = 10;
@@ -375,7 +380,7 @@ describe("client-PIR auth-path reconstruction (T2/T3)", () => {
       expect(RavenError.is(e, "StaleAdapter")).toBe(true);
       if (RavenError.is(e, "StaleAdapter")) {
         expect(e.context.serverWireSchemaVersion).toBe(2);
-        expect(e.context.clientWireSchemaVersion).toBe(3);
+        expect(e.context.clientWireSchemaVersion).toBe(6);
       }
     }
   });
@@ -454,7 +459,7 @@ describe("client-side IMT cache hit / miss", () => {
   });
 
   it("a schema-version advance drops the cached levels", async () => {
-    let schemaVersion = 3;
+    let schemaVersion = 6;
     mountEchoingBatchRoute(server, undefined, () => ({
       epoch: MOCK_EPOCH,
       schemaVersion,
@@ -473,7 +478,7 @@ describe("client-side IMT cache hit / miss", () => {
     await sdk.getMerkleProof(0, 1234 ^ 0b111);
     expect(encodedBatchCount(sdk.lastWireRequests()[0].body)).toBe(4);
 
-    schemaVersion = 4;
+    schemaVersion = 7;
     await sdk.getMerkleProof(0, 1234 ^ 0b111);
     sdk.resetWireCapture();
     await sdk.getMerkleProof(0, 1234 ^ 0b111);
@@ -837,10 +842,15 @@ describe("freshness fallback to upstream PPOI", () => {
     );
     let upstreamHit = false;
     upstreamServer.route(
-      (req) => req.url === "/pois-per-list/0/1",
-      (_req, _body, res) => {
+      (req) => req.url === "/",
+      (_req, body, res) => {
         upstreamHit = true;
-        writeJson(res, { [BC_HEX]: { [LIST_KEY_HEX]: "Valid" } });
+        const request = writeJsonRpcResult(
+          body,
+          res,
+          { [BC_HEX]: { [LIST_KEY_HEX]: "Valid" } },
+        );
+        expect(request.method).toBe("ppoi_pois_per_list");
         return true;
       },
     );

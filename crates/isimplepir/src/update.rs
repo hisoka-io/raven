@@ -130,6 +130,25 @@ pub fn db_update_delete<R: RngCore>(
     db_update_modify(state, row, col, r)
 }
 
+fn validated_insert_params(
+    params: crate::params::LweParams,
+    added_rows: usize,
+) -> Result<crate::params::LweParams> {
+    let next_l =
+        params
+            .l
+            .checked_add(added_rows)
+            .ok_or_else(|| IsimplePirError::InvalidParams {
+                reason: "inserting rows would overflow L".to_owned(),
+            })?;
+    let next_params = crate::params::LweParams {
+        l: next_l,
+        ..params
+    };
+    next_params.validate()?;
+    Ok(next_params)
+}
+
 /// `DBUpdate` for an append-only insertion. `new_row` length `M`,
 /// values in `[0, p)`.
 pub fn db_update_insert(state: &mut ServerState, new_row: &[u32]) -> Result<InsertDelta> {
@@ -154,13 +173,12 @@ pub fn db_update_insert(state: &mut ServerState, new_row: &[u32]) -> Result<Inse
         }
     }
 
+    let next_params = validated_insert_params(params_snapshot, 1)?;
+
     let a_matrix = derive_a_matrix(&a_seed, &params_snapshot)?;
 
     state.db.extend_from_slice(new_row);
-    state.params = crate::params::LweParams {
-        l: state.params.l.saturating_add(1),
-        ..state.params
-    };
+    state.params = next_params;
 
     let mut w_prime = vec![0u32; n];
     for k in 0..m {
@@ -447,6 +465,9 @@ pub fn db_update_batch<R: RngCore>(
             }
         }
     }
+    if !op.insertions.is_empty() {
+        validated_insert_params(state.params, op.insertions.len())?;
+    }
 
     let total = op
         .modifications
@@ -595,6 +616,69 @@ mod tests {
             m: 4,
             bits_per_element: 4,
         }
+    }
+
+    #[test]
+    fn insert_refuses_eq2_boundary_without_mutating_state() {
+        let params = LweParams {
+            p: 6_600,
+            bits_per_element: 12,
+            ..toy_params()
+        };
+        params.validate().expect("four rows satisfy Eq. (2)");
+        let next_params = LweParams {
+            l: params.l + 1,
+            ..params
+        };
+        assert!(matches!(
+            next_params.validate(),
+            Err(IsimplePirError::InvalidParams { .. })
+        ));
+
+        let database = vec![0u32; params.l * params.m];
+        let mut state = setup(&database, params, Some([0u8; 32]))
+            .expect("valid four-row state")
+            .server;
+        let original_version = state.version;
+        let outcome = db_update_insert(&mut state, &vec![1u32; params.m]);
+        assert!(matches!(
+            outcome,
+            Err(IsimplePirError::InvalidParams { .. })
+        ));
+        assert_eq!(state.db, database);
+        assert_eq!(state.params, params);
+        assert_eq!(state.version, original_version);
+    }
+
+    #[test]
+    fn batch_insert_eq2_refusal_keeps_prior_edits_out_of_state() {
+        let params = LweParams {
+            p: 6_600,
+            bits_per_element: 12,
+            ..toy_params()
+        };
+        let database = vec![0u32; params.l * params.m];
+        let mut state = setup(&database, params, Some([0u8; 32]))
+            .expect("valid four-row state")
+            .server;
+        let original_version = state.version;
+        let inserted = vec![1u32; params.m];
+        let outcome = db_update_batch(
+            &mut state,
+            &DbBatchOp {
+                modifications: &[(0, 0, 7)],
+                deletions: &[],
+                insertions: &[inserted.as_slice()],
+            },
+            &mut ChaCha20Rng::from_seed([7u8; 32]),
+        );
+        assert!(matches!(
+            outcome,
+            Err(IsimplePirError::InvalidParams { .. })
+        ));
+        assert_eq!(state.db, database);
+        assert_eq!(state.params, params);
+        assert_eq!(state.version, original_version);
     }
 
     #[test]

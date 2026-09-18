@@ -282,7 +282,7 @@ describe("privacy across every SDK call path", () => {
     ).toThrow(/selected no POST query\/batch\/fanout requests/);
 
     const shortBatch = new Uint8Array(9);
-    shortBatch.set([0, 3]);
+    shortBatch.set([0, 6]);
     expect(() =>
       assertNoCommitmentsInPirRequests(
         [{ url: "/v1/instance/test/batch", method: "POST", body: shortBatch }],
@@ -297,10 +297,10 @@ describe("privacy across every SDK call path", () => {
         ["11".repeat(32)],
         { expectedQueryCount: 1 },
       ),
-    ).toThrow(/schema prefix.*expected \[0, 3\]/);
+    ).toThrow(/schema prefix.*expected \[0, 6\]/);
 
     const zeroCountBatch = new Uint8Array(10);
-    zeroCountBatch.set([0, 3]);
+    zeroCountBatch.set([0, 6]);
     expect(() =>
       assertNoCommitmentsInPirRequests(
         [{ url: "/v1/instance/test/batch", method: "POST", body: zeroCountBatch }],
@@ -310,7 +310,7 @@ describe("privacy across every SDK call path", () => {
     ).toThrow(/invalid batch query count 0/);
 
     const undersizedBatch = new Uint8Array(10 + 31);
-    undersizedBatch.set([0, 3]);
+    undersizedBatch.set([0, 6]);
     new DataView(undersizedBatch.buffer).setBigUint64(2, 1n, true);
     expect(() =>
       assertNoCommitmentsInPirRequests(
@@ -321,7 +321,7 @@ describe("privacy across every SDK call path", () => {
     ).toThrow(/query payload is 31 bytes/);
 
     const unevenBatch = new Uint8Array(10 + 65);
-    unevenBatch.set([0, 3]);
+    unevenBatch.set([0, 6]);
     new DataView(unevenBatch.buffer).setBigUint64(2, 2n, true);
     expect(() =>
       assertNoCommitmentsInPirRequests(

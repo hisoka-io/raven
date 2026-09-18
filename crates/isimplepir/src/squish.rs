@@ -564,7 +564,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "server")]
+    #[cfg(all(feature = "server", target_arch = "x86_64"))]
     fn build_packed_row_and_query(
         m_packed: usize,
         pad: usize,
@@ -592,13 +592,17 @@ mod tests {
         (packed_row, query, original_m, mask)
     }
 
+    #[cfg(all(feature = "server", target_arch = "x86_64"))]
     use rand_chacha::ChaCha20Rng;
+    #[cfg(all(feature = "server", target_arch = "x86_64"))]
     use rand_core::SeedableRng;
 
     /// 8-lane / 16-lane boundaries + realistic widths.
+    #[cfg(all(feature = "server", target_arch = "x86_64"))]
     const PACKED_TEST_M_PACKED: &[usize] = &[
         0, 1, 2, 5, 7, 8, 9, 15, 16, 17, 24, 25, 64, 1000, 1365, 1366, 7282, 15448,
     ];
+    #[cfg(all(feature = "server", target_arch = "x86_64"))]
     const PACKED_TEST_PADS: &[usize] = &[0, 1, 2];
 
     #[cfg(all(feature = "server", target_arch = "x86_64"))]

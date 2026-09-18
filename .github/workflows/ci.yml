@@ -652,15 +652,39 @@ jobs:
       - name: cargo test (parallel feature)
         # re-runs the byte-identity KAT under the rayon path so it cannot regress undetected
         run: cargo test --manifest-path crates/inspire/Cargo.toml --release --features parallel
-      - name: cargo test (mod-switch response contract)
+      - name: cargo test (mod-switch response and column-space contract)
         run: |
           test_name=tree_responder_round_trips_through_the_existing_rims_byte_two_decoder
+          refusal_name=every_seeded_responder_refuses_legacy_three_row_shape_before_expansion
           listed=$(cargo test --manifest-path crates/inspire/Cargo.toml --release \
             --features mod-switch-response --test response_mode_contract -- --list)
           /usr/bin/grep -Fxq "$test_name: test" <<< "$listed"
+          /usr/bin/grep -Fxq "$refusal_name: test" <<< "$listed"
           cargo test --manifest-path crates/inspire/Cargo.toml --release \
             --features mod-switch-response --test response_mode_contract \
             "$test_name" -- --exact
+          cargo test --manifest-path crates/inspire/Cargo.toml --release \
+            --features mod-switch-response --test response_mode_contract \
+            "$refusal_name" -- --exact
+          sweep_name=every_16bit_column_round_trips_through_both_extractors
+          sweep_list=$(cargo test --manifest-path crates/inspire/Cargo.toml --release \
+            --features mod-switch-response --test column_space_extraction -- --list)
+          /usr/bin/grep -Fxq "$sweep_name: test" <<< "$sweep_list"
+          if /usr/bin/grep -B2 "fn $sweep_name" crates/inspire/tests/column_space_extraction.rs \
+            | /usr/bin/grep -Fq '#[ignore'; then
+            echo "$sweep_name must remain unignored" >&2
+            exit 1
+          fi
+          cargo test --manifest-path crates/inspire/Cargo.toml --release \
+            --features mod-switch-response --test column_space_extraction \
+            "$sweep_name" -- --exact
+          mod_switch_list=$(cargo test --manifest-path crates/inspire/Cargo.toml --release \
+            --features mod-switch-response --lib -- --list)
+          mod_switch_count=$(/usr/bin/grep -c '^pir::mod_switch::tests::' <<< "$mod_switch_list")
+          test "$mod_switch_count" -ge 17
+          cargo test --manifest-path crates/inspire/Cargo.toml --release \
+            --features mod-switch-response --lib \
+            pir::mod_switch::tests
       - name: cargo test (simd-packing-offline feature)
         # Without this feature the packing dispatch under test IS the scalar reference, so the
         # differential compares a loop with itself. Nothing in CI built it until now, which is
@@ -771,8 +795,10 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@1.89
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: verify and build the exact 1.89 package set
+      - name: verify, build, and lint the exact 1.89 package set
         run: |
           set -euo pipefail
           IFS='|' read -r -a manifests <<< "$MSRV_MANIFESTS"
@@ -811,6 +837,23 @@ jobs:
             -p raven-railgun-persistence \
             -p raven-railgun-poseidon \
             -p raven-railgun-ppoi-mirror
+          for manifest in "${manifests[@]}"; do
+            echo "::group::cargo clippy --manifest-path $manifest"
+            case "$manifest" in
+              Cargo.toml)
+                cargo clippy --manifest-path "$manifest" --workspace --all-features --all-targets -- -D warnings ;;
+              adapters/howl/Cargo.toml)
+                cargo clippy --manifest-path "$manifest" --workspace --all-targets -- -D warnings ;;
+              benches/b1-bench/Cargo.toml)
+                cargo clippy --manifest-path "$manifest" --features inspire --all-targets -- -D warnings ;;
+              crates/inspire/Cargo.toml|crates/isimplepir/Cargo.toml)
+                cargo clippy --manifest-path "$manifest" --all-features --all-targets -- -D warnings ;;
+              *)
+                cargo clippy --manifest-path "$manifest" --all-targets -- -D warnings ;;
+            esac
+            echo "::endgroup::"
+          done
+          cargo clippy --manifest-path adapters/railgun/Cargo.toml --all-features --all-targets -p raven-railgun-core -p raven-railgun-persistence -p raven-railgun-poseidon -p raven-railgun-ppoi-mirror -- -D warnings
 
   msrv-1-91:
     name: MSRV 1.91 (Railgun and eth-state native graphs)
@@ -824,8 +867,10 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@1.91
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: verify and build the exact 1.91 package set
+      - name: verify, build, and lint the exact 1.91 package set
         run: |
           set -euo pipefail
           IFS='|' read -r -a manifests <<< "$MSRV_MANIFESTS"
@@ -849,6 +894,16 @@ jobs:
                 cargo check --manifest-path "$manifest" --workspace --all-features --all-targets ;;
               examples/eth-state/Cargo.toml)
                 cargo check --manifest-path "$manifest" --all-features --all-targets ;;
+            esac
+            echo "::endgroup::"
+          done
+          for manifest in "${manifests[@]}"; do
+            echo "::group::cargo clippy --manifest-path $manifest"
+            case "$manifest" in
+              adapters/railgun/Cargo.toml)
+                cargo clippy --manifest-path "$manifest" --workspace --all-features --all-targets -- -D warnings ;;
+              examples/eth-state/Cargo.toml)
+                cargo clippy --manifest-path "$manifest" --all-features --all-targets -- -D warnings ;;
             esac
             echo "::endgroup::"
           done

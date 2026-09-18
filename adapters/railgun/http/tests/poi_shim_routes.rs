@@ -348,6 +348,37 @@ async fn bc_to_idx_map_emits_entries_in_index_order_with_etag() {
     assert_eq!(resp2.status(), StatusCode::NOT_MODIFIED);
 }
 
+#[cfg(feature = "prefix-index-channel")]
+#[tokio::test]
+async fn six_byte_prefix_channel_is_binary_and_index_ordered() {
+    let (router, list_key) = build_router();
+    let lk_hex = hex_encode_bytes(&list_key);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/v1/poi/{lk_hex}/bc-prefixes"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("dispatch");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/octet-stream")
+    );
+    let body = body_bytes(response).await;
+    assert_eq!(
+        body.len(),
+        3 * raven_railgun_http::poi_shim::BC_INDEX_PREFIX_BYTES
+    );
+    assert_eq!(body.as_slice(), &[0u8; 18]);
+}
+
 #[tokio::test]
 async fn status_header_partitions_blocked_and_pending_bcs() {
     let (router, list_key) = build_router();

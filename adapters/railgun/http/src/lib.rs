@@ -74,6 +74,8 @@ use crate::batch::{batch_handler, inspire_batch_handler, inspire_query_handler, 
 use crate::events::{cf_connecting_ip_to_xff, events_handler};
 use crate::fanout::fanout_handler;
 use crate::status::{health_live_handler, health_ready_handler, metrics_handler, status_handler};
+
+pub(crate) const FRESHNESS_HORIZON_BLOCKS: u64 = 256;
 use crate::versioned::X_RAVEN_SCHEMA_VERSION_HEADER;
 
 pub(crate) const X_RAVEN_EPOCH: HeaderName = HeaderName::from_static("x-raven-epoch");
@@ -408,7 +410,9 @@ fn freshness_header_value(
     };
     #[allow(clippy::cast_precision_loss)]
     let lag_f = lag as f64;
-    let confidence = (1.0 - (lag_f / 256.0)).clamp(0.0, 1.0);
+    #[allow(clippy::cast_precision_loss)]
+    let horizon_f = FRESHNESS_HORIZON_BLOCKS as f64;
+    let confidence = (1.0 - (lag_f / horizon_f)).clamp(0.0, 1.0);
     format!("lag_blocks={lag} applied_height={applied} epoch={epoch} confidence={confidence:.3}")
 }
 

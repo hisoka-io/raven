@@ -11,7 +11,14 @@ import {
   foldMerkleRoot,
 } from "../src/index";
 import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
-import { startMockServer, writeBinary, writeJson, type MockServer } from "./helpers/mock_server";
+import {
+  startMockServer,
+  writeBinary,
+  writeJson,
+  writeJsonRpcResult,
+  type JsonRpcRequest,
+  type MockServer,
+} from "./helpers/mock_server";
 import { encodeBatchResponse, encodedBatchCount, stubCtx as pathStubCtx } from "./helpers/auth_path_stub";
 
 const TOKEN = "test-token-padded-long-enough-1234";
@@ -89,7 +96,7 @@ function mountNodeBatchRoute(server: MockServer): void {
     (_req, body, res) => {
       writeBinary(res, encodeBatchResponse(1, encodedBatchCount(body)), {
         "x-raven-epoch": "1",
-        "x-raven-schema-version": "3",
+        "x-raven-schema-version": "6",
       });
       return true;
     },
@@ -286,7 +293,7 @@ describe("wire parity: H3 — Error-class discrimination on T1 client-PIR", () =
   });
 });
 
-describe("wire parity: H17 — upstream passthrough URLs include chainType + chainID", () => {
+describe("wire parity: H17 — upstream JSON-RPC carries chainType + chainID", () => {
   let mainServer: MockServer;
   let upstreamServer: MockServer;
   beforeAll(async () => {
@@ -302,8 +309,7 @@ describe("wire parity: H17 — upstream passthrough URLs include chainType + cha
     upstreamServer.reset();
   });
 
-  it("getPOIMerkleProofs passthrough hits upstream `/merkle-proofs/<chainType>/<chainID>`", async () => {
-    // Stale freshness forces upstream fallback; segment is `merkle-proofs`, not `poi-merkle-proofs` (api.ts).
+  it("getPOIMerkleProofs passthrough calls ppoi_merkle_proofs", async () => {
     mainServer.route(
       (req) => req.url === "/v1/poi/merkle-proofs",
       (_req, _body, res) => {
@@ -314,12 +320,11 @@ describe("wire parity: H17 — upstream passthrough URLs include chainType + cha
         return true;
       },
     );
-    let upstreamUrl = "";
+    let observed: JsonRpcRequest | undefined;
     upstreamServer.route(
-      (req) => req.url?.startsWith("/merkle-proofs/") ?? false,
-      (req, _body, res) => {
-        upstreamUrl = req.url ?? "";
-        writeJson(res, [
+      (req) => req.url === "/",
+      (_req, body, res) => {
+        observed = writeJsonRpcResult(body, res, [
           {
             leaf: BC_HEX_A,
             elements: Array.from({ length: 16 }, () => "00".repeat(32)),
@@ -341,10 +346,12 @@ describe("wire parity: H17 — upstream passthrough URLs include chainType + cha
     });
     const got = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX_A]);
     expect(got).toHaveLength(1);
-    expect(upstreamUrl).toBe("/merkle-proofs/0/1");
+    expect(observed?.method).toBe("ppoi_merkle_proofs");
+    expect(observed?.params.chainType).toBe("0");
+    expect(observed?.params.chainID).toBe("1");
   });
 
-  it("getPOIsPerList passthrough hits upstream `/pois-per-list/<chainType>/<chainID>`", async () => {
+  it("getPOIsPerList passthrough calls ppoi_pois_per_list", async () => {
     mainServer.route(
       (req) => req.url === "/v1/poi/pois-per-list",
       (_req, _body, res) => {
@@ -355,12 +362,15 @@ describe("wire parity: H17 — upstream passthrough URLs include chainType + cha
         return true;
       },
     );
-    let upstreamUrl = "";
+    let observed: JsonRpcRequest | undefined;
     upstreamServer.route(
-      (req) => req.url?.startsWith("/pois-per-list/") ?? false,
-      (req, _body, res) => {
-        upstreamUrl = req.url ?? "";
-        writeJson(res, { [BC_HEX_A]: { [LIST_KEY_HEX]: "Valid" } });
+      (req) => req.url === "/",
+      (_req, body, res) => {
+        observed = writeJsonRpcResult(
+          body,
+          res,
+          { [BC_HEX_A]: { [LIST_KEY_HEX]: "Valid" } },
+        );
         return true;
       },
     );
@@ -377,19 +387,17 @@ describe("wire parity: H17 — upstream passthrough URLs include chainType + cha
       [LIST_KEY_HEX],
       [{ blindedCommitment: BC_HEX_A, type: "Shield" }],
     );
-    // Sepolia chain id must round-trip into the URL, not collapse to a default.
-    expect(upstreamUrl).toBe("/pois-per-list/0/11155111");
+    expect(observed?.method).toBe("ppoi_pois_per_list");
+    expect(observed?.params.chainType).toBe("0");
+    expect(observed?.params.chainID).toBe("11155111");
   });
 
-  it("validatePOIMerkleroots posts to `/validate-poi-merkleroots/<chainType>/<chainID>` with poiMerkleroots field", async () => {
-    let observed = "";
-    let observedBody: unknown = null;
+  it("validatePOIMerkleroots calls ppoi_validate_poi_merkleroots with poiMerkleroots", async () => {
+    let observed: JsonRpcRequest | undefined;
     upstreamServer.route(
-      (req) => req.url?.startsWith("/validate-poi-merkleroots/") ?? false,
-      (req, body, res) => {
-        observed = req.url ?? "";
-        observedBody = JSON.parse(new TextDecoder().decode(body));
-        writeJson(res, true);
+      (req) => req.url === "/",
+      (_req, body, res) => {
+        observed = writeJsonRpcResult(body, res, true);
         return true;
       },
     );
@@ -404,24 +412,20 @@ describe("wire parity: H17 — upstream passthrough URLs include chainType + cha
       "11".repeat(32),
     ]);
     expect(got).toBe(true);
-    expect(observed).toBe("/validate-poi-merkleroots/0/1");
-    const decoded = observedBody as Record<string, unknown>;
-    expect(decoded.poiMerkleroots).toEqual(["11".repeat(32)]);
-    expect(decoded.listKey).toBe(LIST_KEY_HEX);
-    expect(decoded.txidVersion).toBe("V2_PoseidonMerkle");
-    expect(decoded.chainType).toBe("0");
-    expect(decoded.chainID).toBe("1");
+    expect(observed?.method).toBe("ppoi_validate_poi_merkleroots");
+    expect(observed?.params.poiMerkleroots).toEqual(["11".repeat(32)]);
+    expect(observed?.params.listKey).toBe(LIST_KEY_HEX);
+    expect(observed?.params.txidVersion).toBe("V2_PoseidonMerkle");
+    expect(observed?.params.chainType).toBe("0");
+    expect(observed?.params.chainID).toBe("1");
   });
 
-  it("submitPOI uses upstream 9-arg signature + posts to `/submit-transact-proof/<chainType>/<chainID>`", async () => {
-    let observed = "";
-    let observedBody: { [k: string]: unknown } | null = null;
+  it("submitPOI uses upstream 9-arg signature with ppoi_submit_transact_proof", async () => {
+    let observed: JsonRpcRequest | undefined;
     upstreamServer.route(
-      (req) => req.url?.startsWith("/submit-transact-proof/") ?? false,
-      (req, body, res) => {
-        observed = req.url ?? "";
-        observedBody = JSON.parse(new TextDecoder().decode(body));
-        writeJson(res, {});
+      (req) => req.url === "/",
+      (_req, body, res) => {
+        observed = writeJsonRpcResult(body, res, null);
         return true;
       },
     );
@@ -449,10 +453,8 @@ describe("wire parity: H17 — upstream passthrough URLs include chainType + cha
       ["bb".repeat(32)],
       "cc".repeat(32),
     );
-    expect(observed).toBe("/submit-transact-proof/0/1");
-    expect(observedBody).not.toBeNull();
-    const body = observedBody as unknown as { [k: string]: unknown };
-    const transactProofData = body.transactProofData as Record<string, unknown>;
+    expect(observed?.method).toBe("ppoi_submit_transact_proof");
+    const transactProofData = observed?.params.transactProofData as Record<string, unknown>;
     expect(transactProofData.snarkProof).toEqual(fakeProof);
     expect(transactProofData.poiMerkleroots).toEqual(["aa".repeat(32)]);
     expect(transactProofData.txidMerkleroot).toBe("ff".repeat(32));

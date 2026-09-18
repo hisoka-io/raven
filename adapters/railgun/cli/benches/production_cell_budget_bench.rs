@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 #[path = "../tests/support/production_cell.rs"]
 mod support;
 
-use support::{ProductionCell, BEARER_TOKEN};
+use support::{ProductionCell, BEARER_TOKEN, CLIENT_ID};
 
 /// SLO gate: single-query and batch round-trip latency at the production cell.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -54,12 +54,14 @@ async fn production_cell_latency_budget_slo() {
     let response = client
         .post(cell.query_url())
         .bearer_auth(BEARER_TOKEN)
+        .header("x-raven-client-id", CLIENT_ID)
         .body(query_bytes)
         .send()
         .await
         .expect("POST query");
-    assert_eq!(response.status(), 200, "HTTP status");
-    let _ = response.bytes().await.expect("body bytes");
+    let status = response.status();
+    let body = response.bytes().await.expect("body bytes");
+    assert_eq!(status, 200, "HTTP status; body={}", String::from_utf8_lossy(&body));
     let single_total = single_start.elapsed();
     eprintln!("production_cell: single-query total = {single_total:?}");
 
@@ -73,6 +75,7 @@ async fn production_cell_latency_budget_slo() {
     let batch_response = client
         .post(cell.batch_url())
         .bearer_auth(BEARER_TOKEN)
+        .header("x-raven-client-id", CLIENT_ID)
         .body(batch_bytes)
         .send()
         .await

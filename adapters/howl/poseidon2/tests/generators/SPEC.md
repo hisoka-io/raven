@@ -71,6 +71,10 @@ without the permutation oracle K1 would have been a matter of transcribing const
 "the published test vector". My generated vector for inputs `(1, 2)` is byte-identical. So the oracle
 I am generating against is provably the one Howl ships against, not merely one with the same name.
 
+To regenerate directly against Aztec, install `@aztec/foundation@2.1.11` and point
+`AZTEC_FOUNDATION_ROOT` at that package's root before running either generator. The generators
+refuse missing, unreadable, wrong-version, or API-incompatible packages.
+
 ## 5. Deliberate non-decisions
 
 Rate boundaries are covered at 3, 4, 6 and 7 inputs specifically because the duplex fires on multiples

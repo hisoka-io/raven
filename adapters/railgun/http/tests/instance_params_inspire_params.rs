@@ -124,7 +124,11 @@ async fn instance_params_inspire_params_decodes_to_secure_128_d2048() {
         "sigma must round-trip exactly"
     );
     assert_eq!(recovered_params.gadget_base, expected.gadget_base);
-    assert_eq!(recovered_params.gadget_len, expected.gadget_len);
+    assert_eq!(recovered_params.query_gadget_len, expected.query_gadget_len);
+    assert_eq!(
+        recovered_params.packing_gadget_len,
+        expected.packing_gadget_len
+    );
 
     // The tuple the wallet hands to `build_client_session`.
     let _crs: ServerCrs =

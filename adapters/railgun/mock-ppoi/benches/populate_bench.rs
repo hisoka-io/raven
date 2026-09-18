@@ -60,7 +60,7 @@ async fn populate_from_zero_takes_under_30s_for_1k_events() {
         chain_type: "0".into(),
         chain_id: 1,
         poll_interval_secs: 1,
-        max_rows_per_fetch: corpus_size.into(),
+        max_rows_per_fetch: 501,
         txid_version: "V2_PoseidonMerkle".into(),
     };
     let mirror = Arc::new(UpstreamPpoiMirror::new(mirror_config).expect("mirror"));

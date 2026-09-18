@@ -65,7 +65,7 @@ describe("batch size ladder", () => {
         response.writeHead(200, {
           "content-type": "application/octet-stream",
           "x-raven-epoch": "1",
-          "x-raven-schema-version": "3",
+          "x-raven-schema-version": "6",
         });
         response.end(Buffer.from(encodeBatchResponse(1, encodedBatchCount(body))));
         return true;
@@ -88,17 +88,17 @@ describe("batch size ladder", () => {
 
       expect(queryBytes.length).toBe(capacityEvidence.serializedQueryBytes);
       expect(frameBytes).toBe(capacityEvidence.batchFrameBytes);
-      expect(queryBytes.length).toBe(49_445);
+      expect(queryBytes.length).toBe(15_491);
       expect(frameBytes).toBe(10);
-      expect(rawCapacity).toBe(169);
-      expect(frameBytes + rawCapacity * queryBytes.length).toBe(8_356_215);
-      expect(frameBytes + (rawCapacity + 1) * queryBytes.length).toBe(8_405_660);
+      expect(rawCapacity).toBe(541);
+      expect(frameBytes + rawCapacity * queryBytes.length).toBe(8_380_641);
+      expect(frameBytes + (rawCapacity + 1) * queryBytes.length).toBe(8_396_132);
       expect(frameBytes + rawCapacity * queryBytes.length).toBeLessThanOrEqual(bodyCapBytes);
       expect(frameBytes + (rawCapacity + 1) * queryBytes.length).toBeGreaterThan(bodyCapBytes);
-      expect(paddedBatchLength(65, rawCapacity)).toBe(128);
-      expect(isOnLadder(128, rawCapacity)).toBe(true);
+      expect(paddedBatchLength(257, rawCapacity)).toBe(512);
+      expect(isOnLadder(512, rawCapacity)).toBe(true);
       expect(isOnLadder(rawCapacity, rawCapacity)).toBe(false);
-      expect(() => paddedBatchLength(129, rawCapacity)).toThrow(/169.*128.*split/);
+      expect(() => paddedBatchLength(513, rawCapacity)).toThrow(/541.*512.*split/);
     } finally {
       await server.close();
     }

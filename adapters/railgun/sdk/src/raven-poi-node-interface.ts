@@ -120,6 +120,15 @@ export interface Proof {
   pi_c: [string, string];
 }
 
+/** Upstream legacy transact proof payload, carried verbatim. */
+export interface LegacyTransactProofData {
+  txidIndex: string;
+  npk: string;
+  value: string;
+  tokenHash: string;
+  blindedCommitment: string;
+}
+
 interface RavenConfigBase {
   endpoint: string;
   bearerToken: string;
@@ -157,7 +166,7 @@ export type PrivateStalePolicy =
 /** SDK constructor options; omitted private-stale policy fails closed. */
 export type RavenConfig = RavenConfigBase & PrivateStalePolicy;
 
-interface BlindedCommitmentData {
+export interface BlindedCommitmentData {
   blindedCommitment: string;
   type: BlindedCommitmentType;
 }
@@ -212,7 +221,7 @@ export interface CapturedWireRequest {
 const X_RAVEN_FRESHNESS = "x-raven-freshness";
 const X_RAVEN_EPOCH = "x-raven-epoch";
 const X_RAVEN_SCHEMA_VERSION = "x-raven-schema-version";
-const WIRE_SCHEMA_VERSION = 3;
+const WIRE_SCHEMA_VERSION = 6;
 const MAX_FANOUT_BODY_BYTES = 8 * 1024 * 1024;
 const DEFAULT_TXID_VERSION = "V2_PoseidonMerkle";
 const DEFAULT_CONFIDENCE_FLOOR = 0.5;
@@ -224,6 +233,13 @@ const PATH_RECORD_BYTES = TREE_DEPTH * NODE_HASH_BYTES;
 const UNOBSERVED_EPOCH = "";
 const AUTH_PATH_ATTEMPTS = 2;
 const SESSION_QUERY_ATTEMPTS = 2;
+
+type UpstreamJsonRpcMethod =
+  | "ppoi_pois_per_list"
+  | "ppoi_merkle_proofs"
+  | "ppoi_validate_poi_merkleroots"
+  | "ppoi_submit_transact_proof"
+  | "ppoi_submit_legacy_transact_proofs";
 
 export class RavenPOINodeInterface {
   private readonly chainId: number;
@@ -245,6 +261,7 @@ export class RavenPOINodeInterface {
   private readonly capturedRequests: CapturedWireRequest[] = [];
   private readonly sessionHandshakes = new Map<string, Promise<bigint>>();
   private readonly clientPirIds = new Map<string, string>();
+  private nextUpstreamRequestId = 1;
 
   constructor(config: RavenConfig) {
     this.chainId = config.chainId ?? DEFAULT_CHAIN_ID;
@@ -295,6 +312,27 @@ export class RavenPOINodeInterface {
           },
         ],
         this.fetchImpl,
+      );
+    }
+  }
+
+  isActive(chain: Chain): boolean {
+    return chain.type === this.chainType && this.registry.knownChainIds().includes(chain.id);
+  }
+
+  async isRequired(chain: Chain): Promise<boolean> {
+    return this.isActive(chain);
+  }
+
+  private requireConfiguredInvocation(txidVersion: string, chain: Chain, operation: string): void {
+    if (txidVersion !== this.txidVersion) {
+      throw RavenError.invalidQuery(
+        `${operation}: txidVersion ${txidVersion} does not match configured ${this.txidVersion}`,
+      );
+    }
+    if (!this.isActive(chain)) {
+      throw RavenError.invalidQuery(
+        `${operation}: chain ${chain.type}:${chain.id} is not active on this interface`,
       );
     }
   }
@@ -394,9 +432,36 @@ export class RavenPOINodeInterface {
   }
 
   async getPOIsPerList(
+    txidVersion: string,
+    chain: Chain,
     listKeys: string[],
     blindedCommitmentDatas: BlindedCommitmentData[],
+  ): Promise<PoisPerListResponse>;
+  async getPOIsPerList(
+    listKeys: string[],
+    blindedCommitmentDatas: BlindedCommitmentData[],
+  ): Promise<PoisPerListResponse>;
+  async getPOIsPerList(
+    txidVersionOrListKeys: string | string[],
+    chainOrCommitments: Chain | BlindedCommitmentData[],
+    upstreamListKeys?: string[],
+    upstreamCommitments?: BlindedCommitmentData[],
   ): Promise<PoisPerListResponse> {
+    const upstreamShape = typeof txidVersionOrListKeys === "string";
+    if (upstreamShape) {
+      this.requireConfiguredInvocation(
+        txidVersionOrListKeys,
+        chainOrCommitments as Chain,
+        "getPOIsPerList",
+      );
+    }
+    const listKeys = upstreamShape ? upstreamListKeys : txidVersionOrListKeys;
+    const blindedCommitmentDatas = upstreamShape
+      ? upstreamCommitments
+      : (chainOrCommitments as BlindedCommitmentData[]);
+    if (!listKeys || !blindedCommitmentDatas) {
+      throw RavenError.invalidQuery("getPOIsPerList: missing list keys or commitments");
+    }
     for (const lk of listKeys) {
       validateListKeyHex(lk);
     }
@@ -423,9 +488,36 @@ export class RavenPOINodeInterface {
   }
 
   async getPOIMerkleProofs(
+    txidVersion: string,
+    chain: Chain,
     listKey: string,
     blindedCommitments: string[],
+  ): Promise<MerkleProof[]>;
+  async getPOIMerkleProofs(
+    listKey: string,
+    blindedCommitments: string[],
+  ): Promise<MerkleProof[]>;
+  async getPOIMerkleProofs(
+    txidVersionOrListKey: string,
+    chainOrCommitments: Chain | string[],
+    upstreamListKey?: string,
+    upstreamCommitments?: string[],
   ): Promise<MerkleProof[]> {
+    const upstreamShape = !Array.isArray(chainOrCommitments);
+    if (upstreamShape) {
+      this.requireConfiguredInvocation(
+        txidVersionOrListKey,
+        chainOrCommitments,
+        "getPOIMerkleProofs",
+      );
+    }
+    const listKey = upstreamShape ? upstreamListKey : txidVersionOrListKey;
+    const blindedCommitments = upstreamShape
+      ? upstreamCommitments
+      : chainOrCommitments;
+    if (!listKey || !blindedCommitments) {
+      throw RavenError.invalidQuery("getPOIMerkleProofs: missing list key or commitments");
+    }
     validateListKeyHex(listKey);
     for (const bc of blindedCommitments) {
       validateBcHex(bc);
@@ -465,44 +557,47 @@ export class RavenPOINodeInterface {
   // body field `poiMerkleroots` matches upstream `ValidatePOIMerklerootsParams` (api.ts:786).
   /** Mirrors upstream `POINodeInterface.validatePOIMerkleroots`. */
   async validatePOIMerkleroots(
+    txidVersion: string,
+    chain: Chain,
     listKey: string,
     poiMerkleroots: string[],
+  ): Promise<boolean>;
+  async validatePOIMerkleroots(listKey: string, poiMerkleroots: string[]): Promise<boolean>;
+  async validatePOIMerkleroots(
+    txidVersionOrListKey: string,
+    chainOrRoots: Chain | string[],
+    upstreamListKey?: string,
+    upstreamRoots?: string[],
   ): Promise<boolean> {
+    const upstreamShape = !Array.isArray(chainOrRoots);
+    if (upstreamShape) {
+      this.requireConfiguredInvocation(
+        txidVersionOrListKey,
+        chainOrRoots,
+        "validatePOIMerkleroots",
+      );
+    }
+    const listKey = upstreamShape ? upstreamListKey : txidVersionOrListKey;
+    const poiMerkleroots = upstreamShape ? upstreamRoots : chainOrRoots;
+    if (!listKey || !poiMerkleroots) {
+      throw RavenError.invalidQuery("validatePOIMerkleroots: missing list key or roots");
+    }
     if (!this.upstream) {
       throw RavenError.invalidQuery(
         "validatePOIMerkleroots requires upstreamFallbackEndpoint",
       );
     }
-    const body = JSON.stringify({
+    const verdict = await this.upstreamJsonRpc<unknown>("ppoi_validate_poi_merkleroots", {
       chainType: String(this.chainType),
       chainID: String(this.chainId),
       txidVersion: this.txidVersion,
       listKey,
       poiMerkleroots,
     });
-    const url = `${this.upstream}/validate-poi-merkleroots/${this.chainType}/${this.chainId}`;
-    this.captureRequest(url, "POST", new TextEncoder().encode(body));
-    let res: Response;
-    try {
-      res = await this.fetchImpl(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body,
-      });
-    } catch (cause) {
-      throw RavenError.network("validatePOIMerkleroots", { url, cause: String(cause) });
-    }
-    if (!res.ok) {
-      throw RavenError.serverError(`upstream validate-poi-merkleroots: ${res.status}`, {
-        url,
-        status: res.status,
-      });
-    }
-    const verdict: unknown = await res.json();
     if (typeof verdict !== "boolean") {
       throw RavenError.decodeError(
         `validatePOIMerkleroots: upstream response must be a boolean verdict, got ${typeof verdict}`,
-        { url },
+        { url: this.upstream },
       );
     }
     return verdict;
@@ -524,7 +619,7 @@ export class RavenPOINodeInterface {
     if (!this.upstream) {
       throw RavenError.invalidQuery("submitPOI requires upstreamFallbackEndpoint");
     }
-    const body = JSON.stringify({
+    await this.upstreamJsonRpc<unknown>("ppoi_submit_transact_proof", {
       chainType: String(chain.type),
       chainID: String(chain.id),
       txidVersion,
@@ -538,60 +633,53 @@ export class RavenPOINodeInterface {
         railgunTxidIfHasUnshield,
       },
     });
-    const url = `${this.upstream}/submit-transact-proof/${chain.type}/${chain.id}`;
-    this.captureRequest(url, "POST", new TextEncoder().encode(body));
-    let res: Response;
-    try {
-      res = await this.fetchImpl(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body,
-      });
-    } catch (cause) {
-      throw RavenError.network("submitPOI", { url, cause: String(cause) });
-    }
-    if (!res.ok) {
-      throw RavenError.serverError(`upstream submit-transact-proof: ${res.status}`, {
-        url,
-        status: res.status,
-      });
-    }
   }
 
   // `POINodeInterface.submitLegacyTransactProofs` (engine/src/poi/poi-node-interface.ts:49-54);
   /** Mirrors upstream `POINodeInterface.submitLegacyTransactProofs`. */
   async submitLegacyTransactProofs(
+    txidVersion: string,
+    chain: Chain,
     listKeys: string[],
-    legacyTransactProofDatas: unknown[],
+    legacyTransactProofDatas: LegacyTransactProofData[],
+  ): Promise<void>;
+  async submitLegacyTransactProofs(
+    listKeys: string[],
+    legacyTransactProofDatas: LegacyTransactProofData[],
+  ): Promise<void>;
+  async submitLegacyTransactProofs(
+    txidVersionOrListKeys: string | string[],
+    chainOrProofs: Chain | LegacyTransactProofData[],
+    upstreamListKeys?: string[],
+    upstreamProofs?: LegacyTransactProofData[],
   ): Promise<void> {
+    const upstreamShape = typeof txidVersionOrListKeys === "string";
+    if (upstreamShape) {
+      this.requireConfiguredInvocation(
+        txidVersionOrListKeys,
+        chainOrProofs as Chain,
+        "submitLegacyTransactProofs",
+      );
+    }
+    const listKeys = upstreamShape ? upstreamListKeys : txidVersionOrListKeys;
+    const legacyTransactProofDatas = upstreamShape
+      ? upstreamProofs
+      : (chainOrProofs as LegacyTransactProofData[]);
+    if (!listKeys || !legacyTransactProofDatas) {
+      throw RavenError.invalidQuery(
+        "submitLegacyTransactProofs: missing list keys or legacy proof data",
+      );
+    }
     if (!this.upstream) {
       throw RavenError.invalidQuery("submitLegacyTransactProofs requires upstreamFallbackEndpoint");
     }
-    const body = JSON.stringify({
+    await this.upstreamJsonRpc<unknown>("ppoi_submit_legacy_transact_proofs", {
       chainType: String(this.chainType),
       chainID: String(this.chainId),
       txidVersion: this.txidVersion,
       listKeys,
       legacyTransactProofDatas,
     });
-    const url = `${this.upstream}/submit-legacy-transact-proofs/${this.chainType}/${this.chainId}`;
-    this.captureRequest(url, "POST", new TextEncoder().encode(body));
-    let res: Response;
-    try {
-      res = await this.fetchImpl(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body,
-      });
-    } catch (cause) {
-      throw RavenError.network("submitLegacyTransactProofs", { url, cause: String(cause) });
-    }
-    if (!res.ok) {
-      throw RavenError.serverError(`upstream submit-legacy-transact-proofs: ${res.status}`, {
-        url,
-        status: res.status,
-      });
-    }
   }
 
   async fetchBcToIdxMap(listKey: string): Promise<{ epoch: number; entries: { bc: string; idx: number }[] }> {
@@ -1282,33 +1370,13 @@ export class RavenPOINodeInterface {
     if (!this.upstream) {
       throw RavenError.invalidQuery("upstream fallback not configured");
     }
-    const body = JSON.stringify({
+    return this.upstreamJsonRpc<PoisPerListResponse>("ppoi_pois_per_list", {
       chainType: String(this.chainType),
       chainID: String(this.chainId),
       txidVersion: this.txidVersion,
       listKeys,
       blindedCommitmentDatas,
     });
-    // Upstream path pois-per-list/:chainType/:chainID (api.ts:713).
-    const url = `${this.upstream}/pois-per-list/${this.chainType}/${this.chainId}`;
-    this.captureRequest(url, "POST", new TextEncoder().encode(body));
-    let res: Response;
-    try {
-      res = await this.fetchImpl(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body,
-      });
-    } catch (cause) {
-      throw RavenError.network("upstream pois-per-list", { url, cause: String(cause) });
-    }
-    if (!res.ok) {
-      throw RavenError.serverError(`upstream pois-per-list: ${res.status}`, {
-        url,
-        status: res.status,
-      });
-    }
-    return (await res.json()) as PoisPerListResponse;
   }
 
   private async passthroughMerkleProofs(
@@ -1318,34 +1386,97 @@ export class RavenPOINodeInterface {
     if (!this.upstream) {
       throw RavenError.invalidQuery("upstream fallback not configured");
     }
-    const body = JSON.stringify({
+    return this.upstreamJsonRpc<MerkleProof[]>("ppoi_merkle_proofs", {
       chainType: String(this.chainType),
       chainID: String(this.chainId),
       txidVersion: this.txidVersion,
       listKey,
       blindedCommitments,
     });
-    // Upstream segment is `merkle-proofs`, not `poi-merkle-proofs`.
-    // Upstream segment is `merkle-proofs`, not `poi-merkle-proofs` (api.ts:739).
-    const url = `${this.upstream}/merkle-proofs/${this.chainType}/${this.chainId}`;
+  }
+
+  private async upstreamJsonRpc<T>(
+    method: UpstreamJsonRpcMethod,
+    params: Readonly<Record<string, unknown>>,
+  ): Promise<T> {
+    if (!this.upstream) {
+      throw RavenError.invalidQuery("upstream fallback not configured");
+    }
+    const id = this.nextUpstreamRequestId;
+    this.nextUpstreamRequestId = id === Number.MAX_SAFE_INTEGER ? 1 : id + 1;
+    const body = JSON.stringify({ jsonrpc: "2.0", method, params, id });
+    const url = this.upstream;
     this.captureRequest(url, "POST", new TextEncoder().encode(body));
-    let res: Response;
+
+    let response: Response;
     try {
-      res = await this.fetchImpl(url, {
+      response = await this.fetchImpl(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body,
       });
     } catch (cause) {
-      throw RavenError.network("upstream poi-merkle-proofs", { url, cause: String(cause) });
+      throw RavenError.network(`upstream ${method}`, { url, cause: String(cause) });
     }
-    if (!res.ok) {
-      throw RavenError.serverError(`upstream poi-merkle-proofs: ${res.status}`, {
+
+    let decoded: unknown;
+    try {
+      decoded = await response.json();
+    } catch (cause) {
+      throw RavenError.decodeError(`upstream ${method}: response is not valid JSON`, {
         url,
-        status: res.status,
+        status: response.status,
+        cause: String(cause),
       });
     }
-    return (await res.json()) as MerkleProof[];
+    if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) {
+      throw RavenError.decodeError(`upstream ${method}: JSON-RPC response is not an object`, {
+        url,
+        status: response.status,
+      });
+    }
+    const envelope = decoded as Record<string, unknown>;
+    if (envelope.jsonrpc !== "2.0" || envelope.id !== id) {
+      throw RavenError.decodeError(
+        `upstream ${method}: JSON-RPC envelope mismatch: version ${String(envelope.jsonrpc)}, id ${String(envelope.id)}, expected 2.0/${id}`,
+        { url, status: response.status },
+      );
+    }
+    const hasResult = Object.prototype.hasOwnProperty.call(envelope, "result");
+    const hasError = Object.prototype.hasOwnProperty.call(envelope, "error");
+    if (hasResult === hasError) {
+      throw RavenError.decodeError(
+        `upstream ${method}: JSON-RPC response must contain exactly one of result or error`,
+        { url, status: response.status },
+      );
+    }
+    if (hasError) {
+      const error = envelope.error;
+      if (typeof error !== "object" || error === null || Array.isArray(error)) {
+        throw RavenError.decodeError(`upstream ${method}: JSON-RPC error is not an object`, {
+          url,
+          status: response.status,
+        });
+      }
+      const rpcError = error as Record<string, unknown>;
+      if (!Number.isInteger(rpcError.code) || typeof rpcError.message !== "string") {
+        throw RavenError.decodeError(
+          `upstream ${method}: JSON-RPC error requires an integer code and string message`,
+          { url, status: response.status },
+        );
+      }
+      throw RavenError.serverError(
+        `upstream ${method} JSON-RPC error ${String(rpcError.code)}: ${rpcError.message}`,
+        { url, status: response.status },
+      );
+    }
+    if (!response.ok) {
+      throw RavenError.serverError(`upstream ${method}: HTTP ${response.status}`, {
+        url,
+        status: response.status,
+      });
+    }
+    return envelope.result as T;
   }
 
   private captureRequest(url: string, method: string, body: Uint8Array): void {

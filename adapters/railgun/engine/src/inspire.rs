@@ -5,7 +5,7 @@ use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, InspireVariant, ShardConfig};
 use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::{
-    extract_two_packing, respond_inspiring_cached_with_session, setup as inspire_setup,
+    extract_two_packing, respond_seeded_inspiring_cached_with_session, setup as inspire_setup,
     ClientSession, ClientState, EncodedDatabase, SeededClientQuery, ServerCrs,
     ServerInspiringCache, ServerResponse,
 };
@@ -71,15 +71,12 @@ impl PirScheme for RavenInspireScheme {
         let (store, inner) = state
             .session_store
             .resolve(query.session_handle, Instant::now())?;
-        // Expand here rather than through the seeded wrapper, which expands identically one line
-        // later. Doing it here is what lets the inner handle be substituted for the external one
-        // the client holds, at no extra cost.
-        let mut expanded = query.expand();
-        expanded.session_handle = inner;
-        respond_inspiring_cached_with_session(
+        let mut resolved = query.clone();
+        resolved.session_handle = inner;
+        respond_seeded_inspiring_cached_with_session(
             state.crs.as_ref(),
             &state.encoded_db,
-            &expanded,
+            &resolved,
             state.cache.as_ref(),
             Some(store.as_ref()),
         )

@@ -119,7 +119,7 @@ describe("T1 end-to-end: real PIR decode from wire bytes to verdicts", () => {
         const out = encodeBatchResponseNodes(
           Array.from({ length: encodedBatchCount(requestBody) }, () => response),
         );
-        out[1] = 4;
+        out[1] = 7;
         writeBinary(res, out);
         return true;
       },
@@ -135,7 +135,7 @@ describe("T1 end-to-end: real PIR decode from wire bytes to verdicts", () => {
       expect.fail("an unknown envelope version must not decode");
     } catch (e) {
       expect(RavenError.is(e, "DecodeError")).toBe(true);
-      expect(String((e as Error).message)).toMatch(/unexpected schema envelope version 4/);
+      expect(String((e as Error).message)).toMatch(/unexpected schema envelope version 7/);
     }
   });
 
@@ -221,7 +221,7 @@ describe("T1 end-to-end: real PIR decode from wire bytes to verdicts", () => {
   });
 
   it("still fails closed when the envelope is stripped entirely (version-byte collision)", async () => {
-    // A raw bincode body has no v3 prefix. Either the envelope guard or the strict wasm
+    // A raw bincode body has no current-version prefix. Either the envelope guard or the strict wasm
     // decoder refuses it; neither layer may fabricate a record from misaligned bytes.
     server.reset();
     server.route(

@@ -115,9 +115,9 @@ function mountRehandshakeRig(
         if (deadRequests >= (options.deadRequestBarrier ?? 1)) releaseDeadRequests?.();
         await deadRequestsReady;
         if (options.genericSameSchema400 === true) {
-          res.writeHead(400, { "x-raven-schema-version": "3" });
+          res.writeHead(400, { "x-raven-schema-version": "6" });
         } else {
-          res.writeHead(409, { "x-raven-schema-version": "3" });
+          res.writeHead(409, { "x-raven-schema-version": "6" });
         }
         res.end();
         return true;
@@ -125,7 +125,7 @@ function mountRehandshakeRig(
       writeBinary(
         res,
         encodeBatchResponseNodes(Array.from({ length: count }, statusRow)),
-        { "x-raven-epoch": "1", "x-raven-schema-version": "3" },
+        { "x-raven-epoch": "1", "x-raven-schema-version": "6" },
       );
       return true;
     },

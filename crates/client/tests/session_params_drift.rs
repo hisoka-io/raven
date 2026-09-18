@@ -13,8 +13,8 @@
 //! the guard does NOT fire, which is the accept case below. `tests/panic_safety.rs:1-3`
 //! records the same constraint for the other wrappers.
 //!
-//! The four comparisons are a disjunction over `ring_dim`, `q`, `p` and `sigma`, so
-//! each gets its own case: a fixture drifting one field leaves the other three
+//! The comparisons are a disjunction over every algebraic parameter, so
+//! each gets its own valid drift case where possible: a fixture drifting one field
 //! comparisons unexecuted, and a mutation deleting any one of them would survive.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
@@ -43,7 +43,8 @@ mod wasm_only {
             p: 65_537,
             sigma: 6.4,
             gadget_base: 1 << 20,
-            gadget_len: 3,
+            query_gadget_len: 3,
+            packing_gadget_len: 3,
             security_level: SecurityLevel::Bits128,
         }
     }
@@ -135,6 +136,21 @@ mod wasm_only {
     #[wasm_bindgen_test]
     fn drift_in_sigma_is_rejected() {
         assert_drift_rejected("sigma", |p| p.sigma = 6.5);
+    }
+
+    #[wasm_bindgen_test]
+    fn drift_in_gadget_base_is_rejected() {
+        assert_drift_rejected("gadget_base", |p| p.gadget_base = 1 << 21);
+    }
+
+    #[wasm_bindgen_test]
+    fn drift_in_query_gadget_len_is_rejected() {
+        assert_drift_rejected("query_gadget_len", |p| p.query_gadget_len = 4);
+    }
+
+    #[wasm_bindgen_test]
+    fn drift_in_packing_gadget_len_is_rejected() {
+        assert_drift_rejected("packing_gadget_len", |p| p.packing_gadget_len = 4);
     }
 
     #[wasm_bindgen_test]
@@ -247,7 +263,8 @@ mod native {
             p: 65_537,
             sigma: 6.4,
             gadget_base: 1 << 20,
-            gadget_len: 3,
+            query_gadget_len: 3,
+            packing_gadget_len: 3,
             security_level: SecurityLevel::Bits128,
         }
     }

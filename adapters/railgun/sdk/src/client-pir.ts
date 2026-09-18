@@ -64,6 +64,56 @@ export interface ClientPirContext {
   readonly entrySize: number;
 }
 
+/** Validated shard addressing needed to choose cover queries. */
+export interface ShardGeometry {
+  readonly entriesPerShard: number;
+  readonly shardCount: number;
+}
+
+/** Decode bincode `ShardConfig { shard_size_bytes, entry_size_bytes, total_entries }`. */
+export function decodeShardGeometry(shardConfigBincode: Uint8Array): ShardGeometry {
+  if (shardConfigBincode.length !== 24) {
+    throw RavenError.invalidQuery(
+      `ShardConfig bincode must be exactly 24 bytes, got ${shardConfigBincode.length}`,
+    );
+  }
+  const view = new DataView(
+    shardConfigBincode.buffer,
+    shardConfigBincode.byteOffset,
+    shardConfigBincode.byteLength,
+  );
+  const shardSizeBytes = view.getBigUint64(0, true);
+  const entrySizeBytes = view.getBigUint64(8, true);
+  const totalEntries = view.getBigUint64(16, true);
+  if (entrySizeBytes === 0n) {
+    throw RavenError.invalidQuery("ShardConfig entry_size_bytes must be non-zero");
+  }
+  if (shardSizeBytes === 0n || shardSizeBytes % entrySizeBytes !== 0n) {
+    throw RavenError.invalidQuery(
+      `ShardConfig shard_size_bytes ${shardSizeBytes} is not divisible by ` +
+        `entry_size_bytes ${entrySizeBytes}`,
+    );
+  }
+  if (totalEntries === 0n) {
+    throw RavenError.invalidQuery("ShardConfig total_entries must be non-zero");
+  }
+  if (totalEntries > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw RavenError.invalidQuery("ShardConfig total_entries exceeds JavaScript safe integer range");
+  }
+  const entriesPerShard = shardSizeBytes / entrySizeBytes;
+  const shardCount = (totalEntries + entriesPerShard - 1n) / entriesPerShard;
+  if (
+    entriesPerShard > BigInt(Number.MAX_SAFE_INTEGER) ||
+    shardCount > BigInt(Number.MAX_SAFE_INTEGER)
+  ) {
+    throw RavenError.invalidQuery("ShardConfig geometry exceeds JavaScript safe integer range");
+  }
+  return {
+    entriesPerShard: Number(entriesPerShard),
+    shardCount: Number(shardCount),
+  };
+}
+
 /** Decoded client-PIR query bundle; mirrors the Rust `WasmSeededQueryOutput` bincode struct. */
 export interface ClientPirQueryBundle {
   /** Local-only; replayed into `extract_response`, never sent to the server. */

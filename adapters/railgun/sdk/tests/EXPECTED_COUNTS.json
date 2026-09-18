@@ -5,13 +5,13 @@
     ".skip) turns the sdk-tests lane green with less running — this file is what",
     "catches the number drifting. `passed` is a floor (new tests may land before this",
     "file is bumped); `skipped`, `testFiles` and `skippedFiles` are EXACT.",
-    "The 21 skipped tests / 3 skipped files are the intentionally env-gated live tier:",
+    "The 22 skipped tests / 4 skipped files are the intentionally env-gated live and bench tier:",
     "live_aggressive_e2e.test.ts (14), live_mainnet_smoke.test.ts (6, incl. 1 stub),",
-    "live_latency_bench.test.ts (1); CI sets none of their RAVEN_LIVE_* env vars.",
+    "live_latency_bench.test.ts (1), poseidon_throughput_bench.test.ts (1); CI sets none of their run env vars.",
     "Anything else skipped is a regression, not a policy."
   ],
-  "testFiles": 38,
-  "skippedFiles": 3,
-  "passed": 360,
-  "skipped": 21
+  "testFiles": 43,
+  "skippedFiles": 4,
+  "passed": 375,
+  "skipped": 22
 }

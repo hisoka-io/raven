@@ -126,8 +126,8 @@ describe("ChainRegistry.refresh parses the /v1/status shape", () => {
       instances: [instanceRow(TREE_INSTANCE, 9)],
       consumer: null,
     });
-    const refreshed = await registryFor(server, 3).refresh(1);
-    expect(refreshed.schemaVersion).toBe(3);
+    const refreshed = await registryFor(server, 4).refresh(1);
+    expect(refreshed.schemaVersion).toBe(4);
   });
 
   it("keeps the refreshed entry resolvable", async () => {

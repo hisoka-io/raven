@@ -86,7 +86,7 @@ enum Commands {
         #[arg(long, default_value_t = 14_737_691)]
         start_block: u64,
         /// Upstream PPOI mirror endpoint.
-        #[arg(long, default_value = "https://poi.us.proxy.railwayapi.xyz")]
+        #[arg(long, default_value = "https://ppoi.fdi.network")]
         mirror_endpoint: String,
         /// Hex-encoded list key to mirror (default: OFAC).
         #[arg(
@@ -871,7 +871,8 @@ async fn run_bootstrap_from_subsquid(opts: BootstrapFromSubsquidOptions) -> anyh
         PooledRpcChainSource::new(Arc::clone(&pool), proxy_addr, opts.chain_id),
     );
     let chain_oracle = ChainSourceOracle::new(Arc::clone(&chain_source));
-    let leaves_src = SubsquidLeavesClient::new(opts.subsquid_url.clone());
+    let leaves_src = SubsquidLeavesClient::new(opts.subsquid_url.clone())
+        .map_err(|error| anyhow::anyhow!("--subsquid-url: {error}"))?;
 
     {
         use raven_railgun_cli::bootstrap_subsquid::ChainOracle as _;

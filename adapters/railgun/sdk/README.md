@@ -13,7 +13,7 @@ const poi = new RavenPOINodeInterface({
   endpoint: "https://raven.example.com",
   bearerToken: process.env.RAVEN_BEARER_TOKEN!,
   // Used by validation/submission; private stale reads still refuse by default.
-  upstreamFallbackEndpoint: "https://poi.us.proxy.railwayapi.xyz",
+  upstreamFallbackEndpoint: "https://ppoi.fdi.network",
 });
 ```
 
@@ -95,7 +95,7 @@ choose freshness over query privacy must opt in:
 const poi = new RavenPOINodeInterface({
   endpoint: "https://raven.example.com",
   bearerToken: process.env.RAVEN_BEARER_TOKEN!,
-  upstreamFallbackEndpoint: "https://poi.us.proxy.railwayapi.xyz",
+  upstreamFallbackEndpoint: "https://ppoi.fdi.network",
   privateStalePolicy: "allow-upstream-disclosure",
 });
 ```

@@ -8,6 +8,9 @@ license.workspace = true
 publish.workspace = true
 description = "HTTP layer for the Raven Railgun PIR adapter (axum + tower middleware)."
 
+[features]
+prefix-index-channel = []
+
 [lints]
 workspace = true
 

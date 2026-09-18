@@ -1,0 +1,41 @@
+name: check-ci-filter-names fixture
+
+jobs:
+  railgun-static:
+    steps:
+      - name: cargo fmt
+        run: |
+          cargo fmt --manifest-path adapters/railgun/Cargo.toml \
+            -p raven-railgun-cli \
+            -p raven-railgun-core \
+            -p raven-railgun-engine \
+            -p raven-railgun-http \
+            -p raven-railgun-indexer \
+            -p raven-railgun-mock-ppoi \
+            -p raven-railgun-persistence \
+            -p raven-railgun-poseidon \
+            -p raven-railgun-ppoi-mirror \
+            -- --check
+
+  railgun-tests:
+    strategy:
+      matrix:
+        shard:
+          - packages: >-
+              -p raven-railgun-cli
+              -p raven-railgun-core
+              -p raven-railgun-engine
+              -p raven-railgun-http
+              -p raven-railgun-indexer
+              -p raven-railgun-mock-ppoi
+              -p raven-railgun-persistence
+              -p raven-railgun-poseidon
+              -p raven-railgun-ppoi-mirror
+    steps:
+      - name: cargo nextest
+        run: cargo nextest run ${{ matrix.shard.packages }}
+
+  unrelated:
+    steps:
+      - name: mention an uncovered package
+        run: echo "-p raven-railgun-testkit"

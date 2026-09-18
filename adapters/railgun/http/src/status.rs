@@ -358,7 +358,9 @@ pub struct RpcEndpointHealthView {
 /// leaf is a real gap, so the comparison is against zero because zero is the whole of the safe
 /// set, not because zero was picked from a range.
 fn consumer_is_stalled(m: &raven_railgun_engine::persistence::ConsumerMetrics) -> bool {
-    m.consecutive_event_errors > 0 || m.unapplied_leaves > 0
+    m.consecutive_event_errors > 0
+        || m.unapplied_leaves > 0
+        || m.indexer_lag_blocks() >= crate::FRESHNESS_HORIZON_BLOCKS
 }
 
 /// Instances whose consumer has failed every event since its last applied one, or is carrying
@@ -371,7 +373,14 @@ fn stalled_consumer_instances<S: PirScheme>(app: &AppState<S>) -> Vec<String> {
     let instances = app.engine.instances();
     if app.instance_metrics.is_empty() {
         let Some(cell) = app.consumer_metrics.as_ref().as_ref() else {
-            return Vec::new();
+            return if app.consumer_metrics_required {
+                instances
+                    .iter()
+                    .map(|instance| instance.id.as_str().to_owned())
+                    .collect()
+            } else {
+                Vec::new()
+            };
         };
         let stalled = consumer_is_stalled(&cell.lock());
         return match instances.first() {
@@ -381,10 +390,9 @@ fn stalled_consumer_instances<S: PirScheme>(app: &AppState<S>) -> Vec<String> {
     }
     let mut stalled: Vec<String> = instances
         .iter()
-        .filter(|instance| {
-            app.instance_metrics
-                .get(&instance.id)
-                .is_some_and(|cell| consumer_is_stalled(&cell.lock()))
+        .filter(|instance| match app.instance_metrics.get(&instance.id) {
+            Some(cell) => consumer_is_stalled(&cell.lock()),
+            None => app.consumer_metrics_required,
         })
         .map(|instance| instance.id.as_str().to_owned())
         .collect();

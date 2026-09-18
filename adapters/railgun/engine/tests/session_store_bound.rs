@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use raven_inspire::params::{InspireParams, InspireVariant};
+use raven_inspire::rgsw::GadgetVector;
 use raven_inspire::{ServerInspiringCache, ServerSessionHandle};
 use raven_railgun_engine::inspire::{
     build_client_session, build_seeded_query, extract_response, register_client_session,
@@ -121,6 +122,32 @@ fn an_unknown_handle_never_reaches_the_inner_store() {
             raven_railgun_core::AdapterError::SessionHandleRejected { .. }
         ),
         "an unknown handle must retain its typed session refusal: {err:?}"
+    );
+}
+
+#[test]
+fn live_adapter_refuses_a_legacy_three_row_query_before_expansion() {
+    let (params, state, mut session, _db) = capped_state();
+    register_client_session(&mut session, &state).expect("register");
+    let (_client_state, mut query) =
+        build_seeded_query(&session, state.shard_config(), 0, &params).expect("build query");
+    let row = query
+        .rgsw_ciphertext
+        .rows
+        .first()
+        .expect("current query has one row")
+        .clone();
+    query.rgsw_ciphertext.rows = vec![row.clone(), row.clone(), row];
+    query.rgsw_ciphertext.gadget = GadgetVector::new(params.gadget_base, 3, params.q);
+
+    let error = <RavenInspireScheme as PirScheme>::respond(&state, &query)
+        .expect_err("the live adapter must reject the legacy query shape");
+    let message = error.to_string();
+    assert!(
+        message.contains("RGSW gadget mismatch")
+            && message.contains("got len=3")
+            && message.contains("expected len=1"),
+        "legacy query reached expansion or returned the wrong refusal: {message}"
     );
 }
 

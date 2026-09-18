@@ -166,7 +166,8 @@ pub fn to_inspire_params(d: &AdaptiveDerivation) -> InspireParams {
         p: d.p,
         sigma: d.sigma_x,
         gadget_base: d.z,
-        gadget_len: d.t_exp_left,
+        query_gadget_len: d.t_exp_left,
+        packing_gadget_len: d.t_exp_left,
         security_level: SecurityLevel::Bits128,
     }
 }
@@ -200,7 +201,8 @@ pub fn fmt_derivation(inputs: &AdaptiveInputs, d: &AdaptiveDerivation) -> String
             "custom_q_log2: {custom_q:.4}\n",
             "InspireParams: ring_dim={ring_dim}, q={q} (log2={q_log2:.4}), ",
             "crt_moduli={crt_moduli:?}, p={bridge_p}, sigma={bridge_sigma}, ",
-            "gadget_base={gadget_base}, gadget_len={gadget_len}, security={sec_level:?}\n",
+            "gadget_base={gadget_base}, query_gadget_len={query_gadget_len}, ",
+            "packing_gadget_len={packing_gadget_len}, security={sec_level:?}\n",
         ),
         num_items = inputs.input_num_items,
         num_items_log2 = (inputs.input_num_items as f64).log2() as u32,
@@ -238,7 +240,8 @@ pub fn fmt_derivation(inputs: &AdaptiveInputs, d: &AdaptiveDerivation) -> String
         bridge_p = inspire.p,
         bridge_sigma = inspire.sigma,
         gadget_base = inspire.gadget_base,
-        gadget_len = inspire.gadget_len,
+        query_gadget_len = inspire.query_gadget_len,
+        packing_gadget_len = inspire.packing_gadget_len,
         sec_level = inspire.security_level,
     )
 }

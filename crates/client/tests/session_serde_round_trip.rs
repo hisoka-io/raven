@@ -32,7 +32,8 @@ fn test_params() -> InspireParams {
         p: 65_537,
         sigma: 6.4,
         gadget_base: 1 << 20,
-        gadget_len: 3,
+        query_gadget_len: 3,
+        packing_gadget_len: 3,
         security_level: raven_inspire::params::SecurityLevel::Bits128,
     }
 }
@@ -145,7 +146,7 @@ fn wasm_session_deserialize_rejects_unversioned_crs() {
         inspire_setup(&params, &database, ENTRY_BYTES, &mut sampler).expect("inspire_setup");
 
     let bundle_bytes = make_params_bundle(&params, &encoded_db.config, &sk);
-    // raw bincode, missing the RAVEN_CRS_v01 magic prefix
+    // raw bincode, missing the current CRS magic prefix
     let unversioned_crs = bincode::serialize(&crs).expect("serialize crs");
     let session_stub = vec![0u8; 16];
 

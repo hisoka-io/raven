@@ -46,6 +46,8 @@ pub struct AppState<S: PirScheme> {
     pub(crate) metrics_handle: Arc<metrics_exporter_prometheus::PrometheusHandle>,
     /// Instance-labelled `/metrics` gauges; empty falls back to `consumer_metrics`.
     pub(crate) instance_metrics: Arc<HashMap<InstanceId, Arc<parking_lot::Mutex<ConsumerMetrics>>>>,
+    /// Whether every served instance must have consumer telemetry before readiness can pass.
+    pub(crate) consumer_metrics_required: bool,
     /// Process start instant, for `raven_railgun_uptime_seconds`.
     pub(crate) process_started_at: Instant,
     /// ETag cache keyed so an epoch bump invalidates without growing the map.
@@ -73,6 +75,7 @@ impl<S: PirScheme> Clone for AppState<S> {
             semaphore: Arc::clone(&self.semaphore),
             metrics_handle: Arc::clone(&self.metrics_handle),
             instance_metrics: Arc::clone(&self.instance_metrics),
+            consumer_metrics_required: self.consumer_metrics_required,
             process_started_at: self.process_started_at,
             params_etag_cache: Arc::clone(&self.params_etag_cache),
         }
@@ -121,6 +124,7 @@ impl<S: PirScheme> AppState<S> {
             semaphore,
             metrics_handle,
             instance_metrics: Arc::new(HashMap::new()),
+            consumer_metrics_required: false,
             process_started_at: Instant::now(),
             params_etag_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         })
@@ -157,6 +161,13 @@ impl<S: PirScheme> AppState<S> {
         metrics: Arc<parking_lot::Mutex<raven_railgun_engine::persistence::ConsumerMetrics>>,
     ) -> Self {
         self.consumer_metrics = Arc::new(Some(metrics));
+        self
+    }
+
+    /// Fail readiness closed when consumer telemetry is absent for a served instance.
+    #[must_use]
+    pub fn require_consumer_metrics(mut self) -> Self {
+        self.consumer_metrics_required = true;
         self
     }
 

@@ -24,7 +24,8 @@ fn params() -> InspireParams {
         p: 65_537,
         sigma: 6.4,
         gadget_base: 1 << 20,
-        gadget_len: 3,
+        query_gadget_len: 3,
+        packing_gadget_len: 3,
         security_level: SecurityLevel::Bits128,
     }
 }
@@ -43,9 +44,9 @@ impl Fixture {
     }
 }
 
-fn fixture() -> Fixture {
+fn fixture_with_shards(num_shards: usize) -> Fixture {
     let params = params();
-    let database = (0..params.ring_dim * ENTRY_BYTES)
+    let database = (0..num_shards * params.ring_dim * ENTRY_BYTES)
         .map(|offset| {
             let row = offset / ENTRY_BYTES;
             let byte = offset % ENTRY_BYTES;
@@ -69,6 +70,10 @@ fn fixture() -> Fixture {
         database,
         store,
     }
+}
+
+fn fixture() -> Fixture {
+    fixture_with_shards(8)
 }
 
 struct ScriptedRng {
@@ -264,6 +269,75 @@ fn cover_selection_consumes_the_csprng_instead_of_cycling_targets() {
 }
 
 #[test]
+fn cover_shards_are_distinct_and_outside_the_real_shard_set() {
+    let fixture = fixture();
+    let targets = [3, 256 + 11, 512 + 42];
+    let batch = build_padded_batch_rust_with_test_rng(
+        &fixture.session,
+        &fixture.params,
+        fixture.shard_config(),
+        &targets,
+        1_000_000,
+        &mut ScriptedRng::new([0, 0, 0, 0]),
+        [0x28; 32],
+    )
+    .expect("batch with one distinct cover shard");
+
+    let wire_shards = batch
+        .queries
+        .iter()
+        .map(|query| query.shard_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(wire_shards.len(), batch.queries.len());
+    assert!([0, 1, 2]
+        .iter()
+        .all(|shard_id| wire_shards.contains(shard_id)));
+}
+
+#[test]
+fn insufficient_distinct_cover_shards_refuse_before_query_construction() {
+    let fixture = fixture_with_shards(3);
+    let targets = [3, 256 + 11, 512 + 42];
+    let error = build_padded_batch_rust_with_test_rng(
+        &fixture.session,
+        &fixture.params,
+        fixture.shard_config(),
+        &targets,
+        1_000_000,
+        &mut ScriptedRng::new([0, 0, 0, 0]),
+        [0x29; 32],
+    )
+    .expect_err("three real shards leave no distinct cover for a four-slot batch");
+
+    assert!(matches!(error, PaddedBatchError::Configuration { .. }));
+    assert!(
+        error.to_string().contains("distinct cover shards"),
+        "refusal must name the unavailable cover resource: {error}"
+    );
+}
+
+#[test]
+fn cover_geometry_refuses_a_real_target_outside_the_database() {
+    let fixture = fixture_with_shards(3);
+    let error = build_padded_batch_rust_with_test_rng(
+        &fixture.session,
+        &fixture.params,
+        fixture.shard_config(),
+        &[fixture.shard_config().total_entries],
+        1_000_000,
+        &mut ScriptedRng::new([0, 0, 0]),
+        [0x2a; 32],
+    )
+    .expect_err("a real target outside validated geometry must refuse");
+
+    assert!(matches!(error, PaddedBatchError::Configuration { .. }));
+    assert!(
+        error.to_string().contains("outside total_entries"),
+        "refusal must name the violated geometry bound: {error}"
+    );
+}
+
+#[test]
 fn builder_returns_typed_empty_cap_and_impossible_padding_errors() {
     let fixture = fixture();
     let build = |targets: &[u64], cap, rng: &mut ScriptedRng| {
@@ -308,7 +382,7 @@ fn builder_returns_typed_empty_cap_and_impossible_padding_errors() {
 
 #[test]
 fn generated_ladder_has_no_fixed_32_slot_ceiling() {
-    let fixture = fixture();
+    let fixture = fixture_with_shards(64);
     let baseline = build_padded_batch_rust_with_test_rng(
         &fixture.session,
         &fixture.params,
