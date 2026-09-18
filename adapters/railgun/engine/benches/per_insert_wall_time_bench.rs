@@ -105,6 +105,9 @@ fn payload_for(cell: &Cell, idx: u32) -> WalEntryPayload {
             list_index: idx,
             blinded_commitment: bc,
             status: 0,
+            event_type: raven_railgun_persistence::PpoiEventType::Shield,
+            signature: vec![0; 64],
+            validated_merkleroot: [0; 32],
         },
         InsertKind::PerTreeAppend => WalEntryPayload::AppendLeaf {
             tree_number: 0,

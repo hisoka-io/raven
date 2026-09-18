@@ -25,6 +25,7 @@ use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
 use raven_railgun_engine::orchestrator::{DataSourceFilter, VerificationMode};
 use raven_railgun_engine::persistence::SnapshotPolicy;
 use raven_railgun_engine::pir_table::EncoderKind;
+use raven_railgun_engine::InstanceRole;
 use raven_railgun_indexer::{
     BlockId, ChainSource, IndexerError, IndexerMessage, Result as IndexerResult,
 };
@@ -149,6 +150,15 @@ fn build_opts(
 ) -> MultiServeOptions {
     let cfg_path = rewrite_to_tempdir(&example_toml_path(), tmp, bind, BEARER_TOKEN);
     let mut opts = load_options_from_toml(&cfg_path).expect("parse config");
+    opts.instances.retain(|instance| {
+        !matches!(instance.data_source, DataSourceFilter::PpoiListBlock { block, .. } if block > 0)
+    });
+    for instance in &mut opts.instances {
+        if let DataSourceFilter::PpoiListBlock { list_key, block: 0 } = instance.data_source {
+            instance.data_source = DataSourceFilter::PpoiList(list_key);
+            instance.role = InstanceRole::Live;
+        }
+    }
     opts.bind = bind;
     opts.skip_chain_workers = true;
     opts.skip_mirror_workers = true;
@@ -349,6 +359,9 @@ async fn drive_synthetic_events(
                 list_index: 0,
                 blinded_commitment: canonical_commit(0x71),
                 status: 0,
+                event_type: raven_railgun_persistence::PpoiEventType::Shield,
+                signature: vec![0; 64],
+                validated_merkleroot: [0; 32],
             },
             0,
         ))
@@ -372,6 +385,9 @@ async fn drive_synthetic_events(
                 list_index: 0,
                 blinded_commitment: canonical_commit(0x82),
                 status: 0,
+                event_type: raven_railgun_persistence::PpoiEventType::Shield,
+                signature: vec![0; 64],
+                validated_merkleroot: [0; 32],
             },
             0,
         ))
@@ -418,6 +434,9 @@ async fn wait_for_apply(view: &BootstrapView, deadline_secs: u64) {
                         all_ready = false;
                         break;
                     }
+                }
+                DataSourceFilter::PpoiListBlock { .. } => {
+                    unreachable!("six-instance fixture has no block route")
                 }
             }
         }
@@ -604,6 +623,9 @@ async fn chain_events_route_to_correct_commit_tree_instance() {
                     m.last_applied_block
                 );
             }
+            DataSourceFilter::PpoiListBlock { .. } => {
+                unreachable!("six-instance fixture has no block route")
+            }
         }
     }
 
@@ -671,6 +693,9 @@ async fn ppoi_events_route_to_correct_list_instance() {
                 );
             }
             DataSourceFilter::PpoiList(_) => panic!("unexpected ppoi list_key"),
+            DataSourceFilter::PpoiListBlock { .. } => {
+                unreachable!("six-instance fixture has no block route")
+            }
             DataSourceFilter::ChainTreeNumber(_) => {
                 let store = inst.logical_store.lock();
                 assert_eq!(
@@ -841,6 +866,9 @@ async fn kill_restart_preserves_per_instance_state() {
                 let store = inst.logical_store.lock();
                 ppoi_pre.push((k, store.ppoi_bc_at(&k, 0)));
             }
+            DataSourceFilter::PpoiListBlock { .. } => {
+                unreachable!("six-instance fixture has no block route")
+            }
         }
     }
 
@@ -951,12 +979,12 @@ async fn manifest_label_mismatch_refuses_boot_per_instance() {
 }
 
 #[test]
-fn example_toml_parses_to_six_instances_with_expected_encoders() {
+fn example_toml_parses_to_six_ppoi_blocks_with_expected_encoders() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let bind: SocketAddr = "127.0.0.1:0".parse().expect("addr");
     let cfg = rewrite_to_tempdir(&example_toml_path(), tmp.path(), bind, BEARER_TOKEN);
     let opts = load_options_from_toml(&cfg).expect("parse");
-    assert_eq!(opts.instances.len(), 6);
+    assert_eq!(opts.instances.len(), 11);
     let labels: Vec<&'static str> = opts.instances.iter().map(|i| i.encoder.label()).collect();
     let want = [
         "per-node",
@@ -964,9 +992,23 @@ fn example_toml_parses_to_six_instances_with_expected_encoders() {
         "per-node",
         "per-node",
         "per-list-status",
-        "per-list-node",
+        "per-list-path10",
+        "per-list-path10",
+        "per-list-path10",
+        "per-list-path10",
+        "per-list-path10",
+        "per-list-path10",
     ];
     assert_eq!(labels, want, "encoder labels drifted");
+    let blocks: Vec<u32> = opts
+        .instances
+        .iter()
+        .filter_map(|instance| match instance.data_source {
+            DataSourceFilter::PpoiListBlock { block, .. } => Some(block),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(blocks, vec![0, 1, 2, 3, 4, 5]);
 
     for inst in &opts.instances {
         match inst.data_source {
@@ -976,7 +1018,7 @@ fn example_toml_parses_to_six_instances_with_expected_encoders() {
                 "{} must use ChainRootHistory",
                 inst.instance_id
             ),
-            DataSourceFilter::PpoiList(_) => assert_eq!(
+            DataSourceFilter::PpoiList(_) | DataSourceFilter::PpoiListBlock { .. } => assert_eq!(
                 inst.verification_mode,
                 VerificationMode::UpstreamSignature,
                 "{} must use UpstreamSignature",

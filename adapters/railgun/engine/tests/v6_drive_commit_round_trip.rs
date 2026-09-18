@@ -22,7 +22,9 @@ use raven_railgun_testkit::canonical;
 
 fn encoder_for(kind: EncoderKind) -> Arc<dyn PirTableEncoder> {
     let record_size = match kind {
-        EncoderKind::PerLeafPath { .. } | EncoderKind::PerListPath { .. } => 16 * 32,
+        EncoderKind::PerLeafPath { .. }
+        | EncoderKind::PerListPath { .. }
+        | EncoderKind::PerListPath10 { .. } => 16 * 32,
         EncoderKind::PerLeafBc { .. }
         | EncoderKind::PerNode { .. }
         | EncoderKind::PerListNode { .. }

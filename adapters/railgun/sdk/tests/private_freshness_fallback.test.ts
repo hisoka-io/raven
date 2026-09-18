@@ -12,9 +12,16 @@ import {
 } from "../src/index";
 import {
   encodeBatchResponse,
+  encodeBatchResponseNodes,
   encodedBatchCount,
-  stubCtx as authPathContext,
+  stubCtx as nodeAuthPathContext,
 } from "./helpers/auth_path_stub";
+import {
+  PATH10_ROW_BYTES,
+  path10Root,
+  path10Siblings,
+  path10Slot,
+} from "./helpers/path10_row";
 import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
 import {
   readJsonRpcRequest,
@@ -72,6 +79,14 @@ function statusContext(): ClientPirContext {
     shardConfigBincode: new Uint8Array(0),
     entrySize: 32,
   };
+}
+
+/** Siblings and the root the SDK must fold to for BC_HEX at local leaf 0. */
+const PATH10_NODES = path10Siblings(0xab);
+const PATH10_ROOT = path10Root(BC_HEX, PATH10_NODES, 0);
+
+function authPathContext(): ClientPirContext {
+  return { ...nodeAuthPathContext(), entrySize: PATH10_ROW_BYTES };
 }
 
 describe("private response freshness fallback", () => {
@@ -326,7 +341,8 @@ describe("private response freshness fallback", () => {
     expect(adapter.requests).toHaveLength(2);
     expect(
       assertNoCommitmentsInPirRequests(adapter.requests, [BC_HEX], {
-        expectedQueryCount: 16,
+        // One 512 B path-10 row replaced sixteen 32 B node reads (W3-01/W3-03).
+        expectedQueryCount: 1,
         expectedQueryBytes: STUB_QUERY_BYTES,
       }),
     ).toHaveLength(1);
@@ -341,10 +357,16 @@ describe("private response freshness fallback", () => {
         `lag_blocks=999 applied_height=10 epoch=1 confidence=${row.confidence}`;
       adapter.route(
         (req) => req.url?.endsWith("/batch") ?? false,
-        (_req, body, res) => {
-          writeBinary(res, encodeBatchResponse(1, encodedBatchCount(body)), {
+        (reqInfo, body, res) => {
+          const isPath = (reqInfo.url ?? "").includes("t2Path");
+          const payload = isPath
+            ? encodeBatchResponseNodes([
+                path10Slot({ bcHex: BC_HEX, nodes: PATH10_NODES }),
+              ])
+            : encodeBatchResponse(1, encodedBatchCount(body));
+          writeBinary(res, payload, {
             "x-raven-epoch": "1",
-            "x-raven-schema-version": "6",
+            "x-raven-schema-version": "7",
             "x-raven-freshness": freshness,
           });
           return true;
@@ -378,6 +400,8 @@ describe("private response freshness fallback", () => {
           [`t2Path:${LIST_KEY_HEX}`, authPathContext()],
         ]),
         bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX, 0]])]]),
+        // D-06: every path-10 fold requires a pinned root.
+        ppoiPinnedRoots: new Map([[`${LIST_KEY_HEX}:0`, PATH10_ROOT]]),
       };
       const config: RavenConfig = row.policy === "allow"
         ? {
@@ -453,7 +477,7 @@ describe("private response freshness fallback", () => {
       }
       expect(
         assertNoCommitmentsInPirRequests(adapter.requests, [BC_HEX], {
-          expectedQueryCount: operation === "t1-status" ? 1 : 16,
+          expectedQueryCount: 1,
           expectedQueryBytes: STUB_QUERY_BYTES,
         }),
       ).toHaveLength(1);
@@ -517,7 +541,7 @@ describe("private response freshness fallback", () => {
       expect(upstream.requests).toHaveLength(0);
       expect(
         assertNoCommitmentsInPirRequests(adapter.requests, [BC_HEX], {
-          expectedQueryCount: operation === "t1-status" ? 1 : 16,
+          expectedQueryCount: 1,
           expectedQueryBytes: STUB_QUERY_BYTES,
         }),
       ).toHaveLength(1);

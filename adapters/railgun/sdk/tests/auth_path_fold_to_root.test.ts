@@ -16,15 +16,28 @@ import {
   encodedBatchCount,
   stubCtx,
 } from "./helpers/auth_path_stub";
+import {
+  PATH10_ROW_BYTES,
+  mountPath10Route,
+  path10Root,
+  path10Siblings,
+} from "./helpers/path10_row";
 
 const LIST_KEY_HEX = "ab".repeat(32);
 const BC_HEX = "11".repeat(32);
 const LEAF = 1234;
 const TREE_NUMBER = 0;
 
-/** Root of the fixed (BC, leaf index, sibling set) below, folded by this SDK at HEAD. */
-const PINNED_ROOT =
-  "21c3bd4a0c9fa6a964d426705abc9425edaa99ee3ad24645ec1bc5e39519d717";
+// W3-01/W3-03 replaced sixteen 32 B node reads with one 512 B path-10 row plus a 160 B
+// upper-sibling addendum, and the pinned root became mandatory (D-06). The served sibling
+// set is now fixture data rather than a literal, so the root is derived from it here --
+// a hardcoded root would only restate whatever the helper happens to emit.
+const PATH10_NODES = path10Siblings(0xab);
+/** A second sibling set, standing in for nodes served at a different epoch. */
+const OTHER_NODES = path10Siblings(0xcd);
+const PATH10_BLOCK = Math.floor(LEAF / 65_536);
+const PATH10_INSTANCE = `t2Path-${LIST_KEY_HEX}`;
+const TRUE_ROOT = path10Root(BC_HEX, PATH10_NODES, LEAF);
 
 function mountBatchRoute(server: MockServer, epoch: number): void {
   server.route(
@@ -42,18 +55,41 @@ function mountBatchRoute(server: MockServer, epoch: number): void {
   );
 }
 
-function newSdk(server: MockServer): RavenPOINodeInterface {
+function newSdk(
+  server: MockServer,
+  overrides: { leaf?: number; pinnedRoot?: string } = {},
+): RavenPOINodeInterface {
+  const leaf = overrides.leaf ?? LEAF;
+  const pathCtx = { ...stubCtx(), entrySize: PATH10_ROW_BYTES };
   return new RavenPOINodeInterface({
     endpoint: server.url,
     bearerToken: TOKEN,
     useClientPir: true,
     clientPirContexts: new Map([
-      [`t2Path:${LIST_KEY_HEX}`, stubCtx()],
+      [`t2Path:${LIST_KEY_HEX}`, pathCtx],
       [`t3CommitTree:${TREE_NUMBER}`, stubCtx()],
     ]),
-    bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX, LEAF]])]]),
+    // D-06: every path-10 fold requires a pinned root, so the rig always supplies one.
+    ppoiPinnedRoots: new Map([
+      [`${LIST_KEY_HEX}:${PATH10_BLOCK}`, overrides.pinnedRoot ?? TRUE_ROOT],
+    ]),
+    bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX, leaf]])]]),
     imtCache: new ImtCache({ disableIndexedDb: true }),
   });
+}
+
+/** Assert the SDK refused specifically because the fold missed the pinned root. */
+async function expectPinnedRootRefusal(promise: Promise<unknown>): Promise<void> {
+  let message = "";
+  let returned = false;
+  try {
+    await promise;
+    returned = true;
+  } catch (e) {
+    message = String((e as Error).message);
+  }
+  expect(returned, "a fold that misses the pinned root must not return a proof").toBe(false);
+  expect(message).toMatch(/does not match pinned root/);
 }
 
 /**
@@ -81,6 +117,11 @@ describe("the SDK's PPOI auth path folds to a verifiable root", () => {
 
   beforeAll(async () => {
     server = await startMockServer();
+    mountPath10Route(server, {
+      bcHex: BC_HEX,
+      nodes: PATH10_NODES,
+      instance: PATH10_INSTANCE,
+    });
     mountBatchRoute(server, 9);
   });
   afterAll(async () => {
@@ -94,7 +135,7 @@ describe("the SDK's PPOI auth path folds to a verifiable root", () => {
     expect(proof.elements).toHaveLength(TREE_DEPTH);
     // nToHex(leafIndex, UINT_256), not the 8-char uint32 that upstream verifyMerkleProof rejects
     expect(proof.indices).toBe(LEAF.toString(16).padStart(64, "0"));
-    expect(proof.root).toBe(PINNED_ROOT);
+    expect(proof.root).toBe(TRUE_ROOT);
     expect(proof.root).toBe(referenceFold(proof.leaf, proof.elements, LEAF));
   });
 
@@ -109,34 +150,50 @@ describe("the SDK's PPOI auth path folds to a verifiable root", () => {
 
   it("consumes the index bits: a sibling-identical neighbour leaf folds to a different root", async () => {
     const neighbour = LEAF ^ 0b1;
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: true,
-      clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, stubCtx()]]),
-      bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX, neighbour]])]]),
-      imtCache: new ImtCache({ disableIndexedDb: true }),
-    });
-    const [proof] = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
-
-    // The stub keys nodes on slot, not on index, so only the fold's index bits differ.
-    expect(proof.elements).toEqual(
-      (await newSdk(server).getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]))[0].elements,
+    // The served siblings are identical, so ONLY the fold's index bits differ. Computed
+    // with `hashLeftRight` alone, independently of the SDK's fold.
+    const neighbourRoot = referenceFold(
+      BC_HEX,
+      PATH10_NODES.map((n) => Buffer.from(n).toString("hex")),
+      neighbour,
     );
-    expect(proof.root).not.toBe(PINNED_ROOT);
-    expect(proof.root).toBe(referenceFold(proof.leaf, proof.elements, neighbour));
+    expect(neighbourRoot).not.toBe(TRUE_ROOT);
+
+    // Under D-06 the SDK no longer merely folds to something else -- it refuses, because
+    // the fold misses the pinned root. That is strictly stronger than the old assertion.
+    await expectPinnedRootRefusal(
+      newSdk(server, { leaf: neighbour }).getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]),
+    );
+    // ...and it accepts the same neighbour fold once its own root is the pinned one,
+    // which proves the refusal tracked the index bits rather than the leaf being odd.
+    const [proof] = await newSdk(server, {
+      leaf: neighbour,
+      pinnedRoot: neighbourRoot,
+    }).getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+    expect(proof.root).toBe(neighbourRoot);
   });
 
   it("consumes the sibling bytes: nodes served at another epoch fold to a different root", async () => {
     const other = await startMockServer();
-    mountBatchRoute(other, 8);
+    mountPath10Route(other, {
+      bcHex: BC_HEX,
+      nodes: OTHER_NODES,
+      instance: PATH10_INSTANCE,
+    });
     try {
-      const [proof] = await newSdk(other).getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+      const otherRoot = path10Root(BC_HEX, OTHER_NODES, LEAF);
+      expect(otherRoot).not.toBe(TRUE_ROOT);
 
+      // Same leaf, same index bits, different sibling BYTES: refused against the pin.
+      await expectPinnedRootRefusal(newSdk(other).getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]));
+
+      const [proof] = await newSdk(other, { pinnedRoot: otherRoot }).getPOIMerkleProofs(
+        LIST_KEY_HEX,
+        [BC_HEX],
+      );
       expect(proof.elements.map(slotTagOf)).toEqual(
         Array.from({ length: TREE_DEPTH }, (_unused, level) => level),
       );
-      expect(proof.root).not.toBe(PINNED_ROOT);
       expect(proof.root).toBe(referenceFold(proof.leaf, proof.elements, LEAF));
     } finally {
       await other.close();

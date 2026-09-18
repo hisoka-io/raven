@@ -11,6 +11,7 @@ import type { ClientPirContext } from "../src/index";
 
 import { loadFixture, makeClientPirContext, type LoadedFixture } from "./helpers/fixture";
 import { encodeBatchResponseNodes, encodedBatchCount } from "./helpers/auth_path_stub";
+import { EXPECTED_WIRE_SCHEMA_VERSION } from "./helpers/wire_schema";
 import { startMockServer, writeBinary, type MockServer } from "./helpers/mock_server";
 
 const TOKEN = "test-token-padded-long-enough-1234";
@@ -119,7 +120,8 @@ describe("T1 end-to-end: real PIR decode from wire bytes to verdicts", () => {
         const out = encodeBatchResponseNodes(
           Array.from({ length: encodedBatchCount(requestBody) }, () => response),
         );
-        out[1] = 7;
+        // Must stay genuinely UNKNOWN: 7 is the current version now.
+        out[1] = EXPECTED_WIRE_SCHEMA_VERSION + 1;
         writeBinary(res, out);
         return true;
       },
@@ -135,7 +137,9 @@ describe("T1 end-to-end: real PIR decode from wire bytes to verdicts", () => {
       expect.fail("an unknown envelope version must not decode");
     } catch (e) {
       expect(RavenError.is(e, "DecodeError")).toBe(true);
-      expect(String((e as Error).message)).toMatch(/unexpected schema envelope version 7/);
+      expect(String((e as Error).message)).toMatch(
+        new RegExp(`unexpected schema envelope version ${EXPECTED_WIRE_SCHEMA_VERSION + 1}`),
+      );
     }
   });
 

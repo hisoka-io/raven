@@ -13,6 +13,7 @@ import {
   assertNoCommitmentsInPirRequests,
   inspectPirDataPosts,
 } from "./helpers/private_wire";
+import { EXPECTED_WIRE_SCHEMA_PREFIX } from "./helpers/wire_schema";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 
@@ -142,12 +143,13 @@ describe("privacy across every SDK call path", () => {
     }
     expect(
       assertNoCommitmentsInPirRequests(sdk.lastWireRequests(), queriedBcs, {
-        expectedQueryCount: 16,
+        // One 512 B path-10 row replaced sixteen 32 B node reads (W3-01/W3-03).
+        expectedQueryCount: 1,
       }),
     ).toHaveLength(1);
     expect(
       assertNoCommitmentsInPirRequests(server.requests, queriedBcs, {
-        expectedQueryCount: 16,
+        expectedQueryCount: 1,
       }),
     ).toHaveLength(1);
   });
@@ -186,6 +188,7 @@ describe("privacy across every SDK call path", () => {
     }
 
     const inspected = inspectPirDataPosts(sdk.lastWireRequests(), {
+      // T3 commit-tree still reads sixteen 32 B nodes; only the T2 list path became one row.
       expectedQueryCount: 16,
     });
     expect(inspected).toHaveLength(1);
@@ -282,7 +285,7 @@ describe("privacy across every SDK call path", () => {
     ).toThrow(/selected no POST query\/batch\/fanout requests/);
 
     const shortBatch = new Uint8Array(9);
-    shortBatch.set([0, 6]);
+    shortBatch.set(EXPECTED_WIRE_SCHEMA_PREFIX);
     expect(() =>
       assertNoCommitmentsInPirRequests(
         [{ url: "/v1/instance/test/batch", method: "POST", body: shortBatch }],
@@ -297,10 +300,14 @@ describe("privacy across every SDK call path", () => {
         ["11".repeat(32)],
         { expectedQueryCount: 1 },
       ),
-    ).toThrow(/schema prefix.*expected \[0, 6\]/);
+    ).toThrow(
+      new RegExp(
+        `schema prefix.*expected \\[${EXPECTED_WIRE_SCHEMA_PREFIX[0]}, ${EXPECTED_WIRE_SCHEMA_PREFIX[1]}\\]`,
+      ),
+    );
 
     const zeroCountBatch = new Uint8Array(10);
-    zeroCountBatch.set([0, 6]);
+    zeroCountBatch.set(EXPECTED_WIRE_SCHEMA_PREFIX);
     expect(() =>
       assertNoCommitmentsInPirRequests(
         [{ url: "/v1/instance/test/batch", method: "POST", body: zeroCountBatch }],
@@ -310,7 +317,7 @@ describe("privacy across every SDK call path", () => {
     ).toThrow(/invalid batch query count 0/);
 
     const undersizedBatch = new Uint8Array(10 + 31);
-    undersizedBatch.set([0, 6]);
+    undersizedBatch.set(EXPECTED_WIRE_SCHEMA_PREFIX);
     new DataView(undersizedBatch.buffer).setBigUint64(2, 1n, true);
     expect(() =>
       assertNoCommitmentsInPirRequests(
@@ -321,7 +328,7 @@ describe("privacy across every SDK call path", () => {
     ).toThrow(/query payload is 31 bytes/);
 
     const unevenBatch = new Uint8Array(10 + 65);
-    unevenBatch.set([0, 6]);
+    unevenBatch.set(EXPECTED_WIRE_SCHEMA_PREFIX);
     new DataView(unevenBatch.buffer).setBigUint64(2, 2n, true);
     expect(() =>
       assertNoCommitmentsInPirRequests(

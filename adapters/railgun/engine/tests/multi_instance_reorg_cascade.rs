@@ -116,6 +116,7 @@ async fn wait_until_seeded(instances: &[PerInstanceHandles], list_key: &[u8; 32]
                 DataSourceFilter::PpoiList(_) => {
                     ppoi_ready = store.ppoi_list_leaves_iter(list_key).count() == 3;
                 }
+                DataSourceFilter::PpoiListBlock { .. } => {}
             }
         }
         if chain_ready == 2 && ppoi_ready {
@@ -211,6 +212,9 @@ async fn reorg_cascade_truncates_chain_instances_only() {
                     list_index: i,
                     blinded_commitment: bc,
                     status: 0,
+                    event_type: raven_railgun_persistence::PpoiEventType::Shield,
+                    signature: vec![0; 64],
+                    validated_merkleroot: [0; 32],
                 },
                 0,
             ))
@@ -231,6 +235,7 @@ async fn reorg_cascade_truncates_chain_instances_only() {
             DataSourceFilter::PpoiList(_) => {
                 pre_ppoi = store.ppoi_list_leaves_iter(&lk_a).count();
             }
+            DataSourceFilter::PpoiListBlock { .. } => unreachable!("fixture has no block route"),
         }
     }
     assert_eq!(pre_chain.len(), 2, "two chain-tree instances seeded");
@@ -278,6 +283,7 @@ async fn reorg_cascade_truncates_chain_instances_only() {
                     "PPOI list must retain all 3 leaves; chain reorg is not chain-anchored"
                 );
             }
+            DataSourceFilter::PpoiListBlock { .. } => unreachable!("fixture has no block route"),
         }
     }
 

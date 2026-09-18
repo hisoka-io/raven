@@ -98,11 +98,31 @@ pub fn setup_state(
     entry_size: usize,
     variant: InspireVariant,
 ) -> Result<(InspireServerState, RlweSecretKey)> {
+    setup_state_with_inspiring_seed(params, database, entry_size, variant, None)
+}
+
+/// Build a fresh state while optionally reusing the public packing seed.
+pub fn setup_state_with_inspiring_seed(
+    params: &InspireParams,
+    database: &[u8],
+    entry_size: usize,
+    variant: InspireVariant,
+    inspiring_w_seed: Option<[u8; 32]>,
+) -> Result<(InspireServerState, RlweSecretKey)> {
     let mut sampler = GaussianSampler::new(params.sigma);
     let (mut crs, encoded_db, sk) = inspire_setup(params, database, entry_size, &mut sampler)
         .map_err(|e| AdapterError::Scheme(format!("inspire setup: {e}")))?;
-    let cache = ServerInspiringCache::from_setup(&mut crs, &encoded_db)
-        .map_err(|e| AdapterError::Scheme(format!("inspire setup cache: {e}")))?;
+    let cache = if let Some(seed) = inspiring_w_seed {
+        crs.inspiring_w_seed = seed;
+        let cache = ServerInspiringCache::new(&crs, &encoded_db)
+            .map_err(|e| AdapterError::Scheme(format!("inspire setup cache: {e}")))?;
+        crs.inspiring_pack_params = None;
+        crs.inspiring_packing_key = None;
+        cache
+    } else {
+        ServerInspiringCache::from_setup(&mut crs, &encoded_db)
+            .map_err(|e| AdapterError::Scheme(format!("inspire setup cache: {e}")))?
+    };
     Ok((
         InspireServerState {
             crs: Arc::new(crs),
@@ -415,12 +435,43 @@ pub fn snapshot_inspire_state(state: &InspireServerState) -> Result<Vec<u8>> {
 /// dispatches on the prefix.
 pub const SNAPSHOT_V6_MAGIC: [u8; 4] = *b"RV6\0";
 
+/// V7 magic header; V7 retains upstream PPOI event metadata in the logical store.
+pub const SNAPSHOT_V7_MAGIC: [u8; 4] = *b"RV7\0";
+
 /// V6 envelope; bundling the store lets a commit archive the WAL without
 /// losing logical state on restart.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PersistedInspireStateV6 {
     state: PersistedInspireState,
     store: LogicalLeafStore,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedInspireStateV7 {
+    state: PersistedInspireState,
+    store: LogicalLeafStore,
+}
+
+/// Serialize `(state, store)` with retained PPOI metadata.
+pub fn snapshot_inspire_state_v7(
+    state: &InspireServerState,
+    store: &LogicalLeafStore,
+) -> Result<Vec<u8>> {
+    let bundle = PersistedInspireStateV7 {
+        state: PersistedInspireState {
+            crs: (*state.crs).clone(),
+            encoded_db: (*state.encoded_db).clone(),
+            variant: state.variant,
+            entry_size: state.entry_size,
+        },
+        store: store.clone(),
+    };
+    let mut out = Vec::with_capacity(SNAPSHOT_V7_MAGIC.len() + 1024);
+    out.extend_from_slice(&SNAPSHOT_V7_MAGIC);
+    let body = bincode::serialize(&bundle)
+        .map_err(|e| AdapterError::Serialization(format!("v7 snapshot serialize: {e}")))?;
+    out.extend_from_slice(&body);
+    Ok(out)
 }
 
 /// Serialize `(state, store)` as `SNAPSHOT_V6_MAGIC || bincode(envelope)`.
@@ -528,7 +579,12 @@ pub(crate) fn persist_inspiring_cache(
 /// Reconstruct `(InspireServerState, LogicalLeafStore)`, dispatching on
 /// [`SNAPSHOT_V6_MAGIC`]. V5 yields an empty store that WAL replay refills.
 pub fn restore_inspire_state_v6(bytes: &[u8]) -> Result<(InspireServerState, LogicalLeafStore)> {
-    if let Some(body) = bytes.strip_prefix(SNAPSHOT_V6_MAGIC.as_slice()) {
+    if let Some(body) = bytes.strip_prefix(SNAPSHOT_V7_MAGIC.as_slice()) {
+        let bundle: PersistedInspireStateV7 = bincode::deserialize(body)
+            .map_err(|e| AdapterError::Serialization(format!("v7 snapshot deserialize: {e}")))?;
+        let state = bundle_to_state(bundle.state)?;
+        Ok((state, bundle.store))
+    } else if let Some(body) = bytes.strip_prefix(SNAPSHOT_V6_MAGIC.as_slice()) {
         let bundle: PersistedInspireStateV6 = bincode::deserialize(body)
             .map_err(|e| AdapterError::Serialization(format!("v6 snapshot deserialize: {e}")))?;
         let state = bundle_to_state(bundle.state)?;
@@ -548,7 +604,21 @@ pub(crate) fn restore_inspire_state_v6_cached(
     bytes: &[u8],
     data_dir: &std::path::Path,
 ) -> Result<(InspireServerState, LogicalLeafStore, bool, bool)> {
-    if let Some(body) = bytes.strip_prefix(SNAPSHOT_V6_MAGIC.as_slice()) {
+    if let Some(body) = bytes.strip_prefix(SNAPSHOT_V7_MAGIC.as_slice()) {
+        let bundle: PersistedInspireStateV7 = bincode::deserialize(body)
+            .map_err(|e| AdapterError::Serialization(format!("v7 snapshot deserialize: {e}")))?;
+        let (cache, hit, persisted) =
+            cache_for_recovery(data_dir, &bundle.state.crs, &bundle.state.encoded_db)?;
+        let state = InspireServerState {
+            crs: Arc::new(bundle.state.crs),
+            encoded_db: Arc::new(bundle.state.encoded_db),
+            cache: Arc::new(cache),
+            session_store: Arc::new(BoundedSessionStore::new()),
+            variant: bundle.state.variant,
+            entry_size: bundle.state.entry_size,
+        };
+        Ok((state, bundle.store, hit, persisted))
+    } else if let Some(body) = bytes.strip_prefix(SNAPSHOT_V6_MAGIC.as_slice()) {
         let bundle: PersistedInspireStateV6 = bincode::deserialize(body)
             .map_err(|e| AdapterError::Serialization(format!("v6 snapshot deserialize: {e}")))?;
         let (cache, hit, persisted) =
@@ -653,7 +723,8 @@ pub use logical_store::{
 mod snapshot_v6_tests {
     use super::{
         restore_inspire_state, restore_inspire_state_v6, setup_state, snapshot_inspire_state,
-        snapshot_inspire_state_v6, InspireVariant, LogicalLeafStore, SNAPSHOT_V6_MAGIC,
+        snapshot_inspire_state_v6, snapshot_inspire_state_v7, InspireVariant, LogicalLeafStore,
+        SNAPSHOT_V6_MAGIC, SNAPSHOT_V7_MAGIC,
     };
     use raven_inspire::params::InspireParams;
 
@@ -677,6 +748,40 @@ mod snapshot_v6_tests {
             "V6 snapshot must start with RV6\\0 magic; got {:?}",
             bytes.get(..SNAPSHOT_V6_MAGIC.len())
         );
+    }
+
+    #[test]
+    fn v7_snapshot_carries_distinct_magic_prefix() {
+        let (state, _) = toy_state_and_db();
+        let store = LogicalLeafStore::new();
+        let bytes = snapshot_inspire_state_v7(&state, &store).expect("v7 serialize");
+        assert!(bytes.starts_with(&SNAPSHOT_V7_MAGIC));
+        assert!(!bytes.starts_with(&SNAPSHOT_V6_MAGIC));
+        restore_inspire_state_v6(&bytes).expect("v7 restore through current reader");
+    }
+
+    #[test]
+    fn explicit_inspiring_seed_is_reused_across_fresh_instances() {
+        let params = InspireParams::secure_128_d2048();
+        let database = raven_railgun_testkit::toy_db(256, 32);
+        let (first, _) = super::setup_state_with_inspiring_seed(
+            &params,
+            &database,
+            32,
+            InspireVariant::TwoPacking,
+            None,
+        )
+        .expect("first setup");
+        let (second, _) = super::setup_state_with_inspiring_seed(
+            &params,
+            &database,
+            32,
+            InspireVariant::TwoPacking,
+            Some(first.crs.inspiring_w_seed),
+        )
+        .expect("second setup");
+        assert_eq!(first.crs.inspiring_w_seed, second.crs.inspiring_w_seed);
+        assert_eq!(first.cache_fingerprint(), second.cache_fingerprint());
     }
 
     #[test]

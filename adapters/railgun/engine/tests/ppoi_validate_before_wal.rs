@@ -50,6 +50,9 @@ fn list_leaf(list_index: u32, byte: u8) -> WalEntryPayload {
         list_index,
         blinded_commitment: blinded_commitment(byte),
         status: 1,
+        event_type: raven_railgun_persistence::PpoiEventType::Shield,
+        signature: vec![0; 64],
+        validated_merkleroot: [0; 32],
     }
 }
 

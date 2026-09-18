@@ -31,7 +31,7 @@ pub(crate) fn bincode_deserialize_capped<T: serde::de::DeserializeOwned>(
 
 /// Wire-protocol schema version; u16 BE prefix on every bincode body. A bump is a
 /// structural break requiring every client to upgrade.
-pub const WIRE_SCHEMA_VERSION: u16 = 6;
+pub const WIRE_SCHEMA_VERSION: u16 = 7;
 
 /// Length of the [`WIRE_SCHEMA_VERSION`] prefix in bytes.
 pub const WIRE_SCHEMA_PREFIX_LEN: usize = 2;

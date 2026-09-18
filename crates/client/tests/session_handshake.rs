@@ -52,7 +52,7 @@ fn wasm_exports_upload_versioned_keys_then_install_the_returned_handle() {
     let (mut session, shard_config) = session_fixture();
 
     let registration = client_packing_keys_versioned(&session).expect("registration body");
-    assert_eq!(registration.get(..2), Some([0, 6].as_slice()));
+    assert_eq!(registration.get(..2), Some([0, 7].as_slice()));
     let keys: ClientPackingKeys =
         bincode::deserialize(registration.get(2..).expect("versioned body")).expect("packing keys");
     assert!(
@@ -113,7 +113,7 @@ fn wasm_padded_batch_is_ready_to_post_and_keeps_caller_order_metadata() {
     let encoded = build_padded_batch(&session, &shard_bincode, &targets_bincode, 1_000_000)
         .expect("padded batch");
     let output: WasmPaddedBatchOutput = bincode::deserialize(&encoded).expect("decode output");
-    assert_eq!(output.query_batch_bytes.get(..2), Some([0, 6].as_slice()));
+    assert_eq!(output.query_batch_bytes.get(..2), Some([0, 7].as_slice()));
     let queries: Vec<SeededClientQuery> = bincode::deserialize(
         output
             .query_batch_bytes

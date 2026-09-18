@@ -7,7 +7,7 @@
 
 mod payload;
 
-pub use payload::WalEntryPayload;
+pub use payload::{PpoiEventMetadata, PpoiEventType, WalEntryPayload};
 
 pub use raven_storage::{
     advance_manifest_and_archive, apply_retention, atomic_write, fsync_parent_dir, open_recovery,

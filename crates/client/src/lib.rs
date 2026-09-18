@@ -307,7 +307,7 @@ fn decode_validated_shard_config(
 }
 
 // Adapter HTTP envelope version; parity-gated here to avoid a framework-to-transport dependency.
-const SESSION_WIRE_SCHEMA_VERSION: u16 = 6;
+const SESSION_WIRE_SCHEMA_VERSION: u16 = 7;
 
 fn decode<T: for<'de> Deserialize<'de>>(
     bytes: &[u8],

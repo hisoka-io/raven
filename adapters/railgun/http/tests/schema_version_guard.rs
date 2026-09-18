@@ -31,7 +31,7 @@ use tower::ServiceExt;
 
 const TOKEN: &str = "schema-version-guard-token-1234567";
 const INSTANCE: &str = "schema-version-instance";
-const PREVIOUS_WIRE_SCHEMA_VERSION: u16 = 5;
+const PREVIOUS_WIRE_SCHEMA_VERSION: u16 = 6;
 
 static APPSTATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -240,7 +240,7 @@ fn read_batch_at_schema<T: serde::de::DeserializeOwned>(
 #[test]
 fn previous_and_current_single_response_layouts_refuse_each_other() {
     assert_eq!(
-        WIRE_SCHEMA_VERSION, 6,
+        WIRE_SCHEMA_VERSION, 7,
         "tight 60-bit coefficients change query and response bytes"
     );
     let (v2_response, current_response) = response_layouts();
@@ -254,12 +254,12 @@ fn previous_and_current_single_response_layouts_refuse_each_other() {
 
     let current_error = raven_railgun_http::read_versioned::<ServerResponse>(&old)
         .expect_err("current reader must refuse a real v2 response");
-    assert!(current_error.to_string().contains("expects v6"));
-    assert!(current_error.to_string().contains("sent v5"));
+    assert!(current_error.to_string().contains("expects v7"));
+    assert!(current_error.to_string().contains("sent v6"));
     let old_error =
         read_at_schema::<FrozenV2ServerResponse>(&current, PREVIOUS_WIRE_SCHEMA_VERSION)
             .expect_err("previous reader must refuse a real current response");
-    assert!(old_error.contains("expected v5, got v6"));
+    assert!(old_error.contains("expected v6, got v7"));
 }
 
 #[test]
@@ -275,13 +275,13 @@ fn previous_and_current_batch_response_layouts_refuse_each_other() {
     );
     let current_error = read_batch_response_versioned::<ServerResponse>(&old)
         .expect_err("current batch reader must refuse a real v2 response");
-    assert!(current_error.to_string().contains("expects v6"));
-    assert!(current_error.to_string().contains("sent v5"));
+    assert!(current_error.to_string().contains("expects v7"));
+    assert!(current_error.to_string().contains("sent v6"));
 
     let old_error =
         read_batch_at_schema::<FrozenV2ServerResponse>(&current, PREVIOUS_WIRE_SCHEMA_VERSION)
             .expect_err("previous batch reader must refuse a real current response");
-    assert!(old_error.contains("expected v5, got v6"));
+    assert!(old_error.contains("expected v6, got v7"));
 }
 
 async fn status_of(route: &str, body: Vec<u8>) -> StatusCode {
@@ -318,7 +318,7 @@ async fn previous_schema_rejection_advertises_the_current_version() {
             .headers()
             .get(X_RAVEN_SCHEMA_VERSION.to_ascii_lowercase())
             .expect("schema mismatch must advertise the accepted version"),
-        "6"
+        "7"
     );
 }
 

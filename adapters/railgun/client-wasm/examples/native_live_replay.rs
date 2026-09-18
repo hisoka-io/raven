@@ -38,7 +38,7 @@ use raven_inspire::{
 };
 
 const WIRE_SCHEMA_PREFIX_LEN: usize = 2;
-const WIRE_SCHEMA_VERSION: u16 = 6;
+const WIRE_SCHEMA_VERSION: u16 = 7;
 const KEY_SEED: [u8; 32] = *b"raven-native-live-replay-key-001";
 const NOISE_SEED: [u8; 32] = *b"raven-native-live-replay-noise01";
 

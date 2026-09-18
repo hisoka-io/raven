@@ -135,6 +135,9 @@ fn seed_ppoi_list_with_committed_snapshot(
             list_index: i,
             blinded_commitment: canonical(u8::try_from(i).unwrap_or(0).saturating_add(1)),
             status: 0,
+            event_type: raven_railgun_persistence::PpoiEventType::Shield,
+            signature: vec![0; 64],
+            validated_merkleroot: [0; 32],
         };
         opened
             .persistence

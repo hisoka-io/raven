@@ -266,7 +266,7 @@ describe("upstream-passthrough endpoints", () => {
     server.route(
       (req) => req.url === "/",
       (_req, body, res) => {
-        observed = writeJsonRpcResult(body, res, null);
+        observed = writeJsonRpcResult(body, res, undefined);
         return true;
       },
     );

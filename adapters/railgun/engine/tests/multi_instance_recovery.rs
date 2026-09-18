@@ -183,6 +183,9 @@ async fn multi_instance_bootstrap_routes_events_per_instance() {
         list_index: 0,
         blinded_commitment: planted_bc_a,
         status: 0,
+        event_type: raven_railgun_persistence::PpoiEventType::Shield,
+        signature: vec![0; 64],
+        validated_merkleroot: [0; 32],
     };
     mh.channels
         .mirror_tx
@@ -214,6 +217,7 @@ async fn multi_instance_bootstrap_routes_events_per_instance() {
                     "PPOI instance must NOT see chain leaves"
                 );
             }
+            DataSourceFilter::PpoiListBlock { .. } => unreachable!("fixture has no block route"),
         }
     }
 
@@ -233,7 +237,9 @@ async fn multi_instance_bootstrap_routes_events_per_instance() {
                     "ppoi-list-b instance must NOT see list-a leaf"
                 );
             }
-            DataSourceFilter::PpoiList(_) | DataSourceFilter::ChainTreeNumber(_) => {
+            DataSourceFilter::PpoiList(_)
+            | DataSourceFilter::PpoiListBlock { .. }
+            | DataSourceFilter::ChainTreeNumber(_) => {
                 assert_eq!(
                     store.ppoi_count(),
                     0,
@@ -310,6 +316,9 @@ async fn multi_instance_recovery_byte_identity() {
                         list_index: i,
                         blinded_commitment: bc,
                         status: 0,
+                        event_type: raven_railgun_persistence::PpoiEventType::Shield,
+                        signature: vec![0; 64],
+                        validated_merkleroot: [0; 32],
                     },
                     0,
                 ))
@@ -335,6 +344,7 @@ async fn multi_instance_recovery_byte_identity() {
                 ppoi_roots_pre.push((lk, store.ppoi_imt_root(&lk)));
                 ppoi_counts_pre.push((lk, store.ppoi_list_leaves_iter(&lk).count()));
             }
+            DataSourceFilter::PpoiListBlock { .. } => unreachable!("fixture has no block route"),
         }
     }
 
@@ -424,6 +434,7 @@ async fn multi_instance_recovery_byte_identity() {
                     );
                 }
             }
+            DataSourceFilter::PpoiListBlock { .. } => unreachable!("fixture has no block route"),
         }
     }
 

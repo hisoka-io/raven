@@ -1,4 +1,5 @@
 import { containsByteSequence, hexToBytes } from "../../src/index";
+import { EXPECTED_WIRE_SCHEMA_PREFIX } from "./wire_schema";
 
 export const STUB_QUERY_BYTES = 64;
 
@@ -38,8 +39,12 @@ function inspectPirRequest(
   if (request.body.length < headerBytes) {
     fail(request, `body is ${request.body.length} bytes, shorter than ${headerBytes}-byte header`);
   }
-  if (request.body[0] !== 0 || request.body[1] !== 6) {
-    fail(request, `schema prefix is [${request.body[0]}, ${request.body[1]}], expected [0, 6]`);
+  const [hi, lo] = EXPECTED_WIRE_SCHEMA_PREFIX;
+  if (request.body[0] !== hi || request.body[1] !== lo) {
+    fail(
+      request,
+      `schema prefix is [${request.body[0]}, ${request.body[1]}], expected [${hi}, ${lo}]`,
+    );
   }
 
   let queryCount = 1;

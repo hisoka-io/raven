@@ -360,6 +360,9 @@ async fn mirror_emits_ppoi_list_leaf_added_for_each_event() {
                     list_key: lk_leaf,
                     list_index,
                     blinded_commitment: bc_leaf,
+                    event_type,
+                    signature,
+                    validated_merkleroot,
                     ..
                 }),
                 Some(WalEntryPayload::PpoiStatus {
@@ -376,6 +379,21 @@ async fn mirror_emits_ppoi_list_leaf_added_for_each_event() {
                 assert_eq!(
                     bc_leaf, bc_status,
                     "PpoiListLeafAdded and PpoiStatus must reference the same bc within a pair"
+                );
+                let second_row = *list_index % 2 == 1;
+                let expected_byte = if second_row { 0x11 } else { 0x00 };
+                assert_eq!(signature, &vec![expected_byte; 64]);
+                assert_eq!(
+                    *event_type,
+                    if second_row {
+                        raven_railgun_persistence::PpoiEventType::Transact
+                    } else {
+                        raven_railgun_persistence::PpoiEventType::Shield
+                    }
+                );
+                assert_eq!(
+                    validated_merkleroot,
+                    &[if second_row { 0xbb } else { 0xaa }; 32]
                 );
                 if let Some(prev) = last_idx {
                     assert!(

@@ -908,8 +908,9 @@ fn spawn_one_ppoi_list(inputs: &PpoiListSpawnInputs<'_>, append_log: bool) -> an
         .map_err(|e| anyhow::anyhow!("engine.add_live: {e}"))?;
 
     inputs.ppoi_list_routes.rcu(|cur| {
-        let mut next: Vec<([u8; 32], tokio::sync::mpsc::Sender<ConsumerEvent>)> = (**cur).clone();
-        next.push((inputs.list_key, sender.clone()));
+        let mut next: Vec<(DataSourceFilter, tokio::sync::mpsc::Sender<ConsumerEvent>)> =
+            (**cur).clone();
+        next.push((DataSourceFilter::PpoiList(inputs.list_key), sender.clone()));
         next
     });
 

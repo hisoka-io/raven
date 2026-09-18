@@ -14,6 +14,11 @@ use raven_railgun_core::InstanceId;
 use raven_railgun_engine::{Engine, PirInstance, PirScheme, Snapshot};
 use tokio::sync::Semaphore;
 
+/// Merkle levels carried IN the path-10 row; the rest ride in the addendum.
+const PATH10_LEVELS: usize = raven_railgun_engine::pir_table::list::PATH10_LEVELS;
+/// Levels 11..15, the upper siblings that are constant across a shard.
+const ADDENDUM_LEVELS: usize = raven_railgun_engine::imt::TREE_DEPTH - PATH10_LEVELS;
+
 use crate::auth::validate_session_binding;
 use crate::state::AppState;
 use crate::versioned::{read_versioned, write_batch_response_versioned, write_versioned};
@@ -261,13 +266,96 @@ pub(crate) async fn inspire_batch_handler(
     body: Bytes,
 ) -> Result<(StatusCode, HeaderMap, Bytes), StatusCode> {
     let instance_id = InstanceId::new(id.clone());
-    admit_instance(&app.engine, &instance_id, "batch").map_err(AdmissionRefusal::status)?;
+    let instance =
+        admit_instance(&app.engine, &instance_id, "batch").map_err(AdmissionRefusal::status)?;
     let queries: Vec<SeededClientQuery> =
         read_versioned(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
     for handle in queries.iter().filter_map(|query| query.session_handle) {
         validate_session_binding(&headers, app.sessions.as_ref(), &instance_id, Some(handle))?;
     }
-    batch_handler(State(app), Path(id), body).await
+    let addenda = match app.instance_logical_stores.get(&instance_id) {
+        None => None,
+        Some((list_key, store)) => {
+            // `entries_per_shard` is operator-configurable. A literal 2048 here computes the
+            // addendum for the WRONG leaf at any other width and returns it with HTTP 200.
+            let entries_per_shard = u32::try_from(
+                instance
+                    .current_snapshot()
+                    .state
+                    .shard_config()
+                    .entries_per_shard(),
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let store = store.lock();
+            let mut out = Vec::with_capacity(queries.len());
+            for query in &queries {
+                let first = query
+                    .shard_id
+                    .checked_mul(entries_per_shard)
+                    .ok_or(StatusCode::BAD_REQUEST)?;
+                // An unpopulated shard used to `unwrap_or_default()` into an EMPTY addendum,
+                // with no log and no counter, which the client folds into a wrong root.
+                let proof = store.ppoi_merkle_proof(list_key, first).map_err(|err| {
+                    tracing::warn!(
+                        instance_id = %instance_id,
+                        shard_id = query.shard_id,
+                        first_leaf = first,
+                        ?err,
+                        "batch refused: no upper-sibling addendum for shard"
+                    );
+                    metrics::counter!(
+                        "raven_railgun_addendum_missing_total",
+                        "instance" => instance_id.to_string()
+                    )
+                    .increment(1);
+                    StatusCode::SERVICE_UNAVAILABLE
+                })?;
+                out.push(
+                    proof
+                        .elements
+                        .into_iter()
+                        .skip(PATH10_LEVELS)
+                        .take(ADDENDUM_LEVELS)
+                        .flatten()
+                        .collect(),
+                );
+            }
+            Some(out)
+        }
+    };
+    let (status, headers, response) = batch_handler(State(app), Path(id), body).await?;
+    let Some(addenda) = addenda else {
+        return Ok((status, headers, response));
+    };
+    let reframed = append_batch_addenda(&response, &addenda)
+        .map_err(|()| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((status, headers, reframed.into()))
+}
+
+fn append_batch_addenda(bytes: &[u8], addenda: &[Vec<u8>]) -> Result<Vec<u8>, ()> {
+    if bytes.len() < 10 {
+        return Err(());
+    }
+    let mut out = bytes.get(..10).ok_or(())?.to_vec();
+    let mut offset = 10usize;
+    for addendum in addenda {
+        let len_end = offset.checked_add(8).ok_or(())?;
+        let len_bytes = bytes.get(offset..len_end).ok_or(())?;
+        let mut len_buf = [0u8; 8];
+        len_buf.copy_from_slice(len_bytes);
+        let len = usize::try_from(u64::from_le_bytes(len_buf)).map_err(|_| ())?;
+        let body_end = len_end.checked_add(len).ok_or(())?;
+        let body = bytes.get(len_end..body_end).ok_or(())?;
+        let new_len = u64::try_from(len.checked_add(addendum.len()).ok_or(())?).map_err(|_| ())?;
+        out.extend_from_slice(&new_len.to_le_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(addendum);
+        offset = body_end;
+    }
+    if offset != bytes.len() {
+        return Err(());
+    }
+    Ok(out)
 }
 
 /// Keep the concurrency permit with the work, not with the request.
@@ -552,5 +640,114 @@ where
                 }),
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod append_addenda_tests {
+    use super::append_batch_addenda;
+    use crate::versioned::{write_batch_response_versioned, WIRE_SCHEMA_PREFIX_LEN};
+
+    /// Rebuild the framing `append_batch_addenda` rewrites, independently of the function
+    /// under test: header, then `{u64 LE len, body}` per slot. Comparing the function to
+    /// itself is the self-oracle this batch has already withdrawn one result over.
+    fn split_slots(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let header = WIRE_SCHEMA_PREFIX_LEN + 8;
+        let count = u64::from_le_bytes(
+            bytes[WIRE_SCHEMA_PREFIX_LEN..header]
+                .try_into()
+                .expect("count"),
+        );
+        let mut out = Vec::new();
+        let mut offset = header;
+        for _ in 0..count {
+            let len = usize::try_from(u64::from_le_bytes(
+                bytes[offset..offset + 8].try_into().expect("len"),
+            ))
+            .expect("len fits");
+            offset += 8;
+            out.push(bytes[offset..offset + len].to_vec());
+            offset += len;
+        }
+        assert_eq!(offset, bytes.len(), "trailing bytes after {count} slots");
+        out
+    }
+
+    fn framed(slots: &[Vec<u8>]) -> Vec<u8> {
+        write_batch_response_versioned(slots).expect("frame")
+    }
+
+    #[test]
+    fn appends_each_addendum_to_its_own_slot_and_preserves_order() {
+        // Distinct lengths AND distinct bytes, so a swapped or shared addendum shows up.
+        let slots = vec![vec![0xaa_u8; 512], vec![0xbb; 512], vec![0xcc; 512]];
+        let addenda = vec![vec![0x11_u8; 160], vec![0x22; 160], vec![0x33; 160]];
+        let out = append_batch_addenda(&framed(&slots), &addenda).expect("append");
+
+        let got = split_slots(&out);
+        assert_eq!(got.len(), 3);
+        for (i, slot) in got.iter().enumerate() {
+            // bincode prefixes a Vec<u8> with its length, so compare the TAIL, which is
+            // what `runClientPirQueryBatch` slices off, not the whole body.
+            assert_eq!(slot.len(), 512 + 8 + 160, "slot {i} length");
+            assert_eq!(&slot[slot.len() - 160..], &addenda[i][..], "slot {i} addendum");
+            assert!(
+                slot[slot.len() - 161] == 0xaa + u8::try_from(i).expect("i") * 0x11,
+                "slot {i} body must still end with its own bytes"
+            );
+        }
+    }
+
+    /// The cover-query shape: a batch padded to the fixed-size ladder.
+    #[test]
+    fn handles_a_padded_cover_batch_of_four() {
+        let slots = vec![vec![0x01_u8; 512]; 4];
+        let addenda = vec![vec![0x09_u8; 160]; 4];
+        let out = append_batch_addenda(&framed(&slots), &addenda).expect("append");
+        let got = split_slots(&out);
+        assert_eq!(got.len(), 4);
+        assert!(got.iter().all(|s| s.len() == 512 + 8 + 160));
+    }
+
+    /// The planted mutation: one addendum too short. The function must still frame
+    /// consistently, and the test must SEE the difference -- this is the check that would
+    /// have caught a truncated addendum being served with HTTP 200.
+    #[test]
+    fn a_short_addendum_changes_the_framed_length() {
+        let slots = vec![vec![0xaa_u8; 512]];
+        let full = append_batch_addenda(&framed(&slots), &[vec![0x11_u8; 160]]).expect("append");
+        let short = append_batch_addenda(&framed(&slots), &[vec![0x11_u8; 159]]).expect("append");
+        assert_ne!(
+            split_slots(&full)[0].len(),
+            split_slots(&short)[0].len(),
+            "a 159-byte addendum must not frame identically to a 160-byte one"
+        );
+    }
+
+    #[test]
+    fn refuses_a_body_shorter_than_the_header() {
+        assert!(append_batch_addenda(&[0u8; 9], &[vec![0u8; 160]]).is_err());
+    }
+
+    #[test]
+    fn refuses_when_a_declared_slot_length_runs_past_the_body() {
+        let mut bytes = framed(&[vec![0xaa_u8; 512]]);
+        let offset = WIRE_SCHEMA_PREFIX_LEN + 8;
+        bytes[offset..offset + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(append_batch_addenda(&bytes, &[vec![0x11_u8; 160]]).is_err());
+    }
+
+    #[test]
+    fn refuses_trailing_bytes_after_the_last_slot() {
+        let mut bytes = framed(&[vec![0xaa_u8; 512]]);
+        bytes.push(0xff);
+        assert!(append_batch_addenda(&bytes, &[vec![0x11_u8; 160]]).is_err());
+    }
+
+    /// Fewer addenda than slots leaves slots unvisited, so `offset != bytes.len()`.
+    #[test]
+    fn refuses_when_addenda_do_not_cover_every_slot() {
+        let slots = vec![vec![0xaa_u8; 512], vec![0xbb; 512]];
+        assert!(append_batch_addenda(&framed(&slots), &[vec![0x11_u8; 160]]).is_err());
     }
 }

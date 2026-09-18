@@ -48,6 +48,9 @@ fn ppoi_payload_with(list_index: u32, bc: [u8; 32]) -> WalEntryPayload {
         list_index,
         blinded_commitment: bc,
         status: 0,
+        event_type: raven_railgun_persistence::PpoiEventType::Shield,
+        signature: vec![0; 64],
+        validated_merkleroot: [0; 32],
     }
 }
 

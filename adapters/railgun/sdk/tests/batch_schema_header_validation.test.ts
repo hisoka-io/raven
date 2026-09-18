@@ -6,6 +6,10 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { ImtCache, RavenError, RavenPOINodeInterface, imtCacheScopeKey } from "../src/index";
 
+import {
+  EXPECTED_WIRE_SCHEMA_PREFIX,
+  EXPECTED_WIRE_SCHEMA_VERSION,
+} from "./helpers/wire_schema";
 import { startMockServer, type MockServer } from "./helpers/mock_server";
 import { NODE_BYTES, TOKEN, encodeBatchResponse, encodedBatchCount, stubCtx } from "./helpers/auth_path_stub";
 
@@ -67,7 +71,7 @@ describe("batch schema-version header validation", () => {
     expect(RavenError.is(thrown, "StaleAdapter")).toBe(true);
   });
 
-  it("sends v6 and classifies an old v2 server refusal with both versions", async () => {
+  it("sends the current schema and classifies an old v2 server refusal with both versions", async () => {
     let requestPrefix: number[] = [];
     server.route(
       (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
@@ -86,10 +90,10 @@ describe("batch schema-version header validation", () => {
       thrown = error;
     }
 
-    expect(requestPrefix).toEqual([0, 6]);
+    expect(requestPrefix).toEqual([...EXPECTED_WIRE_SCHEMA_PREFIX]);
     expect(RavenError.is(thrown, "StaleAdapter")).toBe(true);
     if (RavenError.is(thrown, "StaleAdapter")) {
-      expect(thrown.context.clientWireSchemaVersion).toBe(6);
+      expect(thrown.context.clientWireSchemaVersion).toBe(EXPECTED_WIRE_SCHEMA_VERSION);
       expect(thrown.context.serverWireSchemaVersion).toBe(2);
     }
   });

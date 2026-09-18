@@ -9,9 +9,7 @@ use std::time::Instant;
 
 use raven_railgun_core::AdapterError;
 use raven_railgun_engine::inspire::re_encode_shard;
-use raven_railgun_engine::inspire::{
-    apply_wal_entry, restore_inspire_state_v6, snapshot_inspire_state_v6,
-};
+use raven_railgun_engine::inspire::{apply_wal_entry, restore_inspire_state_v6};
 use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
 use raven_railgun_persistence::{
     open_recovery, Manifest, ManifestShape, PersistenceError, Snapshot, SnapshotId, StoreLayout,
@@ -200,7 +198,7 @@ pub fn run_with_checkpoint(
     checkpoint(MigrationCheckpoint::PreSnapshot);
     // Keeps the V6 body consistent with the manifest stamped below; without it opens
     // recover an empty store and chain events land against nothing.
-    let bundle = snapshot_inspire_state_v6(&state, &logical_store)
+    let bundle = raven_railgun_engine::inspire::snapshot_inspire_state_v7(&state, &logical_store)
         .map_err(|e| anyhow::anyhow!("snapshot_inspire_state_v6: {e}"))?;
     let new_snap = Snapshot::build(bundle, SNAPSHOT_MAGIC);
     let new_id = manifest.current_snapshot_id.next();

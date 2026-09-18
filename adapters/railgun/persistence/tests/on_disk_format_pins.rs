@@ -9,7 +9,7 @@
 #![allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 use raven_railgun_persistence::{
-    Snapshot, SnapshotId, StoreLayout, WalEntryPayload, SNAPSHOT_MAGIC,
+    PpoiEventType, Snapshot, SnapshotId, StoreLayout, WalEntryPayload, SNAPSHOT_MAGIC,
 };
 
 /// The bytes an already-deployed snapshot carries in its header.
@@ -62,6 +62,10 @@ fn wal_payload_vectors() -> Vec<(WalEntryPayload, Vec<u8>)> {
     list_leaf_added.extend_from_slice(&0x2122_2324u32.to_le_bytes());
     list_leaf_added.extend_from_slice(&[0xEE; 32]);
     list_leaf_added.push(0x02);
+    list_leaf_added.extend_from_slice(&0u32.to_le_bytes());
+    list_leaf_added.extend_from_slice(&64u64.to_le_bytes());
+    list_leaf_added.extend_from_slice(&[0xAB; 64]);
+    list_leaf_added.extend_from_slice(&[0xAC; 32]);
 
     let mut reorg = vec![0x03, 0x00, 0x00, 0x00];
     reorg.extend_from_slice(&0x3132_3334_3536_3738u64.to_le_bytes());
@@ -92,6 +96,9 @@ fn wal_payload_vectors() -> Vec<(WalEntryPayload, Vec<u8>)> {
                 list_index: 0x2122_2324,
                 blinded_commitment: [0xEE; 32],
                 status: 2,
+                event_type: PpoiEventType::Shield,
+                signature: vec![0xAB; 64],
+                validated_merkleroot: [0xAC; 32],
             },
             list_leaf_added,
         ),

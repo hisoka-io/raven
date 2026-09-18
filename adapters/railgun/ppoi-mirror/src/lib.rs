@@ -353,6 +353,9 @@ impl UpstreamPpoiMirror {
                     list_index: ev.list_index,
                     blinded_commitment: ev.blinded_commitment.0,
                     status: status_byte,
+                    event_type: ev.event_type,
+                    signature: ev.signature.to_vec(),
+                    validated_merkleroot: ev.validated_merkleroot,
                 };
                 if sender.send((leaf_added, 0)).await.is_err() {
                     tracing::info!("ppoi mirror engine consumer dropped channel; exiting");
@@ -479,6 +482,9 @@ struct IndexedPoiEvent {
     list_index: u32,
     blinded_commitment: BlindedCommitment,
     status: POIStatus,
+    event_type: raven_railgun_persistence::PpoiEventType,
+    signature: [u8; 64],
+    validated_merkleroot: [u8; 32],
 }
 
 fn decode_indexed_events(
@@ -512,19 +518,21 @@ fn decode_indexed_events(
             )));
         }
         previous = Some(index);
-        decode_hex64(&event.signed_event.signature).ok_or_else(|| {
+        let signature = decode_hex64(&event.signed_event.signature).ok_or_else(|| {
             MirrorError::Decode(format!("invalid signature hex at index {index}"))
         })?;
-        if !matches!(
-            event.signed_event.event_type.as_str(),
-            "Shield" | "Transact" | "Unshield" | "LegacyTransact"
-        ) {
-            return Err(MirrorError::Decode(format!(
-                "unknown PPOI event type {} at index {index}",
-                event.signed_event.event_type
-            )));
-        }
-        decode_hex32(&event.validated_merkleroot).ok_or_else(|| {
+        let event_type = match event.signed_event.event_type.as_str() {
+            "Shield" => raven_railgun_persistence::PpoiEventType::Shield,
+            "Transact" => raven_railgun_persistence::PpoiEventType::Transact,
+            "Unshield" => raven_railgun_persistence::PpoiEventType::Unshield,
+            "LegacyTransact" => raven_railgun_persistence::PpoiEventType::LegacyTransact,
+            event_type => {
+                return Err(MirrorError::Decode(format!(
+                    "unknown PPOI event type {event_type} at index {index}"
+                )));
+            }
+        };
+        let validated_merkleroot = decode_hex32(&event.validated_merkleroot).ok_or_else(|| {
             MirrorError::Decode(format!("invalid validatedMerkleroot hex at index {index}"))
         })?;
         let bc_str = event.signed_event.blinded_commitment;
@@ -538,6 +546,9 @@ fn decode_indexed_events(
             list_index,
             blinded_commitment: BlindedCommitment::from_bytes(bc_bytes),
             status: POIStatus::Valid,
+            event_type,
+            signature,
+            validated_merkleroot,
         });
     }
     Ok(out)

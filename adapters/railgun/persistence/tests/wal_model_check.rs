@@ -4,7 +4,7 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use proptest::prelude::*;
-use raven_railgun_persistence::{StoreLayout, Wal, WalEntryPayload};
+use raven_railgun_persistence::{PpoiEventType, StoreLayout, Wal, WalEntryPayload};
 
 fn payload_strategy() -> impl Strategy<Value = WalEntryPayload> {
     prop_oneof![
@@ -30,6 +30,9 @@ fn payload_strategy() -> impl Strategy<Value = WalEntryPayload> {
                     list_index,
                     blinded_commitment,
                     status,
+                    event_type: PpoiEventType::Shield,
+                    signature: vec![0xA5; 64],
+                    validated_merkleroot: [0x5A; 32],
                 }
             }
         ),

@@ -23,7 +23,7 @@ use raven_railgun_engine::persistence::{
 };
 use raven_railgun_engine::pir_table::{
     validate_rows_per_shard, EncoderKind, PirTableEncoder, LEAVES_PER_TREE, NODE_HASH_BYTES,
-    PATH_RECORD_BYTES, PER_NODE_TOTAL_NODES,
+    PATH10_RECORD_BYTES, PATH_RECORD_BYTES, PER_NODE_TOTAL_NODES,
 };
 use raven_railgun_engine::InstanceRole;
 use raven_railgun_persistence::{StoreLayout, WalEntryPayload};
@@ -929,6 +929,7 @@ fn cell_shape_for_encoder(kind: EncoderKind) -> (u32, usize) {
         EncoderKind::PerLeafPath { .. } | EncoderKind::PerListPath { .. } => {
             (LEAVES_PER_TREE, PATH_RECORD_BYTES)
         }
+        EncoderKind::PerListPath10 { .. } => (LEAVES_PER_TREE, PATH10_RECORD_BYTES),
         EncoderKind::PerNode { .. } | EncoderKind::PerListNode { .. } => {
             (PER_NODE_TOTAL_NODES, NODE_HASH_BYTES)
         }
@@ -1092,6 +1093,8 @@ pub trait PpoiEventsSource: Send + Sync {
 pub struct PpoiEventRow {
     pub index: u64,
     pub leaf: [u8; 32],
+    pub event_type: Option<raven_railgun_persistence::PpoiEventType>,
+    pub signature: Option<Vec<u8>>,
     pub validated_merkleroot: [u8; 32],
 }
 
@@ -1228,6 +1231,7 @@ pub struct RailwayPpoiClient {
     chain_type: u32,
     chain_id: u64,
     http: reqwest::Client,
+    max_events: Option<u64>,
 }
 
 impl std::fmt::Debug for RailwayPpoiClient {
@@ -1310,7 +1314,15 @@ impl RailwayPpoiClient {
             chain_type,
             chain_id,
             http,
+            max_events: None,
         })
+    }
+
+    /// Bound a diagnostic sync to an exact prefix of the advertised list.
+    #[must_use]
+    pub fn with_event_limit(mut self, max_events: u64) -> Self {
+        self.max_events = Some(max_events);
+        self
     }
 
     pub fn bases(&self) -> &[String] {
@@ -1352,6 +1364,55 @@ struct RailwayJsonRpcError {
 
 const PPOI_EVENT_PAGE_ROWS: u64 = 501;
 
+fn railway_network_name(chain_id: u64) -> Result<&'static str, BootstrapError> {
+    match chain_id {
+        1 => Ok("Ethereum"),
+        56 => Ok("BNB_Chain"),
+        137 => Ok("Polygon"),
+        42_161 => Ok("Arbitrum"),
+        11_155_111 => Ok("Ethereum_Sepolia"),
+        _ => Err(BootstrapError::ClientConfig {
+            client: "RailwayPpoiClient",
+            reason: format!("unsupported chain id {chain_id} for PPOI node-status canary"),
+        }),
+    }
+}
+
+fn parse_event_history_count(
+    status: &serde_json::Value,
+    network_name: &str,
+    list_key: [u8; 32],
+) -> Result<u64, String> {
+    let list_key_hex = to_hex(&list_key);
+    let list_status = status
+        .get("forNetwork")
+        .and_then(|networks| networks.get(network_name))
+        .and_then(|network| network.get("listStatuses"))
+        .and_then(|lists| lists.get(&list_key_hex))
+        .ok_or_else(|| format!("node status has no {network_name} list {list_key_hex}"))?;
+    let lengths = list_status
+        .get("poiEventLengths")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "node status poiEventLengths is not an object".to_owned())?;
+    let event_count = lengths.values().try_fold(0u64, |sum, value| {
+        let count = value
+            .as_u64()
+            .ok_or_else(|| "node status poiEventLengths contains a non-u64 value".to_owned())?;
+        sum.checked_add(count)
+            .ok_or_else(|| "node status poiEventLengths sum overflows u64".to_owned())
+    })?;
+    let historical_count = list_status
+        .get("historicalMerklerootsLength")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "node status historicalMerklerootsLength is not a u64".to_owned())?;
+    if historical_count != event_count {
+        return Err(format!(
+            "PPOI completeness canary failed: historicalMerklerootsLength {historical_count} != poiEventLengths sum {event_count}"
+        ));
+    }
+    Ok(event_count)
+}
+
 #[async_trait]
 impl PpoiEventsSource for RailwayPpoiClient {
     #[allow(clippy::too_many_lines)]
@@ -1361,14 +1422,79 @@ impl PpoiEventsSource for RailwayPpoiClient {
     ) -> Result<Vec<PpoiEventRow>, BootstrapError> {
         let mut last_err = String::from("(no bases attempted)");
         for base in &self.bases {
+            let status_request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "ppoi_node_status",
+                "params": {},
+                "id": 1u64,
+            });
+            let status_response = match self.http.post(base).json(&status_request).send().await {
+                Ok(response) if response.status().is_success() => response,
+                Ok(response) => {
+                    last_err = format!("{base}: node-status HTTP {}", response.status());
+                    continue;
+                }
+                Err(error) => {
+                    last_err = format!("{base}: node-status {error}");
+                    continue;
+                }
+            };
+            let status_response: RailwayJsonRpcResponse<serde_json::Value> =
+                match status_response.json().await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        last_err = format!("{base}: node-status decode {error}");
+                        continue;
+                    }
+                };
+            let status = match (status_response.result, status_response.error) {
+                (Some(status), None) => status,
+                (None, Some(error)) => {
+                    last_err = format!(
+                        "{base}: node-status JSON-RPC error {}: {}",
+                        error.code, error.message
+                    );
+                    continue;
+                }
+                _ => {
+                    last_err = format!("{base}: node-status malformed JSON-RPC envelope");
+                    continue;
+                }
+            };
+            let network_name = railway_network_name(self.chain_id)?;
+            let expected_events = match parse_event_history_count(&status, network_name, list_key) {
+                Ok(count) => count,
+                Err(error) => {
+                    last_err = format!("{base}: {error}");
+                    continue;
+                }
+            };
+            let target_events = self.max_events.unwrap_or(expected_events);
+            if target_events > expected_events {
+                last_err = format!(
+                    "{base}: requested PPOI prefix {target_events} exceeds node-status count {expected_events}"
+                );
+                continue;
+            }
             let mut out = Vec::new();
             let mut start_index = 0u64;
             let base_outcome = loop {
+                if start_index >= target_events {
+                    break if u64::try_from(out.len()).unwrap_or(u64::MAX) == target_events {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "{base}: PPOI scan returned {} rows for target count {target_events}",
+                            out.len()
+                        ))
+                    };
+                }
                 let Some(end_index) = start_index.checked_add(PPOI_EVENT_PAGE_ROWS - 1) else {
                     break Err(format!(
                         "{base}: PPOI page starting at {start_index} overflows u64"
                     ));
                 };
+                let end_index = end_index.min(target_events - 1);
                 let request = serde_json::json!({
                     "jsonrpc": "2.0",
                     "method": "ppoi_poi_events",
@@ -1417,7 +1543,9 @@ impl PpoiEventsSource for RailwayPpoiClient {
                 };
                 let page_len = parsed.len();
                 if page_len == 0 {
-                    break Ok(());
+                    break Err(format!(
+                        "{base}: PPOI scan ended empty at {start_index} before target count {target_events}"
+                    ));
                 }
                 let mut page = Vec::with_capacity(page_len);
                 let mut previous = None;
@@ -1433,22 +1561,24 @@ impl PpoiEventsSource for RailwayPpoiClient {
                         break;
                     }
                     previous = Some(index);
-                    if parse_hex64(&entry.signed_event.signature).is_err() {
+                    let Ok(signature) = parse_hex64(&entry.signed_event.signature) else {
                         page_error = Some(format!(
                             "{base}: signature at index {index} is not 64-byte hex"
                         ));
                         break;
-                    }
-                    if !matches!(
-                        entry.signed_event.event_type.as_str(),
-                        "Shield" | "Transact" | "Unshield" | "LegacyTransact"
-                    ) {
-                        page_error = Some(format!(
-                            "{base}: unknown PPOI event type {} at index {index}",
-                            entry.signed_event.event_type
-                        ));
-                        break;
-                    }
+                    };
+                    let event_type = match entry.signed_event.event_type.as_str() {
+                        "Shield" => raven_railgun_persistence::PpoiEventType::Shield,
+                        "Transact" => raven_railgun_persistence::PpoiEventType::Transact,
+                        "Unshield" => raven_railgun_persistence::PpoiEventType::Unshield,
+                        "LegacyTransact" => raven_railgun_persistence::PpoiEventType::LegacyTransact,
+                        event_type => {
+                            page_error = Some(format!(
+                                "{base}: unknown PPOI event type {event_type} at index {index}"
+                            ));
+                            break;
+                        }
+                    };
                     let leaf = match parse_hex32(&entry.signed_event.blinded_commitment) {
                         Ok(leaf) => leaf,
                         Err(error) => {
@@ -1470,6 +1600,8 @@ impl PpoiEventsSource for RailwayPpoiClient {
                     page.push(PpoiEventRow {
                         index,
                         leaf,
+                        event_type: Some(event_type),
+                        signature: Some(signature.to_vec()),
                         validated_merkleroot: root,
                     });
                 }
@@ -1832,6 +1964,31 @@ mod unit_tests {
         };
         assert_eq!(client, "RailwayPpoiClient");
         assert!(reason.contains("empty"), "{reason}");
+    }
+
+    #[test]
+    fn ppoi_history_canary_rejects_event_and_root_count_divergence() {
+        let list_key = [0xab; 32];
+        let status = serde_json::json!({
+            "forNetwork": {
+                "Ethereum": {
+                    "listStatuses": {
+                        to_hex(&list_key): {
+                            "poiEventLengths": {
+                                "Shield": 2,
+                                "Transact": 3,
+                                "Unshield": 5,
+                                "LegacyTransact": 7
+                            },
+                            "historicalMerklerootsLength": 16
+                        }
+                    }
+                }
+            }
+        });
+        let error = parse_event_history_count(&status, "Ethereum", list_key)
+            .expect_err("17 events and 16 roots must fail closed");
+        assert!(error.contains("16 != poiEventLengths sum 17"), "{error}");
     }
 
     fn assert_bounded_client_build_failure(

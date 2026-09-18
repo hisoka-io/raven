@@ -6,6 +6,7 @@ import {
   type LegacyTransactProofData,
   type MerkleProof,
   type Proof,
+  ChainRegistry,
   RavenPOINodeInterface,
 } from "../src/index";
 
@@ -80,6 +81,38 @@ describe("upstream POINodeInterface class contract", () => {
     ).rejects.toThrow(/txidVersion/);
     await expect(
       raven.getPOIMerkleProofs("V2_PoseidonMerkle", { type: 0, id: 2 }, "00".repeat(32), []),
+    ).rejects.toThrow(/not active/);
+  });
+
+  it("rejects a registered chain that differs from the configured chain", async () => {
+    const registry = new ChainRegistry([
+      {
+        chainId: 1,
+        endpoint: "https://mainnet.raven.invalid",
+        bearerToken: "mainnet-contract-test-token",
+      },
+      {
+        chainId: 137,
+        endpoint: "https://polygon.raven.invalid",
+        bearerToken: "polygon-contract-test-token",
+      },
+    ]);
+    const raven = new RavenPOINodeInterface({
+      endpoint: "https://ignored.invalid",
+      bearerToken: "contract-test-token-long-enough",
+      chainId: 1,
+      chainRegistry: registry,
+      useClientPir: false,
+    });
+
+    expect(raven.isActive({ type: 0, id: 137 })).toBe(false);
+    await expect(
+      raven.getPOIMerkleProofs(
+        "V2_PoseidonMerkle",
+        { type: 0, id: 137 },
+        "00".repeat(32),
+        [],
+      ),
     ).rejects.toThrow(/not active/);
   });
 });

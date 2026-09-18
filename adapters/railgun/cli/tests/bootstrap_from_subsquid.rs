@@ -813,6 +813,8 @@ async fn ppoi_list_root_via_railway_capture() {
         events.push(PpoiEventRow {
             index: i as u64,
             leaf,
+            event_type: None,
+            signature: None,
             validated_merkleroot: imt.root(),
         });
     }
@@ -1466,9 +1468,38 @@ mod ppoi_resilience {
         (format!("http://{addr}"), shutdown_tx)
     }
 
+    /// W1-04 bounds every bootstrap by `ppoi_node_status`, so EVERY stub must answer it.
+    /// A stub that does not panics on the absent `startIndex`, drops the connection, and
+    /// turns a row-semantics test into a transport test that proves nothing.
+    fn node_status_result(request: &serde_json::Value, total: u64) -> (axum::http::StatusCode, String) {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "forNetwork": {
+                    "Ethereum": {
+                        "listStatuses": {
+                            "abababababababababababababababababababababababababababababababab": {
+                                "poiEventLengths": { "Shield": total },
+                                "historicalMerklerootsLength": total
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        (
+            axum::http::StatusCode::OK,
+            serde_json::to_string(&body).expect("serialize"),
+        )
+    }
+
     fn ok_body_one_event() -> StubFn {
         StdArc::new(|request: serde_json::Value| {
             Box::pin(async move {
+                if request.get("method") == Some(&serde_json::json!("ppoi_node_status")) {
+                    return node_status_result(&request, 1);
+                }
                 let mut imt = Imt::new().expect("imt");
                 let mut leaf = [0u8; 32];
                 leaf[31] = 0x01;
@@ -1558,7 +1589,7 @@ mod ppoi_resilience {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn ppoi_bootstrap_paginates_the_inclusive_501_row_limit() {
+    async fn ppoi_bootstrap_refuses_a_sparse_scan_that_ends_at_the_advertised_count() {
         let mut imt = Imt::new().expect("imt");
         let mut events = Vec::new();
         for index in 0..502usize {
@@ -1586,6 +1617,28 @@ mod ppoi_resilience {
                 let spans = StdArc::clone(&spans);
                 Box::pin(async move {
                     assert_eq!(request.get("jsonrpc"), Some(&serde_json::json!("2.0")));
+                    if request.get("method") == Some(&serde_json::json!("ppoi_node_status")) {
+                        let body = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "result": {
+                                "forNetwork": {
+                                    "Ethereum": {
+                                        "listStatuses": {
+                                            "abababababababababababababababababababababababababababababababab": {
+                                                "poiEventLengths": { "Shield": 502 },
+                                                "historicalMerklerootsLength": 502
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                        return (
+                            axum::http::StatusCode::OK,
+                            serde_json::to_string(&body).expect("serialize"),
+                        );
+                    }
                     assert_eq!(
                         request.get("method"),
                         Some(&serde_json::json!("ppoi_poi_events"))
@@ -1619,13 +1672,14 @@ mod ppoi_resilience {
         let (endpoint, shutdown) = spawn_ppoi_stub(handler).await;
         let client = RailwayPpoiClient::new(endpoint, 0, 1).expect("client");
 
-        let rows = client
+        let error = client
             .fetch_all_events([0xab; 32])
             .await
-            .expect("paginated fetch");
+            .expect_err("missing index 250 must not return a truncated successful prefix");
 
-        assert_eq!(rows.len(), 501);
-        assert_eq!(*spans.lock(), vec![(0, 500), (501, 1001), (1002, 1502)]);
+        assert!(error.to_string().contains("501 rows"), "{error}");
+        assert!(error.to_string().contains("count 502"), "{error}");
+        assert_eq!(*spans.lock(), vec![(0, 500), (501, 501)]);
         let _ = shutdown.send(());
     }
 
@@ -1633,6 +1687,9 @@ mod ppoi_resilience {
     async fn ppoi_bootstrap_falls_back_after_semantically_invalid_rows() {
         let malformed: StubFn = StdArc::new(|request: serde_json::Value| {
             Box::pin(async move {
+                if request.get("method") == Some(&serde_json::json!("ppoi_node_status")) {
+                    return node_status_result(&request, 1);
+                }
                 let body = serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": request["id"],

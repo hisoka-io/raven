@@ -146,6 +146,11 @@ interface RavenConfigBase {
   /** Pre-loaded client-PIR contexts keyed `t1Status|t2Path|t3CommitTree:<chainId>:<id>`;
    * the chain-less legacy key is accepted as a fallback. */
   clientPirContexts?: Map<string, ClientPirContext>;
+  /** Deployed instance ids keyed by the same semantic context key. */
+  clientPirInstanceLabels?: Map<string, string>;
+  /** Pinned PPOI block roots keyed `<chainId>:<listKey>:<block>`;
+   * the chain-less legacy key is accepted as a fallback. Required for every path-10 fold. */
+  ppoiPinnedRoots?: Map<string, string>;
   /** Pre-loaded BC -> idx maps, keyed by `<chainId>:<listKeyHex>` or legacy `<listKeyHex>`. */
   bcToIdxMaps?: Map<string, BcToIdxMap>;
   /** IMT cache for auth-path reconstruction; defaults to in-memory 1024 entries plus IndexedDB when available. */
@@ -191,6 +196,7 @@ type PrivateFreshness =
 
 interface PrivateQueryBatchResult {
   plaintexts: Uint8Array[];
+  addenda: Uint8Array[];
   freshness: PrivateFreshness;
 }
 
@@ -221,7 +227,7 @@ export interface CapturedWireRequest {
 const X_RAVEN_FRESHNESS = "x-raven-freshness";
 const X_RAVEN_EPOCH = "x-raven-epoch";
 const X_RAVEN_SCHEMA_VERSION = "x-raven-schema-version";
-const WIRE_SCHEMA_VERSION = 6;
+const WIRE_SCHEMA_VERSION = 7;
 const MAX_FANOUT_BODY_BYTES = 8 * 1024 * 1024;
 const DEFAULT_TXID_VERSION = "V2_PoseidonMerkle";
 const DEFAULT_CONFIDENCE_FLOOR = 0.5;
@@ -252,6 +258,8 @@ export class RavenPOINodeInterface {
   private readonly confidenceFloor: number;
   private readonly useClientPir: boolean;
   private readonly clientPirContexts: Map<string, ClientPirContext>;
+  private readonly clientPirInstanceLabels: Map<string, string>;
+  private readonly ppoiPinnedRoots: Map<string, string>;
   private readonly bcToIdxMaps: Map<string, BcToIdxMap>;
   private readonly cache: ImtCache;
   // Last snapshot epoch each instance reported; auth-path cache entries are tagged with it.
@@ -282,6 +290,8 @@ export class RavenPOINodeInterface {
     }
     this.useClientPir = config.useClientPir ?? true;
     this.clientPirContexts = config.clientPirContexts ?? new Map();
+    this.clientPirInstanceLabels = config.clientPirInstanceLabels ?? new Map();
+    this.ppoiPinnedRoots = config.ppoiPinnedRoots ?? new Map();
     this.bcToIdxMaps = config.bcToIdxMaps ?? new Map();
     this.cache = config.imtCache ?? new ImtCache();
 
@@ -317,7 +327,7 @@ export class RavenPOINodeInterface {
   }
 
   isActive(chain: Chain): boolean {
-    return chain.type === this.chainType && this.registry.knownChainIds().includes(chain.id);
+    return chain.type === this.chainType && chain.id === this.chainId;
   }
 
   async isRequired(chain: Chain): Promise<boolean> {
@@ -632,7 +642,7 @@ export class RavenPOINodeInterface {
         blindedCommitmentsOut,
         railgunTxidIfHasUnshield,
       },
-    });
+    }, true);
   }
 
   // `POINodeInterface.submitLegacyTransactProofs` (engine/src/poi/poi-node-interface.ts:49-54);
@@ -679,7 +689,7 @@ export class RavenPOINodeInterface {
       txidVersion: this.txidVersion,
       listKeys,
       legacyTransactProofDatas,
-    });
+    }, true);
   }
 
   async fetchBcToIdxMap(listKey: string): Promise<{ epoch: number; entries: { bc: string; idx: number }[] }> {
@@ -733,6 +743,22 @@ export class RavenPOINodeInterface {
     return this.clientPirContexts.get(`${prefix}:${scope}`);
   }
 
+  private instanceLabel(prefix: string, scope: string, fallback: string): string {
+    return (
+      this.clientPirInstanceLabels.get(`${prefix}:${this.chainId}:${scope}`) ??
+      this.clientPirInstanceLabels.get(`${prefix}:${scope}`) ??
+      fallback
+    );
+  }
+
+  /** Pinned PPOI block roots resolve chain-aware first, then the chain-less legacy key. */
+  private pinnedRootFor(rootKey: string): string | undefined {
+    return (
+      this.ppoiPinnedRoots.get(`${this.chainId}:${rootKey}`) ??
+      this.ppoiPinnedRoots.get(rootKey)
+    );
+  }
+
   private lookupBcMap(listKeyHex: string): BcToIdxMap | undefined {
     const chainAware = this.bcToIdxMaps.get(`${this.chainId}:${listKeyHex}`);
     if (chainAware) return chainAware;
@@ -782,8 +808,13 @@ export class RavenPOINodeInterface {
           (chunkIndex + 1) * MAX_BATCH_SIZE,
         );
         try {
-          const privateReply = await this.runClientPirQueryBatch(
+          const statusInstance = this.instanceLabel(
+            "t1Status",
+            lkHex,
             `t1Status-${lkHex}`,
+          );
+          const privateReply = await this.runClientPirQueryBatch(
+            statusInstance,
             ctx,
             chunk.map(({ idx }) => idx),
           );
@@ -851,12 +882,18 @@ export class RavenPOINodeInterface {
         );
       }
       // The leaf index never crosses the wire, only encrypted row queries.
-      const indices = pathIndicesForPerListLeaf(ctx.wasm, lkHex, idx);
-      const privateReply = await this.fetchAuthPathNodes(
+      const block = Math.floor(idx / 65_536);
+      const localIndex = idx % 65_536;
+      const pathInstance = this.instanceLabel(
+        "t2Path",
+        `${lkHex}:${block}`,
         `t2Path-${lkHex}`,
+      );
+      const privateReply = await this.runClientPirQueryBatch(
+        pathInstance,
         ctx,
-        indices,
-        `list-${lkHex}`,
+        [localIndex],
+        160,
       );
       if (this.privateFreshnessAction(privateReply.freshness, "t2-auth-path") === "fallback") {
         // This deliberately reveals the exact BC/list to upstream. The alternative is to
@@ -870,7 +907,47 @@ export class RavenPOINodeInterface {
         }
         out.push(proof);
       } else {
-        out.push(buildMerkleProof(idx, bcHex, privateReply.nodes));
+        const row = privateReply.plaintexts[0];
+        const addendum = privateReply.addenda[0];
+        if (!row || row.length !== 512 || new TextDecoder().decode(row.slice(34, 38)) !== "RVP2") {
+          throw RavenError.decodeError(`client-PIR ${pathInstance}: malformed PPOI v2 row`);
+        }
+        if (bytesToHex(row.slice(0, 32)) !== bcHex) {
+          throw RavenError.decodeError(`client-PIR ${pathInstance}: row leaf does not match requested BC`);
+        }
+        if (!addendum || addendum.length !== 160) {
+          throw RavenError.decodeError(`client-PIR ${pathInstance}: upper-sibling addendum must be 160 bytes`);
+        }
+        const nodes = Array.from({ length: 11 }, (_unused, level) =>
+          row.slice(38 + level * 32, 38 + (level + 1) * 32),
+        ).concat(
+          Array.from({ length: 5 }, (_unused, level) =>
+            addendum.slice(level * 32, (level + 1) * 32),
+          ),
+        );
+        const proof = buildMerkleProof(localIndex, bcHex, nodes);
+        const rootKey = `${lkHex}:${block}`;
+        // Resolved through the SAME chain-aware -> legacy ladder `instanceLabel` routes on.
+        // Keying this guard on the chain-less form while routing on the chain-aware one is
+        // what returned unverified proofs with `Ok`; a `has()` gate here would restore that.
+        const pinnedRoot = this.pinnedRootFor(rootKey);
+        if (!pinnedRoot) {
+          // `invalidQuery`, not `staleData`: nothing here is stale, and StaleDataContext
+          // demands lag/confidence numbers a missing pin does not have -- inventing them
+          // would be the fabricated-context version of the defect this guard closes. This
+          // matches how the same function reports missing preloaded client-PIR config.
+          throw RavenError.invalidQuery(
+            `client-PIR ${pathInstance}: no pinned root for ${rootKey} on chain ${this.chainId}; ` +
+              "preload ppoiPinnedRoots before calling getPOIMerkleProofs -- a server-supplied " +
+              "auth path cannot be verified without one",
+          );
+        }
+        if (normalizeHex(pinnedRoot) !== proof.root) {
+          throw RavenError.decodeError(
+            `client-PIR ${pathInstance}: folded root does not match pinned root`,
+          );
+        }
+        out.push(proof);
       }
     }
     return out;
@@ -1074,6 +1151,7 @@ export class RavenPOINodeInterface {
     instanceLabel: string,
     ctx: ClientPirContext,
     targetIndices: readonly number[],
+    addendumBytes = 0,
   ): Promise<PrivateQueryBatchResult> {
     return this.withClientPirSessionRetry(instanceLabel, ctx, async () => {
       const route = this.route();
@@ -1097,16 +1175,19 @@ export class RavenPOINodeInterface {
           { url },
         );
       }
+      const addenda = realTargets.map((_targetIdx, slot) =>
+        responses[slot].slice(responses[slot].length - addendumBytes),
+      );
       const plaintexts = realTargets.map((_targetIdx, slot) =>
         ctx.wasm.extract_response(
           ctx.session,
           ctx.crsBincode,
           queryBundles[slot].clientStateBincode,
-          responses[slot],
+          addendumBytes === 0 ? responses[slot] : responses[slot].slice(0, -addendumBytes),
           ctx.entrySize,
         ),
       );
-      return { plaintexts, freshness };
+      return { plaintexts, addenda, freshness };
     });
   }
 
@@ -1398,6 +1479,7 @@ export class RavenPOINodeInterface {
   private async upstreamJsonRpc<T>(
     method: UpstreamJsonRpcMethod,
     params: Readonly<Record<string, unknown>>,
+    allowMissingResult = false,
   ): Promise<T> {
     if (!this.upstream) {
       throw RavenError.invalidQuery("upstream fallback not configured");
@@ -1444,7 +1526,7 @@ export class RavenPOINodeInterface {
     }
     const hasResult = Object.prototype.hasOwnProperty.call(envelope, "result");
     const hasError = Object.prototype.hasOwnProperty.call(envelope, "error");
-    if (hasResult === hasError) {
+    if ((hasResult && hasError) || (!hasResult && !hasError && !allowMissingResult)) {
       throw RavenError.decodeError(
         `upstream ${method}: JSON-RPC response must contain exactly one of result or error`,
         { url, status: response.status },

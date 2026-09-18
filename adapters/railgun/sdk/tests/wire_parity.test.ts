@@ -20,6 +20,13 @@ import {
   type MockServer,
 } from "./helpers/mock_server";
 import { encodeBatchResponse, encodedBatchCount, stubCtx as pathStubCtx } from "./helpers/auth_path_stub";
+import {
+  PATH10_ROW_BYTES,
+  mountPath10Route,
+  path10Root,
+  path10Siblings,
+} from "./helpers/path10_row";
+import { EXPECTED_WIRE_SCHEMA_VERSION } from "./helpers/wire_schema";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX =
@@ -89,14 +96,20 @@ describe("wire parity: C3 — Poseidon hashLeftRight matches upstream", () => {
   });
 });
 
-/** Echoes one 32 B node per requested slot, stamped with the headers a real batch reply carries. */
+/**
+ * Echoes one 32 B node per requested slot, stamped with the headers a real batch reply
+ * carries. It explicitly EXCLUDES `t2Path-*`: that instance serves 512 B path-10 rows
+ * now, and routes are matched in mount order, so a catch-all here would swallow them.
+ */
 function mountNodeBatchRoute(server: MockServer): void {
   server.route(
-    (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
+    (req) =>
+      /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? "") &&
+      !(req.url ?? "").includes("/instance/t2Path-"),
     (_req, body, res) => {
       writeBinary(res, encodeBatchResponse(1, encodedBatchCount(body)), {
         "x-raven-epoch": "1",
-        "x-raven-schema-version": "6",
+        "x-raven-schema-version": String(EXPECTED_WIRE_SCHEMA_VERSION),
       });
       return true;
     },
@@ -178,11 +191,26 @@ describe("wire parity: C4 — MerkleProof.indices is uint256 (64 hex chars)", ()
   });
 
   it("the T2 per-list proof carries 64-char no-prefix hex indices", async () => {
+    // The T2 list read is one 512 B path-10 row, so it needs its own route alongside the
+    // 32 B node route the T3 commit-tree test uses on the same `/batch` path.
+    const nodes = path10Siblings(0xab);
+    mountPath10Route(server, {
+      bcHex: BC_HEX_A,
+      nodes,
+      instance: `t2Path-${LIST_KEY_HEX}`,
+      schemaVersion: EXPECTED_WIRE_SCHEMA_VERSION,
+    });
     const sdk = new RavenPOINodeInterface({
       endpoint: server.url,
       bearerToken: TOKEN,
       useClientPir: true,
-      clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, pathStubCtx()]]),
+      clientPirContexts: new Map([
+        [`t2Path:${LIST_KEY_HEX}`, { ...pathStubCtx(), entrySize: PATH10_ROW_BYTES }],
+      ]),
+      // D-06: every path-10 fold requires a pinned root.
+      ppoiPinnedRoots: new Map([
+        [`${LIST_KEY_HEX}:0`, path10Root(BC_HEX_A, nodes, LEAF_INDEX)],
+      ]),
       bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX_A, LEAF_INDEX]])]]),
     });
     const [proof] = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX_A]);

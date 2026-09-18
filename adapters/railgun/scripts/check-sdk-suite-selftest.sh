@@ -86,13 +86,17 @@ process.stdout.write(line);
 }
 
 check_named_report() { # report title status failed_count
-  local report="$1" title="$2" status="$3" failed_count="$4" raw
-  raw="$(json_line "$report")" || {
+  local report="$1" title="$2" status="$3" failed_count="$4"
+  json_line "$report" >/dev/null || {
     echo "check-sdk-suite-selftest: no JSON report in ${report}" >&2
     return 1
   }
   node -e '
-const report = JSON.parse(process.argv[1]);
+const fs = require("fs");
+const line = fs.readFileSync(process.argv[1], "utf8")
+  .split("\n").find((candidate) => candidate.trimStart().startsWith("{"));
+if (!line) process.exit(3);
+const report = JSON.parse(line);
 const title = process.argv[2];
 const status = process.argv[3];
 const failed = Number(process.argv[4]);
@@ -102,7 +106,7 @@ if (hits.length !== 1 || hits[0].status !== status || report.numFailedTests !== 
   console.error(`named test mismatch: title=${title} hits=${hits.length} status=${hits[0]?.status} failed=${report.numFailedTests}`);
   process.exit(1);
 }
-' "$raw" "$title" "$status" "$failed_count"
+' "$report" "$title" "$status" "$failed_count"
 }
 
 echo "check-sdk-suite-selftest: verifying the unmutated scratch suite"
@@ -114,13 +118,16 @@ if [[ "$pristine_exit" -ne 0 ]]; then
   tail -n 20 -- "$pristine_err" "$pristine_json" >&2
   exit 1
 fi
-pristine_report="$(json_line "$pristine_json")" || {
+json_line "$pristine_json" >/dev/null || {
   echo "check-sdk-suite-selftest: unmutated scratch emitted no JSON report" >&2
   exit 1
 }
 node -e '
 const fs = require("fs");
-const report = JSON.parse(process.argv[1]);
+const line = fs.readFileSync(process.argv[1], "utf8")
+  .split("\n").find((candidate) => candidate.trimStart().startsWith("{"));
+if (!line) process.exit(3);
+const report = JSON.parse(line);
 const expected = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
 const files = report.testResults ?? [];
 const skipped = report.numPendingTests + (report.numTodoTests ?? 0);
@@ -134,7 +141,7 @@ if (files.length !== expected.testFiles || skippedFiles !== expected.skippedFile
   process.exit(1);
 }
 console.log(`  unmutated scratch: ${report.numPassedTests} passed / ${skipped} skipped across ${files.length} files`);
-' "$pristine_report" "$work/tests/EXPECTED_COUNTS.json" || exit 1
+' "$pristine_json" "$work/tests/EXPECTED_COUNTS.json" || exit 1
 
 fanout_title='refuses the packed deep import that can emit a real unretargeted query'
 ( cd "$work" && NO_COLOR=1 ./node_modules/.bin/vitest run \

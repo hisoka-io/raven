@@ -16,7 +16,7 @@ const TREE_NUMBER = 0;
 const LEAF = 1234;
 const NODE_BYTES = 32;
 const MOCK_EPOCH = 1;
-const MOCK_SCHEMA_VERSION = 6;
+const MOCK_SCHEMA_VERSION = 7;
 
 function stubWasm(): RavenInspireWasm {
   return {
@@ -47,7 +47,7 @@ function mountBatchRoute(server: MockServer): void {
     (_req, _body, res) => {
       const slots = 16;
       const out = new Uint8Array(2 + 8 + slots * (8 + NODE_BYTES));
-      out[1] = 6;
+      out[1] = 7;
       const dv = new DataView(out.buffer);
       dv.setUint32(2, slots, true);
       let off = 10;

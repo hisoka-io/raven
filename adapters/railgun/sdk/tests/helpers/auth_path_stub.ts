@@ -71,7 +71,7 @@ export function encodeBatchResponseNodes(nodes: readonly Uint8Array[]): Uint8Arr
   }
   const out = new Uint8Array(total);
   out[0] = 0;
-  out[1] = 6;
+  out[1] = 7;
   const dv = new DataView(out.buffer);
   dv.setUint32(2, nodes.length, true);
   dv.setUint32(6, 0, true);

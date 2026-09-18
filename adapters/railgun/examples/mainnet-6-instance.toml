@@ -1,8 +1,8 @@
-# Example 6-instance mainnet config for
+# Example mainnet config for
 # `raven-railgun serve-production --config <this file>`.
 #
 # Mirrors the Railgun mainnet topology: 3 static (filled) commit-trees,
-# 1 live commit-tree, and 2 PPOI list instances. Adjust the [[instance]]
+# 1 live commit-tree, 1 PPOI status instance, and 6 PPOI path blocks. Adjust the [[instance]]
 # blocks to match the current on-chain tree topology.
 #
 # Cell shape: each [[instance]] takes an optional `entries` (row count) and
@@ -117,10 +117,55 @@ verification_mode = "upstream-signature"
 data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", what = "status" }
 
 [[instance]]
-id = "ppoi-paths-ofac"
-role = "live"
-encoder = "per-list-node"
+id = "ppoi-paths-ofac-0"
+role = "static"
+encoder = "per-list-path10"
 list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
-data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac"
+data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-0"
 verification_mode = "upstream-signature"
-data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", what = "path" }
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 0, what = "path" }
+
+[[instance]]
+id = "ppoi-paths-ofac-1"
+role = "static"
+encoder = "per-list-path10"
+list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
+data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-1"
+verification_mode = "upstream-signature"
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 1, what = "path" }
+
+[[instance]]
+id = "ppoi-paths-ofac-2"
+role = "static"
+encoder = "per-list-path10"
+list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
+data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-2"
+verification_mode = "upstream-signature"
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 2, what = "path" }
+
+[[instance]]
+id = "ppoi-paths-ofac-3"
+role = "static"
+encoder = "per-list-path10"
+list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
+data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-3"
+verification_mode = "upstream-signature"
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 3, what = "path" }
+
+[[instance]]
+id = "ppoi-paths-ofac-4"
+role = "static"
+encoder = "per-list-path10"
+list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
+data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-4"
+verification_mode = "upstream-signature"
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 4, what = "path" }
+
+[[instance]]
+id = "ppoi-paths-ofac-5"
+role = "live"
+encoder = "per-list-path10"
+list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
+data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-5"
+verification_mode = "upstream-signature"
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 5, what = "path" }

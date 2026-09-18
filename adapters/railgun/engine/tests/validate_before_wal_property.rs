@@ -91,6 +91,9 @@ fn ppoi_list_leaf_strategy() -> impl Strategy<Value = WalEntryPayload> {
             list_index,
             blinded_commitment,
             status,
+            event_type: raven_railgun_persistence::PpoiEventType::Shield,
+            signature: vec![0; 64],
+            validated_merkleroot: [0; 32],
         },
     )
 }
@@ -122,6 +125,9 @@ fn prefix_and_candidate(ppoi_only: bool) -> impl Strategy<Value = (u32, WalEntry
                         list_index: index,
                         blinded_commitment: leaf,
                         status,
+                        event_type: raven_railgun_persistence::PpoiEventType::Shield,
+                        signature: vec![0; 64],
+                        validated_merkleroot: [0; 32],
                     }
                 } else {
                     WalEntryPayload::AppendLeaf {
@@ -151,6 +157,9 @@ fn contiguous_prefix(len: u32) -> Vec<WalEntryPayload> {
             list_index: i,
             blinded_commitment: canonical_commitment(seed),
             status: 1,
+            event_type: raven_railgun_persistence::PpoiEventType::Shield,
+            signature: vec![0; 64],
+            validated_merkleroot: [0; 32],
         });
     }
     out
@@ -331,6 +340,9 @@ proptest! {
                 list_index: index,
                 blinded_commitment: leaf,
                 status,
+                event_type: raven_railgun_persistence::PpoiEventType::Shield,
+                signature: vec![0; 64],
+                validated_merkleroot: [0; 32],
             }
         } else {
             WalEntryPayload::AppendLeaf { tree_number: 0, leaf_index: index, commitment: leaf }

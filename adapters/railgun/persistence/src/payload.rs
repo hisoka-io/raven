@@ -1,5 +1,29 @@
 use serde::{Deserialize, Serialize};
 
+/// Upstream event kind retained with each PPOI list leaf.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PpoiEventType {
+    /// Shield event.
+    Shield,
+    /// Transact event.
+    Transact,
+    /// Unshield event.
+    Unshield,
+    /// Legacy transact event.
+    LegacyTransact,
+}
+
+/// Upstream metadata retained in logical snapshots for a PPOI list leaf.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PpoiEventMetadata {
+    /// Upstream event kind.
+    pub event_type: PpoiEventType,
+    /// Upstream 64-byte ed25519 signature.
+    pub signature: Vec<u8>,
+    /// Upstream root after appending the leaf.
+    pub validated_merkleroot: [u8; 32],
+}
+
 /// Application WAL payload variants for this adapter.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WalEntryPayload {
@@ -32,6 +56,12 @@ pub enum WalEntryPayload {
         blinded_commitment: [u8; 32],
         /// Initial status byte.
         status: u8,
+        /// Upstream event kind.
+        event_type: PpoiEventType,
+        /// Upstream 64-byte ed25519 signature.
+        signature: Vec<u8>,
+        /// Upstream root after appending this leaf.
+        validated_merkleroot: [u8; 32],
     },
     /// Reorg fence; entries with a `marker` above `height` are truncated.
     Reorg {

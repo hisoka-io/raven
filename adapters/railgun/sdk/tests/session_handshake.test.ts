@@ -11,6 +11,7 @@ import {
   type RavenInspireWasm,
 } from "../src/index";
 import { encodeBatchResponseNodes, encodedBatchCount } from "./helpers/auth_path_stub";
+import { EXPECTED_WIRE_SCHEMA_VERSION } from "./helpers/wire_schema";
 import { startMockServer, writeBinary, writeJson, type MockServer } from "./helpers/mock_server";
 import {
   assertNoCommitmentsInPirRequests,
@@ -114,10 +115,11 @@ function mountRehandshakeRig(
         deadRequests += 1;
         if (deadRequests >= (options.deadRequestBarrier ?? 1)) releaseDeadRequests?.();
         await deadRequestsReady;
+        const sameSchema = String(EXPECTED_WIRE_SCHEMA_VERSION);
         if (options.genericSameSchema400 === true) {
-          res.writeHead(400, { "x-raven-schema-version": "6" });
+          res.writeHead(400, { "x-raven-schema-version": sameSchema });
         } else {
-          res.writeHead(409, { "x-raven-schema-version": "6" });
+          res.writeHead(409, { "x-raven-schema-version": sameSchema });
         }
         res.end();
         return true;

@@ -20,7 +20,7 @@ use raven_railgun_cli::auto_spawn_driver::{
 };
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{InspireServerState, RavenInspireScheme};
-use raven_railgun_engine::orchestrator::PpoiListRoutes;
+use raven_railgun_engine::orchestrator::{DataSourceFilter, PpoiListRoutes};
 use raven_railgun_engine::persistence::ConsumerEvent;
 use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
 
@@ -191,7 +191,10 @@ async fn synthetic_upstream_emits_new_list_key_spawns_two_instances() {
     }
 
     let routes = harness.ppoi_list_routes.load();
-    let matching: Vec<_> = routes.iter().filter(|(k, _)| *k == TEST_LIST_KEY).collect();
+    let matching: Vec<_> = routes
+        .iter()
+        .filter(|(filter, _)| *filter == DataSourceFilter::PpoiList(TEST_LIST_KEY))
+        .collect();
     assert_eq!(
         matching.len(),
         2,
@@ -287,7 +290,10 @@ async fn concurrent_list_observed_bursts_dedupe_to_one_spawn_per_template_per_li
     );
 
     let routes = harness.ppoi_list_routes.load();
-    let matching: Vec<_> = routes.iter().filter(|(k, _)| *k == TEST_LIST_KEY).collect();
+    let matching: Vec<_> = routes
+        .iter()
+        .filter(|(filter, _)| *filter == DataSourceFilter::PpoiList(TEST_LIST_KEY))
+        .collect();
     assert_eq!(
         matching.len(),
         2,
@@ -385,7 +391,7 @@ async fn restart_replay_picks_up_auto_spawned_ppoi_list_instances_from_spawn_log
     let routes_after = routes_v2.load();
     let matching: Vec<_> = routes_after
         .iter()
-        .filter(|(k, _)| *k == TEST_LIST_KEY)
+        .filter(|(filter, _)| *filter == DataSourceFilter::PpoiList(TEST_LIST_KEY))
         .collect();
     assert_eq!(
         matching.len(),

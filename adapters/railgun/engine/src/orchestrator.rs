@@ -217,6 +217,7 @@ pub const fn default_k_for(encoder: super::pir_table::EncoderKind) -> usize {
     match encoder {
         super::pir_table::EncoderKind::PerNode { .. }
         | super::pir_table::EncoderKind::PerListPath { .. }
+        | super::pir_table::EncoderKind::PerListPath10 { .. }
         | super::pir_table::EncoderKind::PerListNode { .. } => 16,
         super::pir_table::EncoderKind::PerLeafPath { .. } => 8,
         super::pir_table::EncoderKind::PerLeafBc { .. }
@@ -347,6 +348,13 @@ pub enum DataSourceFilter {
     ChainTreeNumber(u32),
     /// Consume mirror `PpoiStatus`/`PpoiListLeafAdded` events for this list key.
     PpoiList([u8; 32]),
+    /// Consume one 65,536-row block of a PPOI list using local row indices.
+    PpoiListBlock {
+        /// 32-byte list key.
+        list_key: [u8; 32],
+        /// Zero-based block number.
+        block: u32,
+    },
 }
 
 /// Per-instance configuration for [`bootstrap_railgun_engine_multi`].
@@ -470,6 +478,19 @@ impl InstanceConfig {
             chain_source: None,
         }
     }
+
+    /// Default config for one block of a PPOI list forest.
+    #[must_use]
+    pub fn ppoi_list_block(
+        instance_id: impl Into<String>,
+        data_dir: std::path::PathBuf,
+        list_key: [u8; 32],
+        block: u32,
+    ) -> Self {
+        let mut config = Self::ppoi_list(instance_id, data_dir, list_key);
+        config.data_source = DataSourceFilter::PpoiListBlock { list_key, block };
+        config
+    }
 }
 
 /// Per-instance handles produced by [`bootstrap_railgun_engine_multi`].
@@ -507,7 +528,8 @@ impl std::fmt::Debug for PerInstanceHandles {
 pub type ChainTreeRoutes = Arc<arc_swap::ArcSwap<Vec<(u32, mpsc::Sender<ConsumerEvent>)>>>;
 
 /// Per-list routing table, swapped via `ArcSwap::rcu` on `list_observed`.
-pub type PpoiListRoutes = Arc<arc_swap::ArcSwap<Vec<([u8; 32], mpsc::Sender<ConsumerEvent>)>>>;
+pub type PpoiListRoutes =
+    Arc<arc_swap::ArcSwap<Vec<(DataSourceFilter, mpsc::Sender<ConsumerEvent>)>>>;
 
 /// Operator-facing handle returned by [`bootstrap_railgun_engine_multi`].
 pub struct MultiOrchestratorHandle {
@@ -671,13 +693,15 @@ where
         .iter()
         .filter_map(|(ds, tx)| match ds {
             DataSourceFilter::ChainTreeNumber(t) => Some((*t, tx.clone())),
-            DataSourceFilter::PpoiList(_) => None,
+            DataSourceFilter::PpoiList(_) | DataSourceFilter::PpoiListBlock { .. } => None,
         })
         .collect();
-    let ppoi_routes: Vec<([u8; 32], mpsc::Sender<ConsumerEvent>)> = routes
+    let ppoi_routes: Vec<(DataSourceFilter, mpsc::Sender<ConsumerEvent>)> = routes
         .iter()
         .filter_map(|(ds, tx)| match ds {
-            DataSourceFilter::PpoiList(k) => Some((*k, tx.clone())),
+            DataSourceFilter::PpoiList(_) | DataSourceFilter::PpoiListBlock { .. } => {
+                Some((*ds, tx.clone()))
+            }
             DataSourceFilter::ChainTreeNumber(_) => None,
         })
         .collect();
@@ -952,7 +976,7 @@ async fn forward_reorg_barrier(
 async fn forward_mirror_payload(
     payload: WalEntryPayload,
     height: u64,
-    ppoi_list_routes: &arc_swap::ArcSwap<Vec<([u8; 32], mpsc::Sender<ConsumerEvent>)>>,
+    ppoi_list_routes: &arc_swap::ArcSwap<Vec<(DataSourceFilter, mpsc::Sender<ConsumerEvent>)>>,
     list_observed: &tokio::sync::broadcast::Sender<[u8; 32]>,
 ) {
     let list_key: Option<[u8; 32]> = match &payload {
@@ -969,14 +993,13 @@ async fn forward_mirror_payload(
     // Fires before routing so a fresh list key surfaces before its route exists.
     let _ = list_observed.send(lk);
     let routes = ppoi_list_routes.load();
-    // Fan out to every sender bound to `lk`: encoders can share a list key, so
-    // `.find()` would drop events past the first match.
-    let matched: Vec<mpsc::Sender<ConsumerEvent>> = routes
-        .iter()
-        .filter(|(k, _)| *k == lk)
-        .map(|(_, s)| s.clone())
-        .collect();
-    // Last recipient takes ownership, so the common single-route case never clones.
+    let mut matched = Vec::new();
+    for (filter, sender) in routes.iter() {
+        let routed = payload_for_ppoi_route(*filter, &payload, lk);
+        if let Some(routed) = routed {
+            matched.push((sender.clone(), routed));
+        }
+    }
     let Some((last, rest)) = matched.split_last() else {
         count_router_drop("no_route");
         tracing::warn!(
@@ -986,9 +1009,9 @@ async fn forward_mirror_payload(
         );
         return;
     };
-    for tx in rest {
+    for (tx, routed) in rest {
         if tx
-            .send(ConsumerEvent::Ppoi(payload.clone(), height))
+            .send(ConsumerEvent::Ppoi(routed.clone(), height))
             .await
             .is_err()
         {
@@ -997,11 +1020,99 @@ async fn forward_mirror_payload(
         }
     }
     if last
-        .send(ConsumerEvent::Ppoi(payload, height))
+        .0
+        .send(ConsumerEvent::Ppoi(last.1.clone(), height))
         .await
         .is_err()
     {
         count_router_drop("consumer_channel_closed");
         tracing::warn!(height, "consumer channel closed; mirror payload dropped");
+    }
+}
+
+fn payload_for_ppoi_route(
+    filter: DataSourceFilter,
+    payload: &WalEntryPayload,
+    list_key: [u8; 32],
+) -> Option<WalEntryPayload> {
+    match (filter, payload) {
+        (DataSourceFilter::PpoiList(key), _) if key == list_key => Some(payload.clone()),
+        (
+            DataSourceFilter::PpoiListBlock {
+                list_key: route_key,
+                block,
+            },
+            WalEntryPayload::PpoiListLeafAdded {
+                list_index,
+                blinded_commitment,
+                status,
+                event_type,
+                signature,
+                validated_merkleroot,
+                ..
+            },
+        ) if route_key == list_key && *list_index / 65_536 == block => {
+            Some(WalEntryPayload::PpoiListLeafAdded {
+                list_key: route_key,
+                list_index: *list_index % 65_536,
+                blinded_commitment: *blinded_commitment,
+                status: *status,
+                event_type: *event_type,
+                signature: signature.clone(),
+                validated_merkleroot: *validated_merkleroot,
+            })
+        }
+        (DataSourceFilter::PpoiListBlock { list_key: route_key, .. }, WalEntryPayload::PpoiStatus { .. })
+            if route_key == list_key => Some(payload.clone()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod forest_routing_tests {
+    use super::*;
+
+    fn leaf(index: u32) -> WalEntryPayload {
+        WalEntryPayload::PpoiListLeafAdded {
+            list_key: [7; 32],
+            list_index: index,
+            blinded_commitment: [8; 32],
+            status: 0,
+            event_type: raven_railgun_persistence::PpoiEventType::Shield,
+            signature: vec![9; 64],
+            validated_merkleroot: [10; 32],
+        }
+    }
+
+    #[test]
+    fn six_block_routes_localize_every_global_boundary_and_refuse_the_seventh() {
+        for block in 0..6u32 {
+            for local in [0u32, 65_535] {
+                let global = block * 65_536 + local;
+                let routed = payload_for_ppoi_route(
+                    DataSourceFilter::PpoiListBlock {
+                        list_key: [7; 32],
+                        block,
+                    },
+                    &leaf(global),
+                    [7; 32],
+                )
+                .expect("configured block routes");
+                assert!(matches!(
+                    routed,
+                    WalEntryPayload::PpoiListLeafAdded { list_index, .. } if list_index == local
+                ));
+            }
+        }
+        let seventh = leaf(6 * 65_536);
+        assert!((0..6u32).all(|block| payload_for_ppoi_route(
+            DataSourceFilter::PpoiListBlock {
+                list_key: [7; 32],
+                block,
+            },
+            &seventh,
+            [7; 32],
+        )
+        .is_none()));
     }
 }

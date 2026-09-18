@@ -170,6 +170,11 @@ pub struct LogicalLeafStore {
     ppoi_imts: std::collections::HashMap<[u8; 32], crate::imt::Imt>,
     ppoi_bc_index: std::collections::BTreeMap<([u8; 32], [u8; 32]), u32>,
     ppoi_index_bc: std::collections::BTreeMap<([u8; 32], u32), [u8; 32]>,
+    #[serde(default)]
+    ppoi_event_metadata: std::collections::BTreeMap<
+        ([u8; 32], u32),
+        raven_railgun_persistence::PpoiEventMetadata,
+    >,
     ppoi_list_leaf_block_height: std::collections::BTreeMap<([u8; 32], u32), u64>,
 }
 
@@ -238,6 +243,9 @@ impl LogicalLeafStore {
                 list_index,
                 blinded_commitment,
                 status,
+                event_type,
+                signature,
+                validated_merkleroot,
             } => {
                 let expected_idx = self
                     .ppoi_imts
@@ -260,6 +268,14 @@ impl LogicalLeafStore {
                 let idx_key = (*list_key, *list_index);
                 self.ppoi_bc_index.insert(bc_key, *list_index);
                 self.ppoi_index_bc.insert(idx_key, *blinded_commitment);
+                self.ppoi_event_metadata.insert(
+                    idx_key,
+                    raven_railgun_persistence::PpoiEventMetadata {
+                        event_type: *event_type,
+                        signature: signature.clone(),
+                        validated_merkleroot: *validated_merkleroot,
+                    },
+                );
                 self.ppoi_status.insert(bc_key, *status);
                 self.ppoi_block_height.insert(bc_key, block_height);
                 self.ppoi_list_leaf_block_height
@@ -322,6 +338,7 @@ impl LogicalLeafStore {
                 for key in stale_list_leaves {
                     let (list_key, list_index) = key;
                     self.ppoi_list_leaf_block_height.remove(&key);
+                    self.ppoi_event_metadata.remove(&key);
                     if let Some(bc) = self.ppoi_index_bc.remove(&key) {
                         self.ppoi_bc_index.remove(&(list_key, bc));
                     }
@@ -425,6 +442,16 @@ impl LogicalLeafStore {
     #[must_use]
     pub fn ppoi_bc_at(&self, list_key: &[u8; 32], list_index: u32) -> Option<[u8; 32]> {
         self.ppoi_index_bc.get(&(*list_key, list_index)).copied()
+    }
+
+    /// Upstream metadata retained atomically with a per-list leaf.
+    #[must_use]
+    pub fn ppoi_event_metadata(
+        &self,
+        list_key: &[u8; 32],
+        list_index: u32,
+    ) -> Option<&raven_railgun_persistence::PpoiEventMetadata> {
+        self.ppoi_event_metadata.get(&(*list_key, list_index))
     }
 
     /// Per-list `(list_index -> status_byte)` derived view.

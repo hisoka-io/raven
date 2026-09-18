@@ -22,6 +22,13 @@ import {
   type BlindedCommitmentType,
   type RavenErrorKind,
 } from "../src/index";
+import {
+  PATH10_ROW_BYTES,
+  mountPath10Route,
+  path10Root,
+  path10Siblings,
+} from "./helpers/path10_row";
+import { EXPECTED_WIRE_SCHEMA_VERSION } from "./helpers/wire_schema";
 import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
 
 import * as wasmPkg from "raven-inspire-client-wasm";
@@ -34,10 +41,11 @@ import {
 } from "./helpers/mock_server";
 import { encodeBatchResponse, encodeBatchResponseNodes } from "./helpers/auth_path_stub";
 import { authPathOf, encodedBatchCount } from "./helpers/auth_path_stub";
+import { foldMerkleRoot } from "../src/poseidon";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const MOCK_EPOCH = 1;
-const MOCK_SCHEMA_VERSION = 6;
+const MOCK_SCHEMA_VERSION = EXPECTED_WIRE_SCHEMA_VERSION;
 const LIST_KEY_HEX = "abababababababababababababababababababababababababababababababab";
 // Non-zero in its leading bytes so a status row's BC tail cannot match by accident.
 const BC_HEX = "9f3c17aa04e1b28d6605c9713fe82b40d1a7c35e96280bf4517ade0c2b6d8391";
@@ -146,7 +154,7 @@ function mountEchoingBatchRoute(
       const slots = encodedBatchCount(body);
       const elemBytes = 32;
       const out = new Uint8Array(2 + 8 + slots * (8 + elemBytes));
-      out[1] = 6;
+      out[1] = 7;
       const dv = new DataView(out.buffer);
       dv.setUint32(2, slots, true);
       let off = 10;
@@ -312,19 +320,84 @@ describe("client-PIR auth-path reconstruction (T2/T3)", () => {
     }
   });
 
-  it("getPOIMerkleProofs uses per-list-node path indices + batch route", async () => {
-    mountBatchRoute(server);
+  it("getPOIMerkleProofs reads one path-10 row and still yields 16 elements", async () => {
+    // W3-01/W3-03: one 512 B row (levels 0..10) plus a 160 B addendum (levels 11..15)
+    // replaced sixteen 32 B node reads. The proof the wallet sees is unchanged at 16.
+    const nodes = path10Siblings(0xab);
+    mountPath10Route(server, {
+      bcHex: BC_HEX,
+      nodes,
+      instance: `t2Path-${LIST_KEY_HEX}`,
+      schemaVersion: MOCK_SCHEMA_VERSION,
+      epoch: MOCK_EPOCH,
+    });
     const bcMap = new Map<string, number>([[BC_HEX, 7]]);
     const sdk = new RavenPOINodeInterface({
       endpoint: server.url,
       bearerToken: TOKEN,
       useClientPir: true,
-      clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, stubCtx()]]),
+      clientPirContexts: new Map([
+        [`t2Path:${LIST_KEY_HEX}`, { ...stubCtx(), entrySize: PATH10_ROW_BYTES }],
+      ]),
+      ppoiPinnedRoots: new Map([[`${LIST_KEY_HEX}:0`, path10Root(BC_HEX, nodes, 7)]]),
       bcToIdxMaps: new Map([[LIST_KEY_HEX, bcMap]]),
     });
     const proofs = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
     expect(proofs).toHaveLength(1);
     expect(proofs[0].elements).toHaveLength(16);
+    expect(sdk.lastWireRequests()).toHaveLength(1);
+  });
+
+  it("routes a PPOI index through its configured deployed block instance", async () => {
+    server.route(
+      (req) => req.url === "/v1/instance/ppoi-paths-ofac-1/batch",
+      (_req, _body, res) => {
+        const row = new Uint8Array(512);
+        row.set(Buffer.from(BC_HEX, "hex"), 0);
+        row.set(new TextEncoder().encode("RVP2"), 34);
+        for (let level = 0; level < 11; level += 1) row[38 + level * 32] = level + 1;
+        const addendum = new Uint8Array(160);
+        for (let level = 0; level < 5; level += 1) addendum[level * 32] = level + 12;
+        const out = encodeBatchResponseNodes([
+          new Uint8Array([...row, ...addendum]),
+        ]);
+        res.writeHead(200, {
+          "content-type": "application/octet-stream",
+          "x-raven-epoch": String(MOCK_EPOCH),
+          "x-raven-schema-version": String(MOCK_SCHEMA_VERSION),
+          "x-raven-freshness": "lag_blocks=0 applied_height=0 epoch=1 confidence=1",
+        });
+        res.end(Buffer.from(out));
+        return true;
+      },
+    );
+    const globalIndex = 65_536 + 7;
+    const pathContext = { ...stubCtx(), entrySize: 512 };
+    const siblings = Array.from({ length: 16 }, (_unused, level) => {
+      const sibling = new Uint8Array(32);
+      sibling[0] = level + 1;
+      return Buffer.from(sibling).toString("hex");
+    });
+    const pinnedRoot = foldMerkleRoot(BC_HEX, siblings, 7n);
+    const sdk = new RavenPOINodeInterface({
+      endpoint: server.url,
+      bearerToken: TOKEN,
+      useClientPir: true,
+      clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, pathContext]]),
+      clientPirInstanceLabels: new Map([
+        [`t2Path:${LIST_KEY_HEX}:1`, "ppoi-paths-ofac-1"],
+      ]),
+      ppoiPinnedRoots: new Map([[`${LIST_KEY_HEX}:1`, pinnedRoot]]),
+      bcToIdxMaps: new Map([
+        [LIST_KEY_HEX, new Map([[BC_HEX, globalIndex]])],
+      ]),
+    });
+
+    await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+
+    expect(sdk.lastWireRequests()[0].url).toContain(
+      "/v1/instance/ppoi-paths-ofac-1/batch",
+    );
   });
 
   it("BatchMismatch surfaces as a typed error when server returns wrong count", async () => {
@@ -380,7 +453,7 @@ describe("client-PIR auth-path reconstruction (T2/T3)", () => {
       expect(RavenError.is(e, "StaleAdapter")).toBe(true);
       if (RavenError.is(e, "StaleAdapter")) {
         expect(e.context.serverWireSchemaVersion).toBe(2);
-        expect(e.context.clientWireSchemaVersion).toBe(6);
+        expect(e.context.clientWireSchemaVersion).toBe(EXPECTED_WIRE_SCHEMA_VERSION);
       }
     }
   });

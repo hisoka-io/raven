@@ -16,6 +16,10 @@ use crate::global_prometheus_handle;
 
 pub use crate::auth::X_RAVEN_CLIENT_ID;
 
+type SharedLogicalStore =
+    Arc<parking_lot::Mutex<raven_railgun_engine::inspire::LogicalLeafStore>>;
+type InstanceLogicalStores = HashMap<InstanceId, ([u8; 32], SharedLogicalStore)>;
+
 /// Handler-shared state; cheap to clone. The manual `Clone` avoids the derive's
 /// spurious `S: Clone` bound.
 pub struct AppState<S: PirScheme> {
@@ -35,6 +39,7 @@ pub struct AppState<S: PirScheme> {
     /// Shared logical leaf store for the PPOI shim routes. `None` returns 503.
     pub(crate) logical_store:
         Arc<Option<Arc<parking_lot::Mutex<raven_railgun_engine::inspire::LogicalLeafStore>>>>,
+    pub(crate) instance_logical_stores: Arc<InstanceLogicalStores>,
     /// Per-instance concurrency caps for `/v1/status`. Falls back to `max_concurrent_queries`.
     pub(crate) instance_concurrency: Arc<HashMap<InstanceId, u32>>,
     /// Indexer chain-source mode flag for `/v1/health/ready`.
@@ -68,6 +73,7 @@ impl<S: PirScheme> Clone for AppState<S> {
             scheme_name: Arc::clone(&self.scheme_name),
             consumer_metrics: Arc::clone(&self.consumer_metrics),
             logical_store: Arc::clone(&self.logical_store),
+            instance_logical_stores: Arc::clone(&self.instance_logical_stores),
             instance_concurrency: Arc::clone(&self.instance_concurrency),
             chain_source_mode: Arc::clone(&self.chain_source_mode),
             rpc_pool: Arc::clone(&self.rpc_pool),
@@ -117,6 +123,7 @@ impl<S: PirScheme> AppState<S> {
             scheme_name,
             consumer_metrics: Arc::new(None),
             logical_store: Arc::new(None),
+            instance_logical_stores: Arc::new(HashMap::new()),
             instance_concurrency: Arc::new(HashMap::new()),
             chain_source_mode: Arc::new(None),
             rpc_pool: Arc::new(None),
@@ -128,6 +135,16 @@ impl<S: PirScheme> AppState<S> {
             process_started_at: Instant::now(),
             params_etag_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Attach per-instance PPOI logical stores used for response addenda.
+    #[must_use]
+    pub fn with_instance_logical_stores(
+        mut self,
+        stores: InstanceLogicalStores,
+    ) -> Self {
+        self.instance_logical_stores = Arc::new(stores);
+        self
     }
 
     /// Attach the chain-source mode flag; surfaced in `/v1/health/ready`.

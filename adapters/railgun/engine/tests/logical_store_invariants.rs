@@ -1,10 +1,19 @@
 //! `LogicalLeafStore` invariant tests.
 
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
+use std::fmt::Write as _;
 
 use raven_railgun_core::MerkleProof;
 use raven_railgun_engine::inspire::{apply_wal_entry, LogicalLeafStore};
-use raven_railgun_engine::pir_table::PerLeafCommitmentEncoder;
+use raven_railgun_engine::pir_table::{
+    PerLeafCommitmentEncoder, PerListPath10Encoder, PirTableEncoder, PATH10_RECORD_BYTES,
+};
 use raven_railgun_persistence::WalEntryPayload;
 use raven_railgun_poseidon::merkle_node;
 
@@ -76,6 +85,9 @@ fn ppoi_list_leaf_added_advances_per_list_imt() {
             list_index: 0,
             blinded_commitment: bc,
             status: 0,
+            event_type: raven_railgun_persistence::PpoiEventType::Shield,
+            signature: vec![0; 64],
+            validated_merkleroot: [0; 32],
         },
         200,
         &e,
@@ -90,6 +102,9 @@ fn ppoi_list_leaf_added_advances_per_list_imt() {
             list_index: 1,
             blinded_commitment: bc2,
             status: 1,
+            event_type: raven_railgun_persistence::PpoiEventType::Transact,
+            signature: vec![1; 64],
+            validated_merkleroot: [1; 32],
         },
         201,
         &e,
@@ -101,6 +116,67 @@ fn ppoi_list_leaf_added_advances_per_list_imt() {
     assert_eq!(store.ppoi_bc_at(&LIST_KEY, 1), Some(bc2));
     assert_eq!(store.ppoi_index_of(&LIST_KEY, &bc), Some(0));
     assert_eq!(store.ppoi_index_of(&LIST_KEY, &bc2), Some(1));
+    assert_eq!(
+        store.ppoi_event_metadata(&LIST_KEY, 1),
+        Some(&raven_railgun_persistence::PpoiEventMetadata {
+            event_type: raven_railgun_persistence::PpoiEventType::Transact,
+            signature: vec![1; 64],
+            validated_merkleroot: [1; 32],
+        })
+    );
+}
+
+#[test]
+fn ppoi_path10_row_matches_the_logical_store_and_independent_proof() {
+    let encoder = PerListPath10Encoder::new(2048, LIST_KEY).expect("encoder");
+    let mut store = LogicalLeafStore::new();
+    for (index, tag) in [(0u32, 0x11u8), (1, 0x22)] {
+        apply_wal_entry(
+            &mut store,
+            &WalEntryPayload::PpoiListLeafAdded {
+                list_key: LIST_KEY,
+                list_index: index,
+                blinded_commitment: fr_canonical(tag),
+                status: u8::try_from(index).expect("fixture status fits u8"),
+                event_type: if index == 0 {
+                    raven_railgun_persistence::PpoiEventType::Shield
+                } else {
+                    raven_railgun_persistence::PpoiEventType::Transact
+                },
+                signature: vec![tag; 64],
+                validated_merkleroot: [tag; 32],
+            },
+            200 + u64::from(index),
+            &encoder,
+        )
+        .expect("apply");
+    }
+
+    let row = encoder.materialize_shard(0, &store);
+    let kat = row[..PATH10_RECORD_BYTES]
+        .iter()
+        .fold(String::with_capacity(PATH10_RECORD_BYTES * 2), |mut hex, byte| {
+            write!(hex, "{byte:02x}").expect("write to string");
+            hex
+        });
+    assert_eq!(
+        kat,
+        include_str!("../../sdk/tests/fixtures/path10_row.hex").trim()
+    );
+    assert_eq!(&row[..32], &fr_canonical(0x11));
+    assert_eq!(row[32], 0);
+    assert_eq!(row[33], 0);
+    assert_eq!(&row[34..38], b"RVP2");
+    let proof = store.ppoi_merkle_proof(&LIST_KEY, 0).expect("proof");
+    for (level, sibling) in proof.elements.iter().take(11).enumerate() {
+        let start = 38 + level * 32;
+        assert_eq!(&row[start..start + 32], sibling, "level {level}");
+    }
+    assert!(row[390..PATH10_RECORD_BYTES].iter().all(|byte| *byte == 0));
+    assert_eq!(
+        encoder.affected_shards_for_ppoi_leaf(&LIST_KEY, 2048),
+        std::collections::BTreeSet::from([1])
+    );
 }
 
 #[test]
@@ -115,6 +191,9 @@ fn ppoi_status_in_place_update_does_not_affect_imt_root() {
             list_index: 0,
             blinded_commitment: bc,
             status: 0,
+            event_type: raven_railgun_persistence::PpoiEventType::Shield,
+            signature: vec![0; 64],
+            validated_merkleroot: [0; 32],
         },
         200,
         &e,
@@ -153,6 +232,9 @@ fn ppoi_list_count_reflects_distinct_list_keys() {
             list_index: 0,
             blinded_commitment: fr_canonical(0x11),
             status: 0,
+            event_type: raven_railgun_persistence::PpoiEventType::Shield,
+            signature: vec![0; 64],
+            validated_merkleroot: [0; 32],
         },
         200,
         &e,
@@ -165,6 +247,9 @@ fn ppoi_list_count_reflects_distinct_list_keys() {
             list_index: 0,
             blinded_commitment: fr_canonical(0x22),
             status: 0,
+            event_type: raven_railgun_persistence::PpoiEventType::Shield,
+            signature: vec![0; 64],
+            validated_merkleroot: [0; 32],
         },
         201,
         &e,
@@ -215,6 +300,9 @@ fn ppoi_merkle_proof_round_trips_for_added_bc() {
             list_index: 0,
             blinded_commitment: bc,
             status: 0,
+            event_type: raven_railgun_persistence::PpoiEventType::Shield,
+            signature: vec![0; 64],
+            validated_merkleroot: [0; 32],
         },
         200,
         &e,

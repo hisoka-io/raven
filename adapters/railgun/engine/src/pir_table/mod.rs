@@ -13,7 +13,10 @@ pub mod leaf;
 pub mod list;
 
 pub use leaf::{PerLeafCommitmentEncoder, PerLeafEncoder, PerLeafPathEncoder, PerNodeEncoder};
-pub use list::{PerListNodeEncoder, PerListPathEncoder, PerListStatusEncoder};
+pub use list::{
+    PerListNodeEncoder, PerListPath10Encoder, PerListPathEncoder, PerListStatusEncoder,
+    PATH10_RECORD_BYTES,
+};
 
 /// Stable encoder labels, surfaced on `/v1/status` and matched against the
 /// manifest's `encoder_label`.
@@ -28,6 +31,8 @@ pub mod labels {
     pub const PER_LIST_STATUS: &str = "per-list-status";
     /// T2 PPOI auth-path encoder.
     pub const PER_LIST_PATH: &str = "per-list-path";
+    /// PPOI v2 block-local path encoder.
+    pub const PER_LIST_PATH10: &str = "per-list-path10";
     /// Per-list Merkle-node encoder; `per-node` keyed on `list_key`.
     pub const PER_LIST_NODE: &str = "per-list-node";
 }
@@ -68,6 +73,11 @@ pub enum EncoderKind {
         /// 32-byte list_key this encoder is pinned to.
         list_key: [u8; 32],
     },
+    /// PPOI v2 block-local row with lower path levels.
+    PerListPath10 {
+        /// 32-byte list key this encoder is pinned to.
+        list_key: [u8; 32],
+    },
     /// Per-list Merkle-node encoder: [`PerNode`]'s layout over the per-list
     /// IMT, pinned to one `list_key`.
     PerListNode {
@@ -98,7 +108,10 @@ impl EncoderKind {
             Self::PerLeafBc { tree_number }
             | Self::PerLeafPath { tree_number }
             | Self::PerNode { tree_number } => Some(*tree_number),
-            Self::PerListStatus { .. } | Self::PerListPath { .. } | Self::PerListNode { .. } => {
+            Self::PerListStatus { .. }
+            | Self::PerListPath { .. }
+            | Self::PerListPath10 { .. }
+            | Self::PerListNode { .. } => {
                 None
             }
         }
@@ -113,6 +126,7 @@ impl EncoderKind {
             Self::PerNode { .. } => labels::PER_NODE,
             Self::PerListStatus { .. } => labels::PER_LIST_STATUS,
             Self::PerListPath { .. } => labels::PER_LIST_PATH,
+            Self::PerListPath10 { .. } => labels::PER_LIST_PATH10,
             Self::PerListNode { .. } => labels::PER_LIST_NODE,
         }
     }
@@ -127,7 +141,8 @@ impl EncoderKind {
             Self::PerLeafBc { .. }
             | Self::PerLeafPath { .. }
             | Self::PerListStatus { .. }
-            | Self::PerListPath { .. } => LEAVES_PER_TREE,
+            | Self::PerListPath { .. }
+            | Self::PerListPath10 { .. } => LEAVES_PER_TREE,
         }
     }
 
@@ -140,7 +155,8 @@ impl EncoderKind {
             Self::PerLeafBc { .. }
             | Self::PerLeafPath { .. }
             | Self::PerListStatus { .. }
-            | Self::PerListPath { .. } => LEAVES_PER_TREE as usize,
+            | Self::PerListPath { .. }
+            | Self::PerListPath10 { .. } => LEAVES_PER_TREE as usize,
         }
     }
 
@@ -148,7 +164,10 @@ impl EncoderKind {
     #[must_use]
     pub const fn default_concurrency(&self) -> usize {
         match self {
-            Self::PerNode { .. } | Self::PerListNode { .. } | Self::PerListPath { .. } => 16,
+            Self::PerNode { .. }
+            | Self::PerListNode { .. }
+            | Self::PerListPath { .. }
+            | Self::PerListPath10 { .. } => 16,
             Self::PerLeafPath { .. } => 8,
             Self::PerLeafBc { .. } | Self::PerListStatus { .. } => 4,
         }
@@ -159,6 +178,7 @@ impl EncoderKind {
     pub const fn fixed_record_size(&self) -> Option<usize> {
         match self {
             Self::PerLeafPath { .. } | Self::PerListPath { .. } => Some(PATH_RECORD_BYTES),
+            Self::PerListPath10 { .. } => Some(PATH10_RECORD_BYTES),
             Self::PerNode { .. } | Self::PerListNode { .. } => Some(NODE_HASH_BYTES),
             Self::PerLeafBc { .. } | Self::PerListStatus { .. } => None,
         }
@@ -202,6 +222,10 @@ impl EncoderKind {
             }
             Self::PerListPath { list_key } => {
                 let enc = PerListPathEncoder::new(PATH_RECORD_BYTES, entries_per_shard, *list_key)?;
+                Ok(Arc::new(enc))
+            }
+            Self::PerListPath10 { list_key } => {
+                let enc = PerListPath10Encoder::new(entries_per_shard, *list_key)?;
                 Ok(Arc::new(enc))
             }
             Self::PerListNode { list_key } => {
@@ -443,10 +467,19 @@ pub(crate) fn path_affected_shards_into(
     leaf_index: u32,
     dirty: &mut BTreeSet<u32>,
 ) {
+    let highest_stored_level = u32::try_from(TREE_DEPTH.saturating_sub(1)).unwrap_or(u32::MAX);
+    path_affected_shards_for_level_into(entries_per_shard, leaf_index, highest_stored_level, dirty);
+}
+
+pub(crate) fn path_affected_shards_for_level_into(
+    entries_per_shard: u32,
+    leaf_index: u32,
+    highest_stored_level: u32,
+    dirty: &mut BTreeSet<u32>,
+) {
     dirty.insert(leaf_index / entries_per_shard);
     let total_shards_usize = (LEAVES_PER_TREE / entries_per_shard) as usize;
-    let depth = u32::try_from(TREE_DEPTH).unwrap_or(u32::MAX);
-    for k in 1..=depth {
+    for k in 1..=highest_stored_level.saturating_add(1) {
         let block_size = 1u32 << k;
         let block_start = (leaf_index / block_size) * block_size;
         if block_start == leaf_index {
@@ -1004,6 +1037,78 @@ mod tests {
                 assert_eq!(
                     new_list, old,
                     "PerListPath byte-identity mismatch eps={eps} leaf={leaf}"
+                );
+            }
+        }
+    }
+
+    fn materialized_path_diff_shards(
+        entries_per_shard: u32,
+        inserted: u32,
+        highest_stored_level: u32,
+    ) -> BTreeSet<u32> {
+        let mut changed = BTreeSet::from([inserted / entries_per_shard]);
+        for level in 0..=highest_stored_level {
+            let subtree_size = 1u32 << level;
+            let sibling_start = (((inserted >> level) ^ 1) << level).min(LEAVES_PER_TREE);
+            if sibling_start < inserted {
+                let sibling_end = sibling_start
+                    .saturating_add(subtree_size - 1)
+                    .min(inserted - 1);
+                changed.extend(sibling_start / entries_per_shard..=sibling_end / entries_per_shard);
+            }
+        }
+        changed
+    }
+
+    /// W3-01's path-10 encoder returned a hardcoded singleton instead of walking the path,
+    /// so the property below -- proved on the SHARED helper -- guarded nothing the encoder
+    /// actually ran. This pins the encoder itself against the same independent
+    /// materialization oracle, at shard widths either side of one 2^PATH10_LEVELS subtree.
+    #[test]
+    fn path10_encoder_dirty_set_matches_materialized_diff_at_every_shard_width() {
+        let highest_stored_level =
+            u32::try_from(crate::pir_table::list::PATH10_LEVELS.saturating_sub(1))
+                .expect("levels fit u32");
+        for entries_per_shard in [512u32, 1024, 2048, 4096] {
+            let encoder =
+                crate::pir_table::list::PerListPath10Encoder::new(entries_per_shard, [0u8; 32])
+                    .expect("encoder");
+            for inserted in 0..LEAVES_PER_TREE {
+                let actual = encoder.affected_shards_for_ppoi_leaf(&[0u8; 32], inserted);
+                assert_eq!(
+                    actual,
+                    materialized_path_diff_shards(
+                        entries_per_shard,
+                        inserted,
+                        highest_stored_level,
+                    ),
+                    "entries_per_shard={entries_per_shard} inserted={inserted}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn path_dirty_set_matches_materialized_diff_for_every_insert_and_level_cut() {
+        let entries_per_shard = 2048;
+        for highest_stored_level in 0..u32::try_from(TREE_DEPTH).expect("depth fits u32") {
+            for inserted in 0..LEAVES_PER_TREE {
+                let mut actual = BTreeSet::new();
+                path_affected_shards_for_level_into(
+                    entries_per_shard,
+                    inserted,
+                    highest_stored_level,
+                    &mut actual,
+                );
+                assert_eq!(
+                    actual,
+                    materialized_path_diff_shards(
+                        entries_per_shard,
+                        inserted,
+                        highest_stored_level,
+                    ),
+                    "inserted={inserted} highest_stored_level={highest_stored_level}"
                 );
             }
         }

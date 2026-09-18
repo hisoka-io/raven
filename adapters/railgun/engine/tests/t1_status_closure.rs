@@ -65,6 +65,9 @@ fn build_state_session() -> (
             list_index: i,
             blinded_commitment: bc_for(i),
             status: status_for(i),
+            event_type: raven_railgun_persistence::PpoiEventType::Shield,
+            signature: vec![0; 64],
+            validated_merkleroot: [0; 32],
         };
         apply_wal_entry(&mut store, &payload, 100 + u64::from(i), encoder.as_ref())
             .expect("apply leaf");

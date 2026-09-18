@@ -16,6 +16,12 @@ use crate::inspire::LogicalLeafStore;
 /// it fails open. Matches what the plaintext shim returns for the same state
 /// (`poi_shim.rs` maps `None` to `Missing`).
 pub const ABSENT_STATUS_BYTE: u8 = POIStatus::Missing.wire_byte();
+/// PPOI v2 row width.
+pub const PATH10_RECORD_BYTES: usize = 512;
+/// Number of lower siblings retained in a PPOI v2 row.
+pub const PATH10_LEVELS: usize = 11;
+/// Non-zero format marker preventing an absent row from decoding as `Valid`.
+pub const PATH10_MAGIC: [u8; 4] = *b"RVP2";
 
 /// Status encoder: row at `list_index` is `[status_byte, bc[0..31]]` padded to
 /// `record_size`. The BC tail lets one query recover verdict and canonical bytes.
@@ -202,6 +208,126 @@ impl PirTableEncoder for PerListPathEncoder {
 
     fn label(&self) -> &'static str {
         labels::PER_LIST_PATH
+    }
+}
+
+/// PPOI v2 row encoder: leaf, status, type, magic and levels 0 through 10.
+#[derive(Debug, Clone)]
+pub struct PerListPath10Encoder {
+    entries_per_shard: u32,
+    list_key: [u8; 32],
+}
+
+impl PerListPath10Encoder {
+    /// Construct a block-local encoder.
+    pub fn new(entries_per_shard: u32, list_key: [u8; 32]) -> Result<Self> {
+        if entries_per_shard == 0 {
+            return Err(AdapterError::InvalidQuery(
+                "PerListPath10Encoder: entries_per_shard must be > 0".to_owned(),
+            ));
+        }
+        Ok(Self {
+            entries_per_shard,
+            list_key,
+        })
+    }
+}
+
+impl PirTableEncoder for PerListPath10Encoder {
+    fn record_size(&self) -> usize {
+        PATH10_RECORD_BYTES
+    }
+
+    fn entries_per_shard(&self) -> u32 {
+        self.entries_per_shard
+    }
+
+    fn materialize_shard(&self, shard_id: u32, store: &LogicalLeafStore) -> Vec<u8> {
+        let rows = self.entries_per_shard as usize;
+        let mut out = vec![0u8; rows.saturating_mul(PATH10_RECORD_BYTES)];
+        let Some(imt) = store.ppoi_imt(&self.list_key) else {
+            return out;
+        };
+        let row_start = (shard_id as usize).saturating_mul(rows);
+        for row_offset in 0..rows {
+            let list_index = row_start + row_offset;
+            if list_index >= imt.leaf_count() {
+                break;
+            }
+            let Ok(list_index_u32) = u32::try_from(list_index) else {
+                break;
+            };
+            let Some(leaf) = store.ppoi_bc_at(&self.list_key, list_index_u32) else {
+                continue;
+            };
+            let Some(metadata) = store.ppoi_event_metadata(&self.list_key, list_index_u32) else {
+                continue;
+            };
+            let Ok(proof) = imt.merkle_proof(list_index) else {
+                continue;
+            };
+            let start = row_offset * PATH10_RECORD_BYTES;
+            let Some(row) = out.get_mut(start..start + PATH10_RECORD_BYTES) else {
+                continue;
+            };
+            if let Some(dst) = row.get_mut(..32) {
+                dst.copy_from_slice(&leaf);
+            }
+            if let Some(status) = row.get_mut(32) {
+                *status = store
+                    .ppoi_status_at(&self.list_key, list_index_u32)
+                    .unwrap_or(ABSENT_STATUS_BYTE);
+            }
+            let event_type = match metadata.event_type {
+                raven_railgun_persistence::PpoiEventType::Shield => 0,
+                raven_railgun_persistence::PpoiEventType::Transact => 1,
+                raven_railgun_persistence::PpoiEventType::Unshield => 2,
+                raven_railgun_persistence::PpoiEventType::LegacyTransact => 3,
+            };
+            if let Some(dst) = row.get_mut(33) {
+                *dst = event_type;
+            }
+            if let Some(dst) = row.get_mut(34..38) {
+                dst.copy_from_slice(&PATH10_MAGIC);
+            }
+            for (level, sibling) in proof.elements.iter().take(PATH10_LEVELS).enumerate() {
+                let sibling_start = 38 + level * NODE_HASH_BYTES;
+                if let Some(dst) = row.get_mut(sibling_start..sibling_start + NODE_HASH_BYTES) {
+                    dst.copy_from_slice(sibling);
+                }
+            }
+        }
+        out
+    }
+
+    fn affected_shards_for_leaf(&self, _tree: u32, _leaf_index: u32) -> BTreeSet<u32> {
+        BTreeSet::new()
+    }
+
+    fn affected_shards_for_ppoi_leaf(&self, list_key: &[u8; 32], list_index: u32) -> BTreeSet<u32> {
+        let mut dirty = BTreeSet::new();
+        if list_key != &self.list_key || list_index >= LEAVES_PER_TREE {
+            return dirty;
+        }
+        // Levels 0..=PATH10_LEVELS-1 are stored IN the row, so an insert restales every
+        // shard holding a leaf whose stored path moved -- the same walk the per-list path
+        // encoder uses, and the one W3-02's exhaustive property guards. The singleton this
+        // replaces was correct only when a shard was exactly one 2^PATH10_LEVELS subtree,
+        // while `new()` accepts any non-zero width: at 512 rows, inserting leaf 512 left
+        // shard 0 stale with no error and no counter.
+        let highest_stored_level =
+            u32::try_from(PATH10_LEVELS.saturating_sub(1)).unwrap_or(u32::MAX);
+        super::path_affected_shards_for_level_into(
+            self.entries_per_shard,
+            list_index,
+            highest_stored_level,
+            &mut dirty,
+        );
+        dirty
+    }
+
+    fn label(&self) -> &'static str {
+        labels::PER_LIST_PATH10
     }
 }
 

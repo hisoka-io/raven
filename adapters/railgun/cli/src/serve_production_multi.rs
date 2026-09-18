@@ -12,7 +12,7 @@ use anyhow::Context;
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_core::{InstanceId, ListKey};
 use raven_railgun_engine::inspire::{
-    setup_state, InspireServerState, LogicalLeafStore, RavenInspireScheme,
+    setup_state_with_inspiring_seed, InspireServerState, LogicalLeafStore, RavenInspireScheme,
 };
 use raven_railgun_engine::orchestrator::{
     bootstrap_railgun_engine_multi, DataSourceFilter, InstanceConfig, MultiOrchestratorHandle,
@@ -287,6 +287,7 @@ enum EncoderString {
     PerNode,
     PerListStatus,
     PerListPath,
+    PerListPath10,
     PerListNode,
 }
 
@@ -314,6 +315,8 @@ enum DataSourceSection {
     },
     Mirror {
         list_key: String,
+        #[serde(default)]
+        block: Option<u32>,
         #[serde(default)]
         #[allow(dead_code)]
         what: Option<String>,
@@ -529,10 +532,10 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
             anyhow::bail!("[[ppoi_list_template]] requires non-empty template_id");
         }
         match tpl.encoder.as_str() {
-            "per-list-status" | "per-list-path" | "per-list-node" => {}
+            "per-list-status" | "per-list-path" | "per-list-path10" | "per-list-node" => {}
             other => anyhow::bail!(
                 "[[ppoi_list_template]] template_id={:?} encoder={other:?} is not a \
-                 PPOI encoder (allowed: per-list-status, per-list-path, per-list-node)",
+                 PPOI encoder (allowed: per-list-status, per-list-path, per-list-path10, per-list-node)",
                 tpl.template_id
             ),
         }
@@ -749,6 +752,13 @@ fn build_encoder_kind(
                 list_key: parse_hex32(lk)?,
             })
         }
+        EncoderString::PerListPath10 => {
+            let lk = list_key
+                .ok_or_else(|| anyhow::anyhow!("per-list-path10 encoder requires `list_key`"))?;
+            Ok(EncoderKind::PerListPath10 {
+                list_key: parse_hex32(lk)?,
+            })
+        }
         EncoderString::PerListNode => {
             let lk = list_key
                 .ok_or_else(|| anyhow::anyhow!("per-list-node encoder requires `list_key`"))?;
@@ -764,9 +774,15 @@ fn build_data_source(section: &DataSourceSection) -> anyhow::Result<DataSourceFi
         DataSourceSection::Indexer { filter } => {
             Ok(DataSourceFilter::ChainTreeNumber(filter.tree_number))
         }
-        DataSourceSection::Mirror { list_key, .. } => {
-            Ok(DataSourceFilter::PpoiList(parse_hex32(list_key)?))
-        }
+        DataSourceSection::Mirror {
+            list_key, block, ..
+        } => match block {
+            Some(block) => Ok(DataSourceFilter::PpoiListBlock {
+                list_key: parse_hex32(list_key)?,
+                block: *block,
+            }),
+            None => Ok(DataSourceFilter::PpoiList(parse_hex32(list_key)?)),
+        },
     }
 }
 
@@ -776,14 +792,17 @@ fn enforce_verification_mode_matches_data_source(
 ) -> anyhow::Result<()> {
     match (data_source, mode) {
         (DataSourceFilter::ChainTreeNumber(_), VerificationMode::ChainRootHistory)
-        | (DataSourceFilter::PpoiList(_), VerificationMode::UpstreamSignature) => Ok(()),
+        | (
+            DataSourceFilter::PpoiList(_) | DataSourceFilter::PpoiListBlock { .. },
+            VerificationMode::UpstreamSignature,
+        ) => Ok(()),
         (DataSourceFilter::ChainTreeNumber(t), VerificationMode::UpstreamSignature) => {
             anyhow::bail!(
                 "chain-tree instance (tree_number={t}) must use \
                  verification_mode = \"chain-root-history\""
             )
         }
-        (DataSourceFilter::PpoiList(_), VerificationMode::ChainRootHistory) => {
+        (DataSourceFilter::PpoiList(_) | DataSourceFilter::PpoiListBlock { .. }, VerificationMode::ChainRootHistory) => {
             anyhow::bail!("ppoi-list instance must use verification_mode = \"upstream-signature\"")
         }
     }
@@ -818,8 +837,9 @@ fn enforce_encoder_matches_data_source(
         (
             EncoderKind::PerListStatus { .. }
             | EncoderKind::PerListPath { .. }
+            | EncoderKind::PerListPath10 { .. }
             | EncoderKind::PerListNode { .. },
-            DataSourceFilter::PpoiList(_),
+            DataSourceFilter::PpoiList(_) | DataSourceFilter::PpoiListBlock { .. },
         ) => Ok(()),
         _ => anyhow::bail!(
             "encoder kind {} does not match data_source {:?}",
@@ -1149,6 +1169,19 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         app_state
     };
     let app_state = app_state.with_instance_concurrency(k_map);
+    let instance_logical_stores = bootstrap
+        .handles
+        .instances
+        .iter()
+        .filter_map(|handle| match handle.config.encoder {
+            EncoderKind::PerListPath10 { list_key } => Some((
+                handle.instance.id.clone(),
+                (list_key, Arc::clone(&handle.logical_store)),
+            )),
+            _ => None,
+        })
+        .collect();
+    let app_state = app_state.with_instance_logical_stores(instance_logical_stores);
     let app_state = if let Some(pool) = chain_workers
         .as_ref()
         .and_then(|w| w.rpc_pool.as_ref())
@@ -1959,6 +1992,7 @@ fn bootstrap_instances(
 ) -> anyhow::Result<Bootstrap> {
     let mut state_holders: Vec<Option<InspireServerState>> =
         Vec::with_capacity(opts.instances.len());
+    let mut shared_inspiring_seed = None;
     for cfg in &opts.instances {
         let entry_size = cfg.record_size.max(32);
         let entries = entries_for_instance(opts, cfg, fleet_default_entries);
@@ -1966,8 +2000,15 @@ fn bootstrap_instances(
         let initial_db: Vec<u8> = (0..entries)
             .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).unwrap_or(0)))
             .collect();
-        let (state, _sk) = setup_state(params, &initial_db, entry_size, InspireVariant::TwoPacking)
-            .map_err(|e| anyhow::anyhow!("setup_state: {e}"))?;
+        let (state, _sk) = setup_state_with_inspiring_seed(
+            params,
+            &initial_db,
+            entry_size,
+            InspireVariant::TwoPacking,
+            shared_inspiring_seed,
+        )
+        .map_err(|e| anyhow::anyhow!("setup_state: {e}"))?;
+        shared_inspiring_seed.get_or_insert(state.crs.inspiring_w_seed);
         state_holders.push(Some(state));
     }
 
@@ -2305,7 +2346,9 @@ fn spawn_mirror_workers(
             let tx = mirror_tx.clone();
             // per-list-path owns the path sidecar; every other kind uses status.
             let kind = match inst.config.encoder {
-                EncoderKind::PerListPath { .. } => MirrorKind::Path,
+                EncoderKind::PerListPath { .. } | EncoderKind::PerListPath10 { .. } => {
+                    MirrorKind::Path
+                }
                 _ => MirrorKind::Status,
             };
             let fallback = {

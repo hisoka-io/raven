@@ -513,7 +513,7 @@ impl InspirePersistence {
         current_block_height: u64,
     ) -> Result<SnapshotId> {
         self.validate_commit_shape(state)?;
-        let bundle = super::inspire::snapshot_inspire_state_v6(state, store)?;
+        let bundle = super::inspire::snapshot_inspire_state_v7(state, store)?;
         let id = self.commit_serialized_bundle(bundle, current_block_height)?;
         if let Err(error) = self.persist_cache_if_changed(state) {
             tracing::warn!(error = %error, "offline packing cache store failed after commit");
@@ -2138,6 +2138,9 @@ mod tests {
                     list_index: 0,
                     blinded_commitment: [2u8; 32],
                     status: 1,
+                    event_type: raven_railgun_persistence::PpoiEventType::Shield,
+                    signature: vec![0; 64],
+                    validated_merkleroot: [0; 32],
                 },
                 HEIGHT,
             )],
@@ -2204,6 +2207,9 @@ mod tests {
                 list_index: 0,
                 blinded_commitment: [2u8; 32],
                 status: 0,
+                event_type: raven_railgun_persistence::PpoiEventType::Shield,
+                signature: vec![0; 64],
+                validated_merkleroot: [0; 32],
             },
         ];
         let inert = [

@@ -62,6 +62,9 @@ fn canonical_payload(seed: u64, i: usize) -> (WalEntryPayload, u64) {
                 a
             },
             status: ((h >> 16) % 4) as u8,
+            event_type: raven_railgun_persistence::PpoiEventType::Shield,
+            signature: vec![0; 64],
+            validated_merkleroot: [0; 32],
         },
         _ => WalEntryPayload::Heartbeat {
             wallclock_unix_ms: h,

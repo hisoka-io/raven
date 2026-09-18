@@ -277,6 +277,8 @@ impl ChainalysisOnChainOracleSource {
             out.push(PpoiEventRow {
                 index: idx,
                 leaf: bc,
+                event_type: None,
+                signature: None,
                 validated_merkleroot: imt.root(),
             });
         }
