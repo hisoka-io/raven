@@ -13,7 +13,8 @@ const LIST_KEY: [u8; 32] = [
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "live production read: 128 JSON-RPC event pages"]
+#[ignore = "trigger: run by hand against live production; 131 JSON-RPC event pages \
+             (65,536 rows at 501 inclusive rows per page)"]
 async fn first_real_frozen_block_sync_retains_metadata_and_matches_every_root() {
     let client = RailwayPpoiClient::new("https://ppoi.fdi.network", 0, 1)
         .expect("live client")

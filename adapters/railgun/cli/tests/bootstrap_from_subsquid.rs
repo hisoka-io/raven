@@ -1468,7 +1468,7 @@ mod ppoi_resilience {
         (format!("http://{addr}"), shutdown_tx)
     }
 
-    /// W1-04 bounds every bootstrap by `ppoi_node_status`, so EVERY stub must answer it.
+    /// Bootstrap is bounded by `ppoi_node_status`, so EVERY stub must answer it.
     /// A stub that does not panics on the absent `startIndex`, drops the connection, and
     /// turns a row-semantics test into a transport test that proves nothing.
     fn node_status_result(request: &serde_json::Value, total: u64) -> (axum::http::StatusCode, String) {

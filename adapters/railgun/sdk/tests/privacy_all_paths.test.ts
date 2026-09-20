@@ -143,7 +143,7 @@ describe("privacy across every SDK call path", () => {
     }
     expect(
       assertNoCommitmentsInPirRequests(sdk.lastWireRequests(), queriedBcs, {
-        // One 512 B path-10 row replaced sixteen 32 B node reads (W3-01/W3-03).
+        // One 512 B path-10 row replaced sixteen 32 B node reads.
         expectedQueryCount: 1,
       }),
     ).toHaveLength(1);

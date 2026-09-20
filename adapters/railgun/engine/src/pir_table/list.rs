@@ -311,7 +311,7 @@ impl PirTableEncoder for PerListPath10Encoder {
         }
         // Levels 0..=PATH10_LEVELS-1 are stored IN the row, so an insert restales every
         // shard holding a leaf whose stored path moved -- the same walk the per-list path
-        // encoder uses, and the one W3-02's exhaustive property guards. The singleton this
+        // encoder uses, and the one the exhaustive dirty-set property guards. The singleton this
         // replaces was correct only when a shard was exactly one 2^PATH10_LEVELS subtree,
         // while `new()` accepts any non-zero width: at 512 rows, inserting leaf 512 left
         // shard 0 stale with no error and no counter.

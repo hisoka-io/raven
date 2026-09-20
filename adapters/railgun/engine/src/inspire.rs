@@ -440,10 +440,13 @@ pub const SNAPSHOT_V7_MAGIC: [u8; 4] = *b"RV7\0";
 
 /// V6 envelope; bundling the store lets a commit archive the WAL without
 /// losing logical state on restart.
+///
+/// `store` is the FROZEN [`LogicalLeafStoreV6`], never the live one. Every V6 snapshot on
+/// disk was written by a build predating `ppoi_event_metadata`, and bincode is positional.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PersistedInspireStateV6 {
     state: PersistedInspireState,
-    store: LogicalLeafStore,
+    store: LogicalLeafStoreV6,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -486,7 +489,7 @@ pub fn snapshot_inspire_state_v6(
             variant: state.variant,
             entry_size: state.entry_size,
         },
-        store: store.clone(),
+        store: LogicalLeafStoreV6::try_from_current(store)?,
     };
     let mut out = Vec::with_capacity(SNAPSHOT_V6_MAGIC.len() + 1024);
     out.extend_from_slice(&SNAPSHOT_V6_MAGIC);
@@ -496,10 +499,44 @@ pub fn snapshot_inspire_state_v6(
     Ok(out)
 }
 
+/// Decode a snapshot body, REFUSING surplus bytes.
+///
+/// `bincode::deserialize` is `…with_fixint_encoding().allow_trailing_bytes()`, which bincode's own
+/// docs flag as the opposite of the `DefaultOptions` struct's default. Surplus after a snapshot
+/// means the writer and the reader disagree about the shape; discarding it silently is how a
+/// V7-shaped store read through the V6 reader returns `Ok` with a list key assembled from
+/// signature bytes. `inspire-cache`, `pir/respond.rs` and `crates/client` already reject trailing
+/// bytes -- the snapshot path was the outlier.
+fn decode_snapshot_body<'a, T: serde::de::Deserialize<'a>>(
+    body: &'a [u8],
+) -> std::result::Result<T, bincode::Error> {
+    use bincode::Options as _;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize(body)
+}
+
+/// Shared tail for every snapshot-decode refusal.
+///
+/// `PersistedInspireState` is the first field of every envelope and reaches into the InsPIRe
+/// submodule's types, so a field moved anywhere in that reach surfaces as an arbitrary error on
+/// whichever arm happened to run. The arm is not a diagnosis and the message must not read as
+/// one. The command below is exact: this is a DETACHED workspace, so `-p` alone resolves to
+/// nothing from the repo root.
+const SNAPSHOT_LAYOUT_HELP: &str = "Either these bytes are damaged, or they were written by a \
+     build whose serialized layout differs from this one: bincode is positional, so a field \
+     added or moved anywhere inside the snapshot -- including inside the embedded InsPIRe \
+     types -- shifts every byte after it, and no in-place migration exists. Operator: probe a \
+     data_dir before deploying, with RAVEN_PROBE_DATA_DIR=<dir> cargo test --manifest-path \
+     adapters/railgun/Cargo.toml -p raven-railgun-engine --test data_dir_reopen_probe -- \
+     --ignored; then either ship a build whose layout matches, or re-bootstrap this instance.";
+
 /// Reconstruct an [`InspireServerState`] from bincode bytes. Rebuilds cache; session store starts empty.
 pub fn restore_inspire_state(bytes: &[u8]) -> Result<InspireServerState> {
-    let bundle: PersistedInspireState = bincode::deserialize(bytes)
-        .map_err(|e| AdapterError::Serialization(format!("snapshot deserialize: {e}")))?;
+    let bundle: PersistedInspireState = decode_snapshot_body(bytes).map_err(|e| {
+        AdapterError::Serialization(format!("v5 snapshot deserialize: {e}. {SNAPSHOT_LAYOUT_HELP}"))
+    })?;
     bundle_to_state(bundle)
 }
 
@@ -576,19 +613,39 @@ pub(crate) fn persist_inspiring_cache(
         .map_err(|e| AdapterError::Internal(format!("offline packing cache store: {e}")))
 }
 
+/// A V6 body that will not parse as the frozen V6 layout is either damaged or was written by
+/// a build with a different one; these bytes cannot tell you which, and the message says so.
+/// What it can say is that bincode carries no field names, so nothing migrates in place.
+fn decode_v6_body(body: &[u8]) -> Result<PersistedInspireStateV6> {
+    decode_snapshot_body(body).map_err(|e| {
+        AdapterError::Serialization(format!(
+            "v6 snapshot deserialize: {e}. These bytes do not match the frozen V6 layout. \
+             {SNAPSHOT_LAYOUT_HELP}"
+        ))
+    })
+}
+
+/// V7 carries the LIVE store, so unlike V6 there is no frozen shape to name -- but the
+/// operator's options are identical and so is the message.
+fn decode_v7_body(body: &[u8]) -> Result<PersistedInspireStateV7> {
+    decode_snapshot_body(body).map_err(|e| {
+        AdapterError::Serialization(format!(
+            "v7 snapshot deserialize: {e}. {SNAPSHOT_LAYOUT_HELP}"
+        ))
+    })
+}
+
 /// Reconstruct `(InspireServerState, LogicalLeafStore)`, dispatching on
 /// [`SNAPSHOT_V6_MAGIC`]. V5 yields an empty store that WAL replay refills.
 pub fn restore_inspire_state_v6(bytes: &[u8]) -> Result<(InspireServerState, LogicalLeafStore)> {
     if let Some(body) = bytes.strip_prefix(SNAPSHOT_V7_MAGIC.as_slice()) {
-        let bundle: PersistedInspireStateV7 = bincode::deserialize(body)
-            .map_err(|e| AdapterError::Serialization(format!("v7 snapshot deserialize: {e}")))?;
+        let bundle = decode_v7_body(body)?;
         let state = bundle_to_state(bundle.state)?;
         Ok((state, bundle.store))
     } else if let Some(body) = bytes.strip_prefix(SNAPSHOT_V6_MAGIC.as_slice()) {
-        let bundle: PersistedInspireStateV6 = bincode::deserialize(body)
-            .map_err(|e| AdapterError::Serialization(format!("v6 snapshot deserialize: {e}")))?;
+        let bundle = decode_v6_body(body)?;
         let state = bundle_to_state(bundle.state)?;
-        Ok((state, bundle.store))
+        Ok((state, bundle.store.into_current()))
     } else {
         tracing::warn!(
             target = "raven::engine::snapshot",
@@ -605,8 +662,7 @@ pub(crate) fn restore_inspire_state_v6_cached(
     data_dir: &std::path::Path,
 ) -> Result<(InspireServerState, LogicalLeafStore, bool, bool)> {
     if let Some(body) = bytes.strip_prefix(SNAPSHOT_V7_MAGIC.as_slice()) {
-        let bundle: PersistedInspireStateV7 = bincode::deserialize(body)
-            .map_err(|e| AdapterError::Serialization(format!("v7 snapshot deserialize: {e}")))?;
+        let bundle = decode_v7_body(body)?;
         let (cache, hit, persisted) =
             cache_for_recovery(data_dir, &bundle.state.crs, &bundle.state.encoded_db)?;
         let state = InspireServerState {
@@ -619,8 +675,7 @@ pub(crate) fn restore_inspire_state_v6_cached(
         };
         Ok((state, bundle.store, hit, persisted))
     } else if let Some(body) = bytes.strip_prefix(SNAPSHOT_V6_MAGIC.as_slice()) {
-        let bundle: PersistedInspireStateV6 = bincode::deserialize(body)
-            .map_err(|e| AdapterError::Serialization(format!("v6 snapshot deserialize: {e}")))?;
+        let bundle = decode_v6_body(body)?;
         let (cache, hit, persisted) =
             cache_for_recovery(data_dir, &bundle.state.crs, &bundle.state.encoded_db)?;
         let state = InspireServerState {
@@ -631,15 +686,21 @@ pub(crate) fn restore_inspire_state_v6_cached(
             variant: bundle.state.variant,
             entry_size: bundle.state.entry_size,
         };
-        Ok((state, bundle.store, hit, persisted))
+        Ok((state, bundle.store.into_current(), hit, persisted))
     } else {
         tracing::warn!(
             target = "raven::engine::snapshot",
             "legacy V5 snapshot (no V6 magic prefix); LogicalLeafStore starts empty and will \
              be repopulated from WAL replay if WAL bytes are still present"
         );
-        let bundle: PersistedInspireState = bincode::deserialize(bytes)
-            .map_err(|e| AdapterError::Serialization(format!("snapshot deserialize: {e}")))?;
+        // The boot path (`persistence.rs`) comes through HERE, not through the uncached
+        // twin -- so this is the arm a production reopen failure surfaces on, and it was the
+        // one still emitting a bare bincode error the operator could not act on.
+        let bundle: PersistedInspireState = decode_snapshot_body(bytes).map_err(|e| {
+            AdapterError::Serialization(format!(
+                "v5 snapshot deserialize: {e}. {SNAPSHOT_LAYOUT_HELP}"
+            ))
+        })?;
         let (cache, hit, persisted) =
             cache_for_recovery(data_dir, &bundle.crs, &bundle.encoded_db)?;
         let state = InspireServerState {
@@ -713,11 +774,288 @@ pub fn re_encode_shard(
 
 mod logical_store;
 
-pub(crate) use logical_store::appends_to_a_tree;
+pub(crate) use logical_store::{appends_to_a_tree, LogicalLeafStoreV6};
 pub use logical_store::{
     apply_wal_entry, ensure_canonical_leaf, materialize_shard_bytes, validate_apply,
     LogicalLeafStore,
 };
+
+#[cfg(test)]
+mod frozen_v6_shape_tests {
+    //! Every V6 snapshot on disk was written before `ppoi_event_metadata` existed.
+    //! bincode is positional, so reading those bytes with the LIVE struct reinterprets
+    //! `ppoi_list_leaf_block_height` as the new field. These tests pin the V6 read path to
+    //! frozen BYTES, because a round trip through today's codec cannot see a shape change --
+    //! it writes and reads the same wrong layout and passes.
+    //!
+    //! LIMIT, stated so a green run is not over-read: the store holds `HashMap`s, so minting
+    //! is NOT byte-reproducible. Decoding is order-independent, so the fixtures are sound to
+    //! read -- but a fixture diff is not evidence of a shape change, and a test that passes
+    //! after a re-mint proves only that the fixture matches the struct that minted it. The
+    //! control is that both generators are `#[ignore]`d and re-minting is a deliberate act.
+
+    use super::{
+        apply_wal_entry, restore_inspire_state_v6, setup_state, InspireVariant, LogicalLeafStore,
+        LogicalLeafStoreV6, PersistedInspireState, SNAPSHOT_V6_MAGIC, SNAPSHOT_V7_MAGIC,
+    };
+    use crate::pir_table::PerLeafCommitmentEncoder;
+    use raven_inspire::params::InspireParams;
+    use raven_railgun_persistence::{PpoiEventType, WalEntryPayload};
+
+    /// The bytes a pre-`ppoi_event_metadata` build WOULD have written for the store
+    /// `sample_store()` builds -- minted here, not recovered from one; that build could not have
+    /// constructed this store at all, since three of the payload fields postdate it.
+    /// Store-only: `PersistedInspireStateV6` is positionally `state ++ store`.
+    const FROZEN_V6_STORE: &[u8] = include_bytes!("../tests/fixtures/logical_store_v6.bin");
+
+    /// The CURRENT layout, frozen at the shape that ships. V7 carries the live struct, which
+    /// is the position V6 was in when it broke: the next field inserted mid-struct silently
+    /// reinterprets the bytes on every deployed data_dir. This fixture fires here rather than
+    /// on the box.
+    ///
+    /// What it catches: a field added, removed or moved, and a width change -- the decode
+    /// underruns or leaves surplus, and surplus is now refused. What it does NOT catch: a
+    /// same-width type substitution (`u64` for `i64`), which decodes cleanly and passes every
+    /// assertion below.
+    const FROZEN_V7_STORE: &[u8] = include_bytes!("../tests/fixtures/logical_store_v7.bin");
+
+    const LIST_KEY: [u8; 32] = [0xab; 32];
+
+    /// One commitment leaf and two PPOI list leaves. The PPOI leaves are what matters: they
+    /// are the only writers of `ppoi_list_leaf_block_height`, the map the inserted field
+    /// steals the bytes of. Height 0 mirrors production, where the mirror sends 0.
+    fn sample_store() -> LogicalLeafStore {
+        let enc = PerLeafCommitmentEncoder::new(32, 65_536, 0).expect("test encoder");
+        let mut store = LogicalLeafStore::new();
+        apply_wal_entry(
+            &mut store,
+            &WalEntryPayload::AppendLeaf {
+                tree_number: 0,
+                leaf_index: 0,
+                commitment: [7u8; 32],
+            },
+            0,
+            &enc,
+        )
+        .expect("append leaf");
+        for index in 0..2u32 {
+            let mut bc = [0u8; 32];
+            bc[31] = u8::try_from(index).unwrap_or(0).saturating_add(1);
+            apply_wal_entry(
+                &mut store,
+                &WalEntryPayload::PpoiListLeafAdded {
+                    list_key: LIST_KEY,
+                    list_index: index,
+                    blinded_commitment: bc,
+                    status: 0,
+                    event_type: PpoiEventType::Shield,
+                    signature: vec![0x5a; 64],
+                    validated_merkleroot: [0x11; 32],
+                },
+                0,
+                &enc,
+            )
+            .expect("append ppoi list leaf");
+        }
+        store
+    }
+
+    /// One InsPIRe setup shared by every test here; it dominates this module's runtime.
+    fn toy_state() -> &'static super::InspireServerState {
+        static STATE: std::sync::OnceLock<super::InspireServerState> = std::sync::OnceLock::new();
+        STATE.get_or_init(|| {
+            let params = InspireParams::secure_128_d2048();
+            let db = raven_railgun_testkit::toy_db(256, 32);
+            let (state, _sk) =
+                setup_state(&params, &db, 32, InspireVariant::TwoPacking).expect("setup");
+            state
+        })
+    }
+
+    fn state_bytes() -> Vec<u8> {
+        let state = toy_state();
+        bincode::serialize(&PersistedInspireState {
+            crs: (*state.crs).clone(),
+            encoded_db: (*state.encoded_db).clone(),
+            variant: state.variant,
+            entry_size: state.entry_size,
+        })
+        .expect("serialize state")
+    }
+
+    /// `PersistedInspireStateV6` is `{ state, store }` and bincode writes fields in order, so
+    /// this is today's state bytes followed by the frozen store bytes.
+    ///
+    /// **Legacy in the STORE half only.** The state half is serialized by today's code and
+    /// therefore carries today's `InspireParams`. A real V6 snapshot on a box carries the older
+    /// one, and that half is not frozen here -- so nothing built on this function is evidence
+    /// that a production data_dir reopens. `data_dir_reopen_probe` is what answers that.
+    fn legacy_v6_snapshot(magic: [u8; 4]) -> Vec<u8> {
+        let mut out = magic.to_vec();
+        out.extend_from_slice(&state_bytes());
+        out.extend_from_slice(FROZEN_V6_STORE);
+        out
+    }
+
+    #[test]
+    #[ignore = "trigger: a deliberate re-mint only; this WRITES the fixture it pins, so running \
+                it in a lane would erase the evidence. Run with --ignored by hand."]
+    fn mint_frozen_v6_store_fixture() {
+        let frozen = LogicalLeafStoreV6::from_current_dropping_metadata(&sample_store());
+        let bytes = bincode::serialize(&frozen).expect("serialize frozen v6 store");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/logical_store_v6.bin");
+        std::fs::write(&path, &bytes).expect("write fixture");
+    }
+
+    #[test]
+    #[ignore = "trigger: a change to LogicalLeafStore's layout, and then only in the same \
+                change as a new snapshot magic. Run with --ignored by hand."]
+    fn mint_frozen_v7_store_fixture() {
+        let bytes = bincode::serialize(&sample_store()).expect("serialize v7 store");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/logical_store_v7.bin");
+        std::fs::write(&path, &bytes).expect("write fixture");
+    }
+
+    // The same trap, one version forward. Changing `LogicalLeafStore`'s layout without a magic
+    // reddens HERE, at desk speed, instead of at boot on a data_dir nobody can re-read.
+    #[test]
+    fn the_live_store_still_reads_the_shipped_v7_layout() {
+        let store: LogicalLeafStore = super::decode_snapshot_body(FROZEN_V7_STORE)
+            .unwrap_or_else(|e| {
+            panic!(
+                "LogicalLeafStore no longer reads the V7 bytes it ships with ({e}). bincode is \
+                 positional: a field added or moved breaks every deployed data_dir. Add a new \
+                 SNAPSHOT_V8_MAGIC, freeze the V7 shape the way LogicalLeafStoreV6 is frozen, \
+                 and re-mint this fixture in the SAME change."
+                )
+            });
+        assert_eq!(store.leaf(0, 0), Some(&[7u8; 32]));
+        assert_eq!(store.ppoi_list_leaves_iter(&LIST_KEY).count(), 2);
+        assert_eq!(store.ppoi_list_leaf_block_height_len(), 2);
+        let meta = store
+            .ppoi_event_metadata(&LIST_KEY, 0)
+            .expect("V7 retains upstream metadata; that is what V7 is for");
+        assert_eq!(meta.validated_merkleroot, [0x11; 32]);
+        assert_eq!(meta.signature.len(), 64);
+    }
+
+    // THE DEFECT, pinned. Deserializing the frozen bytes with the LIVE struct is exactly what
+    // the V6 arm did before this fix. If someone later "simplifies" `LogicalLeafStoreV6` back
+    // to `LogicalLeafStore`, this test is what tells them the box cannot reopen.
+    #[test]
+    fn frozen_v6_store_bytes_do_not_decode_as_the_live_store() {
+        let Err(err) = super::decode_snapshot_body::<LogicalLeafStore>(FROZEN_V6_STORE) else {
+            panic!("the live struct must NOT be able to read frozen V6 bytes");
+        };
+        assert!(
+            err.to_string().contains("end of file"),
+            "expected the reader to outrun the buffer; got {err}"
+        );
+    }
+
+    #[test]
+    fn frozen_v6_store_bytes_decode_as_the_frozen_shape() {
+        let frozen: LogicalLeafStoreV6 =
+            super::decode_snapshot_body(FROZEN_V6_STORE)
+                .expect("frozen shape must read its own bytes");
+        let store = frozen.into_current();
+        assert_eq!(store.leaf(0, 0), Some(&[7u8; 32]), "commitment leaf survived");
+        assert_eq!(store.ppoi_list_count(), 1, "one list key");
+        assert_eq!(
+            store.ppoi_list_leaves_iter(&LIST_KEY).count(),
+            2,
+            "both PPOI list leaves survived"
+        );
+        // The map the inserted field steals the bytes of. Asserted directly, because a
+        // clean decode of the fields BEFORE it would not have noticed.
+        assert_eq!(store.ppoi_list_leaf_block_height_len(), 2);
+        let mut bc = [0u8; 32];
+        bc[31] = 1;
+        assert_eq!(store.ppoi_index_of(&LIST_KEY, &bc), Some(0));
+        assert_eq!(
+            store.ppoi_event_metadata(&LIST_KEY, 0),
+            None,
+            "V6 never carried retained metadata; absence is a fact about the snapshot"
+        );
+    }
+
+    // Store half only -- see `legacy_v6_snapshot`. A green here does NOT mean a deployed
+    // data_dir reopens; it means the frozen V6 store shape is read correctly.
+    #[test]
+    fn a_legacy_v6_snapshot_reopens() {
+        let (state, store) =
+            restore_inspire_state_v6(&legacy_v6_snapshot(SNAPSHOT_V6_MAGIC)).expect("v6 reopen");
+        assert_eq!(state.entry_size, 32);
+        assert_eq!(store.ppoi_list_leaves_iter(&LIST_KEY).count(), 2);
+        assert_eq!(store.ppoi_list_leaf_block_height_len(), 2);
+        assert_eq!(store.leaf(0, 0), Some(&[7u8; 32]));
+    }
+
+    // The V7 arm still reads the live struct -- correctly, since V7 wrote it. Feeding it a
+    // legacy body exercises the same deserialization target the V6 arm had before it was
+    // frozen. (The error path around it is new; the struct being decoded into is not.)
+    #[test]
+    fn the_same_legacy_body_under_v7_magic_is_refused() {
+        let Err(err) = restore_inspire_state_v6(&legacy_v6_snapshot(SNAPSHOT_V7_MAGIC)) else {
+            panic!("legacy bytes must not be readable as V7");
+        };
+        assert!(
+            err.to_string().contains("v7 snapshot deserialize"),
+            "got {err}"
+        );
+    }
+
+    // A V7-shaped store under V6 magic. The frozen V6 reader stops after its eleventh field,
+    // and while surplus bytes were tolerated it returned `Ok` with a list key assembled from
+    // the tail of a signature -- wrong bytes, `Ok`, nothing logged, on this repo's own fixtures.
+    #[test]
+    fn a_v7_shaped_store_under_v6_magic_is_refused_rather_than_truncated() {
+        let mut snapshot = SNAPSHOT_V6_MAGIC.to_vec();
+        snapshot.extend_from_slice(&state_bytes());
+        snapshot.extend_from_slice(FROZEN_V7_STORE);
+        let Err(err) = restore_inspire_state_v6(&snapshot) else {
+            panic!("a V7-shaped store must not decode as V6 with the surplus discarded");
+        };
+        assert!(err.to_string().contains("v6 snapshot deserialize"), "got {err}");
+    }
+
+    #[test]
+    fn an_unreadable_v6_body_names_the_migration_not_bincode_alone() {
+        let mut truncated = legacy_v6_snapshot(SNAPSHOT_V6_MAGIC);
+        truncated.truncate(truncated.len() - 16);
+        let Err(err) = restore_inspire_state_v6(&truncated) else {
+            panic!("a truncated body must refuse");
+        };
+        let msg = err.to_string();
+        // The last needle is the one that matters: this is a detached workspace, and the
+        // advice shipped without `--manifest-path` resolves to no package from the repo root.
+        // Asserting the message merely SAYS "Operator" would pin the letter of the gate.
+        for needle in [
+            "frozen V6 layout",
+            "re-bootstrap",
+            "Operator",
+            "--manifest-path adapters/railgun/Cargo.toml",
+        ] {
+            assert!(
+                msg.contains(needle),
+                "refusal must tell the operator what to do; {needle:?} missing from {msg:?}"
+            );
+        }
+    }
+
+    // V6 has no field for retained metadata, so writing one from a store that carries it would
+    // drop data silently -- the defect class this whole card is about, in the other direction.
+    #[test]
+    fn writing_v6_from_a_store_carrying_metadata_is_refused() {
+        let Err(err) = super::snapshot_inspire_state_v6(toy_state(), &sample_store()) else {
+            panic!("V6 cannot represent retained metadata");
+        };
+        assert!(err.to_string().contains("Write V7"), "got {err}");
+    }
+
+}
 
 #[cfg(test)]
 mod snapshot_v6_tests {

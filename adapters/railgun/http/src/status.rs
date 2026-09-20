@@ -307,6 +307,14 @@ pub struct HealthReadyResponse {
     /// one, so the served tree is missing chain state. Non-empty forces 503.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stalled_consumer_instances: Vec<String>,
+    /// Routing targets not currently receiving events: no route accepts them, or the
+    /// bound consumer's channel is gone. Non-empty forces 503.
+    ///
+    /// The mark is self-healing — a delivery clears it — so this gates readiness without
+    /// latching on the ordinary block rollover, where a fully provisioned list misses for
+    /// exactly one event while the next block's route is installed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub router_unrouted_targets: Vec<String>,
 }
 
 /// Indexer-consumer view in [`HealthReadyResponse`].
@@ -414,9 +422,11 @@ pub(crate) async fn health_ready_handler<S: PirScheme>(
             layer2_divergent_instances: Vec::new(),
             wal_replay_skipped_instances: Vec::new(),
             stalled_consumer_instances: Vec::new(),
+            router_unrouted_targets: Vec::new(),
         };
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body));
     }
+    let unrouted_targets = raven_railgun_engine::orchestrator::router_unrouted_targets();
     let divergent = raven_railgun_engine::persistence::layer2_divergent_instances();
     let replay_skipped = raven_railgun_engine::persistence::wal_replay_skipped_instances();
     let stalled = stalled_consumer_instances(&app);
@@ -444,9 +454,18 @@ pub(crate) async fn health_ready_handler<S: PirScheme>(
         .as_ref()
         .map(build_rpc_pool_health_view);
     // Known divergence fails closed: the tree this endpoint would answer from is
-    // provably not the chain's, not even its own WAL's, or missing every event
-    // its consumer has dropped since the last one it applied.
-    let (code, status) = if divergent.is_empty() && replay_skipped.is_empty() && stalled.is_empty()
+    // provably not the chain's, not even its own WAL's, missing every event its consumer
+    // has dropped since the last one it applied, or missing events no route accepts.
+    //
+    // The last of those gates safely only because the mark is self-healing. Route
+    // installation is ASYNCHRONOUS -- auto-spawn reacts to an observed key and publishes
+    // the route afterwards -- so a newly observed tree, and every list crossing a block
+    // boundary, legitimately misses for a short window. A latching mark would turn that
+    // routine window into a permanent 503; a mark the next delivery clears does not.
+    let (code, status) = if divergent.is_empty()
+        && replay_skipped.is_empty()
+        && stalled.is_empty()
+        && unrouted_targets.is_empty()
     {
         (StatusCode::OK, "ready")
     } else {
@@ -461,6 +480,7 @@ pub(crate) async fn health_ready_handler<S: PirScheme>(
         layer2_divergent_instances: divergent,
         wal_replay_skipped_instances: replay_skipped,
         stalled_consumer_instances: stalled,
+        router_unrouted_targets: unrouted_targets,
     };
     (code, Json(body))
 }
@@ -594,6 +614,31 @@ mod tests {
             "clearing the divergence must restore readiness"
         );
         assert!(body.layer2_divergent_instances.is_empty());
+
+        // A target no route accepts must take the endpoint out of rotation, and a
+        // delivery must put it back: the mark is self-healing, which is what makes
+        // gating on it safe across a block rollover.
+        let target = "list:health-gate-router-drop";
+        raven_railgun_engine::orchestrator::clear_router_unrouted_target(target);
+        raven_railgun_engine::orchestrator::mark_router_unrouted_target(target);
+        let (code, body) = ready_probe(state_with_one_instance(ID)).await;
+        assert_eq!(
+            code,
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "a target that is not currently receiving events must fail readiness closed"
+        );
+        assert_eq!(body.status, "not_ready");
+        assert_eq!(body.router_unrouted_targets, vec![target.to_owned()]);
+
+        raven_railgun_engine::orchestrator::clear_router_unrouted_target(target);
+        let (code, body) = ready_probe(state_with_one_instance(ID)).await;
+        assert_eq!(
+            code,
+            http::StatusCode::OK,
+            "a delivery clears the mark, so readiness returns without a restart -- the \
+             property that makes this gate safe on the ordinary block rollover"
+        );
+        assert!(body.router_unrouted_targets.is_empty());
 
         mark_wal_replay_skipped(ID);
         let (code, body) = ready_probe(state_with_one_instance(ID)).await;

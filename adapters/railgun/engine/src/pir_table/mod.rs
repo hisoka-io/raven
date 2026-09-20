@@ -1061,7 +1061,7 @@ mod tests {
         changed
     }
 
-    /// W3-01's path-10 encoder returned a hardcoded singleton instead of walking the path,
+    /// The path-10 encoder returned a hardcoded singleton instead of walking the path,
     /// so the property below -- proved on the SHARED helper -- guarded nothing the encoder
     /// actually ran. This pins the encoder itself against the same independent
     /// materialization oracle, at shard widths either side of one 2^PATH10_LEVELS subtree.

@@ -14,6 +14,7 @@ import type { ClientPirContext, RavenInspireWasm } from "../src/index";
 
 import * as wasmPkg from "raven-inspire-client-wasm";
 import { encodeBatchResponseNodes, encodedBatchCount } from "./helpers/auth_path_stub";
+import { EXPECTED_WIRE_SCHEMA_PREFIX } from "./helpers/wire_schema";
 import {
   assertNoCommitmentsInPirRequests,
   injectCommitment,
@@ -202,7 +203,13 @@ describe("RavenPOINodeInterface privacy invariant", () => {
     expect(wireRequests.some((request) => request.url.endsWith("/session"))).toBe(false);
     const registration = mock.receivedBodies.find((request) => request.url.endsWith("/session"));
     expect(registration!.body.length).toBeGreaterThan(1024);
-    expect(registration!.body.subarray(0, 2)).toEqual(new Uint8Array([0, 6]));
+    // The WASM stamps this prefix, so this compares against the linked Rust binary rather
+    // than against a TS literal -- as does the body-length assertion above it. It read
+    // `[0, 6]` and passed only because the wasm was itself a stale v6 build; see
+    // `wasm_schema_parity.test.ts`.
+    expect(registration!.body.subarray(0, 2)).toEqual(
+      new Uint8Array(EXPECTED_WIRE_SCHEMA_PREFIX),
+    );
 
     // Server-side cross-check guards against the SDK capturing the wrong body.
     expect(

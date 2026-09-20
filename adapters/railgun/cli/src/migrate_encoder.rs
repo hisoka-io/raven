@@ -196,10 +196,10 @@ pub fn run_with_checkpoint(
     checkpoint(MigrationCheckpoint::PostReEncode);
 
     checkpoint(MigrationCheckpoint::PreSnapshot);
-    // Keeps the V6 body consistent with the manifest stamped below; without it opens
+    // Keeps the snapshot body consistent with the manifest stamped below; without it opens
     // recover an empty store and chain events land against nothing.
     let bundle = raven_railgun_engine::inspire::snapshot_inspire_state_v7(&state, &logical_store)
-        .map_err(|e| anyhow::anyhow!("snapshot_inspire_state_v6: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("snapshot_inspire_state_v7: {e}"))?;
     let new_snap = Snapshot::build(bundle, SNAPSHOT_MAGIC);
     let new_id = manifest.current_snapshot_id.next();
     new_snap

@@ -170,12 +170,121 @@ pub struct LogicalLeafStore {
     ppoi_imts: std::collections::HashMap<[u8; 32], crate::imt::Imt>,
     ppoi_bc_index: std::collections::BTreeMap<([u8; 32], [u8; 32]), u32>,
     ppoi_index_bc: std::collections::BTreeMap<([u8; 32], u32), [u8; 32]>,
+    // Inert under bincode, which is positional and carries no field names: inserting this
+    // field mid-struct shifted every field after it. `LogicalLeafStoreV6` is what reads the
+    // bytes written before it existed.
     #[serde(default)]
     ppoi_event_metadata: std::collections::BTreeMap<
         ([u8; 32], u32),
         raven_railgun_persistence::PpoiEventMetadata,
     >,
     ppoi_list_leaf_block_height: std::collections::BTreeMap<([u8; 32], u32), u64>,
+}
+
+/// The `LogicalLeafStore` shape every V6 snapshot on disk was written with, frozen.
+///
+/// Pinning the V6 read path to the *live* struct is what made a field insertion a data-loss
+/// event: bincode is positional, so `ppoi_event_metadata` landing mid-struct reinterpreted
+/// `ppoi_list_leaf_block_height`'s bytes as its own.
+///
+/// This is the shape rather than a guess: field names and types are unchanged at every commit
+/// from the one that introduced `SNAPSHOT_V6_MAGIC` to the one before it broke. (The text is
+/// not identical — one commit respelled `super::imt::Imt` as `crate::imt::Imt` — but the wire
+/// is.) `TREE_DEPTH` is 16 throughout too, which matters because `ZeroValues.levels` is
+/// `[[u8; 32]; TREE_DEPTH + 1]`: a change there would move the wire with no struct text
+/// changing at all. `tests/fixtures/logical_store_v6.bin` pins the result to bytes.
+///
+/// **Do not edit this struct** — a V6 snapshot's shape is history, and a new field belongs in
+/// `LogicalLeafStore` behind a new magic. Note the banner is not sufficient by itself: the
+/// shape is transitively `Imt`'s and `ZeroValues`', so editing either moves V6's wire without
+/// touching anything here. The fixture, not the banner, is what actually catches that.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LogicalLeafStoreV6 {
+    leaves: std::collections::BTreeMap<(u32, u32), [u8; 32]>,
+    ppoi_status: std::collections::BTreeMap<([u8; 32], [u8; 32]), u8>,
+    dirty_shards: std::collections::BTreeSet<u32>,
+    last_block_height: u64,
+    leaf_block_height: std::collections::BTreeMap<(u32, u32), u64>,
+    ppoi_block_height: std::collections::BTreeMap<([u8; 32], [u8; 32]), u64>,
+    imts: std::collections::HashMap<u32, crate::imt::Imt>,
+    ppoi_imts: std::collections::HashMap<[u8; 32], crate::imt::Imt>,
+    ppoi_bc_index: std::collections::BTreeMap<([u8; 32], [u8; 32]), u32>,
+    ppoi_index_bc: std::collections::BTreeMap<([u8; 32], u32), [u8; 32]>,
+    ppoi_list_leaf_block_height: std::collections::BTreeMap<([u8; 32], u32), u64>,
+}
+
+impl LogicalLeafStoreV6 {
+    /// Lossless *about the snapshot*: the retained-metadata field postdates every byte V6 ever
+    /// wrote, so its absence is a fact rather than data dropped on the floor, and any other fill
+    /// would be fabrication.
+    ///
+    /// It is NOT lossless about the store the engine then serves from. Every leaf the snapshot
+    /// covered comes back without metadata, and only leaves replayed from the WAL afterwards get
+    /// any — which is why `restore_inspire_state_v6` logs on this arm rather than healing
+    /// silently.
+    pub(crate) fn into_current(self) -> LogicalLeafStore {
+        // Say it happened. A V6 reopen returns every per-list leaf without its retained
+        // metadata, and the path encoder skips a row whose metadata is absent -- degraded
+        // served content with, until this line, nothing at all in the log.
+        if !self.ppoi_index_bc.is_empty() {
+            tracing::warn!(
+                target = "raven::engine::snapshot",
+                list_leaves = self.ppoi_index_bc.len(),
+                "V6 snapshot: retained PPOI event metadata is absent by construction; \
+                 path-projection rows for leaves covered by this snapshot stay unfilled until \
+                 they are re-ingested"
+            );
+        }
+        LogicalLeafStore {
+            leaves: self.leaves,
+            ppoi_status: self.ppoi_status,
+            dirty_shards: self.dirty_shards,
+            last_block_height: self.last_block_height,
+            leaf_block_height: self.leaf_block_height,
+            ppoi_block_height: self.ppoi_block_height,
+            imts: self.imts,
+            ppoi_imts: self.ppoi_imts,
+            ppoi_bc_index: self.ppoi_bc_index,
+            ppoi_index_bc: self.ppoi_index_bc,
+            ppoi_event_metadata: std::collections::BTreeMap::new(),
+            ppoi_list_leaf_block_height: self.ppoi_list_leaf_block_height,
+        }
+    }
+
+    /// Refuses rather than writing a V6 snapshot that silently drops retained metadata --
+    /// V6 has no field to put it in.
+    pub(crate) fn try_from_current(store: &LogicalLeafStore) -> Result<Self> {
+        if !store.ppoi_event_metadata.is_empty() {
+            return Err(AdapterError::Serialization(format!(
+                "refusing to write a V6 snapshot: the store carries {} retained PPOI event \
+                 metadata entries and the V6 layout has no field for them. Write V7.",
+                store.ppoi_event_metadata.len()
+            )));
+        }
+        Ok(Self {
+            leaves: store.leaves.clone(),
+            ppoi_status: store.ppoi_status.clone(),
+            dirty_shards: store.dirty_shards.clone(),
+            last_block_height: store.last_block_height,
+            leaf_block_height: store.leaf_block_height.clone(),
+            ppoi_block_height: store.ppoi_block_height.clone(),
+            imts: store.imts.clone(),
+            ppoi_imts: store.ppoi_imts.clone(),
+            ppoi_bc_index: store.ppoi_bc_index.clone(),
+            ppoi_index_bc: store.ppoi_index_bc.clone(),
+            ppoi_list_leaf_block_height: store.ppoi_list_leaf_block_height.clone(),
+        })
+    }
+
+    /// Mints the shape a pre-`ppoi_event_metadata` build would have written for `store`.
+    /// Fixture generation only: dropping the field is exactly what those builds did, because
+    /// the field did not exist when they wrote.
+    #[cfg(test)]
+    pub(crate) fn from_current_dropping_metadata(store: &LogicalLeafStore) -> Self {
+        let mut bare = store.clone();
+        bare.ppoi_event_metadata.clear();
+        Self::try_from_current(&bare).expect("metadata cleared on the line above")
+    }
 }
 
 impl LogicalLeafStore {
@@ -459,6 +568,13 @@ impl LogicalLeafStore {
     pub fn ppoi_status_at(&self, list_key: &[u8; 32], list_index: u32) -> Option<u8> {
         let bc = self.ppoi_bc_at(list_key, list_index)?;
         self.ppoi_status(list_key, &bc)
+    }
+
+    /// Entry count of the map that a mid-struct field insertion steals the bytes of; the
+    /// frozen-V6 tests assert on it directly rather than inferring it from a clean decode.
+    #[cfg(test)]
+    pub(crate) fn ppoi_list_leaf_block_height_len(&self) -> usize {
+        self.ppoi_list_leaf_block_height.len()
     }
 
     /// Iterator over per-list leaves in ascending `list_index` order.

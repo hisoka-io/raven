@@ -28,7 +28,7 @@ const BC_HEX = "11".repeat(32);
 const LEAF = 1234;
 const TREE_NUMBER = 0;
 
-// W3-01/W3-03 replaced sixteen 32 B node reads with one 512 B path-10 row plus a 160 B
+// The path-10 record replaced sixteen 32 B node reads with one 512 B row plus a 160 B
 // upper-sibling addendum, and the pinned root became mandatory (D-06). The served sibling
 // set is now fixture data rather than a literal, so the root is derived from it here --
 // a hardcoded root would only restate whatever the helper happens to emit.

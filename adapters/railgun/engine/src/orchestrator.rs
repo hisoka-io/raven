@@ -147,7 +147,8 @@ pub struct OrchestratorConfig {
     pub entries_per_shard: u32,
     /// Max concurrent in-flight respond ops. `None` resolves via [`default_k_for`].
     pub max_concurrent_queries: Option<usize>,
-    /// On-disk-state authority: chain rootHistory or upstream signature.
+    /// On-disk-state authority: chain rootHistory, or the upstream feed with its
+    /// signature retained-but-unverified (see `VerificationMode::UpstreamSignature`).
     pub verification_mode: VerificationMode,
     /// Run the Layer 2 verifier every Nth commit. `0` disables.
     pub verification_cadence_n: u32,
@@ -337,7 +338,24 @@ pub fn bootstrap_railgun_engine(
 pub enum VerificationMode {
     /// Cross-check IMT root against `RailgunSmartWallet.rootHistory`.
     ChainRootHistory,
-    /// Trust the upstream `signedPOIEvent` signature.
+    /// Accept the upstream feed as the authority: no chain cross-check is possible
+    /// because list roots are not chain-anchored.
+    ///
+    /// **This does NOT verify the `signedPOIEvent` signature.** The signature is
+    /// retained on the event (`PpoiListLeafAdded::signature`) and never checked —
+    /// `engine/` contains no ed25519 verifier. The name predates that and asserts a
+    /// check no code performs; correcting the name is a public-API change, so it is
+    /// escalated rather than done here: renaming it is a public-API change and a
+    /// config-token migration across every deployed instance.
+    ///
+    /// **Nothing in this crate checks anything about the upstream feed.** A
+    /// `validatedMerkleroot` byte-identity oracle does exist, but it is elsewhere and
+    /// narrower than it sounds: it lives in `raven-railgun-cli`'s Subsquid bootstrap, it
+    /// is skipped entirely in `SkipOnUnreachable` mode (whose own log line says so), and
+    /// **no runtime append compares anything** — the live mirror path stores the leaf and
+    /// the root side by side without relating them. An earlier version of this comment
+    /// said the root "IS checked on every bootstrap append"; that over-claimed on all
+    /// three counts and was corrected.
     UpstreamSignature,
 }
 
@@ -735,8 +753,127 @@ where
     })
 }
 
+fn hex_lower_32(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 fn count_router_drop(reason: &'static str) {
     metrics::counter!(ROUTER_DROPPED, "reason" => reason).increment(1);
+}
+
+/// Leaves per PPOI block, the width `DataSourceFilter::PpoiListBlock` partitions on.
+pub const LEAVES_PER_PPOI_BLOCK: u32 = 65_536;
+
+/// Routing targets that are **currently** not receiving events.
+///
+/// Self-healing: a delivery clears the target, a miss or a dead consumer marks it. That
+/// is the same two-way choice `ConsumerMetrics` documents for `consecutive_event_errors`
+/// ("any applied event clears it") as against `unapplied_leaves` ("a contiguity gap
+/// outlives unrelated successes"). This registry is the first kind. Built as the second,
+/// it latched forever on the ordinary block rollover, because a fully provisioned list
+/// crossing a block boundary matches no route for exactly one event before the next
+/// block's instance takes over.
+///
+/// **Deliberately not disk-backed, unlike `LAYER2_DIVERGENT`.** The mark asserts a live
+/// property — "no route accepts this target right now" — which the next event for that
+/// target re-establishes or clears on its own. A restart therefore does not need to carry
+/// it. Note what this does NOT claim: events already dropped stay dropped, because the
+/// mirror cursor advanced past them. Durable accounting for that loss is a different
+/// problem and this registry is not it.
+static ROUTER_UNROUTED_TARGETS: parking_lot::Mutex<std::collections::BTreeSet<String>> =
+    parking_lot::Mutex::new(std::collections::BTreeSet::new());
+
+/// Routing targets not currently receiving events, sorted. Readiness probes MUST fail
+/// closed while this is non-empty: every entry means some instance is missing events it
+/// should be getting, right now.
+///
+/// Granularity is the point. `list:<hex>:block:<n>` is one unprovisioned block of a list
+/// that is otherwise served; `list:<hex>` is a list no route mentions at all, which is
+/// the shape of the tree-4 outage. An operator alert can tell them apart.
+///
+/// ```
+/// # use raven_railgun_engine::orchestrator::router_unrouted_targets;
+/// assert!(
+///     router_unrouted_targets().is_empty(),
+///     "no routing has run in this process, so nothing can be unrouted"
+/// );
+/// ```
+#[must_use]
+pub fn router_unrouted_targets() -> Vec<String> {
+    ROUTER_UNROUTED_TARGETS.lock().iter().cloned().collect()
+}
+
+/// Mark a target as not currently receiving events.
+pub fn mark_router_unrouted_target(target: &str) {
+    ROUTER_UNROUTED_TARGETS.lock().insert(target.to_owned());
+}
+
+/// Clear a target: an event reached every route bound to it.
+pub fn clear_router_unrouted_target(target: &str) {
+    ROUTER_UNROUTED_TARGETS.lock().remove(target);
+}
+
+/// Clear `target`, and -- when it is block-granular -- the list-level key it sits under.
+///
+/// The two are not alternatives, they are the SAME target named at two moments. A list key is
+/// first seen BEFORE its route exists, because routing is asynchronous by design (see the
+/// `list_observed` send below), and that moment marks the coarse `list:<hex>`. Every delivery
+/// after the route lands names the fine `list:<hex>:block:<n>`. Clearing only the fine key
+/// leaves the coarse one set for the life of the process, and readiness fails closed on it --
+/// a permanent 503 on a node that recovered in milliseconds -- the same latching readiness
+/// failure this registry was rebuilt to avoid, reintroduced by the block granularity itself.
+fn clear_delivered_target(target: &str) {
+    clear_router_unrouted_target(target);
+    if let Some((list_scope, _)) = target.split_once(":block:") {
+        clear_router_unrouted_target(list_scope);
+    }
+}
+
+/// A route miss: count it and mark the target unrouted.
+fn record_no_route(target: String) {
+    count_router_drop("no_route");
+    ROUTER_UNROUTED_TARGETS.lock().insert(target);
+}
+
+/// A consumer whose channel is gone. The route exists, so this is not `no_route` — but
+/// the target is not receiving either, which is the half the counter description calls
+/// out and nothing surfaced.
+fn record_consumer_closed(target: String) {
+    count_router_drop("consumer_channel_closed");
+    ROUTER_UNROUTED_TARGETS.lock().insert(target);
+}
+
+/// The list key a routing filter is bound to, if any.
+fn filter_list_key(filter: &DataSourceFilter) -> Option<[u8; 32]> {
+    match filter {
+        DataSourceFilter::PpoiList(key) => Some(*key),
+        DataSourceFilter::PpoiListBlock { list_key, .. } => Some(*list_key),
+        DataSourceFilter::ChainTreeNumber(_) => None,
+    }
+}
+
+/// Name the target a mirror payload belongs to, at the granularity that distinguishes an
+/// unprovisioned block from a wholly unserved list.
+fn ppoi_target_name(
+    payload: &WalEntryPayload,
+    lk: &[u8; 32],
+    routes: &[(DataSourceFilter, mpsc::Sender<ConsumerEvent>)],
+) -> String {
+    let hex = hex_lower_32(lk);
+    let list_is_routed = routes
+        .iter()
+        .any(|(filter, _)| filter_list_key(filter).is_some_and(|k| k == *lk));
+    match payload {
+        WalEntryPayload::PpoiListLeafAdded { list_index, .. } if list_is_routed => {
+            format!("list:{hex}:block:{}", list_index / LEAVES_PER_PPOI_BLOCK)
+        }
+        _ => format!("list:{hex}"),
+    }
 }
 
 /// Router drops are silent by construction: an event for a tree no instance routes,
@@ -833,14 +970,17 @@ async fn forward_indexer_message(
                     .map(|(_, s)| s.clone())
                     .collect();
                 // Last recipient takes ownership, so the common single-route case never clones.
+                let target = format!("tree:{t}");
                 if let Some((last, rest)) = matched.split_last() {
+                    let mut delivered_to_all = true;
                     for tx in rest {
                         if tx
                             .send(ConsumerEvent::Chain(event.clone(), block_height))
                             .await
                             .is_err()
                         {
-                            count_router_drop("consumer_channel_closed");
+                            record_consumer_closed(target.clone());
+                            delivered_to_all = false;
                             tracing::warn!(
                                 tree_number = t,
                                 block_height,
@@ -853,15 +993,20 @@ async fn forward_indexer_message(
                         .await
                         .is_err()
                     {
-                        count_router_drop("consumer_channel_closed");
+                        record_consumer_closed(target.clone());
+                        delivered_to_all = false;
                         tracing::warn!(
                             tree_number = t,
                             block_height,
                             "consumer channel closed; chain event dropped"
                         );
                     }
+                    // Self-healing: reaching every bound route is what clears the mark.
+                    if delivered_to_all {
+                        clear_delivered_target(&target);
+                    }
                 } else {
-                    count_router_drop("no_route");
+                    record_no_route(target);
                     tracing::warn!(
                         tree_number = t,
                         block_height,
@@ -1000,22 +1145,25 @@ async fn forward_mirror_payload(
             matched.push((sender.clone(), routed));
         }
     }
+    let target = ppoi_target_name(&payload, &lk, &routes);
     let Some((last, rest)) = matched.split_last() else {
-        count_router_drop("no_route");
+        record_no_route(target);
         tracing::warn!(
             height,
-            "no instance routes list_key; mirror payload dropped and that list now \
+            "no instance routes this payload; mirror payload dropped and that target now \
              trails the mirror"
         );
         return;
     };
+    let mut delivered_to_all = true;
     for (tx, routed) in rest {
         if tx
             .send(ConsumerEvent::Ppoi(routed.clone(), height))
             .await
             .is_err()
         {
-            count_router_drop("consumer_channel_closed");
+            record_consumer_closed(target.clone());
+            delivered_to_all = false;
             tracing::warn!(height, "consumer channel closed; mirror payload dropped");
         }
     }
@@ -1025,8 +1173,13 @@ async fn forward_mirror_payload(
         .await
         .is_err()
     {
-        count_router_drop("consumer_channel_closed");
+        record_consumer_closed(target.clone());
+        delivered_to_all = false;
         tracing::warn!(height, "consumer channel closed; mirror payload dropped");
+    }
+    // Self-healing: reaching every bound route is what clears the mark.
+    if delivered_to_all {
+        clear_delivered_target(&target);
     }
 }
 
@@ -1114,5 +1267,62 @@ mod forest_routing_tests {
             [7; 32],
         )
         .is_none()));
+    }
+
+    /// A distinctive key, because the registry is process-global and unit tests share it.
+    const LATCH_LK: &str = "beeff00d00000000000000000000000000000000000000000000000000000000";
+
+    // THE LATCH. `ppoi_target_name` names the SAME list two ways depending on whether a route
+    // exists yet: coarse before, block-granular after. Routing is asynchronous, so the first
+    // event for a new list key always marks the coarse name and every later one clears the
+    // fine name. Clearing only the fine name pinned readiness at 503 for the life of the
+    // process -- on a node that had already recovered.
+    #[test]
+    fn a_delivery_clears_the_coarse_list_mark_left_by_the_pre_route_miss() {
+        let coarse = format!("list:{LATCH_LK}");
+        let fine = format!("list:{LATCH_LK}:block:2");
+
+        // Exactly what the router does on the first event, before the route is installed.
+        mark_router_unrouted_target(&coarse);
+        assert!(router_unrouted_targets().contains(&coarse));
+
+        // ...and exactly what it does once the route lands and an event gets through.
+        clear_delivered_target(&fine);
+
+        let targets = router_unrouted_targets();
+        assert!(
+            !targets.contains(&coarse),
+            "the pre-route mark must heal when the list starts receiving events again; \
+             leaving it set is a permanent 503 on a healthy node. got {targets:?}"
+        );
+        assert!(!targets.contains(&fine), "got {targets:?}");
+    }
+
+    // ...without becoming a blunt instrument: a delivery to one block says nothing about a
+    // sibling block that genuinely has no instance, which is the distinction the granularity
+    // exists for.
+    #[test]
+    fn a_delivery_to_one_block_does_not_clear_a_sibling_block() {
+        let served = format!("list:{LATCH_LK}:block:4");
+        let unprovisioned = format!("list:{LATCH_LK}:block:5");
+
+        mark_router_unrouted_target(&unprovisioned);
+        clear_delivered_target(&served);
+
+        let targets = router_unrouted_targets();
+        assert!(
+            targets.contains(&unprovisioned),
+            "block 5 has no instance and must stay surfaced; got {targets:?}"
+        );
+        clear_router_unrouted_target(&unprovisioned);
+    }
+
+    // A chain target carries no `:block:` segment, so the coarse-clear must not fire on a
+    // prefix that merely looks similar.
+    #[test]
+    fn a_tree_target_clears_only_itself() {
+        mark_router_unrouted_target("tree:4242");
+        clear_delivered_target("tree:4242");
+        assert!(!router_unrouted_targets().contains(&"tree:4242".to_owned()));
     }
 }

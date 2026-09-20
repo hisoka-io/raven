@@ -152,11 +152,11 @@ describe("IMT cache freshness is scoped to one instance", () => {
     sdk.resetWireCapture();
     serveRowFor(BC_AT_NEAR_LEAF);
     await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_AT_NEAR_LEAF]);
-    // ONE slot, not four. W3-01/W3-03 put all 16 siblings in one row plus its addendum,
+    // ONE slot, not four. The path-10 record puts all 16 siblings in one row plus its addendum,
     // so the list read no longer consults the IMT cache at all -- `fetchAuthPathNodes`
     // has a single caller and it is the commit-tree path. The property this test was
     // written for (a tree query must not evict the LIST's cached nodes) is no longer
-    // expressible, because the list caches nothing. See OQ-017.
+    // expressible, because the list caches nothing.
     expect(slotsOf(sdk)).toEqual([1]);
   });
 
@@ -173,7 +173,7 @@ describe("IMT cache freshness is scoped to one instance", () => {
     await sdk.getMerkleProof(TREE_NUMBER, NEAR_LEAF);
     serveRowFor(BC_AT_NEAR_LEAF);
     await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_AT_NEAR_LEAF]);
-    // Tree stays warm at 4; the list read is a flat 1 whether warm or cold (OQ-017).
+    // Tree stays warm at 4; the list read is a flat 1 whether warm or cold.
     expect(slotsOf(sdk)).toEqual([4, 1]);
   });
 });

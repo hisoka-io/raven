@@ -321,7 +321,7 @@ describe("client-PIR auth-path reconstruction (T2/T3)", () => {
   });
 
   it("getPOIMerkleProofs reads one path-10 row and still yields 16 elements", async () => {
-    // W3-01/W3-03: one 512 B row (levels 0..10) plus a 160 B addendum (levels 11..15)
+    // The path-10 record: one 512 B row (levels 0..10) plus a 160 B addendum (levels 11..15)
     // replaced sixteen 32 B node reads. The proof the wallet sees is unchanged at 16.
     const nodes = path10Siblings(0xab);
     mountPath10Route(server, {

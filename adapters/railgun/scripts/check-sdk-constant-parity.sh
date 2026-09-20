@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cross-language parity gate for eight wire-relevant contracts declared independently
+# Cross-language parity gate for the wire-relevant contracts declared independently
 # in Rust and TypeScript:
 #
 #   1. BATCH_SIZE_LADDER   sdk/src/batch-ladder.ts        vs adapter policy
@@ -12,6 +12,10 @@
 #   7. batch response      sdk/src/raven-poi-node-interface.ts (decodeBatchBody)
 #                          vs http/src/versioned.rs (write_batch_response_versioned)
 #   8. consumer status     sdk/src/events-stream.ts          vs http/src/status.rs
+#
+# The eight entries above are contract FAMILIES, not checks: several expand into more than
+# one comparison, so the summary line reports a count this script computes (19 today) rather
+# than the 8 listed here. They are different numbers on purpose.
 #
 # A Rust-side change leaves the TS suite green while every batch the SDK sends is
 # refused at runtime; a TREE_DEPTH drift silently changes proof length and index
@@ -40,7 +44,9 @@ extract() {
   printf '%s' "$val"
 }
 
+checked_count=0
 compare() { # label ts_val rust_val
+  checked_count=$((checked_count + 1))
   # extract's exit 3 only leaves the $() subshell, so an empty value can reach here —
   # and two empties would compare equal. Empty NEVER passes.
   if [[ -z "$2" || -z "$3" ]]; then
@@ -92,6 +98,7 @@ if /usr/bin/grep -q '^pub enum LadderViolation' "$ADAPTER_BATCH"; then
   echo "  FAIL  adapter ladder: local LadderViolation copy remains" >&2
   failed=1
 else
+  checked_count=$((checked_count + 1))
   echo "  ok    adapter ladder: no local LadderViolation copy"
 fi
 
@@ -118,6 +125,13 @@ compare "schema envelope version" "$ts_env" "$rs_env"
 rs_client_env="$(extract "Rust client session schema version" "${ADAPTER_ROOT}/../../crates/client/src/lib.rs" \
   's/^const SESSION_WIRE_SCHEMA_VERSION: u16 = \([0-9]*\);$/\1/p')"
 compare "client session schema version" "$rs_client_env" "$rs_env"
+# The TEST-SIDE pin. Without this the suite's literal and production's literal are two
+# independent numbers that merely happen to agree. That is how the wasm went stale at 6
+# while the suite pinned 7 and the whole suite stayed green.
+# `wasm_schema_parity.test.ts` closes the binary-vs-TS half; this closes the pin-vs-Rust half.
+ts_test_pin="$(extract "TS test-side schema pin" "${ADAPTER_ROOT}/sdk/tests/helpers/wire_schema.ts" \
+  's/^export const EXPECTED_WIRE_SCHEMA_VERSION = \([0-9]*\);$/\1/p')"
+compare "test-side schema pin" "$ts_test_pin" "$rs_env"
 ts_reader="$(extract "TS envelope reader delegation" "${ADAPTER_ROOT}/sdk/src/raven-poi-node-interface.ts" \
   's/^ *if (envelope !== \(WIRE_SCHEMA_VERSION\)) {$/\1/p')"
 compare "TS envelope reader uses shared version" "$ts_reader" "WIRE_SCHEMA_VERSION"
@@ -229,4 +243,4 @@ if [[ "$failed" -ne 0 ]]; then
   echo "check-sdk-constant-parity.sh: FAILED - a Rust/TS constant pair has drifted." >&2
   exit 1
 fi
-echo "check-sdk-constant-parity.sh: all eight Rust/TS wire contracts agree."
+echo "check-sdk-constant-parity.sh: all ${checked_count} Rust/TS wire contracts agree."

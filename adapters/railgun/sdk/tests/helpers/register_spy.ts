@@ -9,6 +9,7 @@
  */
 
 import type { RavenInspireClientSession, RavenInspireWasm } from "../../src/index";
+import { EXPECTED_WIRE_SCHEMA_PREFIX } from "./wire_schema";
 
 export interface RegisterCall {
   session: RavenInspireClientSession;
@@ -42,7 +43,10 @@ export function stubRemoteSessionExports(): Pick<
   | "retarget_seeded_query_shard"
 > {
   return {
-    client_packing_keys_versioned: () => new Uint8Array([0, 6]),
+    // Routed through the shared pin, not a literal: this stub reaches 11 test files plus
+    // a shared helper, so a stale version here is one literal lying to all of them. It
+    // read [0, 6] while production was 7.
+    client_packing_keys_versioned: () => new Uint8Array(EXPECTED_WIRE_SCHEMA_PREFIX),
     install_server_session_handle: () => undefined,
     retarget_seeded_query_shard: (query, nominalShardId) => {
       if (query.length < 4) throw new Error("stub seeded query is shorter than shard_id");

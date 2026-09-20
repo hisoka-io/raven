@@ -341,7 +341,7 @@ describe("private response freshness fallback", () => {
     expect(adapter.requests).toHaveLength(2);
     expect(
       assertNoCommitmentsInPirRequests(adapter.requests, [BC_HEX], {
-        // One 512 B path-10 row replaced sixteen 32 B node reads (W3-01/W3-03).
+        // One 512 B path-10 row replaced sixteen 32 B node reads.
         expectedQueryCount: 1,
         expectedQueryBytes: STUB_QUERY_BYTES,
       }),

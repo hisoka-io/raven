@@ -55,3 +55,16 @@ crates/inspire/benches/shoup_microbench.rs::microbench_shoup_vs_montgomery_forwa
 crates/inspire/benches/shoup_microbench.rs::microbench_shoup_vs_montgomery_inverse
 crates/inspire/benches/solinas_microbench.rs::microbench_solinas_forward_inverse_ntt
 crates/inspire/benches/solinas_microbench.rs::microbench_solinas_pointwise_all_variants
+
+# Added 2026-09-19. Each of these is uncovered BY DESIGN, not by neglect:
+#  - the frozen-block sync reads LIVE production over the network; a per-push lane would put
+#    CI traffic on the deployed node. A workflow_dispatch lane is the better home for it and
+#    is an owner call, not a builder one.
+#  - the two fixture generators WRITE the fixture bytes they pin. Running either in a lane
+#    would overwrite the evidence the V6/V7 layout tests exist to check.
+adapters/railgun/cli/tests/ppoi_real_frozen_block.rs::first_real_frozen_block_sync_retains_metadata_and_matches_every_root
+adapters/railgun/engine/src/inspire.rs::mint_frozen_v6_store_fixture
+adapters/railgun/engine/src/inspire.rs::mint_frozen_v7_store_fixture
+#  - the reopen probe needs an operator's real data_dir on an operator's filesystem. Its two
+#    self-verification tests DO run in every lane; only the env-var arm is ignored.
+adapters/railgun/engine/tests/data_dir_reopen_probe.rs::the_data_dir_named_by_the_environment_reopens_under_this_binary

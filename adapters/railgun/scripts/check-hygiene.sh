@@ -36,12 +36,34 @@ mapfile -t SOURCE_DIRS < <(
 )
 # `client-wasm` declares its own workspace, so it is not a member and must be added by name.
 SOURCE_DIRS+=("${ROOT}/client-wasm")
+# Non-Cargo source roots. Deriving the scope from workspace members alone left the ENTIRE
+# TypeScript SDK, the adapter's own scripts and the CI workflow unscanned -- and that is
+# where the labels actually leaked. A gate whose scope is derived from one language cannot
+# see a repo written in three.
+SOURCE_DIRS+=("${ROOT}/sdk/src" "${ROOT}/sdk/tests" "${ROOT}/scripts")
+REPO_ROOT="$(cd "${ROOT}/../.." && pwd)"
+if [[ -d "${REPO_ROOT}/.github/workflows" ]]; then
+  SOURCE_DIRS+=("${REPO_ROOT}/.github/workflows")
+fi
 
 if [[ ${#SOURCE_DIRS[@]} -lt 2 ]]; then
   echo "check-hygiene.sh: derived only ${#SOURCE_DIRS[@]} source dir(s) from the workspace members." >&2
   echo "  An empty or near-empty scope is a broken gate, not a clean tree." >&2
   exit 2
 fi
+
+# A Rust-only scan could not see the leak it exists to catch: the labels landed in
+# `.ts`, `.yml` and `.sh` as well. Build artefacts and vendored wasm glue are excluded by
+# scanning only source extensions rather than by path.
+SCAN_INCLUDES=(
+  --include='*.rs' --include='*.ts' --include='*.mjs'
+  --include='*.sh' --include='*.yml' --include='*.yaml' --include='*.toml'
+  --exclude-dir=node_modules --exclude-dir=target
+  --exclude-dir=pkg-node --exclude-dir=pkg-bundler
+  # The gate and its selftest necessarily CONTAIN every label they hunt for -- the
+  # patterns are literals in one and planted fixtures in the other.
+  --exclude=check-hygiene.sh --exclude=check-hygiene-selftest.sh
+)
 
 # Patterns are intentionally word-boundary-anchored to avoid catching
 # legitimate identifier substrings (e.g. "M19" inside an arbitrary
@@ -58,6 +80,17 @@ PATTERNS=(
   # Hyphenated builder-ledger IDs. The unhyphenated `M0NN` rule above never matched these,
   # so every `O-NNN` / `B-NNN` / `G-NNN` label passed a scan that exists to catch exactly them.
   '\b[BDGLMO]-[0-9]{3}[a-z]?\b'
+  # Batch-corpus IDs. The class above covers the builder ledger's own letters and missed
+  # every label a BATCH uses, so a run could cite `OQ-021` or `A-002` in public source and
+  # pass a gate that exists to stop exactly that. `no-commit/` is gitignored, so these
+  # point an external reader at documents that do not exist.
+  '\bOQ-[0-9]{3}\b'
+  '\bA-[0-9]{3}\b'
+  '\bF-[0-9]{3}\b'
+  '\bW[0-9]{1,2}-[0-9]{2}[a-z]?\b'
+  # Bare record filenames. Seven files named FINDINGS.md exist in the corpus, so the
+  # citation is ambiguous even to someone holding the private tree.
+  '[^"](FINDINGS|AUDIT|DOUBTS|EVIDENCE|TASKLIST|DECISIONS|MISTAKES|OPEN-QUESTIONS)\.md\b'
   'no-commit/'
 )
 
@@ -74,9 +107,9 @@ found_any=0
 scan_dir() { # dir pattern extra-flags
   local dir="$1" pat="$2" extra="$3" out rc
   if [[ -n "$extra" ]]; then
-    out="$(grep -rEn "$extra" "$pat" "$dir" --include='*.rs')"
+    out="$(grep -rEn "$extra" "$pat" "$dir" "${SCAN_INCLUDES[@]}")"
   else
-    out="$(grep -rEn "$pat" "$dir" --include='*.rs')"
+    out="$(grep -rEn "$pat" "$dir" "${SCAN_INCLUDES[@]}")"
   fi
   rc=$?
   case "$rc" in

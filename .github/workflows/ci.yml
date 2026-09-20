@@ -41,6 +41,23 @@ jobs:
         run: |
           cargo check --manifest-path crates/inspire/Cargo.toml \
             --features mod-switch-response --all-targets
+      # `prefix-index-channel` is default-off and no job ever RAN it. It IS compiled --
+      # `msrv-1-91` checks and clippies `--workspace --all-features --all-targets` with
+      # raven-railgun-http in MSRV_PACKAGES -- but compiling a gated test is not running
+      # it, and the `railgun-tests` lanes pass no --features at all.
+      # Unlike mod-switch-response above this one is TESTED, not check-only,
+      # because a real test already exists for it and was simply never built:
+      # `http/tests/poi_shim_routes.rs` six_byte_prefix_channel_is_binary_and_index_ordered.
+      # Measured 2026-09-18: without the feature that filter selects 0 tests.
+      # Scoped to --lib and the owning test binary rather than --all-targets on purpose:
+      # `cargo test -p raven-railgun-http --all-targets` is independently FLAKY on
+      # metrics_surface, and importing an unrelated flake into a new lane would
+      # make this gate untrustworthy from its first run.
+      - name: cargo test (raven-railgun-http, prefix-index-channel)
+        run: |
+          cargo test --manifest-path adapters/railgun/Cargo.toml \
+            -p raven-railgun-http --features prefix-index-channel \
+            --lib --test poi_shim_routes
       - name: cargo test
         run: cargo test --workspace --all-targets
 

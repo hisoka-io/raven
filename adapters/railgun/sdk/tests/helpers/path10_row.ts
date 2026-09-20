@@ -1,7 +1,7 @@
 /**
  * The ONE test-side writer of the PPOI v2 path-10 served slot.
  *
- * W3-01/W3-03 changed the t2Path read from sixteen 32 B node queries to a single
+ * The path-10 record changed the t2Path read from sixteen 32 B node queries to a single
  * 512 B row carrying merkle levels 0..10, with levels 11..15 riding along as a 160 B
  * cleartext addendum that `runClientPirQueryBatch` splits off the tail. That change
  * reached production without reaching the test corpus, which is why sixteen assertions

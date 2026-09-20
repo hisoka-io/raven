@@ -2326,8 +2326,7 @@ fn spawn_mirror_workers(
     opts: &MultiServeOptions,
     handle: &MultiOrchestratorHandle,
 ) -> anyhow::Result<MirrorWorkers> {
-    use raven_railgun_engine::pir_table::EncoderKind;
-    use raven_railgun_ppoi_mirror::{MirrorConfig, MirrorCursor, MirrorKind, UpstreamPpoiMirror};
+    use raven_railgun_ppoi_mirror::{MirrorConfig, MirrorCursor, UpstreamPpoiMirror};
 
     let mirror_config = MirrorConfig {
         endpoint: opts.mirror_endpoint.clone(),
@@ -2344,13 +2343,9 @@ fn spawn_mirror_workers(
         if let DataSourceFilter::PpoiList(list_key) = inst.config.data_source {
             let mirror_clone = Arc::clone(&mirror);
             let tx = mirror_tx.clone();
-            // per-list-path owns the path sidecar; every other kind uses status.
-            let kind = match inst.config.encoder {
-                EncoderKind::PerListPath { .. } | EncoderKind::PerListPath10 { .. } => {
-                    MirrorKind::Path
-                }
-                _ => MirrorKind::Status,
-            };
+            // Shared derivation: this used to be a second copy of the match, and the two
+            // drifted -- the single-instance copy never learned `PerListPath10`.
+            let kind = crate::serve_production::mirror_kind_for_encoder(inst.config.encoder);
             let fallback = {
                 let store = inst.logical_store.lock();
                 #[allow(clippy::cast_possible_truncation)]

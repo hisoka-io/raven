@@ -17,7 +17,8 @@ use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, InstanceId, RailgunEvent};
 use raven_railgun_engine::inspire::InspireServerState;
 use raven_railgun_engine::orchestrator::{
-    bootstrap_railgun_engine_multi, DataSourceFilter, InstanceConfig, VerificationMode,
+    bootstrap_railgun_engine_multi, clear_router_unrouted_target, mark_router_unrouted_target,
+    router_unrouted_targets, DataSourceFilter, InstanceConfig, VerificationMode,
 };
 use raven_railgun_engine::persistence::{ConsumerEvent, SnapshotPolicy};
 use raven_railgun_engine::pir_table::EncoderKind;
@@ -127,6 +128,12 @@ async fn an_event_for_a_tree_no_instance_routes_increments_the_dropped_counter()
     // is already accounted for.
     let before = dropped_with_reason("no_route");
 
+    // Pre-mark the ROUTED tree so the delivery below has something to heal. Without
+    // this the clear path is never exercised by production code: the only other way in
+    // is `mark_router_unrouted_target`, whose sole caller would be a test.
+    clear_router_unrouted_target(&format!("tree:{UNROUTED_TREE}"));
+    mark_router_unrouted_target(&format!("tree:{ROUTED_TREE}"));
+
     // Control: a routed tree must NOT be counted, or the counter would just track
     // traffic rather than loss.
     handle
@@ -166,6 +173,30 @@ async fn an_event_for_a_tree_no_instance_routes_increments_the_dropped_counter()
         "exactly one drop must be counted: the tree-{UNROUTED_TREE} event has no route, \
          the tree-{ROUTED_TREE} event does. Got before={before} after={after}"
     );
+
+    // The counter says SOMETHING was dropped; these assert WHICH, which is what an
+    // operator alert matches on and what nothing exercised before. Both strings are
+    // produced by `record_no_route` and the clear inside the router, not by the test.
+    let mut targets = router_unrouted_targets();
+    for _ in 0..200 {
+        if targets.iter().any(|t| t == &format!("tree:{UNROUTED_TREE}")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        targets = router_unrouted_targets();
+    }
+    assert!(
+        targets.contains(&format!("tree:{UNROUTED_TREE}")),
+        "the unrouted tree must be named in the registry, not merely counted; got {targets:?}"
+    );
+    assert!(
+        !targets.contains(&format!("tree:{ROUTED_TREE}")),
+        "a real delivery must CLEAR the mark -- this is the self-healing property that \
+         makes readiness gating safe across a block rollover. It was pre-marked above and \
+         the tree-{ROUTED_TREE} event should have healed it; got {targets:?}"
+    );
+
+    clear_router_unrouted_target(&format!("tree:{UNROUTED_TREE}"));
 
     drop(handle.channels);
     for h in handle.instances.drain(..) {

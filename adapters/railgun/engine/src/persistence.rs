@@ -505,7 +505,12 @@ impl InspirePersistence {
         Ok(id)
     }
 
-    /// V6 commit: snapshot `(state, store)`, archive WAL, bump manifest atomically.
+    /// Snapshot `(state, store)`, archive WAL, bump manifest atomically.
+    ///
+    /// Writes **V7**; the name is kept because callers and tests reference it, and the snapshot
+    /// version is chosen by the writer it calls, not by this name. Two version ladders share the
+    /// numerals 5/6/7 here — the manifest's and the snapshot magic's — so a stale numeral in a
+    /// doc or an error string costs an operator more than it would elsewhere.
     pub fn commit_v6(
         &self,
         state: &InspireServerState,
@@ -840,7 +845,9 @@ const SWAP_RETRY_ATTEMPTS: u32 = 4;
 
 /// Layer 2 verifier wiring threaded into [`run_consumer_task`].
 pub struct Layer2VerifierContext {
-    /// Authority model. `UpstreamSignature` skips the verifier loop.
+    /// Authority model. `UpstreamSignature` skips the chain-rootHistory verifier loop,
+    /// and verifies no signature either — the name is historical (see
+    /// `VerificationMode::UpstreamSignature`).
     pub verification_mode: super::orchestrator::VerificationMode,
     /// Verify every Nth commit. `0` disables.
     pub cadence_n: u32,

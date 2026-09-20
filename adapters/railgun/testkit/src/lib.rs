@@ -211,7 +211,7 @@ mod tests {
     /// The shipped helper at `cli/src/toy_server.rs` spells the same formula with `as u8`
     /// instead of `u8::try_from(..).expect()`. Comparing those two spellings HERE would prove
     /// nothing: `(i + j) % 251` is always below 251, so the two cannot disagree on any input
-    /// the function can produce. `W1-07`'s own risk note says so. Testing the real divergence
+    /// the function can produce. Testing the real divergence
     /// would mean calling the shipped function, and `cli` cannot be a dependency of a crate
     /// that `cli` dev-depends on. So this compares against an independently-written loop and
     /// leaves the cross-crate agreement to the digest pin below.

@@ -84,6 +84,7 @@ crates/isimplepir/src/query.rs
 crates/server/src/lib.rs
 benches/b1-bench/src/bin/b1_inspire.rs
 adapters/railgun/http/src/lib.rs
+adapters/railgun/http/src/status.rs
 adapters/railgun/cli/tests/batch_dispatcher_byte_identity.rs
 crates/inspire/src/pir/eval_poly.rs
 crates/inspire/src/rgsw/external_product.rs

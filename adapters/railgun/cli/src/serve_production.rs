@@ -475,21 +475,81 @@ fn parse_hex32(s: &str) -> anyhow::Result<[u8; 32]> {
     Ok(out)
 }
 
-/// `per-list-path` owns the path sidecar; every other kind uses the status sidecar.
-fn mirror_kind_for_encoder(
+/// Path-projection encoders own the path sidecar; every other kind uses the status
+/// sidecar. The two feeds advance independently, so the wrong sidecar means the wrong
+/// resume cursor after a restart.
+///
+/// **One derivation, both call sites.** This lived inline in `serve_production_multi.rs`
+/// as well and the two drifted: the multi copy learned `PerListPath10` and this one did
+/// not. No deployment could reach that gap — `parse_encoder_kind` has no `per-list-path10`
+/// arm, so the single-instance path cannot construct one — but a second copy of a routing
+/// decision is the defect whether or not it is currently reachable.
+pub(crate) fn mirror_kind_for_encoder(
     encoder: raven_railgun_engine::pir_table::EncoderKind,
 ) -> raven_railgun_ppoi_mirror::MirrorKind {
     use raven_railgun_engine::pir_table::EncoderKind;
     use raven_railgun_ppoi_mirror::MirrorKind;
+    // EXHAUSTIVE on purpose. A `_` arm is what swallowed `PerListPath10` here while the
+    // multi path handled it, and it was still swallowing `PerListNode`. Adding a variant
+    // must now be a compile error that forces this decision, the way
+    // `EncoderKind::chain_tree_number` already does.
     match encoder {
-        EncoderKind::PerListPath { .. } => MirrorKind::Path,
-        _ => MirrorKind::Status,
+        // Driven by `PpoiListLeafAdded`: all three read the per-list IMT that arm writes.
+        EncoderKind::PerListPath { .. }
+        | EncoderKind::PerListPath10 { .. }
+        | EncoderKind::PerListNode { .. } => MirrorKind::Path,
+        // `PerListStatus` is driven by `PpoiStatus`. The three chain-tree encoders take no
+        // mirror feed at all and only reach here via a `PpoiList*` data source, which they
+        // cannot have; Status is the inert answer for them. Merged into one arm because
+        // clippy::match_same_arms rejects splitting on documentation alone -- the point of
+        // this match is that it is EXHAUSTIVE, not how the equal answers are grouped.
+        EncoderKind::PerListStatus { .. }
+        | EncoderKind::PerLeafBc { .. }
+        | EncoderKind::PerLeafPath { .. }
+        | EncoderKind::PerNode { .. } => MirrorKind::Status,
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use raven_railgun_engine::pir_table::EncoderKind;
+    use raven_railgun_ppoi_mirror::MirrorKind;
+
+    /// The status and path feeds own SEPARATE sidecars and advance independently, so an
+    /// encoder routed to the wrong one resumes from the wrong cursor after a restart.
+    /// `serve_production_multi.rs:2349` already matched both path encoders; this single
+    /// instance path matched only `PerListPath`, so `PerListPath10` fell through `_` to
+    /// `Status`. One derivation now serves both call sites.
+    #[test]
+    fn every_path_projection_encoder_owns_the_path_sidecar() {
+        let list_key = [7u8; 32];
+        for encoder in [
+            EncoderKind::PerListPath { list_key },
+            EncoderKind::PerListPath10 { list_key },
+            // The CLI's DEFAULT --ppoi-path-encoder, and it was routed to Status by the
+            // old `_` arm. `PerListNodeEncoder::materialize_shard` reads the per-list IMT,
+            // which only the `PpoiListLeafAdded` arm writes, so it is path-driven.
+            EncoderKind::PerListNode { list_key },
+        ] {
+            assert_eq!(
+                super::mirror_kind_for_encoder(encoder),
+                MirrorKind::Path,
+                "{encoder:?} drives PpoiListLeafAdded and must own the path sidecar"
+            );
+        }
+    }
+
+    #[test]
+    fn non_path_encoders_keep_the_status_sidecar() {
+        assert_eq!(
+            super::mirror_kind_for_encoder(EncoderKind::PerListStatus {
+                list_key: [7u8; 32]
+            }),
+            MirrorKind::Status
+        );
+    }
+
     #[tokio::test]
     async fn drain_or_abort_helper_aborts_a_stuck_worker_within_window() {
         let stuck = tokio::spawn(async {
