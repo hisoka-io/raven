@@ -71,7 +71,7 @@ describe("per-network deployments + validation", () => {
       (_req, _body, res) => {
         writeJson(
           res,
-          { [LIST_KEY_HEX]: { [BC_HEX]: "Valid" } },
+          { [BC_HEX]: { [LIST_KEY_HEX]: "Valid" } },
           {
             "x-raven-chain-id": "999999999",
             "x-raven-freshness": "lag_blocks=1 applied_height=10 epoch=1 confidence=0.99",
@@ -89,8 +89,8 @@ describe("per-network deployments + validation", () => {
       [LIST_KEY_HEX],
       [{ blindedCommitment: BC_HEX, type: "Shield" }],
     );
-    // Returned verbatim: no chain check ran, and no error names the mismatch.
-    expect(got).toEqual({ [LIST_KEY_HEX]: { [BC_HEX]: "Valid" } });
+    // The status survives unchanged: no chain check ran, and no error names the mismatch.
+    expect(got).toEqual({ [BC_HEX]: { [LIST_KEY_HEX]: "Valid" } });
     expect(JSON.stringify(got)).not.toContain("999999999");
   });
 

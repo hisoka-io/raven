@@ -16,8 +16,7 @@ use crate::global_prometheus_handle;
 
 pub use crate::auth::X_RAVEN_CLIENT_ID;
 
-type SharedLogicalStore =
-    Arc<parking_lot::Mutex<raven_railgun_engine::inspire::LogicalLeafStore>>;
+type SharedLogicalStore = Arc<parking_lot::Mutex<raven_railgun_engine::inspire::LogicalLeafStore>>;
 type InstanceLogicalStores = HashMap<InstanceId, ([u8; 32], SharedLogicalStore)>;
 
 /// Handler-shared state; cheap to clone. The manual `Clone` avoids the derive's
@@ -139,10 +138,7 @@ impl<S: PirScheme> AppState<S> {
 
     /// Attach per-instance PPOI logical stores used for response addenda.
     #[must_use]
-    pub fn with_instance_logical_stores(
-        mut self,
-        stores: InstanceLogicalStores,
-    ) -> Self {
+    pub fn with_instance_logical_stores(mut self, stores: InstanceLogicalStores) -> Self {
         self.instance_logical_stores = Arc::new(stores);
         self
     }

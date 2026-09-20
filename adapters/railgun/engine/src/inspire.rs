@@ -531,7 +531,9 @@ const SNAPSHOT_LAYOUT_HELP: &str = "Either these bytes are damaged, or they were
 /// Reconstruct an [`InspireServerState`] from bincode bytes. Rebuilds cache; session store starts empty.
 pub fn restore_inspire_state(bytes: &[u8]) -> Result<InspireServerState> {
     let bundle: PersistedInspireState = decode_snapshot_body(bytes).map_err(|e| {
-        AdapterError::Serialization(format!("v5 snapshot deserialize: {e}. {SNAPSHOT_LAYOUT_HELP}"))
+        AdapterError::Serialization(format!(
+            "v5 snapshot deserialize: {e}. {SNAPSHOT_LAYOUT_HELP}"
+        ))
     })?;
     bundle_to_state(bundle)
 }
@@ -918,9 +920,9 @@ mod frozen_v6_shape_tests {
     // reddens HERE, at desk speed, instead of at boot on a data_dir nobody can re-read.
     #[test]
     fn the_live_store_still_reads_the_shipped_v7_layout() {
-        let store: LogicalLeafStore = super::decode_snapshot_body(FROZEN_V7_STORE)
-            .unwrap_or_else(|e| {
-            panic!(
+        let store: LogicalLeafStore =
+            super::decode_snapshot_body(FROZEN_V7_STORE).unwrap_or_else(|e| {
+                panic!(
                 "LogicalLeafStore no longer reads the V7 bytes it ships with ({e}). bincode is \
                  positional: a field added or moved breaks every deployed data_dir. Add a new \
                  SNAPSHOT_V8_MAGIC, freeze the V7 shape the way LogicalLeafStoreV6 is frozen, \
@@ -953,11 +955,14 @@ mod frozen_v6_shape_tests {
 
     #[test]
     fn frozen_v6_store_bytes_decode_as_the_frozen_shape() {
-        let frozen: LogicalLeafStoreV6 =
-            super::decode_snapshot_body(FROZEN_V6_STORE)
-                .expect("frozen shape must read its own bytes");
+        let frozen: LogicalLeafStoreV6 = super::decode_snapshot_body(FROZEN_V6_STORE)
+            .expect("frozen shape must read its own bytes");
         let store = frozen.into_current();
-        assert_eq!(store.leaf(0, 0), Some(&[7u8; 32]), "commitment leaf survived");
+        assert_eq!(
+            store.leaf(0, 0),
+            Some(&[7u8; 32]),
+            "commitment leaf survived"
+        );
         assert_eq!(store.ppoi_list_count(), 1, "one list key");
         assert_eq!(
             store.ppoi_list_leaves_iter(&LIST_KEY).count(),
@@ -1014,7 +1019,10 @@ mod frozen_v6_shape_tests {
         let Err(err) = restore_inspire_state_v6(&snapshot) else {
             panic!("a V7-shaped store must not decode as V6 with the surplus discarded");
         };
-        assert!(err.to_string().contains("v6 snapshot deserialize"), "got {err}");
+        assert!(
+            err.to_string().contains("v6 snapshot deserialize"),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -1050,7 +1058,6 @@ mod frozen_v6_shape_tests {
         };
         assert!(err.to_string().contains("Write V7"), "got {err}");
     }
-
 }
 
 #[cfg(test)]

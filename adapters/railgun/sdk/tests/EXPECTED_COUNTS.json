@@ -2,7 +2,7 @@
   "_comment": [
     "Asserted by adapters/railgun/scripts/check-sdk-test-count.sh: a test file that",
     "silently stops being collected (rename, bad include glob, a describe left as",
-    ".skip) turns the sdk-tests lane green with less running — this file is what",
+    ".skip) turns the sdk-tests lane green with less running \u2014 this file is what",
     "catches the number drifting. `passed` is a floor (new tests may land before this",
     "file is bumped); `skipped`, `testFiles` and `skippedFiles` are EXACT.",
     "The 22 skipped tests / 4 skipped files are the intentionally env-gated live and bench tier:",
@@ -10,7 +10,7 @@
     "live_latency_bench.test.ts (1), poseidon_throughput_bench.test.ts (1); CI sets none of their run env vars.",
     "Anything else skipped is a regression, not a policy."
   ],
-  "testFiles": 46,
+  "testFiles": 48,
   "skippedFiles": 4,
   "passed": 386,
   "skipped": 22

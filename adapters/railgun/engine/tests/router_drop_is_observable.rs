@@ -179,7 +179,10 @@ async fn an_event_for_a_tree_no_instance_routes_increments_the_dropped_counter()
     // produced by `record_no_route` and the clear inside the router, not by the test.
     let mut targets = router_unrouted_targets();
     for _ in 0..200 {
-        if targets.iter().any(|t| t == &format!("tree:{UNROUTED_TREE}")) {
+        if targets
+            .iter()
+            .any(|t| t == &format!("tree:{UNROUTED_TREE}"))
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;

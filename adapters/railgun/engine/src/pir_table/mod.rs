@@ -111,9 +111,7 @@ impl EncoderKind {
             Self::PerListStatus { .. }
             | Self::PerListPath { .. }
             | Self::PerListPath10 { .. }
-            | Self::PerListNode { .. } => {
-                None
-            }
+            | Self::PerListNode { .. } => None,
         }
     }
 

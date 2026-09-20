@@ -802,7 +802,10 @@ fn enforce_verification_mode_matches_data_source(
                  verification_mode = \"chain-root-history\""
             )
         }
-        (DataSourceFilter::PpoiList(_) | DataSourceFilter::PpoiListBlock { .. }, VerificationMode::ChainRootHistory) => {
+        (
+            DataSourceFilter::PpoiList(_) | DataSourceFilter::PpoiListBlock { .. },
+            VerificationMode::ChainRootHistory,
+        ) => {
             anyhow::bail!("ppoi-list instance must use verification_mode = \"upstream-signature\"")
         }
     }

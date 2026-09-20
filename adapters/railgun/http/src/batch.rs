@@ -690,7 +690,11 @@ mod append_addenda_tests {
             // bincode prefixes a Vec<u8> with its length, so compare the TAIL, which is
             // what `runClientPirQueryBatch` slices off, not the whole body.
             assert_eq!(slot.len(), 512 + 8 + 160, "slot {i} length");
-            assert_eq!(&slot[slot.len() - 160..], &addenda[i][..], "slot {i} addendum");
+            assert_eq!(
+                &slot[slot.len() - 160..],
+                &addenda[i][..],
+                "slot {i} addendum"
+            );
             assert!(
                 slot[slot.len() - 161] == 0xaa + u8::try_from(i).expect("i") * 0x11,
                 "slot {i} body must still end with its own bytes"

@@ -1471,7 +1471,10 @@ mod ppoi_resilience {
     /// Bootstrap is bounded by `ppoi_node_status`, so EVERY stub must answer it.
     /// A stub that does not panics on the absent `startIndex`, drops the connection, and
     /// turns a row-semantics test into a transport test that proves nothing.
-    fn node_status_result(request: &serde_json::Value, total: u64) -> (axum::http::StatusCode, String) {
+    fn node_status_result(
+        request: &serde_json::Value,
+        total: u64,
+    ) -> (axum::http::StatusCode, String) {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": request["id"],

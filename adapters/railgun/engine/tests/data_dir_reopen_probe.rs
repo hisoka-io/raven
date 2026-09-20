@@ -53,8 +53,12 @@ fn probe(dir: &std::path::Path) -> Result<&'static str, String> {
             dir.display()
         ));
     }
-    let snap = Snapshot::load(&layout, id, SNAPSHOT_MAGIC)
-        .map_err(|e| format!("{}: snapshot {id:?} would not load at all: {e}", dir.display()))?;
+    let snap = Snapshot::load(&layout, id, SNAPSHOT_MAGIC).map_err(|e| {
+        format!(
+            "{}: snapshot {id:?} would not load at all: {e}",
+            dir.display()
+        )
+    })?;
 
     // The magic prefix, not the manifest number, picks the read arm. Reporting both stops a
     // reader concluding that "schema_version 5" means the V5 path was taken.
@@ -159,5 +163,8 @@ fn the_probe_reports_red_when_the_snapshot_body_does_not_match_this_binary() {
     let verdict = probe(dir.path()).expect_err("a shifted body must not reopen");
     assert!(verdict.contains("CANNOT REOPEN"), "{verdict}");
     assert!(verdict.contains("snapshot arm by magic: V7"), "{verdict}");
-    assert!(verdict.contains("no in-place migration exists"), "{verdict}");
+    assert!(
+        verdict.contains("no in-place migration exists"),
+        "{verdict}"
+    );
 }

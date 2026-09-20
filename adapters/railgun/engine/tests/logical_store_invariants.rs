@@ -153,12 +153,13 @@ fn ppoi_path10_row_matches_the_logical_store_and_independent_proof() {
     }
 
     let row = encoder.materialize_shard(0, &store);
-    let kat = row[..PATH10_RECORD_BYTES]
-        .iter()
-        .fold(String::with_capacity(PATH10_RECORD_BYTES * 2), |mut hex, byte| {
+    let kat = row[..PATH10_RECORD_BYTES].iter().fold(
+        String::with_capacity(PATH10_RECORD_BYTES * 2),
+        |mut hex, byte| {
             write!(hex, "{byte:02x}").expect("write to string");
             hex
-        });
+        },
+    );
     assert_eq!(
         kat,
         include_str!("../../sdk/tests/fixtures/path10_row.hex").trim()

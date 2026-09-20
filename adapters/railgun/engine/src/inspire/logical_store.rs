@@ -174,10 +174,8 @@ pub struct LogicalLeafStore {
     // field mid-struct shifted every field after it. `LogicalLeafStoreV6` is what reads the
     // bytes written before it existed.
     #[serde(default)]
-    ppoi_event_metadata: std::collections::BTreeMap<
-        ([u8; 32], u32),
-        raven_railgun_persistence::PpoiEventMetadata,
-    >,
+    ppoi_event_metadata:
+        std::collections::BTreeMap<([u8; 32], u32), raven_railgun_persistence::PpoiEventMetadata>,
     ppoi_list_leaf_block_height: std::collections::BTreeMap<([u8; 32], u32), u64>,
 }
 

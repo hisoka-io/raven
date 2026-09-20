@@ -11,10 +11,9 @@ pub use payload::{PpoiEventMetadata, PpoiEventType, WalEntryPayload};
 
 pub use raven_storage::{
     advance_manifest_and_archive, apply_retention, atomic_write, decode_no_trailing,
-    fsync_parent_dir, open_recovery,
-    publish_snapshot, Manifest, ManifestShape, PersistenceError, Result, RetentionPolicy,
-    RetentionReport, SnapshotFile as Snapshot, SnapshotHeader, SnapshotId, StoreLayout,
-    StoreRecovery, Wal, WalEntry, WalReplay, MANIFEST_SCHEMA_VERSION,
+    fsync_parent_dir, open_recovery, publish_snapshot, Manifest, ManifestShape, PersistenceError,
+    Result, RetentionPolicy, RetentionReport, SnapshotFile as Snapshot, SnapshotHeader, SnapshotId,
+    StoreLayout, StoreRecovery, Wal, WalEntry, WalReplay, MANIFEST_SCHEMA_VERSION,
     MIN_READABLE_MANIFEST_SCHEMA_VERSION, WAL_MAX_PAYLOAD_BYTES,
 };
 

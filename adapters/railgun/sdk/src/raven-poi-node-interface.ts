@@ -494,7 +494,10 @@ export class RavenPOINodeInterface {
     if (this.shouldFallback(freshness) && this.upstream) {
       return this.passthroughPoisPerList(listKeys, blindedCommitmentDatas);
     }
-    return json;
+    return rekeyToCallerStrings(
+      assertPoisPerListResponse(json, blindedCommitmentDatas, "/v1/poi/pois-per-list"),
+      blindedCommitmentDatas,
+    );
   }
 
   async getPOIMerkleProofs(
@@ -547,7 +550,7 @@ export class RavenPOINodeInterface {
     if (this.shouldFallback(freshness) && this.upstream) {
       return this.passthroughMerkleProofs(listKey, blindedCommitments);
     }
-    return json;
+    return assertMerkleProofArray(json, "/v1/poi/merkle-proofs");
   }
 
   async getMerkleProof(treeNumber: number, leafIndex: number): Promise<CommitTreeProof> {
@@ -560,7 +563,10 @@ export class RavenPOINodeInterface {
       `/v1/commit-tree/${treeNumber}/merkle-proof`,
       { leafIndex },
     );
-    return { kind: "rooted", proof: json };
+    return {
+      kind: "rooted",
+      proof: assertMerkleProof(json, `/v1/commit-tree/${treeNumber}/merkle-proof`),
+    };
   }
 
   // `POINodeInterface.validatePOIMerkleroots` (engine/src/poi/poi-node-interface.ts:30-35);
@@ -772,8 +778,7 @@ export class RavenPOINodeInterface {
     const out: PoisPerListResponse = {};
     // Pre-init so unknown-BC rows still surface; matches the upstream merge.
     for (const { blindedCommitment } of blindedCommitmentDatas) {
-      const bcHex = normalizeHex(blindedCommitment);
-      out[bcHex] ??= {};
+      out[blindedCommitment] ??= {};
     }
 
     for (const listKey of listKeys) {
@@ -789,15 +794,17 @@ export class RavenPOINodeInterface {
       const members: {
         commitmentData: BlindedCommitmentData;
         bcHex: string;
+        bcKey: string;
         idx: number;
       }[] = [];
       for (const commitmentData of blindedCommitmentDatas) {
-        const bcHex = normalizeHex(commitmentData.blindedCommitment);
+        const bcKey = commitmentData.blindedCommitment;
+        const bcHex = normalizeHex(bcKey);
         const idx = bcMap.get(bcHex);
         if (idx === undefined) {
-          out[bcHex][lkHex] = "Missing";
+          out[bcKey][lkHex] = "Missing";
         } else {
-          members.push({ commitmentData, bcHex, idx });
+          members.push({ commitmentData, bcHex, bcKey, idx });
         }
       }
 
@@ -825,20 +832,20 @@ export class RavenPOINodeInterface {
               [listKey],
               chunk.map(({ commitmentData }) => commitmentData),
             );
-            for (const { bcHex } of chunk) {
-              const fallbackStatus = fallback[bcHex]?.[lkHex];
+            for (const { bcKey } of chunk) {
+              const fallbackStatus = fallback[bcKey]?.[lkHex];
               if (!fallbackStatus) {
                 throw RavenError.decodeError(
-                  `upstream pois-per-list omitted BC ${bcHex} on list ${lkHex}`,
+                  `upstream pois-per-list omitted BC ${bcKey} on list ${lkHex}`,
                 );
               }
-              out[bcHex][lkHex] = fallbackStatus;
+              out[bcKey][lkHex] = fallbackStatus;
             }
           } else {
             for (let slot = 0; slot < chunk.length; slot += 1) {
-              const { bcHex, idx } = chunk[slot];
+              const { bcHex, bcKey, idx } = chunk[slot];
               const label = `client-PIR t1Status-${lkHex} idx ${idx}`;
-              out[bcHex][lkHex] = decodeStatusRow(
+              out[bcKey][lkHex] = decodeStatusRow(
                 privateReply.plaintexts[slot],
                 bcHex,
                 label,
@@ -1451,13 +1458,14 @@ export class RavenPOINodeInterface {
     if (!this.upstream) {
       throw RavenError.invalidQuery("upstream fallback not configured");
     }
-    return this.upstreamJsonRpc<PoisPerListResponse>("ppoi_pois_per_list", {
+    const reply = await this.upstreamJsonRpc<unknown>("ppoi_pois_per_list", {
       chainType: String(this.chainType),
       chainID: String(this.chainId),
       txidVersion: this.txidVersion,
       listKeys,
       blindedCommitmentDatas,
     });
+    return assertPoisPerListResponse(reply, blindedCommitmentDatas, "upstream ppoi_pois_per_list");
   }
 
   private async passthroughMerkleProofs(
@@ -1467,13 +1475,14 @@ export class RavenPOINodeInterface {
     if (!this.upstream) {
       throw RavenError.invalidQuery("upstream fallback not configured");
     }
-    return this.upstreamJsonRpc<MerkleProof[]>("ppoi_merkle_proofs", {
+    const reply = await this.upstreamJsonRpc<unknown>("ppoi_merkle_proofs", {
       chainType: String(this.chainType),
       chainID: String(this.chainId),
       txidVersion: this.txidVersion,
       listKey,
       blindedCommitments,
     });
+    return assertMerkleProofArray(reply, "upstream ppoi_merkle_proofs");
   }
 
   private async upstreamJsonRpc<T>(
@@ -1736,6 +1745,106 @@ function copyForBody(src: Uint8Array): Blob {
 
 function normalizeHex(hex: string): string {
   return (hex.startsWith("0x") || hex.startsWith("0X") ? hex.slice(2) : hex).toLowerCase();
+}
+
+const POI_STATUS_VALUES: readonly string[] = [
+  "Valid",
+  "ShieldBlocked",
+  "ProofSubmitted",
+  "Missing",
+  "Unreachable",
+];
+
+function isHex64(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const stripped = value.startsWith("0x") || value.startsWith("0X") ? value.slice(2) : value;
+  return stripped.length === 64 && /^[0-9a-fA-F]+$/.test(stripped);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * `as T` is erased at runtime, so a shim response was previously believed whatever its shape.
+ *
+ * The outer-key rule is the load-bearing one and a shape check alone cannot replace it:
+ * `{listKey: {bc: status}}` and `{bc: {listKey: status}}` are both `{hex64: {hex64: POIStatus}}`,
+ * so an inverted body is structurally indistinguishable from a correct one.
+ */
+function assertPoisPerListResponse(
+  value: unknown,
+  requested: BlindedCommitmentData[],
+  path: string,
+): PoisPerListResponse {
+  if (!isPlainObject(value)) {
+    throw RavenError.decodeError(`${path}: expected a JSON object keyed by blinded commitment`);
+  }
+  const asked = new Set(requested.map(({ blindedCommitment }) => normalizeHex(blindedCommitment)));
+  for (const [bcKey, perList] of Object.entries(value)) {
+    if (!asked.has(normalizeHex(bcKey))) {
+      throw RavenError.decodeError(
+        `${path}: outer key ${bcKey} was not requested; ` +
+          "the body is keyed by something other than the blinded commitments asked for",
+      );
+    }
+    if (!isPlainObject(perList)) {
+      throw RavenError.decodeError(`${path}: entry for ${bcKey} is not a per-list object`);
+    }
+    for (const [listKey, status] of Object.entries(perList)) {
+      if (typeof status !== "string" || !POI_STATUS_VALUES.includes(status)) {
+        throw RavenError.decodeError(
+          `${path}: status ${JSON.stringify(status)} for ${bcKey}/${listKey} is not a POIStatus`,
+        );
+      }
+    }
+  }
+  return value as PoisPerListResponse;
+}
+
+function assertMerkleProof(value: unknown, path: string): MerkleProof {
+  if (!isPlainObject(value)) {
+    throw RavenError.decodeError(`${path}: proof is not an object`);
+  }
+  if (!isHex64(value.leaf)) {
+    throw RavenError.decodeError(`${path}: proof leaf is not 32 bytes of hex`);
+  }
+  if (!isHex64(value.root)) {
+    throw RavenError.decodeError(`${path}: proof root is not 32 bytes of hex`);
+  }
+  if (typeof value.indices !== "string") {
+    throw RavenError.decodeError(`${path}: proof indices is not a string`);
+  }
+  if (!Array.isArray(value.elements) || !value.elements.every(isHex64)) {
+    throw RavenError.decodeError(`${path}: proof elements are not an array of 32-byte hex strings`);
+  }
+  return value as unknown as MerkleProof;
+}
+
+function assertMerkleProofArray(value: unknown, path: string): MerkleProof[] {
+  if (!Array.isArray(value)) {
+    throw RavenError.decodeError(`${path}: expected an array of merkle proofs`);
+  }
+  return value.map((proof) => assertMerkleProof(proof, path));
+}
+
+/**
+ * Re-key a response to the exact strings the caller passed in. The engine indexes this object with
+ * its own `0x`-prefixed string (`abstract-wallet.ts:1420`) and a miss is an unlogged `continue`, so
+ * a normalized key is silently dropped on every refresh. Normalization is an internal lookup
+ * detail and must not reach the response.
+ */
+function rekeyToCallerStrings(
+  response: PoisPerListResponse,
+  blindedCommitmentDatas: BlindedCommitmentData[],
+): PoisPerListResponse {
+  const out: PoisPerListResponse = {};
+  for (const { blindedCommitment } of blindedCommitmentDatas) {
+    const entry =
+      response[blindedCommitment] ?? response[normalizeHex(blindedCommitment)];
+    if (entry !== undefined) out[blindedCommitment] = entry;
+  }
+  return out;
 }
 
 /** Decimal non-negative wire-schema version, or `null` when the value is not one. */

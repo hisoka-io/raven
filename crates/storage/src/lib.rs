@@ -512,19 +512,31 @@ mod tests {
 
         // Truncate to the length a Short would occupy, then hand the FULL buffer to both
         // decoders. The permissive one stops early and calls it a success.
-        let short_len = bincode::serialize(&TailPayload::Short(7)).expect("serialize").len();
-        assert!(long.len() > short_len, "the long variant must actually be longer");
+        let short_len = bincode::serialize(&TailPayload::Short(7))
+            .expect("serialize")
+            .len();
+        assert!(
+            long.len() > short_len,
+            "the long variant must actually be longer"
+        );
 
         let permissive: Result<TailPayload, _> = bincode::deserialize(&long[..]);
         let strict: Result<TailPayload, _> = decode_no_trailing(&long[..]);
-        assert!(permissive.is_ok() && strict.is_ok(), "an exact buffer decodes either way");
+        assert!(
+            permissive.is_ok() && strict.is_ok(),
+            "an exact buffer decodes either way"
+        );
 
         // Now the real shape of the bug: surplus after a complete value.
         let mut padded = bincode::serialize(&TailPayload::Short(7)).expect("serialize");
         padded.extend_from_slice(&[0xff; 8]);
         let permissive: TailPayload =
             bincode::deserialize(&padded).expect("the free function accepts the surplus");
-        assert_eq!(permissive, TailPayload::Short(7), "and hands back a plausible value");
+        assert_eq!(
+            permissive,
+            TailPayload::Short(7),
+            "and hands back a plausible value"
+        );
         assert!(
             decode_no_trailing::<TailPayload>(&padded).is_err(),
             "the strict decoder must refuse 8 surplus bytes rather than discard them"

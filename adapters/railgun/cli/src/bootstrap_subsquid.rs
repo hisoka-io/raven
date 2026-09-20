@@ -1571,7 +1571,9 @@ impl PpoiEventsSource for RailwayPpoiClient {
                         "Shield" => raven_railgun_persistence::PpoiEventType::Shield,
                         "Transact" => raven_railgun_persistence::PpoiEventType::Transact,
                         "Unshield" => raven_railgun_persistence::PpoiEventType::Unshield,
-                        "LegacyTransact" => raven_railgun_persistence::PpoiEventType::LegacyTransact,
+                        "LegacyTransact" => {
+                            raven_railgun_persistence::PpoiEventType::LegacyTransact
+                        }
                         event_type => {
                             page_error = Some(format!(
                                 "{base}: unknown PPOI event type {event_type} at index {index}"

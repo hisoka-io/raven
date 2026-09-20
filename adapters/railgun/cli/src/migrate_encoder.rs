@@ -133,18 +133,32 @@ pub fn run_with_checkpoint(
     let mut logical_store = recovered_seed_store;
     for entry in &replay.entries {
         // Same strictness as the boot path: an enum decoded permissively loses its tail.
-        let payload: WalEntryPayload = raven_railgun_persistence::decode_no_trailing(&entry.payload)
-            .map_err(|e| anyhow::anyhow!("wal payload deserialize at seq {}: {e}", entry.seq))?;
-        if let Err(AdapterError::InvalidQuery(msg)) = apply_wal_entry(
+        let payload: WalEntryPayload =
+            raven_railgun_persistence::decode_no_trailing(&entry.payload).map_err(|e| {
+                anyhow::anyhow!("wal payload deserialize at seq {}: {e}", entry.seq)
+            })?;
+        // A durable snapshot is built from this store below, so only a structurally invalid
+        // entry may be skipped. Any other variant means the snapshot would describe a store the
+        // WAL does not, and `if let Err(InvalidQuery)` could observe one of nine variants.
+        match apply_wal_entry(
             &mut logical_store,
             &payload,
             entry.marker,
             noop_encoder.as_ref(),
         ) {
-            tracing::warn!(
-                seq = entry.seq,
-                "migrate-encoder: skipping invalid wal entry: {msg}"
-            );
+            Ok(()) => {}
+            Err(AdapterError::InvalidQuery(msg)) => {
+                tracing::warn!(
+                    seq = entry.seq,
+                    "migrate-encoder: skipping invalid wal entry: {msg}"
+                );
+            }
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "migrate-encoder: wal replay failed at seq {}: {err}",
+                    entry.seq
+                ));
+            }
         }
     }
 

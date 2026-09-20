@@ -183,8 +183,14 @@ pub(crate) async fn pois_per_list_handler<S: PirScheme>(
 
     let mut out: PoisPerListMap = PoisPerListMap::new();
     let store = store.lock();
-    for bc in &blinded_commitments {
-        let bc_hex = hex_encode(bc);
+    // Upstream echoes the caller's blindedCommitment verbatim (private-proof-of-innocence
+    // poi-merkletree-manager.ts:216-219), and the engine indexes the reply with its own
+    // `0x`-prefixed string where a miss is an unlogged `continue`. Re-keying here drops every row.
+    for (bc, data) in blinded_commitments
+        .iter()
+        .zip(req.blinded_commitment_datas.iter())
+    {
+        let bc_hex = data.blinded_commitment.clone();
         let mut per_list: std::collections::BTreeMap<HexHash, String> =
             std::collections::BTreeMap::new();
         for (list_key_hex, list_key) in req.list_keys.iter().zip(list_keys.iter()) {

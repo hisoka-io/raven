@@ -288,6 +288,9 @@ jobs:
     # to keep the adapter + inspire test build under the time budget
     name: railgun tests (${{ matrix.shard.name }})
     needs: railgun-static
+    # `skipped` reads as green on a merged board, so an upstream red silenced these for
+    # nineteen days. Run them on their own merits and let them report a real verdict.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -368,6 +371,9 @@ jobs:
     # must be explained by updating that file in the same change.
     name: lane counts (no filter may silently shrink)
     needs: railgun-static
+    # `skipped` reads as green on a merged board, so an upstream red silenced these for
+    # nineteen days. Run them on their own merits and let them report a real verdict.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -402,6 +408,9 @@ jobs:
     # Nothing here is a benchmark; every test asserts byte identity or recovery.
     name: durability + closure (${{ matrix.lane.name }}, --run-ignored all)
     needs: railgun-static
+    # `skipped` reads as green on a merged board, so an upstream red silenced these for
+    # nineteen days. Run them on their own merits and let them report a real verdict.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -814,6 +823,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89
         with:
           components: clippy
+      # The action installs a full patch version; RUSTUP_TOOLCHAIN names the bare
+      # minor. Those are different rustup toolchains, so clippy landed on the one
+      # the job does not run and `cargo clippy` died while `cargo check` passed.
+      - name: install clippy for the toolchain this job actually selects
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --component clippy
       - uses: Swatinem/rust-cache@v2
       - name: verify, build, and lint the exact 1.89 package set
         run: |
@@ -886,6 +900,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.91
         with:
           components: clippy
+      # The action installs a full patch version; RUSTUP_TOOLCHAIN names the bare
+      # minor. Those are different rustup toolchains, so clippy landed on the one
+      # the job does not run and `cargo clippy` died while `cargo check` passed.
+      - name: install clippy for the toolchain this job actually selects
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --component clippy
       - uses: Swatinem/rust-cache@v2
       - name: verify, build, and lint the exact 1.91 package set
         run: |

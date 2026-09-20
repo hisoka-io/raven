@@ -61,7 +61,12 @@ async fn production_cell_latency_budget_slo() {
         .expect("POST query");
     let status = response.status();
     let body = response.bytes().await.expect("body bytes");
-    assert_eq!(status, 200, "HTTP status; body={}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        status,
+        200,
+        "HTTP status; body={}",
+        String::from_utf8_lossy(&body)
+    );
     let single_total = single_start.elapsed();
     eprintln!("production_cell: single-query total = {single_total:?}");
 

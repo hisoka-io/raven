@@ -136,9 +136,10 @@ describe("multi-input spend support", () => {
         const decoded = JSON.parse(new TextDecoder().decode(body));
         expect(decoded.listKeys).toEqual([lkA, lkB]);
         expect(decoded.blindedCommitmentDatas).toHaveLength(2);
+        // BC outer, list key inner — `PoisPerListResponse` and upstream's POIsPerListMap.
         writeJson(res, {
-          [lkA]: { [bcOne]: "Valid", [bcTwo]: "Missing" },
-          [lkB]: { [bcOne]: "ShieldBlocked", [bcTwo]: "ProofSubmitted" },
+          [bcOne]: { [lkA]: "Valid", [lkB]: "ShieldBlocked" },
+          [bcTwo]: { [lkA]: "Missing", [lkB]: "ProofSubmitted" },
         });
         return true;
       },
@@ -155,7 +156,7 @@ describe("multi-input spend support", () => {
         { blindedCommitment: bcTwo, type: "Transact" },
       ],
     );
-    expect(got[lkA][bcOne]).toBe("Valid");
-    expect(got[lkB][bcTwo]).toBe("ProofSubmitted");
+    expect(got[bcOne][lkA]).toBe("Valid");
+    expect(got[bcTwo][lkB]).toBe("ProofSubmitted");
   });
 });

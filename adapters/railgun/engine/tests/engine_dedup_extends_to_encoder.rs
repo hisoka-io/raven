@@ -168,12 +168,10 @@ async fn ppoi_route_dispatch_does_not_collide_for_status_and_paths_on_same_list_
 
     let (tx_status, mut rx_status) = mpsc::channel::<ConsumerEvent>(8);
     let (tx_paths, mut rx_paths) = mpsc::channel::<ConsumerEvent>(8);
-    handle
-        .ppoi_list_routes
-        .store(std::sync::Arc::new(vec![
-            (DataSourceFilter::PpoiList(lk), tx_status),
-            (DataSourceFilter::PpoiList(lk), tx_paths),
-        ]));
+    handle.ppoi_list_routes.store(std::sync::Arc::new(vec![
+        (DataSourceFilter::PpoiList(lk), tx_status),
+        (DataSourceFilter::PpoiList(lk), tx_paths),
+    ]));
 
     let payload = WalEntryPayload::PpoiStatus {
         list_key: lk,

@@ -1229,8 +1229,13 @@ fn payload_for_ppoi_route(
                 validated_merkleroot: *validated_merkleroot,
             })
         }
-        (DataSourceFilter::PpoiListBlock { list_key: route_key, .. }, WalEntryPayload::PpoiStatus { .. })
-            if route_key == list_key => Some(payload.clone()),
+        (
+            DataSourceFilter::PpoiListBlock {
+                list_key: route_key,
+                ..
+            },
+            WalEntryPayload::PpoiStatus { .. },
+        ) if route_key == list_key => Some(payload.clone()),
         _ => None,
     }
 }
