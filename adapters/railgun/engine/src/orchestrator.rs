@@ -767,7 +767,21 @@ fn count_router_drop(reason: &'static str) {
 }
 
 /// Leaves per PPOI block, the width `DataSourceFilter::PpoiListBlock` partitions on.
+/// One block's leaf span. **The routing boundary and the readiness-target name must both be
+/// this symbol.** They were not: the name used the const while `payload_for_ppoi_route` carried
+/// bare `65_536` literals, so respelling the const moved which target an operator alert matches
+/// without moving which block a leaf routes to — two copies of one decision, the same shape as
+/// the separator drift below it.
 pub const LEAVES_PER_PPOI_BLOCK: u32 = 65_536;
+
+// A block must fit in ONE IMT. `checked_imt_append` refuses at `TREE_MAX_ITEMS`, so a wider
+// block would route leaves that the per-list tree then rejects one at a time -- a block that
+// can never complete, discovered leaf by leaf in production rather than here. Nothing asserted
+// this; the two constants live in different files and agreed by coincidence.
+const _: () = assert!(
+    LEAVES_PER_PPOI_BLOCK as usize <= crate::imt::TREE_MAX_ITEMS,
+    "LEAVES_PER_PPOI_BLOCK exceeds the per-list IMT capacity"
+);
 
 /// Routing targets that are **currently** not receiving events.
 ///
@@ -1204,10 +1218,10 @@ fn payload_for_ppoi_route(
                 validated_merkleroot,
                 ..
             },
-        ) if route_key == list_key && *list_index / 65_536 == block => {
+        ) if route_key == list_key && *list_index / LEAVES_PER_PPOI_BLOCK == block => {
             Some(WalEntryPayload::PpoiListLeafAdded {
                 list_key: route_key,
-                list_index: *list_index % 65_536,
+                list_index: *list_index % LEAVES_PER_PPOI_BLOCK,
                 blinded_commitment: *blinded_commitment,
                 status: *status,
                 event_type: *event_type,
@@ -1240,8 +1254,8 @@ mod forest_routing_tests {
     #[test]
     fn six_block_routes_localize_every_global_boundary_and_refuse_the_seventh() {
         for block in 0..6u32 {
-            for local in [0u32, 65_535] {
-                let global = block * 65_536 + local;
+            for local in [0u32, LEAVES_PER_PPOI_BLOCK - 1] {
+                let global = block * LEAVES_PER_PPOI_BLOCK + local;
                 let routed = payload_for_ppoi_route(
                     DataSourceFilter::PpoiListBlock {
                         list_key: [7; 32],
@@ -1257,7 +1271,7 @@ mod forest_routing_tests {
                 ));
             }
         }
-        let seventh = leaf(6 * 65_536);
+        let seventh = leaf(6 * LEAVES_PER_PPOI_BLOCK);
         assert!((0..6u32).all(|block| payload_for_ppoi_route(
             DataSourceFilter::PpoiListBlock {
                 list_key: [7; 32],
@@ -1271,6 +1285,38 @@ mod forest_routing_tests {
 
     /// A distinctive key, because the registry is process-global and unit tests share it.
     const LATCH_LK: &str = "beeff00d00000000000000000000000000000000000000000000000000000000";
+
+    /// A distinct key again: `ppoi_target_name` is the PRODUCER, and the registry is global.
+    const COUPLE_LK: [u8; 32] = [0xbe; 32];
+
+    // The producer and the clear have to agree on one separator, and nothing asserted that.
+    // Both latch tests below pass literals, so `ppoi_target_name` could be respelled -- from
+    // `:block:` to anything -- and the entire suite stayed green while the latch came back.
+    // Verified: that mutation passed 342/342 before this test existed.
+    #[test]
+    fn the_name_a_pre_route_miss_marks_is_the_one_a_delivery_clears() {
+        let payload = leaf(3 * LEAVES_PER_PPOI_BLOCK + 7);
+
+        // Moment one: the list key is seen before any route is bound to it.
+        let coarse = ppoi_target_name(&payload, &COUPLE_LK, &[]);
+
+        // Moment two: a route exists and the same payload is delivered.
+        let (tx, _rx) = mpsc::channel(1);
+        let routes = vec![(DataSourceFilter::PpoiList(COUPLE_LK), tx)];
+        let fine = ppoi_target_name(&payload, &COUPLE_LK, &routes);
+
+        assert_ne!(
+            coarse, fine,
+            "the two moments must stay distinguishable, or the granularity buys nothing"
+        );
+        mark_router_unrouted_target(&coarse);
+        clear_delivered_target(&fine);
+        assert!(
+            !router_unrouted_targets().contains(&coarse),
+            "clearing {fine:?} must heal the mark {coarse:?} left before the route existed; \
+             both strings come from the producer, so this fails if the two spellings drift"
+        );
+    }
 
     // THE LATCH. `ppoi_target_name` names the SAME list two ways depending on whether a route
     // exists yet: coarse before, block-granular after. Routing is asynchronous, so the first

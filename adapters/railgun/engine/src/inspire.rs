@@ -510,11 +510,7 @@ pub fn snapshot_inspire_state_v6(
 fn decode_snapshot_body<'a, T: serde::de::Deserialize<'a>>(
     body: &'a [u8],
 ) -> std::result::Result<T, bincode::Error> {
-    use bincode::Options as _;
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .reject_trailing_bytes()
-        .deserialize(body)
+    raven_railgun_persistence::decode_no_trailing(body)
 }
 
 /// Shared tail for every snapshot-decode refusal.

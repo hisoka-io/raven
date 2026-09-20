@@ -12,6 +12,30 @@ pub mod retention;
 pub mod snapshot;
 pub mod wal;
 
+/// Decode bincode, REFUSING surplus bytes.
+///
+/// The free `bincode::deserialize` is `…with_fixint_encoding().allow_trailing_bytes()` — the
+/// opposite of the `DefaultOptions` struct's default, and bincode's own docs carry a warning
+/// about the discrepancy. On a durable format that permissiveness is a silent-wrong-bytes
+/// defect rather than a convenience: a longer payload decodes as a shorter one and returns
+/// `Ok`, which for an enum means a longer variant read as a shorter one, tail discarded.
+///
+/// Every decode of bytes this crate has persisted goes through here, so the policy is stated
+/// once instead of depending on each call site remembering it.
+///
+/// # Errors
+/// Returns the bincode error when `bytes` is not exactly one `T`.
+pub fn decode_no_trailing<'a, T>(bytes: &'a [u8]) -> std::result::Result<T, bincode::Error>
+where
+    T: serde::de::Deserialize<'a>,
+{
+    use bincode::Options as _;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize(bytes)
+}
+
 use raven_core::InstanceId;
 use std::path::PathBuf;
 
@@ -471,6 +495,41 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two variants of different lengths: the shape an enum payload actually has on disk.
+    #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+    enum TailPayload {
+        Short(u32),
+        Long(u32, [u8; 16]),
+    }
+
+    // The defect, pinned at the primitive. bincode's free `deserialize` accepts surplus, so a
+    // LONG variant handed to a reader expecting the bytes of a SHORT one returns `Ok` with the
+    // tail silently discarded -- wrong bytes, no error. Durable formats cannot afford that.
+    #[test]
+    fn decode_no_trailing_refuses_what_the_free_function_accepts() {
+        let long = bincode::serialize(&TailPayload::Long(7, [0xab; 16])).expect("serialize");
+
+        // Truncate to the length a Short would occupy, then hand the FULL buffer to both
+        // decoders. The permissive one stops early and calls it a success.
+        let short_len = bincode::serialize(&TailPayload::Short(7)).expect("serialize").len();
+        assert!(long.len() > short_len, "the long variant must actually be longer");
+
+        let permissive: Result<TailPayload, _> = bincode::deserialize(&long[..]);
+        let strict: Result<TailPayload, _> = decode_no_trailing(&long[..]);
+        assert!(permissive.is_ok() && strict.is_ok(), "an exact buffer decodes either way");
+
+        // Now the real shape of the bug: surplus after a complete value.
+        let mut padded = bincode::serialize(&TailPayload::Short(7)).expect("serialize");
+        padded.extend_from_slice(&[0xff; 8]);
+        let permissive: TailPayload =
+            bincode::deserialize(&padded).expect("the free function accepts the surplus");
+        assert_eq!(permissive, TailPayload::Short(7), "and hands back a plausible value");
+        assert!(
+            decode_no_trailing::<TailPayload>(&padded).is_err(),
+            "the strict decoder must refuse 8 surplus bytes rather than discard them"
+        );
+    }
 
     #[test]
     fn store_layout_creates_dirs() {

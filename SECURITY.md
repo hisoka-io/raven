@@ -26,38 +26,64 @@ Two items are KNOWN, DOCUMENTED, and currently OPEN. Neither is a defect to be
 quietly fixed later; both are honesty-as-credibility disclosures. Serving real
 value on a Raven deployment is gated on resolving them as described.
 
-### G6 - Unresolved noise-variance factor in parameter derivation
+### G6 - InspiRING packing noise is not modelled by the variance formula
 
 Location: crates/inspire/src/params.rs - get_variance and
-InspireParams::for_scenario. Both carry the disclosure in-source.
+InspireParams::for_scenario, which carry the disclosure in-source; the
+measurement is crates/inspire/benches/packing_noise_measurement.rs.
 
-An external review flagged a potentially missing (q~ / q)^2 factor in the
-ring-LWE noise-variance computation (the get_variance derivation, cross-checked
-against InsPIRe Theorem 7). The current implementation mirrors the upstream
-Google private-membership InsPIRe reference verbatim; the factor, if it is
-authoritatively required by the paper, may be absorbed upstream into
-noise-budget slack. Under the current formula, sampled parameter cells satisfy
-the noise budget with only a thin slack margin.
+This item previously disclosed TWO gaps. The first is resolved; the second is
+open but now bounded by measurement rather than by prose.
 
-A second, related gap is disclosed at the same location. The reproduced
-get_variance formula covers Spiral-family LWE and gadget noise only; it does NOT
-model the additional noise that InspiRING 2-matrix packing introduces.
-Empirically the derived q ~= 2^53 is insufficient for a 2^20 x 256 B cell under
-TwoPacking + InspiRING even though the noise-budget gate reports approximately
-0.093 bits of slack. The failure mode is SILENT: decryption produces
-random-looking bytes once the packing noise term crosses the delta = floor(q/p)
-scaling boundary, with no error raised. The shipped mitigation is
-InspireParams::for_scenario_with_crt with a wider 2-CRT pair (typically 2 x
-30-bit primes, q ~= 2^60); for_scenario is retained for scenarios where the
-tree-packed extract path is the only one in use.
+RESOLVED - the (q~ / q)^2 factor. An external review flagged a potentially
+missing (q~ / q)^2 factor against InsPIRe Theorem 7. A direct read of the
+theorem on 2026-08-01 settled it: get_variance computes the PRE-mod-switch
+variance, which is the correct object for sizing q, and required_q_log2 sizes q
+rather than q~. The factor legitimately does not belong there. What IS absent
+from the formula is the theorem's additive d*sigma_chi^2/4 mod-switch rounding
+term - inert while nothing mod-switches, and load-bearing the moment response
+modulus switching ships. params.rs carries this correction in-source.
 
-Consequence for operators: the thin slack margin above must not be read as a
-passing margin. It is a reading from a formula with a known missing term.
+OPEN - packing noise. The reproduced get_variance formula covers Spiral-family
+LWE and gadget noise only; it does NOT model the additional noise that InspiRING
+2-matrix packing introduces. The failure mode is SILENT: decryption produces
+random-looking bytes once the packing noise crosses the Delta/2 = q/(2p) decode
+boundary, with no error raised. Empirically the derived q ~= 2^53 is
+insufficient for a 2^20 x 256 B cell under TwoPacking + InspiRING even though
+the noise-budget gate reports approximately 0.093 bits of slack. The shipped
+mitigation is InspireParams::for_scenario_with_crt with a wider 2-CRT pair
+(typically 2 x 30-bit primes, q ~= 2^60); for_scenario is retained for scenarios
+where the tree-packed extract path is the only one in use.
 
-Status: GATED ON CRYPTOGRAPHER REVIEW. This item must be resolved by a direct
-read of InsPIRe Theorem 7 against the implementation plus a noise-calibration
-measurement before any deployment serves real value. A change here alters
-shipping noise-budget assumptions, so it is not a routine code edit.
+MEASURED, 2026-09-20. The packed-response noise is now sampled on the shipped
+respond path at both production record widths, 1,000 responses each, and the
+worst sample is asserted against the decode boundary. Against a boundary of
+8,795,958,806,527:
+
+  32 B records  (gamma 16):  worst sample  3,675,159,993  -  11.225 bits margin
+  512 B records (gamma 256): worst sample 14,500,737,099  -   9.245 bits margin
+
+The narrower margin is at the 512 B width, which is what the PPOI path records
+ship at. The measurement is a test assertion, so a parameter or packing change
+that erodes the margin fails rather than scrambling a response in production.
+
+What this does NOT establish, stated plainly because the distinction is the
+whole point of the disclosure: an empirical margin over 1,000 samples is not an
+analytic bound. It shows the shipped cell is comfortably inside the boundary on
+the sampled path; it does not model the term, and it does not bound the tail.
+get_variance's own slack figure therefore remains unreliable as a predictor -
+the number to trust is the measured margin, not the 0.093 bits the gate reports.
+
+Consequence for operators: the formula's thin slack margin must not be read as a
+passing margin. Read the measured margin above instead, and re-run the
+measurement after any change to packing, noise sampling, parameters or the
+mod-switch gate.
+
+Status: the two conditions this disclosure set for itself - a direct read of
+InsPIRe Theorem 7 against the implementation, and a noise-calibration
+measurement - are both now met. What remains open is the modelling: get_variance
+still does not include a packing term, and adding one alters shipping
+noise-budget assumptions, so it is not a routine code edit.
 
 Why it is disclosed rather than silently patched: a wrong noise bound can turn
 into a correctness failure or a privacy leak. We would rather state the open

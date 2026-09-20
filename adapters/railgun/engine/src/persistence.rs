@@ -365,8 +365,17 @@ impl InspirePersistence {
             let mut replay_skipped: u64 = 0;
             let replay_encoder = encoder.as_ref();
             for entry in &replay.entries {
-                let payload: WalEntryPayload = bincode::deserialize(&entry.payload)
-                    .map_err(|e| AdapterError::Serialization(format!("wal payload: {e}")))?;
+                // `WalEntryPayload` is an enum, so a permissive decode reads a longer variant
+                // as a shorter one and silently drops its tail. Refuse the surplus instead.
+                let payload: WalEntryPayload =
+                    raven_railgun_persistence::decode_no_trailing(&entry.payload).map_err(|e| {
+                        AdapterError::Serialization(format!(
+                            "wal payload at seq {}: {e}. These bytes are not exactly one \
+                             WalEntryPayload of this build's shape; repair or truncate the WAL \
+                             before reopening",
+                            entry.seq
+                        ))
+                    })?;
                 super::inspire::ensure_canonical_leaf(&payload).map_err(|e| {
                     AdapterError::Internal(format!(
                         "wal replay refused at seq {} (block {}): {e}. Skipping it \

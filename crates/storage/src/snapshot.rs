@@ -175,7 +175,8 @@ impl SnapshotFile {
             return Err(PersistenceError::SnapshotNotFound(id));
         }
         let header_bytes = std::fs::read(layout.snapshot_header_path(id))?;
-        let header: SnapshotHeader = bincode::deserialize(&header_bytes)?;
+        // Strict: a header from a longer future shape must refuse, not silently read as this one.
+        let header: SnapshotHeader = crate::decode_no_trailing(&header_bytes)?;
         if header.magic != expected_magic {
             return Err(PersistenceError::SnapshotCorrupt(format!(
                 "snap-{:06}: magic mismatch",

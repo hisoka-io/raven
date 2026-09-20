@@ -132,7 +132,8 @@ pub fn run_with_checkpoint(
 
     let mut logical_store = recovered_seed_store;
     for entry in &replay.entries {
-        let payload: WalEntryPayload = bincode::deserialize(&entry.payload)
+        // Same strictness as the boot path: an enum decoded permissively loses its tail.
+        let payload: WalEntryPayload = raven_railgun_persistence::decode_no_trailing(&entry.payload)
             .map_err(|e| anyhow::anyhow!("wal payload deserialize at seq {}: {e}", entry.seq))?;
         if let Err(AdapterError::InvalidQuery(msg)) = apply_wal_entry(
             &mut logical_store,
