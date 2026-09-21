@@ -12,10 +12,326 @@
 # and its own red-proof passed, because the mutation renamed a term to something containing an
 # uppercase letter and the extraction silently skipped it. A gate that cannot see part of its
 # own input is worse than no gate.
+#
+# Two passes, because they cost differently:
+#   (no argument)  name resolution against the working tree. No toolchain, so it runs in the
+#                  cheap hygiene job - and it reads only plain test(NAME) / binary(NAME) terms in
+#                  the workflow. A regex, glob or package() term is invisible to it.
+#   --selected     asks nextest what every declared filter selects, so it sees every filter
+#                  syntax nextest does. Reads the workflow AND every .config/nextest.toml: an
+#                  override whose filter selects nothing configures nothing, silently. Needs the
+#                  test binaries built, like scripts/assert-lane-counts.sh.
+#
+# FILTER_GATE_WORKFLOW and FILTER_GATE_NEXTEST_CONFIGS ("config=manifest ...") point either pass
+# at copies, so a red-proof never has to mutate a tracked file.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-CI=.github/workflows/ci.yml
+CI="${FILTER_GATE_WORKFLOW:-.github/workflows/ci.yml}"
+MODE="${1:-names}"
 fail=0
+
+[ -f "$CI" ] || { echo "scripts/check-ci-filter-names.sh: workflow ${CI} does not exist." >&2; exit 1; }
+
+if [ "$MODE" = "--selected" ]; then
+  if [ -n "${FILTER_GATE_NEXTEST_CONFIGS:-}" ]; then
+    config_specs="$FILTER_GATE_NEXTEST_CONFIGS"
+  else
+    # The disk, not the index, and untracked files count: the same tree nextest answers from.
+    config_specs=$(
+      { git ls-files -- '.config/nextest.toml' '*/.config/nextest.toml'
+        git ls-files --others --exclude-standard -- '.config/nextest.toml' '*/.config/nextest.toml'
+      } | sort -u | while IFS= read -r cfg; do
+        [ -f "$cfg" ] || continue
+        workspace=$(dirname "$(dirname "$cfg")")
+        printf '%s=%s\n' "$cfg" "${workspace}/Cargo.toml"
+      done
+    )
+  fi
+  # shellcheck disable=SC2086
+  exec python3 - "$CI" $config_specs <<'PY'
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tomllib
+
+import yaml
+
+workflow, config_specs = sys.argv[1], sys.argv[2:]
+failures = []
+
+
+def fail(headline, *detail):
+    failures.append("\n".join([headline, *("  " + line for line in detail)]))
+
+
+OPERATOR_WORDS = {"and", "or", "not"}
+WORD = re.compile(r"[a-z_]+")
+
+
+def split_terms(expr):
+    """The leaf predicates of a filterset.
+
+    Finds where each term ends and nothing more; nextest decides what a term matches. Every
+    character is accounted for, so a construct this does not know raises instead of vanishing.
+    """
+    terms, i, n = [], 0, len(expr)
+    while i < n:
+        if expr[i].isspace() or expr[i] in "()&|+-!":
+            i += 1
+            continue
+        word = WORD.match(expr, i)
+        if word is None:
+            raise ValueError(f"unexpected {expr[i]!r} at offset {i}")
+        if word.group(0) in OPERATOR_WORDS:
+            i = word.end()
+            continue
+        k = word.end()
+        if k >= n or expr[k] != "(":
+            raise ValueError(f"{word.group(0)!r} at offset {i} does not open a predicate")
+        k += 1
+        if expr[k:].lstrip().startswith("/"):
+            # a regex may hold ')' and '|'; it ends at the first unescaped '/'
+            k = expr.index("/", k) + 1
+            while k < n and expr[k] != "/":
+                k += 2 if expr[k] == "\\" else 1
+            k += 1
+        while k < n and expr[k] != ")":
+            k += 2 if expr[k] == "\\" else 1
+        if k >= n:
+            raise ValueError(f"unterminated {word.group(0)}( at offset {i}")
+        terms.append(expr[i : k + 1])
+        i = k + 1
+    if not terms:
+        raise ValueError("no predicate in the expression")
+    return terms
+
+
+evaluations = {}
+broken_scopes = {}
+
+
+def select(scope, expr):
+    """(count, None), or (None, reason) when nextest could not answer."""
+    key = (tuple(scope), expr)
+    if key in evaluations:
+        return evaluations[key]
+    if tuple(scope) in broken_scopes:
+        return None, broken_scopes[tuple(scope)]
+    # JSON on stdout, cargo's chatter on stderr: the count never depends on colour or row shape.
+    listing = subprocess.run(
+        ["cargo", "nextest", "list", "--color", "never", *scope, "-E", expr, "-T", "json"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    if listing.returncode != 0:
+        tail = " | ".join(listing.stderr.strip().splitlines()[-4:])
+        reason = f"cargo nextest list exited {listing.returncode}: {tail}"
+        # 94 is nextest rejecting this expression; anything else sinks the whole scope
+        if listing.returncode != 94:
+            broken_scopes[tuple(scope)] = reason
+        evaluations[key] = (None, reason)
+        return evaluations[key]
+    try:
+        suites = json.loads(listing.stdout)["rust-suites"]
+        if not suites:
+            raise ValueError("no test binary listed")
+        statuses = [
+            case["filter-match"]["status"]
+            for suite in suites.values()
+            for case in suite["testcases"].values()
+        ]
+        unknown = set(statuses) - {"matches", "mismatch"}
+        if unknown:
+            raise ValueError(f"unknown filter-match status {sorted(unknown)}")
+        evaluations[key] = (statuses.count("matches"), None)
+    except (KeyError, TypeError, ValueError) as drift:
+        evaluations[key] = (None, f"nextest list JSON is not the shape this gate reads: {drift!r}")
+    return evaluations[key]
+
+
+def check_declaration(where, scope, expr):
+    try:
+        terms = split_terms(expr)
+    except ValueError as unreadable:
+        fail(f"FILTER NOT EVALUATED: {where}", f"filter: {expr}", f"cannot split it into terms: {unreadable}")
+        return
+    count, reason = select(scope, expr)
+    if reason:
+        fail(f"FILTER NOT EVALUATED: {where}", f"filter: {expr}", reason)
+        return
+    print(f"{count:6d}  {where}")
+    if count == 0:
+        fail(
+            f"FILTER SELECTS NOTHING: {where}",
+            f"filter: {expr}",
+            "0 tests selected. Whatever this declaration configures, it configures for no test.",
+        )
+        return
+    if terms == [expr.strip()]:
+        return
+    for term in terms:
+        count, reason = select(scope, term)
+        if reason:
+            fail(f"FILTER TERM NOT EVALUATED: {where}", f"term: {term}", reason)
+        elif count == 0:
+            fail(
+                f"FILTER TERM SELECTS NOTHING: {where}",
+                f"term: {term}",
+                "The rest of the filter still matches, so the lane stays green while this term is dead.",
+            )
+
+
+def declared_filters(node, trail):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ("filter", "default-filter"):
+                yield trail + [key], value, node
+            else:
+                yield from declared_filters(value, trail + [key])
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from declared_filters(value, trail + [index])
+
+
+def check_nextest_config(config, manifest):
+    try:
+        with open(config, "rb") as handle:
+            document = tomllib.load(handle)
+        with open(manifest, "rb") as handle:
+            cargo_profiles = tomllib.load(handle).get("profile") or {}
+    except (OSError, tomllib.TOMLDecodeError) as unreadable:
+        fail(f"CONFIG NOT READ: {config} (workspace {manifest})", repr(unreadable))
+        return
+    # the adapter defines ci-test and CI tests it under nothing else; the root workspace has only dev
+    cargo_profile = ["--cargo-profile", "ci-test"] if "ci-test" in cargo_profiles else []
+    declarations = list(declared_filters(document, []))
+    groups = set(document.get("test-groups") or {})
+    # so a log shows what discovery reached; a config it never opened would otherwise read as clean
+    print(f"        {config}: {len(declarations)} filter declaration(s), {len(groups)} test group(s)")
+    for trail, expr, owner in declarations:
+        where = f"{config} " + ".".join(str(part) for part in trail)
+        if "test-group" in owner:
+            where += f" (test-group {owner['test-group']})"
+        if not isinstance(expr, str):
+            fail(f"FILTER NOT EVALUATED: {where}", f"not a string: {expr!r}")
+            continue
+        profile = trail[1] if trail[0] == "profile" and len(trail) > 2 else "default"
+        # the widest universe nextest can be asked for: dead here is dead in every lane
+        scope = ["--manifest-path", manifest, "--config-file", config, "--profile", profile,
+                 *cargo_profile, "--all-targets", "--run-ignored", "all"]
+        check_declaration(where, scope, expr)
+    assigned = {
+        override["test-group"]
+        for profile in (document.get("profile") or {}).values()
+        for override in profile.get("overrides") or []
+        if "test-group" in override
+    }
+    for group in sorted(groups - assigned):
+        fail(
+            f"TEST GROUP HOLDS NOTHING: {config} test-groups.{group}",
+            "No override assigns a test to it, so its limits apply to no test.",
+        )
+
+
+FILTER_FLAGS = {"-E", "--filterset", "--filter-expr"}
+SCOPE_VALUE_FLAGS = {"--manifest-path", "-p", "--package", "--features", "--cargo-profile",
+                     "--profile", "--run-ignored"}
+SCOPE_BARE_FLAGS = {"--all-targets", "--workspace", "--all-features", "--no-default-features"}
+RUN_ONLY_VALUE_FLAGS = {"--no-tests"}
+RUN_ONLY_BARE_FLAGS = {"--no-fail-fast"}
+MATRIX_FIELD = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\s*\}\}")
+
+
+def lane_scope(arguments):
+    """Split a `cargo nextest run` argument list into what scopes a listing and its filters."""
+    scope, filters, i = [], [], 0
+    while i < len(arguments):
+        flag, inline, value = arguments[i].partition("=")
+        takes_value = flag in FILTER_FLAGS | SCOPE_VALUE_FLAGS | RUN_ONLY_VALUE_FLAGS
+        if takes_value and not inline:
+            i += 1
+            if i >= len(arguments):
+                raise ValueError(f"{flag} has no value")
+            value = arguments[i]
+        if flag in FILTER_FLAGS:
+            filters.append(value)
+        elif flag in SCOPE_VALUE_FLAGS:
+            scope += [flag, value]
+        elif flag in SCOPE_BARE_FLAGS and not inline:
+            scope.append(flag)
+        elif not (flag in RUN_ONLY_VALUE_FLAGS or (flag in RUN_ONLY_BARE_FLAGS and not inline)):
+            raise ValueError(f"argument {arguments[i]!r} is not one this gate knows how to carry into a listing")
+        i += 1
+    return scope, filters
+
+
+def workflow_lanes(document):
+    """Every filtered nextest command the workflow runs, with its matrix values substituted."""
+    for job_name, job in (document.get("jobs") or {}).items():
+        matrix = (job.get("strategy") or {}).get("matrix") or {}
+        for step in job.get("steps") or []:
+            script = (step.get("run") or "").replace("\\\n", " ")
+            for line in script.splitlines():
+                if "nextest" not in line or line.lstrip().startswith("#"):
+                    continue
+                axes = {axis for axis, _field in MATRIX_FIELD.findall(line)}
+                if len(axes) > 1:
+                    raise ValueError(f"{job_name}: a nextest command templated over {sorted(axes)}")
+                entries = matrix.get(axes.pop()) if axes else [{}]
+                if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
+                    raise ValueError(f"{job_name}: matrix axis is not a list of mappings")
+                for position, entry in enumerate(entries):
+                    concrete = MATRIX_FIELD.sub(lambda m: str(entry[m.group(2)]), line)
+                    if "${{" in concrete:
+                        raise ValueError(f"{job_name}: unresolved template in {concrete!r}")
+                    tokens = shlex.split(concrete, comments=True)
+                    if not any(t.partition("=")[0] in FILTER_FLAGS for t in tokens):
+                        continue
+                    if tokens[:3] != ["cargo", "nextest", "run"]:
+                        raise ValueError(f"{job_name}: a filtered command that is not `cargo nextest run`: {concrete!r}")
+                    scope, filters = lane_scope(tokens[3:])
+                    lane = f"{job_name}/{entry.get('name', step.get('name', position))}"
+                    for expr in filters:
+                        yield lane, scope, expr
+
+
+if not config_specs:
+    fail("NO NEXTEST CONFIG FOUND", "Discovery returned nothing; both workspaces are known to carry one.")
+for spec in config_specs:
+    config, separator, manifest = spec.partition("=")
+    if not separator or not os.path.isfile(config) or not os.path.isfile(manifest):
+        fail(f"CONFIG NOT READ: {spec}", "Expected config=manifest, both existing files.")
+        continue
+    check_nextest_config(config, manifest)
+
+try:
+    with open(workflow, encoding="utf-8") as handle:
+        lanes = list(workflow_lanes(yaml.safe_load(handle)))
+    if not lanes:
+        raise ValueError("no filtered nextest command found; extraction drift?")
+except (OSError, KeyError, ValueError, yaml.YAMLError) as unreadable:
+    lanes = []
+    fail(f"WORKFLOW NOT READ: {workflow}", f"{unreadable}")
+for lane, scope, expr in lanes:
+    check_declaration(f"{workflow} {lane}", scope, expr)
+
+for failure in failures:
+    print(failure, file=sys.stderr)
+if failures:
+    print(f"scripts/check-ci-filter-names.sh --selected: {len(failures)} failure(s).", file=sys.stderr)
+    sys.exit(1)
+print(f"scripts/check-ci-filter-names.sh --selected: clean ({len(evaluations)} nextest evaluations).")
+PY
+fi
+
+if [ "$MODE" != "names" ]; then
+  echo "usage: $0 [--selected]" >&2
+  exit 2
+fi
 
 # `test(...)` names: must appear as a `fn <name>` somewhere in a .rs file ON DISK.
 # --untracked, because a lane's brand-new test file is not in the index yet and a gate that
@@ -134,4 +450,4 @@ if [ "$fail" -ne 0 ]; then
   echo "scripts/check-ci-filter-names.sh: at least one CI filter or package name does not resolve." >&2
   exit 1
 fi
-echo "scripts/check-ci-filter-names.sh: clean."
+echo "scripts/check-ci-filter-names.sh: clean (plain test()/binary() names and package coverage; --selected asks nextest)."

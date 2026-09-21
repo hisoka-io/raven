@@ -239,38 +239,6 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         .map_err(|error| anyhow::anyhow!("chain indexer startup reconciliation: {error}"))?;
     let mut indexer_task = AbortOnDropTask::new(indexer_handle);
 
-    let mirror_config = MirrorConfig {
-        endpoint: opts.mirror_endpoint.clone(),
-        ..MirrorConfig::default()
-    };
-    let mirror = Arc::new(
-        UpstreamPpoiMirror::new(mirror_config)
-            .map_err(|e| anyhow::anyhow!("ppoi mirror constructor: {e}"))?,
-    );
-    let mirror_tx = handle.channels.mirror_tx.clone();
-    let mirror_clone = Arc::clone(&mirror);
-    // Under data_dir so a restart resumes from the post-WAL-replay floor instead of
-    // re-firing `expected list_index N, got 0..N-1`.
-    let mirror_kind = mirror_kind_for_encoder(opts.encoder);
-    let fallback = {
-        let store = handle.logical_store.lock();
-        #[allow(clippy::cast_possible_truncation)]
-        let count = store
-            .ppoi_imt(&list_key.0)
-            .map_or(0u64, |imt| imt.leaf_count() as u64);
-        count
-    };
-    let cursor = MirrorCursor::new(opts.data_dir.clone(), mirror_kind, fallback);
-    let mirror_handle = tokio::spawn(async move {
-        if let Err(e) = mirror_clone
-            .run_worker_with_cursor(list_key, 0, Some(cursor), mirror_tx)
-            .await
-        {
-            tracing::error!(error = %e, "ppoi mirror worker exiting");
-        }
-    });
-    let mut mirror_task = AbortOnDropTask::new(mirror_handle);
-
     let http_config = build_http_config(&opts);
 
     let mut engine: Engine<raven_railgun_engine::inspire::RavenInspireScheme> = Engine::new();
@@ -294,6 +262,48 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     > = std::collections::HashMap::new();
     instance_metrics.insert(handle.instance.id.clone(), Arc::clone(&handle.metrics));
     let app_state = app_state.with_instance_metrics(instance_metrics);
+
+    // After `AppState::new`, so the preflight counts into the recorder it installs.
+    ensure_mirror_preflight_metrics_described();
+    let mirror_config = MirrorConfig {
+        endpoint: opts.mirror_endpoint.clone(),
+        ..MirrorConfig::default()
+    };
+    let mirror = Arc::new(
+        UpstreamPpoiMirror::new(mirror_config)
+            .map_err(|e| anyhow::anyhow!("ppoi mirror constructor: {e}"))?,
+    );
+    let mirror_tx = handle.channels.mirror_tx.clone();
+    let mirror_clone = Arc::clone(&mirror);
+    // Under data_dir so a restart resumes from the post-WAL-replay floor instead of
+    // re-firing `expected list_index N, got 0..N-1`.
+    let mirror_kind = mirror_kind_for_encoder(opts.encoder);
+    let fallback = {
+        let store = handle.logical_store.lock();
+        #[allow(clippy::cast_possible_truncation)]
+        let count = store
+            .ppoi_imt(&list_key.0)
+            .map_or(0u64, |imt| imt.leaf_count() as u64);
+        count
+    };
+    let cursor = MirrorCursor::new(opts.data_dir.clone(), mirror_kind, fallback);
+    // A chain cell serves chain rows whatever the list upstream does.
+    preflight_mirror_upstream(
+        &mirror,
+        &list_key,
+        chain_backed || fallback > 0,
+        "--mirror-endpoint",
+    )
+    .await?;
+    let mirror_handle = tokio::spawn(async move {
+        if let Err(e) = mirror_clone
+            .run_worker_with_cursor(list_key, 0, Some(cursor), mirror_tx)
+            .await
+        {
+            tracing::error!(error = %e, "ppoi mirror worker exiting");
+        }
+    });
+    let mut mirror_task = AbortOnDropTask::new(mirror_handle);
 
     let mut auxiliary_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     auxiliary_tasks.push(app_state.start_session_sweeper(std::time::Duration::from_secs(60)));
@@ -475,15 +485,63 @@ fn parse_hex32(s: &str) -> anyhow::Result<[u8; 32]> {
     Ok(out)
 }
 
+/// Bound on the one request that decides whether the configured upstream can feed the mirror.
+pub const MIRROR_PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Boots that went on to serve local rows past an upstream that failed its preflight.
+pub const MIRROR_PREFLIGHT_FAILED_TOTAL: &str = "raven_railgun_ppoi_mirror_preflight_failed_total";
+
+pub(crate) fn ensure_mirror_preflight_metrics_described() {
+    metrics::describe_counter!(
+        MIRROR_PREFLIGHT_FAILED_TOTAL,
+        metrics::Unit::Count,
+        "Count of PPOI lists whose upstream failed the boot preflight while this node had \
+         rows to serve, so it booted and serves them with no feed. Non-zero means the list \
+         stops advancing until the upstream answers; the boot log names the endpoint and the \
+         failure class."
+    );
+    metrics::counter!(MIRROR_PREFLIGHT_FAILED_TOTAL).increment(0);
+}
+
+/// One bounded request to the configured upstream, refused only when `can_serve_without_it`
+/// is false. The worker warns and retries forever, so this is the one place a node with
+/// nothing to serve can be stopped from booting clean and serving nothing. A node with rows
+/// keeps serving: an upstream outage must not become this node's outage.
+///
+/// Counts into the recorder `AppState::new` installs, so it has to run after that.
+pub(crate) async fn preflight_mirror_upstream(
+    mirror: &raven_railgun_ppoi_mirror::UpstreamPpoiMirror,
+    list: &ListKey,
+    can_serve_without_it: bool,
+    endpoint_setting: &str,
+) -> anyhow::Result<()> {
+    let Err(refusal) = mirror.preflight(list, MIRROR_PREFLIGHT_TIMEOUT).await else {
+        return Ok(());
+    };
+    if !can_serve_without_it {
+        anyhow::bail!(
+            "{refusal}; this node holds no rows for list {} and would serve nothing: fix \
+             {endpoint_setting}",
+            hex::encode(list.0)
+        );
+    }
+    metrics::counter!(MIRROR_PREFLIGHT_FAILED_TOTAL).increment(1);
+    tracing::error!(
+        error = %refusal,
+        list_key = %hex::encode(list.0),
+        "ppoi upstream failed its boot preflight; serving local rows with no feed"
+    );
+    Ok(())
+}
+
 /// Path-projection encoders own the path sidecar; every other kind uses the status
 /// sidecar. The two feeds advance independently, so the wrong sidecar means the wrong
 /// resume cursor after a restart.
 ///
 /// **One derivation, both call sites.** This lived inline in `serve_production_multi.rs`
 /// as well and the two drifted: the multi copy learned `PerListPath10` and this one did
-/// not. No deployment could reach that gap — `parse_encoder_kind` has no `per-list-path10`
-/// arm, so the single-instance path cannot construct one — but a second copy of a routing
-/// decision is the defect whether or not it is currently reachable.
+/// not. Both entry points can construct every variant, so a second copy of this routing
+/// decision is a wrong resume cursor on whichever path it lags.
 pub(crate) fn mirror_kind_for_encoder(
     encoder: raven_railgun_engine::pir_table::EncoderKind,
 ) -> raven_railgun_ppoi_mirror::MirrorKind {

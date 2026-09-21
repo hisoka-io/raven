@@ -125,6 +125,69 @@ fn a_reorg_that_drops_a_shield_blocked_status_must_not_leave_the_row_reading_val
     );
 }
 
+/// The served table is rebuilt from `dirty_shards`, not from the store. A reorg that
+/// drops a `Valid` status changes the row to `Missing`; unless the shard is marked, the
+/// node keeps serving the verdict that authorizes a spend.
+#[test]
+fn a_reorg_that_rolls_back_a_valid_status_marks_its_shard_for_re_encode() {
+    let mut store = LogicalLeafStore::new();
+    let commitment = bc(9);
+
+    apply_wal_entry(
+        &mut store,
+        &WalEntryPayload::PpoiListLeafAdded {
+            list_key: LIST_KEY,
+            list_index: 0,
+            blinded_commitment: commitment,
+            status: SHIELD_BLOCKED,
+            event_type: raven_railgun_persistence::PpoiEventType::Shield,
+            signature: vec![0; 64],
+            validated_merkleroot: [0; 32],
+        },
+        100,
+        &enc(),
+    )
+    .expect("leaf at height 100");
+    apply_wal_entry(
+        &mut store,
+        &WalEntryPayload::PpoiStatus {
+            list_key: LIST_KEY,
+            blinded_commitment: commitment,
+            status: VALID,
+        },
+        200,
+        &enc(),
+    )
+    .expect("status at height 200");
+    assert_eq!(status_byte_of_row(&store, 0), VALID);
+    // The commit that published `Valid`.
+    store.clear_dirty_shards();
+
+    apply_wal_entry(
+        &mut store,
+        &WalEntryPayload::Reorg { height: 150 },
+        150,
+        &enc(),
+    )
+    .expect("reorg to 150");
+    assert_eq!(
+        status_byte_of_row(&store, 0),
+        MISSING,
+        "precondition: the row's bytes changed"
+    );
+
+    let row_shards: std::collections::BTreeSet<u32> = enc()
+        .affected_shards_for_ppoi_leaf(&LIST_KEY, 0)
+        .into_iter()
+        .collect();
+    assert!(!row_shards.is_empty(), "the row lives in some shard");
+    assert!(
+        row_shards.is_subset(store.dirty_shards()),
+        "the rolled-back row's shard {row_shards:?} must be dirty; got {:?}",
+        store.dirty_shards()
+    );
+}
+
 /// A present status still round-trips unchanged.
 #[test]
 fn a_present_status_is_encoded_verbatim() {

@@ -48,11 +48,13 @@ fn test_params() -> InspireParams {
 
 /// Closed form for a seeded query's serialized size under bincode 1.3 legacy fixint.
 ///
-/// `Poly{coeffs: Vec<u64>, moduli: Vec<u64>, q, dim, crt_q0_inv_mod_q1, is_ntt}`
-/// (`crates/inspire/src/math/poly.rs:48-55`) is `8*d*k + 8*k + 41`; a seeded RLWE row adds its
+/// `Poly` serializes as `{coeffs, moduli: Vec<u64>, q, dim, crt_q0_inv_mod_q1, is_ntt}` with
+/// `coeffs` bit-packed at the width of the largest modulus (`pack_coefficients_tight` in
+/// `crates/inspire/src/math/poly.rs`): 60 bits for the `q` every fixture here uses, so it is
+/// `ceil(60*d*k/8) + 8*k + 41`, not 8 bytes per coefficient. A seeded RLWE row adds its
 /// 32-byte seed; the exact fold query carries one row; `ClientPackingKeys` is `ell` polynomials plus
 /// a header, because `z_body` ships empty and `full_key` is false
-/// (`inspiring2.rs:604-629`, `:684-690`). Derivation recorded at `ORCH-JOURNAL.md:2104-2121`.
+/// (`inspiring2.rs:604-629`, `:684-690`).
 ///
 /// Carried as a model rather than a bare constant because it states the property the budget
 /// encodes: a query's size is a function of `ring_dim` and the CRT limb count alone - not of the

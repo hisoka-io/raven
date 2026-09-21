@@ -28,8 +28,8 @@ const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-dedup-encoder-t
 const TOY_ENTRY_SIZE: usize = 256;
 const TOY_ENTRIES_PER_SHARD: u32 = 2048;
 
-fn build_toy_state() -> raven_railgun_core::Result<InspireServerState> {
-    raven_railgun_testkit::try_toy_state(TOY_ENTRY_SIZE)
+fn build_toy_state(config: &InstanceConfig) -> raven_railgun_core::Result<InspireServerState> {
+    raven_railgun_testkit::try_toy_state(config.record_size)
 }
 
 fn ofac_list_key() -> [u8; 32] {
@@ -54,7 +54,8 @@ fn cfg(
         role: InstanceRole::Live,
         data_dir: root.join(sub),
         encoder,
-        record_size: TOY_ENTRY_SIZE,
+        // fixed-layout encoders pin their own row width; a declared 256 is substituted, not served
+        record_size: encoder.effective_record_size(TOY_ENTRY_SIZE),
         entries_per_shard: TOY_ENTRIES_PER_SHARD,
         verification_mode: VerificationMode::UpstreamSignature,
         data_source: ds,
@@ -89,8 +90,8 @@ fn bootstrap_engine_rejects_two_instances_with_identical_data_source_AND_encoder
         ),
     ];
     let params = InspireParams::secure_128_d2048();
-    let factory = |_c: &InstanceConfig| -> raven_railgun_core::Result<InspireServerState> {
-        build_toy_state()
+    let factory = |c: &InstanceConfig| -> raven_railgun_core::Result<InspireServerState> {
+        build_toy_state(c)
     };
     let res = bootstrap_railgun_engine_multi(configs, params, factory);
     let err = res.expect_err("expected dedup rejection");
@@ -130,8 +131,8 @@ async fn bootstrap_railgun_engine_multi_routes_two_ppoi_instances_with_same_list
         ),
     ];
     let params = InspireParams::secure_128_d2048();
-    let factory = |_c: &InstanceConfig| -> raven_railgun_core::Result<InspireServerState> {
-        build_toy_state()
+    let factory = |c: &InstanceConfig| -> raven_railgun_core::Result<InspireServerState> {
+        build_toy_state(c)
     };
     let mh =
         bootstrap_railgun_engine_multi(configs, params, factory).expect("bootstrap should succeed");
@@ -163,8 +164,7 @@ async fn ppoi_route_dispatch_does_not_collide_for_status_and_paths_on_same_list_
     )];
     let params = InspireParams::secure_128_d2048();
     let mut handle =
-        bootstrap_railgun_engine_multi(cfgs, params, |_c: &InstanceConfig| build_toy_state())
-            .expect("bootstrap");
+        bootstrap_railgun_engine_multi(cfgs, params, build_toy_state).expect("bootstrap");
 
     let (tx_status, mut rx_status) = mpsc::channel::<ConsumerEvent>(8);
     let (tx_paths, mut rx_paths) = mpsc::channel::<ConsumerEvent>(8);

@@ -25,6 +25,22 @@ use tokio::sync::oneshot;
 
 const BEARER_TOKEN: &str = "config-file-test-token-padded-long";
 
+/// Every `[[instance]]` the example declares, with its encoder-default k:
+/// per-node 16, per-list-status 4, per-list-path10 16.
+const EXAMPLE_INSTANCES: [(&str, u32); 11] = [
+    ("commit-tree-0", 16),
+    ("commit-tree-1", 16),
+    ("commit-tree-2", 16),
+    ("commit-tree-3", 16),
+    ("ppoi-status-ofac", 4),
+    ("ppoi-paths-ofac-0", 16),
+    ("ppoi-paths-ofac-1", 16),
+    ("ppoi-paths-ofac-2", 16),
+    ("ppoi-paths-ofac-3", 16),
+    ("ppoi-paths-ofac-4", 16),
+    ("ppoi-paths-ofac-5", 16),
+];
+
 #[derive(Debug, Deserialize)]
 struct StatusJson {
     instances: Vec<InstanceJson>,
@@ -73,8 +89,8 @@ async fn six_instance_config_file_boots_and_status_lists_all() {
 
     assert_eq!(
         opts.instances.len(),
-        6,
-        "config should describe 6 instances"
+        EXAMPLE_INSTANCES.len(),
+        "config should describe every example instance"
     );
 
     let listener = tokio::net::TcpListener::bind(bind).await.expect("bind");
@@ -107,34 +123,22 @@ async fn six_instance_config_file_boots_and_status_lists_all() {
         panic!("status never returned 2xx; last_err = {last_err:?}");
     });
 
-    assert_eq!(body.instances.len(), 6, "all 6 instances must be visible");
-    let ids: Vec<&str> = body.instances.iter().map(|i| i.id.as_str()).collect();
-    for expect in [
-        "commit-tree-0",
-        "commit-tree-1",
-        "commit-tree-2",
-        "commit-tree-3",
-        "ppoi-status-ofac",
-        "ppoi-paths-ofac",
-    ] {
-        assert!(
-            ids.iter().any(|id| *id == expect),
-            "missing {expect} in {ids:?}"
-        );
-    }
-
-    // active_k_concurrency defaults per-encoder: PerNode->16, PerListStatus->4, PerListNode->16
+    assert_eq!(
+        body.instances.len(),
+        EXAMPLE_INSTANCES.len(),
+        "every declared instance must be visible"
+    );
     let by_id: std::collections::HashMap<&str, u32> = body
         .instances
         .iter()
         .map(|i| (i.id.as_str(), i.active_k_concurrency))
         .collect();
-    assert_eq!(by_id["commit-tree-0"], 16);
-    assert_eq!(by_id["commit-tree-1"], 16);
-    assert_eq!(by_id["commit-tree-2"], 16);
-    assert_eq!(by_id["commit-tree-3"], 16);
-    assert_eq!(by_id["ppoi-status-ofac"], 4);
-    assert_eq!(by_id["ppoi-paths-ofac"], 16);
+    for (id, k) in EXAMPLE_INSTANCES {
+        let served = by_id
+            .get(id)
+            .unwrap_or_else(|| panic!("missing {id} in {:?}", by_id.keys()));
+        assert_eq!(*served, k, "{id} active_k_concurrency");
+    }
 
     let _ = tx.send(());
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), server).await;

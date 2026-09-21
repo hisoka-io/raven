@@ -3,10 +3,31 @@
   "version": "0.1.0-alpha.0",
   "description": "Drop-in RavenPOINodeInterface for the Railgun wallet stack: PIR-substituted T1 status + T2 PPOI auth-paths + T3 commit-tree auth-paths against a Raven adapter server.",
   "type": "module",
-  "main": "./src/index.ts",
-  "types": "./src/index.ts",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/cjs/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
+    },
+    "./package.json": "./package.json",
+    "./src/*": "./src/*.ts"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
   "license": "Apache-2.0",
   "scripts": {
+    "build": "tsc -p tsconfig.build.cjs.json && tsc -p tsconfig.build.esm.json && node ../scripts/finalize-sdk-build.mjs",
+    "prepack": "npm run build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run --config tests/vitest.config.ts"
   },

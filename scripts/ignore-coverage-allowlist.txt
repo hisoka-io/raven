@@ -1,6 +1,6 @@
 # Ignored tests that run in NO CI lane. Frozen 2026-09-01. Was 42; 11 tests gained a lane when their by-name CI exclusions were removed.
 # scripts/check-ignore-coverage.sh fails if a NEW one appears that is not listed here.
-# Removing a line is always allowed - that means the test gained a lane.
+# A line whose test gains a lane must be removed in that same change; the gate fails on it.
 # Format: <file>::<fn>
 adapters/railgun/engine/benches/cache_carry_bench.rs::swap_state_with_matching_seed_carries_cache_under_50ms
 adapters/railgun/engine/benches/cache_carry_bench.rs::swap_state_with_mismatched_seed_rebuilds_cache_above_baseline
@@ -14,10 +14,12 @@ adapters/railgun/engine/benches/offline_packing_keys_cold_vs_warm_bench.rs::prod
 adapters/railgun/engine/benches/per_encoder_fill_level_sweep_bench.rs::per_insert_wall_time_per_encoder_at_fill_levels
 adapters/railgun/engine/benches/per_insert_wall_time_bench.rs::per_insert_wall_time_per_encoder_at_50pct_fill
 adapters/railgun/engine/benches/snapshot_codec_acceleration_bench.rs::snapshot_codec_acceleration_at_production_cell
-adapters/railgun/engine/src/imt.rs::insert_rejects_overflow_past_capacity
 adapters/railgun/persistence/benches/snapshot_codec_bench.rs::snapshot_codec_bench_bincode_vs_bitcode
 adapters/railgun/persistence/benches/snapshot_zstd_bench.rs::snapshot_zstd_bench_bincode_vs_zstd_l3
 adapters/railgun/persistence/benches/wal_replay_scaling_bench.rs::wal_replay_scales_linearly_at_1k_10k_100k
+# These four are defect pins, not cost-gated tests: their fixture is d=256, p=65536, so
+# gcd(d, p) != 1 and tree-packed extract CANNOT succeed. Giving them a lane makes a
+# permanently red one. The trigger in each reason is a fixture refit, not a filter.
 crates/inspire/src/pir/respond.rs::test_respond_one_packing_correctness
 crates/inspire/src/pir/respond.rs::test_respond_one_packing_small_values
 crates/inspire/tests/e2e_pir.rs::test_e2e_variant_one_packing
@@ -25,7 +27,6 @@ crates/inspire/tests/e2e_pir.rs::test_e2e_variant_two_packing
 crates/inspire/tests/raven_local_patches.rs::commit_d_preset_default_q_passes_smoke_at_2_20_x_256b
 crates/isimplepir/tests/kat_fixtures.rs::update_fixtures
 crates/isimplepir/tests/kat_fixtures.rs::update_row_update_fixtures
-crates/inspire/tests/query_indistinguishability_oracle.rs::same_shard_query_transcript_research_oracle
 
 # --- 2026-09-06: made visible by teaching the census to see untracked files ---
 # These seven were ALWAYS uncovered; a tracked-only census could not see them because they
@@ -49,6 +50,7 @@ crates/inspire/benches/ifma52_throughput_probe.rs::scalar_mulx_throughput_probe
 crates/inspire/benches/packing_offline_simd_bench.rs::bench_prod_cell_131072x32
 crates/inspire/benches/packing_offline_simd_bench.rs::bench_prod_cell_65536x512
 crates/inspire/benches/packing_noise_measurement.rs::packing_noise_distribution
+crates/inspire/benches/packing_noise_measurement.rs::served_post_switch_noise_distribution
 crates/inspire/benches/respond_latency_bench.rs::respond_latency_baseline
 crates/inspire/benches/shoup_microbench.rs::microbench_shoup_pointwise_vs_montgomery
 crates/inspire/benches/shoup_microbench.rs::microbench_shoup_vs_montgomery_forward
@@ -68,3 +70,11 @@ adapters/railgun/engine/src/inspire.rs::mint_frozen_v7_store_fixture
 #  - the reopen probe needs an operator's real data_dir on an operator's filesystem. Its two
 #    self-verification tests DO run in every lane; only the env-var arm is ignored.
 adapters/railgun/engine/tests/data_dir_reopen_probe.rs::the_data_dir_named_by_the_environment_reopens_under_this_binary
+adapters/railgun/engine/tests/logical_store_resident_size.rs::one_retained_clone_costs_this_many_bytes_at_the_served_shape
+
+# The six-block shim coverage round trip seeds five sealed 65,536-row blocks: ~165 s of Poseidon
+# inserts, measured under ci-test. Its own trigger says to run it by hand before the wallet PR is
+# handed over, and the non-ignored two-block test in the same file carries the same properties
+# including an index past 65,536. Promote it to production-cell-closure if the nightly budget can
+# take it -- that lane's filter is an explicit binary list scoped to other packages today.
+adapters/railgun/http/tests/poi_shim_coverage.rs::six_covered_blocks_round_trip_one_commitment_from_each

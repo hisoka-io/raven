@@ -141,7 +141,11 @@ while IFS=$'\t' read -r -u 3 name pkgs flags extra filter; do
   [ "$flags" = "-" ] && flags=""
   [ "$extra" = "-" ] && extra=""
   # shellcheck disable=SC2086
-  out=$(cargo nextest list --manifest-path "$MANIFEST" $pkgs $flags $extra \
+  # `ci.yml:14` sets CARGO_TERM_COLOR: always workflow-wide, and nextest does NOT suppress
+  # colour when stdout is a pipe: measured 30 rows unset, 0 with `always`, 30 with `never`.
+  # Every lane then took the count==0 branch, so this gate has been unconditionally red since
+  # it was added and has never protected anything. Pin it here rather than trusting the env.
+  out=$(cargo nextest list --color never --manifest-path "$MANIFEST" $pkgs $flags $extra \
         --cargo-profile ci-test -E "$filter" 2>&1 < /dev/null)
   rc=$?
   if [ "$rc" -ne 0 ]; then

@@ -114,14 +114,15 @@ mod wasm_only {
         assert_drift_rejected("ring_dim", |p| p.ring_dim = 512);
     }
 
-    /// `q - 2*ring_dim` keeps `q % (2*ring_dim) == 1` and stays under
-    /// `gadget_base^gadget_len`, so the drifted params still pass `validate()` and the
-    /// guard is what rejects them.
+    /// The nearest prime below `DEFAULT_Q` that is `1 mod 2*ring_dim`: it stays under
+    /// `gadget_base^gadget_len` and passes `validate()`, so the guard is what rejects it.
+    /// `q - 2*ring_dim` itself is `9151 * 125_988_580_986_431`, which `validate()` now
+    /// refuses as composite -- a drift fixture must fail the guard, not the precondition.
     #[wasm_bindgen_test]
     fn drift_in_q_is_rejected() {
         assert_drift_rejected("q", |p| {
-            p.q = 1_152_921_504_606_830_081;
-            p.crt_moduli = vec![1_152_921_504_606_830_081];
+            p.q = 1_152_921_504_606_827_009;
+            p.crt_moduli = vec![1_152_921_504_606_827_009];
         });
     }
 
@@ -333,8 +334,8 @@ mod native {
     #[test]
     fn every_drift_fixture_is_itself_valid() {
         let mut q_drift = base_params();
-        q_drift.q = 1_152_921_504_606_830_081;
-        q_drift.crt_moduli = vec![1_152_921_504_606_830_081];
+        q_drift.q = 1_152_921_504_606_827_009;
+        q_drift.crt_moduli = vec![1_152_921_504_606_827_009];
         let mut p_drift = base_params();
         p_drift.p = 65_539;
         let mut sigma_drift = base_params();

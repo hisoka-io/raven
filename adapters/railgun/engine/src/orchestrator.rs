@@ -25,11 +25,11 @@ pub async fn indexer_to_consumer_bridge(
                 event,
                 block_height,
             } => {
-                // The single-instance path has no route table, so the tree filter lives
-                // here. Without it a store receives every tree, and `per-leaf-bc` indexes
-                // rows by `leaf_index` alone - two trees would write the same row and the
-                // higher one would silently win. `None` means a per-list encoder, which
-                // consumes no chain-tree events by shape.
+                // The single-instance path has no route table, so the ingest tree filter
+                // lives here: it keeps foreign-tree events out of the store, WAL and snapshots.
+                // Row correctness does not rest on it: each chain-tree encoder also ignores
+                // trees outside its pin. `None` is a per-list encoder: nothing is dropped,
+                // and the store still applies every chain leaf it is sent.
                 if let (Some(scope), Some(event_tree)) = (chain_tree, event.tree_number()) {
                     if event_tree != scope {
                         tracing::trace!(
@@ -348,14 +348,14 @@ pub enum VerificationMode {
     /// escalated rather than done here: renaming it is a public-API change and a
     /// config-token migration across every deployed instance.
     ///
-    /// **Nothing in this crate checks anything about the upstream feed.** A
-    /// `validatedMerkleroot` byte-identity oracle does exist, but it is elsewhere and
-    /// narrower than it sounds: it lives in `raven-railgun-cli`'s Subsquid bootstrap, it
-    /// is skipped entirely in `SkipOnUnreachable` mode (whose own log line says so), and
-    /// **no runtime append compares anything** — the live mirror path stores the leaf and
-    /// the root side by side without relating them. An earlier version of this comment
-    /// said the root "IS checked on every bootstrap append"; that over-claimed on all
-    /// three counts and was corrected.
+    /// **The root is the one thing this crate checks about the upstream feed.** Every
+    /// `PpoiListLeafAdded` is held, ahead of its WAL write, to the `validatedMerkleroot` it
+    /// carries ([`crate::ppoi_root`]); a divergent row is refused and counted. Two limits:
+    /// a row carrying the all-zero root is applied uncompared (counted separately), and the
+    /// check relates the served tree to the published list without authenticating the
+    /// publisher, who can put a consistent root over any leaves. The second oracle, in
+    /// `raven-railgun-cli`'s Subsquid bootstrap, is skipped entirely in `SkipOnUnreachable`
+    /// mode (whose own log line says so).
     UpstreamSignature,
 }
 
@@ -753,7 +753,7 @@ where
     })
 }
 
-fn hex_lower_32(bytes: &[u8; 32]) -> String {
+pub(crate) fn hex_lower_32(bytes: &[u8; 32]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(64);
     for b in bytes {

@@ -18,7 +18,7 @@ crate-type = ["cdylib", "rlib"]
 workspace = true
 
 [dependencies]
-raven-inspire = { path = "../inspire" }
+raven-inspire = { path = "../inspire", features = ["mod-switch-response"] }
 serde = { workspace = true }
 bincode = { workspace = true }
 thiserror = { workspace = true }

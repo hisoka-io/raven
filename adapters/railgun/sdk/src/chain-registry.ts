@@ -1,5 +1,6 @@
-/** Per-chain routing table mapping `chainId` to adapter URL + bearer token. */
+/** Per-chain routing table mapping `chainId` to adapter URL + credential. */
 
+import { bearerHeaders } from "./bearer-auth";
 import { RavenError } from "./errors";
 import type { StatusBody } from "./events-stream";
 
@@ -8,8 +9,8 @@ export interface ChainRegistryEntry {
   readonly chainId: number;
   /** Base URL of the raven-railgun deployment, no trailing slash. */
   readonly endpoint: string;
-  /** Bearer token used for `Authorization: Bearer <token>` headers. */
-  readonly bearerToken: string;
+  /** Adapter credential; omit for a node that serves its routes without one. */
+  readonly bearerToken?: string;
   /** Oldest epoch across this chain's instances; 0 if unknown. A newest-wins summary would
    * report an instance as current while an older one still serves a superseded snapshot. */
   readonly epoch?: number;
@@ -39,6 +40,8 @@ export class ChainRegistry {
     if (e.endpoint.length === 0) {
       throw RavenError.invalidQuery("ChainRegistry: endpoint must be non-empty");
     }
+    // Validates only: a malformed token fails registration, not the first query.
+    bearerHeaders(e.bearerToken);
     this.entries.set(e.chainId, {
       chainId: e.chainId,
       endpoint: e.endpoint.replace(/\/$/, ""),
@@ -70,11 +73,10 @@ export class ChainRegistry {
   async refresh(chainId: number): Promise<ChainRegistryEntry> {
     const e = this.resolve(chainId);
     const url = `${e.endpoint}/v1/status`;
+    const credential = bearerHeaders(e.bearerToken);
     let res: Response;
     try {
-      res = await this.fetchImpl(url, {
-        headers: { authorization: `Bearer ${e.bearerToken}` },
-      });
+      res = await this.fetchImpl(url, { headers: credential });
     } catch (cause) {
       throw RavenError.network(`ChainRegistry.refresh: network error for chain ${chainId}`, {
         url,

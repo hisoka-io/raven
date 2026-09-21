@@ -10,8 +10,8 @@
     "live_latency_bench.test.ts (1), poseidon_throughput_bench.test.ts (1); CI sets none of their run env vars.",
     "Anything else skipped is a regression, not a policy."
   ],
-  "testFiles": 48,
+  "testFiles": 51,
   "skippedFiles": 4,
-  "passed": 386,
+  "passed": 424,
   "skipped": 22
 }

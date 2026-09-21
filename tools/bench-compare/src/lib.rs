@@ -12,6 +12,14 @@ pub enum Verdict {
     WithinThreshold,
     Improvement,
     Regression,
+    /// A byte count fell below its pinned value. Blocking, because a baseline is a pin and
+    /// not a budget: the only way to tell a real win from a truncated body is to re-pin
+    /// deliberately, and scoring the drop as an improvement is what let a 6.4x regression
+    /// headroom open under a green gate.
+    UnpinnedShrink,
+    /// A measured byte count disagrees with the closed form its own producer emitted beside
+    /// it. Nothing about the comparison is trustworthy after that.
+    DerivationMismatch,
     /// Past the threshold in the worse direction, but the shift could not be separated
     /// from run-to-run noise: no samples, or `p >= alpha`. Reported loudly, never blocking.
     RegressionUnconfirmed,
@@ -20,6 +28,13 @@ pub enum Verdict {
     BaselineMissing,
     CurrentMissing,
 }
+
+/// Suffix on the row carrying the closed-form size a measured byte count must equal.
+///
+/// The producer knows the shape; the differ does not, and must not grow a second copy of
+/// the geometry to check it. Carrying the prediction in the artifact keeps one definition
+/// and still lets this tool refuse a body that does not match its own shape.
+pub const DERIVED_SUFFIX: &str = "_derived";
 
 /// What blocks the build, as distinct from what gets reported.
 ///
@@ -74,7 +89,11 @@ impl Verdict {
     #[must_use]
     pub const fn fails_gate(&self) -> bool {
         match *self {
-            Self::Regression | Self::UnitMismatch | Self::CurrentMissing => true,
+            Self::Regression
+            | Self::UnpinnedShrink
+            | Self::DerivationMismatch
+            | Self::UnitMismatch
+            | Self::CurrentMissing => true,
             Self::RegressionUnconfirmed
             | Self::Identical
             | Self::WithinThreshold
@@ -87,10 +106,14 @@ impl Verdict {
     /// than about its value moving.
     ///
     /// Policy exemptions suppress value movements, never these: excusing a config from the
-    /// performance gate must not also excuse it from producing the measurement at all.
+    /// performance gate must not also excuse it from producing the measurement at all, or
+    /// from producing one that agrees with its own declared shape.
     #[must_use]
     pub const fn is_structural(&self) -> bool {
-        matches!(*self, Self::UnitMismatch | Self::CurrentMissing)
+        matches!(
+            *self,
+            Self::UnitMismatch | Self::CurrentMissing | Self::DerivationMismatch
+        )
     }
 
     /// Why this row failed the gate, for the operator-facing summary.
@@ -98,6 +121,8 @@ impl Verdict {
     pub const fn failure_reason(&self) -> &'static str {
         match *self {
             Self::Regression => "regressed",
+            Self::UnpinnedShrink => "shrank off its pin",
+            Self::DerivationMismatch => "does not match its own closed form",
             Self::UnitMismatch => "changed units",
             Self::CurrentMissing => "missing from this run",
             Self::RegressionUnconfirmed
@@ -183,10 +208,34 @@ pub fn compare_with_alpha(
     for r in &current.results {
         by_name.entry(&r.bench).or_default().1 = Some(r);
     }
-    by_name
+    let mut rows: Vec<Comparison> = by_name
         .into_iter()
         .map(|(n, (b, c))| compare_one(n, b, c, threshold, alpha))
-        .collect()
+        .collect();
+    for row in &mut rows {
+        if row.unit == Unit::Bytes
+            && !row.bench.ends_with(DERIVED_SUFFIX)
+            && (derivation_disagrees(baseline, &row.bench)
+                || derivation_disagrees(current, &row.bench))
+        {
+            row.verdict = Verdict::DerivationMismatch;
+        }
+    }
+    rows
+}
+
+/// Whether `bench` carries a closed-form sibling in `file` that its measured value misses.
+///
+/// Absent sibling means no claim was made, so nothing to contradict. A baseline hand-edited
+/// to a smaller figure keeps the prediction it was produced with, which is what turns a
+/// silent shrink into a refusal.
+fn derivation_disagrees(file: &BenchFile, bench: &str) -> bool {
+    let derived = format!("{bench}{DERIVED_SUFFIX}");
+    let row = |name: &str| file.results.iter().find(|r| r.bench == name);
+    match (row(bench), row(&derived)) {
+        (Some(measured), Some(predicted)) => measured.value != predicted.value,
+        _ => false,
+    }
 }
 
 fn compare_one(
@@ -245,6 +294,11 @@ fn compare_one(
     // Bytes are structurally deterministic: measured 0.000% spread across 13 configs x 3
     // seeds and 8 same-producer seeds. Any movement is a real change, so no threshold and
     // no significance test applies. Timings get both.
+    //
+    // Both directions block. A byte count has no improvement verdict, because at this layer
+    // "smaller" and "truncated" are the same observation: the differ sees two numbers and
+    // nothing about the shape behind them. Blocking forces a deliberate re-pin, which is
+    // where a human decides which of the two it was.
     let exact = c.unit == Unit::Bytes;
     let verdict = if b.value == c.value {
         Verdict::Identical
@@ -252,7 +306,7 @@ fn compare_one(
         if worse {
             Verdict::Regression
         } else {
-            Verdict::Improvement
+            Verdict::UnpinnedShrink
         }
     } else if delta_pct.abs() <= threshold {
         Verdict::WithinThreshold
@@ -469,6 +523,8 @@ pub fn render_human_with_policy(
             Verdict::WithinThreshold => "within thresh",
             Verdict::Improvement => "IMPROVEMENT",
             Verdict::Regression => "REGRESSION",
+            Verdict::UnpinnedShrink => "SHRANK: re-pin",
+            Verdict::DerivationMismatch => "NOT ITS SHAPE",
             Verdict::BaselineMissing => "BASELINE MISSING",
             Verdict::CurrentMissing => "CURRENT MISSING",
             Verdict::RegressionUnconfirmed => "noise? (unconfirmed)",
@@ -550,14 +606,17 @@ fn format_ns(ns: f64) -> String {
     }
 }
 
+/// Keeps the TAIL. Bench keys are `<scheme>/<cell>/<metric>` and the scheme slug alone
+/// overruns the column, so a head-first cut printed every row of a cell identically - at the
+/// one moment this gate can fail, nothing on screen said which measurement moved.
 fn truncate(s: &str, width: usize) -> String {
-    if s.len() <= width {
-        s.to_string()
-    } else {
-        let mut t = s[..width.saturating_sub(1)].to_string();
-        t.push('~');
-        t
+    let len = s.chars().count();
+    if len <= width {
+        return s.to_owned();
     }
+    let keep = width.saturating_sub(1);
+    let tail: String = s.chars().skip(len - keep).collect();
+    format!("~{tail}")
 }
 
 pub fn has_regression(rows: &[Comparison]) -> bool {
@@ -579,6 +638,11 @@ pub fn has_regression_with_policy(rows: &[Comparison], policy: &GatePolicy) -> b
 
 #[cfg(test)]
 mod welch_tests {
+    #![allow(
+        clippy::expect_used,
+        reason = "a test asserts by failing; the message is the diagnostic"
+    )]
+
     use super::*;
 
     // n=3 vs n=3, mean diff = 1 sample-sigma. df=4, t=sqrt(3/2).
@@ -638,6 +702,11 @@ mod welch_tests {
 
 #[cfg(test)]
 mod unit_direction_tests {
+    #![allow(
+        clippy::expect_used,
+        reason = "a test asserts by failing; the message is the diagnostic"
+    )]
+
     use super::*;
 
     fn result(bench: &str, value: f64, unit: Unit) -> BenchResult {
@@ -808,6 +877,142 @@ mod unit_direction_tests {
         assert!(
             has_regression_with_policy(&rows, &GatePolicy::default()),
             "and without the exclusion it would have blocked, so the test is not vacuous"
+        );
+    }
+
+    /// The hole this gate shipped with: a baseline six times the real figure scored
+    /// IMPROVEMENT and exited 0, so ~83 KB of regression headroom sat under a green gate and
+    /// nobody was ever forced to re-pin.
+    #[test]
+    fn a_byte_count_that_fell_below_its_pin_blocks_until_it_is_re_pinned() {
+        let base = file(vec![result("q_bytes", 98_840.0, Unit::Bytes)]);
+        let cur = file(vec![result("q_bytes", 15_491.0, Unit::Bytes)]);
+        let rows = compare(&base, &cur, 0.20);
+        assert_eq!(
+            rows[0].verdict,
+            Verdict::UnpinnedShrink,
+            "got {:?}",
+            rows[0]
+        );
+        assert!(
+            has_regression(&rows),
+            "a byte count that walked away from its pin must block, whichever direction"
+        );
+    }
+
+    /// And the re-pin that follows must pass, or the gate is simply un-passable.
+    #[test]
+    fn a_re_pinned_byte_count_passes() {
+        let base = file(vec![result("q_bytes", 15_491.0, Unit::Bytes)]);
+        let cur = file(vec![result("q_bytes", 15_491.0, Unit::Bytes)]);
+        let rows = compare(&base, &cur, 0.20);
+        assert_eq!(rows[0].verdict, Verdict::Identical);
+        assert!(!has_regression(&rows));
+    }
+
+    /// A shrink is only readable as a win when the shape says so, and the shape rides in the
+    /// artifact. This is the truncation case: same pin on both sides is not required - what
+    /// is required is that the body match the size its own declared shape predicts.
+    #[test]
+    fn a_body_shorter_than_its_own_closed_form_is_refused() {
+        let derivable = |measured: f64| {
+            file(vec![
+                result("r_bytes", measured, Unit::Bytes),
+                result("r_bytes_derived", 9_366.0, Unit::Bytes),
+            ])
+        };
+        let base = derivable(9_366.0);
+        let truncated = derivable(9_000.0);
+        let rows = compare(&base, &truncated, 0.20);
+        let measured = rows
+            .iter()
+            .find(|r| r.bench == "r_bytes")
+            .expect("measured row");
+        assert_eq!(measured.verdict, Verdict::DerivationMismatch);
+        assert!(
+            has_regression(&rows),
+            "a body that does not match its own shape must block"
+        );
+    }
+
+    /// The same rule pointed at the baseline: a pin hand-edited downward keeps the
+    /// prediction it was produced with, and the disagreement is the finding.
+    #[test]
+    fn a_baseline_edited_away_from_its_closed_form_is_refused() {
+        let base = file(vec![
+            result("r_bytes", 4_000.0, Unit::Bytes),
+            result("r_bytes_derived", 9_366.0, Unit::Bytes),
+        ]);
+        let cur = file(vec![
+            result("r_bytes", 9_366.0, Unit::Bytes),
+            result("r_bytes_derived", 9_366.0, Unit::Bytes),
+        ]);
+        let rows = compare(&base, &cur, 0.20);
+        let measured = rows
+            .iter()
+            .find(|r| r.bench == "r_bytes")
+            .expect("measured row");
+        assert_eq!(measured.verdict, Verdict::DerivationMismatch);
+        assert!(has_regression(&rows));
+    }
+
+    /// A derivation failure is structural: exempting a config from the performance gate must
+    /// not also exempt it from agreeing with itself.
+    #[test]
+    fn a_non_blocking_pattern_does_not_excuse_a_derivation_mismatch() {
+        let rows = compare(
+            &file(vec![
+                result("s/2e16x512-k4/r_bytes", 9_366.0, Unit::Bytes),
+                result("s/2e16x512-k4/r_bytes_derived", 9_366.0, Unit::Bytes),
+            ]),
+            &file(vec![
+                result("s/2e16x512-k4/r_bytes", 9_000.0, Unit::Bytes),
+                result("s/2e16x512-k4/r_bytes_derived", 9_366.0, Unit::Bytes),
+            ]),
+            0.20,
+        );
+        let policy = GatePolicy {
+            non_blocking: vec!["-k4/".to_owned()],
+            ..GatePolicy::default()
+        };
+        assert!(has_regression_with_policy(&rows, &policy));
+    }
+
+    /// A metric with no prediction beside it makes no claim, so there is nothing to
+    /// contradict. Without this the rule would red every pre-derivation artifact on disk.
+    #[test]
+    fn a_byte_row_with_no_closed_form_beside_it_is_judged_on_its_pin_alone() {
+        let base = file(vec![result("hint_bytes", 0.0, Unit::Bytes)]);
+        let cur = file(vec![result("hint_bytes", 0.0, Unit::Bytes)]);
+        let rows = compare(&base, &cur, 0.20);
+        assert_eq!(rows[0].verdict, Verdict::Identical);
+        assert!(!has_regression(&rows));
+    }
+
+    /// The failing row has to be identifiable. Every key here shares a 60-character scheme
+    /// slug, and a head-first cut printed all of them as the same string.
+    #[test]
+    fn the_rendered_row_names_the_metric_that_moved() {
+        let key = |m: &str| {
+            format!("inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/{m}")
+        };
+        let base = file(vec![
+            result(&key("query_bytes"), 15_491.0, Unit::Bytes),
+            result(&key("response_bytes"), 9_366.0, Unit::Bytes),
+        ]);
+        let cur = file(vec![
+            result(&key("query_bytes"), 15_491.0, Unit::Bytes),
+            result(&key("response_bytes"), 9_000.0, Unit::Bytes),
+        ]);
+        let rows = compare(&base, &cur, 0.20);
+        let rendered = render_human("base", "cur", 0.20, &rows);
+        assert!(
+            rendered.contains("response_bytes"),
+            "the moved metric must survive the column width; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("query_bytes"),
+            "and so must the one that held; got:\n{rendered}"
         );
     }
 

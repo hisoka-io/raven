@@ -18,7 +18,7 @@ pub enum PpoiEventType {
 pub struct PpoiEventMetadata {
     /// Upstream event kind.
     pub event_type: PpoiEventType,
-    /// Upstream 64-byte ed25519 signature.
+    /// Upstream 64-byte ed25519 signature. Carried, never verified.
     pub signature: Vec<u8>,
     /// Upstream root after appending the leaf.
     pub validated_merkleroot: [u8; 32],
@@ -58,7 +58,7 @@ pub enum WalEntryPayload {
         status: u8,
         /// Upstream event kind.
         event_type: PpoiEventType,
-        /// Upstream 64-byte ed25519 signature.
+        /// Upstream 64-byte ed25519 signature. Carried, never verified.
         signature: Vec<u8>,
         /// Upstream root after appending this leaf.
         validated_merkleroot: [u8; 32],

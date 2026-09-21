@@ -1,5 +1,10 @@
 //! Integration tests for the `bench-compare` CLI.
 
+#![allow(
+    clippy::expect_used,
+    reason = "a test asserts by failing; the message is the diagnostic"
+)]
+
 use assert_cmd::Command;
 use predicates::str::contains;
 use std::fs;

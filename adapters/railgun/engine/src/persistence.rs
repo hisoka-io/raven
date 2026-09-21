@@ -1210,6 +1210,7 @@ pub async fn run_consumer_task(
     use raven_railgun_persistence::WalEntryPayload;
 
     ensure_layer2_metrics_described();
+    crate::ppoi_root::ensure_metrics_described();
 
     // Seed from the manifest so an idle instance does not reset its resume floor.
     {
@@ -1217,6 +1218,16 @@ pub async fn run_consumer_task(
         if m.last_applied_leaf_block == 0 {
             m.last_applied_leaf_block = persistence.manifest_block_height();
         }
+    }
+
+    // Seed the addenda from the recovered tree before the first query. Without this the table is
+    // empty until the first commit fires -- up to 1000 appends or 300 s -- and every path query in
+    // that window would be refused for a skew that does not exist.
+    {
+        let snapshot = instance.current_snapshot();
+        let entries_per_shard = encoder.entries_per_shard();
+        let mut store = logical_store.lock();
+        store.refresh_committed_addenda(&snapshot.state.encoded_db, entries_per_shard);
     }
 
     let mut verifier_state = verifier_ctx.map(|ctx| {
@@ -1824,6 +1835,16 @@ fn drive_commit(
     }
 
     publish_recommitted_state(instance, &derived_from, &current, &new_db, height)?;
+
+    // Derive the upper-sibling addenda from the tree this state was encoded from, recorded against
+    // the encoded database just published. The consumer is the sole writer for this instance and is inside
+    // this function, so no append can interleave and the pair is consistent by construction.
+    {
+        let snapshot = instance.current_snapshot();
+        let entries_per_shard = encoder.entries_per_shard();
+        let mut store = logical_store.lock();
+        store.refresh_committed_addenda(&snapshot.state.encoded_db, entries_per_shard);
+    }
 
     let snapshot_state = instance.current_state();
     // Snapshot the store under-lock so it restores atomically with the state.

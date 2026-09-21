@@ -33,12 +33,13 @@ use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, ShardConfig};
 use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::{
-    extract_inspiring, ClientSession, ClientState, PackingMode, SeededClientQuery, ServerCrs,
-    ServerResponse, SessionResidue,
+    ClientSession, ClientState, PackingMode, SeededClientQuery, ServerCrs, ServerResponse,
+    SessionResidue,
 };
+use raven_inspire_client_wasm::extract_response_rust;
 
 const WIRE_SCHEMA_PREFIX_LEN: usize = 2;
-const WIRE_SCHEMA_VERSION: u16 = 7;
+const WIRE_SCHEMA_VERSION: u16 = 8;
 const KEY_SEED: [u8; 32] = *b"raven-native-live-replay-key-001";
 const NOISE_SEED: [u8; 32] = *b"raven-native-live-replay-noise01";
 
@@ -148,7 +149,7 @@ fn extract(work_dir: &Path, response_path: &Path) {
         &fs::read(work_dir.join("client_state.bin")).expect("read client_state.bin"),
     )
     .expect("decode ClientState");
-    // `rlwe_secret_key` is `#[serde(skip)]`; extract_inspiring reads it.
+    // `rlwe_secret_key` is `#[serde(skip)]`; extraction reads it.
     client_state.rlwe_secret_key = session.rlwe_secret_key().clone();
 
     let raw =
@@ -175,7 +176,7 @@ fn extract_response(
     response: &ServerResponse,
     entry_size: usize,
 ) -> Vec<u8> {
-    extract_inspiring(crs, client_state, response, entry_size).expect("extract_inspiring")
+    extract_response_rust(crs, client_state, response, entry_size).expect("extract_response_rust")
 }
 
 fn main() {

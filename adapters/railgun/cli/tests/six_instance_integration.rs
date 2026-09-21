@@ -430,7 +430,11 @@ async fn wait_for_apply(view: &BootstrapView, deadline_secs: u64) {
                 }
                 DataSourceFilter::PpoiList(lk) => {
                     let store = inst.logical_store.lock();
-                    if store.ppoi_list_leaves_iter(&lk).next().is_none() {
+                    // The leaf lands with status 0; the list's last driven event sets it non-zero.
+                    if store
+                        .ppoi_status_at(&lk, 0)
+                        .is_none_or(|status| status == 0)
+                    {
                         all_ready = false;
                         break;
                     }
@@ -493,7 +497,7 @@ async fn six_instance_bootstrap_serves_status_for_all_six() {
         "commit-tree-2",
         "commit-tree-3",
         "ppoi-status-ofac",
-        "ppoi-paths-ofac",
+        "ppoi-paths-ofac-0",
     ] {
         assert!(
             ids.iter().any(|id| *id == expect),
@@ -502,7 +506,7 @@ async fn six_instance_bootstrap_serves_status_for_all_six() {
     }
 
     // End-to-end status-wire pin of the resolved per-encoder k defaults:
-    // PerNode -> 16, PerListStatus -> 4, PerListNode -> 16.
+    // PerNode -> 16, PerListStatus -> 4, PerListPath10 -> 16.
     let k_for = |id: &str| {
         body.instances
             .iter()
@@ -515,7 +519,7 @@ async fn six_instance_bootstrap_serves_status_for_all_six() {
     assert_eq!(k_for("commit-tree-2"), 16);
     assert_eq!(k_for("commit-tree-3"), 16);
     assert_eq!(k_for("ppoi-status-ofac"), 4);
-    assert_eq!(k_for("ppoi-paths-ofac"), 16);
+    assert_eq!(k_for("ppoi-paths-ofac-0"), 16);
 
     assert_eq!(view.instances.len(), 6);
     let label_for = |id: &str| find_inst(&view, id).encoder_label;
@@ -524,7 +528,7 @@ async fn six_instance_bootstrap_serves_status_for_all_six() {
     assert_eq!(label_for("commit-tree-2"), "per-node");
     assert_eq!(label_for("commit-tree-3"), "per-node");
     assert_eq!(label_for("ppoi-status-ofac"), "per-list-status");
-    assert_eq!(label_for("ppoi-paths-ofac"), "per-list-node");
+    assert_eq!(label_for("ppoi-paths-ofac-0"), "per-list-path10");
 
     shutdown(stop, server).await.expect("graceful shutdown");
 }

@@ -23,10 +23,10 @@ use rand::RngCore;
 use raven_inspire::inspiring::PackParams;
 use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, ShardConfig};
+use raven_inspire::pir::mod_switch::{extract_inspiring_mod_switched, MOD_SWITCH_TARGET_36BIT};
 use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::{
-    extract_two_packing, ClientSession, ClientState, SeededClientQuery, ServerCrs, ServerResponse,
-    SessionResidue,
+    ClientSession, ClientState, SeededClientQuery, ServerCrs, ServerResponse, SessionResidue,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -307,7 +307,7 @@ fn decode_validated_shard_config(
 }
 
 // Adapter HTTP envelope version; parity-gated here to avoid a framework-to-transport dependency.
-const SESSION_WIRE_SCHEMA_VERSION: u16 = 7;
+const SESSION_WIRE_SCHEMA_VERSION: u16 = 8;
 
 fn decode<T: for<'de> Deserialize<'de>>(
     bytes: &[u8],
@@ -761,8 +761,9 @@ pub fn build_padded_batch(
     Ok(encode(&output, "wasm_padded_batch_output")?)
 }
 
-/// Decode a server response to plaintext row bytes, dispatching on the server's
-/// declared packing mode.
+/// Decode a server response to plaintext row bytes. The response names its own
+/// ciphertext modulus: it is either unswitched, on the CRS's limbs, or on the one
+/// served mod-switch rung. Anything else is refused before it is decrypted under.
 ///
 /// `client_state_bincode` is the [`build_seeded_query`] output. Its
 /// `rlwe_secret_key` is `#[serde(skip)]`, so it arrives default-built (empty
@@ -782,14 +783,40 @@ pub fn extract_response(
     client_state.rlwe_secret_key = session.inner.rlwe_secret_key().clone();
     let response: ServerResponse = decode(response_bytes, "server_response")?;
     let entry_size = entry_size_against_session(entry_size as usize, session)?;
-    let plaintext =
-        extract_two_packing(&crs, &client_state, &response, entry_size).map_err(|e| {
-            WasmClientError::Inspire {
-                op: "extract_two_packing",
-                detail: e.to_string(),
-            }
+    refuse_unserved_modulus(&crs, &response)?;
+    let plaintext = extract_inspiring_mod_switched(&crs, &client_state, &response, entry_size)
+        .map_err(|e| WasmClientError::Inspire {
+            op: "extract_inspiring_mod_switched",
+            detail: e.to_string(),
         })?;
     Ok(plaintext)
+}
+
+/// The modulus is the server's to declare and the client's to recognise. The extractor
+/// also decrypts under targets no server here serves; a client that accepted those would
+/// take more than one layout for one schema.
+fn refuse_unserved_modulus(
+    crs: &ServerCrs,
+    response: &ServerResponse,
+) -> Result<(), WasmClientError> {
+    let ciphertext = &response.ciphertext;
+    let crs_moduli = crs.params.moduli();
+    let unswitched = ciphertext.a.moduli() == crs_moduli && ciphertext.b.moduli() == crs_moduli;
+    let served_rung = [ciphertext.a.moduli(), ciphertext.b.moduli()]
+        .iter()
+        .all(|moduli| *moduli == [MOD_SWITCH_TARGET_36BIT]);
+    if unswitched || served_rung {
+        return Ok(());
+    }
+    Err(WasmClientError::Decode {
+        what: "server_response",
+        detail: format!(
+            "response modulus {} over {} limb(s) is neither this session's modulus nor the \
+             served mod-switch target",
+            ciphertext.modulus(),
+            ciphertext.a.crt_count().max(ciphertext.b.crt_count()),
+        ),
+    })
 }
 
 /// Reject an `entry_size` the session's ring cannot have encoded.
@@ -1515,7 +1542,9 @@ pub fn extract_response_rust(
     entry_size: usize,
 ) -> Result<Vec<u8>, String> {
     let entry_size = checked_entry_size(entry_size, crs.ring_dim()).map_err(|e| e.to_string())?;
-    extract_two_packing(crs, client_state, response, entry_size).map_err(|e| e.to_string())
+    refuse_unserved_modulus(crs, response).map_err(|e| e.to_string())?;
+    extract_inspiring_mod_switched(crs, client_state, response, entry_size)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

@@ -28,6 +28,7 @@ use serde::Deserialize;
 
 /// Optional `[auto_spawn]` TOML section.
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AutoSpawnConfigToml {
     #[serde(default)]
     pub enabled: bool,
@@ -59,6 +60,7 @@ fn default_auto_spawn_entry_bytes() -> usize {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConfigFile {
     global: GlobalSection,
     #[serde(default)]
@@ -75,6 +77,7 @@ struct ConfigFile {
 
 /// One `[[ppoi_list_template]]` row.
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PpoiListTemplateToml {
     pub template_id: String,
     pub list_key: String,
@@ -93,6 +96,7 @@ pub struct PpoiListTemplateToml {
 
 /// One `[[instance_template]]` row.
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct InstanceTemplateToml {
     pub template_id: String,
     pub encoder: String,
@@ -124,6 +128,7 @@ fn default_snapshot_policy_label() -> String {
 
 /// Optional `[rpc_pool]` TOML section.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RpcPoolConfigToml {
     pub urls: Vec<String>,
     #[serde(default = "default_pool_strategy")]
@@ -169,6 +174,7 @@ impl From<PoolStrategyString> for raven_railgun_indexer::rpc_pool::PoolStrategy 
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GlobalSection {
     bind: SocketAddr,
     /// Mutually exclusive with `token_file` and [`BEARER_TOKEN_ENV`]; forces a
@@ -239,6 +245,7 @@ struct GlobalSection {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InstanceSection {
     id: String,
     role: RoleString,
@@ -308,7 +315,7 @@ impl From<VerificationModeString> for VerificationMode {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 enum DataSourceSection {
     Indexer {
         filter: IndexerFilterSection,
@@ -317,13 +324,15 @@ enum DataSourceSection {
         list_key: String,
         #[serde(default)]
         block: Option<u32>,
+        /// Names the mirror feed. The feed is derived from the encoder, so this is a
+        /// cross-check: a value the encoder does not consume is refused.
         #[serde(default)]
-        #[allow(dead_code)]
         what: Option<String>,
     },
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IndexerFilterSection {
     tree_number: u32,
 }
@@ -452,6 +461,7 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         let data_source = build_data_source(&raw.data_source)?;
         enforce_verification_mode_matches_data_source(&data_source, verification_mode)?;
         enforce_encoder_matches_data_source(encoder, &data_source)?;
+        enforce_mirror_feed_matches_encoder(&raw.id, &raw.data_source, encoder)?;
         let snapshot_policy = match role {
             InstanceRole::Static => SnapshotPolicy::static_default(),
             _ => SnapshotPolicy::default(),
@@ -852,6 +862,31 @@ fn enforce_encoder_matches_data_source(
     }
 }
 
+fn enforce_mirror_feed_matches_encoder(
+    instance_id: &str,
+    section: &DataSourceSection,
+    encoder: EncoderKind,
+) -> anyhow::Result<()> {
+    let DataSourceSection::Mirror {
+        what: Some(what), ..
+    } = section
+    else {
+        return Ok(());
+    };
+    let consumed = match crate::serve_production::mirror_kind_for_encoder(encoder) {
+        raven_railgun_ppoi_mirror::MirrorKind::Status => "status",
+        raven_railgun_ppoi_mirror::MirrorKind::Path => "path",
+    };
+    anyhow::ensure!(
+        what == consumed,
+        "[[instance]] id={instance_id:?} sets data_source.what = {what:?}, but encoder {} \
+         consumes the {consumed:?} mirror feed and the feed follows the encoder. Operator: \
+         set what = {consumed:?} or remove the key.",
+        encoder.label()
+    );
+    Ok(())
+}
+
 fn parse_hex32(s: &str) -> anyhow::Result<[u8; 32]> {
     let trimmed = s.strip_prefix("0x").unwrap_or(s);
     if trimmed.len() != 64 {
@@ -1060,17 +1095,18 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
             .await?,
         )
     };
-    let mirror_workers = if opts.skip_mirror_workers {
-        None
-    } else {
-        Some(spawn_mirror_workers(&opts, &bootstrap.handles)?)
-    };
-
     let http_config = build_http_config(&opts);
 
     let app_state = AppState::new(engine, http_config)
         .map_err(|e| anyhow::anyhow!("AppState::new: {e}"))?
         .require_consumer_metrics();
+
+    // After `AppState::new`, so the preflight counts into the recorder it installs.
+    let mirror_workers = if opts.skip_mirror_workers {
+        None
+    } else {
+        Some(spawn_mirror_workers(&opts, &bootstrap.handles).await?)
+    };
 
     // Retained so shutdown can drain auto-spawned consumers; else they skip the
     // final WAL flush.
@@ -1185,6 +1221,19 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         })
         .collect();
     let app_state = app_state.with_instance_logical_stores(instance_logical_stores);
+    // Every instance, tagged with the filter it was configured with. The shim routes prove
+    // coverage against these rather than reaching a store directly; installing the registry
+    // at all is what puts the undeclared single-store path out of production's reach.
+    let shim_declarations: Vec<(
+        DataSourceFilter,
+        Arc<parking_lot::Mutex<raven_railgun_engine::inspire::LogicalLeafStore>>,
+    )> = bootstrap
+        .handles
+        .instances
+        .iter()
+        .map(|handle| (handle.config.data_source, Arc::clone(&handle.logical_store)))
+        .collect();
+    let app_state = app_state.with_shim_stores(shim_declarations);
     let app_state = if let Some(pool) = chain_workers
         .as_ref()
         .and_then(|w| w.rpc_pool.as_ref())
@@ -2325,7 +2374,7 @@ struct MirrorWorkers {
     handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
-fn spawn_mirror_workers(
+async fn spawn_mirror_workers(
     opts: &MultiServeOptions,
     handle: &MultiOrchestratorHandle,
 ) -> anyhow::Result<MirrorWorkers> {
@@ -2340,7 +2389,29 @@ fn spawn_mirror_workers(
             .map_err(|e| anyhow::anyhow!("ppoi mirror constructor: {e}"))?,
     );
     let mirror_tx = handle.channels.mirror_tx.clone();
+    crate::serve_production::ensure_mirror_preflight_metrics_described();
 
+    // "Nothing to serve" is a property of the LIST, not of the instance the worker runs on:
+    // the shipped topology keeps a list's path rows under block instances beside a status
+    // instance whose own count reads zero.
+    let mut lists_with_rows = std::collections::BTreeSet::new();
+    for inst in &handle.instances {
+        let list_key = match inst.config.data_source {
+            DataSourceFilter::PpoiList(list_key)
+            | DataSourceFilter::PpoiListBlock { list_key, .. } => list_key,
+            DataSourceFilter::ChainTreeNumber(_) => continue,
+        };
+        let rows = inst
+            .logical_store
+            .lock()
+            .ppoi_imt(&list_key)
+            .map_or(0, raven_railgun_engine::imt::Imt::leaf_count);
+        if rows > 0 {
+            lists_with_rows.insert(list_key);
+        }
+    }
+
+    let mut preflighted = std::collections::BTreeSet::new();
     let mut handles = Vec::new();
     for inst in &handle.instances {
         if let DataSourceFilter::PpoiList(list_key) = inst.config.data_source {
@@ -2357,6 +2428,15 @@ fn spawn_mirror_workers(
                     .map_or(0u64, |imt| imt.leaf_count() as u64);
                 count
             };
+            if preflighted.insert(list_key) {
+                crate::serve_production::preflight_mirror_upstream(
+                    &mirror,
+                    &ListKey(list_key),
+                    lists_with_rows.contains(&list_key),
+                    "[global].mirror_endpoint",
+                )
+                .await?;
+            }
             let cursor = MirrorCursor::new(inst.config.data_dir.clone(), kind, fallback);
             let h = tokio::spawn(async move {
                 if let Err(e) = mirror_clone

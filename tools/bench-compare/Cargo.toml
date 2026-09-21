@@ -21,6 +21,19 @@ publish = false
 [dependencies.raven-bench]
 path = "../../benches/raven-bench"
 
+# The root workspace's floor, restated rather than inherited: this manifest is outside that
+# workspace, and the tool that decides whether the byte gate fires is held to the same bar as
+# the code it gates. Only the test modules need an exemption.
+[lints.rust]
+unsafe_code = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
 [lib]
 name = "bench_compare"
 path = "src/lib.rs"

@@ -155,9 +155,9 @@ fn transact_in(tree_number: u32, leaf_index: u32) -> RailgunEvent {
     }
 }
 
-/// The single-instance path has no route table, so the bridge is where the tree scope is
-/// enforced. Without it a `per-leaf-bc` store receives every tree and, because rows are
-/// indexed by `leaf_index` alone, the higher tree silently overwrites the lower one's row.
+/// The single-instance path has no route table, so the bridge is where ingest is scoped
+/// to a tree. Without it a chain-tree store applies and persists every tree; the served
+/// rows stay correct only because each encoder also ignores trees outside its pin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_bridge_drops_chain_events_for_other_trees() {
     let (idx_tx, idx_rx) = mpsc::channel::<IndexerMessage>(8);
@@ -190,8 +190,8 @@ async fn the_bridge_drops_chain_events_for_other_trees() {
     let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
 }
 
-/// `None` means a per-list encoder, which consumes no chain-tree events by shape; the
-/// bridge must not start dropping everything in that case.
+/// `None` is a per-list encoder: the bridge scopes nothing and forwards every tree. The
+/// encoder dirties no shard for a chain leaf, but the store behind it still applies one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unscoped_bridge_still_forwards_every_tree() {
     let (idx_tx, idx_rx) = mpsc::channel::<IndexerMessage>(8);

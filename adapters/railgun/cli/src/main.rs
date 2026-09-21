@@ -113,7 +113,8 @@ enum Commands {
         /// PIR cell record width in bytes.
         #[arg(long, default_value_t = raven_railgun_cli::serve_production::DEFAULT_PRODUCTION_ENTRY_BYTES)]
         entry_bytes: usize,
-        /// Per-instance encoder label (per-leaf-bc, per-leaf-path, per-node, per-list-status, per-list-path).
+        /// Per-instance encoder label (per-leaf-bc, per-leaf-path, per-node, per-list-status,
+        /// per-list-path, per-list-path10, per-list-node).
         #[arg(long, default_value = "per-leaf-bc")]
         encoder: String,
         /// Tree this instance's chain encoder is pinned to (ignored for per-list-* variants).
@@ -321,7 +322,8 @@ enum Commands {
         /// On-disk data directory for the instance to migrate.
         #[arg(long)]
         data_dir: std::path::PathBuf,
-        /// Target encoder label (per-leaf-bc, per-leaf-path, per-node, per-list-status, per-list-path, per-list-node).
+        /// Target encoder label (per-leaf-bc, per-leaf-path, per-node, per-list-status,
+        /// per-list-path, per-list-path10, per-list-node).
         #[arg(long)]
         to: String,
         /// Tree number (required for per-node and per-leaf-path).
@@ -652,13 +654,16 @@ fn parse_encoder_kind(
         "per-list-path" => Ok(EncoderKind::PerListPath {
             list_key: parse_list_key(list_key)?,
         }),
+        "per-list-path10" => Ok(EncoderKind::PerListPath10 {
+            list_key: parse_list_key(list_key)?,
+        }),
         "per-list-node" => Ok(EncoderKind::PerListNode {
             list_key: parse_list_key(list_key)?,
         }),
         other => anyhow::bail!(
             "unknown --encoder {other}; expected one of \
              per-leaf-bc | per-leaf-path | per-node | \
-             per-list-status | per-list-path | per-list-node"
+             per-list-status | per-list-path | per-list-path10 | per-list-node"
         ),
     }
 }

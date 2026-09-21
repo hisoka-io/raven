@@ -6,6 +6,85 @@
 # see part of its own input is worse than no gate; that is why this selftest exists.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+
+# `--selected` asks nextest, so it is proven where the test binaries are built, not in the hygiene
+# job. It reads copies through FILTER_GATE_*: nothing tracked is mutated on this path.
+if [ "${1:-}" = "--selected" ]; then
+  scratch=$(mktemp -d)
+  trap 'rm -rf "$scratch"' EXIT
+  adapter=adapters/railgun/.config/nextest.toml
+  real_configs=".config/nextest.toml=Cargo.toml ${adapter}=adapters/railgun/Cargo.toml"
+  fails=0
+
+  # One red run carries all four plants - each gate run lists every binary ~40 times - and each
+  # headline is asserted by itself, so one check going quiet cannot hide behind the other three.
+  sed 's/^\[test-groups\]$/[test-groups]\nplanted-empty-group = { max-threads = 1 }/' "$adapter" \
+    > "$scratch/nextest.toml"
+  cat >> "$scratch/nextest.toml" <<'PLANT'
+
+[[profile.default.overrides]]
+filter = "test(/no_such_test_planted/)"
+retries = 0
+PLANT
+  cp .github/workflows/ci.yml "$scratch/ci.yml"
+  cat >> "$scratch/ci.yml" <<'PLANT'
+  planted-dead-regex-term:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo nextest run --manifest-path adapters/railgun/Cargo.toml --cargo-profile ci-test -E 'test(/./) + test(/no_such_test_planted/)'
+  planted-shell-variable-filter:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo nextest run --manifest-path adapters/railgun/Cargo.toml --cargo-profile ci-test -E "$FILTER"
+PLANT
+
+  echo "check-ci-filter-names-selftest.sh --selected: four plants the gate must name, then the control"
+  red=$(FILTER_GATE_WORKFLOW="$scratch/ci.yml" \
+        FILTER_GATE_NEXTEST_CONFIGS=".config/nextest.toml=Cargo.toml $scratch/nextest.toml=adapters/railgun/Cargo.toml" \
+        bash scripts/check-ci-filter-names.sh --selected 2>&1 > /dev/null)
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "SELFTEST FAIL: the planted copies did not trip the gate (exit 0)" >&2
+    fails=1
+  fi
+  while IFS= read -r headline; do
+    if /usr/bin/grep -qF -- "$headline" <<< "$red"; then
+      echo "  ok: named -> ${headline}"
+    else
+      echo "SELFTEST FAIL: the gate did not report '${headline}'" >&2
+      fails=1
+    fi
+  done <<EXPECTED
+FILTER SELECTS NOTHING: $scratch/nextest.toml profile.default.overrides
+TEST GROUP HOLDS NOTHING: $scratch/nextest.toml test-groups.planted-empty-group
+FILTER TERM SELECTS NOTHING: $scratch/ci.yml planted-dead-regex-term
+FILTER NOT EVALUATED: $scratch/ci.yml planted-shell-variable-filter
+EXPECTED
+  # exactly the four: a gate that fails everything would name them too
+  named=$(/usr/bin/grep -cE '^[A-Z][A-Z ]+: ' <<< "$red" || true)
+  if [ "$named" -ne 4 ]; then
+    echo "SELFTEST FAIL: expected exactly 4 failures from 4 plants, the gate reported ${named}" >&2
+    printf '%s\n' "$red" >&2
+    fails=1
+  fi
+
+  # the same overrides aimed at the real files: if this is red, the run above proved nothing
+  if FILTER_GATE_WORKFLOW=.github/workflows/ci.yml FILTER_GATE_NEXTEST_CONFIGS="$real_configs" \
+       bash scripts/check-ci-filter-names.sh --selected > /dev/null 2>&1; then
+    echo "  ok: unmutated tree -> exit 0"
+  else
+    echo "SELFTEST FAIL: --selected rejects the UNMUTATED tree" >&2
+    fails=1
+  fi
+
+  if [ "$fails" -ne 0 ]; then
+    echo "check-ci-filter-names-selftest.sh --selected: the gate is not discriminating." >&2
+    exit 1
+  fi
+  echo "check-ci-filter-names-selftest.sh --selected: all cases behaved as required."
+  exit 0
+fi
+
 CI=.github/workflows/ci.yml
 BAK=$(mktemp)
 cp "$CI" "$BAK"

@@ -4,6 +4,11 @@
 //! one thing it never proved was that any producer could generate that shape. A rename on
 //! either side would have kept every test green.
 
+#![allow(
+    clippy::expect_used,
+    reason = "a test asserts by failing; the message is the diagnostic"
+)]
+
 use bench_compare::{compare, has_regression, Unit, Verdict};
 use raven_bench::{BenchFile, BenchReport, GridCell};
 
@@ -108,9 +113,14 @@ fn an_unmeasured_phase_is_omitted_rather_than_reported_as_zero() {
     );
 }
 
-/// The legacy single-cell shape is what every artifact on disk actually is, and those are
-/// the only baselines that exist. Asserted through `load` and the value it yields, because
-/// the operator's observable is the loaded file, not an intermediate.
+/// The legacy single-cell shape is what several artifacts on disk still are. Asserted
+/// through `load` and the value it yields, because the operator's observable is the loaded
+/// file, not an intermediate.
+///
+/// The figures below are round synthetic numbers on purpose. They used to be the live
+/// baseline's, which read as a second copy of the pin and would have been left behind by any
+/// re-pin; the pin itself now lives only in `benches/baselines/`, checked by
+/// `tests/tracked_baseline.rs`.
 #[test]
 fn a_legacy_single_cell_artifact_loads_without_a_shim() {
     const LEGACY: &str = r#"{
@@ -118,8 +128,8 @@ fn a_legacy_single_cell_artifact_loads_without_a_shim() {
       "cell": { "entries_log2": 16, "record_bytes": 32 },
       "setup_ms": 4109.573482,
       "hint_bytes": 0,
-      "query_bytes": 98840,
-      "response_bytes": 32879,
+      "query_bytes": 40000,
+      "response_bytes": 20000,
       "query_ms_median": 7.451,
       "server_ms_median": 4.889,
       "client_ms_median": 2.495,
@@ -150,7 +160,7 @@ fn a_legacy_single_cell_artifact_loads_without_a_shim() {
         .find(|r| r.bench == "inspire-default/2e16x32/query_bytes")
         .expect("query_bytes row");
     assert_eq!(query_bytes.unit, Unit::Bytes);
-    assert!((query_bytes.value - 98_840.0).abs() < f64::EPSILON);
+    assert!((query_bytes.value - 40_000.0).abs() < f64::EPSILON);
 }
 
 /// A file that claims the canonical shape reports the canonical shape's error, so a
@@ -319,21 +329,21 @@ fn an_unsampled_run_reports_no_p_value() {
     assert_eq!(q.p_value, None, "no samples means no p-value");
 }
 
-/// A one-byte movement BLOCKS the gate, so its row is the only output an operator will ever
-/// see this gate fail on. Rendered as a percentage it read `+0.0%` beside `REGRESSION`, with
-/// baseline and current both rounding to the same `96.52 KiB` and no p-value - every column
-/// saying nothing changed while the verdict disagreed.
+/// A one-byte movement BLOCKS the gate, so its row is one of the few outputs an operator
+/// will ever see this gate fail on. Rendered as a percentage it read `+0.0%` beside
+/// `REGRESSION`, with baseline and current both rounding to the same KiB figure and no
+/// p-value - every column saying nothing changed while the verdict disagreed.
 #[test]
 fn a_one_byte_regression_is_legible_in_the_rendered_row() {
     let baseline = file_of(vec![raven_bench::BenchResult {
         bench: "s/2e16x32/query_bytes".to_owned(),
-        value: 98_840.0,
+        value: 40_000.0,
         unit: raven_bench::Unit::Bytes,
         samples: Vec::new(),
     }]);
     let current = file_of(vec![raven_bench::BenchResult {
         bench: "s/2e16x32/query_bytes".to_owned(),
-        value: 98_841.0,
+        value: 40_001.0,
         unit: raven_bench::Unit::Bytes,
         samples: Vec::new(),
     }]);

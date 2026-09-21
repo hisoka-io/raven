@@ -8,7 +8,7 @@
 # Cell shape: each [[instance]] takes an optional `entries` (row count) and
 # `record_size` (row width). Both default to the instance encoder's canonical
 # layout - 131,072 rows for per-node / per-list-node, 65,536 for the leaf-keyed
-# encoders - so the four commit-trees and the PPOI path instance below size
+# encoders - so the four commit-trees and the six PPOI path blocks below size
 # themselves. Setting either to a value the encoder cannot serve is rejected at
 # boot; changing either on a populated data_dir needs a re-bootstrap, because
 # reconfiguring the shape does not convert existing shards.
@@ -107,6 +107,9 @@ data_dir = "/var/lib/raven-railgun/commit-tree-3"
 verification_mode = "chain-root-history"
 data_source = { kind = "indexer", filter = { tree_number = 3 } }
 
+# PPOI list instances. `verification_mode = "upstream-signature"` selects the upstream feed as
+# the authority. Despite the name, no signature is checked: each event's signature is stored,
+# never verified. List authenticity rests on TLS to `mirror_endpoint` - keep it https.
 [[instance]]
 id = "ppoi-status-ofac"
 role = "live"

@@ -20,6 +20,7 @@ use std::path::Path;
 
 use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::InspireParams;
+use raven_inspire::pir::mod_switch::{mod_switch_response_checked, MOD_SWITCH_TARGET_36BIT};
 use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::setup as inspire_setup;
 use raven_inspire_client_wasm::{build_seeded_query_rust, extract_response_rust};
@@ -175,6 +176,9 @@ fn main() {
             Some(&store),
         )
         .expect("respond");
+        // the server switches every response before it reaches the wire
+        let resp = mod_switch_response_checked(&crs.params, &resp, MOD_SWITCH_TARGET_36BIT)
+            .expect("mod-switch response");
 
         let resp_bin = resp.to_binary().expect("serialize response");
         let resp = raven_inspire::ServerResponse::from_binary(&resp_bin)

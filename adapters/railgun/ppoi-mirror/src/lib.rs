@@ -1,4 +1,30 @@
 //! Upstream PPOI mirror over the aggregator's JSON-RPC endpoint.
+//!
+//! # Trust
+//!
+//! A mirrored row is taken on the word of whoever answers at the configured endpoint; see
+//! [`TRUST_STATEMENT`]. Each `signedPOIEvent` carries the list provider's ed25519 signature. The
+//! mirror checks that it is 64 bytes of hex, passes it on in the WAL payload, and never verifies
+//! it. The engine names this authority model `VerificationMode::UpstreamSignature`, and config
+//! spells it `verification_mode = "upstream-signature"`. Despite both names, no signature check
+//! runs.
+//!
+//! # What a mirrored status IS
+//!
+//! `ppoi_poi_events` carries membership, not a verdict. Upstream computes a status per
+//! commitment at query time over four stores (`getPOIStatus`, `poi-merkletree-manager.ts`):
+//! presence in the list's POI merkletree is `Valid`, and its other three verdicts come from the
+//! blocked-shield database, the transact-proof mempool, and a fallthrough - none of which this
+//! endpoint reads. The merkletree leaf IS the event's blinded commitment, inserted at the event's
+//! index by the same call that appends the event, so for one list "member of the event list" and
+//! "`Valid`" are the same statement.
+//!
+//! So every row this mirror emits carries [`LIST_MEMBERSHIP_STATUS`], and that is the whole of
+//! what the data says. A commitment upstream would call `ShieldBlocked` was never given a list
+//! index, so no index-addressed row can express it; reporting its absence as a clean verdict is
+//! the fail-open this statement exists to name. Asking for the other three verdicts means asking
+//! `ppoi_pois_per_blinded_commitment` per commitment - see [`MirrorSource::fetch_status_typed`],
+//! which is the only function here that can return a second value.
 
 #![allow(missing_docs, clippy::items_after_statements)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
@@ -32,11 +58,64 @@ pub enum MirrorError {
 
 pub type Result<T, E = MirrorError> = core::result::Result<T, E>;
 
+/// Class of a refused [`UpstreamPpoiMirror::preflight`].
+#[derive(thiserror::Error, Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreflightFailure {
+    /// The endpoint's host did not resolve.
+    #[error("host did not resolve")]
+    Dns,
+    /// The host resolved but no connection was established.
+    #[error("connection failed")]
+    Connect,
+    /// No complete answer inside the caller's bound.
+    #[error("no answer within {0:?}")]
+    Timeout(std::time::Duration),
+    /// The request failed in transit for a reason no other class covers.
+    #[error("request failed in transit")]
+    Transport,
+    /// Answered with a non-success HTTP status.
+    #[error("answered HTTP {0}")]
+    HttpStatus(u16),
+    /// Answered a body that is not a JSON-RPC 2.0 reply to the request.
+    #[error("answered a body that is not a JSON-RPC 2.0 reply")]
+    MalformedEnvelope,
+    /// Answered a JSON-RPC error object carrying this code.
+    #[error("answered JSON-RPC error {0}")]
+    Rpc(i64),
+    /// Answered rows the worker's decoder refuses.
+    #[error("answered rows the mirror cannot ingest")]
+    UndecodableRows,
+}
+
+/// A refused [`UpstreamPpoiMirror::preflight`].
+#[derive(thiserror::Error, Clone, Debug, Eq, PartialEq)]
+#[error(
+    "ppoi mirror preflight: {} POST {endpoint}: {failure} ({detail})",
+    POI_EVENTS_METHOD
+)]
+pub struct PreflightError {
+    /// The endpoint exactly as configured.
+    pub endpoint: String,
+    /// Failure class.
+    pub failure: PreflightFailure,
+    /// The underlying error, with its causes.
+    pub detail: String,
+}
+
+/// What vouches for a mirrored row, worded for an operator. Logged once per worker.
+pub const TRUST_STATEMENT: &str = "list authenticity rests on TLS to the configured upstream \
+    endpoint; signedPOIEvent signatures are stored, not verified";
+
 /// Default polling cadence between upstream pulls (seconds).
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 30;
 
 /// Default upstream PPOI endpoint.
 pub const DEFAULT_PPOI_ENDPOINT: &str = "https://ppoi.fdi.network";
+
+/// The single verdict a `ppoi_poi_events` row can justify. Upstream derives `Valid` from list
+/// membership alone; see the crate doc. Emitting anything else from that endpoint asserts a fact
+/// its response does not carry.
+pub const LIST_MEMBERSHIP_STATUS: POIStatus = POIStatus::Valid;
 
 const JSON_RPC_VERSION: &str = "2.0";
 const POI_EVENTS_METHOD: &str = "ppoi_poi_events";
@@ -51,7 +130,11 @@ pub const DEFAULT_CHAIN_ID: u64 = 1;
 /// Mirrors upstream PPOI service state into the engine.
 #[async_trait]
 pub trait MirrorSource: Send + Sync + 'static {
-    /// Fetch rows in the inclusive range `[start_index, end_index]`; all returned rows have `Valid` status.
+    /// Fetch the list's members over the inclusive range `[start_index, end_index]`.
+    ///
+    /// Every row carries [`LIST_MEMBERSHIP_STATUS`] because that is all `ppoi_poi_events` says;
+    /// see the crate doc. This is membership, not a per-commitment verdict, and it cannot
+    /// distinguish a blocked commitment from one upstream has never heard of.
     async fn fetch_status_range(
         &self,
         list: &ListKey,
@@ -60,6 +143,10 @@ pub trait MirrorSource: Send + Sync + 'static {
     ) -> Result<Vec<PoiStatusRow>>;
 
     /// Fetch the canonical status for one blinded commitment via JSON-RPC.
+    ///
+    /// The only path here that can return a value other than [`LIST_MEMBERSHIP_STATUS`]: upstream
+    /// consults the blocked-shield database and the transact-proof mempool as well as the list,
+    /// keyed by commitment and by the caller-declared type rather than by list index.
     async fn fetch_status_typed(
         &self,
         list: &ListKey,
@@ -71,7 +158,8 @@ pub trait MirrorSource: Send + Sync + 'static {
 /// Configuration for [`UpstreamPpoiMirror`].
 #[derive(Clone, Debug)]
 pub struct MirrorConfig {
-    /// Upstream PPOI service endpoint (no trailing slash).
+    /// Upstream PPOI service endpoint (no trailing slash). TLS to it is all that authenticates
+    /// the mirrored list; see [`TRUST_STATEMENT`].
     pub endpoint: String,
     /// Chain type identifier sent in JSON-RPC parameters.
     pub chain_type: String,
@@ -274,6 +362,65 @@ impl UpstreamPpoiMirror {
         &self.config.endpoint
     }
 
+    /// One bounded `ppoi_poi_events` request for index 0 of `list`, over the client, envelope
+    /// check and row decoder the worker itself uses, so `Ok` means the worker's first page can
+    /// succeed. The worker retries a dead endpoint forever and only warns; this is the call that
+    /// lets a boot path refuse one instead.
+    ///
+    /// ```no_run
+    /// # async fn boot() -> Result<(), Box<dyn std::error::Error>> {
+    /// use raven_railgun_ppoi_mirror::UpstreamPpoiMirror;
+    /// let mirror = UpstreamPpoiMirror::ofac_default()?;
+    /// let list = raven_railgun_core::ListKey([0u8; 32]);
+    /// mirror.preflight(&list, std::time::Duration::from_secs(5)).await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`PreflightError`] naming the endpoint and the [`PreflightFailure`] class.
+    pub async fn preflight(
+        &self,
+        list: &ListKey,
+        timeout: std::time::Duration,
+    ) -> core::result::Result<(), PreflightError> {
+        let refuse = |failure, detail| PreflightError {
+            endpoint: self.config.endpoint.clone(),
+            failure,
+            detail,
+        };
+        let events: Vec<WirePOISyncedListEvent> = self
+            .exchange_json_rpc(
+                POI_EVENTS_METHOD,
+                self.poi_events_params(list, 0, 0),
+                Some(timeout),
+            )
+            .await
+            .map_err(|failure| {
+                let (class, detail) = failure.into_preflight(timeout);
+                refuse(class, detail)
+            })?;
+        decode_indexed_events(events, 0, 0)
+            .map_err(|error| refuse(PreflightFailure::UndecodableRows, error.to_string()))?;
+        Ok(())
+    }
+
+    fn poi_events_params(
+        &self,
+        list: &ListKey,
+        start_index: u64,
+        end_index: u64,
+    ) -> PoiEventsRequestBody<'_> {
+        PoiEventsRequestBody {
+            chain_type: &self.config.chain_type,
+            chain_id: self.config.chain_id.to_string(),
+            txid_version: &self.config.txid_version,
+            list_key: hex_lower(&list.0),
+            start_index,
+            end_index,
+        }
+    }
+
     /// No-cursor polling worker; delegates to
     /// [`Self::run_worker_with_cursor`] with `None`.
     ///
@@ -321,6 +468,7 @@ impl UpstreamPpoiMirror {
             Some(pc) => pc.resolve_start(),
             None => starting_cursor,
         };
+        tracing::info!(endpoint = %self.config.endpoint, "ppoi mirror: {TRUST_STATEMENT}");
         loop {
             tick.tick().await;
             if sender.is_closed() {
@@ -347,7 +495,9 @@ impl UpstreamPpoiMirror {
             }
             for ev in &events {
                 let status_byte = poi_status_to_byte(ev.status);
-                // Emission order is load-bearing; see the worker doc.
+                // Emission order is load-bearing; see the worker doc. So is the height: upstream
+                // rows have no block, and 0 keeps them out of every reorg unwind (`h > height`
+                // is never true). A real height here makes reorgs start dropping PPOI rows.
                 let leaf_added = raven_railgun_persistence::WalEntryPayload::PpoiListLeafAdded {
                     list_key: list.0,
                     list_index: ev.list_index,
@@ -407,14 +557,7 @@ impl UpstreamPpoiMirror {
         if end_index < start_index {
             return Ok(Vec::new());
         }
-        let params = PoiEventsRequestBody {
-            chain_type: &self.config.chain_type,
-            chain_id: self.config.chain_id.to_string(),
-            txid_version: &self.config.txid_version,
-            list_key: hex_lower(&list.0),
-            start_index,
-            end_index,
-        };
+        let params = self.poi_events_params(list, start_index, end_index);
         let events: Vec<WirePOISyncedListEvent> =
             self.post_json_rpc(POI_EVENTS_METHOD, params).await?;
         decode_indexed_events(events, start_index, end_index)
@@ -425,55 +568,136 @@ impl UpstreamPpoiMirror {
         P: Serialize,
         T: DeserializeOwned,
     {
+        self.exchange_json_rpc(method, params, None)
+            .await
+            .map_err(|failure| failure.into_mirror_error(method, &self.config.endpoint))
+    }
+
+    /// `timeout` overrides the client-wide request timeout for this exchange only.
+    async fn exchange_json_rpc<P, T>(
+        &self,
+        method: &'static str,
+        params: P,
+        timeout: Option<std::time::Duration>,
+    ) -> core::result::Result<T, RpcFailure>
+    where
+        P: Serialize,
+        T: DeserializeOwned,
+    {
         let request = JsonRpcRequest {
             jsonrpc: JSON_RPC_VERSION,
             method,
             params,
             id: 1,
         };
-        let response = self
-            .client
-            .post(&self.config.endpoint)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|error| {
-                MirrorError::Upstream(format!(
-                    "JSON-RPC {method} POST {}: {error}",
-                    self.config.endpoint
-                ))
-            })?;
+        let mut post = self.client.post(&self.config.endpoint).json(&request);
+        if let Some(timeout) = timeout {
+            post = post.timeout(timeout);
+        }
+        let response = post.send().await.map_err(RpcFailure::Send)?;
         let status = response.status();
         if !status.is_success() {
-            return Err(MirrorError::Upstream(format!(
-                "JSON-RPC {method} POST {} returned {status}",
-                self.config.endpoint
-            )));
+            return Err(RpcFailure::Status(status));
         }
-        let response: JsonRpcResponse<T> = response
-            .json()
-            .await
-            .map_err(|error| MirrorError::Decode(format!("JSON-RPC {method} response: {error}")))?;
+        let response: JsonRpcResponse<T> = response.json().await.map_err(RpcFailure::Body)?;
         if response.jsonrpc != JSON_RPC_VERSION || response.id != 1 {
-            return Err(MirrorError::Decode(format!(
-                "JSON-RPC {method} response envelope mismatch: version {}, id {}",
+            return Err(RpcFailure::Envelope(format!(
+                "response envelope mismatch: version {}, id {}",
                 response.jsonrpc, response.id
             )));
         }
         match (response.result, response.error) {
             (Some(result), None) => Ok(result),
-            (None, Some(error)) => Err(MirrorError::Upstream(format!(
-                "JSON-RPC {method} error {}: {}",
-                error.code, error.message
-            ))),
-            (Some(_), Some(_)) => Err(MirrorError::Decode(format!(
-                "JSON-RPC {method} response contains both result and error"
-            ))),
-            (None, None) => Err(MirrorError::Decode(format!(
-                "JSON-RPC {method} response contains neither result nor error"
-            ))),
+            (None, Some(error)) => Err(RpcFailure::Rpc {
+                code: error.code,
+                message: error.message,
+            }),
+            (Some(_), Some(_)) => Err(RpcFailure::Envelope(
+                "response contains both result and error".to_owned(),
+            )),
+            (None, None) => Err(RpcFailure::Envelope(
+                "response contains neither result nor error".to_owned(),
+            )),
         }
     }
+}
+
+/// One failed JSON-RPC exchange, kept classified until a caller words it.
+#[derive(Debug)]
+enum RpcFailure {
+    Send(reqwest::Error),
+    Status(reqwest::StatusCode),
+    Body(reqwest::Error),
+    Envelope(String),
+    Rpc { code: i64, message: String },
+}
+
+impl RpcFailure {
+    fn into_mirror_error(self, method: &str, endpoint: &str) -> MirrorError {
+        match self {
+            Self::Send(error) => {
+                MirrorError::Upstream(format!("JSON-RPC {method} POST {endpoint}: {error}"))
+            }
+            Self::Status(status) => MirrorError::Upstream(format!(
+                "JSON-RPC {method} POST {endpoint} returned {status}"
+            )),
+            Self::Body(error) => {
+                MirrorError::Decode(format!("JSON-RPC {method} response: {error}"))
+            }
+            Self::Envelope(detail) => MirrorError::Decode(format!("JSON-RPC {method} {detail}")),
+            Self::Rpc { code, message } => {
+                MirrorError::Upstream(format!("JSON-RPC {method} error {code}: {message}"))
+            }
+        }
+    }
+
+    fn into_preflight(self, timeout: std::time::Duration) -> (PreflightFailure, String) {
+        match self {
+            Self::Send(error) => (classify_send_error(&error, timeout), error_chain(&error)),
+            Self::Status(status) => (
+                PreflightFailure::HttpStatus(status.as_u16()),
+                status.to_string(),
+            ),
+            // A body that stalls is a timeout, not a malformed reply.
+            Self::Body(error) if error.is_timeout() => {
+                (PreflightFailure::Timeout(timeout), error_chain(&error))
+            }
+            Self::Body(error) => (PreflightFailure::MalformedEnvelope, error_chain(&error)),
+            Self::Envelope(detail) => (PreflightFailure::MalformedEnvelope, detail),
+            Self::Rpc { code, message } => (PreflightFailure::Rpc(code), message),
+        }
+    }
+}
+
+/// Timeout is tested first: a connect that the OS itself times out is also a connect error.
+fn classify_send_error(error: &reqwest::Error, timeout: std::time::Duration) -> PreflightFailure {
+    if error.is_timeout() {
+        return PreflightFailure::Timeout(timeout);
+    }
+    if !error.is_connect() {
+        return PreflightFailure::Transport;
+    }
+    // The connector's error type is private; its message is the only handle on a DNS failure.
+    let mut cause = std::error::Error::source(error);
+    while let Some(inner) = cause {
+        if inner.to_string() == "dns error" {
+            return PreflightFailure::Dns;
+        }
+        cause = inner.source();
+    }
+    PreflightFailure::Connect
+}
+
+/// `reqwest` words only the outermost layer; the causes carry the actionable part.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(inner) = cause {
+        text.push_str(": ");
+        text.push_str(&inner.to_string());
+        cause = inner.source();
+    }
+    text
 }
 
 /// Indexed event row: `list_index` for IMT growth, bc + status for the map.
@@ -535,6 +759,13 @@ fn decode_indexed_events(
         let validated_merkleroot = decode_hex32(&event.validated_merkleroot).ok_or_else(|| {
             MirrorError::Decode(format!("invalid validatedMerkleroot hex at index {index}"))
         })?;
+        // Upstream serves a stored tree root or omits the row; the engine applies an all-zero
+        // root uncompared, so one arriving here would skip the only check on these bytes.
+        if validated_merkleroot == [0u8; 32] {
+            return Err(MirrorError::Decode(format!(
+                "all-zero validatedMerkleroot at index {index}: not a root upstream can publish"
+            )));
+        }
         let bc_str = event.signed_event.blinded_commitment;
         let bc_bytes = decode_hex32(&bc_str).ok_or_else(|| {
             MirrorError::Decode(format!("invalid bc hex at index {index}: {bc_str}"))
@@ -545,7 +776,7 @@ fn decode_indexed_events(
         out.push(IndexedPoiEvent {
             list_index,
             blinded_commitment: BlindedCommitment::from_bytes(bc_bytes),
-            status: POIStatus::Valid,
+            status: LIST_MEMBERSHIP_STATUS,
             event_type,
             signature,
             validated_merkleroot,
@@ -667,14 +898,7 @@ impl MirrorSource for UpstreamPpoiMirror {
         if end_index < start_index {
             return Ok(Vec::new());
         }
-        let params = PoiEventsRequestBody {
-            chain_type: &self.config.chain_type,
-            chain_id: self.config.chain_id.to_string(),
-            txid_version: &self.config.txid_version,
-            list_key: hex_lower(&list.0),
-            start_index,
-            end_index,
-        };
+        let params = self.poi_events_params(list, start_index, end_index);
         let events: Vec<WirePOISyncedListEvent> =
             self.post_json_rpc(POI_EVENTS_METHOD, params).await?;
         decode_indexed_events(events, start_index, end_index).map(|events| {

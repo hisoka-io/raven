@@ -98,6 +98,15 @@ fn visit(root: &Path, current: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
     }
 }
 
+/// The decoded archive, or `None` if zstd refuses the stream.
+fn inflate(compressed: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut dec =
+        zstd::stream::read::Decoder::with_buffer(std::io::Cursor::new(compressed)).ok()?;
+    std::io::Read::read_to_end(&mut dec, &mut out).ok()?;
+    Some(out)
+}
+
 fn read_export_manifest(tarball: &Path) -> ExportManifest {
     let raw = std::fs::read(tarball).expect("read tarball");
     let dec = zstd::stream::read::Decoder::with_buffer(std::io::Cursor::new(raw)).expect("zstd");
@@ -307,10 +316,7 @@ fn tamper_refusal_is_total_over_the_byte_range() {
     .expect("export");
     let pristine = std::fs::read(&tarball).expect("read pristine tarball");
     let len = pristine.len();
-    assert!(
-        len > 222,
-        "tarball ({len} bytes) too small to reach the stored kind field"
-    );
+    let plain = inflate(&pristine).expect("pristine export must inflate");
 
     let mut runner = TestRunner::new(PropConfig {
         cases: 32,
@@ -324,10 +330,16 @@ fn tamper_refusal_is_total_over_the_byte_range() {
             |(offset, mask)| {
                 let i = case_no.get();
                 case_no.set(i + 1);
-                let (offset, mask) = if i == 0 { (222, 1) } else { (offset, mask) };
-
                 let mut bytes = pristine.clone();
                 bytes[offset] ^= mask;
+                // A zstd bitstream has don't-care bits: a flip that decodes to the identical
+                // archive has tampered nothing, and accepting it is correct. Measured at
+                // compressed offset 1122, masks 0x08 and 0x18 leave all 7,680 decoded bytes
+                // unchanged while 0x01 trips the decoder. The totality property is over flips
+                // that CHANGE the decoded archive; a no-op flip is not a tamper.
+                if inflate(&bytes).as_deref() == Some(plain.as_slice()) {
+                    return Ok(());
+                }
                 let tampered = scratch.path().join(format!("tampered-{i}.tar.zst"));
                 std::fs::write(&tampered, &bytes)
                     .map_err(|e| TestCaseError::fail(format!("write tampered copy: {e}")))?;
@@ -350,11 +362,6 @@ fn tamper_refusal_is_total_over_the_byte_range() {
                         "flip at offset {offset} mask {mask:#04x}: untyped error {err:?}"
                     )));
                 };
-                if i == 0 && !matches!(typed, SnapshotPortError::KindMismatch { .. }) {
-                    return Err(TestCaseError::fail(format!(
-                        "stored kind-field flip must be a typed KindMismatch, got {typed:?}"
-                    )));
-                }
                 if !matches!(
                     typed,
                     SnapshotPortError::TarballParse { .. }
@@ -377,6 +384,85 @@ fn tamper_refusal_is_total_over_the_byte_range() {
             },
         )
         .expect("tamper-refusal property");
+}
+
+/// The stored `kind` field must refuse as a TYPED `KindMismatch`, not as whatever byte happens to
+/// live at a fixed offset.
+///
+/// This assertion used to ride inside the tamper proptest as a hand-picked flip at **compressed**
+/// offset 222. `snapshot_port.rs` writes `SystemTime::now()` into `EXPORT_MANIFEST.json`, the first
+/// tar member, so the zstd layout shifts on every export and offset 222 lands somewhere different
+/// each run -- the assertion failed about one run in four with `TarballParse`, and the lane carrying
+/// it had not executed in CI since the offset was introduced.
+///
+/// Tampering the FIELD instead of a byte position is deterministic. The replacement is the same
+/// length, so every tar header and its checksum are untouched and the import reaches the kind check.
+#[test]
+fn a_stored_kind_field_flip_refuses_as_a_typed_kind_mismatch() {
+    const KIND: &[u8] = b"raven-railgun-export/v1";
+    /// Same length as KIND, so every tar header and checksum is untouched.
+    const FLIPPED: &[u8] = b"raven-railgun-export/v0";
+
+    let scratch = tempfile::tempdir().expect("scratch");
+    let src_root = scratch.path().join("src");
+    std::fs::create_dir_all(&src_root).expect("mkdir");
+    let payload: Vec<u8> = (0..16_384u32)
+        .map(|i| u8::try_from(i & 0xFF).expect("byte"))
+        .collect();
+    bootstrap_instance(&src_root, "alpha", "per-leaf-bc", SCHEME_TAG_A, &payload, 4);
+
+    let tarball = scratch.path().join("export.tar.zst");
+    run_export(ExportOptions {
+        data_dir: src_root,
+        output: tarball.clone(),
+        signing_key: None,
+        include_current_wal: false,
+        keep_snapshots: 0,
+    })
+    .expect("export");
+
+    let compressed = std::fs::read(&tarball).expect("read tarball");
+    let mut plain = Vec::new();
+    {
+        let mut dec = zstd::stream::read::Decoder::with_buffer(std::io::Cursor::new(&compressed))
+            .expect("zstd decoder");
+        std::io::Read::read_to_end(&mut dec, &mut plain).expect("inflate");
+    }
+
+    let at = plain
+        .windows(KIND.len())
+        .position(|w| w == KIND)
+        .expect("the export kind literal must be present in the tarball");
+    plain[at..at + KIND.len()].copy_from_slice(FLIPPED);
+
+    let tampered = scratch.path().join("tampered.tar.zst");
+    std::fs::write(
+        &tampered,
+        zstd::stream::encode_all(std::io::Cursor::new(&plain), 3).expect("zstd encode"),
+    )
+    .expect("write tampered");
+
+    let dst_root = scratch.path().join("dst");
+    let err = run_import(ImportOptions {
+        input: tampered,
+        data_dir: dst_root.clone(),
+        verifying_key: None,
+        allow_overwrite: false,
+        unsafe_no_verify: true,
+    })
+    .expect_err("a wrong export kind must refuse");
+    let typed = err
+        .downcast_ref::<SnapshotPortError>()
+        .unwrap_or_else(|| panic!("untyped error: {err:?}"));
+    assert!(
+        matches!(typed, SnapshotPortError::KindMismatch { .. }),
+        "a stored kind-field flip must be a typed KindMismatch, got {typed:?}"
+    );
+    assert!(
+        !dst_root.exists()
+            || std::fs::read_dir(&dst_root).map_or(0, std::iter::Iterator::count) == 0,
+        "a refused import must leave no partial data dir"
+    );
 }
 
 #[test]

@@ -1,5 +1,6 @@
 //! The u16 wire-schema prefix prevents previous and future response layouts from reaching
-//! the wrong decoder. Frozen v2 and current bodies prove both refusal directions.
+//! the wrong decoder. A frozen unswitched body and a current mod-switched body prove both
+//! refusal directions.
 
 #![allow(
     dead_code,
@@ -18,9 +19,11 @@ use axum::{
     http::{header, Method, Request, StatusCode},
 };
 use raven_inspire::math::Poly;
+use raven_inspire::params::InspireParams;
 use raven_inspire::pir::{PackingMode, ServerResponse};
 use raven_inspire::rlwe::RlweCiphertext;
 use raven_railgun_core::{InstanceId, Result as RailgunResult};
+use raven_railgun_engine::inspire::WIRE_RESPONSE_MODULUS;
 use raven_railgun_engine::{Engine, InstanceRole, PirInstance, PirScheme};
 use raven_railgun_http::{
     read_batch_response_versioned, router, write_batch_response_versioned, write_versioned,
@@ -31,7 +34,7 @@ use tower::ServiceExt;
 
 const TOKEN: &str = "schema-version-guard-token-1234567";
 const INSTANCE: &str = "schema-version-instance";
-const PREVIOUS_WIRE_SCHEMA_VERSION: u16 = 6;
+const PREVIOUS_WIRE_SCHEMA_VERSION: u16 = 7;
 
 static APPSTATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -49,13 +52,6 @@ struct EchoQuery {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 struct EchoResponse {
     tag: u32,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct FrozenV2ServerResponse {
-    ciphertext: RlweCiphertext,
-    column_ciphertexts: Vec<RlweCiphertext>,
-    packing_mode: Option<PackingMode>,
 }
 
 impl PirScheme for EchoScheme {
@@ -124,24 +120,21 @@ fn with_schema_version(mut body: Vec<u8>, version: u16) -> Vec<u8> {
     body
 }
 
-fn response_layouts() -> (FrozenV2ServerResponse, ServerResponse) {
-    let modulus = 65_537;
-    let ciphertext = RlweCiphertext::from_parts(
-        Poly::from_coeffs(vec![1, 2, 3, 4], modulus),
-        Poly::from_coeffs(vec![5, 6, 7, 8], modulus),
-    );
+/// One serializer both sides: the previous schema carried the unswitched modulus, the
+/// current carries the served rung, and the tight coefficient width follows the modulus.
+fn response_layouts() -> (ServerResponse, ServerResponse) {
+    let response_at = |modulus: u64| ServerResponse {
+        ciphertext: RlweCiphertext::from_parts(
+            Poly::from_coeffs(vec![1, 2, 3, 4], modulus),
+            Poly::from_coeffs(vec![5, 6, 7, 8], modulus),
+        ),
+        column_ciphertexts: vec![],
+        packing_mode: Some(PackingMode::Inspiring),
+        packed_coefficients: Some(2),
+    };
     (
-        FrozenV2ServerResponse {
-            ciphertext: ciphertext.clone(),
-            column_ciphertexts: vec![],
-            packing_mode: Some(PackingMode::Inspiring),
-        },
-        ServerResponse {
-            ciphertext,
-            column_ciphertexts: vec![],
-            packing_mode: Some(PackingMode::Inspiring),
-            packed_coefficients: Some(2),
-        },
+        response_at(InspireParams::secure_128_d2048().q),
+        response_at(WIRE_RESPONSE_MODULUS),
     )
 }
 
@@ -240,48 +233,50 @@ fn read_batch_at_schema<T: serde::de::DeserializeOwned>(
 #[test]
 fn previous_and_current_single_response_layouts_refuse_each_other() {
     assert_eq!(
-        WIRE_SCHEMA_VERSION, 7,
-        "tight 60-bit coefficients change query and response bytes"
+        WIRE_SCHEMA_VERSION, 8,
+        "mod-switched 36-bit response coefficients change response bytes"
     );
-    let (v2_response, current_response) = response_layouts();
-    let old = write_at_schema(&v2_response, PREVIOUS_WIRE_SCHEMA_VERSION);
+    let (previous_response, current_response) = response_layouts();
+    let old = write_at_schema(&previous_response, PREVIOUS_WIRE_SCHEMA_VERSION);
     let current = write_versioned(&current_response).expect("encode current response layout");
     assert_ne!(
         &old[WIRE_SCHEMA_PREFIX_LEN..],
         &current[WIRE_SCHEMA_PREFIX_LEN..],
-        "the frozen v2 body must not be a relabeled current body"
+        "the frozen v7 body must not be a relabeled current body"
+    );
+    assert!(
+        current.len() < old.len(),
+        "the switched body must pack narrower coefficients than the unswitched one"
     );
 
     let current_error = raven_railgun_http::read_versioned::<ServerResponse>(&old)
-        .expect_err("current reader must refuse a real v2 response");
-    assert!(current_error.to_string().contains("expects v7"));
-    assert!(current_error.to_string().contains("sent v6"));
-    let old_error =
-        read_at_schema::<FrozenV2ServerResponse>(&current, PREVIOUS_WIRE_SCHEMA_VERSION)
-            .expect_err("previous reader must refuse a real current response");
-    assert!(old_error.contains("expected v6, got v7"));
+        .expect_err("current reader must refuse a real v7 response");
+    assert!(current_error.to_string().contains("expects v8"));
+    assert!(current_error.to_string().contains("sent v7"));
+    let old_error = read_at_schema::<ServerResponse>(&current, PREVIOUS_WIRE_SCHEMA_VERSION)
+        .expect_err("previous reader must refuse a real current response");
+    assert!(old_error.contains("expected v7, got v8"));
 }
 
 #[test]
 fn previous_and_current_batch_response_layouts_refuse_each_other() {
-    let (v2_response, current_response) = response_layouts();
-    let old = write_batch_at_schema(&[v2_response], PREVIOUS_WIRE_SCHEMA_VERSION);
+    let (previous_response, current_response) = response_layouts();
+    let old = write_batch_at_schema(&[previous_response], PREVIOUS_WIRE_SCHEMA_VERSION);
     let current =
         write_batch_response_versioned(&[current_response]).expect("encode current batch");
     assert_ne!(
         &old[WIRE_SCHEMA_PREFIX_LEN + 16..],
         &current[WIRE_SCHEMA_PREFIX_LEN + 16..],
-        "the frozen v2 element must not be a relabeled current element"
+        "the frozen v7 element must not be a relabeled current element"
     );
     let current_error = read_batch_response_versioned::<ServerResponse>(&old)
-        .expect_err("current batch reader must refuse a real v2 response");
-    assert!(current_error.to_string().contains("expects v7"));
-    assert!(current_error.to_string().contains("sent v6"));
+        .expect_err("current batch reader must refuse a real v7 response");
+    assert!(current_error.to_string().contains("expects v8"));
+    assert!(current_error.to_string().contains("sent v7"));
 
-    let old_error =
-        read_batch_at_schema::<FrozenV2ServerResponse>(&current, PREVIOUS_WIRE_SCHEMA_VERSION)
-            .expect_err("previous batch reader must refuse a real current response");
-    assert!(old_error.contains("expected v6, got v7"));
+    let old_error = read_batch_at_schema::<ServerResponse>(&current, PREVIOUS_WIRE_SCHEMA_VERSION)
+        .expect_err("previous batch reader must refuse a real current response");
+    assert!(old_error.contains("expected v7, got v8"));
 }
 
 async fn status_of(route: &str, body: Vec<u8>) -> StatusCode {
@@ -318,7 +313,7 @@ async fn previous_schema_rejection_advertises_the_current_version() {
             .headers()
             .get(X_RAVEN_SCHEMA_VERSION.to_ascii_lowercase())
             .expect("schema mismatch must advertise the accepted version"),
-        "7"
+        "8"
     );
 }
 

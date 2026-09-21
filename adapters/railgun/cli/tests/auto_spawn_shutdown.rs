@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use raven_railgun_cli::auto_spawn::load_spawn_log;
 use raven_railgun_cli::serve_production_multi::{
     run_with_listener, AutoSpawnConfigToml, BootstrapObserver, BootstrapView, MultiServeOptions,
 };
@@ -152,6 +153,20 @@ async fn wait_for_snapshot_dir(data_dir: &std::path::Path, id: u64, deadline: Du
     );
 }
 
+/// The spawn record is appended only after the consumer handle is registered for the
+/// shutdown drain. The snapshot dir appears seconds earlier, mid-bootstrap.
+async fn wait_for_spawn_record(registry_dir: &std::path::Path, tree: u32, deadline: Duration) {
+    let started = tokio::time::Instant::now();
+    while started.elapsed() < deadline {
+        let records = load_spawn_log(registry_dir).expect("load spawn log");
+        if records.iter().any(|record| record.tree_number == tree) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("auto-spawn of tree {tree} never reached the spawn log");
+}
+
 // bootstrap writes snap-000001; the Shutdown-arm drive_commit must add snap-000002+
 fn count_snapshots(data_dir: &std::path::Path) -> usize {
     let snap_dir = data_dir.join("snapshots");
@@ -171,7 +186,7 @@ fn count_snapshots(data_dir: &std::path::Path) -> usize {
             Trigger: changing SIGTERM drain for auto-spawned consumers."]
 async fn auto_spawned_consumers_drain_wal_on_sigterm() {
     let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
+        .with_max_level(tracing::Level::INFO)
         .with_test_writer()
         .try_init();
 
@@ -245,8 +260,8 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
     let view = wait_for_observer(&observer, &mut server).await;
     let chain = view.channels.indexer_tx.clone();
 
-    // gate on snap-000001 before the next tree: data_dir alone races the
-    // bootstrap commit (create_dir_all precedes the first snapshot write)
+    // Gate each spawn on its spawn record: the data dir and snap-000001 both appear
+    // before the handle is registered, and a stop sent in that window drains nothing.
     let tree1_dir = tmp.path().join("auto-tree-1");
     let tree2_dir = tmp.path().join("auto-tree-2");
 
@@ -256,6 +271,7 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
         .expect("send tree-1 shield (auto-spawn trigger)");
     wait_for_data_dir(&tree1_dir, Duration::from_secs(180)).await;
     wait_for_snapshot_dir(&tree1_dir, 1, Duration::from_secs(180)).await;
+    wait_for_spawn_record(tmp.path(), 1, Duration::from_secs(180)).await;
 
     chain
         .send(shield_event(2, 0, 200))
@@ -263,9 +279,7 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
         .expect("send tree-2 shield (auto-spawn trigger)");
     wait_for_data_dir(&tree2_dir, Duration::from_secs(180)).await;
     wait_for_snapshot_dir(&tree2_dir, 1, Duration::from_secs(180)).await;
-
-    // let in-flight router fan-out drain before shutdown
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_spawn_record(tmp.path(), 2, Duration::from_secs(180)).await;
 
     let _ = stop_tx.send(());
 

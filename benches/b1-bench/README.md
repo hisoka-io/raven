@@ -7,6 +7,23 @@ Adapter bench driving the Raven-local fork of `inspire-rs`
 CSV. Every run prepends a correctness smoke that halts the
 bench on any byte mismatch.
 
+## What `response_bytes` counts
+
+The two-packing path mod-switches to the served rung before
+serializing and decodes through the switched extractor, so
+`response_bytes` is the body a client actually receives; the
+pre-switch size is published alongside it as
+`response_unswitched_bytes`. Measuring the pre-switch body
+would publish a size nothing sends, and would leave the
+decode timing on a path no shipped client takes.
+
+Each published byte count carries the size its own shape
+predicts (`<metric>_derived`, from
+[`src/wire_size.rs`](src/wire_size.rs)). The producer refuses
+to write an artifact where a measurement and its closed form
+disagree: a body shorter than its shape is truncation, and the
+shape is only in hand here.
+
 The crate lives in its own `[workspace]` (the root `Cargo.toml`
 excludes it) because the upstream crate tree carries transitive
 deps - rayon via the fork, plus bincode/rand - that do not

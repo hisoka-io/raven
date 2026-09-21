@@ -154,7 +154,7 @@ function mountEchoingBatchRoute(
       const slots = encodedBatchCount(body);
       const elemBytes = 32;
       const out = new Uint8Array(2 + 8 + slots * (8 + elemBytes));
-      out[1] = 7;
+      out[1] = 8;
       const dv = new DataView(out.buffer);
       dv.setUint32(2, slots, true);
       let off = 10;

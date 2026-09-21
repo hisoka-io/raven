@@ -18,6 +18,7 @@ import {
   TREE_DEPTH,
 } from "./poi-pir";
 import { drawPaddedSlots, MAX_BATCH_SIZE } from "./batch-ladder";
+import { bearerHeaders } from "./bearer-auth";
 import {
   buildFanoutCoverPlan,
   recoverRealFanoutResponses,
@@ -131,7 +132,9 @@ export interface LegacyTransactProofData {
 
 interface RavenConfigBase {
   endpoint: string;
-  bearerToken: string;
+  /** Adapter credential; omit for a node that serves its routes without one.
+   * Read from `chainRegistry` instead when one is supplied. */
+  bearerToken?: string;
   /** EVM chain id this adapter serves; defaults to 1 (mainnet). */
   chainId?: number;
   /** Upstream `chainType` (0 = EVM); a path segment in PPOI passthrough URLs. */
@@ -227,7 +230,7 @@ export interface CapturedWireRequest {
 const X_RAVEN_FRESHNESS = "x-raven-freshness";
 const X_RAVEN_EPOCH = "x-raven-epoch";
 const X_RAVEN_SCHEMA_VERSION = "x-raven-schema-version";
-const WIRE_SCHEMA_VERSION = 7;
+const WIRE_SCHEMA_VERSION = 8;
 const MAX_FANOUT_BODY_BYTES = 8 * 1024 * 1024;
 const DEFAULT_TXID_VERSION = "V2_PoseidonMerkle";
 const DEFAULT_CONFIDENCE_FLOOR = 0.5;
@@ -702,12 +705,11 @@ export class RavenPOINodeInterface {
     validateListKeyHex(listKey);
     const route = this.route();
     const url = `${route.endpoint}/v1/poi/${listKey}/bc-to-idx-map`;
+    const credential = bearerHeaders(route.bearerToken);
     this.captureRequest(url, "GET", new Uint8Array());
     let res: Response;
     try {
-      res = await this.fetchImpl(url, {
-        headers: { authorization: `Bearer ${route.bearerToken}` },
-      });
+      res = await this.fetchImpl(url, { headers: credential });
     } catch (cause) {
       throw RavenError.network("fetchBcToIdxMap", { url, cause: String(cause) });
     }
@@ -724,12 +726,11 @@ export class RavenPOINodeInterface {
     validateListKeyHex(listKey);
     const route = this.route();
     const url = `${route.endpoint}/v1/poi/${listKey}/status-header`;
+    const credential = bearerHeaders(route.bearerToken);
     this.captureRequest(url, "GET", new Uint8Array());
     let res: Response;
     try {
-      res = await this.fetchImpl(url, {
-        headers: { authorization: `Bearer ${route.bearerToken}` },
-      });
+      res = await this.fetchImpl(url, { headers: credential });
     } catch (cause) {
       throw RavenError.network("fetchStatusHeader", { url, cause: String(cause) });
     }
@@ -1231,7 +1232,7 @@ export class RavenPOINodeInterface {
     requestBody: Uint8Array,
     operation: "batch" | "fanout",
   ): Promise<Response> {
-    const route = this.route();
+    const credential = bearerHeaders(this.route().bearerToken);
     const clientId = this.clientPirClientId(instanceLabel);
     let response: Response;
     try {
@@ -1239,7 +1240,7 @@ export class RavenPOINodeInterface {
         method: "POST",
         headers: {
           "content-type": "application/octet-stream",
-          authorization: `Bearer ${route.bearerToken}`,
+          ...credential,
           "x-raven-client-id": clientId,
         },
         body: copyForBody(requestBody),
@@ -1321,6 +1322,7 @@ export class RavenPOINodeInterface {
       );
     }
     const route = this.route();
+    const credential = bearerHeaders(route.bearerToken);
     const clientId = this.clientPirClientId(instanceLabel);
     const body = ctx.wasm.client_packing_keys_versioned(ctx.session);
     const url = `${route.endpoint}/v1/instance/${encodeURIComponent(instanceLabel)}/session`;
@@ -1330,7 +1332,7 @@ export class RavenPOINodeInterface {
         method: "POST",
         headers: {
           "content-type": "application/octet-stream",
-          authorization: `Bearer ${route.bearerToken}`,
+          ...credential,
           "x-raven-client-id": clientId,
         },
         body: copyForBody(body),
@@ -1377,6 +1379,7 @@ export class RavenPOINodeInterface {
     body: unknown,
   ): Promise<{ json: T; freshness: FreshnessHeader | null }> {
     const route = this.route();
+    const credential = bearerHeaders(route.bearerToken);
     const bodyText = JSON.stringify(body);
     const url = `${route.endpoint}${path}`;
     this.captureRequest(url, "POST", new TextEncoder().encode(bodyText));
@@ -1386,7 +1389,7 @@ export class RavenPOINodeInterface {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          authorization: `Bearer ${route.bearerToken}`,
+          ...credential,
         },
         body: bodyText,
       });

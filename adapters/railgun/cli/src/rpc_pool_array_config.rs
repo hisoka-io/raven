@@ -23,6 +23,7 @@ use raven_railgun_indexer::rpc_pool::{
 };
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EndpointEntry {
     pub url: String,
     pub rps: u32,
@@ -30,6 +31,7 @@ pub struct EndpointEntry {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PoolMeta {
     #[serde(default = "default_strategy")]
     pub strategy: String,
@@ -46,6 +48,7 @@ fn default_cooldown() -> u64 {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WsConfig {
     #[serde(default)]
     pub urls: Vec<String>,
@@ -53,6 +56,7 @@ pub struct WsConfig {
 
 /// Array-shaped pool config consumed by the bootstrap subcommand.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RpcEndpointArrayConfig {
     pub rpc_endpoint: Vec<EndpointEntry>,
     #[serde(default = "default_pool_meta")]

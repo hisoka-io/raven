@@ -11,15 +11,24 @@ use std::time::Instant;
 
 use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, InspireVariant, SecurityLevel, ShardConfig};
+use raven_inspire::pir::mod_switch::{
+    extract_inspiring_mod_switched, mod_switch_response_checked, MOD_SWITCH_TARGET_36BIT,
+};
 use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::{
-    extract_inspiring, extract_with_variant, query, respond_seeded_inspiring_cached_with_session,
+    extract_with_variant, query, respond_seeded_inspiring_cached_with_session,
     respond_with_variant, setup, ClientSession, EncodedDatabase, PackingMode, ServerInspiringCache,
     ServerSessionStore,
 };
 
 use raven_b1_bench::adaptive_params::{derive_medium_payload, fmt_derivation, AdaptiveInputs};
-use raven_bench::{BenchFile, BenchReport, GridCell};
+use raven_b1_bench::wire_size;
+use raven_bench::{BenchFile, BenchReport, BenchResult, GridCell, Unit};
+
+/// The rung every served two-packing response is switched to before it leaves the adapter
+/// (`adapters/railgun/engine/src/inspire.rs`). Measuring the pre-switch body would publish a
+/// size nothing sends.
+const SERVED_RESPONSE_MODULUS: u64 = MOD_SWITCH_TARGET_36BIT;
 
 #[derive(Debug, Clone, Copy)]
 struct RoundTrip {
@@ -29,6 +38,10 @@ struct RoundTrip {
     total_us: u64,
     query_bytes: u64,
     response_bytes: u64,
+    /// Pre-switch body, for the variants that have one; the size the switch buys against.
+    response_unswitched_bytes: Option<u64>,
+    /// Retained `b` prefix the server actually kept, which the closed form must predict.
+    retained_coefficients: Option<u32>,
 }
 
 fn round_trip(
@@ -60,14 +73,22 @@ fn round_trip(
                 Some(session_store),
             )
             .expect("respond_seeded_inspiring_cached_with_session");
+            // Inside the server window, because the adapter's `respond` switches before it
+            // returns; every serialization stays outside it.
+            let served = mod_switch_response_checked(params, &response, SERVED_RESPONSE_MODULUS)
+                .expect("mod_switch_response_checked");
             let t2 = Instant::now();
-            let decoded =
-                extract_inspiring(crs, &state, &response, entry_size).expect("extract_inspiring");
+            let decoded = extract_inspiring_mod_switched(crs, &state, &served, entry_size)
+                .expect("extract_inspiring_mod_switched");
             let t3 = Instant::now();
             let q_bytes = bincode::serialize(&seeded_query)
                 .map(|v: Vec<u8>| v.len() as u64)
                 .unwrap_or(0);
-            let r_bytes = response
+            let r_bytes = served
+                .to_binary()
+                .map(|v: Vec<u8>| v.len() as u64)
+                .unwrap_or(0);
+            let unswitched_bytes = response
                 .to_binary()
                 .map(|v: Vec<u8>| v.len() as u64)
                 .unwrap_or(0);
@@ -80,6 +101,8 @@ fn round_trip(
                     total_us: micros_between(t0, t3),
                     query_bytes: q_bytes,
                     response_bytes: r_bytes,
+                    response_unswitched_bytes: Some(unswitched_bytes),
+                    retained_coefficients: served.packed_coefficients,
                 },
             )
         }
@@ -107,6 +130,8 @@ fn round_trip(
                     total_us: micros_between(t0, t3),
                     query_bytes: q_bytes,
                     response_bytes: r_bytes,
+                    response_unswitched_bytes: None,
+                    retained_coefficients: None,
                 },
             )
         }
@@ -252,6 +277,91 @@ fn parse_args() -> CliArgs {
         }
     }
     cli
+}
+
+/// Emit each published byte count beside the size its own shape predicts, and refuse to
+/// write an artifact where the two disagree.
+///
+/// The gate downstream compares an artifact against a pinned one; on its own that accepts
+/// any shrink as a win. A body shorter than its shape's closed form is truncation, and the
+/// only place that distinction is visible is here, where the shape is still in hand.
+///
+/// Only the shipped two-packing path is modelled: the other variants return column
+/// ciphertexts and an inline-key query, which these forms do not describe.
+fn derived_byte_rows(
+    report: &BenchReport,
+    params: &InspireParams,
+    variant: InspireVariant,
+    record_bytes: usize,
+    unswitched_bytes: Option<u64>,
+    retained: Option<u32>,
+) -> Vec<BenchResult> {
+    if variant != InspireVariant::TwoPacking {
+        return Vec::new();
+    }
+    let key = |metric: &str| format!("{}/{}/{metric}", report.scheme, report.cell.label());
+    let bytes_row = |metric: &str, value: u64| BenchResult {
+        bench: key(metric),
+        value: value as f64,
+        unit: Unit::Bytes,
+        samples: Vec::new(),
+    };
+
+    let expected_retained = wire_size::retained_coefficients(record_bytes);
+    if retained != Some(expected_retained as u32) {
+        eprintln!(
+            "SHAPE MISMATCH: server retained {retained:?} coefficients, the {record_bytes} B \
+             record needs {expected_retained}; the closed forms below would describe a \
+             different response"
+        );
+        std::process::exit(4);
+    }
+
+    let crt_limbs = params.crt_moduli.len();
+    let derived_query = wire_size::query_bytes(params.q, params.ring_dim, crt_limbs) as u64;
+    let derived_response =
+        wire_size::response_bytes(SERVED_RESPONSE_MODULUS, params.ring_dim, record_bytes) as u64;
+    let derived_unswitched =
+        wire_size::response_bytes(params.q, params.ring_dim, record_bytes) as u64;
+
+    // `already_published` marks the two counts `BenchReport::to_results` emits; the third is
+    // this function's own row and has to be emitted here or it never reaches the artifact.
+    let mut rows = vec![
+        ("query_bytes", report.query_bytes, derived_query, true),
+        (
+            "response_bytes",
+            report.response_bytes,
+            derived_response,
+            true,
+        ),
+    ];
+    if let Some(measured) = unswitched_bytes {
+        rows.push((
+            "response_unswitched_bytes",
+            measured,
+            derived_unswitched,
+            false,
+        ));
+    }
+
+    let mut out = Vec::with_capacity(rows.len() * 2);
+    for (metric, measured, derived, already_published) in rows {
+        if measured != derived {
+            eprintln!(
+                "DERIVATION MISMATCH on {metric}: measured {measured} B, the shape predicts \
+                 {derived} B (ring_dim={}, crt_limbs={crt_limbs}, record_bytes={record_bytes}, \
+                 q={}, served q'={SERVED_RESPONSE_MODULUS}). A body that does not match its own \
+                 shape is truncation or padding, not a byte win; refusing to publish it.",
+                params.ring_dim, params.q,
+            );
+            std::process::exit(4);
+        }
+        if !already_published {
+            out.push(bytes_row(metric, measured));
+        }
+        out.push(bytes_row(&format!("{metric}_derived"), derived));
+    }
+    out
 }
 
 fn build_database(entries: u64, record_bytes: usize) -> Vec<u8> {
@@ -438,6 +548,8 @@ fn main() {
 
         let mut last_query_bytes = 0u64;
         let mut last_response_bytes = 0u64;
+        let mut last_unswitched_bytes: Option<u64> = None;
+        let mut last_retained: Option<u32> = None;
         let mut query_gen_times_us: Vec<u64> = Vec::new();
         let mut server_times_us: Vec<u64> = Vec::new();
         let mut extract_times_us: Vec<u64> = Vec::new();
@@ -526,6 +638,8 @@ fn main() {
         for (trial, idx, rt) in &trials_completed {
             last_query_bytes = rt.query_bytes;
             last_response_bytes = rt.response_bytes;
+            last_unswitched_bytes = rt.response_unswitched_bytes;
+            last_retained = rt.retained_coefficients;
 
             writeln!(
                 csv,
@@ -613,8 +727,17 @@ fn main() {
             samples: samples_in_trial_order(&total_times_us, &server_times_us, &client_times_us),
         };
 
-        let json =
-            serde_json::to_string_pretty(&BenchFile::from(report.clone())).expect("serialize");
+        let mut file = BenchFile::from(report.clone());
+        file.results.extend(derived_byte_rows(
+            &report,
+            &params,
+            cli.variant,
+            cli.record_bytes,
+            last_unswitched_bytes,
+            last_retained,
+        ));
+
+        let json = serde_json::to_string_pretty(&file).expect("serialize");
         File::create(seed_dir.join(format!(
             "cell-2e{}x{}.json",
             cell.entries_log2, cell.record_bytes

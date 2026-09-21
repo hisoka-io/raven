@@ -1,10 +1,10 @@
 {
-  "hardware": "os=linux; arch=x86_64; cpus=4; cpu=AMD EPYC 7763 64-Core Processor; image=ubuntu24",
-  "captured_at": "2026-08-26T13:35:05Z",
+  "hardware": "os=linux; arch=x86_64; cpus=16; cpu=AMD Ryzen 7 9800X3D 8-Core Processor",
+  "captured_at": "2026-09-21T21:24:42Z",
   "results": [
     {
       "bench": "inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/setup",
-      "value": 6018905049.0,
+      "value": 5844560801.0,
       "unit": "nanoseconds",
       "samples": []
     },
@@ -16,72 +16,96 @@
     },
     {
       "bench": "inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/query_bytes",
-      "value": 98840.0,
+      "value": 15491.0,
       "unit": "bytes",
       "samples": []
     },
     {
       "bench": "inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/response_bytes",
-      "value": 32879.0,
+      "value": 9366.0,
       "unit": "bytes",
       "samples": []
     },
     {
       "bench": "inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/query_median",
-      "value": 25389000.0,
+      "value": 12668000.0,
       "unit": "nanoseconds",
       "samples": [
-        25174000.0,
-        25211000.0,
-        25211000.0,
-        25229000.0,
-        25239000.0,
-        25389000.0,
-        25391000.0,
-        25395000.0,
-        25666000.0,
-        25683000.0
+        10876000.0,
+        11730000.0,
+        10686000.0,
+        24043000.0,
+        39995000.0,
+        18697000.0,
+        12668000.0,
+        10112000.0,
+        17492000.0,
+        10768000.0
       ]
     },
     {
       "bench": "inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/throughput",
-      "value": 39.434042620313264,
+      "value": 59.85622534671719,
       "unit": "queries_per_second",
       "samples": []
     },
     {
       "bench": "inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/server_median",
-      "value": 13801000.0,
+      "value": 10139000.0,
       "unit": "nanoseconds",
       "samples": [
-        13762000.0,
-        13770000.0,
-        13775000.0,
-        13790000.0,
-        13791000.0,
-        13801000.0,
-        13802000.0,
-        13817000.0,
-        14007000.0,
-        14216000.0
+        8291000.0,
+        9018000.0,
+        8475000.0,
+        20680000.0,
+        37677000.0,
+        16378000.0,
+        10139000.0,
+        7634000.0,
+        14363000.0,
+        8428000.0
       ]
     },
     {
       "bench": "inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/client_median",
-      "value": 11450000.0,
+      "value": 2498000.0,
       "unit": "nanoseconds",
       "samples": [
-        11466000.0,
-        11419000.0,
-        11383000.0,
-        11586000.0,
-        11458000.0,
-        11448000.0,
-        11411000.0,
-        11577000.0,
-        11435000.0,
-        11865000.0
+        2585000.0,
+        2711000.0,
+        2210000.0,
+        3363000.0,
+        2317000.0,
+        2318000.0,
+        2528000.0,
+        2476000.0,
+        3129000.0,
+        2339000.0
       ]
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/query_bytes_derived",
+      "value": 15491.0,
+      "unit": "bytes",
+      "samples": []
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/response_bytes_derived",
+      "value": 9366.0,
+      "unit": "bytes",
+      "samples": []
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/response_unswitched_bytes",
+      "value": 15558.0,
+      "unit": "bytes",
+      "samples": []
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/response_unswitched_bytes_derived",
+      "value": 15558.0,
+      "unit": "bytes",
+      "samples": []
     }
   ]
 }

@@ -23,7 +23,16 @@ if [ "$#" -gt 0 ]; then
 else
   # --untracked: a brand-new wasm test file is the case this exists to catch, and it is not in the
   # index yet. git grep answers from the working tree; a plain `git ls-files` would not see it.
-  test_files=$(git grep -l --untracked -E '#\[(wasm_bindgen_test|cfg_attr\([^]]*wasm_bindgen_test[^]]*\))\]' -- '*/tests/*.rs' 2>/dev/null | sort -u)
+  #
+  # Every .rs, and the submodule too: restricting the census to */tests/*.rs made an in-src
+  # #[cfg(test)] or a benches/ wasm test invisible to the gate bought to make that impossible.
+  # scripts/fixtures/ holds this gate's own red-proof inputs, which no real job names.
+  attribute='#\[(wasm_bindgen_test|cfg_attr\([^]]*wasm_bindgen_test[^]]*\))\]'
+  test_files=$(
+    { git grep -l --untracked -E "$attribute" -- '*.rs' ':(exclude)scripts/fixtures/*'
+      git -C crates/inspire grep -l --untracked -E "$attribute" -- '*.rs' \
+        | sed 's|^|crates/inspire/|'
+    } 2>/dev/null | sort -u)
 fi
 
 if [ ! -f "$CI" ]; then
@@ -39,10 +48,20 @@ while IFS= read -r f; do
     continue
   fi
   stem=$(basename "$f" .rs)
-  if ! awk -v target="$stem" '
+  # wasm-pack forwards these to cargo test, so demanding `--test <stem>` for an in-src or
+  # benches wasm test would demand an invocation that cannot run it
+  case "$f" in
+    */src/*) flag="--lib"; target="" ;;
+    */benches/*) flag="--bench"; target="$stem" ;;
+    *) flag="--test"; target="$stem" ;;
+  esac
+  want="${flag}${target:+ $target}"
+  if ! awk -v flag="$flag" -v target="$target" '
     $1 == "wasm-pack" && $2 == "test" {
       for (field = 3; field <= NF; field++) {
-        if (($field == "--test" && $(field + 1) == target) || $field == "--test=" target) {
+        if (target == "") {
+          if ($field == flag) found = 1
+        } else if (($field == flag && $(field + 1) == target) || $field == flag "=" target) {
           found = 1
         }
       }
@@ -50,7 +69,7 @@ while IFS= read -r f; do
     END { exit !found }
   ' "$CI"; then
     echo "WASM TEST NOT RUN BY CI: ${f}" >&2
-    echo "  It carries a wasm_bindgen_test attribute but no wasm-pack test command invokes the exact '--test ${stem}' target in ${CI}." >&2
+    echo "  It carries a wasm_bindgen_test attribute but no wasm-pack test command invokes the exact '${want}' target in ${CI}." >&2
     echo "  A wasm test no job names is compiled and never executed - which is how the only" >&2
     echo "  other one in this tree stayed broken and green." >&2
     fail=1

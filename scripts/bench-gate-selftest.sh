@@ -151,11 +151,15 @@ if [[ -f "$TMP/gate-noseed/seed-0/${GATE_CELL}.json" ]]; then
   gate_run_n "$TMP/gate-seed3" 3
   SEED3="$TMP/gate-seed3/seed-0/${GATE_CELL}.json"
 
-  seed_scaled() { # field  multiplier
+  # `keep_derived` leaves the `_derived` companion alone, which is how a derivation mismatch is
+  # planted; by default it moves with the row so a movement case cannot pass on the derivation
+  # rule instead of the one it is named for.
+  seed_scaled() { # field  multiplier  [keep_derived]
     cp "$SEED3" "$GATE_BASELINE"
-    python3 - "$GATE_BASELINE" "$1" "$2" <<'PY'
+    python3 - "$GATE_BASELINE" "$1" "$2" "${3:-}" <<'PY'
 import json, sys
 path, field, mult = sys.argv[1], sys.argv[2], float(sys.argv[3])
+keep_derived = len(sys.argv) > 4 and sys.argv[4] == "keep_derived"
 d = json.load(open(path))
 hit = [r for r in d["results"] if r["bench"].endswith("/" + field)]
 assert len(hit) == 1, f"expected exactly one {field} row, got {len(hit)}"
@@ -168,12 +172,20 @@ if row["unit"] != "bytes":
         f"{field} baseline carries {len(row.get('samples') or [])} sample(s); a timing row "
         "needs >= 2 to reach a blocking verdict, so this fixture cannot test an exemption"
     )
-assert mult < 1.0, (
-    f"multiplier {mult} scales the baseline UP, which makes the current run look faster; "
-    "an improvement never blocks under any policy and the case would prove nothing"
-)
+# Byte rows block in BOTH directions, so either multiplier exercises the policy there. A
+# timing row scaled up makes the current run look faster, and an improvement never blocks
+# under any policy, so that case would prove nothing.
+if row["unit"] != "bytes":
+    assert mult < 1.0, (
+        f"multiplier {mult} scales a timing baseline UP, which makes the current run look "
+        "faster; an improvement never blocks and the case would prove nothing"
+    )
 row["value"] *= mult
 row["samples"] = [s * mult for s in row.get("samples") or []]
+if not keep_derived:
+    for companion in d["results"]:
+        if companion["bench"].endswith("/" + field + "_derived"):
+            companion["value"] *= mult
 json.dump(d, open(path, "w"))
 PY
   }
@@ -181,6 +193,32 @@ PY
   seed_scaled response_bytes 0.5
   gate_run_n "$TMP/gate-bytes" 3
   check "a byte count that moved BLOCKS the gate" 1 $?
+
+  # A DROP is the direction that scored as a win for as long as the gate existed, and it is
+  # the one that reaches an external party: a truncated response is smaller. Both new cases
+  # assert the reason as well as the rc, because two different rules can both exit 1 and a
+  # case that reads only the rc cannot tell which one fired.
+  gate_reason() { # out_dir ; prints the gate's output
+    BENCH_ENTRIES_LOG2=10 BENCH_RECORD_BYTES=32 BENCH_MEASURED=3 BENCH_WARMUP=0 BENCH_SEEDS=0 \
+      BENCH_OUT_DIR="$1" ./scripts/bench-gate.sh 2>&1
+  }
+  seed_scaled response_bytes 2.0
+  SHRINK_OUT="$(gate_reason "$TMP/gate-shrink" || true)"
+  case "$SHRINK_OUT" in
+    *"shrank off its pin"*) check "a byte count that SHRANK blocks, and says so" 0 0 ;;
+    *) check "a byte count that SHRANK blocks, and says so" 0 1
+       printf '%s\n' "$SHRINK_OUT" | tail -5 >&2 ;;
+  esac
+
+  # The row moves and its derivation does not, so the published figure no longer equals the
+  # closed form for its own shape - which is the rule that decides WHAT to re-pin to.
+  seed_scaled response_bytes 0.5 keep_derived
+  DERIV_OUT="$(gate_reason "$TMP/gate-deriv" || true)"
+  case "$DERIV_OUT" in
+    *"closed form"*) check "a pin that walked away from its shape blocks, and says so" 0 0 ;;
+    *) check "a pin that walked away from its shape blocks, and says so" 0 1
+       printf '%s\n' "$DERIV_OUT" | tail -5 >&2 ;;
+  esac
 
   seed_scaled server_median 0.1
   gate_run_n "$TMP/gate-timing" 3

@@ -1,5 +1,6 @@
 #[cfg(feature = "inspire")]
 pub mod adaptive_params;
+pub mod wire_size;
 
 #[cfg(test)]
 mod tests {

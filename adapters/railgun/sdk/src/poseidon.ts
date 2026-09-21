@@ -1,7 +1,31 @@
 // The adapter returns auth-path nodes, not the root, so the fold happens here and
 // must match upstream Merkletree.hashLeftRight to verify under verifyMerkleProof.
 
-import { poseidonHex } from "@railgun-community/poseidon-hash-wasm";
+import * as poseidonHashWasm from "@railgun-community/poseidon-hash-wasm";
+
+interface PoseidonHexHost {
+  poseidonHex(inputs: string[]): string;
+}
+
+// The dependency ships one object literal assigned to module.exports, which node's ESM
+// named-export detection cannot read: an ESM consumer of the dual build reaches it only
+// under `default`, while the CommonJS emit and every bundler reach it directly.
+function resolvePoseidonHex(): (inputs: string[]) => string {
+  const namespace = poseidonHashWasm as unknown as Partial<PoseidonHexHost> & {
+    default?: Partial<PoseidonHexHost>;
+  };
+  const host = typeof namespace.poseidonHex === "function" ? namespace : namespace.default;
+  if (host === undefined || typeof host.poseidonHex !== "function") {
+    throw new Error(
+      "poseidon: @railgun-community/poseidon-hash-wasm exposed no poseidonHex on its module " +
+        "namespace or its default export; the installed build is not one this SDK can hash with",
+    );
+  }
+  const bound = host as PoseidonHexHost;
+  return (inputs) => bound.poseidonHex(inputs);
+}
+
+const poseidonHex = resolvePoseidonHex();
 
 const FIELD_HEX_LEN = 64;
 

@@ -127,6 +127,52 @@ impl Imt {
         Ok(())
     }
 
+    /// Root this tree would have after appending `leaf`, without appending it.
+    ///
+    /// Lets a caller hold an append to an externally published root before it mutates or
+    /// persists anything. Costs the same [`TREE_DEPTH`] hashes an insert does.
+    ///
+    /// # Errors
+    /// [`AdapterError::InvalidQuery`] if the tree is full, [`AdapterError::Internal`] if a
+    /// node hash fails (a non-canonical `leaf`).
+    ///
+    /// ```
+    /// # use raven_railgun_engine::imt::Imt;
+    /// let mut tree = Imt::new()?;
+    /// let mut leaf = [0u8; 32];
+    /// leaf[31] = 7;
+    /// let previewed = tree.root_after_append(leaf)?;
+    /// tree.insert_leaves(0, &[leaf])?;
+    /// assert_eq!(previewed, tree.root());
+    /// # Ok::<(), raven_railgun_core::AdapterError>(())
+    /// ```
+    pub fn root_after_append(&self, leaf: [u8; 32]) -> Result<[u8; 32]> {
+        if self.leaf_count >= TREE_MAX_ITEMS {
+            return Err(AdapterError::InvalidQuery(format!(
+                "IMT root_after_append: tree is at capacity {TREE_MAX_ITEMS}"
+            )));
+        }
+        let mut hash = leaf;
+        let mut index = self.leaf_count;
+        for level in 0..TREE_DEPTH {
+            let sibling = self.node_hash(level, index ^ 1);
+            let (left, right) = if index & 1 == 0 {
+                (hash, sibling)
+            } else {
+                (sibling, hash)
+            };
+            hash = merkle_node(left, right).map_err(|e| {
+                AdapterError::Internal(format!(
+                    "imt append preview level {} idx {}: {e}",
+                    level + 1,
+                    index >> 1
+                ))
+            })?;
+            index >>= 1;
+        }
+        Ok(hash)
+    }
+
     fn set_leaf_and_update_path(&mut self, leaf_index: usize, leaf: [u8; 32]) -> Result<()> {
         self.nodes[0].insert(leaf_index, leaf);
 

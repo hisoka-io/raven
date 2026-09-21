@@ -214,6 +214,62 @@ async fn malformed_json_rpc_envelopes_fail_closed() {
     }
 }
 
+/// Upstream serves a stored tree root or omits the row. The engine applies an all-zero root
+/// uncompared, so one arriving here would skip the only check on the row's bytes.
+#[tokio::test]
+async fn an_all_zero_validated_merkleroot_is_refused_at_decode() {
+    for (root, accepted) in [(format!("{:064x}", 7), true), ("0".repeat(64), false)] {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [{
+                "signedPOIEvent": {
+                    "index": 0,
+                    "blindedCommitment": format!("{:064x}", 1),
+                    "signature": "00".repeat(64),
+                    "type": "Shield"
+                },
+                "validatedMerkleroot": root
+            }]
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local address"));
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/",
+                    post(move || {
+                        let response = response.clone();
+                        async move { Json(response) }
+                    }),
+                ),
+            )
+            .await
+            .expect("serve");
+        });
+        let mirror = UpstreamPpoiMirror::new(MirrorConfig {
+            endpoint,
+            ..MirrorConfig::default()
+        })
+        .expect("mirror");
+
+        let result = mirror.fetch_status_range(&ListKey([0x42; 32]), 0, 0).await;
+        if accepted {
+            assert_eq!(result.expect("a real root decodes").len(), 1);
+        } else {
+            let error = result.expect_err("an all-zero root must not decode");
+            assert!(
+                matches!(&error, MirrorError::Decode(detail) if detail.contains("all-zero")),
+                "{error}"
+            );
+        }
+        server.abort();
+    }
+}
+
 #[tokio::test]
 async fn worker_short_tail_resumes_at_the_last_consumed_index() {
     let max_index = Arc::new(AtomicU64::new(2));

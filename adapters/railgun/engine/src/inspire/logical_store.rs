@@ -21,9 +21,9 @@ pub fn materialize_shard_bytes(
     let shard_end_global = shard_start_global + u64::from(entries_per_shard);
 
     // Row index is the leaf index alone, and the tree is a FILTER rather than part of the
-    // index. The invariant lives in the encoder's `tree_number` pin, NOT in the router:
-    // the multi-instance path scopes by route table but `indexer_to_consumer_bridge` on
-    // the single-instance path forwards every tree, so a store can hold more than one.
+    // index. The invariant lives in the encoder's `tree_number` pin, NOT in ingest: both
+    // ingest paths scope by tree (route table, or `indexer_to_consumer_bridge`), but
+    // `LogicalLeafStore::apply` takes any tree, so a store can hold more than one.
     // Folding the tree into the index instead would shift an already-tree-local leaf out
     // of its own cell; ignoring it entirely would let a foreign tree overwrite this row.
     for ((tree, leaf), commitment) in store.leaves_iter() {
@@ -177,6 +177,18 @@ pub struct LogicalLeafStore {
     ppoi_event_metadata:
         std::collections::BTreeMap<([u8; 32], u32), raven_railgun_persistence::PpoiEventMetadata>,
     ppoi_list_leaf_block_height: std::collections::BTreeMap<([u8; 32], u32), u64>,
+    // Upper-sibling addenda as of the last PUBLISHED state, and the epoch they came from. The
+    // served row comes from a snapshot while the addendum used to come from this live store,
+    // which runs up to a commit cadence ahead (1000 appends / 300 s), so the pair could not be
+    // shown to share a state. `serde(skip)`: in-memory only, never on a snapshot or the wire.
+    #[serde(skip)]
+    committed_addenda: std::collections::BTreeMap<([u8; 32], u32), Vec<u8>>,
+    // The encoded database these addenda were derived alongside. THIS is tree provenance, not the
+    // epoch: `heartbeat_session_eviction` bumps the epoch every session-eviction interval while
+    // carrying `encoded_db` by `Arc::clone`, so an epoch equality check refuses a frozen block
+    // forever one hour after boot. A commit replaces the Arc; a heartbeat does not.
+    #[serde(skip)]
+    committed_addenda_db: Option<std::sync::Arc<raven_inspire::EncodedDatabase>>,
 }
 
 /// The `LogicalLeafStore` shape every V6 snapshot on disk was written with, frozen.
@@ -246,6 +258,8 @@ impl LogicalLeafStoreV6 {
             ppoi_index_bc: self.ppoi_index_bc,
             ppoi_event_metadata: std::collections::BTreeMap::new(),
             ppoi_list_leaf_block_height: self.ppoi_list_leaf_block_height,
+            committed_addenda: std::collections::BTreeMap::new(),
+            committed_addenda_db: None,
         }
     }
 
@@ -432,6 +446,12 @@ impl LogicalLeafStore {
                 for key in stale_ppoi {
                     self.ppoi_status.remove(&key);
                     self.ppoi_block_height.remove(&key);
+                    // Dropping a status rewrites the row's verdict byte. Read the index before
+                    // the list-leaf pass below removes it.
+                    if let Some(list_index) = self.ppoi_bc_index.get(&key).copied() {
+                        self.dirty_shards
+                            .extend(encoder.affected_shards_for_ppoi_leaf(&key.0, list_index));
+                    }
                 }
 
                 let stale_list_leaves: Vec<([u8; 32], u32)> = self
@@ -531,6 +551,37 @@ impl LogicalLeafStore {
         self.ppoi_imts.get(list_key).map(crate::imt::Imt::root)
     }
 
+    /// Hold the next append on `list_key` to `upstream_root`: `None` when appending `leaf`
+    /// gives exactly that root, the divergence otherwise. Compares nothing but the root, so
+    /// the index it reports is the only one an append can take, the current leaf count.
+    ///
+    /// # Errors
+    /// [`AdapterError::InvalidQuery`] if the list's tree is full, [`AdapterError::Internal`]
+    /// if `leaf` cannot be hashed.
+    pub fn ppoi_root_divergence(
+        &self,
+        list_key: &[u8; 32],
+        leaf: &[u8; 32],
+        upstream_root: &[u8; 32],
+    ) -> Result<Option<crate::ppoi_root::PpoiRootDivergence>> {
+        let (leaf_count, local_root) = match self.ppoi_imts.get(list_key) {
+            Some(imt) => (imt.leaf_count(), imt.root_after_append(*leaf)?),
+            None => (0, crate::imt::Imt::new()?.root_after_append(*leaf)?),
+        };
+        if &local_root == upstream_root {
+            return Ok(None);
+        }
+        let list_index = u32::try_from(leaf_count).map_err(|_| {
+            AdapterError::Internal(format!("per-list leaf count {leaf_count} exceeds u32"))
+        })?;
+        Ok(Some(crate::ppoi_root::PpoiRootDivergence {
+            list_key: *list_key,
+            list_index,
+            local_root,
+            upstream_root: *upstream_root,
+        }))
+    }
+
     /// Number of distinct PPOI lists with at least one applied leaf.
     #[must_use]
     pub fn ppoi_list_count(&self) -> usize {
@@ -605,6 +656,94 @@ impl LogicalLeafStore {
             AdapterError::InvalidQuery(format!("list_index {list_index} out of usize range"))
         })?;
         imt.merkle_proof(idx)
+    }
+
+    /// Re-derive the upper-sibling addendum for every shard of every list this store holds, and
+    /// record the encoded database it was derived alongside.
+    ///
+    /// The commit driver calls this straight after a state is published, while the consumer -- the
+    /// sole writer for this instance -- is inside `drive_commit` and no append can interleave.
+    /// A shard whose proof does not resolve is left ABSENT rather than defaulted: an empty addendum
+    /// folds to a wrong root, so the caller must refuse instead of serving one.
+    pub fn refresh_committed_addenda(
+        &mut self,
+        derived_alongside: &std::sync::Arc<raven_inspire::EncodedDatabase>,
+        entries_per_shard: u32,
+    ) {
+        self.committed_addenda.clear();
+        self.committed_addenda_db = Some(std::sync::Arc::clone(derived_alongside));
+        if entries_per_shard == 0 {
+            return;
+        }
+        // Levels 11..15 are derived ONCE per shard, from its first leaf, and served to every row in
+        // it. That holds only while a shard sits inside one level-11 subtree. At twice this bound the
+        // two halves of a shard have different upper siblings, and half the rows would fold to a wrong
+        // root -- served with HTTP 200 and caught only by the client's pinned root.
+        //
+        // The bound belongs HERE and not in the encoder's constructor: the same width is legitimate
+        // for the dirty-set property, where the affected subtree sits inside one shard. Refusing at
+        // construction would reject a sound configuration for an unrelated reason.
+        //
+        // Leaving the table empty is the refusal: the batch path already returns 503 and increments
+        // `raven_railgun_addendum_missing_total` for a shard with no committed addendum.
+        let upper_subtree_leaves = 1u32 << crate::pir_table::list::PATH10_LEVELS;
+        if entries_per_shard > upper_subtree_leaves {
+            tracing::error!(
+                target = "raven::engine::addendum",
+                entries_per_shard,
+                bound = upper_subtree_leaves,
+                path10_levels = crate::pir_table::list::PATH10_LEVELS,
+                "refusing to derive upper-sibling addenda: a shard this wide spans more than one \
+                 level-11 subtree, so no single addendum is correct for all of its rows; raise \
+                 PATH10_LEVELS with the record layout or narrow entries_per_shard"
+            );
+            return;
+        }
+        let shards = u32::try_from(crate::imt::TREE_MAX_ITEMS)
+            .unwrap_or(u32::MAX)
+            .saturating_div(entries_per_shard);
+        let list_keys: Vec<[u8; 32]> = self.ppoi_imts.keys().copied().collect();
+        for list_key in list_keys {
+            for shard_id in 0..shards {
+                let Some(first) = shard_id.checked_mul(entries_per_shard) else {
+                    continue;
+                };
+                let Ok(proof) = self.ppoi_merkle_proof(&list_key, first) else {
+                    continue;
+                };
+                let addendum: Vec<u8> = proof
+                    .elements
+                    .into_iter()
+                    .skip(crate::pir_table::list::PATH10_LEVELS)
+                    .take(crate::imt::TREE_DEPTH - crate::pir_table::list::PATH10_LEVELS)
+                    .flatten()
+                    .collect();
+                self.committed_addenda
+                    .insert((list_key, shard_id), addendum);
+            }
+        }
+    }
+
+    /// The upper-sibling addendum for a shard as of [`Self::committed_addenda_epoch`].
+    #[must_use]
+    pub fn committed_addendum(&self, list_key: &[u8; 32], shard_id: u32) -> Option<&[u8]> {
+        self.committed_addenda
+            .get(&(*list_key, shard_id))
+            .map(Vec::as_slice)
+    }
+
+    /// Whether the retained addenda were derived alongside exactly this encoded database.
+    ///
+    /// Pointer identity is the signal on purpose. A heartbeat republishes the same `Arc` and must
+    /// keep serving; a commit publishes a new one and must refuse until the table is refreshed.
+    #[must_use]
+    pub fn committed_addenda_derived_from(
+        &self,
+        db: &std::sync::Arc<raven_inspire::EncodedDatabase>,
+    ) -> bool {
+        self.committed_addenda_db
+            .as_ref()
+            .is_some_and(|mine| std::sync::Arc::ptr_eq(mine, db))
     }
 
     /// Drain the dirty-shards set after re-encoding.
@@ -687,9 +826,16 @@ pub fn apply_wal_entry(
 /// [`LogicalLeafStore::apply`] does, so a payload that passes here and is then
 /// applied against the same store cannot be refused for one of those reasons.
 ///
+/// A `PpoiListLeafAdded` is also held to the upstream root it carries, and ONLY here:
+/// [`LogicalLeafStore::apply`] is what WAL replay runs, replay soft-skips a refused row, and
+/// a skipped row leaves the tree a leaf short for good. A row is screened once, ahead of the
+/// write that makes it durable. The all-zero root is the one value not compared; it is
+/// counted instead.
+///
 /// # Errors
 /// [`AdapterError::InvalidQuery`] on a non-contiguous index, an index at or
-/// past IMT capacity, or a leaf at or above the BN254 scalar modulus.
+/// past IMT capacity, a leaf at or above the BN254 scalar modulus, or a
+/// [`crate::ppoi_root::PpoiRootDivergence`].
 pub fn validate_apply(
     store: &LogicalLeafStore,
     payload: &raven_railgun_persistence::WalEntryPayload,
@@ -712,16 +858,52 @@ pub fn validate_apply(
             list_key,
             list_index,
             blinded_commitment,
+            validated_merkleroot,
             ..
         } => {
             let expected = store
                 .ppoi_imt(list_key)
                 .map_or(0, crate::imt::Imt::leaf_count);
             checked_imt_append(ImtSlot::PpoiList, *list_index, expected, blinded_commitment)?;
+            screen_upstream_root(
+                store,
+                list_key,
+                *list_index,
+                blinded_commitment,
+                validated_merkleroot,
+            )?;
         }
         P::PpoiStatus { .. } | P::Reorg { .. } | P::Heartbeat { .. } => {}
     }
     Ok(())
+}
+
+// Runs after the contiguity screen, so `list_index` is the index the append takes. Counted
+// here rather than by a caller: a refusal nobody counted is the defect this exists to end.
+fn screen_upstream_root(
+    store: &LogicalLeafStore,
+    list_key: &[u8; 32],
+    list_index: u32,
+    leaf: &[u8; 32],
+    upstream_root: &[u8; 32],
+) -> Result<()> {
+    if upstream_root == &crate::ppoi_root::NO_UPSTREAM_ROOT {
+        metrics::counter!(crate::ppoi_root::PPOI_ROOT_UNASSERTED_TOTAL).increment(1);
+        tracing::warn!(
+            list_key = %crate::orchestrator::hex_lower_32(list_key),
+            list_index,
+            "PPOI list row carries the all-zero root; applying it with no upstream root \
+             comparison. The upstream feed never serves one"
+        );
+        return Ok(());
+    }
+    match store.ppoi_root_divergence(list_key, leaf, upstream_root)? {
+        None => Ok(()),
+        Some(divergence) => {
+            metrics::counter!(crate::ppoi_root::PPOI_ROOT_DIVERGENCE_TOTAL).increment(1);
+            Err(divergence.into())
+        }
+    }
 }
 
 /// Whether applying this payload APPENDS to an IMT.

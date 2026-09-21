@@ -5,16 +5,18 @@
 # ignored, and then excluded by name from the one lane that runs ignored tests.
 #
 # This gate does not demand zero. It FREEZES the existing set in
-# scripts/ignore-coverage-allowlist.txt and fails when a NEW uncovered ignore appears. Debt can
-# shrink freely - removing a line means the test gained a lane - and cannot silently grow.
+# scripts/ignore-coverage-allowlist.txt and fails when a NEW uncovered ignore appears, and when a
+# listed one gained a lane and was not removed: the figure it prints is only the real debt while
+# the list is exactly the uncovered set.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-ALLOW=scripts/ignore-coverage-allowlist.txt
+# the overrides point a red-proof at copies, so it never has to mutate a tracked file
+ALLOW="${IGNORE_COVERAGE_ALLOWLIST:-scripts/ignore-coverage-allowlist.txt}"
 [ -f "$ALLOW" ] || { echo "missing ${ALLOW}" >&2; exit 1; }
 
 current=$(python3 - <<'PY'
-import re, subprocess, pathlib, sys
+import os, re, subprocess, pathlib, sys
 def ignores():
     out = []
     invalid = []
@@ -53,15 +55,25 @@ def ignores():
         sys.exit(1)
     return out
 
-ci = pathlib.Path('.github/workflows/ci.yml').read_text()
-bins, excluded = set(), set()
-for m in re.finditer(r'filter: "((?:[^"\\]|\\.)*)"', ci):
-    f = m.group(1)
-    bins |= set(re.findall(r'binary\(([A-Za-z_0-9]+)\)', f))
-    if ' - (' in f:
-        excluded |= set(re.findall(r'test\(([A-Za-z_0-9]+)\)', f.split(' - (', 1)[1]))
-for m in re.finditer(r"-E '([^']*)'", ci):
-    bins |= set(re.findall(r'binary\(([A-Za-z_0-9]+)\)', m.group(1)))
+ci = pathlib.Path(os.environ.get('IGNORE_COVERAGE_WORKFLOW', '.github/workflows/ci.yml')).read_text()
+bins, included, excluded = set(), set(), set()
+for pattern in (r'filter: "((?:[^"\\]|\\.)*)"', r"-E '([^']*)'"):
+    for m in re.finditer(pattern, ci):
+        # a test() term on the INCLUSION side selects as surely as a binary() does; reading only
+        # the exclusion side reported a running test as debt
+        inclusion, _, exclusion = m.group(1).partition(' - (')
+        bins |= set(re.findall(r'binary\(([A-Za-z_0-9]+)\)', inclusion))
+        included |= set(re.findall(r'test\(([A-Za-z_0-9]+)\)', inclusion))
+        excluded |= set(re.findall(r'test\(([A-Za-z_0-9]+)\)', exclusion))
+# a `cargo test -- --ignored --exact NAME` step runs the test as surely as a lane does, and the
+# submodule workspaces are driven that way rather than through nextest filters
+included |= set(re.findall(r'--exact[ \t]+([A-Za-z_0-9]+)', ci))
+
+
+def names(terms, fn):
+    # nextest matches test(NAME) as a substring of the test name
+    return any(term in fn for term in terms)
+
 
 for path, ln in ignores():
     stem = pathlib.Path(path).stem
@@ -72,7 +84,7 @@ for path, ln in ignores():
         if fm:
             fn = fm.group(1)
             break
-    if not (stem in bins and fn not in excluded):
+    if not ((stem in bins or names(included, fn)) and not names(excluded, fn)):
         print(f"{path}::{fn}")
 PY
 ) || { echo "enumeration failed" >&2; exit 1; }
@@ -91,9 +103,12 @@ fi
 
 gone=$(comm -13 <(printf '%s\n' "$current" | sort -u) <(printf '%s\n' "$allowed"))
 if [ -n "$gone" ]; then
-  echo "note: $(printf '%s\n' $gone | wc -l) allowlisted entries are no longer uncovered." >&2
-  echo "      Prune them from ${ALLOW} to keep the debt figure honest:" >&2
+  echo "STALE ALLOWLIST ENTRY: these are covered by a lane and still counted as debt:" >&2
   printf '  %s\n' $gone >&2
+  echo "" >&2
+  echo "Delete them from ${ALLOW} in the change that gave them a lane. The figure this gate" >&2
+  echo "prints is quoted as the repo's test debt, so a stale line makes it a lie." >&2
+  exit 1
 fi
 
 echo "scripts/check-ignore-coverage.sh: clean ($(printf '%s\n' "$current" | /usr/bin/grep -c . ) uncovered, all allowlisted)."

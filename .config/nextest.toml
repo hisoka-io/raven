@@ -17,33 +17,14 @@ failure-output = "final"
 success-output = "never"
 slow-timeout = { period = "120s", terminate-after = 3 }
 
-# serialize tests that contend on shared global resources (child binary,
-# port binds, /tmp dirs, flock on a shared data_dir): one at a time
+# serialize tests that take an flock: one at a time
 [test-groups]
-chaos-subprocess = { max-threads = 1 }
 flock-tests = { max-threads = 1 }
-concurrency-stress = { max-threads = 1 }
-
-[[profile.default.overrides]]
-filter = "test(/chaos|kill_during|sigkill|migrate_chaos|auto_spawn_chaos|snapshot_chaos|fork_and_kill|chaos_child|drain_wal_on_sigterm/)"
-test-group = "chaos-subprocess"
 
 [[profile.default.overrides]]
 filter = "test(/flock|lock_held|concurrent_run_lock|lock_contention/)"
 test-group = "flock-tests"
 
-[[profile.default.overrides]]
-filter = "test(/arcswap_stress|arcswap_routes_no_torn|under_50_readers/)"
-test-group = "concurrency-stress"
-
-[[profile.ci.overrides]]
-filter = "test(/chaos|kill_during|sigkill|migrate_chaos|auto_spawn_chaos|snapshot_chaos|fork_and_kill|chaos_child|drain_wal_on_sigterm/)"
-test-group = "chaos-subprocess"
-
 [[profile.ci.overrides]]
 filter = "test(/flock|lock_held|concurrent_run_lock|lock_contention/)"
 test-group = "flock-tests"
-
-[[profile.ci.overrides]]
-filter = "test(/arcswap_stress|arcswap_routes_no_torn|under_50_readers/)"
-test-group = "concurrency-stress"

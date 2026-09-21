@@ -58,7 +58,7 @@ export function stubCtx(queryBytes?: Uint8Array): ClientPirContext {
 
 /**
  * The ONE test-side writer of the batch-response envelope
- * `[u16 BE version = 6][u64 LE count][{u64 LE len, bytes}*]` that
+ * `[u16 BE version = 8][u64 LE count][{u64 LE len, bytes}*]` that
  * `decodeBatchBody` (src/raven-poi-node-interface.ts) reads. Six hand-rolled copies of
  * this shape used to live across the suite; a wire change would have left five of them
  * silently asserting a format the server no longer speaks. auth_path_stub_parity.test.ts
@@ -71,7 +71,7 @@ export function encodeBatchResponseNodes(nodes: readonly Uint8Array[]): Uint8Arr
   }
   const out = new Uint8Array(total);
   out[0] = 0;
-  out[1] = 7;
+  out[1] = 8;
   const dv = new DataView(out.buffer);
   dv.setUint32(2, nodes.length, true);
   dv.setUint32(6, 0, true);

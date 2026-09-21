@@ -7,6 +7,16 @@
 # Byte counts are exact: query_bytes and response_bytes each hold one value across every
 # CI artifact measured, so any movement is a real change and needs no threshold.
 #
+# BOTH DIRECTIONS BLOCK. The baseline is a pin, not a budget. A differ handed two numbers
+# cannot tell a real byte win from a truncated body, so scoring "smaller" as an improvement
+# both let ~83 KB of regression headroom open under a green gate and removed the only moment
+# a human was forced to look. A win is landed by re-pinning, deliberately, in review.
+#
+# What separates a win from truncation is the shape, and the shape stays with the producer:
+# every byte count in an artifact ships beside the closed form its own run predicts, and the
+# differ refuses any pair that disagrees. That is why a re-pin has to come from a producer
+# run - a hand-edited figure keeps the prediction it was produced with and reds.
+#
 # Timings are exempt because the SAMPLING UNIT is wrong, not because the statistics are.
 # The Welch implementation is exact - cross-checked against scipy over 135 same-commit
 # comparisons, agreeing to 1.78e-14 in log10 p. What it is fed is the within-job sample
@@ -42,7 +52,9 @@ SEEDS="${BENCH_SEEDS:-0,1,2}"
 
 CELL="cell-2e${ENTRIES_LOG2}x${RECORD_BYTES}"
 BASELINE_DIR="benches/baselines"
-BASELINE="${BASELINE_DIR}/b1-${VARIANT}-${CELL}.json"
+# Overridable so a red-proof can point the real gate at a deliberately broken pin without
+# writing inside benches/baselines/, where a crashed run leaves a stray baseline behind.
+BASELINE="${BENCH_BASELINE:-${BASELINE_DIR}/b1-${VARIANT}-${CELL}.json}"
 OUT_DIR="${BENCH_OUT_DIR:-target/bench-gate}"
 REPORT_ONLY="${BENCH_REPORT_ONLY:-0}"
 
@@ -135,6 +147,8 @@ if [[ "$REPORT_ONLY" == "1" ]]; then
   echo "bench-gate: REPORT-ONLY. Nothing above can fail this build."
 else
   echo "bench-gate: gated on BYTE COUNTS ONLY (query_bytes, response_bytes, hint_bytes)."
+  echo "bench-gate: byte counts block in BOTH directions - a drop is landed by re-pinning"
+  echo "bench-gate: from a producer run, not by passing silently."
   echo "bench-gate: every timing row above is measured and exempt, so a green verdict here"
   echo "bench-gate: is NOT evidence that performance held. See the header of this script."
 fi

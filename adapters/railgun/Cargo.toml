@@ -65,7 +65,7 @@ raven-railgun-testkit = { path = "testkit", version = "0.1.0-alpha.0" }
 # Feature unification is per-workspace, so the wasm clients resolve raven-inspire
 # elsewhere (crates/client in the root workspace, client-wasm in its own) and keep
 # the sequential default: no rayon reaches the browser bundle.
-raven-inspire = { path = "../../crates/inspire", features = ["parallel"] }
+raven-inspire = { path = "../../crates/inspire", features = ["parallel", "mod-switch-response"] }
 
 # Common deps
 thiserror = "2"

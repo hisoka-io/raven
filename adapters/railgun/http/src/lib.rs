@@ -25,6 +25,7 @@ pub mod config;
 pub mod events;
 pub mod fanout;
 pub mod poi_shim;
+pub mod shim_store;
 pub mod state;
 pub mod status;
 pub mod trusted_proxy;
@@ -35,6 +36,7 @@ pub use auth::AuthScope;
 pub use batch::BatchError;
 pub use config::HttpConfig;
 pub use fanout::{FanoutError, FanoutRequest};
+pub use shim_store::{CoverageRefusal, ListCoverage, ShimStoreRegistry};
 pub use state::AppState;
 pub use status::{
     ConsumerStatus, HealthConsumerView, HealthReadyResponse, InstanceStatus, RpcEndpointHealthView,

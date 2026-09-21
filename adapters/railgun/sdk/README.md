@@ -2,6 +2,42 @@
 
 Drop-in `POINodeInterface` for the Railgun wallet stack. Privately resolves PPOI status, PPOI auth-paths, and commit-tree auth-paths against a Raven Railgun PIR adapter server.
 
+## Install
+
+```sh
+npm install @raven/railgun-poi-node-interface
+```
+
+```ts
+// ESM, and any bundler
+import { RavenPOINodeInterface } from "@raven/railgun-poi-node-interface";
+```
+
+```js
+// CommonJS, which is what a `tsc`-built wallet emits
+const { RavenPOINodeInterface } = require("@raven/railgun-poi-node-interface");
+```
+
+Node 20 or newer. The package ships a CommonJS build and an ESM build with a `.d.ts` beside each,
+selected through conditional `exports`; no TypeScript source is on any resolution path a loader
+takes. From a checkout, `pnpm install && pnpm run build` produces both, `pnpm pack` produces the
+tarball a consumer installs, and `adapters/railgun/scripts/check-sdk-pack.sh` installs that tarball
+into a throwaway CommonJS project and a throwaway ESM project and refuses a tarball that is not the
+intended surface.
+
+### The PIR client WASM is supplied by the caller
+
+Client-side PIR needs `raven-inspire-client-wasm`, the wasm-pack output of
+`adapters/railgun/client-wasm`. No module under `src/` imports it: the caller loads it and passes it
+in through `clientPirContexts`, typed as `RavenInspireWasm`, so the shape this package depends on is
+the interface, not the artifact.
+
+The manifest still lists that package as a runtime dependency under a repo-relative `file:` path
+that resolves to nothing outside this repository. Installing the tarball succeeds and the SDK works,
+but the consumer is left with a dangling `node_modules/raven-inspire-client-wasm` link and
+`npm ls` reports the tree invalid. How the WASM is published, and therefore how this entry should
+read, is still open.
+
 ## How it plugs in
 
 `RavenPOINodeInterface` implements Railgun's abstract `POINodeInterface`, the same class the stock `WalletPOINodeInterface` implements:
@@ -11,11 +47,30 @@ import { RavenPOINodeInterface } from "@raven/railgun-poi-node-interface";
 
 const poi = new RavenPOINodeInterface({
   endpoint: "https://raven.example.com",
-  bearerToken: process.env.RAVEN_BEARER_TOKEN!,
+  // Optional; see "The credential is optional" below before leaving it out.
+  bearerToken: process.env.RAVEN_BEARER_TOKEN,
   // Used by validation/submission; private stale reads still refuse by default.
   upstreamFallbackEndpoint: "https://ppoi.fdi.network",
 });
 ```
+
+### The credential is optional
+
+`bearerToken` is sent as `Authorization: Bearer <token>` on every request to `endpoint`, and never
+to `upstreamFallbackEndpoint`. Leave it out, or pass `undefined`, and the SDK sends no
+`Authorization` header at all -- the same shape as Railgun's own POI node client, which addresses a
+node by URL alone.
+
+**Leaving it out works only against a node that does not require a credential.** A node that does
+answers `401` on every route the SDK uses, which surfaces as a typed `ServerError` `RavenError`
+carrying `status: 401`. A stock Raven adapter configures a mandatory `read_token`, so it is such a
+node: pass its token.
+
+A token that is empty, has leading or trailing whitespace, or holds anything but printable ASCII
+is refused at construction with `InvalidQuery`, and the message never quotes it. The SDK never
+interpolates what it was given: `process.env.RAVEN_BEARER_TOKEN!` with the variable unset is
+`undefined` at runtime whatever its type says, and that is treated as no credential rather than
+sent as `Authorization: Bearer undefined`, a request that looks authenticated and is not.
 
 Wiring it into a wallet: today `startRailgunEngine` takes a list of POI node URLs and builds the stock `WalletPOINodeInterface` internally, and neither `WalletPOI` nor a POI-interface setter is part of the wallet's public API. Making `RavenPOINodeInterface` the active POI interface therefore needs a small, additive injection point in Railgun (one hook that accepts any `POINodeInterface`), or it is wired in through a fork. That injection point is the integration to land with the Railgun team.
 
@@ -94,7 +149,7 @@ choose freshness over query privacy must opt in:
 ```ts
 const poi = new RavenPOINodeInterface({
   endpoint: "https://raven.example.com",
-  bearerToken: process.env.RAVEN_BEARER_TOKEN!,
+  bearerToken: process.env.RAVEN_BEARER_TOKEN,
   upstreamFallbackEndpoint: "https://ppoi.fdi.network",
   privateStalePolicy: "allow-upstream-disclosure",
 });

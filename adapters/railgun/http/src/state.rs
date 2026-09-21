@@ -35,9 +35,13 @@ pub struct AppState<S: PirScheme> {
     /// Orchestrator metrics for `/v1/status` lag fields. `None` omits the fields.
     pub(crate) consumer_metrics:
         Arc<Option<Arc<parking_lot::Mutex<raven_railgun_engine::persistence::ConsumerMetrics>>>>,
-    /// Shared logical leaf store for the PPOI shim routes. `None` returns 503.
+    /// Undeclared single store for the PPOI shim routes, test-only: it carries no routing
+    /// filter, so no route can prove what it covers. `None` returns 503.
     pub(crate) logical_store:
         Arc<Option<Arc<parking_lot::Mutex<raven_railgun_engine::inspire::LogicalLeafStore>>>>,
+    /// Filter-tagged stores the shim routes prove coverage against. Installed at boot; once
+    /// installed it is authoritative and `logical_store` is never consulted.
+    pub(crate) shim_stores: Arc<Option<crate::shim_store::ShimStoreRegistry>>,
     pub(crate) instance_logical_stores: Arc<InstanceLogicalStores>,
     /// Per-instance concurrency caps for `/v1/status`. Falls back to `max_concurrent_queries`.
     pub(crate) instance_concurrency: Arc<HashMap<InstanceId, u32>>,
@@ -72,6 +76,7 @@ impl<S: PirScheme> Clone for AppState<S> {
             scheme_name: Arc::clone(&self.scheme_name),
             consumer_metrics: Arc::clone(&self.consumer_metrics),
             logical_store: Arc::clone(&self.logical_store),
+            shim_stores: Arc::clone(&self.shim_stores),
             instance_logical_stores: Arc::clone(&self.instance_logical_stores),
             instance_concurrency: Arc::clone(&self.instance_concurrency),
             chain_source_mode: Arc::clone(&self.chain_source_mode),
@@ -122,6 +127,7 @@ impl<S: PirScheme> AppState<S> {
             scheme_name,
             consumer_metrics: Arc::new(None),
             logical_store: Arc::new(None),
+            shim_stores: Arc::new(None),
             instance_logical_stores: Arc::new(HashMap::new()),
             instance_concurrency: Arc::new(HashMap::new()),
             chain_source_mode: Arc::new(None),
@@ -194,7 +200,32 @@ impl<S: PirScheme> AppState<S> {
         self
     }
 
-    /// Attach the logical leaf store for the PPOI shim routes. Without this, shim routes 503.
+    /// Register the filter-tagged stores every shim route proves coverage against.
+    ///
+    /// Installing this is what puts the shim routes out of reach of an undeclared store: a
+    /// route resolves through the registry and refuses when no wired store covers the whole
+    /// question, rather than answering from whatever happens to be held.
+    #[must_use]
+    pub fn with_shim_stores<I>(mut self, declarations: I) -> Self
+    where
+        I: IntoIterator<
+            Item = (
+                raven_railgun_engine::orchestrator::DataSourceFilter,
+                Arc<parking_lot::Mutex<raven_railgun_engine::inspire::LogicalLeafStore>>,
+            ),
+        >,
+    {
+        self.shim_stores = Arc::new(Some(
+            crate::shim_store::ShimStoreRegistry::from_declarations(declarations),
+        ));
+        self
+    }
+
+    /// Attach a single undeclared logical leaf store. Without this, shim routes 503.
+    ///
+    /// Carries no routing filter, so nothing can prove what it covers; kept for unit tests
+    /// that drive the handlers without a multi-instance boot, and ignored entirely once
+    /// [`Self::with_shim_stores`] has been called.
     #[must_use]
     pub fn with_logical_store(
         mut self,

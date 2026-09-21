@@ -120,7 +120,7 @@ describe("T1 end-to-end: real PIR decode from wire bytes to verdicts", () => {
         const out = encodeBatchResponseNodes(
           Array.from({ length: encodedBatchCount(requestBody) }, () => response),
         );
-        // Must stay genuinely UNKNOWN: 7 is the current version now.
+        // Must stay genuinely UNKNOWN: 8 is the current version now.
         out[1] = EXPECTED_WIRE_SCHEMA_VERSION + 1;
         writeBinary(res, out);
         return true;

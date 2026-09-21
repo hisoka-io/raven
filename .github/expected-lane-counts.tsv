@@ -3,7 +3,7 @@
 # this file in the same change that removes the tests.
 durability-and-closure/crash-safety	14
 durability-and-closure/wal-and-snapshot-chaos	3
-durability-and-closure/cli-ignored	63
+durability-and-closure/cli-ignored	70
 # 12, not 8: this lane includes the setup-cache consumption oracles, and its filter carries a
 # bare `test(insert_rejects_overflow_past_capacity)` that
 # resolves to an in-src lib test. The original anchor here counted only `pkg::binary test` rows,

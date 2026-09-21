@@ -31,7 +31,6 @@ slow-timeout = { period = "300s", terminate-after = 4 }
 [test-groups]
 chaos-subprocess = { max-threads = 1 }
 flock-tests = { max-threads = 1 }
-concurrency-stress = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = "test(/chaos|kill_during|sigkill|migrate_chaos|auto_spawn_chaos|snapshot_chaos|fork_and_kill|chaos_child|drain_wal_on_sigterm/)"
@@ -41,10 +40,6 @@ test-group = "chaos-subprocess"
 filter = "test(/flock|lock_held|concurrent_run_lock|lock_contention/)"
 test-group = "flock-tests"
 
-[[profile.default.overrides]]
-filter = "test(/arcswap_stress|arcswap_routes_no_torn|under_50_readers/)"
-test-group = "concurrency-stress"
-
 [[profile.ci.overrides]]
 filter = "test(/chaos|kill_during|sigkill|migrate_chaos|auto_spawn_chaos|snapshot_chaos|fork_and_kill|chaos_child|drain_wal_on_sigterm/)"
 test-group = "chaos-subprocess"
@@ -52,7 +47,3 @@ test-group = "chaos-subprocess"
 [[profile.ci.overrides]]
 filter = "test(/flock|lock_held|concurrent_run_lock|lock_contention/)"
 test-group = "flock-tests"
-
-[[profile.ci.overrides]]
-filter = "test(/arcswap_stress|arcswap_routes_no_torn|under_50_readers/)"
-test-group = "concurrency-stress"

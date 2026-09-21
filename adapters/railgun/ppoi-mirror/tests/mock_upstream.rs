@@ -347,7 +347,9 @@ async fn mirror_emits_ppoi_list_leaf_added_for_each_event() {
             got.len()
         );
         let recv = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
-        if let Ok(Some((payload, _height))) = recv {
+        if let Ok(Some((payload, height))) = recv {
+            // The engine's reorg unwind filters on `h > height`; mirror rows opt out at 0.
+            assert_eq!(height, 0, "mirror rows must be emitted at block height 0");
             got.push(payload);
         }
     }
@@ -419,3 +421,117 @@ async fn mirror_emits_ppoi_list_leaf_added_for_each_event() {
 // above verbatim, and its named no-IMT-growth property is enforced by the `fetch_status_typed`
 // signature itself (no payload channel), so no runtime assertion for it can exist: any mutation
 // that could red it must red the line-211 test first.
+
+/// Two rows whose upstream `type` differs decode to the SAME status, through both the
+/// `MirrorSource` call and the worker's WAL payloads: the endpoint carries membership, so nothing
+/// in its response can move the verdict. The pairing order is already covered above; what this
+/// pins is the emitted VALUE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mirror_emits_exactly_one_status_for_every_event_type() {
+    let (url, _state, server_handle) = start_mock().await;
+    let mirror = build_mirror(url.clone());
+    let list = ListKey([0x77; 32]);
+
+    let rows = mirror
+        .fetch_status_range(&list, 0, 1)
+        .await
+        .expect("fetch_status_range");
+    assert_eq!(
+        rows.len(),
+        2,
+        "mock page is a Shield row and a Transact row"
+    );
+    let distinct: std::collections::HashSet<POIStatus> =
+        rows.iter().map(|row| row.status).collect();
+    assert_eq!(
+        distinct.len(),
+        1,
+        "two upstream event types produced {} distinct statuses: {distinct:?}; \
+         ppoi_poi_events carries no field that could justify a second value",
+        distinct.len()
+    );
+    assert_eq!(
+        distinct.iter().next().copied(),
+        Some(raven_railgun_ppoi_mirror::LIST_MEMBERSHIP_STATUS),
+        "the one status must be the membership verdict named in the crate doc"
+    );
+
+    let cfg = MirrorConfig {
+        endpoint: url,
+        poll_interval_secs: 1,
+        max_rows_per_fetch: 2,
+        ..MirrorConfig::default()
+    };
+    let worker_mirror = Arc::new(UpstreamPpoiMirror::new(cfg).expect("mirror builds"));
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(WalEntryPayload, u64)>(64);
+    let worker_handle = tokio::spawn(async move {
+        let _ = worker_mirror.run_worker(list, 0, tx).await;
+    });
+
+    let membership_byte = raven_railgun_ppoi_mirror::poi_status_to_byte(
+        raven_railgun_ppoi_mirror::LIST_MEMBERSHIP_STATUS,
+    );
+    let mut seen = 0usize;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while seen < 4 {
+        assert!(
+            tokio::time::Instant::now() <= deadline,
+            "worker did not emit 4 payloads within 20s (got {seen})"
+        );
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+        if let Ok(Some((payload, _))) = recv {
+            match payload {
+                WalEntryPayload::PpoiListLeafAdded { status, .. }
+                | WalEntryPayload::PpoiStatus { status, .. } => {
+                    assert_eq!(
+                        status, membership_byte,
+                        "a mirrored WAL row carried status byte {status}, not the membership \
+                         verdict; upstream's ppoi_poi_events response has no status field"
+                    );
+                }
+                other => panic!("unexpected mirror payload: {other:?}"),
+            }
+            seen += 1;
+        }
+    }
+
+    worker_handle.abort();
+    server_handle.abort();
+}
+
+/// Binds the crate doc's membership statement to the decoder it describes. A future change that
+/// starts emitting a second verdict from `ppoi_poi_events` reds here even when no mock row
+/// exercises it, so the statement cannot drift away from the code while every other gate passes.
+#[test]
+fn the_membership_statement_matches_what_the_decoder_emits() {
+    // Source-level: the property is "no other variant is NAMEABLE here", which no fixture reaches.
+    let lib_src = include_str!("../src/lib.rs");
+    for sentence in [
+        "`ppoi_poi_events` carries membership, not a verdict.",
+        "every row this mirror emits carries [`LIST_MEMBERSHIP_STATUS`]",
+    ] {
+        assert!(
+            lib_src.contains(sentence),
+            "the crate doc must still state what a mirrored status is; missing: {sentence}"
+        );
+    }
+
+    let start = lib_src
+        .find("fn decode_indexed_events(")
+        .expect("decode_indexed_events must exist");
+    let body = &lib_src[start..];
+    let end = body
+        .find("\n/// Encode [`POIStatus`] as a WAL byte")
+        .expect("decode_indexed_events must be followed by poi_status_to_byte's doc");
+    let body = &body[..end];
+    assert!(
+        body.contains("status: LIST_MEMBERSHIP_STATUS"),
+        "decode_indexed_events must assign the named membership verdict"
+    );
+    assert!(
+        !body.contains("POIStatus::"),
+        "decode_indexed_events names a POIStatus variant directly: it is emitting a verdict from \
+         a response that carries only membership. Settle it against upstream and update the \
+         crate doc's membership statement before changing this"
+    );
+}

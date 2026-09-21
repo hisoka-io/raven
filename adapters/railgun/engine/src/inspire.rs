@@ -3,11 +3,15 @@
 use super::{PirScheme, Result};
 use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, InspireVariant, ShardConfig};
+use raven_inspire::pir::mod_switch::{
+    check_mod_switch_noise_budget, extract_inspiring_mod_switched, mod_switch_response_checked,
+    MOD_SWITCH_TARGET_36BIT,
+};
 use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::{
-    extract_two_packing, respond_seeded_inspiring_cached_with_session, setup as inspire_setup,
-    ClientSession, ClientState, EncodedDatabase, SeededClientQuery, ServerCrs,
-    ServerInspiringCache, ServerResponse,
+    respond_seeded_inspiring_cached_with_session, setup as inspire_setup, ClientSession,
+    ClientState, EncodedDatabase, SeededClientQuery, ServerCrs, ServerInspiringCache,
+    ServerResponse,
 };
 use raven_railgun_core::{batch_ladder, AdapterError};
 use std::sync::Arc;
@@ -57,6 +61,18 @@ impl InspireServerState {
     }
 }
 
+/// Every served response is mod-switched to this modulus before it leaves `respond`, so
+/// the switch cannot be skipped by a route. The serializer packs at the modulus's tight
+/// width: 36 bits puts a 512 B row at 10,446 wire bytes against 17,358 unswitched.
+pub const WIRE_RESPONSE_MODULUS: u64 = MOD_SWITCH_TARGET_36BIT;
+
+/// The rung is fixed and the parameters are not. Checked wherever a state is built from
+/// parameters: a set the rung cannot carry would otherwise boot healthy and fail every query.
+fn require_wire_rung(params: &InspireParams) -> Result<()> {
+    check_mod_switch_noise_budget(params, WIRE_RESPONSE_MODULUS)
+        .map_err(|e| AdapterError::Scheme(format!("served response modulus: {e}")))
+}
+
 /// Marker type implementing [`PirScheme`] for the production stack.
 #[derive(Debug, Default)]
 pub struct RavenInspireScheme;
@@ -73,14 +89,16 @@ impl PirScheme for RavenInspireScheme {
             .resolve(query.session_handle, Instant::now())?;
         let mut resolved = query.clone();
         resolved.session_handle = inner;
-        respond_seeded_inspiring_cached_with_session(
+        let response = respond_seeded_inspiring_cached_with_session(
             state.crs.as_ref(),
             &state.encoded_db,
             &resolved,
             state.cache.as_ref(),
             Some(store.as_ref()),
         )
-        .map_err(|e| AdapterError::Scheme(format!("inspire respond: {e}")))
+        .map_err(|e| AdapterError::Scheme(format!("inspire respond: {e}")))?;
+        mod_switch_response_checked(&state.crs.params, &response, WIRE_RESPONSE_MODULUS)
+            .map_err(|e| AdapterError::Scheme(format!("inspire mod-switch: {e}")))
     }
     fn state_shape(state: &Self::ServerState) -> raven_server::StateShape {
         let cfg = &state.encoded_db.config;
@@ -109,6 +127,7 @@ pub fn setup_state_with_inspiring_seed(
     variant: InspireVariant,
     inspiring_w_seed: Option<[u8; 32]>,
 ) -> Result<(InspireServerState, RlweSecretKey)> {
+    require_wire_rung(params)?;
     let mut sampler = GaussianSampler::new(params.sigma);
     let (mut crs, encoded_db, sk) = inspire_setup(params, database, entry_size, &mut sampler)
         .map_err(|e| AdapterError::Scheme(format!("inspire setup: {e}")))?;
@@ -365,14 +384,15 @@ pub fn build_padded_batch(
     Ok((states, queries))
 }
 
-/// Decode a server response into the original plaintext bytes.
+/// Decode a served response into the original plaintext bytes. The response carries its
+/// own modulus; an unswitched one is the identity switch, so there is one extract path.
 pub fn extract_response(
     crs: &ServerCrs,
     client_state: &ClientState,
     response: &ServerResponse,
     entry_size: usize,
 ) -> Result<Vec<u8>> {
-    extract_two_packing(crs, client_state, response, entry_size)
+    extract_inspiring_mod_switched(crs, client_state, response, entry_size)
         .map_err(|e| AdapterError::Scheme(format!("inspire extract: {e}")))
 }
 
@@ -539,6 +559,7 @@ pub fn restore_inspire_state(bytes: &[u8]) -> Result<InspireServerState> {
 }
 
 fn bundle_to_state(bundle: PersistedInspireState) -> Result<InspireServerState> {
+    require_wire_rung(&bundle.crs.params)?;
     let cache = ServerInspiringCache::new(&bundle.crs, &bundle.encoded_db)
         .map_err(|e| AdapterError::Scheme(format!("restore cache build: {e}")))?;
     Ok(InspireServerState {

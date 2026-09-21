@@ -17,6 +17,7 @@ use raven_railgun_engine::PirScheme;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::shim_store::{CoverageRefusal, ListCoverage, SharedLogicalStore as CoveredStore};
 use crate::AppState;
 
 const ETAG_HEADER: HeaderName = HeaderName::from_static("etag");
@@ -144,6 +145,62 @@ const MAX_SHIM_LIST_KEYS: usize = 64;
 const MAX_SHIM_BLINDED_COMMITMENTS: usize = 1024;
 const MAX_SHIM_LOOKUP_PAIRS: usize = 16_384;
 
+const POIS_PER_LIST_ROUTE: &str = "pois-per-list";
+const MERKLE_PROOFS_ROUTE: &str = "merkle-proofs";
+const COMMIT_TREE_PROOF_ROUTE: &str = "commit-tree-merkle-proof";
+const BC_TO_IDX_MAP_ROUTE: &str = "bc-to-idx-map";
+const STATUS_HEADER_ROUTE: &str = "status-header";
+#[cfg(feature = "prefix-index-channel")]
+const BC_PREFIXES_ROUTE: &str = "bc-prefixes";
+
+/// Refuse loudly and name what is not covered: a bare 503 reads the same as a crashed process.
+fn refuse_uncovered(route: &'static str, refusal: &CoverageRefusal) -> StatusCode {
+    tracing::warn!(
+        route,
+        reason = %refusal,
+        "poi shim refused: no wired store covers the whole question"
+    );
+    metrics::counter!(
+        "raven_railgun_shim_coverage_refusals_total",
+        "route" => route
+    )
+    .increment(1);
+    StatusCode::SERVICE_UNAVAILABLE
+}
+
+fn cover_list<'a, S: PirScheme>(
+    app: &'a AppState<S>,
+    list_key: [u8; 32],
+    route: &'static str,
+) -> Result<ListCoverage<'a>, StatusCode> {
+    if let Some(registry) = app.shim_stores.as_ref().as_ref() {
+        return registry
+            .prove_list_coverage(&list_key)
+            .map_err(|refusal| refuse_uncovered(route, &refusal));
+    }
+    app.logical_store
+        .as_ref()
+        .as_ref()
+        .map(|store| ListCoverage::undeclared(list_key, store))
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
+}
+
+fn cover_tree<'a, S: PirScheme>(
+    app: &'a AppState<S>,
+    tree_number: u32,
+    route: &'static str,
+) -> Result<&'a CoveredStore, StatusCode> {
+    if let Some(registry) = app.shim_stores.as_ref().as_ref() {
+        return registry
+            .prove_tree(tree_number)
+            .map_err(|refusal| refuse_uncovered(route, &refusal));
+    }
+    app.logical_store
+        .as_ref()
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
+}
+
 pub(crate) async fn pois_per_list_handler<S: PirScheme>(
     State(app): State<AppState<S>>,
     Json(req): Json<PoisPerListRequest>,
@@ -158,12 +215,6 @@ pub(crate) async fn pois_per_list_handler<S: PirScheme>(
     {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
-    let store = app
-        .logical_store
-        .as_ref()
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-
     let list_keys: Vec<[u8; 32]> = req
         .list_keys
         .iter()
@@ -181,20 +232,28 @@ pub(crate) async fn pois_per_list_handler<S: PirScheme>(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // "Missing" is a claim about the WHOLE list, so every requested list key has to be
+    // covered before any of them is answered - a per-key partial answer is the same defect
+    // spread across fewer rows.
     let mut out: PoisPerListMap = PoisPerListMap::new();
-    let store = store.lock();
+    let mut per_key_statuses: Vec<Vec<Option<u8>>> = Vec::with_capacity(list_keys.len());
+    for list_key in &list_keys {
+        let coverage = cover_list(&app, *list_key, POIS_PER_LIST_ROUTE)?;
+        per_key_statuses.push(coverage.statuses_of(&blinded_commitments));
+        coverage
+            .recheck_frontier()
+            .map_err(|refusal| refuse_uncovered(POIS_PER_LIST_ROUTE, &refusal))?;
+    }
+
     // Upstream echoes the caller's blindedCommitment verbatim (private-proof-of-innocence
     // poi-merkletree-manager.ts:216-219), and the engine indexes the reply with its own
     // `0x`-prefixed string where a miss is an unlogged `continue`. Re-keying here drops every row.
-    for (bc, data) in blinded_commitments
-        .iter()
-        .zip(req.blinded_commitment_datas.iter())
-    {
+    for (position, data) in req.blinded_commitment_datas.iter().enumerate() {
         let bc_hex = data.blinded_commitment.clone();
         let mut per_list: std::collections::BTreeMap<HexHash, String> =
             std::collections::BTreeMap::new();
-        for (list_key_hex, list_key) in req.list_keys.iter().zip(list_keys.iter()) {
-            let status_str = match store.ppoi_status(list_key, bc) {
+        for (list_key_hex, statuses) in req.list_keys.iter().zip(per_key_statuses.iter()) {
+            let status_str = match statuses.get(position).copied().flatten() {
                 Some(byte) => poi_status_to_str(byte),
                 None => "Missing",
             };
@@ -212,11 +271,6 @@ pub(crate) async fn merkle_proofs_handler<S: PirScheme>(
     if req.blinded_commitments.len() > MAX_SHIM_BLINDED_COMMITMENTS {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
-    let store = app
-        .logical_store
-        .as_ref()
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let list_key = hex_decode_32(&req.list_key).ok_or(StatusCode::BAD_REQUEST)?;
     let blinded_commitments: Vec<[u8; 32]> = req
         .blinded_commitments
@@ -226,17 +280,23 @@ pub(crate) async fn merkle_proofs_handler<S: PirScheme>(
     if blinded_commitments.len() != req.blinded_commitments.len() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let store = store.lock();
+    // The 404 below is an absence claim, so it needs the same whole-list proof the status
+    // routes need: without it, "not in my block" is served as "not in the list".
+    let coverage = cover_list(&app, list_key, MERKLE_PROOFS_ROUTE)?;
     let mut proofs = Vec::with_capacity(blinded_commitments.len());
     for bc in &blinded_commitments {
-        let idx = store
-            .ppoi_index_of(&list_key, bc)
-            .ok_or(StatusCode::NOT_FOUND)?;
+        // The proof itself comes from the block that HOLDS the row: a block IMT is exactly
+        // the tree upstream's `validatedMerkleroot` is taken over.
+        let (store, local_index) = coverage.owner_of(bc).ok_or(StatusCode::NOT_FOUND)?;
         let proof = store
-            .ppoi_merkle_proof(&list_key, idx)
+            .lock()
+            .ppoi_merkle_proof(&list_key, local_index)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         proofs.push(MerkleProofJson::from_core(&proof, hex_encode(bc)));
     }
+    coverage
+        .recheck_frontier()
+        .map_err(|refusal| refuse_uncovered(MERKLE_PROOFS_ROUTE, &refusal))?;
     Ok(Json(proofs))
 }
 
@@ -245,11 +305,7 @@ pub(crate) async fn commit_tree_proof_handler<S: PirScheme>(
     Path(tree_number): Path<u32>,
     Json(req): Json<CommitTreeProofRequest>,
 ) -> Result<Json<MerkleProofJson>, StatusCode> {
-    let store = app
-        .logical_store
-        .as_ref()
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let store = cover_tree(&app, tree_number, COMMIT_TREE_PROOF_ROUTE)?;
     let store = store.lock();
     let proof = store
         .merkle_proof(tree_number, req.leaf_index)
@@ -291,21 +347,24 @@ pub(crate) async fn bc_prefix_array_handler<S: PirScheme>(
     Path(list_key_hex): Path<String>,
     headers_in: HeaderMap,
 ) -> Result<axum::response::Response, StatusCode> {
-    let store = app
-        .logical_store
-        .as_ref()
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let list_key = hex_decode_32(&list_key_hex).ok_or(StatusCode::BAD_REQUEST)?;
-    let (body, epoch) = {
-        let store = store.lock();
-        let rows = store.ppoi_list_leaves_iter(&list_key).count();
-        let mut body = Vec::with_capacity(rows.saturating_mul(BC_INDEX_PREFIX_BYTES));
-        for (_, commitment) in store.ppoi_list_leaves_iter(&list_key) {
-            body.extend(commitment.iter().copied().take(BC_INDEX_PREFIX_BYTES));
-        }
-        (body, store.last_block_height())
-    };
+    // Ordinal position in this array IS the global index, so a partial array renumbers
+    // every row after the gap.
+    let coverage = cover_list(&app, list_key, BC_PREFIXES_ROUTE)?;
+    let leaves = coverage.leaves();
+    let epoch = coverage.epoch();
+    coverage
+        .recheck_frontier()
+        .map_err(|refusal| refuse_uncovered(BC_PREFIXES_ROUTE, &refusal))?;
+    let mut body = Vec::with_capacity(leaves.len().saturating_mul(BC_INDEX_PREFIX_BYTES));
+    for leaf in &leaves {
+        body.extend(
+            leaf.blinded_commitment
+                .iter()
+                .copied()
+                .take(BC_INDEX_PREFIX_BYTES),
+        );
+    }
     Ok(serve_publishing_bytes(
         body,
         epoch,
@@ -333,27 +392,25 @@ pub(crate) async fn bc_to_idx_map_handler<S: PirScheme>(
     Path(list_key_hex): Path<String>,
     headers_in: HeaderMap,
 ) -> Result<axum::response::Response, StatusCode> {
-    let store = app
-        .logical_store
-        .as_ref()
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let list_key = hex_decode_32(&list_key_hex).ok_or(StatusCode::BAD_REQUEST)?;
-    let (body, epoch) = {
-        let store = store.lock();
-        let entries: Vec<BcIdxEntry> = store
-            .ppoi_list_leaves_iter(&list_key)
-            .map(|(idx, bc)| BcIdxEntry {
-                bc: hex_encode(bc),
-                idx,
+    let coverage = cover_list(&app, list_key, BC_TO_IDX_MAP_ROUTE)?;
+    let leaves = coverage.leaves();
+    let epoch = coverage.epoch();
+    coverage
+        .recheck_frontier()
+        .map_err(|refusal| refuse_uncovered(BC_TO_IDX_MAP_ROUTE, &refusal))?;
+    let body = BcToIdxMapResponse {
+        epoch,
+        list_key: hex_encode(&list_key),
+        // GLOBAL index: the client resolves a PIR row from it, and the router localizes with
+        // `% 65_536` on the way in, so a block-local index here would collide six ways.
+        entries: leaves
+            .iter()
+            .map(|leaf| BcIdxEntry {
+                bc: hex_encode(&leaf.blinded_commitment),
+                idx: leaf.global_index,
             })
-            .collect();
-        let resp = BcToIdxMapResponse {
-            epoch: store.last_block_height(),
-            list_key: hex_encode(&list_key),
-            entries,
-        };
-        (resp, store.last_block_height())
+            .collect(),
     };
     serve_publishing_channel(&body, epoch, &headers_in)
 }
@@ -363,37 +420,36 @@ pub(crate) async fn status_header_handler<S: PirScheme>(
     Path(list_key_hex): Path<String>,
     headers_in: HeaderMap,
 ) -> Result<axum::response::Response, StatusCode> {
-    let store = app
-        .logical_store
-        .as_ref()
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let list_key = hex_decode_32(&list_key_hex).ok_or(StatusCode::BAD_REQUEST)?;
-    let (body, epoch) = {
-        let store = store.lock();
-        let mut blocked: Vec<HexHash> = Vec::new();
-        let mut pending: Vec<HexHash> = Vec::new();
-        for (idx, bc) in store.ppoi_list_leaves_iter(&list_key) {
-            match store.ppoi_status_at(&list_key, idx) {
-                Some(b) if b == poi_status_byte(POIStatus::ShieldBlocked) => {
-                    blocked.push(hex_encode(bc));
-                }
-                Some(b)
-                    if b == poi_status_byte(POIStatus::ProofSubmitted)
-                        || b == poi_status_byte(POIStatus::Missing) =>
-                {
-                    pending.push(hex_encode(bc));
-                }
-                _ => {}
+    // Both fields are SETS over the list; a partial store silently shrinks the blocked set,
+    // which reads as "nothing is blocked".
+    let coverage = cover_list(&app, list_key, STATUS_HEADER_ROUTE)?;
+    let leaves = coverage.leaves();
+    let epoch = coverage.epoch();
+    coverage
+        .recheck_frontier()
+        .map_err(|refusal| refuse_uncovered(STATUS_HEADER_ROUTE, &refusal))?;
+    let mut blocked: Vec<HexHash> = Vec::new();
+    let mut pending: Vec<HexHash> = Vec::new();
+    for leaf in &leaves {
+        match leaf.status {
+            Some(b) if b == poi_status_byte(POIStatus::ShieldBlocked) => {
+                blocked.push(hex_encode(&leaf.blinded_commitment));
             }
+            Some(b)
+                if b == poi_status_byte(POIStatus::ProofSubmitted)
+                    || b == poi_status_byte(POIStatus::Missing) =>
+            {
+                pending.push(hex_encode(&leaf.blinded_commitment));
+            }
+            _ => {}
         }
-        let resp = StatusHeaderResponse {
-            epoch: store.last_block_height(),
-            list_key: hex_encode(&list_key),
-            blocked_bcs: blocked,
-            pending_bcs: pending,
-        };
-        (resp, store.last_block_height())
+    }
+    let body = StatusHeaderResponse {
+        epoch,
+        list_key: hex_encode(&list_key),
+        blocked_bcs: blocked,
+        pending_bcs: pending,
     };
     serve_publishing_channel(&body, epoch, &headers_in)
 }

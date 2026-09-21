@@ -28,7 +28,7 @@ import { startMockServer, writeBinary } from "./helpers/mock_server";
 import { assertNoCommitmentsInPirRequests, stubQueryBundle } from "./helpers/private_wire";
 import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
 
-const WIRE_SCHEMA_VERSION = 7;
+const WIRE_SCHEMA_VERSION = 8;
 const sdkRoot = fileURLToPath(new URL("../", import.meta.url));
 const fixtureRoot = fileURLToPath(new URL("./fixtures/", import.meta.url));
 

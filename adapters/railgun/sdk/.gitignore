@@ -4,3 +4,5 @@ node_modules
 # package-lock.json is intentionally NOT committed (would diverge
 # from the pnpm-resolved graph and confuse fresh-clone installs).
 package-lock.json
+# dual-format build output; the `files` allowlist is what puts it in the tarball
+dist

@@ -659,7 +659,7 @@ fn spawn_consumer_task(inputs: ConsumerSpawnInputs) -> tokio::task::JoinHandle<(
 pub struct PpoiListTemplateRuntime {
     pub template_id: String,
     pub list_key: [u8; 32],
-    /// Must be per-list-status, per-list-path, or per-list-node.
+    /// Must be per-list-status, per-list-path, per-list-path10, or per-list-node.
     pub encoder: String,
     pub scheme_tag: String,
     /// Must contain `{list_key}`.
@@ -678,12 +678,15 @@ impl PpoiListTemplateRuntime {
             "per-list-path" => Ok(EncoderKind::PerListPath {
                 list_key: self.list_key,
             }),
+            "per-list-path10" => Ok(EncoderKind::PerListPath10 {
+                list_key: self.list_key,
+            }),
             "per-list-node" => Ok(EncoderKind::PerListNode {
                 list_key: self.list_key,
             }),
             other => anyhow::bail!(
                 "ppoi_list_template.encoder = {other:?} is not a PPOI encoder \
-                 (allowed: per-list-status, per-list-path, per-list-node)"
+                 (allowed: per-list-status, per-list-path, per-list-path10, per-list-node)"
             ),
         }
     }
@@ -916,7 +919,7 @@ fn spawn_one_ppoi_list(inputs: &PpoiListSpawnInputs<'_>, append_log: bool) -> an
 
     let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default()));
     let logical_store = Arc::new(parking_lot::Mutex::new(recovered_store));
-    // Upstream-signature verification stands in for the L2 chain-root verifier here.
+    // No L2 verifier: list roots are not chain-anchored, and nothing verifies the upstream feed.
     let verifier_ctx: Option<Layer2VerifierContext> = None;
 
     let consumer_inputs = ConsumerSpawnInputs {

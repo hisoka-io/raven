@@ -25,6 +25,7 @@
 )]
 
 use raven_inspire::{SeededClientQuery, ServerResponse};
+use raven_railgun_engine::inspire::WIRE_RESPONSE_MODULUS;
 use serde::Deserialize;
 
 #[path = "support/production_cell.rs"]
@@ -40,6 +41,18 @@ struct BatchCapacityEvidence {
     batch_frame: usize,
     #[serde(rename = "defaultBodyCapBytes")]
     default_body_cap: usize,
+}
+
+/// Bincode bytes of a packed `ServerResponse` around its two coefficient payloads: the
+/// variant tag; `a`'s coefficient length, one-modulus vector, q, dim, CRT inverse and NTT
+/// flag; the `b` prefix length; the retained count; the empty column vector; and
+/// `Some(packing_mode)`.
+const PACKED_RESPONSE_HEADER_BYTES: usize = 4 + (8 + 16 + 8 + 8 + 8 + 1) + 8 + 4 + 8 + 5;
+
+/// The tight serializer packs `a` in full and `b`'s retained prefix at the modulus's width.
+fn tight_packed_response_bytes(modulus: u64, ring_dim: usize, retained: usize) -> usize {
+    let bits = usize::try_from(u64::BITS - (modulus - 1).leading_zeros()).expect("bit width");
+    PACKED_RESPONSE_HEADER_BYTES + ((ring_dim + retained) * bits).div_ceil(8)
 }
 
 async fn assert_batch_capacity_boundary(
@@ -128,16 +141,45 @@ async fn production_cell_round_trip_byte_identity() {
     assert_eq!(response.status(), 200, "HTTP status");
 
     let body = response.bytes().await.expect("body bytes");
-    assert_eq!(body.len(), 17_360, "versioned tight response bytes");
+    // p = 65,537 carries two record bytes per retained coefficient.
+    let retained = ENTRY_BYTES.div_ceil(2);
+    let switched_bytes =
+        tight_packed_response_bytes(WIRE_RESPONSE_MODULUS, cell.params.ring_dim, retained);
+    let unswitched_bytes =
+        tight_packed_response_bytes(cell.params.q, cell.params.ring_dim, retained);
+    assert_eq!(
+        switched_bytes, 10_446,
+        "36-bit packing over 2048 + 256 coefficients"
+    );
+    assert_eq!(
+        unswitched_bytes, 17_358,
+        "60-bit packing over the same coefficients"
+    );
+    assert_eq!(
+        body.len(),
+        raven_railgun_http::WIRE_SCHEMA_PREFIX_LEN + switched_bytes,
+        "versioned switched response bytes"
+    );
     let server_response: ServerResponse =
         raven_railgun_http::read_versioned(&body).expect("deserialize ServerResponse (versioned)");
+    assert_eq!(
+        server_response.ciphertext.modulus(),
+        WIRE_RESPONSE_MODULUS,
+        "every served response is mod-switched"
+    );
+    assert_eq!(
+        server_response.packed_coefficients,
+        Some(u32::try_from(retained).expect("retained fits u32")),
+        "the closed form must count the prefix the server actually retained"
+    );
     assert_eq!(
         server_response
             .to_binary()
             .expect("tight response body")
             .len(),
-        17_358,
-        "tight response saves exactly 1,152 bytes from the 18,510-byte body"
+        switched_bytes,
+        "the switch saves exactly {} bytes from the {unswitched_bytes}-byte unswitched body",
+        unswitched_bytes - switched_bytes
     );
     let plaintext = cell.decode(&client_state, &server_response);
     assert_eq!(

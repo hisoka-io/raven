@@ -41,8 +41,9 @@ theorem on 2026-08-01 settled it: get_variance computes the PRE-mod-switch
 variance, which is the correct object for sizing q, and required_q_log2 sizes q
 rather than q~. The factor legitimately does not belong there. What IS absent
 from the formula is the theorem's additive d*sigma_chi^2/4 mod-switch rounding
-term - inert while nothing mod-switches, and load-bearing the moment response
-modulus switching ships. params.rs carries this correction in-source.
+term - inert while nothing is mod-switched, and load-bearing on the served
+path, where every response is mod-switched to a 36-bit modulus before
+serialization. params.rs carries this correction in-source.
 
 OPEN - packing noise. The reproduced get_variance formula covers Spiral-family
 LWE and gadget noise only; it does NOT model the additional noise that InspiRING
@@ -67,6 +68,15 @@ The narrower margin is at the 512 B width, which is what the PPOI path records
 ship at. The measurement is a test assertion, so a parameter or packing change
 that erodes the margin fails rather than scrambling a response in production.
 
+The served response is mod-switched to a 36-bit modulus (MOD_SWITCH_TARGET_36BIT
+= 2^36 - 2^20 + 1, crates/inspire/src/pir/mod_switch.rs). In the same bench,
+served_post_switch_noise_distribution (--features mod-switch-response) samples it
+after the switch and the serializer, 1,000 per width across 40 sessions, as each
+session carries its own fixed offset. Against a boundary of 524,272 the worst
+error is 1,113 at 512 B (8.88 bits margin), 417 at 32 B (10.30). The mod-switch
+gate charges the residue q' mod p, and this constant was chosen for residue 33: a
+seeded KAT pins error 53,503 at the largest 36-bit NTT prime (residue 53,266).
+
 What this does NOT establish, stated plainly because the distinction is the
 whole point of the disclosure: an empirical margin over 1,000 samples is not an
 analytic bound. It shows the shipped cell is comfortably inside the boundary on
@@ -75,9 +85,9 @@ get_variance's own slack figure therefore remains unreliable as a predictor -
 the number to trust is the measured margin, not the 0.093 bits the gate reports.
 
 Consequence for operators: the formula's thin slack margin must not be read as a
-passing margin. Read the measured margin above instead, and re-run the
-measurement after any change to packing, noise sampling, parameters or the
-mod-switch gate.
+passing margin. Read the measured margins above instead, and re-run both
+measurements after any change to packing, noise sampling, parameters, the served
+modulus or the mod-switch gate.
 
 Status: the two conditions this disclosure set for itself - a direct read of
 InsPIRe Theorem 7 against the implementation, and a noise-calibration
@@ -101,6 +111,17 @@ an operator must reason about here.
 Impact: an observer learns the shard partition the target entry lives in. For a
 deployment with many shards this is a coarse-grained but real leak of where the
 queried record resides.
+
+A record format now depends on this leak. The Railgun adapter's PPOI path row
+carries Merkle levels 0-10 inside the PIR record and returns levels 11-15 as a
+160-byte CLEARTEXT addendum beside it (adapters/railgun/http/src/batch.rs). Those
+upper siblings are constant across a 2,048-leaf shard, so the server selects them
+by the plaintext shard identifier and they reveal nothing the identifier did not.
+Hiding the shard removes that selector: the upper siblings would have to move
+back inside the PIR record (a wider row, and the server cost of the taller
+Merkle ladder) or be published as a separate tree-top tier. Closing this gap is
+therefore a record-format change, not only a compute decision, and neither may
+be changed without the other.
 
 Two proposed widenings (both planned, neither shipped):
 

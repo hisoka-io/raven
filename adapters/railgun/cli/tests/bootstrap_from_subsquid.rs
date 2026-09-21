@@ -19,7 +19,7 @@ use raven_railgun_cli::bootstrap_subsquid::{
     bootstrap_one_list, bootstrap_one_list_with_mode, bootstrap_one_tree,
     bootstrap_one_tree_with_carry, decode_bigint_to_be_bytes32, modulus_be, BootstrapError,
     BootstrapTreeConfig, ChainOracle, CommitmentRow, OracleKind, PpoiBootstrapMode, PpoiEventRow,
-    PpoiEventsSource, RailwayPpoiClient, StowawayCarry, SubsquidLeavesSource,
+    PpoiEventsSource, PpoiListReport, RailwayPpoiClient, StowawayCarry, SubsquidLeavesSource,
 };
 use raven_railgun_engine::imt::Imt;
 use raven_railgun_engine::pir_table::EncoderKind;
@@ -1475,6 +1475,14 @@ mod ppoi_resilience {
         request: &serde_json::Value,
         total: u64,
     ) -> (axum::http::StatusCode, String) {
+        node_status_counts(request, total, total)
+    }
+
+    fn node_status_counts(
+        request: &serde_json::Value,
+        events: u64,
+        roots: u64,
+    ) -> (axum::http::StatusCode, String) {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": request["id"],
@@ -1483,8 +1491,8 @@ mod ppoi_resilience {
                     "Ethereum": {
                         "listStatuses": {
                             "abababababababababababababababababababababababababababababababab": {
-                                "poiEventLengths": { "Shield": total },
-                                "historicalMerklerootsLength": total
+                                "poiEventLengths": { "Shield": events },
+                                "historicalMerklerootsLength": roots
                             }
                         }
                     }
@@ -1889,6 +1897,193 @@ mod ppoi_resilience {
             elapsed < std::time::Duration::from_secs(45),
             "elapsed {elapsed:?} > 45s suggests the per-URL timeout did not fire"
         );
+    }
+
+    fn wire_event(index: u64) -> serde_json::Value {
+        let mut leaf = [0u8; 32];
+        leaf[24..].copy_from_slice(&(index + 1).to_be_bytes());
+        serde_json::json!({
+            "signedPOIEvent": {
+                "index": index,
+                "blindedCommitment": format!("0x{}", hex_lower(&leaf)),
+                "signature": "0".repeat(128),
+                "type": "Shield",
+            },
+            "validatedMerkleroot": format!("0x{}", hex_lower(&[0u8; 32])),
+        })
+    }
+
+    /// Answers node-status with `(events, roots)` and every page request with `page`.
+    fn fixed_page_stub(events: u64, roots: u64, page: serde_json::Value) -> StubFn {
+        StdArc::new(move |request: serde_json::Value| {
+            let page = page.clone();
+            Box::pin(async move {
+                if request.get("method") == Some(&serde_json::json!("ppoi_node_status")) {
+                    return node_status_counts(&request, events, roots);
+                }
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": page,
+                });
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::to_string(&body).expect("serialize"),
+                )
+            })
+        })
+    }
+
+    /// Upstreams that answer, and whose answer is not the complete ordered list.
+    fn integrity_violations() -> Vec<(&'static str, StubFn, &'static str)> {
+        vec![
+            (
+                "root count disagrees with event count",
+                fixed_page_stub(2, 3, serde_json::json!([wire_event(0), wire_event(1)])),
+                "completeness canary",
+            ),
+            (
+                "page out of order",
+                fixed_page_stub(2, 2, serde_json::json!([wire_event(1), wire_event(0)])),
+                "non-monotone",
+            ),
+            (
+                "scan ends short of the advertised count",
+                fixed_page_stub(2, 2, serde_json::json!([wire_event(0)])),
+                "1 rows for target count 2",
+            ),
+        ]
+    }
+
+    async fn bootstrap_in_mode(
+        bases: Vec<String>,
+        mode: PpoiBootstrapMode,
+    ) -> Result<PpoiListReport, BootstrapError> {
+        let client = RailwayPpoiClient::new_multi(bases, 0, 1).expect("client");
+        let tried = client.bases().to_vec();
+        bootstrap_one_list_with_mode(
+            [0xab; 32],
+            &client,
+            "/tmp/raven/list-{LIST_KEY}",
+            mode,
+            &tried,
+        )
+        .await
+    }
+
+    /// Skip mode exists for an upstream that cannot be reached. One that answers with an
+    /// incomplete or reordered list was reached, and an empty tree reported `Ok` hides it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn skip_on_unreachable_never_absorbs_an_integrity_violation() {
+        // Every case runs before any is reported, so one run lists every leak.
+        let mut leaks = Vec::new();
+        for (case, stub, detail) in integrity_violations() {
+            let (base, shutdown) = spawn_ppoi_stub(stub).await;
+            for mode in [
+                PpoiBootstrapMode::SkipOnUnreachable,
+                PpoiBootstrapMode::Strict,
+            ] {
+                match bootstrap_in_mode(vec![base.clone()], mode).await {
+                    Err(BootstrapError::PpoiIntegrity(message)) if message.contains(detail) => {}
+                    Ok(report) => leaks.push(format!(
+                        "{case} / {mode:?}: absorbed as Ok(events={})",
+                        report.events
+                    )),
+                    Err(other) => leaks.push(format!("{case} / {mode:?}: classed as {other:?}")),
+                }
+            }
+            let _ = shutdown.send(());
+        }
+        assert!(leaks.is_empty(), "{}", leaks.join("\n"));
+    }
+
+    /// A dead sibling base must not relabel the violation as unreachability.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_integrity_violation_outranks_a_dead_sibling_base_in_either_order() {
+        for (case, stub, _) in integrity_violations() {
+            let (violating, shutdown) = spawn_ppoi_stub(stub).await;
+            let dead = sealed_url().await;
+            for bases in [
+                vec![violating.clone(), dead.clone()],
+                vec![dead.clone(), violating.clone()],
+            ] {
+                let outcome =
+                    bootstrap_in_mode(bases.clone(), PpoiBootstrapMode::SkipOnUnreachable).await;
+                assert!(
+                    matches!(outcome, Err(BootstrapError::PpoiIntegrity(_))),
+                    "{case} / {bases:?}: {outcome:?}"
+                );
+            }
+            let _ = shutdown.send(());
+        }
+    }
+
+    /// The ladder itself is unchanged: a base that serves the list whole still wins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_healthy_base_still_wins_after_a_violating_one() {
+        for (case, stub, _) in integrity_violations() {
+            let (violating, violating_shutdown) = spawn_ppoi_stub(stub).await;
+            let (healthy, healthy_shutdown) = spawn_ppoi_stub(ok_body_one_event()).await;
+            let report = bootstrap_in_mode(vec![violating, healthy], PpoiBootstrapMode::Strict)
+                .await
+                .unwrap_or_else(|e| panic!("{case}: healthy second base must win: {e}"));
+            assert_eq!(report.events, 1, "{case}");
+            let _ = violating_shutdown.send(());
+            let _ = healthy_shutdown.send(());
+        }
+    }
+
+    /// Reached and unreadable is its own class: not unreachable, not an integrity verdict.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_undecodable_answer_is_named_a_decode_failure() {
+        let mut malformed = wire_event(0);
+        malformed["signedPOIEvent"]["blindedCommitment"] = serde_json::json!("not-hex");
+        let (base, shutdown) =
+            spawn_ppoi_stub(fixed_page_stub(1, 1, serde_json::json!([malformed]))).await;
+        let outcome = bootstrap_in_mode(vec![base], PpoiBootstrapMode::Strict).await;
+        match outcome {
+            Err(BootstrapError::PpoiDecode(message)) => {
+                assert!(message.contains("blindedCommitment"), "{message}");
+            }
+            other => panic!("expected PpoiDecode, got {other:?}"),
+        }
+        let _ = shutdown.send(());
+    }
+
+    /// The root oracle runs after the fetch, so no mode may soften it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn skip_on_unreachable_does_not_soften_the_root_oracle() {
+        let mut imt = Imt::new().expect("imt");
+        let mut leaf = [0u8; 32];
+        leaf[31] = 1;
+        imt.insert_leaves(0, &[leaf]).expect("insert");
+        let mut wrong_root = imt.root();
+        wrong_root[0] ^= 0xff;
+        let src = StubPpoi {
+            events: vec![PpoiEventRow {
+                index: 0,
+                leaf,
+                event_type: None,
+                signature: None,
+                validated_merkleroot: wrong_root,
+            }],
+        };
+        let err = bootstrap_one_list_with_mode(
+            [0xab; 32],
+            &src,
+            "/tmp/raven/list-{LIST_KEY}",
+            PpoiBootstrapMode::SkipOnUnreachable,
+            &[],
+        )
+        .await
+        .expect_err("a root the local tree does not reproduce must hard-stop");
+        assert!(matches!(
+            err,
+            BootstrapError::OracleByteIdentityMismatch {
+                kind: OracleKind::PpoiUpstreamList,
+                ..
+            }
+        ));
     }
 
     /// Mode parser smoke.

@@ -2,10 +2,10 @@
 //!
 //! `leaves` is a `BTreeMap<(tree, leaf), [u8; 32]>` and iterates key-ascending, so if the
 //! row index discards the tree, `(1, 5)` overwrites row 5 after `(0, 5)` - the higher tree
-//! silently wins a row that was previously correct. The single-instance bridge
-//! (`orchestrator.rs` `indexer_to_consumer_bridge`) applies no tree filter, so a store CAN
-//! hold two trees on that path. The invariant therefore has to live in the encoder, which
-//! is why `PerLeafBc` carries its tree.
+//! silently wins a row that was previously correct. Both ingest paths scope by tree, but
+//! `LogicalLeafStore::apply` does not, and WAL replay and direct callers reach it without
+//! passing through ingest, so a store CAN hold two trees. The invariant therefore has to
+//! live in the encoder, which is why `PerLeafBc` carries its tree.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
@@ -61,7 +61,7 @@ fn a_foreign_tree_leaf_does_not_overwrite_this_trees_row() {
         "precondition: tree 0's row holds tree 0's commitment"
     );
 
-    // The single-instance bridge forwards every tree, so this reaches the same store.
+    // `apply` has no tree filter, so a foreign-tree leaf reaches the same store.
     for leaf in 0..=SHARED_LEAF {
         apply_wal_entry(
             &mut store,

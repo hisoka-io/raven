@@ -47,7 +47,7 @@ function mountBatchRoute(server: MockServer): void {
     (_req, _body, res) => {
       const slots = 16;
       const out = new Uint8Array(2 + 8 + slots * (8 + NODE_BYTES));
-      out[1] = 7;
+      out[1] = 8;
       const dv = new DataView(out.buffer);
       dv.setUint32(2, slots, true);
       let off = 10;

@@ -11,7 +11,7 @@
  * When production bumps: change this constant, and expect exactly the tests that assert
  * a *previous* version (fail-closed refusals) to need a second look.
  */
-export const EXPECTED_WIRE_SCHEMA_VERSION = 7;
+export const EXPECTED_WIRE_SCHEMA_VERSION = 8;
 
 /** The two big-endian prefix bytes every batch and query body opens with. */
 export const EXPECTED_WIRE_SCHEMA_PREFIX: readonly [number, number] = [

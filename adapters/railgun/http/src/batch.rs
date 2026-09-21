@@ -18,6 +18,9 @@ use tokio::sync::Semaphore;
 const PATH10_LEVELS: usize = raven_railgun_engine::pir_table::list::PATH10_LEVELS;
 /// Levels 11..15, the upper siblings that are constant across a shard.
 const ADDENDUM_LEVELS: usize = raven_railgun_engine::imt::TREE_DEPTH - PATH10_LEVELS;
+/// The engine derives the addendum now; this is the width it must hand back. A short one folds to
+/// a wrong root, which is the failure this whole path exists to make impossible.
+const ADDENDUM_BYTES: usize = ADDENDUM_LEVELS * 32;
 
 use crate::auth::validate_session_binding;
 use crate::state::AppState;
@@ -273,60 +276,93 @@ pub(crate) async fn inspire_batch_handler(
     for handle in queries.iter().filter_map(|query| query.session_handle) {
         validate_session_binding(&headers, app.sessions.as_ref(), &instance_id, Some(handle))?;
     }
+    // The addendum comes from the table the commit driver derives from the tree a state was
+    // encoded from -- NOT from the live store, which runs a commit cadence ahead (1000 appends /
+    // 300 s) and cannot be shown to share a state with the row. The table is keyed by shard id, so
+    // no width arithmetic happens on this path.
+    //
+    // Selecting by `query.shard_id` works only because the shard id is cleartext (SECURITY.md
+    // G7), and leaks nothing beyond it: levels 11..15 are constant across a shard. Hide the shard
+    // and this path goes with it -- the upper siblings must then travel inside the PIR row.
+    //
+    // Provenance is the `encoded_db` Arc, NOT the epoch. `heartbeat_session_eviction` bumps the
+    // epoch every session-eviction interval while carrying `encoded_db` by `Arc::clone`; an epoch
+    // equality check therefore refused every frozen block forever, one hour after boot. A commit
+    // replaces the Arc; nothing else does.
     let addenda = match app.instance_logical_stores.get(&instance_id) {
         None => None,
         Some((list_key, store)) => {
-            // `entries_per_shard` is operator-configurable. A literal 2048 here computes the
-            // addendum for the WRONG leaf at any other width and returns it with HTTP 200.
-            let entries_per_shard = u32::try_from(
-                instance
-                    .current_snapshot()
-                    .state
-                    .shard_config()
-                    .entries_per_shard(),
-            )
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let before = instance.current_snapshot();
             let store = store.lock();
+            if !store.committed_addenda_derived_from(&before.state.encoded_db) {
+                tracing::warn!(
+                    instance_id = %instance_id,
+                    epoch = before.epoch.0,
+                    "batch refused: committed addenda were not derived alongside the served state"
+                );
+                metrics::counter!(
+                    "raven_railgun_addendum_provenance_skew_total",
+                    "instance" => instance_id.to_string()
+                )
+                .increment(1);
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
             let mut out = Vec::with_capacity(queries.len());
             for query in &queries {
-                let first = query
-                    .shard_id
-                    .checked_mul(entries_per_shard)
-                    .ok_or(StatusCode::BAD_REQUEST)?;
-                // An unpopulated shard used to `unwrap_or_default()` into an EMPTY addendum,
-                // with no log and no counter, which the client folds into a wrong root.
-                let proof = store.ppoi_merkle_proof(list_key, first).map_err(|err| {
+                // An unpopulated shard is ABSENT, never an empty addendum: an empty one folds to
+                // a wrong root with HTTP 200, which is the defect, not the refusal.
+                let addendum = store
+                    .committed_addendum(list_key, query.shard_id)
+                    .ok_or_else(|| {
+                        tracing::warn!(
+                            instance_id = %instance_id,
+                            shard_id = query.shard_id,
+                            "batch refused: no committed upper-sibling addendum for shard"
+                        );
+                        metrics::counter!(
+                            "raven_railgun_addendum_missing_total",
+                            "instance" => instance_id.to_string()
+                        )
+                        .increment(1);
+                        StatusCode::SERVICE_UNAVAILABLE
+                    })?;
+                if addendum.len() != ADDENDUM_BYTES {
                     tracing::warn!(
                         instance_id = %instance_id,
                         shard_id = query.shard_id,
-                        first_leaf = first,
-                        ?err,
-                        "batch refused: no upper-sibling addendum for shard"
+                        len = addendum.len(),
+                        expected = ADDENDUM_BYTES,
+                        "batch refused: committed addendum has the wrong width"
                     );
-                    metrics::counter!(
-                        "raven_railgun_addendum_missing_total",
-                        "instance" => instance_id.to_string()
-                    )
-                    .increment(1);
-                    StatusCode::SERVICE_UNAVAILABLE
-                })?;
-                out.push(
-                    proof
-                        .elements
-                        .into_iter()
-                        .skip(PATH10_LEVELS)
-                        .take(ADDENDUM_LEVELS)
-                        .flatten()
-                        .collect(),
-                );
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+                out.push(addendum.to_vec());
             }
-            Some(out)
+            Some((before, out))
         }
     };
     let (status, headers, response) = batch_handler(State(app), Path(id), body).await?;
-    let Some(addenda) = addenda else {
+    let Some((before, addenda)) = addenda else {
         return Ok((status, headers, response));
     };
+    // `batch_handler` takes its own snapshot between these two reads. If the encoded database is the
+    // same Arc before AND after, the one it served from was that same Arc -- so the row and the
+    // addenda share a tree. A commit landing mid-request changes it, and that pair is refused.
+    let after = instance.current_snapshot();
+    if !Arc::ptr_eq(&before.state.encoded_db, &after.state.encoded_db) {
+        tracing::warn!(
+            instance_id = %instance_id,
+            epoch_before = before.epoch.0,
+            epoch_after = after.epoch.0,
+            "batch refused: a commit replaced the served state mid-request"
+        );
+        metrics::counter!(
+            "raven_railgun_addendum_provenance_skew_total",
+            "instance" => instance_id.to_string()
+        )
+        .increment(1);
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let reframed = append_batch_addenda(&response, &addenda)
         .map_err(|()| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((status, headers, reframed.into()))

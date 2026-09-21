@@ -33,10 +33,10 @@ jobs:
         run: cargo check --workspace --all-targets
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      # `mod-switch-response` is default-off and no job compiled it, so a response-encoding
-      # subsystem sat unbuilt behind the flag. Check-only and deliberately not tested: the
-      # subsystem is deferred, and this exists to stop it rotting, not to adopt it. The manifest
-      # is the submodule's because both the feature and every line it gates live there.
+      # `mod-switch-response` is enabled by the adapter and client workspaces, so every served
+      # response is built and tested with it there. The submodule itself keeps the feature
+      # default-off; this check is the build that turns it on against the submodule's own
+      # manifest, because both the feature and every line it gates live there.
       - name: cargo check (raven-inspire, mod-switch-response)
         run: |
           cargo check --manifest-path crates/inspire/Cargo.toml \
@@ -45,8 +45,8 @@ jobs:
       # `msrv-1-91` checks and clippies `--workspace --all-features --all-targets` with
       # raven-railgun-http in MSRV_PACKAGES -- but compiling a gated test is not running
       # it, and the `railgun-tests` lanes pass no --features at all.
-      # Unlike mod-switch-response above this one is TESTED, not check-only,
-      # because a real test already exists for it and was simply never built:
+      # TESTED, not check-only, because a real test already exists for it and was simply
+      # never built:
       # `http/tests/poi_shim_routes.rs` six_byte_prefix_channel_is_binary_and_index_ordered.
       # Measured 2026-09-18: without the feature that filter selects 0 tests.
       # Scoped to --lib and the owning test binary rather than --all-targets on purpose:
@@ -137,41 +137,55 @@ jobs:
         with:
           submodules: recursive
       - name: check-hygiene
+        if: ${{ !cancelled() }}
         run: adapters/railgun/scripts/check-hygiene.sh
       - name: adapter hygiene red-proof
+        if: ${{ !cancelled() }}
         run: adapters/railgun/scripts/check-hygiene-selftest.sh
       - name: check-repo-hygiene
+        if: ${{ !cancelled() }}
         run: scripts/check-repo-hygiene.sh
       - name: check-repo-hygiene red-proof
+        if: ${{ !cancelled() }}
         run: scripts/check-repo-hygiene-selftest.sh
       # A `test()` term naming a nonexistent test exits 0 and silently shrinks its lane, and both
       # the fmt step and the test shards enumerate packages by hand - a new member is uncovered
       # until someone notices. Both have happened; this makes them build failures.
       - name: check-ci-filter-names
+        if: ${{ !cancelled() }}
         run: scripts/check-ci-filter-names.sh
       - name: check-ci-filter-names red-proof
+        if: ${{ !cancelled() }}
         run: scripts/check-ci-filter-names-selftest.sh
       # An #[ignore]d test no lane selects runs nowhere. 42 of 72 were in that state; this freezes
       # that set and fails when a NEW one appears. Debt can shrink freely, not grow silently.
       - name: check-ignore-coverage
+        if: ${{ !cancelled() }}
         run: scripts/check-ignore-coverage.sh
       - name: check-ignore-coverage red-proof
+        if: ${{ !cancelled() }}
         run: scripts/check-ignore-coverage-selftest.sh
       # A wasm test named by no job is compiled and never executed - the shape that let the
       # tree's only wasm test sit broken and green until it was finally run.
       - name: check-wasm-test-coverage
+        if: ${{ !cancelled() }}
         run: scripts/check-wasm-test-coverage.sh
       - name: check-wasm-test-coverage red-proof
+        if: ${{ !cancelled() }}
         run: scripts/check-wasm-test-coverage-selftest.sh
       - name: check-layering
+        if: ${{ !cancelled() }}
         # Two-repo doctrine: no application vocabulary in crates/, and no framework
         # crate depending on an adapter. Nothing enforced this before.
         run: scripts/check-layering.sh
       - name: check-layering red-proof
+        if: ${{ !cancelled() }}
         run: scripts/check-layering-selftest.sh
       - name: check-rust-toolchain-pin
+        if: ${{ !cancelled() }}
         run: scripts/check-rust-toolchain-pin.sh
       - name: toolchain-pin red-proof
+        if: ${{ !cancelled() }}
         run: scripts/check-rust-toolchain-pin-selftest.sh
 
   advisories:
@@ -346,11 +360,14 @@ jobs:
           # installed release. It does NOT cover a union filter where only one term
           # goes dead (the rest still run, green); check-ci-filter-names.sh covers
           # that direction - the two guards land together, never one instead.
+          # --no-fail-fast: nextest cancels every test still QUEUED behind the first failure,
+          # so one red test reports no verdict for the rest. Measured here: 168 of 178.
           cargo nextest run \
             --manifest-path adapters/railgun/Cargo.toml \
             ${{ matrix.shard.packages }} \
             --all-targets \
             --no-tests=fail \
+            --no-fail-fast \
             --cargo-profile ci-test \
             --profile ci
       - name: sccache stats
@@ -397,6 +414,16 @@ jobs:
       # job because it invokes the gate, which needs the test binaries this job already builds.
       - name: lane-count red-proof
         run: scripts/assert-lane-counts-selftest.sh
+      # The hygiene job's names pass reads only plain-name test() and binary() terms in this file.
+      # This pass asks nextest what each declared filter selects, so it sees every filter syntax,
+      # and it opens every .config/nextest.toml: an override whose filter selects nothing
+      # configures nothing, and nextest says so nowhere. Here because it needs the built binaries.
+      - name: every declared test filter selects at least one test
+        if: ${{ !cancelled() }}
+        run: scripts/check-ci-filter-names.sh --selected
+      - name: selected-filter red-proof
+        if: ${{ !cancelled() }}
+        run: scripts/check-ci-filter-names-selftest.sh --selected
       - name: sccache stats
         run: sccache --show-stats
         if: always()
@@ -497,11 +524,14 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: cargo nextest (ignored included)
         run: |
+          # fail-fast: false above is MATRIX-level and does not reach nextest. Without
+          # --no-fail-fast one red test cancels the queue: measured 7/15 here and 24/65.
           cargo nextest run \
             --manifest-path adapters/railgun/Cargo.toml \
             ${{ matrix.lane.packages }} \
             ${{ matrix.lane.cargo_flags }} \
             --no-tests=fail \
+            --no-fail-fast \
             --cargo-profile ci-test \
             --profile ${{ matrix.lane.nextest_profile }} \
             --run-ignored all \
@@ -570,11 +600,16 @@ jobs:
           # the exact failure this lane exists to prevent. The `-E` list keeps the
           # run scoped despite --all-targets, so the remaining tens-of-minutes
           # ignored benches still do not start.
+          #
+          # --no-fail-fast is what keeps the two wall-clock ceilings from deciding the lane:
+          # they share it with the only production-parameter correctness test, and on 11 of 11
+          # nights a ceiling breach cancelled that test instead of failing beside it.
           cargo nextest run \
             --manifest-path adapters/railgun/Cargo.toml \
             -p raven-railgun-engine -p raven-railgun-cli -p raven-railgun-mock-ppoi \
             --all-targets \
             --no-tests=fail \
+            --no-fail-fast \
             --cargo-profile ci-test \
             --profile production-cell \
             --run-ignored all \
@@ -658,6 +693,10 @@ jobs:
         run: cargo fmt --manifest-path crates/inspire/Cargo.toml -- --check
       - name: cargo clippy
         run: cargo clippy --manifest-path crates/inspire/Cargo.toml --all-targets -- -D warnings
+      - name: cargo clippy (mod-switch-response)
+        # The adapter and client enable this feature, so the module it gates is what ships;
+        # the default-feature lint above never compiles it.
+        run: cargo clippy --manifest-path crates/inspire/Cargo.toml --all-targets --features mod-switch-response -- -D warnings
       - name: record runner SIMD capability
         # RAVEN_REQUIRE_AVX512=1 turns the SIMD tests' capability skips into failures.
         # Arm it only when the runner really has the flags, so the lane is honest on
@@ -707,7 +746,7 @@ jobs:
           mod_switch_list=$(cargo test --manifest-path crates/inspire/Cargo.toml --release \
             --features mod-switch-response --lib -- --list)
           mod_switch_count=$(/usr/bin/grep -c '^pir::mod_switch::tests::' <<< "$mod_switch_list")
-          test "$mod_switch_count" -ge 17
+          test "$mod_switch_count" -ge 22
           cargo test --manifest-path crates/inspire/Cargo.toml --release \
             --features mod-switch-response --lib \
             pir::mod_switch::tests
@@ -716,6 +755,28 @@ jobs:
         # differential compares a loop with itself. Nothing in CI built it until now, which is
         # why simd_packing_offline_kat was green-vacuous on every run it ever made.
         run: cargo test --manifest-path crates/inspire/Cargo.toml --release --features simd-packing-offline --test simd_packing_offline_kat
+      # The instrument's two synthetic controls (planted leak detected, null not rejected) run in
+      # the default step above. Its SUBJECT - the actual shipping query transcripts - ran in no
+      # lane at all, so the privacy claim itself was never exercised. Measured 0.99 s in release
+      # here, against an #[ignore] reason that reads as if it were expensive.
+      - name: cargo test (query-indistinguishability oracle)
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/oracle
+          cargo test --manifest-path crates/inspire/Cargo.toml --release \
+            --test query_indistinguishability_oracle \
+            -- --ignored --exact same_shard_query_transcript_research_oracle --nocapture \
+            2>&1 | tee target/oracle/query-indistinguishability.txt
+      # The verdicts are per-feature p-values, not a pass/fail bit: a privacy review wants the
+      # numbers from the run, and a job log is not something you can diff against last month's.
+      - name: upload oracle transcript verdicts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: query-indistinguishability-${{ github.sha }}
+          path: target/oracle/query-indistinguishability.txt
+          if-no-files-found: error
       - name: cargo check (wasm32, client-clean / no rayon)
         run: cargo check --manifest-path crates/inspire/Cargo.toml --target wasm32-unknown-unknown --no-default-features
       - name: sccache stats
@@ -1044,6 +1105,13 @@ jobs:
         # and exits 0, which is why 15 type errors survived here unnoticed
         run: pnpm typecheck
         working-directory: adapters/railgun/sdk
+      # These read SOURCE and need no suite run, so they go first: a Rust/TS wire constant
+      # drift then fails by NAME (`schema envelope version: TS=6 Rust=7`) instead of as an
+      # opaque two-byte diff inside a fixture, which is how the v6/v7 bump presented.
+      - name: sdk rust/ts constant parity
+        run: adapters/railgun/scripts/check-sdk-constant-parity.sh
+      - name: sdk export coverage
+        run: adapters/railgun/scripts/check-sdk-export-coverage.sh
       - name: pnpm test
         run: pnpm test
         working-directory: adapters/railgun/sdk
@@ -1058,10 +1126,6 @@ jobs:
       #     requires the suite to redden for the RIGHT reason.
       #   - test count: a silently-vanishing test (a bad glob, a dropped file) is a
       #     green suite otherwise. Skips are pinned exactly; the live tier is 21.
-      - name: sdk export coverage
-        run: adapters/railgun/scripts/check-sdk-export-coverage.sh
-      - name: sdk rust/ts constant parity
-        run: adapters/railgun/scripts/check-sdk-constant-parity.sh
       - name: sdk test-count pin
         run: adapters/railgun/scripts/check-sdk-test-count.sh
       - name: sdk suite red-proof

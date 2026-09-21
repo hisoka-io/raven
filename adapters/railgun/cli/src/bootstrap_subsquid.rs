@@ -147,6 +147,13 @@ pub enum BootstrapError {
     PpoiUnreachable(String),
     #[error("PPOI response decode: {0}")]
     PpoiDecode(String),
+    /// Upstream answered, and the answer is not the complete ordered list. No bootstrap
+    /// mode absorbs this: the host was reached.
+    #[error(
+        "PPOI upstream integrity violation: {0}. The host answered, so this is not an outage \
+         and no --ppoi-bootstrap-mode skips it."
+    )]
+    PpoiIntegrity(String),
     #[error("PPOI list_key {list_hex} bootstrap: {reason}")]
     PpoiList { list_hex: String, reason: String },
     #[error(
@@ -1111,8 +1118,9 @@ pub enum PpoiBootstrapMode {
     /// Hard-stop on any upstream unreachability.
     #[default]
     Strict,
-    /// Warn and seed an EMPTY IMT when every source fails at transport level;
-    /// a byte-identity mismatch still hard-stops.
+    /// Warn and seed an EMPTY IMT when no source could be read: every one failed at
+    /// transport level or answered undecodably. An integrity violation or a byte-identity
+    /// mismatch still hard-stops.
     SkipOnUnreachable,
 }
 
@@ -1225,7 +1233,7 @@ fn bounded_http_client(
 }
 
 /// Live client over the upstream PPOI events feed. Walks the bases in order and
-/// only reports `PpoiUnreachable` once every base has failed.
+/// reports only once every base has failed, under the gravest class any of them hit.
 pub struct RailwayPpoiClient {
     bases: Vec<String>,
     chain_type: u32,
@@ -1382,256 +1390,342 @@ fn parse_event_history_count(
     status: &serde_json::Value,
     network_name: &str,
     list_key: [u8; 32],
-) -> Result<u64, String> {
+) -> Result<u64, PpoiBaseFailure> {
+    let unreadable = |detail: &str| PpoiBaseFailure::decode(detail.to_owned());
     let list_key_hex = to_hex(&list_key);
     let list_status = status
         .get("forNetwork")
         .and_then(|networks| networks.get(network_name))
         .and_then(|network| network.get("listStatuses"))
         .and_then(|lists| lists.get(&list_key_hex))
-        .ok_or_else(|| format!("node status has no {network_name} list {list_key_hex}"))?;
+        .ok_or_else(|| {
+            PpoiBaseFailure::decode(format!(
+                "node status has no {network_name} list {list_key_hex}"
+            ))
+        })?;
     let lengths = list_status
         .get("poiEventLengths")
         .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| "node status poiEventLengths is not an object".to_owned())?;
+        .ok_or_else(|| unreadable("node status poiEventLengths is not an object"))?;
     let event_count = lengths.values().try_fold(0u64, |sum, value| {
         let count = value
             .as_u64()
-            .ok_or_else(|| "node status poiEventLengths contains a non-u64 value".to_owned())?;
+            .ok_or_else(|| unreadable("node status poiEventLengths contains a non-u64 value"))?;
         sum.checked_add(count)
-            .ok_or_else(|| "node status poiEventLengths sum overflows u64".to_owned())
+            .ok_or_else(|| unreadable("node status poiEventLengths sum overflows u64"))
     })?;
     let historical_count = list_status
         .get("historicalMerklerootsLength")
         .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| "node status historicalMerklerootsLength is not a u64".to_owned())?;
+        .ok_or_else(|| unreadable("node status historicalMerklerootsLength is not a u64"))?;
     if historical_count != event_count {
-        return Err(format!(
+        return Err(PpoiBaseFailure::integrity(format!(
             "PPOI completeness canary failed: historicalMerklerootsLength {historical_count} != poiEventLengths sum {event_count}"
-        ));
+        )));
     }
     Ok(event_count)
 }
 
+/// How one base failed, ordered by how little the caller may forgive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PpoiFailureClass {
+    /// No answer arrived.
+    Transport,
+    /// An answer arrived in a shape this client cannot read.
+    Decode,
+    /// A readable answer arrived that is not the complete ordered list.
+    Integrity,
+}
+
+#[derive(Debug)]
+struct PpoiBaseFailure {
+    class: PpoiFailureClass,
+    detail: String,
+}
+
+impl PpoiBaseFailure {
+    fn transport(detail: String) -> Self {
+        Self {
+            class: PpoiFailureClass::Transport,
+            detail,
+        }
+    }
+
+    fn decode(detail: String) -> Self {
+        Self {
+            class: PpoiFailureClass::Decode,
+            detail,
+        }
+    }
+
+    fn integrity(detail: String) -> Self {
+        Self {
+            class: PpoiFailureClass::Integrity,
+            detail,
+        }
+    }
+
+    /// A body that never finished arriving is transport; one that arrived and did not
+    /// parse is decode.
+    fn from_body(context: &str, error: &reqwest::Error) -> Self {
+        let detail = format!("{context} {error}");
+        if error.is_decode() {
+            Self::decode(detail)
+        } else {
+            Self::transport(detail)
+        }
+    }
+}
+
+impl RailwayPpoiClient {
+    #[allow(clippy::too_many_lines)]
+    async fn fetch_from_base(
+        &self,
+        base: &str,
+        network_name: &str,
+        list_key: [u8; 32],
+    ) -> Result<Vec<PpoiEventRow>, PpoiBaseFailure> {
+        let status_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "ppoi_node_status",
+            "params": {},
+            "id": 1u64,
+        });
+        let status_response = match self.http.post(base).json(&status_request).send().await {
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) => {
+                return Err(PpoiBaseFailure::transport(format!(
+                    "{base}: node-status HTTP {}",
+                    response.status()
+                )));
+            }
+            Err(error) => {
+                return Err(PpoiBaseFailure::transport(format!(
+                    "{base}: node-status {error}"
+                )));
+            }
+        };
+        let status_response: RailwayJsonRpcResponse<serde_json::Value> = status_response
+            .json()
+            .await
+            .map_err(|error| PpoiBaseFailure::from_body(&format!("{base}: node-status"), &error))?;
+        let status = match (status_response.result, status_response.error) {
+            (Some(status), None) => status,
+            (None, Some(error)) => {
+                return Err(PpoiBaseFailure::decode(format!(
+                    "{base}: node-status JSON-RPC error {}: {}",
+                    error.code, error.message
+                )));
+            }
+            _ => {
+                return Err(PpoiBaseFailure::decode(format!(
+                    "{base}: node-status malformed JSON-RPC envelope"
+                )));
+            }
+        };
+        let expected_events =
+            parse_event_history_count(&status, network_name, list_key).map_err(|failure| {
+                PpoiBaseFailure {
+                    class: failure.class,
+                    detail: format!("{base}: {}", failure.detail),
+                }
+            })?;
+        let target_events = self.max_events.unwrap_or(expected_events);
+        if target_events > expected_events {
+            return Err(PpoiBaseFailure::integrity(format!(
+                "{base}: requested PPOI prefix {target_events} exceeds node-status count {expected_events}"
+            )));
+        }
+        let mut out = Vec::new();
+        let mut start_index = 0u64;
+        loop {
+            if start_index >= target_events {
+                return if u64::try_from(out.len()).unwrap_or(u64::MAX) == target_events {
+                    Ok(out)
+                } else {
+                    Err(PpoiBaseFailure::integrity(format!(
+                        "{base}: PPOI scan returned {} rows for target count {target_events}",
+                        out.len()
+                    )))
+                };
+            }
+            let Some(end_index) = start_index.checked_add(PPOI_EVENT_PAGE_ROWS - 1) else {
+                return Err(PpoiBaseFailure::integrity(format!(
+                    "{base}: PPOI page starting at {start_index} overflows u64"
+                )));
+            };
+            let end_index = end_index.min(target_events - 1);
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "ppoi_poi_events",
+                "params": {
+                    "chainType": self.chain_type.to_string(),
+                    "chainID": self.chain_id.to_string(),
+                    "txidVersion": "V2_PoseidonMerkle",
+                    "listKey": to_hex(&list_key),
+                    "startIndex": start_index,
+                    "endIndex": end_index,
+                },
+                "id": 1u64,
+            });
+            let response = self
+                .http
+                .post(base)
+                .json(&request)
+                .send()
+                .await
+                .map_err(|error| PpoiBaseFailure::transport(format!("{base}: {error}")))?;
+            if !response.status().is_success() {
+                return Err(PpoiBaseFailure::transport(format!(
+                    "{base}: HTTP {}",
+                    response.status()
+                )));
+            }
+            let response: RailwayJsonRpcResponse<Vec<WirePoiEventEntry>> = response
+                .json()
+                .await
+                .map_err(|error| PpoiBaseFailure::from_body(&format!("{base}: decode"), &error))?;
+            if response.jsonrpc != "2.0" || response.id != 1 {
+                return Err(PpoiBaseFailure::decode(format!(
+                    "{base}: JSON-RPC envelope mismatch: version {}, id {}",
+                    response.jsonrpc, response.id
+                )));
+            }
+            let parsed = match (response.result, response.error) {
+                (Some(result), None) => result,
+                (None, Some(error)) => {
+                    return Err(PpoiBaseFailure::decode(format!(
+                        "{base}: JSON-RPC error {}: {}",
+                        error.code, error.message
+                    )));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(PpoiBaseFailure::decode(format!(
+                        "{base}: JSON-RPC result and error both present"
+                    )));
+                }
+                (None, None) => {
+                    return Err(PpoiBaseFailure::decode(format!(
+                        "{base}: JSON-RPC result and error both absent"
+                    )));
+                }
+            };
+            if parsed.is_empty() {
+                return Err(PpoiBaseFailure::integrity(format!(
+                    "{base}: PPOI scan ended empty at {start_index} before target count {target_events}"
+                )));
+            }
+            let mut previous = None;
+            for entry in parsed {
+                let index = entry.signed_event.index;
+                if !(start_index..=end_index).contains(&index)
+                    || previous.is_some_and(|prior| index <= prior)
+                {
+                    return Err(PpoiBaseFailure::integrity(format!(
+                        "{base}: PPOI response index {index} is outside or non-monotone for {start_index}..={end_index}"
+                    )));
+                }
+                previous = Some(index);
+                let signature = parse_hex64(&entry.signed_event.signature).map_err(|_| {
+                    PpoiBaseFailure::decode(format!(
+                        "{base}: signature at index {index} is not 64-byte hex"
+                    ))
+                })?;
+                let event_type = match entry.signed_event.event_type.as_str() {
+                    "Shield" => raven_railgun_persistence::PpoiEventType::Shield,
+                    "Transact" => raven_railgun_persistence::PpoiEventType::Transact,
+                    "Unshield" => raven_railgun_persistence::PpoiEventType::Unshield,
+                    "LegacyTransact" => raven_railgun_persistence::PpoiEventType::LegacyTransact,
+                    event_type => {
+                        return Err(PpoiBaseFailure::decode(format!(
+                            "{base}: unknown PPOI event type {event_type} at index {index}"
+                        )));
+                    }
+                };
+                let leaf =
+                    parse_hex32(&entry.signed_event.blinded_commitment).map_err(|error| {
+                        PpoiBaseFailure::decode(format!(
+                            "{base}: blindedCommitment at index {index}: {error}"
+                        ))
+                    })?;
+                let root = parse_hex32(&entry.validated_merkleroot).map_err(|error| {
+                    PpoiBaseFailure::decode(format!(
+                        "{base}: validatedMerkleroot at index {index}: {error}"
+                    ))
+                })?;
+                out.push(PpoiEventRow {
+                    index,
+                    leaf,
+                    event_type: Some(event_type),
+                    signature: Some(signature.to_vec()),
+                    validated_merkleroot: root,
+                });
+            }
+            start_index = end_index.checked_add(1).ok_or_else(|| {
+                PpoiBaseFailure::integrity(format!(
+                    "{base}: PPOI cursor cannot advance past inclusive end {end_index}"
+                ))
+            })?;
+        }
+    }
+}
+
 #[async_trait]
 impl PpoiEventsSource for RailwayPpoiClient {
-    #[allow(clippy::too_many_lines)]
     async fn fetch_all_events(
         &self,
         list_key: [u8; 32],
     ) -> Result<Vec<PpoiEventRow>, BootstrapError> {
-        let mut last_err = String::from("(no bases attempted)");
+        let network_name = railway_network_name(self.chain_id)?;
+        // The gravest class any base reported decides the variant, so a dead sibling cannot
+        // relabel a base that answered wrongly as unreachable.
+        let mut gravest: Option<PpoiBaseFailure> = None;
         for base in &self.bases {
-            let status_request = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "ppoi_node_status",
-                "params": {},
-                "id": 1u64,
-            });
-            let status_response = match self.http.post(base).json(&status_request).send().await {
-                Ok(response) if response.status().is_success() => response,
-                Ok(response) => {
-                    last_err = format!("{base}: node-status HTTP {}", response.status());
-                    continue;
-                }
-                Err(error) => {
-                    last_err = format!("{base}: node-status {error}");
-                    continue;
-                }
-            };
-            let status_response: RailwayJsonRpcResponse<serde_json::Value> =
-                match status_response.json().await {
-                    Ok(response) => response,
-                    Err(error) => {
-                        last_err = format!("{base}: node-status decode {error}");
-                        continue;
-                    }
-                };
-            let status = match (status_response.result, status_response.error) {
-                (Some(status), None) => status,
-                (None, Some(error)) => {
-                    last_err = format!(
-                        "{base}: node-status JSON-RPC error {}: {}",
-                        error.code, error.message
+            match self.fetch_from_base(base, network_name, list_key).await {
+                Ok(rows) => return Ok(rows),
+                Err(failure) => {
+                    tracing::warn!(
+                        base = %base,
+                        class = ?failure.class,
+                        error = %failure.detail,
+                        "Railway PPOI base failed; trying next"
                     );
-                    continue;
-                }
-                _ => {
-                    last_err = format!("{base}: node-status malformed JSON-RPC envelope");
-                    continue;
-                }
-            };
-            let network_name = railway_network_name(self.chain_id)?;
-            let expected_events = match parse_event_history_count(&status, network_name, list_key) {
-                Ok(count) => count,
-                Err(error) => {
-                    last_err = format!("{base}: {error}");
-                    continue;
-                }
-            };
-            let target_events = self.max_events.unwrap_or(expected_events);
-            if target_events > expected_events {
-                last_err = format!(
-                    "{base}: requested PPOI prefix {target_events} exceeds node-status count {expected_events}"
-                );
-                continue;
-            }
-            let mut out = Vec::new();
-            let mut start_index = 0u64;
-            let base_outcome = loop {
-                if start_index >= target_events {
-                    break if u64::try_from(out.len()).unwrap_or(u64::MAX) == target_events {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "{base}: PPOI scan returned {} rows for target count {target_events}",
-                            out.len()
-                        ))
-                    };
-                }
-                let Some(end_index) = start_index.checked_add(PPOI_EVENT_PAGE_ROWS - 1) else {
-                    break Err(format!(
-                        "{base}: PPOI page starting at {start_index} overflows u64"
-                    ));
-                };
-                let end_index = end_index.min(target_events - 1);
-                let request = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "ppoi_poi_events",
-                    "params": {
-                        "chainType": self.chain_type.to_string(),
-                        "chainID": self.chain_id.to_string(),
-                        "txidVersion": "V2_PoseidonMerkle",
-                        "listKey": to_hex(&list_key),
-                        "startIndex": start_index,
-                        "endIndex": end_index,
-                    },
-                    "id": 1u64,
-                });
-                let response = match self.http.post(base).json(&request).send().await {
-                    Ok(response) => response,
-                    Err(error) => break Err(format!("{base}: {error}")),
-                };
-                if !response.status().is_success() {
-                    break Err(format!("{base}: HTTP {}", response.status()));
-                }
-                let response: RailwayJsonRpcResponse<Vec<WirePoiEventEntry>> =
-                    match response.json().await {
-                        Ok(response) => response,
-                        Err(error) => break Err(format!("{base}: decode {error}")),
-                    };
-                if response.jsonrpc != "2.0" || response.id != 1 {
-                    break Err(format!(
-                        "{base}: JSON-RPC envelope mismatch: version {}, id {}",
-                        response.jsonrpc, response.id
-                    ));
-                }
-                let parsed = match (response.result, response.error) {
-                    (Some(result), None) => result,
-                    (None, Some(error)) => {
-                        break Err(format!(
-                            "{base}: JSON-RPC error {}: {}",
-                            error.code, error.message
-                        ))
-                    }
-                    (Some(_), Some(_)) => {
-                        break Err(format!("{base}: JSON-RPC result and error both present"));
-                    }
-                    (None, None) => {
-                        break Err(format!("{base}: JSON-RPC result and error both absent"));
-                    }
-                };
-                let page_len = parsed.len();
-                if page_len == 0 {
-                    break Err(format!(
-                        "{base}: PPOI scan ended empty at {start_index} before target count {target_events}"
-                    ));
-                }
-                let mut page = Vec::with_capacity(page_len);
-                let mut previous = None;
-                let mut page_error = None;
-                for entry in parsed {
-                    let index = entry.signed_event.index;
-                    if !(start_index..=end_index).contains(&index)
-                        || previous.is_some_and(|prior| index <= prior)
+                    if gravest
+                        .as_ref()
+                        .is_none_or(|held| failure.class >= held.class)
                     {
-                        page_error = Some(format!(
-                            "{base}: PPOI response index {index} is outside or non-monotone for {start_index}..={end_index}"
-                        ));
-                        break;
+                        gravest = Some(failure);
                     }
-                    previous = Some(index);
-                    let Ok(signature) = parse_hex64(&entry.signed_event.signature) else {
-                        page_error = Some(format!(
-                            "{base}: signature at index {index} is not 64-byte hex"
-                        ));
-                        break;
-                    };
-                    let event_type = match entry.signed_event.event_type.as_str() {
-                        "Shield" => raven_railgun_persistence::PpoiEventType::Shield,
-                        "Transact" => raven_railgun_persistence::PpoiEventType::Transact,
-                        "Unshield" => raven_railgun_persistence::PpoiEventType::Unshield,
-                        "LegacyTransact" => {
-                            raven_railgun_persistence::PpoiEventType::LegacyTransact
-                        }
-                        event_type => {
-                            page_error = Some(format!(
-                                "{base}: unknown PPOI event type {event_type} at index {index}"
-                            ));
-                            break;
-                        }
-                    };
-                    let leaf = match parse_hex32(&entry.signed_event.blinded_commitment) {
-                        Ok(leaf) => leaf,
-                        Err(error) => {
-                            page_error = Some(format!(
-                                "{base}: blindedCommitment at index {index}: {error}"
-                            ));
-                            break;
-                        }
-                    };
-                    let root = match parse_hex32(&entry.validated_merkleroot) {
-                        Ok(root) => root,
-                        Err(error) => {
-                            page_error = Some(format!(
-                                "{base}: validatedMerkleroot at index {index}: {error}"
-                            ));
-                            break;
-                        }
-                    };
-                    page.push(PpoiEventRow {
-                        index,
-                        leaf,
-                        event_type: Some(event_type),
-                        signature: Some(signature.to_vec()),
-                        validated_merkleroot: root,
-                    });
-                }
-                if let Some(error) = page_error {
-                    break Err(error);
-                }
-                out.extend(page);
-                start_index = match end_index.checked_add(1) {
-                    Some(next) => next,
-                    _ => {
-                        break Err(format!(
-                            "{base}: PPOI cursor cannot advance past inclusive end {end_index}"
-                        ))
-                    }
-                };
-            };
-            match base_outcome {
-                Ok(()) => return Ok(out),
-                Err(error) => {
-                    tracing::warn!(base = %base, error = %error, "Railway PPOI base failed; trying next");
-                    last_err = error;
                 }
             }
         }
-        Err(BootstrapError::PpoiUnreachable(format!(
-            "all {} Railway base(s) failed; last error: {last_err}",
-            self.bases.len()
-        )))
+        let base_count = self.bases.len();
+        match gravest {
+            Some(PpoiBaseFailure {
+                class: PpoiFailureClass::Integrity,
+                detail,
+            }) => Err(BootstrapError::PpoiIntegrity(format!(
+                "{detail} (of {base_count} Railway base(s), none served the list whole)"
+            ))),
+            Some(PpoiBaseFailure {
+                class: PpoiFailureClass::Decode,
+                detail,
+            }) => Err(BootstrapError::PpoiDecode(format!(
+                "all {base_count} Railway base(s) failed; last unreadable answer: {detail}"
+            ))),
+            Some(PpoiBaseFailure {
+                class: PpoiFailureClass::Transport,
+                detail,
+            }) => Err(BootstrapError::PpoiUnreachable(format!(
+                "all {base_count} Railway base(s) failed; last error: {detail}"
+            ))),
+            // Construction refuses an empty base list; were one to arrive, it is a
+            // configuration fault and must not read as an outage a skip mode absorbs.
+            None => Err(BootstrapError::ClientConfig {
+                client: "RailwayPpoiClient",
+                reason: "no base URL to try".to_owned(),
+            }),
+        }
     }
 }
 
@@ -1988,9 +2082,13 @@ mod unit_tests {
                 }
             }
         });
-        let error = parse_event_history_count(&status, "Ethereum", list_key)
+        let failure = parse_event_history_count(&status, "Ethereum", list_key)
             .expect_err("17 events and 16 roots must fail closed");
-        assert!(error.contains("16 != poiEventLengths sum 17"), "{error}");
+        assert_eq!(failure.class, PpoiFailureClass::Integrity);
+        assert!(
+            failure.detail.contains("16 != poiEventLengths sum 17"),
+            "{failure:?}"
+        );
     }
 
     fn assert_bounded_client_build_failure(
