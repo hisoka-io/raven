@@ -327,6 +327,25 @@ export class RavenPOINodeInterface {
         this.fetchImpl,
       );
     }
+
+    // Only under `allow-upstream-disclosure`, whose entire meaning is "re-ask a DIFFERENT
+    // party": pointing the fallback at this node makes the policy a lie, since the caller
+    // consents to disclosure and gets the same stale answer from the same operator. Under
+    // `refuse` the upstream is only a passthrough target for methods Raven does not
+    // implement, and one process serving both roles is a legitimate topology. Checked after
+    // the registry is built so it covers a caller-supplied `chainRegistry` too.
+    if (
+      this.upstream !== undefined &&
+      this.privateStalePolicy === "allow-upstream-disclosure"
+    ) {
+      const served = this.registry.resolve(this.chainId).endpoint.replace(/\/$/, "");
+      if (served === this.upstream) {
+        throw RavenError.invalidQuery(
+          "upstreamFallbackEndpoint must not be the endpoint it falls back from; both " +
+            `resolve to ${this.upstream}, so the fallback discloses to the same operator`,
+        );
+      }
+    }
   }
 
   isActive(chain: Chain): boolean {
@@ -950,7 +969,17 @@ export class RavenPOINodeInterface {
               "auth path cannot be verified without one",
           );
         }
-        if (normalizeHex(pinnedRoot) !== proof.root) {
+        // `normalizeHex` strips `0x` and lowercases; it does not pad. An unpadded 32-byte
+        // root would compare unequal and be reported as tampering, so width is checked first
+        // and named for what it is.
+        const normalizedPin = normalizeHex(pinnedRoot);
+        if (normalizedPin.length !== 64) {
+          throw RavenError.invalidQuery(
+            `client-PIR ${pathInstance}: pinned root for ${rootKey} is ` +
+              `${normalizedPin.length} hex chars, not 64; pad it to 32 bytes`,
+          );
+        }
+        if (normalizedPin !== proof.root) {
           throw RavenError.decodeError(
             `client-PIR ${pathInstance}: folded root does not match pinned root`,
           );

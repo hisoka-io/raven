@@ -176,6 +176,20 @@ describe("the PPOI path-10 pinned root is mandatory and chain-scoped", () => {
     expect(proof.root).toBe(trueRoot);
   });
 
+  // An unpadded 32-byte root reads as tampering unless width is checked first: the fold
+  // always yields 64 chars, so a 63-char pin can never equal it however honest the server.
+  it("names an unpadded pin as malformed rather than reporting a root mismatch", async () => {
+    mountRowRoute(server, nodes);
+    // 63 chars: what a 32-byte root looks like when its leading zero nibble was dropped.
+    const unpadded = trueRoot.slice(1);
+    expect(unpadded).toHaveLength(63);
+    const sdk = makeSdk(server, {
+      labels: [[`t2Path:${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, "ppoi-paths-ofac-1"]],
+      pinnedRoots: [[`${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, unpadded]],
+    });
+    await expectRejectsWith(sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]), "InvalidQuery");
+  });
+
   it("accepts a root pinned under the legacy chain-less key", async () => {
     mountRowRoute(server, nodes);
     const sdk = makeSdk(server, {

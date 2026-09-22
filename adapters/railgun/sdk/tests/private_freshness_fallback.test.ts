@@ -128,6 +128,40 @@ describe("private response freshness fallback", () => {
     },
   );
 
+  // `allow-upstream-disclosure` means "re-ask a DIFFERENT party". Aimed back at this node
+  // the caller consents to disclosure and gets the same stale answer from the same operator,
+  // so the consent buys nothing and the policy name is false.
+  it("refuses a disclosure fallback aimed at the endpoint it falls back from", () => {
+    let thrown: unknown;
+    try {
+      new RavenPOINodeInterface({
+        endpoint: adapter.url,
+        bearerToken: TOKEN,
+        privateStalePolicy: "allow-upstream-disclosure",
+        upstreamFallbackEndpoint: `${adapter.url}/`,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(RavenError.is(thrown, "InvalidQuery")).toBe(true);
+    expect(String((thrown as Error).message)).toMatch(/must not be the endpoint it falls back from/);
+    expect(adapter.requests).toHaveLength(0);
+    expect(upstream.requests).toHaveLength(0);
+  });
+
+  // The same policy against a genuinely separate party is accepted.
+  it("accepts a disclosure fallback aimed at a separate party", () => {
+    expect(
+      () =>
+        new RavenPOINodeInterface({
+          endpoint: adapter.url,
+          bearerToken: TOKEN,
+          privateStalePolicy: "allow-upstream-disclosure",
+          upstreamFallbackEndpoint: upstream.url,
+        }),
+    ).not.toThrow();
+  });
+
   it("a negative confidence floor cannot turn confidence 0.10 into Valid", async () => {
     adapter.route(
       (req) => req.url?.endsWith("/batch") ?? false,
