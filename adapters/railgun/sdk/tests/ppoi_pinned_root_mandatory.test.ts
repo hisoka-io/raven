@@ -27,6 +27,7 @@ import {
   type MockServer,
 } from "./helpers/mock_server";
 import { foldMerkleRoot } from "../src/poseidon";
+import { assertNoCommitmentsAnywhere } from "./helpers/private_wire";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const MAINNET = 1;
@@ -586,6 +587,30 @@ describe("the pin resolver as public API", () => {
     const width = resolved.window.endIndex - resolved.window.startIndex + 1;
     expect(width).toBeLessThanOrEqual(PIN_TAIL_WINDOW);
     expect(resolved.window.endIndex).toBe(latest);
+  });
+
+  // The whole product is a private read, so the pin fetch must not undo it. Checked with the
+  // whole-request helper, because the PIR harness narrows to the instance paths and would
+  // filter these out -- a leak here would otherwise be invisible to every privacy test.
+  it("puts nothing that identifies the commitment on the wire", async () => {
+    const latest = BLOCK * LEAVES_PER_PPOI_BLOCK + 12;
+    mountUpstream(upstream, {
+      merklerootsLength: latest + 1,
+      rows: inRange([{ index: latest, root: "cc".repeat(32) }]),
+    });
+
+    await resolver().resolve(LIST_KEY_HEX, BLOCK);
+
+    expect(upstream.requests.length).toBeGreaterThan(0);
+    assertNoCommitmentsAnywhere(upstream.requests, [BC_HEX]);
+
+    // The assertion must be able to fail, or the check above proves nothing.
+    expect(() =>
+      assertNoCommitmentsAnywhere(
+        [{ url: "http://x/", method: "POST", body: new TextEncoder().encode(BC_HEX) }],
+        [BC_HEX],
+      ),
+    ).toThrow(/blinded commitment/);
   });
 
   it("refuses a list key that is not 64 hex chars", async () => {

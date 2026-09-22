@@ -90,6 +90,26 @@ export function inspectPirDataPosts(
   return selected.map((request) => inspectPirRequest(request, options));
 }
 
+function assertBodyCarriesNoCommitment(
+  request: TestWireRequest,
+  commitmentHexes: readonly string[],
+): void {
+  for (const commitmentHex of commitmentHexes) {
+    const raw = hexToBytes(commitmentHex);
+    const ascii = new TextEncoder().encode(commitmentHex);
+    const prefixedAscii = new TextEncoder().encode(`0x${commitmentHex}`);
+    if (containsByteSequence(request.body, raw)) {
+      fail(request, `contains raw blinded commitment ${commitmentHex}`);
+    }
+    if (containsByteSequence(request.body, prefixedAscii)) {
+      fail(request, `contains 0x-prefixed ASCII blinded commitment ${commitmentHex}`);
+    }
+    if (containsByteSequence(request.body, ascii)) {
+      fail(request, `contains ASCII blinded commitment ${commitmentHex}`);
+    }
+  }
+}
+
 export function assertNoCommitmentsInPirRequests(
   requests: readonly TestWireRequest[],
   commitmentHexes: readonly string[],
@@ -97,22 +117,30 @@ export function assertNoCommitmentsInPirRequests(
 ): InspectedPirRequest[] {
   const inspected = inspectPirDataPosts(requests, options);
   for (const { request } of inspected) {
-    for (const commitmentHex of commitmentHexes) {
-      const raw = hexToBytes(commitmentHex);
-      const ascii = new TextEncoder().encode(commitmentHex);
-      const prefixedAscii = new TextEncoder().encode(`0x${commitmentHex}`);
-      if (containsByteSequence(request.body, raw)) {
-        fail(request, `contains raw blinded commitment ${commitmentHex}`);
-      }
-      if (containsByteSequence(request.body, prefixedAscii)) {
-        fail(request, `contains 0x-prefixed ASCII blinded commitment ${commitmentHex}`);
-      }
-      if (containsByteSequence(request.body, ascii)) {
-        fail(request, `contains ASCII blinded commitment ${commitmentHex}`);
-      }
-    }
+    assertBodyCarriesNoCommitment(request, commitmentHexes);
   }
   return inspected;
+}
+
+/**
+ * The same leak check over EVERY request, not only the instance query paths.
+ *
+ * `inspectPirDataPosts` narrows to `/v1/instance/<id>/(query|batch|fanout)` and throws on an
+ * empty selection, and every caller passes an exact `expectedQueryCount` — so it cannot be
+ * widened without changing what those callers assert. Pin resolution talks to a different host
+ * on a different path, which means the narrow helper filters those requests straight back out
+ * and structurally cannot fail on a leak there. This is the sibling that can.
+ *
+ * Deliberately has no expected count: it asserts an absence over whatever was sent, so it stays
+ * correct when a path sends nothing at all.
+ */
+export function assertNoCommitmentsAnywhere(
+  requests: readonly TestWireRequest[],
+  commitmentHexes: readonly string[],
+): void {
+  for (const request of requests) {
+    assertBodyCarriesNoCommitment(request, commitmentHexes);
+  }
 }
 
 export function injectCommitment(
