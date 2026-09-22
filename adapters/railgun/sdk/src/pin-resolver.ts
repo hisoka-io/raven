@@ -17,6 +17,9 @@ export const LEAVES_PER_PPOI_BLOCK = 65_536;
  *  wider than 500 leaves, so this has room to grow if a node's lag ever needs it. */
 export const PIN_TAIL_WINDOW = 64;
 
+/** Default deadline for one pin request. */
+const DEFAULT_PIN_REQUEST_TIMEOUT_MS = 10_000;
+
 const DEFAULT_TAIL_TTL_MS = 15_000;
 const ROOT_HEX_CHARS = 64;
 
@@ -47,6 +50,8 @@ export interface UpstreamPinResolverConfig {
   /** Upstream `NetworkName` for the status lookup; defaults from chainType/chainId. */
   readonly networkName?: string;
   readonly tailTtlMs?: number;
+  /** Deadline for one pin request. A wallet is blocked on this, so it must not be unbounded. */
+  readonly requestTimeoutMs?: number;
   readonly onRequest?: PinRequestObserver;
 }
 
@@ -86,6 +91,7 @@ export class UpstreamPinResolver {
   private readonly networkName: string;
   private readonly tailTtlMs: number;
   private readonly onRequest: PinRequestObserver | undefined;
+  private readonly requestTimeoutMs: number;
 
   // A full block's root can never change, so this entry is correct for the process lifetime.
   private readonly frozenRoots = new Map<string, ReadonlySet<string>>();
@@ -118,6 +124,22 @@ export class UpstreamPinResolver {
       );
     }
     this.onRequest = config.onRequest;
+    this.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_PIN_REQUEST_TIMEOUT_MS;
+  }
+
+  /**
+   * Drop the cached TAIL answer for one block, so the next `resolve` re-asks upstream.
+   *
+   * Consulting the tail cache before the point query stops a filling block leaking one
+   * block-naming request per proof, but it also means a block that FREEZES inside the TTL is
+   * still answered from the window it had while filling, and the block's final root is not in
+   * that set. That direction is a refused honest proof rather than an accepted forged one, so
+   * it is safe -- but it is still wrong, and the caller can turn it back into a correct answer
+   * by forgetting once and re-resolving before it refuses. The frozen cache is never dropped:
+   * a full tree's root is immutable, so a miss against it is a real mismatch.
+   */
+  forgetTail(listKeyHex: string, block: number): void {
+    this.tailPins.delete(`${normalizeRootHex(listKeyHex)}:${block}`);
   }
 
   /** Every root upstream is willing to certify for this block. */
@@ -147,17 +169,23 @@ export class UpstreamPinResolver {
     // One point query classifies the block AND answers it: a row at the block's last leaf
     // means the tree is full, so that row's root is the full tree's root and is immutable.
     // No row means the block is still filling (or is past the tip), which needs the window.
-    const frozen = await this.pointQuery(listKey, block, lastIndex);
-    if (frozen) {
-      this.frozenRoots.set(cacheKey, frozen);
-      return { roots: frozen, window: { startIndex: lastIndex, endIndex: lastIndex, frozen: true } };
-    }
-
+    // The tail cache is consulted BEFORE the point query, not after. Checking it second made
+    // a filling block re-send the point query on every single proof, and `startIndex` names
+    // the note's block -- so a wallet emitted one block-naming request per note to the very
+    // party PIR exists to blind. A cached tail answer means this block was not frozen within
+    // the TTL, which is exactly what the point query would re-establish.
     const now = Date.now();
     const cachedTail = this.tailPins.get(cacheKey);
     if (cachedTail && cachedTail.expiresAt > now) {
       return cachedTail.value;
     }
+
+    const frozen = await this.pointQuery(listKey, lastIndex);
+    if (frozen) {
+      this.frozenRoots.set(cacheKey, frozen);
+      return { roots: frozen, window: { startIndex: lastIndex, endIndex: lastIndex, frozen: true } };
+    }
+
     const resolved = await this.tailWindow(listKey, block);
     this.tailPins.set(cacheKey, { expiresAt: now + this.tailTtlMs, value: resolved });
     return resolved;
@@ -167,7 +195,6 @@ export class UpstreamPinResolver {
    *  and filters inclusively at both ends, so this returns at most one row. */
   private async pointQuery(
     listKey: string,
-    block: number,
     lastIndex: number,
   ): Promise<ReadonlySet<string> | undefined> {
     const rows = this.decodeEvents(
@@ -180,7 +207,15 @@ export class UpstreamPinResolver {
         endIndex: lastIndex,
       }),
     );
-    const roots = this.rootsInBlock(rows, block);
+    // Filtering by BLOCK here would accept any row that floor-divides to it, so an upstream
+    // answering the zero-width query with an INTERMEDIATE row would have that partial-tree
+    // root cached as the block's immutable root for the process lifetime. Both audits found
+    // this independently. The query names one index; only that index may answer it.
+    const roots = new Set<string>();
+    for (const row of rows) {
+      if (row.index !== lastIndex) continue;
+      roots.add(row.root);
+    }
     return roots.size === 0 ? undefined : roots;
   }
 
@@ -313,6 +348,11 @@ export class UpstreamPinResolver {
         method: "POST",
         headers: { "content-type": "application/json" },
         body,
+        // A pin fetch blocks a proof the wallet is waiting on, and the endpoint is a third
+        // party: without a deadline a silent upstream leaves that proof pending forever, which
+        // an audit reproduced. `AbortSignal.timeout` is the platform's own, so nothing leaks
+        // when the fetch settles first.
+        signal: AbortSignal.timeout(this.requestTimeoutMs),
       });
     } catch (cause) {
       throw RavenError.network(`pin resolver ${method}`, {

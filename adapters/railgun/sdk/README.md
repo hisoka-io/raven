@@ -179,9 +179,16 @@ Both pin requests are a function of public state only: the list key, a block num
 upstream's own tip. They are byte-identical for every wallet asking about the same block and
 carry nothing that identifies which commitment you hold.
 
-A pin source equal to the endpoint being verified is refused: explicitly setting `pinUpstream` to
-it throws at construction, and inheriting it leaves the resolver inert rather than verifying in a
-circle.
+A pin source that names the same **origin** as the endpoint being verified is refused: setting
+`pinUpstream` to it throws at construction, and inheriting such a value leaves the resolver inert
+rather than verifying in a circle. Scheme case, a default port, a trailing slash and an extra path
+segment all resolve to the same origin and are all caught.
+
+This is a misconfiguration guard, not a security boundary, and the difference is worth stating. It
+cannot prove two host*names* are different parties: `localhost` and `127.0.0.1` are distinct origins
+that reach the same process, and two DNS names can resolve to one host. If you point the pin source
+at the node you are verifying by a name the guard cannot recognise, verification is vacuous and
+nothing will tell you. **Choose a pin source you know is operated by someone else.**
 
 On a chain other than Ethereum mainnet, set `pinUpstreamNetworkName` to the name upstream reports
 under `forNetwork`. An unrecognised chain refuses rather than guessing, because guessing would

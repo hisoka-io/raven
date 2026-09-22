@@ -352,8 +352,8 @@ export class RavenPOINodeInterface {
       this.upstream !== undefined &&
       this.privateStalePolicy === "allow-upstream-disclosure"
     ) {
-      const served = this.registry.resolve(this.chainId).endpoint.replace(/\/$/, "");
-      if (served === this.upstream) {
+      const served = this.registry.resolve(this.chainId).endpoint;
+      if (sameParty(served, this.upstream)) {
         throw RavenError.invalidQuery(
           "upstreamFallbackEndpoint must not be the endpoint it falls back from; both " +
             `resolve to ${this.upstream}, so the fallback discloses to the same operator`,
@@ -372,14 +372,14 @@ export class RavenPOINodeInterface {
       config.pinUpstream === false
         ? undefined
         : (config.pinUpstream ?? this.upstream)?.replace(/\/$/, "");
-    if (typeof config.pinUpstream === "string" && pinSource === routeEndpoint) {
+    if (typeof config.pinUpstream === "string" && sameParty(pinSource, routeEndpoint)) {
       throw RavenError.invalidQuery(
         "pinUpstream must not be the endpoint whose auth paths it verifies; both resolve to " +
           `${routeEndpoint}, so the pin would come from the party that supplied the siblings`,
       );
     }
     this.pinResolver =
-      pinSource === undefined || pinSource === routeEndpoint
+      pinSource === undefined || sameParty(pinSource, routeEndpoint)
         ? undefined
         : new UpstreamPinResolver({
             endpoint: pinSource,
@@ -1060,6 +1060,14 @@ export class RavenPOINodeInterface {
       throw RavenError.is(cause, "Network")
         ? RavenError.network(message, cause.context)
         : RavenError.invalidQuery(message);
+    }
+    if (!resolved.roots.has(foldedRoot)) {
+      // A block that froze inside the tail TTL is still answered from the window it had while
+      // filling, and its final root is not in that set. Re-ask once before refusing, so the
+      // privacy fix above costs at most one extra request on a real freeze instead of costing
+      // an honest caller a refusal. Bounded to a single retry: a genuine forgery misses twice.
+      this.pinResolver.forgetTail(listKeyHex, block);
+      resolved = await this.pinResolver.resolve(listKeyHex, block);
     }
     if (!resolved.roots.has(foldedRoot)) {
       // The window is named because it is what separates "this node is lagging past the
@@ -1856,6 +1864,32 @@ function copyForBody(src: Uint8Array): Blob {
   const buf = new ArrayBuffer(src.byteLength);
   new Uint8Array(buf).set(src);
   return new Blob([buf], { type: "application/octet-stream" });
+}
+
+/**
+ * Whether two endpoints name the same server.
+ *
+ * Compares ORIGIN, not the string. A differing scheme case, a default port, a trailing slash
+ * or an extra path segment all address one server, and a raw string compare passes every one
+ * of them -- two blind audits each pointed a node at itself that way and had a forged auth
+ * path accepted, the worst case needing no explicit pin source at all, only an
+ * `upstreamFallbackEndpoint` with a path suffix.
+ *
+ * This is a MISCONFIGURATION guard and not a security boundary, and the difference matters.
+ * It cannot prove two hostnames are different parties: `localhost` and `127.0.0.1` are
+ * distinct origins that reach the same process, and two DNS names can resolve to one host.
+ * Nothing short of resolving both and trusting the result would close that, and a resolver
+ * is racy and is controlled by whoever controls DNS. An unparseable endpoint is treated as
+ * the same party, so a malformed pin source disables the resolver rather than silently
+ * skipping the check.
+ */
+function sameParty(a: string | undefined, b: string | undefined): boolean {
+  if (a === undefined || b === undefined) return false;
+  try {
+    return new URL(a).origin.toLowerCase() === new URL(b).origin.toLowerCase();
+  } catch {
+    return true;
+  }
 }
 
 function normalizeHex(hex: string): string {

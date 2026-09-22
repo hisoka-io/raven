@@ -103,6 +103,7 @@ interface Options {
   readonly labels?: [string, string][];
   readonly pinnedRoots?: [string, string][];
   readonly pinUpstream?: string | false;
+  readonly pinTailTtlMs?: number;
 }
 
 function makeSdk(server: MockServer, options: Options): RavenPOINodeInterface {
@@ -116,6 +117,7 @@ function makeSdk(server: MockServer, options: Options): RavenPOINodeInterface {
     ppoiPinnedRoots: new Map(options.pinnedRoots ?? []),
     bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX, GLOBAL_INDEX]])]]),
     ...(options.pinUpstream === undefined ? {} : { pinUpstream: options.pinUpstream }),
+    ...(options.pinTailTtlMs === undefined ? {} : { pinTailTtlMs: options.pinTailTtlMs }),
   });
 }
 
@@ -345,6 +347,38 @@ describe("an unpinned PPOI path-10 fold is verified against the upstream aggrega
       pinUpstream: upstream.url,
     });
   }
+
+  // The tail cache is consulted before the point query so a filling block stops leaking one
+  // block-naming request per proof. That trades freshness for privacy, and this is the test
+  // that the trade costs no correctness: a block freezing inside the TTL must still verify,
+  // via a single forget-and-retry, rather than refusing an honest proof for up to the TTL.
+  it("still verifies a fold after the block freezes inside the tail cache window", async () => {
+    mountRowRoute(adapter, nodes);
+    let frozen = false;
+    const fillingRoot = "77".repeat(32);
+    mountUpstream(upstream, {
+      merklerootsLength: BLOCK * 65_536 + 41,
+      rows: (startIndex, endIndex) =>
+        (frozen
+          ? [{ index: BLOCK_LAST_INDEX, root: trueRoot }]
+          : [{ index: BLOCK * 65_536 + 40, root: fillingRoot }]
+        ).filter((r) => r.index >= startIndex && r.index <= endIndex),
+    });
+    const sdk = makeSdk(adapter, {
+      labels: [[`t2Path:${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, "ppoi-paths-ofac-1"]],
+      pinnedRoots: [],
+      pinUpstream: upstream.url,
+      // Long enough that the cache would certainly still be warm without the retry.
+      pinTailTtlMs: 600_000,
+    });
+
+    // Warms the tail cache with a set that does NOT contain the fold.
+    await expectRejectsWith(sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]), "DecodeError");
+
+    frozen = true;
+    const [proof] = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+    expect(proof.root).toBe(trueRoot);
+  });
 
   // An empty pin is a configuration mistake, not an absent pin. Falling through to upstream
   // would silently verify against a different party than the caller asked for, so the
@@ -629,6 +663,35 @@ describe("the pin resolver as public API", () => {
         [BC_HEX],
       ),
     ).toThrow(/blinded commitment/);
+  });
+
+  // A pin fetch blocks a proof the wallet is waiting on, against a third-party host. An audit
+  // showed a silent upstream leaving that proof pending indefinitely. The deadline is asserted
+  // by watching the signal actually abort, not by checking that one was passed: a signal
+  // nobody honours and no signal at all are the same bug.
+  it("bounds a pin request with a deadline that really fires", async () => {
+    let seen: AbortSignal | undefined;
+    const hangingFetch: typeof fetch = (_input, init) => {
+      seen = init?.signal ?? undefined;
+      return new Promise<Response>(() => {
+        /* never settles, exactly like a silent upstream */
+      });
+    };
+    const r = new UpstreamPinResolver({
+      endpoint: "http://pin.invalid",
+      fetchImpl: hangingFetch,
+      chainType: 0,
+      chainId: MAINNET,
+      txidVersion: "V2_PoseidonMerkle",
+      requestTimeoutMs: 50,
+    });
+    void r.resolve(LIST_KEY_HEX, BLOCK);
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(seen).toBeInstanceOf(AbortSignal);
+    expect(seen?.aborted).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(seen?.aborted).toBe(true);
   });
 
   it("refuses a list key that is not 64 hex chars", async () => {
