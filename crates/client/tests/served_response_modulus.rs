@@ -46,7 +46,7 @@ fn serve(crt_moduli: Vec<u64>) -> Served {
         security_level: SecurityLevel::Bits128,
     };
     let database: Vec<u8> = (0..params.ring_dim * ENTRY_SIZE)
-        .map(|i| ((i * 17 + 3) % 251) as u8)
+        .map(|i| u8::try_from((i * 17 + 3) % 251).expect("reduced mod 251, so it fits u8"))
         .collect();
     let mut sampler = GaussianSampler::with_seed(params.sigma, 37);
     let (crs, encoded_db, sk) = setup(&params, &database, ENTRY_SIZE, &mut sampler).expect("setup");

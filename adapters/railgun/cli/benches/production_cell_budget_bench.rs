@@ -15,9 +15,9 @@
 //! slow-timeout is the only budget a machine-speed assertion can survive.
 //! A named `binary(...)` filter is NOT the only route in, which this file
 //! claimed until 2026-09-22: `production-cell-closure/inline` selects it via
-//! `--run-ignored all` without naming it, and CI run 35579440775 red here at
-//! 335 ms — runner speed, on a box that spent 20.3 s on setup. Re-routing or
-//! widening the ceiling is an owner call: G-350 / OQ-036.
+//! `--run-ignored all` without naming it, and CI has red here at 335 ms on a
+//! runner that spent 20.3 s on setup alone. Re-routing this binary or widening
+//! the ceiling is a judgement call, not a cleanup.
 //!
 //! Measured figures behind the ceilings, kept so a reader can tell a real
 //! regression from runner variance: the single-query production floor is
