@@ -16,7 +16,12 @@ import {
   type RavenErrorKind,
 } from "../src/index";
 import { encodeBatchResponseNodes, stubCtx as nodeStubCtx } from "./helpers/auth_path_stub";
-import { startMockServer, type MockServer } from "./helpers/mock_server";
+import {
+  readJsonRpcRequest,
+  startMockServer,
+  writeJsonRpcResult,
+  type MockServer,
+} from "./helpers/mock_server";
 import { foldMerkleRoot } from "../src/poseidon";
 
 const TOKEN = "test-token-padded-long-enough-1234";
@@ -92,6 +97,7 @@ interface Options {
   readonly chainId?: number;
   readonly labels?: [string, string][];
   readonly pinnedRoots?: [string, string][];
+  readonly pinUpstream?: string | false;
 }
 
 function makeSdk(server: MockServer, options: Options): RavenPOINodeInterface {
@@ -104,6 +110,7 @@ function makeSdk(server: MockServer, options: Options): RavenPOINodeInterface {
     clientPirInstanceLabels: new Map(options.labels ?? []),
     ppoiPinnedRoots: new Map(options.pinnedRoots ?? []),
     bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX, GLOBAL_INDEX]])]]),
+    ...(options.pinUpstream === undefined ? {} : { pinUpstream: options.pinUpstream }),
   });
 }
 
@@ -220,5 +227,293 @@ describe("the PPOI path-10 pinned root is mandatory and chain-scoped", () => {
       pinnedRoots: [[`${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, trueRoot]],
     });
     await expectRejectsWith(sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]), "InvalidQuery");
+  });
+});
+
+// Nothing in the repo mints a pin, so the verified path above was unreachable for a real
+// wallet: an integrator would ship the unverified fallback instead. These cover the second
+// rung -- the root read from the UPSTREAM aggregator, never from the node that served the
+// siblings. Raven's block is upstream's tree byte for byte (65,536 leaves, depth 16, same
+// zero value), so the root written immediately after global leaf `B*65536+65535` is the
+// root of full tree `B` and never changes again.
+
+const BLOCK_LAST_INDEX = BLOCK * 65_536 + 65_535;
+
+interface EventRow {
+  readonly index: number;
+  readonly root: string;
+}
+
+interface UpstreamScript {
+  /** Rows the node answers `ppoi_poi_events` with; receives the range it was asked for. */
+  readonly rows?: (startIndex: number, endIndex: number) => EventRow[];
+  /** `historicalMerklerootsLength`, i.e. one more than the latest global leaf index. */
+  readonly merklerootsLength?: number;
+}
+
+/** Rows a well-behaved node returns: everything it holds inside the requested range. */
+function inRange(all: readonly EventRow[]) {
+  return (startIndex: number, endIndex: number): EventRow[] =>
+    all.filter((r) => r.index >= startIndex && r.index <= endIndex);
+}
+
+function mountUpstream(server: MockServer, script: UpstreamScript): void {
+  server.route(
+    (req) => req.method === "POST",
+    (_req, body, res) => {
+      const rpc = readJsonRpcRequest(body);
+      if (rpc.method === "ppoi_node_status") {
+        writeJsonRpcResult(body, res, {
+          forNetwork: {
+            Ethereum: {
+              listStatuses: {
+                [LIST_KEY_HEX]: {
+                  historicalMerklerootsLength: script.merklerootsLength ?? 0,
+                },
+              },
+            },
+          },
+          listKeys: [LIST_KEY_HEX],
+        });
+        return true;
+      }
+      if (rpc.method === "ppoi_poi_events") {
+        const start = rpc.params.startIndex as number;
+        const end = rpc.params.endIndex as number;
+        const rows = script.rows ? script.rows(start, end) : [];
+        writeJsonRpcResult(
+          body,
+          res,
+          rows.map((r) => ({
+            signedPOIEvent: {
+              index: r.index,
+              blindedCommitment: BC_HEX,
+              signature: "00",
+              type: "Transact",
+            },
+            validatedMerkleroot: r.root,
+          })),
+        );
+        return true;
+      }
+      writeJsonRpcResult(body, res, null);
+      return true;
+    },
+  );
+}
+
+function eventRanges(server: MockServer): { startIndex: number; endIndex: number }[] {
+  return server.requests
+    .map((r) => readJsonRpcRequest(r.body))
+    .filter((rpc) => rpc.method === "ppoi_poi_events")
+    .map((rpc) => ({
+      startIndex: rpc.params.startIndex as number,
+      endIndex: rpc.params.endIndex as number,
+    }));
+}
+
+describe("an unpinned PPOI path-10 fold is verified against the upstream aggregator", () => {
+  let adapter: MockServer;
+  let upstream: MockServer;
+  const nodes = siblings(0xab);
+  const trueRoot = foldMerkleRoot(BC_HEX, nodes.map(toHex), BigInt(LOCAL_INDEX));
+  const otherRoot = `${"cd".repeat(31)}ef`;
+
+  beforeAll(async () => {
+    adapter = await startMockServer();
+    upstream = await startMockServer();
+  });
+  afterAll(async () => {
+    await adapter.close();
+    await upstream.close();
+  });
+  afterEach(() => {
+    adapter.reset();
+    upstream.reset();
+  });
+
+  function sdkWithResolver(): RavenPOINodeInterface {
+    mountRowRoute(adapter, nodes);
+    return makeSdk(adapter, {
+      labels: [[`t2Path:${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, "ppoi-paths-ofac-1"]],
+      pinnedRoots: [],
+      pinUpstream: upstream.url,
+    });
+  }
+
+  it("accepts a frozen block's fold against the root upstream wrote at the last leaf", async () => {
+    mountUpstream(upstream, {
+      rows: inRange([{ index: BLOCK_LAST_INDEX, root: trueRoot }]),
+    });
+    const [proof] = await sdkWithResolver().getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+    expect(proof.root).toBe(trueRoot);
+    // A full tree's root is one zero-width point query; no status call is needed to find it.
+    expect(eventRanges(upstream)).toEqual([
+      { startIndex: BLOCK_LAST_INDEX, endIndex: BLOCK_LAST_INDEX },
+    ]);
+  });
+
+  it("refuses a frozen block whose upstream root differs, naming the window it checked", async () => {
+    mountUpstream(upstream, {
+      rows: inRange([{ index: BLOCK_LAST_INDEX, root: otherRoot }]),
+    });
+    let thrown: unknown;
+    try {
+      await sdkWithResolver().getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(RavenError.is(thrown, "DecodeError"), `got ${String(thrown)}`).toBe(true);
+    expect(String((thrown as Error).message)).toContain(
+      `${BLOCK_LAST_INDEX}..${BLOCK_LAST_INDEX}`,
+    );
+    expect(String((thrown as Error).message)).toContain("frozen");
+  });
+
+  // The filling block has no final root, so the fold is matched against a window of the
+  // most recent roots -- one per leaf inserted.
+  it("accepts a filling block's fold against a root inside the tip window", async () => {
+    mountUpstream(upstream, {
+      merklerootsLength: GLOBAL_INDEX + 1,
+      rows: inRange([
+        { index: GLOBAL_INDEX - 1, root: otherRoot },
+        { index: GLOBAL_INDEX, root: trueRoot },
+      ]),
+    });
+    const [proof] = await sdkWithResolver().getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+    expect(proof.root).toBe(trueRoot);
+    // Point query first (empty, so the block is still filling), then the clamped window:
+    // `max(tailBlock*65536, L-63)`, which must not reach back into the previous tree.
+    expect(eventRanges(upstream)).toEqual([
+      { startIndex: BLOCK_LAST_INDEX, endIndex: BLOCK_LAST_INDEX },
+      { startIndex: BLOCK * 65_536, endIndex: GLOBAL_INDEX },
+    ]);
+  });
+
+  it("refuses a filling-block fold whose root has fallen out of the tip window", async () => {
+    const tip = BLOCK * 65_536 + 200;
+    mountUpstream(upstream, {
+      merklerootsLength: tip + 1,
+      rows: inRange([
+        { index: GLOBAL_INDEX, root: trueRoot },
+        { index: tip, root: otherRoot },
+      ]),
+    });
+    let thrown: unknown;
+    try {
+      await sdkWithResolver().getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(RavenError.is(thrown, "DecodeError"), `got ${String(thrown)}`).toBe(true);
+    // The window is what tells an operator "this node is lagging" apart from "this node
+    // forged the siblings", so the refusal has to name it.
+    expect(String((thrown as Error).message)).toContain(`${tip - 63}..${tip}`);
+    expect(String((thrown as Error).message)).toContain("filling");
+  });
+
+  // The clamp keeps the REQUEST inside one tree; the index filter is what protects against
+  // a node that answers outside the range it was asked for. Here the fold's root is real
+  // but belongs to the PREVIOUS tree, where it certifies a different set of leaves.
+  it("does not admit a neighbouring tree's root from a window spanning the boundary", async () => {
+    const tip = BLOCK * 65_536 + 3;
+    mountUpstream(upstream, {
+      merklerootsLength: tip + 1,
+      // Ignores the requested range on purpose.
+      rows: () => [
+        { index: BLOCK * 65_536 - 1, root: trueRoot },
+        { index: tip, root: otherRoot },
+      ],
+    });
+    let thrown: unknown;
+    try {
+      await sdkWithResolver().getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(RavenError.is(thrown, "DecodeError"), `got ${String(thrown)}`).toBe(true);
+    expect(String((thrown as Error).message)).toContain("1 root(s)");
+  });
+
+  // A pin the caller loaded themselves is the strongest claim available and still wins;
+  // the resolver is not consulted at all, so an offline wallet keeps working.
+  it("prefers a caller-supplied pin and never calls upstream", async () => {
+    mountUpstream(upstream, { rows: inRange([{ index: BLOCK_LAST_INDEX, root: otherRoot }]) });
+    mountRowRoute(adapter, nodes);
+    const sdk = makeSdk(adapter, {
+      labels: [[`t2Path:${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, "ppoi-paths-ofac-1"]],
+      pinnedRoots: [[`${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, trueRoot]],
+      pinUpstream: upstream.url,
+    });
+    const [proof] = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+    expect(proof.root).toBe(trueRoot);
+    expect(upstream.requests).toHaveLength(0);
+  });
+
+  // Asking the node that served the siblings for the root that checks them is circular.
+  it("refuses at construction when the pin source is the endpoint being verified", () => {
+    let thrown: unknown;
+    try {
+      makeSdk(adapter, { pinUpstream: adapter.url });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(RavenError.is(thrown, "InvalidQuery"), `got ${String(thrown)}`).toBe(true);
+    expect(String((thrown as Error).message)).toMatch(
+      /must not be the endpoint whose auth paths it verifies/,
+    );
+    expect(adapter.requests).toHaveLength(0);
+  });
+
+  // `upstreamFallbackEndpoint` is also the passthrough target, where one process serving
+  // both roles is legitimate, so an INHERITED pin source aimed at this node cannot fail
+  // construction. It goes inert instead, and the fold-time refusal says why.
+  it("stays inert, not fatal, when the inherited pin source is this node", async () => {
+    mountRowRoute(adapter, nodes);
+    const sdk = new RavenPOINodeInterface({
+      endpoint: adapter.url,
+      bearerToken: TOKEN,
+      useClientPir: true,
+      upstreamFallbackEndpoint: adapter.url,
+      clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, pathCtx()]]),
+      bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX, GLOBAL_INDEX]])]]),
+    });
+    let thrown: unknown;
+    try {
+      await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(RavenError.is(thrown, "InvalidQuery"), `got ${String(thrown)}`).toBe(true);
+    expect(String((thrown as Error).message)).toContain("no usable upstream pin source");
+  });
+
+  // `pinUpstream: false` restores the bare refusal for a wallet that will only ever
+  // trust roots it pinned itself.
+  it("refuses with the disabled message when the resolver is turned off", async () => {
+    mountRowRoute(adapter, nodes);
+    const sdk = makeSdk(adapter, { pinnedRoots: [], pinUpstream: false });
+    let thrown: unknown;
+    try {
+      await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(RavenError.is(thrown, "InvalidQuery"), `got ${String(thrown)}`).toBe(true);
+    expect(String((thrown as Error).message)).toContain("no usable upstream pin source");
+  });
+
+  // Every byte of both pin requests is a function of public state: the list key, a block
+  // number, and upstream's own tip. The blinded commitment must not appear in either.
+  it("sends no blinded-commitment bytes to the pin source", async () => {
+    mountUpstream(upstream, {
+      merklerootsLength: GLOBAL_INDEX + 1,
+      rows: inRange([{ index: GLOBAL_INDEX, root: trueRoot }]),
+    });
+    await sdkWithResolver().getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+    expect(upstream.requests.length).toBeGreaterThan(0);
+    for (const request of upstream.requests) {
+      expect(new TextDecoder().decode(request.body)).not.toContain(BC_HEX);
+    }
   });
 });

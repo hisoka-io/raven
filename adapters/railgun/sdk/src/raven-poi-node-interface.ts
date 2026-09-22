@@ -27,6 +27,7 @@ import {
 import { ChainRegistry, type ChainRegistryEntry } from "./chain-registry";
 import { RavenError, type StaleDataContext } from "./errors";
 import { ImtCache, imtCacheKey, imtCacheScopeKey } from "./imt-cache";
+import { LEAVES_PER_PPOI_BLOCK, type ResolvedPins, UpstreamPinResolver } from "./pin-resolver";
 import { foldMerkleRoot } from "./poseidon";
 
 export type BlindedCommitmentType = "Shield" | "Transact" | "Unshield";
@@ -152,8 +153,19 @@ interface RavenConfigBase {
   /** Deployed instance ids keyed by the same semantic context key. */
   clientPirInstanceLabels?: Map<string, string>;
   /** Pinned PPOI block roots keyed `<chainId>:<listKey>:<block>`;
-   * the chain-less legacy key is accepted as a fallback. Required for every path-10 fold. */
+   * the chain-less legacy key is accepted as a fallback. A caller-supplied pin always wins. */
   ppoiPinnedRoots?: Map<string, string>;
+  /** Upstream PPOI aggregator to read block roots from when no root is pinned. Defaults to
+   * `upstreamFallbackEndpoint`; `false` disables the resolver and restores the bare refusal.
+   *
+   * The default introduces no new party and no new connection: the wallet already opens TLS
+   * to that host for validation and submission. There is deliberately no fallback hostname --
+   * an invented default would send every unconfigured wallet to a host nobody chose. */
+  pinUpstream?: string | false;
+  /** Upstream `NetworkName` under `forNetwork`; defaults from `chainType`/`chainId`. */
+  pinUpstreamNetworkName?: string;
+  /** In-memory TTL for the filling block's roots. Frozen blocks are cached forever. */
+  pinTailTtlMs?: number;
   /** Pre-loaded BC -> idx maps, keyed by `<chainId>:<listKeyHex>` or legacy `<listKeyHex>`. */
   bcToIdxMaps?: Map<string, BcToIdxMap>;
   /** IMT cache for auth-path reconstruction; defaults to in-memory 1024 entries plus IndexedDB when available. */
@@ -237,6 +249,7 @@ const DEFAULT_CONFIDENCE_FLOOR = 0.5;
 const DEFAULT_CHAIN_ID = 1;
 const DEFAULT_CHAIN_TYPE = 0; // upstream `ChainType.EVM`
 const NODE_HASH_BYTES = 32;
+const ROOT_HEX_CHARS = 64;
 const PATH_RECORD_BYTES = TREE_DEPTH * NODE_HASH_BYTES;
 /** Epoch tag before the instance has ever reported one; never collides with a real epoch. */
 const UNOBSERVED_EPOCH = "";
@@ -263,6 +276,7 @@ export class RavenPOINodeInterface {
   private readonly clientPirContexts: Map<string, ClientPirContext>;
   private readonly clientPirInstanceLabels: Map<string, string>;
   private readonly ppoiPinnedRoots: Map<string, string>;
+  private readonly pinResolver: UpstreamPinResolver | undefined;
   private readonly bcToIdxMaps: Map<string, BcToIdxMap>;
   private readonly cache: ImtCache;
   // Last snapshot epoch each instance reported; auth-path cache entries are tagged with it.
@@ -346,6 +360,37 @@ export class RavenPOINodeInterface {
         );
       }
     }
+
+    // A root supplied by the node that served the siblings verifies nothing. Same
+    // normalization as the disclosure guard above, aimed at a different circularity.
+    // An EXPLICIT `pinUpstream` pointed at this node is a configuration error and throws;
+    // one merely inherited from `upstreamFallbackEndpoint` cannot, because that field is
+    // also the passthrough target and one process serving both roles is legitimate there.
+    // It goes inert instead, and the fold-time refusal says so.
+    const routeEndpoint = this.registry.resolve(this.chainId).endpoint.replace(/\/$/, "");
+    const pinSource =
+      config.pinUpstream === false
+        ? undefined
+        : (config.pinUpstream ?? this.upstream)?.replace(/\/$/, "");
+    if (typeof config.pinUpstream === "string" && pinSource === routeEndpoint) {
+      throw RavenError.invalidQuery(
+        "pinUpstream must not be the endpoint whose auth paths it verifies; both resolve to " +
+          `${routeEndpoint}, so the pin would come from the party that supplied the siblings`,
+      );
+    }
+    this.pinResolver =
+      pinSource === undefined || pinSource === routeEndpoint
+        ? undefined
+        : new UpstreamPinResolver({
+            endpoint: pinSource,
+            fetchImpl: this.fetchImpl,
+            chainType: this.chainType,
+            chainId: this.chainId,
+            txidVersion: this.txidVersion,
+            networkName: config.pinUpstreamNetworkName,
+            tailTtlMs: config.pinTailTtlMs,
+            onRequest: (url, method, body) => this.captureRequest(url, method, body),
+          });
   }
 
   isActive(chain: Chain): boolean {
@@ -909,8 +954,8 @@ export class RavenPOINodeInterface {
         );
       }
       // The leaf index never crosses the wire, only encrypted row queries.
-      const block = Math.floor(idx / 65_536);
-      const localIndex = idx % 65_536;
+      const block = Math.floor(idx / LEAVES_PER_PPOI_BLOCK);
+      const localIndex = idx % LEAVES_PER_PPOI_BLOCK;
       const pathInstance = this.instanceLabel(
         "t2Path",
         `${lkHex}:${block}`,
@@ -958,36 +1003,74 @@ export class RavenPOINodeInterface {
         // Keying this guard on the chain-less form while routing on the chain-aware one is
         // what returned unverified proofs with `Ok`; a `has()` gate here would restore that.
         const pinnedRoot = this.pinnedRootFor(rootKey);
-        if (!pinnedRoot) {
-          // `invalidQuery`, not `staleData`: nothing here is stale, and StaleDataContext
-          // demands lag/confidence numbers a missing pin does not have -- inventing them
-          // would be the fabricated-context version of the defect this guard closes. This
-          // matches how the same function reports missing preloaded client-PIR config.
-          throw RavenError.invalidQuery(
-            `client-PIR ${pathInstance}: no pinned root for ${rootKey} on chain ${this.chainId}; ` +
-              "preload ppoiPinnedRoots before calling getPOIMerkleProofs -- a server-supplied " +
-              "auth path cannot be verified without one",
-          );
-        }
-        // `normalizeHex` strips `0x` and lowercases; it does not pad. An unpadded 32-byte
-        // root would compare unequal and be reported as tampering, so width is checked first
-        // and named for what it is.
-        const normalizedPin = normalizeHex(pinnedRoot);
-        if (normalizedPin.length !== 64) {
-          throw RavenError.invalidQuery(
-            `client-PIR ${pathInstance}: pinned root for ${rootKey} is ` +
-              `${normalizedPin.length} hex chars, not 64; pad it to 32 bytes`,
-          );
-        }
-        if (normalizedPin !== proof.root) {
-          throw RavenError.decodeError(
-            `client-PIR ${pathInstance}: folded root does not match pinned root`,
-          );
+        if (pinnedRoot !== undefined) {
+          // `normalizeHex` strips `0x` and lowercases; it does not pad. An unpadded 32-byte
+          // root would compare unequal and be reported as tampering, so width is checked first
+          // and named for what it is.
+          const normalizedPin = normalizeHex(pinnedRoot);
+          if (normalizedPin.length !== ROOT_HEX_CHARS) {
+            throw RavenError.invalidQuery(
+              `client-PIR ${pathInstance}: pinned root for ${rootKey} is ` +
+                `${normalizedPin.length} hex chars, not ${ROOT_HEX_CHARS}; pad it to 32 bytes`,
+            );
+          }
+          if (normalizedPin !== proof.root) {
+            throw RavenError.decodeError(
+              `client-PIR ${pathInstance}: folded root does not match pinned root`,
+            );
+          }
+        } else {
+          await this.verifyAgainstUpstreamPin(pathInstance, lkHex, block, rootKey, proof.root);
         }
         out.push(proof);
       }
     }
     return out;
+  }
+
+  /** Second rung of the root ladder. A caller-supplied pin always wins; with none, the
+   *  roots come from the upstream aggregator, never from the node that served the siblings. */
+  private async verifyAgainstUpstreamPin(
+    pathInstance: string,
+    listKeyHex: string,
+    block: number,
+    rootKey: string,
+    foldedRoot: string,
+  ): Promise<void> {
+    const preamble =
+      `client-PIR ${pathInstance}: no pinned root for ${rootKey} on chain ${this.chainId} and `;
+    const remedy =
+      "; a server-supplied auth path cannot be verified without an independently obtained root";
+    if (!this.pinResolver) {
+      // `invalidQuery`, not `staleData`: nothing here is stale, and StaleDataContext demands
+      // lag/confidence numbers a missing pin does not have -- inventing them would be the
+      // fabricated-context version of the defect this guard closes.
+      throw RavenError.invalidQuery(
+        `${preamble}no usable upstream pin source is configured (set pinUpstream, or preload ` +
+          `ppoiPinnedRoots)${remedy}`,
+      );
+    }
+    let resolved: ResolvedPins;
+    try {
+      resolved = await this.pinResolver.resolve(listKeyHex, block);
+    } catch (cause) {
+      // One message for "there is no independent root", whatever stopped it arriving. The
+      // KIND is preserved so a caller's retry policy still sees a transient upstream as one.
+      const message = `${preamble}the upstream pin source could not answer (${String(cause)})${remedy}`;
+      throw RavenError.is(cause, "Network")
+        ? RavenError.network(message, cause.context)
+        : RavenError.invalidQuery(message);
+    }
+    if (!resolved.roots.has(foldedRoot)) {
+      // The window is named because it is what separates "this node is lagging past the
+      // range upstream was asked about" from "this node forged the siblings".
+      throw RavenError.decodeError(
+        `client-PIR ${pathInstance}: folded root is not among the ${resolved.roots.size} root(s) ` +
+          `upstream certifies for ${rootKey} over global leaf indices ` +
+          `${resolved.window.startIndex}..${resolved.window.endIndex} ` +
+          `(${resolved.window.frozen ? "frozen" : "filling"} block)`,
+      );
+    }
   }
 
   private async getMerkleProofClientPir(

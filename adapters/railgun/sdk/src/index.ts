@@ -25,6 +25,19 @@ export {
 
 export { hashLeftRight, foldMerkleRoot } from "./poseidon";
 
+// Independent PPOI block roots, so a wallet can verify a served auth path without a
+// hand-preloaded pin.
+export {
+  LEAVES_PER_PPOI_BLOCK,
+  PIN_TAIL_WINDOW,
+  UpstreamPinResolver,
+  ppoiNetworkName,
+  type PinWindow,
+  type PinRequestObserver,
+  type ResolvedPins,
+  type UpstreamPinResolverConfig,
+} from "./pin-resolver";
+
 // Generic PIR session bootstrap and query-bundle handling.
 export type {
   ClientPirContext,

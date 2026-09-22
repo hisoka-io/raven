@@ -12,10 +12,13 @@
 #   7. batch response      sdk/src/raven-poi-node-interface.ts (decodeBatchBody)
 #                          vs http/src/versioned.rs (write_batch_response_versioned)
 #   8. consumer status     sdk/src/events-stream.ts          vs http/src/status.rs
+#   9. PPOI block size     sdk/src/pin-resolver.ts        vs engine/src/orchestrator.rs
 #
-# The eight entries above are contract FAMILIES, not checks: several expand into more than
-# one comparison, so the summary line reports a count this script computes (19 today) rather
-# than the 8 listed here. They are different numbers on purpose.
+# The entries above are contract FAMILIES, not checks: several expand into more than one
+# comparison, so the summary line reports a count this script computes rather than the
+# number of families listed here. They are different numbers on purpose, and the count is
+# deliberately NOT restated in this comment -- it said "19 today" while the families said
+# eight, and a number repeated in prose goes stale exactly this way.
 #
 # A Rust-side change leaves the TS suite green while every batch the SDK sends is
 # refused at runtime; a TREE_DEPTH drift silently changes proof length and index
@@ -238,6 +241,16 @@ rs_consumer_status="$(awk '
 require_field_count "TS ConsumerStatus" "$ts_consumer_status" 9
 require_field_count "Rust ConsumerStatus" "$rs_consumer_status" 9
 compare "ConsumerStatus JSON shape" "$ts_consumer_status" "$rs_consumer_status"
+
+# 9. PPOI block size. The SDK derives a block from a global leaf index and asks upstream for
+# that block's root; the engine re-indexes rows block-local by the same number. A drift does
+# not fail loudly -- it points the pin query at the wrong tree and refuses honest proofs.
+# Underscores stripped so 65536 and 65_536 compare as values, not as strings.
+ts_block="$(extract "TS LEAVES_PER_PPOI_BLOCK" "${ADAPTER_ROOT}/sdk/src/pin-resolver.ts" \
+  's/^export const LEAVES_PER_PPOI_BLOCK = \([0-9_]*\);$/\1/p')"
+rs_block="$(extract "Rust LEAVES_PER_PPOI_BLOCK" "${ADAPTER_ROOT}/engine/src/orchestrator.rs" \
+  's/^pub const LEAVES_PER_PPOI_BLOCK: u32 = \([0-9_]*\);$/\1/p')"
+compare "LEAVES_PER_PPOI_BLOCK" "$(tr -d _ <<<"$ts_block")" "$(tr -d _ <<<"$rs_block")"
 
 if [[ "$failed" -ne 0 ]]; then
   echo "check-sdk-constant-parity.sh: FAILED - a Rust/TS constant pair has drifted." >&2
