@@ -15,6 +15,14 @@
 #    actually leaked from; the other eight were .yml, .md and .sh, most of them
 #    outside the adapter. `no-commit/` needs no exclusion here - it is untracked,
 #    so `git ls-files` cannot reach it.
+# 5. No runtime data directory may sit untracked-and-unignored inside a source
+#    tree. A test that derives its data_dir relative to the crate instead of a
+#    temp dir leaves a full node state behind - manifest, snapshots, WAL, packing
+#    keys. One measured instance reached 155 MB under adapters/railgun/cli/,
+#    named after the list key, and `git check-ignore` did not cover it: a single
+#    `git add -A` would have put it in this PUBLIC repo's history permanently,
+#    where it cannot be removed without a rewrite. The test is the bug; this is
+#    the net under it.
 
 # Every scan below captures its output and tests the TEXT, and the `|| true` is load-bearing.
 # Two measured reasons, and the first is the general one:
@@ -74,10 +82,28 @@ if [[ -n "$label_hits" ]]; then
   fail "a tracked file carries an internal ledger label; those are records, not shipped prose"
 fi
 
+# 5. Stray runtime data directories. Fingerprinted on CONTENT, not on name: a data dir
+# carries a manifest beside a `wal/` or `snapshots/` directory, and nothing legitimate in a
+# source tree looks like that. Matching on the name would have caught only the one instance,
+# which happened to be 64 hex chars because it was a list key.
+while IFS= read -r manifest; do
+  [[ -n "$manifest" ]] || continue
+  dir="$(dirname "$manifest")"
+  # Only a data dir has the sibling state beside the manifest; a package manifest does not.
+  if [[ -d "$dir/wal" || -d "$dir/snapshots" ]]; then
+    size="$(du -sh "$dir" 2>/dev/null | cut -f1)"
+    fail "runtime data directory left in a source tree: ${dir} (${size:-unknown}). \
+A test derived its data_dir relative to the crate instead of a temp dir. It is neither \
+tracked nor ignored, so \`git add -A\` would commit it to this public repo forever. \
+Point the test at a temp dir and delete this."
+  fi
+done < <(git ls-files --others --exclude-standard -- 'adapters/**/manifest.json' 'crates/**/manifest.json' 'examples/**/manifest.json' 2>/dev/null || true)
+
 if [[ $failed -ne 0 ]]; then
   echo "scripts/check-repo-hygiene.sh: failed."
   exit 1
 fi
+
 
 echo "scripts/check-repo-hygiene.sh: clean."
 exit 0

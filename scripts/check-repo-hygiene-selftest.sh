@@ -117,6 +117,19 @@ else
   cases=$((cases + 1))
 fi
 
+# The stray-data-dir class is UNTRACKED by nature -- the scan is `git ls-files --others`, so a
+# plant that gets `git add`ed proves nothing and `plant()` above cannot be reused. Both
+# directions matter: a manifest ALONE is an ordinary package file and firing on it would make
+# the gate useless noise, so the negative case is the one that keeps it honest.
+probe_dir="$work/adapters/probe-crate"
+mkdir -p "$probe_dir"
+printf '{}\n' > "$probe_dir/manifest.json"
+check 0 "$(run_gate)" "(control) a manifest with no node state beside it is not a data dir"
+mkdir -p "$probe_dir/wal"
+check 1 "$(run_gate)" "an untracked runtime data directory in a source tree is refused"
+rm -rf "$probe_dir"
+check 0 "$(run_gate)" "removing the data directory clears it"
+
 if [[ "$failed" -ne 0 ]]; then
   echo "check-repo-hygiene selftest: FAILED" >&2
   exit 1
