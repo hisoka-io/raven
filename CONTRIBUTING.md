@@ -32,6 +32,17 @@ is rejected at review, not at release.
 
 ## Definition of Done
 
+Before pushing, run:
+
+    scripts/preflight.sh
+
+This repository is **thirteen separate cargo workspaces** driving twenty-five CI jobs, and most of
+them carry their own `fmt` and `clippy` gate. A `cargo clippy` run only covers the workspace you are
+standing in, so linting the crate you edited is not the same as linting the repository, and the gap
+is invisible until CI finds it. `preflight.sh` runs every workspace's hygiene, format and lint gate
+in one command. Use `--fast` for hygiene and formatting only (seconds), `--msrv` to add both
+minimum-supported-Rust toolchains, and `--with-tests` for the detached workspaces' suites.
+
 A change is ready to merge only when ALL of the following hold:
 
 1. It compiles with zero errors and zero warnings across all affected crates:
@@ -42,9 +53,12 @@ A change is ready to merge only when ALL of the following hold:
 
        cargo check -p <crate> --target wasm32-unknown-unknown
 
-2. Lints pass with warnings denied:
+2. Lints pass with warnings denied, **in every workspace the change touches**, not only the one
+   the command happens to run in:
 
        cargo clippy --all-features --all-targets -- -D warnings
+
+   `scripts/preflight.sh` does this across all of them.
 
 3. New logic has test coverage:
    - unit tests for the logic itself,
