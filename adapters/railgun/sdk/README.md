@@ -158,6 +158,35 @@ const poi = new RavenPOINodeInterface({
 Fresh private responses remain private under either policy. Plaintext mode retains its existing
 fallback because contacting upstream discloses nothing beyond the plaintext request already sent.
 
+## Verifying a served auth path
+
+A PIR-served PPOI auth path arrives as sibling hashes. Folding them yields a root, but a root the
+same node supplied would verify nothing, so the SDK compares the fold against a root obtained
+independently:
+
+1. A root you pinned yourself in `ppoiPinnedRoots` always wins.
+2. Otherwise the SDK asks the upstream PPOI aggregator directly, over the wallet's own `fetch`,
+   never through the Raven node.
+3. Otherwise it refuses. The client-PIR path never returns an unverified proof.
+
+`pinUpstream` defaults to `upstreamFallbackEndpoint`, so the configuration above needs no new
+field: the wallet already opens TLS to that host for validation and submission, and no new party
+is introduced. Set `pinUpstream: false` to disable the resolver and require a hand-loaded pin.
+**There is no default hostname** -- with no upstream configured the resolver is inert and step 3
+applies.
+
+Both pin requests are a function of public state only: the list key, a block number, and
+upstream's own tip. They are byte-identical for every wallet asking about the same block and
+carry nothing that identifies which commitment you hold.
+
+A pin source equal to the endpoint being verified is refused: explicitly setting `pinUpstream` to
+it throws at construction, and inheriting it leaves the resolver inert rather than verifying in a
+circle.
+
+On a chain other than Ethereum mainnet, set `pinUpstreamNetworkName` to the name upstream reports
+under `forNetwork`. An unrecognised chain refuses rather than guessing, because guessing would
+read another chain's tip and refuse honest proofs.
+
 ## IMT cache layers
 
 The client-side IMT (Incremental Merkle Tree) node cache (entry point: `ImtCache` in [`src/imt-cache.ts`](src/imt-cache.ts)) is layered:
