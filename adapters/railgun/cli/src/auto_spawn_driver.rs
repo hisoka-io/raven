@@ -848,6 +848,15 @@ fn spawn_one_ppoi_list(inputs: &PpoiListSpawnInputs<'_>, append_log: bool) -> an
         crate::auto_spawn::instance_id_for_list(&template.template_id, &inputs.list_key);
     let instance_id = InstanceId::new(instance_id_str.clone());
     let encoder_kind = template.resolve_encoder()?;
+    // The live loop filters templates on `list_key`, but the spawn-log replay looks a
+    // template up by `template_id` alone: edit `ppoi_list_template.list_key` with a record
+    // still on disk and the encoder pins one list while the route carries another.
+    crate::serve_production::enforce_encoder_list_key(
+        &instance_id_str,
+        encoder_kind,
+        &inputs.list_key,
+        "the list routed to this spawn",
+    )?;
     let requested_entry_size = template.entry_bytes.max(32);
     let entries = template.entries.max(1);
     let entries_per_shard_u32 = rows_per_shard(inputs.params);
@@ -1209,6 +1218,89 @@ mod tests {
         let err = r.resolve_encoder(0).expect_err("must reject");
         let msg = format!("{err:#}");
         assert!(msg.contains("not a chain-tree encoder"), "got: {msg}");
+    }
+
+    /// `data_dir_for_list` does no rooting of its own, so a bare `{list_key}` template
+    /// lands in the test process's CWD - the crate directory - and a spawn that gets past
+    /// the shape gate writes a full cell there.
+    fn ppoi_template(root: &std::path::Path, list_key: [u8; 32]) -> PpoiListTemplateRuntime {
+        PpoiListTemplateRuntime {
+            template_id: "ofac".to_owned(),
+            list_key,
+            encoder: "per-list-status".to_owned(),
+            scheme_tag: "raven-inspire-twopacking-inspiring-wp3-cache-session".to_owned(),
+            data_dir_template: format!("{}/{{list_key}}", root.display()),
+            // Below the per-list minimum on purpose: the shape gate then stops any spawn
+            // that reaches it, so no cell is ever materialized under `root`.
+            entries: 1,
+            entry_bytes: 32,
+            channel_capacity: 1,
+        }
+    }
+
+    /// The live loop filters templates on `list_key`, so encoder and route always agree
+    /// there. The spawn-log REPLAY resolves a template by `template_id` alone and carries
+    /// the record's own `list_key`, so editing `ppoi_list_template.list_key` with a record
+    /// still on disk pins the encoder to one list and routes another to it.
+    #[tokio::test]
+    async fn a_replayed_spawn_whose_route_left_the_template_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let template = ppoi_template(tmp.path(), [0xaa; 32]);
+        let params = InspireParams::secure_128_d2048();
+        let engine = Arc::new(Engine::<RavenInspireScheme>::new());
+        let routes: raven_railgun_engine::orchestrator::PpoiListRoutes =
+            Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
+        let registry = Arc::new(PpoiListSpawnRegistry::new());
+        let inputs = PpoiListSpawnInputs {
+            template: &template,
+            list_key: [0xbb; 32],
+            params: &params,
+            engine: &engine,
+            ppoi_list_routes: &routes,
+            registry: &registry,
+            spawn_log_dir: tmp.path().to_path_buf(),
+        };
+        let err = super::spawn_one_ppoi_list(&inputs, false)
+            .expect_err("a replayed spawn routed a list the template no longer pins must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&"aa".repeat(32)) && msg.contains(&"bb".repeat(32)),
+            "the refusal must name the pinned and the routed list; got: {msg}"
+        );
+    }
+
+    /// The control: an agreeing pair must pass the list gate and be stopped only by the
+    /// next gate down, the cell-shape check. Without it the test above is satisfied by
+    /// refusing every spawn.
+    #[tokio::test]
+    async fn an_agreeing_spawn_passes_the_list_gate_and_is_stopped_only_by_cell_shape() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let template = ppoi_template(tmp.path(), [0xaa; 32]);
+        let params = InspireParams::secure_128_d2048();
+        let engine = Arc::new(Engine::<RavenInspireScheme>::new());
+        let routes: raven_railgun_engine::orchestrator::PpoiListRoutes =
+            Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
+        let registry = Arc::new(PpoiListSpawnRegistry::new());
+        let inputs = PpoiListSpawnInputs {
+            template: &template,
+            list_key: [0xaa; 32],
+            params: &params,
+            engine: &engine,
+            ppoi_list_routes: &routes,
+            registry: &registry,
+            spawn_log_dir: tmp.path().to_path_buf(),
+        };
+        let err = super::spawn_one_ppoi_list(&inputs, false)
+            .expect_err("a 1-row cell is below the per-list encoder minimum");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("pins list_key"),
+            "an agreeing pair must not trip the list gate; got: {msg}"
+        );
+        assert!(
+            msg.contains("65536") || msg.contains("65,536") || msg.contains("entries"),
+            "the spawn must instead be stopped by the cell-shape gate; got: {msg}"
+        );
     }
 
     #[tokio::test]

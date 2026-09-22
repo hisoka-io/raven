@@ -131,6 +131,14 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         )
     })?;
     let list_key = ListKey(list_key_bytes);
+    // Before `setup_state` and before the chain RPC: nothing downstream can see the
+    // divergence, it only produces an all-zero cell.
+    enforce_encoder_list_key(
+        &opts.instance_id,
+        opts.encoder,
+        &list_key_bytes,
+        "--list-key",
+    )?;
 
     if opts.entries == 0 || opts.entry_bytes == 0 {
         anyhow::bail!(
@@ -574,6 +582,55 @@ pub(crate) fn declared_shim_coverage(
     }
 }
 
+/// The `list_key` a per-list encoder is pinned to, `None` for the chain-tree kinds.
+///
+/// EXHAUSTIVE for the reason `mirror_kind_for_encoder` is: a new variant must state whether
+/// it pins a list rather than inherit whichever arm a `_` put it in.
+pub(crate) fn pinned_list_key(
+    encoder: raven_railgun_engine::pir_table::EncoderKind,
+) -> Option<[u8; 32]> {
+    use raven_railgun_engine::pir_table::EncoderKind;
+    match encoder {
+        EncoderKind::PerListStatus { list_key }
+        | EncoderKind::PerListPath { list_key }
+        | EncoderKind::PerListPath10 { list_key }
+        | EncoderKind::PerListNode { list_key } => Some(list_key),
+        // Pinned to a tree, not a list; `enforce_encoder_matches_data_source` gates those.
+        EncoderKind::PerLeafBc { .. }
+        | EncoderKind::PerLeafPath { .. }
+        | EncoderKind::PerNode { .. } => None,
+    }
+}
+
+/// Refuse a boot whose per-list encoder pins a different list than the one routed to it.
+///
+/// Every per-list encoder drops `affected_shards_for_ppoi_leaf` for a foreign `list_key` and
+/// materializes from `store.ppoi_imt(&self.list_key)`, so a diverged pin reads an IMT nothing
+/// ever writes: the cell stays all-zero and is served at HTTP 200 forever, with no refusal and
+/// no counter. Boot is the only place that is visible.
+pub(crate) fn enforce_encoder_list_key(
+    instance_id: &str,
+    encoder: raven_railgun_engine::pir_table::EncoderKind,
+    routed: &[u8; 32],
+    routed_setting: &str,
+) -> anyhow::Result<()> {
+    let Some(pinned) = pinned_list_key(encoder) else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        pinned == *routed,
+        "instance {instance_id:?}: encoder {label} pins list_key {pinned_hex} but \
+         {routed_setting} gives list_key {routed_hex}. The encoder drops every event for a \
+         list other than its own, so this instance would serve an all-zero cell at HTTP 200 \
+         and never advance. Operator: set the encoder's list_key and {routed_setting} to the \
+         same 64-hex value.",
+        label = encoder.label(),
+        pinned_hex = hex::encode(pinned),
+        routed_hex = hex::encode(routed),
+    );
+    Ok(())
+}
+
 /// Path-projection encoders own the path sidecar; every other kind uses the status
 /// sidecar. The two feeds advance independently, so the wrong sidecar means the wrong
 /// resume cursor after a restart.
@@ -649,6 +706,91 @@ mod tests {
                 "{encoder:?} cannot bound the list's domain from one store"
             );
         }
+    }
+
+    /// A per-list encoder reads `store.ppoi_imt(&self.list_key)` and drops every event for
+    /// a foreign list, so the pin has to be recoverable to be checkable at all.
+    #[test]
+    fn every_per_list_encoder_reports_the_list_it_is_pinned_to() {
+        let list_key = [9u8; 32];
+        for encoder in [
+            EncoderKind::PerListStatus { list_key },
+            EncoderKind::PerListPath { list_key },
+            EncoderKind::PerListPath10 { list_key },
+            EncoderKind::PerListNode { list_key },
+        ] {
+            assert_eq!(
+                super::pinned_list_key(encoder),
+                Some(list_key),
+                "{encoder:?} pins a list and must say which"
+            );
+        }
+    }
+
+    #[test]
+    fn no_chain_tree_encoder_pins_a_list() {
+        for encoder in [
+            EncoderKind::PerLeafBc { tree_number: 0 },
+            EncoderKind::PerLeafPath { tree_number: 3 },
+            EncoderKind::PerNode { tree_number: 7 },
+        ] {
+            assert_eq!(
+                super::pinned_list_key(encoder),
+                None,
+                "{encoder:?} is pinned to a tree, not a list"
+            );
+        }
+    }
+
+    #[test]
+    fn a_diverged_list_pin_is_refused_and_names_both_keys() {
+        let err = super::enforce_encoder_list_key(
+            "ppoi-status-0",
+            EncoderKind::PerListStatus {
+                list_key: [0xaa; 32],
+            },
+            &[0xbb; 32],
+            "data_source.list_key",
+        )
+        .expect_err("a per-list encoder pinned off its routed list must be refused");
+        let msg = format!("{err:#}");
+        for needle in [
+            "ppoi-status-0",
+            "per-list-status",
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            "data_source.list_key",
+        ] {
+            assert!(msg.contains(needle), "refusal must name {needle}: {msg}");
+        }
+    }
+
+    /// Without this the guard could be satisfied by refusing every per-list instance.
+    #[test]
+    fn an_agreeing_list_pin_is_accepted() {
+        let list_key = [0xcd; 32];
+        for encoder in [
+            EncoderKind::PerListStatus { list_key },
+            EncoderKind::PerListPath { list_key },
+            EncoderKind::PerListPath10 { list_key },
+            EncoderKind::PerListNode { list_key },
+        ] {
+            super::enforce_encoder_list_key("ppoi", encoder, &list_key, "--list-key")
+                .unwrap_or_else(|e| panic!("{encoder:?} agrees with its list and must pass: {e}"));
+        }
+    }
+
+    /// A chain cell carries a `--list-key` for its mirror sidecar only; gating it on a pin
+    /// it does not have would refuse every chain instance.
+    #[test]
+    fn a_chain_encoder_is_not_gated_on_the_list_key() {
+        super::enforce_encoder_list_key(
+            "tree-0",
+            EncoderKind::PerLeafBc { tree_number: 0 },
+            &[0xff; 32],
+            "--list-key",
+        )
+        .expect("a tree-pinned encoder pins no list and must not be gated on one");
     }
 
     /// The status and path feeds own SEPARATE sidecars and advance independently, so an

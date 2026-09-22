@@ -460,7 +460,7 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         let encoder = build_encoder_kind(raw.encoder, raw.tree_number, raw.list_key.as_deref())?;
         let data_source = build_data_source(&raw.data_source)?;
         enforce_verification_mode_matches_data_source(&data_source, verification_mode)?;
-        enforce_encoder_matches_data_source(encoder, &data_source)?;
+        enforce_encoder_matches_data_source(&raw.id, encoder, &data_source)?;
         enforce_mirror_feed_matches_encoder(&raw.id, &raw.data_source, encoder)?;
         let snapshot_policy = match role {
             InstanceRole::Static => SnapshotPolicy::static_default(),
@@ -822,6 +822,7 @@ fn enforce_verification_mode_matches_data_source(
 }
 
 fn enforce_encoder_matches_data_source(
+    instance_id: &str,
     encoder: EncoderKind,
     data_source: &DataSourceFilter,
 ) -> anyhow::Result<()> {
@@ -837,9 +838,9 @@ fn enforce_encoder_matches_data_source(
             // instance serves its own tree's rows at HTTP 200 and never updates.
             anyhow::ensure!(
                 tree_number == *routed,
-                "encoder {} is pinned to tree {tree_number} but data_source routes tree \
-                 {routed} to this instance. The encoder drops every event for a tree other \
-                 than its own, so this instance would serve tree {tree_number}'s rows \
+                "instance {instance_id:?}: encoder {} is pinned to tree {tree_number} but \
+                 data_source routes tree {routed} to it. The encoder drops every event for \
+                 a tree other than its own, so this instance would serve tree {tree_number}'s rows \
                  unchanged at HTTP 200 while tree {routed} advanced. Operator: set the \
                  instance's `tree_number` and its `data_source.filter.tree_number` to the \
                  same tree.",
@@ -852,10 +853,18 @@ fn enforce_encoder_matches_data_source(
             | EncoderKind::PerListPath { .. }
             | EncoderKind::PerListPath10 { .. }
             | EncoderKind::PerListNode { .. },
-            DataSourceFilter::PpoiList(_) | DataSourceFilter::PpoiListBlock { .. },
-        ) => Ok(()),
+            DataSourceFilter::PpoiList(routed)
+            | DataSourceFilter::PpoiListBlock {
+                list_key: routed, ..
+            },
+        ) => crate::serve_production::enforce_encoder_list_key(
+            instance_id,
+            encoder,
+            routed,
+            "data_source.list_key",
+        ),
         _ => anyhow::bail!(
-            "encoder kind {} does not match data_source {:?}",
+            "instance {instance_id:?}: encoder kind {} does not match data_source {:?}",
             encoder.label(),
             data_source
         ),
@@ -2647,6 +2656,83 @@ data_source = { kind = "mirror", list_key = "00000000000000000000000000000000000
             msg.contains("pinned to tree 0") && msg.contains("routes tree 3"),
             "the refusal must name both trees; got: {msg}"
         );
+    }
+
+    /// The per-list twin of the tree-pin gate. A per-list encoder drops every event for a
+    /// foreign `list_key` and materializes from its own list's IMT, so the instance would
+    /// serve an all-zero cell at HTTP 200 forever - no error, no empty body, just zeros.
+    #[test]
+    fn an_encoder_pinned_to_another_list_than_its_data_source_is_refused() {
+        let f = write_temp_toml(&list_mismatch_config("aa", "bb", ""));
+        let err = load_options_from_toml(f.path())
+            .expect_err("a list-aa encoder fed list-bb events must be refused");
+        let msg = format!("{err:#}");
+        for needle in [
+            "ppoi-list-pin",
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            "data_source.list_key",
+        ] {
+            assert!(
+                msg.contains(needle),
+                "the refusal must name {needle}; got: {msg}"
+            );
+        }
+    }
+
+    /// The block-scoped data source reaches the same instance through a different variant,
+    /// so it needs its own arm proof rather than the unblocked one's.
+    #[test]
+    fn a_block_scoped_data_source_is_gated_on_the_same_list_key() {
+        let f = write_temp_toml(&list_mismatch_config("aa", "bb", ", block = 3"));
+        let err = load_options_from_toml(f.path())
+            .expect_err("a block-scoped mirror on a foreign list must be refused too");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&"aa".repeat(32)) && msg.contains(&"bb".repeat(32)),
+            "the refusal must name both keys; got: {msg}"
+        );
+    }
+
+    /// The conjunct that keeps the guard honest: refusing every per-list instance would
+    /// also satisfy the two tests above.
+    #[test]
+    fn an_encoder_pinned_to_the_list_it_is_routed_still_parses() {
+        for block in ["", ", block = 2"] {
+            let f = write_temp_toml(&list_mismatch_config("aa", "aa", block));
+            let opts = load_options_from_toml(f.path())
+                .unwrap_or_else(|e| panic!("matching list keys must parse (block={block:?}): {e}"));
+            assert_eq!(
+                crate::serve_production::pinned_list_key(opts.instances[0].encoder),
+                Some([0xaa; 32])
+            );
+        }
+    }
+
+    fn list_mismatch_config(encoder_byte: &str, routed_byte: &str, block: &str) -> String {
+        let encoder_key = encoder_byte.repeat(32);
+        let routed_key = routed_byte.repeat(32);
+        format!(
+            r#"
+[global]
+bind = "127.0.0.1:0"
+token = "test-token-padded-long-enough"
+rpc_url = "http://127.0.0.1:1"
+railgun_proxy = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
+chain_id = 1
+start_block = 0
+mirror_endpoint = "http://127.0.0.1:1"
+
+[[instance]]
+id = "ppoi-list-pin"
+role = "live"
+encoder = "per-list-path10"
+list_key = "{encoder_key}"
+data_dir = "/tmp/raven-ppoi-list-pin"
+verification_mode = "upstream-signature"
+data_source = {{ kind = "mirror", list_key = "{routed_key}"{block}, what = "path" }}
+"#
+        )
     }
 
     fn tree_mismatch_config(encoder_tree: u32, routed_tree: u32) -> String {
