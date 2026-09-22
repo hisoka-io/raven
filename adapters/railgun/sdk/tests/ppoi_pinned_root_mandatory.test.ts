@@ -346,6 +346,24 @@ describe("an unpinned PPOI path-10 fold is verified against the upstream aggrega
     });
   }
 
+  // An empty pin is a configuration mistake, not an absent pin. Falling through to upstream
+  // would silently verify against a different party than the caller asked for, so the
+  // interesting assertion is not that it throws but that it never reached the network.
+  it("refuses an empty caller pin instead of silently resolving upstream", async () => {
+    mountRowRoute(adapter, nodes);
+    mountUpstream(upstream, {
+      rows: inRange([{ index: BLOCK_LAST_INDEX, root: trueRoot }]),
+    });
+    const sdk = makeSdk(adapter, {
+      labels: [[`t2Path:${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, "ppoi-paths-ofac-1"]],
+      pinnedRoots: [[`${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, ""]],
+      pinUpstream: upstream.url,
+    });
+
+    await expectRejectsWith(sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]), "InvalidQuery");
+    expect(upstream.requests).toHaveLength(0);
+  });
+
   it("accepts a frozen block's fold against the root upstream wrote at the last leaf", async () => {
     mountUpstream(upstream, {
       rows: inRange([{ index: BLOCK_LAST_INDEX, root: trueRoot }]),
