@@ -402,6 +402,8 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@1.98.0
+      - name: install lld linker
+        run: sudo apt-get update && sudo apt-get install -y lld
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "railgun"
@@ -1115,7 +1117,7 @@ jobs:
       - name: pnpm test
         run: pnpm test
         working-directory: adapters/railgun/sdk
-      # The suite passing is not the same as the suite being able to fail. Four gates,
+      # The suite passing is not the same as the suite being able to fail. Five gates,
       # each shipped with its own red-proof:
       #   - export coverage: a public export with zero test references is caught here,
       #     not discovered months later (three were dark: subscribeRavenEvents,
@@ -1126,7 +1128,18 @@ jobs:
       #     requires the suite to redden for the RIGHT reason.
       #   - test count: a silently-vanishing test (a bad glob, a dropped file) is a
       #     green suite otherwise. Skips are pinned exactly; the live tier is 21.
+      #   - pack gate: the suite imports ../src directly and never resolves the package by
+      #     name, so an entry point pointing at TypeScript, a missing dist/{cjs,esm} module
+      #     marker, or a pack with no files allowlist is invisible to it. Offline: the one
+      #     registry dependency is packed out of sdk/node_modules, so it must follow
+      #     `pnpm install`.
       - name: sdk test-count pin
         run: adapters/railgun/scripts/check-sdk-test-count.sh
       - name: sdk suite red-proof
         run: adapters/railgun/scripts/check-sdk-suite-selftest.sh
+      - name: sdk pack gate
+        if: ${{ !cancelled() }}
+        run: adapters/railgun/scripts/check-sdk-pack.sh
+      - name: sdk pack red-proof
+        if: ${{ !cancelled() }}
+        run: adapters/railgun/scripts/check-sdk-pack-selftest.sh

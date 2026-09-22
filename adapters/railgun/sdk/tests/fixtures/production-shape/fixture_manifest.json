@@ -1,0 +1,107 @@
+{
+  "generator": "emit_production_shape_fixture",
+  "generator_git_commit": "9b1c31db1b9b35858b97e70fe7a377a06c980f53",
+  "generated_unix_ms": 1790034851840,
+  "inspire_params": {
+    "ring_dim": 2048,
+    "q": 1152921504606830593,
+    "crt_moduli": [
+      1152921504606830593
+    ],
+    "p": 65537,
+    "sigma": 6.4,
+    "gadget_base": 1048576,
+    "query_gadget_len": 3,
+    "packing_gadget_len": 3,
+    "security_level": "Bits128"
+  },
+  "entry_size": 512,
+  "num_indices": 4,
+  "files": [
+    {
+      "name": "inspire_params.bin",
+      "bytes": 76,
+      "sha256": "e612cfc52717e6fc7aa326492e6f3aa16040640ab5bc2964c760ce19c7938061"
+    },
+    {
+      "name": "crs.bin",
+      "bytes": 196,
+      "sha256": "ba7e41b53d0438f53408bcfd6a8092c4a844e13df15009f833e6760c717e8e9b"
+    },
+    {
+      "name": "shard_config.bin",
+      "bytes": 24,
+      "sha256": "e49e57d0fe396fa971b4ce3d70f428f8cf87db1916d4e09ba8e42cdc55015ae2"
+    },
+    {
+      "name": "params_bundle.bin",
+      "bytes": 15533,
+      "sha256": "9308775d451adf8ffe387746ed535b05f2fc0be46b95857d61b00de93bbef2bd"
+    },
+    {
+      "name": "fixture.json",
+      "bytes": 629,
+      "sha256": "4baea21da2c97eb24ee23bf543328b6a13c649a1da4afae9a66165346698e757"
+    },
+    {
+      "name": "client_state_for_idx_0.bin",
+      "bytes": 20,
+      "sha256": "de47c9b27eb8d300dbb5f2c353e632c393262cf06340c4fa7f1b40c4cbd36f90"
+    },
+    {
+      "name": "expected_plain_for_idx_0.bin",
+      "bytes": 512,
+      "sha256": "1386fbdaa7a393922a04b06f1e8b1f26707e204c5204dd7313dd237a49aa7593"
+    },
+    {
+      "name": "response_for_idx_0.bin",
+      "bytes": 10446,
+      "sha256": "0825caf5a5dd334ef879a336719bf3de50c31983cf72e2cdf73c956ba28d3a92"
+    },
+    {
+      "name": "client_state_for_idx_2047.bin",
+      "bytes": 20,
+      "sha256": "96164a3cd588e928b24937737ad295b68b64959e08052b75fcb3332249a5e1f6"
+    },
+    {
+      "name": "expected_plain_for_idx_2047.bin",
+      "bytes": 512,
+      "sha256": "a4374969f9e597ba4595045df80ebd77ec85b6693a776ecc819e1ba041325986"
+    },
+    {
+      "name": "response_for_idx_2047.bin",
+      "bytes": 10446,
+      "sha256": "28639dd1062d7e429a8e05d3cc2563a4c2909d43d63920be336925f6dff1fa07"
+    },
+    {
+      "name": "client_state_for_idx_2048.bin",
+      "bytes": 20,
+      "sha256": "d54e7d982b32b915d2220b3579fb2db50752fbb1a99688e6b12b29f6bb8032e3"
+    },
+    {
+      "name": "expected_plain_for_idx_2048.bin",
+      "bytes": 512,
+      "sha256": "12df6e0df9d856f097eb8a4262b9d2e1b0bc12b5554ca6e028a547fe795734be"
+    },
+    {
+      "name": "response_for_idx_2048.bin",
+      "bytes": 10446,
+      "sha256": "2d8c791f716bdd0dd3550cc6028c11231cf26fed29691edb16652f7846fe4e62"
+    },
+    {
+      "name": "client_state_for_idx_4095.bin",
+      "bytes": 20,
+      "sha256": "b7716ea9e91b44aa79c6862bdbd4d16abfe4ef97d15ce8fbe25a521c8123048b"
+    },
+    {
+      "name": "expected_plain_for_idx_4095.bin",
+      "bytes": 512,
+      "sha256": "c507651061c87d6fffdf7ac7b916c98b70c4172a65e73261b4e5ca101594d285"
+    },
+    {
+      "name": "response_for_idx_4095.bin",
+      "bytes": 10446,
+      "sha256": "0e3a91d76d5b6b98e7f2ab558e82adf8741b36c6f2bf73799548c62f75bf39a6"
+    }
+  ]
+}

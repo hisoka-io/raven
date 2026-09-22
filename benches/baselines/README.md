@@ -2,6 +2,19 @@
 
 Checked-in reference runs for the regression gate (`scripts/bench-gate.sh`).
 
+## Read this before comparing anything against the file on disk
+
+`b1-two-packing-cell-2e16x32.json` was produced on a **developer workstation, not on a CI
+runner**, and says so in its own `hardware` field:
+`os=linux; arch=x86_64; cpus=16; cpu=AMD Ryzen 7 9800X3D 8-Core Processor`.
+
+- **The blocking half is unaffected.** Byte counts are machine-invariant and are the only
+  rows whose VALUE can fail this gate, so the pin is sound exactly as committed.
+- **The timing rows in it are that workstation's**, and a 4-core CI runner reproduces none
+  of them on unchanged code (the measured spread is under "What the gate does with them").
+  A timing delta against this file measures the machine. Regenerate on the runner before any
+  timing comparison against it is read as evidence of anything.
+
 ## Why these are generated here and never imported
 
 A baseline is meaningful only when the producer, the config and the machine class match the
@@ -45,20 +58,18 @@ underivable baseline reds without the bench having to run.
   **identical `query_bytes` and `response_bytes` while timings move up to -42.5%** on
   unchanged code. Byte determinism holds ACROSS machine classes; no timing metric does,
   which is why only bytes block.
-- **Timings block only on a 15% breach that is also significant** (`p < 0.05`, Welch t).
-  A breach that cannot be separated from noise prints as unconfirmed and does not block.
+- **No timing row can block this gate.** `bench-gate.sh` passes `--non-blocking` for
+  `/setup`, `/query_median`, `/server_median` and `/client_median`, and `bench-compare`
+  refuses to block any throughput row by unit (`GatePolicy::row_may_block`). The 15%-breach
+  plus `p < 0.05` Welch rule is `bench-compare`'s DEFAULT policy, which this gate overrides;
+  do not read it as the gate's behaviour. What survives an exemption is structural only, and
+  none of it is a duration: a row missing from the run, a changed unit, or a byte count that
+  disagrees with its own closed form (`Verdict::is_structural`).
 - **Throughput is reported, never blocking.** It is `1/mean(query_latency)` over the same
   vector `query_median` already gates.
-- **`setup` cannot block** because it carries no per-seed samples; it is captured once
-  outside the seed loop. Sample it per seed and it becomes gateable automatically.
+- **`setup` is exempt twice over**: `bench-gate.sh` names it `--non-blocking`, and it is
+  captured once outside the seed loop so it carries no per-seed samples to test with.
+  Sampling it per seed does not arm it; dropping the exemption is what would.
 
 Thresholds and sample count are provisional until the runner's own noise floor is measured.
 Re-ruling them requires a published per-metric CV for the CI runner.
-
-## Provenance of the file on disk
-
-`b1-two-packing-cell-2e16x32.json` was regenerated on a 16-core Ryzen 7 9800X3D, not on the
-CI runner: its `hardware` string says so. The blocking half is unaffected, because byte
-counts are machine-invariant and the byte rows are the only ones that can fail the gate. The
-timing rows in it are this machine's, so **regenerate on the runner** before any timing
-comparison against it is read as evidence.

@@ -13,7 +13,9 @@ use anyhow::Context;
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_core::ListKey;
 use raven_railgun_engine::inspire::setup_state;
-use raven_railgun_engine::orchestrator::{bootstrap_railgun_engine, OrchestratorConfig};
+use raven_railgun_engine::orchestrator::{
+    bootstrap_railgun_engine, DataSourceFilter, OrchestratorConfig,
+};
 use raven_railgun_engine::{Engine, InstanceRole};
 use raven_railgun_http::{inspire_router, AppState, HttpConfig};
 
@@ -262,6 +264,13 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     > = std::collections::HashMap::new();
     instance_metrics.insert(handle.instance.id.clone(), Arc::clone(&handle.metrics));
     let app_state = app_state.with_instance_metrics(instance_metrics);
+    // Installed even when it declares nothing: installing it is what routes every shim answer
+    // through the coverage proof instead of through an undeclared store, so an undeclarable
+    // question is refused by the same rule the multi-instance path is held to.
+    let app_state = app_state.with_shim_stores(
+        declared_shim_coverage(opts.encoder)
+            .map(|filter| (filter, Arc::clone(&handle.logical_store))),
+    );
 
     // After `AppState::new`, so the preflight counts into the recorder it installs.
     ensure_mirror_preflight_metrics_described();
@@ -534,6 +543,37 @@ pub(crate) async fn preflight_mirror_upstream(
     Ok(())
 }
 
+/// What one instance can prove it covers, read off the encoder it is pinned to. `None`
+/// declares nothing and every route over that domain then refuses, named and counted.
+///
+/// A commit-tree proof is a PRESENCE claim over an append-only tree, and every prefix root of
+/// one is in the contract's root history, so a node still catching up still answers with a
+/// proof that verifies. The PPOI routes answer ABSENCE - `"Missing"`, an empty blocked set, a
+/// 404 - which is sound only over a bounded domain, and one store bounds it by nothing but
+/// its own frontier being under the 65,536-row per-IMT wall. On a path that composes no
+/// sealed block under that frontier, "whole list" and "however far this node has got" are the
+/// same predicate; the production list is 358,320 rows, so the node would answer `"Missing"`
+/// for most of it at HTTP 200 and then refuse for good on reaching the wall. A list is
+/// therefore declarable only where sealed blocks carry it, which is the multi-instance path.
+pub(crate) fn declared_shim_coverage(
+    encoder: raven_railgun_engine::pir_table::EncoderKind,
+) -> Option<DataSourceFilter> {
+    use raven_railgun_engine::pir_table::EncoderKind;
+    // EXHAUSTIVE, for the reason `mirror_kind_for_encoder` is: a new encoder must state what
+    // it covers rather than inherit the answer of whichever arm a `_` put it in.
+    match encoder {
+        EncoderKind::PerLeafBc { tree_number }
+        | EncoderKind::PerLeafPath { tree_number }
+        | EncoderKind::PerNode { tree_number } => {
+            Some(DataSourceFilter::ChainTreeNumber(tree_number))
+        }
+        EncoderKind::PerListStatus { .. }
+        | EncoderKind::PerListPath { .. }
+        | EncoderKind::PerListPath10 { .. }
+        | EncoderKind::PerListNode { .. } => None,
+    }
+}
+
 /// Path-projection encoders own the path sidecar; every other kind uses the status
 /// sidecar. The two feeds advance independently, so the wrong sidecar means the wrong
 /// resume cursor after a restart.
@@ -571,8 +611,45 @@ pub(crate) fn mirror_kind_for_encoder(
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use raven_railgun_engine::orchestrator::DataSourceFilter;
     use raven_railgun_engine::pir_table::EncoderKind;
     use raven_railgun_ppoi_mirror::MirrorKind;
+
+    #[test]
+    fn a_chain_encoder_declares_the_tree_it_is_pinned_to() {
+        for tree_number in [0u32, 3] {
+            for encoder in [
+                EncoderKind::PerLeafBc { tree_number },
+                EncoderKind::PerLeafPath { tree_number },
+                EncoderKind::PerNode { tree_number },
+            ] {
+                assert_eq!(
+                    super::declared_shim_coverage(encoder),
+                    Some(DataSourceFilter::ChainTreeNumber(tree_number)),
+                    "{encoder:?} serves tree {tree_number} and nothing else"
+                );
+            }
+        }
+    }
+
+    /// One store bounds a list only by its own frontier, so a whole-list declaration here
+    /// would answer `"Missing"` over the part of the list it has not reached.
+    #[test]
+    fn no_per_list_encoder_declares_a_list_on_the_single_instance_path() {
+        let list_key = [7u8; 32];
+        for encoder in [
+            EncoderKind::PerListStatus { list_key },
+            EncoderKind::PerListPath { list_key },
+            EncoderKind::PerListPath10 { list_key },
+            EncoderKind::PerListNode { list_key },
+        ] {
+            assert_eq!(
+                super::declared_shim_coverage(encoder),
+                None,
+                "{encoder:?} cannot bound the list's domain from one store"
+            );
+        }
+    }
 
     /// The status and path feeds own SEPARATE sidecars and advance independently, so an
     /// encoder routed to the wrong one resumes from the wrong cursor after a restart.

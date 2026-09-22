@@ -63,6 +63,14 @@ pub enum CoverageRefusal {
         /// The full frontier block.
         block: u32,
     },
+    /// The only declared block has never held a row, so rows may exist upstream and nothing
+    /// local reflects them. The mirror image of [`Self::FrontierFull`].
+    EmptyFrontier {
+        /// List key asked about.
+        list_key: [u8; 32],
+        /// The empty block.
+        block: u32,
+    },
     /// No wired store declares this commit tree.
     NoTreeStore {
         /// Tree asked about.
@@ -110,6 +118,12 @@ impl std::fmt::Display for CoverageRefusal {
                 f,
                 "list {} block {block} is full at {LEAVES_PER_PPOI_BLOCK} rows and no successor \
                  block is wired, so rows past it are held by nobody",
+                hex32(list_key)
+            ),
+            Self::EmptyFrontier { list_key, block } => write!(
+                f,
+                "list {} block {block} holds no rows and nothing is sealed under it, so the \
+                 list is unbounded here",
                 hex32(list_key)
             ),
             Self::NoTreeStore { tree_number } => {
@@ -328,6 +342,14 @@ impl<'a> ListCoverage<'a> {
             if position == frontier {
                 if held >= LEAVES_PER_PPOI_BLOCK {
                     return Err(CoverageRefusal::FrontierFull {
+                        list_key: self.list_key,
+                        block,
+                    });
+                }
+                // Only when it is also block 0: under a sealed prefix an empty frontier block
+                // is a real frontier, on its own it is no evidence at all.
+                if held == 0 && frontier == 0 {
+                    return Err(CoverageRefusal::EmptyFrontier {
                         list_key: self.list_key,
                         block,
                     });

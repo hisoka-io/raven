@@ -10,9 +10,15 @@
 # Both are counting errors, not resolution errors, so the cases below mutate the EXPECTATIONS and
 # check the comparison — the half that decides whether a shrinking lane is caught.
 #
-# COST: each case runs the gate, which invokes `cargo nextest list` per lane. Warm target dir,
-# ~1-2 min total; cold, a full build. It is wired into the lane-counts CI job, which already pays
-# that build.
+# The third bug was worse, because it made the gate LIE: CI 35579440775 reported six lanes as
+# "selects ZERO tests" while all six were healthy (colour escapes ahead of the row anchor). A gate
+# that can misattribute is worse than no gate, so the stub cases below drive the four outcomes
+# apart — build broken, filterset malformed, lane empty, lane shrunk — by injecting an exit code
+# through LANE_COUNTS_FAKE_CARGO instead of breaking the tree. They need no build and run first.
+#
+# COST: the stub cases are instant. The cases that mutate EXPECTATIONS run the real gate, which
+# invokes `cargo nextest list` per lane: ~1-2 min on a warm target dir, a full build when cold.
+# It is wired into the lane-counts CI job, which already pays that build.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -23,8 +29,9 @@ FIXTURES=scripts/fixtures/assert-lane-counts
 
 BE=$(mktemp)
 ROWS=$(mktemp)
+STUBS=$(mktemp -d)
 cp "$EXPECTED" "$BE"
-trap 'cp "$BE" "$EXPECTED"; rm -f "$BE" "$ROWS"' EXIT
+trap 'cp "$BE" "$EXPECTED"; rm -f "$BE" "$ROWS"; rm -rf "$STUBS"' EXIT
 
 fails=0
 expect() {  # expect <want-nonzero:0|1> <label>
@@ -47,7 +54,8 @@ LANE='durability-and-closure/engine-ignored'
   echo "SELFTEST FIXTURE STALE: no row for '${LANE}' in ${EXPECTED}; these cases would prove" >&2
   echo "  NOTHING. Re-point LANE at a row that exists." >&2; exit 1; }
 
-echo "assert-lane-counts-selftest.sh: three ways a lane goes quiet, plus the control"
+echo "assert-lane-counts-selftest.sh: three ways a lane goes quiet, four ways the gate could"
+echo "  misattribute one, plus the control"
 
 cat > "$ROWS" <<'ROWS'
 raven-railgun-engine::integration_target integration_test
@@ -71,6 +79,94 @@ for marker in integration_target ' in_src::' bench/latency_bench; do
   fi
   echo "  ok: dropping ${marker} changes the parser count 3 -> 2"
 done
+
+# Colour immunity. `--color never` is pinned at the call site, but it was absent for the whole life
+# of the gate and its loss is silent: the count goes to 0 on a healthy tree and the gate then
+# accuses every filter. The counter must survive the flag going missing again.
+coloured=$(/usr/bin/sed -e 's/^\([^ ]*\) \(.*\)$/\x1b[35;1m\1\x1b[0m \x1b[34;1m\2\x1b[0m/' "$ROWS" \
+  | bash "$GATE" --count-fixture)
+if [ "$coloured" -ne 3 ]; then
+  echo "SELFTEST FAIL: ANSI-coloured rows counted ${coloured}, expected 3. Losing --color never" >&2
+  echo "  would make every lane read 0 and the gate would blame the filters - CI 35579440775." >&2
+  exit 1
+fi
+echo "  ok: ANSI-coloured rows still count (3)"
+
+# --- the four outcomes must not be confusable -------------------------------------------------
+# A stub stands in for cargo so an exit code and a stderr body can be injected without breaking the
+# tree. Each case asserts the message the operator acts on, and the message they must NOT be given.
+cat > "$STUBS/build-fail" <<'STUB'
+#!/usr/bin/env bash
+cat >&2 <<'CARGO'
+   Compiling raven-railgun-engine v0.1.0
+error: linking with `cc` failed: exit status: 1
+  = note: collect2: fatal error: cannot find 'ld'
+          compilation terminated.
+error: could not compile `raven-railgun-engine` (lib test) due to 1 previous error
+error: command `cargo test --no-run` exited with code 101
+CARGO
+exit 101
+STUB
+cat > "$STUBS/filterset-bad" <<'STUB'
+#!/usr/bin/env bash
+echo "  error: operator didn't match any binary names" >&2
+exit 94
+STUB
+cat > "$STUBS/lists-nothing" <<'STUB'
+#!/usr/bin/env bash
+echo "    Finished \`ci-test\` profile [unoptimized] target(s)" >&2
+exit 0
+STUB
+cat > "$STUBS/lists-one" <<'STUB'
+#!/usr/bin/env bash
+echo "    Finished \`ci-test\` profile [unoptimized] target(s)" >&2
+echo "raven-railgun-engine::one_binary the_only_surviving_test"
+exit 0
+STUB
+cat > "$STUBS/lists-coloured" <<'STUB'
+#!/usr/bin/env bash
+echo "    Finished \`ci-test\` profile [unoptimized] target(s)" >&2
+for i in $(seq 1 200); do
+  printf '\033[35;1mraven-railgun-engine::b\033[0m \033[34;1mtest_%s\033[0m\n' "$i"
+done
+exit 0
+STUB
+chmod +x "$STUBS"/*
+
+stub_case() {  # stub_case <stub> <want-nonzero:0|1> <forbidden-text|-> <label> <required-text>...
+  local stub="$1" wantfail="$2" forbid="$3" label="$4"; shift 4
+  local out rc bad=0 need
+  out=$(LANE_COUNTS_FAKE_CARGO="$STUBS/$stub" bash "$GATE" 2>&1); rc=$?
+  if [ "$wantfail" = 1 ] && [ "$rc" -eq 0 ]; then
+    echo "SELFTEST FAIL: ${label}: expected a non-zero exit, got 0" >&2; bad=1
+  elif [ "$wantfail" = 0 ] && [ "$rc" -ne 0 ]; then
+    echo "SELFTEST FAIL: ${label}: expected exit 0, got ${rc}" >&2; bad=1
+  fi
+  for need in "$@"; do
+    if ! printf '%s\n' "$out" | /usr/bin/grep -qF -- "$need"; then
+      echo "SELFTEST FAIL: ${label}: output never says '${need}'" >&2; bad=1
+    fi
+  done
+  if [ "$forbid" != "-" ] && printf '%s\n' "$out" | /usr/bin/grep -qF -- "$forbid"; then
+    echo "SELFTEST FAIL: ${label}: output claims '${forbid}', which is a false cause here" >&2; bad=1
+  fi
+  if [ "$bad" -ne 0 ]; then fails=1; else echo "  ok: ${label} -> exit ${rc}"; fi
+}
+
+stub_case build-fail 1 "selects ZERO tests" \
+  "a failed build is reported as a build failure, never as an empty filter" \
+  "BUILD FAILED" "collect2: fatal error: cannot find 'ld'"
+stub_case filterset-bad 1 "BUILD FAILED" \
+  "a rejected filterset is reported as a filter fault, not a build fault" \
+  "FILTERSET REJECTED"
+stub_case lists-nothing 1 "BUILD FAILED" \
+  "a filter that genuinely selects nothing still trips the zero-selection failure" \
+  "selects ZERO tests"
+stub_case lists-one 1 "selects ZERO tests" \
+  "a lane below its pinned count is reported as a SHRINK, not as an empty filter" \
+  "it SHRANK by"
+stub_case lists-coloured 0 "selects ZERO tests" \
+  "coloured rows end to end: the gate passes instead of accusing every filter"
 
 bash "$GATE" --check-name-fixture \
   "$FIXTURES/expected-with-removed-lane.tsv" "$FIXTURES/current-lanes.tsv" \

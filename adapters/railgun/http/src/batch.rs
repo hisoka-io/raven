@@ -23,7 +23,10 @@ const ADDENDUM_LEVELS: usize = raven_railgun_engine::imt::TREE_DEPTH - PATH10_LE
 const ADDENDUM_BYTES: usize = ADDENDUM_LEVELS * 32;
 
 use crate::auth::validate_session_binding;
-use crate::state::AppState;
+use crate::state::{
+    AppState, ADDENDUM_SKEW_STALE_PROVENANCE, ADDENDUM_SKEW_SWAPPED_MID_REQUEST,
+    ADDENDUM_SKEW_UNSEEDED,
+};
 use crate::versioned::{read_versioned, write_batch_response_versioned, write_versioned};
 use crate::{attach_freshness_header, build_response_headers};
 
@@ -295,14 +298,24 @@ pub(crate) async fn inspire_batch_handler(
             let before = instance.current_snapshot();
             let store = store.lock();
             if !store.committed_addenda_derived_from(&before.state.encoded_db) {
+                // Two operator situations hide behind one `false`. An instance that has never
+                // committed a tree is a correct transient; a superseded database is the narrow
+                // publish_recommitted_state -> refresh window and must not read as one.
+                let reason = if store.has_committed_addenda_provenance() {
+                    ADDENDUM_SKEW_STALE_PROVENANCE
+                } else {
+                    ADDENDUM_SKEW_UNSEEDED
+                };
                 tracing::warn!(
                     instance_id = %instance_id,
                     epoch = before.epoch.0,
+                    reason,
                     "batch refused: committed addenda were not derived alongside the served state"
                 );
                 metrics::counter!(
                     "raven_railgun_addendum_provenance_skew_total",
-                    "instance" => instance_id.to_string()
+                    "instance" => instance_id.to_string(),
+                    "reason" => reason,
                 )
                 .increment(1);
                 return Err(StatusCode::SERVICE_UNAVAILABLE);
@@ -358,7 +371,8 @@ pub(crate) async fn inspire_batch_handler(
         );
         metrics::counter!(
             "raven_railgun_addendum_provenance_skew_total",
-            "instance" => instance_id.to_string()
+            "instance" => instance_id.to_string(),
+            "reason" => ADDENDUM_SKEW_SWAPPED_MID_REQUEST,
         )
         .increment(1);
         return Err(StatusCode::SERVICE_UNAVAILABLE);
@@ -789,5 +803,334 @@ mod append_addenda_tests {
     fn refuses_when_addenda_do_not_cover_every_slot() {
         let slots = vec![vec![0xaa_u8; 512], vec![0xbb; 512]];
         assert!(append_batch_addenda(&framed(&slots), &[vec![0x11_u8; 160]]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod swapped_mid_request_metric_tests {
+    //! The third `reason` on `raven_railgun_addendum_provenance_skew_total`, the one that only
+    //! fires after a batch has already been served: the row is correct, and the commit that
+    //! landed while it was in flight is what makes the addenda no longer its own.
+    //!
+    //! Driven at the handler rather than the router because the refusal needs a commit to land
+    //! strictly between the handler's two provenance reads. `join_next` awaits a spawned task,
+    //! which on a current-thread runtime cannot run before this task yields, so a commit
+    //! applied at the first pending poll is exactly a commit landing mid-request.
+
+    use std::collections::HashMap;
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Waker};
+
+    use axum::extract::{Path, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use raven_inspire::math::GaussianSampler;
+    use raven_inspire::params::{InspireParams, InspireVariant, SecurityLevel};
+    use raven_inspire::{query_seeded, EncodedDatabase, ServerCrs};
+    use raven_railgun_core::{Epoch, InstanceId};
+    use raven_railgun_engine::inspire::{
+        apply_wal_entry, setup_state, swap_state, LogicalLeafStore, RavenInspireScheme,
+    };
+    use raven_railgun_engine::pir_table::PerListPath10Encoder;
+    use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
+    use raven_railgun_persistence::{PpoiEventType, WalEntryPayload};
+
+    use super::inspire_batch_handler;
+    use crate::config::HttpConfig;
+    use crate::state::AppState;
+    use crate::versioned::write_versioned;
+
+    const TOKEN: &str = "addendum-swap-mid-request-token-123456";
+    const INSTANCE: &str = "addendum-swapped-mid-request";
+    const LIST_KEY: [u8; 32] = [0x3a; 32];
+    const ENTRY_BYTES: usize = 32;
+    const ROWS: usize = 32;
+    const ENTRIES_PER_SHARD: u32 = 2_048;
+    const SKEW: &str = "raven_railgun_addendum_provenance_skew_total";
+
+    /// Every counter increment the handler emits, in order, keyed by the rendered metric key.
+    ///
+    /// Reads the emit rather than a `/metrics` scrape because metrics 0.24.5 mis-buckets
+    /// `Registry` entries after a resize (metrics-rs #694): a scrape can render a duplicate of
+    /// the same series and report 0 for an increment that did happen.
+    #[derive(Clone, Debug, Default)]
+    struct EmitLog(Arc<parking_lot::Mutex<Vec<(String, u64)>>>);
+
+    impl EmitLog {
+        /// Increments recorded against the skew counter for one `reason`, oldest first.
+        fn skew(&self, reason: &str) -> Vec<u64> {
+            let name = format!("Key({SKEW}");
+            let label = format!("reason = {reason}");
+            self.0
+                .lock()
+                .iter()
+                .filter(|(key, _)| key.starts_with(&name) && key.contains(&label))
+                .map(|(_, value)| *value)
+                .collect()
+        }
+    }
+
+    #[derive(Debug)]
+    struct LoggedCounter {
+        key: String,
+        log: Arc<parking_lot::Mutex<Vec<(String, u64)>>>,
+    }
+
+    impl metrics::CounterFn for LoggedCounter {
+        fn increment(&self, value: u64) {
+            self.log.lock().push((self.key.clone(), value));
+        }
+
+        fn absolute(&self, value: u64) {
+            self.log.lock().push((self.key.clone(), value));
+        }
+    }
+
+    impl metrics::Recorder for EmitLog {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            metrics::Counter::from_arc(Arc::new(LoggedCounter {
+                key: key.to_string(),
+                log: Arc::clone(&self.0),
+            }))
+        }
+
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    struct Fixture {
+        app: AppState<RavenInspireScheme>,
+        instance: Arc<PirInstance<RavenInspireScheme>>,
+        upload: Vec<u8>,
+        /// A second encoded database of the same shape, for the commit that lands mid-request.
+        recommitted: (ServerCrs, EncodedDatabase),
+    }
+
+    fn params() -> InspireParams {
+        InspireParams {
+            ring_dim: 256,
+            q: 1_152_921_504_606_830_593,
+            crt_moduli: vec![1_152_921_504_606_830_593],
+            p: 65_537,
+            sigma: 6.4,
+            gadget_base: 1 << 20,
+            query_gadget_len: 3,
+            packing_gadget_len: 3,
+            security_level: SecurityLevel::Bits128,
+        }
+    }
+
+    /// A store holding one PPOI leaf, so shard 0 has a real upper-sibling addendum at the served
+    /// width; without it the batch refuses on the missing counter instead.
+    fn seeded_store() -> LogicalLeafStore {
+        let encoder = PerListPath10Encoder::new(ENTRIES_PER_SHARD, LIST_KEY).expect("path-10");
+        let mut store = LogicalLeafStore::new();
+        apply_wal_entry(
+            &mut store,
+            &WalEntryPayload::PpoiListLeafAdded {
+                list_key: LIST_KEY,
+                list_index: 0,
+                blinded_commitment: [0x11; 32],
+                status: 0,
+                event_type: PpoiEventType::Shield,
+                signature: vec![0; 64],
+                validated_merkleroot: [0; 32],
+            },
+            100,
+            &encoder,
+        )
+        .expect("append ppoi leaf");
+        store
+    }
+
+    fn fixture() -> Fixture {
+        let params = params();
+        let db = raven_railgun_testkit::toy_db(ROWS, ENTRY_BYTES);
+        let (state, secret_key) =
+            setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("toy state");
+
+        let mut sampler = GaussianSampler::with_seed(params.sigma, 0x3a);
+        let (_, query) = query_seeded(
+            &state.crs,
+            0,
+            state.shard_config(),
+            &secret_key,
+            &mut sampler,
+        )
+        .expect("seeded query for shard 0");
+        assert!(
+            query.session_handle.is_none(),
+            "the fixture uploads its packing keys inline; a handle would need a session"
+        );
+        let upload = write_versioned(&vec![query]).expect("versioned batch upload");
+
+        let recommitted = ((*state.crs).clone(), (*state.encoded_db).clone());
+
+        let mut store = seeded_store();
+        store.refresh_committed_addenda(&state.encoded_db, ENTRIES_PER_SHARD);
+        assert!(
+            store.committed_addendum(&LIST_KEY, 0).is_some(),
+            "the fixture must clear the missing-addendum guard, or it proves the wrong refusal"
+        );
+
+        let instance_id = InstanceId::new(INSTANCE);
+        let instance = Arc::new(PirInstance::new(
+            instance_id.clone(),
+            InstanceRole::Live,
+            state,
+        ));
+        let engine: Engine<RavenInspireScheme> = Engine::new();
+        engine
+            .add_live(Arc::clone(&instance))
+            .expect("register instance");
+
+        let mut stores = HashMap::new();
+        stores.insert(
+            instance_id,
+            (LIST_KEY, Arc::new(parking_lot::Mutex::new(store))),
+        );
+        let app = AppState::new(engine, HttpConfig::demo(TOKEN))
+            .expect("app state")
+            .with_instance_logical_stores(stores);
+
+        Fixture {
+            app,
+            instance,
+            upload,
+            recommitted,
+        }
+    }
+
+    /// Run `body` on a current-thread runtime with every metric emit captured.
+    fn with_emit_log<F>(body: impl FnOnce(EmitLog) -> F)
+    where
+        F: Future<Output = ()>,
+    {
+        let log = EmitLog::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let captured = log.clone();
+        metrics::with_local_recorder(&log, || runtime.block_on(body(captured)));
+    }
+
+    /// Control for the refusal below: the same fixture, with nothing committed mid-request,
+    /// serves the batch. Without it a green refusal proves only that the fixture is broken.
+    #[test]
+    fn the_same_fixture_serves_when_no_commit_lands_mid_request() {
+        with_emit_log(|log| async move {
+            let fixture = fixture();
+            let served = inspire_batch_handler(
+                State(fixture.app),
+                Path(INSTANCE.to_owned()),
+                HeaderMap::new(),
+                fixture.upload.into(),
+            )
+            .await;
+            let (status, _, body) = served.expect("the fixture must serve when no commit lands");
+            assert_eq!(status, StatusCode::OK);
+            assert!(!body.is_empty());
+            assert_eq!(
+                log.skew("swapped_mid_request"),
+                vec![0],
+                "a served batch must leave the series at its zero-init and nothing more"
+            );
+        });
+    }
+
+    #[test]
+    fn a_commit_landing_mid_request_refuses_under_its_own_reason() {
+        with_emit_log(|log| async move {
+            let fixture = fixture();
+            let instance = Arc::clone(&fixture.instance);
+            let (recommitted_crs, recommitted_db) = fixture.recommitted;
+
+            // The zero-init, on the exact label set the refusal below increments. Without it an
+            // alert on this series reads "no data" and cannot tell a silent server from an
+            // unscraped one.
+            assert_eq!(log.skew("swapped_mid_request"), vec![0]);
+
+            let served_db = Arc::clone(&instance.current_snapshot().state.encoded_db);
+            let batch = inspire_batch_handler(
+                State(fixture.app),
+                Path(INSTANCE.to_owned()),
+                HeaderMap::new(),
+                fixture.upload.into(),
+            );
+            tokio::pin!(batch);
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                matches!(batch.as_mut().poll(&mut cx), Poll::Pending),
+                "the batch must still be in flight; a commit applied after it returned proves \
+                 nothing"
+            );
+
+            swap_state(
+                &instance,
+                recommitted_crs,
+                recommitted_db,
+                InspireVariant::TwoPacking,
+                ENTRY_BYTES,
+                Epoch(1),
+            )
+            .expect("commit lands while the batch is in flight");
+            assert!(
+                !Arc::ptr_eq(&served_db, &instance.current_snapshot().state.encoded_db),
+                "the commit must replace the served database, or the fixture proves nothing"
+            );
+
+            assert_eq!(
+                batch
+                    .await
+                    .expect_err("a row and addenda from two trees must be refused"),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+
+            assert_eq!(
+                log.skew("swapped_mid_request"),
+                vec![0, 1],
+                "the refusal must land on its own reason, after the zero-init"
+            );
+            assert_eq!(log.skew("unseeded"), vec![0]);
+            assert_eq!(log.skew("stale_provenance"), vec![0]);
+        });
     }
 }

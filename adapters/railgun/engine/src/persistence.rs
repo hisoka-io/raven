@@ -359,6 +359,25 @@ impl InspirePersistence {
                 .map(InspireServerState::cache_fingerprint);
             let wal = recovery.wal;
             let mut logical_store = recovered_seed_store;
+            // Derive the addenda from the snapshot's OWN store, BEFORE replay advances it to the
+            // WAL tip. `restore_inspire_state_v6_cached` returned this store and
+            // `state.encoded_db` out of one bundle, and nothing in the manifest or in
+            // `EncodedDatabase` identifies the tree a row was encoded from -- so this is the only
+            // instant in the process where the committed pair exists as data rather than as an
+            // inference. Deriving after replay records committed provenance for TIP-derived
+            // addenda, and `inspire_batch_handler` folds that pair into a wrong Merkle root at
+            // HTTP 200 with no log and no counter.
+            //
+            // A runtime `wal_next_seq() == current_snapshot_seq` test cannot replace this: the
+            // fresh-bootstrap arms of `bootstrap_inspire_instance` and
+            // `bootstrap_railgun_engine_multi` commit a synthetic state against an EMPTY store
+            // while handing the consumer the replayed one, and that commit advances the floor.
+            //
+            // A store that cannot resolve a shard's proof -- V5, or a never-committed tree --
+            // leaves the table empty, which the batch path already refuses.
+            if let Some(state) = recovered_state.as_ref() {
+                logical_store.refresh_committed_addenda(&state.encoded_db, entries_per_shard);
+            }
             let replay = recovery.replay;
             // An unencodable leaf is replay-fatal; every other `InvalidQuery`
             // soft-skips, and Internal/Serialization bubble.
@@ -520,6 +539,15 @@ impl InspirePersistence {
     /// version is chosen by the writer it calls, not by this name. Two version ladders share the
     /// numerals 5/6/7 here — the manifest's and the snapshot magic's — so a stale numeral in a
     /// doc or an error string costs an operator more than it would elsewhere.
+    ///
+    /// **Contract: `store` MUST be the logical store `state.encoded_db` was encoded from.**
+    /// [`InspirePersistence::open`] re-derives the committed upper-sibling addenda from this pair
+    /// on reopen, so a call site that snapshots a store AHEAD of its state serves a wrong Merkle
+    /// root at HTTP 200 one reopen later, with no log and no counter. The production call sites
+    /// are `drive_commit`'s two arms — which hold the consumer lock across the re-encode, so no
+    /// append interleaves — and the two fresh-bootstrap arms, which pair a synthetic state with
+    /// an EMPTY store and therefore reopen with an empty table the batch path refuses. Nothing
+    /// here enforces the contract; a fifth call site re-creates the defect silently.
     pub fn commit_v6(
         &self,
         state: &InspireServerState,
@@ -1220,15 +1248,10 @@ pub async fn run_consumer_task(
         }
     }
 
-    // Seed the addenda from the recovered tree before the first query. Without this the table is
-    // empty until the first commit fires -- up to 1000 appends or 300 s -- and every path query in
-    // that window would be refused for a skew that does not exist.
-    {
-        let snapshot = instance.current_snapshot();
-        let entries_per_shard = encoder.entries_per_shard();
-        let mut store = logical_store.lock();
-        store.refresh_committed_addenda(&snapshot.state.encoded_db, entries_per_shard);
-    }
+    // No addendum seeding here. Recovery has already advanced `logical_store` to the WAL tip,
+    // so deriving from it and recording the committed `encoded_db` as provenance produces a
+    // consistent-looking pair that folds to a wrong root. `InspirePersistence::open` seeds the
+    // table from the snapshot's own store instead, before replay.
 
     let mut verifier_state = verifier_ctx.map(|ctx| {
         let baseline = *metrics.lock();

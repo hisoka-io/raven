@@ -136,6 +136,9 @@ if [[ "$REPORT_ONLY" == "1" ]]; then
 fi
 
 echo "bench-gate: diffing against ${BASELINE}"
+# Timing rows carry the baseline MACHINE, and no other machine class reproduces them, so the
+# rows below are only readable next to whose they are.
+echo "bench-gate: baseline hardware = $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("hardware") or "unrecorded")' "$BASELINE" 2>/dev/null)"
 # `|| RC=$?` rather than a bare call, because `set -e` would abort on the differ's own
 # exit 1 before the policy banner below could print - and that banner is the half an
 # operator needs in order to read the verdict correctly.

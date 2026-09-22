@@ -6,6 +6,10 @@
 //! the InspiRING packing width is `ceil(512/2) = 256` and legal widths are the powers of
 //! two up to `ring_dim/2` (`inspiring/inspiring2.rs:132-137`).
 //!
+//! `crs.bin` is the CRS `GET /v1/instance/{id}/params` ships, not the server's own: the
+//! client decodes it and both the session and the extraction run off it here, so the
+//! fixture tests the bytes a wallet actually holds.
+//!
 //! Run: `cargo run --release --example emit_production_shape_fixture --manifest-path
 //! adapters/railgun/client-wasm/Cargo.toml -- <out-dir>`
 
@@ -27,6 +31,7 @@ use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::InspireParams;
 use raven_inspire::pir::mod_switch::{mod_switch_response_checked, MOD_SWITCH_TARGET_36BIT};
 use raven_inspire::setup as inspire_setup;
+use raven_inspire::ServerCrs;
 use raven_inspire_client_wasm::{build_seeded_query_rust, extract_response_rust};
 
 /// `PATH10_RECORD_BYTES` (`engine/src/pir_table/list.rs:20`).
@@ -144,6 +149,26 @@ fn sha256_file(path: &Path) -> String {
         .to_string()
 }
 
+/// The CRS `/v1/instance/{id}/params` ships, byte-for-byte: a duplicate of the private
+/// `crs_wire_bytes` in `adapters/railgun/http/src/admin.rs:142-158`, which a wasm client
+/// crate cannot reach without depending on the axum server. Field-by-field for the same
+/// reason the original is: a CRS layout change must fail to compile here rather than
+/// silently re-inflate the fixture back past a megabyte.
+fn crs_wire_bytes(crs: &ServerCrs) -> Vec<u8> {
+    ServerCrs {
+        params: crs.params.clone(),
+        galois_keys: Vec::new(),
+        rgsw_gadget: crs.rgsw_gadget.clone(),
+        inspiring_pack_params: None,
+        inspiring_packing_key: None,
+        inspiring_w_seed: crs.inspiring_w_seed,
+        inspiring_v_seed: crs.inspiring_v_seed,
+        inspiring_num_columns: crs.inspiring_num_columns,
+    }
+    .to_versioned_bytes()
+    .expect("versioned wire crs")
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -172,7 +197,22 @@ fn main() {
     );
 
     let inspire_params_bin = bincode::serialize(&params).expect("serialize params");
-    let crs_bin = crs.to_versioned_bytes().expect("versioned crs");
+    let crs_bin = crs_wire_bytes(&crs);
+    let wire_crs = ServerCrs::from_versioned_bytes(&crs_bin).expect("decode wire crs");
+    assert!(
+        wire_crs.galois_keys.is_empty(),
+        "the shipped CRS must carry no galois keys"
+    );
+    assert!(
+        crs.to_versioned_bytes().expect("versioned crs").len() > 1_000_000,
+        "the server's own CRS is over a megabyte at d=2048; if it is not, this fixture is \
+         no longer proving that the wire CRS is the small one"
+    );
+    assert!(
+        crs_bin.len() < 4_096,
+        "wire CRS must stay under 4 KiB (got {}), as crs_wire_omits_galois_keys.rs:122 pins",
+        crs_bin.len()
+    );
     let shard_config_bin = bincode::serialize(&encoded_db.config).expect("serialize shard");
     let sk_bin = bincode::serialize(&sk).expect("serialize sk");
     let params_bundle_bin =
@@ -184,8 +224,9 @@ fn main() {
     fs::write(out.join("params_bundle.bin"), &params_bundle_bin).expect("write bundle");
 
     let mut sampler_session = GaussianSampler::new(params.sigma);
-    let session = raven_inspire::ClientSession::new(crs.clone(), sk.clone(), &mut sampler_session)
-        .expect("session");
+    let session =
+        raven_inspire::ClientSession::new(wire_crs.clone(), sk.clone(), &mut sampler_session)
+            .expect("session");
     let cache = raven_inspire::ServerInspiringCache::new(&crs, &encoded_db).expect("cache");
     let store = raven_inspire::ServerSessionStore::new();
 
@@ -223,7 +264,8 @@ fn main() {
         let response = raven_inspire::ServerResponse::from_binary(&response_bin)
             .expect("deserialize response wire");
 
-        let plain = extract_response_rust(&crs, &state, &response, ENTRY_BYTES).expect("extract");
+        let plain =
+            extract_response_rust(&wire_crs, &state, &response, ENTRY_BYTES).expect("extract");
         assert_eq!(
             plain,
             path10_row(global_idx),

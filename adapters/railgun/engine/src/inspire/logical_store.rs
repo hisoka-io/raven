@@ -661,8 +661,14 @@ impl LogicalLeafStore {
     /// Re-derive the upper-sibling addendum for every shard of every list this store holds, and
     /// record the encoded database it was derived alongside.
     ///
-    /// The commit driver calls this straight after a state is published, while the consumer -- the
-    /// sole writer for this instance -- is inside `drive_commit` and no append can interleave.
+    /// **`self` MUST be the tree `derived_alongside` was encoded from.** This function cannot
+    /// check that and does not try: it records whatever `Arc` it is handed as the provenance of
+    /// whatever tree `self` currently holds, so calling it on a store that has run ahead of
+    /// `derived_alongside` makes `committed_addenda_derived_from` report consistency for a pair
+    /// that folds to a wrong root. Only two call sites satisfy the precondition: `drive_commit`
+    /// immediately after `publish_recommitted_state`, and `InspirePersistence::open` on the
+    /// snapshot's own store before WAL replay.
+    ///
     /// A shard whose proof does not resolve is left ABSENT rather than defaulted: an empty addendum
     /// folds to a wrong root, so the caller must refuse instead of serving one.
     pub fn refresh_committed_addenda(
@@ -730,6 +736,17 @@ impl LogicalLeafStore {
         self.committed_addenda
             .get(&(*list_key, shard_id))
             .map(Vec::as_slice)
+    }
+
+    /// Whether any committed tree has been recorded at all.
+    ///
+    /// Distinguishes "never seeded" from "seeded against a superseded database", which
+    /// [`Self::committed_addenda_derived_from`] collapses into one `false`. A refusal that cannot
+    /// say which one it is sends an operator hunting a commit-cadence skew on an instance that
+    /// has simply never committed.
+    #[must_use]
+    pub fn has_committed_addenda_provenance(&self) -> bool {
+        self.committed_addenda_db.is_some()
     }
 
     /// Whether the retained addenda were derived alongside exactly this encoded database.

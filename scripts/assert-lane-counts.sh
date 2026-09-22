@@ -11,6 +11,12 @@
 # scripts/check-ci-filter-names.sh catches a term that resolves to NOTHING. It cannot catch a
 # lane that still resolves but now runs 12 tests where it used to run 65. This does.
 #
+# It must also never blame a filter for something else. CI 35579440775 printed six "selects ZERO
+# tests" lines against six healthy lanes, and a reader who believed it would have gone editing
+# filters. Three failures are therefore reported as three different things: BUILD FAILED (nothing
+# was listed, no lane was measured), FILTERSET REJECTED (this one lane's filter is malformed), and
+# selects ZERO / SHRANK (the filter resolved and the tests are gone).
+#
 # The counts are a ratchet, not a pin: a lane may only GROW silently. A DROP is a hard failure
 # that must be explained by editing .github/expected-lane-counts.tsv in the same change, so a
 # deletion has to be stated rather than absorbed.
@@ -27,9 +33,18 @@ CI=.github/workflows/ci.yml
 EXPECTED=.github/expected-lane-counts.tsv
 MANIFEST=adapters/railgun/Cargo.toml
 MODE="${1:-check}"
+# Fault-injection seam, used only by scripts/assert-lane-counts-selftest.sh: it points this at a
+# stub that exits 101 or 94, so the build-failure and filterset messages below can be red-proved
+# without breaking the shared tree. A real run must never set it; if it is set, the loop below says
+# so loudly, because a green from an injected run means nothing.
+CARGO="${LANE_COUNTS_FAKE_CARGO:-cargo}"
 
 count_nextest_rows() {
-  /usr/bin/grep -cE '^[A-Za-z0-9_-]+(::[A-Za-z0-9_/-]+)? ' || true
+  # Strip SGR escapes first. `--color never` is pinned at the call site, but losing it is invisible:
+  # a coloured row starts with an escape, misses the column-0 anchor, and every lane reads 0 while
+  # the build was fine. That is CI 35579440775 verbatim. This is the belt to that flag's braces.
+  /usr/bin/sed -e 's/\x1b\[[0-9;]*m//g' \
+    | /usr/bin/grep -cE '^[A-Za-z0-9_-]+(::[A-Za-z0-9_/-]+)? ' || true
 }
 
 check_lane_name_completeness() {
@@ -117,7 +132,11 @@ PY
 
 tmp=$(mktemp)
 lane_names=$(mktemp)
-trap 'rm -f "$tmp" "$lane_names"' EXIT
+# Cargo's stderr is kept OUT of the counted stream and off the success path, but whole on failure:
+# the old `2>&1 | tail -3` showed only cargo's `could not compile` summary, which names the crate
+# and never the cause - a `-fuse-ld` linker error sits a dozen lines above it.
+lane_err=$(mktemp)
+trap 'rm -f "$tmp" "$lane_names" "$lane_err"' EXIT
 fail=0
 
 while IFS=$'\t' read -r -u 3 name _rest; do
@@ -129,6 +148,14 @@ if [ "$MODE" != "--update" ]; then
   if ! check_lane_name_completeness "$EXPECTED" "$lane_names"; then
     fail=1
   fi
+fi
+
+# One line, because the build under this loop was silent for seven minutes in CI and a reader
+# could not tell a cold build from a hang. The success path stays quiet after it.
+echo "assert-lane-counts.sh: listing $(wc -l < "$lane_names") lanes; the first pays the test build." >&2
+if [ -n "${LANE_COUNTS_FAKE_CARGO:-}" ]; then
+  echo "  FAULT INJECTION ACTIVE (LANE_COUNTS_FAKE_CARGO=${CARGO}): this run proves NOTHING" >&2
+  echo "  about the real tree. Only the selftest may set it." >&2
 fi
 
 # The lane list is fed on FD 3 and cargo's stdin is closed. Both matter: cargo reads stdin, and
@@ -145,15 +172,27 @@ while IFS=$'\t' read -r -u 3 name pkgs flags extra filter; do
   # colour when stdout is a pipe: measured 30 rows unset, 0 with `always`, 30 with `never`.
   # Every lane then took the count==0 branch, so this gate has been unconditionally red since
   # it was added and has never protected anything. Pin it here rather than trusting the env.
-  out=$(cargo nextest list --color never --manifest-path "$MANIFEST" $pkgs $flags $extra \
-        --cargo-profile ci-test -E "$filter" 2>&1 < /dev/null)
+  out=$("$CARGO" nextest list --color never --manifest-path "$MANIFEST" $pkgs $flags $extra \
+        --cargo-profile ci-test -E "$filter" 2>"$lane_err" < /dev/null)
   rc=$?
-  if [ "$rc" -ne 0 ]; then
-    echo "LANE ${name}: nextest list FAILED (exit ${rc})." >&2
-    echo "  A binary() naming a target that does not exist fails the whole lane at exit 94." >&2
-    echo "$out" | tail -3 >&2
+  # Three failures, three operator actions, so three distinct messages: the build is broken / this
+  # filter is malformed / this lane lost tests. Collapsing the first two into one made the gate
+  # blame filters for a broken linker. nextest 0.9.129 exit codes, measured: 94 = filterset
+  # rejected (parse error, or a term matching no binary/test name), 101 = test build failed.
+  # Anything else also means nothing was listed, so it is handled as a build failure.
+  if [ "$rc" -eq 94 ]; then
+    echo "LANE ${name}: FILTERSET REJECTED by nextest (exit 94). The build is fine; the filter is not." >&2
+    echo "  filter: ${filter}" >&2
+    cat "$lane_err" >&2
     fail=1
     continue
+  elif [ "$rc" -ne 0 ]; then
+    echo "BUILD FAILED: '${CARGO} nextest list' exited ${rc} while listing lane ${name}." >&2
+    echo "  NOTHING was listed, so this gate measured NO lane and is making NO claim about any" >&2
+    echo "  filter. Fix the build. Do not edit ${EXPECTED} and do not touch a lane's filter." >&2
+    echo "  --- cargo/nextest stderr follows, in full ---" >&2
+    cat "$lane_err" >&2
+    exit 1
   fi
   # `nextest list` prints one unindented row per test, in TWO shapes:
   #   integration/bench target:  `raven-railgun-engine::some_binary the_test_name`
@@ -172,6 +211,12 @@ while IFS=$'\t' read -r -u 3 name pkgs flags extra filter; do
 done 3<<< "$lanes"
 
 if [ "$MODE" = "--update" ]; then
+  # A lane that failed above never reached "$tmp", and --update ignores $fail, so rewriting from a
+  # broken run would silently DELETE that lane's pin - the gate erasing its own evidence.
+  if [ "$fail" -ne 0 ]; then
+    echo "assert-lane-counts.sh: refusing to rewrite ${EXPECTED} from a run with failing lanes." >&2
+    exit 1
+  fi
   {
     echo "# Expected test count per filtered CI lane. Regenerate: scripts/assert-lane-counts.sh --update"
     echo "# A lane may GROW silently; a DROP is a hard failure and must be explained by editing"

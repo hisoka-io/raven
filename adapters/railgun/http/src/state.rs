@@ -62,6 +62,20 @@ pub struct AppState<S: PirScheme> {
     pub(crate) params_etag_cache: Arc<ParamsEtagCache>,
 }
 
+/// Refused because the addenda table has no provenance at all; a never-committed instance.
+pub(crate) const ADDENDUM_SKEW_UNSEEDED: &str = "unseeded";
+/// Refused because the addenda were derived alongside a superseded encoded database.
+pub(crate) const ADDENDUM_SKEW_STALE_PROVENANCE: &str = "stale_provenance";
+/// Refused because a commit replaced the served state between the two provenance reads.
+pub(crate) const ADDENDUM_SKEW_SWAPPED_MID_REQUEST: &str = "swapped_mid_request";
+/// The whole `reason` label domain. Bounded by construction, and named so a typo at an emit
+/// site cannot open a fourth series that no zero-init covers.
+pub(crate) const ADDENDUM_SKEW_REASONS: [&str; 3] = [
+    ADDENDUM_SKEW_UNSEEDED,
+    ADDENDUM_SKEW_STALE_PROVENANCE,
+    ADDENDUM_SKEW_SWAPPED_MID_REQUEST,
+];
+
 /// `InstanceId -> (Epoch, sha256)` for `/v1/instance/:id/params`.
 pub(crate) type ParamsEtagCache =
     parking_lot::RwLock<HashMap<InstanceId, (raven_railgun_core::Epoch, [u8; 32])>>;
@@ -143,8 +157,29 @@ impl<S: PirScheme> AppState<S> {
     }
 
     /// Attach per-instance PPOI logical stores used for response addenda.
+    ///
+    /// The addendum refusal counters are zero-inited here and not in
+    /// `register_prometheus_descriptions`: both carry an `instance` label, and this map's keys
+    /// are exactly the instances that can ever emit them. A zero-init without that label would
+    /// materialise a series no emit ever writes to.
     #[must_use]
     pub fn with_instance_logical_stores(mut self, stores: InstanceLogicalStores) -> Self {
+        for instance_id in stores.keys() {
+            let instance = instance_id.to_string();
+            for reason in ADDENDUM_SKEW_REASONS {
+                metrics::counter!(
+                    "raven_railgun_addendum_provenance_skew_total",
+                    "instance" => instance.clone(),
+                    "reason" => reason,
+                )
+                .increment(0);
+            }
+            metrics::counter!(
+                "raven_railgun_addendum_missing_total",
+                "instance" => instance,
+            )
+            .increment(0);
+        }
         self.instance_logical_stores = Arc::new(stores);
         self
     }
@@ -455,6 +490,17 @@ fn register_prometheus_descriptions() {
         "raven_railgun_indexer_reorg_window_tip_hash_failed_total",
         "Lifetime count of scan ticks held because the chunk's tip block hash \
          could not be fetched, leaving the reorg window unable to span it"
+    );
+    metrics::describe_counter!(
+        "raven_railgun_addendum_provenance_skew_total",
+        "Lifetime count of PIR batches refused because the served row and its upper-sibling \
+         addendum could not be shown to come from one tree, labelled by instance + reason \
+         (unseeded|stale_provenance|swapped_mid_request)"
+    );
+    metrics::describe_counter!(
+        "raven_railgun_addendum_missing_total",
+        "Lifetime count of PIR batches refused because a queried shard has no committed \
+         upper-sibling addendum, labelled by instance"
     );
 
     // An unfired series must scrape as zero, not "no data"; dashboards alert on rate.
