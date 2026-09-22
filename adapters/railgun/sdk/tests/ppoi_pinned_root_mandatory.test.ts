@@ -10,8 +10,12 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import {
+  LEAVES_PER_PPOI_BLOCK,
+  PIN_TAIL_WINDOW,
   RavenError,
   RavenPOINodeInterface,
+  UpstreamPinResolver,
+  ppoiNetworkName,
   type ClientPirContext,
   type RavenErrorKind,
 } from "../src/index";
@@ -515,5 +519,76 @@ describe("an unpinned PPOI path-10 fold is verified against the upstream aggrega
     for (const request of upstream.requests) {
       expect(new TextDecoder().decode(request.body)).not.toContain(BC_HEX);
     }
+  });
+});
+
+// The resolver is public API, so it is exercised directly and not only through the
+// interface: an integrator can pre-warm pins or drive it themselves, and a public symbol
+// reachable only via one caller is one refactor away from being untested.
+describe("the pin resolver as public API", () => {
+  let upstream: MockServer;
+
+  beforeAll(async () => {
+    upstream = await startMockServer();
+  });
+  afterAll(async () => {
+    await upstream.close();
+  });
+  afterEach(() => {
+    upstream.reset();
+  });
+
+  function resolver(): UpstreamPinResolver {
+    return new UpstreamPinResolver({
+      endpoint: upstream.url,
+      fetchImpl: fetch,
+      chainType: 0,
+      chainId: MAINNET,
+      txidVersion: "V2_PoseidonMerkle",
+    });
+  }
+
+  // A wrong network name reads another chain's tip, so an unknown pair must say so rather
+  // than fall back to mainnet.
+  it("names the upstream network for known chains and refuses to guess otherwise", () => {
+    expect(ppoiNetworkName(0, 1)).toBe("Ethereum");
+    expect(ppoiNetworkName(0, 137)).toBe("Polygon");
+    expect(ppoiNetworkName(0, 999_999)).toBeUndefined();
+    expect(ppoiNetworkName(9, 1)).toBeUndefined();
+  });
+
+  // The point query's index IS the constant: asking one short returns the root of a tree
+  // with a leaf missing, which folds to something else entirely.
+  it("asks for a frozen block's last leaf and returns that root", async () => {
+    const root = "aa".repeat(32);
+    const lastIndex = BLOCK * LEAVES_PER_PPOI_BLOCK + (LEAVES_PER_PPOI_BLOCK - 1);
+    mountUpstream(upstream, { rows: inRange([{ index: lastIndex, root }]) });
+
+    const resolved = await resolver().resolve(LIST_KEY_HEX, BLOCK);
+
+    expect(eventRanges(upstream)).toEqual([{ startIndex: lastIndex, endIndex: lastIndex }]);
+    expect(resolved.window.frozen).toBe(true);
+    expect([...resolved.roots]).toEqual([root]);
+  });
+
+  // The window is a privacy and cost bound, not decoration: unbounded it would pull the
+  // whole tail every proof.
+  it("bounds a filling block's window by the exported window size", async () => {
+    const latest = BLOCK * LEAVES_PER_PPOI_BLOCK + 900;
+    mountUpstream(upstream, {
+      merklerootsLength: latest + 1,
+      rows: inRange([{ index: latest, root: "bb".repeat(32) }]),
+    });
+
+    const resolved = await resolver().resolve(LIST_KEY_HEX, BLOCK);
+
+    expect(resolved.window.frozen).toBe(false);
+    const width = resolved.window.endIndex - resolved.window.startIndex + 1;
+    expect(width).toBeLessThanOrEqual(PIN_TAIL_WINDOW);
+    expect(resolved.window.endIndex).toBe(latest);
+  });
+
+  it("refuses a list key that is not 64 hex chars", async () => {
+    await expectRejectsWith(resolver().resolve("abcd", BLOCK), "InvalidQuery");
   });
 });

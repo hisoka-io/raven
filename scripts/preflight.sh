@@ -5,10 +5,12 @@
 # MSRV jobs and the hygiene scripts. Checking only the crate you edited passes locally and reds CI,
 # which is how four green jobs broke in one push. This runs all of them in one command.
 #
-# It deliberately does NOT run the test suites: those take tens of minutes and are sharded in CI.
-# Use --with-tests for the fast per-workspace ones. Lint and hygiene are what narrow checking misses.
+# It deliberately does NOT run the Rust test suites: those take tens of minutes and are sharded
+# in CI. Use --with-tests for the fast per-workspace ones. The SDK suite is the exception and
+# runs by default -- it is seconds, and it is the one suite no cargo command can reach.
+# Lint, hygiene and cross-language contracts are what narrow checking misses.
 #
-#   scripts/preflight.sh              fmt + clippy + hygiene, every workspace
+#   scripts/preflight.sh              fmt + clippy + hygiene + the SDK gates
 #   scripts/preflight.sh --msrv       also both MSRV toolchains (slow, needs 1.89 and 1.91)
 #   scripts/preflight.sh --with-tests also the detached-workspace test suites
 #   scripts/preflight.sh --fast       hygiene + fmt only, no clippy (seconds)
@@ -86,6 +88,26 @@ if [ "$FAST" = 0 ]; then
     run "wasm32 client-wasm"  cargo clippy --manifest-path adapters/railgun/client-wasm/Cargo.toml --all-targets --target wasm32-unknown-unknown $OFFLINE -- -D warnings
   else
     echo "  wasm32 target not installed -- SKIPPED (CI will still run it)"
+  fi
+fi
+
+# The SDK is a second language with its own gates, and they are NOT reachable from any
+# cargo command -- which is how a public export with zero test references reached CI green
+# locally and red remotely. These read source or run a fast suite; the wasm-pack bundle-size
+# gates are deliberately omitted because they need a toolchain install, so CI still owns those.
+if [ -d adapters/railgun/sdk ]; then
+  echo
+  echo "== SDK gates (a cargo run cannot see any of these) =="
+  run "rust/ts constant parity"  bash adapters/railgun/scripts/check-sdk-constant-parity.sh
+  run "export coverage"          bash adapters/railgun/scripts/check-sdk-export-coverage.sh
+  run "test-count contract"      bash adapters/railgun/scripts/check-sdk-test-count.sh
+  if [ "$FAST" = 0 ]; then
+    if [ -d adapters/railgun/sdk/node_modules ]; then
+      run "typecheck"  bash -c 'cd adapters/railgun/sdk && npx tsc --noEmit -p tsconfig.json'
+      run "suite"      bash -c 'cd adapters/railgun/sdk && npm test'
+    else
+      echo "  node_modules absent -- SKIPPED typecheck and suite (run pnpm install)"
+    fi
   fi
 fi
 
