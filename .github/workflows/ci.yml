@@ -560,8 +560,9 @@ jobs:
     # It also carries the SLO gates — assertions whose subject IS a wall clock, so
     # they red on machine speed rather than on code and cannot live in a per-push
     # lane. The production-cell nextest profile's 300 s slow-timeout is the only
-    # budget they survive. Today: production_cell_budget_bench (300 ms single-query
-    # and 3 s batch ceilings, split off the cli round-trip test) and populate_bench
+    # budget they survive. Today: production_cell_budget_bench (1 s single-query
+    # and 12 s batch ceilings, sized for THIS runner rather than a dev box, so
+    # they catch a >10x blow-up and nothing subtler) and populate_bench
     # (30 s for 1k events). A timing harness with NO ceiling stays out of every lane
     # and sits in scripts/ignore-coverage-allowlist.txt instead — a measurement is
     # not a gate, and enrolling one buys nightly minutes and no signal.
