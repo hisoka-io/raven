@@ -701,22 +701,39 @@ jobs:
         # the default-feature lint above never compiles it.
         run: cargo clippy --manifest-path crates/inspire/Cargo.toml --all-targets --features mod-switch-response -- -D warnings
       - name: record runner SIMD capability
-        # RAVEN_REQUIRE_AVX512=1 turns the SIMD tests' capability skips into failures.
-        # Arm it only when the runner really has the flags, so the lane is honest on
-        # either kind of runner and the measured answer lands in the log.
+        # Runners are heterogeneous, so record the answer and let each step decide.
+        #
+        # This used to export RAVEN_REQUIRE_AVX512=1 to GITHUB_ENV, which is global and was
+        # wrong in both directions. That flag turns a SIMD test's skip into a failure, and
+        # arming it ONLY on capable runners meant the capability guard could never fire (the
+        # host always had the flags) while the cargo-feature guard always fired (the default
+        # step does not build with simd-packing-offline). The lane therefore failed exactly
+        # when it landed on a capable runner, which read as a flake.
         run: |
           flags=$(grep -o 'avx512[a-z0-9_]*' /proc/cpuinfo | sort -u | tr '\n' ' ') || flags=""
           echo "runner avx512 flags: ${flags:-none}"
           if grep -qw avx512ifma /proc/cpuinfo && grep -qw avx512f /proc/cpuinfo; then
-            echo "RAVEN_REQUIRE_AVX512=1" >> "$GITHUB_ENV"
-            echo "runner HAS avx512ifma - the SIMD kernels are REQUIRED to run"
+            echo "RAVEN_HAS_AVX512=1" >> "$GITHUB_ENV"
+            echo "runner HAS avx512ifma - the SIMD differential will really run"
           else
-            echo "runner LACKS avx512ifma - the SIMD differential halves will loud-skip by name"
+            echo "runner LACKS avx512ifma - the SIMD halves will loud-skip by name"
           fi
       - name: cargo test (default)
+        # The DEFAULT feature set, which is what a client builds, so no feature flags and no
+        # strictness: the SIMD halves loud-skip here by design and are gated in their own step.
         # Five timing harnesses (10 tests) live under benches/ and run only by hand;
         # the all-target clippy step above still compiles them on every push.
         run: cargo test --manifest-path crates/inspire/Cargo.toml --release
+      - name: cargo test (simd-packing-offline differential)
+        # The only lane where the packing differential is a differential rather than the
+        # scalar path compared against itself. Strictness is armed only when the runner can
+        # actually execute the kernels, so both guards are satisfiable: on a capable runner a
+        # skip is a failure, on an incapable one it is a named loud skip.
+        env:
+          RAVEN_REQUIRE_AVX512: ${{ env.RAVEN_HAS_AVX512 }}
+        run: |
+          cargo test --manifest-path crates/inspire/Cargo.toml --release \
+            --features simd-packing-offline
       - name: cargo test (parallel feature)
         # re-runs the byte-identity KAT under the rayon path so it cannot regress undetected
         run: cargo test --manifest-path crates/inspire/Cargo.toml --release --features parallel
