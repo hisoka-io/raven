@@ -18,7 +18,6 @@ ignore = [
   { id = "RUSTSEC-2026-0220", reason = "ruint 1.18.0 Uint shift operations report incorrect overflow flags and truncate the shift amount. Arrives under alloy-primitives. Raven's U256 use is fail-fast width conversion, not shifting. Retire when alloy resolves ruint >= 1.18.1; the upgrade is a dependency change and needs owner ratification." },
   { id = "RUSTSEC-2024-0436", reason = "paste unmaintained, no known vulnerability, proc-macro only. Arrives transitively under the alloy and metrics stacks; no direct dependency to drop. Retire when both stacks stop pulling it." },
   { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained, no known vulnerability, proc-macro only, transitive. Retire when the tree stops pulling it." },
-  { crate = "metrics@0.24.5", reason = "yanked from crates.io while the adapter Cargo.lock still pins it. `cargo update -p metrics` clears it, which is a lockfile change and an owner decision. Retire by re-resolving the adapter lock." },
 ]
 
 [bans]
