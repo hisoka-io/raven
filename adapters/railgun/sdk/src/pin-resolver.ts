@@ -3,9 +3,16 @@
  *
  * A root fetched from the node that served the auth path proves nothing, so the pin has to
  * come from somewhere else. Every byte of both requests below is a function of public state
- * only -- a list key, a block number, and upstream's own tip -- so the request is
- * byte-identical for every wallet asking about the same block and carries no
- * note-identifying information.
+ * only -- a list key, a block number, and upstream's own tip. No blinded commitment is sent,
+ * and upstream's API takes none.
+ *
+ * What that hides, stated exactly, because an earlier version of this comment overclaimed and
+ * two audits called it: the NOTE is hidden, the BLOCK is not. `block` is
+ * `floor(noteLeafIndex / 65_536)`, so a request tells the aggregator which block the note sits
+ * in -- about one-in-six for the OFAC list today. Requests for one block are identical between
+ * wallets apart from the JSON-RPC `id`, and the tail cache is consulted before the point query
+ * so a filling block costs one request per cache window rather than one per proof. A caller who
+ * needs the block hidden preloads `ppoiPinnedRoots` and never reaches this module.
  */
 
 import { RavenError } from "./errors";

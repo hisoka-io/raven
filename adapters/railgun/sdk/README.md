@@ -176,8 +176,15 @@ is introduced. Set `pinUpstream: false` to disable the resolver and require a ha
 applies.
 
 Both pin requests are a function of public state only: the list key, a block number, and
-upstream's own tip. They are byte-identical for every wallet asking about the same block and
-carry nothing that identifies which commitment you hold.
+upstream's own tip. No blinded commitment is sent, and the aggregator's own API takes none.
+
+Be precise about what that does and does not hide. The **block** is derived from the note's leaf
+index, so a pin request tells the aggregator which 65,536-leaf block your note sits in — today that
+is roughly one-in-six for the OFAC list, and it narrows further as blocks are added. It does not
+reveal which note. Requests for the same block are identical between wallets apart from the
+JSON-RPC `id`, and a filling block is asked about once per cache window rather than once per
+proof. If you want the block hidden too, preload `ppoiPinnedRoots` for every block from a source
+you already trust; the resolver is then never consulted.
 
 A pin source that names the same **origin** as the endpoint being verified is refused: setting
 `pinUpstream` to it throws at construction, and inheriting such a value leaves the resolver inert
