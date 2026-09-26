@@ -1,8 +1,9 @@
-//! Machine class and capture time for a bench artifact.
+//! Machine class, build and capture time for a bench artifact.
 //!
-//! A baseline is only comparable against a run from the same machine class, so an
-//! artifact that does not carry one cannot be checked for that at all.
+//! A baseline is only comparable against a run from the same machine class and the same
+//! build, so an artifact that does not carry both cannot be checked for that at all.
 
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Marker for a component this platform does not expose. Never an empty string: a
@@ -17,8 +18,9 @@ const UNKNOWN: &str = "unknown";
 pub fn hardware() -> String {
     let cpus = std::thread::available_parallelism()
         .map_or_else(|_| UNKNOWN.to_owned(), |n| n.get().to_string());
+    let hypervisor = hypervisor(std::fs::read_to_string("/proc/cpuinfo").ok().as_deref());
     let mut out = format!(
-        "os={}; arch={}; cpus={}; cpu={}",
+        "os={}; arch={}; cpus={}; cpu={}; hypervisor={hypervisor}",
         std::env::consts::OS,
         std::env::consts::ARCH,
         cpus,
@@ -33,12 +35,106 @@ pub fn hardware() -> String {
     out
 }
 
+/// The build this binary came from, as stable `key=value` pairs read from the build.
+///
+/// Cargo takes rustflags from `CARGO_ENCODED_RUSTFLAGS`, then `RUSTFLAGS`, then config,
+/// and only the first two reach the compiler's environment. A config-file flag is
+/// reported by its effect instead: `target_features` is what the code was compiled for.
+#[must_use]
+pub fn build() -> String {
+    let (source, flags) = rustflags(
+        option_env!("CARGO_ENCODED_RUSTFLAGS"),
+        option_env!("RUSTFLAGS"),
+    );
+    let features = compiled_target_features();
+    let exe = std::env::current_exe().ok();
+    format!(
+        "profile_dir={}; debug_assertions={}; rustflags_source={source}; rustflags={flags}; \
+         target_features={}",
+        exe.as_deref().and_then(profile_dir).unwrap_or(UNKNOWN),
+        cfg!(debug_assertions),
+        if features.is_empty() {
+            "baseline".to_owned()
+        } else {
+            features.join(",")
+        }
+    )
+}
+
+fn rustflags(encoded: Option<&str>, plain: Option<&str>) -> (&'static str, String) {
+    let (source, flags) = match (encoded, plain) {
+        (Some(e), _) => (
+            "CARGO_ENCODED_RUSTFLAGS",
+            e.split('\u{1f}')
+                .filter(|f| !f.is_empty())
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        (None, Some(p)) => (
+            "RUSTFLAGS",
+            p.split_whitespace().collect::<Vec<_>>().join(" "),
+        ),
+        (None, None) => return ("config-or-none", UNKNOWN.to_owned()),
+    };
+    if flags.is_empty() {
+        (source, "none".to_owned())
+    } else {
+        (source, flags)
+    }
+}
+
+/// The directory the executable runs from, past `deps/` or `examples/`. It names the cargo
+/// profile only when the binary runs where cargo wrote it; a copy reports where it went.
+fn profile_dir(exe: &Path) -> Option<&str> {
+    let mut dir = exe.parent()?;
+    if matches!(dir.file_name()?.to_str()?, "deps" | "examples") {
+        dir = dir.parent()?;
+    }
+    dir.file_name()?.to_str()
+}
+
+macro_rules! enabled_target_features {
+    ($($feature:literal),* $(,)?) => {{
+        let mut on: Vec<&'static str> = Vec::new();
+        $(if cfg!(target_feature = $feature) { on.push($feature); })*
+        on
+    }};
+}
+
+fn compiled_target_features() -> Vec<&'static str> {
+    enabled_target_features!(
+        "sse4.2",
+        "popcnt",
+        "avx",
+        "avx2",
+        "fma",
+        "bmi2",
+        "adx",
+        "avx512f",
+        "avx512vl",
+        "avx512ifma",
+        "neon",
+        "sve",
+    )
+}
+
 /// Capture time as RFC 3339 UTC to the second.
 #[must_use]
 pub fn captured_at() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or_else(|_| UNKNOWN.to_owned(), |d| rfc3339_utc(d.as_secs()))
+}
+
+/// The CPUID hypervisor bit as the kernel lists it. Without an x86 `flags` line the answer
+/// is unknown, so a platform that cannot say is never read as bare metal.
+fn hypervisor(cpuinfo: Option<&str>) -> &'static str {
+    let flags = cpuinfo.and_then(|info| info.lines().find_map(|line| line.strip_prefix("flags")));
+    match flags.map(|f| f.split_whitespace().any(|flag| flag == "hypervisor")) {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => UNKNOWN,
+    }
 }
 
 fn cpu_model() -> String {
@@ -137,9 +233,102 @@ mod tests {
     #[test]
     fn hardware_names_every_component_even_when_a_probe_fails() {
         let h = hardware();
-        for key in ["os=", "arch=", "cpus=", "cpu="] {
+        for key in ["os=", "arch=", "cpus=", "cpu=", "hypervisor="] {
             assert!(h.contains(key), "hardware() dropped {key}: {h}");
         }
+    }
+
+    #[test]
+    fn rustflags_follow_cargo_precedence() {
+        assert_eq!(
+            rustflags(Some("-C\u{1f}target-cpu=native"), Some("-D warnings")),
+            ("CARGO_ENCODED_RUSTFLAGS", "-C target-cpu=native".to_owned())
+        );
+        assert_eq!(
+            rustflags(None, Some(" -D  warnings ")),
+            ("RUSTFLAGS", "-D warnings".to_owned())
+        );
+        assert_eq!(rustflags(None, Some("")), ("RUSTFLAGS", "none".to_owned()));
+        assert_eq!(
+            rustflags(Some(""), None),
+            ("CARGO_ENCODED_RUSTFLAGS", "none".to_owned())
+        );
+        assert_eq!(
+            rustflags(None, None),
+            ("config-or-none", UNKNOWN.to_owned())
+        );
+    }
+
+    #[test]
+    fn hypervisor_is_read_from_the_x86_flags_line_only() {
+        let guest =
+            "processor\t: 0\nflags\t\t: fpu sse2 hypervisor avx512ifma\nbugs\t\t: spectre_v1\n";
+        let metal = "flags\t\t: fpu sse2 hypervisor_like avx512ifma\nvmx flags\t: hypervisor\n";
+        let arm = "processor\t: 0\nFeatures\t: fp asimd\n";
+        assert_eq!(hypervisor(Some(guest)), "yes");
+        assert_eq!(hypervisor(Some(metal)), "no");
+        assert_eq!(hypervisor(Some(arm)), UNKNOWN);
+        assert_eq!(hypervisor(None), UNKNOWN);
+    }
+
+    /// `rustflags` is covered on its own; this pins which compile-time variable feeds which
+    /// argument, where a swap would attribute flags cargo did not use.
+    #[test]
+    fn build_reads_the_variable_cargo_took_its_flags_from() {
+        let (source, flags) = rustflags(
+            option_env!("CARGO_ENCODED_RUSTFLAGS"),
+            option_env!("RUSTFLAGS"),
+        );
+        let b = build();
+        assert!(
+            b.contains(&format!("; rustflags_source={source}; rustflags={flags}; ")),
+            "{b}"
+        );
+    }
+
+    #[test]
+    fn profile_dir_is_the_directory_cargo_chose() {
+        for (exe, expected) in [
+            ("/r/target/release/b1-inspire", Some("release")),
+            ("/r/target/ci-test/deps/bench-0123abcd", Some("ci-test")),
+            (
+                "/r/target/x86_64-unknown-linux-gnu/release/deps/t-1",
+                Some("release"),
+            ),
+            ("/r/target/debug/examples/demo", Some("debug")),
+            ("b1-inspire", None),
+        ] {
+            assert_eq!(profile_dir(Path::new(exe)), expected, "{exe}");
+        }
+    }
+
+    #[test]
+    fn build_names_every_component_and_none_is_blank() {
+        let b = build();
+        for key in [
+            "profile_dir=",
+            "debug_assertions=",
+            "rustflags_source=",
+            "rustflags=",
+            "target_features=",
+        ] {
+            let value = b
+                .split("; ")
+                .find_map(|pair| pair.strip_prefix(key))
+                .unwrap_or_else(|| panic!("build() dropped {key}: {b}"));
+            assert!(!value.is_empty(), "{key} is blank: {b}");
+        }
+    }
+
+    #[test]
+    fn build_reports_what_this_crate_was_compiled_for() {
+        let b = build();
+        assert_eq!(b.contains("avx2"), cfg!(target_feature = "avx2"), "{b}");
+        assert_eq!(
+            b.contains("debug_assertions=true"),
+            cfg!(debug_assertions),
+            "{b}"
+        );
     }
 
     #[test]

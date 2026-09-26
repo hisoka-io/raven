@@ -106,6 +106,7 @@ pub struct BenchReport {
 /// of a cross-boundary schema is the defect a shared definition exists to prevent.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BenchFile {
+    /// Machine class, then the build: a timing is comparable only to a run matching both.
     #[serde(default)]
     pub hardware: String,
     #[serde(default)]
@@ -245,7 +246,7 @@ impl BenchReport {
 impl From<BenchReport> for BenchFile {
     fn from(report: BenchReport) -> Self {
         Self {
-            hardware: provenance::hardware(),
+            hardware: format!("{}; {}", provenance::hardware(), provenance::build()),
             captured_at: provenance::captured_at(),
             results: report.to_results(),
         }
@@ -327,10 +328,10 @@ mod tests {
     /// missing stamp can be caught. Asserting on `provenance::hardware()` directly would
     /// pass with the conversion still writing an empty string.
     #[test]
-    fn from_bench_report_stamps_the_machine_class() {
+    fn from_bench_report_stamps_the_machine_class_and_the_build() {
         assert_eq!(
             BenchFile::from(probe_report()).hardware,
-            provenance::hardware()
+            format!("{}; {}", provenance::hardware(), provenance::build())
         );
     }
 
