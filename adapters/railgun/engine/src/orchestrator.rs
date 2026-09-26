@@ -3,9 +3,10 @@
 
 use crate::inspire::{InspireServerState, LogicalLeafStore, RavenInspireScheme};
 use crate::persistence::{
-    bootstrap_inspire_instance, run_consumer_task, ConsumerEvent, ConsumerMetrics,
-    InspirePersistence, Layer2VerifierContext, SnapshotPolicy,
+    bootstrap_inspire_instance_with_session_limits, run_consumer_task, ConsumerEvent,
+    ConsumerMetrics, InspirePersistence, Layer2VerifierContext, SnapshotPolicy,
 };
+use crate::session_pool::SessionStoreLimits;
 use crate::{Engine, InstanceRole, PirInstance};
 use raven_railgun_core::{AdapterError, InstanceId, Result};
 use raven_railgun_indexer::{ChainSource, IndexerMessage};
@@ -148,7 +149,7 @@ pub struct OrchestratorConfig {
     /// Max concurrent in-flight respond ops. `None` resolves via [`default_k_for`].
     pub max_concurrent_queries: Option<usize>,
     /// On-disk-state authority: chain rootHistory, or the upstream feed with its
-    /// signature retained-but-unverified (see `VerificationMode::UpstreamSignature`).
+    /// signature retained-but-unverified (see `VerificationMode::UpstreamAsserted`).
     pub verification_mode: VerificationMode,
     /// Run the Layer 2 verifier every Nth commit. `0` disables.
     pub verification_cadence_n: u32,
@@ -156,6 +157,8 @@ pub struct OrchestratorConfig {
     pub verification_tree_number: u32,
     /// Chain source for the Layer 2 verifier. `None` disables the verifier.
     pub chain_source: Option<Arc<dyn ChainSource>>,
+    /// Bounds of the instance's packing-key store.
+    pub session_limits: SessionStoreLimits,
 }
 
 impl OrchestratorConfig {
@@ -178,6 +181,7 @@ impl OrchestratorConfig {
             verification_cadence_n: 10,
             verification_tree_number: 0,
             chain_source: None,
+            session_limits: SessionStoreLimits::default(),
         }
     }
 
@@ -208,6 +212,7 @@ impl std::fmt::Debug for OrchestratorConfig {
             .field("verification_cadence_n", &self.verification_cadence_n)
             .field("verification_tree_number", &self.verification_tree_number)
             .field("chain_source_attached", &self.chain_source.is_some())
+            .field("session_limits", &self.session_limits)
             .finish()
     }
 }
@@ -248,13 +253,14 @@ pub fn bootstrap_railgun_engine(
         .encoder
         .build(config.record_size, config.entries_per_shard)?;
 
-    let (instance, persistence, recovered_store) = bootstrap_inspire_instance(
+    let (instance, persistence, recovered_store) = bootstrap_inspire_instance_with_session_limits(
         layout,
         config.scheme_tag.clone(),
         config.instance_id.clone(),
         config.role,
         config.snapshot_policy,
         Arc::clone(&encoder),
+        config.session_limits,
         fresh_state_factory,
     )?;
 
@@ -333,7 +339,7 @@ pub fn bootstrap_railgun_engine(
 }
 
 /// State authority for an instance. List instances must use
-/// `UpstreamSignature`; their roots are not chain-anchored.
+/// `UpstreamAsserted`; their roots are not chain-anchored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerificationMode {
     /// Cross-check IMT root against `RailgunSmartWallet.rootHistory`.
@@ -341,12 +347,9 @@ pub enum VerificationMode {
     /// Accept the upstream feed as the authority: no chain cross-check is possible
     /// because list roots are not chain-anchored.
     ///
-    /// **This does NOT verify the `signedPOIEvent` signature.** The signature is
-    /// retained on the event (`PpoiListLeafAdded::signature`) and never checked —
-    /// `engine/` contains no ed25519 verifier. The name predates that and asserts a
-    /// check no code performs; correcting the name is a public-API change, so it is
-    /// escalated rather than done here: renaming it is a public-API change and a
-    /// config-token migration across every deployed instance.
+    /// **No signature is verified.** The `signedPOIEvent` signature is retained on the
+    /// event (`PpoiListLeafAdded::signature`) and never checked; `engine/` contains no
+    /// ed25519 verifier. Whoever adds one renames this variant back.
     ///
     /// **The root is the one thing this crate checks about the upstream feed.** Every
     /// `PpoiListLeafAdded` is held, ahead of its WAL write, to the `validatedMerkleroot` it
@@ -356,7 +359,7 @@ pub enum VerificationMode {
     /// publisher, who can put a consistent root over any leaves. The second oracle, in
     /// `raven-railgun-cli`'s Subsquid bootstrap, is skipped entirely in `SkipOnUnreachable`
     /// mode (whose own log line says so).
-    UpstreamSignature,
+    UpstreamAsserted,
 }
 
 /// Routing filter: maps chain/mirror events to a specific instance.
@@ -485,7 +488,7 @@ impl InstanceConfig {
             encoder: super::pir_table::EncoderKind::PerListPath { list_key },
             record_size: 16 * 32,
             entries_per_shard: 2048,
-            verification_mode: VerificationMode::UpstreamSignature,
+            verification_mode: VerificationMode::UpstreamAsserted,
             data_source: DataSourceFilter::PpoiList(list_key),
             use_flock: true,
             snapshot_policy: SnapshotPolicy::default(),
@@ -495,19 +498,6 @@ impl InstanceConfig {
             verification_cadence_n: 0,
             chain_source: None,
         }
-    }
-
-    /// Default config for one block of a PPOI list forest.
-    #[must_use]
-    pub fn ppoi_list_block(
-        instance_id: impl Into<String>,
-        data_dir: std::path::PathBuf,
-        list_key: [u8; 32],
-        block: u32,
-    ) -> Self {
-        let mut config = Self::ppoi_list(instance_id, data_dir, list_key);
-        config.data_source = DataSourceFilter::PpoiListBlock { list_key, block };
-        config
     }
 }
 
@@ -575,16 +565,40 @@ impl std::fmt::Debug for MultiOrchestratorHandle {
     }
 }
 
-/// Bootstrap several instances behind one shared router.
+/// Bootstrap several instances behind one shared router, each with default session limits.
 ///
 /// # Errors
 ///
 /// [`AdapterError::InvalidQuery`] if `configs` is empty or two share a
 /// `data_source`.
-#[allow(clippy::too_many_lines)]
 pub fn bootstrap_railgun_engine_multi<F>(
     configs: Vec<InstanceConfig>,
     params: raven_inspire::params::InspireParams,
+    fresh_state_factory: F,
+) -> Result<MultiOrchestratorHandle>
+where
+    F: FnMut(&InstanceConfig) -> Result<InspireServerState>,
+{
+    bootstrap_railgun_engine_multi_with_session_limits(
+        configs,
+        params,
+        SessionStoreLimits::default(),
+        fresh_state_factory,
+    )
+}
+
+/// [`bootstrap_railgun_engine_multi`] with every instance's packing-key store opened at
+/// `session_limits`.
+///
+/// # Errors
+///
+/// As [`bootstrap_railgun_engine_multi`], plus [`AdapterError::Internal`] when
+/// `session_limits` admits no session.
+#[allow(clippy::too_many_lines)]
+pub fn bootstrap_railgun_engine_multi_with_session_limits<F>(
+    configs: Vec<InstanceConfig>,
+    params: raven_inspire::params::InspireParams,
+    session_limits: SessionStoreLimits,
     mut fresh_state_factory: F,
 ) -> Result<MultiOrchestratorHandle>
 where
@@ -628,8 +642,9 @@ where
         let encoder: Arc<dyn super::pir_table::PirTableEncoder> =
             cfg.encoder.build(cfg.record_size, cfg.entries_per_shard)?;
 
-        let session_store = Arc::new(crate::session_pool::BoundedSessionStore::open(
+        let session_store = Arc::new(crate::session_pool::BoundedSessionStore::open_with_limits(
             layout.root(),
+            session_limits,
         )?);
         let opened = InspirePersistence::open(
             layout,
@@ -783,6 +798,44 @@ const _: () = assert!(
     "LEAVES_PER_PPOI_BLOCK exceeds the per-list IMT capacity"
 );
 
+/// Split a list-wide PPOI event index into `(block, index within that block)`.
+///
+/// A PPOI list is a forest of depth-16 trees, not one tree: upstream derives the tree from
+/// `floor(eventIndex / 65_536)` and publishes, per event, the root of the tree that event
+/// landed in. Anything rebuilding a list from global indices has to make the same split or it
+/// runs a single tree into the capacity wall at 65,536, so the split lives here once rather
+/// than as a second copy of `/` and `%` beside every caller.
+///
+/// ```
+/// # use raven_railgun_engine::orchestrator::{split_ppoi_index, LEAVES_PER_PPOI_BLOCK};
+/// assert_eq!(split_ppoi_index(LEAVES_PER_PPOI_BLOCK - 1), (0, LEAVES_PER_PPOI_BLOCK - 1));
+/// assert_eq!(split_ppoi_index(LEAVES_PER_PPOI_BLOCK), (1, 0));
+/// ```
+#[must_use]
+pub const fn split_ppoi_index(list_index: u32) -> (u32, u32) {
+    (
+        list_index / LEAVES_PER_PPOI_BLOCK,
+        list_index % LEAVES_PER_PPOI_BLOCK,
+    )
+}
+
+/// The list-wide index of `local` inside `block`, the inverse of [`split_ppoi_index`].
+///
+/// `None` past `u32::MAX`, which a depth-16 forest reaches at block 65,536.
+///
+/// ```
+/// # use raven_railgun_engine::orchestrator::{global_ppoi_index, LEAVES_PER_PPOI_BLOCK};
+/// assert_eq!(global_ppoi_index(1, 0), Some(LEAVES_PER_PPOI_BLOCK));
+/// assert_eq!(global_ppoi_index(u32::MAX, 0), None);
+/// ```
+#[must_use]
+pub const fn global_ppoi_index(block: u32, local: u32) -> Option<u32> {
+    match block.checked_mul(LEAVES_PER_PPOI_BLOCK) {
+        Some(base) => base.checked_add(local),
+        None => None,
+    }
+}
+
 /// Routing targets that are **currently** not receiving events.
 ///
 /// Self-healing: a delivery clears the target, a miss or a dead consumer marks it. That
@@ -884,7 +937,7 @@ fn ppoi_target_name(
         .any(|(filter, _)| filter_list_key(filter).is_some_and(|k| k == *lk));
     match payload {
         WalEntryPayload::PpoiListLeafAdded { list_index, .. } if list_is_routed => {
-            format!("list:{hex}:block:{}", list_index / LEAVES_PER_PPOI_BLOCK)
+            format!("list:{hex}:block:{}", split_ppoi_index(*list_index).0)
         }
         _ => format!("list:{hex}"),
     }
@@ -1218,10 +1271,10 @@ fn payload_for_ppoi_route(
                 validated_merkleroot,
                 ..
             },
-        ) if route_key == list_key && *list_index / LEAVES_PER_PPOI_BLOCK == block => {
+        ) if route_key == list_key && split_ppoi_index(*list_index).0 == block => {
             Some(WalEntryPayload::PpoiListLeafAdded {
                 list_key: route_key,
-                list_index: *list_index % LEAVES_PER_PPOI_BLOCK,
+                list_index: split_ppoi_index(*list_index).1,
                 blinded_commitment: *blinded_commitment,
                 status: *status,
                 event_type: *event_type,
@@ -1229,6 +1282,8 @@ fn payload_for_ppoi_route(
                 validated_merkleroot: *validated_merkleroot,
             })
         }
+        // No list index to localize on, so every block gets it; `LogicalLeafStore::apply` files
+        // it only in the block that indexes the commitment, which keeps updates reaching owners.
         (
             DataSourceFilter::PpoiListBlock {
                 list_key: route_key,
@@ -1286,6 +1341,56 @@ mod forest_routing_tests {
             [7; 32],
         )
         .is_none()));
+    }
+
+    #[test]
+    fn the_split_and_its_inverse_agree_across_the_first_block_boundary() {
+        for global in [
+            0,
+            LEAVES_PER_PPOI_BLOCK - 1,
+            LEAVES_PER_PPOI_BLOCK,
+            LEAVES_PER_PPOI_BLOCK + 1,
+        ] {
+            let (block, local) = split_ppoi_index(global);
+            assert!(
+                local < LEAVES_PER_PPOI_BLOCK,
+                "{global} localized to {local}"
+            );
+            assert_eq!(global_ppoi_index(block, local), Some(global));
+        }
+        assert_eq!(split_ppoi_index(LEAVES_PER_PPOI_BLOCK - 1), (0, 65_535));
+        assert_eq!(split_ppoi_index(LEAVES_PER_PPOI_BLOCK), (1, 0));
+        assert_eq!(split_ppoi_index(LEAVES_PER_PPOI_BLOCK + 1), (1, 1));
+    }
+
+    // The whole-list route hands the instance the index upstream published, un-split, and that
+    // is the only sound choice: two leaves in different blocks share a local index, so
+    // localizing here would collide block 1 row 0 onto block 0 row 0 and the per-list IMT
+    // would refuse it as non-contiguous or, worse, publish one leaf's status under another's
+    // row. The consequence is a PROPERTY of the route, not a defect in this arm: an instance
+    // bound to a whole list holds one depth-16 IMT, so it can serve a list of at most
+    // LEAVES_PER_PPOI_BLOCK rows and refuses every row past that at `checked_imt_append`.
+    // A longer list has to be declared per block.
+    #[test]
+    fn the_whole_list_route_forwards_the_list_wide_index_unsplit() {
+        for global in [
+            0,
+            LEAVES_PER_PPOI_BLOCK - 1,
+            LEAVES_PER_PPOI_BLOCK,
+            LEAVES_PER_PPOI_BLOCK + 1,
+            5 * LEAVES_PER_PPOI_BLOCK + 7,
+        ] {
+            let routed =
+                payload_for_ppoi_route(DataSourceFilter::PpoiList([7; 32]), &leaf(global), [7; 32])
+                    .expect("the whole-list route accepts every row of its list");
+            assert!(
+                matches!(
+                    routed,
+                    WalEntryPayload::PpoiListLeafAdded { list_index, .. } if list_index == global
+                ),
+                "row {global} must arrive under its list-wide index"
+            );
+        }
     }
 
     /// A distinctive key, because the registry is process-global and unit tests share it.
@@ -1375,5 +1480,101 @@ mod forest_routing_tests {
         mark_router_unrouted_target("tree:4242");
         clear_delivered_target("tree:4242");
         assert!(!router_unrouted_targets().contains(&"tree:4242".to_owned()));
+    }
+}
+
+#[cfg(test)]
+mod session_limit_tests {
+    use super::*;
+    use raven_inspire::inspiring::ClientPackingKeys;
+    use raven_inspire::math::GaussianSampler;
+    use raven_inspire::params::{InspireParams, InspireVariant};
+    use std::time::Duration;
+
+    const ENTRY_SIZE: usize = 256;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_store_a_multi_bootstrap_opens_carries_the_requested_limits() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let params = InspireParams::secure_128_d2048();
+        let (donor, secret_key) = crate::inspire::setup_state(
+            &params,
+            &raven_railgun_testkit::toy_db(raven_railgun_testkit::TOY_ENTRIES, ENTRY_SIZE),
+            ENTRY_SIZE,
+            InspireVariant::TwoPacking,
+        )
+        .expect("toy state");
+        let configs: Vec<InstanceConfig> = (0..2u32)
+            .map(|tree| {
+                let mut cfg = InstanceConfig::commit_tree(
+                    format!("tree-{tree}"),
+                    root.path().join(format!("tree-{tree}")),
+                    tree,
+                    InstanceRole::Live,
+                );
+                cfg.encoder = crate::pir_table::EncoderKind::PerLeafBc { tree_number: tree };
+                cfg.record_size = ENTRY_SIZE;
+                cfg.use_flock = false;
+                cfg
+            })
+            .collect();
+        let limits = SessionStoreLimits {
+            max_sessions: 2,
+            ttl: Duration::from_secs(600),
+        };
+
+        let handle =
+            bootstrap_railgun_engine_multi_with_session_limits(configs, params, limits, |_| {
+                Ok(InspireServerState {
+                    crs: Arc::clone(&donor.crs),
+                    encoded_db: Arc::clone(&donor.encoded_db),
+                    cache: Arc::clone(&donor.cache),
+                    session_store: Arc::new(crate::session_pool::BoundedSessionStore::new()),
+                    variant: donor.variant,
+                    entry_size: donor.entry_size,
+                })
+            })
+            .expect("bootstrap");
+
+        let mut sampler = GaussianSampler::with_seed(donor.crs.params.sigma, 3);
+        let keys = ClientPackingKeys::generate(
+            &secret_key,
+            donor.cache.pack_params(),
+            donor.crs.inspiring_w_seed,
+            &mut sampler,
+        );
+        let context = donor.crs.params.ntt_context();
+        assert_eq!(handle.instances.len(), 2);
+        for per in &handle.instances {
+            let state = per.instance.current_state();
+            assert_eq!(
+                state.session_store.limits(),
+                limits,
+                "{}",
+                per.config.instance_id
+            );
+            for seat in 0..limits.max_sessions {
+                state
+                    .session_store
+                    .register_server_side(keys.clone(), state.cache.pack_params(), &context)
+                    .unwrap_or_else(|error| panic!("seat {seat}: {error}"));
+            }
+            let refusal = state
+                .session_store
+                .register_server_side(keys.clone(), state.cache.pack_params(), &context)
+                .expect_err("the requested ceiling, not the default, refuses");
+            assert!(
+                refusal.to_string().contains("2 live sessions"),
+                "{}: {refusal}",
+                per.config.instance_id
+            );
+        }
+
+        handle.router.abort();
+        drop(handle.channels);
+        for per in handle.instances {
+            let _ = per.sender.send(ConsumerEvent::Shutdown).await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), per.consumer).await;
+        }
     }
 }

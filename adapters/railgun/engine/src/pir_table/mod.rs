@@ -45,8 +45,8 @@ pub enum EncoderKind {
     /// T1 default: row = 32 B blinded commitment, padded to record_size.
     ///
     /// Carries its tree because the row index is tree-LOCAL: `leaf_index` alone. The
-    /// single-instance ingest path applies no tree filter, so without the pin two trees
-    /// would write the same row and the higher one would silently win.
+    /// store accepts any tree regardless of what ingest scoped, so without the pin two
+    /// trees would write the same row and the higher one would silently win.
     PerLeafBc {
         /// Tree this encoder is pinned to.
         tree_number: u32,

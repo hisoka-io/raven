@@ -170,7 +170,7 @@ async fn a_row_whose_root_is_not_its_own_post_append_root_never_reaches_the_wal(
     config.encoder = EncoderKind::PerListStatus { list_key: LIST_KEY };
     // A snapshot would archive the log this test reads back.
     config.snapshot_policy = SnapshotPolicy::default();
-    config.verification_mode = VerificationMode::UpstreamSignature;
+    config.verification_mode = VerificationMode::UpstreamAsserted;
     config.verification_cadence_n = 0;
     config.chain_source = None;
 

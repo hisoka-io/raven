@@ -1,8 +1,8 @@
 //! `per-leaf-bc` indexes rows by `leaf_index` alone and FILTERS on the tree it is pinned
 //! to. Re-deriving the scope in the index would shift an already-tree-local leaf out of
 //! its own cell and serve filler; dropping the tree entirely would let a foreign tree
-//! overwrite the row. The pin is the invariant - not the router, which scopes only on the
-//! multi-instance path (see `per_leaf_bc_two_trees_must_not_collide`).
+//! overwrite the row. The pin is the invariant - not ingest scoping, which WAL replay and
+//! direct `apply` callers never pass through (see `per_leaf_bc_two_trees_must_not_collide`).
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 

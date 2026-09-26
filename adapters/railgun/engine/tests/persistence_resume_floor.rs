@@ -57,7 +57,7 @@ fn quiet_config(dir: &std::path::Path, instance_id: &str) -> OrchestratorConfig 
     config.role = InstanceRole::Live;
     SCHEME_TAG.clone_into(&mut config.scheme_tag);
     config.snapshot_policy = commit_every_event();
-    config.verification_mode = VerificationMode::UpstreamSignature;
+    config.verification_mode = VerificationMode::UpstreamAsserted;
     config.verification_cadence_n = 0;
     config.chain_source = None;
     config

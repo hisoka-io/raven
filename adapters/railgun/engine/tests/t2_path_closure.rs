@@ -1,6 +1,11 @@
-//! T2 PPOI auth-path PIR closure-rule property test: PIR-derived
-//! 16-sibling path byte-equals `ppoi_merkle_proof.elements` and
-//! reconstructs the per-list IMT root.
+//! Closure for the **16-level `per-list-path` encoder**: a PIR-derived 16-sibling path
+//! byte-equals `ppoi_merkle_proof.elements` and reconstructs the per-list IMT root.
+//!
+//! Read the encoder name, not the file name. This is NOT the shipped `per-list-path10`
+//! record -- that one carries levels 0..10 in a 512 B row and 11..15 in a 160 B addendum,
+//! and its closure lives in `path10_addendum_root_closure.rs`. An audit that reads "T2 path
+//! closure" and stops there counts this file as coverage the deployment does not have; it
+//! did, before that file existed.
 
 #![allow(
     clippy::expect_used,
@@ -122,9 +127,10 @@ fn reconstruct_root(leaf: [u8; 32], leaf_index: u32, path: &MerkleProof) -> [u8;
 }
 
 #[test]
-#[ignore = "production-cell setup is heavy (~12s); T2 path PIR closure. Trigger: changing the \
-            per-list auth-path encoder or ppoi_merkle_proof. CI runs it in the durability + \
-            closure lane."]
+#[ignore = "production-cell setup is heavy (~12s); closure for the 16-level per-list-path \
+            encoder, NOT the shipped path-10 row plus addendum. Trigger: changing \
+            EncoderKind::PerListPath or ppoi_merkle_proof. CI does run it -- the durability + \
+            closure lane names binary(t2_path_closure) and passes --run-ignored all."]
 fn t2_pir_query_recovers_auth_path_byte_identical_and_root_reconstructs() {
     let (live_state, client_session, store, params) = build_state_session();
 

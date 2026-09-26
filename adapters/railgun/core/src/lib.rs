@@ -178,8 +178,8 @@ impl RailgunEvent {
     /// tree because it removes value rather than appending a leaf.
     ///
     /// Used by the single-instance ingest bridge to scope a store to one tree. That scope
-    /// is load-bearing: `per-leaf-bc` indexes rows by `leaf_index` alone, so two trees in
-    /// one store would write the same row.
+    /// keeps foreign trees out of the store; row correctness rests on the encoder's pin,
+    /// since `per-leaf-bc` indexes rows by `leaf_index` alone.
     #[must_use]
     pub const fn tree_number(&self) -> Option<u32> {
         match self {

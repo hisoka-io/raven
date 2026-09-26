@@ -104,7 +104,7 @@ fn cfg(root: &std::path::Path) -> InstanceConfig {
         },
         record_size: TOY_ENTRY_SIZE,
         entries_per_shard: TOY_ENTRIES_PER_SHARD,
-        verification_mode: VerificationMode::UpstreamSignature,
+        verification_mode: VerificationMode::UpstreamAsserted,
         data_source: DataSourceFilter::ChainTreeNumber(ROUTED_TREE),
         use_flock: false,
         snapshot_policy: SnapshotPolicy::default(),

@@ -37,7 +37,7 @@ use raven_railgun_persistence::{
 };
 
 /// `Err` carries the operator-facing verdict; `Ok` carries which arm read it, so a green run
-/// still says whether the V5, V6 or V7 path was exercised.
+/// still says whether the V5 or V7 path was exercised. A V6 body never goes green.
 fn probe(dir: &std::path::Path) -> Result<&'static str, String> {
     let layout = StoreLayout::inspect(dir);
     let manifest = match Manifest::load(&layout) {

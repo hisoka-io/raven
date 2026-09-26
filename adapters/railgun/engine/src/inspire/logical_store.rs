@@ -168,11 +168,14 @@ pub struct LogicalLeafStore {
     ppoi_block_height: std::collections::BTreeMap<([u8; 32], [u8; 32]), u64>,
     imts: std::collections::HashMap<u32, crate::imt::Imt>,
     ppoi_imts: std::collections::HashMap<[u8; 32], crate::imt::Imt>,
-    ppoi_bc_index: std::collections::BTreeMap<([u8; 32], [u8; 32]), u32>,
+    // Upstream dropped its unique `(listKey, blindedCommitment)` index and recreated it
+    // non-unique, so one commitment may hold several indices and a one-index map lost the
+    // earlier one. A set of triples rather than a widened map because under bincode it is
+    // byte-identical to that map; `tests/logical_store_bc_index_wire.rs` holds it to that.
+    ppoi_bc_indices: std::collections::BTreeSet<([u8; 32], [u8; 32], u32)>,
     ppoi_index_bc: std::collections::BTreeMap<([u8; 32], u32), [u8; 32]>,
     // Inert under bincode, which is positional and carries no field names: inserting this
-    // field mid-struct shifted every field after it. `LogicalLeafStoreV6` is what reads the
-    // bytes written before it existed.
+    // field mid-struct shifted every field after it, which is why a V6 body is refused unread.
     #[serde(default)]
     ppoi_event_metadata:
         std::collections::BTreeMap<([u8; 32], u32), raven_railgun_persistence::PpoiEventMetadata>,
@@ -189,114 +192,6 @@ pub struct LogicalLeafStore {
     // forever one hour after boot. A commit replaces the Arc; a heartbeat does not.
     #[serde(skip)]
     committed_addenda_db: Option<std::sync::Arc<raven_inspire::EncodedDatabase>>,
-}
-
-/// The `LogicalLeafStore` shape every V6 snapshot on disk was written with, frozen.
-///
-/// Pinning the V6 read path to the *live* struct is what made a field insertion a data-loss
-/// event: bincode is positional, so `ppoi_event_metadata` landing mid-struct reinterpreted
-/// `ppoi_list_leaf_block_height`'s bytes as its own.
-///
-/// This is the shape rather than a guess: field names and types are unchanged at every commit
-/// from the one that introduced `SNAPSHOT_V6_MAGIC` to the one before it broke. (The text is
-/// not identical — one commit respelled `super::imt::Imt` as `crate::imt::Imt` — but the wire
-/// is.) `TREE_DEPTH` is 16 throughout too, which matters because `ZeroValues.levels` is
-/// `[[u8; 32]; TREE_DEPTH + 1]`: a change there would move the wire with no struct text
-/// changing at all. `tests/fixtures/logical_store_v6.bin` pins the result to bytes.
-///
-/// **Do not edit this struct** — a V6 snapshot's shape is history, and a new field belongs in
-/// `LogicalLeafStore` behind a new magic. Note the banner is not sufficient by itself: the
-/// shape is transitively `Imt`'s and `ZeroValues`', so editing either moves V6's wire without
-/// touching anything here. The fixture, not the banner, is what actually catches that.
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct LogicalLeafStoreV6 {
-    leaves: std::collections::BTreeMap<(u32, u32), [u8; 32]>,
-    ppoi_status: std::collections::BTreeMap<([u8; 32], [u8; 32]), u8>,
-    dirty_shards: std::collections::BTreeSet<u32>,
-    last_block_height: u64,
-    leaf_block_height: std::collections::BTreeMap<(u32, u32), u64>,
-    ppoi_block_height: std::collections::BTreeMap<([u8; 32], [u8; 32]), u64>,
-    imts: std::collections::HashMap<u32, crate::imt::Imt>,
-    ppoi_imts: std::collections::HashMap<[u8; 32], crate::imt::Imt>,
-    ppoi_bc_index: std::collections::BTreeMap<([u8; 32], [u8; 32]), u32>,
-    ppoi_index_bc: std::collections::BTreeMap<([u8; 32], u32), [u8; 32]>,
-    ppoi_list_leaf_block_height: std::collections::BTreeMap<([u8; 32], u32), u64>,
-}
-
-impl LogicalLeafStoreV6 {
-    /// Lossless *about the snapshot*: the retained-metadata field postdates every byte V6 ever
-    /// wrote, so its absence is a fact rather than data dropped on the floor, and any other fill
-    /// would be fabrication.
-    ///
-    /// It is NOT lossless about the store the engine then serves from. Every leaf the snapshot
-    /// covered comes back without metadata, and only leaves replayed from the WAL afterwards get
-    /// any — which is why `restore_inspire_state_v6` logs on this arm rather than healing
-    /// silently.
-    pub(crate) fn into_current(self) -> LogicalLeafStore {
-        // Say it happened. A V6 reopen returns every per-list leaf without its retained
-        // metadata, and the path encoder skips a row whose metadata is absent -- degraded
-        // served content with, until this line, nothing at all in the log.
-        if !self.ppoi_index_bc.is_empty() {
-            tracing::warn!(
-                target = "raven::engine::snapshot",
-                list_leaves = self.ppoi_index_bc.len(),
-                "V6 snapshot: retained PPOI event metadata is absent by construction; \
-                 path-projection rows for leaves covered by this snapshot stay unfilled until \
-                 they are re-ingested"
-            );
-        }
-        LogicalLeafStore {
-            leaves: self.leaves,
-            ppoi_status: self.ppoi_status,
-            dirty_shards: self.dirty_shards,
-            last_block_height: self.last_block_height,
-            leaf_block_height: self.leaf_block_height,
-            ppoi_block_height: self.ppoi_block_height,
-            imts: self.imts,
-            ppoi_imts: self.ppoi_imts,
-            ppoi_bc_index: self.ppoi_bc_index,
-            ppoi_index_bc: self.ppoi_index_bc,
-            ppoi_event_metadata: std::collections::BTreeMap::new(),
-            ppoi_list_leaf_block_height: self.ppoi_list_leaf_block_height,
-            committed_addenda: std::collections::BTreeMap::new(),
-            committed_addenda_db: None,
-        }
-    }
-
-    /// Refuses rather than writing a V6 snapshot that silently drops retained metadata --
-    /// V6 has no field to put it in.
-    pub(crate) fn try_from_current(store: &LogicalLeafStore) -> Result<Self> {
-        if !store.ppoi_event_metadata.is_empty() {
-            return Err(AdapterError::Serialization(format!(
-                "refusing to write a V6 snapshot: the store carries {} retained PPOI event \
-                 metadata entries and the V6 layout has no field for them. Write V7.",
-                store.ppoi_event_metadata.len()
-            )));
-        }
-        Ok(Self {
-            leaves: store.leaves.clone(),
-            ppoi_status: store.ppoi_status.clone(),
-            dirty_shards: store.dirty_shards.clone(),
-            last_block_height: store.last_block_height,
-            leaf_block_height: store.leaf_block_height.clone(),
-            ppoi_block_height: store.ppoi_block_height.clone(),
-            imts: store.imts.clone(),
-            ppoi_imts: store.ppoi_imts.clone(),
-            ppoi_bc_index: store.ppoi_bc_index.clone(),
-            ppoi_index_bc: store.ppoi_index_bc.clone(),
-            ppoi_list_leaf_block_height: store.ppoi_list_leaf_block_height.clone(),
-        })
-    }
-
-    /// Mints the shape a pre-`ppoi_event_metadata` build would have written for `store`.
-    /// Fixture generation only: dropping the field is exactly what those builds did, because
-    /// the field did not exist when they wrote.
-    #[cfg(test)]
-    pub(crate) fn from_current_dropping_metadata(store: &LogicalLeafStore) -> Self {
-        let mut bare = store.clone();
-        bare.ppoi_event_metadata.clear();
-        Self::try_from_current(&bare).expect("metadata cleared on the line above")
-    }
 }
 
 impl LogicalLeafStore {
@@ -350,11 +245,19 @@ impl LogicalLeafStore {
                 blinded_commitment,
                 status,
             } => {
-                let key = (*list_key, *blinded_commitment);
-                self.ppoi_status.insert(key, *status);
-                self.ppoi_block_height.insert(key, block_height);
-                // A status has a row only after its BC is indexed.
-                if let Some(list_index) = self.ppoi_bc_index.get(&key).copied() {
+                // A status carries no list index, so every block of the list receives it; filing
+                // it only where the commitment is indexed keeps one copy of the list's statuses
+                // rather than one per block. The leaf files its own status, so nothing is lost.
+                let occurrences: Vec<u32> =
+                    self.ppoi_indices_of(list_key, blinded_commitment).collect();
+                if !occurrences.is_empty() {
+                    let key = (*list_key, *blinded_commitment);
+                    self.ppoi_status.insert(key, *status);
+                    self.ppoi_block_height.insert(key, block_height);
+                }
+                // EVERY occurrence's row carries the status: it is per commitment upstream, so
+                // dirtying one leaves the other rows publishing the superseded verdict.
+                for list_index in occurrences {
                     self.dirty_shards
                         .extend(encoder.affected_shards_for_ppoi_leaf(list_key, list_index));
                 }
@@ -387,7 +290,8 @@ impl LogicalLeafStore {
                 imt.insert_leaves(leaf_idx_usize, &[*blinded_commitment])?;
                 let bc_key = (*list_key, *blinded_commitment);
                 let idx_key = (*list_key, *list_index);
-                self.ppoi_bc_index.insert(bc_key, *list_index);
+                self.ppoi_bc_indices
+                    .insert((*list_key, *blinded_commitment, *list_index));
                 self.ppoi_index_bc.insert(idx_key, *blinded_commitment);
                 self.ppoi_event_metadata.insert(
                     idx_key,
@@ -446,9 +350,10 @@ impl LogicalLeafStore {
                 for key in stale_ppoi {
                     self.ppoi_status.remove(&key);
                     self.ppoi_block_height.remove(&key);
-                    // Dropping a status rewrites the row's verdict byte. Read the index before
-                    // the list-leaf pass below removes it.
-                    if let Some(list_index) = self.ppoi_bc_index.get(&key).copied() {
+                    // Dropping a status rewrites the verdict byte of every row carrying that
+                    // commitment. Read the indices before the list-leaf pass below removes them.
+                    let occurrences: Vec<u32> = self.ppoi_indices_of(&key.0, &key.1).collect();
+                    for list_index in occurrences {
                         self.dirty_shards
                             .extend(encoder.affected_shards_for_ppoi_leaf(&key.0, list_index));
                     }
@@ -462,16 +367,29 @@ impl LogicalLeafStore {
                     .collect();
                 let mut affected_lists: std::collections::BTreeSet<[u8; 32]> =
                     std::collections::BTreeSet::new();
+                let mut unindexed: Vec<([u8; 32], [u8; 32])> = Vec::new();
                 for key in stale_list_leaves {
                     let (list_key, list_index) = key;
                     self.ppoi_list_leaf_block_height.remove(&key);
                     self.ppoi_event_metadata.remove(&key);
+                    // Only THIS occurrence. Dropping the commitment's whole lookup unindexes a
+                    // commitment that a surviving earlier index still holds, and the shim then
+                    // reports a member of the list as Missing.
                     if let Some(bc) = self.ppoi_index_bc.remove(&key) {
-                        self.ppoi_bc_index.remove(&(list_key, bc));
+                        self.ppoi_bc_indices.remove(&(list_key, bc, list_index));
+                        unindexed.push((list_key, bc));
                     }
                     self.dirty_shards
                         .extend(encoder.affected_shards_for_ppoi_leaf(&list_key, list_index));
                     affected_lists.insert(list_key);
+                }
+                // The apply-time rule, held across a rewind: a status filed at a height below its
+                // leaf's would otherwise outlive the last occurrence it was filed for.
+                for key in unindexed {
+                    if self.ppoi_indices_of(&key.0, &key.1).next().is_none() {
+                        self.ppoi_status.remove(&key);
+                        self.ppoi_block_height.remove(&key);
+                    }
                 }
                 for list_key in &affected_lists {
                     let new_count: usize = match self
@@ -507,7 +425,7 @@ impl LogicalLeafStore {
         self.leaves.iter()
     }
 
-    /// Number of PPOI rows currently tracked.
+    /// Number of indexed blinded commitments holding a status.
     #[must_use]
     pub fn ppoi_count(&self) -> usize {
         self.ppoi_status.len()
@@ -588,12 +506,31 @@ impl LogicalLeafStore {
         self.ppoi_imts.len()
     }
 
-    /// Per-list `(blinded_commitment -> list_index)` lookup.
+    /// Every list_index carrying `blinded_commitment`, ascending.
+    ///
+    /// Upstream permits a commitment to recur within one list -- it dropped the unique
+    /// `(listKey, blindedCommitment)` index and recreated it non-unique -- so this is an
+    /// iterator rather than an `Option`.
+    pub fn ppoi_indices_of(
+        &self,
+        list_key: &[u8; 32],
+        blinded_commitment: &[u8; 32],
+    ) -> impl Iterator<Item = u32> + '_ {
+        let lo = (*list_key, *blinded_commitment, 0u32);
+        let hi = (*list_key, *blinded_commitment, u32::MAX);
+        self.ppoi_bc_indices
+            .range(lo..=hi)
+            .map(|(_, _, list_index)| *list_index)
+    }
+
+    /// Per-list `blinded_commitment -> lowest list_index`.
+    ///
+    /// The LOWEST of several occurrences, not the latest: it is the one a later append cannot
+    /// move and a reorg of the tail cannot take away, and each occurrence proves the same
+    /// membership. Use [`Self::ppoi_indices_of`] when every occurrence matters.
     #[must_use]
     pub fn ppoi_index_of(&self, list_key: &[u8; 32], blinded_commitment: &[u8; 32]) -> Option<u32> {
-        self.ppoi_bc_index
-            .get(&(*list_key, *blinded_commitment))
-            .copied()
+        self.ppoi_indices_of(list_key, blinded_commitment).next()
     }
 
     /// Per-list `(list_index -> blinded_commitment)` lookup.
@@ -620,7 +557,7 @@ impl LogicalLeafStore {
     }
 
     /// Entry count of the map that a mid-struct field insertion steals the bytes of; the
-    /// frozen-V6 tests assert on it directly rather than inferring it from a clean decode.
+    /// frozen-layout test asserts on it directly rather than inferring it from a clean decode.
     #[cfg(test)]
     pub(crate) fn ppoi_list_leaf_block_height_len(&self) -> usize {
         self.ppoi_list_leaf_block_height.len()

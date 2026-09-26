@@ -103,7 +103,7 @@ async fn ppoi_non_contiguous_list_leaf_never_reaches_the_wal() {
     // Snapshotting would archive the log and float the replay floor above the
     // poisoned seq, hiding the very entry this test inspects.
     config.snapshot_policy = SnapshotPolicy::default();
-    config.verification_mode = VerificationMode::UpstreamSignature;
+    config.verification_mode = VerificationMode::UpstreamAsserted;
     config.verification_cadence_n = 0;
     config.chain_source = None;
 

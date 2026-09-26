@@ -177,7 +177,7 @@ fn boot(dir: &std::path::Path) -> OrchestratorHandle {
         max_appends_per_snapshot: 1,
         ..SnapshotPolicy::default()
     };
-    config.verification_mode = VerificationMode::UpstreamSignature;
+    config.verification_mode = VerificationMode::UpstreamAsserted;
     config.verification_cadence_n = 0;
     config.chain_source = None;
     let params = InspireParams::secure_128_d2048();

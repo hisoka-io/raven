@@ -63,9 +63,9 @@ impl PirTableEncoder for PerLeafCommitmentEncoder {
 
     fn affected_shards_for_leaf(&self, tree: u32, leaf_index: u32) -> BTreeSet<u32> {
         let mut dirty = BTreeSet::new();
-        // The pin is the invariant, not the router: the single-instance ingest path
-        // forwards every tree, and the row index is `leaf_index` alone, so an unfiltered
-        // foreign leaf would overwrite this tree's row.
+        // The pin is the invariant, not ingest scoping: the store takes any tree, and the
+        // row index is `leaf_index` alone, so an unfiltered foreign leaf would overwrite
+        // this tree's row.
         if tree != self.tree_number {
             tracing::warn!(
                 target = "raven::pir_table",

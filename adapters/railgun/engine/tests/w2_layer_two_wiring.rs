@@ -1,6 +1,6 @@
 //! Layer 2 verifier wiring in `drive_commit`: per-commit verify under
 //! ChainRootHistory, OutOfSync cascading through `apply_reorg`, and no verifier
-//! call at all under UpstreamSignature.
+//! call at all under UpstreamAsserted.
 
 #![allow(
     clippy::expect_used,
@@ -318,7 +318,7 @@ async fn layer2_first_verdict_out_of_sync_must_not_truncate_to_genesis() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn layer2_verifier_does_not_fire_on_upstream_signature_instance() {
+async fn layer2_verifier_does_not_fire_on_upstream_asserted_instance() {
     let dir = tempfile::tempdir().expect("tempdir");
     // Fails on the first verify, so any verifier call at all trips this.
     let chain_source = Arc::new(SyntheticChainSource::new(0));
@@ -329,7 +329,7 @@ async fn layer2_verifier_does_not_fire_on_upstream_signature_instance() {
     config.role = InstanceRole::Live;
     config.scheme_tag = SCHEME_TAG.to_owned();
     config.snapshot_policy = aggressive_snapshot_policy();
-    config.verification_mode = VerificationMode::UpstreamSignature;
+    config.verification_mode = VerificationMode::UpstreamAsserted;
     config.verification_cadence_n = 1;
     config.verification_tree_number = 0;
     config.chain_source = Some(Arc::clone(&chain_source) as Arc<dyn ChainSource>);
@@ -379,12 +379,12 @@ async fn layer2_verifier_does_not_fire_on_upstream_signature_instance() {
     assert_eq!(
         chain_source.verify_count(),
         0,
-        "UpstreamSignature instance MUST NOT call the chain verifier",
+        "UpstreamAsserted instance MUST NOT call the chain verifier",
     );
     let metrics = *handle.metrics.lock();
     assert_eq!(
         metrics.reorgs_handled, 0,
-        "no synthetic reorg should fire on an UpstreamSignature instance",
+        "no synthetic reorg should fire on an UpstreamAsserted instance",
     );
 
     handle

@@ -57,7 +57,7 @@ fn cfg(
         // fixed-layout encoders pin their own row width; a declared 256 is substituted, not served
         record_size: encoder.effective_record_size(TOY_ENTRY_SIZE),
         entries_per_shard: TOY_ENTRIES_PER_SHARD,
-        verification_mode: VerificationMode::UpstreamSignature,
+        verification_mode: VerificationMode::UpstreamAsserted,
         data_source: ds,
         use_flock: false,
         snapshot_policy: SnapshotPolicy::default(),

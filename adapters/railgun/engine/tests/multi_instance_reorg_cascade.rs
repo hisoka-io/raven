@@ -96,7 +96,7 @@ fn build_three_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
             "ppoi-a",
             EncoderKind::PerLeafBc { tree_number: 0 },
             DataSourceFilter::PpoiList(lk_a),
-            VerificationMode::UpstreamSignature,
+            VerificationMode::UpstreamAsserted,
             InstanceRole::Live,
         ),
     ]

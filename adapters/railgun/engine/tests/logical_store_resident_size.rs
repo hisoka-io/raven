@@ -14,7 +14,7 @@ use raven_railgun_persistence::WalEntryPayload;
 /// One `per-list-path10` block instance owns a full depth-16 tree.
 const LEAVES_PER_BLOCK: u32 = 65_536;
 /// Live OFAC/Ethereum population, measured 2026-09-20. A status carries no `list_index`, so the
-/// router cannot localize it to a block and every block instance files the whole list.
+/// router hands every block instance the whole list's statuses.
 const WHOLE_LIST_POPULATION: u32 = 358_344;
 const ENTRIES_PER_SHARD: u32 = 2_048;
 const LIST_KEY: [u8; 32] = [0xab; 32];
@@ -82,10 +82,10 @@ fn one_retained_clone_costs_this_many_bytes_at_the_served_shape() {
     let build_delta = after_build.saturating_sub(before_build);
     let clone_delta = after_clone.saturating_sub(before_clone);
 
-    // The deployed shape is bigger than this block's own leaves. `logical_store.rs:340-341`
-    // files `ppoi_status` and `ppoi_block_height` UNCONDITIONALLY, before the
-    // `if let Some(list_index)` gate at `:343` -- so a block carries the whole list's status
-    // maps, and that is what a retained clone duplicates. Measured, not modelled.
+    // The deployed shape feeds this block the whole list's statuses. The `PpoiStatus` arm of
+    // `LogicalLeafStore::apply` files one only for a commitment the block indexes, so the
+    // delta below measures what the other blocks' statuses still cost it. Measured, not
+    // modelled.
     let mut deployed = store.clone();
     let before_status = rss_bytes();
     for index in 0..WHOLE_LIST_POPULATION {
@@ -103,6 +103,11 @@ fn one_retained_clone_costs_this_many_bytes_at_the_served_shape() {
     }
     let after_status = rss_bytes();
     let status_delta = after_status.saturating_sub(before_status);
+    assert_eq!(
+        deployed.ppoi_count(),
+        LEAVES_PER_BLOCK as usize,
+        "a block files the statuses of its own rows and no others"
+    );
 
     let before_deployed_clone = rss_bytes();
     let deployed_retained = deployed.clone();

@@ -22,13 +22,7 @@ use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
 use raven_railgun_persistence::WalEntryPayload;
 use raven_railgun_poseidon::{merkle_node, railgun_merkle_zero_value};
 
-/// Block exponent from the read-path design. `BLOCK_K = 10` is a wire-format parameter
-/// and an owner decision, not a tunable: changing it resizes every fetched block
-/// (2^10 leaf commitments = 32 KB payload, anonymity set 1,024) and the public upper
-/// tree. The structural tests in this file derive boundaries from it on both sides and
-/// stay green at any `k` — re-derive the payload and anonymity-set figures before
-/// editing this constant. (This text replaced a #[test] that could only compare these
-/// same-file constants to their own literals; no production symbol carries `BLOCK_K`.)
+/// Wire-format fetch block, not a PPOI list block: 2^10 leaves, 32 KB, anonymity set 1,024.
 const BLOCK_K: usize = 10;
 /// Leaf commitments per block.
 const BLOCK_LEAVES: usize = 1 << BLOCK_K;

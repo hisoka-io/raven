@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{
-    apply_wal_entry, restore_inspire_state_v6, snapshot_inspire_state, snapshot_inspire_state_v6,
-    InspireServerState, LogicalLeafStore, SNAPSHOT_V6_MAGIC,
+    apply_wal_entry, restore_inspire_state_v6, snapshot_inspire_state, snapshot_inspire_state_v7,
+    InspireServerState, LogicalLeafStore, SNAPSHOT_V6_MAGIC, SNAPSHOT_V7_MAGIC,
 };
 use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
@@ -82,7 +82,7 @@ fn bootstrap_then_drive_commit_then_restart_recovers_logical_store() {
     assert_eq!(
         opened2.recovered_logical_store.imt_leaf_count_for(0),
         8,
-        "V6 snapshot must restore 8 leaves into the logical store after WAL archive"
+        "V7 snapshot must restore 8 leaves into the logical store after WAL archive"
     );
     for i in 0..8u32 {
         let want = canonical(u8::try_from(i).unwrap_or(0).saturating_add(1));
@@ -161,7 +161,7 @@ fn bootstrap_then_kill_then_restart_serves_real_leaves() {
     assert_eq!(
         opened2.recovered_logical_store.imt_leaf_count_for(0),
         6,
-        "V6 snapshot (4 leaves) + WAL replay (2 leaves) must combine to 6"
+        "V7 snapshot (4 leaves) + WAL replay (2 leaves) must combine to 6"
     );
     for i in 0..6u32 {
         let want = canonical(u8::try_from(i).unwrap_or(0).saturating_add(1));
@@ -316,7 +316,7 @@ fn manifest_v5_compatibility_on_open_existing_data() {
 }
 
 #[test]
-fn snapshot_v6_envelope_roundtrips_in_isolation() {
+fn snapshot_v7_envelope_roundtrips_in_isolation() {
     let state = build_toy_state();
     let mut store = LogicalLeafStore::default();
     let encoder: Arc<dyn PirTableEncoder> = encoder_arc();
@@ -329,15 +329,15 @@ fn snapshot_v6_envelope_roundtrips_in_isolation() {
         apply_wal_entry(&mut store, &payload, 100 + u64::from(i), encoder.as_ref())
             .expect("apply to logical");
     }
-    let bytes = snapshot_inspire_state_v6(&state, &store).expect("v6 ser");
+    let bytes = snapshot_inspire_state_v7(&state, &store).expect("v7 ser");
     let head = bytes
-        .get(..SNAPSHOT_V6_MAGIC.len())
-        .expect("v6 bytes long enough to hold magic");
+        .get(..SNAPSHOT_V7_MAGIC.len())
+        .expect("v7 bytes long enough to hold magic");
     assert_eq!(
-        head, SNAPSHOT_V6_MAGIC,
-        "v6 envelope must lead with the magic prefix"
+        head, SNAPSHOT_V7_MAGIC,
+        "v7 envelope must lead with the magic prefix"
     );
-    let (back_state, back_store) = restore_inspire_state_v6(&bytes).expect("v6 restore");
+    let (back_state, back_store) = restore_inspire_state_v6(&bytes).expect("v7 restore");
     assert_eq!(back_state.entry_size, state.entry_size);
     assert_eq!(back_store.imt_leaf_count_for(0), 3);
     for i in 0..3u32 {
@@ -349,7 +349,7 @@ fn snapshot_v6_envelope_roundtrips_in_isolation() {
 
 #[test]
 fn drive_commit_truncates_wal_yet_v6_recovery_is_complete() {
-    // commit_v6 archives the WAL, so reopen reads zero entries from current.log; the V6 snapshot must still recover every leaf
+    // commit_v6 archives the WAL, so reopen reads zero entries from current.log; the V7 snapshot must still recover every leaf
     let dir = tempfile::tempdir().expect("tempdir");
 
     {
@@ -409,7 +409,7 @@ fn drive_commit_truncates_wal_yet_v6_recovery_is_complete() {
     assert_eq!(
         opened2.recovered_logical_store.imt_leaf_count_for(0),
         5,
-        "Even with empty current.log post-archive, the V6 snapshot must \
+        "Even with empty current.log post-archive, the V7 snapshot must \
          carry every applied leaf back into the recovered store"
     );
     // "carry every applied leaf" is a claim about bytes; the count above holds for a
@@ -423,4 +423,45 @@ fn drive_commit_truncates_wal_yet_v6_recovery_is_complete() {
             .expect("leaf present after post-archive recovery");
         assert_eq!(got, want, "leaf {i} must byte-equal the commitment written");
     }
+}
+
+/// V7 holds every occurrence of a commitment, so a recurrence survives a snapshot rather than
+/// collapsing to one index the reader can never widen again.
+#[test]
+fn a_v7_snapshot_keeps_every_occurrence_of_a_recurring_commitment() {
+    const LIST_KEY: [u8; 32] = [0x71; 32];
+    let state = build_toy_state();
+    let encoder = raven_railgun_engine::pir_table::PerListStatusEncoder::new(
+        TOY_ENTRY_SIZE,
+        ENTRIES_PER_SHARD,
+        LIST_KEY,
+    )
+    .expect("per-list-status encoder");
+    let mut store = LogicalLeafStore::default();
+    for list_index in 0..2u32 {
+        apply_wal_entry(
+            &mut store,
+            &WalEntryPayload::PpoiListLeafAdded {
+                list_key: LIST_KEY,
+                list_index,
+                blinded_commitment: canonical(9),
+                status: 0,
+                event_type: raven_railgun_persistence::PpoiEventType::Shield,
+                signature: vec![0; 64],
+                validated_merkleroot: [0; 32],
+            },
+            100 + u64::from(list_index),
+            &encoder,
+        )
+        .expect("apply recurring commitment");
+    }
+
+    let bytes = snapshot_inspire_state_v7(&state, &store).expect("v7 ser");
+    let (_, back) = restore_inspire_state_v6(&bytes).expect("v7 restore");
+    assert_eq!(
+        back.ppoi_indices_of(&LIST_KEY, &canonical(9))
+            .collect::<Vec<_>>(),
+        vec![0, 1],
+        "both occurrences must come back from the snapshot"
+    );
 }

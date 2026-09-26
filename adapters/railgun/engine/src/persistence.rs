@@ -683,7 +683,9 @@ impl InspirePersistence {
 }
 
 /// Construct a [`PirInstance<RavenInspireScheme>`] tied to a persistence handle,
-/// recovering from disk when a manifest exists.
+/// recovering from disk when a manifest exists. The packing-key store keeps the
+/// compiled session limits; a serving path sizes it with
+/// [`bootstrap_inspire_instance_with_session_limits`].
 ///
 /// The returned store MUST be the one the consumer task runs against: the
 /// encoded DB and the logical store share a leaf-index contiguity invariant, and
@@ -701,8 +703,42 @@ pub fn bootstrap_inspire_instance(
     Arc<InspirePersistence>,
     super::inspire::LogicalLeafStore,
 )> {
-    let session_store = Arc::new(super::session_pool::BoundedSessionStore::open(
+    bootstrap_inspire_instance_with_session_limits(
+        layout,
+        scheme_tag,
+        instance_id,
+        role,
+        policy,
+        encoder,
+        super::session_pool::SessionStoreLimits::default(),
+        fresh_state_factory,
+    )
+}
+
+/// [`bootstrap_inspire_instance`] with the packing-key store opened at `session_limits`.
+///
+/// # Errors
+///
+/// A persistence, recovery or fresh-state failure, or a session-store error when
+/// `session_limits` admits no session.
+#[allow(clippy::too_many_arguments)]
+pub fn bootstrap_inspire_instance_with_session_limits(
+    layout: StoreLayout,
+    scheme_tag: impl Into<String>,
+    instance_id: InstanceId,
+    role: InstanceRole,
+    policy: SnapshotPolicy,
+    encoder: Arc<dyn super::pir_table::PirTableEncoder>,
+    session_limits: super::session_pool::SessionStoreLimits,
+    fresh_state_factory: impl FnOnce() -> Result<InspireServerState>,
+) -> Result<(
+    PirInstance<RavenInspireScheme>,
+    Arc<InspirePersistence>,
+    super::inspire::LogicalLeafStore,
+)> {
+    let session_store = Arc::new(super::session_pool::BoundedSessionStore::open_with_limits(
         layout.root(),
+        session_limits,
     )?);
     let opened =
         InspirePersistence::open(layout, scheme_tag, instance_id.clone(), policy, encoder)?;
@@ -882,9 +918,8 @@ const SWAP_RETRY_ATTEMPTS: u32 = 4;
 
 /// Layer 2 verifier wiring threaded into [`run_consumer_task`].
 pub struct Layer2VerifierContext {
-    /// Authority model. `UpstreamSignature` skips the chain-rootHistory verifier loop,
-    /// and verifies no signature either — the name is historical (see
-    /// `VerificationMode::UpstreamSignature`).
+    /// Authority model. `UpstreamAsserted` skips the chain-rootHistory verifier loop
+    /// and puts nothing in its place (see `VerificationMode::UpstreamAsserted`).
     pub verification_mode: super::orchestrator::VerificationMode,
     /// Verify every Nth commit. `0` disables.
     pub cadence_n: u32,

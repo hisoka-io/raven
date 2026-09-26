@@ -8,9 +8,11 @@ use super::{
     labels, materialize_node_shard, materialize_path_shard, node_affected_shards, PirTableEncoder,
     LEAVES_PER_TREE, MIN_RECORD_SIZE, NODE_HASH_BYTES, PATH_RECORD_BYTES,
 };
+use crate::imt::Imt;
 use crate::inspire::LogicalLeafStore;
+use crate::orchestrator::hex_lower_32;
 
-/// Status byte for a leaf whose status row is absent.
+/// Status byte of every row that carries no verdict.
 ///
 /// Must not be 0: 0 is `Valid`, the verdict that authorizes a spend, so defaulting to
 /// it fails open. Matches what the plaintext shim returns for the same state
@@ -20,12 +22,49 @@ pub const ABSENT_STATUS_BYTE: u8 = POIStatus::Missing.wire_byte();
 pub const PATH10_RECORD_BYTES: usize = 512;
 /// Number of lower siblings retained in a PPOI v2 row.
 pub const PATH10_LEVELS: usize = 11;
-/// Non-zero format marker preventing an absent row from decoding as `Valid`.
+/// Marks a filled PPOI v2 row. An unfilled row carries no marker, and
+/// [`ABSENT_STATUS_BYTE`] at the status offset.
 pub const PATH10_MAGIC: [u8; 4] = *b"RVP2";
+const PATH10_STATUS_OFFSET: usize = 32;
+
+/// Rows encoded ABSENT for an index the list holds, once per shard materialization.
+///
+/// The list frontier is its leaf count. A row below it has a record upstream, so encoding it
+/// ABSENT is a store inconsistency and is counted, again on every re-encode of its shard while
+/// it persists. A row at or past it is padding for an index the list has not reached; every
+/// shard past the tail is made of them, so they are not.
+const UNFILLED_ROWS_TOTAL: &str = "raven_railgun_pir_unfilled_rows_total";
+
+fn record_unfilled_row(
+    encoder: &'static str,
+    list_key: &[u8; 32],
+    list_index: u32,
+    missing: &'static str,
+) {
+    metrics::describe_counter!(
+        UNFILLED_ROWS_TOTAL,
+        metrics::Unit::Count,
+        "Per-list PIR rows below the list frontier encoded ABSENT because the store lacks \
+         the part the `missing` label names, counted once per shard materialization: a row \
+         that stays unfilled adds one on every re-encode of its shard, so this counts \
+         emissions, not distinct rows. Rows at or past the frontier are padding and are never \
+         counted. Any increase means the node publishes no verdict for an index the list \
+         holds. The warn log names the list_key and list_index."
+    );
+    metrics::counter!(UNFILLED_ROWS_TOTAL, "encoder" => encoder, "missing" => missing).increment(1);
+    tracing::warn!(
+        target = "raven::pir_table",
+        encoder,
+        list_key = %hex_lower_32(list_key),
+        list_index,
+        missing,
+        "row below the list frontier served ABSENT"
+    );
+}
 
 /// Status encoder: row at `list_index` is `[status_byte, bc[0..31]]` padded to
 /// `record_size`. The BC tail lets one query recover verdict and canonical bytes.
-/// A leaf present with no status encodes [`ABSENT_STATUS_BYTE`], never `Valid`.
+/// Every row without a verdict encodes [`ABSENT_STATUS_BYTE`], never `Valid`.
 #[derive(Debug, Clone)]
 pub struct PerListStatusEncoder {
     record_size: usize,
@@ -72,21 +111,36 @@ impl PirTableEncoder for PerListStatusEncoder {
     fn materialize_shard(&self, shard_id: u32, store: &LogicalLeafStore) -> Vec<u8> {
         let eps = self.entries_per_shard as usize;
         let mut buf = vec![0u8; eps.saturating_mul(self.record_size)];
+        for row in buf.chunks_exact_mut(self.record_size) {
+            if let Some(b) = row.first_mut() {
+                *b = ABSENT_STATUS_BYTE;
+            }
+        }
+        let frontier = store.ppoi_imt(&self.list_key).map_or(0, Imt::leaf_count);
+        let unfilled = |list_index, missing| {
+            record_unfilled_row(labels::PER_LIST_STATUS, &self.list_key, list_index, missing);
+        };
         let row_start = (shard_id as usize).saturating_mul(eps);
         for row_offset in 0..eps {
-            let list_index_usize = row_start + row_offset;
+            let list_index_usize = row_start.saturating_add(row_offset);
             let Ok(list_index) = u32::try_from(list_index_usize) else {
                 break;
             };
+            let below_frontier = list_index_usize < frontier;
             let Some(bc) = store.ppoi_bc_at(&self.list_key, list_index) else {
+                if below_frontier {
+                    unfilled(list_index, "leaf");
+                }
                 continue;
             };
-            // Absent, not Valid. A reorg between a leaf and its later status update
-            // clears `ppoi_status` while `ppoi_index_bc` survives, so this default is
-            // reachable and 0 would publish a rolled-back ShieldBlocked as clean.
-            let status = store
-                .ppoi_status(&self.list_key, &bc)
-                .unwrap_or(ABSENT_STATUS_BYTE);
+            // A reorg between a leaf and its later status update clears `ppoi_status` while
+            // `ppoi_index_bc` survives, so this default is reachable.
+            let status = store.ppoi_status(&self.list_key, &bc).unwrap_or_else(|| {
+                if below_frontier {
+                    unfilled(list_index, "status");
+                }
+                ABSENT_STATUS_BYTE
+            });
             let row_byte_start = row_offset * self.record_size;
             if let Some(dst) = buf.get_mut(row_byte_start..row_byte_start + self.record_size) {
                 if let Some(b) = dst.first_mut() {
@@ -245,12 +299,21 @@ impl PirTableEncoder for PerListPath10Encoder {
     fn materialize_shard(&self, shard_id: u32, store: &LogicalLeafStore) -> Vec<u8> {
         let rows = self.entries_per_shard as usize;
         let mut out = vec![0u8; rows.saturating_mul(PATH10_RECORD_BYTES)];
+        // The marker is what the client checks; the status byte is for a reader that does not.
+        for row in out.as_chunks_mut::<PATH10_RECORD_BYTES>().0 {
+            if let Some(status) = row.get_mut(PATH10_STATUS_OFFSET) {
+                *status = ABSENT_STATUS_BYTE;
+            }
+        }
         let Some(imt) = store.ppoi_imt(&self.list_key) else {
             return out;
         };
+        let unfilled = |list_index, missing| {
+            record_unfilled_row(labels::PER_LIST_PATH10, &self.list_key, list_index, missing);
+        };
         let row_start = (shard_id as usize).saturating_mul(rows);
         for row_offset in 0..rows {
-            let list_index = row_start + row_offset;
+            let list_index = row_start.saturating_add(row_offset);
             if list_index >= imt.leaf_count() {
                 break;
             }
@@ -258,12 +321,15 @@ impl PirTableEncoder for PerListPath10Encoder {
                 break;
             };
             let Some(leaf) = store.ppoi_bc_at(&self.list_key, list_index_u32) else {
+                unfilled(list_index_u32, "leaf");
                 continue;
             };
             let Some(metadata) = store.ppoi_event_metadata(&self.list_key, list_index_u32) else {
+                unfilled(list_index_u32, "metadata");
                 continue;
             };
             let Ok(proof) = imt.merkle_proof(list_index) else {
+                unfilled(list_index_u32, "proof");
                 continue;
             };
             let start = row_offset * PATH10_RECORD_BYTES;
@@ -273,10 +339,13 @@ impl PirTableEncoder for PerListPath10Encoder {
             if let Some(dst) = row.get_mut(..32) {
                 dst.copy_from_slice(&leaf);
             }
-            if let Some(status) = row.get_mut(32) {
+            if let Some(status) = row.get_mut(PATH10_STATUS_OFFSET) {
                 *status = store
                     .ppoi_status_at(&self.list_key, list_index_u32)
-                    .unwrap_or(ABSENT_STATUS_BYTE);
+                    .unwrap_or_else(|| {
+                        unfilled(list_index_u32, "status");
+                        ABSENT_STATUS_BYTE
+                    });
             }
             let event_type = match metadata.event_type {
                 raven_railgun_persistence::PpoiEventType::Shield => 0,

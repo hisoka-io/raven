@@ -12,10 +12,14 @@
 //! 958,663,751,023,254,534 bytes against a 16 MiB cap. That length field sits at offset 92.
 //!
 //! WHAT THIS PROVES: pre-epoch bytes are refused, cleanly, by a typed error an operator can act
-//! on. WHAT IT DOES NOT PROVE: that any legacy arm still decodes legacy bytes to the values they
-//! decoded to before. No bytes this build can decode past `InspireParams` survive anywhere, so
-//! that property has no corpus and is not asserted here. A same-length reinterpretation inside
-//! `InspireParams` would leave every assertion below green.
+//! on, and a V6 body is refused unread: every body behind the V6 magic, well-formed or with two
+//! same-width fields swapped or retyped, gets the byte-identical refusal, so no reinterpretation
+//! under that magic can decode to a value. A snapshot carrying bytes past its envelope is refused
+//! on both live arms rather than decoded with the tail discarded.
+//!
+//! WHAT IT DOES NOT PROVE: the same for the no-magic V5 arm. That arm still decodes, because
+//! `InspirePersistence::commit` still writes V5, so a same-length reinterpretation inside
+//! `InspireParams` behind no magic would leave the V5 assertions below green.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
@@ -23,7 +27,8 @@ use std::sync::Arc;
 
 use raven_railgun_core::{AdapterError, InstanceId};
 use raven_railgun_engine::inspire::{
-    restore_inspire_state_v6, SNAPSHOT_V6_MAGIC, SNAPSHOT_V7_MAGIC,
+    restore_inspire_state_v6, snapshot_inspire_state, snapshot_inspire_state_v7, LogicalLeafStore,
+    SNAPSHOT_V6_MAGIC, SNAPSHOT_V7_MAGIC,
 };
 use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
@@ -52,6 +57,9 @@ const RECOVERED_V5_SNAPSHOT_HEAD: [u8; 100] = [
 /// it faithfully. Drop this and the head is indistinguishable from any truncated buffer.
 const SHIFTED_LENGTH_FINGERPRINT: &str =
     "tight coefficient payload declares 958663751023254534 bytes, cap is 16777216";
+
+/// bincode's own wording when a decode ends before the buffer does.
+const SURPLUS_FINGERPRINT: &str = "bytes remaining after deserialization";
 
 /// The restored instance's own manifest fields, so the boot path validates the identity it
 /// actually shipped with rather than one invented here.
@@ -122,17 +130,107 @@ fn recovered_pre_epoch_bytes_are_refused_by_a_typed_error_naming_the_v5_arm() {
     );
 }
 
-/// The V6 and V7 arms are the reference decoders and stay; behind their own magic the same
-/// recovered bytes must refuse the same way, naming the arm that read them.
+/// Behind the V7 magic the same recovered bytes refuse the same way, naming the arm that read
+/// them.
 #[test]
-fn the_recovered_bytes_behind_each_version_magic_are_refused_naming_that_arm() {
-    for (magic, arm) in [(SNAPSHOT_V6_MAGIC, "v6"), (SNAPSHOT_V7_MAGIC, "v7")] {
-        let mut bytes = magic.to_vec();
-        bytes.extend_from_slice(&RECOVERED_V5_SNAPSHOT_HEAD);
-        let error = restore_inspire_state_v6(&bytes)
-            .err()
-            .unwrap_or_else(|| panic!("{arm} arm must not decode pre-epoch bytes"));
-        assert_names_arm_and_helps_the_operator(&refusal_text(error, arm), arm);
+fn the_recovered_bytes_behind_the_v7_magic_are_refused_naming_that_arm() {
+    let mut bytes = SNAPSHOT_V7_MAGIC.to_vec();
+    bytes.extend_from_slice(&RECOVERED_V5_SNAPSHOT_HEAD);
+    let error =
+        restore_inspire_state_v6(&bytes).expect_err("v7 arm must not decode pre-epoch bytes");
+    assert_names_arm_and_helps_the_operator(&refusal_text(error, "v7"), "v7");
+}
+
+/// Eleven empty collections and a zero height: the store half of a V7 snapshot of an empty
+/// store, each field one `u64`.
+const EMPTY_V7_STORE_BYTES: usize = 12 * 8;
+
+/// A V6 envelope a V6 reader would have accepted: today's state half, then the eleven V6 store
+/// fields empty. V6 lacked only `ppoi_event_metadata`, so this is the empty V7 body one
+/// `u64` short.
+fn well_formed_v6_body() -> Vec<u8> {
+    let state = raven_railgun_testkit::toy_state(TOY_ENTRY_SIZE);
+    let v7 = snapshot_inspire_state_v7(&state, &LogicalLeafStore::new()).expect("v7 serialize");
+    restore_inspire_state_v6(&v7).expect("control: the same state half decodes under V7");
+    let body = v7
+        .strip_prefix(SNAPSHOT_V7_MAGIC.as_slice())
+        .expect("v7 magic");
+    let (state_half, store_half) = body.split_at(body.len() - EMPTY_V7_STORE_BYTES);
+    assert!(
+        store_half.iter().all(|b| *b == 0),
+        "the empty store half must be all zero, or the V6 layout below is not what it claims"
+    );
+    let mut v6 = state_half.to_vec();
+    v6.extend_from_slice(&[0; EMPTY_V7_STORE_BYTES - 8]);
+    v6
+}
+
+fn v6_refusal(body: &[u8]) -> String {
+    let mut bytes = SNAPSHOT_V6_MAGIC.to_vec();
+    bytes.extend_from_slice(body);
+    let error = restore_inspire_state_v6(&bytes)
+        .err()
+        .unwrap_or_else(|| panic!("a {}-byte V6 body decoded to a state", body.len()));
+    refusal_text(error, "the V6 arm")
+}
+
+fn assert_names_the_v6_epoch_and_helps_the_operator(detail: &str) {
+    for needle in [
+        "v6 snapshot refused",
+        "V7 snapshot epoch",
+        "no in-place migration exists",
+        "re-bootstrap",
+    ] {
+        assert!(
+            detail.contains(needle),
+            "{needle:?} missing from {detail:?}"
+        );
+    }
+    // A V6 body can never reopen under this build, so the probe cannot go green and no
+    // matching build exists to ship.
+    for futile in ["RAVEN_PROBE_DATA_DIR", "ship a build"] {
+        assert!(
+            !detail.contains(futile),
+            "{futile:?} sends the operator nowhere: {detail:?}"
+        );
+    }
+}
+
+/// The reinterpretation half, closed by refusal: a decoder cannot tell a swapped or retyped
+/// same-width field from a value, so the V6 arm runs none, and a body read under any retyped
+/// reader is the well-formed body itself. Every body gets one byte-identical answer.
+#[test]
+fn a_v6_body_is_refused_unread_whatever_it_contains() {
+    let well_formed = well_formed_v6_body();
+
+    let mut swapped = well_formed.clone();
+    let (ring_dim, rest) = swapped.split_at_mut(8);
+    let (q, _) = rest.split_at_mut(8);
+    ring_dim.swap_with_slice(q);
+
+    let mut rewritten = well_formed.clone();
+    *rewritten.get_mut(7).expect("ring_dim's top byte") ^= 0x80;
+
+    let mut v7_shaped = well_formed.clone();
+    v7_shaped.extend_from_slice(&[0; 8]);
+
+    let expected = v6_refusal(&well_formed);
+    assert_names_the_v6_epoch_and_helps_the_operator(&expected);
+    for (label, body) in [
+        ("empty", Vec::new()),
+        (
+            "recovered pre-epoch head",
+            RECOVERED_V5_SNAPSHOT_HEAD.to_vec(),
+        ),
+        ("ring_dim and q swapped", swapped),
+        ("ring_dim rewritten at the same width", rewritten),
+        ("a V7-shaped store", v7_shaped),
+    ] {
+        assert_eq!(
+            v6_refusal(&body),
+            expected,
+            "{label}: the body must not reach a decoder"
+        );
     }
 }
 
@@ -155,15 +253,12 @@ fn no_prefix_of_the_recovered_bytes_is_ever_accepted() {
     }
 }
 
-/// The arm production boots through is the cached twin, reached only from `open`. Same bytes,
-/// same refusal, on the path a deploy actually meets.
-#[test]
-fn the_boot_path_refuses_a_data_dir_holding_recovered_pre_epoch_bytes() {
+fn data_dir_holding(snapshot: Vec<u8>) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let layout = StoreLayout::open(dir.path()).expect("layout");
 
     let snapshot_id = SnapshotId(1);
-    Snapshot::build(RECOVERED_V5_SNAPSHOT_HEAD.to_vec(), SNAPSHOT_MAGIC)
+    Snapshot::build(snapshot, SNAPSHOT_MAGIC)
         .save(&layout, snapshot_id)
         .expect("save recovered snapshot");
     Manifest {
@@ -180,7 +275,10 @@ fn the_boot_path_refuses_a_data_dir_holding_recovered_pre_epoch_bytes() {
     }
     .save(&layout)
     .expect("save recovered manifest");
+    dir
+}
 
+fn boot_refusal(dir: &tempfile::TempDir) -> String {
     let error = InspirePersistence::open(
         StoreLayout::open(dir.path()).expect("layout reopen"),
         RECOVERED_SCHEME_TAG,
@@ -189,10 +287,54 @@ fn the_boot_path_refuses_a_data_dir_holding_recovered_pre_epoch_bytes() {
         recovered_encoder(),
     )
     .expect_err("opening a data_dir of pre-epoch bytes must fail closed");
-    let detail = refusal_text(error, "the boot path");
+    refusal_text(error, "the boot path")
+}
+
+/// The arm production boots through is the cached twin, reached only from `open`. Same bytes,
+/// same refusal, on the path a deploy actually meets.
+#[test]
+fn the_boot_path_refuses_a_data_dir_holding_recovered_pre_epoch_bytes() {
+    let dir = data_dir_holding(RECOVERED_V5_SNAPSHOT_HEAD.to_vec());
+    let detail = boot_refusal(&dir);
     assert_names_arm_and_helps_the_operator(&detail, "v5");
     assert!(
         detail.contains(SHIFTED_LENGTH_FINGERPRINT),
         "the boot path must reach the snapshot decode, not stop at manifest identity: {detail}"
     );
+}
+
+#[test]
+fn the_boot_path_refuses_a_well_formed_v6_snapshot_unread() {
+    let body = well_formed_v6_body();
+    let mut snapshot = SNAPSHOT_V6_MAGIC.to_vec();
+    snapshot.extend_from_slice(&body);
+    let dir = data_dir_holding(snapshot);
+    assert_eq!(boot_refusal(&dir), v6_refusal(&body));
+}
+
+/// Surplus past the envelope means the writer and the reader disagree about the shape. Decoding
+/// the prefix and discarding the rest is how a longer layout once read as a shorter one returned
+/// `Ok`, so both live arms refuse it, on the uncached path and on the one a boot takes.
+#[test]
+fn a_snapshot_carrying_surplus_bytes_is_refused_on_both_paths_naming_its_arm() {
+    let state = raven_railgun_testkit::toy_state(TOY_ENTRY_SIZE);
+    let v7 = snapshot_inspire_state_v7(&state, &LogicalLeafStore::new()).expect("v7 serialize");
+    let v5 = snapshot_inspire_state(&state).expect("v5 serialize");
+    for (arm, exact) in [("v7", v7), ("v5", v5)] {
+        restore_inspire_state_v6(&exact)
+            .unwrap_or_else(|e| panic!("control: the exact {arm} bytes must decode: {e}"));
+        let mut surplus = exact;
+        surplus.push(0);
+        let uncached = restore_inspire_state_v6(&surplus)
+            .err()
+            .unwrap_or_else(|| panic!("{arm}: a trailing byte was decoded and discarded"));
+        let boot = boot_refusal(&data_dir_holding(surplus));
+        for (path, detail) in [("uncached", refusal_text(uncached, arm)), ("boot", boot)] {
+            assert!(
+                detail.contains(&format!("{arm} snapshot deserialize"))
+                    && detail.contains(SURPLUS_FINGERPRINT),
+                "{arm} on the {path} path must refuse for the surplus, naming the arm: {detail}"
+            );
+        }
+    }
 }
