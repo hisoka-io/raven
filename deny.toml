@@ -3,20 +3,27 @@
 # No trailing subcommand: naming one restricts the run to it, which left
 # [licenses], [bans] and [sources] enforced by no job.
 #
-# Every `ignore` entry is accepted risk with a named retirement trigger. Adding
-# one is an owner decision, because the alternative - changing a dependency - is
-# itself an owner decision. A NEW advisory must fail this job, never be silenced
-# by widening a rule.
+# Every `ignore` entry is accepted risk with a named retirement trigger, and the
+# reason states the reachability argument, not just the crate. A NEW advisory must
+# fail this job, never be silenced by widening a rule.
 
 [advisories]
 unmaintained = "all"
+# Armed deliberately. Left unset, cargo-deny does not evaluate the unsound class at
+# all, and the output cannot show it: an ignore entry for an unsound advisory then
+# reports `advisory-not-detected`, which reads as "the crate is not in this graph"
+# and actually meant "nothing looked". Measured here: `anyhow 1.0.102` is in
+# adapters/railgun/Cargo.lock and RUSTSEC-2026-0190 covers <=1.0.102, yet the entry
+# reported not-detected until this line existed. Arming it surfaced a real
+# use-after-free advisory carrying no entry at all.
+unsound = "all"
 yanked = "deny"
 ignore = [
   { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 unmaintained, not vulnerable. It encodes the on-disk snapshot and the on-the-wire session, so bincode 2 is a format break needing owner ratification plus a migration. Retire when that migration lands." },
-  { id = "RUSTSEC-2026-0190", reason = "anyhow <=1.0.102 Error::downcast_mut unsoundness, reachable only via wit-bindgen -> getrandom -> tempfile -> proptest, i.e. the test harness, never a runtime path. Retire when the transitive tree resolves anyhow >= 1.0.103." },
   { id = "RUSTSEC-2026-0204", reason = "crossbeam-epoch 0.9.18 invalid pointer dereference in the fmt::Pointer impl for Atomic/Shared. Reached only by formatting an Atomic/Shared with {:p}, which no Raven crate does; the crate arrives transitively under rayon. Retire when the tree resolves crossbeam-epoch >= 0.9.19." },
   { id = "RUSTSEC-2026-0220", reason = "ruint 1.18.0 Uint shift operations report incorrect overflow flags and truncate the shift amount. Arrives under alloy-primitives. Raven's U256 use is fail-fast width conversion, not shifting. Retire when alloy resolves ruint >= 1.18.1; the upgrade is a dependency change and needs owner ratification." },
   { id = "RUSTSEC-2024-0436", reason = "paste unmaintained, no known vulnerability, proc-macro only. Arrives transitively under the alloy and metrics stacks; no direct dependency to drop. Retire when both stacks stop pulling it." },
+  { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 LruCache::pop() is not panic-safe: a panicking Drop on a stored key skips detach(), leaving a dangling pointer the next eviction dereferences (use-after-free / double-free). Raven never calls LruCache - it arrives only under alloy-provider, whose cache keys are block numbers and hashes, whose Drop cannot panic, and the UB additionally needs catch_unwind around that Drop. Patched >= 0.18.2, which alloy-provider 1.8.3 does not admit: `cargo update -p lru` locks 0 packages. Retire when alloy resolves lru >= 0.18.2." },
   { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained, no known vulnerability, proc-macro only, transitive. Retire when the tree stops pulling it." },
 ]
 
