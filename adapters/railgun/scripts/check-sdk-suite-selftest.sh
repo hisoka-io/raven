@@ -136,7 +136,7 @@ const skippedFiles = files.filter((file) => {
   return tests.length > 0 && tests.every((test) => ["pending", "skipped", "todo"].includes(test.status));
 }).length;
 if (files.length !== expected.testFiles || skippedFiles !== expected.skippedFiles ||
-    report.numPassedTests < expected.passed || skipped !== expected.skipped) {
+    report.numPassedTests !== expected.passed || skipped !== expected.skipped) {
   console.error(`unmutated scratch counts: passed=${report.numPassedTests} skipped=${skipped} files=${files.length} skipped_files=${skippedFiles}`);
   process.exit(1);
 }
@@ -254,7 +254,7 @@ if (failures.length !== 2 || report.numFailedTests !== 2 || failureTitles.size !
     [...wantedFailures].some((title) => !failureTitles.has(title)) ||
     fanout.length !== 1 || fanout[0].status !== "passed" ||
     files.length !== expected.testFiles || skipped !== expected.skipped ||
-    report.numPassedTests + report.numFailedTests < expected.passed) {
+    report.numPassedTests + report.numFailedTests !== expected.passed) {
   console.error(`schema mutation mismatch: failures=${failures.map((test) => test.title).join(" | ")} fanout=${fanout[0]?.status} passed=${report.numPassedTests} skipped=${skipped} files=${files.length}`);
   process.exit(1);
 }
