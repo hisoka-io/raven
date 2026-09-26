@@ -97,7 +97,36 @@ A test derived its data_dir relative to the crate instead of a temp dir. It is n
 tracked nor ignored, so \`git add -A\` would commit it to this public repo forever. \
 Point the test at a temp dir and delete this."
   fi
-done < <(git ls-files --others --exclude-standard -- 'adapters/**/manifest.json' 'crates/**/manifest.json' 'examples/**/manifest.json' 2>/dev/null || true)
+# One pathspec, whole repo. The first version named `adapters/** crates/** examples/**`, and
+# git's `**` requires an intervening component -- so it missed the repo ROOT, which is where a
+# binary run by hand leaves its data dir, and missed `tools/`, `benches/`, `run/` and `scripts/`
+# entirely, two of which are cargo workspaces here. `--exclude-standard` already drops anything
+# ignored, so widening the net costs nothing.
+done < <(git ls-files --others --exclude-standard -- '*manifest.json' 2>/dev/null || true)
+
+# 6. Truncation damage. A tracked file that is EMPTY in the working tree but non-empty at HEAD
+# is not a plausible edit; it is an unclean shutdown that never flushed.
+#
+# This exists because it happened and nothing caught it. A shutdown zero-filled
+# `sdk/src/raven-poi-node-interface.ts` -- 2,066 lines, a day of uncommitted work -- and TWO
+# separate corruption scans reported clean, for two different reasons. Both scanned for NUL BYTES,
+# and a file truncated to length zero contains none. One of them also took its file list from
+# `git ls-files --others --exclude-standard`, which omits ignored paths, so the entire private
+# corpus was outside it. The damage surfaced from an unrelated agent mentioning a file size.
+#
+# Compared against HEAD rather than against a size threshold, because an intentionally empty
+# tracked file is legitimate and stays legitimate -- only a file that HAD content and now has none
+# is reported.
+while IFS= read -r f; do
+  [[ -n "$f" ]] || continue
+  [[ -f "$f" ]] || continue
+  [[ -s "$f" ]] && continue
+  head_size=$(git cat-file -s "HEAD:$f" 2>/dev/null || echo 0)
+  [[ "$head_size" -eq 0 ]] && continue
+  fail "tracked file truncated to zero: ${f} (${head_size} bytes at HEAD, 0 in the working tree). \
+An unclean shutdown zero-fills like this. Recover from HEAD plus whatever diff of your \
+uncommitted work survives -- do NOT assume the working tree was the empty one."
+done < <(git ls-files 2>/dev/null || true)
 
 if [[ $failed -ne 0 ]]; then
   echo "scripts/check-repo-hygiene.sh: failed."

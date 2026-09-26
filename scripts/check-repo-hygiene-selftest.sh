@@ -130,6 +130,24 @@ check 1 "$(run_gate)" "an untracked runtime data directory in a source tree is r
 rm -rf "$probe_dir"
 check 0 "$(run_gate)" "removing the data directory clears it"
 
+# The reach, not the fingerprint. The three-tree pathspec this replaced matched none of these:
+# the repo root is where a binary run by hand leaves its data dir, and `tools/` and `benches/`
+# are cargo workspaces whose tests can do exactly what the measured instance did.
+for where in . tools/probe-crate benches/probe-crate; do
+  mkdir -p "$work/$where/wal"
+  printf '{}\n' > "$work/$where/manifest.json"
+  check 1 "$(run_gate)" "a runtime data directory at ${where} is refused"
+  rm -rf "$work/$where/wal" "$work/$where/manifest.json"
+done
+# `run/` is the deliberate exception and the control for the whole widening: it is gitignored,
+# so `git add -A` cannot commit it, which is the harm this gate exists to prevent. The scan is
+# `--exclude-standard` for exactly that reason, and this case proves the widening did not lose it.
+mkdir -p "$work/run/wal"
+printf '{}\n' > "$work/run/manifest.json"
+check 0 "$(run_gate)" "(control) an IGNORED runtime data directory under run/ is not refused"
+rm -rf "$work/run"
+check 0 "$(run_gate)" "removing them all clears it"
+
 if [[ "$failed" -ne 0 ]]; then
   echo "check-repo-hygiene selftest: FAILED" >&2
   exit 1
