@@ -30,7 +30,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 CI=.github/workflows/ci.yml
-EXPECTED=.github/expected-lane-counts.tsv
+EXPECTED="${LANE_COUNTS_EXPECTED:-.github/expected-lane-counts.tsv}"
 MANIFEST=adapters/railgun/Cargo.toml
 MODE="${1:-check}"
 # Fault-injection seam, used only by scripts/assert-lane-counts-selftest.sh: it points this at a
@@ -228,6 +228,11 @@ if [ "$MODE" = "--update" ]; then
   exit 0
 fi
 
+# EXACT, not a floor. A floor lets a lane grow silently, and every unrecorded addition becomes slack a
+# later deletion can hide inside: a pin of 34 against a true 40 lets six tests vanish without a word,
+# which is not hypothetical -- it was measured here. So growth must be recorded in the same change
+# that adds the tests, exactly as a deletion must. Every lane's count is printed either way, so a
+# clean run still says what it counted.
 while IFS=$'\t' read -r name count; do
   want=$(/usr/bin/grep -P "^\Q${name}\E\t" "$EXPECTED" | cut -f2)
   if [ -z "$want" ]; then
@@ -240,6 +245,13 @@ while IFS=$'\t' read -r name count; do
     echo "LANE ${name}: selects ${count} tests, expected ${want} - it SHRANK by $((want - count))." >&2
     echo "  If tests were deliberately deleted, say so by updating ${EXPECTED} in the same change." >&2
     fail=1
+  elif [ "$count" -gt "$want" ]; then
+    echo "LANE ${name}: selects ${count} tests, expected ${want} - it GREW by $((count - want))." >&2
+    echo "  Record the new count in ${EXPECTED} in the same change: unrecorded growth is slack a" >&2
+    echo "  later deletion hides inside." >&2
+    fail=1
+  else
+    echo "  lane ${name}: ${count} (pinned ${want})"
   fi
 done < "$tmp"
 

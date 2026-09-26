@@ -1,9 +1,10 @@
 # Expected test count per filtered CI lane. Regenerate: scripts/assert-lane-counts.sh --update
-# A lane may GROW silently; a DROP is a hard failure and must be explained by editing
-# this file in the same change that removes the tests.
+# EXACT: a lane that grows OR shrinks fails until this file is updated in the same change.
+# A floor let growth accumulate as slack a later deletion could hide inside.
 durability-and-closure/crash-safety	14
 durability-and-closure/wal-and-snapshot-chaos	3
-durability-and-closure/cli-ignored	70
+durability-and-closure/cli-ignored	74
+durability-and-closure/shipped-config-spawn	1
 # Higher than a `binary(...)`-only count would suggest: this lane includes the setup-cache
 # consumption oracles, and its filter carries a bare `test(insert_rejects_overflow_past_capacity)`
 # that resolves to an in-src lib test. The original anchor counted only `pkg::binary test` rows and
@@ -20,4 +21,17 @@ durability-and-closure/closure	8
 # indices). The count also moved because this gate's row anchor was corrected the same day: it
 # had missed nextest's lib-target rows (`pkg imt::tests::x`, no `::` before the space) and then,
 # briefly, its bench rows (`pkg::bench/name x`, a slash in the binary segment).
-production-cell-closure/inline	23
+# 2026-09-22: 23 -> 34 -> 40. The lane gained the `raven-railgun-http` package and a
+# `binary(poi_shim_coverage)` term, for one test that seeds five sealed 65,536-row blocks and so
+# cannot run per push. The other tests in that binary come along and are cheap. The pin is
+# raised rather than left low because a floor below the truth cannot detect a drop (the ratchet
+# was a floor then; it is exact now, so growth fails too). 34 was exact when set (that binary had
+# 11 tests); the index-channel work took it to 17, so the lane now selects 40. Counted with the
+# gate's own row regex, not estimated. Bump this in the SAME change that adds tests to any binary
+# the filter names.
+# 2026-09-24: +1, a CORS test proving a cross-origin reader sees every index-cursor header.
+# 2026-09-25: +4. poi_shim_coverage proves a short or empty frontier is answered only while upstream's
+# own recent row count vouches for it (a cold sync part-way, and an empty block over sealed ones), that
+# a block declared ahead of the list is answered over while a row past an empty block is a hole, and
+# that each list is answered only on its own upstream count.
+production-cell-closure/inline	45

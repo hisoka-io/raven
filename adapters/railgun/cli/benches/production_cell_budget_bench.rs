@@ -1,21 +1,23 @@
 //! SLO GATE, not a benchmark: the production-cell latency budget.
 //!
 //! Both assertions here compare a wall clock against a fixed ceiling, so they
-//! red on runner speed rather than on code — which is exactly why they were
+//! red on runner speed rather than on code -- which is exactly why they were
 //! split out of `tests/production_cell.rs`. That test's byte-identity
 //! assertions now run per commit; these deadlines run where a machine-speed
 //! assertion can survive.
 //!
 //! ROUTING, READ BEFORE MOVING THIS FILE: an SLO in `benches/` is only a gate
-//! if some lane actually selects it. The railgun test matrix builds bench
-//! targets (it passes `--all-targets`), but the cli lane's filter is a union of
-//! named `binary(...)` terms and does not name this one — deliberately, since
-//! putting a deadline back in a per-push lane recreates the flake the split
-//! removed. It needs the nightly production-cell profile, whose 300 s
-//! slow-timeout is the only budget a machine-speed assertion can survive.
-//! A named `binary(...)` filter is NOT the only route in, which this file
-//! claimed until 2026-09-22: the nightly lane selects it via `--run-ignored all`
-//! without naming it, so it DOES run and the ceilings must fit that runner.
+//! if some lane selects it, and exactly one does. The nightly production-cell
+//! job passes `--all-targets`, `--run-ignored all` and an `-E` naming
+//! `binary(production_cell_budget_bench)`, so it builds and runs this test under
+//! the 300 s slow-timeout, the only budget a machine-speed assertion survives;
+//! the ceilings must fit that runner. The per-push `railgun-tests` cli shard
+//! passes `--all-targets` with no `--run-ignored`, so it builds this target and
+//! skips the test as ignored. The per-push `cli-ignored` lane passes
+//! `--run-ignored all` without `--all-targets`, so cargo never builds this
+//! target (a bench defaults to `test = false`), and its `-E` does not name it.
+//! Keep it that way: a deadline in a per-push lane recreates the flake the split
+//! removed. Check with `cargo nextest list` under each lane's own arguments.
 //!
 //! Measured figures behind the ceilings, kept so a reader can tell a real
 //! regression from runner variance. Single query: 71.9 ms on a 16-core dev box,
@@ -26,10 +28,16 @@
 //!
 //! The ceilings are sized for the SLOWEST host they run on, not the fastest,
 //! because a ceiling the nightly lane cannot meet is a red every night and a
-//! gate nobody reads. At 1 s and 12 s they catch a >10x blow-up — a lost index,
-//! an accidental full scan, a re-setup per request — and nothing subtler. For a
-//! real latency number, measure on a known box against the floors above; these
-//! assertions are not that measurement and cannot be.
+//! gate nobody reads. State the margin against THAT host, not the dev box: at
+//! 1 s and 12 s over the shared runner's 335 ms and ~5.6 s, the headroom is
+//! 3.0x and 2.1x. (Against the dev-box floors it is 14x and 10x, which is where
+//! an earlier "catches a >10x blow-up" came from -- a true sentence about the
+//! machine these assertions do not run on.) So a red here is 3x on a single
+//! query or 2x on a batch, and on the batch that is the same order as the
+//! runner variance that produced the 335 ms sample. Read a batch red as
+//! "measure this", not as "a regression landed". For a real latency number,
+//! measure on a known box against the floors above; these assertions are not
+//! that measurement and cannot be.
 
 #![allow(
     clippy::expect_used,
@@ -50,7 +58,7 @@ use support::{ProductionCell, BEARER_TOKEN, CLIENT_ID};
 #[ignore = "SLO gate (not a bench): asserts a 1 s single-query and 12 s batch ceiling at the \
             65,536 x 512 B cell, sized for the slowest host it runs on. A wall-clock ceiling reds \
             on runner speed, so it belongs in the nightly closure lane, never per push. Trigger: a \
-            >10x latency blow-up in the HTTP query or batch path at production parameters."]
+            ~3x single-query or ~2x batch latency blow-up at production parameters on that runner."]
 async fn production_cell_latency_budget_slo() {
     let cell = ProductionCell::spawn().await;
     eprintln!("production_cell: setup elapsed = {:?}", cell.setup_elapsed);

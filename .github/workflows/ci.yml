@@ -12,6 +12,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Replaces .cargo/config.toml's rustflags, its lld flag included. That costs nothing from 1.90,
+  # where rustc links x86_64-linux with its bundled rust-lld by default; a pre-1.90 job names lld
+  # itself. Never add the flag here: a wasm32 link rejects -fuse-ld=lld.
   RUSTFLAGS: "-D warnings"
   RUSTDOCFLAGS: "-D warnings"
 
@@ -41,23 +44,36 @@ jobs:
         run: |
           cargo check --manifest-path crates/inspire/Cargo.toml \
             --features mod-switch-response --all-targets
-      # `prefix-index-channel` is default-off and no job ever RAN it. It IS compiled --
-      # `msrv-1-91` checks and clippies `--workspace --all-features --all-targets` with
-      # raven-railgun-http in MSRV_PACKAGES -- but compiling a gated test is not running
-      # it, and the `railgun-tests` lanes pass no --features at all.
-      # TESTED, not check-only, because a real test already exists for it and was simply
-      # never built:
-      # `http/tests/poi_shim_routes.rs` six_byte_prefix_channel_is_binary_and_index_ordered.
-      # Measured 2026-09-18: without the feature that filter selects 0 tests.
-      # Scoped to --lib and the owning test binary rather than --all-targets on purpose:
-      # `cargo test -p raven-railgun-http --all-targets` is independently FLAKY on
-      # metrics_surface, and importing an unrelated flake into a new lane would
-      # make this gate untrustworthy from its first run.
-      - name: cargo test (raven-railgun-http, prefix-index-channel)
+      # ONE channel off and the other on, which is the only build where the route-dropping test
+      # compiles at all: it is `cfg(all(not(json-index-channel), prefix-index-channel))`.
+      #
+      # The first version of this lane passed a bare `--no-default-features`, turning BOTH off, so
+      # the test it exists to run was cfg'd out and the lane went green having selected 10 tests
+      # and none of them. Measured: `--no-default-features` lists 10 with zero matching
+      # `drop|json|prefix`; adding the feature lists 13 with two. That is the same green-vacuous
+      # shape as the `simd_packing_offline_kat` step deleted in this same change, committed one
+      # commit later into the same file -- so the check below is now what proves the lane is real.
+      #
+      # Scoped away from --all-targets on purpose: `cargo test -p raven-railgun-http
+      # --all-targets` is independently FLAKY on metrics_surface, and importing an unrelated
+      # flake would make this gate untrustworthy from its first run.
+      - name: cargo test (raven-railgun-http, json channel dropped)
         run: |
+          set -euo pipefail
+          listed=$(cargo test --manifest-path adapters/railgun/Cargo.toml \
+            -p raven-railgun-http --no-default-features --features prefix-index-channel \
+            --test poi_shim_routes -- --list)
+          # A lane that selects the test is the claim; assert it rather than trusting the filter.
+          grep -Fq 'dropping_the_json_index_channel_drops_its_route: test' <<< "$listed"
           cargo test --manifest-path adapters/railgun/Cargo.toml \
-            -p raven-railgun-http --features prefix-index-channel \
-            --lib --test poi_shim_routes
+            -p raven-railgun-http --no-default-features --features prefix-index-channel \
+            --lib --test poi_shim_routes --test poi_shim_coverage
+      # Both channels off is a separate property -- the crate must still COMPILE with neither
+      # `#[cfg]` arm -- and it needs no test to be worth checking.
+      - name: cargo check (raven-railgun-http, no index channels)
+        run: |
+          cargo check --manifest-path adapters/railgun/Cargo.toml \
+            -p raven-railgun-http --no-default-features --all-targets
       - name: cargo test
         run: cargo test --workspace --all-targets
 
@@ -128,6 +144,9 @@ jobs:
         run: cargo check --manifest-path adapters/railgun/client-wasm/Cargo.toml --target wasm32-unknown-unknown
       - name: cargo clippy (wasm32, raven-inspire-client-wasm)
         run: cargo clippy --manifest-path adapters/railgun/client-wasm/Cargo.toml --all-targets --target wasm32-unknown-unknown -- -D warnings
+      - name: wasm-pack test --node (raven-inspire-client-wasm)
+        run: |
+          wasm-pack test --node adapters/railgun/client-wasm --test wasm_path_index_refusals
 
   hygiene:
     name: docs/comment hygiene (no internal-label / no-commit-path leaks)
@@ -484,6 +503,17 @@ jobs:
             cargo_flags: ""
             nextest_profile: ci
             filter: "binary(auto_spawn_shutdown) + binary(bootstrap_from_subsquid) + binary(multi_list_ppoi_dynamic) + binary(production_cell) + binary(serve_production_config_file) + binary(six_instance_integration) + binary(smart_policy_deferred) + binary(smart_policy_lifecycle)"
+          # The shipped multi-instance config, booted by the production binary in a child process.
+          # Not in cli-ignored: that lane already runs two eleven-instance boots, and a third
+          # co-scheduled with them took ~10 GB resident on a 16-core box.
+          - name: shipped-config-spawn
+            packages: "-p raven-railgun-cli"
+            cargo_flags: ""
+            # production-cell, not ci: the boot is close to serial (105-123 s on a 16-core
+            # box, 111 s on four logical CPUs, 114 s on two), so per-core speed sets it, and
+            # this runner's is unmeasured against ci's 120 s x 3 cap
+            nextest_profile: production-cell
+            filter: "binary(shipped_config_spawn)"
           - name: engine-ignored
             packages: "-p raven-railgun-engine"
             cargo_flags: ""
@@ -561,8 +591,9 @@ jobs:
     # they red on machine speed rather than on code and cannot live in a per-push
     # lane. The production-cell nextest profile's 300 s slow-timeout is the only
     # budget they survive. Today: production_cell_budget_bench (1 s single-query
-    # and 12 s batch ceilings, sized for THIS runner rather than a dev box, so
-    # they catch a >10x blow-up and nothing subtler) and populate_bench
+    # and 12 s batch ceilings, sized for THIS runner rather than a dev box: 3.0x
+    # and 2.1x over its measured 335 ms and ~5.6 s, so a red is a ~3x or ~2x
+    # blow-up, and a batch red is within reach of runner variance) and populate_bench
     # (30 s for 1k events). A timing harness with NO ceiling stays out of every lane
     # and sits in scripts/ignore-coverage-allowlist.txt instead — a measurement is
     # not a gate, and enrolling one buys nightly minutes and no signal.
@@ -607,16 +638,25 @@ jobs:
           # --no-fail-fast is what keeps the two wall-clock ceilings from deciding the lane:
           # they share it with the only production-parameter correctness test, and on 11 of 11
           # nights a ceiling breach cancelled that test instead of failing beside it.
+          #
+          # `raven-railgun-http` is here for one test: the six-block shim coverage round trip, which
+          # seeds five sealed 65,536-row blocks at ~165 s of Poseidon inserts and so cannot live in a
+          # per-push lane, and no other lane runs it. Budget checked, and then checked again because the first arithmetic
+          # was wrong: this lane ran 23 tests in 158 s against `timeout-minutes: 60` = 3600 s, so
+          # ~165 s is **4.6%** of the cap, not the 0.5% first written here, and 158 + 165 = ~9%
+          # before checkout, toolchain, `apt-get install lld` and building a package this lane did
+          # not previously build. Still comfortable, and comfortable for a stated reason.
           cargo nextest run \
             --manifest-path adapters/railgun/Cargo.toml \
             -p raven-railgun-engine -p raven-railgun-cli -p raven-railgun-mock-ppoi \
+            -p raven-railgun-http \
             --all-targets \
             --no-tests=fail \
             --no-fail-fast \
             --cargo-profile ci-test \
             --profile production-cell \
             --run-ignored all \
-            -E 'binary(db1_note_record_production_cell) + binary(db2_block_production_cell) + binary(cell_width_runtime_gate) + binary(per_leaf_path_production_cell) + binary(per_node_production_cell) + binary(production_cell_budget_bench) + binary(populate_bench) + binary(recovery_latency_bench)'
+            -E 'binary(db1_note_record_production_cell) + binary(db2_block_production_cell) + binary(cell_width_runtime_gate) + binary(per_leaf_path_production_cell) + binary(per_node_production_cell) + binary(production_cell_budget_bench) + binary(populate_bench) + binary(recovery_latency_bench) + binary(poi_shim_coverage)'
       - name: sccache stats
         run: sccache --show-stats
         if: always()
@@ -723,20 +763,36 @@ jobs:
         # strictness: the SIMD halves loud-skip here by design and are gated in their own step.
         # Five timing harnesses (10 tests) live under benches/ and run only by hand;
         # the all-target clippy step above still compiles them on every push.
-        run: cargo test --manifest-path crates/inspire/Cargo.toml --release
+        # The three suite steps keep their output for the packing-results artifact below, and
+        # run --no-fail-fast so a red run still records every binary's verdicts.
+        run: |
+          set -euo pipefail
+          mkdir -p target/inspire-results
+          cargo test --manifest-path crates/inspire/Cargo.toml --release --no-fail-fast \
+            2>&1 | tee target/inspire-results/default.txt
       - name: cargo test (simd-packing-offline differential)
         # The only lane where the packing differential is a differential rather than the
-        # scalar path compared against itself. Strictness is armed only when the runner can
-        # actually execute the kernels, so both guards are satisfiable: on a capable runner a
-        # skip is a failure, on an incapable one it is a named loud skip.
+        # scalar path compared against itself -- without this feature the dispatch under test
+        # IS the scalar reference, which is why simd_packing_offline_kat was green-vacuous on
+        # every run it ever made. Strictness is armed only when the runner can actually
+        # execute the kernels, so both guards are satisfiable: on a capable runner a skip is a
+        # failure, on an incapable one it is a named loud skip. The whole suite runs here, so
+        # the KAT is covered; a second step naming just the KAT ran it again WITHOUT the
+        # strictness, which is the weaker of the two answers and the one a reader would trust.
         env:
           RAVEN_REQUIRE_AVX512: ${{ env.RAVEN_HAS_AVX512 }}
         run: |
-          cargo test --manifest-path crates/inspire/Cargo.toml --release \
-            --features simd-packing-offline
+          set -euo pipefail
+          mkdir -p target/inspire-results
+          cargo test --manifest-path crates/inspire/Cargo.toml --release --no-fail-fast \
+            --features simd-packing-offline 2>&1 | tee target/inspire-results/simd-packing-offline.txt
       - name: cargo test (parallel feature)
         # re-runs the byte-identity KAT under the rayon path so it cannot regress undetected
-        run: cargo test --manifest-path crates/inspire/Cargo.toml --release --features parallel
+        run: |
+          set -euo pipefail
+          mkdir -p target/inspire-results
+          cargo test --manifest-path crates/inspire/Cargo.toml --release --no-fail-fast \
+            --features parallel 2>&1 | tee target/inspire-results/parallel.txt
       - name: cargo test (mod-switch response and column-space contract)
         run: |
           test_name=tree_responder_round_trips_through_the_existing_rims_byte_two_decoder
@@ -770,11 +826,6 @@ jobs:
           cargo test --manifest-path crates/inspire/Cargo.toml --release \
             --features mod-switch-response --lib \
             pir::mod_switch::tests
-      - name: cargo test (simd-packing-offline feature)
-        # Without this feature the packing dispatch under test IS the scalar reference, so the
-        # differential compares a loop with itself. Nothing in CI built it until now, which is
-        # why simd_packing_offline_kat was green-vacuous on every run it ever made.
-        run: cargo test --manifest-path crates/inspire/Cargo.toml --release --features simd-packing-offline --test simd_packing_offline_kat
       # The instrument's two synthetic controls (planted leak detected, null not rejected) run in
       # the default step above. Its SUBJECT - the actual shipping query transcripts - ran in no
       # lane at all, so the privacy claim itself was never exercised. Measured 0.99 s in release
@@ -796,6 +847,27 @@ jobs:
         with:
           name: query-indistinguishability-${{ github.sha }}
           path: target/oracle/query-indistinguishability.txt
+          if-no-files-found: error
+      # The packing round trip at production scale, d=2048 InspiRING over 2^20 x 256 B, so a fault
+      # that shows only at a full-size layout has a lane. The count check stops a rename from
+      # turning it into a run of zero tests.
+      - name: cargo test (d=2048 InspiRING round trip at 2^20 x 256 B)
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/inspire-results
+          cargo test --manifest-path crates/inspire/Cargo.toml --release --test raven_local_patches \
+            -- --ignored --exact commit_d_preset_default_q_passes_smoke_at_2_20_x_256b \
+            2>&1 | tee target/inspire-results/production-scale-round-trip.txt
+          /usr/bin/grep -Eq '^test result: ok\. 1 passed; 0 failed' target/inspire-results/production-scale-round-trip.txt
+      # The packing round trips and KATs run inside the suite steps above, so their verdicts are
+      # kept the same way: a file that can be diffed against an earlier run.
+      - name: upload packing round-trip results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: inspire-packing-${{ github.sha }}
+          path: target/inspire-results/
           if-no-files-found: error
       - name: cargo check (wasm32, client-clean / no rayon)
         run: cargo check --manifest-path crates/inspire/Cargo.toml --target wasm32-unknown-unknown --no-default-features
@@ -894,6 +966,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTUP_TOOLCHAIN: "1.89"
+      # 1.89 predates rust-lld as rustc's x86_64-linux default, so this job names lld itself
+      RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=lld"
       MSRV_MANIFESTS: "Cargo.toml|adapters/howl/Cargo.toml|adapters/railgun/client-wasm/Cargo.toml|benches/b1-bench/Cargo.toml|benches/b2-bench/Cargo.toml|crates/inspire/Cargo.toml|crates/isimplepir/Cargo.toml|tools/bench-compare/Cargo.toml"
       MSRV_PACKAGES: "bench-compare,howl-poseidon2,howl-record,raven-b1-bench,raven-b2-bench,raven-bench,raven-client,raven-core,raven-crypto-primitives,raven-indexer,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-isimplepir,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage"
       MSRV_EXTRA_PACKAGES: "raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror"
@@ -909,6 +983,8 @@ jobs:
       # the job does not run and `cargo clippy` died while `cargo check` passed.
       - name: install clippy for the toolchain this job actually selects
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --component clippy
+      - name: install lld linker
+        run: sudo apt-get update && sudo apt-get install -y lld
       - uses: Swatinem/rust-cache@v2
       - name: verify, build, and lint the exact 1.89 package set
         run: |
@@ -1113,18 +1189,33 @@ jobs:
           cache-dependency-path: adapters/railgun/sdk/pnpm-lock.yaml
       - name: install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      # Also records each wasm's sha256 in the package that ships it and gives the bundler target
+      # its own package name; the size gate then runs on exactly what was built.
       - name: build wasm-pack pkg-node + pkg-bundler + size gate
-        run: adapters/railgun/scripts/check-wasm-bundle-size.sh
+        run: adapters/railgun/client-wasm/scripts/wasm-build.sh
       - name: wasm bundle-size red-proof
         run: adapters/railgun/scripts/check-wasm-bundle-size-selftest.sh
       - name: pnpm install
         run: pnpm install --frozen-lockfile
         working-directory: adapters/railgun/sdk
+      # Before anything runs the wasm: a copy the SDK links that the build did not emit fails here
+      # by name, keyed on sha256, instead of passing or failing the suite on bytes nobody built.
+      # It also packs both targets and checks each tarball carries the built wasm and its record.
+      - name: wasm content identity
+        env:
+          WASM_IDENTITY_PACK_DIR: ${{ runner.temp }}/wasm-pack-candidate
+        run: adapters/railgun/scripts/check-wasm-identity.sh
+      - name: wasm content identity red-proof
+        run: adapters/railgun/scripts/check-wasm-identity-selftest.sh
       - name: pnpm typecheck
         # must run from the SDK directory: a repo-root `tsc` resolves nothing
         # and exits 0, which is why 15 type errors survived here unnoticed
         run: pnpm typecheck
         working-directory: adapters/railgun/sdk
+      - name: sdk engine contract red-proof
+        # only the typecheck can fail upstream_class_contract.test.ts; this proves it does, for a
+        # wrong return shape and for an engine declaration that degraded to any
+        run: adapters/railgun/scripts/check-sdk-engine-contract-selftest.sh
       # These read SOURCE and need no suite run, so they go first: a Rust/TS wire constant
       # drift then fails by NAME (`schema envelope version: TS=6 Rust=7`) instead of as an
       # opaque two-byte diff inside a fixture, which is how the v6/v7 bump presented.
@@ -1145,7 +1236,7 @@ jobs:
       #   - suite red-proof: deletes the schema-envelope guard in a scratch COPY and
       #     requires the suite to redden for the RIGHT reason.
       #   - test count: a silently-vanishing test (a bad glob, a dropped file) is a
-      #     green suite otherwise. Skips are pinned exactly; the live tier is 21.
+      #     green suite otherwise. Skips are pinned exactly; see tests/EXPECTED_COUNTS.json.
       #   - pack gate: the suite imports ../src directly and never resolves the package by
       #     name, so an entry point pointing at TypeScript, a missing dist/{cjs,esm} module
       #     marker, or a pack with no files allowlist is invisible to it. Offline: the one
@@ -1153,11 +1244,53 @@ jobs:
       #     `pnpm install`.
       - name: sdk test-count pin
         run: adapters/railgun/scripts/check-sdk-test-count.sh
+      - name: sdk test-count red-proof
+        run: adapters/railgun/scripts/check-sdk-test-count-selftest.sh
       - name: sdk suite red-proof
         run: adapters/railgun/scripts/check-sdk-suite-selftest.sh
       - name: sdk pack gate
         if: ${{ !cancelled() }}
+        env:
+          SDK_PACK_SCRATCH: ${{ runner.temp }}/sdk-pack
         run: adapters/railgun/scripts/check-sdk-pack.sh
       - name: sdk pack red-proof
         if: ${{ !cancelled() }}
         run: adapters/railgun/scripts/check-sdk-pack-selftest.sh
+      # The publish candidate is the exact tarball the pack gate installed and inspected, emitted
+      # only when every step above passed. Publishing it stays manual: this job holds no registry
+      # credential. The gate's scratch also holds the dependency it packed for its offline
+      # installs, so the tarball is chosen by the name@version inside it, read from package.json.
+      - name: stage the sdk pack candidate
+        run: |
+          set -euo pipefail
+          want=$(node -p 'const m = require("./adapters/railgun/sdk/package.json"); `${m.name}@${m.version}`')
+          out="$RUNNER_TEMP/sdk-pack-candidate"
+          mkdir -p "$out"
+          for tgz in "$RUNNER_TEMP"/sdk-pack/tar/*.tgz; do
+            got=$(tar -xOzf "$tgz" package/package.json \
+              | node -p 'const m = JSON.parse(require("node:fs").readFileSync(0, "utf8")); `${m.name}@${m.version}`')
+            if [[ "$got" == "$want" ]]; then cp "$tgz" "$out/"; fi
+          done
+          count=$(find "$out" -name '*.tgz' | wc -l)
+          [[ "$count" -eq 1 ]] || { echo "expected one packed tarball for $want, found $count" >&2; exit 1; }
+          cd "$out"
+          sha256sum -- *.tgz > SHA256SUMS
+          # The form a registry reports as dist.integrity, so a published copy can be matched to this one.
+          node -e 'const c = require("node:crypto"), f = require("node:fs");
+            for (const p of process.argv.slice(1)) console.log(`sha512-${c.createHash("sha512").update(f.readFileSync(p)).digest("base64")}  ${p}`)' \
+            -- *.tgz > INTEGRITY
+          cat SHA256SUMS INTEGRITY
+      - name: upload the sdk pack candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-pack-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/sdk-pack-candidate/
+          if-no-files-found: error
+      # The two wasm packages exactly as the identity step packed and checked them, each recording
+      # the build's wasm sha256, so a copy released later can be matched to this build.
+      - name: upload the wasm pack candidates
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-pack-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/wasm-pack-candidate/
+          if-no-files-found: error

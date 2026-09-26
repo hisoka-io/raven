@@ -165,7 +165,11 @@ stub_case lists-nothing 1 "BUILD FAILED" \
 stub_case lists-one 1 "selects ZERO tests" \
   "a lane below its pinned count is reported as a SHRINK, not as an empty filter" \
   "it SHRANK by"
-stub_case lists-coloured 0 "selects ZERO tests" \
+# The gate is exact, so this stub's 200 rows pass only against pins of 200; what is under test is
+# that coloured rows are counted at all.
+awk -F'\t' 'BEGIN{OFS="\t"} /^#/ || NF<2 {print; next} {print $1, 200}' .github/expected-lane-counts.tsv \
+  > "$STUBS/expected-200.tsv"
+LANE_COUNTS_EXPECTED="$STUBS/expected-200.tsv" stub_case lists-coloured 0 "selects ZERO tests" \
   "coloured rows end to end: the gate passes instead of accusing every filter"
 
 bash "$GATE" --check-name-fixture \
@@ -191,6 +195,16 @@ echo "  ok: the unmutated tree -> exit 0"
 cur=$(/usr/bin/grep "^${LANE}	" "$EXPECTED" | cut -f2)
 awk -F'\t' -v l="$LANE" -v n="$((cur + 1000))" 'BEGIN{OFS="\t"} $1==l{$2=n} {print}' "$BE" > "$EXPECTED"
 expect 1 "a lane selecting fewer tests than recorded (the shrink this gate exists for)"
+
+# 1b. ONE test deleted from a lane whose pin had slack. Under the old floor rule this passed: lower
+#     the pin by one (the lane now looks one test richer than recorded, i.e. unrecorded growth) and
+#     the gate must refuse, because that slack is exactly what a later single deletion hides in.
+awk -F'\t' -v l="$LANE" -v n="$((cur - 1))" 'BEGIN{OFS="\t"} $1==l{$2=n} {print}' "$BE" > "$EXPECTED"
+expect 1 "a lane that grew by one without recording it (slack a deletion would hide in)"
+
+# 1c. And a single deletion at an exact pin: raise the pin by exactly one.
+awk -F'\t' -v l="$LANE" -v n="$((cur + 1))" 'BEGIN{OFS="\t"} $1==l{$2=n} {print}' "$BE" > "$EXPECTED"
+expect 1 "a lane one test short of its pin (a single deletion)"
 
 # 2. A lane with NO recorded expectation - a new lane added to ci.yml and never seeded, which
 #    would otherwise pass unexamined.
