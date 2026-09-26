@@ -23,7 +23,9 @@ for a in "$@"; do
     --msrv) MSRV=1 ;;
     --with-tests) WITH_TESTS=1 ;;
     --fast) FAST=1 ;;
-    -h|--help) sed -n '2,15p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    # 2,16 -- the range stopped at 15 and silently hid --fast, the one flag a hurried
+    # contributor most wants. Extend it whenever a usage line is added.
+    -h|--help) sed -n '2,16p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "preflight: unknown flag $a" >&2; exit 2 ;;
   esac
 done
@@ -100,11 +102,13 @@ if [ -d adapters/railgun/sdk ]; then
   echo "== SDK gates (a cargo run cannot see any of these) =="
   run "rust/ts constant parity"  bash adapters/railgun/scripts/check-sdk-constant-parity.sh
   run "export coverage"          bash adapters/railgun/scripts/check-sdk-export-coverage.sh
-  run "test-count contract"      bash adapters/railgun/scripts/check-sdk-test-count.sh
   if [ "$FAST" = 0 ]; then
     if [ -d adapters/railgun/sdk/node_modules ]; then
       run "typecheck"  bash -c 'cd adapters/railgun/sdk && npx tsc --noEmit -p tsconfig.json'
       run "suite"      bash -c 'cd adapters/railgun/sdk && npm test'
+      # Below the suite because it RUNS the suite: leaving it above made --fast take 58s
+      # while claiming "seconds", so nobody used the flag for what it is for.
+      run "test-count contract"  bash adapters/railgun/scripts/check-sdk-test-count.sh
     else
       echo "  node_modules absent -- SKIPPED typecheck and suite (run pnpm install)"
     fi

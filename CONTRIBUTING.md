@@ -40,8 +40,9 @@ This repository is **thirteen separate cargo workspaces** driving twenty-five CI
 them carry their own `fmt` and `clippy` gate. A `cargo clippy` run only covers the workspace you are
 standing in, so linting the crate you edited is not the same as linting the repository, and the gap
 is invisible until CI finds it. `preflight.sh` runs every workspace's hygiene, format and lint gate
-in one command. Use `--fast` for hygiene and formatting only (seconds), `--msrv` to add both
-minimum-supported-Rust toolchains, and `--with-tests` for the detached workspaces' suites.
+in one command. Use `--fast` for hygiene, formatting and the source-reading SDK gates only (a few seconds; no
+clippy and no suite), `--msrv` to add both minimum-supported-Rust toolchains, and `--with-tests`
+for the detached workspaces' suites.
 
 A change is ready to merge only when ALL of the following hold:
 
