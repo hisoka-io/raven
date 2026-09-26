@@ -26,7 +26,9 @@ use raven_inspire::{ClientSession, ServerSessionHandle, ServerSessionStore};
 use raven_storage::{atomic_write, ExclusiveLock, PersistenceError, StoreLayout};
 use sha2::{Digest, Sha256};
 
-/// Session ceiling before whole-generation reclamation.
+/// Session ceiling: wire registration is refused above it, and the in-process path
+/// reclaims a whole generation. A memory bound: a seat holds `6 * gamma - 3` server-derived
+/// ring polynomials, 24 MiB at `gamma = 256`, `d = 2048`.
 pub const DEFAULT_MAX_SESSIONS: usize = 64;
 
 /// Serviceable lifetime of a registered session.
@@ -65,6 +67,16 @@ pub enum SessionStoreError {
     InvalidLimits {
         /// Configured occupancy ceiling.
         max_sessions: usize,
+    },
+    /// Every resident session is still live and the ceiling is reached.
+    #[error(
+        "session store holds {max_sessions} live sessions, its configured ceiling; refusing registration rather than retiring another caller's keys, retry after a session expires (ttl {ttl_secs}s)"
+    )]
+    AtCapacity {
+        /// Configured occupancy ceiling.
+        max_sessions: usize,
+        /// Serviceable lifetime a resident session is counted for.
+        ttl_secs: u64,
     },
     /// The short reservation lock could not be acquired.
     #[error("session handle floor lock failed under {}: {source}", data_dir.display())]
@@ -236,7 +248,9 @@ impl SessionStoreError {
     #[must_use]
     pub const fn class(&self) -> SessionStoreErrorClass {
         match self {
-            Self::InvalidLimits { .. } => SessionStoreErrorClass::Configuration,
+            Self::InvalidLimits { .. } | Self::AtCapacity { .. } => {
+                SessionStoreErrorClass::Configuration
+            }
             Self::FloorLock { .. }
             | Self::FloorRead { .. }
             | Self::FloorMissing { .. }
@@ -262,6 +276,7 @@ impl SessionStoreError {
         match self {
             Self::HandleRejected { detail } => Some(detail),
             Self::InvalidLimits { .. }
+            | Self::AtCapacity { .. }
             | Self::FloorLock { .. }
             | Self::FloorRead { .. }
             | Self::FloorMissing { .. }
@@ -288,7 +303,8 @@ pub type Result<T, E = SessionStoreError> = std::result::Result<T, E>;
 /// Occupancy and lifetime bounds for a [`BoundedSessionStore`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionStoreLimits {
-    /// Inner-store length at which whole-generation reclamation fires.
+    /// Inner-store length at which wire registration is refused and the in-process
+    /// path reclaims a whole generation.
     pub max_sessions: usize,
     /// How long a handle stays serviceable after registration.
     pub ttl: Duration,
@@ -580,8 +596,10 @@ fn encode_handle_record(floor: u64, magic: [u8; 8]) -> [u8; HANDLE_FLOOR_BYTES] 
 
 /// Occupancy-bounded session store with optional restart-safe external handles.
 ///
-/// Reclamation replaces a whole generation. A resolved request retains an `Arc` to its generation,
-/// so an in-flight response can finish while every later request rejects its retired handle.
+/// In-process reclamation replaces a whole generation. A resolved request retains an `Arc` to its
+/// generation, so an in-flight response can finish while every later request rejects its retired
+/// handle. Wire registration never reclaims: at the ceiling it refuses, because its caller is
+/// unauthenticated and would otherwise discard sessions it does not own.
 pub struct BoundedSessionStore {
     limits: SessionStoreLimits,
     current: RwLock<Generation>,
@@ -708,6 +726,9 @@ impl BoundedSessionStore {
     }
 
     /// Register wire-delivered packing keys and derive the server-side representation.
+    ///
+    /// Refuses with [`SessionStoreError::AtCapacity`] once `max_sessions` live sessions are
+    /// resident, rather than retiring any of them.
     pub fn register_server_side(
         &self,
         keys: ClientPackingKeys,
@@ -718,6 +739,9 @@ impl BoundedSessionStore {
     }
 
     /// Register wire-delivered packing keys against an explicit clock.
+    ///
+    /// Refuses with [`SessionStoreError::AtCapacity`] once `max_sessions` live sessions are
+    /// resident, rather than retiring any of them.
     pub fn register_server_side_at(
         &self,
         keys: ClientPackingKeys,
@@ -735,37 +759,23 @@ impl BoundedSessionStore {
         let mut generation = self.current.write();
         let mut observation = SessionObservation::default();
         let mut warnings = Vec::new();
-        if Self::would_flush_after_sweep(&generation, now, self.limits.max_sessions) {
-            let replacement = Arc::new(ServerSessionStore::new());
-            let outcome = replacement
-                .register_server_side(keys, pack_params, context)
-                .map_err(|source| SessionStoreError::Inspire {
-                    operation: "session register_server_side",
-                    source: Box::new(source),
-                })
-                .and_then(|inner| {
-                    let external = self
-                        .durable_handles
-                        .as_ref()
-                        .map(|allocator| allocator.allocate())
-                        .transpose()?;
-                    self.make_room(&mut generation, now, &mut observation, &mut warnings);
-                    generation.store = replacement;
-                    let handle = external.unwrap_or(inner);
-                    generation
-                        .expiry
-                        .insert(handle.0, SessionEntry { inner, expires_at });
-                    Ok(handle)
-                });
+        self.reclaim_expired(&mut generation, now, &mut observation, &mut warnings);
+        // Wire-delivered keys arrive from a caller that presented no credential, so
+        // whole-generation reclamation here would let any one of them discard every other
+        // caller's packing keys. Refusing ahead of the derivation also keeps a full pool
+        // from paying for the expansion.
+        if generation.store.len() >= self.limits.max_sessions {
             observation.counts = Some(generation.counts());
             self.finish_observation(&mut observation);
             return Observed {
-                outcome,
+                outcome: Err(SessionStoreError::AtCapacity {
+                    max_sessions: self.limits.max_sessions,
+                    ttl_secs: self.limits.ttl.as_secs(),
+                }),
                 observation,
                 warnings,
             };
         }
-        self.make_room(&mut generation, now, &mut observation, &mut warnings);
         let outcome = (|| {
             let external = self
                 .durable_handles
@@ -1038,7 +1048,7 @@ impl BoundedSessionStore {
         (removed, warnings)
     }
 
-    fn make_room(
+    fn reclaim_expired(
         &self,
         generation: &mut Generation,
         now: Instant,
@@ -1052,6 +1062,16 @@ impl BoundedSessionStore {
             self.evicted_total.fetch_add(swept_u64, Ordering::Relaxed);
             observation.evictions.expired = swept_u64;
         }
+    }
+
+    fn make_room(
+        &self,
+        generation: &mut Generation,
+        now: Instant,
+        observation: &mut SessionObservation,
+        warnings: &mut Vec<SessionWarning>,
+    ) {
+        self.reclaim_expired(generation, now, observation, warnings);
         if generation.store.len() < self.limits.max_sessions {
             return;
         }
@@ -1403,9 +1423,52 @@ mod tests {
     }
 
     #[test]
-    fn refused_registration_at_capacity_preserves_the_live_session() {
+    fn a_wire_registration_at_capacity_is_refused_and_keeps_every_live_session() {
         let (keys, pack_params, context) = real_registration_material();
-        let store = store(1);
+        let store = store(2);
+        let now = Instant::now();
+        let residents: Vec<_> = (0..2)
+            .map(|index| {
+                store
+                    .register_server_side_at(keys.clone(), &pack_params, &context, now)
+                    .outcome
+                    .unwrap_or_else(|error| panic!("resident {index}: {error}"))
+            })
+            .collect();
+
+        let (refused, observation, warnings) = store
+            .register_server_side_at(keys.clone(), &pack_params, &context, now)
+            .into_parts();
+
+        assert!(
+            matches!(refused, Err(super::SessionStoreError::AtCapacity { max_sessions, .. }) if max_sessions == 2),
+            "a full pool must refuse by capacity, not by flushing"
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(observation.evictions, super::SessionEvictions::default());
+        assert_eq!(observation.flushes, 0);
+        assert_eq!(store.flushes_total(), 0);
+        assert_eq!(store.evicted_total(), 0);
+        assert_eq!(store.len(), 2);
+        for (index, handle) in residents.iter().enumerate() {
+            assert!(
+                store.resolve(Some(*handle), now).is_ok(),
+                "resident {index} must still serve"
+            );
+        }
+
+        // The seat frees only when its own TTL elapses.
+        let after_ttl = now + store.limits.ttl + Duration::from_secs(1);
+        let readmitted = store
+            .register_server_side_at(keys, &pack_params, &context, after_ttl)
+            .outcome;
+        assert!(readmitted.is_ok(), "expiry must free the pool again");
+    }
+
+    #[test]
+    fn a_rejected_key_set_below_capacity_preserves_the_live_session() {
+        let (keys, pack_params, context) = real_registration_material();
+        let store = store(4);
         let now = Instant::now();
         let (first, _, _) = store
             .register_server_side_at(keys.clone(), &pack_params, &context, now)

@@ -533,11 +533,13 @@ mod tests {
             .all(|(key, _, _, _)| { key.key().name() != "raven_railgun_session_evictions_total" }));
     }
 
+    /// The rejected set would take the last seat, so the capacity refusal cannot answer first:
+    /// at one seat of one the store refused before reading the keys and this passed vacuously.
     #[test]
-    fn failed_registration_at_capacity_preserves_live_gauges_without_flush() {
+    fn failed_registration_into_the_last_seat_preserves_live_gauges_without_flush() {
         let (keys, pack_params, context) = real_registration_material();
         let store = BoundedSessionStore::with_limits(SessionStoreLimits {
-            max_sessions: 1,
+            max_sessions: 2,
             ttl: DEFAULT_SESSION_TTL,
         });
         let first = store
@@ -549,9 +551,13 @@ mod tests {
         let snapshotter = recorder.snapshotter();
 
         metrics::with_local_recorder(&recorder, || {
-            assert!(store
+            let refusal = store
                 .register_server_side_at(invalid, &pack_params, &context, Instant::now())
-                .is_err());
+                .expect_err("a short key set is refused");
+            assert!(
+                matches!(refusal, AdapterError::Scheme(_)),
+                "the refusal must come from reading the keys, not from the capacity check: {refusal}"
+            );
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
