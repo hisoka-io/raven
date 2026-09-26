@@ -5,9 +5,9 @@
 //! A mirrored row is taken on the word of whoever answers at the configured endpoint; see
 //! [`TRUST_STATEMENT`]. Each `signedPOIEvent` carries the list provider's ed25519 signature. The
 //! mirror checks that it is 64 bytes of hex, passes it on in the WAL payload, and never verifies
-//! it. The engine names this authority model `VerificationMode::UpstreamSignature`, and config
-//! spells it `verification_mode = "upstream-signature"`. Despite both names, no signature check
-//! runs.
+//! it. The engine names this authority model `VerificationMode::UpstreamAsserted`, and config
+//! spells it `verification_mode = "upstream-asserted"`: the upstream's assertion is the whole of
+//! the authority, and no signature check runs.
 //!
 //! # What a mirrored status IS
 //!
@@ -54,11 +54,16 @@ pub enum MirrorError {
     /// Mirror source has been shut down.
     #[error("source closed")]
     Closed,
+    /// No consumer can hold the row at `list_index`, so the feed stopped in front of it.
+    #[error("no consumer holds list index {list_index}; the feed stopped in front of it")]
+    Unheld { list_index: u64 },
 }
 
 pub type Result<T, E = MirrorError> = core::result::Result<T, E>;
 
-/// Class of a refused [`UpstreamPpoiMirror::preflight`].
+/// Class of a failed exchange with the upstream: a refused [`UpstreamPpoiMirror::preflight`], or
+/// a feed request recorded in [`FeedProgress::last_failure`]. It names no endpoint and quotes no
+/// body, so an uncredentialed surface can carry it.
 #[derive(thiserror::Error, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PreflightFailure {
     /// The endpoint's host did not resolve.
@@ -108,6 +113,9 @@ pub const TRUST_STATEMENT: &str = "list authenticity rests on TLS to the configu
 
 /// Default polling cadence between upstream pulls (seconds).
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 30;
+
+/// Bound on one upstream request, connect to last body byte.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Default upstream PPOI endpoint.
 pub const DEFAULT_PPOI_ENDPOINT: &str = "https://ppoi.fdi.network";
@@ -310,10 +318,77 @@ fn read_cursor_sidecar(path: &Path) -> Option<u64> {
     Some(u64::from_le_bytes(arr))
 }
 
+/// What one list's feed has seen of upstream, as of its last request.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FeedProgress {
+    /// List-wide index of the next row the feed asks for.
+    pub next_index: u64,
+    /// Upstream's row count, known only when its last answer came back shorter than the page
+    /// asked for. `None` while pages come back full, and before the first answer.
+    pub upstream_rows: Option<u64>,
+    /// Rows handed downstream since the feed started.
+    pub rows_delivered: u64,
+    /// Requests that failed since upstream last answered.
+    pub consecutive_failures: u64,
+    /// Class of the latest failure; cleared by an answer.
+    pub last_failure: Option<PreflightFailure>,
+    /// When upstream last answered.
+    pub last_answer: Option<std::time::Instant>,
+    /// Why the feed stopped for good; `None` while it runs.
+    pub stopped: Option<String>,
+}
+
+/// Shared handle on one feed's [`FeedProgress`]: the feed writes it, an operator surface reads
+/// it. Every lock is taken and released inside one call, never across an await.
+#[derive(Clone, Debug, Default)]
+pub struct FeedStatus(std::sync::Arc<std::sync::Mutex<FeedProgress>>);
+
+impl FeedStatus {
+    /// The feed as of its last request.
+    #[must_use]
+    pub fn snapshot(&self) -> FeedProgress {
+        self.progress().clone()
+    }
+
+    // A poisoned lock still holds the last whole write, which is the best report there is.
+    fn progress(&self) -> std::sync::MutexGuard<'_, FeedProgress> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn at(&self, next_index: u64) {
+        self.progress().next_index = next_index;
+    }
+
+    fn failed(&self, class: PreflightFailure) {
+        let mut progress = self.progress();
+        progress.consecutive_failures = progress.consecutive_failures.saturating_add(1);
+        progress.last_failure = Some(class);
+    }
+
+    fn answered(&self, next_index: u64, delivered: usize, upstream_rows: Option<u64>) {
+        let mut progress = self.progress();
+        progress.next_index = next_index;
+        progress.rows_delivered = progress
+            .rows_delivered
+            .saturating_add(u64::try_from(delivered).unwrap_or(u64::MAX));
+        progress.upstream_rows = upstream_rows;
+        progress.consecutive_failures = 0;
+        progress.last_failure = None;
+        progress.last_answer = Some(std::time::Instant::now());
+    }
+
+    fn stopped(&self, reason: String) {
+        self.progress().stopped = Some(reason);
+    }
+}
+
 /// HTTP pull from the configured upstream PPOI service.
 pub struct UpstreamPpoiMirror {
     config: MirrorConfig,
     client: reqwest::Client,
+    backfill_interval: Option<std::time::Duration>,
 }
 
 impl std::fmt::Debug for UpstreamPpoiMirror {
@@ -322,6 +397,7 @@ impl std::fmt::Debug for UpstreamPpoiMirror {
             .field("endpoint", &self.config.endpoint)
             .field("chain_type", &self.config.chain_type)
             .field("chain_id", &self.config.chain_id)
+            .field("backfill_interval", &self.backfill_interval)
             .finish_non_exhaustive()
     }
 }
@@ -341,10 +417,23 @@ impl UpstreamPpoiMirror {
             )));
         }
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|e| MirrorError::Upstream(format!("reqwest builder: {e}")))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            backfill_interval: None,
+        })
+    }
+
+    /// Wait `interval` after a page that came back as long as it asked for, and the poll interval
+    /// after any other. Only a cold sync sees full pages, so a caught-up worker is back at the
+    /// poll cadence one page later. Unset, every page waits the poll interval.
+    #[must_use]
+    pub fn with_backfill_interval(mut self, interval: std::time::Duration) -> Self {
+        self.backfill_interval = Some(interval);
+        self
     }
 
     /// Build with the default OFAC-list config.
@@ -460,20 +549,124 @@ impl UpstreamPpoiMirror {
         persistent_cursor: Option<MirrorCursor>,
         sender: tokio::sync::mpsc::Sender<(raven_railgun_persistence::WalEntryPayload, u64)>,
     ) -> Result<()> {
-        use tokio::time::{interval, Duration, MissedTickBehavior};
-        let mut tick = interval(Duration::from_secs(self.config.poll_interval_secs.max(1)));
-        // Next tick is relative to completion, not to the missed tick.
-        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut cursor = match persistent_cursor.as_ref() {
+        self.run_worker_bounded(
+            list,
+            starting_cursor,
+            persistent_cursor,
+            |_| u64::MAX,
+            sender,
+        )
+        .await
+    }
+
+    /// [`Self::run_worker_with_cursor`], stopped in front of the first row nothing downstream
+    /// can hold.
+    ///
+    /// `first_unheld(cursor)` is the first list-wide index at or after `cursor` that no consumer
+    /// holds. No page reaches past it, so neither the cursor nor its sidecar ever passes a row
+    /// that was not delivered, and a consumer declared later resumes the feed at that row.
+    ///
+    /// # Errors
+    ///
+    /// [`MirrorError::Unheld`] once the cursor reaches that index, otherwise as
+    /// [`Self::run_worker_with_cursor`].
+    pub async fn run_worker_bounded<F>(
+        self: std::sync::Arc<Self>,
+        list: ListKey,
+        starting_cursor: u64,
+        persistent_cursor: Option<MirrorCursor>,
+        first_unheld: F,
+        sender: tokio::sync::mpsc::Sender<(raven_railgun_persistence::WalEntryPayload, u64)>,
+    ) -> Result<()>
+    where
+        F: Fn(u64) -> u64 + Send,
+    {
+        let cursor = match persistent_cursor.as_ref() {
             Some(pc) => pc.resolve_start(),
             None => starting_cursor,
         };
+        self.feed(
+            list,
+            cursor,
+            persistent_cursor.as_ref(),
+            move |cursor| cursor..first_unheld(cursor),
+            &FeedStatus::default(),
+            sender,
+        )
+        .await
+    }
+
+    /// A feed with no sidecar that asks only for the rows `span(cursor)` names, and records what
+    /// it sees of upstream in `status`.
+    ///
+    /// `span(cursor)` starts at the lowest list-wide index at or after `cursor` that some
+    /// consumer still has to append, and ends in front of the first index past that which no
+    /// consumer needs or can hold. The rows it steps over are held by every consumer that can
+    /// hold them, so they are not pulled again. An empty span stops the feed.
+    ///
+    /// # Errors
+    ///
+    /// [`MirrorError::Unheld`] at an empty span, naming the span's start, which can lie below
+    /// the cursor; otherwise only non-recoverable failures. A failed request is counted in
+    /// `status` and retried at the poll interval.
+    pub async fn run_feed<F>(
+        self: std::sync::Arc<Self>,
+        list: ListKey,
+        starting_cursor: u64,
+        span: F,
+        status: FeedStatus,
+        sender: tokio::sync::mpsc::Sender<(raven_railgun_persistence::WalEntryPayload, u64)>,
+    ) -> Result<()>
+    where
+        F: Fn(u64) -> std::ops::Range<u64> + Send,
+    {
+        let outcome = self
+            .feed(list, starting_cursor, None, span, &status, sender)
+            .await;
+        status.stopped(match &outcome {
+            Ok(()) => "the engine closed the feed channel".to_owned(),
+            Err(error) => error.to_string(),
+        });
+        outcome
+    }
+
+    async fn feed<F>(
+        &self,
+        list: ListKey,
+        mut cursor: u64,
+        persistent_cursor: Option<&MirrorCursor>,
+        span: F,
+        status: &FeedStatus,
+        sender: tokio::sync::mpsc::Sender<(raven_railgun_persistence::WalEntryPayload, u64)>,
+    ) -> Result<()>
+    where
+        F: Fn(u64) -> std::ops::Range<u64> + Send,
+    {
+        use tokio::time::{sleep, Duration, Instant};
+        let poll = Duration::from_secs(self.config.poll_interval_secs.max(1));
+        let backfill = self.backfill_interval.unwrap_or(poll);
+        status.at(cursor);
         tracing::info!(endpoint = %self.config.endpoint, "ppoi mirror: {TRUST_STATEMENT}");
+        let mut pause = Duration::ZERO;
+        let mut asked_at = Instant::now();
         loop {
-            tick.tick().await;
+            // Measured from the previous request, so the setting bounds the request rate.
+            sleep(pause.saturating_sub(asked_at.elapsed())).await;
+            asked_at = Instant::now();
+            pause = poll;
             if sender.is_closed() {
                 tracing::info!(cursor, "ppoi mirror worker exiting; channel closed");
                 return Ok(());
+            }
+            let wanted = span(cursor);
+            if wanted.start > cursor {
+                cursor = wanted.start;
+                status.at(cursor);
+            }
+            if wanted.end <= cursor {
+                return Err(MirrorError::Unheld {
+                    list_index: wanted.start,
+                });
             }
             let end = cursor
                 .checked_add(self.config.max_rows_per_fetch - 1)
@@ -482,16 +675,19 @@ impl UpstreamPpoiMirror {
                         "PPOI page starting at {cursor} overflows u64 for {} rows",
                         self.config.max_rows_per_fetch
                     ))
-                })?;
+                })?
+                .min(wanted.end - 1);
             let events = match self.fetch_indexed_events(&list, cursor, end).await {
                 Ok(v) => v,
-                Err(e) => {
+                Err((class, e)) => {
                     tracing::warn!(error = %e, "fetch_indexed_events failed; retrying next tick");
+                    status.failed(class);
                     continue;
                 }
             };
-            if events.is_empty() {
-                continue;
+            let full = u64::try_from(events.len()).is_ok_and(|rows| rows == end - cursor + 1);
+            if full {
+                pause = backfill;
             }
             for ev in &events {
                 let status_byte = poi_status_to_byte(ev.status);
@@ -521,46 +717,54 @@ impl UpstreamPpoiMirror {
                     return Ok(());
                 }
             }
-            let last_index = events
-                .last()
-                .map(|event| u64::from(event.list_index))
-                .ok_or_else(|| {
-                    MirrorError::Decode("nonempty PPOI page lost its final index".to_owned())
+            if let Some(last) = events.last() {
+                let last_index = u64::from(last.list_index);
+                cursor = last_index.checked_add(1).ok_or_else(|| {
+                    MirrorError::Decode(format!(
+                        "PPOI cursor cannot advance past consumed index {last_index}"
+                    ))
                 })?;
-            cursor = last_index.checked_add(1).ok_or_else(|| {
-                MirrorError::Decode(format!(
-                    "PPOI cursor cannot advance past consumed index {last_index}"
-                ))
-            })?;
-            if let Some(pc) = persistent_cursor.as_ref() {
-                if let Err(e) = pc.persist(cursor) {
-                    tracing::warn!(
-                        error = %e,
-                        sidecar = %pc.sidecar_path().display(),
-                        cursor,
-                        "ppoi mirror cursor: atomic write failed; will retry on next batch"
-                    );
+                if let Some(pc) = persistent_cursor {
+                    if let Err(e) = pc.persist(cursor) {
+                        tracing::warn!(
+                            error = %e,
+                            sidecar = %pc.sidecar_path().display(),
+                            cursor,
+                            "ppoi mirror cursor: atomic write failed; will retry on next batch"
+                        );
+                    }
                 }
             }
+            // A short answer is the whole of upstream's list: no row past its last exists yet.
+            status.answered(cursor, events.len(), (!full).then_some(cursor));
         }
     }
 
     /// `ppoi_poi_events` pull retaining each row's `list_index`, which the worker
     /// needs to drive per-list IMT growth and
-    /// [`MirrorSource::fetch_status_range`] therefore strips.
+    /// [`MirrorSource::fetch_status_range`] therefore strips. A failure carries its class
+    /// beside the worded error.
     async fn fetch_indexed_events(
         &self,
         list: &ListKey,
         start_index: u64,
         end_index: u64,
-    ) -> Result<Vec<IndexedPoiEvent>> {
+    ) -> core::result::Result<Vec<IndexedPoiEvent>, (PreflightFailure, MirrorError)> {
         if end_index < start_index {
             return Ok(Vec::new());
         }
         let params = self.poi_events_params(list, start_index, end_index);
-        let events: Vec<WirePOISyncedListEvent> =
-            self.post_json_rpc(POI_EVENTS_METHOD, params).await?;
+        let events: Vec<WirePOISyncedListEvent> = self
+            .exchange_json_rpc(POI_EVENTS_METHOD, params, None)
+            .await
+            .map_err(|failure| {
+                (
+                    failure.class(REQUEST_TIMEOUT),
+                    failure.into_mirror_error(POI_EVENTS_METHOD, &self.config.endpoint),
+                )
+            })?;
         decode_indexed_events(events, start_index, end_index)
+            .map_err(|error| (PreflightFailure::UndecodableRows, error))
     }
 
     async fn post_json_rpc<P, T>(&self, method: &'static str, params: P) -> Result<T>
@@ -651,21 +855,26 @@ impl RpcFailure {
         }
     }
 
-    fn into_preflight(self, timeout: std::time::Duration) -> (PreflightFailure, String) {
+    fn class(&self, timeout: std::time::Duration) -> PreflightFailure {
         match self {
-            Self::Send(error) => (classify_send_error(&error, timeout), error_chain(&error)),
-            Self::Status(status) => (
-                PreflightFailure::HttpStatus(status.as_u16()),
-                status.to_string(),
-            ),
+            Self::Send(error) => classify_send_error(error, timeout),
+            Self::Status(status) => PreflightFailure::HttpStatus(status.as_u16()),
             // A body that stalls is a timeout, not a malformed reply.
-            Self::Body(error) if error.is_timeout() => {
-                (PreflightFailure::Timeout(timeout), error_chain(&error))
-            }
-            Self::Body(error) => (PreflightFailure::MalformedEnvelope, error_chain(&error)),
-            Self::Envelope(detail) => (PreflightFailure::MalformedEnvelope, detail),
-            Self::Rpc { code, message } => (PreflightFailure::Rpc(code), message),
+            Self::Body(error) if error.is_timeout() => PreflightFailure::Timeout(timeout),
+            Self::Body(_) | Self::Envelope(_) => PreflightFailure::MalformedEnvelope,
+            Self::Rpc { code, .. } => PreflightFailure::Rpc(*code),
         }
+    }
+
+    fn into_preflight(self, timeout: std::time::Duration) -> (PreflightFailure, String) {
+        let class = self.class(timeout);
+        let detail = match self {
+            Self::Send(error) | Self::Body(error) => error_chain(&error),
+            Self::Status(status) => status.to_string(),
+            Self::Envelope(detail) => detail,
+            Self::Rpc { message, .. } => message,
+        };
+        (class, detail)
     }
 }
 
