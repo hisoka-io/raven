@@ -17,6 +17,21 @@ use raven_railgun_engine::orchestrator::{DataSourceFilter, LEAVES_PER_PPOI_BLOCK
 /// Shared logical leaf store, as the orchestrator hands it out per instance.
 pub type SharedLogicalStore = Arc<parking_lot::Mutex<LogicalLeafStore>>;
 
+/// Upstream's own row count for one list, and how long ago it gave it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpstreamTip {
+    /// Rows upstream held when its answer came back short of a full page.
+    pub rows: u64,
+    /// Seconds since that answer.
+    pub age_secs: u64,
+}
+
+/// Oldest upstream count a frontier may rest on. A caught-up mirror renews it every poll, and
+/// this outlasts two failed polls in a row; the boot that wires the two pins that against the
+/// mirror's own timings. Past it the list routes refuse rather than answer absence over rows
+/// upstream may have added since.
+pub const UPSTREAM_TIP_MAX_AGE_SECS: u64 = 120;
+
 /// What a shim route could not prove about the stores it was given.
 ///
 /// Every variant names the list key or tree and the rule that failed, because a bare 503
@@ -44,7 +59,7 @@ pub enum CoverageRefusal {
         /// Block number actually found there.
         found_block: u32,
     },
-    /// A block below the frontier is short, so the list has a hole under a later block.
+    /// A block is short while a later declared block holds rows, so the list has a hole.
     ShortBlock {
         /// List key asked about.
         list_key: [u8; 32],
@@ -55,21 +70,26 @@ pub enum CoverageRefusal {
         /// Rows a sealed block must hold.
         expected: u32,
     },
-    /// The last declared block is full, so a successor block may exist upstream and is
-    /// wired to nothing. Refused rather than guessed.
+    /// Every declared block is full, so a successor block may exist upstream and is wired to
+    /// nothing. Refused rather than guessed.
     FrontierFull {
         /// List key asked about.
         list_key: [u8; 32],
         /// The full frontier block.
         block: u32,
     },
-    /// The only declared block has never held a row, so rows may exist upstream and nothing
-    /// local reflects them. The mirror image of [`Self::FrontierFull`].
-    EmptyFrontier {
+    /// The frontier block is short of full, and upstream has not said recently enough that
+    /// the list ends where the local rows do. Rows past them may exist upstream and nothing
+    /// local holds them, so contiguity alone proves nothing about the tip.
+    FrontierUnanchored {
         /// List key asked about.
         list_key: [u8; 32],
-        /// The empty block.
+        /// The frontier block.
         block: u32,
+        /// Rows held across the covered prefix, list-wide.
+        held: u64,
+        /// Upstream's latest count, when it has stated one.
+        asserted: Option<UpstreamTip>,
     },
     /// No wired store declares this commit tree.
     NoTreeStore {
@@ -110,8 +130,8 @@ impl std::fmt::Display for CoverageRefusal {
                 expected,
             } => write!(
                 f,
-                "list {} block {block} holds {held} of {expected} rows while a later block is \
-                 declared, so the list has a hole",
+                "list {} block {block} holds {held} of {expected} rows while a later block \
+                 holds rows, so the list has a hole",
                 hex32(list_key)
             ),
             Self::FrontierFull { list_key, block } => write!(
@@ -120,12 +140,35 @@ impl std::fmt::Display for CoverageRefusal {
                  block is wired, so rows past it are held by nobody",
                 hex32(list_key)
             ),
-            Self::EmptyFrontier { list_key, block } => write!(
-                f,
-                "list {} block {block} holds no rows and nothing is sealed under it, so the \
-                 list is unbounded here",
-                hex32(list_key)
-            ),
+            Self::FrontierUnanchored {
+                list_key,
+                block,
+                held,
+                asserted,
+            } => {
+                write!(
+                    f,
+                    "list {} frontier block {block} ends at {held} rows list-wide and ",
+                    hex32(list_key)
+                )?;
+                match asserted {
+                    None => write!(f, "upstream has stated no row count"),
+                    Some(tip) if tip.age_secs > UPSTREAM_TIP_MAX_AGE_SECS => write!(
+                        f,
+                        "upstream's last count, {} rows, is {} s old, past the {} s bound",
+                        tip.rows, tip.age_secs, UPSTREAM_TIP_MAX_AGE_SECS
+                    ),
+                    Some(tip) => write!(
+                        f,
+                        "upstream counted {} rows {} s ago",
+                        tip.rows, tip.age_secs
+                    ),
+                }?;
+                write!(
+                    f,
+                    ", so rows past the local ones may exist and are held by nobody"
+                )
+            }
             Self::NoTreeStore { tree_number } => {
                 write!(f, "no wired store declares commit tree {tree_number}")
             }
@@ -207,33 +250,40 @@ impl ShimStoreRegistry {
     }
 
     /// Prove that the wired stores hold a gap-free prefix of `list_key` whose frontier is
-    /// not sitting on the per-IMT capacity wall.
+    /// not sitting on the per-IMT capacity wall, and reaches at least as far as `tip`, the
+    /// count upstream gave for the list no more than [`UPSTREAM_TIP_MAX_AGE_SECS`] ago. Blocks
+    /// declared past the frontier may be empty, since that count ends the list before them.
     ///
     /// Block declarations are tried first: they are the only shape that can span more than
     /// one IMT, and the list outgrew one IMT long ago.
     pub fn prove_list_coverage(
         &self,
         list_key: &[u8; 32],
+        tip: Option<UpstreamTip>,
     ) -> Result<ListCoverage<'_>, CoverageRefusal> {
-        match self.prove_from_blocks(list_key) {
+        match self.prove_from_blocks(list_key, tip) {
             Ok(coverage) => Ok(coverage),
             // Blocks are declared for this list but do not cover it. The whole-list store is
             // then provably behind them - it stops at one IMT while they do not - so falling
             // back to it would answer from strictly less than the process already holds.
-            Err(refusal @ CoverageRefusal::NoListStore { .. }) => {
-                self.prove_from_whole_list(list_key).map_err(|fallback| {
+            Err(refusal @ CoverageRefusal::NoListStore { .. }) => self
+                .prove_from_whole_list(list_key, tip)
+                .map_err(|fallback| {
                     if matches!(fallback, CoverageRefusal::NoListStore { .. }) {
                         refusal
                     } else {
                         fallback
                     }
-                })
-            }
+                }),
             Err(refusal) => Err(refusal),
         }
     }
 
-    fn prove_from_blocks(&self, list_key: &[u8; 32]) -> Result<ListCoverage<'_>, CoverageRefusal> {
+    fn prove_from_blocks(
+        &self,
+        list_key: &[u8; 32],
+        tip: Option<UpstreamTip>,
+    ) -> Result<ListCoverage<'_>, CoverageRefusal> {
         let declared: Vec<(u32, &Vec<SharedLogicalStore>)> = self
             .ppoi_blocks
             .range((*list_key, 0u32)..)
@@ -271,13 +321,14 @@ impl ShimStoreRegistry {
             list_key: *list_key,
             blocks,
         };
-        coverage.prove_prefix()?;
+        coverage.prove_prefix(tip)?;
         Ok(coverage)
     }
 
     fn prove_from_whole_list(
         &self,
         list_key: &[u8; 32],
+        tip: Option<UpstreamTip>,
     ) -> Result<ListCoverage<'_>, CoverageRefusal> {
         let declared = self
             .ppoi_whole
@@ -298,7 +349,7 @@ impl ShimStoreRegistry {
             list_key: *list_key,
             blocks: vec![single],
         };
-        coverage.prove_prefix()?;
+        coverage.prove_prefix(tip)?;
         Ok(coverage)
     }
 }
@@ -334,43 +385,58 @@ impl<'a> ListCoverage<'a> {
         }
     }
 
-    fn prove_prefix(&self) -> Result<(), CoverageRefusal> {
-        let frontier = self.blocks.len().saturating_sub(1);
-        for (position, store) in self.blocks.iter().enumerate() {
-            let held = self.held_rows(store);
-            let block = u32::try_from(position).unwrap_or(u32::MAX);
-            if position == frontier {
-                if held >= LEAVES_PER_PPOI_BLOCK {
-                    return Err(CoverageRefusal::FrontierFull {
-                        list_key: self.list_key,
-                        block,
-                    });
-                }
-                // Only when it is also block 0: under a sealed prefix an empty frontier block
-                // is a real frontier, on its own it is no evidence at all.
-                if held == 0 && frontier == 0 {
-                    return Err(CoverageRefusal::EmptyFrontier {
-                        list_key: self.list_key,
-                        block,
-                    });
-                }
-            } else if held != LEAVES_PER_PPOI_BLOCK {
-                return Err(CoverageRefusal::ShortBlock {
-                    list_key: self.list_key,
-                    block,
-                    held,
-                    expected: LEAVES_PER_PPOI_BLOCK,
-                });
-            }
+    fn prove_prefix(&self, tip: Option<UpstreamTip>) -> Result<(), CoverageRefusal> {
+        let held: Vec<u32> = self
+            .blocks
+            .iter()
+            .map(|store| self.held_rows(store))
+            .collect();
+        let frontier = held
+            .iter()
+            .position(|&rows| rows < LEAVES_PER_PPOI_BLOCK)
+            .unwrap_or_else(|| held.len().saturating_sub(1));
+        let block = u32::try_from(frontier).unwrap_or(u32::MAX);
+        let frontier_rows = held.get(frontier).copied().unwrap_or(0);
+        if frontier_rows >= LEAVES_PER_PPOI_BLOCK {
+            return Err(CoverageRefusal::FrontierFull {
+                list_key: self.list_key,
+                block,
+            });
+        }
+        // An operator declares the next block before the current one fills, so a block past the
+        // frontier may sit empty; one holding a row leaves a hole under it.
+        if held.iter().skip(frontier + 1).any(|&rows| rows > 0) {
+            return Err(CoverageRefusal::ShortBlock {
+                list_key: self.list_key,
+                block,
+                held: frontier_rows,
+                expected: LEAVES_PER_PPOI_BLOCK,
+            });
+        }
+        let held_total =
+            u64::from(block) * u64::from(LEAVES_PER_PPOI_BLOCK) + u64::from(frontier_rows);
+        // A contiguous prefix says nothing about where upstream's list ends: a cold sync, or a
+        // restart that missed rows, leaves the frontier short while upstream holds more. Only
+        // upstream's own recent count says the rows past the local ones do not exist, and the
+        // same count puts every block past the frontier beyond the list's end.
+        let current = tip
+            .is_some_and(|tip| tip.age_secs <= UPSTREAM_TIP_MAX_AGE_SECS && held_total >= tip.rows);
+        if !current {
+            return Err(CoverageRefusal::FrontierUnanchored {
+                list_key: self.list_key,
+                block,
+                held: held_total,
+                asserted: tip,
+            });
         }
         Ok(())
     }
 
     /// Re-check the frontier after the answer was read.
     ///
-    /// The proof and the read are separate lock acquisitions, and the frontier block is the
-    /// one that grows. If it reached capacity in between, a successor block exists upstream
-    /// and the answer just read is no longer a complete prefix.
+    /// The proof and the read are separate lock acquisitions, and the list grows in between.
+    /// If the last declared block reached capacity meanwhile, rows past it may exist upstream
+    /// and are held by nobody, so the answer just read is no longer a complete prefix.
     pub fn recheck_frontier(&self) -> Result<(), CoverageRefusal> {
         let Some(store) = self.blocks.last() else {
             return Ok(());
@@ -511,11 +577,26 @@ mod tests {
         }
     }
 
+    fn counted(rows: u64, age_secs: u64) -> UpstreamTip {
+        UpstreamTip { rows, age_secs }
+    }
+
+    fn unanchored(held: u64, asserted: Option<UpstreamTip>) -> CoverageRefusal {
+        CoverageRefusal::FrontierUnanchored {
+            list_key: LIST_KEY,
+            block: 0,
+            held,
+            asserted,
+        }
+    }
+
     #[test]
     fn a_single_short_block_covers_the_list_it_declares() {
         let registry =
             ShimStoreRegistry::from_declarations([(block_filter(0), block_store(0..4, 0))]);
-        let coverage = registry.prove_list_coverage(&LIST_KEY).expect("covered");
+        let coverage = registry
+            .prove_list_coverage(&LIST_KEY, Some(counted(4, 0)))
+            .expect("covered");
         let leaves = coverage.leaves();
         assert_eq!(leaves.len(), 4);
         assert_eq!(leaves[3].global_index, 3);
@@ -528,7 +609,9 @@ mod tests {
         let registry =
             ShimStoreRegistry::from_declarations([(block_filter(2), block_store(0..4, 0))]);
         assert_eq!(
-            registry.prove_list_coverage(&LIST_KEY).err(),
+            registry
+                .prove_list_coverage(&LIST_KEY, Some(counted(u64::MAX, 0)))
+                .err(),
             Some(CoverageRefusal::BlockGap {
                 list_key: LIST_KEY,
                 expected_block: 0,
@@ -544,7 +627,9 @@ mod tests {
             (block_filter(2), block_store(0..4, 100)),
         ]);
         assert_eq!(
-            registry.prove_list_coverage(&LIST_KEY).err(),
+            registry
+                .prove_list_coverage(&LIST_KEY, Some(counted(u64::MAX, 0)))
+                .err(),
             Some(CoverageRefusal::BlockGap {
                 list_key: LIST_KEY,
                 expected_block: 1,
@@ -560,7 +645,50 @@ mod tests {
             (block_filter(1), block_store(0..4, 100)),
         ]);
         assert_eq!(
-            registry.prove_list_coverage(&LIST_KEY).err(),
+            registry
+                .prove_list_coverage(&LIST_KEY, Some(counted(u64::MAX, 0)))
+                .err(),
+            Some(CoverageRefusal::ShortBlock {
+                list_key: LIST_KEY,
+                block: 0,
+                held: 4,
+                expected: LEAVES_PER_PPOI_BLOCK,
+            })
+        );
+    }
+
+    /// The next block declared before the current one fills: it holds nothing upstream counts, so
+    /// it is covered empty, and the count still decides the frontier under it.
+    #[test]
+    fn a_block_declared_ahead_of_the_list_is_covered_empty() {
+        let registry = ShimStoreRegistry::from_declarations([
+            (block_filter(0), block_store(0..4, 0)),
+            (block_filter(1), block_store(0..0, 100)),
+            (block_filter(2), block_store(0..0, 200)),
+        ]);
+        let coverage = registry
+            .prove_list_coverage(&LIST_KEY, Some(counted(4, 0)))
+            .expect("covered");
+        assert_eq!(coverage.leaves().len(), 4);
+        for tip in [None, Some(counted(5, 0))] {
+            assert_eq!(
+                registry.prove_list_coverage(&LIST_KEY, tip).err(),
+                Some(unanchored(4, tip))
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_past_an_empty_block_is_a_hole() {
+        let registry = ShimStoreRegistry::from_declarations([
+            (block_filter(0), block_store(0..4, 0)),
+            (block_filter(1), block_store(0..0, 100)),
+            (block_filter(2), block_store(0..1, 200)),
+        ]);
+        assert_eq!(
+            registry
+                .prove_list_coverage(&LIST_KEY, Some(counted(0, 0)))
+                .err(),
             Some(CoverageRefusal::ShortBlock {
                 list_key: LIST_KEY,
                 block: 0,
@@ -577,7 +705,9 @@ mod tests {
             (block_filter(0), block_store(0..4, 100)),
         ]);
         assert_eq!(
-            registry.prove_list_coverage(&LIST_KEY).err(),
+            registry
+                .prove_list_coverage(&LIST_KEY, Some(counted(u64::MAX, 0)))
+                .err(),
             Some(CoverageRefusal::DuplicateBlock {
                 list_key: LIST_KEY,
                 block: 0,
@@ -595,7 +725,9 @@ mod tests {
             (DataSourceFilter::PpoiList(LIST_KEY), block_store(0..4, 100)),
         ]);
         assert_eq!(
-            registry.prove_list_coverage(&LIST_KEY).err(),
+            registry
+                .prove_list_coverage(&LIST_KEY, Some(counted(u64::MAX, 0)))
+                .err(),
             Some(CoverageRefusal::BlockGap {
                 list_key: LIST_KEY,
                 expected_block: 0,
@@ -612,7 +744,9 @@ mod tests {
             DataSourceFilter::PpoiList(LIST_KEY),
             block_store(0..4, 0),
         )]);
-        let coverage = registry.prove_list_coverage(&LIST_KEY).expect("covered");
+        let coverage = registry
+            .prove_list_coverage(&LIST_KEY, Some(counted(4, 0)))
+            .expect("covered");
         assert_eq!(coverage.leaves().len(), 4);
     }
 
@@ -622,7 +756,9 @@ mod tests {
             ShimStoreRegistry::from_declarations([(block_filter(0), block_store(0..4, 0))]);
         let other = [0x99; 32];
         assert_eq!(
-            registry.prove_list_coverage(&other).err(),
+            registry
+                .prove_list_coverage(&other, Some(counted(0, 0)))
+                .err(),
             Some(CoverageRefusal::NoListStore { list_key: other })
         );
     }
@@ -676,5 +812,124 @@ mod tests {
             !ShimStoreRegistry::from_declarations([(block_filter(0), block_store(0..1, 0))])
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_frontier_no_upstream_count_vouches_for_is_refused() {
+        let registry =
+            ShimStoreRegistry::from_declarations([(block_filter(0), block_store(0..4, 0))]);
+        assert_eq!(
+            registry.prove_list_coverage(&LIST_KEY, None).err(),
+            Some(unanchored(4, None))
+        );
+    }
+
+    #[test]
+    fn a_frontier_behind_upstreams_count_is_refused_and_one_at_or_past_it_is_not() {
+        let registry =
+            ShimStoreRegistry::from_declarations([(block_filter(0), block_store(0..4, 0))]);
+        assert_eq!(
+            registry
+                .prove_list_coverage(&LIST_KEY, Some(counted(5, 0)))
+                .err(),
+            Some(unanchored(4, Some(counted(5, 0))))
+        );
+        // Rows the store applied after upstream's answer still leave it complete as of then.
+        for rows in [4, 3] {
+            assert!(registry
+                .prove_list_coverage(&LIST_KEY, Some(counted(rows, 0)))
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn an_upstream_count_past_the_age_bound_anchors_nothing() {
+        let registry =
+            ShimStoreRegistry::from_declarations([(block_filter(0), block_store(0..4, 0))]);
+        assert!(registry
+            .prove_list_coverage(&LIST_KEY, Some(counted(4, UPSTREAM_TIP_MAX_AGE_SECS)))
+            .is_ok());
+        let stale = Some(counted(4, UPSTREAM_TIP_MAX_AGE_SECS + 1));
+        assert_eq!(
+            registry.prove_list_coverage(&LIST_KEY, stale).err(),
+            Some(unanchored(4, stale))
+        );
+    }
+
+    /// An empty frontier is refused on its own and answered once upstream says the list is empty
+    /// too: the count is the anchor, not the row count.
+    #[test]
+    fn an_empty_frontier_is_covered_only_when_upstream_counts_it_empty() {
+        let registry =
+            ShimStoreRegistry::from_declarations([(block_filter(0), block_store(0..0, 0))]);
+        assert_eq!(
+            registry.prove_list_coverage(&LIST_KEY, None).err(),
+            Some(unanchored(0, None))
+        );
+        assert_eq!(
+            registry
+                .prove_list_coverage(&LIST_KEY, Some(counted(1, 0)))
+                .err(),
+            Some(unanchored(0, Some(counted(1, 0))))
+        );
+        assert!(registry
+            .prove_list_coverage(&LIST_KEY, Some(counted(0, 0)))
+            .is_ok());
+    }
+
+    /// The whole-list shape has no sealed block under its frontier, so without a count a store
+    /// three rows into a long list would prove the whole of it.
+    #[test]
+    fn a_whole_list_store_short_of_upstreams_count_is_refused() {
+        let registry = ShimStoreRegistry::from_declarations([(
+            DataSourceFilter::PpoiList(LIST_KEY),
+            block_store(0..3, 0),
+        )]);
+        assert_eq!(
+            registry.prove_list_coverage(&LIST_KEY, None).err(),
+            Some(unanchored(3, None))
+        );
+        assert_eq!(
+            registry
+                .prove_list_coverage(&LIST_KEY, Some(counted(358_344, 4)))
+                .err(),
+            Some(unanchored(3, Some(counted(358_344, 4))))
+        );
+    }
+
+    #[test]
+    fn an_unanchored_refusal_names_the_list_the_block_and_both_counts() {
+        let refusal = CoverageRefusal::FrontierUnanchored {
+            list_key: LIST_KEY,
+            block: 5,
+            held: 327_697,
+            asserted: Some(counted(358_344, 7)),
+        };
+        let text = refusal.to_string();
+        for needle in [
+            hex32(&LIST_KEY).as_str(),
+            "block 5",
+            "327697",
+            "358344",
+            "7 s",
+        ] {
+            assert!(text.contains(needle), "{needle} missing from: {text}");
+        }
+        let stale = CoverageRefusal::FrontierUnanchored {
+            list_key: LIST_KEY,
+            block: 0,
+            held: 3,
+            asserted: Some(counted(3, UPSTREAM_TIP_MAX_AGE_SECS + 9)),
+        }
+        .to_string();
+        assert!(stale.contains("past the"), "{stale}");
+        let silent = CoverageRefusal::FrontierUnanchored {
+            list_key: LIST_KEY,
+            block: 0,
+            held: 0,
+            asserted: None,
+        }
+        .to_string();
+        assert!(silent.contains("no row count"), "{silent}");
     }
 }

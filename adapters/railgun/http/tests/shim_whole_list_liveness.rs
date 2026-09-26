@@ -1,12 +1,9 @@
 //! What a whole-list declaration actually proves, held in place by the answers it gives.
 //!
 //! A `PpoiList` declaration is the only shape with no sealed block under its frontier, so the
-//! coverage proof reduces to one rule: this store has not reached the 65,536-row per-IMT wall.
-//! These tests record what that buys - an empty store and a store three rows into a long list
-//! both prove coverage and both serve `"Missing"` at HTTP 200 - so a caller weighing a
-//! whole-list declaration is reading the property, not inferring it. The multi-instance path
-//! is unaffected: its block declarations are tried first and seal every block below the
-//! frontier.
+//! store's own rows say nothing about where the list ends: an empty store and a store three
+//! rows into a long list look alike. Only upstream's own recent row count separates them, so
+//! without it both are refused, and with it the store answers exactly as far as that count.
 
 #![allow(
     clippy::expect_used,
@@ -26,6 +23,7 @@ use raven_railgun_engine::inspire::{apply_wal_entry, LogicalLeafStore};
 use raven_railgun_engine::orchestrator::DataSourceFilter;
 use raven_railgun_engine::pir_table::PerLeafCommitmentEncoder;
 use raven_railgun_engine::{Engine, PirScheme};
+use raven_railgun_http::status::{MirrorFeedState, MirrorFeedView};
 use raven_railgun_http::{AppState, HttpConfig};
 use raven_railgun_persistence::WalEntryPayload;
 use serde::{Deserialize, Serialize};
@@ -118,6 +116,12 @@ fn store_holding(rows: u32) -> SharedStore {
 }
 
 fn declaring_the_whole_list(store: SharedStore) -> Router {
+    declaring_the_whole_list_counted(store, None)
+}
+
+/// The same declaration beside the list's mirror feed, whose last answer upstream counted
+/// `upstream_rows` rows in just now.
+fn declaring_the_whole_list_counted(store: SharedStore, upstream_rows: Option<u64>) -> Router {
     let engine: Engine<StubScheme> = Engine::new();
     let state = {
         let _g = APPSTATE_LOCK
@@ -126,6 +130,22 @@ fn declaring_the_whole_list(store: SharedStore) -> Router {
         AppState::new(engine, HttpConfig::demo(TOKEN)).expect("appstate")
     };
     let state = state.with_shim_stores(vec![(DataSourceFilter::PpoiList(LIST_KEY), store)]);
+    let state = match upstream_rows {
+        Some(rows) => {
+            let feed = MirrorFeedView {
+                list_key: hex32(&LIST_KEY),
+                state: MirrorFeedState::CaughtUp,
+                rows_held: rows,
+                upstream_rows: Some(rows),
+                next_index: rows,
+                consecutive_failures: 0,
+                last_failure: None,
+                seconds_since_answer: Some(0),
+            };
+            state.with_mirror_feeds(Arc::new(move || vec![feed.clone()]))
+        }
+        None => state,
+    };
     raven_railgun_http::router(state).expect("router")
 }
 
@@ -196,33 +216,109 @@ async fn a_whole_list_declaration_over_an_empty_store_is_refused() {
         "an empty whole-list store must not prove coverage"
     );
 
-    // The index route is a separate proof site, so it is asserted rather than assumed.
-    let (status, body) = send(
-        &router,
-        authed(
-            Method::GET,
-            &format!("/v1/poi/{}/bc-to-idx-map", hex32(&LIST_KEY)),
-            Body::empty(),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    let published_entries =
-        serde_json::from_slice::<serde_json::Value>(&body).is_ok_and(|v| v["entries"].is_array());
-    assert!(
-        !published_entries,
-        "a refused route must not also publish an empty index"
-    );
+    // Each index channel is a separate proof site, so each is asserted rather than assumed.
+    #[cfg(feature = "json-index-channel")]
+    {
+        let (status, body) = send(
+            &router,
+            authed(
+                Method::GET,
+                &format!("/v1/poi/{}/bc-to-idx-map", hex32(&LIST_KEY)),
+                Body::empty(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let published_entries = serde_json::from_slice::<serde_json::Value>(&body)
+            .is_ok_and(|v| v["entries"].is_array());
+        assert!(
+            !published_entries,
+            "a refused route must not also publish an empty index"
+        );
+    }
+
+    #[cfg(feature = "prefix-index-channel")]
+    {
+        let (status, body) = send(
+            &router,
+            authed(
+                Method::GET,
+                &format!("/v1/poi/{}/bc-prefixes", hex32(&LIST_KEY)),
+                Body::empty(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body.is_empty(),
+            "a refused segment must not also publish an empty one"
+        );
+    }
 }
 
-/// Partway through ingest, the same answer: the frontier is the only boundary the proof has,
-/// so every row above it reads as absent rather than as unknown.
+/// Partway through ingest the store's rows end short of upstream's, and the frontier alone
+/// cannot say so: every row above it would read as absent. Refused until upstream's count
+/// says the list ends where the store does, and answered as far as that count once it does.
 #[tokio::test]
-async fn a_whole_list_declaration_answers_missing_for_a_row_above_its_frontier() {
-    let router = declaring_the_whole_list(store_holding(HELD_ROWS));
+async fn a_whole_list_declaration_answers_only_as_far_as_upstreams_count() {
     let held = hex32(&bc_for(0));
     let above = hex32(&bc_for(UNHELD_INDEX));
 
+    for (case, upstream_rows) in [
+        ("no upstream count", None),
+        (
+            "upstream counting rows past the store's",
+            Some(u64::from(UNHELD_INDEX) + 1),
+        ),
+    ] {
+        let router = declaring_the_whole_list_counted(store_holding(HELD_ROWS), upstream_rows);
+        for bc in [&held, &above] {
+            let (status, _body) = ask_pois_per_list(&router, bc).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{case}: a row above the frontier must not read as absent"
+            );
+        }
+        #[cfg(feature = "json-index-channel")]
+        {
+            let (status, _body) = send(
+                &router,
+                authed(
+                    Method::GET,
+                    &format!("/v1/poi/{}/bc-to-idx-map", hex32(&LIST_KEY)),
+                    Body::empty(),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{case}: an index short of the list must not be published"
+            );
+        }
+        #[cfg(feature = "prefix-index-channel")]
+        {
+            let (status, body) = send(
+                &router,
+                authed(
+                    Method::GET,
+                    &format!("/v1/poi/{}/bc-prefixes", hex32(&LIST_KEY)),
+                    Body::empty(),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{case}: a prefix segment short of the list must not be published"
+            );
+            assert!(body.is_empty(), "{case}: a refused segment carries no rows");
+        }
+    }
+
+    let router =
+        declaring_the_whole_list_counted(store_holding(HELD_ROWS), Some(u64::from(HELD_ROWS)));
     let (status, body) = ask_pois_per_list(&router, &held).await;
     assert_eq!(status, StatusCode::OK);
     assert_ne!(
@@ -230,29 +326,30 @@ async fn a_whole_list_declaration_answers_missing_for_a_row_above_its_frontier()
         "Missing",
         "a row the store holds must not read as absent, or this test proves nothing"
     );
-
     let (status, body) = ask_pois_per_list(&router, &above).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         status_for(&body, &above),
         "Missing",
-        "a row above the frontier is served as absent, not refused"
+        "upstream says the list ends at the store's frontier, so a row past it is absent"
     );
 
-    let (status, body) = send(
-        &router,
-        authed(
-            Method::GET,
-            &format!("/v1/poi/{}/bc-to-idx-map", hex32(&LIST_KEY)),
-            Body::empty(),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let map: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    assert_eq!(
-        map["entries"].as_array().expect("entries").len(),
-        HELD_ROWS as usize,
-        "the published index stops at the frontier and says so nowhere"
-    );
+    #[cfg(feature = "json-index-channel")]
+    {
+        let (status, body) = send(
+            &router,
+            authed(
+                Method::GET,
+                &format!("/v1/poi/{}/bc-to-idx-map", hex32(&LIST_KEY)),
+                Body::empty(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let map: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            map["entries"].as_array().expect("entries").len(),
+            HELD_ROWS as usize
+        );
+    }
 }

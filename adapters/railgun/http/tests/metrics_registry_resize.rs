@@ -1,6 +1,6 @@
 //! A counter must still render its true total after the registry's map has grown.
 //!
-//! `metrics` 0.24.5 shipped a `Key` whose `Hash` impl disagreed with `Key::get_hash()`.
+//! `metrics` 0.24.5 shipped a `KeyHasher` that disagreed with `Key::get_hash()`.
 //! `metrics_util::Registry` looks entries up by `get_hash()` through
 //! `raw_entry_mut().from_key_hashed_nocheck(..)`, which bypasses the `BuildHasher` — but a
 //! hashbrown **resize** cannot bypass it and rehashes every stored key through `KeyHasher`.
@@ -60,14 +60,20 @@ fn a_counter_still_renders_its_total_after_the_registry_map_grows() {
          Key::get_hash() -- check that the lockfile has not moved metrics below 0.24.6"
     );
 
-    // One key means one entry. Duplicates are the defect's signature and render arbitrarily.
+    // A shape assertion, NOT a second detector, and the difference was worth stating because the
+    // first version of this comment claimed otherwise. `Registry::get_counter_handles()` collects
+    // into a `HashMap<Key, _>`, so duplicate registry entries collapse BEFORE rendering: an audit
+    // ran the defect under 0.24.5 and got exactly one line carrying the wrong value, 4. So this
+    // can never fail from the defect above -- the `value == 7` assertion is the whole detector.
+    // It stays as a guard on the render path: more than one line here means the scrape itself
+    // changed shape, which would make the value assertion read the wrong number silently.
     let occurrences = rendered
         .lines()
         .filter(|l| l.starts_with("raven_resize_probe{"))
         .count();
     assert_eq!(
         occurrences, 1,
-        "the probe key must appear exactly once; {occurrences} lines means the registry holds \
-         duplicate entries for one key:\n{rendered}"
+        "the probe key must render exactly once; {occurrences} lines means the scrape's shape \
+         changed and the value assertion above is no longer reading one counter:\n{rendered}"
     );
 }

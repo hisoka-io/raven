@@ -2,6 +2,12 @@
 //! not reusable. The 401 must say so, or a pooled peer reuses the socket the
 //! server is closing and its next request fails as a transport error instead of
 //! a 401.
+//!
+//! The subject is `/v1/admin/*`: the read path carries no credential and cannot 401,
+//! so the control plane is the only route left that rejects on headers with a body
+//! still on the wire. That is also why the admin gate belongs in the middleware -
+//! `admin_drain_handler`'s own refusal returns a bare `StatusCode` with no
+//! `Connection: close`, which is the bug this file exists to catch.
 
 #![allow(
     clippy::expect_used,
@@ -21,7 +27,7 @@ use raven_railgun_engine::{Engine, InstanceRole, PirInstance, PirScheme};
 use raven_railgun_http::{router, write_versioned, AppState, HttpConfig};
 use serde::{Deserialize, Serialize};
 
-const TOKEN: &str = "auth-reject-close-token-padded-1234";
+const TOKEN: &str = "auth-reject-close-ADMIN-padded-1234";
 const WRONG_TOKEN: &str = "auth-reject-close-WRONG-padded-1234";
 const INSTANCE: &str = "auth-reject-close-instance";
 
@@ -69,7 +75,8 @@ fn build_router() -> axum::Router {
             EchoState,
         )))
         .expect("register instance");
-    let mut cfg = HttpConfig::demo(TOKEN);
+    let mut cfg = HttpConfig::demo("auth-reject-close-read-padded-12345");
+    cfg.admin_token = Some(TOKEN.to_owned());
     cfg.rate_limit_rps = 10_000;
     cfg.rate_limit_burst = 10_000;
     let state = {
@@ -105,7 +112,7 @@ fn query_body(nonce: u64) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_non_exact_authorization_value_returns_401() {
     let (addr, handle) = spawn_server().await;
-    let url = format!("http://{addr}/v1/instance/{INSTANCE}/query");
+    let url = format!("http://{addr}/v1/admin/instances/drain/{INSTANCE}");
     let exact = format!("Bearer {TOKEN}");
     let strategy = proptest::collection::vec(0x21u8..=0x7e, 0..128)
         .prop_map(|bytes| String::from_utf8(bytes).expect("printable ASCII"))
@@ -154,6 +161,8 @@ async fn every_non_exact_authorization_value_returns_401() {
         );
     }
 
+    // Non-vacuity: with no admin token accepted, every refusal above is free.
+    // Drains the instance, so it is the last request this server serves.
     let accepted = client
         .post(&url)
         .header(http::header::AUTHORIZATION, exact)
@@ -178,7 +187,7 @@ async fn the_401_carries_connection_close_on_the_wire() {
     let head = tokio::task::spawn_blocking(move || {
         let mut sock = std::net::TcpStream::connect(addr).expect("connect");
         let request = format!(
-            "POST /v1/instance/{INSTANCE}/query HTTP/1.1\r\n\
+            "POST /v1/admin/instances/drain/{INSTANCE} HTTP/1.1\r\n\
              Host: {addr}\r\n\
              Authorization: Bearer {WRONG_TOKEN}\r\n\
              Content-Type: application/octet-stream\r\n\
@@ -209,15 +218,14 @@ async fn the_401_carries_connection_close_on_the_wire() {
          peer evicts the socket instead of reusing it; got {head:?}"
     );
 
-    // Keep-alive half: an authorized response consumed its body and must NOT
-    // carry a Connection header on the wire.
+    // Keep-alive half: a served response consumed its body and must NOT carry a
+    // Connection header on the wire. No credential is offered, which is the point.
     let body = query_body(8);
     let ok_head = tokio::task::spawn_blocking(move || {
         let mut sock = std::net::TcpStream::connect(addr).expect("connect ok");
         let request = format!(
             "POST /v1/instance/{INSTANCE}/query HTTP/1.1\r\n\
              Host: {addr}\r\n\
-             Authorization: Bearer {TOKEN}\r\n\
              Content-Type: application/octet-stream\r\n\
              Content-Length: {}\r\n\r\n",
             body.len()
@@ -238,11 +246,11 @@ async fn the_401_carries_connection_close_on_the_wire() {
 
     assert!(
         ok_head.starts_with("http/1.1 200"),
-        "authorized raw request must answer 200; got {ok_head:?}"
+        "an uncredentialed raw read must answer 200; got {ok_head:?}"
     );
     assert!(
         !ok_head.contains("connection:"),
-        "an authorized response must stay keep-alive (no Connection header \
+        "a served response must stay keep-alive (no Connection header \
          on the wire); got {ok_head:?}"
     );
 
@@ -250,17 +258,19 @@ async fn the_401_carries_connection_close_on_the_wire() {
     let _ = h.await;
 }
 
-/// The wallet-facing consequence: a pooled client whose token rotated mid-session
-/// must see a 401, not a `BrokenPipe` from reusing the socket the server closed.
+/// The operator-facing consequence: a pooled client refused at the admin gate must see a
+/// 401, not a `BrokenPipe` from reusing the socket the server closed - and the read
+/// request it makes next must still be served on a fresh connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pooled_client_sees_401_then_serves_the_next_request() {
     let (addr, h) = spawn_server().await;
+    let admin_url = format!("http://{addr}/v1/admin/instances/drain/{INSTANCE}");
     let url = format!("http://{addr}/v1/instance/{INSTANCE}/query");
     let client = reqwest::Client::new();
 
     for attempt in 0..8u64 {
         let rejected = client
-            .post(&url)
+            .post(&admin_url)
             .bearer_auth(WRONG_TOKEN)
             // Must exceed the socket buffer, or the body is fully written before the
             // server can reject and the race this test names never opens. Auth runs
@@ -278,7 +288,6 @@ async fn a_pooled_client_sees_401_then_serves_the_next_request() {
 
         let accepted = client
             .post(&url)
-            .bearer_auth(TOKEN)
             .body(query_body(attempt))
             .send()
             .await
@@ -291,7 +300,7 @@ async fn a_pooled_client_sees_401_then_serves_the_next_request() {
         assert_eq!(
             accepted.status().as_u16(),
             200,
-            "attempt {attempt}: valid bearer must be served after a 401"
+            "attempt {attempt}: the uncredentialed read must be served after a 401"
         );
     }
 

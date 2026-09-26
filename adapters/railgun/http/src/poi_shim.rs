@@ -2,9 +2,14 @@
 //! `private-proof-of-innocence/packages/node/src/api/api.ts`.
 //!
 //! These routes are NOT private; wallet privacy needs `/v1/instance/:id/query`.
+//!
+//! Two features publish the same index: `bc-prefixes` in per-block segments a client
+//! resumes with `?since=`, `bc-to-idx-map` as 64-hex rows in one unbounded body.
 
 use std::sync::Arc;
 
+#[cfg(feature = "prefix-index-channel")]
+use axum::extract::Query;
 use axum::{
     extract::{Path, State},
     http::{header::HeaderName, HeaderMap, HeaderValue, StatusCode},
@@ -13,17 +18,28 @@ use axum::{
 };
 use raven_railgun_core::{MerkleProof as CoreMerkleProof, POIStatus};
 use raven_railgun_engine::inspire::LogicalLeafStore;
+#[cfg(feature = "prefix-index-channel")]
+use raven_railgun_engine::orchestrator::LEAVES_PER_PPOI_BLOCK;
 use raven_railgun_engine::PirScheme;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::shim_store::{CoverageRefusal, ListCoverage, SharedLogicalStore as CoveredStore};
+use crate::shim_store::{
+    CoverageRefusal, ListCoverage, SharedLogicalStore as CoveredStore, UpstreamTip,
+};
+use crate::status::MirrorFeedView;
 use crate::AppState;
 
 const ETAG_HEADER: HeaderName = HeaderName::from_static("etag");
 const IF_NONE_MATCH_HEADER: HeaderName = HeaderName::from_static("if-none-match");
 const CACHE_CONTROL_HEADER: HeaderName = HeaderName::from_static("cache-control");
 const LAST_MODIFIED_HEADER: HeaderName = HeaderName::from_static("last-modified");
+
+// `bc-prefixes` cursor. TOTAL and EPOCH describe the whole list, so only the frontier carries them.
+pub(crate) const X_RAVEN_INDEX_BASE: HeaderName = HeaderName::from_static("x-raven-index-base");
+pub(crate) const X_RAVEN_INDEX_NEXT: HeaderName = HeaderName::from_static("x-raven-index-next");
+pub(crate) const X_RAVEN_INDEX_TOTAL: HeaderName = HeaderName::from_static("x-raven-index-total");
+pub(crate) const X_RAVEN_INDEX_EPOCH: HeaderName = HeaderName::from_static("x-raven-index-epoch");
 
 /// Hex-encoded 32-byte blob. No `0x` prefix (matches Railgun upstream).
 type HexHash = String;
@@ -148,6 +164,7 @@ const MAX_SHIM_LOOKUP_PAIRS: usize = 16_384;
 const POIS_PER_LIST_ROUTE: &str = "pois-per-list";
 const MERKLE_PROOFS_ROUTE: &str = "merkle-proofs";
 const COMMIT_TREE_PROOF_ROUTE: &str = "commit-tree-merkle-proof";
+#[cfg(feature = "json-index-channel")]
 const BC_TO_IDX_MAP_ROUTE: &str = "bc-to-idx-map";
 const STATUS_HEADER_ROUTE: &str = "status-header";
 #[cfg(feature = "prefix-index-channel")]
@@ -168,14 +185,35 @@ fn refuse_uncovered(route: &'static str, refusal: &CoverageRefusal) -> StatusCod
     StatusCode::SERVICE_UNAVAILABLE
 }
 
+/// Every mirror feed as readiness reads it. Taken once per request, because the probe locks
+/// every store on every list.
+fn read_mirror_feeds<S: PirScheme>(app: &AppState<S>) -> Vec<MirrorFeedView> {
+    app.mirror_feeds
+        .as_ref()
+        .map(|probe| probe())
+        .unwrap_or_default()
+}
+
+/// Upstream's latest row count for `list_key`. No feed, or one whose last answer was a full
+/// page, gives none.
+fn upstream_tip(feeds: &[MirrorFeedView], list_key: &[u8; 32]) -> Option<UpstreamTip> {
+    let wanted = hex_encode(list_key);
+    let feed = feeds.iter().find(|feed| feed.list_key == wanted)?;
+    Some(UpstreamTip {
+        rows: feed.upstream_rows?,
+        age_secs: feed.seconds_since_answer?,
+    })
+}
+
 fn cover_list<'a, S: PirScheme>(
     app: &'a AppState<S>,
     list_key: [u8; 32],
     route: &'static str,
+    feeds: &[MirrorFeedView],
 ) -> Result<ListCoverage<'a>, StatusCode> {
     if let Some(registry) = app.shim_stores.as_ref().as_ref() {
         return registry
-            .prove_list_coverage(&list_key)
+            .prove_list_coverage(&list_key, upstream_tip(feeds, &list_key))
             .map_err(|refusal| refuse_uncovered(route, &refusal));
     }
     app.logical_store
@@ -237,8 +275,9 @@ pub(crate) async fn pois_per_list_handler<S: PirScheme>(
     // spread across fewer rows.
     let mut out: PoisPerListMap = PoisPerListMap::new();
     let mut per_key_statuses: Vec<Vec<Option<u8>>> = Vec::with_capacity(list_keys.len());
+    let feeds = read_mirror_feeds(&app);
     for list_key in &list_keys {
-        let coverage = cover_list(&app, *list_key, POIS_PER_LIST_ROUTE)?;
+        let coverage = cover_list(&app, *list_key, POIS_PER_LIST_ROUTE, &feeds)?;
         per_key_statuses.push(coverage.statuses_of(&blinded_commitments));
         coverage
             .recheck_frontier()
@@ -282,7 +321,12 @@ pub(crate) async fn merkle_proofs_handler<S: PirScheme>(
     }
     // The 404 below is an absence claim, so it needs the same whole-list proof the status
     // routes need: without it, "not in my block" is served as "not in the list".
-    let coverage = cover_list(&app, list_key, MERKLE_PROOFS_ROUTE)?;
+    let coverage = cover_list(
+        &app,
+        list_key,
+        MERKLE_PROOFS_ROUTE,
+        &read_mirror_feeds(&app),
+    )?;
     let mut proofs = Vec::with_capacity(blinded_commitments.len());
     for bc in &blinded_commitments {
         // The proof itself comes from the block that HOLDS the row: a block IMT is exactly
@@ -318,10 +362,11 @@ pub(crate) async fn commit_tree_proof_handler<S: PirScheme>(
 }
 
 /// JSON shape returned by `GET /v1/poi/:list_key_hex/bc-to-idx-map`.
+#[cfg(feature = "json-index-channel")]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BcToIdxMapResponse {
-    /// Block height at time of snapshot.
+    /// Lowest block height any covering store has applied; 0 for a mirrored PPOI list.
     pub epoch: u64,
     /// Hex-encoded 32-byte list key.
     pub list_key: HexHash,
@@ -330,6 +375,7 @@ pub struct BcToIdxMapResponse {
 }
 
 /// One row of the bc-to-idx publishing channel.
+#[cfg(feature = "json-index-channel")]
 #[derive(Debug, Clone, Serialize)]
 pub struct BcIdxEntry {
     /// Hex-encoded blinded commitment.
@@ -338,26 +384,61 @@ pub struct BcIdxEntry {
     pub idx: u32,
 }
 
-/// Prefix width for the default-off binary index channel.
+/// Prefix width for the binary index channel.
 pub const BC_INDEX_PREFIX_BYTES: usize = 6;
 
+/// Largest body the index channel can emit: the list's size decides how many segments a
+/// cold client walks, never how large one of them is.
 #[cfg(feature = "prefix-index-channel")]
-pub(crate) async fn bc_prefix_array_handler<S: PirScheme>(
+pub const BC_INDEX_SEGMENT_MAX_BYTES: usize =
+    BC_INDEX_PREFIX_BYTES * LEAVES_PER_PPOI_BLOCK as usize;
+
+/// Query string of `GET /v1/poi/:list_key_hex/bc-prefixes`.
+#[cfg(feature = "prefix-index-channel")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct IndexSegmentQuery {
+    /// Global index to resume from. Absent means the head of the list.
+    #[serde(default)]
+    pub since: Option<u32>,
+}
+
+#[cfg(feature = "prefix-index-channel")]
+pub(crate) async fn bc_prefix_segment_handler<S: PirScheme>(
     State(app): State<AppState<S>>,
     Path(list_key_hex): Path<String>,
+    Query(segment): Query<IndexSegmentQuery>,
     headers_in: HeaderMap,
 ) -> Result<axum::response::Response, StatusCode> {
     let list_key = hex_decode_32(&list_key_hex).ok_or(StatusCode::BAD_REQUEST)?;
-    // Ordinal position in this array IS the global index, so a partial array renumbers
-    // every row after the gap.
-    let coverage = cover_list(&app, list_key, BC_PREFIXES_ROUTE)?;
-    let leaves = coverage.leaves();
+    let coverage = cover_list(&app, list_key, BC_PREFIXES_ROUTE, &read_mirror_feeds(&app))?;
+    // Epoch before rows, so it never names a height whose rows are missing from the body.
     let epoch = coverage.epoch();
+    let leaves = coverage.leaves();
     coverage
         .recheck_frontier()
         .map_err(|refusal| refuse_uncovered(BC_PREFIXES_ROUTE, &refusal))?;
-    let mut body = Vec::with_capacity(leaves.len().saturating_mul(BC_INDEX_PREFIX_BYTES));
-    for leaf in &leaves {
+
+    let total = u32::try_from(leaves.len()).unwrap_or(u32::MAX);
+    let since = segment.since.unwrap_or(0);
+    // Past the frontier the caller holds rows this epoch does not, which is a rollback to
+    // report rather than an empty body to absorb.
+    if since > total {
+        return Err(StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+    // A block below the frontier is full, so its rows can never change again; that is what
+    // bounds the response and what makes the segment cacheable forever.
+    let block_end = (since / LEAVES_PER_PPOI_BLOCK)
+        .saturating_add(1)
+        .saturating_mul(LEAVES_PER_PPOI_BLOCK);
+    let next = block_end.min(total);
+    let sealed = next == block_end;
+
+    let skip = usize::try_from(since).unwrap_or(usize::MAX);
+    let take = usize::try_from(next.saturating_sub(since)).unwrap_or(usize::MAX);
+    // Ordinal position in a proven coverage IS the global index, so `since` indexes the
+    // row vector directly.
+    let mut body = Vec::with_capacity(take.saturating_mul(BC_INDEX_PREFIX_BYTES));
+    for leaf in leaves.iter().skip(skip).take(take) {
         body.extend(
             leaf.blinded_commitment
                 .iter()
@@ -365,11 +446,35 @@ pub(crate) async fn bc_prefix_array_handler<S: PirScheme>(
                 .take(BC_INDEX_PREFIX_BYTES),
         );
     }
+
+    let mut extra = vec![
+        (X_RAVEN_INDEX_BASE, HeaderValue::from(since)),
+        (X_RAVEN_INDEX_NEXT, HeaderValue::from(next)),
+    ];
+    // An immutable response may carry only what is immutable: a cache holds it for a year, and
+    // a list-wide total or epoch read off it then contradicts the frontier's.
+    let last_modified = if sealed {
+        extra.push((
+            CACHE_CONTROL_HEADER,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        ));
+        None
+    } else {
+        extra.push((X_RAVEN_INDEX_TOTAL, HeaderValue::from(total)));
+        extra.push((X_RAVEN_INDEX_EPOCH, HeaderValue::from(epoch)));
+        extra.push((
+            CACHE_CONTROL_HEADER,
+            HeaderValue::from_static("public, max-age=15, must-revalidate"),
+        ));
+        Some(epoch)
+    };
+
     Ok(serve_publishing_bytes(
         body,
-        epoch,
+        last_modified,
         &headers_in,
         HeaderValue::from_static("application/octet-stream"),
+        &extra,
     ))
 }
 
@@ -377,7 +482,7 @@ pub(crate) async fn bc_prefix_array_handler<S: PirScheme>(
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusHeaderResponse {
-    /// Block height at time of snapshot.
+    /// Lowest block height any covering store has applied; 0 for a mirrored PPOI list.
     pub epoch: u64,
     /// Hex-encoded 32-byte list key.
     pub list_key: HexHash,
@@ -387,13 +492,19 @@ pub struct StatusHeaderResponse {
     pub pending_bcs: Vec<HexHash>,
 }
 
+#[cfg(feature = "json-index-channel")]
 pub(crate) async fn bc_to_idx_map_handler<S: PirScheme>(
     State(app): State<AppState<S>>,
     Path(list_key_hex): Path<String>,
     headers_in: HeaderMap,
 ) -> Result<axum::response::Response, StatusCode> {
     let list_key = hex_decode_32(&list_key_hex).ok_or(StatusCode::BAD_REQUEST)?;
-    let coverage = cover_list(&app, list_key, BC_TO_IDX_MAP_ROUTE)?;
+    let coverage = cover_list(
+        &app,
+        list_key,
+        BC_TO_IDX_MAP_ROUTE,
+        &read_mirror_feeds(&app),
+    )?;
     let leaves = coverage.leaves();
     let epoch = coverage.epoch();
     coverage
@@ -423,7 +534,12 @@ pub(crate) async fn status_header_handler<S: PirScheme>(
     let list_key = hex_decode_32(&list_key_hex).ok_or(StatusCode::BAD_REQUEST)?;
     // Both fields are SETS over the list; a partial store silently shrinks the blocked set,
     // which reads as "nothing is blocked".
-    let coverage = cover_list(&app, list_key, STATUS_HEADER_ROUTE)?;
+    let coverage = cover_list(
+        &app,
+        list_key,
+        STATUS_HEADER_ROUTE,
+        &read_mirror_feeds(&app),
+    )?;
     let leaves = coverage.leaves();
     let epoch = coverage.epoch();
     coverage
@@ -467,17 +583,21 @@ fn serve_publishing_channel<T: Serialize>(
     let json = serde_json::to_vec(body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(serve_publishing_bytes(
         json,
-        epoch,
+        Some(epoch),
         headers_in,
         HeaderValue::from_static("application/json"),
+        &[],
     ))
 }
 
+/// `extra` lands on the 304 as well, so a resuming client learns where to continue from a
+/// response whose body it already holds.
 fn serve_publishing_bytes(
     body: Vec<u8>,
-    epoch: u64,
+    last_modified: Option<u64>,
     headers_in: &HeaderMap,
     content_type: HeaderValue,
+    extra: &[(HeaderName, HeaderValue)],
 ) -> axum::response::Response {
     let mut hasher = Sha256::new();
     hasher.update(&body);
@@ -503,6 +623,9 @@ fn serve_publishing_bytes(
         if let Ok(v) = HeaderValue::from_str(&etag) {
             hdrs.insert(ETAG_HEADER, v);
         }
+        for (name, value) in extra {
+            hdrs.insert(name.clone(), value.clone());
+        }
         return (StatusCode::NOT_MODIFIED, hdrs).into_response();
     }
 
@@ -511,13 +634,16 @@ fn serve_publishing_bytes(
     if let Ok(v) = HeaderValue::from_str(&etag) {
         hdrs.insert(ETAG_HEADER, v);
     }
-    if let Ok(v) = HeaderValue::from_str(&epoch.to_string()) {
-        hdrs.insert(LAST_MODIFIED_HEADER, v);
+    if let Some(epoch) = last_modified {
+        hdrs.insert(LAST_MODIFIED_HEADER, HeaderValue::from(epoch));
     }
     hdrs.insert(
         CACHE_CONTROL_HEADER,
         HeaderValue::from_static("public, max-age=15, must-revalidate"),
     );
+    for (name, value) in extra {
+        hdrs.insert(name.clone(), value.clone());
+    }
     (StatusCode::OK, hdrs, body).into_response()
 }
 
@@ -532,17 +658,18 @@ pub fn poi_shim_routes<S: PirScheme>(state: AppState<S>) -> axum::Router {
             post(commit_tree_proof_handler::<S>),
         )
         .route(
-            "/v1/poi/:list_key_hex/bc-to-idx-map",
-            get(bc_to_idx_map_handler::<S>),
-        )
-        .route(
             "/v1/poi/:list_key_hex/status-header",
             get(status_header_handler::<S>),
         );
+    #[cfg(feature = "json-index-channel")]
+    let router = router.route(
+        "/v1/poi/:list_key_hex/bc-to-idx-map",
+        get(bc_to_idx_map_handler::<S>),
+    );
     #[cfg(feature = "prefix-index-channel")]
     let router = router.route(
         "/v1/poi/:list_key_hex/bc-prefixes",
-        get(bc_prefix_array_handler::<S>),
+        get(bc_prefix_segment_handler::<S>),
     );
     router.with_state(state)
 }

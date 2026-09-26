@@ -157,6 +157,15 @@ fn crs_wire_bytes(crs: &ServerCrs) -> raven_inspire::pir::Result<Vec<u8>> {
     .to_versioned_bytes()
 }
 
+fn count_establish_refusal(instance_id: &InstanceId, reason: &'static str) {
+    metrics::counter!(
+        "raven_railgun_session_establish_refused_total",
+        "instance" => instance_id.to_string(),
+        "reason" => reason
+    )
+    .increment(1);
+}
+
 pub(crate) async fn session_establish_handler(
     State(app): State<AppState<RavenInspireScheme>>,
     Path(id): Path<String>,
@@ -171,11 +180,7 @@ pub(crate) async fn session_establish_handler(
     let snapshot = instance.current_snapshot();
     let state: &InspireServerState = snapshot.state.as_ref();
 
-    let token = headers_in
-        .get(http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+    // No credential: `x-raven-client-id` is the whole session identity.
     let client_id = require_client_id_header(&headers_in).map_err(|()| StatusCode::BAD_REQUEST)?;
 
     let keys: ClientPackingKeys = read_versioned(&body).map_err(|err| {
@@ -185,21 +190,42 @@ pub(crate) async fn session_establish_handler(
         );
         StatusCode::BAD_REQUEST
     })?;
+    // A re-handshake under one identity must cost the pool the slot it already holds,
+    // not a second one: the superseded keys are unreachable the moment the map moves.
+    let session_key = SessionKey::new(instance_id.clone(), client_id);
+    if let Some(superseded) = app.sessions.take(&session_key) {
+        state.session_store.remove(superseded);
+    }
+
     let pack_params = state.cache.pack_params();
     let ctx = state.crs.params.ntt_context();
     let handle = state
         .session_store
         .register_server_side(keys, pack_params, &ctx)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|error| {
+            tracing::warn!(%error, "session establish refused");
+            // At the ceiling the store refuses rather than retiring another caller's
+            // keys, so the caller is being asked to wait, not told the server broke.
+            if state.session_store.len() >= state.session_store.limits().max_sessions {
+                count_establish_refusal(&instance_id, "pool");
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
     if instance.current_epoch() != snapshot.epoch {
         state.session_store.remove(handle);
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    let session_key = SessionKey::new(token, instance_id.clone(), client_id);
-    let ttl = Duration::from_secs(app.config.session_ttl_secs);
+    // The binding must not lapse before the seat it names: a re-handshake after that finds
+    // nothing to take, and the old seat stays held until the store's own expiry.
+    let ttl = state.session_store.limits().ttl;
     let now = Instant::now();
-    let expires_at = now + ttl;
+    let Some(expires_at) = now.checked_add(ttl) else {
+        state.session_store.remove(handle);
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
     let outcome = app.sessions.upsert(
         session_key,
         handle,
@@ -207,6 +233,11 @@ pub(crate) async fn session_establish_handler(
         app.config.session_lru_cap,
         now,
     );
+    if outcome == EvictionOutcome::AtCapacity {
+        state.session_store.remove(handle);
+        count_establish_refusal(&instance_id, "binding");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
 
     metrics::counter!(
         "raven_railgun_sessions_established_total",
@@ -220,18 +251,11 @@ pub(crate) async fn session_establish_handler(
         "instance" => instance_id.to_string()
     )
     .set(occupancy);
-    if matches!(outcome, EvictionOutcome::Pressure) {
-        metrics::counter!(
-            "raven_railgun_session_eviction_pressure_total",
-            "instance" => instance_id.to_string()
-        )
-        .increment(1);
-    }
 
     let expires_at_unix_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
-        .saturating_add(app.config.session_ttl_secs);
+        .saturating_add(ttl.as_secs());
 
     let mut hdrs = HeaderMap::new();
     hdrs.insert(

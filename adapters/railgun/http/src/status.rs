@@ -315,6 +315,66 @@ pub struct HealthReadyResponse {
     /// exactly one event while the next block's route is installed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub router_unrouted_targets: Vec<String>,
+    /// One entry per mirrored PPOI list; omitted when no feed is wired. A list in
+    /// [`MirrorFeedState::NeverFed`] or [`MirrorFeedState::Stopped`] forces 503.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirror_feeds: Vec<MirrorFeedView>,
+}
+
+/// Where one PPOI list's upstream feed stands. The first that applies, in this order.
+///
+/// The HTTP status carries the two that fail readiness, so `curl -f` in a container
+/// HEALTHCHECK reports them as unhealthy. It carries the other three as ready, and `curl` then
+/// prints the body, so the container's health log still records which one it was.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MirrorFeedState {
+    /// The feed stopped for good, so the list cannot advance until a restart. Fails readiness.
+    Stopped,
+    /// No instance on the list holds a row: every query would read as absent. Fails readiness,
+    /// including when upstream answers with an empty list, which is what a wrong list key gets.
+    NeverFed,
+    /// The node holds rows and upstream's last request failed. Readiness holds: the rows served
+    /// are still upstream's, and only rows newer than the last answer are missing. Taking the
+    /// node out would make a third party's outage this node's outage.
+    UpstreamRefusing,
+    /// Upstream's last answer was short of a full page, and every row it held is applied in
+    /// every instance that holds its index. Healthy and idle. This is the trigger to wait for
+    /// before stopping the process to export a snapshot: a graceful stop then commits every row
+    /// upstream had.
+    CaughtUp,
+    /// The node holds rows and is still paging toward upstream's tip, or applying the rows its
+    /// last answer delivered.
+    Syncing,
+}
+
+impl MirrorFeedState {
+    /// Whether this state takes the node out of rotation.
+    #[must_use]
+    pub const fn fails_readiness(self) -> bool {
+        matches!(self, Self::Stopped | Self::NeverFed)
+    }
+}
+
+/// One PPOI list's upstream feed in [`HealthReadyResponse`].
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MirrorFeedView {
+    /// Lowercase hex list key.
+    pub list_key: String,
+    /// See [`MirrorFeedState`].
+    pub state: MirrorFeedState,
+    /// One past the highest list-wide index any instance on the list has applied.
+    pub rows_held: u64,
+    /// Upstream's row count as of its last answer, when that answer was short of a full page.
+    pub upstream_rows: Option<u64>,
+    /// List-wide index the feed asks upstream for next.
+    pub next_index: u64,
+    /// Requests upstream has failed since it last answered.
+    pub consecutive_failures: u64,
+    /// Class of the latest failure, naming no endpoint; `None` once upstream answers.
+    pub last_failure: Option<String>,
+    /// Seconds since upstream last answered; `None` if it has not in this process.
+    pub seconds_since_answer: Option<u64>,
 }
 
 /// Indexer-consumer view in [`HealthReadyResponse`].
@@ -423,6 +483,7 @@ pub(crate) async fn health_ready_handler<S: PirScheme>(
             wal_replay_skipped_instances: Vec::new(),
             stalled_consumer_instances: Vec::new(),
             router_unrouted_targets: Vec::new(),
+            mirror_feeds: Vec::new(),
         };
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body));
     }
@@ -430,6 +491,11 @@ pub(crate) async fn health_ready_handler<S: PirScheme>(
     let divergent = raven_railgun_engine::persistence::layer2_divergent_instances();
     let replay_skipped = raven_railgun_engine::persistence::wal_replay_skipped_instances();
     let stalled = stalled_consumer_instances(&app);
+    let mirror_feeds = app
+        .mirror_feeds
+        .as_ref()
+        .map(|probe| probe())
+        .unwrap_or_default();
     let consumer = app.consumer_metrics.as_ref().as_ref().map(|m| {
         let snap = *m.lock();
         HealthConsumerView {
@@ -462,10 +528,14 @@ pub(crate) async fn health_ready_handler<S: PirScheme>(
     // the route afterwards -- so a newly observed tree, and every list crossing a block
     // boundary, legitimately misses for a short window. A latching mark would turn that
     // routine window into a permanent 503; a mark the next delivery clears does not.
+    //
+    // A mirrored list with no row answers every query as absent, and a stopped feed never
+    // advances again; both fail closed. An upstream refusing a node that holds rows does not.
     let (code, status) = if divergent.is_empty()
         && replay_skipped.is_empty()
         && stalled.is_empty()
         && unrouted_targets.is_empty()
+        && !mirror_feeds.iter().any(|feed| feed.state.fails_readiness())
     {
         (StatusCode::OK, "ready")
     } else {
@@ -481,6 +551,7 @@ pub(crate) async fn health_ready_handler<S: PirScheme>(
         wal_replay_skipped_instances: replay_skipped,
         stalled_consumer_instances: stalled,
         router_unrouted_targets: unrouted_targets,
+        mirror_feeds,
     };
     (code, Json(body))
 }

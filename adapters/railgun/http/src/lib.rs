@@ -4,6 +4,7 @@
 //! No `CompressionLayer`: PIR ciphertext is incompressible.
 //! `trust_proxy_header` + `trusted_proxy_cidrs` gate whether forwarding headers
 //! are read at all; an untrusted peer always keys to its socket address.
+//! The read path needs no credential, so that per-IP key is the only thing bounding it.
 
 #![cfg_attr(
     test,
@@ -48,13 +49,12 @@ pub use versioned::{
     VersionedDecodeError, WIRE_SCHEMA_PREFIX_LEN, WIRE_SCHEMA_VERSION, X_RAVEN_SCHEMA_VERSION,
 };
 
-use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, DefaultBodyLimit},
+    extract::DefaultBodyLimit,
     http::{header::HeaderName, HeaderMap, HeaderValue, Request, StatusCode},
     middleware,
     response::Response,
@@ -63,7 +63,6 @@ use axum::{
 };
 use raven_railgun_engine::inspire::RavenInspireScheme;
 use raven_railgun_engine::PirScheme;
-use std::net::SocketAddr;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::Span;
@@ -121,7 +120,11 @@ pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
         rate_limited.layer(build_governor_layer_peer(rps, burst))
     };
 
-    // Bypasses Governor so scrape + SSE never exhaust the per-IP burst.
+    // Its OWN Governor bucket, not none. The original split existed so a scrape or an SSE
+    // reconnect could not exhaust the per-IP burst the query path needs -- an independent bucket
+    // at the same `(rps, burst)` keeps exactly that and stops these four being the one group
+    // that is both uncredentialed and unlimited. `/v1/events` needs more than a rate limit
+    // anyway: see `max_sse_connections`, which bounds what is HELD rather than what arrives.
     let public = Router::new()
         .route("/v1/health/live", get(health_live_handler))
         .route("/v1/health/ready", get(health_ready_handler::<S>))
@@ -129,6 +132,12 @@ pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
         .route("/metrics", get(metrics_handler::<S>))
         .with_state(state)
         .layer(auth_layer);
+
+    let public = if let Some(extractor) = trusted_proxies.clone() {
+        public.layer(build_governor_layer_trusted(rps, burst, extractor)?)
+    } else {
+        public.layer(build_governor_layer_peer(rps, burst))
+    };
 
     let base = rate_limited.merge(public);
 
@@ -167,8 +176,8 @@ pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
         ))
 }
 
-/// Inspire router; adds `/session` and `/params`. Splits into a Governor-limited
-/// scope and a public scope so scrapes and SSE cannot exhaust the per-IP burst.
+/// Inspire router; adds `/session` and `/params`. Two Governor buckets, so scrapes and SSE
+/// cannot exhaust the query path's per-IP burst.
 pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, String> {
     let trusted_proxies = resolve_trusted_proxies(&state.config)?;
     let rps = state.config.rate_limit_rps.max(1);
@@ -218,7 +227,9 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
         rate_limited.layer(build_governor_layer_peer(rps, burst))
     };
 
-    // Bypasses Governor only; `bearer_auth` still applies.
+    // Its own Governor bucket, as in `router`, so a scrape or an SSE reconnect cannot spend the
+    // query path's burst. `bearer_auth` still gates `/metrics` while it is default-deny; the other
+    // three need no credential.
     let public = Router::new()
         .route("/v1/health/live", get(health_live_handler))
         .route(
@@ -229,6 +240,12 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
         .route("/metrics", get(metrics_handler::<RavenInspireScheme>))
         .with_state(state)
         .layer(auth_layer);
+
+    let public = if let Some(extractor) = trusted_proxies.clone() {
+        public.layer(build_governor_layer_trusted(rps, burst, extractor)?)
+    } else {
+        public.layer(build_governor_layer_peer(rps, burst))
+    };
 
     let base = rate_limited.merge(public);
 
@@ -298,11 +315,18 @@ fn resolve_trusted_proxies(
     Ok(Some(TrustedProxyIpKeyExtractor::new(ranges.into())))
 }
 
+/// One cell every `1/rps` seconds. `GovernorConfigBuilder::per_second` takes a PERIOD in
+/// seconds, not a rate, so passing `rate_limit_rps` to it read as "one request per 200
+/// seconds" - 40,000x the configured limit, in the strict direction.
+fn replenish_period(rps: u64) -> Duration {
+    Duration::from_nanos(1_000_000_000 / rps.clamp(1, 1_000_000_000))
+}
+
 fn build_governor_layer_peer(rps: u64, burst: u32) -> RavenGovernorLayerPeer {
     use tower_governor::governor::GovernorConfigBuilder;
     use tower_governor::GovernorLayer;
     let cfg = GovernorConfigBuilder::default()
-        .per_second(rps)
+        .period(replenish_period(rps))
         .burst_size(burst)
         .finish();
     let cfg = match cfg {
@@ -330,7 +354,7 @@ fn build_governor_layer_trusted(
     let burst = burst.max(1);
     let cfg = GovernorConfigBuilder::default()
         .key_extractor(extractor)
-        .per_second(rps)
+        .period(replenish_period(rps))
         .burst_size(burst)
         .finish()
         .ok_or_else(|| {
@@ -344,10 +368,24 @@ fn build_governor_layer_trusted(
     })
 }
 
-/// CORS layer exposing `X-Raven-*` over GET + POST; `None` when no origins are set.
+/// Every non-safelisted header a client reads; a browser sees `null` for any header missing here.
+const CORS_EXPOSED_HEADERS: [HeaderName; 10] = [
+    X_RAVEN_EPOCH,
+    X_RAVEN_SCHEME,
+    HeaderName::from_static(X_RAVEN_SCHEMA_VERSION_HEADER),
+    X_RAVEN_SESSION,
+    X_RAVEN_FRESHNESS,
+    poi_shim::X_RAVEN_INDEX_BASE,
+    poi_shim::X_RAVEN_INDEX_NEXT,
+    poi_shim::X_RAVEN_INDEX_TOTAL,
+    poi_shim::X_RAVEN_INDEX_EPOCH,
+    // tower_governor 0.4 emits `x-ratelimit-after`, not `retry-after`.
+    HeaderName::from_static("x-ratelimit-after"),
+];
+
+/// CORS layer over GET + POST; `None` when no origins are set.
 fn build_cors_layer(allowed_origins: &[String]) -> Option<CorsLayer> {
     use http::header::{AUTHORIZATION, CONTENT_TYPE};
-    use http::HeaderName;
     use http::HeaderValue;
     use http::Method;
     if allowed_origins.is_empty() {
@@ -369,14 +407,7 @@ fn build_cors_layer(allowed_origins: &[String]) -> Option<CorsLayer> {
                 CONTENT_TYPE,
                 HeaderName::from_static("x-raven-client-id"),
             ])
-            .expose_headers([
-                http::HeaderName::from_static("x-raven-epoch"),
-                http::HeaderName::from_static("x-raven-scheme"),
-                http::HeaderName::from_static("x-raven-schema-version"),
-                http::HeaderName::from_static("x-raven-session"),
-                // tower_governor 0.4 emits `x-ratelimit-after`, not `retry-after`.
-                http::HeaderName::from_static("x-ratelimit-after"),
-            ]),
+            .expose_headers(CORS_EXPOSED_HEADERS),
     )
 }
 
@@ -435,13 +466,6 @@ pub(crate) fn attach_freshness_header(
     }
 }
 
-#[allow(dead_code)]
-fn extract_client_ip(req: &Request<Body>) -> Option<IpAddr> {
-    req.extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(sa)| sa.ip())
-}
-
 /// Install or return the process-global Prometheus recorder (idempotent via `OnceLock`).
 pub(crate) fn global_prometheus_handle(
 ) -> Result<Arc<metrics_exporter_prometheus::PrometheusHandle>, String> {
@@ -475,7 +499,7 @@ pub(crate) fn global_prometheus_handle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{ct_eq_str, stable_hash_token, EvictionOutcome, SessionKey, SessionMap};
+    use crate::auth::{ct_eq_str, EvictionOutcome, SessionKey, SessionMap};
     use crate::config::{HTTP_MAX_BODY_CEILING, HTTP_MAX_FANOUT_CEILING};
     use raven_inspire::ServerSessionHandle;
     use raven_railgun_core::InstanceId;
@@ -622,23 +646,23 @@ mod tests {
     }
 
     #[test]
-    fn session_key_stable_hash_is_deterministic() {
-        let h1 = stable_hash_token("alpha-token");
-        let h2 = stable_hash_token("alpha-token");
-        let h3 = stable_hash_token("beta-token");
-        assert_eq!(h1, h2, "same input must produce same hash");
-        assert_ne!(h1, h3, "different inputs must produce different hashes");
+    fn session_key_eq_is_instance_and_client_id() {
+        let zero = [0u8; 16];
+        let a = SessionKey::new(InstanceId::new("toy"), zero);
+        let b = SessionKey::new(InstanceId::new("toy"), zero);
+        let c = SessionKey::new(InstanceId::new("other"), zero);
+        assert_eq!(a, b, "same instance + client_id must produce equal keys");
+        assert_ne!(a, c, "a different instance must differentiate");
     }
 
     #[test]
-    fn session_key_eq_round_trips_via_stable_hash() {
-        let id = InstanceId::new("toy");
-        let zero = [0u8; 16];
-        let a = SessionKey::new("token-X", id.clone(), zero);
-        let b = SessionKey::new("token-X", id.clone(), zero);
-        let c = SessionKey::new("token-Y", id, zero);
-        assert_eq!(a, b, "same token + instance must produce equal keys");
-        assert_ne!(a, c, "different token must differentiate");
+    fn replenish_period_reads_rate_limit_rps_as_a_rate() {
+        assert_eq!(replenish_period(200), Duration::from_millis(5));
+        assert_eq!(replenish_period(1), Duration::from_secs(1));
+        // Clamped, because a zero period makes `GovernorConfigBuilder::finish` return None
+        // and the whole limiter silently fall back to 1 request per second.
+        assert_eq!(replenish_period(0), Duration::from_secs(1));
+        assert!(replenish_period(u64::MAX).as_nanos() > 0);
     }
 
     #[test]
@@ -829,21 +853,118 @@ mod tests {
         );
     }
 
+    /// A browser reads `null` for an unexposed header, and the SDK refuses a private reply
+    /// whose freshness it cannot read. Built from the functions the handlers call, so a
+    /// header added there without exposure fails here.
+    #[tokio::test]
+    async fn cors_exposes_every_raven_header_a_query_response_carries() {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let origin = "https://wallet.example.com";
+        let cors = super::build_cors_layer(&[origin.to_owned()]).expect("cors layer");
+        let app: Router = Router::new()
+            .route(
+                "/reply",
+                get(|| async {
+                    let mut headers = build_response_headers(7, "raven-inspire").expect("headers");
+                    attach_freshness_header(&mut headers, None, 7);
+                    headers.insert(X_RAVEN_SESSION, HeaderValue::from_static("0"));
+                    headers
+                }),
+            )
+            .layer(cors);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/reply")
+                    .header("origin", origin)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        let exposed: Vec<String> = response
+            .headers()
+            .get_all("access-control-expose-headers")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(|name| name.trim().to_ascii_lowercase())
+            .collect();
+        let served: Vec<&str> = response
+            .headers()
+            .keys()
+            .map(HeaderName::as_str)
+            .filter(|name| name.starts_with("x-raven-"))
+            .collect();
+        assert!(
+            served.contains(&X_RAVEN_FRESHNESS.as_str()),
+            "the reply must carry freshness, or this test proves nothing: {served:?}"
+        );
+        for name in served {
+            assert!(
+                exposed.iter().any(|e| e == name),
+                "{name} is served but not exposed, so a browser reads it as null: {exposed:?}"
+            );
+        }
+    }
+
     #[test]
-    fn session_map_eviction_outcome_pressure_when_cap_full_with_live_entries() {
+    fn session_map_refuses_a_new_key_when_cap_full_with_live_entries() {
         use std::time::{Duration, Instant};
         let map = SessionMap::new();
         let now = Instant::now();
         let ttl = Duration::from_secs(3600);
         let zero = [0u8; 16];
-        let k1 = SessionKey::new("a", InstanceId::new("toy"), zero);
-        let k2 = SessionKey::new("b", InstanceId::new("toy"), zero);
-        let k3 = SessionKey::new("c", InstanceId::new("toy"), zero);
+        let k1 = SessionKey::new(InstanceId::new("a"), zero);
+        let k2 = SessionKey::new(InstanceId::new("b"), zero);
+        let k3 = SessionKey::new(InstanceId::new("c"), zero);
         let h = ServerSessionHandle(1);
-        let _ = map.upsert(k1, h, now + ttl, 2, now);
+        let _ = map.upsert(k1.clone(), h, now + ttl, 2, now);
         let _ = map.upsert(k2, h, now + ttl + Duration::from_secs(1), 2, now);
-        let outcome = map.upsert(k3, h, now + ttl + Duration::from_secs(2), 2, now);
-        assert!(matches!(outcome, EvictionOutcome::Pressure));
+        let outcome = map.upsert(k3.clone(), h, now + ttl + Duration::from_secs(2), 2, now);
+        assert!(matches!(outcome, EvictionOutcome::AtCapacity));
+        assert_eq!(map.len(), 2, "the refusal must not insert");
+        assert_eq!(
+            map.get(&k1, now),
+            Some(h),
+            "the incumbent must keep its binding"
+        );
+        assert!(map.get(&k3, now).is_none());
+        assert!(
+            matches!(map.upsert(k1, h, now + ttl, 2, now), EvictionOutcome::None),
+            "a caller that already holds a slot must always be able to refresh it"
+        );
+    }
+
+    #[test]
+    fn session_map_reclaims_expired_entries_before_refusing() {
+        use std::time::{Duration, Instant};
+        let map = SessionMap::new();
+        let now = Instant::now();
+        let zero = [0u8; 16];
+        let dead = SessionKey::new(InstanceId::new("dead"), zero);
+        let live = SessionKey::new(InstanceId::new("live"), zero);
+        let fresh = SessionKey::new(InstanceId::new("fresh"), zero);
+        let h = ServerSessionHandle(3);
+        let _ = map.upsert(dead, h, now + Duration::from_secs(1), 2, now);
+        let _ = map.upsert(live.clone(), h, now + Duration::from_secs(3600), 2, now);
+        let later = now + Duration::from_secs(2);
+        let outcome = map.upsert(
+            fresh.clone(),
+            h,
+            later + Duration::from_secs(3600),
+            2,
+            later,
+        );
+        assert!(matches!(outcome, EvictionOutcome::ExpiredOnly));
+        assert_eq!(map.get(&fresh, later), Some(h));
+        assert_eq!(map.get(&live, later), Some(h), "the live entry must remain");
     }
 
     #[test]
@@ -851,7 +972,7 @@ mod tests {
         use std::time::{Duration, Instant};
         let map = SessionMap::new();
         let now = Instant::now();
-        let k = SessionKey::new("a", InstanceId::new("toy"), [0u8; 16]);
+        let k = SessionKey::new(InstanceId::new("a"), [0u8; 16]);
         let h = ServerSessionHandle(7);
         let past = now
             .checked_sub(Duration::from_secs(1))

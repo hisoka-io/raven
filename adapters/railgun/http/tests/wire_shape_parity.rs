@@ -210,6 +210,7 @@ async fn pois_per_list_status_values_use_pascal_case_enum_names() {
     assert_eq!(json[&bc_c][&lk_hex].as_str(), Some("ProofSubmitted"));
 }
 
+#[cfg(feature = "json-index-channel")]
 #[tokio::test]
 async fn bc_to_idx_map_json_envelope_shape() {
     let lk = fr_canonical(0x42);

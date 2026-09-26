@@ -1,5 +1,7 @@
-//! Token rotation must bind immediately for new requests while leaving in-flight
-//! queries that already cleared auth uninterrupted.
+//! `/metrics` is the one route the read bearer still opens, so it is where rotation is
+//! observable. Rotation must bind immediately for new scrapes while leaving in-flight
+//! work uninterrupted - and it must not reach the read path, which carries no credential
+//! to rotate.
 
 #![allow(
     clippy::expect_used,
@@ -110,12 +112,11 @@ async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
         .to_vec()
 }
 
-fn build_query_request(token: &str, nonce: u64) -> Request<Body> {
+fn build_anonymous_query_request(nonce: u64) -> Request<Body> {
     let body = write_versioned(&SleepyQuery { nonce }).expect("encode versioned body");
     let mut req = Request::builder()
         .method(Method::POST)
         .uri(format!("/v1/instance/{INSTANCE_ID}/query"))
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .body(Body::from(body))
         .expect("build query req");
@@ -123,11 +124,20 @@ fn build_query_request(token: &str, nonce: u64) -> Request<Body> {
     req
 }
 
-fn build_status_request(token: &str) -> Request<Body> {
+fn build_metrics_request(token: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder().method(Method::GET).uri("/metrics");
+    if let Some(token) = token {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let mut req = builder.body(Body::empty()).expect("build metrics req");
+    inject_connect_info(&mut req);
+    req
+}
+
+fn build_anonymous_status_request() -> Request<Body> {
     let mut req = Request::builder()
         .method(Method::GET)
         .uri("/v1/status")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .body(Body::empty())
         .expect("build status req");
     inject_connect_info(&mut req);
@@ -135,52 +145,73 @@ fn build_status_request(token: &str) -> Request<Body> {
 }
 
 #[tokio::test]
-async fn bearer_rotation_observable_on_status_route() {
+async fn bearer_rotation_observable_on_the_metrics_route() {
     let state = Arc::new(SleepyState::default());
     let (app_state, router) = build_state_and_router(state);
 
     let resp_pre = router
         .clone()
-        .oneshot(build_status_request(OLD_TOKEN))
+        .oneshot(build_metrics_request(Some(OLD_TOKEN)))
         .await
         .expect("dispatch pre");
     assert_eq!(
         resp_pre.status(),
         StatusCode::OK,
-        "pre-rotation OLD-token status must succeed"
+        "pre-rotation OLD-token scrape must succeed"
     );
 
     app_state.set_read_token(NEW_TOKEN);
 
     let resp_old = router
         .clone()
-        .oneshot(build_status_request(OLD_TOKEN))
+        .oneshot(build_metrics_request(Some(OLD_TOKEN)))
         .await
         .expect("dispatch old");
     assert_eq!(
         resp_old.status(),
         StatusCode::UNAUTHORIZED,
-        "post-rotation OLD-token status must be 401"
+        "post-rotation OLD-token scrape must be 401"
+    );
+
+    let resp_anon = router
+        .clone()
+        .oneshot(build_metrics_request(None))
+        .await
+        .expect("dispatch anon");
+    assert_eq!(
+        resp_anon.status(),
+        StatusCode::UNAUTHORIZED,
+        "rotating to a token nobody holds must not read as `metrics_public`"
     );
 
     let resp_new = router
         .clone()
-        .oneshot(build_status_request(NEW_TOKEN))
+        .oneshot(build_metrics_request(Some(NEW_TOKEN)))
         .await
         .expect("dispatch new");
     assert_eq!(
         resp_new.status(),
         StatusCode::OK,
-        "post-rotation NEW-token status must succeed"
+        "post-rotation NEW-token scrape must succeed"
+    );
+
+    let resp_read = router
+        .oneshot(build_anonymous_status_request())
+        .await
+        .expect("dispatch read");
+    assert_eq!(
+        resp_read.status(),
+        StatusCode::OK,
+        "rotation must not reach the credential-free read path"
     );
 }
 
-// The rotation 401/200 property on the query route restated what
-// `bearer_rotation_observable_on_status_route` proves: `router()` installs ONE
-// auth_layer cloned across both route groups (src/lib.rs), and a no-op
-// `set_read_token` mutation reds both routes identically (proved 2026-09-06).
+// The read path has no credential to rotate, so the question this asks is the one left:
+// a rotation landing mid-request must neither abort the in-flight query nor delay the
+// scrape gate. `router()` installs ONE auth_layer cloned across both route groups
+// (src/lib.rs), so the `/metrics` assertions here also cover the layer the query took.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bearer_rotation_does_not_kill_inflight_query_started_under_old_token() {
+async fn rotation_mid_request_neither_aborts_the_query_nor_lags_the_metrics_gate() {
     let sleepy = Arc::new(SleepyState {
         sleep_ms: parking_lot::Mutex::new(750),
     });
@@ -188,7 +219,7 @@ async fn bearer_rotation_does_not_kill_inflight_query_started_under_old_token() 
 
     let router_clone = router.clone();
     let inflight = tokio::spawn(async move {
-        let req = build_query_request(OLD_TOKEN, 9_001);
+        let req = build_anonymous_query_request(9_001);
         router_clone.oneshot(req).await.expect("dispatch slow")
     });
 
@@ -196,28 +227,44 @@ async fn bearer_rotation_does_not_kill_inflight_query_started_under_old_token() 
 
     app_state.set_read_token(NEW_TOKEN);
 
-    let new_req = build_query_request(NEW_TOKEN, 9_002);
-    let new_resp = router.clone().oneshot(new_req).await.expect("dispatch new");
+    let new_resp = router
+        .clone()
+        .oneshot(build_metrics_request(Some(NEW_TOKEN)))
+        .await
+        .expect("dispatch new");
     assert_eq!(
         new_resp.status(),
         StatusCode::OK,
-        "NEW-token query during in-flight OLD-token query must succeed"
+        "NEW-token scrape during an in-flight query must succeed"
     );
 
-    let old_req = build_query_request(OLD_TOKEN, 9_003);
-    let old_resp = router.clone().oneshot(old_req).await.expect("dispatch old");
+    let old_resp = router
+        .clone()
+        .oneshot(build_metrics_request(Some(OLD_TOKEN)))
+        .await
+        .expect("dispatch old");
     assert_eq!(
         old_resp.status(),
         StatusCode::UNAUTHORIZED,
-        "post-rotation OLD-token NEW-request must be 401"
+        "post-rotation OLD-token scrape must be 401 without waiting on the query"
+    );
+
+    let anon_read = router
+        .clone()
+        .oneshot(build_anonymous_query_request(9_002))
+        .await
+        .expect("dispatch anon read");
+    assert_eq!(
+        anon_read.status(),
+        StatusCode::OK,
+        "a credential-free query must be served across a rotation"
     );
 
     let inflight_resp = inflight.await.expect("join inflight task");
     assert_eq!(
         inflight_resp.status(),
         StatusCode::OK,
-        "in-flight OLD-token query must complete on its prior bearer; \
-         rotation must NOT abort it mid-flight (got {})",
+        "the in-flight query must complete; rotation must NOT abort it mid-flight (got {})",
         inflight_resp.status()
     );
     let bytes = body_bytes(inflight_resp).await;
@@ -226,5 +273,44 @@ async fn bearer_rotation_does_not_kill_inflight_query_started_under_old_token() 
     assert_eq!(
         decoded.echo_nonce, 9_001,
         "in-flight echo must match the original query nonce"
+    );
+}
+
+/// `set_read_token` takes any string, so it can install what `HttpConfig::validate` would
+/// reject. An empty token must not read as "no credential required" - neither for a missing
+/// header nor for `Authorization: Bearer ` with nothing after it, which a naive
+/// `strip_prefix(...).unwrap_or_default()` compares equal to it.
+#[tokio::test]
+async fn an_empty_rotated_token_opens_nothing() {
+    let state = Arc::new(SleepyState::default());
+    let (app_state, router) = build_state_and_router(state);
+    app_state.set_read_token("");
+
+    for (name, request) in [
+        ("a missing header", build_metrics_request(None)),
+        ("an empty bearer", build_metrics_request(Some(""))),
+    ] {
+        let status = router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("dispatch")
+            .status();
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{name} must not clear a `/metrics` gate whose token was rotated to empty"
+        );
+    }
+
+    let status = router
+        .oneshot(build_anonymous_status_request())
+        .await
+        .expect("dispatch read")
+        .status();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the read path is unaffected; a dead router would pass the refusals above"
     );
 }

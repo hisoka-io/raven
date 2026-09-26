@@ -69,9 +69,11 @@ fn encoder() -> PerLeafCommitmentEncoder {
     PerLeafCommitmentEncoder::new(32, ENTRIES_PER_SHARD, 0).expect("encoder")
 }
 
-/// Zeroes in the high 16 bytes, `tag` in the low 16; stays below the BN254 field modulus.
+/// `tag` in byte 1 and the low 16, zero elsewhere, so the value stays below the BN254 modulus
+/// and the six-byte prefix still tells two tags apart.
 fn fr_canonical(tag: u8) -> [u8; 32] {
     let mut out = [0u8; 32];
+    out[1] = tag;
     for byte in out.iter_mut().skip(16) {
         *byte = tag;
     }
@@ -314,6 +316,7 @@ async fn commit_tree_merkle_proof_route_returns_path() {
     assert_served_proof_matches_store(&json, &expected);
 }
 
+#[cfg(feature = "json-index-channel")]
 #[tokio::test]
 async fn bc_to_idx_map_emits_entries_in_index_order_with_etag() {
     let (router, list_key) = build_router();
@@ -375,11 +378,18 @@ async fn six_byte_prefix_channel_is_binary_and_index_ordered() {
         Some("application/octet-stream")
     );
     let body = body_bytes(response).await;
+    let expected: Vec<u8> = [0x11, 0x22, 0x33]
+        .into_iter()
+        .flat_map(|tag| {
+            fr_canonical(tag)
+                .into_iter()
+                .take(raven_railgun_http::poi_shim::BC_INDEX_PREFIX_BYTES)
+        })
+        .collect();
     assert_eq!(
-        body.len(),
-        3 * raven_railgun_http::poi_shim::BC_INDEX_PREFIX_BYTES
+        body, expected,
+        "row i is the prefix of the commitment seeded at index i"
     );
-    assert_eq!(body.as_slice(), &[0u8; 18]);
 }
 
 #[tokio::test]
@@ -411,6 +421,7 @@ async fn status_header_partitions_blocked_and_pending_bcs() {
 
 // ETag must equal SHA-256(body)[..16] hex for every response, even under concurrent writes.
 
+#[cfg(feature = "json-index-channel")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bc_to_idx_map_etag_matches_body_under_concurrent_updates() {
     use sha2::{Digest, Sha256};
@@ -614,4 +625,112 @@ async fn merkle_proofs_rejects_more_blinded_commitments_than_the_cap() {
         "1025 blinded commitments must be refused before the store lock is taken; \
          uncapped this body walks every entry and answers 404 on the first unknown BC"
     );
+}
+
+/// The ETag is the digest of the body that was served, so a same-epoch rewrite
+/// cannot reuse it. A 304 still has to say where to resume, or a caught-up client that
+/// revalidates loses its cursor.
+#[cfg(feature = "prefix-index-channel")]
+#[tokio::test]
+async fn index_channel_etag_is_the_body_digest_and_a_304_still_says_where_to_resume() {
+    use sha2::{Digest, Sha256};
+
+    let (router, list_key) = build_router();
+    let lk_hex = hex_encode_bytes(&list_key);
+    let uri = format!("/v1/poi/{lk_hex}/bc-prefixes");
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(&uri)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("dispatch");
+    assert_eq!(response.status(), StatusCode::OK);
+    let etag = response
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .expect("etag")
+        .to_owned();
+    let next = response
+        .headers()
+        .get("x-raven-index-next")
+        .and_then(|v| v.to_str().ok())
+        .expect("next")
+        .to_owned();
+    let body = body_bytes(response).await;
+
+    let digest = Sha256::digest(&body);
+    let expected = {
+        use std::fmt::Write as _;
+        let mut s = String::from("\"");
+        for b in digest.iter().take(16) {
+            let _ = write!(s, "{b:02x}");
+        }
+        s.push('"');
+        s
+    };
+    assert_eq!(etag, expected, "the ETag must be the served body's digest");
+    assert_eq!(
+        body.len(),
+        3 * raven_railgun_http::poi_shim::BC_INDEX_PREFIX_BYTES
+    );
+
+    let revalidated = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(&uri)
+                .header("if-none-match", &etag)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("dispatch");
+    assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        revalidated
+            .headers()
+            .get("x-raven-index-next")
+            .and_then(|v| v.to_str().ok()),
+        Some(next.as_str()),
+        "a 304 must still carry the resume cursor"
+    );
+}
+
+/// The whole-list JSON channel is a feature, not a fixture: dropping it drops its route
+/// while the bounded channel keeps answering.
+#[cfg(all(not(feature = "json-index-channel"), feature = "prefix-index-channel"))]
+#[tokio::test]
+async fn dropping_the_json_index_channel_drops_its_route() {
+    let (router, list_key) = build_router();
+    let lk_hex = hex_encode_bytes(&list_key);
+    let json = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/v1/poi/{lk_hex}/bc-to-idx-map"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("dispatch");
+    assert_eq!(json.status(), StatusCode::NOT_FOUND);
+
+    let binary = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/v1/poi/{lk_hex}/bc-prefixes"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("dispatch");
+    assert_eq!(binary.status(), StatusCode::OK);
 }

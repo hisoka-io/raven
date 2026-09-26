@@ -19,6 +19,9 @@ pub use crate::auth::X_RAVEN_CLIENT_ID;
 type SharedLogicalStore = Arc<parking_lot::Mutex<raven_railgun_engine::inspire::LogicalLeafStore>>;
 type InstanceLogicalStores = HashMap<InstanceId, ([u8; 32], SharedLogicalStore)>;
 
+/// Reads every mirrored PPOI list's feed for `/v1/health/ready`. Called once per probe.
+pub type MirrorFeedProbe = Arc<dyn Fn() -> Vec<crate::status::MirrorFeedView> + Send + Sync>;
+
 /// Handler-shared state; cheap to clone. The manual `Clone` avoids the derive's
 /// spurious `S: Clone` bound.
 pub struct AppState<S: PirScheme> {
@@ -26,7 +29,7 @@ pub struct AppState<S: PirScheme> {
     pub engine: Arc<Engine<S>>,
     /// Layer config (auth, rate limit, session, concurrency).
     pub config: Arc<HttpConfig>,
-    /// Bearer token for read scope, in an RwLock for hot rotation without restart.
+    /// Bearer token for `/metrics`, in an RwLock for hot rotation without restart.
     pub read_token: Arc<parking_lot::RwLock<String>>,
     /// Bearer token for admin scope (optional).
     pub admin_token: Arc<Option<String>>,
@@ -51,11 +54,18 @@ pub struct AppState<S: PirScheme> {
     pub(crate) rpc_pool: Arc<Option<Arc<raven_railgun_indexer::rpc_pool::RpcEndpointPool>>>,
     pub(crate) sessions: Arc<SessionMap>,
     pub(crate) semaphore: Arc<Semaphore>,
+    /// Concurrent `/v1/events` streams. Separate from `semaphore` on purpose: a respond permit
+    /// is held for milliseconds, an SSE permit for as long as a client stays connected, so one
+    /// pool would let idle watchers starve the query path.
+    pub(crate) sse_permits: Arc<Semaphore>,
+    pub(crate) sse_peers: Arc<crate::events::SsePeerStreams>,
     pub(crate) metrics_handle: Arc<metrics_exporter_prometheus::PrometheusHandle>,
     /// Instance-labelled `/metrics` gauges; empty falls back to `consumer_metrics`.
     pub(crate) instance_metrics: Arc<HashMap<InstanceId, Arc<parking_lot::Mutex<ConsumerMetrics>>>>,
     /// Whether every served instance must have consumer telemetry before readiness can pass.
     pub(crate) consumer_metrics_required: bool,
+    /// Mirrored PPOI list feeds for `/v1/health/ready`. `None` reports and gates on none.
+    pub(crate) mirror_feeds: Option<MirrorFeedProbe>,
     /// Process start instant, for `raven_railgun_uptime_seconds`.
     pub(crate) process_started_at: Instant,
     /// ETag cache keyed so an epoch bump invalidates without growing the map.
@@ -97,9 +107,12 @@ impl<S: PirScheme> Clone for AppState<S> {
             rpc_pool: Arc::clone(&self.rpc_pool),
             sessions: Arc::clone(&self.sessions),
             semaphore: Arc::clone(&self.semaphore),
+            sse_permits: Arc::clone(&self.sse_permits),
+            sse_peers: Arc::clone(&self.sse_peers),
             metrics_handle: Arc::clone(&self.metrics_handle),
             instance_metrics: Arc::clone(&self.instance_metrics),
             consumer_metrics_required: self.consumer_metrics_required,
+            mirror_feeds: self.mirror_feeds.clone(),
             process_started_at: self.process_started_at,
             params_etag_cache: Arc::clone(&self.params_etag_cache),
         }
@@ -128,6 +141,13 @@ impl<S: PirScheme> AppState<S> {
         let scheme_name = Arc::new(config.scheme_name.clone());
         let max_concurrent = config.max_concurrent_queries.max(1);
         let semaphore = Arc::new(Semaphore::new(max_concurrent));
+        let sse_permits = Arc::new(Semaphore::new(config.max_sse_connections.max(1)));
+        let sse_peers = Arc::new(crate::events::SsePeerStreams::new(
+            crate::trusted_proxy::TrustedProxyIpKeyExtractor::new(
+                config.resolve_trusted_proxy_ranges()?.into(),
+            ),
+            config.max_sse_connections_per_peer,
+        ));
         let sessions = Arc::new(SessionMap::new());
 
         let metrics_handle = global_prometheus_handle()?;
@@ -148,9 +168,12 @@ impl<S: PirScheme> AppState<S> {
             rpc_pool: Arc::new(None),
             sessions,
             semaphore,
+            sse_permits,
+            sse_peers,
             metrics_handle,
             instance_metrics: Arc::new(HashMap::new()),
             consumer_metrics_required: false,
+            mirror_feeds: None,
             process_started_at: Instant::now(),
             params_etag_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         })
@@ -225,6 +248,14 @@ impl<S: PirScheme> AppState<S> {
         self
     }
 
+    /// Report each mirrored PPOI list's feed in `/v1/health/ready`, and fail readiness while
+    /// one is never fed or stopped.
+    #[must_use]
+    pub fn with_mirror_feeds(mut self, probe: MirrorFeedProbe) -> Self {
+        self.mirror_feeds = Some(probe);
+        self
+    }
+
     /// `/metrics` emits `instance="<id>"` gauges; empty falls back to the single cell.
     #[must_use]
     pub fn with_instance_metrics(
@@ -270,8 +301,8 @@ impl<S: PirScheme> AppState<S> {
         self
     }
 
-    /// Hot-rotate the read bearer token; requests that already cleared auth continue
-    /// on their prior snapshot.
+    /// Hot-rotate the `/metrics` bearer token; requests that already cleared auth
+    /// continue on their prior snapshot.
     pub fn set_read_token(&self, new_token: &str) {
         let mut guard = self.read_token.write();
         new_token.clone_into(&mut guard);
@@ -450,9 +481,9 @@ fn register_prometheus_descriptions() {
     metrics::describe_counter!(
         "raven_railgun_session_evictions_total",
         "Lifetime count of session entries evicted, labelled by `reason` \
-         (ttl = sticky entry swept past expires_at, lru = displaced on cap-pressure \
-         upsert, expired = packing keys past TTL, removed = explicit removal, \
-         flushed = dropped by the packing-key occupancy backstop)"
+         (ttl = sticky entry swept past expires_at, expired = packing keys past TTL, \
+         removed = explicit removal, flushed = dropped by the packing-key occupancy \
+         backstop on the in-process path)"
     );
     metrics::describe_counter!(
         "raven_railgun_batch_off_ladder_total",
@@ -471,8 +502,10 @@ fn register_prometheus_descriptions() {
         "Session handles the engine store will still resolve"
     );
     metrics::describe_counter!(
-        "raven_railgun_session_eviction_pressure_total",
-        "Lifetime count of LRU-pressure session evictions per instance"
+        "raven_railgun_session_establish_refused_total",
+        "Lifetime count of session handshakes refused because every seat was held by a \
+         live session, labelled by instance + `reason` (pool = packing-key store, \
+         binding = sticky-session map)"
     );
     metrics::describe_counter!(
         "raven_railgun_session_eviction_swaps_total",

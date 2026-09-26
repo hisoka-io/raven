@@ -1,4 +1,8 @@
 //! Authentication scopes, sticky-session map, and bearer-auth middleware.
+//!
+//! The read path carries NO credential: the PPOI list is public data and the routes that
+//! serve it answer a third party that holds nothing. A bearer is required only for
+//! `/v1/admin/*` and for `/metrics` while it is default-deny.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -20,29 +24,28 @@ use crate::state::AppState;
 /// Authentication scope decoded from the bearer token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthScope {
-    /// Grants access to queries, session-establish, status, metrics, params.
+    /// Opens `/metrics` while it is default-deny. Queries, batch, session, params and
+    /// status need no scope at all.
     Read,
-    /// Reserved for future control-plane endpoints.
+    /// The control plane: `/v1/admin/*`. Also satisfies [`AuthScope::Read`].
     Admin,
 }
 
-/// Sticky-session identity keyed by `(sha256_truncated_token, instance_id, client_id)`.
+/// Sticky-session identity keyed by `(instance_id, client_id)`.
 ///
-/// The bearer token is hashed before keying so raw values never appear in map
-/// keys or telemetry. `client_id` keeps two clients sharing one bearer from
-/// colliding on the same session entry; absent header maps to the all-zero id.
-/// Not an auth check; bearer validation happens in [`bearer_auth`].
+/// `client_id` is the whole discriminator. The bearer that used to be hashed into this
+/// key was ONE value shared by every caller, so it never separated two of them; the read
+/// path now carries none at all. Not an auth check - a handle presented under the wrong
+/// `client_id` is a 409, not a 401.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SessionKey {
-    token_hash: u64,
     instance_id: InstanceId,
     client_id: [u8; 16],
 }
 
 impl SessionKey {
-    pub(crate) fn new(token: &str, instance_id: InstanceId, client_id: [u8; 16]) -> Self {
+    pub(crate) fn new(instance_id: InstanceId, client_id: [u8; 16]) -> Self {
         Self {
-            token_hash: stable_hash_token(token),
             instance_id,
             client_id,
         }
@@ -81,16 +84,6 @@ fn decode_client_id_header(headers: &http::HeaderMap) -> Option<[u8; 16]> {
     Some(out)
 }
 
-/// SHA-256-derived 64-bit hash; deterministic unlike `RandomState` (which seeds per call).
-pub(crate) fn stable_hash_token(token: &str) -> u64 {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(token.as_bytes());
-    let mut bytes = [0u8; 8];
-    let head = digest.get(..8).unwrap_or(&[0u8; 8]);
-    bytes.copy_from_slice(head);
-    u64::from_le_bytes(bytes)
-}
-
 #[derive(Clone, Debug)]
 struct SessionEntry {
     handle: ServerSessionHandle,
@@ -98,7 +91,8 @@ struct SessionEntry {
 }
 
 /// In-memory sticky-session map bounded by `session_lru_cap`.
-/// Eviction policy: soonest `expires_at` (NOT classical LRU).
+/// Entries leave only by expiry or by their own caller re-handshaking; a full map
+/// refuses a new caller rather than displacing one.
 /// Stale inner `ServerSessionStore` handles linger until `swap_state` drops `InspireServerState`.
 #[derive(Debug, Default)]
 pub(crate) struct SessionMap {
@@ -120,8 +114,16 @@ impl SessionMap {
         Some(entry.handle)
     }
 
-    /// Insert or refresh a session. Evicts the soonest-expiring entry when at cap.
-    /// Returns `Pressure` when the evicted entry was still live (cap exhaustion signal).
+    /// Stop serving `key`, returning the handle it was bound to.
+    pub(crate) fn take(&self, key: &SessionKey) -> Option<ServerSessionHandle> {
+        self.inner.lock().remove(key).map(|entry| entry.handle)
+    }
+
+    /// Insert or refresh a session, reclaiming expired entries to make room.
+    ///
+    /// A caller that already owns `key` always keeps it. A new key is refused once the
+    /// map is full of other callers' live entries: an establish carries no credential,
+    /// so evicting one here would hand any caller the power to retire another's session.
     pub(crate) fn upsert(
         &self,
         key: SessionKey,
@@ -133,17 +135,13 @@ impl SessionMap {
         let mut guard = self.inner.lock();
         let mut outcome = EvictionOutcome::None;
         if guard.len() >= cap && !guard.contains_key(&key) {
-            if let Some((oldest_key, oldest_expires)) = guard
-                .iter()
-                .min_by_key(|(_, v)| v.expires_at)
-                .map(|(k, v)| (k.clone(), v.expires_at))
-            {
-                outcome = if oldest_expires > now {
-                    EvictionOutcome::Pressure
-                } else {
-                    EvictionOutcome::ExpiredOnly
-                };
-                guard.remove(&oldest_key);
+            let before = guard.len();
+            guard.retain(|_, v| v.expires_at > now);
+            if guard.len() < before {
+                outcome = EvictionOutcome::ExpiredOnly;
+            }
+            if guard.len() >= cap {
+                return EvictionOutcome::AtCapacity;
             }
         }
         guard.insert(key, SessionEntry { handle, expires_at });
@@ -175,12 +173,7 @@ pub(crate) fn validate_session_binding(
         return Ok(());
     };
     let client_id = require_client_id_header(headers).map_err(|()| StatusCode::BAD_REQUEST)?;
-    let token = headers
-        .get(http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-    let key = SessionKey::new(token, instance_id.clone(), client_id);
+    let key = SessionKey::new(instance_id.clone(), client_id);
     if sessions.get(&key, Instant::now()) == Some(handle) {
         Ok(())
     } else {
@@ -193,7 +186,24 @@ pub(crate) fn validate_session_binding(
 pub(crate) enum EvictionOutcome {
     None,
     ExpiredOnly,
-    Pressure,
+    /// Nothing was inserted: the map is full of other callers' live entries.
+    AtCapacity,
+}
+
+/// The scope a path demands, or `None` when it is public.
+///
+/// Default-public, because the read path is the public one. Only the control plane and
+/// the default-deny scrape are named here, and `/v1/admin` is matched on the path axum
+/// itself routes on, so a segment that does not match this prefix cannot reach an admin
+/// handler either.
+fn required_scope(path: &str, metrics_public: bool) -> Option<AuthScope> {
+    if path == "/v1/admin" || path.starts_with("/v1/admin/") {
+        return Some(AuthScope::Admin);
+    }
+    if path == "/metrics" && !metrics_public {
+        return Some(AuthScope::Read);
+    }
+    None
 }
 
 pub(crate) async fn bearer_auth<S: PirScheme>(
@@ -201,57 +211,54 @@ pub(crate) async fn bearer_auth<S: PirScheme>(
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let path = request.uri().path();
-    // Health probes + SSE feed are always unauthenticated (gateway-tier auth).
-    if matches!(path, "/v1/health/live" | "/v1/health/ready" | "/v1/events") {
+    let Some(required) = required_scope(request.uri().path(), app.config.metrics_public) else {
         return Ok(next.run(request).await);
-    }
-    // `/metrics` is default-deny; operators opt in via `metrics_public`.
-    if path == "/metrics" && app.config.metrics_public {
-        return Ok(next.run(request).await);
-    }
+    };
 
-    let header = request
+    let bearer = request
         .headers()
         .get(http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let token = bearer.unwrap_or_default();
 
-    let scope = if let Some(token) = header.strip_prefix("Bearer ") {
-        // Both compares always evaluate; the snapshot keeps the lock off the compare.
-        let active_read_token: String = app.read_token.read().clone();
-        let read_match: bool = ct_eq_str(token.as_bytes(), active_read_token.as_bytes()).into();
-        let admin_match: bool = if let Some(admin) = app.admin_token.as_ref().as_ref() {
-            ct_eq_str(token.as_bytes(), admin.as_bytes()).into()
-        } else {
-            // Keeps the no-admin path equal-cost.
-            let _ = ct_eq_str(token.as_bytes(), &[]);
-            false
-        };
-
-        if read_match {
-            Some(AuthScope::Read)
-        } else if admin_match {
-            Some(AuthScope::Admin)
-        } else {
-            None
-        }
+    // Both compares always evaluate; the snapshot keeps the lock off the compare.
+    // The `is_empty` guards are on the CONFIGURED token, so they branch on nothing secret:
+    // `set_read_token` takes any string, unlike `HttpConfig::validate`, and an empty one
+    // would otherwise be cleared by `Authorization: Bearer ` with nothing after it.
+    let active_read_token: String = app.read_token.read().clone();
+    let read_match: bool = !active_read_token.is_empty()
+        && bool::from(ct_eq_str(token.as_bytes(), active_read_token.as_bytes()));
+    let admin_match: bool = if let Some(admin) = app.admin_token.as_ref().as_ref() {
+        !admin.is_empty() && bool::from(ct_eq_str(token.as_bytes(), admin.as_bytes()))
     } else {
-        // Pay constant-time cost even on the missing-prefix path.
-        let active_read_token: String = app.read_token.read().clone();
-        let _ = ct_eq_str(b"", active_read_token.as_bytes());
-        if let Some(admin) = app.admin_token.as_ref().as_ref() {
-            let _ = ct_eq_str(b"", admin.as_bytes());
-        }
+        // Keeps the no-admin path equal-cost. An absent admin token grants nothing, so an
+        // admin path with none configured refuses every caller.
+        let _ = ct_eq_str(token.as_bytes(), &[]);
+        false
+    };
+
+    // A header that is absent or not `Bearer ` grants nothing at all.
+    let granted = if bearer.is_none() {
+        None
+    } else if admin_match {
+        Some(AuthScope::Admin)
+    } else if read_match {
+        Some(AuthScope::Read)
+    } else {
         None
     };
 
-    let Some(scope) = scope else {
+    let cleared = matches!(
+        (required, granted),
+        (AuthScope::Admin, Some(AuthScope::Admin)) | (AuthScope::Read, Some(_))
+    );
+    if !cleared {
         return Ok(unauthorized_close());
-    };
+    }
     metrics::counter!(
         "raven_railgun_auth_ok_total",
-        "scope" => scope_label(scope)
+        "scope" => scope_label(required)
     )
     .increment(1);
     Ok(next.run(request).await)
@@ -385,14 +392,14 @@ mod tests {
     }
 
     #[test]
-    fn session_key_distinguishes_client_id_under_shared_bearer() {
+    fn session_key_distinguishes_client_id_on_one_instance() {
         let id = InstanceId::new("toy");
-        let alice = SessionKey::new("shared-bearer", id.clone(), [0xaa; 16]);
-        let bob = SessionKey::new("shared-bearer", id.clone(), [0xbb; 16]);
+        let alice = SessionKey::new(id.clone(), [0xaa; 16]);
+        let bob = SessionKey::new(id.clone(), [0xbb; 16]);
         assert_ne!(alice, bob, "distinct client_ids must produce distinct keys");
 
-        let legacy_a = SessionKey::new("legacy-bearer", id.clone(), [0u8; 16]);
-        let legacy_b = SessionKey::new("legacy-bearer", id, [0u8; 16]);
+        let legacy_a = SessionKey::new(id.clone(), [0u8; 16]);
+        let legacy_b = SessionKey::new(id, [0u8; 16]);
         assert_eq!(
             legacy_a, legacy_b,
             "absent-header back-compat must collapse to the same key"
@@ -407,20 +414,16 @@ mod tests {
         let client_id = [0x44; 16];
         let first = InstanceId::new("first");
         let second = InstanceId::new("second");
-        let key = SessionKey::new("shared-bearer", first.clone(), client_id);
+        let key = SessionKey::new(first.clone(), client_id);
         map.upsert(key, handle, now + Duration::from_secs(60), 8, now);
         map.upsert(
-            SessionKey::new("shared-bearer", second.clone(), [0x55; 16]),
+            SessionKey::new(second.clone(), [0x55; 16]),
             handle,
             now + Duration::from_secs(60),
             8,
             now,
         );
         let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer shared-bearer"),
-        );
         headers.insert(
             HeaderName::from_static("x-raven-client-id"),
             HeaderValue::from_static("44444444444444444444444444444444"),
@@ -454,12 +457,12 @@ mod tests {
         let h = ServerSessionHandle(1);
         let cap = 100;
 
-        let dead_a = SessionKey::new("dead-a", InstanceId::new("toy"), [0u8; 16]);
-        let dead_b = SessionKey::new("dead-b", InstanceId::new("toy"), [0u8; 16]);
+        let dead_a = SessionKey::new(InstanceId::new("dead-a"), [0u8; 16]);
+        let dead_b = SessionKey::new(InstanceId::new("dead-b"), [0u8; 16]);
         let _ = map.upsert(dead_a, h, t0 + ttl, cap, t0);
         let _ = map.upsert(dead_b, h, t0 + ttl, cap, t0);
 
-        let alive = SessionKey::new("alive", InstanceId::new("toy"), [0u8; 16]);
+        let alive = SessionKey::new(InstanceId::new("alive"), [0u8; 16]);
         let _ = map.upsert(alive.clone(), h, t0 + Duration::from_secs(3600), cap, t0);
 
         assert_eq!(map.len(), 3, "sanity: 3 sessions inserted");
@@ -482,7 +485,7 @@ mod tests {
         let ttl = Duration::from_secs(3600);
         let h = ServerSessionHandle(2);
         for i in 0..3 {
-            let k = SessionKey::new(&format!("live-{i}"), InstanceId::new("toy"), [0u8; 16]);
+            let k = SessionKey::new(InstanceId::new(format!("live-{i}")), [0u8; 16]);
             let _ = map.upsert(k, h, t0 + ttl, 100, t0);
         }
         let removed = map.sweep_expired(t0 + Duration::from_secs(60));
