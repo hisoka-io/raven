@@ -1,0 +1,5 @@
+jobs:
+  wasm:
+    steps:
+      - run: |
+          wasm-pack test --node scripts/fixtures/check-wasm-test-coverage/client -p another-package --test exact_target

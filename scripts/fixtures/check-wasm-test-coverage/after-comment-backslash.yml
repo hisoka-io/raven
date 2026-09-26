@@ -2,5 +2,5 @@ jobs:
   wasm:
     steps:
       - run: |
+          # a backslash ending a comment continues nothing \
           wasm-pack test --node scripts/fixtures/check-wasm-test-coverage/client --test exact_target
-          wasm-pack test --node scripts/fixtures/check-wasm-test-coverage/client --lib

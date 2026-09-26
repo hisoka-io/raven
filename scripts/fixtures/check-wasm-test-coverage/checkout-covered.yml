@@ -1,0 +1,7 @@
+jobs:
+  wasm:
+    steps:
+      - run: |
+          wasm-pack test --node lib --test args_form
+          wasm-pack test --node lib --test split_attribute
+          wasm-pack test --node vendor/sub --test in_submodule

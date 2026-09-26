@@ -1,0 +1,6 @@
+jobs:
+  wasm:
+    steps:
+      - run: |
+          wasm-pack test --node scripts/fixtures/check-wasm-test-coverage/client --test exact_target 2>&1 \
+            --manifest-path another/Cargo.toml

@@ -2,4 +2,4 @@ jobs:
   wasm:
     steps:
       - run: |
-          wasm-pack test --node crates/client --test another_target
+          wasm-pack test --node scripts/fixtures/check-wasm-test-coverage/client --test another_target

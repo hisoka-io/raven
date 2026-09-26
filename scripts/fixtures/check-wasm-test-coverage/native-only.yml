@@ -2,4 +2,4 @@ jobs:
   native:
     steps:
       - run: |
-          cargo test --manifest-path crates/client/Cargo.toml --test exact_target
+          cargo test --manifest-path scripts/fixtures/check-wasm-test-coverage/client/Cargo.toml --test exact_target

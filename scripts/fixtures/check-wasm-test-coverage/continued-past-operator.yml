@@ -2,5 +2,6 @@ jobs:
   wasm:
     steps:
       - run: |
+          cargo test --lib; echo skipping \
           wasm-pack test --node scripts/fixtures/check-wasm-test-coverage/client --test exact_target
           wasm-pack test --node scripts/fixtures/check-wasm-test-coverage/client --lib
