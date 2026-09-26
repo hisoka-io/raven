@@ -88,6 +88,11 @@ PATTERNS=(
   '\bA-[0-9]{3}\b'
   '\bF-[0-9]{3}\b'
   '\bW[0-9]{1,2}-[0-9]{2}[a-z]?\b'
+  # Deep-hunt lane labels. Four reached public source -- two inside a shipped `#[ignore]` reason --
+  # because every rule above names a class that had already escaped and this one had not yet.
+  # Adding a fourth literal is the same move a fourth time; it is here because the leak was real
+  # today, and whether this list should be a shape rule instead is still open.
+  '\bDH-L[0-9]+-[0-9]+\b'
   # Bare record filenames. Seven files named FINDINGS.md exist in the corpus, so the
   # citation is ambiguous even to someone holding the private tree.
   '[^"](FINDINGS|AUDIT|DOUBTS|EVIDENCE|TASKLIST|DECISIONS|MISTAKES|OPEN-QUESTIONS)\.md\b'

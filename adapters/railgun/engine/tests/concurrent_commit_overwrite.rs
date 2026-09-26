@@ -1,4 +1,4 @@
-//! DH-L3-9: two concurrent `commit_v6` calls on ONE handle can publish writer B's
+//! Two concurrent `commit_v6` calls on ONE handle can publish writer B's
 //! bytes under the id `commit_v6` returned to writer A, with no error to either.
 //!
 //! The window is at `engine/src/persistence.rs::commit_serialized_bundle`: the
@@ -67,7 +67,7 @@ fn store_with(leaves: u32) -> LogicalLeafStore {
 }
 
 #[test]
-#[ignore = "DH-L3-9, LATENT: commit_serialized_bundle drops the manifest lock across \
+#[ignore = "LATENT: commit_serialized_bundle drops the manifest lock across \
             the destructive snap.save and CAS-checks only afterwards \
             (engine/src/persistence.rs:459-490 + crates/storage/src/snapshot.rs:76-131), \
             so the winner is handed Ok(id) for the loser's bytes. RED until the fix — \
