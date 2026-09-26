@@ -1024,8 +1024,8 @@ fn example_toml_parses_to_six_ppoi_blocks_with_expected_encoders() {
             ),
             DataSourceFilter::PpoiList(_) | DataSourceFilter::PpoiListBlock { .. } => assert_eq!(
                 inst.verification_mode,
-                VerificationMode::UpstreamSignature,
-                "{} must use UpstreamSignature",
+                VerificationMode::UpstreamAsserted,
+                "{} must use UpstreamAsserted",
                 inst.instance_id
             ),
         }

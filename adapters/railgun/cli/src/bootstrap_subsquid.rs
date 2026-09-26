@@ -18,6 +18,7 @@ use raven_railgun_engine::imt::{Imt, TREE_MAX_ITEMS};
 use raven_railgun_engine::inspire::{
     apply_wal_entry, setup_state, validate_apply, LogicalLeafStore,
 };
+use raven_railgun_engine::orchestrator::{split_ppoi_index, LEAVES_PER_PPOI_BLOCK};
 use raven_railgun_engine::persistence::{
     bootstrap_inspire_instance, InspirePersistence, SnapshotPolicy,
 };
@@ -151,7 +152,7 @@ pub enum BootstrapError {
     /// mode absorbs this: the host was reached.
     #[error(
         "PPOI upstream integrity violation: {0}. The host answered, so this is not an outage \
-         and no --ppoi-bootstrap-mode skips it."
+         and no bootstrap mode skips it."
     )]
     PpoiIntegrity(String),
     #[error("PPOI list_key {list_hex} bootstrap: {reason}")]
@@ -1109,55 +1110,39 @@ pub struct PpoiEventRow {
 pub struct PpoiListReport {
     pub list_key: [u8; 32],
     pub events: usize,
+    /// Root of the newest block, which is the only one still taking rows.
     pub local_root: [u8; 32],
+    /// One root per block, oldest first; `local_root` is its last element.
+    pub block_roots: Vec<[u8; 32]>,
 }
 
-/// Operator-side resilience policy for the PPOI bootstrap step.
+/// Unreachability policy for [`bootstrap_one_list_with_mode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PpoiBootstrapMode {
     /// Hard-stop on any upstream unreachability.
     #[default]
     Strict,
-    /// Warn and seed an EMPTY IMT when no source could be read: every one failed at
-    /// transport level or answered undecodably. An integrity violation or a byte-identity
-    /// mismatch still hard-stops.
+    /// Warn and report the list empty when no source could be read: every one failed at
+    /// transport level or answered undecodably. Nothing is persisted in either mode. An
+    /// integrity violation or a byte-identity mismatch still hard-stops.
     SkipOnUnreachable,
-}
-
-impl PpoiBootstrapMode {
-    pub fn parse_cli(s: &str) -> Result<Self, String> {
-        match s {
-            "strict" => Ok(Self::Strict),
-            "skip-on-unreachable" => Ok(Self::SkipOnUnreachable),
-            other => Err(format!(
-                "unknown ppoi-bootstrap-mode {other}; expected one of strict | skip-on-unreachable"
-            )),
-        }
-    }
 }
 
 /// Strict-mode [`bootstrap_one_list_with_mode`].
 pub async fn bootstrap_one_list(
     list_key: [u8; 32],
     src: &dyn PpoiEventsSource,
-    data_dir_template: &str,
 ) -> Result<PpoiListReport, BootstrapError> {
-    bootstrap_one_list_with_mode(
-        list_key,
-        src,
-        data_dir_template,
-        PpoiBootstrapMode::Strict,
-        &[],
-    )
-    .await
+    bootstrap_one_list_with_mode(list_key, src, PpoiBootstrapMode::Strict, &[]).await
 }
 
-/// Assert each upstream `validatedMerkleroot` byte-equals the locally rebuilt
-/// per-list IMT root after every insert. `tried_sources_for_log` is log-only.
+/// Rebuild the list as a forest of depth-16 trees and assert each upstream
+/// `validatedMerkleroot` byte-equals the rebuilt root of the block its event landed in.
+/// Verification only: nothing is written, so it takes no data_dir. `tried_sources_for_log`
+/// is log-only.
 pub async fn bootstrap_one_list_with_mode(
     list_key: [u8; 32],
     src: &dyn PpoiEventsSource,
-    _data_dir_template: &str,
     mode: PpoiBootstrapMode,
     tried_sources_for_log: &[String],
 ) -> Result<PpoiListReport, BootstrapError> {
@@ -1181,45 +1166,89 @@ pub async fn bootstrap_one_list_with_mode(
                     list_key = %key_hex,
                     tried_sources = %sources_csv,
                     cause = %e,
-                    "PPOI bootstrap skipped: list_key={key_hex}; sources tried: {sources_csv}; per-list IMT seeded EMPTY; runtime mirror will populate when upstream becomes reachable. UPSTREAM SIGNATURE VERIFY GAP: validatedMerkleroot byte-identity oracle and ed25519 signed-event verification both deferred."
+                    "PPOI list verification skipped: list_key={key_hex}; sources tried: {sources_csv}; reported EMPTY and nothing persisted; lists are synced by the runtime mirror. UPSTREAM SIGNATURE VERIFY GAP: validatedMerkleroot byte-identity oracle and ed25519 signed-event verification both deferred."
                 );
                 return Ok(PpoiListReport {
                     list_key,
                     events: 0,
                     local_root: imt.root(),
+                    block_roots: vec![imt.root()],
                 });
             }
             return Err(e);
         }
     };
+    replay_list_forest(list_key, &events)
+}
+
+/// Rebuild a PPOI list as the forest upstream publishes it and hold every block root to the
+/// `validatedMerkleroot` its event carries.
+///
+/// A list is not one tree. Upstream seals a depth-16 tree every [`LEAVES_PER_PPOI_BLOCK`]
+/// events, and the root it publishes with an event is the root of the tree that event landed
+/// in, so a single `Imt` over list-wide indices is wrong twice: it compares against a root
+/// that was never taken over those leaves, and it dies outright on the row that reaches the
+/// per-tree capacity.
+fn replay_list_forest(
+    list_key: [u8; 32],
+    events: &[PpoiEventRow],
+) -> Result<PpoiListReport, BootstrapError> {
     let mut imt = Imt::new().map_err(|e| BootstrapError::Engine(format!("ppoi imt new: {e}")))?;
-    for (i, ev) in events.iter().enumerate() {
-        imt.insert_leaves(i, std::slice::from_ref(&ev.leaf))
-            .map_err(|e| BootstrapError::Engine(format!("ppoi imt insert {i}: {e}")))?;
-        let local = imt.root();
-        if local != ev.validated_merkleroot {
+    let mut block_roots = Vec::new();
+    let mut open_block = 0u32;
+    for ev in events {
+        let list_index = u32::try_from(ev.index).map_err(|_| {
+            BootstrapError::PpoiIntegrity(format!(
+                "ppoi event index {} exceeds the u32 list index a depth-16 forest addresses",
+                ev.index
+            ))
+        })?;
+        let (block, local) = split_ppoi_index(list_index);
+        if block != open_block {
+            // A rebuilt root only means something if the block under it is the block upstream
+            // hashed. A feed that skips rows still opens the next block at its row 0, and
+            // every root from there on reproduces -- over the wrong leaves.
+            let sealed = imt.leaf_count();
+            if block != open_block.saturating_add(1) || sealed != LEAVES_PER_PPOI_BLOCK as usize {
+                return Err(BootstrapError::PpoiIntegrity(format!(
+                    "ppoi list index {list_index} opens block {block} while block {open_block} \
+                     holds {sealed} of {LEAVES_PER_PPOI_BLOCK} rows: the feed skipped rows, and \
+                     the roots rebuilt past here would not be the ones upstream published"
+                )));
+            }
+            block_roots.push(imt.root());
+            imt = Imt::new().map_err(|e| BootstrapError::Engine(format!("ppoi imt new: {e}")))?;
+            open_block = block;
+        }
+        imt.insert_leaves(local as usize, std::slice::from_ref(&ev.leaf))
+            .map_err(|e| {
+                BootstrapError::Engine(format!(
+                    "ppoi imt insert at list index {list_index} (block {block} row {local}): {e}"
+                ))
+            })?;
+        let local_root = imt.root();
+        if local_root != ev.validated_merkleroot {
             return Err(BootstrapError::OracleByteIdentityMismatch {
                 kind: OracleKind::PpoiUpstreamList,
-                tree_number: u32::MAX,
-                expected_hex: to_hex(&local),
+                tree_number: block,
+                expected_hex: to_hex(&local_root),
                 observed_hex: to_hex(&ev.validated_merkleroot),
-                first_match_index: i,
+                first_match_index: list_index as usize,
             });
         }
     }
+    block_roots.push(imt.root());
     Ok(PpoiListReport {
         list_key,
         events: events.len(),
         local_root: imt.root(),
+        block_roots,
     })
 }
 
 /// Per-base HTTP timeout before walking to the next base; mirrors upstream
 /// `wallet/src/services/poi/poi-node-request.ts`.
 const RAILWAY_PER_URL_TIMEOUT: Duration = Duration::from_secs(8);
-
-/// Default bases for `--ppoi-endpoint`; order is priority, first reachable wins.
-pub const DEFAULT_RAILWAY_BASES: &[&str] = &["https://ppoi.fdi.network"];
 
 fn bounded_http_client(
     client: &'static str,
@@ -2027,16 +2056,6 @@ pub fn resolve_data_dir_template(template: &str, tree_number: u32) -> Result<Pat
     ))
 }
 
-/// Expands `{LIST_KEY}` in a data_dir template; errors when absent.
-pub fn resolve_ppoi_data_dir(template: &str, list_key: [u8; 32]) -> Result<PathBuf, String> {
-    if !template.contains("{LIST_KEY}") {
-        return Err(format!("template must contain {{LIST_KEY}}: {template}"));
-    }
-    Ok(PathBuf::from(
-        template.replace("{LIST_KEY}", &to_hex(&list_key)),
-    ))
-}
-
 #[doc(hidden)]
 pub fn modulus_be() -> [u8; 32] {
     BN254_FR_MODULUS_BE
@@ -2045,11 +2064,6 @@ pub fn modulus_be() -> [u8; 32] {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-
-    #[test]
-    fn default_railway_base_is_the_published_live_aggregator() {
-        assert_eq!(DEFAULT_RAILWAY_BASES, &["https://ppoi.fdi.network"]);
-    }
 
     #[test]
     fn railway_single_base_refuses_an_empty_url() {
@@ -2224,11 +2238,5 @@ mod unit_tests {
     #[test]
     fn template_resolution_rejects_missing_placeholder() {
         assert!(resolve_data_dir_template("/tmp/no-placeholder", 0).is_err());
-    }
-
-    #[test]
-    fn ppoi_template_resolution_replaces_placeholder() {
-        let p = resolve_ppoi_data_dir("/tmp/raven/list-{LIST_KEY}", [0xab; 32]).expect("ok");
-        assert!(p.to_string_lossy().ends_with(&"ab".repeat(32)));
     }
 }

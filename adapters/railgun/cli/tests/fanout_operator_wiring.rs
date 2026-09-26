@@ -76,6 +76,7 @@ fn single_options(dir: &std::path::Path) -> ProductionServeOptions {
         metrics_public: false,
         enable_fanout: true,
         max_fanout_shards: 32,
+        session_capacity: raven_railgun_cli::serve_production::SessionCapacity::default(),
     }
 }
 

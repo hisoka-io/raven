@@ -79,6 +79,11 @@ impl FixtureSubsquidSource {
         self.list_roots.insert((list_key, block_height), root);
     }
 
+    /// Test-only: its whole purpose is to forge a root, so a release build must not carry it.
+    /// `insert_list_root` above stays public because it builds rather than corrupts and an
+    /// engine integration test uses it across the crate boundary; this one's only caller is
+    /// the test below.
+    #[cfg(test)]
     pub fn corrupt_tree_root(
         &mut self,
         tree_number: u32,

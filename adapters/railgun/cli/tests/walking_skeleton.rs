@@ -159,7 +159,10 @@ async fn pir_query_round_trip_recovers_planted_row() {
         .send()
         .await
         .expect("POST without auth");
-    assert_eq!(no_auth_resp.status(), 401);
+    // 400, not 401: a read route no longer refuses a missing credential, so what an empty body
+    // now buys is the malformed-query refusal. Kept rather than deleted because the property
+    // worth pinning here is that the route is REACHED -- a 401 would mean the read path closed.
+    assert_eq!(no_auth_resp.status(), 400);
 
     server_handle.abort();
     let _ = server_handle.await;

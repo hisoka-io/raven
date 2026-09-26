@@ -4,6 +4,7 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::process::Command;
 
 use raven_railgun_cli::rpc_pool_array_config::RpcEndpointArrayConfig;
 use raven_railgun_cli::serve_production_multi::load_options_from_toml;
@@ -70,7 +71,7 @@ role = "live"
 encoder = "per-list-status"
 list_key = "{LIST_KEY}"
 data_dir = "/tmp/raven-unused/ppoi-status"
-verification_mode = "upstream-signature"
+verification_mode = "upstream-asserted"
 [instance.data_source]
 kind = "mirror"
 list_key = "{LIST_KEY}"
@@ -142,6 +143,23 @@ fn a_misspelt_key_is_refused_by_name_in_every_table() {
     });
 }
 
+/// A retired value must red the boot, not fall through to some other authority model.
+#[test]
+fn the_retired_verification_mode_value_is_refused_by_name() {
+    let base = multi_instance_config();
+    let retired = base.replace("upstream-asserted", "upstream-signature");
+    assert_ne!(
+        base, retired,
+        "the fixture no longer carries the value under test"
+    );
+
+    let message = refusal(&retired, "a retired verification_mode value");
+    assert!(
+        message.contains("verification_mode") && message.contains("upstream-signature"),
+        "a retired value must be refused naming the key and the value: {message}"
+    );
+}
+
 fn status_instance_with(what: &str) -> String {
     multi_instance_config().replace("#@mirror@", &format!("what = \"{what}\""))
 }
@@ -201,6 +219,89 @@ fn the_bootstrap_rpc_pool_file_refuses_a_misspelt_key_in_every_table() {
             .map(|_| ())
             .map_err(|err| err.to_string())
     });
+}
+
+/// Reaps at teardown only, so a boot that never ends cannot outlive the test.
+struct Reap(std::process::Child);
+
+impl Drop for Reap {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A PPOI-only fleet: nothing indexes a commit tree, so nothing reads a WebSocket endpoint.
+fn mirror_only_config(data_dir: &Path) -> String {
+    format!(
+        r#"
+[global]
+bind = "127.0.0.1:0"
+token = "unknown-key-test-token-padded-long"
+chain_id = 1
+mirror_endpoint = "http://127.0.0.1:1"
+
+[[instance]]
+id = "ppoi-status"
+role = "live"
+encoder = "per-list-status"
+list_key = "{LIST_KEY}"
+data_dir = "{}"
+verification_mode = "upstream-asserted"
+[instance.data_source]
+kind = "mirror"
+list_key = "{LIST_KEY}"
+"#,
+        data_dir.display()
+    )
+}
+
+/// Allowed beside `--config`, so it must reach the boot: over a fleet with no chain reader the
+/// boot refuses it by name, before any store opens or any request leaves.
+#[test]
+fn the_ws_endpoint_flag_beside_config_reaches_the_boot() {
+    let data = tempfile::tempdir().expect("tempdir");
+    let body = mirror_only_config(&data.path().join("ppoi-status"));
+    load(&body).expect("a fixture that does not load proves nothing below");
+    // NamedTempFile is 0600, which the inline token requires.
+    let mut file = tempfile::NamedTempFile::new().expect("tempfile");
+    file.write_all(body.as_bytes()).expect("write config");
+
+    let mut child = Reap(
+        Command::new(env!("CARGO_BIN_EXE_raven-railgun"))
+            .args(["serve-production", "--config"])
+            .arg(file.path())
+            .args(["--ws-endpoint", "ws://127.0.0.1:1"])
+            .env_remove("RAVEN_BEARER_TOKEN")
+            .env_remove("RAVEN_RPC_URL")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn raven-railgun"),
+    );
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.0.try_wait().expect("poll raven-railgun") {
+            break status;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "booted as if --ws-endpoint were absent"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(
+        &mut child.0.stderr.take().expect("piped stderr"),
+        &mut stderr,
+    )
+    .expect("read stderr");
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("a WebSocket endpoint is set (`--ws-endpoint`"),
+        "the boot must refuse the flag it was handed: {stderr}"
+    );
 }
 
 #[test]

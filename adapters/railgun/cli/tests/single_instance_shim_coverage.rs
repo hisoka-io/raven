@@ -92,6 +92,7 @@ fn single_options(
         metrics_public: false,
         enable_fanout: false,
         max_fanout_shards: 16,
+        session_capacity: raven_railgun_cli::serve_production::SessionCapacity::default(),
     }
 }
 

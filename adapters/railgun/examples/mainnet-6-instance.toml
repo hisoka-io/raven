@@ -59,6 +59,15 @@ trust_proxy_header = false
 # rate_limit_rps = 200      # per-IP refill rate (req/s)
 # rate_limit_burst = 400    # per-IP token-bucket capacity
 
+# What uncredentialed callers can hold. Each instance, auto-spawned ones included, has
+# max_sessions_per_instance packing-key seats, and a seat keeps about 24 MiB of derived
+# keys at a 512 B row, so lowering it bounds memory. session_ttl_secs can only be
+# lowered from 3600. The event-stream caps key peers the way the rate limit does.
+# max_sessions_per_instance = 64
+# session_ttl_secs = 3600
+# max_sse_connections = 64
+# max_sse_connections_per_peer = 16
+
 # Where the fill watcher spawns the successor commit-tree. Without this the
 # watcher can see the rollover coming and have nowhere to put the new instance.
 # `data_dir_template` MUST contain {tree_number}, or every spawned tree would
@@ -107,16 +116,16 @@ data_dir = "/var/lib/raven-railgun/commit-tree-3"
 verification_mode = "chain-root-history"
 data_source = { kind = "indexer", filter = { tree_number = 3 } }
 
-# PPOI list instances. `verification_mode = "upstream-signature"` selects the upstream feed as
-# the authority. Despite the name, no signature is checked: each event's signature is stored,
-# never verified. List authenticity rests on TLS to `mirror_endpoint` - keep it https.
+# PPOI list instances. `verification_mode = "upstream-asserted"` selects the upstream feed as
+# the authority: each event's signature is stored and never verified, so nothing authenticates
+# the publisher. List authenticity rests on TLS to `mirror_endpoint` - keep it https.
 [[instance]]
 id = "ppoi-status-ofac"
 role = "live"
 encoder = "per-list-status"
 list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
 data_dir = "/var/lib/raven-railgun/ppoi-status-ofac"
-verification_mode = "upstream-signature"
+verification_mode = "upstream-asserted"
 data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", what = "status" }
 
 [[instance]]
@@ -125,7 +134,7 @@ role = "static"
 encoder = "per-list-path10"
 list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
 data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-0"
-verification_mode = "upstream-signature"
+verification_mode = "upstream-asserted"
 data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 0, what = "path" }
 
 [[instance]]
@@ -134,7 +143,7 @@ role = "static"
 encoder = "per-list-path10"
 list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
 data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-1"
-verification_mode = "upstream-signature"
+verification_mode = "upstream-asserted"
 data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 1, what = "path" }
 
 [[instance]]
@@ -143,7 +152,7 @@ role = "static"
 encoder = "per-list-path10"
 list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
 data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-2"
-verification_mode = "upstream-signature"
+verification_mode = "upstream-asserted"
 data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 2, what = "path" }
 
 [[instance]]
@@ -152,7 +161,7 @@ role = "static"
 encoder = "per-list-path10"
 list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
 data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-3"
-verification_mode = "upstream-signature"
+verification_mode = "upstream-asserted"
 data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 3, what = "path" }
 
 [[instance]]
@@ -161,7 +170,7 @@ role = "static"
 encoder = "per-list-path10"
 list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
 data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-4"
-verification_mode = "upstream-signature"
+verification_mode = "upstream-asserted"
 data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 4, what = "path" }
 
 [[instance]]
@@ -170,5 +179,5 @@ role = "live"
 encoder = "per-list-path10"
 list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
 data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-5"
-verification_mode = "upstream-signature"
+verification_mode = "upstream-asserted"
 data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 5, what = "path" }

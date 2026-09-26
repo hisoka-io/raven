@@ -22,6 +22,7 @@ use raven_railgun_cli::bootstrap_subsquid::{
     PpoiEventsSource, PpoiListReport, RailwayPpoiClient, StowawayCarry, SubsquidLeavesSource,
 };
 use raven_railgun_engine::imt::Imt;
+use raven_railgun_engine::orchestrator::{split_ppoi_index, LEAVES_PER_PPOI_BLOCK};
 use raven_railgun_engine::pir_table::EncoderKind;
 
 /// Covers live byte-identity, static membership, and the pruning branch.
@@ -303,12 +304,12 @@ fn synthetic_leaves_at_block(count: usize, block_number: u64) -> (Vec<Commitment
     (rows, imt.root())
 }
 
-fn fresh_data_dir(stem: &str) -> std::path::PathBuf {
+// The guard must be bound for the whole test body; dropping it deletes the dir. Leaking it instead
+// left ~150 MB per call behind on every run.
+fn fresh_data_dir(stem: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let base = tempfile::tempdir().expect("tempdir");
     let path = base.path().join(stem);
-    // leak so the dir outlives the handle for the test body
-    std::mem::forget(base);
-    path
+    (base, path)
 }
 
 fn cfg_for(tree_number: u32, dir: std::path::PathBuf) -> BootstrapTreeConfig {
@@ -331,7 +332,7 @@ fn cfg_for(tree_number: u32, dir: std::path::PathBuf) -> BootstrapTreeConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn second_bootstrap_over_a_populated_data_dir_refuses_before_the_wal_grows() {
     let (rows, root) = synthetic_leaves(8);
-    let dir = fresh_data_dir("commit-tree-0-rerun");
+    let (_guard, dir) = fresh_data_dir("commit-tree-0-rerun");
     let cfg = cfg_for(0, dir.clone());
     let chain = StubChain::new(20_000_000, 99);
     chain.record_root(0, root);
@@ -393,7 +394,8 @@ async fn the_closing_root_is_read_at_the_rollover_block_not_at_the_tree_number()
     chain.set_root_from(TREE_0_ROLLOVER, [0xBB; 32]);
     chain.record_root(0, root);
 
-    let cfg = cfg_for(0, fresh_data_dir("commit-tree-0-rollover-search"));
+    let (_guard, scratch_dir) = fresh_data_dir("commit-tree-0-rollover-search");
+    let cfg = cfg_for(0, scratch_dir);
     let report = bootstrap_one_tree(&cfg, &leaves, &chain)
         .await
         .expect("the closing root is the one held one block below the rollover");
@@ -423,7 +425,8 @@ async fn a_probe_below_the_contract_deployment_is_never_made() {
     chain.set_root_from(TREE_0_ROLLOVER - 1, root);
     chain.record_root(0, root);
 
-    let cfg = cfg_for(0, fresh_data_dir("commit-tree-0-deploy-floor"));
+    let (_guard, scratch_dir) = fresh_data_dir("commit-tree-0-deploy-floor");
+    let cfg = cfg_for(0, scratch_dir);
     assert!(
         cfg.contract_start_block < TREE_0_ROLLOVER,
         "premise: the floor is below the rollover, so a floored search can still find it"
@@ -450,9 +453,10 @@ async fn a_search_floor_above_the_trees_own_rollover_is_refused() {
     chain.set_rollover_ladder(&[(0, 0), (17_000_000, 1), (18_000_000, 2), (19_000_000, 3)]);
     chain.record_root(0, root);
 
+    let (_guard, scratch_dir) = fresh_data_dir("commit-tree-0-floor-too-high");
     let cfg = BootstrapTreeConfig {
         contract_start_block: 18_500_000,
-        ..cfg_for(0, fresh_data_dir("commit-tree-0-floor-too-high"))
+        ..cfg_for(0, scratch_dir)
     };
     let err = bootstrap_one_tree(&cfg, &leaves, &chain)
         .await
@@ -472,7 +476,8 @@ async fn a_repair_trigger_above_capacity_is_refused_because_it_can_never_be_reac
     let chain = StubChain::new(20_000_000, 3);
     chain.record_root(0, root);
 
-    let base = cfg_for(0, fresh_data_dir("commit-tree-0-threshold-unreachable"));
+    let (_guard, scratch_dir) = fresh_data_dir("commit-tree-0-threshold-unreachable");
+    let base = cfg_for(0, scratch_dir);
     let cfg = BootstrapTreeConfig {
         repair_trigger_threshold: base.expected_filled_count + 1,
         ..base
@@ -510,7 +515,8 @@ async fn a_prefix_truncated_closed_tree_is_refused_even_though_root_history_hold
     chain.record_root(0, short_root);
     chain.record_root(0, full_root);
 
-    let cfg = cfg_for(0, fresh_data_dir("commit-tree-0-truncated"));
+    let (_guard, scratch_dir) = fresh_data_dir("commit-tree-0-truncated");
+    let cfg = cfg_for(0, scratch_dir);
     let err = bootstrap_one_tree(&cfg, &leaves, &chain)
         .await
         .expect_err("a prefix of a closed tree must not bootstrap as the whole tree");
@@ -538,7 +544,8 @@ async fn a_short_tree_below_the_repair_threshold_is_refused_not_accepted() {
     chain.record_root(0, short_root);
     chain.record_root(0, full_root);
 
-    let cfg = cfg_for_boundary(0, fresh_data_dir("commit-tree-0-below-threshold"));
+    let (_guard, scratch_dir) = fresh_data_dir("commit-tree-0-below-threshold");
+    let cfg = cfg_for_boundary(0, scratch_dir);
     // premise: 3 rows is below `repair_trigger_threshold: 4`, so no gap-walk runs at all.
     assert!(3 < cfg.repair_trigger_threshold);
 
@@ -562,7 +569,8 @@ async fn a_closed_tree_that_legitimately_ended_short_still_bootstraps() {
     let chain = StubChain::new(20_000_000, 99);
     chain.record_root(0, root);
 
-    let cfg = cfg_for(0, fresh_data_dir("commit-tree-0-short-but-closed"));
+    let (_guard, scratch_dir) = fresh_data_dir("commit-tree-0-short-but-closed");
+    let cfg = cfg_for(0, scratch_dir);
     let report = bootstrap_one_tree(&cfg, &leaves, &chain)
         .await
         .expect("a short tree whose root is its CLOSING root is complete");
@@ -578,7 +586,8 @@ async fn bootstrap_static_tree_membership_oracle_pass() {
     // active tree 99 != queried tree 0 -> static path
     let chain = StubChain::new(20_000_000, 99);
     chain.record_root(0, root);
-    let cfg = cfg_for(0, fresh_data_dir("commit-tree-0-static"));
+    let (_guard, scratch_dir) = fresh_data_dir("commit-tree-0-static");
+    let cfg = cfg_for(0, scratch_dir);
     let report = bootstrap_one_tree(&cfg, &leaves, &chain)
         .await
         .expect("static membership ok");
@@ -595,7 +604,8 @@ async fn bootstrap_live_tree_byte_identity_pass() {
     let leaves = StubLeaves::new(rows);
     let chain = StubChain::new(20_000_000, 3);
     chain.set_chain_root(root);
-    let cfg = cfg_for(3, fresh_data_dir("commit-tree-3-live"));
+    let (_guard, scratch_dir) = fresh_data_dir("commit-tree-3-live");
+    let cfg = cfg_for(3, scratch_dir);
     let report = bootstrap_one_tree(&cfg, &leaves, &chain)
         .await
         .expect("live byte-identity ok");
@@ -612,7 +622,8 @@ async fn bootstrap_static_tree_membership_mismatch_hard_stop() {
     let mut other = root;
     other[0] ^= 0xff;
     chain.record_root(0, other);
-    let cfg = cfg_for(0, fresh_data_dir("commit-tree-0-static-bad"));
+    let (_guard, scratch_dir) = fresh_data_dir("commit-tree-0-static-bad");
+    let cfg = cfg_for(0, scratch_dir);
     let err = bootstrap_one_tree(&cfg, &leaves, &chain)
         .await
         .expect_err("must hard-stop on rootHistory==false");
@@ -632,7 +643,8 @@ async fn bootstrap_live_tree_byte_identity_mismatch_hard_stop() {
     let mut bad_chain_root = root;
     bad_chain_root[0] ^= 0xff;
     chain.set_chain_root(bad_chain_root);
-    let cfg = cfg_for(3, fresh_data_dir("commit-tree-3-corrupt-chain"));
+    let (_guard, scratch_dir) = fresh_data_dir("commit-tree-3-corrupt-chain");
+    let cfg = cfg_for(3, scratch_dir);
     let err = bootstrap_one_tree(&cfg, &leaves, &chain)
         .await
         .expect_err("must hard-stop on chain disagreement");
@@ -649,7 +661,8 @@ async fn bootstrap_subsquid_unreachable_actionable_error() {
     let (rows, _root) = synthetic_leaves(4);
     let leaves = StubLeaves::new(rows).fail_with_503();
     let chain = StubChain::new(20_000_000, 99);
-    let cfg = cfg_for(0, fresh_data_dir("commit-tree-0-503"));
+    let (_guard, scratch_dir) = fresh_data_dir("commit-tree-0-503");
+    let cfg = cfg_for(0, scratch_dir);
     let err = bootstrap_one_tree(&cfg, &leaves, &chain)
         .await
         .expect_err("503 must surface");
@@ -663,7 +676,8 @@ async fn bootstrap_partial_leaf_count_hard_stop() {
     let leaves = StubLeaves::new(rows).cap_at(7);
     let chain = StubChain::new(20_000_000, 99);
     chain.record_root(0, root_full);
-    let cfg = cfg_for(0, fresh_data_dir("commit-tree-0-partial"));
+    let (_guard, scratch_dir) = fresh_data_dir("commit-tree-0-partial");
+    let cfg = cfg_for(0, scratch_dir);
     let err = bootstrap_one_tree(&cfg, &leaves, &chain)
         .await
         .expect_err("partial pagination triggers oracle mismatch");
@@ -678,7 +692,7 @@ async fn bootstrap_partial_leaf_count_hard_stop() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_concurrent_run_lock_contention() {
-    let dir = fresh_data_dir("commit-tree-0-conflict");
+    let (_guard, dir) = fresh_data_dir("commit-tree-0-conflict");
     std::fs::create_dir_all(&dir).expect("mkdir");
     // hold the lock first so the bootstrap runner contends for it
     let (_layout, _lock) =
@@ -697,7 +711,7 @@ async fn bootstrap_concurrent_run_lock_contention() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_resume_from_partial_state() {
     let (rows, root) = synthetic_leaves(4);
-    let dir = fresh_data_dir("commit-tree-0-resume");
+    let (_guard, dir) = fresh_data_dir("commit-tree-0-resume");
     let leaves = StubLeaves::new(rows.clone());
     let chain = StubChain::new(20_000_000, 99);
     chain.record_root(0, root);
@@ -739,7 +753,8 @@ async fn bootstrap_pagination_treeposition_cursor_handles_gap() {
     let leaves = StubLeaves::new(rows);
     let chain = StubChain::new(20_000_000, 99);
     chain.record_root(0, root);
-    let cfg = cfg_for(0, fresh_data_dir("commit-tree-0-page"));
+    let (_guard, scratch_dir) = fresh_data_dir("commit-tree-0-page");
+    let cfg = cfg_for(0, scratch_dir);
     let report = bootstrap_one_tree(&cfg, &leaves, &chain)
         .await
         .expect("paginated bootstrap");
@@ -779,14 +794,15 @@ async fn bootstrap_pruning_during_run_classified_as_no_archival() {
     let leaves = StubLeaves::new(rows);
     let chain = StubChain::new(20_000_000, 99);
     chain.set_pruning();
-    let cfg = cfg_for(0, fresh_data_dir("commit-tree-0-prune"));
+    let (_guard, scratch_dir) = fresh_data_dir("commit-tree-0-prune");
+    let cfg = cfg_for(0, scratch_dir);
     let err = bootstrap_one_tree(&cfg, &leaves, &chain)
         .await
         .expect_err("must surface NoArchivalRpc");
     assert!(matches!(err, BootstrapError::NoArchivalRpc { .. }));
 }
 
-/// Synthetic PPOI source; each event carries the per-step IMT root the upstream signed.
+/// Synthetic PPOI source; each event carries the per-step IMT root upstream published.
 struct StubPpoi {
     events: Vec<PpoiEventRow>,
 }
@@ -819,7 +835,7 @@ async fn ppoi_list_root_via_railway_capture() {
         });
     }
     let src = StubPpoi { events };
-    let report = bootstrap_one_list([0xab; 32], &src, "/tmp/raven/list-{LIST_KEY}")
+    let report = bootstrap_one_list([0xab; 32], &src)
         .await
         .expect("ppoi bootstrap ok");
     assert_eq!(report.events, 4);
@@ -829,7 +845,7 @@ async fn ppoi_list_root_via_railway_capture() {
     let last = bad.len() - 1;
     bad[last].validated_merkleroot[0] ^= 0xff;
     let bad_src = StubPpoi { events: bad };
-    let err = bootstrap_one_list([0xab; 32], &bad_src, "/tmp/raven/list-{LIST_KEY}")
+    let err = bootstrap_one_list([0xab; 32], &bad_src)
         .await
         .expect_err("corrupted upstream root must hard-stop");
     assert!(matches!(
@@ -839,6 +855,169 @@ async fn ppoi_list_root_via_railway_capture() {
             ..
         }
     ));
+}
+
+/// Leaves that are canonical BN254 Fr elements, which `merkle_node` requires.
+fn forest_leaf(list_index: u32) -> [u8; 32] {
+    let mut leaf = [0u8; 32];
+    leaf[28..].copy_from_slice(&list_index.to_be_bytes());
+    leaf
+}
+
+/// The feed upstream actually publishes: a depth-16 tree sealed every
+/// `LEAVES_PER_PPOI_BLOCK` events, and per event the root of the tree that event landed in.
+fn forest_events(count: u32) -> Vec<PpoiEventRow> {
+    let mut imt = Imt::new().expect("imt new");
+    let mut out = Vec::with_capacity(count as usize);
+    for list_index in 0..count {
+        let (_, local) = split_ppoi_index(list_index);
+        if local == 0 && list_index > 0 {
+            imt = Imt::new().expect("imt new");
+        }
+        let leaf = forest_leaf(list_index);
+        imt.insert_leaves(local as usize, &[leaf]).expect("insert");
+        out.push(PpoiEventRow {
+            index: u64::from(list_index),
+            leaf,
+            event_type: None,
+            signature: None,
+            validated_merkleroot: imt.root(),
+        });
+    }
+    out
+}
+
+/// The production OFAC list is several depth-16 trees, so a rebuild that treats it as one
+/// dies at row `LEAVES_PER_PPOI_BLOCK` and can never finish. Two trees plus a row is the
+/// smallest fixture that crosses the boundary, and the rows either side of it are where an
+/// off-by-one in the split would hide.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ppoi_bootstrap_rebuilds_a_list_that_spans_two_trees() {
+    let span = LEAVES_PER_PPOI_BLOCK + 2;
+    let events = forest_events(span);
+    let last_of_block_0 = (LEAVES_PER_PPOI_BLOCK - 1) as usize;
+    let first_of_block_1 = LEAVES_PER_PPOI_BLOCK as usize;
+
+    // The fixture is only evidence if the two blocks are distinguishable: a builder that
+    // silently kept one tree would still reproduce block 0.
+    assert_ne!(
+        events[last_of_block_0].validated_merkleroot, events[first_of_block_1].validated_merkleroot,
+        "a sealed block and a fresh one must not share a root"
+    );
+
+    let src = StubPpoi {
+        events: events.clone(),
+    };
+    let report = bootstrap_one_list([0xab; 32], &src)
+        .await
+        .expect("a list of two trees must rebuild");
+
+    assert_eq!(report.events, span as usize);
+    assert_eq!(
+        report.block_roots.len(),
+        2,
+        "one root per block, got {:?}",
+        report.block_roots.len()
+    );
+    assert_eq!(
+        report.block_roots[0], events[last_of_block_0].validated_merkleroot,
+        "block 0 must seal on the root upstream published for its last row"
+    );
+    assert_eq!(
+        report.block_roots[1],
+        events[span as usize - 1].validated_merkleroot,
+        "block 1 must carry the root upstream published for the row past the boundary"
+    );
+    assert_eq!(report.local_root, report.block_roots[1]);
+
+    // The row past the boundary is row 0 of a FRESH tree, not row 65,536 of the old one.
+    let mut second_tree = Imt::new().expect("imt new");
+    second_tree
+        .insert_leaves(0, &[forest_leaf(LEAVES_PER_PPOI_BLOCK)])
+        .expect("insert");
+    assert_eq!(
+        events[first_of_block_1].validated_merkleroot,
+        second_tree.root(),
+        "row LEAVES_PER_PPOI_BLOCK opens block 1 at local row 0"
+    );
+}
+
+/// Opening a block is the one moment the rebuild stops checking against the previous root, so
+/// it is where a truncated feed would slip through: every root past the jump reproduces
+/// perfectly, over leaves upstream never hashed together. Two rows are enough to show it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ppoi_bootstrap_refuses_a_feed_that_opens_a_block_over_an_unfilled_one() {
+    let mut first = Imt::new().expect("imt new");
+    first
+        .insert_leaves(0, &[forest_leaf(0)])
+        .expect("insert row 0");
+    let mut jumped = Imt::new().expect("imt new");
+    let far = 2 * LEAVES_PER_PPOI_BLOCK;
+    jumped
+        .insert_leaves(0, &[forest_leaf(far)])
+        .expect("insert row 0 of block 2");
+
+    let src = StubPpoi {
+        events: vec![
+            PpoiEventRow {
+                index: 0,
+                leaf: forest_leaf(0),
+                event_type: None,
+                signature: None,
+                validated_merkleroot: first.root(),
+            },
+            // Row 0 of block 2, over a block 0 that holds one row and a block 1 never seen.
+            PpoiEventRow {
+                index: u64::from(far),
+                leaf: forest_leaf(far),
+                event_type: None,
+                signature: None,
+                validated_merkleroot: jumped.root(),
+            },
+        ],
+    };
+
+    let err = bootstrap_one_list([0xab; 32], &src)
+        .await
+        .expect_err("a feed that jumps a block must hard-stop, not rebuild a hole");
+    let message = err.to_string();
+    assert!(
+        message.contains("block 2") && message.contains("block 0"),
+        "the refusal must name the block it opened and the one it left short: {message}"
+    );
+    assert!(
+        message.contains(&LEAVES_PER_PPOI_BLOCK.to_string()),
+        "the refusal must name the rows a block owes: {message}"
+    );
+}
+
+/// The oracle has to still be comparing inside the SECOND tree; a rebuild that sealed block 0
+/// and then stopped checking would pass the test above unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ppoi_bootstrap_oracle_fires_on_a_bad_root_in_the_second_tree() {
+    let span = LEAVES_PER_PPOI_BLOCK + 2;
+    let mut events = forest_events(span);
+    let corrupt_at = span - 1;
+    events[corrupt_at as usize].validated_merkleroot[0] ^= 0xff;
+
+    let src = StubPpoi { events };
+    let err = bootstrap_one_list([0xab; 32], &src)
+        .await
+        .expect_err("a root the second tree does not reproduce must hard-stop");
+
+    match err {
+        BootstrapError::OracleByteIdentityMismatch {
+            kind,
+            tree_number,
+            first_match_index,
+            ..
+        } => {
+            assert!(matches!(kind, OracleKind::PpoiUpstreamList), "{kind:?}");
+            assert_eq!(tree_number, 1, "the refusal must name the block it is in");
+            assert_eq!(first_match_index, corrupt_at as usize);
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
 }
 
 /// Boundary-repair config at fixture size: 8-leaf trees, repair trigger low
@@ -870,7 +1049,8 @@ async fn boundary_repair_captures_stowaway_at_treeposition_65536_into_carry() {
     let leaves = StubLeaves::new(rows);
     let chain = StubChain::new(20_000_000, 99);
     chain.record_root(0, root);
-    let cfg = cfg_for_boundary(0, fresh_data_dir("commit-tree-0-stowaway"));
+    let (_guard, scratch_dir) = fresh_data_dir("commit-tree-0-stowaway");
+    let cfg = cfg_for_boundary(0, scratch_dir);
     let mut carry = StowawayCarry::new();
     let report = bootstrap_one_tree_with_carry(&cfg, &leaves, &chain, &mut carry)
         .await
@@ -919,7 +1099,8 @@ async fn boundary_repair_retags_stowaway_as_tree_n_plus_1_position_0() {
     chain.record_root(1, tree1_root);
 
     let mut carry = StowawayCarry::new();
-    let cfg0 = cfg_for_boundary(0, fresh_data_dir("retag-tree-0"));
+    let (_guard, scratch_dir) = fresh_data_dir("retag-tree-0");
+    let cfg0 = cfg_for_boundary(0, scratch_dir);
     let r0 = bootstrap_one_tree_with_carry(&cfg0, &StubLeaves::new(tree0_rows), &chain, &mut carry)
         .await
         .expect("tree 0 boundary repair");
@@ -927,7 +1108,8 @@ async fn boundary_repair_retags_stowaway_as_tree_n_plus_1_position_0() {
     assert_eq!(r0.chain_static_membership, Some(true));
 
     let tree1_sparse: Vec<CommitmentRow> = tree1_full.iter().skip(1).cloned().collect();
-    let cfg1 = cfg_for_boundary(1, fresh_data_dir("retag-tree-1"));
+    let (_guard, scratch_dir) = fresh_data_dir("retag-tree-1");
+    let cfg1 = cfg_for_boundary(1, scratch_dir);
     let r1 =
         bootstrap_one_tree_with_carry(&cfg1, &StubLeaves::new(tree1_sparse), &chain, &mut carry)
             .await
@@ -969,10 +1151,11 @@ async fn boundary_repair_recovers_missing_position_0_in_tree_1_via_carry_with_ta
         block_number: 21_332_254,
     });
 
+    let (_guard, scratch_dir) = fresh_data_dir("recover-tree-0");
     let cfg_tree0_local = BootstrapTreeConfig {
         tree_number: 0,
         checkpoint_depth: 64,
-        data_dir: fresh_data_dir("recover-tree-0"),
+        data_dir: scratch_dir,
         instance_id: "commit-tree-0-recover".to_owned(),
         max_wall_mins: 5,
         repair_trigger_threshold: 4,
@@ -1015,7 +1198,8 @@ async fn boundary_repair_recovers_missing_position_0_in_tree_1_via_carry_with_ta
         "stowaway carried to tree 1 before tree 1 bootstrap"
     );
 
-    let cfg1 = cfg_for_boundary(1, fresh_data_dir("recover-tree-1"));
+    let (_guard, scratch_dir) = fresh_data_dir("recover-tree-1");
+    let cfg1 = cfg_for_boundary(1, scratch_dir);
     let r1 =
         bootstrap_one_tree_with_carry(&cfg1, &StubLeaves::new(sparse_rows), &chain, &mut carry)
             .await
@@ -1044,7 +1228,8 @@ async fn boundary_repair_skips_tail_gap_when_tree_closed_short_of_capacity() {
     let leaves = StubLeaves::new(sparse_rows);
     let chain = StubChain::new(20_000_000, 99);
     chain.record_root(1, partial_root);
-    let cfg = cfg_for_boundary(1, fresh_data_dir("commit-tree-1-tail-short"));
+    let (_guard, scratch_dir) = fresh_data_dir("commit-tree-1-tail-short");
+    let cfg = cfg_for_boundary(1, scratch_dir);
     let report = bootstrap_one_tree(&cfg, &leaves, &chain)
         .await
         .expect("boundary repair tolerates tail gap when tree closed short");
@@ -1111,14 +1296,16 @@ async fn boundary_repair_post_fix_chain_oracle_byte_identity_passes_all_three_fi
 
     let mut carry = StowawayCarry::new();
 
-    let cfg0 = cfg_for_boundary(0, fresh_data_dir("e2e-all-three-tree-0"));
+    let (_guard, scratch_dir) = fresh_data_dir("e2e-all-three-tree-0");
+    let cfg0 = cfg_for_boundary(0, scratch_dir);
     let r0 = bootstrap_one_tree_with_carry(&cfg0, &StubLeaves::new(tree0_rows), &chain, &mut carry)
         .await
         .expect("tree 0 byte-identity");
     assert_eq!(r0.local_root, tree0_root);
     assert_eq!(r0.chain_static_membership, Some(true));
 
-    let cfg1 = cfg_for_boundary(1, fresh_data_dir("e2e-all-three-tree-1"));
+    let (_guard, scratch_dir) = fresh_data_dir("e2e-all-three-tree-1");
+    let cfg1 = cfg_for_boundary(1, scratch_dir);
     let r1 = bootstrap_one_tree_with_carry(
         &cfg1,
         &StubLeaves::new(tree1_with_stowaway),
@@ -1130,7 +1317,8 @@ async fn boundary_repair_post_fix_chain_oracle_byte_identity_passes_all_three_fi
     assert_eq!(r1.local_root, tree1_partial_root);
     assert_eq!(r1.chain_static_membership, Some(true));
 
-    let cfg2 = cfg_for_boundary(2, fresh_data_dir("e2e-all-three-tree-2"));
+    let (_guard, scratch_dir) = fresh_data_dir("e2e-all-three-tree-2");
+    let cfg2 = cfg_for_boundary(2, scratch_dir);
     let r2 =
         bootstrap_one_tree_with_carry(&cfg2, &StubLeaves::new(tree2_subsquid), &chain, &mut carry)
             .await
@@ -1155,10 +1343,11 @@ async fn bootstrap_three_seed_production_cell_bench() {
     let (rows, root) = synthetic_leaves(64);
     let chain = StubChain::new(20_000_000, 99);
     chain.record_root(0, root);
+    let (_guard, scratch_dir) = fresh_data_dir("prod-cell-bootstrap");
     let cfg = BootstrapTreeConfig {
         tree_number: 0,
         checkpoint_depth: 64,
-        data_dir: fresh_data_dir("prod-cell-bootstrap"),
+        data_dir: scratch_dir,
         instance_id: "commit-tree-prod-cell".to_owned(),
         max_wall_mins: 30,
         ..BootstrapTreeConfig::default()
@@ -1246,10 +1435,8 @@ async fn boundary_repair_three_seed_per_tree_bench() {
             }
         }
         sparse.sort_by_key(|r| r.tree_position);
-        let cfg = cfg_for_boundary(
-            tree_number,
-            fresh_data_dir(&format!("boundary-arm-tree{tree_number}")),
-        );
+        let (_guard, scratch_dir) = fresh_data_dir(&format!("boundary-arm-tree{tree_number}"));
+        let cfg = cfg_for_boundary(tree_number, scratch_dir);
         let leaves = StubLeaves::new(sparse);
         let outcome = bootstrap_one_tree(&cfg, &leaves, &chain).await;
 
@@ -1303,7 +1490,7 @@ async fn bootstrap_with_encoder_per_node_writes_correct_manifest_label() {
     let leaves = StubLeaves::new(rows);
     let chain = StubChain::new(20_000_000, 99);
     chain.record_root(0, root);
-    let dir = fresh_data_dir("commit-tree-0-encoder-per-node");
+    let (_guard, dir) = fresh_data_dir("commit-tree-0-encoder-per-node");
     let mut cfg = cfg_for(0, dir.clone());
     cfg.encoder_kind = EncoderKind::PerNode { tree_number: 0 };
     bootstrap_one_tree(&cfg, &leaves, &chain)
@@ -1325,7 +1512,7 @@ async fn bootstrap_default_encoder_field_is_per_leaf_bc_for_backward_compat() {
     let leaves = StubLeaves::new(rows);
     let chain = StubChain::new(20_000_000, 99);
     chain.record_root(0, root);
-    let dir = fresh_data_dir("commit-tree-0-encoder-default");
+    let (_guard, dir) = fresh_data_dir("commit-tree-0-encoder-default");
     let cfg = cfg_for(0, dir.clone());
     bootstrap_one_tree(&cfg, &leaves, &chain)
         .await
@@ -1348,7 +1535,7 @@ async fn bootstrap_with_encoder_per_leaf_path_writes_correct_manifest_label() {
     let leaves = StubLeaves::new(rows);
     let chain = StubChain::new(20_000_000, 99);
     chain.record_root(0, root);
-    let dir = fresh_data_dir("commit-tree-0-encoder-per-leaf-path");
+    let (_guard, dir) = fresh_data_dir("commit-tree-0-encoder-per-leaf-path");
     let mut cfg = cfg_for(0, dir.clone());
     cfg.encoder_kind = EncoderKind::PerLeafPath { tree_number: 0 };
     bootstrap_one_tree(&cfg, &leaves, &chain)
@@ -1398,34 +1585,92 @@ fn bootstrap_rejects_invalid_encoder_kind_at_parse_time() {
     );
 }
 
-#[test]
-fn bootstrap_rejects_invalid_ppoi_status_encoder_at_parse_time() {
-    let bin = env!("CARGO_BIN_EXE_raven-railgun");
+/// Runs the real binary with a pool config that does not exist, so an argument clap accepts
+/// ends in a runtime error (exit 1) before any network read, and only a parse-time refusal
+/// exits 2.
+fn bootstrap_cli(extra: &[&str]) -> (Option<i32>, String) {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let pool_cfg = tmp.path().join("rpc-pool.toml");
-    std::fs::write(&pool_cfg, "[[endpoint]]\nurl = \"http://127.0.0.1:1\"\n")
-        .expect("write pool cfg");
     let template = tmp.path().join("tree-{N}").to_string_lossy().into_owned();
-    let out = std::process::Command::new(bin)
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_raven-railgun"))
         .arg("bootstrap-from-subsquid")
         .arg("--rpc-pool-config")
-        .arg(&pool_cfg)
+        .arg(tmp.path().join("absent-rpc-pool.toml"))
         .arg("--data-dir-template")
         .arg(&template)
-        .arg("--tree-numbers")
-        .arg("0")
-        .arg("--ppoi-status-encoder")
-        .arg("not-a-real-encoder")
+        .args(extra)
         .output()
         .expect("spawn raven-railgun");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Each case leads with the flag it must be refused for. Every case is tried before any is
+/// reported, so one run names every flag still accepted.
+fn assert_each_refused_at_parse_time(cases: &[&[&str]]) {
+    let mut accepted = Vec::new();
+    for args in cases {
+        let (code, stderr) = bootstrap_cli(args);
+        if code != Some(2) || !stderr.contains(&format!("unexpected argument '{}'", args[0])) {
+            accepted.push(format!("{}: exit {code:?}: {stderr}", args.join(" ")));
+        }
+    }
+    assert!(accepted.is_empty(), "{}", accepted.join("\n"));
+}
+
+/// Each parsed and changed nothing: the encoder flags reached only a log line, and the oracle
+/// flag could only be set to the one behaviour there is. A script that still passes one must
+/// fail naming it, not run as if it had been applied.
+#[test]
+fn flags_that_changed_nothing_are_refused_as_unexpected_arguments() {
+    assert_each_refused_at_parse_time(&[
+        &["--ppoi-status-encoder", "per-list-status"],
+        &["--ppoi-path-encoder", "per-list-path10"],
+        &["--strict-oracle-byte-identity"],
+    ]);
+}
+
+/// This command never wrote a PPOI list: it rebuilt one in memory, dropped the data_dir it
+/// resolved, and logged the list complete. No flag may offer that again, and the help names
+/// where lists come from instead.
+#[test]
+fn bootstrap_from_subsquid_offers_no_ppoi_list_bootstrap() {
+    assert_each_refused_at_parse_time(&[
+        &[
+            "--ppoi-list-data-dir-template",
+            "/tmp/raven-list-{LIST_KEY}",
+        ],
+        &[
+            "--ppoi-list-keys",
+            "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88",
+        ],
+        &["--ppoi-endpoint", "http://127.0.0.1:1"],
+        &["--ppoi-bootstrap-mode", "skip-on-unreachable"],
+        &["--ppoi-source", "chainalysis-oracle"],
+        &[
+            "--chainalysis-oracle",
+            "0x40C57923924B5c5c5455c48D93317139ADDaC8fb",
+        ],
+        &["--chainalysis-block-start", "0"],
+        &["--chain-type", "0"],
+    ]);
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_raven-railgun"))
+        .args(["bootstrap-from-subsquid", "--help"])
+        .output()
+        .expect("spawn raven-railgun");
+    assert!(out.status.success(), "{out:?}");
+    let help = String::from_utf8_lossy(&out.stdout);
+    for advertised in ["--ppoi", "--chainalysis", "--chain-type", "LIST_KEY"] {
+        assert!(
+            !help.contains(advertised),
+            "the help still offers `{advertised}`: {help}"
+        );
+    }
     assert!(
-        !out.status.success(),
-        "expected non-zero exit on bogus --ppoi-status-encoder"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("unknown ppoi encoder not-a-real-encoder"),
-        "stderr must surface the ppoi-encoder-parse error; got: {stderr}"
+        help.contains("serve-production") && help.contains("mirror"),
+        "the help must name the runtime mirror as the source of PPOI lists: {help}"
     );
 }
 
@@ -1742,15 +1987,10 @@ mod ppoi_resilience {
         let bases = client.bases().to_vec();
         assert_eq!(bases.len(), 3, "all 3 bases retained");
 
-        let report = bootstrap_one_list_with_mode(
-            [0xab; 32],
-            &client,
-            "/tmp/raven/list-{LIST_KEY}",
-            PpoiBootstrapMode::Strict,
-            &bases,
-        )
-        .await
-        .expect("walker reaches the third base");
+        let report =
+            bootstrap_one_list_with_mode([0xab; 32], &client, PpoiBootstrapMode::Strict, &bases)
+                .await
+                .expect("walker reaches the third base");
         assert_eq!(
             report.events, 1,
             "exactly one event served from the third base"
@@ -1760,7 +2000,8 @@ mod ppoi_resilience {
         let _ = good_shutdown.send(());
     }
 
-    /// All sources dead: skip-on-unreachable WARNs about the signature gap and seeds an empty IMT.
+    /// All sources dead: `SkipOnUnreachable` WARNs about the signature gap and reports the list
+    /// empty, persisting nothing.
     ///
     /// `current_thread` so the `set_default` thread-local subscriber sees the bootstrap's emissions.
     #[tokio::test(flavor = "current_thread")]
@@ -1784,21 +2025,20 @@ mod ppoi_resilience {
         let report = bootstrap_one_list_with_mode(
             [0xcd; 32],
             &client,
-            "/tmp/raven/list-{LIST_KEY}",
             PpoiBootstrapMode::SkipOnUnreachable,
             &bases,
         )
         .await
-        .expect("skip-on-unreachable returns Ok with empty IMT");
+        .expect("SkipOnUnreachable returns Ok with an empty list");
         drop(guard);
 
-        assert_eq!(report.events, 0, "empty IMT seeded");
+        assert_eq!(report.events, 0, "reported empty");
         let empty = Imt::new().expect("imt").root();
         assert_eq!(report.local_root, empty, "local_root is the empty-IMT root");
 
         let logs = capture.snapshot();
         assert!(
-            logs.contains("PPOI bootstrap skipped"),
+            logs.contains("PPOI list verification skipped"),
             "warn log fires: {logs}"
         );
         assert!(
@@ -1806,8 +2046,8 @@ mod ppoi_resilience {
             "warn log surfaces signature gap: {logs}"
         );
         assert!(
-            logs.contains("seeded EMPTY"),
-            "warn log states the IMT seeding: {logs}"
+            logs.contains("nothing persisted") && !logs.contains("seeded"),
+            "warn log must not read as a write: {logs}"
         );
         assert!(
             logs.contains(&bad1) || logs.contains(&bad2),
@@ -1822,15 +2062,10 @@ mod ppoi_resilience {
         let (bad2, shutdown_bad2) = spawn_ppoi_stub(always_503()).await;
         let client = RailwayPpoiClient::new_multi(vec![bad1, bad2], 0, 1).expect("client");
         let bases = client.bases().to_vec();
-        let err = bootstrap_one_list_with_mode(
-            [0xef; 32],
-            &client,
-            "/tmp/raven/list-{LIST_KEY}",
-            PpoiBootstrapMode::Strict,
-            &bases,
-        )
-        .await
-        .expect_err("strict mode hard-stops");
+        let err =
+            bootstrap_one_list_with_mode([0xef; 32], &client, PpoiBootstrapMode::Strict, &bases)
+                .await
+                .expect_err("strict mode hard-stops");
         match err {
             BootstrapError::PpoiUnreachable(msg) => {
                 assert!(
@@ -1882,7 +2117,6 @@ mod ppoi_resilience {
             bootstrap_one_list_with_mode(
                 [0xcd; 32],
                 &client,
-                "/tmp/raven/list-{LIST_KEY}",
                 PpoiBootstrapMode::SkipOnUnreachable,
                 client.bases(),
             ),
@@ -1891,7 +2125,7 @@ mod ppoi_resilience {
         .expect("must error inside 60s when per-URL timeout is wired");
         let elapsed = started.elapsed();
 
-        let report = outcome.expect("skip-on-unreachable degrades to empty");
+        let report = outcome.expect("SkipOnUnreachable degrades to empty");
         assert_eq!(report.events, 0, "no events from a silent server");
         assert!(
             elapsed < std::time::Duration::from_secs(45),
@@ -1961,18 +2195,12 @@ mod ppoi_resilience {
     ) -> Result<PpoiListReport, BootstrapError> {
         let client = RailwayPpoiClient::new_multi(bases, 0, 1).expect("client");
         let tried = client.bases().to_vec();
-        bootstrap_one_list_with_mode(
-            [0xab; 32],
-            &client,
-            "/tmp/raven/list-{LIST_KEY}",
-            mode,
-            &tried,
-        )
-        .await
+        bootstrap_one_list_with_mode([0xab; 32], &client, mode, &tried).await
     }
 
     /// Skip mode exists for an upstream that cannot be reached. One that answers with an
     /// incomplete or reordered list was reached, and an empty tree reported `Ok` hides it.
+    /// No command sets the mode, so the refusal must not send the reader to a flag.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn skip_on_unreachable_never_absorbs_an_integrity_violation() {
         // Every case runs before any is reported, so one run lists every leak.
@@ -1984,7 +2212,12 @@ mod ppoi_resilience {
                 PpoiBootstrapMode::Strict,
             ] {
                 match bootstrap_in_mode(vec![base.clone()], mode).await {
-                    Err(BootstrapError::PpoiIntegrity(message)) if message.contains(detail) => {}
+                    Err(error @ BootstrapError::PpoiIntegrity(_)) => {
+                        let shown = error.to_string();
+                        if !shown.contains(detail) || shown.contains("--") {
+                            leaks.push(format!("{case} / {mode:?}: shown as `{shown}`"));
+                        }
+                    }
                     Ok(report) => leaks.push(format!(
                         "{case} / {mode:?}: absorbed as Ok(events={})",
                         report.events
@@ -2071,7 +2304,6 @@ mod ppoi_resilience {
         let err = bootstrap_one_list_with_mode(
             [0xab; 32],
             &src,
-            "/tmp/raven/list-{LIST_KEY}",
             PpoiBootstrapMode::SkipOnUnreachable,
             &[],
         )
@@ -2084,20 +2316,5 @@ mod ppoi_resilience {
                 ..
             }
         ));
-    }
-
-    /// Mode parser smoke.
-    #[test]
-    fn ppoi_bootstrap_mode_parses_cli_strings() {
-        assert_eq!(
-            PpoiBootstrapMode::parse_cli("strict").expect("strict ok"),
-            PpoiBootstrapMode::Strict
-        );
-        assert_eq!(
-            PpoiBootstrapMode::parse_cli("skip-on-unreachable").expect("skip ok"),
-            PpoiBootstrapMode::SkipOnUnreachable
-        );
-        let err = PpoiBootstrapMode::parse_cli("nonsense").expect_err("rejects unknown");
-        assert!(err.contains("unknown"), "{err}");
     }
 }

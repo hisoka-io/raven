@@ -78,6 +78,7 @@ fn runtime(tmp: &std::path::Path) -> AutoSpawnRuntime {
         verification_cadence_n: 0,
         max_instance_count: None,
         cooldown: None,
+        session_limits: raven_railgun_engine::session_pool::SessionStoreLimits::default(),
     }
 }
 

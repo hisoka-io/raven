@@ -10,39 +10,15 @@
 )]
 #![cfg(test)]
 
+#[path = "support/snapshot_fixture.rs"]
+mod snapshot_fixture;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use raven_railgun_cli::snapshot_port::{
     prune_old_export_tarballs, run_export, run_prune, ExportOptions, PruneOptions,
 };
-use raven_railgun_persistence::{
-    Manifest, Snapshot, SnapshotId, StoreLayout, MANIFEST_SCHEMA_VERSION, SNAPSHOT_MAGIC,
-};
-
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
-
-/// Minimal manifest+snapshot data_dir so `run_export` has one instance to walk.
-fn bootstrap_minimal_instance(root: &Path, instance_id: &str, payload: &[u8]) {
-    let inst_dir = root.join(instance_id);
-    let layout = StoreLayout::open(&inst_dir).expect("StoreLayout::open");
-    let snap = Snapshot::build(payload.to_vec(), SNAPSHOT_MAGIC);
-    let snap_id = SnapshotId(7);
-    snap.save(&layout, snap_id).expect("snapshot save");
-    let manifest = Manifest {
-        schema_version: MANIFEST_SCHEMA_VERSION,
-        scheme_tag: SCHEME_TAG.to_owned(),
-        instance_id: instance_id.to_owned(),
-        current_snapshot_id: snap_id,
-        current_snapshot_seq: 1,
-        current_marker: 100,
-        encoder_label: "per-leaf-bc".to_owned(),
-        prev_encoder_label: None,
-        entry_size_bytes: Some(32),
-        rows_per_shard: Some(2048),
-    };
-    manifest.save(&layout).expect("manifest save");
-}
 
 /// Write `bytes` and stamp `mtime` deterministically.
 fn write_with_mtime(path: &Path, bytes: &[u8], mtime: SystemTime) {
@@ -191,7 +167,7 @@ fn prune_snapshots_subcommand_removes_oldest_tarballs() {
 }
 
 // Sidecar pairing through `run_prune` needs no separate test: run_prune is
-// prune_old_export_tarballs plus one tracing::info (snapshot_port.rs:397-406),
+// prune_old_export_tarballs plus one tracing::info,
 // and the sidecar property is pinned at the lib seam above.
 
 #[test]
@@ -245,7 +221,13 @@ fn export_snapshot_invokes_pruner_after_write() {
     let scratch = tempfile::tempdir().expect("tempdir");
     let src_root = scratch.path().join("src");
     std::fs::create_dir_all(&src_root).expect("mkdir src");
-    bootstrap_minimal_instance(&src_root, "alpha", b"deadbeef-payload");
+    snapshot_fixture::wal_only_instance(
+        &src_root,
+        "alpha",
+        snapshot_fixture::SCHEME_TAG_A,
+        snapshot_fixture::LIST_A,
+        4,
+    );
 
     // pre-seed stale tarballs the export must prune
     let parent = scratch.path().join("snapshots");
@@ -266,7 +248,6 @@ fn export_snapshot_invokes_pruner_after_write() {
         data_dir: src_root,
         output: fresh.clone(),
         signing_key: None,
-        include_current_wal: false,
         keep_snapshots: 2,
     })
     .expect("run_export");

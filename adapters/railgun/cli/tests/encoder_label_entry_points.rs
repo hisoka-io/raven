@@ -156,6 +156,7 @@ fn ppoi_list_template(encoder: &str) -> PpoiListTemplateRuntime {
         entries: 65_536,
         entry_bytes: 512,
         channel_capacity: 16,
+        session_limits: raven_railgun_engine::session_pool::SessionStoreLimits::default(),
     }
 }
 
@@ -187,6 +188,7 @@ fn auto_spawn_resolves_every_chain_encoder_and_no_ppoi_encoder() {
         verification_cadence_n: 0,
         max_instance_count: None,
         cooldown: None,
+        session_limits: raven_railgun_engine::session_pool::SessionStoreLimits::default(),
     };
     for kind in chain_kinds() {
         let resolved = runtime(kind.label())
@@ -201,7 +203,14 @@ fn auto_spawn_resolves_every_chain_encoder_and_no_ppoi_encoder() {
     }
 }
 
+/// The chain settings only when `tables` indexes a commit tree; the loader refuses them otherwise.
 fn config_with(tables: &str) -> tempfile::NamedTempFile {
+    let chain = if tables.contains(r#"kind = "indexer""#) {
+        "rpc_url = \"http://127.0.0.1:1\"\n\
+         railgun_proxy = \"0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9\"\nstart_block = 0"
+    } else {
+        ""
+    };
     let mut file = tempfile::NamedTempFile::new().expect("tempfile");
     write!(
         file,
@@ -209,11 +218,9 @@ fn config_with(tables: &str) -> tempfile::NamedTempFile {
 [global]
 bind = "127.0.0.1:0"
 token = "encoder-label-test-token-padded-long"
-rpc_url = "http://127.0.0.1:1"
-railgun_proxy = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
 chain_id = 1
-start_block = 0
 mirror_endpoint = "http://127.0.0.1:1"
+{chain}
 {tables}
 "#
     )
@@ -244,7 +251,7 @@ role = "live"
 encoder = "{label}"
 list_key = "{LIST_KEY_HEX}"
 data_dir = "/tmp/raven-unused"
-verification_mode = "upstream-signature"
+verification_mode = "upstream-asserted"
 data_source = {{ kind = "mirror", list_key = "{LIST_KEY_HEX}" }}
 "#
         ),

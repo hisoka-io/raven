@@ -8,18 +8,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::bearer_token::{resolve_bearer_token, BEARER_TOKEN_ENV};
+pub use crate::serve_production::SessionCapacity;
 use anyhow::Context;
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_core::{InstanceId, ListKey};
+use raven_railgun_engine::imt::TREE_MAX_ITEMS;
 use raven_railgun_engine::inspire::{
     setup_state_with_inspiring_seed, InspireServerState, LogicalLeafStore, RavenInspireScheme,
 };
 use raven_railgun_engine::orchestrator::{
-    bootstrap_railgun_engine_multi, DataSourceFilter, InstanceConfig, MultiOrchestratorHandle,
-    OrchestratorChannels, PerInstanceHandles, VerificationMode,
+    bootstrap_railgun_engine_multi_with_session_limits, DataSourceFilter, InstanceConfig,
+    MultiOrchestratorHandle, OrchestratorChannels, PerInstanceHandles, VerificationMode,
+    LEAVES_PER_PPOI_BLOCK,
 };
 use raven_railgun_engine::persistence::{ConsumerMetrics, SnapshotPolicy};
 use raven_railgun_engine::pir_table::EncoderKind;
+use raven_railgun_engine::session_pool::SessionStoreLimits;
 use raven_railgun_engine::{Engine, InstanceRole};
 use raven_railgun_http::{
     inspire_router, trusted_proxy::resolve_declared_ranges, AppState, HttpConfig,
@@ -184,11 +188,23 @@ struct GlobalSection {
     /// 600-mode file holding the bearer token; the production path.
     #[serde(default)]
     token_file: Option<PathBuf>,
-    rpc_url: String,
-    railgun_proxy: String,
+    /// Required by a config that reads the chain (a commit-tree instance, `[auto_spawn]`, or a
+    /// chain-encoder `[[instance_template]]`), and refused by one that does not.
+    #[serde(default)]
+    rpc_url: Option<String>,
+    /// Required or refused together with `rpc_url`.
+    #[serde(default)]
+    railgun_proxy: Option<String>,
+    /// The chain the indexer reads and the one whose PPOI lists the mirror asks upstream for.
     chain_id: u64,
-    start_block: u64,
+    /// Required or refused together with `rpc_url`.
+    #[serde(default)]
+    start_block: Option<u64>,
     mirror_endpoint: String,
+    /// Seconds between mirror pages while upstream answers full ones: a cold sync. A short,
+    /// empty or failed page waits the poll interval. Absent, every page waits the poll interval.
+    #[serde(default)]
+    mirror_backfill_interval_secs: Option<u64>,
     #[serde(default)]
     max_concurrent_queries: Option<usize>,
     #[serde(default)]
@@ -233,6 +249,18 @@ struct GlobalSection {
     /// Heartbeat session-eviction interval (seconds); `0` disables.
     #[serde(default)]
     session_eviction_interval_secs: Option<u64>,
+    /// Packing-key seats per instance, auto-spawned ones included.
+    #[serde(default)]
+    max_sessions_per_instance: Option<usize>,
+    /// Seat and handle lifetime in seconds; may only be lowered from the default.
+    #[serde(default)]
+    session_ttl_secs: Option<u64>,
+    /// Concurrent `/v1/events` streams.
+    #[serde(default)]
+    max_sse_connections: Option<usize>,
+    /// Concurrent `/v1/events` streams one peer may hold.
+    #[serde(default)]
+    max_sse_connections_per_peer: Option<usize>,
     /// Mount one-query multi-shard fanout. Absent keeps the disabled default.
     #[serde(default)]
     enable_fanout: Option<bool>,
@@ -302,14 +330,14 @@ enum EncoderString {
 #[serde(rename_all = "kebab-case")]
 enum VerificationModeString {
     ChainRootHistory,
-    UpstreamSignature,
+    UpstreamAsserted,
 }
 
 impl From<VerificationModeString> for VerificationMode {
     fn from(mode: VerificationModeString) -> Self {
         match mode {
             VerificationModeString::ChainRootHistory => Self::ChainRootHistory,
-            VerificationModeString::UpstreamSignature => Self::UpstreamSignature,
+            VerificationModeString::UpstreamAsserted => Self::UpstreamAsserted,
         }
     }
 }
@@ -342,15 +370,21 @@ struct IndexerFilterSection {
 pub struct MultiServeOptions {
     pub bind: SocketAddr,
     pub token: String,
+    /// Empty when the config reads nothing off the chain; no indexer dials it then.
     pub rpc_url: String,
+    /// Empty when the config reads nothing off the chain.
     pub railgun_proxy: String,
     pub chain_id: u64,
+    /// Zero when the config reads nothing off the chain.
     pub start_block: u64,
     pub mirror_endpoint: String,
+    /// `[global].mirror_backfill_interval_secs`; `None` paces every page at the poll interval.
+    pub mirror_backfill_interval_secs: Option<u64>,
     pub max_concurrent_queries: usize,
     pub respond_timeout_secs: u64,
     pub instances: Vec<InstanceConfig>,
-    /// Tests set this to skip the live RPC + indexer worker.
+    /// Tests set this to skip the live RPC + indexer worker. Unset, the indexer still starts
+    /// only when [`chain_indexer_reason`] names a reader.
     pub skip_chain_workers: bool,
     pub skip_mirror_workers: bool,
     /// Fallback for instances absent from `instance_entries`.
@@ -388,6 +422,8 @@ pub struct MultiServeOptions {
     pub max_fanout_shards: Option<usize>,
     /// Indexer Layer 1 reorg-window cache path; absent = ephemeral.
     pub reorg_window_path: Option<PathBuf>,
+    /// Session seats, session lifetime and event-stream bounds; absent keys keep the defaults.
+    pub session_capacity: SessionCapacity,
 }
 
 pub type BootstrapObserver = Arc<parking_lot::Mutex<Option<BootstrapView>>>;
@@ -573,6 +609,15 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
     }
 
     let global_max_instance_count = parsed.global.max_instance_count;
+    let spawning_template = if parsed.auto_spawn.enabled {
+        None
+    } else {
+        parsed
+            .instance_template
+            .iter()
+            .find(|t| is_chain_encoder_label(&t.encoder))
+            .map(|t| t.template_id.clone())
+    };
     let auto_spawn = if parsed.auto_spawn.enabled {
         let mut cfg = parsed.auto_spawn;
         crate::auto_spawn::validate_data_dir_template(&cfg.data_dir_template)?;
@@ -584,12 +629,7 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         parsed
             .instance_template
             .iter()
-            .find(|t| {
-                matches!(
-                    t.encoder.as_str(),
-                    "per-leaf-bc" | "per-leaf-path" | "per-node"
-                )
-            })
+            .find(|t| is_chain_encoder_label(&t.encoder))
             .map(|tpl| AutoSpawnConfigToml {
                 enabled: true,
                 data_dir_template: tpl.data_dir_template.clone(),
@@ -639,6 +679,34 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         }
     }
 
+    // A backfill slower than the poll it replaces is a unit slip, not a choice.
+    if let Some(secs) = parsed.global.mirror_backfill_interval_secs {
+        let poll = raven_railgun_ppoi_mirror::DEFAULT_POLL_INTERVAL_SECS;
+        if secs > poll {
+            anyhow::bail!(
+                "[global].mirror_backfill_interval_secs = {secs} is slower than the {poll} s \
+                 mirror poll interval it shortens (must be 0..={poll})"
+            );
+        }
+    }
+
+    let session_capacity = {
+        let defaults = SessionCapacity::default();
+        let global = &parsed.global;
+        SessionCapacity {
+            max_sessions_per_instance: global
+                .max_sessions_per_instance
+                .unwrap_or(defaults.max_sessions_per_instance),
+            session_ttl_secs: global.session_ttl_secs.unwrap_or(defaults.session_ttl_secs),
+            max_sse_connections: global
+                .max_sse_connections
+                .unwrap_or(defaults.max_sse_connections),
+            max_sse_connections_per_peer: global
+                .max_sse_connections_per_peer
+                .unwrap_or(defaults.max_sse_connections_per_peer),
+        }
+    };
+
     let bearer = resolve_bearer_token(
         parsed.global.token.as_deref(),
         parsed.global.token_file.as_deref(),
@@ -655,14 +723,34 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
     )
     .map_err(|e| anyhow::anyhow!("[global] {e}"))?;
 
+    // A template that turned auto-spawn on is named, not the `[auto_spawn]` table it stood in for.
+    let chain_reason = match &spawning_template {
+        Some(template_id) if !reads_commit_tree(&instances) => Some(format!(
+            "[[instance_template]] template_id={template_id:?} has a chain encoder, which turns \
+             on auto-spawn of commit-tree instances"
+        )),
+        _ => chain_indexer_reason(&instances, auto_spawn.as_ref()),
+    };
+    let (rpc_url, railgun_proxy, start_block) = if let Some(reason) = chain_reason {
+        (
+            require_chain_key(parsed.global.rpc_url, "rpc_url", &reason)?,
+            require_chain_key(parsed.global.railgun_proxy, "railgun_proxy", &reason)?,
+            require_chain_key(parsed.global.start_block, "start_block", &reason)?,
+        )
+    } else {
+        refuse_unread_chain_settings(&parsed.global, parsed.rpc_pool.is_some())?;
+        (String::new(), String::new(), 0)
+    };
+
     Ok(MultiServeOptions {
         bind: parsed.global.bind,
         token: bearer.token,
-        rpc_url: parsed.global.rpc_url,
-        railgun_proxy: parsed.global.railgun_proxy,
+        rpc_url,
+        railgun_proxy,
         chain_id: parsed.global.chain_id,
-        start_block: parsed.global.start_block,
+        start_block,
         mirror_endpoint: parsed.global.mirror_endpoint,
+        mirror_backfill_interval_secs: parsed.global.mirror_backfill_interval_secs,
         max_concurrent_queries: parsed.global.max_concurrent_queries.unwrap_or(4),
         respond_timeout_secs: parsed.global.respond_timeout_secs.unwrap_or(30),
         instances,
@@ -688,7 +776,84 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         enable_fanout: parsed.global.enable_fanout,
         max_fanout_shards: parsed.global.max_fanout_shards,
         reorg_window_path: parsed.global.reorg_window_path,
+        session_capacity,
     })
+}
+
+/// The encoders an `[[instance_template]]` spawns commit-tree instances with.
+fn is_chain_encoder_label(encoder: &str) -> bool {
+    matches!(encoder, "per-leaf-bc" | "per-leaf-path" | "per-node")
+}
+
+fn reads_commit_tree(instances: &[InstanceConfig]) -> bool {
+    instances
+        .iter()
+        .any(|instance| matches!(instance.data_source, DataSourceFilter::ChainTreeNumber(_)))
+}
+
+/// Why the node needs a chain indexer, or `None` when nothing it serves is read off the chain.
+/// A commit-tree instance is fed only by the indexer, and `[auto_spawn]` creates more of them.
+#[must_use]
+pub fn chain_indexer_reason(
+    instances: &[InstanceConfig],
+    auto_spawn: Option<&AutoSpawnConfigToml>,
+) -> Option<String> {
+    let tree_reader = instances
+        .iter()
+        .find_map(|instance| match instance.data_source {
+            DataSourceFilter::ChainTreeNumber(tree) => Some(format!(
+                "instance {} indexes commit tree {tree}",
+                instance.instance_id.as_str()
+            )),
+            _ => None,
+        });
+    tree_reader.or_else(|| {
+        auto_spawn
+            .is_some_and(|cfg| cfg.enabled)
+            .then(|| "[auto_spawn] is enabled and spawns commit-tree instances".to_owned())
+    })
+}
+
+fn require_chain_key<T>(value: Option<T>, key: &str, reason: &str) -> anyhow::Result<T> {
+    value.ok_or_else(|| {
+        anyhow::anyhow!(
+            "[global].{key} is required because {reason}, and the chain indexer reads it"
+        )
+    })
+}
+
+/// Only the chain indexer and `[auto_spawn]` read these, so with neither they would be dropped.
+fn refuse_unread_chain_settings(global: &GlobalSection, rpc_pool: bool) -> anyhow::Result<()> {
+    let unread: Vec<&str> = [
+        ("[global].rpc_url", global.rpc_url.is_some()),
+        ("[global].railgun_proxy", global.railgun_proxy.is_some()),
+        ("[global].start_block", global.start_block.is_some()),
+        ("[global].ws_endpoint", global.ws_endpoint.is_some()),
+        (
+            "[global].reorg_window_path",
+            global.reorg_window_path.is_some(),
+        ),
+        (
+            "[global].tree_fill_threshold",
+            global.tree_fill_threshold.is_some(),
+        ),
+        (
+            "[global].max_instance_count",
+            global.max_instance_count.is_some(),
+        ),
+        ("[rpc_pool]", rpc_pool),
+    ]
+    .into_iter()
+    .filter_map(|(key, set)| set.then_some(key))
+    .collect();
+    if unread.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "chain settings `{}` are set, but no instance indexes a commit tree and [auto_spawn] is \
+         off, so nothing reads them: remove them, or declare the commit-tree instance they are for",
+        unread.join("`, `")
+    )
 }
 
 /// Build the HTTP configuration used by the multi-instance production path.
@@ -724,6 +889,7 @@ pub fn build_http_config(opts: &MultiServeOptions) -> HttpConfig {
     if let Some(max) = opts.max_fanout_shards {
         config.max_fanout_shards = max;
     }
+    opts.session_capacity.apply_to(&mut config);
     config
 }
 
@@ -804,9 +970,9 @@ fn enforce_verification_mode_matches_data_source(
         (DataSourceFilter::ChainTreeNumber(_), VerificationMode::ChainRootHistory)
         | (
             DataSourceFilter::PpoiList(_) | DataSourceFilter::PpoiListBlock { .. },
-            VerificationMode::UpstreamSignature,
+            VerificationMode::UpstreamAsserted,
         ) => Ok(()),
-        (DataSourceFilter::ChainTreeNumber(t), VerificationMode::UpstreamSignature) => {
+        (DataSourceFilter::ChainTreeNumber(t), VerificationMode::UpstreamAsserted) => {
             anyhow::bail!(
                 "chain-tree instance (tree_number={t}) must use \
                  verification_mode = \"chain-root-history\""
@@ -816,7 +982,7 @@ fn enforce_verification_mode_matches_data_source(
             DataSourceFilter::PpoiList(_) | DataSourceFilter::PpoiListBlock { .. },
             VerificationMode::ChainRootHistory,
         ) => {
-            anyhow::bail!("ppoi-list instance must use verification_mode = \"upstream-signature\"")
+            anyhow::bail!("ppoi-list instance must use verification_mode = \"upstream-asserted\"")
         }
     }
 }
@@ -1011,6 +1177,14 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     if opts.instances.is_empty() {
         anyhow::bail!("multi-instance serve requires at least one [[instance]] config");
     }
+    let reads_chain = chain_indexer_reason(&opts.instances, opts.auto_spawn.as_ref()).is_some();
+    // `--ws-endpoint` is merged in after the loader refused the TOML key, so it is refused here.
+    if !reads_chain && opts.ws_endpoint.is_some() {
+        anyhow::bail!(
+            "a WebSocket endpoint is set (`--ws-endpoint` or `[global].ws_endpoint`), but no \
+             instance indexes a commit tree and [auto_spawn] is off, so nothing reads it: drop it"
+        );
+    }
 
     let params = InspireParams::secure_128_d2048();
     let fleet_default_entries = opts.entries.max(1);
@@ -1023,7 +1197,14 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
 
     warn_if_ifma52_small_cell(&opts, smallest_cell_entries);
 
-    let bootstrap = bootstrap_instances(&opts, fleet_default_entries, &params)?;
+    // Before any store opens: every store, auto-spawned ones included, takes its limits here.
+    let http_config = build_http_config(&opts);
+    http_config
+        .validate()
+        .map_err(|e| anyhow::anyhow!("[global] {e}"))?;
+    let session_limits = http_config.session_store_limits();
+
+    let bootstrap = bootstrap_instances(&opts, fleet_default_entries, &params, session_limits)?;
 
     let mut engine: Engine<RavenInspireScheme> = Engine::new();
     let mut k_map: HashMap<InstanceId, u32> =
@@ -1088,7 +1269,10 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
             .map(|parent| parent.join("indexer_reorg_window.bin"))
     });
 
-    let chain_workers = if opts.skip_chain_workers {
+    if !reads_chain {
+        tracing::info!("no instance reads the chain and [auto_spawn] is off; no chain indexer");
+    }
+    let chain_workers = if opts.skip_chain_workers || !reads_chain {
         None
     } else {
         Some(
@@ -1104,7 +1288,6 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
             .await?,
         )
     };
-    let http_config = build_http_config(&opts);
 
     let app_state = AppState::new(engine, http_config)
         .map_err(|e| anyhow::anyhow!("AppState::new: {e}"))?
@@ -1132,6 +1315,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
             bootstrap.handles.tree_observed.clone(),
             &bootstrap.handles.instances,
             &opts,
+            session_limits,
         )?)
     } else {
         None
@@ -1148,6 +1332,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
             bootstrap.handles.list_observed.clone(),
             &bootstrap.handles.instances,
             opts.entries,
+            session_limits,
         )?)
     };
 
@@ -1271,6 +1456,10 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         .map(|h| (h.config.instance_id.clone(), Arc::clone(&h.metrics)))
         .collect();
     let app_state = app_state.with_instance_metrics(per_instance_metrics);
+    let app_state = match mirror_workers.as_ref() {
+        Some(workers) => app_state.with_mirror_feeds(workers.readiness_probe()),
+        None => app_state,
+    };
 
     let sweeper_handle = app_state.start_session_sweeper(std::time::Duration::from_secs(60));
     auxiliary_tasks.push(sweeper_handle);
@@ -1566,7 +1755,10 @@ async fn run_sighup_reload_loop(
                     max_instance_count: tpl.max_instance_count,
                     cooldown_seconds: tpl.cooldown_seconds,
                 };
-                let runtime = runtime_from_auto_spawn_section(&synthesized, entries_default);
+                // The HTTP layer is not reloaded, so neither are the seats it was sized for.
+                let session_limits = live_runtime.load().session_limits;
+                let runtime =
+                    runtime_from_auto_spawn_section(&synthesized, entries_default, session_limits);
                 live_runtime.store(Arc::new(runtime));
                 if let Some(observer) = &applied_observer {
                     let _ = observer.send(tpl.template_id.clone());
@@ -1793,6 +1985,7 @@ async fn run_tree_fill_watcher(inputs: TreeFillWatcherInputs) {
 fn runtime_from_auto_spawn_section(
     cfg: &AutoSpawnConfigToml,
     default_entries: usize,
+    session_limits: SessionStoreLimits,
 ) -> crate::auto_spawn_driver::AutoSpawnRuntime {
     crate::auto_spawn_driver::AutoSpawnRuntime {
         data_dir_template: cfg.data_dir_template.clone(),
@@ -1819,9 +2012,11 @@ fn runtime_from_auto_spawn_section(
             .cooldown_seconds
             .filter(|n| *n > 0)
             .map(|n| std::time::Duration::from_secs(u64::from(n))),
+        session_limits,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wire_auto_spawn(
     cfg: &AutoSpawnConfigToml,
     params: &InspireParams,
@@ -1830,10 +2025,11 @@ fn wire_auto_spawn(
     tree_observed: tokio::sync::broadcast::Sender<u32>,
     initial_handles: &[raven_railgun_engine::orchestrator::PerInstanceHandles],
     opts: &MultiServeOptions,
+    session_limits: SessionStoreLimits,
 ) -> anyhow::Result<AutoSpawnWiring> {
     use crate::auto_spawn_driver::{replay_spawn_log, run_driver_dynamic, SpawnRegistry};
 
-    let runtime = runtime_from_auto_spawn_section(cfg, opts.entries);
+    let runtime = runtime_from_auto_spawn_section(cfg, opts.entries, session_limits);
 
     let spawn_log_dir = match initial_handles.first() {
         Some(h) => h
@@ -1910,6 +2106,7 @@ fn wire_ppoi_list_driver(
     list_observed: tokio::sync::broadcast::Sender<[u8; 32]>,
     initial_handles: &[raven_railgun_engine::orchestrator::PerInstanceHandles],
     entries_default: usize,
+    session_limits: SessionStoreLimits,
 ) -> anyhow::Result<PpoiListWiring> {
     use crate::auto_spawn_driver::{
         replay_ppoi_list_spawn_log, run_ppoi_list_driver, PpoiListSpawnRegistry,
@@ -1918,7 +2115,7 @@ fn wire_ppoi_list_driver(
 
     let runtimes: Vec<PpoiListTemplateRuntime> = templates
         .iter()
-        .map(|t| ppoi_list_template_runtime(t, entries_default))
+        .map(|t| ppoi_list_template_runtime(t, entries_default, session_limits))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     let spawn_log_dir = match initial_handles.first() {
@@ -1978,6 +2175,7 @@ fn wire_ppoi_list_driver(
 fn ppoi_list_template_runtime(
     tpl: &PpoiListTemplateToml,
     entries_default: usize,
+    session_limits: SessionStoreLimits,
 ) -> anyhow::Result<crate::auto_spawn_driver::PpoiListTemplateRuntime> {
     let list_key = parse_hex32(&tpl.list_key)?;
     Ok(crate::auto_spawn_driver::PpoiListTemplateRuntime {
@@ -2001,6 +2199,7 @@ fn ppoi_list_template_runtime(
             tpl.entry_bytes
         },
         channel_capacity: 1024,
+        session_limits,
     })
 }
 
@@ -2050,6 +2249,7 @@ fn bootstrap_instances(
     opts: &MultiServeOptions,
     fleet_default_entries: usize,
     params: &InspireParams,
+    session_limits: SessionStoreLimits,
 ) -> anyhow::Result<Bootstrap> {
     let mut state_holders: Vec<Option<InspireServerState>> =
         Vec::with_capacity(opts.instances.len());
@@ -2102,8 +2302,13 @@ fn bootstrap_instances(
         })
     };
 
-    let handles = bootstrap_railgun_engine_multi(opts.instances.clone(), params.clone(), factory)
-        .map_err(|e| anyhow::anyhow!("bootstrap_railgun_engine_multi: {e}"))?;
+    let handles = bootstrap_railgun_engine_multi_with_session_limits(
+        opts.instances.clone(),
+        params.clone(),
+        session_limits,
+        factory,
+    )
+    .map_err(|e| anyhow::anyhow!("bootstrap_railgun_engine_multi: {e}"))?;
     Ok(Bootstrap { handles })
 }
 
@@ -2381,84 +2586,369 @@ impl Drop for ChainWorkers {
 
 struct MirrorWorkers {
     handles: Vec<tokio::task::JoinHandle<()>>,
+    feeds: Vec<FeedReport>,
 }
+
+/// What readiness reads of one list's feed: the feed's own progress, and the stores of every
+/// instance the list routes to, read at probe time.
+#[derive(Clone)]
+struct FeedReport {
+    list_key: [u8; 32],
+    status: raven_railgun_ppoi_mirror::FeedStatus,
+    stores: Vec<(DataSourceFilter, Arc<parking_lot::Mutex<LogicalLeafStore>>)>,
+}
+
+impl FeedReport {
+    fn view(&self) -> raven_railgun_http::status::MirrorFeedView {
+        let held: Vec<(DataSourceFilter, usize)> = self
+            .stores
+            .iter()
+            .map(|(filter, store)| (*filter, list_rows(&store.lock(), &self.list_key)))
+            .collect();
+        mirror_feed_view(&self.list_key, &self.status.snapshot(), &held)
+    }
+}
+
+impl MirrorWorkers {
+    fn readiness_probe(&self) -> raven_railgun_http::state::MirrorFeedProbe {
+        let feeds = self.feeds.clone();
+        Arc::new(move || feeds.iter().map(FeedReport::view).collect::<Vec<_>>())
+    }
+}
+
+pub(crate) fn list_rows(store: &LogicalLeafStore, list_key: &[u8; 32]) -> usize {
+    store
+        .ppoi_imt(list_key)
+        .map_or(0, raven_railgun_engine::imt::Imt::leaf_count)
+}
+
+// A caught-up feed renews the count the shim anchors a frontier on once per poll. The shim's bound
+// has to outlast two failed polls in a row, each running to the request timeout.
+const _: () = assert!(
+    raven_railgun_http::shim_store::UPSTREAM_TIP_MAX_AGE_SECS
+        >= 3 * raven_railgun_ppoi_mirror::DEFAULT_POLL_INTERVAL_SECS
+            + raven_railgun_ppoi_mirror::REQUEST_TIMEOUT.as_secs()
+);
 
 async fn spawn_mirror_workers(
     opts: &MultiServeOptions,
     handle: &MultiOrchestratorHandle,
 ) -> anyhow::Result<MirrorWorkers> {
-    use raven_railgun_ppoi_mirror::{MirrorConfig, MirrorCursor, UpstreamPpoiMirror};
+    use raven_railgun_ppoi_mirror::{FeedStatus, MirrorConfig, UpstreamPpoiMirror};
 
     let mirror_config = MirrorConfig {
         endpoint: opts.mirror_endpoint.clone(),
+        chain_id: opts.chain_id,
         ..MirrorConfig::default()
     };
-    let mirror = Arc::new(
-        UpstreamPpoiMirror::new(mirror_config)
-            .map_err(|e| anyhow::anyhow!("ppoi mirror constructor: {e}"))?,
-    );
+    let mut mirror = UpstreamPpoiMirror::new(mirror_config)
+        .map_err(|e| anyhow::anyhow!("ppoi mirror constructor: {e}"))?;
+    if let Some(secs) = opts.mirror_backfill_interval_secs {
+        mirror = mirror.with_backfill_interval(std::time::Duration::from_secs(secs));
+    }
+    let mirror = Arc::new(mirror);
     let mirror_tx = handle.channels.mirror_tx.clone();
     crate::serve_production::ensure_mirror_preflight_metrics_described();
 
-    // "Nothing to serve" is a property of the LIST, not of the instance the worker runs on:
-    // the shipped topology keeps a list's path rows under block instances beside a status
-    // instance whose own count reads zero.
-    let mut lists_with_rows = std::collections::BTreeSet::new();
-    for inst in &handle.instances {
-        let list_key = match inst.config.data_source {
-            DataSourceFilter::PpoiList(list_key)
-            | DataSourceFilter::PpoiListBlock { list_key, .. } => list_key,
-            DataSourceFilter::ChainTreeNumber(_) => continue,
-        };
-        let rows = inst
-            .logical_store
-            .lock()
-            .ppoi_imt(&list_key)
-            .map_or(0, raven_railgun_engine::imt::Imt::leaf_count);
-        if rows > 0 {
-            lists_with_rows.insert(list_key);
-        }
-    }
+    let held: Vec<(DataSourceFilter, usize)> = handle
+        .instances
+        .iter()
+        .filter_map(|inst| {
+            let (list_key, _) = holding(inst.config.data_source, 0)?;
+            let rows = list_rows(&inst.logical_store.lock(), &list_key);
+            Some((inst.config.data_source, rows))
+        })
+        .collect();
 
-    let mut preflighted = std::collections::BTreeSet::new();
     let mut handles = Vec::new();
-    for inst in &handle.instances {
-        if let DataSourceFilter::PpoiList(list_key) = inst.config.data_source {
-            let mirror_clone = Arc::clone(&mirror);
-            let tx = mirror_tx.clone();
-            // Shared derivation: this used to be a second copy of the match, and the two
-            // drifted -- the single-instance copy never learned `PerListPath10`.
-            let kind = crate::serve_production::mirror_kind_for_encoder(inst.config.encoder);
-            let fallback = {
-                let store = inst.logical_store.lock();
-                #[allow(clippy::cast_possible_truncation)]
-                let count = store
-                    .ppoi_imt(&list_key)
-                    .map_or(0u64, |imt| imt.leaf_count() as u64);
-                count
-            };
-            if preflighted.insert(list_key) {
-                crate::serve_production::preflight_mirror_upstream(
-                    &mirror,
-                    &ListKey(list_key),
-                    lists_with_rows.contains(&list_key),
-                    "[global].mirror_endpoint",
-                )
-                .await?;
-            }
-            let cursor = MirrorCursor::new(inst.config.data_dir.clone(), kind, fallback);
-            let h = tokio::spawn(async move {
-                if let Err(e) = mirror_clone
-                    .run_worker_with_cursor(ListKey(list_key), 0, Some(cursor), tx)
-                    .await
-                {
-                    tracing::error!(error = %e, "ppoi mirror worker exiting");
-                }
-            });
-            handles.push(h);
+    let mut feeds = Vec::new();
+    for feed in mirror_feeds(&held) {
+        let list = ListKey(feed.list_key);
+        crate::serve_production::preflight_mirror_upstream(
+            &mirror,
+            &list,
+            feed.holds_rows,
+            "[global].mirror_endpoint",
+        )
+        .await?;
+        tracing::info!(
+            list_key = %hex::encode(feed.list_key),
+            resume_at = feed.resume_at,
+            "ppoi mirror resuming at the lowest row any instance on the list lacks"
+        );
+        let status = FeedStatus::default();
+        feeds.push(FeedReport {
+            list_key: feed.list_key,
+            status: status.clone(),
+            stores: handle
+                .instances
+                .iter()
+                .filter(|inst| {
+                    holding(inst.config.data_source, 0).is_some_and(|(key, _)| key == feed.list_key)
+                })
+                .map(|inst| (inst.config.data_source, Arc::clone(&inst.logical_store)))
+                .collect(),
+        });
+        handles.push(tokio::spawn(run_mirror_feed(
+            Arc::clone(&mirror),
+            feed,
+            Arc::clone(&handle.ppoi_list_routes),
+            mirror_tx.clone(),
+            status,
+        )));
+    }
+    Ok(MirrorWorkers { handles, feeds })
+}
+
+/// One list's feed, stopped in front of the first row no route on the list can hold.
+///
+/// Past the last declared block the router still hands each row to the whole-list status
+/// instance, whose tree ends at one block and refuses it, so the row counts as delivered while it
+/// is lost and the cursor walks on. Stopping there keeps the row for the block an operator
+/// declares next, and naming that block's target holds readiness down until then.
+async fn run_mirror_feed(
+    mirror: Arc<raven_railgun_ppoi_mirror::UpstreamPpoiMirror>,
+    feed: MirrorFeed,
+    routes: raven_railgun_engine::orchestrator::PpoiListRoutes,
+    tx: tokio::sync::mpsc::Sender<(raven_railgun_persistence::WalEntryPayload, u64)>,
+    status: raven_railgun_ppoi_mirror::FeedStatus,
+) {
+    let list_key = feed.list_key;
+    let holdings = feed.holdings;
+    let span = move |cursor| {
+        feed_span(&holdings, cursor, |at| {
+            first_unheld_index(
+                routes.load().iter().map(|(filter, _)| *filter),
+                &list_key,
+                at,
+            )
+        })
+    };
+    match mirror
+        .run_feed(ListKey(list_key), feed.resume_at, span, status, tx)
+        .await
+    {
+        Ok(()) => {}
+        Err(raven_railgun_ppoi_mirror::MirrorError::Unheld { list_index }) => {
+            let target = format!(
+                "list:{}:block:{}",
+                hex::encode(list_key),
+                list_index / u64::from(LEAVES_PER_PPOI_BLOCK)
+            );
+            raven_railgun_engine::orchestrator::mark_router_unrouted_target(&target);
+            tracing::error!(
+                %target,
+                list_index,
+                "ppoi mirror stopped: no instance holds the next row; declare the block that \
+                 holds it and restart"
+            );
+        }
+        Err(e) => tracing::error!(error = %e, "ppoi mirror worker exiting"),
+    }
+}
+
+/// The first list-wide index at or after `cursor` that no route on `list_key` can hold. A
+/// block route holds its block. A whole-list route holds one tree from index 0, status as well as
+/// path, because a status row lands only on a leaf the same instance has indexed.
+pub(crate) fn first_unheld_index(
+    filters: impl IntoIterator<Item = DataSourceFilter>,
+    list_key: &[u8; 32],
+    cursor: u64,
+) -> u64 {
+    let held: Vec<std::ops::Range<u64>> = filters
+        .into_iter()
+        .filter_map(|filter| match holding(filter, 0) {
+            Some((key, reach)) if key == *list_key => Some(reach.first..reach.end),
+            _ => None,
+        })
+        .collect();
+    let mut at = cursor;
+    while let Some(range) = held.iter().find(|range| range.contains(&at)) {
+        at = range.end;
+    }
+    at
+}
+
+/// One instance's reach on a list: it can hold list-wide rows `first..end`, and has applied every
+/// row below `next`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Holding {
+    first: u64,
+    end: u64,
+    next: u64,
+}
+
+/// The list an instance holding `rows` of it is fed from, and its reach. A whole-list instance
+/// holds one tree from index 0; a block instance holds its block, at block-local indices.
+pub(crate) fn holding(source: DataSourceFilter, rows: usize) -> Option<([u8; 32], Holding)> {
+    let (list_key, first, capacity) = match source {
+        DataSourceFilter::PpoiList(list_key) => (list_key, 0, TREE_MAX_ITEMS as u64),
+        DataSourceFilter::PpoiListBlock { list_key, block } => (
+            list_key,
+            u64::from(block) * u64::from(LEAVES_PER_PPOI_BLOCK),
+            u64::from(LEAVES_PER_PPOI_BLOCK),
+        ),
+        DataSourceFilter::ChainTreeNumber(_) => return None,
+    };
+    let rows = (rows as u64).min(capacity);
+    Some((
+        list_key,
+        Holding {
+            first,
+            end: first + capacity,
+            next: first + rows,
+        },
+    ))
+}
+
+/// The rows a feed at `cursor` asks for next: from the lowest index some instance still has to
+/// append, to the first index past that which no instance needs. Neither end passes the first
+/// row, counted from the list's lowest declared one, that no route holds; an empty span there
+/// stops the feed on that row.
+///
+/// Each boot frontier is read as advanced by every row the feed delivered below `cursor`, which
+/// the router gave to every instance whose reach covers it. So the span is a function of the
+/// cursor alone, and does not race the consumers applying what the last page delivered. A row
+/// every instance that can hold it already holds is never asked for again: re-pulled into a full
+/// instance it would be refused as out of order, and that instance would read as stalled for
+/// good, since nothing it can still append arrives to clear the run. A row no route holds is
+/// never stepped over either: a block declared past a gap would otherwise read as caught up
+/// while the gap's rows went unserved.
+pub(crate) fn feed_span(
+    holdings: &[Holding],
+    cursor: u64,
+    first_unheld: impl Fn(u64) -> u64,
+) -> std::ops::Range<u64> {
+    let covered = first_unheld(
+        holdings
+            .iter()
+            .map(|reach| reach.first)
+            .min()
+            .unwrap_or(cursor),
+    );
+    let lacking: Vec<std::ops::Range<u64>> = holdings
+        .iter()
+        .map(|reach| reach.next.max(cursor.min(reach.end))..reach.end.min(covered))
+        .filter(|range| !range.is_empty())
+        .collect();
+    let Some(start) = lacking.iter().map(|range| range.start).min() else {
+        return covered..covered;
+    };
+    let mut end = start;
+    while let Some(further) = lacking
+        .iter()
+        .filter(|range| range.contains(&end))
+        .map(|range| range.end)
+        .max()
+    {
+        end = further;
+    }
+    start..end
+}
+
+/// One upstream feed for a PPOI list.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MirrorFeed {
+    pub(crate) list_key: [u8; 32],
+    /// List-wide index of the first row the worker asks for.
+    pub(crate) resume_at: u64,
+    /// A property of the LIST, not of one instance: the shipped topology keeps a list's path
+    /// rows under block instances beside a status instance whose own count reads zero.
+    pub(crate) holds_rows: bool,
+    /// Every instance on the list, as it stood at boot.
+    pub(crate) holdings: Vec<Holding>,
+}
+
+/// One feed per PPOI list, in config order, resuming at the lowest list-wide index that some
+/// instance on the list can still append.
+///
+/// The router fans each row to every instance on the key, so one worker feeds them all; a
+/// second re-delivers every row, and each copy is refused as a duplicate. A list declared only
+/// in blocks gets its worker too.
+///
+/// Instances on one key need not agree. One restored from an older snapshot, or added later,
+/// stands behind the rest, and a feed that resumes past it leaves it refusing every later row
+/// as non-contiguous, for good. The store is the cursor: the start is read off every instance's
+/// replayed rows, and no sidecar is consulted, so a sidecar that is missing, torn, or written
+/// ahead of rows that never reached the WAL can neither skip a row nor rewind the feed. A full
+/// instance appends nothing more and does not hold the feed back; once all are full the feed
+/// resumes where the declared coverage ends.
+pub(crate) fn mirror_feeds(held: &[(DataSourceFilter, usize)]) -> Vec<MirrorFeed> {
+    let mut lists: Vec<([u8; 32], Vec<Holding>)> = Vec::new();
+    for &(source, rows) in held {
+        let Some((list_key, reach)) = holding(source, rows) else {
+            continue;
+        };
+        match lists.iter_mut().find(|(key, _)| *key == list_key) {
+            Some((_, holdings)) => holdings.push(reach),
+            None => lists.push((list_key, vec![reach])),
         }
     }
-    Ok(MirrorWorkers { handles })
+    lists
+        .into_iter()
+        .map(|(list_key, holdings)| {
+            let lowest_open = holdings
+                .iter()
+                .filter(|reach| reach.next < reach.end)
+                .map(|reach| reach.next)
+                .min();
+            let highest_held = holdings.iter().map(|reach| reach.next).max().unwrap_or(0);
+            MirrorFeed {
+                list_key,
+                resume_at: lowest_open.unwrap_or(highest_held),
+                holds_rows: holdings.iter().any(|reach| reach.next > reach.first),
+                holdings,
+            }
+        })
+        .collect()
+}
+
+/// One list's feed as readiness reports it, from the feed's progress and the rows each instance
+/// on the list holds now.
+pub(crate) fn mirror_feed_view(
+    list_key: &[u8; 32],
+    progress: &raven_railgun_ppoi_mirror::FeedProgress,
+    held: &[(DataSourceFilter, usize)],
+) -> raven_railgun_http::status::MirrorFeedView {
+    use raven_railgun_http::status::{MirrorFeedState, MirrorFeedView};
+    let holdings: Vec<Holding> = held
+        .iter()
+        .filter_map(|&(source, rows)| holding(source, rows))
+        .filter(|(key, _)| key == list_key)
+        .map(|(_, reach)| reach)
+        .collect();
+    let rows_held = holdings
+        .iter()
+        .filter(|reach| reach.next > reach.first)
+        .map(|reach| reach.next)
+        .max()
+        .unwrap_or(0);
+    let caught_up = progress.upstream_rows.is_some_and(|tip| {
+        holdings
+            .iter()
+            .all(|reach| reach.next >= tip.clamp(reach.first, reach.end))
+    });
+    let state = if progress.stopped.is_some() {
+        MirrorFeedState::Stopped
+    } else if rows_held == 0 {
+        MirrorFeedState::NeverFed
+    } else if progress.consecutive_failures > 0 {
+        MirrorFeedState::UpstreamRefusing
+    } else if caught_up {
+        MirrorFeedState::CaughtUp
+    } else {
+        MirrorFeedState::Syncing
+    };
+    MirrorFeedView {
+        list_key: hex::encode(list_key),
+        state,
+        rows_held,
+        upstream_rows: progress.upstream_rows,
+        next_index: progress.next_index,
+        consecutive_failures: progress.consecutive_failures,
+        last_failure: progress.last_failure.map(|class| class.to_string()),
+        seconds_since_answer: progress.last_answer.map(|at| at.elapsed().as_secs()),
+    }
 }
 
 impl Drop for MirrorWorkers {
@@ -2589,7 +3079,7 @@ role = "live"
 encoder = "per-list-status"
 list_key = "0000000000000000000000000000000000000000000000000000000000000001"
 data_dir = "/tmp/raven-ppoi"
-verification_mode = "upstream-signature"
+verification_mode = "upstream-asserted"
 data_source = { kind = "mirror", list_key = "0000000000000000000000000000000000000000000000000000000000000001", what = "status" }
 "#;
         let f = write_temp_toml(body);
@@ -2717,10 +3207,7 @@ data_source = { kind = "mirror", list_key = "00000000000000000000000000000000000
 [global]
 bind = "127.0.0.1:0"
 token = "test-token-padded-long-enough"
-rpc_url = "http://127.0.0.1:1"
-railgun_proxy = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
 chain_id = 1
-start_block = 0
 mirror_endpoint = "http://127.0.0.1:1"
 
 [[instance]]
@@ -2729,7 +3216,7 @@ role = "live"
 encoder = "per-list-path10"
 list_key = "{encoder_key}"
 data_dir = "/tmp/raven-ppoi-list-pin"
-verification_mode = "upstream-signature"
+verification_mode = "upstream-asserted"
 data_source = {{ kind = "mirror", list_key = "{routed_key}"{block}, what = "path" }}
 "#
         )
@@ -3004,7 +3491,7 @@ role = "live"
 encoder = "per-list-node"
 list_key = "0000000000000000000000000000000000000000000000000000000000000001"
 data_dir = "/tmp/raven-ppoi-paths"
-verification_mode = "upstream-signature"
+verification_mode = "upstream-asserted"
 data_source = { kind = "mirror", list_key = "0000000000000000000000000000000000000000000000000000000000000001" }
 
 [[instance]]
@@ -3013,7 +3500,7 @@ role = "live"
 encoder = "per-list-status"
 list_key = "0000000000000000000000000000000000000000000000000000000000000001"
 data_dir = "/tmp/raven-ppoi-status"
-verification_mode = "upstream-signature"
+verification_mode = "upstream-asserted"
 data_source = { kind = "mirror", list_key = "0000000000000000000000000000000000000000000000000000000000000001", what = "status" }
 
 [[instance]]
@@ -3023,7 +3510,7 @@ encoder = "per-list-status"
 list_key = "0000000000000000000000000000000000000000000000000000000000000001"
 record_size = 128
 data_dir = "/tmp/raven-ppoi-status-wide"
-verification_mode = "upstream-signature"
+verification_mode = "upstream-asserted"
 data_source = { kind = "mirror", list_key = "0000000000000000000000000000000000000000000000000000000000000001", what = "status" }
 "#;
         let f = write_temp_toml(body);
@@ -3114,7 +3601,7 @@ role = "live"
 encoder = "per-list-status"
 list_key = "{OFAC_LIST_KEY}"
 data_dir = "/tmp/raven-ppoi-status-ofac"
-verification_mode = "upstream-signature"
+verification_mode = "upstream-asserted"
 data_source = {{ kind = "mirror", list_key = "{OFAC_LIST_KEY}", what = "status" }}
 
 [[instance]]
@@ -3123,7 +3610,7 @@ role = "live"
 encoder = "per-list-node"
 list_key = "{OFAC_LIST_KEY}"
 data_dir = "/tmp/raven-ppoi-paths-ofac"
-verification_mode = "upstream-signature"
+verification_mode = "upstream-asserted"
 data_source = {{ kind = "mirror", list_key = "{OFAC_LIST_KEY}", what = "path" }}
 "#
         )
@@ -3248,10 +3735,7 @@ data_source = {{ kind = "mirror", list_key = "{OFAC_LIST_KEY}", what = "path" }}
 [global]
 bind = "127.0.0.1:0"
 token = "test-token-padded-long-enough"
-rpc_url = "http://127.0.0.1:1"
-railgun_proxy = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
 chain_id = 1
-start_block = 0
 mirror_endpoint = "http://127.0.0.1:1"
 
 [[instance]]
@@ -3267,7 +3751,7 @@ data_source = { kind = "mirror", list_key = "00000000000000000000000000000000000
         let err = load_options_from_toml(f.path()).expect_err("must reject");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("upstream-signature"),
+            msg.contains("upstream-asserted"),
             "expected verification_mode error, got: {msg}"
         );
     }
@@ -3278,10 +3762,7 @@ data_source = { kind = "mirror", list_key = "00000000000000000000000000000000000
 [global]
 bind = "127.0.0.1:0"
 token = "test-token-padded-long-enough"
-rpc_url = "http://127.0.0.1:1"
-railgun_proxy = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
 chain_id = 1
-start_block = 0
 mirror_endpoint = "http://127.0.0.1:1"
 "#;
         let f = write_temp_toml(body);
@@ -3422,6 +3903,10 @@ verification_mode = "chain-root-history"
 data_source = { kind = "indexer", filter = { tree_number = 0 } }
 "#,
         );
+        let boot_limits = SessionStoreLimits {
+            max_sessions: 3,
+            ttl: std::time::Duration::from_secs(600),
+        };
         let initial_runtime = crate::auto_spawn_driver::AutoSpawnRuntime {
             data_dir_template: "/tmp/raven-sighup-a-{tree_number}".to_owned(),
             encoder: "per-leaf-bc".to_owned(),
@@ -3432,6 +3917,7 @@ data_source = { kind = "indexer", filter = { tree_number = 0 } }
             verification_cadence_n: 0,
             max_instance_count: None,
             cooldown: None,
+            session_limits: boot_limits,
         };
         let runtime = Arc::new(arc_swap::ArcSwap::from_pointee(initial_runtime));
         let (applied_tx, mut applied_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -3518,8 +4004,652 @@ data_source = { kind = "indexer", filter = { tree_number = 0 } }
                 "tree-template-D".to_owned(),
             ]
         );
+        assert_eq!(
+            runtime.load().session_limits,
+            boot_limits,
+            "a reloaded template must spawn at the seats the running HTTP layer was sized for"
+        );
 
         reload.abort();
         let _ = reload.await;
+    }
+
+    fn resume_points(held: &[(DataSourceFilter, usize)]) -> Vec<([u8; 32], u64)> {
+        mirror_feeds(held)
+            .into_iter()
+            .map(|feed| (feed.list_key, feed.resume_at))
+            .collect()
+    }
+
+    /// Every instance on a list is fed from the lowest row one of them lacks, whichever order
+    /// the config declares them in, and an instance that can append nothing more is no floor.
+    #[test]
+    fn a_mirror_feed_resumes_at_the_lowest_row_any_instance_on_its_list_lacks() {
+        let list = [7u8; 32];
+        let whole = DataSourceFilter::PpoiList(list);
+        let block = |block| DataSourceFilter::PpoiListBlock {
+            list_key: list,
+            block,
+        };
+        let full_block = LEAVES_PER_PPOI_BLOCK as usize;
+        let block_start = |block: u32| u64::from(block) * u64::from(LEAVES_PER_PPOI_BLOCK);
+        let cases = [
+            (
+                "a whole-list instance behind another",
+                vec![(whole, 5), (whole, 2)],
+                2,
+            ),
+            (
+                "a block behind the whole-list instance",
+                vec![(whole, 3), (block(0), 0)],
+                0,
+            ),
+            (
+                "a list declared only in blocks",
+                vec![(block(0), full_block), (block(1), 10)],
+                block_start(1) + 10,
+            ),
+            (
+                "a whole-list instance at the tree wall",
+                vec![
+                    (whole, TREE_MAX_ITEMS),
+                    (block(0), full_block),
+                    (block(5), 7),
+                ],
+                block_start(5) + 7,
+            ),
+            (
+                "every instance full",
+                vec![(whole, TREE_MAX_ITEMS), (block(2), full_block)],
+                block_start(3),
+            ),
+        ];
+        for (case, held, resume_at) in cases {
+            let reversed: Vec<_> = held.iter().rev().copied().collect();
+            for order in [held, reversed] {
+                assert_eq!(
+                    resume_points(&order),
+                    vec![(list, resume_at)],
+                    "{case}: {order:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn each_ppoi_list_gets_one_feed_in_config_order_and_a_chain_tree_none() {
+        let (first, second) = ([2u8; 32], [1u8; 32]);
+        let held = [
+            (DataSourceFilter::ChainTreeNumber(3), 100),
+            (
+                DataSourceFilter::PpoiListBlock {
+                    list_key: first,
+                    block: 1,
+                },
+                0,
+            ),
+            (DataSourceFilter::PpoiList(second), 4),
+            (DataSourceFilter::PpoiList(first), 0),
+        ];
+        let feeds: Vec<([u8; 32], u64, bool, usize)> = mirror_feeds(&held)
+            .into_iter()
+            .map(|feed| {
+                (
+                    feed.list_key,
+                    feed.resume_at,
+                    feed.holds_rows,
+                    feed.holdings.len(),
+                )
+            })
+            .collect();
+        assert_eq!(feeds, vec![(first, 0, false, 2), (second, 4, true, 1)]);
+    }
+
+    /// Every list-wide index a feed asks upstream for, paging the way the worker does, until
+    /// its span comes back empty; and the index it stopped in front of.
+    fn walk_feed(held: &[(DataSourceFilter, usize)], page: u64) -> (Vec<u64>, u64) {
+        let feed = mirror_feeds(held).pop().expect("one list");
+        let filters: Vec<DataSourceFilter> = held.iter().map(|(filter, _)| *filter).collect();
+        let first_unheld = |at| first_unheld_index(filters.iter().copied(), &feed.list_key, at);
+        let mut asked = Vec::new();
+        let mut cursor = feed.resume_at;
+        loop {
+            let span = feed_span(&feed.holdings, cursor, first_unheld);
+            cursor = cursor.max(span.start);
+            if span.end <= cursor {
+                return (asked, cursor);
+            }
+            let end = (cursor + page - 1).min(span.end - 1);
+            asked.extend(cursor..=end);
+            cursor = end + 1;
+        }
+    }
+
+    /// Instances on one list that disagree: the status instance restored from an older
+    /// snapshot, block 1 part-way, block 2 full, block 3 empty. The feed asks for exactly the
+    /// rows some instance still has to append, each once, so no full block is handed a row it
+    /// can only refuse.
+    #[test]
+    fn a_feed_asks_once_for_each_row_some_instance_lacks_and_never_for_one_all_hold() {
+        let list = [9u8; 32];
+        let block = |block| DataSourceFilter::PpoiListBlock {
+            list_key: list,
+            block,
+        };
+        let full = LEAVES_PER_PPOI_BLOCK as usize;
+        let start = |block: u64| block * u64::from(LEAVES_PER_PPOI_BLOCK);
+        let held = [
+            (DataSourceFilter::PpoiList(list), 30_000),
+            (block(0), full),
+            (block(1), 50_000),
+            (block(2), full),
+            (block(3), 0),
+        ];
+        let (asked, stopped_at) = walk_feed(&held, 501);
+        let lacked: Vec<u64> = (30_000..start(1))
+            .chain(start(1) + 50_000..start(2))
+            .chain(start(3)..start(4))
+            .collect();
+        assert_eq!(asked, lacked, "asked for a row no instance lacks, or twice");
+        assert_eq!(
+            stopped_at,
+            start(4),
+            "stops where the declared coverage ends"
+        );
+
+        let (asked, _) = walk_feed(&[(block(1), full), (block(2), 7)], 501);
+        assert_eq!(
+            asked.first(),
+            Some(&(start(2) + 7)),
+            "resumes at the global frontier, not at a block-local row count"
+        );
+    }
+
+    /// The shipped forest booted empty: one page per 501 rows, back to back, through all six
+    /// blocks, although seven instances share the list.
+    #[test]
+    fn a_cold_shipped_boot_asks_for_each_page_of_the_list_exactly_once() {
+        let (_, routes) = shipped_ppoi_routes();
+        let held: Vec<(DataSourceFilter, usize)> = routes.iter().map(|&route| (route, 0)).collect();
+        let (asked, stopped_at) = walk_feed(&held, 501);
+        let six_blocks = 6 * u64::from(LEAVES_PER_PPOI_BLOCK);
+        assert!(
+            asked.iter().copied().eq(0..six_blocks),
+            "every row of six blocks, once, in order"
+        );
+        assert_eq!(stopped_at, six_blocks);
+    }
+
+    /// Readiness tells the three states the operator acts on apart, and only never-fed and
+    /// stopped take the node out.
+    #[test]
+    fn the_feed_view_tells_idle_from_never_fed_from_refusing() {
+        use raven_railgun_http::status::MirrorFeedState;
+        use raven_railgun_ppoi_mirror::{FeedProgress, PreflightFailure};
+
+        let list = [3u8; 32];
+        let whole = DataSourceFilter::PpoiList(list);
+        let block = |block| DataSourceFilter::PpoiListBlock {
+            list_key: list,
+            block,
+        };
+        let answered = |tip| FeedProgress {
+            next_index: tip,
+            upstream_rows: Some(tip),
+            last_answer: Some(std::time::Instant::now()),
+            ..FeedProgress::default()
+        };
+        let refusing = FeedProgress {
+            consecutive_failures: 3,
+            last_failure: Some(PreflightFailure::HttpStatus(500)),
+            ..answered(1_010)
+        };
+        let stopped = FeedProgress {
+            stopped: Some("no consumer holds list index 393216".to_owned()),
+            ..answered(1_010)
+        };
+        let full = LEAVES_PER_PPOI_BLOCK as usize;
+        let shipped_at_tip: Vec<(DataSourceFilter, usize)> = std::iter::once((whole, full))
+            .chain((0..5).map(|index| (block(index), full)))
+            .chain(std::iter::once((block(5), 30_640)))
+            .collect();
+        let cases = [
+            (
+                "no answer yet, nothing held",
+                FeedProgress::default(),
+                vec![(whole, 0), (block(0), 0)],
+                MirrorFeedState::NeverFed,
+            ),
+            (
+                "upstream answers an empty list, as it does for a wrong key",
+                answered(0),
+                vec![(whole, 0), (block(0), 0)],
+                MirrorFeedState::NeverFed,
+            ),
+            (
+                "at upstream's tip, every row applied",
+                answered(1_010),
+                vec![(whole, 1_010), (block(0), 1_010), (block(1), 0)],
+                MirrorFeedState::CaughtUp,
+            ),
+            (
+                "at upstream's tip, one instance still applying",
+                answered(1_010),
+                vec![(whole, 1_010), (block(0), 1_000)],
+                MirrorFeedState::Syncing,
+            ),
+            (
+                "paging full pages",
+                FeedProgress {
+                    upstream_rows: None,
+                    ..answered(1_002)
+                },
+                vec![(block(0), 1_002)],
+                MirrorFeedState::Syncing,
+            ),
+            (
+                "rows held, upstream refusing",
+                refusing,
+                vec![(whole, 1_010), (block(0), 1_010)],
+                MirrorFeedState::UpstreamRefusing,
+            ),
+            (
+                "the feed stopped",
+                stopped,
+                vec![(block(0), 1_010)],
+                MirrorFeedState::Stopped,
+            ),
+            (
+                "the shipped forest at the tip, status instance at its wall",
+                answered(358_320),
+                shipped_at_tip,
+                MirrorFeedState::CaughtUp,
+            ),
+        ];
+        for (case, progress, held, expected) in cases {
+            let view = mirror_feed_view(&list, &progress, &held);
+            assert_eq!(view.state, expected, "{case}");
+            assert_eq!(
+                view.state.fails_readiness(),
+                matches!(
+                    expected,
+                    MirrorFeedState::NeverFed | MirrorFeedState::Stopped
+                ),
+                "{case}"
+            );
+        }
+        let view = mirror_feed_view(&list, &answered(358_320), &[(block(5), 30_640)]);
+        assert_eq!(
+            view.rows_held, 358_320,
+            "the list-wide frontier, not a block count"
+        );
+        let view = mirror_feed_view(
+            &list,
+            &FeedProgress {
+                consecutive_failures: 1,
+                last_failure: Some(PreflightFailure::HttpStatus(500)),
+                ..FeedProgress::default()
+            },
+            &[(block(0), 5)],
+        );
+        assert_eq!(view.last_failure.as_deref(), Some("answered HTTP 500"));
+    }
+
+    fn global_with(line: &str) -> String {
+        format!(
+            r#"
+[global]
+bind = "127.0.0.1:0"
+token = "test-token-padded-long-enough"
+chain_id = 1
+mirror_endpoint = "http://127.0.0.1:1"
+{line}
+
+[[instance]]
+id = "ppoi-status"
+role = "live"
+encoder = "per-list-status"
+list_key = "0000000000000000000000000000000000000000000000000000000000000001"
+data_dir = "/tmp/raven-ppoi"
+verification_mode = "upstream-asserted"
+data_source = {{ kind = "mirror", list_key = "0000000000000000000000000000000000000000000000000000000000000001", what = "status" }}
+"#
+        )
+    }
+
+    /// The setting shortens the poll; one longer than the poll is a unit slip and is refused
+    /// by name before any instance boots.
+    #[test]
+    fn the_backfill_setting_loads_and_one_slower_than_the_poll_is_refused_by_name() {
+        let backfill = |line: &str| {
+            let f = write_temp_toml(&global_with(line));
+            load_options_from_toml(f.path()).map(|opts| opts.mirror_backfill_interval_secs)
+        };
+        assert_eq!(backfill("").expect("absent"), None);
+        assert_eq!(
+            backfill("mirror_backfill_interval_secs = 0").expect("zero"),
+            Some(0)
+        );
+        let poll = raven_railgun_ppoi_mirror::DEFAULT_POLL_INTERVAL_SECS;
+        assert_eq!(
+            backfill(&format!("mirror_backfill_interval_secs = {poll}")).expect("the poll"),
+            Some(poll)
+        );
+        let refusal = backfill(&format!("mirror_backfill_interval_secs = {}", poll + 1))
+            .expect_err("slower than the poll");
+        assert!(
+            format!("{refusal:#}").contains("mirror_backfill_interval_secs"),
+            "{refusal:#}"
+        );
+    }
+
+    /// The shipped example's PPOI routes, loaded the way boot loads them.
+    fn shipped_ppoi_routes() -> ([u8; 32], Vec<DataSourceFilter>) {
+        let example =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/mainnet-6-instance.toml");
+        let body = std::fs::read_to_string(example)
+            .expect("read the shipped example")
+            .replace("REPLACE_ME", &"a1b2c3d4".repeat(8));
+        let f = write_temp_toml(&body);
+        let filters: Vec<DataSourceFilter> = load_options_from_toml(f.path())
+            .expect("the shipped example loads")
+            .instances
+            .into_iter()
+            .map(|instance| instance.data_source)
+            .filter(|source| !matches!(source, DataSourceFilter::ChainTreeNumber(_)))
+            .collect();
+        let list_key = match filters.first() {
+            Some(
+                DataSourceFilter::PpoiList(key)
+                | DataSourceFilter::PpoiListBlock { list_key: key, .. },
+            ) => *key,
+            other => panic!("the shipped example declares no PPOI instance: {other:?}"),
+        };
+        (list_key, filters)
+    }
+
+    /// The shipped forest is a whole-list status instance and blocks 0-5. Every row below the
+    /// seventh block has a holder and none at or past it does; the status instance holds only
+    /// its one tree, so it cannot stand in for a missing block.
+    #[test]
+    fn the_shipped_topology_holds_every_row_below_the_seventh_block_and_none_past_it() {
+        let (list, routes) = shipped_ppoi_routes();
+        let block = u64::from(LEAVES_PER_PPOI_BLOCK);
+        let unheld = |routes: &[DataSourceFilter], cursor| {
+            first_unheld_index(routes.iter().copied(), &list, cursor)
+        };
+        for cursor in [0, block - 1, block, 5 * block, 6 * block - 1, 6 * block] {
+            assert_eq!(unheld(&routes, cursor), 6 * block, "cursor {cursor}");
+        }
+
+        let whole_list_only: Vec<_> = routes
+            .iter()
+            .copied()
+            .filter(|route| matches!(route, DataSourceFilter::PpoiList(_)))
+            .collect();
+        assert_eq!(whole_list_only.len(), 1, "fixture: one status instance");
+        assert_eq!(unheld(&whole_list_only, 0), block);
+
+        let without_block_3: Vec<_> = routes
+            .iter()
+            .copied()
+            .filter(|route| !matches!(route, DataSourceFilter::PpoiListBlock { block: 3, .. }))
+            .collect();
+        assert_eq!(unheld(&without_block_3, 0), 3 * block);
+
+        let mut with_block_6 = routes.clone();
+        with_block_6.push(DataSourceFilter::PpoiListBlock {
+            list_key: list,
+            block: 6,
+        });
+        assert_eq!(unheld(&with_block_6, 6 * block), 7 * block);
+
+        assert_eq!(
+            first_unheld_index(routes.iter().copied(), &[0xAB; 32], 7),
+            7,
+            "another list's routes hold nothing of this one"
+        );
+    }
+
+    /// Serves every index it is asked for and records each page's bounds.
+    async fn upstream_holding_every_row() -> (String, Arc<parking_lot::Mutex<Vec<(u64, u64)>>>) {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+        let asked = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let log = Arc::clone(&asked);
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let log = Arc::clone(&log);
+                async move {
+                    let bound = |name: &str| {
+                        request
+                            .pointer(&format!("/params/{name}"))
+                            .and_then(Value::as_u64)
+                            .expect("page bound")
+                    };
+                    let (start, end) = (bound("startIndex"), bound("endIndex"));
+                    log.lock().push((start, end));
+                    let rows: Vec<Value> = (start..=end)
+                        .map(|index| {
+                            json!({
+                                "signedPOIEvent": {
+                                    "index": index,
+                                    "blindedCommitment": format!("{index:064x}"),
+                                    "signature": "00".repeat(64),
+                                    "type": "Shield"
+                                },
+                                "validatedMerkleroot": format!("{:064x}", index + 1)
+                            })
+                        })
+                        .collect();
+                    Json(json!({ "jsonrpc": "2.0", "id": 1, "result": rows }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        (endpoint, asked)
+    }
+
+    fn leaves_sent(
+        rx: &mut tokio::sync::mpsc::Receiver<(raven_railgun_persistence::WalEntryPayload, u64)>,
+    ) -> Vec<u64> {
+        let mut leaves = Vec::new();
+        while let Ok((payload, _)) = rx.try_recv() {
+            if let raven_railgun_persistence::WalEntryPayload::PpoiListLeafAdded {
+                list_index,
+                ..
+            } = payload
+            {
+                leaves.push(u64::from(list_index));
+            }
+        }
+        leaves
+    }
+
+    /// The row at the seventh-block boundary on the shipped topology. The whole-list status
+    /// route would take it and refuse it, so any-route-matched says nothing; the feed must stop
+    /// in front of it and name the block readiness waits on. Declaring the block then resumes
+    /// the feed at that very row, which the router places at the new block's local index 0.
+    #[tokio::test]
+    async fn the_shipped_feed_stops_at_the_seventh_block_names_it_and_resumes_when_it_is_declared()
+    {
+        use raven_railgun_engine::orchestrator::split_ppoi_index;
+        use raven_railgun_ppoi_mirror::{MirrorConfig, UpstreamPpoiMirror};
+
+        let (list_key, filters) = shipped_ppoi_routes();
+        let seventh = u64::from(6 * LEAVES_PER_PPOI_BLOCK);
+        // The feed reads only the filters; nothing is routed in this test.
+        let consumer = |filter| (filter, tokio::sync::mpsc::channel(1).0);
+        let routes: raven_railgun_engine::orchestrator::PpoiListRoutes = Arc::new(
+            arc_swap::ArcSwap::from_pointee(filters.iter().copied().map(consumer).collect()),
+        );
+        let (endpoint, asked) = upstream_holding_every_row().await;
+        let mirror = Arc::new(
+            UpstreamPpoiMirror::new(MirrorConfig {
+                endpoint,
+                poll_interval_secs: 1,
+                ..MirrorConfig::default()
+            })
+            .expect("mirror"),
+        );
+        let feed_from = |filters: &[DataSourceFilter], frontier: u64| {
+            let held: Vec<(DataSourceFilter, usize)> = filters
+                .iter()
+                .map(|&filter| {
+                    let (_, reach) = holding(filter, 0).expect("a PPOI route");
+                    let rows = frontier.clamp(reach.first, reach.end) - reach.first;
+                    (filter, usize::try_from(rows).expect("rows"))
+                })
+                .collect();
+            let feed = mirror_feeds(&held).pop().expect("one list");
+            assert_eq!(
+                feed.resume_at, frontier,
+                "fixture: the feed starts at the frontier"
+            );
+            feed
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_mirror_feed(
+                Arc::clone(&mirror),
+                feed_from(&filters, seventh - 2),
+                Arc::clone(&routes),
+                tx,
+                raven_railgun_ppoi_mirror::FeedStatus::default(),
+            ),
+        )
+        .await
+        .expect("the feed must stop at the seventh block, not wait there");
+        assert_eq!(leaves_sent(&mut rx), [seventh - 2, seventh - 1]);
+        assert_eq!(
+            asked.lock().clone(),
+            [(seventh - 2, seventh - 1)],
+            "nothing at or past the seventh block may be asked for"
+        );
+        assert_eq!(
+            unrouted_on(&list_key),
+            [format!("list:{}:block:6", hex::encode(list_key))],
+            "readiness must name the block the feed is waiting on"
+        );
+
+        routes.rcu(|current| {
+            let mut next = (**current).clone();
+            next.push(consumer(DataSourceFilter::PpoiListBlock {
+                list_key,
+                block: 6,
+            }));
+            next
+        });
+        let mut declared = filters.clone();
+        declared.push(DataSourceFilter::PpoiListBlock { list_key, block: 6 });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let resumed = tokio::spawn(run_mirror_feed(
+            mirror,
+            feed_from(&declared, seventh),
+            routes,
+            tx,
+            raven_railgun_ppoi_mirror::FeedStatus::default(),
+        ));
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the declared block is fed")
+            .expect("the feed is running");
+        resumed.abort();
+        let raven_railgun_persistence::WalEntryPayload::PpoiListLeafAdded { list_index, .. } =
+            &first.0
+        else {
+            panic!("a row's leaf goes first: {first:?}");
+        };
+        assert_eq!(u64::from(*list_index), seventh);
+        assert_eq!(split_ppoi_index(*list_index), (6, 0));
+    }
+
+    /// This list's marks in the process-wide unrouted registry, which other tests also mark.
+    fn unrouted_on(list_key: &[u8; 32]) -> Vec<String> {
+        let prefix = format!("list:{}:", hex::encode(list_key));
+        raven_railgun_engine::orchestrator::router_unrouted_targets()
+            .into_iter()
+            .filter(|target| target.starts_with(&prefix))
+            .collect()
+    }
+
+    /// A gap in the declared blocks: `block = 7` written for the seventh block, which is block
+    /// 6, or a block left out of the middle. Stepping over the gap leaves its rows unserved
+    /// behind a feed that reads as caught up, so the feed stops on the gap's first row and names
+    /// its block, whether it pages up to the gap or boots already past it.
+    #[tokio::test]
+    async fn a_gap_in_the_declared_blocks_stops_the_feed_on_its_first_row() {
+        use raven_railgun_ppoi_mirror::{FeedStatus, MirrorConfig, UpstreamPpoiMirror};
+
+        let list_key = [0x5A; 32];
+        let block = |block| DataSourceFilter::PpoiListBlock { list_key, block };
+        let start = |block: u32| u64::from(block * LEAVES_PER_PPOI_BLOCK);
+        let full = LEAVES_PER_PPOI_BLOCK as usize;
+        let block_7_for_the_seventh: Vec<(DataSourceFilter, usize)> =
+            std::iter::once((DataSourceFilter::PpoiList(list_key), full))
+                .chain((0..5).map(|index| (block(index), full)))
+                .chain([(block(5), full - 2), (block(7), 0)])
+                .collect();
+        let block_1_left_out = vec![(block(0), full), (block(2), 7)];
+        let cases = [
+            (
+                "paged up to the gap",
+                block_7_for_the_seventh,
+                vec![(start(6) - 2, start(6) - 1)],
+                6,
+            ),
+            ("booted past the gap", block_1_left_out, vec![], 1),
+        ];
+        for (case, held, pages, gap_block) in cases {
+            let (endpoint, asked) = upstream_holding_every_row().await;
+            let mirror = Arc::new(
+                UpstreamPpoiMirror::new(MirrorConfig {
+                    endpoint,
+                    poll_interval_secs: 1,
+                    ..MirrorConfig::default()
+                })
+                .expect("mirror"),
+            );
+            let routes: raven_railgun_engine::orchestrator::PpoiListRoutes =
+                Arc::new(arc_swap::ArcSwap::from_pointee(
+                    held.iter()
+                        .map(|&(filter, _)| (filter, tokio::sync::mpsc::channel(1).0))
+                        .collect(),
+                ));
+            let feed = mirror_feeds(&held).pop().expect("one list");
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                run_mirror_feed(mirror, feed, routes, tx, FeedStatus::default()),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{case}: the feed stepped over the gap: asked {:?}",
+                    asked.lock()
+                )
+            });
+            let sent: Vec<u64> = pages
+                .iter()
+                .flat_map(|&(first, last)| first..=last)
+                .collect();
+            assert_eq!(asked.lock().clone(), pages, "{case}");
+            assert_eq!(leaves_sent(&mut rx), sent, "{case}");
+            let target = format!("list:{}:block:{gap_block}", hex::encode(list_key));
+            assert!(
+                unrouted_on(&list_key).contains(&target),
+                "{case}: readiness must name {target}: {:?}",
+                unrouted_on(&list_key)
+            );
+        }
     }
 }

@@ -110,6 +110,7 @@ fn template_runtime(
         entries: legal_cell_rows(encoder),
         entry_bytes: TOY_ENTRY_BYTES,
         channel_capacity: 64,
+        session_limits: raven_railgun_engine::session_pool::SessionStoreLimits::default(),
     }
 }
 

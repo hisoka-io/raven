@@ -41,6 +41,7 @@ fn opts_with(
         metrics_public: false,
         enable_fanout: false,
         max_fanout_shards: 16,
+        session_capacity: raven_railgun_cli::serve_production::SessionCapacity::default(),
     }
 }
 
@@ -209,10 +210,7 @@ fn write_single_instance_config(
 [global]
 bind = "127.0.0.1:0"
 token = "cell-width-boot-gate-token-padded"
-rpc_url = "http://127.0.0.1:1"
-railgun_proxy = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
 chain_id = 1
-start_block = 0
 mirror_endpoint = "http://127.0.0.1:1"
 record_size = {record_size}
 entries_per_shard = {entries_per_shard}
@@ -224,7 +222,7 @@ role = "live"
 encoder = "per-list-status"
 list_key = "{list_key}"
 data_dir = "{data_dir}/ppoi-status-gate"
-verification_mode = "upstream-signature"
+verification_mode = "upstream-asserted"
 data_source = {{ kind = "mirror", list_key = "{list_key}", what = "status" }}
 "#,
         data_dir = dir.display()

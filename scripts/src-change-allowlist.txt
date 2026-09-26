@@ -75,6 +75,8 @@ adapters/railgun/http/src/batch.rs
 adapters/railgun/http/src/fanout.rs
 adapters/railgun/http/src/admin.rs
 adapters/railgun/http/src/auth.rs
+adapters/railgun/http/src/config.rs
+adapters/railgun/http/src/events.rs
 adapters/railgun/http/src/versioned.rs
 adapters/railgun/ppoi-mirror/src/lib.rs
 adapters/railgun/poseidon/src/lib.rs
@@ -97,3 +99,10 @@ crates/storage/src/recovery.rs
 crates/storage/src/retention.rs
 crates/storage/src/snapshot.rs
 benches/raven-bench/src/provenance.rs
+adapters/railgun/cli/src/bootstrap_chainalysis.rs
+adapters/railgun/indexer/src/subsquid.rs
+adapters/railgun/http/src/shim_store.rs
+benches/raven-bench/src/lib.rs
+adapters/railgun/sdk/src/bc-prefix-index.ts
+adapters/railgun/sdk/src/poi-list-index-store.ts
+adapters/railgun/sdk/src/pin-resolver.ts

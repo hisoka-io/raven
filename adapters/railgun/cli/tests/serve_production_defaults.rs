@@ -29,7 +29,11 @@ fn production_cell_defaults_match_locked_t2_t3_shape_documentation_only() {
 async fn production_cell_zero_dimension_bails_regression() {
     use raven_railgun_cli::serve_production::run_with_listener;
 
-    fn opts_with(entries: usize, entry_bytes: usize) -> ProductionServeOptions {
+    fn opts_with(
+        entries: usize,
+        entry_bytes: usize,
+        data_dir: &std::path::Path,
+    ) -> ProductionServeOptions {
         ProductionServeOptions {
             bind: "127.0.0.1:0".parse::<SocketAddr>().expect("addr"),
             token: "test-token-padded-to-meet-min-length".to_owned(),
@@ -39,7 +43,7 @@ async fn production_cell_zero_dimension_bails_regression() {
             start_block: 0,
             mirror_endpoint: "http://127.0.0.1:1".to_owned(),
             list_key: "0".repeat(64),
-            data_dir: tempfile::tempdir().expect("tempdir").keep(),
+            data_dir: data_dir.to_path_buf(),
             instance_id: "test".to_owned(),
             max_concurrent_queries: 4,
             respond_timeout_secs: 30,
@@ -50,11 +54,13 @@ async fn production_cell_zero_dimension_bails_regression() {
             metrics_public: false,
             enable_fanout: false,
             max_fanout_shards: 16,
+            session_capacity: raven_railgun_cli::serve_production::SessionCapacity::default(),
         }
     }
 
     for (entries, entry_bytes) in [(0, 512), (65_536, 0), (0, 0)] {
-        let opts = opts_with(entries, entry_bytes);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let opts = opts_with(entries, entry_bytes, tmp.path());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");

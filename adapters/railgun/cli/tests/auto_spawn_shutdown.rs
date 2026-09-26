@@ -213,6 +213,7 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
         chain_id: 1,
         start_block: 0,
         mirror_endpoint: "http://127.0.0.1:1".to_owned(),
+        mirror_backfill_interval_secs: None,
         max_concurrent_queries: 4,
         respond_timeout_secs: 30,
         instances: vec![bootstrap_tree_zero_cfg(bootstrap_dir)],
@@ -247,6 +248,7 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
         enable_fanout: None,
         max_fanout_shards: None,
         reorg_window_path: None,
+        session_capacity: raven_railgun_cli::serve_production::SessionCapacity::default(),
     };
 
     let (stop_tx, stop_rx) = oneshot::channel::<()>();

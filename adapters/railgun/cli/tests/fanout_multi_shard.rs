@@ -375,14 +375,20 @@ async fn fanout_refusal_reasons_reach_the_wire_as_400_and_the_cap_is_inclusive()
     fixture.shutdown().await;
 }
 
-/// The observable is the refusal itself, not that the upload finished. A refusal
-/// abandons the uploaded query unread, so the connection is spent; the caller
-/// must still get a 401 it can act on, and must be told not to reuse the socket.
+/// Fan-out is a READ route, so it carries no credential -- and this pins that, because the
+/// direction that silently regresses is re-closing it. The bearer is not merely optional here:
+/// a wrong one is served too, since nothing on a read route consults it at all.
+///
+/// The connection-close property these probes used to assert now belongs to the admin route,
+/// which is the only one that still refuses: see
+/// `http/tests/auth_reject_connection_close.rs::the_401_carries_connection_close_on_the_wire`.
+///
+/// Leaving fan-out anonymous makes it a k-times amplifier for an uncredentialed caller. That
+/// is a deliberate consequence of opening the read path, left as an open decision rather
+/// than settled here; `enable_fanout` is false by default, which is what makes it survivable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fanout_requires_a_valid_bearer_token() {
+async fn fanout_is_served_without_a_bearer_token() {
     let fixture = spawn_multi_shard_server().await;
-    // Each refusal ends its connection, so a pooled socket would carry a doomed
-    // handshake into the next probe and mask the status under a transport error.
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(0)
         .build()
@@ -400,17 +406,12 @@ async fn fanout_requires_a_valid_bearer_token() {
         .body(body.clone())
         .send()
         .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "an unauthenticated fan-out must be refused with 401, not fail in transport: {e}"
-            )
-        });
+        .unwrap_or_else(|e| panic!("an unauthenticated fan-out must be served, not fail: {e}"));
     assert_eq!(
         no_auth.status(),
-        401,
-        "fan-out must never be reachable without a bearer token"
+        200,
+        "fan-out is a read route and must be reachable without a bearer token"
     );
-    assert_connection_closed(no_auth.headers(), "unauthenticated");
 
     let wrong_token = client
         .post(fixture.fanout_url())
@@ -419,32 +420,20 @@ async fn fanout_requires_a_valid_bearer_token() {
         .body(body)
         .send()
         .await
-        .unwrap_or_else(|e| {
-            panic!("a wrong bearer must be refused with 401, not fail in transport: {e}")
-        });
-    assert_eq!(wrong_token.status(), 401, "a wrong bearer must be rejected");
-    assert_connection_closed(wrong_token.headers(), "wrong-bearer");
+        .unwrap_or_else(|e| panic!("a wrong bearer must be ignored, not fail in transport: {e}"));
+    assert_eq!(
+        wrong_token.status(),
+        200,
+        "a read route must not consult the bearer at all, so a wrong one changes nothing"
+    );
 
     let (served, _, _) = post_fanout(&client, &fixture, &query, vec![0, 1]).await;
     assert_eq!(
         served, 200,
-        "the refusals must not leave the server unable to serve a valid bearer"
+        "the anonymous probes must not leave the server unable to serve a valid bearer"
     );
 
     fixture.shutdown().await;
-}
-
-fn assert_connection_closed(headers: &reqwest::header::HeaderMap, label: &str) {
-    let connection = headers
-        .get(reqwest::header::CONNECTION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    assert!(
-        connection.contains("close"),
-        "the {label} refusal left the uploaded query unread, so it must mark the \
-         connection unreusable; got {connection:?}"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

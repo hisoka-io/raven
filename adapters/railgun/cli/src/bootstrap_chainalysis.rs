@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::Address;
 use alloy::sol;
 use alloy::sol_types::SolEvent;
 use async_trait::async_trait;
@@ -303,22 +303,10 @@ impl PpoiEventsSource for ChainalysisOnChainOracleSource {
             return Err(BootstrapError::PpoiUnreachable(
                 "Chainalysis adapter: sanctioned-address set is non-empty but no shield rows \
                  supplied. The derivation layer requires the indexer to feed pre-decoded \
-                 shield events; without them, use skip-on-unreachable to seed an empty IMT."
+                 shield events; without them there is no list to derive."
                     .to_owned(),
             ));
         }
         Self::derive_event_rows(&sanctioned, &self.shield_rows)
     }
-}
-
-pub fn parse_chainalysis_oracle(s: &str) -> Result<Address, String> {
-    s.parse::<Address>()
-        .map_err(|e| format!("invalid chainalysis-oracle address {s}: {e}"))
-}
-
-/// Keeps `U256`/`B256` in scope for the live-derivation path.
-#[doc(hidden)]
-#[allow(dead_code)]
-pub fn __keep_alloy_imports() -> (U256, B256) {
-    (U256::ZERO, B256::ZERO)
 }

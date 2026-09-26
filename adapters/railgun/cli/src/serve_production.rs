@@ -44,6 +44,42 @@ pub struct ProductionServeOptions {
     pub enable_fanout: bool,
     /// Maximum shard ids accepted by one fanout request.
     pub max_fanout_shards: usize,
+    /// Session seats, session lifetime and event-stream bounds.
+    pub session_capacity: SessionCapacity,
+}
+
+/// Operator bounds on what anonymous callers can hold: packing-key seats per instance, how
+/// long a seat lives, and concurrent `/v1/events` streams in total and per peer. The HTTP
+/// layer enforces the stream bounds; every store the serve path opens takes its limits from
+/// [`HttpConfig::session_store_limits`] of the same config, so the two cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionCapacity {
+    pub max_sessions_per_instance: usize,
+    /// Refused above [`raven_railgun_http::config::DEFAULT_SESSION_TTL_SECS`].
+    pub session_ttl_secs: u64,
+    pub max_sse_connections: usize,
+    pub max_sse_connections_per_peer: usize,
+}
+
+impl Default for SessionCapacity {
+    fn default() -> Self {
+        Self {
+            max_sessions_per_instance: raven_railgun_engine::session_pool::DEFAULT_MAX_SESSIONS,
+            session_ttl_secs: raven_railgun_http::config::DEFAULT_SESSION_TTL_SECS,
+            max_sse_connections: raven_railgun_http::config::DEFAULT_MAX_SSE_CONNECTIONS,
+            max_sse_connections_per_peer:
+                raven_railgun_http::config::DEFAULT_MAX_SSE_CONNECTIONS_PER_PEER,
+        }
+    }
+}
+
+impl SessionCapacity {
+    pub fn apply_to(&self, config: &mut HttpConfig) {
+        config.max_sessions_per_instance = self.max_sessions_per_instance;
+        config.session_ttl_secs = self.session_ttl_secs;
+        config.max_sse_connections = self.max_sse_connections;
+        config.max_sse_connections_per_peer = self.max_sse_connections_per_peer;
+    }
 }
 
 /// Per-leaf cell: 65,536 rows x 512 B (16 siblings x 32 B). Per-node encoders
@@ -63,6 +99,7 @@ pub fn build_http_config(opts: &ProductionServeOptions) -> HttpConfig {
     config.session_eviction_interval_secs = opts.session_eviction_interval_secs;
     config.enable_fanout = opts.enable_fanout;
     config.max_fanout_shards = opts.max_fanout_shards;
+    opts.session_capacity.apply_to(&mut config);
     config
 }
 
@@ -118,7 +155,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     use raven_railgun_indexer::{
         ChainSource, IndexerWorker, IndexerWorkerConfig, RpcChainSource, DEFAULT_POLL_INTERVAL_SECS,
     };
-    use raven_railgun_ppoi_mirror::{MirrorConfig, MirrorCursor, UpstreamPpoiMirror};
+    use raven_railgun_ppoi_mirror::{MirrorConfig, UpstreamPpoiMirror};
 
     let proxy_addr: Address = opts
         .railgun_proxy
@@ -139,6 +176,12 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         &list_key_bytes,
         "--list-key",
     )?;
+
+    // Before any store opens: the stores take their limits from this config.
+    let http_config = build_http_config(&opts);
+    http_config
+        .validate()
+        .map_err(|e| anyhow::anyhow!("http config rejected: {e}"))?;
 
     if opts.entries == 0 || opts.entry_bytes == 0 {
         anyhow::bail!(
@@ -189,6 +232,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     )
     .map_err(|e| anyhow::anyhow!("rows per shard rejected: {e}"))?;
     config.max_concurrent_queries = Some(opts.max_concurrent_queries);
+    config.session_limits = http_config.session_store_limits();
     let resolved_k = u32::try_from(config.resolved_max_concurrent_queries()).unwrap_or(u32::MAX);
 
     let handle = bootstrap_railgun_engine(config, params.clone(), factory)
@@ -249,8 +293,6 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         .map_err(|error| anyhow::anyhow!("chain indexer startup reconciliation: {error}"))?;
     let mut indexer_task = AbortOnDropTask::new(indexer_handle);
 
-    let http_config = build_http_config(&opts);
-
     let mut engine: Engine<raven_railgun_engine::inspire::RavenInspireScheme> = Engine::new();
     engine
         .register_instance(Arc::clone(&handle.instance))
@@ -292,34 +334,54 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     );
     let mirror_tx = handle.channels.mirror_tx.clone();
     let mirror_clone = Arc::clone(&mirror);
-    // Under data_dir so a restart resumes from the post-WAL-replay floor instead of
-    // re-firing `expected list_index N, got 0..N-1`.
-    let mirror_kind = mirror_kind_for_encoder(opts.encoder);
-    let fallback = {
-        let store = handle.logical_store.lock();
-        #[allow(clippy::cast_possible_truncation)]
-        let count = store
-            .ppoi_imt(&list_key.0)
-            .map_or(0u64, |imt| imt.leaf_count() as u64);
-        count
-    };
-    let cursor = MirrorCursor::new(opts.data_dir.clone(), mirror_kind, fallback);
+    // The store is the cursor, as on the multi-instance path: the rows WAL replay recovered,
+    // never a sidecar that can run ahead of rows that did not reach the WAL. The one instance
+    // holds the list's first tree, so the feed stops in front of the row past it.
+    let list_route = DataSourceFilter::PpoiList(list_key.0);
+    let rows = crate::serve_production_multi::list_rows(&handle.logical_store.lock(), &list_key.0);
+    let feed = crate::serve_production_multi::mirror_feeds(&[(list_route, rows)])
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("a whole-list route yields one mirror feed"))?;
     // A chain cell serves chain rows whatever the list upstream does.
     preflight_mirror_upstream(
         &mirror,
         &list_key,
-        chain_backed || fallback > 0,
+        chain_backed || feed.holds_rows,
         "--mirror-endpoint",
     )
     .await?;
+    let feed_status = raven_railgun_ppoi_mirror::FeedStatus::default();
+    let resume_at = feed.resume_at;
+    let holdings = feed.holdings;
+    let span = move |cursor| {
+        crate::serve_production_multi::feed_span(&holdings, cursor, |at| {
+            crate::serve_production_multi::first_unheld_index([list_route], &list_key.0, at)
+        })
+    };
+    let worker_status = feed_status.clone();
     let mirror_handle = tokio::spawn(async move {
         if let Err(e) = mirror_clone
-            .run_worker_with_cursor(list_key, 0, Some(cursor), mirror_tx)
+            .run_feed(list_key, resume_at, span, worker_status, mirror_tx)
             .await
         {
             tracing::error!(error = %e, "ppoi mirror worker exiting");
         }
     });
+    // A chain cell's readiness is its chain rows; a list cell's is the list it serves.
+    let app_state = if pinned_list_key(opts.encoder).is_some() {
+        let store = Arc::clone(&handle.logical_store);
+        let list = list_key.0;
+        app_state.with_mirror_feeds(Arc::new(move || {
+            let rows = crate::serve_production_multi::list_rows(&store.lock(), &list);
+            vec![crate::serve_production_multi::mirror_feed_view(
+                &list,
+                &feed_status.snapshot(),
+                &[(list_route, rows)],
+            )]
+        }))
+    } else {
+        app_state
+    };
     let mut mirror_task = AbortOnDropTask::new(mirror_handle);
 
     let mut auxiliary_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -631,14 +693,12 @@ pub(crate) fn enforce_encoder_list_key(
     Ok(())
 }
 
-/// Path-projection encoders own the path sidecar; every other kind uses the status
-/// sidecar. The two feeds advance independently, so the wrong sidecar means the wrong
-/// resume cursor after a restart.
+/// Which mirror payload an encoder is driven by: path projections read the per-list IMT that
+/// `PpoiListLeafAdded` grows, every other kind the `PpoiStatus` byte. A config's
+/// `data_source.what` must name it, and is refused at load when it does not.
 ///
-/// **One derivation, both call sites.** This lived inline in `serve_production_multi.rs`
-/// as well and the two drifted: the multi copy learned `PerListPath10` and this one did
-/// not. Both entry points can construct every variant, so a second copy of this routing
-/// decision is a wrong resume cursor on whichever path it lags.
+/// **One derivation.** A second copy of this decision drifted once already: it learned
+/// `PerListPath10` on one path and not the other.
 pub(crate) fn mirror_kind_for_encoder(
     encoder: raven_railgun_engine::pir_table::EncoderKind,
 ) -> raven_railgun_ppoi_mirror::MirrorKind {

@@ -81,30 +81,13 @@ async fn error_paths_return_their_status_codes() {
     let empty_batch: Vec<u8> =
         raven_railgun_http::write_versioned::<Vec<()>>(&Vec::new()).expect("ser");
 
+    // The three `/query` refusal cases that stood here are gone, not re-pointed at 400: a read
+    // route refuses no credential now, so "wrong bearer", "no header" and "non-bearer scheme"
+    // all describe a refusal that does not exist. Re-pointing them at 400 would have asserted
+    // the empty-body path twice, since `malformed query body` below already covers it. The
+    // `Bearer `-prefix parsing the third one protected is now asserted on the admin route, in
+    // `http/tests/auth_reject_connection_close.rs`, against the same near-miss table.
     let cases = vec![
-        ErrorCase {
-            name: "wrong bearer token",
-            path: query_path.clone(),
-            authorization: Some("Bearer not-the-real-token"),
-            body: Vec::new(),
-            expect: 401,
-        },
-        ErrorCase {
-            name: "no authorization header",
-            path: query_path.clone(),
-            authorization: None,
-            body: Vec::new(),
-            expect: 401,
-        },
-        // The token is the configured one; only the scheme word is wrong, so a gate that
-        // searched the header for the token instead of parsing `Bearer ` would serve this.
-        ErrorCase {
-            name: "non-bearer authorization scheme",
-            path: query_path.clone(),
-            authorization: Some("Basic http-error-paths-test-token"),
-            body: Vec::new(),
-            expect: 401,
-        },
         ErrorCase {
             name: "unknown instance",
             path: "/v1/instance/no-such-instance/query".to_owned(),

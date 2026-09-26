@@ -47,8 +47,8 @@ enum Commands {
         /// Per-IP rate-limit burst budget (token-bucket capacity).
         #[arg(long, default_value_t = 200)]
         rate_limit_burst: u32,
-        /// Sticky-session TTL in seconds.
-        #[arg(long, default_value_t = 3600)]
+        /// Session lifetime in seconds; at most the compiled default.
+        #[arg(long, default_value_t = raven_railgun_http::config::DEFAULT_SESSION_TTL_SECS)]
         session_ttl_secs: u64,
         /// Sticky-session LRU cap.
         #[arg(long, default_value_t = 10_000)]
@@ -56,14 +56,16 @@ enum Commands {
     },
     /// Boot the production HTTP server against a real Ethereum RPC + upstream PPOI aggregator.
     ServeProduction {
-        /// Multi-instance TOML config file; when set, all single-instance flags are ignored.
+        /// Multi-instance TOML config file; the single-instance flags are refused alongside it.
         #[arg(long, conflicts_with_all = [
             "rpc_url", "data_dir", "instance_id", "encoder",
             "list_key", "tree_number", "entries", "entry_bytes",
             "respond_timeout_secs", "max_concurrent_queries",
             "enable_fanout", "max_fanout_shards",
+            "max_sessions_per_instance", "session_ttl_secs",
+            "max_sse_connections", "max_sse_connections_per_peer",
             "railgun_proxy", "chain_id", "start_block", "mirror_endpoint",
-            "token", "bind",
+            "token", "bind", "session_eviction_interval_secs",
         ])]
         config: Option<std::path::PathBuf>,
         /// Local address to bind the HTTP server.
@@ -139,6 +141,22 @@ enum Commands {
         /// Maximum shard ids accepted by one fanout request.
         #[arg(long, default_value_t = 16)]
         max_fanout_shards: usize,
+        /// Packing-key seats per instance. Each seat holds the server-derived keys,
+        /// about 24 MiB at a 512 B row, so this bounds session memory.
+        #[arg(long, default_value_t = raven_railgun_engine::session_pool::DEFAULT_MAX_SESSIONS)]
+        max_sessions_per_instance: usize,
+        /// Seat and session-handle lifetime in seconds; at most the compiled default.
+        #[arg(long, default_value_t = raven_railgun_http::config::DEFAULT_SESSION_TTL_SECS)]
+        session_ttl_secs: u64,
+        /// Concurrent `/v1/events` streams.
+        #[arg(long, default_value_t = raven_railgun_http::config::DEFAULT_MAX_SSE_CONNECTIONS)]
+        max_sse_connections: usize,
+        /// Concurrent `/v1/events` streams one peer may hold.
+        #[arg(
+            long,
+            default_value_t = raven_railgun_http::config::DEFAULT_MAX_SSE_CONNECTIONS_PER_PEER
+        )]
+        max_sse_connections_per_peer: usize,
     },
     /// Print engine status by curling /v1/status against a running server.
     Status {
@@ -169,9 +187,6 @@ enum Commands {
         /// Path to a 32-byte raw or 64-char hex Ed25519 seed (required with `--sign`).
         #[arg(long)]
         signing_key: Option<std::path::PathBuf>,
-        /// Capture `wal/current.log` in addition to archived WAL segments.
-        #[arg(long, default_value_t = false)]
-        include_current_wal: bool,
         /// Retain only the N newest `*.tar.zst` beside the output; `0` disables.
         #[arg(long, default_value_t = 3)]
         keep_snapshots: usize,
@@ -185,30 +200,32 @@ enum Commands {
         #[arg(long, default_value_t = 3)]
         keep: usize,
     },
-    /// Restore an export tarball into `--data-dir`, verifying checksums before any disk write.
+    /// Restore a signed export into `--data-dir`; nothing is swapped in unless it recovers to
+    /// the state the export recorded.
     ImportSnapshot {
-        /// Tarball produced by `export-snapshot`.
+        /// Tarball produced by `export-snapshot`; its `.sig` sidecar must sit beside it.
         #[arg(long)]
         input: std::path::PathBuf,
         /// Destination root for the unpacked instance data_dirs.
         #[arg(long)]
         data_dir: std::path::PathBuf,
-        /// Legacy alias: when set without `--verifying-key`, the import refuses to proceed.
+        /// Path to a 32-byte raw or 64-char hex Ed25519 verifying key.
         #[arg(long)]
-        verify_sig: bool,
-        /// Path to a 32-byte raw or 64-char hex Ed25519 verifying key (required unless `--unsafe-no-verify`).
+        verifying_key: std::path::PathBuf,
+        /// The `content_hash_hex` export-snapshot printed for this deploy's export.
         #[arg(long)]
-        verifying_key: Option<std::path::PathBuf>,
-        /// Bypass Ed25519 verification (prints a warning; use only for unsigned test fixtures).
-        #[arg(long, default_value_t = false, conflicts_with = "verifying_key")]
-        unsafe_no_verify: bool,
-        /// Permit overwriting an existing populated data root (backs it up first).
+        expect_content_hash: String,
+        /// Permit importing over a non-empty data root; what it holds is moved to
+        /// `<root>.pre-import.<ts>/` first, never deleted.
         #[arg(long, default_value_t = false)]
         allow_overwrite: bool,
     },
-    /// Bootstrap on-disk instance state from a Subsquid checkpoint, verified
+    /// Bootstrap commitment-tree instance state from a Subsquid checkpoint, verified
     /// against the chain ABI. Requires archival RPC state at
     /// `chain_head - checkpoint_depth`.
+    ///
+    /// Writes commitment trees only. PPOI lists are synced at runtime by `serve-production`,
+    /// from each `[[instance]]` whose `data_source` kind is `mirror`.
     BootstrapFromSubsquid {
         /// Per-endpoint heterogeneous rpc-pool TOML.
         #[arg(long)]
@@ -228,53 +245,9 @@ enum Commands {
         /// Block depth below chain head to anchor the checkpoint at.
         #[arg(long, default_value_t = 64)]
         checkpoint_depth: u64,
-        /// Comma-separated PPOI list keys (64 hex chars, optional `0x`).
-        #[arg(
-            long,
-            default_value = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88",
-            value_delimiter = ','
-        )]
-        ppoi_list_keys: Vec<String>,
-        /// PPOI per-list data_dir template; must contain `{LIST_KEY}`.
-        #[arg(long)]
-        ppoi_list_data_dir_template: Option<String>,
-        /// Upstream PPOI base URL(s), repeatable or comma-separated. Walked in
-        /// priority order; the first reachable base wins.
-        #[arg(
-            long,
-            default_values_t = raven_railgun_cli::bootstrap_subsquid::DEFAULT_RAILWAY_BASES
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect::<Vec<String>>(),
-            value_delimiter = ','
-        )]
-        ppoi_endpoint: Vec<String>,
-        /// `strict` hard-stops on upstream unreachability;
-        /// `skip-on-unreachable` warns and seeds an EMPTY per-list IMT.
-        #[arg(long, default_value = "strict")]
-        ppoi_bootstrap_mode: String,
-        /// `railway` pulls signed upstream events; `chainalysis-oracle` derives
-        /// the list locally from the on-chain sanctions oracle.
-        #[arg(long, default_value = "railway")]
-        ppoi_source: String,
-        /// Sanctions oracle address for `--ppoi-source chainalysis-oracle`.
-        #[arg(
-            long,
-            default_value = raven_railgun_cli::bootstrap_chainalysis::CHAINALYSIS_ORACLE_MAINNET
-        )]
-        chainalysis_oracle: String,
-        /// First block scanned for sanctions-added events.
-        #[arg(
-            long,
-            default_value_t = raven_railgun_cli::bootstrap_chainalysis::CHAINALYSIS_ORACLE_FIRST_BLOCK
-        )]
-        chainalysis_block_start: u64,
-        /// Chain id for the PPOI endpoint path component.
+        /// Chain id every RPC pool endpoint must report; an endpoint on another chain is refused.
         #[arg(long, default_value_t = 1)]
         chain_id: u64,
-        /// Railgun PPOI chain-type path component (`0` = EVM).
-        #[arg(long, default_value_t = 0)]
-        chain_type: u32,
         /// Scheme tag for the persisted manifest.
         #[arg(
             long,
@@ -287,9 +260,6 @@ enum Commands {
         /// Removed: the encoder determines bootstrap row width.
         #[arg(long, value_parser = removed_bootstrap_entry_bytes)]
         entry_bytes: Option<usize>,
-        /// Strict 2/3-oracle byte-identity gate.
-        #[arg(long, default_value_t = true)]
-        strict_oracle_byte_identity: bool,
         /// Wall-clock cap for the entire bootstrap loop.
         #[arg(long, default_value_t = 30)]
         max_bootstrap_wall_mins: u64,
@@ -310,12 +280,6 @@ enum Commands {
         /// `per-leaf-bc`, `per-leaf-path`, or `per-node`.
         #[arg(long, default_value = "per-node")]
         encoder: String,
-        /// PPOI status encoder: `per-list-status`, `per-list-path`, or `per-list-node`.
-        #[arg(long, default_value = "per-list-status")]
-        ppoi_status_encoder: String,
-        /// PPOI path encoder: `per-list-status`, `per-list-path`, or `per-list-node`.
-        #[arg(long, default_value = "per-list-node")]
-        ppoi_path_encoder: String,
     },
     /// Re-encode an on-disk instance to a new encoder (server must be stopped first).
     MigrateEncoder {
@@ -391,16 +355,13 @@ async fn main() -> anyhow::Result<()> {
             session_eviction_interval_secs,
             enable_fanout,
             max_fanout_shards,
+            max_sessions_per_instance,
+            session_ttl_secs,
+            max_sse_connections,
+            max_sse_connections_per_peer,
         } => {
             if let Some(path) = config {
-                let mut opts =
-                    raven_railgun_cli::serve_production_multi::load_options_from_toml(&path)?;
-                if ws_endpoint.is_some() {
-                    opts.ws_endpoint = ws_endpoint;
-                }
-                if metrics_public {
-                    opts.metrics_public = Some(true);
-                }
+                let opts = multi_options_from_config(&path, ws_endpoint, metrics_public)?;
                 return raven_railgun_cli::serve_production_multi::run(opts).await;
             }
             if ws_endpoint.is_some() {
@@ -442,6 +403,12 @@ async fn main() -> anyhow::Result<()> {
                 metrics_public,
                 enable_fanout,
                 max_fanout_shards,
+                session_capacity: raven_railgun_cli::serve_production::SessionCapacity {
+                    max_sessions_per_instance,
+                    session_ttl_secs,
+                    max_sse_connections,
+                    max_sse_connections_per_peer,
+                },
             };
             raven_railgun_cli::serve_production::run(opts).await
         }
@@ -469,7 +436,6 @@ async fn main() -> anyhow::Result<()> {
             output,
             sign,
             signing_key,
-            include_current_wal,
             keep_snapshots,
         } => {
             if sign && signing_key.is_none() {
@@ -483,10 +449,11 @@ async fn main() -> anyhow::Result<()> {
                 data_dir,
                 output,
                 signing_key,
-                include_current_wal,
                 keep_snapshots,
             };
-            raven_railgun_cli::snapshot_port::run_export(opts)
+            let receipt = raven_railgun_cli::snapshot_port::run_export(opts)?;
+            println!("{receipt}");
+            Ok(())
         }
         Commands::PruneSnapshots { data_dir, keep } => raven_railgun_cli::snapshot_port::run_prune(
             raven_railgun_cli::snapshot_port::PruneOptions {
@@ -497,44 +464,20 @@ async fn main() -> anyhow::Result<()> {
         Commands::ImportSnapshot {
             input,
             data_dir,
-            verify_sig,
             verifying_key,
-            unsafe_no_verify,
+            expect_content_hash,
             allow_overwrite,
         } => {
-            if verify_sig && verifying_key.is_none() {
-                anyhow::bail!(
-                    "--verify-sig requires --verifying-key; pass --verifying-key <path> \
-                     or use --unsafe-no-verify to opt out (not recommended)"
-                );
-            }
-            if unsafe_no_verify && verifying_key.is_some() {
-                anyhow::bail!("--unsafe-no-verify and --verifying-key are mutually exclusive");
-            }
-            if verifying_key.is_none() && !unsafe_no_verify {
-                anyhow::bail!(
-                    "import-snapshot requires Ed25519 verification by default: pass \
-                     --verifying-key <path>, or explicitly opt out with \
-                     --unsafe-no-verify (an attacker who replaces the tarball can \
-                     swap your entire data_dir)"
-                );
-            }
-            if unsafe_no_verify {
-                eprintln!(
-                    "WARNING: --unsafe-no-verify bypasses Ed25519 signature \
-                     verification on import. The tarball contents WILL replace \
-                     your data_dir without authentication. Only use this for \
-                     unsigned test fixtures."
-                );
-            }
             let opts = raven_railgun_cli::snapshot_port::ImportOptions {
                 input,
                 data_dir,
                 verifying_key,
+                expected_content_hash: expect_content_hash,
                 allow_overwrite,
-                unsafe_no_verify,
             };
-            raven_railgun_cli::snapshot_port::run_import(opts)
+            let receipt = raven_railgun_cli::snapshot_port::run_import(opts)?;
+            println!("{receipt}");
+            Ok(())
         }
         Commands::BootstrapFromSubsquid {
             rpc_pool_config,
@@ -542,66 +485,30 @@ async fn main() -> anyhow::Result<()> {
             data_dir_template,
             tree_numbers,
             checkpoint_depth,
-            ppoi_list_keys,
-            ppoi_list_data_dir_template,
-            ppoi_endpoint,
-            ppoi_bootstrap_mode,
-            ppoi_source,
-            chainalysis_oracle,
-            chainalysis_block_start,
             chain_id,
-            chain_type,
             scheme_tag,
             entries: _,
             entry_bytes: _,
-            strict_oracle_byte_identity,
             max_bootstrap_wall_mins,
             railgun_proxy,
             contract_start_block,
             boundary_repair_trigger_threshold,
             encoder,
-            ppoi_status_encoder,
-            ppoi_path_encoder,
         } => {
             let chain_encoder_family = parse_chain_encoder_family(&encoder)?;
-            let ppoi_status_family = parse_ppoi_encoder_family(&ppoi_status_encoder)
-                .map_err(|e| anyhow::anyhow!("--ppoi-status-encoder: {e}"))?;
-            let ppoi_path_family = parse_ppoi_encoder_family(&ppoi_path_encoder)
-                .map_err(|e| anyhow::anyhow!("--ppoi-path-encoder: {e}"))?;
-            let parsed_mode = raven_railgun_cli::bootstrap_subsquid::PpoiBootstrapMode::parse_cli(
-                &ppoi_bootstrap_mode,
-            )
-            .map_err(|e| anyhow::anyhow!("--ppoi-bootstrap-mode: {e}"))?;
-            let parsed_source = parse_ppoi_source(&ppoi_source)
-                .map_err(|e| anyhow::anyhow!("--ppoi-source: {e}"))?;
-            let parsed_oracle = raven_railgun_cli::bootstrap_chainalysis::parse_chainalysis_oracle(
-                &chainalysis_oracle,
-            )
-            .map_err(|e| anyhow::anyhow!("--chainalysis-oracle: {e}"))?;
             let opts = BootstrapFromSubsquidOptions {
                 rpc_pool_config,
                 subsquid_url,
                 data_dir_template,
                 tree_numbers,
                 checkpoint_depth,
-                ppoi_list_keys,
-                ppoi_list_data_dir_template,
-                ppoi_endpoint,
-                ppoi_bootstrap_mode: parsed_mode,
-                ppoi_source: parsed_source,
-                chainalysis_oracle: parsed_oracle,
-                chainalysis_block_start,
                 chain_id,
-                chain_type,
                 scheme_tag,
-                strict_oracle_byte_identity,
                 max_bootstrap_wall_mins,
                 railgun_proxy,
                 contract_start_block,
                 boundary_repair_trigger_threshold,
                 chain_encoder_family,
-                ppoi_status_family,
-                ppoi_path_family,
             };
             run_bootstrap_from_subsquid(opts).await
         }
@@ -636,6 +543,22 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// The two flags `--config` does not refuse; each overrides its TOML key.
+fn multi_options_from_config(
+    path: &std::path::Path,
+    ws_endpoint: Option<String>,
+    metrics_public: bool,
+) -> anyhow::Result<raven_railgun_cli::serve_production_multi::MultiServeOptions> {
+    let mut opts = raven_railgun_cli::serve_production_multi::load_options_from_toml(path)?;
+    if ws_endpoint.is_some() {
+        opts.ws_endpoint = ws_endpoint;
+    }
+    if metrics_public {
+        opts.metrics_public = Some(true);
+    }
+    Ok(opts)
 }
 
 fn parse_encoder_kind(
@@ -739,40 +662,13 @@ struct BootstrapFromSubsquidOptions {
     data_dir_template: String,
     tree_numbers: Vec<u32>,
     checkpoint_depth: u64,
-    ppoi_list_keys: Vec<String>,
-    ppoi_list_data_dir_template: Option<String>,
-    ppoi_endpoint: Vec<String>,
-    ppoi_bootstrap_mode: raven_railgun_cli::bootstrap_subsquid::PpoiBootstrapMode,
-    ppoi_source: PpoiSourceKind,
-    chainalysis_oracle: alloy::primitives::Address,
-    chainalysis_block_start: u64,
     chain_id: u64,
-    chain_type: u32,
     scheme_tag: String,
-    strict_oracle_byte_identity: bool,
     max_bootstrap_wall_mins: u64,
     railgun_proxy: String,
     contract_start_block: u64,
     boundary_repair_trigger_threshold: Option<usize>,
     chain_encoder_family: ChainEncoderFamily,
-    ppoi_status_family: PpoiEncoderFamily,
-    ppoi_path_family: PpoiEncoderFamily,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PpoiSourceKind {
-    Railway,
-    ChainalysisOracle,
-}
-
-fn parse_ppoi_source(s: &str) -> Result<PpoiSourceKind, String> {
-    match s {
-        "railway" => Ok(PpoiSourceKind::Railway),
-        "chainalysis-oracle" => Ok(PpoiSourceKind::ChainalysisOracle),
-        other => Err(format!(
-            "unknown ppoi-source {other}; expected one of railway | chainalysis-oracle"
-        )),
-    }
 }
 
 fn removed_bootstrap_entries(_: &str) -> Result<usize, String> {
@@ -802,25 +698,6 @@ impl ChainEncoderFamily {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-#[allow(clippy::enum_variant_names)]
-enum PpoiEncoderFamily {
-    PerListStatus,
-    PerListPath,
-    PerListNode,
-}
-
-impl PpoiEncoderFamily {
-    fn label(self) -> &'static str {
-        use raven_railgun_engine::pir_table::labels;
-        match self {
-            Self::PerListStatus => labels::PER_LIST_STATUS,
-            Self::PerListPath => labels::PER_LIST_PATH,
-            Self::PerListNode => labels::PER_LIST_NODE,
-        }
-    }
-}
-
 fn parse_chain_encoder_family(s: &str) -> anyhow::Result<ChainEncoderFamily> {
     match s {
         "per-leaf-bc" => Ok(ChainEncoderFamily::PerLeafBc),
@@ -833,34 +710,15 @@ fn parse_chain_encoder_family(s: &str) -> anyhow::Result<ChainEncoderFamily> {
     }
 }
 
-fn parse_ppoi_encoder_family(s: &str) -> anyhow::Result<PpoiEncoderFamily> {
-    match s {
-        "per-list-status" => Ok(PpoiEncoderFamily::PerListStatus),
-        "per-list-path" => Ok(PpoiEncoderFamily::PerListPath),
-        "per-list-node" => Ok(PpoiEncoderFamily::PerListNode),
-        other => anyhow::bail!(
-            "unknown ppoi encoder {other}; expected one of \
-             per-list-status | per-list-path | per-list-node"
-        ),
-    }
-}
-
-#[allow(clippy::too_many_lines)]
 async fn run_bootstrap_from_subsquid(opts: BootstrapFromSubsquidOptions) -> anyhow::Result<()> {
     use raven_railgun_cli::bootstrap_subsquid::{
-        bootstrap_one_list_with_mode, bootstrap_one_tree_with_carry, resolve_data_dir_template,
-        resolve_ppoi_data_dir, BootstrapTreeConfig, ChainSourceOracle, RailwayPpoiClient,
-        StowawayCarry, SubsquidLeavesClient,
+        bootstrap_one_tree_with_carry, resolve_data_dir_template, BootstrapTreeConfig,
+        ChainSourceOracle, StowawayCarry, SubsquidLeavesClient,
     };
     use raven_railgun_cli::rpc_pool_array_config::RpcEndpointArrayConfig;
     use raven_railgun_indexer::rpc_pool::PooledRpcChainSource;
     use std::sync::Arc;
 
-    if !opts.strict_oracle_byte_identity {
-        anyhow::bail!(
-            "--strict-oracle-byte-identity false is not supported in V1; the oracle gate is mandatory"
-        );
-    }
     let pool_cfg = RpcEndpointArrayConfig::load_from_path(&opts.rpc_pool_config)
         .map_err(|e| anyhow::anyhow!("rpc_pool_config: {e}"))?;
     let pool = Arc::new(
@@ -934,76 +792,6 @@ async fn run_bootstrap_from_subsquid(opts: BootstrapFromSubsquidOptions) -> anyh
         );
     }
 
-    if let Some(template) = &opts.ppoi_list_data_dir_template {
-        match opts.ppoi_source {
-            PpoiSourceKind::Railway => {
-                let ppoi = RailwayPpoiClient::new_multi(
-                    opts.ppoi_endpoint.clone(),
-                    opts.chain_type,
-                    opts.chain_id,
-                )
-                .map_err(|e| anyhow::anyhow!("--ppoi-endpoint: {e}"))?;
-                let bases_for_log: Vec<String> = ppoi.bases().to_vec();
-                for list_hex in &opts.ppoi_list_keys {
-                    let key =
-                        parse_list_key(list_hex).map_err(|e| anyhow::anyhow!("list_key: {e}"))?;
-                    let _data_dir = resolve_ppoi_data_dir(template, key)
-                        .map_err(|e| anyhow::anyhow!("ppoi_data_dir: {e}"))?;
-                    let report = bootstrap_one_list_with_mode(
-                        key,
-                        &ppoi,
-                        template,
-                        opts.ppoi_bootstrap_mode,
-                        &bases_for_log,
-                    )
-                    .await?;
-                    tracing::info!(
-                        events = report.events,
-                        ppoi_source = "railway",
-                        ppoi_status_encoder = opts.ppoi_status_family.label(),
-                        ppoi_path_encoder = opts.ppoi_path_family.label(),
-                        "bootstrap-from-subsquid: PPOI list complete"
-                    );
-                }
-            }
-            PpoiSourceKind::ChainalysisOracle => {
-                use raven_railgun_cli::bootstrap_chainalysis::ChainalysisOnChainOracleSource;
-                let chainalysis = ChainalysisOnChainOracleSource::new_live(
-                    Arc::clone(&pool),
-                    opts.chain_id,
-                    opts.chainalysis_oracle,
-                    opts.chainalysis_block_start,
-                    None,
-                );
-                let tried_log = vec![format!(
-                    "chainalysis-oracle@{:#x} from_block={}",
-                    opts.chainalysis_oracle, opts.chainalysis_block_start
-                )];
-                for list_hex in &opts.ppoi_list_keys {
-                    let key =
-                        parse_list_key(list_hex).map_err(|e| anyhow::anyhow!("list_key: {e}"))?;
-                    let _data_dir = resolve_ppoi_data_dir(template, key)
-                        .map_err(|e| anyhow::anyhow!("ppoi_data_dir: {e}"))?;
-                    let report = bootstrap_one_list_with_mode(
-                        key,
-                        &chainalysis,
-                        template,
-                        opts.ppoi_bootstrap_mode,
-                        &tried_log,
-                    )
-                    .await?;
-                    tracing::info!(
-                        events = report.events,
-                        ppoi_source = "chainalysis-oracle",
-                        ppoi_status_encoder = opts.ppoi_status_family.label(),
-                        ppoi_path_encoder = opts.ppoi_path_family.label(),
-                        "bootstrap-from-subsquid: PPOI list complete"
-                    );
-                }
-            }
-        }
-    }
-
     println!(
         "bootstrap-from-subsquid: {} tree(s) complete",
         tree_reports.len()
@@ -1015,4 +803,144 @@ async fn run_bootstrap_from_subsquid(opts: BootstrapFromSubsquidOptions) -> anyh
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, FromArgMatches};
+    use std::io::Write;
+
+    const LIST_KEY: &str = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88";
+
+    /// `serve-production` arguments the multi-instance path applies on top of the file.
+    const APPLIED_BESIDE_CONFIG: [&str; 3] = ["config", "ws_endpoint", "metrics_public"];
+
+    /// The binary's parser with the `RAVEN_RPC_URL` fallback detached, so an exported value
+    /// cannot decide a parse here.
+    fn parse(argv: &[&str]) -> Result<Cli, clap::Error> {
+        let matches = Cli::command()
+            .mut_subcommand("serve-production", |cmd| {
+                cmd.mut_arg("rpc_url", |arg| arg.env(None))
+            })
+            .try_get_matches_from(argv)?;
+        Cli::from_arg_matches(&matches)
+    }
+
+    /// Enumerated from the parser, hidden arguments included, so an argument added later
+    /// without a conflict entry is caught here rather than parsed and dropped.
+    #[test]
+    fn every_serve_production_flag_the_config_path_does_not_apply_is_refused_beside_it() {
+        let cli = Cli::command();
+        let serve = cli
+            .find_subcommand("serve-production")
+            .expect("serve-production");
+        let mut refused = Vec::new();
+        let mut dropped = Vec::new();
+        for arg in serve.get_arguments() {
+            let id = arg.get_id().as_str();
+            if APPLIED_BESIDE_CONFIG.contains(&id) {
+                continue;
+            }
+            let Some(long) = arg.get_long() else {
+                dropped.push(format!("{id}: no long flag to pass beside --config"));
+                continue;
+            };
+            let flag = format!("--{long}");
+            let value = arg
+                .get_default_values()
+                .first()
+                .map_or_else(|| "1".to_owned(), |v| v.to_string_lossy().into_owned());
+            let mut argv = vec![
+                "raven-railgun",
+                "serve-production",
+                "--config",
+                "/unread.toml",
+                &flag,
+            ];
+            if arg.get_action().takes_values() {
+                argv.push(&value);
+            }
+            match parse(&argv) {
+                Err(err)
+                    if err.kind() == clap::error::ErrorKind::ArgumentConflict
+                        && err.to_string().contains(&flag) =>
+                {
+                    refused.push(id);
+                }
+                Err(err) => dropped.push(format!("{flag}: {err}")),
+                Ok(_) => dropped.push(format!("{flag}: parsed beside --config")),
+            }
+        }
+        assert!(dropped.is_empty(), "{}", dropped.join("\n"));
+        for id in ["bind", "session_eviction_interval_secs"] {
+            assert!(
+                refused.contains(&id),
+                "the enumeration lost {id}: {refused:?}"
+            );
+        }
+        for id in APPLIED_BESIDE_CONFIG {
+            assert!(
+                serve.get_arguments().any(|arg| arg.get_id() == id),
+                "{id} is exempt but no longer declared"
+            );
+        }
+    }
+
+    fn options_for(extra: &[&str]) -> raven_railgun_cli::serve_production_multi::MultiServeOptions {
+        let data = tempfile::tempdir().expect("tempdir");
+        let body = format!(
+            r#"
+[global]
+bind = "127.0.0.1:0"
+token = "config-override-test-token-padded-long"
+chain_id = 1
+mirror_endpoint = "http://127.0.0.1:1"
+
+[[instance]]
+id = "ppoi-status"
+role = "live"
+encoder = "per-list-status"
+list_key = "{LIST_KEY}"
+data_dir = "{}"
+verification_mode = "upstream-asserted"
+[instance.data_source]
+kind = "mirror"
+list_key = "{LIST_KEY}"
+"#,
+            data.path().join("ppoi-status").display()
+        );
+        // NamedTempFile is 0600, which the inline token requires.
+        let mut file = tempfile::NamedTempFile::new().expect("tempfile");
+        file.write_all(body.as_bytes()).expect("write config");
+        let config = file.path().to_str().expect("utf-8 path");
+        let argv: Vec<&str> = ["raven-railgun", "serve-production", "--config", config]
+            .into_iter()
+            .chain(extra.iter().copied())
+            .collect();
+        let Commands::ServeProduction {
+            config: Some(path),
+            ws_endpoint,
+            metrics_public,
+            ..
+        } = parse(&argv).expect("parse").command
+        else {
+            panic!("parsed as another command");
+        };
+        multi_options_from_config(&path, ws_endpoint, metrics_public).expect("load config")
+    }
+
+    /// Allowed beside `--config`, so each must land in the options the boot runs on.
+    #[test]
+    fn the_flags_allowed_beside_config_reach_the_loaded_options() {
+        let bare = options_for(&[]);
+        assert_eq!(
+            (bare.ws_endpoint.as_deref(), bare.metrics_public),
+            (None, None),
+            "the fixture must not set either key itself"
+        );
+        let set = options_for(&["--ws-endpoint", "ws://127.0.0.1:1", "--metrics-public"]);
+        assert_eq!(set.ws_endpoint.as_deref(), Some("ws://127.0.0.1:1"));
+        assert_eq!(set.metrics_public, Some(true));
+    }
 }

@@ -1,0 +1,111 @@
+# Example PPOI-only mainnet config for
+# `raven-railgun serve-production --config <this file>`.
+#
+# Seven instances on the OFAC list: 1 PPOI status instance and 6 PPOI path blocks of 65,536
+# rows each. Every instance is fed by the upstream mirror, so the node starts no chain
+# indexer and this file names no chain RPC: `rpc_url`, `railgun_proxy` and `start_block` are
+# required by a config with a commit-tree instance, `[auto_spawn]` enabled, or an
+# `[[instance_template]]` with a chain encoder, and refused by one without any of them, as are
+# the other chain settings.
+#
+# The list routes answer only once the mirror has caught up with upstream: until then a
+# partially synced list would read as "Missing" for every row it has not reached, so they
+# refuse with 503 instead.
+#
+# Block 5 fills at list row 393,216. Past the last declared block the list routes refuse and
+# the mirror stops until the next block is declared, so declare block 6 ahead of that and
+# restart: a block past upstream's row count is served as empty.
+
+[global]
+bind = "0.0.0.0:8080"
+# Bearer token, from EXACTLY ONE of: `token` (inline), `token_file`, or the
+# RAVEN_BEARER_TOKEN environment variable. Zero or two sources is a boot error.
+# The literal "REPLACE_ME" is rejected from every source. A `token_file` and, when
+# `token` is inline, this config itself must be mode 600.
+#   token_file = "/srv/raven/secrets/bearer-token"
+token = "REPLACE_ME"
+# The chain whose PPOI lists the mirror asks upstream for.
+chain_id = 1
+mirror_endpoint = "https://ppoi.fdi.network"
+# Seconds between pages while upstream answers full ones, i.e. during a cold sync. Absent,
+# every page waits the 30 s poll interval.
+#   mirror_backfill_interval_secs = 1
+max_concurrent_queries = 4
+respond_timeout_secs = 30
+record_size = 512
+entries_per_shard = 2048
+scheme_tag = "raven-inspire-twopacking-inspiring-wp3-cache-session"
+use_flock = true
+channel_capacity = 1024
+
+# Key per-IP rate limiting off X-Forwarded-For / cf-connecting-ip only for peers in
+# `trusted_proxy_cidrs`; every other peer keys on its socket address.
+#   trust_proxy_header = true
+#   trusted_proxy_cidrs = ["127.0.0.1/32", "172.16.0.0/12"]
+trust_proxy_header = false
+
+# `verification_mode = "upstream-asserted"` selects the upstream feed as the authority: each
+# event's signature is stored and never verified, so nothing authenticates the publisher. List
+# authenticity rests on TLS to `mirror_endpoint` - keep it https.
+[[instance]]
+id = "ppoi-status-ofac"
+role = "live"
+encoder = "per-list-status"
+list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
+data_dir = "/var/lib/raven-railgun/ppoi-status-ofac"
+verification_mode = "upstream-asserted"
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", what = "status" }
+
+[[instance]]
+id = "ppoi-paths-ofac-0"
+role = "static"
+encoder = "per-list-path10"
+list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
+data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-0"
+verification_mode = "upstream-asserted"
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 0, what = "path" }
+
+[[instance]]
+id = "ppoi-paths-ofac-1"
+role = "static"
+encoder = "per-list-path10"
+list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
+data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-1"
+verification_mode = "upstream-asserted"
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 1, what = "path" }
+
+[[instance]]
+id = "ppoi-paths-ofac-2"
+role = "static"
+encoder = "per-list-path10"
+list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
+data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-2"
+verification_mode = "upstream-asserted"
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 2, what = "path" }
+
+[[instance]]
+id = "ppoi-paths-ofac-3"
+role = "static"
+encoder = "per-list-path10"
+list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
+data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-3"
+verification_mode = "upstream-asserted"
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 3, what = "path" }
+
+[[instance]]
+id = "ppoi-paths-ofac-4"
+role = "static"
+encoder = "per-list-path10"
+list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
+data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-4"
+verification_mode = "upstream-asserted"
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 4, what = "path" }
+
+[[instance]]
+id = "ppoi-paths-ofac-5"
+role = "live"
+encoder = "per-list-path10"
+list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
+data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-5"
+verification_mode = "upstream-asserted"
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 5, what = "path" }

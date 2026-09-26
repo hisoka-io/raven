@@ -11,13 +11,14 @@ use raven_railgun_engine::orchestrator::{
     ChainTreeRoutes, DataSourceFilter, PerInstanceHandles, VerificationMode,
 };
 use raven_railgun_engine::persistence::{
-    bootstrap_inspire_instance, run_consumer_task, ConsumerEvent, ConsumerMetrics,
-    InspirePersistence, Layer2VerifierContext, SnapshotPolicy,
+    bootstrap_inspire_instance_with_session_limits, run_consumer_task, ConsumerEvent,
+    ConsumerMetrics, InspirePersistence, Layer2VerifierContext, SnapshotPolicy,
 };
 use raven_railgun_engine::pir_table::{
     validate_cell_width, validate_rows_per_shard, validate_total_entries, EncoderKind,
     PirTableEncoder,
 };
+use raven_railgun_engine::session_pool::SessionStoreLimits;
 use raven_railgun_engine::tree_fill_watcher::TreeFillWatcher;
 use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
 use raven_railgun_persistence::StoreLayout;
@@ -70,6 +71,8 @@ pub struct AutoSpawnRuntime {
     pub max_instance_count: Option<u32>,
     /// When `Some(d)`: refuse spawns within `d` of the previous successful spawn.
     pub cooldown: Option<std::time::Duration>,
+    /// Bounds of each spawned instance's packing-key store.
+    pub session_limits: SessionStoreLimits,
 }
 
 impl AutoSpawnRuntime {
@@ -538,13 +541,14 @@ fn spawn_one(inputs: &SpawnInputs<'_>, tree: u32, append_log: bool) -> anyhow::R
         Ok(state)
     };
 
-    let (instance, persistence, recovered_store) = bootstrap_inspire_instance(
+    let (instance, persistence, recovered_store) = bootstrap_inspire_instance_with_session_limits(
         layout,
         runtime.scheme_tag.clone(),
         instance_id.clone(),
         InstanceRole::Live,
         policy,
         Arc::clone(&encoder),
+        runtime.session_limits,
         fresh_state_factory,
     )
     .map_err(|e| anyhow::anyhow!("bootstrap_inspire_instance: {e}"))?;
@@ -667,6 +671,8 @@ pub struct PpoiListTemplateRuntime {
     pub entries: usize,
     pub entry_bytes: usize,
     pub channel_capacity: usize,
+    /// Bounds of each spawned instance's packing-key store.
+    pub session_limits: SessionStoreLimits,
 }
 
 impl PpoiListTemplateRuntime {
@@ -899,13 +905,14 @@ fn spawn_one_ppoi_list(inputs: &PpoiListSpawnInputs<'_>, append_log: bool) -> an
         Ok(state)
     };
 
-    let (instance, persistence, recovered_store) = bootstrap_inspire_instance(
+    let (instance, persistence, recovered_store) = bootstrap_inspire_instance_with_session_limits(
         layout,
         template.scheme_tag.clone(),
         instance_id.clone(),
         InstanceRole::Live,
         policy,
         Arc::clone(&encoder),
+        template.session_limits,
         fresh_state_factory,
     )
     .map_err(|e| anyhow::anyhow!("bootstrap_inspire_instance: {e}"))?;
@@ -1175,6 +1182,7 @@ mod tests {
             verification_cadence_n: 0,
             max_instance_count: None,
             cooldown: None,
+            session_limits: SessionStoreLimits::default(),
         };
         match r.resolve_encoder(7).unwrap() {
             EncoderKind::PerNode { tree_number } => assert_eq!(tree_number, 7),
@@ -1214,6 +1222,7 @@ mod tests {
             verification_cadence_n: 0,
             max_instance_count: None,
             cooldown: None,
+            session_limits: SessionStoreLimits::default(),
         };
         let err = r.resolve_encoder(0).expect_err("must reject");
         let msg = format!("{err:#}");
@@ -1235,6 +1244,7 @@ mod tests {
             entries: 1,
             entry_bytes: 32,
             channel_capacity: 1,
+            session_limits: SessionStoreLimits::default(),
         }
     }
 
