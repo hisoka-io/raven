@@ -19,8 +19,20 @@
 #                  the workflow. A regex, glob or package() term is invisible to it.
 #   --selected     asks nextest what every declared filter selects, so it sees every filter
 #                  syntax nextest does. Reads the workflow AND every .config/nextest.toml: an
-#                  override whose filter selects nothing configures nothing, silently. Needs the
-#                  test binaries built, like scripts/assert-lane-counts.sh.
+#                  override whose filter selects nothing configures nothing, silently. The whole
+#                  filter, each term and each top-level alternative of a regex must select a test
+#                  in every profile the declaration applies in, over the bare workspace and each
+#                  package/feature selection a workflow lane builds. Group membership is what
+#                  `nextest show-config test-groups` reports: every declared group holds a test,
+#                  a serialising group holds more tests than it admits at once, and every test of
+#                  a spawn-and-kill target sits in a max-threads = 1 group. Needs the test
+#                  binaries built, like scripts/assert-lane-counts.sh.
+#   --spawn-and-kill FILE...
+#                  the classifier --selected uses, on its own so a selftest can prove it on
+#                  fixtures without a toolchain. A target root, with every file its `mod`s load,
+#                  spawns and kills when it names CARGO_BIN_EXE_ or current_exe() and calls kill()
+#                  outside comments, strings and `impl Drop`: a Drop reaps at teardown and races
+#                  nothing.
 #
 # FILTER_GATE_WORKFLOW and FILTER_GATE_NEXTEST_CONFIGS ("config=manifest ...") point either pass
 # at copies, so a red-proof never has to mutate a tracked file.
@@ -32,12 +44,15 @@ fail=0
 
 [ -f "$CI" ] || { echo "scripts/check-ci-filter-names.sh: workflow ${CI} does not exist." >&2; exit 1; }
 
-if [ "$MODE" = "--selected" ]; then
-  if [ -n "${FILTER_GATE_NEXTEST_CONFIGS:-}" ]; then
-    config_specs="$FILTER_GATE_NEXTEST_CONFIGS"
-  else
+if [ "$MODE" = "--selected" ] || [ "$MODE" = "--spawn-and-kill" ]; then
+  shift
+  if [ "$MODE" = "--selected" ] && [ -n "${FILTER_GATE_NEXTEST_CONFIGS:-}" ]; then
+    # shellcheck disable=SC2086
+    set -- $FILTER_GATE_NEXTEST_CONFIGS
+  elif [ "$MODE" = "--selected" ]; then
     # The disk, not the index, and untracked files count: the same tree nextest answers from.
-    config_specs=$(
+    # shellcheck disable=SC2046
+    set -- $(
       { git ls-files -- '.config/nextest.toml' '*/.config/nextest.toml'
         git ls-files --others --exclude-standard -- '.config/nextest.toml' '*/.config/nextest.toml'
       } | sort -u | while IFS= read -r cfg; do
@@ -47,8 +62,8 @@ if [ "$MODE" = "--selected" ]; then
       done
     )
   fi
-  # shellcheck disable=SC2086
-  exec python3 - "$CI" $config_specs <<'PY'
+  exec python3 - "$MODE" "$CI" "$@" <<'PY'
+import collections
 import json
 import os
 import re
@@ -57,9 +72,7 @@ import subprocess
 import sys
 import tomllib
 
-import yaml
-
-workflow, config_specs = sys.argv[1], sys.argv[2:]
+mode, workflow, config_specs = sys.argv[1], sys.argv[2], sys.argv[3:]
 failures = []
 
 
@@ -109,12 +122,40 @@ def split_terms(expr):
     return terms
 
 
+def regex_alternatives(term):
+    """`test(/a|b/)` as `test(/a/)` and `test(/b/)`: one live alternative carries a dead one."""
+    head, _, rest = term.partition("(")
+    body = rest[:-1].strip()
+    if len(body) < 2 or body[0] != "/" or body[-1] != "/":
+        return []
+    body = body[1:-1]
+    alternatives, start, depth, in_class, i = [], 0, 0, False, 0
+    while i < len(body):
+        ch = body[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if in_class:
+            in_class = ch != "]"
+        elif ch == "[":
+            in_class = True
+        elif ch in "()":
+            depth += 1 if ch == "(" else -1
+        elif ch == "|" and depth == 0:
+            alternatives.append(body[start:i])
+            start = i + 1
+        i += 1
+    alternatives.append(body[start:])
+    return [f"{head}(/{alt}/)" for alt in alternatives] if len(alternatives) > 1 else []
+
+
+Listing = collections.namedtuple("Listing", "matched universe suites")
 evaluations = {}
 broken_scopes = {}
 
 
 def select(scope, expr):
-    """(count, None), or (None, reason) when nextest could not answer."""
+    """(Listing, None), or (None, reason) when nextest could not answer."""
     key = (tuple(scope), expr)
     if key in evaluations:
         return evaluations[key]
@@ -139,50 +180,73 @@ def select(scope, expr):
         suites = json.loads(listing.stdout)["rust-suites"]
         if not suites:
             raise ValueError("no test binary listed")
-        statuses = [
-            case["filter-match"]["status"]
-            for suite in suites.values()
-            for case in suite["testcases"].values()
-        ]
-        unknown = set(statuses) - {"matches", "mismatch"}
-        if unknown:
-            raise ValueError(f"unknown filter-match status {sorted(unknown)}")
-        evaluations[key] = (statuses.count("matches"), None)
+        matched, universe, shapes = set(), set(), {}
+        for binary_id, suite in suites.items():
+            shapes[binary_id] = (suite["package-name"], suite["binary-name"], suite["kind"])
+            for name, case in suite["testcases"].items():
+                status = case["filter-match"]["status"]
+                if status not in ("matches", "mismatch"):
+                    raise ValueError(f"unknown filter-match status {status!r}")
+                universe.add((binary_id, name))
+                if status == "matches":
+                    matched.add((binary_id, name))
+        evaluations[key] = (Listing(frozenset(matched), frozenset(universe), shapes), None)
     except (KeyError, TypeError, ValueError) as drift:
         evaluations[key] = (None, f"nextest list JSON is not the shape this gate reads: {drift!r}")
     return evaluations[key]
 
 
-def check_declaration(where, scope, expr):
+def selected(scopes, expr):
+    """What `expr` selects across every scope, or (None, reason)."""
+    matched = set()
+    for scope in scopes:
+        listing, reason = select(scope, expr)
+        if reason:
+            return None, reason
+        matched |= listing.matched
+    return matched, None
+
+
+DEAD = {
+    "FILTER": "0 tests selected. Whatever this declaration configures, it configures for no test.",
+    "FILTER TERM": "The rest of the filter still matches, so the lane stays green while this term is dead.",
+    "FILTER ALTERNATIVE": "The other alternatives still match, so the regex reads as live while this one is dead.",
+}
+
+
+def check_declaration(where, scopes_by_profile, expr):
+    """Every profile the declaration applies in must select a test for it, each of its terms and
+    each top-level alternative of a regex term."""
     try:
         terms = split_terms(expr)
     except ValueError as unreadable:
         fail(f"FILTER NOT EVALUATED: {where}", f"filter: {expr}", f"cannot split it into terms: {unreadable}")
         return
-    count, reason = select(scope, expr)
-    if reason:
-        fail(f"FILTER NOT EVALUATED: {where}", f"filter: {expr}", reason)
-        return
-    print(f"{count:6d}  {where}")
-    if count == 0:
-        fail(
-            f"FILTER SELECTS NOTHING: {where}",
-            f"filter: {expr}",
-            "0 tests selected. Whatever this declaration configures, it configures for no test.",
-        )
-        return
-    if terms == [expr.strip()]:
-        return
-    for term in terms:
-        count, reason = select(scope, term)
+    pieces = [("FILTER", expr)]
+    if terms != [expr.strip()]:
+        pieces += [("FILTER TERM", term) for term in terms]
+    pieces += [("FILTER ALTERNATIVE", alt) for term in terms for alt in regex_alternatives(term)]
+    for kind, piece in pieces:
+        label = kind.split()[-1].lower()
+        counts, reason = {}, None
+        for profile, scopes in scopes_by_profile.items():
+            matched, reason = selected(scopes, piece)
+            if reason:
+                break
+            counts[profile] = len(matched)
         if reason:
-            fail(f"FILTER TERM NOT EVALUATED: {where}", f"term: {term}", reason)
-        elif count == 0:
-            fail(
-                f"FILTER TERM SELECTS NOTHING: {where}",
-                f"term: {term}",
-                "The rest of the filter still matches, so the lane stays green while this term is dead.",
-            )
+            fail(f"{kind} NOT EVALUATED: {where}", f"{label}: {piece}", reason)
+            if kind == "FILTER":
+                return
+            continue
+        dead = [profile for profile, count in counts.items() if count == 0]
+        if kind == "FILTER":
+            print(f"{min(counts.values()):6d}  {where}")
+        if dead:
+            suffix = f" (profile {', '.join(dead)})" if any(dead) else ""
+            fail(f"{kind} SELECTS NOTHING: {where}{suffix}", f"{label}: {piece}", DEAD[kind])
+            if kind == "FILTER":
+                return
 
 
 def declared_filters(node, trail):
@@ -197,44 +261,223 @@ def declared_filters(node, trail):
             yield from declared_filters(value, trail + [index])
 
 
-def check_nextest_config(config, manifest):
-    try:
-        with open(config, "rb") as handle:
-            document = tomllib.load(handle)
-        with open(manifest, "rb") as handle:
-            cargo_profiles = tomllib.load(handle).get("profile") or {}
-    except (OSError, tomllib.TOMLDecodeError) as unreadable:
-        fail(f"CONFIG NOT READ: {config} (workspace {manifest})", repr(unreadable))
-        return
-    # the adapter defines ci-test and CI tests it under nothing else; the root workspace has only dev
-    cargo_profile = ["--cargo-profile", "ci-test"] if "ci-test" in cargo_profiles else []
-    declarations = list(declared_filters(document, []))
-    groups = set(document.get("test-groups") or {})
-    # so a log shows what discovery reached; a config it never opened would otherwise read as clean
-    print(f"        {config}: {len(declarations)} filter declaration(s), {len(groups)} test group(s)")
-    for trail, expr, owner in declarations:
-        where = f"{config} " + ".".join(str(part) for part in trail)
-        if "test-group" in owner:
-            where += f" (test-group {owner['test-group']})"
-        if not isinstance(expr, str):
-            fail(f"FILTER NOT EVALUATED: {where}", f"not a string: {expr!r}")
+SPAWNS = re.compile(r"CARGO_BIN_EXE_|current_exe\(\)")
+KILLS = re.compile(r"(?:\.|::)kill\s*\(")
+RAW_STRING = re.compile(r'(?<![A-Za-z0-9_])b?r(#*)"')
+DROP_IMPL = re.compile(r"\bimpl\b[^{;]*?\bDrop\s+for\b[^{;]*\{")
+MOD_DECL = re.compile(r"((?:#\[[^\]]*\]\s*)*)(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;")
+PATH_ATTR = re.compile(r'#\[\s*path\s*=\s*"([^"]+)"\s*\]')
+
+
+def masked(text, strings):
+    """Comments blanked, and string and char literals too when `strings`; offsets kept."""
+    out, i, n = list(text), 0, len(text)
+
+    def blank(start, end):
+        for k in range(start, min(end, n)):
+            if out[k] != "\n":
+                out[k] = " "
+
+    while i < n:
+        raw = RAW_STRING.match(text, i) if text[i] in "br" else None
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            end = n if end < 0 else end
+            blank(i, end)
+        elif text.startswith("/*", i):
+            depth, end = 1, i + 2
+            while end < n and depth:
+                step = text[end : end + 2]
+                depth += 1 if step == "/*" else -1 if step == "*/" else 0
+                end += 2 if step in ("/*", "*/") else 1
+            blank(i, end)
+        elif raw:
+            close = text.find('"' + raw.group(1), raw.end())
+            end = n if close < 0 else close + 1 + len(raw.group(1))
+            if strings:
+                blank(raw.end(), end)
+        elif text[i] == '"':
+            end = i + 1
+            while end < n and text[end] != '"':
+                end += 2 if text[end] == "\\" else 1
+            end += 1
+            if strings:
+                blank(i + 1, end - 1)
+        elif text[i] == "'" and (text[i + 1 : i + 2] == "\\" or text[i + 2 : i + 3] == "'"):
+            close = text.find("'", i + 3 if text[i + 1] == "\\" else i + 2)
+            end = n if close < 0 else close + 1
+            if strings:
+                blank(i + 1, end - 1)
+        else:
+            end = i + 1
+        i = end
+    return "".join(out)
+
+
+def without_drop_impls(code):
+    """A kill in `impl Drop` reaps a child at teardown; it races nothing."""
+    out = list(code)
+    for impl in DROP_IMPL.finditer(code):
+        depth, end = 1, impl.end()
+        while end < len(code) and depth:
+            depth += {"{": 1, "}": -1}.get(code[end], 0)
+            end += 1
+        out[impl.start() : end] = " " * (end - impl.start())
+    return "".join(out)
+
+
+def source_files(root):
+    """A target's root file and every file its `mod` declarations load."""
+    files, queue = [], [(root, os.path.dirname(root))]
+    while queue:
+        path, base = queue.pop()
+        if path in files:
             continue
-        profile = trail[1] if trail[0] == "profile" and len(trail) > 2 else "default"
-        # the widest universe nextest can be asked for: dead here is dead in every lane
-        scope = ["--manifest-path", manifest, "--config-file", config, "--profile", profile,
-                 *cargo_profile, "--all-targets", "--run-ignored", "all"]
-        check_declaration(where, scope, expr)
-    assigned = {
-        override["test-group"]
-        for profile in (document.get("profile") or {}).values()
-        for override in profile.get("overrides") or []
-        if "test-group" in override
-    }
-    for group in sorted(groups - assigned):
-        fail(
-            f"TEST GROUP HOLDS NOTHING: {config} test-groups.{group}",
-            "No override assigns a test to it, so its limits apply to no test.",
-        )
+        files.append(path)
+        with open(path, encoding="utf-8") as handle:
+            code = masked(handle.read(), strings=False)
+        for decl in MOD_DECL.finditer(code):
+            attr = PATH_ATTR.search(decl.group(1))
+            if attr:
+                child = os.path.normpath(os.path.join(os.path.dirname(path), attr.group(1)))
+                queue.append((child, os.path.dirname(child)))
+                continue
+            for child, child_base in ((os.path.join(base, decl.group(2) + ".rs"), os.path.join(base, decl.group(2))),
+                                      (os.path.join(base, decl.group(2), "mod.rs"), os.path.join(base, decl.group(2)))):
+                if os.path.isfile(child):
+                    queue.append((child, child_base))
+                    break
+    return files
+
+
+def spawns_and_kills(root):
+    spawn = kill = False
+    for path in source_files(root):
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        spawn = spawn or bool(SPAWNS.search(masked(text, strings=False)))
+        kill = kill or bool(KILLS.search(without_drop_impls(masked(text, strings=True))))
+    return spawn and kill
+
+
+def spawn_and_kill_targets(manifest):
+    """Test and bench targets whose sources run a cargo-built binary and kill it outside a Drop."""
+    meta = subprocess.run(
+        ["cargo", "metadata", "--no-deps", "--format-version", "1", "--manifest-path", manifest],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    if meta.returncode != 0:
+        raise ValueError(f"cargo metadata exited {meta.returncode}: {meta.stderr.strip()[-300:]}")
+    for package in json.loads(meta.stdout)["packages"]:
+        for target in package["targets"]:
+            kind = next((k for k in target["kind"] if k in ("test", "bench")), None)
+            if kind is not None and spawns_and_kills(target["src_path"]):
+                yield package["name"], target["name"], kind
+
+
+GROUP_HEADER = re.compile(r"group: (\S+) \(max threads = ([^)]+)\)")
+GROUP_OVERRIDE = re.compile(r"  \* override for \S+ profile with filter '.*':")
+GROUP_BINARY = re.compile(r" {6}(\S+):")
+GROUP_TEST = re.compile(r" {10}(\S+)")
+GROUP_EMPTY = "    (no matches)"
+
+
+def group_members(scope):
+    """({group: (max threads, {(binary id, test)})}, None) as nextest assigns them, or (None, reason)."""
+    key = ("show-config", tuple(scope))
+    if key in evaluations:
+        return evaluations[key]
+    shown = subprocess.run(
+        ["cargo", "nextest", "show-config", "test-groups", "--color", "never", "--no-pager", *scope],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    if shown.returncode != 0:
+        tail = " | ".join(shown.stderr.strip().splitlines()[-4:])
+        evaluations[key] = (None, f"cargo nextest show-config test-groups exited {shown.returncode}: {tail}")
+        return evaluations[key]
+    groups, group, binary = {}, None, None
+    for line in shown.stdout.splitlines():
+        header, member = GROUP_HEADER.fullmatch(line), GROUP_TEST.fullmatch(line)
+        if header:
+            group, binary = header.group(1), None
+            threads = header.group(2)
+            groups[group] = (int(threads) if threads.isdigit() else threads, set())
+        elif group and (GROUP_OVERRIDE.fullmatch(line) or line == GROUP_EMPTY):
+            binary = None
+        elif group and GROUP_BINARY.fullmatch(line):
+            binary = GROUP_BINARY.fullmatch(line).group(1)
+        elif group and binary and member:
+            groups[group][1].add((binary, member.group(1)))
+        elif line.strip():
+            evaluations[key] = (None, f"nextest show-config output is not the shape this gate reads: {line!r}")
+            return evaluations[key]
+    evaluations[key] = (groups, None)
+    return evaluations[key]
+
+
+def check_groups(config, document, scopes_by_profile, manifest):
+    """Membership as nextest reports it, in every profile: a declared group holds a test, a
+    serialising group holds more tests than it admits at once, and every test of a spawn-and-kill
+    target sits in a max-threads = 1 group."""
+    declared = sorted(document.get("test-groups") or {})
+    try:
+        killers = sorted(set(spawn_and_kill_targets(manifest)))
+    except (OSError, KeyError, ValueError) as unreadable:
+        fail(f"SPAWN AND KILL TARGETS NOT READ: {config} (workspace {manifest})", repr(unreadable))
+        return
+    if not declared and not killers:
+        return
+    held, small, loose, listed = set(), collections.defaultdict(list), collections.defaultdict(list), set()
+    for profile, scopes in scopes_by_profile.items():
+        limit, group_of, universe, shapes = {}, {}, set(), {}
+        for scope in scopes:
+            if killers:
+                listing, reason = select(scope, "all()")
+                if reason:
+                    fail(f"TEST GROUP NOT EVALUATED: {config} (profile {profile})", reason)
+                    return
+                universe |= listing.universe
+                shapes.update(listing.suites)
+            if declared:
+                groups, reason = group_members(scope)
+                if reason:
+                    fail(f"TEST GROUP NOT EVALUATED: {config} (profile {profile})", reason)
+                    return
+                for group, (threads, members) in groups.items():
+                    limit[group] = threads
+                    group_of.update(dict.fromkeys(members, group))
+        for group in declared:
+            size = sum(1 for owner in group_of.values() if owner == group)
+            if size:
+                held.add(group)
+            if isinstance(limit.get(group), int) and 0 < size <= limit[group]:
+                small[group].append(f"profile {profile}: {size} test(s) against max-threads = {limit[group]}")
+        for target in killers:
+            tests = sorted(t for t in universe if shapes[t[0]] == target)
+            if tests:
+                listed.add(target)
+            outside = [t[1] for t in tests if limit.get(group_of.get(t)) != 1]
+            if outside:
+                loose[target].append(f"profile {profile}: {', '.join(outside)}")
+    for group in declared:
+        if group not in held:
+            fail(f"TEST GROUP HOLDS NOTHING: {config} test-groups.{group}",
+                 "nextest assigns it no test in any profile, so its limits apply to no test.")
+    for group, detail in sorted(small.items()):
+        fail(f"TEST GROUP CONSTRAINS NOTHING: {config} test-groups.{group}", *detail,
+             "A group that never holds more tests than it admits at once serialises nothing.")
+    for package, name, kind in killers:
+        if (package, name, kind) not in listed:
+            fail(f"SPAWN AND KILL TARGET NOT LISTED: {config} {package}::{name}",
+                 f"{kind} target spawns a cargo-built binary and kills it, and no scope this gate lists holds a test from it.")
+        elif (package, name, kind) in loose:
+            fail(f"SPAWN AND KILL TEST NOT SERIALISED: {config} {package}::{name}",
+                 *loose[(package, name, kind)],
+                 "It spawns a cargo-built binary and kills it, outside every max-threads = 1 group.")
 
 
 FILTER_FLAGS = {"-E", "--filterset", "--filter-expr"}
@@ -299,14 +542,70 @@ def workflow_lanes(document):
                         yield lane, scope, expr
 
 
-if not config_specs:
-    fail("NO NEXTEST CONFIG FOUND", "Discovery returned nothing; both workspaces are known to carry one.")
-for spec in config_specs:
-    config, separator, manifest = spec.partition("=")
-    if not separator or not os.path.isfile(config) or not os.path.isfile(manifest):
-        fail(f"CONFIG NOT READ: {spec}", "Expected config=manifest, both existing files.")
-        continue
-    check_nextest_config(config, manifest)
+def feature_variants(manifest, lanes):
+    """The package and feature selections the workflow builds this workspace with, plus none."""
+    variants = {()}
+    for _lane, scope, _expr in lanes:
+        flags, lane_manifest, i = [], "Cargo.toml", 0
+        while i < len(scope):
+            if scope[i] == "--manifest-path":
+                lane_manifest = scope[i + 1]
+            if scope[i] in ("-p", "--package", "--features"):
+                flags += scope[i : i + 2]
+            elif scope[i] in ("--all-features", "--no-default-features"):
+                flags.append(scope[i])
+            i += 2 if scope[i] in SCOPE_VALUE_FLAGS else 1
+        if os.path.normpath(lane_manifest) != os.path.normpath(manifest):
+            continue
+        if {"--features", "--all-features", "--no-default-features"} & set(flags):
+            variants.add(tuple(flags))
+    return sorted(variants)
+
+
+def check_nextest_config(config, manifest, lanes):
+    try:
+        with open(config, "rb") as handle:
+            document = tomllib.load(handle)
+        with open(manifest, "rb") as handle:
+            cargo_profiles = tomllib.load(handle).get("profile") or {}
+    except (OSError, tomllib.TOMLDecodeError) as unreadable:
+        fail(f"CONFIG NOT READ: {config} (workspace {manifest})", repr(unreadable))
+        return
+    # the adapter defines ci-test and CI tests it under nothing else; the root workspace has only dev
+    cargo_profile = ["--cargo-profile", "ci-test"] if "ci-test" in cargo_profiles else []
+    declarations = list(declared_filters(document, []))
+    groups = set(document.get("test-groups") or {})
+    profiles = ["default", *sorted(set(document.get("profile") or {}) - {"default"})]
+    variants = feature_variants(manifest, lanes)
+    # the widest universe nextest can be asked for, per profile: dead here is dead in every lane
+    scopes_by_profile = {
+        profile: [["--manifest-path", manifest, "--config-file", config, "--profile", profile,
+                   *cargo_profile, *variant, "--all-targets", "--run-ignored", "all"] for variant in variants]
+        for profile in profiles
+    }
+    # so a log shows what discovery reached; a config it never opened would otherwise read as clean
+    print(f"        {config}: {len(declarations)} filter declaration(s), {len(groups)} test group(s), "
+          f"profiles {', '.join(profiles)}, {len(variants)} feature scope(s)")
+    for trail, expr, owner in declarations:
+        where = f"{config} " + ".".join(str(part) for part in trail)
+        if "test-group" in owner:
+            where += f" (test-group {owner['test-group']})"
+        if not isinstance(expr, str):
+            fail(f"FILTER NOT EVALUATED: {where}", f"not a string: {expr!r}")
+            continue
+        owner_profile = trail[1] if trail[0] == "profile" and len(trail) > 2 else "default"
+        # the default profile's overrides are nextest's fallback in every other profile
+        applies = profiles if owner_profile == "default" else [owner_profile]
+        check_declaration(where, {profile: scopes_by_profile[profile] for profile in applies}, expr)
+    check_groups(config, document, scopes_by_profile, manifest)
+
+
+if mode == "--spawn-and-kill":
+    for root in config_specs:
+        print(f"{'spawns and kills' if spawns_and_kills(root) else 'does not'}: {root}")
+    sys.exit(0)
+
+import yaml  # not above: --spawn-and-kill runs in the hygiene job, which needs no PyYAML
 
 try:
     with open(workflow, encoding="utf-8") as handle:
@@ -316,8 +615,18 @@ try:
 except (OSError, KeyError, ValueError, yaml.YAMLError) as unreadable:
     lanes = []
     fail(f"WORKFLOW NOT READ: {workflow}", f"{unreadable}")
+
+if not config_specs:
+    fail("NO NEXTEST CONFIG FOUND", "Discovery returned nothing; both workspaces are known to carry one.")
+for spec in config_specs:
+    config, separator, manifest = spec.partition("=")
+    if not separator or not os.path.isfile(config) or not os.path.isfile(manifest):
+        fail(f"CONFIG NOT READ: {spec}", "Expected config=manifest, both existing files.")
+        continue
+    check_nextest_config(config, manifest, lanes)
+
 for lane, scope, expr in lanes:
-    check_declaration(f"{workflow} {lane}", scope, expr)
+    check_declaration(f"{workflow} {lane}", {"": [scope]}, expr)
 
 for failure in failures:
     print(failure, file=sys.stderr)

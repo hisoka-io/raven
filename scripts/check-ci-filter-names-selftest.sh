@@ -16,15 +16,24 @@ if [ "${1:-}" = "--selected" ]; then
   real_configs=".config/nextest.toml=Cargo.toml ${adapter}=adapters/railgun/Cargo.toml"
   fails=0
 
-  # One red run carries all four plants - each gate run lists every binary ~40 times - and each
-  # headline is asserted by itself, so one check going quiet cannot hide behind the other three.
-  sed 's/^\[test-groups\]$/[test-groups]\nplanted-empty-group = { max-threads = 1 }/' "$adapter" \
-    > "$scratch/nextest.toml"
+  # One red run carries all seven plants - each gate run lists every binary ~80 times - and each
+  # headline is asserted by itself, so one check going quiet cannot hide behind the other six.
+  # The chaos group loses wal_chaos_layer_b: the regression the group exists to prevent.
+  sed -e 's/^\[test-groups\]$/[test-groups]\nplanted-empty-group = { max-threads = 1 }\nplanted-single-group = { max-threads = 1 }/' \
+      -e 's/ + binary(wal_chaos_layer_b)"$/"/' "$adapter" > "$scratch/nextest.toml"
+  if cmp -s "$adapter" "$scratch/nextest.toml" || /usr/bin/grep -q 'binary(wal_chaos_layer_b)' "$scratch/nextest.toml"; then
+    echo "SELFTEST CANNOT RUN: the plants no longer apply to ${adapter}" >&2
+    exit 1
+  fi
   cat >> "$scratch/nextest.toml" <<'PLANT'
 
 [[profile.default.overrides]]
 filter = "test(/no_such_test_planted/)"
 retries = 0
+
+[[profile.default.overrides]]
+filter = "test(=bootstrap_concurrent_run_lock_contention)"
+test-group = "planted-single-group"
 PLANT
   cp .github/workflows/ci.yml "$scratch/ci.yml"
   cat >> "$scratch/ci.yml" <<'PLANT'
@@ -36,9 +45,13 @@ PLANT
     runs-on: ubuntu-latest
     steps:
       - run: cargo nextest run --manifest-path adapters/railgun/Cargo.toml --cargo-profile ci-test -E "$FILTER"
+  planted-dead-alternative:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo nextest run --manifest-path adapters/railgun/Cargo.toml --cargo-profile ci-test -E 'test(/kill_during_spawn|no_such_alternative_planted/)'
 PLANT
 
-  echo "check-ci-filter-names-selftest.sh --selected: four plants the gate must name, then the control"
+  echo "check-ci-filter-names-selftest.sh --selected: seven plants the gate must name, then the control"
   red=$(FILTER_GATE_WORKFLOW="$scratch/ci.yml" \
         FILTER_GATE_NEXTEST_CONFIGS=".config/nextest.toml=Cargo.toml $scratch/nextest.toml=adapters/railgun/Cargo.toml" \
         bash scripts/check-ci-filter-names.sh --selected 2>&1 > /dev/null)
@@ -59,11 +72,14 @@ FILTER SELECTS NOTHING: $scratch/nextest.toml profile.default.overrides
 TEST GROUP HOLDS NOTHING: $scratch/nextest.toml test-groups.planted-empty-group
 FILTER TERM SELECTS NOTHING: $scratch/ci.yml planted-dead-regex-term
 FILTER NOT EVALUATED: $scratch/ci.yml planted-shell-variable-filter
+FILTER ALTERNATIVE SELECTS NOTHING: $scratch/ci.yml planted-dead-alternative
+TEST GROUP CONSTRAINS NOTHING: $scratch/nextest.toml test-groups.planted-single-group
+SPAWN AND KILL TEST NOT SERIALISED: $scratch/nextest.toml raven-railgun-persistence::wal_chaos_layer_b
 EXPECTED
-  # exactly the four: a gate that fails everything would name them too
+  # exactly the seven: a gate that fails everything would name them too
   named=$(/usr/bin/grep -cE '^[A-Z][A-Z ]+: ' <<< "$red" || true)
-  if [ "$named" -ne 4 ]; then
-    echo "SELFTEST FAIL: expected exactly 4 failures from 4 plants, the gate reported ${named}" >&2
+  if [ "$named" -ne 7 ]; then
+    echo "SELFTEST FAIL: expected exactly 7 failures from 7 plants, the gate reported ${named}" >&2
     printf '%s\n' "$red" >&2
     fails=1
   fi
@@ -109,7 +125,7 @@ expect_fail() {
   cp "$BAK" "$CI"
 }
 
-echo "check-ci-filter-names-selftest.sh: six cases the gate must fail on"
+echo "check-ci-filter-names-selftest.sh: six cases the gate must fail on, then the classifier fixtures"
 
 sed -i 's/test(insert_rejects_overflow_past_capacity)/test(insert_rejects_overflow_past_capacity_RENAMED)/' "$CI"
 expect_fail "a test() term renamed to a nonexistent test (uppercase in the name)"
@@ -134,6 +150,27 @@ expect_fail "a workspace member named only outside the fmt and test jobs"
 rm -f "$VICTIM"
 expect_fail "a binary() whose file is deleted in the working tree but still in the index"
 cp "$VBAK" "$VICTIM"
+
+# The spawn-and-kill classifier --selected uses, on fixtures: every verdict must match.
+fixtures=scripts/fixtures/check-ci-filter-names/spawn-and-kill
+expected="spawns and kills: ${fixtures}/drop-then-kill.rs
+does not: ${fixtures}/kill-in-comment-and-string.rs
+spawns and kills: ${fixtures}/kills-in-module.rs
+spawns and kills: ${fixtures}/kills-in-test.rs
+does not: ${fixtures}/kills-only-in-drop.rs
+does not: ${fixtures}/kills-without-spawn.rs
+spawns and kills: ${fixtures}/path-module.rs
+does not: ${fixtures}/spawn-named-only-in-comment.rs"
+roots=$(sed -E 's/^[a-z ]+: //' <<< "$expected")
+# shellcheck disable=SC2086
+got=$(bash scripts/check-ci-filter-names.sh --spawn-and-kill $roots 2>&1)
+if [ "$got" = "$expected" ]; then
+  echo "  ok: spawn-and-kill classifier -> all $(wc -l <<< "$expected") fixture verdicts"
+else
+  echo "SELFTEST FAIL: the spawn-and-kill classifier disagrees with its fixtures" >&2
+  diff <(printf '%s\n' "$expected") <(printf '%s\n' "$got") >&2
+  fails=1
+fi
 
 # And the control: unmutated, the gate must PASS. A gate that always fails is not a gate.
 bash scripts/check-ci-filter-names.sh > /dev/null 2>&1

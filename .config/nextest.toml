@@ -16,15 +16,3 @@ final-status-level = "fail"
 failure-output = "final"
 success-output = "never"
 slow-timeout = { period = "120s", terminate-after = 3 }
-
-# serialize tests that take an flock: one at a time
-[test-groups]
-flock-tests = { max-threads = 1 }
-
-[[profile.default.overrides]]
-filter = "test(/flock|lock_held|concurrent_run_lock|lock_contention/)"
-test-group = "flock-tests"
-
-[[profile.ci.overrides]]
-filter = "test(/flock|lock_held|concurrent_run_lock|lock_contention/)"
-test-group = "flock-tests"

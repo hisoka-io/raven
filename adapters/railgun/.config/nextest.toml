@@ -26,24 +26,14 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 inherits = "ci"
 slow-timeout = { period = "300s", terminate-after = 4 }
 
-# serialize tests that contend on shared global resources (child binary,
-# port binds, /tmp dirs, flock on a shared data_dir): one at a time
+# One at a time: every test in a target that spawns a cargo-built child and kills it outside
+# `impl Drop` (a Drop kill is teardown). Each such kill races a wall clock (a sleep, or a sentinel
+# read under a timeout) against the child's progress, and a loaded box moves one against the other.
+# The default profile's overrides apply in every profile. `check-ci-filter-names.sh --selected`
+# fails when a test of such a target is outside this group.
 [test-groups]
 chaos-subprocess = { max-threads = 1 }
-flock-tests = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = "test(/chaos|kill_during|sigkill|migrate_chaos|auto_spawn_chaos|snapshot_chaos|fork_and_kill|chaos_child|drain_wal_on_sigterm/)"
+filter = "binary(auto_spawn_races) + binary(migrate_encoder_real_sigkill) + binary(snapshot_chaos_save_two_rename) + binary(wal_chaos_layer_b)"
 test-group = "chaos-subprocess"
-
-[[profile.default.overrides]]
-filter = "test(/flock|lock_held|concurrent_run_lock|lock_contention/)"
-test-group = "flock-tests"
-
-[[profile.ci.overrides]]
-filter = "test(/chaos|kill_during|sigkill|migrate_chaos|auto_spawn_chaos|snapshot_chaos|fork_and_kill|chaos_child|drain_wal_on_sigterm/)"
-test-group = "chaos-subprocess"
-
-[[profile.ci.overrides]]
-filter = "test(/flock|lock_held|concurrent_run_lock|lock_contention/)"
-test-group = "flock-tests"
