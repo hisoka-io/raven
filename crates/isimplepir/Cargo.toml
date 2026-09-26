@@ -81,9 +81,6 @@ uninlined_format_args = "allow"
 # Errors
 thiserror = "2"
 
-# Byte containers
-bytes = "1"
-
 # PRG / seeding (WASM-compatible stable-Rust)
 rand_core = { version = "0.9", default-features = false }
 rand_chacha = { version = "0.9", default-features = false }

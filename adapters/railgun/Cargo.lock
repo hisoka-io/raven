@@ -763,9 +763,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arc-swap"
@@ -3654,17 +3654,13 @@ name = "raven-inspire"
 version = "0.1.0-alpha.0"
 dependencies = [
  "bincode",
- "byteorder",
  "getrandom 0.2.17",
- "hex",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
  "rayon",
  "serde",
  "serde_json",
  "subtle",
- "tiny-keccak",
- "tracing",
 ]
 
 [[package]]
@@ -3801,7 +3797,6 @@ dependencies = [
  "subtle",
  "thiserror 2.0.18",
  "tokio",
- "tokio-stream",
  "tower",
  "tower-http",
  "tower_governor",
