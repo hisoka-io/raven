@@ -8,6 +8,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { RavenPOINodeInterface } from "../src/index";
 import { startMockServer, writeJson, type MockServer } from "./helpers/mock_server";
+import { ppoiTree } from "./helpers/ppoi_tree";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX = "abababababababababababababababababababababababababababababababab";
@@ -16,13 +17,14 @@ function bcAt(idx: number): string {
   return idx.toString(16).padStart(2, "0").repeat(32);
 }
 
-function leafProof(leaf: string) {
-  return {
-    leaf,
-    elements: Array.from({ length: 16 }, (_, j) => j.toString(16).padStart(2, "0").repeat(32)),
-    indices: "0x00",
-    root: "ff".repeat(32),
-  };
+/** The plaintext route does not say which block a proof is in, so its root must be pinned. */
+function pinnedSdk(endpoint: string, root: string): RavenPOINodeInterface {
+  return new RavenPOINodeInterface({
+    endpoint,
+    bearerToken: TOKEN,
+    useClientPir: false,
+    ppoiPinnedRoots: new Map([[`${LIST_KEY_HEX}:0`, root]]),
+  });
 }
 
 describe("multi-input spend support", () => {
@@ -43,20 +45,17 @@ describe("multi-input spend support", () => {
   for (const n of [1, 2, 4, 13]) {
     it(`N=${n}: SDK fetches ${n} PPOI proofs in one call`, async () => {
       const bcs = Array.from({ length: n }, (_, i) => bcAt(i + 1));
+      const tree = ppoiTree(bcs);
       server.route(
         (req) => req.url === "/v1/poi/merkle-proofs",
         (_req, body, res) => {
           const decoded = JSON.parse(new TextDecoder().decode(body));
           expect(decoded.blindedCommitments).toHaveLength(n);
-          writeJson(res, bcs.map(leafProof));
+          writeJson(res, tree.proofs);
           return true;
         },
       );
-      const sdk = new RavenPOINodeInterface({
-        endpoint: server.url,
-        bearerToken: TOKEN,
-        useClientPir: false,
-      });
+      const sdk = pinnedSdk(server.url, tree.root);
       const proofs = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, bcs);
       expect(proofs).toHaveLength(n);
       proofs.forEach((p, i) => expect(p.leaf).toBe(bcs[i]));
@@ -67,18 +66,15 @@ describe("multi-input spend support", () => {
     // 13 = upstream circuitConfigs.js cap; the SDK does not enforce it, only round-trips it
     const n = 13;
     const bcs = Array.from({ length: n }, (_, i) => bcAt(i + 1));
+    const tree = ppoiTree(bcs);
     server.route(
       (req) => req.url === "/v1/poi/merkle-proofs",
       (_req, _body, res) => {
-        writeJson(res, bcs.map(leafProof));
+        writeJson(res, tree.proofs);
         return true;
       },
     );
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: false,
-    });
+    const sdk = pinnedSdk(server.url, tree.root);
     const proofs = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, bcs);
     expect(proofs).toHaveLength(13);
   });
@@ -86,9 +82,9 @@ describe("multi-input spend support", () => {
   it("cross-tree spend: 3 commit-tree proofs each from a different tree", async () => {
     // one proof per UTXO, each dispatched to its tree-specific commit-tree route
     const inputs = [
-      { tree: 0, leafIndex: 100, expectedRoot: "aa".repeat(32) },
-      { tree: 2, leafIndex: 5_000, expectedRoot: "bb".repeat(32) },
-      { tree: 3, leafIndex: 75, expectedRoot: "cc".repeat(32) },
+      { tree: 0, leafIndex: 100, sibling: "aa".repeat(32) },
+      { tree: 2, leafIndex: 5_000, sibling: "bb".repeat(32) },
+      { tree: 3, leafIndex: 75, sibling: "cc".repeat(32) },
     ];
     for (const inp of inputs) {
       server.route(
@@ -96,9 +92,9 @@ describe("multi-input spend support", () => {
         (_req, _body, res) => {
           writeJson(res, {
             leaf: bcAt(inp.tree + 1),
-            elements: Array.from({ length: 16 }, () => "00".repeat(32)),
+            elements: Array.from({ length: 16 }, () => inp.sibling),
             indices: `0x${inp.leafIndex.toString(16)}`,
-            root: inp.expectedRoot,
+            root: "dd".repeat(32),
           });
           return true;
         },
@@ -114,8 +110,8 @@ describe("multi-input spend support", () => {
     );
     expect(proofs).toHaveLength(3);
     proofs.forEach((p, i) => {
-      if (p.kind !== "rooted") throw new Error(`expected a rooted proof, got kind=${p.kind}`);
-      expect(p.proof.root).toBe(inputs[i].expectedRoot);
+      expect(p.elements).toStrictEqual(Array.from({ length: 16 }, () => inputs[i].sibling));
+      expect(p.indices).toBe(inputs[i].leafIndex.toString(16).padStart(64, "0"));
     });
     const wires = sdk.lastWireRequests();
     expect(wires.length).toBe(3);

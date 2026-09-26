@@ -3,12 +3,13 @@
 
 import { afterEach, beforeAll, describe, expect, it, afterAll } from "vitest";
 
-import { RavenPOINodeInterface, containsByteSequence } from "../src/index";
+import { RavenPOINodeInterface, containsByteSequence, paddedBatchLength } from "../src/index";
 import type { ClientPirContext } from "../src/index";
 
 import { loadFixture, makeClientPirContext } from "./helpers/fixture";
 import { encodeBatchResponseNodes, encodedBatchCount } from "./helpers/auth_path_stub";
 import { startMockServer, writeBinary, writeJson, type MockServer } from "./helpers/mock_server";
+import { mountPrefixChannel } from "./helpers/prefix_channel";
 import {
   assertNoCommitmentsInPirRequests,
   inspectPirDataPosts,
@@ -141,15 +142,22 @@ describe("privacy across every SDK call path", () => {
       await sdk.getPOIMerkleProofs(fixture.meta.list_key_hex, queriedBcs);
     } catch {
     }
+    // One 512 B path-10 row replaced sixteen 32 B node reads, and the K rows for one block now
+    // travel as ONE padded batch. The detection is below, not here: `assertNoCommitmentsInPirRequests`
+    // compares this against the count encoded in the request body, and `toHaveLength(1)` pins that
+    // there is a single request. A regression to one batch per commitment reds both. (An earlier
+    // version added an `expect(expectedQueryCount).toBeGreaterThan(1)` guard here and claimed it
+    // caught the regression -- it could not: the value is computed from the ladder alone and never
+    // observes the SDK, so it reduced to `expect(8).toBeGreaterThan(1)`.)
+    const expectedQueryCount = paddedBatchLength(queriedBcs.length);
     expect(
       assertNoCommitmentsInPirRequests(sdk.lastWireRequests(), queriedBcs, {
-        // One 512 B path-10 row replaced sixteen 32 B node reads.
-        expectedQueryCount: 1,
+        expectedQueryCount,
       }),
     ).toHaveLength(1);
     expect(
       assertNoCommitmentsInPirRequests(server.requests, queriedBcs, {
-        expectedQueryCount: 1,
+        expectedQueryCount,
       }),
     ).toHaveLength(1);
   });
@@ -206,10 +214,10 @@ describe("privacy across every SDK call path", () => {
     }
   });
 
-  // D4 / DH-L0-6: the number of request envelopes must not reveal how many supplied
+  // The number of request envelopes must not reveal how many supplied
   // commitments are members of the list.
   it(
-    "T1 outbound request count is independent of list membership (D4 / DH-L0-6)",
+    "T1 outbound request count is independent of list membership",
     async () => {
       const lk = fixture.meta.list_key_hex;
       const memberBcs = fixture.meta.target_indices
@@ -245,6 +253,7 @@ describe("privacy across every SDK call path", () => {
         useClientPir: true,
         clientPirContexts: ctxs,
         bcToIdxMaps: bcMaps,
+        indexStalenessPolicy: "answer-at-index-rows",
       });
       await sdk0.getPOIsPerList(
         [lk],
@@ -259,6 +268,7 @@ describe("privacy across every SDK call path", () => {
         useClientPir: true,
         clientPirContexts: ctxs,
         bcToIdxMaps: bcMaps,
+        indexStalenessPolicy: "answer-at-index-rows",
       });
       await sdk3.getPOIsPerList(
         [lk],
@@ -339,7 +349,7 @@ describe("privacy across every SDK call path", () => {
     ).toThrow(/payload bytes do not divide/);
   });
 
-  it("bc-to-idx-map publishing channel emits a GET with no body", async () => {
+  it("bc-to-idx-map publishing channel emits GETs with no body", async () => {
     server.route(
       (req) => req.url?.endsWith("/bc-to-idx-map") ?? false,
       (_req, _body, res) => {
@@ -351,6 +361,7 @@ describe("privacy across every SDK call path", () => {
         return true;
       },
     );
+    mountPrefixChannel(server, fixture.meta.list_key_hex, { commitments: [] });
     const sdk = new RavenPOINodeInterface({
       endpoint: server.url,
       bearerToken: TOKEN,
@@ -358,9 +369,15 @@ describe("privacy across every SDK call path", () => {
     });
     await sdk.fetchBcToIdxMap(fixture.meta.list_key_hex);
     const wires = sdk.lastWireRequests();
-    expect(wires.length).toBe(1);
-    expect(wires[0].method).toBe("GET");
-    expect(wires[0].body.length).toBe(0);
+    // The prefix channel the map is checked against, read first, then the map.
+    expect(wires.map((w) => w.url.replace(/^.*\/v1\/poi\/[0-9a-f]+\//, ""))).toStrictEqual([
+      "bc-prefixes?since=0",
+      "bc-to-idx-map",
+    ]);
+    for (const wire of wires) {
+      expect(wire.method).toBe("GET");
+      expect(wire.body.length).toBe(0);
+    }
   });
 
   it("status-header publishing channel emits a GET with no body", async () => {

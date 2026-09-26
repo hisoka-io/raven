@@ -51,7 +51,9 @@ function serveRowFor(bc: string): void {
 
 function mountPathRoute(server: MockServer): void {
   server.route(
-    (req) => req.url === `/v1/instance/${PATH10_INSTANCE}/batch`,
+    (req) =>
+      req.url === `/v1/instance/${PATH10_INSTANCE}/batch` ||
+      req.url === `/v1/instance/${PATH10_INSTANCE}-1/batch`,
     (_req, _body, res) => {
       res.writeHead(200, {
         "content-type": "application/octet-stream",
@@ -95,6 +97,7 @@ function newSdk(server: MockServer, cache: ImtCache): RavenPOINodeInterface {
       [`t3CommitTree:${TREE_NUMBER}`, stubCtx()],
       [`t2Path:${LIST_KEY_HEX}`, { ...stubCtx(), entrySize: PATH10_ROW_BYTES }],
     ]),
+    clientPirInstanceLabels: new Map([[`t2Path:${LIST_KEY_HEX}:1`, `${PATH10_INSTANCE}-1`]]),
     bcToIdxMaps: new Map([
       [
         LIST_KEY_HEX,

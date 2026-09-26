@@ -238,6 +238,7 @@ describe("RavenPOINodeInterface privacy invariant", () => {
           new Map(fixture.meta.target_indices.map((idx) => [fixture.meta.bcs_hex[idx], idx])),
         ],
       ]),
+      indexStalenessPolicy: "answer-at-index-rows",
     });
 
     const memberBcs = fixture.meta.target_indices

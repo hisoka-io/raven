@@ -1,29 +1,37 @@
 #!/usr/bin/env bash
 # The sdk-tests lane asserts nothing about how many tests ran: a file that stops being
-# collected — a rename, a bad glob in tests/vitest.config.ts, a describe left as
-# describe.skip — passes as a green lane with less running. This gate pins the counts to
-# tests/EXPECTED_COUNTS.json: `passed` is a floor, `skipped`/`testFiles`/`skippedFiles`
-# are exact (an at-least/at-most pair alone is satisfied by adding a trivial test while
-# a real one disappears; the exact file count is what catches that).
+# collected -- a rename, a bad glob in tests/vitest.config.ts, a describe left as
+# describe.skip -- passes as a green lane with less running. This gate pins the counts to
+# tests/EXPECTED_COUNTS.json, and every count is EXACT. A floor on `passed` lets a new test
+# cover for a deleted one inside the same file, where the file count cannot see it, so any
+# change to the number is a deliberate bump reviewed with the diff that caused it.
+#
+# Overrides, both used by check-sdk-test-count-selftest.sh:
+#   SDK_TEST_COUNT_EXPECTED  counts file (default: tests/EXPECTED_COUNTS.json)
+#   SDK_TEST_COUNT_REPORT    an existing vitest JSON report to judge instead of running the suite
 set -uo pipefail
 
 ADAPTER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SDK="${ADAPTER_ROOT}/sdk"
-EXPECTED="${SDK}/tests/EXPECTED_COUNTS.json"
+EXPECTED="${SDK_TEST_COUNT_EXPECTED:-${SDK}/tests/EXPECTED_COUNTS.json}"
 
 if [[ ! -f "$EXPECTED" ]]; then
   echo "check-sdk-test-count: missing ${EXPECTED}" >&2
   exit 3
 fi
 
-out="$(mktemp)"
-trap 'rm -f "$out"' EXIT
-
-( cd "$SDK" && ./node_modules/.bin/vitest run --config tests/vitest.config.ts --reporter=json >"$out" 2>/dev/null )
-suite_exit=$?
-if [[ "$suite_exit" -ne 0 ]]; then
-  echo "check-sdk-test-count: the suite itself failed (exit ${suite_exit}); fix that first" >&2
-  exit "$suite_exit"
+if [[ -n "${SDK_TEST_COUNT_REPORT:-}" ]]; then
+  out="$SDK_TEST_COUNT_REPORT"
+  [[ -f "$out" ]] || { echo "check-sdk-test-count: missing report ${out}" >&2; exit 3; }
+else
+  out="$(mktemp)"
+  trap 'rm -f "$out"' EXIT
+  ( cd "$SDK" && ./node_modules/.bin/vitest run --config tests/vitest.config.ts --reporter=json >"$out" 2>/dev/null )
+  suite_exit=$?
+  if [[ "$suite_exit" -ne 0 ]]; then
+    echo "check-sdk-test-count: the suite itself failed (exit ${suite_exit}); fix that first" >&2
+    exit "$suite_exit"
+  fi
 fi
 
 node -e '
@@ -45,7 +53,7 @@ const got = {
 };
 // Refuse a vacuous run outright: a glob matching nothing is the failure mode this exists for.
 if (!got.testFiles || !got.passed) {
-  console.error(`check-sdk-test-count: implausible run (files=${got.testFiles}, passed=${got.passed}) — collection is broken`);
+  console.error(`check-sdk-test-count: implausible run (files=${got.testFiles}, passed=${got.passed}) -- collection is broken`);
   process.exit(1);
 }
 let failed = false;
@@ -55,11 +63,11 @@ const check = (name, ok, detail) => {
 };
 check("test files (exact)", got.testFiles === expected.testFiles, `got ${got.testFiles}, expected ${expected.testFiles}`);
 check("skipped files (exact)", got.skippedFiles === expected.skippedFiles, `got ${got.skippedFiles}, expected ${expected.skippedFiles}`);
-check("passed (floor)", got.passed >= expected.passed, `got ${got.passed}, floor ${expected.passed}`);
+check("passed (exact)", got.passed === expected.passed, `got ${got.passed}, expected ${expected.passed}`);
 check("skipped tests (exact)", got.skipped === expected.skipped, `got ${got.skipped}, expected ${expected.skipped}`);
 if (failed) {
-  console.error("check-sdk-test-count: counts drifted — a test file stopped being collected, a describe went .skip, or EXPECTED_COUNTS.json needs a deliberate bump WITH review.");
+  console.error("check-sdk-test-count: counts drifted -- a test file stopped being collected, a describe went .skip, or EXPECTED_COUNTS.json needs a deliberate bump WITH review.");
   process.exit(1);
 }
-console.log(`check-sdk-test-count: ${got.passed} passed / ${got.skipped} skipped across ${got.testFiles} files — matches EXPECTED_COUNTS.json.`);
+console.log(`check-sdk-test-count: ${got.passed} passed / ${got.skipped} skipped across ${got.testFiles} files -- matches EXPECTED_COUNTS.json.`);
 ' "$EXPECTED" "$out"

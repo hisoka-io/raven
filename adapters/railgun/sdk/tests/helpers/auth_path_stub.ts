@@ -9,6 +9,7 @@ import {
 } from "../../src/index";
 import { makeRegisterSpy, stubRemoteSessionExports } from "./register_spy";
 import { stubQueryBundle } from "./private_wire";
+import { shardConfigBincode } from "./shard_config";
 
 export const TOKEN = "test-token-padded-long-enough-1234";
 export const NODE_BYTES = 32;
@@ -51,7 +52,7 @@ export function stubCtx(queryBytes?: Uint8Array): ClientPirContext {
     wasm: stubWasm(queryBytes),
     session: { free: () => undefined },
     crsBincode: new Uint8Array(0),
-    shardConfigBincode: new Uint8Array(0),
+    shardConfigBincode: shardConfigBincode(),
     entrySize: NODE_BYTES,
   };
 }
@@ -110,8 +111,9 @@ export function epochMarkers(elements: string[]): string[] {
 
 /** Narrow a commit-tree result to its rootless auth-path arm. */
 export function authPathOf(proof: CommitTreeProof): CommitTreeAuthPath {
-  if (proof.kind !== "authPath") {
-    throw new Error(`expected a commit-tree auth path, got kind=${proof.kind}`);
+  const kind: string = proof.kind;
+  if (kind !== "authPath") {
+    throw new Error(`expected a commit-tree auth path, got kind=${kind}`);
   }
   return proof;
 }

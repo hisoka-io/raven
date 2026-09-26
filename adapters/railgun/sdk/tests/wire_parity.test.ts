@@ -27,6 +27,8 @@ import {
   path10Siblings,
 } from "./helpers/path10_row";
 import { EXPECTED_WIRE_SCHEMA_VERSION } from "./helpers/wire_schema";
+import { ppoiTree } from "./helpers/ppoi_tree";
+import { shardConfigBincode } from "./helpers/shard_config";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX =
@@ -184,7 +186,7 @@ describe("wire parity: C4 — MerkleProof.indices is uint256 (64 hex chars)", ()
       clientPirContexts: new Map([["t3CommitTree:0", pathStubCtx()]]),
     });
     const got = await sdk.getMerkleProof(0, LEAF_INDEX);
-    if (got.kind !== "authPath") throw new Error(`expected authPath, got ${got.kind}`);
+    expect(got.kind).toBe("authPath");
     expect(got.indices).toBe(EXPECTED);
     expect(got.indices.length).toBe(64);
     expect(got.indices.startsWith("0x")).toBe(false);
@@ -207,7 +209,7 @@ describe("wire parity: C4 — MerkleProof.indices is uint256 (64 hex chars)", ()
       clientPirContexts: new Map([
         [`t2Path:${LIST_KEY_HEX}`, { ...pathStubCtx(), entrySize: PATH10_ROW_BYTES }],
       ]),
-      // D-06: every path-10 fold requires a pinned root.
+      // Every path-10 fold requires a pinned root.
       ppoiPinnedRoots: new Map([
         [`${LIST_KEY_HEX}:0`, path10Root(BC_HEX_A, nodes, LEAF_INDEX)],
       ]),
@@ -246,7 +248,7 @@ describe("wire parity: H3 — Error-class discrimination on T1 client-PIR", () =
       },
       session: { free: () => undefined },
       crsBincode: new Uint8Array(0),
-      shardConfigBincode: new Uint8Array(0),
+      shardConfigBincode: shardConfigBincode(),
       entrySize: 32,
     };
   }
@@ -349,17 +351,11 @@ describe("wire parity: H17 — upstream JSON-RPC carries chainType + chainID", (
       },
     );
     let observed: JsonRpcRequest | undefined;
+    const tree = ppoiTree([BC_HEX_A]);
     upstreamServer.route(
       (req) => req.url === "/",
       (_req, body, res) => {
-        observed = writeJsonRpcResult(body, res, [
-          {
-            leaf: BC_HEX_A,
-            elements: Array.from({ length: 16 }, () => "00".repeat(32)),
-            indices: "0".repeat(64),
-            root: "0".repeat(64),
-          },
-        ]);
+        observed = writeJsonRpcResult(body, res, tree.proofs);
         return true;
       },
     );
@@ -371,6 +367,7 @@ describe("wire parity: H17 — upstream JSON-RPC carries chainType + chainID", (
       freshnessConfidenceFloor: 0.5,
       chainType: 0,
       chainId: 1,
+      ppoiPinnedRoots: new Map([[`${LIST_KEY_HEX}:0`, tree.root]]),
     });
     const got = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX_A]);
     expect(got).toHaveLength(1);

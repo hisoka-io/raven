@@ -5,12 +5,16 @@ import { RavenError } from "./errors";
 /**
  * Wallet-facing POI verdict. `Unreachable` is SDK-local: no adapter response was
  * received, so it must not be treated like the adapter's non-blocking `Missing` verdict.
+ * `MissingStale` is SDK-local too: absent from an index or map that could not be shown to cover
+ * the list the node serves, answered only when the caller opted in to that. The engine reads it
+ * as it reads `Missing`, since it acts only on `Valid`, `ShieldBlocked` and `ProofSubmitted`.
  */
 export type POIStatus =
   | "Valid"
   | "ShieldBlocked"
   | "ProofSubmitted"
   | "Missing"
+  | "MissingStale"
   | "Unreachable";
 
 /** Railgun Merkle-path methods supplied by `raven-inspire-client-wasm`. */
@@ -23,6 +27,44 @@ export interface RavenPOIPathWasm {
 
 /** BC -> idx map for one PPOI list, fetched from `GET /v1/poi/:list/bc-to-idx-map`. */
 export type BcToIdxMap = Map<string, number>;
+
+/** One row of the JSON index channel, as `fetchBcToIdxMap` returns it. */
+export interface BcIdxEntry {
+  readonly bc: string;
+  readonly idx: number;
+}
+
+/**
+ * Build the preload map from the JSON index channel's rows.
+ *
+ * The channel emits one entry per LEAF, and upstream permits a commitment to recur within a list
+ * -- it dropped the unique `(listKey, blindedCommitment)` index and recreated it non-unique. So
+ * `new Map(entries)` is last-wins and keeps the HIGHEST occurrence, while the adapter resolves to
+ * the LOWEST: the one a later append cannot move and a tail reorg cannot take away. Both prove
+ * the same membership, but they are different leaves in possibly different PPOI blocks, so they
+ * route to different instances and verify against different roots -- and both carry the same
+ * commitment, so the row-binding guard cannot tell them apart.
+ *
+ * Keys are normalized: the internal lookup is an exact-string `Map.get` on stripped lower-case
+ * hex, so a `0x`-prefixed or upper-cased row would miss and read as "not on the list".
+ */
+export function bcToIdxMapFrom(entries: Iterable<BcIdxEntry>): BcToIdxMap {
+  const out: BcToIdxMap = new Map();
+  for (const { bc, idx } of entries) {
+    validateBcHex(bc, "bc-to-idx-map entry");
+    // Not `validateLeafIndex`: that one bounds a commit-tree leaf at 2^16, while this is a
+    // GLOBAL list index and a list spans many PPOI blocks.
+    if (!Number.isSafeInteger(idx) || idx < 0) {
+      throw RavenError.invalidQuery(
+        `bc-to-idx-map entry ${bc}: idx is ${idx}, not a non-negative integer`,
+      );
+    }
+    const key = (bc.startsWith("0x") || bc.startsWith("0X") ? bc.slice(2) : bc).toLowerCase();
+    const seen = out.get(key);
+    if (seen === undefined || idx < seen) out.set(key, idx);
+  }
+  return out;
+}
 
 /** Narrowest T1 status row the Rust status encoder will build. */
 export const MIN_STATUS_ROW_BYTES = 32;

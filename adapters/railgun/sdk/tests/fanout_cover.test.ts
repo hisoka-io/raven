@@ -200,7 +200,7 @@ describe("one-query fanout cover", () => {
 
       const packageRoot = join(
         packageProbeRoot,
-        "node_modules/@raven/railgun-poi-node-interface",
+        "node_modules/@hisoka-io/railgun-poi-node-interface",
       );
       mkdirSync(packageRoot, { recursive: true });
       execFileSync(
@@ -232,11 +232,11 @@ import * as wasmPkg from "raven-inspire-client-wasm";
 import {
   buildFanoutCoverPlan,
   encodeFanoutRequest,
-} from "@raven/railgun-poi-node-interface/src/fanout-cover";
+} from "@hisoka-io/railgun-poi-node-interface/src/fanout-cover";
 import {
   decodeClientPirQueryBundle,
   type RavenInspireWasm,
-} from "@raven/railgun-poi-node-interface/src/client-pir";
+} from "@hisoka-io/railgun-poi-node-interface/src/client-pir";
 
 const fixtureRoot = ${JSON.stringify(fixtureRoot)};
 const read = (name: string): Uint8Array =>

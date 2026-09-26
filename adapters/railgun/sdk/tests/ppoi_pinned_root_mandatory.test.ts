@@ -28,6 +28,7 @@ import {
 } from "./helpers/mock_server";
 import { foldMerkleRoot } from "../src/poseidon";
 import { assertNoCommitmentsAnywhere } from "./helpers/private_wire";
+import { shardConfigBincode } from "./helpers/shard_config";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const MAINNET = 1;
@@ -94,12 +95,15 @@ function mountRowRoute(server: MockServer, nodes: Uint8Array[]): void {
   );
 }
 
-function pathCtx(): ClientPirContext {
-  return { ...nodeStubCtx(), entrySize: ROW_BYTES };
+function pathCtx(rows?: number): ClientPirContext {
+  const ctx = { ...nodeStubCtx(), entrySize: ROW_BYTES };
+  return rows === undefined ? ctx : { ...ctx, shardConfigBincode: shardConfigBincode(rows) };
 }
 
 interface Options {
   readonly chainId?: number;
+  /** Rows the path instance holds; the stub's one tree when omitted. */
+  readonly rows?: number;
   readonly labels?: [string, string][];
   readonly pinnedRoots?: [string, string][];
   readonly pinUpstream?: string | false;
@@ -112,7 +116,7 @@ function makeSdk(server: MockServer, options: Options): RavenPOINodeInterface {
     bearerToken: TOKEN,
     useClientPir: true,
     chainId: options.chainId ?? MAINNET,
-    clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, pathCtx()]]),
+    clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, pathCtx(options.rows)]]),
     clientPirInstanceLabels: new Map(options.labels ?? []),
     ppoiPinnedRoots: new Map(options.pinnedRoots ?? []),
     bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX, GLOBAL_INDEX]])]]),
@@ -173,11 +177,26 @@ describe("the PPOI path-10 pinned root is mandatory and chain-scoped", () => {
   });
 
   // No label registered at all still folds a server-supplied path: the absence of a
-  // label is not evidence that the root is trustworthy.
+  // label is not evidence that the root is trustworthy. Unlabelled, the list's one instance
+  // is asked at the list index, so it must hold rows past block 0 for the fold to be reached.
   it("refuses when no label is registered and no root is pinned", async () => {
     mountRowRoute(server, nodes);
-    const sdk = makeSdk(server, { labels: [], pinnedRoots: [] });
-    await expectRejectsWith(sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]), "InvalidQuery");
+    const sdk = makeSdk(server, {
+      labels: [],
+      pinnedRoots: [],
+      rows: 2 * LEAVES_PER_PPOI_BLOCK,
+    });
+    let thrown: unknown;
+    try {
+      await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(RavenError.is(thrown, "InvalidQuery"), `got ${String(thrown)}`).toBe(true);
+    expect(String((thrown as Error).message)).toContain(`no pinned root for ${LIST_KEY_HEX}:1`);
+    expect(server.requests.map((request) => request.url)).toContain(
+      `/v1/instance/t2Path-${LIST_KEY_HEX}/batch`,
+    );
   });
 
   it("accepts a root pinned under the chain-aware key", async () => {
@@ -380,6 +399,25 @@ describe("an unpinned PPOI path-10 fold is verified against the upstream aggrega
     expect(proof.root).toBe(trueRoot);
   });
 
+  // Width alone was half the check. A 64-char NON-hex pin also cannot equal a fold, so it too
+  // reported as `DecodeError` -- "the node forged your auth path" -- for what is a caller typo.
+  it("refuses a 64-char non-hex caller pin as a caller error, not node tampering", async () => {
+    mountRowRoute(adapter, nodes);
+    const sdk = makeSdk(adapter, {
+      labels: [[`t2Path:${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, "ppoi-paths-ofac-1"]],
+      pinnedRoots: [[`${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, "z".repeat(64)]],
+      pinUpstream: upstream.url,
+    });
+    let thrown: unknown;
+    try {
+      await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(RavenError.is(thrown, "InvalidQuery"), `got ${String(thrown)}`).toBe(true);
+    expect(String((thrown as Error).message)).toContain("is not hexadecimal");
+  });
+
   // An empty pin is a configuration mistake, not an absent pin. Falling through to upstream
   // would silently verify against a different party than the caller asked for, so the
   // interesting assertion is not that it throws but that it never reached the network.
@@ -522,6 +560,160 @@ describe("an unpinned PPOI path-10 fold is verified against the upstream aggrega
     expect(adapter.requests).toHaveLength(0);
   });
 
+  // Refusing a typo as a circularity sent an operator looking for a circular config that was
+  // not there: `sameParty` could not parse the string, and "cannot parse" was spelled "same
+  // party". The shape check runs first so the circularity message only ever describes a real one.
+  it("reports a malformed pin source as malformed, not as a circularity", () => {
+    for (const bad of ["not a url", "", "ftp://pin.example", "/"]) {
+      let thrown: unknown;
+      try {
+        makeSdk(adapter, { pinUpstream: bad });
+      } catch (e) {
+        thrown = e;
+      }
+      expect(RavenError.is(thrown, "InvalidQuery"), `${bad}: got ${String(thrown)}`).toBe(true);
+      expect(String((thrown as Error).message)).toMatch(
+        /pinUpstream must be an http\(s\) URL or a same-origin path/,
+      );
+    }
+  });
+
+  // `//host` is SCHEME-relative, not same-origin. Admitting it as "a same-origin path" let a pin
+  // source aimed at the served node past the circularity guard whenever the schemes differed.
+  it("refuses a scheme-relative pin source, which is not a same-origin path", () => {
+    for (const bad of ["//evil.example", "///x", "//"]) {
+      let thrown: unknown;
+      try {
+        makeSdk(adapter, { pinUpstream: bad });
+      } catch (e) {
+        thrown = e;
+      }
+      expect(RavenError.is(thrown, "InvalidQuery"), `${bad}: got ${String(thrown)}`).toBe(true);
+      expect(String((thrown as Error).message)).toMatch(
+        /pinUpstream must be an http\(s\) URL or a same-origin path/,
+      );
+    }
+  });
+
+  // Naming `pinTailTtlMs` is asking for the resolver as much as naming `pinUpstream` is. Without
+  // that, a bad TTL had its refusal swallowed and verification went silently off.
+  it("surfaces a bad pin TTL instead of silently disabling verification", () => {
+    let thrown: unknown;
+    try {
+      new RavenPOINodeInterface({
+        endpoint: adapter.url,
+        bearerToken: TOKEN,
+        useClientPir: true,
+        upstreamFallbackEndpoint: upstream.url,
+        pinTailTtlMs: -1,
+        clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, pathCtx()]]),
+        bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX, GLOBAL_INDEX]])]]),
+      });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(RavenError.is(thrown, "InvalidQuery"), `got ${String(thrown)}`).toBe(true);
+    expect(String((thrown as Error).message)).toContain("tail TTL must be finite and non-negative");
+  });
+
+  // A same-origin deployment writes its endpoint `/raven`, which `fetch` handles and `new URL`
+  // does not. Treating the parse failure as "same party" silently disabled verification for
+  // exactly that deployment -- the quiet direction, which is why no test caught it.
+  it("does not mistake a same-origin endpoint for the pin source's party", () => {
+    expect(() => makeSdk({ ...adapter, url: "/raven" } as MockServer, {
+      pinUpstream: upstream.url,
+    })).not.toThrow();
+  });
+
+  // A full tree has one root at its last leaf, and this answer is cached as immutable for the
+  // process lifetime. Unioning a second one would have made upstream's self-contradiction
+  // permanent and invisible.
+  it("refuses a frozen block whose zero-width query returns two different roots", async () => {
+    mountRowRoute(adapter, nodes);
+    mountUpstream(upstream, {
+      rows: inRange([
+        { index: BLOCK_LAST_INDEX, root: trueRoot },
+        { index: BLOCK_LAST_INDEX, root: otherRoot },
+      ]),
+    });
+    const sdk = makeSdk(adapter, {
+      labels: [[`t2Path:${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, "ppoi-paths-ofac-1"]],
+      pinnedRoots: [],
+      pinUpstream: upstream.url,
+    });
+    let thrown: unknown;
+    try {
+      await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(String(thrown)).toMatch(/2 different roots; a frozen block has one/);
+    // The KIND, not just the message. Asserting only the substring is how this test passed
+    // while the refusal reached the caller as `InvalidQuery` -- "your configuration is wrong" --
+    // for an upstream contradicting itself. An audit caught it; this line is the cheap half.
+    expect(RavenError.is(thrown, "ServerError"), `got ${String(thrown)}`).toBe(true);
+  });
+
+  // The same wrapper, on the kind a retry policy actually cares about: a transient upstream
+  // fault must not arrive as the caller's own configuration error, or nothing retries it.
+  it("reports a transient upstream fault as a server error, not a caller error", async () => {
+    mountRowRoute(adapter, nodes);
+    upstream.route(
+      (req) => req.method === "POST",
+      (_req, body, res) => {
+        const rpc = readJsonRpcRequest(body);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: rpc.id,
+            error: { code: -32000, message: "upstream overloaded" },
+          }),
+        );
+        return true;
+      },
+    );
+    const sdk = makeSdk(adapter, {
+      labels: [[`t2Path:${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, "ppoi-paths-ofac-1"]],
+      pinnedRoots: [],
+      pinUpstream: upstream.url,
+    });
+    let thrown: unknown;
+    try {
+      await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(RavenError.is(thrown, "ServerError"), `got ${String(thrown)}`).toBe(true);
+    expect(String((thrown as Error).message)).toContain("the upstream pin source could not answer");
+  });
+
+  // The refusal names the window as what upstream was asked about, so a root volunteered from
+  // OUTSIDE it must not be counted as a candidate the fold was measured against. `pointQuery`
+  // was hardened for this first; `tailWindow` filtered by block only.
+  it("ignores a window row upstream volunteered outside the requested range", async () => {
+    mountRowRoute(adapter, nodes);
+    const firstLeaf = BLOCK * LEAVES_PER_PPOI_BLOCK;
+    mountUpstream(upstream, {
+      merklerootsLength: firstLeaf + 200,
+      // Returned whatever the range: in-block, but far below the tail window.
+      rows: (start) => (start > firstLeaf ? [{ index: firstLeaf, root: trueRoot }] : []),
+    });
+    const sdk = makeSdk(adapter, {
+      labels: [[`t2Path:${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, "ppoi-paths-ofac-1"]],
+      pinnedRoots: [],
+      pinUpstream: upstream.url,
+    });
+    let thrown: unknown;
+    try {
+      await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(RavenError.is(thrown, "DecodeError"), `got ${String(thrown)}`).toBe(true);
+    expect(String((thrown as Error).message)).toContain("not among the 0 root(s)");
+  });
+
   // `upstreamFallbackEndpoint` is also the passthrough target, where one process serving
   // both roles is legitimate, so an INHERITED pin source aimed at this node cannot fail
   // construction. It goes inert instead, and the fold-time refusal says why.
@@ -533,6 +725,9 @@ describe("an unpinned PPOI path-10 fold is verified against the upstream aggrega
       useClientPir: true,
       upstreamFallbackEndpoint: adapter.url,
       clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, pathCtx()]]),
+      clientPirInstanceLabels: new Map([
+        [`t2Path:${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, "ppoi-paths-ofac-1"],
+      ]),
       bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX, GLOBAL_INDEX]])]]),
     });
     let thrown: unknown;
@@ -549,7 +744,11 @@ describe("an unpinned PPOI path-10 fold is verified against the upstream aggrega
   // trust roots it pinned itself.
   it("refuses with the disabled message when the resolver is turned off", async () => {
     mountRowRoute(adapter, nodes);
-    const sdk = makeSdk(adapter, { pinnedRoots: [], pinUpstream: false });
+    const sdk = makeSdk(adapter, {
+      labels: [[`t2Path:${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, "ppoi-paths-ofac-1"]],
+      pinnedRoots: [],
+      pinUpstream: false,
+    });
     let thrown: unknown;
     try {
       await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
@@ -696,5 +895,31 @@ describe("the pin resolver as public API", () => {
 
   it("refuses a list key that is not 64 hex chars", async () => {
     await expectRejectsWith(resolver().resolve("abcd", BLOCK), "InvalidQuery");
+  });
+
+  // JSON-RPC 2.0 says `error` is ABSENT on success, but proxies and alternative nodes spell
+  // success `"error": null`. Testing for the member's presence turned every pin fetch behind
+  // such a proxy -- and therefore every unpinned proof -- into a refusal.
+  it("treats a null error alongside a valid result as success", async () => {
+    const root = `${"5a".repeat(31)}01`;
+    upstream.route(
+      (req) => req.method === "POST",
+      (_req, body, res) => {
+        const rpc = readJsonRpcRequest(body);
+        const result =
+          rpc.method === "ppoi_poi_events"
+            ? [
+                {
+                  signedPOIEvent: { index: BLOCK_LAST_INDEX, blindedCommitment: BC_HEX },
+                  validatedMerkleroot: root,
+                },
+              ]
+            : {};
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, error: null, result }));
+        return true;
+      },
+    );
+    expect([...(await resolver().rootsFor(LIST_KEY_HEX, BLOCK))]).toEqual([root]);
   });
 });

@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"ppoi_poi_events","params":{"chainType":"0","chainID":"1","txidVersion":"V2_PoseidonMerkle","listKey":"efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88","startIndex":393215,"endIndex":393215},"id":2}

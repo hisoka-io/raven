@@ -12,6 +12,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { RavenPOINodeInterface } from "../src/index";
 import { startMockServer, type MockServer } from "./helpers/mock_server";
+import { ppoiTree } from "./helpers/ppoi_tree";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX = "abababababababababababababababababababababababababababababababab";
@@ -41,11 +42,14 @@ describe("JSON from the shim is validated before it is returned as a typed resul
     server.reset();
   });
 
+  // A pinned list, so a proof request reaches the shim and its body is what gets refused.
+  const TREE = ppoiTree([BC_HEX]);
   function sdk(): RavenPOINodeInterface {
     return new RavenPOINodeInterface({
       endpoint: server.url,
       bearerToken: TOKEN,
       useClientPir: false,
+      ppoiPinnedRoots: new Map([[`${LIST_KEY_HEX}:0`, TREE.root]]),
     });
   }
 
@@ -103,8 +107,7 @@ describe("JSON from the shim is validated before it is returned as a typed resul
   });
 
   it("accepts a well-formed merkle-proofs body unchanged", async () => {
-    const proof = { leaf: BC_HEX, elements: [LIST_KEY_HEX], indices: "0", root: BC_HEX };
-    mountJson(server, "/v1/poi/merkle-proofs", [proof]);
-    await expect(askProofs()).resolves.toEqual([proof]);
+    mountJson(server, "/v1/poi/merkle-proofs", TREE.proofs);
+    await expect(askProofs()).resolves.toEqual(TREE.proofs);
   });
 });

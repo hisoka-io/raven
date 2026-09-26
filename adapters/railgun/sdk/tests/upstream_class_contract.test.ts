@@ -1,73 +1,79 @@
+import type { POI, POINodeInterface, TXOPOIListStatus } from "@railgun-community/engine";
 import { describe, expect, expectTypeOf, it } from "vitest";
 
-import {
-  type BlindedCommitmentData,
-  type Chain,
-  type LegacyTransactProofData,
-  type MerkleProof,
-  type Proof,
-  ChainRegistry,
-  RavenPOINodeInterface,
-} from "../src/index";
+import { ChainRegistry, RavenPOINodeInterface } from "../src/index";
 
-abstract class FrozenUpstreamPOINodeInterface {
-  abstract isActive(chain: Chain): boolean;
-  abstract isRequired(chain: Chain): Promise<boolean>;
-  abstract getPOIsPerList(
-    txidVersion: string,
-    chain: Chain,
-    listKeys: string[],
-    commitments: BlindedCommitmentData[],
-  ): Promise<unknown>;
-  abstract getPOIMerkleProofs(
-    txidVersion: string,
-    chain: Chain,
-    listKey: string,
-    commitments: string[],
-  ): Promise<MerkleProof[]>;
-  abstract validatePOIMerkleroots(
-    txidVersion: string,
-    chain: Chain,
-    listKey: string,
-    roots: string[],
-  ): Promise<boolean>;
-  abstract submitPOI(
-    txidVersion: string,
-    chain: Chain,
-    listKey: string,
-    proof: Proof,
-    roots: string[],
-    txidRoot: string,
-    txidRootIndex: number,
-    commitmentsOut: string[],
-    unshieldTxid: string,
-  ): Promise<void>;
-  abstract submitLegacyTransactProofs(
-    txidVersion: string,
-    chain: Chain,
-    listKeys: string[],
-    proofs: LegacyTransactProofData[],
-  ): Promise<void>;
+// Engine consumers compile with skipLibCheck, where a declaration that fails to resolve becomes an
+// error type: it behaves as `any` and silences every check built on it, `expectTypeOf` included.
+// An unused `@ts-expect-error` is still reported, so each canary below is a directive that only an
+// intact declaration satisfies.
+type Leaves<T, Depth extends unknown[] = []> = Depth["length"] extends 3
+  ? T
+  : T extends readonly (infer E)[]
+    ? T | Leaves<E, [...Depth, 0]>
+    : T extends object
+      ? T | Leaves<T[keyof T], [...Depth, 0]>
+      : T;
+type ContractTypes = {
+  [K in keyof POINodeInterface]: POINodeInterface[K] extends (...args: infer A) => infer R
+    ? Leaves<A[number] | Awaited<R>>
+    : never;
+}[keyof POINodeInterface];
+
+class Foreign {
+  readonly foreignBrand = Symbol("foreign");
 }
 
-function walletPoiInit(node: FrozenUpstreamPOINodeInterface): FrozenUpstreamPOINodeInterface {
-  return node;
+type EngineStatusMap = Awaited<ReturnType<POINodeInterface["getPOIsPerList"]>>;
+
+// The shape Raven answered with before it adopted engine's type: the same strings, rejected
+// because engine's status is a nominal enum.
+class LiteralStatusNode {
+  isActive(): boolean {
+    return true;
+  }
+  async isRequired(): Promise<boolean> {
+    return true;
+  }
+  async getPOIsPerList(): Promise<{ [bc: string]: { [listKey: string]: "Valid" } }> {
+    return {};
+  }
+  async getPOIMerkleProofs(): Promise<never[]> {
+    return [];
+  }
+  async validatePOIMerkleroots(): Promise<boolean> {
+    return true;
+  }
+  async submitPOI(): Promise<void> {}
+  async submitLegacyTransactProofs(): Promise<void> {}
 }
 
 describe("upstream POINodeInterface class contract", () => {
-  it("is structurally accepted by WalletPOI.init's interface parameter", async () => {
+  it("is assignable to engine's POINodeInterface and to the POI.init seam", async () => {
     const raven = new RavenPOINodeInterface({
       endpoint: "https://raven.invalid",
       bearerToken: "contract-test-token-long-enough",
       useClientPir: false,
     });
-    const accepted = walletPoiInit(raven);
-    expect(accepted).toBe(raven);
+    const x: POINodeInterface = raven;
+    const injected: Parameters<typeof POI.init>[1] = raven;
+    expect(x).toBe(raven);
+    expect(injected).toBe(raven);
     expect(raven.isActive({ type: 0, id: 1 })).toBe(true);
     expect(raven.isActive({ type: 1, id: 1 })).toBe(false);
     await expect(raven.isRequired({ type: 0, id: 1 })).resolves.toBe(true);
     await expect(raven.isRequired({ type: 0, id: 2 })).resolves.toBe(false);
-    expectTypeOf(raven).toMatchTypeOf<FrozenUpstreamPOINodeInterface>();
+    expectTypeOf(raven).toMatchTypeOf<POINodeInterface>();
+  });
+
+  it("checks against engine's declaration, not an `any` it degraded to", () => {
+    expectTypeOf<EngineStatusMap[string][string]>().toEqualTypeOf<TXOPOIListStatus>();
+    // @ts-expect-error only an `any` somewhere in engine's contract admits a foreign instance
+    const degraded: ContractTypes = new Foreign();
+    // @ts-expect-error a literal-string status map is not engine's nominal enum
+    const rejected: POINodeInterface = new LiteralStatusNode();
+    expect(degraded).toBeInstanceOf(Foreign);
+    expect(rejected).toBeInstanceOf(LiteralStatusNode);
   });
 
   it("fails closed when leading engine coordinates differ from configuration", async () => {

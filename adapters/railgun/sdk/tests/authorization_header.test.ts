@@ -24,6 +24,7 @@ import {
   type MockServer,
   type RecordedRequest,
 } from "./helpers/mock_server";
+import { mountPrefixChannel } from "./helpers/prefix_channel";
 
 const LIST_KEY = "ab".repeat(32);
 const BC = "bc00112233445566778899aabbccddeeff00112233445566778899aabbccdd01";
@@ -34,6 +35,7 @@ const UNSET_ENV_TOKEN = process.env.RAVEN_SDK_TEST_TOKEN_THAT_IS_NEVER_SET!;
 
 type Site =
   | "bcToIdxMap"
+  | "bcPrefixes"
   | "statusHeader"
   | "session"
   | "batch"
@@ -49,6 +51,7 @@ interface RequestLine {
 
 const SITE_OF: Record<Site, (request: RequestLine) => boolean> = {
   bcToIdxMap: (r) => r.method === "GET" && (r.url ?? "").endsWith("/bc-to-idx-map"),
+  bcPrefixes: (r) => r.method === "GET" && (r.url ?? "").includes("/bc-prefixes?"),
   statusHeader: (r) => r.method === "GET" && (r.url ?? "").endsWith("/status-header"),
   session: (r) => r.method === "POST" && (r.url ?? "").endsWith("/session"),
   batch: (r) => r.method === "POST" && (r.url ?? "").endsWith("/batch"),
@@ -59,6 +62,7 @@ const SITE_OF: Record<Site, (request: RequestLine) => boolean> = {
 
 const ADAPTER_SITES: Site[] = [
   "bcToIdxMap",
+  "bcPrefixes",
   "statusHeader",
   "session",
   "batch",
@@ -77,6 +81,7 @@ function mountEveryRoute(server: MockServer): void {
     writeJson(res, { epoch: 1, listKey: LIST_KEY, entries: [] });
     return true;
   });
+  mountPrefixChannel(server, LIST_KEY, { commitments: [] });
   server.route(SITE_OF.statusHeader, (_req, _body, res) => {
     writeJson(res, { epoch: 1, listKey: LIST_KEY, blockedBcs: [], pendingBcs: [] });
     return true;

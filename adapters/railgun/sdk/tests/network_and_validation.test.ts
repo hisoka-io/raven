@@ -5,6 +5,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { RavenPOINodeInterface } from "../src/index";
 import { startMockServer, writeJson, type MockServer } from "./helpers/mock_server";
+import { mountPrefixChannel } from "./helpers/prefix_channel";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX = "abababababababababababababababababababababababababababababababab";
@@ -254,11 +255,14 @@ describe("per-network deployments + validation", () => {
         return true;
       },
     );
+    mountPrefixChannel(server, LIST_KEY_HEX, { commitments: [] });
     const sdk = new RavenPOINodeInterface({
       endpoint: server.url,
       bearerToken: TOKEN,
     });
     await sdk.fetchBcToIdxMap(LIST_KEY_HEX);
     expect(observed).toBe(`Bearer ${TOKEN}`);
+    const prefixReads = server.requests.filter((r) => r.url.includes("/bc-prefixes"));
+    expect(prefixReads.map((r) => r.headers.authorization)).toStrictEqual([`Bearer ${TOKEN}`]);
   });
 });

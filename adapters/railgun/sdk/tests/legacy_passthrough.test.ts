@@ -6,7 +6,7 @@
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { RavenPOINodeInterface } from "../src/index";
+import { RavenError, RavenPOINodeInterface, foldMerkleRoot } from "../src/index";
 
 import {
   readJsonRpcRequest,
@@ -15,6 +15,7 @@ import {
   writeJsonRpcResult,
   type MockServer,
 } from "./helpers/mock_server";
+import { ppoiTree } from "./helpers/ppoi_tree";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX =
@@ -115,14 +116,7 @@ describe("legacy plaintext fallback paths", () => {
       const bcs = Array.from({ length: n }, (_, i) =>
         i.toString(16).padStart(2, "0").repeat(32),
       );
-      const proofs = bcs.map((bc) => ({
-        leaf: bc,
-        elements: Array.from({ length: 16 }, (_, j) =>
-          j.toString(16).padStart(2, "0").repeat(32),
-        ),
-        indices: "0x00",
-        root: "ff".repeat(32),
-      }));
+      const { root, proofs } = ppoiTree(bcs);
       server.route(
         (req) => req.url === "/v1/poi/merkle-proofs",
         (_req, _body, res) => {
@@ -136,6 +130,7 @@ describe("legacy plaintext fallback paths", () => {
         endpoint: server.url,
         bearerToken: TOKEN,
         useClientPir: false,
+        ppoiPinnedRoots: new Map([[`${LIST_KEY_HEX}:0`, root]]),
       });
       const got = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, bcs);
       expect(got).toHaveLength(n);
@@ -152,7 +147,7 @@ describe("legacy plaintext fallback paths", () => {
     const proof = {
       leaf: "00".repeat(32),
       elements: Array.from({ length: 16 }, () => "11".repeat(32)),
-      indices: "0x00",
+      indices: (42).toString(16).padStart(64, "0"),
       root: "ff".repeat(32),
     };
     server.route(
@@ -168,7 +163,11 @@ describe("legacy plaintext fallback paths", () => {
       useClientPir: false,
     });
     const got = await sdk.getMerkleProof(2, 42);
-    expect(got).toEqual({ kind: "rooted", proof });
+    expect(got).toStrictEqual({
+      kind: "authPath",
+      elements: proof.elements,
+      indices: proof.indices,
+    });
     const wires = sdk.lastWireRequests();
     expect(wires.length).toBe(1);
     const decoded = JSON.parse(new TextDecoder().decode(wires[0].body));
@@ -270,7 +269,11 @@ describe("legacy plaintext fallback paths", () => {
     expect(sdk.lastWireRequests().length).toBe(1);
   });
 
-  it("getPOIMerkleProofs legacy mode falls back when freshness is below floor", async () => {
+  // The stale upstream fallback, and the route's own answer, reach the wallet only once the proof
+  // folds to a root the caller pinned: neither route says which block a proof is in.
+  const PLAINTEXT_TREE = ppoiTree([BC_VALID, BC_BLOCKED]);
+
+  function staleProofsRoute(upstreamProof: unknown = PLAINTEXT_TREE.proofs[0]): void {
     server.route(
       (req) => req.url === "/v1/poi/merkle-proofs",
       (_req, _body, res) => {
@@ -283,26 +286,162 @@ describe("legacy plaintext fallback paths", () => {
     server.route(
       (req) => req.url === "/",
       (_req, body, res) => {
-        const request = writeJsonRpcResult(body, res, [
-          {
-            leaf: BC_VALID,
-            elements: Array.from({ length: 16 }, () => "00".repeat(32)),
-            indices: "0x00",
-            root: "ff".repeat(32),
-          },
-        ]);
+        const request = writeJsonRpcResult(body, res, [upstreamProof]);
         expect(request.method).toBe("ppoi_merkle_proofs");
         return true;
       },
     );
-    const sdk = new RavenPOINodeInterface({
+  }
+
+  function servedProofsRoute(proofs: unknown[]): void {
+    server.route(
+      (req) => req.url === "/v1/poi/merkle-proofs",
+      (_req, _body, res) => {
+        writeJson(res, proofs, {
+          "x-raven-freshness": "lag_blocks=1 applied_height=10 epoch=1 confidence=0.99",
+        });
+        return true;
+      },
+    );
+  }
+
+  function plaintextSdk(pins?: Map<string, string>, upstream = false): RavenPOINodeInterface {
+    return new RavenPOINodeInterface({
       endpoint: server.url,
       bearerToken: TOKEN,
-      upstreamFallbackEndpoint: server.url,
       useClientPir: false,
       freshnessConfidenceFloor: 0.5,
+      ...(upstream ? { upstreamFallbackEndpoint: server.url } : {}),
+      ...(pins ? { ppoiPinnedRoots: pins } : {}),
     });
+  }
+
+  async function refusal(run: () => Promise<unknown>): Promise<unknown> {
+    try {
+      await run();
+    } catch (error) {
+      return error;
+    }
+    return undefined;
+  }
+
+  it("getPOIMerkleProofs legacy mode falls back when freshness is below floor", async () => {
+    staleProofsRoute();
+    const sdk = plaintextSdk(new Map([[`${LIST_KEY_HEX}:0`, PLAINTEXT_TREE.root]]), true);
     const got = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_VALID]);
-    expect(got).toHaveLength(1);
+    expect(got).toEqual([PLAINTEXT_TREE.proofs[0]]);
+  });
+
+  // Upstream's answer is checked exactly as the route's own is.
+  it.each([
+    {
+      label: "whose fold is none of the pinned roots",
+      proof: PLAINTEXT_TREE.proofs[0],
+      pin: "33".repeat(32),
+      reason: /not among the 1 root\(s\) pinned/,
+    },
+    {
+      label: "that does not fold to the root it claims, even a pinned one",
+      proof: { ...PLAINTEXT_TREE.proofs[0], root: "33".repeat(32) },
+      pin: "33".repeat(32),
+      reason: /does not fold to the root it claims/,
+    },
+  ])("refuses an upstream fallback proof $label", async ({ proof, pin, reason }) => {
+    staleProofsRoute(proof);
+    const thrown = await refusal(() =>
+      plaintextSdk(new Map([[`${LIST_KEY_HEX}:0`, pin]]), true).getPOIMerkleProofs(
+        LIST_KEY_HEX,
+        [BC_VALID],
+      ),
+    );
+    expect(RavenError.is(thrown, "DecodeError"), String(thrown)).toBe(true);
+    expect(String((thrown as Error).message)).toMatch(/^upstream ppoi_merkle_proofs: /);
+    expect(String((thrown as Error).message)).toMatch(reason);
+    expect(server.requests.filter((request) => request.url === "/")).toHaveLength(1);
+  });
+
+  // Such a call could only refuse, so it refuses before sending the commitments anywhere.
+  it("refuses before any request when no root is pinned for the list", async () => {
+    staleProofsRoute();
+    const thrown = await refusal(() =>
+      plaintextSdk(undefined, true).getPOIMerkleProofs(LIST_KEY_HEX, [BC_VALID, BC_BLOCKED]),
+    );
+    expect(RavenError.is(thrown, "InvalidQuery"), String(thrown)).toBe(true);
+    expect(String((thrown as Error).message)).toMatch(/no root pinned for the list/);
+    expect(server.requests).toHaveLength(0);
+  });
+
+  it("refuses the route's proof when its fold is none of the pinned roots", async () => {
+    servedProofsRoute(PLAINTEXT_TREE.proofs);
+    const pins = new Map([[`${LIST_KEY_HEX}:0`, "33".repeat(32)]]);
+    const thrown = await refusal(() =>
+      plaintextSdk(pins).getPOIMerkleProofs(LIST_KEY_HEX, [BC_VALID]),
+    );
+    expect(RavenError.is(thrown, "DecodeError"), String(thrown)).toBe(true);
+  });
+
+  // A forged root that the caller happens to have pinned still has to be the fold.
+  it("refuses a proof that does not fold to the root it claims, even a pinned one", async () => {
+    const forged = { ...PLAINTEXT_TREE.proofs[0], root: "33".repeat(32) };
+    servedProofsRoute([forged]);
+    const pins = new Map([[`${LIST_KEY_HEX}:0`, forged.root]]);
+    const thrown = await refusal(() =>
+      plaintextSdk(pins).getPOIMerkleProofs(LIST_KEY_HEX, [BC_VALID]),
+    );
+    expect(RavenError.is(thrown, "DecodeError"), String(thrown)).toBe(true);
+    expect(String((thrown as Error).message)).toMatch(/does not fold to the root it claims/);
+  });
+
+  // The fold only reads the low sixteen index bits and the elements it is given, so a proof of
+  // another depth or position could fold to a pinned root and still be unusable to the circuit.
+  it.each([
+    {
+      label: "fifteen elements",
+      proof: (() => {
+        const short = { ...PLAINTEXT_TREE.proofs[0], elements: PLAINTEXT_TREE.proofs[0].elements.slice(0, 15) };
+        return { ...short, root: foldMerkleRoot(BC_VALID, short.elements, 0n) };
+      })(),
+    },
+    {
+      label: "indices past a depth-16 tree",
+      proof: { ...PLAINTEXT_TREE.proofs[0], indices: (1n << 16n).toString(16).padStart(64, "0") },
+    },
+  ])("refuses a proof with $label even when its fold is pinned", async ({ proof }) => {
+    servedProofsRoute([proof]);
+    const pins = new Map([[`${LIST_KEY_HEX}:0`, proof.root]]);
+    const thrown = await refusal(() =>
+      plaintextSdk(pins).getPOIMerkleProofs(LIST_KEY_HEX, [BC_VALID]),
+    );
+    expect(RavenError.is(thrown, "DecodeError"), String(thrown)).toBe(true);
+  });
+
+  it("refuses a proof for a leaf the caller did not ask about", async () => {
+    servedProofsRoute([PLAINTEXT_TREE.proofs[1]]);
+    const pins = new Map([[`${LIST_KEY_HEX}:0`, PLAINTEXT_TREE.root]]);
+    const thrown = await refusal(() =>
+      plaintextSdk(pins).getPOIMerkleProofs(LIST_KEY_HEX, [BC_VALID]),
+    );
+    expect(RavenError.is(thrown, "DecodeError"), String(thrown)).toBe(true);
+  });
+
+  // The block is unknown on this route, so a pin for any block of the list can answer.
+  it("accepts a proof whose fold is the pin of a block other than the first", async () => {
+    servedProofsRoute([PLAINTEXT_TREE.proofs[1]]);
+    const pins = new Map([
+      [`${LIST_KEY_HEX}:0`, "33".repeat(32)],
+      [`1:${LIST_KEY_HEX}:4`, PLAINTEXT_TREE.root],
+    ]);
+    const got = await plaintextSdk(pins).getPOIMerkleProofs(LIST_KEY_HEX, [BC_BLOCKED]);
+    expect(got).toEqual([PLAINTEXT_TREE.proofs[1]]);
+  });
+
+  it("does not accept a pin for the same list on another chain", async () => {
+    servedProofsRoute([PLAINTEXT_TREE.proofs[1]]);
+    const pins = new Map([[`137:${LIST_KEY_HEX}:0`, PLAINTEXT_TREE.root]]);
+    const thrown = await refusal(() =>
+      plaintextSdk(pins).getPOIMerkleProofs(LIST_KEY_HEX, [BC_BLOCKED]),
+    );
+    expect(RavenError.is(thrown, "InvalidQuery"), String(thrown)).toBe(true);
+    expect(server.requests).toHaveLength(0);
   });
 });

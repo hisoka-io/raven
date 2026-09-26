@@ -16,6 +16,7 @@ describe("ShardConfig geometry", () => {
     expect(decodeShardGeometry(shardConfig(65_536n, 32n, 4_097n))).toEqual({
       entriesPerShard: 2_048,
       shardCount: 3,
+      totalEntries: 4_097,
     });
   });
 

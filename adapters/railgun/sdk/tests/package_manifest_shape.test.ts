@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { prerelease, satisfies, valid, validRange } from "semver";
 import { describe, expect, it } from "vitest";
 
 // The suite imports ../src directly and so can never see the manifest a consumer reads.
@@ -7,7 +8,17 @@ import { describe, expect, it } from "vitest";
 // installs; these are the manifest invariants that must hold on every push without one.
 
 const sdkRoot = resolve(__dirname, "..");
+type DependencyMap = Readonly<Record<string, string>>;
 const manifest = JSON.parse(readFileSync(resolve(sdkRoot, "package.json"), "utf8")) as {
+  readonly name?: string;
+  readonly version?: string;
+  readonly publishConfig?: Readonly<Record<string, string>>;
+  readonly dependencies?: DependencyMap;
+  readonly optionalDependencies?: DependencyMap;
+  readonly peerDependencies?: DependencyMap;
+  readonly devDependencies?: DependencyMap;
+  readonly bundleDependencies?: readonly string[] | boolean;
+  readonly bundledDependencies?: readonly string[] | boolean;
   readonly type?: string;
   readonly main?: string;
   readonly module?: string;
@@ -16,6 +27,10 @@ const manifest = JSON.parse(readFileSync(resolve(sdkRoot, "package.json"), "utf8
   readonly scripts?: Readonly<Record<string, string>>;
   readonly exports?: Readonly<Record<string, unknown>>;
 };
+
+const ENGINE = "@railgun-community/engine";
+// What @railgun-community/wallet@10.10.0-rc.1, the terminal wallet's pin, depends on exactly.
+const WALLET_ENGINE_PIN = "9.7.0-rc.0";
 
 const shippedBy = (allowlist: readonly string[], target: string): boolean => {
   const path = target.replace(/^\.\//, "");
@@ -80,6 +95,47 @@ describe("published package manifest", () => {
     for (const script of ["test", "typecheck"] as const) {
       expect(manifest.scripts?.[script], `${script} script`).toBeTypeOf("string");
       expect(manifest.scripts?.[script]).not.toContain("build");
+    }
+  });
+
+  it("installs every runtime dependency from the registry, never from a repository path", () => {
+    for (const field of ["dependencies", "optionalDependencies", "peerDependencies"] as const) {
+      for (const [name, spec] of Object.entries(manifest[field] ?? {})) {
+        const message = `${field}.${name} is ${spec}, not a registry range`;
+        expect(validRange(spec), message).not.toBeNull();
+      }
+    }
+  });
+
+  // Engine's POI seam is a static on a class; a second engine copy beside the wallet's own takes
+  // an interface installed on it and never reads it. A peer can only share the consumer's copy.
+  it("can never install a second engine, and its peer range admits the wallet's pin", () => {
+    for (const field of ["dependencies", "optionalDependencies"] as const) {
+      expect(manifest[field]?.[ENGINE], `engine in ${field}`).toBeUndefined();
+    }
+    for (const bundled of [manifest.bundleDependencies, manifest.bundledDependencies]) {
+      expect(bundled === true || (Array.isArray(bundled) && bundled.includes(ENGINE))).toBe(false);
+    }
+    const peer = manifest.peerDependencies?.[ENGINE] ?? "";
+    expect(validRange(peer), `engine peer range ${peer}`).not.toBeNull();
+    // A prerelease satisfies only a range naming its own major.minor.patch: `^9.6.0` excludes it.
+    expect(satisfies(WALLET_ENGINE_PIN, peer), `${peer} admits ${WALLET_ENGINE_PIN}`).toBe(true);
+    const typedAgainst = manifest.devDependencies?.[ENGINE] ?? "";
+    expect(valid(typedAgainst), "the suite typechecks against one exact engine").not.toBeNull();
+    expect(satisfies(typedAgainst, peer), `${peer} admits ${typedAgainst}`).toBe(true);
+  });
+
+  it("publishes publicly under the project's scope, off the latest tag while a prerelease", () => {
+    expect(manifest.name).toMatch(/^@hisoka-io\//);
+    expect(manifest.publishConfig?.access, "a scoped package publishes restricted by default").toBe(
+      "public",
+    );
+    expect(valid(manifest.version ?? ""), "version is not semver").not.toBeNull();
+    if (prerelease(manifest.version ?? "") !== null) {
+      expect(manifest.publishConfig?.tag, "npm refuses a prerelease with no dist-tag").toBeTypeOf(
+        "string",
+      );
+      expect(manifest.publishConfig?.tag).not.toBe("latest");
     }
   });
 });

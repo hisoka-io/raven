@@ -2,8 +2,9 @@
  * End-to-end sweeps against a live adapter: per-tree byte identity vs on-chain
  * `rootHistory`, PPOI probes, random-leaf fuzz, and per-instance throughput.
  *
- * Gated behind `RAVEN_LIVE_URL` + `RAVEN_LIVE_TOKEN` + `RAVEN_INFURA_URL`.
- * Divergences are recorded with full request/response bytes; never retried away.
+ * Gated behind `RAVEN_LIVE_URL` + `RAVEN_INFURA_URL`; `RAVEN_LIVE_TOKEN` is sent when set,
+ * for a node that still gates reads. Divergences are recorded with full request/response
+ * bytes; never retried away.
  */
 
 import { afterAll, describe, expect, it } from "vitest";
@@ -19,20 +20,30 @@ import {
   foldMerkleRoot,
   pathIndicesForLeaf,
 } from "../src/index";
+import { drawPaddedSlots } from "../src/batch-ladder";
 import { decodeClientPirQueryBundle } from "../src/client-pir";
+import {
+  LIVE_URL,
+  PPOI_STATUS_INSTANCE,
+  decodeBatchResponse,
+  decodeInstanceParams,
+  liveHeaders,
+  ppoiPathInstance,
+  stripVersionedResponse,
+  versionedBatchBody,
+  versionedQueryBody,
+  type DecodedInstanceParams,
+} from "./helpers/live_wire";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FINDINGS_DIR =
   process.env.RAVEN_BENCH_FINDINGS_DIR ??
   resolve(HERE, "..", "..", "..", "target", "bench-findings");
 
-const LIVE_URL = process.env.RAVEN_LIVE_URL;
-const LIVE_TOKEN = process.env.RAVEN_LIVE_TOKEN;
 const INFURA_URL = process.env.RAVEN_INFURA_URL ?? "";
 const RAILGUN_PROXY = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9";
 
-const RUN_LIVE =
-  LIVE_URL !== undefined && LIVE_TOKEN !== undefined && INFURA_URL !== "";
+const RUN_LIVE = LIVE_URL !== undefined && INFURA_URL !== "";
 const liveDescribe = RUN_LIVE ? describe : describe.skip;
 
 const PARAMS_DOWNLOAD_TIMEOUT_MS = 240_000;
@@ -53,16 +64,6 @@ const FUZZ_SAMPLE = Number(process.env.RAVEN_FUZZ_SAMPLE ?? "25");
 const THROUGHPUT_SAMPLE = Number(process.env.RAVEN_THROUGHPUT_SAMPLE ?? "30");
 const THROUGHPUT_SEEDS = Number(process.env.RAVEN_THROUGHPUT_SEEDS ?? "3");
 
-interface DecodedInstanceParams {
-  wireSchemaVersion: number;
-  crsBincode: Uint8Array;
-  shardConfigBincode: Uint8Array;
-  inspireParamsBincode: Uint8Array;
-  entrySize: number;
-  variant: string;
-  epoch: bigint;
-}
-
 interface InstanceBundle {
   decoded: DecodedInstanceParams;
   context: ClientPirContext;
@@ -75,75 +76,8 @@ if (typeof wasmInit.init_panic_hook === "function") {
   wasmInit.init_panic_hook();
 }
 
-function readU64LE(view: DataView, offset: number): number {
-  const lo = view.getUint32(offset, true);
-  const hi = view.getUint32(offset + 4, true);
-  if (hi !== 0) {
-    throw new Error(`readU64LE: payload exceeds 2^32 (hi=${hi}) at offset ${offset}`);
-  }
-  return lo;
-}
-
-function readByteVec(buf: Uint8Array, offset: number): { value: Uint8Array; next: number } {
-  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const len = readU64LE(view, offset);
-  const start = offset + 8;
-  const end = start + len;
-  if (end > buf.length) {
-    throw new Error(
-      `readByteVec: truncated (need ${end}, have ${buf.length}) at offset ${offset}`,
-    );
-  }
-  return { value: new Uint8Array(buf.subarray(start, end)), next: end };
-}
-
-function readString(buf: Uint8Array, offset: number): { value: string; next: number } {
-  const inner = readByteVec(buf, offset);
-  return { value: new TextDecoder().decode(inner.value), next: inner.next };
-}
-
-function decodeInstanceParams(buf: Uint8Array): DecodedInstanceParams {
-  if (buf.length < 4) {
-    throw new Error(`decodeInstanceParams: too short (${buf.length})`);
-  }
-  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const envelope = (view.getUint8(0) << 8) | view.getUint8(1);
-  if (envelope !== 2) {
-    throw new Error(`decodeInstanceParams: unexpected envelope version ${envelope}`);
-  }
-  let off = 2;
-  const wireSchemaVersion = view.getUint16(off, true);
-  off += 2;
-  const crs = readByteVec(buf, off);
-  off = crs.next;
-  const shard = readByteVec(buf, off);
-  off = shard.next;
-  const inspire = readByteVec(buf, off);
-  off = inspire.next;
-  const entrySize = readU64LE(view, off);
-  off += 8;
-  const variant = readString(buf, off);
-  off = variant.next;
-  if (off + 8 > buf.length) {
-    throw new Error(`decodeInstanceParams: truncated trailing epoch (off=${off})`);
-  }
-  const epochLo = view.getUint32(off, true);
-  const epochHi = view.getUint32(off + 4, true);
-  const epoch = (BigInt(epochHi) << 32n) | BigInt(epochLo);
-  return {
-    wireSchemaVersion,
-    crsBincode: crs.value,
-    shardConfigBincode: shard.value,
-    inspireParamsBincode: inspire.value,
-    entrySize,
-    variant: variant.value,
-    epoch,
-  };
-}
-
 async function fetchInstanceParams(
   endpoint: string,
-  token: string,
   instanceId: string,
 ): Promise<InstanceBundle> {
   const start = Date.now();
@@ -152,7 +86,7 @@ async function fetchInstanceParams(
   let res: Response;
   try {
     res = await fetch(`${endpoint}/v1/instance/${instanceId}/params`, {
-      headers: { authorization: `Bearer ${token}` },
+      headers: liveHeaders(),
       signal: ctrl.signal,
     });
   } finally {
@@ -184,10 +118,10 @@ async function fetchInstanceParams(
 const bundleCache = new Map<string, InstanceBundle>();
 
 async function getInstance(instanceId: string): Promise<InstanceBundle> {
-  if (!LIVE_URL || !LIVE_TOKEN) throw new Error("env guard");
+  if (!LIVE_URL) throw new Error("env guard");
   const hit = bundleCache.get(instanceId);
   if (hit) return hit;
-  const fresh = await fetchInstanceParams(LIVE_URL, LIVE_TOKEN, instanceId);
+  const fresh = await fetchInstanceParams(LIVE_URL, instanceId);
   bundleCache.set(instanceId, fresh);
   return fresh;
 }
@@ -256,7 +190,6 @@ interface SingleQueryResult {
  * sizes and freshness headers so failures can be correlated. */
 async function fetchSingleRow(
   endpoint: string,
-  token: string,
   instanceId: string,
   ctx: ClientPirContext,
   flatIdx: number,
@@ -265,16 +198,13 @@ async function fetchSingleRow(
     ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, BigInt(flatIdx)),
   );
   const url = `${endpoint}/v1/instance/${encodeURIComponent(instanceId)}/query`;
-  const wireBody = new Uint8Array(2 + queryBundle.queryBytes.length);
-  wireBody[0] = 0;
-  wireBody[1] = 1;
-  wireBody.set(queryBundle.queryBytes, 2);
+  const wireBody = versionedQueryBody(queryBundle.queryBytes);
   const fetchBody = wireBody as unknown as BodyInit;
   const res = await fetch(url, {
     method: "POST",
     headers: {
       "content-type": "application/octet-stream",
-      authorization: `Bearer ${token}`,
+      ...liveHeaders(),
     },
     body: fetchBody,
   });
@@ -284,12 +214,10 @@ async function fetchSingleRow(
     );
   }
   const enveloped = new Uint8Array(await res.arrayBuffer());
-  if (enveloped.length < 2 || ((enveloped[0] << 8) | enveloped[1]) !== 1) {
-    throw new Error(
-      `fetchSingleRow(${instanceId}, flat=${flatIdx}): bad response envelope`,
-    );
-  }
-  const responseBytes = enveloped.subarray(2);
+  const responseBytes = stripVersionedResponse(
+    enveloped,
+    `fetchSingleRow(${instanceId}, flat=${flatIdx})`,
+  );
   const plaintext = ctx.wasm.extract_response(
     ctx.session,
     ctx.crsBincode,
@@ -313,39 +241,27 @@ interface BatchResult {
   responseBytes: number;
 }
 
+/** Pads `flatIndices` onto the batch ladder, since the server refuses any other length, and
+ *  returns the responses for the real slots only, in order. */
 async function fetchBatch(
   endpoint: string,
-  token: string,
   instanceId: string,
   ctx: ClientPirContext,
   flatIndices: number[],
 ): Promise<BatchResult> {
-  const queryBundles = flatIndices.map((idx) =>
+  const slots = drawPaddedSlots(flatIndices);
+  const queryBundles = slots.map((idx) =>
     decodeClientPirQueryBundle(
       ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, BigInt(idx)),
     ),
   );
-  const queryBytes = queryBundles.map((b) => b.queryBytes);
-  // [u16 BE schema][u64 LE count][concat queries]
-  let total = 2 + 8;
-  for (const q of queryBytes) total += q.length;
-  const body = new Uint8Array(total);
-  body[0] = 0;
-  body[1] = 1;
-  const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
-  view.setUint32(2, flatIndices.length, true);
-  view.setUint32(6, 0, true);
-  let off = 10;
-  for (const q of queryBytes) {
-    body.set(q, off);
-    off += q.length;
-  }
+  const body = versionedBatchBody(queryBundles.map((b) => b.queryBytes));
   const url = `${endpoint}/v1/instance/${encodeURIComponent(instanceId)}/batch`;
   const res = await fetch(url, {
     method: "POST",
     headers: {
       "content-type": "application/octet-stream",
-      authorization: `Bearer ${token}`,
+      ...liveHeaders(),
     },
     body: body as unknown as BodyInit,
   });
@@ -353,32 +269,18 @@ async function fetchBatch(
     throw new Error(`fetchBatch(${instanceId}): HTTP ${res.status}`);
   }
   const respBuf = new Uint8Array(await res.arrayBuffer());
-  // [u16 BE schema][u64 LE count][{u64 LE len, body}*]
-  if (respBuf.length < 10) {
-    throw new Error(`fetchBatch(${instanceId}): response too short ${respBuf.length}`);
-  }
-  const respView = new DataView(respBuf.buffer, respBuf.byteOffset, respBuf.byteLength);
-  let respOff = 2;
-  const count = readU64LE(respView, respOff);
-  respOff += 8;
-  if (count !== flatIndices.length) {
+  const out = decodeBatchResponse(respBuf, `fetchBatch(${instanceId})`);
+  if (out.length !== slots.length) {
     throw new Error(
-      `fetchBatch(${instanceId}): mismatched count ${count} vs ${flatIndices.length}`,
+      `fetchBatch(${instanceId}): mismatched count ${out.length} vs ${slots.length}`,
     );
-  }
-  const out: Uint8Array[] = [];
-  for (let i = 0; i < count; i += 1) {
-    const elemLen = readU64LE(respView, respOff);
-    respOff += 8;
-    out.push(new Uint8Array(respBuf.subarray(respOff, respOff + elemLen)));
-    respOff += elemLen;
   }
   // `extract_response` needs the exact `clientStateBincode` its own
   // `build_seeded_query` produced; a re-issue draws fresh randomness and fails.
   const clientStates = queryBundles.map((b) => b.clientStateBincode);
   return {
-    responses: out,
-    clientStates,
+    responses: out.slice(0, flatIndices.length),
+    clientStates: clientStates.slice(0, flatIndices.length),
     bodyBytes: body.length,
     responseBytes: respBuf.length,
   };
@@ -392,19 +294,20 @@ interface ProbeStatus {
     role: string;
     drain_state: string;
   }>;
+  // Absent on a node with no chain consumer, which a mirror-fed PPOI node may be.
   consumer: {
     last_applied_block: number;
     last_scanned_block: number;
     last_known_chain_head: number;
     indexer_lag_blocks: number;
     blocks_since_last_applied_event: number;
-  };
+  } | null;
 }
 
 async function probeStatus(): Promise<ProbeStatus> {
-  if (!LIVE_URL || !LIVE_TOKEN) throw new Error("env guard");
+  if (!LIVE_URL) throw new Error("env guard");
   const res = await fetch(`${LIVE_URL}/v1/status`, {
-    headers: { authorization: `Bearer ${LIVE_TOKEN}` },
+    headers: liveHeaders(),
   });
   if (!res.ok) throw new Error(`probeStatus: HTTP ${res.status}`);
   return (await res.json()) as ProbeStatus;
@@ -511,7 +414,7 @@ liveDescribe("aggressive E2E (per-tree byte identity)", () => {
     it(
       `commit-tree-${treeNumber}: ${PER_TREE_SAMPLE} random leaves byte-identical via PIR + on-chain rootHistory`,
       async () => {
-        if (!LIVE_URL || !LIVE_TOKEN) throw new Error("env guard");
+        if (!LIVE_URL) throw new Error("env guard");
         const instanceId = `commit-tree-${treeNumber}`;
         const bundle = await getInstance(instanceId);
         const leafCount = TREE_LEAF_COUNT[treeNumber];
@@ -531,7 +434,6 @@ liveDescribe("aggressive E2E (per-tree byte identity)", () => {
             for (let level = 0; level < indices.length; level += 1) {
               const r = await fetchSingleRow(
                 LIVE_URL,
-                LIVE_TOKEN,
                 instanceId,
                 bundle.context,
                 indices[level],
@@ -540,7 +442,6 @@ liveDescribe("aggressive E2E (per-tree byte identity)", () => {
             }
             const leafR = await fetchSingleRow(
               LIVE_URL,
-              LIVE_TOKEN,
               instanceId,
               bundle.context,
               leafIndex,
@@ -585,11 +486,11 @@ liveDescribe("aggressive E2E (per-tree byte identity)", () => {
 });
 
 liveDescribe("aggressive E2E (PPOI architecture probe)", () => {
-  for (const instanceId of ["ppoi-status-ofac", "ppoi-paths-ofac"]) {
+  for (const instanceId of [PPOI_STATUS_INSTANCE, ppoiPathInstance(0)]) {
     it(
       `${instanceId}: probe for non-empty corpus`,
       async () => {
-        if (!LIVE_URL || !LIVE_TOKEN) throw new Error("env guard");
+        if (!LIVE_URL) throw new Error("env guard");
         const status = await probeStatus();
         const inst = status.instances.find((i) => i.id === instanceId);
         if (!inst) {
@@ -602,12 +503,12 @@ liveDescribe("aggressive E2E (PPOI architecture probe)", () => {
           return;
         }
         // epoch 0 + active drain_state + no applied block reads as an empty corpus.
-        const empty = inst.epoch === 0 && status.consumer.last_applied_block === 0;
+        const empty = inst.epoch === 0 && status.consumer?.last_applied_block === 0;
         if (empty) {
           ppoiRows.push({
             instance: instanceId,
             populated: false,
-            reason: `epoch=0, consumer.last_applied_block=0 — empty corpus pre-mock-ppoi-redeploy (Tier 0.H gap)`,
+            reason: "epoch=0 and consumer.last_applied_block=0: the corpus is empty",
           });
           emitFindings();
           return;
@@ -616,7 +517,6 @@ liveDescribe("aggressive E2E (PPOI architecture probe)", () => {
         try {
           const r = await fetchSingleRow(
             LIVE_URL,
-            LIVE_TOKEN,
             instanceId,
             bundle.context,
             0,
@@ -651,7 +551,7 @@ liveDescribe("aggressive E2E (fuzz)", () => {
     it(
       `commit-tree-${treeNumber}: ${FUZZ_SAMPLE} random fold-and-verify iterations`,
       async () => {
-        if (!LIVE_URL || !LIVE_TOKEN) throw new Error("env guard");
+        if (!LIVE_URL) throw new Error("env guard");
         const instanceId = `commit-tree-${treeNumber}`;
         const bundle = await getInstance(instanceId);
         const leafCount = TREE_LEAF_COUNT[treeNumber];
@@ -669,7 +569,6 @@ liveDescribe("aggressive E2E (fuzz)", () => {
             const allIdx = [leafIndex, ...Array.from(indices)];
             const batch = await fetchBatch(
               LIVE_URL,
-              LIVE_TOKEN,
               instanceId,
               bundle.context,
               allIdx,
@@ -730,9 +629,9 @@ liveDescribe("aggressive E2E (throughput)", () => {
     "commit-tree-3",
   ]) {
     it(
-      `${instanceId}: throughput sweep K={1,4,16} × ${THROUGHPUT_SEEDS} seeds × ${THROUGHPUT_SAMPLE} queries`,
+      `${instanceId}: throughput sweep K={1,4,16} x ${THROUGHPUT_SEEDS} seeds x ${THROUGHPUT_SAMPLE} queries`,
       async () => {
-        if (!LIVE_URL || !LIVE_TOKEN) throw new Error("env guard");
+        if (!LIVE_URL) throw new Error("env guard");
         const treeNumber = Number(instanceId.split("-").pop()!);
         const bundle = await getInstance(instanceId);
         const leafCount = TREE_LEAF_COUNT[treeNumber];
@@ -760,7 +659,6 @@ liveDescribe("aggressive E2E (throughput)", () => {
                 try {
                   await fetchSingleRow(
                     LIVE_URL!,
-                    LIVE_TOKEN!,
                     instanceId,
                     bundle.context,
                     target,
@@ -803,7 +701,6 @@ liveDescribe("aggressive E2E (throughput)", () => {
         const t0 = Date.now();
         const batchRes = await fetchBatch(
           LIVE_URL,
-          LIVE_TOKEN,
           instanceId,
           bundle.context,
           Array.from(indices),

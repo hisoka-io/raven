@@ -68,6 +68,8 @@ export interface ClientPirContext {
 export interface ShardGeometry {
   readonly entriesPerShard: number;
   readonly shardCount: number;
+  /** Rows the instance holds; an index at or past it has no row. */
+  readonly totalEntries: number;
 }
 
 /** Decode bincode `ShardConfig { shard_size_bytes, entry_size_bytes, total_entries }`. */
@@ -111,6 +113,7 @@ export function decodeShardGeometry(shardConfigBincode: Uint8Array): ShardGeomet
   return {
     entriesPerShard: Number(entriesPerShard),
     shardCount: Number(shardCount),
+    totalEntries: Number(totalEntries),
   };
 }
 

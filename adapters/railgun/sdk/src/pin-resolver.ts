@@ -10,9 +10,15 @@
  * two audits called it: the NOTE is hidden, the BLOCK is not. `block` is
  * `floor(noteLeafIndex / 65_536)`, so a request tells the aggregator which block the note sits
  * in -- about one-in-six for the OFAC list today. Requests for one block are identical between
- * wallets apart from the JSON-RPC `id`, and the tail cache is consulted before the point query
- * so a filling block costs one request per cache window rather than one per proof. A caller who
- * needs the block hidden preloads `ppoiPinnedRoots` and never reaches this module.
+ * wallets apart from the JSON-RPC `id`, and the tail cache is consulted before the point query,
+ * so a BURST of proofs against one Raven snapshot costs one block-naming request rather than one
+ * per proof. It is not one per cache window: a fold whose root has moved off the cached window
+ * makes `verifyAgainstUpstreamPin` forget the tail and re-resolve, and a re-resolve starts with
+ * the point query. For a filling block every insert moves every auth path in it, so a list that
+ * takes a leaf between two proofs is back to one block-naming request per proof. State it that
+ * way -- the first version of this paragraph overclaimed and two audits called it, and the
+ * replacement overclaimed differently. A caller who needs the block hidden preloads
+ * `ppoiPinnedRoots` and never reaches this module.
  */
 
 import { RavenError } from "./errors";
@@ -223,6 +229,16 @@ export class UpstreamPinResolver {
       if (row.index !== lastIndex) continue;
       roots.add(row.root);
     }
+    // A full tree has exactly one root at its last leaf, so a second distinct answer is upstream
+    // contradicting itself -- and this result is cached as immutable for the process lifetime.
+    // Widening the accepted set would have made that contradiction permanent and invisible.
+    if (roots.size > 1) {
+      throw RavenError.serverError(
+        `pin resolver: upstream answered the zero-width query at leaf ${lastIndex} with ` +
+          `${roots.size} different roots; a frozen block has one`,
+        { url: this.endpoint },
+      );
+    }
     return roots.size === 0 ? undefined : roots;
   }
 
@@ -244,19 +260,25 @@ export class UpstreamPinResolver {
       }),
     );
     return {
-      roots: this.rootsInBlock(rows, block),
+      roots: this.rootsInBlock(rows, block, startIndex, latestIndex),
       window: { startIndex, endIndex: latestIndex, frozen: false },
     };
   }
 
-  /** The index filter is not decoration: clamping to the tail block still lets a window
-   *  that began in block B-1 hand back B-1's root, which folds against a different tree. */
+  /** Two filters, both load-bearing. Block: a window that began in block B-1 would otherwise hand
+   *  back B-1's root, which folds against a different tree. Range: the refusal quotes this window
+   *  as what was checked, so a row upstream volunteered from OUTSIDE it -- the block's first leaf,
+   *  say -- must not be counted as a candidate the wallet's fold was measured against. Same
+   *  reasoning as `pointQuery`, which was hardened first and one function up. */
   private rootsInBlock(
     rows: readonly { index: number; root: string }[],
     block: number,
+    startIndex: number,
+    endIndex: number,
   ): ReadonlySet<string> {
     const out = new Set<string>();
     for (const row of rows) {
+      if (row.index < startIndex || row.index > endIndex) continue;
       if (Math.floor(row.index / LEAVES_PER_PPOI_BLOCK) !== block) continue;
       out.add(row.root);
     }
@@ -391,7 +413,10 @@ export class UpstreamPinResolver {
         { url: this.endpoint, status: response.status },
       );
     }
-    if (Object.prototype.hasOwnProperty.call(decoded, "error")) {
+    // Presence, not content, was the test -- so a proxy that spells success `"error": null`
+    // turned every pin fetch, and therefore every unpinned proof, into a refusal. JSON-RPC 2.0
+    // says the member is absent on success; tolerating the null spelling costs nothing.
+    if (decoded.error !== undefined && decoded.error !== null) {
       const rpcError = decoded.error;
       const detail = isRecord(rpcError)
         ? `${String(rpcError.code)}: ${String(rpcError.message)}`

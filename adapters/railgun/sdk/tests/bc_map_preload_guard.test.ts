@@ -1,25 +1,20 @@
-// CHARACTERIZES a known gap, in the shape `network_and_validation.test.ts` uses for the unchecked
-// chain-id header: an EMPTY bc-to-idx map is accepted as a list state.
-//
-// `lookupBcMap` returns whatever is cached and callers refuse only on `undefined`. An empty Map is
-// truthy, so a node that has not bootstrapped — which serves an empty map — makes the SDK write
-// "Missing" for every blinded commitment, with no query issued and nothing logged. "Missing" is a
-// verdict a wallet acts on.
-//
-// Asserting that an empty map is REFUSED is what a fix looks like. It was not made here because the
-// refusal cannot distinguish "the node has no data" from "this BC is genuinely not on the list"
-// without the map's epoch, and the epoch is discarded by `BcToIdxMap = Map<string, number>`
-// (`poi-pir.ts:25`) even though `fetchBcToIdxMap` returns it. Carrying it changes a public exported
-// type, which is owner-reserved. See the open question filed for this card.
+// A node that has not bootstrapped serves an EMPTY bc-to-idx map, and `lookupBcMap` refuses only
+// on `undefined`: an empty Map is truthy, so reading it as a list state made the SDK write "Missing"
+// for every blinded commitment, with nothing logged. "Missing" is a verdict a wallet acts on, and an
+// empty map cannot tell "the node has no data" from "this commitment is not on the list". So an
+// absence reads "Missing" only from an index shown to cover the rows the node serves; a map, which
+// carries no row count, answers one only when the caller decides it may, as "MissingStale", and the
+// decision is counted.
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { RavenPOINodeInterface } from "../src/index";
+import { RavenError, RavenPOINodeInterface } from "../src/index";
 import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
 import type { ClientPirContext, RavenInspireWasm } from "../src/index";
 import { encodeBatchResponseNodes, encodedBatchCount } from "./helpers/auth_path_stub";
 import { startMockServer, writeBinary, type MockServer } from "./helpers/mock_server";
 import { stubQueryBundle } from "./helpers/private_wire";
+import { shardConfigBincode } from "./helpers/shard_config";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX = "abababababababababababababababababababababababababababababababab";
@@ -40,12 +35,12 @@ function stubCtx(): ClientPirContext {
     wasm,
     session: { free: () => undefined },
     crsBincode: new Uint8Array(0),
-    shardConfigBincode: new Uint8Array(0),
+    shardConfigBincode: shardConfigBincode(),
     entrySize: 32,
   };
 }
 
-describe("an empty bc-to-idx map is accepted as a list state", () => {
+describe("an empty bc-to-idx map is not a list state", () => {
   let server: MockServer;
   beforeAll(async () => {
     server = await startMockServer();
@@ -61,37 +56,79 @@ describe("an empty bc-to-idx map is accepted as a list state", () => {
         return true;
       },
     );
+    // What the shim answers for a list it holds no rows of.
+    server.route(
+      (req) => (req.url ?? "").startsWith(`/v1/poi/${LIST_KEY_HEX}/bc-prefixes`),
+      (_req, _body, res) => {
+        res.writeHead(503, { "content-type": "text/plain" });
+        res.end("no wired store covers the list");
+        return true;
+      },
+    );
   });
   afterAll(async () => {
     await server.close();
   });
 
-  function sdkWith(map: Map<string, number>): RavenPOINodeInterface {
+  function sdkWith(
+    map: Map<string, number>,
+    policy?: "refuse" | "answer-at-index-rows",
+  ): RavenPOINodeInterface {
     return new RavenPOINodeInterface({
       endpoint: server.url,
       bearerToken: TOKEN,
       useClientPir: true,
       clientPirContexts: new Map([[`t1Status:${LIST_KEY_HEX}`, stubCtx()]]),
       bcToIdxMaps: new Map([[LIST_KEY_HEX, map]]),
+      indexStalenessPolicy: policy,
+      poiListIndexStore: false,
     });
   }
 
-  it("an unbootstrapped node's empty map reads as Missing, not as a refusal", async () => {
-    const got = await sdkWith(new Map()).getPOIsPerList(
+  it("refuses an absence read from an unbootstrapped node's empty map", async () => {
+    const sdk = sdkWith(new Map());
+    await expect(
+      sdk.getPOIsPerList([LIST_KEY_HEX], [{ blindedCommitment: BC_HEX, type: "Shield" }]),
+    ).rejects.toSatisfy(
+      (e: unknown) => RavenError.is(e, "InvalidQuery") && /carries no row count/.test(e.message),
+    );
+    expect(sdk.indexCounters().refused).toBe(1);
+  });
+
+  it("refuses an absence read from an empty index the node cannot bring up to date", async () => {
+    const sdk = new RavenPOINodeInterface({
+      endpoint: server.url,
+      bearerToken: TOKEN,
+      useClientPir: true,
+      clientPirContexts: new Map([[`t1Status:${LIST_KEY_HEX}`, stubCtx()]]),
+      poiListIndexes: new Map([[LIST_KEY_HEX, { epoch: 0, total: 0, prefixes: new Uint8Array(0) }]]),
+      poiListIndexStore: false,
+    });
+    await expect(
+      sdk.getPOIsPerList([LIST_KEY_HEX], [{ blindedCommitment: BC_HEX, type: "Shield" }]),
+    ).rejects.toSatisfy((e: unknown) => RavenError.is(e, "ServerError"));
+    expect(sdk.indexCounters().absent).toBe(0);
+  });
+
+  it("answers MissingStale from an empty map only on the caller's decision, and counts it apart", async () => {
+    const sdk = sdkWith(new Map(), "answer-at-index-rows");
+    const got = await sdk.getPOIsPerList(
       [LIST_KEY_HEX],
       [{ blindedCommitment: BC_HEX, type: "Shield" }],
     );
-    // The gap: indistinguishable from a real absence, and acted on as a verdict.
-    expect(got[BC_HEX][LIST_KEY_HEX]).toBe("Missing");
+    expect(got[BC_HEX][LIST_KEY_HEX]).toBe("MissingStale");
+    expect(sdk.indexCounters().absentFromBareMap).toBe(1);
+    expect(sdk.indexCounters().absent).toBe(0);
   });
 
-  it("a MISSING map entry does refuse, which is the behaviour an empty map should share", async () => {
+  it("a MISSING map entry refuses too", async () => {
     const sdk = new RavenPOINodeInterface({
       endpoint: server.url,
       bearerToken: TOKEN,
       useClientPir: true,
       clientPirContexts: new Map([[`t1Status:${LIST_KEY_HEX}`, stubCtx()]]),
       bcToIdxMaps: new Map(),
+      poiListIndexStore: false,
     });
     await expect(
       sdk.getPOIsPerList([LIST_KEY_HEX], [{ blindedCommitment: BC_HEX, type: "Shield" }]),

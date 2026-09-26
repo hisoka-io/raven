@@ -4,6 +4,7 @@ export {
   type RavenConfig,
   type PrivateStalePolicy,
   type POIStatus,
+  type PoisPerListResponse,
   type BlindedCommitmentType,
   type BlindedCommitmentData,
   type StatusHeader,
@@ -14,6 +15,9 @@ export {
   type Proof,
   type LegacyTransactProofData,
   type CapturedWireRequest,
+  type BcToIdxMapBody,
+  type IndexStalenessPolicy,
+  type PoiIndexCounters,
   containsByteSequence,
   hexToBytes,
   bytesToHex,
@@ -55,9 +59,10 @@ export {
 } from "./client-pir";
 
 // Railgun POI decoding and Merkle addressing.
-export type { BcToIdxMap, RavenPOIPathWasm } from "./poi-pir";
+export type { BcIdxEntry, BcToIdxMap, RavenPOIPathWasm } from "./poi-pir";
 
 export {
+  bcToIdxMapFrom,
   statusByteToPOIStatus,
   validateBcHex,
   validateLeafIndex,
@@ -107,3 +112,20 @@ export {
   isOnLadder,
   paddedBatchLength,
 } from "./batch-ladder";
+
+export {
+  BC_INDEX_PREFIX_BYTES,
+  BC_INDEX_RESUME_ALIGN_ROWS,
+  fetchBcPrefixIndex,
+  indexCandidatesFor,
+  indexCandidatesForEach,
+  resumeBcPrefixIndex,
+  type BcPrefixIndex,
+} from "./bc-prefix-index";
+
+// Persistence for list indexes, so a restarted client resolves without re-walking the list.
+export {
+  indexedDbPoiListIndexStore,
+  type IndexedDbPoiListIndexStoreConfig,
+  type PoiListIndexStore,
+} from "./poi-list-index-store";

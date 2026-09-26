@@ -1,8 +1,11 @@
+import type { POIsPerList as EnginePOIsPerList } from "@railgun-community/engine";
 import {
   type ClientPirContext,
   decodeClientPirQueryBundle,
+  decodeShardGeometry,
 } from "./client-pir";
 import {
+  type BcIdxEntry,
   type BcToIdxMap,
   type POIStatus,
   bytesToHex,
@@ -18,6 +21,16 @@ import {
   TREE_DEPTH,
 } from "./poi-pir";
 import { drawPaddedSlots, MAX_BATCH_SIZE } from "./batch-ladder";
+import {
+  type BcPrefixIndex,
+  BC_INDEX_PREFIX_BYTES,
+  assertBcPrefixIndex,
+  bcPrefixIndexFromRows,
+  fetchBcPrefixIndex,
+  indexCandidatesForEach,
+  resumeBcPrefixIndex,
+  sharesOnlyPrefix,
+} from "./bc-prefix-index";
 import { bearerHeaders } from "./bearer-auth";
 import {
   buildFanoutCoverPlan,
@@ -28,6 +41,13 @@ import { ChainRegistry, type ChainRegistryEntry } from "./chain-registry";
 import { RavenError, type StaleDataContext } from "./errors";
 import { ImtCache, imtCacheKey, imtCacheScopeKey } from "./imt-cache";
 import { LEAVES_PER_PPOI_BLOCK, type ResolvedPins, UpstreamPinResolver } from "./pin-resolver";
+import {
+  type PoiListIndexStore,
+  decodePoiListIndexRecord,
+  encodePoiListIndexRecord,
+  indexedDbPoiListIndexStore,
+  poiListIndexStoreKey,
+} from "./poi-list-index-store";
 import { foldMerkleRoot } from "./poseidon";
 
 export type BlindedCommitmentType = "Shield" | "Transact" | "Unshield";
@@ -41,7 +61,7 @@ export type BlindedCommitmentType = "Shield" | "Transact" | "Unshield";
  * every ShieldBlocked commitment on the list read as clean.
  */
 export interface StatusHeader {
-  /** Block height of the snapshot. */
+  /** Lowest block height any store covering the list has applied; 0 for a mirrored PPOI list. */
   epoch: number;
   /** Hex-encoded 32-byte list key. */
   listKey: string;
@@ -98,13 +118,12 @@ export interface CommitTreeAuthPath {
 }
 
 /**
- * Commit-tree proof, discriminated by whether a root is available. Client-PIR retrieves
- * auth-path siblings and never the leaf, so it cannot fold a root and does not claim one;
- * only the plaintext route, which the adapter answers with its own root, carries `rooted`.
+ * Commit-tree proof, on both routes: siblings and path bits, never a root. Client-PIR never
+ * retrieves the leaf, so it has nothing to fold one from. The plaintext route sends a root, but
+ * only the serving node vouches for it, so it is dropped with the leaf: the wallet folds its own
+ * note, and the contract's root history is what checks the result.
  */
-export type CommitTreeProof =
-  | { readonly kind: "rooted"; readonly proof: MerkleProof }
-  | ({ readonly kind: "authPath" } & CommitTreeAuthPath);
+export type CommitTreeProof = { readonly kind: "authPath" } & CommitTreeAuthPath;
 
 // Upstream Railgun Chain shape (engine/src/models/engine-types.ts); numeric `type` matches upstream wire shape.
 /** Upstream Chain shape; numeric `type` matches the upstream wire shape. */
@@ -150,24 +169,45 @@ interface RavenConfigBase {
   /** Pre-loaded client-PIR contexts keyed `t1Status|t2Path|t3CommitTree:<chainId>:<id>`;
    * the chain-less legacy key is accepted as a fallback. */
   clientPirContexts?: Map<string, ClientPirContext>;
-  /** Deployed instance ids keyed by the same semantic context key. */
+  /** Deployed instance ids keyed by the same semantic context key. A path label keyed
+   *  `t2Path:<chainId>:<listKey>:<block>` names an instance holding that block alone, asked at the
+   *  leaf's row in it; any other label names one instance for the whole list, asked at the list
+   *  index. An index past the rows an instance's shard config declares is refused by name. */
   clientPirInstanceLabels?: Map<string, string>;
   /** Pinned PPOI block roots keyed `<chainId>:<listKey>:<block>`;
-   * the chain-less legacy key is accepted as a fallback. A caller-supplied pin always wins. */
+   * the chain-less legacy key is accepted as a fallback. A caller-supplied pin always wins.
+   * With `useClientPir: false` no route names a proof's block, so `getPOIMerkleProofs` refuses
+   * before any request unless the list has a pin here, and accepts only a proof folding to one. */
   ppoiPinnedRoots?: Map<string, string>;
   /** Upstream PPOI aggregator to read block roots from when no root is pinned. Defaults to
    * `upstreamFallbackEndpoint`; `false` disables the resolver and restores the bare refusal.
    *
    * The default introduces no new party and no new connection: the wallet already opens TLS
    * to that host for validation and submission. There is deliberately no fallback hostname --
-   * an invented default would send every unconfigured wallet to a host nobody chose. */
+   * an invented default would send every unconfigured wallet to a host nobody chose.
+   *
+   * A stale-fallback proof comes from `upstreamFallbackEndpoint` itself, and a root from the
+   * proof's own source checks nothing, so the resolver is not asked for it on that origin. Under
+   * the default such a proof refuses unless its block is pinned or this names another aggregator. */
   pinUpstream?: string | false;
   /** Upstream `NetworkName` under `forNetwork`; defaults from `chainType`/`chainId`. */
   pinUpstreamNetworkName?: string;
   /** In-memory TTL for the filling block's roots. Frozen blocks are cached forever. */
   pinTailTtlMs?: number;
-  /** Pre-loaded BC -> idx maps, keyed by `<chainId>:<listKeyHex>` or legacy `<listKeyHex>`. */
+  /** Pre-loaded BC -> idx maps, keyed by `<chainId>:<listKeyHex>` or legacy `<listKeyHex>`.
+   *  A map carries no row count, so an absence read from one cannot be shown current; see
+   *  `indexStalenessPolicy`. */
   bcToIdxMaps?: Map<string, BcToIdxMap>;
+  /** List indexes carrying the row count they cover, keyed as `bcToIdxMaps`; `syncPoiListIndex`
+   *  builds one. Every client-PIR call brings the index up to the node's list before using it, and
+   *  the first one re-reads every row of an index given here, since this node did not produce it. */
+  poiListIndexes?: Map<string, BcPrefixIndex>;
+  /** Where list indexes persist between runs: IndexedDB where the runtime has it, which Node does
+   *  not, so a Node caller passes its own. `false` keeps them in memory only. */
+  poiListIndexStore?: PoiListIndexStore | false;
+  /** An absence that cannot be shown current is refused by default. `"answer-at-index-rows"`
+   *  answers it `MissingStale` as of the rows held, and `indexCounters()` counts it apart. */
+  indexStalenessPolicy?: IndexStalenessPolicy;
   /** IMT cache for auth-path reconstruction; defaults to in-memory 1024 entries plus IndexedDB when available. */
   imtCache?: ImtCache;
 }
@@ -186,14 +226,52 @@ export type PrivateStalePolicy =
 /** SDK constructor options; omitted private-stale policy fails closed. */
 export type RavenConfig = RavenConfigBase & PrivateStalePolicy;
 
+/** What an absence is answered with when it cannot be shown current against the node's list. */
+export type IndexStalenessPolicy = "refuse" | "answer-at-index-rows";
+
+/** How each index-derived absence was answered. Only `absent` speaks for the list served now.
+ *  A proof has no answer for an absence, so `getPOIMerkleProofs` refuses every kind and counts it
+ *  under the field its status would have taken. */
+export interface PoiIndexCounters {
+  /** `Missing`, from an index brought up to the node's list in the same call. */
+  readonly absent: number;
+  /** `MissingStale`, from an index whose sync failed, under `answer-at-index-rows`. */
+  readonly absentFromStaleIndex: number;
+  /** `MissingStale`, from a `bcToIdxMaps` entry, which has no row count, under
+   *  `answer-at-index-rows`. */
+  readonly absentFromBareMap: number;
+  /** Per-list refusals of absences that could not be shown current: thrown, or `Unreachable`
+   *  when the sync failed on the network. */
+  readonly refused: number;
+  /** Syncs that found the node's list longer than the index held. */
+  readonly staleIndexesCaught: number;
+}
+
+/** `GET /v1/poi/:list/bc-to-idx-map`, checked rather than cast. */
+export interface BcToIdxMapBody {
+  /** As served; 0 for a mirrored PPOI list, so it says nothing about how current the rows are. */
+  readonly epoch: number;
+  readonly listKey: string;
+  /** The body covers rows `[0, rows)`, one entry per row in index order. `rows` lies between the
+   *  counts the node's prefix channel served just before and just after the body, and every row
+   *  carries the prefix that channel serves for it. */
+  readonly rows: number;
+  readonly entries: BcIdxEntry[];
+}
+
+/** `failure` set means the index could not be brought up to the node's list: its present
+ *  candidates still resolve, since a row the list holds never moves, but its absences are stale. */
+type ListIndexSource =
+  | { readonly kind: "bound"; readonly index: BcPrefixIndex; readonly failure?: unknown }
+  | { readonly kind: "bare"; readonly map: BcToIdxMap };
+
 export interface BlindedCommitmentData {
   blindedCommitment: string;
   type: BlindedCommitmentType;
 }
 
-interface PoisPerListResponse {
-  // Outer key BC hex, inner list-key hex; mirrors upstream POIsPerListMap.
-  // Outer key BC hex, inner list-key hex; mirrors upstream POIsPerListMap (shared-models/src/models/proof-of-innocence.ts:153).
+/** Outer key BC hex, inner list-key hex; mirrors upstream `POIsPerListMap`. */
+export interface PoisPerListResponse {
   [bcHex: string]: { [listKey: string]: POIStatus };
 }
 
@@ -219,6 +297,17 @@ interface AuthPathResult {
   nodes: Uint8Array[];
   freshness: PrivateFreshness;
 }
+
+/** Where one list index is asked, and where its leaf sits in its PPOI block's tree. */
+interface ListRowTarget {
+  readonly block: number;
+  readonly leaf: number;
+  readonly label: string;
+  readonly row: number;
+}
+
+/** Checks a fold against a root some party other than the proof's source vouches for. */
+type RootAnchor = (folded: string, bcHex: string, label: string) => Promise<void>;
 
 interface SessionLease {
   readonly key: string;
@@ -277,7 +366,25 @@ export class RavenPOINodeInterface {
   private readonly clientPirInstanceLabels: Map<string, string>;
   private readonly ppoiPinnedRoots: Map<string, string>;
   private readonly pinResolver: UpstreamPinResolver | undefined;
+  private readonly pinResolverSource: string | undefined;
   private readonly bcToIdxMaps: Map<string, BcToIdxMap>;
+  private readonly poiListIndexes: Map<string, BcPrefixIndex>;
+  private readonly indexStore: PoiListIndexStore | undefined;
+  private readonly stalenessPolicy: IndexStalenessPolicy;
+  private readonly heldIndexes = new Map<string, BcPrefixIndex>();
+  // Keys whose held rows this node served or confirmed; any other index is re-read in full.
+  private readonly confirmedIndexes = new Set<string>();
+  // One sync per key at a time, so a slower one cannot land an older list over a newer one.
+  private readonly syncQueues = new Map<string, Promise<BcPrefixIndex>>();
+  // One store read per key, awaited by every caller: a caller arriving mid-read gets its result.
+  private readonly storeLoads = new Map<string, Promise<void>>();
+  private readonly counters = {
+    absent: 0,
+    absentFromStaleIndex: 0,
+    absentFromBareMap: 0,
+    refused: 0,
+    staleIndexesCaught: 0,
+  };
   private readonly cache: ImtCache;
   // Last snapshot epoch each instance reported; auth-path cache entries are tagged with it.
   private readonly observedEpochs: Map<string, string> = new Map();
@@ -310,6 +417,20 @@ export class RavenPOINodeInterface {
     this.clientPirInstanceLabels = config.clientPirInstanceLabels ?? new Map();
     this.ppoiPinnedRoots = config.ppoiPinnedRoots ?? new Map();
     this.bcToIdxMaps = config.bcToIdxMaps ?? new Map();
+    this.poiListIndexes = config.poiListIndexes ?? new Map();
+    for (const [key, index] of this.poiListIndexes) {
+      assertBcPrefixIndex(index, `poiListIndexes[${key}]`);
+    }
+    this.indexStore =
+      config.poiListIndexStore === false
+        ? undefined
+        : (config.poiListIndexStore ?? indexedDbPoiListIndexStore());
+    this.stalenessPolicy = config.indexStalenessPolicy ?? "refuse";
+    if (this.stalenessPolicy !== "refuse" && this.stalenessPolicy !== "answer-at-index-rows") {
+      throw RavenError.invalidQuery(
+        `indexStalenessPolicy must be "refuse" or "answer-at-index-rows"`,
+      );
+    }
     this.cache = config.imtCache ?? new ImtCache();
 
     if (
@@ -353,7 +474,7 @@ export class RavenPOINodeInterface {
       this.privateStalePolicy === "allow-upstream-disclosure"
     ) {
       const served = this.registry.resolve(this.chainId).endpoint;
-      if (sameParty(served, this.upstream)) {
+      if (samePartyOrUnknown(served, this.upstream) !== false) {
         throw RavenError.invalidQuery(
           "upstreamFallbackEndpoint must not be the endpoint it falls back from; both " +
             `resolve to ${this.upstream}, so the fallback discloses to the same operator`,
@@ -372,25 +493,61 @@ export class RavenPOINodeInterface {
       config.pinUpstream === false
         ? undefined
         : (config.pinUpstream ?? this.upstream)?.replace(/\/$/, "");
-    if (typeof config.pinUpstream === "string" && sameParty(pinSource, routeEndpoint)) {
+    if (typeof config.pinUpstream === "string" && !isUsableEndpoint(pinSource ?? "")) {
+      throw RavenError.invalidQuery(
+        `pinUpstream must be an http(s) URL or a same-origin path, got ` +
+          `${JSON.stringify(config.pinUpstream)}; pass false to disable pin verification`,
+      );
+    }
+    if (typeof config.pinUpstream === "string" && samePartyOrUnknown(pinSource, routeEndpoint)) {
       throw RavenError.invalidQuery(
         "pinUpstream must not be the endpoint whose auth paths it verifies; both resolve to " +
           `${routeEndpoint}, so the pin would come from the party that supplied the siblings`,
       );
     }
-    this.pinResolver =
-      pinSource === undefined || sameParty(pinSource, routeEndpoint)
-        ? undefined
-        : new UpstreamPinResolver({
-            endpoint: pinSource,
-            fetchImpl: this.fetchImpl,
-            chainType: this.chainType,
-            chainId: this.chainId,
-            txidVersion: this.txidVersion,
-            networkName: config.pinUpstreamNetworkName,
-            tailTtlMs: config.pinTailTtlMs,
-            onRequest: (url, method, body) => this.captureRequest(url, method, body),
-          });
+    // An INHERITED pin source must never be fatal. The guard above already gets that right for
+    // the self-aiming case, and then this constructor undid it: `UpstreamPinResolver` throws on
+    // an unlisted chain, so a wallet whose only relevant config is `upstreamFallbackEndpoint` --
+    // the configuration the README calls normal -- failed to construct at all on any chain
+    // outside the six-entry network map, killing the status, commit-tree and passthrough paths,
+    // none of which use pins. An audit reproduced it on chain 10. A caller who named
+    // `pinUpstream` or `pinUpstreamNetworkName` asked for the resolver and still gets the throw.
+    // `pinTailTtlMs` belongs here beside the other two: naming it is asking for the resolver just
+    // as much, and without it a caller who set a negative TTL had the constructor's refusal
+    // swallowed, pin verification silently off, and a fold-time message naming neither the field
+    // nor its value.
+    const pinRequestedByName =
+      typeof config.pinUpstream === "string" ||
+      config.pinUpstreamNetworkName !== undefined ||
+      config.pinTailTtlMs !== undefined;
+    if (pinSource === undefined || samePartyOrUnknown(pinSource, routeEndpoint) === true) {
+      this.pinResolver = undefined;
+      this.pinResolverSource = undefined;
+    } else {
+      const build = (): UpstreamPinResolver =>
+        new UpstreamPinResolver({
+          endpoint: pinSource,
+          fetchImpl: this.fetchImpl,
+          chainType: this.chainType,
+          chainId: this.chainId,
+          txidVersion: this.txidVersion,
+          networkName: config.pinUpstreamNetworkName,
+          tailTtlMs: config.pinTailTtlMs,
+          onRequest: (url, method, body) => this.captureRequest(url, method, body),
+        });
+      if (pinRequestedByName) {
+        this.pinResolver = build();
+      } else {
+        try {
+          this.pinResolver = build();
+        } catch {
+          // Inert, exactly as the self-aiming inherited case is. The fold-time refusal names
+          // the missing pin source, which is the diagnosis a caller can act on.
+          this.pinResolver = undefined;
+        }
+      }
+      this.pinResolverSource = this.pinResolver === undefined ? undefined : pinSource;
+    }
   }
 
   isActive(chain: Chain): boolean {
@@ -508,12 +665,15 @@ export class RavenPOINodeInterface {
     );
   }
 
+  // Engine's status is a nominal string enum that no literal union is assignable to, so this
+  // overload answers in engine's own type. `Unreachable` is not one of its members; engine only
+  // compares statuses for equality, so it reads as not-Valid.
   async getPOIsPerList(
     txidVersion: string,
     chain: Chain,
     listKeys: string[],
     blindedCommitmentDatas: BlindedCommitmentData[],
-  ): Promise<PoisPerListResponse>;
+  ): Promise<{ [blindedCommitment: string]: EnginePOIsPerList }>;
   async getPOIsPerList(
     listKeys: string[],
     blindedCommitmentDatas: BlindedCommitmentData[],
@@ -542,7 +702,6 @@ export class RavenPOINodeInterface {
     for (const lk of listKeys) {
       validateListKeyHex(lk);
     }
-    // Pre-init BC slots so unknown-BC rows still surface; matches upstream merge (poi-merkletree-manager.ts:215-218).
     for (const { blindedCommitment } of blindedCommitmentDatas) {
       validateBcHex(blindedCommitment);
     }
@@ -605,6 +764,11 @@ export class RavenPOINodeInterface {
     if (this.useClientPir) {
       return this.getPOIMerkleProofsClientPir(listKey, blindedCommitments);
     }
+    if (blindedCommitments.length === 0) return [];
+    const lkHex = normalizeHex(listKey);
+    // Neither this route nor upstream names a proof's block, so only a caller pin can anchor it,
+    // and a call with none for the list refuses before sending the commitments anywhere.
+    const anchor = this.listPinAnchor(lkHex);
     const body = {
       txidVersion: this.txidVersion,
       listKey,
@@ -614,10 +778,23 @@ export class RavenPOINodeInterface {
       "/v1/poi/merkle-proofs",
       body,
     );
-    if (this.shouldFallback(freshness) && this.upstream) {
-      return this.passthroughMerkleProofs(listKey, blindedCommitments);
+    const fromUpstream = this.shouldFallback(freshness) && Boolean(this.upstream);
+    const proofs = fromUpstream
+      ? await this.passthroughMerkleProofs(listKey, blindedCommitments)
+      : assertMerkleProofArray(json, "/v1/poi/merkle-proofs");
+    const label = fromUpstream ? "upstream ppoi_merkle_proofs" : "/v1/poi/merkle-proofs";
+    const byLeaf = new Map(proofs.map((proof) => [normalizeHex(proof.leaf), proof]));
+    const out: MerkleProof[] = [];
+    for (const bc of blindedCommitments) {
+      const bcHex = normalizeHex(bc);
+      const proof = byLeaf.get(bcHex);
+      if (!proof) {
+        throw RavenError.decodeError(`${label}: omitted BC ${bcHex} on list ${lkHex}`);
+      }
+      await anchor(foldForeignProof(proof, bcHex, label), bcHex, label);
+      out.push(proof);
     }
-    return assertMerkleProofArray(json, "/v1/poi/merkle-proofs");
+    return out;
   }
 
   async getMerkleProof(treeNumber: number, leafIndex: number): Promise<CommitTreeProof> {
@@ -626,14 +803,9 @@ export class RavenPOINodeInterface {
     if (this.useClientPir) {
       return this.getMerkleProofClientPir(treeNumber, leafIndex);
     }
-    const { json } = await this.postJson<MerkleProof>(
-      `/v1/commit-tree/${treeNumber}/merkle-proof`,
-      { leafIndex },
-    );
-    return {
-      kind: "rooted",
-      proof: assertMerkleProof(json, `/v1/commit-tree/${treeNumber}/merkle-proof`),
-    };
+    const route = `/v1/commit-tree/${treeNumber}/merkle-proof`;
+    const { json } = await this.postJson<unknown>(route, { leafIndex });
+    return servedCommitTreeAuthPath(json, leafIndex, route);
   }
 
   // `POINodeInterface.validatePOIMerkleroots` (engine/src/poi/poi-node-interface.ts:30-35);
@@ -765,15 +937,33 @@ export class RavenPOINodeInterface {
     }, true);
   }
 
-  async fetchBcToIdxMap(listKey: string): Promise<{ epoch: number; entries: { bc: string; idx: number }[] }> {
+  /** Rows of the JSON index channel. Turn them into a preload map with `bcToIdxMapFrom`,
+   *  which keeps the occurrence the adapter resolves to; `new Map(entries)` keeps the other one.
+   *
+   *  The body carries no count of its own, so every row is compared with the prefix channel, read
+   *  just before it. The list only grows, so a body shorter than that read was cut or copied from
+   *  an older list, and one longer than the list served just after it holds rows the node does not
+   *  serve: both are refused, as is any row whose prefix differs. */
+  async fetchBcToIdxMap(listKey: string): Promise<BcToIdxMapBody> {
     validateListKeyHex(listKey);
     const route = this.route();
-    const url = `${route.endpoint}/v1/poi/${listKey}/bc-to-idx-map`;
+    const lkHex = normalizeHex(listKey);
     const credential = bearerHeaders(route.bearerToken);
+    const onPrefixRequest = (prefixUrl: string): void =>
+      this.captureRequest(prefixUrl, "GET", new Uint8Array());
+    const before = await fetchBcPrefixIndex(
+      this.fetchImpl,
+      route.endpoint,
+      lkHex,
+      credential,
+      onPrefixRequest,
+    );
+    const url = `${route.endpoint}/v1/poi/${listKey}/bc-to-idx-map`;
     this.captureRequest(url, "GET", new Uint8Array());
     let res: Response;
     try {
-      res = await this.fetchImpl(url, { headers: credential });
+      // Served cacheable: a copy from before the prefix read would be refused as short.
+      res = await this.fetchImpl(url, { headers: credential, cache: "no-cache" });
     } catch (cause) {
       throw RavenError.network("fetchBcToIdxMap", { url, cause: String(cause) });
     }
@@ -783,7 +973,233 @@ export class RavenPOINodeInterface {
         status: res.status,
       });
     }
-    return await res.json();
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch (cause) {
+      throw RavenError.decodeError("bc-to-idx-map: body is not valid JSON", {
+        url,
+        cause: String(cause),
+      });
+    }
+    const parsed = parseBcToIdxMap(body, lkHex, url);
+    if (parsed.rows < before.total) {
+      throw RavenError.decodeError(
+        `bc-to-idx-map: the body carries ${parsed.rows} rows and the node's prefix channel ` +
+          `serves ${before.total}; a list that only grows cannot be shorter than it was just ` +
+          "before, so the body was cut or copied from an older list",
+        { url },
+      );
+    }
+    // Longer is an append that landed between the two reads; the node's list must now cover it.
+    const after =
+      parsed.rows > before.total
+        ? await resumeBcPrefixIndex(
+            this.fetchImpl,
+            route.endpoint,
+            lkHex,
+            credential,
+            before,
+            onPrefixRequest,
+            before.total,
+          )
+        : before;
+    if (parsed.rows > after.total) {
+      throw RavenError.decodeError(
+        `bc-to-idx-map: the body carries ${parsed.rows} rows, more than the ${after.total} the ` +
+          "node's prefix channel serves",
+        { url },
+      );
+    }
+    const rows = bcPrefixIndexFromRows(parsed.epoch, parsed.entries).prefixes;
+    for (let byte = 0; byte < rows.length; byte += 1) {
+      if (rows[byte] !== after.prefixes[byte]) {
+        throw RavenError.decodeError(
+          `bc-to-idx-map: row ${Math.floor(byte / BC_INDEX_PREFIX_BYTES)} differs from the ` +
+            "node's prefix channel, so the body is not the list the node serves",
+          { url },
+        );
+      }
+    }
+    return parsed;
+  }
+
+  /**
+   * Build, or bring up to the node's list, the index this client answers from, and persist it.
+   * The first sync walks the whole prefix channel; every later one re-reads only the tail.
+   */
+  async syncPoiListIndex(listKey: string): Promise<BcPrefixIndex> {
+    validateListKeyHex(listKey);
+    return this.syncIndex(normalizeHex(listKey));
+  }
+
+  /** Candidate indices for a commitment, read from the index held in memory or in the store,
+   *  with the row count they are complete for. Sends nothing. */
+  async poiListIndexCandidates(
+    listKey: string,
+    blindedCommitment: string,
+  ): Promise<{ rows: number; candidates: number[] }> {
+    validateListKeyHex(listKey);
+    validateBcHex(blindedCommitment);
+    const lkHex = normalizeHex(listKey);
+    const held = await this.heldIndex(lkHex);
+    if (held === undefined) {
+      throw RavenError.invalidQuery(
+        `no index is held for list ${lkHex} on this node; call syncPoiListIndex first`,
+      );
+    }
+    return {
+      rows: held.total,
+      candidates: indexCandidatesForEach(held, [normalizeHex(blindedCommitment)])[0],
+    };
+  }
+
+  indexCounters(): PoiIndexCounters {
+    return { ...this.counters };
+  }
+
+  private indexKey(lkHex: string): string {
+    return poiListIndexStoreKey(this.chainId, this.route().endpoint.replace(/\/$/, ""), lkHex);
+  }
+
+  private async heldIndex(lkHex: string): Promise<BcPrefixIndex | undefined> {
+    const key = this.indexKey(lkHex);
+    const held = this.heldIndexes.get(key);
+    if (held !== undefined) return held;
+    const preloaded =
+      this.poiListIndexes.get(`${this.chainId}:${lkHex}`) ?? this.poiListIndexes.get(lkHex);
+    if (preloaded !== undefined) {
+      this.heldIndexes.set(key, preloaded);
+      return preloaded;
+    }
+    if (this.indexStore === undefined) return undefined;
+    let load = this.storeLoads.get(key);
+    if (load === undefined) {
+      load = this.restoreIndex(lkHex, key, this.indexStore);
+      this.storeLoads.set(key, load);
+    }
+    await load;
+    return this.heldIndexes.get(key);
+  }
+
+  private async restoreIndex(lkHex: string, key: string, store: PoiListIndexStore): Promise<void> {
+    let restored: BcPrefixIndex | undefined;
+    try {
+      const record = await store.load(key);
+      restored = record === undefined ? undefined : await decodePoiListIndexRecord(lkHex, record);
+    } catch {
+      restored = undefined;
+    }
+    // Only a completed sync against this same node writes a record, so its rows are confirmed.
+    // Every sync awaits this read first, so nothing newer can be held yet.
+    if (restored !== undefined) {
+      this.heldIndexes.set(key, restored);
+      this.confirmedIndexes.add(key);
+    }
+  }
+
+  private syncIndex(lkHex: string): Promise<BcPrefixIndex> {
+    const key = this.indexKey(lkHex);
+    const prior = this.syncQueues.get(key);
+    const run =
+      prior === undefined
+        ? this.syncIndexNow(lkHex, key)
+        : prior.then(
+            () => this.syncIndexNow(lkHex, key),
+            () => this.syncIndexNow(lkHex, key),
+          );
+    this.syncQueues.set(key, run);
+    const settle = (): void => {
+      if (this.syncQueues.get(key) === run) this.syncQueues.delete(key);
+    };
+    run.then(settle, settle);
+    return run;
+  }
+
+  private async syncIndexNow(lkHex: string, key: string): Promise<BcPrefixIndex> {
+    const held = await this.heldIndex(lkHex);
+    const confirmed = held !== undefined && this.confirmedIndexes.has(key);
+    const route = this.route();
+    const headers = bearerHeaders(route.bearerToken);
+    const onRequest = (url: string): void => this.captureRequest(url, "GET", new Uint8Array());
+    const synced =
+      held === undefined
+        ? await fetchBcPrefixIndex(this.fetchImpl, route.endpoint, lkHex, headers, onRequest)
+        : await resumeBcPrefixIndex(
+            this.fetchImpl,
+            route.endpoint,
+            lkHex,
+            headers,
+            held,
+            onRequest,
+            confirmed ? held.total : 0,
+          );
+    if (held !== undefined && synced.total > held.total) this.counters.staleIndexesCaught += 1;
+    this.heldIndexes.set(key, synced);
+    this.confirmedIndexes.add(key);
+    if (
+      this.indexStore !== undefined &&
+      (!confirmed || synced.total !== held.total || synced.epoch !== held.epoch)
+    ) {
+      try {
+        await this.indexStore.save(key, await encodePoiListIndexRecord(lkHex, synced));
+      } catch {
+        // A failed save costs the next run a longer walk, never a wrong answer.
+      }
+    }
+    return synced;
+  }
+
+  /** The index a call answers from. A bound index is synced first; a failed sync is carried, not
+   *  thrown, since it decides only what the call's absences may say. */
+  private async listSource(lkHex: string): Promise<ListIndexSource | undefined> {
+    const held = await this.heldIndex(lkHex);
+    if (held === undefined) {
+      const map = this.lookupBcMap(lkHex);
+      return map === undefined ? undefined : { kind: "bare", map };
+    }
+    try {
+      return { kind: "bound", index: await this.syncIndex(lkHex) };
+    } catch (failure) {
+      return { kind: "bound", index: (await this.heldIndex(lkHex)) ?? held, failure };
+    }
+  }
+
+  /** Returns a refusal rather than throwing it: the caller raises it once every list's queries
+   *  have gone out, so whether a commitment was absent never changes what the node sees. */
+  private answerAbsences(
+    absent: readonly { [listKey: string]: POIStatus }[],
+    lkHex: string,
+    source: ListIndexSource,
+  ): RavenError | undefined {
+    if (absent.length === 0) return undefined;
+    let verdict: POIStatus;
+    if (source.kind === "bound" && source.failure === undefined) {
+      this.counters.absent += absent.length;
+      verdict = "Missing";
+    } else if (this.stalenessPolicy === "answer-at-index-rows") {
+      if (source.kind === "bound") this.counters.absentFromStaleIndex += absent.length;
+      else this.counters.absentFromBareMap += absent.length;
+      verdict = "MissingStale";
+    } else {
+      this.counters.refused += 1;
+      if (source.kind === "bare") {
+        return RavenError.invalidQuery(
+          `client-PIR: ${absent.length} commitment(s) are absent from the bc-to-idx map for ` +
+            `list ${lkHex}, which carries no row count, so the absence cannot be shown current; ` +
+            `hold an index from syncPoiListIndex, or set indexStalenessPolicy to ` +
+            `"answer-at-index-rows"`,
+        );
+      }
+      if (!RavenError.is(source.failure, "Network")) {
+        return indexSyncFailure(lkHex, source.index, source.failure);
+      }
+      verdict = "Unreachable";
+    }
+    for (const verdicts of absent) {
+      verdicts[lkHex] = verdict;
+    }
+    return undefined;
   }
 
   async fetchStatusHeader(listKey: string): Promise<StatusHeader> {
@@ -814,12 +1230,51 @@ export class RavenPOINodeInterface {
     return this.clientPirContexts.get(`${prefix}:${scope}`);
   }
 
-  private instanceLabel(prefix: string, scope: string, fallback: string): string {
+  private instanceLabel(prefix: string, scope: string): string | undefined {
     return (
       this.clientPirInstanceLabels.get(`${prefix}:${this.chainId}:${scope}`) ??
-      this.clientPirInstanceLabels.get(`${prefix}:${scope}`) ??
-      fallback
+      this.clientPirInstanceLabels.get(`${prefix}:${scope}`)
     );
+  }
+
+  /**
+   * Where a list index is asked, for the status and the path route alike. A block-keyed label is
+   * asked at the leaf's row in its block; any other instance holds the whole list and is asked at
+   * the list index, since localizing there would alias every block onto block 0's rows. Status is
+   * never split by block: asking only the blocks that hold a commitment tells the node which.
+   *
+   * An index past the instance's rows is refused, as its row was never written. Returned, not
+   * thrown, so the status route can raise it once every list has been asked.
+   */
+  private listRowTarget(
+    route: "t1Status" | "t2Path",
+    lkHex: string,
+    idx: number,
+    ctx: ClientPirContext,
+  ): ListRowTarget | RavenError {
+    const block = Math.floor(idx / LEAVES_PER_PPOI_BLOCK);
+    const blockLabel =
+      route === "t2Path" ? this.instanceLabel(route, `${lkHex}:${block}`) : undefined;
+    const label = blockLabel ?? this.instanceLabel(route, lkHex) ?? `${route}-${lkHex}`;
+    const leaf = idx - block * LEAVES_PER_PPOI_BLOCK;
+    const row = blockLabel === undefined ? idx : leaf;
+    let capacity: number;
+    try {
+      capacity = decodeShardGeometry(ctx.shardConfigBincode).totalEntries;
+    } catch (cause) {
+      return RavenError.invalidQuery(
+        `client-PIR ${label}: the context's shard config gives no row count, so no index can be ` +
+          `shown to be held (${cause instanceof Error ? cause.message : String(cause)})`,
+      );
+    }
+    if (row >= capacity) {
+      const within = row === idx ? "" : ` (row ${row} of block ${block})`;
+      return RavenError.invalidQuery(
+        `client-PIR ${label}: list index ${idx}${within} is past the instance's capacity of ` +
+          `${capacity} rows, so no row there was ever written; refused rather than answered`,
+      );
+    }
+    return { block, leaf, label, row };
   }
 
   /** Pinned PPOI block roots resolve chain-aware first, then the chain-less legacy key. */
@@ -846,88 +1301,134 @@ export class RavenPOINodeInterface {
       out[blindedCommitment] ??= {};
     }
 
+    let refusal: RavenError | undefined;
     for (const listKey of listKeys) {
       const lkHex = normalizeHex(listKey);
       const ctx = this.lookupContext("t1Status", lkHex);
-      const bcMap = this.lookupBcMap(lkHex);
-      if (!ctx || !bcMap) {
+      const source = ctx === undefined ? undefined : await this.listSource(lkHex);
+      if (!ctx || !source) {
         throw RavenError.invalidQuery(
           `client-PIR: missing context or bc-to-idx-map for list ${listKey}; ` +
-            "preload via loadClientPirContext + fetchBcToIdxMap before calling getPOIsPerList",
+            "preload via loadClientPirContext and syncPoiListIndex(listKey) before calling " +
+            "getPOIsPerList",
         );
       }
-      const members: {
+      // `verdicts` IS the caller-keyed row, resolved where the caller's spelling is the only one
+      // in scope, so the arms below have no key left to pick. `normalizeHex` output is a lookup
+      // key and indexes nothing in `out`; the index signature types that miss as present, so a
+      // verdict written under it throws at runtime with nothing to catch it at compile time.
+      const bcHexes = blindedCommitmentDatas.map(({ blindedCommitment }) =>
+        normalizeHex(blindedCommitment),
+      );
+      const candidateSets = candidatesIn(source, bcHexes);
+      const absent: { [listKey: string]: POIStatus }[] = [];
+      let pending: {
         commitmentData: BlindedCommitmentData;
         bcHex: string;
         bcKey: string;
-        idx: number;
+        verdicts: { [listKey: string]: POIStatus };
+        candidates: number[];
+        next: number;
       }[] = [];
-      for (const commitmentData of blindedCommitmentDatas) {
+      blindedCommitmentDatas.forEach((commitmentData, position) => {
         const bcKey = commitmentData.blindedCommitment;
-        const bcHex = normalizeHex(bcKey);
-        const idx = bcMap.get(bcHex);
-        if (idx === undefined) {
-          out[bcKey][lkHex] = "Missing";
+        const verdicts = out[bcKey];
+        const candidates = candidateSets[position];
+        if (candidates.length === 0) {
+          absent.push(verdicts);
         } else {
-          members.push({ commitmentData, bcHex, bcKey, idx });
+          const bcHex = bcHexes[position];
+          pending.push({ commitmentData, bcHex, bcKey, verdicts, candidates, next: 0 });
         }
-      }
+      });
 
-      const chunkCount = Math.max(1, Math.ceil(members.length / MAX_BATCH_SIZE));
-      for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
-        const chunk = members.slice(
-          chunkIndex * MAX_BATCH_SIZE,
-          (chunkIndex + 1) * MAX_BATCH_SIZE,
-        );
-        try {
-          const statusInstance = this.instanceLabel(
-            "t1Status",
-            lkHex,
-            `t1Status-${lkHex}`,
-          );
-          const privateReply = await this.runClientPirQueryBatch(
-            statusInstance,
-            ctx,
-            chunk.map(({ idx }) => idx),
-          );
-          if (this.privateFreshnessAction(privateReply.freshness, "t1-status") === "fallback") {
-            // This deliberately reveals the exact BC/list to upstream. Returning a stale
-            // spend-authorizing verdict would preserve lookup privacy at the cost of correctness.
-            const fallback = await this.passthroughPoisPerList(
-              [listKey],
-              chunk.map(({ commitmentData }) => commitmentData),
-            );
-            for (const { bcKey } of chunk) {
-              const fallbackStatus = fallback[bcKey]?.[lkHex];
-              if (!fallbackStatus) {
-                throw RavenError.decodeError(
-                  `upstream pois-per-list omitted BC ${bcKey} on list ${lkHex}`,
-                );
-              }
-              out[bcKey][lkHex] = fallbackStatus;
-            }
-          } else {
-            for (let slot = 0; slot < chunk.length; slot += 1) {
-              const { bcHex, bcKey, idx } = chunk[slot];
-              const label = `client-PIR t1Status-${lkHex} idx ${idx}`;
-              out[bcKey][lkHex] = decodeStatusRow(
-                privateReply.plaintexts[slot],
-                bcHex,
-                label,
-              );
-            }
+      // A later round exists only for a prefix collision, and asks the next candidate.
+      for (let round = 0; round === 0 || pending.length > 0; round += 1) {
+        const collided: typeof pending = [];
+        const byInstance = new Map<string, { member: (typeof pending)[number]; row: number }[]>();
+        for (const member of pending) {
+          const at = this.listRowTarget("t1Status", lkHex, member.candidates[member.next], ctx);
+          if (at instanceof RavenError) {
+            refusal ??= at;
+            continue;
           }
-        } catch (cause) {
-          if (cause instanceof RavenError && cause.kind === "Network") {
-            for (const { bcHex } of chunk) {
-              out[bcHex][lkHex] = "Unreachable";
+          const group = byInstance.get(at.label);
+          if (group === undefined) byInstance.set(at.label, [{ member, row: at.row }]);
+          else group.push({ member, row: at.row });
+        }
+        if (byInstance.size === 0) {
+          const cover = this.listRowTarget("t1Status", lkHex, 0, ctx);
+          if (cover instanceof RavenError) {
+            refusal ??= cover;
+            break;
+          }
+          byInstance.set(cover.label, []);
+        }
+        for (const [statusInstance, asked] of byInstance) {
+          const chunkCount = Math.max(1, Math.ceil(asked.length / MAX_BATCH_SIZE));
+          for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+            const chunk = asked.slice(
+              chunkIndex * MAX_BATCH_SIZE,
+              (chunkIndex + 1) * MAX_BATCH_SIZE,
+            );
+            try {
+              const privateReply = await this.runClientPirQueryBatch(
+                statusInstance,
+                ctx,
+                chunk.map(({ row }) => row),
+              );
+              if (this.privateFreshnessAction(privateReply.freshness, "t1-status") === "fallback") {
+                // This deliberately reveals the exact BC/list to upstream. Returning a stale
+                // spend-authorizing verdict would preserve lookup privacy at the cost of
+                // correctness.
+                const fallback = await this.passthroughPoisPerList(
+                  [listKey],
+                  chunk.map(({ member }) => member.commitmentData),
+                );
+                for (const { member } of chunk) {
+                  const fallbackStatus = fallback[member.bcKey]?.[lkHex];
+                  if (!fallbackStatus) {
+                    throw RavenError.decodeError(
+                      `upstream pois-per-list omitted BC ${member.bcKey} on list ${lkHex}`,
+                    );
+                  }
+                  member.verdicts[lkHex] = fallbackStatus;
+                }
+              } else {
+                for (let slot = 0; slot < chunk.length; slot += 1) {
+                  const { member } = chunk[slot];
+                  const plaintext = privateReply.plaintexts[slot];
+                  if (
+                    source.kind === "bound" &&
+                    sharesOnlyPrefix(plaintext.subarray(1), hexToBytes(member.bcHex))
+                  ) {
+                    member.next += 1;
+                    if (member.next < member.candidates.length) collided.push(member);
+                    else absent.push(member.verdicts);
+                    continue;
+                  }
+                  const label =
+                    `client-PIR t1Status-${lkHex} idx ${member.candidates[member.next]}`;
+                  member.verdicts[lkHex] = decodeStatusRow(plaintext, member.bcHex, label);
+                }
+              }
+            } catch (cause) {
+              if (cause instanceof RavenError && cause.kind === "Network") {
+                for (const { member } of chunk) {
+                  member.verdicts[lkHex] = "Unreachable";
+                }
+              } else {
+                throw cause;
+              }
             }
-          } else {
-            throw cause;
           }
         }
+        pending = collided;
       }
+      const refused = this.answerAbsences(absent, lkHex, source);
+      refusal ??= refused;
     }
+    if (refusal !== undefined) throw refusal;
     return out;
   }
 
@@ -937,93 +1438,187 @@ export class RavenPOINodeInterface {
   ): Promise<MerkleProof[]> {
     const lkHex = normalizeHex(listKey);
     const ctx = this.lookupContext("t2Path", lkHex);
-    const bcMap = this.lookupBcMap(lkHex);
-    if (!ctx || !bcMap) {
+    const source = ctx === undefined ? undefined : await this.listSource(lkHex);
+    if (!ctx || !source) {
       throw RavenError.invalidQuery(
         `client-PIR: missing context or bc-to-idx-map for list ${listKey}; ` +
-          "preload via loadClientPirContext + fetchBcToIdxMap before calling getPOIMerkleProofs",
+          "preload via loadClientPirContext and syncPoiListIndex(listKey) before calling " +
+          "getPOIMerkleProofs",
       );
     }
-    const out: MerkleProof[] = [];
-    for (const bc of blindedCommitments) {
-      const bcHex = normalizeHex(bc);
-      const idx = bcMap.get(bcHex);
-      if (idx === undefined) {
-        throw RavenError.invalidQuery(
-          `client-PIR: BC ${bcHex} not present in list ${lkHex} (idx unknown)`,
-        );
-      }
-      // The leaf index never crosses the wire, only encrypted row queries.
-      const block = Math.floor(idx / LEAVES_PER_PPOI_BLOCK);
-      const localIndex = idx % LEAVES_PER_PPOI_BLOCK;
-      const pathInstance = this.instanceLabel(
-        "t2Path",
-        `${lkHex}:${block}`,
-        `t2Path-${lkHex}`,
-      );
-      const privateReply = await this.runClientPirQueryBatch(
-        pathInstance,
-        ctx,
-        [localIndex],
-        160,
-      );
-      if (this.privateFreshnessAction(privateReply.freshness, "t2-auth-path") === "fallback") {
-        // This deliberately reveals the exact BC/list to upstream. The alternative is to
-        // return an auth path whose freshness is below the operator-selected confidence floor.
-        const fallback = await this.passthroughMerkleProofs(listKey, [bc]);
-        const proof = fallback[0];
-        if (!proof) {
-          throw RavenError.decodeError(
-            `upstream merkle-proofs omitted BC ${bcHex} on list ${lkHex}`,
-          );
-        }
-        out.push(proof);
+    // No proof exists for an absence, so every kind is refused; it is counted as getPOIsPerList
+    // counts it, and the refusal says whether it could be shown current.
+    const notPresent = (bcHex: string, absences: number): RavenError => {
+      let scope: string;
+      if (source.kind === "bare") {
+        scope = "the bc-to-idx map carries no row count, so the absence cannot be shown current";
+      } else if (source.failure === undefined) {
+        scope = `the index holds the ${source.index.total} rows the node serves`;
       } else {
-        const row = privateReply.plaintexts[0];
-        const addendum = privateReply.addenda[0];
-        if (!row || row.length !== 512 || new TextDecoder().decode(row.slice(34, 38)) !== "RVP2") {
-          throw RavenError.decodeError(`client-PIR ${pathInstance}: malformed PPOI v2 row`);
-        }
-        if (bytesToHex(row.slice(0, 32)) !== bcHex) {
-          throw RavenError.decodeError(`client-PIR ${pathInstance}: row leaf does not match requested BC`);
-        }
-        if (!addendum || addendum.length !== 160) {
-          throw RavenError.decodeError(`client-PIR ${pathInstance}: upper-sibling addendum must be 160 bytes`);
-        }
-        const nodes = Array.from({ length: 11 }, (_unused, level) =>
-          row.slice(38 + level * 32, 38 + (level + 1) * 32),
-        ).concat(
-          Array.from({ length: 5 }, (_unused, level) =>
-            addendum.slice(level * 32, (level + 1) * 32),
-          ),
-        );
-        const proof = buildMerkleProof(localIndex, bcHex, nodes);
-        const rootKey = `${lkHex}:${block}`;
-        // Resolved through the SAME chain-aware -> legacy ladder `instanceLabel` routes on.
-        // Keying this guard on the chain-less form while routing on the chain-aware one is
-        // what returned unverified proofs with `Ok`; a `has()` gate here would restore that.
-        const pinnedRoot = this.pinnedRootFor(rootKey);
-        if (pinnedRoot !== undefined) {
-          // `normalizeHex` strips `0x` and lowercases; it does not pad. An unpadded 32-byte
-          // root would compare unequal and be reported as tampering, so width is checked first
-          // and named for what it is.
-          const normalizedPin = normalizeHex(pinnedRoot);
-          if (normalizedPin.length !== ROOT_HEX_CHARS) {
-            throw RavenError.invalidQuery(
-              `client-PIR ${pathInstance}: pinned root for ${rootKey} is ` +
-                `${normalizedPin.length} hex chars, not ${ROOT_HEX_CHARS}; pad it to 32 bytes`,
-            );
-          }
-          if (normalizedPin !== proof.root) {
-            throw RavenError.decodeError(
-              `client-PIR ${pathInstance}: folded root does not match pinned root`,
-            );
-          }
-        } else {
-          await this.verifyAgainstUpstreamPin(pathInstance, lkHex, block, rootKey, proof.root);
-        }
-        out.push(proof);
+        scope =
+          `the index holds ${source.index.total} rows and could not be brought up to the ` +
+          "node's list, so the absence cannot be shown current";
       }
+      if (source.kind === "bound" && source.failure === undefined) {
+        this.counters.absent += absences;
+      } else if (this.stalenessPolicy === "refuse") {
+        this.counters.refused += 1;
+        if (source.kind === "bound") return indexSyncFailure(lkHex, source.index, source.failure);
+      } else if (source.kind === "bound") {
+        this.counters.absentFromStaleIndex += absences;
+      } else {
+        this.counters.absentFromBareMap += absences;
+      }
+      return RavenError.invalidQuery(
+        `client-PIR: BC ${bcHex} not present in list ${lkHex} (idx unknown; ${scope})`,
+      );
+    };
+    // Resolve every commitment BEFORE any request goes out. Two things fall out of that: an
+    // unknown BC now refuses without having disclosed the earlier ones, and the grouping below
+    // needs the whole set in hand.
+    const bcHexes = blindedCommitments.map((bc) => normalizeHex(bc));
+    const candidateSets = candidatesIn(source, bcHexes);
+    const firstAbsent = candidateSets.findIndex((candidates) => candidates.length === 0);
+    if (firstAbsent !== -1) {
+      throw notPresent(
+        bcHexes[firstAbsent],
+        candidateSets.filter((candidates) => candidates.length === 0).length,
+      );
+    }
+    let pending = blindedCommitments.map((bc, position) => ({
+      bc,
+      bcHex: bcHexes[position],
+      position,
+      candidates: candidateSets[position],
+      next: 0,
+    }));
+
+    // Group by block, then pad each group on the ladder -- the same shape the T1 status path
+    // has always had. Proving K commitments one await at a time was K serial POSTs, and every
+    // one of them reached `drawPaddedSlots` with a single real target: `paddedBatchLength(1)`
+    // is 1, so ZERO cover slots were drawn and the server counted the wallet's exact cache-miss
+    // count off a stable client id. That is verbatim what the ladder exists to prevent. The
+    // round-trip cost and the leak were one defect.
+    //
+    // Two bounds on that win, both real, because a comment that states only the good case is how
+    // the last three claims in this file went wrong. (1) Grouping is WITHIN a block, since each
+    // block routes to its own instance label, so commitments spread over six blocks still cost six
+    // round trips. (2) The ladder hides K within its dyadic bucket, never K itself: a chunk of k
+    // real targets goes out as P = paddedBatchLength(k) queries, and P tells the server k is in
+    // (P/2, P]. That bucket is a single value at P = 1 and P = 2, so a block group of K = 1 or
+    // K = 2, or any K whose last 32-chunk holds one or two (K mod 32 in {1, 2}), is still disclosed
+    // exactly. Zero cover slots is not the tell: K = 4 draws none and reads the same as K = 3.
+    // Flooring the ladder at 2 would make {1, 2} one bucket and double the cost of the ordinary
+    // single-note proof, which is a product decision rather than one to take here.
+    //
+    // A later round exists only for a prefix collision, and asks the next candidate.
+    const out = new Array<MerkleProof>(pending.length);
+    while (pending.length > 0) {
+      const collided: typeof pending = [];
+      const byBlock = new Map<
+        number,
+        { label: string; group: { target: (typeof pending)[number]; at: ListRowTarget }[] }
+      >();
+      for (const target of pending) {
+        const at = this.listRowTarget("t2Path", lkHex, target.candidates[target.next], ctx);
+        if (at instanceof RavenError) throw at;
+        const held = byBlock.get(at.block);
+        if (held === undefined) byBlock.set(at.block, { label: at.label, group: [{ target, at }] });
+        else held.group.push({ target, at });
+      }
+
+      for (const [block, { label: pathInstance, group }] of byBlock) {
+        const rootKey = `${lkHex}:${block}`;
+        const chunkCount = Math.ceil(group.length / MAX_BATCH_SIZE);
+        for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+          const chunk = group.slice(
+            chunkIndex * MAX_BATCH_SIZE,
+            (chunkIndex + 1) * MAX_BATCH_SIZE,
+          );
+          // The leaf index never crosses the wire, only encrypted row queries.
+          const privateReply = await this.runClientPirQueryBatch(
+            pathInstance,
+            ctx,
+            chunk.map(({ at }) => at.row),
+            160,
+          );
+          if (this.privateFreshnessAction(privateReply.freshness, "t2-auth-path") === "fallback") {
+            // This deliberately reveals the exact BC/list to upstream. The alternative is to
+            // return an auth path whose freshness is below the operator-selected confidence floor.
+            // Matched by LEAF rather than by position: upstream's reply order is its own business,
+            // and a silently transposed pair here would hand a wallet another note's auth path.
+            // The anchor is taken first: a disclosure whose answer cannot be verified buys nothing.
+            const label = `upstream fallback for ${pathInstance}`;
+            const anchor = this.blockRootAnchor(lkHex, block, this.upstream, label);
+            const fallback = await this.passthroughMerkleProofs(
+              listKey,
+              chunk.map(({ target }) => target.bc),
+            );
+            const byLeaf = new Map(fallback.map((proof) => [normalizeHex(proof.leaf), proof]));
+            for (const { target: { bcHex, position } } of chunk) {
+              const proof = byLeaf.get(bcHex);
+              if (!proof) {
+                throw RavenError.decodeError(
+                  `upstream merkle-proofs omitted BC ${bcHex} on list ${lkHex}`,
+                );
+              }
+              await anchor(foldForeignProof(proof, bcHex, label), bcHex, label);
+              out[position] = proof;
+            }
+            continue;
+          }
+          for (let slot = 0; slot < chunk.length; slot += 1) {
+            const { target, at } = chunk[slot];
+            const { bcHex, position } = target;
+            const localIndex = at.leaf;
+            const row = privateReply.plaintexts[slot];
+            const addendum = privateReply.addenda[slot];
+            if (!row || row.length !== 512 || new TextDecoder().decode(row.slice(34, 38)) !== "RVP2") {
+              throw RavenError.decodeError(`client-PIR ${pathInstance}: malformed PPOI v2 row`);
+            }
+            if (source.kind === "bound" && sharesOnlyPrefix(row.subarray(0, 32), hexToBytes(bcHex))) {
+              target.next += 1;
+              if (target.next === target.candidates.length) throw notPresent(bcHex, 1);
+              collided.push(target);
+              continue;
+            }
+            if (bytesToHex(row.slice(0, 32)) !== bcHex) {
+              throw RavenError.decodeError(`client-PIR ${pathInstance}: row leaf does not match requested BC`);
+            }
+            if (!addendum || addendum.length !== 160) {
+              throw RavenError.decodeError(`client-PIR ${pathInstance}: upper-sibling addendum must be 160 bytes`);
+            }
+            const nodes = Array.from({ length: 11 }, (_unused, level) =>
+              row.slice(38 + level * 32, 38 + (level + 1) * 32),
+            ).concat(
+              Array.from({ length: 5 }, (_unused, level) =>
+                addendum.slice(level * 32, (level + 1) * 32),
+              ),
+            );
+            const proof = buildMerkleProof(localIndex, bcHex, nodes);
+            // Resolved through the SAME chain-aware -> legacy ladder `instanceLabel` routes on.
+            // Keying this guard on the chain-less form while routing on the chain-aware one is
+            // what returned unverified proofs with `Ok`; a `has()` gate here would restore that.
+            const pinnedRoot = this.pinnedRootFor(rootKey);
+            if (pinnedRoot !== undefined) {
+              const normalizedPin = checkedPinnedRoot(
+                pinnedRoot,
+                rootKey,
+                `client-PIR ${pathInstance}`,
+              );
+              if (normalizedPin !== proof.root) {
+                throw RavenError.decodeError(
+                  `client-PIR ${pathInstance}: folded root does not match pinned root`,
+                );
+              }
+            } else {
+              await this.verifyAgainstUpstreamPin(pathInstance, lkHex, block, rootKey, proof.root);
+            }
+            out[position] = proof;
+          }
+        }
+      }
+      pending = collided;
     }
     return out;
   }
@@ -1054,20 +1649,30 @@ export class RavenPOINodeInterface {
     try {
       resolved = await this.pinResolver.resolve(listKeyHex, block);
     } catch (cause) {
-      // One message for "there is no independent root", whatever stopped it arriving. The
-      // KIND is preserved so a caller's retry policy still sees a transient upstream as one.
-      const message = `${preamble}the upstream pin source could not answer (${String(cause)})${remedy}`;
-      throw RavenError.is(cause, "Network")
-        ? RavenError.network(message, cause.context)
-        : RavenError.invalidQuery(message);
+      throw pinSourceFailure(preamble, remedy, cause);
     }
     if (!resolved.roots.has(foldedRoot)) {
       // A block that froze inside the tail TTL is still answered from the window it had while
-      // filling, and its final root is not in that set. Re-ask once before refusing, so the
-      // privacy fix above costs at most one extra request on a real freeze instead of costing
-      // an honest caller a refusal. Bounded to a single retry: a genuine forgery misses twice.
+      // filling, and its final root is not in that set. Re-ask before refusing, so an honest
+      // caller is not charged a refusal for the privacy fix above.
+      //
+      // Its cost, stated straight because the first version of this comment understated it: THREE
+      // extra requests (point query, status, events), one of which names the block, and it fires
+      // on every window miss, not only on a real freeze. A node lagging more than a window behind
+      // therefore pays it on every proof while refusing every proof -- an audit measured
+      // [6, 3, 3] requests over three folds. Bounding it per block is not a free win: the bound
+      // that stops the leak also stops a block that freezes between two folds from verifying,
+      // which `ppoi_pinned_root_mandatory.test.ts` pins deliberately. Which of the two a wallet
+      // should get is a caller's decision, so neither is hardcoded here until one is asked for.
       this.pinResolver.forgetTail(listKeyHex, block);
-      resolved = await this.pinResolver.resolve(listKeyHex, block);
+      try {
+        resolved = await this.pinResolver.resolve(listKeyHex, block);
+      } catch (cause) {
+        // Same wrapper as the first attempt, and for the same reason: without it an upstream
+        // outage inside the retry window surfaced as `DecodeError` -- the tampering kind --
+        // with no instance, no rootKey and none of the remedy text.
+        throw pinSourceFailure(preamble, remedy, cause);
+      }
     }
     if (!resolved.roots.has(foldedRoot)) {
       // The window is named because it is what separates "this node is lagging past the
@@ -1079,6 +1684,79 @@ export class RavenPOINodeInterface {
           `(${resolved.window.frozen ? "frozen" : "filling"} block)`,
       );
     }
+  }
+
+  /**
+   * The independent root for one block, for a proof whose root came from `proofSource`. A root
+   * from the proof's own source would pass any forgery that source sends, so the resolver
+   * answers only when it is known to be another party; unknown counts as the same, as the
+   * disclosure guard counts it. Taken before this block group's proofs are fetched, so a group
+   * that could only refuse discloses none of its commitments; an earlier group of the same call
+   * has already been sent by then.
+   */
+  private blockRootAnchor(
+    lkHex: string,
+    block: number,
+    proofSource: string | undefined,
+    label: string,
+  ): RootAnchor {
+    const rootKey = `${lkHex}:${block}`;
+    const pinnedRoot = this.pinnedRootFor(rootKey);
+    if (pinnedRoot !== undefined) {
+      const pin = checkedPinnedRoot(pinnedRoot, rootKey, label);
+      return async (folded, _bcHex, at) => {
+        if (folded !== pin) {
+          throw RavenError.decodeError(`${at}: folded root does not match pinned root`);
+        }
+      };
+    }
+    if (
+      this.pinResolver === undefined ||
+      proofSource === undefined ||
+      samePartyOrUnknown(this.pinResolverSource, proofSource) !== false
+    ) {
+      throw RavenError.invalidQuery(
+        `${label}: no pinned root for ${rootKey} on chain ${this.chainId}, and no root from a ` +
+          `party other than the one that would send the proof; set pinUpstream to an aggregator ` +
+          "upstreamFallbackEndpoint does not operate, or preload ppoiPinnedRoots",
+      );
+    }
+    return (folded, _bcHex, at) => this.verifyAgainstUpstreamPin(at, lkHex, block, rootKey, folded);
+  }
+
+  /** Every caller pin for one list on this chain, each block through the same chain-aware ->
+   *  legacy ladder `pinnedRootFor` applies. A fold equal to any of them proves inclusion in that
+   *  block's tree, whichever block the server meant. */
+  private listPinAnchor(lkHex: string): RootAnchor {
+    const label = `merkle proofs for list ${lkHex}`;
+    const blocks = new Set<string>();
+    for (const key of this.ppoiPinnedRoots.keys()) {
+      const parts = key.split(":");
+      const [chain, list, block] = parts.length === 3 ? parts : [undefined, ...parts];
+      if (chain !== undefined && chain !== String(this.chainId)) continue;
+      if (list === lkHex && block !== undefined && /^[0-9]+$/.test(block)) blocks.add(block);
+    }
+    const pinned = new Set<string>();
+    for (const block of blocks) {
+      const rootKey = `${lkHex}:${block}`;
+      const pin = this.pinnedRootFor(rootKey);
+      if (pin !== undefined) pinned.add(checkedPinnedRoot(pin, rootKey, label));
+    }
+    if (pinned.size === 0) {
+      throw RavenError.invalidQuery(
+        `${label}: no root pinned for the list on chain ${this.chainId}, and the plaintext route ` +
+          "does not say which block a proof is in, so no root from a party other than its source " +
+          "can be asked for; preload ppoiPinnedRoots for the list, or use client-PIR",
+      );
+    }
+    return async (folded, bcHex, at) => {
+      if (!pinned.has(folded)) {
+        throw RavenError.decodeError(
+          `${at}: proof for ${bcHex} folds to a root that is not among the ${pinned.size} ` +
+            `root(s) pinned for list ${lkHex}; either its block is not pinned or the proof is forged`,
+        );
+      }
+    };
   }
 
   private async getMerkleProofClientPir(
@@ -1866,6 +2544,44 @@ function copyForBody(src: Uint8Array): Blob {
   return new Blob([buf], { type: "application/octet-stream" });
 }
 
+/** A malformed pin can never equal a fold, so without these checks a caller's own typo would
+ *  surface as `DecodeError`, the kind that blames the node for forging the path. */
+function checkedPinnedRoot(pin: string, rootKey: string, label: string): string {
+  const normalizedPin = normalizeHex(pin);
+  if (normalizedPin.length !== ROOT_HEX_CHARS) {
+    throw RavenError.invalidQuery(
+      `${label}: pinned root for ${rootKey} is ${normalizedPin.length} hex chars, not ` +
+        `${ROOT_HEX_CHARS}; pad it to 32 bytes`,
+    );
+  }
+  if (!/^[0-9a-f]+$/.test(normalizedPin)) {
+    throw RavenError.invalidQuery(`${label}: pinned root for ${rootKey} is not hexadecimal`);
+  }
+  return normalizedPin;
+}
+
+/** Callers match the proof to `bcHex` by leaf first. The fold reads only sixteen elements and
+ *  sixteen index bits, so any other depth or position is refused rather than folded. */
+function foldForeignProof(proof: MerkleProof, bcHex: string, label: string): string {
+  if (proof.elements.length !== TREE_DEPTH) {
+    throw RavenError.decodeError(
+      `${label}: proof for ${bcHex} has ${proof.elements.length} elements, not ${TREE_DEPTH}`,
+    );
+  }
+  const indices = normalizeHex(proof.indices);
+  if (!/^[0-9a-f]{1,64}$/.test(indices) || BigInt(`0x${indices}`) >= 1n << BigInt(TREE_DEPTH)) {
+    throw RavenError.decodeError(
+      `${label}: proof for ${bcHex} has indices ${JSON.stringify(proof.indices)}, not a leaf ` +
+        `position in a depth-${TREE_DEPTH} tree`,
+    );
+  }
+  const folded = foldMerkleRoot(bcHex, proof.elements, BigInt(`0x${indices}`));
+  if (folded !== normalizeHex(proof.root)) {
+    throw RavenError.decodeError(`${label}: proof for ${bcHex} does not fold to the root it claims`);
+  }
+  return folded;
+}
+
 /**
  * Whether two endpoints name the same server.
  *
@@ -1883,12 +2599,147 @@ function copyForBody(src: Uint8Array): Blob {
  * the same party, so a malformed pin source disables the resolver rather than silently
  * skipping the check.
  */
-function sameParty(a: string | undefined, b: string | undefined): boolean {
+/**
+ * One message for "there is no independent root", whatever stopped it arriving -- keeping the
+ * CAUSE'S kind, because that is what a caller's retry policy reads.
+ *
+ * The first version kept only `Network` and flattened everything else to `InvalidQuery`, which
+ * says "your configuration is wrong". So an upstream 500, an RPC error, and an upstream that
+ * answered a frozen block's last leaf with two different roots all told the operator to go and
+ * check their own config, and told a retry policy not to retry a transient fault. An audit found
+ * it by asserting the KIND; the test that shipped with the bug asserted only the message.
+ */
+function pinSourceFailure(preamble: string, remedy: string, cause: unknown): RavenError {
+  const message = `${preamble}the upstream pin source could not answer (${String(cause)})${remedy}`;
+  if (!(cause instanceof RavenError)) return RavenError.invalidQuery(message);
+  // Only the four kinds the resolver can raise. A default of `invalidQuery` is right for the
+  // rest: they would mean the SDK asked for something it should not have, which IS the caller.
+  switch (cause.kind) {
+    case "Network":
+      return RavenError.network(message, cause.context);
+    case "ServerError":
+      return RavenError.serverError(message, cause.context);
+    case "DecodeError":
+      return RavenError.decodeError(message, cause.context);
+    default:
+      return RavenError.invalidQuery(message);
+  }
+}
+
+/** Keeps the cause's kind, which is what a caller's retry policy reads. */
+function indexSyncFailure(lkHex: string, held: BcPrefixIndex, cause: unknown): RavenError {
+  const message =
+    `client-PIR: the index for list ${lkHex} holds ${held.total} rows and could not be brought ` +
+    `up to the list the node serves (${String(cause)}), so an absence from it cannot be shown ` +
+    `current; set indexStalenessPolicy to "answer-at-index-rows" to answer from the rows held`;
+  if (!(cause instanceof RavenError)) return RavenError.invalidQuery(message);
+  switch (cause.kind) {
+    case "Network":
+      return RavenError.network(message, cause.context);
+    case "ServerError":
+      return RavenError.serverError(message, cause.context);
+    case "DecodeError":
+      return RavenError.decodeError(message, cause.context);
+    case "StaleAdapter":
+      return RavenError.staleAdapter(message, cause.context);
+    default:
+      return RavenError.invalidQuery(message);
+  }
+}
+
+/** Ascending candidate indices per commitment. A map yields at most one, the lowest occurrence
+ *  `bcToIdxMapFrom` kept; an index yields every row sharing the prefix. */
+function candidatesIn(source: ListIndexSource, bcHexes: readonly string[]): number[][] {
+  if (source.kind === "bound") return indexCandidatesForEach(source.index, bcHexes);
+  return bcHexes.map((bcHex) => {
+    const idx = source.map.get(bcHex);
+    return idx === undefined ? [] : [idx];
+  });
+}
+
+/**
+ * The body is the node's proven gap-free prefix in index order, so entry `i` must be row `i`. That
+ * refuses a row omitted, repeated or moved while the labels still name the original rows; one hidden
+ * by relabelling every later row, and a cut tail, are refused by the row-by-row comparison with the
+ * prefix channel in `fetchBcToIdxMap`.
+ */
+function parseBcToIdxMap(body: unknown, listKeyHex: string, url: string): BcToIdxMapBody {
+  if (!isPlainObject(body)) {
+    throw RavenError.decodeError("bc-to-idx-map: body is not an object", { url });
+  }
+  const { epoch, listKey, entries } = body;
+  if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 0) {
+    throw RavenError.decodeError("bc-to-idx-map: epoch is not a non-negative integer", { url });
+  }
+  if (typeof listKey !== "string" || !isHex64(listKey) || normalizeHex(listKey) !== listKeyHex) {
+    throw RavenError.decodeError(
+      `bc-to-idx-map: answered for list ${String(listKey)}, asked for ${listKeyHex}`,
+      { url },
+    );
+  }
+  if (!Array.isArray(entries)) {
+    throw RavenError.decodeError("bc-to-idx-map: entries is not an array", { url });
+  }
+  const rows: BcIdxEntry[] = new Array(entries.length);
+  entries.forEach((entry: unknown, row) => {
+    if (!isPlainObject(entry) || typeof entry.bc !== "string" || !isHex64(entry.bc)) {
+      throw RavenError.decodeError(`bc-to-idx-map: row ${row} carries no 32-byte commitment`, {
+        url,
+      });
+    }
+    if (entry.idx !== row) {
+      throw RavenError.decodeError(
+        `bc-to-idx-map: row ${row} is labelled idx ${String(entry.idx)}; a row is missing, ` +
+          "repeated or out of place",
+        { url },
+      );
+    }
+    rows[row] = { bc: entry.bc, idx: row };
+  });
+  return { epoch, listKey: listKeyHex, rows: rows.length, entries: rows };
+}
+
+/** A base for endpoints written same-origin (`/raven`), which `fetch` accepts in a browser and
+ *  which have no origin of their own. Never contacted: `.invalid` is reserved precisely so it
+ *  cannot resolve. */
+const RELATIVE_ENDPOINT_BASE = "http://same-origin.invalid/";
+
+/**
+ * Do two endpoints name the same operator? `undefined` means "cannot tell".
+ *
+ * Origin, not string: two spellings of one host are one party, and comparing raw strings let a
+ * fully forged auth path through once. The tri-state is not decoration -- the two callers have
+ * OPPOSITE safe defaults (a disclosure guard wants unknown treated as same-party and refuses; the
+ * resolver wants unknown treated as different and builds an anchor that may be vacuous), and
+ * collapsing that into one boolean gave both the disclosure guard's answer, which silently
+ * disabled verification for any deployment whose endpoint is same-origin relative.
+ */
+function samePartyOrUnknown(a: string | undefined, b: string | undefined): boolean | undefined {
   if (a === undefined || b === undefined) return false;
+  const base =
+    typeof globalThis.location?.href === "string" ? globalThis.location.href : RELATIVE_ENDPOINT_BASE;
   try {
-    return new URL(a).origin.toLowerCase() === new URL(b).origin.toLowerCase();
+    return new URL(a, base).origin.toLowerCase() === new URL(b, base).origin.toLowerCase();
   } catch {
-    return true;
+    return a === b ? true : undefined;
+  }
+}
+
+/** An endpoint is an absolute URL or a same-origin path. Anything else is a typo, and it used to
+ *  reach `samePartyOrUnknown`, fail to parse and be reported as a circular configuration -- sending
+ *  an operator to look for a circularity that was not there. */
+function isUsableEndpoint(value: string): boolean {
+  // `//host` is SCHEME-relative, not same-origin: it resolves to a different authority
+  // entirely. Admitting it here let a pin source aimed at the served node slip past the
+  // circularity guard on a scheme mismatch, and made both this function's doc and the
+  // refusal text describe something narrower than what they accepted.
+  if (value.startsWith("//")) return false;
+  if (value.startsWith("/")) return value.length > 1;
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
   }
 }
 
@@ -1968,6 +2819,36 @@ function assertMerkleProof(value: unknown, path: string): MerkleProof {
     throw RavenError.decodeError(`${path}: proof elements are not an array of 32-byte hex strings`);
   }
   return value as unknown as MerkleProof;
+}
+
+/** The plaintext route's path, kept only if it answers the leaf asked for; its position is then
+ *  minted from the request, as the client-PIR route mints it. */
+function servedCommitTreeAuthPath(
+  value: unknown,
+  leafIndex: number,
+  path: string,
+): CommitTreeProof {
+  if (!isPlainObject(value)) {
+    throw RavenError.decodeError(`${path}: proof is not an object`);
+  }
+  const { elements, indices } = value;
+  if (!Array.isArray(elements) || elements.length !== TREE_DEPTH || !elements.every(isHex64)) {
+    throw RavenError.decodeError(
+      `${path}: proof elements are not ${TREE_DEPTH} 32-byte hex strings`,
+    );
+  }
+  const served = typeof indices === "string" ? normalizeHex(indices) : "";
+  if (!/^[0-9a-f]{1,64}$/.test(served) || BigInt(`0x${served}`) !== BigInt(leafIndex)) {
+    throw RavenError.decodeError(
+      `${path}: proof indices ${JSON.stringify(indices)} do not name leaf ${leafIndex}, ` +
+        "the one asked for",
+    );
+  }
+  return {
+    kind: "authPath",
+    elements: elements.map((element: string) => normalizeHex(element)),
+    indices: leafIndexToIndicesHex(leafIndex),
+  };
 }
 
 function assertMerkleProofArray(value: unknown, path: string): MerkleProof[] {

@@ -4,6 +4,7 @@ import {
   RavenPOINodeInterface,
   RavenError,
   containsByteSequence,
+  foldMerkleRoot,
   hexToBytes,
   type ClientPirContext,
   type RavenConfig,
@@ -35,6 +36,7 @@ import {
   STUB_QUERY_BYTES,
   stubQueryBundle,
 } from "./helpers/private_wire";
+import { shardConfigBincode } from "./helpers/shard_config";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX = "ab".repeat(32);
@@ -76,7 +78,7 @@ function statusContext(): ClientPirContext {
     wasm,
     session: { free: () => undefined },
     crsBincode: new Uint8Array(0),
-    shardConfigBincode: new Uint8Array(0),
+    shardConfigBincode: shardConfigBincode(),
     entrySize: 32,
   };
 }
@@ -84,6 +86,33 @@ function statusContext(): ClientPirContext {
 /** Siblings and the root the SDK must fold to for BC_HEX at local leaf 0. */
 const PATH10_NODES = path10Siblings(0xab);
 const PATH10_ROOT = path10Root(BC_HEX, PATH10_NODES, 0);
+const PATH10_HEX = PATH10_NODES.map((node) => Buffer.from(node).toString("hex"));
+const BLOCK0_LAST_INDEX = 65_535;
+/** An honest upstream proof for BC_HEX at leaf 0, spelled as upstream spells it: `0x` on the
+ *  leaf and on the first element only. */
+const UPSTREAM_PROOF = {
+  leaf: `0x${BC_HEX}`,
+  elements: [`0x${PATH10_HEX[0]}`, ...PATH10_HEX.slice(1)],
+  indices: "0".repeat(64),
+  root: PATH10_ROOT,
+};
+/** Claims the honest root, but its elements are garbage and fold to something else. */
+const FORGED_PROOF = {
+  leaf: BC_HEX,
+  elements: Array.from({ length: 16 }, () => "11".repeat(32)),
+  indices: "0".repeat(64),
+  root: PATH10_ROOT,
+};
+/** Folds to the root it claims, but over fifteen levels: an interior node posing as a leaf. */
+const SHORT_PROOF = (() => {
+  const elements = UPSTREAM_PROOF.elements.slice(0, 15);
+  return { ...UPSTREAM_PROOF, elements, root: foldMerkleRoot(BC_HEX, elements, 0n) };
+})();
+/** Folds to the honest root, since the fold reads only sixteen index bits. */
+const OUT_OF_RANGE_PROOF = {
+  ...UPSTREAM_PROOF,
+  indices: (1n << 16n).toString(16).padStart(64, "0"),
+};
 
 function authPathContext(): ClientPirContext {
   return { ...nodeAuthPathContext(), entrySize: PATH10_ROW_BYTES };
@@ -331,7 +360,10 @@ describe("private response freshness fallback", () => {
     ).toBe(true);
   });
 
-  it("explicitly falls back from a low-confidence private auth path", async () => {
+  // Low confidence is the server's own claim, so it must not buy the wallet an unverified proof.
+  // The fallback proof is folded, and the fold must match a root from a party other than the
+  // upstream that sent the proof: a root from the proof's own source verifies nothing.
+  function staleAuthPathRoute(): void {
     adapter.route(
       (req) => req.url?.endsWith("/batch") ?? false,
       (_req, body, res) => {
@@ -343,21 +375,21 @@ describe("private response freshness fallback", () => {
         return true;
       },
     );
-    const upstreamProof = {
-      leaf: BC_HEX,
-      elements: Array.from({ length: 16 }, () => "11".repeat(32)),
-      indices: "0".repeat(64),
-      root: "22".repeat(32),
-    };
+  }
+
+  function upstreamAnswers(proof: unknown): void {
     upstream.route(
       (req) => req.url === "/",
       (_req, body, res) => {
-        const request = writeJsonRpcResult(body, res, [upstreamProof]);
+        const request = writeJsonRpcResult(body, res, [proof]);
         expect(request.method).toBe("ppoi_merkle_proofs");
         return true;
       },
     );
-    const sdk = new RavenPOINodeInterface({
+  }
+
+  function fallbackSdk(extra: Partial<RavenConfig> = {}): RavenPOINodeInterface {
+    return new RavenPOINodeInterface({
       endpoint: adapter.url,
       bearerToken: TOKEN,
       upstreamFallbackEndpoint: upstream.url,
@@ -366,16 +398,40 @@ describe("private response freshness fallback", () => {
       freshnessConfidenceFloor: 0.5,
       clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, authPathContext()]]),
       bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX, 0]])]]),
-    });
+      ...extra,
+    } as RavenConfig);
+  }
 
-    const proofs = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+  async function fallbackOutcome(sdk: RavenPOINodeInterface): Promise<{
+    returned: unknown;
+    thrown: unknown;
+  }> {
+    try {
+      return { returned: await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]), thrown: undefined };
+    } catch (error) {
+      return { returned: undefined, thrown: error };
+    }
+  }
 
-    expect(proofs).toEqual([upstreamProof]);
+  // The root a proof claims is only its sender's word, so each of these claims exactly the root the
+  // caller pinned and is still refused.
+  it.each([
+    { label: "garbage elements", proof: FORGED_PROOF, reason: /does not fold to the root it claims/ },
+    { label: "fifteen elements", proof: SHORT_PROOF, reason: /has 15 elements/ },
+    { label: "indices past a depth-16 tree", proof: OUT_OF_RANGE_PROOF, reason: /has indices/ },
+  ])("refuses a fallback proof with $label that claims the pinned root", async ({ proof, reason }) => {
+    staleAuthPathRoute();
+    upstreamAnswers(proof);
+    const sdk = fallbackSdk({ ppoiPinnedRoots: new Map([[`${LIST_KEY_HEX}:0`, proof.root]]) });
+
+    const { returned, thrown } = await fallbackOutcome(sdk);
+
+    expect(returned).toBeUndefined();
+    expect(RavenError.is(thrown, "DecodeError"), String(thrown)).toBe(true);
+    expect(String((thrown as Error).message)).toMatch(reason);
     expect(upstream.requests).toHaveLength(1);
-    expect(adapter.requests).toHaveLength(2);
     expect(
       assertNoCommitmentsInPirRequests(adapter.requests, [BC_HEX], {
-        // One 512 B path-10 row replaced sixteen 32 B node reads.
         expectedQueryCount: 1,
         expectedQueryBytes: STUB_QUERY_BYTES,
       }),
@@ -383,6 +439,179 @@ describe("private response freshness fallback", () => {
     expect(
       containsByteSequence(upstream.requests[0].body, new TextEncoder().encode(BC_HEX)),
     ).toBe(true);
+  });
+
+  // Upstream would be asked for the proof and for the root that checks it, which is circular,
+  // so the call refuses before the commitment is disclosed at all.
+  it("refuses before disclosing when upstream is the only root source", async () => {
+    staleAuthPathRoute();
+    upstreamAnswers(UPSTREAM_PROOF);
+    const sdk = fallbackSdk();
+
+    const { returned, thrown } = await fallbackOutcome(sdk);
+
+    expect(returned).toBeUndefined();
+    expect(RavenError.is(thrown, "InvalidQuery"), String(thrown)).toBe(true);
+    expect(String((thrown as Error).message)).toMatch(/no root from a party other than/);
+    expect(upstream.requests).toHaveLength(0);
+  });
+
+  it("refuses before disclosing under a pin source on upstream's own origin", async () => {
+    staleAuthPathRoute();
+    upstreamAnswers(UPSTREAM_PROOF);
+    const sdk = fallbackSdk({ pinUpstream: `${upstream.url}/pins` });
+
+    const { returned, thrown } = await fallbackOutcome(sdk);
+
+    expect(returned).toBeUndefined();
+    expect(RavenError.is(thrown, "InvalidQuery"), String(thrown)).toBe(true);
+    expect(upstream.requests).toHaveLength(0);
+  });
+
+  // With no resolver at all, the fold-time check would refuse too, but only after the commitment
+  // had reached upstream, and a disclosure cannot be taken back.
+  it.each([
+    { label: "pin verification is switched off", extra: { pinUpstream: false } },
+    { label: "the chain has no upstream network name", extra: { chainId: 10 } },
+  ] as const)("refuses before disclosing when $label", async ({ extra }) => {
+    staleAuthPathRoute();
+    upstreamAnswers(UPSTREAM_PROOF);
+    const sdk = fallbackSdk(extra);
+
+    const { returned, thrown } = await fallbackOutcome(sdk);
+
+    expect(returned).toBeUndefined();
+    expect(RavenError.is(thrown, "InvalidQuery"), String(thrown)).toBe(true);
+    expect(String((thrown as Error).message)).toMatch(/no root from a party other than/);
+    expect(upstream.requests).toHaveLength(0);
+  });
+
+  it("returns a fallback proof that folds to the caller's pinned root", async () => {
+    staleAuthPathRoute();
+    upstreamAnswers(UPSTREAM_PROOF);
+    const sdk = fallbackSdk({ ppoiPinnedRoots: new Map([[`${LIST_KEY_HEX}:0`, PATH10_ROOT]]) });
+
+    const proofs = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+
+    expect(proofs).toEqual([UPSTREAM_PROOF]);
+    expect(upstream.requests).toHaveLength(1);
+    expect(adapter.requests).toHaveLength(2);
+  });
+
+  it("refuses a fallback proof whose fold is not the caller's pinned root", async () => {
+    staleAuthPathRoute();
+    upstreamAnswers(UPSTREAM_PROOF);
+    const sdk = fallbackSdk({ ppoiPinnedRoots: new Map([[`${LIST_KEY_HEX}:0`, "33".repeat(32)]]) });
+
+    const { returned, thrown } = await fallbackOutcome(sdk);
+
+    expect(returned).toBeUndefined();
+    expect(RavenError.is(thrown, "DecodeError"), String(thrown)).toBe(true);
+  });
+
+  // Block groups are fetched one after another, so the anchor guards each group's own commitments:
+  // a later group that could only refuse is refused before it reaches upstream.
+  it("refuses a later block group with no independent root before disclosing it", async () => {
+    const secondBlockBc = "00".repeat(31) + "02";
+    staleAuthPathRoute();
+    upstreamAnswers(UPSTREAM_PROOF);
+    const sdk = fallbackSdk({
+      bcToIdxMaps: new Map([
+        [LIST_KEY_HEX, new Map([[BC_HEX, 0], [secondBlockBc, BLOCK0_LAST_INDEX + 1]])],
+      ]),
+      clientPirInstanceLabels: new Map([[`t2Path:${LIST_KEY_HEX}:1`, "ppoi-paths-1"]]),
+      ppoiPinnedRoots: new Map([[`${LIST_KEY_HEX}:0`, PATH10_ROOT]]),
+    });
+
+    let thrown: unknown;
+    try {
+      await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX, secondBlockBc]);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(RavenError.is(thrown, "InvalidQuery"), String(thrown)).toBe(true);
+    expect(String((thrown as Error).message)).toMatch(
+      new RegExp(`no pinned root for ${LIST_KEY_HEX}:1 on chain`),
+    );
+    for (const request of upstream.requests) {
+      expect(
+        containsByteSequence(request.body, new TextEncoder().encode(secondBlockBc)),
+      ).toBe(false);
+    }
+  });
+
+  describe("with a pin source that is not upstream", () => {
+    let pins: MockServer;
+
+    beforeAll(async () => {
+      pins = await startMockServer();
+    });
+    afterAll(async () => {
+      await pins.close();
+    });
+    afterEach(() => {
+      pins.reset();
+    });
+
+    function pinsCertify(root: string): void {
+      pins.route(
+        (req) => req.url === "/",
+        (_req, body, res) => {
+          const request = readJsonRpcRequest(body);
+          expect(request.method).toBe("ppoi_poi_events");
+          writeJsonRpcResult(body, res, [
+            {
+              signedPOIEvent: { index: BLOCK0_LAST_INDEX },
+              validatedMerkleroot: root,
+            },
+          ]);
+          return true;
+        },
+      );
+    }
+
+    it("verifies the fallback proof against the root that source certifies", async () => {
+      staleAuthPathRoute();
+      upstreamAnswers(UPSTREAM_PROOF);
+      pinsCertify(PATH10_ROOT);
+      const sdk = fallbackSdk({ pinUpstream: pins.url });
+
+      const proofs = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+
+      expect(proofs).toEqual([UPSTREAM_PROOF]);
+      expect(upstream.requests).toHaveLength(1);
+      expect(pins.requests).toHaveLength(1);
+      expect(
+        containsByteSequence(pins.requests[0].body, new TextEncoder().encode(BC_HEX)),
+      ).toBe(false);
+    });
+
+    it("refuses a forged fallback proof that claims the root that source certifies", async () => {
+      staleAuthPathRoute();
+      upstreamAnswers(FORGED_PROOF);
+      pinsCertify(FORGED_PROOF.root);
+      const sdk = fallbackSdk({ pinUpstream: pins.url });
+
+      const { returned, thrown } = await fallbackOutcome(sdk);
+
+      expect(returned).toBeUndefined();
+      expect(RavenError.is(thrown, "DecodeError"), String(thrown)).toBe(true);
+      expect(String((thrown as Error).message)).toMatch(/does not fold to the root it claims/);
+    });
+
+    it("refuses the fallback proof when its fold misses that root", async () => {
+      staleAuthPathRoute();
+      upstreamAnswers(UPSTREAM_PROOF);
+      pinsCertify("44".repeat(32));
+      const sdk = fallbackSdk({ pinUpstream: pins.url });
+
+      const { returned, thrown } = await fallbackOutcome(sdk);
+
+      expect(returned).toBeUndefined();
+      expect(RavenError.is(thrown, "DecodeError"), String(thrown)).toBe(true);
+      expect(pins.requests.length).toBeGreaterThan(0);
+    });
   });
 
   for (const operation of ["t1-status", "t2-auth-path"] as const) {
@@ -406,12 +635,7 @@ describe("private response freshness fallback", () => {
           return true;
         },
       );
-      const upstreamProof = {
-        leaf: BC_HEX,
-        elements: Array.from({ length: 16 }, () => "11".repeat(32)),
-        indices: "0".repeat(64),
-        root: "22".repeat(32),
-      };
+      const upstreamProof = UPSTREAM_PROOF;
       upstream.route(
         (req) => req.url === "/",
         (_req, body, res) => {
@@ -434,7 +658,7 @@ describe("private response freshness fallback", () => {
           [`t2Path:${LIST_KEY_HEX}`, authPathContext()],
         ]),
         bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX, 0]])]]),
-        // D-06: every path-10 fold requires a pinned root.
+        // Every path-10 fold requires a pinned root.
         ppoiPinnedRoots: new Map([[`${LIST_KEY_HEX}:0`, PATH10_ROOT]]),
       };
       const config: RavenConfig = row.policy === "allow"

@@ -20,6 +20,7 @@ import {
   STUB_QUERY_BYTES,
   stubQueryBundle,
 } from "./helpers/private_wire";
+import { shardConfigBincode } from "./helpers/shard_config";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX = "abababababababababababababababababababababababababababababababab";
@@ -58,7 +59,7 @@ function stubCtx(entrySize: number = STATUS_ROW_BYTES): ClientPirContext {
     wasm: passthroughWasm(),
     session: { free: () => undefined },
     crsBincode: new Uint8Array(0),
-    shardConfigBincode: new Uint8Array(0),
+    shardConfigBincode: shardConfigBincode(),
     entrySize,
   };
 }

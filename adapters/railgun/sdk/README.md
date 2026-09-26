@@ -1,21 +1,21 @@
-# @raven/railgun-poi-node-interface
+# @hisoka-io/railgun-poi-node-interface
 
 Drop-in `POINodeInterface` for the Railgun wallet stack. Privately resolves PPOI status, PPOI auth-paths, and commit-tree auth-paths against a Raven Railgun PIR adapter server.
 
 ## Install
 
 ```sh
-npm install @raven/railgun-poi-node-interface
+npm install @hisoka-io/railgun-poi-node-interface
 ```
 
 ```ts
 // ESM, and any bundler
-import { RavenPOINodeInterface } from "@raven/railgun-poi-node-interface";
+import { RavenPOINodeInterface } from "@hisoka-io/railgun-poi-node-interface";
 ```
 
 ```js
 // CommonJS, which is what a `tsc`-built wallet emits
-const { RavenPOINodeInterface } = require("@raven/railgun-poi-node-interface");
+const { RavenPOINodeInterface } = require("@hisoka-io/railgun-poi-node-interface");
 ```
 
 Node 20 or newer. The package ships a CommonJS build and an ESM build with a `.d.ts` beside each,
@@ -32,18 +32,36 @@ Client-side PIR needs `raven-inspire-client-wasm`, the wasm-pack output of
 in through `clientPirContexts`, typed as `RavenInspireWasm`, so the shape this package depends on is
 the interface, not the artifact.
 
-The manifest still lists that package as a runtime dependency under a repo-relative `file:` path
-that resolves to nothing outside this repository. Installing the tarball succeeds and the SDK works,
-but the consumer is left with a dangling `node_modules/raven-inspire-client-wasm` link and
-`npm ls` reports the tree invalid. How the WASM is published, and therefore how this entry should
-read, is still open.
+It is a development dependency only, for this package's own tests, so installing the SDK installs
+no WASM: the caller adds `raven-inspire-client-wasm` to its own dependencies. How that package is
+published is still open.
+
+### Engine is a peer, never a dependency
+
+`RavenPOINodeInterface` is assignable to `POINodeInterface` from `@railgun-community/engine`, and its
+declarations import engine's types. Engine is therefore an optional peer dependency
+(`^9.6.0 || 9.7.0-rc.0`), which shares the copy your wallet already has and can never install a
+second one. That matters because engine's injection seam, `POI.init`, is a static on a class: an
+interface installed through a second copy is never read by the wallet's, and nothing reports it.
+
+The range is written out because a prerelease satisfies only a range that names its own version:
+`^9.6.0` does not admit `9.7.0-rc.0`, which `@railgun-community/wallet@10.10.0-rc.1` pins exactly.
+`adapters/railgun/scripts/check-sdk-engine-singleton.sh` installs the packed SDK beside that wallet,
+with npm's default resolution and with `--legacy-peer-deps`, and requires one engine copy on disk,
+one resolved file, and a consumer that typechecks against it.
+
+Engine's status values are a string enum, which no string literal satisfies, so the engine-shaped
+`getPOIsPerList(txidVersion, chain, listKeys, commitments)` is typed with engine's own
+`POIsPerList`. The one value it can return outside that enum is `"Unreachable"`, when the adapter
+could not be reached; engine compares statuses only for equality, so it reads as not `Valid`. The
+two-argument `getPOIsPerList(listKeys, commitments)` returns `PoisPerListResponse`, which names it.
 
 ## How it plugs in
 
 `RavenPOINodeInterface` implements Railgun's abstract `POINodeInterface`, the same class the stock `WalletPOINodeInterface` implements:
 
 ```ts
-import { RavenPOINodeInterface } from "@raven/railgun-poi-node-interface";
+import { RavenPOINodeInterface } from "@hisoka-io/railgun-poi-node-interface";
 
 const poi = new RavenPOINodeInterface({
   endpoint: "https://raven.example.com",
@@ -63,8 +81,10 @@ node by URL alone.
 
 **Leaving it out works only against a node that does not require a credential.** A node that does
 answers `401` on every route the SDK uses, which surfaces as a typed `ServerError` `RavenError`
-carrying `status: 401`. A stock Raven adapter configures a mandatory `read_token`, so it is such a
-node: pass its token.
+carrying `status: 401`. A stock Raven adapter is no longer such a node -- its read routes carry no
+credential, and the PPOI list they serve is public data either way. Pass a token only when the
+operator says their node wants one. Two routes still refuse without one, and the SDK calls neither:
+`/v1/admin/*`, and `/metrics` while `metrics_public` is false, which is its default.
 
 A token that is empty, has leading or trailing whitespace, or holds anything but printable ASCII
 is refused at construction with `InvalidQuery`, and the message never quotes it. The SDK never
@@ -95,7 +115,132 @@ Public-info channels (cacheable, no per-BC leak):
 | Method               | Route                              |
 |----------------------|------------------------------------|
 | `fetchBcToIdxMap`    | `GET /v1/poi/:list/bc-to-idx-map`  |
+| `fetchBcPrefixIndex` | `GET /v1/poi/:list/bc-prefixes`    |
 | `fetchStatusHeader`  | `GET /v1/poi/:list/status-header`  |
+
+`fetchBcToIdxMap` returns the channel's rows as `{ epoch, listKey, rows, entries }`, parsed rather
+than cast. The node publishes a gap-free prefix of the list in index order, so entry `i` must be row
+`i`: a body that is not JSON, answers for another list, or has a row repeated or out of place is
+refused with a typed `DecodeError`. The body carries no count of its own, so the call first walks
+the prefix channel and then compares the body with it row by row. The list only grows, so these are
+refused with a `DecodeError` too: a body shorter than that walk (cut, or served from an older copy),
+a body longer than the list the channel serves when read again, and any row whose prefix differs,
+including a row hidden by relabelling every row after it. A body that an append overtook between
+the two reads is accepted after one read of the new tail. Both reads are sent with
+`cache: "no-cache"`. The check costs one walk of the prefix channel, 6 B a row: 2,150,064 B at
+N = 358,344 (2026-09-20T08:14:13Z, derived), beside the 31,064,918 B body it checks at that N.
+A wallet that needs only its own notes' indices should hold an index from `syncPoiListIndex` (next
+section) and skip the JSON channel entirely.
+
+Build a `bcToIdxMaps` preload from the rows with **`bcToIdxMapFrom(entries)`**, not
+`new Map(entries)`: the channel emits one row per LEAF and a commitment may recur within a list, so
+`new Map` is last-wins and keeps the highest occurrence while the adapter resolves to the lowest -- a
+different leaf, in a possibly different PPOI block, verified against a different root, and carrying
+the same commitment so the row-binding guard cannot tell the two apart. The helper also strips and
+lower-cases the key, which the internal lookup matches exactly. A map carries no row count, so read
+the next section before relying on one.
+
+`bc-prefixes` publishes the same index as **6 bytes per row instead of ~86**, segmented one block per
+response with a `?since=N` cursor and an immutable `Cache-Control` on any sealed block. Measured
+against a two-block fixture (N = 65,539): **393,234 B over two responses** versus **5,625,348 B in
+one** -- a 14.3x saving, and the only one of the two a client can resume rather than re-download
+whole.
+
+`fetchBcPrefixIndex` walks every segment and returns `{ epoch, prefixes, total }`. A sealed segment
+carries only its own cursor (`x-raven-index-base`, `x-raven-index-next`); the list-wide
+`x-raven-index-total` and `x-raven-index-epoch` ride on the frontier segment alone, and the walk
+reads them only there. A cache may replay a sealed segment for a year, so a total read off one
+would contradict the frontier's, and a stale total equal to the segment's own cursor would end the
+walk early with no error. A cross-origin browser can read all four once the wallet's origin is in
+the server's `cors_allowed_origins`, which exposes them.
+
+**The epoch says nothing for a PPOI list.** Mirrored rows carry no chain height, so it is always 0,
+and a lookup with no candidates means *"absent from the first `total` rows"*, not *"absent from the
+list"*. `total` is the quantity that moves when the list grows, so it is what the SDK binds an index
+to; see the next section.
+
+**A six-byte prefix is not a commitment**, so `indexCandidatesFor` returns every matching row rather
+than the first. A blinded commitment is a BN254 field element, so its first six bytes take about
+2^45.6 values, not 2^48; over ~360k rows the chance that some two rows share a prefix is about 0.12%.
+Unlikely, not impossible, and a client that assumed uniqueness would eventually fetch the wrong row.
+Resolving a candidate costs nothing extra: the served row carries the full commitment in its first
+32 bytes and the fold path already refuses a row whose commitment is not the one asked for.
+
+A wallet proving its own notes wants this rather than the whole map -- it holds K commitments and
+needs K indices, not the entire list.
+
+## An absence is answered only at the row count the node serves
+
+A commitment with no index has no row to query, so its `Missing` is decided by the index alone and no
+row's commitment check ever runs. An index one append behind the list therefore reads a real member
+as `Missing`, and that is the verdict a wallet acts on. The SDK closes this by binding every index to
+the list's row count and bringing it up to the node's count on each call:
+
+```ts
+const poi = new RavenPOINodeInterface({ endpoint, clientPirContexts });
+await poi.syncPoiListIndex(listKey); // first run: walks the prefix channel once, ~6 B per row
+// every later getPOIsPerList / getPOIMerkleProofs re-reads only the index's tail first
+```
+
+- **Each client-PIR call on an index first syncs it.** The sync re-reads from a multiple of
+  `BC_INDEX_RESUME_ALIGN_ROWS` (2,048) below the rows held, so the cursor it sends names a window of
+  about three days of list growth rather than the exact row a client last reached, which would link
+  its calls and its restarts. The re-read rows are compared with what is held: the list is
+  append-only, so a difference is the node contradicting itself and is refused (`DecodeError`), as
+  is a node serving fewer rows than the index holds (`StaleAdapter`). The sync request is sent
+  whatever the commitments are, so it says nothing about membership, and it carries the bearer
+  credential but never the PIR client id. It is sent with `cache: "no-cache"`: the frontier is
+  served `max-age=15`, and a browser or CDN answering from its copy would let an absence read as
+  current against a list up to 15 s old. Syncs of one index run one at a time, so a slower one
+  never lands an older list over a newer one.
+- **An index this node did not produce is re-read in full.** One passed in `poiListIndexes` is
+  compared row by row against the prefix channel on its first sync, because an absence is answered
+  from the index alone and a row changed anywhere in it would silently turn a member into a
+  non-member. After that it is held as the node's own, and later syncs re-read only the tail.
+- **Only then is an absence `Missing`**, and it is counted as `absent` in `indexCounters()`.
+- **An absence that cannot be shown current is refused by default.** That is an index whose sync
+  failed, or a `bcToIdxMaps` entry, which has no row count at all. `indexStalenessPolicy:
+  "answer-at-index-rows"` is the explicit decision to answer it anyway, and it answers the SDK-local
+  verdict `MissingStale`, never `Missing`, so each verdict says which kind of absence it is, per
+  commitment and per list. Those answers are counted apart, as `absentFromStaleIndex` or
+  `absentFromBareMap`. The engine reads `MissingStale` exactly as it reads `Missing`: it acts only on
+  `Valid`, `ShieldBlocked` and `ProofSubmitted`. Under the default, a sync that fails on the network
+  reads `Unreachable` for the absences in `getPOIsPerList`, as a failed query does.
+- **A failed sync costs only the absences.** A commitment the held index has a row for is still
+  asked, and its row confirms it: a row the list holds never moves. So `getPOIsPerList` still answers
+  members and `getPOIMerkleProofs` still proves them; only a commitment with no row is refused, with
+  the sync's own error kind.
+- **A proof has no answer for an absence**, so `getPOIMerkleProofs` refuses every kind, and its
+  refusal says whether the absence is from the node's list or could not be shown current. It is
+  counted in the `indexCounters()` field the same absence takes in `getPOIsPerList`.
+- **A prefix is not a commitment**, so a candidate is confirmed by the row it returns: a row carrying
+  the same six-byte prefix but another commitment moves the SDK to the next candidate in a second
+  round, and a row that does not even carry the prefix is refused rather than read as absent. The
+  lowest confirmed candidate wins, which is the occurrence the adapter resolves to.
+
+What no channel on the node can show is a node that serves the same shorter list everywhere: that
+reads exactly like a node that has not ingested the tail yet, and for a PPOI list nothing the node
+publishes tracks that lag. The freshness header's `applied_height` is 0 for a mirrored list and its
+`lag_blocks` follows the chain, not the list. Only a total read from upstream could tell the two
+apart.
+
+### The index survives a restart
+
+`syncPoiListIndex` and every sync that moves the index write it to `poiListIndexStore`: IndexedDB by
+default where the runtime has it (`indexedDbPoiListIndexStore`). Node has none, so a Node wallet
+passes its own `{ load, save }` over whatever it persists to; the record is opaque bytes. A restarted
+client reads the index from the store, so `poiListIndexCandidates(listKey, commitment)` resolves an
+index with no request at all, and its next call resumes from the stored cursor. Calls that arrive
+while the store is being read all wait for that one read, so a wallet's first calls after a start,
+which arrive together, all resolve from it. Records are keyed by
+chain, node and list, carry their list key and a SHA-256 digest, and anything that does not verify is
+ignored and costs a re-walk, never an answer. A failed save is swallowed for the same reason.
+
+A record is written only after a sync against that same node, so every row in it was served or
+confirmed by that node, and a restart re-reads only the tail rather than the whole list again. The
+rows below the cursor are not re-read on each start: re-reading them is the full walk the store
+exists to avoid, and a re-read of the same node could catch only a row it once served wrongly and
+later corrected, never one it serves wrongly throughout.
 
 ## One-query cover fanout
 
@@ -179,17 +324,27 @@ Both pin requests are a function of public state only: the list key, a block num
 upstream's own tip. No blinded commitment is sent, and the aggregator's own API takes none.
 
 Be precise about what that does and does not hide. The **block** is derived from the note's leaf
-index, so a pin request tells the aggregator which 65,536-leaf block your note sits in — today that
+index, so a pin request tells the aggregator which 65,536-leaf block your note sits in -- today that
 is roughly one-in-six for the OFAC list, and it narrows further as blocks are added. It does not
 reveal which note. Requests for the same block are identical between wallets apart from the
-JSON-RPC `id`, and a filling block is asked about once per cache window rather than once per
-proof. If you want the block hidden too, preload `ppoiPinnedRoots` for every block from a source
-you already trust; the resolver is then never consulted.
+JSON-RPC `id`, and a burst of proofs against one Raven snapshot costs one block-naming request
+rather than one per proof.
+
+Not once per cache window, which this paragraph claimed until it was measured. A fold whose root
+has moved off the cached window makes the SDK forget the tail and re-resolve, and a re-resolve
+starts with the block-naming query. Every insert into a filling block moves every auth path in it,
+so a list that takes a leaf between two of your proofs is back to one block-naming request per
+proof -- as is a node lagging 64 or more leaves behind you (the window is the 64 indices
+`tip-63 .. tip`, so a node exactly 64 behind is already outside it), which pays it on every proof while
+refusing every proof. If you want the block hidden too, preload `ppoiPinnedRoots` for every block
+from a source you already trust; the resolver is then never consulted.
 
 A pin source that names the same **origin** as the endpoint being verified is refused: setting
 `pinUpstream` to it throws at construction, and inheriting such a value leaves the resolver inert
 rather than verifying in a circle. Scheme case, a default port, a trailing slash and an extra path
-segment all resolve to the same origin and are all caught.
+segment all resolve to the same origin and are all caught. A `pinUpstream` that is neither an
+http(s) URL nor a same-origin path is refused as malformed and says so -- it used to be reported as
+a circularity, sending operators to look for one that was not there.
 
 This is a misconfiguration guard, not a security boundary, and the difference is worth stating. It
 cannot prove two host*names* are different parties: `localhost` and `127.0.0.1` are distinct origins

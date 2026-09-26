@@ -252,6 +252,15 @@ rs_block="$(extract "Rust LEAVES_PER_PPOI_BLOCK" "${ADAPTER_ROOT}/engine/src/orc
   's/^pub const LEAVES_PER_PPOI_BLOCK: u32 = \([0-9_]*\);$/\1/p')"
 compare "LEAVES_PER_PPOI_BLOCK" "$(tr -d _ <<<"$ts_block")" "$(tr -d _ <<<"$rs_block")"
 
+# The six-byte index channel publishes a fixed prefix width, and the client slices on it. A
+# server that widened the prefix without the client following would hand back rows the client
+# reads at the wrong stride -- silently, because every byte is still a valid byte.
+ts_prefix="$(extract "TS BC_INDEX_PREFIX_BYTES" "${ADAPTER_ROOT}/sdk/src/bc-prefix-index.ts" \
+  's/^export const BC_INDEX_PREFIX_BYTES = \([0-9_]*\);$/\1/p')"
+rs_prefix="$(extract "Rust BC_INDEX_PREFIX_BYTES" "${ADAPTER_ROOT}/http/src/poi_shim.rs" \
+  's/^pub const BC_INDEX_PREFIX_BYTES: usize = \([0-9_]*\);$/\1/p')"
+compare "BC_INDEX_PREFIX_BYTES" "$(tr -d _ <<<"$ts_prefix")" "$(tr -d _ <<<"$rs_prefix")"
+
 if [[ "$failed" -ne 0 ]]; then
   echo "check-sdk-constant-parity.sh: FAILED - a Rust/TS constant pair has drifted." >&2
   exit 1

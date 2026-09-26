@@ -42,6 +42,7 @@ import {
 import { encodeBatchResponse, encodeBatchResponseNodes } from "./helpers/auth_path_stub";
 import { authPathOf, encodedBatchCount } from "./helpers/auth_path_stub";
 import { foldMerkleRoot } from "../src/poseidon";
+import { shardConfigBincode } from "./helpers/shard_config";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const MOCK_EPOCH = 1;
@@ -114,7 +115,7 @@ function stubCtx(): ClientPirContext {
     wasm,
     session: { free: () => undefined },
     crsBincode: new Uint8Array(0),
-    shardConfigBincode: new Uint8Array(0),
+    shardConfigBincode: shardConfigBincode(),
     entrySize: 32,
   };
 }

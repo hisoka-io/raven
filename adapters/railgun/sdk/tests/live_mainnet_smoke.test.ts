@@ -2,8 +2,9 @@
  * Live mainnet smoke: params fetch -> WASM session -> auth-path PIR query ->
  * Poseidon fold -> on-chain `rootHistory` cross-check.
  *
- * Every block skips unless `RAVEN_LIVE_URL` + `RAVEN_LIVE_TOKEN` +
- * `RAVEN_INFURA_URL` are set, so offline lanes make no network calls.
+ * Every block skips unless `RAVEN_LIVE_URL` + `RAVEN_INFURA_URL` are set, so offline
+ * lanes make no network calls. `RAVEN_LIVE_TOKEN` is sent when set, for a node that
+ * still gates reads.
  */
 
 import { afterAll, describe, expect, it } from "vitest";
@@ -19,115 +20,28 @@ import {
 } from "../src/index";
 import { RavenError } from "../src/errors";
 import { decodeClientPirQueryBundle } from "../src/client-pir";
-import { authPathOf } from "./helpers/auth_path_stub";
+import { authPathOf, encodedBatchCount } from "./helpers/auth_path_stub";
+import {
+  LIVE_TOKEN,
+  LIVE_URL,
+  PPOI_STATUS_INSTANCE,
+  decodeInstanceParams,
+  liveHeaders,
+  ppoiPathInstance,
+  stripVersionedResponse,
+  versionedQueryBody,
+  type DecodedInstanceParams,
+} from "./helpers/live_wire";
 
-const LIVE_URL = process.env.RAVEN_LIVE_URL;
-const LIVE_TOKEN = process.env.RAVEN_LIVE_TOKEN;
 const INFURA_URL = process.env.RAVEN_INFURA_URL ?? "";
 const RAILGUN_PROXY = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9";
 const CHAIN_ID = 1;
 
-const RUN_LIVE =
-  LIVE_URL !== undefined && LIVE_TOKEN !== undefined && INFURA_URL !== "";
+const RUN_LIVE = LIVE_URL !== undefined && INFURA_URL !== "";
 const liveIt = RUN_LIVE ? it : it.skip;
 
 const PARAMS_DOWNLOAD_TIMEOUT_MS = 240_000;
 const TEST_TIMEOUT_MS = 600_000;
-
-interface DecodedInstanceParams {
-  wireSchemaVersion: number;
-  crsBincode: Uint8Array;
-  shardConfigBincode: Uint8Array;
-  inspireParamsBincode: Uint8Array;
-  entrySize: number;
-  variant: string;
-  epoch: bigint;
-}
-
-function readU64LE(view: DataView, offset: number): number {
-  const lo = view.getUint32(offset, true);
-  const hi = view.getUint32(offset + 4, true);
-  if (hi !== 0) {
-    throw new Error(`readU64LE: payload exceeds 2^32 (hi=${hi}) at offset ${offset}`);
-  }
-  return lo;
-}
-
-function readByteVec(buf: Uint8Array, offset: number): { value: Uint8Array; next: number } {
-  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const len = readU64LE(view, offset);
-  const start = offset + 8;
-  const end = start + len;
-  if (end > buf.length) {
-    throw new Error(
-      `readByteVec: truncated (need ${end}, have ${buf.length}) at offset ${offset}`,
-    );
-  }
-  return {
-    value: new Uint8Array(buf.subarray(start, end)),
-    next: end,
-  };
-}
-
-function readString(buf: Uint8Array, offset: number): { value: string; next: number } {
-  const inner = readByteVec(buf, offset);
-  return {
-    value: new TextDecoder().decode(inner.value),
-    next: inner.next,
-  };
-}
-
-/**
- * Decode `/v1/instance/:id/params`, mirroring `InstanceParams` behind the
- * `write_versioned` envelope:
- *
- *   [u16 BE  schema_version]
- *   [u16 LE  wire_schema_version]
- *   [u64 LE  crs_bincode.len]      [crs_bincode bytes]
- *   [u64 LE  shard_config.len]     [shard_config bytes]
- *   [u64 LE  inspire_params.len]   [inspire_params bytes]
- *   [u64 LE  entry_size]
- *   [u64 LE  variant.len]          [variant utf-8]
- *   [u64 LE  epoch]
- */
-function decodeInstanceParams(buf: Uint8Array): DecodedInstanceParams {
-  if (buf.length < 4) {
-    throw new Error(`decodeInstanceParams: too short (${buf.length})`);
-  }
-  const envelopeView = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const envelope = (envelopeView.getUint8(0) << 8) | envelopeView.getUint8(1);
-  if (envelope !== 2) {
-    throw new Error(`decodeInstanceParams: unexpected envelope version ${envelope}`);
-  }
-  let off = 2;
-  const wireSchemaVersion = envelopeView.getUint16(off, true);
-  off += 2;
-  const crs = readByteVec(buf, off);
-  off = crs.next;
-  const shard = readByteVec(buf, off);
-  off = shard.next;
-  const inspire = readByteVec(buf, off);
-  off = inspire.next;
-  const entrySize = readU64LE(envelopeView, off);
-  off += 8;
-  const variant = readString(buf, off);
-  off = variant.next;
-  if (off + 8 > buf.length) {
-    throw new Error(`decodeInstanceParams: truncated trailing epoch (off=${off})`);
-  }
-  const epochLo = envelopeView.getUint32(off, true);
-  const epochHi = envelopeView.getUint32(off + 4, true);
-  const epoch = (BigInt(epochHi) << 32n) | BigInt(epochLo);
-  return {
-    wireSchemaVersion,
-    crsBincode: crs.value,
-    shardConfigBincode: shard.value,
-    inspireParamsBincode: inspire.value,
-    entrySize,
-    variant: variant.value,
-    epoch,
-  };
-}
 
 interface InstanceBundle {
   decoded: DecodedInstanceParams;
@@ -145,7 +59,6 @@ if (typeof wasmInit.init_panic_hook === "function") {
 
 async function fetchInstanceParams(
   endpoint: string,
-  token: string,
   instanceId: string,
 ): Promise<InstanceBundle> {
   const start = Date.now();
@@ -154,7 +67,7 @@ async function fetchInstanceParams(
   let res: Response;
   try {
     res = await fetch(`${endpoint}/v1/instance/${instanceId}/params`, {
-      headers: { authorization: `Bearer ${token}` },
+      headers: liveHeaders(),
       signal: ctrl.signal,
     });
   } finally {
@@ -255,7 +168,6 @@ async function rootHistoryContains(
  * folded with its siblings without a separately-known BC. */
 async function fetchSingleRow(
   endpoint: string,
-  token: string,
   instanceId: string,
   ctx: ClientPirContext,
   flatIdx: number,
@@ -264,31 +176,23 @@ async function fetchSingleRow(
     ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, BigInt(flatIdx)),
   );
   const url = `${endpoint}/v1/instance/${encodeURIComponent(instanceId)}/query`;
-  // `read_versioned` expects `[u16 BE schema][bincode body]`.
-  const wireBody = new Uint8Array(2 + queryBundle.queryBytes.length);
-  wireBody[0] = 0;
-  wireBody[1] = 1;
-  wireBody.set(queryBundle.queryBytes, 2);
   // Some tsc targets refuse `Uint8Array<ArrayBufferLike>` as BodyInit.
-  const fetchBody = wireBody as unknown as BodyInit;
+  const fetchBody = versionedQueryBody(queryBundle.queryBytes) as unknown as BodyInit;
   const res = await fetch(url, {
     method: "POST",
     headers: {
       "content-type": "application/octet-stream",
-      authorization: `Bearer ${token}`,
+      ...liveHeaders(),
     },
     body: fetchBody,
   });
   if (!res.ok) {
     throw new Error(`fetchSingleRow(${instanceId}, flat=${flatIdx}): HTTP ${res.status}`);
   }
-  const enveloped = new Uint8Array(await res.arrayBuffer());
-  if (enveloped.length < 2 || ((enveloped[0] << 8) | enveloped[1]) !== 1) {
-    throw new Error(
-      `fetchSingleRow(${instanceId}, flat=${flatIdx}): bad response envelope`,
-    );
-  }
-  const responseBytes = enveloped.subarray(2);
+  const responseBytes = stripVersionedResponse(
+    new Uint8Array(await res.arrayBuffer()),
+    `fetchSingleRow(${instanceId}, flat=${flatIdx})`,
+  );
   const plaintext = ctx.wasm.extract_response(
     ctx.session,
     ctx.crsBincode,
@@ -319,10 +223,10 @@ function recordFinding(row: FindingsRow): void {
 const bundleCache = new Map<string, InstanceBundle>();
 
 async function getInstance(instanceId: string): Promise<InstanceBundle> {
-  if (!LIVE_URL || !LIVE_TOKEN) throw new Error("env guard");
+  if (!LIVE_URL) throw new Error("env guard");
   const hit = bundleCache.get(instanceId);
   if (hit) return hit;
-  const fresh = await fetchInstanceParams(LIVE_URL, LIVE_TOKEN, instanceId);
+  const fresh = await fetchInstanceParams(LIVE_URL, instanceId);
   bundleCache.set(instanceId, fresh);
   return fresh;
 }
@@ -331,7 +235,7 @@ describe("live mainnet PIR smoke", () => {
   if (!RUN_LIVE) {
     // RUN_LIVE also requires RAVEN_INFURA_URL; without it the on-chain rootHistory
     // cross-check has nothing to compare against and the whole block is decoration.
-    it.skip("requires RAVEN_LIVE_URL + RAVEN_LIVE_TOKEN + RAVEN_INFURA_URL", () => {
+    it.skip("requires RAVEN_LIVE_URL + RAVEN_INFURA_URL", () => {
     });
   }
 
@@ -345,7 +249,7 @@ describe("live mainnet PIR smoke", () => {
   liveIt(
     "T3 commit-tree-0 leaf 0: PIR-derived root matches on-chain rootHistory",
     async () => {
-      if (!LIVE_URL || !LIVE_TOKEN) throw new Error("env guard");
+      if (!LIVE_URL) throw new Error("env guard");
       const bundle = await getInstance("commit-tree-0");
       const sdk = new RavenPOINodeInterface({
         endpoint: LIVE_URL,
@@ -361,7 +265,6 @@ describe("live mainnet PIR smoke", () => {
       // The auth path carries no leaf, so the row is fetched on its own to fold a root.
       const leafBytes = await fetchSingleRow(
         LIVE_URL,
-        LIVE_TOKEN,
         "commit-tree-0",
         bundle.context,
         leafIndex,
@@ -394,7 +297,7 @@ describe("live mainnet PIR smoke", () => {
   liveIt(
     "T3 commit-tree-3 leaf 100: PIR-derived root matches on-chain rootHistory",
     async () => {
-      if (!LIVE_URL || !LIVE_TOKEN) throw new Error("env guard");
+      if (!LIVE_URL) throw new Error("env guard");
       const bundle = await getInstance("commit-tree-3");
       const sdk = new RavenPOINodeInterface({
         endpoint: LIVE_URL,
@@ -409,7 +312,6 @@ describe("live mainnet PIR smoke", () => {
       const path = authPathOf(await sdk.getMerkleProof(3, leafIndex));
       const leafBytes = await fetchSingleRow(
         LIVE_URL,
-        LIVE_TOKEN,
         "commit-tree-3",
         bundle.context,
         leafIndex,
@@ -436,12 +338,12 @@ describe("live mainnet PIR smoke", () => {
   );
 
   liveIt(
-    "T1 ppoi-status-ofac architecture path: SDK preflight returns Missing for unmapped BC",
+    `T1 ${PPOI_STATUS_INSTANCE} architecture path: SDK preflight returns MissingStale for unmapped BC`,
     async () => {
-      if (!LIVE_URL || !LIVE_TOKEN) throw new Error("env guard");
-      const bundle = await getInstance("ppoi-status-ofac");
+      if (!LIVE_URL) throw new Error("env guard");
+      const bundle = await getInstance(PPOI_STATUS_INSTANCE);
       const listKey = "00".repeat(32);
-      // An empty bc-to-idx map must short-circuit to "Missing" with no wire query.
+      // An empty bc-to-idx map carries no row count, so the opt-in answers "MissingStale".
       const sdk = new RavenPOINodeInterface({
         endpoint: LIVE_URL,
         bearerToken: LIVE_TOKEN,
@@ -451,6 +353,7 @@ describe("live mainnet PIR smoke", () => {
           [`t1Status:${CHAIN_ID}:${listKey}`, bundle.context],
         ]),
         bcToIdxMaps: new Map([[`${CHAIN_ID}:${listKey}`, new Map()]]),
+        indexStalenessPolicy: "answer-at-index-rows",
       });
       const bcHex = "01".padStart(64, "0");
       const t0 = Date.now();
@@ -459,10 +362,18 @@ describe("live mainnet PIR smoke", () => {
         [{ blindedCommitment: bcHex, type: "Shield" }],
       );
       const elapsed = Date.now() - t0;
-      expect(got[bcHex][listKey]).toBe("Missing");
-      expect(sdk.lastWireRequests().length).toBe(0);
+      expect(got[bcHex][listKey]).toBe("MissingStale");
+      // Membership must not change what goes out, so an all-absent call still sends its list's
+      // one-slot cover batch, and nothing else.
+      const wires = sdk.lastWireRequests();
+      expect(wires.length).toBeGreaterThan(0);
+      for (const wire of wires) {
+        expect(wire.method).toBe("POST");
+        expect(wire.url).toMatch(/\/v1\/instance\/[^/]+\/batch$/);
+        expect(encodedBatchCount(wire.body)).toBe(1);
+      }
       recordFinding({
-        scope: "T1 ppoi-status-ofac empty bcToIdxMap",
+        scope: `T1 ${PPOI_STATUS_INSTANCE} empty bcToIdxMap`,
         bytes: bundle.decoded.crsBincode.length,
         ms: elapsed,
         rootMatch: null,
@@ -475,10 +386,10 @@ describe("live mainnet PIR smoke", () => {
   );
 
   liveIt(
-    "T2 ppoi-paths-ofac architecture path: SDK preflight throws on unmapped BC",
+    `T2 ${ppoiPathInstance(0)} architecture path: SDK preflight throws on unmapped BC`,
     async () => {
-      if (!LIVE_URL || !LIVE_TOKEN) throw new Error("env guard");
-      const bundle = await getInstance("ppoi-paths-ofac");
+      if (!LIVE_URL) throw new Error("env guard");
+      const bundle = await getInstance(ppoiPathInstance(0));
       const listKey = "00".repeat(32);
       const sdk = new RavenPOINodeInterface({
         endpoint: LIVE_URL,
@@ -503,7 +414,7 @@ describe("live mainnet PIR smoke", () => {
       expect(threw).toBe(true);
       expect(sdk.lastWireRequests().length).toBe(0);
       recordFinding({
-        scope: "T2 ppoi-paths-ofac empty bcToIdxMap",
+        scope: `T2 ${ppoiPathInstance(0)} empty bcToIdxMap`,
         bytes: bundle.decoded.crsBincode.length,
         ms: elapsed,
         rootMatch: null,

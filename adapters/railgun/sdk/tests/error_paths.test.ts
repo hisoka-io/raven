@@ -16,6 +16,8 @@ import {
   writeBinary,
   type MockServer,
 } from "./helpers/mock_server";
+import { mountPrefixChannel } from "./helpers/prefix_channel";
+import { shardConfigBincode } from "./helpers/shard_config";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX = "abababababababababababababababababababababababababababababababab";
@@ -44,7 +46,7 @@ function stubCtx(): ClientPirContext {
     wasm,
     session: { free: () => undefined },
     crsBincode: new Uint8Array(0),
-    shardConfigBincode: new Uint8Array(0),
+    shardConfigBincode: shardConfigBincode(),
     entrySize: 32,
   };
 }
@@ -313,6 +315,7 @@ describe("error-path + truncated-response handling", () => {
   });
 
   it("fetchBcToIdxMap throws on non-200", async () => {
+    mountPrefixChannel(server, LIST_KEY_HEX, { commitments: [] });
     server.route(
       (req) => req.url?.endsWith("/bc-to-idx-map") ?? false,
       (_req, _body, res) => {

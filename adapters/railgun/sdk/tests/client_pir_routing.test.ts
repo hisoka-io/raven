@@ -11,6 +11,7 @@ import {
   encodeBatchResponseNodes,
   encodedBatchCount,
 } from "./helpers/auth_path_stub";
+import { shardConfigBincode } from "./helpers/shard_config";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX = "abababababababababababababababababababababababababababababababab";
@@ -40,7 +41,7 @@ function stubCtx(): ClientPirContext {
     wasm,
     session: { free: () => undefined },
     crsBincode: new Uint8Array(0),
-    shardConfigBincode: new Uint8Array(0),
+    shardConfigBincode: shardConfigBincode(),
     entrySize: 32,
   };
 }
@@ -111,7 +112,7 @@ describe("client-PIR routing + pre-flight", () => {
     ).rejects.toThrow(/missing context or bc-to-idx-map/);
   });
 
-  it("getPOIsPerList client-PIR mode unknown BC returns Missing", async () => {
+  it("getPOIsPerList client-PIR mode unknown BC returns MissingStale when the caller decides so", async () => {
     mountDecoyBatchRoute(server);
     const sdk = new RavenPOINodeInterface({
       endpoint: server.url,
@@ -119,12 +120,13 @@ describe("client-PIR routing + pre-flight", () => {
       useClientPir: true,
       clientPirContexts: new Map([[`t1Status:${LIST_KEY_HEX}`, stubCtx()]]),
       bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map()]]),
+      indexStalenessPolicy: "answer-at-index-rows",
     });
     const got = await sdk.getPOIsPerList(
       [LIST_KEY_HEX],
       [{ blindedCommitment: BC_HEX, type: "Shield" }],
     );
-    expect(got[BC_HEX][LIST_KEY_HEX]).toBe("Missing");
+    expect(got[BC_HEX][LIST_KEY_HEX]).toBe("MissingStale");
     expect(sdk.lastWireRequests()).toHaveLength(1);
     expect(encodedBatchCount(sdk.lastWireRequests()[0].body)).toBe(1);
   });
@@ -172,14 +174,15 @@ describe("client-PIR routing + pre-flight", () => {
         [lkA, new Map()],
         [lkB, new Map()],
       ]),
+      indexStalenessPolicy: "answer-at-index-rows",
     });
     const got = await sdk.getPOIsPerList(
       [lkA, lkB],
       [{ blindedCommitment: BC_HEX, type: "Shield" }],
     );
     expect(Object.keys(got)).toEqual([BC_HEX]);
-    expect(got[BC_HEX][lkA]).toBe("Missing");
-    expect(got[BC_HEX][lkB]).toBe("Missing");
+    expect(got[BC_HEX][lkA]).toBe("MissingStale");
+    expect(got[BC_HEX][lkB]).toBe("MissingStale");
   });
 
   it("getPOIsPerList client-PIR propagates 5xx as ServerError (no silent Missing)", async () => {
@@ -242,6 +245,7 @@ describe("client-PIR routing + pre-flight", () => {
       useClientPir: true,
       clientPirContexts: new Map([[`t1Status:${LIST_KEY_HEX}`, stubCtx()]]),
       bcToIdxMaps: new Map([[LIST_KEY_HEX, bcMap]]),
+      indexStalenessPolicy: "answer-at-index-rows",
     });
     const got = await sdk.getPOIsPerList(
       [LIST_KEY_HEX],
@@ -253,7 +257,7 @@ describe("client-PIR routing + pre-flight", () => {
     const fromBrokenTransport = got[bcQueried][LIST_KEY_HEX];
     const fromAbsentRecord = got[bcAbsent][LIST_KEY_HEX];
     expect(fromBrokenTransport).toBe("Unreachable");
-    expect(fromAbsentRecord).toBe("Missing");
+    expect(fromAbsentRecord).toBe("MissingStale");
     expect(fromBrokenTransport).not.toBe(fromAbsentRecord);
   });
 

@@ -15,7 +15,9 @@
  *     6. extract_response                (WASM decrypt)
  *
  * Env guards:
- *   RAVEN_LIVE_URL, RAVEN_LIVE_TOKEN
+ *   RAVEN_LIVE_URL
+ *   RAVEN_LIVE_TOKEN           (optional; sent when set, for a node that
+ *                              still gates reads)
  *   RAVEN_BENCH_INSTANCE       (default commit-tree-0)
  *   RAVEN_BENCH_HOT_QUERIES    (default 10)
  *   RAVEN_BENCH_TARGET_IDX     (default 0; subsequent queries hit
@@ -31,19 +33,24 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as wasmPkg from "raven-inspire-client-wasm";
 import { decodeClientPirQueryBundle } from "../src/client-pir";
+import {
+  LIVE_URL,
+  decodeInstanceParams,
+  liveHeaders,
+  stripVersionedResponse,
+  versionedQueryBody,
+} from "./helpers/live_wire";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FINDINGS_DIR =
   process.env.RAVEN_BENCH_FINDINGS_DIR ??
   resolve(HERE, "..", "..", "..", "target", "bench-findings");
 
-const LIVE_URL = process.env.RAVEN_LIVE_URL;
-const LIVE_TOKEN = process.env.RAVEN_LIVE_TOKEN;
 const INSTANCE = process.env.RAVEN_BENCH_INSTANCE ?? "commit-tree-0";
 const HOT_QUERIES = Number(process.env.RAVEN_BENCH_HOT_QUERIES ?? "10");
 const TARGET_IDX = Number(process.env.RAVEN_BENCH_TARGET_IDX ?? "0");
 
-const RUN = LIVE_URL !== undefined && LIVE_TOKEN !== undefined;
+const RUN = LIVE_URL !== undefined;
 const liveDescribe = RUN ? describe : describe.skip;
 
 const PARAMS_TIMEOUT_MS = 600_000;
@@ -72,16 +79,6 @@ interface HotSample {
   responseBytes: number;
   extractMs: number;
   totalMs: number;
-}
-
-interface DecodedParams {
-  wireSchemaVersion: number;
-  crsBincode: Uint8Array;
-  shardConfigBincode: Uint8Array;
-  inspireParamsBincode: Uint8Array;
-  entrySize: number;
-  variant: string;
-  epoch: bigint;
 }
 
 const wasm = wasmPkg as unknown as {
@@ -116,64 +113,6 @@ const wasm = wasmPkg as unknown as {
 
 if (typeof wasm.init_panic_hook === "function") {
   wasm.init_panic_hook();
-}
-
-function readU64LE(view: DataView, offset: number): number {
-  const lo = view.getUint32(offset, true);
-  const hi = view.getUint32(offset + 4, true);
-  if (hi !== 0) {
-    throw new Error(`readU64LE: payload exceeds 2^32 (hi=${hi}) at offset ${offset}`);
-  }
-  return lo;
-}
-
-function readByteVec(buf: Uint8Array, offset: number): { value: Uint8Array; next: number } {
-  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const len = readU64LE(view, offset);
-  const start = offset + 8;
-  const end = start + len;
-  if (end > buf.length) {
-    throw new Error(`readByteVec: truncated (need ${end}, have ${buf.length})`);
-  }
-  return { value: new Uint8Array(buf.subarray(start, end)), next: end };
-}
-
-function readString(buf: Uint8Array, offset: number): { value: string; next: number } {
-  const inner = readByteVec(buf, offset);
-  return { value: new TextDecoder().decode(inner.value), next: inner.next };
-}
-
-/**
- * Mirrors `raven-railgun-http::InstanceParams` envelope:
- *   [u16 BE schema][u16 LE wire][u64 crs.len, crs][u64 shard.len, shard]
- *   [u64 inspire.len, inspire][u64 entry_size][u64 variant.len, variant]
- *   [u64 epoch]
- */
-function decodeInstanceParams(buf: Uint8Array): DecodedParams {
-  if (buf.length < 4) throw new Error(`/params body too short: ${buf.length}`);
-  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const envelope = (view.getUint8(0) << 8) | view.getUint8(1);
-  if (envelope !== 2) throw new Error(`unexpected envelope=${envelope}`);
-  let off = 2;
-  const wireSchemaVersion = view.getUint16(off, true);
-  off += 2;
-  const crs = readByteVec(buf, off); off = crs.next;
-  const shard = readByteVec(buf, off); off = shard.next;
-  const inspire = readByteVec(buf, off); off = inspire.next;
-  const entrySize = readU64LE(view, off); off += 8;
-  const variant = readString(buf, off); off = variant.next;
-  const epochLo = view.getUint32(off, true);
-  const epochHi = view.getUint32(off + 4, true);
-  const epoch = (BigInt(epochHi) << 32n) | BigInt(epochLo);
-  return {
-    wireSchemaVersion,
-    crsBincode: crs.value,
-    shardConfigBincode: shard.value,
-    inspireParamsBincode: inspire.value,
-    entrySize,
-    variant: variant.value,
-    epoch,
-  };
 }
 
 async function fetchWithTimeout(
@@ -227,7 +166,7 @@ liveDescribe("live latency bench", () => {
       const t0 = performance.now();
       const res = await fetchWithTimeout(
         `${LIVE_URL}/v1/instance/${encodeURIComponent(INSTANCE)}/params`,
-        { headers: { authorization: `Bearer ${LIVE_TOKEN}` } },
+        { headers: liveHeaders() },
         PARAMS_TIMEOUT_MS,
       );
       if (!res.ok) throw new Error(`GET /params: HTTP ${res.status}`);
@@ -269,10 +208,7 @@ liveDescribe("live latency bench", () => {
         const h1 = performance.now();
         const buildQueryMs = h1 - h0;
 
-        const wireBody = new Uint8Array(2 + queryBundle.queryBytes.length);
-        wireBody[0] = 0;
-        wireBody[1] = 1;
-        wireBody.set(queryBundle.queryBytes, 2);
+        const wireBody = versionedQueryBody(queryBundle.queryBytes);
 
         const h2 = performance.now();
         const queryRes = await fetchWithTimeout(
@@ -281,7 +217,7 @@ liveDescribe("live latency bench", () => {
             method: "POST",
             headers: {
               "content-type": "application/octet-stream",
-              authorization: `Bearer ${LIVE_TOKEN}`,
+              ...liveHeaders(),
             },
             body: wireBody as unknown as BodyInit,
           },
@@ -292,10 +228,7 @@ liveDescribe("live latency bench", () => {
         const h3 = performance.now();
         const queryPostMs = h3 - h2;
 
-        if (enveloped.length < 2 || ((enveloped[0] << 8) | enveloped[1]) !== 1) {
-          throw new Error(`bad response envelope iter=${i}`);
-        }
-        const responseBytes = enveloped.subarray(2);
+        const responseBytes = stripVersionedResponse(enveloped, `POST /query iter=${i}`);
 
         const h4 = performance.now();
         const plaintext = wasm.extract_response(
@@ -351,31 +284,24 @@ liveDescribe("live latency bench", () => {
         const warmQueryBundle = decodeClientPirQueryBundle(
           wasm.build_seeded_query(warmSession, decoded.shardConfigBincode, BigInt(warmTargetIdx)),
         );
-        const warmWireBody = new Uint8Array(2 + warmQueryBundle.queryBytes.length);
-        warmWireBody[0] = 0;
-        warmWireBody[1] = 1;
-        warmWireBody.set(warmQueryBundle.queryBytes, 2);
+        const warmWireBody = versionedQueryBody(warmQueryBundle.queryBytes);
         const warmRes = await fetchWithTimeout(
           `${LIVE_URL}/v1/instance/${encodeURIComponent(INSTANCE)}/query`,
           {
             method: "POST",
             headers: {
               "content-type": "application/octet-stream",
-              authorization: `Bearer ${LIVE_TOKEN}`,
+              ...liveHeaders(),
             },
             body: warmWireBody as unknown as BodyInit,
           },
           QUERY_TIMEOUT_MS,
         );
         if (!warmRes.ok) throw new Error(`POST /query warm: HTTP ${warmRes.status}`);
-        const warmEnveloped = new Uint8Array(await warmRes.arrayBuffer());
-        if (
-          warmEnveloped.length < 2 ||
-          ((warmEnveloped[0] << 8) | warmEnveloped[1]) !== 1
-        ) {
-          throw new Error("bad response envelope on warm-path sanity query");
-        }
-        const warmResponseBytes = warmEnveloped.subarray(2);
+        const warmResponseBytes = stripVersionedResponse(
+          new Uint8Array(await warmRes.arrayBuffer()),
+          "POST /query warm",
+        );
         const warmPlaintext = wasm.extract_response(
           warmSession,
           decoded.crsBincode,

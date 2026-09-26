@@ -1,11 +1,11 @@
-// The commit-tree client-PIR path fetches auth-path siblings only. Folding a root needs
-// the leaf, which that path never retrieves, so the result must not carry a `root` field
-// at all: a substituted zero leaf folds to a root matching no tree state the server ever
-// published, while the same method's plaintext path returns the adapter's real root.
+// A commit-tree proof carries no root on either path. Client-PIR fetches auth-path siblings only
+// and never the leaf, and a substituted zero leaf would fold to a root no tree state ever had. The
+// plaintext route does send a root, but only the serving node vouches for it, so it is dropped and
+// the wallet folds its own note, which the contract's root history then checks.
 
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { RavenPOINodeInterface } from "../src/index";
+import { RavenError, RavenPOINodeInterface } from "../src/index";
 import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
 import type { ClientPirContext, RavenInspireWasm } from "../src/index";
 
@@ -17,6 +17,14 @@ const LEAF = 1234;
 const NODE_BYTES = 32;
 const MOCK_EPOCH = 1;
 const MOCK_SCHEMA_VERSION = 7;
+const LEAF_INDICES = LEAF.toString(16).padStart(64, "0");
+/** What the node's plaintext route sends: its own leaf and root beside the path. */
+const PLAINTEXT_BODY = {
+  leaf: "aa".repeat(32),
+  elements: Array.from({ length: 16 }, (_unused, i) => i.toString(16).padStart(2, "0").repeat(32)),
+  indices: LEAF_INDICES,
+  root: "cc".repeat(32),
+};
 
 function stubWasm(): RavenInspireWasm {
   return {
@@ -71,6 +79,7 @@ function mountBatchRoute(server: MockServer): void {
 
 describe("commit-tree proof shape per retrieval path", () => {
   let server: MockServer;
+  let plaintextBody: unknown = PLAINTEXT_BODY;
 
   beforeAll(async () => {
     server = await startMockServer();
@@ -78,20 +87,27 @@ describe("commit-tree proof shape per retrieval path", () => {
     server.route(
       (req) => /^\/v1\/commit-tree\/\d+\/merkle-proof$/.test(req.url ?? ""),
       (_req, _body, res) => {
-        writeJson(res, {
-          leaf: "aa".repeat(32),
-          elements: Array.from({ length: 16 }, (_unused, i) => `${i.toString(16).padStart(2, "0")}`.repeat(32)),
-          indices: LEAF.toString(16).padStart(64, "0"),
-          root: "cc".repeat(32),
-        });
+        writeJson(res, plaintextBody);
         return true;
       },
     );
   });
 
+  afterEach(() => {
+    plaintextBody = PLAINTEXT_BODY;
+  });
+
   afterAll(async () => {
     await server.close();
   });
+
+  function plaintextSdk(): RavenPOINodeInterface {
+    return new RavenPOINodeInterface({
+      endpoint: server.url,
+      bearerToken: TOKEN,
+      useClientPir: false,
+    });
+  }
 
   it("the client-PIR path returns an auth path with no root field", async () => {
     const sdk = new RavenPOINodeInterface({
@@ -121,16 +137,52 @@ describe("commit-tree proof shape per retrieval path", () => {
     expect(serialized).not.toContain("0".repeat(64));
   });
 
-  it("the plaintext path still carries the adapter's own root", async () => {
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: false,
+  it.each([
+    { label: "as the node spells it", body: PLAINTEXT_BODY },
+    {
+      label: "from a 0x-prefixed upper-case spelling",
+      body: {
+        ...PLAINTEXT_BODY,
+        elements: PLAINTEXT_BODY.elements.map((element) => `0x${element.toUpperCase()}`),
+        indices: `0x${LEAF.toString(16)}`,
+      },
+    },
+  ])("the plaintext path returns the same rootless auth path $label", async ({ body }) => {
+    plaintextBody = body;
+    const got = await plaintextSdk().getMerkleProof(TREE_NUMBER, LEAF);
+    expect(got).toStrictEqual({
+      kind: "authPath",
+      elements: PLAINTEXT_BODY.elements,
+      indices: LEAF_INDICES,
     });
-    const got = await sdk.getMerkleProof(TREE_NUMBER, LEAF);
-    expect(got.kind).toBe("rooted");
-    if (got.kind !== "rooted") throw new Error("unreachable");
-    expect(got.proof.root).toBe("cc".repeat(32));
-    expect(got.proof.leaf).toBe("aa".repeat(32));
+    expect(JSON.stringify(got)).not.toContain(PLAINTEXT_BODY.root);
+  });
+
+  it.each([
+    {
+      label: "answers another leaf",
+      body: { ...PLAINTEXT_BODY, indices: (LEAF + 1).toString(16).padStart(64, "0") },
+      reason: /do not name leaf 1234/,
+    },
+    {
+      label: "is fifteen levels deep",
+      body: { ...PLAINTEXT_BODY, elements: PLAINTEXT_BODY.elements.slice(1) },
+      reason: /not 16 32-byte hex/,
+    },
+    {
+      label: "carries a non-hex sibling",
+      body: { ...PLAINTEXT_BODY, elements: ["zz".repeat(32), ...PLAINTEXT_BODY.elements.slice(1)] },
+      reason: /not 16 32-byte hex/,
+    },
+  ])("refuses a plaintext path that $label", async ({ body, reason }) => {
+    plaintextBody = body;
+    const thrown = await plaintextSdk()
+      .getMerkleProof(TREE_NUMBER, LEAF)
+      .then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+    expect(RavenError.is(thrown, "DecodeError"), String(thrown)).toBe(true);
+    expect(String((thrown as Error).message)).toMatch(reason);
   });
 });

@@ -18,6 +18,7 @@ import {
   STUB_QUERY_BYTES,
   stubQueryBundle,
 } from "./helpers/private_wire";
+import { shardConfigBincode } from "./helpers/shard_config";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const INSTANCE = "t1Status:abababababababababababababababababababababababababababababababab";
@@ -87,7 +88,7 @@ function mountRehandshakeRig(
     wasm,
     session: { free: () => undefined },
     crsBincode: new Uint8Array(0),
-    shardConfigBincode: new Uint8Array(0),
+    shardConfigBincode: shardConfigBincode(),
     entrySize: 32,
   };
 
@@ -205,7 +206,7 @@ describe("client-PIR remote session handshake", () => {
       wasm,
       session: { free: () => undefined },
       crsBincode: new Uint8Array(0),
-      shardConfigBincode: new Uint8Array(0),
+      shardConfigBincode: shardConfigBincode(),
       entrySize: 32,
     };
 
