@@ -1,5 +1,5 @@
 {
-  "name": "@raven/railgun-poi-node-interface",
+  "name": "@hisoka-io/railgun-poi-node-interface",
   "version": "0.1.0-alpha.0",
   "description": "Drop-in RavenPOINodeInterface for the Railgun wallet stack: PIR-substituted T1 status + T2 PPOI auth-paths + T3 commit-tree auth-paths against a Raven adapter server.",
   "type": "module",
@@ -25,6 +25,10 @@
     "src"
   ],
   "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public",
+    "tag": "alpha"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.cjs.json && tsc -p tsconfig.build.esm.json && node ../scripts/finalize-sdk-build.mjs",
     "prepack": "npm run build",
@@ -32,11 +36,22 @@
     "test": "vitest run --config tests/vitest.config.ts"
   },
   "dependencies": {
-    "@railgun-community/poseidon-hash-wasm": "^1.0.2",
-    "raven-inspire-client-wasm": "file:../client-wasm/pkg-node"
+    "@railgun-community/poseidon-hash-wasm": "^1.0.2"
+  },
+  "peerDependencies": {
+    "@railgun-community/engine": "^9.6.0 || 9.7.0-rc.0"
+  },
+  "peerDependenciesMeta": {
+    "@railgun-community/engine": {
+      "optional": true
+    }
   },
   "devDependencies": {
+    "@railgun-community/engine": "9.7.0-rc.0",
     "@types/node": "^20.0.0",
+    "@types/semver": "^7.7.0",
+    "raven-inspire-client-wasm": "file:../client-wasm/pkg-node",
+    "semver": "^7.7.0",
     "typescript": "^5.4.0",
     "vitest": "^2.1.0"
   }

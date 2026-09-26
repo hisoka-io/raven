@@ -6,6 +6,8 @@
 #   mutation A: main/types back to ./src/index.ts with no exports map - the consumer
 #               resolves TypeScript at runtime, which is the state this repo shipped.
 #   mutation B: the files allowlist removed - the whole test tier ships to consumers.
+#   mutation C: a runtime dependency on a repo-relative `file:` path. The install succeeds and
+#               leaves a dangling link, which is the state this repo shipped.
 #
 # The real tree is never written to and no git command is run.
 set -uo pipefail
@@ -92,4 +94,8 @@ expect_red no-files-allowlist \
   'manifest.pop("files", None)' \
   "pack-contents"
 
-echo "check-sdk-pack-selftest: the pack gate refuses a TypeScript entry point and an unrestricted pack."
+expect_red dangling-file-dependency \
+  'manifest.setdefault("dependencies", collections.OrderedDict())["raven-inspire-client-wasm"] = "file:../client-wasm/pkg-node"' \
+  "dependency-tree"
+
+echo "check-sdk-pack-selftest: the pack gate refuses a TypeScript entry point, an unrestricted pack and a dangling dependency."

@@ -11,6 +11,9 @@
 #   3. The CommonJS and ESM halves of a dual build can each be broken on their own:
 #      a missing `type` marker beside the CommonJS emit, or an extensionless relative
 #      specifier in the ESM emit, fails only at a consumer's first import.
+#   4. A runtime dependency on a repo-relative `file:` path installs "successfully" and
+#      leaves the consumer a dangling link. Plain `npm ls` exits 0 on that tree; only
+#      `--all` reports it.
 #
 # Everything here is offline. The one registry dependency is packed out of the SDK's own
 # installed tree, so no network call is made and no registry credential is needed.
@@ -63,6 +66,7 @@ packed_filename() { node -e 'let s="";process.stdin.on("data",(d)=>{s+=d}).on("e
   process.stdout.write(entries[0].filename);
 });'; }
 
+sdk_name="$(node -p 'require(process.argv[1]).name' "${PKG}/package.json")" || exit 3
 tarball="${WORK}/tar/$( cd "$PKG" && npm pack --json --ignore-scripts --pack-destination "${WORK}/tar" 2>"${WORK}/pack.err" | packed_filename )"
 [[ -f "$tarball" ]] || { cat "${WORK}/pack.err" >&2; fail "npm pack named a tarball that is not there: ${tarball}"; }
 
@@ -112,6 +116,9 @@ install_consumer() { # dir module-type
   printf '{"name":"raven-%s-consumer","private":true,"version":"0.0.0","type":"%s"}\n' "$type" "$type" > "${dir}/package.json"
   ( cd "$dir" && npm install --offline --no-audit --no-fund "$tarball" "$poseidon_tgz" ) >"${dir}/install.log" 2>&1 \
     || { cat "${dir}/install.log" >&2; fail "${type}-consumer: offline install of the tarball failed"; }
+  ( cd "$dir" && npm ls --all ) >"${dir}/npm-ls.txt" 2>&1 \
+    || { cat "${dir}/npm-ls.txt" >&2; fail "dependency-tree (${type}): npm ls --all finds the installed tree invalid"; }
+  echo "  ok    dependency tree (${type}): npm ls --all is clean"
 }
 
 # --- CommonJS consumer ------------------------------------------------------
@@ -129,7 +136,7 @@ Module._resolveFilename = function (...args) {
 };
 let sdk;
 try {
-  sdk = require("@raven/railgun-poi-node-interface");
+  sdk = require(process.argv[2]);
 } finally {
   Module._resolveFilename = inner;
 }
@@ -144,14 +151,14 @@ const typescript = resolved
 if (typescript.length > 0) throw new Error(`resolved TypeScript at runtime: ${typescript.join(", ")}`);
 console.log(`  ok    commonjs consumer: required, constructed, ${resolved.length} resolutions, 0 TypeScript`);
 PROBEEOF
-( cd "${WORK}/cjs" && node probe.cjs ) || fail "commonjs-consumer: see the error above"
+( cd "${WORK}/cjs" && node probe.cjs "$sdk_name" ) || fail "commonjs-consumer: see the error above"
 
 # The consuming wallet compiles with module/moduleResolution NodeNext under
 # "type": "commonjs". Under NodeNext the `require` branch of the exports map is what
 # supplies the declarations, and a declaration reachable only through the `import` branch
 # typechecks nowhere in that wallet.
-cat > "${WORK}/cjs/consumer.ts" <<'CONSUMEREOF'
-import { RavenPOINodeInterface, type RavenConfig } from "@raven/railgun-poi-node-interface";
+cat > "${WORK}/cjs/consumer.ts" <<CONSUMEREOF
+import { RavenPOINodeInterface, type RavenConfig } from "${sdk_name}";
 const config: RavenConfig = { endpoint: "https://raven.example.com" };
 export const poi: RavenPOINodeInterface = new RavenPOINodeInterface(config);
 CONSUMEREOF
@@ -196,7 +203,7 @@ const sentinelArrived = new Promise((settle) => { arrived = settle; });
 port1.on("message", (url) => { resolved.push(url); if (url === SENTINEL) arrived(); });
 register("./resolve-hook.mjs", import.meta.url, { data: { port: port2 }, transferList: [port2] });
 
-const sdk = await import("@raven/railgun-poi-node-interface");
+const sdk = await import(process.argv[2]);
 // Port delivery is ordered: once the sentinel lands, every earlier resolution has landed.
 await import(SENTINEL);
 await sentinelArrived;
@@ -212,6 +219,6 @@ if (typescript.length > 0) throw new Error(`resolved TypeScript at runtime: ${ty
 if (resolved.length < 10) throw new Error(`only ${resolved.length} resolutions seen - the hook is blind`);
 console.log(`  ok    esm consumer: imported, constructed, ${resolved.length} resolutions, 0 TypeScript`);
 PROBEEOF
-( cd "${WORK}/esm" && node probe.mjs ) || fail "esm-consumer: see the error above"
+( cd "${WORK}/esm" && node probe.mjs "$sdk_name" ) || fail "esm-consumer: see the error above"
 
 echo "check-sdk-pack: the packed tarball installs into a fresh CommonJS and a fresh ESM project and resolves no TypeScript."
