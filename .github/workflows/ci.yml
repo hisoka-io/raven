@@ -507,16 +507,16 @@ jobs:
             cargo_flags: ""
             nextest_profile: ci
             run_ignored: only
-            filter: "binary(auto_spawn_shutdown) + binary(bootstrap_from_subsquid) + binary(multi_list_ppoi_dynamic) + binary(production_cell) + binary(serve_production_config_file) + binary(six_instance_integration) + binary(smart_policy_deferred) + binary(smart_policy_lifecycle)"
-          # The shipped multi-instance config, booted by the production binary in a child process.
-          # Not in cli-ignored: that lane already runs two eleven-instance boots, and a third
+            filter: "binary(auto_spawn_shutdown) + binary(bootstrap_from_subsquid) + binary(production_cell) + binary(serve_production_config_file) + binary(six_instance_integration) + binary(smart_policy_deferred) + binary(smart_policy_lifecycle)"
+          # The config the image ships, booted by the production binary in a child process.
+          # Not in cli-ignored: that lane already runs two ten-instance boots, and a third
           # co-scheduled with them took ~10 GB resident on a 16-core box.
           - name: shipped-config-spawn
             packages: "-p raven-railgun-cli"
             cargo_flags: ""
-            # production-cell, not ci: the boot is close to serial (105-123 s on a 16-core
-            # box, 111 s on four logical CPUs, 114 s on two), so per-core speed sets it, and
-            # this runner's is unmeasured against ci's 120 s x 3 cap
+            # production-cell, not ci: the boot is close to serial (the seven-block config's
+            # test took 100 s on a 16-core box beside another boot), so per-core speed sets it,
+            # and this runner's is unmeasured against ci's 120 s x 3 cap
             nextest_profile: production-cell
             run_ignored: only
             filter: "binary(shipped_config_spawn)"

@@ -28,7 +28,6 @@ role = "live"
 encoder = "per-list-path10"
 list_key = "{LIST_KEY_HEX}"
 data_dir = "{data_dir}/ppoi-paths-0"
-verification_mode = "upstream-asserted"
 data_source = {{ kind = "mirror", list_key = "{LIST_KEY_HEX}", block = 0 }}
 "#,
         data_dir = dir.display()

@@ -77,9 +77,10 @@ adapters/railgun/engine/tests/logical_store_resident_size.rs::one_retained_clone
 #  - the served-respond latency bench times served queries over a 65,536-row state for minutes,
 #    and its figures mean nothing on a shared runner; its byte-replay test needs two builds run
 #    in turn against one recorded fixture, which no single CI job does.
-#  - the three mirror cold-sync runs make hundreds of thousands to millions of fsynced WAL
-#    appends and outlast nextest's 300 s kill. What they time is not their only proof: the stop
-#    at the last declared block is proven per push by
+#  - the three mirror cold-sync runs apply 65,536 to 358,344 rows each through fsynced WAL
+#    appends, minutes to tens of minutes. What they time is not their only proof: the stop at
+#    the last declared block, and a row past 65,536 answered from its own block, are proven per
+#    push by
 #    mirror_preflight_boot::a_feed_stops_at_the_last_declared_row_names_the_next_block_and_feeds_it_once_declared.
 adapters/railgun/cli/tests/mirror_preflight_boot.rs::a_cold_sync_of_the_whole_shipped_list_at_the_live_round_trip
 adapters/railgun/cli/tests/mirror_preflight_boot.rs::a_cold_sync_stops_where_the_declared_blocks_end_and_names_the_next

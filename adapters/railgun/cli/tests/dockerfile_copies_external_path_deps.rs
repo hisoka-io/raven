@@ -184,3 +184,103 @@ fn workspace_inheriting_deps_pull_in_the_root_manifest() {
         );
     }
 }
+
+/// Paths the runtime stage declares `VOLUME`, read from its JSON-array form.
+fn volumes(dockerfile: &str) -> Vec<PathBuf> {
+    dockerfile
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("VOLUME "))
+        .flat_map(quoted_items)
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// The `(source, destination)` of the runtime stage's config template `COPY`.
+fn shipped_template(dockerfile: &str) -> (String, PathBuf) {
+    let joined = dockerfile.replace("\\\n", " ");
+    joined
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("COPY --from=build "))
+        .map(|rest| rest.split_whitespace().collect::<Vec<_>>())
+        .find(|tokens| {
+            tokens.len() == 2
+                && Path::new(tokens[0])
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+        })
+        .map(|tokens| {
+            let name = Path::new(tokens[0])
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("template file name")
+                .to_owned();
+            (name, PathBuf::from(tokens[1]))
+        })
+        .expect("the image ships a config template")
+}
+
+/// The template an operator copies with only its token replaced must boot as the image user
+/// and keep its state on a declared volume: a data_dir anywhere else is lost with the container
+/// or unwritable by uid 1500.
+#[test]
+fn the_shipped_template_keeps_every_data_dir_on_a_volume_the_image_user_owns() {
+    let dockerfile =
+        fs::read_to_string(adapter_root().join("Dockerfile")).expect("read adapter Dockerfile");
+    let (name, destination) = shipped_template(&dockerfile);
+    assert_eq!(
+        destination.file_name().and_then(|n| n.to_str()),
+        Some(name.as_str()),
+        "the image keeps the example's name"
+    );
+    let template = fs::read_to_string(adapter_root().join("examples").join(&name))
+        .expect("the shipped template is an example in the tree");
+    let parsed: toml::Value = toml::from_str(&template).expect("the template is TOML");
+    let data_dirs: Vec<PathBuf> = parsed
+        .get("instance")
+        .and_then(toml::Value::as_array)
+        .expect("the template declares instances")
+        .iter()
+        .map(|instance| {
+            PathBuf::from(
+                instance
+                    .get("data_dir")
+                    .and_then(toml::Value::as_str)
+                    .expect("every instance names its data_dir"),
+            )
+        })
+        .collect();
+    assert!(!data_dirs.is_empty());
+
+    let volumes = volumes(&dockerfile);
+    let data_volume = volumes
+        .iter()
+        .find(|volume| data_dirs.iter().all(|dir| dir.starts_with(volume)))
+        .unwrap_or_else(|| {
+            panic!("every data_dir {data_dirs:?} must lie under one VOLUME of {volumes:?}")
+        });
+
+    let volume_line = dockerfile
+        .find("\nVOLUME ")
+        .expect("the image declares its volumes");
+    let before_volume = dockerfile[..volume_line].replace("\\\n", " ");
+    let volume_text = data_volume.to_str().expect("utf-8 volume path");
+    assert!(
+        before_volume.lines().any(|line| {
+            line.trim_start().starts_with("RUN ")
+                && line.contains(volume_text)
+                && line.contains("raven:raven")
+        }),
+        "{volume_text} must be created owned by raven:raven before VOLUME, or a fresh volume \
+         is root-owned and the uid-1500 process cannot create its data_dirs"
+    );
+    assert!(
+        dockerfile.contains("--uid 1500"),
+        "the image user is uid 1500"
+    );
+    assert!(
+        dockerfile
+            .lines()
+            .any(|line| line.trim() == "USER raven:raven"),
+        "the node runs as the image user, not root"
+    );
+}

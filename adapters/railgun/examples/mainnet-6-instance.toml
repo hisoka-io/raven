@@ -2,8 +2,12 @@
 # `raven-railgun serve-production --config <this file>`.
 #
 # Mirrors the Railgun mainnet topology: 3 static (filled) commit-trees,
-# 1 live commit-tree, 1 PPOI status instance, and 6 PPOI path blocks. Adjust the [[instance]]
+# 1 live commit-tree, and 6 PPOI path blocks. Adjust the [[instance]]
 # blocks to match the current on-chain tree topology.
+#
+# The PPOI blocks stop at block 5, list rows 327,680 to 393,215. The list is expected to reach
+# row 393,216 in November 2026, and past the last declared block the mirror stops: declare
+# block 6 before then, as `mainnet-ppoi.toml` does.
 #
 # Cell shape: each [[instance]] takes an optional `entries` (row count) and
 # `record_size` (row width). Both default to the instance encoder's canonical
@@ -87,7 +91,6 @@ role = "static"
 encoder = "per-node"
 tree_number = 0
 data_dir = "/var/lib/raven-railgun/commit-tree-0"
-verification_mode = "chain-root-history"
 data_source = { kind = "indexer", filter = { tree_number = 0 } }
 
 [[instance]]
@@ -96,7 +99,6 @@ role = "static"
 encoder = "per-node"
 tree_number = 1
 data_dir = "/var/lib/raven-railgun/commit-tree-1"
-verification_mode = "chain-root-history"
 data_source = { kind = "indexer", filter = { tree_number = 1 } }
 
 [[instance]]
@@ -105,7 +107,6 @@ role = "static"
 encoder = "per-node"
 tree_number = 2
 data_dir = "/var/lib/raven-railgun/commit-tree-2"
-verification_mode = "chain-root-history"
 data_source = { kind = "indexer", filter = { tree_number = 2 } }
 
 [[instance]]
@@ -114,29 +115,18 @@ role = "live"
 encoder = "per-node"
 tree_number = 3
 data_dir = "/var/lib/raven-railgun/commit-tree-3"
-verification_mode = "chain-root-history"
 data_source = { kind = "indexer", filter = { tree_number = 3 } }
 
-# PPOI list instances. `verification_mode = "upstream-asserted"` selects the upstream feed as
-# the authority: each event's signature is stored and never verified, so nothing authenticates
-# the publisher. List authenticity rests on TLS to `mirror_endpoint` - keep it https.
-[[instance]]
-id = "ppoi-status-ofac"
-role = "live"
-encoder = "per-list-status"
-list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
-data_dir = "/var/lib/raven-railgun/ppoi-status-ofac"
-verification_mode = "upstream-asserted"
-data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", what = "status" }
-
+# PPOI list blocks, fed by the upstream mirror, which is their authority: each event's
+# signature is stored and never verified, so nothing authenticates the publisher. List
+# authenticity rests on TLS to `mirror_endpoint` - keep it https.
 [[instance]]
 id = "ppoi-paths-ofac-0"
 role = "static"
 encoder = "per-list-path10"
 list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
 data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-0"
-verification_mode = "upstream-asserted"
-data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 0, what = "path" }
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 0 }
 
 [[instance]]
 id = "ppoi-paths-ofac-1"
@@ -144,8 +134,7 @@ role = "static"
 encoder = "per-list-path10"
 list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
 data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-1"
-verification_mode = "upstream-asserted"
-data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 1, what = "path" }
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 1 }
 
 [[instance]]
 id = "ppoi-paths-ofac-2"
@@ -153,8 +142,7 @@ role = "static"
 encoder = "per-list-path10"
 list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
 data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-2"
-verification_mode = "upstream-asserted"
-data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 2, what = "path" }
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 2 }
 
 [[instance]]
 id = "ppoi-paths-ofac-3"
@@ -162,8 +150,7 @@ role = "static"
 encoder = "per-list-path10"
 list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
 data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-3"
-verification_mode = "upstream-asserted"
-data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 3, what = "path" }
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 3 }
 
 [[instance]]
 id = "ppoi-paths-ofac-4"
@@ -171,8 +158,7 @@ role = "static"
 encoder = "per-list-path10"
 list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
 data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-4"
-verification_mode = "upstream-asserted"
-data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 4, what = "path" }
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 4 }
 
 [[instance]]
 id = "ppoi-paths-ofac-5"
@@ -180,5 +166,4 @@ role = "live"
 encoder = "per-list-path10"
 list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
 data_dir = "/var/lib/raven-railgun/ppoi-paths-ofac-5"
-verification_mode = "upstream-asserted"
-data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 5, what = "path" }
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 5 }

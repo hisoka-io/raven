@@ -4,7 +4,7 @@
 
 use std::io::Write;
 
-use raven_railgun_cli::auto_spawn_driver::{AutoSpawnRuntime, PpoiListTemplateRuntime};
+use raven_railgun_cli::auto_spawn_driver::AutoSpawnRuntime;
 use raven_railgun_cli::serve_production_multi::load_options_from_toml;
 use raven_railgun_engine::pir_table::EncoderKind;
 
@@ -32,7 +32,6 @@ fn every_encoder_kind() -> Vec<EncoderKind> {
         EncoderKind::PerNode {
             tree_number: TREE_NUMBER,
         },
-        EncoderKind::PerListStatus { list_key },
         EncoderKind::PerListPath { list_key },
         EncoderKind::PerListPath10 { list_key },
         EncoderKind::PerListNode { list_key },
@@ -43,10 +42,12 @@ fn every_encoder_kind() -> Vec<EncoderKind> {
             EncoderKind::PerLeafBc { .. }
             | EncoderKind::PerLeafPath { .. }
             | EncoderKind::PerNode { .. }
-            | EncoderKind::PerListStatus { .. }
             | EncoderKind::PerListPath { .. }
             | EncoderKind::PerListPath10 { .. }
             | EncoderKind::PerListNode { .. } => {}
+            EncoderKind::PerListStatus { .. } => {
+                panic!("no entry point names the status encoder; the config refuses it")
+            }
         }
     }
     kinds
@@ -64,36 +65,6 @@ fn chain_kinds() -> Vec<EncoderKind> {
         .into_iter()
         .filter(|kind| kind.chain_tree_number().is_some())
         .collect()
-}
-
-fn ppoi_list_template(encoder: &str) -> PpoiListTemplateRuntime {
-    PpoiListTemplateRuntime {
-        template_id: "ppoi-template".to_owned(),
-        list_key: list_key(),
-        encoder: encoder.to_owned(),
-        scheme_tag: "test".to_owned(),
-        data_dir_template: "/tmp/raven-unused-{list_key}".to_owned(),
-        entries: 65_536,
-        entry_bytes: 512,
-        channel_capacity: 16,
-        session_limits: raven_railgun_engine::session_pool::SessionStoreLimits::default(),
-    }
-}
-
-#[test]
-fn ppoi_list_template_resolves_every_ppoi_encoder_and_no_chain_encoder() {
-    for kind in ppoi_kinds() {
-        let resolved = ppoi_list_template(kind.label())
-            .resolve_encoder()
-            .unwrap_or_else(|e| panic!("{} must resolve: {e}", kind.label()));
-        assert_eq!(resolved, kind);
-    }
-    for kind in chain_kinds() {
-        let err = ppoi_list_template(kind.label())
-            .resolve_encoder()
-            .expect_err("a chain-tree label is not a PPOI template encoder");
-        assert!(err.to_string().contains("per-list-path10"), "{err}");
-    }
 }
 
 #[test]
@@ -159,7 +130,6 @@ role = "live"
 encoder = "{label}"
 tree_number = {tree}
 data_dir = "/tmp/raven-unused"
-verification_mode = "chain-root-history"
 data_source = {{ kind = "indexer", filter = {{ tree_number = {tree} }} }}
 "#
         ),
@@ -171,8 +141,7 @@ role = "live"
 encoder = "{label}"
 list_key = "{LIST_KEY_HEX}"
 data_dir = "/tmp/raven-unused"
-verification_mode = "upstream-asserted"
-data_source = {{ kind = "mirror", list_key = "{LIST_KEY_HEX}" }}
+data_source = {{ kind = "mirror", list_key = "{LIST_KEY_HEX}", block = 0 }}
 "#
         ),
     }
@@ -185,33 +154,5 @@ fn config_file_instance_names_every_encoder() {
         let opts = load_options_from_toml(file.path())
             .unwrap_or_else(|e| panic!("{} must load: {e:#}", kind.label()));
         assert_eq!(opts.instances[0].encoder, kind);
-    }
-}
-
-/// The loader vets a template's label at boot and the driver resolves it at spawn time,
-/// possibly weeks later. A label the first accepts and the second refuses boots clean and
-/// then never spawns.
-#[test]
-fn every_template_label_the_loader_accepts_resolves_at_spawn_time() {
-    for kind in ppoi_kinds() {
-        let label = kind.label();
-        let tables = format!(
-            r#"
-[[ppoi_list_template]]
-template_id = "ppoi-template"
-list_key = "{LIST_KEY_HEX}"
-encoder = "{label}"
-data_dir_template = "/tmp/raven-unused-{{list_key}}"
-{}"#,
-            instance_table(EncoderKind::PerLeafBc { tree_number: 0 })
-        );
-        let file = config_with(&tables);
-        let opts = load_options_from_toml(file.path())
-            .unwrap_or_else(|e| panic!("template {label} must load: {e:#}"));
-        let accepted = &opts.ppoi_list_templates[0];
-        let resolved = ppoi_list_template(&accepted.encoder)
-            .resolve_encoder()
-            .unwrap_or_else(|e| panic!("loader accepted {label} but the driver refuses it: {e}"));
-        assert_eq!(resolved, kind);
     }
 }

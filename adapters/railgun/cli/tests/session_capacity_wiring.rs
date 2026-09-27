@@ -29,14 +29,11 @@ use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
 use raven_railgun_engine::session_pool::SessionStoreLimits;
 use raven_railgun_http::{read_versioned, write_versioned, HttpConfig, InstanceParams};
 use raven_railgun_indexer::IndexerMessage;
-use raven_railgun_persistence::{PpoiEventType, WalEntryPayload};
 use serde_json::Value;
 
 const TOKEN: &str = "session-capacity-wiring-token-padded";
 const BOOT_INSTANCE: &str = "commit-tree-0";
 const SPAWNED_TREE_INSTANCE: &str = "commit-tree-1";
-const LIST_TEMPLATE: &str = "ppoi";
-const LIST_KEY_HEX: &str = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88";
 /// The smallest cell a leaf-keyed encoder accepts, at the narrowest legal row.
 const CELL_ROWS: usize = 65_536;
 const ROW_BYTES: usize = 32;
@@ -52,15 +49,6 @@ const LIMIT_FLAGS: [(&str, &str); 4] = [
     ("--max-sse-connections", "64"),
     ("--max-sse-connections-per-peer", "16"),
 ];
-
-fn list_key() -> [u8; 32] {
-    let mut key = [0u8; 32];
-    for (byte, pair) in key.iter_mut().zip(LIST_KEY_HEX.as_bytes().chunks(2)) {
-        let pair = std::str::from_utf8(pair).expect("ascii hex");
-        *byte = u8::from_str_radix(pair, 16).expect("hex byte");
-    }
-    key
-}
 
 fn configured_limits() -> String {
     format!(
@@ -99,7 +87,6 @@ tree_number = 0
 record_size = {ROW_BYTES}
 entries = {CELL_ROWS}
 data_dir = "{dir}/{BOOT_INSTANCE}"
-verification_mode = "chain-root-history"
 data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
 {tail}
 "#
@@ -109,7 +96,7 @@ data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
     file
 }
 
-fn spawn_templates(dir: &Path) -> String {
+fn spawn_template(dir: &Path) -> String {
     let dir = dir.display();
     format!(
         r#"
@@ -117,14 +104,6 @@ fn spawn_templates(dir: &Path) -> String {
 enabled = true
 data_dir_template = "{dir}/commit-tree-{{tree_number}}"
 encoder = "per-leaf-bc"
-entries = {CELL_ROWS}
-entry_bytes = {ROW_BYTES}
-
-[[ppoi_list_template]]
-template_id = "{LIST_TEMPLATE}"
-list_key = "{LIST_KEY_HEX}"
-encoder = "per-list-status"
-data_dir_template = "{dir}/list-{{list_key}}"
 entries = {CELL_ROWS}
 entry_bytes = {ROW_BYTES}
 "#
@@ -234,7 +213,13 @@ async fn a_lifetime_above_the_ceiling_is_refused_before_any_store_opens() {
 }
 
 /// Packing keys a wallet would upload to `instance`, derived from the parameters it serves.
-async fn packing_keys(client: &reqwest::Client, base: &str, instance: &str) -> Vec<u8> {
+/// `pack` caches the packing table, the costly part, across instances that share its shape.
+async fn packing_keys(
+    client: &reqwest::Client,
+    base: &str,
+    instance: &str,
+    pack: &mut Option<(usize, PackParams)>,
+) -> Vec<u8> {
     let body = client
         .get(format!("{base}/v1/instance/{instance}/params"))
         .send()
@@ -249,8 +234,13 @@ async fn packing_keys(client: &reqwest::Client, base: &str, instance: &str) -> V
     let crs = ServerCrs::from_versioned_bytes(&params.crs_bincode).expect("decode crs");
     let mut sampler = GaussianSampler::with_seed(crs.params.sigma, 41);
     let secret = RlweSecretKey::generate(&crs.params, &mut sampler);
-    let pack = PackParams::try_new(&crs.params, crs.inspiring_num_columns).expect("pack params");
-    let keys = ClientPackingKeys::generate(&secret, &pack, crs.inspiring_w_seed, &mut sampler);
+    let columns = crs.inspiring_num_columns;
+    if pack.as_ref().is_none_or(|(cached, _)| *cached != columns) {
+        let built = PackParams::try_new(&crs.params, columns).expect("pack params");
+        *pack = Some((columns, built));
+    }
+    let (_, table) = pack.as_ref().expect("cached above");
+    let keys = ClientPackingKeys::generate(&secret, table, crs.inspiring_w_seed, &mut sampler);
     write_versioned(&keys).expect("serialize keys")
 }
 
@@ -288,20 +278,29 @@ fn unix_now() -> u64 {
 }
 
 /// `SEATS` distinct identities are seated for `TTL_SECS`, and the next one is refused.
-async fn assert_configured_seats(client: &reqwest::Client, base: &str, instance: &str) {
-    let keys = packing_keys(client, base, instance).await;
+async fn assert_configured_seats(
+    client: &reqwest::Client,
+    base: &str,
+    instance: &str,
+    pack: &mut Option<(usize, PackParams)>,
+) {
+    let keys = packing_keys(client, base, instance, pack).await;
     for identity in 0..SEATS {
         let before = unix_now();
         let (status, expires) = establish(client, base, instance, identity, &keys).await;
+        let after = unix_now();
         assert_eq!(
             status,
             reqwest::StatusCode::OK,
             "{instance}: seat {identity} of {SEATS} must be admitted"
         );
-        let lifetime = expires.expect("expiry").saturating_sub(before);
+        // The server stamps its clock somewhere inside the request, so a slow establish
+        // widens the window instead of failing it.
+        let expires = expires.expect("expiry");
         assert!(
-            (TTL_SECS..=TTL_SECS + 5).contains(&lifetime),
-            "{instance}: a seat must live the configured {TTL_SECS} s, not {lifetime} s"
+            (before + TTL_SECS..=after + TTL_SECS).contains(&expires),
+            "{instance}: a seat must live the configured {TTL_SECS} s: expires at {expires}, \
+             requested between {before} and {after}"
         );
     }
     let (status, _) = establish(client, base, instance, SEATS, &keys).await;
@@ -438,28 +437,6 @@ async fn shut_down(server: MultiServer) {
     let _ = tokio::time::timeout(Duration::from_secs(30), server.server).await;
 }
 
-/// Bootstrap instance: seats, lifetime, and both stream bounds, all from `[global]`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn global_keys_bound_the_bootstrap_store_and_the_event_stream() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let config = multi_config(dir.path(), &configured_limits(), "");
-    let server = boot_multi(config.path()).await;
-    let client = reqwest::Client::new();
-
-    assert_configured_seats(&client, &server.base, BOOT_INSTANCE).await;
-    assert_configured_streams(
-        [
-            (&client, Some("10.0.0.1")),
-            (&client, Some("10.0.0.2")),
-            (&client, Some("10.0.0.3")),
-        ],
-        &server.base,
-    )
-    .await;
-
-    shut_down(server).await;
-}
-
 fn shield(tree: u32, height: u64) -> IndexerMessage {
     IndexerMessage::Event {
         event: RailgunEvent::Shield {
@@ -478,30 +455,31 @@ fn shield(tree: u32, height: u64) -> IndexerMessage {
     }
 }
 
-fn list_row() -> WalEntryPayload {
-    WalEntryPayload::PpoiListLeafAdded {
-        list_key: list_key(),
-        list_index: 0,
-        blinded_commitment: raven_railgun_testkit::canonical(0x71),
-        status: 0,
-        event_type: PpoiEventType::Shield,
-        signature: vec![0; 64],
-        validated_merkleroot: [0; 32],
-    }
-}
-
-/// Stores opened after boot, by the chain-tree and the PPOI-list auto-spawn drivers, take the
-/// same `[global]` seats and lifetime as the bootstrap store.
+/// Every store the server opens, the bootstrap one and the one the chain-tree auto-spawn
+/// driver opens after boot, takes the `[global]` seats and lifetime; the event stream takes
+/// both `[global]` stream bounds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn global_keys_bound_every_store_auto_spawn_opens() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = multi_config(
         dir.path(),
         &configured_limits(),
-        &spawn_templates(dir.path()),
+        &spawn_template(dir.path()),
     );
     let server = boot_multi(config.path()).await;
     let client = reqwest::Client::new();
+    let mut pack = None;
+
+    assert_configured_seats(&client, &server.base, BOOT_INSTANCE, &mut pack).await;
+    assert_configured_streams(
+        [
+            (&client, Some("10.0.0.1")),
+            (&client, Some("10.0.0.2")),
+            (&client, Some("10.0.0.3")),
+        ],
+        &server.base,
+    )
+    .await;
 
     server
         .view
@@ -510,21 +488,9 @@ async fn global_keys_bound_every_store_auto_spawn_opens() {
         .send(shield(1, 1))
         .await
         .expect("indexer channel open");
-    server
-        .view
-        .channels
-        .mirror_tx
-        .send((list_row(), 1))
-        .await
-        .expect("mirror channel open");
-
-    let list_instance =
-        raven_railgun_cli::auto_spawn::instance_id_for_list(LIST_TEMPLATE, &list_key());
-    for instance in [SPAWNED_TREE_INSTANCE, list_instance.as_str()] {
-        let params = format!("{}/v1/instance/{instance}/params", server.base);
-        wait_for_ok(&client, &params, instance).await;
-        assert_configured_seats(&client, &server.base, instance).await;
-    }
+    let params = format!("{}/v1/instance/{SPAWNED_TREE_INSTANCE}/params", server.base);
+    wait_for_ok(&client, &params, SPAWNED_TREE_INSTANCE).await;
+    assert_configured_seats(&client, &server.base, SPAWNED_TREE_INSTANCE, &mut pack).await;
 
     shut_down(server).await;
 }

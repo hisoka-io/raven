@@ -1,27 +1,81 @@
 //! The same batch at K=1, K=4, K=16 must produce byte-identical response vectors,
-//! catching index-shuffling in the JoinSet drain loop.
+//! catching index-shuffling in the JoinSet drain loop. The order is parameter-independent, so a
+//! ring-256 cell stands in for the production one.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
-
-#[path = "support/toy_server.rs"]
-mod toy_server;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use raven_inspire::{ServerResponse, ServerSessionHandle};
+use raven_inspire::params::{InspireParams, InspireVariant, SecurityLevel};
+use raven_inspire::{ClientSession, ServerResponse, ServerSessionHandle};
 use raven_railgun_core::InstanceId;
-use raven_railgun_engine::inspire::{build_seeded_query, RavenInspireScheme};
-use raven_railgun_engine::{Engine, PirInstance};
+use raven_railgun_engine::inspire::{
+    build_client_session, build_seeded_query, register_client_session, setup_state,
+    RavenInspireScheme,
+};
+use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
 use raven_railgun_http::{inspire_router, AppState, HttpConfig};
 use tokio::sync::oneshot;
-use toy_server::{build_toy_pieces, ToyDbConfig, TOY_INSTANCE_ID};
 
 const BEARER_TOKEN: &str = "batch-byte-identity-test-token";
 const BATCH_SIZE: usize = 16;
 const K_VALUES: &[usize] = &[1, 4, 16];
 const CLIENT_ID: &str = "00112233445566778899aabbccddeeff";
+const TOY_INSTANCE_ID: &str = "toy";
+const ENTRIES: usize = 256;
+const ENTRY_BYTES: usize = 32;
+
+fn ring_256() -> InspireParams {
+    InspireParams {
+        ring_dim: 256,
+        q: 1_152_921_504_606_830_593,
+        crt_moduli: vec![1_152_921_504_606_830_593],
+        p: 65_537,
+        sigma: 6.4,
+        gadget_base: 1 << 20,
+        query_gadget_len: 3,
+        packing_gadget_len: 3,
+        security_level: SecurityLevel::Bits128,
+    }
+}
+
+struct Fixture {
+    instance: Arc<PirInstance<RavenInspireScheme>>,
+    client_session: ClientSession,
+    registration_body: Vec<u8>,
+    params: InspireParams,
+}
+
+fn fixture() -> Fixture {
+    let params = ring_256();
+    let db = raven_railgun_testkit::toy_db(ENTRIES, ENTRY_BYTES);
+    let (state, secret) =
+        setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("setup_state");
+    let mut client_session =
+        build_client_session((*state.crs).clone(), secret, &params).expect("client session");
+    let (_, registration) = build_seeded_query(&client_session, state.shard_config(), 0, &params)
+        .expect("registration query");
+    let registration_body = raven_railgun_http::write_versioned(
+        &registration
+            .inspiring_packing_keys
+            .expect("a fresh session carries packing keys"),
+    )
+    .expect("registration wire");
+    register_client_session(&mut client_session, &state).expect("register session");
+    let instance = Arc::new(PirInstance::new(
+        InstanceId::new(TOY_INSTANCE_ID),
+        InstanceRole::Static,
+        state,
+    ));
+    Fixture {
+        instance,
+        client_session,
+        registration_body,
+        params,
+    }
+}
 
 fn build_app_state_with_k(
     instance: Arc<PirInstance<RavenInspireScheme>>,
@@ -83,32 +137,24 @@ async fn establish_http_session(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)]
 async fn batch_dispatcher_byte_identity_across_k_values() {
-    let pieces = build_toy_pieces(BEARER_TOKEN.to_owned(), ToyDbConfig::default())
-        .expect("toy stack builds");
-
-    let shared_instance: Arc<PirInstance<RavenInspireScheme>> = pieces
-        .app_state
-        .engine
-        .instance(&InstanceId::new(TOY_INSTANCE_ID))
-        .expect("toy instance registered")
-        .clone();
+    let fixture = fixture();
+    let shared_instance = Arc::clone(&fixture.instance);
     let server_state_arc = shared_instance.current_state();
 
     let mut batch_queries = Vec::with_capacity(BATCH_SIZE);
     for k in 0..BATCH_SIZE as u64 {
-        let idx = (37u64.wrapping_add(k * 11)) % (pieces.config.entries as u64);
+        let idx = (37u64.wrapping_add(k * 11)) % (ENTRIES as u64);
         let (_cs, q) = build_seeded_query(
-            &pieces.client_session,
+            &fixture.client_session,
             server_state_arc.shard_config(),
             idx,
-            &pieces.params,
+            &fixture.params,
         )
         .expect("build_seeded_query");
         batch_queries.push(q);
     }
-    // generous deadline: K=16 debug batch wall-clocks past 30s on 2-vCPU CI
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(30))
         .build()
         .expect("reqwest client");
 
@@ -117,7 +163,7 @@ async fn batch_dispatcher_byte_identity_across_k_values() {
     for &k in K_VALUES {
         let app_state = build_app_state_with_k(Arc::clone(&shared_instance), k);
         let (addr, server_handle) = spawn_server(app_state).await;
-        let handle = establish_http_session(&client, addr, &pieces.session_registration_body).await;
+        let handle = establish_http_session(&client, addr, &fixture.registration_body).await;
         let bound_queries = batch_queries
             .iter()
             .cloned()
@@ -154,6 +200,15 @@ async fn batch_dispatcher_byte_identity_across_k_values() {
             BATCH_SIZE,
             "K={k}: batch returned wrong count {}",
             decoded.len()
+        );
+        let distinct: std::collections::BTreeSet<Vec<u8>> = decoded
+            .iter()
+            .map(|response| raven_railgun_http::write_versioned(response).expect("encode"))
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            BATCH_SIZE,
+            "K={k}: two queries drew one response, so a shuffle between them would go unseen"
         );
 
         bodies_per_k.push((k, body));

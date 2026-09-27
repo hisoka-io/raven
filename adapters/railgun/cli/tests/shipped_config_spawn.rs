@@ -1,11 +1,11 @@
-//! The shipped multi-instance config, run the way an operator runs it: the production binary,
+//! The config the image ships, run the way an operator runs it: the production binary,
 //! `serve-production --config`, in a child process.
 //!
 //! The shim routes were certified for months by a hand-wired state while the deployment served
 //! 503. Here nothing is wired by the test: the example file is rewritten only where it names a
 //! host, a directory or a secret, and every answer comes over HTTP from the binary's own boot.
 //!
-//! Both upstreams are in-process listeners on loopback, so nothing leaves the machine.
+//! The upstream is an in-process listener on loopback, so nothing leaves the machine.
 
 #![allow(
     clippy::expect_used,
@@ -36,10 +36,9 @@ const BEARER_TOKEN: &str = "shipped-config-spawn-token-padded-long";
 // against a live host.
 const SHIPPED_BIND: &str = "bind = \"0.0.0.0:8080\"";
 const SHIPPED_TOKEN: &str = "token = \"REPLACE_ME\"";
-const SHIPPED_RPC_URL: &str = "rpc_url = \"https://mainnet.example/eth\"";
 const SHIPPED_MIRROR: &str = "mirror_endpoint = \"https://ppoi.fdi.network\"";
-/// Every data directory and template sits under this root, so it is replaced wherever it occurs.
-const SHIPPED_DATA_ROOT: &str = "/var/lib/raven-railgun/";
+/// Every data directory sits under this root, so it is replaced wherever it occurs.
+const SHIPPED_DATA_ROOT: &str = "/srv/raven/data/";
 
 /// The config binds port 0, so the port is read back from this line of the binary's log.
 const LISTENING: &str = "raven-railgun multi-instance production serve listening";
@@ -53,14 +52,16 @@ const _: () = assert!(LIST_ROWS < LEAVES_PER_PPOI_BLOCK);
 /// refused" from "no store was ever wired": both answer 503.
 const COVERAGE_REFUSALS_TOTAL: &str = "raven_railgun_shim_coverage_refusals_total";
 const COMMIT_TREE_ROUTE: &str = "commit-tree-merkle-proof";
-const LIST_ROUTES: [&str; 3] = ["pois-per-list", "merkle-proofs", "status-header"];
+const LIST_ROUTES: [&str; 2] = ["merkle-proofs", "bc-to-idx-map"];
+/// The block the list reaches at row 393,216, which the shipped config must declare ahead of it.
+const NEXT_BLOCK_INSTANCE: &str = "ppoi-paths-ofac-6";
 
-/// The eleven-instance boot served in 105-123 s on a 16-core box, 111 s pinned to four logical
-/// CPUs and 114 s on two: it is close to serial, so a runner's per-core speed sets it. The CI lane
-/// runs under nextest's `production-cell` profile, which kills at 1200 s. The budgets here sum
-/// below that, so a stuck boot fails with the log tail rather than as a bare kill.
+/// The boot builds one production cell per instance, close to serially, so a runner's per-core
+/// speed sets it. The CI lane runs under nextest's `production-cell` profile, which kills at
+/// 1200 s. The budgets here sum below that, so a stuck boot fails with the log tail rather than
+/// as a bare kill.
 const BOOT_BUDGET: Duration = Duration::from_mins(15);
-/// After the boot serves: the first mirror page and the first indexer tick are both immediate.
+/// After the boot serves: the first mirror page is immediate.
 const SETTLE_BUDGET: Duration = Duration::from_secs(60);
 
 /// The child. Dropping it reaps the process, so a failed assertion cannot leak a server.
@@ -96,10 +97,8 @@ struct Booted {
     _root: tempfile::TempDir,
     addr: SocketAddr,
     declared_instances: BTreeSet<String>,
-    trees: Vec<u32>,
     list_key: String,
     roots: Arc<Vec<[u8; 32]>>,
-    chain_calls: Calls,
 }
 
 fn leaf_at(index: u32) -> [u8; 32] {
@@ -122,75 +121,12 @@ fn serve(listener: tokio::net::TcpListener, app: Router) {
     });
 }
 
-type Calls = Arc<parking_lot::Mutex<Vec<String>>>;
-
-fn block_at(number: u64) -> Value {
-    let hash = |n: u64| {
-        let mut bytes = [0u8; 32];
-        bytes[24..].copy_from_slice(&n.to_be_bytes());
-        format!("0x{}", hex::encode(bytes))
-    };
-    json!({
-        "hash": hash(number),
-        "parentHash": hash(number.saturating_sub(1)),
-        "sha3Uncles": hash(0),
-        "miner": "0x0000000000000000000000000000000000000000",
-        "stateRoot": hash(0),
-        "transactionsRoot": hash(0),
-        "receiptsRoot": hash(0),
-        "logsBloom": format!("0x{}", "0".repeat(512)),
-        "difficulty": "0x0",
-        "number": format!("0x{number:x}"),
-        "gasLimit": "0x1c9c380",
-        "gasUsed": "0x0",
-        "timestamp": "0x65000000",
-        "extraData": "0x",
-        "mixHash": hash(0),
-        "nonce": "0x0000000000000000",
-        "baseFeePerGas": "0x7",
-        "size": "0x220",
-        "transactions": [],
-        "uncles": []
-    })
-}
-
 fn rpc_error(id: Value, message: &str) -> Json<Value> {
     Json(json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": { "code": -32601, "message": message }
     }))
-}
-
-/// A chain as far as a boot asks of it: the configured chain id, a finalized `head`, and no
-/// Railgun logs. Any other method is refused, so a boot that starts needing one fails loudly
-/// instead of reading a guess.
-fn chain_rpc(chain_id: u64, head: u64, calls: Calls) -> Router {
-    Router::new().route(
-        "/",
-        post(move |Json(request): Json<Value>| {
-            let calls = Arc::clone(&calls);
-            async move {
-                let method = request["method"].as_str().unwrap_or_default().to_owned();
-                let id = request.get("id").cloned().unwrap_or(Value::Null);
-                calls.lock().push(method.clone());
-                let result = match method.as_str() {
-                    "eth_chainId" => json!(format!("0x{chain_id:x}")),
-                    "eth_blockNumber" => json!(format!("0x{head:x}")),
-                    "eth_getBlockByNumber" => block_at(
-                        request["params"][0]
-                            .as_str()
-                            .and_then(|asked| asked.strip_prefix("0x"))
-                            .and_then(|digits| u64::from_str_radix(digits, 16).ok())
-                            .unwrap_or(head),
-                    ),
-                    "eth_getLogs" => json!([]),
-                    _ => return rpc_error(id, &format!("stub has no {method}")),
-                };
-                Json(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
-            }
-        }),
-    )
 }
 
 /// Upstream holding rows `0..LIST_ROWS` of `list_key`, each with the root upstream publishes
@@ -254,14 +190,13 @@ fn replace_once(body: &str, anchor: &str, with: &str) -> String {
     body.replace(anchor, with)
 }
 
-/// The shipped example, rewritten only at its bind, token, chain RPC, upstream and data root,
-/// and created owner-only because it carries the token inline.
-fn write_shipped_config(root: &Path, rpc_url: &str, mirror_endpoint: &str) -> PathBuf {
-    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/mainnet-6-instance.toml");
+/// The shipped example, rewritten only at its bind, token, upstream and data root, and created
+/// owner-only because it carries the token inline.
+fn write_shipped_config(root: &Path, mirror_endpoint: &str) -> PathBuf {
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/mainnet-ppoi.toml");
     let body = std::fs::read_to_string(example).expect("read the shipped example");
     let body = replace_once(&body, SHIPPED_BIND, "bind = \"127.0.0.1:0\"");
     let body = replace_once(&body, SHIPPED_TOKEN, &format!("token = \"{BEARER_TOKEN}\""));
-    let body = replace_once(&body, SHIPPED_RPC_URL, &format!("rpc_url = \"{rpc_url}\""));
     let body = replace_once(
         &body,
         SHIPPED_MIRROR,
@@ -301,24 +236,18 @@ fn owner_only(path: &Path) -> std::fs::File {
     file
 }
 
-/// The commit trees and the single PPOI list the config declares, read from the file the
-/// binary loads, so the probes follow the example rather than a copy of it.
-fn declared_domains(opts: &MultiServeOptions) -> (Vec<u32>, [u8; 32]) {
-    let mut trees: Vec<u32> = opts
-        .instances
-        .iter()
-        .filter_map(|inst| match inst.data_source {
-            DataSourceFilter::ChainTreeNumber(tree) => Some(tree),
-            _ => None,
-        })
-        .collect();
-    trees.sort_unstable();
+/// The single PPOI list the config declares, read from the file the binary loads, so the probes
+/// follow the example rather than a copy of it. It declares nothing else.
+fn declared_list(opts: &MultiServeOptions) -> [u8; 32] {
     let mut keys: BTreeSet<[u8; 32]> = BTreeSet::new();
     let mut blocks = 0usize;
     for inst in &opts.instances {
-        if let DataSourceFilter::PpoiListBlock { list_key, .. } = inst.data_source {
-            keys.insert(list_key);
-            blocks += 1;
+        match inst.data_source {
+            DataSourceFilter::PpoiListBlock { list_key, .. } => {
+                keys.insert(list_key);
+                blocks += 1;
+            }
+            other => panic!("the shipped config declares a non-block instance: {other:?}"),
         }
     }
     assert_eq!(
@@ -327,10 +256,10 @@ fn declared_domains(opts: &MultiServeOptions) -> (Vec<u32>, [u8; 32]) {
         "the example declares path blocks for one list"
     );
     assert!(
-        trees.len() >= 2 && blocks >= 2,
-        "fewer than two trees and two blocks cannot tell a declared store from any store"
+        blocks >= 2,
+        "fewer than two blocks cannot tell a declared store from any store"
     );
-    (trees, keys.into_iter().next().expect("one list"))
+    keys.into_iter().next().expect("one list")
 }
 
 fn spawn_binary(config: &Path, root: &Path) -> Node {
@@ -387,24 +316,12 @@ async fn wait_until_listening(node: &mut Node) -> SocketAddr {
 
 async fn boot_the_shipped_config() -> Booted {
     let root = tempfile::tempdir().expect("tempdir");
-    let (chain_listener, rpc_url) = loopback().await;
     let (upstream_listener, mirror_endpoint) = loopback().await;
-    let config = write_shipped_config(root.path(), &rpc_url, &mirror_endpoint);
+    let config = write_shipped_config(root.path(), &mirror_endpoint);
 
     let opts = load_options_from_toml(&config).expect("parse the rewritten shipped config");
-    let (trees, list_key) = declared_domains(&opts);
-    let list_key = hex::encode(list_key);
+    let list_key = hex::encode(declared_list(&opts));
     let roots = Arc::new(upstream_roots());
-    let chain_calls = Calls::default();
-    serve(
-        chain_listener,
-        // One block past the start, so the indexer has a range to scan.
-        chain_rpc(
-            opts.chain_id,
-            opts.start_block + 1,
-            Arc::clone(&chain_calls),
-        ),
-    );
     serve(
         upstream_listener,
         ppoi_upstream(list_key.clone(), Arc::clone(&roots)),
@@ -421,10 +338,8 @@ async fn boot_the_shipped_config() -> Booted {
             .iter()
             .map(|inst| inst.instance_id.as_str().to_owned())
             .collect(),
-        trees,
         list_key,
         roots,
-        chain_calls,
     }
 }
 
@@ -472,26 +387,6 @@ async fn wait_until_caught_up(booted: &Booted) -> MirrorFeedView {
     }
 }
 
-/// The indexer's first tick scans the range past the start block. A boot that skipped the chain
-/// workers never asks for logs.
-async fn wait_until_scanned(booted: &Booted) {
-    let started = Instant::now();
-    while !booted
-        .chain_calls
-        .lock()
-        .iter()
-        .any(|method| method == "eth_getLogs")
-    {
-        assert!(
-            started.elapsed() < SETTLE_BUDGET,
-            "the chain indexer never scanned: {:?}\n{}",
-            booted.chain_calls.lock(),
-            booted.node.tail()
-        );
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
 async fn ask_commit_tree(addr: SocketAddr, tree_number: u32) -> StatusCode {
     reqwest::Client::new()
         .post(format!(
@@ -530,60 +425,48 @@ fn refusals_for(scrape: &str, route: &str) -> u64 {
 
 /// What the list routes answered, each asked exactly once so a refusal count is exact.
 struct ListAnswers {
-    pois: (StatusCode, Value),
     proofs: (StatusCode, Value),
-    header: (StatusCode, Value),
+    absent_proof: StatusCode,
+    index: (StatusCode, Value),
 }
 
 async fn ask_list_routes(booted: &Booted, held: [u8; 32], absent: [u8; 32]) -> ListAnswers {
     let client = reqwest::Client::new();
     let base = format!("http://{}/v1/poi", booted.addr);
     let list_key = booted.list_key.as_str();
-    let pois = ask(
-        client.post(format!("{base}/pois-per-list")).json(&json!({
-            "listKeys": [list_key],
-            "blindedCommitmentDatas": [
-                { "blindedCommitment": hex::encode(leaf_at(0)) },
-                { "blindedCommitment": hex::encode(held) },
-                { "blindedCommitment": hex::encode(absent) },
-            ],
-        })),
-        "pois-per-list",
-    )
-    .await;
-    let proofs = ask(
+    let proof_of = |bc: [u8; 32]| {
         client
             .post(format!("{base}/merkle-proofs"))
-            .json(&json!({ "listKey": list_key, "blindedCommitments": [hex::encode(held)] })),
-        "merkle-proofs",
-    )
-    .await;
-    let header = ask(
-        client.get(format!("{base}/{list_key}/status-header")),
-        "status-header",
+            .json(&json!({ "listKey": list_key, "blindedCommitments": [hex::encode(bc)] }))
+    };
+    let proofs = ask(proof_of(held), "merkle-proofs").await;
+    let (absent_proof, _) = ask(proof_of(absent), "merkle-proofs for an absent row").await;
+    let index = ask(
+        client.get(format!("{base}/{list_key}/bc-to-idx-map")),
+        "bc-to-idx-map",
     )
     .await;
     ListAnswers {
-        pois,
         proofs,
-        header,
+        absent_proof,
+        index,
     }
 }
 
-/// Every commit tree the shipped config declares reaches its own store and one it does not
-/// declare is refused by the coverage proof; the declared list answers rows only a store the
-/// binary fed from upstream can hold.
+/// The shipped config serves every block it declares, the one the list reaches next included,
+/// and answers list rows only from a store the binary fed from upstream; a commit tree it does
+/// not declare is refused by the coverage proof.
 ///
-/// The commit-tree refusal count is the load-bearing assertion there: exactly one, the
-/// undeclared tree, while the declared trees answered 404 from an empty store. Take the store
-/// registry out of the boot and every one of them answers 503 with the counter at zero.
+/// The refusal count is the load-bearing assertion there: exactly one, the commit tree, while
+/// the list routes answered from the declared blocks. Take the store registry out of the boot
+/// and every one of them answers 503 with the counter at zero.
 ///
 /// No `Authorization` header goes to a shim route: the read path is public and a wallet holds
 /// no credential. Only the `/metrics` scrape is authenticated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "boots the production binary on the shipped 11-instance config, ~100-120 s of PIR \
-            setup on a 16-core box. Trigger: changing serve-production --config boot wiring, shim-route store \
-            resolution, or the example config's declared trees and list blocks."]
+#[ignore = "boots the production binary on the shipped seven-block config, a production cell per \
+            block. Trigger: changing serve-production --config boot wiring, shim-route store \
+            resolution, or the example config's declared list blocks."]
 async fn the_shipped_config_serves_shim_routes_from_the_stores_it_declares() {
     let booted = boot_the_shipped_config().await;
     let addr = booted.addr;
@@ -604,49 +487,44 @@ async fn the_shipped_config_serves_shim_routes_from_the_stores_it_declares() {
         served, booted.declared_instances,
         "the binary serves every declared instance"
     );
+    assert!(
+        served.contains(NEXT_BLOCK_INSTANCE),
+        "the block holding row 393,216 must be served before the list reaches it: {served:?}"
+    );
+    let params = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/v1/instance/{NEXT_BLOCK_INSTANCE}/params"
+        ))
+        .send()
+        .await
+        .expect("params of the next block");
+    assert_eq!(
+        params.status(),
+        StatusCode::OK,
+        "{NEXT_BLOCK_INSTANCE} hands a wallet what it needs to query it"
+    );
 
     let feed = wait_until_caught_up(&booted).await;
     assert_eq!(feed.rows_held, u64::from(LIST_ROWS), "{feed:?}");
-    wait_until_scanned(&booted).await;
 
-    let mut declared_trees = Vec::with_capacity(booted.trees.len());
-    for tree in &booted.trees {
-        declared_trees.push((*tree, ask_commit_tree(addr, *tree).await));
-    }
-    let undeclared_tree = booted.trees.last().copied().expect("a declared tree") + 1;
-    let undeclared = ask_commit_tree(addr, undeclared_tree).await;
+    let undeclared = ask_commit_tree(addr, 0).await;
     let held = leaf_at(LIST_ROWS - 1);
     let absent = leaf_at(LIST_ROWS);
     let answers = ask_list_routes(&booted, held, absent).await;
     let scrape = scrape(addr).await;
 
-    for (tree, status) in &declared_trees {
-        assert_eq!(
-            *status,
-            StatusCode::NOT_FOUND,
-            "commit tree {tree} is declared, so the request must reach its store and miss \
-             there rather than find no store at all"
-        );
-    }
     assert_eq!(
         undeclared,
         StatusCode::SERVICE_UNAVAILABLE,
-        "commit tree {undeclared_tree} is held by nobody and must not be answered from a \
-         declared tree's store"
+        "commit tree 0 is held by nobody and must not be answered from a list block's store"
     );
     assert_eq!(
         refusals_for(&scrape, COMMIT_TREE_ROUTE),
         1,
-        "exactly one commit-tree request refused through the proof, the undeclared one; zero \
-         means no registry was installed and every 503 is the absent-store 503: {scrape}"
+        "exactly one commit-tree request refused through the proof; zero means no registry \
+         was installed and every 503 is the absent-store 503: {scrape}"
     );
 
-    let list_key = booted.list_key.as_str();
-    let (status, pois) = &answers.pois;
-    assert_eq!(*status, StatusCode::OK, "{}", booted.node.tail());
-    for (bc, want) in [(leaf_at(0), "Valid"), (held, "Valid"), (absent, "Missing")] {
-        assert_eq!(pois[hex::encode(bc)][list_key], want, "{pois}");
-    }
     let (status, proofs) = &answers.proofs;
     assert_eq!(*status, StatusCode::OK, "{}", booted.node.tail());
     assert_eq!(proofs[0]["leaf"], hex::encode(held), "{proofs}");
@@ -655,9 +533,31 @@ async fn the_shipped_config_serves_shim_routes_from_the_stores_it_declares() {
         hex::encode(booted.roots.last().expect("a root")),
         "the proof must come from the block holding the row, at the root upstream published"
     );
-    let (status, header) = &answers.header;
+    assert_eq!(
+        answers.absent_proof,
+        StatusCode::NOT_FOUND,
+        "a row past the list's end is absent from the declared blocks that cover it"
+    );
+    let (status, index) = &answers.index;
     assert_eq!(*status, StatusCode::OK, "{}", booted.node.tail());
-    assert_eq!(header["listKey"], list_key, "{header}");
+    let entries: Vec<(Option<u64>, Option<&str>)> = index["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|entry| (entry["idx"].as_u64(), entry["bc"].as_str()))
+        .collect();
+    let expected: Vec<String> = (0..LIST_ROWS)
+        .map(|row| hex::encode(leaf_at(row)))
+        .collect();
+    assert_eq!(
+        entries,
+        expected
+            .iter()
+            .zip(0u64..)
+            .map(|(bc, idx)| (Some(idx), Some(bc.as_str())))
+            .collect::<Vec<_>>(),
+        "{index}"
+    );
     for route in LIST_ROUTES {
         assert_eq!(
             refusals_for(&scrape, route),

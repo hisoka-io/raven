@@ -43,20 +43,12 @@ encoder = "per-node"
 data_dir_template = "/tmp/raven-unused/template-{{tree_number}}"
 #@instance_template@
 
-[[ppoi_list_template]]
-template_id = "ppoi"
-list_key = "{LIST_KEY}"
-encoder = "per-list-status"
-data_dir_template = "/tmp/raven-unused/list-{{list_key}}"
-#@ppoi_list_template@
-
 [[instance]]
 id = "commit-tree-0"
 role = "live"
 encoder = "per-node"
 tree_number = 0
 data_dir = "/tmp/raven-unused/commit-tree-0"
-verification_mode = "chain-root-history"
 #@instance@
 [instance.data_source]
 kind = "indexer"
@@ -66,15 +58,15 @@ tree_number = 0
 #@filter@
 
 [[instance]]
-id = "ppoi-status"
+id = "ppoi-paths-0"
 role = "live"
-encoder = "per-list-status"
+encoder = "per-list-path10"
 list_key = "{LIST_KEY}"
-data_dir = "/tmp/raven-unused/ppoi-status"
-verification_mode = "upstream-asserted"
+data_dir = "/tmp/raven-unused/ppoi-paths-0"
 [instance.data_source]
 kind = "mirror"
 list_key = "{LIST_KEY}"
+block = 0
 #@mirror@
 "#
     )
@@ -85,13 +77,6 @@ fn load(body: &str) -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new().expect("tempfile");
     file.write_all(body.as_bytes()).expect("write config");
     load_options_from_toml(file.path()).map(|_| ())
-}
-
-fn refusal(body: &str, why: &str) -> String {
-    match load(body) {
-        Ok(()) => panic!("{why}: the config booted"),
-        Err(err) => format!("{err:#}"),
-    }
 }
 
 /// Every case is tried before any is reported, so one run lists every table that leaks.
@@ -132,7 +117,6 @@ fn a_misspelt_key_is_refused_by_name_in_every_table() {
         ("#@auto_spawn@", "cooldown_secs = 300", "cooldown_secs"),
         ("#@rpc_pool@", "cooldown_seconds = 30", "cooldown_seconds"),
         ("#@instance_template@", "max_instances = 8", "max_instances"),
-        ("#@ppoi_list_template@", "k_concurency = 4", "k_concurency"),
         ("#@instance@", "record_bytes = 512", "record_bytes"),
         ("#@indexer@", "tree = 0", "tree"),
         ("#@filter@", "tree_num = 0", "tree_num"),
@@ -141,50 +125,6 @@ fn a_misspelt_key_is_refused_by_name_in_every_table() {
     assert_each_refused_by_name(&multi_instance_config(), &cases, |body| {
         load(body).map_err(|err| format!("{err:#}"))
     });
-}
-
-/// A retired value must red the boot, not fall through to some other authority model.
-#[test]
-fn the_retired_verification_mode_value_is_refused_by_name() {
-    let base = multi_instance_config();
-    let retired = base.replace("upstream-asserted", "upstream-signature");
-    assert_ne!(
-        base, retired,
-        "the fixture no longer carries the value under test"
-    );
-
-    let message = refusal(&retired, "a retired verification_mode value");
-    assert!(
-        message.contains("verification_mode") && message.contains("upstream-signature"),
-        "a retired value must be refused naming the key and the value: {message}"
-    );
-}
-
-fn status_instance_with(what: &str) -> String {
-    multi_instance_config().replace("#@mirror@", &format!("what = \"{what}\""))
-}
-
-#[test]
-fn the_mirror_feed_name_is_checked_against_the_encoder() {
-    load(&status_instance_with("status")).expect("the feed a status encoder consumes");
-    for wrong in ["path", "nonsense", ""] {
-        let message = refusal(&status_instance_with(wrong), wrong);
-        assert!(
-            message.contains("what") && message.contains("ppoi-status"),
-            "`what = {wrong:?}` must be refused naming the key and the instance: {message}"
-        );
-    }
-
-    let path_instance = |what: &str| {
-        status_instance_with(what).replace(
-            "encoder = \"per-list-status\"\nlist_key",
-            "encoder = \"per-list-path10\"\nlist_key",
-        )
-    };
-    assert_ne!(path_instance("path"), status_instance_with("path"));
-    load(&path_instance("path")).expect("the feed a path encoder consumes");
-    let message = refusal(&path_instance("status"), "status feed on a path encoder");
-    assert!(message.contains("what"), "{message}");
 }
 
 const BOOTSTRAP_RPC_POOL: &str = r#"
@@ -242,15 +182,15 @@ chain_id = 1
 mirror_endpoint = "http://127.0.0.1:1"
 
 [[instance]]
-id = "ppoi-status"
+id = "ppoi-paths-0"
 role = "live"
-encoder = "per-list-status"
+encoder = "per-list-path10"
 list_key = "{LIST_KEY}"
 data_dir = "{}"
-verification_mode = "upstream-asserted"
 [instance.data_source]
 kind = "mirror"
 list_key = "{LIST_KEY}"
+block = 0
 "#,
         data_dir.display()
     )
@@ -261,7 +201,7 @@ list_key = "{LIST_KEY}"
 #[test]
 fn the_ws_endpoint_flag_beside_config_reaches_the_boot() {
     let data = tempfile::tempdir().expect("tempdir");
-    let body = mirror_only_config(&data.path().join("ppoi-status"));
+    let body = mirror_only_config(&data.path().join("ppoi-paths-0"));
     load(&body).expect("a fixture that does not load proves nothing below");
     // NamedTempFile is 0600, which the inline token requires.
     let mut file = tempfile::NamedTempFile::new().expect("tempfile");
@@ -307,6 +247,11 @@ fn the_ws_endpoint_flag_beside_config_reaches_the_boot() {
 #[test]
 fn the_shipped_examples_use_only_declared_keys() {
     let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples");
+    let ppoi = std::fs::read_to_string(examples.join("mainnet-ppoi.toml"))
+        .expect("read PPOI example")
+        .replace("REPLACE_ME", "unknown-key-test-token-padded-long");
+    load(&ppoi).expect("PPOI example");
+
     let mainnet = std::fs::read_to_string(examples.join("mainnet-6-instance.toml"))
         .expect("read mainnet example")
         .replace("REPLACE_ME", "unknown-key-test-token-padded-long");

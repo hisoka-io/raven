@@ -61,7 +61,7 @@ fn node_status(network: &str, list_key_hex: &str) -> String {
 /// the replay as the one upstream, paged back to back.
 fn shipped_config(root: &Path, endpoint: &str) -> PathBuf {
     // Compiled in, so renaming the example breaks every build rather than only this ignored test.
-    let body = include_str!("../../examples/mainnet-ppoi-7-instance.toml");
+    let body = include_str!("../../examples/mainnet-ppoi.toml");
     assert_eq!(
         body.matches(SHIPPED_ENDPOINT).count(),
         1,
@@ -72,7 +72,7 @@ fn shipped_config(root: &Path, endpoint: &str) -> PathBuf {
             SHIPPED_ENDPOINT,
             &format!("mirror_endpoint = \"{endpoint}\"\nmirror_backfill_interval_secs = 0"),
         )
-        .replace("/var/lib/raven-railgun/", &format!("{}/", root.display()))
+        .replace("/srv/raven/data/", &format!("{}/", root.display()))
         .replace("0.0.0.0:8080", "127.0.0.1:0")
         .replace("REPLACE_ME", BEARER_TOKEN);
     let path = root.join("config.toml");
@@ -260,7 +260,6 @@ async fn every_captured_row_applies_through_the_mirror_feed_with_its_root_matche
         u64::from(served.chain_id),
         "the capture's chain and the example's must agree"
     );
-    // The whole-list status instance stops at one tree; the forest is the block instances.
     opts.instances.retain(|instance| {
         matches!(
             instance.data_source,

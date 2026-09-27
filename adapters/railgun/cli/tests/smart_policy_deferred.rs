@@ -1,5 +1,4 @@
-//! SIGHUP hot-reload, PPOI list-template parsing, `tree_fill_threshold`
-//! pre-spawn, and admin-drain x auto-spawn interactions.
+//! `tree_fill_threshold` pre-spawn and admin-drain x auto-spawn interactions.
 
 #![allow(
     clippy::expect_used,
@@ -20,7 +19,6 @@ use raven_inspire::params::InspireParams;
 use raven_railgun_cli::auto_spawn_driver::{
     pre_spawn_for_tree, run_driver_dynamic, AutoSpawnRuntime, SpawnRegistry,
 };
-use raven_railgun_cli::serve_production_multi::load_options_from_toml;
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{InspireServerState, RavenInspireScheme};
 use raven_railgun_engine::orchestrator::ChainTreeRoutes;
@@ -163,123 +161,6 @@ async fn wait_for_chain_tree_count(
     panic!(
         "timed out waiting for chain_tree_count >= {expected}; got {}",
         registry.chain_tree_count()
-    );
-}
-
-#[test]
-fn multi_list_ppoi_auto_spawn_on_new_list_key() {
-    use std::io::Write;
-
-    let body = r#"
-[global]
-bind = "127.0.0.1:0"
-token = "ppoi-template-toml-token-padded"
-rpc_url = "http://127.0.0.1:1"
-railgun_proxy = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
-chain_id = 1
-start_block = 0
-mirror_endpoint = "http://127.0.0.1:1"
-
-[[ppoi_list_template]]
-template_id = "ppoi-status-templ"
-list_key = "0000000000000000000000000000000000000000000000000000000000000001"
-encoder = "per-list-status"
-data_dir_template = "/var/lib/raven-railgun/ppoi-status-{list_key}"
-k_concurrency = 16
-
-[[ppoi_list_template]]
-template_id = "ppoi-node-templ"
-list_key = "0000000000000000000000000000000000000000000000000000000000000002"
-encoder = "per-list-node"
-data_dir_template = "/var/lib/raven-railgun/ppoi-node-{list_key}"
-k_concurrency = 32
-
-[[instance]]
-id = "commit-tree-0"
-role = "static"
-encoder = "per-leaf-bc"
-tree_number = 0
-data_dir = "/tmp/raven-ppoi-templates-tree-0"
-verification_mode = "chain-root-history"
-data_source = { kind = "indexer", filter = { tree_number = 0 } }
-"#;
-    let mut f = tempfile::NamedTempFile::new().expect("tempfile");
-    f.write_all(body.as_bytes()).expect("write");
-    let opts = load_options_from_toml(f.path()).expect("parse ppoi templates");
-    assert_eq!(opts.ppoi_list_templates.len(), 2);
-    assert_eq!(opts.ppoi_list_templates[0].template_id, "ppoi-status-templ");
-    assert_eq!(opts.ppoi_list_templates[0].encoder, "per-list-status");
-    assert_eq!(opts.ppoi_list_templates[1].encoder, "per-list-node");
-
-    let bad_body = r#"
-[global]
-bind = "127.0.0.1:0"
-token = "ppoi-template-toml-token-padded"
-rpc_url = "http://127.0.0.1:1"
-railgun_proxy = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
-chain_id = 1
-start_block = 0
-mirror_endpoint = "http://127.0.0.1:1"
-
-[[ppoi_list_template]]
-template_id = "ppoi-bad-templ"
-list_key = "0000000000000000000000000000000000000000000000000000000000000003"
-encoder = "per-list-status"
-data_dir_template = "/var/lib/raven-railgun/no-placeholder"
-
-[[instance]]
-id = "commit-tree-0"
-role = "static"
-encoder = "per-leaf-bc"
-tree_number = 0
-data_dir = "/tmp/raven-ppoi-bad-tree-0"
-verification_mode = "chain-root-history"
-data_source = { kind = "indexer", filter = { tree_number = 0 } }
-"#;
-    let mut bad_f = tempfile::NamedTempFile::new().expect("tempfile bad");
-    bad_f.write_all(bad_body.as_bytes()).expect("write bad");
-    let err = load_options_from_toml(bad_f.path()).expect_err("must reject missing placeholder");
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("{list_key}"),
-        "expected missing-placeholder error; got: {msg}"
-    );
-
-    let wrong_encoder = r#"
-[global]
-bind = "127.0.0.1:0"
-token = "ppoi-template-toml-token-padded"
-rpc_url = "http://127.0.0.1:1"
-railgun_proxy = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
-chain_id = 1
-start_block = 0
-mirror_endpoint = "http://127.0.0.1:1"
-
-[[ppoi_list_template]]
-template_id = "ppoi-wrong"
-list_key = "0000000000000000000000000000000000000000000000000000000000000004"
-encoder = "per-leaf-bc"
-data_dir_template = "/var/lib/raven-railgun/x-{list_key}"
-
-[[instance]]
-id = "commit-tree-0"
-role = "static"
-encoder = "per-leaf-bc"
-tree_number = 0
-data_dir = "/tmp/raven-ppoi-wrong-tree-0"
-verification_mode = "chain-root-history"
-data_source = { kind = "indexer", filter = { tree_number = 0 } }
-"#;
-    let mut wrong_f = tempfile::NamedTempFile::new().expect("tempfile wrong");
-    wrong_f
-        .write_all(wrong_encoder.as_bytes())
-        .expect("write wrong");
-    let err =
-        load_options_from_toml(wrong_f.path()).expect_err("must reject non-PPOI encoder label");
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("not a") && msg.contains("PPOI encoder"),
-        "expected not-a-PPOI-encoder error; got: {msg}"
     );
 }
 

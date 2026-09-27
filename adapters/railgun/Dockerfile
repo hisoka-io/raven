@@ -33,13 +33,17 @@ RUN apt-get update \
  && useradd  --system --uid 1500 --gid 1500 --home-dir /data --shell /usr/sbin/nologin raven
 
 # a template only: its token is REPLACE_ME, which boot refuses, so CMD reads the operator's copy
-COPY --from=build /build/adapters/railgun/examples/mainnet-ppoi-7-instance.toml \
-     /etc/raven-railgun/mainnet-ppoi-7-instance.toml
+COPY --from=build /build/adapters/railgun/examples/mainnet-ppoi.toml \
+     /etc/raven-railgun/mainnet-ppoi.toml
 COPY --from=build /build/adapters/railgun/target/release/raven-railgun \
      /usr/local/bin/raven-railgun
 RUN strip /usr/local/bin/raven-railgun || true
 
-# data: instance dirs; secrets: operator-mounted config + bearer token
+# data: instance dirs; secrets: operator-mounted config + bearer token. Created owned by raven
+# first, since a fresh volume copies the image dir's owner and a root-owned one is unwritable.
+RUN mkdir -p /srv/raven/data /srv/raven/secrets \
+ && chown raven:raven /srv/raven/data /srv/raven/secrets \
+ && chmod 0750 /srv/raven/data /srv/raven/secrets
 VOLUME ["/srv/raven/data", "/srv/raven/secrets"]
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=60s \

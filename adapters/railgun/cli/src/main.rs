@@ -420,7 +420,6 @@ role = "live"
 encoder = "per-list-path10"
 list_key = "{LIST_KEY}"
 data_dir = "{}"
-verification_mode = "upstream-asserted"
 [instance.data_source]
 kind = "mirror"
 list_key = "{LIST_KEY}"

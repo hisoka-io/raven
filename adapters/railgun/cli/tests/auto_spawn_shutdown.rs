@@ -234,7 +234,6 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
         }),
         rpc_pool: None,
         instance_templates: vec![],
-        ppoi_list_templates: vec![],
         tree_fill_threshold: None,
         reload_config_path: None,
         ws_endpoint: None,

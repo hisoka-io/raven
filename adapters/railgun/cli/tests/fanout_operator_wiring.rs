@@ -75,7 +75,6 @@ tree_number = 0
 record_size = 32
 entries = 256
 data_dir = "/tmp/raven-fanout-operator-wiring"
-verification_mode = "chain-root-history"
 data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
 "#
     )

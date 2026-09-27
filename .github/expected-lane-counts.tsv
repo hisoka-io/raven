@@ -6,7 +6,9 @@
 # test that left a lane is non-ignored in a package whose railgun-tests shard runs it under the
 # same ci-test cargo profile, and the two terms that selected nothing under only were dropped.
 durability-and-closure/wal-and-snapshot-chaos	4
-durability-and-closure/cli-ignored	21
+# 2026-09-27: cli-ignored lost the three tests of the `[[ppoi_list_template]]` auto-spawn, deleted
+# with it: it spawned only whole-list instances, which the mirror never fed.
+durability-and-closure/cli-ignored	18
 durability-and-closure/shipped-config-spawn	1
 # Its filter carries a bare `test(insert_rejects_overflow_past_capacity)` that resolves to an
 # in-src lib test. The original anchor counted only `pkg::binary test` rows and silently dropped

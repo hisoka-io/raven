@@ -1,5 +1,5 @@
 //! Multi-instance config-file integration test.
-//! Boots the multi-instance serve loop from the canonical
+//! Boots the multi-instance serve loop from the chain-and-list
 //! `examples/mainnet-6-instance.toml` shape and verifies status output
 //! plus encoder-default `active_k_concurrency` resolution, and that a wallet-shim route
 //! is answered from the stores that config declares.
@@ -33,13 +33,12 @@ use tokio::sync::oneshot;
 const BEARER_TOKEN: &str = "config-file-test-token-padded-long";
 
 /// Every `[[instance]]` the example declares, with its encoder-default k:
-/// per-node 16, per-list-status 4, per-list-path10 16.
-const EXAMPLE_INSTANCES: [(&str, u32); 11] = [
+/// per-node 16, per-list-path10 16.
+const EXAMPLE_INSTANCES: [(&str, u32); 10] = [
     ("commit-tree-0", 16),
     ("commit-tree-1", 16),
     ("commit-tree-2", 16),
     ("commit-tree-3", 16),
-    ("ppoi-status-ofac", 4),
     ("ppoi-paths-ofac-0", 16),
     ("ppoi-paths-ofac-1", 16),
     ("ppoi-paths-ofac-2", 16),
@@ -159,7 +158,7 @@ const COMMIT_TREE_ROUTE: &str = "commit-tree-merkle-proof";
 
 /// The shim list routes that are mounted unconditionally, so the exact refusal counts
 /// below do not move with whichever index channel is compiled in.
-const LIST_ROUTES: [&str; 3] = ["pois-per-list", "merkle-proofs", "status-header"];
+const LIST_ROUTES: [&str; 1] = ["merkle-proofs"];
 
 fn hex32(bytes: &[u8; 32]) -> String {
     use std::fmt::Write as _;
@@ -241,40 +240,16 @@ async fn ask_list_routes(
     let client = reqwest::Client::new();
     let probe = hex32(&raven_railgun_testkit::canonical(0x71));
     let base = format!("http://{addr}");
-    vec![
-        (
-            "pois-per-list",
-            client
-                .post(format!("{base}/v1/poi/pois-per-list"))
-                .json(&serde_json::json!({
-                    "listKeys": [list_key],
-                    "blindedCommitmentDatas": [{ "blindedCommitment": probe }],
-                }))
-                .send()
-                .await
-                .expect("pois-per-list")
-                .status(),
-        ),
-        (
-            "merkle-proofs",
-            client
-                .post(format!("{base}/v1/poi/merkle-proofs"))
-                .json(&serde_json::json!({ "listKey": list_key, "blindedCommitments": [probe] }))
-                .send()
-                .await
-                .expect("merkle-proofs")
-                .status(),
-        ),
-        (
-            "status-header",
-            client
-                .get(format!("{base}/v1/poi/{list_key}/status-header"))
-                .send()
-                .await
-                .expect("status-header")
-                .status(),
-        ),
-    ]
+    vec![(
+        "merkle-proofs",
+        client
+            .post(format!("{base}/v1/poi/merkle-proofs"))
+            .json(&serde_json::json!({ "listKey": list_key, "blindedCommitments": [probe] }))
+            .send()
+            .await
+            .expect("merkle-proofs")
+            .status(),
+    )]
 }
 
 /// Every commit tree the config declares reaches its own store; one it does not declare is
@@ -289,7 +264,7 @@ async fn ask_list_routes(
 /// No `Authorization` header goes to a shim route: the read path is public and a wallet
 /// holds no credential. Only the `/metrics` scrape is authenticated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "stands up the same 11 PIR instances as the boot test above, ~7 s each. \
+#[ignore = "stands up the same 10 PIR instances as the boot test above, ~7 s each. \
             Trigger: changing shim-route store resolution, or the example config's \
             declared trees and list blocks."]
 async fn shim_routes_answer_only_from_the_stores_the_example_config_declares() {
@@ -416,10 +391,10 @@ fn default_k_for_per_node_is_sixteen() {
     );
     assert_eq!(default_k_for(EncoderKind::PerLeafBc { tree_number: 0 }), 4);
     assert_eq!(
-        default_k_for(EncoderKind::PerListStatus {
+        default_k_for(EncoderKind::PerListPath10 {
             list_key: [0u8; 32]
         }),
-        4
+        16
     );
 }
 

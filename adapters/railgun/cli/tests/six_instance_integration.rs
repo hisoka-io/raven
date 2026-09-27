@@ -1,4 +1,5 @@
-//! End-to-end synthetic-chain test for the 6-instance topology; `#[ignore]`-gated.
+//! End-to-end synthetic-chain test for a 6-instance topology, four commit trees and two blocks of
+//! one PPOI list; `#[ignore]`-gated.
 
 #![allow(
     clippy::expect_used,
@@ -22,10 +23,10 @@ use raven_railgun_cli::serve_production_multi::{
     BootstrapView, MultiServeOptions,
 };
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
+use raven_railgun_engine::orchestrator::LEAVES_PER_PPOI_BLOCK;
 use raven_railgun_engine::orchestrator::{DataSourceFilter, VerificationMode};
 use raven_railgun_engine::persistence::SnapshotPolicy;
 use raven_railgun_engine::pir_table::EncoderKind;
-use raven_railgun_engine::InstanceRole;
 use raven_railgun_indexer::{
     BlockId, ChainSource, IndexerError, IndexerMessage, Result as IndexerResult,
 };
@@ -36,8 +37,6 @@ use tokio::sync::oneshot;
 const BEARER_TOKEN: &str = "six-instance-integration-token-pad";
 
 const PPOI_LIST_OFAC_HEX: &str = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88";
-const PPOI_LIST_RAILWAY_HEX: &str =
-    "0000000000000000000000000000000000000000000000000000000000000001";
 
 #[derive(Debug, Deserialize)]
 struct StatusJson {
@@ -151,14 +150,8 @@ fn build_opts(
     let cfg_path = rewrite_to_tempdir(&example_toml_path(), tmp, bind, BEARER_TOKEN);
     let mut opts = load_options_from_toml(&cfg_path).expect("parse config");
     opts.instances.retain(|instance| {
-        !matches!(instance.data_source, DataSourceFilter::PpoiListBlock { block, .. } if block > 0)
+        !matches!(instance.data_source, DataSourceFilter::PpoiListBlock { block, .. } if block > 1)
     });
-    for instance in &mut opts.instances {
-        if let DataSourceFilter::PpoiListBlock { list_key, block: 0 } = instance.data_source {
-            instance.data_source = DataSourceFilter::PpoiList(list_key);
-            instance.role = InstanceRole::Live;
-        }
-    }
     opts.bind = bind;
     opts.skip_chain_workers = true;
     opts.skip_mirror_workers = true;
@@ -253,12 +246,16 @@ async fn wait_for_observer(observer: &BootstrapObserver) -> BootstrapView {
     panic!("bootstrap observer never populated within 300s");
 }
 
+/// Above the server's own drain, 5 s per consumer and 2 s for the router, so a loaded box that
+/// stretches each final commit is not mistaken for a hang.
+const SHUTDOWN_BOUND: Duration = Duration::from_secs(60);
+
 async fn shutdown(
     tx: oneshot::Sender<()>,
     server: tokio::task::JoinHandle<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
     let _ = tx.send(());
-    match tokio::time::timeout(Duration::from_secs(20), server).await {
+    match tokio::time::timeout(SHUTDOWN_BOUND, server).await {
         Ok(Ok(res)) => res,
         Ok(Err(join_err)) => Err(anyhow::anyhow!("server task join error: {join_err}")),
         Err(_) => Err(anyhow::anyhow!("server shutdown timed out")),
@@ -277,11 +274,8 @@ async fn abort_without_final_commit(
     tokio::time::sleep(Duration::from_millis(500)).await;
 }
 
-async fn drive_synthetic_events(
-    view: &BootstrapView,
-    list_key_ofac: [u8; 32],
-    list_key_railway: [u8; 32],
-) {
+/// One row for each PPOI block: list row 0 lands in block 0, row 65,536 in block 1.
+async fn drive_synthetic_events(view: &BootstrapView, list_key_ofac: [u8; 32]) {
     let chain = &view.channels.indexer_tx;
     let mirror = &view.channels.mirror_tx;
 
@@ -352,58 +346,23 @@ async fn drive_synthetic_events(
         .await
         .expect("send tree-1 nullified");
 
-    mirror
-        .send((
-            WalEntryPayload::PpoiListLeafAdded {
-                list_key: list_key_ofac,
-                list_index: 0,
-                blinded_commitment: canonical_commit(0x71),
-                status: 0,
-                event_type: raven_railgun_persistence::PpoiEventType::Shield,
-                signature: vec![0; 64],
-                validated_merkleroot: [0; 32],
-            },
-            0,
-        ))
-        .await
-        .expect("send ofac leaf");
-    mirror
-        .send((
-            WalEntryPayload::PpoiStatus {
-                list_key: list_key_ofac,
-                blinded_commitment: canonical_commit(0x71),
-                status: 1,
-            },
-            0,
-        ))
-        .await
-        .expect("send ofac status");
-    mirror
-        .send((
-            WalEntryPayload::PpoiListLeafAdded {
-                list_key: list_key_railway,
-                list_index: 0,
-                blinded_commitment: canonical_commit(0x82),
-                status: 0,
-                event_type: raven_railgun_persistence::PpoiEventType::Shield,
-                signature: vec![0; 64],
-                validated_merkleroot: [0; 32],
-            },
-            0,
-        ))
-        .await
-        .expect("send railway leaf");
-    mirror
-        .send((
-            WalEntryPayload::PpoiStatus {
-                list_key: list_key_railway,
-                blinded_commitment: canonical_commit(0x82),
-                status: 2,
-            },
-            0,
-        ))
-        .await
-        .expect("send railway status");
+    for (list_index, bc) in [(0, 0x71), (LEAVES_PER_PPOI_BLOCK, 0x82)] {
+        mirror
+            .send((
+                WalEntryPayload::PpoiListLeafAdded {
+                    list_key: list_key_ofac,
+                    list_index,
+                    blinded_commitment: canonical_commit(bc),
+                    status: 0,
+                    event_type: raven_railgun_persistence::PpoiEventType::Shield,
+                    signature: vec![0; 64],
+                    validated_merkleroot: [0; 32],
+                },
+                0,
+            ))
+            .await
+            .expect("send ofac leaf");
+    }
 }
 
 async fn wait_for_apply(view: &BootstrapView, deadline_secs: u64) {
@@ -428,19 +387,15 @@ async fn wait_for_apply(view: &BootstrapView, deadline_secs: u64) {
                         }
                     }
                 }
-                DataSourceFilter::PpoiList(lk) => {
-                    let store = inst.logical_store.lock();
-                    // The leaf lands with status 0; the list's last driven event sets it non-zero.
-                    if store
-                        .ppoi_status_at(&lk, 0)
-                        .is_none_or(|status| status == 0)
-                    {
+                DataSourceFilter::PpoiListBlock { list_key, .. } => {
+                    // Each block holds its driven row at its own local index 0.
+                    if inst.logical_store.lock().ppoi_bc_at(&list_key, 0).is_none() {
                         all_ready = false;
                         break;
                     }
                 }
-                DataSourceFilter::PpoiListBlock { .. } => {
-                    unreachable!("six-instance fixture has no block route")
+                DataSourceFilter::PpoiList(_) => {
+                    unreachable!("the boot builds no whole-list route")
                 }
             }
         }
@@ -496,8 +451,8 @@ async fn six_instance_bootstrap_serves_status_for_all_six() {
         "commit-tree-1",
         "commit-tree-2",
         "commit-tree-3",
-        "ppoi-status-ofac",
         "ppoi-paths-ofac-0",
+        "ppoi-paths-ofac-1",
     ] {
         assert!(
             ids.iter().any(|id| *id == expect),
@@ -506,7 +461,7 @@ async fn six_instance_bootstrap_serves_status_for_all_six() {
     }
 
     // End-to-end status-wire pin of the resolved per-encoder k defaults:
-    // PerNode -> 16, PerListStatus -> 4, PerListPath10 -> 16.
+    // PerNode -> 16, PerListPath10 -> 16.
     let k_for = |id: &str| {
         body.instances
             .iter()
@@ -518,8 +473,8 @@ async fn six_instance_bootstrap_serves_status_for_all_six() {
     assert_eq!(k_for("commit-tree-1"), 16);
     assert_eq!(k_for("commit-tree-2"), 16);
     assert_eq!(k_for("commit-tree-3"), 16);
-    assert_eq!(k_for("ppoi-status-ofac"), 4);
     assert_eq!(k_for("ppoi-paths-ofac-0"), 16);
+    assert_eq!(k_for("ppoi-paths-ofac-1"), 16);
 
     assert_eq!(view.instances.len(), 6);
     let label_for = |id: &str| find_inst(&view, id).encoder_label;
@@ -527,8 +482,8 @@ async fn six_instance_bootstrap_serves_status_for_all_six() {
     assert_eq!(label_for("commit-tree-1"), "per-node");
     assert_eq!(label_for("commit-tree-2"), "per-node");
     assert_eq!(label_for("commit-tree-3"), "per-node");
-    assert_eq!(label_for("ppoi-status-ofac"), "per-list-status");
     assert_eq!(label_for("ppoi-paths-ofac-0"), "per-list-path10");
+    assert_eq!(label_for("ppoi-paths-ofac-1"), "per-list-path10");
 
     shutdown(stop, server).await.expect("graceful shutdown");
 }
@@ -550,11 +505,10 @@ async fn chain_events_route_to_correct_commit_tree_instance() {
     );
 
     let lk_ofac = parse_hex32(PPOI_LIST_OFAC_HEX);
-    let lk_railway = parse_hex32(PPOI_LIST_RAILWAY_HEX);
 
     let (_local_addr, server, stop) = spawn_server(opts).await;
     let view = wait_for_observer(&observer).await;
-    drive_synthetic_events(&view, lk_ofac, lk_railway).await;
+    drive_synthetic_events(&view, lk_ofac).await;
     wait_for_apply(&view, 25).await;
 
     for inst in &view.instances {
@@ -619,7 +573,7 @@ async fn chain_events_route_to_correct_commit_tree_instance() {
             DataSourceFilter::ChainTreeNumber(other) => {
                 panic!("unexpected commit-tree number {other}");
             }
-            DataSourceFilter::PpoiList(_) => {
+            DataSourceFilter::PpoiListBlock { .. } => {
                 let m = inst.metrics.lock();
                 assert_eq!(
                     m.last_applied_block, 0,
@@ -627,9 +581,7 @@ async fn chain_events_route_to_correct_commit_tree_instance() {
                     m.last_applied_block
                 );
             }
-            DataSourceFilter::PpoiListBlock { .. } => {
-                unreachable!("six-instance fixture has no block route")
-            }
+            DataSourceFilter::PpoiList(_) => unreachable!("the boot builds no whole-list route"),
         }
     }
 
@@ -637,7 +589,7 @@ async fn chain_events_route_to_correct_commit_tree_instance() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "stands up 6 InsPIRe instances and drives 4 PPOI events; ~12 s wall on Zen 5. Trigger: \
+#[ignore = "stands up 6 InsPIRe instances and drives 2 PPOI events; ~12 s wall on Zen 5. Trigger: \
             changing PPOI-event routing to list instances."]
 async fn ppoi_events_route_to_correct_list_instance() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -653,61 +605,47 @@ async fn ppoi_events_route_to_correct_list_instance() {
     );
 
     let lk_ofac = parse_hex32(PPOI_LIST_OFAC_HEX);
-    let lk_railway = parse_hex32(PPOI_LIST_RAILWAY_HEX);
 
     let (_local_addr, server, stop) = spawn_server(opts).await;
     let view = wait_for_observer(&observer).await;
-    drive_synthetic_events(&view, lk_ofac, lk_railway).await;
+    drive_synthetic_events(&view, lk_ofac).await;
     wait_for_apply(&view, 25).await;
 
     for inst in &view.instances {
         match inst.data_source {
-            DataSourceFilter::PpoiList(k) if k == lk_ofac => {
+            DataSourceFilter::PpoiListBlock { list_key, block } => {
+                assert_eq!(list_key, lk_ofac, "the fixture declares one list");
+                let (own, other) = if block == 0 {
+                    (0x71, 0x82)
+                } else {
+                    (0x82, 0x71)
+                };
                 let store = inst.logical_store.lock();
+                assert_eq!(
+                    store.ppoi_list_leaves_iter(&lk_ofac).count(),
+                    1,
+                    "block {block} holds its one row and no other"
+                );
                 assert_eq!(
                     store.ppoi_bc_at(&lk_ofac, 0),
-                    Some(canonical_commit(0x71)),
-                    "ofac instance must hold its leaf"
+                    Some(canonical_commit(own)),
+                    "block {block} holds its row at its local index 0"
                 );
                 assert_eq!(
-                    store.ppoi_status_at(&lk_ofac, 0),
-                    Some(1),
-                    "ofac instance must hold the status update"
+                    store.ppoi_index_of(&lk_ofac, &canonical_commit(other)),
+                    None,
+                    "block {block} must NOT see the other block's row"
                 );
-                assert!(
-                    store.ppoi_list_leaves_iter(&lk_railway).next().is_none(),
-                    "ofac instance must NOT see railway leaves"
-                );
-            }
-            DataSourceFilter::PpoiList(k) if k == lk_railway => {
-                let store = inst.logical_store.lock();
-                assert_eq!(
-                    store.ppoi_bc_at(&lk_railway, 0),
-                    Some(canonical_commit(0x82)),
-                    "railway instance must hold its leaf"
-                );
-                assert_eq!(
-                    store.ppoi_status_at(&lk_railway, 0),
-                    Some(2),
-                    "railway instance must hold the status update"
-                );
-                assert!(
-                    store.ppoi_list_leaves_iter(&lk_ofac).next().is_none(),
-                    "railway instance must NOT see ofac leaves"
-                );
-            }
-            DataSourceFilter::PpoiList(_) => panic!("unexpected ppoi list_key"),
-            DataSourceFilter::PpoiListBlock { .. } => {
-                unreachable!("six-instance fixture has no block route")
             }
             DataSourceFilter::ChainTreeNumber(_) => {
                 let store = inst.logical_store.lock();
                 assert_eq!(
                     store.ppoi_count(),
                     0,
-                    "commit-tree instance must NOT receive PPOI status rows"
+                    "commit-tree instance must NOT receive PPOI rows"
                 );
             }
+            DataSourceFilter::PpoiList(_) => unreachable!("the boot builds no whole-list route"),
         }
     }
 
@@ -814,7 +752,7 @@ async fn layer2_fires_only_on_commit_tree_instances() {
 
     // PPOI instances have no chain_source and no routed events: 0 reorgs/commits
     for inst in &view.instances {
-        if matches!(inst.data_source, DataSourceFilter::PpoiList(_)) {
+        if matches!(inst.data_source, DataSourceFilter::PpoiListBlock { .. }) {
             let m = inst.metrics.lock();
             assert_eq!(
                 m.reorgs_handled, 0,
@@ -840,7 +778,6 @@ async fn kill_restart_preserves_per_instance_state() {
     let bind: SocketAddr = "127.0.0.1:0".parse().expect("addr");
 
     let lk_ofac = parse_hex32(PPOI_LIST_OFAC_HEX);
-    let lk_railway = parse_hex32(PPOI_LIST_RAILWAY_HEX);
 
     let observer1: BootstrapObserver = Arc::new(parking_lot::Mutex::new(None));
     let chain_sources1 = six_synthetic_sources();
@@ -854,11 +791,11 @@ async fn kill_restart_preserves_per_instance_state() {
 
     let (_addr1, server1, stop1) = spawn_server(opts1).await;
     let view1 = wait_for_observer(&observer1).await;
-    drive_synthetic_events(&view1, lk_ofac, lk_railway).await;
+    drive_synthetic_events(&view1, lk_ofac).await;
     wait_for_apply(&view1, 25).await;
 
     let mut chain_pre: Vec<(u32, u64, Option<[u8; 32]>)> = Vec::new();
-    let mut ppoi_pre: Vec<([u8; 32], Option<[u8; 32]>)> = Vec::new();
+    let mut ppoi_pre: Vec<(DataSourceFilter, Option<[u8; 32]>)> = Vec::new();
     for inst in &view1.instances {
         match inst.data_source {
             DataSourceFilter::ChainTreeNumber(t) => {
@@ -866,13 +803,11 @@ async fn kill_restart_preserves_per_instance_state() {
                 let m = inst.metrics.lock();
                 chain_pre.push((t, m.last_applied_block, store.leaf(t, 0).copied()));
             }
-            DataSourceFilter::PpoiList(k) => {
+            DataSourceFilter::PpoiListBlock { list_key, .. } => {
                 let store = inst.logical_store.lock();
-                ppoi_pre.push((k, store.ppoi_bc_at(&k, 0)));
+                ppoi_pre.push((inst.data_source, store.ppoi_bc_at(&list_key, 0)));
             }
-            DataSourceFilter::PpoiListBlock { .. } => {
-                unreachable!("six-instance fixture has no block route")
-            }
+            DataSourceFilter::PpoiList(_) => unreachable!("the boot builds no whole-list route"),
         }
     }
 
@@ -907,15 +842,15 @@ async fn kill_restart_preserves_per_instance_state() {
             "tree-{t} leaf must match pre-shutdown after restart"
         );
     }
-    for (k, pre_bc) in &ppoi_pre {
+    for (filter, pre_bc) in &ppoi_pre {
         let inst = view2
             .instances
             .iter()
-            .find(|i| matches!(i.data_source, DataSourceFilter::PpoiList(kk) if kk == *k))
-            .unwrap_or_else(|| panic!("no ppoi instance for list {k:?} after restart"));
+            .find(|i| i.data_source == *filter)
+            .unwrap_or_else(|| panic!("no ppoi instance for {filter:?} after restart"));
         let store = inst.logical_store.lock();
         assert_eq!(
-            store.ppoi_bc_at(k, 0),
+            store.ppoi_bc_at(&lk_ofac, 0),
             *pre_bc,
             "ppoi list leaf must match pre-shutdown after restart"
         );
@@ -988,14 +923,13 @@ fn example_toml_parses_to_six_ppoi_blocks_with_expected_encoders() {
     let bind: SocketAddr = "127.0.0.1:0".parse().expect("addr");
     let cfg = rewrite_to_tempdir(&example_toml_path(), tmp.path(), bind, BEARER_TOKEN);
     let opts = load_options_from_toml(&cfg).expect("parse");
-    assert_eq!(opts.instances.len(), 11);
+    assert_eq!(opts.instances.len(), 10);
     let labels: Vec<&'static str> = opts.instances.iter().map(|i| i.encoder.label()).collect();
     let want = [
         "per-node",
         "per-node",
         "per-node",
         "per-node",
-        "per-list-status",
         "per-list-path10",
         "per-list-path10",
         "per-list-path10",
@@ -1014,21 +948,14 @@ fn example_toml_parses_to_six_ppoi_blocks_with_expected_encoders() {
         .collect();
     assert_eq!(blocks, vec![0, 1, 2, 3, 4, 5]);
 
+    // No key sets the mode; the loader derives it from the data source.
     for inst in &opts.instances {
-        match inst.data_source {
-            DataSourceFilter::ChainTreeNumber(_) => assert_eq!(
-                inst.verification_mode,
-                VerificationMode::ChainRootHistory,
-                "{} must use ChainRootHistory",
-                inst.instance_id
-            ),
-            DataSourceFilter::PpoiList(_) | DataSourceFilter::PpoiListBlock { .. } => assert_eq!(
-                inst.verification_mode,
-                VerificationMode::UpstreamAsserted,
-                "{} must use UpstreamAsserted",
-                inst.instance_id
-            ),
-        }
+        let want = if matches!(inst.data_source, DataSourceFilter::ChainTreeNumber(_)) {
+            VerificationMode::ChainRootHistory
+        } else {
+            VerificationMode::UpstreamAsserted
+        };
+        assert_eq!(inst.verification_mode, want, "{}", inst.instance_id);
     }
 }
 

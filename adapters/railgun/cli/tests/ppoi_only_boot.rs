@@ -12,6 +12,9 @@
     clippy::unwrap_used
 )]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,6 +23,7 @@ use std::time::Duration;
 
 use axum::routing::post;
 use axum::{Json, Router};
+use progress::until_done_or_stalled;
 use raven_railgun_cli::serve_production_multi::{
     chain_indexer_reason, load_options_from_toml, run_with_listener, BootstrapObserver,
     BootstrapView, MultiServeOptions,
@@ -34,15 +38,13 @@ use tokio::task::JoinHandle;
 
 const BEARER_TOKEN: &str = "ppoi-only-boot-token-padded-long";
 const OFAC_LIST_HEX: &str = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88";
-const STATUS: &str = "ppoi-status-ofac";
 const PATHS_BLOCK_0: &str = "ppoi-paths-ofac-0";
 const PATHS_BLOCK_1: &str = "ppoi-paths-ofac-1";
 const SHIPPED_ENDPOINT: &str = "mirror_endpoint = \"https://ppoi.fdi.network\"";
 const CHAIN_KEYS: [&str; 3] = ["rpc_url", "railgun_proxy", "start_block"];
 
 fn example() -> String {
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/mainnet-ppoi-7-instance.toml");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/mainnet-ppoi.toml");
     std::fs::read_to_string(path).expect("read the PPOI-only example")
 }
 
@@ -63,7 +65,7 @@ fn write_config(root: &Path, body: &str, endpoint: &str, global: &str) -> PathBu
             SHIPPED_ENDPOINT,
             &format!("mirror_endpoint = \"{endpoint}\"\n{global}"),
         )
-        .replace("/var/lib/raven-railgun/", &format!("{}/", root.display()))
+        .replace("/srv/raven/data/", &format!("{}/", root.display()))
         .replace("0.0.0.0:8080", "127.0.0.1:0")
         .replace("REPLACE_ME", BEARER_TOKEN);
     let path = root.join("config.toml");
@@ -91,7 +93,6 @@ fn commit_tree_instance(root: &Path) -> String {
     format!(
         "\n[[instance]]\nid = \"commit-tree-0\"\nrole = \"static\"\nencoder = \"per-node\"\n\
          tree_number = 0\ndata_dir = \"{}/commit-tree-0\"\n\
-         verification_mode = \"chain-root-history\"\n\
          data_source = {{ kind = \"indexer\", filter = {{ tree_number = 0 }} }}\n",
         root.display()
     )
@@ -274,11 +275,13 @@ async fn serving(booting: &mut Booting, observer: &BootstrapObserver) -> Bootstr
     panic!("the PPOI-only config never answered /v1/status");
 }
 
+/// A stop commits every instance, re-encoding its whole cell, and nothing observable moves while
+/// it does. A loaded full run has taken that past a minute, so the bound is the stall bound.
 async fn shut_down(booting: Booting) {
     let _ = booting.stop.send(());
-    tokio::time::timeout(Duration::from_secs(20), booting.server)
+    tokio::time::timeout(progress::STALL, booting.server)
         .await
-        .expect("shutdown timed out")
+        .expect("shutdown stalled")
         .expect("server task panicked")
         .expect("graceful shutdown");
 }
@@ -312,22 +315,19 @@ async fn feed(addr: SocketAddr) -> (u16, MirrorFeedView) {
     (code, feed)
 }
 
-async fn eventually<T>(
-    within: Duration,
-    what: &str,
-    mut probe: impl AsyncFnMut() -> Option<T>,
-) -> T {
-    let deadline = tokio::time::Instant::now() + within;
-    loop {
-        if let Some(found) = probe().await {
-            return found;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "never reached: {what}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+/// How far the feed and each instance have got: what moves while a sync is under way. Failures
+/// and the clock are left out, since a feed retrying a dead upstream changes both forever.
+async fn sync_progress(
+    addr: SocketAddr,
+    view: &BootstrapView,
+) -> (u64, u64, Option<u64>, Vec<usize>) {
+    let (_, feed) = feed(addr).await;
+    let rows = view
+        .instances
+        .iter()
+        .map(|instance| rows_under(view, instance.instance_id.as_str()))
+        .collect();
+    (feed.rows_held, feed.next_index, feed.upstream_rows, rows)
 }
 
 /// Every list route, in order, asked about `bc`. No `Authorization`: the read path is public.
@@ -337,18 +337,6 @@ async fn list_routes(addr: SocketAddr, bc: &str) -> Vec<(&'static str, reqwest::
     let get = |path: &str| client.get(format!("{base}/{OFAC_LIST_HEX}/{path}")).send();
     vec![
         (
-            "pois-per-list",
-            client
-                .post(format!("{base}/pois-per-list"))
-                .json(&json!({
-                    "listKeys": [OFAC_LIST_HEX],
-                    "blindedCommitmentDatas": [{ "blindedCommitment": bc }],
-                }))
-                .send()
-                .await
-                .expect("pois-per-list"),
-        ),
-        (
             "merkle-proofs",
             client
                 .post(format!("{base}/merkle-proofs"))
@@ -356,10 +344,6 @@ async fn list_routes(addr: SocketAddr, bc: &str) -> Vec<(&'static str, reqwest::
                 .send()
                 .await
                 .expect("merkle-proofs"),
-        ),
-        (
-            "status-header",
-            get("status-header").await.expect("status-header"),
         ),
         (
             "bc-to-idx-map",
@@ -409,8 +393,8 @@ async fn assert_every_list_route_refuses(addr: SocketAddr, bc: &str) {
 }
 
 /// Every route answers over the list upstream holds, one row per root in `roots`: its last row
-/// with its status and upstream's root, a row past it as absent, and every row in the index at
-/// its global position.
+/// with upstream's root, a row past it as absent, and every row in the index at its global
+/// position.
 async fn assert_list_routes_answer_the_whole_list(addr: SocketAddr, roots: &[[u8; 32]]) {
     let rows = u64::try_from(roots.len()).unwrap();
     let last = hex::encode(leaf_at(rows - 1));
@@ -424,13 +408,11 @@ async fn assert_list_routes_answer_the_whole_list(addr: SocketAddr, roots: &[[u8
         );
         response.json().await.unwrap_or(Value::Null)
     };
-    assert_eq!(body().await[&last][OFAC_LIST_HEX], "Valid");
     assert_eq!(
         body().await[0]["root"],
         hex::encode(roots[roots.len() - 1]),
         "the proof's root is the one upstream published for that row"
     );
-    body().await;
     let map = body().await;
     let entries = map["entries"].as_array().expect("entries");
     assert_eq!(entries.len(), roots.len());
@@ -448,10 +430,10 @@ async fn assert_list_routes_answer_the_whole_list(addr: SocketAddr, roots: &[[u8
         .await
         .into_iter()
         .next()
-        .expect("pois");
-    let pois: Value = response.json().await.expect("pois-per-list body");
+        .expect("merkle-proofs");
     assert_eq!(
-        pois[&past][OFAC_LIST_HEX], "Missing",
+        response.status(),
+        StatusCode::NOT_FOUND,
         "a row past the end of a list upstream has ended is absent"
     );
 }
@@ -487,27 +469,24 @@ fn the_ppoi_only_example_names_no_chain_setting_and_loads() {
         None
     );
     let list_key: [u8; 32] = hex::decode(OFAC_LIST_HEX).unwrap().try_into().unwrap();
-    let mut blocks = Vec::new();
-    let mut whole = 0;
-    for instance in &opts.instances {
-        match instance.data_source {
+    let blocks: Vec<u32> = opts
+        .instances
+        .iter()
+        .map(|instance| match instance.data_source {
             DataSourceFilter::PpoiListBlock {
                 list_key: key,
                 block,
-            } if key == list_key => {
-                blocks.push(block);
-            }
-            DataSourceFilter::PpoiList(key) if key == list_key => whole += 1,
+            } if key == list_key => block,
             other => panic!(
-                "{} is not on the OFAC list: {other:?}",
+                "{} is not a block of the OFAC list: {other:?}",
                 instance.instance_id.as_str()
             ),
-        }
-    }
+        })
+        .collect();
     assert_eq!(
-        (whole, blocks),
-        (1, vec![0, 1, 2, 3, 4, 5]),
-        "one status instance, six blocks"
+        blocks,
+        (0..7).collect::<Vec<u32>>(),
+        "seven blocks, the one the list reaches at row 393,216 included, and nothing else"
     );
 }
 
@@ -535,7 +514,7 @@ fn every_shipped_serve_config_loads_through_the_loader() {
             .unwrap_or_else(|e| panic!("{} does not load: {e:#}", path.display()));
         loaded.push(path.file_name().expect("file name").to_owned());
     }
-    for shipped in ["mainnet-6-instance.toml", "mainnet-ppoi-7-instance.toml"] {
+    for shipped in ["mainnet-6-instance.toml", "mainnet-ppoi.toml"] {
         assert!(
             loaded.iter().any(|name| name.as_os_str() == shipped),
             "{shipped} was not loaded: {loaded:?}"
@@ -676,6 +655,9 @@ fn a_config_that_reads_the_chain_is_refused_without_each_chain_setting() {
 /// upstream has not said where its list ends: each list route refuses through the coverage
 /// proof. Once the feed reaches the tip every route answers, with global indices, over block 1
 /// too, which the example declares ahead of the list and which holds nothing yet.
+///
+/// Every wait fails only once nothing moves: the apply is fsync-bound, so a loaded box slows a
+/// correct run without stopping it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_ppoi_only_example_boots_and_answers_list_routes_only_at_upstreams_tip() {
     const ROWS: u64 = 1_010;
@@ -688,17 +670,17 @@ async fn the_ppoi_only_example_boots_and_answers_list_routes_only_at_upstreams_t
         &endpoint,
         "mirror_backfill_interval_secs = 0",
     );
-    let (opts, observer) = narrowed(&config, &[STATUS, PATHS_BLOCK_0, PATHS_BLOCK_1]);
+    let (opts, observer) = narrowed(&config, &[PATHS_BLOCK_0, PATHS_BLOCK_1]);
     assert!(opts.rpc_url.is_empty() && opts.railgun_proxy.is_empty());
     let mut booting = boot(opts).await;
     let view = serving(&mut booting, &observer).await;
     let addr = booting.addr;
 
-    eventually(
-        Duration::from_secs(60),
-        "the first page applied",
-        async || (rows_under(&view, PATHS_BLOCK_0) == 501).then_some(()),
-    )
+    until_done_or_stalled("the first page applied", async || {
+        let progress = sync_progress(addr, &view).await;
+        let done = rows_under(&view, PATHS_BLOCK_0) == 501;
+        (progress, done.then_some(()))
+    })
     .await;
     let (_, part_way) = feed(addr).await;
     assert_eq!(
@@ -709,14 +691,14 @@ async fn the_ppoi_only_example_boots_and_answers_list_routes_only_at_upstreams_t
     assert_every_list_route_refuses(addr, &hex::encode(leaf_at(0))).await;
 
     release.send(true).expect("upstream listening");
-    let caught_up = eventually(
-        Duration::from_secs(90),
-        "the feed at upstream's tip",
-        async || {
-            let (code, view) = feed(addr).await;
-            (view.state == MirrorFeedState::CaughtUp).then_some((code, view))
-        },
-    )
+    let caught_up = until_done_or_stalled("the feed at upstream's tip", async || {
+        let progress = sync_progress(addr, &view).await;
+        let (code, feed) = feed(addr).await;
+        (
+            progress,
+            (feed.state == MirrorFeedState::CaughtUp).then_some((code, feed)),
+        )
+    })
     .await;
     assert_eq!(
         (
@@ -782,14 +764,10 @@ async fn a_ppoi_only_boot_dials_no_chain_rpc_and_mirrors_the_configured_chain() 
         0,
         "the indexer starts before the listener serves, so a dial would have landed by now"
     );
-    let asked = eventually(
-        Duration::from_secs(30),
-        "a page asked of upstream",
-        async || {
-            let asked = chains_asked.lock().clone();
-            (!asked.is_empty()).then_some(asked)
-        },
-    )
+    let asked = until_done_or_stalled("a page asked of upstream", async || {
+        let asked = chains_asked.lock().clone();
+        (asked.len(), (!asked.is_empty()).then_some(asked))
+    })
     .await;
     assert!(
         asked

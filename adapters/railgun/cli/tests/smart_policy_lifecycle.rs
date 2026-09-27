@@ -480,7 +480,6 @@ role = "static"
 encoder = "per-node"
 tree_number = 0
 data_dir = "/var/lib/raven-railgun/commit-tree-0"
-verification_mode = "chain-root-history"
 data_source = { kind = "indexer", filter = { tree_number = 0 } }
 "#;
 
@@ -541,7 +540,6 @@ role = "static"
 encoder = "per-node"
 tree_number = 0
 data_dir = "/var/lib/raven-railgun/commit-tree-0"
-verification_mode = "chain-root-history"
 data_source = { kind = "indexer", filter = { tree_number = 0 } }
 "#;
 

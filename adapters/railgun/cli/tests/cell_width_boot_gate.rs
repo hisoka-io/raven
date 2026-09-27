@@ -38,7 +38,7 @@ async fn serve_production_multi_rejects_an_illegal_global_record_size() {
     let config = write_single_instance_config(tmp.path(), NOTE_RECORD_BYTES, ROWS_PER_SHARD);
     let msg = boot_error(&config).await;
     // 328 induces 164 columns, off the power-of-two law; 512 is the next legal width.
-    for needle in ["328", "164", "512", "ppoi-status"] {
+    for needle in ["328", "164", "512", "leaf-bc-gate"] {
         assert!(
             msg.contains(needle),
             "rejection must name {needle} (width, columns, next legal width, instance): {msg}"
@@ -68,7 +68,6 @@ encoder = "per-list-path10"
 list_key = "{LIST_KEY_HEX}"
 record_size = 32
 data_dir = "{data_dir}/ppoi-paths-gate"
-verification_mode = "upstream-asserted"
 data_source = {{ kind = "mirror", list_key = "{LIST_KEY_HEX}", block = 0 }}
 "#,
         data_dir = tmp.path().display()
@@ -91,7 +90,7 @@ async fn serve_production_multi_rejects_an_under_width_rows_per_shard() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = write_single_instance_config(tmp.path(), 512, ROWS_PER_SHARD / 2);
     let msg = boot_error(&config).await;
-    for needle in ["1024", "2048", "ppoi-status-gate", "entries_per_shard"] {
+    for needle in ["1024", "2048", "leaf-bc-gate", "entries_per_shard"] {
         assert!(
             msg.contains(needle),
             "rejection must name {needle} (supplied rows, required rows, instance, config key): {msg}"
@@ -99,31 +98,33 @@ async fn serve_production_multi_rejects_an_under_width_rows_per_shard() {
     }
 }
 
+/// `per-leaf-bc` takes `[global].record_size` as given; every PPOI encoder pins its own width.
 fn write_single_instance_config(
     dir: &Path,
     record_size: usize,
     entries_per_shard: u32,
 ) -> std::path::PathBuf {
-    let list_key = "ef".repeat(32);
     let body = format!(
         r#"
 [global]
 bind = "127.0.0.1:0"
 token = "cell-width-boot-gate-token-padded"
+rpc_url = "http://127.0.0.1:1"
+railgun_proxy = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
 chain_id = 1
+start_block = 0
 mirror_endpoint = "http://127.0.0.1:1"
 record_size = {record_size}
 entries_per_shard = {entries_per_shard}
 use_flock = false
 
 [[instance]]
-id = "ppoi-status-gate"
+id = "leaf-bc-gate"
 role = "live"
-encoder = "per-list-status"
-list_key = "{list_key}"
-data_dir = "{data_dir}/ppoi-status-gate"
-verification_mode = "upstream-asserted"
-data_source = {{ kind = "mirror", list_key = "{list_key}", what = "status" }}
+encoder = "per-leaf-bc"
+tree_number = 0
+data_dir = "{data_dir}/leaf-bc-gate"
+data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
 "#,
         data_dir = dir.display()
     );

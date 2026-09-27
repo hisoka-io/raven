@@ -11,6 +11,9 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -19,6 +22,7 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
+use progress::until_done_or_stalled;
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_cli::serve_production_multi::{
     load_options_from_toml, run_with_listener, BootstrapObserver, BootstrapView, MultiServeOptions,
@@ -34,18 +38,16 @@ use raven_railgun_engine::orchestrator::{
 use raven_railgun_engine::persistence::{ConsumerEvent, InspirePersistence};
 use raven_railgun_engine::pir_table::PirTableEncoder;
 use raven_railgun_engine::session_pool::BoundedSessionStore;
-use raven_railgun_engine::InstanceRole;
 use raven_railgun_http::status::{MirrorFeedState, MirrorFeedView};
 use raven_railgun_http::HealthReadyResponse;
 use raven_railgun_persistence::{PpoiEventType, StoreLayout, WalEntryPayload};
-use raven_railgun_ppoi_mirror::{MirrorCursor, MirrorKind, PreflightFailure};
+use raven_railgun_ppoi_mirror::PreflightFailure;
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 const BEARER_TOKEN: &str = "mirror-preflight-boot-token-padded";
 const OFAC_LIST_HEX: &str = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88";
-const STATUS: &str = "ppoi-status-ofac";
 const PATHS_BLOCK_0: &str = "ppoi-paths-ofac-0";
 const PATHS_BLOCK_1: &str = "ppoi-paths-ofac-1";
 const SHIPPED_ENDPOINT: &str = "mirror_endpoint = \"https://ppoi.fdi.network\"";
@@ -127,7 +129,7 @@ fn shipped_ppoi_options_with(
         mirror_endpoint.starts_with("http://127.0.0.1:"),
         "mirror workers are enabled; the endpoint must be an in-process listener: {mirror_endpoint}"
     );
-    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/mainnet-6-instance.toml");
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/mainnet-ppoi.toml");
     let body = std::fs::read_to_string(example).expect("read the shipped example");
     assert_eq!(
         body.matches(SHIPPED_ENDPOINT).count(),
@@ -139,10 +141,7 @@ fn shipped_ppoi_options_with(
             SHIPPED_ENDPOINT,
             &format!("{SHIPPED_ENDPOINT}\n{global_line}"),
         )
-        .replace(
-            "/var/lib/raven-railgun/",
-            &format!("{}/", data_root.display()),
-        )
+        .replace("/srv/raven/data/", &format!("{}/", data_root.display()))
         .replace("REPLACE_ME", BEARER_TOKEN);
     let config = data_root.join("config.toml");
     std::fs::write(&config, body).expect("write config");
@@ -256,17 +255,13 @@ async fn boot_verdict(booting: &mut Booting) -> Boot {
         .expect("boot neither refused nor served inside twice the preflight bound")
 }
 
+/// A stop commits every instance, re-encoding its whole cell, and nothing observable moves while
+/// it does. A loaded full run has taken that past a minute, so the bound is the stall bound.
 async fn shut_down(booting: Booting) {
-    shut_down_within(booting, Duration::from_secs(20)).await;
-}
-
-/// A graceful stop commits each instance's snapshot, and a production cell holding a full block
-/// re-encodes and writes one, which a loaded box stretches well past [`shut_down`]'s bound.
-async fn shut_down_within(booting: Booting, within: Duration) {
     let _ = booting.stop.send(());
-    tokio::time::timeout(within, booting.server)
+    tokio::time::timeout(progress::STALL, booting.server)
         .await
-        .expect("shutdown timed out")
+        .expect("shutdown stalled")
         .expect("server task panicked")
         .expect("graceful shutdown");
 }
@@ -344,18 +339,12 @@ fn worker_pages(requests: &Requests) -> Vec<Value> {
 
 /// A worker asks for its first page as it spawns, and the next only a poll interval later.
 async fn first_worker_page(requests: &Requests) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(page) = worker_pages(requests).into_iter().next() {
-            return page;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "no mirror worker asked upstream for a page of the list; upstream saw {:?}",
-            requests.lock()
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    until_done_or_stalled("a mirror worker's first page", async || {
+        let seen = requests.lock().clone();
+        let page = worker_pages(requests).into_iter().next();
+        (seen, page)
+    })
+    .await
 }
 
 async fn leave_one_row_on_disk(data_root: &Path, instance_ids: &[&str]) {
@@ -412,18 +401,16 @@ async fn leave_rows_on_disk(data_root: &Path, instance_ids: &[&str], indices: &[
             .await
             .expect("mirror channel open");
     }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while !engine
-        .instances
-        .iter()
-        .all(|instance| rows_in(&instance.logical_store, &ofac_list()) == indices.len())
-    {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the row was never applied"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    until_done_or_stalled("the rows applied", async || {
+        let rows: Vec<usize> = engine
+            .instances
+            .iter()
+            .map(|instance| rows_in(&instance.logical_store, &ofac_list()))
+            .collect();
+        let done = rows.iter().all(|held| *held == indices.len());
+        (rows, done.then_some(()))
+    })
+    .await;
 
     for instance in &mut engine.instances {
         instance
@@ -454,8 +441,7 @@ fn leave_rows_committed(data_root: &Path, instance_ids: &[&str], rows: u64) -> I
             assert!(
                 matches!(
                     config.data_source,
-                    DataSourceFilter::PpoiList(_)
-                        | DataSourceFilter::PpoiListBlock { block: 0, .. }
+                    DataSourceFilter::PpoiListBlock { block: 0, .. }
                 ),
                 "fixture seeds from the list's first row: {config:?}"
             );
@@ -560,7 +546,7 @@ fn commit_rows(
 async fn a_node_holding_no_rows_refuses_to_boot_against_an_upstream_that_never_answers() {
     let data_root = tempfile::tempdir().expect("tempdir");
     let endpoint = upstream_that_never_answers().await;
-    let (opts, observer) = shipped_ppoi_options(data_root.path(), &[STATUS], &endpoint);
+    let (opts, observer) = shipped_ppoi_options(data_root.path(), &[PATHS_BLOCK_0], &endpoint);
     let mut booting = boot_multi(opts).await;
     bootstrapped(&observer, &mut booting).await;
 
@@ -578,10 +564,10 @@ async fn a_node_holding_no_rows_refuses_to_boot_against_an_upstream_that_never_a
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_holding_rows_boots_past_an_upstream_that_never_answers_and_counts_it() {
     let data_root = tempfile::tempdir().expect("tempdir");
-    leave_one_row_on_disk(data_root.path(), &[STATUS]).await;
+    leave_one_row_on_disk(data_root.path(), &[PATHS_BLOCK_0]).await;
 
     let endpoint = upstream_that_never_answers().await;
-    let (opts, observer) = shipped_ppoi_options(data_root.path(), &[STATUS], &endpoint);
+    let (opts, observer) = shipped_ppoi_options(data_root.path(), &[PATHS_BLOCK_0], &endpoint);
     let mut booting = boot_multi(opts).await;
     let view = bootstrapped(&observer, &mut booting)
         .await
@@ -610,23 +596,27 @@ async fn a_node_holding_rows_boots_past_an_upstream_that_never_answers_and_count
     shut_down(booting).await;
 }
 
-/// The list's only row lives under a path block; the status instance beside it holds none.
+/// Holding rows is the list's property: the block beside the one holding the only row holds
+/// none, and the node still comes up past a dead upstream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rows_held_only_by_a_block_instance_still_keep_the_node_up() {
+async fn rows_held_by_one_block_of_the_list_keep_the_node_up() {
     let data_root = tempfile::tempdir().expect("tempdir");
     leave_one_row_on_disk(data_root.path(), &[PATHS_BLOCK_0]).await;
 
     let endpoint = upstream_that_never_answers().await;
     let (opts, observer) =
-        shipped_ppoi_options(data_root.path(), &[STATUS, PATHS_BLOCK_0], &endpoint);
+        shipped_ppoi_options(data_root.path(), &[PATHS_BLOCK_0, PATHS_BLOCK_1], &endpoint);
     let mut booting = boot_multi(opts).await;
     let view = bootstrapped(&observer, &mut booting)
         .await
         .expect("restart bootstraps");
     assert_eq!(
-        (rows_under(&view, STATUS), rows_under(&view, PATHS_BLOCK_0)),
-        (0, 1),
-        "fixture: the list's only row must sit under the block instance"
+        (
+            rows_under(&view, PATHS_BLOCK_0),
+            rows_under(&view, PATHS_BLOCK_1)
+        ),
+        (1, 0),
+        "fixture: the list's only row must sit under block 0"
     );
 
     match boot_verdict(&mut booting).await {
@@ -642,24 +632,16 @@ async fn rows_held_only_by_a_block_instance_still_keep_the_node_up() {
     shut_down(booting).await;
 }
 
-/// A list past one depth-16 tree can only be held by block instances, so a config that
-/// declares nothing else still has to drive the feed. A spawn loop keyed on whole-list routes
-/// gives it no worker: boot comes up clean, serves its rows, and never asks upstream for a
-/// single row -- the outage this suite exists for, with no endpoint to blame. The preflight
-/// names the list as well, so only a worker's page proves the feed runs.
+/// A list held in blocks drives its feed from the row after the store's last: boot comes up
+/// clean and asks upstream for the rows it lacks. The preflight names the list as well, so only
+/// a worker's page proves the feed runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_list_declared_only_in_blocks_still_drives_its_mirror_feed() {
+async fn a_list_held_in_blocks_drives_its_mirror_feed_from_the_row_it_lacks() {
     let data_root = tempfile::tempdir().expect("tempdir");
     leave_one_row_on_disk(data_root.path(), &[PATHS_BLOCK_0]).await;
     let (endpoint, requests) = upstream_with_an_empty_list().await;
     let (opts, observer) =
         shipped_ppoi_options(data_root.path(), &[PATHS_BLOCK_0, PATHS_BLOCK_1], &endpoint);
-    assert!(
-        opts.instances
-            .iter()
-            .all(|instance| matches!(instance.data_source, DataSourceFilter::PpoiListBlock { .. })),
-        "fixture: no whole-list route may remain, or the old spawn loop would find one"
-    );
 
     let mut booting = boot_multi(opts).await;
     bootstrapped(&observer, &mut booting).await;
@@ -677,36 +659,29 @@ async fn a_list_declared_only_in_blocks_still_drives_its_mirror_feed() {
     shut_down(booting).await;
 }
 
-/// Instances on one list need not stand at the same row: this block was restored from an
-/// older snapshot, or added after the status instance had mirrored a row and persisted its
-/// cursor past it. A feed resumed from that cursor starts past the row the block lacks, and the
-/// block then refuses every later row as non-contiguous, for good.
+/// Blocks on one list need not stand at the same row: block 0 was restored from an older
+/// snapshot, or added after block 1 had rows. A feed resumed at the highest frontier starts past
+/// every row block 0 lacks, and they go unserved for good.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_instance_behind_the_rest_of_its_list_is_fed_from_the_row_it_lacks() {
+async fn a_block_behind_the_rest_of_its_list_is_fed_from_the_row_it_lacks() {
     let data_root = tempfile::tempdir().expect("tempdir");
-    leave_one_row_on_disk(data_root.path(), &[STATUS]).await;
+    let block_1 = LEAVES_PER_PPOI_BLOCK;
+    leave_rows_on_disk(data_root.path(), &[PATHS_BLOCK_1], &[block_1, block_1 + 1]).await;
     let (endpoint, requests) = upstream_with_an_empty_list().await;
     let (opts, observer) =
-        shipped_ppoi_options(data_root.path(), &[STATUS, PATHS_BLOCK_0], &endpoint);
-    let status_dir = opts
-        .instances
-        .iter()
-        .find(|instance| instance.instance_id.as_str() == STATUS)
-        .expect("the status instance is declared")
-        .data_dir
-        .clone();
-    MirrorCursor::new(status_dir, MirrorKind::Status, 0)
-        .persist(1)
-        .expect("leave the cursor a worker on the status instance persists");
+        shipped_ppoi_options(data_root.path(), &[PATHS_BLOCK_0, PATHS_BLOCK_1], &endpoint);
 
     let mut booting = boot_multi(opts).await;
     let view = bootstrapped(&observer, &mut booting)
         .await
         .expect("restart bootstraps");
     assert_eq!(
-        (rows_under(&view, STATUS), rows_under(&view, PATHS_BLOCK_0)),
-        (1, 0),
-        "fixture: the block must stand behind the status instance"
+        (
+            rows_under(&view, PATHS_BLOCK_0),
+            rows_under(&view, PATHS_BLOCK_1)
+        ),
+        (0, 2),
+        "fixture: block 0 must stand behind block 1"
     );
     match boot_verdict(&mut booting).await {
         Boot::Serving => {}
@@ -729,17 +704,8 @@ async fn an_instance_behind_the_rest_of_its_list_is_fed_from_the_row_it_lacks() 
 async fn an_answering_upstream_is_asked_once_per_list_key_however_many_instances_share_it() {
     let data_root = tempfile::tempdir().expect("tempdir");
     let (endpoint, requests) = upstream_with_an_empty_list().await;
-    let (mut opts, observer) = shipped_ppoi_options(
-        data_root.path(),
-        &[STATUS, PATHS_BLOCK_0, PATHS_BLOCK_1],
-        &endpoint,
-    );
-    for instance in &mut opts.instances {
-        if let DataSourceFilter::PpoiListBlock { list_key, block: 0 } = instance.data_source {
-            instance.data_source = DataSourceFilter::PpoiList(list_key);
-            instance.role = InstanceRole::Live;
-        }
-    }
+    let (opts, observer) =
+        shipped_ppoi_options(data_root.path(), &[PATHS_BLOCK_0, PATHS_BLOCK_1], &endpoint);
     let mut booting = boot_multi(opts).await;
     bootstrapped(&observer, &mut booting).await;
 
@@ -860,21 +826,19 @@ async fn the_backfill_setting_pages_a_cold_sync_back_to_back_then_returns_to_the
     assert_eq!(opts.mirror_backfill_interval_secs, Some(0));
 
     let mut booting = boot_multi(opts).await;
-    bootstrapped(&observer, &mut booting).await;
+    let view = bootstrapped(&observer, &mut booting)
+        .await
+        .expect("boot bootstraps");
     match boot_verdict(&mut booting).await {
         Boot::Serving => {}
         Boot::Refused(refusal) => panic!("an answering upstream was refused: {refusal}"),
     }
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while timed_worker_pages(&requests).len() < 3 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "a cold sync of three pages did not finish: {:?}",
-            timed_worker_pages(&requests)
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    until_done_or_stalled("a cold sync of three pages", async || {
+        let asked = timed_worker_pages(&requests).len();
+        ((asked, rows_applied(&view)), (asked >= 3).then_some(()))
+    })
+    .await;
     let pages = timed_worker_pages(&requests);
     let starts: Vec<u64> = pages.iter().map(|(_, start)| *start).collect();
     assert_eq!(
@@ -1014,24 +978,38 @@ async fn readiness(addr: SocketAddr) -> (u16, HealthReadyResponse) {
     (code, response.json().await.expect("readiness body"))
 }
 
-/// Polls readiness until the list's feed satisfies `done`, and returns that answer.
-async fn readiness_once(
+/// Rows each instance holds: progress the feed's own view reports only once all have them.
+fn rows_applied(view: &BootstrapView) -> Vec<usize> {
+    view.instances
+        .iter()
+        .map(|instance| local_rows(instance, &ofac_list()))
+        .collect()
+}
+
+/// How far each feed readiness reports has got. Failures and the clock are left out: a feed
+/// retrying a dead upstream changes both forever without moving.
+fn feed_progress(body: &HealthReadyResponse) -> Vec<(u64, u64, Option<u64>)> {
+    body.mirror_feeds
+        .iter()
+        .map(|feed| (feed.rows_held, feed.next_index, feed.upstream_rows))
+        .collect()
+}
+
+/// Polls readiness until the list's feed satisfies `done`, and returns that answer. Fails only
+/// when neither the feed nor any instance's rows move for [`progress::STALL`].
+async fn readiness_until(
     addr: SocketAddr,
-    within: Duration,
+    view: &BootstrapView,
+    what: &str,
     done: impl Fn(&MirrorFeedView) -> bool,
 ) -> (u16, HealthReadyResponse) {
-    let deadline = tokio::time::Instant::now() + within;
-    loop {
+    until_done_or_stalled(what, async || {
         let (code, body) = readiness(addr).await;
-        if body.mirror_feeds.iter().any(&done) {
-            return (code, body);
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "readiness never reached the awaited feed state: {code} {body:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+        let progress = (feed_progress(&body), rows_applied(view));
+        let reached = body.mirror_feeds.iter().any(&done);
+        (progress, reached.then_some((code, body)))
+    })
+    .await
 }
 
 fn start_indices(requests: &Requests) -> Vec<u64> {
@@ -1056,7 +1034,7 @@ async fn a_ppoi_only_boot_asks_for_each_page_once_and_fills_every_instance_on_th
     let (endpoint, requests) = upstream_holding_rooted(ROWS).await;
     let (opts, observer) = shipped_ppoi_options_with(
         data_root.path(),
-        &[STATUS, PATHS_BLOCK_0, PATHS_BLOCK_1],
+        &[PATHS_BLOCK_0, PATHS_BLOCK_1],
         &endpoint,
         "mirror_backfill_interval_secs = 0",
     );
@@ -1069,7 +1047,7 @@ async fn a_ppoi_only_boot_asks_for_each_page_once_and_fills_every_instance_on_th
         Boot::Refused(refusal) => panic!("an answering upstream was refused: {refusal}"),
     }
 
-    let (code, body) = readiness_once(booting.addr, Duration::from_secs(60), |feed| {
+    let (code, body) = readiness_until(booting.addr, &view, "the feed caught up", |feed| {
         feed.state == MirrorFeedState::CaughtUp
     })
     .await;
@@ -1081,11 +1059,10 @@ async fn a_ppoi_only_boot_asks_for_each_page_once_and_fills_every_instance_on_th
     );
     assert_eq!(
         (
-            rows_under(&view, STATUS),
             rows_under(&view, PATHS_BLOCK_0),
             rows_under(&view, PATHS_BLOCK_1)
         ),
-        (1_010, 1_010, 0),
+        (1_010, 0),
         "every instance holds the rows its reach covers, and only those"
     );
     let (paging, polling): (Vec<u64>, Vec<u64>) = start_indices(&requests)
@@ -1111,11 +1088,10 @@ async fn a_ppoi_only_boot_asks_for_each_page_once_and_fills_every_instance_on_th
     // What the trigger promises: stopped once caught up, the data dirs hold every row upstream had.
     assert_eq!(
         (
-            recovered_rows(data_root.path(), STATUS),
             recovered_rows(data_root.path(), PATHS_BLOCK_0),
             recovered_rows(data_root.path(), PATHS_BLOCK_1)
         ),
-        (ROWS, ROWS, 0)
+        (ROWS, 0)
     );
 }
 
@@ -1162,14 +1138,16 @@ async fn a_list_that_has_applied_nothing_is_not_ready_although_upstream_answers(
     let (endpoint, requests) = upstream_with_an_empty_list().await;
     let (opts, observer) = shipped_ppoi_options(data_root.path(), &[PATHS_BLOCK_0], &endpoint);
     let mut booting = boot_multi(opts).await;
-    bootstrapped(&observer, &mut booting).await;
+    let view = bootstrapped(&observer, &mut booting)
+        .await
+        .expect("boot bootstraps");
     match boot_verdict(&mut booting).await {
         Boot::Serving => {}
         Boot::Refused(refusal) => panic!("an answering upstream was refused: {refusal}"),
     }
     first_worker_page(&requests).await;
 
-    let (code, body) = readiness_once(booting.addr, Duration::from_secs(20), |feed| {
+    let (code, body) = readiness_until(booting.addr, &view, "upstream's empty answer", |feed| {
         feed.upstream_rows == Some(0)
     })
     .await;
@@ -1199,13 +1177,15 @@ async fn a_node_holding_rows_stays_ready_while_upstream_refuses_and_says_so() {
     let endpoint = upstream_answering_500().await;
     let (opts, observer) = shipped_ppoi_options(data_root.path(), &[PATHS_BLOCK_0], &endpoint);
     let mut booting = boot_multi(opts).await;
-    bootstrapped(&observer, &mut booting).await;
+    let view = bootstrapped(&observer, &mut booting)
+        .await
+        .expect("boot bootstraps");
     match boot_verdict(&mut booting).await {
         Boot::Serving => {}
         Boot::Refused(refusal) => panic!("rows held, yet boot was refused: {refusal}"),
     }
 
-    let (code, body) = readiness_once(booting.addr, Duration::from_secs(20), |feed| {
+    let (code, body) = readiness_until(booting.addr, &view, "an upstream failure", |feed| {
         feed.consecutive_failures > 0
     })
     .await;
@@ -1226,59 +1206,11 @@ async fn a_node_holding_rows_stays_ready_while_upstream_refuses_and_says_so() {
     shut_down(booting).await;
 }
 
-/// A block's rows are list-wide indices from its block's first, and the store alone says where
-/// they end. A sidecar there -- torn, written ahead of rows that never reached the WAL, behind
-/// them, or holding the block-local count -- cannot move the resume point.
+/// Across a block boundary from one feed: block 0 fills to its 65,536 rows and the feed carries
+/// on into block 1 at local row 0 with that block's own roots, readiness up past 65,536 rows.
+/// Every page is still asked for once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn no_sidecar_a_block_instance_leaves_behind_moves_where_its_feed_resumes() {
-    let data_root = tempfile::tempdir().expect("tempdir");
-    let block_1 = raven_railgun_engine::orchestrator::LEAVES_PER_PPOI_BLOCK;
-    leave_rows_on_disk(data_root.path(), &[PATHS_BLOCK_1], &[block_1, block_1 + 1]).await;
-    let frontier = u64::from(block_1) + 2;
-
-    let sidecars: [(&str, Vec<u8>); 4] = [
-        ("torn", vec![0xAB; 3]),
-        ("ahead", 5_000_000u64.to_le_bytes().to_vec()),
-        ("behind", 0u64.to_le_bytes().to_vec()),
-        ("block-local", 2u64.to_le_bytes().to_vec()),
-    ];
-    for (case, bytes) in sidecars {
-        let (endpoint, requests) = upstream_with_an_empty_list().await;
-        let (opts, observer) = shipped_ppoi_options(data_root.path(), &[PATHS_BLOCK_1], &endpoint);
-        let data_dir = opts
-            .instances
-            .first()
-            .expect("the block instance is declared")
-            .data_dir
-            .clone();
-        for kind in [MirrorKind::Status, MirrorKind::Path] {
-            std::fs::write(data_dir.join(kind.sidecar_filename()), &bytes)
-                .expect("leave a sidecar behind");
-        }
-        let mut booting = boot_multi(opts).await;
-        let view = bootstrapped(&observer, &mut booting)
-            .await
-            .expect("restart bootstraps");
-        assert_eq!(rows_under(&view, PATHS_BLOCK_1), 2, "{case}: fixture");
-        match boot_verdict(&mut booting).await {
-            Boot::Serving => {}
-            Boot::Refused(refusal) => panic!("{case}: rows held, yet refused: {refusal}"),
-        }
-        let page = first_worker_page(&requests).await;
-        assert_eq!(
-            page.pointer("/params/startIndex"),
-            Some(&json!(frontier)),
-            "{case}: the feed must resume at the list-wide row after the store's last: {page}"
-        );
-        shut_down(booting).await;
-    }
-}
-
-/// Across a block boundary from one feed: block 0 fills to its 65,536 rows, the feed carries on
-/// into block 1 at local row 0 with that block's own roots, and the whole-list status instance
-/// stops at its one-tree wall. Every page is still asked for once.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "cost: about 330,000 fsynced WAL appends, minutes; run by hand when the feed or router changes"]
+#[ignore = "cost: a cold sync of 66,546 rows into two production cells, tens of minutes on a loaded box, past nextest's kill; run by hand, as the test binary with --ignored, when the feed or router changes"]
 async fn one_feed_fills_block_0_and_carries_on_into_block_1() {
     let block = u64::from(raven_railgun_engine::orchestrator::LEAVES_PER_PPOI_BLOCK);
     let rows = block + 1_010;
@@ -1286,7 +1218,7 @@ async fn one_feed_fills_block_0_and_carries_on_into_block_1() {
     let (endpoint, requests) = upstream_holding_rooted(rows).await;
     let (opts, observer) = shipped_ppoi_options_with(
         data_root.path(),
-        &[STATUS, PATHS_BLOCK_0, PATHS_BLOCK_1],
+        &[PATHS_BLOCK_0, PATHS_BLOCK_1],
         &endpoint,
         "mirror_backfill_interval_secs = 0",
     );
@@ -1299,21 +1231,21 @@ async fn one_feed_fills_block_0_and_carries_on_into_block_1() {
         Boot::Refused(refusal) => panic!("an answering upstream was refused: {refusal}"),
     }
 
-    let (_, body) = readiness_once(booting.addr, Duration::from_mins(30), |feed| {
+    let (code, body) = readiness_until(booting.addr, &view, "the feed caught up", |feed| {
         feed.state == MirrorFeedState::CaughtUp
     })
     .await;
+    assert_eq!(code, 200, "ready past 65,536 rows: {body:?}");
     let feed = body.mirror_feeds.first().expect("one list");
     assert_eq!((feed.rows_held, feed.upstream_rows), (rows, Some(rows)));
     let full = usize::try_from(block).expect("block rows");
     assert_eq!(
         (
-            rows_under(&view, STATUS),
             rows_under(&view, PATHS_BLOCK_0),
             rows_under(&view, PATHS_BLOCK_1)
         ),
-        (full, full, 1_010),
-        "block 0 full, block 1 carrying the rest, the status instance at its wall"
+        (full, 1_010),
+        "block 0 full, block 1 carrying the rest"
     );
     let (paging, polling): (Vec<u64>, Vec<u64>) = start_indices(&requests)
         .into_iter()
@@ -1387,9 +1319,11 @@ fn page_bounds(requests: &Requests) -> Vec<(u64, u64)> {
 }
 
 /// The stop through the production boot, on a node six rows short of the last row its blocks
-/// declare: the shipped status instance and block 0, fed from an upstream holding rows past
-/// block 0. The feed asks for the six and no further, and readiness names block 1. Declared and
-/// restarted, block 1 is fed from its first row.
+/// declare: the shipped block 0, fed from an upstream holding rows past it. The feed asks for the
+/// six and no further, readiness names block 1, and no list route answers for a row no declared
+/// block holds. Declared and restarted, block 1 is fed from its first row, readiness is up past
+/// 65,536 rows, and the list routes answer a row of block 1 at its global index from block 1's
+/// own store.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_feed_stops_at_the_last_declared_row_names_the_next_block_and_feeds_it_once_declared() {
     let block = u64::from(LEAVES_PER_PPOI_BLOCK);
@@ -1397,14 +1331,16 @@ async fn a_feed_stops_at_the_last_declared_row_names_the_next_block_and_feeds_it
     let held = block - 6;
     let beyond = 10;
     let data_root = tempfile::tempdir().expect("tempdir");
-    let tree = leave_rows_committed(data_root.path(), &[STATUS, PATHS_BLOCK_0], held);
+    let tree = leave_rows_committed(data_root.path(), &[PATHS_BLOCK_0], held);
     let roots = roots_past(tree, held, beyond);
+    let block_1_root = *roots
+        .get(&(block + beyond - 1))
+        .expect("block 1's last root");
     let (endpoint, requests) =
         upstream_answering(move |index| roots.get(&index).copied(), Duration::ZERO).await;
 
-    let (booting, view) = serving(data_root.path(), &[STATUS, PATHS_BLOCK_0], &endpoint).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    let (code, body) = loop {
+    let (booting, view) = serving(data_root.path(), &[PATHS_BLOCK_0], &endpoint).await;
+    let (code, body) = until_done_or_stalled("block 0 filled and the feed stopped", async || {
         let pages = page_bounds(&requests);
         assert!(
             pages.iter().all(|&(_, end)| end < block),
@@ -1415,16 +1351,12 @@ async fn a_feed_stops_at_the_last_declared_row_names_the_next_block_and_feeds_it
             .mirror_feeds
             .iter()
             .any(|feed| feed.state == MirrorFeedState::Stopped);
-        let applied = rows_under(&view, STATUS) == full && rows_under(&view, PATHS_BLOCK_0) == full;
-        if stopped && applied && !body.router_unrouted_targets.is_empty() {
-            break (code, body);
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the feed never filled block 0, stopped and named a block: {code} {body:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+        let applied = rows_under(&view, PATHS_BLOCK_0) == full;
+        let progress = (feed_progress(&body), rows_applied(&view), pages.len());
+        let done = stopped && applied && !body.router_unrouted_targets.is_empty();
+        (progress, done.then_some((code, body)))
+    })
+    .await;
     assert_eq!(code, 503, "{body:?}");
     assert_eq!(
         body.router_unrouted_targets,
@@ -1441,25 +1373,23 @@ async fn a_feed_stops_at_the_last_declared_row_names_the_next_block_and_feeds_it
         [(held, block - 1)],
         "one page, cut at the last row a declared block holds"
     );
-    shut_down_within(booting, Duration::from_mins(2)).await;
+    let (status, _) = merkle_proof(booting.addr, block).await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a proof for a row no declared block holds must not be served"
+    );
+    shut_down(booting).await;
 
     let asked = worker_pages(&requests).len();
-    let (booting, view) = serving(
-        data_root.path(),
-        &[STATUS, PATHS_BLOCK_0, PATHS_BLOCK_1],
-        &endpoint,
-    )
-    .await;
+    let (booting, view) =
+        serving(data_root.path(), &[PATHS_BLOCK_0, PATHS_BLOCK_1], &endpoint).await;
     let fed = usize::try_from(beyond).expect("rows");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while rows_under(&view, PATHS_BLOCK_1) < fed {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the declared block was never fed: {}",
-            rows_under(&view, PATHS_BLOCK_1)
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let (code, body) = readiness_until(booting.addr, &view, "block 1 fed and caught up", |feed| {
+        feed.state == MirrorFeedState::CaughtUp
+    })
+    .await;
+    assert_eq!(code, 200, "ready past 65,536 rows: {body:?}");
     assert_eq!(
         page_bounds(&requests).get(asked).map(|&(start, _)| start),
         Some(block),
@@ -1472,24 +1402,81 @@ async fn a_feed_stops_at_the_last_declared_row_names_the_next_block_and_feeds_it
         ),
         (full, fed)
     );
-    let (_, body) = readiness(booting.addr).await;
     assert!(
         !body
             .router_unrouted_targets
             .contains(&format!("list:{OFAC_LIST_HEX}:block:1")),
         "a delivery to the declared block clears its mark: {body:?}"
     );
-    shut_down_within(booting, Duration::from_mins(2)).await;
+
+    assert_row_answered_from_its_block(booting.addr, block, block_1_root).await;
+    shut_down(booting).await;
 }
 
-/// Where a cold sync runs out of declared blocks, through the production boot: the shipped status
-/// instance and block 0 fed at the backfill setting from an upstream holding rows past block 0.
-/// The feed fills both instances, never asks for a row at or past 65,536, stops, and readiness
-/// names block 1 until an operator declares it. The fill is also the one-block cold-sync
-/// measurement, printed with each instance's commit count and the graceful stop that commits
-/// the static block.
+/// List row `index`, past block 0, is answered by the block holding it: its proof ends on that
+/// block's `root`, which block 0's tree over the same rows does not have, and the index carries
+/// it at its global position rather than the block-local one.
+async fn assert_row_answered_from_its_block(addr: SocketAddr, index: u64, root: [u8; 32]) {
+    let (status, proof) = merkle_proof(addr, index).await;
+    assert_eq!(status, StatusCode::OK, "{proof}");
+    assert_eq!(
+        (
+            proof.pointer("/0/leaf").and_then(Value::as_str),
+            proof.pointer("/0/root").and_then(Value::as_str)
+        ),
+        (
+            Some(hex::encode(leaf_at(index)).as_str()),
+            Some(hex::encode(root).as_str())
+        ),
+        "the proof must come from the block holding the row: {proof}"
+    );
+    let map: Value = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/v1/poi/{OFAC_LIST_HEX}/bc-to-idx-map"
+        ))
+        .send()
+        .await
+        .expect("bc-to-idx-map")
+        .json()
+        .await
+        .expect("bc-to-idx-map body");
+    let bc = hex::encode(leaf_at(index));
+    let position = map
+        .get("entries")
+        .and_then(Value::as_array)
+        .expect("entries")
+        .iter()
+        .find(|entry| entry.get("bc").and_then(Value::as_str) == Some(bc.as_str()))
+        .and_then(|entry| entry.get("idx").and_then(Value::as_u64));
+    assert_eq!(
+        position,
+        Some(index),
+        "the index carries the global position, not the block-local one: {map}"
+    );
+}
+
+/// `POST /v1/poi/merkle-proofs` for list row `index`, uncredentialed as a wallet sends it.
+async fn merkle_proof(addr: SocketAddr, index: u64) -> (StatusCode, Value) {
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/poi/merkle-proofs"))
+        .json(&json!({
+            "listKey": OFAC_LIST_HEX,
+            "blindedCommitments": [hex::encode(leaf_at(index))],
+        }))
+        .send()
+        .await
+        .expect("merkle-proofs");
+    let status = StatusCode::from_u16(response.status().as_u16()).expect("status");
+    (status, response.json().await.unwrap_or(Value::Null))
+}
+
+/// Where a cold sync runs out of declared blocks, through the production boot: the shipped
+/// block 0 fed at the backfill setting from an upstream holding rows past it. The feed fills the
+/// block, never asks for a row at or past 65,536, stops, and readiness names block 1 until an
+/// operator declares it. The fill is also the one-block cold-sync measurement, printed with the
+/// block's commit count and the graceful stop that commits the static block.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "cost: about 262,000 fsynced WAL appends, past nextest's 300 s kill; run by hand, as the test binary with --ignored, when the feed, router or commit policy changes"]
+#[ignore = "cost: a cold sync of 65,536 rows into one production cell, minutes; run by hand, as the test binary with --ignored, when the feed, router or commit policy changes"]
 #[allow(clippy::print_stderr)]
 async fn a_cold_sync_stops_where_the_declared_blocks_end_and_names_the_next() {
     let block = u64::from(raven_railgun_engine::orchestrator::LEAVES_PER_PPOI_BLOCK);
@@ -1498,7 +1485,7 @@ async fn a_cold_sync_stops_where_the_declared_blocks_end_and_names_the_next() {
     let (endpoint, requests) = upstream_holding_rooted(rows).await;
     let (opts, observer) = shipped_ppoi_options_with(
         data_root.path(),
-        &[STATUS, PATHS_BLOCK_0],
+        &[PATHS_BLOCK_0],
         &endpoint,
         "mirror_backfill_interval_secs = 0",
     );
@@ -1520,36 +1507,27 @@ async fn a_cold_sync_stops_where_the_declared_blocks_end_and_names_the_next() {
             .max()
             .unwrap_or(0)
     };
-    let deadline = began + Duration::from_mins(30);
     let mut applied = None;
-    loop {
+    until_done_or_stalled("block 0 filled and the feed stopped", async || {
         assert!(
             furthest_asked() < block,
             "the feed asked upstream for row {} with no block declared to hold it",
             furthest_asked()
         );
-        if applied.is_none()
-            && rows_under(&view, STATUS) == full
-            && rows_under(&view, PATHS_BLOCK_0) == full
-        {
+        if applied.is_none() && rows_under(&view, PATHS_BLOCK_0) == full {
             applied = Some(began.elapsed());
         }
-        let (code, body) = readiness(booting.addr).await;
+        let (_, body) = readiness(booting.addr).await;
         let stopped = body
             .mirror_feeds
             .iter()
             .any(|feed| feed.state == MirrorFeedState::Stopped);
-        if applied.is_some() && stopped {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "block 0 never filled, or the feed never stopped: {code} {body:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+        let progress = (feed_progress(&body), rows_applied(&view));
+        (progress, (applied.is_some() && stopped).then_some(()))
+    })
+    .await;
     // The feed records its stop a moment before it marks the block.
-    let (code, body) = readiness_once(booting.addr, Duration::from_secs(5), |_| {
+    let (code, body) = readiness_until(booting.addr, &view, "block 1 named", |_| {
         !raven_railgun_engine::orchestrator::router_unrouted_targets().is_empty()
     })
     .await;
@@ -1560,7 +1538,7 @@ async fn a_cold_sync_stops_where_the_declared_blocks_end_and_names_the_next() {
         .collect();
     eprintln!(
         "one-block cold sync at mirror_backfill_interval_secs = 0: {block} rows applied to \
-         {STATUS} and {PATHS_BLOCK_0} in {:?}; commits {commits:?}; {} upstream requests",
+         {PATHS_BLOCK_0} in {:?}; commits {commits:?}; {} upstream requests",
         applied.expect("applied"),
         requests.lock().len()
     );
@@ -1595,21 +1573,19 @@ async fn a_cold_sync_stops_where_the_declared_blocks_end_and_names_the_next() {
 /// the backfill setting from an upstream holding the list at its measured row count and answering
 /// each page after the measured live round trip, so fetch and apply overlap as they would against
 /// the real one. Prints the wall clock to caught up and the graceful stop that commits the static
-/// blocks. Blocks 0-4 fill, block 5 holds the rest, and the status instance stops at its one tree.
+/// blocks. Blocks 0-4 fill, block 5 holds the rest, and block 6 stays empty.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "cost: about 2.9 million fsynced WAL appends in seven production cells, tens of minutes; run by hand, as the test binary with --ignored, when the feed, router, commit policy or list size changes"]
+#[ignore = "cost: a cold sync of 358,344 rows into seven production cells, tens of minutes; run by hand, as the test binary with --ignored, when the feed, router, commit policy or list size changes"]
 #[allow(clippy::print_stderr)]
 async fn a_cold_sync_of_the_whole_shipped_list_at_the_live_round_trip() {
     // Upstream's row count at 2026-09-20T08:14:13Z, and its round trip for a full page.
     const ROWS: u64 = 358_344;
     const ROUND_TRIP: Duration = Duration::from_millis(1_050);
     let block = u64::from(raven_railgun_engine::orchestrator::LEAVES_PER_PPOI_BLOCK);
-    let blocks: Vec<String> = (0..6)
+    let blocks: Vec<String> = (0..7)
         .map(|index| format!("ppoi-paths-ofac-{index}"))
         .collect();
-    let ids: Vec<&str> = std::iter::once(STATUS)
-        .chain(blocks.iter().map(String::as_str))
-        .collect();
+    let ids: Vec<&str> = blocks.iter().map(String::as_str).collect();
     let data_root = tempfile::tempdir().expect("tempdir");
     let (endpoint, requests) = upstream_holding_rooted_after(ROWS, ROUND_TRIP).await;
     let (opts, observer) = shipped_ppoi_options_with(
@@ -1627,7 +1603,7 @@ async fn a_cold_sync_of_the_whole_shipped_list_at_the_live_round_trip() {
         Boot::Refused(refusal) => panic!("an answering upstream was refused: {refusal}"),
     }
     let began = std::time::Instant::now();
-    let (_, body) = readiness_once(booting.addr, Duration::from_hours(3), |feed| {
+    let (_, body) = readiness_until(booting.addr, &view, "the whole list caught up", |feed| {
         feed.state == MirrorFeedState::CaughtUp
     })
     .await;
@@ -1637,7 +1613,7 @@ async fn a_cold_sync_of_the_whole_shipped_list_at_the_live_round_trip() {
     let full = usize::try_from(block).expect("block rows");
     let held: Vec<usize> = ids.iter().map(|id| rows_under(&view, id)).collect();
     let last = usize::try_from(ROWS - 5 * block).expect("rows");
-    assert_eq!(held, [full, full, full, full, full, full, last]);
+    assert_eq!(held, [full, full, full, full, full, last, 0]);
     let (paging, polling): (Vec<u64>, Vec<u64>) = start_indices(&requests)
         .into_iter()
         .partition(|start| *start < ROWS);
@@ -1650,7 +1626,7 @@ async fn a_cold_sync_of_the_whole_shipped_list_at_the_live_round_trip() {
         .map(|instance| instance.metrics.lock().commits_fired)
         .collect();
     eprintln!(
-        "whole-list cold sync at mirror_backfill_interval_secs = 0 and a {ROUND_TRIP:?} round \
+        "full-list cold sync at mirror_backfill_interval_secs = 0 and a {ROUND_TRIP:?} round \
          trip: {ROWS} rows, {} pages, caught up in {caught_up:?}; commits {commits:?}",
         pages.len()
     );

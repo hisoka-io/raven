@@ -27,8 +27,8 @@ Scope of the blindness is bounded and documented: PIR hides which row inside a s
 Currently one: **Railgun**.
 
 - Uses InsPIRe for both static and dynamic state.
-- Blue-green rebuild pattern keeps PPOI status, PPOI paths, and commit-tree paths fresh against live chain head.
-- Drop-in `POINodeInterface` for the Railgun wallet stack.
+- Serves PPOI list paths mirrored from the upstream PPOI node, in 65,536-row blocks, and commit-tree paths indexed from the chain.
+- A `POINodeInterface` for the Railgun engine ([SDK](./adapters/railgun/sdk/README.md)): it answers PPOI status on the device from a list index it syncs from the Raven server, and fetches PPOI paths from that server by PIR. Proof submission and merkleroot validation still go to the upstream PPOI node in plaintext, and so does the root-pin fetch that checks each path (to `pinUpstream`, the upstream node by default): it names the note's 65,536-row block unless `ppoiPinnedRoots` is preloaded.
 
 Live demo: <https://demo.railgun.hisoka.io/>
 
