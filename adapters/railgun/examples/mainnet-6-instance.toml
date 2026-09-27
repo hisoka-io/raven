@@ -16,7 +16,8 @@
 [global]
 bind = "0.0.0.0:8080"
 # Bearer token, from EXACTLY ONE of: `token` (inline), `token_file`, or the
-# RAVEN_BEARER_TOKEN environment variable. Zero or two sources is a boot error.
+# RAVEN_BEARER_TOKEN environment variable. Two sources is a boot error; zero is one
+# unless /metrics is public (`metrics_public` or --metrics-public).
 # The literal "REPLACE_ME" is rejected from every source; generate via
 # `openssl rand -hex 32`.
 #

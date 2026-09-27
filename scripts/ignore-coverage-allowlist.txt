@@ -61,16 +61,12 @@ crates/inspire/benches/solinas_microbench.rs::microbench_solinas_forward_inverse
 crates/inspire/benches/solinas_microbench.rs::microbench_solinas_pointwise_all_variants
 
 # Added 2026-09-19. Each of these is uncovered BY DESIGN, not by neglect:
-#  - the frozen-block sync and the whole-list root oracle read a live upstream PPOI aggregator
-#    over the network, not Raven's deployment; a per-push lane would put CI traffic on that
-#    aggregator, and a workflow_dispatch lane is the better home for them. The whole-list
-#    oracle (added 2026-09-25) pages the full list, about 720
-#    requests, and takes its base from RAVEN_PPOI_UPSTREAM_BASE, so no lane reaches it by
-#    accident; its stub-backed twin runs in the per-push cli test shard.
+#  - the capture root oracle cold-syncs a recorded upstream list capture, tens of minutes, and
+#    takes the capture folder from PPOI_REPLAY_CAPTURE, which no lane sets; the capture is not
+#    in the repository.
 #  - the fixture generator WRITES the fixture bytes it pins. Running it in a lane would
 #    overwrite the evidence the V7 layout test exists to check.
-adapters/railgun/cli/tests/ppoi_real_frozen_block.rs::first_real_frozen_block_sync_retains_metadata_and_matches_every_root
-adapters/railgun/cli/tests/ppoi_real_whole_list.rs::every_root_of_the_live_list_matches_the_aggregator
+adapters/railgun/cli/tests/ppoi_capture_root_oracle.rs::every_captured_row_applies_through_the_mirror_feed_with_its_root_matched
 adapters/railgun/engine/src/inspire.rs::mint_frozen_v7_store_fixture
 #  - the reopen probe needs an operator's real data_dir on an operator's filesystem. Its two
 #    self-verification tests DO run in every lane; only the env-var arm is ignored.

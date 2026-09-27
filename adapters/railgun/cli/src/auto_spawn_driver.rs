@@ -461,22 +461,6 @@ pub fn pre_spawn_for_tree(
     Ok(registry.known().contains(&tree))
 }
 
-pub(crate) fn warn_on_record_size_override(
-    encoder: EncoderKind,
-    requested: usize,
-    effective: usize,
-) {
-    if requested == effective {
-        return;
-    }
-    tracing::warn!(
-        encoder = encoder.label(),
-        requested_record_size = requested,
-        effective_record_size = effective,
-        "encoder layout pins the record width; the configured width is ignored"
-    );
-}
-
 /// Bootstrap a successor, wire it into engine + routes + registry, append the
 /// [`SpawnRecord`], then flip the predecessor to Static. That order is crash-safe:
 /// no log entry can point at a half-built layout, and a crash after the append is
@@ -508,7 +492,11 @@ fn spawn_one(inputs: &SpawnInputs<'_>, tree: u32, append_log: bool) -> anyhow::R
     let layout = StoreLayout::open(&data_dir)
         .with_context(|| format!("open StoreLayout at {}", data_dir.display()))?;
     let entry_size = encoder_kind.effective_record_size(requested_entry_size);
-    warn_on_record_size_override(encoder_kind, requested_entry_size, entry_size);
+    crate::serve_production_multi::warn_on_record_size_override(
+        encoder_kind,
+        requested_entry_size,
+        entry_size,
+    );
     validate_cell_width(entry_size, inputs.params.ring_dim)
         .map_err(|e| anyhow::anyhow!("encoder cell shape rejected: {e}"))?;
     validate_rows_per_shard(entries_per_shard_u32, inputs.params.ring_dim)
@@ -857,7 +845,7 @@ fn spawn_one_ppoi_list(inputs: &PpoiListSpawnInputs<'_>, append_log: bool) -> an
     // The live loop filters templates on `list_key`, but the spawn-log replay looks a
     // template up by `template_id` alone: edit `ppoi_list_template.list_key` with a record
     // still on disk and the encoder pins one list while the route carries another.
-    crate::serve_production::enforce_encoder_list_key(
+    crate::serve_production_multi::enforce_encoder_list_key(
         &instance_id_str,
         encoder_kind,
         &inputs.list_key,
@@ -872,7 +860,11 @@ fn spawn_one_ppoi_list(inputs: &PpoiListSpawnInputs<'_>, append_log: bool) -> an
     let layout = StoreLayout::open(&data_dir)
         .with_context(|| format!("open StoreLayout at {}", data_dir.display()))?;
     let entry_size = encoder_kind.effective_record_size(requested_entry_size);
-    warn_on_record_size_override(encoder_kind, requested_entry_size, entry_size);
+    crate::serve_production_multi::warn_on_record_size_override(
+        encoder_kind,
+        requested_entry_size,
+        entry_size,
+    );
     validate_cell_width(entry_size, inputs.params.ring_dim)
         .map_err(|e| anyhow::anyhow!("encoder cell shape rejected: {e}"))?;
     validate_rows_per_shard(entries_per_shard_u32, inputs.params.ring_dim)

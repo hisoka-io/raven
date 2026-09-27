@@ -70,9 +70,16 @@ p.write_text(p.read_text() + '\n#[test]\n#[ignore = "1 ms. Trigger: selftest mis
 PYEOF
 expect 1 "a new reasoned ignore missing from the allowlist"
 
-# 4. Dropping a lane's binary from ci.yml orphans every ignored test in it.
-sed -i 's/binary(migrate_encoder_real_sigkill) + //' "$CI"
-expect 1 "a lane losing a binary that carried ignored tests"
+# 4. Dropping a lane's binary from ci.yml orphans every ignored test in it. The victim must be
+# a binary with an #[ignore]d test that only this lane runs.
+sed -i 's/ + binary(production_cell) + / + /' "$CI"
+if cmp -s "$BC" "$CI"; then
+  echo "SELFTEST FIXTURE STALE: case 4 - binary(production_cell) is in no lane filter, so" >&2
+  echo "  this case proved NOTHING about the gate. Re-point the fixture." >&2
+  fails=1
+else
+  expect 1 "a lane losing a binary that carried ignored tests"
+fi
 
 # 5. Subtracting a name by hand removes that test's only lane. W3-27 emptied the subtraction
 # clause entirely, so this case now INTRODUCES one rather than editing one - which is the shape

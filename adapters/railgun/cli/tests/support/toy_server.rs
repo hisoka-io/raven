@@ -1,10 +1,10 @@
-//! Toy in-memory PIR-engine wiring used by `serve` and integration tests.
+//! Toy in-memory PIR-engine wiring for the HTTP integration tests.
 //!
 //! Record size must be even: each 16-bit TwoPacking slot encodes 2 bytes, so an
 //! odd record_bytes leaves a half-slot unrecoverable on decrypt.
 
-#![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
-#![allow(missing_docs)]
+// `#[path]`-included by several targets; each uses a different subset.
+#![allow(dead_code, unreachable_pub)]
 
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_inspire::rlwe::RlweSecretKey;
@@ -108,64 +108,4 @@ pub fn build_toy_pieces(token: String, config: ToyDbConfig) -> Result<ToyPieces>
         config,
         db,
     })
-}
-
-pub fn build_toy_state(token: String) -> Result<AppState<RavenInspireScheme>> {
-    let pieces = build_toy_pieces(token, ToyDbConfig::default())?;
-    Ok(pieces.app_state)
-}
-
-#[derive(Clone, Debug)]
-pub struct ToyServerOverrides {
-    pub token: String,
-    pub max_concurrent_queries: usize,
-    pub rate_limit_rps: u64,
-    pub rate_limit_burst: u32,
-    pub session_ttl_secs: u64,
-    pub session_lru_cap: usize,
-}
-
-pub fn build_toy_state_with_overrides(
-    overrides: ToyServerOverrides,
-) -> Result<AppState<RavenInspireScheme>> {
-    let params = InspireParams::secure_128_d2048();
-    let config = ToyDbConfig::default();
-    let db = build_toy_database(config.entries, config.entry_bytes);
-    let (server_state, secret_key) = raven_railgun_engine::inspire::setup_state(
-        &params,
-        &db,
-        config.entry_bytes,
-        config.variant,
-    )?;
-
-    let mut client_session = raven_railgun_engine::inspire::build_client_session(
-        (*server_state.crs).clone(),
-        secret_key,
-        &params,
-    )?;
-    raven_railgun_engine::inspire::register_client_session(&mut client_session, &server_state)?;
-    drop(client_session); // binary path discards: real wallets establish their own
-
-    let mut engine: raven_railgun_engine::Engine<RavenInspireScheme> =
-        raven_railgun_engine::Engine::new();
-    engine.add_instance(raven_railgun_engine::PirInstance::new(
-        InstanceId::new(TOY_INSTANCE_ID),
-        raven_railgun_engine::InstanceRole::Static,
-        server_state,
-    ))?;
-
-    let mut http_config = HttpConfig::demo(overrides.token);
-    SCHEME_NAME.clone_into(&mut http_config.scheme_name);
-    http_config.max_concurrent_queries = overrides.max_concurrent_queries.max(1);
-    http_config.rate_limit_rps = overrides.rate_limit_rps;
-    http_config.rate_limit_burst = overrides.rate_limit_burst;
-    http_config.session_ttl_secs = overrides.session_ttl_secs;
-    http_config.session_lru_cap = overrides.session_lru_cap;
-
-    AppState::new(engine, http_config)
-        .map_err(|e| AdapterError::Internal(format!("AppState init: {e}")))
-}
-
-pub fn into_internal<E: std::fmt::Display>(err: E) -> AdapterError {
-    AdapterError::Internal(err.to_string())
 }

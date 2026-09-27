@@ -1,8 +1,7 @@
 //! What an uncredentialed caller can hold on a running server is what the operator configured:
 //! packing-key seats per instance, their lifetime, and `/v1/events` streams in total and per
-//! peer. Each bound is asserted over HTTP against a server booted through a production entry
-//! point, `[global]` keys for the multi-instance path and flags for the single-instance binary,
-//! and for every store the server opens, auto-spawned ones included.
+//! peer. Each bound is asserted over HTTP against a server booted from `[global]` keys, for every
+//! store the server opens, auto-spawned ones included.
 
 #![allow(
     clippy::expect_used,
@@ -12,34 +11,26 @@
 )]
 
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::http::StatusCode;
-use axum::routing::post;
-use axum::{Json, Router};
 use raven_inspire::inspiring::{ClientPackingKeys, PackParams};
 use raven_inspire::math::GaussianSampler;
 use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::ServerCrs;
-use raven_railgun_cli::serve_production::{
-    build_http_config as build_single_http_config, run_with_listener as run_single,
-    ProductionServeOptions, SessionCapacity,
-};
 use raven_railgun_cli::serve_production_multi::{
     build_http_config as build_multi_http_config, load_options_from_toml,
     run_with_listener as run_multi, BootstrapObserver, BootstrapView, MultiServeOptions,
+    SessionCapacity,
 };
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
-use raven_railgun_engine::pir_table::EncoderKind;
 use raven_railgun_engine::session_pool::SessionStoreLimits;
 use raven_railgun_http::{read_versioned, write_versioned, HttpConfig, InstanceParams};
 use raven_railgun_indexer::IndexerMessage;
 use raven_railgun_persistence::{PpoiEventType, WalEntryPayload};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 const TOKEN: &str = "session-capacity-wiring-token-padded";
 const BOOT_INSTANCE: &str = "commit-tree-0";
@@ -140,31 +131,6 @@ entry_bytes = {ROW_BYTES}
     )
 }
 
-fn single_options(data_dir: PathBuf, rpc_url: String) -> ProductionServeOptions {
-    ProductionServeOptions {
-        bind: "127.0.0.1:0".parse().expect("address"),
-        token: TOKEN.to_owned(),
-        rpc_url,
-        railgun_proxy: "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9".to_owned(),
-        chain_id: 1,
-        start_block: 0,
-        mirror_endpoint: "http://127.0.0.1:1".to_owned(),
-        list_key: LIST_KEY_HEX.to_owned(),
-        data_dir,
-        instance_id: BOOT_INSTANCE.to_owned(),
-        max_concurrent_queries: 4,
-        respond_timeout_secs: 30,
-        entries: CELL_ROWS,
-        entry_bytes: ROW_BYTES,
-        encoder: EncoderKind::PerLeafBc { tree_number: 0 },
-        session_eviction_interval_secs: 0,
-        metrics_public: false,
-        enable_fanout: false,
-        max_fanout_shards: 16,
-        session_capacity: SessionCapacity::default(),
-    }
-}
-
 fn assert_documented_defaults(config: &HttpConfig, path: &str) {
     let demo = HttpConfig::demo(TOKEN);
     let pairs = [
@@ -205,47 +171,17 @@ fn raven_railgun(args: &[&str]) -> std::process::Output {
         .expect("run raven-railgun")
 }
 
-/// The line of `serve-production --help` that introduces `flag`, and the paragraph under it.
-fn help_entry(help: &str, flag: &str) -> String {
-    let introducer = format!("{flag} <");
-    let mut lines = help
-        .lines()
-        .skip_while(|line| !line.trim_start().starts_with(&introducer));
-    let first = lines
-        .next()
-        .unwrap_or_else(|| panic!("{flag} is not a serve-production flag:\n{help}"));
-    std::iter::once(first)
-        .chain(lines.take_while(|line| !line.trim_start().starts_with('-')))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 #[test]
-fn unset_keys_and_flags_keep_the_documented_defaults() {
+fn unset_keys_keep_the_documented_defaults() {
     let dir = tempfile::tempdir().expect("tempdir");
     let options = load_options_from_toml(multi_config(dir.path(), "", "").path()).expect("load");
     assert_eq!(options.session_capacity, SessionCapacity::default());
     assert_documented_defaults(&build_multi_http_config(&options), "multi-instance");
-
-    let single = single_options(dir.path().join("single"), "http://127.0.0.1:1".to_owned());
-    assert_documented_defaults(&build_single_http_config(&single), "single-instance");
-
-    let help = raven_railgun(&["serve-production", "--help"]);
-    assert!(help.status.success(), "serve-production --help failed");
-    let help = String::from_utf8(help.stdout).expect("utf-8 help");
-    for (flag, documented) in LIMIT_FLAGS {
-        let entry = help_entry(&help, flag);
-        assert!(
-            entry.contains(&format!("[default: {documented}]")),
-            "{flag} must default to {documented}: {entry}"
-        );
-    }
 }
 
-/// The TOML carries these for the multi-instance path, so a flag beside `--config` would be a
-/// second source for one value.
+/// The file is the one source for these bounds; the binary takes no flag for any of them.
 #[test]
-fn every_limit_flag_is_refused_beside_a_config_file() {
+fn no_limit_flag_is_accepted_beside_a_config_file() {
     for (flag, value) in LIMIT_FLAGS {
         let output = raven_railgun(&["serve-production", "--config", "unused.toml", flag, value]);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -254,20 +190,20 @@ fn every_limit_flag_is_refused_beside_a_config_file() {
             "{flag} was accepted beside --config"
         );
         assert!(
-            stderr.contains("cannot be used with"),
-            "{flag} beside --config must be a usage conflict: {stderr}"
+            stderr.contains("unexpected argument"),
+            "{flag} must be refused as an unknown argument: {stderr}"
         );
     }
 }
 
 /// The lifetime ceiling is a privacy bound, and it is enforced before any store opens: a
-/// refused config leaves no data_dir behind.
+/// refused config leaves no data_dir behind, through the library boot and the binary alike.
 #[tokio::test]
 async fn a_lifetime_above_the_ceiling_is_refused_before_any_store_opens() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let options =
-        load_options_from_toml(multi_config(dir.path(), "session_ttl_secs = 3601\n", "").path())
-            .expect("the key is declared; its value is what is refused");
+    let config = multi_config(dir.path(), "session_ttl_secs = 3601\n", "");
+    let options = load_options_from_toml(config.path())
+        .expect("the key is declared; its value is what is refused");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -283,39 +219,18 @@ async fn a_lifetime_above_the_ceiling_is_refused_before_any_store_opens() {
         "a store was opened"
     );
 
-    let mut single = single_options(dir.path().join("single"), "http://127.0.0.1:1".to_owned());
-    single.session_capacity.session_ttl_secs = 3601;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let error = run_single(single, listener, std::future::pending())
-        .await
-        .expect_err("a 3601 s lifetime must refuse the single-instance boot");
-    assert!(
-        format!("{error:#}").contains("session_ttl_secs 3601"),
-        "{error:#}"
-    );
-    assert!(!dir.path().join("single").exists(), "a store was opened");
-
-    let data_dir = dir.path().join("binary");
-    let data_dir_arg = data_dir.to_str().expect("utf-8 tempdir");
     let output = raven_railgun(&[
         "serve-production",
-        "--token",
-        TOKEN,
-        "--rpc-url",
-        "http://127.0.0.1:1",
-        "--mirror-endpoint",
-        "http://127.0.0.1:1",
-        "--data-dir",
-        data_dir_arg,
-        "--session-ttl-secs",
-        "3601",
+        "--config",
+        config.path().to_str().expect("utf-8 config path"),
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "the binary booted at 3601 s");
     assert!(stderr.contains("session_ttl_secs 3601"), "{stderr}");
-    assert!(!data_dir.exists(), "the binary opened a store");
+    assert!(
+        !dir.path().join(BOOT_INSTANCE).exists(),
+        "the binary opened a store"
+    );
 }
 
 /// Packing keys a wallet would upload to `instance`, derived from the parameters it serves.
@@ -612,200 +527,4 @@ async fn global_keys_bound_every_store_auto_spawn_opens() {
     }
 
     shut_down(server).await;
-}
-
-/// Answers the chain calls the single-instance boot makes; everything else is an RPC error.
-async fn chain_rpc() -> String {
-    let app = Router::new().route(
-        "/",
-        post(|Json(request): Json<Value>| async move {
-            let id = request.get("id").cloned().unwrap_or(Value::Null);
-            let result = match request.get("method").and_then(Value::as_str) {
-                Some("eth_chainId") => json!("0x1"),
-                Some("eth_getBlockByNumber") => finalized_block(),
-                _ => {
-                    return (
-                        StatusCode::OK,
-                        Json(json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": { "code": -32601, "message": "unsupported in fixture" }
-                        })),
-                    );
-                }
-            };
-            (
-                StatusCode::OK,
-                Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })),
-            )
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let url = format!("http://{}", listener.local_addr().expect("local addr"));
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve");
-    });
-    url
-}
-
-fn finalized_block() -> Value {
-    let zero_hash = format!("0x{}", "0".repeat(64));
-    json!({
-        "number": "0x10",
-        "hash": format!("0x{}", "1".repeat(64)),
-        "parentHash": zero_hash,
-        "sha3Uncles": zero_hash,
-        "logsBloom": format!("0x{}", "0".repeat(512)),
-        "transactionsRoot": zero_hash,
-        "stateRoot": zero_hash,
-        "receiptsRoot": zero_hash,
-        "miner": format!("0x{}", "0".repeat(40)),
-        "difficulty": "0x0",
-        "totalDifficulty": "0x0",
-        "mixHash": zero_hash,
-        "nonce": "0x0000000000000000",
-        "extraData": "0x",
-        "size": "0x0",
-        "gasLimit": "0x0",
-        "gasUsed": "0x0",
-        "timestamp": "0x0",
-        "transactions": [],
-        "uncles": [],
-        "baseFeePerGas": "0x0",
-    })
-}
-
-/// Kills the server on every exit path, a failed assertion included.
-struct ServingBinary {
-    child: std::process::Child,
-    log: PathBuf,
-}
-
-impl ServingBinary {
-    fn log_tail(&self) -> String {
-        let log = std::fs::read_to_string(&self.log).unwrap_or_default();
-        let start = log.len().saturating_sub(4_000);
-        log.get(start..).unwrap_or(&log).to_owned()
-    }
-}
-
-impl Drop for ServingBinary {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn free_loopback_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
-
-fn client_from(source: Ipv4Addr) -> reqwest::Client {
-    reqwest::Client::builder()
-        .local_address(IpAddr::V4(source))
-        .build()
-        .expect("client")
-}
-
-/// The single-instance binary, flags only: seats, lifetime and both stream bounds. Peers are
-/// told apart by loopback source address, since this path trusts no forwarding header; Linux
-/// routes all of 127.0.0.0/8 to the loopback interface.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn flags_bound_the_single_instance_store_and_the_event_stream() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let rpc_url = chain_rpc().await;
-    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), free_loopback_port());
-    let data_dir = dir.path().join("single");
-    let log = dir.path().join("serve.log");
-    let log_file = std::fs::File::create(&log).expect("log file");
-    let (seats, ttl, streams, per_peer) = (
-        SEATS.to_string(),
-        TTL_SECS.to_string(),
-        STREAMS.to_string(),
-        STREAMS_PER_PEER.to_string(),
-    );
-    let child = Command::new(env!("CARGO_BIN_EXE_raven-railgun"))
-        .args([
-            "serve-production",
-            "--bind",
-            &bind.to_string(),
-            "--token",
-            TOKEN,
-            "--rpc-url",
-            &rpc_url,
-            "--mirror-endpoint",
-            "http://127.0.0.1:1",
-            "--start-block",
-            "0",
-            "--data-dir",
-            data_dir.to_str().expect("utf-8 tempdir"),
-            "--instance-id",
-            BOOT_INSTANCE,
-            "--encoder",
-            "per-leaf-bc",
-            "--tree-number",
-            "0",
-            "--list-key",
-            LIST_KEY_HEX,
-            "--entries",
-            &CELL_ROWS.to_string(),
-            "--entry-bytes",
-            &ROW_BYTES.to_string(),
-            "--max-sessions-per-instance",
-            &seats,
-            "--session-ttl-secs",
-            &ttl,
-            "--max-sse-connections",
-            &streams,
-            "--max-sse-connections-per-peer",
-            &per_peer,
-        ])
-        .env_remove("RAVEN_BEARER_TOKEN")
-        .env_remove("RAVEN_RPC_URL")
-        .env("NO_COLOR", "1")
-        .stdin(Stdio::null())
-        .stdout(log_file.try_clone().expect("log handle"))
-        .stderr(log_file)
-        .spawn()
-        .expect("spawn raven-railgun");
-    let mut serving = ServingBinary { child, log };
-
-    let base = format!("http://{bind}");
-    let client = reqwest::Client::new();
-    let deadline = Instant::now() + Duration::from_secs(240);
-    loop {
-        if let Ok(Some(status)) = serving.child.try_wait() {
-            panic!("the server exited ({status}):\n{}", serving.log_tail());
-        }
-        if client
-            .get(format!("{base}/v1/status"))
-            .bearer_auth(TOKEN)
-            .send()
-            .await
-            .is_ok_and(|response| response.status().is_success())
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the server never answered /v1/status:\n{}",
-            serving.log_tail()
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    assert_configured_seats(&client, &base, BOOT_INSTANCE).await;
-    let (first, second, third) = (
-        client_from(Ipv4Addr::LOCALHOST),
-        client_from(Ipv4Addr::new(127, 0, 0, 2)),
-        client_from(Ipv4Addr::new(127, 0, 0, 3)),
-    );
-    assert_configured_streams([(&first, None), (&second, None), (&third, None)], &base).await;
-    drop(serving);
 }

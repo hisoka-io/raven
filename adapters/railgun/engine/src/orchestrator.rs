@@ -356,9 +356,7 @@ pub enum VerificationMode {
     /// carries ([`crate::ppoi_root`]); a divergent row is refused and counted. Two limits:
     /// a row carrying the all-zero root is applied uncompared (counted separately), and the
     /// check relates the served tree to the published list without authenticating the
-    /// publisher, who can put a consistent root over any leaves. The second oracle, in
-    /// `raven-railgun-cli`'s Subsquid bootstrap, is skipped entirely in `SkipOnUnreachable`
-    /// mode (whose own log line says so).
+    /// publisher, who can put a consistent root over any leaves. This is the only root check.
     UpstreamAsserted,
 }
 

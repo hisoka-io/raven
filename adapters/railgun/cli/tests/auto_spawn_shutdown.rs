@@ -248,7 +248,7 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
         enable_fanout: None,
         max_fanout_shards: None,
         reorg_window_path: None,
-        session_capacity: raven_railgun_cli::serve_production::SessionCapacity::default(),
+        session_capacity: raven_railgun_cli::serve_production_multi::SessionCapacity::default(),
     };
 
     let (stop_tx, stop_rx) = oneshot::channel::<()>();

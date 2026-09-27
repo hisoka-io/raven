@@ -3,11 +3,14 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use raven_railgun_cli::toy_server::{build_toy_pieces, ToyDbConfig, SCHEME_NAME, TOY_INSTANCE_ID};
+#[path = "support/toy_server.rs"]
+mod toy_server;
+
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{build_seeded_query, extract_response, InspireServerState};
 use std::sync::Arc;
 use tokio::sync::oneshot;
+use toy_server::{build_toy_pieces, ToyDbConfig, SCHEME_NAME, TOY_INSTANCE_ID};
 
 const BEARER_TOKEN: &str = "walking-skeleton-test-token";
 const CLIENT_ID: &str = "00112233445566778899aabbccddeeff";

@@ -7,8 +7,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::bearer_token::{resolve_bearer_token, BEARER_TOKEN_ENV};
-pub use crate::serve_production::SessionCapacity;
+use crate::bearer_token::{resolve_bearer_token, BearerTokenError, BEARER_TOKEN_ENV};
 use anyhow::Context;
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_core::{InstanceId, ListKey};
@@ -56,11 +55,11 @@ pub struct AutoSpawnConfigToml {
 }
 
 fn default_auto_spawn_entries() -> usize {
-    super::serve_production::DEFAULT_PRODUCTION_ENTRIES
+    DEFAULT_PRODUCTION_ENTRIES
 }
 
 fn default_auto_spawn_entry_bytes() -> usize {
-    super::serve_production::DEFAULT_PRODUCTION_ENTRY_BYTES
+    DEFAULT_PRODUCTION_ENTRY_BYTES
 }
 
 #[derive(Debug, Deserialize)]
@@ -369,6 +368,7 @@ struct IndexerFilterSection {
 #[derive(Debug, Clone)]
 pub struct MultiServeOptions {
     pub bind: SocketAddr,
+    /// Opens `/metrics`. Empty when no source was set, which boot refuses unless `/metrics` is public.
     pub token: String,
     /// Empty when the config reads nothing off the chain; no indexer dials it then.
     pub rpc_url: String,
@@ -463,7 +463,182 @@ impl std::fmt::Debug for BootstrapInstanceView {
     }
 }
 
-pub const DEFAULT_PRODUCTION_ENTRIES: usize = super::serve_production::DEFAULT_PRODUCTION_ENTRIES;
+/// Operator bounds on what anonymous callers can hold: packing-key seats per instance, how
+/// long a seat lives, and concurrent `/v1/events` streams in total and per peer. The HTTP
+/// layer enforces the stream bounds; every store the serve path opens takes its limits from
+/// [`HttpConfig::session_store_limits`] of the same config, so the two cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionCapacity {
+    pub max_sessions_per_instance: usize,
+    /// Refused above [`raven_railgun_http::config::DEFAULT_SESSION_TTL_SECS`].
+    pub session_ttl_secs: u64,
+    pub max_sse_connections: usize,
+    pub max_sse_connections_per_peer: usize,
+}
+
+impl Default for SessionCapacity {
+    fn default() -> Self {
+        Self {
+            max_sessions_per_instance: raven_railgun_engine::session_pool::DEFAULT_MAX_SESSIONS,
+            session_ttl_secs: raven_railgun_http::config::DEFAULT_SESSION_TTL_SECS,
+            max_sse_connections: raven_railgun_http::config::DEFAULT_MAX_SSE_CONNECTIONS,
+            max_sse_connections_per_peer:
+                raven_railgun_http::config::DEFAULT_MAX_SSE_CONNECTIONS_PER_PEER,
+        }
+    }
+}
+
+impl SessionCapacity {
+    pub fn apply_to(&self, config: &mut HttpConfig) {
+        config.max_sessions_per_instance = self.max_sessions_per_instance;
+        config.session_ttl_secs = self.session_ttl_secs;
+        config.max_sse_connections = self.max_sse_connections;
+        config.max_sse_connections_per_peer = self.max_sse_connections_per_peer;
+    }
+}
+
+/// Per-leaf cell: 65,536 rows x 512 B (16 siblings x 32 B). Per-node encoders
+/// derive a different shape from `TREE_DEPTH`.
+pub const DEFAULT_PRODUCTION_ENTRIES: usize = 65_536;
+pub const DEFAULT_PRODUCTION_ENTRY_BYTES: usize = 512;
+
+/// Bound on the one request that decides whether the configured upstream can feed the mirror.
+pub const MIRROR_PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Boots that went on to serve local rows past an upstream that failed its preflight.
+pub const MIRROR_PREFLIGHT_FAILED_TOTAL: &str = "raven_railgun_ppoi_mirror_preflight_failed_total";
+
+pub(crate) fn ensure_mirror_preflight_metrics_described() {
+    metrics::describe_counter!(
+        MIRROR_PREFLIGHT_FAILED_TOTAL,
+        metrics::Unit::Count,
+        "Count of PPOI lists whose upstream failed the boot preflight while this node had \
+         rows to serve, so it booted and serves them with no feed. Non-zero means the list \
+         stops advancing until the upstream answers; the boot log names the endpoint and the \
+         failure class."
+    );
+    metrics::counter!(MIRROR_PREFLIGHT_FAILED_TOTAL).increment(0);
+}
+
+/// One bounded request to the configured upstream, refused only when `can_serve_without_it`
+/// is false. The worker warns and retries forever, so this is the one place a node with
+/// nothing to serve can be stopped from booting clean and serving nothing. A node with rows
+/// keeps serving: an upstream outage must not become this node's outage.
+///
+/// Counts into the recorder `AppState::new` installs, so it has to run after that.
+pub(crate) async fn preflight_mirror_upstream(
+    mirror: &raven_railgun_ppoi_mirror::UpstreamPpoiMirror,
+    list: &ListKey,
+    can_serve_without_it: bool,
+    endpoint_setting: &str,
+) -> anyhow::Result<()> {
+    let Err(refusal) = mirror.preflight(list, MIRROR_PREFLIGHT_TIMEOUT).await else {
+        return Ok(());
+    };
+    if !can_serve_without_it {
+        anyhow::bail!(
+            "{refusal}; this node holds no rows for list {} and would serve nothing: fix \
+             {endpoint_setting}",
+            hex::encode(list.0)
+        );
+    }
+    metrics::counter!(MIRROR_PREFLIGHT_FAILED_TOTAL).increment(1);
+    tracing::error!(
+        error = %refusal,
+        list_key = %hex::encode(list.0),
+        "ppoi upstream failed its boot preflight; serving local rows with no feed"
+    );
+    Ok(())
+}
+
+/// The `list_key` a per-list encoder is pinned to, `None` for the chain-tree kinds.
+///
+/// EXHAUSTIVE for the reason `mirror_kind_for_encoder` is: a new variant must state whether
+/// it pins a list rather than inherit whichever arm a `_` put it in.
+pub(crate) fn pinned_list_key(encoder: EncoderKind) -> Option<[u8; 32]> {
+    match encoder {
+        EncoderKind::PerListStatus { list_key }
+        | EncoderKind::PerListPath { list_key }
+        | EncoderKind::PerListPath10 { list_key }
+        | EncoderKind::PerListNode { list_key } => Some(list_key),
+        // Pinned to a tree, not a list; `enforce_encoder_matches_data_source` gates those.
+        EncoderKind::PerLeafBc { .. }
+        | EncoderKind::PerLeafPath { .. }
+        | EncoderKind::PerNode { .. } => None,
+    }
+}
+
+/// Refuse a boot whose per-list encoder pins a different list than the one routed to it.
+///
+/// Every per-list encoder drops `affected_shards_for_ppoi_leaf` for a foreign `list_key` and
+/// materializes from `store.ppoi_imt(&self.list_key)`, so a diverged pin reads an IMT nothing
+/// ever writes: the cell stays all-zero and is served at HTTP 200 forever, with no refusal and
+/// no counter. Boot is the only place that is visible.
+pub(crate) fn enforce_encoder_list_key(
+    instance_id: &str,
+    encoder: EncoderKind,
+    routed: &[u8; 32],
+    routed_setting: &str,
+) -> anyhow::Result<()> {
+    let Some(pinned) = pinned_list_key(encoder) else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        pinned == *routed,
+        "instance {instance_id:?}: encoder {label} pins list_key {pinned_hex} but \
+         {routed_setting} gives list_key {routed_hex}. The encoder drops every event for a \
+         list other than its own, so this instance would serve an all-zero cell at HTTP 200 \
+         and never advance. Operator: set the encoder's list_key and {routed_setting} to the \
+         same 64-hex value.",
+        label = encoder.label(),
+        pinned_hex = hex::encode(pinned),
+        routed_hex = hex::encode(routed),
+    );
+    Ok(())
+}
+
+/// Which mirror payload an encoder is driven by: path projections read the per-list IMT that
+/// `PpoiListLeafAdded` grows, every other kind the `PpoiStatus` byte. A config's
+/// `data_source.what` must name it, and is refused at load when it does not.
+pub(crate) fn mirror_kind_for_encoder(
+    encoder: EncoderKind,
+) -> raven_railgun_ppoi_mirror::MirrorKind {
+    use raven_railgun_ppoi_mirror::MirrorKind;
+    // EXHAUSTIVE: a `_` arm once swallowed two path encoders into `Status`, so a new variant
+    // must be a compile error that forces this decision.
+    match encoder {
+        // Driven by `PpoiListLeafAdded`: all three read the per-list IMT that arm writes.
+        EncoderKind::PerListPath { .. }
+        | EncoderKind::PerListPath10 { .. }
+        | EncoderKind::PerListNode { .. } => MirrorKind::Path,
+        // `PerListStatus` is driven by `PpoiStatus`. The three chain-tree encoders take no
+        // mirror feed at all and only reach here via a `PpoiList*` data source, which they
+        // cannot have; Status is the inert answer for them. Merged into one arm because
+        // clippy::match_same_arms rejects splitting on documentation alone -- the point of
+        // this match is that it is EXHAUSTIVE, not how the equal answers are grouped.
+        EncoderKind::PerListStatus { .. }
+        | EncoderKind::PerLeafBc { .. }
+        | EncoderKind::PerLeafPath { .. }
+        | EncoderKind::PerNode { .. } => MirrorKind::Status,
+    }
+}
+
+/// Logs a configured width the encoder's row layout overrides.
+pub(crate) fn warn_on_record_size_override(
+    encoder: EncoderKind,
+    requested: usize,
+    effective: usize,
+) {
+    if requested == effective {
+        return;
+    }
+    tracing::warn!(
+        encoder = encoder.label(),
+        requested_record_size = requested,
+        effective_record_size = effective,
+        "encoder layout pins the record width; the configured width is ignored"
+    );
+}
 
 const SCHEME_TAG_DEFAULT: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
 
@@ -505,11 +680,7 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         // Verbatim so `validate_cell_shape` rejects a conflict instead of substituting.
         let record_size = raw.record_size.unwrap_or_else(|| {
             let effective = encoder.effective_record_size(fallback_record_size);
-            crate::auto_spawn_driver::warn_on_record_size_override(
-                encoder,
-                fallback_record_size,
-                effective,
-            );
+            warn_on_record_size_override(encoder, fallback_record_size, effective);
             effective
         });
         let instance_id = InstanceId::new(raw.id);
@@ -707,13 +878,21 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         }
     };
 
-    let bearer = resolve_bearer_token(
+    // The token gates `/metrics` alone, and `--metrics-public` can open it after this load, so
+    // whether no source at all is an error is decided at boot. Any source given is vetted here.
+    let token = match resolve_bearer_token(
         parsed.global.token.as_deref(),
         parsed.global.token_file.as_deref(),
         std::env::var(BEARER_TOKEN_ENV).ok(),
         path,
-    )?;
-    tracing::info!(source = bearer.source.label(), "bearer token resolved");
+    ) {
+        Ok(bearer) => {
+            tracing::info!(source = bearer.source.label(), "bearer token resolved");
+            bearer.token
+        }
+        Err(BearerTokenError::NoSource { .. }) => String::new(),
+        Err(refused) => return Err(refused.into()),
+    };
 
     // Ahead of `HttpConfig::validate` so an exposed-origin posture is refused
     // before bootstrap does any chain work.
@@ -744,7 +923,7 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
 
     Ok(MultiServeOptions {
         bind: parsed.global.bind,
-        token: bearer.token,
+        token,
         rpc_url,
         railgun_proxy,
         chain_id: parsed.global.chain_id,
@@ -1023,12 +1202,7 @@ fn enforce_encoder_matches_data_source(
             | DataSourceFilter::PpoiListBlock {
                 list_key: routed, ..
             },
-        ) => crate::serve_production::enforce_encoder_list_key(
-            instance_id,
-            encoder,
-            routed,
-            "data_source.list_key",
-        ),
+        ) => enforce_encoder_list_key(instance_id, encoder, routed, "data_source.list_key"),
         _ => anyhow::bail!(
             "instance {instance_id:?}: encoder kind {} does not match data_source {:?}",
             encoder.label(),
@@ -1048,7 +1222,7 @@ fn enforce_mirror_feed_matches_encoder(
     else {
         return Ok(());
     };
-    let consumed = match crate::serve_production::mirror_kind_for_encoder(encoder) {
+    let consumed = match mirror_kind_for_encoder(encoder) {
         raven_railgun_ppoi_mirror::MirrorKind::Status => "status",
         raven_railgun_ppoi_mirror::MirrorKind::Path => "path",
     };
@@ -1199,6 +1373,14 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
 
     // Before any store opens: every store, auto-spawned ones included, takes its limits here.
     let http_config = build_http_config(&opts);
+    if !http_config.metrics_public && http_config.read_token.is_empty() {
+        anyhow::bail!(
+            "no bearer token: /metrics is not public, and the token is what opens it. Set \
+             exactly one of [global].token, [global].token_file or the {BEARER_TOKEN_ENV} \
+             environment variable, or serve /metrics open with [global].metrics_public = true \
+             or --metrics-public"
+        );
+    }
     http_config
         .validate()
         .map_err(|e| anyhow::anyhow!("[global] {e}"))?;
@@ -2648,7 +2830,7 @@ async fn spawn_mirror_workers(
     }
     let mirror = Arc::new(mirror);
     let mirror_tx = handle.channels.mirror_tx.clone();
-    crate::serve_production::ensure_mirror_preflight_metrics_described();
+    ensure_mirror_preflight_metrics_described();
 
     let held: Vec<(DataSourceFilter, usize)> = handle
         .instances
@@ -2664,13 +2846,8 @@ async fn spawn_mirror_workers(
     let mut feeds = Vec::new();
     for feed in mirror_feeds(&held) {
         let list = ListKey(feed.list_key);
-        crate::serve_production::preflight_mirror_upstream(
-            &mirror,
-            &list,
-            feed.holds_rows,
-            "[global].mirror_endpoint",
-        )
-        .await?;
+        preflight_mirror_upstream(&mirror, &list, feed.holds_rows, "[global].mirror_endpoint")
+            .await?;
         tracing::info!(
             list_key = %hex::encode(feed.list_key),
             resume_at = feed.resume_at,
@@ -3192,10 +3369,7 @@ data_source = { kind = "mirror", list_key = "00000000000000000000000000000000000
             let f = write_temp_toml(&list_mismatch_config("aa", "aa", block));
             let opts = load_options_from_toml(f.path())
                 .unwrap_or_else(|e| panic!("matching list keys must parse (block={block:?}): {e}"));
-            assert_eq!(
-                crate::serve_production::pinned_list_key(opts.instances[0].encoder),
-                Some([0xaa; 32])
-            );
+            assert_eq!(pinned_list_key(opts.instances[0].encoder), Some([0xaa; 32]));
         }
     }
 
@@ -3334,13 +3508,14 @@ data_source = {{ kind = "indexer", filter = {{ tree_number = 0 }} }}
         assert!(msg.contains("[global].token_file"), "{msg}");
     }
 
+    /// The token opens `/metrics` alone, and `--metrics-public` is applied after the load, so
+    /// no source at all is judged at boot; `tests/metrics_token_boot_gate.rs` holds that half.
     #[test]
-    fn no_token_source_at_all_is_rejected() {
+    fn no_token_source_at_all_loads_with_an_empty_token() {
         let body = config_with_global_extras("");
         let f = write_temp_toml(&body);
-        let err = load_options_from_toml(f.path()).expect_err("zero sources must be rejected");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("RAVEN_BEARER_TOKEN"), "{msg}");
+        let opts = load_options_from_toml(f.path()).expect("zero sources must load");
+        assert!(opts.token.is_empty(), "no source must leave no token");
     }
 
     #[test]
@@ -4651,5 +4826,119 @@ data_source = {{ kind = "mirror", list_key = "0000000000000000000000000000000000
                 unrouted_on(&list_key)
             );
         }
+    }
+
+    /// A per-list encoder reads `store.ppoi_imt(&self.list_key)` and drops every event for
+    /// a foreign list, so the pin has to be recoverable to be checkable at all.
+    #[test]
+    fn every_per_list_encoder_reports_the_list_it_is_pinned_to() {
+        let list_key = [9u8; 32];
+        for encoder in [
+            EncoderKind::PerListStatus { list_key },
+            EncoderKind::PerListPath { list_key },
+            EncoderKind::PerListPath10 { list_key },
+            EncoderKind::PerListNode { list_key },
+        ] {
+            assert_eq!(
+                super::pinned_list_key(encoder),
+                Some(list_key),
+                "{encoder:?} pins a list and must say which"
+            );
+        }
+    }
+
+    #[test]
+    fn no_chain_tree_encoder_pins_a_list() {
+        for encoder in [
+            EncoderKind::PerLeafBc { tree_number: 0 },
+            EncoderKind::PerLeafPath { tree_number: 3 },
+            EncoderKind::PerNode { tree_number: 7 },
+        ] {
+            assert_eq!(
+                super::pinned_list_key(encoder),
+                None,
+                "{encoder:?} is pinned to a tree, not a list"
+            );
+        }
+    }
+
+    #[test]
+    fn a_diverged_list_pin_is_refused_and_names_both_keys() {
+        let err = super::enforce_encoder_list_key(
+            "ppoi-status-0",
+            EncoderKind::PerListStatus {
+                list_key: [0xaa; 32],
+            },
+            &[0xbb; 32],
+            "data_source.list_key",
+        )
+        .expect_err("a per-list encoder pinned off its routed list must be refused");
+        let msg = format!("{err:#}");
+        for needle in [
+            "ppoi-status-0",
+            "per-list-status",
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            "data_source.list_key",
+        ] {
+            assert!(msg.contains(needle), "refusal must name {needle}: {msg}");
+        }
+    }
+
+    /// Without this the guard could be satisfied by refusing every per-list instance.
+    #[test]
+    fn an_agreeing_list_pin_is_accepted() {
+        let list_key = [0xcd; 32];
+        for encoder in [
+            EncoderKind::PerListStatus { list_key },
+            EncoderKind::PerListPath { list_key },
+            EncoderKind::PerListPath10 { list_key },
+            EncoderKind::PerListNode { list_key },
+        ] {
+            super::enforce_encoder_list_key("ppoi", encoder, &list_key, "data_source.list_key")
+                .unwrap_or_else(|e| panic!("{encoder:?} agrees with its list and must pass: {e}"));
+        }
+    }
+
+    /// A chain encoder pins no list; gating it on one would refuse every chain instance.
+    #[test]
+    fn a_chain_encoder_is_not_gated_on_the_list_key() {
+        super::enforce_encoder_list_key(
+            "tree-0",
+            EncoderKind::PerLeafBc { tree_number: 0 },
+            &[0xff; 32],
+            "data_source.list_key",
+        )
+        .expect("a tree-pinned encoder pins no list and must not be gated on one");
+    }
+
+    /// The status and path feeds own SEPARATE sidecars and advance independently, so an
+    /// encoder routed to the wrong one resumes from the wrong cursor after a restart.
+    #[test]
+    fn every_path_projection_encoder_owns_the_path_sidecar() {
+        let list_key = [7u8; 32];
+        for encoder in [
+            EncoderKind::PerListPath { list_key },
+            EncoderKind::PerListPath10 { list_key },
+            // `PerListNodeEncoder::materialize_shard` reads the per-list IMT, which only the
+            // `PpoiListLeafAdded` arm writes, so it is path-driven.
+            EncoderKind::PerListNode { list_key },
+        ] {
+            assert_eq!(
+                super::mirror_kind_for_encoder(encoder),
+                raven_railgun_ppoi_mirror::MirrorKind::Path,
+                "{encoder:?} drives PpoiListLeafAdded and must own the path sidecar"
+            );
+        }
+    }
+
+    #[test]
+    fn non_path_encoders_keep_the_status_sidecar() {
+        assert_eq!(
+            super::mirror_kind_for_encoder(EncoderKind::PerListStatus {
+                list_key: [7u8; 32]
+            }),
+            raven_railgun_ppoi_mirror::MirrorKind::Status
+        );
     }
 }

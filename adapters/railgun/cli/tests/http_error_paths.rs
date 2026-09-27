@@ -11,16 +11,19 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+#[path = "support/toy_server.rs"]
+mod toy_server;
+
 use raven_inspire::params::{InspireParams, InspireVariant};
-use raven_railgun_cli::toy_server::{
-    build_toy_database, SCHEME_NAME, TOY_DB_ENTRIES, TOY_ENTRY_BYTES, TOY_INSTANCE_ID,
-};
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{setup_state, RavenInspireScheme};
 use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
 use raven_railgun_http::{AppState, HttpConfig};
 use std::net::SocketAddr;
 use tokio::sync::oneshot;
+use toy_server::{
+    build_toy_database, SCHEME_NAME, TOY_DB_ENTRIES, TOY_ENTRY_BYTES, TOY_INSTANCE_ID,
+};
 
 const BEARER_TOKEN: &str = "http-error-paths-test-token";
 
@@ -81,12 +84,9 @@ async fn error_paths_return_their_status_codes() {
     let empty_batch: Vec<u8> =
         raven_railgun_http::write_versioned::<Vec<()>>(&Vec::new()).expect("ser");
 
-    // The three `/query` refusal cases that stood here are gone, not re-pointed at 400: a read
-    // route refuses no credential now, so "wrong bearer", "no header" and "non-bearer scheme"
-    // all describe a refusal that does not exist. Re-pointing them at 400 would have asserted
-    // the empty-body path twice, since `malformed query body` below already covers it. The
-    // `Bearer `-prefix parsing the third one protected is now asserted on the admin route, in
-    // `http/tests/auth_reject_connection_close.rs`, against the same near-miss table.
+    // A read route takes no credential, so no bearer case belongs here. The `Bearer `-prefix
+    // near-miss table is asserted on `/metrics`, the one route that still refuses, in
+    // `http/tests/auth_reject_connection_close.rs`.
     let cases = vec![
         ErrorCase {
             name: "unknown instance",

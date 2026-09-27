@@ -480,9 +480,9 @@ jobs:
         if: always()
 
   durability-and-closure:
-    # The crash-safety and PIR-closure corpora are `#[ignore]`-gated for local
+    # The chaos, CLI and PIR-closure corpora are `#[ignore]`-gated for local
     # wall time and therefore ran in NO lane at all. Measured on a Zen 5 box:
-    # crash-safety 253 s / 16 tests, closure + recovery 113 s / 9 tests, all green.
+    # closure + recovery 113 s / 9 tests, all green.
     # Nothing here is a benchmark; every test asserts byte identity or recovery.
     #
     # Each lane runs its binaries' IGNORED tests only (`run_ignored: only`). Under `all` these
@@ -502,13 +502,6 @@ jobs:
       fail-fast: false
       matrix:
         lane:
-          - name: crash-safety
-            packages: "-p raven-railgun-cli"
-            cargo_flags: ""
-            nextest_profile: ci
-            run_ignored: only
-            # auto_spawn_races has no ignored test; the railgun-tests cli shard runs all five
-            filter: "binary(migrate_encoder_real_sigkill) + binary(migrate_encoder_kill_during)"
           - name: wal-and-snapshot-chaos
             packages: "-p raven-railgun-persistence"
             # both suites are #![cfg(feature = "chaos-tests")] and compile to

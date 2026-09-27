@@ -192,20 +192,20 @@ workflow_case() {  # workflow_case <workflow-copy> <label> <required-text>...
   if [ "$bad" -ne 0 ]; then fails=1; printf '%s\n' "$out" | tail -20 >&2; else echo "  ok: ${label} -> exit ${rc}"; fi
 }
 
-awk '/^          - name: crash-safety$/ { lane = 1 } lane && /^ +run_ignored: / { lane = 0; next } { print }' \
+awk '/^          - name: cli-ignored$/ { lane = 1 } lane && /^ +run_ignored: / { lane = 0; next } { print }' \
   .github/workflows/ci.yml > "$STUBS/ci-no-mode.yml"
 workflow_case "$STUBS/ci-no-mode.yml" "a filtered matrix entry with no run_ignored field" \
-  "LANE MODE NOT READ: durability-and-closure/crash-safety: run_ignored is None"
+  "LANE MODE NOT READ: durability-and-closure/cli-ignored: run_ignored is None"
 
 sed 's/--run-ignored ${{ matrix.lane.run_ignored }}/--run-ignored all/' \
   .github/workflows/ci.yml > "$STUBS/ci-constant-mode.yml"
 workflow_case "$STUBS/ci-constant-mode.yml" "a lane command that ignores its run_ignored field" \
   "LANE MODE NOT READ: durability-and-closure: its nextest command does not pass --run-ignored"
 
-awk '/^          - name: crash-safety$/ { lane = 1 } lane && /^ +run_ignored: / { sub(/only$/, "default"); lane = 0 } { print }' \
+awk '/^          - name: cli-ignored$/ { lane = 1 } lane && /^ +run_ignored: / { sub(/only$/, "default"); lane = 0 } { print }' \
   .github/workflows/ci.yml > "$STUBS/ci-default-mode.yml"
 workflow_case "$STUBS/ci-default-mode.yml" "a lane whose run_ignored is default" \
-  "LANE MODE NOT READ: durability-and-closure/crash-safety: run_ignored is 'default', not one of only, all"
+  "LANE MODE NOT READ: durability-and-closure/cli-ignored: run_ignored is 'default', not one of only, all"
 
 awk '{ line = $0 }
      /^ +--run-ignored \$\{\{ matrix\.lane\.run_ignored \}\} \\$/ {

@@ -35,5 +35,5 @@ slow-timeout = { period = "300s", terminate-after = 4 }
 chaos-subprocess = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = "binary(auto_spawn_races) + binary(migrate_encoder_real_sigkill) + binary(snapshot_chaos_save_two_rename) + binary(wal_chaos_layer_b)"
+filter = "binary(auto_spawn_races) + binary(snapshot_chaos_save_two_rename) + binary(wal_chaos_layer_b)"
 test-group = "chaos-subprocess"

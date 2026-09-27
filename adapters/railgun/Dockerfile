@@ -39,8 +39,8 @@ COPY --from=build /build/adapters/railgun/target/release/raven-railgun \
      /usr/local/bin/raven-railgun
 RUN strip /usr/local/bin/raven-railgun || true
 
-# data: instance dirs; snapshots: export drop-zone; secrets: operator-mounted config + bearer + key
-VOLUME ["/srv/raven/data", "/srv/raven/snapshots", "/srv/raven/secrets"]
+# data: instance dirs; secrets: operator-mounted config + bearer token
+VOLUME ["/srv/raven/data", "/srv/raven/secrets"]
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=60s \
     CMD curl -f http://localhost:8080/v1/health/ready || exit 1

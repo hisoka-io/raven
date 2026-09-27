@@ -208,7 +208,7 @@ mod tests {
         format!("{h:016x}")
     }
 
-    /// The shipped helper at `cli/src/toy_server.rs` spells the same formula with `as u8`
+    /// The test helper at `cli/tests/support/toy_server.rs` spells the same formula with `as u8`
     /// instead of `u8::try_from(..).expect()`. Comparing those two spellings HERE would prove
     /// nothing: `(i + j) % 251` is always below 251, so the two cannot disagree on any input
     /// the function can produce. Testing the real divergence

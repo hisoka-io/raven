@@ -20,13 +20,10 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use raven_inspire::params::{InspireParams, InspireVariant};
-use raven_railgun_cli::serve_production::{
-    ProductionServeOptions, MIRROR_PREFLIGHT_FAILED_TOTAL, MIRROR_PREFLIGHT_TIMEOUT,
-};
 use raven_railgun_cli::serve_production_multi::{
     load_options_from_toml, run_with_listener, BootstrapObserver, BootstrapView, MultiServeOptions,
+    MIRROR_PREFLIGHT_FAILED_TOTAL, MIRROR_PREFLIGHT_TIMEOUT,
 };
-use raven_railgun_cli::snapshot_port::{run_export, ExportOptions};
 use raven_railgun_engine::imt::Imt;
 use raven_railgun_engine::inspire::{
     apply_wal_entry, re_encode_shard, setup_state_with_inspiring_seed, LogicalLeafStore,
@@ -35,7 +32,7 @@ use raven_railgun_engine::orchestrator::{
     bootstrap_railgun_engine_multi, DataSourceFilter, InstanceConfig, LEAVES_PER_PPOI_BLOCK,
 };
 use raven_railgun_engine::persistence::{ConsumerEvent, InspirePersistence};
-use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
+use raven_railgun_engine::pir_table::PirTableEncoder;
 use raven_railgun_engine::session_pool::BoundedSessionStore;
 use raven_railgun_engine::InstanceRole;
 use raven_railgun_http::status::{MirrorFeedState, MirrorFeedView};
@@ -43,7 +40,7 @@ use raven_railgun_http::HealthReadyResponse;
 use raven_railgun_persistence::{PpoiEventType, StoreLayout, WalEntryPayload};
 use raven_railgun_ppoi_mirror::{MirrorCursor, MirrorKind, PreflightFailure};
 use serde_json::{json, Value};
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 const BEARER_TOKEN: &str = "mirror-preflight-boot-token-padded";
@@ -274,13 +271,6 @@ async fn shut_down_within(booting: Booting, within: Duration) {
         .expect("graceful shutdown");
 }
 
-/// The single-instance path drains its indexer and mirror workers in turn on a graceful
-/// shutdown, up to 14 s each; nothing here is asserted after the verdict, so abort instead.
-async fn abort(booting: Booting) {
-    booting.server.abort();
-    let _ = tokio::time::timeout(Duration::from_secs(20), booting.server).await;
-}
-
 fn assert_refusal_names_the_dead_endpoint(refusal: &str, endpoint: &str, setting: &str) {
     assert!(
         refusal.contains(endpoint),
@@ -319,10 +309,7 @@ async fn served_through_failures(addr: SocketAddr) -> u64 {
 }
 
 fn rows_in(store: &parking_lot::Mutex<LogicalLeafStore>, list_key: &[u8; 32]) -> usize {
-    store
-        .lock()
-        .ppoi_imt(list_key)
-        .map_or(0, raven_railgun_engine::imt::Imt::leaf_count)
+    rows_in_store(&store.lock(), list_key)
 }
 
 fn local_rows(
@@ -918,181 +905,6 @@ async fn the_backfill_setting_pages_a_cold_sync_back_to_back_then_returns_to_the
     shut_down(booting).await;
 }
 
-/// Answers the two calls the single-instance path makes before it builds the mirror, and
-/// signals the second: that is the end of its instance bootstrap.
-async fn chain_rpc_with_a_finalized_block() -> (String, Arc<Notify>) {
-    let head_asked = Arc::new(Notify::new());
-    let signal = Arc::clone(&head_asked);
-    let app = Router::new().route(
-        "/",
-        post(move |Json(request): Json<Value>| {
-            let signal = Arc::clone(&signal);
-            async move {
-                let id = request.get("id").cloned().unwrap_or(Value::Null);
-                let result = match request.get("method").and_then(Value::as_str) {
-                    Some("eth_chainId") => json!("0x1"),
-                    Some("eth_getBlockByNumber") => {
-                        signal.notify_one();
-                        finalized_block()
-                    }
-                    _ => {
-                        return (
-                            StatusCode::OK,
-                            Json(json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "error": { "code": -32601, "message": "unsupported in fixture" }
-                            })),
-                        );
-                    }
-                };
-                (
-                    StatusCode::OK,
-                    Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })),
-                )
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let url = format!("http://{}", listener.local_addr().expect("local addr"));
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve");
-    });
-    (url, head_asked)
-}
-
-fn finalized_block() -> Value {
-    let zero_hash = format!("0x{}", "0".repeat(64));
-    json!({
-        "number": "0x10",
-        "hash": format!("0x{}", "1".repeat(64)),
-        "parentHash": zero_hash,
-        "sha3Uncles": zero_hash,
-        "logsBloom": format!("0x{}", "0".repeat(512)),
-        "transactionsRoot": zero_hash,
-        "stateRoot": zero_hash,
-        "receiptsRoot": zero_hash,
-        "miner": format!("0x{}", "0".repeat(40)),
-        "difficulty": "0x0",
-        "totalDifficulty": "0x0",
-        "mixHash": zero_hash,
-        "nonce": "0x0000000000000000",
-        "extraData": "0x",
-        "size": "0x0",
-        "gasLimit": "0x0",
-        "gasUsed": "0x0",
-        "timestamp": "0x0",
-        "transactions": [],
-        "uncles": [],
-        "baseFeePerGas": "0x0",
-    })
-}
-
-fn single_instance_options(
-    data_dir: &Path,
-    encoder: EncoderKind,
-    rpc_url: String,
-    mirror_endpoint: String,
-) -> ProductionServeOptions {
-    ProductionServeOptions {
-        bind: "127.0.0.1:0".parse().expect("addr"),
-        token: BEARER_TOKEN.to_owned(),
-        rpc_url,
-        railgun_proxy: "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9".to_owned(),
-        chain_id: 1,
-        start_block: 0,
-        mirror_endpoint,
-        list_key: OFAC_LIST_HEX.to_owned(),
-        data_dir: data_dir.to_path_buf(),
-        instance_id: "single".to_owned(),
-        max_concurrent_queries: 4,
-        respond_timeout_secs: 30,
-        entries: 65_536,
-        entry_bytes: 32,
-        encoder,
-        session_eviction_interval_secs: 0,
-        metrics_public: false,
-        enable_fanout: false,
-        max_fanout_shards: 16,
-        session_capacity: raven_railgun_cli::serve_production::SessionCapacity::default(),
-    }
-}
-
-async fn boot_single(opts: ProductionServeOptions, head_asked: &Notify) -> Booting {
-    let listener = tokio::net::TcpListener::bind(opts.bind)
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("local addr");
-    let (stop, stopped) = oneshot::channel::<()>();
-    let server = tokio::spawn(raven_railgun_cli::serve_production::run_with_listener(
-        opts,
-        listener,
-        async move {
-            let _ = stopped.await;
-        },
-    ));
-    tokio::time::timeout(Duration::from_secs(300), head_asked.notified())
-        .await
-        .expect("the single-instance path never asked the chain RPC for its head");
-    Booting { addr, server, stop }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_single_list_instance_holding_no_rows_refuses_an_upstream_that_never_answers() {
-    let data_dir = tempfile::tempdir().expect("tempdir");
-    let (rpc_url, head_asked) = chain_rpc_with_a_finalized_block().await;
-    let endpoint = upstream_that_never_answers().await;
-    let opts = single_instance_options(
-        data_dir.path(),
-        EncoderKind::PerListStatus {
-            list_key: ofac_list(),
-        },
-        rpc_url,
-        endpoint.clone(),
-    );
-    let mut booting = boot_single(opts, &head_asked).await;
-
-    match boot_verdict(&mut booting).await {
-        Boot::Refused(refusal) => {
-            assert_refusal_names_the_dead_endpoint(&refusal, &endpoint, "--mirror-endpoint");
-        }
-        Boot::Serving => panic!(
-            "a list instance holding no rows booted and is serving, against an upstream that \
-             never answers"
-        ),
-    }
-}
-
-/// The single-instance path runs a mirror beside every encoder, the default chain cell
-/// included. That cell serves chain rows, so the list upstream being down is not its outage.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_single_chain_instance_boots_past_an_upstream_that_never_answers_and_counts_it() {
-    let data_dir = tempfile::tempdir().expect("tempdir");
-    let (rpc_url, head_asked) = chain_rpc_with_a_finalized_block().await;
-    let endpoint = upstream_that_never_answers().await;
-    let opts = single_instance_options(
-        data_dir.path(),
-        EncoderKind::PerLeafBc { tree_number: 0 },
-        rpc_url,
-        endpoint,
-    );
-    let mut booting = boot_single(opts, &head_asked).await;
-
-    match boot_verdict(&mut booting).await {
-        Boot::Serving => {}
-        Boot::Refused(refusal) => panic!(
-            "a chain instance was kept down by the list upstream it does not serve from: {refusal}"
-        ),
-    }
-    assert!(
-        served_through_failures(booting.addr).await >= 1,
-        "serving past a dead upstream must be counted on /metrics"
-    );
-    abort(booting).await;
-}
-
 /// Holds rows `0..rows` of the list with the roots upstream publishes, one depth-16 tree per
 /// 65,536-row block, so every instance on the list applies what it is sent.
 async fn upstream_holding_rooted(rows: u64) -> (String, Requests) {
@@ -1236,7 +1048,7 @@ fn start_indices(requests: &Requests) -> Vec<u64> {
 /// The shipped PPOI instances on one list, fed cold from one upstream: each page of the list is
 /// asked for once, however many instances share it, and each instance ends holding every row
 /// its reach covers. Readiness is down while nothing is held and up once the feed is caught up,
-/// which is the state an operator waits for before stopping the process to export.
+/// which is the state an operator waits for before stopping the process to copy its data dirs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_ppoi_only_boot_asks_for_each_page_once_and_fills_every_instance_on_the_list() {
     const ROWS: u64 = 1_010;
@@ -1296,31 +1108,50 @@ async fn a_ppoi_only_boot_asks_for_each_page_once_and_fills_every_instance_on_th
     assert_eq!(preflights, 1, "and one preflight for the list");
     shut_down(booting).await;
 
-    // What the trigger promises: stopped once caught up, the export holds every row upstream had.
-    let exports = tempfile::tempdir().expect("tempdir");
-    let receipt = run_export(ExportOptions {
-        data_dir: data_root.path().to_path_buf(),
-        output: exports.path().join("export.tar.zst"),
-        signing_key: None,
-        keep_snapshots: 0,
-    })
-    .expect("export after a graceful stop");
-    let exported = |id: &str| -> u64 {
-        receipt
-            .instances
-            .iter()
-            .find(|(instance, _)| instance == id)
-            .map(|(_, recovered)| recovered.lists.iter().map(|list| list.leaf_count).sum())
-            .expect("every instance is exported")
-    };
+    // What the trigger promises: stopped once caught up, the data dirs hold every row upstream had.
     assert_eq!(
         (
-            exported(STATUS),
-            exported(PATHS_BLOCK_0),
-            exported(PATHS_BLOCK_1)
+            recovered_rows(data_root.path(), STATUS),
+            recovered_rows(data_root.path(), PATHS_BLOCK_0),
+            recovered_rows(data_root.path(), PATHS_BLOCK_1)
         ),
         (ROWS, ROWS, 0)
     );
+}
+
+/// Rows of the list `instance_id`'s data dir recovers to, reopened the way a boot reopens it.
+/// Rows come back through the commit or WAL replay alike, so this pins durability across the
+/// stop, not the stop's own final commit.
+fn recovered_rows(data_root: &Path, instance_id: &str) -> u64 {
+    let (opts, _) = shipped_ppoi_options(data_root, &[instance_id], "http://127.0.0.1:1");
+    let config = opts.instances.first().expect("the instance");
+    let encoder = config
+        .encoder
+        .build(config.record_size, config.entries_per_shard)
+        .expect("encoder");
+    let opened = InspirePersistence::open(
+        StoreLayout::open(&config.data_dir).expect("layout"),
+        config.scheme_tag.clone(),
+        config.instance_id.clone(),
+        config.snapshot_policy,
+        encoder,
+    )
+    .expect("reopen after a graceful stop");
+    assert!(
+        opened.recovered_state.is_some(),
+        "{instance_id}: nothing recoverable after the stop"
+    );
+    // Mirror rows carry no chain block, which is what `dump` reports for this marker.
+    assert_eq!(
+        opened.persistence.manifest_block_height(),
+        0,
+        "{instance_id}: a mirror-fed commit marker"
+    );
+    u64::try_from(rows_in_store(&opened.recovered_logical_store, &ofac_list())).expect("rows")
+}
+
+fn rows_in_store(store: &LogicalLeafStore, list_key: &[u8; 32]) -> usize {
+    store.ppoi_imt(list_key).map_or(0, Imt::leaf_count)
 }
 
 /// The fresh box the gate is written for: booted, answering, and holding nothing. Every other

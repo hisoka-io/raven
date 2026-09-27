@@ -5,7 +5,6 @@
 # mode it now runs with; these rows used to count --run-ignored all whatever the lane ran. Every
 # test that left a lane is non-ignored in a package whose railgun-tests shard runs it under the
 # same ci-test cargo profile, and the two terms that selected nothing under only were dropped.
-durability-and-closure/crash-safety	9
 durability-and-closure/wal-and-snapshot-chaos	4
 durability-and-closure/cli-ignored	21
 durability-and-closure/shipped-config-spawn	1

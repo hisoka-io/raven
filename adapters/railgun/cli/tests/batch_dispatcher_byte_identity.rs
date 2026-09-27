@@ -3,17 +3,20 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+#[path = "support/toy_server.rs"]
+mod toy_server;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use raven_inspire::{ServerResponse, ServerSessionHandle};
-use raven_railgun_cli::toy_server::{build_toy_pieces, ToyDbConfig, TOY_INSTANCE_ID};
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{build_seeded_query, RavenInspireScheme};
 use raven_railgun_engine::{Engine, PirInstance};
 use raven_railgun_http::{inspire_router, AppState, HttpConfig};
 use tokio::sync::oneshot;
+use toy_server::{build_toy_pieces, ToyDbConfig, TOY_INSTANCE_ID};
 
 const BEARER_TOKEN: &str = "batch-byte-identity-test-token";
 const BATCH_SIZE: usize = 16;

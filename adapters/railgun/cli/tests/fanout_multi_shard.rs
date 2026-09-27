@@ -8,10 +8,12 @@
     clippy::unwrap_used
 )]
 
+#[path = "support/toy_server.rs"]
+mod toy_server;
+
 use std::net::SocketAddr;
 
 use raven_inspire::ServerResponse;
-use raven_railgun_cli::toy_server::{build_toy_pieces, ToyDbConfig, TOY_INSTANCE_ID};
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{build_seeded_query, extract_response, RavenInspireScheme};
 use raven_railgun_engine::{DrainState, PirInstance};
@@ -20,6 +22,7 @@ use raven_railgun_http::{
 };
 use std::sync::Arc;
 use tokio::sync::oneshot;
+use toy_server::{build_toy_pieces, ToyDbConfig, TOY_INSTANCE_ID};
 
 const BEARER_TOKEN: &str = "fanout-multi-shard-test-token";
 const CLIENT_ID: &str = "00112233445566778899aabbccddeeff";
@@ -35,7 +38,7 @@ struct FanoutFixture {
     addr: SocketAddr,
     server: tokio::task::JoinHandle<()>,
     instance: Arc<PirInstance<RavenInspireScheme>>,
-    pieces: raven_railgun_cli::toy_server::ToyPieces,
+    pieces: toy_server::ToyPieces,
 }
 
 async fn spawn_multi_shard_server() -> FanoutFixture {
@@ -379,9 +382,8 @@ async fn fanout_refusal_reasons_reach_the_wire_as_400_and_the_cap_is_inclusive()
 /// direction that silently regresses is re-closing it. The bearer is not merely optional here:
 /// a wrong one is served too, since nothing on a read route consults it at all.
 ///
-/// The connection-close property these probes used to assert now belongs to the admin route,
-/// which is the only one that still refuses: see
-/// `http/tests/auth_reject_connection_close.rs::the_401_carries_connection_close_on_the_wire`.
+/// The 401 connection-close property belongs to `/metrics`, the only route that still refuses:
+/// see `http/tests/auth_reject_connection_close.rs::the_401_carries_connection_close_on_the_wire`.
 ///
 /// Leaving fan-out anonymous makes it a k-times amplifier for an uncredentialed caller. That
 /// is a deliberate consequence of opening the read path, left as an open decision rather
