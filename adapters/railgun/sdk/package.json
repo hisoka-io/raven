@@ -30,7 +30,7 @@
     "tag": "alpha"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.cjs.json && tsc -p tsconfig.build.esm.json && node ../scripts/finalize-sdk-build.mjs",
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.cjs.json && tsc -p tsconfig.build.esm.json && node ../scripts/finalize-sdk-build.mjs",
     "prepack": "npm run build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run --config tests/vitest.config.ts"
