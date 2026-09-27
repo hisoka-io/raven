@@ -109,7 +109,6 @@ impl Imt {
             )));
         }
 
-        // No staging needed: `leaf_count` advances only after the helper succeeds.
         if leaves.len() == 1 {
             self.set_leaf_and_update_path(start_index, leaves[0])?;
             self.leaf_count = end;
@@ -190,8 +189,16 @@ impl Imt {
                 "IMT root_after_append: tree is at capacity {TREE_MAX_ITEMS}"
             )));
         }
+        let path = self.path_hashes(self.leaf_count, leaf)?;
+        Ok(path[TREE_DEPTH - 1])
+    }
+
+    /// Hashes of levels `1..=TREE_DEPTH` on `leaf_index`'s path with `leaf` at level 0,
+    /// reading every sibling as stored.
+    fn path_hashes(&self, leaf_index: usize, leaf: [u8; 32]) -> Result<[[u8; 32]; TREE_DEPTH]> {
+        let mut path = [[0u8; 32]; TREE_DEPTH];
         let mut hash = leaf;
-        let mut index = self.leaf_count;
+        let mut index = leaf_index;
         for level in 0..TREE_DEPTH {
             let sibling = self.node_hash(level, index ^ 1);
             let (left, right) = if index & 1 == 0 {
@@ -201,33 +208,24 @@ impl Imt {
             };
             hash = merkle_node(left, right).map_err(|e| {
                 AdapterError::Internal(format!(
-                    "imt append preview level {} idx {}: {e}",
+                    "imt parent hash level {} idx {}: {e}",
                     level + 1,
                     index >> 1
                 ))
             })?;
+            path[level] = hash;
             index >>= 1;
         }
-        Ok(hash)
+        Ok(path)
     }
 
+    /// Hashes the whole path before storing any of it, so a refused leaf leaves the
+    /// tree untouched.
     fn set_leaf_and_update_path(&mut self, leaf_index: usize, leaf: [u8; 32]) -> Result<()> {
+        let path = self.path_hashes(leaf_index, leaf)?;
         self.nodes[0].insert(leaf_index, leaf);
-
-        let mut current_index = leaf_index;
-        for level in 1..=TREE_DEPTH {
-            let parent_index = current_index >> 1;
-            let left_index = parent_index << 1;
-            let right_index = left_index + 1;
-            let left = self.node_hash(level - 1, left_index);
-            let right = self.node_hash(level - 1, right_index);
-            let parent_hash = merkle_node(left, right).map_err(|e| {
-                AdapterError::Internal(format!(
-                    "imt parent hash level {level} idx {parent_index}: {e}"
-                ))
-            })?;
-            self.nodes[level].insert(parent_index, parent_hash);
-            current_index = parent_index;
+        for (level, hash) in (1..=TREE_DEPTH).zip(path) {
+            self.nodes[level].insert(leaf_index >> level, hash);
         }
         Ok(())
     }
@@ -571,6 +569,38 @@ mod tests {
         let mp = multi_path.merkle_proof(0).expect("mp proof");
         assert_eq!(fp.elements, mp.elements);
         assert_eq!(fp.indices, mp.indices);
+    }
+
+    #[test]
+    fn a_refused_single_leaf_leaves_every_stored_node_unchanged() {
+        let leaves: Vec<[u8; 32]> = (1..=3u8)
+            .map(|i| {
+                let mut b = [0u8; 32];
+                b[31] = i;
+                b
+            })
+            .collect();
+        let mut tree = Imt::new().expect("imt build");
+        tree.insert_leaves(0, &leaves).expect("seed");
+        let before = tree.clone();
+        let proofs_before: Vec<MerkleProof> = (0..leaves.len())
+            .map(|i| tree.merkle_proof(i).expect("proof"))
+            .collect();
+
+        // Above the BN254 scalar prime, so Poseidon refuses it at level 1.
+        tree.insert_leaves(3, &[[0xff; 32]])
+            .expect_err("a non-canonical leaf must be refused");
+
+        assert_eq!(tree.leaf_count(), 3);
+        assert_eq!(
+            tree.node(0, 3),
+            before.node(0, 3),
+            "the refused leaf was stored"
+        );
+        assert_eq!(tree.nodes, before.nodes, "a stored node changed");
+        for (i, proof) in proofs_before.iter().enumerate() {
+            assert_eq!(&tree.merkle_proof(i).expect("proof"), proof, "leaf {i}");
+        }
     }
 
     #[test]

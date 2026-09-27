@@ -33,6 +33,24 @@ pub fn resume_floor_refusals() -> u64 {
     RESUME_FLOOR_REFUSALS.load(Ordering::Relaxed)
 }
 
+static DIRECTORY_SYNCS: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide count of directory syncs the WAL has issued: those that make a
+/// log [`Wal::open`] created durable, and those of each [`Wal::archive`].
+/// Monotonic; nothing resets it.
+///
+/// ```
+/// let dir = tempfile::tempdir()?;
+/// let layout = raven_storage::StoreLayout::open(dir.path())?;
+/// let before = raven_storage::wal::directory_syncs();
+/// raven_storage::Wal::open(&layout, None)?;
+/// assert!(raven_storage::wal::directory_syncs() > before);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn directory_syncs() -> u64 {
+    DIRECTORY_SYNCS.load(Ordering::Relaxed)
+}
+
 /// One on-the-wire WAL entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WalEntry {
@@ -248,13 +266,22 @@ impl Wal {
     ///
     /// # Errors
     /// [`PersistenceError::Invariant`] when the floor sits above a non-empty
-    /// tail, plus any I/O failure while scanning or truncating.
+    /// tail, plus any I/O failure while creating, syncing, scanning or truncating.
     pub fn open(layout: &StoreLayout, last_committed_seq: Option<u64>) -> Result<Self> {
         let path = layout.wal_current_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let wal_dir = layout.wal_dir();
+        std::fs::create_dir_all(&wal_dir)?;
+        let creating = !path.try_exists()?;
         let file = open_wal_owner_only(&path)?;
+        if creating {
+            // An acknowledged append into a log whose entry a power loss drops is lost
+            // whole. Whoever made wal/ and data_dir (StoreLayout::open does) left their
+            // entries unsynced, and which ancestors are new is unknowable here, so all are.
+            file.sync_all()?;
+            for dir in std::fs::canonicalize(&wal_dir)?.ancestors() {
+                sync_directory(dir)?;
+            }
+        }
 
         let scan = scan_for_tail(&path)?;
 
@@ -500,16 +527,22 @@ fn reopen_current_after_archive(
     archive_parent: &std::path::Path,
 ) -> Result<File> {
     if let Some(source_parent) = current.parent() {
-        crate::fsync_parent_dir(source_parent)?;
+        sync_directory(source_parent)?;
     }
-    crate::fsync_parent_dir(archive_parent)?;
+    sync_directory(archive_parent)?;
     let new_file = open_wal_owner_only(current)?;
     new_file.sync_all()?;
     // second pass makes the new current.log's creation durable
     if let Some(source_parent) = current.parent() {
-        crate::fsync_parent_dir(source_parent)?;
+        sync_directory(source_parent)?;
     }
     Ok(new_file)
+}
+
+fn sync_directory(dir: &std::path::Path) -> std::io::Result<()> {
+    crate::fsync_parent_dir(dir)?;
+    DIRECTORY_SYNCS.fetch_add(1, Ordering::Relaxed);
+    Ok(())
 }
 
 /// Byte length the log must be restored to if a frame write fails.
