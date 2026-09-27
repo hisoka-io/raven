@@ -414,6 +414,137 @@ impl LogicalLeafStore {
         Ok(())
     }
 
+    /// Append a contiguous run of `AppendLeaf` rows for one tree, or of `PpoiListLeafAdded` rows
+    /// for one list, reaching the state [`Self::apply`] reaches row by row while hashing each tree
+    /// node once for the whole run.
+    ///
+    /// For fixtures and bootstrap only. WAL replay must stay per row: it skips a refused entry and
+    /// carries on, where this refuses the whole run.
+    ///
+    /// # Errors
+    /// The error [`Self::apply`] gives the first row it would refuse, or
+    /// [`AdapterError::InvalidQuery`] for a row of another kind, tree or list than the first. The
+    /// store is then untouched.
+    pub fn seed_leaf_run(
+        &mut self,
+        rows: &[(raven_railgun_persistence::WalEntryPayload, u64)],
+        encoder: &dyn crate::pir_table::PirTableEncoder,
+    ) -> Result<()> {
+        use raven_railgun_persistence::WalEntryPayload as P;
+        // (tree, list): exactly one is set, naming the IMT the whole run appends to.
+        let (tree, list) = match rows.first() {
+            None => return Ok(()),
+            Some((P::AppendLeaf { tree_number, .. }, _)) => (Some(*tree_number), None),
+            Some((P::PpoiListLeafAdded { list_key, .. }, _)) => (None, Some(*list_key)),
+            Some(_) => {
+                return Err(AdapterError::InvalidQuery(
+                    "seed_leaf_run: the first row is not a tree leaf".into(),
+                ));
+            }
+        };
+        let (slot, existing) = match (tree, list) {
+            (Some(tree_number), _) => (
+                ImtSlot::CommitmentTree(tree_number),
+                self.imts.get(&tree_number),
+            ),
+            (None, key) => (ImtSlot::PpoiList, key.and_then(|k| self.ppoi_imts.get(&k))),
+        };
+        let start = existing.map_or(0, crate::imt::Imt::leaf_count);
+
+        let mut leaves = Vec::with_capacity(rows.len());
+        for (offset, (payload, _)) in rows.iter().enumerate() {
+            let (index, leaf) = match payload {
+                P::AppendLeaf {
+                    tree_number,
+                    leaf_index,
+                    commitment,
+                } if tree == Some(*tree_number) => (*leaf_index, commitment),
+                P::PpoiListLeafAdded {
+                    list_key,
+                    list_index,
+                    blinded_commitment,
+                    ..
+                } if list == Some(*list_key) => (*list_index, blinded_commitment),
+                _ => {
+                    return Err(AdapterError::InvalidQuery(format!(
+                        "seed_leaf_run: row {offset} is not a leaf of the first row's tree"
+                    )));
+                }
+            };
+            checked_imt_append(slot, index, start.saturating_add(offset), leaf)?;
+            leaves.push(*leaf);
+        }
+
+        let mut imt = match existing {
+            Some(imt) => imt.clone(),
+            None => crate::imt::Imt::new()?,
+        };
+        imt.insert_leaves(start, &leaves)?;
+        match (tree, list) {
+            (Some(tree_number), _) => self.imts.insert(tree_number, imt),
+            (None, Some(key)) => self.ppoi_imts.insert(key, imt),
+            (None, None) => None,
+        };
+        for (payload, block_height) in rows {
+            self.record_seeded_leaf(payload, *block_height, encoder);
+        }
+        Ok(())
+    }
+
+    /// The bookkeeping of the matching [`Self::apply`] arm once its IMT append has succeeded.
+    fn record_seeded_leaf(
+        &mut self,
+        payload: &raven_railgun_persistence::WalEntryPayload,
+        block_height: u64,
+        encoder: &dyn crate::pir_table::PirTableEncoder,
+    ) {
+        use raven_railgun_persistence::WalEntryPayload as P;
+        match payload {
+            P::AppendLeaf {
+                tree_number,
+                leaf_index,
+                commitment,
+            } => {
+                let key = (*tree_number, *leaf_index);
+                self.leaves.insert(key, *commitment);
+                self.leaf_block_height.insert(key, block_height);
+                self.dirty_shards
+                    .extend(encoder.affected_shards_for_leaf(*tree_number, *leaf_index));
+            }
+            P::PpoiListLeafAdded {
+                list_key,
+                list_index,
+                blinded_commitment,
+                status,
+                event_type,
+                signature,
+                validated_merkleroot,
+            } => {
+                let bc_key = (*list_key, *blinded_commitment);
+                let idx_key = (*list_key, *list_index);
+                self.ppoi_bc_indices
+                    .insert((*list_key, *blinded_commitment, *list_index));
+                self.ppoi_index_bc.insert(idx_key, *blinded_commitment);
+                self.ppoi_event_metadata.insert(
+                    idx_key,
+                    raven_railgun_persistence::PpoiEventMetadata {
+                        event_type: *event_type,
+                        signature: signature.clone(),
+                        validated_merkleroot: *validated_merkleroot,
+                    },
+                );
+                self.ppoi_status.insert(bc_key, *status);
+                self.ppoi_block_height.insert(bc_key, block_height);
+                self.ppoi_list_leaf_block_height
+                    .insert(idx_key, block_height);
+                self.dirty_shards
+                    .extend(encoder.affected_shards_for_ppoi_leaf(list_key, *list_index));
+            }
+            P::PpoiStatus { .. } | P::Reorg { .. } | P::Heartbeat { .. } => {}
+        }
+        self.last_block_height = self.last_block_height.max(block_height);
+    }
+
     /// Number of leaves currently tracked.
     #[must_use]
     pub fn leaf_count(&self) -> usize {

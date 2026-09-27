@@ -1,5 +1,6 @@
 //! Per-shard re-encode cost across cell shapes; per-insert wall time is
-//! `dirty_shards x per_shard_re_encode`. Gated, stderr-only.
+//! `dirty_shards x per_shard_re_encode`. Also the logical cost of seeding a whole PPOI
+//! block, batched against row by row. Gated, stderr-only.
 
 #![allow(
     clippy::expect_used,
@@ -12,7 +13,10 @@
 use std::time::Instant;
 
 use raven_inspire::params::{InspireParams, InspireVariant};
-use raven_railgun_engine::inspire;
+use raven_railgun_engine::inspire::{self, apply_wal_entry, LogicalLeafStore};
+use raven_railgun_engine::orchestrator::LEAVES_PER_PPOI_BLOCK;
+use raven_railgun_engine::pir_table::PerLeafCommitmentEncoder;
+use raven_railgun_persistence::{PpoiEventType, WalEntryPayload};
 
 const CELLS: &[(u32, usize, &str)] = &[
     (16, 32, "65k_x_32B"),
@@ -111,4 +115,59 @@ fn per_shard_re_encode_cost_per_cell() {
     }
 
     eprintln!("INSERT_BENCH: ----- END -----");
+}
+
+/// A block of distinct canonical blinded commitments, one list, one row per slot.
+fn ppoi_block_rows() -> Vec<(WalEntryPayload, u64)> {
+    (0..LEAVES_PER_PPOI_BLOCK)
+        .map(|list_index| {
+            let mut bc = [0u8; 32];
+            bc[20] = 0x01;
+            bc[28..].copy_from_slice(&list_index.to_be_bytes());
+            let payload = WalEntryPayload::PpoiListLeafAdded {
+                list_key: [0x42; 32],
+                list_index,
+                blinded_commitment: bc,
+                status: u8::from(list_index.is_multiple_of(3)),
+                event_type: PpoiEventType::Shield,
+                signature: vec![0; 64],
+                validated_merkleroot: [0; 32],
+            };
+            (payload, 1_000 + u64::from(list_index))
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "seeds one 65,536-row PPOI block batched and row by row; about 30-60 s. Trigger: \
+            changing Imt::insert_leaves, LogicalLeafStore::seed_leaf_run or merkle_node."]
+fn ppoi_block_seed_batched_vs_per_row() {
+    let encoder = PerLeafCommitmentEncoder::new(32, LEAVES_PER_PPOI_BLOCK, 0).expect("encoder");
+    let rows = ppoi_block_rows();
+
+    let mut seeded = LogicalLeafStore::new();
+    let start = Instant::now();
+    seeded
+        .seed_leaf_run(&rows, &encoder)
+        .expect("seed_leaf_run");
+    let seed_s = start.elapsed().as_secs_f64();
+
+    let mut applied = LogicalLeafStore::new();
+    let start = Instant::now();
+    for (payload, height) in &rows {
+        apply_wal_entry(&mut applied, payload, *height, &encoder).expect("apply");
+    }
+    let apply_s = start.elapsed().as_secs_f64();
+
+    assert_eq!(
+        seeded.ppoi_imt_root(&[0x42; 32]),
+        applied.ppoi_imt_root(&[0x42; 32]),
+        "the batched seed must reach the row-by-row root"
+    );
+    eprintln!(
+        "INSERT_BENCH: ppoi_block rows={rows} seed_leaf_run_s={seed_s:.3} per_row_apply_s={apply_s:.3} \
+         speedup={speedup:.1}x",
+        rows = rows.len(),
+        speedup = apply_s / seed_s
+    );
 }

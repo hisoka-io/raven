@@ -5,8 +5,10 @@
 #![deny(missing_docs)]
 #![allow(clippy::items_after_statements)]
 
+use std::cell::RefCell;
+
 use ark_bn254::Fr;
-use ark_ff::{BigInteger, PrimeField};
+use ark_ff::{AdditiveGroup, BigInt, PrimeField};
 use light_poseidon::{Poseidon, PoseidonHasher};
 
 /// Errors surfaced by Poseidon helpers.
@@ -25,37 +27,76 @@ pub type Result<T, E = PoseidonError> = core::result::Result<T, E>;
 
 /// Decode a 32-byte big-endian buffer into a BN254 Fr, rejecting non-canonical inputs (>= modulus).
 fn fr_from_be_bytes(bytes: &[u8; 32]) -> Result<Fr> {
-    let candidate = Fr::from_be_bytes_mod_order(bytes);
-    let canonical = candidate.into_bigint().to_bytes_be();
-    if canonical.as_slice() != bytes.as_slice() {
-        return Err(PoseidonError::InvalidFr(format!("0x{}", hex_lower(bytes))));
+    let mut limbs = [0u64; 4];
+    for (limb, word) in limbs.iter_mut().rev().zip(bytes.as_chunks::<8>().0) {
+        *limb = u64::from_be_bytes(*word);
     }
-    Ok(candidate)
+    // `from_bigint` refuses anything at or above the modulus, which is the canonical check.
+    Fr::from_bigint(BigInt::new(limbs))
+        .ok_or_else(|| PoseidonError::InvalidFr(format!("0x{}", hex_lower(bytes))))
 }
 
 fn fr_to_be_bytes(fr: Fr) -> [u8; 32] {
-    let bytes = fr.into_bigint().to_bytes_be();
     let mut out = [0u8; 32];
-    let copy_len = bytes.len().min(32);
-    if let Some(dst) = out.get_mut(32 - copy_len..) {
-        if let Some(src) = bytes.get(..copy_len) {
-            dst.copy_from_slice(src);
-        }
+    for (word, limb) in out
+        .as_chunks_mut::<8>()
+        .0
+        .iter_mut()
+        .zip(fr.into_bigint().0.iter().rev())
+    {
+        *word = limb.to_be_bytes();
     }
     out
 }
 
+/// Highest arity light-poseidon's circom parameter set covers.
+const MAX_ARITY: usize = 12;
+
+thread_local! {
+    // `new_circom` rebuilds every round constant, which costs about a fifth of a 2-to-1 hash.
+    // A hasher clears its sponge at the end of each `hash`, so one per arity is reusable.
+    static HASHERS: RefCell<[Option<Poseidon<Fr>>; MAX_ARITY]> =
+        const { RefCell::new([const { None }; MAX_ARITY]) };
+}
+
+fn new_hasher(arity: usize) -> Result<Poseidon<Fr>> {
+    Poseidon::<Fr>::new_circom(arity)
+        .map_err(|e| PoseidonError::LightPoseidon(format!("new_circom: {e:?}")))
+}
+
 /// Circomlibjs-compatible Poseidon-BN254 over `inputs.len()` field elements (arity 1..=12).
 pub fn hash_n(inputs: &[[u8; 32]]) -> Result<[u8; 32]> {
-    let mut hasher = Poseidon::<Fr>::new_circom(inputs.len())
-        .map_err(|e| PoseidonError::LightPoseidon(format!("new_circom: {e:?}")))?;
-    let mut frs: Vec<Fr> = Vec::with_capacity(inputs.len());
-    for buf in inputs {
-        frs.push(fr_from_be_bytes(buf)?);
+    let arity = inputs.len();
+    if arity == 0 || arity > MAX_ARITY {
+        new_hasher(arity)?;
+        return Err(PoseidonError::LightPoseidon(format!(
+            "unsupported arity {arity}"
+        )));
     }
+    let mut frs = [Fr::ZERO; MAX_ARITY];
+    for (slot, buf) in frs.iter_mut().zip(inputs) {
+        *slot = fr_from_be_bytes(buf)?;
+    }
+    let frs = frs.get(..arity).unwrap_or_default();
+
+    // Taken out of the slot for the duration of the hash: a hasher that errors or unwinds
+    // mid-sponge is dropped rather than returned, so the next call rebuilds it clean.
+    let cached = HASHERS
+        .try_with(|cell| cell.borrow_mut().get_mut(arity - 1).and_then(Option::take))
+        .ok()
+        .flatten();
+    let mut hasher = match cached {
+        Some(hasher) => hasher,
+        None => new_hasher(arity)?,
+    };
     let hash = hasher
-        .hash(&frs)
+        .hash(frs)
         .map_err(|e| PoseidonError::LightPoseidon(format!("hash: {e:?}")))?;
+    let _ = HASHERS.try_with(|cell| {
+        if let Some(slot) = cell.borrow_mut().get_mut(arity - 1) {
+            *slot = Some(hasher);
+        }
+    });
     Ok(fr_to_be_bytes(hash))
 }
 

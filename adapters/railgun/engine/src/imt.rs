@@ -116,14 +116,52 @@ impl Imt {
             return Ok(());
         }
 
-        // Stage a clone so a mid-loop failure on a non-canonical leaf rolls back.
-        let mut staged = self.clone();
-        for (offset, leaf) in leaves.iter().enumerate() {
-            let leaf_index = start_index + offset;
-            staged.set_leaf_and_update_path(leaf_index, *leaf)?;
+        self.append_run(start_index, leaves)?;
+        self.leaf_count = end;
+        Ok(())
+    }
+
+    /// Writes exactly the nodes per-leaf insertion would, each hashed once: about
+    /// `leaves.len() + TREE_DEPTH` hashes instead of `TREE_DEPTH` per leaf. Every node is
+    /// staged first, so a non-canonical leaf refuses the run with the tree untouched.
+    fn append_run(&mut self, start_index: usize, leaves: &[[u8; 32]]) -> Result<()> {
+        let Some(last_index) = (start_index + leaves.len()).checked_sub(1) else {
+            return Ok(());
+        };
+        let mut levels: Vec<Vec<[u8; 32]>> = Vec::with_capacity(TREE_DEPTH + 1);
+        levels.push(leaves.to_vec());
+        for level in 1..=TREE_DEPTH {
+            let children = &levels[level - 1];
+            let children_start = start_index >> (level - 1);
+            let child = |index: usize| {
+                index
+                    .checked_sub(children_start)
+                    .and_then(|offset| children.get(offset))
+                    .copied()
+                    .unwrap_or_else(|| self.node_hash(level - 1, index))
+            };
+            let first = start_index >> level;
+            let last = last_index >> level;
+            let mut parents = Vec::with_capacity(last - first + 1);
+            for parent_index in first..=last {
+                let left = child(parent_index << 1);
+                let right = child((parent_index << 1) + 1);
+                parents.push(merkle_node(left, right).map_err(|e| {
+                    AdapterError::Internal(format!(
+                        "imt parent hash level {level} idx {parent_index}: {e}"
+                    ))
+                })?);
+            }
+            levels.push(parents);
         }
-        staged.leaf_count = end;
-        *self = staged;
+        for (level, hashes) in levels.into_iter().enumerate() {
+            let first = start_index >> level;
+            let level_map = &mut self.nodes[level];
+            level_map.reserve(hashes.len());
+            for (offset, hash) in hashes.into_iter().enumerate() {
+                level_map.insert(first + offset, hash);
+            }
+        }
         Ok(())
     }
 
@@ -431,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "fills the full 65,536-leaf tree, ~1M Poseidon hashes; release-only. Trigger: \
+    #[ignore = "fills the full 65,536-leaf tree in one run, 65,535 Poseidon hashes. Trigger: \
                 changing TREE_MAX_ITEMS, Imt::insert_leaves, or the capacity guard. CI runs it in \
                 the durability + closure engine-ignored lane."]
     fn insert_rejects_overflow_past_capacity() {
