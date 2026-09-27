@@ -10,7 +10,6 @@ import {
   TOKEN,
   authPathOf,
   encodeBatchResponse,
-  encodedBatchCount,
   stubCtx,
 } from "./helpers/auth_path_stub";
 
@@ -31,7 +30,7 @@ function mountBatchRoute(server: MockServer, policy: HeaderPolicy): void {
       if (policy.epoch !== null) headers["x-raven-epoch"] = policy.epoch;
       if (policy.schemaVersion !== null) headers["x-raven-schema-version"] = policy.schemaVersion;
       res.writeHead(200, headers);
-      res.end(Buffer.from(encodeBatchResponse(SERVED_EPOCH, encodedBatchCount(body))));
+      res.end(Buffer.from(encodeBatchResponse(SERVED_EPOCH, body)));
       return true;
     },
   );

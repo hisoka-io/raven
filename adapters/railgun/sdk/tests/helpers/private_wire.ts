@@ -1,4 +1,9 @@
-import { containsByteSequence, hexToBytes } from "../../src/index";
+import {
+  containsByteSequence,
+  decodeClientPirQueryBundle,
+  hexToBytes,
+  type RavenInspireWasm,
+} from "../../src/index";
 import { EXPECTED_WIRE_SCHEMA_PREFIX } from "./wire_schema";
 
 export const STUB_QUERY_BYTES = 64;
@@ -171,8 +176,56 @@ export function stubQueryBundle(queryBytes: Uint8Array = defaultStubQuery()): Ui
   return out;
 }
 
+/** A stub query naming its target in its first 8 bytes, so a mock answers per row as a node does
+ *  rather than per slot, which the SDK shuffles. */
+export function targetNamingQueryBundle(target: bigint | number): Uint8Array {
+  const query = defaultStubQuery();
+  new DataView(query.buffer).setBigUint64(0, BigInt(target), true);
+  return stubQueryBundle(query);
+}
+
+/** Targets named by a batch of `targetNamingQueryBundle` queries, in wire order. */
+export function namedBatchTargets(body: Uint8Array): number[] {
+  const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
+  const count = Number(view.getBigUint64(2, true));
+  return Array.from({ length: count }, (_unused, slot) =>
+    Number(view.getBigUint64(10 + slot * STUB_QUERY_BYTES, true)),
+  );
+}
+
 function defaultStubQuery(): Uint8Array {
   const query = new Uint8Array(STUB_QUERY_BYTES);
   query.fill(0xa5);
   return query;
+}
+
+/** `wasm` with every query it builds remembered by its bytes, so a mock can answer an encrypted
+ *  batch per target, as a node does, although the SDK shuffles its slots. */
+export function targetRecordingWasm(wasm: RavenInspireWasm): {
+  wasm: RavenInspireWasm;
+  targetsOf: (batchBody: Uint8Array) => (number | undefined)[];
+} {
+  const targets = new Map<string, number>();
+  const recording: RavenInspireWasm = {
+    ...wasm,
+    build_seeded_query: (session, shardConfig, target) => {
+      const bundle = wasm.build_seeded_query(session, shardConfig, target);
+      const { queryBytes } = decodeClientPirQueryBundle(bundle);
+      targets.set(Buffer.from(queryBytes).toString("base64"), Number(target));
+      return bundle;
+    },
+  };
+  const targetsOf = (batchBody: Uint8Array): (number | undefined)[] => {
+    const view = new DataView(batchBody.buffer, batchBody.byteOffset, batchBody.byteLength);
+    const count = Number(view.getBigUint64(2, true));
+    const width = (batchBody.length - 10) / count;
+    return Array.from({ length: count }, (_unused, slot) =>
+      targets.get(
+        Buffer.from(batchBody.subarray(10 + slot * width, 10 + (slot + 1) * width)).toString(
+          "base64",
+        ),
+      ),
+    );
+  };
+  return { wasm: recording, targetsOf };
 }

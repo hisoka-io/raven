@@ -39,6 +39,20 @@ function batches(server: MockServer): { url: string; targets: number[] }[] {
     .map((request) => ({ url: request.url, targets: batchTargets(request.body) }));
 }
 
+/** One batch per list, each a single cover query at a row that list's instance holds. */
+function expectLoneCover(
+  asked: { url: string; targets: number[] }[],
+  lists: [string, number][],
+): void {
+  expect(asked.map(({ url }) => url)).toEqual(
+    lists.map(([lk]) => `/v1/instance/t1Status-${lk}/batch`),
+  );
+  asked.forEach(({ targets }, position) => {
+    expect(targets).toHaveLength(1);
+    expect(targets[0]).toBeLessThan(lists[position][1]);
+  });
+}
+
 async function refusalOf(call: Promise<unknown>): Promise<Error> {
   let answered: unknown;
   try {
@@ -98,10 +112,8 @@ describe("a status index the whole-list instance does not hold", () => {
     expect(refusal.message).toMatch(/capacity of 65536 rows/);
     expect(refusal.message).toContain(`t1Status-${LIST_A}`);
     // The list is still asked, exactly as for an absent commitment, so what the node sees does
-    // not depend on where the commitment sits.
-    expect(batches(server)).toEqual([
-      { url: `/v1/instance/t1Status-${LIST_A}/batch`, targets: [0] },
-    ]);
+    // not depend on where the commitment sits: one cover at a row the instance holds.
+    expectLoneCover(batches(server), [[LIST_A, TREE_ROWS]]);
   });
 
   it("names an index and a capacity that differ", async () => {
@@ -142,10 +154,9 @@ describe("a status index the whole-list instance does not hold", () => {
     );
 
     expect(refusal.message).toMatch(/list index 65536 is past the instance's capacity of 65536/);
-    expect(batches(server)).toEqual([
-      { url: `/v1/instance/t1Status-${LIST_A}/batch`, targets: [0] },
-      { url: `/v1/instance/t1Status-${LIST_B}/batch`, targets: [3] },
-    ]);
+    const [coverA, realB] = batches(server);
+    expectLoneCover([coverA], [[LIST_A, TREE_ROWS]]);
+    expect(realB).toEqual({ url: `/v1/instance/t1Status-${LIST_B}/batch`, targets: [3] });
   });
 });
 

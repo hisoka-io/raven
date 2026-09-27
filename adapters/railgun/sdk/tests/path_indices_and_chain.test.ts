@@ -30,6 +30,7 @@ import {
 } from "./helpers/path10_row";
 import { EXPECTED_WIRE_SCHEMA_VERSION } from "./helpers/wire_schema";
 import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
+import { targetNamingQueryBundle } from "./helpers/private_wire";
 
 import * as wasmPkg from "raven-inspire-client-wasm";
 
@@ -77,7 +78,7 @@ function realPathStubWasm(): RavenInspireWasm {
   return {
     ...stubRemoteSessionExports(),
     build_client_session: () => ({ free: () => undefined }),
-    build_seeded_query: () => new Uint8Array(16),
+    build_seeded_query: (_session, _shards, target) => targetNamingQueryBundle(target),
     extract_response: (_session, _crs, _state, response, _entry) => {
       // Pass-through: test routes encode the desired plaintext directly into the response body.
       if (response.length === 0) return new Uint8Array(0);
@@ -124,10 +125,10 @@ function stubCtx(): ClientPirContext {
 function mountBatchRoute(server: MockServer, freshness?: { epoch?: number; schemaVersion?: number }): void {
   server.route(
     (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
-    (_req, _body, res) => {
-      // 16 synthetic nodes: 0xab marker at byte 0, level at byte 31 — the shared
-      // encoder's (epoch, slot) convention, so the shape has ONE writer.
-      const out = encodeBatchResponse(0xab, 16);
+    (_req, body, res) => {
+      // Synthetic nodes: 0xab marker at byte 0, the named row's level at byte 31 -- the shared
+      // encoder's convention, so the shape has ONE writer.
+      const out = encodeBatchResponse(0xab, body);
       // `build_response_headers` stamps both on every batch reply, so the mock always does too.
       const headers: Record<string, string> = {
         "content-type": "application/octet-stream",
@@ -152,20 +153,8 @@ function mountEchoingBatchRoute(
     (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
     (_req, body, res) => {
       onHit?.();
-      const slots = encodedBatchCount(body);
-      const elemBytes = 32;
-      const out = new Uint8Array(2 + 8 + slots * (8 + elemBytes));
-      out[1] = 8;
-      const dv = new DataView(out.buffer);
-      dv.setUint32(2, slots, true);
-      let off = 10;
-      for (let slot = 0; slot < slots; slot += 1) {
-        dv.setUint32(off, elemBytes, true);
-        off += 8;
-        out[off] = 0xab;
-        out[off + elemBytes - 1] = slot;
-        off += elemBytes;
-      }
+      // Tagged by the level of the row each slot names, since the SDK shuffles its slots.
+      const out = encodeBatchResponse(0xab, body);
       const tags = freshness?.() ?? { epoch: MOCK_EPOCH, schemaVersion: MOCK_SCHEMA_VERSION };
       res.writeHead(200, {
         "content-type": "application/octet-stream",

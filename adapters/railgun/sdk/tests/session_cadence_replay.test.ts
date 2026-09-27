@@ -13,6 +13,7 @@ import {
   TOKEN,
 } from "./helpers/auth_path_stub";
 import { STUB_QUERY_BYTES, stubQueryBundle } from "./helpers/private_wire";
+import { shardConfigBincode } from "./helpers/shard_config";
 
 const TRANSACTION_COUNT = 20_000;
 const INPUTS_PER_TRANSACTION = 2;
@@ -119,7 +120,7 @@ async function replayActualSdk(_timestamps: readonly number[]): Promise<CadenceD
     wasm,
     session: { free: () => undefined },
     crsBincode: new Uint8Array(0),
-    shardConfigBincode: new Uint8Array(0),
+    shardConfigBincode: shardConfigBincode(),
     entrySize: NODE_BYTES,
   };
   const fetchImpl: typeof fetch = async (input, init) => {

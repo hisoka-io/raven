@@ -6,8 +6,8 @@ import { RavenError } from "./errors";
  * Wallet-facing POI verdict. `Unreachable` is SDK-local: no adapter response was
  * received, so it must not be treated like the adapter's non-blocking `Missing` verdict.
  * `MissingStale` is SDK-local too: absent from an index or map that could not be shown to cover
- * the list the node serves, answered only when the caller opted in to that. The engine reads it
- * as it reads `Missing`, since it acts only on `Valid`, `ShieldBlocked` and `ProofSubmitted`.
+ * the list the node serves, answered only when the caller opted in to that. Neither reaches the
+ * engine: the engine-shaped `getPOIsPerList` leaves such a commitment out instead.
  */
 export type POIStatus =
   | "Valid"

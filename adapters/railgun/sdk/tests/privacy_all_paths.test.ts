@@ -6,7 +6,7 @@ import { afterEach, beforeAll, describe, expect, it, afterAll } from "vitest";
 import { RavenPOINodeInterface, containsByteSequence, paddedBatchLength } from "../src/index";
 import type { ClientPirContext } from "../src/index";
 
-import { loadFixture, makeClientPirContext } from "./helpers/fixture";
+import { fixtureResponsesFor, loadFixture, makeClientPirContext } from "./helpers/fixture";
 import { encodeBatchResponseNodes, encodedBatchCount } from "./helpers/auth_path_stub";
 import { startMockServer, writeBinary, writeJson, type MockServer } from "./helpers/mock_server";
 import { mountPrefixChannel } from "./helpers/prefix_channel";
@@ -225,18 +225,13 @@ describe("privacy across every SDK call path", () => {
         .map((idx) => fixture.meta.bcs_hex[idx]);
       const nonMemberBcs = ["77".repeat(32), "88".repeat(32), "99".repeat(32)];
       const served = fixture.meta.target_indices.slice(0, 3);
-      let batchNumber = 0;
       server.route(
         (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
         (_req, body, res) => {
-          const count = encodedBatchCount(body);
-          const real =
-            batchNumber === 0
-              ? [fixture.responsesByIdx.get(served[0])!]
-              : served.map((idx) => fixture.responsesByIdx.get(idx)!);
-          batchNumber += 1;
-          const responses = Array.from({ length: count }, (_unused, slot) =>
-            slot < real.length ? real[slot] : real[0],
+          const responses = fixtureResponsesFor(
+            fixture,
+            body,
+            fixture.responsesByIdx.get(served[0])!,
           );
           writeBinary(res, encodeBatchResponseNodes(responses));
           return true;

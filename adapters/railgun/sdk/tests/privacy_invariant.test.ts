@@ -13,11 +13,12 @@ import { RavenPOINodeInterface, containsByteSequence } from "../src/index";
 import type { ClientPirContext, RavenInspireWasm } from "../src/index";
 
 import * as wasmPkg from "raven-inspire-client-wasm";
-import { encodeBatchResponseNodes, encodedBatchCount } from "./helpers/auth_path_stub";
+import { encodeBatchResponseNodes } from "./helpers/auth_path_stub";
 import { EXPECTED_WIRE_SCHEMA_PREFIX } from "./helpers/wire_schema";
 import {
   assertNoCommitmentsInPirRequests,
   injectCommitment,
+  targetRecordingWasm,
 } from "./helpers/private_wire";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -61,10 +62,10 @@ interface MockServerHandle {
 async function startMockServer(
   meta: FixtureMeta,
   responsesByIdx: Map<number, Uint8Array>,
+  targetsOf: (batchBody: Uint8Array) => (number | undefined)[],
 ): Promise<MockServerHandle> {
   const receivedBodies: { url: string; method: string; body: Uint8Array }[] = [];
-
-  const responseSequence = meta.target_indices;
+  const anyResponse = responsesByIdx.get(meta.target_indices[0])!;
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const chunks: Buffer[] = [];
@@ -104,8 +105,9 @@ async function startMockServer(
       }
 
       if (url.match(/^\/v1\/instance\/[^/]+\/batch$/)) {
-        const responses = Array.from({ length: encodedBatchCount(body) }, (_unused, slot) =>
-          responsesByIdx.get(responseSequence[slot % responseSequence.length])!,
+        // Answered per target, as a node does; a cover slot gets any recorded response.
+        const responses = targetsOf(new Uint8Array(body)).map(
+          (target) => (target === undefined ? undefined : responsesByIdx.get(target)) ?? anyResponse,
         );
         res.writeHead(200, {
           "content-type": "application/octet-stream",
@@ -134,10 +136,12 @@ async function stopMockServer(h: MockServerHandle): Promise<void> {
   );
 }
 
+const recording = targetRecordingWasm(wasmPkg as unknown as RavenInspireWasm);
+
 function makeClientPirContext(
   fixture: ReturnType<typeof loadFixture>,
 ): ClientPirContext {
-  const wasm = wasmPkg as unknown as RavenInspireWasm;
+  const wasm = recording.wasm;
   const session = wasm.build_client_session(fixture.paramsBundle, fixture.crsBincode);
   return {
     wasm,
@@ -156,7 +160,7 @@ describe("RavenPOINodeInterface privacy invariant", () => {
   beforeAll(async () => {
     fixture = loadFixture();
     ctx = makeClientPirContext(fixture);
-    mock = await startMockServer(fixture.meta, fixture.responsesByIdx);
+    mock = await startMockServer(fixture.meta, fixture.responsesByIdx, recording.targetsOf);
   });
 
   afterAll(async () => {

@@ -9,7 +9,12 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { RavenPOINodeInterface, RavenError, type POIStatus } from "../src/index";
 import type { ClientPirContext } from "../src/index";
 
-import { loadFixture, makeClientPirContext, type LoadedFixture } from "./helpers/fixture";
+import {
+  fixtureResponsesFor,
+  loadFixture,
+  makeClientPirContext,
+  type LoadedFixture,
+} from "./helpers/fixture";
 import { encodeBatchResponseNodes, encodedBatchCount } from "./helpers/auth_path_stub";
 import { EXPECTED_WIRE_SCHEMA_VERSION } from "./helpers/wire_schema";
 import { startMockServer, writeBinary, type MockServer } from "./helpers/mock_server";
@@ -51,15 +56,13 @@ describe("T1 end-to-end: real PIR decode from wire bytes to verdicts", () => {
   }
 
   it("returns the verdicts native Rust encoded, decoded from real responses", async () => {
-    // The batch's real prefix keeps supplied order; padding follows it.
-    const sequence = [...fixture.meta.target_indices];
+    // Answered per target, as a node does: the SDK shuffles real and cover slots.
     server.reset();
     server.route(
       (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
       (_req, body, res) => {
-        const responses = Array.from({ length: encodedBatchCount(body) }, (_unused, slot) =>
-          fixture.responsesByIdx.get(sequence[slot % sequence.length])!,
-        );
+        const cover = fixture.responsesByIdx.get(fixture.meta.target_indices[0])!;
+        const responses = fixtureResponsesFor(fixture, body, cover);
         writeBinary(res, encodeBatchResponseNodes(responses));
         return true;
       },

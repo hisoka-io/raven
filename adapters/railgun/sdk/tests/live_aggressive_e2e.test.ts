@@ -20,8 +20,8 @@ import {
   foldMerkleRoot,
   pathIndicesForLeaf,
 } from "../src/index";
-import { drawPaddedSlots } from "../src/batch-ladder";
-import { decodeClientPirQueryBundle } from "../src/client-pir";
+import { buildPaddedQueryPlan, recoverRealQueryResponses } from "../src/batch-cover";
+import { decodeClientPirQueryBundle, decodeShardGeometry } from "../src/client-pir";
 import {
   LIVE_URL,
   PPOI_STATUS_INSTANCE,
@@ -249,7 +249,9 @@ async function fetchBatch(
   ctx: ClientPirContext,
   flatIndices: number[],
 ): Promise<BatchResult> {
-  const slots = drawPaddedSlots(flatIndices);
+  const { entriesPerShard, totalEntries } = decodeShardGeometry(ctx.shardConfigBincode);
+  const plan = buildPaddedQueryPlan(flatIndices, entriesPerShard, totalEntries);
+  const slots = plan.wireTargets;
   const queryBundles = slots.map((idx) =>
     decodeClientPirQueryBundle(
       ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, BigInt(idx)),
@@ -279,8 +281,8 @@ async function fetchBatch(
   // `build_seeded_query` produced; a re-issue draws fresh randomness and fails.
   const clientStates = queryBundles.map((b) => b.clientStateBincode);
   return {
-    responses: out.slice(0, flatIndices.length),
-    clientStates: clientStates.slice(0, flatIndices.length),
+    responses: recoverRealQueryResponses(plan, out),
+    clientStates: recoverRealQueryResponses(plan, clientStates),
     bodyBytes: body.length,
     responseBytes: respBuf.length,
   };

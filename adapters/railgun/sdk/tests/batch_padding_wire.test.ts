@@ -19,7 +19,7 @@ function mountEchoingBatchRoute(server: MockServer): void {
     (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
     (_req, body, res) => {
       // Shared encoder, (epoch=0xab, slot) node convention; one writer for the wire shape.
-      const out = encodeBatchResponse(0xab, encodedBatchCount(body));
+      const out = encodeBatchResponse(0xab, body);
       res.writeHead(200, {
         "content-type": "application/octet-stream",
         "x-raven-epoch": "1",

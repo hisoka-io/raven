@@ -1,7 +1,7 @@
 {
   "name": "@hisoka-io/railgun-poi-node-interface",
   "version": "0.1.0-alpha.0",
-  "description": "Drop-in RavenPOINodeInterface for the Railgun wallet stack: PIR-substituted T1 status + T2 PPOI auth-paths + T3 commit-tree auth-paths against a Raven adapter server.",
+  "description": "A POINodeInterface for the Railgun engine that resolves PPOI status, PPOI auth-paths and commit-tree auth-paths from a Raven adapter server, by client-side PIR unless configured otherwise.",
   "type": "module",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",

@@ -9,7 +9,6 @@ import { startMockServer, writeJson, type MockServer } from "./helpers/mock_serv
 import {
   authPathOf,
   encodeBatchResponse,
-  encodedBatchCount,
   epochMarkers,
   stubCtx,
 } from "./helpers/auth_path_stub";
@@ -43,7 +42,7 @@ function mountAdapter(server: MockServer, state: AdapterState): void {
         "x-raven-epoch": String(state.epoch),
         "x-raven-schema-version": String(SCHEMA_VERSION),
       });
-      res.end(Buffer.from(encodeBatchResponse(state.epoch, encodedBatchCount(body))));
+      res.end(Buffer.from(encodeBatchResponse(state.epoch, body)));
       return true;
     },
   );

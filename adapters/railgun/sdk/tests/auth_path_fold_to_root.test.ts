@@ -13,7 +13,6 @@ import {
   TOKEN,
   authPathOf,
   encodeBatchResponse,
-  encodedBatchCount,
   stubCtx,
 } from "./helpers/auth_path_stub";
 import {
@@ -49,7 +48,7 @@ function mountBatchRoute(server: MockServer, epoch: number): void {
         "x-raven-schema-version": "6",
         "x-raven-freshness": "lag_blocks=0 applied_height=0 epoch=1 confidence=1",
       });
-      res.end(Buffer.from(encodeBatchResponse(epoch, encodedBatchCount(body))));
+      res.end(Buffer.from(encodeBatchResponse(epoch, body)));
       return true;
     },
   );

@@ -19,7 +19,7 @@ import {
   type JsonRpcRequest,
   type MockServer,
 } from "./helpers/mock_server";
-import { encodeBatchResponse, encodedBatchCount, stubCtx as pathStubCtx } from "./helpers/auth_path_stub";
+import { encodeBatchResponse, stubCtx as pathStubCtx } from "./helpers/auth_path_stub";
 import {
   PATH10_ROW_BYTES,
   mountPath10Route,
@@ -109,7 +109,7 @@ function mountNodeBatchRoute(server: MockServer): void {
       /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? "") &&
       !(req.url ?? "").includes("/instance/t2Path-"),
     (_req, body, res) => {
-      writeBinary(res, encodeBatchResponse(1, encodedBatchCount(body)), {
+      writeBinary(res, encodeBatchResponse(1, body), {
         "x-raven-epoch": "1",
         "x-raven-schema-version": String(EXPECTED_WIRE_SCHEMA_VERSION),
       });

@@ -14,7 +14,6 @@ import {
 import {
   encodeBatchResponse,
   encodeBatchResponseNodes,
-  encodedBatchCount,
   stubCtx as nodeAuthPathContext,
 } from "./helpers/auth_path_stub";
 import {
@@ -195,7 +194,7 @@ describe("private response freshness fallback", () => {
     adapter.route(
       (req) => req.url?.endsWith("/batch") ?? false,
       (_req, body, res) => {
-        writeBinary(res, encodeBatchResponse(1, encodedBatchCount(body)), {
+        writeBinary(res, encodeBatchResponse(1, body), {
           "x-raven-freshness": STALE_FRESHNESS,
         });
         return true;
@@ -232,7 +231,7 @@ describe("private response freshness fallback", () => {
     adapter.route(
       (req) => req.url?.endsWith("/batch") ?? false,
       (_req, body, res) => {
-        writeBinary(res, encodeBatchResponse(1, encodedBatchCount(body)), {
+        writeBinary(res, encodeBatchResponse(1, body), {
           "x-raven-freshness":
             `lag_blocks=0 applied_height=10 epoch=1 confidence=${confidence}`,
         });
@@ -260,7 +259,7 @@ describe("private response freshness fallback", () => {
     adapter.route(
       (req) => req.url?.endsWith("/batch") ?? false,
       (_req, body, res) => {
-        writeBinary(res, encodeBatchResponse(1, encodedBatchCount(body)), {
+        writeBinary(res, encodeBatchResponse(1, body), {
           "x-raven-freshness": STALE_FRESHNESS,
         });
         return true;
@@ -312,7 +311,7 @@ describe("private response freshness fallback", () => {
     adapter.route(
       (req) => req.url?.endsWith("/batch") ?? false,
       (_req, body, res) => {
-        writeBinary(res, encodeBatchResponse(1, encodedBatchCount(body)), {
+        writeBinary(res, encodeBatchResponse(1, body), {
           "x-raven-freshness": STALE_FRESHNESS,
         });
         return true;
@@ -367,7 +366,7 @@ describe("private response freshness fallback", () => {
     adapter.route(
       (req) => req.url?.endsWith("/batch") ?? false,
       (_req, body, res) => {
-        writeBinary(res, encodeBatchResponse(1, encodedBatchCount(body)), {
+        writeBinary(res, encodeBatchResponse(1, body), {
           "x-raven-epoch": "1",
           "x-raven-schema-version": "6",
           "x-raven-freshness": STALE_FRESHNESS,
@@ -626,7 +625,7 @@ describe("private response freshness fallback", () => {
             ? encodeBatchResponseNodes([
                 path10Slot({ bcHex: BC_HEX, nodes: PATH10_NODES }),
               ])
-            : encodeBatchResponse(1, encodedBatchCount(body));
+            : encodeBatchResponse(1, body);
           writeBinary(res, payload, {
             "x-raven-epoch": "1",
             "x-raven-schema-version": "7",
@@ -766,7 +765,7 @@ describe("private response freshness fallback", () => {
           };
           if (header !== null) headers["x-raven-freshness"] = header;
           res.writeHead(200, headers);
-          res.end(Buffer.from(encodeBatchResponse(1, encodedBatchCount(body))));
+          res.end(Buffer.from(encodeBatchResponse(1, body)));
           return true;
         },
       );

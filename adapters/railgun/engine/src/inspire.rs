@@ -325,13 +325,84 @@ fn uniform_below(bound: u64) -> Result<u64> {
     ))
 }
 
+/// Global rows for one padded batch: `global_indices` in order, then `padded - len` covers.
+///
+/// `shard_id` travels in cleartext, so the server counts the distinct shards a batch touches.
+/// Covers go to shards no real index occupies, up to min(padded, shard count) distinct shards, so
+/// with distinct real shards that count depends on the ladder step and the table alone. A cover
+/// that fits no free shard goes to a uniform shard. Two real indices sharing a shard still show as
+/// one: the cleartext selector cannot hide that. Covers address rows below `total_entries`.
+fn padded_targets(
+    shard_config: &ShardConfig,
+    global_indices: &[u64],
+    padded: usize,
+) -> Result<Vec<u64>> {
+    let per_shard = shard_config.entries_per_shard();
+    if per_shard == 0 {
+        return Err(AdapterError::InvalidQuery(
+            "shard config holds no entries per shard, so no cover shard can be named".to_owned(),
+        ));
+    }
+    let overflow = || AdapterError::Scheme("cover target arithmetic overflowed".to_owned());
+    let mut rows = shard_config.total_entries.max(1);
+    let mut taken: Vec<u64> = Vec::with_capacity(padded);
+    for &index in global_indices {
+        // A real index past the stated table proves the row exists, so the bound was stale.
+        rows = rows.max(index.checked_add(1).ok_or_else(overflow)?);
+        let shard = index / per_shard;
+        if let Err(at) = taken.binary_search(&shard) {
+            taken.insert(at, shard);
+        }
+    }
+    let shards = rows.div_ceil(per_shard);
+    let padded_u64 = u64::try_from(padded).map_err(|_| overflow())?;
+    let cover_slots = padded
+        .checked_sub(global_indices.len())
+        .ok_or_else(overflow)?;
+    let free = padded_u64
+        .min(shards)
+        .saturating_sub(u64::try_from(taken.len()).map_err(|_| overflow())?);
+    let distinct = cover_slots.min(usize::try_from(free).map_err(|_| overflow())?);
+
+    let cover_row = |shard: u64| -> Result<u64> {
+        let first = shard.checked_mul(per_shard).ok_or_else(overflow)?;
+        let span = per_shard.min(rows.checked_sub(first).ok_or_else(overflow)?);
+        first.checked_add(uniform_below(span)?).ok_or_else(overflow)
+    };
+    let mut targets = global_indices.to_vec();
+    for _ in 0..distinct {
+        let open = shards
+            .checked_sub(u64::try_from(taken.len()).map_err(|_| overflow())?)
+            .ok_or_else(overflow)?;
+        let mut shard = uniform_below(open)?;
+        for &held in &taken {
+            if held > shard {
+                break;
+            }
+            shard = shard.checked_add(1).ok_or_else(overflow)?;
+        }
+        if let Err(at) = taken.binary_search(&shard) {
+            taken.insert(at, shard);
+        }
+        targets.push(cover_row(shard)?);
+    }
+    while targets.len() < padded {
+        targets.push(cover_row(uniform_below(shards)?)?);
+    }
+    Ok(targets)
+}
+
 /// Build a batch padded up to the next [`batch_ladder`] step. Slots stay in
 /// `global_indices` order, so `states[i]` decodes `responses[i]`.
 ///
 /// Padding is client-side because the server is the adversary the ladder hides
 /// the count from: a pad the server generates is a pad the server knows about.
-/// Each pad re-queries an in-batch index with fresh randomness and costs a full
-/// database pass, so it is indistinguishable from a real slot.
+/// Each pad is a fresh query that costs a full database pass, so it is
+/// indistinguishable from a real slot by size or work. Pads are aimed as
+/// [`padded_targets`] describes. Residual: reals hold slots 0..len in order, so
+/// a structured real sequence (an auth path's ascending levels) can mark where
+/// the covers begin; closing that needs a shuffle plus a permutation map, which
+/// changes this contract.
 ///
 /// # Errors
 /// [`AdapterError::InvalidQuery`] when `global_indices` is empty or exceeds
@@ -357,26 +428,10 @@ pub fn build_padded_batch(
         ));
     }
 
+    let targets = padded_targets(shard_config, global_indices, padded)?;
     let mut states = Vec::with_capacity(padded);
     let mut queries = Vec::with_capacity(padded);
-    for slot in 0..padded {
-        // Pads draw uniformly from the real set: same cleartext shard distribution as
-        // cycling, without the period-`global_indices.len()` repeat that published the
-        // real count. Residual: reals hold slots 0..len in order, so with distinct
-        // reals the first repeated shard still bounds the count. Closing that needs a
-        // whole-batch shuffle plus a permutation map, which changes this contract.
-        let index = if let Some(real) = global_indices.get(slot) {
-            *real
-        } else {
-            let len = u64::try_from(global_indices.len())
-                .map_err(|_| AdapterError::Scheme("batch length exceeds u64".to_owned()))?;
-            let pick = usize::try_from(uniform_below(len)?)
-                .map_err(|_| AdapterError::Scheme("pad index exceeds usize".to_owned()))?;
-            global_indices
-                .get(pick)
-                .copied()
-                .ok_or_else(|| AdapterError::Scheme("pad index out of range".to_owned()))?
-        };
+    for index in targets {
         let (state, query) = build_seeded_query(client_session, shard_config, index, params)?;
         states.push(state);
         queries.push(query);
@@ -1531,7 +1586,73 @@ mod re_encode_tests {
 
 #[cfg(test)]
 mod pad_draw_tests {
-    use super::{rejection_limit, uniform_below};
+    use super::{padded_targets, rejection_limit, uniform_below};
+    use raven_inspire::params::ShardConfig;
+    use raven_railgun_core::batch_ladder;
+    use std::collections::BTreeSet;
+
+    const PER_SHARD: u64 = 2048;
+
+    fn table(shards: u64) -> ShardConfig {
+        ShardConfig {
+            shard_size_bytes: PER_SHARD * 32,
+            entry_size_bytes: 32,
+            total_entries: shards * PER_SHARD,
+        }
+    }
+
+    fn distinct_shards(targets: &[u64]) -> usize {
+        targets
+            .iter()
+            .map(|t| t / PER_SHARD)
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    /// A pad that re-queries a real index touches no new shard, so the distinct cleartext
+    /// `shard_id` count would be the real count the ladder exists to hide.
+    #[test]
+    fn distinct_shards_depend_on_the_ladder_step_alone() {
+        let config = table(64);
+        for real in 1..=32_usize {
+            let padded = batch_ladder::padded_len(real).expect("in ladder range");
+            let reals: Vec<u64> = (0..real as u64).map(|s| s * PER_SHARD + 3).collect();
+            for _ in 0..4 {
+                let targets = padded_targets(&config, &reals, padded).expect("targets");
+                assert_eq!(targets.len(), padded);
+                assert_eq!(
+                    targets.get(..real),
+                    Some(reals.as_slice()),
+                    "reals lead in order"
+                );
+                assert_eq!(
+                    distinct_shards(&targets),
+                    padded,
+                    "{real} reals in {real} shards must touch {padded} shards"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_small_table_is_covered_whole_and_no_row_past_it_is_named() {
+        let config = ShardConfig {
+            total_entries: 3 * PER_SHARD - 100,
+            ..table(3)
+        };
+        for real in 1..=32_usize {
+            let padded = batch_ladder::padded_len(real).expect("in ladder range");
+            let reals: Vec<u64> = (0..real as u64)
+                .map(|i| (i % 3) * PER_SHARD + i / 3)
+                .collect();
+            let targets = padded_targets(&config, &reals, padded).expect("targets");
+            assert_eq!(distinct_shards(&targets), padded.min(3), "real={real}");
+            assert!(
+                targets.iter().all(|t| *t < config.total_entries),
+                "{targets:?}"
+            );
+        }
+    }
 
     /// `SeededClientQuery.shard_id` travels in cleartext, so a favoured residue is a bias in
     /// what an operator sees. The bound is the observable: the bias a bare remainder leaves at

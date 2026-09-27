@@ -8,7 +8,12 @@ import {
   type RavenInspireWasm,
 } from "../../src/index";
 import { makeRegisterSpy, stubRemoteSessionExports } from "./register_spy";
-import { stubQueryBundle } from "./private_wire";
+import {
+  STUB_QUERY_BYTES,
+  namedBatchTargets,
+  stubQueryBundle,
+  targetNamingQueryBundle,
+} from "./private_wire";
 import { shardConfigBincode } from "./shard_config";
 
 export const TOKEN = "test-token-padded-long-enough-1234";
@@ -33,7 +38,8 @@ export function stubWasm(queryBytes?: Uint8Array): RavenInspireWasm {
   return {
     ...stubRemoteSessionExports(),
     build_client_session: () => ({ free: () => undefined }),
-    build_seeded_query: () => stubQueryBundle(queryBytes),
+    build_seeded_query: (_session, _shards, target) =>
+      queryBytes === undefined ? targetNamingQueryBundle(target) : stubQueryBundle(queryBytes),
     extract_response: (_session, _crs, _state, response, _entry) => new Uint8Array(response),
     build_instance_params_blob: () => new Uint8Array(0),
     register_client_session: makeRegisterSpy(),
@@ -87,13 +93,39 @@ export function encodeBatchResponseNodes(nodes: readonly Uint8Array[]): Uint8Arr
   return out;
 }
 
-/** Byte 0 of every node carries the serving epoch, so a mixed-epoch fold shows up in `elements`. */
-export function encodeBatchResponse(epoch: number, slots: number): Uint8Array {
+/** A reply answering each slot of a `stubCtx()` batch by the row it names: `rowFor` for a row it
+ *  knows, else a zero node, which is what a cover slot gets. */
+export function encodeRepliesByTarget(
+  body: Uint8Array,
+  rowFor: (target: number) => Uint8Array | undefined,
+  coverBytes = NODE_BYTES,
+): Uint8Array {
+  return encodeBatchResponseNodes(
+    namedBatchTargets(body).map((target) => rowFor(target) ?? new Uint8Array(coverBytes)),
+  );
+}
+
+/** The level of the stub tree a flat row sits at, or 0xff for a row outside it. */
+function levelOfFlatIndex(row: number): number {
+  const total = 1 << (TREE_DEPTH + 1);
+  for (let level = 0; level <= TREE_DEPTH; level += 1) {
+    const start = total - (1 << (TREE_DEPTH + 1 - level));
+    if (row >= start && row < start + (1 << (TREE_DEPTH - level))) return level;
+  }
+  return 0xff;
+}
+
+/** Byte 0 of every node carries the serving epoch, so a mixed-epoch fold shows up in `elements`;
+ *  the last byte carries the level of the row the slot names, since slots arrive shuffled. A body
+ *  whose queries name no row, from a caller-supplied query, tags every node 0xff. */
+export function encodeBatchResponse(epoch: number, body: Uint8Array): Uint8Array {
+  const slots = encodedBatchCount(body);
+  const named = body.length === 10 + slots * STUB_QUERY_BYTES ? namedBatchTargets(body) : [];
   const nodes: Uint8Array[] = [];
   for (let slot = 0; slot < slots; slot += 1) {
     const node = new Uint8Array(NODE_BYTES);
     node[0] = epoch;
-    node[NODE_BYTES - 1] = slot;
+    node[NODE_BYTES - 1] = slot < named.length ? levelOfFlatIndex(named[slot]) : 0xff;
     nodes.push(node);
   }
   return encodeBatchResponseNodes(nodes);

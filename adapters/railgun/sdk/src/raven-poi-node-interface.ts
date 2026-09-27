@@ -20,7 +20,8 @@ import {
   validateTreeNumber,
   TREE_DEPTH,
 } from "./poi-pir";
-import { drawPaddedSlots, MAX_BATCH_SIZE } from "./batch-ladder";
+import { MAX_BATCH_SIZE } from "./batch-ladder";
+import { authPathQueryLevels, buildPaddedQueryPlan } from "./batch-cover";
 import {
   type BcPrefixIndex,
   BC_INDEX_PREFIX_BYTES,
@@ -49,16 +50,16 @@ import {
   poiListIndexStoreKey,
 } from "./poi-list-index-store";
 import { foldMerkleRoot } from "./poseidon";
+import { checkedRequestTimeoutMs, fetchWithDeadline } from "./request-deadline";
 
 export type BlindedCommitmentType = "Shield" | "Transact" | "Unshield";
 
 /**
  * `GET /v1/poi/:list_key/status-header`, in the shape the server actually sends.
  *
- * Keys are camelCase because the handler carries `#[serde(rename_all = "camelCase")]`.
- * Declaring them snake_case made TypeScript report `string[]` for fields that were
- * `undefined` at runtime, so `new Set(h.blocked_bcs ?? [])` produced an empty set and
- * every ShieldBlocked commitment on the list read as clean.
+ * Keys are camelCase because the handler carries `#[serde(rename_all = "camelCase")]`. A
+ * snake_case key would type-check yet read `undefined`, leaving the blocked set empty and every
+ * ShieldBlocked commitment on the list reading as clean.
  */
 export interface StatusHeader {
   /** Lowest block height any store covering the list has applied; 0 for a mirrored PPOI list. */
@@ -163,6 +164,9 @@ interface RavenConfigBase {
   chainRegistry?: ChainRegistry;
   txidVersion?: string;
   fetchImpl?: typeof fetch;
+  /** Deadline for each request, from sending it to its last body byte; defaults to 60 000 ms, as
+   *  the stock wallet interface allows. A request past it fails as `Network`. */
+  requestTimeoutMs?: number;
   freshnessConfidenceFloor?: number;
   /** When true (default), PIR queries are built client-side; plaintext blinded commitments never cross the wire. */
   useClientPir?: boolean;
@@ -241,7 +245,7 @@ export interface PoiIndexCounters {
    *  `answer-at-index-rows`. */
   readonly absentFromBareMap: number;
   /** Per-list refusals of absences that could not be shown current: thrown, or `Unreachable`
-   *  when the sync failed on the network. */
+   *  when the sync failed on the network; the engine-shaped call leaves them out instead. */
   readonly refused: number;
   /** Syncs that found the node's list longer than the index held. */
   readonly staleIndexesCaught: number;
@@ -304,6 +308,14 @@ interface ListRowTarget {
   readonly leaf: number;
   readonly label: string;
   readonly row: number;
+  /** Rows of the list this instance holds, which bounds where a cover query may point. */
+  readonly rows: number;
+}
+
+/** One commitment's verdict row on the list being answered, under the caller's own key. */
+interface PendingVerdict {
+  readonly bcKey: string;
+  readonly verdicts: { [listKey: string]: POIStatus };
 }
 
 /** Checks a fold against a root some party other than the proof's source vouches for. */
@@ -343,6 +355,11 @@ const PATH_RECORD_BYTES = TREE_DEPTH * NODE_HASH_BYTES;
 /** Epoch tag before the instance has ever reported one; never collides with a real epoch. */
 const UNOBSERVED_EPOCH = "";
 const AUTH_PATH_ATTEMPTS = 2;
+/** Commitments per request on the engine-shaped plaintext and legacy-submit paths, as the stock
+ *  wallet interface batches them. */
+const ENGINE_BATCH_SIZE = 20;
+/** The verdicts engine's `TXOPOIListStatus` has; the others are SDK-local. */
+const ENGINE_STATUSES: readonly string[] = ["Valid", "ShieldBlocked", "ProofSubmitted", "Missing"];
 const SESSION_QUERY_ATTEMPTS = 2;
 
 type UpstreamJsonRpcMethod =
@@ -401,7 +418,10 @@ export class RavenPOINodeInterface {
     this.upstream = config.upstreamFallbackEndpoint?.replace(/\/$/, "");
     this.privateStalePolicy = config.privateStalePolicy ?? "refuse";
     this.txidVersion = config.txidVersion ?? DEFAULT_TXID_VERSION;
-    this.fetchImpl = config.fetchImpl ?? fetch;
+    this.fetchImpl = fetchWithDeadline(
+      config.fetchImpl ?? fetch,
+      checkedRequestTimeoutMs(config.requestTimeoutMs),
+    );
     this.confidenceFloor = config.freshnessConfidenceFloor ?? DEFAULT_CONFIDENCE_FLOOR;
     if (
       !Number.isFinite(this.confidenceFloor) ||
@@ -505,17 +525,13 @@ export class RavenPOINodeInterface {
           `${routeEndpoint}, so the pin would come from the party that supplied the siblings`,
       );
     }
-    // An INHERITED pin source must never be fatal. The guard above already gets that right for
-    // the self-aiming case, and then this constructor undid it: `UpstreamPinResolver` throws on
-    // an unlisted chain, so a wallet whose only relevant config is `upstreamFallbackEndpoint` --
-    // the configuration the README calls normal -- failed to construct at all on any chain
-    // outside the six-entry network map, killing the status, commit-tree and passthrough paths,
-    // none of which use pins. An audit reproduced it on chain 10. A caller who named
-    // `pinUpstream` or `pinUpstreamNetworkName` asked for the resolver and still gets the throw.
-    // `pinTailTtlMs` belongs here beside the other two: naming it is asking for the resolver just
-    // as much, and without it a caller who set a negative TTL had the constructor's refusal
-    // swallowed, pin verification silently off, and a fold-time message naming neither the field
-    // nor its value.
+    // An INHERITED pin source must never be fatal: `UpstreamPinResolver` throws on an unlisted
+    // chain, and a wallet whose only relevant config is `upstreamFallbackEndpoint` -- the
+    // configuration the README calls normal -- would fail to construct on any chain outside the
+    // network map, taking down the status, commit-tree and passthrough paths, none of which use
+    // pins. A caller who named `pinUpstream`, `pinUpstreamNetworkName` or `pinTailTtlMs` asked for
+    // the resolver and still gets the throw, so a bad value is refused by name rather than
+    // silently turning pin verification off.
     const pinRequestedByName =
       typeof config.pinUpstream === "string" ||
       config.pinUpstreamNetworkName !== undefined ||
@@ -665,9 +681,15 @@ export class RavenPOINodeInterface {
     );
   }
 
-  // Engine's status is a nominal string enum that no literal union is assignable to, so this
-  // overload answers in engine's own type. `Unreachable` is not one of its members; engine only
-  // compares statuses for equality, so it reads as not-Valid.
+  /**
+   * Engine's status is a nominal string enum that no literal union is assignable to, so the
+   * engine-shaped overload answers in engine's own type, and as the stock wallet interface does:
+   * it never rejects for a failed list or commitment. Engine replaces a commitment's whole stored
+   * map with what it gets back, so a commitment whose verdict on any list could not be
+   * established is left out, and engine keeps what it held. That includes the SDK-local
+   * `Unreachable` and `MissingStale`, which are not engine statuses. The two-argument overload
+   * keeps the typed errors and SDK-local verdicts.
+   */
   async getPOIsPerList(
     txidVersion: string,
     chain: Chain,
@@ -699,6 +721,7 @@ export class RavenPOINodeInterface {
     if (!listKeys || !blindedCommitmentDatas) {
       throw RavenError.invalidQuery("getPOIsPerList: missing list keys or commitments");
     }
+    if (upstreamShape) return this.getPOIsPerListForEngine(listKeys, blindedCommitmentDatas);
     for (const lk of listKeys) {
       validateListKeyHex(lk);
     }
@@ -708,6 +731,52 @@ export class RavenPOINodeInterface {
     if (this.useClientPir) {
       return this.getPOIsPerListClientPir(listKeys, blindedCommitmentDatas);
     }
+    return this.getPOIsPerListPlaintext(listKeys, blindedCommitmentDatas);
+  }
+
+  /** The engine-shaped contract: see the `getPOIsPerList` overloads. */
+  private async getPOIsPerListForEngine(
+    listKeys: string[],
+    blindedCommitmentDatas: BlindedCommitmentData[],
+  ): Promise<PoisPerListResponse> {
+    const valid = (check: () => void): boolean => {
+      try {
+        check();
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    if (!listKeys.every((lk) => valid(() => validateListKeyHex(lk)))) return {};
+    const asked = blindedCommitmentDatas.filter(({ blindedCommitment }) =>
+      valid(() => validateBcHex(blindedCommitment)),
+    );
+    const unestablished = new Set<string>();
+    let answered: PoisPerListResponse = {};
+    if (this.useClientPir) {
+      try {
+        answered = await this.getPOIsPerListClientPir(listKeys, asked, unestablished);
+      } catch {
+        return {};
+      }
+    } else {
+      // Batched as the stock interface batches, so one failed request costs only its batch.
+      for (let start = 0; start < asked.length; start += ENGINE_BATCH_SIZE) {
+        const batch = asked.slice(start, start + ENGINE_BATCH_SIZE);
+        try {
+          Object.assign(answered, await this.getPOIsPerListPlaintext(listKeys, batch));
+        } catch {
+          for (const { blindedCommitment } of batch) unestablished.add(blindedCommitment);
+        }
+      }
+    }
+    return engineVerdicts(answered, listKeys, unestablished);
+  }
+
+  private async getPOIsPerListPlaintext(
+    listKeys: string[],
+    blindedCommitmentDatas: BlindedCommitmentData[],
+  ): Promise<PoisPerListResponse> {
     const body = {
       txidVersion: this.txidVersion,
       listKeys,
@@ -891,7 +960,10 @@ export class RavenPOINodeInterface {
   }
 
   // `POINodeInterface.submitLegacyTransactProofs` (engine/src/poi/poi-node-interface.ts:49-54);
-  /** Mirrors upstream `POINodeInterface.submitLegacyTransactProofs`. */
+  /** Mirrors upstream `POINodeInterface.submitLegacyTransactProofs`. The engine-shaped overload
+   *  submits in batches and, as the stock wallet interface does, never rejects: a failed batch,
+   *  or no upstream to send to, leaves the proofs for engine's next refresh. The two-argument
+   *  overload sends one request and throws. */
   async submitLegacyTransactProofs(
     txidVersion: string,
     chain: Chain,
@@ -925,9 +997,30 @@ export class RavenPOINodeInterface {
         "submitLegacyTransactProofs: missing list keys or legacy proof data",
       );
     }
+    if (upstreamShape) {
+      if (!this.upstream) return;
+      for (let start = 0; start < legacyTransactProofDatas.length; start += ENGINE_BATCH_SIZE) {
+        try {
+          await this.submitLegacyBatch(
+            listKeys,
+            legacyTransactProofDatas.slice(start, start + ENGINE_BATCH_SIZE),
+          );
+        } catch {
+          // Contained to this batch; engine resubmits what is still unproven on its next refresh.
+        }
+      }
+      return;
+    }
     if (!this.upstream) {
       throw RavenError.invalidQuery("submitLegacyTransactProofs requires upstreamFallbackEndpoint");
     }
+    await this.submitLegacyBatch(listKeys, legacyTransactProofDatas);
+  }
+
+  private async submitLegacyBatch(
+    listKeys: string[],
+    legacyTransactProofDatas: LegacyTransactProofData[],
+  ): Promise<void> {
     await this.upstreamJsonRpc<unknown>("ppoi_submit_legacy_transact_proofs", {
       chainType: String(this.chainType),
       chainID: String(this.chainId),
@@ -1166,17 +1259,24 @@ export class RavenPOINodeInterface {
   }
 
   /** Returns a refusal rather than throwing it: the caller raises it once every list's queries
-   *  have gone out, so whether a commitment was absent never changes what the node sees. */
+   *  have gone out, so whether a commitment was absent never changes what the node sees. With
+   *  `unestablished`, an absence that cannot be shown current is recorded there instead of being
+   *  answered, since the engine would persist any answer over the verdict it holds. */
   private answerAbsences(
-    absent: readonly { [listKey: string]: POIStatus }[],
+    absent: readonly PendingVerdict[],
     lkHex: string,
     source: ListIndexSource,
+    unestablished?: Set<string>,
   ): RavenError | undefined {
     if (absent.length === 0) return undefined;
     let verdict: POIStatus;
     if (source.kind === "bound" && source.failure === undefined) {
       this.counters.absent += absent.length;
       verdict = "Missing";
+    } else if (unestablished !== undefined) {
+      this.counters.refused += 1;
+      for (const { bcKey } of absent) unestablished.add(bcKey);
+      return undefined;
     } else if (this.stalenessPolicy === "answer-at-index-rows") {
       if (source.kind === "bound") this.counters.absentFromStaleIndex += absent.length;
       else this.counters.absentFromBareMap += absent.length;
@@ -1196,7 +1296,7 @@ export class RavenPOINodeInterface {
       }
       verdict = "Unreachable";
     }
-    for (const verdicts of absent) {
+    for (const { verdicts } of absent) {
       verdicts[lkHex] = verdict;
     }
     return undefined;
@@ -1251,6 +1351,7 @@ export class RavenPOINodeInterface {
     lkHex: string,
     idx: number,
     ctx: ClientPirContext,
+    listRows: number,
   ): ListRowTarget | RavenError {
     const block = Math.floor(idx / LEAVES_PER_PPOI_BLOCK);
     const blockLabel =
@@ -1274,7 +1375,8 @@ export class RavenPOINodeInterface {
           `${capacity} rows, so no row there was ever written; refused rather than answered`,
       );
     }
-    return { block, leaf, label, row };
+    const rowsBelow = row === idx ? listRows : listRows - block * LEAVES_PER_PPOI_BLOCK;
+    return { block, leaf, label, row, rows: Math.max(row + 1, Math.min(capacity, rowsBelow)) };
   }
 
   /** Pinned PPOI block roots resolve chain-aware first, then the chain-less legacy key. */
@@ -1291,28 +1393,46 @@ export class RavenPOINodeInterface {
     return this.bcToIdxMaps.get(listKeyHex);
   }
 
+  /** With `unestablished`, every failure is contained: the caller key of a commitment whose
+   *  verdict on some list could not be established is added to it, and nothing is thrown. */
   private async getPOIsPerListClientPir(
     listKeys: string[],
     blindedCommitmentDatas: BlindedCommitmentData[],
+    unestablished?: Set<string>,
   ): Promise<PoisPerListResponse> {
     const out: PoisPerListResponse = {};
     // Pre-init so unknown-BC rows still surface; matches the upstream merge.
     for (const { blindedCommitment } of blindedCommitmentDatas) {
       out[blindedCommitment] ??= {};
     }
+    const failAll = (): void => {
+      for (const { blindedCommitment } of blindedCommitmentDatas) {
+        unestablished?.add(blindedCommitment);
+      }
+    };
 
     let refusal: RavenError | undefined;
     for (const listKey of listKeys) {
       const lkHex = normalizeHex(listKey);
       const ctx = this.lookupContext("t1Status", lkHex);
-      const source = ctx === undefined ? undefined : await this.listSource(lkHex);
+      let source: ListIndexSource | undefined;
+      try {
+        source = ctx === undefined ? undefined : await this.listSource(lkHex);
+      } catch (cause) {
+        if (unestablished === undefined) throw cause;
+      }
       if (!ctx || !source) {
+        if (unestablished !== undefined) {
+          failAll();
+          continue;
+        }
         throw RavenError.invalidQuery(
           `client-PIR: missing context or bc-to-idx-map for list ${listKey}; ` +
             "preload via loadClientPirContext and syncPoiListIndex(listKey) before calling " +
             "getPOIsPerList",
         );
       }
+      const listRows = rowsHeldBy(source);
       // `verdicts` IS the caller-keyed row, resolved where the caller's spelling is the only one
       // in scope, so the arms below have no key left to pick. `normalizeHex` output is a lookup
       // key and indexes nothing in `out`; the index signature types that miss as present, so a
@@ -1321,21 +1441,19 @@ export class RavenPOINodeInterface {
         normalizeHex(blindedCommitment),
       );
       const candidateSets = candidatesIn(source, bcHexes);
-      const absent: { [listKey: string]: POIStatus }[] = [];
-      let pending: {
+      const absent: PendingVerdict[] = [];
+      let pending: (PendingVerdict & {
         commitmentData: BlindedCommitmentData;
         bcHex: string;
-        bcKey: string;
-        verdicts: { [listKey: string]: POIStatus };
         candidates: number[];
         next: number;
-      }[] = [];
+      })[] = [];
       blindedCommitmentDatas.forEach((commitmentData, position) => {
         const bcKey = commitmentData.blindedCommitment;
         const verdicts = out[bcKey];
         const candidates = candidateSets[position];
         if (candidates.length === 0) {
-          absent.push(verdicts);
+          absent.push({ bcKey, verdicts });
         } else {
           const bcHex = bcHexes[position];
           pending.push({ commitmentData, bcHex, bcKey, verdicts, candidates, next: 0 });
@@ -1345,37 +1463,56 @@ export class RavenPOINodeInterface {
       // A later round exists only for a prefix collision, and asks the next candidate.
       for (let round = 0; round === 0 || pending.length > 0; round += 1) {
         const collided: typeof pending = [];
-        const byInstance = new Map<string, { member: (typeof pending)[number]; row: number }[]>();
+        const byInstance = new Map<
+          string,
+          { rows: number; asked: { member: (typeof pending)[number]; row: number }[] }
+        >();
         for (const member of pending) {
-          const at = this.listRowTarget("t1Status", lkHex, member.candidates[member.next], ctx);
+          const at = this.listRowTarget(
+            "t1Status",
+            lkHex,
+            member.candidates[member.next],
+            ctx,
+            listRows,
+          );
           if (at instanceof RavenError) {
             refusal ??= at;
+            unestablished?.add(member.bcKey);
             continue;
           }
           const group = byInstance.get(at.label);
-          if (group === undefined) byInstance.set(at.label, [{ member, row: at.row }]);
-          else group.push({ member, row: at.row });
+          if (group === undefined) {
+            byInstance.set(at.label, { rows: at.rows, asked: [{ member, row: at.row }] });
+          } else {
+            group.asked.push({ member, row: at.row });
+          }
         }
         if (byInstance.size === 0) {
-          const cover = this.listRowTarget("t1Status", lkHex, 0, ctx);
+          const cover = this.listRowTarget("t1Status", lkHex, 0, ctx, listRows);
           if (cover instanceof RavenError) {
             refusal ??= cover;
             break;
           }
-          byInstance.set(cover.label, []);
+          byInstance.set(cover.label, { rows: cover.rows, asked: [] });
         }
-        for (const [statusInstance, asked] of byInstance) {
+        for (const [statusInstance, { rows, asked }] of byInstance) {
           const chunkCount = Math.max(1, Math.ceil(asked.length / MAX_BATCH_SIZE));
           for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
             const chunk = asked.slice(
               chunkIndex * MAX_BATCH_SIZE,
               (chunkIndex + 1) * MAX_BATCH_SIZE,
             );
+            // A member's own failure is contained to it when containing; otherwise it is thrown.
+            const settle = (bcKey: string, failure: RavenError): void => {
+              if (unestablished === undefined) throw failure;
+              unestablished.add(bcKey);
+            };
             try {
               const privateReply = await this.runClientPirQueryBatch(
                 statusInstance,
                 ctx,
                 chunk.map(({ row }) => row),
+                rows,
               );
               if (this.privateFreshnessAction(privateReply.freshness, "t1-status") === "fallback") {
                 // This deliberately reveals the exact BC/list to upstream. Returning a stale
@@ -1388,9 +1525,13 @@ export class RavenPOINodeInterface {
                 for (const { member } of chunk) {
                   const fallbackStatus = fallback[member.bcKey]?.[lkHex];
                   if (!fallbackStatus) {
-                    throw RavenError.decodeError(
-                      `upstream pois-per-list omitted BC ${member.bcKey} on list ${lkHex}`,
+                    settle(
+                      member.bcKey,
+                      RavenError.decodeError(
+                        `upstream pois-per-list omitted BC ${member.bcKey} on list ${lkHex}`,
+                      ),
                     );
+                    continue;
                   }
                   member.verdicts[lkHex] = fallbackStatus;
                 }
@@ -1404,16 +1545,23 @@ export class RavenPOINodeInterface {
                   ) {
                     member.next += 1;
                     if (member.next < member.candidates.length) collided.push(member);
-                    else absent.push(member.verdicts);
+                    else absent.push(member);
                     continue;
                   }
                   const label =
                     `client-PIR t1Status-${lkHex} idx ${member.candidates[member.next]}`;
-                  member.verdicts[lkHex] = decodeStatusRow(plaintext, member.bcHex, label);
+                  try {
+                    member.verdicts[lkHex] = decodeStatusRow(plaintext, member.bcHex, label);
+                  } catch (cause) {
+                    if (!(cause instanceof RavenError)) throw cause;
+                    settle(member.bcKey, cause);
+                  }
                 }
               }
             } catch (cause) {
-              if (cause instanceof RavenError && cause.kind === "Network") {
+              if (unestablished !== undefined) {
+                for (const { member } of chunk) unestablished.add(member.bcKey);
+              } else if (cause instanceof RavenError && cause.kind === "Network") {
                 for (const { member } of chunk) {
                   member.verdicts[lkHex] = "Unreachable";
                 }
@@ -1425,10 +1573,10 @@ export class RavenPOINodeInterface {
         }
         pending = collided;
       }
-      const refused = this.answerAbsences(absent, lkHex, source);
+      const refused = this.answerAbsences(absent, lkHex, source, unestablished);
       refusal ??= refused;
     }
-    if (refusal !== undefined) throw refusal;
+    if (refusal !== undefined && unestablished === undefined) throw refusal;
     return out;
   }
 
@@ -1474,10 +1622,11 @@ export class RavenPOINodeInterface {
       );
     };
     // Resolve every commitment BEFORE any request goes out. Two things fall out of that: an
-    // unknown BC now refuses without having disclosed the earlier ones, and the grouping below
+    // unknown BC refuses without having disclosed the others, and the grouping below
     // needs the whole set in hand.
     const bcHexes = blindedCommitments.map((bc) => normalizeHex(bc));
     const candidateSets = candidatesIn(source, bcHexes);
+    const listRows = rowsHeldBy(source);
     const firstAbsent = candidateSets.findIndex((candidates) => candidates.length === 0);
     if (firstAbsent !== -1) {
       throw notPresent(
@@ -1493,15 +1642,11 @@ export class RavenPOINodeInterface {
       next: 0,
     }));
 
-    // Group by block, then pad each group on the ladder -- the same shape the T1 status path
-    // has always had. Proving K commitments one await at a time was K serial POSTs, and every
-    // one of them reached `drawPaddedSlots` with a single real target: `paddedBatchLength(1)`
-    // is 1, so ZERO cover slots were drawn and the server counted the wallet's exact cache-miss
-    // count off a stable client id. That is verbatim what the ladder exists to prevent. The
-    // round-trip cost and the leak were one defect.
+    // Group by block, then pad each group on the ladder, as the T1 status path does. One
+    // unpadded request per commitment would cost K round trips and hand the server the exact
+    // count off a stable client id, which is what the ladder exists to hide.
     //
-    // Two bounds on that win, both real, because a comment that states only the good case is how
-    // the last three claims in this file went wrong. (1) Grouping is WITHIN a block, since each
+    // Two bounds on that. (1) Grouping is WITHIN a block, since each
     // block routes to its own instance label, so commitments spread over six blocks still cost six
     // round trips. (2) The ladder hides K within its dyadic bucket, never K itself: a chunk of k
     // real targets goes out as P = paddedBatchLength(k) queries, and P tells the server k is in
@@ -1517,17 +1662,30 @@ export class RavenPOINodeInterface {
       const collided: typeof pending = [];
       const byBlock = new Map<
         number,
-        { label: string; group: { target: (typeof pending)[number]; at: ListRowTarget }[] }
+        {
+          label: string;
+          rows: number;
+          group: { target: (typeof pending)[number]; at: ListRowTarget }[];
+        }
       >();
       for (const target of pending) {
-        const at = this.listRowTarget("t2Path", lkHex, target.candidates[target.next], ctx);
+        const at = this.listRowTarget(
+          "t2Path",
+          lkHex,
+          target.candidates[target.next],
+          ctx,
+          listRows,
+        );
         if (at instanceof RavenError) throw at;
         const held = byBlock.get(at.block);
-        if (held === undefined) byBlock.set(at.block, { label: at.label, group: [{ target, at }] });
-        else held.group.push({ target, at });
+        if (held === undefined) {
+          byBlock.set(at.block, { label: at.label, rows: at.rows, group: [{ target, at }] });
+        } else {
+          held.group.push({ target, at });
+        }
       }
 
-      for (const [block, { label: pathInstance, group }] of byBlock) {
+      for (const [block, { label: pathInstance, rows, group }] of byBlock) {
         const rootKey = `${lkHex}:${block}`;
         const chunkCount = Math.ceil(group.length / MAX_BATCH_SIZE);
         for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
@@ -1540,6 +1698,7 @@ export class RavenPOINodeInterface {
             pathInstance,
             ctx,
             chunk.map(({ at }) => at.row),
+            rows,
             160,
           );
           if (this.privateFreshnessAction(privateReply.freshness, "t2-auth-path") === "fallback") {
@@ -1596,9 +1755,9 @@ export class RavenPOINodeInterface {
               ),
             );
             const proof = buildMerkleProof(localIndex, bcHex, nodes);
-            // Resolved through the SAME chain-aware -> legacy ladder `instanceLabel` routes on.
-            // Keying this guard on the chain-less form while routing on the chain-aware one is
-            // what returned unverified proofs with `Ok`; a `has()` gate here would restore that.
+            // Resolved through the same chain-aware -> legacy ladder `instanceLabel` routes on:
+            // a guard keyed on the chain-less form, or a `has()` gate, would skip the check for a
+            // proof routed on the chain-aware form and return it unverified with `Ok`.
             const pinnedRoot = this.pinnedRootFor(rootKey);
             if (pinnedRoot !== undefined) {
               const normalizedPin = checkedPinnedRoot(
@@ -1656,11 +1815,10 @@ export class RavenPOINodeInterface {
       // filling, and its final root is not in that set. Re-ask before refusing, so an honest
       // caller is not charged a refusal for the privacy fix above.
       //
-      // Its cost, stated straight because the first version of this comment understated it: THREE
-      // extra requests (point query, status, events), one of which names the block, and it fires
-      // on every window miss, not only on a real freeze. A node lagging more than a window behind
-      // therefore pays it on every proof while refusing every proof -- an audit measured
-      // [6, 3, 3] requests over three folds. Bounding it per block is not a free win: the bound
+      // Its cost: THREE extra requests (point query, status, events), one of which names the
+      // block, and it fires on every window miss, not only on a real freeze. A node lagging more
+      // than a window behind therefore pays it on every proof while refusing every proof, [6, 3, 3]
+      // requests over three folds. Bounding it per block is not a free win: the bound
       // that stops the leak also stops a block that freezes between two folds from verifying,
       // which `ppoi_pinned_root_mandatory.test.ts` pins deliberately. Which of the two a wallet
       // should get is a caller's decision, so neither is hardcoded here until one is asked for.
@@ -1669,7 +1827,7 @@ export class RavenPOINodeInterface {
         resolved = await this.pinResolver.resolve(listKeyHex, block);
       } catch (cause) {
         // Same wrapper as the first attempt, and for the same reason: without it an upstream
-        // outage inside the retry window surfaced as `DecodeError` -- the tampering kind --
+        // outage inside the retry window would surface as `DecodeError` -- the tampering kind --
         // with no instance, no rootKey and none of the remedy text.
         throw pinSourceFailure(preamble, remedy, cause);
       }
@@ -1853,27 +2011,20 @@ export class RavenPOINodeInterface {
       }
     }
 
-    // A zero-miss path re-queries every level rather than skipping the batch: an absent
-    // request publishes a fully-warm cache more precisely than any batch length does.
-    const queryLevels =
-      stillMissing.length > 0 ? stillMissing : indices.map((_unused, level) => level);
+    const queryLevels = authPathQueryLevels(stillMissing, indices.length);
     const foldsCachedLevels = queryLevels.length < indices.length;
 
-    // Padded to a ladder step so the length publishes a bucket, not the exact
-    // cache-miss count. Pads re-query a real level, so they are drawn from the
-    // real slots' distribution and cost the server a full pass.
-    //
-    // Pads are drawn at RANDOM, never cycled. `SeededClientQuery.shard_id` is
-    // unencrypted on the wire, so `queryLevels[slot % len]` made slot j and slot j+len
-    // address the identical global index - the server reads the repeat period straight
-    // off the shard sequence and recovers the exact miss count, which is the one
-    // quantity the ladder exists to hide. Mirrors the Rust `build_padded_batch` fix.
-    const queryBundles = drawPaddedSlots(queryLevels).map((level) => {
-      const target = BigInt(indices[level]);
-      return decodeClientPirQueryBundle(
-        ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, target),
-      );
-    });
+    const geometry = decodeShardGeometry(ctx.shardConfigBincode);
+    const plan = buildPaddedQueryPlan(
+      queryLevels.map((level) => indices[level]),
+      geometry.entriesPerShard,
+      geometry.totalEntries,
+    );
+    const queryBundles = plan.wireTargets.map((target) =>
+      decodeClientPirQueryBundle(
+        ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, BigInt(target)),
+      ),
+    );
     const batchBody = encodeBatchBody(queryBundles.map((b) => b.queryBytes));
     const url = `${route.endpoint}/v1/instance/${encodeURIComponent(instanceLabel)}/batch`;
     this.captureRequest(url, "POST", batchBody);
@@ -1922,13 +2073,14 @@ export class RavenPOINodeInterface {
     }
     for (let k = 0; k < queryLevels.length; k += 1) {
       const level = queryLevels[k];
+      const wireSlot = plan.realSlots[k];
       let plaintext: Uint8Array;
       try {
         plaintext = ctx.wasm.extract_response(
           ctx.session,
           ctx.crsBincode,
-          queryBundles[k].clientStateBincode,
-          responses[k],
+          queryBundles[wireSlot].clientStateBincode,
+          responses[wireSlot],
           ctx.entrySize,
         );
       } catch (cause) {
@@ -1952,17 +2104,20 @@ export class RavenPOINodeInterface {
     return { nodes: collectAuthPath(out), freshness };
   }
 
-  /** T1 status path: build, pad, and decrypt one `/batch` request. */
+  /** List-row paths: build, pad, and decrypt one `/batch` request. Covers address rows below
+   *  `populatedRows`; an empty `targetIndices` sends a lone cover and returns no rows. */
   private async runClientPirQueryBatch(
     instanceLabel: string,
     ctx: ClientPirContext,
     targetIndices: readonly number[],
+    populatedRows: number,
     addendumBytes = 0,
   ): Promise<PrivateQueryBatchResult> {
     return this.withClientPirSessionRetry(instanceLabel, ctx, async () => {
       const route = this.route();
-      const realTargets = targetIndices.length > 0 ? targetIndices : [0];
-      const queryBundles = drawPaddedSlots(realTargets).map((targetIdx) =>
+      const { entriesPerShard } = decodeShardGeometry(ctx.shardConfigBincode);
+      const plan = buildPaddedQueryPlan(targetIndices, entriesPerShard, populatedRows);
+      const queryBundles = plan.wireTargets.map((targetIdx) =>
         decodeClientPirQueryBundle(
           ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, BigInt(targetIdx)),
         ),
@@ -1981,10 +2136,10 @@ export class RavenPOINodeInterface {
           { url },
         );
       }
-      const addenda = realTargets.map((_targetIdx, slot) =>
+      const addenda = plan.realSlots.map((slot) =>
         responses[slot].slice(responses[slot].length - addendumBytes),
       );
-      const plaintexts = realTargets.map((_targetIdx, slot) =>
+      const plaintexts = plan.realSlots.map((slot) =>
         ctx.wasm.extract_response(
           ctx.session,
           ctx.crsBincode,
@@ -2583,31 +2738,10 @@ function foldForeignProof(proof: MerkleProof, bcHex: string, label: string): str
 }
 
 /**
- * Whether two endpoints name the same server.
- *
- * Compares ORIGIN, not the string. A differing scheme case, a default port, a trailing slash
- * or an extra path segment all address one server, and a raw string compare passes every one
- * of them -- two blind audits each pointed a node at itself that way and had a forged auth
- * path accepted, the worst case needing no explicit pin source at all, only an
- * `upstreamFallbackEndpoint` with a path suffix.
- *
- * This is a MISCONFIGURATION guard and not a security boundary, and the difference matters.
- * It cannot prove two hostnames are different parties: `localhost` and `127.0.0.1` are
- * distinct origins that reach the same process, and two DNS names can resolve to one host.
- * Nothing short of resolving both and trusting the result would close that, and a resolver
- * is racy and is controlled by whoever controls DNS. An unparseable endpoint is treated as
- * the same party, so a malformed pin source disables the resolver rather than silently
- * skipping the check.
- */
-/**
  * One message for "there is no independent root", whatever stopped it arriving -- keeping the
- * CAUSE'S kind, because that is what a caller's retry policy reads.
- *
- * The first version kept only `Network` and flattened everything else to `InvalidQuery`, which
- * says "your configuration is wrong". So an upstream 500, an RPC error, and an upstream that
- * answered a frozen block's last leaf with two different roots all told the operator to go and
- * check their own config, and told a retry policy not to retry a transient fault. An audit found
- * it by asserting the KIND; the test that shipped with the bug asserted only the message.
+ * CAUSE'S kind, because that is what a caller's retry policy reads. Flattening an upstream 500,
+ * an RPC error, or a frozen block answered with two roots to `InvalidQuery` would tell the
+ * operator to check their own config and a retry policy not to retry a transient fault.
  */
 function pinSourceFailure(preamble: string, remedy: string, cause: unknown): RavenError {
   const message = `${preamble}the upstream pin source could not answer (${String(cause)})${remedy}`;
@@ -2645,6 +2779,37 @@ function indexSyncFailure(lkHex: string, held: BcPrefixIndex, cause: unknown): R
     default:
       return RavenError.invalidQuery(message);
   }
+}
+
+/** The commitments whose every asked list carries an engine verdict. Any other is left out, since
+ *  engine replaces a commitment's stored map with what it is given. */
+function engineVerdicts(
+  answered: PoisPerListResponse,
+  listKeys: readonly string[],
+  unestablished: ReadonlySet<string>,
+): PoisPerListResponse {
+  const wanted = listKeys.map((listKey) => normalizeHex(listKey));
+  const out: PoisPerListResponse = {};
+  for (const [bcKey, perList] of Object.entries(answered)) {
+    if (unestablished.has(bcKey)) continue;
+    const statuses = Object.values(perList) as string[];
+    const held = new Set(Object.keys(perList).map((listKey) => normalizeHex(listKey)));
+    if (
+      statuses.every((status) => ENGINE_STATUSES.includes(status)) &&
+      wanted.every((listKey) => held.has(listKey))
+    ) {
+      out[bcKey] = perList;
+    }
+  }
+  return out;
+}
+
+/** Rows of the list a source covers; a bare map carries no count, so its highest index stands in. */
+function rowsHeldBy(source: ListIndexSource): number {
+  if (source.kind === "bound") return Math.max(1, source.index.total);
+  let highest = 0;
+  for (const idx of source.map.values()) highest = Math.max(highest, idx);
+  return highest + 1;
 }
 
 /** Ascending candidate indices per commitment. A map yields at most one, the lowest occurrence
@@ -2705,14 +2870,19 @@ function parseBcToIdxMap(body: unknown, listKeyHex: string, url: string): BcToId
 const RELATIVE_ENDPOINT_BASE = "http://same-origin.invalid/";
 
 /**
- * Do two endpoints name the same operator? `undefined` means "cannot tell".
+ * Do two endpoints name the same operator? `false` when either is absent, since there is nothing
+ * to compare; otherwise their origins decide, and `undefined` means one did not parse and the two
+ * differ as strings, so the answer is "cannot tell".
  *
- * Origin, not string: two spellings of one host are one party, and comparing raw strings let a
- * fully forged auth path through once. The tri-state is not decoration -- the two callers have
- * OPPOSITE safe defaults (a disclosure guard wants unknown treated as same-party and refuses; the
- * resolver wants unknown treated as different and builds an anchor that may be vacuous), and
- * collapsing that into one boolean gave both the disclosure guard's answer, which silently
- * disabled verification for any deployment whose endpoint is same-origin relative.
+ * Origin, not string: a differing scheme case, a default port, a trailing slash or an extra path
+ * segment all address one server, and a raw string compare would let a node verify its own forged
+ * auth path. The tri-state is not decoration -- the callers have OPPOSITE safe defaults (a
+ * disclosure guard treats unknown as same-party and refuses; the resolver treats it as different
+ * and builds an anchor that may be vacuous), and one boolean would give both the disclosure
+ * guard's answer, disabling verification for any deployment whose endpoint is same-origin relative.
+ *
+ * A MISCONFIGURATION guard, not a security boundary: `localhost` and `127.0.0.1` are distinct
+ * origins that reach one process, and two DNS names can resolve to one host.
  */
 function samePartyOrUnknown(a: string | undefined, b: string | undefined): boolean | undefined {
   if (a === undefined || b === undefined) return false;
@@ -2725,14 +2895,13 @@ function samePartyOrUnknown(a: string | undefined, b: string | undefined): boole
   }
 }
 
-/** An endpoint is an absolute URL or a same-origin path. Anything else is a typo, and it used to
- *  reach `samePartyOrUnknown`, fail to parse and be reported as a circular configuration -- sending
- *  an operator to look for a circularity that was not there. */
+/** An endpoint is an absolute URL or a same-origin path. Anything else is a typo, refused as
+ *  malformed rather than left to fail to parse in `samePartyOrUnknown` and read as a circular
+ *  configuration. */
 function isUsableEndpoint(value: string): boolean {
   // `//host` is SCHEME-relative, not same-origin: it resolves to a different authority
-  // entirely. Admitting it here let a pin source aimed at the served node slip past the
-  // circularity guard on a scheme mismatch, and made both this function's doc and the
-  // refusal text describe something narrower than what they accepted.
+  // entirely, and admitting it would let a pin source aimed at the served node slip past the
+  // circularity guard on a scheme mismatch.
   if (value.startsWith("//")) return false;
   if (value.startsWith("/")) return value.length > 1;
   try {
@@ -2766,7 +2935,7 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * `as T` is erased at runtime, so a shim response was previously believed whatever its shape.
+ * `as T` is erased at runtime, so a shim response is checked rather than cast.
  *
  * The outer-key rule is the load-bearing one and a shape check alone cannot replace it:
  * `{listKey: {bc: status}}` and `{bc: {listKey: status}}` are both `{hex64: {hex64: POIStatus}}`,

@@ -4,8 +4,6 @@
  * with `raven_railgun_core::batch_ladder`; Raven core owns the generic arithmetic.
  */
 
-import { uniformRandomBelow } from "./crypto-random";
-
 /** Permitted batch sizes, ascending. */
 export const BATCH_SIZE_LADDER: readonly number[] = [1, 2, 4, 8, 16, 32];
 
@@ -61,20 +59,4 @@ export function paddedBatchLength(
     );
   }
   return step;
-}
-
-/**
- * Slot plan for one padded batch: the real slots in order, then pad slots drawn at RANDOM
- * from the real ones.
- *
- * Pads are never cycled. `slot % realSlots.length` makes slot j and slot j+len address the
- * identical global index, so a server reading the cleartext `shard_id` sequence recovers the
- * repeat period and with it the exact cache-miss count - the one quantity the ladder exists
- * to hide. Lives here, exported, so the test exercises the shipped draw rather than a copy.
- */
-export function drawPaddedSlots(realSlots: readonly number[]): number[] {
-  const padded = paddedBatchLength(realSlots.length);
-  return Array.from({ length: padded }, (_unused, slot) =>
-    slot < realSlots.length ? realSlots[slot] : realSlots[uniformRandomBelow(realSlots.length)],
-  );
 }

@@ -1,6 +1,8 @@
 # @hisoka-io/railgun-poi-node-interface
 
-Drop-in `POINodeInterface` for the Railgun wallet stack. Privately resolves PPOI status, PPOI auth-paths, and commit-tree auth-paths against a Raven Railgun PIR adapter server.
+A `POINodeInterface` for the Railgun engine. It resolves PPOI status, PPOI auth-paths and
+commit-tree auth-paths from a Raven Railgun adapter server, by client-side PIR unless configured
+otherwise.
 
 ## Install
 
@@ -52,9 +54,22 @@ one resolved file, and a consumer that typechecks against it.
 
 Engine's status values are a string enum, which no string literal satisfies, so the engine-shaped
 `getPOIsPerList(txidVersion, chain, listKeys, commitments)` is typed with engine's own
-`POIsPerList`. The one value it can return outside that enum is `"Unreachable"`, when the adapter
-could not be reached; engine compares statuses only for equality, so it reads as not `Valid`. The
-two-argument `getPOIsPerList(listKeys, commitments)` returns `PoisPerListResponse`, which names it.
+`POIsPerList`. The two-argument `getPOIsPerList(listKeys, commitments)` returns
+`PoisPerListResponse`, which adds the SDK-local verdicts `Unreachable` and `MissingStale`.
+
+The two shapes fail differently, because engine runs its receive refresh, legacy submission, spent
+refresh and spend-POI generation in one chain that a rejection cuts short:
+
+- The engine-shaped `getPOIsPerList` never rejects over a failed list or commitment. Engine
+  replaces a commitment's whole stored map with the one it is handed, so a commitment whose verdict
+  on any asked list could not be established (a failed or stale request, a missing context, an
+  absence that cannot be shown current, or an SDK-local verdict) is left out of the result, and
+  engine keeps what it held. In plaintext mode it asks in batches of 20, as the stock interface does.
+- The engine-shaped `submitLegacyTransactProofs` submits in batches of 20 and never rejects: a
+  failed batch, or no `upstreamFallbackEndpoint` to send to, leaves those proofs for engine's next
+  refresh.
+- The engine-shaped calls still refuse a `txidVersion` or chain other than the configured one.
+- The two-argument overloads raise the typed `RavenError`s described below.
 
 ## How it plugs in
 
@@ -71,6 +86,12 @@ const poi = new RavenPOINodeInterface({
   upstreamFallbackEndpoint: "https://ppoi.fdi.network",
 });
 ```
+
+Every request the interface sends carries a deadline, `requestTimeoutMs`, from sending it to its
+last body byte: 60,000 ms by default, which is what the stock interface allows a POI node request.
+A request past it fails as `Network`. The deadline covers the whole body, so a caller of
+`fetchBcToIdxMap` on a slow link raises it: that body is tens of megabytes on a large list (see
+below).
 
 ### The credential is optional
 
@@ -92,31 +113,54 @@ interpolates what it was given: `process.env.RAVEN_BEARER_TOKEN!` with the varia
 `undefined` at runtime whatever its type says, and that is treated as no credential rather than
 sent as `Authorization: Bearer undefined`, a request that looks authenticated and is not.
 
-Wiring it into a wallet: today `startRailgunEngine` takes a list of POI node URLs and builds the stock `WalletPOINodeInterface` internally, and neither `WalletPOI` nor a POI-interface setter is part of the wallet's public API. Making `RavenPOINodeInterface` the active POI interface therefore needs a small, additive injection point in Railgun (one hook that accepts any `POINodeInterface`), or it is wired in through a fork. That injection point is the integration to land with the Railgun team.
+Wiring it into a wallet needs no Railgun change and no fork: engine's public `POI.init(lists,
+nodeInterface)` is the injection point. `startRailgunEngine` still takes `poiNodeURLs`, since the
+wallet refuses to load a POI network without them and uses them for its txid merkleroot validation,
+which this package does not replace. It then installs the stock `WalletPOINodeInterface` through
+`POI.init`; calling `POI.init` again afterwards, from the same engine copy (see above), installs this
+one in its place:
+
+```ts
+import { POI } from "@railgun-community/engine";
+import { POI_REQUIRED_LISTS } from "@railgun-community/shared-models";
+
+await startRailgunEngine(/* ..., */ poiNodeURLs /* , ... */);
+POI.init([...POI_REQUIRED_LISTS, ...customPOILists], poi);
+```
+
+`POI.init` installs one interface for every chain the engine runs. This one answers only its
+configured chain: on any other it reports POI as not required and is inactive, so install it only in
+a wallet that runs that one chain.
 
 ## What it routes
 
-| Method                    | Route                                                    | Privacy |
-|---------------------------|----------------------------------------------------------|---------|
-| `getPOIsPerList`          | `POST /v1/poi/pois-per-list`                             | PIR     |
-| `getPOIMerkleProofs`      | `POST /v1/poi/merkle-proofs`                             | PIR     |
-| `getMerkleProof`          | `POST /v1/commit-tree/:tree/merkle-proof`                | PIR     |
-| `validatePOIMerkleroots`  | upstream passthrough                                     | trust   |
-| `submitPOI`               | upstream passthrough                                     | trust   |
-| `submitLegacyTransactProofs` | upstream passthrough                                  | trust   |
+| Method                       | Client-PIR (default)             | Plaintext (`useClientPir: false`)         |
+|------------------------------|----------------------------------|-------------------------------------------|
+| `getPOIsPerList`             | `POST /v1/instance/:id/batch`    | `POST /v1/poi/pois-per-list`              |
+| `getPOIMerkleProofs`         | `POST /v1/instance/:id/batch`    | `POST /v1/poi/merkle-proofs`              |
+| `getMerkleProof`             | `POST /v1/instance/:id/batch`    | `POST /v1/commit-tree/:tree/merkle-proof` |
+| `validatePOIMerkleroots`     | upstream JSON-RPC                | upstream JSON-RPC                         |
+| `submitPOI`                  | upstream JSON-RPC                | upstream JSON-RPC                         |
+| `submitLegacyTransactProofs` | upstream JSON-RPC                | upstream JSON-RPC                         |
 
-`getMerkleProof` returns a `CommitTreeProof`, discriminated on `kind`:
+Only the client-PIR column is private: the plaintext routes carry the blinded commitments or the
+leaf index in the request body. The upstream calls go to `upstreamFallbackEndpoint` in plaintext, as
+the stock interface's go to its POI node, and refuse when it is not configured, except the
+engine-shaped `submitLegacyTransactProofs` above.
 
-- `kind: "authPath"` -- the client-PIR path. Carries `elements` and `indices` and **no root**. PIR fetches the 16 auth-path siblings; it never fetches the leaf, so there is nothing to fold a root from. A caller that needs a root fetches the leaf row itself and folds with the exported `foldMerkleRoot`.
-- `kind: "rooted"` -- the plaintext path (`useClientPir: false`). Carries the adapter's own `MerkleProof` under `proof`, root included.
+`getMerkleProof` returns a `CommitTreeProof` of `kind: "authPath"` on both paths: `elements` and
+`indices`, and **no root**. PIR fetches the 16 auth-path siblings; it never fetches the leaf, so there
+is nothing to fold a root from. A caller that needs a root fetches the leaf row itself and folds with
+the exported `foldMerkleRoot`.
 
 Public-info channels (cacheable, no per-BC leak):
 
-| Method               | Route                              |
-|----------------------|------------------------------------|
-| `fetchBcToIdxMap`    | `GET /v1/poi/:list/bc-to-idx-map`  |
-| `fetchBcPrefixIndex` | `GET /v1/poi/:list/bc-prefixes`    |
-| `fetchStatusHeader`  | `GET /v1/poi/:list/status-header`  |
+| Call                                         | Route                              |
+|----------------------------------------------|------------------------------------|
+| `fetchBcToIdxMap` (method)                   | `GET /v1/poi/:list/bc-to-idx-map`  |
+| `syncPoiListIndex` (method)                  | `GET /v1/poi/:list/bc-prefixes`    |
+| `fetchBcPrefixIndex` (exported function)     | `GET /v1/poi/:list/bc-prefixes`    |
+| `fetchStatusHeader` (method)                 | `GET /v1/poi/:list/status-header`  |
 
 `fetchBcToIdxMap` returns the channel's rows as `{ epoch, listKey, rows, entries }`, parsed rather
 than cast. The node publishes a gap-free prefix of the list in index order, so entry `i` must be row
@@ -203,9 +247,9 @@ await poi.syncPoiListIndex(listKey); // first run: walks the prefix channel once
   "answer-at-index-rows"` is the explicit decision to answer it anyway, and it answers the SDK-local
   verdict `MissingStale`, never `Missing`, so each verdict says which kind of absence it is, per
   commitment and per list. Those answers are counted apart, as `absentFromStaleIndex` or
-  `absentFromBareMap`. The engine reads `MissingStale` exactly as it reads `Missing`: it acts only on
-  `Valid`, `ShieldBlocked` and `ProofSubmitted`. Under the default, a sync that fails on the network
-  reads `Unreachable` for the absences in `getPOIsPerList`, as a failed query does.
+  `absentFromBareMap`. Under the default, a sync that fails on the network reads `Unreachable` for
+  the absences in the two-argument `getPOIsPerList`, as a failed query does. The engine-shaped call
+  answers neither `MissingStale` nor `Unreachable`: it leaves the commitment out.
 - **A failed sync costs only the absences.** A commitment the held index has a row for is still
   asked, and its row confirms it: a row the list holds never moves. So `getPOIsPerList` still answers
   members and `getPOIMerkleProofs` still proves them; only a commitment with no row is refused, with
@@ -267,9 +311,10 @@ therefore compares the row's BC tail against the blinded commitment it asked abo
 typed `DecodeError` `RavenError` on any mismatch -- including the all-zero row -- rather than
 returning a status.
 
-A `Network` failure returns the SDK-local `Unreachable` verdict. It never degrades to the adapter's
-non-blocking `Missing` verdict, so callers can distinguish an absent PPOI record from a request that
-never reached the adapter.
+On the two-argument call a `Network` failure returns the SDK-local `Unreachable` verdict. It never
+degrades to the adapter's non-blocking `Missing` verdict, so callers can distinguish an absent PPOI
+record from a request that never reached the adapter. The engine-shaped call leaves such a
+commitment out, as it does a row that fails the binding check.
 
 Two limits are worth stating plainly. At the narrowest record width the encoder builds (32 bytes) the
 row has room for `bc[0..31]`, so the binding covers 31 of the 32 BC bytes; a wider record binds all
@@ -281,8 +326,9 @@ the row describes *your* BC, not that the verdict inside it is correct.
 Every PIR response carries
 `X-Raven-Freshness: lag_blocks=N applied_height=M epoch=E confidence=0.X`. In client-PIR mode,
 confidence below `freshnessConfidenceFloor` (default 0.5) raises a typed `StaleData` error even when
-`upstreamFallbackEndpoint` is configured. The error carries the public freshness values but no
-blinded commitment, list key, token, or URL.
+`upstreamFallbackEndpoint` is configured; the engine-shaped `getPOIsPerList` leaves that request's
+commitments out instead. The error carries the public freshness values but no blinded commitment,
+list key, token, or URL.
 
 `freshnessConfidenceFloor` must be finite and within `[0,1]`; invalid values are rejected with
 `InvalidQuery` during construction. A missing private freshness header raises `StaleAdapter`, and a
@@ -361,7 +407,7 @@ read another chain's tip and refuse honest proofs.
 The client-side IMT (Incremental Merkle Tree) node cache (entry point: `ImtCache` in [`src/imt-cache.ts`](src/imt-cache.ts)) is layered:
 
 - **L1 -- `InMemoryLru`** (always present). Bounded `Map`-backed LRU; default capacity 1024 entries x 32 byte values = ~32 KB. Synchronous `getSync`/`set` fast-path.
-- **L2 -- IndexedDB** (when `globalThis.indexedDB` is exposed). Used by modern browsers (Safari 10+, Chrome 24+, Firefox 16+) and by Node tests via an IDB shim. Lazily opened on first use; reads promote IDB hits back into L1.
+- **L2 -- IndexedDB** (when `globalThis.indexedDB` is exposed, which browsers do and Node does not). Lazily opened on first use; reads promote IDB hits back into L1.
 
 There is **no `localStorage` L2.** Every supported browser ships IndexedDB, so a synchronous-blocking 5 MB key-value store would only add eviction-policy complexity without unlocking a real environment. In the rare no-IDB case (Safari private browsing on older versions, custom embedders that strip IDB), the L1 in-memory layer alone is the fallback -- the cache is best-effort, not authoritative.
 

@@ -10,6 +10,7 @@ import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_sp
 import type { ClientPirContext, RavenInspireWasm } from "../src/index";
 
 import { startMockServer, writeJson, type MockServer } from "./helpers/mock_server";
+import { shardConfigBincode } from "./helpers/shard_config";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const TREE_NUMBER = 0;
@@ -44,7 +45,7 @@ function stubCtx(): ClientPirContext {
     wasm: stubWasm(),
     session: { free: () => undefined },
     crsBincode: new Uint8Array(0),
-    shardConfigBincode: new Uint8Array(0),
+    shardConfigBincode: shardConfigBincode(),
     entrySize: NODE_BYTES,
   };
 }

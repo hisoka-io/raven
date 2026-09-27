@@ -12,13 +12,14 @@ import {
 import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
 import type { ClientPirContext, POIStatus, RavenInspireWasm } from "../src/index";
 
-import { encodeBatchResponseNodes, encodedBatchCount } from "./helpers/auth_path_stub";
+import { encodeBatchResponseNodes } from "./helpers/auth_path_stub";
 import { startMockServer, writeBinary, type MockServer } from "./helpers/mock_server";
 import {
   assertNoCommitmentsInPirRequests,
   injectCommitment,
   STUB_QUERY_BYTES,
-  stubQueryBundle,
+  namedBatchTargets,
+  targetNamingQueryBundle,
 } from "./helpers/private_wire";
 import { shardConfigBincode } from "./helpers/shard_config";
 
@@ -44,7 +45,7 @@ function passthroughWasm(): RavenInspireWasm {
   return {
     ...stubRemoteSessionExports(),
     build_client_session: () => ({ free: () => undefined }),
-    build_seeded_query: () => stubQueryBundle(),
+    build_seeded_query: (_session, _shards, target) => targetNamingQueryBundle(target),
     // Test routes encode the intended plaintext row into the response body directly.
     extract_response: (_session, _crs, _state, response, _entry) => new Uint8Array(response),
     build_instance_params_blob: () => new Uint8Array(0),
@@ -68,10 +69,8 @@ function mountStatusRows(server: MockServer, rows: readonly Uint8Array[]): void 
   server.route(
     (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
     (_req, body, res) => {
-      const count = encodedBatchCount(body);
-      const responses = Array.from({ length: count }, (_unused, slot) =>
-        slot < rows.length ? rows[slot] : rows[0],
-      );
+      // Row `i` answers list index `i`, as a node answers the row a query names.
+      const responses = namedBatchTargets(body).map((target) => rows[target] ?? rows[0]);
       writeBinary(res, encodeBatchResponseNodes(responses));
       return true;
     },

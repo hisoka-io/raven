@@ -11,7 +11,7 @@ import {
   EXPECTED_WIRE_SCHEMA_VERSION,
 } from "./helpers/wire_schema";
 import { startMockServer, type MockServer } from "./helpers/mock_server";
-import { NODE_BYTES, TOKEN, encodeBatchResponse, encodedBatchCount, stubCtx } from "./helpers/auth_path_stub";
+import { NODE_BYTES, TOKEN, encodeBatchResponse, stubCtx } from "./helpers/auth_path_stub";
 
 const TREE_NUMBER = 0;
 const LEAF = 1234;
@@ -21,7 +21,7 @@ function mountBatchRoute(server: MockServer, schemaVersion: string | null): void
   server.route(
     (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
     (_req, body, res) => {
-      const out = encodeBatchResponse(7, encodedBatchCount(body));
+      const out = encodeBatchResponse(7, body);
       const headers: Record<string, string> = {
         "content-type": "application/octet-stream",
         "x-raven-epoch": SERVED_EPOCH,

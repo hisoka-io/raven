@@ -67,7 +67,7 @@ describe("batch size ladder", () => {
           "x-raven-epoch": "1",
           "x-raven-schema-version": "6",
         });
-        response.end(Buffer.from(encodeBatchResponse(1, encodedBatchCount(body))));
+        response.end(Buffer.from(encodeBatchResponse(1, body)));
         return true;
       },
     );

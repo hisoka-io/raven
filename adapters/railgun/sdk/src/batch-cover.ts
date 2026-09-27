@@ -1,60 +1,143 @@
-import { buildFanoutCoverPlan, recoverRealFanoutResponses, type FanoutCoverPlan } from "./fanout-cover";
-import { decodeShardGeometry } from "./client-pir";
+import { paddedBatchLength } from "./batch-ladder";
 import { uniformRandomBelow } from "./crypto-random";
 import { RavenError } from "./errors";
 
-/** Padded global query targets plus the private map restoring caller order. */
+/** One padded `/batch` request: every target in wire order, and where each caller target sits. */
 export interface PaddedQueryPlan {
+  /** Global row indices in wire order, real and cover alike. */
   readonly wireTargets: readonly number[];
+  /** Wire slot answering each caller target, in caller order. */
+  readonly realSlots: readonly number[];
 }
 
-const issuedPlans = new WeakMap<PaddedQueryPlan, FanoutCoverPlan>();
+function invalid(message: string): never {
+  throw RavenError.invalidQuery(`batch cover: ${message}`);
+}
 
-/** Build a dyadic, distinct-shard cover plan from validated shard geometry. */
+function checkedCount(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    invalid(`${name} must be a positive integer, got ${value}`);
+  }
+  return value;
+}
+
+/** The `rank`-th shard below the populated count that `taken` (ascending) does not hold. */
+function freeShardAtRank(rank: number, taken: readonly number[]): number {
+  let shard = rank;
+  for (const held of taken) {
+    if (held > shard) break;
+    shard += 1;
+  }
+  return shard;
+}
+
+function insertSorted(sorted: number[], value: number): void {
+  let at = 0;
+  while (at < sorted.length && sorted[at] < value) at += 1;
+  sorted.splice(at, 0, value);
+}
+
+/**
+ * Pad `realTargets` to a ladder step and shuffle the slots.
+ *
+ * `shard_id` is cleartext, so the server counts distinct shards per request. Covers go to shards
+ * no real target occupies, up to min(padded length, populated shards) distinct shards, so with
+ * distinct real shards that count depends on the ladder step and the table alone. A cover that
+ * fits no free shard goes to a uniform populated shard. Two real targets sharing a shard still
+ * show as one shard, so a caller whose reals can collide fixes its real set per step instead, as
+ * {@link authPathQueryLevels} does.
+ *
+ * Covers address rows below `populatedRows`, since a query into rows the instance never wrote
+ * could only be a cover. An empty `realTargets` yields one cover query, for a request whose
+ * absence would itself say every lookup was answered locally.
+ */
 export function buildPaddedQueryPlan(
   realTargets: readonly number[],
-  shardConfigBincode: Uint8Array,
+  entriesPerShard: number,
+  populatedRows: number,
 ): PaddedQueryPlan {
-  const geometry = decodeShardGeometry(shardConfigBincode);
-  if (realTargets.length === 0) {
-    throw RavenError.invalidQuery("batch cover: real target list must not be empty");
-  }
-  const realShardIds = realTargets.map((target, position) => {
+  checkedCount(entriesPerShard, "entries per shard");
+  let rowBound = checkedCount(populatedRows, "populated rows");
+  const realShards: number[] = [];
+  for (const [position, target] of realTargets.entries()) {
     if (!Number.isSafeInteger(target) || target < 0) {
-      throw RavenError.invalidQuery(
-        `batch cover: target at position ${position} must be a non-negative integer`,
-      );
+      invalid(`target at position ${position} must be a non-negative integer, got ${target}`);
     }
-    const shardId = Math.floor(target / geometry.entriesPerShard);
-    if (shardId >= geometry.shardCount) {
-      throw RavenError.invalidQuery(
-        `batch cover: target ${target} is out of range for ${geometry.shardCount} shards`,
-      );
-    }
-    return shardId;
-  });
-  const fanout = buildFanoutCoverPlan(realShardIds, geometry.shardCount, 32);
-  const realTargetBySlot = new Map(
-    fanout.responseSlotByRealPosition.map((slot, position) => [slot, realTargets[position]]),
+    // A target past the stated bound proves the row exists, so the bound was stale.
+    rowBound = Math.max(rowBound, target + 1);
+    const shard = Math.floor(target / entriesPerShard);
+    if (!realShards.includes(shard)) insertSorted(realShards, shard);
+  }
+  const shardCount = Math.ceil(rowBound / entriesPerShard);
+  const padded = realTargets.length === 0 ? 1 : paddedBatchLength(realTargets.length);
+  const coverSlots = padded - realTargets.length;
+  const distinctCovers = Math.min(coverSlots, Math.min(padded, shardCount) - realShards.length);
+
+  const coverRow = (shard: number): number => {
+    const first = shard * entriesPerShard;
+    return first + uniformRandomBelow(Math.min(entriesPerShard, rowBound - first));
+  };
+  const slots: { target: number; realPosition: number | null }[] = realTargets.map(
+    (target, realPosition) => ({ target, realPosition }),
   );
-  const wireTargets = fanout.wireShardIds.map((shardId, slot) => {
-    const realTarget = realTargetBySlot.get(slot);
-    if (realTarget !== undefined) return realTarget;
-    return shardId * geometry.entriesPerShard + uniformRandomBelow(geometry.entriesPerShard);
+  const taken = [...realShards];
+  for (let drawn = 0; drawn < distinctCovers; drawn += 1) {
+    const shard = freeShardAtRank(uniformRandomBelow(shardCount - taken.length), taken);
+    insertSorted(taken, shard);
+    slots.push({ target: coverRow(shard), realPosition: null });
+  }
+  while (slots.length < padded) {
+    slots.push({ target: coverRow(uniformRandomBelow(shardCount)), realPosition: null });
+  }
+  for (let right = slots.length - 1; right > 0; right -= 1) {
+    const left = uniformRandomBelow(right + 1);
+    [slots[left], slots[right]] = [slots[right], slots[left]];
+  }
+
+  const realSlots = new Array<number>(realTargets.length);
+  const wireTargets = slots.map(({ target, realPosition }, wireSlot) => {
+    if (realPosition !== null) realSlots[realPosition] = wireSlot;
+    return target;
   });
-  const plan: PaddedQueryPlan = Object.freeze({ wireTargets: Object.freeze(wireTargets) });
-  issuedPlans.set(plan, fanout);
-  return plan;
+  return Object.freeze({
+    wireTargets: Object.freeze(wireTargets),
+    realSlots: Object.freeze(realSlots),
+  });
 }
 
-/** Select real responses from a plan and restore the caller's target order. */
+/**
+ * Auth-path levels to fetch when `missingLevels` are not cached: every level below the ladder
+ * step that covers the highest miss, re-fetching cached ones among them.
+ *
+ * The levels of one path pack unevenly into shards (on a commit tree every level above the sixth
+ * shares one shard), so random covers cannot give a fixed shard count: the reals' own collisions
+ * would publish how many upper levels missed. The bottom `step` levels of a path touch shards
+ * fixed by the step and the table alone. Cache misses run from level 0 up, so this costs nothing
+ * over padding the misses themselves; no miss re-fetches the whole path, since skipping the
+ * request would publish a fully warm cache.
+ */
+export function authPathQueryLevels(missingLevels: readonly number[], depth: number): number[] {
+  checkedCount(depth, "path depth");
+  let highest = -1;
+  for (const level of missingLevels) {
+    if (!Number.isSafeInteger(level) || level < 0 || level >= depth) {
+      invalid(`missing level ${level} is not a level of a depth-${depth} path`);
+    }
+    highest = Math.max(highest, level);
+  }
+  const step = highest < 0 ? depth : Math.min(paddedBatchLength(highest + 1), depth);
+  return Array.from({ length: step }, (_unused, level) => level);
+}
+
+/** Responses for the caller's targets, in caller order. */
 export function recoverRealQueryResponses<T>(
   plan: PaddedQueryPlan,
   wireResponses: readonly T[],
 ): T[] {
-  const fanout = issuedPlans.get(plan);
-  if (!fanout) {
-    throw RavenError.invalidQuery("batch cover: plan was not issued by buildPaddedQueryPlan");
+  if (wireResponses.length !== plan.wireTargets.length) {
+    throw RavenError.batchMismatch(
+      `batch cover: expected ${plan.wireTargets.length} responses, got ${wireResponses.length}`,
+    );
   }
-  return recoverRealFanoutResponses(fanout, wireResponses);
+  return plan.realSlots.map((wireSlot) => wireResponses[wireSlot]);
 }

@@ -10,7 +10,7 @@ import { RavenPOINodeInterface, TREE_DEPTH, type RavenInspireWasm } from "../src
 import {
   TOKEN,
   authPathOf,
-  encodeBatchResponseNodes,
+  encodeRepliesByTarget,
   stubCtx,
   stubWasm,
 } from "./helpers/auth_path_stub";
@@ -67,13 +67,15 @@ describe("shared batch-response encoder round-trips through the SDK's own decode
       });
       server.route(
         (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
-        (_req, _body, res) => {
+        (_req, body, res) => {
           res.writeHead(200, {
             "content-type": "application/octet-stream",
             "x-raven-epoch": "1",
             "x-raven-schema-version": "6",
           });
-          res.end(Buffer.from(encodeBatchResponseNodes(nodes)));
+          // Answered per named row, as a node does: the SDK shuffles its slots.
+          const path = Array.from(stub.path_indices_for_leaf(0, 5));
+          res.end(Buffer.from(encodeRepliesByTarget(body, (row) => nodes[path.indexOf(row)])));
           return true;
         },
       );

@@ -6,8 +6,7 @@
  * only -- a list key, a block number, and upstream's own tip. No blinded commitment is sent,
  * and upstream's API takes none.
  *
- * What that hides, stated exactly, because an earlier version of this comment overclaimed and
- * two audits called it: the NOTE is hidden, the BLOCK is not. `block` is
+ * What that hides, stated exactly: the NOTE is hidden, the BLOCK is not. `block` is
  * `floor(noteLeafIndex / 65_536)`, so a request tells the aggregator which block the note sits
  * in -- about one-in-six for the OFAC list today. Requests for one block are identical between
  * wallets apart from the JSON-RPC `id`, and the tail cache is consulted before the point query,
@@ -15,9 +14,8 @@
  * per proof. It is not one per cache window: a fold whose root has moved off the cached window
  * makes `verifyAgainstUpstreamPin` forget the tail and re-resolve, and a re-resolve starts with
  * the point query. For a filling block every insert moves every auth path in it, so a list that
- * takes a leaf between two proofs is back to one block-naming request per proof. State it that
- * way -- the first version of this paragraph overclaimed and two audits called it, and the
- * replacement overclaimed differently. A caller who needs the block hidden preloads
+ * takes a leaf between two proofs is back to one block-naming request per proof. A caller who
+ * needs the block hidden preloads
  * `ppoiPinnedRoots` and never reaches this module.
  */
 
@@ -222,8 +220,8 @@ export class UpstreamPinResolver {
     );
     // Filtering by BLOCK here would accept any row that floor-divides to it, so an upstream
     // answering the zero-width query with an INTERMEDIATE row would have that partial-tree
-    // root cached as the block's immutable root for the process lifetime. Both audits found
-    // this independently. The query names one index; only that index may answer it.
+    // root cached as the block's immutable root for the process lifetime. The query names one
+    // index; only that index may answer it.
     const roots = new Set<string>();
     for (const row of rows) {
       if (row.index !== lastIndex) continue;
@@ -268,8 +266,8 @@ export class UpstreamPinResolver {
   /** Two filters, both load-bearing. Block: a window that began in block B-1 would otherwise hand
    *  back B-1's root, which folds against a different tree. Range: the refusal quotes this window
    *  as what was checked, so a row upstream volunteered from OUTSIDE it -- the block's first leaf,
-   *  say -- must not be counted as a candidate the wallet's fold was measured against. Same
-   *  reasoning as `pointQuery`, which was hardened first and one function up. */
+   *  say -- must not be counted as a candidate the wallet's fold was measured against. `pointQuery`
+   *  filters the same way. */
   private rootsInBlock(
     rows: readonly { index: number; root: string }[],
     block: number,
@@ -378,8 +376,8 @@ export class UpstreamPinResolver {
         headers: { "content-type": "application/json" },
         body,
         // A pin fetch blocks a proof the wallet is waiting on, and the endpoint is a third
-        // party: without a deadline a silent upstream leaves that proof pending forever, which
-        // an audit reproduced. `AbortSignal.timeout` is the platform's own, so nothing leaks
+        // party: without a deadline a silent upstream leaves that proof pending forever.
+        // `AbortSignal.timeout` is the platform's own, so nothing leaks
         // when the fetch settles first.
         signal: AbortSignal.timeout(this.requestTimeoutMs),
       });
@@ -413,9 +411,9 @@ export class UpstreamPinResolver {
         { url: this.endpoint, status: response.status },
       );
     }
-    // Presence, not content, was the test -- so a proxy that spells success `"error": null`
-    // turned every pin fetch, and therefore every unpinned proof, into a refusal. JSON-RPC 2.0
-    // says the member is absent on success; tolerating the null spelling costs nothing.
+    // Content, not presence: a proxy that spells success `"error": null` would otherwise turn
+    // every pin fetch, and therefore every unpinned proof, into a refusal. JSON-RPC 2.0 says the
+    // member is absent on success; tolerating the null spelling costs nothing.
     if (decoded.error !== undefined && decoded.error !== null) {
       const rpcError = decoded.error;
       const detail = isRecord(rpcError)

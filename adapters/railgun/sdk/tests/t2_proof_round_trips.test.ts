@@ -26,6 +26,7 @@ import {
 } from "../src/index";
 import { startMockServer, type MockServer } from "./helpers/mock_server";
 import { TOKEN, encodeBatchResponseNodes, stubCtx } from "./helpers/auth_path_stub";
+import { namedBatchTargets } from "./helpers/private_wire";
 import {
   PATH10_ROW_BYTES,
   path10Root,
@@ -108,10 +109,7 @@ describe("round trips for a K-commitment proof", () => {
     server.reset();
   });
 
-  function rig(
-    p: Plan,
-    callerOrder?: readonly string[],
-  ): { sdk: RavenPOINodeInterface; bcs: string[]; queriesPerPost: number[] } {
+  function rig(p: Plan): { sdk: RavenPOINodeInterface; bcs: string[]; queriesPerPost: number[] } {
     const queriesPerPost: number[] = [];
     const slots = new Map<string, Uint8Array>();
     const bcToIdx = new Map<string, number>();
@@ -124,12 +122,10 @@ describe("round trips for a K-commitment proof", () => {
       });
     }
 
-    // What the SDK will ask for, per block, in the order it will ask: the caller's own order
-    // filtered to that block. A real PIR server cannot know which row a query targets -- this
-    // rig can, which is the only reason the assertions below can check ORDER at all.
-    const order = callerOrder ?? p.blocks.flatMap(({ bcs }) => bcs);
-    const pending = new Map<number, string[]>(
-      p.blocks.map(({ block, bcs }) => [block, order.filter((bc) => bcs.includes(bc))]),
+    // A real PIR server cannot know which row a query targets -- this rig's stub queries name
+    // it, which is the only reason the assertions below can check ORDER at all.
+    const bcAtRow = new Map<string, string>(
+      p.blocks.flatMap(({ block, bcs }) => bcs.map((bc, row) => [`${block}:${row}`, bc])),
     );
 
     server.route(
@@ -138,17 +134,16 @@ describe("round trips for a K-commitment proof", () => {
         const raw = /^\/v1\/instance\/([^/]+)\/batch$/.exec(req.url ?? "")?.[1] ?? "";
         const label = decodeURIComponent(raw);
         const block = Number(label.slice(label.lastIndexOf(":") + 1));
-        const queue = pending.get(block);
-        if (!queue) throw new Error(`no planned block for instance label ${label}`);
-        const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
-        const queries = Number(view.getBigUint64(2, true));
-        queriesPerPost.push(queries);
-        // `drawPaddedSlots` keeps the real targets at slots 0..K-1 and fills the rest with
-        // repeats of real ones, so the cover slots may echo any row of this group.
-        const real = queue.splice(0, Math.min(queries, MAX_BATCH_SIZE));
-        const served = Array.from({ length: queries }, (_u, slot) =>
-          slots.get(real[Math.min(slot, real.length - 1)])!,
-        );
+        if (!p.blocks.some((planned) => planned.block === block)) {
+          throw new Error(`no planned block for instance label ${label}`);
+        }
+        const targets = namedBatchTargets(body);
+        queriesPerPost.push(targets.length);
+        // A cover slot names a row this rig holds no commitment at; any well-formed row answers it.
+        const served = targets.map((row) => {
+          const bc = bcAtRow.get(`${block}:${row}`);
+          return slots.get(bc ?? p.blocks[0].bcs[0])!;
+        });
         res.writeHead(200, {
           "content-type": "application/octet-stream",
           "x-raven-epoch": "1",
@@ -231,7 +226,7 @@ describe("round trips for a K-commitment proof", () => {
       p.blocks[1].bcs[1],
       p.blocks[0].bcs[0],
     ];
-    const { sdk } = rig(p, interleaved);
+    const { sdk } = rig(p);
     const proofs = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, interleaved);
     expect(proofs.map((proof) => proof.leaf)).toEqual(interleaved);
   });

@@ -36,7 +36,7 @@ function mountAdapter(server: MockServer): Adapter {
         "x-raven-epoch": String(EPOCH),
         "x-raven-schema-version": "6",
       });
-      res.end(Buffer.from(encodeBatchResponse(EPOCH, encodedBatchCount(body))));
+      res.end(Buffer.from(encodeBatchResponse(EPOCH, body)));
       return true;
     },
   );

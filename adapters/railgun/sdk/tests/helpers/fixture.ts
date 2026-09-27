@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import * as wasmPkg from "raven-inspire-client-wasm";
 
 import type { ClientPirContext, RavenInspireWasm } from "../../src/index";
+import { targetRecordingWasm } from "./private_wire";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = join(HERE, "..", "fixtures");
@@ -43,8 +44,25 @@ export function loadFixture(): LoadedFixture {
   return { meta, paramsBundle, crsBincode, shardConfigBincode, responsesByIdx };
 }
 
+const recording = targetRecordingWasm(wasmPkg as unknown as RavenInspireWasm);
+
+/** Targets of a batch built from a `makeClientPirContext` context, in wire order; `undefined`
+ *  for a query this process did not build. */
+export const fixtureBatchTargets = recording.targetsOf;
+
+/** The fixture's response for each slot's target, and `cover` for a target it has none for. */
+export function fixtureResponsesFor(
+  fixture: LoadedFixture,
+  batchBody: Uint8Array,
+  cover: Uint8Array,
+): Uint8Array[] {
+  return fixtureBatchTargets(batchBody).map(
+    (target) => (target === undefined ? undefined : fixture.responsesByIdx.get(target)) ?? cover,
+  );
+}
+
 export function makeClientPirContext(fixture: LoadedFixture): ClientPirContext {
-  const wasm = wasmPkg as unknown as RavenInspireWasm;
+  const wasm = recording.wasm;
   const session = wasm.build_client_session(fixture.paramsBundle, fixture.crsBincode);
   return {
     wasm,
