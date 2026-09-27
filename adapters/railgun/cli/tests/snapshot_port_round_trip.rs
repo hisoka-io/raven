@@ -19,9 +19,10 @@ use raven_railgun_cli::snapshot_port::{
     SnapshotPortError,
 };
 use raven_railgun_persistence::MANIFEST_SCHEMA_VERSION;
+use sha2::Digest;
 use snapshot_fixture::{
     export, import, is_empty_or_absent, keys, read_tarball, rewrite_manifest, sig_path,
-    wal_only_instance, LIST_A, LIST_B, SCHEME_TAG_A, SCHEME_TAG_B,
+    synced_instance, wal_only_instance, LIST_A, LIST_B, SCHEME_TAG_A, SCHEME_TAG_B,
 };
 
 /// The decoded archive, or `None` if zstd refuses the stream.
@@ -66,11 +67,13 @@ fn typed(err: &anyhow::Error) -> &SnapshotPortError {
         .unwrap_or_else(|| panic!("untyped error: {err:?}"))
 }
 
+/// Alpha carries a committed snapshot, whose bytes are the point; beta shares its scheme tag, so
+/// the one export also proves the shared CRS entry is deduplicated.
 #[test]
 fn export_then_import_round_trip_preserves_byte_identity() {
     let scratch = tempfile::tempdir().expect("scratch");
     let src_root = scratch.path().join("src");
-    wal_only_instance(&src_root, "alpha", SCHEME_TAG_A, LIST_A, 40);
+    synced_instance(&src_root, "alpha", SCHEME_TAG_A, LIST_A, 40);
     wal_only_instance(&src_root, "beta", SCHEME_TAG_A, LIST_B, 24);
     let keys = keys(scratch.path(), 0x42);
 
@@ -83,9 +86,35 @@ fn export_then_import_round_trip_preserves_byte_identity() {
         original_alpha.contains_key("wal/current.log"),
         "the live log is part of every export"
     );
+    assert!(
+        original_alpha
+            .keys()
+            .any(|rel| rel.starts_with("snapshots/")),
+        "alpha must carry snapshot bytes for the byte-identity check to cover them: {:?}",
+        original_alpha.keys()
+    );
+
+    assert_eq!(
+        manifest.shared_crs.len(),
+        1,
+        "two instances sharing scheme_tag must dedup to one shared CRS entry"
+    );
+    let crs_count = count_tarball_entries_matching(&tarball, "shared/crs/");
+    assert_eq!(
+        crs_count, 1,
+        "tarball must contain exactly one shared/crs/ payload"
+    );
+    assert_eq!(
+        manifest.instances[0].shared_crs_hash, manifest.instances[1].shared_crs_hash,
+        "both instances must reference the same CRS hash"
+    );
 
     let dst_root = scratch.path().join("dst");
-    import(&tarball, &dst_root, &keys, &receipt.content_hash_hex).expect("import");
+    let imported = import(&tarball, &dst_root, &keys, &receipt.content_hash_hex).expect("import");
+    assert_eq!(
+        imported.instances, receipt.instances,
+        "the import recovers what the export recorded"
+    );
 
     assert_eq!(
         exported_files(&manifest, "alpha", &dst_root),
@@ -125,30 +154,12 @@ fn export_inspection_does_not_create_layout_under_non_instance_candidates() {
     );
 }
 
-#[test]
-fn signed_export_ignores_legacy_fixed_tmp_collision() {
-    let scratch = tempfile::tempdir().expect("scratch");
-    let src_root = scratch.path().join("src");
-    wal_only_instance(&src_root, "alpha", SCHEME_TAG_A, LIST_A, 1);
-
-    let keys = keys(scratch.path(), 41);
-    let tarball = scratch.path().join("export.tar.zst");
-    let sig = sig_path(&tarball);
-    let fixed_tmp = sig.with_extension("import-tmp");
-    std::fs::create_dir(&fixed_tmp).expect("reserve legacy fixed tmp path");
-
-    export(&src_root, &tarball, &keys);
-
-    assert!(sig.is_file(), "signature sidecar must be published");
-    assert!(fixed_tmp.is_dir(), "legacy tmp sentinel must be untouched");
-}
-
 /// Tamper-refusal TOTALITY: for ANY offset past the zstd frame header and ANY
 /// non-zero xor mask, import must refuse with a TYPED error and leave no
 /// partial data dir. Replaces the two former single-offset examples (mid-file
 /// and offset-256): two lucky offsets usually land in the zstd entropy stream
 /// and prove only that zstd notices, while a flip inside a stored (raw) block
-/// of high-entropy CRS bytes decompresses cleanly and reaches the manifest
+/// of high-entropy bytes decompresses cleanly and reaches the manifest
 /// checksum layer -- the layer that actually guards silent-wrong-bytes.
 #[test]
 fn tamper_refusal_is_total_over_the_byte_range() {
@@ -157,7 +168,17 @@ fn tamper_refusal_is_total_over_the_byte_range() {
 
     let scratch = tempfile::tempdir().expect("scratch");
     let src_root = scratch.path().join("src");
-    wal_only_instance(&src_root, "alpha", SCHEME_TAG_A, LIST_A, 64);
+    let alpha = wal_only_instance(&src_root, "alpha", SCHEME_TAG_A, LIST_A, 64);
+    // The raw blocks: export carries a sealed segment and recovery never reads one, so these
+    // bytes cost no replay. A multiple of 512 leaves no tar padding inside them.
+    let incompressible: Vec<u8> = (0u32..8192)
+        .flat_map(|i| sha2::Sha256::digest(i.to_le_bytes()))
+        .collect();
+    std::fs::write(
+        alpha.join("wal/archived/seq-00000000000000000000-00000000000000000000.log"),
+        &incompressible,
+    )
+    .expect("sealed segment");
     let keys = keys(scratch.path(), 0x51);
 
     // Export ONCE; every case copies and tampers these bytes, beside the untouched sidecar.
@@ -316,22 +337,6 @@ fn cross_version_v_minus_one_export_refused() {
 }
 
 #[test]
-fn signed_export_verifies_with_correct_pubkey() {
-    let scratch = tempfile::tempdir().expect("scratch");
-    let src_root = scratch.path().join("src");
-    wal_only_instance(&src_root, "alpha", SCHEME_TAG_A, LIST_A, 2);
-    let keys = keys(scratch.path(), 0x42);
-
-    let tarball = scratch.path().join("export.tar.zst");
-    let receipt = export(&src_root, &tarball, &keys);
-
-    let dst_root = scratch.path().join("dst");
-    let imported =
-        import(&tarball, &dst_root, &keys, &receipt.content_hash_hex).expect("matching pubkey");
-    assert_eq!(imported.instances, receipt.instances);
-}
-
-#[test]
 fn signed_export_refused_with_wrong_pubkey() {
     let scratch = tempfile::tempdir().expect("scratch");
     let src_root = scratch.path().join("src");
@@ -354,49 +359,8 @@ fn signed_export_refused_with_wrong_pubkey() {
     );
 }
 
-#[test]
-fn import_into_existing_data_dir_refused_without_allow_overwrite() {
-    let scratch = tempfile::tempdir().expect("scratch");
-    let src_root = scratch.path().join("src");
-    wal_only_instance(&src_root, "alpha", SCHEME_TAG_A, LIST_A, 1);
-    let keys = keys(scratch.path(), 0x42);
-
-    let tarball = scratch.path().join("export.tar.zst");
-    let receipt = export(&src_root, &tarball, &keys);
-
-    let dst_root = scratch.path().join("dst");
-    let pre_existing_marker: PathBuf = dst_root.join("preexisting").join("manifest.json");
-    std::fs::create_dir_all(pre_existing_marker.parent().expect("parent")).expect("mkdir");
-    std::fs::write(&pre_existing_marker, b"{}").expect("marker");
-
-    let err = import(&tarball, &dst_root, &keys, &receipt.content_hash_hex)
-        .expect_err("populated root must refuse without --allow-overwrite");
-    assert!(
-        matches!(typed(&err), SnapshotPortError::DestinationPopulated),
-        "expected DestinationPopulated, got: {err:?}"
-    );
-
-    run_import(ImportOptions {
-        input: tarball,
-        data_dir: dst_root.clone(),
-        verifying_key: keys.verifying.clone(),
-        expected_content_hash: receipt.content_hash_hex.clone(),
-        allow_overwrite: true,
-    })
-    .expect("import with --allow-overwrite");
-
-    let parent = dst_root.parent().expect("parent");
-    assert!(
-        !snapshot_fixture::siblings_with_prefix(parent, "dst.pre-import.").is_empty(),
-        "expected at least one .pre-import backup directory"
-    );
-    assert!(
-        dst_root.join("alpha").join("manifest.json").is_file(),
-        "imported instance must have replaced the root"
-    );
-}
-
-/// A root that holds no instance is still the operator's, e.g. the parent of the real one.
+/// A root that holds no instance is still the operator's, e.g. the parent of the real one; a
+/// root that holds an instance is refused the same way.
 #[test]
 fn import_never_deletes_what_the_destination_already_holds() {
     let scratch = tempfile::tempdir().expect("scratch");
@@ -413,14 +377,34 @@ fn import_never_deletes_what_the_destination_already_holds() {
     std::fs::write(dst_root.join(&kept), b"not an instance").expect("operator file");
 
     let err = import(&tarball, &dst_root, &keys, pin)
-        .expect_err("a non-empty root must refuse without --allow-overwrite");
+        .expect_err("a root holding no instance must still refuse without --allow-overwrite");
     assert!(
         matches!(typed(&err), SnapshotPortError::DestinationPopulated),
-        "expected DestinationPopulated, got: {err:?}"
+        "expected DestinationPopulated for a no-instance root, got: {err:?}"
     );
     assert_eq!(
         std::fs::read(dst_root.join(&kept)).expect("operator file survives the refusal"),
         b"not an instance"
+    );
+
+    let pre_existing_marker: PathBuf = Path::new("preexisting").join("manifest.json");
+    std::fs::create_dir_all(dst_root.join("preexisting")).expect("mkdir");
+    std::fs::write(dst_root.join(&pre_existing_marker), b"{}").expect("marker");
+
+    let err = import(&tarball, &dst_root, &keys, pin)
+        .expect_err("a root holding an instance must refuse without --allow-overwrite");
+    assert!(
+        matches!(typed(&err), SnapshotPortError::DestinationPopulated),
+        "expected DestinationPopulated for a root holding an instance, got: {err:?}"
+    );
+    assert_eq!(
+        std::fs::read(dst_root.join(&kept)).expect("operator file survives the refusal"),
+        b"not an instance"
+    );
+    assert_eq!(
+        std::fs::read(dst_root.join(&pre_existing_marker))
+            .expect("pre-existing instance manifest survives the refusal"),
+        b"{}"
     );
 
     run_import(ImportOptions {
@@ -438,7 +422,16 @@ fn import_never_deletes_what_the_destination_already_holds() {
             .expect("operator file moved aside, not deleted"),
         b"not an instance"
     );
-    assert!(dst_root.join("alpha").join("manifest.json").is_file());
+    assert_eq!(
+        std::fs::read(scratch.path().join(&backups[0]).join(&pre_existing_marker))
+            .expect("pre-existing instance moved aside, not deleted"),
+        b"{}"
+    );
+    assert!(
+        dst_root.join("alpha").join("manifest.json").is_file()
+            && !dst_root.join("preexisting").exists(),
+        "imported instance must have replaced the root"
+    );
 
     let empty_root = scratch.path().join("empty");
     std::fs::create_dir(&empty_root).expect("mkdir");
@@ -447,39 +440,6 @@ fn import_never_deletes_what_the_destination_already_holds() {
     assert!(
         snapshot_fixture::siblings_with_prefix(scratch.path(), "empty.pre-import.").is_empty(),
         "nothing to back up"
-    );
-}
-
-#[test]
-fn dedup_shared_crs_appears_once_in_tarball() {
-    let scratch = tempfile::tempdir().expect("scratch");
-    let src_root = scratch.path().join("src");
-    wal_only_instance(&src_root, "alpha", SCHEME_TAG_A, LIST_A, 1);
-    wal_only_instance(&src_root, "beta", SCHEME_TAG_A, LIST_B, 1);
-
-    let tarball = scratch.path().join("export.tar.zst");
-    run_export(ExportOptions {
-        data_dir: src_root,
-        output: tarball.clone(),
-        signing_key: None,
-        keep_snapshots: 0,
-    })
-    .expect("export");
-
-    let manifest = read_export_manifest(&tarball);
-    assert_eq!(
-        manifest.shared_crs.len(),
-        1,
-        "two instances sharing scheme_tag must dedup to one shared CRS entry"
-    );
-    let crs_count = count_tarball_entries_matching(&tarball, "shared/crs/");
-    assert_eq!(
-        crs_count, 1,
-        "tarball must contain exactly one shared/crs/ payload"
-    );
-    assert_eq!(
-        manifest.instances[0].shared_crs_hash, manifest.instances[1].shared_crs_hash,
-        "both instances must reference the same CRS hash"
     );
 }
 

@@ -226,7 +226,8 @@ async fn boot_serving(opts: MultiServeOptions) -> Booting {
 
 async fn shut_down(booting: Booting) {
     let _ = booting.stop.send(());
-    tokio::time::timeout(Duration::from_secs(20), booting.server)
+    // Above the server's own drain, which gives each consumer up to 30 s, one after another.
+    tokio::time::timeout(Duration::from_secs(90), booting.server)
         .await
         .expect("shutdown timed out")
         .expect("server task panicked")

@@ -1,8 +1,13 @@
 //! Real instance data_dirs for the snapshot export / import tests.
 //!
-//! An export now recovers every instance through the node's open path, so a fixture must be a
-//! data_dir a node could boot. The shape is the one a static PPOI instance holds right after a
-//! sync: one committed snapshot of an empty store, and every row only in `wal/current.log`.
+//! An export recovers every instance through the node's open path, so a fixture must be a
+//! data_dir a node could boot. Two shapes are:
+//! - [`wal_only_instance`]: `manifest.json` at snapshot id 0 plus the live log. Recovery replays
+//!   the whole log and builds no PIR state, so an export or import of it takes milliseconds.
+//! - [`synced_instance`]: what a static PPOI instance holds right after a sync, one committed
+//!   snapshot of an empty store and every row only in the live log. Each recovery of it rebuilds
+//!   the packing cache, so only tests whose property is the snapshot bytes or this synced shape
+//!   use it.
 
 // `#[path]`-included by several targets; each uses a different subset.
 #![allow(dead_code, unreachable_pub)]
@@ -72,7 +77,7 @@ pub fn open(dir: &Path, id: &str, scheme_tag: &str, list_key: [u8; 32]) -> Opene
     .expect("open through the node's recovery path")
 }
 
-/// A synced static instance: an empty committed snapshot and `rows` rows in the live log.
+/// An instance that never committed: `rows` rows in the live log and no snapshot.
 pub fn wal_only_instance(
     root: &Path,
     id: &str,
@@ -81,6 +86,24 @@ pub fn wal_only_instance(
     rows: u32,
 ) -> PathBuf {
     wal_only_instance_of(root, id, scheme_tag, list_key, &list_rows(list_key, rows))
+}
+
+/// A synced static instance: an empty committed snapshot and `rows` rows in the live log.
+pub fn synced_instance(
+    root: &Path,
+    id: &str,
+    scheme_tag: &str,
+    list_key: [u8; 32],
+    rows: u32,
+) -> PathBuf {
+    instance_of(
+        root,
+        id,
+        scheme_tag,
+        list_key,
+        &list_rows(list_key, rows),
+        true,
+    )
 }
 
 pub fn list_rows(list_key: [u8; 32], rows: u32) -> Vec<WalEntryPayload> {
@@ -95,20 +118,33 @@ pub fn wal_only_instance_of(
     list_key: [u8; 32],
     rows: &[WalEntryPayload],
 ) -> PathBuf {
+    instance_of(root, id, scheme_tag, list_key, rows, false)
+}
+
+fn instance_of(
+    root: &Path,
+    id: &str,
+    scheme_tag: &str,
+    list_key: [u8; 32],
+    rows: &[WalEntryPayload],
+    commit_empty_snapshot: bool,
+) -> PathBuf {
     let dir = root.join(id);
     let opened = open(&dir, id, scheme_tag, list_key);
     assert!(
         opened.recovered_state.is_none(),
         "fixture wants a fresh data_dir"
     );
-    opened
-        .persistence
-        .commit_v6(
-            &raven_railgun_testkit::cached_toy_state(RECORD_SIZE),
-            &LogicalLeafStore::default(),
-            0,
-        )
-        .expect("empty first commit");
+    if commit_empty_snapshot {
+        opened
+            .persistence
+            .commit_v6(
+                &raven_railgun_testkit::cached_toy_state(RECORD_SIZE),
+                &LogicalLeafStore::default(),
+                0,
+            )
+            .expect("empty first commit");
+    }
     for (i, row) in (0u64..).zip(rows) {
         let (_, trigger) = opened
             .persistence

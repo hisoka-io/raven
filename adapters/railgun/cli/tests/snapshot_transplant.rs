@@ -16,7 +16,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use raven_railgun_cli::snapshot_port::{
-    export_content_hash, run_export, ExportOptions, ExportReceipt, SnapshotPortError,
+    run_export, ExportOptions, ExportReceipt, SnapshotPortError,
 };
 use raven_railgun_engine::imt::Imt;
 use raven_railgun_engine::persistence::{
@@ -27,8 +27,8 @@ use raven_railgun_persistence::WalEntryPayload;
 use snapshot_fixture::{
     encoder, expected_store, export, import, is_empty_or_absent, keys, list_rows, open,
     read_tarball, reforge, restitch, rewrite_manifest, siblings_with_prefix, sig_path, store_of,
-    sync_more, wal_only_instance, wal_only_instance_of, write_signature, ENTRIES_PER_SHARD, LIST_A,
-    SCHEME_TAG_A,
+    sync_more, synced_instance, wal_only_instance, wal_only_instance_of, write_signature,
+    ENTRIES_PER_SHARD, LIST_A, SCHEME_TAG_A,
 };
 
 const LIVE_LOG: &str = "instances/alpha/wal/current.log";
@@ -55,12 +55,20 @@ fn two_exports(scratch: &Path, first: u32, total: u32) -> (ExportReceipt, Export
     (older, current)
 }
 
+/// One genuine signed export of one instance holding `rows`.
+fn one_export(scratch: &Path, rows: u32) -> ExportReceipt {
+    let src = scratch.join("src");
+    wal_only_instance(&src, "alpha", SCHEME_TAG_A, LIST_A, rows);
+    export(&src, &scratch.join("current.tar.zst"), &keys(scratch, 0x33))
+}
+
 #[test]
 fn an_export_right_after_a_sync_carries_the_live_log_and_the_import_serves_the_same_rows() {
-    const ROWS: u32 = 300;
+    // Every row lands in shard 0 either way; the property is the shape, not the row count.
+    const ROWS: u32 = 20;
     let scratch = tempfile::tempdir().expect("scratch");
     let src = scratch.path().join("src");
-    let alpha = wal_only_instance(&src, "alpha", SCHEME_TAG_A, LIST_A, ROWS);
+    let alpha = synced_instance(&src, "alpha", SCHEME_TAG_A, LIST_A, ROWS);
 
     // The shape a synced static instance has on disk: nothing archived, every row live.
     let live_len = std::fs::metadata(alpha.join("wal/current.log"))
@@ -148,9 +156,13 @@ fn an_older_genuine_export_is_refused_against_the_pinned_hash() {
 #[test]
 fn a_byte_perfect_signed_export_that_recovers_to_other_rows_fails_the_post_import_check() {
     let scratch = tempfile::tempdir().expect("scratch");
-    let (older, current) = two_exports(scratch.path(), 20, 50);
+    let src = scratch.path().join("src");
+    let alpha = wal_only_instance(&src, "alpha", SCHEME_TAG_A, LIST_A, 20);
+    // The bytes an export taken now would carry as its live log.
+    let older_log = std::fs::read(alpha.join("wal/current.log")).expect("live log at 20 rows");
+    sync_more(&alpha, "alpha", SCHEME_TAG_A, LIST_A, 20..50);
     let keys = keys(scratch.path(), 0x33);
-    let older_log = read_tarball(&older.output).1[LIVE_LOG].clone();
+    let current = export(&src, &scratch.path().join("current.tar.zst"), &keys);
 
     // The live log dropped from an otherwise intact, re-signed export: the old default.
     let dropped = scratch.path().join("dropped.tar.zst");
@@ -194,7 +206,7 @@ fn a_signed_export_with_the_same_row_count_but_other_rows_fails_the_post_import_
     const ROWS: u32 = 50;
     const ROW: u32 = 17;
     let scratch = tempfile::tempdir().expect("scratch");
-    let (_, current) = two_exports(scratch.path(), 20, ROWS);
+    let current = one_export(scratch.path(), ROWS);
     let keys = keys(scratch.path(), 0x33);
     let expected = expected_store(LIST_A, ROWS);
 
@@ -269,7 +281,8 @@ fn a_signed_export_with_the_same_row_count_but_other_rows_fails_the_post_import_
     }
 }
 
-/// Each edit is consistent with itself and rehashed, and the genuine sidecar is kept.
+/// Each edit is consistent with itself and rehashed, and the genuine sidecar is kept. The same
+/// edit left unrehashed is refused earlier, by the manifest's own hash.
 #[test]
 fn every_identity_field_class_is_inside_the_signature() {
     let scratch = tempfile::tempdir().expect("scratch");
@@ -277,13 +290,29 @@ fn every_identity_field_class_is_inside_the_signature() {
     let keys = keys(scratch.path(), 0x33);
     let (older_manifest, older_files) = read_tarball(&older.output);
 
-    for label in ["instance_count", "shared_crs", "instances"] {
+    let stale_field = scratch.path().join("stale-field.tar.zst");
+    copy_export(&current.output, &stale_field);
+    rewrite_manifest(&stale_field, |m| m.exported_at_unix_ms += 1);
+    let dst = scratch.path().join("dst-stale-field");
+    let err = import(&stale_field, &dst, &keys, &current.content_hash_hex)
+        .expect_err("an edited export time must not verify");
+    assert!(
+        matches!(typed(&err), SnapshotPortError::ContentHashMismatch),
+        "unrehashed exported_at: {err:?}"
+    );
+    assert!(
+        is_empty_or_absent(&dst),
+        "unrehashed exported_at: destination untouched"
+    );
+
+    for label in ["instance_count", "shared_crs", "instances", "exported_at"] {
         let tarball = scratch.path().join(format!("{label}.tar.zst"));
         copy_export(&current.output, &tarball);
         let rehashed = restitch(&tarball, |m, files| match label {
             "instance_count" => m.instance_count += 1,
             "shared_crs" => m.shared_crs[0].scheme_tag.push('x'),
-            _ => {
+            "exported_at" => m.exported_at_unix_ms += 1,
+            "instances" => {
                 m.instances.clone_from(&older_manifest.instances);
                 files.retain(|name, _| !name.starts_with("instances/"));
                 files.extend(
@@ -293,6 +322,7 @@ fn every_identity_field_class_is_inside_the_signature() {
                         .map(|(name, bytes)| (name.clone(), bytes.clone())),
                 );
             }
+            other => unreachable!("no edit for {other}"),
         });
         let dst = scratch.path().join(format!("dst-{label}"));
         let err = import(&tarball, &dst, &keys, &current.content_hash_hex)
@@ -304,48 +334,6 @@ fn every_identity_field_class_is_inside_the_signature() {
         assert!(is_empty_or_absent(&dst), "{label}: destination untouched");
         assert_ne!(rehashed, current.content_hash_hex, "{label}");
     }
-}
-
-#[test]
-fn an_export_time_edit_breaks_the_signed_identity() {
-    let scratch = tempfile::tempdir().expect("scratch");
-    let src = scratch.path().join("src");
-    wal_only_instance(&src, "alpha", SCHEME_TAG_A, LIST_A, 4);
-    let keys = keys(scratch.path(), 0x44);
-    let receipt = export(&src, &scratch.path().join("export.tar.zst"), &keys);
-
-    let stale_field = scratch.path().join("stale-field.tar.zst");
-    copy_export(&receipt.output, &stale_field);
-    rewrite_manifest(&stale_field, |m| m.exported_at_unix_ms += 1);
-    let err = import(
-        &stale_field,
-        &scratch.path().join("dst-a"),
-        &keys,
-        &receipt.content_hash_hex,
-    )
-    .expect_err("an edited export time must not verify");
-    assert!(
-        matches!(typed(&err), SnapshotPortError::ContentHashMismatch),
-        "{err:?}"
-    );
-
-    let rehashed = scratch.path().join("rehashed.tar.zst");
-    copy_export(&receipt.output, &rehashed);
-    rewrite_manifest(&rehashed, |m| {
-        m.exported_at_unix_ms += 1;
-        m.content_hash_hex = export_content_hash(m).expect("hash");
-    });
-    let err = import(
-        &rehashed,
-        &scratch.path().join("dst-b"),
-        &keys,
-        &receipt.content_hash_hex,
-    )
-    .expect_err("a rehashed edit is not what was signed");
-    assert!(
-        matches!(typed(&err), SnapshotPortError::SignatureContentHashMismatch),
-        "{err:?}"
-    );
 }
 
 #[test]

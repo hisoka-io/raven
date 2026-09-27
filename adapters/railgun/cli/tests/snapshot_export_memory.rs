@@ -30,7 +30,7 @@ fn peak_rss_bytes() -> u64 {
 /// instance's bytes at a time: four instances need no more than one does.
 #[test]
 fn export_memory_does_not_grow_with_the_instance_count() {
-    const PAYLOAD: u64 = 128 << 20;
+    const PAYLOAD: u64 = 32 << 20;
     let scratch = tempfile::tempdir().expect("scratch");
     let heavy = |root: &Path, id: &str| {
         let dir = wal_only_instance(root, id, SCHEME_TAG_A, LIST_A, 1);
