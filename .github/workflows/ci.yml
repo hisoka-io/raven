@@ -834,6 +834,19 @@ jobs:
           cargo test --manifest-path crates/inspire/Cargo.toml --release \
             --features mod-switch-response --lib \
             pir::mod_switch::tests
+      # The served client extractor's refusals are feature-gated: the default step lists zero of
+      # them, so they run here or nowhere.
+      - name: cargo test (mod-switch-response refusals at the extractor and wire boundary)
+        run: |
+          set -euo pipefail
+          for pair in mod_switched_extract_refusals:10 wire_shape_boundary:20; do
+            t=${pair%%:*}; floor=${pair##*:}
+            n=$(cargo test --manifest-path crates/inspire/Cargo.toml --release \
+              --features mod-switch-response --test "$t" -- --list | /usr/bin/grep -c ': test$')
+            test "$n" -ge "$floor"
+            cargo test --manifest-path crates/inspire/Cargo.toml --release \
+              --features mod-switch-response --test "$t"
+          done
       # The instrument's two synthetic controls (planted leak detected, null not rejected) run in
       # the default step above. Its SUBJECT - the actual shipping query transcripts - ran in no
       # lane at all, so the privacy claim itself was never exercised. Measured 0.99 s in release
