@@ -86,12 +86,16 @@ pub(crate) async fn query_handler<S: PirScheme>(
     let instance =
         admit_instance(&app.engine, &instance_id, "query").map_err(AdmissionRefusal::status)?;
 
-    let permit = app
-        .semaphore
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let Ok(acquired) = tokio::time::timeout(
+        app.config.respond_permit_wait(),
+        Arc::clone(&app.semaphore).acquire_owned(),
+    )
+    .await
+    else {
+        count_permit_wait_refusal(&instance_id, "single");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let permit = acquired.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let query: S::Query = read_versioned(&body).map_err(|err| {
         tracing::warn!(?err, "query versioned-bincode deserialize failed");
         StatusCode::BAD_REQUEST
@@ -216,20 +220,25 @@ pub(crate) async fn batch_handler<S: PirScheme>(
     let k = app.config.max_concurrent_queries.max(1);
     let respond_timeout = Duration::from_secs(app.config.respond_timeout_secs.max(1));
 
-    let responses_result = dispatch_batch::<S, S::Query>(
+    let responses_result = dispatch_batch_within::<S, S::Query>(
         queries,
         Arc::clone(&instance),
         snapshot_for_batch,
         Arc::clone(&app.semaphore),
         k,
         respond_timeout,
+        Some(app.config.respond_permit_wait()),
     )
     .await;
 
     let elapsed = started.elapsed();
 
     let responses = responses_result.map_err(|err| {
-        tracing::error!(error = %err, "batch dispatch failed");
+        if matches!(err, BatchError::PermitWait { .. }) {
+            count_permit_wait_refusal(&instance_id, "batch");
+        } else {
+            tracing::error!(error = %err, "batch dispatch failed");
+        }
         err.status()
     })?;
 
@@ -408,6 +417,21 @@ fn append_batch_addenda(bytes: &[u8], addenda: &[Vec<u8>]) -> Result<Vec<u8>, ()
     Ok(out)
 }
 
+/// One request answered 503 because no respond permit freed within `respond_permit_wait_ms`.
+fn count_permit_wait_refusal(instance_id: &InstanceId, kind: &'static str) {
+    tracing::info!(
+        instance_id = %instance_id,
+        kind,
+        "query refused: no respond permit within the configured wait"
+    );
+    metrics::counter!(
+        "raven_railgun_respond_permit_wait_refused_total",
+        "instance" => instance_id.to_string(),
+        "kind" => kind
+    )
+    .increment(1);
+}
+
 /// Keep the concurrency permit with the work, not with the request.
 ///
 /// A timeout only drops the `JoinHandle`; `spawn_blocking` has no cancellation,
@@ -430,7 +454,7 @@ fn hold_permit_until_detached<T: Send + 'static>(
     });
 }
 
-/// Failure mode of a [`dispatch_batch`] call.
+/// Failure mode of a batch dispatch.
 #[derive(Debug, thiserror::Error)]
 pub enum BatchError {
     /// `S::respond` returned a typed error at `index`.
@@ -455,13 +479,21 @@ pub enum BatchError {
         /// 0-based slot index.
         index: usize,
     },
-    /// Per-query timeout fired; permits are released on `Elapsed`.
+    /// Per-query timeout fired; the permit stays with the detached respond until it ends.
     #[error("respond timed out at index {index} after {secs}s")]
     Timeout {
         /// 0-based slot index.
         index: usize,
         /// Timeout budget in seconds.
         secs: u64,
+    },
+    /// No respond permit freed within the configured wait.
+    #[error("slot {index} got no respond permit within {waited_ms} ms")]
+    PermitWait {
+        /// 0-based slot index.
+        index: usize,
+        /// The wait that elapsed, in milliseconds.
+        waited_ms: u64,
     },
     /// `spawn_blocking` panicked or was cancelled.
     #[error("worker task aborted at index {index}")]
@@ -488,7 +520,8 @@ impl BatchError {
             BatchError::SessionHandleRejected { .. } => StatusCode::CONFLICT,
             BatchError::WorkerAborted { .. }
             | BatchError::SemaphoreClosed
-            | BatchError::Timeout { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            | BatchError::Timeout { .. }
+            | BatchError::PermitWait { .. } => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -500,6 +533,7 @@ impl BatchError {
             | BatchError::InvalidSlot { index, .. }
             | BatchError::SessionHandleRejected { index }
             | BatchError::Timeout { index, .. }
+            | BatchError::PermitWait { index, .. }
             | BatchError::WorkerAborted { index } => {
                 if *index == usize::MAX {
                     None
@@ -518,6 +552,7 @@ impl BatchError {
             BatchError::InvalidSlot { .. } => "invalid_slot",
             BatchError::SessionHandleRejected { .. } => "session_handle_rejected",
             BatchError::Timeout { .. } => "timeout",
+            BatchError::PermitWait { .. } => "permit_wait",
             BatchError::WorkerAborted { .. } => "worker_aborted",
             BatchError::SemaphoreClosed => "semaphore_closed",
             BatchError::Invariant(_) => "invariant",
@@ -539,6 +574,9 @@ type WorkerOutcome<R> = (usize, Result<R, BatchError>);
 /// fanning one shared upload across slots pays at most `k` live copies, not one
 /// per slot. `/batch` owns its queries outright and converts through the
 /// identity `Into`.
+///
+/// Waits for each permit without a deadline; `/batch` bounds it through
+/// [`dispatch_batch_within`].
 pub(crate) async fn dispatch_batch<S, Q>(
     slots: Vec<Q>,
     instance: Arc<PirInstance<S>>,
@@ -546,6 +584,32 @@ pub(crate) async fn dispatch_batch<S, Q>(
     semaphore: Arc<Semaphore>,
     k: usize,
     respond_timeout: Duration,
+) -> Result<Vec<S::Response>, BatchError>
+where
+    S: PirScheme,
+    Q: Into<S::Query> + Send + 'static,
+{
+    dispatch_batch_within(
+        slots,
+        instance,
+        snapshot,
+        semaphore,
+        k,
+        respond_timeout,
+        None,
+    )
+    .await
+}
+
+/// [`dispatch_batch`], with each slot's permit wait bounded by `permit_wait` when set.
+pub(crate) async fn dispatch_batch_within<S, Q>(
+    slots: Vec<Q>,
+    instance: Arc<PirInstance<S>>,
+    snapshot: Arc<Snapshot<S>>,
+    semaphore: Arc<Semaphore>,
+    k: usize,
+    respond_timeout: Duration,
+    permit_wait: Option<Duration>,
 ) -> Result<Vec<S::Response>, BatchError>
 where
     S: PirScheme,
@@ -568,9 +632,9 @@ where
         let sem = Arc::clone(&semaphore);
         let snap = Arc::clone(&snapshot);
         let idx = next_idx;
-        join.spawn(
-            async move { worker::<S, Q>(idx, slot, inst, snap, sem, respond_timeout).await },
-        );
+        join.spawn(async move {
+            worker::<S, Q>(idx, slot, inst, snap, sem, respond_timeout, permit_wait).await
+        });
         next_idx += 1;
     }
 
@@ -621,7 +685,7 @@ where
                 let snap = Arc::clone(&snapshot);
                 let idx = next_idx;
                 join.spawn(async move {
-                    worker::<S, Q>(idx, slot, inst, snap, sem, respond_timeout).await
+                    worker::<S, Q>(idx, slot, inst, snap, sem, respond_timeout, permit_wait).await
                 });
                 next_idx += 1;
             }
@@ -635,7 +699,7 @@ where
     collected.ok_or(BatchError::Invariant("response collect produced None"))
 }
 
-/// One in-flight batch worker. Acquires a permit, runs
+/// One in-flight batch worker. Acquires a permit, within `permit_wait` when set, runs
 /// `query_active_tracked_with_snapshot` against the batch-captured
 /// `Arc<Snapshot<S>>` on `spawn_blocking` under `tokio::time::timeout`.
 /// A timed-out slot keeps its permit until the detached respond ends. The slot
@@ -648,12 +712,29 @@ async fn worker<S, Q>(
     snapshot: Arc<Snapshot<S>>,
     sem: Arc<Semaphore>,
     respond_timeout: Duration,
+    permit_wait: Option<Duration>,
 ) -> WorkerOutcome<S::Response>
 where
     S: PirScheme,
     Q: Into<S::Query> + Send + 'static,
 {
-    let Ok(permit) = sem.acquire_owned().await else {
+    let acquired = match permit_wait {
+        Some(wait) => match tokio::time::timeout(wait, sem.acquire_owned()).await {
+            Ok(acquired) => acquired,
+            Err(_elapsed) => {
+                let waited_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+                return (
+                    idx,
+                    Err(BatchError::PermitWait {
+                        index: idx,
+                        waited_ms,
+                    }),
+                );
+            }
+        },
+        None => sem.acquire_owned().await,
+    };
+    let Ok(permit) = acquired else {
         return (idx, Err(BatchError::SemaphoreClosed));
     };
     let mut join = tokio::task::spawn_blocking(move || {

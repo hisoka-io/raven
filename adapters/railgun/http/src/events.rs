@@ -10,7 +10,6 @@ use std::time::Duration;
 use axum::{
     body::Body,
     extract::State,
-    middleware,
     response::sse::{Event as SseEvent, KeepAlive, Sse},
     response::{IntoResponse, Response},
 };
@@ -151,31 +150,6 @@ pub(crate) async fn events_handler<S: PirScheme>(
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE).text("keepalive"))
         .into_response()
-}
-
-/// Cloudflare Tunnel client-IP rewrite middleware.
-///
-/// Through `cloudflared` the `x-forwarded-for` chain starts with a per-region
-/// CF edge IP, so without this rewrite every tunnel visitor keys to one
-/// `SmartIpKeyExtractor` bucket and a single session exhausts the global burst.
-/// Replaces `x-forwarded-for` with `cf-connecting-ip` when present; otherwise
-/// no-op. Rewrites only for peers inside `trusted`, since `cf-connecting-ip` is
-/// as forgeable as `x-forwarded-for` on a directly reachable origin.
-pub(crate) async fn cf_connecting_ip_to_xff(
-    trusted: TrustedProxyIpKeyExtractor,
-    mut req: Request<Body>,
-    next: middleware::Next,
-) -> Response {
-    if !trusted.trusts_request(&req) {
-        return next.run(req).await;
-    }
-    if let Some(cf_ip) = req.headers().get("cf-connecting-ip").cloned() {
-        req.headers_mut().insert(
-            http::header::HeaderName::from_static("x-forwarded-for"),
-            cf_ip,
-        );
-    }
-    next.run(req).await
 }
 
 #[cfg(test)]

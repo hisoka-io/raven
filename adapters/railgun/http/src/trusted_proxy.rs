@@ -7,7 +7,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::ConnectInfo;
+use axum::middleware;
+use axum::response::Response;
 use http::Request;
 use thiserror::Error;
 use tower_governor::errors::GovernorError;
@@ -241,6 +244,31 @@ impl KeyExtractor for TrustedProxyIpKeyExtractor {
     }
 }
 
+/// Cloudflare Tunnel client-IP rewrite middleware.
+///
+/// Through `cloudflared` the `x-forwarded-for` chain starts with a per-region
+/// CF edge IP, so without this rewrite every tunnel visitor keys to one
+/// `SmartIpKeyExtractor` bucket and a single session exhausts the global burst.
+/// Replaces `x-forwarded-for` with `cf-connecting-ip` when present; otherwise
+/// no-op. Rewrites only for peers inside `trusted`, since `cf-connecting-ip` is
+/// as forgeable as `x-forwarded-for` on a directly reachable origin.
+pub(crate) async fn cf_connecting_ip_to_xff(
+    trusted: TrustedProxyIpKeyExtractor,
+    mut req: Request<Body>,
+    next: middleware::Next,
+) -> Response {
+    if !trusted.trusts_request(&req) {
+        return next.run(req).await;
+    }
+    if let Some(cf_ip) = req.headers().get("cf-connecting-ip").cloned() {
+        req.headers_mut().insert(
+            http::header::HeaderName::from_static("x-forwarded-for"),
+            cf_ip,
+        );
+    }
+    next.run(req).await
+}
+
 /// The immediate socket peer, ignoring every header.
 pub(crate) fn peer_ip<T>(req: &Request<T>) -> Option<IpAddr> {
     req.extensions()
@@ -278,7 +306,6 @@ fn mask_v6(addr: Ipv6Addr, prefix_len: u8) -> Ipv6Addr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
 
     fn ranges(entries: &[&str]) -> TrustedProxyIpKeyExtractor {
         let owned: Vec<String> = entries.iter().map(|e| (*e).to_owned()).collect();
@@ -465,6 +492,88 @@ mod tests {
             .body(Body::empty())
             .expect("request builds");
         assert!(!extractor.trusts_request(&no_peer));
+    }
+
+    /// The `x-forwarded-for` a handler behind [`cf_connecting_ip_to_xff`] sees.
+    async fn forwarded_for_after_rewrite(
+        extractor: TrustedProxyIpKeyExtractor,
+        peer: &str,
+        forwarded_for: Option<&str>,
+        cf_connecting_ip: Option<&str>,
+    ) -> String {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let app = axum::Router::new()
+            .route(
+                "/v1/status",
+                axum::routing::get(|headers: http::HeaderMap| async move {
+                    headers
+                        .get("x-forwarded-for")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned()
+                }),
+            )
+            .layer(middleware::from_fn(move |req, next| {
+                cf_connecting_ip_to_xff(extractor.clone(), req, next)
+            }));
+        let mut req = request(peer, forwarded_for);
+        if let Some(client) = cf_connecting_ip {
+            req.headers_mut().insert(
+                "cf-connecting-ip",
+                client.parse().expect("header value parses"),
+            );
+        }
+        let body = app
+            .oneshot(req)
+            .await
+            .expect("dispatch")
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        String::from_utf8(body.to_vec()).expect("utf-8")
+    }
+
+    #[tokio::test]
+    async fn a_trusted_peer_cf_connecting_ip_replaces_the_forwarded_chain() {
+        let seen = forwarded_for_after_rewrite(
+            ranges(&["172.16.0.0/12"]),
+            "172.17.0.1:41000",
+            Some("104.16.0.1"),
+            Some("198.51.100.7"),
+        )
+        .await;
+        assert_eq!(seen, "198.51.100.7");
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_peer_cf_connecting_ip_is_ignored() {
+        let seen = forwarded_for_after_rewrite(
+            ranges(&["172.16.0.0/12"]),
+            "203.0.113.9:41000",
+            Some("104.16.0.1"),
+            Some("198.51.100.7"),
+        )
+        .await;
+        assert_eq!(
+            seen, "104.16.0.1",
+            "a direct caller must not choose its own key"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trusted_peer_without_cf_connecting_ip_keeps_its_chain() {
+        let seen = forwarded_for_after_rewrite(
+            ranges(&["172.16.0.0/12"]),
+            "172.17.0.1:41000",
+            Some("198.51.100.7"),
+            None,
+        )
+        .await;
+        assert_eq!(seen, "198.51.100.7");
     }
 
     #[test]

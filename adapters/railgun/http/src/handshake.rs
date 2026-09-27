@@ -1,4 +1,4 @@
-//! Inspire session-establish and params handlers.
+//! The client handshake: `GET /params` for the CRS and `POST /session` for a packing-key seat.
 
 use std::time::Instant;
 

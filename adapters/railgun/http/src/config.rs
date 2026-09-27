@@ -14,6 +14,14 @@ pub(crate) const HTTP_MAX_BODY_CEILING: usize = 64 * 1024 * 1024;
 /// amplification, since one request costs k respond operations.
 pub(crate) const HTTP_MAX_FANOUT_CEILING: usize = 128;
 
+/// Default [`HttpConfig::respond_permit_wait_ms`]: this wait plus the default 30 s respond
+/// timeout stays inside a wallet's 60 s request deadline.
+pub const DEFAULT_RESPOND_PERMIT_WAIT_MS: u64 = 20_000;
+
+/// Ceiling for [`HttpConfig::respond_permit_wait_ms`]: past a wallet's 60 s request deadline a
+/// queued query is answered to nobody.
+pub(crate) const HTTP_MAX_RESPOND_PERMIT_WAIT_MS: u64 = 60_000;
+
 /// Default and ceiling session lifetime in seconds; also the default eviction cadence.
 pub const DEFAULT_SESSION_TTL_SECS: u64 =
     raven_railgun_engine::session_pool::DEFAULT_SESSION_TTL.as_secs();
@@ -21,8 +29,9 @@ pub const DEFAULT_SESSION_TTL_SECS: u64 =
 /// HTTP layer configuration; all knobs are tunable without recompiling.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HttpConfig {
-    /// Bearer token opening `/metrics` while [`HttpConfig::metrics_public`] is false.
-    /// It gates nothing else: query, batch, session, params and status answer any caller.
+    /// Bearer token opening `/metrics` while [`HttpConfig::metrics_public`] is false, and
+    /// required to be at least [`HttpConfig::MIN_TOKEN_LEN`] bytes only then. It gates nothing
+    /// else: query, batch, session, params and status answer any caller.
     pub read_token: String,
     /// Maximum body bytes accepted by any route. Default 8 MiB.
     pub max_body_bytes: usize,
@@ -32,6 +41,12 @@ pub struct HttpConfig {
     pub rate_limit_burst: u32,
     /// Max concurrent in-flight respond operations. K=4 default.
     pub max_concurrent_queries: usize,
+    /// Longest a query waits for one of the [`HttpConfig::max_concurrent_queries`] respond
+    /// permits, in milliseconds, before it is answered 503. Applies to a single query and to
+    /// each `/batch` slot. It bounds the queue without a per-peer cap, which would lock out
+    /// every client sharing one exit address. Default [`DEFAULT_RESPOND_PERMIT_WAIT_MS`].
+    #[serde(default = "default_respond_permit_wait_ms")]
+    pub respond_permit_wait_ms: u64,
     /// Max concurrent `/v1/events` SSE streams. Each one holds a task, two timers and an
     /// `AppState` clone for as long as the client stays connected, and the route carries no
     /// credential, so a rate limit on new connections does not bound what is HELD. This does.
@@ -49,7 +64,9 @@ pub struct HttpConfig {
     /// [`HttpConfig::session_store_limits`]. At most [`DEFAULT_SESSION_TTL_SECS`], because one
     /// handle links every query made under it.
     pub session_ttl_secs: u64,
-    /// Sticky-session bindings across all instances; at least one instance's full pool.
+    /// Sticky-session bindings across all instances. [`HttpConfig::validate`] requires one
+    /// instance's full pool; [`HttpConfig::validate_for_instances`] requires every instance's,
+    /// and [`crate::inspire_router`] applies it to the booted instances.
     pub session_lru_cap: usize,
     /// Packing-key seats per instance, and so a memory bound: a seat holds the server-derived
     /// keys, about 24 MiB at a 512 B row and 1.5 MiB at a 32 B row.
@@ -57,7 +74,8 @@ pub struct HttpConfig {
     pub max_sessions_per_instance: usize,
     /// Identifier surfaced in the `X-Raven-Scheme` response header.
     pub scheme_name: String,
-    /// Per-query response timeout; a timed-out worker releases its semaphore permit.
+    /// Per-query response timeout. A timed-out respond keeps its permit until the detached work
+    /// ends, since `spawn_blocking` cannot be cancelled.
     pub respond_timeout_secs: u64,
     /// Requires a non-empty [`HttpConfig::trusted_proxy_cidrs`]; validated as a pair.
     pub trust_proxy_header: bool,
@@ -105,6 +123,10 @@ const fn default_max_sse_connections_per_peer() -> usize {
     DEFAULT_MAX_SSE_CONNECTIONS_PER_PEER
 }
 
+const fn default_respond_permit_wait_ms() -> u64 {
+    DEFAULT_RESPOND_PERMIT_WAIT_MS
+}
+
 const fn default_max_sessions_per_instance() -> usize {
     DEFAULT_MAX_SESSIONS
 }
@@ -125,6 +147,7 @@ impl HttpConfig {
             rate_limit_rps: 200,
             rate_limit_burst: 400,
             max_concurrent_queries: 4,
+            respond_permit_wait_ms: default_respond_permit_wait_ms(),
             max_sse_connections: default_max_sse_connections(),
             max_sse_connections_per_peer: default_max_sse_connections_per_peer(),
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
@@ -142,21 +165,23 @@ impl HttpConfig {
         }
     }
 
-    /// Validate config; called by [`AppState::new`]. `Err` names the first failing
+    /// Validate config; called by [`crate::AppState::new`]. `Err` names the first failing
     /// invariant.
     pub fn validate(&self) -> Result<(), String> {
-        if self.read_token.len() < Self::MIN_TOKEN_LEN {
+        if !self.metrics_public && self.read_token.len() < Self::MIN_TOKEN_LEN {
             return Err(format!(
-                "read_token too short: {} bytes (minimum {})",
+                "read_token too short: {} bytes (minimum {}); it opens /metrics while \
+                 metrics_public = false",
                 self.read_token.len(),
                 Self::MIN_TOKEN_LEN
             ));
         }
         for origin in &self.cors_allowed_origins {
             if origin == "*" {
-                return Err("cors_allowed_origins must not contain `*` for an \
-                     authenticated PIR server; list explicit origins"
-                    .to_owned());
+                return Err(
+                    "cors_allowed_origins must not contain `*`; list the wallet origins explicitly"
+                        .to_owned(),
+                );
             }
             if origin.is_empty() {
                 return Err("cors_allowed_origins entry must not be empty".to_owned());
@@ -176,6 +201,7 @@ impl HttpConfig {
             );
         }
         self.validate_sessions()?;
+        self.validate_respond_permit_wait()?;
         if self.max_body_bytes == 0 {
             return Err("max_body_bytes must be > 0".to_owned());
         }
@@ -229,15 +255,58 @@ impl HttpConfig {
                     .to_owned(),
             );
         }
-        if self.session_lru_cap < self.max_sessions_per_instance {
+        self.validate_session_lru_cap(1)
+    }
+
+    /// [`HttpConfig::validate`], plus a binding map large enough for every seat of
+    /// `instance_count` instances. The map is shared across instances, so sizing it for one
+    /// pool refuses handshakes the others still have seats for.
+    pub fn validate_for_instances(&self, instance_count: usize) -> Result<(), String> {
+        self.validate()?;
+        self.validate_session_lru_cap(instance_count)
+    }
+
+    fn validate_session_lru_cap(&self, instance_count: usize) -> Result<(), String> {
+        let seats = self.max_sessions_per_instance;
+        let Some(needed) = seats.checked_mul(instance_count) else {
             return Err(format!(
-                "session_lru_cap {} is below max_sessions_per_instance {}: the binding map would \
-                 refuse handshakes the pool has seats for. Raise session_lru_cap to at least the \
-                 per-instance seat count times the instance count",
-                self.session_lru_cap, self.max_sessions_per_instance
+                "max_sessions_per_instance {seats} x {instance_count} instances overflows usize"
+            ));
+        };
+        if self.session_lru_cap < needed {
+            return Err(format!(
+                "session_lru_cap {} is below max_sessions_per_instance {seats} x \
+                 {instance_count} instance(s) = {needed}: the binding map would refuse \
+                 handshakes the pools have seats for. Raise session_lru_cap to at least {needed}",
+                self.session_lru_cap
             ));
         }
         Ok(())
+    }
+
+    fn validate_respond_permit_wait(&self) -> Result<(), String> {
+        if self.respond_permit_wait_ms == 0 {
+            return Err(
+                "respond_permit_wait_ms must be > 0: zero is not unbounded, it refuses every \
+                 query that finds all respond permits busy"
+                    .to_owned(),
+            );
+        }
+        if self.respond_permit_wait_ms > HTTP_MAX_RESPOND_PERMIT_WAIT_MS {
+            return Err(format!(
+                "respond_permit_wait_ms {} exceeds the {HTTP_MAX_RESPOND_PERMIT_WAIT_MS} ms \
+                 ceiling: a wallet's request deadline passes first, so the query is answered to \
+                 nobody",
+                self.respond_permit_wait_ms
+            ));
+        }
+        Ok(())
+    }
+
+    /// The permit wait as a [`Duration`].
+    #[must_use]
+    pub fn respond_permit_wait(&self) -> Duration {
+        Duration::from_millis(self.respond_permit_wait_ms)
     }
 
     /// Parse the trusted-proxy ranges, enforcing agreement with
@@ -400,6 +469,107 @@ mod tests {
         cfg.max_sse_connections = 0;
         let err = cfg.validate().expect_err("zero is refused");
         assert!(err.contains("max_sse_connections"), "{err}");
+    }
+
+    /// `read_token` opens `/metrics` and nothing else, so a public `/metrics` needs none.
+    #[test]
+    fn a_public_metrics_endpoint_needs_no_read_token() {
+        for token in ["", "short"] {
+            let mut cfg = HttpConfig::demo(token);
+            cfg.metrics_public = true;
+            cfg.validate()
+                .unwrap_or_else(|err| panic!("token {token:?} with public /metrics: {err}"));
+        }
+    }
+
+    #[test]
+    fn a_gated_metrics_endpoint_needs_a_full_length_read_token() {
+        let short = "x".repeat(HttpConfig::MIN_TOKEN_LEN - 1);
+        let err = HttpConfig::demo(short)
+            .validate()
+            .expect_err("a short token cannot gate /metrics");
+        assert!(err.contains("read_token"), "{err}");
+        assert!(err.contains("metrics_public"), "{err}");
+        HttpConfig::demo("x".repeat(HttpConfig::MIN_TOKEN_LEN))
+            .validate()
+            .expect("the minimum length validates");
+    }
+
+    /// Nothing but `/metrics` is authenticated, so the refusal must not say otherwise.
+    #[test]
+    fn the_cors_wildcard_refusal_describes_the_server_truthfully() {
+        let mut cfg = config();
+        cfg.cors_allowed_origins = vec!["*".to_owned()];
+        let err = cfg.validate().expect_err("a wildcard origin is refused");
+        assert!(err.contains("cors_allowed_origins"), "{err}");
+        assert!(!err.contains("authenticated"), "{err}");
+    }
+
+    #[test]
+    fn the_binding_map_must_hold_every_instance_pool() {
+        let mut cfg = config();
+        cfg.max_sessions_per_instance = 64;
+        cfg.session_lru_cap = 64 * 7 - 1;
+        cfg.validate()
+            .expect("one instance's pool fits, which is all validate can know");
+        let err = cfg
+            .validate_for_instances(7)
+            .expect_err("seven pools do not fit");
+        for needle in [
+            "session_lru_cap 447",
+            "max_sessions_per_instance 64",
+            "7 instance",
+            "448",
+        ] {
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+        cfg.session_lru_cap = 64 * 7;
+        cfg.validate_for_instances(7)
+            .expect("a map holding every seat validates");
+    }
+
+    #[test]
+    fn a_seat_count_that_overflows_is_refused() {
+        let mut cfg = config();
+        cfg.max_sessions_per_instance = usize::MAX / 2 + 1;
+        cfg.session_lru_cap = usize::MAX;
+        cfg.validate().expect("one pool fits");
+        let err = cfg.validate_for_instances(2).expect_err("two overflow");
+        assert!(err.contains("overflows"), "{err}");
+    }
+
+    #[test]
+    fn respond_permit_wait_is_bounded_on_both_sides() {
+        let mut cfg = config();
+        assert_eq!(cfg.respond_permit_wait_ms, DEFAULT_RESPOND_PERMIT_WAIT_MS);
+        cfg.validate().expect("the default validates");
+        for ms in [1, HTTP_MAX_RESPOND_PERMIT_WAIT_MS] {
+            cfg.respond_permit_wait_ms = ms;
+            cfg.validate().expect("bounds are legal");
+            assert_eq!(cfg.respond_permit_wait(), Duration::from_millis(ms));
+        }
+        for ms in [0, HTTP_MAX_RESPOND_PERMIT_WAIT_MS + 1] {
+            cfg.respond_permit_wait_ms = ms;
+            let err = cfg.validate().expect_err("out of bounds");
+            assert!(err.contains("respond_permit_wait_ms"), "{ms}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_config_serialized_before_the_permit_wait_existed_still_loads() {
+        let mut value = serde_json::to_value(config())
+            .expect("a config serializes")
+            .as_object()
+            .cloned()
+            .expect("an object");
+        assert!(value.remove("respond_permit_wait_ms").is_some());
+        let restored: HttpConfig = serde_json::from_value(serde_json::Value::Object(value))
+            .expect("loads without the wait");
+        assert_eq!(
+            restored.respond_permit_wait_ms,
+            DEFAULT_RESPOND_PERMIT_WAIT_MS
+        );
+        restored.validate().expect("and the default validates");
     }
 
     #[test]

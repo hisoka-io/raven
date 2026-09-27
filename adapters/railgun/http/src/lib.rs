@@ -19,12 +19,12 @@
 )]
 #![deny(missing_docs)]
 
-pub mod admin;
 pub mod auth;
 pub mod batch;
 pub mod config;
 pub mod events;
 pub mod fanout;
+pub mod handshake;
 pub mod poi_shim;
 pub mod shim_store;
 pub mod state;
@@ -32,10 +32,10 @@ pub mod status;
 pub mod trusted_proxy;
 pub mod versioned;
 
-pub use admin::{InstanceParams, SessionEstablishResponse};
 pub use batch::BatchError;
 pub use config::HttpConfig;
 pub use fanout::{FanoutError, FanoutRequest};
+pub use handshake::{InstanceParams, SessionEstablishResponse};
 pub use shim_store::{CoverageRefusal, ListCoverage, ShimStoreRegistry};
 pub use state::AppState;
 pub use status::{
@@ -66,12 +66,13 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::Span;
 
-use crate::admin::{params_handler, session_establish_handler};
 use crate::auth::bearer_auth;
 use crate::batch::{batch_handler, inspire_batch_handler, inspire_query_handler, query_handler};
-use crate::events::{cf_connecting_ip_to_xff, events_handler};
+use crate::events::events_handler;
 use crate::fanout::fanout_handler;
+use crate::handshake::{params_handler, session_establish_handler};
 use crate::status::{health_live_handler, health_ready_handler, metrics_handler, status_handler};
+use crate::trusted_proxy::cf_connecting_ip_to_xff;
 
 pub(crate) const FRESHNESS_HORIZON_BLOCKS: u64 = 256;
 use crate::versioned::X_RAVEN_SCHEMA_VERSION_HEADER;
@@ -165,8 +166,14 @@ pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
 }
 
 /// Inspire router; adds `/session` and `/params`. Two Governor buckets, so scrapes and SSE
-/// cannot exhaust the query path's per-IP burst.
+/// cannot exhaust the query path's per-IP burst. `Err` also when the session binding map is
+/// smaller than every booted instance's seat pool.
 pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, String> {
+    // The earliest point the http layer sees the instance count; `AppState::new` only has one
+    // pool to size against. Instances spawned later are the caller's to account for.
+    state
+        .config
+        .validate_for_instances(state.engine.instances().len().max(1))?;
     let trusted_proxies = resolve_trusted_proxies(&state.config)?;
     let rps = state.config.rate_limit_rps.max(1);
     let burst = state.config.rate_limit_burst.max(1);
@@ -983,6 +990,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct SlowableState {
         sleep_ms_per_query: parking_lot::Mutex<std::collections::HashMap<u32, u64>>,
+        /// A tag whose respond blocks until the paired sender drops.
+        held: Option<(u32, std::sync::Mutex<std::sync::mpsc::Receiver<()>>)>,
     }
 
     #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -1012,6 +1021,14 @@ mod tests {
             if sleep_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
             }
+            if let Some((tag, gate)) = &state.held {
+                if *tag == query.tag {
+                    let _ = gate
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .recv();
+                }
+            }
             Ok(SlowableResponse {
                 echo_tag: query.tag,
             })
@@ -1036,12 +1053,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn dispatch_batch_timeout_attributes_correct_slot() {
-        // Slot 2 sleeps 5 s; timeout = 250 ms; slots 0, 1, 3 are fast.
+        // Slot 2 blocks until `release` drops; timeout = 250 ms; slots 0, 1, 3 are fast.
         const SLOW_SLOT: usize = 2;
         const SLOW_TAG: u32 = 4242;
-        let state = SlowableState::default();
-        state.sleep_ms_per_query.lock().insert(SLOW_TAG, 5_000);
-        let instance = build_slowable_instance(state);
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let instance = build_slowable_instance(SlowableState {
+            held: Some((SLOW_TAG, std::sync::Mutex::new(gate))),
+            ..SlowableState::default()
+        });
         let queries: Vec<SlowableQuery> = vec![
             SlowableQuery { tag: 1 },
             SlowableQuery { tag: 2 },
@@ -1051,18 +1070,23 @@ mod tests {
 
         let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
         let snapshot = instance.current_snapshot();
-        let started = std::time::Instant::now();
-        let result = crate::batch::dispatch_batch::<SlowableScheme, SlowableQuery>(
-            queries,
-            Arc::clone(&instance),
-            snapshot,
-            semaphore,
-            4,
-            std::time::Duration::from_millis(250),
+        // The slow slot is still blocked when this budget runs out, so returning inside it
+        // proves the short-circuit without sleeping the respond for longer than the budget.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            crate::batch::dispatch_batch::<SlowableScheme, SlowableQuery>(
+                queries,
+                Arc::clone(&instance),
+                snapshot,
+                semaphore,
+                4,
+                std::time::Duration::from_millis(250),
+            ),
         )
         .await;
-        let elapsed = started.elapsed();
+        drop(release);
 
+        let result = outcome.expect("dispatch_batch must short-circuit on timeout");
         let err = result.expect_err("slow slot must time out");
         match err {
             BatchError::Timeout { index, secs: _ } => {
@@ -1074,9 +1098,49 @@ mod tests {
             other => panic!("expected BatchError::Timeout, got {other:?}"),
         }
         assert_eq!(err_status_for_timeout(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// No permit ever frees, so every in-flight slot must give up at the deadline: the dispatch
+    /// joins all of them before returning, and one unbounded wait would hold it forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dispatch_batch_within_refuses_every_waiting_slot_at_the_permit_deadline() {
+        let wait = std::time::Duration::from_millis(200);
+        let instance = build_slowable_instance(SlowableState::default());
+        let queries: Vec<SlowableQuery> = (0u32..4).map(|tag| SlowableQuery { tag }).collect();
+        let snapshot = instance.current_snapshot();
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::batch::dispatch_batch_within::<SlowableScheme, SlowableQuery>(
+                queries,
+                instance,
+                snapshot,
+                Arc::new(tokio::sync::Semaphore::new(0)),
+                4,
+                std::time::Duration::from_secs(30),
+                Some(wait),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let err = outcome
+            .expect("every slot's permit wait must be bounded")
+            .expect_err("no permit is ever free");
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "dispatch_batch must short-circuit on timeout; ran for {elapsed:?}"
+            matches!(err, BatchError::PermitWait { waited_ms: 200, .. }),
+            "{err:?}"
+        );
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.class(), "permit_wait");
+        assert!(err.index().is_some_and(|index| index < 4), "{err:?}");
+        assert!(
+            elapsed >= wait,
+            "refused before the wait ran out: {elapsed:?}"
+        );
+        assert!(
+            elapsed < wait + std::time::Duration::from_secs(1),
+            "refused long after the wait: {elapsed:?}"
         );
     }
 
