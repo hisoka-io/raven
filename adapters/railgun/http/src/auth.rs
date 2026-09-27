@@ -1,8 +1,8 @@
-//! Authentication scopes, sticky-session map, and bearer-auth middleware.
+//! Sticky-session map and the bearer-auth middleware.
 //!
 //! The read path carries NO credential: the PPOI list is public data and the routes that
 //! serve it answer a third party that holds nothing. A bearer is required only for
-//! `/v1/admin/*` and for `/metrics` while it is default-deny.
+//! `/metrics` while it is default-deny.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -20,16 +20,6 @@ use raven_railgun_core::InstanceId;
 use raven_railgun_engine::PirScheme;
 
 use crate::state::AppState;
-
-/// Authentication scope decoded from the bearer token.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AuthScope {
-    /// Opens `/metrics` while it is default-deny. Queries, batch, session, params and
-    /// status need no scope at all.
-    Read,
-    /// The control plane: `/v1/admin/*`. Also satisfies [`AuthScope::Read`].
-    Admin,
-}
 
 /// Sticky-session identity keyed by `(instance_id, client_id)`.
 ///
@@ -190,20 +180,10 @@ pub(crate) enum EvictionOutcome {
     AtCapacity,
 }
 
-/// The scope a path demands, or `None` when it is public.
-///
-/// Default-public, because the read path is the public one. Only the control plane and
-/// the default-deny scrape are named here, and `/v1/admin` is matched on the path axum
-/// itself routes on, so a segment that does not match this prefix cannot reach an admin
-/// handler either.
-fn required_scope(path: &str, metrics_public: bool) -> Option<AuthScope> {
-    if path == "/v1/admin" || path.starts_with("/v1/admin/") {
-        return Some(AuthScope::Admin);
-    }
-    if path == "/metrics" && !metrics_public {
-        return Some(AuthScope::Read);
-    }
-    None
+/// Default-public, because the read path is the public one; only the default-deny
+/// scrape is named here.
+fn requires_read_token(path: &str, metrics_public: bool) -> bool {
+    path == "/metrics" && !metrics_public
 }
 
 pub(crate) async fn bearer_auth<S: PirScheme>(
@@ -211,9 +191,9 @@ pub(crate) async fn bearer_auth<S: PirScheme>(
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let Some(required) = required_scope(request.uri().path(), app.config.metrics_public) else {
+    if !requires_read_token(request.uri().path(), app.config.metrics_public) {
         return Ok(next.run(request).await);
-    };
+    }
 
     let bearer = request
         .headers()
@@ -222,45 +202,19 @@ pub(crate) async fn bearer_auth<S: PirScheme>(
         .and_then(|v| v.strip_prefix("Bearer "));
     let token = bearer.unwrap_or_default();
 
-    // Both compares always evaluate; the snapshot keeps the lock off the compare.
-    // The `is_empty` guards are on the CONFIGURED token, so they branch on nothing secret:
-    // `set_read_token` takes any string, unlike `HttpConfig::validate`, and an empty one
-    // would otherwise be cleared by `Authorization: Bearer ` with nothing after it.
+    // The compare always evaluates; the snapshot keeps the lock off it. The `is_empty`
+    // guard is on the CONFIGURED token, so it branches on nothing secret: `set_read_token`
+    // takes any string, unlike `HttpConfig::validate`, and an empty one would otherwise be
+    // cleared by `Authorization: Bearer ` with nothing after it.
     let active_read_token: String = app.read_token.read().clone();
     let read_match: bool = !active_read_token.is_empty()
         && bool::from(ct_eq_str(token.as_bytes(), active_read_token.as_bytes()));
-    let admin_match: bool = if let Some(admin) = app.admin_token.as_ref().as_ref() {
-        !admin.is_empty() && bool::from(ct_eq_str(token.as_bytes(), admin.as_bytes()))
-    } else {
-        // Keeps the no-admin path equal-cost. An absent admin token grants nothing, so an
-        // admin path with none configured refuses every caller.
-        let _ = ct_eq_str(token.as_bytes(), &[]);
-        false
-    };
 
     // A header that is absent or not `Bearer ` grants nothing at all.
-    let granted = if bearer.is_none() {
-        None
-    } else if admin_match {
-        Some(AuthScope::Admin)
-    } else if read_match {
-        Some(AuthScope::Read)
-    } else {
-        None
-    };
-
-    let cleared = matches!(
-        (required, granted),
-        (AuthScope::Admin, Some(AuthScope::Admin)) | (AuthScope::Read, Some(_))
-    );
-    if !cleared {
+    if bearer.is_none() || !read_match {
         return Ok(unauthorized_close());
     }
-    metrics::counter!(
-        "raven_railgun_auth_ok_total",
-        "scope" => scope_label(required)
-    )
-    .increment(1);
+    metrics::counter!("raven_railgun_auth_ok_total", "scope" => "read").increment(1);
     Ok(next.run(request).await)
 }
 
@@ -287,13 +241,6 @@ pub(crate) fn ct_eq_str(a: &[u8], b: &[u8]) -> subtle::Choice {
         return subtle::Choice::from(0u8);
     }
     a.ct_eq(b)
-}
-
-pub(crate) fn scope_label(scope: AuthScope) -> &'static str {
-    match scope {
-        AuthScope::Read => "read",
-        AuthScope::Admin => "admin",
-    }
 }
 
 #[cfg(test)]

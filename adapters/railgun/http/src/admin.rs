@@ -1,6 +1,6 @@
-//! Admin drain/undrain handlers and inspire-specific session/params handlers.
+//! Inspire session-establish and params handlers.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::{
     extract::{Path, State},
@@ -12,102 +12,12 @@ use raven_inspire::inspiring::ClientPackingKeys;
 use raven_inspire::ServerCrs;
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{InspireServerState, RavenInspireScheme};
-use raven_railgun_engine::{DrainState, PirScheme};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{ct_eq_str, require_client_id_header, EvictionOutcome, SessionKey};
+use crate::auth::{require_client_id_header, EvictionOutcome, SessionKey};
 use crate::state::AppState;
 use crate::versioned::{read_versioned, write_versioned, WIRE_SCHEMA_VERSION};
 use crate::{X_RAVEN_EPOCH, X_RAVEN_SCHEME, X_RAVEN_SESSION};
-
-/// JSON body returned by drain/undrain admin routes.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct DrainAdminResponse {
-    /// Echoed instance id.
-    pub instance_id: String,
-    /// Post-transition drain state label.
-    pub drain_state: String,
-    /// In-flight count at response time.
-    pub in_flight: u64,
-}
-
-pub(crate) fn admin_token_matches<S: PirScheme>(app: &AppState<S>, headers: &HeaderMap) -> bool {
-    let Some(admin) = app.admin_token.as_ref().as_ref() else {
-        // Keeps the no-admin path equal-cost.
-        let _ = ct_eq_str(b"", b"");
-        return false;
-    };
-    let supplied = headers
-        .get(http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .unwrap_or_default();
-    ct_eq_str(supplied.as_bytes(), admin.as_bytes()).into()
-}
-
-/// Max time in ms to wait for in-flight count to reach zero after flipping to Draining.
-pub(crate) const DRAIN_PROMOTE_BUDGET_MS: u64 = 30_000;
-pub(crate) const DRAIN_PROMOTE_POLL_INTERVAL_MS: u64 = 50;
-
-pub(crate) async fn admin_drain_handler<S: PirScheme>(
-    State(app): State<AppState<S>>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<DrainAdminResponse>, StatusCode> {
-    if !admin_token_matches(&app, &headers) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    let instance_id = InstanceId::new(id);
-    let instance = app
-        .engine
-        .instance(&instance_id)
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    let current = instance.drain_state();
-    if matches!(current, DrainState::Active | DrainState::Draining) {
-        instance.set_drain_state(DrainState::Draining);
-    }
-
-    let deadline = Instant::now() + Duration::from_millis(DRAIN_PROMOTE_BUDGET_MS);
-    while Instant::now() < deadline {
-        if instance.in_flight_count() == 0 {
-            if instance.drain_state() == DrainState::Draining {
-                instance.set_drain_state(DrainState::Drained);
-            }
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(DRAIN_PROMOTE_POLL_INTERVAL_MS)).await;
-    }
-
-    let final_state = instance.drain_state();
-    let in_flight = instance.in_flight_count();
-    Ok(Json(DrainAdminResponse {
-        instance_id: instance.id.to_string(),
-        drain_state: final_state.label().to_owned(),
-        in_flight,
-    }))
-}
-
-pub(crate) async fn admin_undrain_handler<S: PirScheme>(
-    State(app): State<AppState<S>>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<DrainAdminResponse>, StatusCode> {
-    if !admin_token_matches(&app, &headers) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    let instance_id = InstanceId::new(id);
-    let instance = app
-        .engine
-        .instance(&instance_id)
-        .ok_or(StatusCode::NOT_FOUND)?;
-    instance.set_drain_state(DrainState::Active);
-    Ok(Json(DrainAdminResponse {
-        instance_id: instance.id.to_string(),
-        drain_state: DrainState::Active.label().to_owned(),
-        in_flight: instance.in_flight_count(),
-    }))
-}
 
 /// JSON returned by `POST /v1/instance/{id}/session`.
 #[derive(Serialize, Deserialize, Debug)]

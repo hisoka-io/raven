@@ -24,8 +24,6 @@ pub struct HttpConfig {
     /// Bearer token opening `/metrics` while [`HttpConfig::metrics_public`] is false.
     /// It gates nothing else: query, batch, session, params and status answer any caller.
     pub read_token: String,
-    /// Optional bearer token granting admin scope.
-    pub admin_token: Option<String>,
     /// Maximum body bytes accepted by any route. Default 8 MiB.
     pub max_body_bytes: usize,
     /// Per-IP rate limit: max sustained requests per second.
@@ -123,7 +121,6 @@ impl HttpConfig {
     pub fn demo(read_token: impl Into<String>) -> Self {
         Self {
             read_token: read_token.into(),
-            admin_token: None,
             max_body_bytes: 8 * 1024 * 1024,
             rate_limit_rps: 200,
             rate_limit_burst: 400,
@@ -154,15 +151,6 @@ impl HttpConfig {
                 self.read_token.len(),
                 Self::MIN_TOKEN_LEN
             ));
-        }
-        if let Some(admin) = self.admin_token.as_ref() {
-            if admin.len() < Self::MIN_TOKEN_LEN {
-                return Err(format!(
-                    "admin_token too short: {} bytes (minimum {})",
-                    admin.len(),
-                    Self::MIN_TOKEN_LEN
-                ));
-            }
         }
         for origin in &self.cors_allowed_origins {
             if origin == "*" {

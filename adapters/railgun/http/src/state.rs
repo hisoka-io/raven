@@ -31,8 +31,6 @@ pub struct AppState<S: PirScheme> {
     pub config: Arc<HttpConfig>,
     /// Bearer token for `/metrics`, in an RwLock for hot rotation without restart.
     pub read_token: Arc<parking_lot::RwLock<String>>,
-    /// Bearer token for admin scope (optional).
-    pub admin_token: Arc<Option<String>>,
     /// Identifier surfaced in `X-Raven-Scheme`.
     pub scheme_name: Arc<String>,
     /// Orchestrator metrics for `/v1/status` lag fields. `None` omits the fields.
@@ -96,7 +94,6 @@ impl<S: PirScheme> Clone for AppState<S> {
             engine: Arc::clone(&self.engine),
             config: Arc::clone(&self.config),
             read_token: Arc::clone(&self.read_token),
-            admin_token: Arc::clone(&self.admin_token),
             scheme_name: Arc::clone(&self.scheme_name),
             consumer_metrics: Arc::clone(&self.consumer_metrics),
             logical_store: Arc::clone(&self.logical_store),
@@ -137,7 +134,6 @@ impl<S: PirScheme> AppState<S> {
     pub fn new(engine: Engine<S>, config: HttpConfig) -> Result<Self, String> {
         config.validate()?;
         let read_token = Arc::new(parking_lot::RwLock::new(config.read_token.clone()));
-        let admin_token = Arc::new(config.admin_token.clone());
         let scheme_name = Arc::new(config.scheme_name.clone());
         let max_concurrent = config.max_concurrent_queries.max(1);
         let semaphore = Arc::new(Semaphore::new(max_concurrent));
@@ -157,7 +153,6 @@ impl<S: PirScheme> AppState<S> {
             engine: Arc::new(engine),
             config: Arc::new(config),
             read_token,
-            admin_token,
             scheme_name,
             consumer_metrics: Arc::new(None),
             logical_store: Arc::new(None),

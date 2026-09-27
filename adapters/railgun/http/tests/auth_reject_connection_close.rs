@@ -3,11 +3,9 @@
 //! server is closing and its next request fails as a transport error instead of
 //! a 401.
 //!
-//! The subject is `/v1/admin/*`: the read path carries no credential and cannot 401,
-//! so the control plane is the only route left that rejects on headers with a body
-//! still on the wire. That is also why the admin gate belongs in the middleware -
-//! `admin_drain_handler`'s own refusal returns a bare `StatusCode` with no
-//! `Connection: close`, which is the bug this file exists to catch.
+//! The subject is the default-deny `/metrics`: the read path carries no credential and
+//! cannot 401, so the scrape is the only route left that rejects on headers. A GET may
+//! still carry a body, and a refusal that leaves one on the wire is the case covered here.
 
 #![allow(
     clippy::expect_used,
@@ -27,7 +25,7 @@ use raven_railgun_engine::{Engine, InstanceRole, PirInstance, PirScheme};
 use raven_railgun_http::{router, write_versioned, AppState, HttpConfig};
 use serde::{Deserialize, Serialize};
 
-const TOKEN: &str = "auth-reject-close-ADMIN-padded-1234";
+const TOKEN: &str = "auth-reject-close-READ-padded-12345";
 const WRONG_TOKEN: &str = "auth-reject-close-WRONG-padded-1234";
 const INSTANCE: &str = "auth-reject-close-instance";
 
@@ -75,8 +73,7 @@ fn build_router() -> axum::Router {
             EchoState,
         )))
         .expect("register instance");
-    let mut cfg = HttpConfig::demo("auth-reject-close-read-padded-12345");
-    cfg.admin_token = Some(TOKEN.to_owned());
+    let mut cfg = HttpConfig::demo(TOKEN);
     cfg.rate_limit_rps = 10_000;
     cfg.rate_limit_burst = 10_000;
     let state = {
@@ -112,7 +109,7 @@ fn query_body(nonce: u64) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_non_exact_authorization_value_returns_401() {
     let (addr, handle) = spawn_server().await;
-    let url = format!("http://{addr}/v1/admin/instances/drain/{INSTANCE}");
+    let url = format!("http://{addr}/metrics");
     let exact = format!("Bearer {TOKEN}");
     let strategy = proptest::collection::vec(0x21u8..=0x7e, 0..128)
         .prop_map(|bytes| String::from_utf8(bytes).expect("printable ASCII"))
@@ -146,7 +143,7 @@ async fn every_non_exact_authorization_value_returns_401() {
 
     let client = reqwest::Client::new();
     for authorization in generated {
-        let mut request = client.post(&url).body(query_body(9));
+        let mut request = client.get(&url).body(query_body(9));
         if let Some(value) = &authorization {
             request = request.header(http::header::AUTHORIZATION, value);
         }
@@ -161,10 +158,9 @@ async fn every_non_exact_authorization_value_returns_401() {
         );
     }
 
-    // Non-vacuity: with no admin token accepted, every refusal above is free.
-    // Drains the instance, so it is the last request this server serves.
+    // Non-vacuity: with no token accepted, every refusal above is free.
     let accepted = client
-        .post(&url)
+        .get(&url)
         .header(http::header::AUTHORIZATION, exact)
         .body(query_body(10))
         .send()
@@ -187,7 +183,7 @@ async fn the_401_carries_connection_close_on_the_wire() {
     let head = tokio::task::spawn_blocking(move || {
         let mut sock = std::net::TcpStream::connect(addr).expect("connect");
         let request = format!(
-            "POST /v1/admin/instances/drain/{INSTANCE} HTTP/1.1\r\n\
+            "GET /metrics HTTP/1.1\r\n\
              Host: {addr}\r\n\
              Authorization: Bearer {WRONG_TOKEN}\r\n\
              Content-Type: application/octet-stream\r\n\
@@ -258,24 +254,23 @@ async fn the_401_carries_connection_close_on_the_wire() {
     let _ = h.await;
 }
 
-/// The operator-facing consequence: a pooled client refused at the admin gate must see a
+/// The operator-facing consequence: a pooled client refused at the scrape gate must see a
 /// 401, not a `BrokenPipe` from reusing the socket the server closed - and the read
 /// request it makes next must still be served on a fresh connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pooled_client_sees_401_then_serves_the_next_request() {
     let (addr, h) = spawn_server().await;
-    let admin_url = format!("http://{addr}/v1/admin/instances/drain/{INSTANCE}");
+    let metrics_url = format!("http://{addr}/metrics");
     let url = format!("http://{addr}/v1/instance/{INSTANCE}/query");
     let client = reqwest::Client::new();
 
     for attempt in 0..8u64 {
         let rejected = client
-            .post(&admin_url)
+            .get(&metrics_url)
             .bearer_auth(WRONG_TOKEN)
             // Must exceed the socket buffer, or the body is fully written before the
             // server can reject and the race this test names never opens. Auth runs
-            // as a layer above the handler, so the bytes are never decoded. 256 KiB
-            // against the 15,491-byte production query, under the 8 MiB cap.
+            // as a layer above the handler, so the bytes are never decoded.
             .body(vec![0u8; 256 * 1024])
             .send()
             .await

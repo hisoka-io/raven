@@ -32,8 +32,7 @@ pub mod status;
 pub mod trusted_proxy;
 pub mod versioned;
 
-pub use admin::{DrainAdminResponse, InstanceParams, SessionEstablishResponse};
-pub use auth::AuthScope;
+pub use admin::{InstanceParams, SessionEstablishResponse};
 pub use batch::BatchError;
 pub use config::HttpConfig;
 pub use fanout::{FanoutError, FanoutRequest};
@@ -67,9 +66,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::Span;
 
-use crate::admin::{
-    admin_drain_handler, admin_undrain_handler, params_handler, session_establish_handler,
-};
+use crate::admin::{params_handler, session_establish_handler};
 use crate::auth::bearer_auth;
 use crate::batch::{batch_handler, inspire_batch_handler, inspire_query_handler, query_handler};
 use crate::events::{cf_connecting_ip_to_xff, events_handler};
@@ -101,17 +98,8 @@ pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
         .route("/v1/status", get(status_handler::<S>))
         .route("/v1/instance/:id/query", post(query_handler::<S>))
         .route("/v1/instance/:id/batch", post(batch_handler::<S>))
-        .route(
-            "/v1/admin/instances/drain/:id",
-            post(admin_drain_handler::<S>),
-        )
-        .route(
-            "/v1/admin/instances/undrain/:id",
-            post(admin_undrain_handler::<S>),
-        )
         .with_state(state.clone())
         .merge(poi_routes)
-        .layer(auth_layer.clone())
         .layer(DefaultBodyLimit::max(max_body));
 
     let rate_limited = if let Some(extractor) = trusted_proxies.clone() {
@@ -198,14 +186,6 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
         .route("/v1/status", get(status_handler::<RavenInspireScheme>))
         .route("/v1/instance/:id/query", post(inspire_query_handler))
         .route("/v1/instance/:id/batch", post(inspire_batch_handler))
-        .route(
-            "/v1/admin/instances/drain/:id",
-            post(admin_drain_handler::<RavenInspireScheme>),
-        )
-        .route(
-            "/v1/admin/instances/undrain/:id",
-            post(admin_undrain_handler::<RavenInspireScheme>),
-        )
         .route("/v1/instance/:id/session", post(session_establish_handler));
 
     let rate_limited = if state.config.enable_fanout {
@@ -218,7 +198,6 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
         .with_state(state.clone())
         .merge(params_route)
         .merge(poi_shim::poi_shim_routes(state.clone()))
-        .layer(auth_layer.clone())
         .layer(DefaultBodyLimit::max(max_body));
 
     let rate_limited = if let Some(extractor) = trusted_proxies.clone() {
@@ -665,7 +644,6 @@ mod tests {
         assert_eq!(cfg.rate_limit_burst, 400);
         assert!(!cfg.metrics_public);
         assert_eq!(cfg.session_eviction_interval_secs, 3600);
-        assert!(cfg.admin_token.is_none());
         cfg.validate().expect("padded token must validate");
     }
 
@@ -676,16 +654,6 @@ mod tests {
             .validate()
             .expect_err("token below MIN_TOKEN_LEN must be rejected");
         assert!(err.contains("read_token too short"), "err = {err}");
-    }
-
-    #[test]
-    fn http_config_validate_rejects_short_admin_token() {
-        let mut cfg = HttpConfig::demo("test-token-padded-long");
-        cfg.admin_token = Some("nope".to_owned());
-        let err = cfg
-            .validate()
-            .expect_err("short admin_token must be rejected");
-        assert!(err.contains("admin_token too short"), "err = {err}");
     }
 
     #[test]

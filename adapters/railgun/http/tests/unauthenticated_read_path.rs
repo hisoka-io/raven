@@ -1,4 +1,5 @@
-//! The PPOI read path answers a caller that holds no credential; `/v1/admin/*` does not.
+//! The PPOI read path answers a caller that holds no credential; the default-deny
+//! `/metrics` does not.
 //!
 //! Both halves run against ONE router in ONE test, because they are the same property:
 //! a router that refused everything and a router that served everything each pass half
@@ -32,8 +33,7 @@ use tower::ServiceExt;
 
 const INSTANCE_ID: &str = "unauthenticated-read-instance";
 const CLIENT_ID: &str = "0f0e0d0c0b0a09080706050403020100";
-const ADMIN_TOKEN: &str = "unauth-read-ADMIN-token-padded-1234";
-const READ_TOKEN: &str = "unauth-read-legacy-token-padded-123";
+const READ_TOKEN: &str = "unauth-read-scrape-token-padded-123";
 const TOY_ENTRIES: usize = 256;
 const TOY_ENTRY_BYTES: usize = 256;
 
@@ -49,7 +49,7 @@ struct Fixture {
     expected: Vec<u8>,
 }
 
-fn fixture(admin_token: Option<&str>) -> Fixture {
+fn fixture() -> Fixture {
     let params = InspireParams::secure_128_d2048();
     let db = raven_railgun_testkit::toy_db(TOY_ENTRIES, TOY_ENTRY_BYTES);
     let (state, sk) =
@@ -81,8 +81,7 @@ fn fixture(admin_token: Option<&str>) -> Fixture {
         ))
         .expect("register instance");
 
-    let mut cfg = HttpConfig::demo(READ_TOKEN);
-    cfg.admin_token = admin_token.map(str::to_owned);
+    let cfg = HttpConfig::demo(READ_TOKEN);
     let app_state = {
         let _g = APPSTATE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         AppState::new(engine, cfg).expect("appstate")
@@ -139,10 +138,6 @@ async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
         .expect("body")
         .to_bytes()
         .to_vec()
-}
-
-fn drain_uri() -> String {
-    format!("/v1/admin/instances/drain/{INSTANCE_ID}")
 }
 
 /// `GET /v1/instance/{id}/params`, with no credential.
@@ -228,8 +223,8 @@ async fn anonymous_read(router: &axum::Router, route: &str, body: Vec<u8>) -> Ve
 }
 
 #[tokio::test]
-async fn the_four_read_routes_answer_with_no_authorization_header_while_admin_refuses_one() {
-    let mut fixture = fixture(Some(ADMIN_TOKEN));
+async fn the_four_read_routes_answer_with_no_authorization_header_while_the_scrape_refuses_one() {
+    let mut fixture = fixture();
     let router = fixture.router.clone();
 
     let params = anonymous_params(&router).await;
@@ -260,83 +255,41 @@ async fn the_four_read_routes_answer_with_no_authorization_header_while_admin_re
         read_batch_response_versioned(&batched).expect("batch response");
     assert_decrypts(&fixture, decoded.first().expect("one batch response"));
 
-    // Same run, same router: the control plane is still shut.
-    let status = router
-        .clone()
-        .oneshot(anonymous(Method::POST, &drain_uri(), Vec::new()))
-        .await
-        .expect("admin dispatch")
-        .status();
-    assert_eq!(
-        status,
-        StatusCode::UNAUTHORIZED,
-        "an uncredentialed /v1/admin/* must still be refused"
-    );
-
-    // Non-vacuity: the admin route is alive and the credential is the only thing gating it.
-    // Drains the instance, so it runs last.
-    let status = router
-        .oneshot(bearer(Method::POST, &drain_uri(), ADMIN_TOKEN))
-        .await
-        .expect("admin bearer dispatch")
-        .status();
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "the admin token must still drain; otherwise the refusal above proves nothing"
-    );
-}
-
-/// An unset `admin_token` must not read as "admin needs no credential". The read path
-/// stays open in the same run, so a router that simply died cannot pass this either.
-#[tokio::test]
-async fn an_unset_admin_token_closes_the_admin_routes_rather_than_opening_them() {
-    let Fixture { router, .. } = fixture(None);
-
+    // Same run, same router: the scrape is still shut, and only the header opens it.
     for (name, request) in [
+        ("no header", anonymous(Method::GET, "/metrics", Vec::new())),
         (
-            "no header",
-            anonymous(Method::POST, &drain_uri(), Vec::new()),
-        ),
-        (
-            "the read token",
-            bearer(Method::POST, &drain_uri(), READ_TOKEN),
-        ),
-        (
-            "an arbitrary bearer",
-            bearer(
-                Method::POST,
-                &drain_uri(),
-                "any-token-at-all-padded-12345678",
+            "a query-parameter token",
+            anonymous(
+                Method::GET,
+                &format!("/metrics?token={READ_TOKEN}"),
+                Vec::new(),
             ),
         ),
-        ("the empty bearer", bearer(Method::POST, &drain_uri(), "")),
+        ("the empty bearer", bearer(Method::GET, "/metrics", "")),
     ] {
         let status = router
             .clone()
             .oneshot(request)
             .await
-            .expect("admin dispatch")
+            .expect("metrics dispatch")
             .status();
         assert_eq!(
             status,
             StatusCode::UNAUTHORIZED,
-            "with no admin_token configured, {name} must NOT open /v1/admin/*"
+            "{name} must not open /metrics"
         );
     }
 
+    // Non-vacuity: the scrape is alive and the credential is the only thing gating it.
     let status = router
-        .oneshot(anonymous(
-            Method::GET,
-            &format!("/v1/instance/{INSTANCE_ID}/params"),
-            Vec::new(),
-        ))
+        .oneshot(bearer(Method::GET, "/metrics", READ_TOKEN))
         .await
-        .expect("params dispatch")
+        .expect("metrics bearer dispatch")
         .status();
     assert_eq!(
         status,
         StatusCode::OK,
-        "the read path must still answer; a dead router would pass the refusals above"
+        "the read token must still open /metrics; otherwise the refusals above prove nothing"
     );
 }
