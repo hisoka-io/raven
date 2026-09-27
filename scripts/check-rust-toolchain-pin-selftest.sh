@@ -6,8 +6,8 @@ CHECKER="$SCRIPT_DIR/check-rust-toolchain-pin.sh"
 FIXTURE_ROOT="$(mktemp -d)"
 trap 'rm -rf "$FIXTURE_ROOT"' EXIT
 
-MSRV_189_MANIFESTS='Cargo.toml|adapters/howl/Cargo.toml|adapters/railgun/client-wasm/Cargo.toml|benches/b1-bench/Cargo.toml|benches/b2-bench/Cargo.toml|crates/inspire/Cargo.toml|crates/isimplepir/Cargo.toml|tools/bench-compare/Cargo.toml'
-MSRV_189_PACKAGES='bench-compare,howl-poseidon2,howl-record,raven-b1-bench,raven-b2-bench,raven-bench,raven-client,raven-core,raven-crypto-primitives,raven-indexer,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-isimplepir,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage'
+MSRV_189_MANIFESTS='Cargo.toml|adapters/howl/Cargo.toml|adapters/railgun/client-wasm/Cargo.toml|benches/b1-bench/Cargo.toml|crates/inspire/Cargo.toml|tools/bench-compare/Cargo.toml'
+MSRV_189_PACKAGES='bench-compare,howl-poseidon2,howl-record,raven-b1-bench,raven-bench,raven-client,raven-core,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage'
 MSRV_189_EXTRA_PACKAGES='raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror'
 MSRV_189_OVERRIDE_MANIFESTS='adapters/railgun/core/Cargo.toml|adapters/railgun/persistence/Cargo.toml|adapters/railgun/poseidon/Cargo.toml|adapters/railgun/ppoi-mirror/Cargo.toml'
 MSRV_191_MANIFESTS='adapters/railgun/Cargo.toml|examples/eth-state/Cargo.toml'
@@ -29,7 +29,6 @@ IFS='|' read -r -a floor_189_overrides <<< "$MSRV_189_OVERRIDE_MANIFESTS"
 for manifest in "${floor_189_overrides[@]}"; do write_manifest "$manifest" "1.89"; done
 IFS='|' read -r -a floor_191_manifests <<< "$MSRV_191_MANIFESTS"
 for manifest in "${floor_191_manifests[@]}"; do write_manifest "$manifest" "1.91"; done
-write_manifest "crates/binary-fuse-filter/Cargo.toml" "1.85"
 
 cat > "$FIXTURE_ROOT/.github/workflows/ci.yml" <<EOF
 jobs:

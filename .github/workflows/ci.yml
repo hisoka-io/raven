@@ -230,11 +230,8 @@ jobs:
             adapters/railgun/client-wasm/Cargo.toml \
             adapters/howl/Cargo.toml \
             crates/inspire/Cargo.toml \
-            crates/isimplepir/Cargo.toml \
-            crates/binary-fuse-filter/Cargo.toml \
             examples/eth-state/Cargo.toml \
             benches/b1-bench/Cargo.toml \
-            benches/b2-bench/Cargo.toml \
             tools/bench-compare/Cargo.toml
           do
             echo "::group::cargo-deny $manifest"
@@ -688,48 +685,6 @@ jobs:
         run: sccache --show-stats
         if: always()
 
-  isimplepir-tests:
-    name: isimplepir (detached workspace)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@1.98.0
-        with:
-          targets: wasm32-unknown-unknown
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo fmt
-        run: cargo fmt --manifest-path crates/isimplepir/Cargo.toml -- --check
-      - name: cargo clippy
-        run: cargo clippy --manifest-path crates/isimplepir/Cargo.toml --all-targets -- -D warnings
-      - name: cargo test
-        run: cargo test --manifest-path crates/isimplepir/Cargo.toml --release
-      - name: cargo check (wasm32 client path)
-        run: cargo check --manifest-path crates/isimplepir/Cargo.toml --target wasm32-unknown-unknown --no-default-features
-
-  bff-tests:
-    name: binary-fuse-filter (detached workspace)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@1.98.0
-        with:
-          targets: wasm32-unknown-unknown
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo fmt
-        run: cargo fmt --manifest-path crates/binary-fuse-filter/Cargo.toml -- --check
-      - name: cargo clippy
-        run: cargo clippy --manifest-path crates/binary-fuse-filter/Cargo.toml --all-targets -- -D warnings
-      - name: cargo test
-        run: cargo test --manifest-path crates/binary-fuse-filter/Cargo.toml --release
-      - name: cargo check (wasm32)
-        run: cargo check --manifest-path crates/binary-fuse-filter/Cargo.toml --target wasm32-unknown-unknown
-
   inspire-tests:
     # submodule detached workspace; --release avoids the dev-mode d=2048 timeout.
     # lld + sccache keep the two test runs (default + parallel) under budget.
@@ -946,24 +901,6 @@ jobs:
       - name: cargo check
         run: cargo check --manifest-path benches/b1-bench/Cargo.toml --features inspire --all-targets
 
-  b2-bench:
-    name: b2-bench (detached workspace)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@1.98.0
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo fmt
-        run: cargo fmt --manifest-path benches/b2-bench/Cargo.toml -- --check
-      - name: cargo clippy
-        run: cargo clippy --manifest-path benches/b2-bench/Cargo.toml --all-targets -- -D warnings
-      - name: cargo check
-        run: cargo check --manifest-path benches/b2-bench/Cargo.toml --all-targets
-
   bench-compare:
     name: bench-compare (detached workspace)
     runs-on: ubuntu-latest
@@ -995,8 +932,8 @@ jobs:
       RUSTUP_TOOLCHAIN: "1.89"
       # 1.89 predates rust-lld as rustc's x86_64-linux default, so this job names lld itself
       RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=lld"
-      MSRV_MANIFESTS: "Cargo.toml|adapters/howl/Cargo.toml|adapters/railgun/client-wasm/Cargo.toml|benches/b1-bench/Cargo.toml|benches/b2-bench/Cargo.toml|crates/inspire/Cargo.toml|crates/isimplepir/Cargo.toml|tools/bench-compare/Cargo.toml"
-      MSRV_PACKAGES: "bench-compare,howl-poseidon2,howl-record,raven-b1-bench,raven-b2-bench,raven-bench,raven-client,raven-core,raven-crypto-primitives,raven-indexer,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-isimplepir,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage"
+      MSRV_MANIFESTS: "Cargo.toml|adapters/howl/Cargo.toml|adapters/railgun/client-wasm/Cargo.toml|benches/b1-bench/Cargo.toml|crates/inspire/Cargo.toml|tools/bench-compare/Cargo.toml"
+      MSRV_PACKAGES: "bench-compare,howl-poseidon2,howl-record,raven-b1-bench,raven-bench,raven-client,raven-core,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage"
       MSRV_EXTRA_PACKAGES: "raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror"
     steps:
       - uses: actions/checkout@v4
@@ -1040,7 +977,7 @@ jobs:
                 cargo check --manifest-path "$manifest" --workspace --all-targets ;;
               benches/b1-bench/Cargo.toml)
                 cargo check --manifest-path "$manifest" --features inspire --all-targets ;;
-              crates/inspire/Cargo.toml|crates/isimplepir/Cargo.toml)
+              crates/inspire/Cargo.toml)
                 cargo check --manifest-path "$manifest" --all-features --all-targets ;;
               *)
                 cargo check --manifest-path "$manifest" --all-targets ;;
@@ -1061,7 +998,7 @@ jobs:
                 cargo clippy --manifest-path "$manifest" --workspace --all-targets -- -D warnings ;;
               benches/b1-bench/Cargo.toml)
                 cargo clippy --manifest-path "$manifest" --features inspire --all-targets -- -D warnings ;;
-              crates/inspire/Cargo.toml|crates/isimplepir/Cargo.toml)
+              crates/inspire/Cargo.toml)
                 cargo clippy --manifest-path "$manifest" --all-features --all-targets -- -D warnings ;;
               *)
                 cargo clippy --manifest-path "$manifest" --all-targets -- -D warnings ;;

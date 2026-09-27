@@ -29,8 +29,6 @@ crates/inspire/src/pir/respond.rs::test_respond_one_packing_correctness
 crates/inspire/src/pir/respond.rs::test_respond_one_packing_small_values
 crates/inspire/tests/e2e_pir.rs::test_e2e_variant_one_packing
 crates/inspire/tests/e2e_pir.rs::test_e2e_variant_two_packing
-crates/isimplepir/tests/kat_fixtures.rs::update_fixtures
-crates/isimplepir/tests/kat_fixtures.rs::update_row_update_fixtures
 
 # --- 2026-09-06: made visible by teaching the census to see untracked files ---
 # These seven were ALWAYS uncovered; a tracked-only census could not see them because they

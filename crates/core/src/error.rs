@@ -9,13 +9,6 @@ pub enum Error {
     #[error("invalid parameters: {0}")]
     InvalidParams(String),
 
-    /// Lookup targeted a key the store does not hold.
-    #[error("key {key} not found in store")]
-    KeyNotFound {
-        /// The key that was requested but is absent.
-        key: u64,
-    },
-
     /// The backend itself failed: lock poisoned, I/O, or capacity.
     #[error("storage backend error: {0}")]
     Storage(String),
@@ -57,8 +50,8 @@ mod tests {
 
     #[test]
     fn display_messages() {
-        let err = Error::KeyNotFound { key: 42 };
-        assert_eq!(err.to_string(), "key 42 not found in store");
+        let err = Error::storage("lock poisoned");
+        assert_eq!(err.to_string(), "storage backend error: lock poisoned");
 
         let err = Error::invalid_params("dim must be power of two");
         assert_eq!(

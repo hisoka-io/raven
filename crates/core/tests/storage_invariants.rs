@@ -245,10 +245,13 @@ fn every_framework_crate_still_denies_missing_docs() {
         ("raven-client", include_str!("../../client/src/lib.rs")),
         ("raven-server", include_str!("../../server/src/lib.rs")),
         ("raven-storage", include_str!("../../storage/src/lib.rs")),
-        ("raven-indexer", include_str!("../../indexer/src/lib.rs")),
         (
-            "raven-crypto-primitives",
-            include_str!("../../crypto-primitives/src/lib.rs"),
+            "raven-inspire-cache",
+            include_str!("../../inspire-cache/src/lib.rs"),
+        ),
+        (
+            "raven-inspire-session",
+            include_str!("../../inspire-session/src/lib.rs"),
         ),
     ];
     for (name, src) in crates {

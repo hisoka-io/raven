@@ -29,7 +29,7 @@ ignore = [
 
 [bans]
 # "allow" made this check a guaranteed pass. At "warn" it reports the current
-# 21 duplicate groups (root 3, adapters/railgun 12, examples/eth-state 6) as a
+# 19 duplicate groups (root 1, adapters/railgun 12, examples/eth-state 6) as a
 # baseline without failing the build; tightening to "deny" needs those resolved
 # first, which is a dependency decision.
 multiple-versions = "warn"

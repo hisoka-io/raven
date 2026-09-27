@@ -1,29 +1,16 @@
 //! Typed server-runtime error surface, distinct from the storage-layer [`crate::Error`].
 
-use crate::instance::{Epoch, InstanceId};
+use crate::instance::InstanceId;
 
 /// Generic server-runtime error surface shared by the server and storage crates.
 #[derive(thiserror::Error, Debug)]
 pub enum ServerError {
-    /// Engine instance lookup failed.
-    #[error("instance not found: {0}")]
-    InstanceNotFound(InstanceId),
-
     /// Instance is draining or drained. Routing layers should return 503
     /// (transient, retry) rather than 404.
     #[error("instance draining or drained: {instance_id}")]
     NoActiveInstance {
         /// Instance whose drain state was non-Active at routing time.
         instance_id: InstanceId,
-    },
-
-    /// Client query referenced a stale snapshot epoch.
-    #[error("epoch mismatch: client requires >= {client}, server is at {server}")]
-    EpochMismatch {
-        /// Minimum epoch the client's session was prepared against.
-        client: Epoch,
-        /// Current server epoch at query time.
-        server: Epoch,
     },
 
     /// Wrapped scheme-layer error.

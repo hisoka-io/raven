@@ -2,8 +2,6 @@
 resolver = "2"
 members = [
     "crates/core",
-    "crates/crypto-primitives",
-    "crates/indexer",
     "crates/client",
     "crates/inspire-cache",
     "crates/inspire-session",
@@ -17,7 +15,6 @@ exclude = [
     "adapters/howl",
     "adapters/railgun/client-wasm",
     "benches/b1-bench",
-    "benches/b2-bench",
     "tools/bench-compare",
 ]
 

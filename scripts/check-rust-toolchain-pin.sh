@@ -10,8 +10,8 @@ PINNED_DOCKER_TAG="1.98.0-slim-bookworm"
 # Gates parse nextest's text output, which is not a stable interface: 0.9.146 changed a
 # show-config line and failed a healthy tree. Move this only with those gates re-proven.
 PINNED_NEXTEST="0.9.129"
-MSRV_189_MANIFESTS='Cargo.toml|adapters/howl/Cargo.toml|adapters/railgun/client-wasm/Cargo.toml|benches/b1-bench/Cargo.toml|benches/b2-bench/Cargo.toml|crates/inspire/Cargo.toml|crates/isimplepir/Cargo.toml|tools/bench-compare/Cargo.toml'
-MSRV_189_PACKAGES='bench-compare,howl-poseidon2,howl-record,raven-b1-bench,raven-b2-bench,raven-bench,raven-client,raven-core,raven-crypto-primitives,raven-indexer,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-isimplepir,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage'
+MSRV_189_MANIFESTS='Cargo.toml|adapters/howl/Cargo.toml|adapters/railgun/client-wasm/Cargo.toml|benches/b1-bench/Cargo.toml|crates/inspire/Cargo.toml|tools/bench-compare/Cargo.toml'
+MSRV_189_PACKAGES='bench-compare,howl-poseidon2,howl-record,raven-b1-bench,raven-bench,raven-client,raven-core,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage'
 MSRV_189_EXTRA_PACKAGES='raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror'
 MSRV_189_OVERRIDE_MANIFESTS='adapters/railgun/core/Cargo.toml|adapters/railgun/persistence/Cargo.toml|adapters/railgun/poseidon/Cargo.toml|adapters/railgun/ppoi-mirror/Cargo.toml'
 MSRV_191_MANIFESTS='adapters/railgun/Cargo.toml|examples/eth-state/Cargo.toml'
@@ -74,9 +74,8 @@ check_manifest_floors() {
 check_manifest_floors "$MSRV_189_MANIFESTS" "$MSRV_189"
 check_manifest_floors "$MSRV_189_OVERRIDE_MANIFESTS" "$MSRV_189"
 check_manifest_floors "$MSRV_191_MANIFESTS" "$MSRV_191"
-check_manifest_floors "crates/binary-fuse-filter/Cargo.toml" "1.85"
 
-known_floor_manifests="|$MSRV_189_MANIFESTS|$MSRV_189_OVERRIDE_MANIFESTS|$MSRV_191_MANIFESTS|crates/binary-fuse-filter/Cargo.toml|"
+known_floor_manifests="|$MSRV_189_MANIFESTS|$MSRV_189_OVERRIDE_MANIFESTS|$MSRV_191_MANIFESTS|"
 while IFS= read -r -d '' manifest; do
   declared="$(awk -F'"' '/^rust-version[[:space:]]*=/ { print $2; exit }' "$manifest")"
   [[ -n "$declared" ]] || continue
@@ -319,7 +318,7 @@ if [[ "$failed" -ne 0 ]]; then
   exit 1
 fi
 
-printf 'Rust toolchain selectors pinned: channel=%s files=%d CI=%d MSRV=1.89/21+1.91/11 overrides=%d Docker=%d nextest=%d@%s cargo-binstall=%d\n' \
+printf 'Rust toolchain selectors pinned: channel=%s files=%d CI=%d MSRV=1.89/17+1.91/11 overrides=%d Docker=%d nextest=%d@%s cargo-binstall=%d\n' \
   "$PINNED_TOOLCHAIN" "$toolchain_files" "$pinned_actions" \
   "$((msrv_189_overrides + msrv_191_overrides))" "$docker_builders" \
   "$nextest_installers" "$PINNED_NEXTEST" "$cargo_binstall_invocations"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the CI gates that fail on a narrow local check, before pushing.
 #
-# The repo is thirteen separate cargo workspaces, each with its own fmt and clippy job, plus two
+# The repo is eight separate cargo workspaces, each with its own fmt and clippy job, plus two
 # MSRV jobs and the hygiene scripts. Checking only the crate you edited passes locally and reds CI,
 # which is how four green jobs broke in one push. This runs all of them in one command.
 #
@@ -63,11 +63,8 @@ run "railgun"       cargo fmt --manifest-path adapters/railgun/Cargo.toml \
 run "client-wasm"   cargo fmt --manifest-path adapters/railgun/client-wasm/Cargo.toml -- --check
 run "howl"          cargo fmt --manifest-path adapters/howl/Cargo.toml --all -- --check
 run "inspire"       cargo fmt --manifest-path crates/inspire/Cargo.toml -- --check
-run "isimplepir"    cargo fmt --manifest-path crates/isimplepir/Cargo.toml -- --check
-run "binary-fuse"   cargo fmt --manifest-path crates/binary-fuse-filter/Cargo.toml -- --check
 run "eth-state"     cargo fmt --manifest-path examples/eth-state/Cargo.toml -- --check
 run "b1-bench"      cargo fmt --manifest-path benches/b1-bench/Cargo.toml -- --check
-run "b2-bench"      cargo fmt --manifest-path benches/b2-bench/Cargo.toml -- --check
 run "bench-compare" cargo fmt --manifest-path tools/bench-compare/Cargo.toml -- --check
 
 if [ "$FAST" = 0 ]; then
@@ -78,11 +75,8 @@ if [ "$FAST" = 0 ]; then
   run "howl"           cargo clippy --manifest-path adapters/howl/Cargo.toml --all-targets $OFFLINE -- -D warnings
   run "inspire"        cargo clippy --manifest-path crates/inspire/Cargo.toml --all-targets $OFFLINE -- -D warnings
   run "inspire modsw"  cargo clippy --manifest-path crates/inspire/Cargo.toml --all-targets --features mod-switch-response $OFFLINE -- -D warnings
-  run "isimplepir"     cargo clippy --manifest-path crates/isimplepir/Cargo.toml --all-targets $OFFLINE -- -D warnings
-  run "binary-fuse"    cargo clippy --manifest-path crates/binary-fuse-filter/Cargo.toml --all-targets $OFFLINE -- -D warnings
   run "eth-state"      cargo clippy --manifest-path examples/eth-state/Cargo.toml --all-targets $OFFLINE -- -D warnings
   run "b1-bench"       cargo clippy --manifest-path benches/b1-bench/Cargo.toml --features inspire --all-targets $OFFLINE -- -D warnings
-  run "b2-bench"       cargo clippy --manifest-path benches/b2-bench/Cargo.toml --all-targets $OFFLINE -- -D warnings
   run "bench-compare"  cargo clippy --manifest-path tools/bench-compare/Cargo.toml --all-targets $OFFLINE -- -D warnings
   # wasm32 is a separate target and catches things the native lint cannot.
   if rustup target list --installed 2>/dev/null | grep -q wasm32-unknown-unknown; then
@@ -119,7 +113,7 @@ if [ "$MSRV" = 1 ]; then
   echo
   echo "== MSRV clippy (separate toolchains; a newer lint set is not the gate) =="
   for m in Cargo.toml adapters/howl/Cargo.toml adapters/railgun/client-wasm/Cargo.toml \
-           benches/b2-bench/Cargo.toml crates/isimplepir/Cargo.toml tools/bench-compare/Cargo.toml; do
+           tools/bench-compare/Cargo.toml; do
     RUSTUP_TOOLCHAIN=1.89 run "1.89 $m" cargo clippy --manifest-path "$m" --all-targets $OFFLINE -- -D warnings
   done
   RUSTUP_TOOLCHAIN=1.89 run "1.89 root --all-features" cargo clippy --manifest-path Cargo.toml --workspace --all-features --all-targets $OFFLINE -- -D warnings
@@ -132,8 +126,6 @@ if [ "$WITH_TESTS" = 1 ]; then
   echo
   echo "== detached-workspace tests (the railgun shards are too slow for preflight) =="
   run "inspire"      cargo test --manifest-path crates/inspire/Cargo.toml $OFFLINE
-  run "isimplepir"   cargo test --manifest-path crates/isimplepir/Cargo.toml $OFFLINE
-  run "binary-fuse"  cargo test --manifest-path crates/binary-fuse-filter/Cargo.toml $OFFLINE
   run "howl"         cargo test --manifest-path adapters/howl/Cargo.toml --all-targets $OFFLINE
   run "bench-compare" cargo test --manifest-path tools/bench-compare/Cargo.toml $OFFLINE
 fi

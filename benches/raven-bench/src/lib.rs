@@ -12,10 +12,7 @@
 )]
 #![allow(missing_docs)]
 
-pub mod frame;
 pub mod harness;
-pub mod noise;
-pub mod pir_eng_notes;
 pub mod provenance;
 pub mod timing;
 

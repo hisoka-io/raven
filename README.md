@@ -21,7 +21,6 @@ Scope of the blindness is bounded and documented: PIR hides which row inside a s
 | Scheme                                              | Status      |
 | --------------------------------------------------- | ----------- |
 | [InsPIRe](https://eprint.iacr.org/2025/1352)        | Integrated. |
-| [iSimplePIR](https://eprint.iacr.org/2026/030)      | WIP         |
 
 ## Adapters
 
@@ -49,10 +48,9 @@ cargo check -p raven-client --target wasm32-unknown-unknown
 ```
 
 `--workspace` covers the root members only. Several trees are detached workspaces
-(`crates/inspire`, `crates/isimplepir`, `crates/binary-fuse-filter`, `adapters/railgun`,
-`examples/eth-state`); build each with its own `--manifest-path`. The wasm target applies to the
-client path (`raven-client`), not to every crate: server-side crates pull in native-only
-dependencies.
+(`crates/inspire`, `adapters/railgun`, `examples/eth-state`); build each with its own
+`--manifest-path`. The wasm target applies to the client path (`raven-client`), not to every
+crate: server-side crates pull in native-only dependencies.
 
 ## License
 

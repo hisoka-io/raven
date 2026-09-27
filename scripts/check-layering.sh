@@ -42,7 +42,7 @@ ADDRESS_LITERAL='0x[0-9a-fA-F]{40}'
 # express these: `_` is a regex word character and CamelCase has no boundary, so `\bevm\b`
 # passes `evm_state()`, `"evm_chain_id"`, `EvmClient`, `memo_bytes()` and `MemoField` -
 # every realistic leak. A bare `memo` cannot be used instead because `memory` is a real
-# word in this tree (`crates/core/src/lib.rs`, `crates/binary-fuse-filter/src/filter.rs`).
+# word in this tree (`crates/core/src/lib.rs`).
 CHAIN_WORDS_CI='ethereum|eth_call|eth_getLogs|eth_chainId'
 CHAIN_IDENTS_CS='\bevm\b|\bevm_|_evm\b|_evm_|\bEvm[A-Z]|[a-z]Evm'
 DOMAIN_IDENTS_CI='note_commitment|blinded_commitment'

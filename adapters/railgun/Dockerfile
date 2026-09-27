@@ -32,10 +32,9 @@ RUN apt-get update \
  && groupadd --system --gid 1500 raven \
  && useradd  --system --uid 1500 --gid 1500 --home-dir /data --shell /usr/sbin/nologin raven
 
-COPY --from=build /build/adapters/railgun/examples/mainnet-6-instance.toml \
-     /etc/raven-railgun/mainnet-6-instance.toml
-COPY --from=build /build/adapters/railgun/examples/rpc-pool.example.toml \
-     /etc/raven-railgun/rpc-pool.example.toml
+# a template only: its token is REPLACE_ME, which boot refuses, so CMD reads the operator's copy
+COPY --from=build /build/adapters/railgun/examples/mainnet-ppoi-7-instance.toml \
+     /etc/raven-railgun/mainnet-ppoi-7-instance.toml
 COPY --from=build /build/adapters/railgun/target/release/raven-railgun \
      /usr/local/bin/raven-railgun
 RUN strip /usr/local/bin/raven-railgun || true
