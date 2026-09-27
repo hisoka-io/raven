@@ -37,16 +37,18 @@ tags = ["rpc-provider", "quicknode", "credential"]
 description = """
 Build outputs, and the Railgun PPOI list identifier.
 
-`list_key` / `list_key_hex` (the SDK's `listKey` and `*_LIST_KEY`) is a 32-byte
+`list_key` / `list_key_hex` (the SDK's `listKey` and `[OFAC_]LIST_KEY`) is a 32-byte
 PUBLIC list identifier, not a credential: clients supply it in request bodies to
-the PPOI shim endpoints (`adapters/railgun/http/src/poi_shim.rs:39` `pub list_keys: Vec<HexHash>` and
-`:63` `pub list_key: HexHash`). A value the public API accepts as input cannot
-be a server secret. It trips the default `generic-api-key` heuristic purely on
-hex entropy.
+the PPOI shim endpoints (`pub list_keys: Vec<HexHash>` and
+`pub list_key: HexHash` in `adapters/railgun/http/src/poi_shim.rs`). A value the
+public API accepts as input cannot be a server secret. It trips the default
+`generic-api-key` heuristic purely on hex entropy.
 
-The allowlist is anchored on the `list_key` assignment shape rather than on the
-containing paths, so an actual credential appearing in the same files is still
-reported.
+The regex is tested against each finding's own match, not the whole line, and
+is anchored at both ends: it clears only a finding that is exactly one of the
+listed identifiers assigned a quoted 64-hex value. Another secret on the same
+line is a separate finding and is still reported, and an identifier that merely
+ends in a list-key name (`apiSecretlistKey`) is not cleared.
 
 The path entries are build outputs plus the directories git ignores entirely.
 `gitleaks --no-git` walks the filesystem and does not read `.gitignore`, so
@@ -58,9 +60,9 @@ outputs that do not exist until a build runs and carry their own generated
 `.gitignore`, so they are listed here to cover the post-build tree.
 Do NOT add a path here that git tracks.
 """
-regexTarget = "line"
+regexTarget = "match"
 regexes = [
-  '''(list_key(_hex)?|listKey|LIST_KEY)"?\s*[:=]\s*"(0x)?[0-9a-fA-F]{64}"''',
+  '''^(?:_?list_key(?:_hex)?|listKey(?:Hex)?|(?:OFAC_)?LIST_KEY(?:_HEX)?)"?\s*[:=]\s*"(?:0x)?[0-9a-fA-F]{64}"$''',
 ]
 paths = [
   '''(^|/)target/''',

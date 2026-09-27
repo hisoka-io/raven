@@ -612,7 +612,6 @@ dependencies = [
 name = "raven-bench"
 version = "0.1.0-alpha.0"
 dependencies = [
- "proptest",
  "serde",
  "serde_json",
 ]
