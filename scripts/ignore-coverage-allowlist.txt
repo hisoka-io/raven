@@ -6,6 +6,7 @@ adapters/railgun/engine/benches/cache_carry_bench.rs::swap_state_with_matching_s
 adapters/railgun/engine/benches/cache_carry_bench.rs::swap_state_with_mismatched_seed_rebuilds_cache_above_baseline
 adapters/railgun/engine/benches/end_to_end_spend_bench.rs::end_to_end_spend_latency_per_encoder
 adapters/railgun/engine/benches/insert_cost_bench.rs::per_shard_re_encode_cost_per_cell
+adapters/railgun/engine/benches/insert_cost_bench.rs::ppoi_block_seed_batched_vs_per_row
 adapters/railgun/engine/benches/k4_dispatcher_bench.rs::k4_dispatcher_strategy_comparison
 adapters/railgun/engine/benches/k_widening_bench.rs::k_widening_at_two_cells
 adapters/railgun/engine/benches/multi_instance_bottleneck_probe.rs::multi_instance_bottleneck_probe
@@ -17,6 +18,8 @@ adapters/railgun/engine/benches/snapshot_codec_acceleration_bench.rs::snapshot_c
 adapters/railgun/persistence/benches/snapshot_codec_bench.rs::snapshot_codec_bench_bincode_vs_bitcode
 adapters/railgun/persistence/benches/snapshot_zstd_bench.rs::snapshot_zstd_bench_bincode_vs_zstd_l3
 adapters/railgun/persistence/benches/wal_replay_scaling_bench.rs::wal_replay_scales_linearly_at_1k_10k_100k
+adapters/railgun/persistence/benches/wal_append_throughput_bench.rs::wal_append_synced_vs_deferred_at_batch_1_64_1024
+adapters/railgun/poseidon/benches/hash_bench.rs::hash_n_per_call_vs_fresh_hasher
 # These four are not cost-gated tests, and giving any of them a lane makes a permanently red
 # one. Three are defect pins: their fixture is d=256, p=65536, so gcd(d, p) != 1 and
 # tree-packed extract CANNOT succeed; the trigger is a fixture refit, not a filter. The fourth,
