@@ -5,16 +5,15 @@
     ".skip) turns the sdk-tests lane green with less running -- this file is what",
     "catches the number drifting. Every count is EXACT: a floor on `passed` lets a new test",
     "cover for a deleted one, so any change to it is a deliberate bump reviewed with its diff.",
-    "The 26 skipped tests / 4 skipped files are the intentionally env-gated live and bench tier:",
-    "live_aggressive_e2e.test.ts (14), live_mainnet_smoke.test.ts (6, incl. 1 stub),",
-    "live_latency_bench.test.ts (1), poseidon_throughput_bench.test.ts (1); CI sets none of their run env vars.",
+    "The 6 skipped tests / 2 skipped files are the intentionally env-gated live and bench tier:",
+    "live_latency_bench.test.ts (1) and poseidon_throughput_bench.test.ts (1); CI sets none of their run env vars.",
     "pin_resolver_live.test.ts skips 3 without RAVEN_PIN_UPSTREAM and runs its 1 offline fold, and",
-    "live_ppoi_smoke.test.ts skips 1 without RAVEN_LIVE_URL + RAVEN_PIN_UPSTREAM and runs 29 against an",
+    "live_ppoi_smoke.test.ts skips 1 without RAVEN_LIVE_URL + RAVEN_PIN_UPSTREAM and runs 26 against an",
     "in-process node and aggregator, so neither is a skipped file.",
     "Anything else skipped is a regression, not a policy."
   ],
-  "testFiles": 63,
-  "skippedFiles": 4,
-  "passed": 654,
-  "skipped": 26
+  "testFiles": 49,
+  "skippedFiles": 2,
+  "passed": 451,
+  "skipped": 6
 }

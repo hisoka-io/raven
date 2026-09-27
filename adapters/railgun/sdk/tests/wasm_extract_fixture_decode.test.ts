@@ -89,18 +89,6 @@ describe("wasm extract_response against the checked-in Rust-emitted fixture", ()
     sessions.length = 0;
   });
 
-  it("exports the typed fanout shard retarget without changing encrypted query bytes", () => {
-    const session = newSession();
-    const original = decodeClientPirQueryBundle(
-      wasm.build_seeded_query(session, shardConfigBincode, 0n),
-    ).queryBytes;
-    const retargeted = wasm.retarget_seeded_query_shard(original, 23);
-
-    expect(new DataView(original.buffer, original.byteOffset).getUint32(0, true)).toBe(0);
-    expect(new DataView(retargeted.buffer, retargeted.byteOffset).getUint32(0, true)).toBe(23);
-    expect(retargeted.subarray(4)).toEqual(original.subarray(4));
-  });
-
   it("recovers the row native Rust encoded, byte for byte, at every fixture index", () => {
     expect(meta.target_indices).toEqual([0, 1, 2, 3, 4]);
     const session = newSession();
@@ -169,6 +157,18 @@ describe("wasm extract_response against the checked-in Rust-emitted fixture", ()
     expect(message.toLowerCase()).not.toContain("unreachable");
   });
 
+  it("refuses a response element with trailing bytes rather than ignoring them", () => {
+    const session = newSession();
+    const full = read("response_for_idx_0.bin");
+    const overlong = new Uint8Array(full.length + 1);
+    overlong.set(full);
+    overlong[overlong.length - 1] = 0xa5;
+
+    expect(() =>
+      wasm.extract_response(session, crsBincode, clientStateFor(session, 0), overlong, meta.entry_size),
+    ).toThrow(/bytes remaining/);
+  });
+
   it("surfaces a 1-byte response as a typed decode error, not a wasm trap", () => {
     const session = newSession();
     const state = clientStateFor(session, 0);
@@ -220,9 +220,9 @@ describe("wasm extract_response against the checked-in Rust-emitted fixture", ()
 
   it("does NOT bind the recovered row to the index the caller asked for", () => {
     // CHARACTERIZATION, not an endorsement. A server that answers row M to a query for row
-    // N returns a well-formed 32-byte plaintext and no error, so the substitution has to be
-    // caught above the ciphertext: T1 re-checks the row's own BC against the one requested
-    // (status_row_bc_binding), and T2/T3 catch it only when the folded root fails to verify.
+    // N returns a well-formed plaintext and no error, so the substitution has to be caught
+    // above the ciphertext: the path proof checks the row's own leaf against the commitment
+    // requested, and its folded root against a pin.
     const session = newSession();
     const stateForZero = clientStateFor(session, 0);
 

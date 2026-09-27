@@ -2,30 +2,29 @@
 export {
   RavenPOINodeInterface,
   type RavenConfig,
-  type PrivateStalePolicy,
   type POIStatus,
   type PoisPerListResponse,
   type BlindedCommitmentType,
   type BlindedCommitmentData,
-  type StatusHeader,
   type MerkleProof,
-  type CommitTreeAuthPath,
-  type CommitTreeProof,
   type Chain,
   type Proof,
   type LegacyTransactProofData,
   type CapturedWireRequest,
-  type BcToIdxMapBody,
-  type IndexStalenessPolicy,
   type PoiIndexCounters,
   containsByteSequence,
   hexToBytes,
   bytesToHex,
-  pathIndicesForLeaf,
   pathIndicesForPerListLeaf,
   TREE_DEPTH,
   PATH_RECORD_BYTES,
 } from "./raven-poi-node-interface";
+
+// One engine-wide interface that answers Raven's chains through Raven and every other through
+// the stock interface.
+export { PerChainPOINodeInterface } from "./per-chain-poi-node-interface";
+
+export type { SubmittedProofStore } from "./submitted-proofs";
 
 export { hashLeftRight, foldMerkleRoot } from "./poseidon";
 
@@ -58,16 +57,13 @@ export {
   loadClientPirContext,
 } from "./client-pir";
 
-// Railgun POI decoding and Merkle addressing.
-export type { BcIdxEntry, BcToIdxMap, RavenPOIPathWasm } from "./poi-pir";
+// Railgun POI validation and Merkle addressing.
+export type { RavenPOIPathWasm } from "./poi-pir";
 
 export {
-  bcToIdxMapFrom,
-  statusByteToPOIStatus,
   validateBcHex,
   validateLeafIndex,
   validateListKeyHex,
-  validateTreeNumber,
 } from "./poi-pir";
 
 // Generic client-side session persistence.
@@ -78,15 +74,8 @@ export {
   sha256Hex,
 } from "./session-cache";
 
-// Railgun deployment routing, freshness caching, and event/status surfaces.
+// Railgun deployment routing.
 export { ChainRegistry, type ChainRegistryEntry } from "./chain-registry";
-
-export {
-  ImtCache,
-  imtCacheKey,
-  imtCacheScopeKey,
-  type ImtCacheConfig,
-} from "./imt-cache";
 
 export {
   RavenError,
@@ -96,15 +85,6 @@ export {
   type StaleDataContext,
   type StaleDataError,
 } from "./errors";
-
-export {
-  subscribeRavenEvents,
-  type RavenEventsConfig,
-  type RavenEventsHandle,
-  type StatusBody as RavenStatusBody,
-  type InstanceStatus as RavenInstanceStatus,
-  type ConsumerStatus as RavenConsumerStatus,
-} from "./events-stream";
 
 export {
   BATCH_SIZE_LADDER,

@@ -18,7 +18,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import {
-  ImtCache,
   MAX_BATCH_SIZE,
   RavenPOINodeInterface,
   hashLeftRight,
@@ -27,6 +26,7 @@ import {
 import { startMockServer, type MockServer } from "./helpers/mock_server";
 import { TOKEN, encodeBatchResponseNodes, stubCtx } from "./helpers/auth_path_stub";
 import { namedBatchTargets } from "./helpers/private_wire";
+import { indexHolding } from "./helpers/prefix_channel";
 import {
   PATH10_ROW_BYTES,
   path10Root,
@@ -112,12 +112,12 @@ describe("round trips for a K-commitment proof", () => {
   function rig(p: Plan): { sdk: RavenPOINodeInterface; bcs: string[]; queriesPerPost: number[] } {
     const queriesPerPost: number[] = [];
     const slots = new Map<string, Uint8Array>();
-    const bcToIdx = new Map<string, number>();
+    const placed: [string, number][] = [];
     const pinned = new Map<string, string>();
     for (const { block, bcs, perLeaf, root } of p.blocks) {
-      pinned.set(`${LIST_KEY_HEX}:${block}`, root);
+      pinned.set(`1:${LIST_KEY_HEX}:${block}`, root);
       bcs.forEach((bcHex, i) => {
-        bcToIdx.set(bcHex, block * LEAVES_PER_BLOCK + i);
+        placed.push([bcHex, block * LEAVES_PER_BLOCK + i]);
         slots.set(bcHex, path10Slot({ bcHex, nodes: perLeaf[i].map(hexToBytes) }));
       });
     }
@@ -159,19 +159,17 @@ describe("round trips for a K-commitment proof", () => {
     const sdk = new RavenPOINodeInterface({
       endpoint: server.url,
       bearerToken: TOKEN,
-      useClientPir: true,
-      // Keyed on the chain-less `t2Path:<lk>` form the interface looks contexts up by; the
-      // per-block LABELS below are what route to an instance.
-      clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, pathCtx]]),
+      // One context per list; the per-block LABELS below are what route to an instance.
+      clientPirContexts: new Map([[`t2Path:1:${LIST_KEY_HEX}`, pathCtx]]),
       clientPirInstanceLabels: new Map(
         p.blocks.map(({ block }) => [
-          `t2Path:${LIST_KEY_HEX}:${block}`,
+          `t2Path:1:${LIST_KEY_HEX}:${block}`,
           `t2Path-${LIST_KEY_HEX}:${block}`,
         ]),
       ),
       ppoiPinnedRoots: pinned,
-      bcToIdxMaps: new Map([[LIST_KEY_HEX, bcToIdx]]),
-      imtCache: new ImtCache({ disableIndexedDb: true }),
+      poiListIndexes: new Map([[`1:${LIST_KEY_HEX}`, indexHolding(placed)]]),
+      poiListIndexStore: false,
     });
     return { sdk, bcs: p.blocks.flatMap(({ bcs }) => bcs), queriesPerPost };
   }

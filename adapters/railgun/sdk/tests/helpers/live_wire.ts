@@ -28,9 +28,7 @@ export const LIVE_TOKEN = setting("RAVEN_LIVE_TOKEN");
 /** The PPOI aggregator the PPOI smoke checks the node against. */
 export const LIVE_AGGREGATOR = setting("RAVEN_PIN_UPSTREAM");
 
-/** Instance ids are operator config; the defaults are the ones the shipped example uses. */
-export const PPOI_STATUS_INSTANCE =
-  setting("RAVEN_LIVE_PPOI_STATUS_INSTANCE") ?? "ppoi-status-ofac";
+/** Instance ids are operator config; the default is the one the shipped example uses. */
 const PPOI_PATH_INSTANCE_PREFIX =
   setting("RAVEN_LIVE_PPOI_PATH_INSTANCE_PREFIX") ?? "ppoi-paths-ofac-";
 

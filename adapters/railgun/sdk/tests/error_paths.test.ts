@@ -16,11 +16,25 @@ import {
   writeBinary,
   type MockServer,
 } from "./helpers/mock_server";
-import { mountPrefixChannel } from "./helpers/prefix_channel";
+import { forestConfig } from "./helpers/forest";
 import { shardConfigBincode } from "./helpers/shard_config";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX = "abababababababababababababababababababababababababababababababab";
+const BC_PRESENT = "aa".repeat(32);
+
+/** Holds `BC_PRESENT` at index 0, so a proof reaches the instance route. */
+function pathSdk(server: MockServer): RavenPOINodeInterface {
+  return new RavenPOINodeInterface({
+    ...forestConfig({
+      endpoint: server.url,
+      listKeyHex: LIST_KEY_HEX,
+      ctx: stubCtx(),
+      placed: [[BC_PRESENT, 0]],
+    }),
+    bearerToken: TOKEN,
+  });
+}
 
 function stubWasm(): RavenInspireWasm {
   return {
@@ -35,7 +49,6 @@ function stubWasm(): RavenInspireWasm {
     },
     build_instance_params_blob: () => new Uint8Array(0),
     register_client_session: makeRegisterSpy(),
-    path_indices_for_leaf: () => new Uint32Array(16),
     path_indices_for_per_list_leaf: () => new Uint32Array(16),
   };
 }
@@ -91,57 +104,6 @@ describe("error-path + truncated-response handling", () => {
     expect(() => decodeClientPirQueryBundle(buf)).toThrow(/exceeds 2\^32/);
   });
 
-  it("getPOIsPerList legacy mode throws on malformed JSON response", async () => {
-    server.route(
-      (req) => req.url === "/v1/poi/pois-per-list",
-      (_req, _body, res) => {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end("{not-json-at-all");
-        return true;
-      },
-    );
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: false,
-    });
-    await expect(
-      sdk.getPOIsPerList(
-        [LIST_KEY_HEX],
-        [{ blindedCommitment: "11".repeat(32), type: "Shield" }],
-      ),
-    ).rejects.toThrow();
-  });
-
-  it("client-PIR query with HTTP 5xx propagates as typed ServerError (no silent Missing)", async () => {
-    // 5xx must propagate so the wallet retries/falls back instead of silently spending against unmarked BCs
-    server.route(
-      (req) => req.url?.startsWith("/v1/instance/") ?? false,
-      (_req, _body, res) => {
-        res.writeHead(503, { "content-type": "text/plain" });
-        res.end("server overload");
-        return true;
-      },
-    );
-    const bcMap = new Map<string, number>([["aa".repeat(32), 0]]);
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: true,
-      clientPirContexts: new Map([[`t1Status:${LIST_KEY_HEX}`, stubCtx()]]),
-      bcToIdxMaps: new Map([[LIST_KEY_HEX, bcMap]]),
-    });
-    try {
-      await sdk.getPOIsPerList(
-        [LIST_KEY_HEX],
-        [{ blindedCommitment: "aa".repeat(32), type: "Shield" }],
-      );
-      expect.fail("expected ServerError");
-    } catch (e) {
-      expect(RavenError.is(e, "ServerError")).toBe(true);
-    }
-  });
-
   it("client-PIR T2 batch with HTTP 5xx surfaces as a thrown error (T2 cannot fail-soft)", async () => {
     server.route(
       (req) => req.url?.startsWith("/v1/instance/") ?? false,
@@ -151,16 +113,8 @@ describe("error-path + truncated-response handling", () => {
         return true;
       },
     );
-    const bcMap = new Map<string, number>([["aa".repeat(32), 0]]);
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: true,
-      clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, stubCtx()]]),
-      bcToIdxMaps: new Map([[LIST_KEY_HEX, bcMap]]),
-    });
     await expect(
-      sdk.getPOIMerkleProofs(LIST_KEY_HEX, ["aa".repeat(32)]),
+      pathSdk(server).getPOIMerkleProofs(LIST_KEY_HEX, [BC_PRESENT]),
     ).rejects.toThrow(/client-PIR batch/);
   });
 
@@ -176,28 +130,14 @@ describe("error-path + truncated-response handling", () => {
         return true;
       },
     );
-    const bcMap = new Map<string, number>([["aa".repeat(32), 0]]);
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: true,
-      clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, stubCtx()]]),
-      bcToIdxMaps: new Map([[LIST_KEY_HEX, bcMap]]),
-    });
     await expect(
-      sdk.getPOIMerkleProofs(LIST_KEY_HEX, ["aa".repeat(32)]),
+      pathSdk(server).getPOIMerkleProofs(LIST_KEY_HEX, [BC_PRESENT]),
     ).rejects.toThrow(/decodeBatchBody|too short|truncated/);
   });
 
-  // -------------------------------------------------------------------------
-  // 404 on an instance route: the client-side half of the tree-4 outage class.
-  // Railgun rolled to a new commit tree, the adapter had no instance for it, and
-  // every instance-route request answered 404. The offline suite covered 5xx on
-  // /query and 404 on bc-to-idx-map, but never 404 on /v1/instance/* — the exact
-  // wire shape a wallet sees during that outage. A 404 carries no
-  // X-Raven-Schema-Version header, so it must surface as ServerError (never
-  // StaleAdapter, never a downgraded Network->Missing verdict).
-  // -------------------------------------------------------------------------
+  // 404 on an instance route: what a wallet sees when the node has no instance for a block it
+  // was told about, such as a block declared before the node's config caught up. A 404 carries
+  // no X-Raven-Schema-Version header, so it must surface as ServerError, never StaleAdapter.
 
   function mount404Instance(): void {
     server.route(
@@ -210,64 +150,10 @@ describe("error-path + truncated-response handling", () => {
     );
   }
 
-  it("T1 getPOIsPerList: 404 from the instance route is a typed ServerError, no verdict fabricated", async () => {
-    mount404Instance();
-    const bcPresent = "aa".repeat(32);
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: true,
-      clientPirContexts: new Map([[`t1Status:${LIST_KEY_HEX}`, stubCtx()]]),
-      bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[bcPresent, 0]])]]),
-    });
-    try {
-      const got = await sdk.getPOIsPerList(
-        [LIST_KEY_HEX],
-        [{ blindedCommitment: bcPresent, type: "Shield" }],
-      );
-      expect.fail(
-        `expected ServerError, got a verdict map: ${JSON.stringify(got)} — ` +
-          "a missing instance answered with a confident verdict is the outage made silent",
-      );
-    } catch (e) {
-      expect(RavenError.is(e, "ServerError"), `wrong kind: ${String(e)}`).toBe(true);
-      expect(RavenError.is(e, "StaleAdapter")).toBe(false);
-      expect(RavenError.is(e, "Network")).toBe(false);
-      expect(String((e as Error).message)).toContain("404");
-    }
-  });
-
   it("T2 getPOIMerkleProofs: 404 from the instance route is a typed ServerError", async () => {
     mount404Instance();
-    const bcPresent = "aa".repeat(32);
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: true,
-      clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, stubCtx()]]),
-      bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[bcPresent, 0]])]]),
-    });
     try {
-      await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [bcPresent]);
-      expect.fail("expected ServerError");
-    } catch (e) {
-      expect(RavenError.is(e, "ServerError"), `wrong kind: ${String(e)}`).toBe(true);
-      expect(String((e as Error).message)).toContain("404");
-    }
-  });
-
-  it("T3 getMerkleProof: 404 from the instance route is a typed ServerError (tree-4 shape)", async () => {
-    mount404Instance();
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: true,
-      clientPirContexts: new Map([["t3CommitTree:4", stubCtx()]]),
-    });
-    // Tree 4 with a context but no server instance: the live incident's exact shape —
-    // the CLIENT is willing, the SERVER has nothing to answer with.
-    try {
-      await sdk.getMerkleProof(4, 0);
+      await pathSdk(server).getPOIMerkleProofs(LIST_KEY_HEX, [BC_PRESENT]);
       expect.fail("expected ServerError");
     } catch (e) {
       expect(RavenError.is(e, "ServerError"), `wrong kind: ${String(e)}`).toBe(true);
@@ -314,26 +200,9 @@ describe("error-path + truncated-response handling", () => {
     ).rejects.toThrow(/-32603: unauthorized/);
   });
 
-  it("fetchBcToIdxMap throws on non-200", async () => {
-    mountPrefixChannel(server, LIST_KEY_HEX, { commitments: [] });
+  it("syncPoiListIndex throws on non-200", async () => {
     server.route(
-      (req) => req.url?.endsWith("/bc-to-idx-map") ?? false,
-      (_req, _body, res) => {
-        res.writeHead(404);
-        res.end();
-        return true;
-      },
-    );
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-    });
-    await expect(sdk.fetchBcToIdxMap(LIST_KEY_HEX)).rejects.toThrow(/bc-to-idx-map: 404/);
-  });
-
-  it("fetchStatusHeader throws on non-200", async () => {
-    server.route(
-      (req) => req.url?.endsWith("/status-header") ?? false,
+      (req) => req.url?.includes("/bc-prefixes") ?? false,
       (_req, _body, res) => {
         res.writeHead(403);
         res.end();
@@ -344,6 +213,6 @@ describe("error-path + truncated-response handling", () => {
       endpoint: server.url,
       bearerToken: TOKEN,
     });
-    await expect(sdk.fetchStatusHeader(LIST_KEY_HEX)).rejects.toThrow(/status-header: 403/);
+    await expect(sdk.syncPoiListIndex(LIST_KEY_HEX)).rejects.toThrow(/bc-prefixes: 403/);
   });
 });

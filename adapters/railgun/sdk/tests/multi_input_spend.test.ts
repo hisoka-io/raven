@@ -1,29 +1,62 @@
 /**
- * Multi-input spend tests over the legacy passthrough path. N=1/2/4/13 (the
- * upstream circuitConfigs.js input cap) plus a cross-tree spend lock that the
- * SDK fans out per BC and per instance without state cross-contamination.
+ * Multi-input spend over the private path. N=1/2/4/13 (the upstream circuitConfigs.js input
+ * cap) in one block, a spend whose inputs sit in three blocks, and the status of several
+ * commitments on several lists answered without cross-contamination.
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { RavenPOINodeInterface } from "../src/index";
-import { startMockServer, writeJson, type MockServer } from "./helpers/mock_server";
+import { LEAVES_PER_PPOI_BLOCK, RavenPOINodeInterface, hexToBytes } from "../src/index";
+import { TOKEN, encodeBatchResponseNodes, stubCtx } from "./helpers/auth_path_stub";
+import { blockLabel, forestConfig } from "./helpers/forest";
+import { startMockServer, writeJsonRpcResult, type MockServer } from "./helpers/mock_server";
+import { PATH10_ROW_BYTES, path10Slot } from "./helpers/path10_row";
 import { ppoiTree } from "./helpers/ppoi_tree";
+import { commitmentAt, mountPrefixChannel, targetNamingCtx } from "./helpers/prefix_channel";
+import { namedBatchTargets } from "./helpers/private_wire";
 
-const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX = "abababababababababababababababababababababababababababababababab";
 
-function bcAt(idx: number): string {
-  return idx.toString(16).padStart(2, "0").repeat(32);
+interface Note {
+  readonly bc: string;
+  readonly index: number;
+  readonly elements: readonly string[];
 }
 
-/** The plaintext route does not say which block a proof is in, so its root must be pinned. */
-function pinnedSdk(endpoint: string, root: string): RavenPOINodeInterface {
+/** Serves each block's notes at their rows; the instance label names the block. */
+function mountForest(server: MockServer, notes: readonly Note[]): void {
+  server.route(
+    (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
+    (req, body, res) => {
+      const label = decodeURIComponent(/^\/v1\/instance\/([^/]+)\/batch$/.exec(req.url ?? "")![1]);
+      const inBlock = notes.filter(
+        (note) => blockLabel(LIST_KEY_HEX, Math.floor(note.index / LEAVES_PER_PPOI_BLOCK)) === label,
+      );
+      const slots = namedBatchTargets(body).map((row) => {
+        const note =
+          inBlock.find((candidate) => candidate.index % LEAVES_PER_PPOI_BLOCK === row) ?? inBlock[0];
+        return path10Slot({ bcHex: note.bc, nodes: note.elements.map((e) => hexToBytes(e)) });
+      });
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "x-raven-freshness": "lag_blocks=0 applied_height=0 epoch=1 confidence=1",
+      });
+      res.end(Buffer.from(encodeBatchResponseNodes(slots)));
+      return true;
+    },
+  );
+}
+
+function forestSdk(server: MockServer, notes: readonly Note[], pins: Map<number, string>) {
   return new RavenPOINodeInterface({
-    endpoint,
+    ...forestConfig({
+      endpoint: server.url,
+      listKeyHex: LIST_KEY_HEX,
+      ctx: { ...stubCtx(), entrySize: PATH10_ROW_BYTES },
+      placed: notes.map((note) => [note.bc, note.index] as const),
+      pins,
+    }),
     bearerToken: TOKEN,
-    useClientPir: false,
-    ppoiPinnedRoots: new Map([[`${LIST_KEY_HEX}:0`, root]]),
   });
 }
 
@@ -44,107 +77,76 @@ describe("multi-input spend support", () => {
 
   for (const n of [1, 2, 4, 13]) {
     it(`N=${n}: SDK fetches ${n} PPOI proofs in one call`, async () => {
-      const bcs = Array.from({ length: n }, (_, i) => bcAt(i + 1));
+      const bcs = Array.from({ length: n }, (_, i) => commitmentAt(i + 1));
       const tree = ppoiTree(bcs);
-      server.route(
-        (req) => req.url === "/v1/poi/merkle-proofs",
-        (_req, body, res) => {
-          const decoded = JSON.parse(new TextDecoder().decode(body));
-          expect(decoded.blindedCommitments).toHaveLength(n);
-          writeJson(res, tree.proofs);
-          return true;
-        },
+      const notes = bcs.map((bc, index) => ({ bc, index, elements: tree.proofs[index].elements }));
+      mountForest(server, notes);
+
+      const proofs = await forestSdk(server, notes, new Map([[0, tree.root]])).getPOIMerkleProofs(
+        LIST_KEY_HEX,
+        bcs,
       );
-      const sdk = pinnedSdk(server.url, tree.root);
-      const proofs = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, bcs);
       expect(proofs).toHaveLength(n);
-      proofs.forEach((p, i) => expect(p.leaf).toBe(bcs[i]));
+      proofs.forEach((p, i) => {
+        expect(p.leaf).toBe(bcs[i]);
+        expect(p.root).toBe(tree.root);
+      });
+      // The 13-input cap is the circuit's; the SDK round-trips it in one padded batch.
+      expect(server.requests.filter((r) => r.url.endsWith("/batch"))).toHaveLength(1);
     });
   }
 
-  it("13-input spend stays at the circuit cap", async () => {
-    // 13 = upstream circuitConfigs.js cap; the SDK does not enforce it, only round-trips it
-    const n = 13;
-    const bcs = Array.from({ length: n }, (_, i) => bcAt(i + 1));
-    const tree = ppoiTree(bcs);
-    server.route(
-      (req) => req.url === "/v1/poi/merkle-proofs",
-      (_req, _body, res) => {
-        writeJson(res, tree.proofs);
-        return true;
-      },
+  it("a spend whose inputs sit in three blocks asks each block's own instance", async () => {
+    const notes: Note[] = [0, 2, 3].map((block, i) => {
+      const bc = commitmentAt(0x100 + i);
+      return { bc, index: block * LEAVES_PER_PPOI_BLOCK, elements: ppoiTree([bc]).proofs[0].elements };
+    });
+    const pins = new Map(
+      notes.map((note) => [Math.floor(note.index / LEAVES_PER_PPOI_BLOCK), ppoiTree([note.bc]).root]),
     );
-    const sdk = pinnedSdk(server.url, tree.root);
-    const proofs = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, bcs);
-    expect(proofs).toHaveLength(13);
+    mountForest(server, notes);
+
+    const proofs = await forestSdk(server, notes, pins).getPOIMerkleProofs(
+      LIST_KEY_HEX,
+      notes.map((note) => note.bc),
+    );
+
+    expect(proofs.map((p) => p.leaf)).toEqual(notes.map((note) => note.bc));
+    const asked = server.requests.filter((r) => r.url.endsWith("/batch")).map((r) => r.url);
+    expect(asked.sort()).toEqual(
+      [0, 2, 3].map((block) => `/v1/instance/${blockLabel(LIST_KEY_HEX, block)}/batch`).sort(),
+    );
   });
 
-  it("cross-tree spend: 3 commit-tree proofs each from a different tree", async () => {
-    // one proof per UTXO, each dispatched to its tree-specific commit-tree route
-    const inputs = [
-      { tree: 0, leafIndex: 100, sibling: "aa".repeat(32) },
-      { tree: 2, leafIndex: 5_000, sibling: "bb".repeat(32) },
-      { tree: 3, leafIndex: 75, sibling: "cc".repeat(32) },
-    ];
-    for (const inp of inputs) {
-      server.route(
-        (req) => req.url === `/v1/commit-tree/${inp.tree}/merkle-proof`,
-        (_req, _body, res) => {
-          writeJson(res, {
-            leaf: bcAt(inp.tree + 1),
-            elements: Array.from({ length: 16 }, () => inp.sibling),
-            indices: `0x${inp.leafIndex.toString(16)}`,
-            root: "dd".repeat(32),
-          });
-          return true;
-        },
-      );
-    }
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: false,
-    });
-    const proofs = await Promise.all(
-      inputs.map((inp) => sdk.getMerkleProof(inp.tree, inp.leafIndex)),
-    );
-    expect(proofs).toHaveLength(3);
-    proofs.forEach((p, i) => {
-      expect(p.elements).toStrictEqual(Array.from({ length: 16 }, () => inputs[i].sibling));
-      expect(p.indices).toBe(inputs[i].leafIndex.toString(16).padStart(64, "0"));
-    });
-    const wires = sdk.lastWireRequests();
-    expect(wires.length).toBe(3);
-    const urls = wires.map((w) => w.url);
-    expect(urls).toContain(`${server.url}/v1/commit-tree/0/merkle-proof`);
-    expect(urls).toContain(`${server.url}/v1/commit-tree/2/merkle-proof`);
-    expect(urls).toContain(`${server.url}/v1/commit-tree/3/merkle-proof`);
-  });
-
-  it("getPOIsPerList multi-list multi-BC fans out per (list, BC)", async () => {
+  it("getPOIsPerList answers every (BC, list) cell for several lists and commitments", async () => {
     const lkA = "11".repeat(32);
     const lkB = "22".repeat(32);
-    const bcOne = bcAt(1);
-    const bcTwo = bcAt(2);
+    const bcOne = commitmentAt(1);
+    const bcTwo = commitmentAt(2);
+    mountPrefixChannel(server, lkA, { commitments: [bcOne] });
+    mountPrefixChannel(server, lkB, { commitments: [commitmentAt(9)] });
     server.route(
-      (req) => req.url === "/v1/poi/pois-per-list",
+      (req) => req.url === "/",
       (_req, body, res) => {
-        const decoded = JSON.parse(new TextDecoder().decode(body));
-        expect(decoded.listKeys).toEqual([lkA, lkB]);
-        expect(decoded.blindedCommitmentDatas).toHaveLength(2);
-        // BC outer, list key inner — `PoisPerListResponse` and upstream's POIsPerListMap.
-        writeJson(res, {
-          [bcOne]: { [lkA]: "Valid", [lkB]: "ShieldBlocked" },
-          [bcTwo]: { [lkA]: "Missing", [lkB]: "ProofSubmitted" },
-        });
+        writeJsonRpcResult(body, res, null);
         return true;
       },
     );
     const sdk = new RavenPOINodeInterface({
       endpoint: server.url,
       bearerToken: TOKEN,
-      useClientPir: false,
+      upstreamFallbackEndpoint: `${server.url}/`,
+      clientPirContexts: new Map([
+        [`t2Path:1:${lkA}`, targetNamingCtx()],
+        [`t2Path:1:${lkB}`, targetNamingCtx()],
+      ]),
+      poiListIndexStore: false,
     });
+    await sdk.submitLegacyTransactProofs(
+      [lkB],
+      [{ txidIndex: "1", npk: "2", value: "3", tokenHash: "4", blindedCommitment: bcTwo }],
+    );
+
     const got = await sdk.getPOIsPerList(
       [lkA, lkB],
       [
@@ -152,7 +154,9 @@ describe("multi-input spend support", () => {
         { blindedCommitment: bcTwo, type: "Transact" },
       ],
     );
-    expect(got[bcOne][lkA]).toBe("Valid");
-    expect(got[bcTwo][lkB]).toBe("ProofSubmitted");
+    expect(got).toStrictEqual({
+      [bcOne]: { [lkA]: "Valid", [lkB]: "Missing" },
+      [bcTwo]: { [lkA]: "Missing", [lkB]: "ProofSubmitted" },
+    });
   });
 });

@@ -2,7 +2,16 @@
 
 import { bearerHeaders } from "./bearer-auth";
 import { RavenError } from "./errors";
-import type { StatusBody } from "./events-stream";
+
+/** One row of `/v1/status`'s `instances`, as `refresh` reads it. */
+interface InstanceStatus {
+  id: string;
+  epoch: number;
+  role: string;
+  drain_state: string;
+  in_flight: number;
+  active_k_concurrency: number;
+}
 
 export interface ChainRegistryEntry {
   /** EVM chain id this adapter serves (1 = mainnet, 11155111 = Sepolia, ...). */
@@ -122,7 +131,7 @@ function statusInstancesIn(
   body: unknown,
   chainId: number,
   url: string,
-): StatusBody["instances"] {
+): InstanceStatus[] {
   const instances = typeof body === "object" && body !== null
     ? (body as { instances?: unknown }).instances
     : undefined;
@@ -141,7 +150,7 @@ function parseInstanceStatus(
   at: number,
   chainId: number,
   url: string,
-): StatusBody["instances"][number] {
+): InstanceStatus {
   const reject = (why: string): never => {
     throw RavenError.decodeError(
       `ChainRegistry.refresh: /v1/status for chain ${chainId} instance[${at}] ${why}`,

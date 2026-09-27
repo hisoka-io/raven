@@ -9,13 +9,14 @@ import { fileURLToPath } from "node:url";
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { ChainRegistry, RavenError, RavenPOINodeInterface, hexToBytes } from "../src/index";
+import { ChainRegistry, RavenError, RavenPOINodeInterface } from "../src/index";
 import {
   TOKEN,
   encodeBatchResponseNodes,
   encodedBatchCount,
   stubCtx,
 } from "./helpers/auth_path_stub";
+import { forestConfig } from "./helpers/forest";
 import {
   startMockServer,
   writeBinary,
@@ -24,24 +25,18 @@ import {
   type MockServer,
   type RecordedRequest,
 } from "./helpers/mock_server";
+import { PATH10_ROW_BYTES, path10Root, path10Siblings, path10Slot } from "./helpers/path10_row";
 import { mountPrefixChannel } from "./helpers/prefix_channel";
 
 const LIST_KEY = "ab".repeat(32);
 const BC = "bc00112233445566778899aabbccddeeff00112233445566778899aabbccdd01";
 const ROOT = "00".repeat(32);
+const NODES = path10Siblings(0x2a);
 
 // What `process.env.RAVEN_BEARER_TOKEN!` evaluates to when the variable is unset.
 const UNSET_ENV_TOKEN = process.env.RAVEN_SDK_TEST_TOKEN_THAT_IS_NEVER_SET!;
 
-type Site =
-  | "bcToIdxMap"
-  | "bcPrefixes"
-  | "statusHeader"
-  | "session"
-  | "batch"
-  | "plaintextShim"
-  | "registryRefresh"
-  | "upstream";
+type Site = "bcPrefixes" | "session" | "batch" | "registryRefresh" | "upstream";
 
 /** The part of a request both the mock's matcher and its recorder expose. */
 interface RequestLine {
@@ -50,49 +45,37 @@ interface RequestLine {
 }
 
 const SITE_OF: Record<Site, (request: RequestLine) => boolean> = {
-  bcToIdxMap: (r) => r.method === "GET" && (r.url ?? "").endsWith("/bc-to-idx-map"),
   bcPrefixes: (r) => r.method === "GET" && (r.url ?? "").includes("/bc-prefixes?"),
-  statusHeader: (r) => r.method === "GET" && (r.url ?? "").endsWith("/status-header"),
   session: (r) => r.method === "POST" && (r.url ?? "").endsWith("/session"),
   batch: (r) => r.method === "POST" && (r.url ?? "").endsWith("/batch"),
-  plaintextShim: (r) => r.method === "POST" && r.url === "/v1/poi/pois-per-list",
   registryRefresh: (r) => r.method === "GET" && r.url === "/v1/status",
   upstream: (r) => r.method === "POST" && r.url === "/",
 };
 
-const ADAPTER_SITES: Site[] = [
-  "bcToIdxMap",
-  "bcPrefixes",
-  "statusHeader",
-  "session",
-  "batch",
-  "plaintextShim",
-  "registryRefresh",
-];
+const ADAPTER_SITES: Site[] = ["bcPrefixes", "session", "batch", "registryRefresh"];
 
-function statusRow(): Uint8Array {
-  const row = new Uint8Array(32);
-  row.set(hexToBytes(BC).subarray(0, 31), 1);
-  return row;
+/** Holds the one note at index 0, so a proof call still reaches the session and batch routes
+ *  when the index channel refuses it. */
+function privateSdk(server: MockServer, credential: { bearerToken?: string }): RavenPOINodeInterface {
+  return new RavenPOINodeInterface({
+    ...forestConfig({
+      endpoint: server.url,
+      listKeyHex: LIST_KEY,
+      ctx: { ...stubCtx(), entrySize: PATH10_ROW_BYTES },
+      placed: [[BC, 0]],
+      pins: new Map([[0, path10Root(BC, NODES, 0)]]),
+    }),
+    ...credential,
+    upstreamFallbackEndpoint: server.url,
+  });
 }
 
 function mountEveryRoute(server: MockServer): void {
-  server.route(SITE_OF.bcToIdxMap, (_req, _body, res) => {
-    writeJson(res, { epoch: 1, listKey: LIST_KEY, entries: [] });
-    return true;
-  });
-  mountPrefixChannel(server, LIST_KEY, { commitments: [] });
-  server.route(SITE_OF.statusHeader, (_req, _body, res) => {
-    writeJson(res, { epoch: 1, listKey: LIST_KEY, blockedBcs: [], pendingBcs: [] });
-    return true;
-  });
+  mountPrefixChannel(server, LIST_KEY, { commitments: [BC] });
   server.route(SITE_OF.batch, (_req, body, res) => {
     const slots = encodedBatchCount(body);
-    writeBinary(res, encodeBatchResponseNodes(Array.from({ length: slots }, statusRow)));
-    return true;
-  });
-  server.route(SITE_OF.plaintextShim, (_req, _body, res) => {
-    writeJson(res, {});
+    const slot = path10Slot({ bcHex: BC, nodes: NODES });
+    writeBinary(res, encodeBatchResponseNodes(Array.from({ length: slots }, () => slot)));
     return true;
   });
   server.route(SITE_OF.registryRefresh, (_req, _body, res) => {
@@ -113,26 +96,12 @@ async function driveEverySite(
   mountEveryRoute(server);
   const commitments = [{ blindedCommitment: BC, type: "Shield" as const }];
 
-  const privateSdk = new RavenPOINodeInterface({
-    endpoint: server.url,
-    ...credential,
-    upstreamFallbackEndpoint: server.url,
-    clientPirContexts: new Map([[`t1Status:${LIST_KEY}`, stubCtx()]]),
-    bcToIdxMaps: new Map([[LIST_KEY, new Map([[BC, 0]])]]),
-  });
-  await privateSdk.fetchBcToIdxMap(LIST_KEY);
-  await privateSdk.fetchStatusHeader(LIST_KEY);
-  expect(await privateSdk.getPOIsPerList([LIST_KEY], commitments)).toEqual({
+  const sdk = privateSdk(server, credential);
+  expect(await sdk.getPOIsPerList([LIST_KEY], commitments)).toEqual({
     [BC]: { [LIST_KEY]: "Valid" },
   });
-  expect(await privateSdk.validatePOIMerkleroots(LIST_KEY, [ROOT])).toBe(true);
-
-  const plaintextSdk = new RavenPOINodeInterface({
-    endpoint: server.url,
-    ...credential,
-    useClientPir: false,
-  });
-  await plaintextSdk.getPOIsPerList([LIST_KEY], commitments);
+  expect(await sdk.getPOIMerkleProofs(LIST_KEY, [BC])).toHaveLength(1);
+  expect(await sdk.validatePOIMerkleroots(LIST_KEY, [ROOT])).toBe(true);
 
   await new ChainRegistry([{ chainId: 1, endpoint: server.url, ...credential }]).refresh(1);
 }
@@ -214,17 +183,12 @@ describe("adapter authorization header", () => {
     server.route(() => true, refuse);
 
     const commitments = [{ blindedCommitment: BC, type: "Shield" as const }];
-    const privateSdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      clientPirContexts: new Map([[`t1Status:${LIST_KEY}`, stubCtx()]]),
-      bcToIdxMaps: new Map([[LIST_KEY, new Map([[BC, 0]])]]),
-    });
-    const plaintextSdk = new RavenPOINodeInterface({ endpoint: server.url, useClientPir: false });
+    const sdk = privateSdk(server, {});
     const calls: [string, () => Promise<unknown>][] = [
-      ["bc-to-idx-map", () => privateSdk.fetchBcToIdxMap(LIST_KEY)],
-      ["status-header", () => privateSdk.fetchStatusHeader(LIST_KEY)],
-      ["private status", () => privateSdk.getPOIsPerList([LIST_KEY], commitments)],
-      ["plaintext status", () => plaintextSdk.getPOIsPerList([LIST_KEY], commitments)],
+      ["index sync", () => sdk.syncPoiListIndex(LIST_KEY)],
+      ["status", () => sdk.getPOIsPerList([LIST_KEY], commitments)],
+      // The held index carries the refused sync, so the proof goes on to the session route.
+      ["proof session", () => sdk.getPOIMerkleProofs(LIST_KEY, [BC])],
       [
         "registry refresh",
         () => new ChainRegistry([{ chainId: 1, endpoint: server.url }]).refresh(1),

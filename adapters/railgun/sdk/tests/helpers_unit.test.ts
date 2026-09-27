@@ -7,7 +7,6 @@ import {
   hexToBytes,
   bytesToHex,
   decodeClientPirQueryBundle,
-  statusByteToPOIStatus,
   PATH_RECORD_BYTES,
   TREE_DEPTH,
 } from "../src/index";
@@ -137,26 +136,6 @@ describe("containsByteSequence", () => {
     haystack[42] = 0xcd;
     const needle = new Uint8Array(100).fill(0xab);
     expect(containsByteSequence(haystack, needle)).toBe(false);
-  });
-});
-
-describe("statusByteToPOIStatus", () => {
-  it("maps 0 -> Valid", () => {
-    expect(statusByteToPOIStatus(0)).toBe("Valid");
-  });
-  it("maps 1 -> ShieldBlocked", () => {
-    expect(statusByteToPOIStatus(1)).toBe("ShieldBlocked");
-  });
-  it("maps 2 -> ProofSubmitted", () => {
-    expect(statusByteToPOIStatus(2)).toBe("ProofSubmitted");
-  });
-  it("maps 3 -> Missing", () => {
-    expect(statusByteToPOIStatus(3)).toBe("Missing");
-  });
-  it("refuses every unknown status byte", () => {
-    for (const b of [4, 5, 99, 128, 255]) {
-      expect(() => statusByteToPOIStatus(b), `byte ${b}`).toThrow(/unknown POI status byte/);
-    }
   });
 });
 

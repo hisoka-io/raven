@@ -3,10 +3,9 @@
 # referenced by at least one test file that actually runs in CI.
 #
 # Why this exists: the package has no coverage tooling at all, and an audit found three
-# public exports with ZERO test references — one of them (subscribeRavenEvents) an entire
-# 110-line module consuming untrusted server JSON. The three permanently env-gated
-# live_*.test.ts files do NOT count as coverage: a symbol tested only there is untested
-# in every CI run.
+# public exports with ZERO test references, one of them an entire module consuming untrusted
+# server JSON. The permanently env-gated live_*.test.ts files do NOT count as coverage: a
+# symbol tested only there is untested in every CI run.
 #
 # Guards against its own vacuity: it refuses to pass if the export extraction or the
 # test-file scan comes back implausibly empty, so a format change in index.ts fails the

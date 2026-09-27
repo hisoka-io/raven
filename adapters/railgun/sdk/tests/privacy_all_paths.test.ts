@@ -1,38 +1,25 @@
-// No call path leaks plaintext BC bytes when useClientPir is true. Asserts only the
-// OUTGOING direction; response decode is allowed to fail (tolerated via try/catch).
+// No call path puts plaintext BC bytes on the wire. Asserts only the OUTGOING direction; a
+// proof's response decode is allowed to fail (the fixture's rows are not path rows).
 
 import { afterEach, beforeAll, describe, expect, it, afterAll } from "vitest";
 
-import { RavenPOINodeInterface, containsByteSequence, paddedBatchLength } from "../src/index";
+import { RavenPOINodeInterface, paddedBatchLength } from "../src/index";
 import type { ClientPirContext } from "../src/index";
 
-import { fixtureResponsesFor, loadFixture, makeClientPirContext } from "./helpers/fixture";
+import { loadFixture, makeClientPirContext } from "./helpers/fixture";
 import { encodeBatchResponseNodes, encodedBatchCount } from "./helpers/auth_path_stub";
-import { startMockServer, writeBinary, writeJson, type MockServer } from "./helpers/mock_server";
-import { mountPrefixChannel } from "./helpers/prefix_channel";
+import { forestConfig } from "./helpers/forest";
+import { startMockServer, writeBinary, type MockServer } from "./helpers/mock_server";
+import { commitmentAt, mountPrefixChannel } from "./helpers/prefix_channel";
 import {
+  assertNoCommitmentsAnywhere,
   assertNoCommitmentsInPirRequests,
-  inspectPirDataPosts,
 } from "./helpers/private_wire";
 import { EXPECTED_WIRE_SCHEMA_PREFIX } from "./helpers/wire_schema";
 
 const TOKEN = "test-token-padded-long-enough-1234";
-
-function makeMaps(fixture: ReturnType<typeof loadFixture>, ctx: ClientPirContext) {
-  const lk = fixture.meta.list_key_hex;
-  const ctxs = new Map<string, ClientPirContext>([
-    [`t1Status:${lk}`, ctx],
-    [`t2Path:${lk}`, ctx],
-    [`t3CommitTree:0`, ctx],
-    [`t3CommitTree:1`, ctx],
-  ]);
-  const bcMap = new Map<string, number>();
-  for (const idx of fixture.meta.target_indices) {
-    bcMap.set(fixture.meta.bcs_hex[idx], idx);
-  }
-  const bcMaps = new Map<string, Map<string, number>>([[lk, bcMap]]);
-  return { ctxs, bcMaps };
-}
+const MEMBERS = [commitmentAt(0), commitmentAt(1), commitmentAt(2), commitmentAt(3), commitmentAt(4)];
+const NON_MEMBERS = [commitmentAt(0x77), commitmentAt(0x88), commitmentAt(0x99)];
 
 describe("privacy across every SDK call path", () => {
   let fixture: ReturnType<typeof loadFixture>;
@@ -54,240 +41,83 @@ describe("privacy across every SDK call path", () => {
     server.reset();
   });
 
-  it("getPOIsPerList client-PIR path leaks no BC bytes", async () => {
-    const responses = Array.from(fixture.responsesByIdx.values());
-    let cursor = 0;
+  function sdk(): RavenPOINodeInterface {
+    mountPrefixChannel(server, fixture.meta.list_key_hex, { commitments: [...MEMBERS] });
+    return new RavenPOINodeInterface({
+      ...forestConfig({ endpoint: server.url, listKeyHex: fixture.meta.list_key_hex, ctx }),
+      bearerToken: TOKEN,
+    });
+  }
+
+  it("getPOIsPerList sends no query and no body, whoever is asked about", async () => {
+    const client = sdk();
+    await client.getPOIsPerList(
+      [fixture.meta.list_key_hex],
+      [...MEMBERS, ...NON_MEMBERS].map((bc) => ({ blindedCommitment: bc, type: "Shield" as const })),
+    );
+    const wires = client.lastWireRequests();
+    expect(wires.map((w) => w.method)).toEqual(["GET"]);
+    expect(wires[0].body.length).toBe(0);
+    expect(server.requests.some((r) => r.url.includes("/v1/instance/"))).toBe(false);
+    assertNoCommitmentsAnywhere(wires, [...MEMBERS, ...NON_MEMBERS]);
+  });
+
+  it("getPOIMerkleProofs client-PIR path leaks no BC bytes", async () => {
+    const response = fixture.responsesByIdx.get(0)!;
     server.route(
-      (req) => /^\/v1\/instance\/[^/]+\/(query|batch)$/.test(req.url ?? ""),
-      (req, _body, res) => {
-        if ((req.url ?? "").endsWith("/batch")) {
-          const r = responses[cursor % responses.length];
-          cursor += 1;
-          writeBinary(res, encodeBatchResponseNodes(new Array<Uint8Array>(16).fill(r)));
-          return true;
-        }
-        const r = responses[cursor % responses.length];
-        cursor += 1;
-        writeBinary(res, r);
+      (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
+      (_req, body, res) => {
+        writeBinary(
+          res,
+          encodeBatchResponseNodes(new Array<Uint8Array>(encodedBatchCount(body)).fill(response)),
+        );
         return true;
       },
     );
+    const client = sdk();
+    await client.getPOIMerkleProofs(fixture.meta.list_key_hex, MEMBERS).catch(() => undefined);
 
-    const { ctxs, bcMaps } = makeMaps(fixture, ctx);
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: true,
-      clientPirContexts: ctxs,
-      bcToIdxMaps: bcMaps,
-    });
-
-    const queriedBcs = fixture.meta.target_indices.map((idx) => fixture.meta.bcs_hex[idx]);
-    try {
-      await sdk.getPOIsPerList(
-        [fixture.meta.list_key_hex],
-        queriedBcs.map((bc) => ({ blindedCommitment: bc, type: "Shield" as const })),
-      );
-    } catch {
-    }
+    // The K rows for one block travel as ONE padded batch: `assertNoCommitmentsInPirRequests`
+    // compares this against the count encoded in the request body, and `toHaveLength(1)` pins
+    // that there is a single request, so a regression to one batch per commitment reds both.
+    const expectedQueryCount = paddedBatchLength(MEMBERS.length);
     expect(
-      assertNoCommitmentsInPirRequests(sdk.lastWireRequests(), queriedBcs, {
-        expectedQueryCount: 8,
-      }),
+      assertNoCommitmentsInPirRequests(client.lastWireRequests(), MEMBERS, { expectedQueryCount }),
     ).toHaveLength(1);
     expect(
-      assertNoCommitmentsInPirRequests(server.requests, queriedBcs, {
-        expectedQueryCount: 8,
-      }),
+      assertNoCommitmentsInPirRequests(server.requests, MEMBERS, { expectedQueryCount }),
     ).toHaveLength(1);
     const sessionOnly = server.requests.filter((request) => request.url.endsWith("/session"));
     expect(sessionOnly).toHaveLength(1);
     expect(() =>
-      assertNoCommitmentsInPirRequests(sessionOnly, queriedBcs, {
-        expectedQueryCount: 8,
-      }),
-    ).toThrow(/selected no POST query\/batch\/fanout requests/);
+      assertNoCommitmentsInPirRequests(sessionOnly, MEMBERS, { expectedQueryCount }),
+    ).toThrow(/selected no POST query\/batch requests/);
   });
 
-  it("getPOIMerkleProofs client-PIR path leaks no BC bytes", async () => {
-    const responses = Array.from(fixture.responsesByIdx.values());
-    let cursor = 0;
-    server.route(
-      (req) => /^\/v1\/instance\/[^/]+\/(query|batch)$/.test(req.url ?? ""),
-      (req, _body, res) => {
-        if ((req.url ?? "").endsWith("/batch")) {
-          const r = responses[cursor % responses.length];
-          cursor += 1;
-          writeBinary(res, encodeBatchResponseNodes(new Array<Uint8Array>(16).fill(r)));
-          return true;
-        }
-        const r = responses[cursor % responses.length];
-        cursor += 1;
-        writeBinary(res, r);
-        return true;
-      },
+  // What the node sees of a status call must not reveal how many asked commitments are members.
+  it("status requests are the same whatever share of the asked commitments are members", async () => {
+    const seen = async (asked: string[]): Promise<string[]> => {
+      server.reset();
+      const client = sdk();
+      await client.getPOIsPerList(
+        [fixture.meta.list_key_hex],
+        asked.map((bc) => ({ blindedCommitment: bc, type: "Shield" as const })),
+      );
+      return server.requests.map((r) => `${r.method} ${r.url} ${r.body.length}`);
+    };
+    const none = await seen(NON_MEMBERS);
+    const three = await seen([...MEMBERS.slice(0, 3), ...NON_MEMBERS]);
+    expect(three, "same N, different M must look the same or the requests are an oracle").toEqual(
+      none,
     );
-
-    const { ctxs, bcMaps } = makeMaps(fixture, ctx);
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: true,
-      clientPirContexts: ctxs,
-      bcToIdxMaps: bcMaps,
-    });
-
-    const queriedBcs = fixture.meta.target_indices.map((idx) => fixture.meta.bcs_hex[idx]);
-    try {
-      await sdk.getPOIMerkleProofs(fixture.meta.list_key_hex, queriedBcs);
-    } catch {
-    }
-    // One 512 B path-10 row replaced sixteen 32 B node reads, and the K rows for one block now
-    // travel as ONE padded batch. The detection is below, not here: `assertNoCommitmentsInPirRequests`
-    // compares this against the count encoded in the request body, and `toHaveLength(1)` pins that
-    // there is a single request. A regression to one batch per commitment reds both. (An earlier
-    // version added an `expect(expectedQueryCount).toBeGreaterThan(1)` guard here and claimed it
-    // caught the regression -- it could not: the value is computed from the ladder alone and never
-    // observes the SDK, so it reduced to `expect(8).toBeGreaterThan(1)`.)
-    const expectedQueryCount = paddedBatchLength(queriedBcs.length);
-    expect(
-      assertNoCommitmentsInPirRequests(sdk.lastWireRequests(), queriedBcs, {
-        expectedQueryCount,
-      }),
-    ).toHaveLength(1);
-    expect(
-      assertNoCommitmentsInPirRequests(server.requests, queriedBcs, {
-        expectedQueryCount,
-      }),
-    ).toHaveLength(1);
   });
-
-  it("getMerkleProof (T3 commit-tree) client-PIR path leaks no BC bytes", async () => {
-    const responses = Array.from(fixture.responsesByIdx.values());
-    let cursor = 0;
-    server.route(
-      (req) => /^\/v1\/instance\/[^/]+\/(query|batch)$/.test(req.url ?? ""),
-      (req, _body, res) => {
-        if ((req.url ?? "").endsWith("/batch")) {
-          const r = responses[cursor % responses.length];
-          cursor += 1;
-          writeBinary(res, encodeBatchResponseNodes(new Array<Uint8Array>(16).fill(r)));
-          return true;
-        }
-        const r = responses[cursor % responses.length];
-        cursor += 1;
-        writeBinary(res, r);
-        return true;
-      },
-    );
-
-    const { ctxs } = makeMaps(fixture, ctx);
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: true,
-      clientPirContexts: ctxs,
-    });
-
-    // T3 keys on (treeNumber, leafIndex); assert the leaf index never serializes into the wire body.
-    try {
-      await sdk.getMerkleProof(0, 1234);
-    } catch {
-    }
-
-    const inspected = inspectPirDataPosts(sdk.lastWireRequests(), {
-      // T3 commit-tree still reads sixteen 32 B nodes; only the T2 list path became one row.
-      expectedQueryCount: 16,
-    });
-    expect(inspected).toHaveLength(1);
-    const ascii = new TextEncoder().encode("1234");
-    const raw = new Uint8Array([0xd2, 0x04, 0x00, 0x00]); // 1234 LE u32
-    for (const { request: w } of inspected) {
-      expect(
-        containsByteSequence(w.body, raw),
-        `body for ${w.url} contains raw u32 LE leafIndex`,
-      ).toBe(false);
-      expect(
-        containsByteSequence(w.body, ascii),
-        `body for ${w.url} contains ASCII leafIndex`,
-      ).toBe(false);
-    }
-  });
-
-  // The number of request envelopes must not reveal how many supplied
-  // commitments are members of the list.
-  it(
-    "T1 outbound request count is independent of list membership",
-    async () => {
-      const lk = fixture.meta.list_key_hex;
-      const memberBcs = fixture.meta.target_indices
-        .slice(0, 3)
-        .map((idx) => fixture.meta.bcs_hex[idx]);
-      const nonMemberBcs = ["77".repeat(32), "88".repeat(32), "99".repeat(32)];
-      const served = fixture.meta.target_indices.slice(0, 3);
-      server.route(
-        (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
-        (_req, body, res) => {
-          const responses = fixtureResponsesFor(
-            fixture,
-            body,
-            fixture.responsesByIdx.get(served[0])!,
-          );
-          writeBinary(res, encodeBatchResponseNodes(responses));
-          return true;
-        },
-      );
-
-      const countQueries = (sdk: RavenPOINodeInterface): number =>
-        sdk.lastWireRequests().filter((r) => r.url.includes("/v1/instance/")).length;
-
-      const { ctxs, bcMaps } = makeMaps(fixture, ctx);
-      const sdk0 = new RavenPOINodeInterface({
-        endpoint: server.url,
-        bearerToken: TOKEN,
-        useClientPir: true,
-        clientPirContexts: ctxs,
-        bcToIdxMaps: bcMaps,
-        indexStalenessPolicy: "answer-at-index-rows",
-      });
-      await sdk0.getPOIsPerList(
-        [lk],
-        nonMemberBcs.map((bc) => ({ blindedCommitment: bc, type: "Shield" as const })),
-      );
-      const countZeroMembers = countQueries(sdk0);
-      expect(encodedBatchCount(sdk0.lastWireRequests()[0].body)).toBe(1);
-
-      const sdk3 = new RavenPOINodeInterface({
-        endpoint: server.url,
-        bearerToken: TOKEN,
-        useClientPir: true,
-        clientPirContexts: ctxs,
-        bcToIdxMaps: bcMaps,
-        indexStalenessPolicy: "answer-at-index-rows",
-      });
-      await sdk3.getPOIsPerList(
-        [lk],
-        [...memberBcs, ...nonMemberBcs].map((bc) => ({
-          blindedCommitment: bc,
-          type: "Shield" as const,
-        })),
-      );
-      const countThreeMembers = countQueries(sdk3);
-      expect(encodedBatchCount(sdk3.lastWireRequests()[0].body)).toBe(4);
-
-      expect(
-        countThreeMembers,
-        "same N, different M must produce the same request count or the count is an oracle",
-      ).toBe(countZeroMembers);
-    },
-  );
 
   it("privacy assertion refuses empty and malformed request sets", () => {
     expect(() =>
       assertNoCommitmentsInPirRequests([], ["11".repeat(32)], {
         expectedQueryCount: 1,
       }),
-    ).toThrow(/selected no POST query\/batch\/fanout requests/);
+    ).toThrow(/selected no POST query\/batch requests/);
 
     const shortBatch = new Uint8Array(9);
     shortBatch.set(EXPECTED_WIRE_SCHEMA_PREFIX);
@@ -344,68 +174,21 @@ describe("privacy across every SDK call path", () => {
     ).toThrow(/payload bytes do not divide/);
   });
 
-  it("bc-to-idx-map publishing channel emits GETs with no body", async () => {
-    server.route(
-      (req) => req.url?.endsWith("/bc-to-idx-map") ?? false,
-      (_req, _body, res) => {
-        writeJson(res, {
-          epoch: 1,
-          listKey: fixture.meta.list_key_hex,
-          entries: [],
-        });
-        return true;
-      },
-    );
+  it("the index channel emits GETs with no body", async () => {
     mountPrefixChannel(server, fixture.meta.list_key_hex, { commitments: [] });
-    const sdk = new RavenPOINodeInterface({
+    const client = new RavenPOINodeInterface({
       endpoint: server.url,
       bearerToken: TOKEN,
-      useClientPir: true,
+      poiListIndexStore: false,
     });
-    await sdk.fetchBcToIdxMap(fixture.meta.list_key_hex);
-    const wires = sdk.lastWireRequests();
-    // The prefix channel the map is checked against, read first, then the map.
+    await client.syncPoiListIndex(fixture.meta.list_key_hex);
+    const wires = client.lastWireRequests();
     expect(wires.map((w) => w.url.replace(/^.*\/v1\/poi\/[0-9a-f]+\//, ""))).toStrictEqual([
       "bc-prefixes?since=0",
-      "bc-to-idx-map",
     ]);
     for (const wire of wires) {
       expect(wire.method).toBe("GET");
       expect(wire.body.length).toBe(0);
     }
-  });
-
-  it("status-header publishing channel emits a GET with no body", async () => {
-    server.route(
-      (req) => req.url?.endsWith("/status-header") ?? false,
-      (_req, _body, res) => {
-        writeJson(res, {
-          epoch: 1,
-          listKey: fixture.meta.list_key_hex,
-          blockedBcs: [],
-          pendingBcs: [],
-        });
-        return true;
-      },
-    );
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: true,
-    });
-    const result = (await sdk.fetchStatusHeader(fixture.meta.list_key_hex)) as unknown as {
-      epoch: number;
-      listKey: string;
-      blockedBcs: string[];
-      pendingBcs: string[];
-    };
-    // SDK must return upstream camelCase keys verbatim, never translate to snake_case.
-    expect(result.epoch).toBe(1);
-    expect(result.listKey).toBe(fixture.meta.list_key_hex);
-    expect(Array.isArray(result.blockedBcs)).toBe(true);
-    expect(Array.isArray(result.pendingBcs)).toBe(true);
-    const wires = sdk.lastWireRequests();
-    expect(wires.length).toBe(1);
-    expect(wires[0].method).toBe("GET");
   });
 });

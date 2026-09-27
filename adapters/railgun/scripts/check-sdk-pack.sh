@@ -16,7 +16,8 @@
 #      `--all` reports it.
 #
 # Everything here is offline. The one registry dependency is packed out of the SDK's own
-# installed tree, so no network call is made and no registry credential is needed.
+# installed tree, and the required engine peer is met by a stand-in, so no network call is made
+# and no registry credential is needed. check-sdk-engine-singleton.sh installs the real engine.
 #
 # Overrides, both used by check-sdk-pack-selftest.sh:
 #   SDK_PACK_PACKAGE_DIR  package to pack (default: the real SDK)
@@ -111,10 +112,22 @@ poseidon_dir="${PKG}/node_modules/@railgun-community/poseidon-hash-wasm"
 poseidon_tgz="${WORK}/tar/$( cd "$PKG" && npm pack --json --ignore-scripts --pack-destination "${WORK}/tar" "$poseidon_dir" 2>/dev/null | packed_filename )"
 [[ -f "$poseidon_tgz" ]] || fail "could not pack the poseidon dependency for an offline consumer install"
 
+# A wallet already holds engine, which the SDK names as a required peer. The stand-in carries the
+# version the SDK is typed against and throws if loaded, so the runtime probes below also prove
+# the SDK never loads engine: it uses engine's types alone.
+engine_version="$(node -p 'require(process.argv[1]).devDependencies["@railgun-community/engine"]' "${PKG}/package.json")" || exit 3
+engine_dir="${WORK}/engine-stand-in"
+rm -rf "$engine_dir"
+mkdir -p "$engine_dir"
+printf '{"name":"@railgun-community/engine","version":"%s","main":"index.js"}\n' "$engine_version" > "${engine_dir}/package.json"
+printf 'throw new Error("the SDK loaded @railgun-community/engine at runtime");\n' > "${engine_dir}/index.js"
+engine_tgz="${WORK}/tar/$( cd "$PKG" && npm pack --json --ignore-scripts --pack-destination "${WORK}/tar" "$engine_dir" 2>/dev/null | packed_filename )"
+[[ -f "$engine_tgz" ]] || fail "could not pack the engine stand-in for an offline consumer install"
+
 install_consumer() { # dir module-type
   local dir="$1" type="$2"
   printf '{"name":"raven-%s-consumer","private":true,"version":"0.0.0","type":"%s"}\n' "$type" "$type" > "${dir}/package.json"
-  ( cd "$dir" && npm install --offline --no-audit --no-fund "$tarball" "$poseidon_tgz" ) >"${dir}/install.log" 2>&1 \
+  ( cd "$dir" && npm install --offline --no-audit --no-fund "$tarball" "$poseidon_tgz" "$engine_tgz" ) >"${dir}/install.log" 2>&1 \
     || { cat "${dir}/install.log" >&2; fail "${type}-consumer: offline install of the tarball failed"; }
   ( cd "$dir" && npm ls --all ) >"${dir}/npm-ls.txt" 2>&1 \
     || { cat "${dir}/npm-ls.txt" >&2; fail "dependency-tree (${type}): npm ls --all finds the installed tree invalid"; }

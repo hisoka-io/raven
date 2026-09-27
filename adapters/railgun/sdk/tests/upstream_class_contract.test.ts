@@ -1,7 +1,12 @@
 import type { POI, POINodeInterface, TXOPOIListStatus } from "@railgun-community/engine";
 import { describe, expect, expectTypeOf, it } from "vitest";
 
-import { ChainRegistry, RavenPOINodeInterface } from "../src/index";
+import {
+  ChainRegistry,
+  PerChainPOINodeInterface,
+  RavenError,
+  RavenPOINodeInterface,
+} from "../src/index";
 
 // Engine consumers compile with skipLibCheck, where a declaration that fails to resolve becomes an
 // error type: it behaves as `any` and silences every check built on it, `expectTypeOf` included.
@@ -53,7 +58,6 @@ describe("upstream POINodeInterface class contract", () => {
     const raven = new RavenPOINodeInterface({
       endpoint: "https://raven.invalid",
       bearerToken: "contract-test-token-long-enough",
-      useClientPir: false,
     });
     const x: POINodeInterface = raven;
     const injected: Parameters<typeof POI.init>[1] = raven;
@@ -62,8 +66,24 @@ describe("upstream POINodeInterface class contract", () => {
     expect(raven.isActive({ type: 0, id: 1 })).toBe(true);
     expect(raven.isActive({ type: 1, id: 1 })).toBe(false);
     await expect(raven.isRequired({ type: 0, id: 1 })).resolves.toBe(true);
-    await expect(raven.isRequired({ type: 0, id: 2 })).resolves.toBe(false);
+    // Engine reads `false` as every balance bucket spendable, so a chain it does not serve is
+    // refused rather than answered.
+    await expect(raven.isRequired({ type: 0, id: 2 })).rejects.toSatisfy(
+      (error: unknown) =>
+        RavenError.is(error, "InvalidQuery") && /not served by this interface/.test(String(error)),
+    );
+    await expect(raven.isRequired({ type: 1, id: 1 })).rejects.toSatisfy((error: unknown) =>
+      RavenError.is(error, "InvalidQuery"),
+    );
     expectTypeOf(raven).toMatchTypeOf<POINodeInterface>();
+  });
+
+  it("installs the per-chain router through the same seam", () => {
+    const raven = new RavenPOINodeInterface({ endpoint: "https://raven.invalid" });
+    const router = new PerChainPOINodeInterface(raven, [raven]);
+    const injected: Parameters<typeof POI.init>[1] = router;
+    expect(injected).toBe(router);
+    expectTypeOf(router).toMatchTypeOf<POINodeInterface>();
   });
 
   it("checks against engine's declaration, not an `any` it degraded to", () => {
@@ -80,10 +100,9 @@ describe("upstream POINodeInterface class contract", () => {
     const raven = new RavenPOINodeInterface({
       endpoint: "https://raven.invalid",
       bearerToken: "contract-test-token-long-enough",
-      useClientPir: false,
     });
     await expect(
-      raven.getPOIsPerList("V3_PoseidonMerkle", { type: 0, id: 1 }, [], []),
+      raven.getPOIMerkleProofs("V3_PoseidonMerkle", { type: 0, id: 1 }, "00".repeat(32), []),
     ).rejects.toThrow(/txidVersion/);
     await expect(
       raven.getPOIMerkleProofs("V2_PoseidonMerkle", { type: 0, id: 2 }, "00".repeat(32), []),
@@ -108,7 +127,6 @@ describe("upstream POINodeInterface class contract", () => {
       bearerToken: "contract-test-token-long-enough",
       chainId: 1,
       chainRegistry: registry,
-      useClientPir: false,
     });
 
     expect(raven.isActive({ type: 0, id: 137 })).toBe(false);

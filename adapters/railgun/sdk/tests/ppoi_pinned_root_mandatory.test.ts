@@ -27,6 +27,7 @@ import {
   type MockServer,
 } from "./helpers/mock_server";
 import { foldMerkleRoot } from "../src/poseidon";
+import { indexHolding } from "./helpers/prefix_channel";
 import { assertNoCommitmentsAnywhere } from "./helpers/private_wire";
 import { shardConfigBincode } from "./helpers/shard_config";
 
@@ -110,16 +111,22 @@ interface Options {
   readonly pinTailTtlMs?: number;
 }
 
+/** The list index a node publishes with this file's one note at its global index. */
+function noteIndexes(chainId: number = MAINNET): Map<string, ReturnType<typeof indexHolding>> {
+  return new Map([[`${chainId}:${LIST_KEY_HEX}`, indexHolding([[BC_HEX, GLOBAL_INDEX]])]]);
+}
+
 function makeSdk(server: MockServer, options: Options): RavenPOINodeInterface {
+  const chainId = options.chainId ?? MAINNET;
   return new RavenPOINodeInterface({
     endpoint: server.url,
     bearerToken: TOKEN,
-    useClientPir: true,
-    chainId: options.chainId ?? MAINNET,
-    clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, pathCtx(options.rows)]]),
+    chainId,
+    clientPirContexts: new Map([[`t2Path:${chainId}:${LIST_KEY_HEX}`, pathCtx(options.rows)]]),
     clientPirInstanceLabels: new Map(options.labels ?? []),
     ppoiPinnedRoots: new Map(options.pinnedRoots ?? []),
-    bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX, GLOBAL_INDEX]])]]),
+    poiListIndexes: noteIndexes(chainId),
+    poiListIndexStore: false,
     ...(options.pinUpstream === undefined ? {} : { pinUpstream: options.pinUpstream }),
     ...(options.pinTailTtlMs === undefined ? {} : { pinTailTtlMs: options.pinTailTtlMs }),
   });
@@ -167,19 +174,20 @@ describe("the PPOI path-10 pinned root is mandatory and chain-scoped", () => {
     await expectRejectsWith(sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]), "InvalidQuery");
   });
 
-  it("refuses when the routing label is chain-less and no root is pinned", async () => {
+  // A label keyed without the chain names no instance: there is no key ladder to fall back on.
+  it("refuses a block label keyed without the chain, before any query", async () => {
     mountRowRoute(server, nodes);
     const sdk = makeSdk(server, {
       labels: [[`t2Path:${LIST_KEY_HEX}:${BLOCK}`, "ppoi-paths-ofac-1"]],
       pinnedRoots: [],
     });
     await expectRejectsWith(sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]), "InvalidQuery");
+    expect(server.requests.some((request) => request.url.endsWith("/batch"))).toBe(false);
   });
 
-  // No label registered at all still folds a server-supplied path: the absence of a
-  // label is not evidence that the root is trustworthy. Unlabelled, the list's one instance
-  // is asked at the list index, so it must hold rows past block 0 for the fold to be reached.
-  it("refuses when no label is registered and no root is pinned", async () => {
+  // A forest has no whole-list path instance, so a block with no label is refused by name
+  // rather than asked of an instance that holds some other block's rows.
+  it("refuses a block with no label, naming the label it needs", async () => {
     mountRowRoute(server, nodes);
     const sdk = makeSdk(server, {
       labels: [],
@@ -193,10 +201,10 @@ describe("the PPOI path-10 pinned root is mandatory and chain-scoped", () => {
       thrown = e;
     }
     expect(RavenError.is(thrown, "InvalidQuery"), `got ${String(thrown)}`).toBe(true);
-    expect(String((thrown as Error).message)).toContain(`no pinned root for ${LIST_KEY_HEX}:1`);
-    expect(server.requests.map((request) => request.url)).toContain(
-      `/v1/instance/t2Path-${LIST_KEY_HEX}/batch`,
+    expect(String((thrown as Error).message)).toContain(
+      `t2Path:${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`,
     );
+    expect(server.requests.some((request) => request.url.endsWith("/batch"))).toBe(false);
   });
 
   it("accepts a root pinned under the chain-aware key", async () => {
@@ -223,14 +231,13 @@ describe("the PPOI path-10 pinned root is mandatory and chain-scoped", () => {
     await expectRejectsWith(sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]), "InvalidQuery");
   });
 
-  it("accepts a root pinned under the legacy chain-less key", async () => {
+  it("does not read a root pinned under a key without the chain", async () => {
     mountRowRoute(server, nodes);
     const sdk = makeSdk(server, {
       labels: [[`t2Path:${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, "ppoi-paths-ofac-1"]],
       pinnedRoots: [[`${LIST_KEY_HEX}:${BLOCK}`, trueRoot]],
     });
-    const [proof] = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
-    expect(proof.root).toBe(trueRoot);
+    await expectRejectsWith(sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]), "InvalidQuery");
   });
 
   // Forged siblings: the server swaps one level and the fold lands somewhere else.
@@ -603,11 +610,10 @@ describe("an unpinned PPOI path-10 fold is verified against the upstream aggrega
       new RavenPOINodeInterface({
         endpoint: adapter.url,
         bearerToken: TOKEN,
-        useClientPir: true,
         upstreamFallbackEndpoint: upstream.url,
         pinTailTtlMs: -1,
-        clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, pathCtx()]]),
-        bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX, GLOBAL_INDEX]])]]),
+        clientPirContexts: new Map([[`t2Path:${MAINNET}:${LIST_KEY_HEX}`, pathCtx()]]),
+        poiListIndexes: noteIndexes(),
       });
     } catch (e) {
       thrown = e;
@@ -714,21 +720,21 @@ describe("an unpinned PPOI path-10 fold is verified against the upstream aggrega
     expect(String((thrown as Error).message)).toContain("not among the 0 root(s)");
   });
 
-  // `upstreamFallbackEndpoint` is also the passthrough target, where one process serving
-  // both roles is legitimate, so an INHERITED pin source aimed at this node cannot fail
+  // `upstreamFallbackEndpoint` is also the submission target, where one process serving both
+  // roles is legitimate, so an INHERITED pin source aimed at this node cannot fail
   // construction. It goes inert instead, and the fold-time refusal says why.
   it("stays inert, not fatal, when the inherited pin source is this node", async () => {
     mountRowRoute(adapter, nodes);
     const sdk = new RavenPOINodeInterface({
       endpoint: adapter.url,
       bearerToken: TOKEN,
-      useClientPir: true,
       upstreamFallbackEndpoint: adapter.url,
-      clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, pathCtx()]]),
+      clientPirContexts: new Map([[`t2Path:${MAINNET}:${LIST_KEY_HEX}`, pathCtx()]]),
       clientPirInstanceLabels: new Map([
         [`t2Path:${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, "ppoi-paths-ofac-1"],
       ]),
-      bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX, GLOBAL_INDEX]])]]),
+      poiListIndexes: noteIndexes(),
+      poiListIndexStore: false,
     });
     let thrown: unknown;
     try {

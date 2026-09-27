@@ -4,8 +4,8 @@
  *
  * The known commitment sits at the last leaf of block 0 of the OFAC list. That block is full, so
  * its commitment, its path and its root can never change; the harness still re-reads the event
- * from upstream and refuses if it moved. The unlisted commitment is there because the status tier
- * serves membership: a member reads Valid and anything else reads Missing, so a smoke over one
+ * from upstream and refuses if it moved. The unlisted commitment is there because status is read
+ * from the list's index: a member reads Valid and anything else reads Missing, so a smoke over one
  * member could only ever see one value and would prove nothing about status.
  *
  * Bytes are HTTP body bytes in each direction; headers and TLS are not counted.
@@ -16,7 +16,6 @@ import { readFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 
 import {
-  ImtCache,
   LEAVES_PER_PPOI_BLOCK,
   RavenError,
   RavenPOINodeInterface,
@@ -71,8 +70,8 @@ export const UNLISTED_BC = (() => {
 })();
 
 export const MEMBERSHIP_STATEMENT =
-  "The status tier answers list membership: Valid for a member, Missing otherwise. " +
-  "ShieldBlocked and ProofSubmitted describe commitments with no list index, which it cannot express.";
+  "Status is read on the device from the list's index: Valid for a member, Missing otherwise. " +
+  "ShieldBlocked is never answered, and ProofSubmitted only for this device's own submissions.";
 
 type Party = "node" | "aggregator" | "other";
 
@@ -127,11 +126,9 @@ export interface PpoiSmokeReport {
   readonly index: {
     readonly total: number;
     readonly candidates: readonly number[];
-    /** Empty on an honest node. A prefix twin puts a row here and costs the refusal a PIR query. */
+    /** Empty on an honest node. A prefix twin puts a row here and reads the unlisted one Valid. */
     readonly unlistedCandidates: readonly number[];
   };
-  readonly statusHeader: { readonly blocked: number; readonly pending: number };
-  readonly jsonIndex: { readonly served: false } | { readonly served: true; readonly rows: number };
   readonly phases: readonly PhaseTotals[];
   readonly totals: Readonly<Record<Party, { requests: number; up: number; down: number }>>;
   /** Responses that arrived content-encoded; nonzero means `down` is above the wire figure. */
@@ -143,7 +140,6 @@ export interface PpoiSmokeOptions {
   readonly node: string;
   readonly aggregator: string;
   readonly wasm: RavenInspireWasm;
-  readonly statusInstance: string;
   readonly pathInstanceForBlock: (block: number) => string;
   readonly fetchImpl?: typeof fetch;
   readonly chainId?: number;
@@ -168,8 +164,6 @@ export type SmokeSdk = Pick<
   RavenPOINodeInterface,
   | "syncPoiListIndex"
   | "poiListIndexCandidates"
-  | "fetchStatusHeader"
-  | "fetchBcToIdxMap"
   | "getPOIsPerList"
   | "getPOIMerkleProofs"
 >;
@@ -199,7 +193,7 @@ function routeOf(party: Party, url: string, body: Uint8Array): string {
     }
   }
   const path = new URL(url).pathname;
-  const match = /\/(params|session|batch|query|fanout|bc-prefixes|bc-to-idx-map|status-header)$/.exec(path);
+  const match = /\/(params|session|batch|query|bc-prefixes)$/.exec(path);
   return match ? match[1] : path;
 }
 
@@ -432,10 +426,7 @@ export async function runPpoiSmoke(options: PpoiSmokeOptions): Promise<PpoiSmoke
   const started = performance.now();
 
   const pathInstance = options.pathInstanceForBlock(block);
-  const { status: statusLoad, path: pathLoad } = await phase("params", async () => ({
-    status: await loadContext(meter, options, options.statusInstance),
-    path: await loadContext(meter, options, pathInstance),
-  }));
+  const pathLoad = await phase("params", () => loadContext(meter, options, pathInstance));
 
   const event = await phase("oracle-event", () => oracleEventAt(meter, options.aggregator, chainId));
   const listed = { blindedCommitment: event.spelling, type: event.type };
@@ -453,20 +444,12 @@ export async function runPpoiSmoke(options: PpoiSmokeOptions): Promise<PpoiSmoke
   const real = new RavenPOINodeInterface({
     endpoint: options.node,
     chainId,
-    useClientPir: true,
-    clientPirContexts: new Map([
-      [`t1Status:${chainId}:${OFAC_LIST_KEY}`, statusLoad.context],
-      [`t2Path:${chainId}:${OFAC_LIST_KEY}`, pathLoad.context],
-    ]),
-    clientPirInstanceLabels: new Map([
-      [`t1Status:${chainId}:${OFAC_LIST_KEY}`, options.statusInstance],
-      [`t2Path:${chainId}:${OFAC_LIST_KEY}:${block}`, pathInstance],
-    ]),
+    clientPirContexts: new Map([[`t2Path:${chainId}:${OFAC_LIST_KEY}`, pathLoad.context]]),
+    clientPirInstanceLabels: new Map([[`t2Path:${chainId}:${OFAC_LIST_KEY}:${block}`, pathInstance]]),
     pinUpstream: options.aggregator,
     ppoiPinnedRoots: options.sdkPinnedRoots === undefined ? undefined : new Map(options.sdkPinnedRoots),
     bearerToken: options.bearerToken,
     poiListIndexStore: false,
-    imtCache: new ImtCache({ disableIndexedDb: true }),
     fetchImpl: meter.fetch,
   });
   const sdk: SmokeSdk = options.wrapSdk?.(real, meter.fetch) ?? real;
@@ -488,28 +471,6 @@ export async function runPpoiSmoke(options: PpoiSmokeOptions): Promise<PpoiSmoke
     );
   }
 
-  const header = await phase("status-header", () => sdk.fetchStatusHeader(OFAC_LIST_KEY));
-  if (normalize(header.listKey) !== OFAC_LIST_KEY) {
-    throw new Error(`status-header: answered for list ${header.listKey}`);
-  }
-
-  const jsonIndex = await phase("json-index", async (): Promise<PpoiSmokeReport["jsonIndex"]> => {
-    let body;
-    try {
-      body = await sdk.fetchBcToIdxMap(OFAC_LIST_KEY);
-    } catch (e) {
-      if (RavenError.is(e, "ServerError") && e.context.status === 404) return { served: false };
-      throw e;
-    }
-    const row = body.entries[KNOWN_INDEX];
-    if (row === undefined || normalize(row.bc) !== KNOWN_BC) {
-      throw new Error(
-        `bc-to-idx-map: row ${KNOWN_INDEX} of ${body.rows} is ${row?.bc}, upstream says ${KNOWN_BC}`,
-      );
-    }
-    return { served: true, rows: body.rows };
-  });
-
   const verdicts = (await phase("status", () =>
     sdk.getPOIsPerList(TXID_VERSION, chain, [OFAC_LIST_KEY], [listed, unlisted]),
   )) as Record<string, Record<string, string> | undefined>;
@@ -519,6 +480,15 @@ export async function runPpoiSmoke(options: PpoiSmokeOptions): Promise<PpoiSmoke
     throw new Error(
       `status: the node answers listed=${nodeListed} unlisted=${nodeUnlisted}, ` +
         `upstream answers listed=${oracleListed} unlisted=${oracleUnlisted}`,
+    );
+  }
+  const statusQueries = meter.log.filter(
+    (r) => r.phase === "status" && r.party === "node" && r.route !== "bc-prefixes",
+  );
+  if (statusQueries.length !== 0) {
+    throw new Error(
+      `status: the SDK sent ${statusQueries.map((r) => r.route).join(", ")} to the node; status ` +
+        "is read from the index alone",
     );
   }
 
@@ -622,7 +592,7 @@ export async function runPpoiSmoke(options: PpoiSmokeOptions): Promise<PpoiSmoke
     knownBc: KNOWN_BC,
     unlistedBc: UNLISTED_BC,
     membership: MEMBERSHIP_STATEMENT,
-    params: { [options.statusInstance]: statusLoad.summary, [pathInstance]: pathLoad.summary },
+    params: { [pathInstance]: pathLoad.summary },
     status: {
       listed: { node: nodeListed, oracle: oracleListed },
       unlisted: { node: nodeUnlisted ?? "", oracle: oracleUnlisted },
@@ -638,8 +608,6 @@ export async function runPpoiSmoke(options: PpoiSmokeOptions): Promise<PpoiSmoke
         `(${resolved.window.frozen ? "frozen" : "filling"})`,
     },
     index,
-    statusHeader: { blocked: header.blockedBcs.length, pending: header.pendingBcs.length },
-    jsonIndex,
     phases: totalsByPhase(meter.log, phaseMs),
     totals,
     encodedResponses: meter.log.filter((r) => r.encoding !== null && r.encoding !== "identity").length,

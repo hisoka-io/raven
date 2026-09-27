@@ -16,6 +16,7 @@ const manifest = JSON.parse(readFileSync(resolve(sdkRoot, "package.json"), "utf8
   readonly dependencies?: DependencyMap;
   readonly optionalDependencies?: DependencyMap;
   readonly peerDependencies?: DependencyMap;
+  readonly peerDependenciesMeta?: Readonly<Record<string, Readonly<{ optional?: boolean }>>>;
   readonly devDependencies?: DependencyMap;
   readonly bundleDependencies?: readonly string[] | boolean;
   readonly bundledDependencies?: readonly string[] | boolean;
@@ -118,6 +119,11 @@ describe("published package manifest", () => {
     }
     const peer = manifest.peerDependencies?.[ENGINE] ?? "";
     expect(validRange(peer), `engine peer range ${peer}`).not.toBeNull();
+    // The published declarations name engine's types, so a consumer without engine would get
+    // declarations that resolve to nothing; the peer is required, never optional.
+    expect(manifest.peerDependenciesMeta?.[ENGINE]?.optional, "engine is an optional peer").not.toBe(
+      true,
+    );
     // A prerelease satisfies only a range naming its own major.minor.patch: `^9.6.0` excludes it.
     expect(satisfies(WALLET_ENGINE_PIN, peer), `${peer} admits ${WALLET_ENGINE_PIN}`).toBe(true);
     const typedAgainst = manifest.devDependencies?.[ENGINE] ?? "";

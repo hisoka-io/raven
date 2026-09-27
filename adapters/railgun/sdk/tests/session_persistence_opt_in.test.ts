@@ -8,7 +8,7 @@ import { idbClear, loadClientPirContext } from "../src/index";
 import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
 import type { RavenInspireClientSession, RavenInspireWasm } from "../src/index";
 
-const INSTANCE_ID = "t1Status-persistence";
+const INSTANCE_ID = "ppoi-paths-persistence";
 const CRS = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
 const SESSION_BLOB = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
 
@@ -35,7 +35,6 @@ function spyWasm(): PersistenceSpy {
       extract_response: () => new Uint8Array(32),
       build_instance_params_blob: () => new Uint8Array([9, 9]),
       register_client_session: makeRegisterSpy(),
-      path_indices_for_leaf: () => new Uint32Array(16),
       path_indices_for_per_list_leaf: () => new Uint32Array(16),
       serialize_client_session: () => {
         spy.serializeCalls += 1;

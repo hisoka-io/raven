@@ -15,7 +15,6 @@ import {
 import {
   commitmentAt,
   mountPrefixChannel,
-  mountStatusRows,
   prefixIndexOf,
   targetNamingCtx,
   type MockList,
@@ -24,7 +23,6 @@ import { startMockServer, type MockServer } from "./helpers/mock_server";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX = "ab".repeat(32);
-const SHIELD_BLOCKED = 1;
 
 class MemoryStore implements PoiListIndexStore {
   readonly records = new Map<string, Uint8Array>();
@@ -72,8 +70,7 @@ describe("a list index survives a restart", () => {
     return new RavenPOINodeInterface({
       endpoint: server.url,
       bearerToken: TOKEN,
-      useClientPir: true,
-      clientPirContexts: new Map([[`t1Status:${LIST_KEY_HEX}`, targetNamingCtx()]]),
+      clientPirContexts: new Map([[`t2Path:1:${LIST_KEY_HEX}`, targetNamingCtx()]]),
       poiListIndexStore: store,
       fetchImpl,
     });
@@ -118,7 +115,6 @@ describe("a list index survives a restart", () => {
   it("answers concurrent status calls on a restarted client from the stored index's tail", async () => {
     const list = listOf(2_050);
     mountPrefixChannel(server, LIST_KEY_HEX, list);
-    mountStatusRows(server, list, () => SHIELD_BLOCKED);
     const store = new MemoryStore();
     await client(store).syncPoiListIndex(LIST_KEY_HEX);
     server.requests.length = 0;
@@ -130,8 +126,8 @@ describe("a list index survives a restart", () => {
 
     expect(settled.map((r) => r.status)).toStrictEqual(["fulfilled", "fulfilled"]);
     const [first, second] = settled.map((r) => (r.status === "fulfilled" ? r.value : {}));
-    expect(first[commitmentAt(1)]?.[LIST_KEY_HEX]).toBe("ShieldBlocked");
-    expect(second[commitmentAt(2_049)]?.[LIST_KEY_HEX]).toBe("ShieldBlocked");
+    expect(first[commitmentAt(1)]?.[LIST_KEY_HEX]).toBe("Valid");
+    expect(second[commitmentAt(2_049)]?.[LIST_KEY_HEX]).toBe("Valid");
     expect(
       server.requests.filter((r) => r.url.includes("/bc-prefixes")).map((r) => r.url),
     ).toStrictEqual([
@@ -143,7 +139,6 @@ describe("a list index survives a restart", () => {
   it("resumes from the persisted cursor and catches what was appended while it was down", async () => {
     const list = listOf(2_050);
     mountPrefixChannel(server, LIST_KEY_HEX, list);
-    mountStatusRows(server, list, () => SHIELD_BLOCKED);
     const store = new MemoryStore();
     await client(store).syncPoiListIndex(LIST_KEY_HEX);
     const appended = commitmentAt(2_050);
@@ -156,7 +151,7 @@ describe("a list index survives a restart", () => {
       [{ blindedCommitment: appended, type: "Shield" }],
     );
 
-    expect(got[appended][LIST_KEY_HEX]).toBe("ShieldBlocked");
+    expect(got[appended][LIST_KEY_HEX]).toBe("Valid");
     expect(restarted.indexCounters().staleIndexesCaught).toBe(1);
     expect(
       server.requests.filter((r) => r.url.includes("/bc-prefixes")).map((r) => r.url),
@@ -172,7 +167,7 @@ describe("a list index survives a restart", () => {
     const preloaded = new RavenPOINodeInterface({
       endpoint: server.url,
       bearerToken: TOKEN,
-      poiListIndexes: new Map([[LIST_KEY_HEX, prefixIndexOf(list.commitments)]]),
+      poiListIndexes: new Map([[`1:${LIST_KEY_HEX}`, prefixIndexOf(list.commitments)]]),
       poiListIndexStore: store,
     });
     await preloaded.syncPoiListIndex(LIST_KEY_HEX);
@@ -255,11 +250,10 @@ describe("a list index survives a restart", () => {
     const restarted = new RavenPOINodeInterface({
       endpoint: server.url,
       bearerToken: TOKEN,
-      useClientPir: true,
-      clientPirContexts: new Map([[`t2Path:${LIST_KEY_HEX}`, targetNamingCtx()]]),
+      clientPirContexts: new Map([[`t2Path:1:${LIST_KEY_HEX}`, targetNamingCtx()]]),
       clientPirInstanceLabels: new Map([
-        [`t2Path:${LIST_KEY_HEX}:0`, "block0"],
-        [`t2Path:${LIST_KEY_HEX}:1`, "block1"],
+        [`t2Path:1:${LIST_KEY_HEX}:0`, "block0"],
+        [`t2Path:1:${LIST_KEY_HEX}:1`, "block1"],
       ]),
       poiListIndexStore: store,
     });

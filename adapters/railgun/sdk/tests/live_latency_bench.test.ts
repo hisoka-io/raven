@@ -18,7 +18,7 @@
  *   RAVEN_LIVE_URL
  *   RAVEN_LIVE_TOKEN           (optional; sent when set, for a node that
  *                              still gates reads)
- *   RAVEN_BENCH_INSTANCE       (default commit-tree-0)
+ *   RAVEN_BENCH_INSTANCE       (default ppoi-paths-ofac-0)
  *   RAVEN_BENCH_HOT_QUERIES    (default 10)
  *   RAVEN_BENCH_TARGET_IDX     (default 0; subsequent queries hit
  *                              targetIdx + i to spread cache misses)
@@ -46,7 +46,7 @@ const FINDINGS_DIR =
   process.env.RAVEN_BENCH_FINDINGS_DIR ??
   resolve(HERE, "..", "..", "..", "target", "bench-findings");
 
-const INSTANCE = process.env.RAVEN_BENCH_INSTANCE ?? "commit-tree-0";
+const INSTANCE = process.env.RAVEN_BENCH_INSTANCE ?? "ppoi-paths-ofac-0";
 const HOT_QUERIES = Number(process.env.RAVEN_BENCH_HOT_QUERIES ?? "10");
 const TARGET_IDX = Number(process.env.RAVEN_BENCH_TARGET_IDX ?? "0");
 

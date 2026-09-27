@@ -12,6 +12,7 @@ import {
 } from "../src/batch-ladder";
 import { RavenPOINodeInterface } from "../src/index";
 import { encodeBatchResponse, encodedBatchCount, stubCtx, TOKEN } from "./helpers/auth_path_stub";
+import { forestConfig } from "./helpers/forest";
 import { startMockServer } from "./helpers/mock_server";
 
 const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
@@ -73,14 +74,19 @@ describe("batch size ladder", () => {
     );
 
     try {
+      const bc = "5a".repeat(32);
       const sdk = new RavenPOINodeInterface({
-        endpoint: server.url,
+        ...forestConfig({
+          endpoint: server.url,
+          listKeyHex: "ab".repeat(32),
+          ctx: stubCtx(queryBytes),
+          placed: [[bc, 31_415]],
+        }),
         bearerToken: TOKEN,
-        useClientPir: true,
-        clientPirContexts: new Map([["t3CommitTree:0", stubCtx(queryBytes)]]),
       });
-      await sdk.getMerkleProof(0, 31_415);
-      const [wire] = sdk.lastWireRequests();
+      // The reply is no path row, so the call refuses; the request it sent is what is measured.
+      await sdk.getPOIMerkleProofs("ab".repeat(32), [bc]).catch(() => undefined);
+      const wire = sdk.lastWireRequests().find((request) => request.url.endsWith("/batch"))!;
       const queryCount = encodedBatchCount(wire.body);
       const frameBytes = wire.body.length - queryCount * queryBytes.length;
       const bodyCapBytes = capacityEvidence.defaultBodyCapBytes;

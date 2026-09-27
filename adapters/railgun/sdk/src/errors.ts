@@ -24,7 +24,7 @@ export interface RavenErrorContext {
 
 /** Public freshness values carried by a private stale-data refusal. */
 export interface StaleDataContext {
-  readonly operation: "t1-status" | "t2-auth-path" | "fanout";
+  readonly operation: "t2-auth-path";
   readonly lagBlocks: number;
   readonly appliedHeight: number;
   readonly epoch: number;

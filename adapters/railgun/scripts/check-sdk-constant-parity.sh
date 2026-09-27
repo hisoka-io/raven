@@ -8,11 +8,10 @@
 #   4. NODE_HASH_BYTES     sdk/src/raven-poi-node-interface.ts vs engine/src/pir_table/mod.rs
 #   5. schema envelope     sdk/src/raven-poi-node-interface.ts (stripSchemaEnvelope)
 #                          vs http/src/versioned.rs (WIRE_SCHEMA_VERSION)
-#   6. POI status bytes    sdk/src/poi-pir.ts             vs http/src/poi_shim.rs
-#   7. batch response      sdk/src/raven-poi-node-interface.ts (decodeBatchBody)
+#   6. batch response      sdk/src/raven-poi-node-interface.ts (decodeBatchBody)
 #                          vs http/src/versioned.rs (write_batch_response_versioned)
-#   8. consumer status     sdk/src/events-stream.ts          vs http/src/status.rs
-#   9. PPOI block size     sdk/src/pin-resolver.ts        vs engine/src/orchestrator.rs
+#   7. PPOI block size     sdk/src/pin-resolver.ts        vs engine/src/orchestrator.rs
+#   8. index prefix width  sdk/src/bc-prefix-index.ts     vs http/src/poi_shim.rs
 #
 # The entries above are contract FAMILIES, not checks: several expand into more than one
 # comparison, so the summary line reports a count this script computes rather than the
@@ -66,15 +65,6 @@ compare() { # label ts_val rust_val
 }
 
 norm_list() { tr -d ' ' <<<"$1"; }
-
-require_field_count() { # label table expected
-  local label="$1" table="$2" expected="$3" count
-  count="$(awk -F',' '{ print NF }' <<<"$table")"
-  if [[ "$count" != "$expected" ]]; then
-    echo "check-sdk-constant-parity: ${label}: extracted ${count} fields, expected ${expected}; refusing a partial table" >&2
-    exit 3
-  fi
-}
 
 echo "sdk constant parity:"
 
@@ -145,46 +135,7 @@ ts_writer_lo="$(extract "TS envelope writer low byte" "${ADAPTER_ROOT}/sdk/src/r
 compare "TS envelope writer high byte uses shared version" "$ts_writer_hi" "WIRE_SCHEMA_VERSION"
 compare "TS envelope writer low byte uses shared version" "$ts_writer_lo" "WIRE_SCHEMA_VERSION"
 
-# 6. POI status bytes. The Rust shim delegates to the one authoritative
-# `POIStatus::wire_byte`; its local executable table supplies the four values.
-rs_status_delegate="$(extract "Rust poi_status_byte delegation" "${ADAPTER_ROOT}/http/src/poi_shim.rs" \
-  's/^    \(s\.wire_byte()\)$/\1/p')"
-compare "poi_status_byte delegates to wire_byte" "$rs_status_delegate" "s.wire_byte()"
-
-rs_status="$(awk '
-  /assert_eq!\(poi_status_byte\(POIStatus::/ {
-    line = $0
-    sub(/^.*POIStatus::/, "", line)
-    name = line
-    sub(/\).*$/, "", name)
-    code = line
-    sub(/^.*\), /, "", code)
-    sub(/\).*$/, "", code)
-    printf "%s%s=%s", separator, name, code
-    separator = ","
-  }
-' "${ADAPTER_ROOT}/http/src/poi_shim.rs")"
-ts_status="$(awk '
-  /^export function statusByteToPOIStatus/ { inside = 1; next }
-  inside && /^    case [0-9]+:/ {
-    code = $2
-    sub(/:$/, "", code)
-    next
-  }
-  inside && /^      return "[A-Za-z]+";/ {
-    name = $2
-    gsub(/[";]/, "", name)
-    printf "%s%s=%s", separator, name, code
-    separator = ","
-    next
-  }
-  inside && /^}/ { exit }
-' "${ADAPTER_ROOT}/sdk/src/poi-pir.ts")"
-require_field_count "Rust POI status table" "$rs_status" 4
-require_field_count "TS POI status table" "$ts_status" 4
-compare "POI status byte table" "$ts_status" "$rs_status"
-
-# 7. Batch response framing. The existing envelope-version pair above owns the
+# 6. Batch response framing. The existing envelope-version pair above owns the
 # version value; this pair owns prefix width, count/element integer widths and
 # endian, and the length-delimited element body.
 rs_batch_prefix="$(extract "Rust batch prefix width" "${ADAPTER_ROOT}/http/src/versioned.rs" \
@@ -216,33 +167,7 @@ ts_batch_body="$(extract "TS batch element body" "${ADAPTER_ROOT}/sdk/src/raven-
 ts_batch="${ts_batch_prefix}|${ts_batch_count_lo}|${ts_batch_len_lo}|${ts_batch_body}"
 compare "batch response framing" "$ts_batch" "$rs_batch"
 
-# 8. SSE consumer status shape. Rust u64 values cross JSON as TypeScript numbers;
-# field identity and ordering must remain exact so a new metric cannot vanish in the SDK cast.
-ts_consumer_status="$(awk '
-  /^export interface ConsumerStatus/ { inside = 1; next }
-  inside && /^}/ { exit }
-  inside && /^  [a-z_]+: number;$/ {
-    field = $1
-    sub(/:$/, "", field)
-    printf "%s%s:number", separator, field
-    separator = ","
-  }
-' "${ADAPTER_ROOT}/sdk/src/events-stream.ts")"
-rs_consumer_status="$(awk '
-  /^pub struct ConsumerStatus/ { inside = 1; next }
-  inside && /^}/ { exit }
-  inside && /^    pub [a-z_]+: u64,$/ {
-    field = $2
-    sub(/:$/, "", field)
-    printf "%s%s:number", separator, field
-    separator = ","
-  }
-' "${ADAPTER_ROOT}/http/src/status.rs")"
-require_field_count "TS ConsumerStatus" "$ts_consumer_status" 9
-require_field_count "Rust ConsumerStatus" "$rs_consumer_status" 9
-compare "ConsumerStatus JSON shape" "$ts_consumer_status" "$rs_consumer_status"
-
-# 9. PPOI block size. The SDK derives a block from a global leaf index and asks upstream for
+# 7. PPOI block size. The SDK derives a block from a global leaf index and asks upstream for
 # that block's root; the engine re-indexes rows block-local by the same number. A drift does
 # not fail loudly -- it points the pin query at the wrong tree and refuses honest proofs.
 # Underscores stripped so 65536 and 65_536 compare as values, not as strings.
@@ -252,7 +177,7 @@ rs_block="$(extract "Rust LEAVES_PER_PPOI_BLOCK" "${ADAPTER_ROOT}/engine/src/orc
   's/^pub const LEAVES_PER_PPOI_BLOCK: u32 = \([0-9_]*\);$/\1/p')"
 compare "LEAVES_PER_PPOI_BLOCK" "$(tr -d _ <<<"$ts_block")" "$(tr -d _ <<<"$rs_block")"
 
-# The six-byte index channel publishes a fixed prefix width, and the client slices on it. A
+# 8. The six-byte index channel publishes a fixed prefix width, and the client slices on it. A
 # server that widened the prefix without the client following would hand back rows the client
 # reads at the wrong stride -- silently, because every byte is still a valid byte.
 ts_prefix="$(extract "TS BC_INDEX_PREFIX_BYTES" "${ADAPTER_ROOT}/sdk/src/bc-prefix-index.ts" \

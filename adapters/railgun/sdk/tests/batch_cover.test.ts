@@ -5,22 +5,17 @@
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { RavenPOINodeInterface, paddedBatchLength, type ClientPirContext } from "../src/index";
 import {
-  authPathQueryLevels,
-  buildPaddedQueryPlan,
-  recoverRealQueryResponses,
-} from "../src/batch-cover";
-import { authPathOf, encodeBatchResponse, stubCtx } from "./helpers/auth_path_stub";
-import { startMockServer, type MockServer } from "./helpers/mock_server";
-import {
-  batchTargets,
-  commitmentAt,
-  mountStatusRows,
-  targetNamingCtx,
-  type MockList,
-} from "./helpers/prefix_channel";
-import { namedBatchTargets } from "./helpers/private_wire";
+  LEAVES_PER_PPOI_BLOCK,
+  RavenPOINodeInterface,
+  paddedBatchLength,
+  type ClientPirContext,
+} from "../src/index";
+import { buildPaddedQueryPlan, recoverRealQueryResponses } from "../src/batch-cover";
+import { forestConfig } from "./helpers/forest";
+import { startMockServer, writeError, type MockServer } from "./helpers/mock_server";
+import { PATH10_ROW_BYTES } from "./helpers/path10_row";
+import { batchTargets, commitmentAt, targetNamingCtx } from "./helpers/prefix_channel";
 import { shardConfigBincode } from "./helpers/shard_config";
 
 const TOKEN = "test-token-padded-long-enough-1234";
@@ -115,157 +110,59 @@ describe("padded query cover", () => {
 });
 
 describe("padded query cover on the wire", () => {
-  function statusCtx(): ClientPirContext {
-    return { ...targetNamingCtx(), shardConfigBincode: shardConfigBincode(ROWS) };
+  // One path instance holds one 65,536-leaf block: 32 shards, so up to 17 lookups can sit in
+  // distinct shards and still leave the ladder step room for distinct covers.
+  const BLOCK_SHARDS = LEAVES_PER_PPOI_BLOCK / PER_SHARD;
+  let server: MockServer;
+  beforeAll(async () => {
+    server = await startMockServer();
+    // The reply is refused; the batch that was sent is what the property is about.
+    server.route(
+      (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
+      (_req, _body, res) => {
+        writeError(res, 500, "not answered");
+        return true;
+      },
+    );
+  });
+  afterEach(() => {
+    server.requests.length = 0;
+  });
+  afterAll(async () => {
+    await server.close();
+  });
+
+  function pathCtx(): ClientPirContext {
+    return {
+      ...targetNamingCtx(),
+      entrySize: PATH10_ROW_BYTES,
+      shardConfigBincode: shardConfigBincode(LEAVES_PER_PPOI_BLOCK),
+    };
   }
 
-  describe("T1 status", () => {
-    // One commitment at the start of every shard, so k lookups can sit in k distinct shards.
-    const list: MockList = {
-      commitments: Array.from({ length: ROWS }, (_unused, row) => commitmentAt(row)),
-    };
-    const rowOf = new Map(list.commitments.map((bc, row) => [bc, row]));
-    let server: MockServer;
-    beforeAll(async () => {
-      server = await startMockServer();
-      mountStatusRows(server, list, () => 0);
-    });
-    afterEach(() => {
-      server.requests.length = 0;
-    });
-    afterAll(async () => {
-      await server.close();
-    });
-
-    function sdk(): RavenPOINodeInterface {
-      return new RavenPOINodeInterface({
-        endpoint: server.url,
-        bearerToken: TOKEN,
-        useClientPir: true,
-        clientPirContexts: new Map([[`t1Status:${LIST_KEY_HEX}`, statusCtx()]]),
-        bcToIdxMaps: new Map([[LIST_KEY_HEX, rowOf]]),
-      });
-    }
-
-    for (const k of [1, 2, 3, 5, 9, 17]) {
-      it(`k=${k} lookups in ${k} shards touch ${paddedBatchLength(k)} shards`, async () => {
-        const rows = distinctShardRows(k);
-        const got = await sdk().getPOIsPerList(
-          [LIST_KEY_HEX],
-          rows.map((row) => ({ blindedCommitment: list.commitments[row], type: "Shield" })),
-        );
-        for (const row of rows) expect(got[list.commitments[row]][LIST_KEY_HEX]).toBe("Valid");
-        const [batch] = server.requests.filter((request) => request.url.endsWith("/batch"));
-        expect(distinctShards(batchTargets(batch.body))).toBe(paddedBatchLength(k));
-      });
-    }
-
-    it("an all-absent lookup sends a cover spread over the rows held, not row 0", async () => {
-      const shards = new Set<number>();
-      for (let trial = 0; trial < 40; trial += 1) {
-        await sdk()
-          .getPOIsPerList([LIST_KEY_HEX], [{ blindedCommitment: "77".repeat(32), type: "Shield" }])
-          .catch(() => undefined);
-        const batches = server.requests.filter((request) => request.url.endsWith("/batch"));
-        const [target] = batchTargets(batches[batches.length - 1].body);
-        shards.add(Math.floor(target / PER_SHARD));
-      }
-      expect(shards.size).toBeGreaterThan(1);
-    });
-  });
-
-  describe("T3 auth path", () => {
-    let server: MockServer;
-    afterAll(async () => {
-      await server.close();
-    });
-    beforeAll(async () => {
-      server = await startMockServer();
-      server.route(
-        (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
-        (_req, body, res) => {
-          res.writeHead(200, {
-            "content-type": "application/octet-stream",
-            "x-raven-epoch": "1",
-            "x-raven-schema-version": "8",
-          });
-          res.end(Buffer.from(encodeBatchResponse(1, body)));
-          return true;
-        },
-      );
-    });
-
-    it("a cold path of sixteen levels still returns every level in order", async () => {
+  for (const k of [1, 2, 3, 5, 9, 17]) {
+    it(`k=${k} proofs in ${k} shards touch ${paddedBatchLength(k)} shards`, async () => {
+      const rows = distinctShardRows(k, BLOCK_SHARDS);
+      const bcs = rows.map((row) => commitmentAt(row));
       const sdk = new RavenPOINodeInterface({
-        endpoint: server.url,
-        bearerToken: TOKEN,
-        useClientPir: true,
-        clientPirContexts: new Map([["t3CommitTree:0", stubCtx()]]),
-      });
-      const path = authPathOf(await sdk.getMerkleProof(0, 1234));
-      expect(path.elements.map((element) => Number.parseInt(element.slice(62), 16))).toEqual(
-        Array.from({ length: 16 }, (_unused, level) => level),
-      );
-      const [batch] = server.requests.filter((request) => request.url.endsWith("/batch"));
-      expect(namedBatchTargets(batch.body)).toHaveLength(16);
-    });
-
-    /** Per-shard slot counts, sorted: the whole cleartext shard picture a batch gives away. */
-    function shardProfile(targets: readonly number[]): number[] {
-      const perShard = new Map<number, number>();
-      for (const target of targets) {
-        const shard = Math.floor(target / PER_SHARD);
-        perShard.set(shard, (perShard.get(shard) ?? 0) + 1);
-      }
-      return [...perShard.values()].sort((a, b) => a - b);
-    }
-
-    // Levels 6 and up of a commit-tree path share one shard, so covers aimed away from the real
-    // shards would leave the count of upper-level misses readable from the shard picture.
-    it("a warm path's shard picture depends on the ladder step alone, not the miss count", async () => {
-      const LEAF = 1234;
-      const byStep = new Map<number, Set<string>>();
-      for (let misses = 1; misses <= 16; misses += 1) {
-        const sdk = new RavenPOINodeInterface({
+        ...forestConfig({
           endpoint: server.url,
-          bearerToken: TOKEN,
-          useClientPir: true,
-          clientPirContexts: new Map([["t3CommitTree:0", stubCtx()]]),
-        });
-        await sdk.getMerkleProof(0, LEAF);
-        // Flipping bit `misses - 1` changes the sibling at exactly levels 0..misses-1.
-        const other = LEAF ^ (1 << (misses - 1));
-        const path = authPathOf(await sdk.getMerkleProof(0, other));
-        expect(path.elements.map((element) => Number.parseInt(element.slice(62), 16))).toEqual(
-          Array.from({ length: 16 }, (_unused, level) => level),
-        );
-        const batches = server.requests.filter((request) => request.url.endsWith("/batch"));
-        const targets = namedBatchTargets(batches[batches.length - 1].body);
-        const step = paddedBatchLength(misses);
-        expect(targets).toHaveLength(step);
-        const seen = byStep.get(step) ?? new Set<string>();
-        seen.add(JSON.stringify(shardProfile(targets)));
-        byStep.set(step, seen);
-      }
-      for (const [step, profiles] of byStep) {
-        expect([...profiles], `ladder step ${step}`).toHaveLength(1);
-      }
-      expect(JSON.parse([...(byStep.get(16) ?? [])][0])).toContain(10);
+          listKeyHex: LIST_KEY_HEX,
+          ctx: pathCtx(),
+          placed: rows.map((row, at) => [bcs[at], row] as const),
+          total: LEAVES_PER_PPOI_BLOCK,
+        }),
+        bearerToken: TOKEN,
+      });
+      await expect(sdk.getPOIMerkleProofs(LIST_KEY_HEX, bcs)).rejects.toThrow(/500/);
+      const batches = server.requests.filter((request) => request.url.endsWith("/batch"));
+      expect(batches).toHaveLength(1);
+      const targets = batchTargets(batches[0].body);
+      expect(targets).toHaveLength(paddedBatchLength(k));
+      expect(distinctShards(targets)).toBe(paddedBatchLength(k));
+      expect([...targets].sort((a, b) => a - b)).toEqual(
+        expect.arrayContaining([...rows].sort((a, b) => a - b)),
+      );
     });
-  });
-});
-
-describe("auth-path level selection", () => {
-  it("fetches the bottom levels up to the step covering the highest miss", () => {
-    expect(authPathQueryLevels([0, 1, 2], 16)).toEqual([0, 1, 2, 3]);
-    expect(authPathQueryLevels([7], 16)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
-    expect(authPathQueryLevels([15], 16)).toHaveLength(16);
-    expect(authPathQueryLevels([], 16)).toHaveLength(16);
-  });
-
-  it("refuses a level outside the path", () => {
-    expect(() => authPathQueryLevels([16], 16)).toThrow(/not a level/);
-    expect(() => authPathQueryLevels([-1], 16)).toThrow(/not a level/);
-    expect(() => authPathQueryLevels([0], 0)).toThrow(/path depth/);
-  });
+  }
 });

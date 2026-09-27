@@ -8,6 +8,8 @@
 #   mutation B: the files allowlist removed - the whole test tier ships to consumers.
 #   mutation C: a runtime dependency on a repo-relative `file:` path. The install succeeds and
 #               leaves a dangling link, which is the state this repo shipped.
+#   mutation D: the SDK loads engine at runtime. Engine is a peer the SDK uses for types alone,
+#               and the gate's stand-in for it throws when loaded.
 #
 # The real tree is never written to and no git command is run.
 set -uo pipefail
@@ -98,4 +100,17 @@ expect_red dangling-file-dependency \
   'manifest.setdefault("dependencies", collections.OrderedDict())["raven-inspire-client-wasm"] = "file:../client-wasm/pkg-node"' \
   "dependency-tree"
 
-echo "check-sdk-pack-selftest: the pack gate refuses a TypeScript entry point, an unrestricted pack and a dangling dependency."
+dest="$(stage engine-at-runtime)"
+printf 'import "@railgun-community/engine";\n' >> "${dest}/src/index.ts"
+if run_gate "$dest" "${SCRATCH}/engine-at-runtime.log"; then
+  echo "check-sdk-pack-selftest: engine-at-runtime: the gate PASSED a package it must refuse" >&2
+  exit 1
+fi
+if ! /usr/bin/grep -q "the SDK loaded @railgun-community/engine at runtime" "${SCRATCH}/engine-at-runtime.log"; then
+  echo "check-sdk-pack-selftest: engine-at-runtime: the gate failed, but not for the reason under test" >&2
+  tail -n 30 "${SCRATCH}/engine-at-runtime.log" >&2
+  exit 1
+fi
+echo "  ok    engine-at-runtime: refused, naming the engine load"
+
+echo "check-sdk-pack-selftest: the pack gate refuses a TypeScript entry point, an unrestricted pack, a dangling dependency and a runtime engine load."

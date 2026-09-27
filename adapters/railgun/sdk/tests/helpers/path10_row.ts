@@ -86,11 +86,8 @@ export interface Path10RouteOptions extends Path10SlotOptions {
   readonly schemaVersion?: number;
   readonly freshness?: string;
   readonly onHit?: () => void;
-  /**
-   * Restrict the route to one instance label. Commit-tree (t3) reads still serve 32 B
-   * nodes on the same `/batch` path, so a suite exercising both must discriminate or the
-   * first route mounted swallows the other's requests.
-   */
+  /** Restrict the route to one instance label, so a suite serving several blocks can tell
+   *  their batches apart. */
   readonly instance?: string;
 }
 

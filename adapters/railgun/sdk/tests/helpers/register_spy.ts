@@ -35,12 +35,10 @@ export function makeRegisterSpy(): RegisterClientSessionSpy {
   return spy;
 }
 
-/** Minimal remote-session and typed-fanout exports for tests whose concern starts later. */
+/** Minimal remote-session exports for tests whose concern starts later. */
 export function stubRemoteSessionExports(): Pick<
   RavenInspireWasm,
-  | "client_packing_keys_versioned"
-  | "install_server_session_handle"
-  | "retarget_seeded_query_shard"
+  "client_packing_keys_versioned" | "install_server_session_handle"
 > {
   return {
     // Routed through the shared pin, not a literal: this stub reaches 11 test files plus
@@ -48,11 +46,5 @@ export function stubRemoteSessionExports(): Pick<
     // read [0, 6] while production was 7.
     client_packing_keys_versioned: () => new Uint8Array(EXPECTED_WIRE_SCHEMA_PREFIX),
     install_server_session_handle: () => undefined,
-    retarget_seeded_query_shard: (query, nominalShardId) => {
-      if (query.length < 4) throw new Error("stub seeded query is shorter than shard_id");
-      const retargeted = new Uint8Array(query);
-      new DataView(retargeted.buffer).setUint32(0, nominalShardId, true);
-      return retargeted;
-    },
   };
 }

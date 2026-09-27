@@ -4,9 +4,9 @@
 // every run and cannot rot the way the live tier's wire literals did.
 //
 // Live, alone: `vitest run --config tests/vitest.config.ts tests/live_ppoi_smoke.test.ts` with
-// those two set. RAVEN_LIVE_TOKEN is sent to the node when set. RAVEN_LIVE_PPOI_STATUS_INSTANCE
-// and RAVEN_LIVE_PPOI_PATH_INSTANCE_PREFIX name the instances when the deployment's ids differ
-// from the shipped example's. The report lands in RAVEN_BENCH_FINDINGS_DIR as ppoi-smoke.json.
+// those two set. RAVEN_LIVE_TOKEN is sent to the node when set. RAVEN_LIVE_PPOI_PATH_INSTANCE_PREFIX
+// names the path instances when the deployment's ids differ from the shipped example's. The report
+// lands in RAVEN_BENCH_FINDINGS_DIR as ppoi-smoke.json.
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -31,7 +31,6 @@ import {
   LIVE_AGGREGATOR,
   LIVE_TOKEN,
   LIVE_URL,
-  PPOI_STATUS_INSTANCE,
   decodeBatchResponse,
   decodeInstanceParams,
   encodeInstanceParams,
@@ -44,7 +43,6 @@ import {
   readJsonRpcRequest,
   startMockServer,
   writeBinary,
-  writeJson,
   writeJsonRpcResult,
   type MockServer,
 } from "./helpers/mock_server";
@@ -68,7 +66,6 @@ import {
   batchTargets,
   commitmentAt,
   mountPrefixChannel,
-  statusRow,
   targetNamingCtx,
   type MockList,
 } from "./helpers/prefix_channel";
@@ -82,12 +79,10 @@ const FINDINGS_DIR =
   process.env.RAVEN_BENCH_FINDINGS_DIR ?? resolve(HERE, "..", "..", "..", "target", "bench-findings");
 
 const LIST_ROWS = KNOWN_INDEX + 5;
-const STATUS_ROWS = 131_072;
 const PATH_ROWS = 65_536;
 const PATH_ENTRY_BYTES = 512;
 const PATH_SLOT_BYTES = PATH_ENTRY_BYTES + 160;
 const STUB_QUERY_BYTES = 64;
-const STATUS_BYTE_MISSING = 3;
 
 /** Upstream's list. The node serves it too unless a fault says otherwise. */
 const UPSTREAM_LIST: readonly string[] = Array.from({ length: LIST_ROWS }, (_u, i) =>
@@ -97,9 +92,8 @@ const MEMBERS = new Set(UPSTREAM_LIST);
 /** Shares the unlisted commitment's index prefix and nothing after it. */
 const UNLISTED_TWIN =
   UNLISTED_BC.slice(0, 2 * BC_INDEX_PREFIX_BYTES) + "cd".repeat(32 - BC_INDEX_PREFIX_BYTES);
-const OTHER_LIST_KEY = "ab".repeat(32);
 const MOVED = "11".repeat(32);
-const HEADER_PATH = `/v1/poi/${OFAC_LIST_KEY}/status-header`;
+const INDEX_HEAD = `/v1/poi/${OFAC_LIST_KEY}/bc-prefixes?since=0`;
 
 interface RigFaults {
   /** Wire schema the node's params envelope declares; the body's own field follows it. */
@@ -108,14 +102,10 @@ interface RigFaults {
   readonly innerSchema?: number;
   /** Rows where the node's list departs from upstream's. */
   readonly nodeRows?: Readonly<Record<number, string>>;
-  /** Status bytes the node serves by row; Valid (0) everywhere else. */
-  readonly statusBytes?: Readonly<Record<number, number>>;
   /** A sibling level the node corrupts in every path it serves. */
   readonly forgedLevel?: number;
-  readonly headerListKey?: string;
-  /** The node sends the status header's request on to another origin. */
-  readonly redirectHeader?: boolean;
-  readonly jsonIndex?: "unserved" | "wrong-row";
+  /** The node sends its first index request on to another origin. */
+  readonly redirectIndex?: boolean;
   /** The aggregator answers Valid for every commitment. */
   readonly oracleAnswersValid?: boolean;
   /** The aggregator's event at the known index differs from the recorded one in this field. */
@@ -129,10 +119,6 @@ function hexBytes(hex: string): Uint8Array {
   return new Uint8Array(Buffer.from(hex, "hex"));
 }
 
-function statusHeaderBody(listKey: string): unknown {
-  return { epoch: 0, listKey, blockedBcs: [], pendingBcs: [] };
-}
-
 function mountNode(node: MockServer, stranger: MockServer, faults: RigFaults): void {
   const list: MockList = { commitments: [...UPSTREAM_LIST] };
   for (const [row, bc] of Object.entries(faults.nodeRows ?? {})) list.commitments[Number(row)] = bc;
@@ -143,12 +129,7 @@ function mountNode(node: MockServer, stranger: MockServer, faults: RigFaults): v
     (req) => req.method === "GET" && /^\/v1\/instance\/[^/]+\/params$/.test(req.url ?? ""),
     (req, _body, res) => {
       const id = decodeURIComponent(/^\/v1\/instance\/([^/]+)\/params$/.exec(req.url ?? "")?.[1] ?? "");
-      const shape =
-        id === "ppoi-status-ofac"
-          ? { rows: STATUS_ROWS, entry: 32 }
-          : id === "ppoi-paths-ofac-0"
-            ? { rows: PATH_ROWS, entry: PATH_ENTRY_BYTES }
-            : undefined;
+      const shape = id === "ppoi-paths-ofac-0" ? { rows: PATH_ROWS, entry: PATH_ENTRY_BYTES } : undefined;
       if (shape === undefined) return false;
       const body = encodeInstanceParams(
         {
@@ -167,18 +148,6 @@ function mountNode(node: MockServer, stranger: MockServer, faults: RigFaults): v
     },
   );
   node.route(
-    (req) => req.url === "/v1/instance/ppoi-status-ofac/batch",
-    (_req, body, res) => {
-      const rows = batchTargets(body).map((target) =>
-        target < list.commitments.length
-          ? statusRow(faults.statusBytes?.[target] ?? 0, list.commitments[target])
-          : new Uint8Array(32),
-      );
-      writeBinary(res, encodeBatchResponseNodes(rows));
-      return true;
-    },
-  );
-  node.route(
     (req) => req.url === "/v1/instance/ppoi-paths-ofac-0/batch",
     (_req, body, res) => {
       const slots = batchTargets(body).map((target) =>
@@ -190,41 +159,18 @@ function mountNode(node: MockServer, stranger: MockServer, faults: RigFaults): v
       return true;
     },
   );
+  let redirected = faults.redirectIndex !== true;
+  node.route(
+    (req) => req.url === INDEX_HEAD && !redirected,
+    (_req, _body, res) => {
+      redirected = true;
+      res.writeHead(307, { location: `${stranger.url}${INDEX_HEAD}` });
+      res.end();
+      return true;
+    },
+  );
   mountPrefixChannel(node, OFAC_LIST_KEY, list);
-  node.route(
-    (req) => req.url === HEADER_PATH,
-    (_req, _body, res) => {
-      if (faults.redirectHeader === true) {
-        res.writeHead(307, { location: `${stranger.url}${HEADER_PATH}` });
-        res.end();
-      } else {
-        writeJson(res, statusHeaderBody(faults.headerListKey ?? OFAC_LIST_KEY));
-      }
-      return true;
-    },
-  );
-  stranger.route(
-    (req) => req.url === HEADER_PATH,
-    (_req, _body, res) => {
-      writeJson(res, statusHeaderBody(OFAC_LIST_KEY));
-      return true;
-    },
-  );
-  node.route(
-    (req) => req.url === `/v1/poi/${OFAC_LIST_KEY}/bc-to-idx-map`,
-    (_req, _body, res) => {
-      if (faults.jsonIndex === "unserved") return false;
-      writeJson(res, {
-        epoch: 0,
-        listKey: OFAC_LIST_KEY,
-        entries: list.commitments.map((bc, idx) => ({
-          bc: faults.jsonIndex === "wrong-row" && idx === KNOWN_INDEX ? commitmentAt(idx) : bc,
-          idx,
-        })),
-      });
-      return true;
-    },
-  );
+  mountPrefixChannel(stranger, OFAC_LIST_KEY, list);
 }
 
 function mountAggregator(aggregator: MockServer, faults: RigFaults): void {
@@ -286,8 +232,6 @@ function faultySdk(
   return (sdk, meteredFetch) => ({
     syncPoiListIndex: sdk.syncPoiListIndex.bind(sdk),
     poiListIndexCandidates: sdk.poiListIndexCandidates.bind(sdk),
-    fetchStatusHeader: sdk.fetchStatusHeader.bind(sdk),
-    fetchBcToIdxMap: sdk.fetchBcToIdxMap.bind(sdk),
     getPOIsPerList: sdk.getPOIsPerList.bind(sdk),
     getPOIMerkleProofs: sdk.getPOIMerkleProofs.bind(sdk),
     ...overrides(sdk, meteredFetch),
@@ -343,7 +287,6 @@ describe("PPOI acceptance smoke against a local node and aggregator", () => {
       node: node.url,
       aggregator: aggregator.url,
       wasm: targetNamingCtx().wasm,
-      statusInstance: "ppoi-status-ofac",
       pathInstanceForBlock: (block) => `ppoi-paths-ofac-${block}`,
       fetchImpl,
       ...extra,
@@ -385,8 +328,6 @@ describe("PPOI acceptance smoke against a local node and aggregator", () => {
     expect(report.path.resolverRoots).toEqual([KNOWN_BLOCK_ROOT]);
     expect(report.path.resolverWindow).toBe(`${KNOWN_INDEX}..${KNOWN_INDEX} (frozen)`);
     expect(report.index).toEqual({ total: LIST_ROWS, candidates: [KNOWN_INDEX], unlistedCandidates: [] });
-    expect(report.jsonIndex).toEqual({ served: true, rows: LIST_ROWS });
-    expect(report.statusHeader).toEqual({ blocked: 0, pending: 0 });
     for (const summary of Object.values(report.params)) {
       expect(summary.wireSchema).toBe(EXPECTED_WIRE_SCHEMA_VERSION);
     }
@@ -400,8 +341,6 @@ describe("PPOI acceptance smoke against a local node and aggregator", () => {
       "oracle-event",
       "oracle-status",
       "index",
-      "status-header",
-      "json-index",
       "status",
       "path",
       "path-unlisted",
@@ -409,8 +348,8 @@ describe("PPOI acceptance smoke against a local node and aggregator", () => {
     ]);
 
     // The traffic a live run is authorized for: one prefix request per started block (two here),
-    // again before the JSON map it checks, a frontier re-read per later SDK call, one packing-key
-    // upload per PIR instance.
+    // a frontier re-read per later SDK call, one packing-key upload for the path instance, and no
+    // query at all for status.
     const requestsByPhase = Object.fromEntries(
       report.phases.map((p) => [
         p.phase,
@@ -418,13 +357,11 @@ describe("PPOI acceptance smoke against a local node and aggregator", () => {
       ]),
     );
     expect(requestsByPhase).toEqual({
-      params: { "node:params": 2 },
+      params: { "node:params": 1 },
       "oracle-event": { "aggregator:ppoi_poi_events": 1 },
       "oracle-status": { "aggregator:ppoi_pois_per_list": 1 },
       index: { "node:bc-prefixes": 2 },
-      "status-header": { "node:status-header": 1 },
-      "json-index": { "node:bc-to-idx-map": 1, "node:bc-prefixes": 2 },
-      status: { "node:bc-prefixes": 1, "node:session": 1, "node:batch": 1 },
+      status: { "node:bc-prefixes": 1 },
       path: {
         "node:bc-prefixes": 1,
         "node:session": 1,
@@ -434,14 +371,12 @@ describe("PPOI acceptance smoke against a local node and aggregator", () => {
       "path-unlisted": { "node:bc-prefixes": 1 },
       "oracle-root": { "aggregator:ppoi_poi_events": 1 },
     });
-    expect(report.totals.node.requests).toBe(15);
+    expect(report.totals.node.requests).toBe(8);
     expect(report.totals.aggregator.requests).toBe(4);
 
     // One stub query up, one 672-byte slot down, each inside the versioned batch frame.
     const path = report.phases.find((p) => p.phase === "path");
     expect(path?.byRoute["node:batch"]).toEqual({ requests: 1, up: 2 + 8 + STUB_QUERY_BYTES, down: 2 + 8 + 8 + PATH_SLOT_BYTES });
-    const status = report.phases.find((p) => p.phase === "status");
-    expect(status?.byRoute["node:batch"]).toEqual({ requests: 1, up: 2 + 8 + STUB_QUERY_BYTES, down: 2 + 8 + 8 + 32 });
 
     // The live tier frames its hand-rolled batches with this helper; it must match the SDK's frame.
     const wasm = targetNamingCtx().wasm;
@@ -476,12 +411,6 @@ describe("PPOI acceptance smoke against a local node and aggregator", () => {
     expect(node.requests.filter((r) => !r.url.endsWith("/params"))).toHaveLength(0);
   });
 
-  it("catches a status the node serves that the aggregator does not", async () => {
-    await expect(smoke({ statusBytes: { [KNOWN_INDEX]: 1 } })).rejects.toThrow(
-      "status: the node answers listed=ShieldBlocked unlisted=Missing, upstream answers listed=Valid unlisted=Missing",
-    );
-  });
-
   it("catches a node that answers Valid for a commitment upstream does not list", async () => {
     await expect(smoke({ nodeRows: { [KNOWN_INDEX - 1]: UNLISTED_BC } })).rejects.toThrow(
       "status: the node answers listed=Valid unlisted=Valid, upstream answers listed=Valid unlisted=Missing",
@@ -500,23 +429,6 @@ describe("PPOI acceptance smoke against a local node and aggregator", () => {
     ).rejects.toThrow(
       `index: the node's list of ${LIST_ROWS} rows gives ${KNOWN_BC} candidates [${KNOWN_INDEX - 2}], ` +
         `not the upstream index ${KNOWN_INDEX}`,
-    );
-  });
-
-  it("catches a JSON index row that names another commitment", async () => {
-    await expect(smoke({ jsonIndex: "wrong-row" })).rejects.toThrow(
-      `bc-to-idx-map: row ${KNOWN_INDEX} differs from the node's prefix channel`,
-    );
-  });
-
-  it("passes against a node built without the JSON index, and says it was not served", async () => {
-    const report = await smoke({ jsonIndex: "unserved" });
-    expect(report.jsonIndex).toEqual({ served: false });
-  });
-
-  it("catches a status header answered for another list", async () => {
-    await expect(smoke({ headerListKey: OTHER_LIST_KEY })).rejects.toThrow(
-      `status-header: answered for list ${OTHER_LIST_KEY}`,
     );
   });
 
@@ -564,30 +476,51 @@ describe("PPOI acceptance smoke against a local node and aggregator", () => {
     );
   });
 
-  it("catches an unlisted commitment the node's list holds in block 0, which the SDK then queries", async () => {
-    await expect(
-      smoke({
-        nodeRows: { [KNOWN_INDEX - 1]: UNLISTED_BC },
-        statusBytes: { [KNOWN_INDEX - 1]: STATUS_BYTE_MISSING },
-      }),
-    ).rejects.toThrow(/not refused as absent: .*folded root is not among the 1 root\(s\) upstream certifies/);
-  });
-
-  it("catches an unlisted commitment refused for a reason other than its absence", async () => {
-    await expect(
-      smoke({
-        nodeRows: { [KNOWN_INDEX + 1]: UNLISTED_BC },
-        statusBytes: { [KNOWN_INDEX + 1]: STATUS_BYTE_MISSING },
-      }),
-    ).rejects.toThrow(/not refused as absent: .*past the instance's capacity/);
-  });
-
-  it("catches an unlisted commitment whose refusal cost a PIR query, from a prefix twin on the list", async () => {
+  // Status fetches no row, so a prefix twin reads Valid on the device; the proof it would need to
+  // spend is where the twin is refused. The smoke's status check is what catches the node here.
+  it("catches a node whose list holds a prefix twin of the unlisted commitment", async () => {
     expect(UNLISTED_TWIN.slice(0, 2 * BC_INDEX_PREFIX_BYTES)).toBe(UNLISTED_BC.slice(0, 2 * BC_INDEX_PREFIX_BYTES));
     expect(UNLISTED_TWIN).not.toBe(UNLISTED_BC);
     await expect(smoke({ nodeRows: { [KNOWN_INDEX - 1]: UNLISTED_TWIN } })).rejects.toThrow(
-      `path: the unlisted commitment sent 1 PIR batch(es) before its refusal; the node's index ` +
-        `gives it candidates [${KNOWN_INDEX - 1}]`,
+      "status: the node answers listed=Valid unlisted=Valid, upstream answers listed=Valid unlisted=Missing",
+    );
+  });
+
+  it("catches an SDK that queries the node for status", async () => {
+    const querying = faultySdk((sdk, meteredFetch) => ({
+      getPOIsPerList: (async (txidVersion: string, chain: Chain, listKeys: string[], datas: BlindedCommitmentData[]) => {
+        await meteredFetch(`${node.url}/v1/instance/ppoi-paths-ofac-0/batch`, { method: "POST", body: new Uint8Array(10) });
+        return sdk.getPOIsPerList(txidVersion, chain, listKeys, datas);
+      }) as SmokeSdk["getPOIsPerList"],
+    }));
+    await expect(smoke({}, undefined, { wrapSdk: querying })).rejects.toThrow(
+      "status: the SDK sent batch to the node; status is read from the index alone",
+    );
+  });
+
+  it("catches an unlisted commitment refused for a reason other than its absence", async () => {
+    const misrefusing = faultySdk((sdk) => ({
+      getPOIMerkleProofs: (async (txidVersion: string, chain: Chain, listKey: string, bcs: string[]) => {
+        if (bcs.includes(`0x${UNLISTED_BC}`)) throw RavenError.invalidQuery("past the instance's capacity");
+        return sdk.getPOIMerkleProofs(txidVersion, chain, listKey, bcs);
+      }) as SmokeSdk["getPOIMerkleProofs"],
+    }));
+    await expect(smoke({}, undefined, { wrapSdk: misrefusing })).rejects.toThrow(
+      /not refused as absent: .*past the instance's capacity/,
+    );
+  });
+
+  it("catches an unlisted commitment whose refusal cost a PIR query", async () => {
+    const querying = faultySdk((sdk, meteredFetch) => ({
+      getPOIMerkleProofs: (async (txidVersion: string, chain: Chain, listKey: string, bcs: string[]) => {
+        if (bcs.includes(`0x${UNLISTED_BC}`)) {
+          await meteredFetch(`${node.url}/v1/instance/ppoi-paths-ofac-0/batch`, { method: "POST", body: new Uint8Array(10) });
+        }
+        return sdk.getPOIMerkleProofs(txidVersion, chain, listKey, bcs);
+      }) as SmokeSdk["getPOIMerkleProofs"],
+    }));
+    await expect(smoke({}, undefined, { wrapSdk: querying })).rejects.toThrow(
+      "path: the unlisted commitment sent 1 PIR batch(es) before its refusal",
     );
   });
 
@@ -613,10 +546,10 @@ describe("PPOI acceptance smoke against a local node and aggregator", () => {
 
   it("catches an SDK that sends a commitment in a request body", async () => {
     const leaky = faultySdk((sdk, meteredFetch) => ({
-      getPOIsPerList: (async (txidVersion: string, chain: Chain, listKeys: string[], datas: BlindedCommitmentData[]) => {
-        await meteredFetch(`${node.url}/v1/poi/pois-per-list`, { method: "POST", body: JSON.stringify(datas) });
-        return sdk.getPOIsPerList(txidVersion, chain, listKeys, datas);
-      }) as SmokeSdk["getPOIsPerList"],
+      getPOIMerkleProofs: (async (txidVersion: string, chain: Chain, listKey: string, bcs: string[]) => {
+        await meteredFetch(`${node.url}/v1/poi/leak`, { method: "POST", body: JSON.stringify(bcs) });
+        return sdk.getPOIMerkleProofs(txidVersion, chain, listKey, bcs);
+      }) as SmokeSdk["getPOIMerkleProofs"],
     }));
     await expect(smoke({}, undefined, { wrapSdk: leaky })).rejects.toThrow(
       `contains 0x-prefixed ASCII blinded commitment ${KNOWN_BC}`,
@@ -625,9 +558,9 @@ describe("PPOI acceptance smoke against a local node and aggregator", () => {
 
   it("catches an SDK that puts a commitment in a URL", async () => {
     const leaky = faultySdk((sdk, meteredFetch) => ({
-      fetchStatusHeader: async (listKey: string) => {
+      syncPoiListIndex: async (listKey: string) => {
         await meteredFetch(`${node.url}/v1/poi/${listKey}/${KNOWN_BC}`);
-        return sdk.fetchStatusHeader(listKey);
+        return sdk.syncPoiListIndex(listKey);
       },
     }));
     await expect(smoke({}, undefined, { wrapSdk: leaky })).rejects.toThrow(
@@ -636,8 +569,8 @@ describe("PPOI acceptance smoke against a local node and aggregator", () => {
   });
 
   it("catches a node that redirects the SDK to a third party", async () => {
-    await expect(smoke({ redirectHeader: true })).rejects.toThrow(
-      `the SDK contacted a third party: ${node.url}${HEADER_PATH} -> ${stranger.url}${HEADER_PATH}`,
+    await expect(smoke({ redirectIndex: true })).rejects.toThrow(
+      `the SDK contacted a third party: ${node.url}${INDEX_HEAD} -> ${stranger.url}${INDEX_HEAD}`,
     );
     expect(stranger.requests).toHaveLength(1);
   });
@@ -678,7 +611,6 @@ describe("PPOI acceptance smoke against the real deployment", () => {
         node: LIVE_URL as string,
         aggregator: LIVE_AGGREGATOR as string,
         wasm,
-        statusInstance: PPOI_STATUS_INSTANCE,
         pathInstanceForBlock: ppoiPathInstance,
         bearerToken: LIVE_TOKEN,
       });

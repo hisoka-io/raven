@@ -44,8 +44,7 @@ function insertSorted(sorted: number[], value: number): void {
  * no real target occupies, up to min(padded length, populated shards) distinct shards, so with
  * distinct real shards that count depends on the ladder step and the table alone. A cover that
  * fits no free shard goes to a uniform populated shard. Two real targets sharing a shard still
- * show as one shard, so a caller whose reals can collide fixes its real set per step instead, as
- * {@link authPathQueryLevels} does.
+ * show as one shard.
  *
  * Covers address rows below `populatedRows`, since a query into rows the instance never wrote
  * could only be a cover. An empty `realTargets` yields one cover query, for a request whose
@@ -103,30 +102,6 @@ export function buildPaddedQueryPlan(
     wireTargets: Object.freeze(wireTargets),
     realSlots: Object.freeze(realSlots),
   });
-}
-
-/**
- * Auth-path levels to fetch when `missingLevels` are not cached: every level below the ladder
- * step that covers the highest miss, re-fetching cached ones among them.
- *
- * The levels of one path pack unevenly into shards (on a commit tree every level above the sixth
- * shares one shard), so random covers cannot give a fixed shard count: the reals' own collisions
- * would publish how many upper levels missed. The bottom `step` levels of a path touch shards
- * fixed by the step and the table alone. Cache misses run from level 0 up, so this costs nothing
- * over padding the misses themselves; no miss re-fetches the whole path, since skipping the
- * request would publish a fully warm cache.
- */
-export function authPathQueryLevels(missingLevels: readonly number[], depth: number): number[] {
-  checkedCount(depth, "path depth");
-  let highest = -1;
-  for (const level of missingLevels) {
-    if (!Number.isSafeInteger(level) || level < 0 || level >= depth) {
-      invalid(`missing level ${level} is not a level of a depth-${depth} path`);
-    }
-    highest = Math.max(highest, level);
-  }
-  const step = highest < 0 ? depth : Math.min(paddedBatchLength(highest + 1), depth);
-  return Array.from({ length: step }, (_unused, level) => level);
 }
 
 /** Responses for the caller's targets, in caller order. */

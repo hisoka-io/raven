@@ -86,11 +86,11 @@ export function inspectPirDataPosts(
   const selected = requests.filter((request) => {
     const path = requestPath(request.url);
     return (
-      request.method === "POST" && /^\/v1\/instance\/[^/]+\/(?:query|batch|fanout)$/.test(path)
+      request.method === "POST" && /^\/v1\/instance\/[^/]+\/(?:query|batch)$/.test(path)
     );
   });
   if (selected.length === 0) {
-    throw new Error("private PIR assertion selected no POST query/batch/fanout requests");
+    throw new Error("private PIR assertion selected no POST query/batch requests");
   }
   return selected.map((request) => inspectPirRequest(request, options));
 }
@@ -130,7 +130,7 @@ export function assertNoCommitmentsInPirRequests(
 /**
  * The same leak check over EVERY request, not only the instance query paths.
  *
- * `inspectPirDataPosts` narrows to `/v1/instance/<id>/(query|batch|fanout)` and throws on an
+ * `inspectPirDataPosts` narrows to `/v1/instance/<id>/(query|batch)` and throws on an
  * empty selection, and every caller passes an exact `expectedQueryCount` — so it cannot be
  * widened without changing what those callers assert. Pin resolution talks to a different host
  * on a different path, which means the narrow helper filters those requests straight back out

@@ -1,7 +1,7 @@
 {
   "name": "@hisoka-io/railgun-poi-node-interface",
   "version": "0.1.0-alpha.0",
-  "description": "A POINodeInterface for the Railgun engine that resolves PPOI status, PPOI auth-paths and commit-tree auth-paths from a Raven adapter server, by client-side PIR unless configured otherwise.",
+  "description": "A POINodeInterface for the Railgun engine that answers PPOI status on the device from a Raven node's list index and fetches PPOI auth paths from it by client-side PIR.",
   "type": "module",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",
@@ -40,11 +40,6 @@
   },
   "peerDependencies": {
     "@railgun-community/engine": "^9.6.0 || 9.7.0-rc.0"
-  },
-  "peerDependenciesMeta": {
-    "@railgun-community/engine": {
-      "optional": true
-    }
   },
   "devDependencies": {
     "@railgun-community/engine": "9.7.0-rc.0",

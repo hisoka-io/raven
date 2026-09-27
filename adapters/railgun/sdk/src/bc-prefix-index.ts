@@ -1,10 +1,6 @@
 /**
- * The 6-byte-per-row index channel, client side.
- *
- * The JSON channel publishes the same index as `{"bc":"<64 hex>","idx":N}` per row -- ~86 bytes
- * against 6 -- in one unbounded body with no cursor, so any append re-downloads the whole list.
- * At the OFAC list's size that is the difference between a few megabytes and tens of them on a
- * wallet's first run, and between a resumable fetch and a restart.
+ * The 6-byte-per-row index channel, client side: segmented one PPOI block per response and
+ * resumable from a cursor, so a wallet downloads the list once and then only its tail.
  *
  * What a 6-byte prefix costs, stated because it is the whole design tension: it is not a blinded
  * commitment, so a lookup can return more than one candidate index. A blinded commitment is a
@@ -15,12 +11,13 @@
  * real data eventually. So the lookup returns EVERY candidate and the caller decides. That costs
  * nothing in practice: the row the server returns carries the full commitment in its first 32
  * bytes and the fold path already refuses a row whose commitment is not the one asked for, so a
- * wrong candidate is caught by a check that has to run anyway.
+ * wrong candidate is caught by a check that has to run anyway. Status fetches no row: it reads
+ * any match as `Valid`, so a note whose prefix collides with a listed one reads `Valid` until its
+ * proof, which binds all 32 bytes, is fetched and refused.
  */
 
 import { RavenError } from "./errors";
 import { LEAVES_PER_PPOI_BLOCK } from "./pin-resolver";
-import type { BcIdxEntry } from "./poi-pir";
 
 /** Bytes of each blinded commitment the channel publishes. Must match the server's constant. */
 export const BC_INDEX_PREFIX_BYTES = 6;
@@ -203,29 +200,6 @@ export async function fetchBcPrefixIndex(
     onRequest,
   );
   return { epoch, prefixes: rows, total };
-}
-
-/** The JSON channel's rows as prefixes, so they can be compared with the prefix channel's. */
-export function bcPrefixIndexFromRows(epoch: number, entries: readonly BcIdxEntry[]): BcPrefixIndex {
-  const prefixes = new Uint8Array(entries.length * BC_INDEX_PREFIX_BYTES);
-  entries.forEach(({ bc, idx }, row) => {
-    const hex = bc.startsWith("0x") || bc.startsWith("0X") ? bc.slice(2) : bc;
-    if (idx !== row || hex.length !== 64 || !/^[0-9a-fA-F]+$/.test(hex)) {
-      throw RavenError.invalidQuery(
-        `bc-prefixes: row ${row} must be a 32-byte commitment at idx ${row}; ` +
-          "an index is a gap-free prefix of the list in index order",
-      );
-    }
-    for (let byte = 0; byte < BC_INDEX_PREFIX_BYTES; byte += 1) {
-      prefixes[row * BC_INDEX_PREFIX_BYTES + byte] = Number.parseInt(
-        hex.slice(byte * 2, byte * 2 + 2),
-        16,
-      );
-    }
-  });
-  const index = { epoch, prefixes, total: entries.length };
-  assertBcPrefixIndex(index, "bc-prefixes: index from rows");
-  return index;
 }
 
 /**

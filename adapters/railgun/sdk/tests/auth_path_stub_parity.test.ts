@@ -1,36 +1,24 @@
-// Five test files read batch slot counts and cache hit/miss through the shared path-indices
-// stub, so every conclusion they draw about padding and cache warmth rests on that stub
-// matching the shipped wasm. Nothing checked that, and a drifted stub fails nothing.
+// Stub-driven suites read path indices and batch replies through shared helpers, so every
+// conclusion they draw rests on those helpers matching the shipped wasm and the SDK's own reader.
+// A drifted stub fails nothing on its own.
 
 import { describe, expect, it } from "vitest";
 
 import * as wasmPkg from "raven-inspire-client-wasm";
 
 import { RavenPOINodeInterface, TREE_DEPTH, type RavenInspireWasm } from "../src/index";
-import {
-  TOKEN,
-  authPathOf,
-  encodeRepliesByTarget,
-  stubCtx,
-  stubWasm,
-} from "./helpers/auth_path_stub";
+import { TOKEN, encodeBatchResponseNodes, stubCtx, stubWasm } from "./helpers/auth_path_stub";
+import { forestConfig } from "./helpers/forest";
 import { startMockServer } from "./helpers/mock_server";
+import { PATH10_ROW_BYTES, path10Root, path10Slot } from "./helpers/path10_row";
 
 const real = wasmPkg as unknown as RavenInspireWasm;
 const stub = stubWasm();
 const LIST_KEY = new Uint8Array(32).fill(0xab);
-// The leaves the stub-driven suites actually query, plus both ends of the tree.
+const LIST_KEY_HEX = "ab".repeat(32);
 const LEAVES = [0, 1, 7, 100, 1234, 1234 ^ 0b111, 4096, 4223, 65_534, 65_535];
 
-describe("shared auth-path stub matches the shipped wasm geometry", () => {
-  it("reproduces path_indices_for_leaf at every level", () => {
-    for (const leaf of LEAVES) {
-      const got = Array.from(stub.path_indices_for_leaf(0, leaf));
-      expect(got, `leaf ${leaf}`).toEqual(Array.from(real.path_indices_for_leaf(0, leaf)));
-      expect(got).toHaveLength(TREE_DEPTH);
-    }
-  });
-
+describe("shared path-indices stub matches the shipped wasm geometry", () => {
   it("reproduces path_indices_for_per_list_leaf at every level", () => {
     for (const leaf of LEAVES) {
       expect(
@@ -39,25 +27,17 @@ describe("shared auth-path stub matches the shipped wasm geometry", () => {
       ).toEqual(Array.from(real.path_indices_for_per_list_leaf(LIST_KEY, leaf)));
     }
   });
-
-  // The partial-hit arithmetic the padding tests assert on: 1234 and 1234^0b111 must share
-  // every sibling above level 2, or "exactly 3 levels miss" is a claim about nothing.
-  it("agrees with the wasm on how many levels two nearby leaves share", () => {
-    const a = Array.from(real.path_indices_for_leaf(0, 1234));
-    const b = Array.from(real.path_indices_for_leaf(0, 1234 ^ 0b111));
-    const shared = a.filter((v, i) => v === b[i]).length;
-    expect(shared).toBe(TREE_DEPTH - 3);
-  });
 });
 
 describe("shared batch-response encoder round-trips through the SDK's own decode", () => {
-  // Ten suites now serve batch replies through encodeBatchResponse*; this pins that ONE
-  // writer to the real reader (stripSchemaEnvelope + decodeBatchBody + element slicing in
-  // src/raven-poi-node-interface.ts) byte-for-byte, so the helper tracks the wire shape
-  // the server actually speaks rather than a memory of it.
+  // Suites serve batch replies through encodeBatchResponseNodes; this pins that ONE writer to
+  // the real reader (stripSchemaEnvelope, decodeBatchBody and the addendum split in
+  // src/raven-poi-node-interface.ts) byte for byte, so the helper tracks the wire shape the
+  // server speaks rather than a memory of it.
   it("every node byte comes back as the corresponding auth-path element", async () => {
     const server = await startMockServer();
     try {
+      const bcHex = "0e".repeat(32);
       const nodes = Array.from({ length: TREE_DEPTH }, (_unused, i) => {
         const node = new Uint8Array(32);
         node[0] = 0x10 + i;
@@ -67,25 +47,26 @@ describe("shared batch-response encoder round-trips through the SDK's own decode
       });
       server.route(
         (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
-        (_req, body, res) => {
+        (_req, _body, res) => {
           res.writeHead(200, {
             "content-type": "application/octet-stream",
-            "x-raven-epoch": "1",
-            "x-raven-schema-version": "6",
+            "x-raven-freshness": "lag_blocks=0 applied_height=0 epoch=1 confidence=1",
           });
-          // Answered per named row, as a node does: the SDK shuffles its slots.
-          const path = Array.from(stub.path_indices_for_leaf(0, 5));
-          res.end(Buffer.from(encodeRepliesByTarget(body, (row) => nodes[path.indexOf(row)])));
+          res.end(Buffer.from(encodeBatchResponseNodes([path10Slot({ bcHex, nodes })])));
           return true;
         },
       );
       const sdk = new RavenPOINodeInterface({
-        endpoint: server.url,
+        ...forestConfig({
+          endpoint: server.url,
+          listKeyHex: LIST_KEY_HEX,
+          ctx: { ...stubCtx(), entrySize: PATH10_ROW_BYTES },
+          placed: [[bcHex, 5]],
+          pins: new Map([[0, path10Root(bcHex, nodes, 5)]]),
+        }),
         bearerToken: TOKEN,
-        useClientPir: true,
-        clientPirContexts: new Map([["t3CommitTree:0", stubCtx()]]),
       });
-      const proof = authPathOf(await sdk.getMerkleProof(0, 5));
+      const [proof] = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [bcHex]);
       expect(proof.elements).toHaveLength(TREE_DEPTH);
       const hex = (b: Uint8Array): string =>
         Array.from(b)

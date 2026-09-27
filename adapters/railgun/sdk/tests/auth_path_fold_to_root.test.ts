@@ -6,15 +6,11 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { ImtCache, RavenPOINodeInterface, TREE_DEPTH, hashLeftRight } from "../src/index";
+import { RavenPOINodeInterface, TREE_DEPTH, hashLeftRight } from "../src/index";
 
 import { startMockServer, type MockServer } from "./helpers/mock_server";
-import {
-  TOKEN,
-  authPathOf,
-  encodeBatchResponse,
-  stubCtx,
-} from "./helpers/auth_path_stub";
+import { TOKEN, stubCtx } from "./helpers/auth_path_stub";
+import { blockLabel, forestConfig } from "./helpers/forest";
 import {
   PATH10_ROW_BYTES,
   mountPath10Route,
@@ -25,7 +21,6 @@ import {
 const LIST_KEY_HEX = "ab".repeat(32);
 const BC_HEX = "11".repeat(32);
 const LEAF = 1234;
-const TREE_NUMBER = 0;
 
 // The path-10 record replaced sixteen 32 B node reads with one 512 B row plus a 160 B
 // upper-sibling addendum, and the pinned root became mandatory (D-06). The served sibling
@@ -35,45 +30,24 @@ const PATH10_NODES = path10Siblings(0xab);
 /** A second sibling set, standing in for nodes served at a different epoch. */
 const OTHER_NODES = path10Siblings(0xcd);
 const PATH10_BLOCK = Math.floor(LEAF / 65_536);
-const PATH10_INSTANCE = `t2Path-${LIST_KEY_HEX}`;
+const PATH10_INSTANCE = blockLabel(LIST_KEY_HEX, PATH10_BLOCK);
 const TRUE_ROOT = path10Root(BC_HEX, PATH10_NODES, LEAF);
-
-function mountBatchRoute(server: MockServer, epoch: number): void {
-  server.route(
-    (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
-    (_req, body, res) => {
-      res.writeHead(200, {
-        "content-type": "application/octet-stream",
-        "x-raven-epoch": String(epoch),
-        "x-raven-schema-version": "6",
-        "x-raven-freshness": "lag_blocks=0 applied_height=0 epoch=1 confidence=1",
-      });
-      res.end(Buffer.from(encodeBatchResponse(epoch, body)));
-      return true;
-    },
-  );
-}
 
 function newSdk(
   server: MockServer,
   overrides: { leaf?: number; pinnedRoot?: string } = {},
 ): RavenPOINodeInterface {
   const leaf = overrides.leaf ?? LEAF;
-  const pathCtx = { ...stubCtx(), entrySize: PATH10_ROW_BYTES };
   return new RavenPOINodeInterface({
-    endpoint: server.url,
+    ...forestConfig({
+      endpoint: server.url,
+      listKeyHex: LIST_KEY_HEX,
+      ctx: { ...stubCtx(), entrySize: PATH10_ROW_BYTES },
+      placed: [[BC_HEX, leaf]],
+      // Every path-10 fold requires a pinned root, so the rig always supplies one.
+      pins: new Map([[PATH10_BLOCK, overrides.pinnedRoot ?? TRUE_ROOT]]),
+    }),
     bearerToken: TOKEN,
-    useClientPir: true,
-    clientPirContexts: new Map([
-      [`t2Path:${LIST_KEY_HEX}`, pathCtx],
-      [`t3CommitTree:${TREE_NUMBER}`, stubCtx()],
-    ]),
-    // D-06: every path-10 fold requires a pinned root, so the rig always supplies one.
-    ppoiPinnedRoots: new Map([
-      [`${LIST_KEY_HEX}:${PATH10_BLOCK}`, overrides.pinnedRoot ?? TRUE_ROOT],
-    ]),
-    bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX, leaf]])]]),
-    imtCache: new ImtCache({ disableIndexedDb: true }),
   });
 }
 
@@ -106,7 +80,7 @@ function referenceFold(leaf: string, siblings: string[], leafIndex: number): str
   return current;
 }
 
-/** Slot tag `encodeBatchResponse` writes into the last byte of every node. */
+/** The level `path10Siblings` writes into the last byte of every node. */
 function slotTagOf(elementHex: string): number {
   return Number.parseInt(elementHex.slice(62), 16);
 }
@@ -121,7 +95,6 @@ describe("the SDK's PPOI auth path folds to a verifiable root", () => {
       nodes: PATH10_NODES,
       instance: PATH10_INSTANCE,
     });
-    mountBatchRoute(server, 9);
   });
   afterAll(async () => {
     await server.close();
@@ -197,14 +170,5 @@ describe("the SDK's PPOI auth path folds to a verifiable root", () => {
     } finally {
       await other.close();
     }
-  });
-
-  it("hands the commit-tree caller siblings in the same level order it must fold in", async () => {
-    // T3 returns no root, so the level order IS the whole contract with the wallet.
-    const path = authPathOf(await newSdk(server).getMerkleProof(TREE_NUMBER, LEAF));
-
-    expect(path.elements.map(slotTagOf)).toEqual(
-      Array.from({ length: TREE_DEPTH }, (_unused, level) => level),
-    );
   });
 });

@@ -9,6 +9,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { RavenError, RavenPOINodeInterface } from "../src/index";
 import { fetchWithDeadline } from "../src/request-deadline";
+import { forestConfig } from "./helpers/forest";
+import { targetNamingCtx } from "./helpers/prefix_channel";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX = "ab".repeat(32);
@@ -48,9 +50,8 @@ describe("request deadline", () => {
 
   it("fails a node that stalls mid-body as Network, within the deadline", async () => {
     const sdk = new RavenPOINodeInterface({
-      endpoint: url,
+      ...forestConfig({ endpoint: url, listKeyHex: LIST_KEY_HEX, ctx: targetNamingCtx() }),
       bearerToken: TOKEN,
-      useClientPir: false,
       requestTimeoutMs: DEADLINE_MS,
     });
     const started = Date.now();
@@ -65,19 +66,17 @@ describe("request deadline", () => {
     const sdk = new RavenPOINodeInterface({
       endpoint: "https://raven.invalid",
       bearerToken: TOKEN,
-      useClientPir: false,
       requestTimeoutMs: DEADLINE_MS,
       fetchImpl: () => new Promise<Response>(() => undefined),
     });
-    const { error } = await settledWithin(sdk.fetchStatusHeader(LIST_KEY_HEX));
+    const { error } = await settledWithin(sdk.syncPoiListIndex(LIST_KEY_HEX));
     expect(RavenError.is(error, "Network"), String(error)).toBe(true);
   });
 
   it("lets the engine-shaped status call resolve past a stalled node", async () => {
     const sdk = new RavenPOINodeInterface({
-      endpoint: url,
+      ...forestConfig({ endpoint: url, listKeyHex: LIST_KEY_HEX, ctx: targetNamingCtx() }),
       bearerToken: TOKEN,
-      useClientPir: false,
       requestTimeoutMs: DEADLINE_MS,
     });
     const { value, error } = await settledWithin(

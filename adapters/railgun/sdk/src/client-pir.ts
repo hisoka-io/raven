@@ -15,8 +15,6 @@ export interface RavenInspireWasm extends RavenPOIPathWasm {
     shardConfigBincode: Uint8Array,
     targetIdx: bigint,
   ): Uint8Array;
-  /** Replace only the clear shard selector in one serialized seeded query. */
-  retarget_seeded_query_shard(queryBincode: Uint8Array, nominalShardId: number): Uint8Array;
   extract_response(
     session: RavenInspireClientSession,
     crsBincode: Uint8Array,

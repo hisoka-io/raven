@@ -10,33 +10,28 @@ import {
   hashLeftRight,
   foldMerkleRoot,
 } from "../src/index";
-import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
 import {
   startMockServer,
-  writeBinary,
-  writeJson,
   writeJsonRpcResult,
   type JsonRpcRequest,
   type MockServer,
 } from "./helpers/mock_server";
-import { encodeBatchResponse, stubCtx as pathStubCtx } from "./helpers/auth_path_stub";
+import { stubCtx as pathStubCtx } from "./helpers/auth_path_stub";
+import { blockLabel, forestConfig } from "./helpers/forest";
 import {
   PATH10_ROW_BYTES,
   mountPath10Route,
   path10Root,
   path10Siblings,
 } from "./helpers/path10_row";
+import { commitmentAt, listHolding, mountPrefixChannel } from "./helpers/prefix_channel";
 import { EXPECTED_WIRE_SCHEMA_VERSION } from "./helpers/wire_schema";
-import { ppoiTree } from "./helpers/ppoi_tree";
-import { shardConfigBincode } from "./helpers/shard_config";
 
 const TOKEN = "test-token-padded-long-enough-1234";
 const LIST_KEY_HEX =
   "abababababababababababababababababababababababababababababababab";
-const BC_HEX_A =
-  "0000000000000000000000000000000000000000000000000000000000000001";
-const BC_HEX_B =
-  "0000000000000000000000000000000000000000000000000000000000000002";
+const BC_HEX_A = commitmentAt(1);
+const BC_HEX_B = commitmentAt(2);
 
 // Upstream KAT vectors from engine/src/merkletree/__tests__/utxo-merkletree.test.ts ("Should hash left/right").
 const UPSTREAM_HASH_LEFT_RIGHT_VECTORS = [
@@ -98,24 +93,22 @@ describe("wire parity: C3 — Poseidon hashLeftRight matches upstream", () => {
   });
 });
 
-/**
- * Echoes one 32 B node per requested slot, stamped with the headers a real batch reply
- * carries. It explicitly EXCLUDES `t2Path-*`: that instance serves 512 B path-10 rows
- * now, and routes are matched in mount order, so a catch-all here would swallow them.
- */
-function mountNodeBatchRoute(server: MockServer): void {
-  server.route(
-    (req) =>
-      /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? "") &&
-      !(req.url ?? "").includes("/instance/t2Path-"),
-    (_req, body, res) => {
-      writeBinary(res, encodeBatchResponse(1, body), {
-        "x-raven-epoch": "1",
-        "x-raven-schema-version": String(EXPECTED_WIRE_SCHEMA_VERSION),
-      });
-      return true;
-    },
-  );
+const LEAF_INDEX = 1234;
+const NODES = path10Siblings(0xab);
+
+function pathSdk(endpoint: string, upstream?: string): RavenPOINodeInterface {
+  return new RavenPOINodeInterface({
+    ...forestConfig({
+      endpoint,
+      listKeyHex: LIST_KEY_HEX,
+      ctx: { ...pathStubCtx(), entrySize: PATH10_ROW_BYTES },
+      placed: [[BC_HEX_A, LEAF_INDEX]],
+      // Every path-10 fold requires a pinned root.
+      pins: new Map([[0, path10Root(BC_HEX_A, NODES, LEAF_INDEX)]]),
+    }),
+    bearerToken: TOKEN,
+    ...(upstream === undefined ? {} : { upstreamFallbackEndpoint: upstream }),
+  });
 }
 
 describe("wire parity: C1 — PoisPerListResponse outer key is BC (NOT listKey)", () => {
@@ -130,99 +123,52 @@ describe("wire parity: C1 — PoisPerListResponse outer key is BC (NOT listKey)"
     server.reset();
   });
 
-  it("legacy mode round-trips upstream POIsPerListMap shape verbatim", async () => {
+  it("answers in upstream's POIsPerListMap shape", async () => {
     // Upstream `{ [BC]: { [listKey]: status } }` (poi-merkletree-manager.ts).
-    const expected = {
-      [BC_HEX_A]: { [LIST_KEY_HEX]: "Valid" },
-      [BC_HEX_B]: { [LIST_KEY_HEX]: "ShieldBlocked" },
-    };
-    server.route(
-      (req) => req.url === "/v1/poi/pois-per-list",
-      (_req, _body, res) => {
-        writeJson(res, expected);
-        return true;
-      },
-    );
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: false,
-    });
-    const got = await sdk.getPOIsPerList(
+    mountPrefixChannel(server, LIST_KEY_HEX, { commitments: listHolding([[BC_HEX_A, LEAF_INDEX]]) });
+    const got = await pathSdk(server.url).getPOIsPerList(
       [LIST_KEY_HEX],
       [
         { blindedCommitment: BC_HEX_A, type: "Shield" },
         { blindedCommitment: BC_HEX_B, type: "Transact" },
       ],
     );
-    expect(got).toEqual(expected);
-    expect(got[BC_HEX_A][LIST_KEY_HEX]).toBe("Valid");
-    expect(got[BC_HEX_B][LIST_KEY_HEX]).toBe("ShieldBlocked");
+    expect(got).toEqual({
+      [BC_HEX_A]: { [LIST_KEY_HEX]: "Valid" },
+      [BC_HEX_B]: { [LIST_KEY_HEX]: "Missing" },
+    });
     expect(got[LIST_KEY_HEX]).toBeUndefined();
   });
 });
 
 describe("wire parity: C4 — MerkleProof.indices is uint256 (64 hex chars)", () => {
-  // This block used to build its own object literal and assert on it, which no change to the
-  // SDK could ever fail. Drive the SDK instead: both client-PIR arms mint `indices` themselves.
+  // Drives the SDK: the client-PIR proof mints `indices` itself.
   let server: MockServer;
   beforeAll(async () => {
     server = await startMockServer();
-    mountNodeBatchRoute(server);
   });
   afterAll(async () => {
     await server.close();
   });
 
-  const LEAF_INDEX = 1234;
   // Upstream nToHex(index, UINT_256) -> 64 hex chars, no prefix (merkletree.ts).
   const EXPECTED = LEAF_INDEX.toString(16).padStart(64, "0");
 
-  it("the T3 commit-tree auth path carries 64-char no-prefix hex indices", async () => {
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: true,
-      clientPirContexts: new Map([["t3CommitTree:0", pathStubCtx()]]),
-    });
-    const got = await sdk.getMerkleProof(0, LEAF_INDEX);
-    expect(got.kind).toBe("authPath");
-    expect(got.indices).toBe(EXPECTED);
-    expect(got.indices.length).toBe(64);
-    expect(got.indices.startsWith("0x")).toBe(false);
-  });
-
-  it("the T2 per-list proof carries 64-char no-prefix hex indices", async () => {
-    // The T2 list read is one 512 B path-10 row, so it needs its own route alongside the
-    // 32 B node route the T3 commit-tree test uses on the same `/batch` path.
-    const nodes = path10Siblings(0xab);
+  it("the per-list proof carries 64-char no-prefix hex indices", async () => {
     mountPath10Route(server, {
       bcHex: BC_HEX_A,
-      nodes,
-      instance: `t2Path-${LIST_KEY_HEX}`,
+      nodes: NODES,
+      instance: blockLabel(LIST_KEY_HEX, 0),
       schemaVersion: EXPECTED_WIRE_SCHEMA_VERSION,
     });
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: true,
-      clientPirContexts: new Map([
-        [`t2Path:${LIST_KEY_HEX}`, { ...pathStubCtx(), entrySize: PATH10_ROW_BYTES }],
-      ]),
-      // Every path-10 fold requires a pinned root.
-      ppoiPinnedRoots: new Map([
-        [`${LIST_KEY_HEX}:0`, path10Root(BC_HEX_A, nodes, LEAF_INDEX)],
-      ]),
-      bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX_A, LEAF_INDEX]])]]),
-    });
-    const [proof] = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX_A]);
+    const [proof] = await pathSdk(server.url).getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX_A]);
     expect(proof.indices).toBe(EXPECTED);
     expect(proof.indices.length).toBe(64);
     expect(proof.indices.startsWith("0x")).toBe(false);
   });
 });
 
-describe("wire parity: H3 — Error-class discrimination on T1 client-PIR", () => {
+describe("wire parity: H3 - error-class discrimination on the proof path", () => {
   let server: MockServer;
   beforeAll(async () => {
     server = await startMockServer();
@@ -234,26 +180,7 @@ describe("wire parity: H3 — Error-class discrimination on T1 client-PIR", () =
     server.reset();
   });
 
-  function stubCtx(): import("../src/index").ClientPirContext {
-    return {
-      wasm: {
-        ...stubRemoteSessionExports(),
-        build_client_session: () => ({ free: () => undefined }),
-        build_seeded_query: () => new Uint8Array(16),
-        extract_response: () => new Uint8Array(32),
-        build_instance_params_blob: () => new Uint8Array(0),
-        register_client_session: makeRegisterSpy(),
-        path_indices_for_leaf: () => new Uint32Array(16),
-        path_indices_for_per_list_leaf: () => new Uint32Array(16),
-      },
-      session: { free: () => undefined },
-      crsBincode: new Uint8Array(0),
-      shardConfigBincode: shardConfigBincode(),
-      entrySize: 32,
-    };
-  }
-
-  it("ServerError (5xx) propagates as typed RavenError, NOT silent Missing", async () => {
+  it("ServerError (5xx) propagates as typed RavenError", async () => {
     server.route(
       (req) => req.url?.startsWith("/v1/instance/") ?? false,
       (_req, _body, res) => {
@@ -262,25 +189,12 @@ describe("wire parity: H3 — Error-class discrimination on T1 client-PIR", () =
         return true;
       },
     );
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: true,
-      clientPirContexts: new Map([[`t1Status:${LIST_KEY_HEX}`, stubCtx()]]),
-      bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX_A, 0]])]]),
-    });
-    try {
-      await sdk.getPOIsPerList(
-        [LIST_KEY_HEX],
-        [{ blindedCommitment: BC_HEX_A, type: "Shield" }],
-      );
-      expect.fail("expected ServerError");
-    } catch (e) {
-      expect(RavenError.is(e, "ServerError")).toBe(true);
-    }
+    await expect(pathSdk(server.url).getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX_A])).rejects.toSatisfy(
+      (e: unknown) => RavenError.is(e, "ServerError"),
+    );
   });
 
-  it("StaleAdapter (400 + X-Raven-Schema-Version) propagates, NOT silent Missing", async () => {
+  it("StaleAdapter (400 + X-Raven-Schema-Version) propagates", async () => {
     server.route(
       (req) => req.url?.startsWith("/v1/instance/") ?? false,
       (_req, _body, res) => {
@@ -289,37 +203,15 @@ describe("wire parity: H3 — Error-class discrimination on T1 client-PIR", () =
         return true;
       },
     );
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: true,
-      clientPirContexts: new Map([[`t1Status:${LIST_KEY_HEX}`, stubCtx()]]),
-      bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX_A, 0]])]]),
-    });
-    try {
-      await sdk.getPOIsPerList(
-        [LIST_KEY_HEX],
-        [{ blindedCommitment: BC_HEX_A, type: "Shield" }],
-      );
-      expect.fail("expected StaleAdapter");
-    } catch (e) {
-      expect(RavenError.is(e, "StaleAdapter")).toBe(true);
-    }
+    await expect(pathSdk(server.url).getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX_A])).rejects.toSatisfy(
+      (e: unknown) => RavenError.is(e, "StaleAdapter"),
+    );
   });
 
-  it("Network failure (unreachable port) returns Unreachable per BC", async () => {
-    const sdk = new RavenPOINodeInterface({
-      endpoint: "http://127.0.0.1:1",
-      bearerToken: TOKEN,
-      useClientPir: true,
-      clientPirContexts: new Map([[`t1Status:${LIST_KEY_HEX}`, stubCtx()]]),
-      bcToIdxMaps: new Map([[LIST_KEY_HEX, new Map([[BC_HEX_A, 0]])]]),
-    });
-    const got = await sdk.getPOIsPerList(
-      [LIST_KEY_HEX],
-      [{ blindedCommitment: BC_HEX_A, type: "Shield" }],
-    );
-    expect(got[BC_HEX_A][LIST_KEY_HEX]).toBe("Unreachable");
+  it("Network failure (unreachable port) raises Network", async () => {
+    await expect(
+      pathSdk("http://127.0.0.1:1").getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX_A]),
+    ).rejects.toSatisfy((e: unknown) => RavenError.is(e, "Network"));
   });
 });
 
@@ -339,82 +231,32 @@ describe("wire parity: H17 — upstream JSON-RPC carries chainType + chainID", (
     upstreamServer.reset();
   });
 
-  it("getPOIMerkleProofs passthrough calls ppoi_merkle_proofs", async () => {
-    mainServer.route(
-      (req) => req.url === "/v1/poi/merkle-proofs",
-      (_req, _body, res) => {
-        writeJson(res, [], {
-          "x-raven-freshness":
-            "lag_blocks=999 applied_height=10 epoch=1 confidence=0.10",
-        });
-        return true;
-      },
-    );
-    let observed: JsonRpcRequest | undefined;
-    const tree = ppoiTree([BC_HEX_A]);
+  // Upstream is asked only what every stock wallet asks it: never a status or a proof, which
+  // would name the note to the aggregator.
+  it("never asks upstream a status or proof question", async () => {
+    mountPrefixChannel(mainServer, LIST_KEY_HEX, { commitments: listHolding([[BC_HEX_A, LEAF_INDEX]]) });
+    mountPath10Route(mainServer, {
+      bcHex: BC_HEX_A,
+      nodes: NODES,
+      instance: blockLabel(LIST_KEY_HEX, 0),
+      freshness: "lag_blocks=999 applied_height=10 epoch=1 confidence=0.10",
+    });
     upstreamServer.route(
       (req) => req.url === "/",
       (_req, body, res) => {
-        observed = writeJsonRpcResult(body, res, tree.proofs);
+        writeJsonRpcResult(body, res, null);
         return true;
       },
     );
-    const sdk = new RavenPOINodeInterface({
-      endpoint: mainServer.url,
-      bearerToken: TOKEN,
-      upstreamFallbackEndpoint: upstreamServer.url,
-      useClientPir: false,
-      freshnessConfidenceFloor: 0.5,
-      chainType: 0,
-      chainId: 1,
-      ppoiPinnedRoots: new Map([[`${LIST_KEY_HEX}:0`, tree.root]]),
-    });
-    const got = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX_A]);
-    expect(got).toHaveLength(1);
-    expect(observed?.method).toBe("ppoi_merkle_proofs");
-    expect(observed?.params.chainType).toBe("0");
-    expect(observed?.params.chainID).toBe("1");
-  });
-
-  it("getPOIsPerList passthrough calls ppoi_pois_per_list", async () => {
-    mainServer.route(
-      (req) => req.url === "/v1/poi/pois-per-list",
-      (_req, _body, res) => {
-        writeJson(res, {}, {
-          "x-raven-freshness":
-            "lag_blocks=999 applied_height=10 epoch=1 confidence=0.10",
-        });
-        return true;
-      },
+    const sdk = pathSdk(mainServer.url, upstreamServer.url);
+    await sdk.getPOIsPerList([LIST_KEY_HEX], [{ blindedCommitment: BC_HEX_A, type: "Shield" }]);
+    await sdk.getPOIsPerList("V2_PoseidonMerkle", { type: 0, id: 1 }, [LIST_KEY_HEX], [
+      { blindedCommitment: BC_HEX_B, type: "Shield" },
+    ]);
+    await expect(sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX_A])).rejects.toSatisfy(
+      (e: unknown) => RavenError.is(e, "StaleData"),
     );
-    let observed: JsonRpcRequest | undefined;
-    upstreamServer.route(
-      (req) => req.url === "/",
-      (_req, body, res) => {
-        observed = writeJsonRpcResult(
-          body,
-          res,
-          { [BC_HEX_A]: { [LIST_KEY_HEX]: "Valid" } },
-        );
-        return true;
-      },
-    );
-    const sdk = new RavenPOINodeInterface({
-      endpoint: mainServer.url,
-      bearerToken: TOKEN,
-      upstreamFallbackEndpoint: upstreamServer.url,
-      useClientPir: false,
-      freshnessConfidenceFloor: 0.5,
-      chainType: 0,
-      chainId: 11_155_111,
-    });
-    await sdk.getPOIsPerList(
-      [LIST_KEY_HEX],
-      [{ blindedCommitment: BC_HEX_A, type: "Shield" }],
-    );
-    expect(observed?.method).toBe("ppoi_pois_per_list");
-    expect(observed?.params.chainType).toBe("0");
-    expect(observed?.params.chainID).toBe("11155111");
+    expect(upstreamServer.requests).toHaveLength(0);
   });
 
   it("validatePOIMerkleroots calls ppoi_validate_poi_merkleroots with poiMerkleroots", async () => {

@@ -4,13 +4,15 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import {
+  LEAVES_PER_PPOI_BLOCK,
   RavenPOINodeInterface,
   RavenError,
-  hexToBytes,
   type ClientPirContext,
   type RavenInspireWasm,
 } from "../src/index";
 import { encodeBatchResponseNodes, encodedBatchCount } from "./helpers/auth_path_stub";
+import { blockLabel, forestConfig } from "./helpers/forest";
+import { PATH10_ROW_BYTES, path10Root, path10Siblings, path10Slot } from "./helpers/path10_row";
 import { EXPECTED_WIRE_SCHEMA_VERSION } from "./helpers/wire_schema";
 import { startMockServer, writeBinary, writeJson, type MockServer } from "./helpers/mock_server";
 import {
@@ -21,16 +23,37 @@ import {
 import { shardConfigBincode } from "./helpers/shard_config";
 
 const TOKEN = "test-token-padded-long-enough-1234";
-const INSTANCE = "t1Status:abababababababababababababababababababababababababababababababab";
 const LIST_KEY = "abababababababababababababababababababababababababababababababab";
-const BC = "bc00112233445566778899aabbccddeeff00112233445566778899aabbccdd01";
+const BC = "0c00112233445566778899aabbccddeeff00112233445566778899aabbccdd01";
+/** The same note shape one block up, so a second instance is asked. */
+const BC_BLOCK1 = "0d00112233445566778899aabbccddeeff00112233445566778899aabbccdd02";
 const HANDLE = 9_007_199_254_740_997n;
 const REGISTRATION_BODY = new Uint8Array([0, 2, 7, 8, 9]);
+const NODES = path10Siblings(0x3c);
 
-function statusRow(): Uint8Array {
-  const row = new Uint8Array(32);
-  row.set(hexToBytes(BC).subarray(0, 31), 1);
-  return row;
+/** Every slot answers with the note of the block the instance label names. */
+function slotFor(url: string): Uint8Array {
+  const bcHex = url.includes(encodeURIComponent(blockLabel(LIST_KEY, 1))) ? BC_BLOCK1 : BC;
+  return path10Slot({ bcHex, nodes: NODES });
+}
+
+function sessionSdk(server: MockServer, context: ClientPirContext): RavenPOINodeInterface {
+  return new RavenPOINodeInterface({
+    ...forestConfig({
+      endpoint: server.url,
+      listKeyHex: LIST_KEY,
+      ctx: context,
+      placed: [
+        [BC, 0],
+        [BC_BLOCK1, LEAVES_PER_PPOI_BLOCK],
+      ],
+      pins: new Map([
+        [0, path10Root(BC, NODES, 0)],
+        [1, path10Root(BC_BLOCK1, NODES, 0)],
+      ]),
+    }),
+    bearerToken: TOKEN,
+  });
 }
 
 function queryBundleForHandle(handle: bigint | undefined): Uint8Array {
@@ -45,8 +68,8 @@ interface RehandshakeRig {
   readonly sdk: RavenPOINodeInterface;
   readonly installedHandles: bigint[];
   readonly batchHandles: bigint[];
-  query(): Promise<Record<string, Record<string, string>>>;
-  queryPath(): Promise<unknown>;
+  query(): Promise<unknown[]>;
+  queryPath(): Promise<unknown[]>;
   flush(): void;
 }
 
@@ -77,11 +100,9 @@ function mountRehandshakeRig(
       installedHandles.push(handle);
     },
     build_seeded_query: () => queryBundleForHandle(installed),
-    retarget_seeded_query_shard: (query) => new Uint8Array(query),
     extract_response: (_session, _crs, _state, response) => new Uint8Array(response),
     register_client_session: () => undefined,
     build_instance_params_blob: () => new Uint8Array(0),
-    path_indices_for_leaf: () => new Uint32Array(16),
     path_indices_for_per_list_leaf: () => new Uint32Array(16),
   };
   const context: ClientPirContext = {
@@ -89,7 +110,7 @@ function mountRehandshakeRig(
     session: { free: () => undefined },
     crsBincode: new Uint8Array(0),
     shardConfigBincode: shardConfigBincode(),
-    entrySize: 32,
+    entrySize: PATH10_ROW_BYTES,
   };
 
   server.routeSession((_req, body, res) => {
@@ -103,7 +124,7 @@ function mountRehandshakeRig(
   });
   server.route(
     (req) => (req.url ?? "").endsWith("/batch"),
-    async (_req, body, res) => {
+    async (req, body, res) => {
       const count = encodedBatchCount(body);
       const bodyView = new DataView(body.buffer, body.byteOffset, body.byteLength);
       const handle = bodyView.getBigUint64(10, true);
@@ -125,35 +146,19 @@ function mountRehandshakeRig(
         res.end();
         return true;
       }
-      writeBinary(
-        res,
-        encodeBatchResponseNodes(Array.from({ length: count }, statusRow)),
-        { "x-raven-epoch": "1", "x-raven-schema-version": "6" },
-      );
+      const slot = slotFor(req.url ?? "");
+      writeBinary(res, encodeBatchResponseNodes(Array.from({ length: count }, () => slot)));
       return true;
     },
   );
 
-  const sdk = new RavenPOINodeInterface({
-    endpoint: server.url,
-    bearerToken: TOKEN,
-    useClientPir: true,
-    clientPirContexts: new Map([
-      [INSTANCE, context],
-      ["t3CommitTree:0", context],
-    ]),
-    bcToIdxMaps: new Map([[LIST_KEY, new Map([[BC, 0]])]]),
-  });
+  const sdk = sessionSdk(server, context);
   return {
     sdk,
     installedHandles,
     batchHandles,
-    query: () =>
-      sdk.getPOIsPerList(
-        [LIST_KEY],
-        [{ blindedCommitment: BC, type: "Shield" }],
-      ),
-    queryPath: () => sdk.getMerkleProof(0, 0),
+    query: () => sdk.getPOIMerkleProofs(LIST_KEY, [BC]),
+    queryPath: () => sdk.getPOIMerkleProofs(LIST_KEY, [BC_BLOCK1]),
     flush: () => {
       flushed = true;
       active = undefined;
@@ -195,11 +200,9 @@ describe("client-PIR remote session handshake", () => {
         buildHandles.push(installed);
         return new Uint8Array(16);
       },
-      retarget_seeded_query_shard: (query) => new Uint8Array(query),
       extract_response: (_session, _crs, _state, response) => new Uint8Array(response),
       register_client_session: () => undefined,
       build_instance_params_blob: () => new Uint8Array(0),
-      path_indices_for_leaf: () => new Uint32Array(16),
       path_indices_for_per_list_leaf: () => new Uint32Array(16),
     };
     const context: ClientPirContext = {
@@ -207,7 +210,7 @@ describe("client-PIR remote session handshake", () => {
       session: { free: () => undefined },
       crsBincode: new Uint8Array(0),
       shardConfigBincode: shardConfigBincode(),
-      entrySize: 32,
+      entrySize: PATH10_ROW_BYTES,
     };
 
     server.routeSession(
@@ -221,28 +224,19 @@ describe("client-PIR remote session handshake", () => {
     );
     server.route(
       (req) => (req.url ?? "").endsWith("/batch"),
-      (_req, body, res) => {
+      (req, body, res) => {
         const count = encodedBatchCount(body);
-        writeBinary(res, encodeBatchResponseNodes(Array.from({ length: count }, statusRow)));
+        const slot = slotFor(req.url ?? "");
+        writeBinary(res, encodeBatchResponseNodes(Array.from({ length: count }, () => slot)));
         return true;
       },
     );
 
-    const sdk = new RavenPOINodeInterface({
-      endpoint: server.url,
-      bearerToken: TOKEN,
-      useClientPir: true,
-      clientPirContexts: new Map([[INSTANCE, context]]),
-      bcToIdxMaps: new Map([[LIST_KEY, new Map([[BC, 0]])]]),
-    });
-    const query = () =>
-      sdk.getPOIsPerList(
-        [LIST_KEY],
-        [{ blindedCommitment: BC, type: "Shield" }],
-      );
+    const sdk = sessionSdk(server, context);
+    const query = () => sdk.getPOIMerkleProofs(LIST_KEY, [BC]);
 
-    await expect(query()).resolves.toEqual({ [BC]: { [LIST_KEY]: "Valid" } });
-    await expect(query()).resolves.toEqual({ [BC]: { [LIST_KEY]: "Valid" } });
+    await expect(query()).resolves.toHaveLength(1);
+    await expect(query()).resolves.toHaveLength(1);
 
     const sessionRequests = server.requests.filter((request) => request.url.endsWith("/session"));
     const batchRequests = server.requests.filter((request) => request.url.endsWith("/batch"));
@@ -255,16 +249,17 @@ describe("client-PIR remote session handshake", () => {
     expect(new Set(clientIds)).toEqual(new Set([clientIds[0]]));
     expect(installed).toBe(HANDLE);
     expect(buildHandles).toEqual([HANDLE, HANDLE]);
-    expect(sdk.lastWireRequests()).toHaveLength(2);
-    expect(sdk.lastWireRequests().every((request) => request.url.endsWith("/batch"))).toBe(true);
+    const posted = sdk.lastWireRequests().filter((request) => request.method === "POST");
+    expect(posted).toHaveLength(2);
+    expect(posted.every((request) => request.url.endsWith("/batch"))).toBe(true);
   });
 
   it("replaces a flushed handle once and serves the retried query", async () => {
     const rig = mountRehandshakeRig(server);
-    await expect(rig.query()).resolves.toEqual({ [BC]: { [LIST_KEY]: "Valid" } });
+    await expect(rig.query()).resolves.toHaveLength(1);
 
     rig.flush();
-    await expect(rig.query()).resolves.toEqual({ [BC]: { [LIST_KEY]: "Valid" } });
+    await expect(rig.query()).resolves.toHaveLength(1);
 
     expect(rig.installedHandles).toEqual([41n, 41n, 42n]);
     expect(rig.batchHandles).toEqual([41n, 41n, 42n]);
@@ -279,7 +274,7 @@ describe("client-PIR remote session handshake", () => {
 
   it("stops after one replacement when the replacement handle is also refused", async () => {
     const rig = mountRehandshakeRig(server, { refuseAfterFlush: true });
-    await expect(rig.query()).resolves.toEqual({ [BC]: { [LIST_KEY]: "Valid" } });
+    await expect(rig.query()).resolves.toHaveLength(1);
 
     rig.flush();
     await expect(rig.query()).rejects.toMatchObject({
@@ -308,12 +303,12 @@ describe("client-PIR remote session handshake", () => {
     expect(rig.batchHandles).toEqual([41n]);
   });
 
-  it("uses the same one-replacement state machine for auth-path batches", async () => {
+  it("runs the same one-replacement state machine on another block's instance", async () => {
     const rig = mountRehandshakeRig(server);
-    await expect(rig.queryPath()).resolves.toMatchObject({ kind: "authPath" });
+    await expect(rig.queryPath()).resolves.toHaveLength(1);
 
     rig.flush();
-    await expect(rig.queryPath()).resolves.toMatchObject({ kind: "authPath" });
+    await expect(rig.queryPath()).resolves.toHaveLength(1);
 
     expect(rig.installedHandles).toEqual([41n, 41n, 42n]);
     expect(rig.batchHandles).toEqual([41n, 41n, 42n]);
@@ -322,29 +317,29 @@ describe("client-PIR remote session handshake", () => {
 
   it("uses a distinct stable client identity for each instance", async () => {
     const rig = mountRehandshakeRig(server);
-    await expect(rig.query()).resolves.toEqual({ [BC]: { [LIST_KEY]: "Valid" } });
-    await expect(rig.queryPath()).resolves.toMatchObject({ kind: "authPath" });
+    await expect(rig.query()).resolves.toHaveLength(1);
+    await expect(rig.queryPath()).resolves.toHaveLength(1);
 
-    const statusRequests = server.requests.filter((request) =>
-      request.url.includes(encodeURIComponent(`t1Status-${LIST_KEY}`)),
+    const block0Requests = server.requests.filter((request) =>
+      request.url.includes(encodeURIComponent(blockLabel(LIST_KEY, 0))),
     );
-    const treeRequests = server.requests.filter((request) =>
-      request.url.includes(encodeURIComponent("commit-tree-0")),
+    const block1Requests = server.requests.filter((request) =>
+      request.url.includes(encodeURIComponent(blockLabel(LIST_KEY, 1))),
     );
-    const statusIds = new Set(
-      statusRequests.map((request) => request.headers["x-raven-client-id"]),
+    const block0Ids = new Set(
+      block0Requests.map((request) => request.headers["x-raven-client-id"]),
     );
-    const treeIds = new Set(treeRequests.map((request) => request.headers["x-raven-client-id"]));
-    expect(statusIds.size).toBe(1);
-    expect(treeIds.size).toBe(1);
-    expect([...statusIds][0]).toMatch(/^[0-9a-f]{32}$/);
-    expect([...treeIds][0]).toMatch(/^[0-9a-f]{32}$/);
-    expect([...statusIds][0]).not.toBe([...treeIds][0]);
+    const block1Ids = new Set(block1Requests.map((request) => request.headers["x-raven-client-id"]));
+    expect(block0Ids.size).toBe(1);
+    expect(block1Ids.size).toBe(1);
+    expect([...block0Ids][0]).toMatch(/^[0-9a-f]{32}$/);
+    expect([...block1Ids][0]).toMatch(/^[0-9a-f]{32}$/);
+    expect([...block0Ids][0]).not.toBe([...block1Ids][0]);
   });
 
   it("deduplicates the replacement handshake across concurrent dead-handle refusals", async () => {
     const rig = mountRehandshakeRig(server, { deadRequestBarrier: 2 });
-    await expect(rig.query()).resolves.toEqual({ [BC]: { [LIST_KEY]: "Valid" } });
+    await expect(rig.query()).resolves.toHaveLength(1);
 
     rig.flush();
     await expect(Promise.all([rig.query(), rig.query()])).resolves.toHaveLength(2);

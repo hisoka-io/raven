@@ -1,12 +1,6 @@
 /** Auth-path test rig: a path-indices wasm stub and a batch encoder whose nodes carry their serving epoch. */
 
-import {
-  TREE_DEPTH,
-  type ClientPirContext,
-  type CommitTreeAuthPath,
-  type CommitTreeProof,
-  type RavenInspireWasm,
-} from "../../src/index";
+import { TREE_DEPTH, type ClientPirContext, type RavenInspireWasm } from "../../src/index";
 import { makeRegisterSpy, stubRemoteSessionExports } from "./register_spy";
 import {
   STUB_QUERY_BYTES,
@@ -43,7 +37,6 @@ export function stubWasm(queryBytes?: Uint8Array): RavenInspireWasm {
     extract_response: (_session, _crs, _state, response, _entry) => new Uint8Array(response),
     build_instance_params_blob: () => new Uint8Array(0),
     register_client_session: makeRegisterSpy(),
-    path_indices_for_leaf: (_tree: number, leafIdx: number): Uint32Array => siblingPath(leafIdx),
     path_indices_for_per_list_leaf: (listKey: Uint8Array, idx: number): Uint32Array => {
       if (listKey.length !== 32) {
         throw new Error("path_indices_for_per_list_leaf: list_key length must be 32");
@@ -139,13 +132,4 @@ export function encodedBatchCount(body: Uint8Array): number {
 
 export function epochMarkers(elements: string[]): string[] {
   return Array.from(new Set(elements.map((e) => e.slice(0, 2)))).sort();
-}
-
-/** Narrow a commit-tree result to its rootless auth-path arm. */
-export function authPathOf(proof: CommitTreeProof): CommitTreeAuthPath {
-  const kind: string = proof.kind;
-  if (kind !== "authPath") {
-    throw new Error(`expected a commit-tree auth path, got kind=${kind}`);
-  }
-  return proof;
 }

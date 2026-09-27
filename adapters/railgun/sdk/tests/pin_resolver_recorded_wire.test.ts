@@ -19,11 +19,11 @@ import {
 } from "../src/index";
 import { TOKEN, stubCtx } from "./helpers/auth_path_stub";
 import { startMockServer, type MockServer } from "./helpers/mock_server";
+import { indexHolding } from "./helpers/prefix_channel";
 import { PATH10_ROW_BYTES, mountPath10Route } from "./helpers/path10_row";
 import { EXPECTED_WIRE_SCHEMA_VERSION } from "./helpers/wire_schema";
 
 const AGGREGATOR = "https://aggregator.invalid";
-const OTHER_UPSTREAM = "https://upstream.invalid";
 const MAINNET = 1;
 const TXID_VERSION = "V2_PoseidonMerkle";
 const OFAC_LIST_KEY = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88";
@@ -230,10 +230,13 @@ describe("pin resolution over recorded aggregator answers", () => {
       return new RavenPOINodeInterface({
         endpoint: adapter.url,
         bearerToken: TOKEN,
-        useClientPir: true,
         chainId: MAINNET,
-        clientPirContexts: new Map([[`t2Path:${OFAC_LIST_KEY}`, pathCtx]]),
-        bcToIdxMaps: new Map([[OFAC_LIST_KEY, new Map([[BLOCK0_LAST_BC, BLOCK0_LAST_INDEX]])]]),
+        clientPirContexts: new Map([[`t2Path:${MAINNET}:${OFAC_LIST_KEY}`, pathCtx]]),
+        clientPirInstanceLabels: new Map([[`t2Path:${MAINNET}:${OFAC_LIST_KEY}:0`, "ppoi-paths-ofac-0"]]),
+        poiListIndexes: new Map([
+          [`${MAINNET}:${OFAC_LIST_KEY}`, indexHolding([[BLOCK0_LAST_BC, BLOCK0_LAST_INDEX]])],
+        ]),
+        poiListIndexStore: false,
         upstreamFallbackEndpoint: AGGREGATOR,
         fetchImpl: wire.fetch,
         ...extra,
@@ -251,7 +254,9 @@ describe("pin resolution over recorded aggregator answers", () => {
       expect(wire.sent(AGGREGATOR)).toEqual([BLOCK0_POINT.request]);
       expect(wire.sent(AGGREGATOR).some((body) => body.includes(BLOCK0_LAST_BC))).toBe(false);
       for (const request of adapter.requests) {
-        expect(request.url).toMatch(/\/session$|^\/v1\/instance\/[^/]+\/batch$/);
+        expect(request.url).toMatch(
+          /\/session$|^\/v1\/instance\/[^/]+\/batch$|^\/v1\/poi\/[0-9a-f]{64}\/bc-prefixes\?since=0$/,
+        );
       }
     });
 
@@ -276,30 +281,22 @@ describe("pin resolution over recorded aggregator answers", () => {
       expect(wire.sent(AGGREGATOR)).toEqual([BLOCK0_POINT.request]);
     });
 
-    // The recorded upstream proof, in upstream's own spelling, on the stale fallback: it reaches
-    // the wallet only because its fold equals a root from a party other than the one that sent it.
-    it("verifies the recorded upstream proof on the stale fallback against a separate pin source", async () => {
+    // No private way exists to re-ask for a stale path, so it is refused, and nothing about the
+    // note goes to the aggregator or anyone else.
+    it("refuses a stale served path and asks no one else for it", async () => {
       servePath(BLOCK0_SIBLINGS, STALE_FRESHNESS);
       const aggregator = replayHost([BLOCK0_POINT], faults);
-      const upstream: Host = (body) => {
-        const request = JSON.parse(body) as { id: number; method: string };
-        expect(request.method).toBe("ppoi_merkle_proofs");
-        return new Response(
-          JSON.stringify({ jsonrpc: "2.0", result: [BLOCK0_PROOF], id: request.id }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
-      };
-      const wire = stubWire({ [AGGREGATOR]: aggregator, [OTHER_UPSTREAM]: upstream }, faults);
+      const wire = stubWire({ [AGGREGATOR]: aggregator }, faults);
 
-      const proofs = await sdkOver(wire, {
-        upstreamFallbackEndpoint: OTHER_UPSTREAM,
-        privateStalePolicy: "allow-upstream-disclosure",
-        pinUpstream: AGGREGATOR,
-      }).getPOIMerkleProofs(OFAC_LIST_KEY, [BLOCK0_LAST_BC]);
+      let thrown: unknown;
+      try {
+        await sdkOver(wire).getPOIMerkleProofs(OFAC_LIST_KEY, [BLOCK0_LAST_BC]);
+      } catch (error) {
+        thrown = error;
+      }
 
-      expect(proofs).toEqual([BLOCK0_PROOF]);
-      expect(wire.sent(OTHER_UPSTREAM)).toHaveLength(1);
-      expect(wire.sent(AGGREGATOR)).toEqual([BLOCK0_POINT.request]);
+      expect(RavenError.is(thrown, "StaleData"), String(thrown)).toBe(true);
+      expect(wire.sent(AGGREGATOR)).toEqual([]);
     });
   });
 });

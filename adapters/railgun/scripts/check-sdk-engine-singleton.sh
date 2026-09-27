@@ -6,6 +6,10 @@
 # static, so an interface installed through one copy is never read through the other: wrong state
 # and no error. The SDK's own tree cannot show this, because engine is only a devDependency there.
 #
+# Engine is a required peer, so the consumer lists it at the wallet's own version, read from the
+# wallet's manifest. Without that npm meets the peer with the newest version the range admits and
+# nests the wallet's pinned copy beneath it: two engines.
+#
 # Three instruments, because each misses a defect another catches: a second engine copy leaves
 # `npm ls` green, and a peer range that excludes the wallet's pin leaves one copy on disk.
 #   single-instance  exactly one engine directory, and the consumer, the SDK and the wallet all
@@ -15,20 +19,28 @@
 #                    under skipLibCheck, which every engine consumer needs; and with it off, no
 #                    diagnostic lands outside engine's own declarations
 #
-# Needs the npm registry for the wallet's tree, so it stays out of the offline pack gate. Two
-# installs: npm's default, and --legacy-peer-deps, which is how the terminal wallet installs.
+# A consumer that skips that line gets two engines, which no manifest of ours can prevent. The
+# wallet-only install is that consumer: whatever npm lays out, PerChainPOINodeInterface.install
+# through the consumer's engine must land where the wallet reads, or refuse with InvalidQuery. It
+# never passes silently while the wallet's engine keeps its stock interface.
+#   install-lands    after the wallet's copy is given a stock interface, as startRailgunEngine
+#                    does, install either leaves the router on that copy or refuses
+#
+# Needs the npm registry for the wallet's tree, so it stays out of the offline pack gate. Three
+# installs: npm's default and --legacy-peer-deps (how the terminal wallet installs), both listing
+# engine at the wallet's version, and wallet-only, which leaves engine out.
 #
 # Overrides, all used by check-sdk-engine-singleton-selftest.sh:
 #   SDK_ENGINE_PACKAGE_DIR  package to pack (default: the real SDK)
 #   SDK_ENGINE_SCRATCH      working directory (default: a fresh mktemp dir)
 #   SDK_ENGINE_WALLET       wallet to install beside it (default: the version the terminal wallet pins)
-#   SDK_ENGINE_MODES        install modes (default: "default legacy-peer-deps")
+#   SDK_ENGINE_MODES        install modes (default: "default legacy-peer-deps wallet-only")
 set -uo pipefail
 
 ADAPTER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PKG="$(cd "${SDK_ENGINE_PACKAGE_DIR:-${ADAPTER_ROOT}/sdk}" && pwd)"
 WALLET="${SDK_ENGINE_WALLET:-@railgun-community/wallet@10.10.0-rc.1}"
-MODES="${SDK_ENGINE_MODES:-default legacy-peer-deps}"
+MODES="${SDK_ENGINE_MODES:-default legacy-peer-deps wallet-only}"
 TSC="${PKG}/node_modules/.bin/tsc"
 
 fail() { echo "check-sdk-engine-singleton: FAIL $*" >&2; exit 1; }
@@ -126,7 +138,7 @@ check_mode() { # mode
   mkdir -p "$dir"
   printf '{"name":"raven-engine-singleton-probe","private":true,"version":"0.0.0","type":"commonjs"}\n' \
     > "${dir}/package.json"
-  ( cd "$dir" && npm install "${flags[@]}" "$tarball" "$WALLET" ) >"${dir}/install.log" 2>&1 \
+  ( cd "$dir" && npm install "${flags[@]}" "$tarball" "$WALLET" "@railgun-community/engine@${engine_pin}" ) >"${dir}/install.log" 2>&1 \
     || { tail -n 40 "${dir}/install.log" >&2; fail "install (${mode}): the tarball and ${WALLET} do not install together"; }
 
   local copies=()
@@ -173,8 +185,84 @@ if (files.size !== 1 || ![...files][0].startsWith(home)) {
   echo "  ok    ${mode}: one engine (${copies[0]}), every edge valid, one resolved file; types assign, lib check clean outside engine (${upstream} upstream diagnostics inside it)"
 }
 
+check_wallet_only() {
+  local mode=wallet-only dir="${WORK}/wallet-only"
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  printf '{"name":"raven-engine-singleton-probe","private":true,"version":"0.0.0","type":"commonjs"}\n' \
+    > "${dir}/package.json"
+  ( cd "$dir" && npm install --no-audit --no-fund --ignore-scripts "$tarball" "$WALLET" ) >"${dir}/install.log" 2>&1 \
+    || { tail -n 40 "${dir}/install.log" >&2; fail "install (${mode}): the tarball and ${WALLET} do not install together"; }
+
+  local copies=()
+  mapfile -t copies < <( cd "$dir" && find node_modules -type d -path '*/@railgun-community/engine' | LC_ALL=C sort )
+
+  local outcome
+  outcome="$( cd "$dir" && node -e '
+const { realpathSync } = require("node:fs");
+const { join } = require("node:path");
+const [sdkName] = process.argv.slice(1);
+const sdk = require(sdkName);
+const walletEngine = require(require.resolve("@railgun-community/engine", {
+  paths: [realpathSync(join("node_modules", "@railgun-community", "wallet"))],
+}));
+let consumerEngine;
+try {
+  consumerEngine = require("@railgun-community/engine");
+} catch (cause) {
+  console.error(`the consumer cannot import engine, so it cannot call install: ${cause}`);
+  process.exit(1);
+}
+const stock = {
+  isActive: () => true,
+  isRequired: async () => true,
+  getPOIsPerList: async () => ({}),
+  getPOIMerkleProofs: async () => [],
+  validatePOIMerkleroots: async () => true,
+  submitPOI: async () => undefined,
+  submitLegacyTransactProofs: async () => undefined,
+};
+walletEngine.POI.init([], stock);
+const raven = new sdk.RavenPOINodeInterface({ endpoint: "https://raven.example.com" });
+let refused;
+try {
+  sdk.PerChainPOINodeInterface.install(consumerEngine.POI, [], [raven]);
+} catch (cause) {
+  refused = cause;
+}
+const held = walletEngine.POI.nodeInterface;
+if (refused === undefined) {
+  if (!(held instanceof sdk.PerChainPOINodeInterface)) {
+    console.error("install returned, and the wallet engine still holds its stock interface: the router landed on a copy the wallet never reads");
+    process.exit(1);
+  }
+  process.stdout.write("installed on the wallet engine");
+} else {
+  if (!sdk.RavenError.is(refused, "InvalidQuery")) {
+    console.error(`install refused with something other than InvalidQuery: ${refused}`);
+    process.exit(1);
+  }
+  if (consumerEngine === walletEngine) {
+    console.error(`install refused although the consumer and the wallet share one engine: ${refused.message}`);
+    process.exit(1);
+  }
+  if (held !== stock) {
+    console.error("install refused, yet the wallet engine no longer holds its stock interface");
+    process.exit(1);
+  }
+  process.stdout.write("refused with InvalidQuery");
+}
+' "$sdk_name" 2>"${dir}/install-lands.err" )" \
+    || { cat "${dir}/install-lands.err" >&2; fail "install-lands (${mode}): PerChainPOINodeInterface.install did not land where the wallet reads or refuse"; }
+
+  echo "  ok    ${mode}: ${#copies[@]} engine copies; install ${outcome}"
+}
+
+engine_pin="$(npm view "$WALLET" "dependencies.@railgun-community/engine" 2>/dev/null)"
+[[ -n "$engine_pin" ]] || { echo "check-sdk-engine-singleton: could not read the engine version ${WALLET} depends on" >&2; exit 3; }
+
 for mode in $MODES; do
-  check_mode "$mode"
+  if [[ "$mode" == wallet-only ]]; then check_wallet_only; else check_mode "$mode"; fi
 done
 
-echo "check-sdk-engine-singleton: beside ${WALLET}, the packed SDK leaves one engine and typechecks against it."
+echo "check-sdk-engine-singleton: beside ${WALLET}, the packed SDK leaves one engine and typechecks against it, and without engine listed its install lands where the wallet reads or refuses."

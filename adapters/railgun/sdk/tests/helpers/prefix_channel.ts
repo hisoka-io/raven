@@ -1,6 +1,4 @@
-/** A list the mock node serves on both the prefix channel and the PIR batch route. */
-
-import type { ServerResponse } from "node:http";
+/** A list the mock node serves on the prefix channel, and indexes built without asking one. */
 
 import {
   BC_INDEX_PREFIX_BYTES,
@@ -10,8 +8,7 @@ import {
   type ClientPirContext,
   type RavenInspireWasm,
 } from "../../src/index";
-import { encodeBatchResponseNodes } from "./auth_path_stub";
-import { writeJson, type MockServer } from "./mock_server";
+import type { MockServer } from "./mock_server";
 import { stubQueryBundle } from "./private_wire";
 import { makeRegisterSpy, stubRemoteSessionExports } from "./register_spy";
 import { shardConfigBincode } from "./shard_config";
@@ -69,27 +66,6 @@ export function mountPrefixChannel(server: MockServer, listKeyHex: string, list:
   );
 }
 
-/** The JSON channel over the same list; `rows` overrides what it serves, as a faulty node would. */
-export function mountJsonIndex(
-  server: MockServer,
-  listKeyHex: string,
-  list: MockList,
-  rows?: () => string[],
-): void {
-  server.route(
-    (req) => req.url === `/v1/poi/${listKeyHex}/bc-to-idx-map`,
-    (_req, _body, res) => {
-      const served = rows?.() ?? list.commitments;
-      writeJson(res, {
-        epoch: list.epoch ?? 0,
-        listKey: listKeyHex,
-        entries: served.map((bc, idx) => ({ bc, idx })),
-      });
-      return true;
-    },
-  );
-}
-
 /** The index a node serving `commitments` publishes, built without asking one. */
 export function prefixIndexOf(commitments: readonly string[], epoch = 0): BcPrefixIndex {
   const prefixes = new Uint8Array(commitments.length * BC_INDEX_PREFIX_BYTES);
@@ -112,7 +88,6 @@ export function targetNamingCtx(entrySize = 32): ClientPirContext {
     extract_response: (_s, _c, _st, response, _e) => new Uint8Array(response),
     build_instance_params_blob: () => new Uint8Array(0),
     register_client_session: makeRegisterSpy(),
-    path_indices_for_leaf: () => new Uint32Array(16),
     path_indices_for_per_list_leaf: () => new Uint32Array(16),
   };
   return {
@@ -135,37 +110,6 @@ export function batchTargets(body: Uint8Array): number[] {
   return out;
 }
 
-export function statusRow(statusByte: number, commitmentHex: string): Uint8Array {
-  const row = new Uint8Array(32);
-  row[0] = statusByte;
-  row.set(hexToBytes(commitmentHex).subarray(0, 31), 1);
-  return row;
-}
-
-/** T1 rows for the list: row `i` binds `commitments[i]`, with the status `statusOf(i)` returns. */
-export function mountStatusRows(
-  server: MockServer,
-  list: MockList,
-  statusOf: (row: number) => number,
-  rowFor: (row: number) => Uint8Array = (row) =>
-    statusRow(statusOf(row), list.commitments[row]),
-): void {
-  server.route(
-    (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
-    (_req, body, res: ServerResponse) => {
-      const rows = batchTargets(body).map((target) =>
-        target < list.commitments.length ? rowFor(target) : new Uint8Array(32),
-      );
-      res.writeHead(200, {
-        "content-type": "application/octet-stream",
-        "x-raven-freshness": "lag_blocks=0 applied_height=0 epoch=1 confidence=1",
-      });
-      res.end(Buffer.from(encodeBatchResponseNodes(rows)));
-      return true;
-    },
-  );
-}
-
 /** Distinct 32-byte commitments below the BN254 modulus, with distinct six-byte prefixes. */
 export function commitmentAt(seed: number): string {
   return `10${seed.toString(16).padStart(10, "0")}${"ab".repeat(26)}`;
@@ -174,4 +118,36 @@ export function commitmentAt(seed: number): string {
 /** A second commitment sharing `commitmentAt(seed)`'s prefix and nothing after it. */
 export function prefixTwinOf(seed: number): string {
   return `10${seed.toString(16).padStart(10, "0")}${"cd".repeat(26)}`;
+}
+
+/** Filler rows start 0xfffe, a prefix no commitment below the BN254 modulus can carry. */
+function fillerPrefix(row: number): Uint8Array {
+  return new Uint8Array([0xff, 0xfe, row >>> 24, (row >>> 16) & 0xff, (row >>> 8) & 0xff, row & 0xff]);
+}
+
+/** An index of `total` rows holding each commitment at its index and filler everywhere else. */
+export function indexHolding(
+  placed: readonly (readonly [string, number])[],
+  total = Math.max(0, ...placed.map(([, idx]) => idx + 1)),
+): BcPrefixIndex {
+  const prefixes = new Uint8Array(total * BC_INDEX_PREFIX_BYTES);
+  for (let row = 0; row < total; row += 1) {
+    prefixes.set(fillerPrefix(row), row * BC_INDEX_PREFIX_BYTES);
+  }
+  for (const [bc, idx] of placed) {
+    prefixes.set(hexToBytes(bc).subarray(0, BC_INDEX_PREFIX_BYTES), idx * BC_INDEX_PREFIX_BYTES);
+  }
+  return { epoch: 0, prefixes, total };
+}
+
+/** The commitments of an index built by `indexHolding`, filler included, for a mock channel. */
+export function listHolding(
+  placed: readonly (readonly [string, number])[],
+  total = Math.max(0, ...placed.map(([, idx]) => idx + 1)),
+): string[] {
+  const rows = Array.from({ length: total }, (_unused, row) =>
+    Buffer.from(fillerPrefix(row)).toString("hex").padEnd(64, "0"),
+  );
+  for (const [bc, idx] of placed) rows[idx] = bc.replace(/^0x/i, "").toLowerCase();
+  return rows;
 }

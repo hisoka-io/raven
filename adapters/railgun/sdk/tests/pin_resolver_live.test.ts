@@ -16,6 +16,7 @@ import {
 import { foldMerkleRoot } from "../src/poseidon";
 import { TOKEN, encodeBatchResponseNodes, stubCtx } from "./helpers/auth_path_stub";
 import { startMockServer, type MockServer } from "./helpers/mock_server";
+import { indexHolding } from "./helpers/prefix_channel";
 
 const UPSTREAM = process.env.RAVEN_PIN_UPSTREAM;
 const liveIt = UPSTREAM !== undefined && UPSTREAM !== "" ? it : it.skip;
@@ -102,11 +103,13 @@ function liveSdk(adapter: MockServer, log: SentRequest[]): RavenPOINodeInterface
   return new RavenPOINodeInterface({
     endpoint: adapter.url,
     bearerToken: TOKEN,
-    useClientPir: true,
     chainId: MAINNET,
-    clientPirContexts: new Map([[`t2Path:${OFAC_LIST_KEY}`, pathCtx]]),
+    clientPirContexts: new Map([[`t2Path:${MAINNET}:${OFAC_LIST_KEY}`, pathCtx]]),
     clientPirInstanceLabels: new Map([[`t2Path:${MAINNET}:${OFAC_LIST_KEY}:0`, "ppoi-paths-ofac-0"]]),
-    bcToIdxMaps: new Map([[OFAC_LIST_KEY, new Map([[BLOCK0_LAST_BC, BLOCK0_LAST_INDEX]])]]),
+    poiListIndexes: new Map([
+      [`${MAINNET}:${OFAC_LIST_KEY}`, indexHolding([[BLOCK0_LAST_BC, BLOCK0_LAST_INDEX]])],
+    ]),
+    poiListIndexStore: false,
     upstreamFallbackEndpoint: UPSTREAM,
     fetchImpl: recordingFetch(log),
   });

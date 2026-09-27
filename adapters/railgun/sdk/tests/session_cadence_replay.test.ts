@@ -8,12 +8,16 @@ import {
 import {
   encodeBatchResponseNodes,
   encodedBatchCount,
-  NODE_BYTES,
   stubWasm,
   TOKEN,
 } from "./helpers/auth_path_stub";
+import { forestConfig } from "./helpers/forest";
+import { PATH10_ROW_BYTES, path10Siblings, path10Slot } from "./helpers/path10_row";
 import { STUB_QUERY_BYTES, stubQueryBundle } from "./helpers/private_wire";
 import { shardConfigBincode } from "./helpers/shard_config";
+
+const LIST_KEY_HEX = "ab".repeat(32);
+const BC_HEX = "5a".repeat(32);
 
 const TRANSACTION_COUNT = 20_000;
 const INPUTS_PER_TRANSACTION = 2;
@@ -121,8 +125,11 @@ async function replayActualSdk(_timestamps: readonly number[]): Promise<CadenceD
     session: { free: () => undefined },
     crsBincode: new Uint8Array(0),
     shardConfigBincode: shardConfigBincode(),
-    entrySize: NODE_BYTES,
+    entrySize: PATH10_ROW_BYTES,
   };
+  // A row with the wrong magic is refused before the 16-hash fold, which 40,000 proofs cannot
+  // afford here; the handshake cadence is decided before the row is read.
+  const slot = path10Slot({ bcHex: BC_HEX, nodes: path10Siblings(), magic: "XXXX" });
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = requestUrl(input);
     if (url.endsWith("/session")) {
@@ -154,8 +161,8 @@ async function replayActualSdk(_timestamps: readonly number[]): Promise<CadenceD
       });
     }
     const count = encodedBatchCount(body);
-    const nodes = Array.from({ length: count }, () => new Uint8Array(NODE_BYTES));
-    return new Response(ownedBuffer(encodeBatchResponseNodes(nodes)), {
+    const slots = Array.from({ length: count }, () => slot);
+    return new Response(ownedBuffer(encodeBatchResponseNodes(slots)), {
       status: 200,
       headers: {
         "content-type": "application/octet-stream",
@@ -166,19 +173,23 @@ async function replayActualSdk(_timestamps: readonly number[]): Promise<CadenceD
     });
   };
   const sdk = new RavenPOINodeInterface({
-    endpoint: "https://cadence.invalid",
+    ...forestConfig({
+      endpoint: "https://cadence.invalid",
+      listKeyHex: LIST_KEY_HEX,
+      ctx: context,
+      placed: [[BC_HEX, 0]],
+    }),
     bearerToken: TOKEN,
-    useClientPir: true,
     fetchImpl,
-    clientPirContexts: new Map([["t3CommitTree:0", context]]),
   });
 
   let queries = 0;
   for (let transaction = 0; transaction < timestamps.length; transaction += 1) {
     server.now = timestamps[transaction];
-    const firstLeaf = (transaction * INPUTS_PER_TRANSACTION) % 65_536;
     for (let input = 0; input < INPUTS_PER_TRANSACTION; input += 1) {
-      await sdk.getMerkleProof(0, firstLeaf + input);
+      await expect(sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX])).rejects.toThrow(
+        /malformed PPOI v2 row/,
+      );
       queries += 1;
     }
   }
