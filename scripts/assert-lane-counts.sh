@@ -17,9 +17,13 @@
 # was listed, no lane was measured), FILTERSET REJECTED (this one lane's filter is malformed), and
 # selects ZERO / SHRANK (the filter resolved and the tests are gone).
 #
-# The counts are a ratchet, not a pin: a lane may only GROW silently. A DROP is a hard failure
-# that must be explained by editing .github/expected-lane-counts.tsv in the same change, so a
-# deletion has to be stated rather than absorbed.
+# The counts are EXACT: a lane that grows or shrinks fails until .github/expected-lane-counts.tsv
+# is edited in the same change, so a deletion has to be stated rather than absorbed, and growth
+# cannot build slack for a later deletion to hide in.
+#
+# Each lane is listed with the `--run-ignored` mode it runs with, read from the same place the
+# workflow reads it: a matrix entry's `run_ignored` field, or an inline command's own flag. A
+# constant here once listed every lane under `all` whatever the lane ran.
 #
 # Usage:
 #   scripts/assert-lane-counts.sh            # verify against the checked-in expectations
@@ -29,7 +33,8 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-CI=.github/workflows/ci.yml
+# LANE_COUNTS_WORKFLOW points the gate at a copy, so a red-proof never mutates the tracked file.
+CI="${LANE_COUNTS_WORKFLOW:-.github/workflows/ci.yml}"
 EXPECTED="${LANE_COUNTS_EXPECTED:-.github/expected-lane-counts.tsv}"
 MANIFEST=adapters/railgun/Cargo.toml
 MODE="${1:-check}"
@@ -85,23 +90,39 @@ fi
 # Emit one TSV row per filtered lane: name, packages, cargo flags, extra flags, filter.
 # Sourced from ci.yml itself so a new lane cannot be added without this gate seeing it.
 lanes=$(python3 - "$CI" <<'PY'
-import sys, yaml
+import re, sys, yaml
 d = yaml.safe_load(open(sys.argv[1]))
-rows = []
+rows, errors = [], []
+# No 'default': a lane that skips its binaries' ignored tests leaves them running nowhere, and
+# check-ignore-coverage.sh counts any named binary() as coverage whatever the lane's mode.
+MODES = ('only', 'all')
 for jn, job in (d.get('jobs') or {}).items():
     mat = ((job.get('strategy') or {}).get('matrix') or {})
-    for _key, entries in mat.items():
+    # comment lines dropped, or a template in a comment would vouch for a hard-coded mode
+    runs = ' '.join(line for s in (job.get('steps') or [])
+                    for line in (s.get('run') or '').splitlines()
+                    if not line.lstrip().startswith('#'))
+    for key, entries in mat.items():
         if not isinstance(entries, list):
             continue
-        for e in entries:
-            if isinstance(e, dict) and e.get('filter'):
-                rows.append((
-                    f"{jn}/{e.get('name','?')}",
-                    e.get('packages', ''),
-                    e.get('cargo_flags', '') or '',
-                    '--run-ignored all',
-                    e['filter'],
-                ))
+        filtered = [e for e in entries if isinstance(e, dict) and e.get('filter')]
+        # the field is only the lane's mode if the lane's command passes it to nextest
+        if filtered and not re.search(r'--run-ignored\s+\$\{\{\s*matrix\.' + re.escape(key)
+                                      + r'\.run_ignored\s*\}\}', runs):
+            errors.append(f"{jn}: its nextest command does not pass --run-ignored "
+                          f"${{{{ matrix.{key}.run_ignored }}}}, so no count here would be the lane's")
+        for e in filtered:
+            mode = e.get('run_ignored')
+            if mode not in MODES:
+                errors.append(f"{jn}/{e.get('name', '?')}: run_ignored is {mode!r}, not one of {', '.join(MODES)}")
+                continue
+            rows.append((
+                f"{jn}/{e.get('name','?')}",
+                e.get('packages', ''),
+                e.get('cargo_flags', '') or '',
+                f'--run-ignored {mode}',
+                e['filter'],
+            ))
     # Steps that carry an inline -E filterset (the nightly production-cell lane).
     for s in (job.get('steps') or []):
         run = s.get('run') or ''
@@ -115,10 +136,15 @@ for jn, job in (d.get('jobs') or {}).items():
         if '${{' in filt:
             continue
         pkgs = ' '.join(f"-p {t}" for t in body.split() if t.startswith('raven-railgun-'))
-        extra = '--run-ignored all'
+        mode = re.search(r'--run-ignored[ =](\S+)', body)
+        extra = f'--run-ignored {mode.group(1)}' if mode else ''
         if '--all-targets' in body:
             extra += ' --all-targets'
-        rows.append((f"{jn}/inline", pkgs, '', extra, filt))
+        rows.append((f"{jn}/inline", pkgs, '', extra.strip(), filt))
+if errors:
+    for error in errors:
+        print(f"LANE MODE NOT READ: {error}", file=sys.stderr)
+    sys.exit(1)
 # Empty fields are emitted as "-", never as "". Tab is IFS *whitespace* to bash, so
 # `IFS=$'\t' read a b c d e` COLLAPSES a run of tabs into one delimiter and drops empty
 # fields entirely — every lane with no cargo_flags had its columns shift left and handed
@@ -219,8 +245,8 @@ if [ "$MODE" = "--update" ]; then
   fi
   {
     echo "# Expected test count per filtered CI lane. Regenerate: scripts/assert-lane-counts.sh --update"
-    echo "# A lane may GROW silently; a DROP is a hard failure and must be explained by editing"
-    echo "# this file in the same change that removes the tests."
+    echo "# EXACT: a lane that grows OR shrinks fails until this file is updated in the same change."
+    echo "# A floor let growth accumulate as slack a later deletion could hide inside."
     cat "$tmp"
   } > "$EXPECTED"
   echo "assert-lane-counts.sh: wrote ${EXPECTED}"

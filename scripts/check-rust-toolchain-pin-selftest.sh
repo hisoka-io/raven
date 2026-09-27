@@ -36,6 +36,14 @@ jobs:
   shipping:
     steps:
       - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.129
+  lanes:
+    steps:
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: "cargo-nextest@0.9.129"
   msrv-1-89:
     env:
       RUSTUP_TOOLCHAIN: "1.89"
@@ -176,6 +184,43 @@ sed -i '/RUSTUP_TOOLCHAIN: "1.91"/d; s|rust-toolchain@1.91|rust-toolchain@1.98.0
 expect_rejection "MSRV 1.91 action" "accidental 1.98-only floor"
 cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
 
+# nextest: gates parse its text output, so every job must install the one release they were
+# proven against. An unpinned install took 0.9.146 and failed a healthy tree.
+sed -i '0,/uses: taiki-e\/install-action@v2/s//uses: taiki-e\/install-action@nextest/' \
+  "$FIXTURE_ROOT/.github/workflows/ci.yml"
+expect_rejection "installs an unpinned nextest" "tool-named install-action ref"
+cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
+
+sed -i '0,/tool: cargo-nextest@0.9.129/s//tool: cargo-nextest/' "$FIXTURE_ROOT/.github/workflows/ci.yml"
+expect_rejection "installs nextest as 'cargo-nextest', which floats" "versionless tool input"
+cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
+
+sed -i '0,/tool: cargo-nextest@0.9.129/s//tool: nextest@0.9/' "$FIXTURE_ROOT/.github/workflows/ci.yml"
+expect_rejection "installs nextest as 'nextest@0.9', which floats" "minor-only tool pin"
+cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
+
+sed -i 's/tool: "cargo-nextest@0.9.129"/tool: "cargo-nextest@0.9.146"/' "$FIXTURE_ROOT/.github/workflows/ci.yml"
+expect_rejection "CI installs divergent nextest versions: 0.9.129 0.9.146" "two pinned nextest versions"
+cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
+
+sed -i 's/cargo-nextest@0.9.129/cargo-nextest@0.9.146/' "$FIXTURE_ROOT/.github/workflows/ci.yml"
+expect_rejection "CI installs nextest 0.9.146, expected 0.9.129" "one pin, not the proven release"
+cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
+
+sed -i '0,/uses: taiki-e\/install-action@v2/s//uses: taiki-e\/install-action@v2\n        with: { tool: cargo-nextest }\n      - uses: taiki-e\/install-action@v2/' \
+  "$FIXTURE_ROOT/.github/workflows/ci.yml"
+expect_rejection "installs nextest as 'cargo-nextest', which floats" "flow-style tool input"
+cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
+
+sed -i '0,/tool: cargo-nextest@0.9.129/s//tool: cargo-nextest@0.9.129\n      - run: curl -LsSf https:\/\/get.nexte.st\/latest\/linux | tar zxf - -C ~\/.cargo\/bin/' \
+  "$FIXTURE_ROOT/.github/workflows/ci.yml"
+expect_rejection "downloads nextest from nexte.st" "curl install from get.nexte.st"
+cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
+
+sed -i '/tool: /d' "$FIXTURE_ROOT/.github/workflows/ci.yml"
+expect_rejection "no CI job installs nextest" "no nextest install at all"
+cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
+
 sed -i '/RUSTUP_TOOLCHAIN: "1.89"/d' "$FIXTURE_ROOT/.github/workflows/ci.yml"
 expect_rejection "MSRV 1.89 override" "shadowed 1.89 floor"
 cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
@@ -183,4 +228,4 @@ cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
 sed -i '/RUSTUP_TOOLCHAIN: "1.91"/d' "$FIXTURE_ROOT/.github/workflows/ci.yml"
 expect_rejection "MSRV 1.91 override" "shadowed 1.91 floor"
 
-printf 'toolchain pin selftest: all five scan families and MSRV job invariants rejected their mutations\n'
+printf 'toolchain pin selftest: all five scan families, the nextest pin and MSRV job invariants rejected their mutations\n'

@@ -7,6 +7,43 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# The show-config reader on saved outputs of both releases CI has met. 0.9.146 appended
+# "(from FILE)" to every override line and the gate rejected a healthy tree, so both shapes must
+# parse to the same groups, and an unknown line must fail naming the release that printed it.
+show_config_fixtures() {
+  local dir=scripts/fixtures/check-ci-filter-names/show-config version out release bad=0
+  local want="group chaos-subprocess max-threads 1: 4 test(s)
+  raven-railgun-cli::auto_spawn_races concurrent_chain_event_floods_dedupe_to_one_spawn
+  raven-railgun-cli::auto_spawn_races kill_during_spawn::after_add_live_before_log_kill_leaves_orphan_engine_no_log
+  raven-railgun-cli::migrate_encoder_real_sigkill real_sigkill_at_post_manifest_bump_yields_fully_migrated_state
+  raven-railgun-cli::migrate_encoder_real_sigkill real_sigkill_at_post_re_encode_no_disk_mutation_then_resume_succeeds
+group planted-empty-group max-threads 1: 0 test(s)
+group planted-single-group max-threads 2: 1 test(s)
+  raven-railgun-cli::bootstrap_from_subsquid bootstrap_concurrent_run_lock_contention"
+  for release in 0.9.129 0.9.146; do
+    version="cargo-nextest ${release}"
+    if out=$(bash scripts/check-ci-filter-names.sh --show-config-fixture "$version" "${dir}/nextest-${release}.txt" 2>&1) \
+        && [ "$out" = "$want" ]; then
+      echo "  ok: show-config shape of ${release} -> the same groups and members"
+    else
+      echo "SELFTEST FAIL: show-config output of ${release} is misread" >&2
+      diff <(printf '%s\n' "$want") <(printf '%s\n' "$out") >&2
+      bad=1
+    fi
+  done
+  version="cargo-nextest 0.9.999-planted"
+  if out=$(bash scripts/check-ci-filter-names.sh --show-config-fixture "$version" "${dir}/unknown-override-shape.txt" 2>&1); then
+    echo "SELFTEST FAIL: an unknown show-config line was accepted" >&2
+    bad=1
+  elif ! /usr/bin/grep -qF -- "${version}: its show-config output is not the shape this gate reads" <<< "$out"; then
+    echo "SELFTEST FAIL: an unknown show-config line failed without naming the release: ${out}" >&2
+    bad=1
+  else
+    echo "  ok: unknown show-config line -> fails naming ${version}"
+  fi
+  return "$bad"
+}
+
 # `--selected` asks nextest, so it is proven where the test binaries are built, not in the hygiene
 # job. It reads copies through FILTER_GATE_*: nothing tracked is mutated on this path.
 if [ "${1:-}" = "--selected" ]; then
@@ -84,6 +121,8 @@ EXPECTED
     fails=1
   fi
 
+  show_config_fixtures || fails=1
+
   # the same overrides aimed at the real files: if this is red, the run above proved nothing
   if FILTER_GATE_WORKFLOW=.github/workflows/ci.yml FILTER_GATE_NEXTEST_CONFIGS="$real_configs" \
        bash scripts/check-ci-filter-names.sh --selected > /dev/null 2>&1; then
@@ -114,6 +153,12 @@ trap 'cp "$BAK" "$CI"; cp "$VBAK" "$VICTIM"; rm -f "$BAK" "$VBAK"' EXIT
 fails=0
 expect_fail() {
   local label="$1"
+  # a sed whose pattern left the workflow proves nothing: the gate passes an unmutated file
+  if [ "${2:-}" != "workflow-untouched" ] && cmp -s "$BAK" "$CI"; then
+    echo "SELFTEST CANNOT RUN: ${label}: the mutation no longer applies to ${CI}" >&2
+    fails=1
+    return
+  fi
   bash scripts/check-ci-filter-names.sh > /dev/null 2>&1
   local rc=$?
   if [ "$rc" -eq 0 ]; then
@@ -133,7 +178,7 @@ expect_fail "a test() term renamed to a nonexistent test (uppercase in the name)
 sed -i 's/test(insert_rejects_overflow_past_capacity)/test(no_such_test_anywhere)/' "$CI"
 expect_fail "a test() term renamed to a nonexistent test (lowercase)"
 
-sed -i 's/binary(offline_packing_keys_cache)/binary(a_target_that_does_not_exist)/' "$CI"
+sed -i 's/binary(engine_dedup_extends_to_encoder)/binary(a_target_that_does_not_exist)/' "$CI"
 expect_fail "a binary() term naming a deleted target"
 
 sed -i '/-p raven-railgun-testkit/d' "$CI"
@@ -148,7 +193,7 @@ expect_fail "a workspace member named only outside the fmt and test jobs"
 # nightly lane would have died at nextest exit 94. ci.yml is untouched here on purpose:
 # the mutation is the missing file, not the filter.
 rm -f "$VICTIM"
-expect_fail "a binary() whose file is deleted in the working tree but still in the index"
+expect_fail "a binary() whose file is deleted in the working tree but still in the index" workflow-untouched
 cp "$VBAK" "$VICTIM"
 
 # The spawn-and-kill classifier --selected uses, on fixtures: every verdict must match.
@@ -171,6 +216,8 @@ else
   diff <(printf '%s\n' "$expected") <(printf '%s\n' "$got") >&2
   fails=1
 fi
+
+show_config_fixtures || fails=1
 
 # And the control: unmutated, the gate must PASS. A gate that always fails is not a gate.
 bash scripts/check-ci-filter-names.sh > /dev/null 2>&1

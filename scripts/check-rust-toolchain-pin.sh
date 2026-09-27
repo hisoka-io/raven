@@ -7,6 +7,9 @@ PINNED_TOOLCHAIN="1.98.0"
 MSRV_189="1.89"
 MSRV_191="1.91"
 PINNED_DOCKER_TAG="1.98.0-slim-bookworm"
+# Gates parse nextest's text output, which is not a stable interface: 0.9.146 changed a
+# show-config line and failed a healthy tree. Move this only with those gates re-proven.
+PINNED_NEXTEST="0.9.129"
 MSRV_189_MANIFESTS='Cargo.toml|adapters/howl/Cargo.toml|adapters/railgun/client-wasm/Cargo.toml|benches/b1-bench/Cargo.toml|benches/b2-bench/Cargo.toml|crates/inspire/Cargo.toml|crates/isimplepir/Cargo.toml|tools/bench-compare/Cargo.toml'
 MSRV_189_PACKAGES='bench-compare,howl-poseidon2,howl-record,raven-b1-bench,raven-b2-bench,raven-bench,raven-client,raven-core,raven-crypto-primitives,raven-indexer,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-isimplepir,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage'
 MSRV_189_EXTRA_PACKAGES='raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror'
@@ -23,6 +26,7 @@ msrv_191_overrides=0
 docker_builders=0
 toolchain_files=0
 nextest_installers=0
+nextest_versions=""
 cargo_binstall_invocations=0
 
 fail() {
@@ -125,8 +129,32 @@ while IFS= read -r -d '' workflow; do
     if [[ "$line" =~ rustup[[:space:]]+(default|install|toolchain[[:space:]]+install|run)[[:space:]]+(stable|beta|nightly) ]]; then
       fail "$workflow:$line_number invokes floating rustup selector '${BASH_REMATCH[2]}'"
     fi
-    if [[ "$line" =~ taiki-e/install-action@nextest ]]; then
+    # install-action's tool-named refs (@nextest, @cargo-nextest) install whatever is newest
+    if [[ "$line" =~ taiki-e/install-action@(cargo-)?nextest([^[:alnum:]_.-]|$) ]]; then
       nextest_installers=$((nextest_installers + 1))
+      fail "$workflow:$line_number installs an unpinned nextest; use install-action@v2 with tool: cargo-nextest@$PINNED_NEXTEST"
+    fi
+    # the flow form `with: { tool: ... }` counts too, or it would install nextest unseen
+    if [[ "$line" =~ (^|[[:space:]{,])tool:[[:space:]]*(.*)$ ]]; then
+      tools="${BASH_REMATCH[2]//[,\"\'\}]/ }"
+      for tool in $tools; do
+        [[ "$tool" =~ ^(cargo-)?nextest(@(.*))?$ ]] || continue
+        nextest_installers=$((nextest_installers + 1))
+        version="${BASH_REMATCH[3]}"
+        if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          fail "$workflow:$line_number installs nextest as '$tool', which floats; pin cargo-nextest@$PINNED_NEXTEST"
+        elif [[ " $nextest_versions " != *" $version "* ]]; then
+          nextest_versions="${nextest_versions:+$nextest_versions }$version"
+        fi
+      done
+    fi
+    if [[ "$line" =~ (get\.)?nexte\.st/ ]]; then
+      nextest_installers=$((nextest_installers + 1))
+      fail "$workflow:$line_number downloads nextest from nexte.st; use install-action@v2 with tool: cargo-nextest@$PINNED_NEXTEST"
+    fi
+    if [[ "$line" =~ cargo[[:space:]]+(b?install)[[:space:]].*cargo-nextest ]]; then
+      nextest_installers=$((nextest_installers + 1))
+      fail "$workflow:$line_number installs nextest with cargo ${BASH_REMATCH[1]}; use install-action@v2 with tool: cargo-nextest@$PINNED_NEXTEST"
     fi
     if [[ "$line" == *'RUSTUP_TOOLCHAIN: "1.89"'* || "$line" == *'RUSTUP_TOOLCHAIN: 1.89'* ]]; then
       msrv_189_overrides=$((msrv_189_overrides + 1))
@@ -152,6 +180,13 @@ if [[ "$msrv_189_actions" -ne 1 ]]; then
 fi
 if [[ "$msrv_191_actions" -ne 1 ]]; then
   fail "expected exactly one MSRV 1.91 action, found $msrv_191_actions"
+fi
+if [[ "$nextest_installers" -eq 0 ]]; then
+  fail "no CI job installs nextest"
+elif [[ "$nextest_versions" == *" "* ]]; then
+  fail "CI installs divergent nextest versions: $nextest_versions"
+elif [[ -n "$nextest_versions" && "$nextest_versions" != "$PINNED_NEXTEST" ]]; then
+  fail "CI installs nextest $nextest_versions, expected $PINNED_NEXTEST"
 fi
 if [[ "$msrv_189_overrides" -ne 1 ]]; then
   fail "expected one MSRV 1.89 override, found $msrv_189_overrides"
@@ -284,7 +319,7 @@ if [[ "$failed" -ne 0 ]]; then
   exit 1
 fi
 
-printf 'Rust toolchain selectors pinned: channel=%s files=%d CI=%d MSRV=1.89/21+1.91/11 overrides=%d Docker=%d nextest=%d cargo-binstall=%d\n' \
+printf 'Rust toolchain selectors pinned: channel=%s files=%d CI=%d MSRV=1.89/21+1.91/11 overrides=%d Docker=%d nextest=%d@%s cargo-binstall=%d\n' \
   "$PINNED_TOOLCHAIN" "$toolchain_files" "$pinned_actions" \
   "$((msrv_189_overrides + msrv_191_overrides))" "$docker_builders" \
-  "$nextest_installers" "$cargo_binstall_invocations"
+  "$nextest_installers" "$PINNED_NEXTEST" "$cargo_binstall_invocations"

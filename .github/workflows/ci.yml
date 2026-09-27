@@ -372,7 +372,9 @@ jobs:
         with:
           # shared so shards reuse the first shard's target/ instead of rebuilding inspire cold
           shared-key: "railgun-tests"
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.129
       - name: cargo nextest (ci-test profile)
         run: |
           # --no-tests=fail pins nextest's zero-match behavior regardless of the
@@ -402,9 +404,9 @@ jobs:
     # one week, and a shrunken lane reports success the whole time.
     #
     # This needs the adapter's test binaries built, so it is its own job rather than a step in
-    # the cheap hygiene job — that build is the honest price of the check. The expectations in
-    # .github/expected-lane-counts.tsv are a RATCHET: a lane may grow silently, a drop fails and
-    # must be explained by updating that file in the same change.
+    # the cheap hygiene job: that build is the honest price of the check. The counts in
+    # .github/expected-lane-counts.tsv are EXACT: a lane that grows or shrinks fails until that
+    # file is updated in the same change, because unrecorded growth is slack a deletion hides in.
     name: lane counts (no filter may silently shrink)
     needs: railgun-static
     # `skipped` reads as green on a merged board, so an upstream red silenced these for
@@ -427,7 +429,12 @@ jobs:
         with:
           shared-key: "railgun"
       - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: taiki-e/install-action@nextest
+      # One release in every job, the one the nextest-reading gates are proven against: an
+      # unpinned install took 0.9.146, whose show-config shape the gate did not read.
+      # scripts/check-rust-toolchain-pin.sh fails a floating or divergent pin.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.129
       - name: assert every filtered lane still selects its tests
         run: scripts/assert-lane-counts.sh
       # The gate shipped with two counting bugs that its prose red-proof missed, both found by
@@ -454,7 +461,14 @@ jobs:
     # wall time and therefore ran in NO lane at all. Measured on a Zen 5 box:
     # crash-safety 253 s / 16 tests, closure + recovery 113 s / 9 tests, all green.
     # Nothing here is a benchmark; every test asserts byte identity or recovery.
-    name: durability + closure (${{ matrix.lane.name }}, --run-ignored all)
+    #
+    # Each lane runs its binaries' IGNORED tests only (`run_ignored: only`). Under `all` these
+    # lanes re-ran 73 non-ignored tests, 743 test-seconds, that the railgun-tests shard of the
+    # same package had already run under the same ci-test cargo profile. The exception is
+    # wal-and-snapshot-chaos: its binaries compile only under --features chaos-tests, which no
+    # per-push shard enables, so its non-ignored tests run nowhere else. scripts/assert-lane-counts.sh
+    # lists each lane with the same `run_ignored` field, so the count and the lane cannot diverge.
+    name: durability + closure (${{ matrix.lane.name }}, --run-ignored ${{ matrix.lane.run_ignored }})
     needs: railgun-static
     # `skipped` reads as green on a merged board, so an upstream red silenced these for
     # nineteen days. Run them on their own merits and let them report a real verdict.
@@ -469,13 +483,17 @@ jobs:
             packages: "-p raven-railgun-cli"
             cargo_flags: ""
             nextest_profile: ci
-            filter: "binary(migrate_encoder_real_sigkill) + binary(migrate_encoder_kill_during) + binary(auto_spawn_races)"
+            run_ignored: only
+            # auto_spawn_races has no ignored test; the railgun-tests cli shard runs all five
+            filter: "binary(migrate_encoder_real_sigkill) + binary(migrate_encoder_kill_during)"
           - name: wal-and-snapshot-chaos
             packages: "-p raven-railgun-persistence"
             # both suites are #![cfg(feature = "chaos-tests")] and compile to
             # empty without it, so the flag is what makes this lane real
             cargo_flags: "--features chaos-tests"
             nextest_profile: ci
+            # all: nothing else builds these binaries, see the job comment
+            run_ignored: all
             filter: "binary(wal_chaos_layer_b) + binary(snapshot_chaos_save_two_rename)"
           # This lane runs the assertion-carrying `#[ignore]`d CLI tests that once ran
           # in NO lane. The 2026-08-11 measurement found 12 RED and 13 names were
@@ -494,14 +512,15 @@ jobs:
           #   - `boundary_repair_three_seed_per_tree_bench` was excluded as a timing
           #     harness with no assertions. It now asserts the recovered root, the leaf
           #     count and the tail-gap refusal per arm, and passes in 25.1 s.
-          # The lane selects 63 tests. Two gates keep this honest: check-ci-filter-names.sh
-          # fails the build when a filter term stops resolving (it caught the dead
-          # subtraction term above), and check-ignore-coverage.sh fails when a new
-          # ignored test lands with no lane and no allowlist entry.
+          # Two gates keep this honest: check-ci-filter-names.sh fails the build when a
+          # filter term stops resolving (it caught the dead subtraction term above), and
+          # check-ignore-coverage.sh fails when a new ignored test lands with no lane and no
+          # allowlist entry. The count lives in .github/expected-lane-counts.tsv only.
           - name: cli-ignored
             packages: "-p raven-railgun-cli"
             cargo_flags: ""
             nextest_profile: ci
+            run_ignored: only
             filter: "binary(auto_spawn_shutdown) + binary(bootstrap_from_subsquid) + binary(multi_list_ppoi_dynamic) + binary(production_cell) + binary(serve_production_config_file) + binary(six_instance_integration) + binary(smart_policy_deferred) + binary(smart_policy_lifecycle)"
           # The shipped multi-instance config, booted by the production binary in a child process.
           # Not in cli-ignored: that lane already runs two eleven-instance boots, and a third
@@ -513,12 +532,15 @@ jobs:
             # box, 111 s on four logical CPUs, 114 s on two), so per-core speed sets it, and
             # this runner's is unmeasured against ci's 120 s x 3 cap
             nextest_profile: production-cell
+            run_ignored: only
             filter: "binary(shipped_config_spawn)"
           - name: engine-ignored
             packages: "-p raven-railgun-engine"
             cargo_flags: ""
             nextest_profile: ci
-            filter: "binary(engine_dedup_extends_to_encoder) + binary(offline_packing_keys_cache) + test(insert_rejects_overflow_past_capacity)"
+            run_ignored: only
+            # offline_packing_keys_cache has no ignored test; the railgun-tests engine shard runs it
+            filter: "binary(engine_dedup_extends_to_encoder) + test(insert_rejects_overflow_past_capacity)"
           - name: closure
             packages: "-p raven-railgun-engine"
             cargo_flags: ""
@@ -526,6 +548,7 @@ jobs:
             # measures 113 s on a 16-core box and would trip ci's 120 s x 3 cap
             # on a 4-vCPU runner
             nextest_profile: production-cell
+            run_ignored: only
             # t3_commit_tree_path_closure was deleted with proof that the closure it
             # asserted is carried by per_leaf_path_production_cell (nightly) and the
             # per-commit path oracle; its term went with the file, in this same change.
@@ -553,8 +576,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "railgun-tests"
-      - uses: taiki-e/install-action@nextest
-      - name: cargo nextest (ignored included)
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.129
+      - name: cargo nextest (the lane's --run-ignored mode)
         run: |
           # fail-fast: false above is MATRIX-level and does not reach nextest. Without
           # --no-fail-fast one red test cancels the queue: measured 7/15 here and 24/65.
@@ -566,7 +591,7 @@ jobs:
             --no-fail-fast \
             --cargo-profile ci-test \
             --profile ${{ matrix.lane.nextest_profile }} \
-            --run-ignored all \
+            --run-ignored ${{ matrix.lane.run_ignored }} \
             -E '${{ matrix.lane.filter }}'
       - name: sccache stats
         run: sccache --show-stats
@@ -625,7 +650,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "railgun-tests"
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.129
       - name: cargo nextest (production-cell closure, ignored included)
         run: |
           # --all-targets is REQUIRED, not cosmetic: without it cargo does not build

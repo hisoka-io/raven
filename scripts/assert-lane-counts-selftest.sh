@@ -172,6 +172,51 @@ awk -F'\t' 'BEGIN{OFS="\t"} /^#/ || NF<2 {print; next} {print $1, 200}' .github/
 LANE_COUNTS_EXPECTED="$STUBS/expected-200.tsv" stub_case lists-coloured 0 "selects ZERO tests" \
   "coloured rows end to end: the gate passes instead of accusing every filter"
 
+# --- each lane is counted under the --run-ignored mode it runs with ---------------------------
+# The gate once listed every lane under a hard-coded `all`, so a lane switched to `only` would have
+# been measured against tests it no longer runs. The mode now comes from the matrix entry the
+# workflow reads, and these copies prove the gate refuses a workflow where that link is broken.
+workflow_case() {  # workflow_case <workflow-copy> <label> <required-text>...
+  local copy="$1" label="$2"; shift 2
+  local out rc bad=0 need
+  if cmp -s "$copy" .github/workflows/ci.yml; then
+    echo "SELFTEST CANNOT RUN: ${label}: the mutation no longer applies to ci.yml" >&2; fails=1; return
+  fi
+  out=$(LANE_COUNTS_WORKFLOW="$copy" bash "$GATE" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || { echo "SELFTEST FAIL: ${label}: the gate passed (exit 0)" >&2; bad=1; }
+  for need in "$@"; do
+    if ! printf '%s\n' "$out" | /usr/bin/grep -qF -- "$need"; then
+      echo "SELFTEST FAIL: ${label}: output never says '${need}'" >&2; bad=1
+    fi
+  done
+  if [ "$bad" -ne 0 ]; then fails=1; printf '%s\n' "$out" | tail -20 >&2; else echo "  ok: ${label} -> exit ${rc}"; fi
+}
+
+awk '/^          - name: crash-safety$/ { lane = 1 } lane && /^ +run_ignored: / { lane = 0; next } { print }' \
+  .github/workflows/ci.yml > "$STUBS/ci-no-mode.yml"
+workflow_case "$STUBS/ci-no-mode.yml" "a filtered matrix entry with no run_ignored field" \
+  "LANE MODE NOT READ: durability-and-closure/crash-safety: run_ignored is None"
+
+sed 's/--run-ignored ${{ matrix.lane.run_ignored }}/--run-ignored all/' \
+  .github/workflows/ci.yml > "$STUBS/ci-constant-mode.yml"
+workflow_case "$STUBS/ci-constant-mode.yml" "a lane command that ignores its run_ignored field" \
+  "LANE MODE NOT READ: durability-and-closure: its nextest command does not pass --run-ignored"
+
+awk '/^          - name: crash-safety$/ { lane = 1 } lane && /^ +run_ignored: / { sub(/only$/, "default"); lane = 0 } { print }' \
+  .github/workflows/ci.yml > "$STUBS/ci-default-mode.yml"
+workflow_case "$STUBS/ci-default-mode.yml" "a lane whose run_ignored is default" \
+  "LANE MODE NOT READ: durability-and-closure/crash-safety: run_ignored is 'default', not one of only, all"
+
+awk '{ line = $0 }
+     /^ +--run-ignored \$\{\{ matrix\.lane\.run_ignored \}\} \\$/ {
+       indent = line; sub(/--.*/, "", indent)
+       print indent "# --run-ignored ${{ matrix.lane.run_ignored }}"
+       sub(/\$\{\{ matrix\.lane\.run_ignored \}\}/, "all", line)
+     }
+     { print line }' .github/workflows/ci.yml > "$STUBS/ci-comment-mode.yml"
+workflow_case "$STUBS/ci-comment-mode.yml" "a hard-coded mode with the template only in a comment" \
+  "LANE MODE NOT READ: durability-and-closure: its nextest command does not pass --run-ignored"
+
 bash "$GATE" --check-name-fixture \
   "$FIXTURES/expected-with-removed-lane.tsv" "$FIXTURES/current-lanes.tsv" \
   > /dev/null 2>&1
@@ -211,15 +256,27 @@ expect 1 "a lane one test short of its pin (a single deletion)"
 /usr/bin/grep -v "^${LANE}	" "$BE" > "$EXPECTED"
 expect 1 "a lane present in ci.yml with no expected count recorded"
 
-# 3. The live in-src row floor supplements the shape fixture with the current lane.
-if [ "$cur" -lt 9 ]; then
-  echo "SELFTEST FAIL: ${LANE} is recorded at ${cur}; it must be >= 9, because its filter's bare" >&2
+# 3. The live in-src row floor supplements the shape fixture with the current lane: one ignored
+#    integration test plus the in-src lib test its bare test() term names.
+if [ "$cur" -lt 2 ]; then
+  echo "SELFTEST FAIL: ${LANE} is recorded at ${cur}; it must be >= 2, because its filter's bare" >&2
   echo "  test() term resolves to an in-src lib test. A lower number means the row anchor in" >&2
   echo "  ${GATE} stopped counting lib rows again - see M-065." >&2
   fails=1
 else
-  echo "  ok: ${LANE} counts its in-src lib row (${cur} >= 9)"
+  echo "  ok: ${LANE} counts its in-src lib row (${cur} >= 2)"
 fi
+
+# 4. A matrix entry whose mode and the recorded count disagree, in both directions: cli-ignored
+#    flipped to `all` re-selects the non-ignored tests the per-push shard runs, and
+#    wal-and-snapshot-chaos flipped to `only` selects nothing, since none of its tests is ignored.
+awk '/^          - name: / { lane = $3 }
+     lane == "cli-ignored" && /^ +run_ignored: only$/ { sub(/only$/, "all") }
+     lane == "wal-and-snapshot-chaos" && /^ +run_ignored: all$/ { sub(/all$/, "only") }
+     { print }' .github/workflows/ci.yml > "$STUBS/ci-flipped-mode.yml"
+workflow_case "$STUBS/ci-flipped-mode.yml" "a lane mode flipped without recounting (both directions)" \
+  "LANE durability-and-closure/cli-ignored: selects" "- it GREW by" \
+  "LANE durability-and-closure/wal-and-snapshot-chaos: selects ZERO tests"
 
 if [ "$fails" -ne 0 ]; then
   echo "assert-lane-counts-selftest.sh: the gate is not discriminating." >&2

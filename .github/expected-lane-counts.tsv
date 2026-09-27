@@ -1,18 +1,20 @@
 # Expected test count per filtered CI lane. Regenerate: scripts/assert-lane-counts.sh --update
 # EXACT: a lane that grows OR shrinks fails until this file is updated in the same change.
 # A floor let growth accumulate as slack a later deletion could hide inside.
-durability-and-closure/crash-safety	14
+# 2026-09-27: every durability lane but wal-and-snapshot-chaos counts with --run-ignored only, the
+# mode it now runs with; these rows used to count --run-ignored all whatever the lane ran. Every
+# test that left a lane is non-ignored in a package whose railgun-tests shard runs it under the
+# same ci-test cargo profile, and the two terms that selected nothing under only were dropped.
+durability-and-closure/crash-safety	9
 durability-and-closure/wal-and-snapshot-chaos	3
-durability-and-closure/cli-ignored	74
+durability-and-closure/cli-ignored	21
 durability-and-closure/shipped-config-spawn	1
-# Higher than a `binary(...)`-only count would suggest: this lane includes the setup-cache
-# consumption oracles, and its filter carries a bare `test(insert_rejects_overflow_past_capacity)`
-# that resolves to an in-src lib test. The original anchor counted only `pkg::binary test` rows and
-# silently dropped every in-src test, undercounting the one lane whose filter depends on one.
-# 2026-09-22: this comment used to open "12, not 8" above a row that had since moved 12 -> 15.
+# Its filter carries a bare `test(insert_rejects_overflow_past_capacity)` that resolves to an
+# in-src lib test. The original anchor counted only `pkg::binary test` rows and silently dropped
+# every in-src test, undercounting the one lane whose filter depends on one.
 # The number lives in the row below and nowhere else; state the reason here, never the value.
-durability-and-closure/engine-ignored	15
-durability-and-closure/closure	8
+durability-and-closure/engine-ignored	2
+durability-and-closure/closure	6
 # 2026-09-07: was 21 before wave 5. binary(db2_block_production_cell) lost
 # block_exponent_and_payload_are_pinned_to_the_read_path_design, which asserted BLOCK_K == 10
 # against a `const BLOCK_K: usize = 10` three lines above it in the same test file; verified no

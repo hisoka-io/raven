@@ -33,6 +33,11 @@
 #                  spawns and kills when it names CARGO_BIN_EXE_ or current_exe() and calls kill()
 #                  outside comments, strings and `impl Drop`: a Drop reaps at teardown and races
 #                  nothing.
+#   --show-config-fixture VERSION FILE
+#                  the `show-config test-groups` reader --selected uses, on a saved output. That
+#                  text is not a stable interface: 0.9.146 added a "(from FILE)" suffix that
+#                  0.9.129 does not print, and the gate rejected a healthy tree on it. An unknown
+#                  line fails naming the release that printed it, VERSION here.
 #
 # FILTER_GATE_WORKFLOW and FILTER_GATE_NEXTEST_CONFIGS ("config=manifest ...") point either pass
 # at copies, so a red-proof never has to mutate a tracked file.
@@ -44,7 +49,7 @@ fail=0
 
 [ -f "$CI" ] || { echo "scripts/check-ci-filter-names.sh: workflow ${CI} does not exist." >&2; exit 1; }
 
-if [ "$MODE" = "--selected" ] || [ "$MODE" = "--spawn-and-kill" ]; then
+if [ "$MODE" = "--selected" ] || [ "$MODE" = "--spawn-and-kill" ] || [ "$MODE" = "--show-config-fixture" ]; then
   shift
   if [ "$MODE" = "--selected" ] && [ -n "${FILTER_GATE_NEXTEST_CONFIGS:-}" ]; then
     # shellcheck disable=SC2086
@@ -378,10 +383,45 @@ def spawn_and_kill_targets(manifest):
 
 
 GROUP_HEADER = re.compile(r"group: (\S+) \(max threads = ([^)]+)\)")
-GROUP_OVERRIDE = re.compile(r"  \* override for \S+ profile with filter '.*':")
+# 0.9.146 appends the declaring file to this line, 0.9.129 does not; both are read
+GROUP_OVERRIDE = re.compile(r"  \* override for \S+ profile with filter '.*'(?: \(from .+\))?:")
 GROUP_BINARY = re.compile(r" {6}(\S+):")
 GROUP_TEST = re.compile(r" {10}(\S+)")
 GROUP_EMPTY = "    (no matches)"
+_nextest_version = []
+
+
+def nextest_version():
+    """The installed release, for a message that blames a format change on the right tool."""
+    if not _nextest_version:
+        shown = subprocess.run(["cargo", "nextest", "--version"], stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True)
+        first = shown.stdout.strip().splitlines()[:1]
+        _nextest_version.append(first[0] if shown.returncode == 0 and first else
+                                f"cargo-nextest (version unreadable, exit {shown.returncode})")
+    return _nextest_version[0]
+
+
+def parse_show_config(text, version):
+    """({group: (max threads, {(binary id, test)})}, None), or (None, reason) on an unknown line."""
+    groups, group, binary = {}, None, None
+    for line in text.splitlines():
+        header, member = GROUP_HEADER.fullmatch(line), GROUP_TEST.fullmatch(line)
+        if header:
+            group, binary = header.group(1), None
+            threads = header.group(2)
+            groups[group] = (int(threads) if threads.isdigit() else threads, set())
+        elif group and (GROUP_OVERRIDE.fullmatch(line) or line == GROUP_EMPTY):
+            binary = None
+        elif group and GROUP_BINARY.fullmatch(line):
+            binary = GROUP_BINARY.fullmatch(line).group(1)
+        elif group and binary and member:
+            groups[group][1].add((binary, member.group(1)))
+        elif line.strip():
+            return None, (f"{version}: its show-config output is not the shape this gate reads: {line!r}. "
+                          "CI pins the release in its install steps; teach parse_show_config the new "
+                          "shape, with a fixture, before moving that pin.")
+    return groups, None
 
 
 def group_members(scope):
@@ -397,25 +437,10 @@ def group_members(scope):
     )
     if shown.returncode != 0:
         tail = " | ".join(shown.stderr.strip().splitlines()[-4:])
-        evaluations[key] = (None, f"cargo nextest show-config test-groups exited {shown.returncode}: {tail}")
+        evaluations[key] = (None, f"cargo nextest show-config test-groups exited {shown.returncode} "
+                                  f"({nextest_version()}): {tail}")
         return evaluations[key]
-    groups, group, binary = {}, None, None
-    for line in shown.stdout.splitlines():
-        header, member = GROUP_HEADER.fullmatch(line), GROUP_TEST.fullmatch(line)
-        if header:
-            group, binary = header.group(1), None
-            threads = header.group(2)
-            groups[group] = (int(threads) if threads.isdigit() else threads, set())
-        elif group and (GROUP_OVERRIDE.fullmatch(line) or line == GROUP_EMPTY):
-            binary = None
-        elif group and GROUP_BINARY.fullmatch(line):
-            binary = GROUP_BINARY.fullmatch(line).group(1)
-        elif group and binary and member:
-            groups[group][1].add((binary, member.group(1)))
-        elif line.strip():
-            evaluations[key] = (None, f"nextest show-config output is not the shape this gate reads: {line!r}")
-            return evaluations[key]
-    evaluations[key] = (groups, None)
+    evaluations[key] = parse_show_config(shown.stdout, nextest_version())
     return evaluations[key]
 
 
@@ -603,6 +628,19 @@ def check_nextest_config(config, manifest, lanes):
 if mode == "--spawn-and-kill":
     for root in config_specs:
         print(f"{'spawns and kills' if spawns_and_kills(root) else 'does not'}: {root}")
+    sys.exit(0)
+
+if mode == "--show-config-fixture":
+    version, fixture = config_specs
+    with open(fixture, encoding="utf-8") as handle:
+        groups, reason = parse_show_config(handle.read(), version)
+    if reason:
+        print(reason, file=sys.stderr)
+        sys.exit(1)
+    for group, (threads, members) in sorted(groups.items()):
+        print(f"group {group} max-threads {threads}: {len(members)} test(s)")
+        for binary, test in sorted(members):
+            print(f"  {binary} {test}")
     sys.exit(0)
 
 import yaml  # not above: --spawn-and-kill runs in the hygiene job, which needs no PyYAML

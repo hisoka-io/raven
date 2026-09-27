@@ -1,0 +1,14 @@
+group: chaos-subprocess (max threads = 1)
+  * override (adapters/railgun/.config/nextest.toml) for default profile, filter 'binary(auto_spawn_races)':
+      raven-railgun-cli::auto_spawn_races:
+          concurrent_chain_event_floods_dedupe_to_one_spawn
+          kill_during_spawn::after_add_live_before_log_kill_leaves_orphan_engine_no_log
+      raven-railgun-cli::migrate_encoder_real_sigkill:
+          real_sigkill_at_post_manifest_bump_yields_fully_migrated_state
+          real_sigkill_at_post_re_encode_no_disk_mutation_then_resume_succeeds
+group: planted-empty-group (max threads = 1)
+    (no matches)
+group: planted-single-group (max threads = 2)
+  * override for ci profile with filter 'test(=bootstrap_concurrent_run_lock_contention)' (from adapters/railgun/.config/nextest.toml):
+      raven-railgun-cli::bootstrap_from_subsquid:
+          bootstrap_concurrent_run_lock_contention
