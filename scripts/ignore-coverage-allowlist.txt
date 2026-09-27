@@ -64,9 +64,12 @@ crates/inspire/benches/solinas_microbench.rs::microbench_solinas_pointwise_all_v
 #  - the capture root oracle cold-syncs a recorded upstream list capture, tens of minutes, and
 #    takes the capture folder from PPOI_REPLAY_CAPTURE, which no lane sets; the capture is not
 #    in the repository.
+adapters/railgun/cli/tests/ppoi_capture_root_oracle.rs::every_captured_row_applies_through_the_mirror_feed_with_its_root_matched
+#  - the capture signature oracle checks every captured row's signature, about 20 s, and needs
+#    the same untracked capture named by PPOI_REPLAY_CAPTURE.
+adapters/railgun/ppoi-replay/tests/capture_signatures.rs::every_captured_row_verifies_at_ingest_and_planted_forgeries_are_refused
 #  - the fixture generator WRITES the fixture bytes it pins. Running it in a lane would
 #    overwrite the evidence the V7 layout test exists to check.
-adapters/railgun/cli/tests/ppoi_capture_root_oracle.rs::every_captured_row_applies_through_the_mirror_feed_with_its_root_matched
 adapters/railgun/engine/src/inspire.rs::mint_frozen_v7_store_fixture
 #  - the reopen probe needs an operator's real data_dir on an operator's filesystem. Its two
 #    self-verification tests DO run in every lane; only the env-var arm is ignored.

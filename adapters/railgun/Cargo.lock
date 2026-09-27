@@ -3824,15 +3824,14 @@ dependencies = [
 name = "raven-railgun-ppoi-mirror"
 version = "0.1.0-alpha.0"
 dependencies = [
- "async-trait",
  "axum",
+ "ed25519-dalek",
  "parking_lot",
  "raven-railgun-core",
  "raven-railgun-persistence",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

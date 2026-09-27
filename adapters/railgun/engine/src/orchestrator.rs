@@ -347,9 +347,15 @@ pub enum VerificationMode {
     /// Accept the upstream feed as the authority: no chain cross-check is possible
     /// because list roots are not chain-anchored.
     ///
-    /// **No signature is verified.** The `signedPOIEvent` signature is retained on the
-    /// event (`PpoiListLeafAdded::signature`) and never checked; `engine/` contains no
-    /// ed25519 verifier. Whoever adds one renames this variant back.
+    /// **The signature is checked at ingest, by the mirror, when its config asks.** With the
+    /// mirror's `verify_signatures` set, each row's `signedPOIEvent` ed25519 signature is
+    /// verified against the configured list key before the row reaches this crate, and a row
+    /// that fails is never delivered. That authenticates the row's index, blinded commitment
+    /// and type, not the chain or txid version it was signed for, so the endpoint can still
+    /// serve rows the same key signed for another chain or txid version, and can withhold or
+    /// delay rows; the list key is trusted as configured. Unset, rows arrive on the endpoint's
+    /// word. Either way this crate verifies no signature itself: it only carries the bytes
+    /// (`PpoiListLeafAdded::signature`).
     ///
     /// **The root is the one thing this crate checks about the upstream feed.** Every
     /// `PpoiListLeafAdded` is held, ahead of its WAL write, to the `validatedMerkleroot` it

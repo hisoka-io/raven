@@ -1,11 +1,14 @@
-//! How fast a mirror worker asks upstream for pages, and where it stops asking.
+//! How fast a mirror feed asks upstream for pages, and where it stops asking.
 //!
 //! A cold sync of a list several hundred pages long is a morning at a page per poll interval,
 //! and a node that simply polled faster would keep that rate against a third party forever.
 //! So a full page is followed at the backfill setting and every other page waits the poll.
 //! Separately, a row nothing downstream can hold must stop the feed, not pass under an
 //! advancing cursor.
-//! And a worker waiting out a poll stops as soon as the engine hangs up.
+//! And a feed waiting out a poll stops as soon as the engine hangs up.
+//!
+//! Every wait here is bounded by progress, not by the whole run: a run slowed by a loaded host
+//! passes, and only a feed that stops moving for [`STALL`] fails.
 
 #![allow(
     clippy::expect_used,
@@ -19,9 +22,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use raven_railgun_core::ListKey;
 use raven_railgun_persistence::WalEntryPayload;
-use raven_railgun_ppoi_mirror::{
-    FeedStatus, MirrorConfig, MirrorCursor, MirrorError, MirrorKind, UpstreamPpoiMirror,
-};
+use raven_railgun_ppoi_mirror::{FeedStatus, MirrorConfig, MirrorError, UpstreamPpoiMirror};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,6 +32,10 @@ const LIST: ListKey = ListKey([0x51; 32]);
 
 /// First row of the seventh 65,536-row block: where a six-block forest runs out.
 const SEVENTH_BLOCK: u64 = 6 * 65_536;
+
+/// Longest a feed may go without visible progress before a wait fails. Below the 30 s poll, so a
+/// feed paced by the poll where it should be paced by the backfill setting still fails.
+const STALL: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Asked {
@@ -148,34 +153,73 @@ fn mirror(
 
 type Payloads = mpsc::Receiver<(WalEntryPayload, u64)>;
 
-/// Leaf indices received until `last` arrives, or a panic once `within` runs out.
-async fn leaves_through(rx: &mut Payloads, last: u32, within: Duration) -> Vec<u32> {
+fn feed_all(mirror: Arc<UpstreamPpoiMirror>, tx: mpsc::Sender<(WalEntryPayload, u64)>) -> Feed {
+    tokio::spawn(mirror.run_feed(
+        LIST,
+        0,
+        |cursor| cursor..u64::MAX,
+        FeedStatus::default(),
+        tx,
+    ))
+}
+
+type Feed = tokio::task::JoinHandle<Result<(), MirrorError>>;
+
+/// Leaf indices received until `last` arrives, or a panic once no leaf arrives for [`STALL`].
+async fn leaves_through(rx: &mut Payloads, last: u32) -> Vec<u32> {
     let mut seen = Vec::new();
-    tokio::time::timeout(within, async {
-        while let Some((payload, _)) = rx.recv().await {
-            if let WalEntryPayload::PpoiListLeafAdded { list_index, .. } = payload {
+    loop {
+        let received = tokio::time::timeout(STALL, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("no leaf for {STALL:?} before {last}; got {seen:?}"));
+        match received {
+            Some((WalEntryPayload::PpoiListLeafAdded { list_index, .. }, _)) => {
                 seen.push(list_index);
                 if list_index == last {
-                    return;
+                    return seen;
+                }
+            }
+            Some(_) => {}
+            None => panic!("the feed hung up before sending leaf {last}"),
+        }
+    }
+}
+
+/// Waits for `count` requests, failing once no new request arrives for `stall`.
+async fn requests_made(upstream: &Upstream, count: usize, stall: Duration) {
+    let mut seen = upstream.asked().len();
+    let mut since = Instant::now();
+    while seen < count {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let now = upstream.asked().len();
+        if now > seen {
+            (seen, since) = (now, Instant::now());
+        }
+        assert!(
+            since.elapsed() < stall,
+            "no request for {stall:?} with {seen} of {count} made: {:?}",
+            upstream.asked()
+        );
+    }
+}
+
+/// Drives `feed` to completion, failing once its status stops changing for [`STALL`].
+async fn settled<T>(status: &FeedStatus, feed: impl std::future::Future<Output = T>) -> T {
+    tokio::pin!(feed);
+    let mut last = status.snapshot();
+    let mut since = Instant::now();
+    loop {
+        tokio::select! {
+            outcome = &mut feed => return outcome,
+            () = tokio::time::sleep(Duration::from_millis(50)) => {
+                let now = status.snapshot();
+                if now == last {
+                    assert!(since.elapsed() < STALL, "the feed made no progress for {STALL:?}: {now:?}");
+                } else {
+                    (last, since) = (now, Instant::now());
                 }
             }
         }
-        panic!("the worker hung up before sending leaf {last}");
-    })
-    .await
-    .unwrap_or_else(|_| panic!("leaf {last} did not arrive within {within:?}; got {seen:?}"));
-    seen
-}
-
-async fn requests_made(upstream: &Upstream, count: usize, within: Duration) {
-    let deadline = Instant::now() + within;
-    while upstream.asked().len() < count {
-        assert!(
-            Instant::now() < deadline,
-            "{count} requests not made within {within:?}: {:?}",
-            upstream.asked()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -183,17 +227,24 @@ fn page(start: u64, end: u64) -> Asked {
     Asked { start, end }
 }
 
-/// At a 30 s poll the second page alone would take 30 s, so ten seconds for four pages is only
-/// reachable at the backfill setting. The short fourth page then holds the fifth for the poll.
+/// At a 30 s poll a page paced by the poll comes 30 s after the one before it, so four pages
+/// each inside half the poll are only reachable at the backfill setting. The short fourth page
+/// then holds the fifth for the poll.
 #[tokio::test]
 async fn full_pages_follow_at_the_backfill_setting_and_a_short_page_returns_to_the_poll() {
     let (endpoint, upstream) = serve(Upstream::holding_through(34)).await;
     let (tx, mut rx) = mpsc::channel(256);
-    let worker =
-        tokio::spawn(mirror(&endpoint, 30, 10, Some(Duration::ZERO)).run_worker(LIST, 0, tx));
+    let worker = feed_all(mirror(&endpoint, 30, 10, Some(Duration::ZERO)), tx);
 
-    let leaves = leaves_through(&mut rx, 34, Duration::from_secs(10)).await;
+    let leaves = leaves_through(&mut rx, 34).await;
     assert_eq!(leaves, (0..=34).collect::<Vec<u32>>());
+    for later in 2..=4 {
+        assert!(
+            upstream.gap_before(later) < STALL,
+            "full page {later} came {:?} after the one before it, at the poll",
+            upstream.gap_before(later)
+        );
+    }
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(
         upstream.asked(),
@@ -208,9 +259,9 @@ async fn full_pages_follow_at_the_backfill_setting_and_a_short_page_returns_to_t
 async fn without_a_backfill_setting_a_full_page_still_waits_the_poll() {
     let (endpoint, upstream) = serve(Upstream::holding_through(34)).await;
     let (tx, _rx) = mpsc::channel(256);
-    let worker = tokio::spawn(mirror(&endpoint, 3, 10, None).run_worker(LIST, 0, tx));
+    let worker = feed_all(mirror(&endpoint, 3, 10, None), tx);
 
-    requests_made(&upstream, 2, Duration::from_secs(10)).await;
+    requests_made(&upstream, 2, STALL).await;
     assert_eq!(upstream.asked(), [page(0, 9), page(10, 19)]);
     assert!(
         upstream.gap_before(2) >= Duration::from_millis(2_500),
@@ -226,10 +277,9 @@ async fn without_a_backfill_setting_a_full_page_still_waits_the_poll() {
 async fn a_failed_page_waits_the_poll_even_mid_backfill() {
     let (endpoint, upstream) = serve(Upstream::holding_through(34).failing(&[2])).await;
     let (tx, _rx) = mpsc::channel(256);
-    let worker =
-        tokio::spawn(mirror(&endpoint, 3, 10, Some(Duration::ZERO)).run_worker(LIST, 0, tx));
+    let worker = feed_all(mirror(&endpoint, 3, 10, Some(Duration::ZERO)), tx);
 
-    requests_made(&upstream, 4, Duration::from_secs(15)).await;
+    requests_made(&upstream, 4, STALL).await;
     assert_eq!(
         upstream.asked()[..4],
         [page(0, 9), page(10, 19), page(10, 19), page(20, 29)]
@@ -249,10 +299,9 @@ async fn a_failed_page_waits_the_poll_even_mid_backfill() {
 async fn an_empty_page_waits_the_poll() {
     let (endpoint, upstream) = serve(Upstream::holding_through(19)).await;
     let (tx, _rx) = mpsc::channel(256);
-    let worker =
-        tokio::spawn(mirror(&endpoint, 3, 10, Some(Duration::ZERO)).run_worker(LIST, 0, tx));
+    let worker = feed_all(mirror(&endpoint, 3, 10, Some(Duration::ZERO)), tx);
 
-    requests_made(&upstream, 4, Duration::from_secs(15)).await;
+    requests_made(&upstream, 4, STALL).await;
     assert_eq!(
         upstream.asked()[..4],
         [page(0, 9), page(10, 19), page(20, 29), page(20, 29)]
@@ -267,29 +316,25 @@ async fn an_empty_page_waits_the_poll() {
 }
 
 /// The six-block forest ends at `SEVENTH_BLOCK`. The page that would straddle it is cut at the
-/// last held row, nothing at or past it is asked for or sent, and the persisted cursor names
-/// the row itself, so the block declared next resumes the feed there and nothing is skipped.
+/// last held row, nothing at or past it is asked for or sent, and the feed's progress names the
+/// row itself, so the block declared next resumes the feed there and nothing is skipped.
 #[tokio::test]
 async fn the_feed_stops_in_front_of_the_first_unheld_row_and_resumes_there() {
     let (endpoint, upstream) = serve(Upstream::holding_through(u64::from(u32::MAX))).await;
-    let scratch = tempfile::tempdir().expect("tempdir");
-    let cursor = MirrorCursor::new(scratch.path().to_path_buf(), MirrorKind::Path, 0);
-    cursor.persist(SEVENTH_BLOCK - 2).expect("seed the cursor");
-
     // Room for a whole page, so a feed that ran past the stop is caught by what it sent.
     let (tx, mut rx) = mpsc::channel(1_024);
-    let stopped = tokio::time::timeout(
-        Duration::from_secs(10),
-        mirror(&endpoint, 1, 501, None).run_worker_bounded(
+    let status = FeedStatus::default();
+    let stopped = settled(
+        &status,
+        mirror(&endpoint, 1, 501, None).run_feed(
             LIST,
-            0,
-            Some(cursor.clone()),
-            |at| at.max(SEVENTH_BLOCK),
+            SEVENTH_BLOCK - 2,
+            |at| at..at.max(SEVENTH_BLOCK),
+            status.clone(),
             tx,
         ),
     )
-    .await
-    .expect("the worker must stop, not wait on the unheld row");
+    .await;
     assert!(
         matches!(stopped, Err(MirrorError::Unheld { list_index }) if list_index == SEVENTH_BLOCK),
         "{stopped:?}"
@@ -299,41 +344,34 @@ async fn the_feed_stops_in_front_of_the_first_unheld_row_and_resumes_there() {
     while let Ok((payload, _)) = rx.try_recv() {
         sent.push(payload);
     }
-    let leaves: Vec<u32> = sent
-        .iter()
-        .filter_map(|payload| match payload {
-            WalEntryPayload::PpoiListLeafAdded { list_index, .. } => Some(*list_index),
-            _ => None,
-        })
-        .collect();
     let held_through = u32::try_from(SEVENTH_BLOCK - 1).expect("u32 index");
-    assert_eq!(leaves, [held_through - 1, held_through]);
-    assert_eq!(
-        sent.len(),
-        4,
-        "a status row rides with each leaf, and no more"
+    assert!(
+        matches!(
+            sent[..],
+            [
+                WalEntryPayload::PpoiListLeafAdded { list_index: a, .. },
+                WalEntryPayload::PpoiListLeafAdded { list_index: b, .. },
+            ] if a == held_through - 1 && b == held_through
+        ),
+        "one leaf per held row, and nothing else: {sent:?}"
     );
     assert_eq!(
         upstream.asked(),
         [page(SEVENTH_BLOCK - 2, SEVENTH_BLOCK - 1)],
         "the page must end at the last held row"
     );
-    assert_eq!(cursor.resolve_start(), SEVENTH_BLOCK);
+    let resume_at = status.snapshot().next_index;
+    assert_eq!(resume_at, SEVENTH_BLOCK);
 
     let (tx, mut rx) = mpsc::channel(64);
-    let resumed = tokio::spawn(mirror(&endpoint, 1, 501, None).run_worker_bounded(
+    let resumed = tokio::spawn(mirror(&endpoint, 1, 501, None).run_feed(
         LIST,
-        0,
-        Some(cursor),
-        |at| at.max(SEVENTH_BLOCK + 65_536),
+        resume_at,
+        |at| at..at.max(SEVENTH_BLOCK + 65_536),
+        FeedStatus::default(),
         tx,
     ));
-    let first = leaves_through(
-        &mut rx,
-        u32::try_from(SEVENTH_BLOCK).expect("u32 index"),
-        Duration::from_secs(10),
-    )
-    .await;
+    let first = leaves_through(&mut rx, u32::try_from(SEVENTH_BLOCK).expect("u32 index")).await;
     assert_eq!(
         first,
         [u32::try_from(SEVENTH_BLOCK).expect("u32 index")],
@@ -346,18 +384,18 @@ async fn the_feed_stops_in_front_of_the_first_unheld_row_and_resumes_there() {
 async fn a_feed_starting_on_its_stop_asks_upstream_for_nothing() {
     let (endpoint, upstream) = serve(Upstream::holding_through(u64::from(u32::MAX))).await;
     let (tx, mut rx) = mpsc::channel(8);
-    let stopped = tokio::time::timeout(
-        Duration::from_secs(10),
-        mirror(&endpoint, 1, 501, None).run_worker_bounded(
+    let status = FeedStatus::default();
+    let stopped = settled(
+        &status,
+        mirror(&endpoint, 1, 501, None).run_feed(
             LIST,
             SEVENTH_BLOCK,
-            None,
-            |at| at.max(SEVENTH_BLOCK),
+            |at| at..at.max(SEVENTH_BLOCK),
+            status.clone(),
             tx,
         ),
     )
-    .await
-    .expect("the worker must stop at once");
+    .await;
     assert!(
         matches!(stopped, Err(MirrorError::Unheld { list_index }) if list_index == SEVENTH_BLOCK),
         "{stopped:?}"
@@ -373,18 +411,18 @@ async fn a_feed_booted_past_an_unheld_row_names_that_row() {
     const GAP: u64 = 65_536;
     let (endpoint, upstream) = serve(Upstream::holding_through(u64::from(u32::MAX))).await;
     let (tx, mut rx) = mpsc::channel(8);
-    let stopped = tokio::time::timeout(
-        Duration::from_secs(10),
+    let status = FeedStatus::default();
+    let stopped = settled(
+        &status,
         mirror(&endpoint, 1, 501, None).run_feed(
             LIST,
             2 * GAP + 7,
             |_| GAP..GAP,
-            FeedStatus::default(),
+            status.clone(),
             tx,
         ),
     )
-    .await
-    .expect("the feed must stop at once");
+    .await;
     assert!(
         matches!(stopped, Err(MirrorError::Unheld { list_index }) if list_index == GAP),
         "{stopped:?}"
@@ -393,7 +431,7 @@ async fn a_feed_booted_past_an_unheld_row_names_that_row() {
     assert!(rx.try_recv().is_err());
 }
 
-/// A worker waiting out a 30 s poll notices the engine hanging up at once, not a poll later, so
+/// A feed waiting out a 30 s poll notices the engine hanging up at once, not a poll later, so
 /// a graceful shutdown is not held for the rest of the interval.
 #[tokio::test]
 async fn a_closed_channel_ends_the_poll_wait_at_once() {
@@ -407,11 +445,11 @@ async fn a_closed_channel_ends_the_poll_wait_at_once() {
         status.clone(),
         tx,
     ));
-    leaves_through(&mut rx, 4, Duration::from_secs(10)).await;
-    requests_made(&upstream, 1, Duration::from_secs(10)).await;
+    leaves_through(&mut rx, 4).await;
+    requests_made(&upstream, 1, STALL).await;
 
     drop(rx);
-    let outcome = tokio::time::timeout(Duration::from_secs(5), worker)
+    let outcome = tokio::time::timeout(STALL, worker)
         .await
         .expect("the worker must stop without waiting out the poll")
         .expect("worker task");

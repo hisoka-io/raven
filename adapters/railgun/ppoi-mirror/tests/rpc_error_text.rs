@@ -1,5 +1,6 @@
-//! The worker logs these errors and retries, so their text is what an operator has to act on.
-//! Each one must keep naming the method, the endpoint and the upstream's own answer.
+//! A refused boot quotes this text, and the feed logs the same words for a failed page, so it is
+//! what an operator has to act on. Each one must keep naming the method, the endpoint, the
+//! failure class and the upstream's own answer.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
@@ -7,7 +8,8 @@ use axum::http::{header::CONTENT_TYPE, StatusCode};
 use axum::routing::post;
 use axum::Router;
 use raven_railgun_core::ListKey;
-use raven_railgun_ppoi_mirror::{MirrorConfig, MirrorSource, UpstreamPpoiMirror};
+use raven_railgun_ppoi_mirror::{MirrorConfig, UpstreamPpoiMirror};
+use std::time::Duration;
 
 async fn serve_fixed(
     status: StatusCode,
@@ -34,7 +36,7 @@ async fn fetch_error_text(endpoint: &str) -> String {
     })
     .expect("mirror builds");
     mirror
-        .fetch_status_range(&ListKey([0x42; 32]), 0, 0)
+        .preflight(&ListKey([0x42; 32]), Duration::from_secs(5))
         .await
         .expect_err("upstream answer must be refused")
         .to_string()
@@ -46,7 +48,8 @@ async fn http_status_text_names_method_endpoint_and_status() {
     assert_eq!(
         fetch_error_text(&url).await,
         format!(
-            "upstream error: JSON-RPC ppoi_poi_events POST {url} returned 500 Internal Server Error"
+            "ppoi mirror preflight: ppoi_poi_events POST {url}: answered HTTP 500 \
+             (500 Internal Server Error)"
         )
     );
     task.abort();
@@ -57,7 +60,10 @@ async fn envelope_mismatch_text_names_version_and_id() {
     let (url, task) = serve_fixed(StatusCode::OK, r#"{"jsonrpc":"1.0","id":7,"result":[]}"#).await;
     assert_eq!(
         fetch_error_text(&url).await,
-        "decode error: JSON-RPC ppoi_poi_events response envelope mismatch: version 1.0, id 7"
+        format!(
+            "ppoi mirror preflight: ppoi_poi_events POST {url}: answered a body that is not a \
+             JSON-RPC 2.0 reply (response envelope mismatch: version 1.0, id 7)"
+        )
     );
     task.abort();
 }
@@ -71,7 +77,10 @@ async fn rpc_error_text_carries_upstream_code_and_message() {
     .await;
     assert_eq!(
         fetch_error_text(&url).await,
-        "upstream error: JSON-RPC ppoi_poi_events error -32602: unknown listKey"
+        format!(
+            "ppoi mirror preflight: ppoi_poi_events POST {url}: answered JSON-RPC error -32602 \
+             (unknown listKey)"
+        )
     );
     task.abort();
 }
@@ -85,7 +94,10 @@ async fn result_and_error_together_are_refused() {
     .await;
     assert_eq!(
         fetch_error_text(&url).await,
-        "decode error: JSON-RPC ppoi_poi_events response contains both result and error"
+        format!(
+            "ppoi mirror preflight: ppoi_poi_events POST {url}: answered a body that is not a \
+             JSON-RPC 2.0 reply (response contains both result and error)"
+        )
     );
     task.abort();
 }
@@ -95,7 +107,10 @@ async fn neither_result_nor_error_is_refused() {
     let (url, task) = serve_fixed(StatusCode::OK, r#"{"jsonrpc":"2.0","id":1}"#).await;
     assert_eq!(
         fetch_error_text(&url).await,
-        "decode error: JSON-RPC ppoi_poi_events response contains neither result nor error"
+        format!(
+            "ppoi mirror preflight: ppoi_poi_events POST {url}: answered a body that is not a \
+             JSON-RPC 2.0 reply (response contains neither result nor error)"
+        )
     );
     task.abort();
 }
@@ -105,7 +120,10 @@ async fn non_json_body_text_names_the_method() {
     let (url, task) = serve_fixed(StatusCode::OK, "<html>gateway</html>").await;
     let text = fetch_error_text(&url).await;
     assert!(
-        text.starts_with("decode error: JSON-RPC ppoi_poi_events response: "),
+        text.starts_with(&format!(
+            "ppoi mirror preflight: ppoi_poi_events POST {url}: answered a body that is not a \
+             JSON-RPC 2.0 reply (error decoding response body"
+        )),
         "{text}"
     );
     task.abort();
@@ -121,7 +139,7 @@ async fn refused_connection_text_names_method_and_endpoint() {
     let text = fetch_error_text(&url).await;
     assert!(
         text.starts_with(&format!(
-            "upstream error: JSON-RPC ppoi_poi_events POST {url}: "
+            "ppoi mirror preflight: ppoi_poi_events POST {url}: connection failed ("
         )),
         "{text}"
     );

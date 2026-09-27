@@ -2,37 +2,35 @@
 //!
 //! # Trust
 //!
-//! A mirrored row is taken on the word of whoever answers at the configured endpoint; see
-//! [`TRUST_STATEMENT`]. Each `signedPOIEvent` carries the list provider's ed25519 signature. The
-//! mirror checks that it is 64 bytes of hex, passes it on in the WAL payload, and never verifies
-//! it. The engine names this authority model `VerificationMode::UpstreamAsserted`, and config
-//! spells it `verification_mode = "upstream-asserted"`: the upstream's assertion is the whole of
-//! the authority, and no signature check runs.
+//! Each `signedPOIEvent` carries the list provider's ed25519 signature over the UTF-8 of
+//! `JSON.stringify({index, blindedCommitment, type})`, built from the strings exactly as upstream
+//! serves them. A Railgun list key is the provider's public key. With
+//! [`MirrorConfig::verify_signatures`] set, the feed checks every row against the list key it is
+//! given. A row whose signature fails, or is not 64 bytes of hex, is refused by index, counted
+//! in [`FeedProgress::signatures_refused`], and never delivered: the feed stops in front of it
+//! and asks for it again.
 //!
-//! # What a mirrored status IS
+//! That authenticates each row's index, blinded commitment and type. It does not stop the
+//! endpoint from withholding or delaying rows, it does not cover `validatedMerkleroot` (the
+//! engine holds each row to that root against the tree it builds), and the list key itself is
+//! trusted as configured. The signed message names no chain and no txid version, and an
+//! upstream node signs for all of them with one key, so the endpoint can serve rows the same key
+//! signed for another chain or txid version. With the setting off, a row is taken on the
+//! endpoint's word and its signature is carried unverified. [`TRUST_STATEMENT`] and
+//! [`UNVERIFIED_TRUST_STATEMENT`] say the same for an operator's log.
 //!
-//! `ppoi_poi_events` carries membership, not a verdict. Upstream computes a status per
-//! commitment at query time over four stores (`getPOIStatus`, `poi-merkletree-manager.ts`):
-//! presence in the list's POI merkletree is `Valid`, and its other three verdicts come from the
-//! blocked-shield database, the transact-proof mempool, and a fallthrough - none of which this
-//! endpoint reads. The merkletree leaf IS the event's blinded commitment, inserted at the event's
-//! index by the same call that appends the event, so for one list "member of the event list" and
-//! "`Valid`" are the same statement.
+//! # What a mirrored status is
 //!
-//! So every row this mirror emits carries [`LIST_MEMBERSHIP_STATUS`], and that is the whole of
-//! what the data says. A commitment upstream would call `ShieldBlocked` was never given a list
-//! index, so no index-addressed row can express it; reporting its absence as a clean verdict is
-//! the fail-open this statement exists to name. Asking for the other three verdicts means asking
-//! `ppoi_pois_per_blinded_commitment` per commitment - see [`MirrorSource::fetch_status_typed`],
-//! which is the only function here that can return a second value.
+//! `ppoi_poi_events` carries membership, not a verdict. Upstream's `Valid` for a list is presence
+//! in that list's POI merkletree, whose leaf is the event's blinded commitment, inserted at the
+//! event's index. So every row this mirror emits carries [`LIST_MEMBERSHIP_STATUS`], and that is
+//! the whole of what the data says. A commitment upstream would call `ShieldBlocked` was never
+//! given a list index, so no row here can express it.
 
 #![allow(missing_docs, clippy::items_after_statements)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
-use async_trait::async_trait;
-use raven_railgun_core::{
-    BlindedCommitment, BlindedCommitmentType, ListKey, POIStatus, PoiStatusRow,
-};
+use raven_railgun_core::{BlindedCommitment, ListKey, POIStatus};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -51,9 +49,6 @@ pub enum MirrorError {
     /// JSON decode or type-shape mismatch.
     #[error("decode error: {0}")]
     Decode(String),
-    /// Mirror source has been shut down.
-    #[error("source closed")]
-    Closed,
     /// No consumer can hold the row at `list_index`, so the feed stopped in front of it.
     #[error("no consumer holds list index {list_index}; the feed stopped in front of it")]
     Unheld { list_index: u64 },
@@ -94,6 +89,10 @@ pub enum PreflightFailure {
     /// for again.
     #[error("answered a page without row {0}")]
     MissingRow(u64),
+    /// Answered row `.0` with a signature the list key does not verify; the rows below it were
+    /// taken and it is asked for again.
+    #[error("answered row {0} with a signature the list key does not verify")]
+    BadSignature(u64),
 }
 
 /// A refused [`UpstreamPpoiMirror::preflight`].
@@ -111,14 +110,22 @@ pub struct PreflightError {
     pub detail: String,
 }
 
-/// What vouches for a mirrored row, worded for an operator. Logged once per worker.
-pub const TRUST_STATEMENT: &str = "list authenticity rests on TLS to the configured upstream \
-    endpoint; signedPOIEvent signatures are stored, not verified";
+/// What vouches for a mirrored row when [`MirrorConfig::verify_signatures`] is set, worded for an
+/// operator. Logged once per feed.
+pub const TRUST_STATEMENT: &str = "each row's index, blinded commitment and type are \
+    authenticated by its signedPOIEvent ed25519 signature under the configured list key; the \
+    endpoint can still withhold or delay rows, validatedMerkleroot is not signed, the signature \
+    binds neither chain nor txid version so rows the same key signed for another chain or txid \
+    version pass, and the list key is trusted as configured";
+
+/// What vouches for a mirrored row when [`MirrorConfig::verify_signatures`] is unset.
+pub const UNVERIFIED_TRUST_STATEMENT: &str = "list authenticity rests on the configured upstream \
+    endpoint and the transport to it; signedPOIEvent signatures are stored, not verified";
 
 /// Default polling cadence between upstream pulls (seconds).
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 30;
 
-/// Bound on one upstream request, connect to last body byte.
+/// Default bound on one upstream request, connect to last body byte.
 pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Default upstream PPOI endpoint.
@@ -131,7 +138,6 @@ pub const LIST_MEMBERSHIP_STATUS: POIStatus = POIStatus::Valid;
 
 const JSON_RPC_VERSION: &str = "2.0";
 const POI_EVENTS_METHOD: &str = "ppoi_poi_events";
-const POIS_PER_BLINDED_COMMITMENT_METHOD: &str = "ppoi_pois_per_blinded_commitment";
 
 /// Default chain type in PPOI URLs.
 pub const DEFAULT_CHAIN_TYPE: &str = "0";
@@ -139,39 +145,10 @@ pub const DEFAULT_CHAIN_TYPE: &str = "0";
 /// Default Ethereum mainnet chain id.
 pub const DEFAULT_CHAIN_ID: u64 = 1;
 
-/// Mirrors upstream PPOI service state into the engine.
-#[async_trait]
-pub trait MirrorSource: Send + Sync + 'static {
-    /// Fetch the list's members over the inclusive range `[start_index, end_index]`.
-    ///
-    /// Every row carries [`LIST_MEMBERSHIP_STATUS`] because that is all `ppoi_poi_events` says;
-    /// see the crate doc. This is membership, not a per-commitment verdict, and it cannot
-    /// distinguish a blocked commitment from one upstream has never heard of.
-    async fn fetch_status_range(
-        &self,
-        list: &ListKey,
-        start_index: u64,
-        end_index: u64,
-    ) -> Result<Vec<PoiStatusRow>>;
-
-    /// Fetch the canonical status for one blinded commitment via JSON-RPC.
-    ///
-    /// The only path here that can return a value other than [`LIST_MEMBERSHIP_STATUS`]: upstream
-    /// consults the blocked-shield database and the transact-proof mempool as well as the list,
-    /// keyed by commitment and by the caller-declared type rather than by list index.
-    async fn fetch_status_typed(
-        &self,
-        list: &ListKey,
-        bc: &BlindedCommitment,
-        bc_type: BlindedCommitmentType,
-    ) -> Result<POIStatus>;
-}
-
 /// Configuration for [`UpstreamPpoiMirror`].
 #[derive(Clone, Debug)]
 pub struct MirrorConfig {
-    /// Upstream PPOI service endpoint (no trailing slash). TLS to it is all that authenticates
-    /// the mirrored list; see [`TRUST_STATEMENT`].
+    /// Upstream PPOI service endpoint (no trailing slash).
     pub endpoint: String,
     /// Chain type identifier sent in JSON-RPC parameters.
     pub chain_type: String,
@@ -183,6 +160,11 @@ pub struct MirrorConfig {
     pub max_rows_per_fetch: u64,
     /// `txidVersion` field in every PPOI request body.
     pub txid_version: String,
+    /// Bound on one feed request, connect to last body byte.
+    pub request_timeout: std::time::Duration,
+    /// Check each row's signature against the list key, and refuse a row that fails. Unset, rows
+    /// are taken on the endpoint's word; see the crate's trust section.
+    pub verify_signatures: bool,
 }
 
 impl Default for MirrorConfig {
@@ -194,23 +176,23 @@ impl Default for MirrorConfig {
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
             max_rows_per_fetch: 501,
             txid_version: DEFAULT_TXID_VERSION.to_owned(),
+            request_timeout: REQUEST_TIMEOUT,
+            verify_signatures: false,
         }
     }
 }
 
-/// Cursor kind. Status and path-projection feeds get separate sidecars
-/// because they advance independently across restarts.
+/// Cursor kind: the sidecar filename a [`MirrorCursor`] reads and writes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MirrorKind {
-    /// Drives `PpoiStatus` consumers.
+    /// The status-list sidecar.
     Status,
-    /// Drives `PpoiListLeafAdded` consumers used by path-projection encoders.
+    /// The path-projection sidecar.
     Path,
 }
 
 impl MirrorKind {
-    /// Sidecar filename suffix; distinct per kind so the two feeds advance
-    /// independently after a restart.
+    /// Sidecar filename suffix; distinct per kind.
     #[must_use]
     pub const fn sidecar_filename(self) -> &'static str {
         match self {
@@ -220,17 +202,15 @@ impl MirrorKind {
     }
 }
 
-/// Sidecar cursor for [`UpstreamPpoiMirror::run_worker_with_cursor`]. Written
-/// write-tmp + fsync + rename, so a torn cursor is never observable; a crash
-/// mid-write leaves the prior sidecar, or the `fallback` when absent.
+/// A cursor sidecar file. The feed reads none: its start comes from the rows the store holds.
+/// Written write-tmp + fsync + rename, so a torn cursor is never observable.
 #[derive(Clone, Debug)]
 pub struct MirrorCursor {
     /// Directory holding `kind.sidecar_filename()`.
     pub data_dir: PathBuf,
     /// Cursor kind; selects the sidecar filename.
     pub kind: MirrorKind,
-    /// Used when the sidecar is missing or torn. Derive it from the replayed
-    /// per-list leaf count so a fresh bootstrap never re-pulls from index 0.
+    /// Used when the sidecar is missing or torn.
     pub fallback: u64,
 }
 
@@ -251,29 +231,13 @@ impl MirrorCursor {
         self.data_dir.join(self.kind.sidecar_filename())
     }
 
-    /// Starting cursor: the sidecar when decodable, else `self.fallback`.
+    /// The sidecar when decodable, else `self.fallback`.
     #[must_use]
     pub fn resolve_start(&self) -> u64 {
-        let path = self.sidecar_path();
-        if let Some(v) = read_cursor_sidecar(&path) {
-            tracing::info!(
-                sidecar = %path.display(),
-                cursor = v,
-                "ppoi mirror cursor: resumed from sidecar"
-            );
-            v
-        } else {
-            tracing::info!(
-                sidecar = %path.display(),
-                fallback = self.fallback,
-                "ppoi mirror cursor: sidecar absent or torn; falling back"
-            );
-            self.fallback
-        }
+        read_cursor_sidecar(&self.sidecar_path()).unwrap_or(self.fallback)
     }
 
-    /// Atomically persist the cursor. The worker logs and continues on error;
-    /// the next successful batch retries the write.
+    /// Atomically persist the cursor.
     ///
     /// # Errors
     ///
@@ -286,8 +250,6 @@ impl MirrorCursor {
 /// Cursor sidecar wire size: one little-endian u64.
 pub const MIRROR_CURSOR_SIDECAR_BYTES: usize = 8;
 
-/// Write `cursor` as little-endian bytes via tmp + fsync + rename, so a torn
-/// cursor is never observable across a crash.
 fn write_cursor_sidecar_atomic(path: &Path, cursor: u64) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
@@ -311,14 +273,9 @@ fn write_cursor_sidecar_atomic(path: &Path, cursor: u64) -> std::io::Result<()> 
     Ok(())
 }
 
-/// Read the sidecar; `None` on any failure so the worker falls back cleanly.
 fn read_cursor_sidecar(path: &Path) -> Option<u64> {
     let bytes = std::fs::read(path).ok()?;
-    if bytes.len() != MIRROR_CURSOR_SIDECAR_BYTES {
-        return None;
-    }
-    let mut arr = [0u8; MIRROR_CURSOR_SIDECAR_BYTES];
-    arr.copy_from_slice(&bytes);
+    let arr: [u8; MIRROR_CURSOR_SIDECAR_BYTES] = bytes.try_into().ok()?;
     Some(u64::from_le_bytes(arr))
 }
 
@@ -340,6 +297,12 @@ pub struct FeedProgress {
     pub last_answer: Option<std::time::Instant>,
     /// Why the feed stopped for good; `None` while it runs.
     pub stopped: Option<String>,
+    /// Rows refused because the list key does not verify their signature, since the feed
+    /// started. A row refused again when it is asked for again counts again.
+    pub signatures_refused: u64,
+    /// A row the feed delivered that no consumer took, which it is asking for again. Cleared
+    /// once the span starts past it, so while this is set the list cannot complete.
+    pub untaken_row: Option<u64>,
 }
 
 /// Shared handle on one feed's [`FeedProgress`]: the feed writes it, an operator surface reads
@@ -383,13 +346,12 @@ impl FeedStatus {
         progress.last_answer = Some(std::time::Instant::now());
     }
 
-    /// Upstream answered, but left out the row at `missing`: the rows below it were delivered, and
-    /// the page says nothing of upstream's size.
-    fn answered_short_of(&self, next_index: u64, delivered: usize, missing: u64) {
+    /// Upstream answered, but the page stops short at a row the feed cannot take: the rows below
+    /// it were delivered, and the page says nothing of upstream's size.
+    fn answered_short_of(&self, next_index: u64, delivered: usize, refusal: PreflightFailure) {
         tracing::warn!(
-            missing,
-            "ppoi mirror: upstream page left out a row; took the rows below it and will ask for \
-             it again"
+            %refusal,
+            "ppoi mirror: took the rows below the refused one and will ask for it again"
         );
         let mut progress = self.progress();
         progress.next_index = next_index;
@@ -398,8 +360,15 @@ impl FeedStatus {
             .saturating_add(u64::try_from(delivered).unwrap_or(u64::MAX));
         progress.upstream_rows = None;
         progress.consecutive_failures = progress.consecutive_failures.saturating_add(1);
-        progress.last_failure = Some(PreflightFailure::MissingRow(missing));
+        progress.last_failure = Some(refusal);
         progress.last_answer = Some(std::time::Instant::now());
+        if matches!(refusal, PreflightFailure::BadSignature(_)) {
+            progress.signatures_refused = progress.signatures_refused.saturating_add(1);
+        }
+    }
+
+    fn untaken(&self, row: Option<u64>) {
+        self.progress().untaken_row = row;
     }
 
     fn stopped(&self, reason: String) {
@@ -420,18 +389,20 @@ impl std::fmt::Debug for UpstreamPpoiMirror {
             .field("endpoint", &self.config.endpoint)
             .field("chain_type", &self.config.chain_type)
             .field("chain_id", &self.config.chain_id)
+            .field("verify_signatures", &self.config.verify_signatures)
             .field("backfill_interval", &self.backfill_interval)
             .finish_non_exhaustive()
     }
 }
 
 impl UpstreamPpoiMirror {
-    /// Build from config with a default 10s-timeout `reqwest::Client`.
+    /// Build from config, with a client bounded by `config.request_timeout`.
     ///
     /// # Errors
     ///
-    /// [`MirrorError::Upstream`] if client construction fails; escalated rather
-    /// than falling back to a timeout-less client.
+    /// [`MirrorError::InvalidConfig`] for a page size outside `1..=501` or a zero timeout;
+    /// [`MirrorError::Upstream`] if client construction fails, escalated rather than falling
+    /// back to a timeout-less client.
     pub fn new(config: MirrorConfig) -> Result<Self> {
         if config.max_rows_per_fetch == 0 || config.max_rows_per_fetch > 501 {
             return Err(MirrorError::InvalidConfig(format!(
@@ -439,8 +410,13 @@ impl UpstreamPpoiMirror {
                 config.max_rows_per_fetch
             )));
         }
+        if config.request_timeout.is_zero() {
+            return Err(MirrorError::InvalidConfig(
+                "request_timeout must be above zero".to_owned(),
+            ));
+        }
         let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(config.request_timeout)
             .build()
             .map_err(|e| MirrorError::Upstream(format!("reqwest builder: {e}")))?;
         Ok(Self {
@@ -474,10 +450,20 @@ impl UpstreamPpoiMirror {
         &self.config.endpoint
     }
 
+    /// What vouches for the rows this mirror delivers, as configured.
+    #[must_use]
+    pub fn trust_statement(&self) -> &'static str {
+        if self.config.verify_signatures {
+            TRUST_STATEMENT
+        } else {
+            UNVERIFIED_TRUST_STATEMENT
+        }
+    }
+
     /// One bounded `ppoi_poi_events` request for index 0 of `list`, over the client, envelope
-    /// check and row decoder the worker itself uses, so `Ok` means the worker's first page can
-    /// succeed. The worker retries a dead endpoint forever and only warns; this is the call that
-    /// lets a boot path refuse one instead.
+    /// check, row decoder and signature check the feed itself uses, so `Ok` means the feed's
+    /// first page can succeed. The feed retries a dead endpoint forever and only warns; this is
+    /// the call that lets a boot path refuse one instead.
     ///
     /// ```no_run
     /// # async fn boot() -> Result<(), Box<dyn std::error::Error>> {
@@ -501,20 +487,27 @@ impl UpstreamPpoiMirror {
             failure,
             detail,
         };
-        let events: Vec<WirePOISyncedListEvent> = self
-            .exchange_json_rpc(
-                POI_EVENTS_METHOD,
-                self.poi_events_params(list, 0, 0),
-                Some(timeout),
-            )
+        let verifier = self.verifier(list);
+        let page = self
+            .fetch_page(list, 0, 0, Some(timeout), verifier.as_ref())
             .await
-            .map_err(|failure| {
-                let (class, detail) = failure.into_preflight(timeout);
-                refuse(class, detail)
-            })?;
-        decode_indexed_events(events, 0, 0)
-            .map_err(|error| refuse(PreflightFailure::UndecodableRows, error.to_string()))?;
-        Ok(())
+            .map_err(|(class, detail)| refuse(class, detail))?;
+        match page.forged {
+            Some(row) => Err(refuse(
+                PreflightFailure::BadSignature(row),
+                format!(
+                    "list key {} does not verify the row's signature",
+                    hex_lower(&list.0)
+                ),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    fn verifier(&self, list: &ListKey) -> Option<RowVerifier> {
+        self.config
+            .verify_signatures
+            .then(|| RowVerifier::for_list(list))
     }
 
     fn poi_events_params(
@@ -533,106 +526,24 @@ impl UpstreamPpoiMirror {
         }
     }
 
-    /// No-cursor polling worker; delegates to
-    /// [`Self::run_worker_with_cursor`] with `None`.
+    /// Feed `list` from `starting_cursor`, asking only for the rows `span(cursor)` names, and
+    /// record what it sees of upstream in `status`.
     ///
-    /// # Errors
-    ///
-    /// [`MirrorError`] only for non-recoverable failures; per-batch fetch
-    /// failures log and retry on the next tick.
-    pub async fn run_worker(
-        self: std::sync::Arc<Self>,
-        list: ListKey,
-        starting_cursor: u64,
-        sender: tokio::sync::mpsc::Sender<(raven_railgun_persistence::WalEntryPayload, u64)>,
-    ) -> Result<()> {
-        self.run_worker_with_cursor(list, starting_cursor, None, sender)
-            .await
-    }
-
-    /// Cursor-aware polling worker. With `persistent_cursor` set, the start
-    /// position comes from the sidecar and the advanced cursor is persisted
-    /// after every successful batch; `starting_cursor` applies only when it is
-    /// `None`.
-    ///
-    /// # Load-bearing emission order
-    ///
-    /// Per upstream row, `PpoiListLeafAdded` MUST be emitted before
-    /// `PpoiStatus`: the apply path allocates the
-    /// `(blinded_commitment -> list_index)` mapping from the former, and the
-    /// reverse order leaves the per-list IMT silently stale.
-    ///
-    /// # Errors
-    ///
-    /// [`MirrorError`] only for non-recoverable failures.
-    pub async fn run_worker_with_cursor(
-        self: std::sync::Arc<Self>,
-        list: ListKey,
-        starting_cursor: u64,
-        persistent_cursor: Option<MirrorCursor>,
-        sender: tokio::sync::mpsc::Sender<(raven_railgun_persistence::WalEntryPayload, u64)>,
-    ) -> Result<()> {
-        self.run_worker_bounded(
-            list,
-            starting_cursor,
-            persistent_cursor,
-            |_| u64::MAX,
-            sender,
-        )
-        .await
-    }
-
-    /// [`Self::run_worker_with_cursor`], stopped in front of the first row nothing downstream
-    /// can hold.
-    ///
-    /// `first_unheld(cursor)` is the first list-wide index at or after `cursor` that no consumer
-    /// holds. No page reaches past it, so neither the cursor nor its sidecar ever passes a row
-    /// that was not delivered, and a consumer declared later resumes the feed at that row.
-    ///
-    /// # Errors
-    ///
-    /// [`MirrorError::Unheld`] once the cursor reaches that index, otherwise as
-    /// [`Self::run_worker_with_cursor`].
-    pub async fn run_worker_bounded<F>(
-        self: std::sync::Arc<Self>,
-        list: ListKey,
-        starting_cursor: u64,
-        persistent_cursor: Option<MirrorCursor>,
-        first_unheld: F,
-        sender: tokio::sync::mpsc::Sender<(raven_railgun_persistence::WalEntryPayload, u64)>,
-    ) -> Result<()>
-    where
-        F: Fn(u64) -> u64 + Send,
-    {
-        let cursor = match persistent_cursor.as_ref() {
-            Some(pc) => pc.resolve_start(),
-            None => starting_cursor,
-        };
-        self.feed(
-            list,
-            cursor,
-            persistent_cursor.as_ref(),
-            move |cursor| cursor..first_unheld(cursor),
-            &FeedStatus::default(),
-            sender,
-        )
-        .await
-    }
-
-    /// A feed with no sidecar that asks only for the rows `span(cursor)` names, and records what
-    /// it sees of upstream in `status`.
-    ///
-    /// `span(cursor)` starts at the lowest list-wide index at or after `cursor` that some
-    /// consumer still has to append, and ends in front of the first index past that which no
-    /// consumer needs or can hold. The rows it steps over are held by every consumer that can
-    /// hold them, so they are not pulled again. An empty span stops the feed.
+    /// `span(cursor)` starts at the lowest list-wide index that some consumer still has to
+    /// append, and ends in front of the first index past that which no consumer needs or can
+    /// hold. A start above the cursor steps over rows every consumer that can hold them already
+    /// holds. A start below it is a row the feed delivered and no consumer took; once it has
+    /// stood there for a poll interval, the feed moves back, asks for it again and names it in
+    /// [`FeedProgress::untaken_row`] until a consumer takes it. That recovers a refused row
+    /// without a restart only if `span` reads what each consumer holds at the call: a span that
+    /// never starts below the cursor never sends the feed back. An empty span stops the feed.
     ///
     /// # Errors
     ///
     /// [`MirrorError::Unheld`] at an empty span, naming the span's start, which can lie below
     /// the cursor; otherwise only non-recoverable failures. A failed request is counted in
-    /// `status` and retried at the poll interval, and so is a page that leaves out a row, once
-    /// the rows below that row are delivered.
+    /// `status` and retried at the poll interval, and so is a page that leaves out a row or
+    /// carries one whose signature fails, once the rows below that row are delivered.
     pub async fn run_feed<F>(
         self: std::sync::Arc<Self>,
         list: ListKey,
@@ -645,7 +556,7 @@ impl UpstreamPpoiMirror {
         F: Fn(u64) -> std::ops::Range<u64> + Send,
     {
         let outcome = self
-            .feed(list, starting_cursor, None, span, &status, sender)
+            .feed(list, starting_cursor, span, &status, sender)
             .await;
         status.stopped(match &outcome {
             Ok(()) => "the engine closed the feed channel".to_owned(),
@@ -658,7 +569,6 @@ impl UpstreamPpoiMirror {
         &self,
         list: ListKey,
         mut cursor: u64,
-        persistent_cursor: Option<&MirrorCursor>,
         span: F,
         status: &FeedStatus,
         sender: tokio::sync::mpsc::Sender<(raven_railgun_persistence::WalEntryPayload, u64)>,
@@ -669,10 +579,12 @@ impl UpstreamPpoiMirror {
         use tokio::time::{sleep, Duration, Instant};
         let poll = Duration::from_secs(self.config.poll_interval_secs.max(1));
         let backfill = self.backfill_interval.unwrap_or(poll);
+        let verifier = self.verifier(&list);
         status.at(cursor);
-        tracing::info!(endpoint = %self.config.endpoint, "ppoi mirror: {TRUST_STATEMENT}");
+        tracing::info!(endpoint = %self.config.endpoint, "ppoi mirror: {}", self.trust_statement());
         let mut pause = Duration::ZERO;
         let mut asked_at = Instant::now();
+        let mut untaken = UntakenRow::default();
         loop {
             // Measured from the previous request, so the setting bounds the request rate. A closed
             // channel ends the wait, so shutdown is not held for a poll interval.
@@ -687,11 +599,18 @@ impl UpstreamPpoiMirror {
             asked_at = Instant::now();
             pause = poll;
             let wanted = span(cursor);
+            if let Some(row) = untaken.observe(&wanted, cursor, poll, status) {
+                cursor = row;
+                status.at(cursor);
+            }
             if wanted.start > cursor {
                 cursor = wanted.start;
                 status.at(cursor);
             }
             if wanted.end <= cursor {
+                if untaken.waiting() {
+                    continue;
+                }
                 return Err(MirrorError::Unheld {
                     list_index: wanted.start,
                 });
@@ -705,29 +624,40 @@ impl UpstreamPpoiMirror {
                     ))
                 })?
                 .min(wanted.end - 1);
-            let mut events = match self.fetch_indexed_events(&list, cursor, end).await {
-                Ok(v) => v,
-                Err((class, e)) => {
-                    tracing::warn!(error = %e, "fetch_indexed_events failed; retrying next tick");
+            let Page { mut events, forged } = match self
+                .fetch_page(&list, cursor, end, None, verifier.as_ref())
+                .await
+            {
+                Ok(page) => page,
+                Err((class, detail)) => {
+                    tracing::warn!(
+                        endpoint = %self.config.endpoint,
+                        method = POI_EVENTS_METHOD,
+                        failure = %class,
+                        %detail,
+                        "ppoi mirror: page request failed; asking again at the poll interval"
+                    );
                     status.failed(class);
                     continue;
                 }
             };
             let missing = truncate_at_first_missing(&mut events, cursor);
-            let full = u64::try_from(events.len()).is_ok_and(|rows| rows == end - cursor + 1);
+            let taken = u64::try_from(events.len()).unwrap_or(u64::MAX);
+            let next = cursor.saturating_add(taken);
+            let refusal = page_refusal(missing, forged, next);
+            let full = taken == end - cursor + 1;
             if full {
                 pause = backfill;
             }
-            for ev in &events {
-                let status_byte = poi_status_to_byte(ev.status);
-                // Emission order is load-bearing; see the worker doc. So is the height: upstream
-                // rows have no block, and 0 keeps them out of every reorg unwind (`h > height`
-                // is never true). A real height here makes reorgs start dropping PPOI rows.
+            let membership = LIST_MEMBERSHIP_STATUS.wire_byte();
+            for ev in events {
+                // Upstream rows have no block, and 0 keeps them out of every reorg unwind
+                // (`h > height` is never true). A real height here makes reorgs drop PPOI rows.
                 let leaf_added = raven_railgun_persistence::WalEntryPayload::PpoiListLeafAdded {
                     list_key: list.0,
                     list_index: ev.list_index,
                     blinded_commitment: ev.blinded_commitment.0,
-                    status: status_byte,
+                    status: membership,
                     event_type: ev.event_type,
                     signature: ev.signature.to_vec(),
                     validated_merkleroot: ev.validated_merkleroot,
@@ -736,80 +666,40 @@ impl UpstreamPpoiMirror {
                     tracing::info!("ppoi mirror engine consumer dropped channel; exiting");
                     return Ok(());
                 }
-                let status_payload = raven_railgun_persistence::WalEntryPayload::PpoiStatus {
-                    list_key: list.0,
-                    blinded_commitment: ev.blinded_commitment.0,
-                    status: status_byte,
-                };
-                if sender.send((status_payload, 0)).await.is_err() {
-                    tracing::info!("ppoi mirror engine consumer dropped channel; exiting");
-                    return Ok(());
-                }
             }
-            if let Some(last) = events.last() {
-                let last_index = u64::from(last.list_index);
-                cursor = last_index.checked_add(1).ok_or_else(|| {
-                    MirrorError::Decode(format!(
-                        "PPOI cursor cannot advance past consumed index {last_index}"
-                    ))
-                })?;
-                if let Some(pc) = persistent_cursor {
-                    if let Err(e) = pc.persist(cursor) {
-                        tracing::warn!(
-                            error = %e,
-                            sidecar = %pc.sidecar_path().display(),
-                            cursor,
-                            "ppoi mirror cursor: atomic write failed; will retry on next batch"
-                        );
-                    }
-                }
-            }
-            match missing {
-                Some(missing) => status.answered_short_of(cursor, events.len(), missing),
+            cursor = next;
+            let delivered = usize::try_from(taken).unwrap_or(usize::MAX);
+            match refusal {
+                Some(refusal) => status.answered_short_of(cursor, delivered, refusal),
                 // A short answer is the whole of upstream's list: no row past its last exists yet.
-                None => status.answered(cursor, events.len(), (!full).then_some(cursor)),
+                None => status.answered(cursor, delivered, (!full).then_some(cursor)),
             }
         }
     }
 
-    /// `ppoi_poi_events` pull retaining each row's `list_index`, which the worker
-    /// needs to drive per-list IMT growth and
-    /// [`MirrorSource::fetch_status_range`] therefore strips. A failure carries its class
-    /// beside the worded error.
-    async fn fetch_indexed_events(
+    /// One `ppoi_poi_events` page, decoded and, with `verifier`, checked. `timeout` overrides
+    /// the client-wide bound. A failure carries its class beside its worded detail.
+    async fn fetch_page(
         &self,
         list: &ListKey,
         start_index: u64,
         end_index: u64,
-    ) -> core::result::Result<Vec<IndexedPoiEvent>, (PreflightFailure, MirrorError)> {
-        if end_index < start_index {
-            return Ok(Vec::new());
-        }
-        let params = self.poi_events_params(list, start_index, end_index);
+        timeout: Option<std::time::Duration>,
+        verifier: Option<&RowVerifier>,
+    ) -> core::result::Result<Page, (PreflightFailure, String)> {
+        let bound = timeout.unwrap_or(self.config.request_timeout);
         let events: Vec<WirePOISyncedListEvent> = self
-            .exchange_json_rpc(POI_EVENTS_METHOD, params, None)
+            .exchange_json_rpc(
+                POI_EVENTS_METHOD,
+                self.poi_events_params(list, start_index, end_index),
+                timeout,
+            )
             .await
-            .map_err(|failure| {
-                (
-                    failure.class(REQUEST_TIMEOUT),
-                    failure.into_mirror_error(POI_EVENTS_METHOD, &self.config.endpoint),
-                )
-            })?;
-        decode_indexed_events(events, start_index, end_index)
-            .map_err(|error| (PreflightFailure::UndecodableRows, error))
+            .map_err(|failure| failure.classify(bound))?;
+        decode_indexed_events(events, start_index, end_index, verifier)
+            .map_err(|error| (PreflightFailure::UndecodableRows, error.to_string()))
     }
 
-    async fn post_json_rpc<P, T>(&self, method: &'static str, params: P) -> Result<T>
-    where
-        P: Serialize,
-        T: DeserializeOwned,
-    {
-        self.exchange_json_rpc(method, params, None)
-            .await
-            .map_err(|failure| failure.into_mirror_error(method, &self.config.endpoint))
-    }
-
-    /// `timeout` overrides the client-wide request timeout for this exchange only.
     async fn exchange_json_rpc<P, T>(
         &self,
         method: &'static str,
@@ -858,6 +748,72 @@ impl UpstreamPpoiMirror {
     }
 }
 
+/// A span start below the cursor: a row the feed delivered that no consumer took.
+#[derive(Debug, Default)]
+struct UntakenRow {
+    /// The row the span starts on below the cursor, and since when.
+    standing: Option<(u64, tokio::time::Instant)>,
+    /// The row last asked for again, until the span starts past it.
+    asked_again: Option<u64>,
+}
+
+impl UntakenRow {
+    /// The row to ask for again, once the span has started on it, below `cursor`, for
+    /// `patience`. Rows still in flight downstream look the same until applied, so a row is only
+    /// asked for again once it stops moving: a duplicate is refused downstream, a skipped row is
+    /// never recovered. `status` names the row from then until the span starts past it.
+    fn observe(
+        &mut self,
+        wanted: &std::ops::Range<u64>,
+        cursor: u64,
+        patience: std::time::Duration,
+        status: &FeedStatus,
+    ) -> Option<u64> {
+        if self.asked_again.is_some_and(|row| wanted.start > row) {
+            self.asked_again = None;
+            status.untaken(None);
+        }
+        if wanted.start >= cursor || wanted.is_empty() {
+            self.standing = None;
+            return None;
+        }
+        match self.standing {
+            Some((row, since)) if row == wanted.start => {
+                if since.elapsed() < patience {
+                    return None;
+                }
+                tracing::warn!(
+                    row,
+                    "ppoi mirror: no consumer took the row; asking for it again"
+                );
+                self.standing = None;
+                self.asked_again = Some(row);
+                status.untaken(self.asked_again);
+                Some(row)
+            }
+            _ => {
+                self.standing = Some((wanted.start, tokio::time::Instant::now()));
+                None
+            }
+        }
+    }
+
+    fn waiting(&self) -> bool {
+        self.standing.is_some()
+    }
+}
+
+/// Why a page stops short of what it holds: the first row missing from it, or the first whose
+/// signature failed when no row below it is missing. `next` is the first index not taken.
+fn page_refusal(missing: Option<u64>, forged: Option<u64>, next: u64) -> Option<PreflightFailure> {
+    match (missing, forged) {
+        (Some(row), _) => Some(PreflightFailure::MissingRow(row)),
+        (None, Some(row)) if row == next => Some(PreflightFailure::BadSignature(row)),
+        (None, Some(_)) => Some(PreflightFailure::MissingRow(next)),
+        (None, None) => None,
+    }
+}
+
 /// One failed JSON-RPC exchange, kept classified until a caller words it.
 #[derive(Debug)]
 enum RpcFailure {
@@ -869,37 +825,15 @@ enum RpcFailure {
 }
 
 impl RpcFailure {
-    fn into_mirror_error(self, method: &str, endpoint: &str) -> MirrorError {
-        match self {
-            Self::Send(error) => {
-                MirrorError::Upstream(format!("JSON-RPC {method} POST {endpoint}: {error}"))
-            }
-            Self::Status(status) => MirrorError::Upstream(format!(
-                "JSON-RPC {method} POST {endpoint} returned {status}"
-            )),
-            Self::Body(error) => {
-                MirrorError::Decode(format!("JSON-RPC {method} response: {error}"))
-            }
-            Self::Envelope(detail) => MirrorError::Decode(format!("JSON-RPC {method} {detail}")),
-            Self::Rpc { code, message } => {
-                MirrorError::Upstream(format!("JSON-RPC {method} error {code}: {message}"))
-            }
-        }
-    }
-
-    fn class(&self, timeout: std::time::Duration) -> PreflightFailure {
-        match self {
+    fn classify(self, timeout: std::time::Duration) -> (PreflightFailure, String) {
+        let class = match &self {
             Self::Send(error) => classify_send_error(error, timeout),
             Self::Status(status) => PreflightFailure::HttpStatus(status.as_u16()),
             // A body that stalls is a timeout, not a malformed reply.
             Self::Body(error) if error.is_timeout() => PreflightFailure::Timeout(timeout),
             Self::Body(_) | Self::Envelope(_) => PreflightFailure::MalformedEnvelope,
             Self::Rpc { code, .. } => PreflightFailure::Rpc(*code),
-        }
-    }
-
-    fn into_preflight(self, timeout: std::time::Duration) -> (PreflightFailure, String) {
-        let class = self.class(timeout);
+        };
         let detail = match self {
             Self::Send(error) | Self::Body(error) => error_chain(&error),
             Self::Status(status) => status.to_string(),
@@ -941,12 +875,80 @@ fn error_chain(error: &dyn std::error::Error) -> String {
     text
 }
 
-/// Indexed event row: `list_index` for IMT growth, bc + status for the map.
+/// The list key as a signature verifier.
+struct RowVerifier {
+    /// `None` when the key is not a curve point: it then verifies no row, so every row is
+    /// refused rather than the list being taken unchecked.
+    key: Option<ed25519_dalek::VerifyingKey>,
+}
+
+impl RowVerifier {
+    fn for_list(list: &ListKey) -> Self {
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&list.0).ok();
+        if key.is_none() {
+            tracing::warn!(
+                list_key = %hex_lower(&list.0),
+                "ppoi mirror: the list key is not an ed25519 public key, so no row can verify"
+            );
+        }
+        Self { key }
+    }
+
+    /// Upstream signs `JSON.stringify({index, blindedCommitment, type})` over the wire strings.
+    /// Five mainnet rows serve their commitment without `0x` and are signed that way, so the
+    /// strings are never normalised first.
+    fn accepts(
+        &self,
+        index: u64,
+        blinded_commitment: &str,
+        event_type: &str,
+        signature: &[u8; 64],
+    ) -> bool {
+        let Some(key) = &self.key else {
+            return false;
+        };
+        let Ok(message) = signed_message(index, blinded_commitment, event_type) else {
+            return false;
+        };
+        // Stricter than upstream's verify: small-order keys and R are refused. Only the key
+        // holder could craft a signature that passes there and fails here, and it fails closed.
+        key.verify_strict(&message, &ed25519_dalek::Signature::from_bytes(signature))
+            .is_ok()
+    }
+}
+
+/// The bytes a list provider signs for one event.
+fn signed_message(
+    index: u64,
+    blinded_commitment: &str,
+    event_type: &str,
+) -> serde_json::Result<Vec<u8>> {
+    #[derive(Serialize)]
+    struct SignedPoiEvent<'a> {
+        index: u64,
+        #[serde(rename = "blindedCommitment")]
+        blinded_commitment: &'a str,
+        #[serde(rename = "type")]
+        event_type: &'a str,
+    }
+    serde_json::to_vec(&SignedPoiEvent {
+        index,
+        blinded_commitment,
+        event_type,
+    })
+}
+
+/// A decoded page: the rows below `forged`, and the index of the first row whose signature
+/// failed, if one did.
+struct Page {
+    events: Vec<IndexedPoiEvent>,
+    forged: Option<u64>,
+}
+
 #[derive(Clone, Debug)]
 struct IndexedPoiEvent {
     list_index: u32,
     blinded_commitment: BlindedCommitment,
-    status: POIStatus,
     event_type: raven_railgun_persistence::PpoiEventType,
     signature: [u8; 64],
     validated_merkleroot: [u8; 32],
@@ -970,7 +972,8 @@ fn decode_indexed_events(
     events: Vec<WirePOISyncedListEvent>,
     start_index: u64,
     end_index: u64,
-) -> Result<Vec<IndexedPoiEvent>> {
+    verifier: Option<&RowVerifier>,
+) -> Result<Page> {
     let requested = end_index
         .checked_sub(start_index)
         .and_then(|span| span.checked_add(1))
@@ -997,9 +1000,7 @@ fn decode_indexed_events(
             )));
         }
         previous = Some(index);
-        let signature = decode_hex64(&event.signed_event.signature).ok_or_else(|| {
-            MirrorError::Decode(format!("invalid signature hex at index {index}"))
-        })?;
+        let signature = decode_hex64(&event.signed_event.signature);
         let event_type = match event.signed_event.event_type.as_str() {
             "Shield" => raven_railgun_persistence::PpoiEventType::Shield,
             "Transact" => raven_railgun_persistence::PpoiEventType::Transact,
@@ -1021,41 +1022,40 @@ fn decode_indexed_events(
                 "all-zero validatedMerkleroot at index {index}: not a root upstream can publish"
             )));
         }
-        let bc_str = event.signed_event.blinded_commitment;
-        let bc_bytes = decode_hex32(&bc_str).ok_or_else(|| {
+        let bc_str = &event.signed_event.blinded_commitment;
+        let bc_bytes = decode_hex32(bc_str).ok_or_else(|| {
             MirrorError::Decode(format!("invalid bc hex at index {index}: {bc_str}"))
         })?;
         let list_index = u32::try_from(index).map_err(|_| {
             MirrorError::Decode(format!("list_index {index} exceeds u32 IMT capacity"))
         })?;
+        if let Some(verifier) = verifier {
+            let verified = signature.as_ref().is_some_and(|signature| {
+                verifier.accepts(index, bc_str, &event.signed_event.event_type, signature)
+            });
+            if !verified {
+                // Rows past a refused one cannot be applied before it, so they are not decoded.
+                return Ok(Page {
+                    events: out,
+                    forged: Some(index),
+                });
+            }
+        }
+        let signature = signature.ok_or_else(|| {
+            MirrorError::Decode(format!("invalid signature hex at index {index}"))
+        })?;
         out.push(IndexedPoiEvent {
             list_index,
             blinded_commitment: BlindedCommitment::from_bytes(bc_bytes),
-            status: LIST_MEMBERSHIP_STATUS,
             event_type,
             signature,
             validated_merkleroot,
         });
     }
-    Ok(out)
-}
-
-/// Encode [`POIStatus`] as a WAL byte (Valid=0, ShieldBlocked=1, ProofSubmitted=2, Missing=3).
-#[must_use]
-pub fn poi_status_to_byte(s: POIStatus) -> u8 {
-    s.wire_byte()
-}
-
-/// Decode a WAL byte back to [`POIStatus`]; returns `None` for unknown values.
-#[must_use]
-pub fn poi_status_from_byte(b: u8) -> Option<POIStatus> {
-    match b {
-        0 => Some(POIStatus::Valid),
-        1 => Some(POIStatus::ShieldBlocked),
-        2 => Some(POIStatus::ProofSubmitted),
-        3 => Some(POIStatus::Missing),
-        _ => None,
-    }
+    Ok(Page {
+        events: out,
+        forged: None,
+    })
 }
 
 /// Wire JSON shape for a `ppoi_poi_events` result row.
@@ -1118,88 +1118,6 @@ struct PoiEventsRequestBody<'a> {
     end_index: u64,
 }
 
-/// Single entry in `blindedCommitmentDatas[]` for status queries.
-#[derive(Debug, Serialize)]
-struct WireBlindedCommitmentData {
-    #[serde(rename = "blindedCommitment")]
-    blinded_commitment: String,
-    #[serde(rename = "type")]
-    bc_type: BlindedCommitmentType,
-}
-
-/// Parameters for `ppoi_pois_per_blinded_commitment`.
-#[derive(Debug, Serialize)]
-struct PoisPerBlindedCommitmentRequestBody<'a> {
-    #[serde(rename = "chainType")]
-    chain_type: &'a str,
-    #[serde(rename = "chainID")]
-    chain_id: String,
-    #[serde(rename = "txidVersion")]
-    txid_version: &'a str,
-    #[serde(rename = "listKey")]
-    list_key: String,
-    #[serde(rename = "blindedCommitmentDatas")]
-    blinded_commitment_datas: Vec<WireBlindedCommitmentData>,
-}
-
-#[async_trait]
-impl MirrorSource for UpstreamPpoiMirror {
-    async fn fetch_status_range(
-        &self,
-        list: &ListKey,
-        start_index: u64,
-        end_index: u64,
-    ) -> Result<Vec<PoiStatusRow>> {
-        if end_index < start_index {
-            return Ok(Vec::new());
-        }
-        let params = self.poi_events_params(list, start_index, end_index);
-        let events: Vec<WirePOISyncedListEvent> =
-            self.post_json_rpc(POI_EVENTS_METHOD, params).await?;
-        decode_indexed_events(events, start_index, end_index).map(|events| {
-            events
-                .into_iter()
-                .map(|event| PoiStatusRow {
-                    blinded_commitment: event.blinded_commitment,
-                    status: event.status,
-                })
-                .collect()
-        })
-    }
-
-    async fn fetch_status_typed(
-        &self,
-        list: &ListKey,
-        bc: &BlindedCommitment,
-        bc_type: BlindedCommitmentType,
-    ) -> Result<POIStatus> {
-        let bc_hex = hex_lower(bc.as_bytes());
-        let prefixed = format!("0x{bc_hex}");
-        let params = PoisPerBlindedCommitmentRequestBody {
-            chain_type: &self.config.chain_type,
-            chain_id: self.config.chain_id.to_string(),
-            txid_version: &self.config.txid_version,
-            list_key: hex_lower(&list.0),
-            blinded_commitment_datas: vec![WireBlindedCommitmentData {
-                blinded_commitment: prefixed.clone(),
-                bc_type,
-            }],
-        };
-        let map: std::collections::HashMap<String, POIStatus> = self
-            .post_json_rpc(POIS_PER_BLINDED_COMMITMENT_METHOD, params)
-            .await?;
-        // Upstream keys by `bc_hex` with or without the `0x` prefix.
-        map.get(&bc_hex)
-            .or_else(|| map.get(&prefixed))
-            .copied()
-            .ok_or_else(|| {
-                MirrorError::Decode(format!(
-                    "ppoi_pois_per_blinded_commitment response missing key {bc_hex}"
-                ))
-            })
-    }
-}
-
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -1254,19 +1172,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn poi_status_byte_round_trip() {
-        for s in [
-            POIStatus::Valid,
-            POIStatus::ShieldBlocked,
-            POIStatus::ProofSubmitted,
-            POIStatus::Missing,
-        ] {
-            let b = poi_status_to_byte(s);
-            assert_eq!(poi_status_from_byte(b), Some(s));
-        }
-    }
-
-    #[test]
     fn decode_hex32_accepts_0x_prefix() {
         let bytes = [1u8; 32];
         let s = format!("0x{}", hex_lower(&bytes));
@@ -1279,16 +1184,15 @@ mod tests {
         assert!(decode_hex32("0xdeadbeef").is_none());
     }
 
+    /// Byte for byte what `JSON.stringify({index, blindedCommitment, type})` produces: that key
+    /// order, no whitespace, the number bare and the strings quoted as given.
     #[test]
-    fn poi_status_pascal_case_serde_round_trip() {
-        for s in ["Valid", "ShieldBlocked", "ProofSubmitted", "Missing"] {
-            let parsed: POIStatus = serde_json::from_str(&format!("\"{s}\""))
-                .expect("PascalCase status decodes via serde");
-            let reser = serde_json::to_string(&parsed).expect("serialize");
-            assert_eq!(reser, format!("\"{s}\""));
-        }
-        let bad: serde_json::Result<POIStatus> = serde_json::from_str("\"nonsense\"");
-        assert!(bad.is_err(), "unknown status must reject");
+    fn the_signed_message_is_upstreams_json_stringify() {
+        let message = signed_message(301_593, "0141bf", "Unshield").expect("serializes");
+        assert_eq!(
+            message,
+            br#"{"index":301593,"blindedCommitment":"0141bf","type":"Unshield"}"#
+        );
     }
 
     #[test]
