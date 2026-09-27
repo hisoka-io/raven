@@ -91,6 +91,14 @@ pub enum CoverageRefusal {
         /// Upstream's latest count, when it has stated one.
         asserted: Option<UpstreamTip>,
     },
+    /// A block's rows do not sit at the indices its tree counts, so reading it gives no
+    /// gap-free prefix.
+    TornBlock {
+        /// List key asked about.
+        list_key: [u8; 32],
+        /// Block whose rows are out of place.
+        block: u32,
+    },
     /// No wired store declares this commit tree.
     NoTreeStore {
         /// Tree asked about.
@@ -169,6 +177,12 @@ impl std::fmt::Display for CoverageRefusal {
                     ", so rows past the local ones may exist and are held by nobody"
                 )
             }
+            Self::TornBlock { list_key, block } => write!(
+                f,
+                "list {} block {block} holds rows that do not sit at the indices its tree \
+                 counts, so it is no gap-free prefix",
+                hex32(list_key)
+            ),
             Self::NoTreeStore { tree_number } => {
                 write!(f, "no wired store declares commit tree {tree_number}")
             }
@@ -199,6 +213,98 @@ pub struct ShimStoreRegistry {
     ppoi_blocks: BTreeMap<([u8; 32], u32), Vec<SharedLogicalStore>>,
     ppoi_whole: BTreeMap<[u8; 32], Vec<SharedLogicalStore>>,
     chain_trees: BTreeMap<u32, Vec<SharedLogicalStore>>,
+    publishing: Publishing,
+}
+
+/// Whole-list reads of the JSON index channel at once. Its body is kept, so a read happens only
+/// when the list moved, and the requests queued behind that read are answered from its body.
+pub const INDEX_MAP_READS_AT_ONCE: usize = 1;
+
+/// Whole-list reads of the status channel at once. Its body is small, but no fingerprint covers
+/// statuses, so each answer visits every row.
+pub const STATUS_HEADER_READS_AT_ONCE: usize = 4;
+
+/// What the publishing channels keep between requests.
+///
+/// A whole-list read is sized by the list rather than by its answer, and on the blocking pool it
+/// outlives a client that hung up, so the reads are rationed by permit. The JSON index channel
+/// keeps one body per list, answered again for as long as the list's fingerprint holds.
+#[derive(Debug)]
+pub(crate) struct Publishing {
+    #[cfg(feature = "json-index-channel")]
+    index_maps: parking_lot::Mutex<BTreeMap<[u8; 32], (ListFingerprint, PublishedBody)>>,
+    #[cfg(feature = "json-index-channel")]
+    index_map_reads: Arc<tokio::sync::Semaphore>,
+    status_header_reads: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    probes: Probes,
+}
+
+impl Default for Publishing {
+    fn default() -> Self {
+        Self {
+            #[cfg(feature = "json-index-channel")]
+            index_maps: parking_lot::Mutex::default(),
+            #[cfg(feature = "json-index-channel")]
+            index_map_reads: Arc::new(tokio::sync::Semaphore::new(INDEX_MAP_READS_AT_ONCE)),
+            status_header_reads: Arc::new(tokio::sync::Semaphore::new(STATUS_HEADER_READS_AT_ONCE)),
+            #[cfg(test)]
+            probes: Probes::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct Probes {
+    list_reads: std::sync::atomic::AtomicUsize,
+    blocks_walked: std::sync::atomic::AtomicUsize,
+}
+
+/// A publishing body and its ETag.
+#[cfg(feature = "json-index-channel")]
+#[derive(Debug, Clone)]
+pub(crate) struct PublishedBody {
+    pub(crate) etag: String,
+    pub(crate) body: bytes::Bytes,
+}
+
+/// Everything a body built from a list's rows depends on: each block's row count and tree root,
+/// and the lowest height any block had applied. Each block's index is walked before its count
+/// is taken, so a block whose rows left a hole is refused rather than fingerprinted; past that,
+/// the root commits to the rows. Statuses are not in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListFingerprint {
+    blocks: Vec<(u32, [u8; 32])>,
+    epoch: u64,
+}
+
+impl ListFingerprint {
+    /// Lowest height any block had applied when its rows were read.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
+/// Where one `since` read of the prefix channel ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexSegment {
+    /// Global index one past the last row read.
+    pub next: u32,
+    /// The segment's block was read full, so its rows can never change.
+    pub sealed: bool,
+}
+
+/// Why a prefix-channel segment was not read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SegmentRefusal {
+    /// `since` is past every row held.
+    PastFrontier {
+        /// Rows the covered prefix holds, list-wide.
+        total: u32,
+    },
+    /// What was read is no gap-free prefix of the list.
+    Uncovered(CoverageRefusal),
 }
 
 impl ShimStoreRegistry {
@@ -230,6 +336,35 @@ impl ShimStoreRegistry {
             }
         }
         registry
+    }
+
+    /// Permits for whole-list reads of the JSON index channel.
+    #[cfg(feature = "json-index-channel")]
+    pub(crate) fn index_map_reads(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.publishing.index_map_reads
+    }
+
+    /// Permits for whole-list reads of the status channel.
+    pub(crate) fn status_header_reads(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.publishing.status_header_reads
+    }
+
+    /// Whole-list reads taken through this registry's coverages.
+    #[cfg(test)]
+    pub(crate) fn list_reads(&self) -> usize {
+        self.publishing
+            .probes
+            .list_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Blocks whose rows were walked through this registry's coverages.
+    #[cfg(test)]
+    pub(crate) fn blocks_walked(&self) -> usize {
+        self.publishing
+            .probes
+            .blocks_walked
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// True when no declaration was supplied at all.
@@ -320,6 +455,7 @@ impl ShimStoreRegistry {
         let coverage = ListCoverage {
             list_key: *list_key,
             blocks,
+            publishing: Some(&self.publishing),
         };
         coverage.prove_prefix(tip)?;
         Ok(coverage)
@@ -348,10 +484,23 @@ impl ShimStoreRegistry {
         let coverage = ListCoverage {
             list_key: *list_key,
             blocks: vec![single],
+            publishing: Some(&self.publishing),
         };
         coverage.prove_prefix(tip)?;
         Ok(coverage)
     }
+}
+
+/// Rows of the gap-free prefix `held` describes: every full block, then the first short one.
+fn contiguous_rows(held: &[u32]) -> u64 {
+    let mut total = 0u64;
+    for &rows in held {
+        total = total.saturating_add(u64::from(rows));
+        if rows < LEAVES_PER_PPOI_BLOCK {
+            break;
+        }
+    }
+    total
 }
 
 /// A proven gap-free prefix of one list, in block order. Index in `blocks` is the block number.
@@ -359,6 +508,8 @@ impl ShimStoreRegistry {
 pub struct ListCoverage<'a> {
     list_key: [u8; 32],
     blocks: Vec<&'a SharedLogicalStore>,
+    #[cfg_attr(not(feature = "json-index-channel"), allow(dead_code))]
+    publishing: Option<&'a Publishing>,
 }
 
 /// One row of a covered list, carrying the index a client can act on.
@@ -382,6 +533,7 @@ impl<'a> ListCoverage<'a> {
         Self {
             list_key,
             blocks: vec![store],
+            publishing: None,
         }
     }
 
@@ -470,26 +622,247 @@ impl<'a> ListCoverage<'a> {
             .unwrap_or(0)
     }
 
-    /// Every covered row in ascending global-index order. Each block is locked once.
-    pub fn leaves(&self) -> Vec<CoveredLeaf> {
-        let mut out = Vec::new();
-        for (block, store) in self.blocks.iter().enumerate() {
-            let base = u32::try_from(block)
-                .unwrap_or(u32::MAX)
-                .saturating_mul(LEAVES_PER_PPOI_BLOCK);
-            let guard = store.lock();
-            out.extend(
-                guard
-                    .ppoi_list_leaves_iter(&self.list_key)
-                    .map(|(local, bc)| CoveredLeaf {
-                        global_index: base.saturating_add(local),
-                        blinded_commitment: *bc,
-                        status: guard.ppoi_status(&self.list_key, bc),
-                    })
-                    .collect::<Vec<_>>(),
-            );
+    /// Row count and tree root of one block, read under the caller's lock.
+    fn block_state(&self, store: &LogicalLeafStore) -> (u32, [u8; 32]) {
+        store.ppoi_imt(&self.list_key).map_or((0, [0; 32]), |imt| {
+            (
+                u32::try_from(imt.leaf_count()).unwrap_or(u32::MAX),
+                imt.root(),
+            )
+        })
+    }
+
+    /// Hand each of one block's rows to `visit` in local-index order under the caller's lock,
+    /// and return the block's row count and root. A block whose rows do not sit at the indices
+    /// its tree counts gives no gap-free prefix, so it is refused.
+    fn walk_block(
+        &self,
+        guard: &LogicalLeafStore,
+        block: u32,
+        visit: &mut dyn FnMut(u32, &[u8; 32]),
+    ) -> Result<(u32, [u8; 32]), CoverageRefusal> {
+        #[cfg(test)]
+        if let Some(publishing) = self.publishing {
+            publishing
+                .probes
+                .blocks_walked
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        out
+        let (count, root) = self.block_state(guard);
+        let mut read = 0u32;
+        for (local, bc) in guard.ppoi_list_leaves_iter(&self.list_key) {
+            if local != read {
+                return Err(self.torn(block));
+            }
+            visit(local, bc);
+            read = read.saturating_add(1);
+        }
+        if read != count {
+            return Err(self.torn(block));
+        }
+        Ok((count, root))
+    }
+
+    /// The fingerprint a whole-list read of the current state would carry. Walks each block's
+    /// index without copying a row, so it refuses exactly what that read would refuse.
+    pub fn fingerprint(&self) -> Result<ListFingerprint, CoverageRefusal> {
+        self.read_blocks(&mut |_, _, _| {}, &mut |_| {})
+    }
+
+    /// The JSON index channel's body, if a read of the state `fingerprint` names published one.
+    #[cfg(feature = "json-index-channel")]
+    pub(crate) fn published_index_map(
+        &self,
+        fingerprint: &ListFingerprint,
+    ) -> Option<PublishedBody> {
+        let publishing = self.publishing?;
+        let index_maps = publishing.index_maps.lock();
+        index_maps
+            .get(&self.list_key)
+            .filter(|(read, _)| read == fingerprint)
+            .map(|(_, published)| published.clone())
+    }
+
+    /// Keep the body a read of `fingerprint` produced, replacing the list's previous one.
+    #[cfg(feature = "json-index-channel")]
+    pub(crate) fn publish_index_map(&self, fingerprint: ListFingerprint, published: PublishedBody) {
+        if let Some(publishing) = self.publishing {
+            publishing
+                .index_maps
+                .lock()
+                .insert(self.list_key, (fingerprint, published));
+        }
+    }
+
+    /// Every covered row in ascending global-index order, handed to `visit` under the lock of
+    /// the block that holds it, so `visit` must only copy. `with_status` adds each row's status.
+    /// Returns the fingerprint of the state the rows came from.
+    ///
+    /// Each block's height is read under the same lock as its rows, so the epoch never names a
+    /// height whose rows are missing. Blocks are locked one at a time while the list grows, so
+    /// a block read short followed by one read holding rows is a hole in what was read, and is
+    /// refused rather than served with its rows shifted down.
+    pub fn read_list(
+        &self,
+        with_status: bool,
+        visit: impl FnMut(CoveredLeaf),
+    ) -> Result<ListFingerprint, CoverageRefusal> {
+        self.read_list_with(with_status, visit, &mut |_| {})
+    }
+
+    fn read_list_with(
+        &self,
+        with_status: bool,
+        mut visit: impl FnMut(CoveredLeaf),
+        between_blocks: &mut dyn FnMut(u32),
+    ) -> Result<ListFingerprint, CoverageRefusal> {
+        #[cfg(test)]
+        if let Some(publishing) = self.publishing {
+            publishing
+                .probes
+                .list_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.read_blocks(
+            &mut |guard, global_index, bc| {
+                visit(CoveredLeaf {
+                    global_index,
+                    blinded_commitment: *bc,
+                    status: if with_status {
+                        guard.ppoi_status(&self.list_key, bc)
+                    } else {
+                        None
+                    },
+                });
+            },
+            between_blocks,
+        )
+    }
+
+    fn read_blocks(
+        &self,
+        visit: &mut dyn FnMut(&LogicalLeafStore, u32, &[u8; 32]),
+        between_blocks: &mut dyn FnMut(u32),
+    ) -> Result<ListFingerprint, CoverageRefusal> {
+        let mut blocks = Vec::with_capacity(self.blocks.len());
+        let mut epoch: Option<u64> = None;
+        let mut short: Option<(u32, u32)> = None;
+        for (position, store) in self.blocks.iter().enumerate() {
+            let block = u32::try_from(position).unwrap_or(u32::MAX);
+            let base = block.saturating_mul(LEAVES_PER_PPOI_BLOCK);
+            let guard = store.lock();
+            let held_store: &LogicalLeafStore = &guard;
+            if let Some((short_block, short_held)) = short {
+                if self.block_state(held_store).0 > 0 {
+                    return Err(CoverageRefusal::ShortBlock {
+                        list_key: self.list_key,
+                        block: short_block,
+                        held: short_held,
+                        expected: LEAVES_PER_PPOI_BLOCK,
+                    });
+                }
+            }
+            let state = self.walk_block(held_store, block, &mut |local, bc| {
+                visit(held_store, base.saturating_add(local), bc);
+            })?;
+            let height = held_store.last_block_height();
+            drop(guard);
+            epoch = Some(epoch.map_or(height, |lowest| lowest.min(height)));
+            if state.0 < LEAVES_PER_PPOI_BLOCK && short.is_none() {
+                short = Some((block, state.0));
+            }
+            blocks.push(state);
+            between_blocks(block);
+        }
+        Ok(ListFingerprint {
+            blocks,
+            epoch: epoch.unwrap_or(0),
+        })
+    }
+
+    /// Every covered row with its status, in ascending global-index order.
+    pub fn leaves(&self) -> Result<Vec<CoveredLeaf>, CoverageRefusal> {
+        let mut out = Vec::new();
+        self.read_list(true, |leaf| out.push(leaf))?;
+        Ok(out)
+    }
+
+    /// Read the prefix-channel segment starting at global index `since`: the rows of that one
+    /// block from `since` on, handed to `visit` under the block's lock.
+    ///
+    /// Only that block's rows are read, so a row's position in the segment is its global index
+    /// by construction. The segment is sealed only when its block was read full; a short one is
+    /// the frontier, and a later block holding rows under it is refused as a hole.
+    pub fn segment(
+        &self,
+        since: u32,
+        visit: impl FnMut(&[u8; 32]),
+    ) -> Result<IndexSegment, SegmentRefusal> {
+        self.segment_with(since, visit, &mut |_| {})
+    }
+
+    fn segment_with(
+        &self,
+        since: u32,
+        mut visit: impl FnMut(&[u8; 32]),
+        between_blocks: &mut dyn FnMut(u32),
+    ) -> Result<IndexSegment, SegmentRefusal> {
+        let block = since / LEAVES_PER_PPOI_BLOCK;
+        let base = block * LEAVES_PER_PPOI_BLOCK;
+        let held: Vec<u32> = self
+            .blocks
+            .iter()
+            .map(|store| self.held_rows(store))
+            .collect();
+        let total = contiguous_rows(&held);
+        if u64::from(since) > total {
+            return Err(SegmentRefusal::PastFrontier {
+                total: u32::try_from(total).unwrap_or(u32::MAX),
+            });
+        }
+        let position = usize::try_from(block).unwrap_or(usize::MAX);
+        let read = match self.blocks.get(position) {
+            None => 0,
+            Some(store) => {
+                let guard = store.lock();
+                let skip = since - base;
+                self.walk_block(&guard, block, &mut |local, bc| {
+                    if local >= skip {
+                        visit(bc);
+                    }
+                })
+                .map_err(SegmentRefusal::Uncovered)?
+                .0
+            }
+        };
+        between_blocks(block);
+        let next = base.saturating_add(read);
+        if since > next {
+            return Err(SegmentRefusal::PastFrontier { total: next });
+        }
+        let sealed = read >= LEAVES_PER_PPOI_BLOCK;
+        if !sealed {
+            let later = self.blocks.iter().skip(position.saturating_add(1));
+            if later
+                .map(|store| self.held_rows(store))
+                .any(|rows| rows > 0)
+            {
+                return Err(SegmentRefusal::Uncovered(CoverageRefusal::ShortBlock {
+                    list_key: self.list_key,
+                    block,
+                    held: read,
+                    expected: LEAVES_PER_PPOI_BLOCK,
+                }));
+            }
+        }
+        Ok(IndexSegment { next, sealed })
+    }
+
+    fn torn(&self, block: u32) -> CoverageRefusal {
+        CoverageRefusal::TornBlock {
+            list_key: self.list_key,
+            block,
+        }
     }
 
     /// The block that holds `blinded_commitment`, as `(store, local_index)`.
@@ -548,11 +921,18 @@ mod tests {
     }
 
     fn block_store(local_indices: std::ops::Range<u32>, seed_base: u32) -> SharedLogicalStore {
-        let mut store = LogicalLeafStore::new();
+        let store = Arc::new(parking_lot::Mutex::new(LogicalLeafStore::new()));
+        append(&store, local_indices, seed_base);
+        store
+    }
+
+    /// Append rows at `local_indices`, each at height `1_000 + local`.
+    fn append(store: &SharedLogicalStore, local_indices: std::ops::Range<u32>, seed_base: u32) {
         let enc = encoder();
+        let mut guard = store.lock();
         for local in local_indices {
             apply_wal_entry(
-                &mut store,
+                &mut guard,
                 &WalEntryPayload::PpoiListLeafAdded {
                     list_key: LIST_KEY,
                     list_index: local,
@@ -567,7 +947,17 @@ mod tests {
             )
             .expect("seed ppoi leaf");
         }
-        Arc::new(parking_lot::Mutex::new(store))
+    }
+
+    /// A short block 0 with four rows and an empty block 1 the test can grow mid-read, proven
+    /// at upstream's count of four.
+    fn short_block_then_empty() -> (ShimStoreRegistry, SharedLogicalStore) {
+        let block_one = block_store(0..0, 100);
+        let registry = ShimStoreRegistry::from_declarations([
+            (block_filter(0), block_store(0..4, 0)),
+            (block_filter(1), Arc::clone(&block_one)),
+        ]);
+        (registry, block_one)
     }
 
     fn block_filter(block: u32) -> DataSourceFilter {
@@ -597,7 +987,7 @@ mod tests {
         let coverage = registry
             .prove_list_coverage(&LIST_KEY, Some(counted(4, 0)))
             .expect("covered");
-        let leaves = coverage.leaves();
+        let leaves = coverage.leaves().expect("read");
         assert_eq!(leaves.len(), 4);
         assert_eq!(leaves[3].global_index, 3);
     }
@@ -669,7 +1059,7 @@ mod tests {
         let coverage = registry
             .prove_list_coverage(&LIST_KEY, Some(counted(4, 0)))
             .expect("covered");
-        assert_eq!(coverage.leaves().len(), 4);
+        assert_eq!(coverage.leaves().expect("read").len(), 4);
         for tip in [None, Some(counted(5, 0))] {
             assert_eq!(
                 registry.prove_list_coverage(&LIST_KEY, tip).err(),
@@ -747,7 +1137,7 @@ mod tests {
         let coverage = registry
             .prove_list_coverage(&LIST_KEY, Some(counted(4, 0)))
             .expect("covered");
-        assert_eq!(coverage.leaves().len(), 4);
+        assert_eq!(coverage.leaves().expect("read").len(), 4);
     }
 
     #[test]
@@ -931,5 +1321,208 @@ mod tests {
         }
         .to_string();
         assert!(silent.contains("no row count"), "{silent}");
+    }
+
+    /// Blocks are locked one at a time while the list grows. Rows reaching block 1 after a short
+    /// block 0 was read would follow block 0's rows at positions 4 and 5 while carrying global
+    /// indices 65,536 and 65,537: a map with a hole in it. The read refuses instead.
+    #[test]
+    fn a_whole_list_read_refuses_rows_that_land_past_a_short_block_mid_read() {
+        let (registry, block_one) = short_block_then_empty();
+        let coverage = registry
+            .prove_list_coverage(&LIST_KEY, Some(counted(4, 0)))
+            .expect("covered before the interleaving");
+        let mut served = Vec::new();
+        let read =
+            coverage.read_list_with(false, |leaf| served.push(leaf.global_index), &mut |block| {
+                if block == 0 {
+                    append(&block_one, 0..2, 100);
+                }
+            });
+        assert_eq!(
+            read.err(),
+            Some(CoverageRefusal::ShortBlock {
+                list_key: LIST_KEY,
+                block: 0,
+                held: 4,
+                expected: LEAVES_PER_PPOI_BLOCK,
+            })
+        );
+        for (position, global) in served.iter().enumerate() {
+            assert_eq!(
+                u32::try_from(position).ok(),
+                Some(*global),
+                "row {position} was handed on at global index {global}"
+            );
+        }
+    }
+
+    /// The prefix channel reads only the block `since` falls in, so a row's position is its global
+    /// index by construction, and rows landing in a later block while the frontier is read are a
+    /// hole to refuse, not a segment to serve with block 1's rows renumbered into block 0.
+    #[test]
+    fn a_segment_reads_only_its_own_block_and_refuses_rows_landing_past_it_mid_read() {
+        let (registry, block_one) = short_block_then_empty();
+        let coverage = registry
+            .prove_list_coverage(&LIST_KEY, Some(counted(4, 0)))
+            .expect("covered before the interleaving");
+        let walked_before = registry.blocks_walked();
+        let mut served = Vec::new();
+        let segment = coverage.segment_with(0, |bc| served.push(*bc), &mut |block| {
+            if block == 0 {
+                append(&block_one, 0..2, 100);
+            }
+        });
+        let expected: Vec<[u8; 32]> = (0..4).map(fr).collect();
+        assert_eq!(
+            served, expected,
+            "position i must carry the row seeded at global index i"
+        );
+        assert_eq!(
+            segment,
+            Err(SegmentRefusal::Uncovered(CoverageRefusal::ShortBlock {
+                list_key: LIST_KEY,
+                block: 0,
+                held: 4,
+                expected: LEAVES_PER_PPOI_BLOCK,
+            }))
+        );
+        assert_eq!(
+            registry.blocks_walked() - walked_before,
+            1,
+            "two blocks are declared, and only the one `since` falls in may have its rows walked"
+        );
+    }
+
+    #[test]
+    fn a_segment_starts_at_since_and_ends_at_the_frontier() {
+        let (registry, _block_one) = short_block_then_empty();
+        let coverage = registry
+            .prove_list_coverage(&LIST_KEY, Some(counted(4, 0)))
+            .expect("covered");
+        let mut served = Vec::new();
+        assert_eq!(
+            coverage.segment(1, |bc| served.push(*bc)),
+            Ok(IndexSegment {
+                next: 4,
+                sealed: false
+            })
+        );
+        assert_eq!(served, (1..4).map(fr).collect::<Vec<_>>());
+        assert_eq!(
+            coverage.segment(4, |_| {}),
+            Ok(IndexSegment {
+                next: 4,
+                sealed: false
+            })
+        );
+        assert_eq!(
+            coverage.segment(5, |_| {}),
+            Err(SegmentRefusal::PastFrontier { total: 4 })
+        );
+    }
+
+    /// Each block's height is read under the lock its rows are read under. Read after the rows,
+    /// the epoch names the height of a row appended since, which the read never saw.
+    #[test]
+    fn a_whole_list_read_names_the_height_its_rows_were_read_at() {
+        let block_zero = block_store(0..4, 0);
+        let registry =
+            ShimStoreRegistry::from_declarations([(block_filter(0), Arc::clone(&block_zero))]);
+        let coverage = registry
+            .prove_list_coverage(&LIST_KEY, Some(counted(4, 0)))
+            .expect("covered");
+        let mut rows = 0u32;
+        let read = coverage
+            .read_list_with(false, |_| rows += 1, &mut |_| append(&block_zero, 4..5, 0))
+            .expect("read");
+        assert_eq!(rows, 4);
+        assert_eq!(
+            read.epoch(),
+            1_003,
+            "the body holds rows up to height 1,003; 1,004 belongs to a row it lacks"
+        );
+    }
+
+    /// A reorg that drops a middle row leaves the tree counting past a hole in the index, with
+    /// its count, root and height all unchanged. Its rows no longer sit at their indices, so the
+    /// block is refused rather than served shifted, and it is refused by the fingerprint too, so a
+    /// body kept from before the reorg is never answered again as current.
+    #[test]
+    fn a_block_whose_rows_do_not_sit_at_their_indices_is_refused() {
+        let store = Arc::new(parking_lot::Mutex::new(LogicalLeafStore::new()));
+        let enc = encoder();
+        let coverage = ListCoverage::undeclared(LIST_KEY, &store);
+        {
+            let mut guard = store.lock();
+            for (local, height) in [(0u32, 1_000u64), (1, 2_000), (2, 1_001)] {
+                apply_wal_entry(
+                    &mut guard,
+                    &WalEntryPayload::PpoiListLeafAdded {
+                        list_key: LIST_KEY,
+                        list_index: local,
+                        blinded_commitment: fr(local),
+                        status: 0,
+                        event_type: raven_railgun_persistence::PpoiEventType::Shield,
+                        signature: vec![0; 64],
+                        validated_merkleroot: [0; 32],
+                    },
+                    height,
+                    &enc,
+                )
+                .expect("seed ppoi leaf");
+            }
+        }
+        assert!(coverage.fingerprint().is_ok(), "no hole before the reorg");
+        apply_wal_entry(
+            &mut store.lock(),
+            &WalEntryPayload::Reorg { height: 1_500 },
+            1_500,
+            &enc,
+        )
+        .expect("reorg");
+        let torn = CoverageRefusal::TornBlock {
+            list_key: LIST_KEY,
+            block: 0,
+        };
+        assert_eq!(coverage.fingerprint().err(), Some(torn.clone()));
+        assert_eq!(coverage.leaves().err(), Some(torn.clone()));
+        assert_eq!(
+            coverage.segment(0, |_| {}),
+            Err(SegmentRefusal::Uncovered(torn))
+        );
+    }
+
+    /// The JSON channel's body is kept against the fingerprint of the read that produced it, and
+    /// a list that grows no longer matches it.
+    #[cfg(feature = "json-index-channel")]
+    #[test]
+    fn a_kept_body_matches_only_the_state_it_was_read_from() {
+        let block_zero = block_store(0..4, 0);
+        let registry =
+            ShimStoreRegistry::from_declarations([(block_filter(0), Arc::clone(&block_zero))]);
+        let coverage = registry
+            .prove_list_coverage(&LIST_KEY, Some(counted(4, 0)))
+            .expect("covered");
+        let read = coverage.read_list(false, |_| {}).expect("read");
+        assert_eq!(coverage.fingerprint().as_ref(), Ok(&read));
+        coverage.publish_index_map(
+            read.clone(),
+            PublishedBody {
+                etag: "\"a\"".to_owned(),
+                body: bytes::Bytes::from_static(b"{}"),
+            },
+        );
+        assert_eq!(
+            coverage
+                .published_index_map(&read)
+                .map(|published| published.etag)
+                .as_deref(),
+            Some("\"a\"")
+        );
+        append(&block_zero, 4..5, 0);
+        let grown = coverage.fingerprint().expect("fingerprint");
+        assert_ne!(grown, read);
+        assert!(coverage.published_index_map(&grown).is_none());
     }
 }

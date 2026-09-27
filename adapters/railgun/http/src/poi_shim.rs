@@ -16,6 +16,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use bytes::Bytes;
 use raven_railgun_core::{MerkleProof as CoreMerkleProof, POIStatus};
 use raven_railgun_engine::inspire::LogicalLeafStore;
 #[cfg(feature = "prefix-index-channel")]
@@ -24,8 +25,13 @@ use raven_railgun_engine::PirScheme;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "json-index-channel")]
+use crate::shim_store::PublishedBody;
+#[cfg(feature = "prefix-index-channel")]
+use crate::shim_store::SegmentRefusal;
 use crate::shim_store::{
-    CoverageRefusal, ListCoverage, SharedLogicalStore as CoveredStore, UpstreamTip,
+    CoverageRefusal, ListCoverage, SharedLogicalStore as CoveredStore, ShimStoreRegistry,
+    UpstreamTip,
 };
 use crate::status::MirrorFeedView;
 use crate::AppState;
@@ -410,57 +416,60 @@ pub(crate) async fn bc_prefix_segment_handler<S: PirScheme>(
     headers_in: HeaderMap,
 ) -> Result<axum::response::Response, StatusCode> {
     let list_key = hex_decode_32(&list_key_hex).ok_or(StatusCode::BAD_REQUEST)?;
-    let coverage = cover_list(&app, list_key, BC_PREFIXES_ROUTE, &read_mirror_feeds(&app))?;
+    let since = segment.since.unwrap_or(0);
+    off_executor(move || serve_prefix_segment(&app, list_key, since, &headers_in)).await
+}
+
+#[cfg(feature = "prefix-index-channel")]
+fn serve_prefix_segment<S: PirScheme>(
+    app: &AppState<S>,
+    list_key: [u8; 32],
+    since: u32,
+    headers_in: &HeaderMap,
+) -> Result<axum::response::Response, StatusCode> {
+    let coverage = cover_list(app, list_key, BC_PREFIXES_ROUTE, &read_mirror_feeds(app))?;
     // Epoch before rows, so it never names a height whose rows are missing from the body.
     let epoch = coverage.epoch();
-    let leaves = coverage.leaves();
+    let mut body = Vec::new();
+    let segment = coverage.segment(since, |bc| {
+        body.extend(bc.iter().copied().take(BC_INDEX_PREFIX_BYTES));
+    });
     coverage
         .recheck_frontier()
         .map_err(|refusal| refuse_uncovered(BC_PREFIXES_ROUTE, &refusal))?;
-
-    let total = u32::try_from(leaves.len()).unwrap_or(u32::MAX);
-    let since = segment.since.unwrap_or(0);
-    // Past the frontier the caller holds rows this epoch does not, which is a rollback to
-    // report rather than an empty body to absorb.
-    if since > total {
-        return Err(StatusCode::RANGE_NOT_SATISFIABLE);
-    }
-    // A block below the frontier is full, so its rows can never change again; that is what
-    // bounds the response and what makes the segment cacheable forever.
-    let block_end = (since / LEAVES_PER_PPOI_BLOCK)
-        .saturating_add(1)
-        .saturating_mul(LEAVES_PER_PPOI_BLOCK);
-    let next = block_end.min(total);
-    let sealed = next == block_end;
-
-    let skip = usize::try_from(since).unwrap_or(usize::MAX);
-    let take = usize::try_from(next.saturating_sub(since)).unwrap_or(usize::MAX);
-    // Ordinal position in a proven coverage IS the global index, so `since` indexes the
-    // row vector directly.
-    let mut body = Vec::with_capacity(take.saturating_mul(BC_INDEX_PREFIX_BYTES));
-    for leaf in leaves.iter().skip(skip).take(take) {
-        body.extend(
-            leaf.blinded_commitment
-                .iter()
-                .copied()
-                .take(BC_INDEX_PREFIX_BYTES),
-        );
-    }
+    let segment = match segment {
+        Ok(segment) => segment,
+        // Past the frontier the caller holds rows this epoch does not, which is a rollback to
+        // report rather than an empty body to absorb. The refusal still says where this node's
+        // list ends, so the caller can resume from there.
+        Err(SegmentRefusal::PastFrontier { total }) => {
+            let mut hdrs = HeaderMap::new();
+            hdrs.insert(X_RAVEN_INDEX_TOTAL, HeaderValue::from(total));
+            hdrs.insert(X_RAVEN_INDEX_EPOCH, HeaderValue::from(epoch));
+            return Ok((StatusCode::RANGE_NOT_SATISFIABLE, hdrs).into_response());
+        }
+        Err(SegmentRefusal::Uncovered(refusal)) => {
+            return Err(refuse_uncovered(BC_PREFIXES_ROUTE, &refusal));
+        }
+    };
+    let next = segment.next;
 
     let mut extra = vec![
         (X_RAVEN_INDEX_BASE, HeaderValue::from(since)),
         (X_RAVEN_INDEX_NEXT, HeaderValue::from(next)),
     ];
+    // A sealed block can never change again, which is what makes its segment cacheable forever.
     // An immutable response may carry only what is immutable: a cache holds it for a year, and
     // a list-wide total or epoch read off it then contradicts the frontier's.
-    let last_modified = if sealed {
+    let last_modified = if segment.sealed {
         extra.push((
             CACHE_CONTROL_HEADER,
             HeaderValue::from_static("public, max-age=31536000, immutable"),
         ));
         None
     } else {
-        extra.push((X_RAVEN_INDEX_TOTAL, HeaderValue::from(total)));
+        // An unsealed segment is the frontier, so the list ends where it does.
+        extra.push((X_RAVEN_INDEX_TOTAL, HeaderValue::from(next)));
         extra.push((X_RAVEN_INDEX_EPOCH, HeaderValue::from(epoch)));
         extra.push((
             CACHE_CONTROL_HEADER,
@@ -469,10 +478,12 @@ pub(crate) async fn bc_prefix_segment_handler<S: PirScheme>(
         Some(epoch)
     };
 
+    let etag = body_etag(&body);
     Ok(serve_publishing_bytes(
-        body,
+        Bytes::from(body),
+        &etag,
         last_modified,
-        &headers_in,
+        headers_in,
         HeaderValue::from_static("application/octet-stream"),
         &extra,
     ))
@@ -499,31 +510,91 @@ pub(crate) async fn bc_to_idx_map_handler<S: PirScheme>(
     headers_in: HeaderMap,
 ) -> Result<axum::response::Response, StatusCode> {
     let list_key = hex_decode_32(&list_key_hex).ok_or(StatusCode::BAD_REQUEST)?;
-    let coverage = cover_list(
-        &app,
-        list_key,
-        BC_TO_IDX_MAP_ROUTE,
-        &read_mirror_feeds(&app),
-    )?;
-    let leaves = coverage.leaves();
-    let epoch = coverage.epoch();
-    coverage
-        .recheck_frontier()
-        .map_err(|refusal| refuse_uncovered(BC_TO_IDX_MAP_ROUTE, &refusal))?;
+    let (kept_app, kept_headers) = (app.clone(), headers_in.clone());
+    if let Some(response) =
+        off_executor(move || serve_index_map(&kept_app, list_key, &kept_headers, false)).await?
+    {
+        return Ok(response);
+    }
+    // The requests queued here are answered from the body the read ahead of them kept, unless
+    // the list moved again in between.
+    let permit = read_permit(&app, ShimStoreRegistry::index_map_reads).await?;
+    off_executor(move || {
+        let _permit = permit;
+        serve_index_map(&app, list_key, &headers_in, true)
+    })
+    .await?
+    .ok_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// `None` when the list moved since its body was kept and `may_read` is false.
+#[cfg(feature = "json-index-channel")]
+fn serve_index_map<S: PirScheme>(
+    app: &AppState<S>,
+    list_key: [u8; 32],
+    headers_in: &HeaderMap,
+    may_read: bool,
+) -> Result<Option<axum::response::Response>, StatusCode> {
+    let refuse = |refusal: CoverageRefusal| refuse_uncovered(BC_TO_IDX_MAP_ROUTE, &refusal);
+    let coverage = cover_list(app, list_key, BC_TO_IDX_MAP_ROUTE, &read_mirror_feeds(app))?;
+    // Uncredentialed, pollable and sized by the list, so an unchanged list is answered from the
+    // body its last read kept, a matching revalidation included; only a moved list is read again.
+    let fingerprint = coverage.fingerprint().map_err(refuse)?;
+    if let Some(kept) = coverage.published_index_map(&fingerprint) {
+        coverage.recheck_frontier().map_err(refuse)?;
+        return Ok(Some(serve_publishing_bytes(
+            kept.body,
+            &kept.etag,
+            Some(fingerprint.epoch()),
+            headers_in,
+            HeaderValue::from_static("application/json"),
+            &[],
+        )));
+    }
+    if !may_read {
+        return Ok(None);
+    }
+    let mut rows: Vec<(u32, [u8; 32])> = Vec::new();
+    let read = coverage
+        .read_list(false, |leaf| {
+            rows.push((leaf.global_index, leaf.blinded_commitment));
+        })
+        .map_err(refuse)?;
+    coverage.recheck_frontier().map_err(refuse)?;
     let body = BcToIdxMapResponse {
-        epoch,
+        epoch: read.epoch(),
         list_key: hex_encode(&list_key),
         // GLOBAL index: the client resolves a PIR row from it, and the router localizes with
         // `% 65_536` on the way in, so a block-local index here would collide six ways.
-        entries: leaves
+        entries: rows
             .iter()
-            .map(|leaf| BcIdxEntry {
-                bc: hex_encode(&leaf.blinded_commitment),
-                idx: leaf.global_index,
+            .map(|(idx, bc)| BcIdxEntry {
+                bc: hex_encode(bc),
+                idx: *idx,
             })
             .collect(),
     };
-    serve_publishing_channel(&body, epoch, &headers_in)
+    drop(rows);
+    let json =
+        Bytes::from(serde_json::to_vec(&body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+    drop(body);
+    let etag = body_etag(&json);
+    let epoch = read.epoch();
+    coverage.publish_index_map(
+        read,
+        PublishedBody {
+            etag: etag.clone(),
+            body: json.clone(),
+        },
+    );
+    Ok(Some(serve_publishing_bytes(
+        json,
+        &etag,
+        Some(epoch),
+        headers_in,
+        HeaderValue::from_static("application/json"),
+        &[],
+    )))
 }
 
 pub(crate) async fn status_header_handler<S: PirScheme>(
@@ -532,46 +603,79 @@ pub(crate) async fn status_header_handler<S: PirScheme>(
     headers_in: HeaderMap,
 ) -> Result<axum::response::Response, StatusCode> {
     let list_key = hex_decode_32(&list_key_hex).ok_or(StatusCode::BAD_REQUEST)?;
+    // No fingerprint covers statuses, so every answer, a 304 included, reads the whole list.
+    let permit = read_permit(&app, ShimStoreRegistry::status_header_reads).await?;
+    off_executor(move || {
+        let _permit = permit;
+        serve_status_header(&app, list_key, &headers_in)
+    })
+    .await
+}
+
+fn serve_status_header<S: PirScheme>(
+    app: &AppState<S>,
+    list_key: [u8; 32],
+    headers_in: &HeaderMap,
+) -> Result<axum::response::Response, StatusCode> {
     // Both fields are SETS over the list; a partial store silently shrinks the blocked set,
     // which reads as "nothing is blocked".
-    let coverage = cover_list(
-        &app,
-        list_key,
-        STATUS_HEADER_ROUTE,
-        &read_mirror_feeds(&app),
-    )?;
-    let leaves = coverage.leaves();
-    let epoch = coverage.epoch();
+    let coverage = cover_list(app, list_key, STATUS_HEADER_ROUTE, &read_mirror_feeds(app))?;
+    let blocked_byte = poi_status_byte(POIStatus::ShieldBlocked);
+    let pending_bytes = [
+        poi_status_byte(POIStatus::ProofSubmitted),
+        poi_status_byte(POIStatus::Missing),
+    ];
+    let mut blocked: Vec<[u8; 32]> = Vec::new();
+    let mut pending: Vec<[u8; 32]> = Vec::new();
+    let read = coverage
+        .read_list(true, |leaf| match leaf.status {
+            Some(b) if b == blocked_byte => blocked.push(leaf.blinded_commitment),
+            Some(b) if pending_bytes.contains(&b) => pending.push(leaf.blinded_commitment),
+            _ => {}
+        })
+        .map_err(|refusal| refuse_uncovered(STATUS_HEADER_ROUTE, &refusal))?;
     coverage
         .recheck_frontier()
         .map_err(|refusal| refuse_uncovered(STATUS_HEADER_ROUTE, &refusal))?;
-    let mut blocked: Vec<HexHash> = Vec::new();
-    let mut pending: Vec<HexHash> = Vec::new();
-    for leaf in &leaves {
-        match leaf.status {
-            Some(b) if b == poi_status_byte(POIStatus::ShieldBlocked) => {
-                blocked.push(hex_encode(&leaf.blinded_commitment));
-            }
-            Some(b)
-                if b == poi_status_byte(POIStatus::ProofSubmitted)
-                    || b == poi_status_byte(POIStatus::Missing) =>
-            {
-                pending.push(hex_encode(&leaf.blinded_commitment));
-            }
-            _ => {}
-        }
-    }
     let body = StatusHeaderResponse {
-        epoch,
+        epoch: read.epoch(),
         list_key: hex_encode(&list_key),
-        blocked_bcs: blocked,
-        pending_bcs: pending,
+        blocked_bcs: blocked.iter().map(hex_encode).collect(),
+        pending_bcs: pending.iter().map(hex_encode).collect(),
     };
-    serve_publishing_channel(&body, epoch, &headers_in)
+    serve_publishing_channel(&body, read.epoch(), headers_in)
 }
 
 fn poi_status_byte(s: POIStatus) -> u8 {
     s.wire_byte()
+}
+
+/// The publishing channels read up to a whole list under store locks the ingest path also takes,
+/// so they run on the blocking pool rather than stall the executor every other route shares.
+async fn off_executor<T, F>(work: F) -> Result<T, StatusCode>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, StatusCode> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+}
+
+/// A permit from the registry pool `pick` names, held for the whole read. The undeclared
+/// single-store path has no registry and no production caller, so it takes none.
+async fn read_permit<S: PirScheme>(
+    app: &AppState<S>,
+    pick: fn(&ShimStoreRegistry) -> &Arc<tokio::sync::Semaphore>,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, StatusCode> {
+    let Some(registry) = app.shim_stores.as_ref().as_ref() else {
+        return Ok(None);
+    };
+    let pool = Arc::clone(pick(registry));
+    pool.acquire_owned()
+        .await
+        .map(Some)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
 }
 
 /// ETag + 304 short-circuit for publishing channels; ETag = SHA-256(body)[..16] hex.
@@ -581,8 +685,10 @@ fn serve_publishing_channel<T: Serialize>(
     headers_in: &HeaderMap,
 ) -> Result<axum::response::Response, StatusCode> {
     let json = serde_json::to_vec(body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let etag = body_etag(&json);
     Ok(serve_publishing_bytes(
-        json,
+        Bytes::from(json),
+        &etag,
         Some(epoch),
         headers_in,
         HeaderValue::from_static("application/json"),
@@ -590,48 +696,53 @@ fn serve_publishing_channel<T: Serialize>(
     ))
 }
 
+/// Quoted SHA-256(body)[..16] hex.
+fn body_etag(body: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(body);
+    let mut etag = String::with_capacity(2 + 32);
+    etag.push('"');
+    for b in digest.iter().take(16) {
+        let _ = write!(etag, "{b:02x}");
+    }
+    etag.push('"');
+    etag
+}
+
+fn if_none_match(headers_in: &HeaderMap) -> Option<&str> {
+    headers_in
+        .get(&IF_NONE_MATCH_HEADER)
+        .and_then(|v| v.to_str().ok())
+}
+
 /// `extra` lands on the 304 as well, so a resuming client learns where to continue from a
 /// response whose body it already holds.
+fn not_modified(etag: &str, extra: &[(HeaderName, HeaderValue)]) -> axum::response::Response {
+    let mut hdrs = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(etag) {
+        hdrs.insert(ETAG_HEADER, v);
+    }
+    for (name, value) in extra {
+        hdrs.insert(name.clone(), value.clone());
+    }
+    (StatusCode::NOT_MODIFIED, hdrs).into_response()
+}
+
 fn serve_publishing_bytes(
-    body: Vec<u8>,
+    body: Bytes,
+    etag: &str,
     last_modified: Option<u64>,
     headers_in: &HeaderMap,
     content_type: HeaderValue,
     extra: &[(HeaderName, HeaderValue)],
 ) -> axum::response::Response {
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let digest = hasher.finalize();
-    let etag = {
-        use std::fmt::Write as _;
-        let mut s = String::with_capacity(2 + 32);
-        s.push('"');
-        for b in digest.iter().take(16) {
-            let _ = write!(s, "{b:02x}");
-        }
-        s.push('"');
-        s
-    };
-
-    let if_none_match = headers_in
-        .get(&IF_NONE_MATCH_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-
-    if if_none_match == etag {
-        let mut hdrs = HeaderMap::new();
-        if let Ok(v) = HeaderValue::from_str(&etag) {
-            hdrs.insert(ETAG_HEADER, v);
-        }
-        for (name, value) in extra {
-            hdrs.insert(name.clone(), value.clone());
-        }
-        return (StatusCode::NOT_MODIFIED, hdrs).into_response();
+    if if_none_match(headers_in) == Some(etag) {
+        return not_modified(etag, extra);
     }
 
     let mut hdrs = HeaderMap::new();
     hdrs.insert(axum::http::header::CONTENT_TYPE, content_type);
-    if let Ok(v) = HeaderValue::from_str(&etag) {
+    if let Ok(v) = HeaderValue::from_str(etag) {
         hdrs.insert(ETAG_HEADER, v);
     }
     if let Some(epoch) = last_modified {
@@ -718,5 +829,280 @@ mod tests {
         assert_eq!(poi_status_byte(POIStatus::ShieldBlocked), 1);
         assert_eq!(poi_status_byte(POIStatus::ProofSubmitted), 2);
         assert_eq!(poi_status_byte(POIStatus::Missing), 3);
+    }
+
+    mod publishing_reads {
+        use super::super::*;
+        use crate::shim_store::STATUS_HEADER_READS_AT_ONCE;
+        use crate::status::{MirrorFeedState, MirrorFeedView};
+        use crate::HttpConfig;
+        use raven_railgun_engine::orchestrator::DataSourceFilter;
+        use raven_railgun_engine::pir_table::PerLeafCommitmentEncoder;
+        use raven_railgun_engine::Engine;
+        use raven_railgun_persistence::WalEntryPayload;
+
+        const LIST_KEY: [u8; 32] = [0x42; 32];
+
+        #[derive(Debug, Default)]
+        struct StubScheme;
+
+        #[derive(Debug, Default)]
+        struct StubState;
+
+        impl PirScheme for StubScheme {
+            type ServerState = StubState;
+            type Query = ();
+            type Response = ();
+
+            fn respond(
+                _state: &Self::ServerState,
+                _query: &Self::Query,
+            ) -> raven_railgun_core::Result<Self::Response> {
+                Err(raven_railgun_core::AdapterError::Scheme(
+                    "stub respond invoked".to_owned(),
+                ))
+            }
+
+            fn state_shape(_state: &Self::ServerState) -> raven_railgun_engine::StateShape {
+                raven_railgun_engine::StateShape {
+                    entry_size_bytes: 1,
+                    rows_per_shard: u64::MAX,
+                }
+            }
+        }
+
+        fn fr(seed: u32) -> [u8; 32] {
+            let mut out = [0u8; 32];
+            out[20] = 0x01;
+            out[28..].copy_from_slice(&seed.to_be_bytes());
+            out
+        }
+
+        fn append(store: &SharedLogicalStore, local_indices: std::ops::Range<u32>) {
+            let enc = PerLeafCommitmentEncoder::new(32, 65_536, 0).expect("encoder");
+            let mut guard = store.lock();
+            for local in local_indices {
+                apply_wal_entry_for_test(
+                    &mut guard,
+                    &WalEntryPayload::PpoiListLeafAdded {
+                        list_key: LIST_KEY,
+                        list_index: local,
+                        blinded_commitment: fr(local),
+                        status: 0,
+                        event_type: raven_railgun_persistence::PpoiEventType::Shield,
+                        signature: vec![0; 64],
+                        validated_merkleroot: [0; 32],
+                    },
+                    1_000 + u64::from(local),
+                    &enc,
+                )
+                .expect("seed ppoi leaf");
+            }
+        }
+
+        fn store_with(rows: u32) -> SharedLogicalStore {
+            let store: SharedLogicalStore =
+                Arc::new(parking_lot::Mutex::new(LogicalLeafStore::new()));
+            append(&store, 0..rows);
+            store
+        }
+
+        /// One declared block holding `rows` rows, with upstream counting exactly that many.
+        fn covered_app(store: &SharedLogicalStore, rows: u64) -> AppState<StubScheme> {
+            // The recorder install loses a race to a concurrent winner until the winner has
+            // published its handle, so wait a bounded while for one before building state on it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while crate::global_prometheus_handle().is_err() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no metrics recorder handle within 10 s"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let view = MirrorFeedView {
+                list_key: hex_encode(&LIST_KEY),
+                state: MirrorFeedState::Syncing,
+                rows_held: rows,
+                upstream_rows: Some(rows),
+                next_index: rows,
+                consecutive_failures: 0,
+                last_failure: None,
+                seconds_since_answer: Some(0),
+            };
+            AppState::new(
+                Engine::<StubScheme>::new(),
+                HttpConfig::demo("shim-unit-test-token"),
+            )
+            .expect("appstate")
+            .with_shim_stores([(
+                DataSourceFilter::PpoiListBlock {
+                    list_key: LIST_KEY,
+                    block: 0,
+                },
+                Arc::clone(store),
+            )])
+            .with_mirror_feeds(Arc::new(move || vec![view.clone()]))
+        }
+
+        fn registry(app: &AppState<StubScheme>) -> &ShimStoreRegistry {
+            app.shim_stores.as_ref().as_ref().expect("registry")
+        }
+
+        #[cfg(feature = "json-index-channel")]
+        fn revalidating(etag: &str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                IF_NONE_MATCH_HEADER,
+                HeaderValue::from_str(etag).expect("etag"),
+            );
+            headers
+        }
+
+        #[cfg(feature = "json-index-channel")]
+        fn etag_of(response: &axum::response::Response) -> String {
+            response
+                .headers()
+                .get(ETAG_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .expect("etag")
+                .to_owned()
+        }
+
+        #[cfg(feature = "json-index-channel")]
+        async fn body_of(response: axum::response::Response) -> Bytes {
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body")
+        }
+
+        /// Poll `done` for up to ten seconds; the interleavings below are staged, not timed.
+        #[cfg(feature = "json-index-channel")]
+        async fn until(mut done: impl FnMut() -> bool) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !done() {
+                assert!(std::time::Instant::now() < deadline, "stage never reached");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+
+        /// The channel is uncredentialed and pollable, so an unchanged list is answered from the
+        /// body its last read kept, a matching revalidation and a repeat 200 alike; a list that
+        /// moved since is read again.
+        #[cfg(feature = "json-index-channel")]
+        #[tokio::test]
+        async fn an_unchanged_list_is_answered_without_a_read_and_a_moved_list_is_read_again() {
+            let store = store_with(4);
+            let app = covered_app(&store, 4);
+            let serve = |headers: &HeaderMap, may_read| {
+                serve_index_map(&app, LIST_KEY, headers, may_read)
+                    .expect("served")
+                    .expect("answered")
+            };
+
+            let first = serve(&HeaderMap::new(), true);
+            assert_eq!(first.status(), StatusCode::OK);
+            let etag = etag_of(&first);
+            let first_body = body_of(first).await;
+            assert_eq!(registry(&app).list_reads(), 1);
+
+            for _ in 0..3 {
+                let again = serve(&revalidating(&etag), false);
+                assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+                assert_eq!(etag_of(&again), etag);
+            }
+            let repeat = serve(&revalidating("\"not-it\""), false);
+            assert_eq!(repeat.status(), StatusCode::OK);
+            assert_eq!(etag_of(&repeat), etag);
+            assert_eq!(body_of(repeat).await, first_body);
+            assert_eq!(
+                registry(&app).list_reads(),
+                1,
+                "an unchanged list must be answered before it is read"
+            );
+
+            append(&store, 4..5);
+            assert!(
+                serve_index_map(&app, LIST_KEY, &revalidating(&etag), false)
+                    .expect("served")
+                    .is_none(),
+                "a list that grew must not revalidate against its old body"
+            );
+            let moved = serve(&revalidating(&etag), true);
+            assert_eq!(moved.status(), StatusCode::OK);
+            assert_ne!(etag_of(&moved), etag);
+            assert_eq!(registry(&app).list_reads(), 2);
+        }
+
+        /// A 200 costs a whole-list read and a body sized by the list, so requests that find no
+        /// kept body queue for one read at a time and the ones behind it are answered from what
+        /// it kept. Every request below misses before the first read is let through.
+        #[cfg(feature = "json-index-channel")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn requests_queued_behind_a_read_are_answered_from_its_body() {
+            const REQUESTS: usize = 8;
+            let store = store_with(4);
+            let app = covered_app(&store, 4);
+            let held = Arc::clone(registry(&app).index_map_reads())
+                .acquire_owned()
+                .await
+                .expect("permit");
+
+            let walked_before = registry(&app).blocks_walked();
+            let requests: Vec<_> = (0..REQUESTS)
+                .map(|_| {
+                    tokio::spawn(bc_to_idx_map_handler(
+                        State(app.clone()),
+                        Path(hex_encode(&LIST_KEY)),
+                        HeaderMap::new(),
+                    ))
+                })
+                .collect();
+            // One block walked per request is each request's fingerprint missing the empty cache.
+            until(|| registry(&app).blocks_walked() - walked_before >= REQUESTS).await;
+            assert_eq!(registry(&app).list_reads(), 0);
+            drop(held);
+
+            let mut etags = std::collections::BTreeSet::new();
+            for request in requests {
+                let response = request.await.expect("joined").expect("served");
+                assert_eq!(response.status(), StatusCode::OK);
+                etags.insert(etag_of(&response));
+            }
+            assert_eq!(etags.len(), 1);
+            assert_eq!(
+                registry(&app).list_reads(),
+                1,
+                "requests queued behind a read must be answered from its body"
+            );
+        }
+
+        /// No fingerprint covers statuses, so each status answer reads the whole list; past the
+        /// pool's permits a request waits rather than start another read.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_status_read_past_the_pool_waits_for_a_permit() {
+            let store = store_with(4);
+            let app = covered_app(&store, 4);
+            let pool = Arc::clone(registry(&app).status_header_reads());
+            let held = pool
+                .acquire_many_owned(
+                    u32::try_from(STATUS_HEADER_READS_AT_ONCE).expect("permit count"),
+                )
+                .await
+                .expect("permits");
+
+            let request = tokio::spawn(status_header_handler(
+                State(app.clone()),
+                Path(hex_encode(&LIST_KEY)),
+                HeaderMap::new(),
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert!(!request.is_finished(), "a read ran with every permit held");
+            assert_eq!(registry(&app).list_reads(), 0);
+
+            drop(held);
+            let response = request.await.expect("joined").expect("served");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(registry(&app).list_reads(), 1);
+        }
     }
 }

@@ -1273,6 +1273,138 @@ mod index_channel {
         assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
     }
 
+    /// A single short block 0 at upstream's count, with its store handed back so a test can
+    /// grow it. Cheap: no sealed block.
+    fn one_short_block(rows: u32) -> (axum::Router, super::SharedStore) {
+        let block_zero = super::seed_block(0, rows);
+        let router = super::declared_with(
+            vec![(
+                DataSourceFilter::PpoiListBlock {
+                    list_key: LIST_KEY,
+                    block: 0,
+                },
+                std::sync::Arc::clone(&block_zero),
+            )],
+            Some(super::counted(u64::from(rows))),
+        );
+        (router, block_zero)
+    }
+
+    /// A caller holding more rows than this node is told so, and the refusal still carries the
+    /// cursor headers that say where this node's list ends, so it can resume from there.
+    #[tokio::test]
+    async fn a_refusal_past_the_frontier_still_names_where_the_list_ends() {
+        let (router, _block_zero) = one_short_block(4);
+        let (status, body, frontier) = segment(&router, "?since=4").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_empty());
+
+        let (status, _, refused) = segment(&router, "?since=5").await;
+        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+        for name in ["x-raven-index-total", "x-raven-index-epoch"] {
+            assert_eq!(
+                refused.get(name),
+                frontier.get(name),
+                "a refusal past the frontier must carry the frontier's {name}: {refused:?}"
+            );
+        }
+        assert_eq!(cursor(&refused, "x-raven-index-total"), 4);
+    }
+
+    /// The JSON channel answers a matching revalidation off what the last read depended on, so
+    /// a list that grew since must not revalidate against the old digest. Its epoch is the one
+    /// the prefix channel names for the same state.
+    #[cfg(feature = "json-index-channel")]
+    #[tokio::test]
+    async fn the_json_channel_revalidates_only_while_the_list_is_unchanged() {
+        let (router, block_zero) = one_short_block(4);
+        let uri = format!("/v1/poi/{}/bc-to-idx-map", hex32(&LIST_KEY));
+        let get = |etag: Option<String>| {
+            let mut request = authed(Method::GET, &uri, Body::empty());
+            if let Some(etag) = etag {
+                request
+                    .headers_mut()
+                    .insert("if-none-match", etag.parse().expect("etag"));
+            }
+            let router = router.clone();
+            async move {
+                let response = router.oneshot(request).await.expect("dispatch");
+                let status = response.status();
+                let etag = response
+                    .headers()
+                    .get("etag")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                let body = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("body")
+                    .to_bytes()
+                    .to_vec();
+                (status, etag, body)
+            }
+        };
+
+        let (status, etag, body) = get(None).await;
+        assert_eq!(status, StatusCode::OK);
+        let etag = etag.expect("etag");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let (_, _, frontier) = segment(&router, "").await;
+        assert_eq!(
+            parsed["epoch"].as_u64().map(|e| e.to_string()).as_deref(),
+            frontier.get("x-raven-index-epoch").map(String::as_str),
+            "both channels must name one epoch for one state"
+        );
+
+        let (status, revalidated, body) = get(Some(etag.clone())).await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED);
+        assert_eq!(revalidated.as_deref(), Some(etag.as_str()));
+        assert!(body.is_empty());
+
+        append_block_zero_row(&block_zero, 4);
+        let (status, moved, body) = get(Some(etag.clone())).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a list that grew must be served again, not revalidated"
+        );
+        let moved = moved.expect("etag");
+        assert_ne!(moved, etag);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let entries = parsed["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[4]["bc"].as_str(), Some(hex32(&bc_for(4)).as_str()));
+
+        let (status, _, _) = get(Some(moved)).await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED);
+    }
+
+    #[cfg(feature = "json-index-channel")]
+    fn append_block_zero_row(store: &super::SharedStore, local: u32) {
+        let enc = raven_railgun_engine::pir_table::PerLeafCommitmentEncoder::new(
+            32,
+            LEAVES_PER_PPOI_BLOCK,
+            0,
+        )
+        .expect("encoder");
+        raven_railgun_engine::inspire::apply_wal_entry(
+            &mut store.lock(),
+            &raven_railgun_persistence::WalEntryPayload::PpoiListLeafAdded {
+                list_key: LIST_KEY,
+                list_index: local,
+                blinded_commitment: bc_for(local),
+                status: 0,
+                event_type: raven_railgun_persistence::PpoiEventType::Shield,
+                signature: vec![0; 64],
+                validated_merkleroot: [0; 32],
+            },
+            1_000 + u64::from(local),
+            &enc,
+        )
+        .expect("append row");
+    }
+
     /// The cold-start cost of the two channels, measured off the served bytes at one
     /// synthetic list size rather than computed from a row template. The ratio is the
     /// N-independent part: a 6-byte row against a 64-hex row inside a JSON envelope.
