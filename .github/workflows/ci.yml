@@ -328,10 +328,10 @@ jobs:
             -p raven-railgun-engine \
             -p raven-railgun-http \
             -p raven-railgun-indexer \
-            -p raven-railgun-mock-ppoi \
             -p raven-railgun-persistence \
             -p raven-railgun-poseidon \
             -p raven-railgun-ppoi-mirror \
+            -p raven-railgun-ppoi-replay \
             -p raven-railgun-testkit \
             -- --check
       - name: cargo check
@@ -361,10 +361,10 @@ jobs:
             packages: >-
               -p raven-railgun-http
               -p raven-railgun-indexer
-              -p raven-railgun-mock-ppoi
               -p raven-railgun-persistence
               -p raven-railgun-poseidon
               -p raven-railgun-ppoi-mirror
+              -p raven-railgun-ppoi-replay
               -p raven-railgun-core
               -p raven-railgun-testkit
     env:
@@ -641,9 +641,9 @@ jobs:
     # budget they survive. Today: production_cell_budget_bench (1 s single-query
     # and 12 s batch ceilings, sized for THIS runner rather than a dev box: 3.0x
     # and 2.1x over its measured 335 ms and ~5.6 s, so a red is a ~3x or ~2x
-    # blow-up, and a batch red is within reach of runner variance) and populate_bench
-    # (30 s for 1k events). A timing harness with NO ceiling stays out of every lane
-    # and sits in scripts/ignore-coverage-allowlist.txt instead — a measurement is
+    # blow-up, and a batch red is within reach of runner variance). A timing harness
+    # with NO ceiling stays out of every lane and sits in
+    # scripts/ignore-coverage-allowlist.txt instead — a measurement is
     # not a gate, and enrolling one buys nightly minutes and no signal.
     name: production-cell closure (d=2048, --run-ignored all)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -698,7 +698,7 @@ jobs:
           # not previously build. Still comfortable, and comfortable for a stated reason.
           cargo nextest run \
             --manifest-path adapters/railgun/Cargo.toml \
-            -p raven-railgun-engine -p raven-railgun-cli -p raven-railgun-mock-ppoi \
+            -p raven-railgun-engine -p raven-railgun-cli \
             -p raven-railgun-http \
             --all-targets \
             --no-tests=fail \
@@ -706,7 +706,7 @@ jobs:
             --cargo-profile ci-test \
             --profile production-cell \
             --run-ignored all \
-            -E 'binary(db1_note_record_production_cell) + binary(db2_block_production_cell) + binary(cell_width_runtime_gate) + binary(per_leaf_path_production_cell) + binary(per_node_production_cell) + binary(production_cell_budget_bench) + binary(populate_bench) + binary(recovery_latency_bench) + binary(poi_shim_coverage)'
+            -E 'binary(db1_note_record_production_cell) + binary(db2_block_production_cell) + binary(cell_width_runtime_gate) + binary(per_leaf_path_production_cell) + binary(per_node_production_cell) + binary(production_cell_budget_bench) + binary(recovery_latency_bench) + binary(poi_shim_coverage)'
       - name: sccache stats
         run: sccache --show-stats
         if: always()
@@ -1041,7 +1041,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: "1.91"
       MSRV_MANIFESTS: "adapters/eth-state/Cargo.toml|adapters/railgun/Cargo.toml"
-      MSRV_PACKAGES: "eth-state,raven-railgun-cli,raven-railgun-core,raven-railgun-engine,raven-railgun-http,raven-railgun-indexer,raven-railgun-mock-ppoi,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-railgun-testkit"
+      MSRV_PACKAGES: "eth-state,raven-railgun-cli,raven-railgun-core,raven-railgun-engine,raven-railgun-http,raven-railgun-indexer,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-railgun-ppoi-replay,raven-railgun-testkit"
     steps:
       - uses: actions/checkout@v4
         with:

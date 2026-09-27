@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Red-proof for check-hygiene.sh: a gate ships with proof it can fail.
 #
-# The gate had two defects that a passing run could never reveal. Its scope was a literal list
-# that had drifted away from the workspace members, so `mock-ppoi` was CI-gated and unscanned.
+# Two defects a passing run can never reveal. A scope kept as a literal list drifts away from the
+# workspace members, leaving a CI-gated member unscanned.
 # And `if matches=$(grep ...)` treats an invalid pattern as "no matches", because grep exits 2
 # and the `if` is false: a broken regex, a missing directory and a clean tree were the same
 # observable.
@@ -46,10 +46,10 @@ check 1 "$(run_gate)" "a no-commit path leak is refused"
 git -C "$work" checkout -- adapters/railgun/core/src/lib.rs 2>/dev/null \
   || cp "$ROOT/adapters/railgun/core/src/lib.rs" "$work/adapters/railgun/core/src/lib.rs"
 
-# The drift itself: mock-ppoi is a workspace member and CI-gated, and was never scanned.
-printf '\n// per B012 the caller retries\n' >> "$work/adapters/railgun/mock-ppoi/src/lib.rs"
-check 1 "$(run_gate)" "a leak in mock-ppoi is refused (the dir the literal list omitted)"
-cp "$ROOT/adapters/railgun/mock-ppoi/src/lib.rs" "$work/adapters/railgun/mock-ppoi/src/lib.rs"
+# The drift itself: a workspace member the old literal list omitted must be scanned.
+printf '\n// per B012 the caller retries\n' >> "$work/adapters/railgun/ppoi-replay/src/lib.rs"
+check 1 "$(run_gate)" "a leak in ppoi-replay is refused (a member the literal list would omit)"
+cp "$ROOT/adapters/railgun/ppoi-replay/src/lib.rs" "$work/adapters/railgun/ppoi-replay/src/lib.rs"
 
 # A hyphenated ledger ID. The unhyphenated rule never matched these, so this class of label
 # shipped into the tree through a gate written to catch it.

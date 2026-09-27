@@ -11,10 +11,10 @@ jobs:
             -p raven-railgun-engine \
             -p raven-railgun-http \
             -p raven-railgun-indexer \
-            -p raven-railgun-mock-ppoi \
             -p raven-railgun-persistence \
             -p raven-railgun-poseidon \
             -p raven-railgun-ppoi-mirror \
+            -p raven-railgun-ppoi-replay \
             -- --check
 
   railgun-tests:
@@ -27,10 +27,10 @@ jobs:
               -p raven-railgun-engine
               -p raven-railgun-http
               -p raven-railgun-indexer
-              -p raven-railgun-mock-ppoi
               -p raven-railgun-persistence
               -p raven-railgun-poseidon
               -p raven-railgun-ppoi-mirror
+              -p raven-railgun-ppoi-replay
     steps:
       - name: cargo nextest
         run: cargo nextest run ${{ matrix.shard.packages }}

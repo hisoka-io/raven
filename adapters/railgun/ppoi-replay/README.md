@@ -42,7 +42,7 @@ Only `POST /` is served. It is the one route Raven's clients call.
 
 | Method | Caller | Answer |
 |---|---|---|
-| `ppoi_poi_events` | ppoi-mirror feed and preflight, SDK pin resolver | Upstream's `getPoiEvents`: rows with `startIndex <= index <= endIndex` among the served rows, in index order. `endIndex - startIndex` above 500 is refused with HTTP 500 and `{"code":-32603,"message":"Max event query range length is 500"}`, the aggregator's measured answer, so a page holds at most 501 rows. A negative span gets `Invalid query range` in the same shape. |
+| `ppoi_poi_events` | ppoi-mirror feed and preflight, SDK pin resolver | Upstream's `getPoiEvents`: rows with `startIndex <= index <= endIndex` among the served rows, in index order. `endIndex - startIndex` above 500 is refused with HTTP 500 and `{"code":-32603,"message":"Max event query range length is 500"}`, the aggregator's measured answer, so a page holds at most 501 rows. A negative span gets `Invalid query range` in the same shape; that shape is inferred from the cap answer, not recorded. |
 | `ppoi_node_status` | SDK pin resolver | The recorded body's `result`. For this network and list, `poiEventLengths`, `historicalMerklerootsLength` and `latestHistoricalMerkleroot` are computed from the served rows (`No merkleroot found` when none are). |
 | `ppoi_validate_poi_merkleroots` | SDK | `true` if every root is the stored spelling (bare lowercase hex) of a served row's root. |
 | `ppoi_submit_transact_proof`, `ppoi_submit_legacy_transact_proofs` | SDK | Refused: HTTP 500, `-32603`. A recording cannot take a submission, and answering success would claim an acceptance that did not happen. |
@@ -61,6 +61,10 @@ Where it differs from upstream:
   (HTTP 500), another `txidVersion` an empty result.
 - `ppoi_node_status` with a `listKey` gets `Cannot connect to listKey`, because upstream forwards
   that call to the list's own node and a replay has none.
+- Another list the aggregator serves (its key appears in the recorded node status) is refused as
+  `Invalid listKey`; the aggregator would answer for it.
+- The two submission methods are refused before their params are checked; upstream checks the
+  params first.
 - A body that is not JSON gets a JSON-RPC `-32700` error, not Express's HTML page.
 - Missing `params` gets `-32602`. Upstream throws outside its handler and never answers.
 

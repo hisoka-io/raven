@@ -27,9 +27,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# Derived from the workspace members, never hand-maintained. The previous literal list had
-# drifted: `mock-ppoi` is a member and is CI-gated (ci.yml:198) yet was never scanned. A gate
-# whose scope is a copy of another file's list stops covering the thing it names.
+# Derived from the workspace members, never hand-maintained: a gate whose scope is a copy of
+# another file's list stops covering the thing it names.
 mapfile -t SOURCE_DIRS < <(
   sed -n '/^members = \[/,/\]/p' "${ROOT}/Cargo.toml" \
     | grep -oE '"[^"]+"' | tr -d '"' | sed "s|^|${ROOT}/|"

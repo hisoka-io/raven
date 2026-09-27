@@ -57,9 +57,10 @@ echo "== cargo fmt --check, every workspace =="
 run "root"          cargo fmt --all -- --check
 run "railgun"       cargo fmt --manifest-path adapters/railgun/Cargo.toml \
                       -p raven-railgun-cli -p raven-railgun-core -p raven-railgun-engine \
-                      -p raven-railgun-http -p raven-railgun-indexer -p raven-railgun-mock-ppoi \
+                      -p raven-railgun-http -p raven-railgun-indexer \
                       -p raven-railgun-persistence -p raven-railgun-poseidon \
-                      -p raven-railgun-ppoi-mirror -p raven-railgun-testkit -- --check
+                      -p raven-railgun-ppoi-mirror -p raven-railgun-ppoi-replay \
+                      -p raven-railgun-testkit -- --check
 run "client-wasm"   cargo fmt --manifest-path adapters/railgun/client-wasm/Cargo.toml -- --check
 run "howl"          cargo fmt --manifest-path adapters/howl/Cargo.toml --all -- --check
 run "inspire"       cargo fmt --manifest-path crates/inspire/Cargo.toml -- --check
