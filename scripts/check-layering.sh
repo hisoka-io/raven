@@ -16,8 +16,8 @@
 # Its PROSE is NOT excluded, and is scanned below: nothing else reads it, and it is the one
 # crate published publicly as a standalone library, so a doctrine leak reaches a public
 # README and survives there.
-# `adapters/`, `examples/` and `benches/` are EXCLUDED by design - the eth-state
-# example is a second adapter and Ethereum vocabulary is correct there.
+# `adapters/` and `benches/` are EXCLUDED by design - eth-state is a second adapter
+# and Ethereum vocabulary is correct there.
 #
 # Patterns are deliberately identifier-shaped where a bare word would collide with
 # ordinary English: `memo` is word-anchored so it cannot match `memory`, and `Note`

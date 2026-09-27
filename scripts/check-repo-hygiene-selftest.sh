@@ -96,16 +96,52 @@ plant README.md "This build provides 128-bit security."
 check 1 "$(run_gate)" "a 128-bit security claim is refused"
 unplant README.md
 
-# The condition that made the whole-tree scan unable to fire: a submodule GITLINK is listed
-# by `git ls-files` as a path with no file behind it, and grep handed a directory poisons the
-# pipeline's status. Added with update-index so no submodule content is needed.
-git -C "$work" update-index --add --cacheinfo 160000,0000000000000000000000000000000000000001,vendored/sub 2>/dev/null \
-  && {
-    plant README.md "B-123 with a gitlink in the file list"
-    check 1 "$(run_gate)" "a label is still caught when a submodule gitlink is listed"
-    unplant README.md
-    git -C "$work" update-index --force-remove vendored/sub >/dev/null 2>&1
-  } || { echo "  ok    (skipped) gitlink case: update-index unavailable"; cases=$((cases + 1)); }
+# An owned submodule: a checkout of its own, recorded in the parent only as a gitlink. The parent
+# `git ls-files` lists that gitlink as a path with no file behind it, and grep handed a directory
+# poisons the pipeline's status - the condition that once made the whole-tree scan unable to fire.
+# The scratch copy flattens the real submodules into plain files, so this one is built here.
+# Its index is enough: nothing here needs a commit, and the truncation check skips a file with no
+# HEAD blob.
+owned=adapters/probe-owned
+mkdir -p "$work/$owned"
+git -C "$work/$owned" init -q .
+sub_unplant() {
+  printf 'pub fn probe() {}\n' > "$work/$owned/lib.rs"
+  printf '# probe\n' > "$work/$owned/README.md"
+  git -C "$work/$owned" add -A >/dev/null 2>&1
+}
+sub_plant() { printf '%s\n' "$2" >> "$work/$owned/$1"; git -C "$work/$owned" add "$1" >/dev/null 2>&1; }
+sub_unplant
+git -C "$work" update-index --add --cacheinfo 160000,0000000000000000000000000000000000000001,"$owned"
+
+check 0 "$(run_gate)" "(control) a clean owned submodule passes"
+
+plant README.md "B-123 with a gitlink in the file list"
+check 1 "$(run_gate)" "a label is still caught when a submodule gitlink is listed"
+unplant README.md
+
+sub_plant lib.rs "// G-456 in an owned submodule"
+check 1 "$(run_gate)" "a ledger label inside an owned submodule is refused"
+sub_unplant lib.rs
+
+sub_plant README.md "This build provides 128-bit security."
+check 1 "$(run_gate)" "a 128-bit security claim inside an owned submodule is refused"
+sub_unplant README.md
+
+mkdir -p "$work/$owned/probe/wal"
+printf '{}\n' > "$work/$owned/probe/manifest.json"
+check 1 "$(run_gate)" "an untracked runtime data directory inside an owned submodule is refused"
+rm -rf "$work/$owned/probe"
+
+# Not checked out: the directory is there and empty of a repository, so a scan of it would find
+# nothing and read clean. It must be refused instead.
+mv "$work/$owned/.git" "$work/probe-owned.git"
+check 1 "$(run_gate)" "an owned submodule that is not checked out is refused"
+mv "$work/probe-owned.git" "$work/$owned/.git"
+check 0 "$(run_gate)" "(control) checking it out again clears it"
+
+git -C "$work" update-index --force-remove "$owned" >/dev/null 2>&1
+rm -rf "${work:?}/$owned"
 
 # The submodule carries its own history and is corrected through a submodule change.
 if [[ -d "$work/crates/inspire" ]]; then

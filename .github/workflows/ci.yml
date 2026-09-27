@@ -229,8 +229,8 @@ jobs:
             adapters/railgun/Cargo.toml \
             adapters/railgun/client-wasm/Cargo.toml \
             adapters/howl/Cargo.toml \
+            adapters/eth-state/Cargo.toml \
             crates/inspire/Cargo.toml \
-            examples/eth-state/Cargo.toml \
             benches/b1-bench/Cargo.toml \
             tools/bench-compare/Cargo.toml
           do
@@ -278,6 +278,32 @@ jobs:
           set -euo pipefail
           gitleaks detect --source . --config .gitleaks.toml --redact --no-banner --exit-code 1 \
             --log-opts "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+      - name: scan submodule commits introduced by this pull request
+        if: github.event_name == 'pull_request'
+        # the range above holds only a submodule's gitlink: its commits live in its own repository.
+        # Each gitlink the PR moves is scanned there over old..new, and one it adds over its whole
+        # history, which has no base to be scoped to.
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          gitlink() { git ls-tree "$1" -- "$2" | awk '$2 == "commit" { print $3 }'; }
+          while IFS= read -r path; do
+            old=$(gitlink "$base" "$path")
+            new=$(gitlink "$head" "$path")
+            [ "$old" = "$new" ] && continue
+            if [ "$(git -C "$path" rev-parse --is-shallow-repository)" = true ]; then
+              git -C "$path" fetch --quiet --unshallow origin
+            fi
+            for sha in $old $new; do
+              git -C "$path" cat-file -e "${sha}^{commit}" 2>/dev/null \
+                || git -C "$path" fetch --quiet origin "$sha"
+            done
+            range="${old:+${old}..}${new}"
+            echo "scanning ${path} ${range}"
+            gitleaks detect --source "$path" --config .gitleaks.toml --redact --no-banner --exit-code 1 \
+              --log-opts "$range"
+          done < <(git ls-tree -r "$head" | awk '$2 == "commit"' | cut -f2)
 
   railgun-static:
     name: railgun adapter (fmt + check + clippy)
@@ -858,6 +884,8 @@ jobs:
         run: sccache --show-stats
 
   eth-state-example:
+    # adapters/eth-state is a submodule that builds against this checkout's crates by path.
+    # The check name predates the move and is kept: branch protection requires it by name.
     name: eth-state example (detached workspace)
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -870,15 +898,15 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt
-        run: cargo fmt --manifest-path examples/eth-state/Cargo.toml -- --check
+        run: cargo fmt --manifest-path adapters/eth-state/Cargo.toml -- --check
       - name: cargo clippy
-        run: cargo clippy --manifest-path examples/eth-state/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path adapters/eth-state/Cargo.toml --all-targets -- -D warnings
       - name: cargo check
-        run: cargo check --manifest-path examples/eth-state/Cargo.toml --all-targets
+        run: cargo check --manifest-path adapters/eth-state/Cargo.toml --all-targets
       - name: cargo test (ci-test profile)
         # release-grade profile: the InsPIRe setup this demo drives is slow
         # enough under the dev profile to read as a hang
-        run: cargo test --manifest-path examples/eth-state/Cargo.toml --profile ci-test
+        run: cargo test --manifest-path adapters/eth-state/Cargo.toml --profile ci-test
 
   b1-bench:
     name: b1-bench (detached workspace)
@@ -1012,7 +1040,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTUP_TOOLCHAIN: "1.91"
-      MSRV_MANIFESTS: "adapters/railgun/Cargo.toml|examples/eth-state/Cargo.toml"
+      MSRV_MANIFESTS: "adapters/eth-state/Cargo.toml|adapters/railgun/Cargo.toml"
       MSRV_PACKAGES: "eth-state,raven-railgun-cli,raven-railgun-core,raven-railgun-engine,raven-railgun-http,raven-railgun-indexer,raven-railgun-mock-ppoi,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-railgun-testkit"
     steps:
       - uses: actions/checkout@v4
@@ -1049,7 +1077,7 @@ jobs:
             case "$manifest" in
               adapters/railgun/Cargo.toml)
                 cargo check --manifest-path "$manifest" --workspace --all-features --all-targets ;;
-              examples/eth-state/Cargo.toml)
+              adapters/eth-state/Cargo.toml)
                 cargo check --manifest-path "$manifest" --all-features --all-targets ;;
             esac
             echo "::endgroup::"
@@ -1059,7 +1087,7 @@ jobs:
             case "$manifest" in
               adapters/railgun/Cargo.toml)
                 cargo clippy --manifest-path "$manifest" --workspace --all-features --all-targets -- -D warnings ;;
-              examples/eth-state/Cargo.toml)
+              adapters/eth-state/Cargo.toml)
                 cargo clippy --manifest-path "$manifest" --all-features --all-targets -- -D warnings ;;
             esac
             echo "::endgroup::"

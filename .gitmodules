@@ -1,3 +1,9 @@
 [submodule "crates/inspire"]
 	path = crates/inspire
 	url = https://github.com/hisoka-io/inspire-rs.git
+[submodule "adapters/howl"]
+	path = adapters/howl
+	url = https://github.com/hisoka-io/raven-howl.git
+[submodule "adapters/eth-state"]
+	path = adapters/eth-state
+	url = https://github.com/hisoka-io/raven-eth-state.git

@@ -41,7 +41,7 @@ crates/inspire/tests/e2e_pir.rs::test_e2e_variant_two_packing
 # the client bench's wasm round trip stayed in tests/wasm_client_roundtrip.rs, and the eth-state
 # cache guard stayed in tests/cached_respond_kat.rs as a non-timing poisoned-cache observable.
 crates/client/benches/wasm_client_native_bench.rs::wasm_client_bench_native_per_cell
-examples/eth-state/benches/cached_respond_latency_bench.rs::cached_vs_noncached_latency
+adapters/eth-state/benches/cached_respond_latency_bench.rs::cached_vs_noncached_latency
 
 # --- 2026-09-07: two more red-with-trigger defect pins ---
 # Both FAIL today by design. They must NOT gain a CI lane until the defect each names is fixed;

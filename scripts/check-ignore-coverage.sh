@@ -17,6 +17,22 @@ ALLOW="${IGNORE_COVERAGE_ALLOWLIST:-scripts/ignore-coverage-allowlist.txt}"
 
 current=$(python3 - <<'PY'
 import os, re, subprocess, pathlib, sys
+def repos():
+    # A top-level grep never enters a submodule, so each one is searched in its own right.
+    yield None, ''
+    stage = subprocess.run(['git', 'ls-files', '--stage'], capture_output=True, text=True, check=True)
+    for line in stage.stdout.splitlines():
+        meta, path = line.split('\t', 1)
+        if not meta.startswith('160000 '):
+            continue
+        # an uninitialised submodule is an empty directory that greps clean
+        top = subprocess.run(['git', '-C', path, 'rev-parse', '--show-toplevel'],
+                             capture_output=True, text=True)
+        if top.returncode or os.path.realpath(top.stdout.strip()) != os.path.realpath(path):
+            sys.exit(f'submodule {path} is not checked out, so its ignored tests cannot be counted')
+        yield path, path + '/'
+
+
 def ignores():
     out = []
     invalid = []
@@ -24,13 +40,15 @@ def ignores():
         r'(?i)(trigger\s*:|run manually after|run (?:this )?by hand|run with\b|red until|until\b|'
         r'compiles only under|changing\b|when\b|after intentional|un-?ignore|once\b)'
     )
-    for repo, prefix in ((None, ''), ('crates/inspire', 'crates/inspire/')):
+    for repo, prefix in repos():
         # --untracked: an ignored test MOVED into a new, not-yet-committed file is invisible to a
         # tracked-only census, so the debt figure silently under-reports and a genuinely uncovered
         # ignore escapes. That happened when the client bench moved from tests/ to benches/.
         cmd = ['git'] + (['-C', repo] if repo else []) \
             + ['grep', '--untracked', '-n', '^\\s*#\\[ignore', '--', '*.rs']
         r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode > 1:
+            sys.exit(f'git grep exited {r.returncode} in {repo or "."}: {r.stderr.strip()}')
         for line in r.stdout.splitlines():
             path, ln, _ = line.split(':', 2)
             ln = int(ln)

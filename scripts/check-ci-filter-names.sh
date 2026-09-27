@@ -16,7 +16,8 @@
 # Two passes, because they cost differently:
 #   (no argument)  name resolution against the working tree. No toolchain, so it runs in the
 #                  cheap hygiene job - and it reads only plain test(NAME) / binary(NAME) terms in
-#                  the workflow. A regex, glob or package() term is invisible to it.
+#                  the workflow. A regex, glob or package() term is invisible to it. Names resolve
+#                  in the superproject and in every submodule.
 #   --selected     asks nextest what every declared filter selects, so it sees every filter
 #                  syntax nextest does. Reads the workflow AND every .config/nextest.toml: an
 #                  override whose filter selects nothing configures nothing, silently. The whole
@@ -27,6 +28,9 @@
 #                  a serialising group holds more tests than it admits at once, and every test of
 #                  a spawn-and-kill target sits in a max-threads = 1 group. Needs the test
 #                  binaries built, like scripts/assert-lane-counts.sh.
+#   --nextest-configs
+#                  the config=manifest pairs --selected discovers, superproject and submodules,
+#                  printed so a selftest can prove discovery without a toolchain.
 #   --spawn-and-kill FILE...
 #                  the classifier --selected uses, on its own so a selftest can prove it on
 #                  fixtures without a toolchain. A target root, with every file its `mod`s load,
@@ -49,23 +53,55 @@ fail=0
 
 [ -f "$CI" ] || { echo "scripts/check-ci-filter-names.sh: workflow ${CI} does not exist." >&2; exit 1; }
 
+# Submodule paths, from the index. A top-level git listing never enters a submodule, so every
+# lookup below lists each one in its own right, and refuses one that is not checked out: an
+# uninitialised submodule is an empty directory that lists nothing, which would turn a resolving
+# name into a false leak and a nextest config into silence.
+submodules() {
+  git ls-files --stage | awk '$1 == "160000" { sub(/^[^\t]*\t/, ""); print }'
+}
+require_submodules() {
+  local link top
+  while IFS= read -r link; do
+    [ -n "$link" ] || continue
+    top=$(git -C "$link" rev-parse --show-toplevel 2>/dev/null) && [ "$top" = "$(cd "$link" && pwd -P)" ] \
+      || { echo "scripts/check-ci-filter-names.sh: submodule ${link} is not checked out." >&2; exit 1; }
+  done < <(submodules)
+}
+# `git ls-files ARGS` over the superproject and every submodule, as superproject paths. A pattern
+# anchored below a directory (*/tests/x.rs) misses a submodule's root, so callers pass both forms.
+ls_all() {
+  local link
+  git ls-files "$@"
+  while IFS= read -r link; do
+    [ -n "$link" ] && git -C "$link" ls-files "$@" | sed "s|^|${link}/|"
+  done < <(submodules)
+}
+# The disk, not the index, and untracked files count: the same tree nextest answers from.
+nextest_configs() {
+  { ls_all -- '.config/nextest.toml' '*/.config/nextest.toml'
+    ls_all --others --exclude-standard -- '.config/nextest.toml' '*/.config/nextest.toml'
+  } | sort -u | while IFS= read -r cfg; do
+    [ -f "$cfg" ] || continue
+    printf '%s=%s\n' "$cfg" "$(dirname "$(dirname "$cfg")")/Cargo.toml"
+  done
+}
+
+if [ "$MODE" = "--nextest-configs" ]; then
+  require_submodules
+  nextest_configs
+  exit 0
+fi
+
 if [ "$MODE" = "--selected" ] || [ "$MODE" = "--spawn-and-kill" ] || [ "$MODE" = "--show-config-fixture" ]; then
   shift
   if [ "$MODE" = "--selected" ] && [ -n "${FILTER_GATE_NEXTEST_CONFIGS:-}" ]; then
     # shellcheck disable=SC2086
     set -- $FILTER_GATE_NEXTEST_CONFIGS
   elif [ "$MODE" = "--selected" ]; then
-    # The disk, not the index, and untracked files count: the same tree nextest answers from.
+    require_submodules
     # shellcheck disable=SC2046
-    set -- $(
-      { git ls-files -- '.config/nextest.toml' '*/.config/nextest.toml'
-        git ls-files --others --exclude-standard -- '.config/nextest.toml' '*/.config/nextest.toml'
-      } | sort -u | while IFS= read -r cfg; do
-        [ -f "$cfg" ] || continue
-        workspace=$(dirname "$(dirname "$cfg")")
-        printf '%s=%s\n' "$cfg" "${workspace}/Cargo.toml"
-      done
-    )
+    set -- $(nextest_configs)
   fi
   exec python3 - "$MODE" "$CI" "$@" <<'PY'
 import collections
@@ -676,16 +712,22 @@ PY
 fi
 
 if [ "$MODE" != "names" ]; then
-  echo "usage: $0 [--selected]" >&2
+  echo "usage: $0 [--selected | --nextest-configs]" >&2
   exit 2
 fi
+require_submodules
 
 # `test(...)` names: must appear as a `fn <name>` somewhere in a .rs file ON DISK.
 # --untracked, because a lane's brand-new test file is not in the index yet and a gate that
 # cannot see it fails on correct work.
 while IFS= read -r name; do
   [ -z "$name" ] && continue
-  if ! git grep --untracked -qE "fn +${name}\b" -- '*.rs' 2>/dev/null; then
+  found=0
+  git grep --untracked -qE "fn +${name}\b" -- '*.rs' 2>/dev/null && found=1
+  while [ "$found" -eq 0 ] && IFS= read -r link; do
+    [ -n "$link" ] && git -C "$link" grep --untracked -qE "fn +${name}\b" -- '*.rs' 2>/dev/null && found=1
+  done < <(submodules)
+  if [ "$found" -eq 0 ]; then
     echo "CI FILTER LEAK: test(${name}) in ${CI} matches no 'fn ${name}' in the tree." >&2
     echo "  A test() term naming a nonexistent test exits 0 and silently shrinks the lane." >&2
     fail=1
@@ -705,9 +747,10 @@ while IFS= read -r name; do
   found=0
   while IFS= read -r cand; do
     [ -n "$cand" ] && [ -f "$cand" ] && { found=1; break; }
-  done < <(git ls-files "*/tests/${name}.rs" "*/benches/${name}.rs" "*/src/bin/${name}.rs"; \
-           git ls-files --others --exclude-standard \
-             "*/tests/${name}.rs" "*/benches/${name}.rs" "*/src/bin/${name}.rs")
+  done < <(pats=("tests/${name}.rs" "benches/${name}.rs" "src/bin/${name}.rs"
+                 "*/tests/${name}.rs" "*/benches/${name}.rs" "*/src/bin/${name}.rs")
+           ls_all -- "${pats[@]}"
+           ls_all --others --exclude-standard -- "${pats[@]}")
   if [ "$found" -eq 0 ]; then
     echo "CI FILTER LEAK: binary(${name}) in ${CI} matches no test/bench target on disk." >&2
     echo "  nextest fails the whole lane (exit 94) on a binary() that names nothing." >&2

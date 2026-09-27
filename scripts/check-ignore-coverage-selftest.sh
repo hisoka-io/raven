@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Red-proof for check-ignore-coverage.sh. Six cases it must fail on, plus the control.
+# Red-proof for check-ignore-coverage.sh. Seven cases it must fail on, plus the control.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 ALLOW=scripts/ignore-coverage-allowlist.txt
@@ -7,10 +7,12 @@ CI=.github/workflows/ci.yml
 # Deliberately outside every lane write set: writing to a directory another agent
 # owns is how concurrent work gets clobbered, and this selftest mutates its victim.
 VICTIM=crates/inspire-cache/tests/public_surface.rs
-BA=$(mktemp); BC=$(mktemp); BV=$(mktemp)
-cp "$ALLOW" "$BA"; cp "$CI" "$BC"; cp "$VICTIM" "$BV"
+# A test inside a submodule, which a top-level grep never reaches.
+SUB_VICTIM=adapters/howl/record/tests/codec_parity.rs
+BA=$(mktemp); BC=$(mktemp); BV=$(mktemp); BS=$(mktemp)
+cp "$ALLOW" "$BA"; cp "$CI" "$BC"; cp "$VICTIM" "$BV"; cp "$SUB_VICTIM" "$BS"
 # Restore installed BEFORE any mutation - a killed run must not leave one applied.
-trap 'cp "$BA" "$ALLOW"; cp "$BC" "$CI"; cp "$BV" "$VICTIM"; rm -f "$BA" "$BC" "$BV"' EXIT
+trap 'cp "$BA" "$ALLOW"; cp "$BC" "$CI"; cp "$BV" "$VICTIM"; cp "$BS" "$SUB_VICTIM"; rm -f "$BA" "$BC" "$BV" "$BS"' EXIT
 
 fails=0
 
@@ -39,7 +41,7 @@ expect() {  # expect <want-exit-nonzero:0|1> <label>
   else
     echo "  ok: ${label} -> exit ${rc}"
   fi
-  cp "$BA" "$ALLOW"; cp "$BC" "$CI"; cp "$BV" "$VICTIM"
+  cp "$BA" "$ALLOW"; cp "$BC" "$CI"; cp "$BV" "$VICTIM"; cp "$BS" "$SUB_VICTIM"
 }
 
 echo "check-ignore-coverage-selftest.sh:"
@@ -86,6 +88,15 @@ fi
 # 6. Emptying the allowlist must fail: every uncovered entry becomes unexplained.
 : > "$ALLOW"
 expect 1 "an emptied allowlist"
+
+# 7. The same uncovered ignore inside a submodule. The census once searched only the top level
+# and one named submodule, so an ignored test in any other submodule was never counted.
+python3 - <<'PYEOF'
+import pathlib
+p = pathlib.Path('adapters/howl/record/tests/codec_parity.rs')
+p.write_text(p.read_text() + '\n#[test]\n#[ignore = "1 ms. Trigger: selftest missing allowlist entry."]\nfn a_selftest_submodule_ignore() {}\n')
+PYEOF
+expect 1 "a new reasoned ignore inside a submodule missing from the allowlist"
 
 # Control: unmutated, the gate must PASS. A gate that always fails is not a gate.
 expect 0 "the unmutated tree"

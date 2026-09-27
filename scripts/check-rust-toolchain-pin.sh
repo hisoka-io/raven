@@ -14,7 +14,7 @@ MSRV_189_MANIFESTS='Cargo.toml|adapters/howl/Cargo.toml|adapters/railgun/client-
 MSRV_189_PACKAGES='bench-compare,howl-poseidon2,howl-record,raven-b1-bench,raven-bench,raven-client,raven-core,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage'
 MSRV_189_EXTRA_PACKAGES='raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror'
 MSRV_189_OVERRIDE_MANIFESTS='adapters/railgun/core/Cargo.toml|adapters/railgun/persistence/Cargo.toml|adapters/railgun/poseidon/Cargo.toml|adapters/railgun/ppoi-mirror/Cargo.toml'
-MSRV_191_MANIFESTS='adapters/railgun/Cargo.toml|examples/eth-state/Cargo.toml'
+MSRV_191_MANIFESTS='adapters/eth-state/Cargo.toml|adapters/railgun/Cargo.toml'
 MSRV_191_PACKAGES='eth-state,raven-railgun-cli,raven-railgun-core,raven-railgun-engine,raven-railgun-http,raven-railgun-indexer,raven-railgun-mock-ppoi,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-railgun-testkit'
 
 failed=0

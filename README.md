@@ -34,7 +34,9 @@ Live demo: <https://demo.railgun.hisoka.io/>
 
 ## Build
 
-`crates/inspire` is a git submodule and the root workspace does not resolve without it:
+`crates/inspire`, `adapters/howl` and `adapters/eth-state` are git submodules. The root
+workspace does not resolve without `crates/inspire`, and `adapters/eth-state` builds against
+this checkout's crates by path:
 
 ```bash
 git clone --recursive https://github.com/hisoka-io/raven.git
@@ -48,9 +50,9 @@ cargo check -p raven-client --target wasm32-unknown-unknown
 ```
 
 `--workspace` covers the root members only. Several trees are detached workspaces
-(`crates/inspire`, `adapters/railgun`, `examples/eth-state`); build each with its own
-`--manifest-path`. The wasm target applies to the client path (`raven-client`), not to every
-crate: server-side crates pull in native-only dependencies.
+(`crates/inspire`, `adapters/railgun`, `adapters/howl`, `adapters/eth-state`); build each with
+its own `--manifest-path`. The wasm target applies to the client path (`raven-client`), not to
+every crate: server-side crates pull in native-only dependencies.
 
 ## License
 

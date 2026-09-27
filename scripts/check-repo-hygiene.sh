@@ -46,6 +46,30 @@ fail() {
   failed=1
 }
 
+# Every submodule but the vendored one is this repository's own source and is held to the same
+# rules. A top-level `git ls-files` lists a submodule as one gitlink and never its files, so each
+# one is listed in its own right. crates/inspire has its own upstream and stays exempt.
+VENDORED=crates/inspire
+OWNED=()
+while IFS= read -r sub; do
+  [[ -n "$sub" && "$sub" != "$VENDORED" ]] || continue
+  # An uninitialised submodule is an empty directory inside this repository: listing it
+  # succeeds and finds nothing, which would read as a clean scan.
+  if top="$(git -C "$sub" rev-parse --show-toplevel 2>/dev/null)" \
+    && [[ "$top" == "$(cd "$sub" && pwd -P)" ]]; then
+    OWNED+=("$sub")
+  else
+    fail "submodule $sub is not checked out, so its files cannot be scanned"
+  fi
+done < <(git ls-files --stage | awk '$1 == "160000" { sub(/^[^\t]*\t/, ""); print }')
+
+owned_files() { # ls-files arguments; prints paths from the repository root
+  local sub
+  for sub in "${OWNED[@]}"; do
+    git -C "$sub" ls-files "$@" | sed "s|^|${sub}/|"
+  done
+}
+
 if [[ -f .gitmodules ]]; then
   while read -r url; do
     case "$url" in
@@ -65,7 +89,7 @@ done
 
 # crates/inspire is a vendored submodule with its own history; its docs are
 # corrected through a submodule change, not here.
-sec_hits="$(git ls-files -- '*.md' ':!:crates/inspire' ':!:crates/inspire/*' \
+sec_hits="$( { git ls-files -- '*.md' ':!:crates/inspire' ':!:crates/inspire/*'; owned_files -- '*.md'; } \
   | xargs grep -nE '128-bit secur|128 bits of secur' 2>/dev/null || true)"
 if [[ -n "$sec_hits" ]]; then
   echo "$sec_hits"
@@ -75,8 +99,8 @@ fi
 # Selftests are excluded because planting a label is what they are for: the adapter red-proof
 # writes one into a throwaway worktree and has to keep being able to.
 LABEL_RE='\b[BDGLMOS]-[0-9]{3}[a-z]?\b'
-label_hits="$(git ls-files -- ':!:crates/inspire' ':!:crates/inspire/*' ':!:*selftest*' \
-  | xargs grep -nE "$LABEL_RE" 2>/dev/null || true)"
+label_hits="$( { git ls-files -- ':!:crates/inspire' ':!:crates/inspire/*' ':!:*selftest*'
+  owned_files -- ':!:*selftest*'; } | xargs grep -nE "$LABEL_RE" 2>/dev/null || true)"
 if [[ -n "$label_hits" ]]; then
   echo "$label_hits"
   fail "a tracked file carries an internal ledger label; those are records, not shipped prose"
@@ -102,7 +126,8 @@ Point the test at a temp dir and delete this."
 # binary run by hand leaves its data dir, and missed `tools/`, `benches/`, `run/` and `scripts/`
 # entirely, two of which are cargo workspaces here. `--exclude-standard` already drops anything
 # ignored, so widening the net costs nothing.
-done < <(git ls-files --others --exclude-standard -- '*manifest.json' 2>/dev/null || true)
+done < <(git ls-files --others --exclude-standard -- '*manifest.json' 2>/dev/null
+  owned_files --others --exclude-standard -- '*manifest.json' 2>/dev/null || true)
 
 # 6. Truncation damage. A tracked file that is EMPTY in the working tree but non-empty at HEAD
 # is not a plausible edit; it is an unclean shutdown that never flushed.
@@ -117,16 +142,21 @@ done < <(git ls-files --others --exclude-standard -- '*manifest.json' 2>/dev/nul
 # Compared against HEAD rather than against a size threshold, because an intentionally empty
 # tracked file is legitimate and stays legitimate -- only a file that HAD content and now has none
 # is reported.
-while IFS= read -r f; do
-  [[ -n "$f" ]] || continue
-  [[ -f "$f" ]] || continue
-  [[ -s "$f" ]] && continue
-  head_size=$(git cat-file -s "HEAD:$f" 2>/dev/null || echo 0)
-  [[ "$head_size" -eq 0 ]] && continue
-  fail "tracked file truncated to zero: ${f} (${head_size} bytes at HEAD, 0 in the working tree). \
+# Each repository answers for its own HEAD: the parent's HEAD holds no submodule file.
+for repo in . "${OWNED[@]}"; do
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    path="${f}"
+    [[ "$repo" == . ]] || path="${repo}/${f}"
+    [[ -f "$path" ]] || continue
+    [[ -s "$path" ]] && continue
+    head_size=$(git -C "$repo" cat-file -s "HEAD:$f" 2>/dev/null || echo 0)
+    [[ "$head_size" -eq 0 ]] && continue
+    fail "tracked file truncated to zero: ${path} (${head_size} bytes at HEAD, 0 in the working tree). \
 An unclean shutdown zero-fills like this. Recover from HEAD plus whatever diff of your \
 uncommitted work survives -- do NOT assume the working tree was the empty one."
-done < <(git ls-files 2>/dev/null || true)
+  done < <(git -C "$repo" ls-files 2>/dev/null || true)
+done
 
 if [[ $failed -ne 0 ]]; then
   echo "scripts/check-repo-hygiene.sh: failed."

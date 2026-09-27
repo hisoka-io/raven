@@ -170,7 +170,7 @@ expect_fail() {
   cp "$BAK" "$CI"
 }
 
-echo "check-ci-filter-names-selftest.sh: six cases the gate must fail on, then the classifier fixtures"
+echo "check-ci-filter-names-selftest.sh: six cases the gate must fail on, submodule cases, then the classifier fixtures"
 
 sed -i 's/test(insert_rejects_overflow_past_capacity)/test(insert_rejects_overflow_past_capacity_RENAMED)/' "$CI"
 expect_fail "a test() term renamed to a nonexistent test (uppercase in the name)"
@@ -195,6 +195,64 @@ expect_fail "a workspace member named only outside the fmt and test jobs"
 rm -f "$VICTIM"
 expect_fail "a binary() whose file is deleted in the working tree but still in the index" workflow-untouched
 cp "$VBAK" "$VICTIM"
+
+# Submodules. A name defined only inside one must resolve, and discovery must list its nextest
+# config: a top-level git listing never enters a submodule, so both were blind to them once.
+printf '# test(consume_both) binary(consume_both)\n' >> "$CI"
+if [ ! -f adapters/eth-state/tests/consume_both.rs ]; then
+  echo "SELFTEST CANNOT RUN: adapters/eth-state/tests/consume_both.rs is gone" >&2
+  fails=1
+elif bash scripts/check-ci-filter-names.sh > /dev/null 2>&1; then
+  echo "  ok: test() and binary() defined only inside a submodule -> resolve"
+else
+  echo "SELFTEST FAIL: a name defined only inside the adapters/eth-state submodule is a leak" >&2
+  fails=1
+fi
+cp "$BAK" "$CI"
+if bash scripts/check-ci-filter-names.sh --nextest-configs 2>/dev/null \
+     | /usr/bin/grep -qx 'adapters/eth-state/.config/nextest.toml=adapters/eth-state/Cargo.toml'; then
+  echo "  ok: discovery lists the adapters/eth-state submodule's nextest config"
+else
+  echo "SELFTEST FAIL: discovery does not list adapters/eth-state/.config/nextest.toml" >&2
+  fails=1
+fi
+
+# An uninitialised submodule, in a scratch superproject so nothing real is emptied: every pass
+# refuses it by name, and once checked out its configs are discovered, nested ones included.
+sub=$(mktemp -d)
+trap 'cp "$BAK" "$CI"; cp "$VBAK" "$VICTIM"; rm -rf "$BAK" "$VBAK" "$sub"' EXIT
+mkdir -p "$sub/scripts" "$sub/.config" "$sub/mod/inner/.config"
+cp scripts/check-ci-filter-names.sh "$sub/scripts/"
+: > "$sub/ci.yml"
+: > "$sub/.config/nextest.toml"
+git -C "$sub" init -q
+git -C "$sub" update-index --add --cacheinfo "160000,$(printf '%040d' 1),mod"
+for mode in names --nextest-configs --selected; do
+  arg=$mode; [ "$mode" = names ] && arg=
+  # shellcheck disable=SC2086
+  if out=$(FILTER_GATE_WORKFLOW="$sub/ci.yml" bash "$sub/scripts/check-ci-filter-names.sh" $arg 2>&1); then
+    echo "SELFTEST FAIL: ${mode} accepted an uninitialised submodule" >&2
+    fails=1
+  elif ! /usr/bin/grep -qF 'submodule mod is not checked out' <<< "$out"; then
+    echo "SELFTEST FAIL: ${mode} failed on an uninitialised submodule without naming it: ${out}" >&2
+    fails=1
+  else
+    echo "  ok: ${mode} with an uninitialised submodule -> refuses, naming it"
+  fi
+done
+git -C "$sub/mod" init -q
+: > "$sub/mod/inner/.config/nextest.toml"
+want=".config/nextest.toml=./Cargo.toml
+mod/inner/.config/nextest.toml=mod/inner/Cargo.toml"
+got=$(FILTER_GATE_WORKFLOW="$sub/ci.yml" bash "$sub/scripts/check-ci-filter-names.sh" --nextest-configs 2>&1)
+if [ "$got" = "$want" ]; then
+  echo "  ok: checked-out submodule -> its nested nextest config is discovered"
+else
+  echo "SELFTEST FAIL: discovery in a checked-out submodule is wrong" >&2
+  diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") >&2
+  fails=1
+fi
+rm -rf "$sub"
 
 # The spawn-and-kill classifier --selected uses, on fixtures: every verdict must match.
 fixtures=scripts/fixtures/check-ci-filter-names/spawn-and-kill
