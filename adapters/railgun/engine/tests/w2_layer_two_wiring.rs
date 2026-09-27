@@ -107,6 +107,11 @@ fn build_toy_state() -> raven_railgun_core::Result<InspireServerState> {
 
 use raven_railgun_testkit::canonical_zeroable as canonical_commitment;
 
+/// Every event here commits, and the first commit also writes the offline packing cache, so a
+/// loaded box spends tens of seconds before the first verdict. A pass returns as soon as the
+/// condition holds; only a failure waits this long.
+const LOADED_BOX_DEADLINE: Duration = Duration::from_secs(120);
+
 fn aggressive_snapshot_policy() -> SnapshotPolicy {
     SnapshotPolicy {
         max_appends_per_snapshot: 1,
@@ -157,7 +162,7 @@ async fn layer2_verifier_fires_per_commit_and_cascades_reorg_on_out_of_sync() {
 
     // Post-cascade appends are rejected as non-contiguous, so events_processed
     // stalls and only reorgs_handled is a sound assertion target.
-    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let drain_deadline = tokio::time::Instant::now() + LOADED_BOX_DEADLINE;
     loop {
         let m = *handle.metrics.lock();
         if m.reorgs_handled >= 1 {
@@ -165,7 +170,7 @@ async fn layer2_verifier_fires_per_commit_and_cascades_reorg_on_out_of_sync() {
         }
         assert!(
             tokio::time::Instant::now() < drain_deadline,
-            "cascade reorg did not fire within 20 s; \
+            "cascade reorg did not fire within {LOADED_BOX_DEADLINE:?}; \
              events_processed = {}, commits_fired = {}, reorgs_handled = {}, verify_calls = {}",
             m.events_processed,
             m.commits_fired,
@@ -264,7 +269,7 @@ async fn layer2_first_verdict_out_of_sync_must_not_truncate_to_genesis() {
 
     // A genesis cascade stalls events_processed at 1 and fires a reorg; a refusal
     // drains all five. Either settles this loop, so it cannot mask the defect.
-    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let drain_deadline = tokio::time::Instant::now() + LOADED_BOX_DEADLINE;
     loop {
         let m = *handle.metrics.lock();
         if chain_source.verify_count() >= 1
@@ -274,7 +279,7 @@ async fn layer2_first_verdict_out_of_sync_must_not_truncate_to_genesis() {
         }
         assert!(
             tokio::time::Instant::now() < drain_deadline,
-            "verifier never fired within 30 s; events_processed = {}, commits_fired = {}, \
+            "verifier never fired within {LOADED_BOX_DEADLINE:?}; events_processed = {}, commits_fired = {}, \
              reorgs_handled = {}, verify_calls = {}",
             m.events_processed,
             m.commits_fired,
@@ -361,7 +366,7 @@ async fn layer2_verifier_does_not_fire_on_upstream_asserted_instance() {
     }
 
     // Deadlock detector, not a throughput floor.
-    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let drain_deadline = tokio::time::Instant::now() + LOADED_BOX_DEADLINE;
     loop {
         let m = *handle.metrics.lock();
         if m.events_processed >= 10 {
@@ -369,7 +374,7 @@ async fn layer2_verifier_does_not_fire_on_upstream_asserted_instance() {
         }
         assert!(
             tokio::time::Instant::now() < drain_deadline,
-            "consumer did not drain 10 events within 30 s; events_processed = {}",
+            "consumer did not drain 10 events within {LOADED_BOX_DEADLINE:?}; events_processed = {}",
             m.events_processed,
         );
         tokio::time::sleep(Duration::from_millis(50)).await;

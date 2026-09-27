@@ -48,23 +48,32 @@ fn expected_row() -> Vec<u8> {
 #[test]
 fn respond_returns_the_switched_modulus_and_the_tight_wire_size() {
     assert_eq!(wire_bytes(ENTRY_BYTES, 60), 17_358);
-    // Status row, the 256 B cell, and the served path row.
-    for (entry_bytes, pinned) in [(32, 9_366), (256, 9_870), (ENTRY_BYTES, 10_446)] {
+    // Status row and the 256 B cell; the served path row is pinned beside its extraction below.
+    for (entry_bytes, pinned) in [(32, 9_366), (256, 9_870)] {
         let (_state, _client_state, response) = served_response(entry_bytes);
-        assert_eq!(response.ciphertext.modulus(), WIRE_RESPONSE_MODULUS);
-        let wire = response.to_binary().expect("serialize");
-        assert_eq!(wire.len(), pinned, "entry_bytes={entry_bytes}");
-        assert_eq!(
-            wire_bytes(entry_bytes, 36),
-            pinned,
-            "entry_bytes={entry_bytes}"
-        );
+        assert_switched_and_tight(&response, entry_bytes, pinned);
     }
+}
+
+fn assert_switched_and_tight(
+    response: &raven_inspire::ServerResponse,
+    entry_bytes: usize,
+    pinned: usize,
+) {
+    assert_eq!(response.ciphertext.modulus(), WIRE_RESPONSE_MODULUS);
+    let wire = response.to_binary().expect("serialize");
+    assert_eq!(wire.len(), pinned, "entry_bytes={entry_bytes}");
+    assert_eq!(
+        wire_bytes(entry_bytes, 36),
+        pinned,
+        "entry_bytes={entry_bytes}"
+    );
 }
 
 #[test]
 fn the_switched_response_extracts_to_the_row_and_the_unswitched_extractor_cannot() {
     let (state, client_state, response) = served_response(ENTRY_BYTES);
+    assert_switched_and_tight(&response, ENTRY_BYTES, 10_446);
     let expected = expected_row();
 
     // Negative control: the pre-switch extractor sees a modulus the CRS does not describe.

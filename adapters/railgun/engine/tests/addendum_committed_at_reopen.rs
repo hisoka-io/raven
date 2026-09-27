@@ -102,6 +102,9 @@ fn toy_state_at_path10_width() -> raven_railgun_engine::inspire::InspireServerSt
 /// subtree, so replaying it necessarily moves shard 0's addendum. Dropping the handle without a
 /// second commit is the unclean stop.
 ///
+/// The committed tree is built in memory: the commit archives every WAL entry before it and no
+/// reopen reads them back, so only the trailing leaf has to pay a WAL append.
+///
 /// Returns the committed tree's shard-0 addendum: the only value the server may serve beside a
 /// row encoded from that tree.
 fn seed(dir: &std::path::Path, trailing_append: bool) -> Vec<u8> {
@@ -109,12 +112,13 @@ fn seed(dir: &std::path::Path, trailing_append: bool) -> Vec<u8> {
     let opened = open_at(dir, Arc::clone(&enc));
     let mut store = LogicalLeafStore::new();
     for index in 0..ENTRIES_PER_SHARD {
-        let payload = leaf_payload(index);
-        opened
-            .persistence
-            .apply_event(&payload, COMMIT_HEIGHT)
-            .expect("wal append");
-        apply_wal_entry(&mut store, &payload, COMMIT_HEIGHT, enc.as_ref()).expect("store append");
+        apply_wal_entry(
+            &mut store,
+            &leaf_payload(index),
+            COMMIT_HEIGHT,
+            enc.as_ref(),
+        )
+        .expect("store append");
     }
 
     let params = InspireParams::secure_128_d2048();
@@ -148,43 +152,8 @@ fn seed(dir: &std::path::Path, trailing_append: bool) -> Vec<u8> {
     expected
 }
 
-/// CASE A: `open()` must hand back the COMMITTED addendum, not the replayed tip's.
-#[test]
-fn open_after_an_unclean_stop_restores_the_committed_addendum() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let expected = seed(dir.path(), true);
-
-    let reopened = open_at(dir.path(), encoder());
-    let store = &reopened.recovered_logical_store;
-
-    // NEGATIVE CONTROL, FIRST. Without it every assertion below passes on a tree that never moved.
-    assert_eq!(
-        list_leaf_count(store),
-        ENTRIES_PER_SHARD as usize + 1,
-        "WAL replay must carry the store past the committed tree, or this test proves nothing"
-    );
-    assert_ne!(
-        expected,
-        live_addendum(store, 0),
-        "the uncommitted leaf must actually move shard 0's upper siblings"
-    );
-
-    let recovered = reopened
-        .recovered_state
-        .as_ref()
-        .expect("a committed snapshot must be recovered");
-    assert_eq!(
-        store.committed_addendum(&LIST_KEY, 0),
-        Some(&expected[..]),
-        "the addendum must belong to the tree `encoded_db` was encoded from"
-    );
-    assert!(
-        store.committed_addenda_derived_from(&recovered.encoded_db),
-        "provenance must name the recovered encoded database"
-    );
-}
-
-/// CASE B -- THE GATE. The defect end to end, in the production wiring, by value.
+/// CASE A, then B -- THE GATE. `open()` must hand back the COMMITTED addendum, not the
+/// replayed tip's; then the defect end to end, in the production wiring, by value.
 ///
 /// The boot seed in `run_consumer_task` derives from the store it is handed, which recovery has
 /// already advanced to the WAL tip, and records the COMMITTED `encoded_db` as provenance. The
@@ -196,6 +165,37 @@ async fn the_consumer_boot_seed_must_not_replace_the_committed_addendum_with_the
 
     let enc = encoder();
     let reopened = open_at(dir.path(), Arc::clone(&enc));
+    {
+        let store = &reopened.recovered_logical_store;
+
+        // NEGATIVE CONTROL, FIRST. Without it every assertion below passes on a tree that never
+        // moved.
+        assert_eq!(
+            list_leaf_count(store),
+            ENTRIES_PER_SHARD as usize + 1,
+            "WAL replay must carry the store past the committed tree, or this test proves nothing"
+        );
+        assert_ne!(
+            expected,
+            live_addendum(store, 0),
+            "the uncommitted leaf must actually move shard 0's upper siblings"
+        );
+
+        let recovered = reopened
+            .recovered_state
+            .as_ref()
+            .expect("a committed snapshot must be recovered");
+        assert_eq!(
+            store.committed_addendum(&LIST_KEY, 0),
+            Some(&expected[..]),
+            "open() must pair the addendum with the tree `encoded_db` was encoded from"
+        );
+        assert!(
+            store.committed_addenda_derived_from(&recovered.encoded_db),
+            "provenance must name the recovered encoded database"
+        );
+    }
+
     let recovered_state = reopened
         .recovered_state
         .expect("a committed snapshot must be recovered");

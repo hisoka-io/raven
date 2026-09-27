@@ -300,21 +300,6 @@ proptest! {
         assert_validate_matches_apply(prefix_len, &candidate)?;
     }
 
-    #[test]
-    fn validate_then_wal_then_mutate_keeps_wal_clean(
-        payloads in prop::collection::vec(imt_backed_payload_strategy(), 1..32),
-    ) {
-        assert_wal_holds_exactly_the_validated_events(&payloads)?;
-    }
-
-    /// PPOI-only, so a WAL-poisoning PPOI leaf cannot hide behind append traffic.
-    #[test]
-    fn ppoi_validate_then_wal_keeps_wal_clean(
-        payloads in prop::collection::vec(ppoi_list_leaf_strategy(), 1..32),
-    ) {
-        assert_wal_holds_exactly_the_validated_events(&payloads)?;
-    }
-
     /// Filling a tree to 65,536 leaves is out of reach here, so the capacity
     /// refusal is pinned on the index alone: no prefix may rescue it.
     #[test]
@@ -359,5 +344,29 @@ proptest! {
             prefix_len,
             msg,
         );
+    }
+}
+
+// Each case opens, fsyncs every accepted append and reopens a data_dir, so these legs are
+// bound by the disk rather than the generator; the in-memory legs above run 256 cases.
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 64,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn validate_then_wal_then_mutate_keeps_wal_clean(
+        payloads in prop::collection::vec(imt_backed_payload_strategy(), 1..32),
+    ) {
+        assert_wal_holds_exactly_the_validated_events(&payloads)?;
+    }
+
+    /// PPOI-only, so a WAL-poisoning PPOI leaf cannot hide behind append traffic.
+    #[test]
+    fn ppoi_validate_then_wal_keeps_wal_clean(
+        payloads in prop::collection::vec(ppoi_list_leaf_strategy(), 1..32),
+    ) {
+        assert_wal_holds_exactly_the_validated_events(&payloads)?;
     }
 }

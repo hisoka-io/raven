@@ -262,7 +262,12 @@ async fn a_divergence_mark_outlives_the_process_that_set_it() {
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("shutdown");
-    let _ = tokio::time::timeout(Duration::from_secs(30), handle.consumer).await;
+    // The reopen below takes this data_dir without a flock, so the first writer has to be gone
+    // before it; a shutdown commit still running would make it a second concurrent writer.
+    let _first_exit = tokio::time::timeout(Duration::from_secs(120), handle.consumer)
+        .await
+        .expect("the first consumer must stop before its data_dir is reopened")
+        .expect("consumer join");
 
     clear_layer2_divergent(INSTANCE_ID);
     let reopened_source = Arc::new(ScriptedChainSource::new(false));

@@ -1,5 +1,6 @@
-//! The session store stays under its cap on the production
-//! `register_client_session` / `respond` path, and a retired handle fails closed.
+//! On the production `register_client_session` / `respond` path a retired or unknown handle
+//! fails closed. The cap and the flush bookkeeping are proven in `raven-inspire-session`, which
+//! this adapter store wraps.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -8,7 +9,7 @@ use std::time::Duration;
 
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_inspire::rgsw::GadgetVector;
-use raven_inspire::{ServerInspiringCache, ServerSessionHandle};
+use raven_inspire::ServerSessionHandle;
 use raven_railgun_engine::inspire::{
     build_client_session, build_seeded_query, extract_response, register_client_session,
     setup_state, InspireServerState, RavenInspireScheme,
@@ -38,12 +39,10 @@ fn capped_state() -> (
     let db = database();
     let (base, sk) =
         setup_state(&params, &db, ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup_state");
-    let cache = ServerInspiringCache::new(base.crs.as_ref(), base.encoded_db.as_ref())
-        .expect("cache rebuild");
     let state = InspireServerState {
         crs: Arc::clone(&base.crs),
         encoded_db: Arc::clone(&base.encoded_db),
-        cache: Arc::new(cache),
+        cache: Arc::clone(&base.cache),
         session_store: Arc::new(BoundedSessionStore::with_limits(SessionStoreLimits {
             max_sessions: CAP,
             ttl: Duration::from_secs(3600),
@@ -54,30 +53,6 @@ fn capped_state() -> (
     let crs = (*state.crs).clone();
     let session = build_client_session(crs, sk, &params).expect("client session");
     (params, state, session, db)
-}
-
-#[test]
-fn occupancy_stays_under_the_cap_across_repeated_registration() {
-    let (_params, state, mut session, _db) = capped_state();
-    for i in 0..12u32 {
-        register_client_session(&mut session, &state).expect("register");
-        assert!(
-            state.session_store.len() <= CAP,
-            "occupancy {} exceeded cap {CAP} after {} registrations; the pre-fix \
-             store grew to the registration count",
-            state.session_store.len(),
-            i + 1
-        );
-    }
-    assert!(
-        state.session_store.flushes_total() >= 1,
-        "12 registrations at cap {CAP} must have hit the backstop at least once"
-    );
-    assert!(
-        state.session_store.evicted_total() >= 10,
-        "evictions must be counted; got {}",
-        state.session_store.evicted_total()
-    );
 }
 
 #[test]
@@ -105,14 +80,7 @@ fn a_retired_handle_is_refused_instead_of_served() {
         msg.contains("not registered") && msg.contains("handshake"),
         "the refusal must tell the caller to re-handshake: {msg}"
     );
-}
 
-#[test]
-fn an_unknown_handle_never_reaches_the_inner_store() {
-    let (params, state, mut session, _db) = capped_state();
-    register_client_session(&mut session, &state).expect("register");
-    let (_client_state, mut query) =
-        build_seeded_query(&session, state.shard_config(), 0, &params).expect("build query");
     query.session_handle = Some(ServerSessionHandle(u64::MAX));
     let err = <RavenInspireScheme as PirScheme>::respond(&state, &query)
         .expect_err("unknown handle must be refused");
@@ -199,59 +167,5 @@ fn a_wire_handle_is_the_core_handle_the_store_is_keyed_on() {
         wrapped_plaintext,
         db.get(3 * ENTRY_SIZE..4 * ENTRY_SIZE).expect("record"),
         "bounding must not disturb a live session's answers"
-    );
-}
-
-/// A flushed handle stays unique because allocation is process-global in the core store.
-#[test]
-fn a_flushed_core_handle_is_refused_and_never_reissued() {
-    let (_params, state, mut session, _db) = capped_state();
-    let now = std::time::Instant::now();
-
-    let stale = state
-        .session_store
-        .register_client_session_at(&mut session, now)
-        .expect("first registration")
-        .expect("the session carries packing keys");
-
-    // Fill to the cap so the backstop replaces the store.
-    for _ in 0..=CAP {
-        let _ = state
-            .session_store
-            .register_client_session_at(&mut session, now);
-    }
-
-    let reissued = state
-        .session_store
-        .register_client_session_at(&mut session, now)
-        .expect("post-flush registration")
-        .expect("the session carries packing keys");
-
-    assert!(
-        state.session_store.flushes_total() >= 1,
-        "premise: the cap was reached and a flush happened"
-    );
-    assert_ne!(
-        stale.0, reissued.0,
-        "a core handle must never be reused when the bounded store is replaced"
-    );
-
-    let err = state
-        .session_store
-        .resolve(Some(stale), now)
-        .expect_err("a handle from a superseded generation must fail closed");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("not registered"),
-        "the replacement store must not contain the flushed core handle; got: {msg}"
-    );
-
-    let (_store, inner) = state
-        .session_store
-        .resolve(Some(reissued), now)
-        .expect("the live handle still resolves");
-    assert!(
-        inner.is_some(),
-        "a resolved wire handle must reach the core store"
     );
 }

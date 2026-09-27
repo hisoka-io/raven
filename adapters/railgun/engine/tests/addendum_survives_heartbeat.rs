@@ -93,7 +93,16 @@ fn a_heartbeat_bumps_the_epoch_but_the_addenda_still_match_the_served_state() {
     );
 
     // And a real commit -- a NEW encoded database -- is the only thing that invalidates them.
-    let recommitted = toy_state();
+    // Provenance is `Arc` identity, so a fresh `Arc` over the same rows is a new database.
+    let served = &after_heartbeat.state;
+    let recommitted = InspireServerState {
+        crs: Arc::clone(&served.crs),
+        encoded_db: Arc::new((*served.encoded_db).clone()),
+        cache: Arc::clone(&served.cache),
+        session_store: Arc::clone(&served.session_store),
+        variant: served.variant,
+        entry_size: served.entry_size,
+    };
     instance
         .swap_state(recommitted, after_heartbeat.epoch.next())
         .expect("swap to a recommitted state");

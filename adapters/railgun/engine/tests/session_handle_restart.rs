@@ -36,14 +36,14 @@ fn reopening_one_data_dir_never_reissues_a_stale_handle() {
         .collect();
     let (state, secret_key) =
         setup_state(&params, &database, ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup");
-    let mut first_client = build_client_session((*state.crs).clone(), secret_key.clone(), &params)
-        .expect("first client");
-    let mut second_client =
-        build_client_session((*state.crs).clone(), secret_key, &params).expect("second client");
+    // The store issues the handle, so one client registered on both sides of the restart is
+    // enough to show the restart never reissues.
+    let mut client =
+        build_client_session((*state.crs).clone(), secret_key, &params).expect("client");
 
     let first = BoundedSessionStore::open_with_limits(dir.path(), limits()).expect("first open");
     let stale = first
-        .register_client_session_at(&mut first_client, std::time::Instant::now())
+        .register_client_session_at(&mut client, std::time::Instant::now())
         .expect("first register")
         .expect("packing handle");
     drop(first);
@@ -52,7 +52,7 @@ fn reopening_one_data_dir_never_reissues_a_stale_handle() {
         BoundedSessionStore::open_with_limits(dir.path(), limits()).expect("restart open"),
     );
     let live = second
-        .register_client_session_at(&mut second_client, std::time::Instant::now())
+        .register_client_session_at(&mut client, std::time::Instant::now())
         .expect("second register")
         .expect("packing handle");
 
@@ -81,7 +81,7 @@ fn reopening_one_data_dir_never_reissues_a_stale_handle() {
         entry_size: state.entry_size,
     };
     let (client_state, query) =
-        build_seeded_query(&second_client, durable_state.shard_config(), 3, &params)
+        build_seeded_query(&client, durable_state.shard_config(), 3, &params)
             .expect("translated query");
     let response = <RavenInspireScheme as PirScheme>::respond(&durable_state, &query)
         .expect("translated response");
@@ -100,106 +100,7 @@ fn reopening_one_data_dir_never_reissues_a_stale_handle() {
         "external-to-inner translation must preserve response bytes"
     );
 
-    assert_durable_lifecycle(&second, &mut second_client, live, &inner_store, inner);
-}
-
-#[test]
-fn deleting_the_floor_cannot_serve_a_stale_clients_query() -> Result<(), String> {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let params = InspireParams::secure_128_d2048();
-    let database: Vec<u8> = (0..params.ring_dim * ENTRY_SIZE)
-        .map(|offset| u8::try_from(offset % 251).expect("mod 251"))
-        .collect();
-    let (state, first_secret_key) =
-        setup_state(&params, &database, ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup");
-    let mut first_client = build_client_session((*state.crs).clone(), first_secret_key, &params)
-        .expect("first client");
-    let first =
-        Arc::new(BoundedSessionStore::open_with_limits(dir.path(), limits()).expect("first open"));
-    let stale = first
-        .register_client_session_at(&mut first_client, std::time::Instant::now())
-        .expect("first register")
-        .expect("first handle");
-    let (client_state, old_query) =
-        build_seeded_query(&first_client, state.shard_config(), 3, &params).expect("old query");
-    assert_eq!(old_query.session_handle, Some(stale));
-
-    let first_server = InspireServerState {
-        crs: Arc::clone(&state.crs),
-        encoded_db: Arc::clone(&state.encoded_db),
-        cache: Arc::clone(&state.cache),
-        session_store: first,
-        variant: state.variant,
-        entry_size: state.entry_size,
-    };
-    let good_response = <RavenInspireScheme as PirScheme>::respond(&first_server, &old_query)
-        .expect("original response");
-    let expected = database
-        .get(3 * ENTRY_SIZE..4 * ENTRY_SIZE)
-        .expect("expected record");
-    assert_eq!(
-        extract_response(
-            first_server.crs.as_ref(),
-            &client_state,
-            &good_response,
-            ENTRY_SIZE
-        )
-        .expect("original extraction"),
-        expected
-    );
-    drop(first_server);
-    std::fs::remove_file(dir.path().join(FLOOR_FILE)).expect("remove only floor");
-
-    match BoundedSessionStore::open_with_limits(dir.path(), limits()) {
-        Err(error) => {
-            assert!(
-                matches!(error, raven_railgun_core::AdapterError::Internal(_)),
-                "{error}"
-            );
-            assert!(error.to_string().contains("floor missing"), "{error}");
-        }
-        Ok(replacement) => {
-            let mut sampler = raven_inspire::math::GaussianSampler::with_seed(params.sigma, 0x5758);
-            let second_secret_key =
-                raven_inspire::rlwe::RlweSecretKey::generate(&params, &mut sampler);
-            let mut second_client =
-                build_client_session((*state.crs).clone(), second_secret_key, &params)
-                    .expect("second client");
-            let replacement = Arc::new(replacement);
-            let new_handle = replacement
-                .register_client_session_at(&mut second_client, std::time::Instant::now())
-                .expect("replacement register")
-                .expect("replacement handle");
-            let second_server = InspireServerState {
-                crs: Arc::clone(&state.crs),
-                encoded_db: Arc::clone(&state.encoded_db),
-                cache: Arc::clone(&state.cache),
-                session_store: replacement,
-                variant: state.variant,
-                entry_size: state.entry_size,
-            };
-            match <RavenInspireScheme as PirScheme>::respond(&second_server, &old_query) {
-                Ok(response) => {
-                    let plaintext = extract_response(
-                        second_server.crs.as_ref(),
-                        &client_state,
-                        &response,
-                        ENTRY_SIZE,
-                    )
-                    .expect("stale extraction returned Ok");
-                    return Err(format!(
-                        "stale handle {stale:?} rebound to {new_handle:?}; responder and decoder returned Ok with wrong plaintext={plaintext:?}, expected={expected:?}"
-                    ));
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "allocator accepted missing floor before responder rejection: {error}"
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
+    assert_durable_lifecycle(&second, &mut client, live, &inner_store, inner);
 }
 
 fn assert_durable_lifecycle(
@@ -331,7 +232,10 @@ async fn production_single_boot_opens_the_durable_allocator_and_refuses_corrupti
     config.use_flock = false;
     config.role = InstanceRole::Live;
     let params = InspireParams::secure_128_d2048();
-    let database = vec![0u8; params.ring_dim * 256];
+    // Non-constant rows, so the control below proves the client decoded its own record.
+    let database: Vec<u8> = (0..params.ring_dim * 256)
+        .map(|offset| u8::try_from(offset % 251).expect("mod 251"))
+        .collect();
     let (fresh_state, secret_key) =
         setup_state(&params, &database, 256, InspireVariant::TwoPacking).expect("single setup");
     let handle = bootstrap_railgun_engine(config, params.clone(), || Ok(fresh_state))
@@ -350,6 +254,21 @@ async fn production_single_boot_opens_the_durable_allocator_and_refuses_corrupti
         .resolve(Some(external), std::time::Instant::now())
         .expect("single resolve");
     assert_ne!(external, inner.expect("single inner"));
+
+    // NEGATIVE CONTROL: before the floor goes, this client's query is served. Without it the
+    // refusals below could be a client that never worked.
+    let (client_state, query) =
+        build_seeded_query(&client, state.shard_config(), 3, &params).expect("single query");
+    assert_eq!(query.session_handle, Some(external));
+    let response =
+        <RavenInspireScheme as PirScheme>::respond(&state, &query).expect("single response");
+    let plaintext = extract_response(state.crs.as_ref(), &client_state, &response, 256)
+        .expect("the registered client's query must serve before the floor is deleted");
+    assert_eq!(
+        plaintext,
+        database.get(3 * 256..4 * 256).expect("expected record"),
+        "the registered client's query must serve its own record before the floor is deleted"
+    );
     handle.consumer.abort();
     handle.indexer_bridge.abort();
     handle.mirror_bridge.abort();
@@ -357,6 +276,15 @@ async fn production_single_boot_opens_the_durable_allocator_and_refuses_corrupti
 
     assert!(dir.path().join("manifest.json").exists());
     std::fs::remove_file(dir.path().join(FLOOR_FILE)).expect("remove production floor");
+    // The allocator decides before any responder runs, so a stale client's handle can never be
+    // rebound to a replacement client's keys.
+    let error = BoundedSessionStore::open_with_limits(dir.path(), limits())
+        .expect_err("a deleted floor must refuse the allocator itself");
+    assert!(
+        matches!(error, raven_railgun_core::AdapterError::Internal(_)),
+        "{error}"
+    );
+    assert!(error.to_string().contains("floor missing"), "{error}");
     let mut restart_config = OrchestratorConfig::demo(dir.path().to_path_buf(), "durable-single");
     restart_config.record_size = 256;
     restart_config.use_flock = false;

@@ -52,6 +52,19 @@ fn seed_data_dir(dir: &std::path::Path, instance: &str, stored_width: usize) {
         .expect("commit_v6");
 }
 
+/// The width and row-window refusals are decided from the manifest before any snapshot byte is
+/// read, so the data_dir they reopen needs only the manifest a fresh open writes.
+fn seed_manifest_only(dir: &std::path::Path, instance: &str, stored_width: usize) {
+    InspirePersistence::open(
+        StoreLayout::open(dir).expect("layout"),
+        SCHEME_TAG,
+        InstanceId::new(instance),
+        SnapshotPolicy::default(),
+        encoder_at(stored_width),
+    )
+    .expect("fresh open");
+}
+
 fn reopen(dir: &std::path::Path, instance: &str, width: usize) -> Result<(), AdapterError> {
     let layout = StoreLayout::open(dir).expect("layout reopen");
     InspirePersistence::open(
@@ -67,7 +80,7 @@ fn reopen(dir: &std::path::Path, instance: &str, width: usize) -> Result<(), Ada
 #[test]
 fn narrower_encoder_than_stored_cell_is_refused_on_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
-    seed_data_dir(dir.path(), "narrow-vs-stored", STORED_WIDTH);
+    seed_manifest_only(dir.path(), "narrow-vs-stored", STORED_WIDTH);
 
     let Err(err) = reopen(dir.path(), "narrow-vs-stored", NARROW_WIDTH) else {
         panic!(
@@ -102,7 +115,7 @@ fn narrower_encoder_than_stored_cell_is_refused_on_reopen() {
 #[test]
 fn wider_encoder_than_stored_cell_is_refused_on_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
-    seed_data_dir(dir.path(), "wide-vs-stored", NARROW_WIDTH);
+    seed_manifest_only(dir.path(), "wide-vs-stored", NARROW_WIDTH);
 
     let Err(err) = reopen(dir.path(), "wide-vs-stored", STORED_WIDTH) else {
         panic!(
@@ -137,7 +150,7 @@ fn matching_width_still_reopens() {
 #[test]
 fn mismatched_rows_per_shard_are_refused_during_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
-    seed_data_dir(dir.path(), "row-mismatch", STORED_WIDTH);
+    seed_manifest_only(dir.path(), "row-mismatch", STORED_WIDTH);
 
     let layout = StoreLayout::open(dir.path()).expect("layout reopen");
     let error = InspirePersistence::open(

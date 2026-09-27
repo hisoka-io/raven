@@ -1,9 +1,9 @@
-//! Disk-backed offline-packing-key cache. One `(PackParams, OfflinePackingKeys)` per PROCESS,
-//! cloned per test.
+//! Disk-backed offline-packing-key cache.
 //!
-//! That does NOT pay the build once, which this header used to claim. `cargo nextest` runs every
-//! test in its own process, so a per-process `OnceLock` amortises only within a single test - this
-//! binary pays the build once per test, not once. Measured 2026-08-31.
+//! The file-format cases store synthetic parts: the cache never inspects what it holds beyond
+//! the body hash, and real d=2048 parts are 160 MiB per store and load. The setup-consumption
+//! case and the warm-load round trip keep the real parts, so one test still proves a
+//! production-size cache fits the size limit and decodes byte-equal.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::print_stderr)]
 
@@ -11,7 +11,9 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use raven_inspire::inspiring::{OfflinePackingKeys, PackParams};
+use raven_inspire::math::Poly;
 use raven_inspire::params::{InspireParams, InspireVariant};
+use raven_inspire::rgsw::GadgetVector;
 use raven_railgun_engine::inspire;
 use raven_railgun_engine::offline_packing_keys_cache::{
     CacheLoad, CellShape, OfflinePackingKeysCache, OfflinePackingKeysCacheError,
@@ -22,7 +24,7 @@ const TEST_ENTRY_BYTES: usize = 32;
 const SCHEME_TAG: &[u8] = b"raven-inspire-twopacking-wp3-v1";
 const PACKING_PARAM_ID: &[u8] = b"InspireParams::secure_128_d2048";
 
-fn shared_parts() -> &'static (PackParams, OfflinePackingKeys, bool) {
+fn real_parts() -> &'static (PackParams, OfflinePackingKeys, bool) {
     static PARTS: OnceLock<(PackParams, OfflinePackingKeys, bool)> = OnceLock::new();
     PARTS.get_or_init(|| {
         let params = InspireParams::secure_128_d2048();
@@ -38,10 +40,44 @@ fn shared_parts() -> &'static (PackParams, OfflinePackingKeys, bool) {
     })
 }
 
+/// Two-poly stand-ins with the production ring and modulus, so the file keeps its real layout.
+fn synthetic_parts() -> (PackParams, OfflinePackingKeys) {
+    let params = InspireParams::secure_128_d2048();
+    let zero = || Poly::zero(params.ring_dim, params.q);
+    let pack_params = PackParams {
+        num_to_pack: 16,
+        ring_dim: params.ring_dim,
+        q: params.q,
+        moduli: vec![params.q],
+        generator: 5,
+        gen_pows: vec![1, 5],
+        mod_inv_gamma: 1,
+        mod_inv_poly_ntt: zero(),
+        monomials: vec![zero(), zero()],
+        neg_monomials: vec![zero(), zero()],
+        monomials_ntt: vec![zero(), zero()],
+        neg_monomials_ntt: vec![zero(), zero()],
+        gadget: GadgetVector::new(params.gadget_base, 3, params.q),
+        automorph_tables: vec![vec![0, 1], vec![1, 0]],
+    };
+    let offline_keys = OfflinePackingKeys {
+        w_seed: [7; 32],
+        v_seed: [0; 32],
+        w_mask: vec![zero()],
+        v_mask: Vec::new(),
+        w_all: vec![vec![zero()]],
+        w_all_ntt: vec![vec![zero()]],
+        w_bar_all: Vec::new(),
+        w_bar_all_ntt: Vec::new(),
+        full_key: false,
+    };
+    (pack_params, offline_keys)
+}
+
 #[test]
 fn production_setup_consumes_the_setup_cache_parts() {
     assert!(
-        shared_parts().2,
+        real_parts().2,
         "setup_state rebuilt the cache instead of consuming setup output"
     );
 }
@@ -75,7 +111,7 @@ fn cache_uses_v3_magic_and_refuses_v2_before_body_decode() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = OfflinePackingKeysCache::new(dir.path());
     let cell = test_cell();
-    let parts = shared_parts();
+    let parts = &synthetic_parts();
     cache.store(&cell, &parts.0, &parts.1).expect("store");
 
     let mut bytes = std::fs::read(cache.path()).expect("new cache bytes");
@@ -92,25 +128,18 @@ fn cache_uses_v3_magic_and_refuses_v2_before_body_decode() {
         }
         other => panic!("expected v2 BadMagic miss, got {other:?}"),
     }
-}
 
-#[test]
-fn bad_magic_is_a_typed_miss() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let cache = OfflinePackingKeysCache::new(dir.path());
-    let cell = test_cell();
-    let parts = shared_parts();
-    cache.store(&cell, &parts.0, &parts.1).expect("store");
-    let mut bytes = std::fs::read(cache.path()).expect("cache bytes");
+    // The version byte alone is not the whole check: a corrupt leading byte must miss too.
+    cache.store(&cell, &parts.0, &parts.1).expect("restore");
+    let mut bytes = std::fs::read(cache.path()).expect("restored cache bytes");
     *bytes.first_mut().expect("magic byte") ^= 1;
-    std::fs::write(cache.path(), bytes).expect("mutate magic");
-
+    std::fs::write(cache.path(), bytes).expect("mutate leading magic byte");
     match cache.load(&cell) {
         CacheLoad::Miss(OfflinePackingKeysCacheError::BadMagic { expected, found }) => {
             assert_eq!(expected, *b"RVN_OPK3");
             assert_ne!(found, expected);
         }
-        other => panic!("expected BadMagic miss, got {other:?}"),
+        other => panic!("expected BadMagic miss on a corrupt leading byte, got {other:?}"),
     }
 }
 
@@ -122,7 +151,7 @@ fn cache_store_is_owner_only_and_ignores_legacy_tmp_collision() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = OfflinePackingKeysCache::new(dir.path());
     let cell = test_cell();
-    let parts = shared_parts();
+    let parts = &synthetic_parts();
     let legacy_tmp = cache.path().with_extension("tmp");
     std::fs::create_dir_all(legacy_tmp.parent().expect("parent")).expect("cache dir");
     std::fs::write(&legacy_tmp, b"collision").expect("legacy collision");
@@ -146,7 +175,7 @@ fn cold_load_writes_cache_then_warm_load_skips_offline_phase() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = OfflinePackingKeysCache::new(dir.path());
     let cell = test_cell();
-    let parts = shared_parts();
+    let parts = real_parts();
 
     let cold_start = Instant::now();
     let (server_cache, hit) = cache
@@ -194,7 +223,7 @@ fn cold_load_writes_cache_then_warm_load_skips_offline_phase() {
 fn scheme_tag_mismatch_falls_through_to_offline_phase_and_overwrites_cache() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = OfflinePackingKeysCache::new(dir.path());
-    let parts = shared_parts();
+    let parts = &synthetic_parts();
 
     let cell_a = CellShape {
         scheme_tag: b"first".to_vec(),
@@ -246,7 +275,7 @@ fn scheme_tag_mismatch_falls_through_to_offline_phase_and_overwrites_cache() {
 fn cell_shape_change_invalidates_cache() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = OfflinePackingKeysCache::new(dir.path());
-    let parts = shared_parts();
+    let parts = &synthetic_parts();
 
     let baseline = test_cell();
     cache
@@ -290,7 +319,7 @@ fn corrupt_cache_file_falls_through_cleanly_then_overwrites() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = OfflinePackingKeysCache::new(dir.path());
     let cell = test_cell();
-    let parts = shared_parts();
+    let parts = &synthetic_parts();
 
     if let Some(parent) = cache.path().parent() {
         std::fs::create_dir_all(parent).expect("mkdir cache dir");
@@ -328,7 +357,7 @@ fn body_hash_rejects_a_validly_decoded_mutation() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = OfflinePackingKeysCache::new(dir.path());
     let cell = test_cell();
-    let parts = shared_parts();
+    let parts = &synthetic_parts();
     cache.store(&cell, &parts.0, &parts.1).expect("store");
     let mut bytes = std::fs::read(cache.path()).expect("read cache");
     let last = bytes.last_mut().expect("non-empty cache");
@@ -347,7 +376,7 @@ fn concurrent_writes_safe_via_atomic_rename() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = OfflinePackingKeysCache::new(dir.path());
     let cell = test_cell();
-    let parts = shared_parts();
+    let parts = &synthetic_parts();
 
     // Atomic rename: no reader sees a partial file, and losing writers overwrite
     // with byte-identical content.

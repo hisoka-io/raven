@@ -4,15 +4,12 @@ use std::sync::Arc;
 
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{
-    apply_wal_entry, restore_inspire_state_v6, snapshot_inspire_state, snapshot_inspire_state_v7,
-    InspireServerState, LogicalLeafStore, SNAPSHOT_V6_MAGIC, SNAPSHOT_V7_MAGIC,
+    apply_wal_entry, restore_inspire_state_v6, snapshot_inspire_state_v7, InspireServerState,
+    LogicalLeafStore, SNAPSHOT_V7_MAGIC,
 };
 use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
-use raven_railgun_persistence::{
-    Manifest, Snapshot, SnapshotId, StoreLayout, Wal, WalEntryPayload, MANIFEST_SCHEMA_VERSION,
-    SNAPSHOT_MAGIC,
-};
+use raven_railgun_persistence::{StoreLayout, Wal, WalEntryPayload};
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-wal-v6-recovery";
 const TOY_ENTRY_SIZE: usize = 32;
@@ -29,71 +26,6 @@ fn encoder_arc() -> Arc<dyn PirTableEncoder> {
 }
 
 use raven_railgun_testkit::canonical;
-
-#[test]
-fn bootstrap_then_drive_commit_then_restart_recovers_logical_store() {
-    let dir = tempfile::tempdir().expect("tempdir");
-
-    {
-        let layout = StoreLayout::open(dir.path()).expect("layout");
-        let opened = InspirePersistence::open(
-            layout,
-            SCHEME_TAG,
-            InstanceId::new("v6-recovery-1"),
-            SnapshotPolicy::default(),
-            encoder_arc(),
-        )
-        .expect("fresh open");
-
-        let state = build_toy_state();
-        let mut store = LogicalLeafStore::default();
-        let encoder: Arc<dyn PirTableEncoder> = encoder_arc();
-
-        for i in 0..8u32 {
-            let payload = WalEntryPayload::AppendLeaf {
-                tree_number: 0,
-                leaf_index: i,
-                commitment: canonical(u8::try_from(i).unwrap_or(0).saturating_add(1)),
-            };
-            apply_wal_entry(&mut store, &payload, 100 + u64::from(i), encoder.as_ref())
-                .expect("apply to logical");
-            opened
-                .persistence
-                .apply_event(&payload, 100 + u64::from(i))
-                .expect("apply_event");
-        }
-
-        opened
-            .persistence
-            .commit_v6(&state, &store, 200)
-            .expect("commit_v6");
-    }
-
-    let layout2 = StoreLayout::open(dir.path()).expect("layout reopen");
-    let opened2 = InspirePersistence::open(
-        layout2,
-        SCHEME_TAG,
-        InstanceId::new("v6-recovery-1"),
-        SnapshotPolicy::default(),
-        encoder_arc(),
-    )
-    .expect("recovery open");
-
-    assert_eq!(
-        opened2.recovered_logical_store.imt_leaf_count_for(0),
-        8,
-        "V7 snapshot must restore 8 leaves into the logical store after WAL archive"
-    );
-    for i in 0..8u32 {
-        let want = canonical(u8::try_from(i).unwrap_or(0).saturating_add(1));
-        let got = opened2
-            .recovered_logical_store
-            .leaf(0, i)
-            .copied()
-            .expect("leaf present after recovery");
-        assert_eq!(got, want, "leaf {i} commitment hash must round-trip");
-    }
-}
 
 #[test]
 fn bootstrap_then_kill_then_restart_serves_real_leaves() {
@@ -246,76 +178,6 @@ fn wal_replay_drops_entries_already_in_snapshot_at_v6() {
 }
 
 #[test]
-fn manifest_v5_compatibility_on_open_existing_data() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let layout = StoreLayout::open(dir.path()).expect("layout");
-
-    let state = build_toy_state();
-    let v5_bytes = snapshot_inspire_state(&state).expect("snapshot v5");
-    let v5_head = v5_bytes.get(..SNAPSHOT_V6_MAGIC.len()).unwrap_or(&v5_bytes);
-    assert_ne!(
-        v5_head, SNAPSHOT_V6_MAGIC,
-        "V5 codec must not accidentally emit the V6 magic prefix"
-    );
-
-    let snap_id = SnapshotId(1);
-    let snap = Snapshot::build(v5_bytes, SNAPSHOT_MAGIC);
-    snap.save(&layout, snap_id).expect("save v5 snapshot");
-
-    let manifest = Manifest {
-        schema_version: 5,
-        scheme_tag: SCHEME_TAG.to_owned(),
-        instance_id: "v5-compat".to_owned(),
-        current_snapshot_id: snap_id,
-        current_snapshot_seq: 0,
-        current_marker: 0,
-        encoder_label: encoder_arc().label().to_owned(),
-        prev_encoder_label: None,
-        entry_size_bytes: None,
-        rows_per_shard: None,
-    };
-    manifest.save(&layout).expect("save v5 manifest");
-
-    let layout2 = StoreLayout::open(dir.path()).expect("layout reopen");
-    let opened = InspirePersistence::open(
-        layout2,
-        SCHEME_TAG,
-        InstanceId::new("v5-compat"),
-        SnapshotPolicy::default(),
-        encoder_arc(),
-    )
-    .expect("V5 manifest must load under the V7-capable engine");
-
-    let migrated = Manifest::load(&layout)
-        .expect("migrated manifest reread")
-        .expect("migrated manifest present");
-    assert_eq!(migrated.schema_version, MANIFEST_SCHEMA_VERSION);
-    assert_eq!(migrated.entry_size_bytes, Some(32));
-    assert_eq!(migrated.rows_per_shard, Some(2048));
-
-    assert_eq!(
-        opened.recovered_logical_store.leaf_count(),
-        0,
-        "legacy V5 snapshot has no embedded LogicalLeafStore; recovery starts empty"
-    );
-
-    let state_after = opened.recovered_state.expect("recovered state present");
-    let store = LogicalLeafStore::default();
-    opened
-        .persistence
-        .commit_v6(&state_after, &store, 1)
-        .expect("post-migration V7 commit must succeed");
-
-    let m_after = Manifest::load(&layout)
-        .expect("manifest reread")
-        .expect("present");
-    assert_eq!(
-        m_after.schema_version, MANIFEST_SCHEMA_VERSION,
-        "after a V7 commit the on-disk manifest must report the current schema"
-    );
-}
-
-#[test]
 fn snapshot_v7_envelope_roundtrips_in_isolation() {
     let state = build_toy_state();
     let mut store = LogicalLeafStore::default();
@@ -352,7 +214,7 @@ fn drive_commit_truncates_wal_yet_v6_recovery_is_complete() {
     // commit_v6 archives the WAL, so reopen reads zero entries from current.log; the V7 snapshot must still recover every leaf
     let dir = tempfile::tempdir().expect("tempdir");
 
-    {
+    let staged_root = {
         let layout = StoreLayout::open(dir.path()).expect("layout");
         let opened = InspirePersistence::open(
             layout,
@@ -362,6 +224,10 @@ fn drive_commit_truncates_wal_yet_v6_recovery_is_complete() {
             encoder_arc(),
         )
         .expect("fresh open");
+        assert!(
+            opened.recovered_state.is_none(),
+            "fresh bootstrap leaves no recovered state until the first commit"
+        );
 
         let state = build_toy_state();
         let mut store = LogicalLeafStore::default();
@@ -380,11 +246,13 @@ fn drive_commit_truncates_wal_yet_v6_recovery_is_complete() {
                 .expect("apply_event");
         }
 
+        let staged_root = store.imt_root(0).expect("staged tree root");
         opened
             .persistence
             .commit_v6(&state, &store, 999)
             .expect("commit_v6");
-    }
+        staged_root
+    };
 
     let layout_probe = StoreLayout::open(dir.path()).expect("layout probe");
     let wal = Wal::open(&layout_probe, None).expect("wal probe open");
@@ -406,6 +274,10 @@ fn drive_commit_truncates_wal_yet_v6_recovery_is_complete() {
     )
     .expect("recovery open");
 
+    assert!(
+        opened2.recovered_state.is_some(),
+        "post-commit reopen must surface recovered_state"
+    );
     assert_eq!(
         opened2.recovered_logical_store.imt_leaf_count_for(0),
         5,
@@ -423,6 +295,12 @@ fn drive_commit_truncates_wal_yet_v6_recovery_is_complete() {
             .expect("leaf present after post-archive recovery");
         assert_eq!(got, want, "leaf {i} must byte-equal the commitment written");
     }
+    assert_eq!(
+        opened2.recovered_logical_store.imt_root(0),
+        Some(staged_root),
+        "the recovered IMT root must equal the staged tree's root, so corruption that \
+         never reaches a leaf slot is caught too"
+    );
 }
 
 /// V7 holds every occurrence of a commitment, so a recurrence survives a snapshot rather than

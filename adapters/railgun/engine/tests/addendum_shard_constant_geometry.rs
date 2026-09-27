@@ -73,10 +73,11 @@ fn a_shard_wider_than_one_upper_subtree_yields_no_addendum_rather_than_a_wrong_o
 #[test]
 fn the_shipped_geometry_and_everything_narrower_still_derives_one() {
     // `entries_per_shard == ring_dim == 2048` is the shipped shape and is exactly at the bound.
+    let db = some_encoded_db();
     for width in [512u32, 1_024, 1u32 << PATH10_LEVELS] {
         let encoder = PerListPath10Encoder::new(width, LIST_KEY).expect("encoder");
         let mut store = store_with_one_leaf(&encoder);
-        store.refresh_committed_addenda(&some_encoded_db(), width);
+        store.refresh_committed_addenda(&db, width);
         assert!(
             store.committed_addendum(&LIST_KEY, 0).is_some(),
             "width {width} is sound and must still derive an addendum"

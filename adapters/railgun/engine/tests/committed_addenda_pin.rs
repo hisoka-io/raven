@@ -128,7 +128,8 @@ fn an_append_after_the_commit_cannot_move_the_addendum_the_row_is_served_with() 
     );
 
     // And a new publish re-derives it, so the pair tracks the state rather than freezing forever.
-    let db8 = some_encoded_db();
+    // Provenance is `Arc` identity, so a fresh `Arc` over the same rows is a new database.
+    let db8 = std::sync::Arc::new((*db7).clone());
     store.refresh_committed_addenda(&db8, ENTRIES_PER_SHARD);
     assert!(store.committed_addenda_derived_from(&db8));
     assert!(
