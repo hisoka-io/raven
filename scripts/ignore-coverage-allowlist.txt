@@ -94,3 +94,4 @@ adapters/railgun/engine/benches/served_respond_latency_bench.rs::served_response
 
 crates/inspire/benches/pack_params_build_bench.rs::pack_params_build_median_at_production_cell
 crates/inspire/src/inspiring/inspiring2/automorph_tables_oracle.rs::derived_tables_equal_the_search_for_every_odd_t_at_d2048
+crates/inspire/src/rlwe/enc.rs::rounding_matches_the_divide_exhaustively_below_the_served_rung
