@@ -768,7 +768,7 @@ pub fn build_padded_batch(
 /// `client_state_bincode` is the [`build_seeded_query`] output. Its
 /// `rlwe_secret_key` is `#[serde(skip)]`, so it arrives default-built (empty
 /// `moduli`) and must be rehydrated from `session` before extraction; otherwise
-/// `Poly::mul_ntt` panics with `Moduli must match`.
+/// extraction refuses it as a shape mismatch.
 #[wasm_bindgen]
 pub fn extract_response(
     session: &ClientSessionHandle,

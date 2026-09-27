@@ -208,8 +208,8 @@ fn wasm_extract_byte_equals_native() {
 }
 
 /// Round-trip strips serde(skip) keys; `extract_response` must rehydrate
-/// `rlwe_secret_key` from the session or `Poly::mul_ntt` panics with `Moduli must
-/// match`. Exercises the trip explicitly since live-value tests never hit it.
+/// `rlwe_secret_key` from the session or extraction refuses the empty key. Exercises
+/// the trip explicitly since live-value tests never hit it.
 #[test]
 fn bincode_roundtrip_then_rehydrate_extracts_byte_identical_to_live_state() {
     let params = test_params();
@@ -305,16 +305,28 @@ fn bincode_roundtrip_without_rehydrate_fails_in_extract() {
     let state_rt: raven_inspire::ClientState =
         bincode::deserialize(&state_bytes).expect("deserialize state");
 
-    // no rehydration: expect a panic in Poly::mul_ntt ("Moduli must match"), caught here
+    // no rehydration: the extractor refuses the default-built key with a typed error
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         extract_response_rust(&crs, &state_rt, &response, ENTRY_BYTES)
     }));
-    assert!(
-        outcome.is_err(),
-        "bincode round-trip without rehydration must surface as a Poly::mul_ntt panic; \
-         if this passes upstream changed `#[serde(skip)]` and the WASM rehydration is no \
-         longer required"
-    );
+    match outcome {
+        Ok(Err(error)) => assert!(
+            error.contains("secret key has ring_dim 0"),
+            "wrong refusal for an unrehydrated state: {error}"
+        ),
+        Ok(Ok(_)) => panic!(
+            "bincode round-trip without rehydration extracted; upstream changed \
+             `#[serde(skip)]` and the WASM rehydration is no longer required"
+        ),
+        Err(payload) => {
+            let reason = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload");
+            panic!("an unrehydrated state must be refused with an error, not a panic: {reason}")
+        }
+    }
 }
 
 #[test]
