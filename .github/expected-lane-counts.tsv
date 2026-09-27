@@ -36,4 +36,4 @@ durability-and-closure/closure	6
 # own recent row count vouches for it (a cold sync part-way, and an empty block over sealed ones), that
 # a block declared ahead of the list is answered over while a row past an empty block is a hole, and
 # that each list is answered only on its own upstream count.
-production-cell-closure/inline	45
+production-cell-closure/inline	47
