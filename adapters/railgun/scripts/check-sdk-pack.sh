@@ -16,7 +16,7 @@
 #      `--all` reports it.
 #
 # Everything here is offline. The one registry dependency is packed out of the SDK's own
-# installed tree, and the required engine peer is met by a stand-in, so no network call is made
+# installed tree, and the optional engine peer is met by a stand-in, so no network call is made
 # and no registry credential is needed. check-sdk-engine-singleton.sh installs the real engine.
 #
 # Overrides, both used by check-sdk-pack-selftest.sh:
@@ -112,7 +112,7 @@ poseidon_dir="${PKG}/node_modules/@railgun-community/poseidon-hash-wasm"
 poseidon_tgz="${WORK}/tar/$( cd "$PKG" && npm pack --json --ignore-scripts --pack-destination "${WORK}/tar" "$poseidon_dir" 2>/dev/null | packed_filename )"
 [[ -f "$poseidon_tgz" ]] || fail "could not pack the poseidon dependency for an offline consumer install"
 
-# A wallet already holds engine, which the SDK names as a required peer. The stand-in carries the
+# A wallet already holds engine, which the SDK names as an optional peer. The stand-in carries the
 # version the SDK is typed against and throws if loaded, so the runtime probes below also prove
 # the SDK never loads engine: it uses engine's types alone.
 engine_version="$(node -p 'require(process.argv[1]).devDependencies["@railgun-community/engine"]' "${PKG}/package.json")" || exit 3

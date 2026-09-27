@@ -32,6 +32,8 @@ const manifest = JSON.parse(readFileSync(resolve(sdkRoot, "package.json"), "utf8
 const ENGINE = "@railgun-community/engine";
 // What @railgun-community/wallet@10.10.0-rc.1, the terminal wallet's pin, depends on exactly.
 const WALLET_ENGINE_PIN = "9.7.0-rc.0";
+// Released wallets depend on `^9.6.0` (10.9.x), `^9.7.0` (11.0.1) and `^9.8.0` (11.1.0).
+const WALLET_ENGINE_LINE = ["9.6.0", "9.7.0", "9.8.0"];
 
 const shippedBy = (allowlist: readonly string[], target: string): boolean => {
   const path = target.replace(/^\.\//, "");
@@ -109,8 +111,9 @@ describe("published package manifest", () => {
   });
 
   // Engine's POI seam is a static on a class; a second engine copy beside the wallet's own takes
-  // an interface installed on it and never reads it. A peer can only share the consumer's copy.
-  it("can never install a second engine, and its peer range admits the wallet's pin", () => {
+  // an interface installed on it and never reads it. An optional peer installs nothing and reads
+  // the copy the wallet brings.
+  it("can never install a second engine, and its peer range admits the wallets' engines", () => {
     for (const field of ["dependencies", "optionalDependencies"] as const) {
       expect(manifest[field]?.[ENGINE], `engine in ${field}`).toBeUndefined();
     }
@@ -119,13 +122,15 @@ describe("published package manifest", () => {
     }
     const peer = manifest.peerDependencies?.[ENGINE] ?? "";
     expect(validRange(peer), `engine peer range ${peer}`).not.toBeNull();
-    // The published declarations name engine's types, so a consumer without engine would get
-    // declarations that resolve to nothing; the peer is required, never optional.
-    expect(manifest.peerDependenciesMeta?.[ENGINE]?.optional, "engine is an optional peer").not.toBe(
+    // A required peer is one npm installs itself, at the newest version the range admits, beside
+    // the wallet's exact pin.
+    expect(manifest.peerDependenciesMeta?.[ENGINE]?.optional, "engine is a required peer").toBe(
       true,
     );
     // A prerelease satisfies only a range naming its own major.minor.patch: `^9.6.0` excludes it.
-    expect(satisfies(WALLET_ENGINE_PIN, peer), `${peer} admits ${WALLET_ENGINE_PIN}`).toBe(true);
+    for (const version of [WALLET_ENGINE_PIN, ...WALLET_ENGINE_LINE]) {
+      expect(satisfies(version, peer), `${peer} admits ${version}`).toBe(true);
+    }
     const typedAgainst = manifest.devDependencies?.[ENGINE] ?? "";
     expect(valid(typedAgainst), "the suite typechecks against one exact engine").not.toBeNull();
     expect(satisfies(typedAgainst, peer), `${peer} admits ${typedAgainst}`).toBe(true);

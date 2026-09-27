@@ -41,6 +41,11 @@
   "peerDependencies": {
     "@railgun-community/engine": "^9.6.0 || 9.7.0-rc.0"
   },
+  "peerDependenciesMeta": {
+    "@railgun-community/engine": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@railgun-community/engine": "9.7.0-rc.0",
     "@types/node": "^20.0.0",

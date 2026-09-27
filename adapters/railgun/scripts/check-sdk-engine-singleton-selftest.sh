@@ -5,17 +5,18 @@
 #   hard-dependency:   engine as a runtime dependency at a version the wallet's exact pin excludes.
 #                      npm nests the wallet's copy and `npm ls` stays green, so only the
 #                      single-instance instrument sees it.
+#   required-peer:     engine a required peer again. With engine left out, npm meets the peer with
+#                      the newest version the range admits and nests the wallet's pin: two copies.
 #   peer-excludes-pin: a peer range that reads right and excludes the wallet's prerelease pin
-#                      (`^9.6.0` does not admit 9.7.0-rc.0). The consumer lists engine at that
-#                      pin, and a required peer that excludes it fails npm's install outright;
-#                      under --legacy-peer-deps one copy lands, so only the edge check sees it.
+#                      (`^9.6.0` does not admit 9.7.0-rc.0). Listed at the pin, npm refuses the
+#                      install; left out, or under --legacy-peer-deps, one copy lands and only the
+#                      edge check sees it.
 #   return-shape:      the engine-facing getPOIsPerList answers with the SDK's literal-union map.
 #                      The per-chain router holds the interface as engine's type, so the SDK's own
 #                      build already refuses it.
 #   install-unguarded: PerChainPOINodeInterface.install takes whatever the consumer's engine holds
-#                      as the stock interface. Without engine listed, the consumer's copy is not the
-#                      wallet's, so the router lands where the wallet never reads; only the
-#                      wallet-only install-lands instrument sees it.
+#                      as the stock interface. On a second copy the router lands where the wallet
+#                      never reads; only the split install-refuses instrument sees it.
 #
 # Needs the npm registry, like the gate. The real tree is never written to and no git command is run.
 set -uo pipefail
@@ -62,15 +63,15 @@ io.open(path, "w", encoding="utf-8").write(json.dumps(manifest, indent=2) + "\n"
 PYEOF
 }
 
-# One install mode per defect is enough to prove the gate can fail; the gate itself runs both.
+# One install mode per defect is enough to prove the gate can fail; the unmutated copy runs them all.
 run_gate() { # package-dir logfile [modes]
-  SDK_ENGINE_PACKAGE_DIR="$1" SDK_ENGINE_SCRATCH="${SCRATCH}/work" SDK_ENGINE_MODES="${3:-default}" \
+  SDK_ENGINE_PACKAGE_DIR="$1" SDK_ENGINE_SCRATCH="${SCRATCH}/work" SDK_ENGINE_MODES="${3:-wallet-only default legacy-peer-deps split}" \
     "$GATE" >"$2" 2>&1
 }
 
-expect_red() { # label dir needle [modes]
+expect_red() { # label dir needle modes
   local label="$1" dir="$2" needle="$3" log="${SCRATCH}/$1.log"
-  if run_gate "$dir" "$log" "${4:-default}"; then
+  if run_gate "$dir" "$log" "$4"; then
     echo "check-sdk-engine-singleton-selftest: ${label}: the gate PASSED a package it must refuse" >&2
     exit 1
   fi
@@ -88,15 +89,20 @@ if ! run_gate "$pristine" "${SCRATCH}/pristine.log"; then
   tail -n 30 "${SCRATCH}/pristine.log" >&2
   exit 1
 fi
-echo "  ok    unmutated copy passes the gate"
+echo "  ok    unmutated copy passes the gate in every mode"
 
 dir="$(stage hard-dependency)"
 mutate_manifest "$dir" 'manifest["dependencies"]["@railgun-community/engine"] = "9.8.0"' || exit 3
-expect_red hard-dependency "$dir" "single-instance (default)"
+expect_red hard-dependency "$dir" "single-instance (wallet-only)" wallet-only
+
+dir="$(stage required-peer)"
+mutate_manifest "$dir" 'manifest.pop("peerDependenciesMeta")' || exit 3
+expect_red required-peer "$dir" "single-instance (wallet-only)" wallet-only
 
 dir="$(stage peer-excludes-pin)"
 mutate_manifest "$dir" 'manifest["peerDependencies"]["@railgun-community/engine"] = "^9.6.0"' || exit 3
-expect_red peer-excludes-pin "$dir" "install (default)"
+expect_red peer-excludes-pin-wallet-only "$dir" "engine-edges (wallet-only)" wallet-only
+expect_red peer-excludes-pin "$dir" "install (default)" default
 expect_red peer-excludes-pin-legacy "$dir" "engine-edges (legacy-peer-deps)" legacy-peer-deps
 
 dir="$(stage return-shape)"
@@ -111,7 +117,7 @@ source = source.replace(engine_shaped, "  ): Promise<PoisPerListResponse>;\n")
 source = source.replace('import type { POIsPerList as EnginePOIsPerList } from "@railgun-community/engine";\n', "")
 io.open(path, "w", encoding="utf-8").write(source)
 PYEOF
-expect_red return-shape "$dir" "build: the dual-format emit did not complete"
+expect_red return-shape "$dir" "build: the dual-format emit did not complete" wallet-only
 /usr/bin/grep -q "The types returned by 'getPOIsPerList(...)' are incompatible" "${SCRATCH}/return-shape.log" \
   || { echo "check-sdk-engine-singleton-selftest: return-shape: the refusal does not name getPOIsPerList" >&2; exit 1; }
 
@@ -126,6 +132,6 @@ if source.count(guard) != 1:
 source = source.replace(guard, guard + "  return true;\n")
 io.open(path, "w", encoding="utf-8").write(source)
 PYEOF
-expect_red install-unguarded "$dir" "install-lands (wallet-only)" wallet-only
+expect_red install-unguarded "$dir" "install-refuses (split)" split
 
-echo "check-sdk-engine-singleton-selftest: the gate refuses a second engine, a peer range that excludes the pin, a return shape engine rejects, and an install that lands where the wallet never reads."
+echo "check-sdk-engine-singleton-selftest: the gate refuses a second engine, a required peer, a peer range that excludes the pin, a return shape engine rejects, and an install that lands where the wallet never reads."

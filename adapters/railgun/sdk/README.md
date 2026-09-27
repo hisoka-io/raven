@@ -38,29 +38,33 @@ It is a development dependency only, for this package's own tests, so installing
 no WASM: the caller adds `raven-inspire-client-wasm` to its own dependencies. How that package is
 published is still open.
 
-### Engine is a required peer, never a dependency
+### Engine is an optional peer: the package needs its types only
 
-`RavenPOINodeInterface` is assignable to `POINodeInterface` from `@railgun-community/engine`, and its
-published declarations import engine's types, so engine is a required peer dependency
-(`^9.6.0 || 9.7.0-rc.0`). The SDK uses engine's types only; nothing in it loads engine at runtime,
-and the pack gate's consumers hold a stand-in engine that throws if loaded.
+This package is useful only inside a Railgun wallet, and it needs `@railgun-community/engine` for
+its types alone: `RavenPOINodeInterface` is assignable to engine's `POINodeInterface`, and the
+published declarations import engine's types. Every Railgun wallet already has engine, directly or
+through `@railgun-community/wallet`, so engine is an optional peer (`^9.6.0 || 9.7.0-rc.0`): installing
+this package installs no engine, and its types resolve against the copy your wallet has. Nothing
+in it loads engine at runtime; a test refuses any `src/` import of engine that is not
+`import type`, and the pack gate's consumers hold a stand-in engine that throws if loaded.
 
-A peer shares the copy your wallet already has, which matters because engine's injection seam,
-`POI.init`, is a static on a class: an interface installed through a second copy is never read by
-the wallet's, and nothing reports it. **List `@railgun-community/engine` in your wallet's own
-dependencies at the version your `@railgun-community/wallet` depends on.** Without that, npm meets
-the peer with the newest version the range admits and nests the wallet's own copy beneath it,
-which is two engines. In that tree `PerChainPOINodeInterface.install(POI, ...)`, given the `POI`
-your code imports, refuses with `InvalidQuery`, because that copy holds no interface; a direct
-`POI.init` through it succeeds and is never read by the wallet.
+One copy matters because engine's injection seam, `POI.init`, is a static on a class: an interface
+installed through a second copy is never read by the wallet's, and nothing reports it.
+`PerChainPOINodeInterface.install(POI, ...)` refuses with `InvalidQuery` when the `POI` it is given
+holds no interface, which is how a copy the wallet never started looks; a direct `POI.init`
+through such a copy succeeds and is never read. The wallet package does not export `POI`, so the
+code that calls `install` imports it from `@railgun-community/engine`, and should list it. List it at
+the version your `@railgun-community/wallet` depends on: a different version is what installs a
+second copy.
 
 The range is written out because a prerelease satisfies only a range that names its own version:
 `^9.6.0` does not admit `9.7.0-rc.0`, which `@railgun-community/wallet@10.10.0-rc.1` pins exactly.
-`adapters/railgun/scripts/check-sdk-engine-singleton.sh` installs the packed SDK beside that wallet,
-with engine listed at the wallet's version, under npm's default resolution and under
-`--legacy-peer-deps`, and requires one engine copy on disk, one resolved file, and a consumer that
-typechecks against it. A third install leaves engine out and requires `install` either to land on
-the wallet's copy or to refuse.
+`adapters/railgun/scripts/check-sdk-engine-singleton.sh` installs the packed SDK beside that wallet
+with npm, first with nothing else and then with engine listed at the wallet's version (under npm's
+default resolution and under `--legacy-peer-deps`), and requires one engine copy on disk, one
+resolved file, a consumer that typechecks against it, and `install` landing on the copy the wallet
+reads. A fourth install lists engine at another version, forcing a second copy, and requires
+`install` to refuse.
 
 Engine's status values are a string enum, which no string literal satisfies, so the engine-shaped
 `getPOIsPerList(txidVersion, chain, listKeys, commitments)` is typed with engine's own
