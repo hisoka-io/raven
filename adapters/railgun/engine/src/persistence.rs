@@ -50,8 +50,19 @@ impl Default for SnapshotPolicy {
     }
 }
 
+/// Longest the consumer lets an applied row sit outside the served database.
+///
+/// Every policy's timer is checked only on an append, so for any role this bound, not the timer,
+/// is what publishes the rows of a feed that has gone quiet. It also caps a longer timer, such as
+/// the static policy's.
+const MAX_UNPUBLISHED_SECS: u64 = 300;
+
 impl SnapshotPolicy {
-    /// Policy for static commit-tree instances: effectively snapshot-once.
+    /// Policy for static instances: no append or timer snapshot trigger.
+    ///
+    /// A filled tree then does no periodic work. Rows it does receive still reach the served
+    /// database within [`SnapshotPolicy::publish_bound`], and the append that fills a tree
+    /// publishes at once.
     pub const fn static_default() -> Self {
         Self {
             max_appends_per_snapshot: usize::MAX,
@@ -61,6 +72,18 @@ impl SnapshotPolicy {
                 snapshots_retain: 2,
             },
         }
+    }
+
+    /// Longest an applied row waits for the consumer to publish it when no append triggers a
+    /// snapshot first. Also the retry interval after a failed publish, hence never zero.
+    #[must_use]
+    pub const fn publish_bound(&self) -> Duration {
+        let secs = if self.max_seconds_between_snapshots < MAX_UNPUBLISHED_SECS {
+            self.max_seconds_between_snapshots
+        } else {
+            MAX_UNPUBLISHED_SECS
+        };
+        Duration::from_secs(if secs == 0 { 1 } else { secs })
     }
 }
 
@@ -811,9 +834,10 @@ pub struct ConsumerMetrics {
     pub commits_fired: u64,
     /// Per-event errors (log-and-continue) since startup.
     pub consumer_errors: u64,
-    /// Failed events since the last applied one. Nonzero means the consumer is
-    /// stalled on a repeating failure; the lag gauges cannot say that, because a
-    /// heartbeat keeps the scan watermark at the tip while nothing applies.
+    /// Failed events since the last applied one, plus failed deferred publishes since the last
+    /// commit. Nonzero means the consumer is stalled on a repeating failure; the lag gauges
+    /// cannot say that, because a heartbeat keeps the scan watermark at the tip while nothing
+    /// applies.
     pub consecutive_event_errors: u64,
     /// Leaves abandoned when a per-leaf loop broke, and not yet re-applied.
     ///
@@ -1293,8 +1317,77 @@ pub async fn run_consumer_task(
         Layer2VerifierState::new(ctx, &baseline)
     });
 
+    // Snapshot triggers fire only on an append, so a feed that goes quiet, a static policy, or a
+    // WAL tail replayed at open would otherwise leave applied rows out of the served database
+    // until the next triggering append or shutdown. The shim reads the store and would not show
+    // it.
+    let mut unpublished_since: Option<tokio::time::Instant> = None;
+    let mut commits_seen = metrics.lock().commits_fired;
+    // This loop's share of the error run. A complete tree applies no further event to clear it,
+    // so the next commit by any path does, or one transient failure holds readiness shut for good.
+    let mut failed_publishes: u64 = 0;
+
     loop {
-        let Some(msg) = rx.recv().await else {
+        let now = tokio::time::Instant::now();
+        {
+            let mut m = metrics.lock();
+            if m.consecutive_event_errors == 0 {
+                failed_publishes = 0;
+            }
+            if m.commits_fired != commits_seen {
+                commits_seen = m.commits_fired;
+                unpublished_since = None;
+                m.consecutive_event_errors =
+                    m.consecutive_event_errors.saturating_sub(failed_publishes);
+                failed_publishes = 0;
+            }
+        }
+        let behind = !logical_store.lock().dirty_shards().is_empty();
+        unpublished_since = if behind {
+            unpublished_since.or(Some(now))
+        } else {
+            None
+        };
+        let publish_at = unpublished_since.map(|since| {
+            since
+                .checked_add(persistence.snapshot_policy().publish_bound())
+                .unwrap_or(since)
+        });
+        if publish_at.is_some_and(|at| at <= now) {
+            // Between events, so the floor names only blocks whose events fully applied.
+            let floor = metrics.lock().last_applied_leaf_block;
+            if let Err(e) = drive_commit(
+                &instance,
+                &persistence,
+                &logical_store,
+                &params,
+                encoder.as_ref(),
+                floor,
+                &metrics,
+            ) {
+                tracing::error!(
+                    error = %e,
+                    block_height = floor,
+                    "deferred publish failed; the rows stay applied and it is retried after the \
+                     publish bound"
+                );
+                let mut m = metrics.lock();
+                m.consumer_errors = m.consumer_errors.saturating_add(1);
+                m.consecutive_event_errors = m.consecutive_event_errors.saturating_add(1);
+                drop(m);
+                failed_publishes = failed_publishes.saturating_add(1);
+                unpublished_since = Some(tokio::time::Instant::now());
+            }
+            continue;
+        }
+        let received = match publish_at {
+            None => rx.recv().await,
+            Some(at) => match tokio::time::timeout_at(at, rx.recv()).await {
+                Ok(received) => received,
+                Err(_) => continue,
+            },
+        };
+        let Some(msg) = received else {
             tracing::info!("consumer channel closed; exiting");
             return Ok(());
         };
@@ -1587,17 +1680,18 @@ fn apply_one_leaf(
         super::inspire::validate_apply(&store, p)?;
     }
     let (_seq, trigger) = persistence.apply_event(p, height)?;
-    {
+    let filled = {
         let mut store = logical_store.lock();
         super::inspire::apply_wal_entry(&mut store, p, height, encoder)?;
-    }
+        filled_its_tree(&store, p)
+    };
     // The floor names the last FULLY applied block, so a leaf does not advance it:
     // an event that fails partway would otherwise leave the marker on a block the
     // indexer resumes above, and its remaining leaves are never re-read. The caller
     // advances it once the whole event lands. A commit driven mid-event therefore
     // commits under the previous floor, which is the conservative direction.
     let floor = { metrics.lock().last_applied_leaf_block };
-    if trigger {
+    if trigger || filled {
         drive_commit(
             instance,
             persistence,
@@ -1609,6 +1703,21 @@ fn apply_one_leaf(
         )?;
     }
     Ok(())
+}
+
+/// Whether `payload` was the append that filled its tree. Nothing appends to that tree again, so
+/// its last rows are published now rather than a publish bound later.
+fn filled_its_tree(
+    store: &super::inspire::LogicalLeafStore,
+    payload: &raven_railgun_persistence::WalEntryPayload,
+) -> bool {
+    use raven_railgun_persistence::WalEntryPayload as P;
+    let imt = match payload {
+        P::AppendLeaf { tree_number, .. } => store.imt(*tree_number),
+        P::PpoiListLeafAdded { list_key, .. } => store.ppoi_imt(list_key),
+        P::PpoiStatus { .. } | P::Reorg { .. } | P::Heartbeat { .. } => None,
+    };
+    imt.is_some_and(|imt| imt.leaf_count() == super::imt::TREE_MAX_ITEMS)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1688,10 +1797,11 @@ fn apply_ppoi(
         super::inspire::validate_apply(&store, payload)?;
     }
     let (_seq, trigger) = persistence.apply_event(payload, height)?;
-    {
+    let filled = {
         let mut store = logical_store.lock();
         super::inspire::apply_wal_entry(&mut store, payload, height, encoder)?;
-    }
+        filled_its_tree(&store, payload)
+    };
     // Mirror rows carry height 0, so neither the floor nor the commit marker may
     // be driven from `height`.
     let floor = {
@@ -1699,7 +1809,7 @@ fn apply_ppoi(
         m.last_applied_leaf_block = m.last_applied_leaf_block.max(height);
         m.last_applied_leaf_block
     };
-    if trigger {
+    if trigger || filled {
         drive_commit(
             instance,
             persistence,
@@ -3980,5 +4090,288 @@ mod tests {
             m.commits_fired, 100,
             "every drive_commit must still bump commits_fired"
         );
+    }
+
+    /// Pinned against literals: the static policy keeps no append or timer trigger, and the
+    /// consumer's bound is what still publishes the rows such an instance applies.
+    #[test]
+    fn every_policy_publishes_within_a_bounded_nonzero_time() {
+        assert_eq!(
+            SnapshotPolicy::static_default().publish_bound(),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            SnapshotPolicy::default().publish_bound(),
+            Duration::from_secs(300)
+        );
+        let with_timer = |secs| SnapshotPolicy {
+            max_seconds_between_snapshots: secs,
+            ..SnapshotPolicy::static_default()
+        };
+        assert_eq!(with_timer(2).publish_bound(), Duration::from_secs(2));
+        assert_eq!(
+            with_timer(0).publish_bound(),
+            Duration::from_secs(1),
+            "a zero bound would retry a failing publish in a tight loop"
+        );
+    }
+
+    /// The append that fills a tree publishes at once under the static policy, and the one
+    /// before it does not. The fixture's table is one shard, so the filled leaf's shard is out of
+    /// range and dropped; the commit is what is counted.
+    #[test]
+    fn the_append_that_fills_a_tree_publishes_under_the_static_policy() {
+        use crate::imt::TREE_MAX_ITEMS;
+        let (instance, persistence, logical_store, params, encoder, metrics, _dir) =
+            build_unsat_shard_fixtures();
+        persistence.set_snapshot_policy(SnapshotPolicy::static_default());
+        let leaf = |index: usize| {
+            let mut commitment = [0u8; 32];
+            commitment[28..].copy_from_slice(&u32::try_from(index).expect("u32").to_be_bytes());
+            WalEntryPayload::AppendLeaf {
+                tree_number: 0,
+                leaf_index: u32::try_from(index).expect("u32"),
+                commitment,
+            }
+        };
+        {
+            let prefill: Vec<_> = (0..TREE_MAX_ITEMS - 2).map(|i| (leaf(i), 1)).collect();
+            let mut store = logical_store.lock();
+            store
+                .seed_leaf_run(&prefill, encoder.as_ref())
+                .expect("prefill");
+            store.clear_dirty_shards();
+        }
+        let append = |index: usize| {
+            super::apply_one_leaf(
+                &leaf(index),
+                1,
+                &instance,
+                &persistence,
+                &logical_store,
+                &params,
+                encoder.as_ref(),
+                &metrics,
+            )
+            .expect("append");
+            metrics.lock().commits_fired
+        };
+        assert_eq!(append(TREE_MAX_ITEMS - 2), 0, "a tree with room left waits");
+        assert_eq!(
+            append(TREE_MAX_ITEMS - 1),
+            1,
+            "the filling append publishes"
+        );
+        assert!(logical_store.lock().dirty_shards().is_empty());
+    }
+
+    /// The mirror path's twin of the chain fill test: the row that fills a list block's tree
+    /// publishes at once under the static policy. The fixture's encoder maps no list row to a
+    /// shard, so the commit is what is counted.
+    #[test]
+    fn the_ppoi_row_that_fills_a_list_tree_publishes_under_the_static_policy() {
+        use crate::imt::TREE_MAX_ITEMS;
+        let (instance, persistence, logical_store, params, encoder, metrics, _dir) =
+            build_unsat_shard_fixtures();
+        persistence.set_snapshot_policy(SnapshotPolicy::static_default());
+        let row = |index: usize| {
+            let list_index = u32::try_from(index).expect("u32");
+            let mut blinded_commitment = [0u8; 32];
+            blinded_commitment[28..].copy_from_slice(&list_index.to_be_bytes());
+            WalEntryPayload::PpoiListLeafAdded {
+                list_key: [0x5c; 32],
+                list_index,
+                blinded_commitment,
+                status: 1,
+                event_type: raven_railgun_persistence::PpoiEventType::Shield,
+                signature: vec![0; 64],
+                validated_merkleroot: [0; 32],
+            }
+        };
+        {
+            let prefill: Vec<_> = (0..TREE_MAX_ITEMS - 2).map(|i| (row(i), 0)).collect();
+            let mut store = logical_store.lock();
+            store
+                .seed_leaf_run(&prefill, encoder.as_ref())
+                .expect("prefill");
+            store.clear_dirty_shards();
+        }
+        // Mirror rows carry height 0, as in production.
+        let append = |index: usize| {
+            super::apply_ppoi(
+                &row(index),
+                0,
+                &instance,
+                &persistence,
+                &logical_store,
+                &params,
+                encoder.as_ref(),
+                &metrics,
+            )
+            .expect("append");
+            metrics.lock().commits_fired
+        };
+        assert_eq!(
+            append(TREE_MAX_ITEMS - 2),
+            0,
+            "a list tree with room left waits"
+        );
+        assert_eq!(append(TREE_MAX_ITEMS - 1), 1, "the filling row publishes");
+        assert!(logical_store.lock().dirty_shards().is_empty());
+    }
+
+    /// The timed publish writes the resume floor, so it must name the last fully applied block:
+    /// never the chain head a heartbeat reports, never a block whose event broke partway.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deferred_publish_commits_the_last_fully_applied_block_as_the_floor() {
+        const APPLIED: u64 = 1_000;
+        const BROKEN: u64 = 2_000;
+        const HEAD: u64 = 50_000;
+        let (instance, persistence, logical_store, params, encoder, metrics, _dir) =
+            build_unsat_shard_fixtures();
+        persistence.set_snapshot_policy(SnapshotPolicy {
+            max_seconds_between_snapshots: 2,
+            ..SnapshotPolicy::static_default()
+        });
+        // The same timer also trips on an append, and a mid-event commit keeps the previous
+        // floor by design. Parking the append-side clock in the future keeps a slow box from
+        // taking that path, so every commit here is the timed publish.
+        let park_append_timer = || {
+            persistence.counters.lock().last_snapshot_at =
+                Instant::now() + Duration::from_secs(3_600);
+        };
+        park_append_timer();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let task = tokio::spawn(run_consumer_task(
+            Arc::clone(&instance),
+            Arc::clone(&persistence),
+            Arc::clone(&logical_store),
+            Arc::clone(&metrics),
+            params,
+            encoder,
+            rx,
+            None,
+        ));
+        let heartbeat = || ConsumerEvent::Heartbeat {
+            chain_head: HEAD,
+            scanned_through: HEAD,
+        };
+        let published = |commits: u64| {
+            let metrics = Arc::clone(&metrics);
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+                while metrics.lock().commits_fired < commits {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "no timed publish within 45 s at a 2 s bound"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+
+        tx.send(shield_at(APPLIED, vec![leaf_at(0, 1)]))
+            .await
+            .expect("send");
+        tx.send(heartbeat()).await.expect("send");
+        published(1).await;
+        assert_eq!(
+            persistence.manifest_block_height(),
+            APPLIED,
+            "the floor is the applied block, not the chain head"
+        );
+
+        park_append_timer();
+        // Leaf 1 applies, then a divergent redelivery of leaf 0 breaks the event.
+        tx.send(shield_at(BROKEN, vec![leaf_at(1, 2), leaf_at(0, 9)]))
+            .await
+            .expect("send");
+        tx.send(heartbeat()).await.expect("send");
+        published(2).await;
+        assert_eq!(
+            persistence.manifest_block_height(),
+            APPLIED,
+            "block {BROKEN} broke partway, so the floor must stay on {APPLIED}"
+        );
+        assert!(logical_store.lock().dirty_shards().is_empty());
+        assert_eq!(
+            metrics.lock().commits_fired,
+            2,
+            "one publish per applied event"
+        );
+
+        drop(tx);
+        task.await.expect("join").expect("consumer task");
+    }
+
+    /// A failing publish is retried once per bound, never in a loop, and holds the error run
+    /// only until a publish lands: a complete tree applies no event that would clear it. The
+    /// failure is a file squatting on the next snapshot's staging path, removed mid-test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_deferred_publish_is_retried_per_bound_and_clears_once_one_lands() {
+        let (instance, persistence, logical_store, params, encoder, metrics, _dir) =
+            build_unsat_shard_fixtures();
+        persistence.set_snapshot_policy(SnapshotPolicy {
+            max_seconds_between_snapshots: 1,
+            ..SnapshotPolicy::static_default()
+        });
+        let leaf = WalEntryPayload::AppendLeaf {
+            tree_number: 0,
+            leaf_index: 0,
+            commitment: [7; 32],
+        };
+        crate::inspire::apply_wal_entry(&mut logical_store.lock(), &leaf, 1, encoder.as_ref())
+            .expect("apply");
+        let next = SnapshotId(persistence.current_snapshot_id().0 + 1);
+        let blocker = persistence
+            .layout()
+            .snapshot_dir(next)
+            .with_extension("tmp");
+        std::fs::write(&blocker, b"").expect("blocker");
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(run_consumer_task(
+            Arc::clone(&instance),
+            Arc::clone(&persistence),
+            Arc::clone(&logical_store),
+            Arc::clone(&metrics),
+            params,
+            encoder,
+            rx,
+            None,
+        ));
+        tokio::time::sleep(Duration::from_millis(3_500)).await;
+        let failed = *metrics.lock();
+        assert!(
+            (1..=4).contains(&failed.consumer_errors),
+            "{} failed publishes in 3.5 s at a 1 s bound",
+            failed.consumer_errors
+        );
+        assert_eq!(
+            failed.consecutive_event_errors, failed.consumer_errors,
+            "readiness must see a publish that is failing"
+        );
+        assert_eq!(failed.commits_fired, 0);
+        assert_eq!(logical_store.lock().dirty_shards().len(), 1, "still owed");
+
+        std::fs::remove_file(&blocker).expect("unblock");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while metrics.lock().commits_fired == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tx.send(ConsumerEvent::Shutdown)
+            .await
+            .expect("send shutdown");
+        task.await.expect("join").expect("consumer task");
+
+        let landed = *metrics.lock();
+        assert!(landed.commits_fired >= 1, "the retry published");
+        assert_eq!(
+            landed.consecutive_event_errors, 0,
+            "a landed publish must reopen readiness with no event to help"
+        );
+        assert_eq!(landed.consumer_errors, failed.consumer_errors);
+        assert!(logical_store.lock().dirty_shards().is_empty());
     }
 }
