@@ -440,7 +440,11 @@ where
 /// The order is a crash-safety contract, not a style choice: the manifest save
 /// moves the replay floor to `wal.next_seq()` BEFORE the archive moves the log,
 /// so a crash between the two still replays the survivors in `current.log`.
-/// Archiving first would strand entries the floor still points at.
+/// Archiving first would strand entries the floor still points at. The log is
+/// synced before either, because a floor above the durable tail is refused at
+/// boot by [`Wal::open`] once a power loss drops the deferred frames below it.
+/// No append may run concurrently with this call: a frame landing after the
+/// floor is read would be sealed into an archive the manifest has skipped.
 ///
 /// `mutate` receives the snapshot id and the new replay floor, so the caller
 /// keeps ownership of its own manifest fields. It MUST assign both: a manifest
@@ -457,8 +461,10 @@ where
 ///
 /// # Errors
 /// [`PersistenceError::Invariant`] when `mutate` leaves the staged manifest off
-/// `snapshot_id` or off the new floor, plus any manifest write or archive
-/// failure, unmodified.
+/// `snapshot_id` or off the new floor, plus any WAL sync, manifest write or
+/// archive failure, unmodified. A WAL whose sync failed is refused before
+/// anything is written; one poisoned only by a torn append is sealed, which
+/// clears the poison.
 pub fn advance_manifest_and_archive<F>(
     layout: &StoreLayout,
     wal: &Wal,
@@ -469,9 +475,8 @@ pub fn advance_manifest_and_archive<F>(
 where
     F: FnOnce(&mut Manifest, SnapshotId, u64),
 {
-    let new_floor = wal.next_seq();
+    let (new_floor, sealable) = wal.sync_for_seal()?;
     let archive_to = new_floor.saturating_sub(1);
-    let sealable = wal.first_seq();
     let archive_from = sealable.unwrap_or(new_floor);
 
     let mut staged = manifest.clone();

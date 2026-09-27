@@ -1,5 +1,7 @@
 //! Layer B WAL chaos: forks `wal_chaos_child`, SIGKILLs at varying delays, asserts recovery.
-//! Complements Layer A (`wal_model_check.rs`) by exercising the real fsync + kernel page-cache path.
+//! Complements Layer A (`wal_model_check.rs`) with a real process kill. The page cache
+//! outlives the process, so this proves every written frame survives a kill; it never
+//! tests fsync, and a power loss is Layer A's truncation model.
 //! Run: `cargo test -p raven-railgun-persistence --features chaos-tests --test wal_chaos_layer_b -- --nocapture`
 
 #![cfg(feature = "chaos-tests")]
@@ -12,6 +14,7 @@
 )]
 
 use raven_railgun_persistence::{StoreLayout, Wal, WalEntryPayload};
+use std::io::BufRead;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -74,24 +77,45 @@ fn canonical_payload(seed: u64, i: usize) -> (WalEntryPayload, u64) {
 }
 
 fn one_chaos_round(seed: u64, kill_delay: Duration) -> usize {
+    chaos_round(seed, kill_delay, false).0
+}
+
+/// Returns the recovered count and, in deferred mode, the frames the child reported
+/// as handed to the kernel; synced mode reports nothing per frame.
+fn chaos_round(seed: u64, kill_delay: Duration, deferred: bool) -> (usize, Option<usize>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let child_bin = env!("CARGO_BIN_EXE_wal_chaos_child");
-    let mut child = Command::new(child_bin)
+    let mut command = Command::new(child_bin);
+    command
         .arg("--data-dir")
         .arg(dir.path())
         .arg("--seed")
         .arg(seed.to_string())
         .arg("--max")
-        .arg("1000")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn child");
+        .arg(if deferred { "100000" } else { "1000" })
+        .stderr(Stdio::null());
+    if deferred {
+        command.arg("--deferred").stdout(Stdio::piped());
+    } else {
+        command.stdout(Stdio::null());
+    }
+    let mut child = command.spawn().expect("spawn child");
+    // drained on a thread so a full pipe never stalls the child before the kill
+    let acked = child.stdout.take().map(|out| {
+        std::thread::spawn(move || {
+            std::io::BufReader::new(out)
+                .lines()
+                .map_while(Result::ok)
+                .filter(|line| line.starts_with("acked "))
+                .count()
+        })
+    });
 
     std::thread::sleep(kill_delay);
 
     let _ = child.kill();
     let _ = child.wait();
+    let acked = acked.map(|reader| reader.join().expect("stdout reader"));
 
     let layout = StoreLayout::open(dir.path()).expect("layout");
     let wal = Wal::open(&layout, None).expect("wal");
@@ -128,7 +152,17 @@ fn one_chaos_round(seed: u64, kill_delay: Duration) -> usize {
         replay.entries.len()
     );
 
-    replay.entries.len()
+    if let Some(acked) = acked {
+        assert!(
+            replay.entries.len() >= acked,
+            "the child acknowledged {acked} frames but only {} survived the kill: a frame \
+             is being held in user space past append_deferred (seed={seed}, \
+             kill_delay={kill_delay:?})",
+            replay.entries.len()
+        );
+    }
+
+    (replay.entries.len(), acked)
 }
 
 #[test]
@@ -144,7 +178,28 @@ fn chaos_kill_at_random_offsets_recovers_clean_prefix() {
     }
     assert!(
         total > 0,
-        "every trial recovered zero entries: fsync-acknowledged appends are not surviving a kill"
+        "every trial recovered zero entries: written appends are not surviving a kill"
+    );
+}
+
+/// Deferred appends are unsynced, but a kill must still lose none of them: `write(2)`
+/// has handed each one to the page cache before `append_deferred` returns. A user-space
+/// buffer in front of the file would lose up to a sync interval of acknowledged frames.
+#[test]
+fn chaos_kill_during_deferred_appends_loses_no_acked_frame() {
+    let mut acked_total = 0usize;
+    for (trial, delay_ms) in [(11u64, 10u64), (12, 30), (13, 60), (14, 120), (15, 250)] {
+        let (recovered, acked) = chaos_round(trial, Duration::from_millis(delay_ms), true);
+        let acked = acked.expect("deferred mode reports acks");
+        eprintln!(
+            "Layer B deferred trial {trial} (delay={delay_ms}ms): acked {acked}, \
+             recovered {recovered}"
+        );
+        acked_total += acked;
+    }
+    assert!(
+        acked_total > 0,
+        "no trial acknowledged a frame before the kill, so nothing was tested"
     );
 }
 

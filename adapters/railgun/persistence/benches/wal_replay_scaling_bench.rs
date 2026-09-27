@@ -32,12 +32,15 @@ fn payload_for(seq: usize) -> WalEntryPayload {
     }
 }
 
+// Replay reads what the page cache holds either way, so one sync replaces one per frame.
 fn seed_wal(layout: &StoreLayout, n_entries: usize) {
     let wal = Wal::open(layout, None).expect("wal open");
     for i in 0..n_entries {
         let payload = payload_for(i);
-        wal.append(&payload, 100 + i as u64).expect("wal append");
+        wal.append_deferred(&payload, 100 + i as u64)
+            .expect("wal append");
     }
+    wal.sync().expect("wal sync");
 }
 
 fn measured_replay(layout: &StoreLayout) -> (Duration, usize) {
@@ -54,10 +57,10 @@ fn median(timings: &mut [Duration]) -> Duration {
 }
 
 #[test]
-#[ignore = "~20 min wall (1215 s measured on a 16-core box; ~10 min on an idle one): the cost is \
-            the 333k fsynced WAL appends that seed the sweep, not the replay it measures, which is \
-            110 ms at 100k as a 3-seed median. Trigger: changing Wal::replay or the WAL frame \
-            layout."]
+#[ignore = "about 1 s (1.14 s in release at load 14.6): seeding is deferred appends plus one \
+            sync, and replay itself is 105 ms at 100k as a 3-seed median. A timing bench, only \
+            meaningful in a release build, so it is run by hand. Trigger: changing Wal::replay \
+            or the WAL frame layout."]
 fn wal_replay_scales_linearly_at_1k_10k_100k() {
     eprintln!(
         "wal_replay_scaling: SEEDS={} ENTRY_COUNTS={:?}",

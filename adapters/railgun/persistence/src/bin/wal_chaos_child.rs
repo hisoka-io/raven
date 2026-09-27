@@ -2,6 +2,9 @@
 //!
 //! Writes a deterministic `--seed`-derived sequence of WAL entries; the parent SIGKILLs
 //! it at a random delay and asserts replay returns a clean prefix of the canonical sequence.
+//! `--deferred` appends without a sync, syncs every [`SYNC_EVERY`] frames, and prints
+//! `acked <i>` once frame `i` is handed to the kernel, so the parent can hold every
+//! acknowledged frame to surviving the kill.
 
 #![allow(
     clippy::expect_used,
@@ -13,11 +16,15 @@
 
 use raven_railgun_persistence::{StoreLayout, Wal, WalEntryPayload};
 
-fn parse_args() -> (std::path::PathBuf, u64, usize) {
+// Long enough that a kill usually lands among appends, not inside the sync.
+const SYNC_EVERY: usize = 4096;
+
+fn parse_args() -> (std::path::PathBuf, u64, usize, bool) {
     let mut args = std::env::args().skip(1);
     let mut data_dir = None;
     let mut seed = 0u64;
     let mut max_entries = 1000usize;
+    let mut deferred = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--data-dir" => {
@@ -39,10 +46,16 @@ fn parse_args() -> (std::path::PathBuf, u64, usize) {
                     .parse()
                     .expect("max must be usize");
             }
+            "--deferred" => deferred = true,
             other => panic!("unknown flag {other}"),
         }
     }
-    (data_dir.expect("--data-dir required"), seed, max_entries)
+    (
+        data_dir.expect("--data-dir required"),
+        seed,
+        max_entries,
+        deferred,
+    )
 }
 
 /// Deterministic payload generator; parent mirrors this to verify recovered entries.
@@ -105,12 +118,13 @@ pub fn canonical_payload(seed: u64, i: usize) -> (WalEntryPayload, u64) {
 }
 
 fn main() {
-    let (data_dir, seed, max_entries) = parse_args();
+    let (data_dir, seed, max_entries, deferred) = parse_args();
     eprintln!(
-        "wal_chaos_child: data_dir={} seed={} max_entries={}",
+        "wal_chaos_child: data_dir={} seed={} max_entries={} deferred={}",
         data_dir.display(),
         seed,
-        max_entries
+        max_entries,
+        deferred
     );
     std::fs::create_dir_all(&data_dir).expect("mkdir data_dir");
     let layout = StoreLayout::open(&data_dir).expect("open layout");
@@ -118,10 +132,23 @@ fn main() {
 
     for i in 0..max_entries {
         let (payload, block_height) = canonical_payload(seed, i);
-        let _seq = wal.append(&payload, block_height).expect("append");
-        if i % 50 == 0 {
-            println!("wrote {i}");
+        if deferred {
+            let _seq = wal
+                .append_deferred(&payload, block_height)
+                .expect("append_deferred");
+            println!("acked {i}");
+            if (i + 1) % SYNC_EVERY == 0 {
+                wal.sync().expect("sync");
+            }
+        } else {
+            let _seq = wal.append(&payload, block_height).expect("append");
+            if i % 50 == 0 {
+                println!("wrote {i}");
+            }
         }
+    }
+    if deferred {
+        wal.sync().expect("sync");
     }
     eprintln!("wal_chaos_child: completed {max_entries} entries cleanly");
 }

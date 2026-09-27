@@ -4,6 +4,13 @@
 //! crc over everything preceding it plus the payload. `seq` is the WAL's own
 //! monotonic counter; `marker` is caller-supplied and also monotonic. Payloads
 //! are opaque - [`Wal::replay`] hands the raw bytes back undecoded.
+//!
+//! [`Wal::append_deferred`] writes a frame with one `write(2)` and no fsync, so a
+//! process kill loses nothing but a power loss can drop the unsynced suffix;
+//! [`Wal::sync`] makes it durable. Frames carry no incarnation tag and the seqs of
+//! lost frames are reused, so after a power loss the crc and seq scan is sound
+//! only if the filesystem never exposes stale or reordered data inside the file's
+//! durable length. ext4 with `data=ordered` (the default) and XFS guarantee that.
 
 use crate::{PersistenceError, Result, StoreLayout};
 use parking_lot::Mutex;
@@ -14,6 +21,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Per-entry ceiling; rejects a nonsense `payload_len` from a torn write.
 pub const WAL_MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+// A frame buffer grown past this by one large payload is dropped, not kept.
+const RETAINED_FRAME_BUFFER_BYTES: usize = 1024 * 1024;
 
 static RESUME_FLOOR_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
@@ -48,10 +58,24 @@ struct WalState {
     /// Lowest seq still in `current.log`; `None` once it holds nothing.
     first_seq: Option<u64>,
     last_marker: u64,
-    /// Set when an append tore. Every later append is refused, because an
-    /// fsync-acknowledged entry that a later replay drops is worse than a
-    /// refused write.
+    /// Byte length of `current.log`, and so the rewind target of a failed frame
+    /// write. Tracked rather than read with `fstat`, so every path that changes the
+    /// length (append, rewind, archive, the torn-tail cut in `open`) must set it.
+    len: u64,
+    /// Prefix of `len` known durable. Below `len` means a sync is pending.
+    synced_len: u64,
+    /// Set when an append tore or a sync failed. Every later append and sync is
+    /// refused, because an entry acknowledged as written that a later replay
+    /// drops is worse than a refused write.
     poisoned: bool,
+    /// A sync failed. Linux may drop the failed dirty pages and clear the error,
+    /// so a retried fsync can report success over lost data: only a reopen
+    /// clears this, never an archive. A reopen restores appends, not proof of
+    /// durability: frames it replays may still be missing after a power loss,
+    /// and the source of truth re-derives them.
+    sync_failed: bool,
+    /// Reused so header and payload leave in one `write(2)` without a fresh buffer.
+    frame: Vec<u8>,
     /// One-shot fault points; `cfg(test)` prevents a production test door.
     #[cfg(test)]
     faults: WalFaults,
@@ -59,19 +83,157 @@ struct WalState {
 
 #[cfg(test)]
 #[derive(Debug, Default)]
+#[allow(clippy::struct_excessive_bools)] // independent one-shot fault points, not a state
 struct WalFaults {
     frame_write: bool,
     rewind: bool,
     archive_reopen: bool,
+    sync: bool,
 }
 
-/// One whole frame: header then payload then fsync. Any error leaves the caller
-/// to rewind, because a header without its payload stops replay.
-fn write_frame(file: &mut File, header: &[u8; 24], payload: &[u8]) -> Result<()> {
-    file.write_all(header)?;
-    file.write_all(payload)?;
-    file.sync_all()?;
-    Ok(())
+fn poisoned_error() -> PersistenceError {
+    PersistenceError::Invariant(
+        "WAL is poisoned by an earlier torn append or failed sync; reopen to recover".to_owned(),
+    )
+}
+
+impl WalState {
+    /// fdatasync unless nothing is pending. A failure poisons for good: see
+    /// `sync_failed`. Does not check `poisoned`, because a seal recovers a log a
+    /// torn append poisoned; `refuse_seal_after_failed_sync` guards it instead.
+    fn flush(&mut self) -> Result<()> {
+        if !self.poisoned && self.synced_len == self.len {
+            return Ok(());
+        }
+        #[cfg(test)]
+        let synced = if std::mem::replace(&mut self.faults.sync, false) {
+            Err(std::io::Error::other("injected sync failure"))
+        } else {
+            self.file.sync_data()
+        };
+        #[cfg(not(test))]
+        let synced = self.file.sync_data();
+        match synced {
+            Ok(()) => {
+                self.synced_len = self.len;
+                Ok(())
+            }
+            Err(e) => {
+                self.poisoned = true;
+                self.sync_failed = true;
+                Err(e.into())
+            }
+        }
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        if self.poisoned {
+            return Err(poisoned_error());
+        }
+        self.flush()
+    }
+
+    fn refuse_seal_after_failed_sync(&self, layout: &StoreLayout) -> Result<()> {
+        if self.sync_failed {
+            return Err(PersistenceError::Invariant(format!(
+                "wal archive refused: an earlier sync of wal/current.log failed, so its \
+                 durable contents are unknown and sealing it would retry that sync as a \
+                 success. Operator: restart to reopen the log. Path: {}",
+                layout.root().display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Restore the log to `tail` after a frame write failed part-way, because a
+    /// header without its payload stops replay at it.
+    fn rewind(&mut self, tail: u64) {
+        #[cfg(test)]
+        if std::mem::replace(&mut self.faults.rewind, false) {
+            self.poisoned = true;
+            return;
+        }
+        let cut = self.file.set_len(tail);
+        let synced = cut.is_ok() && {
+            let ok = self.file.sync_all().is_ok();
+            self.sync_failed |= !ok;
+            ok
+        };
+        let placed = synced && self.file.seek(SeekFrom::Start(tail)).is_ok();
+        if synced {
+            self.synced_len = tail;
+        }
+        // Poison on a rewind that failed OR that left the file shorter than the tail it
+        // was meant to restore: both mean the on-disk extent is no longer known good,
+        // and a successful truncation to the wrong length is the more dangerous of the
+        // two because it looks like a clean recovery.
+        let shorter_than_tail = match self.file.metadata() {
+            Ok(m) => m.len() < tail,
+            Err(_) => true,
+        };
+        self.poisoned = !placed || shorter_than_tail;
+    }
+
+    fn write_frame(&mut self, marker: u64, payload_len: u32, payload: &[u8]) -> Result<u64> {
+        if self.poisoned {
+            return Err(poisoned_error());
+        }
+        let seq = self.next_seq;
+        let mut frame = std::mem::take(&mut self.frame);
+        frame.clear();
+        frame.extend_from_slice(&seq.to_be_bytes());
+        frame.extend_from_slice(&marker.to_be_bytes());
+        frame.extend_from_slice(&payload_len.to_be_bytes());
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&frame);
+        hasher.update(payload);
+        frame.extend_from_slice(&hasher.finalize().to_be_bytes());
+        frame.extend_from_slice(payload);
+
+        // A partial write leaves a frame replay stops at, silently dropping every later
+        // entry. Rewind to the last whole frame: the tracked length, never the fd offset,
+        // because O_APPEND leaves the offset at 0 until the first write after a reopen.
+        let tail = self.len;
+        #[cfg(test)]
+        let written = if std::mem::replace(&mut self.faults.frame_write, false) {
+            Err(std::io::Error::other("injected frame-write failure"))
+        } else {
+            self.file.write_all(&frame)
+        };
+        #[cfg(not(test))]
+        let written = self.file.write_all(&frame);
+        let frame_len = frame.len() as u64;
+        if frame.capacity() <= RETAINED_FRAME_BUFFER_BYTES {
+            self.frame = frame;
+        }
+        if let Err(e) = written {
+            self.rewind(tail);
+            return Err(e.into());
+        }
+
+        self.len = tail.saturating_add(frame_len);
+        self.next_seq = self.next_seq.saturating_add(1);
+        self.first_seq.get_or_insert(seq);
+        self.last_marker = marker;
+        Ok(seq)
+    }
+}
+
+/// Bincode `payload` under the size ceiling. Serializing here, outside the lock,
+/// keeps the critical section to the write itself.
+fn encode_payload<P: Serialize>(payload: &P) -> Result<(Vec<u8>, u32)> {
+    let bytes = bincode::serialize(payload)?;
+    if bytes.len() > WAL_MAX_PAYLOAD_BYTES {
+        return Err(PersistenceError::Invariant(format!(
+            "WAL payload {} bytes exceeds max {}",
+            bytes.len(),
+            WAL_MAX_PAYLOAD_BYTES
+        )));
+    }
+    let payload_len = u32::try_from(bytes.len()).map_err(|_| {
+        PersistenceError::Invariant(format!("WAL payload size {} overflows u32", bytes.len()))
+    })?;
+    Ok((bytes, payload_len))
 }
 
 impl Wal {
@@ -134,6 +296,10 @@ impl Wal {
         }
 
         let file = open_wal_owner_only(&path)?;
+        let len = rewind_target(&file)?;
+        // An earlier process may have left written but unsynced frames, so only a
+        // log this open just synced, or an empty one, starts clean.
+        let synced_len = if scan.truncate_at.is_some() { len } else { 0 };
 
         Ok(Self {
             layout: layout.clone(),
@@ -142,101 +308,56 @@ impl Wal {
                 next_seq,
                 first_seq: scan.first_seq,
                 last_marker: scan.last_marker,
+                len,
+                synced_len,
                 poisoned: false,
+                sync_failed: false,
+                frame: Vec::new(),
                 #[cfg(test)]
                 faults: WalFaults::default(),
             }),
         })
     }
 
-    /// Assigns the next seq, fsyncs, returns that seq. The bound is `Serialize`
-    /// alone because the WAL never decodes what it stores.
+    /// Assigns the next seq, writes the frame, syncs it and every deferred frame
+    /// before it, and returns that seq: the frame is durable on return. The bound
+    /// is `Serialize` alone because the WAL never decodes what it stores.
+    ///
+    /// # Errors
+    /// A payload over [`WAL_MAX_PAYLOAD_BYTES`], a poisoned WAL, or an I/O
+    /// failure. A failed sync poisons the WAL, and the frame may still replay.
     pub fn append<P: Serialize>(&self, payload: &P, marker: u64) -> Result<u64> {
-        let bincoded = bincode::serialize(payload)?;
-        if bincoded.len() > WAL_MAX_PAYLOAD_BYTES {
-            return Err(PersistenceError::Invariant(format!(
-                "WAL payload {} bytes exceeds max {}",
-                bincoded.len(),
-                WAL_MAX_PAYLOAD_BYTES
-            )));
-        }
-
+        let (bytes, payload_len) = encode_payload(payload)?;
         let mut state = self.inner.lock();
-        let seq = state.next_seq;
-        let payload_len = u32::try_from(bincoded.len()).map_err(|_| {
-            PersistenceError::Invariant(format!(
-                "WAL payload size {} overflows u32",
-                bincoded.len()
-            ))
-        })?;
-
-        let mut header = [0u8; 24];
-        header[0..8].copy_from_slice(&seq.to_be_bytes());
-        header[8..16].copy_from_slice(&marker.to_be_bytes());
-        header[16..20].copy_from_slice(&payload_len.to_be_bytes());
-
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&header[0..20]);
-        hasher.update(&bincoded);
-        let crc = hasher.finalize();
-        header[20..24].copy_from_slice(&crc.to_be_bytes());
-
-        if state.poisoned {
-            return Err(PersistenceError::Invariant(
-                "WAL is poisoned by an earlier torn append; reopen to recover".to_owned(),
-            ));
-        }
-
-        // A partial write leaves a frame replay stops at, silently dropping every later
-        // entry even though append returned Ok and fsynced. Rewind to the last whole frame.
-        //
-        // The target is the file LENGTH, never the fd offset: O_APPEND leaves the offset at
-        // 0 until the kernel repositions it on the first write, so on the first append after
-        // any reopen `stream_position` reports 0 and a rewind to it truncates the whole log.
-        let tail = rewind_target(&state.file)?;
-        #[cfg(test)]
-        let frame = if std::mem::replace(&mut state.faults.frame_write, false) {
-            Err(PersistenceError::Io(std::io::Error::other(
-                "injected frame-write failure",
-            )))
-        } else {
-            write_frame(&mut state.file, &header, &bincoded)
-        };
-        #[cfg(not(test))]
-        let frame = write_frame(&mut state.file, &header, &bincoded);
-        if let Err(e) = frame {
-            #[cfg(test)]
-            let rewound = if std::mem::replace(&mut state.faults.rewind, false) {
-                Err(std::io::Error::other("injected rewind failure"))
-            } else {
-                state
-                    .file
-                    .set_len(tail)
-                    .and_then(|()| state.file.sync_all())
-                    .and_then(|()| state.file.seek(SeekFrom::Start(tail)).map(|_| ()))
-            };
-            #[cfg(not(test))]
-            let rewound = state
-                .file
-                .set_len(tail)
-                .and_then(|()| state.file.sync_all())
-                .and_then(|()| state.file.seek(SeekFrom::Start(tail)).map(|_| ()));
-            // Poison on a rewind that failed OR that left the file shorter than the tail it
-            // was meant to restore: both mean the on-disk extent is no longer known good,
-            // and a successful truncation to the wrong length is the more dangerous of the
-            // two because it looks like a clean recovery.
-            let shorter_than_tail = match state.file.metadata() {
-                Ok(m) => m.len() < tail,
-                Err(_) => true,
-            };
-            state.poisoned = rewound.is_err() || shorter_than_tail;
-            return Err(e);
-        }
-
-        state.next_seq = state.next_seq.saturating_add(1);
-        state.first_seq.get_or_insert(seq);
-        state.last_marker = marker;
+        let seq = state.write_frame(marker, payload_len, &bytes)?;
+        state.sync()?;
         Ok(seq)
+    }
+
+    /// [`Wal::append`] without the sync. The frame is handed to the kernel before
+    /// this returns, so a process kill loses nothing; a power loss can lose it and
+    /// every frame after it until [`Wal::sync`] succeeds. Replay keeps the longest
+    /// valid prefix, so a loss is always a suffix, never a gap.
+    ///
+    /// # Errors
+    /// As [`Wal::append`], less the sync.
+    pub fn append_deferred<P: Serialize>(&self, payload: &P, marker: u64) -> Result<u64> {
+        let (bytes, payload_len) = encode_payload(payload)?;
+        self.inner.lock().write_frame(marker, payload_len, &bytes)
+    }
+
+    /// Make every frame written so far durable. A no-op when nothing is pending.
+    ///
+    /// # Errors
+    /// A poisoned WAL, or the fdatasync failure, which poisons it: the sync is
+    /// never retried, since a retry can report success over dropped pages.
+    pub fn sync(&self) -> Result<()> {
+        self.inner.lock().sync()
+    }
+
+    /// Byte length of `current.log` known durable.
+    pub fn synced_len(&self) -> u64 {
+        self.inner.lock().synced_len
     }
 
     /// All entries from the start of the file, in seq order.
@@ -251,9 +372,15 @@ impl Wal {
         self.inner.lock().next_seq
     }
 
-    /// Lowest seq `current.log` still holds, `None` when it holds nothing.
-    pub(crate) fn first_seq(&self) -> Option<u64> {
-        self.inner.lock().first_seq
+    /// Sync ahead of a seal and return `(next_seq, first_seq)` from the same lock
+    /// hold, so no deferred frame can land between the sync and the floor read.
+    /// Refuses only a failed sync, as [`Wal::archive`] does: a torn-append poison
+    /// is recovered by the seal that follows.
+    pub(crate) fn sync_for_seal(&self) -> Result<(u64, Option<u64>)> {
+        let mut state = self.inner.lock();
+        state.refuse_seal_after_failed_sync(&self.layout)?;
+        state.flush()?;
+        Ok((state.next_seq, state.first_seq))
     }
 
     /// Marker of the most recently appended entry.
@@ -276,10 +403,11 @@ impl Wal {
     ///
     /// # Errors
     /// [`PersistenceError::Invariant`] when `wal/archived/` already holds that
-    /// range, plus any I/O failure while syncing, renaming, or reopening.
+    /// range or an earlier sync failed, plus any I/O failure while syncing,
+    /// renaming, or reopening.
     pub fn archive(&self, from_seq: u64, to_seq: u64) -> Result<()> {
         let mut state = self.inner.lock();
-        state.file.sync_all()?;
+        state.refuse_seal_after_failed_sync(&self.layout)?;
         let target = self.layout.wal_archived_path(from_seq, to_seq);
         if std::fs::symlink_metadata(&target).is_ok() {
             return Err(PersistenceError::Invariant(format!(
@@ -291,6 +419,9 @@ impl Wal {
                 self.layout.root().display()
             )));
         }
+        // After the collision guard, so a refused seal leaves the log exactly as it
+        // was; the publish helper's power-loss test relies on that order.
+        state.flush()?;
         let archive_parent = match target.parent() {
             Some(p) => {
                 std::fs::create_dir_all(p)?;
@@ -305,9 +436,9 @@ impl Wal {
         let current = self.layout.wal_current_path();
         std::fs::rename(&current, &target)?;
         // Past the rename the log has moved on disk while `state.file` still holds the
-        // sealed inode. An early return here would leave appends writing and fsyncing
+        // sealed inode. An early return here would leave appends writing and syncing
         // into a file `replay()` never opens - it resolves `current.log` by path - so
-        // every fsync-acknowledged entry after it would be silently unreplayable.
+        // every acknowledged entry after it would be silently unreplayable.
         // Poison instead: a refused write beats an acknowledged one that is lost.
         #[cfg(test)]
         let reopened = if std::mem::replace(&mut state.faults.archive_reopen, false) {
@@ -323,6 +454,8 @@ impl Wal {
             Ok(new_file) => {
                 state.file = new_file;
                 state.first_seq = None;
+                state.len = 0;
+                state.synced_len = 0;
                 // a fresh file has no torn tail to be poisoned by
                 state.poisoned = false;
                 Ok(())
@@ -1188,8 +1321,9 @@ mod tests {
     }
 
     /// A successful archive CLEARS the flag, which is the only in-process route out of poison -
-    /// a reopen is the other, and it is a new process. Without it a WAL poisoned by a torn
-    /// append stays refusing every append after a clean seal.
+    /// a reopen is the other, and it is a new process. Production reaches it through
+    /// `advance_manifest_and_archive`. Without it a WAL poisoned by a torn append stays
+    /// refusing every append after a clean seal.
     #[test]
     fn a_successful_archive_clears_the_poison() {
         let (_d, layout) = make_layout();
@@ -1299,5 +1433,358 @@ mod tests {
             .expect("stat")
             .len();
         assert_eq!(before, after, "a refused append must not grow the file");
+    }
+
+    fn replayed_seqs(wal: &Wal) -> Vec<u64> {
+        wal.replay()
+            .expect("replay")
+            .entries
+            .iter()
+            .map(|e| e.seq)
+            .collect()
+    }
+
+    /// A failed sync poisons for good. Linux can drop the failed dirty pages and clear
+    /// the error, so a retried fsync reports success over lost data (fsyncgate); the
+    /// only honest answer to every later sync, append and seal is a refusal.
+    #[test]
+    fn a_failed_sync_poisons_and_is_never_retried_as_a_success() {
+        let (_d, layout) = make_layout();
+        let wal = Wal::open(&layout, None).expect("open");
+        wal.append(&test_payload(0), 1).expect("synced");
+        wal.append_deferred(&test_payload(1), 2).expect("deferred");
+
+        wal.inner.lock().faults.sync = true;
+        let err = wal
+            .sync()
+            .expect_err("the injected sync failure must surface");
+        assert!(matches!(err, PersistenceError::Io(_)), "got {err:?}");
+
+        let retried = wal
+            .sync()
+            .expect_err("a retried sync must be refused, never reported durable");
+        assert!(format!("{retried}").contains("poisoned"), "got {retried}");
+        let refused = wal
+            .append_deferred(&test_payload(2), 3)
+            .expect_err("a deferred append after a failed sync must be refused");
+        assert!(format!("{refused}").contains("poisoned"), "got {refused}");
+        wal.append(&test_payload(2), 3)
+            .expect_err("a synced append after a failed sync must be refused");
+        let sealed = wal
+            .archive(0, 1)
+            .expect_err("sealing would retry the failed sync as a success");
+        assert!(format!("{sealed}").contains("sync"), "got {sealed}");
+        assert_eq!(wal.next_seq(), 2, "refused appends burn no seq");
+        drop(wal);
+
+        let reopened = Wal::open(&layout, None).expect("a reopen is the recovery");
+        assert_eq!(replayed_seqs(&reopened), vec![0, 1]);
+        reopened
+            .append(&test_payload(2), 3)
+            .expect("appends work again after a reopen");
+    }
+
+    /// `append` is `append_deferred` plus `sync`, so a failed sync inside it poisons too.
+    #[test]
+    fn a_failed_sync_inside_append_poisons() {
+        let (_d, layout) = make_layout();
+        let wal = Wal::open(&layout, None).expect("open");
+        wal.inner.lock().faults.sync = true;
+        wal.append(&test_payload(0), 1)
+            .expect_err("the injected sync failure must surface");
+        wal.append(&test_payload(1), 2)
+            .expect_err("the log is poisoned after it");
+    }
+
+    /// Nothing is pending after a sync, so a second one does no I/O: an armed sync
+    /// fault is not consumed by it.
+    #[test]
+    fn a_sync_with_nothing_pending_is_a_no_op() {
+        let (_d, layout) = make_layout();
+        let wal = Wal::open(&layout, None).expect("open");
+        wal.append_deferred(&test_payload(0), 1).expect("deferred");
+        wal.sync().expect("sync");
+        let len = std::fs::metadata(layout.wal_current_path())
+            .expect("metadata")
+            .len();
+        assert_eq!(wal.synced_len(), len, "a sync covers every written byte");
+
+        wal.inner.lock().faults.sync = true;
+        wal.sync()
+            .expect("nothing pending, so no fdatasync is issued");
+        assert!(
+            wal.inner.lock().faults.sync,
+            "the fault must still be armed"
+        );
+    }
+
+    /// A reopened log may hold frames an earlier process wrote but never synced, so
+    /// the first sync after `open` must reach the disk rather than trust it clean.
+    #[test]
+    fn a_reopened_non_empty_log_is_synced_by_the_first_sync() {
+        let (_d, layout) = make_layout();
+        {
+            let wal = Wal::open(&layout, None).expect("open");
+            wal.append_deferred(&test_payload(0), 1).expect("deferred");
+        }
+        let reopened = Wal::open(&layout, None).expect("reopen");
+        assert_eq!(reopened.synced_len(), 0, "nothing is known durable yet");
+        reopened.inner.lock().faults.sync = true;
+        reopened
+            .sync()
+            .expect_err("the first sync must issue an fdatasync, and so meet the fault");
+    }
+
+    /// The rewind target is the tracked length, which `open` sets from the file. A
+    /// tracked length left at 0 after a reopen truncates every committed frame.
+    #[test]
+    fn a_failed_append_after_a_reopen_keeps_every_earlier_frame() {
+        let (_d, layout) = make_layout();
+        {
+            let wal = Wal::open(&layout, None).expect("open");
+            wal.append(&test_payload(0), 1).expect("synced");
+            wal.append_deferred(&test_payload(1), 2).expect("deferred");
+        }
+        let reopened = Wal::open(&layout, None).expect("reopen");
+        reopened
+            .append_deferred(&test_payload(2), 3)
+            .expect("deferred after reopen");
+        let len_before = std::fs::metadata(layout.wal_current_path())
+            .expect("metadata")
+            .len();
+
+        reopened.inner.lock().faults.frame_write = true;
+        reopened
+            .append_deferred(&test_payload(3), 4)
+            .expect_err("the injected failure must surface");
+
+        assert_eq!(
+            std::fs::metadata(layout.wal_current_path())
+                .expect("metadata")
+                .len(),
+            len_before
+        );
+        assert_eq!(replayed_seqs(&reopened), vec![0, 1, 2]);
+        assert_eq!(
+            reopened.synced_len(),
+            len_before,
+            "the rewind synced the log, so everything below it is durable"
+        );
+        let seq = reopened
+            .append(&test_payload(3), 4)
+            .expect("the log stays appendable");
+        assert_eq!(replayed_seqs(&reopened), vec![0, 1, 2, seq]);
+    }
+
+    /// `open` cuts a torn tail, and the tracked length must follow the cut: a length
+    /// read before it makes a later rewind grow the file past the last whole frame.
+    #[test]
+    fn a_failed_append_after_a_torn_tail_cut_rewinds_to_the_cut() {
+        let (_d, layout) = make_layout();
+        {
+            let wal = Wal::open(&layout, None).expect("open");
+            wal.append(&test_payload(0), 1).expect("first");
+            wal.append(&test_payload(1), 2).expect("second");
+        }
+        let whole = std::fs::metadata(layout.wal_current_path())
+            .expect("metadata")
+            .len();
+        {
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(layout.wal_current_path())
+                .expect("open append");
+            f.write_all(&[0xFF; 50]).expect("write garbage");
+        }
+        let reopened = Wal::open(&layout, None).expect("reopen cuts the torn tail");
+        assert_eq!(reopened.synced_len(), whole, "the cut was synced by open");
+
+        reopened.inner.lock().faults.frame_write = true;
+        reopened
+            .append(&test_payload(2), 3)
+            .expect_err("the injected failure must surface");
+        assert_eq!(
+            std::fs::metadata(layout.wal_current_path())
+                .expect("metadata")
+                .len(),
+            whole,
+            "the rewind target is the length after the cut"
+        );
+        let seq = reopened.append(&test_payload(2), 3).expect("appendable");
+        assert_eq!(replayed_seqs(&reopened), vec![0, 1, seq]);
+    }
+
+    /// `archive` starts a fresh file, so the tracked length must restart at 0. The
+    /// sealed file's length would make a rewind grow the new log with zeroes that
+    /// replay stops at, hiding every frame after them.
+    #[test]
+    fn a_failed_append_after_an_archive_keeps_every_earlier_frame() {
+        let (_d, layout) = make_layout();
+        let wal = Wal::open(&layout, None).expect("open");
+        for i in 0..3u32 {
+            wal.append(&test_payload(i), u64::from(i)).expect("append");
+        }
+        wal.archive(0, 2).expect("archive");
+        assert_eq!(wal.synced_len(), 0);
+        wal.append_deferred(&test_payload(3), 3).expect("deferred");
+        wal.append_deferred(&test_payload(4), 4).expect("deferred");
+        let len_before = std::fs::metadata(layout.wal_current_path())
+            .expect("metadata")
+            .len();
+
+        wal.inner.lock().faults.frame_write = true;
+        wal.append_deferred(&test_payload(5), 5)
+            .expect_err("the injected failure must surface");
+
+        assert_eq!(
+            std::fs::metadata(layout.wal_current_path())
+                .expect("metadata")
+                .len(),
+            len_before
+        );
+        let seq = wal.append(&test_payload(5), 5).expect("appendable");
+        assert_eq!(replayed_seqs(&wal), vec![3, 4, seq]);
+    }
+
+    /// A torn append poisons with no failed sync behind it, so a seal is still its
+    /// recovery; a failed sync blocks the seal, which would retry it.
+    #[test]
+    fn an_archive_after_a_sync_failure_is_refused_but_after_a_tear_it_seals() {
+        let (_d, layout) = make_layout();
+        let wal = Wal::open(&layout, None).expect("open");
+        wal.append(&test_payload(0), 1).expect("first");
+        wal.inner.lock().poisoned = true;
+        wal.archive(0, 0)
+            .expect("a torn-append poison has no failed sync behind it");
+
+        wal.append(&test_payload(1), 2).expect("fresh log");
+        wal.inner.lock().sync_failed = true;
+        wal.archive(1, 1)
+            .expect_err("a failed sync must block the seal");
+        assert!(layout.wal_current_path().is_file(), "the log did not move");
+    }
+
+    /// `archive` syncs before it seals, so a sync that fails there refuses the seal
+    /// and leaves the unsynced frames in `current.log` rather than sealing them.
+    #[test]
+    fn an_archive_whose_sync_fails_does_not_seal() {
+        let (_d, layout) = make_layout();
+        let wal = Wal::open(&layout, None).expect("open");
+        wal.append(&test_payload(0), 1).expect("synced");
+        wal.append_deferred(&test_payload(1), 2).expect("deferred");
+        let len = std::fs::metadata(layout.wal_current_path())
+            .expect("metadata")
+            .len();
+
+        wal.inner.lock().faults.sync = true;
+        let err = wal
+            .archive(0, 1)
+            .expect_err("the seal must not outrun a failed sync");
+        assert!(matches!(err, PersistenceError::Io(_)), "got {err:?}");
+        assert!(wal.inner.lock().sync_failed, "the failure poisons for good");
+        assert!(
+            std::fs::symlink_metadata(layout.wal_archived_path(0, 1)).is_err(),
+            "nothing was sealed"
+        );
+        assert_eq!(
+            std::fs::metadata(layout.wal_current_path())
+                .expect("the log did not move")
+                .len(),
+            len
+        );
+        assert_eq!(replayed_seqs(&wal), vec![0, 1]);
+    }
+
+    fn manifest_at(replay_floor: u64) -> crate::Manifest {
+        crate::Manifest {
+            schema_version: crate::MANIFEST_SCHEMA_VERSION,
+            scheme_tag: "test-scheme".to_owned(),
+            instance_id: "test-instance".to_owned(),
+            current_snapshot_id: crate::SnapshotId(0),
+            current_snapshot_seq: replay_floor,
+            current_marker: 0,
+            encoder_label: "test-encoder".to_owned(),
+            prev_encoder_label: None,
+            entry_size_bytes: Some(32),
+            rows_per_shard: Some(2048),
+        }
+    }
+
+    fn point_at(m: &mut crate::Manifest, id: crate::SnapshotId, floor: u64) {
+        m.current_snapshot_id = id;
+        m.current_snapshot_seq = floor;
+    }
+
+    /// A tear whose rewind failed poisons with no failed sync behind it. The commit
+    /// still seals the log, which excludes the torn frame and clears the poison;
+    /// refusing it would turn a recoverable tear into an outage until restart.
+    #[test]
+    fn a_commit_seals_a_log_a_torn_append_poisoned() {
+        let (_d, layout) = make_layout();
+        let wal = Wal::open(&layout, None).expect("open");
+        wal.append(&test_payload(0), 1).expect("first");
+        wal.append_deferred(&test_payload(1), 2).expect("second");
+        {
+            let mut state = wal.inner.lock();
+            state.faults.frame_write = true;
+            state.faults.rewind = true;
+        }
+        wal.append_deferred(&test_payload(2), 3)
+            .expect_err("the injected tear must surface");
+        assert!(wal.inner.lock().poisoned);
+
+        let mut manifest = manifest_at(0);
+        crate::advance_manifest_and_archive(
+            &layout,
+            &wal,
+            &mut manifest,
+            crate::SnapshotId(1),
+            point_at,
+        )
+        .expect("a torn-append poison is recovered by the seal");
+
+        let on_disk = crate::Manifest::load(&layout)
+            .expect("load")
+            .expect("the manifest landed");
+        assert_eq!(
+            on_disk.current_snapshot_seq, 2,
+            "the floor excludes the tear"
+        );
+        assert!(layout.wal_archived_path(0, 1).is_file());
+        assert!(!wal.inner.lock().poisoned, "the seal cleared the poison");
+        assert_eq!(wal.append(&test_payload(2), 3).expect("appendable"), 2);
+    }
+
+    /// After a failed sync the durable tail is unknown, so a commit must refuse
+    /// before the manifest records a floor the disk may not hold.
+    #[test]
+    fn a_commit_after_a_failed_sync_writes_no_manifest() {
+        let (_d, layout) = make_layout();
+        let wal = Wal::open(&layout, None).expect("open");
+        wal.append(&test_payload(0), 1).expect("synced");
+        wal.append_deferred(&test_payload(1), 2).expect("deferred");
+        wal.inner.lock().faults.sync = true;
+        wal.sync()
+            .expect_err("the injected sync failure must surface");
+
+        let mut manifest = manifest_at(0);
+        let err = crate::advance_manifest_and_archive(
+            &layout,
+            &wal,
+            &mut manifest,
+            crate::SnapshotId(1),
+            point_at,
+        )
+        .expect_err("a commit over a failed sync must be refused");
+        assert!(format!("{err}").contains("sync"), "got {err}");
+        assert!(
+            crate::Manifest::load(&layout).expect("load").is_none(),
+            "no manifest may be written"
+        );
+        assert_eq!(
+            manifest.current_snapshot_seq, 0,
+            "the caller's copy is untouched"
+        );
+        assert_eq!(replayed_seqs(&wal), vec![0, 1], "the log did not move");
     }
 }

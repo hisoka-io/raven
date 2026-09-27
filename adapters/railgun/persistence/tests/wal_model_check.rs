@@ -1,9 +1,11 @@
 //! Property tests for the WAL recovery path: random truncation must preserve intact-prefix semantics.
-//! 100 trials x 3 seeds; runs in CI.
+//! Runs in CI. Truncation models a power loss, so the property holds for synced and deferred
+//! appends alike; the deferred twins carry the case count because they skip a fsync per frame.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use proptest::prelude::*;
+use proptest::test_runner::TestCaseError;
 use raven_railgun_persistence::{PpoiEventType, StoreLayout, Wal, WalEntryPayload};
 
 fn payload_strategy() -> impl Strategy<Value = WalEntryPayload> {
@@ -40,6 +42,188 @@ fn payload_strategy() -> impl Strategy<Value = WalEntryPayload> {
     ]
 }
 
+/// Synced appends, or deferred appends with one sync at the end.
+#[derive(Clone, Copy, Debug)]
+enum Mode {
+    Synced,
+    Deferred,
+}
+
+fn append(wal: &Wal, mode: Mode, payload: &WalEntryPayload, marker: u64) -> u64 {
+    match mode {
+        Mode::Synced => wal.append(payload, marker).expect("append"),
+        Mode::Deferred => wal
+            .append_deferred(payload, marker)
+            .expect("append_deferred"),
+    }
+}
+
+fn check_random_truncate(
+    payloads: &[WalEntryPayload],
+    cut_fraction: u32,
+    mode: Mode,
+) -> Result<(), TestCaseError> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let layout = StoreLayout::open(dir.path()).expect("open");
+    let path = layout.wal_current_path();
+
+    // Both append kinds write each frame with one `write(2)`, so the file length after
+    // either IS that frame's end offset. Recording it here makes the survivor count
+    // below an independent oracle instead of a restatement of whatever `replay` chose
+    // to return.
+    let wal = Wal::open(&layout, None).expect("open wal");
+    let mut written = Vec::new();
+    for (i, p) in payloads.iter().enumerate() {
+        let block_height = u64::try_from(i).unwrap_or(0) * 10 + 100;
+        let seq = append(&wal, mode, p, block_height);
+        let frame_end = std::fs::metadata(&path).expect("meta").len();
+        written.push((seq, block_height, p.clone(), frame_end));
+    }
+    wal.sync().expect("sync");
+    drop(wal);
+
+    let total = std::fs::metadata(&path).expect("meta").len();
+    let cut_at = total * u64::from(cut_fraction) / 1000;
+    {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open write");
+        f.set_len(cut_at).expect("set_len");
+        f.sync_all().expect("sync");
+    }
+
+    // Every whole frame below the cut must come back, and nothing above it may.
+    let expected_len = written.iter().filter(|row| row.3 <= cut_at).count();
+
+    let wal2 = Wal::open(&layout, None).expect("reopen after truncate");
+    let replay = wal2.replay().expect("replay");
+
+    prop_assert_eq!(
+        replay.entries.len(),
+        expected_len,
+        "cut at {} of {} bytes keeps {} whole frames; replay returned {}",
+        cut_at,
+        total,
+        expected_len,
+        replay.entries.len()
+    );
+    for (i, recovered) in replay.entries.iter().enumerate() {
+        let row = written.get(i).expect("written index in range");
+        prop_assert_eq!(recovered.seq, row.0);
+        prop_assert_eq!(recovered.marker, row.1);
+        let parsed: WalEntryPayload = bincode::deserialize(&recovered.payload).expect("deser");
+        prop_assert_eq!(&parsed, &row.2);
+    }
+
+    // `open` rewinds the torn tail, so the log it hands back has no gap left in it.
+    prop_assert_eq!(replay.truncated_at, None);
+    prop_assert_eq!(replay.next_seq, expected_len as u64);
+    prop_assert_eq!(wal2.next_seq(), expected_len as u64);
+
+    // A recovered log must still be writable, at the seq the survivors end on.
+    let appended = append(
+        &wal2,
+        mode,
+        &WalEntryPayload::Heartbeat {
+            wallclock_unix_ms: 1,
+        },
+        u64::MAX,
+    );
+    prop_assert_eq!(appended, expected_len as u64);
+    Ok(())
+}
+
+fn check_archive_then_truncate(
+    before: &[WalEntryPayload],
+    after: &[WalEntryPayload],
+    cut_fraction: u32,
+    mode: Mode,
+) -> Result<(), TestCaseError> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let layout = StoreLayout::open(dir.path()).expect("open");
+    let path = layout.wal_current_path();
+
+    let wal = Wal::open(&layout, None).expect("open wal");
+    for (i, p) in before.iter().enumerate() {
+        append(&wal, mode, p, u64::try_from(i).unwrap_or(0) * 10 + 100);
+    }
+    let sealed_bytes = std::fs::metadata(&path).expect("meta").len();
+    let last_archived_seq = wal.next_seq().saturating_sub(1);
+    let from_seq = 0;
+    wal.archive(from_seq, last_archived_seq).expect("archive");
+
+    // The seal is a rename, so the archived file must hold every sealed byte. A
+    // path-exists check passes just as well over an empty or half-copied file.
+    let archived = layout.wal_archived_path(from_seq, last_archived_seq);
+    prop_assert_eq!(
+        std::fs::metadata(&archived).expect("archived meta").len(),
+        sealed_bytes
+    );
+    prop_assert_eq!(std::fs::metadata(&path).expect("current meta").len(), 0);
+
+    let mut written = Vec::new();
+    for (i, p) in after.iter().enumerate() {
+        let marker = u64::try_from(i).unwrap_or(0) * 10 + 1000;
+        let seq = append(&wal, mode, p, marker);
+        let frame_end = std::fs::metadata(&path).expect("meta").len();
+        written.push((seq, marker, p.clone(), frame_end));
+    }
+    wal.sync().expect("sync");
+    drop(wal);
+
+    let total = std::fs::metadata(&path).expect("meta").len();
+    let cut_at = total * u64::from(cut_fraction) / 1000;
+    {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open");
+        f.set_len(cut_at).expect("set_len");
+        f.sync_all().expect("sync");
+    }
+
+    // Truncating current.log must not reach the sealed range at all.
+    prop_assert_eq!(
+        std::fs::metadata(&archived).expect("archived meta").len(),
+        sealed_bytes
+    );
+
+    let expected_len = written.iter().filter(|row| row.3 <= cut_at).count();
+    let wal2 = Wal::open(&layout, Some(last_archived_seq)).expect("reopen");
+    let replay = wal2.replay().expect("replay");
+
+    prop_assert_eq!(replay.entries.len(), expected_len);
+    prop_assert_eq!(replay.truncated_at, None);
+    for (i, recovered) in replay.entries.iter().enumerate() {
+        let row = written.get(i).expect("written index in range");
+        // Post-archive seqs continue past the sealed range; restarting them at 0
+        // would make replay read the survivors as a torn tail.
+        prop_assert_eq!(recovered.seq, row.0);
+        prop_assert!(recovered.seq > last_archived_seq);
+        prop_assert_eq!(recovered.marker, row.1);
+        let parsed: WalEntryPayload = bincode::deserialize(&recovered.payload).expect("deser");
+        prop_assert_eq!(&parsed, &row.2);
+    }
+
+    // The resume floor is the sealed tail, so the next append lands above it whether
+    // or not anything in current.log survived.
+    let expected_next = last_archived_seq
+        .saturating_add(1)
+        .saturating_add(expected_len as u64);
+    prop_assert_eq!(wal2.next_seq(), expected_next);
+    let appended = append(
+        &wal2,
+        mode,
+        &WalEntryPayload::Heartbeat {
+            wallclock_unix_ms: 2,
+        },
+        u64::MAX,
+    );
+    prop_assert_eq!(appended, expected_next);
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 100,
@@ -51,68 +235,7 @@ proptest! {
         payloads in prop::collection::vec(payload_strategy(), 1..50),
         cut_fraction in 0u32..=1000u32,
     ) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let layout = StoreLayout::open(dir.path()).expect("open");
-        let path = layout.wal_current_path();
-
-        // `append` fsyncs each frame, so the file length after it IS that frame's end
-        // offset. Recording it here makes the survivor count below an independent oracle
-        // instead of a restatement of whatever `replay` chose to return.
-        let wal = Wal::open(&layout, None).expect("open wal");
-        let mut written = Vec::new();
-        for (i, p) in payloads.iter().enumerate() {
-            let block_height = u64::try_from(i).unwrap_or(0) * 10 + 100;
-            let seq = wal.append(p, block_height).expect("append");
-            let frame_end = std::fs::metadata(&path).expect("meta").len();
-            written.push((seq, block_height, p.clone(), frame_end));
-        }
-        drop(wal);
-
-        let total = std::fs::metadata(&path).expect("meta").len();
-        let cut_at = total * u64::from(cut_fraction) / 1000;
-        {
-            let f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .expect("open write");
-            f.set_len(cut_at).expect("set_len");
-            f.sync_all().expect("sync");
-        }
-
-        // Every whole frame below the cut must come back, and nothing above it may.
-        let expected_len = written.iter().filter(|row| row.3 <= cut_at).count();
-
-        let wal2 = Wal::open(&layout, None).expect("reopen after truncate");
-        let replay = wal2.replay().expect("replay");
-
-        prop_assert_eq!(
-            replay.entries.len(),
-            expected_len,
-            "cut at {} of {} bytes keeps {} whole frames; replay returned {}",
-            cut_at,
-            total,
-            expected_len,
-            replay.entries.len()
-        );
-        for (i, recovered) in replay.entries.iter().enumerate() {
-            let row = written.get(i).expect("written index in range");
-            prop_assert_eq!(recovered.seq, row.0);
-            prop_assert_eq!(recovered.marker, row.1);
-            let parsed: WalEntryPayload =
-                bincode::deserialize(&recovered.payload).expect("deser");
-            prop_assert_eq!(&parsed, &row.2);
-        }
-
-        // `open` rewinds the torn tail, so the log it hands back has no gap left in it.
-        prop_assert_eq!(replay.truncated_at, None);
-        prop_assert_eq!(replay.next_seq, expected_len as u64);
-        prop_assert_eq!(wal2.next_seq(), expected_len as u64);
-
-        // A recovered log must still be writable, at the seq the survivors end on.
-        let appended = wal2
-            .append(&WalEntryPayload::Heartbeat { wallclock_unix_ms: 1 }, u64::MAX)
-            .expect("append after recovery");
-        prop_assert_eq!(appended, expected_len as u64);
+        check_random_truncate(&payloads, cut_fraction, Mode::Synced)?;
     }
 
     #[test]
@@ -121,81 +244,23 @@ proptest! {
         after in prop::collection::vec(payload_strategy(), 1..20),
         cut_fraction in 0u32..=1000u32,
     ) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let layout = StoreLayout::open(dir.path()).expect("open");
-        let path = layout.wal_current_path();
+        check_archive_then_truncate(&before, &after, cut_fraction, Mode::Synced)?;
+    }
 
-        let wal = Wal::open(&layout, None).expect("open wal");
-        for (i, p) in before.iter().enumerate() {
-            wal.append(p, u64::try_from(i).unwrap_or(0) * 10 + 100).expect("append");
-        }
-        let sealed_bytes = std::fs::metadata(&path).expect("meta").len();
-        let last_archived_seq = wal.next_seq().saturating_sub(1);
-        let from_seq = 0;
-        wal.archive(from_seq, last_archived_seq).expect("archive");
+    #[test]
+    fn random_truncate_preserves_prefix_with_deferred_appends(
+        payloads in prop::collection::vec(payload_strategy(), 1..50),
+        cut_fraction in 0u32..=1000u32,
+    ) {
+        check_random_truncate(&payloads, cut_fraction, Mode::Deferred)?;
+    }
 
-        // The seal is a rename, so the archived file must hold every sealed byte. A
-        // path-exists check passes just as well over an empty or half-copied file.
-        let archived = layout.wal_archived_path(from_seq, last_archived_seq);
-        prop_assert_eq!(
-            std::fs::metadata(&archived).expect("archived meta").len(),
-            sealed_bytes
-        );
-        prop_assert_eq!(std::fs::metadata(&path).expect("current meta").len(), 0);
-
-        let mut written = Vec::new();
-        for (i, p) in after.iter().enumerate() {
-            let marker = u64::try_from(i).unwrap_or(0) * 10 + 1000;
-            let seq = wal.append(p, marker).expect("append");
-            let frame_end = std::fs::metadata(&path).expect("meta").len();
-            written.push((seq, marker, p.clone(), frame_end));
-        }
-        drop(wal);
-
-        let total = std::fs::metadata(&path).expect("meta").len();
-        let cut_at = total * u64::from(cut_fraction) / 1000;
-        {
-            let f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .expect("open");
-            f.set_len(cut_at).expect("set_len");
-            f.sync_all().expect("sync");
-        }
-
-        // Truncating current.log must not reach the sealed range at all.
-        prop_assert_eq!(
-            std::fs::metadata(&archived).expect("archived meta").len(),
-            sealed_bytes
-        );
-
-        let expected_len = written.iter().filter(|row| row.3 <= cut_at).count();
-        let wal2 = Wal::open(&layout, Some(last_archived_seq)).expect("reopen");
-        let replay = wal2.replay().expect("replay");
-
-        prop_assert_eq!(replay.entries.len(), expected_len);
-        prop_assert_eq!(replay.truncated_at, None);
-        for (i, recovered) in replay.entries.iter().enumerate() {
-            let row = written.get(i).expect("written index in range");
-            // Post-archive seqs continue past the sealed range; restarting them at 0
-            // would make replay read the survivors as a torn tail.
-            prop_assert_eq!(recovered.seq, row.0);
-            prop_assert!(recovered.seq > last_archived_seq);
-            prop_assert_eq!(recovered.marker, row.1);
-            let parsed: WalEntryPayload =
-                bincode::deserialize(&recovered.payload).expect("deser");
-            prop_assert_eq!(&parsed, &row.2);
-        }
-
-        // The resume floor is the sealed tail, so the next append lands above it whether
-        // or not anything in current.log survived.
-        let expected_next = last_archived_seq
-            .saturating_add(1)
-            .saturating_add(expected_len as u64);
-        prop_assert_eq!(wal2.next_seq(), expected_next);
-        let appended = wal2
-            .append(&WalEntryPayload::Heartbeat { wallclock_unix_ms: 2 }, u64::MAX)
-            .expect("append after recovery");
-        prop_assert_eq!(appended, expected_next);
+    #[test]
+    fn archive_then_truncate_preserves_archived_with_deferred_appends(
+        before in prop::collection::vec(payload_strategy(), 1..20),
+        after in prop::collection::vec(payload_strategy(), 1..20),
+        cut_fraction in 0u32..=1000u32,
+    ) {
+        check_archive_then_truncate(&before, &after, cut_fraction, Mode::Deferred)?;
     }
 }
