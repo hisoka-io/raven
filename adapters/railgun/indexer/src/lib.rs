@@ -1125,12 +1125,11 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
                         .await?;
                     hash_cache.retain(|&block, _| block <= height);
                     cursor = config.configured_start_block.max(cursor.min(height));
-                    let first_replayed = height.saturating_add(1);
-                    for floor in config.per_tree_start_blocks.values_mut() {
-                        *floor = config
-                            .configured_start_block
-                            .max((*floor).min(first_replayed));
-                    }
+                    lower_tree_floors_for_reorg(
+                        &mut config.per_tree_start_blocks,
+                        config.configured_start_block,
+                        height,
+                    );
                     persist_reorg_window_best_effort(path, &hash_cache);
                 }
                 // A missing resume hash would defer reconciliation until after serving starts.
@@ -1235,6 +1234,11 @@ impl<S: ChainSource + std::fmt::Debug> IndexerWorker<S> {
                     }
                     hash_cache.retain(|&n, _| n <= height);
                     cursor = height;
+                    lower_tree_floors_for_reorg(
+                        &mut config.per_tree_start_blocks,
+                        config.configured_start_block,
+                        height,
+                    );
                     if let Some(path) = config.reorg_window_path.as_ref() {
                         persist_reorg_window_best_effort(path, &hash_cache);
                     }
@@ -1674,6 +1678,20 @@ pub fn build_indexer_channel() -> (
     tokio::sync::mpsc::Receiver<IndexerMessage>,
 ) {
     tokio::sync::mpsc::channel(1024)
+}
+
+/// After a rewind to `height`, no tree's floor may sit above the first rescanned block: the
+/// consumers drop what they hold past `height`, so a floor left higher would filter out the
+/// replayed events that restore it and wedge the tree on its next leaf.
+fn lower_tree_floors_for_reorg(
+    floors: &mut std::collections::BTreeMap<u32, u64>,
+    configured_start_block: u64,
+    height: u64,
+) {
+    let first_replayed = height.saturating_add(1);
+    for floor in floors.values_mut() {
+        *floor = configured_start_block.max((*floor).min(first_replayed));
+    }
 }
 
 /// Layer 1 reorg detection, bounded to `max_depth_blocks` below `cursor`.

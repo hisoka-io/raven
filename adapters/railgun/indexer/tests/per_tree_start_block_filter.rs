@@ -52,6 +52,12 @@ impl PerTreeMockSource {
         let mut g = self.inner.lock().expect("lock");
         g.events.entry(n).or_default().push(ev);
     }
+    fn replace_hashes(&self, from: u64, to: u64, hash: [u8; 32]) {
+        let mut g = self.inner.lock().expect("lock");
+        for n in from..=to {
+            g.chain.insert(n, hash);
+        }
+    }
 }
 
 #[async_trait]
@@ -487,5 +493,91 @@ async fn indexer_passes_through_unshield_events_unconditionally() {
         received_blocks,
         vec![1, 6],
         "Unshield events must pass through; got {received_blocks:?}"
+    );
+}
+
+/// A runtime reorg below a tree's startup floor rewinds that tree's store past the floor, so the
+/// rescan must deliver the tree's events between the reorg height and the old floor again. A
+/// floor left where startup put it drops them, and the tree's next leaf is out of order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runtime_reorg_below_a_tree_floor_redelivers_the_rewound_blocks() {
+    const FLOOR: u64 = 25;
+    const SURVIVING_TIP: u64 = 20;
+    let src = Arc::new(PerTreeMockSource::new());
+    for n in 0..=40u64 {
+        src.add_block(n, [u8::try_from(n & 0xff).expect("byte"); 32]);
+    }
+    src.add_event(22, shield(0, 22, 0));
+    src.add_event(27, shield(0, 27, 1));
+
+    let (tx, mut rx) = mpsc::channel::<IndexerMessage>(256);
+    let worker = IndexerWorker::new(Arc::clone(&src), tx);
+    let cfg = IndexerWorkerConfig {
+        start_block: 0,
+        poll_interval_secs: 1,
+        chunk_blocks: 10,
+        per_tree_start_blocks: BTreeMap::from([(0, FLOOR)]),
+        ..IndexerWorkerConfig::default()
+    };
+    let join = tokio::spawn(async move { worker.run(cfg).await });
+
+    let shield_block = |message: &IndexerMessage| match message {
+        IndexerMessage::Event {
+            event: RailgunEvent::Shield { block_number, .. },
+            ..
+        } => Some(*block_number),
+        _ => None,
+    };
+    let mut before = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let message = tokio::time::timeout(remaining, rx.recv())
+            .await
+            .expect("the scan never reached block 40")
+            .expect("worker hung up");
+        before.extend(shield_block(&message));
+        if matches!(
+            message,
+            IndexerMessage::Heartbeat {
+                scanned_through_block: 40,
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+    assert_eq!(
+        before,
+        [27],
+        "fixture: block 22 sits below the startup floor"
+    );
+
+    src.replace_hashes(SURVIVING_TIP + 1, 40, [0xee; 32]);
+    let mut reorged_to = None;
+    let mut after = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !after.contains(&27) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let message = tokio::time::timeout(remaining, rx.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("no rescan through block 27; reorg {reorged_to:?}, got {after:?}")
+            })
+            .expect("worker hung up");
+        if let IndexerMessage::Reorg { height } = message {
+            reorged_to = Some(height);
+        } else if reorged_to.is_some() {
+            after.extend(shield_block(&message));
+        }
+    }
+    drop(rx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), join).await;
+
+    assert_eq!(reorged_to, Some(SURVIVING_TIP));
+    assert_eq!(
+        after,
+        [22, 27],
+        "every event past the reorg height is delivered again, the floor notwithstanding"
     );
 }

@@ -5,6 +5,7 @@
 //! So a full page is followed at the backfill setting and every other page waits the poll.
 //! Separately, a row nothing downstream can hold must stop the feed, not pass under an
 //! advancing cursor.
+//! And a worker waiting out a poll stops as soon as the engine hangs up.
 
 #![allow(
     clippy::expect_used,
@@ -390,4 +391,35 @@ async fn a_feed_booted_past_an_unheld_row_names_that_row() {
     );
     assert!(upstream.asked().is_empty(), "{:?}", upstream.asked());
     assert!(rx.try_recv().is_err());
+}
+
+/// A worker waiting out a 30 s poll notices the engine hanging up at once, not a poll later, so
+/// a graceful shutdown is not held for the rest of the interval.
+#[tokio::test]
+async fn a_closed_channel_ends_the_poll_wait_at_once() {
+    let (endpoint, upstream) = serve(Upstream::holding_through(4)).await;
+    let (tx, mut rx) = mpsc::channel(64);
+    let status = FeedStatus::default();
+    let worker = tokio::spawn(mirror(&endpoint, 30, 10, None).run_feed(
+        LIST,
+        0,
+        |cursor| cursor..u64::MAX,
+        status.clone(),
+        tx,
+    ));
+    leaves_through(&mut rx, 4, Duration::from_secs(10)).await;
+    requests_made(&upstream, 1, Duration::from_secs(10)).await;
+
+    drop(rx);
+    let outcome = tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("the worker must stop without waiting out the poll")
+        .expect("worker task");
+    assert!(outcome.is_ok(), "{outcome:?}");
+    assert_eq!(
+        upstream.asked(),
+        [page(0, 9)],
+        "no request after the hang-up"
+    );
+    assert!(status.snapshot().stopped.is_some());
 }

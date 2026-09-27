@@ -120,7 +120,7 @@ async fn worker_default_page_emits_index_500_without_exceeding_the_cap() {
         .expect("mirror"),
     );
     let (tx, mut rx) = tokio::sync::mpsc::channel(1_100);
-    let worker = tokio::spawn(async move { mirror.run_worker(ListKey([0x43; 32]), 0, tx).await });
+    let worker = tokio::spawn(async move { mirror.run_worker(ListKey([0x45; 32]), 0, tx).await });
 
     let last_index = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
@@ -144,6 +144,53 @@ async fn worker_default_page_emits_index_500_without_exceeding_the_cap() {
         .expect("captured params");
     assert_eq!(params.get("startIndex"), Some(&json!(501)));
     assert_eq!(params.get("endIndex"), Some(&json!(1001)));
+    worker.abort();
+    server.abort();
+}
+
+/// A default page missing row 250 is taken through 249 only, and the next page starts at 250,
+/// still within the 501-row cap.
+#[tokio::test]
+async fn worker_default_page_missing_a_row_is_asked_again_from_that_row() {
+    let (endpoint, captured, server) = start_json_rpc().await;
+    let mirror = Arc::new(
+        UpstreamPpoiMirror::new(MirrorConfig {
+            endpoint,
+            poll_interval_secs: 1,
+            ..MirrorConfig::default()
+        })
+        .expect("mirror"),
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1_100);
+    let worker = tokio::spawn(async move { mirror.run_worker(ListKey([0x43; 32]), 0, tx).await });
+
+    let mut emitted = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while emitted.len() < 250 {
+            let (payload, _) = rx.recv().await.expect("worker channel");
+            if let WalEntryPayload::PpoiListLeafAdded { list_index, .. } = payload {
+                emitted.push(list_index);
+            }
+        }
+    })
+    .await
+    .expect("worker must emit the rows below the missing one");
+    assert_eq!(emitted, (0..250).collect::<Vec<u32>>());
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    while let Ok((payload, _)) = rx.try_recv() {
+        assert!(
+            !matches!(payload, WalEntryPayload::PpoiListLeafAdded { .. }),
+            "nothing past the missing row is sent: {payload:?}"
+        );
+    }
+    let request = captured.0.lock();
+    let params = request
+        .as_ref()
+        .and_then(|request| request.get("params"))
+        .expect("captured params");
+    assert_eq!(params.get("startIndex"), Some(&json!(250)));
+    assert_eq!(params.get("endIndex"), Some(&json!(750)));
     worker.abort();
     server.abort();
 }

@@ -193,7 +193,9 @@ fn parse_subsquid_bignum(v: &serde_json::Value) -> Option<u64> {
 /// HTTP client against a real subsquid GraphQL endpoint.
 pub struct SubsquidClient {
     endpoint: String,
-    http: reqwest::Client,
+    /// The bounded client, or why it could not be built. There is no unbounded fallback: a
+    /// stalled gateway would hang the caller for good.
+    http: core::result::Result<reqwest::Client, String>,
 }
 
 impl std::fmt::Debug for SubsquidClient {
@@ -205,18 +207,30 @@ impl std::fmt::Debug for SubsquidClient {
 }
 
 impl SubsquidClient {
+    /// A client whose every request is bounded by [`SUBSQUID_REQUEST_TIMEOUT`]. If that client
+    /// cannot be built, every query refuses with [`SubsquidError::Http`] rather than running
+    /// unbounded.
     pub fn new(endpoint: impl Into<String>) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(SUBSQUID_REQUEST_TIMEOUT)
-            .connect_timeout(SUBSQUID_REQUEST_TIMEOUT)
-            .build()
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    error = %e,
-                    "reqwest builder failed for SubsquidClient; falling back to Client::new() (no timeout)"
-                );
-                reqwest::Client::new()
-            });
+        Self::new_with_build(endpoint, |builder| {
+            builder.build().map_err(|error| error.to_string())
+        })
+    }
+
+    fn new_with_build(
+        endpoint: impl Into<String>,
+        build: impl FnOnce(reqwest::ClientBuilder) -> core::result::Result<reqwest::Client, String>,
+    ) -> Self {
+        let http = build(
+            reqwest::Client::builder()
+                .timeout(SUBSQUID_REQUEST_TIMEOUT)
+                .connect_timeout(SUBSQUID_REQUEST_TIMEOUT),
+        );
+        if let Err(reason) = &http {
+            tracing::error!(
+                %reason,
+                "SubsquidClient could not build its bounded HTTP client; every query will refuse"
+            );
+        }
         Self {
             endpoint: endpoint.into(),
             http,
@@ -238,8 +252,11 @@ impl SubsquidRootSource for SubsquidClient {
                 "block": block_height,
             },
         });
-        let resp = self
+        let http = self
             .http
+            .as_ref()
+            .map_err(|reason| SubsquidError::Http(format!("no bounded HTTP client: {reason}")))?;
+        let resp = http
             .post(&self.endpoint)
             .json(&body)
             .send()
@@ -321,6 +338,21 @@ mod tests {
             .block_on(fixture.commitment_root_at_height(0, 100))
             .expect("present");
         assert_eq!(resp.root, [2u8; 32]);
+    }
+
+    #[test]
+    fn a_client_that_cannot_be_bounded_refuses_every_query() {
+        let client = SubsquidClient::new_with_build("http://127.0.0.1:9/graphql", |_| {
+            Err("synthetic reqwest build failure".to_owned())
+        });
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let err = rt
+            .block_on(client.commitment_root_at_height(0, 100))
+            .expect_err("an unbounded query must not run");
+        assert!(
+            matches!(&err, SubsquidError::Http(reason) if reason.contains("synthetic reqwest build failure")),
+            "{err:?}"
+        );
     }
 
     #[test]

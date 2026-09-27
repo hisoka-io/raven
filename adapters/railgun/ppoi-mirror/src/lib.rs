@@ -90,6 +90,10 @@ pub enum PreflightFailure {
     /// Answered rows the worker's decoder refuses.
     #[error("answered rows the mirror cannot ingest")]
     UndecodableRows,
+    /// Answered a page missing the row at `.0`; the rows below it were taken and it is asked
+    /// for again.
+    #[error("answered a page without row {0}")]
+    MissingRow(u64),
 }
 
 /// A refused [`UpstreamPpoiMirror::preflight`].
@@ -379,6 +383,25 @@ impl FeedStatus {
         progress.last_answer = Some(std::time::Instant::now());
     }
 
+    /// Upstream answered, but left out the row at `missing`: the rows below it were delivered, and
+    /// the page says nothing of upstream's size.
+    fn answered_short_of(&self, next_index: u64, delivered: usize, missing: u64) {
+        tracing::warn!(
+            missing,
+            "ppoi mirror: upstream page left out a row; took the rows below it and will ask for \
+             it again"
+        );
+        let mut progress = self.progress();
+        progress.next_index = next_index;
+        progress.rows_delivered = progress
+            .rows_delivered
+            .saturating_add(u64::try_from(delivered).unwrap_or(u64::MAX));
+        progress.upstream_rows = None;
+        progress.consecutive_failures = progress.consecutive_failures.saturating_add(1);
+        progress.last_failure = Some(PreflightFailure::MissingRow(missing));
+        progress.last_answer = Some(std::time::Instant::now());
+    }
+
     fn stopped(&self, reason: String) {
         self.progress().stopped = Some(reason);
     }
@@ -608,7 +631,8 @@ impl UpstreamPpoiMirror {
     ///
     /// [`MirrorError::Unheld`] at an empty span, naming the span's start, which can lie below
     /// the cursor; otherwise only non-recoverable failures. A failed request is counted in
-    /// `status` and retried at the poll interval.
+    /// `status` and retried at the poll interval, and so is a page that leaves out a row, once
+    /// the rows below that row are delivered.
     pub async fn run_feed<F>(
         self: std::sync::Arc<Self>,
         list: ListKey,
@@ -650,14 +674,18 @@ impl UpstreamPpoiMirror {
         let mut pause = Duration::ZERO;
         let mut asked_at = Instant::now();
         loop {
-            // Measured from the previous request, so the setting bounds the request rate.
-            sleep(pause.saturating_sub(asked_at.elapsed())).await;
+            // Measured from the previous request, so the setting bounds the request rate. A closed
+            // channel ends the wait, so shutdown is not held for a poll interval.
+            tokio::select! {
+                biased;
+                () = sender.closed() => {
+                    tracing::info!(cursor, "ppoi mirror worker exiting; channel closed");
+                    return Ok(());
+                }
+                () = sleep(pause.saturating_sub(asked_at.elapsed())) => {}
+            }
             asked_at = Instant::now();
             pause = poll;
-            if sender.is_closed() {
-                tracing::info!(cursor, "ppoi mirror worker exiting; channel closed");
-                return Ok(());
-            }
             let wanted = span(cursor);
             if wanted.start > cursor {
                 cursor = wanted.start;
@@ -677,7 +705,7 @@ impl UpstreamPpoiMirror {
                     ))
                 })?
                 .min(wanted.end - 1);
-            let events = match self.fetch_indexed_events(&list, cursor, end).await {
+            let mut events = match self.fetch_indexed_events(&list, cursor, end).await {
                 Ok(v) => v,
                 Err((class, e)) => {
                     tracing::warn!(error = %e, "fetch_indexed_events failed; retrying next tick");
@@ -685,6 +713,7 @@ impl UpstreamPpoiMirror {
                     continue;
                 }
             };
+            let missing = truncate_at_first_missing(&mut events, cursor);
             let full = u64::try_from(events.len()).is_ok_and(|rows| rows == end - cursor + 1);
             if full {
                 pause = backfill;
@@ -735,8 +764,11 @@ impl UpstreamPpoiMirror {
                     }
                 }
             }
-            // A short answer is the whole of upstream's list: no row past its last exists yet.
-            status.answered(cursor, events.len(), (!full).then_some(cursor));
+            match missing {
+                Some(missing) => status.answered_short_of(cursor, events.len(), missing),
+                // A short answer is the whole of upstream's list: no row past its last exists yet.
+                None => status.answered(cursor, events.len(), (!full).then_some(cursor)),
+            }
         }
     }
 
@@ -918,6 +950,20 @@ struct IndexedPoiEvent {
     event_type: raven_railgun_persistence::PpoiEventType,
     signature: [u8; 64],
     validated_merkleroot: [u8; 32],
+}
+
+/// Cut `events`, a decoded page asked for from `from`, at its first missing row, and name that
+/// row. The cursor may only pass rows that were delivered, so the missing row is asked for again.
+fn truncate_at_first_missing(events: &mut Vec<IndexedPoiEvent>, from: u64) -> Option<u64> {
+    let contiguous = events
+        .iter()
+        .zip(from..)
+        .take_while(|(ev, at)| u64::from(ev.list_index) == *at)
+        .count();
+    let missing = (contiguous < events.len())
+        .then(|| from.saturating_add(u64::try_from(contiguous).unwrap_or(u64::MAX)));
+    events.truncate(contiguous);
+    missing
 }
 
 fn decode_indexed_events(
