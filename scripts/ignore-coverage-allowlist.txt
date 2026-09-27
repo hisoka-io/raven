@@ -91,3 +91,5 @@ adapters/railgun/engine/benches/served_respond_latency_bench.rs::served_respond_
 adapters/railgun/engine/benches/served_respond_latency_bench.rs::served_respond_stage_split_at_deployed_cell
 adapters/railgun/engine/benches/served_respond_latency_bench.rs::served_response_bytes_match_a_recorded_build
 
+crates/inspire/benches/pack_params_build_bench.rs::pack_params_build_median_at_production_cell
+crates/inspire/src/inspiring/inspiring2/automorph_tables_oracle.rs::derived_tables_equal_the_search_for_every_odd_t_at_d2048
