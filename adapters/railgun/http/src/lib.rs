@@ -466,34 +466,22 @@ pub(crate) fn attach_freshness_header(
     }
 }
 
-/// Install or return the process-global Prometheus recorder (idempotent via `OnceLock`).
+/// Install or return the process-global Prometheus recorder.
+///
+/// `get_or_init` makes concurrent first callers wait on the single install. The Err is
+/// cached because a global recorder can never be replaced, so a retry cannot succeed.
 pub(crate) fn global_prometheus_handle(
 ) -> Result<Arc<metrics_exporter_prometheus::PrometheusHandle>, String> {
-    static HANDLE: OnceLock<Arc<metrics_exporter_prometheus::PrometheusHandle>> = OnceLock::new();
-    if let Some(h) = HANDLE.get() {
-        return Ok(Arc::clone(h));
-    }
-    let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
-    match builder.install_recorder() {
-        Ok(handle) => {
-            let arc = Arc::new(handle);
-            match HANDLE.set(Arc::clone(&arc)) {
-                Ok(()) => Ok(arc),
-                Err(_) => HANDLE
-                    .get()
-                    .cloned()
-                    .ok_or_else(|| "OnceLock race produced no handle".to_owned()),
-            }
-        }
-        Err(install_err) => {
-            if let Some(h) = HANDLE.get() {
-                return Ok(Arc::clone(h));
-            }
-            Err(format!(
-                "metrics-exporter-prometheus install_recorder: {install_err}"
-            ))
-        }
-    }
+    static HANDLE: OnceLock<Result<Arc<metrics_exporter_prometheus::PrometheusHandle>, String>> =
+        OnceLock::new();
+    HANDLE
+        .get_or_init(|| {
+            metrics_exporter_prometheus::PrometheusBuilder::new()
+                .install_recorder()
+                .map(Arc::new)
+                .map_err(|e| format!("metrics-exporter-prometheus install_recorder: {e}"))
+        })
+        .clone()
 }
 
 #[cfg(test)]
@@ -1318,5 +1306,36 @@ mod tests {
         cfg.max_body_bytes = HTTP_MAX_BODY_CEILING;
         cfg.validate()
             .expect("max_body_bytes at the ceiling must validate");
+    }
+
+    // Only the first caller in a process can lose the install race, so this reds only when it
+    // runs before any AppState::new: alone, or under nextest's process-per-test.
+    #[test]
+    fn concurrent_first_callers_all_get_the_one_prometheus_handle() {
+        const CALLERS: usize = 32;
+        let barrier = std::sync::Barrier::new(CALLERS);
+        let results: Vec<_> = std::thread::scope(|s| {
+            let joins: Vec<_> = (0..CALLERS)
+                .map(|_| {
+                    s.spawn(|| {
+                        barrier.wait();
+                        global_prometheus_handle()
+                    })
+                })
+                .collect();
+            joins
+                .into_iter()
+                .map(|j| j.join().expect("caller thread"))
+                .collect()
+        });
+        let handles: Vec<_> = results
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| r.unwrap_or_else(|e| panic!("caller {i} got Err: {e}")))
+            .collect();
+        let again = global_prometheus_handle().expect("a later caller");
+        for h in &handles {
+            assert!(Arc::ptr_eq(h, &again), "every caller must share one handle");
+        }
     }
 }
