@@ -1,9 +1,9 @@
 //! A shim route answers from a store that covers the whole question, or refuses.
 //!
-//! The routes answer questions whose domain is a whole list: `"Missing"`, an empty
-//! blocked-set and a 404 are all claims about absence. A store holding one 65,536-row block
-//! of a 358,320-row list can answer none of them, and every such answer is a well-formed
-//! 200. These tests hold the refusal in place.
+//! The routes answer questions whose domain is a whole list: a 404 and the end of an index
+//! segment are both claims about absence, and the end of the index is what a client reads as
+//! "Missing". A store holding one 65,536-row block of a 358,320-row list can answer neither,
+//! and every such answer is a well-formed 200. These tests hold the refusal in place.
 //!
 //! A gap-free prefix is not enough on its own: the frontier block has to be CURRENT, which only
 //! upstream's own recent row count can say. A cold sync or a restart leaves the frontier short
@@ -28,6 +28,7 @@ use raven_railgun_engine::inspire::{apply_wal_entry, LogicalLeafStore};
 use raven_railgun_engine::orchestrator::{DataSourceFilter, LEAVES_PER_PPOI_BLOCK};
 use raven_railgun_engine::pir_table::PerLeafCommitmentEncoder;
 use raven_railgun_engine::{Engine, PirScheme};
+use raven_railgun_http::poi_shim::BC_INDEX_PREFIX_BYTES;
 use raven_railgun_http::shim_store::UPSTREAM_TIP_MAX_AGE_SECS;
 use raven_railgun_http::status::{MirrorFeedState, MirrorFeedView};
 use raven_railgun_http::{AppState, HttpConfig};
@@ -99,33 +100,34 @@ fn seed_block(block: u32, rows: u32) -> SharedStore {
     seed_list_block(LIST_KEY, block, rows)
 }
 
+/// One seeded run: each tree node is hashed once, not once per row, so a sealed block costs
+/// about 65,536 Poseidon hashes instead of the 1,048,576 a row-by-row apply pays.
 fn seed_list_block(list_key: [u8; 32], block: u32, rows: u32) -> SharedStore {
     let enc = PerLeafCommitmentEncoder::new(32, LEAVES_PER_PPOI_BLOCK, 0).expect("encoder");
-    let mut store = LogicalLeafStore::new();
     let base = block * LEAVES_PER_PPOI_BLOCK;
-    for local in 0..rows {
-        apply_wal_entry(
-            &mut store,
-            &WalEntryPayload::PpoiListLeafAdded {
-                list_key,
-                list_index: local,
-                blinded_commitment: bc_for(base + local),
-                // ShieldBlocked on every third row, so the status-header sets are non-trivial.
-                status: u8::from((base + local).is_multiple_of(3)),
-                event_type: raven_railgun_persistence::PpoiEventType::Shield,
-                signature: vec![0; 64],
-                validated_merkleroot: [0; 32],
-            },
-            1_000 + u64::from(base + local),
-            &enc,
-        )
-        .expect("seed ppoi leaf");
-    }
+    let run: Vec<(WalEntryPayload, u64)> = (0..rows)
+        .map(|local| {
+            (
+                WalEntryPayload::PpoiListLeafAdded {
+                    list_key,
+                    list_index: local,
+                    blinded_commitment: bc_for(base + local),
+                    status: 0,
+                    event_type: raven_railgun_persistence::PpoiEventType::Shield,
+                    signature: vec![0; 64],
+                    validated_merkleroot: [0; 32],
+                },
+                1_000 + u64::from(base + local),
+            )
+        })
+        .collect();
+    let mut store = LogicalLeafStore::new();
+    store.seed_leaf_run(&run, &enc).expect("seed ppoi rows");
     Arc::new(parking_lot::Mutex::new(store))
 }
 
-/// A sealed block costs 65,536 Poseidon IMT inserts (measured 32.8 s under `ci-test`), and
-/// the coverage predicate cannot be satisfied without one. Paid once per test binary.
+/// The coverage predicate cannot be satisfied past one block without a sealed one. Shared by
+/// the tests of one process; nextest runs each test in its own, so each pays it once.
 fn sealed_block_zero() -> SharedStore {
     static SEALED: OnceLock<SharedStore> = OnceLock::new();
     Arc::clone(SEALED.get_or_init(|| seed_block(0, LEAVES_PER_PPOI_BLOCK)))
@@ -217,17 +219,8 @@ fn two_block_declarations(frontier: SharedStore) -> Vec<(DataSourceFilter, Share
 }
 
 /// A sealed block 0 plus a live block 1, at upstream's count: the smallest wiring the coverage
-/// predicate accepts that still spans the 65,536 boundary.
-fn two_covered_blocks() -> Router {
-    declared_with(
-        two_block_declarations(seed_block(1, 3)),
-        Some(counted(u64::from(LEAVES_PER_PPOI_BLOCK) + 3)),
-    )
-}
-
-/// The same wiring, handing back block 1 so a test can grow the frontier under a sealed
-/// block and watch the sealed bytes not move.
-#[cfg(feature = "prefix-index-channel")]
+/// predicate accepts that still spans the 65,536 boundary. Block 1 is handed back so a test can
+/// grow the frontier under a sealed block and watch the sealed bytes not move.
 fn two_covered_blocks_with_frontier() -> (Router, SharedStore) {
     let frontier = seed_block(1, 3);
     let router = declared_with(
@@ -239,7 +232,6 @@ fn two_covered_blocks_with_frontier() -> (Router, SharedStore) {
 
 /// Append one row to a frontier block, so a test can move it while a sealed block below
 /// stays put.
-#[cfg(feature = "prefix-index-channel")]
 fn append_frontier_row(store: &SharedStore, local: u32) {
     let enc = PerLeafCommitmentEncoder::new(32, LEAVES_PER_PPOI_BLOCK, 0).expect("encoder");
     let global = LEAVES_PER_PPOI_BLOCK + local;
@@ -297,25 +289,9 @@ async fn send(router: &Router, request: Request<Body>) -> (StatusCode, Vec<u8>) 
     (status, bytes)
 }
 
-/// The routes a stock build registers. Both index channels are default features, so both
-/// are here; a build that drops one drops its route with it.
+/// Every route a build registers.
 fn stock_requests(list_key_hex: &str, probe_bc: &str) -> Vec<(&'static str, Request<Body>)> {
-    #[allow(unused_mut)]
-    let mut requests = vec![
-        (
-            "pois-per-list",
-            authed(
-                Method::POST,
-                "/v1/poi/pois-per-list",
-                Body::from(
-                    serde_json::json!({
-                        "listKeys": [list_key_hex],
-                        "blindedCommitmentDatas": [{ "blindedCommitment": probe_bc }],
-                    })
-                    .to_string(),
-                ),
-            ),
-        ),
+    vec![
         (
             "merkle-proofs",
             authed(
@@ -339,33 +315,14 @@ fn stock_requests(list_key_hex: &str, probe_bc: &str) -> Vec<(&'static str, Requ
             ),
         ),
         (
-            "status-header",
+            "bc-prefixes",
             authed(
                 Method::GET,
-                &format!("/v1/poi/{list_key_hex}/status-header"),
+                &format!("/v1/poi/{list_key_hex}/bc-prefixes"),
                 Body::empty(),
             ),
         ),
-    ];
-    #[cfg(feature = "json-index-channel")]
-    requests.push((
-        "bc-to-idx-map",
-        authed(
-            Method::GET,
-            &format!("/v1/poi/{list_key_hex}/bc-to-idx-map"),
-            Body::empty(),
-        ),
-    ));
-    #[cfg(feature = "prefix-index-channel")]
-    requests.push((
-        "bc-prefixes",
-        authed(
-            Method::GET,
-            &format!("/v1/poi/{list_key_hex}/bc-prefixes"),
-            Body::empty(),
-        ),
-    ));
-    requests
+    ]
 }
 
 /// The 503 nobody had ever seen: a live probe answers 401 from the auth layer before the
@@ -387,67 +344,8 @@ async fn every_stock_route_refuses_when_no_store_is_wired() {
     }
 }
 
-/// The trap the card says a builder falls into on the first try, pinned as a live fact:
-/// the undeclared single-store setter carries no filter, so a block store's LOCAL indices
-/// are served as if they were the list's. Block 2's rows are real; every index is wrong by
-/// 131,072 and every BC outside the block reads `"Missing"` at HTTP 200.
-#[cfg(feature = "json-index-channel")]
-#[tokio::test]
-async fn an_undeclared_block_store_serves_local_indices_as_if_they_were_global() {
-    let block_two = seed_block(2, 4);
-    let router = app_state(move |state| state.with_logical_store(Arc::clone(&block_two)));
-    let list_key_hex = hex32(&LIST_KEY);
-
-    let (status, body) = send(
-        &router,
-        authed(
-            Method::GET,
-            &format!("/v1/poi/{list_key_hex}/bc-to-idx-map"),
-            Body::empty(),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    let entries = parsed["entries"].as_array().expect("entries");
-    assert_eq!(entries.len(), 4);
-    assert_eq!(
-        entries[0]["idx"].as_u64(),
-        Some(0),
-        "the undeclared path serves the block-local index; the row's global index is 131,072"
-    );
-    assert_eq!(
-        entries[0]["bc"].as_str().map(str::to_owned),
-        Some(hex32(&bc_for(2 * LEAVES_PER_PPOI_BLOCK))),
-        "the row itself is block 2's, so index 0 names a commitment at global index 131,072"
-    );
-
-    let (status, body) = send(
-        &router,
-        authed(
-            Method::POST,
-            "/v1/poi/pois-per-list",
-            Body::from(
-                serde_json::json!({
-                    "listKeys": [list_key_hex],
-                    "blindedCommitmentDatas": [{ "blindedCommitment": hex32(&bc_for(0)) }],
-                })
-                .to_string(),
-            ),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    assert_eq!(
-        parsed[hex32(&bc_for(0))][&list_key_hex].as_str(),
-        Some("Missing"),
-        "a block-0 commitment reads Missing off a block-2 store, at 200, with nothing logged"
-    );
-}
-
-/// The same store, declared. Declaring it is what makes the answer provably wrong and the
-/// route refuse: blocks 0 and 1 are held by nobody, so no absence claim over the list holds.
+/// One block of a list, declared as what it is: blocks 0 and 1 are held by nobody, so no
+/// absence claim over the list holds.
 #[tokio::test]
 async fn one_block_of_a_multi_block_list_refuses_on_every_stock_route() {
     let router = declared(vec![(
@@ -552,110 +450,6 @@ async fn a_frontier_block_at_capacity_refuses() {
     }
 }
 
-/// The positive case, across a sealed block and a live one: every served index is the
-/// GLOBAL index, and the row past 65,535 proves the composition rather than a coincidence
-/// of a single block's numbering.
-#[cfg(feature = "json-index-channel")]
-#[tokio::test]
-async fn covered_blocks_serve_global_indices_past_the_block_boundary() {
-    let router = two_covered_blocks();
-    let list_key_hex = hex32(&LIST_KEY);
-
-    let (status, body) = send(
-        &router,
-        authed(
-            Method::GET,
-            &format!("/v1/poi/{list_key_hex}/bc-to-idx-map"),
-            Body::empty(),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    let entries = parsed["entries"].as_array().expect("entries");
-    assert_eq!(
-        entries.len(),
-        LEAVES_PER_PPOI_BLOCK as usize + 3,
-        "the map must span every covered block"
-    );
-
-    for global in [
-        0u32,
-        LEAVES_PER_PPOI_BLOCK - 1,
-        LEAVES_PER_PPOI_BLOCK,
-        LEAVES_PER_PPOI_BLOCK + 2,
-    ] {
-        let entry = &entries[global as usize];
-        assert_eq!(
-            entry["idx"].as_u64(),
-            Some(u64::from(global)),
-            "row {global} must carry its global index"
-        );
-        assert_eq!(
-            entry["bc"].as_str().map(str::to_owned),
-            Some(hex32(&bc_for(global))),
-            "row {global} must carry the commitment that lives at that global index"
-        );
-    }
-
-    // The round trip: a commitment from the block past the boundary resolves to an index at
-    // or above 65,536.
-    let past_boundary = bc_for(LEAVES_PER_PPOI_BLOCK + 1);
-    let resolved = entries
-        .iter()
-        .find(|entry| entry["bc"].as_str() == Some(&hex32(&past_boundary)))
-        .and_then(|entry| entry["idx"].as_u64())
-        .expect("commitment past the boundary must appear in the map");
-    assert!(
-        resolved >= u64::from(LEAVES_PER_PPOI_BLOCK),
-        "expected a global index at or past the block boundary, got {resolved}"
-    );
-}
-
-/// Over a covered list, `"Missing"` becomes a claim the coverage proof backs: it is served
-/// for a commitment in no block and never for one the blocks hold.
-#[tokio::test]
-async fn missing_is_served_only_for_a_commitment_no_covered_block_holds() {
-    let router = two_covered_blocks();
-    let list_key_hex = hex32(&LIST_KEY);
-    let past_boundary = bc_for(LEAVES_PER_PPOI_BLOCK + 1);
-    let absent = fr(0xDEAD_BEEF);
-
-    let (status, body) = send(
-        &router,
-        authed(
-            Method::POST,
-            "/v1/poi/pois-per-list",
-            Body::from(
-                serde_json::json!({
-                    "listKeys": [list_key_hex],
-                    "blindedCommitmentDatas": [
-                        { "blindedCommitment": hex32(&bc_for(0)) },
-                        { "blindedCommitment": hex32(&past_boundary) },
-                        { "blindedCommitment": hex32(&absent) },
-                    ],
-                })
-                .to_string(),
-            ),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    for bc in [bc_for(0), past_boundary] {
-        assert_ne!(
-            parsed[hex32(&bc)][&list_key_hex].as_str(),
-            Some("Missing"),
-            "a covered commitment must not read Missing"
-        );
-    }
-    assert_eq!(
-        parsed[hex32(&absent)][&list_key_hex].as_str(),
-        Some("Missing"),
-        "a commitment in no covered block is absent from the list"
-    );
-}
-
 /// A merkle proof comes from the block that holds the row, and the block IMT is the tree
 /// upstream takes `validatedMerkleroot` over, so the proof is against that block's root.
 #[tokio::test]
@@ -727,40 +521,6 @@ async fn a_merkle_proof_past_the_boundary_comes_from_the_block_that_holds_the_ro
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
-/// The status-header sets are defined over the whole list, so they must span every covered
-/// block rather than stopping at the first.
-#[tokio::test]
-async fn status_header_sets_span_every_covered_block() {
-    let router = two_covered_blocks();
-    let list_key_hex = hex32(&LIST_KEY);
-    let (status, body) = send(
-        &router,
-        authed(
-            Method::GET,
-            &format!("/v1/poi/{list_key_hex}/status-header"),
-            Body::empty(),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    let blocked: Vec<String> = parsed["blockedBcs"]
-        .as_array()
-        .expect("blockedBcs")
-        .iter()
-        .filter_map(|v| v.as_str().map(str::to_owned))
-        .collect();
-    // Seeded ShieldBlocked on every third global index; 65,538 is the first past the boundary.
-    assert!(
-        blocked.contains(&hex32(&bc_for(0))),
-        "a blocked row in the sealed block must be in the set"
-    );
-    assert!(
-        blocked.contains(&hex32(&bc_for(65_538))),
-        "a blocked row past the block boundary must be in the set too"
-    );
 }
 
 /// Every stock list route over `router`, in order. The commit-tree route is left out: no list
@@ -843,30 +603,19 @@ async fn an_empty_frontier_over_sealed_blocks_is_refused_until_upstream_counts_i
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{route}");
     }
 
+    // An index that ended at the local rows would read as "Missing" for every row upstream
+    // holds past them.
     let counted_behind = declared_with(
         declarations.clone(),
         Some(counted(u64::from(LEAVES_PER_PPOI_BLOCK) + 33_000)),
     );
-    let (status, _) = send(
-        &counted_behind,
-        authed(
-            Method::POST,
-            "/v1/poi/pois-per-list",
-            Body::from(
-                serde_json::json!({
-                    "listKeys": [hex32(&LIST_KEY)],
-                    "blindedCommitmentDatas": [{ "blindedCommitment": hex32(&fr(0xDEAD_BEEF)) }],
-                })
-                .to_string(),
-            ),
-        ),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "a commitment past the local rows must not read Missing while upstream holds more"
-    );
+    for (route, status) in list_route_statuses(&counted_behind, &hex32(&fr(0xDEAD_BEEF))).await {
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{route} answered while upstream holds more rows than the local ones"
+        );
+    }
 
     let at_tip = declared_with(
         declarations,
@@ -907,28 +656,34 @@ async fn a_block_declared_ahead_of_the_list_is_answered_over_and_a_row_past_it_i
             "{route} refused over a block declared ahead of the list"
         );
     }
-    let next_row = hex32(&bc_for(4));
+    // The index ends at row 4, which is what a client reads as "Missing" for the next row.
     let (status, body) = send(
         &at_tip,
         authed(
+            Method::GET,
+            &format!("/v1/poi/{}/bc-prefixes", hex32(&LIST_KEY)),
+            Body::empty(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.len(), 4 * BC_INDEX_PREFIX_BYTES);
+    let (status, _) = send(
+        &at_tip,
+        authed(
             Method::POST,
-            "/v1/poi/pois-per-list",
+            "/v1/poi/merkle-proofs",
             Body::from(
                 serde_json::json!({
-                    "listKeys": [hex32(&LIST_KEY)],
-                    "blindedCommitmentDatas": [{ "blindedCommitment": next_row }],
+                    "listKey": hex32(&LIST_KEY),
+                    "blindedCommitments": [hex32(&bc_for(4))],
                 })
                 .to_string(),
             ),
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    assert_eq!(
-        parsed[&next_row][hex32(&LIST_KEY)].as_str(),
-        Some("Missing")
-    );
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     let behind = declared_with(ahead, Some(counted(5)));
     for (route, status) in list_route_statuses(&behind, &probe).await {
@@ -1000,69 +755,11 @@ async fn each_list_is_answered_only_on_its_own_upstream_count() {
     }
 }
 
-/// The card's gate names six blocks. Five of them must be sealed to satisfy the coverage
-/// predicate, and a sealed block costs 65,536 Poseidon IMT inserts: 32.8 s each under
-/// `ci-test`, measured, so ~2.8 minutes of pure seeding. The two-block tests above carry
-/// the same properties including an index past 65,536.
-///
-/// Trigger: run this by hand before the wallet PR is handed to Railgun, and whenever
-/// `LEAVES_PER_PPOI_BLOCK`, the router localization or the coverage predicate changes.
-#[tokio::test]
-#[ignore = "seeds five sealed blocks: 5 x 65,536 Poseidon IMT inserts, ~165 s measured under \
-            ci-test. Trigger: before the wallet PR is handed to Railgun, and whenever \
-            LEAVES_PER_PPOI_BLOCK, the router localization or the coverage predicate changes."]
-async fn six_covered_blocks_round_trip_one_commitment_from_each() {
-    let mut declarations: Vec<(DataSourceFilter, SharedStore)> = Vec::with_capacity(6);
-    for block in 0..6u32 {
-        let rows = if block == 5 {
-            17
-        } else {
-            LEAVES_PER_PPOI_BLOCK
-        };
-        declarations.push((
-            DataSourceFilter::PpoiListBlock {
-                list_key: LIST_KEY,
-                block,
-            },
-            seed_block(block, rows),
-        ));
-    }
-    let held = 5 * u64::from(LEAVES_PER_PPOI_BLOCK) + 17;
-    let list_key_hex = hex32(&LIST_KEY);
-    let map_uri = format!("/v1/poi/{list_key_hex}/bc-to-idx-map");
-
-    // Five sealed blocks under a short sixth is the shape a cold sync passes through; without
-    // upstream's count it is no evidence the list ends there.
-    let unanchored = declared_with(declarations.clone(), None);
-    let (status, _) = send(&unanchored, authed(Method::GET, &map_uri, Body::empty())).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-
-    let router = declared_with(declarations, Some(counted(held)));
-    let (status, body) = send(&router, authed(Method::GET, &map_uri, Body::empty())).await;
-    assert_eq!(status, StatusCode::OK);
-    let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    let entries = parsed["entries"].as_array().expect("entries");
-    assert_eq!(entries.len(), 5 * LEAVES_PER_PPOI_BLOCK as usize + 17);
-
-    for block in 0..6u32 {
-        let global = block * LEAVES_PER_PPOI_BLOCK + 3;
-        let entry = entries
-            .iter()
-            .find(|entry| entry["bc"].as_str() == Some(&hex32(&bc_for(global))))
-            .expect("one commitment from each block must appear");
-        assert_eq!(
-            entry["idx"].as_u64(),
-            Some(u64::from(global)),
-            "block {block}'s commitment must carry its global index"
-        );
-    }
-}
-
-#[cfg(feature = "prefix-index-channel")]
 mod index_channel {
     use super::{
-        authed, bc_for, hex32, two_covered_blocks_with_frontier, Body, BodyExt, DataSourceFilter,
-        HttpConfig, Method, ServiceExt, StatusCode, LEAVES_PER_PPOI_BLOCK, LIST_KEY, TOKEN,
+        authed, bc_for, counted, declared_with, hex32, seed_block,
+        two_covered_blocks_with_frontier, Body, BodyExt, DataSourceFilter, HttpConfig, Method,
+        ServiceExt, SharedStore, StatusCode, LEAVES_PER_PPOI_BLOCK, LIST_KEY, TOKEN,
     };
     use raven_railgun_http::poi_shim::{BC_INDEX_PREFIX_BYTES, BC_INDEX_SEGMENT_MAX_BYTES};
     use std::collections::BTreeMap;
@@ -1182,24 +879,10 @@ mod index_channel {
             TOTAL_ROWS as usize * BC_INDEX_PREFIX_BYTES,
             "the walk must reconstruct the whole channel"
         );
-    }
-
-    /// The undeclared setter carries no block filter, so block 2's rows are renumbered to
-    /// 0 before the channel ever sees them and `?since` addresses the wrong row. Pinned on
-    /// the bounded channel too: the renumbering is in the coverage layer, not in a handler,
-    /// so a guard here could never fire and the trap has to be caught upstream.
-    #[tokio::test]
-    async fn an_undeclared_block_store_renumbers_the_segment_to_zero() {
-        let block_two = super::seed_block(2, 4);
-        let router = super::app_state(move |state| state.with_logical_store(block_two));
-        let (status, body, headers) = segment(&router, "").await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(headers["x-raven-index-base"], "0");
-        assert_eq!(headers["x-raven-index-total"], "4");
         assert_eq!(
-            row(&body, 0),
-            prefix_of(2 * LEAVES_PER_PPOI_BLOCK),
-            "segment position 0 carries the commitment at global index 131,072"
+            walk(&router).await.len(),
+            2,
+            "65,539 rows is two blocks, so two responses"
         );
     }
 
@@ -1257,27 +940,11 @@ mod index_channel {
         );
     }
 
-    /// `since` at the frontier is a caught-up poll; past it the caller holds rows this
-    /// epoch does not, which is a rollback to report rather than an empty body to absorb.
-    #[tokio::test]
-    async fn since_at_the_frontier_is_empty_and_past_it_is_refused() {
-        let (router, _frontier) = two_covered_blocks_with_frontier();
-
-        let (status, body, headers) = segment(&router, &format!("?since={TOTAL_ROWS}")).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body.is_empty());
-        assert_eq!(headers["x-raven-index-next"], TOTAL_ROWS.to_string());
-        assert_eq!(headers["x-raven-index-total"], TOTAL_ROWS.to_string());
-
-        let (status, _, _) = segment(&router, &format!("?since={}", TOTAL_ROWS + 1)).await;
-        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
-    }
-
     /// A single short block 0 at upstream's count, with its store handed back so a test can
     /// grow it. Cheap: no sealed block.
-    fn one_short_block(rows: u32) -> (axum::Router, super::SharedStore) {
-        let block_zero = super::seed_block(0, rows);
-        let router = super::declared_with(
+    fn one_short_block(rows: u32) -> (axum::Router, SharedStore) {
+        let block_zero = seed_block(0, rows);
+        let router = declared_with(
             vec![(
                 DataSourceFilter::PpoiListBlock {
                     list_key: LIST_KEY,
@@ -1285,19 +952,22 @@ mod index_channel {
                 },
                 std::sync::Arc::clone(&block_zero),
             )],
-            Some(super::counted(u64::from(rows))),
+            Some(counted(u64::from(rows))),
         );
         (router, block_zero)
     }
 
-    /// A caller holding more rows than this node is told so, and the refusal still carries the
-    /// cursor headers that say where this node's list ends, so it can resume from there.
+    /// `since` at the frontier is a caught-up poll. Past it the caller holds rows this epoch
+    /// does not, which is a rollback to report rather than an empty body to absorb, and the
+    /// refusal still carries the cursor headers that say where this node's list ends.
     #[tokio::test]
     async fn a_refusal_past_the_frontier_still_names_where_the_list_ends() {
         let (router, _block_zero) = one_short_block(4);
         let (status, body, frontier) = segment(&router, "?since=4").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.is_empty());
+        assert_eq!(cursor(&frontier, "x-raven-index-next"), 4);
+        assert_eq!(cursor(&frontier, "x-raven-index-total"), 4);
 
         let (status, _, refused) = segment(&router, "?since=5").await;
         assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
@@ -1311,154 +981,6 @@ mod index_channel {
         assert_eq!(cursor(&refused, "x-raven-index-total"), 4);
     }
 
-    /// The JSON channel answers a matching revalidation off what the last read depended on, so
-    /// a list that grew since must not revalidate against the old digest. Its epoch is the one
-    /// the prefix channel names for the same state.
-    #[cfg(feature = "json-index-channel")]
-    #[tokio::test]
-    async fn the_json_channel_revalidates_only_while_the_list_is_unchanged() {
-        let (router, block_zero) = one_short_block(4);
-        let uri = format!("/v1/poi/{}/bc-to-idx-map", hex32(&LIST_KEY));
-        let get = |etag: Option<String>| {
-            let mut request = authed(Method::GET, &uri, Body::empty());
-            if let Some(etag) = etag {
-                request
-                    .headers_mut()
-                    .insert("if-none-match", etag.parse().expect("etag"));
-            }
-            let router = router.clone();
-            async move {
-                let response = router.oneshot(request).await.expect("dispatch");
-                let status = response.status();
-                let etag = response
-                    .headers()
-                    .get("etag")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_owned);
-                let body = response
-                    .into_body()
-                    .collect()
-                    .await
-                    .expect("body")
-                    .to_bytes()
-                    .to_vec();
-                (status, etag, body)
-            }
-        };
-
-        let (status, etag, body) = get(None).await;
-        assert_eq!(status, StatusCode::OK);
-        let etag = etag.expect("etag");
-        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
-        let (_, _, frontier) = segment(&router, "").await;
-        assert_eq!(
-            parsed["epoch"].as_u64().map(|e| e.to_string()).as_deref(),
-            frontier.get("x-raven-index-epoch").map(String::as_str),
-            "both channels must name one epoch for one state"
-        );
-
-        let (status, revalidated, body) = get(Some(etag.clone())).await;
-        assert_eq!(status, StatusCode::NOT_MODIFIED);
-        assert_eq!(revalidated.as_deref(), Some(etag.as_str()));
-        assert!(body.is_empty());
-
-        append_block_zero_row(&block_zero, 4);
-        let (status, moved, body) = get(Some(etag.clone())).await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "a list that grew must be served again, not revalidated"
-        );
-        let moved = moved.expect("etag");
-        assert_ne!(moved, etag);
-        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
-        let entries = parsed["entries"].as_array().expect("entries");
-        assert_eq!(entries.len(), 5);
-        assert_eq!(entries[4]["bc"].as_str(), Some(hex32(&bc_for(4)).as_str()));
-
-        let (status, _, _) = get(Some(moved)).await;
-        assert_eq!(status, StatusCode::NOT_MODIFIED);
-    }
-
-    #[cfg(feature = "json-index-channel")]
-    fn append_block_zero_row(store: &super::SharedStore, local: u32) {
-        let enc = raven_railgun_engine::pir_table::PerLeafCommitmentEncoder::new(
-            32,
-            LEAVES_PER_PPOI_BLOCK,
-            0,
-        )
-        .expect("encoder");
-        raven_railgun_engine::inspire::apply_wal_entry(
-            &mut store.lock(),
-            &raven_railgun_persistence::WalEntryPayload::PpoiListLeafAdded {
-                list_key: LIST_KEY,
-                list_index: local,
-                blinded_commitment: bc_for(local),
-                status: 0,
-                event_type: raven_railgun_persistence::PpoiEventType::Shield,
-                signature: vec![0; 64],
-                validated_merkleroot: [0; 32],
-            },
-            1_000 + u64::from(local),
-            &enc,
-        )
-        .expect("append row");
-    }
-
-    /// The cold-start cost of the two channels, measured off the served bytes at one
-    /// synthetic list size rather than computed from a row template. The ratio is the
-    /// N-independent part: a 6-byte row against a 64-hex row inside a JSON envelope.
-    #[cfg(feature = "json-index-channel")]
-    #[tokio::test]
-    async fn the_json_channel_costs_an_order_of_magnitude_more_per_row() {
-        let (router, _frontier) = two_covered_blocks_with_frontier();
-        let binary: usize = walk(&router).await.iter().map(|(body, _)| body.len()).sum();
-
-        let json = super::send(
-            &router,
-            authed(
-                Method::GET,
-                &format!("/v1/poi/{}/bc-to-idx-map", hex32(&LIST_KEY)),
-                Body::empty(),
-            ),
-        )
-        .await
-        .1
-        .len();
-
-        assert_eq!(binary, TOTAL_ROWS as usize * BC_INDEX_PREFIX_BYTES);
-        assert!(
-            json >= binary * 13,
-            "one JSON row is a 64-hex string in an envelope against six raw bytes; \
-             measured {json} B against {binary} B at {TOTAL_ROWS} rows"
-        );
-    }
-
-    /// The published size of the channel is this, measured off the served bytes rather
-    /// than computed: six bytes per row, and never more than one block in one response.
-    #[tokio::test]
-    async fn the_served_channel_is_six_bytes_per_row_and_one_block_per_response() {
-        let (router, _frontier) = two_covered_blocks_with_frontier();
-        let segments = walk(&router).await;
-        for (body, _) in &segments {
-            assert!(
-                body.len() <= BC_INDEX_SEGMENT_MAX_BYTES,
-                "no response may exceed one block: {} bytes",
-                body.len()
-            );
-        }
-        let (_, frontier) = segments.last().expect("a walk reaches a frontier");
-        assert_eq!(cursor(frontier, "x-raven-index-total"), TOTAL_ROWS);
-        assert_eq!(cursor(frontier, "x-raven-index-next"), TOTAL_ROWS);
-        let served: usize = segments.iter().map(|(body, _)| body.len()).sum();
-        assert_eq!(served, TOTAL_ROWS as usize * BC_INDEX_PREFIX_BYTES);
-        assert_eq!(
-            segments.len(),
-            2,
-            "65,539 rows is two blocks, so two responses"
-        );
-    }
-
     /// A browser hands a cross-origin script `null` for any response header CORS does not
     /// expose, and the SDK's walk refuses a segment without its cursor. Checked on the
     /// frontier, the one segment carrying every cursor header, through the production router.
@@ -1467,7 +989,7 @@ mod index_channel {
         const ORIGIN: &str = "https://wallet.example.com";
         let mut config = HttpConfig::demo(TOKEN);
         config.cors_allowed_origins = vec![ORIGIN.to_owned()];
-        let block_zero = super::seed_block(0, 4);
+        let block_zero = seed_block(0, 4);
         let upstream = super::feed(Some(4), 0);
         let router = super::app_state_with(config, move |state| {
             state
@@ -1525,6 +1047,58 @@ mod index_channel {
             assert!(
                 exposed.iter().any(|e| e == name),
                 "{name} is served but not exposed, so a browser reads it as null: {exposed:?}"
+            );
+        }
+    }
+
+    /// Six blocks: five sealed under a short sixth, the shape of the list itself. The two-block
+    /// tests carry the same properties per push, including an index past 65,536.
+    ///
+    /// Trigger: run this by hand before the wallet PR is handed to Railgun, and whenever
+    /// `LEAVES_PER_PPOI_BLOCK`, the router localization or the coverage predicate changes.
+    #[tokio::test]
+    #[ignore = "seeds five sealed blocks, 8.3 s measured under ci-test. Trigger: before the wallet \
+                PR is handed to Railgun, and whenever LEAVES_PER_PPOI_BLOCK, the router \
+                localization or the coverage predicate changes."]
+    async fn six_covered_blocks_round_trip_one_commitment_from_each() {
+        let declarations: Vec<(DataSourceFilter, SharedStore)> = (0..6u32)
+            .map(|block| {
+                let rows = if block == 5 {
+                    17
+                } else {
+                    LEAVES_PER_PPOI_BLOCK
+                };
+                (
+                    DataSourceFilter::PpoiListBlock {
+                        list_key: LIST_KEY,
+                        block,
+                    },
+                    seed_block(block, rows),
+                )
+            })
+            .collect();
+        let held = 5 * LEAVES_PER_PPOI_BLOCK + 17;
+
+        // Five sealed blocks under a short sixth is the shape a cold sync passes through; without
+        // upstream's count it is no evidence the list ends there.
+        let unanchored = declared_with(declarations.clone(), None);
+        let (status, _, _) = segment(&unanchored, "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let router = declared_with(declarations, Some(counted(u64::from(held))));
+        let segments = walk(&router).await;
+        assert_eq!(segments.len(), 6);
+        let index: Vec<u8> = segments
+            .iter()
+            .flat_map(|(body, _)| body.iter().copied())
+            .collect();
+        assert_eq!(index.len(), held as usize * BC_INDEX_PREFIX_BYTES);
+        for block in 0..6u32 {
+            let global = block * LEAVES_PER_PPOI_BLOCK + 3;
+            assert_eq!(
+                row(&index, global as usize),
+                prefix_of(global),
+                "block {block}'s commitment must sit at its global index"
             );
         }
     }

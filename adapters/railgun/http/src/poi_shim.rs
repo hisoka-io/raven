@@ -3,35 +3,24 @@
 //!
 //! These routes are NOT private; wallet privacy needs `/v1/instance/:id/query`.
 //!
-//! Two features publish the same index: `bc-prefixes` in per-block segments a client
-//! resumes with `?since=`, `bc-to-idx-map` as 64-hex rows in one unbounded body.
+//! `bc-prefixes` publishes the list's index in per-block segments a client resumes with
+//! `?since=`. No route answers a per-commitment status: the client derives it from the index.
 
 use std::sync::Arc;
 
-#[cfg(feature = "prefix-index-channel")]
-use axum::extract::Query;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header::HeaderName, HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     Json,
 };
-use bytes::Bytes;
-use raven_railgun_core::{MerkleProof as CoreMerkleProof, POIStatus};
-use raven_railgun_engine::inspire::LogicalLeafStore;
-#[cfg(feature = "prefix-index-channel")]
+use raven_railgun_core::MerkleProof as CoreMerkleProof;
 use raven_railgun_engine::orchestrator::LEAVES_PER_PPOI_BLOCK;
 use raven_railgun_engine::PirScheme;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
-#[cfg(feature = "json-index-channel")]
-use crate::shim_store::PublishedBody;
-#[cfg(feature = "prefix-index-channel")]
-use crate::shim_store::SegmentRefusal;
 use crate::shim_store::{
-    CoverageRefusal, ListCoverage, SharedLogicalStore as CoveredStore, ShimStoreRegistry,
-    UpstreamTip,
+    CoverageRefusal, ListCoverage, SegmentRefusal, SharedLogicalStore as CoveredStore, UpstreamTip,
 };
 use crate::status::MirrorFeedView;
 use crate::AppState;
@@ -49,30 +38,6 @@ pub(crate) const X_RAVEN_INDEX_EPOCH: HeaderName = HeaderName::from_static("x-ra
 
 /// Hex-encoded 32-byte blob. No `0x` prefix (matches Railgun upstream).
 type HexHash = String;
-
-/// Body for `POST /v1/poi/pois-per-list`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PoisPerListRequest {
-    /// Echoes `txidVersion`; accepted but not dispatched on.
-    #[serde(default)]
-    pub txid_version: Option<String>,
-    /// List keys to query (hex-encoded 32-byte, no `0x`).
-    pub list_keys: Vec<HexHash>,
-    /// Blinded commitments to look up.
-    pub blinded_commitment_datas: Vec<BlindedCommitmentData>,
-}
-
-/// One entry in [`PoisPerListRequest`], mirroring upstream `BlindedCommitmentData`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BlindedCommitmentData {
-    /// Hex-encoded 32-byte blinded commitment.
-    pub blinded_commitment: HexHash,
-    /// `Shield` / `Transact` / `Unshield`; carried for parity only.
-    #[serde(default)]
-    pub r#type: Option<String>,
-}
 
 /// Body for `POST /v1/poi/merkle-proofs`.
 #[derive(Debug, Clone, Deserialize)]
@@ -148,32 +113,12 @@ fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-fn poi_status_to_str(byte: u8) -> &'static str {
-    match byte {
-        0 => "Valid",
-        1 => "ShieldBlocked",
-        2 => "ProofSubmitted",
-        _ => "Missing",
-    }
-}
-
-type PoisPerListMap =
-    std::collections::BTreeMap<HexHash, std::collections::BTreeMap<HexHash, String>>;
-
-/// Element caps on the shim request vectors. These handlers hold the global
-/// [`LogicalLeafStore`] mutex that block-commit also takes, so an oversized body
-/// stalls the indexer; `pois-per-list` caps the vector product, not just each side.
-const MAX_SHIM_LIST_KEYS: usize = 64;
+/// `merkle-proofs` looks each commitment up under every block's lock, which the ingest path
+/// also takes, so the vector is capped.
 const MAX_SHIM_BLINDED_COMMITMENTS: usize = 1024;
-const MAX_SHIM_LOOKUP_PAIRS: usize = 16_384;
 
-const POIS_PER_LIST_ROUTE: &str = "pois-per-list";
 const MERKLE_PROOFS_ROUTE: &str = "merkle-proofs";
 const COMMIT_TREE_PROOF_ROUTE: &str = "commit-tree-merkle-proof";
-#[cfg(feature = "json-index-channel")]
-const BC_TO_IDX_MAP_ROUTE: &str = "bc-to-idx-map";
-const STATUS_HEADER_ROUTE: &str = "status-header";
-#[cfg(feature = "prefix-index-channel")]
 const BC_PREFIXES_ROUTE: &str = "bc-prefixes";
 
 /// Refuse loudly and name what is not covered: a bare 503 reads the same as a crashed process.
@@ -217,16 +162,12 @@ fn cover_list<'a, S: PirScheme>(
     route: &'static str,
     feeds: &[MirrorFeedView],
 ) -> Result<ListCoverage<'a>, StatusCode> {
-    if let Some(registry) = app.shim_stores.as_ref().as_ref() {
-        return registry
-            .prove_list_coverage(&list_key, upstream_tip(feeds, &list_key))
-            .map_err(|refusal| refuse_uncovered(route, &refusal));
-    }
-    app.logical_store
+    app.shim_stores
         .as_ref()
         .as_ref()
-        .map(|store| ListCoverage::undeclared(list_key, store))
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+        .prove_list_coverage(&list_key, upstream_tip(feeds, &list_key))
+        .map_err(|refusal| refuse_uncovered(route, &refusal))
 }
 
 fn cover_tree<'a, S: PirScheme>(
@@ -234,79 +175,12 @@ fn cover_tree<'a, S: PirScheme>(
     tree_number: u32,
     route: &'static str,
 ) -> Result<&'a CoveredStore, StatusCode> {
-    if let Some(registry) = app.shim_stores.as_ref().as_ref() {
-        return registry
-            .prove_tree(tree_number)
-            .map_err(|refusal| refuse_uncovered(route, &refusal));
-    }
-    app.logical_store
+    app.shim_stores
         .as_ref()
         .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
-}
-
-pub(crate) async fn pois_per_list_handler<S: PirScheme>(
-    State(app): State<AppState<S>>,
-    Json(req): Json<PoisPerListRequest>,
-) -> Result<Json<PoisPerListMap>, StatusCode> {
-    if req.list_keys.len() > MAX_SHIM_LIST_KEYS
-        || req.blinded_commitment_datas.len() > MAX_SHIM_BLINDED_COMMITMENTS
-        || req
-            .list_keys
-            .len()
-            .saturating_mul(req.blinded_commitment_datas.len())
-            > MAX_SHIM_LOOKUP_PAIRS
-    {
-        return Err(StatusCode::PAYLOAD_TOO_LARGE);
-    }
-    let list_keys: Vec<[u8; 32]> = req
-        .list_keys
-        .iter()
-        .filter_map(|s| hex_decode_32(s))
-        .collect();
-    if list_keys.len() != req.list_keys.len() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let blinded_commitments: Vec<[u8; 32]> = req
-        .blinded_commitment_datas
-        .iter()
-        .filter_map(|d| hex_decode_32(&d.blinded_commitment))
-        .collect();
-    if blinded_commitments.len() != req.blinded_commitment_datas.len() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    // "Missing" is a claim about the WHOLE list, so every requested list key has to be
-    // covered before any of them is answered - a per-key partial answer is the same defect
-    // spread across fewer rows.
-    let mut out: PoisPerListMap = PoisPerListMap::new();
-    let mut per_key_statuses: Vec<Vec<Option<u8>>> = Vec::with_capacity(list_keys.len());
-    let feeds = read_mirror_feeds(&app);
-    for list_key in &list_keys {
-        let coverage = cover_list(&app, *list_key, POIS_PER_LIST_ROUTE, &feeds)?;
-        per_key_statuses.push(coverage.statuses_of(&blinded_commitments));
-        coverage
-            .recheck_frontier()
-            .map_err(|refusal| refuse_uncovered(POIS_PER_LIST_ROUTE, &refusal))?;
-    }
-
-    // Upstream echoes the caller's blindedCommitment verbatim (private-proof-of-innocence
-    // poi-merkletree-manager.ts:216-219), and the engine indexes the reply with its own
-    // `0x`-prefixed string where a miss is an unlogged `continue`. Re-keying here drops every row.
-    for (position, data) in req.blinded_commitment_datas.iter().enumerate() {
-        let bc_hex = data.blinded_commitment.clone();
-        let mut per_list: std::collections::BTreeMap<HexHash, String> =
-            std::collections::BTreeMap::new();
-        for (list_key_hex, statuses) in req.list_keys.iter().zip(per_key_statuses.iter()) {
-            let status_str = match statuses.get(position).copied().flatten() {
-                Some(byte) => poi_status_to_str(byte),
-                None => "Missing",
-            };
-            per_list.insert(list_key_hex.clone(), status_str.to_owned());
-        }
-        out.insert(bc_hex, per_list);
-    }
-    Ok(Json(out))
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+        .prove_tree(tree_number)
+        .map_err(|refusal| refuse_uncovered(route, &refusal))
 }
 
 pub(crate) async fn merkle_proofs_handler<S: PirScheme>(
@@ -325,8 +199,8 @@ pub(crate) async fn merkle_proofs_handler<S: PirScheme>(
     if blinded_commitments.len() != req.blinded_commitments.len() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    // The 404 below is an absence claim, so it needs the same whole-list proof the status
-    // routes need: without it, "not in my block" is served as "not in the list".
+    // The 404 below is an absence claim, so it needs a whole-list proof: without it, "not in
+    // my block" is served as "not in the list".
     let coverage = cover_list(
         &app,
         list_key,
@@ -367,40 +241,15 @@ pub(crate) async fn commit_tree_proof_handler<S: PirScheme>(
     Ok(Json(MerkleProofJson::from_core(&proof, leaf_hex)))
 }
 
-/// JSON shape returned by `GET /v1/poi/:list_key_hex/bc-to-idx-map`.
-#[cfg(feature = "json-index-channel")]
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BcToIdxMapResponse {
-    /// Lowest block height any covering store has applied; 0 for a mirrored PPOI list.
-    pub epoch: u64,
-    /// Hex-encoded 32-byte list key.
-    pub list_key: HexHash,
-    /// `(blinded_commitment_hex, list_index)` rows in ascending index order.
-    pub entries: Vec<BcIdxEntry>,
-}
-
-/// One row of the bc-to-idx publishing channel.
-#[cfg(feature = "json-index-channel")]
-#[derive(Debug, Clone, Serialize)]
-pub struct BcIdxEntry {
-    /// Hex-encoded blinded commitment.
-    pub bc: HexHash,
-    /// List index.
-    pub idx: u32,
-}
-
 /// Prefix width for the binary index channel.
 pub const BC_INDEX_PREFIX_BYTES: usize = 6;
 
 /// Largest body the index channel can emit: the list's size decides how many segments a
 /// cold client walks, never how large one of them is.
-#[cfg(feature = "prefix-index-channel")]
 pub const BC_INDEX_SEGMENT_MAX_BYTES: usize =
     BC_INDEX_PREFIX_BYTES * LEAVES_PER_PPOI_BLOCK as usize;
 
 /// Query string of `GET /v1/poi/:list_key_hex/bc-prefixes`.
-#[cfg(feature = "prefix-index-channel")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct IndexSegmentQuery {
     /// Global index to resume from. Absent means the head of the list.
@@ -408,7 +257,6 @@ pub struct IndexSegmentQuery {
     pub since: Option<u32>,
 }
 
-#[cfg(feature = "prefix-index-channel")]
 pub(crate) async fn bc_prefix_segment_handler<S: PirScheme>(
     State(app): State<AppState<S>>,
     Path(list_key_hex): Path<String>,
@@ -417,10 +265,33 @@ pub(crate) async fn bc_prefix_segment_handler<S: PirScheme>(
 ) -> Result<axum::response::Response, StatusCode> {
     let list_key = hex_decode_32(&list_key_hex).ok_or(StatusCode::BAD_REQUEST)?;
     let since = segment.since.unwrap_or(0);
-    off_executor(move || serve_prefix_segment(&app, list_key, since, &headers_in)).await
+    // Waited for here, off the blocking pool, so a queued read holds no thread.
+    let permit = {
+        let registry = app
+            .shim_stores
+            .as_ref()
+            .as_ref()
+            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        Arc::clone(registry.segment_reads())
+    }
+    .acquire_owned()
+    .await
+    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        #[cfg(test)]
+        let _reading = app
+            .shim_stores
+            .as_ref()
+            .as_ref()
+            .map(crate::shim_store::ShimStoreRegistry::segment_read_probe);
+        serve_prefix_segment(&app, list_key, since, &headers_in)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
-#[cfg(feature = "prefix-index-channel")]
+/// Runs under block locks the ingest path also takes, so only ever on the blocking pool.
 fn serve_prefix_segment<S: PirScheme>(
     app: &AppState<S>,
     list_key: [u8; 32],
@@ -430,10 +301,7 @@ fn serve_prefix_segment<S: PirScheme>(
     let coverage = cover_list(app, list_key, BC_PREFIXES_ROUTE, &read_mirror_feeds(app))?;
     // Epoch before rows, so it never names a height whose rows are missing from the body.
     let epoch = coverage.epoch();
-    let mut body = Vec::new();
-    let segment = coverage.segment(since, |bc| {
-        body.extend(bc.iter().copied().take(BC_INDEX_PREFIX_BYTES));
-    });
+    let segment = coverage.segment(since);
     coverage
         .recheck_frontier()
         .map_err(|refusal| refuse_uncovered(BC_PREFIXES_ROUTE, &refusal))?;
@@ -478,235 +346,13 @@ fn serve_prefix_segment<S: PirScheme>(
         Some(epoch)
     };
 
-    let etag = body_etag(&body);
     Ok(serve_publishing_bytes(
-        Bytes::from(body),
-        &etag,
+        segment.prefixes,
+        &segment.etag,
         last_modified,
         headers_in,
-        HeaderValue::from_static("application/octet-stream"),
         &extra,
     ))
-}
-
-/// JSON shape returned by `GET /v1/poi/:list_key_hex/status-header`.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StatusHeaderResponse {
-    /// Lowest block height any covering store has applied; 0 for a mirrored PPOI list.
-    pub epoch: u64,
-    /// Hex-encoded 32-byte list key.
-    pub list_key: HexHash,
-    /// Shield-blocked blinded commitments.
-    pub blocked_bcs: Vec<HexHash>,
-    /// Proof-submitted (pending) blinded commitments.
-    pub pending_bcs: Vec<HexHash>,
-}
-
-#[cfg(feature = "json-index-channel")]
-pub(crate) async fn bc_to_idx_map_handler<S: PirScheme>(
-    State(app): State<AppState<S>>,
-    Path(list_key_hex): Path<String>,
-    headers_in: HeaderMap,
-) -> Result<axum::response::Response, StatusCode> {
-    let list_key = hex_decode_32(&list_key_hex).ok_or(StatusCode::BAD_REQUEST)?;
-    let (kept_app, kept_headers) = (app.clone(), headers_in.clone());
-    if let Some(response) =
-        off_executor(move || serve_index_map(&kept_app, list_key, &kept_headers, false)).await?
-    {
-        return Ok(response);
-    }
-    // The requests queued here are answered from the body the read ahead of them kept, unless
-    // the list moved again in between.
-    let permit = read_permit(&app, ShimStoreRegistry::index_map_reads).await?;
-    off_executor(move || {
-        let _permit = permit;
-        serve_index_map(&app, list_key, &headers_in, true)
-    })
-    .await?
-    .ok_or(StatusCode::INTERNAL_SERVER_ERROR)
-}
-
-/// `None` when the list moved since its body was kept and `may_read` is false.
-#[cfg(feature = "json-index-channel")]
-fn serve_index_map<S: PirScheme>(
-    app: &AppState<S>,
-    list_key: [u8; 32],
-    headers_in: &HeaderMap,
-    may_read: bool,
-) -> Result<Option<axum::response::Response>, StatusCode> {
-    let refuse = |refusal: CoverageRefusal| refuse_uncovered(BC_TO_IDX_MAP_ROUTE, &refusal);
-    let coverage = cover_list(app, list_key, BC_TO_IDX_MAP_ROUTE, &read_mirror_feeds(app))?;
-    // Uncredentialed, pollable and sized by the list, so an unchanged list is answered from the
-    // body its last read kept, a matching revalidation included; only a moved list is read again.
-    let fingerprint = coverage.fingerprint().map_err(refuse)?;
-    if let Some(kept) = coverage.published_index_map(&fingerprint) {
-        coverage.recheck_frontier().map_err(refuse)?;
-        return Ok(Some(serve_publishing_bytes(
-            kept.body,
-            &kept.etag,
-            Some(fingerprint.epoch()),
-            headers_in,
-            HeaderValue::from_static("application/json"),
-            &[],
-        )));
-    }
-    if !may_read {
-        return Ok(None);
-    }
-    let mut rows: Vec<(u32, [u8; 32])> = Vec::new();
-    let read = coverage
-        .read_list(false, |leaf| {
-            rows.push((leaf.global_index, leaf.blinded_commitment));
-        })
-        .map_err(refuse)?;
-    coverage.recheck_frontier().map_err(refuse)?;
-    let body = BcToIdxMapResponse {
-        epoch: read.epoch(),
-        list_key: hex_encode(&list_key),
-        // GLOBAL index: the client resolves a PIR row from it, and the router localizes with
-        // `% 65_536` on the way in, so a block-local index here would collide six ways.
-        entries: rows
-            .iter()
-            .map(|(idx, bc)| BcIdxEntry {
-                bc: hex_encode(bc),
-                idx: *idx,
-            })
-            .collect(),
-    };
-    drop(rows);
-    let json =
-        Bytes::from(serde_json::to_vec(&body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
-    drop(body);
-    let etag = body_etag(&json);
-    let epoch = read.epoch();
-    coverage.publish_index_map(
-        read,
-        PublishedBody {
-            etag: etag.clone(),
-            body: json.clone(),
-        },
-    );
-    Ok(Some(serve_publishing_bytes(
-        json,
-        &etag,
-        Some(epoch),
-        headers_in,
-        HeaderValue::from_static("application/json"),
-        &[],
-    )))
-}
-
-pub(crate) async fn status_header_handler<S: PirScheme>(
-    State(app): State<AppState<S>>,
-    Path(list_key_hex): Path<String>,
-    headers_in: HeaderMap,
-) -> Result<axum::response::Response, StatusCode> {
-    let list_key = hex_decode_32(&list_key_hex).ok_or(StatusCode::BAD_REQUEST)?;
-    // No fingerprint covers statuses, so every answer, a 304 included, reads the whole list.
-    let permit = read_permit(&app, ShimStoreRegistry::status_header_reads).await?;
-    off_executor(move || {
-        let _permit = permit;
-        serve_status_header(&app, list_key, &headers_in)
-    })
-    .await
-}
-
-fn serve_status_header<S: PirScheme>(
-    app: &AppState<S>,
-    list_key: [u8; 32],
-    headers_in: &HeaderMap,
-) -> Result<axum::response::Response, StatusCode> {
-    // Both fields are SETS over the list; a partial store silently shrinks the blocked set,
-    // which reads as "nothing is blocked".
-    let coverage = cover_list(app, list_key, STATUS_HEADER_ROUTE, &read_mirror_feeds(app))?;
-    let blocked_byte = poi_status_byte(POIStatus::ShieldBlocked);
-    let pending_bytes = [
-        poi_status_byte(POIStatus::ProofSubmitted),
-        poi_status_byte(POIStatus::Missing),
-    ];
-    let mut blocked: Vec<[u8; 32]> = Vec::new();
-    let mut pending: Vec<[u8; 32]> = Vec::new();
-    let read = coverage
-        .read_list(true, |leaf| match leaf.status {
-            Some(b) if b == blocked_byte => blocked.push(leaf.blinded_commitment),
-            Some(b) if pending_bytes.contains(&b) => pending.push(leaf.blinded_commitment),
-            _ => {}
-        })
-        .map_err(|refusal| refuse_uncovered(STATUS_HEADER_ROUTE, &refusal))?;
-    coverage
-        .recheck_frontier()
-        .map_err(|refusal| refuse_uncovered(STATUS_HEADER_ROUTE, &refusal))?;
-    let body = StatusHeaderResponse {
-        epoch: read.epoch(),
-        list_key: hex_encode(&list_key),
-        blocked_bcs: blocked.iter().map(hex_encode).collect(),
-        pending_bcs: pending.iter().map(hex_encode).collect(),
-    };
-    serve_publishing_channel(&body, read.epoch(), headers_in)
-}
-
-fn poi_status_byte(s: POIStatus) -> u8 {
-    s.wire_byte()
-}
-
-/// The publishing channels read up to a whole list under store locks the ingest path also takes,
-/// so they run on the blocking pool rather than stall the executor every other route shares.
-async fn off_executor<T, F>(work: F) -> Result<T, StatusCode>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T, StatusCode> + Send + 'static,
-{
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-}
-
-/// A permit from the registry pool `pick` names, held for the whole read. The undeclared
-/// single-store path has no registry and no production caller, so it takes none.
-async fn read_permit<S: PirScheme>(
-    app: &AppState<S>,
-    pick: fn(&ShimStoreRegistry) -> &Arc<tokio::sync::Semaphore>,
-) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, StatusCode> {
-    let Some(registry) = app.shim_stores.as_ref().as_ref() else {
-        return Ok(None);
-    };
-    let pool = Arc::clone(pick(registry));
-    pool.acquire_owned()
-        .await
-        .map(Some)
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
-}
-
-/// ETag + 304 short-circuit for publishing channels; ETag = SHA-256(body)[..16] hex.
-fn serve_publishing_channel<T: Serialize>(
-    body: &T,
-    epoch: u64,
-    headers_in: &HeaderMap,
-) -> Result<axum::response::Response, StatusCode> {
-    let json = serde_json::to_vec(body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let etag = body_etag(&json);
-    Ok(serve_publishing_bytes(
-        Bytes::from(json),
-        &etag,
-        Some(epoch),
-        headers_in,
-        HeaderValue::from_static("application/json"),
-        &[],
-    ))
-}
-
-/// Quoted SHA-256(body)[..16] hex.
-fn body_etag(body: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let digest = Sha256::digest(body);
-    let mut etag = String::with_capacity(2 + 32);
-    etag.push('"');
-    for b in digest.iter().take(16) {
-        let _ = write!(etag, "{b:02x}");
-    }
-    etag.push('"');
-    etag
 }
 
 fn if_none_match(headers_in: &HeaderMap) -> Option<&str> {
@@ -729,11 +375,10 @@ fn not_modified(etag: &str, extra: &[(HeaderName, HeaderValue)]) -> axum::respon
 }
 
 fn serve_publishing_bytes(
-    body: Bytes,
+    body: bytes::Bytes,
     etag: &str,
     last_modified: Option<u64>,
     headers_in: &HeaderMap,
-    content_type: HeaderValue,
     extra: &[(HeaderName, HeaderValue)],
 ) -> axum::response::Response {
     if if_none_match(headers_in) == Some(etag) {
@@ -741,7 +386,10 @@ fn serve_publishing_bytes(
     }
 
     let mut hdrs = HeaderMap::new();
-    hdrs.insert(axum::http::header::CONTENT_TYPE, content_type);
+    hdrs.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
     if let Ok(v) = HeaderValue::from_str(etag) {
         hdrs.insert(ETAG_HEADER, v);
     }
@@ -758,38 +406,21 @@ fn serve_publishing_bytes(
     (StatusCode::OK, hdrs, body).into_response()
 }
 
-/// Build the wallet-shim + publishing-channel router.
+/// Build the wallet-shim + index-channel router.
 pub fn poi_shim_routes<S: PirScheme>(state: AppState<S>) -> axum::Router {
     use axum::routing::{get, post};
-    let router = axum::Router::new()
-        .route("/v1/poi/pois-per-list", post(pois_per_list_handler::<S>))
+    axum::Router::new()
         .route("/v1/poi/merkle-proofs", post(merkle_proofs_handler::<S>))
         .route(
             "/v1/commit-tree/:tree_number/merkle-proof",
             post(commit_tree_proof_handler::<S>),
         )
         .route(
-            "/v1/poi/:list_key_hex/status-header",
-            get(status_header_handler::<S>),
-        );
-    #[cfg(feature = "json-index-channel")]
-    let router = router.route(
-        "/v1/poi/:list_key_hex/bc-to-idx-map",
-        get(bc_to_idx_map_handler::<S>),
-    );
-    #[cfg(feature = "prefix-index-channel")]
-    let router = router.route(
-        "/v1/poi/:list_key_hex/bc-prefixes",
-        get(bc_prefix_segment_handler::<S>),
-    );
-    router.with_state(state)
+            "/v1/poi/:list_key_hex/bc-prefixes",
+            get(bc_prefix_segment_handler::<S>),
+        )
+        .with_state(state)
 }
-
-/// Re-exported so fixtures can seed a [`LogicalLeafStore`].
-pub use raven_railgun_engine::inspire::apply_wal_entry as apply_wal_entry_for_test;
-
-/// `Arc<Mutex<LogicalLeafStore>>` alias for passing to [`AppState`].
-pub type SharedLogicalStore = Arc<parking_lot::Mutex<LogicalLeafStore>>;
 
 #[cfg(test)]
 mod tests {
@@ -823,19 +454,12 @@ mod tests {
         assert!(s.ends_with("0102"));
     }
 
-    #[test]
-    fn poi_status_byte_round_trips_each_variant() {
-        assert_eq!(poi_status_byte(POIStatus::Valid), 0);
-        assert_eq!(poi_status_byte(POIStatus::ShieldBlocked), 1);
-        assert_eq!(poi_status_byte(POIStatus::ProofSubmitted), 2);
-        assert_eq!(poi_status_byte(POIStatus::Missing), 3);
-    }
-
-    mod publishing_reads {
+    mod index_channel_reads {
         use super::super::*;
-        use crate::shim_store::STATUS_HEADER_READS_AT_ONCE;
+        use crate::shim_store::{ShimStoreRegistry, SEGMENT_READS_AT_ONCE};
         use crate::status::{MirrorFeedState, MirrorFeedView};
         use crate::HttpConfig;
+        use raven_railgun_engine::inspire::{apply_wal_entry, LogicalLeafStore};
         use raven_railgun_engine::orchestrator::DataSourceFilter;
         use raven_railgun_engine::pir_table::PerLeafCommitmentEncoder;
         use raven_railgun_engine::Engine;
@@ -871,44 +495,45 @@ mod tests {
             }
         }
 
+        /// Canonical BN254 Fr, with the seed inside the published six-byte prefix too.
         fn fr(seed: u32) -> [u8; 32] {
             let mut out = [0u8; 32];
+            out[1..5].copy_from_slice(&seed.to_be_bytes());
             out[20] = 0x01;
             out[28..].copy_from_slice(&seed.to_be_bytes());
             out
         }
 
-        fn append(store: &SharedLogicalStore, local_indices: std::ops::Range<u32>) {
-            let enc = PerLeafCommitmentEncoder::new(32, 65_536, 0).expect("encoder");
-            let mut guard = store.lock();
-            for local in local_indices {
-                apply_wal_entry_for_test(
-                    &mut guard,
-                    &WalEntryPayload::PpoiListLeafAdded {
-                        list_key: LIST_KEY,
-                        list_index: local,
-                        blinded_commitment: fr(local),
-                        status: 0,
-                        event_type: raven_railgun_persistence::PpoiEventType::Shield,
-                        signature: vec![0; 64],
-                        validated_merkleroot: [0; 32],
-                    },
-                    1_000 + u64::from(local),
-                    &enc,
-                )
-                .expect("seed ppoi leaf");
-            }
+        fn leaf(local: u32, seed: u32) -> (WalEntryPayload, u64) {
+            (
+                WalEntryPayload::PpoiListLeafAdded {
+                    list_key: LIST_KEY,
+                    list_index: local,
+                    blinded_commitment: fr(seed),
+                    status: 0,
+                    event_type: raven_railgun_persistence::PpoiEventType::Shield,
+                    signature: vec![0; 64],
+                    validated_merkleroot: [0; 32],
+                },
+                1_000 + u64::from(local),
+            )
         }
 
-        fn store_with(rows: u32) -> SharedLogicalStore {
-            let store: SharedLogicalStore =
-                Arc::new(parking_lot::Mutex::new(LogicalLeafStore::new()));
-            append(&store, 0..rows);
-            store
+        fn encoder() -> PerLeafCommitmentEncoder {
+            PerLeafCommitmentEncoder::new(32, LEAVES_PER_PPOI_BLOCK, 0).expect("encoder")
         }
 
-        /// One declared block holding `rows` rows, with upstream counting exactly that many.
-        fn covered_app(store: &SharedLogicalStore, rows: u64) -> AppState<StubScheme> {
+        /// Block `block` holding `rows` rows, each seeded with its global index.
+        fn block_store(block: u32, rows: u32) -> CoveredStore {
+            let base = block * LEAVES_PER_PPOI_BLOCK;
+            let run: Vec<_> = (0..rows).map(|local| leaf(local, base + local)).collect();
+            let mut store = LogicalLeafStore::new();
+            store.seed_leaf_run(&run, &encoder()).expect("seed rows");
+            Arc::new(parking_lot::Mutex::new(store))
+        }
+
+        /// Blocks `0..` in order, with upstream counting exactly the rows they hold.
+        fn covered_app(blocks: &[CoveredStore], rows: u64) -> AppState<StubScheme> {
             let view = MirrorFeedView {
                 list_key: hex_encode(&LIST_KEY),
                 state: MirrorFeedState::Syncing,
@@ -919,18 +544,24 @@ mod tests {
                 last_failure: None,
                 seconds_since_answer: Some(0),
             };
+            let declarations: Vec<_> = (0u32..)
+                .zip(blocks)
+                .map(|(block, store)| {
+                    (
+                        DataSourceFilter::PpoiListBlock {
+                            list_key: LIST_KEY,
+                            block,
+                        },
+                        Arc::clone(store),
+                    )
+                })
+                .collect();
             AppState::new(
                 Engine::<StubScheme>::new(),
                 HttpConfig::demo("shim-unit-test-token"),
             )
             .expect("appstate")
-            .with_shim_stores([(
-                DataSourceFilter::PpoiListBlock {
-                    list_key: LIST_KEY,
-                    block: 0,
-                },
-                Arc::clone(store),
-            )])
+            .with_shim_stores(declarations)
             .with_mirror_feeds(Arc::new(move || vec![view.clone()]))
         }
 
@@ -938,17 +569,12 @@ mod tests {
             app.shim_stores.as_ref().as_ref().expect("registry")
         }
 
-        #[cfg(feature = "json-index-channel")]
-        fn revalidating(etag: &str) -> HeaderMap {
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                IF_NONE_MATCH_HEADER,
-                HeaderValue::from_str(etag).expect("etag"),
-            );
-            headers
+        async fn body_of(response: axum::response::Response) -> bytes::Bytes {
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body")
         }
 
-        #[cfg(feature = "json-index-channel")]
         fn etag_of(response: &axum::response::Response) -> String {
             response
                 .headers()
@@ -958,15 +584,7 @@ mod tests {
                 .to_owned()
         }
 
-        #[cfg(feature = "json-index-channel")]
-        async fn body_of(response: axum::response::Response) -> Bytes {
-            axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("body")
-        }
-
         /// Poll `done` for up to ten seconds; the interleavings below are staged, not timed.
-        #[cfg(feature = "json-index-channel")]
         async fn until(mut done: impl FnMut() -> bool) {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while !done() {
@@ -975,124 +593,202 @@ mod tests {
             }
         }
 
-        /// The channel is uncredentialed and pollable, so an unchanged list is answered from the
-        /// body its last read kept, a matching revalidation and a repeat 200 alike; a list that
-        /// moved since is read again.
-        #[cfg(feature = "json-index-channel")]
+        /// A sealed block's rows are walked once and its body is answered again, a mid-block
+        /// `since` included, while the frontier is walked on every read. The body is kept by
+        /// the block's root, so rows that change under a full block are read again.
         #[tokio::test]
-        async fn an_unchanged_list_is_answered_without_a_read_and_a_moved_list_is_read_again() {
-            let store = store_with(4);
-            let app = covered_app(&store, 4);
-            let serve = |headers: &HeaderMap, may_read| {
-                serve_index_map(&app, LIST_KEY, headers, may_read)
-                    .expect("served")
-                    .expect("answered")
+        async fn a_sealed_repeat_rebuilds_nothing_until_the_block_changes() {
+            let sealed = block_store(0, LEAVES_PER_PPOI_BLOCK);
+            let frontier = block_store(1, 3);
+            let app = covered_app(
+                &[Arc::clone(&sealed), frontier],
+                u64::from(LEAVES_PER_PPOI_BLOCK) + 3,
+            );
+            let get = |since: u32| {
+                let walked = registry(&app).blocks_walked();
+                let response =
+                    serve_prefix_segment(&app, LIST_KEY, since, &HeaderMap::new()).expect("served");
+                assert_eq!(response.status(), StatusCode::OK, "since={since}");
+                (response, registry(&app).blocks_walked() - walked)
             };
 
-            let first = serve(&HeaderMap::new(), true);
-            assert_eq!(first.status(), StatusCode::OK);
+            let (first, walked) = get(0);
+            assert_eq!(walked, 1);
             let etag = etag_of(&first);
-            let first_body = body_of(first).await;
-            assert_eq!(registry(&app).list_reads(), 1);
+            let body = body_of(first).await;
+            assert_eq!(body.len(), BC_INDEX_SEGMENT_MAX_BYTES);
 
-            for _ in 0..3 {
-                let again = serve(&revalidating(&etag), false);
-                assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
-                assert_eq!(etag_of(&again), etag);
-            }
-            let repeat = serve(&revalidating("\"not-it\""), false);
-            assert_eq!(repeat.status(), StatusCode::OK);
+            let (repeat, walked) = get(0);
+            assert_eq!(walked, 0, "a sealed repeat must not rebuild the body");
             assert_eq!(etag_of(&repeat), etag);
-            assert_eq!(body_of(repeat).await, first_body);
+            assert_eq!(body_of(repeat).await, body);
+
+            let (mid, walked) = get(10);
             assert_eq!(
-                registry(&app).list_reads(),
-                1,
-                "an unchanged list must be answered before it is read"
+                walked, 0,
+                "a resume inside a sealed block must not rebuild the body"
+            );
+            assert_eq!(
+                body_of(mid).await,
+                body.slice(10 * BC_INDEX_PREFIX_BYTES..),
+                "position i must still be the row at global index since + i"
             );
 
-            append(&store, 4..5);
-            assert!(
-                serve_index_map(&app, LIST_KEY, &revalidating(&etag), false)
-                    .expect("served")
-                    .is_none(),
-                "a list that grew must not revalidate against its old body"
+            for _ in 0..2 {
+                let (_, walked) = get(LEAVES_PER_PPOI_BLOCK);
+                assert_eq!(
+                    walked, 1,
+                    "the frontier still grows, so it is read every time"
+                );
+            }
+
+            // A rewind past the block's tail, refilled with other rows: full again, new root.
+            let refill_from = LEAVES_PER_PPOI_BLOCK - 500;
+            let enc = encoder();
+            {
+                let mut store = sealed.lock();
+                apply_wal_entry(
+                    &mut store,
+                    &WalEntryPayload::Reorg {
+                        height: 1_000 + u64::from(refill_from) - 1,
+                    },
+                    1_000 + u64::from(refill_from) - 1,
+                    &enc,
+                )
+                .expect("rewind");
+                for local in refill_from..LEAVES_PER_PPOI_BLOCK {
+                    let (payload, height) = leaf(local, 0x00ff_0000 + local);
+                    apply_wal_entry(&mut store, &payload, height, &enc).expect("refill");
+                }
+            }
+            let (changed, walked) = get(0);
+            assert_eq!(
+                walked, 1,
+                "a sealed block whose rows changed must be read again"
             );
-            let moved = serve(&revalidating(&etag), true);
-            assert_eq!(moved.status(), StatusCode::OK);
-            assert_ne!(etag_of(&moved), etag);
-            assert_eq!(registry(&app).list_reads(), 2);
+            assert_ne!(etag_of(&changed), etag);
+            let changed = body_of(changed).await;
+            let tail = usize::try_from(refill_from).expect("usize") * BC_INDEX_PREFIX_BYTES;
+            assert_eq!(changed.slice(..tail), body.slice(..tail));
+            assert_eq!(
+                changed.slice(tail..tail + BC_INDEX_PREFIX_BYTES).to_vec(),
+                fr(0x00ff_0000 + refill_from)
+                    .into_iter()
+                    .take(BC_INDEX_PREFIX_BYTES)
+                    .collect::<Vec<_>>()
+            );
+            let (_, walked) = get(0);
+            assert_eq!(walked, 0);
         }
 
-        /// A 200 costs a whole-list read and a body sized by the list, so requests that find no
-        /// kept body queue for one read at a time and the ones behind it are answered from what
-        /// it kept. Every request below misses before the first read is let through.
-        #[cfg(feature = "json-index-channel")]
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn requests_queued_behind_a_read_are_answered_from_its_body() {
-            const REQUESTS: usize = 8;
-            let store = store_with(4);
-            let app = covered_app(&store, 4);
-            let held = Arc::clone(registry(&app).index_map_reads())
-                .acquire_owned()
-                .await
-                .expect("permit");
+        /// A reorg that drops a middle row of a sealed block leaves its count and root unchanged.
+        /// A process that kept the block's body must refuse it exactly as a fresh process does,
+        /// not answer the pre-reorg bytes as immutable.
+        #[tokio::test]
+        async fn a_kept_sealed_body_is_refused_once_a_reorg_tears_the_block() {
+            const DROPPED: u32 = 30_000;
+            const DROPPED_AT: u64 = 5_000_000;
+            let run: Vec<_> = (0..LEAVES_PER_PPOI_BLOCK)
+                .map(|local| {
+                    let (payload, height) = leaf(local, local);
+                    (payload, if local == DROPPED { DROPPED_AT } else { height })
+                })
+                .collect();
+            let mut seeded = LogicalLeafStore::new();
+            seeded.seed_leaf_run(&run, &encoder()).expect("seed rows");
+            let sealed = Arc::new(parking_lot::Mutex::new(seeded));
+            let frontier = block_store(1, 3);
+            let rows = u64::from(LEAVES_PER_PPOI_BLOCK) + 3;
+            let stores = [Arc::clone(&sealed), Arc::clone(&frontier)];
+            let kept = covered_app(&stores, rows);
 
-            let walked_before = registry(&app).blocks_walked();
-            let requests: Vec<_> = (0..REQUESTS)
+            let first =
+                serve_prefix_segment(&kept, LIST_KEY, 0, &HeaderMap::new()).expect("served");
+            assert_eq!(first.status(), StatusCode::OK);
+
+            let state = |store: &CoveredStore| {
+                let guard = store.lock();
+                let imt = guard.ppoi_imt(&LIST_KEY).expect("imt");
+                (imt.leaf_count(), imt.root())
+            };
+            let before = state(&sealed);
+            apply_wal_entry(
+                &mut sealed.lock(),
+                &WalEntryPayload::Reorg {
+                    height: DROPPED_AT - 1,
+                },
+                DROPPED_AT - 1,
+                &encoder(),
+            )
+            .expect("reorg");
+            assert_eq!(
+                state(&sealed),
+                before,
+                "the tear leaves count and root alone"
+            );
+            assert!(sealed.lock().ppoi_bc_at(&LIST_KEY, DROPPED).is_none());
+
+            let fresh =
+                serve_prefix_segment(&covered_app(&stores, rows), LIST_KEY, 0, &HeaderMap::new())
+                    .map(|response| response.status());
+            assert_eq!(fresh, Err(StatusCode::SERVICE_UNAVAILABLE));
+            let repeat = serve_prefix_segment(&kept, LIST_KEY, 0, &HeaderMap::new())
+                .map(|response| response.status());
+            assert_eq!(repeat, fresh, "a kept body outlived the tear");
+            let mid = serve_prefix_segment(&kept, LIST_KEY, 10, &HeaderMap::new())
+                .map(|response| response.status());
+            assert_eq!(mid, fresh);
+        }
+
+        /// A segment read holds a blocking-pool thread `/batch` also responds on, so past the
+        /// pool's permits a request waits without starting a read.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn segment_reads_past_the_pool_wait_for_a_permit() {
+            let store = block_store(0, 4);
+            let app = covered_app(&[Arc::clone(&store)], 4);
+
+            // Held on its own thread so every read that starts blocks on it.
+            let (locked_tx, locked) = std::sync::mpsc::channel::<()>();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let holder = {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    let _guard = store.lock();
+                    let _ = locked_tx.send(());
+                    let _ = released.recv();
+                })
+            };
+            locked.recv().expect("store locked");
+
+            let requests: Vec<_> = (0..=SEGMENT_READS_AT_ONCE)
                 .map(|_| {
-                    tokio::spawn(bc_to_idx_map_handler(
+                    tokio::spawn(bc_prefix_segment_handler(
                         State(app.clone()),
                         Path(hex_encode(&LIST_KEY)),
+                        Query(IndexSegmentQuery { since: None }),
                         HeaderMap::new(),
                     ))
                 })
                 .collect();
-            // One block walked per request is each request's fingerprint missing the empty cache.
-            until(|| registry(&app).blocks_walked() - walked_before >= REQUESTS).await;
-            assert_eq!(registry(&app).list_reads(), 0);
-            drop(held);
+            until(|| registry(&app).segment_reads_now_and_peak().0 >= SEGMENT_READS_AT_ONCE).await;
+            // Time for the request past the pool to start a read, if it could.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert_eq!(
+                registry(&app).segment_reads_now_and_peak(),
+                (SEGMENT_READS_AT_ONCE, SEGMENT_READS_AT_ONCE),
+                "a read ran past the pool's permits"
+            );
 
-            let mut etags = std::collections::BTreeSet::new();
+            release.send(()).expect("release");
+            holder.join().expect("holder");
             for request in requests {
                 let response = request.await.expect("joined").expect("served");
                 assert_eq!(response.status(), StatusCode::OK);
-                etags.insert(etag_of(&response));
             }
-            assert_eq!(etags.len(), 1);
             assert_eq!(
-                registry(&app).list_reads(),
-                1,
-                "requests queued behind a read must be answered from its body"
+                registry(&app).segment_reads_now_and_peak(),
+                (0, SEGMENT_READS_AT_ONCE)
             );
-        }
-
-        /// No fingerprint covers statuses, so each status answer reads the whole list; past the
-        /// pool's permits a request waits rather than start another read.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn a_status_read_past_the_pool_waits_for_a_permit() {
-            let store = store_with(4);
-            let app = covered_app(&store, 4);
-            let pool = Arc::clone(registry(&app).status_header_reads());
-            let held = pool
-                .acquire_many_owned(
-                    u32::try_from(STATUS_HEADER_READS_AT_ONCE).expect("permit count"),
-                )
-                .await
-                .expect("permits");
-
-            let request = tokio::spawn(status_header_handler(
-                State(app.clone()),
-                Path(hex_encode(&LIST_KEY)),
-                HeaderMap::new(),
-            ));
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            assert!(!request.is_finished(), "a read ran with every permit held");
-            assert_eq!(registry(&app).list_reads(), 0);
-
-            drop(held);
-            let response = request.await.expect("joined").expect("served");
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(registry(&app).list_reads(), 1);
         }
     }
 }

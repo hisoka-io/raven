@@ -42,10 +42,6 @@ struct Fixture {
     query: SeededClientQuery,
 }
 
-fn fixture() -> Fixture {
-    fixture_with(HttpConfig::demo(READ_TOKEN), None)
-}
-
 /// `store_limits` stands in for the operator wiring that opens each instance's store from the
 /// same config; `None` keeps the store at its compiled defaults.
 fn fixture_with(config: HttpConfig, store_limits: Option<SessionStoreLimits>) -> Fixture {
@@ -166,142 +162,9 @@ async fn query_status(
         .status()
 }
 
-#[tokio::test]
-async fn an_anonymous_establish_storm_cannot_retire_another_callers_session() {
-    let Fixture {
-        router,
-        instance,
-        victim_keys,
-        attacker_keys,
-        query,
-    } = fixture();
-
-    let (victim_status, victim_handle) = establish(&router, VICTIM_CLIENT, victim_keys).await;
-    assert_eq!(
-        victim_status,
-        StatusCode::OK,
-        "premise: the victim establishes with no credential at all"
-    );
-    assert_eq!(
-        query_status(&router, VICTIM_CLIENT, &query, victim_handle).await,
-        StatusCode::OK,
-        "premise: the victim's session serves a query before the storm"
-    );
-
-    // One request per pool slot, all anonymous, all from one peer, well inside the
-    // 200 rps / 400 burst the route is limited to.
-    let mut refused = 0usize;
-    for index in 0..DEFAULT_MAX_SESSIONS {
-        let (status, _) = establish(&router, &client_id_of(index), attacker_keys.clone()).await;
-        if status != StatusCode::OK {
-            refused += 1;
-        }
-    }
-
-    let store = instance.current_state();
-    let flushes = store.session_store.flushes_total();
-    assert_eq!(
-        query_status(&router, VICTIM_CLIENT, &query, victim_handle).await,
-        StatusCode::OK,
-        "the victim's next query must still be served after {DEFAULT_MAX_SESSIONS} anonymous \
-         establishes ({refused} refused, {flushes} whole-generation reclamations)"
-    );
-    assert!(
-        store
-            .session_store
-            .resolve(Some(ServerSessionHandle(victim_handle)), Instant::now())
-            .is_ok(),
-        "the victim's packing keys must survive the storm"
-    );
-    assert_eq!(flushes, 0, "no establish may reclaim a whole generation");
-
-    // A session the operator genuinely retires still dies.
-    heartbeat_session_eviction(&instance).expect("evict session generation");
-    assert_eq!(
-        query_status(&router, VICTIM_CLIENT, &query, victim_handle).await,
-        StatusCode::CONFLICT,
-        "an operator-retired generation must still refuse the handle"
-    );
-}
-
-#[tokio::test]
-async fn re_establishing_under_one_identity_costs_the_pool_one_slot() {
-    let Fixture {
-        router,
-        instance,
-        victim_keys,
-        ..
-    } = fixture();
-
-    let mut last: Option<u64> = None;
-    for round in 0..4 {
-        let (status, handle) = establish(&router, VICTIM_CLIENT, victim_keys.clone()).await;
-        assert_eq!(status, StatusCode::OK, "re-establish {round} must succeed");
-        assert_ne!(
-            Some(handle),
-            last,
-            "each handshake must mint a fresh handle (round {round})"
-        );
-        last = Some(handle);
-        assert_eq!(
-            instance.current_state().session_store.len(),
-            1,
-            "one identity must never hold more than one slot (round {round})"
-        );
-    }
-
-    let last = last.expect("four rounds ran");
-    assert!(
-        instance
-            .current_state()
-            .session_store
-            .resolve(Some(ServerSessionHandle(last)), Instant::now())
-            .is_ok(),
-        "the surviving slot must be the newest handshake"
-    );
-}
-
-#[tokio::test]
-async fn a_full_pool_refuses_a_new_identity_instead_of_retiring_an_old_one() {
-    let Fixture {
-        router,
-        instance,
-        attacker_keys,
-        ..
-    } = fixture();
-
-    let mut first_handle = None;
-    for index in 0..DEFAULT_MAX_SESSIONS {
-        let (status, handle) =
-            establish(&router, &client_id_of(index), attacker_keys.clone()).await;
-        assert_eq!(status, StatusCode::OK, "slot {index} must be admitted");
-        first_handle.get_or_insert(handle);
-    }
-    let first_handle = first_handle.expect("at least one slot");
-
-    let (status, _) = establish(
-        &router,
-        &client_id_of(DEFAULT_MAX_SESSIONS),
-        attacker_keys.clone(),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "a full pool must refuse rather than reclaim"
-    );
-    assert!(
-        instance
-            .current_state()
-            .session_store
-            .resolve(Some(ServerSessionHandle(first_handle)), Instant::now())
-            .is_ok(),
-        "the refusal must leave the oldest live session serving"
-    );
-}
-
-/// The storm again, at a pool the operator sized rather than the compiled default: the
-/// configured ceiling is what refuses, and it still refuses instead of retiring the victim.
+/// An anonymous establish storm at a pool the operator sized: the configured ceiling, not the
+/// compiled default, is what refuses, and it refuses instead of retiring the victim. A session
+/// the operator genuinely retires still dies.
 #[tokio::test]
 async fn an_anonymous_storm_at_a_configured_pool_size_cannot_retire_a_session() {
     const SEATS: usize = 4;
@@ -347,10 +210,18 @@ async fn an_anonymous_storm_at_a_configured_pool_size_cannot_retire_a_session() 
         StatusCode::OK,
         "the victim must still be served once the configured pool is full"
     );
+
+    heartbeat_session_eviction(&instance).expect("evict session generation");
+    assert_eq!(
+        query_status(&router, VICTIM_CLIENT, &query, victim_handle).await,
+        StatusCode::CONFLICT,
+        "an operator-retired generation must still refuse the handle"
+    );
 }
 
 /// A binding that lapses before its seat strands the seat: the re-handshake finds nothing to
-/// take, and one identity then holds two seats until the store's own expiry.
+/// take, and one identity then holds two seats until the store's own expiry. Every
+/// re-handshake mints a fresh handle and still costs the pool one seat.
 #[tokio::test]
 async fn a_binding_lives_as_long_as_its_seat_not_the_http_lifetime() {
     let mut config = HttpConfig::demo(READ_TOKEN);
@@ -372,11 +243,27 @@ async fn a_binding_lives_as_long_as_its_seat_not_the_http_lifetime() {
         StatusCode::OK,
         "the seat is still live, so its binding must be too"
     );
-    let (status, _) = establish(&router, VICTIM_CLIENT, victim_keys).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        instance.current_state().session_store.len(),
-        1,
-        "a re-handshake must release the seat it replaces"
+    let mut last = handle;
+    for round in 0..4 {
+        let (status, handle) = establish(&router, VICTIM_CLIENT, victim_keys.clone()).await;
+        assert_eq!(status, StatusCode::OK, "re-establish {round} must succeed");
+        assert_ne!(
+            handle, last,
+            "each handshake must mint a fresh handle (round {round})"
+        );
+        last = handle;
+        assert_eq!(
+            instance.current_state().session_store.len(),
+            1,
+            "a re-handshake must release the seat it replaces (round {round})"
+        );
+    }
+    assert!(
+        instance
+            .current_state()
+            .session_store
+            .resolve(Some(ServerSessionHandle(last)), Instant::now())
+            .is_ok(),
+        "the surviving seat must be the newest handshake"
     );
 }

@@ -17,8 +17,10 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use raven_railgun_engine::inspire::{apply_wal_entry, LogicalLeafStore};
+use raven_railgun_engine::orchestrator::DataSourceFilter;
 use raven_railgun_engine::pir_table::PerLeafCommitmentEncoder;
 use raven_railgun_engine::{Engine, PirScheme};
+use raven_railgun_http::status::{MirrorFeedState, MirrorFeedView};
 use raven_railgun_http::{poi_shim, AppState, HttpConfig};
 use raven_railgun_persistence::WalEntryPayload;
 use serde::{Deserialize, Serialize};
@@ -65,51 +67,50 @@ fn fr_canonical(tag: u8) -> [u8; 32] {
     out
 }
 
-fn build_router_with_seed(
-    leaves: &[(u32, u32, u8)],
-    list_leaves: &[([u8; 32], u32, u8, u8)],
-) -> Router {
+/// One declared block of `list_key` holding `bc_tags` in order, at upstream's count.
+fn build_router(list_key: [u8; 32], bc_tags: &[u8]) -> Router {
     let mut store = LogicalLeafStore::new();
     let enc = PerLeafCommitmentEncoder::new(32, ENTRIES_PER_SHARD, 0).expect("encoder");
-    for (tree, idx, tag) in leaves {
-        apply_wal_entry(
-            &mut store,
-            &WalEntryPayload::AppendLeaf {
-                tree_number: *tree,
-                leaf_index: *idx,
-                commitment: fr_canonical(*tag),
-            },
-            100 + u64::from(*idx),
-            &enc,
-        )
-        .expect("seed leaf");
-    }
-    for (lk, idx, tag, status) in list_leaves {
+    for (idx, tag) in (0u32..).zip(bc_tags) {
         apply_wal_entry(
             &mut store,
             &WalEntryPayload::PpoiListLeafAdded {
-                list_key: *lk,
-                list_index: *idx,
+                list_key,
+                list_index: idx,
                 blinded_commitment: fr_canonical(*tag),
-                status: *status,
+                status: 0,
                 event_type: raven_railgun_persistence::PpoiEventType::Shield,
                 signature: vec![0; 64],
                 validated_merkleroot: [0; 32],
             },
-            200 + u64::from(*idx),
+            200 + u64::from(idx),
             &enc,
         )
         .expect("seed ppoi leaf");
     }
 
-    let store_arc = Arc::new(parking_lot::Mutex::new(store));
+    let rows = u64::try_from(bc_tags.len()).expect("row count");
+    let upstream = MirrorFeedView {
+        list_key: hex_encode_bytes(&list_key),
+        state: MirrorFeedState::Syncing,
+        rows_held: rows,
+        upstream_rows: Some(rows),
+        next_index: rows,
+        consecutive_failures: 0,
+        last_failure: None,
+        seconds_since_answer: Some(0),
+    };
     let cfg = HttpConfig::demo(TOKEN);
     let engine: Engine<StubScheme> = Engine::new();
     let state = {
         let _g = APPSTATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         AppState::new(engine, cfg).expect("appstate")
     }
-    .with_logical_store(Arc::clone(&store_arc));
+    .with_shim_stores([(
+        DataSourceFilter::PpoiListBlock { list_key, block: 0 },
+        Arc::new(parking_lot::Mutex::new(store)),
+    )])
+    .with_mirror_feeds(Arc::new(move || vec![upstream.clone()]));
     poi_shim::poi_shim_routes(state)
 }
 
@@ -137,7 +138,7 @@ async fn merkle_proof_json_keys_match_upstream_shape() {
     let bc_tag = 0x11;
     let bc_hex = hex_encode_bytes(&fr_canonical(bc_tag));
     let lk_hex = hex_encode_bytes(&lk);
-    let router = build_router_with_seed(&[], &[(lk, 0, bc_tag, 0)]);
+    let router = build_router(lk, &[bc_tag]);
     let payload = serde_json::json!({
         "listKey": lk_hex,
         "blindedCommitments": [bc_hex],
@@ -174,101 +175,4 @@ async fn merkle_proof_json_keys_match_upstream_shape() {
     for e in entry["elements"].as_array().expect("elements") {
         assert!(e.is_string(), "every element must be string");
     }
-}
-
-#[tokio::test]
-async fn pois_per_list_status_values_use_pascal_case_enum_names() {
-    let lk = fr_canonical(0x42);
-    let lk_hex = hex_encode_bytes(&lk);
-    let bc_a = hex_encode_bytes(&fr_canonical(0x11));
-    let bc_b = hex_encode_bytes(&fr_canonical(0x22));
-    let bc_c = hex_encode_bytes(&fr_canonical(0x33));
-    // 0=Valid, 1=ShieldBlocked, 2=ProofSubmitted
-    let router =
-        build_router_with_seed(&[], &[(lk, 0, 0x11, 0), (lk, 1, 0x22, 1), (lk, 2, 0x33, 2)]);
-    let payload = serde_json::json!({
-        "txidVersion": "V2_PoseidonMerkle",
-        "listKeys": [lk_hex],
-        "blindedCommitmentDatas": [
-            { "blindedCommitment": bc_a, "type": "Shield" },
-            { "blindedCommitment": bc_b, "type": "Shield" },
-            { "blindedCommitment": bc_c, "type": "Shield" },
-        ],
-    });
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/v1/poi/pois-per-list")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(payload.to_string()))
-        .expect("build req");
-    let resp = router.oneshot(req).await.expect("dispatch");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = body_bytes(resp).await;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("decode");
-    assert_eq!(json[&bc_a][&lk_hex].as_str(), Some("Valid"));
-    assert_eq!(json[&bc_b][&lk_hex].as_str(), Some("ShieldBlocked"));
-    assert_eq!(json[&bc_c][&lk_hex].as_str(), Some("ProofSubmitted"));
-}
-
-#[cfg(feature = "json-index-channel")]
-#[tokio::test]
-async fn bc_to_idx_map_json_envelope_shape() {
-    let lk = fr_canonical(0x42);
-    let lk_hex = hex_encode_bytes(&lk);
-    let router =
-        build_router_with_seed(&[], &[(lk, 0, 0x11, 0), (lk, 1, 0x22, 1), (lk, 2, 0x33, 2)]);
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(format!("/v1/poi/{lk_hex}/bc-to-idx-map"))
-        .body(Body::empty())
-        .expect("build req");
-    let resp = router.oneshot(req).await.expect("dispatch");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = body_bytes(resp).await;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("decode");
-    let obj = json.as_object().expect("object");
-    let keys: std::collections::BTreeSet<&str> =
-        obj.keys().map(std::string::String::as_str).collect();
-    let expected: std::collections::BTreeSet<&str> =
-        ["epoch", "listKey", "entries"].iter().copied().collect();
-    assert_eq!(
-        keys, expected,
-        "envelope must be exactly {{ epoch, listKey, entries }}"
-    );
-    assert!(json["epoch"].is_number());
-    assert_eq!(json["listKey"].as_str(), Some(lk_hex.as_str()));
-    let entries = json["entries"].as_array().expect("entries");
-    assert_eq!(entries.len(), 3);
-    for e in entries {
-        let inner = e.as_object().expect("entry object");
-        let entry_keys: std::collections::BTreeSet<&str> =
-            inner.keys().map(std::string::String::as_str).collect();
-        assert_eq!(
-            entry_keys,
-            ["bc", "idx"].iter().copied().collect(),
-            "entry must be {{ bc, idx }}"
-        );
-        assert!(inner["bc"].is_string());
-        assert!(inner["idx"].is_number());
-    }
-}
-
-/// Empty POST must 4xx (client error), not 5xx.
-#[tokio::test]
-async fn empty_pois_per_list_post_returns_client_error_not_server_error() {
-    let router = build_router_with_seed(&[], &[]);
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/v1/poi/pois-per-list")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::empty())
-        .expect("build req");
-    let resp = router.oneshot(req).await.expect("dispatch");
-    // Exactly 400: `is_client_error()` also accepts the 404/405 a deleted or
-    // renamed route would produce, which is the opposite of route coverage.
-    assert_eq!(
-        resp.status(),
-        StatusCode::BAD_REQUEST,
-        "empty body POST must be refused by the handler with 400"
-    );
 }

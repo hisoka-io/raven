@@ -21,13 +21,17 @@ use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::{
-    extract_inspiring, extract_with_variant, query, query_seeded, respond_seeded_inspiring,
-    respond_with_variant, PackingMode, ServerCrs,
+    extract_with_variant, query, query_seeded, respond_with_variant, PackingMode, ServerCrs,
+    ServerResponse,
 };
 use raven_railgun_core::InstanceId;
-use raven_railgun_engine::inspire::{setup_state, InspireServerState, RavenInspireScheme};
+use raven_railgun_engine::inspire::{
+    extract_response, setup_state, InspireServerState, RavenInspireScheme,
+};
 use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
-use raven_railgun_http::{inspire_router, read_versioned, AppState, HttpConfig, InstanceParams};
+use raven_railgun_http::{
+    inspire_router, read_versioned, write_versioned, AppState, HttpConfig, InstanceParams,
+};
 use tower::ServiceExt;
 
 const READ_TOKEN: &str = "BEARER-CRS-WIRE-TEST-padded-min-len-aabb";
@@ -58,37 +62,43 @@ fn build_state(params: &InspireParams) -> (InspireServerState, RlweSecretKey, Ve
     (state, sk, db)
 }
 
-async fn fetch_wire_crs(state: InspireServerState) -> Vec<u8> {
+fn served(state: InspireServerState) -> axum::Router {
     let mut engine: Engine<RavenInspireScheme> = Engine::new();
     let instance = PirInstance::new(InstanceId::new(INSTANCE_ID), InstanceRole::Live, state);
     engine.add_instance(instance).expect("register instance");
+    let _g = APPSTATE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let app_state = AppState::new(engine, HttpConfig::demo(READ_TOKEN)).expect("appstate");
+    inspire_router(app_state).expect("router build")
+}
 
-    let router = {
-        let _g = APPSTATE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-        let app_state = AppState::new(engine, HttpConfig::demo(READ_TOKEN)).expect("appstate");
-        inspire_router(app_state).expect("router build")
-    };
-
+fn request(method: Method, route: &str, body: Body) -> Request<Body> {
     let mut req = Request::builder()
-        .method(Method::GET)
-        .uri(format!("/v1/instance/{INSTANCE_ID}/params"))
+        .method(method)
+        .uri(format!("/v1/instance/{INSTANCE_ID}/{route}"))
         .header(header::AUTHORIZATION, format!("Bearer {READ_TOKEN}"))
-        .body(Body::empty())
-        .expect("build params req");
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(body)
+        .expect("build request");
     req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         12_345,
     )));
+    req
+}
 
-    let resp = router.oneshot(req).await.expect("oneshot");
-    assert_eq!(resp.status(), StatusCode::OK, "params endpoint must 200");
-    let bytes = resp
-        .into_body()
+async fn ok_body(router: &axum::Router, req: Request<Body>) -> Vec<u8> {
+    let resp = router.clone().oneshot(req).await.expect("oneshot");
+    assert_eq!(resp.status(), StatusCode::OK);
+    resp.into_body()
         .collect()
         .await
         .expect("body")
         .to_bytes()
-        .to_vec();
+        .to_vec()
+}
+
+async fn fetch_wire_crs(router: &axum::Router) -> Vec<u8> {
+    let bytes = ok_body(router, request(Method::GET, "params", Body::empty())).await;
     let decoded: InstanceParams = read_versioned(&bytes).expect("decode versioned InstanceParams");
     decoded.crs_bincode
 }
@@ -101,7 +111,7 @@ async fn params_crs_drops_galois_keys_and_keeps_every_serialized_field() {
     let full_bytes = full.to_versioned_bytes().expect("full crs bytes");
     let full_round_tripped = ServerCrs::from_versioned_bytes(&full_bytes).expect("decode full crs");
 
-    let wire_bytes = fetch_wire_crs(state).await;
+    let wire_bytes = fetch_wire_crs(&served(state)).await;
     let wire = ServerCrs::from_versioned_bytes(&wire_bytes).expect("decode wire crs");
 
     assert_eq!(
@@ -144,15 +154,16 @@ async fn params_crs_drops_galois_keys_and_keeps_every_serialized_field() {
     );
 }
 
+/// A client holding only the wire CRS queries, and the served `/query` route (the cached,
+/// mod-switched production respond) answers it.
 #[tokio::test]
 async fn wire_crs_drives_the_inspiring_round_trip() {
     let params = InspireParams::secure_128_d2048();
     let (state, sk, db) = build_state(&params);
-    let full = state.crs.as_ref().clone();
-    let encoded_db = std::sync::Arc::clone(&state.encoded_db);
-    let shard_config = encoded_db.config.clone();
+    let shard_config = state.encoded_db.config.clone();
+    let router = served(state);
 
-    let wire_bytes = fetch_wire_crs(state).await;
+    let wire_bytes = fetch_wire_crs(&router).await;
     let wire = ServerCrs::from_versioned_bytes(&wire_bytes).expect("decode wire crs");
 
     let mut sampler = GaussianSampler::new(params.sigma);
@@ -165,9 +176,10 @@ async fn wire_crs_drives_the_inspiring_round_trip() {
         "the wire CRS must still select the production packing mode"
     );
 
-    let response =
-        respond_seeded_inspiring(&full, &encoded_db, &client_query).expect("server respond");
-    let recovered = extract_inspiring(&wire, &client_state, &response, TOY_ENTRY_BYTES)
+    let body = write_versioned(&client_query).expect("query body");
+    let bytes = ok_body(&router, request(Method::POST, "query", Body::from(body))).await;
+    let response: ServerResponse = read_versioned(&bytes).expect("decode response");
+    let recovered = extract_response(&wire, &client_state, &response, TOY_ENTRY_BYTES)
         .expect("extract with the wire CRS");
 
     assert_eq!(

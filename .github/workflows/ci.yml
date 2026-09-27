@@ -44,36 +44,6 @@ jobs:
         run: |
           cargo check --manifest-path crates/inspire/Cargo.toml \
             --features mod-switch-response --all-targets
-      # ONE channel off and the other on, which is the only build where the route-dropping test
-      # compiles at all: it is `cfg(all(not(json-index-channel), prefix-index-channel))`.
-      #
-      # The first version of this lane passed a bare `--no-default-features`, turning BOTH off, so
-      # the test it exists to run was cfg'd out and the lane went green having selected 10 tests
-      # and none of them. Measured: `--no-default-features` lists 10 with zero matching
-      # `drop|json|prefix`; adding the feature lists 13 with two. That is the same green-vacuous
-      # shape as the `simd_packing_offline_kat` step deleted in this same change, committed one
-      # commit later into the same file -- so the check below is now what proves the lane is real.
-      #
-      # Scoped away from --all-targets on purpose: `cargo test -p raven-railgun-http
-      # --all-targets` is independently FLAKY on metrics_surface, and importing an unrelated
-      # flake would make this gate untrustworthy from its first run.
-      - name: cargo test (raven-railgun-http, json channel dropped)
-        run: |
-          set -euo pipefail
-          listed=$(cargo test --manifest-path adapters/railgun/Cargo.toml \
-            -p raven-railgun-http --no-default-features --features prefix-index-channel \
-            --test poi_shim_routes -- --list)
-          # A lane that selects the test is the claim; assert it rather than trusting the filter.
-          grep -Fq 'dropping_the_json_index_channel_drops_its_route: test' <<< "$listed"
-          cargo test --manifest-path adapters/railgun/Cargo.toml \
-            -p raven-railgun-http --no-default-features --features prefix-index-channel \
-            --lib --test poi_shim_routes --test poi_shim_coverage
-      # Both channels off is a separate property -- the crate must still COMPILE with neither
-      # `#[cfg]` arm -- and it needs no test to be worth checking.
-      - name: cargo check (raven-railgun-http, no index channels)
-        run: |
-          cargo check --manifest-path adapters/railgun/Cargo.toml \
-            -p raven-railgun-http --no-default-features --all-targets
       - name: cargo test
         run: cargo test --workspace --all-targets
 
@@ -683,12 +653,8 @@ jobs:
           # nights a ceiling breach cancelled that test instead of failing beside it.
           #
           # `raven-railgun-http` is here for one test: the six-block shim coverage round trip, which
-          # seeds five sealed 65,536-row blocks at ~165 s of Poseidon inserts and so cannot live in a
-          # per-push lane, and no other lane runs it. Budget checked, and then checked again because the first arithmetic
-          # was wrong: this lane ran 23 tests in 158 s against `timeout-minutes: 60` = 3600 s, so
-          # ~165 s is **4.6%** of the cap, not the 0.5% first written here, and 158 + 165 = ~9%
-          # before checkout, toolchain, `apt-get install lld` and building a package this lane did
-          # not previously build. Still comfortable, and comfortable for a stated reason.
+          # seeds five sealed 65,536-row blocks (8.3 s measured under ci-test) and no other lane
+          # runs. The rest of its binary comes along, about 1.7 s per test that seeds a sealed block.
           cargo nextest run \
             --manifest-path adapters/railgun/Cargo.toml \
             -p raven-railgun-engine -p raven-railgun-cli \

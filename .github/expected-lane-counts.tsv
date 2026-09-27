@@ -24,7 +24,7 @@ durability-and-closure/closure	6
 # briefly, its bench rows (`pkg::bench/name x`, a slash in the binary segment).
 # 2026-09-22: 23 -> 34 -> 40. The lane gained the `raven-railgun-http` package and a
 # `binary(poi_shim_coverage)` term, for one test that seeds five sealed 65,536-row blocks and so
-# cannot run per push. The other tests in that binary come along and are cheap. The pin is
+# cannot run per push. The other tests in that binary come along. The pin is
 # raised rather than left low because a floor below the truth cannot detect a drop (the ratchet
 # was a floor then; it is exact now, so growth fails too). 34 was exact when set (that binary had
 # 11 tests); the index-channel work took it to 17, so the lane now selects 40. Counted with the
@@ -37,4 +37,9 @@ durability-and-closure/closure	6
 # that each list is answered only on its own upstream count.
 # 2026-09-27: 47 -> 46. populate_bench left with the synthetic PPOI server it timed; its one test
 # fed a PPOI list through a commit-tree encoder, which measures nothing the forest serves.
-production-cell-closure/inline	46
+# 2026-09-27: 46 -> 37. poi_shim_coverage lost the tests of the removed JSON index and
+# per-commitment status routes and of the undeclared single-store path, and folded two duplicates
+# into the index-channel tests. Its fixtures now seed a sealed block as one run: about 1.7 s per
+# test that seeds one, and 8.3 s for the five-block test, measured under ci-test. The earlier
+# "cheap" was wrong: each of those tests then seeded its own sealed block at about 33 s.
+production-cell-closure/inline	37

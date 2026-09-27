@@ -16,8 +16,9 @@ use axum::{
     http::{header, Method, Request, StatusCode},
 };
 use raven_railgun_core::{InstanceId, Result as RailgunResult};
+use raven_railgun_engine::inspire::RavenInspireScheme;
 use raven_railgun_engine::{Engine, InstanceRole, PirInstance, PirScheme};
-use raven_railgun_http::{router, AppState, HttpConfig};
+use raven_railgun_http::{inspire_router, router, AppState, HttpConfig};
 use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
 
@@ -211,4 +212,49 @@ async fn the_burst_refills_at_the_configured_requests_per_second() {
         "at 50 rps the cell must be back within 100 ms; if this is a 429 the configured \
          rate is being read as a replenish period"
     );
+}
+
+/// Every production binary serves through `inspire_router`, which builds its own limiter, so
+/// the routes it adds (`/session`, `/params`) and the one it shares (`/batch`) must each spend
+/// the per-IP bucket there too.
+#[tokio::test]
+async fn the_inspire_router_rate_limits_session_params_and_batch() {
+    let mut cfg = HttpConfig::demo(TOKEN);
+    cfg.rate_limit_rps = 1;
+    cfg.rate_limit_burst = 1;
+    let state = {
+        let _g = APPSTATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        AppState::new(Engine::<RavenInspireScheme>::new(), cfg).expect("appstate")
+    };
+    let router = inspire_router(state).expect("router");
+
+    // One peer per route, so each route is judged on a bucket only it has spent.
+    for (peer, method, route) in [
+        ("198.51.100.81:41000", Method::POST, "session"),
+        ("198.51.100.82:41000", Method::GET, "params"),
+        ("198.51.100.83:41000", Method::POST, "batch"),
+    ] {
+        let request = || {
+            let mut req = Request::builder()
+                .method(method.clone())
+                .uri(format!("/v1/instance/{INSTANCE}/{route}"))
+                .body(Body::empty())
+                .expect("build request");
+            let addr: SocketAddr = peer.parse().expect("peer socket addr");
+            req.extensions_mut().insert(ConnectInfo(addr));
+            req
+        };
+        assert_ne!(
+            status_of(&router, request()).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{route}: the first request on a fresh key must reach the handler"
+        );
+        assert_eq!(
+            status_of(&router, request()).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{route}: a second request inside the second must be refused by the limiter"
+        );
+    }
 }

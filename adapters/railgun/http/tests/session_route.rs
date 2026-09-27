@@ -151,84 +151,8 @@ fn session_request(body: Vec<u8>) -> Request<Body> {
     req
 }
 
-#[tokio::test]
-async fn session_establishment_requires_a_valid_client_id() {
-    let Fixture {
-        router,
-        instance,
-        body,
-        ..
-    } = fixture();
-    let mut missing = session_request(body.clone());
-    missing.headers_mut().remove("x-raven-client-id");
-    let missing_response = router
-        .clone()
-        .oneshot(missing)
-        .await
-        .expect("missing dispatch");
-    assert_eq!(missing_response.status(), StatusCode::BAD_REQUEST);
-
-    let mut malformed = session_request(body);
-    malformed.headers_mut().insert(
-        "x-raven-client-id",
-        "not-a-client-id".parse().expect("header"),
-    );
-    let malformed_response = router.oneshot(malformed).await.expect("malformed dispatch");
-    assert_eq!(malformed_response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        instance.current_state().session_store.len(),
-        0,
-        "invalid identity must be refused before key registration"
-    );
-}
-
-#[tokio::test]
-async fn valid_packing_keys_establish_a_session_with_handle_and_expiry() {
-    let Fixture {
-        router,
-        body,
-        ttl_secs,
-        ..
-    } = fixture();
-    let req = session_request(body);
-
-    let before_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_secs();
-    let resp = router.oneshot(req).await.expect("dispatch");
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "a valid session establish must 200"
-    );
-    let session_header = resp
-        .headers()
-        .get("x-raven-session")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .expect("x-raven-session header must carry the numeric handle");
-
-    let bytes = resp
-        .into_body()
-        .collect()
-        .await
-        .expect("body")
-        .to_bytes()
-        .to_vec();
-    let decoded: SessionEstablishResponse =
-        serde_json::from_slice(&bytes).expect("decode SessionEstablishResponse");
-    assert_eq!(
-        decoded.handle, session_header,
-        "body handle and x-raven-session header must agree"
-    );
-    assert!(
-        decoded.expires_at_unix_secs >= before_unix + ttl_secs - 2,
-        "expires_at must reflect the configured TTL ({ttl_secs}s); got {} at now {before_unix}",
-        decoded.expires_at_unix_secs
-    );
-}
-
+/// A session is established only under a valid client id, answers with its handle and expiry,
+/// and every route that takes the handle serves only the client that established it.
 #[tokio::test]
 async fn every_handle_route_is_bound_to_the_establishing_client() {
     let Fixture {
@@ -239,19 +163,53 @@ async fn every_handle_route_is_bound_to_the_establishing_client() {
         crs,
         expected,
         instance,
-        ..
+        ttl_secs,
     } = fixture();
+    assert_establish_refuses_an_invalid_client_id(&router, &body).await;
+    assert_eq!(
+        instance.current_state().session_store.len(),
+        0,
+        "invalid identity must be refused before key registration"
+    );
+
+    let before_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
     let session_response = router
         .clone()
         .oneshot(session_request(body))
         .await
         .expect("session dispatch");
+    assert_eq!(
+        session_response.status(),
+        StatusCode::OK,
+        "a valid session establish must 200"
+    );
     let handle = session_response
         .headers()
         .get("x-raven-session")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
-        .expect("session handle");
+        .expect("x-raven-session header must carry the numeric handle");
+    let bytes = session_response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes()
+        .to_vec();
+    let decoded: SessionEstablishResponse =
+        serde_json::from_slice(&bytes).expect("decode SessionEstablishResponse");
+    assert_eq!(
+        decoded.handle, handle,
+        "body handle and x-raven-session header must agree"
+    );
+    assert!(
+        decoded.expires_at_unix_secs >= before_unix + ttl_secs - 2,
+        "expires_at must reflect the configured TTL ({ttl_secs}s); got {} at now {before_unix}",
+        decoded.expires_at_unix_secs
+    );
     let inline_query = query.clone();
     query.session_handle = Some(ServerSessionHandle(handle));
     query.inspiring_packing_keys = None;
@@ -280,6 +238,29 @@ async fn every_handle_route_is_bound_to_the_establishing_client() {
         .expect("retired dispatch")
         .status();
     assert_eq!(retired_status, StatusCode::CONFLICT);
+}
+
+async fn assert_establish_refuses_an_invalid_client_id(router: &axum::Router, body: &[u8]) {
+    let mut missing = session_request(body.to_vec());
+    missing.headers_mut().remove("x-raven-client-id");
+    let missing_response = router
+        .clone()
+        .oneshot(missing)
+        .await
+        .expect("missing dispatch");
+    assert_eq!(missing_response.status(), StatusCode::BAD_REQUEST);
+
+    let mut malformed = session_request(body.to_vec());
+    malformed.headers_mut().insert(
+        "x-raven-client-id",
+        "not-a-client-id".parse().expect("header"),
+    );
+    let malformed_response = router
+        .clone()
+        .oneshot(malformed)
+        .await
+        .expect("malformed dispatch");
+    assert_eq!(malformed_response.status(), StatusCode::BAD_REQUEST);
 }
 
 async fn assert_handle_identity_matrix(router: &axum::Router, query: &SeededClientQuery) {
