@@ -909,16 +909,6 @@ mod tests {
 
         /// One declared block holding `rows` rows, with upstream counting exactly that many.
         fn covered_app(store: &SharedLogicalStore, rows: u64) -> AppState<StubScheme> {
-            // The recorder install loses a race to a concurrent winner until the winner has
-            // published its handle, so wait a bounded while for one before building state on it.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while crate::global_prometheus_handle().is_err() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "no metrics recorder handle within 10 s"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
             let view = MirrorFeedView {
                 list_key: hex_encode(&LIST_KEY),
                 state: MirrorFeedState::Syncing,
