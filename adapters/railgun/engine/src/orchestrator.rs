@@ -148,8 +148,8 @@ pub struct OrchestratorConfig {
     pub entries_per_shard: u32,
     /// Max concurrent in-flight respond ops. `None` resolves via [`default_k_for`].
     pub max_concurrent_queries: Option<usize>,
-    /// On-disk-state authority: chain rootHistory, or the upstream feed with its
-    /// signature retained-but-unverified (see `VerificationMode::UpstreamAsserted`).
+    /// On-disk-state authority: chain rootHistory, or the upstream feed (see
+    /// `VerificationMode::UpstreamAsserted`).
     pub verification_mode: VerificationMode,
     /// Run the Layer 2 verifier every Nth commit. `0` disables.
     pub verification_cadence_n: u32,
@@ -220,15 +220,7 @@ impl std::fmt::Debug for OrchestratorConfig {
 /// Per-encoder default concurrency cap (`max_concurrent_queries`).
 #[must_use]
 pub const fn default_k_for(encoder: super::pir_table::EncoderKind) -> usize {
-    match encoder {
-        super::pir_table::EncoderKind::PerNode { .. }
-        | super::pir_table::EncoderKind::PerListPath { .. }
-        | super::pir_table::EncoderKind::PerListPath10 { .. }
-        | super::pir_table::EncoderKind::PerListNode { .. } => 16,
-        super::pir_table::EncoderKind::PerLeafPath { .. } => 8,
-        super::pir_table::EncoderKind::PerLeafBc { .. }
-        | super::pir_table::EncoderKind::PerListStatus { .. } => 4,
-    }
+    encoder.default_concurrency()
 }
 
 /// Bootstrap persistence plus the consumer task. `fresh_state_factory` runs
@@ -354,8 +346,8 @@ pub enum VerificationMode {
     /// and type, not the chain or txid version it was signed for, so the endpoint can still
     /// serve rows the same key signed for another chain or txid version, and can withhold or
     /// delay rows; the list key is trusted as configured. Unset, rows arrive on the endpoint's
-    /// word. Either way this crate verifies no signature itself: it only carries the bytes
-    /// (`PpoiListLeafAdded::signature`).
+    /// word. Either way this crate verifies no signature and stores none: the WAL and the
+    /// snapshot drop the signature the mirror hands over.
     ///
     /// **The root is the one thing this crate checks about the upstream feed.** Every
     /// `PpoiListLeafAdded` is held, ahead of its WAL write, to the `validatedMerkleroot` it
@@ -371,8 +363,6 @@ pub enum VerificationMode {
 pub enum DataSourceFilter {
     /// Consume chain `AppendLeaf` events for this tree number.
     ChainTreeNumber(u32),
-    /// Consume mirror `PpoiStatus`/`PpoiListLeafAdded` events for this list key.
-    PpoiList([u8; 32]),
     /// Consume one 65,536-row block of a PPOI list using local row indices.
     PpoiListBlock {
         /// 32-byte list key.
@@ -477,32 +467,6 @@ impl InstanceConfig {
             chain_source: None,
         }
     }
-
-    /// Default config for a PPOI list instance.
-    #[must_use]
-    pub fn ppoi_list(
-        instance_id: impl Into<String>,
-        data_dir: std::path::PathBuf,
-        list_key: [u8; 32],
-    ) -> Self {
-        Self {
-            instance_id: InstanceId::new(instance_id),
-            role: InstanceRole::Live,
-            data_dir,
-            encoder: super::pir_table::EncoderKind::PerListPath { list_key },
-            record_size: 16 * 32,
-            entries_per_shard: 2048,
-            verification_mode: VerificationMode::UpstreamAsserted,
-            data_source: DataSourceFilter::PpoiList(list_key),
-            use_flock: true,
-            snapshot_policy: SnapshotPolicy::default(),
-            scheme_tag: "raven-inspire-twopacking-inspiring-wp3-cache-session".to_owned(),
-            channel_capacity: 1024,
-            max_concurrent_queries: None,
-            verification_cadence_n: 0,
-            chain_source: None,
-        }
-    }
 }
 
 /// Per-instance handles produced by [`bootstrap_railgun_engine_multi`].
@@ -539,7 +503,7 @@ impl std::fmt::Debug for PerInstanceHandles {
 /// new routes lock-free.
 pub type ChainTreeRoutes = Arc<arc_swap::ArcSwap<Vec<(u32, mpsc::Sender<ConsumerEvent>)>>>;
 
-/// Per-list routing table, swapped via `ArcSwap::rcu` on `list_observed`.
+/// Per-list routing table.
 pub type PpoiListRoutes =
     Arc<arc_swap::ArcSwap<Vec<(DataSourceFilter, mpsc::Sender<ConsumerEvent>)>>>;
 
@@ -557,8 +521,6 @@ pub struct MultiOrchestratorHandle {
     pub ppoi_list_routes: PpoiListRoutes,
     /// Lossy broadcast of every chain `tree_number` seen by the router.
     pub tree_observed: tokio::sync::broadcast::Sender<u32>,
-    /// Lossy broadcast of every PPOI `list_key` seen by the router.
-    pub list_observed: tokio::sync::broadcast::Sender<[u8; 32]>,
 }
 
 impl std::fmt::Debug for MultiOrchestratorHandle {
@@ -730,15 +692,13 @@ where
         .iter()
         .filter_map(|(ds, tx)| match ds {
             DataSourceFilter::ChainTreeNumber(t) => Some((*t, tx.clone())),
-            DataSourceFilter::PpoiList(_) | DataSourceFilter::PpoiListBlock { .. } => None,
+            DataSourceFilter::PpoiListBlock { .. } => None,
         })
         .collect();
     let ppoi_routes: Vec<(DataSourceFilter, mpsc::Sender<ConsumerEvent>)> = routes
         .iter()
         .filter_map(|(ds, tx)| match ds {
-            DataSourceFilter::PpoiList(_) | DataSourceFilter::PpoiListBlock { .. } => {
-                Some((*ds, tx.clone()))
-            }
+            DataSourceFilter::PpoiListBlock { .. } => Some((*ds, tx.clone())),
             DataSourceFilter::ChainTreeNumber(_) => None,
         })
         .collect();
@@ -747,7 +707,6 @@ where
     let ppoi_list_routes: PpoiListRoutes = Arc::new(arc_swap::ArcSwap::from_pointee(ppoi_routes));
     // Lagged receivers re-sync on the next event, so a small capacity suffices.
     let (tree_observed_tx, _) = tokio::sync::broadcast::channel::<u32>(64);
-    let (list_observed_tx, _) = tokio::sync::broadcast::channel::<[u8; 32]>(64);
 
     let router = tokio::spawn(multi_instance_router(
         indexer_rx,
@@ -755,7 +714,6 @@ where
         Arc::clone(&chain_tree_routes),
         Arc::clone(&ppoi_list_routes),
         tree_observed_tx.clone(),
-        list_observed_tx.clone(),
     ));
 
     Ok(MultiOrchestratorHandle {
@@ -768,7 +726,6 @@ where
         chain_tree_routes,
         ppoi_list_routes,
         tree_observed: tree_observed_tx,
-        list_observed: list_observed_tx,
     })
 }
 
@@ -892,8 +849,7 @@ pub fn clear_router_unrouted_target(target: &str) {
 /// Clear `target`, and -- when it is block-granular -- the list-level key it sits under.
 ///
 /// The two are not alternatives, they are the SAME target named at two moments. A list key is
-/// first seen BEFORE its route exists, because routing is asynchronous by design (see the
-/// `list_observed` send below), and that moment marks the coarse `list:<hex>`. Every delivery
+/// first seen BEFORE its route exists, and that moment marks the coarse `list:<hex>`. Every delivery
 /// after the route lands names the fine `list:<hex>:block:<n>`. Clearing only the fine key
 /// leaves the coarse one set for the life of the process, and readiness fails closed on it --
 /// a permanent 503 on a node that recovered in milliseconds -- the same latching readiness
@@ -922,7 +878,6 @@ fn record_consumer_closed(target: String) {
 /// The list key a routing filter is bound to, if any.
 fn filter_list_key(filter: &DataSourceFilter) -> Option<[u8; 32]> {
     match filter {
-        DataSourceFilter::PpoiList(key) => Some(*key),
         DataSourceFilter::PpoiListBlock { list_key, .. } => Some(*list_key),
         DataSourceFilter::ChainTreeNumber(_) => None,
     }
@@ -975,7 +930,6 @@ async fn multi_instance_router(
     chain_tree_routes: ChainTreeRoutes,
     ppoi_list_routes: PpoiListRoutes,
     tree_observed: tokio::sync::broadcast::Sender<u32>,
-    list_observed: tokio::sync::broadcast::Sender<[u8; 32]>,
 ) {
     ensure_router_metrics_described();
     let mut indexer_open = true;
@@ -992,13 +946,7 @@ async fn multi_instance_router(
             }
             msg = mirror_rx.recv(), if mirror_open => {
                 if let Some((payload, height)) = msg {
-                    forward_mirror_payload(
-                        payload,
-                        height,
-                        &ppoi_list_routes,
-                        &list_observed,
-                    )
-                    .await;
+                    forward_mirror_payload(payload, height, &ppoi_list_routes).await;
                 } else {
                     mirror_open = false;
                     tracing::info!("multi_instance_router: mirror channel closed");
@@ -1193,11 +1141,9 @@ async fn forward_mirror_payload(
     payload: WalEntryPayload,
     height: u64,
     ppoi_list_routes: &arc_swap::ArcSwap<Vec<(DataSourceFilter, mpsc::Sender<ConsumerEvent>)>>,
-    list_observed: &tokio::sync::broadcast::Sender<[u8; 32]>,
 ) {
     let list_key: Option<[u8; 32]> = match &payload {
-        WalEntryPayload::PpoiStatus { list_key, .. }
-        | WalEntryPayload::PpoiListLeafAdded { list_key, .. } => Some(*list_key),
+        WalEntryPayload::PpoiListLeafAdded { list_key, .. } => Some(*list_key),
         WalEntryPayload::AppendLeaf { .. }
         | WalEntryPayload::Reorg { .. }
         | WalEntryPayload::Heartbeat { .. } => None,
@@ -1206,8 +1152,6 @@ async fn forward_mirror_payload(
         tracing::trace!("mirror payload without list_key; dropping");
         return;
     };
-    // Fires before routing so a fresh list key surfaces before its route exists.
-    let _ = list_observed.send(lk);
     let routes = ppoi_list_routes.load();
     let mut matched = Vec::new();
     for (filter, sender) in routes.iter() {
@@ -1260,7 +1204,6 @@ fn payload_for_ppoi_route(
     list_key: [u8; 32],
 ) -> Option<WalEntryPayload> {
     match (filter, payload) {
-        (DataSourceFilter::PpoiList(key), _) if key == list_key => Some(payload.clone()),
         (
             DataSourceFilter::PpoiListBlock {
                 list_key: route_key,
@@ -1286,15 +1229,6 @@ fn payload_for_ppoi_route(
                 validated_merkleroot: *validated_merkleroot,
             })
         }
-        // No list index to localize on, so every block gets it; `LogicalLeafStore::apply` files
-        // it only in the block that indexes the commitment, which keeps updates reaching owners.
-        (
-            DataSourceFilter::PpoiListBlock {
-                list_key: route_key,
-                ..
-            },
-            WalEntryPayload::PpoiStatus { .. },
-        ) if route_key == list_key => Some(payload.clone()),
         _ => None,
     }
 }
@@ -1367,36 +1301,6 @@ mod forest_routing_tests {
         assert_eq!(split_ppoi_index(LEAVES_PER_PPOI_BLOCK + 1), (1, 1));
     }
 
-    // The whole-list route hands the instance the index upstream published, un-split, and that
-    // is the only sound choice: two leaves in different blocks share a local index, so
-    // localizing here would collide block 1 row 0 onto block 0 row 0 and the per-list IMT
-    // would refuse it as non-contiguous or, worse, publish one leaf's status under another's
-    // row. The consequence is a PROPERTY of the route, not a defect in this arm: an instance
-    // bound to a whole list holds one depth-16 IMT, so it can serve a list of at most
-    // LEAVES_PER_PPOI_BLOCK rows and refuses every row past that at `checked_imt_append`.
-    // A longer list has to be declared per block.
-    #[test]
-    fn the_whole_list_route_forwards_the_list_wide_index_unsplit() {
-        for global in [
-            0,
-            LEAVES_PER_PPOI_BLOCK - 1,
-            LEAVES_PER_PPOI_BLOCK,
-            LEAVES_PER_PPOI_BLOCK + 1,
-            5 * LEAVES_PER_PPOI_BLOCK + 7,
-        ] {
-            let routed =
-                payload_for_ppoi_route(DataSourceFilter::PpoiList([7; 32]), &leaf(global), [7; 32])
-                    .expect("the whole-list route accepts every row of its list");
-            assert!(
-                matches!(
-                    routed,
-                    WalEntryPayload::PpoiListLeafAdded { list_index, .. } if list_index == global
-                ),
-                "row {global} must arrive under its list-wide index"
-            );
-        }
-    }
-
     /// A distinctive key, because the registry is process-global and unit tests share it.
     const LATCH_LK: &str = "beeff00d00000000000000000000000000000000000000000000000000000000";
 
@@ -1416,7 +1320,13 @@ mod forest_routing_tests {
 
         // Moment two: a route exists and the same payload is delivered.
         let (tx, _rx) = mpsc::channel(1);
-        let routes = vec![(DataSourceFilter::PpoiList(COUPLE_LK), tx)];
+        let routes = vec![(
+            DataSourceFilter::PpoiListBlock {
+                list_key: COUPLE_LK,
+                block: 3,
+            },
+            tx,
+        )];
         let fine = ppoi_target_name(&payload, &COUPLE_LK, &routes);
 
         assert_ne!(

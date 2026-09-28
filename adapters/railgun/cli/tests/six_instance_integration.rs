@@ -394,9 +394,6 @@ async fn wait_for_apply(view: &BootstrapView, deadline_secs: u64) {
                         break;
                     }
                 }
-                DataSourceFilter::PpoiList(_) => {
-                    unreachable!("the boot builds no whole-list route")
-                }
             }
         }
         if all_ready {
@@ -581,7 +578,6 @@ async fn chain_events_route_to_correct_commit_tree_instance() {
                     m.last_applied_block
                 );
             }
-            DataSourceFilter::PpoiList(_) => unreachable!("the boot builds no whole-list route"),
         }
     }
 
@@ -640,12 +636,11 @@ async fn ppoi_events_route_to_correct_list_instance() {
             DataSourceFilter::ChainTreeNumber(_) => {
                 let store = inst.logical_store.lock();
                 assert_eq!(
-                    store.ppoi_count(),
+                    store.ppoi_list_count(),
                     0,
                     "commit-tree instance must NOT receive PPOI rows"
                 );
             }
-            DataSourceFilter::PpoiList(_) => unreachable!("the boot builds no whole-list route"),
         }
     }
 
@@ -807,7 +802,6 @@ async fn kill_restart_preserves_per_instance_state() {
                 let store = inst.logical_store.lock();
                 ppoi_pre.push((inst.data_source, store.ppoi_bc_at(&list_key, 0)));
             }
-            DataSourceFilter::PpoiList(_) => unreachable!("the boot builds no whole-list route"),
         }
     }
 
@@ -880,10 +874,10 @@ async fn manifest_label_mismatch_refuses_boot_per_instance() {
     shutdown(stop1, server1).await.expect("first shutdown");
 
     // Both encoders are valid AND cell-shape compatible; only the manifest verifier rejects the
-    // mismatch. The swap must keep the row width: PerNode and PerListNode both pin
-    // NODE_HASH_BYTES, so `validate_cell_shape` passes and the label check is what fires. Swapping
-    // to a 512-byte path encoder instead makes the shape guard reject first, and the test then
-    // passes or fails on the wrong guard - which is what it was doing.
+    // mismatch. The swap must keep the row width: PerNode pins NODE_HASH_BYTES and PerLeafBc takes
+    // the instance's width, so `validate_cell_shape` passes and the label check is what fires.
+    // Swapping to a 512-byte path encoder instead makes the shape guard reject first, and the test
+    // then passes or fails on the wrong guard - which is what it was doing.
     let observer2: BootstrapObserver = Arc::new(parking_lot::Mutex::new(None));
     let chain_sources2 = six_synthetic_sources();
     let mut opts2 = build_opts(
@@ -895,9 +889,7 @@ async fn manifest_label_mismatch_refuses_boot_per_instance() {
     );
     for inst in &mut opts2.instances {
         if inst.instance_id.as_str() == "commit-tree-0" {
-            inst.encoder = EncoderKind::PerListNode {
-                list_key: [0x5a; 32],
-            };
+            inst.encoder = EncoderKind::PerLeafBc { tree_number: 0 };
         }
     }
 
@@ -943,7 +935,7 @@ fn example_toml_parses_to_six_ppoi_blocks_with_expected_encoders() {
         .iter()
         .filter_map(|instance| match instance.data_source {
             DataSourceFilter::PpoiListBlock { block, .. } => Some(block),
-            _ => None,
+            DataSourceFilter::ChainTreeNumber(_) => None,
         })
         .collect();
     assert_eq!(blocks, vec![0, 1, 2, 3, 4, 5]);

@@ -23,7 +23,7 @@ use raven_railgun_persistence::{StoreLayout, Wal, WalEntryPayload};
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-ppoi-validate-before-wal";
 const INSTANCE_ID: &str = "ppoi-validate-before-wal";
-const TOY_ENTRY_SIZE: usize = 256;
+const TOY_ENTRY_SIZE: usize = 512;
 const ENTRIES_PER_SHARD: u32 = 2048;
 const LIST_KEY: [u8; 32] = [0xab; 32];
 /// An empty list only admits index 0, so this one must be refused.
@@ -99,7 +99,7 @@ async fn ppoi_non_contiguous_list_leaf_never_reaches_the_wal() {
     config.use_flock = false;
     config.role = InstanceRole::Live;
     config.scheme_tag = SCHEME_TAG.to_owned();
-    config.encoder = EncoderKind::PerListStatus { list_key: LIST_KEY };
+    config.encoder = EncoderKind::PerListPath10 { list_key: LIST_KEY };
     // Snapshotting would archive the log and float the replay floor above the
     // poisoned seq, hiding the very entry this test inspects.
     config.snapshot_policy = SnapshotPolicy::default();
@@ -154,7 +154,7 @@ async fn ppoi_non_contiguous_list_leaf_never_reaches_the_wal() {
         SCHEME_TAG,
         InstanceId::new(INSTANCE_ID),
         SnapshotPolicy::default(),
-        EncoderKind::PerListStatus { list_key: LIST_KEY }
+        EncoderKind::PerListPath10 { list_key: LIST_KEY }
             .build(TOY_ENTRY_SIZE, ENTRIES_PER_SHARD)
             .expect("reopen encoder"),
     )

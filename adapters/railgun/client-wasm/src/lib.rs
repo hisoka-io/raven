@@ -1,5 +1,5 @@
 //! WASM client surface: `raven-client`'s PIR query/extract exports (byte-stable
-//! through the re-export) plus commitment-tree / per-list auth-path helpers.
+//! through the re-export) plus the commitment-tree auth-path helper.
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
@@ -18,12 +18,6 @@ const PATH_INDICES_LEN: usize = PATH_INDEX_TREE_DEPTH as usize;
 #[wasm_bindgen]
 pub fn path_indices_for_leaf(tree_number: u32, leaf_idx: u32) -> Result<Vec<u32>, JsValue> {
     path_indices_for_leaf_impl(tree_number, leaf_idx).map_err(|error| JsValue::from_str(&error))
-}
-
-/// [`path_indices_for_leaf`] under `PerListNodeEncoder`, keyed on `list_key`.
-#[wasm_bindgen]
-pub fn path_indices_for_per_list_leaf(list_key: &[u8], idx: u32) -> Result<Vec<u32>, JsValue> {
-    path_indices_for_per_list_leaf_impl(list_key, idx).map_err(|error| JsValue::from_str(&error))
 }
 
 fn path_indices(operation: &str, index_name: &str, idx: u32) -> Result<Vec<u32>, String> {
@@ -51,24 +45,9 @@ fn path_indices_for_leaf_impl(tree_number: u32, leaf_idx: u32) -> Result<Vec<u32
     path_indices("path_indices_for_leaf", "leaf_idx", leaf_idx)
 }
 
-fn path_indices_for_per_list_leaf_impl(list_key: &[u8], idx: u32) -> Result<Vec<u32>, String> {
-    if list_key.len() != 32 {
-        return Err(format!(
-            "path_indices_for_per_list_leaf: list_key length {} must be 32",
-            list_key.len()
-        ));
-    }
-    path_indices("path_indices_for_per_list_leaf", "idx", idx)
-}
-
 /// Rust-native mirror of [`path_indices_for_leaf`].
 pub fn path_indices_for_leaf_rust(tree_number: u32, leaf_idx: u32) -> Result<Vec<u32>, String> {
     path_indices_for_leaf_impl(tree_number, leaf_idx)
-}
-
-/// Rust-native mirror of [`path_indices_for_per_list_leaf`].
-pub fn path_indices_for_per_list_leaf_rust(list_key: &[u8], idx: u32) -> Result<Vec<u32>, String> {
-    path_indices_for_per_list_leaf_impl(list_key, idx)
 }
 
 #[cfg(test)]
@@ -80,15 +59,6 @@ mod path_indices_tests {
         let out = path_indices_for_leaf_rust(0, 0).expect("leaf 0 ok");
         assert_eq!(out[0], 1);
         assert_eq!(out[1], 65537);
-    }
-
-    #[test]
-    fn path_indices_for_per_list_returns_same_layout_as_per_node_encoder() {
-        // Per-list and commit-tree share the flat layout.
-        let key = [7u8; 32];
-        let a = path_indices_for_leaf_rust(0, 1234).expect("leaf 1234 ok");
-        let b = path_indices_for_per_list_leaf_rust(&key, 1234).expect("per-list 1234 ok");
-        assert_eq!(a, b);
     }
 
     #[test]

@@ -23,7 +23,7 @@ fn canonical_payload(seed: u64, i: usize) -> (WalEntryPayload, u64) {
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .wrapping_add(i as u64);
     let block_height = 100u64.saturating_add(i as u64);
-    let variant = (h as usize) % 5;
+    let variant = (h as usize) % 4;
     let payload = match variant {
         0 => WalEntryPayload::AppendLeaf {
             tree_number: (h % 4) as u32,
@@ -36,23 +36,10 @@ fn canonical_payload(seed: u64, i: usize) -> (WalEntryPayload, u64) {
                 a
             },
         },
-        1 => WalEntryPayload::PpoiStatus {
-            list_key: {
-                let mut a = [0u8; 32];
-                a[0] = (h & 0xff) as u8;
-                a
-            },
-            blinded_commitment: {
-                let mut a = [0u8; 32];
-                a[0] = ((h >> 8) & 0xff) as u8;
-                a
-            },
-            status: ((h >> 16) % 4) as u8,
-        },
-        2 => WalEntryPayload::Reorg {
+        1 => WalEntryPayload::Reorg {
             height: block_height,
         },
-        3 => WalEntryPayload::PpoiListLeafAdded {
+        2 => WalEntryPayload::PpoiListLeafAdded {
             list_key: {
                 let mut a = [0u8; 32];
                 a[0] = (h & 0xff) as u8;
@@ -64,9 +51,9 @@ fn canonical_payload(seed: u64, i: usize) -> (WalEntryPayload, u64) {
                 a[0] = ((h >> 8) & 0xff) as u8;
                 a
             },
-            status: ((h >> 16) % 4) as u8,
+            status: 0,
             event_type: raven_railgun_persistence::PpoiEventType::Shield,
-            signature: vec![0; 64],
+            signature: Vec::new(),
             validated_merkleroot: [0; 32],
         },
         _ => WalEntryPayload::Heartbeat {

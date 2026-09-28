@@ -17,23 +17,16 @@ fn payload_strategy() -> impl Strategy<Value = WalEntryPayload> {
                 commitment,
             }
         ),
-        (any::<[u8; 32]>(), any::<[u8; 32]>(), 0u8..4).prop_map(
-            |(list_key, blinded_commitment, status)| WalEntryPayload::PpoiStatus {
-                list_key,
-                blinded_commitment,
-                status,
-            }
-        ),
         any::<u64>().prop_map(|height| WalEntryPayload::Reorg { height }),
-        (any::<[u8; 32]>(), 0u32..65_536, any::<[u8; 32]>(), 0u8..4).prop_map(
-            |(list_key, list_index, blinded_commitment, status)| {
+        (any::<[u8; 32]>(), 0u32..65_536, any::<[u8; 32]>()).prop_map(
+            |(list_key, list_index, blinded_commitment)| {
                 WalEntryPayload::PpoiListLeafAdded {
                     list_key,
                     list_index,
                     blinded_commitment,
-                    status,
+                    status: 0,
                     event_type: PpoiEventType::Shield,
-                    signature: vec![0xA5; 64],
+                    signature: Vec::new(),
                     validated_merkleroot: [0x5A; 32],
                 }
             }

@@ -12,10 +12,11 @@
 //! 958,663,751,023,254,534 bytes against a 16 MiB cap. That length field sits at offset 92.
 //!
 //! WHAT THIS PROVES: pre-epoch bytes are refused, cleanly, by a typed error an operator can act
-//! on, and a V6 body is refused unread: every body behind the V6 magic, well-formed or with two
-//! same-width fields swapped or retyped, gets the byte-identical refusal, so no reinterpretation
-//! under that magic can decode to a value. A snapshot carrying bytes past its envelope is refused
-//! on both live arms rather than decoded with the tail discarded.
+//! on, and a V6 or V7 body is refused unread: every body behind either magic, well-formed or with
+//! two same-width fields swapped or retyped, gets the byte-identical refusal, so no
+//! reinterpretation under that magic can decode to a value. A data_dir the V7 build wrote is
+//! refused by name at open. A snapshot carrying bytes past its envelope is refused on both live
+//! arms rather than decoded with the tail discarded.
 //!
 //! WHAT IT DOES NOT PROVE: the same for the no-magic V5 arm. That arm still decodes, because
 //! `InspirePersistence::commit` still writes V5, so a same-length reinterpretation inside
@@ -27,8 +28,8 @@ use std::sync::Arc;
 
 use raven_railgun_core::{AdapterError, InstanceId};
 use raven_railgun_engine::inspire::{
-    restore_inspire_state_v6, snapshot_inspire_state, snapshot_inspire_state_v7, LogicalLeafStore,
-    SNAPSHOT_V6_MAGIC, SNAPSHOT_V7_MAGIC,
+    restore_inspire_state_v6, snapshot_inspire_state, snapshot_inspire_state_v8, LogicalLeafStore,
+    SNAPSHOT_V6_MAGIC, SNAPSHOT_V7_MAGIC, SNAPSHOT_V8_MAGIC,
 };
 use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
@@ -70,10 +71,14 @@ const _: () = assert!(RECOVERED_MANIFEST_SCHEMA_VERSION < MANIFEST_SCHEMA_VERSIO
 const TOY_ENTRY_SIZE: usize = 32;
 const ENTRIES_PER_SHARD: u32 = 2048;
 
+/// The store half of a V7 snapshot, minted by the last build that wrote V7: one commitment leaf
+/// and two PPOI list leaves, each with its status byte and signature.
+const FROZEN_V7_STORE: &[u8] = include_bytes!("fixtures/logical_store_v7.bin");
+
 fn recovered_encoder() -> Arc<dyn PirTableEncoder> {
-    EncoderKind::PerListNode { list_key: [0; 32] }
+    EncoderKind::PerNode { tree_number: 0 }
         .build(TOY_ENTRY_SIZE, ENTRIES_PER_SHARD)
-        .expect("build per-list-node encoder")
+        .expect("build per-node encoder")
 }
 
 /// Refusal is a claim about the error's TYPE as much as its text: `Serialization` is what the
@@ -107,6 +112,7 @@ fn the_recovered_head_carries_neither_version_magic() {
     let head = &RECOVERED_V5_SNAPSHOT_HEAD[..4];
     assert_ne!(head, SNAPSHOT_V6_MAGIC.as_slice());
     assert_ne!(head, SNAPSHOT_V7_MAGIC.as_slice());
+    assert_ne!(head, SNAPSHOT_V8_MAGIC.as_slice());
     assert_eq!(
         u64::from_le_bytes(
             RECOVERED_V5_SNAPSHOT_HEAD[..8]
@@ -130,54 +136,71 @@ fn recovered_pre_epoch_bytes_are_refused_by_a_typed_error_naming_the_v5_arm() {
     );
 }
 
-/// Behind the V7 magic the same recovered bytes refuse the same way, naming the arm that read
+/// Behind the V8 magic the same recovered bytes refuse the same way, naming the arm that read
 /// them.
 #[test]
-fn the_recovered_bytes_behind_the_v7_magic_are_refused_naming_that_arm() {
-    let mut bytes = SNAPSHOT_V7_MAGIC.to_vec();
+fn the_recovered_bytes_behind_the_v8_magic_are_refused_naming_that_arm() {
+    let mut bytes = SNAPSHOT_V8_MAGIC.to_vec();
     bytes.extend_from_slice(&RECOVERED_V5_SNAPSHOT_HEAD);
     let error =
-        restore_inspire_state_v6(&bytes).expect_err("v7 arm must not decode pre-epoch bytes");
-    assert_names_arm_and_helps_the_operator(&refusal_text(error, "v7"), "v7");
+        restore_inspire_state_v6(&bytes).expect_err("v8 arm must not decode pre-epoch bytes");
+    assert_names_arm_and_helps_the_operator(&refusal_text(error, "v8"), "v8");
 }
 
-/// Eleven empty collections and a zero height: the store half of a V7 snapshot of an empty
-/// store, each field one `u64`.
+/// Nine empty collections and a zero height: the store half of a V8 snapshot of an empty store,
+/// each field one `u64`.
+const EMPTY_V8_STORE_BYTES: usize = 10 * 8;
+/// The V7 store had two more collections, the per-commitment statuses and their heights.
 const EMPTY_V7_STORE_BYTES: usize = 12 * 8;
 
-/// A V6 envelope a V6 reader would have accepted: today's state half, then the eleven V6 store
-/// fields empty. V6 lacked only `ppoi_event_metadata`, so this is the empty V7 body one
-/// `u64` short.
-fn well_formed_v6_body() -> Vec<u8> {
+/// The state half this build writes, which every epoch shares.
+fn state_half() -> Vec<u8> {
     let state = raven_railgun_testkit::toy_state(TOY_ENTRY_SIZE);
-    let v7 = snapshot_inspire_state_v7(&state, &LogicalLeafStore::new()).expect("v7 serialize");
-    restore_inspire_state_v6(&v7).expect("control: the same state half decodes under V7");
-    let body = v7
-        .strip_prefix(SNAPSHOT_V7_MAGIC.as_slice())
-        .expect("v7 magic");
-    let (state_half, store_half) = body.split_at(body.len() - EMPTY_V7_STORE_BYTES);
+    let v8 = snapshot_inspire_state_v8(&state, &LogicalLeafStore::new()).expect("v8 serialize");
+    restore_inspire_state_v6(&v8).expect("control: the same state half decodes under V8");
+    let body = v8
+        .strip_prefix(SNAPSHOT_V8_MAGIC.as_slice())
+        .expect("v8 magic");
+    let (state_half, store_half) = body.split_at(body.len() - EMPTY_V8_STORE_BYTES);
     assert!(
         store_half.iter().all(|b| *b == 0),
-        "the empty store half must be all zero, or the V6 layout below is not what it claims"
+        "the empty store half must be all zero, or the layouts below are not what they claim"
     );
-    let mut v6 = state_half.to_vec();
+    state_half.to_vec()
+}
+
+/// A V6 envelope a V6 reader would have accepted: the state half, then the eleven V6 store
+/// fields empty. V6 lacked only `ppoi_event_metadata` of the V7 store.
+fn well_formed_v6_body() -> Vec<u8> {
+    let mut v6 = state_half();
     v6.extend_from_slice(&[0; EMPTY_V7_STORE_BYTES - 8]);
     v6
 }
 
-fn v6_refusal(body: &[u8]) -> String {
-    let mut bytes = SNAPSHOT_V6_MAGIC.to_vec();
+/// A V7 envelope the V7 reader accepted: the state half, then its twelve store fields empty.
+fn well_formed_v7_body() -> Vec<u8> {
+    let mut v7 = state_half();
+    v7.extend_from_slice(&[0; EMPTY_V7_STORE_BYTES]);
+    v7
+}
+
+fn retired_refusal(magic: [u8; 4], body: &[u8]) -> String {
+    let mut bytes = magic.to_vec();
     bytes.extend_from_slice(body);
     let error = restore_inspire_state_v6(&bytes)
         .err()
-        .unwrap_or_else(|| panic!("a {}-byte V6 body decoded to a state", body.len()));
-    refusal_text(error, "the V6 arm")
+        .unwrap_or_else(|| panic!("a {}-byte retired body decoded to a state", body.len()));
+    refusal_text(error, "a retired arm")
 }
 
-fn assert_names_the_v6_epoch_and_helps_the_operator(detail: &str) {
+fn v6_refusal(body: &[u8]) -> String {
+    retired_refusal(SNAPSHOT_V6_MAGIC, body)
+}
+
+fn assert_names_the_retired_epoch_and_helps_the_operator(detail: &str, epoch: &str) {
     for needle in [
-        "v6 snapshot refused",
-        "V7 snapshot epoch",
+        &format!("{epoch} snapshot refused"),
+        "V8 snapshot epoch",
         "no in-place migration exists",
         "re-bootstrap",
     ] {
@@ -211,11 +234,10 @@ fn a_v6_body_is_refused_unread_whatever_it_contains() {
     let mut rewritten = well_formed.clone();
     *rewritten.get_mut(7).expect("ring_dim's top byte") ^= 0x80;
 
-    let mut v7_shaped = well_formed.clone();
-    v7_shaped.extend_from_slice(&[0; 8]);
+    let v7_shaped = well_formed_v7_body();
 
     let expected = v6_refusal(&well_formed);
-    assert_names_the_v6_epoch_and_helps_the_operator(&expected);
+    assert_names_the_retired_epoch_and_helps_the_operator(&expected, "v6");
     for (label, body) in [
         ("empty", Vec::new()),
         (
@@ -303,6 +325,67 @@ fn the_boot_path_refuses_a_data_dir_holding_recovered_pre_epoch_bytes() {
     );
 }
 
+/// A data_dir the V7 build wrote: its manifest, and a snapshot whose store half that build
+/// minted, with a status byte per commitment and each row's signature.
+fn v7_data_dir() -> (tempfile::TempDir, Vec<u8>) {
+    let state = raven_railgun_testkit::toy_state(TOY_ENTRY_SIZE);
+    let mut body = snapshot_inspire_state(&state).expect("state half");
+    body.extend_from_slice(FROZEN_V7_STORE);
+    let mut snapshot = SNAPSHOT_V7_MAGIC.to_vec();
+    snapshot.extend_from_slice(&body);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let layout = StoreLayout::open(dir.path()).expect("layout");
+    Snapshot::build(snapshot, SNAPSHOT_MAGIC)
+        .save(&layout, SnapshotId(1))
+        .expect("save v7 snapshot");
+    Manifest {
+        schema_version: MANIFEST_SCHEMA_VERSION,
+        scheme_tag: RECOVERED_SCHEME_TAG.to_owned(),
+        instance_id: RECOVERED_INSTANCE_ID.to_owned(),
+        current_snapshot_id: SnapshotId(1),
+        current_snapshot_seq: 0,
+        current_marker: 0,
+        encoder_label: recovered_encoder().label().to_owned(),
+        prev_encoder_label: None,
+        entry_size_bytes: Some(TOY_ENTRY_SIZE),
+        rows_per_shard: Some(u64::from(ENTRIES_PER_SHARD)),
+    }
+    .save(&layout)
+    .expect("save v7 manifest");
+    (dir, body)
+}
+
+/// The previous on-disk format is refused by name at open, never read: the V8 store dropped the
+/// per-commitment statuses and the stored signatures, so the V7 bytes are not a V8 layout.
+#[test]
+fn the_boot_path_refuses_a_data_dir_the_v7_build_wrote_by_name() {
+    let (dir, body) = v7_data_dir();
+    let detail = boot_refusal(&dir);
+    assert_names_the_retired_epoch_and_helps_the_operator(&detail, "v7");
+    assert_eq!(detail, retired_refusal(SNAPSHOT_V7_MAGIC, &body));
+    let mut as_v8 = SNAPSHOT_V8_MAGIC.to_vec();
+    as_v8.extend_from_slice(&body);
+    assert!(
+        restore_inspire_state_v6(&as_v8).is_err(),
+        "control: the V7 body does not read as V8, so the refusal is not the only barrier"
+    );
+}
+
+/// Every body behind the V7 magic gets one byte-identical answer, as the V6 magic does.
+#[test]
+fn a_v7_body_is_refused_unread_whatever_it_contains() {
+    let expected = retired_refusal(SNAPSHOT_V7_MAGIC, &well_formed_v7_body());
+    assert_names_the_retired_epoch_and_helps_the_operator(&expected, "v7");
+    for body in [
+        Vec::new(),
+        RECOVERED_V5_SNAPSHOT_HEAD.to_vec(),
+        v7_data_dir().1,
+    ] {
+        assert_eq!(retired_refusal(SNAPSHOT_V7_MAGIC, &body), expected);
+    }
+}
+
 #[test]
 fn the_boot_path_refuses_a_well_formed_v6_snapshot_unread() {
     let body = well_formed_v6_body();
@@ -318,9 +401,9 @@ fn the_boot_path_refuses_a_well_formed_v6_snapshot_unread() {
 #[test]
 fn a_snapshot_carrying_surplus_bytes_is_refused_on_both_paths_naming_its_arm() {
     let state = raven_railgun_testkit::toy_state(TOY_ENTRY_SIZE);
-    let v7 = snapshot_inspire_state_v7(&state, &LogicalLeafStore::new()).expect("v7 serialize");
+    let v8 = snapshot_inspire_state_v8(&state, &LogicalLeafStore::new()).expect("v8 serialize");
     let v5 = snapshot_inspire_state(&state).expect("v5 serialize");
-    for (arm, exact) in [("v7", v7), ("v5", v5)] {
+    for (arm, exact) in [("v8", v8), ("v5", v5)] {
         restore_inspire_state_v6(&exact)
             .unwrap_or_else(|e| panic!("control: the exact {arm} bytes must decode: {e}"));
         let mut surplus = exact;

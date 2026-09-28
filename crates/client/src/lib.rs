@@ -679,24 +679,6 @@ pub fn build_seeded_query(
     Ok(encode(&bundle, "wasm_seeded_query_output")?)
 }
 
-/// Replace only the clear shard selector in a serialized seeded query.
-///
-/// Fanout responders override this field per response slot. Retargeting it to an independently
-/// sampled slot prevents the original target shard from remaining as a clear marker while the
-/// encrypted local-index query, packing mode, keys, and session handle remain unchanged.
-///
-/// # Errors
-/// Returns a JS error when `query_bytes` is not exactly one valid bincode [`SeededClientQuery`].
-#[wasm_bindgen]
-pub fn retarget_seeded_query_shard(
-    query_bytes: &[u8],
-    nominal_shard_id: u32,
-) -> Result<Vec<u8>, JsValue> {
-    let mut query: SeededClientQuery = decode(query_bytes, "fanout_seeded_client_query")?;
-    query.shard_id = nominal_shard_id;
-    Ok(encode(&query, "fanout_seeded_client_query")?)
-}
-
 /// Build a shuffled, CSPRNG-padded batch for a browser client.
 ///
 /// `global_indices_bincode` is a bincode `Vec<u64>`. The returned

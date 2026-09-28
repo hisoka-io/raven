@@ -30,14 +30,14 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use raven_railgun_engine::inspire::{
-    restore_inspire_state_v6, snapshot_inspire_state_v7, LogicalLeafStore,
+    restore_inspire_state_v6, snapshot_inspire_state_v8, LogicalLeafStore,
 };
 use raven_railgun_persistence::{
     Manifest, Snapshot, SnapshotId, StoreLayout, MANIFEST_SCHEMA_VERSION, SNAPSHOT_MAGIC,
 };
 
 /// `Err` carries the operator-facing verdict; `Ok` carries which arm read it, so a green run
-/// still says whether the V5 or V7 path was exercised. A V6 body never goes green.
+/// still says whether the V5 or V8 path was exercised. A V6 or V7 body never goes green.
 fn probe(dir: &std::path::Path) -> Result<&'static str, String> {
     let layout = StoreLayout::inspect(dir);
     let manifest = match Manifest::load(&layout) {
@@ -63,6 +63,7 @@ fn probe(dir: &std::path::Path) -> Result<&'static str, String> {
     // The magic prefix, not the manifest number, picks the read arm. Reporting both stops a
     // reader concluding that "schema_version 5" means the V5 path was taken.
     let arm = match snap.data.get(..4) {
+        Some(b"RV8\0") => "V8",
         Some(b"RV7\0") => "V7",
         Some(b"RV6\0") => "V6",
         _ => "V5 (no magic prefix)",
@@ -99,7 +100,7 @@ fn the_probe_reports_green_on_a_data_dir_this_binary_just_wrote() {
     let layout = StoreLayout::open(dir.path()).expect("layout");
     let state = raven_railgun_testkit::toy_state(32);
     let payload =
-        snapshot_inspire_state_v7(&state, &LogicalLeafStore::new()).expect("v7 serialize");
+        snapshot_inspire_state_v8(&state, &LogicalLeafStore::new()).expect("v8 serialize");
 
     let id = SnapshotId(1);
     Snapshot::build(payload, SNAPSHOT_MAGIC)
@@ -122,20 +123,20 @@ fn the_probe_reports_green_on_a_data_dir_this_binary_just_wrote() {
 
     assert_eq!(
         probe(dir.path()).expect("a data_dir this binary just wrote must reopen"),
-        "V7"
+        "V8"
     );
 }
 
 /// ...and that it goes RED for the reason it claims. A byte flipped inside the embedded
 /// InsPIRe types is the shape of the real failure: the header still validates, the arm is
-/// still V7, and the decode fails anyway.
+/// still V8, and the decode fails anyway.
 #[test]
 fn the_probe_reports_red_when_the_snapshot_body_does_not_match_this_binary() {
     let dir = tempfile::tempdir().expect("tempdir");
     let layout = StoreLayout::open(dir.path()).expect("layout");
     let state = raven_railgun_testkit::toy_state(32);
     let mut payload =
-        snapshot_inspire_state_v7(&state, &LogicalLeafStore::new()).expect("v7 serialize");
+        snapshot_inspire_state_v8(&state, &LogicalLeafStore::new()).expect("v8 serialize");
 
     // Splice out eight bytes just past the magic: exactly what a removed `usize` field does
     // to every byte after it.
@@ -162,7 +163,7 @@ fn the_probe_reports_red_when_the_snapshot_body_does_not_match_this_binary() {
 
     let verdict = probe(dir.path()).expect_err("a shifted body must not reopen");
     assert!(verdict.contains("CANNOT REOPEN"), "{verdict}");
-    assert!(verdict.contains("snapshot arm by magic: V7"), "{verdict}");
+    assert!(verdict.contains("snapshot arm by magic: V8"), "{verdict}");
     assert!(
         verdict.contains("no in-place migration exists"),
         "{verdict}"

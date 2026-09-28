@@ -26,7 +26,7 @@ use raven_railgun_core::AdapterError;
 use raven_railgun_engine::imt::{Imt, TREE_DEPTH, TREE_MAX_ITEMS};
 use raven_railgun_engine::inspire::{apply_wal_entry, LogicalLeafStore};
 use raven_railgun_engine::pir_table::{
-    PerLeafCommitmentEncoder, PerListStatusEncoder, PirTableEncoder,
+    PerLeafCommitmentEncoder, PerListPath10Encoder, PirTableEncoder,
 };
 use raven_railgun_persistence::{PpoiEventMetadata, PpoiEventType, WalEntryPayload};
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,9 @@ use serde::{Deserialize, Serialize};
 const NON_CANONICAL: [u8; 32] = [0xff; 32];
 const LIST_KEY: [u8; 32] = [0x5e; 32];
 const TREE: u32 = 3;
+/// Four rows a shard: a run spans many shards, so a dirty set that diverges between the two
+/// paths shows. At the shipped 2,048 every row of these runs would land in shard 0.
+const ROWS_PER_SHARD: u32 = 4;
 
 /// `Imt` as bincode lays it out, with each level's hash map read as a vector of entries.
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
@@ -56,11 +59,9 @@ impl ImtMirror {
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 struct StoreMirror {
     leaves: BTreeMap<(u32, u32), [u8; 32]>,
-    ppoi_status: BTreeMap<([u8; 32], [u8; 32]), u8>,
     dirty_shards: BTreeSet<u32>,
     last_block_height: u64,
     leaf_block_height: BTreeMap<(u32, u32), u64>,
-    ppoi_block_height: BTreeMap<([u8; 32], [u8; 32]), u64>,
     imts: Vec<(u32, ImtMirror)>,
     ppoi_imts: Vec<([u8; 32], ImtMirror)>,
     ppoi_bc_indices: BTreeSet<([u8; 32], [u8; 32], u32)>,
@@ -199,16 +200,10 @@ fn check_imt_case(case: &ImtCase) -> Result<(), TestCaseError> {
         at = end;
     }
 
-    // A run of one takes the single-leaf path, which is per-leaf insertion itself.
-    let multi: Vec<usize> = (0..chunks.len()).filter(|&c| chunks[c].len() > 1).collect();
-    let bad = case
-        .bad
-        .as_ref()
-        .filter(|_| !multi.is_empty())
-        .map(|(c, p)| {
-            let chunk = &chunks[*c.get(&multi)];
-            chunk.start + p.index(chunk.len())
-        });
+    let bad = case.bad.as_ref().map(|(c, p)| {
+        let chunk = &chunks[c.index(chunks.len())];
+        chunk.start + p.index(chunk.len())
+    });
     let mut run = run.to_vec();
     if let Some(at) = bad {
         run[at] = NON_CANONICAL;
@@ -317,15 +312,15 @@ fn a_non_canonical_leaf_at_either_end_of_a_full_run_leaves_the_tree_untouched() 
 
 // -- LogicalLeafStore::seed_leaf_run against apply, row by row --------------------------------
 
-fn ppoi_row(list_index: u32, bc: [u8; 32], status: u8) -> WalEntryPayload {
+fn ppoi_row(list_index: u32, bc: [u8; 32], tag: u8) -> WalEntryPayload {
     WalEntryPayload::PpoiListLeafAdded {
         list_key: LIST_KEY,
         list_index,
         blinded_commitment: bc,
-        status,
+        status: 0,
         event_type: PpoiEventType::Shield,
-        signature: vec![status; 64],
-        validated_merkleroot: [status; 32],
+        signature: Vec::new(),
+        validated_merkleroot: [tag; 32],
     }
 }
 
@@ -342,7 +337,6 @@ enum Planted {
     NonCanonical,
     Gap,
     ForeignTree,
-    Status,
 }
 
 #[derive(Debug, Clone)]
@@ -369,7 +363,6 @@ fn store_case() -> impl Strategy<Value = StoreCase> {
                     Just(Planted::NonCanonical),
                     Just(Planted::Gap),
                     Just(Planted::ForeignTree),
-                    Just(Planted::Status),
                 ],
             ),
         ),
@@ -392,14 +385,14 @@ fn pool_leaf(seed: u8) -> [u8; 32] {
 
 fn check_store_case(case: &StoreCase) -> Result<(), TestCaseError> {
     let encoder: Box<dyn PirTableEncoder> = if case.ppoi {
-        Box::new(PerListStatusEncoder::new(32, 2048, LIST_KEY).expect("encoder"))
+        Box::new(PerListPath10Encoder::new(ROWS_PER_SHARD, LIST_KEY).expect("encoder"))
     } else {
-        Box::new(PerLeafCommitmentEncoder::new(32, 2048, TREE).expect("encoder"))
+        Box::new(PerLeafCommitmentEncoder::new(32, ROWS_PER_SHARD, TREE).expect("encoder"))
     };
-    let row = |index: usize, (bc, status): (u8, u8)| {
+    let row = |index: usize, (bc, tag): (u8, u8)| {
         let index = index as u32;
         if case.ppoi {
-            ppoi_row(index, pool_leaf(bc), status)
+            ppoi_row(index, pool_leaf(bc), tag)
         } else {
             tree_row(index, pool_leaf(bc))
         }
@@ -440,11 +433,6 @@ fn check_store_case(case: &StoreCase) -> Result<(), TestCaseError> {
                 event_type: PpoiEventType::Shield,
                 signature: vec![],
                 validated_merkleroot: [0; 32],
-            },
-            (Planted::Status, _) => WalEntryPayload::PpoiStatus {
-                list_key: LIST_KEY,
-                blinded_commitment: pool_leaf(1),
-                status: 1,
             },
         };
     }
@@ -501,9 +489,40 @@ proptest! {
     }
 }
 
+/// The differential above compares the two paths with each other, so a defect in the bookkeeping
+/// they share passes it. This holds a seeded run to the rows themselves.
+#[test]
+fn a_seeded_list_run_records_every_row_it_was_handed() {
+    let encoder = PerListPath10Encoder::new(ROWS_PER_SHARD, LIST_KEY).expect("encoder");
+    let rows: Vec<(WalEntryPayload, u64)> = (0..10u32)
+        .map(|i| {
+            (
+                ppoi_row(i, pool_leaf(i as u8 % 4), i as u8),
+                30 + u64::from(i),
+            )
+        })
+        .collect();
+    let mut store = LogicalLeafStore::new();
+    store.seed_leaf_run(&rows, &encoder).expect("seed");
+    let mut dirtied = BTreeSet::new();
+    for i in 0..10u32 {
+        let bc = pool_leaf(i as u8 % 4);
+        assert_eq!(store.ppoi_bc_at(&LIST_KEY, i), Some(bc), "row {i}");
+        assert!(
+            store.ppoi_indices_of(&LIST_KEY, &bc).any(|at| at == i),
+            "row {i}"
+        );
+        let meta = store.ppoi_event_metadata(&LIST_KEY, i).expect("metadata");
+        assert_eq!(meta.validated_merkleroot, [i as u8; 32], "row {i}");
+        dirtied.extend(encoder.affected_shards_for_ppoi_leaf(&LIST_KEY, i));
+    }
+    assert_eq!(store.dirty_shards(), &dirtied);
+    assert_eq!(store.last_block_height(), 39);
+}
+
 #[test]
 fn an_empty_run_is_a_no_op_and_a_non_leaf_first_row_is_refused() {
-    let encoder = PerListStatusEncoder::new(32, 2048, LIST_KEY).expect("encoder");
+    let encoder = PerListPath10Encoder::new(ROWS_PER_SHARD, LIST_KEY).expect("encoder");
     let mut store = LogicalLeafStore::new();
     store.seed_leaf_run(&[], &encoder).expect("empty run");
     let before = store_state(&store);

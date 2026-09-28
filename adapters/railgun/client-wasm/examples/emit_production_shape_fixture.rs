@@ -150,7 +150,7 @@ fn sha256_file(path: &Path) -> String {
 }
 
 /// The CRS `/v1/instance/{id}/params` ships, byte-for-byte: a duplicate of the private
-/// `crs_wire_bytes` in `adapters/railgun/http/src/admin.rs:142-158`, which a wasm client
+/// `crs_wire_bytes` in `adapters/railgun/http/src/handshake.rs`, which a wasm client
 /// crate cannot reach without depending on the axum server. Field-by-field for the same
 /// reason the original is: a CRS layout change must fail to compile here rather than
 /// silently re-inflate the fixture back past a megabyte.

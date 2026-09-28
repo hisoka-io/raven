@@ -144,7 +144,7 @@ CI=.github/workflows/ci.yml
 BAK=$(mktemp)
 cp "$CI" "$BAK"
 # Case 5 hides a real test file, so its restore is part of the same trap.
-VICTIM=adapters/railgun/engine/tests/t1_status_closure.rs
+VICTIM=adapters/railgun/engine/tests/multi_instance_recovery.rs
 VBAK=$(mktemp)
 cp "$VICTIM" "$VBAK"
 # Restore installed BEFORE any mutation: a killed run must not leave one applied.
@@ -178,7 +178,7 @@ expect_fail "a test() term renamed to a nonexistent test (uppercase in the name)
 sed -i 's/test(insert_rejects_overflow_past_capacity)/test(no_such_test_anywhere)/' "$CI"
 expect_fail "a test() term renamed to a nonexistent test (lowercase)"
 
-sed -i 's/binary(engine_dedup_extends_to_encoder)/binary(a_target_that_does_not_exist)/' "$CI"
+sed -i 's/binary(multi_instance_reorg_cascade)/binary(a_target_that_does_not_exist)/' "$CI"
 expect_fail "a binary() term naming a deleted target"
 
 sed -i '/-p raven-railgun-testkit/d' "$CI"

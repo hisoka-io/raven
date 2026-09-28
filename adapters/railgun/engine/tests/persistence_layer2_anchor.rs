@@ -154,11 +154,15 @@ fn leaf_event(leaf_index: u32, height: u64) -> RailgunEvent {
     }
 }
 
-fn mirror_row(byte: u8) -> WalEntryPayload {
-    WalEntryPayload::PpoiStatus {
+fn mirror_row(list_index: u32, byte: u8) -> WalEntryPayload {
+    WalEntryPayload::PpoiListLeafAdded {
         list_key: LIST_KEY,
+        list_index,
         blinded_commitment: canonical_commitment(byte),
-        status: 1,
+        status: 0,
+        event_type: raven_railgun_persistence::PpoiEventType::Shield,
+        signature: Vec::new(),
+        validated_merkleroot: [0; 32],
     }
 }
 
@@ -200,7 +204,7 @@ async fn mirror_height_zero_in_sync_verdict_must_not_become_a_fork_anchor() {
     let before = chain_source.rounds();
     handle
         .sender
-        .send(ConsumerEvent::Ppoi(mirror_row(0x91), 0))
+        .send(ConsumerEvent::Ppoi(mirror_row(0, 0x91), 0))
         .await
         .expect("send mirror row");
     await_rounds(&chain_source, before + 1, "phase 2").await;
@@ -218,7 +222,7 @@ async fn mirror_height_zero_in_sync_verdict_must_not_become_a_fork_anchor() {
     let before = chain_source.rounds();
     handle
         .sender
-        .send(ConsumerEvent::Ppoi(mirror_row(0x92), 0))
+        .send(ConsumerEvent::Ppoi(mirror_row(1, 0x92), 0))
         .await
         .expect("send mirror row");
     await_rounds(&chain_source, before + 1, "phase 3").await;

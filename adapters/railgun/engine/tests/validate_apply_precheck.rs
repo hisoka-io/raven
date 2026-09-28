@@ -130,3 +130,50 @@ fn a_wal_holding_a_non_canonical_leaf_refuses_the_reopen() {
         "the refusal must name the offending WAL seq and the reason, got: {msg}"
     );
 }
+
+fn list_leaf(list_index: u32) -> WalEntryPayload {
+    let mut bc = [0u8; 32];
+    bc[20] = 0x01;
+    bc[28..].copy_from_slice(&list_index.to_be_bytes());
+    WalEntryPayload::PpoiListLeafAdded {
+        list_key: [0x3d; 32],
+        list_index,
+        blinded_commitment: bc,
+        status: 0,
+        event_type: raven_railgun_persistence::PpoiEventType::Shield,
+        signature: Vec::new(),
+        validated_merkleroot: [0; 32],
+    }
+}
+
+/// The last slot of a list's tree is a slot like any other: a store holding 65,535 rows takes
+/// index 65,535, and only the index past it is refused for capacity.
+#[test]
+fn a_list_one_short_of_capacity_takes_its_last_index() {
+    const LAST: u32 = 65_535;
+    let encoder = raven_railgun_engine::pir_table::PerListPath10Encoder::new(2048, [0x3d; 32])
+        .expect("encoder");
+    let rows: Vec<(WalEntryPayload, u64)> = (0..LAST).map(|i| (list_leaf(i), 0)).collect();
+    let mut store = LogicalLeafStore::new();
+    store
+        .seed_leaf_run(&rows, &encoder)
+        .expect("seed 65,535 rows");
+
+    validate_apply(&store, &list_leaf(LAST)).expect("index 65,535 is the tree's last slot");
+    apply_wal_entry(&mut store, &list_leaf(LAST), 0, &encoder).expect("the last slot applies");
+    assert_eq!(
+        store.ppoi_bc_at(&[0x3d; 32], LAST),
+        Some({
+            let mut bc = [0u8; 32];
+            bc[20] = 0x01;
+            bc[28..].copy_from_slice(&LAST.to_be_bytes());
+            bc
+        })
+    );
+
+    let past = validate_apply(&store, &list_leaf(LAST + 1)).expect_err("past the tree");
+    assert!(
+        matches!(&past, AdapterError::InvalidQuery(msg) if msg.contains("capacity")),
+        "{past:?}"
+    );
+}

@@ -28,12 +28,11 @@ if (typeof wasmInit.init_panic_hook === "function") {
 }
 
 /**
- * Rows `adapters/railgun/client-wasm/examples/emit_test_fixture.rs` encoded:
- * `[status = idx % 4, bc[0..31]]` over a 32-byte cell — the production
- * `PerListStatusEncoder` shape (engine/src/pir_table/list.rs). Pinned rather than
- * recomputed so a regenerated fixture that changes the row shape reddens instead of
- * agreeing with itself; that pin is exactly what caught the first-cut emitter
- * writing `bc[1..32]` and shipping rows production would never serve.
+ * Rows `adapters/railgun/client-wasm/examples/emit_test_fixture.rs` encoded over a 32-byte
+ * cell: a tag byte `idx % 4`, then the first 31 bytes of the fixture's commitment for `idx`.
+ * A synthetic shape no server encoder writes; it only has to make every row distinct. Pinned
+ * rather than recomputed so a regenerated fixture that changes the rows reddens instead of
+ * agreeing with itself.
  */
 const EXPECTED_ROW_HEX: Record<number, string> = {
   0: "00bc000000000000000000000000000000000000000000000000000000000000",
@@ -102,8 +101,8 @@ describe("wasm extract_response against the checked-in Rust-emitted fixture", ()
       );
       expect(plaintext.length, `idx ${idx} plaintext length`).toBe(meta.entry_size);
       expect(hex(plaintext), `idx ${idx} row`).toBe(EXPECTED_ROW_HEX[idx]);
-      // The row is [status, bc[0..31]]; the tail is the first 31 bytes of the fixture's own BC.
-      expect(hex(plaintext.subarray(1)), `idx ${idx} bc tail`).toBe(
+      // After the tag byte, the row is the first 31 bytes of the fixture's own commitment.
+      expect(hex(plaintext.subarray(1)), `idx ${idx} commitment bytes`).toBe(
         meta.bcs_hex[idx].slice(0, 62),
       );
       // Cross-check against the plaintext native Rust recorded IN the fixture run, so the

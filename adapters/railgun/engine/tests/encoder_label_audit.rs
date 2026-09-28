@@ -1,6 +1,6 @@
 //! `EncoderKind` parity with what `build` returns — label, row width, and the per-node
-//! flat-index round trip — plus degenerate-input rejection, list-key carry, and the
-//! record-width constants those parity properties deliberately cannot pin.
+//! flat-index round trip — plus degenerate-input rejection and the record-width constants
+//! those parity properties deliberately cannot pin.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -8,17 +8,14 @@ use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 use raven_railgun_engine::inspire::{apply_wal_entry, LogicalLeafStore};
 use raven_railgun_engine::pir_table::{
-    EncoderKind, PerLeafCommitmentEncoder, PerLeafPathEncoder, PerListPathEncoder,
-    PerListStatusEncoder, PerNodeEncoder, PirTableEncoder, MIN_RECORD_SIZE, NODE_HASH_BYTES,
-    PATH_RECORD_BYTES,
+    EncoderKind, PerLeafCommitmentEncoder, PerLeafPathEncoder, PerNodeEncoder, PirTableEncoder,
+    MIN_RECORD_SIZE, NODE_HASH_BYTES, PATH10_RECORD_BYTES, PATH_RECORD_BYTES,
 };
 use raven_railgun_persistence::WalEntryPayload;
 use raven_railgun_testkit::canonical;
 
 const ENTRIES: u32 = 65_536;
-const RECORD: usize = 32;
 const PATH_BYTES: usize = 16 * 32;
-const LIST_KEY: [u8; 32] = [0xab; 32];
 const TREE_DEPTH: u32 = 16;
 
 /// Every variant, with the pin drawn rather than fixed: a parity law that holds only for
@@ -28,9 +25,7 @@ fn any_encoder_kind() -> impl Strategy<Value = EncoderKind> {
         any::<u32>().prop_map(|tree_number| EncoderKind::PerLeafBc { tree_number }),
         any::<u32>().prop_map(|tree_number| EncoderKind::PerLeafPath { tree_number }),
         any::<u32>().prop_map(|tree_number| EncoderKind::PerNode { tree_number }),
-        any::<[u8; 32]>().prop_map(|list_key| EncoderKind::PerListStatus { list_key }),
-        any::<[u8; 32]>().prop_map(|list_key| EncoderKind::PerListPath { list_key }),
-        any::<[u8; 32]>().prop_map(|list_key| EncoderKind::PerListNode { list_key }),
+        any::<[u8; 32]>().prop_map(|list_key| EncoderKind::PerListPath10 { list_key }),
     ]
 }
 
@@ -138,12 +133,16 @@ proptest! {
 
 /// Pinned against literals on purpose. The parity property above asserts only that
 /// prediction and construction MOVE TOGETHER, so a change to both at once — the exact shape
-/// of a silent wire-format break — satisfies it. These two numbers are the wire.
+/// of a silent wire-format break — satisfies it. These numbers are the wire.
 #[test]
 fn record_size_constants_are_pinned() {
     assert_eq!(
         PATH_RECORD_BYTES, 512,
         "a path record is 16 siblings x 32 B; changing it changes the served row width"
+    );
+    assert_eq!(
+        PATH10_RECORD_BYTES, 512,
+        "a PPOI row is 512 B; changing it changes the served row width"
     );
     assert_eq!(
         NODE_HASH_BYTES, 32,
@@ -166,31 +165,6 @@ fn per_leaf_bc_rejects_zero_entries_per_shard() {
     let err = PerLeafCommitmentEncoder::new(32, 0, 0).expect_err("must reject 0");
     let msg = format!("{err}");
     assert!(msg.contains("> 0"), "rejected with unexpected msg: {msg}");
-}
-
-#[test]
-fn per_list_status_rejects_too_small_record_size() {
-    let err = PerListStatusEncoder::new(8, ENTRIES, LIST_KEY).expect_err("must reject 8");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("record_size 8") && msg.contains("must be >= 32"),
-        "rejection must name the supplied width and the floor: {msg}"
-    );
-}
-
-// The two list-key carries below are NOT folded into the parity properties above:
-// `build` returns `Arc<dyn PirTableEncoder>` and `list_key()` is not on that trait, so no
-// property phrased over build's return value can reach the pin at all.
-#[test]
-fn per_list_status_carries_list_key_round_trip() {
-    let enc = PerListStatusEncoder::new(RECORD, ENTRIES, LIST_KEY).expect("build");
-    assert_eq!(enc.list_key(), &LIST_KEY);
-}
-
-#[test]
-fn per_list_path_carries_list_key_round_trip() {
-    let enc = PerListPathEncoder::new(PATH_BYTES, ENTRIES, LIST_KEY).expect("build");
-    assert_eq!(enc.list_key(), &LIST_KEY);
 }
 
 /// The pin selects which tree's auth paths a shard carries. An empty store returns the

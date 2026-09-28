@@ -57,14 +57,14 @@ const BN254_FR_MODULUS_BE: [u8; 32] = [
 #[derive(Clone, Copy)]
 enum ImtSlot {
     CommitmentTree(u32),
-    PpoiList,
+    List([u8; 32]),
 }
 
 impl ImtSlot {
     const fn index_field(self) -> &'static str {
         match self {
             Self::CommitmentTree(_) => "leaf_index",
-            Self::PpoiList => "list_index",
+            Self::List(_) => "list_index",
         }
     }
 
@@ -82,7 +82,7 @@ impl ImtSlot {
                 "non-contiguous AppendLeaf: tree {tree_number} expected leaf_index \
                  {expected}, got {got}"
             ),
-            Self::PpoiList => format!(
+            Self::List(_) => format!(
                 "non-contiguous PpoiListLeafAdded: list expected list_index \
                  {expected}, got {got}"
             ),
@@ -99,8 +99,7 @@ fn checked_imt_append(
     leaf: &[u8; 32],
 ) -> Result<usize> {
     let field = slot.index_field();
-    let index_usize = usize::try_from(index)
-        .map_err(|_| AdapterError::InvalidQuery(format!("{field} {index} out of usize range")))?;
+    let index_usize = index as usize;
     if index_usize >= crate::imt::TREE_MAX_ITEMS {
         return Err(AdapterError::InvalidQuery(format!(
             "{field} {index} is at or past IMT capacity {}",
@@ -144,11 +143,12 @@ pub fn ensure_canonical_leaf(payload: &raven_railgun_persistence::WalEntryPayloa
             commitment,
         ),
         P::PpoiListLeafAdded {
+            list_key,
             list_index,
             blinded_commitment,
             ..
-        } => (ImtSlot::PpoiList, *list_index, blinded_commitment),
-        P::PpoiStatus { .. } | P::Reorg { .. } | P::Heartbeat { .. } => return Ok(()),
+        } => (ImtSlot::List(*list_key), *list_index, blinded_commitment),
+        P::Reorg { .. } | P::Heartbeat { .. } => return Ok(()),
     };
     if leaf >= &BN254_FR_MODULUS_BE {
         return Err(slot.non_canonical_leaf(index, leaf));
@@ -156,27 +156,41 @@ pub fn ensure_canonical_leaf(payload: &raven_railgun_persistence::WalEntryPayloa
     Ok(())
 }
 
+/// Identifies one state of a store's list rows within this process. Every store starts with a
+/// fresh value, a decoded one included, and takes another whenever a list row is added or
+/// removed, so two equal stamps mean the same list rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowsStamp(u64);
+
+static NEXT_ROWS_STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl RowsStamp {
+    fn fresh() -> Self {
+        Self(NEXT_ROWS_STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Default for RowsStamp {
+    fn default() -> Self {
+        Self::fresh()
+    }
+}
+
 /// Sidecar logical-state store; accumulates chain rows and marks shards dirty
 /// so commit re-encodes only those. Rebuilt from WAL replay on bootstrap.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogicalLeafStore {
     leaves: std::collections::BTreeMap<(u32, u32), [u8; 32]>,
-    ppoi_status: std::collections::BTreeMap<([u8; 32], [u8; 32]), u8>,
     dirty_shards: std::collections::BTreeSet<u32>,
     last_block_height: u64,
     leaf_block_height: std::collections::BTreeMap<(u32, u32), u64>,
-    ppoi_block_height: std::collections::BTreeMap<([u8; 32], [u8; 32]), u64>,
     imts: std::collections::HashMap<u32, crate::imt::Imt>,
     ppoi_imts: std::collections::HashMap<[u8; 32], crate::imt::Imt>,
     // Upstream dropped its unique `(listKey, blindedCommitment)` index and recreated it
     // non-unique, so one commitment may hold several indices and a one-index map lost the
-    // earlier one. A set of triples rather than a widened map because under bincode it is
-    // byte-identical to that map; `tests/logical_store_bc_index_wire.rs` holds it to that.
+    // earlier one.
     ppoi_bc_indices: std::collections::BTreeSet<([u8; 32], [u8; 32], u32)>,
     ppoi_index_bc: std::collections::BTreeMap<([u8; 32], u32), [u8; 32]>,
-    // Inert under bincode, which is positional and carries no field names: inserting this
-    // field mid-struct shifted every field after it, which is why a V6 body is refused unread.
-    #[serde(default)]
     ppoi_event_metadata:
         std::collections::BTreeMap<([u8; 32], u32), raven_railgun_persistence::PpoiEventMetadata>,
     ppoi_list_leaf_block_height: std::collections::BTreeMap<([u8; 32], u32), u64>,
@@ -192,6 +206,8 @@ pub struct LogicalLeafStore {
     // forever one hour after boot. A commit replaces the Arc; a heartbeat does not.
     #[serde(skip)]
     committed_addenda_db: Option<std::sync::Arc<raven_inspire::EncodedDatabase>>,
+    #[serde(skip)]
+    list_rows_stamp: RowsStamp,
 }
 
 impl LogicalLeafStore {
@@ -202,7 +218,6 @@ impl LogicalLeafStore {
     }
 
     /// Apply one WAL payload. Logical mutation only; does not touch `encoded_db`.
-    #[allow(clippy::too_many_lines)]
     pub fn apply(
         &mut self,
         payload: &raven_railgun_persistence::WalEntryPayload,
@@ -216,201 +231,125 @@ impl LogicalLeafStore {
                 leaf_index,
                 commitment,
             } => {
-                let expected_idx = self
-                    .imts
-                    .get(tree_number)
-                    .map_or(0, crate::imt::Imt::leaf_count);
-                let leaf_idx_usize = checked_imt_append(
-                    ImtSlot::CommitmentTree(*tree_number),
-                    *leaf_index,
-                    expected_idx,
-                    commitment,
-                )?;
-
-                let imt = match self.imts.entry(*tree_number) {
-                    std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(v) => {
-                        v.insert(crate::imt::Imt::new()?)
-                    }
-                };
-                imt.insert_leaves(leaf_idx_usize, &[*commitment])?;
-                let key = (*tree_number, *leaf_index);
-                self.leaves.insert(key, *commitment);
-                self.leaf_block_height.insert(key, block_height);
-                self.dirty_shards
-                    .extend(encoder.affected_shards_for_leaf(*tree_number, *leaf_index));
-            }
-            P::PpoiStatus {
-                list_key,
-                blinded_commitment,
-                status,
-            } => {
-                // A status carries no list index, so every block of the list receives it; filing
-                // it only where the commitment is indexed keeps one copy of the list's statuses
-                // rather than one per block. The leaf files its own status, so nothing is lost.
-                let occurrences: Vec<u32> =
-                    self.ppoi_indices_of(list_key, blinded_commitment).collect();
-                if !occurrences.is_empty() {
-                    let key = (*list_key, *blinded_commitment);
-                    self.ppoi_status.insert(key, *status);
-                    self.ppoi_block_height.insert(key, block_height);
-                }
-                // EVERY occurrence's row carries the status: it is per commitment upstream, so
-                // dirtying one leaves the other rows publishing the superseded verdict.
-                for list_index in occurrences {
-                    self.dirty_shards
-                        .extend(encoder.affected_shards_for_ppoi_leaf(list_key, list_index));
-                }
+                let slot = ImtSlot::CommitmentTree(*tree_number);
+                let at =
+                    checked_imt_append(slot, *leaf_index, self.slot_leaf_count(slot), commitment)?;
+                self.append_to_imt(slot, at, &[*commitment])?;
+                self.record_appended_leaf(payload, block_height, encoder);
             }
             P::PpoiListLeafAdded {
                 list_key,
                 list_index,
                 blinded_commitment,
-                status,
-                event_type,
-                signature,
-                validated_merkleroot,
+                ..
             } => {
-                let expected_idx = self
-                    .ppoi_imts
-                    .get(list_key)
-                    .map_or(0, crate::imt::Imt::leaf_count);
-                let leaf_idx_usize = checked_imt_append(
-                    ImtSlot::PpoiList,
+                let slot = ImtSlot::List(*list_key);
+                let at = checked_imt_append(
+                    slot,
                     *list_index,
-                    expected_idx,
+                    self.slot_leaf_count(slot),
                     blinded_commitment,
                 )?;
-                let imt = match self.ppoi_imts.entry(*list_key) {
-                    std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(v) => {
-                        v.insert(crate::imt::Imt::new()?)
-                    }
-                };
-                imt.insert_leaves(leaf_idx_usize, &[*blinded_commitment])?;
-                let bc_key = (*list_key, *blinded_commitment);
-                let idx_key = (*list_key, *list_index);
-                self.ppoi_bc_indices
-                    .insert((*list_key, *blinded_commitment, *list_index));
-                self.ppoi_index_bc.insert(idx_key, *blinded_commitment);
-                self.ppoi_event_metadata.insert(
-                    idx_key,
-                    raven_railgun_persistence::PpoiEventMetadata {
-                        event_type: *event_type,
-                        signature: signature.clone(),
-                        validated_merkleroot: *validated_merkleroot,
-                    },
-                );
-                self.ppoi_status.insert(bc_key, *status);
-                self.ppoi_block_height.insert(bc_key, block_height);
-                self.ppoi_list_leaf_block_height
-                    .insert(idx_key, block_height);
-                self.dirty_shards
-                    .extend(encoder.affected_shards_for_ppoi_leaf(list_key, *list_index));
+                self.append_to_imt(slot, at, &[*blinded_commitment])?;
+                self.record_appended_leaf(payload, block_height, encoder);
             }
-            P::Reorg { height } => {
-                let stale_leaves: Vec<(u32, u32)> = self
-                    .leaf_block_height
-                    .iter()
-                    .filter(|(_, &h)| h > *height)
-                    .map(|(k, _)| *k)
-                    .collect();
-                let mut affected_trees: std::collections::BTreeSet<u32> =
-                    std::collections::BTreeSet::new();
-                for key in stale_leaves {
-                    let (tree_number, leaf_index) = key;
-                    self.leaves.remove(&key);
-                    self.leaf_block_height.remove(&key);
-                    self.dirty_shards
-                        .extend(encoder.affected_shards_for_leaf(tree_number, leaf_index));
-                    affected_trees.insert(tree_number);
-                }
-                // Surviving count = max remaining leaf_index + 1, scoped to one tree.
-                for tree in &affected_trees {
-                    let new_count: usize = match self
-                        .leaves
-                        .range((*tree, 0u32)..(tree.saturating_add(1), 0u32))
-                        .next_back()
-                    {
-                        Some(((_, last_idx), _)) => {
-                            usize::try_from(last_idx.saturating_add(1)).unwrap_or(usize::MAX)
-                        }
-                        None => 0,
-                    };
-                    if let Some(imt) = self.imts.get_mut(tree) {
-                        imt.truncate_to(new_count);
-                    }
-                }
-                let stale_ppoi: Vec<([u8; 32], [u8; 32])> = self
-                    .ppoi_block_height
-                    .iter()
-                    .filter(|(_, &h)| h > *height)
-                    .map(|(k, _)| *k)
-                    .collect();
-                for key in stale_ppoi {
-                    self.ppoi_status.remove(&key);
-                    self.ppoi_block_height.remove(&key);
-                    // Dropping a status rewrites the verdict byte of every row carrying that
-                    // commitment. Read the indices before the list-leaf pass below removes them.
-                    let occurrences: Vec<u32> = self.ppoi_indices_of(&key.0, &key.1).collect();
-                    for list_index in occurrences {
-                        self.dirty_shards
-                            .extend(encoder.affected_shards_for_ppoi_leaf(&key.0, list_index));
-                    }
-                }
-
-                let stale_list_leaves: Vec<([u8; 32], u32)> = self
-                    .ppoi_list_leaf_block_height
-                    .iter()
-                    .filter(|(_, &h)| h > *height)
-                    .map(|(k, _)| *k)
-                    .collect();
-                let mut affected_lists: std::collections::BTreeSet<[u8; 32]> =
-                    std::collections::BTreeSet::new();
-                let mut unindexed: Vec<([u8; 32], [u8; 32])> = Vec::new();
-                for key in stale_list_leaves {
-                    let (list_key, list_index) = key;
-                    self.ppoi_list_leaf_block_height.remove(&key);
-                    self.ppoi_event_metadata.remove(&key);
-                    // Only THIS occurrence. Dropping the commitment's whole lookup unindexes a
-                    // commitment that a surviving earlier index still holds, and the shim then
-                    // reports a member of the list as Missing.
-                    if let Some(bc) = self.ppoi_index_bc.remove(&key) {
-                        self.ppoi_bc_indices.remove(&(list_key, bc, list_index));
-                        unindexed.push((list_key, bc));
-                    }
-                    self.dirty_shards
-                        .extend(encoder.affected_shards_for_ppoi_leaf(&list_key, list_index));
-                    affected_lists.insert(list_key);
-                }
-                // The apply-time rule, held across a rewind: a status filed at a height below its
-                // leaf's would otherwise outlive the last occurrence it was filed for.
-                for key in unindexed {
-                    if self.ppoi_indices_of(&key.0, &key.1).next().is_none() {
-                        self.ppoi_status.remove(&key);
-                        self.ppoi_block_height.remove(&key);
-                    }
-                }
-                for list_key in &affected_lists {
-                    let new_count: usize = match self
-                        .ppoi_index_bc
-                        .range((*list_key, 0u32)..)
-                        .take_while(|((lk, _), _)| lk == list_key)
-                        .last()
-                    {
-                        Some(((_, last_idx), _)) => {
-                            usize::try_from(last_idx.saturating_add(1)).unwrap_or(usize::MAX)
-                        }
-                        None => 0,
-                    };
-                    if let Some(imt) = self.ppoi_imts.get_mut(list_key) {
-                        imt.truncate_to(new_count);
-                    }
-                }
-            }
+            P::Reorg { height } => self.rewind_past(*height, encoder),
             P::Heartbeat { .. } => {}
         }
         self.last_block_height = self.last_block_height.max(block_height);
+        Ok(())
+    }
+
+    fn rewind_past(&mut self, height: u64, encoder: &dyn crate::pir_table::PirTableEncoder) {
+        let stale_leaves: Vec<(u32, u32)> = self
+            .leaf_block_height
+            .iter()
+            .filter(|(_, &h)| h > height)
+            .map(|(k, _)| *k)
+            .collect();
+        let mut affected_trees: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        for key in stale_leaves {
+            let (tree_number, leaf_index) = key;
+            self.leaves.remove(&key);
+            self.leaf_block_height.remove(&key);
+            self.dirty_shards
+                .extend(encoder.affected_shards_for_leaf(tree_number, leaf_index));
+            affected_trees.insert(tree_number);
+        }
+        // Surviving count = max remaining leaf_index + 1, scoped to one tree.
+        for tree in &affected_trees {
+            let new_count = self
+                .leaves
+                .range((*tree, 0u32)..(tree.saturating_add(1), 0u32))
+                .next_back()
+                .map_or(0, |((_, last_idx), _)| *last_idx as usize + 1);
+            if let Some(imt) = self.imts.get_mut(tree) {
+                imt.truncate_to(new_count);
+            }
+        }
+
+        let stale_list_leaves: Vec<([u8; 32], u32)> = self
+            .ppoi_list_leaf_block_height
+            .iter()
+            .filter(|(_, &h)| h > height)
+            .map(|(k, _)| *k)
+            .collect();
+        let mut affected_lists: std::collections::BTreeSet<[u8; 32]> =
+            std::collections::BTreeSet::new();
+        if !stale_list_leaves.is_empty() {
+            self.list_rows_stamp = RowsStamp::fresh();
+        }
+        for key in stale_list_leaves {
+            let (list_key, list_index) = key;
+            self.ppoi_list_leaf_block_height.remove(&key);
+            self.ppoi_event_metadata.remove(&key);
+            // Only THIS occurrence. Dropping the commitment's whole lookup unindexes a
+            // commitment that a surviving earlier index still holds, and the shim then
+            // reports a member of the list as Missing.
+            if let Some(bc) = self.ppoi_index_bc.remove(&key) {
+                self.ppoi_bc_indices.remove(&(list_key, bc, list_index));
+            }
+            self.dirty_shards
+                .extend(encoder.affected_shards_for_ppoi_leaf(&list_key, list_index));
+            affected_lists.insert(list_key);
+        }
+        for list_key in &affected_lists {
+            let new_count = self
+                .ppoi_index_bc
+                .range((*list_key, 0u32)..)
+                .take_while(|((lk, _), _)| lk == list_key)
+                .last()
+                .map_or(0, |((_, last_idx), _)| *last_idx as usize + 1);
+            if let Some(imt) = self.ppoi_imts.get_mut(list_key) {
+                imt.truncate_to(new_count);
+            }
+        }
+    }
+
+    fn slot_leaf_count(&self, slot: ImtSlot) -> usize {
+        let imt = match slot {
+            ImtSlot::CommitmentTree(tree_number) => self.imts.get(&tree_number),
+            ImtSlot::List(list_key) => self.ppoi_imts.get(&list_key),
+        };
+        imt.map_or(0, crate::imt::Imt::leaf_count)
+    }
+
+    /// Append in place. `Imt::insert_leaves` refuses with the tree untouched, and a slot with no
+    /// tree yet gets one only once the append succeeded, so a refusal leaves the store as it was.
+    fn append_to_imt(&mut self, slot: ImtSlot, start: usize, leaves: &[[u8; 32]]) -> Result<()> {
+        let existing = match slot {
+            ImtSlot::CommitmentTree(tree_number) => self.imts.get_mut(&tree_number),
+            ImtSlot::List(list_key) => self.ppoi_imts.get_mut(&list_key),
+        };
+        if let Some(imt) = existing {
+            return imt.insert_leaves(start, leaves);
+        }
+        let mut imt = crate::imt::Imt::new()?;
+        imt.insert_leaves(start, leaves)?;
+        match slot {
+            ImtSlot::CommitmentTree(tree_number) => self.imts.insert(tree_number, imt),
+            ImtSlot::List(list_key) => self.ppoi_imts.insert(list_key, imt),
+        };
         Ok(())
     }
 
@@ -431,40 +370,38 @@ impl LogicalLeafStore {
         encoder: &dyn crate::pir_table::PirTableEncoder,
     ) -> Result<()> {
         use raven_railgun_persistence::WalEntryPayload as P;
-        // (tree, list): exactly one is set, naming the IMT the whole run appends to.
-        let (tree, list) = match rows.first() {
+        let slot = match rows.first() {
             None => return Ok(()),
-            Some((P::AppendLeaf { tree_number, .. }, _)) => (Some(*tree_number), None),
-            Some((P::PpoiListLeafAdded { list_key, .. }, _)) => (None, Some(*list_key)),
+            Some((P::AppendLeaf { tree_number, .. }, _)) => ImtSlot::CommitmentTree(*tree_number),
+            Some((P::PpoiListLeafAdded { list_key, .. }, _)) => ImtSlot::List(*list_key),
             Some(_) => {
                 return Err(AdapterError::InvalidQuery(
                     "seed_leaf_run: the first row is not a tree leaf".into(),
                 ));
             }
         };
-        let (slot, existing) = match (tree, list) {
-            (Some(tree_number), _) => (
-                ImtSlot::CommitmentTree(tree_number),
-                self.imts.get(&tree_number),
-            ),
-            (None, key) => (ImtSlot::PpoiList, key.and_then(|k| self.ppoi_imts.get(&k))),
-        };
-        let start = existing.map_or(0, crate::imt::Imt::leaf_count);
+        let start = self.slot_leaf_count(slot);
 
         let mut leaves = Vec::with_capacity(rows.len());
         for (offset, (payload, _)) in rows.iter().enumerate() {
-            let (index, leaf) = match payload {
-                P::AppendLeaf {
-                    tree_number,
-                    leaf_index,
-                    commitment,
-                } if tree == Some(*tree_number) => (*leaf_index, commitment),
-                P::PpoiListLeafAdded {
-                    list_key,
-                    list_index,
-                    blinded_commitment,
-                    ..
-                } if list == Some(*list_key) => (*list_index, blinded_commitment),
+            let (index, leaf) = match (slot, payload) {
+                (
+                    ImtSlot::CommitmentTree(tree),
+                    P::AppendLeaf {
+                        tree_number,
+                        leaf_index,
+                        commitment,
+                    },
+                ) if tree == *tree_number => (*leaf_index, commitment),
+                (
+                    ImtSlot::List(list),
+                    P::PpoiListLeafAdded {
+                        list_key,
+                        list_index,
+                        blinded_commitment,
+                        ..
+                    },
+                ) if list == *list_key => (*list_index, blinded_commitment),
                 _ => {
                     return Err(AdapterError::InvalidQuery(format!(
                         "seed_leaf_run: row {offset} is not a leaf of the first row's tree"
@@ -475,24 +412,17 @@ impl LogicalLeafStore {
             leaves.push(*leaf);
         }
 
-        let mut imt = match existing {
-            Some(imt) => imt.clone(),
-            None => crate::imt::Imt::new()?,
-        };
-        imt.insert_leaves(start, &leaves)?;
-        match (tree, list) {
-            (Some(tree_number), _) => self.imts.insert(tree_number, imt),
-            (None, Some(key)) => self.ppoi_imts.insert(key, imt),
-            (None, None) => None,
-        };
+        self.append_to_imt(slot, start, &leaves)?;
         for (payload, block_height) in rows {
-            self.record_seeded_leaf(payload, *block_height, encoder);
+            self.record_appended_leaf(payload, *block_height, encoder);
+            self.last_block_height = self.last_block_height.max(*block_height);
         }
         Ok(())
     }
 
-    /// The bookkeeping of the matching [`Self::apply`] arm once its IMT append has succeeded.
-    fn record_seeded_leaf(
+    /// Everything a leaf row records besides its IMT append, which the caller has made. The one
+    /// copy [`Self::apply`] and [`Self::seed_leaf_run`] share.
+    fn record_appended_leaf(
         &mut self,
         payload: &raven_railgun_persistence::WalEntryPayload,
         block_height: u64,
@@ -515,12 +445,10 @@ impl LogicalLeafStore {
                 list_key,
                 list_index,
                 blinded_commitment,
-                status,
                 event_type,
-                signature,
                 validated_merkleroot,
+                ..
             } => {
-                let bc_key = (*list_key, *blinded_commitment);
                 let idx_key = (*list_key, *list_index);
                 self.ppoi_bc_indices
                     .insert((*list_key, *blinded_commitment, *list_index));
@@ -529,20 +457,25 @@ impl LogicalLeafStore {
                     idx_key,
                     raven_railgun_persistence::PpoiEventMetadata {
                         event_type: *event_type,
-                        signature: signature.clone(),
                         validated_merkleroot: *validated_merkleroot,
                     },
                 );
-                self.ppoi_status.insert(bc_key, *status);
-                self.ppoi_block_height.insert(bc_key, block_height);
                 self.ppoi_list_leaf_block_height
                     .insert(idx_key, block_height);
                 self.dirty_shards
                     .extend(encoder.affected_shards_for_ppoi_leaf(list_key, *list_index));
+                self.list_rows_stamp = RowsStamp::fresh();
             }
-            P::PpoiStatus { .. } | P::Reorg { .. } | P::Heartbeat { .. } => {}
+            P::Reorg { .. } | P::Heartbeat { .. } => {}
         }
-        self.last_block_height = self.last_block_height.max(block_height);
+    }
+
+    /// The state of this store's list rows, unique in the process: equal stamps mean no list
+    /// row was added or removed in between, so a reader can reuse what it derived from them
+    /// without walking them again.
+    #[must_use]
+    pub fn list_rows_stamp(&self) -> u64 {
+        self.list_rows_stamp.0
     }
 
     /// Number of leaves currently tracked.
@@ -554,12 +487,6 @@ impl LogicalLeafStore {
     /// Iterator over all leaves in deterministic `BTreeMap` order.
     pub fn leaves_iter(&self) -> impl Iterator<Item = (&(u32, u32), &[u8; 32])> {
         self.leaves.iter()
-    }
-
-    /// Number of indexed blinded commitments holding a status.
-    #[must_use]
-    pub fn ppoi_count(&self) -> usize {
-        self.ppoi_status.len()
     }
 
     /// Set of shard ids with pending re-encode work.
@@ -578,14 +505,6 @@ impl LogicalLeafStore {
     #[must_use]
     pub fn leaf(&self, tree_number: u32, leaf_index: u32) -> Option<&[u8; 32]> {
         self.leaves.get(&(tree_number, leaf_index))
-    }
-
-    /// Look up a PPOI status row.
-    #[must_use]
-    pub fn ppoi_status(&self, list_key: &[u8; 32], blinded_commitment: &[u8; 32]) -> Option<u8> {
-        self.ppoi_status
-            .get(&(*list_key, *blinded_commitment))
-            .copied()
     }
 
     /// Per-list IMT for `list_key`, or `None` if no leaves applied yet.
@@ -680,13 +599,6 @@ impl LogicalLeafStore {
         self.ppoi_event_metadata.get(&(*list_key, list_index))
     }
 
-    /// Per-list `(list_index -> status_byte)` derived view.
-    #[must_use]
-    pub fn ppoi_status_at(&self, list_key: &[u8; 32], list_index: u32) -> Option<u8> {
-        let bc = self.ppoi_bc_at(list_key, list_index)?;
-        self.ppoi_status(list_key, &bc)
-    }
-
     /// Entry count of the map that a mid-struct field insertion steals the bytes of; the
     /// frozen-layout test asserts on it directly rather than inferring it from a clean decode.
     #[cfg(test)]
@@ -720,10 +632,7 @@ impl LogicalLeafStore {
                 "no per-list IMT for list_key {list_key:?}; no leaves applied yet"
             ))
         })?;
-        let idx = usize::try_from(list_index).map_err(|_| {
-            AdapterError::InvalidQuery(format!("list_index {list_index} out of usize range"))
-        })?;
-        imt.merkle_proof(idx)
+        imt.merkle_proof(list_index as usize)
     }
 
     /// Re-derive the upper-sibling addendum for every shard of every list this store holds, and
@@ -862,10 +771,7 @@ impl LogicalLeafStore {
                 "no IMT for tree {tree_number}; no leaves applied yet"
             ))
         })?;
-        let idx = usize::try_from(leaf_index).map_err(|_| {
-            AdapterError::InvalidQuery(format!("leaf_index {leaf_index} out of usize range"))
-        })?;
-        imt.merkle_proof(idx)
+        imt.merkle_proof(leaf_index as usize)
     }
 
     /// Current root of the per-tree IMT, or `None` if no leaves applied yet.
@@ -946,10 +852,13 @@ pub fn validate_apply(
             validated_merkleroot,
             ..
         } => {
-            let expected = store
-                .ppoi_imt(list_key)
-                .map_or(0, crate::imt::Imt::leaf_count);
-            checked_imt_append(ImtSlot::PpoiList, *list_index, expected, blinded_commitment)?;
+            let slot = ImtSlot::List(*list_key);
+            checked_imt_append(
+                slot,
+                *list_index,
+                store.slot_leaf_count(slot),
+                blinded_commitment,
+            )?;
             screen_upstream_root(
                 store,
                 list_key,
@@ -958,7 +867,7 @@ pub fn validate_apply(
                 validated_merkleroot,
             )?;
         }
-        P::PpoiStatus { .. } | P::Reorg { .. } | P::Heartbeat { .. } => {}
+        P::Reorg { .. } | P::Heartbeat { .. } => {}
     }
     Ok(())
 }
@@ -994,9 +903,8 @@ fn screen_upstream_root(
 /// Whether applying this payload APPENDS to an IMT.
 ///
 /// The error run `/health/ready` gates on means leaf application is wedged, and only an IMT
-/// append can close the contiguity gap that wedges it. A payload that mutates other store state
-/// (`PpoiStatus` writes a status byte and dirties shards) says nothing about that gap, so
-/// clearing the run on one reports a wedged tree as healthy.
+/// append can close the contiguity gap that wedges it. Any other payload says nothing about that
+/// gap, so clearing the run on one reports a wedged tree as healthy.
 ///
 /// Deliberately the same partition [`validate_apply`] screens on: these are exactly the variants
 /// that reach `checked_imt_append`, and the two must not drift apart.
@@ -1005,6 +913,6 @@ pub(crate) fn appends_to_a_tree(payload: &raven_railgun_persistence::WalEntryPay
     use raven_railgun_persistence::WalEntryPayload as P;
     match payload {
         P::AppendLeaf { .. } | P::PpoiListLeafAdded { .. } => true,
-        P::PpoiStatus { .. } | P::Reorg { .. } | P::Heartbeat { .. } => false,
+        P::Reorg { .. } | P::Heartbeat { .. } => false,
     }
 }

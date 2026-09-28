@@ -117,10 +117,9 @@ fn main() {
 
     let params = test_params();
 
-    // Row shape [status, bc[0..31]] mirrors PerListStatusEncoder::materialize_shard
-    // (engine/src/pir_table/list.rs): status byte, then the FIRST record_size-1 BC
-    // bytes. The first cut of this file wrote bc[1..32] and shipped a fixture whose
-    // rows disagreed with production, so decodeStatusRow could never pass on it.
+    // A synthetic 32-byte row, a tag byte then the first 31 bytes of a distinct commitment, so
+    // every row differs and a transposed extract shows. No server encoder writes this shape;
+    // the production row is pinned by emit_production_shape_fixture.
     let num_entries = params.ring_dim;
     let mut db = vec![0u8; num_entries * ENTRY_BYTES];
     for idx in 0..(num_entries as u32) {
@@ -185,15 +184,11 @@ fn main() {
             .expect("deserialize response wire");
 
         let plain = extract_response_rust(&crs, &state, &resp, ENTRY_BYTES).expect("extract");
-        assert_eq!(
-            plain[0],
-            (idx % 4) as u8,
-            "status byte mismatch at idx {idx}"
-        );
+        assert_eq!(plain[0], (idx % 4) as u8, "tag byte mismatch at idx {idx}");
         assert_eq!(
             &plain[1..32],
             &bc[0..31],
-            "row BC tail disagrees with the production encoder shape at idx {idx}"
+            "row commitment bytes disagree with the encoded row at idx {idx}"
         );
 
         // The state and plaintext were always computed here and then discarded, which

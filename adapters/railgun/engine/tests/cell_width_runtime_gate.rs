@@ -184,12 +184,12 @@ fn shipped_cell_shapes_pass_the_runtime_gate() {
     )
     .expect("per-node 32");
     validate_cell_shape(
-        &EncoderKind::PerListStatus { list_key: [0; 32] },
+        &EncoderKind::PerListPath10 { list_key: [0; 32] },
         leaves,
         512,
         ring_dim,
     )
-    .expect("per-list-status 512");
+    .expect("per-list-path10 512");
 }
 
 #[test]

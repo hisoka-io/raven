@@ -256,15 +256,15 @@ expect 1 "a lane one test short of its pin (a single deletion)"
 /usr/bin/grep -v "^${LANE}	" "$BE" > "$EXPECTED"
 expect 1 "a lane present in ci.yml with no expected count recorded"
 
-# 3. The live in-src row floor supplements the shape fixture with the current lane: one ignored
-#    integration test plus the in-src lib test its bare test() term names.
-if [ "$cur" -lt 2 ]; then
-  echo "SELFTEST FAIL: ${LANE} is recorded at ${cur}; it must be >= 2, because its filter's bare" >&2
+# 3. The live in-src row floor supplements the shape fixture with the current lane: its filter is
+#    a bare test() term naming one in-src lib test, and nothing else.
+if [ "$cur" -lt 1 ]; then
+  echo "SELFTEST FAIL: ${LANE} is recorded at ${cur}; it must be >= 1, because its filter's bare" >&2
   echo "  test() term resolves to an in-src lib test. A lower number means the row anchor in" >&2
   echo "  ${GATE} stopped counting lib rows again - see M-065." >&2
   fails=1
 else
-  echo "  ok: ${LANE} counts its in-src lib row (${cur} >= 2)"
+  echo "  ok: ${LANE} counts its in-src lib row (${cur} >= 1)"
 fi
 
 # 4. A matrix entry whose mode and the recorded count disagree, in both directions: cli-ignored

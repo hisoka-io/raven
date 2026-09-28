@@ -2,9 +2,10 @@
 //! bincode encoding of [`WalEntryPayload`].
 //!
 //! Both are symmetric in-process - the same build writes and reads them - so changing
-//! either is invisible to every round-trip test in the tree while silently orphaning
-//! every snapshot and WAL frame already on an operator's disk. The expected bytes here
-//! are therefore written out by hand, never derived from the types under test.
+//! either is invisible to every round-trip test in the tree while a data_dir written by the
+//! previous build stops reading, or reads as something else. The expected bytes here are
+//! therefore written out by hand, never derived from the types under test. A deliberate change
+//! re-mints them in the same change as the snapshot epoch that refuses the older layout.
 
 #![allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
@@ -12,15 +13,15 @@ use raven_railgun_persistence::{
     PpoiEventType, Snapshot, SnapshotId, StoreLayout, WalEntryPayload, SNAPSHOT_MAGIC,
 };
 
-/// The bytes an already-deployed snapshot carries in its header.
+/// The header magic every snapshot this adapter has written carries.
 const ON_DISK_SNAPSHOT_MAGIC: [u8; 16] = *b"RAVEN_RAILGUN_01";
 
 #[test]
 fn snapshot_magic_matches_the_bytes_already_on_disk() {
     assert_eq!(
         SNAPSHOT_MAGIC, ON_DISK_SNAPSHOT_MAGIC,
-        "changing SNAPSHOT_MAGIC orphans every existing snapshot; it is an operator \
-         migration, not a rename"
+        "changing SNAPSHOT_MAGIC refuses every existing snapshot; the body epoch inside it \
+         is what versions the layout"
     );
 }
 
@@ -46,16 +47,96 @@ fn a_snapshot_written_under_the_literal_magic_loads_under_the_constant() {
 /// bincode tags an enum with its declaration index as a u32 LE prefix, so reordering the
 /// variants - or reordering, widening or narrowing a field - re-points every frame an
 /// older build wrote at a different variant, and `replay` reports success on the wrong one.
+/// The two transport-only fields of a list leaf are left at their defaults here; the test
+/// below pins that they are not written.
 fn wal_payload_vectors() -> Vec<(WalEntryPayload, Vec<u8>)> {
     let mut append_leaf = vec![0x00, 0x00, 0x00, 0x00];
     append_leaf.extend_from_slice(&0x0102_0304u32.to_le_bytes());
     append_leaf.extend_from_slice(&0x1112_1314u32.to_le_bytes());
     append_leaf.extend_from_slice(&[0xAA; 32]);
 
-    let mut ppoi_status = vec![0x01, 0x00, 0x00, 0x00];
-    ppoi_status.extend_from_slice(&[0xBB; 32]);
-    ppoi_status.extend_from_slice(&[0xCC; 32]);
-    ppoi_status.push(0x03);
+    let mut list_leaf_added = vec![0x01, 0x00, 0x00, 0x00];
+    list_leaf_added.extend_from_slice(&[0xDD; 32]);
+    list_leaf_added.extend_from_slice(&0x2122_2324u32.to_le_bytes());
+    list_leaf_added.extend_from_slice(&[0xEE; 32]);
+    list_leaf_added.extend_from_slice(&0u32.to_le_bytes());
+    list_leaf_added.extend_from_slice(&[0xAC; 32]);
+
+    let mut heartbeat = vec![0x02, 0x00, 0x00, 0x00];
+    heartbeat.extend_from_slice(&0x4142_4344_4546_4748u64.to_le_bytes());
+
+    let mut reorg = vec![0x03, 0x00, 0x00, 0x00];
+    reorg.extend_from_slice(&0x3132_3334_3536_3738u64.to_le_bytes());
+
+    vec![
+        (
+            WalEntryPayload::AppendLeaf {
+                tree_number: 0x0102_0304,
+                leaf_index: 0x1112_1314,
+                commitment: [0xAA; 32],
+            },
+            append_leaf,
+        ),
+        (list_leaf(0, Vec::new()), list_leaf_added),
+        (
+            WalEntryPayload::Heartbeat {
+                wallclock_unix_ms: 0x4142_4344_4546_4748,
+            },
+            heartbeat,
+        ),
+        (
+            WalEntryPayload::Reorg {
+                height: 0x3132_3334_3536_3738,
+            },
+            reorg,
+        ),
+    ]
+}
+
+fn list_leaf(status: u8, signature: Vec<u8>) -> WalEntryPayload {
+    WalEntryPayload::PpoiListLeafAdded {
+        list_key: [0xDD; 32],
+        list_index: 0x2122_2324,
+        blinded_commitment: [0xEE; 32],
+        status,
+        event_type: PpoiEventType::Shield,
+        signature,
+        validated_merkleroot: [0xAC; 32],
+    }
+}
+
+/// Storage keeps no signature and no status byte: the mirror's values for both are dropped at
+/// the WAL write, and a replayed entry carries the defaults.
+#[test]
+fn a_list_leaf_stores_neither_its_signature_nor_its_status() {
+    let handed_over = list_leaf(3, vec![0xAB; 64]);
+    let (stored, bytes) = wal_payload_vectors()
+        .into_iter()
+        .nth(1)
+        .expect("the list-leaf vector");
+    assert_eq!(
+        bincode::serialize(&handed_over).expect("serialize"),
+        bytes,
+        "the WAL frame of a list leaf must not carry its signature or status"
+    );
+    let replayed: WalEntryPayload =
+        raven_railgun_persistence::decode_no_trailing(&bytes).expect("decode");
+    assert_eq!(replayed, stored);
+}
+
+/// Every WAL frame shape the previous layout wrote, by hand. That layout had a status variant
+/// at tag 1, a list leaf at tag 2 carrying a status byte and a length-prefixed signature, a
+/// reorg at tag 3 and a heartbeat at tag 4.
+fn previous_layout_frames() -> Vec<(&'static str, Vec<u8>)> {
+    let mut append_leaf = vec![0x00, 0x00, 0x00, 0x00];
+    append_leaf.extend_from_slice(&0x0102_0304u32.to_le_bytes());
+    append_leaf.extend_from_slice(&0x1112_1314u32.to_le_bytes());
+    append_leaf.extend_from_slice(&[0xAA; 32]);
+
+    let mut status = vec![0x01, 0x00, 0x00, 0x00];
+    status.extend_from_slice(&[0xBB; 32]);
+    status.extend_from_slice(&[0xCC; 32]);
+    status.push(0x03);
 
     let mut list_leaf_added = vec![0x02, 0x00, 0x00, 0x00];
     list_leaf_added.extend_from_slice(&[0xDD; 32]);
@@ -74,47 +155,32 @@ fn wal_payload_vectors() -> Vec<(WalEntryPayload, Vec<u8>)> {
     heartbeat.extend_from_slice(&0x4142_4344_4546_4748u64.to_le_bytes());
 
     vec![
-        (
-            WalEntryPayload::AppendLeaf {
-                tree_number: 0x0102_0304,
-                leaf_index: 0x1112_1314,
-                commitment: [0xAA; 32],
-            },
-            append_leaf,
-        ),
-        (
-            WalEntryPayload::PpoiStatus {
-                list_key: [0xBB; 32],
-                blinded_commitment: [0xCC; 32],
-                status: 3,
-            },
-            ppoi_status,
-        ),
-        (
-            WalEntryPayload::PpoiListLeafAdded {
-                list_key: [0xDD; 32],
-                list_index: 0x2122_2324,
-                blinded_commitment: [0xEE; 32],
-                status: 2,
-                event_type: PpoiEventType::Shield,
-                signature: vec![0xAB; 64],
-                validated_merkleroot: [0xAC; 32],
-            },
-            list_leaf_added,
-        ),
-        (
-            WalEntryPayload::Reorg {
-                height: 0x3132_3334_3536_3738,
-            },
-            reorg,
-        ),
-        (
-            WalEntryPayload::Heartbeat {
-                wallclock_unix_ms: 0x4142_4344_4546_4748,
-            },
-            heartbeat,
-        ),
+        ("append", append_leaf),
+        ("status", status),
+        ("list leaf", list_leaf_added),
+        ("reorg", reorg),
+        ("heartbeat", heartbeat),
     ]
+}
+
+/// A frame the previous layout wrote either decodes to the entry that wrote it or is refused.
+/// Declared in the natural order, the heartbeat would take the old reorg's tag and a replayed
+/// reorg would become a no-op.
+#[test]
+fn no_previous_layout_frame_decodes_as_a_different_entry() {
+    for (name, bytes) in previous_layout_frames() {
+        let decoded = raven_railgun_persistence::decode_no_trailing::<WalEntryPayload>(&bytes);
+        match (name, decoded) {
+            ("append", Ok(WalEntryPayload::AppendLeaf { leaf_index, .. })) => {
+                assert_eq!(leaf_index, 0x1112_1314);
+            }
+            ("reorg", Ok(WalEntryPayload::Reorg { height })) => {
+                assert_eq!(height, 0x3132_3334_3536_3738);
+            }
+            (_, Err(_)) if name != "append" && name != "reorg" => {}
+            (name, other) => panic!("previous-layout {name} frame decoded as {other:?}"),
+        }
+    }
 }
 
 #[test]

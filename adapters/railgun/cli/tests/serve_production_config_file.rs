@@ -203,7 +203,7 @@ fn declared_domains(opts: &MultiServeOptions) -> (Vec<u32>, [u8; 32]) {
         .iter()
         .filter_map(|inst| match inst.data_source {
             DataSourceFilter::ChainTreeNumber(tree) => Some(tree),
-            _ => None,
+            DataSourceFilter::PpoiListBlock { .. } => None,
         })
         .collect();
     trees.sort_unstable();
@@ -373,18 +373,6 @@ async fn shim_routes_answer_only_from_the_stores_the_example_config_declares() {
 #[test]
 fn default_k_for_per_node_is_sixteen() {
     assert_eq!(default_k_for(EncoderKind::PerNode { tree_number: 0 }), 16);
-    assert_eq!(
-        default_k_for(EncoderKind::PerListPath {
-            list_key: [0u8; 32]
-        }),
-        16
-    );
-    assert_eq!(
-        default_k_for(EncoderKind::PerListNode {
-            list_key: [0u8; 32]
-        }),
-        16
-    );
     assert_eq!(
         default_k_for(EncoderKind::PerLeafPath { tree_number: 0 }),
         8

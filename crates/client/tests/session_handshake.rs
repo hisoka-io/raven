@@ -5,8 +5,8 @@
 
 use raven_client::{
     build_client_session, build_instance_params_blob, build_padded_batch, build_seeded_query,
-    client_packing_keys_versioned, install_server_session_handle, retarget_seeded_query_shard,
-    WasmPaddedBatchOutput, WasmSeededQueryOutput,
+    client_packing_keys_versioned, install_server_session_handle, WasmPaddedBatchOutput,
+    WasmSeededQueryOutput,
 };
 use raven_inspire::inspiring::ClientPackingKeys;
 use raven_inspire::math::GaussianSampler;
@@ -71,33 +71,6 @@ fn wasm_exports_upload_versioned_keys_then_install_the_returned_handle() {
     assert!(
         query.inspiring_packing_keys.is_none(),
         "registered queries must never inline the uploaded packing keys"
-    );
-}
-
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-fn wasm_retargets_only_the_clear_seeded_query_shard() {
-    let (mut session, shard_config) = session_fixture();
-    install_server_session_handle(&mut session, 91).expect("install handle");
-    let shard_bincode = bincode::serialize(&shard_config).expect("serialize shard config");
-    let query_bundle = build_seeded_query(&session, &shard_bincode, 7).expect("seeded query");
-    let output: WasmSeededQueryOutput = bincode::deserialize(&query_bundle).expect("query output");
-    let original: SeededClientQuery =
-        bincode::deserialize(&output.query_bytes).expect("original query");
-
-    let retargeted_bytes =
-        retarget_seeded_query_shard(&output.query_bytes, 23).expect("retarget query");
-    let retargeted: SeededClientQuery =
-        bincode::deserialize(&retargeted_bytes).expect("retargeted query");
-    assert_eq!(original.shard_id, 0);
-    assert_eq!(retargeted.shard_id, 23);
-
-    let mut expected = original;
-    expected.shard_id = 23;
-    assert_eq!(
-        bincode::serialize(&retargeted).expect("serialize retargeted"),
-        bincode::serialize(&expected).expect("serialize expected"),
-        "the typed retarget must not alter encrypted query material or the session handle"
     );
 }
 

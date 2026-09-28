@@ -13,9 +13,6 @@ use raven_railgun_persistence::WalEntryPayload;
 
 /// One `per-list-path10` block instance owns a full depth-16 tree.
 const LEAVES_PER_BLOCK: u32 = 65_536;
-/// Live OFAC/Ethereum population, measured 2026-09-20. A status carries no `list_index`, so the
-/// router hands every block instance the whole list's statuses.
-const WHOLE_LIST_POPULATION: u32 = 358_344;
 const ENTRIES_PER_SHARD: u32 = 2_048;
 const LIST_KEY: [u8; 32] = [0xab; 32];
 
@@ -50,7 +47,7 @@ fn build_block(encoder: &dyn PirTableEncoder) -> LogicalLeafStore {
                 blinded_commitment: bc_for(index),
                 status: 0,
                 event_type: raven_railgun_persistence::PpoiEventType::Shield,
-                signature: vec![0; 64],
+                signature: Vec::new(),
                 validated_merkleroot: [0; 32],
             },
             0,
@@ -66,8 +63,6 @@ fn build_block(encoder: &dyn PirTableEncoder) -> LogicalLeafStore {
 fn one_retained_clone_costs_this_many_bytes_at_the_served_shape() {
     let encoder =
         PerListPath10Encoder::new(ENTRIES_PER_SHARD, LIST_KEY).expect("per-list-path10 encoder");
-    let encoder_ref: Box<dyn PirTableEncoder> =
-        Box::new(PerListPath10Encoder::new(ENTRIES_PER_SHARD, LIST_KEY).expect("second encoder"));
 
     let before_build = rss_bytes();
     let store = build_block(&encoder);
@@ -81,49 +76,6 @@ fn one_retained_clone_costs_this_many_bytes_at_the_served_shape() {
 
     let build_delta = after_build.saturating_sub(before_build);
     let clone_delta = after_clone.saturating_sub(before_clone);
-
-    // The deployed shape feeds this block the whole list's statuses. The `PpoiStatus` arm of
-    // `LogicalLeafStore::apply` files one only for a commitment the block indexes, so the
-    // delta below measures what the other blocks' statuses still cost it. Measured, not
-    // modelled.
-    let mut deployed = store.clone();
-    let before_status = rss_bytes();
-    for index in 0..WHOLE_LIST_POPULATION {
-        apply_wal_entry(
-            &mut deployed,
-            &WalEntryPayload::PpoiStatus {
-                list_key: LIST_KEY,
-                blinded_commitment: bc_for(index),
-                status: 0,
-            },
-            0,
-            &*encoder_ref,
-        )
-        .expect("status");
-    }
-    let after_status = rss_bytes();
-    let status_delta = after_status.saturating_sub(before_status);
-    assert_eq!(
-        deployed.ppoi_count(),
-        LEAVES_PER_BLOCK as usize,
-        "a block files the statuses of its own rows and no others"
-    );
-
-    let before_deployed_clone = rss_bytes();
-    let deployed_retained = deployed.clone();
-    let after_deployed_clone = rss_bytes();
-    let deployed_clone_delta = after_deployed_clone.saturating_sub(before_deployed_clone);
-
-    eprintln!(
-        "{{\"whole_list_status_delta_bytes\":{},\"deployed_clone_delta_bytes\":{},\"deployed_clone_delta_mib\":{}}}",
-        status_delta,
-        deployed_clone_delta,
-        deployed_clone_delta / (1024 * 1024),
-    );
-    assert!(
-        deployed_retained.ppoi_imt_root(&LIST_KEY).is_some(),
-        "deployed-shape clone must still hold the tree"
-    );
 
     eprintln!(
         "{{\"leaves\":{},\"entries_per_shard\":{},\"build_delta_bytes\":{},\"clone_delta_bytes\":{},\"clone_delta_kib\":{}}}",

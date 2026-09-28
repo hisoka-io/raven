@@ -222,7 +222,7 @@ pub struct ShimStoreRegistry {
 pub const SEGMENT_READS_AT_ONCE: usize = 4;
 
 /// What the index channel keeps between requests: the read permits, and each sealed block's
-/// body, so a repeat for a sealed block copies and hashes no rows.
+/// body, so a repeat for a sealed block reads, copies and hashes no rows.
 #[derive(Debug)]
 pub(crate) struct Publishing {
     segment_reads: Arc<tokio::sync::Semaphore>,
@@ -242,11 +242,12 @@ impl Default for Publishing {
     }
 }
 
-/// A sealed block's whole prefix body and the root it was read at. While the root matches and
-/// the index holds no hole these are the block's bytes; one entry per declared block.
+/// A sealed block's whole prefix body and the rows stamp it was read at. While the store's stamp
+/// is unchanged no row was added or removed, so these are still the block's bytes; one entry per
+/// declared block.
 #[derive(Debug, Clone)]
 struct SealedBlock {
-    root: [u8; 32],
+    rows_stamp: u64,
     prefixes: Bytes,
     etag: String,
 }
@@ -255,6 +256,7 @@ struct SealedBlock {
 #[derive(Debug, Default)]
 struct Probes {
     blocks_walked: std::sync::atomic::AtomicUsize,
+    rows_read: std::sync::atomic::AtomicUsize,
     segment_reads_now: std::sync::atomic::AtomicUsize,
     segment_reads_peak: std::sync::atomic::AtomicUsize,
 }
@@ -313,9 +315,6 @@ impl ShimStoreRegistry {
                         .or_default()
                         .push(store);
                 }
-                // One IMT of a list that outgrew one IMT: it can prove no index past the first
-                // block, so the shim never answers from it.
-                DataSourceFilter::PpoiList(_) => {}
                 DataSourceFilter::PpoiListBlock { list_key, block } => {
                     registry
                         .ppoi_blocks
@@ -339,6 +338,15 @@ impl ShimStoreRegistry {
         self.publishing
             .probes
             .blocks_walked
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Index rows read through this registry's coverages, a count included.
+    #[cfg(test)]
+    pub(crate) fn rows_read(&self) -> usize {
+        self.publishing
+            .probes
+            .rows_read
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -535,11 +543,7 @@ impl ListCoverage<'_> {
     /// Rows held for this list, from the IMT leaf count rather than a scan: appends are
     /// contiguous from zero by `checked_imt_append`, so the count IS the frontier.
     fn held_rows(&self, store: &SharedLogicalStore) -> u32 {
-        let guard = store.lock();
-        let leaves = guard
-            .ppoi_imt(&self.list_key)
-            .map_or(0, raven_railgun_engine::imt::Imt::leaf_count);
-        u32::try_from(leaves).unwrap_or(u32::MAX)
+        self.block_rows(&store.lock())
     }
 
     /// Height the composed answer is complete as of: the lowest any contributor has reached.
@@ -551,33 +555,45 @@ impl ListCoverage<'_> {
             .unwrap_or(0)
     }
 
-    /// Row count and tree root of one block, read under the caller's lock.
-    fn block_state(&self, store: &LogicalLeafStore) -> (u32, [u8; 32]) {
-        store.ppoi_imt(&self.list_key).map_or((0, [0; 32]), |imt| {
-            (
-                u32::try_from(imt.leaf_count()).unwrap_or(u32::MAX),
-                imt.root(),
-            )
+    /// Row count of one block, read under the caller's lock.
+    fn block_rows(&self, store: &LogicalLeafStore) -> u32 {
+        store
+            .ppoi_imt(&self.list_key)
+            .map_or(0, |imt| u32::try_from(imt.leaf_count()).unwrap_or(u32::MAX))
+    }
+
+    /// One block's index in local-index order. Every read of the index goes through here, so the
+    /// test probe counts each row a request reads, a bare count included.
+    fn index_rows<'g>(
+        &'g self,
+        guard: &'g LogicalLeafStore,
+    ) -> impl Iterator<Item = (u32, &'g [u8; 32])> + 'g {
+        guard.ppoi_list_leaves_iter(&self.list_key).inspect(|_| {
+            #[cfg(test)]
+            self.publishing
+                .probes
+                .rows_read
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         })
     }
 
     /// Hand each of one block's rows to `visit` in local-index order under the caller's lock,
-    /// and return the block's row count and root. A block whose rows do not sit at the indices
-    /// its tree counts gives no gap-free prefix, so it is refused.
+    /// and return the block's row count. A block whose rows do not sit at the indices its tree
+    /// counts gives no gap-free prefix, so it is refused.
     fn walk_block(
         &self,
         guard: &LogicalLeafStore,
         block: u32,
         visit: &mut dyn FnMut(&[u8; 32]),
-    ) -> Result<(u32, [u8; 32]), CoverageRefusal> {
+    ) -> Result<u32, CoverageRefusal> {
         #[cfg(test)]
         self.publishing
             .probes
             .blocks_walked
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let (count, root) = self.block_state(guard);
+        let count = self.block_rows(guard);
         let mut read = 0u32;
-        for (local, bc) in guard.ppoi_list_leaves_iter(&self.list_key) {
+        for (local, bc) in self.index_rows(guard) {
             if local != read {
                 return Err(self.torn(block));
             }
@@ -587,37 +603,31 @@ impl ListCoverage<'_> {
         if read != count {
             return Err(self.torn(block));
         }
-        Ok((count, root))
+        Ok(count)
     }
 
     /// Every row's prefix in one block, its row count, and the body's ETag when the block is
-    /// sealed. A sealed block whose root matches the one its body was read at is answered from
-    /// that body without copying a row. The root does not move when a reorg drops a middle row,
-    /// so the index is counted too: every row sits below the tree's count, so a full count
-    /// means no hole.
+    /// sealed. A sealed block whose rows stamp is the one its body was read at is answered from
+    /// that body without reading a row. The root alone would not do: it does not move when a
+    /// reorg drops a middle row, and the stamp does.
     fn block_prefixes(
         &self,
         store: &SharedLogicalStore,
         block: u32,
     ) -> Result<(u32, Bytes, Option<String>), CoverageRefusal> {
         let guard = store.lock();
-        let (count, root) = self.block_state(&guard);
+        let rows_stamp = guard.list_rows_stamp();
+        let count = self.block_rows(&guard);
         if count >= LEAVES_PER_PPOI_BLOCK {
             let kept = self
                 .publishing
                 .sealed
                 .lock()
                 .get(&(self.list_key, block))
+                .filter(|kept| kept.rows_stamp == rows_stamp)
                 .cloned();
-            if let Some(kept) = kept.filter(|kept| kept.root == root) {
-                let indexed = guard.ppoi_list_leaves_iter(&self.list_key).count();
-                if indexed == usize::try_from(count).unwrap_or(usize::MAX) {
-                    return Ok((count, kept.prefixes, Some(kept.etag)));
-                }
-                self.publishing
-                    .sealed
-                    .lock()
-                    .remove(&(self.list_key, block));
+            if let Some(kept) = kept {
+                return Ok((count, kept.prefixes, Some(kept.etag)));
             }
         }
         let mut body = Vec::with_capacity(
@@ -625,10 +635,20 @@ impl ListCoverage<'_> {
                 .unwrap_or(0)
                 .saturating_mul(BC_INDEX_PREFIX_BYTES),
         );
-        let (read, root) = self.walk_block(&guard, block, &mut |bc| {
+        let walked = self.walk_block(&guard, block, &mut |bc| {
             body.extend(bc.iter().copied().take(BC_INDEX_PREFIX_BYTES));
-        })?;
+        });
         drop(guard);
+        let read = match walked {
+            Ok(walked) => walked,
+            Err(refusal) => {
+                self.publishing
+                    .sealed
+                    .lock()
+                    .remove(&(self.list_key, block));
+                return Err(refusal);
+            }
+        };
         let prefixes = Bytes::from(body);
         if read < LEAVES_PER_PPOI_BLOCK {
             return Ok((read, prefixes, None));
@@ -637,7 +657,7 @@ impl ListCoverage<'_> {
         self.publishing.sealed.lock().insert(
             (self.list_key, block),
             SealedBlock {
-                root,
+                rows_stamp,
                 prefixes: prefixes.clone(),
                 etag: etag.clone(),
             },
@@ -951,35 +971,6 @@ mod tests {
 
     /// A whole-list store holds one IMT of a list that outgrew one, so it proves no index past
     /// the first block: it neither covers a list alone nor rescues a failed block proof.
-    #[test]
-    fn a_whole_list_declaration_covers_nothing() {
-        let alone = ShimStoreRegistry::from_declarations([(
-            DataSourceFilter::PpoiList(LIST_KEY),
-            block_store(0..4, 0),
-        )]);
-        assert!(alone.is_empty());
-        assert_eq!(
-            alone
-                .prove_list_coverage(&LIST_KEY, Some(counted(4, 0)))
-                .err(),
-            Some(CoverageRefusal::NoListStore { list_key: LIST_KEY })
-        );
-        let beside_a_gap = ShimStoreRegistry::from_declarations([
-            (block_filter(2), block_store(0..4, 0)),
-            (DataSourceFilter::PpoiList(LIST_KEY), block_store(0..4, 100)),
-        ]);
-        assert_eq!(
-            beside_a_gap
-                .prove_list_coverage(&LIST_KEY, Some(counted(u64::MAX, 0)))
-                .err(),
-            Some(CoverageRefusal::BlockGap {
-                list_key: LIST_KEY,
-                expected_block: 0,
-                found_block: 2,
-            })
-        );
-    }
-
     #[test]
     fn an_undeclared_list_is_refused() {
         let registry =

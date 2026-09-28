@@ -1,8 +1,15 @@
 //! The same batch at K=1, K=4, K=16 must produce byte-identical response vectors,
 //! catching index-shuffling in the JoinSet drain loop. The order is parameter-independent, so a
-//! ring-256 cell stands in for the production one.
+//! ring-256 cell stands in for the production one. A second test makes the responds finish out
+//! of order, which the real scheme's near-equal respond times seldom do.
 
-#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation
+)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,8 +22,9 @@ use raven_railgun_engine::inspire::{
     build_client_session, build_seeded_query, register_client_session, setup_state,
     RavenInspireScheme,
 };
-use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
-use raven_railgun_http::{inspire_router, AppState, HttpConfig};
+use raven_railgun_engine::{Engine, InstanceRole, PirInstance, PirScheme};
+use raven_railgun_http::{inspire_router, router, AppState, HttpConfig};
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 const BEARER_TOKEN: &str = "batch-byte-identity-test-token";
@@ -93,7 +101,10 @@ fn build_app_state_with_k(
 async fn spawn_server(
     app_state: AppState<RavenInspireScheme>,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let router = inspire_router(app_state).expect("router");
+    serve(inspire_router(app_state).expect("router")).await
+}
+
+async fn serve(router: axum::Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind loopback");
@@ -232,5 +243,107 @@ async fn batch_dispatcher_byte_identity_across_k_values() {
             "K={k}: response body bytes differ from K={reference_k}; \
              dispatcher is NOT byte-identical across concurrency levels"
         );
+    }
+}
+
+/// Each respond sleeps longer the earlier its slot sits in a window of `K`, so within every window
+/// the later slots finish first.
+#[derive(Debug)]
+struct ReversedScheme;
+
+#[derive(Debug, Default)]
+struct ReversedState {
+    finished: parking_lot::Mutex<Vec<u32>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ReversedQuery {
+    tag: u32,
+    delay_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct ReversedResponse {
+    tag: u32,
+}
+
+impl PirScheme for ReversedScheme {
+    type ServerState = ReversedState;
+    type Query = ReversedQuery;
+    type Response = ReversedResponse;
+
+    fn respond(
+        state: &Self::ServerState,
+        query: &Self::Query,
+    ) -> raven_railgun_core::Result<Self::Response> {
+        std::thread::sleep(Duration::from_millis(query.delay_ms));
+        state.finished.lock().push(query.tag);
+        Ok(ReversedResponse { tag: query.tag })
+    }
+
+    fn state_shape(_state: &Self::ServerState) -> raven_railgun_engine::StateShape {
+        raven_railgun_engine::StateShape {
+            entry_size_bytes: 1,
+            rows_per_shard: u64::MAX,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn responds_that_finish_out_of_order_are_answered_in_request_order() {
+    const STEP_MS: u64 = 40;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("reqwest client");
+    for &k in &K_VALUES[1..] {
+        let instance = Arc::new(PirInstance::new(
+            InstanceId::new(TOY_INSTANCE_ID),
+            InstanceRole::Static,
+            ReversedState::default(),
+        ));
+        let mut engine: Engine<ReversedScheme> = Engine::new();
+        engine
+            .register_instance(Arc::clone(&instance))
+            .expect("register instance");
+        let mut http_config = HttpConfig::demo(BEARER_TOKEN.to_owned());
+        http_config.max_concurrent_queries = k;
+        let app_state = AppState::new(engine, http_config).expect("AppState::new");
+        let (addr, server_handle) =
+            serve(router::<ReversedScheme>(app_state).expect("router")).await;
+
+        let window = u64::try_from(k).expect("k fits u64");
+        let queries: Vec<ReversedQuery> = (0..BATCH_SIZE as u32)
+            .map(|tag| ReversedQuery {
+                tag,
+                delay_ms: (window - u64::from(tag) % window) * STEP_MS,
+            })
+            .collect();
+        let resp = client
+            .post(format!("http://{addr}/v1/instance/{TOY_INSTANCE_ID}/batch"))
+            .bearer_auth(BEARER_TOKEN)
+            .header("x-raven-client-id", CLIENT_ID)
+            .body(raven_railgun_http::write_versioned(&queries).expect("serialize batch"))
+            .send()
+            .await
+            .expect("POST batch");
+        assert_eq!(resp.status(), 200, "K={k}");
+        let body = resp.bytes().await.expect("body bytes");
+        let answered: Vec<ReversedResponse> =
+            raven_railgun_http::read_batch_response_versioned(&body).expect("decode batch");
+
+        let finished = instance.current_state().finished.lock().clone();
+        assert!(
+            finished.windows(2).any(|pair| pair[0] > pair[1]),
+            "K={k}: the responds finished in request order {finished:?}, so this proves nothing"
+        );
+        assert_eq!(
+            answered.iter().map(|r| r.tag).collect::<Vec<_>>(),
+            (0..BATCH_SIZE as u32).collect::<Vec<_>>(),
+            "K={k}: slot i must carry query i's response whatever order they finished in"
+        );
+
+        server_handle.abort();
+        let _ = server_handle.await;
     }
 }

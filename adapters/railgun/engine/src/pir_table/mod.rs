@@ -13,10 +13,7 @@ pub mod leaf;
 pub mod list;
 
 pub use leaf::{PerLeafCommitmentEncoder, PerLeafEncoder, PerLeafPathEncoder, PerNodeEncoder};
-pub use list::{
-    PerListNodeEncoder, PerListPath10Encoder, PerListPathEncoder, PerListStatusEncoder,
-    PATH10_RECORD_BYTES,
-};
+pub use list::{PerListPath10Encoder, PATH10_RECORD_BYTES};
 
 /// Stable encoder labels, surfaced on `/v1/status` and matched against the
 /// manifest's `encoder_label`.
@@ -27,14 +24,8 @@ pub mod labels {
     pub const PER_LEAF_PATH: &str = "per-leaf-path";
     /// Per-node encoder.
     pub const PER_NODE: &str = "per-node";
-    /// T1 PPOI status encoder.
-    pub const PER_LIST_STATUS: &str = "per-list-status";
-    /// T2 PPOI auth-path encoder.
-    pub const PER_LIST_PATH: &str = "per-list-path";
     /// PPOI v2 block-local path encoder.
     pub const PER_LIST_PATH10: &str = "per-list-path10";
-    /// Per-list Merkle-node encoder; `per-node` keyed on `list_key`.
-    pub const PER_LIST_NODE: &str = "per-list-node";
 }
 
 /// Operator-facing encoder discriminator with its construction config.
@@ -61,27 +52,9 @@ pub enum EncoderKind {
         /// Tree this encoder is pinned to.
         tree_number: u32,
     },
-    /// T1 PPOI status encoder; row at idx = `(status_byte || blinded_commitment)`
-    /// for the per-list leaf at that idx, padded to record_size.
-    PerListStatus {
-        /// 32-byte list_key this encoder is pinned to.
-        list_key: [u8; 32],
-    },
-    /// T2 PPOI auth-path encoder; row at idx = 16 sibling hashes from
-    /// the per-list IMT proof for leaf idx (PATH_RECORD_BYTES = 512).
-    PerListPath {
-        /// 32-byte list_key this encoder is pinned to.
-        list_key: [u8; 32],
-    },
     /// PPOI v2 block-local row with lower path levels.
     PerListPath10 {
         /// 32-byte list key this encoder is pinned to.
-        list_key: [u8; 32],
-    },
-    /// Per-list Merkle-node encoder: [`PerNode`]'s layout over the per-list
-    /// IMT, pinned to one `list_key`.
-    PerListNode {
-        /// 32-byte list_key this encoder is pinned to.
         list_key: [u8; 32],
     },
 }
@@ -95,7 +68,7 @@ impl Default for EncoderKind {
 }
 
 impl EncoderKind {
-    /// Chain tree this encoder is scoped to, or `None` for the per-list variants.
+    /// Chain tree this encoder is scoped to, or `None` for the per-list variant.
     ///
     /// Every chain-tree encoder now carries its tree, so an ingest path can filter on it
     /// without a separate config field. That matters because the row layouts differ in how
@@ -108,10 +81,7 @@ impl EncoderKind {
             Self::PerLeafBc { tree_number }
             | Self::PerLeafPath { tree_number }
             | Self::PerNode { tree_number } => Some(*tree_number),
-            Self::PerListStatus { .. }
-            | Self::PerListPath { .. }
-            | Self::PerListPath10 { .. }
-            | Self::PerListNode { .. } => None,
+            Self::PerListPath10 { .. } => None,
         }
     }
 
@@ -122,10 +92,7 @@ impl EncoderKind {
             Self::PerLeafBc { .. } => labels::PER_LEAF_BC,
             Self::PerLeafPath { .. } => labels::PER_LEAF_PATH,
             Self::PerNode { .. } => labels::PER_NODE,
-            Self::PerListStatus { .. } => labels::PER_LIST_STATUS,
-            Self::PerListPath { .. } => labels::PER_LIST_PATH,
             Self::PerListPath10 { .. } => labels::PER_LIST_PATH10,
-            Self::PerListNode { .. } => labels::PER_LIST_NODE,
         }
     }
 
@@ -135,12 +102,10 @@ impl EncoderKind {
     #[must_use]
     pub const fn min_total_entries(&self) -> u32 {
         match self {
-            Self::PerNode { .. } | Self::PerListNode { .. } => PER_NODE_TOTAL_NODES,
-            Self::PerLeafBc { .. }
-            | Self::PerLeafPath { .. }
-            | Self::PerListStatus { .. }
-            | Self::PerListPath { .. }
-            | Self::PerListPath10 { .. } => LEAVES_PER_TREE,
+            Self::PerNode { .. } => PER_NODE_TOTAL_NODES,
+            Self::PerLeafBc { .. } | Self::PerLeafPath { .. } | Self::PerListPath10 { .. } => {
+                LEAVES_PER_TREE
+            }
         }
     }
 
@@ -149,12 +114,10 @@ impl EncoderKind {
     #[must_use]
     pub const fn default_total_entries(&self) -> usize {
         match self {
-            Self::PerNode { .. } | Self::PerListNode { .. } => 131_072,
-            Self::PerLeafBc { .. }
-            | Self::PerLeafPath { .. }
-            | Self::PerListStatus { .. }
-            | Self::PerListPath { .. }
-            | Self::PerListPath10 { .. } => LEAVES_PER_TREE as usize,
+            Self::PerNode { .. } => 131_072,
+            Self::PerLeafBc { .. } | Self::PerLeafPath { .. } | Self::PerListPath10 { .. } => {
+                LEAVES_PER_TREE as usize
+            }
         }
     }
 
@@ -162,12 +125,9 @@ impl EncoderKind {
     #[must_use]
     pub const fn default_concurrency(&self) -> usize {
         match self {
-            Self::PerNode { .. }
-            | Self::PerListNode { .. }
-            | Self::PerListPath { .. }
-            | Self::PerListPath10 { .. } => 16,
+            Self::PerNode { .. } | Self::PerListPath10 { .. } => 16,
             Self::PerLeafPath { .. } => 8,
-            Self::PerLeafBc { .. } | Self::PerListStatus { .. } => 4,
+            Self::PerLeafBc { .. } => 4,
         }
     }
 
@@ -175,10 +135,10 @@ impl EncoderKind {
     #[must_use]
     pub const fn fixed_record_size(&self) -> Option<usize> {
         match self {
-            Self::PerLeafPath { .. } | Self::PerListPath { .. } => Some(PATH_RECORD_BYTES),
+            Self::PerLeafPath { .. } => Some(PATH_RECORD_BYTES),
             Self::PerListPath10 { .. } => Some(PATH10_RECORD_BYTES),
-            Self::PerNode { .. } | Self::PerListNode { .. } => Some(NODE_HASH_BYTES),
-            Self::PerLeafBc { .. } | Self::PerListStatus { .. } => None,
+            Self::PerNode { .. } => Some(NODE_HASH_BYTES),
+            Self::PerLeafBc { .. } => None,
         }
     }
 
@@ -214,20 +174,8 @@ impl EncoderKind {
                 let enc = PerNodeEncoder::new(entries_per_shard, *tree_number)?;
                 Ok(Arc::new(enc))
             }
-            Self::PerListStatus { list_key } => {
-                let enc = PerListStatusEncoder::new(record_size, entries_per_shard, *list_key)?;
-                Ok(Arc::new(enc))
-            }
-            Self::PerListPath { list_key } => {
-                let enc = PerListPathEncoder::new(PATH_RECORD_BYTES, entries_per_shard, *list_key)?;
-                Ok(Arc::new(enc))
-            }
             Self::PerListPath10 { list_key } => {
                 let enc = PerListPath10Encoder::new(entries_per_shard, *list_key)?;
-                Ok(Arc::new(enc))
-            }
-            Self::PerListNode { list_key } => {
-                let enc = PerListNodeEncoder::new(entries_per_shard, *list_key)?;
                 Ok(Arc::new(enc))
             }
         }
@@ -238,13 +186,13 @@ impl EncoderKind {
 pub const MIN_RECORD_SIZE: usize = 32;
 /// 32-byte BN254 Poseidon node / leaf / blinded-commitment hash size.
 pub const NODE_HASH_BYTES: usize = 32;
-/// Path record size for `PerLeafPath` / `PerListPath`: [`TREE_DEPTH`] siblings
+/// Path record size for `PerLeafPath`: [`TREE_DEPTH`] siblings
 /// x [`NODE_HASH_BYTES`].
 pub const PATH_RECORD_BYTES: usize = TREE_DEPTH * NODE_HASH_BYTES;
 /// 2^16 = 65,536 leaves per Railgun commitment tree.
 pub const LEAVES_PER_TREE: u32 = 1u32 << TREE_DEPTH;
 /// 2^17 - 1 = 131,071 total IMT nodes in the flat-global-index PIR table
-/// layout used by `PerNodeEncoder` and `PerListNodeEncoder`.
+/// layout used by `PerNodeEncoder`.
 pub const PER_NODE_TOTAL_NODES: u32 = (1u32 << (TREE_DEPTH + 1)) - 1;
 
 /// By-reference free-function alias for [`EncoderKind::default_total_entries`].
@@ -858,20 +806,6 @@ mod tests {
     }
 
     #[test]
-    fn per_list_node_rejects_zero_entries_per_shard() {
-        assert!(PerListNodeEncoder::new(0, [0u8; 32]).is_err());
-    }
-
-    #[test]
-    fn per_list_node_materialize_shard_zero_for_empty_store() {
-        let enc = PerListNodeEncoder::new(2048, [0u8; 32]).expect("valid");
-        let store = LogicalLeafStore::new();
-        let buf = enc.materialize_shard(0, &store);
-        assert_eq!(buf.len(), 2048 * NODE_HASH_BYTES);
-        assert!(buf.iter().all(|&b| b == 0));
-    }
-
-    #[test]
     fn imt_oracle_round_trip_for_a_few_internal_nodes() {
         let mut imt = Imt::new().expect("imt");
         let l0 = canonical(1);
@@ -884,44 +818,35 @@ mod tests {
     }
 
     #[test]
-    fn default_entries_for_returns_131072_for_per_node_family() {
+    fn default_entries_for_returns_131072_for_per_node() {
         let pn = EncoderKind::PerNode { tree_number: 0 };
-        let pln = EncoderKind::PerListNode { list_key: [0; 32] };
         assert_eq!(default_entries_for(&pn), 131_072);
-        assert_eq!(default_entries_for(&pln), 131_072);
         assert_eq!(pn.default_total_entries(), 131_072);
-        assert_eq!(pln.default_total_entries(), 131_072);
     }
 
     #[test]
     fn default_entries_for_returns_65536_for_leaf_keyed_family() {
         let bc = EncoderKind::PerLeafBc { tree_number: 0 };
-        let st = EncoderKind::PerListStatus { list_key: [0; 32] };
         let lp = EncoderKind::PerLeafPath { tree_number: 0 };
-        let plp = EncoderKind::PerListPath { list_key: [0; 32] };
+        let p10 = EncoderKind::PerListPath10 { list_key: [0; 32] };
         assert_eq!(default_entries_for(&bc), 65_536);
-        assert_eq!(default_entries_for(&st), 65_536);
         assert_eq!(default_entries_for(&lp), 65_536);
-        assert_eq!(default_entries_for(&plp), 65_536);
+        assert_eq!(default_entries_for(&p10), 65_536);
     }
 
     #[test]
-    fn default_concurrency_for_per_node_family_is_16() {
+    fn default_concurrency_for_per_node_and_path10_is_16() {
         let pn = EncoderKind::PerNode { tree_number: 0 };
-        let pln = EncoderKind::PerListNode { list_key: [0; 32] };
-        let plp = EncoderKind::PerListPath { list_key: [0; 32] };
+        let p10 = EncoderKind::PerListPath10 { list_key: [0; 32] };
         assert_eq!(default_concurrency_for(&pn), 16);
-        assert_eq!(default_concurrency_for(&pln), 16);
-        assert_eq!(default_concurrency_for(&plp), 16);
+        assert_eq!(default_concurrency_for(&p10), 16);
     }
 
     #[test]
     fn default_concurrency_for_leaf_keyed_and_path() {
         let bc = EncoderKind::PerLeafBc { tree_number: 0 };
-        let st = EncoderKind::PerListStatus { list_key: [0; 32] };
         let lp = EncoderKind::PerLeafPath { tree_number: 0 };
         assert_eq!(default_concurrency_for(&bc), 4);
-        assert_eq!(default_concurrency_for(&st), 4);
         assert_eq!(default_concurrency_for(&lp), 8);
     }
 
@@ -951,49 +876,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_total_entries_rejects_per_list_node_with_undersized_cell() {
-        let pln = EncoderKind::PerListNode { list_key: [0; 32] };
-        let r = validate_total_entries(&pln, 65_536);
-        assert!(matches!(
-            r,
-            Err(raven_railgun_core::AdapterError::InvalidQuery(_))
-        ));
-        validate_total_entries(&pln, 131_071).expect("PerListNode at floor must validate");
-    }
-
-    #[test]
     fn validate_total_entries_accepts_path_family_at_leaves_per_tree() {
         let bc = EncoderKind::PerLeafBc { tree_number: 0 };
         let lp = EncoderKind::PerLeafPath { tree_number: 0 };
-        let plp = EncoderKind::PerListPath { list_key: [0; 32] };
-        let st = EncoderKind::PerListStatus { list_key: [0; 32] };
+        let p10 = EncoderKind::PerListPath10 { list_key: [0; 32] };
         validate_total_entries(&bc, 65_536).expect("PerLeafBc at LEAVES_PER_TREE");
         validate_total_entries(&lp, 65_536).expect("PerLeafPath at LEAVES_PER_TREE");
-        validate_total_entries(&plp, 65_536).expect("PerListPath at LEAVES_PER_TREE");
-        validate_total_entries(&st, 65_536).expect("PerListStatus at LEAVES_PER_TREE");
-    }
-
-    #[test]
-    fn per_list_node_max_shard_id_overflows_undersized_cell_regression() {
-        // A 65,536-entry cell gives 32 shards, but the node encoder dirties ids
-        // past 31, so the cell must be sized off PER_NODE_TOTAL_NODES.
-        let entries_per_shard: u32 = 2048;
-        let pln_enc = PerListNodeEncoder::new(entries_per_shard, [0; 32]).expect("encoder");
-        let undersized_total: u32 = 65_536;
-        let undersized_shards = undersized_total / entries_per_shard;
-        let mut max_seen = 0u32;
-        for leaf in 0u32..LEAVES_PER_TREE {
-            for s in pln_enc.affected_shards_for_ppoi_leaf(&[0; 32], leaf) {
-                max_seen = max_seen.max(s);
-            }
-            if max_seen >= undersized_shards {
-                break;
-            }
-        }
-        assert!(
-            max_seen >= undersized_shards,
-            "regression guard: PerListNodeEncoder must dirty shard >= {undersized_shards} at some leaf"
-        );
+        validate_total_entries(&p10, 65_536).expect("PerListPath10 at LEAVES_PER_TREE");
     }
 
     #[test]
@@ -1028,13 +917,6 @@ mod tests {
                 assert_eq!(
                     new, old,
                     "PerLeafPath byte-identity mismatch eps={eps} leaf={leaf}: new {new:?} vs old {old:?}"
-                );
-                let pl_list =
-                    PerListPathEncoder::new(PATH_RECORD_BYTES, eps, [0; 32]).expect("encoder");
-                let new_list = pl_list.affected_shards_for_ppoi_leaf(&[0; 32], leaf);
-                assert_eq!(
-                    new_list, old,
-                    "PerListPath byte-identity mismatch eps={eps} leaf={leaf}"
                 );
             }
         }

@@ -117,10 +117,14 @@ async fn ppoi_height_zero_must_not_collapse_the_resume_floor() {
     let leaves_committed = handle.metrics.lock().commits_fired;
 
     for byte in 0u8..4 {
-        let payload = WalEntryPayload::PpoiStatus {
+        let payload = WalEntryPayload::PpoiListLeafAdded {
             list_key: LIST_KEY,
+            list_index: u32::from(byte),
             blinded_commitment: canonical_commitment(0x80 | byte),
-            status: 1,
+            status: 0,
+            event_type: raven_railgun_persistence::PpoiEventType::Shield,
+            signature: Vec::new(),
+            validated_merkleroot: [0; 32],
         };
         handle
             .sender

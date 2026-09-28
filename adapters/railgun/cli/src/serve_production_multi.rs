@@ -296,9 +296,7 @@ enum EncoderString {
     PerLeafBc,
     PerLeafPath,
     PerNode,
-    PerListPath,
     PerListPath10,
-    PerListNode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -512,10 +510,7 @@ pub(crate) async fn preflight_mirror_upstream(
 /// arm a `_` put it in.
 pub(crate) fn pinned_list_key(encoder: EncoderKind) -> Option<[u8; 32]> {
     match encoder {
-        EncoderKind::PerListStatus { list_key }
-        | EncoderKind::PerListPath { list_key }
-        | EncoderKind::PerListPath10 { list_key }
-        | EncoderKind::PerListNode { list_key } => Some(list_key),
+        EncoderKind::PerListPath10 { list_key } => Some(list_key),
         // Pinned to a tree, not a list; `enforce_encoder_matches_data_source` gates those.
         EncoderKind::PerLeafBc { .. }
         | EncoderKind::PerLeafPath { .. }
@@ -874,7 +869,7 @@ pub fn chain_indexer_reason(
                 "instance {} indexes commit tree {tree}",
                 instance.instance_id.as_str()
             )),
-            _ => None,
+            DataSourceFilter::PpoiListBlock { .. } => None,
         });
     tree_reader.or_else(|| {
         auto_spawn
@@ -983,24 +978,10 @@ fn build_encoder_kind(
                 .ok_or_else(|| anyhow::anyhow!("per-node encoder requires `tree_number`"))?;
             Ok(EncoderKind::PerNode { tree_number: t })
         }
-        EncoderString::PerListPath => {
-            let lk = list_key
-                .ok_or_else(|| anyhow::anyhow!("per-list-path encoder requires `list_key`"))?;
-            Ok(EncoderKind::PerListPath {
-                list_key: parse_hex32(lk)?,
-            })
-        }
         EncoderString::PerListPath10 => {
             let lk = list_key
                 .ok_or_else(|| anyhow::anyhow!("per-list-path10 encoder requires `list_key`"))?;
             Ok(EncoderKind::PerListPath10 {
-                list_key: parse_hex32(lk)?,
-            })
-        }
-        EncoderString::PerListNode => {
-            let lk = list_key
-                .ok_or_else(|| anyhow::anyhow!("per-list-node encoder requires `list_key`"))?;
-            Ok(EncoderKind::PerListNode {
                 list_key: parse_hex32(lk)?,
             })
         }
@@ -1057,9 +1038,7 @@ fn enforce_encoder_matches_data_source(
             Ok(())
         }
         (
-            EncoderKind::PerListPath { .. }
-            | EncoderKind::PerListPath10 { .. }
-            | EncoderKind::PerListNode { .. },
+            EncoderKind::PerListPath10 { .. },
             DataSourceFilter::PpoiListBlock {
                 list_key: routed, ..
             },
@@ -2627,7 +2606,7 @@ pub(crate) fn holding(source: DataSourceFilter, rows: usize) -> Option<([u8; 32]
             u64::from(block) * u64::from(LEAVES_PER_PPOI_BLOCK),
             u64::from(LEAVES_PER_PPOI_BLOCK),
         ),
-        DataSourceFilter::ChainTreeNumber(_) | DataSourceFilter::PpoiList(_) => return None,
+        DataSourceFilter::ChainTreeNumber(_) => return None,
     };
     let rows = (rows as u64).min(capacity);
     Some((
@@ -2959,11 +2938,6 @@ data_source = { kind = "mirror", list_key = "00000000000000000000000000000000000
                 "a mirror data source without a block",
                 base.replace(", block = 0", ""),
                 "block",
-            ),
-            (
-                "the status encoder",
-                base.replace("per-list-path10", "per-list-status"),
-                "per-list-status",
             ),
             (
                 "data_source.what",
@@ -3358,14 +3332,6 @@ data_dir = "/tmp/raven-commit-tree-0"
 data_source = { kind = "indexer", filter = { tree_number = 0 } }
 
 [[instance]]
-id = "ppoi-paths"
-role = "live"
-encoder = "per-list-node"
-list_key = "0000000000000000000000000000000000000000000000000000000000000001"
-data_dir = "/tmp/raven-ppoi-paths"
-data_source = { kind = "mirror", list_key = "0000000000000000000000000000000000000000000000000000000000000001", block = 0 }
-
-[[instance]]
 id = "leaf-bc"
 role = "live"
 encoder = "per-leaf-bc"
@@ -3397,11 +3363,6 @@ data_source = { kind = "indexer", filter = { tree_number = 2 } }
             width("commit-tree-0"),
             node_hash,
             "per-node pins its canonical width over [global].record_size"
-        );
-        assert_eq!(
-            width("ppoi-paths"),
-            node_hash,
-            "per-list-node pins its canonical width over [global].record_size"
         );
         assert_eq!(
             width("leaf-bc"),
@@ -3472,11 +3433,11 @@ data_dir = "/tmp/raven-ppoi-paths10-ofac"
 data_source = {{ kind = "mirror", list_key = "{OFAC_LIST_KEY}", block = 0 }}
 
 [[instance]]
-id = "ppoi-paths-ofac"
+id = "ppoi-paths10-ofac-1"
 role = "live"
-encoder = "per-list-node"
+encoder = "per-list-path10"
 list_key = "{OFAC_LIST_KEY}"
-data_dir = "/tmp/raven-ppoi-paths-ofac"
+data_dir = "/tmp/raven-ppoi-paths10-ofac-1"
 data_source = {{ kind = "mirror", list_key = "{OFAC_LIST_KEY}", block = 1 }}
 "#
         )
@@ -3506,12 +3467,13 @@ data_source = {{ kind = "mirror", list_key = "{OFAC_LIST_KEY}", block = 1 }}
                 "per-node resolves its canonical total"
             );
         }
-        assert_eq!(resolved_entries(&opts, "ppoi-paths-ofac"), 131_072);
-        assert_eq!(
-            resolved_entries(&opts, "ppoi-paths10-ofac"),
-            DEFAULT_PRODUCTION_ENTRIES,
-            "leaf-keyed encoders keep the 65,536-row cell; a fleet-wide total would double it"
-        );
+        for id in ["ppoi-paths10-ofac", "ppoi-paths10-ofac-1"] {
+            assert_eq!(
+                resolved_entries(&opts, id),
+                DEFAULT_PRODUCTION_ENTRIES,
+                "leaf-keyed encoders keep the 65,536-row cell; a fleet-wide total would double it"
+            );
+        }
 
         let ring_dim = InspireParams::secure_128_d2048().ring_dim;
         for cfg in &opts.instances {
@@ -3546,7 +3508,6 @@ data_source = {{ kind = "mirror", list_key = "{OFAC_LIST_KEY}", block = 1 }}
                 "commit-tree-1",
                 "commit-tree-2",
                 "commit-tree-3",
-                "ppoi-paths-ofac",
             ],
             "one global row count cannot serve both encoder families"
         );
@@ -4210,7 +4171,9 @@ data_source = {{ kind = "mirror", list_key = "0000000000000000000000000000000000
             .iter()
             .map(|route| match route {
                 DataSourceFilter::PpoiListBlock { block, .. } => *block,
-                other => panic!("the shipped example declares a non-block PPOI route: {other:?}"),
+                other @ DataSourceFilter::ChainTreeNumber(_) => {
+                    panic!("the shipped example declares a non-block PPOI route: {other:?}")
+                }
             })
             .collect();
         assert_eq!(blocks, (0..7).collect::<Vec<u32>>());
@@ -4487,22 +4450,13 @@ data_source = {{ kind = "mirror", list_key = "0000000000000000000000000000000000
         }
     }
 
-    /// A per-list encoder reads `store.ppoi_imt(&self.list_key)` and drops every event for
+    /// The per-list encoder reads `store.ppoi_imt(&self.list_key)` and drops every event for
     /// a foreign list, so the pin has to be recoverable to be checkable at all.
     #[test]
-    fn every_per_list_encoder_reports_the_list_it_is_pinned_to() {
+    fn the_per_list_encoder_reports_the_list_it_is_pinned_to() {
         let list_key = [9u8; 32];
-        for encoder in [
-            EncoderKind::PerListPath { list_key },
-            EncoderKind::PerListPath10 { list_key },
-            EncoderKind::PerListNode { list_key },
-        ] {
-            assert_eq!(
-                super::pinned_list_key(encoder),
-                Some(list_key),
-                "{encoder:?} pins a list and must say which"
-            );
-        }
+        let encoder = EncoderKind::PerListPath10 { list_key };
+        assert_eq!(super::pinned_list_key(encoder), Some(list_key));
     }
 
     #[test]
@@ -4547,14 +4501,9 @@ data_source = {{ kind = "mirror", list_key = "0000000000000000000000000000000000
     #[test]
     fn an_agreeing_list_pin_is_accepted() {
         let list_key = [0xcd; 32];
-        for encoder in [
-            EncoderKind::PerListPath { list_key },
-            EncoderKind::PerListPath10 { list_key },
-            EncoderKind::PerListNode { list_key },
-        ] {
-            super::enforce_encoder_list_key("ppoi", encoder, &list_key, "data_source.list_key")
-                .unwrap_or_else(|e| panic!("{encoder:?} agrees with its list and must pass: {e}"));
-        }
+        let encoder = EncoderKind::PerListPath10 { list_key };
+        super::enforce_encoder_list_key("ppoi", encoder, &list_key, "data_source.list_key")
+            .unwrap_or_else(|e| panic!("{encoder:?} agrees with its list and must pass: {e}"));
     }
 
     /// A chain encoder pins no list; gating it on one would refuse every chain instance.

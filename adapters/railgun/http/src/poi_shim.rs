@@ -593,9 +593,10 @@ mod tests {
             }
         }
 
-        /// A sealed block's rows are walked once and its body is answered again, a mid-block
-        /// `since` included, while the frontier is walked on every read. The body is kept by
-        /// the block's root, so rows that change under a full block are read again.
+        /// A sealed block's rows are read on the first request only, and its body is answered
+        /// again, a mid-block `since` included, while the frontier is read on every request. The
+        /// body is kept by the store's rows stamp, so rows that change under a full block are
+        /// read again.
         #[tokio::test]
         async fn a_sealed_repeat_rebuilds_nothing_until_the_block_changes() {
             let sealed = block_store(0, LEAVES_PER_PPOI_BLOCK);
@@ -604,29 +605,37 @@ mod tests {
                 &[Arc::clone(&sealed), frontier],
                 u64::from(LEAVES_PER_PPOI_BLOCK) + 3,
             );
+            // Blocks walked, and index rows read by any means, a count included.
             let get = |since: u32| {
                 let walked = registry(&app).blocks_walked();
+                let rows = registry(&app).rows_read();
                 let response =
                     serve_prefix_segment(&app, LIST_KEY, since, &HeaderMap::new()).expect("served");
                 assert_eq!(response.status(), StatusCode::OK, "since={since}");
-                (response, registry(&app).blocks_walked() - walked)
+                (
+                    response,
+                    registry(&app).blocks_walked() - walked,
+                    registry(&app).rows_read() - rows,
+                )
             };
 
-            let (first, walked) = get(0);
+            let (first, walked, rows) = get(0);
             assert_eq!(walked, 1);
+            assert_eq!(rows, LEAVES_PER_PPOI_BLOCK as usize);
             let etag = etag_of(&first);
             let body = body_of(first).await;
             assert_eq!(body.len(), BC_INDEX_SEGMENT_MAX_BYTES);
 
-            let (repeat, walked) = get(0);
-            assert_eq!(walked, 0, "a sealed repeat must not rebuild the body");
+            let (repeat, walked, rows) = get(0);
+            assert_eq!((walked, rows), (0, 0), "a sealed repeat must read no row");
             assert_eq!(etag_of(&repeat), etag);
             assert_eq!(body_of(repeat).await, body);
 
-            let (mid, walked) = get(10);
+            let (mid, walked, rows) = get(10);
             assert_eq!(
-                walked, 0,
-                "a resume inside a sealed block must not rebuild the body"
+                (walked, rows),
+                (0, 0),
+                "a resume inside a sealed block must read no row"
             );
             assert_eq!(
                 body_of(mid).await,
@@ -635,7 +644,7 @@ mod tests {
             );
 
             for _ in 0..2 {
-                let (_, walked) = get(LEAVES_PER_PPOI_BLOCK);
+                let (_, walked, _) = get(LEAVES_PER_PPOI_BLOCK);
                 assert_eq!(
                     walked, 1,
                     "the frontier still grows, so it is read every time"
@@ -661,7 +670,7 @@ mod tests {
                     apply_wal_entry(&mut store, &payload, height, &enc).expect("refill");
                 }
             }
-            let (changed, walked) = get(0);
+            let (changed, walked, _) = get(0);
             assert_eq!(
                 walked, 1,
                 "a sealed block whose rows changed must be read again"
@@ -677,8 +686,8 @@ mod tests {
                     .take(BC_INDEX_PREFIX_BYTES)
                     .collect::<Vec<_>>()
             );
-            let (_, walked) = get(0);
-            assert_eq!(walked, 0);
+            let (_, walked, rows) = get(0);
+            assert_eq!((walked, rows), (0, 0));
         }
 
         /// A reorg that drops a middle row of a sealed block leaves its count and root unchanged.

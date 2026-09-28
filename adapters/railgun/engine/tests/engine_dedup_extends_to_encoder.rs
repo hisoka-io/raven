@@ -1,5 +1,5 @@
-//! Bootstrap dedup keys on `(DataSourceFilter, encoder_label)`, so one list key
-//! may carry several encoder kinds but not a duplicate pair.
+//! Bootstrap dedup keys on `(DataSourceFilter, encoder_label)`, so one block of a list may not
+//! be declared twice, and the router hands a row to every route bound to its block.
 
 #![allow(
     clippy::expect_used,
@@ -21,7 +21,7 @@ use raven_railgun_engine::orchestrator::{
 use raven_railgun_engine::persistence::{ConsumerEvent, SnapshotPolicy};
 use raven_railgun_engine::pir_table::EncoderKind;
 use raven_railgun_engine::InstanceRole;
-use raven_railgun_persistence::WalEntryPayload;
+use raven_railgun_persistence::{PpoiEventType, WalEntryPayload};
 use tokio::sync::mpsc;
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-dedup-encoder-test";
@@ -73,32 +73,26 @@ fn cfg(
 fn bootstrap_engine_rejects_two_instances_with_identical_data_source_AND_encoder_kind() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let lk = ofac_list_key();
-    let configs = vec![
+    let block = |id: &str, sub: &str| {
         cfg(
-            "ppoi-status-a",
-            "a",
+            id,
+            sub,
             tmp.path(),
-            EncoderKind::PerListStatus { list_key: lk },
-            DataSourceFilter::PpoiList(lk),
-        ),
-        cfg(
-            "ppoi-status-b",
-            "b",
-            tmp.path(),
-            EncoderKind::PerListStatus { list_key: lk },
-            DataSourceFilter::PpoiList(lk),
-        ),
-    ];
-    let params = InspireParams::secure_128_d2048();
-    let factory = |c: &InstanceConfig| -> raven_railgun_core::Result<InspireServerState> {
-        build_toy_state(c)
+            EncoderKind::PerListPath10 { list_key: lk },
+            DataSourceFilter::PpoiListBlock {
+                list_key: lk,
+                block: 2,
+            },
+        )
     };
-    let res = bootstrap_railgun_engine_multi(configs, params, factory);
+    let configs = vec![block("ppoi-block-a", "a"), block("ppoi-block-b", "b")];
+    let params = InspireParams::secure_128_d2048();
+    let res = bootstrap_railgun_engine_multi(configs, params, build_toy_state);
     let err = res.expect_err("expected dedup rejection");
     match err {
         AdapterError::InvalidQuery(msg) => {
             assert!(
-                msg.contains("duplicate") && msg.contains("per-list-status"),
+                msg.contains("duplicate") && msg.contains("per-list-path10"),
                 "expected duplicate + encoder label in error, got: {msg}"
             );
         }
@@ -106,77 +100,46 @@ fn bootstrap_engine_rejects_two_instances_with_identical_data_source_AND_encoder
     }
 }
 
+/// Two routes bound to one block must both receive its row. Drives the REAL router fan-out
+/// (`bootstrap_railgun_engine_multi`'s mirror channel), not a local restatement of it: the
+/// production comment warns that `.find()` would drop events past the first match, and only the
+/// real path can prove that warning is enforced.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "stands up 2 InsPIRe instances, ~7 s of setup each. Trigger: changing the bootstrap \
-            dedup key over (DataSourceFilter, encoder_label). CI runs it in the durability + \
-            closure engine-ignored lane."]
-async fn bootstrap_railgun_engine_multi_routes_two_ppoi_instances_with_same_list_key_different_encoder_kinds(
-) {
+async fn a_row_reaches_every_route_bound_to_its_block() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let lk = ofac_list_key();
-    let configs = vec![
-        cfg(
-            "ppoi-status-ofac",
-            "status",
-            tmp.path(),
-            EncoderKind::PerListStatus { list_key: lk },
-            DataSourceFilter::PpoiList(lk),
-        ),
-        cfg(
-            "ppoi-paths-ofac",
-            "paths",
-            tmp.path(),
-            EncoderKind::PerListPath { list_key: lk },
-            DataSourceFilter::PpoiList(lk),
-        ),
-    ];
-    let params = InspireParams::secure_128_d2048();
-    let factory = |c: &InstanceConfig| -> raven_railgun_core::Result<InspireServerState> {
-        build_toy_state(c)
+    let block = DataSourceFilter::PpoiListBlock {
+        list_key: lk,
+        block: 0,
     };
-    let mh =
-        bootstrap_railgun_engine_multi(configs, params, factory).expect("bootstrap should succeed");
-    assert_eq!(mh.instances.len(), 2, "two instances expected");
-    let labels: Vec<&str> = mh
-        .instances
-        .iter()
-        .map(|p| p.config.encoder.label())
-        .collect();
-    assert!(labels.contains(&"per-list-status"));
-    assert!(labels.contains(&"per-list-path"));
-    let _ = mh;
-}
-
-/// One list key with two route entries must reach both consumers. Drives the REAL
-/// router fan-out (`bootstrap_railgun_engine_multi`'s mirror channel), not a local
-/// restatement of it: the production comment warns that `.find()` would drop events
-/// past the first match, and only the real path can prove that warning is enforced.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ppoi_route_dispatch_does_not_collide_for_status_and_paths_on_same_list_key() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let lk = ofac_list_key();
     let cfgs = vec![cfg(
         "ppoi-fanout-host",
         "host",
         tmp.path(),
-        EncoderKind::PerListStatus { list_key: lk },
-        DataSourceFilter::PpoiList(lk),
+        EncoderKind::PerListPath10 { list_key: lk },
+        block,
     )];
     let params = InspireParams::secure_128_d2048();
     let mut handle =
         bootstrap_railgun_engine_multi(cfgs, params, build_toy_state).expect("bootstrap");
 
-    let (tx_status, mut rx_status) = mpsc::channel::<ConsumerEvent>(8);
-    let (tx_paths, mut rx_paths) = mpsc::channel::<ConsumerEvent>(8);
+    let (tx_first, mut rx_first) = mpsc::channel::<ConsumerEvent>(8);
+    let (tx_second, mut rx_second) = mpsc::channel::<ConsumerEvent>(8);
     handle.ppoi_list_routes.store(std::sync::Arc::new(vec![
-        (DataSourceFilter::PpoiList(lk), tx_status),
-        (DataSourceFilter::PpoiList(lk), tx_paths),
+        (block, tx_first),
+        (block, tx_second),
     ]));
 
-    let payload = WalEntryPayload::PpoiStatus {
+    let mut bc = [0u8; 32];
+    bc[31] = 7;
+    let payload = WalEntryPayload::PpoiListLeafAdded {
         list_key: lk,
-        blinded_commitment: [7u8; 32],
-        status: 1,
+        list_index: 0,
+        blinded_commitment: bc,
+        status: 0,
+        event_type: PpoiEventType::Shield,
+        signature: Vec::new(),
+        validated_merkleroot: [0; 32],
     };
     handle
         .channels
@@ -185,15 +148,15 @@ async fn ppoi_route_dispatch_does_not_collide_for_status_and_paths_on_same_list_
         .await
         .expect("router mirror inbound open");
 
-    let got_status = tokio::time::timeout(Duration::from_secs(2), rx_status.recv())
+    let got_first = tokio::time::timeout(Duration::from_secs(2), rx_first.recv())
         .await
-        .expect("status consumer timed out")
-        .expect("status channel closed");
-    let got_paths = tokio::time::timeout(Duration::from_secs(2), rx_paths.recv())
+        .expect("first consumer timed out")
+        .expect("first channel closed");
+    let got_second = tokio::time::timeout(Duration::from_secs(2), rx_second.recv())
         .await
-        .expect("second route bound to the same list_key never received the payload")
-        .expect("paths channel closed");
-    match (got_status, got_paths) {
+        .expect("second route bound to the same block never received the row")
+        .expect("second channel closed");
+    match (got_first, got_second) {
         (ConsumerEvent::Ppoi(p1, h1), ConsumerEvent::Ppoi(p2, h2)) => {
             assert_eq!(p1, payload);
             assert_eq!(p2, payload);

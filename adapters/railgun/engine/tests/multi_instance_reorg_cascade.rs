@@ -95,7 +95,10 @@ fn build_three_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
             "ppoi-list-a",
             "ppoi-a",
             EncoderKind::PerLeafBc { tree_number: 0 },
-            DataSourceFilter::PpoiList(lk_a),
+            DataSourceFilter::PpoiListBlock {
+                list_key: lk_a,
+                block: 0,
+            },
             VerificationMode::UpstreamAsserted,
             InstanceRole::Live,
         ),
@@ -113,10 +116,9 @@ async fn wait_until_seeded(instances: &[PerInstanceHandles], list_key: &[u8; 32]
                 DataSourceFilter::ChainTreeNumber(tree) => {
                     chain_ready += usize::from(store.imt_leaf_count_for(tree) == 5);
                 }
-                DataSourceFilter::PpoiList(_) => {
+                DataSourceFilter::PpoiListBlock { .. } => {
                     ppoi_ready = store.ppoi_list_leaves_iter(list_key).count() == 3;
                 }
-                DataSourceFilter::PpoiListBlock { .. } => {}
             }
         }
         if chain_ready == 2 && ppoi_ready {
@@ -152,7 +154,6 @@ fn split(mh: raven_railgun_engine::orchestrator::MultiOrchestratorHandle) -> Par
         chain_tree_routes: _,
         ppoi_list_routes: _,
         tree_observed: _,
-        list_observed: _,
     } = mh;
     Parts {
         instances,
@@ -232,10 +233,9 @@ async fn reorg_cascade_truncates_chain_instances_only() {
             DataSourceFilter::ChainTreeNumber(t) => {
                 pre_chain.push((t, store.imt_leaf_count_for(t)));
             }
-            DataSourceFilter::PpoiList(_) => {
+            DataSourceFilter::PpoiListBlock { .. } => {
                 pre_ppoi = store.ppoi_list_leaves_iter(&lk_a).count();
             }
-            DataSourceFilter::PpoiListBlock { .. } => unreachable!("fixture has no block route"),
         }
     }
     assert_eq!(pre_chain.len(), 2, "two chain-tree instances seeded");
@@ -275,7 +275,7 @@ async fn reorg_cascade_truncates_chain_instances_only() {
                     "tree-{t} must have 3 leaves post-reorg (heights 100..=102 survive); had {post}"
                 );
             }
-            DataSourceFilter::PpoiList(lk) => {
+            DataSourceFilter::PpoiListBlock { list_key: lk, .. } => {
                 assert_eq!(lk, lk_a, "expected the only PPOI instance to be list-a");
                 let post = store.ppoi_list_leaves_iter(&lk_a).count();
                 assert_eq!(
@@ -283,7 +283,6 @@ async fn reorg_cascade_truncates_chain_instances_only() {
                     "PPOI list must retain all 3 leaves; chain reorg is not chain-anchored"
                 );
             }
-            DataSourceFilter::PpoiListBlock { .. } => unreachable!("fixture has no block route"),
         }
     }
 

@@ -1,4 +1,4 @@
-//! Wall-clock per-INSERT bench across all six encoder choices.
+//! Wall-clock per-INSERT bench across every encoder choice.
 
 #![allow(
     clippy::expect_used,
@@ -203,7 +203,7 @@ fn run_cell(cell: &Cell) {
 
 #[test]
 #[ignore = "production-cell setup is heavy (~12s per encoder x 3 seeds); ~3 minutes total. \
-            Trigger: changing per-insert re-encode cost for any of the six encoders."]
+            Trigger: changing per-insert re-encode cost for any encoder."]
 fn per_insert_wall_time_per_encoder_at_50pct_fill() {
     append_findings_line("");
     append_findings_line(
@@ -236,24 +236,10 @@ fn per_insert_wall_time_per_encoder_at_50pct_fill() {
             insert_kind: InsertKind::PerTreeAppend,
         },
         Cell {
-            label: "per-list-status 65536x32 list",
-            entries: leaf_entries,
-            entry_bytes: 32,
-            encoder_kind: EncoderKind::PerListStatus { list_key: LIST_KEY },
-            insert_kind: InsertKind::PerListAppend,
-        },
-        Cell {
-            label: "per-list-path 65536x512 list",
+            label: "per-list-path10 65536x512 list",
             entries: leaf_entries,
             entry_bytes: 512,
-            encoder_kind: EncoderKind::PerListPath { list_key: LIST_KEY },
-            insert_kind: InsertKind::PerListAppend,
-        },
-        Cell {
-            label: "per-list-node 131072x32 list",
-            entries: node_entries,
-            entry_bytes: 32,
-            encoder_kind: EncoderKind::PerListNode { list_key: LIST_KEY },
+            encoder_kind: EncoderKind::PerListPath10 { list_key: LIST_KEY },
             insert_kind: InsertKind::PerListAppend,
         },
     ];

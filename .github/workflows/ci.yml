@@ -526,7 +526,7 @@ jobs:
             nextest_profile: ci
             run_ignored: only
             # offline_packing_keys_cache has no ignored test; the railgun-tests engine shard runs it
-            filter: "binary(engine_dedup_extends_to_encoder) + test(insert_rejects_overflow_past_capacity)"
+            filter: "test(insert_rejects_overflow_past_capacity)"
           - name: closure
             packages: "-p raven-railgun-engine"
             cargo_flags: ""
@@ -538,7 +538,7 @@ jobs:
             # t3_commit_tree_path_closure was deleted with proof that the closure it
             # asserted is carried by per_leaf_path_production_cell (nightly) and the
             # per-commit path oracle; its term went with the file, in this same change.
-            filter: "binary(t1_status_closure) + binary(t2_path_closure) + binary(phase4_closure) + binary(multi_instance_recovery) + binary(multi_instance_reorg_cascade)"
+            filter: "binary(phase4_closure) + binary(multi_instance_recovery) + binary(multi_instance_reorg_cascade)"
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"

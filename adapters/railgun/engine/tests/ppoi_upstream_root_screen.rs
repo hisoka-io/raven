@@ -6,14 +6,14 @@ use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use proptest::prelude::*;
 use raven_railgun_engine::imt::Imt;
 use raven_railgun_engine::inspire::{apply_wal_entry, validate_apply, LogicalLeafStore};
-use raven_railgun_engine::pir_table::PerListStatusEncoder;
+use raven_railgun_engine::pir_table::PerListPath10Encoder;
 use raven_railgun_engine::ppoi_root::PpoiRootDivergence;
 use raven_railgun_persistence::WalEntryPayload;
 
 const LIST_KEY: [u8; 32] = [0x5c; 32];
 
-fn encoder() -> PerListStatusEncoder {
-    PerListStatusEncoder::new(64, 2048, LIST_KEY).expect("encoder")
+fn encoder() -> PerListPath10Encoder {
+    PerListPath10Encoder::new(2048, LIST_KEY).expect("encoder")
 }
 
 fn list_leaf(list_index: u32, leaf: [u8; 32], validated_merkleroot: [u8; 32]) -> WalEntryPayload {
@@ -23,7 +23,7 @@ fn list_leaf(list_index: u32, leaf: [u8; 32], validated_merkleroot: [u8; 32]) ->
         blinded_commitment: leaf,
         status: 0,
         event_type: raven_railgun_persistence::PpoiEventType::Shield,
-        signature: vec![0; 64],
+        signature: Vec::new(),
         validated_merkleroot,
     }
 }

@@ -70,7 +70,7 @@ adapters/railgun/cli/tests/ppoi_capture_root_oracle.rs::every_captured_row_appli
 adapters/railgun/ppoi-replay/tests/capture_signatures.rs::every_captured_row_verifies_at_ingest_and_planted_forgeries_are_refused
 #  - the fixture generator WRITES the fixture bytes it pins. Running it in a lane would
 #    overwrite the evidence the V7 layout test exists to check.
-adapters/railgun/engine/src/inspire.rs::mint_frozen_v7_store_fixture
+adapters/railgun/engine/src/inspire.rs::mint_frozen_v8_store_fixture
 #  - the reopen probe needs an operator's real data_dir on an operator's filesystem. Its two
 #    self-verification tests DO run in every lane; only the env-var arm is ignored.
 adapters/railgun/engine/tests/data_dir_reopen_probe.rs::the_data_dir_named_by_the_environment_reopens_under_this_binary

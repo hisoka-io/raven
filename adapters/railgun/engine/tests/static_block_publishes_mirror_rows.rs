@@ -11,7 +11,6 @@
     clippy::unwrap_used
 )]
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use raven_inspire::params::{InspireParams, InspireVariant};
@@ -346,16 +345,11 @@ async fn a_restarted_static_block_serves_the_rows_its_wal_replayed() {
     stop_uncleanly(second);
 }
 
-/// Once nothing is pending the block commits nothing while no event arrives, and re-encodes
-/// nothing while the list's statuses keep arriving for commitments it does not hold. A status for
-/// a row it does hold is published.
-///
-/// The re-encode check reads the served table itself: a re-encode replaces it, a snapshot-only
-/// commit (which the shortened timer may fire on any append) does not.
+/// Once nothing is pending the block commits nothing while no event arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_static_block_publishes_a_status_flip_and_re_encodes_nothing_while_idle() {
+async fn a_static_block_takes_no_commit_while_idle() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (fresh, secret_key) = fresh_state();
+    let (fresh, _secret_key) = fresh_state();
     let handle = boot(dir.path(), short_bound(), Some(fresh));
     let booted = handle.instances.first().expect("one instance");
     let mut upstream = Imt::new().expect("reference tree");
@@ -366,8 +360,6 @@ async fn a_static_block_publishes_a_status_flip_and_re_encodes_nothing_while_idl
         booted.logical_store.lock().dirty_shards().is_empty(),
         "precondition: the rows were published, still pending after {waited:?}"
     );
-    let served = || Arc::clone(&booted.instance.current_state().encoded_db);
-    let published = served();
 
     // The publish counts its commit just after draining the dirty set; let it land first.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -377,44 +369,6 @@ async fn a_static_block_publishes_a_status_flip_and_re_encodes_nothing_while_idl
         booted.metrics.lock().commits_fired,
         commits,
         "a block with nothing pending and no event must take no periodic commit"
-    );
-
-    let status = |blinded_commitment| WalEntryPayload::PpoiStatus {
-        list_key: LIST_KEY,
-        blinded_commitment,
-        status: POIStatus::ShieldBlocked.wire_byte(),
-    };
-    let processed = booted.metrics.lock().events_processed;
-    handle
-        .channels
-        .mirror_tx
-        .send((status(bc_for(ROWS + 100)), 0))
-        .await
-        .expect("router open");
-    while booted.metrics.lock().events_processed == processed {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    tokio::time::sleep(Duration::from_secs(BOUND_SECS * 3)).await;
-    assert!(
-        Arc::ptr_eq(&served(), &published),
-        "a status for a commitment this block does not hold must not re-encode it"
-    );
-
-    handle
-        .channels
-        .mirror_tx
-        .send((status(bc_for(0)), 0))
-        .await
-        .expect("router open");
-    let deadline = tokio::time::Instant::now() + PUBLISH_DEADLINE;
-    while Arc::ptr_eq(&served(), &published) && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let row = decrypt_row(&booted.instance.current_state(), secret_key, 0);
-    assert_eq!(
-        row[PATH10_STATUS],
-        POIStatus::ShieldBlocked.wire_byte(),
-        "the served row must carry the status flip"
     );
     stop_uncleanly(handle);
 }

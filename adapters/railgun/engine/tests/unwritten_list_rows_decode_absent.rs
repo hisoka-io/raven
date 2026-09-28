@@ -1,8 +1,8 @@
 //! A per-list row whose list index has no record must decode as ABSENT to ANY reader, and a
 //! row below the list frontier served that way must be counted and logged.
 //!
-//! "Any reader" is the weakest one: it maps the status byte and checks nothing else, no BC
-//! tail and no format marker. The SDK checks both, and its refusal is not what this proves.
+//! "Any reader" is the weakest one: it maps the status byte and checks nothing else, not the
+//! leaf and not the format marker. The SDK checks both, and its refusal is not what this proves.
 //! Status byte 0 is `Valid`, the verdict that authorizes a spend, so a zero-filled row is the
 //! fail-open case.
 
@@ -28,32 +28,28 @@ use raven_railgun_engine::inspire::{
 };
 use raven_railgun_engine::orchestrator::{
     bootstrap_railgun_engine_multi, DataSourceFilter, InstanceConfig, VerificationMode,
-    LEAVES_PER_PPOI_BLOCK,
 };
 use raven_railgun_engine::persistence::{ConsumerEvent, RetentionPolicy, SnapshotPolicy};
 use raven_railgun_engine::pir_table::list::PATH10_MAGIC;
 use raven_railgun_engine::pir_table::{
-    EncoderKind, PerListPath10Encoder, PerListStatusEncoder, PirTableEncoder, LEAVES_PER_TREE,
-    PATH10_RECORD_BYTES,
+    EncoderKind, PerListPath10Encoder, PirTableEncoder, PATH10_RECORD_BYTES,
 };
 use raven_railgun_engine::{InstanceRole, PirScheme};
 use raven_railgun_persistence::{PpoiEventType, WalEntryPayload};
 
 const LIST_KEY: [u8; 32] = [0x6b; 32];
-const STATUS_RECORD: usize = 32;
 const EPS: u32 = 2048;
 const PATH10_STATUS: usize = 32;
 const PATH10_MARKER: std::ops::Range<usize> = 34..38;
 const UNFILLED: &str = "raven_railgun_pir_unfilled_rows_total";
 
-/// Row 0: leaf kept, status rolled back. Row 1: no leaf, below the frontier. Row 2: filled,
-/// `Valid`. Rows 3 and up: past the frontier.
-const DROPPED_STATUS: u32 = 0;
+/// Rows 0 and 2: filled. Row 1: no leaf, below the frontier. Rows 3 and up: past the frontier.
+const FIRST: u32 = 0;
 const HOLE: u32 = 1;
 const FILLED: u32 = 2;
 const FRONTIER: u32 = 3;
 
-/// Fr-canonical, distinct per index, and non-zero in the bytes a status row's tail carries.
+/// Fr-canonical and distinct per index.
 fn bc_for(list_index: u32) -> [u8; 32] {
     let mut bc = [0u8; 32];
     bc[0] = 0x0a;
@@ -62,22 +58,18 @@ fn bc_for(list_index: u32) -> [u8; 32] {
     bc
 }
 
-fn leaf(list_index: u32, status: POIStatus) -> WalEntryPayload {
-    rooted_leaf(list_index, status, [0; 32])
+fn leaf(list_index: u32) -> WalEntryPayload {
+    rooted_leaf(list_index, [0; 32])
 }
 
-fn rooted_leaf(
-    list_index: u32,
-    status: POIStatus,
-    validated_merkleroot: [u8; 32],
-) -> WalEntryPayload {
+fn rooted_leaf(list_index: u32, validated_merkleroot: [u8; 32]) -> WalEntryPayload {
     WalEntryPayload::PpoiListLeafAdded {
         list_key: LIST_KEY,
         list_index,
         blinded_commitment: bc_for(list_index),
-        status: status.wire_byte(),
+        status: 0,
         event_type: PpoiEventType::Shield,
-        signature: vec![0; 64],
+        signature: Vec::new(),
         validated_merkleroot,
     }
 }
@@ -94,25 +86,16 @@ fn verdict(byte: u8) -> Option<POIStatus> {
     .find(|status| status.wire_byte() == byte)
 }
 
-/// Both below-frontier absences, reached through the public apply path alone.
+/// A below-frontier absence, reached through the public apply path alone.
 ///
 /// Leaf 1 lands at a height above leaf 2, so a rewind between them takes leaf 1 and keeps leaf
-/// 2: the tree keeps three leaves and row 1 has no record. Leaf 0's later ShieldBlocked update
-/// is rewound too, which leaves the leaf with no status at all.
-fn store_with_both_absences(encoder: &dyn PirTableEncoder) -> LogicalLeafStore {
+/// 2: the tree keeps three leaves and row 1 has no record.
+fn store_with_a_hole(encoder: &dyn PirTableEncoder) -> LogicalLeafStore {
     let mut store = LogicalLeafStore::new();
     for (payload, height) in [
-        (leaf(DROPPED_STATUS, POIStatus::Valid), 100),
-        (leaf(HOLE, POIStatus::Valid), 300),
-        (leaf(FILLED, POIStatus::Valid), 200),
-        (
-            WalEntryPayload::PpoiStatus {
-                list_key: LIST_KEY,
-                blinded_commitment: bc_for(DROPPED_STATUS),
-                status: POIStatus::ShieldBlocked.wire_byte(),
-            },
-            260,
-        ),
+        (leaf(FIRST), 100),
+        (leaf(HOLE), 300),
+        (leaf(FILLED), 200),
         (WalEntryPayload::Reorg { height: 250 }, 250),
     ] {
         apply_wal_entry(&mut store, &payload, height, encoder).expect("apply");
@@ -127,15 +110,10 @@ fn store_with_both_absences(encoder: &dyn PirTableEncoder) -> LogicalLeafStore {
         "precondition: row 1 has no leaf"
     );
     assert!(
-        store.ppoi_bc_at(&LIST_KEY, DROPPED_STATUS).is_some()
-            && store.ppoi_status_at(&LIST_KEY, DROPPED_STATUS).is_none(),
-        "precondition: row 0 keeps its leaf and loses its status"
+        store.ppoi_bc_at(&LIST_KEY, FIRST).is_some(),
+        "precondition: row 0 keeps its leaf"
     );
     store
-}
-
-fn status_encoder() -> PerListStatusEncoder {
-    PerListStatusEncoder::new(STATUS_RECORD, EPS, LIST_KEY).expect("status encoder")
 }
 
 fn path10_encoder() -> PerListPath10Encoder {
@@ -148,70 +126,19 @@ fn rows(bytes: &[u8], width: usize) -> Vec<&[u8]> {
 }
 
 #[test]
-fn every_status_row_without_a_verdict_reads_missing_and_only_a_real_verdict_reads_valid() {
-    let encoder = status_encoder();
-    let store = store_with_both_absences(&encoder);
-
-    let shard = encoder.materialize_shard(0, &store);
-    for (list_index, row) in rows(&shard, STATUS_RECORD).into_iter().enumerate() {
-        let expected = if list_index == FILLED as usize {
-            POIStatus::Valid
-        } else {
-            POIStatus::Missing
-        };
-        assert_eq!(
-            verdict(row[0]),
-            Some(expected),
-            "status row {list_index} must read {expected:?}"
-        );
-    }
-    let by_index = rows(&shard, STATUS_RECORD);
-    assert_eq!(&by_index[FILLED as usize][1..], &bc_for(FILLED)[..31]);
-    assert_eq!(
-        &by_index[DROPPED_STATUS as usize][1..],
-        &bc_for(DROPPED_STATUS)[..31]
-    );
-    assert!(
-        by_index[HOLE as usize][1..].iter().all(|b| *b == 0),
-        "no record, no tail"
-    );
-
-    let past_the_tail = encoder.materialize_shard(1, &store);
-    assert!(
-        rows_read(&past_the_tail, STATUS_RECORD, 0).all(|v| v == Some(POIStatus::Missing)),
-        "a shard wholly past the frontier must read Missing on every row"
-    );
-    let empty = encoder.materialize_shard(0, &LogicalLeafStore::new());
-    assert!(
-        rows_read(&empty, STATUS_RECORD, 0).all(|v| v == Some(POIStatus::Missing)),
-        "a list with no leaves must read Missing on every row"
-    );
-}
-
-fn rows_read(
-    bytes: &[u8],
-    width: usize,
-    status_offset: usize,
-) -> impl Iterator<Item = Option<POIStatus>> + '_ {
-    bytes
-        .chunks_exact(width)
-        .map(move |row| verdict(row[status_offset]))
-}
-
-#[test]
 fn every_path10_row_without_a_record_has_no_marker_and_reads_missing() {
     let encoder = path10_encoder();
-    let store = store_with_both_absences(&encoder);
+    let store = store_with_a_hole(&encoder);
 
     let shard = encoder.materialize_shard(0, &store);
     for (list_index, row) in rows(&shard, PATH10_RECORD_BYTES).into_iter().enumerate() {
-        let filled = list_index == FILLED as usize || list_index == DROPPED_STATUS as usize;
+        let filled = list_index == FILLED as usize || list_index == FIRST as usize;
         assert_eq!(
             &row[PATH10_MARKER] == PATH10_MAGIC.as_slice(),
             filled,
             "path10 row {list_index}: the marker must be present exactly when the row is filled"
         );
-        let expected = if list_index == FILLED as usize {
+        let expected = if filled {
             POIStatus::Valid
         } else {
             POIStatus::Missing
@@ -330,16 +257,13 @@ fn observe(encoder: &dyn PirTableEncoder, store: &LogicalLeafStore) -> (Counts, 
 }
 
 fn assert_counted_and_named(encoder: &dyn PirTableEncoder) {
-    let store = store_with_both_absences(encoder);
+    let store = store_with_a_hole(encoder);
     let (counts, warns) = observe(encoder, &store);
     let label = encoder.label().to_owned();
     assert_eq!(
         counts,
-        BTreeMap::from([
-            ((label.clone(), "leaf".to_owned()), 1),
-            ((label.clone(), "status".to_owned()), 1),
-        ]),
-        "{label}: exactly the two below-frontier rows count; the {} padding rows past the \
+        BTreeMap::from([((label.clone(), "leaf".to_owned()), 1)]),
+        "{label}: exactly the below-frontier hole counts; the {} padding rows past the \
          frontier in shard 0 and the whole of shard 1 must not",
         EPS - FRONTIER
     );
@@ -356,18 +280,15 @@ fn assert_counted_and_named(encoder: &dyn PirTableEncoder) {
     let key_hex = "6b".repeat(32);
     assert_eq!(
         named,
-        BTreeSet::from([
-            (key_hex.clone(), HOLE.to_string(), "leaf".to_owned()),
-            (key_hex, DROPPED_STATUS.to_string(), "status".to_owned()),
-        ]),
+        BTreeSet::from([(key_hex, HOLE.to_string(), "leaf".to_owned())]),
         "{label}: one warn per unfilled row, naming the list and the index"
     );
-    assert_eq!(warns.len(), 2, "{label}: no warn for padding");
+    assert_eq!(warns.len(), 1, "{label}: no warn for padding");
 
     let clean = {
         let mut store = LogicalLeafStore::new();
         for i in 0..FRONTIER {
-            apply_wal_entry(&mut store, &leaf(i, POIStatus::Valid), 100, encoder).expect("apply");
+            apply_wal_entry(&mut store, &leaf(i), 100, encoder).expect("apply");
         }
         store
     };
@@ -376,11 +297,6 @@ fn assert_counted_and_named(encoder: &dyn PirTableEncoder) {
         counts.values().all(|c| *c == 0) && warns.is_empty(),
         "{label}: a list with no holes serves padding silently: {counts:?} {warns:?}"
     );
-}
-
-#[test]
-fn the_status_encoder_counts_and_names_each_unfilled_row_and_never_padding() {
-    assert_counted_and_named(&status_encoder());
 }
 
 #[test]
@@ -426,31 +342,9 @@ fn served_rows(database: &[u8], entry_size: usize, list_indices: &[u32]) -> Vec<
 }
 
 #[test]
-fn a_served_status_row_with_no_record_decrypts_to_missing() {
-    let encoder = status_encoder();
-    let store = store_with_both_absences(&encoder);
-    let database = encoder.materialize_shard(0, &store);
-    let cases = [
-        (HOLE, POIStatus::Missing),
-        (FRONTIER + 7, POIStatus::Missing),
-        (DROPPED_STATUS, POIStatus::Missing),
-        (FILLED, POIStatus::Valid),
-    ];
-    let indices: Vec<u32> = cases.iter().map(|(list_index, _)| *list_index).collect();
-    let served = served_rows(&database, STATUS_RECORD, &indices);
-    for ((list_index, expected), row) in cases.into_iter().zip(served) {
-        assert_eq!(
-            verdict(row[0]),
-            Some(expected),
-            "served status row {list_index}"
-        );
-    }
-}
-
-#[test]
 fn a_served_path10_row_with_no_record_decrypts_to_missing_without_a_marker() {
     let encoder = path10_encoder();
-    let store = store_with_both_absences(&encoder);
+    let store = store_with_a_hole(&encoder);
     let database = encoder.materialize_shard(0, &store);
     let indices = [HOLE, FRONTIER + 7];
     let served = served_rows(&database, PATH10_RECORD_BYTES, &indices);
@@ -504,7 +398,10 @@ async fn served_after_commit(
         record_size: width,
         entries_per_shard: EPS,
         verification_mode: VerificationMode::UpstreamAsserted,
-        data_source: DataSourceFilter::PpoiList(LIST_KEY),
+        data_source: DataSourceFilter::PpoiListBlock {
+            list_key: LIST_KEY,
+            block: 0,
+        },
         use_flock: false,
         snapshot_policy: SnapshotPolicy {
             max_appends_per_snapshot: FRONTIER as usize,
@@ -530,7 +427,7 @@ async fn served_after_commit(
         upstream
             .insert_leaves(list_index as usize, &[bc_for(list_index)])
             .expect("reference insert");
-        let row = rooted_leaf(list_index, POIStatus::Valid, upstream.root());
+        let row = rooted_leaf(list_index, upstream.root());
         booted
             .sender
             .send(ConsumerEvent::Ppoi(row, 100))
@@ -563,40 +460,8 @@ async fn served_after_commit(
 }
 
 /// Every leaf dirties shard 0, so the commit rewrites all of it from the encoder: no seeded row
-/// may survive there, including row 251, which the seed makes `Valid`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_booted_status_instance_serves_missing_rows_across_a_committed_shard() {
-    const SEEDED_VALID: u32 = 251;
-    assert_eq!(
-        verdict(seeded_rows(STATUS_RECORD)[SEEDED_VALID as usize * STATUS_RECORD]),
-        Some(POIStatus::Valid),
-        "precondition: the seed reads Valid at row {SEEDED_VALID}"
-    );
-    let cases = [
-        (0, POIStatus::Valid),
-        (FILLED, POIStatus::Valid),
-        (FRONTIER, POIStatus::Missing),
-        (SEEDED_VALID, POIStatus::Missing),
-        (EPS - 1, POIStatus::Missing),
-    ];
-    let indices: Vec<u32> = cases.iter().map(|(list_index, _)| *list_index).collect();
-    let served = served_after_commit(
-        EncoderKind::PerListStatus { list_key: LIST_KEY },
-        STATUS_RECORD,
-        &indices,
-    )
-    .await;
-    for ((list_index, expected), row) in cases.into_iter().zip(&served) {
-        assert_eq!(
-            verdict(row[0]),
-            Some(expected),
-            "served status row {list_index} after the commit"
-        );
-    }
-    assert_eq!(&served[1][1..], &bc_for(FILLED)[..31], "the encoder's row");
-}
-
-/// The path10 twin. Row 219 is seeded `Valid` at the status offset: (219 + 32) % 251 == 0.
+/// may survive there, including row 219, which the seed makes `Valid` at the status offset:
+/// (219 + 32) % 251 == 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_booted_path10_instance_serves_unmarked_missing_rows_across_a_committed_shard() {
     const SEEDED_VALID: u32 = 219;
@@ -634,48 +499,4 @@ async fn a_booted_path10_instance_serves_unmarked_missing_rows_across_a_committe
         );
     }
     assert_eq!(&served[0][..32], &bc_for(FILLED), "the encoder's leaf");
-}
-
-/// A status table holds one tree, and the client asks status at the list index, never by block.
-/// Rows for indices past that tree are written nowhere because apply refuses the index before any
-/// row or dirty mark exists, not because this dirty set drops it. Every index the table holds
-/// dirties the shard carrying its row. A row past the table is never served: the client refuses
-/// to ask for it and the server refuses a query for a shard it does not hold.
-#[test]
-fn the_status_dirty_set_covers_every_index_the_instance_can_hold_and_nothing_else_arrives() {
-    let encoder = status_encoder();
-    let shards = LEAVES_PER_TREE / EPS;
-    assert_eq!(
-        EncoderKind::PerListStatus { list_key: LIST_KEY }.min_total_entries(),
-        LEAVES_PER_TREE,
-        "the status table has exactly one tree's rows"
-    );
-    for list_index in 0..LEAVES_PER_TREE {
-        let dirty = encoder.affected_shards_for_ppoi_leaf(&LIST_KEY, list_index);
-        assert_eq!(
-            dirty,
-            BTreeSet::from([list_index / EPS]),
-            "index {list_index} must dirty the shard carrying its row"
-        );
-        assert!(list_index / EPS < shards);
-    }
-
-    let mut store = LogicalLeafStore::new();
-    let refusal = apply_wal_entry(
-        &mut store,
-        &leaf(LEAVES_PER_PPOI_BLOCK, POIStatus::Valid),
-        100,
-        &encoder,
-    )
-    .expect_err("an index past one tree cannot enter a whole-list store");
-    assert!(
-        refusal.to_string().contains("capacity"),
-        "the refusal must name the capacity: {refusal}"
-    );
-    assert!(
-        store.dirty_shards().is_empty(),
-        "a refused row marks nothing"
-    );
-    assert!(store.ppoi_bc_at(&LIST_KEY, LEAVES_PER_PPOI_BLOCK).is_none());
-    assert!(store.ppoi_imt(&LIST_KEY).is_none());
 }

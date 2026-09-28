@@ -73,6 +73,21 @@ fn require_wire_rung(params: &InspireParams) -> Result<()> {
         .map_err(|e| AdapterError::Scheme(format!("served response modulus: {e}")))
 }
 
+/// A snapshot's parameters and shard geometry are data, so a restored state is held to what
+/// setup accepts before anything is built from it.
+fn validate_persisted_state(bundle: &PersistedInspireState) -> Result<()> {
+    let params = &bundle.crs.params;
+    params
+        .validate()
+        .map_err(|e| AdapterError::Scheme(format!("snapshot parameters: {e}")))?;
+    require_wire_rung(params)?;
+    bundle
+        .encoded_db
+        .config
+        .validate_for_params(params)
+        .map_err(|e| AdapterError::Scheme(format!("snapshot shard geometry: {e}")))
+}
+
 /// Marker type implementing [`PirScheme`] for the production stack.
 #[derive(Debug, Default)]
 pub struct RavenInspireScheme;
@@ -494,7 +509,7 @@ impl std::fmt::Debug for PersistedInspireState {
 }
 
 /// Serialize an [`InspireServerState`] to legacy V5 bincode bytes. Prefer
-/// [`snapshot_inspire_state_v7`], which also embeds the [`LogicalLeafStore`].
+/// [`snapshot_inspire_state_v8`], which also embeds the [`LogicalLeafStore`].
 pub fn snapshot_inspire_state(state: &InspireServerState) -> Result<Vec<u8>> {
     let bundle = PersistedInspireState {
         crs: (*state.crs).clone(),
@@ -510,23 +525,28 @@ pub fn snapshot_inspire_state(state: &InspireServerState) -> Result<Vec<u8>> {
 /// starts with these bytes.
 pub const SNAPSHOT_V6_MAGIC: [u8; 4] = *b"RV6\0";
 
-/// V7 magic header; V7 retains upstream PPOI event metadata in the logical store.
+/// V7 magic header, recognised only so a V7 body is refused by name. V7 stored a status byte
+/// per list commitment and each row's upstream signature.
 pub const SNAPSHOT_V7_MAGIC: [u8; 4] = *b"RV7\0";
 
-/// V7 envelope; bundling the store lets a commit archive the WAL without
+/// V8 magic header; V8 retains each list row's event type and upstream root, and no status or
+/// signature.
+pub const SNAPSHOT_V8_MAGIC: [u8; 4] = *b"RV8\0";
+
+/// V8 envelope; bundling the store lets a commit archive the WAL without
 /// losing logical state on restart.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct PersistedInspireStateV7 {
+struct PersistedInspireStateV8 {
     state: PersistedInspireState,
     store: LogicalLeafStore,
 }
 
-/// Serialize `(state, store)` with retained PPOI metadata.
-pub fn snapshot_inspire_state_v7(
+/// Serialize `(state, store)` under [`SNAPSHOT_V8_MAGIC`].
+pub fn snapshot_inspire_state_v8(
     state: &InspireServerState,
     store: &LogicalLeafStore,
 ) -> Result<Vec<u8>> {
-    let bundle = PersistedInspireStateV7 {
+    let bundle = PersistedInspireStateV8 {
         state: PersistedInspireState {
             crs: (*state.crs).clone(),
             encoded_db: (*state.encoded_db).clone(),
@@ -535,10 +555,10 @@ pub fn snapshot_inspire_state_v7(
         },
         store: store.clone(),
     };
-    let mut out = Vec::with_capacity(SNAPSHOT_V7_MAGIC.len() + 1024);
-    out.extend_from_slice(&SNAPSHOT_V7_MAGIC);
+    let mut out = Vec::with_capacity(SNAPSHOT_V8_MAGIC.len() + 1024);
+    out.extend_from_slice(&SNAPSHOT_V8_MAGIC);
     let body = bincode::serialize(&bundle)
-        .map_err(|e| AdapterError::Serialization(format!("v7 snapshot serialize: {e}")))?;
+        .map_err(|e| AdapterError::Serialization(format!("v8 snapshot serialize: {e}")))?;
     out.extend_from_slice(&body);
     Ok(out)
 }
@@ -583,7 +603,7 @@ pub fn restore_inspire_state(bytes: &[u8]) -> Result<InspireServerState> {
 }
 
 fn bundle_to_state(bundle: PersistedInspireState) -> Result<InspireServerState> {
-    require_wire_rung(&bundle.crs.params)?;
+    validate_persisted_state(&bundle)?;
     let cache = ServerInspiringCache::new(&bundle.crs, &bundle.encoded_db)
         .map_err(|e| AdapterError::Scheme(format!("restore cache build: {e}")))?;
     Ok(InspireServerState {
@@ -656,39 +676,49 @@ pub(crate) fn persist_inspiring_cache(
         .map_err(|e| AdapterError::Internal(format!("offline packing cache store: {e}")))
 }
 
-/// Refused before a byte of the body is read. No V6 writer survives and every recovered
-/// pre-V7 snapshot is V5, so a V6 decoder has nothing to read correctly and could not tell a
-/// same-width reinterpretation from a value. The layout help is left off: its probe and
-/// matching-build advice cannot succeed on a body this build never reads.
-fn refuse_v6_body() -> AdapterError {
-    AdapterError::Serialization(
-        "v6 snapshot refused: this build reads the V7 snapshot epoch and refuses a V6 body \
-         unread, whatever it contains. It reads no V6 body and no in-place migration exists. \
-         Operator: re-bootstrap this instance."
-            .to_owned(),
-    )
+/// Refused before a byte of the body is read. No V6 or V7 writer survives, so a decoder for
+/// either has nothing to read correctly and could not tell a same-width reinterpretation from a
+/// value. The layout help is left off: its probe and matching-build advice cannot succeed on a
+/// body this build never reads.
+fn refuse_retired_body(epoch: &str) -> AdapterError {
+    AdapterError::Serialization(format!(
+        "{epoch} snapshot refused: this build reads the V8 snapshot epoch and refuses a \
+         {epoch} body unread, whatever it contains; no in-place migration exists. Operator: \
+         re-bootstrap this instance."
+    ))
 }
 
-/// V7 carries the LIVE store, so there is no frozen shape to name; the operator's options are
+/// The magic of a snapshot epoch this build refuses by name, if `bytes` carries one.
+fn retired_epoch(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(SNAPSHOT_V7_MAGIC.as_slice()) {
+        Some("v7")
+    } else if bytes.starts_with(SNAPSHOT_V6_MAGIC.as_slice()) {
+        Some("v6")
+    } else {
+        None
+    }
+}
+
+/// V8 carries the LIVE store, so there is no frozen shape to name; the operator's options are
 /// those of every other arm, and so is the message.
-fn decode_v7_body(body: &[u8]) -> Result<PersistedInspireStateV7> {
+fn decode_v8_body(body: &[u8]) -> Result<PersistedInspireStateV8> {
     decode_snapshot_body(body).map_err(|e| {
         AdapterError::Serialization(format!(
-            "v7 snapshot deserialize: {e}. {SNAPSHOT_LAYOUT_HELP}"
+            "v8 snapshot deserialize: {e}. {SNAPSHOT_LAYOUT_HELP}"
         ))
     })
 }
 
 /// Reconstruct `(InspireServerState, LogicalLeafStore)`, dispatching on the snapshot magic.
-/// V7 carries the store, V6 is refused unread, and V5 yields an empty store that WAL replay
-/// refills.
+/// V8 carries the store, V7 and V6 are refused unread, and V5 yields an empty store that WAL
+/// replay refills.
 pub fn restore_inspire_state_v6(bytes: &[u8]) -> Result<(InspireServerState, LogicalLeafStore)> {
-    if let Some(body) = bytes.strip_prefix(SNAPSHOT_V7_MAGIC.as_slice()) {
-        let bundle = decode_v7_body(body)?;
+    if let Some(body) = bytes.strip_prefix(SNAPSHOT_V8_MAGIC.as_slice()) {
+        let bundle = decode_v8_body(body)?;
         let state = bundle_to_state(bundle.state)?;
         Ok((state, bundle.store))
-    } else if bytes.starts_with(SNAPSHOT_V6_MAGIC.as_slice()) {
-        Err(refuse_v6_body())
+    } else if let Some(epoch) = retired_epoch(bytes) {
+        Err(refuse_retired_body(epoch))
     } else {
         tracing::warn!(
             target = "raven::engine::snapshot",
@@ -704,8 +734,9 @@ pub(crate) fn restore_inspire_state_v6_cached(
     bytes: &[u8],
     data_dir: &std::path::Path,
 ) -> Result<(InspireServerState, LogicalLeafStore, bool, bool)> {
-    if let Some(body) = bytes.strip_prefix(SNAPSHOT_V7_MAGIC.as_slice()) {
-        let bundle = decode_v7_body(body)?;
+    if let Some(body) = bytes.strip_prefix(SNAPSHOT_V8_MAGIC.as_slice()) {
+        let bundle = decode_v8_body(body)?;
+        validate_persisted_state(&bundle.state)?;
         let (cache, hit, persisted) =
             cache_for_recovery(data_dir, &bundle.state.crs, &bundle.state.encoded_db)?;
         let state = InspireServerState {
@@ -717,8 +748,8 @@ pub(crate) fn restore_inspire_state_v6_cached(
             entry_size: bundle.state.entry_size,
         };
         Ok((state, bundle.store, hit, persisted))
-    } else if bytes.starts_with(SNAPSHOT_V6_MAGIC.as_slice()) {
-        Err(refuse_v6_body())
+    } else if let Some(epoch) = retired_epoch(bytes) {
+        Err(refuse_retired_body(epoch))
     } else {
         tracing::warn!(
             target = "raven::engine::snapshot",
@@ -733,6 +764,7 @@ pub(crate) fn restore_inspire_state_v6_cached(
                 "v5 snapshot deserialize: {e}. {SNAPSHOT_LAYOUT_HELP}"
             ))
         })?;
+        validate_persisted_state(&bundle)?;
         let (cache, hit, persisted) =
             cache_for_recovery(data_dir, &bundle.crs, &bundle.encoded_db)?;
         let state = InspireServerState {
@@ -813,10 +845,10 @@ pub use logical_store::{
 };
 
 #[cfg(test)]
-mod frozen_v7_shape_tests {
-    //! V7 carries the LIVE `LogicalLeafStore`, the position V6 was in when a field inserted
+mod frozen_v8_shape_tests {
+    //! V8 carries the LIVE `LogicalLeafStore`, the position V6 was in when a field inserted
     //! mid-struct reinterpreted the bytes of every snapshot written before it. These tests pin
-    //! the V7 read path to frozen BYTES, because a round trip through today's codec cannot see
+    //! the V8 read path to frozen BYTES, because a round trip through today's codec cannot see
     //! a shape change -- it writes and reads the same wrong layout and passes.
     //!
     //! LIMIT, stated so a green run is not over-read: the store holds `HashMap`s, so minting
@@ -836,6 +868,11 @@ mod frozen_v7_shape_tests {
     /// underruns or leaves surplus, and surplus is refused. What it does NOT catch: a
     /// same-width type substitution (`u64` for `i64`), which decodes cleanly and passes every
     /// assertion below.
+    const FROZEN_V8_STORE: &[u8] = include_bytes!("../tests/fixtures/logical_store_v8.bin");
+
+    /// The store the V7 epoch wrote, minted by the last build that wrote it. It is kept to prove
+    /// that the V8 layout really differs, so a V7 body read as V8 could only fail or misread,
+    /// which is why the V7 magic is refused unread.
     const FROZEN_V7_STORE: &[u8] = include_bytes!("../tests/fixtures/logical_store_v7.bin");
 
     const LIST_KEY: [u8; 32] = [0xab; 32];
@@ -882,24 +919,24 @@ mod frozen_v7_shape_tests {
     #[test]
     #[ignore = "trigger: a change to LogicalLeafStore's layout, and then only in the same \
                 change as a new snapshot magic. Run with --ignored by hand."]
-    fn mint_frozen_v7_store_fixture() {
-        let bytes = bincode::serialize(&sample_store()).expect("serialize v7 store");
+    fn mint_frozen_v8_store_fixture() {
+        let bytes = bincode::serialize(&sample_store()).expect("serialize v8 store");
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/logical_store_v7.bin");
+            .join("tests/fixtures/logical_store_v8.bin");
         std::fs::write(&path, &bytes).expect("write fixture");
     }
 
     // Changing `LogicalLeafStore`'s layout without a magic reddens HERE, at desk speed,
     // instead of at boot on a data_dir nobody can re-read.
     #[test]
-    fn the_live_store_still_reads_the_shipped_v7_layout() {
+    fn the_live_store_still_reads_the_shipped_v8_layout() {
         let store: LogicalLeafStore =
-            super::decode_snapshot_body(FROZEN_V7_STORE).unwrap_or_else(|e| {
+            super::decode_snapshot_body(FROZEN_V8_STORE).unwrap_or_else(|e| {
                 panic!(
-                "LogicalLeafStore no longer reads the V7 bytes it ships with ({e}). bincode is \
-                 positional: a field added or moved breaks every deployed data_dir. Add a new \
-                 SNAPSHOT_V8_MAGIC, decide whether a V7 body is then refused or read through a \
-                 frozen V7 shape, and re-mint this fixture in the SAME change."
+                "LogicalLeafStore no longer reads the V8 bytes it ships with ({e}). bincode is \
+                 positional: a field added or moved breaks every existing data_dir. Add a new \
+                 SNAPSHOT_V9_MAGIC, refuse a V8 body by name, and re-mint this fixture in the \
+                 SAME change."
                 )
             });
         assert_eq!(store.leaf(0, 0), Some(&[7u8; 32]));
@@ -907,9 +944,19 @@ mod frozen_v7_shape_tests {
         assert_eq!(store.ppoi_list_leaf_block_height_len(), 2);
         let meta = store
             .ppoi_event_metadata(&LIST_KEY, 0)
-            .expect("V7 retains upstream metadata; that is what V7 is for");
+            .expect("V8 retains each row's upstream metadata");
         assert_eq!(meta.validated_merkleroot, [0x11; 32]);
-        assert_eq!(meta.signature.len(), 64);
+        assert_eq!(meta.event_type, PpoiEventType::Shield);
+    }
+
+    #[test]
+    fn a_v7_store_does_not_read_as_the_v8_layout() {
+        let decoded = super::decode_snapshot_body::<LogicalLeafStore>(FROZEN_V7_STORE);
+        assert!(
+            decoded.is_err(),
+            "the V7 store decodes under the V8 layout, so the epochs are not distinct layouts \
+             and the V7 refusal would be refusing a readable body"
+        );
     }
 }
 
@@ -917,8 +964,8 @@ mod frozen_v7_shape_tests {
 mod snapshot_v6_tests {
     use super::{
         restore_inspire_state, restore_inspire_state_v6, setup_state, snapshot_inspire_state,
-        snapshot_inspire_state_v7, InspireVariant, LogicalLeafStore, SNAPSHOT_V6_MAGIC,
-        SNAPSHOT_V7_MAGIC,
+        snapshot_inspire_state_v8, InspireVariant, LogicalLeafStore, SNAPSHOT_V6_MAGIC,
+        SNAPSHOT_V7_MAGIC, SNAPSHOT_V8_MAGIC,
     };
     use raven_inspire::params::InspireParams;
 
@@ -933,13 +980,14 @@ mod snapshot_v6_tests {
     }
 
     #[test]
-    fn v7_snapshot_carries_distinct_magic_prefix() {
+    fn v8_snapshot_carries_distinct_magic_prefix() {
         let (state, _) = toy_state_and_db();
         let store = LogicalLeafStore::new();
-        let bytes = snapshot_inspire_state_v7(&state, &store).expect("v7 serialize");
-        assert!(bytes.starts_with(&SNAPSHOT_V7_MAGIC));
+        let bytes = snapshot_inspire_state_v8(&state, &store).expect("v8 serialize");
+        assert!(bytes.starts_with(&SNAPSHOT_V8_MAGIC));
+        assert!(!bytes.starts_with(&SNAPSHOT_V7_MAGIC));
         assert!(!bytes.starts_with(&SNAPSHOT_V6_MAGIC));
-        restore_inspire_state_v6(&bytes).expect("v7 restore through current reader");
+        restore_inspire_state_v6(&bytes).expect("v8 restore through current reader");
     }
 
     #[test]
@@ -967,14 +1015,43 @@ mod snapshot_v6_tests {
     }
 
     #[test]
-    fn v7_round_trip_restores_state_and_empty_store() {
+    fn v8_round_trip_restores_state_and_empty_store() {
         let (state, _) = toy_state_and_db();
         let store = LogicalLeafStore::new();
-        let bytes = snapshot_inspire_state_v7(&state, &store).expect("v7 serialize");
-        let (restored, store_back) = restore_inspire_state_v6(&bytes).expect("v7 restore");
+        let bytes = snapshot_inspire_state_v8(&state, &store).expect("v8 serialize");
+        let (restored, store_back) = restore_inspire_state_v6(&bytes).expect("v8 restore");
         assert_eq!(restored.entry_size, state.entry_size);
-        assert_eq!(store_back.ppoi_count(), 0);
+        assert_eq!(store_back.ppoi_list_count(), 0);
         assert_eq!(store_back.leaf_count(), 0);
+    }
+
+    /// A snapshot's parameters are data read off disk, so the boot path holds them to what setup
+    /// accepts. Here `q` no longer equals its CRT moduli's product.
+    #[test]
+    fn a_snapshot_whose_parameters_setup_would_refuse_is_refused_on_both_paths() {
+        let (state, _) = toy_state_and_db();
+        let mut crs = (*state.crs).clone();
+        crs.params.q = crs.params.q.wrapping_add(2);
+        let tampered = super::InspireServerState {
+            crs: std::sync::Arc::new(crs),
+            ..state
+        };
+        let bytes =
+            snapshot_inspire_state_v8(&tampered, &LogicalLeafStore::new()).expect("v8 serialize");
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (path, outcome) in [
+            ("uncached", restore_inspire_state_v6(&bytes).map(|_| ())),
+            (
+                "boot",
+                super::restore_inspire_state_v6_cached(&bytes, dir.path()).map(|_| ()),
+            ),
+        ] {
+            let error = outcome.expect_err("tampered parameters must not restore");
+            assert!(
+                error.to_string().contains("snapshot parameters"),
+                "{path}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -987,7 +1064,7 @@ mod snapshot_v6_tests {
         );
         let (restored, store_back) = restore_inspire_state_v6(&v5_bytes).expect("v5 via v6");
         assert_eq!(restored.entry_size, state.entry_size);
-        assert_eq!(store_back.ppoi_count(), 0);
+        assert_eq!(store_back.ppoi_list_count(), 0);
         let _ = restore_inspire_state(&v5_bytes).expect("v5 directly via legacy path");
     }
 }
@@ -1066,37 +1143,6 @@ mod logical_store_tests {
     }
 
     #[test]
-    fn ppoi_status_round_trips() {
-        let mut s = LogicalLeafStore::new();
-        let lk = [1u8; 32];
-        let bc = [2u8; 32];
-        apply_wal_entry(&mut s, &list_leaf(lk, 0, bc), 100, &enc()).expect("apply leaf");
-        let payload = WalEntryPayload::PpoiStatus {
-            list_key: lk,
-            blinded_commitment: bc,
-            status: 3,
-        };
-        apply_wal_entry(&mut s, &payload, 200, &enc()).expect("apply");
-        assert_eq!(s.ppoi_count(), 1);
-        assert_eq!(s.ppoi_status(&lk, &bc), Some(3));
-    }
-
-    #[test]
-    fn a_status_for_a_commitment_this_store_does_not_index_is_not_filed() {
-        let mut s = LogicalLeafStore::new();
-        let lk = [1u8; 32];
-        let payload = WalEntryPayload::PpoiStatus {
-            list_key: lk,
-            blinded_commitment: [2u8; 32],
-            status: 3,
-        };
-        apply_wal_entry(&mut s, &payload, 200, &enc()).expect("apply");
-        assert_eq!(s.ppoi_count(), 0);
-        assert_eq!(s.ppoi_status(&lk, &[2u8; 32]), None);
-        assert_eq!(s.last_block_height(), 200, "the payload was still applied");
-    }
-
-    #[test]
     fn reorg_truncates_leaves_and_ppoi_past_height() {
         let mut s = LogicalLeafStore::new();
         for i in 0..5u32 {
@@ -1108,19 +1154,17 @@ mod logical_store_tests {
             bc[0] = i;
             let leaf = list_leaf([0u8; 32], u32::from(i), bc);
             apply_wal_entry(&mut s, &leaf, 200 + u64::from(i), &enc()).expect("apply leaf");
-            let payload = WalEntryPayload::PpoiStatus {
-                list_key: [0u8; 32],
-                blinded_commitment: bc,
-                status: 0,
-            };
-            apply_wal_entry(&mut s, &payload, 200 + u64::from(i), &enc()).expect("apply");
         }
         assert_eq!(s.leaf_count(), 5);
-        assert_eq!(s.ppoi_count(), 3);
+        assert_eq!(s.ppoi_list_leaves_iter(&[0u8; 32]).count(), 3);
         let reorg = WalEntryPayload::Reorg { height: 102 };
         apply_wal_entry(&mut s, &reorg, 102, &enc()).expect("apply reorg");
         assert_eq!(s.leaf_count(), 3, "leaves at 100, 101, 102 survive");
-        assert_eq!(s.ppoi_count(), 0, "all PPOI past 102 dropped");
+        assert_eq!(
+            s.ppoi_list_leaves_iter(&[0u8; 32]).count(),
+            0,
+            "all PPOI past 102 dropped"
+        );
         assert!(s.leaf(0, 0).is_some());
         assert!(s.leaf(0, 1).is_some());
         assert!(s.leaf(0, 2).is_some());
@@ -1137,7 +1181,7 @@ mod logical_store_tests {
         };
         apply_wal_entry(&mut s, &hb, 500, &enc()).expect("apply");
         assert_eq!(s.leaf_count(), 0);
-        assert_eq!(s.ppoi_count(), 0);
+        assert_eq!(s.ppoi_list_count(), 0);
         assert_eq!(s.last_block_height(), 500);
     }
 

@@ -915,16 +915,10 @@ fn first_match_index(leaves: &[[u8; 32]], target_root: &[u8; 32]) -> Result<usiz
 /// Cell shape (rows x record bytes) an encoder kind expects.
 fn cell_shape_for_encoder(kind: EncoderKind) -> (u32, usize) {
     match kind {
-        EncoderKind::PerLeafBc { .. } | EncoderKind::PerListStatus { .. } => {
-            (LEAVES_PER_TREE, NODE_HASH_BYTES)
-        }
-        EncoderKind::PerLeafPath { .. } | EncoderKind::PerListPath { .. } => {
-            (LEAVES_PER_TREE, PATH_RECORD_BYTES)
-        }
+        EncoderKind::PerLeafBc { .. } => (LEAVES_PER_TREE, NODE_HASH_BYTES),
+        EncoderKind::PerLeafPath { .. } => (LEAVES_PER_TREE, PATH_RECORD_BYTES),
         EncoderKind::PerListPath10 { .. } => (LEAVES_PER_TREE, PATH10_RECORD_BYTES),
-        EncoderKind::PerNode { .. } | EncoderKind::PerListNode { .. } => {
-            (PER_NODE_TOTAL_NODES, NODE_HASH_BYTES)
-        }
+        EncoderKind::PerNode { .. } => (PER_NODE_TOTAL_NODES, NODE_HASH_BYTES),
     }
 }
 

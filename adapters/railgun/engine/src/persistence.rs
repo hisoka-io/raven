@@ -326,7 +326,7 @@ impl InspirePersistence {
         })?;
         if let Some(recovery) = recovered {
             let mut manifest = recovery.manifest;
-            // SnapshotId(0) means no commit yet. V6 seeds the replay base with its
+            // SnapshotId(0) means no commit yet. V8 seeds the replay base with its
             // embedded store; V5 starts empty and relies wholly on WAL replay.
             let (
                 recovered_state,
@@ -558,9 +558,9 @@ impl InspirePersistence {
 
     /// Snapshot `(state, store)`, archive WAL, bump manifest atomically.
     ///
-    /// Writes **V7**; the name is kept because callers and tests reference it, and the snapshot
+    /// Writes **V8**; the name is kept because callers and tests reference it, and the snapshot
     /// version is chosen by the writer it calls, not by this name. Two version ladders share the
-    /// numerals 5/6/7 here — the manifest's and the snapshot magic's — so a stale numeral in a
+    /// numerals 5 to 8 here — the manifest's and the snapshot magic's — so a stale numeral in a
     /// doc or an error string costs an operator more than it would elsewhere.
     ///
     /// **Contract: `store` MUST be the logical store `state.encoded_db` was encoded from.**
@@ -578,7 +578,7 @@ impl InspirePersistence {
         current_block_height: u64,
     ) -> Result<SnapshotId> {
         self.validate_commit_shape(state)?;
-        let bundle = super::inspire::snapshot_inspire_state_v7(state, store)?;
+        let bundle = super::inspire::snapshot_inspire_state_v8(state, store)?;
         let id = self.commit_serialized_bundle(bundle, current_block_height)?;
         if let Err(error) = self.persist_cache_if_changed(state) {
             tracing::warn!(error = %error, "offline packing cache store failed after commit");
@@ -1715,7 +1715,7 @@ fn filled_its_tree(
     let imt = match payload {
         P::AppendLeaf { tree_number, .. } => store.imt(*tree_number),
         P::PpoiListLeafAdded { list_key, .. } => store.ppoi_imt(list_key),
-        P::PpoiStatus { .. } | P::Reorg { .. } | P::Heartbeat { .. } => None,
+        P::Reorg { .. } | P::Heartbeat { .. } => None,
     };
     imt.is_some_and(|imt| imt.leaf_count() == super::imt::TREE_MAX_ITEMS)
 }
@@ -2361,41 +2361,6 @@ mod tests {
         );
     }
 
-    /// The arm is not homogeneous, and the classification is per PAYLOAD. A status row writes a
-    /// status byte and dirties shards; it never reaches `checked_imt_append`, so it cannot close
-    /// the contiguity gap the error run stands for and must not report the stall resolved.
-    ///
-    /// Companion to `a_ppoi_list_leaf_clears_the_error_run_because_it_grows_a_tree`, which asserts
-    /// the opposite direction on the same arm. Either alone would pass a wholesale conversion.
-    #[tokio::test]
-    async fn a_ppoi_status_row_must_not_clear_a_stall_because_it_appends_to_no_tree() {
-        const STALL: u64 = 6;
-        const HEIGHT: u64 = 5_000;
-        let m = drive_consumer(
-            vec![ConsumerEvent::Ppoi(
-                raven_railgun_persistence::WalEntryPayload::PpoiStatus {
-                    list_key: [1u8; 32],
-                    blinded_commitment: [2u8; 32],
-                    status: 3,
-                },
-                HEIGHT,
-            )],
-            STALL,
-            1_000,
-            "ppoi-status-routing",
-        )
-        .await;
-
-        assert_eq!(
-            m.consecutive_event_errors, STALL,
-            "a status byte appends to no tree, so it must not report the stall resolved"
-        );
-        assert_eq!(
-            m.last_applied_block, HEIGHT,
-            "the chain cursor still advances: the row WAS applied"
-        );
-    }
-
     /// The partition must not drift from the one `validate_apply` screens: every variant that
     /// reaches `checked_imt_append` is exactly a variant that may clear the error run.
     #[test]
@@ -2418,11 +2383,6 @@ mod tests {
             },
         ];
         let inert = [
-            P::PpoiStatus {
-                list_key: [1u8; 32],
-                blinded_commitment: [2u8; 32],
-                status: 0,
-            },
             P::Reorg { height: 1 },
             P::Heartbeat {
                 wallclock_unix_ms: 0,
@@ -2430,7 +2390,7 @@ mod tests {
         ];
         assert_eq!(
             appends.len() + inert.len(),
-            5,
+            4,
             "every payload variant must be classified; a new one defaults to nothing"
         );
         for p in &appends {

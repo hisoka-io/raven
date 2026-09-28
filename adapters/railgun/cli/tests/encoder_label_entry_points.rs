@@ -32,9 +32,7 @@ fn every_encoder_kind() -> Vec<EncoderKind> {
         EncoderKind::PerNode {
             tree_number: TREE_NUMBER,
         },
-        EncoderKind::PerListPath { list_key },
         EncoderKind::PerListPath10 { list_key },
-        EncoderKind::PerListNode { list_key },
     ];
     // No wildcard: a new variant must fail to compile here until it joins the list above.
     for kind in &kinds {
@@ -42,12 +40,7 @@ fn every_encoder_kind() -> Vec<EncoderKind> {
             EncoderKind::PerLeafBc { .. }
             | EncoderKind::PerLeafPath { .. }
             | EncoderKind::PerNode { .. }
-            | EncoderKind::PerListPath { .. }
-            | EncoderKind::PerListPath10 { .. }
-            | EncoderKind::PerListNode { .. } => {}
-            EncoderKind::PerListStatus { .. } => {
-                panic!("no entry point names the status encoder; the config refuses it")
-            }
+            | EncoderKind::PerListPath10 { .. } => {}
         }
     }
     kinds

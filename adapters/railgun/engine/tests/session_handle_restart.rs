@@ -316,7 +316,8 @@ async fn production_multi_boot_opens_each_data_dir_allocator() {
     let data_dir = dir.path().join("instance");
     std::fs::create_dir_all(&data_dir).expect("create instance dir");
     drop(BoundedSessionStore::open(&data_dir).expect("prime multi durable floor"));
-    let mut config = InstanceConfig::ppoi_list("durable-multi", data_dir.clone(), [0x55; 32]);
+    let mut config =
+        InstanceConfig::commit_tree("durable-multi", data_dir.clone(), 0, InstanceRole::Live);
     config.use_flock = false;
     let params = InspireParams::secure_128_d2048();
     let database = vec![0u8; params.ring_dim * 512];
@@ -356,7 +357,7 @@ async fn production_multi_boot_opens_each_data_dir_allocator() {
     assert!(data_dir.join("manifest.json").exists());
     std::fs::remove_file(data_dir.join(FLOOR_FILE)).expect("remove multi-instance floor");
     let mut restart_config =
-        InstanceConfig::ppoi_list("durable-multi", data_dir.clone(), [0x55; 32]);
+        InstanceConfig::commit_tree("durable-multi", data_dir.clone(), 0, InstanceRole::Live);
     restart_config.use_flock = false;
     let error = bootstrap_railgun_engine_multi(vec![restart_config], params, |_| {
         raven_railgun_testkit::try_toy_state(512)

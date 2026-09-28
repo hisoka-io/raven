@@ -15,7 +15,7 @@ use std::time::Instant;
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_engine::inspire::{self, apply_wal_entry, LogicalLeafStore};
 use raven_railgun_engine::orchestrator::LEAVES_PER_PPOI_BLOCK;
-use raven_railgun_engine::pir_table::PerLeafCommitmentEncoder;
+use raven_railgun_engine::pir_table::{PerListPath10Encoder, PirTableEncoder};
 use raven_railgun_persistence::{PpoiEventType, WalEntryPayload};
 
 const CELLS: &[(u32, usize, &str)] = &[
@@ -128,7 +128,7 @@ fn ppoi_block_rows() -> Vec<(WalEntryPayload, u64)> {
                 list_key: [0x42; 32],
                 list_index,
                 blinded_commitment: bc,
-                status: u8::from(list_index.is_multiple_of(3)),
+                status: 0,
                 event_type: PpoiEventType::Shield,
                 signature: vec![0; 64],
                 validated_merkleroot: [0; 32],
@@ -142,7 +142,8 @@ fn ppoi_block_rows() -> Vec<(WalEntryPayload, u64)> {
 #[ignore = "seeds one 65,536-row PPOI block batched and row by row; about 30-60 s. Trigger: \
             changing Imt::insert_leaves, LogicalLeafStore::seed_leaf_run or merkle_node."]
 fn ppoi_block_seed_batched_vs_per_row() {
-    let encoder = PerLeafCommitmentEncoder::new(32, LEAVES_PER_PPOI_BLOCK, 0).expect("encoder");
+    // Four rows a shard, so every row dirties shards of its own and a dirty-set divergence shows.
+    let encoder = PerListPath10Encoder::new(4, [0x42; 32]).expect("encoder");
     let rows = ppoi_block_rows();
 
     let mut seeded = LogicalLeafStore::new();
@@ -163,6 +164,15 @@ fn ppoi_block_seed_batched_vs_per_row() {
         seeded.ppoi_imt_root(&[0x42; 32]),
         applied.ppoi_imt_root(&[0x42; 32]),
         "the batched seed must reach the row-by-row root"
+    );
+    assert_eq!(
+        seeded.dirty_shards(),
+        applied.dirty_shards(),
+        "the batched seed must dirty the shards row-by-row apply dirties"
+    );
+    assert_eq!(
+        seeded.dirty_shards().len(),
+        (LEAVES_PER_PPOI_BLOCK / encoder.entries_per_shard()) as usize
     );
     eprintln!(
         "INSERT_BENCH: ppoi_block rows={rows} seed_leaf_run_s={seed_s:.3} per_row_apply_s={apply_s:.3} \

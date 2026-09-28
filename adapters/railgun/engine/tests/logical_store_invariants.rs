@@ -120,7 +120,6 @@ fn ppoi_list_leaf_added_advances_per_list_imt() {
         store.ppoi_event_metadata(&LIST_KEY, 1),
         Some(&raven_railgun_persistence::PpoiEventMetadata {
             event_type: raven_railgun_persistence::PpoiEventType::Transact,
-            signature: vec![1; 64],
             validated_merkleroot: [1; 32],
         })
     );
@@ -178,46 +177,6 @@ fn ppoi_path10_row_matches_the_logical_store_and_independent_proof() {
         encoder.affected_shards_for_ppoi_leaf(&LIST_KEY, 2048),
         std::collections::BTreeSet::from([1])
     );
-}
-
-#[test]
-fn ppoi_status_in_place_update_does_not_affect_imt_root() {
-    let mut store = LogicalLeafStore::new();
-    let e = enc();
-    let bc = fr_canonical(0x11);
-    apply_wal_entry(
-        &mut store,
-        &WalEntryPayload::PpoiListLeafAdded {
-            list_key: LIST_KEY,
-            list_index: 0,
-            blinded_commitment: bc,
-            status: 0,
-            event_type: raven_railgun_persistence::PpoiEventType::Shield,
-            signature: vec![0; 64],
-            validated_merkleroot: [0; 32],
-        },
-        200,
-        &e,
-    )
-    .expect("apply add");
-    let root_before = store.ppoi_imt_root(&LIST_KEY).expect("root");
-    apply_wal_entry(
-        &mut store,
-        &WalEntryPayload::PpoiStatus {
-            list_key: LIST_KEY,
-            blinded_commitment: bc,
-            status: 1,
-        },
-        201,
-        &e,
-    )
-    .expect("apply status update");
-    let root_after = store.ppoi_imt_root(&LIST_KEY).expect("root");
-    assert_eq!(
-        root_before, root_after,
-        "status update MUST NOT change per-list IMT root (root is over BCs, not status)"
-    );
-    assert_eq!(store.ppoi_status_at(&LIST_KEY, 0), Some(1));
 }
 
 #[test]

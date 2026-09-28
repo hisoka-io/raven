@@ -24,7 +24,7 @@ use raven_railgun_persistence::{StoreLayout, Wal, WalEntryPayload};
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-ppoi-upstream-root";
 const INSTANCE_ID: &str = "ppoi-upstream-root";
-const TOY_ENTRY_SIZE: usize = 256;
+const TOY_ENTRY_SIZE: usize = 512;
 const ENTRIES_PER_SHARD: u32 = 2048;
 const LIST_KEY: [u8; 32] = [0xab; 32];
 
@@ -167,7 +167,7 @@ async fn a_row_whose_root_is_not_its_own_post_append_root_never_reaches_the_wal(
     config.use_flock = false;
     config.role = InstanceRole::Live;
     config.scheme_tag = SCHEME_TAG.to_owned();
-    config.encoder = EncoderKind::PerListStatus { list_key: LIST_KEY };
+    config.encoder = EncoderKind::PerListPath10 { list_key: LIST_KEY };
     // A snapshot would archive the log this test reads back.
     config.snapshot_policy = SnapshotPolicy::default();
     config.verification_mode = VerificationMode::UpstreamAsserted;

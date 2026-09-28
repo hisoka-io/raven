@@ -110,7 +110,10 @@ fn build_six_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
             "ppoi-list-a",
             "ppoi-a",
             raven_railgun_engine::pir_table::EncoderKind::PerLeafBc { tree_number: 0 },
-            DataSourceFilter::PpoiList(lk_a),
+            DataSourceFilter::PpoiListBlock {
+                list_key: lk_a,
+                block: 0,
+            },
             VerificationMode::UpstreamAsserted,
             InstanceRole::Live,
         ),
@@ -118,7 +121,10 @@ fn build_six_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
             "ppoi-list-b",
             "ppoi-b",
             raven_railgun_engine::pir_table::EncoderKind::PerLeafBc { tree_number: 0 },
-            DataSourceFilter::PpoiList(lk_b),
+            DataSourceFilter::PpoiListBlock {
+                list_key: lk_b,
+                block: 0,
+            },
             VerificationMode::UpstreamAsserted,
             InstanceRole::Live,
         ),
@@ -240,37 +246,34 @@ async fn multi_instance_bootstrap_routes_events_per_instance() {
                     "tree-{t} instance must NOT see tree-2 leaf"
                 );
             }
-            DataSourceFilter::PpoiList(_) => {
+            DataSourceFilter::PpoiListBlock { .. } => {
                 assert!(
                     store.leaves_iter().next().is_none(),
                     "PPOI instance must NOT see chain leaves"
                 );
             }
-            DataSourceFilter::PpoiListBlock { .. } => unreachable!("fixture has no block route"),
         }
     }
 
     for h in &mh.instances {
         let store = h.logical_store.lock();
         match h.config.data_source {
-            DataSourceFilter::PpoiList(k) if k == lk_a => {
+            DataSourceFilter::PpoiListBlock { list_key: k, .. } if k == lk_a => {
                 assert_eq!(
                     store.ppoi_bc_at(&lk_a, 0),
                     Some(planted_bc_a),
                     "ppoi-list-a instance should have the planted PPOI leaf"
                 );
             }
-            DataSourceFilter::PpoiList(k) if k == lk_b => {
+            DataSourceFilter::PpoiListBlock { list_key: k, .. } if k == lk_b => {
                 assert!(
                     store.ppoi_bc_at(&lk_b, 0).is_none(),
                     "ppoi-list-b instance must NOT see list-a leaf"
                 );
             }
-            DataSourceFilter::PpoiList(_)
-            | DataSourceFilter::PpoiListBlock { .. }
-            | DataSourceFilter::ChainTreeNumber(_) => {
+            DataSourceFilter::PpoiListBlock { .. } | DataSourceFilter::ChainTreeNumber(_) => {
                 assert_eq!(
-                    store.ppoi_count(),
+                    store.ppoi_list_count(),
                     0,
                     "non-list-a instance must have empty PPOI store"
                 );
@@ -373,11 +376,10 @@ async fn multi_instance_recovery_byte_identity() {
                 chain_roots_pre.push((t, store.imt_root(t)));
                 chain_counts_pre.push((t, store.imt_leaf_count_for(t)));
             }
-            DataSourceFilter::PpoiList(lk) => {
+            DataSourceFilter::PpoiListBlock { list_key: lk, .. } => {
                 ppoi_roots_pre.push((lk, store.ppoi_imt_root(&lk)));
                 ppoi_counts_pre.push((lk, store.ppoi_list_leaves_iter(&lk).count()));
             }
-            DataSourceFilter::PpoiListBlock { .. } => unreachable!("fixture has no block route"),
         }
     }
 
@@ -438,7 +440,7 @@ async fn multi_instance_recovery_byte_identity() {
                     );
                 }
             }
-            DataSourceFilter::PpoiList(lk) => {
+            DataSourceFilter::PpoiListBlock { list_key: lk, .. } => {
                 let pre_root = ppoi_roots_pre
                     .iter()
                     .find(|(k, _)| *k == lk)
@@ -468,7 +470,6 @@ async fn multi_instance_recovery_byte_identity() {
                     );
                 }
             }
-            DataSourceFilter::PpoiListBlock { .. } => unreachable!("fixture has no block route"),
         }
     }
 
@@ -497,7 +498,6 @@ fn split_handle(
         chain_tree_routes: _,
         ppoi_list_routes: _,
         tree_observed: _,
-        list_observed: _,
     } = mh;
     MultiOrchestratorHandleParts {
         instances,
