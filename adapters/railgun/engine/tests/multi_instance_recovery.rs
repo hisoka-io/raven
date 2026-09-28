@@ -125,8 +125,32 @@ fn build_six_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
     ]
 }
 
-async fn drain_for_apply() {
-    tokio::time::sleep(Duration::from_millis(400)).await;
+/// Waits until every instance holds the rows sent to it. Each row is in the store only after its WAL
+/// append synced, so this is also the point where the rows are durable. A fixed sleep here raced the
+/// apply on loaded runners and captured a partial tree as the pre-restart state.
+async fn until_applied(
+    instances: &[PerInstanceHandles],
+    expected: impl Fn(&DataSourceFilter) -> usize,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let short = instances.iter().find(|h| {
+            let store = h.logical_store.lock();
+            let held = match h.config.data_source {
+                DataSourceFilter::ChainTreeNumber(t) => store.imt_leaf_count_for(t),
+                DataSourceFilter::PpoiList(lk) => store.ppoi_list_leaves_iter(&lk).count(),
+                DataSourceFilter::PpoiListBlock { .. } => 0,
+            };
+            held < expected(&h.config.data_source)
+        });
+        let Some(short) = short else { return };
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{:?} did not apply its rows within 60 s",
+            short.config.data_source
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 async fn shutdown_all(handles: Vec<PerInstanceHandles>, channels: OrchestratorChannels) {
@@ -193,7 +217,12 @@ async fn multi_instance_bootstrap_routes_events_per_instance() {
         .await
         .expect("send mirror event");
 
-    drain_for_apply().await;
+    until_applied(&mh.instances, |source| match source {
+        DataSourceFilter::ChainTreeNumber(2) => 1,
+        DataSourceFilter::PpoiList(lk) if *lk == lk_a => 1,
+        _ => 0,
+    })
+    .await;
 
     for h in &mh.instances {
         let store = h.logical_store.lock();
@@ -327,7 +356,11 @@ async fn multi_instance_recovery_byte_identity() {
         }
     }
 
-    drain_for_apply().await;
+    until_applied(&mh1.instances, |source| match source {
+        DataSourceFilter::ChainTreeNumber(_) | DataSourceFilter::PpoiList(_) => 3,
+        DataSourceFilter::PpoiListBlock { .. } => 0,
+    })
+    .await;
 
     let mut chain_roots_pre: Vec<(u32, Option<[u8; 32]>)> = Vec::new();
     let mut chain_counts_pre: Vec<(u32, usize)> = Vec::new();
@@ -358,7 +391,10 @@ async fn multi_instance_recovery_byte_identity() {
     drop(channels);
     for h in instances {
         h.consumer.abort();
-        let _ = tokio::time::timeout(Duration::from_secs(5), h.consumer).await;
+        // The restart must not open a data dir the old consumer is still writing.
+        let _cancelled = tokio::time::timeout(Duration::from_secs(60), h.consumer)
+            .await
+            .expect("an aborted consumer must exit before the restart");
     }
     router.abort();
 
@@ -368,8 +404,6 @@ async fn multi_instance_recovery_byte_identity() {
     };
     let mh2 =
         bootstrap_railgun_engine_multi(configs2, params.clone(), factory2).expect("bootstrap2");
-
-    drain_for_apply().await;
 
     for h in &mh2.instances {
         let store = h.logical_store.lock();
