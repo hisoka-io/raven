@@ -20,6 +20,7 @@ import {
   RavenError,
   RavenPOINodeInterface,
   UpstreamPinResolver,
+  fetchInstanceParams,
   foldMerkleRoot,
   loadClientPirContext,
   type BlindedCommitmentType,
@@ -28,8 +29,6 @@ import {
   type MerkleProof,
   type RavenInspireWasm,
 } from "../../src/index";
-import { bearerHeaders } from "../../src/bearer-auth";
-import { decodeInstanceParams } from "./live_wire";
 import { assertNoCommitmentsAnywhere } from "./private_wire";
 
 function normalize(hex: string): string {
@@ -346,13 +345,14 @@ async function loadContext(
   options: PpoiSmokeOptions,
   instanceId: string,
 ): Promise<{ context: ClientPirContext; summary: PpoiSmokeReport["params"][string] }> {
-  const res = await meter.fetch(
-    `${options.node}/v1/instance/${encodeURIComponent(instanceId)}/params`,
-    { headers: bearerHeaders(options.bearerToken), signal: AbortSignal.timeout(600_000) },
-  );
-  if (!res.ok) throw new Error(`params ${instanceId}: HTTP ${res.status}`);
-  const body = new Uint8Array(await res.arrayBuffer());
-  const params = decodeInstanceParams(body);
+  const params = await fetchInstanceParams({
+    endpoint: options.node,
+    instanceId,
+    bearerToken: options.bearerToken,
+    fetchImpl: meter.fetch,
+    requestTimeoutMs: 600_000,
+  });
+  const fetched = meter.log[meter.log.length - 1];
   const { context } = await loadClientPirContext({
     wasm: options.wasm,
     instanceId,
@@ -368,7 +368,7 @@ async function loadContext(
       entrySize: params.entrySize,
       variant: params.variant,
       epoch: params.epoch.toString(),
-      bytes: body.length,
+      bytes: fetched?.down ?? 0,
     },
   };
 }

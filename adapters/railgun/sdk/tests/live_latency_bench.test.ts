@@ -33,9 +33,9 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as wasmPkg from "raven-inspire-client-wasm";
 import { decodeClientPirQueryBundle } from "../src/client-pir";
+import { decodeInstanceParams } from "../src/instance-params";
 import {
   LIVE_URL,
-  decodeInstanceParams,
   liveHeaders,
   stripVersionedResponse,
   versionedQueryBody,

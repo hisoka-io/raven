@@ -9,6 +9,7 @@
  */
 
 import { bearerHeaders } from "../../src/bearer-auth";
+import type { InstanceParams } from "../../src/instance-params";
 import { EXPECTED_WIRE_SCHEMA_PREFIX, EXPECTED_WIRE_SCHEMA_VERSION } from "./wire_schema";
 
 function setting(name: string): string | undefined {
@@ -40,18 +41,6 @@ export function ppoiPathInstance(block: number): string {
 /** Headers for a hand-rolled request to the node: the credential when one is configured. */
 export function liveHeaders(): Record<string, string> {
   return bearerHeaders(LIVE_TOKEN);
-}
-
-/** `InstanceParams` from `GET /v1/instance/:id/params`, as the server serializes it. */
-export interface DecodedInstanceParams {
-  readonly envelope: number;
-  readonly wireSchemaVersion: number;
-  readonly crsBincode: Uint8Array;
-  readonly shardConfigBincode: Uint8Array;
-  readonly inspireParamsBincode: Uint8Array;
-  readonly entrySize: number;
-  readonly variant: string;
-  readonly epoch: bigint;
 }
 
 function readU64(view: DataView, offset: number, label: string): number {
@@ -88,58 +77,9 @@ function envelopeOf(buf: Uint8Array, label: string): number {
   return (buf[0] << 8) | buf[1];
 }
 
-/**
- * `[u16 BE envelope][u16 LE wire_schema_version][Vec crs][Vec shard_config][Vec inspire_params]
- * [u64 entry_size][String variant][u64 epoch]`. Both version fields are checked, the envelope
- * first, and a mismatch names the served version, which is the first thing to know about a node
- * that has not been redeployed.
- */
-export function decodeInstanceParams(buf: Uint8Array): DecodedInstanceParams {
-  const label = "instance params";
-  const envelope = envelopeOf(buf, label);
-  if (envelope !== EXPECTED_WIRE_SCHEMA_VERSION) {
-    throw new Error(
-      `${label}: envelope is wire schema ${envelope}, this client speaks ${EXPECTED_WIRE_SCHEMA_VERSION}`,
-    );
-  }
-  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  if (buf.length < 4) {
-    throw new Error(`${label}: ${buf.length} bytes is too short for the inner version`);
-  }
-  const wireSchemaVersion = view.getUint16(2, true);
-  if (wireSchemaVersion !== EXPECTED_WIRE_SCHEMA_VERSION) {
-    throw new Error(
-      `${label}: body declares wire schema ${wireSchemaVersion}, this client speaks ${EXPECTED_WIRE_SCHEMA_VERSION}`,
-    );
-  }
-  const crs = readBytes(buf, view, 4, `${label} crs`);
-  const shard = readBytes(buf, view, crs.next, `${label} shard config`);
-  const inspire = readBytes(buf, view, shard.next, `${label} inspire params`);
-  const entrySize = readU64(view, inspire.next, `${label} entry size`);
-  const variant = readBytes(buf, view, inspire.next + 8, `${label} variant`);
-  if (variant.next + 8 !== buf.length) {
-    throw new Error(
-      `${label}: epoch must end the body at ${variant.next + 8}, body is ${buf.length} bytes`,
-    );
-  }
-  const epoch =
-    (BigInt(view.getUint32(variant.next + 4, true)) << 32n) |
-    BigInt(view.getUint32(variant.next, true));
-  return {
-    envelope,
-    wireSchemaVersion,
-    crsBincode: crs.value,
-    shardConfigBincode: shard.value,
-    inspireParamsBincode: inspire.value,
-    entrySize,
-    variant: new TextDecoder().decode(variant.value),
-    epoch,
-  };
-}
-
 /** The test-side writer for a mock node. The server writes one version into both fields. */
 export function encodeInstanceParams(
-  params: Omit<DecodedInstanceParams, "envelope" | "wireSchemaVersion">,
+  params: Omit<InstanceParams, "envelope" | "wireSchemaVersion">,
   version: number = EXPECTED_WIRE_SCHEMA_VERSION,
   innerVersion: number = version,
 ): Uint8Array {

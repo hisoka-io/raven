@@ -56,6 +56,14 @@ export {
   loadClientPirContext,
 } from "./client-pir";
 
+// A PIR instance's public parameters, the input to loadClientPirContext.
+export {
+  decodeInstanceParams,
+  fetchInstanceParams,
+  type FetchInstanceParamsOptions,
+  type InstanceParams,
+} from "./instance-params";
+
 // Railgun POI validation.
 export {
   validateBcHex,

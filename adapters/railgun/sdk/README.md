@@ -115,6 +115,21 @@ const raven = new RavenPOINodeInterface({
 });
 ```
 
+The context comes from the node's public parameters for one path instance:
+
+```ts
+import { fetchInstanceParams, loadClientPirContext } from "@hisoka-io/railgun-poi-node-interface";
+import * as wasm from "raven-inspire-client-wasm";
+
+const params = await fetchInstanceParams({ endpoint, instanceId: "ppoi-paths-ofac-0" });
+const { context: pathContext } = await loadClientPirContext({ wasm, instanceId: "ppoi-paths-ofac-0", ...params });
+```
+
+`fetchInstanceParams` refuses a node on another wire schema as `StaleAdapter` naming the served
+version, a non-2xx answer as `ServerError`, and a malformed body as `DecodeError`;
+`decodeInstanceParams` reads a body fetched some other way. One context serves every block of a
+list only when the node set its blocks up together, in one fresh boot.
+
 A list is served on the interface's chain exactly when `clientPirContexts` holds a
 `t2Path:<chainId>:<listKey>` context for it. Every key names the chain: a key without it matches
 nothing.

@@ -1849,6 +1849,7 @@ export {
   bytesToHex,
   TREE_DEPTH,
   PATH_RECORD_BYTES,
+  WIRE_SCHEMA_VERSION,
 };
 export type {
   ClientPirContext,

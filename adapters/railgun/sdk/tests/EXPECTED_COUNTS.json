@@ -12,8 +12,8 @@
     "in-process node and aggregator, so neither is a skipped file.",
     "Anything else skipped is a regression, not a policy."
   ],
-  "testFiles": 50,
+  "testFiles": 51,
   "skippedFiles": 2,
-  "passed": 447,
+  "passed": 463,
   "skipped": 6
 }
