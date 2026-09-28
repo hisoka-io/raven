@@ -231,6 +231,34 @@ async fn params_handler_returns_304_on_matching_if_none_match() {
     assert!(body.is_empty(), "304 body must be empty");
 }
 
+/// A repeat 200 takes its ETag from the cached value, re-read as bytes: it must be the body's
+/// digest, not a mis-read of it.
+#[tokio::test]
+async fn a_repeat_200_carries_the_etag_its_body_hashes_to() {
+    let router = build_router(build_app_state());
+    let mut etags = Vec::new();
+    for _ in 0..2 {
+        let resp = router
+            .clone()
+            .oneshot(build_params_request(READ_TOKEN))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag = resp
+            .headers()
+            .get(header::ETAG)
+            .expect("etag")
+            .to_str()
+            .expect("ascii")
+            .to_owned();
+        let digest = Sha256::digest(body_bytes(resp).await);
+        assert_eq!(etag, format!("\"{}\"", hex_lower(digest.as_slice())));
+        etags.push(etag);
+    }
+    etags.dedup();
+    assert_eq!(etags.len(), 1, "both answers carry one ETag");
+}
+
 /// Positive: mismatched `If-None-Match` returns 200 with the full body
 /// (not 304). Pins the round-trip ETag-mismatch path.
 #[tokio::test]

@@ -13,9 +13,7 @@ use std::time::Duration;
 use raven_inspire::params::InspireParams;
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::InspireServerState;
-use raven_railgun_engine::orchestrator::{
-    bootstrap_railgun_engine, OrchestratorConfig, VerificationMode,
-};
+use raven_railgun_engine::orchestrator::{bootstrap_railgun_engine, OrchestratorConfig};
 use raven_railgun_engine::persistence::{ConsumerEvent, InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::EncoderKind;
 use raven_railgun_engine::InstanceRole;
@@ -49,9 +47,7 @@ fn list_leaf(list_index: u32, byte: u8) -> WalEntryPayload {
         list_key: LIST_KEY,
         list_index,
         blinded_commitment: blinded_commitment(byte),
-        status: 1,
         event_type: raven_railgun_persistence::PpoiEventType::Shield,
-        signature: vec![0; 64],
         validated_merkleroot: [0; 32],
     }
 }
@@ -103,7 +99,6 @@ async fn ppoi_non_contiguous_list_leaf_never_reaches_the_wal() {
     // Snapshotting would archive the log and float the replay floor above the
     // poisoned seq, hiding the very entry this test inspects.
     config.snapshot_policy = SnapshotPolicy::default();
-    config.verification_mode = VerificationMode::UpstreamAsserted;
     config.verification_cadence_n = 0;
     config.chain_source = None;
 

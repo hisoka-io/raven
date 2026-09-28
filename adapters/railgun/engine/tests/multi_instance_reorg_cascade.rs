@@ -20,7 +20,7 @@ use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
 use raven_railgun_engine::inspire::InspireServerState;
 use raven_railgun_engine::orchestrator::{
     bootstrap_railgun_engine_multi, DataSourceFilter, InstanceConfig, OrchestratorChannels,
-    PerInstanceHandles, VerificationMode,
+    PerInstanceHandles,
 };
 use raven_railgun_engine::persistence::ConsumerEvent;
 use raven_railgun_engine::InstanceRole;
@@ -52,7 +52,6 @@ fn build_three_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
               sub: &str,
               encoder: EncoderKind,
               ds: DataSourceFilter,
-              mode: VerificationMode,
               role: InstanceRole|
      -> InstanceConfig {
         InstanceConfig {
@@ -62,7 +61,6 @@ fn build_three_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
             encoder,
             record_size: TOY_ENTRY_SIZE,
             entries_per_shard: TOY_ENTRIES_PER_SHARD,
-            verification_mode: mode,
             data_source: ds,
             use_flock: false,
             snapshot_policy: raven_railgun_engine::persistence::SnapshotPolicy::default(),
@@ -80,7 +78,6 @@ fn build_three_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
             "tree-0",
             EncoderKind::PerLeafBc { tree_number: 0 },
             DataSourceFilter::ChainTreeNumber(0),
-            VerificationMode::ChainRootHistory,
             InstanceRole::Live,
         ),
         mk(
@@ -88,7 +85,6 @@ fn build_three_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
             "tree-1",
             EncoderKind::PerLeafBc { tree_number: 0 },
             DataSourceFilter::ChainTreeNumber(1),
-            VerificationMode::ChainRootHistory,
             InstanceRole::Live,
         ),
         mk(
@@ -99,7 +95,6 @@ fn build_three_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
                 list_key: lk_a,
                 block: 0,
             },
-            VerificationMode::UpstreamAsserted,
             InstanceRole::Live,
         ),
     ]
@@ -212,9 +207,7 @@ async fn reorg_cascade_truncates_chain_instances_only() {
                     list_key: lk_a,
                     list_index: i,
                     blinded_commitment: bc,
-                    status: 0,
                     event_type: raven_railgun_persistence::PpoiEventType::Shield,
-                    signature: vec![0; 64],
                     validated_merkleroot: [0; 32],
                 },
                 0,

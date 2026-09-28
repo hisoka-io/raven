@@ -11,7 +11,7 @@ use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
 use raven_railgun_engine::inspire::InspireServerState;
 use raven_railgun_engine::orchestrator::{
-    bootstrap_railgun_engine, OrchestratorConfig, OrchestratorHandle, VerificationMode,
+    bootstrap_railgun_engine, OrchestratorConfig, OrchestratorHandle,
 };
 use raven_railgun_engine::persistence::{ConsumerEvent, ConsumerMetrics, SnapshotPolicy};
 use raven_railgun_engine::InstanceRole;
@@ -70,7 +70,6 @@ fn quiet_config(dir: &std::path::Path, instance_id: &str) -> OrchestratorConfig 
         max_appends_per_snapshot: 1,
         ..SnapshotPolicy::default()
     };
-    config.verification_mode = VerificationMode::UpstreamAsserted;
     config.verification_cadence_n = 0;
     config.chain_source = None;
     config

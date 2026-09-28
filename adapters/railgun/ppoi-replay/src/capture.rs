@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::{ReplayError, Result};
+use raven_railgun_core::hex::decode_hex;
 
 /// `events.bin` magic.
 pub const EVENTS_BIN_MAGIC: [u8; 8] = *b"RVNPPOI1";
@@ -442,20 +443,6 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
         })
 }
 
-/// Either case, optional `0x`: upstream serves both prefixed and bare commitments.
-pub(crate) fn decode_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
-    let digits = s.strip_prefix("0x").unwrap_or(s).as_bytes();
-    if digits.len() != N * 2 {
-        return None;
-    }
-    let mut out = [0u8; N];
-    for (byte, pair) in out.iter_mut().zip(digits.as_chunks::<2>().0) {
-        let text = std::str::from_utf8(pair).ok()?;
-        *byte = u8::from_str_radix(text, 16).ok()?;
-    }
-    Some(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,7 +520,16 @@ mod tests {
 
         let mut beyond = BTreeMap::new();
         beyond.insert(3, bare(&rows[2]));
-        assert!(Capture::new([0; 32], rows, beyond).is_err());
+        assert!(Capture::new([0; 32], rows.clone(), beyond).is_err());
+
+        let mut signed_digit = BTreeMap::new();
+        let mut plus = bare(&rows[2]);
+        plus.blinded_commitment = format!("+{}", &plus.blinded_commitment[1..]);
+        signed_digit.insert(2, plus);
+        let error = Capture::new([0; 32], rows, signed_digit)
+            .expect_err("a signed digit pair is not hex")
+            .to_string();
+        assert!(error.contains("index 2: blindedCommitment"), "{error}");
     }
 
     #[test]

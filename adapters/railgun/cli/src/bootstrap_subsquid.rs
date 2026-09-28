@@ -160,18 +160,11 @@ pub fn decode_bigint_to_be_bytes32(s: &str) -> Result<[u8; 32], String> {
         return Err("empty bigint".to_owned());
     }
     let big = if let Some(hex) = trimmed.strip_prefix("0x") {
-        if hex.len() > 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        if hex.len() > 64 {
             return Err(format!("hex shape rejected: {trimmed}"));
         }
-        let padded = format!("{hex:0>64}");
-        let mut out = [0u8; 32];
-        for (i, slot) in out.iter_mut().enumerate() {
-            let pair = padded
-                .get(i * 2..i * 2 + 2)
-                .ok_or_else(|| format!("hex range: {trimmed}"))?;
-            *slot = u8::from_str_radix(pair, 16).map_err(|e| format!("hex parse: {e}"))?;
-        }
-        out
+        raven_railgun_core::hex::decode_hex(&format!("{hex:0>64}"))
+            .ok_or_else(|| format!("hex shape rejected: {trimmed}"))?
     } else {
         if !trimmed.chars().all(|c| c.is_ascii_digit()) {
             return Err(format!("non-decimal: {trimmed}"));
@@ -1464,6 +1457,15 @@ mod unit_tests {
     #[test]
     fn decimal_with_letters_rejected() {
         assert!(decode_bigint_to_be_bytes32("12abc").is_err());
+    }
+
+    #[test]
+    fn short_hex_pads_on_the_left_and_a_non_digit_is_rejected() {
+        let low: [u8; 32] = std::array::from_fn(|at| if at == 31 { 0x1f } else { 0 });
+        assert_eq!(decode_bigint_to_be_bytes32("0x1F"), Ok(low));
+        for text in ["0x+a", "0x0x1f", &format!("0x{}", "0".repeat(65))] {
+            assert!(decode_bigint_to_be_bytes32(text).is_err(), "{text}");
+        }
     }
 
     #[test]

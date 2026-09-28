@@ -106,9 +106,7 @@ fn ppoi_leaf(index: u32) -> WalEntryPayload {
         list_key: LIST_KEY,
         list_index: index,
         blinded_commitment: bc_for(index),
-        status: 0,
         event_type: raven_railgun_persistence::PpoiEventType::Shield,
-        signature: vec![0; 64],
         validated_merkleroot: [0; 32],
     }
 }

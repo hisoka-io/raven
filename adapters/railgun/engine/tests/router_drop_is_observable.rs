@@ -18,7 +18,7 @@ use raven_railgun_core::{CommitmentLeaf, InstanceId, RailgunEvent};
 use raven_railgun_engine::inspire::InspireServerState;
 use raven_railgun_engine::orchestrator::{
     bootstrap_railgun_engine_multi, clear_router_unrouted_target, mark_router_unrouted_target,
-    router_unrouted_targets, DataSourceFilter, InstanceConfig, VerificationMode,
+    router_unrouted_targets, DataSourceFilter, InstanceConfig,
 };
 use raven_railgun_engine::persistence::{ConsumerEvent, SnapshotPolicy};
 use raven_railgun_engine::pir_table::EncoderKind;
@@ -104,7 +104,6 @@ fn cfg(root: &std::path::Path) -> InstanceConfig {
         },
         record_size: TOY_ENTRY_SIZE,
         entries_per_shard: TOY_ENTRIES_PER_SHARD,
-        verification_mode: VerificationMode::UpstreamAsserted,
         data_source: DataSourceFilter::ChainTreeNumber(ROUTED_TREE),
         use_flock: false,
         snapshot_policy: SnapshotPolicy::default(),

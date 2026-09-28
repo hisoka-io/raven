@@ -14,9 +14,7 @@ use std::time::Duration;
 use raven_inspire::params::InspireParams;
 use raven_railgun_engine::imt::Imt;
 use raven_railgun_engine::inspire::InspireServerState;
-use raven_railgun_engine::orchestrator::{
-    bootstrap_railgun_engine, OrchestratorConfig, VerificationMode,
-};
+use raven_railgun_engine::orchestrator::{bootstrap_railgun_engine, OrchestratorConfig};
 use raven_railgun_engine::persistence::{ConsumerEvent, ConsumerMetrics, SnapshotPolicy};
 use raven_railgun_engine::pir_table::EncoderKind;
 use raven_railgun_engine::InstanceRole;
@@ -95,9 +93,7 @@ fn list_leaf(list_index: u32, leaf: [u8; 32], validated_merkleroot: [u8; 32]) ->
         list_key: LIST_KEY,
         list_index,
         blinded_commitment: leaf,
-        status: 0,
         event_type: raven_railgun_persistence::PpoiEventType::Shield,
-        signature: vec![0; 64],
         validated_merkleroot,
     }
 }
@@ -170,7 +166,6 @@ async fn a_row_whose_root_is_not_its_own_post_append_root_never_reaches_the_wal(
     config.encoder = EncoderKind::PerListPath10 { list_key: LIST_KEY };
     // A snapshot would archive the log this test reads back.
     config.snapshot_policy = SnapshotPolicy::default();
-    config.verification_mode = VerificationMode::UpstreamAsserted;
     config.verification_cadence_n = 0;
     config.chain_source = None;
 

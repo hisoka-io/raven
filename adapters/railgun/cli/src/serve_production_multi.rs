@@ -16,8 +16,7 @@ use raven_railgun_engine::inspire::{
 };
 use raven_railgun_engine::orchestrator::{
     bootstrap_railgun_engine_multi_with_session_limits, DataSourceFilter, InstanceConfig,
-    MultiOrchestratorHandle, OrchestratorChannels, PerInstanceHandles, VerificationMode,
-    LEAVES_PER_PPOI_BLOCK,
+    MultiOrchestratorHandle, OrchestratorChannels, PerInstanceHandles, LEAVES_PER_PPOI_BLOCK,
 };
 use raven_railgun_engine::persistence::{ConsumerMetrics, SnapshotPolicy};
 use raven_railgun_engine::pir_table::EncoderKind;
@@ -617,7 +616,6 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
             encoder,
             record_size,
             entries_per_shard,
-            verification_mode: verification_mode_for(&data_source),
             data_source,
             use_flock,
             snapshot_policy,
@@ -1000,16 +998,6 @@ fn build_data_source(section: &DataSourceSection) -> anyhow::Result<DataSourceFi
     }
 }
 
-/// A commit tree is checked against the chain's root history; a mirrored list has only
-/// upstream's word, so its mode follows from the data source and is not configurable.
-fn verification_mode_for(data_source: &DataSourceFilter) -> VerificationMode {
-    if matches!(data_source, DataSourceFilter::ChainTreeNumber(_)) {
-        VerificationMode::ChainRootHistory
-    } else {
-        VerificationMode::UpstreamAsserted
-    }
-}
-
 fn enforce_encoder_matches_data_source(
     instance_id: &str,
     encoder: EncoderKind,
@@ -1051,34 +1039,9 @@ fn enforce_encoder_matches_data_source(
     }
 }
 
-fn parse_hex32(s: &str) -> anyhow::Result<[u8; 32]> {
-    let trimmed = s.strip_prefix("0x").unwrap_or(s);
-    if trimmed.len() != 64 {
-        anyhow::bail!("expected 64 hex chars for list_key, got {}", trimmed.len());
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        let hi = trimmed
-            .as_bytes()
-            .get(i * 2)
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("list_key hex out-of-range"))?;
-        let lo = trimmed
-            .as_bytes()
-            .get(i * 2 + 1)
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("list_key hex out-of-range"))?;
-        let nib = |c: u8| -> anyhow::Result<u8> {
-            match c {
-                b'0'..=b'9' => Ok(c - b'0'),
-                b'a'..=b'f' => Ok(c - b'a' + 10),
-                b'A'..=b'F' => Ok(c - b'A' + 10),
-                other => anyhow::bail!("invalid hex byte {other:#x}"),
-            }
-        };
-        *byte = (nib(hi)? << 4) | nib(lo)?;
-    }
-    Ok(out)
+fn parse_hex32(text: &str) -> anyhow::Result<[u8; 32]> {
+    raven_railgun_core::hex::decode_hex(text)
+        .ok_or_else(|| anyhow::anyhow!("list_key {text:?} is not 32 bytes of hex"))
 }
 
 pub async fn run(opts: MultiServeOptions) -> anyhow::Result<()> {
@@ -2913,15 +2876,6 @@ data_source = { kind = "mirror", list_key = "00000000000000000000000000000000000
             opts.instances[1].data_source,
             DataSourceFilter::PpoiListBlock { block: 0, .. }
         ));
-        // No key sets the mode: the data source decides it.
-        assert_eq!(
-            opts.instances[0].verification_mode,
-            VerificationMode::ChainRootHistory
-        );
-        assert_eq!(
-            opts.instances[1].verification_mode,
-            VerificationMode::UpstreamAsserted
-        );
     }
 
     /// A PPOI instance holds one block of its list. Neither a whole-list instance, a status
@@ -3045,6 +2999,26 @@ data_source = { kind = "mirror", list_key = "00000000000000000000000000000000000
         let f = write_temp_toml(&list_mismatch_config("aa", "aa"));
         let opts = load_options_from_toml(f.path()).expect("matching list keys must parse");
         assert_eq!(pinned_list_key(opts.instances[0].encoder), Some([0xaa; 32]));
+    }
+
+    /// Operators paste keys in both spellings, so `0x` must name the same list, byte for byte.
+    #[test]
+    fn a_0x_prefixed_list_key_loads_to_the_same_bytes() {
+        use std::fmt::Write as _;
+        let key: [u8; 32] = std::array::from_fn(|at| u8::try_from(at * 7 + 1).unwrap_or(0));
+        let spelled = key.iter().fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02X}");
+            hex
+        });
+        let body =
+            list_mismatch_config("aa", "aa").replace(&"aa".repeat(32), &format!("0x{spelled}"));
+        let f = write_temp_toml(&body);
+        let opts = load_options_from_toml(f.path()).expect("a 0x-prefixed list key must parse");
+        assert_eq!(pinned_list_key(opts.instances[0].encoder), Some(key));
+        assert!(matches!(
+            opts.instances[0].data_source,
+            DataSourceFilter::PpoiListBlock { list_key, block: 0 } if list_key == key
+        ));
     }
 
     fn list_mismatch_config(encoder_byte: &str, routed_byte: &str) -> String {
@@ -4202,7 +4176,13 @@ data_source = {{ kind = "mirror", list_key = "0000000000000000000000000000000000
         );
     }
 
-    /// Serves every index it is asked for and records each page's bounds.
+    /// The provider of the list the feed tests mirror: its rows are signed, so its key stands in
+    /// for the shipped list's.
+    fn provider() -> raven_railgun_ppoi_mirror::test_signer::TestListSigner {
+        raven_railgun_ppoi_mirror::test_signer::TestListSigner::new(0x5A)
+    }
+
+    /// Serves every index it is asked for, signed by [`provider`], and records each page's bounds.
     async fn upstream_holding_every_row() -> (String, Arc<parking_lot::Mutex<Vec<(u64, u64)>>>) {
         use axum::{routing::post, Json, Router};
         use serde_json::{json, Value};
@@ -4223,15 +4203,14 @@ data_source = {{ kind = "mirror", list_key = "0000000000000000000000000000000000
                     log.lock().push((start, end));
                     let rows: Vec<Value> = (start..=end)
                         .map(|index| {
-                            json!({
-                                "signedPOIEvent": {
-                                    "index": index,
-                                    "blindedCommitment": format!("{index:064x}"),
-                                    "signature": "00".repeat(64),
-                                    "type": "Shield"
-                                },
-                                "validatedMerkleroot": format!("{:064x}", index + 1)
-                            })
+                            provider()
+                                .row(
+                                    index,
+                                    &format!("{index:064x}"),
+                                    "Shield",
+                                    &format!("{:064x}", index + 1),
+                                )
+                                .expect("signs")
                         })
                         .collect();
                     Json(json!({ "jsonrpc": "2.0", "id": 1, "result": rows }))
@@ -4273,7 +4252,17 @@ data_source = {{ kind = "mirror", list_key = "0000000000000000000000000000000000
         use raven_railgun_engine::orchestrator::split_ppoi_index;
         use raven_railgun_ppoi_mirror::{MirrorConfig, UpstreamPpoiMirror};
 
-        let (list_key, filters) = shipped_ppoi_routes();
+        let list_key = provider().list_key();
+        let filters: Vec<DataSourceFilter> = shipped_ppoi_routes()
+            .1
+            .into_iter()
+            .map(|route| match route {
+                DataSourceFilter::PpoiListBlock { block, .. } => {
+                    DataSourceFilter::PpoiListBlock { list_key, block }
+                }
+                other @ DataSourceFilter::ChainTreeNumber(_) => other,
+            })
+            .collect();
         let next_block = 7;
         let first_unheld = u64::from(next_block * LEAVES_PER_PPOI_BLOCK);
         // The feed reads only the filters; nothing is routed in this test.
@@ -4379,7 +4368,7 @@ data_source = {{ kind = "mirror", list_key = "0000000000000000000000000000000000
     async fn a_gap_in_the_declared_blocks_stops_the_feed_on_its_first_row() {
         use raven_railgun_ppoi_mirror::{FeedStatus, MirrorConfig, UpstreamPpoiMirror};
 
-        let list_key = [0x5A; 32];
+        let list_key = provider().list_key();
         let block = |block| DataSourceFilter::PpoiListBlock { list_key, block };
         let start = |block: u32| u64::from(block * LEAVES_PER_PPOI_BLOCK);
         let full = LEAVES_PER_PPOI_BLOCK as usize;

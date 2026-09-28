@@ -945,9 +945,6 @@ const SWAP_RETRY_ATTEMPTS: u32 = 4;
 
 /// Layer 2 verifier wiring threaded into [`run_consumer_task`].
 pub struct Layer2VerifierContext {
-    /// Authority model. `UpstreamAsserted` skips the chain-rootHistory verifier loop
-    /// and puts nothing in its place (see `VerificationMode::UpstreamAsserted`).
-    pub verification_mode: super::orchestrator::VerificationMode,
     /// Verify every Nth commit. `0` disables.
     pub cadence_n: u32,
     /// Tree number whose IMT root is verified.
@@ -959,7 +956,6 @@ pub struct Layer2VerifierContext {
 impl std::fmt::Debug for Layer2VerifierContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Layer2VerifierContext")
-            .field("verification_mode", &self.verification_mode)
             .field("cadence_n", &self.cadence_n)
             .field("tree_number", &self.tree_number)
             .field("chain_source_attached", &self.chain_source.is_some())
@@ -991,12 +987,7 @@ impl Layer2VerifierState {
     }
 
     fn is_active(&self) -> bool {
-        self.ctx.cadence_n > 0
-            && self.ctx.chain_source.is_some()
-            && matches!(
-                self.ctx.verification_mode,
-                super::orchestrator::VerificationMode::ChainRootHistory,
-            )
+        self.ctx.cadence_n > 0 && self.ctx.chain_source.is_some()
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -2345,9 +2336,7 @@ mod tests {
                     list_key: [1u8; 32],
                     list_index: 0,
                     blinded_commitment: [2u8; 32],
-                    status: 1,
                     event_type: raven_railgun_persistence::PpoiEventType::Shield,
-                    signature: vec![0; 64],
                     validated_merkleroot: [0; 32],
                 },
                 HEIGHT,
@@ -2379,9 +2368,7 @@ mod tests {
                 list_key: [1u8; 32],
                 list_index: 0,
                 blinded_commitment: [2u8; 32],
-                status: 0,
                 event_type: raven_railgun_persistence::PpoiEventType::Shield,
-                signature: vec![0; 64],
                 validated_merkleroot: [0; 32],
             },
         ];
@@ -4145,9 +4132,7 @@ mod tests {
                 list_key: [0x5c; 32],
                 list_index,
                 blinded_commitment,
-                status: 1,
                 event_type: raven_railgun_persistence::PpoiEventType::Shield,
-                signature: vec![0; 64],
                 validated_merkleroot: [0; 32],
             }
         };

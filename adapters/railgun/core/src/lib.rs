@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod batch_ladder;
+pub mod hex;
 pub mod tree_layout;
 
 /// Server-runtime identity and error types, re-exported from `raven-core`.

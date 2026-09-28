@@ -19,7 +19,7 @@ use raven_railgun_cli::serve_production_multi::{
     run_with_listener, AutoSpawnConfigToml, BootstrapObserver, BootstrapView, MultiServeOptions,
 };
 use raven_railgun_core::{CommitmentLeaf, InstanceId, RailgunEvent};
-use raven_railgun_engine::orchestrator::{DataSourceFilter, InstanceConfig, VerificationMode};
+use raven_railgun_engine::orchestrator::{DataSourceFilter, InstanceConfig};
 use raven_railgun_engine::persistence::SnapshotPolicy;
 use raven_railgun_engine::pir_table::EncoderKind;
 use raven_railgun_engine::InstanceRole;
@@ -70,7 +70,6 @@ fn bootstrap_tree_zero_cfg(data_dir: PathBuf) -> InstanceConfig {
         // Must equal ring_dim: one entry per ring coefficient is the shard geometry the PIR
         // scheme assumes, and 65_536 / 2_048 = 32 shards.
         entries_per_shard: 2_048,
-        verification_mode: VerificationMode::ChainRootHistory,
         data_source: DataSourceFilter::ChainTreeNumber(0),
         use_flock: false,
         snapshot_policy: SnapshotPolicy::default(),

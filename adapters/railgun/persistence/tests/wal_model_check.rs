@@ -24,9 +24,7 @@ fn payload_strategy() -> impl Strategy<Value = WalEntryPayload> {
                     list_key,
                     list_index,
                     blinded_commitment,
-                    status: 0,
                     event_type: PpoiEventType::Shield,
-                    signature: Vec::new(),
                     validated_merkleroot: [0x5A; 32],
                 }
             }

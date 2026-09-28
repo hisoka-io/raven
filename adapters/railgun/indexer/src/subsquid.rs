@@ -282,22 +282,8 @@ impl SubsquidRootSource for SubsquidClient {
 
 /// Decode a `0x`-prefixed or bare 64-character hex string into 32 bytes.
 pub fn decode_bytes32_hex(s: &str) -> Result<[u8; 32]> {
-    let trimmed = s.strip_prefix("0x").unwrap_or(s);
-    if trimmed.len() != 64 {
-        return Err(SubsquidError::Decode(format!(
-            "expected 64 hex chars, got {}",
-            trimmed.len()
-        )));
-    }
-    let mut out = [0u8; 32];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let pair = trimmed
-            .get(i * 2..i * 2 + 2)
-            .ok_or_else(|| SubsquidError::Decode(format!("hex parse out of range at byte {i}")))?;
-        *slot = u8::from_str_radix(pair, 16)
-            .map_err(|e| SubsquidError::Decode(format!("hex parse byte {i}: {e}")))?;
-    }
-    Ok(out)
+    raven_railgun_core::hex::decode_hex(s)
+        .ok_or_else(|| SubsquidError::Decode(format!("{s:?} is not 32 bytes of hex")))
 }
 
 #[cfg(test)]
@@ -315,6 +301,11 @@ mod tests {
     #[test]
     fn decode_bytes32_hex_rejects_wrong_length() {
         assert!(decode_bytes32_hex("0xdeadbeef").is_err());
+    }
+
+    #[test]
+    fn decode_bytes32_hex_refuses_a_signed_digit_pair() {
+        assert!(decode_bytes32_hex(&format!("+a{}", "00".repeat(31))).is_err());
     }
 
     #[test]

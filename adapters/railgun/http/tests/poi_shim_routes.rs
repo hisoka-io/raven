@@ -118,9 +118,7 @@ fn seeded_store() -> (LogicalLeafStore, [u8; 32]) {
                 list_key,
                 list_index: i as u32,
                 blinded_commitment: *bc,
-                status: 0,
                 event_type: raven_railgun_persistence::PpoiEventType::Shield,
-                signature: vec![0; 64],
                 validated_merkleroot: [0; 32],
             },
             200 + i as u64,
@@ -246,6 +244,35 @@ async fn merkle_proofs_route_returns_proof_per_blinded_commitment() {
         guard
             .ppoi_merkle_proof(&list_key, idx)
             .expect("store proof for seeded slot")
+    };
+    assert_served_proof_matches_store(entry, &expected);
+}
+
+/// Wallets send keys and commitments with or without `0x`; both must reach the same slot.
+#[tokio::test]
+async fn merkle_proofs_route_answers_a_0x_prefixed_list_key_and_commitment() {
+    let (router, list_key, store) = build_router_with_store();
+    let bc = fr_canonical(0x22);
+    let payload = serde_json::json!({
+        "listKey": format!("0x{}", hex_encode_bytes(&list_key)),
+        "blindedCommitments": [format!("0x{}", hex_encode_bytes(&bc).to_uppercase())],
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/poi/merkle-proofs")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(payload.to_string()))
+        .expect("build req");
+    let resp = router.oneshot(req).await.expect("dispatch");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).expect("decode");
+    let entry = &json.as_array().expect("array")[0];
+    let expected = {
+        let guard = store.lock();
+        let idx = guard.ppoi_index_of(&list_key, &bc).expect("seeded");
+        guard
+            .ppoi_merkle_proof(&list_key, idx)
+            .expect("store proof")
     };
     assert_served_proof_matches_store(entry, &expected);
 }

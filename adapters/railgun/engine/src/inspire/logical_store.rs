@@ -707,7 +707,7 @@ impl LogicalLeafStore {
         }
     }
 
-    /// The upper-sibling addendum for a shard as of [`Self::committed_addenda_epoch`].
+    /// The upper-sibling addendum for a shard as of the last [`Self::refresh_committed_addenda`].
     #[must_use]
     pub fn committed_addendum(&self, list_key: &[u8; 32], shard_id: u32) -> Option<&[u8]> {
         self.committed_addenda

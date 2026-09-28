@@ -1,4 +1,4 @@
-//! The production mirror feed, pointed at the replay over loopback with signature checks on,
+//! The production mirror feed, which checks every signature, pointed at the replay over loopback,
 //! takes a generated list to completion through a cold catch-up and then a growth step, every
 //! row intact, and stops in front of a row whose signature fails.
 
@@ -59,7 +59,6 @@ fn checking_mirror(addr: std::net::SocketAddr) -> Arc<UpstreamPpoiMirror> {
             endpoint: format!("http://{addr}"),
             poll_interval_secs: 1,
             max_rows_per_fetch: 501,
-            verify_signatures: true,
             ..MirrorConfig::default()
         })
         .expect("mirror config")
@@ -102,7 +101,6 @@ async fn the_mirror_catches_up_then_follows_growth_with_every_root_matching() {
             list_index,
             blinded_commitment,
             event_type,
-            signature,
             validated_merkleroot,
             ..
         } = payload
@@ -118,12 +116,6 @@ async fn the_mirror_catches_up_then_follows_growth_with_every_root_matching() {
         );
         assert_eq!(
             *validated_merkleroot, row.validated_merkleroot,
-            "index {}",
-            row.index
-        );
-        assert_eq!(
-            signature.as_slice(),
-            row.signature.as_slice(),
             "index {}",
             row.index
         );

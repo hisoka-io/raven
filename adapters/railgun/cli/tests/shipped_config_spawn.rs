@@ -3,7 +3,9 @@
 //!
 //! The shim routes were certified for months by a hand-wired state while the deployment served
 //! 503. Here nothing is wired by the test: the example file is rewritten only where it names a
-//! host, a directory or a secret, and every answer comes over HTTP from the binary's own boot.
+//! host, a directory, a secret or the list key, and every answer comes over HTTP from the binary's
+//! own boot. The list key is the one change past an operator's: the binary verifies every row,
+//! and only a test key can sign the rows a test serves.
 //!
 //! The upstream is an in-process listener on loopback, so nothing leaves the machine.
 
@@ -16,6 +18,8 @@
 
 #[path = "support/bc_prefixes.rs"]
 mod bc_prefixes;
+#[path = "support/signed_list.rs"]
+mod signed_list;
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -33,6 +37,7 @@ use raven_railgun_engine::orchestrator::{DataSourceFilter, LEAVES_PER_PPOI_BLOCK
 use raven_railgun_http::status::{MirrorFeedState, MirrorFeedView};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
+use signed_list::{rekeyed, signed_row};
 
 const BEARER_TOKEN: &str = "shipped-config-spawn-token-padded-long";
 
@@ -157,15 +162,11 @@ fn ppoi_upstream(list_key: String, roots: Arc<Vec<[u8; 32]>>) -> Router {
                         .map_while(|index| {
                             let index = u32::try_from(index).ok()?;
                             let root = roots.get(usize::try_from(index).ok()?)?;
-                            Some(json!({
-                                "signedPOIEvent": {
-                                    "index": index,
-                                    "blindedCommitment": hex::encode(leaf_at(index)),
-                                    "signature": "00".repeat(64),
-                                    "type": "Shield"
-                                },
-                                "validatedMerkleroot": hex::encode(root)
-                            }))
+                            Some(signed_row(
+                                u64::from(index),
+                                &hex::encode(leaf_at(index)),
+                                &hex::encode(root),
+                            ))
                         })
                         .collect()
                 } else {
@@ -197,8 +198,8 @@ fn replace_once(body: &str, anchor: &str, with: &str) -> String {
     body.replace(anchor, with)
 }
 
-/// The shipped example, rewritten only at its bind, token, upstream and data root, and created
-/// owner-only because it carries the token inline.
+/// The shipped example, rewritten only at its bind, token, upstream, data root and list key, and
+/// created owner-only because it carries the token inline.
 fn write_shipped_config(root: &Path, mirror_endpoint: &str) -> PathBuf {
     let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/mainnet-ppoi.toml");
     let body = std::fs::read_to_string(example).expect("read the shipped example");
@@ -213,7 +214,7 @@ fn write_shipped_config(root: &Path, mirror_endpoint: &str) -> PathBuf {
         body.contains(SHIPPED_DATA_ROOT),
         "the shipped example no longer places data under {SHIPPED_DATA_ROOT}"
     );
-    let body = body.replace(SHIPPED_DATA_ROOT, &format!("{}/", root.display()));
+    let body = rekeyed(&body.replace(SHIPPED_DATA_ROOT, &format!("{}/", root.display())));
 
     let path = root.join("config.toml");
     let mut file = owner_only(&path);

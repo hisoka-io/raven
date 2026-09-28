@@ -1,6 +1,6 @@
-//! Layer 2 verifier wiring in `drive_commit`: per-commit verify under
-//! ChainRootHistory, OutOfSync cascading through `apply_reorg`, and no verifier
-//! call at all under UpstreamAsserted.
+//! Layer 2 verifier wiring in `drive_commit`: per-commit verify on a chain tree,
+//! OutOfSync cascading through `apply_reorg`, and no verifier call at all on a
+//! list instance.
 
 #![allow(
     clippy::expect_used,
@@ -17,12 +17,12 @@ use async_trait::async_trait;
 use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
 use raven_railgun_engine::inspire::InspireServerState;
-use raven_railgun_engine::orchestrator::{
-    bootstrap_railgun_engine, OrchestratorConfig, VerificationMode,
-};
+use raven_railgun_engine::orchestrator::{bootstrap_railgun_engine, OrchestratorConfig};
 use raven_railgun_engine::persistence::{ConsumerEvent, SnapshotPolicy};
+use raven_railgun_engine::pir_table::EncoderKind;
 use raven_railgun_engine::InstanceRole;
 use raven_railgun_indexer::{BlockId, ChainSource, IndexerError, Result as IndexerResult};
+use raven_railgun_persistence::{PpoiEventType, WalEntryPayload};
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-w2-layer2-test";
 /// Row width of the toy cell; the configured encoder must emit it.
@@ -130,7 +130,6 @@ async fn layer2_verifier_fires_per_commit_and_cascades_reorg_on_out_of_sync() {
     config.role = InstanceRole::Live;
     config.scheme_tag = SCHEME_TAG.to_owned();
     config.snapshot_policy = aggressive_snapshot_policy();
-    config.verification_mode = VerificationMode::ChainRootHistory;
     config.verification_cadence_n = 1;
     config.verification_tree_number = 0;
     config.chain_source = Some(Arc::clone(&chain_source) as Arc<dyn ChainSource>);
@@ -236,7 +235,6 @@ async fn layer2_first_verdict_out_of_sync_must_not_truncate_to_genesis() {
     config.role = InstanceRole::Live;
     config.scheme_tag = SCHEME_TAG.to_owned();
     config.snapshot_policy = aggressive_snapshot_policy();
-    config.verification_mode = VerificationMode::ChainRootHistory;
     config.verification_cadence_n = 1;
     config.verification_tree_number = 0;
     config.chain_source = Some(Arc::clone(&chain_source) as Arc<dyn ChainSource>);
@@ -322,29 +320,51 @@ async fn layer2_first_verdict_out_of_sync_must_not_truncate_to_genesis() {
     let _ = tokio::time::timeout(Duration::from_secs(10), handle.consumer).await;
 }
 
+/// A list's root is its provider's, not the chain's, so a list instance handed a chain source
+/// never asks the chain, even once commitment leaves reach its store: the verifier checks the
+/// tree it finds there, and a stray tree would drive reorgs through the list's store.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn layer2_verifier_does_not_fire_on_upstream_asserted_instance() {
+async fn layer2_verifier_does_not_fire_on_a_list_instance_given_a_chain_source() {
+    const LIST_KEY: [u8; 32] = [0xab; 32];
+    const LIST_ENTRY_SIZE: usize = 512;
     let dir = tempfile::tempdir().expect("tempdir");
     // Fails on the first verify, so any verifier call at all trips this.
     let chain_source = Arc::new(SyntheticChainSource::new(0));
 
     let mut config = OrchestratorConfig::demo(dir.path().to_path_buf(), "w2-ppoi-regression");
-    config.record_size = TOY_ENTRY_SIZE;
+    config.record_size = LIST_ENTRY_SIZE;
+    config.encoder = EncoderKind::PerListPath10 { list_key: LIST_KEY };
     config.use_flock = false;
     config.role = InstanceRole::Live;
     config.scheme_tag = SCHEME_TAG.to_owned();
     config.snapshot_policy = aggressive_snapshot_policy();
-    config.verification_mode = VerificationMode::UpstreamAsserted;
     config.verification_cadence_n = 1;
     config.verification_tree_number = 0;
     config.chain_source = Some(Arc::clone(&chain_source) as Arc<dyn ChainSource>);
 
     let params = InspireParams::secure_128_d2048();
-    let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
+    let handle = bootstrap_railgun_engine(config, params, || {
+        raven_railgun_testkit::try_toy_state(LIST_ENTRY_SIZE)
+    })
+    .expect("bootstrap");
 
     for i in 0..10u32 {
+        let row = WalEntryPayload::PpoiListLeafAdded {
+            list_key: LIST_KEY,
+            list_index: i,
+            blinded_commitment: canonical_commitment(
+                u8::try_from((i & 0xff) | 0x10).expect("byte"),
+            ),
+            event_type: PpoiEventType::Shield,
+            validated_merkleroot: [0; 32],
+        };
+        handle
+            .sender
+            .send(ConsumerEvent::Ppoi(row, 0))
+            .await
+            .expect("send");
         let height = 200 + u64::from(i);
-        let event = RailgunEvent::Transact {
+        let leaf = RailgunEvent::Transact {
             block_number: height,
             tx_hash: [0u8; 32],
             tree_number: 0,
@@ -353,14 +373,14 @@ async fn layer2_verifier_does_not_fire_on_upstream_asserted_instance() {
                 tree_number: 0,
                 leaf_index: i,
                 commitment_hash: canonical_commitment(
-                    u8::try_from((i & 0xff) | 0x10).expect("byte"),
+                    u8::try_from((i & 0xff) | 0x20).expect("byte"),
                 ),
                 ciphertext: vec![],
             }],
         };
         handle
             .sender
-            .send(ConsumerEvent::Chain(event, height))
+            .send(ConsumerEvent::Chain(leaf, height))
             .await
             .expect("send");
     }
@@ -369,13 +389,12 @@ async fn layer2_verifier_does_not_fire_on_upstream_asserted_instance() {
     let drain_deadline = tokio::time::Instant::now() + LOADED_BOX_DEADLINE;
     loop {
         let m = *handle.metrics.lock();
-        if m.events_processed >= 10 {
+        if m.events_processed >= 20 && m.commits_fired >= 1 {
             break;
         }
         assert!(
             tokio::time::Instant::now() < drain_deadline,
-            "consumer did not drain 10 events within {LOADED_BOX_DEADLINE:?}; events_processed = {}",
-            m.events_processed,
+            "consumer did not apply and commit 20 events within {LOADED_BOX_DEADLINE:?}; {m:?}",
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -384,12 +403,13 @@ async fn layer2_verifier_does_not_fire_on_upstream_asserted_instance() {
     assert_eq!(
         chain_source.verify_count(),
         0,
-        "UpstreamAsserted instance MUST NOT call the chain verifier",
+        "a list instance MUST NOT call the chain verifier",
     );
     let metrics = *handle.metrics.lock();
     assert_eq!(
-        metrics.reorgs_handled, 0,
-        "no synthetic reorg should fire on an UpstreamAsserted instance",
+        (metrics.reorgs_handled, metrics.consumer_errors),
+        (0, 0),
+        "no synthetic reorg or refused row on a list instance",
     );
 
     handle

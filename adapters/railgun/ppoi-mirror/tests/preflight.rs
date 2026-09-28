@@ -8,19 +8,35 @@ use axum::http::{header::CONTENT_TYPE, StatusCode};
 use axum::routing::post;
 use axum::Router;
 use raven_railgun_core::ListKey;
+use raven_railgun_ppoi_mirror::test_signer::TestListSigner;
 use raven_railgun_ppoi_mirror::{
     MirrorConfig, PreflightError, PreflightFailure, UpstreamPpoiMirror,
 };
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const LIST: ListKey = ListKey([0x42; 32]);
+fn provider() -> TestListSigner {
+    TestListSigner::new(0x42)
+}
 const BOUND: Duration = Duration::from_millis(250);
 /// Below the client's own 10 s timeout, so a preflight that ignores its bound overruns it.
 const HANG_GUARD: Duration = Duration::from_secs(5);
 
-const ONE_ROW: &str = r#"{"jsonrpc":"2.0","id":1,"result":[{"signedPOIEvent":{"index":0,"blindedCommitment":"0x1111111111111111111111111111111111111111111111111111111111111111","signature":"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","type":"Shield"},"validatedMerkleroot":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#;
+/// A page holding one row, signed by the list's provider.
+fn one_row() -> &'static str {
+    let row = provider()
+        .row(
+            0,
+            &format!("0x{}", "11".repeat(32)),
+            "Shield",
+            &"aa".repeat(32),
+        )
+        .expect("signs");
+    let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": [row] }).to_string();
+    Box::leak(body.into_boxed_str())
+}
 
 type Requests = Arc<parking_lot::Mutex<Vec<serde_json::Value>>>;
 
@@ -74,9 +90,12 @@ async fn preflight(endpoint: &str, bound: Duration) -> Result<(), PreflightError
         ..MirrorConfig::default()
     })
     .expect("mirror builds");
-    tokio::time::timeout(HANG_GUARD, mirror.preflight(&LIST, bound))
-        .await
-        .expect("preflight overran its bound and hit the hang guard")
+    tokio::time::timeout(
+        HANG_GUARD,
+        mirror.preflight(&ListKey(provider().list_key()), bound),
+    )
+    .await
+    .expect("preflight overran its bound and hit the hang guard")
 }
 
 async fn refusal(endpoint: &str) -> PreflightError {
@@ -93,7 +112,7 @@ async fn refusal(endpoint: &str) -> PreflightError {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn answering_endpoint_passes_with_exactly_one_index_zero_request() {
-    let (url, requests) = serve_fixed(StatusCode::OK, ONE_ROW).await;
+    let (url, requests) = serve_fixed(StatusCode::OK, one_row()).await;
     preflight(&url, Duration::from_secs(5))
         .await
         .expect("an answering endpoint passes");
@@ -111,7 +130,16 @@ async fn answering_endpoint_passes_with_exactly_one_index_zero_request() {
     assert_eq!(field("/params/endIndex"), Some(0.into()));
     assert_eq!(
         field("/params/listKey"),
-        Some("4242424242424242424242424242424242424242424242424242424242424242".into())
+        Some(
+            provider()
+                .list_key()
+                .iter()
+                .fold(String::new(), |mut hex, byte| {
+                    let _ = write!(hex, "{byte:02x}");
+                    hex
+                })
+                .into()
+        )
     );
 }
 
@@ -207,7 +235,7 @@ async fn json_rpc_error_is_classed_by_its_code() {
 async fn rows_the_worker_would_refuse_fail_the_preflight() {
     let (url, _) = serve_fixed(
         StatusCode::OK,
-        r#"{"jsonrpc":"2.0","id":1,"result":[{"signedPOIEvent":{"index":0,"blindedCommitment":"0x1111111111111111111111111111111111111111111111111111111111111111","signature":"not-hex","type":"Shield"},"validatedMerkleroot":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
+        r#"{"jsonrpc":"2.0","id":1,"result":[{"signedPOIEvent":{"index":0,"blindedCommitment":"0xnot-hex","signature":"00","type":"Shield"},"validatedMerkleroot":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
     )
     .await;
     assert_eq!(

@@ -7,9 +7,7 @@ use anyhow::Context;
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{setup_state, LogicalLeafStore, RavenInspireScheme};
-use raven_railgun_engine::orchestrator::{
-    ChainTreeRoutes, DataSourceFilter, PerInstanceHandles, VerificationMode,
-};
+use raven_railgun_engine::orchestrator::{ChainTreeRoutes, DataSourceFilter, PerInstanceHandles};
 use raven_railgun_engine::persistence::{
     bootstrap_inspire_instance_with_session_limits, run_consumer_task, ConsumerEvent,
     ConsumerMetrics, InspirePersistence, Layer2VerifierContext, SnapshotPolicy,
@@ -562,7 +560,6 @@ fn spawn_one(inputs: &SpawnInputs<'_>, tree: u32, append_log: bool) -> anyhow::R
         .chain_source
         .as_ref()
         .map(|cs| Layer2VerifierContext {
-            verification_mode: VerificationMode::ChainRootHistory,
             cadence_n: runtime.verification_cadence_n,
             tree_number: tree,
             chain_source: Some(Arc::clone(cs)),

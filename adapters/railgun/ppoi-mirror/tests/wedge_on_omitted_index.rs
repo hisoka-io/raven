@@ -24,6 +24,7 @@ use axum::routing::post;
 use axum::Router;
 use raven_railgun_core::ListKey;
 use raven_railgun_persistence::WalEntryPayload;
+use raven_railgun_ppoi_mirror::test_signer::TestListSigner;
 use raven_railgun_ppoi_mirror::{FeedStatus, MirrorConfig, PreflightFailure, UpstreamPpoiMirror};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -70,16 +71,19 @@ async fn poi_events_handler(
     })))
 }
 
+fn provider() -> TestListSigner {
+    TestListSigner::new(0x42)
+}
+
 fn row(index: u64) -> serde_json::Value {
-    serde_json::json!({
-        "signedPOIEvent": {
-            "index": index,
-            "blindedCommitment": format!("0x{:064x}", index + 1),
-            "signature": "00".repeat(64),
-            "type": "Shield",
-        },
-        "validatedMerkleroot": format!("{:064x}", index + 1),
-    })
+    provider()
+        .row(
+            index,
+            &format!("0x{:064x}", index + 1),
+            "Shield",
+            &format!("{:064x}", index + 1),
+        )
+        .expect("signs")
 }
 
 async fn start_mock() -> (String, Arc<MockState>, tokio::task::JoinHandle<()>) {
@@ -174,7 +178,7 @@ async fn the_feed_asks_again_for_a_row_a_page_left_out_and_the_list_completes() 
     let (tx, mut rx) = mpsc::channel::<(WalEntryPayload, u64)>(128);
     let status = FeedStatus::default();
     let worker = tokio::spawn(mirror(url).run_feed(
-        ListKey([0x42; 32]),
+        ListKey(provider().list_key()),
         0,
         |cursor| cursor..u64::MAX,
         status.clone(),

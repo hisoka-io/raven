@@ -33,7 +33,6 @@ const NODE_BYTES: usize = 32;
 const MAGIC_AT: usize = 34;
 const SIBLINGS_AT: usize = 38;
 const ADDENDUM_BYTES: usize = (TREE_DEPTH - PATH10_LEVELS) * NODE_BYTES;
-const LEAF_STATUS: u8 = 0;
 
 // A second shard must be populated, or the shard-misalignment property has nothing to compare.
 const _: () = assert!(LEAVES > ENTRIES_PER_SHARD);
@@ -98,9 +97,7 @@ fn committed_store() -> (LogicalLeafStore, PerListPath10Encoder) {
                 list_key: LIST_KEY,
                 list_index: local,
                 blinded_commitment: leaf_value(local),
-                status: LEAF_STATUS,
                 event_type: PpoiEventType::Shield,
-                signature: vec![0; 64],
                 validated_merkleroot: [0; 32],
             },
             u64::from(local),

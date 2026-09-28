@@ -21,9 +21,7 @@ fn list_leaf(list_index: u32, leaf: [u8; 32], validated_merkleroot: [u8; 32]) ->
         list_key: LIST_KEY,
         list_index,
         blinded_commitment: leaf,
-        status: 0,
         event_type: raven_railgun_persistence::PpoiEventType::Shield,
-        signature: Vec::new(),
         validated_merkleroot,
     }
 }

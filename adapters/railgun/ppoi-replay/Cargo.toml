@@ -24,9 +24,9 @@ clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
+raven-railgun-core = { workspace = true }
 
 [dev-dependencies]
-raven-railgun-core = { workspace = true }
 raven-railgun-engine = { workspace = true }
 raven-railgun-persistence = { workspace = true }
 raven-railgun-ppoi-mirror = { workspace = true }

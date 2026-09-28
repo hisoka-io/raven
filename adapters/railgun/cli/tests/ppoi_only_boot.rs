@@ -16,6 +16,8 @@
 mod bc_prefixes;
 #[path = "support/progress.rs"]
 mod progress;
+#[path = "support/signed_list.rs"]
+mod signed_list;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -36,11 +38,11 @@ use raven_railgun_http::status::{MirrorFeedState, MirrorFeedView};
 use raven_railgun_http::HealthReadyResponse;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
+use signed_list::{rekeyed, signed_row, LIST_HEX, SHIPPED_LIST_HEX};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 const BEARER_TOKEN: &str = "ppoi-only-boot-token-padded-long";
-const OFAC_LIST_HEX: &str = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88";
 const PATHS_BLOCK_0: &str = "ppoi-paths-ofac-0";
 const PATHS_BLOCK_1: &str = "ppoi-paths-ofac-1";
 const SHIPPED_ENDPOINT: &str = "mirror_endpoint = \"https://ppoi.fdi.network\"";
@@ -128,7 +130,8 @@ fn leaf_at(index: u64) -> [u8; 32] {
     leaf
 }
 
-/// Holds rows `0..rows` of the list with the roots upstream publishes, and returns those roots.
+/// Holds rows `0..rows` of the test list, signed, with the roots upstream publishes, and returns
+/// those roots.
 /// A page starting at or past `held_back_from` is not answered until `true` is sent, so a cold
 /// sync can be stopped part-way with every page it has had so far come back full.
 async fn upstream_holding(
@@ -164,15 +167,11 @@ async fn upstream_holding(
                 let result: Vec<Value> = (start..=end)
                     .filter_map(|index| {
                         let root = served.get(usize::try_from(index).ok()?)?;
-                        Some(json!({
-                            "signedPOIEvent": {
-                                "index": index,
-                                "blindedCommitment": hex::encode(leaf_at(index)),
-                                "signature": "00".repeat(64),
-                                "type": "Shield"
-                            },
-                            "validatedMerkleroot": hex::encode(root)
-                        }))
+                        Some(signed_row(
+                            index,
+                            &hex::encode(leaf_at(index)),
+                            &hex::encode(root),
+                        ))
                     })
                     .collect();
                 Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
@@ -293,7 +292,7 @@ async fn shut_down(booting: Booting) {
 }
 
 fn rows_under(view: &BootstrapView, instance_id: &str) -> usize {
-    let list_key: [u8; 32] = hex::decode(OFAC_LIST_HEX)
+    let list_key: [u8; 32] = hex::decode(LIST_HEX)
         .expect("hex")
         .try_into()
         .expect("32 bytes");
@@ -340,13 +339,13 @@ async fn sync_progress(
 async fn list_routes(addr: SocketAddr, bc: &str) -> Vec<(&'static str, reqwest::Response)> {
     let client = reqwest::Client::new();
     let base = format!("http://{addr}/v1/poi");
-    let get = |path: &str| client.get(format!("{base}/{OFAC_LIST_HEX}/{path}")).send();
+    let get = |path: &str| client.get(format!("{base}/{LIST_HEX}/{path}")).send();
     vec![
         (
             "merkle-proofs",
             client
                 .post(format!("{base}/merkle-proofs"))
-                .json(&json!({ "listKey": OFAC_LIST_HEX, "blindedCommitments": [bc] }))
+                .json(&json!({ "listKey": LIST_HEX, "blindedCommitments": [bc] }))
                 .send()
                 .await
                 .expect("merkle-proofs"),
@@ -480,7 +479,7 @@ fn the_ppoi_only_example_names_no_chain_setting_and_loads() {
         chain_indexer_reason(&opts.instances, opts.auto_spawn.as_ref()),
         None
     );
-    let list_key: [u8; 32] = hex::decode(OFAC_LIST_HEX).unwrap().try_into().unwrap();
+    let list_key: [u8; 32] = hex::decode(SHIPPED_LIST_HEX).unwrap().try_into().unwrap();
     let blocks: Vec<u32> = opts
         .instances
         .iter()
@@ -678,7 +677,7 @@ async fn the_ppoi_only_example_boots_and_answers_list_routes_only_at_upstreams_t
     let (endpoint, roots, release) = upstream_holding(ROWS, FIRST_PAGE).await;
     let config = write_config(
         root.path(),
-        &example(),
+        &rekeyed(&example()),
         &endpoint,
         "mirror_backfill_interval_secs = 0",
     );

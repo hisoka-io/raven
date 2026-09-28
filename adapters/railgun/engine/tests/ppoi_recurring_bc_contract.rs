@@ -31,9 +31,7 @@ fn leaf_added(list_index: u32, blinded_commitment: [u8; 32]) -> WalEntryPayload 
         list_key: LIST_KEY,
         list_index,
         blinded_commitment,
-        status: 0,
         event_type: PpoiEventType::Shield,
-        signature: Vec::new(),
         validated_merkleroot: [7; 32],
     }
 }

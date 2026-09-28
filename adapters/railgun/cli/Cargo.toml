@@ -53,6 +53,7 @@ tempfile = "3"
 raven-railgun-engine = { workspace = true }
 raven-railgun-indexer = { workspace = true }
 raven-railgun-persistence = { workspace = true }
+raven-railgun-ppoi-mirror = { workspace = true, features = ["test-signer"] }
 raven-railgun-ppoi-replay = { path = "../ppoi-replay" }
 parking_lot = { workspace = true }
 async-trait = { workspace = true }

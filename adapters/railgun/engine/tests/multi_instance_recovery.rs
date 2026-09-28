@@ -19,7 +19,7 @@ use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
 use raven_railgun_engine::inspire::InspireServerState;
 use raven_railgun_engine::orchestrator::{
     bootstrap_railgun_engine_multi, DataSourceFilter, InstanceConfig, OrchestratorChannels,
-    PerInstanceHandles, VerificationMode,
+    PerInstanceHandles,
 };
 use raven_railgun_engine::persistence::ConsumerEvent;
 use raven_railgun_engine::InstanceRole;
@@ -49,7 +49,6 @@ fn build_six_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
               sub: &str,
               encoder: EncoderKind,
               ds: DataSourceFilter,
-              mode: VerificationMode,
               role: InstanceRole|
      -> InstanceConfig {
         InstanceConfig {
@@ -59,7 +58,6 @@ fn build_six_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
             encoder,
             record_size: TOY_ENTRY_SIZE,
             entries_per_shard: TOY_ENTRIES_PER_SHARD,
-            verification_mode: mode,
             data_source: ds,
             use_flock: false,
             snapshot_policy: raven_railgun_engine::persistence::SnapshotPolicy::default(),
@@ -79,7 +77,6 @@ fn build_six_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
             "tree-0",
             raven_railgun_engine::pir_table::EncoderKind::PerLeafBc { tree_number: 0 },
             DataSourceFilter::ChainTreeNumber(0),
-            VerificationMode::ChainRootHistory,
             InstanceRole::Static,
         ),
         mk(
@@ -87,7 +84,6 @@ fn build_six_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
             "tree-1",
             raven_railgun_engine::pir_table::EncoderKind::PerLeafBc { tree_number: 0 },
             DataSourceFilter::ChainTreeNumber(1),
-            VerificationMode::ChainRootHistory,
             InstanceRole::Static,
         ),
         mk(
@@ -95,7 +91,6 @@ fn build_six_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
             "tree-2",
             raven_railgun_engine::pir_table::EncoderKind::PerLeafBc { tree_number: 0 },
             DataSourceFilter::ChainTreeNumber(2),
-            VerificationMode::ChainRootHistory,
             InstanceRole::Static,
         ),
         mk(
@@ -103,7 +98,6 @@ fn build_six_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
             "tree-3",
             raven_railgun_engine::pir_table::EncoderKind::PerLeafBc { tree_number: 0 },
             DataSourceFilter::ChainTreeNumber(3),
-            VerificationMode::ChainRootHistory,
             InstanceRole::Live,
         ),
         mk(
@@ -114,7 +108,6 @@ fn build_six_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
                 list_key: lk_a,
                 block: 0,
             },
-            VerificationMode::UpstreamAsserted,
             InstanceRole::Live,
         ),
         mk(
@@ -125,7 +118,6 @@ fn build_six_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
                 list_key: lk_b,
                 block: 0,
             },
-            VerificationMode::UpstreamAsserted,
             InstanceRole::Live,
         ),
     ]
@@ -213,9 +205,7 @@ async fn multi_instance_bootstrap_routes_events_per_instance() {
         list_key: lk_a,
         list_index: 0,
         blinded_commitment: planted_bc_a,
-        status: 0,
         event_type: raven_railgun_persistence::PpoiEventType::Shield,
-        signature: vec![0; 64],
         validated_merkleroot: [0; 32],
     };
     mh.channels
@@ -348,9 +338,7 @@ async fn multi_instance_recovery_byte_identity() {
                         list_key: lk,
                         list_index: i,
                         blinded_commitment: bc,
-                        status: 0,
                         event_type: raven_railgun_persistence::PpoiEventType::Shield,
-                        signature: vec![0; 64],
                         validated_merkleroot: [0; 32],
                     },
                     0,

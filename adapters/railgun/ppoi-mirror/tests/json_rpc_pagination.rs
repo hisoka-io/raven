@@ -11,6 +11,7 @@
 use axum::{extract::State, routing::post, Json, Router};
 use raven_railgun_core::ListKey;
 use raven_railgun_persistence::WalEntryPayload;
+use raven_railgun_ppoi_mirror::test_signer::TestListSigner;
 use raven_railgun_ppoi_mirror::{FeedStatus, MirrorConfig, PreflightFailure, UpstreamPpoiMirror};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,19 +30,30 @@ impl CapturedRequests {
     }
 }
 
-fn row(index: u64) -> Value {
-    json!({
-        "signedPOIEvent": {
-            "index": index,
-            "blindedCommitment": format!("{index:064x}"),
-            "signature": "00".repeat(64),
-            "type": "Shield"
-        },
-        "validatedMerkleroot": format!("{:064x}", index + 1)
-    })
+/// The provider of each list these tests ask for, named by its seed.
+fn provider(seed: u8) -> TestListSigner {
+    TestListSigner::new(seed)
 }
 
-/// Refuses a range over 501 rows, as upstream does. A list key starting `43` leaves out row 250.
+fn list(seed: u8) -> ListKey {
+    ListKey(provider(seed).list_key())
+}
+
+/// The list whose pages leave out row 250.
+const GAPPED: u8 = 0x43;
+
+fn row(seed: u8, index: u64) -> Value {
+    provider(seed)
+        .row(
+            index,
+            &format!("{index:064x}"),
+            "Shield",
+            &format!("{:064x}", index + 1),
+        )
+        .expect("signs")
+}
+
+/// Refuses a range over 501 rows, as upstream does. The [`GAPPED`] list leaves out row 250.
 async fn json_rpc(
     State(captured): State<Arc<CapturedRequests>>,
     Json(request): Json<Value>,
@@ -57,12 +69,12 @@ async fn json_rpc(
             "error": {"code": -32602, "message": "range exceeds 501 rows"}
         }));
     }
-    let drop_index_250 = params["listKey"]
-        .as_str()
-        .is_some_and(|list| list.starts_with("43"));
+    let seed = (0x42..=0x45)
+        .find(|seed| params["listKey"] == provider(*seed).list_key_hex())
+        .expect("a list these tests name");
     let events: Vec<Value> = (start..=end)
-        .filter(|index| !(drop_index_250 && *index == 250))
-        .map(row)
+        .filter(|index| !(seed == GAPPED && *index == 250))
+        .map(|index| row(seed, index))
         .collect();
     Json(json!({ "jsonrpc": "2.0", "id": request["id"], "result": events }))
 }
@@ -110,7 +122,7 @@ async fn the_default_page_takes_501_rows_and_the_next_starts_after_them() {
     let (endpoint, captured) = start_json_rpc().await;
     let (tx, mut rx) = tokio::sync::mpsc::channel(1_100);
     let worker = tokio::spawn(feed_mirror(endpoint).run_feed(
-        ListKey([0x45; 32]),
+        list(0x45),
         0,
         |cursor| cursor..u64::MAX,
         FeedStatus::default(),
@@ -163,7 +175,7 @@ async fn a_default_page_missing_a_row_is_asked_again_from_that_row() {
     let (endpoint, captured) = start_json_rpc().await;
     let (tx, mut rx) = tokio::sync::mpsc::channel(1_100);
     let worker = tokio::spawn(feed_mirror(endpoint).run_feed(
-        ListKey([0x43; 32]),
+        list(GAPPED),
         0,
         |cursor| cursor..u64::MAX,
         FeedStatus::default(),
@@ -221,7 +233,7 @@ async fn preflight(endpoint: String) -> Result<(), PreflightFailure> {
         ..MirrorConfig::default()
     })
     .expect("mirror")
-    .preflight(&ListKey([0x42; 32]), Duration::from_secs(5))
+    .preflight(&list(0x42), Duration::from_secs(5))
     .await
     .map_err(|error| error.failure)
 }
@@ -253,7 +265,7 @@ async fn malformed_json_rpc_envelopes_fail_closed() {
 #[tokio::test]
 async fn an_all_zero_validated_merkleroot_is_refused_at_decode() {
     for (root, accepted) in [(format!("{:064x}", 7), true), ("0".repeat(64), false)] {
-        let mut page = row(0);
+        let mut page = row(0x42, 0);
         page["validatedMerkleroot"] = json!(root);
         let outcome =
             preflight(serve_one(json!({"jsonrpc": "2.0", "id": 1, "result": [page]})).await).await;
@@ -297,7 +309,7 @@ async fn a_short_tail_resumes_at_the_row_after_the_last_taken() {
                     let start = request["params"]["startIndex"].as_u64().expect("start");
                     let end = request["params"]["endIndex"].as_u64().expect("end");
                     let events: Vec<Value> = (start..=end.min(max_index.load(Ordering::SeqCst)))
-                        .map(row)
+                        .map(|index| row(0x44, index))
                         .collect();
                     Json(json!({"jsonrpc": "2.0", "id": 1, "result": events}))
                 }
@@ -318,13 +330,8 @@ async fn a_short_tail_resumes_at_the_row_after_the_last_taken() {
     );
     let status = FeedStatus::default();
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-    let worker = tokio::spawn(mirror.run_feed(
-        ListKey([0x44; 32]),
-        0,
-        |cursor| cursor..u64::MAX,
-        status.clone(),
-        tx,
-    ));
+    let worker =
+        tokio::spawn(mirror.run_feed(list(0x44), 0, |cursor| cursor..u64::MAX, status.clone(), tx));
     leaf_arrives(&mut rx, 2).await;
     let tip = tokio::time::timeout(Duration::from_secs(30), async {
         loop {

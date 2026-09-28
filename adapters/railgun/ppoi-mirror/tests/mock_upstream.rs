@@ -15,12 +15,15 @@ use axum::routing::post;
 use axum::Router;
 use raven_railgun_core::ListKey;
 use raven_railgun_persistence::{PpoiEventType, WalEntryPayload};
-use raven_railgun_ppoi_mirror::{
-    FeedStatus, MirrorConfig, MirrorError, UpstreamPpoiMirror, LIST_MEMBERSHIP_STATUS,
-};
+use raven_railgun_ppoi_mirror::test_signer::TestListSigner;
+use raven_railgun_ppoi_mirror::{FeedStatus, MirrorConfig, MirrorError, UpstreamPpoiMirror};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
+
+fn provider() -> TestListSigner {
+    TestListSigner::new(0x55)
+}
 
 #[derive(Default)]
 struct MockState {
@@ -39,25 +42,19 @@ async fn json_rpc_handler(
     let start = request["params"]["startIndex"]
         .as_u64()
         .ok_or(StatusCode::BAD_REQUEST)?;
+    let row = |index, commitment: &str, event_type, root: &str| {
+        provider()
+            .row(
+                index,
+                &format!("0x{}", commitment.repeat(32)),
+                event_type,
+                &format!("0x{}", root.repeat(32)),
+            )
+            .expect("signs")
+    };
     let result = json!([
-        {
-            "signedPOIEvent": {
-                "index": start,
-                "blindedCommitment": format!("0x{}", "11".repeat(32)),
-                "signature": "00".repeat(64),
-                "type": "Shield",
-            },
-            "validatedMerkleroot": format!("0x{}", "aa".repeat(32)),
-        },
-        {
-            "signedPOIEvent": {
-                "index": start + 1,
-                "blindedCommitment": format!("0x{}", "22".repeat(32)),
-                "signature": "11".repeat(64),
-                "type": "Transact",
-            },
-            "validatedMerkleroot": format!("0x{}", "bb".repeat(32)),
-        }
+        row(start, "11", "Shield", "aa"),
+        row(start + 1, "22", "Transact", "bb"),
     ]);
     Ok(Json(
         json!({ "jsonrpc": "2.0", "id": request["id"], "result": result }),
@@ -80,8 +77,8 @@ async fn start_mock() -> (String, Arc<MockState>) {
 }
 
 /// Two pages of two rows, then the span ends: each row reaches the engine as exactly one
-/// `PpoiListLeafAdded` at height 0, carrying the upstream fields and the membership byte, and
-/// nothing else is sent for it.
+/// `PpoiListLeafAdded` at height 0, carrying the upstream fields the WAL keeps, and nothing else
+/// is sent for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_row_reaches_the_engine_as_one_leaf_carrying_its_upstream_fields() {
     let (url, state) = start_mock().await;
@@ -95,7 +92,7 @@ async fn each_row_reaches_the_engine_as_one_leaf_carrying_its_upstream_fields() 
         .expect("mirror builds")
         .with_backfill_interval(Duration::ZERO),
     );
-    let list = ListKey([0x55; 32]);
+    let list = ListKey(provider().list_key());
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(WalEntryPayload, u64)>(64);
     let stopped = tokio::time::timeout(
         Duration::from_secs(30),
@@ -118,7 +115,7 @@ async fn each_row_reaches_the_engine_as_one_leaf_carrying_its_upstream_fields() 
             assert_eq!(params["chainType"], "0");
             assert_eq!(params["chainID"], "1");
             assert_eq!(params["txidVersion"], "V2_PoseidonMerkle");
-            assert_eq!(params["listKey"], "55".repeat(32));
+            assert_eq!(params["listKey"], provider().list_key_hex());
             assert_eq!(params["startIndex"], start);
             assert_eq!(params["endIndex"], start + 1);
         }
@@ -139,9 +136,7 @@ async fn each_row_reaches_the_engine_as_one_leaf_carrying_its_upstream_fields() 
             list_key,
             list_index,
             blinded_commitment,
-            status,
             event_type,
-            signature,
             validated_merkleroot,
         } = payload
         else {
@@ -152,11 +147,6 @@ async fn each_row_reaches_the_engine_as_one_leaf_carrying_its_upstream_fields() 
         assert_eq!(*list_index, index);
         assert_eq!(*blinded_commitment, [if second { 0x22 } else { 0x11 }; 32]);
         assert_eq!(
-            *status,
-            LIST_MEMBERSHIP_STATUS.wire_byte(),
-            "an event type moved the status byte: ppoi_poi_events carries no verdict"
-        );
-        assert_eq!(
             *event_type,
             if second {
                 PpoiEventType::Transact
@@ -164,7 +154,6 @@ async fn each_row_reaches_the_engine_as_one_leaf_carrying_its_upstream_fields() 
                 PpoiEventType::Shield
             }
         );
-        assert_eq!(*signature, vec![if second { 0x11 } else { 0x00 }; 64]);
         assert_eq!(
             *validated_merkleroot,
             [if second { 0xbb } else { 0xaa }; 32]
@@ -173,27 +162,26 @@ async fn each_row_reaches_the_engine_as_one_leaf_carrying_its_upstream_fields() 
 }
 
 /// Binds the crate doc's membership statement to the code it describes. A change that makes a
-/// second verdict nameable in the mirror reds here even when no mock row exercises it, so the
-/// statement cannot drift away from the code while every other gate passes.
+/// verdict nameable in the mirror reds here even when no mock row exercises it, so the statement
+/// cannot drift away from the code while every other gate passes.
 #[test]
-fn the_membership_statement_matches_the_only_verdict_the_mirror_names() {
+fn the_membership_statement_matches_a_mirror_that_names_no_verdict() {
     let lib_src = include_str!("../src/lib.rs");
     for sentence in [
         "`ppoi_poi_events` carries membership, not a verdict.",
-        "every row this mirror emits carries [`LIST_MEMBERSHIP_STATUS`]",
+        "So a row this mirror delivers carries no status",
     ] {
         assert!(
             lib_src.contains(sentence),
-            "the crate doc must still state what a mirrored status is; missing: {sentence}"
+            "the crate doc must still state what a mirrored row says; missing: {sentence}"
         );
     }
     let code = &lib_src[..lib_src.find("#[cfg(test)]").expect("test module")];
     assert_eq!(
-        code.matches("POIStatus::").count(),
-        1,
-        "the mirror names a POIStatus variant besides LIST_MEMBERSHIP_STATUS: it is emitting a \
-         verdict from a response that carries only membership. Settle it against upstream and \
-         update the crate doc's membership statement before changing this"
+        code.matches("POIStatus").count(),
+        0,
+        "the mirror names a POIStatus: it is emitting a verdict from a response that carries only \
+         membership. Settle it against upstream and update the crate doc's membership statement \
+         before changing this"
     );
-    assert!(code.contains("pub const LIST_MEMBERSHIP_STATUS: POIStatus = POIStatus::Valid;"));
 }

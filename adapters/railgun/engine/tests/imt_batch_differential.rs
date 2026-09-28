@@ -317,9 +317,7 @@ fn ppoi_row(list_index: u32, bc: [u8; 32], tag: u8) -> WalEntryPayload {
         list_key: LIST_KEY,
         list_index,
         blinded_commitment: bc,
-        status: 0,
         event_type: PpoiEventType::Shield,
-        signature: Vec::new(),
         validated_merkleroot: [tag; 32],
     }
 }
@@ -429,9 +427,7 @@ fn check_store_case(case: &StoreCase) -> Result<(), TestCaseError> {
                 list_key: [0x77; 32],
                 list_index: index as u32,
                 blinded_commitment: pool_leaf(1),
-                status: 0,
                 event_type: PpoiEventType::Shield,
-                signature: vec![],
                 validated_merkleroot: [0; 32],
             },
         };

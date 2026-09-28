@@ -27,7 +27,7 @@ use raven_railgun_engine::inspire::{
     register_client_session, setup_state, InspireServerState, LogicalLeafStore, RavenInspireScheme,
 };
 use raven_railgun_engine::orchestrator::{
-    bootstrap_railgun_engine_multi, DataSourceFilter, InstanceConfig, VerificationMode,
+    bootstrap_railgun_engine_multi, DataSourceFilter, InstanceConfig,
 };
 use raven_railgun_engine::persistence::{ConsumerEvent, RetentionPolicy, SnapshotPolicy};
 use raven_railgun_engine::pir_table::list::PATH10_MAGIC;
@@ -67,9 +67,7 @@ fn rooted_leaf(list_index: u32, validated_merkleroot: [u8; 32]) -> WalEntryPaylo
         list_key: LIST_KEY,
         list_index,
         blinded_commitment: bc_for(list_index),
-        status: 0,
         event_type: PpoiEventType::Shield,
-        signature: Vec::new(),
         validated_merkleroot,
     }
 }
@@ -397,7 +395,6 @@ async fn served_after_commit(
         encoder,
         record_size: width,
         entries_per_shard: EPS,
-        verification_mode: VerificationMode::UpstreamAsserted,
         data_source: DataSourceFilter::PpoiListBlock {
             list_key: LIST_KEY,
             block: 0,

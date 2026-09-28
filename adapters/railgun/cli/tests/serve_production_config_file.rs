@@ -19,9 +19,7 @@
 use raven_railgun_cli::serve_production_multi::{
     load_options_from_toml, run_with_listener, MultiServeOptions,
 };
-use raven_railgun_engine::orchestrator::{
-    default_k_for, DataSourceFilter, InstanceConfig, VerificationMode,
-};
+use raven_railgun_engine::orchestrator::{default_k_for, DataSourceFilter, InstanceConfig};
 use raven_railgun_engine::persistence::SnapshotPolicy;
 use raven_railgun_engine::pir_table::EncoderKind;
 use raven_railgun_engine::InstanceRole;
@@ -395,7 +393,6 @@ fn explicit_k_override_replaces_encoder_default() {
         encoder: EncoderKind::PerNode { tree_number: 0 },
         record_size: 32,
         entries_per_shard: 256,
-        verification_mode: VerificationMode::ChainRootHistory,
         data_source: DataSourceFilter::ChainTreeNumber(0),
         use_flock: false,
         snapshot_policy: SnapshotPolicy::default(),

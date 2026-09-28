@@ -1,5 +1,5 @@
 //! Real-data signature oracle: a recorded capture of an upstream PPOI list, served by the replay
-//! over loopback, fed through the production mirror feed with signature checks on. Every row
+//! over loopback, fed through the production mirror feed, which checks every signature. Every row
 //! must verify under the list key, the rows served without `0x` included, and a row planted with
 //! a changed signature, index, type or commitment must be refused by index and never sent.
 //!
@@ -91,7 +91,6 @@ fn checking_mirror(endpoint: String, scope: &ChainScope) -> Arc<UpstreamPpoiMirr
             chain_id: u64::from(scope.chain_id),
             txid_version: scope.txid_version.clone(),
             poll_interval_secs: 1,
-            verify_signatures: true,
             ..MirrorConfig::default()
         })
         .expect("mirror config")
@@ -263,7 +262,6 @@ async fn every_captured_row_verifies_at_ingest_and_planted_forgeries_are_refused
             list_index,
             blinded_commitment,
             event_type,
-            signature,
             validated_merkleroot,
             ..
         } = payload
@@ -277,7 +275,6 @@ async fn every_captured_row_verifies_at_ingest_and_planted_forgeries_are_refused
             "row {delivered}"
         );
         assert_eq!(event_type, wal_type(row.event_type), "row {delivered}");
-        assert_eq!(signature, row.signature.to_vec(), "row {delivered}");
         assert_eq!(
             validated_merkleroot, row.validated_merkleroot,
             "row {delivered}"

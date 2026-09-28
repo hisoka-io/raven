@@ -92,9 +92,7 @@ pub fn canonical_payload(seed: u64, i: usize) -> (WalEntryPayload, u64) {
                 a[0] = ((h >> 8) & 0xff) as u8;
                 a
             },
-            status: 0,
             event_type: raven_railgun_persistence::PpoiEventType::Shield,
-            signature: Vec::new(),
             validated_merkleroot: [0; 32],
         },
         _ => WalEntryPayload::Heartbeat {

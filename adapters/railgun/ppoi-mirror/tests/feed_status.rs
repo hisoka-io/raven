@@ -16,6 +16,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use raven_railgun_core::ListKey;
 use raven_railgun_persistence::WalEntryPayload;
+use raven_railgun_ppoi_mirror::test_signer::TestListSigner;
 use raven_railgun_ppoi_mirror::{
     FeedProgress, FeedStatus, MirrorConfig, MirrorError, PreflightFailure, UpstreamPpoiMirror,
 };
@@ -25,7 +26,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-const LIST: ListKey = ListKey([0x52; 32]);
+fn provider() -> TestListSigner {
+    TestListSigner::new(0x52)
+}
+
+fn list() -> ListKey {
+    ListKey(provider().list_key())
+}
 
 struct Upstream {
     /// Rows `0..rows` exist.
@@ -64,15 +71,10 @@ async fn serve(rows: u64, failing: &[usize]) -> (String, Arc<Upstream>) {
                 }
                 let rows: Vec<Value> = (start..=end.min(upstream.rows.saturating_sub(1)))
                     .map(|index| {
-                        json!({
-                            "signedPOIEvent": {
-                                "index": index,
-                                "blindedCommitment": format!("{:064x}", index + 1),
-                                "signature": "00".repeat(64),
-                                "type": "Shield"
-                            },
-                            "validatedMerkleroot": format!("{:064x}", index + 1)
-                        })
+                        let digits = format!("{:064x}", index + 1);
+                        provider()
+                            .row(index, &digits, "Shield", &digits)
+                            .expect("signs")
                     })
                     .collect();
                 Ok(Json(json!({ "jsonrpc": "2.0", "id": 1, "result": rows })))
@@ -143,7 +145,7 @@ async fn a_feed_asks_only_for_the_runs_its_span_names_and_stops_after_the_last()
     let status = FeedStatus::default();
     let stopped = tokio::time::timeout(
         Duration::from_secs(10),
-        mirror(&endpoint, 3).run_feed(LIST, 0, two_runs, status.clone(), tx),
+        mirror(&endpoint, 3).run_feed(list(), 0, two_runs, status.clone(), tx),
     )
     .await
     .expect("the feed must stop after the last run");
@@ -179,7 +181,7 @@ async fn the_status_counts_failures_until_an_answer_and_knows_the_tip_only_from_
     let (tx, mut rx) = mpsc::channel(256);
     let status = FeedStatus::default();
     let worker = tokio::spawn(mirror(&endpoint, 10).run_feed(
-        LIST,
+        list(),
         0,
         |cursor| cursor..u64::MAX,
         status.clone(),

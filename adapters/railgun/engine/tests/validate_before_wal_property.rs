@@ -85,17 +85,15 @@ fn append_leaf_strategy() -> impl Strategy<Value = WalEntryPayload> {
 }
 
 fn ppoi_list_leaf_strategy() -> impl Strategy<Value = WalEntryPayload> {
-    (slot_index_strategy(), leaf_bytes_strategy(), any::<u8>()).prop_map(
-        |(list_index, blinded_commitment, status)| WalEntryPayload::PpoiListLeafAdded {
+    (slot_index_strategy(), leaf_bytes_strategy()).prop_map(|(list_index, blinded_commitment)| {
+        WalEntryPayload::PpoiListLeafAdded {
             list_key: LIST_KEY,
             list_index,
             blinded_commitment,
-            status,
             event_type: raven_railgun_persistence::PpoiEventType::Shield,
-            signature: vec![0; 64],
             validated_merkleroot: [0; 32],
-        },
-    )
+        }
+    })
 }
 
 fn imt_backed_payload_strategy() -> impl Strategy<Value = WalEntryPayload> {
@@ -115,18 +113,15 @@ fn prefix_and_candidate(ppoi_only: bool) -> impl Strategy<Value = (u32, WalEntry
             Just(prefix_len),
             candidate_index_strategy(prefix_len),
             leaf_bytes_strategy(),
-            any::<u8>(),
             variant,
         )
-            .prop_map(|(prefix_len, index, leaf, status, is_ppoi)| {
+            .prop_map(|(prefix_len, index, leaf, is_ppoi)| {
                 let payload = if is_ppoi {
                     WalEntryPayload::PpoiListLeafAdded {
                         list_key: LIST_KEY,
                         list_index: index,
                         blinded_commitment: leaf,
-                        status,
                         event_type: raven_railgun_persistence::PpoiEventType::Shield,
-                        signature: vec![0; 64],
                         validated_merkleroot: [0; 32],
                     }
                 } else {
@@ -156,9 +151,7 @@ fn contiguous_prefix(len: u32) -> Vec<WalEntryPayload> {
             list_key: LIST_KEY,
             list_index: i,
             blinded_commitment: canonical_commitment(seed),
-            status: 1,
             event_type: raven_railgun_persistence::PpoiEventType::Shield,
-            signature: vec![0; 64],
             validated_merkleroot: [0; 32],
         });
     }
@@ -311,7 +304,6 @@ proptest! {
             Just(u32::MAX),
         ],
         leaf in leaf_bytes_strategy(),
-        status in any::<u8>(),
         is_ppoi in any::<bool>(),
     ) {
         let mut store = LogicalLeafStore::new();
@@ -324,9 +316,7 @@ proptest! {
                 list_key: LIST_KEY,
                 list_index: index,
                 blinded_commitment: leaf,
-                status,
                 event_type: raven_railgun_persistence::PpoiEventType::Shield,
-                signature: vec![0; 64],
                 validated_merkleroot: [0; 32],
             }
         } else {

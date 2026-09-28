@@ -9,9 +9,7 @@ use std::time::Duration;
 use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
 use raven_railgun_engine::inspire::InspireServerState;
-use raven_railgun_engine::orchestrator::{
-    bootstrap_railgun_engine, OrchestratorConfig, VerificationMode,
-};
+use raven_railgun_engine::orchestrator::{bootstrap_railgun_engine, OrchestratorConfig};
 use raven_railgun_engine::persistence::{ConsumerEvent, SnapshotPolicy};
 use raven_railgun_engine::InstanceRole;
 use raven_railgun_persistence::WalEntryPayload;
@@ -57,7 +55,6 @@ fn quiet_config(dir: &std::path::Path, instance_id: &str) -> OrchestratorConfig 
     config.role = InstanceRole::Live;
     SCHEME_TAG.clone_into(&mut config.scheme_tag);
     config.snapshot_policy = commit_every_event();
-    config.verification_mode = VerificationMode::UpstreamAsserted;
     config.verification_cadence_n = 0;
     config.chain_source = None;
     config
@@ -121,9 +118,7 @@ async fn ppoi_height_zero_must_not_collapse_the_resume_floor() {
             list_key: LIST_KEY,
             list_index: u32::from(byte),
             blinded_commitment: canonical_commitment(0x80 | byte),
-            status: 0,
             event_type: raven_railgun_persistence::PpoiEventType::Shield,
-            signature: Vec::new(),
             validated_merkleroot: [0; 32],
         };
         handle

@@ -22,13 +22,20 @@ use axum::routing::post;
 use axum::{Json, Router};
 use raven_railgun_core::ListKey;
 use raven_railgun_persistence::WalEntryPayload;
+use raven_railgun_ppoi_mirror::test_signer::TestListSigner;
 use raven_railgun_ppoi_mirror::{FeedStatus, MirrorConfig, MirrorError, UpstreamPpoiMirror};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-const LIST: ListKey = ListKey([0x51; 32]);
+fn provider() -> TestListSigner {
+    TestListSigner::new(0x51)
+}
+
+fn list() -> ListKey {
+    ListKey(provider().list_key())
+}
 
 /// First row of the seventh 65,536-row block: where a six-block forest runs out.
 const SEVENTH_BLOCK: u64 = 6 * 65_536;
@@ -78,15 +85,14 @@ impl Upstream {
 }
 
 fn row(index: u64) -> Value {
-    json!({
-        "signedPOIEvent": {
-            "index": index,
-            "blindedCommitment": format!("{index:064x}"),
-            "signature": "00".repeat(64),
-            "type": "Shield"
-        },
-        "validatedMerkleroot": format!("{:064x}", index + 1)
-    })
+    provider()
+        .row(
+            index,
+            &format!("{index:064x}"),
+            "Shield",
+            &format!("{:064x}", index + 1),
+        )
+        .expect("signs")
 }
 
 async fn serve(upstream: Upstream) -> (String, Arc<Upstream>) {
@@ -155,7 +161,7 @@ type Payloads = mpsc::Receiver<(WalEntryPayload, u64)>;
 
 fn feed_all(mirror: Arc<UpstreamPpoiMirror>, tx: mpsc::Sender<(WalEntryPayload, u64)>) -> Feed {
     tokio::spawn(mirror.run_feed(
-        LIST,
+        list(),
         0,
         |cursor| cursor..u64::MAX,
         FeedStatus::default(),
@@ -327,7 +333,7 @@ async fn the_feed_stops_in_front_of_the_first_unheld_row_and_resumes_there() {
     let stopped = settled(
         &status,
         mirror(&endpoint, 1, 501, None).run_feed(
-            LIST,
+            list(),
             SEVENTH_BLOCK - 2,
             |at| at..at.max(SEVENTH_BLOCK),
             status.clone(),
@@ -365,7 +371,7 @@ async fn the_feed_stops_in_front_of_the_first_unheld_row_and_resumes_there() {
 
     let (tx, mut rx) = mpsc::channel(64);
     let resumed = tokio::spawn(mirror(&endpoint, 1, 501, None).run_feed(
-        LIST,
+        list(),
         resume_at,
         |at| at..at.max(SEVENTH_BLOCK + 65_536),
         FeedStatus::default(),
@@ -388,7 +394,7 @@ async fn a_feed_starting_on_its_stop_asks_upstream_for_nothing() {
     let stopped = settled(
         &status,
         mirror(&endpoint, 1, 501, None).run_feed(
-            LIST,
+            list(),
             SEVENTH_BLOCK,
             |at| at..at.max(SEVENTH_BLOCK),
             status.clone(),
@@ -415,7 +421,7 @@ async fn a_feed_booted_past_an_unheld_row_names_that_row() {
     let stopped = settled(
         &status,
         mirror(&endpoint, 1, 501, None).run_feed(
-            LIST,
+            list(),
             2 * GAP + 7,
             |_| GAP..GAP,
             status.clone(),
@@ -439,7 +445,7 @@ async fn a_closed_channel_ends_the_poll_wait_at_once() {
     let (tx, mut rx) = mpsc::channel(64);
     let status = FeedStatus::default();
     let worker = tokio::spawn(mirror(&endpoint, 30, 10, None).run_feed(
-        LIST,
+        list(),
         0,
         |cursor| cursor..u64::MAX,
         status.clone(),

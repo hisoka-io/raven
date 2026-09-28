@@ -15,7 +15,7 @@ use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, InstanceId, RailgunEvent};
 use raven_railgun_engine::inspire::{InspireServerState, RavenInspireScheme};
 use raven_railgun_engine::orchestrator::{
-    bootstrap_railgun_engine_multi, DataSourceFilter, InstanceConfig, VerificationMode,
+    bootstrap_railgun_engine_multi, DataSourceFilter, InstanceConfig,
 };
 use raven_railgun_engine::persistence::{ConsumerEvent, SnapshotPolicy};
 use raven_railgun_engine::pir_table::EncoderKind;
@@ -43,7 +43,6 @@ fn commit_tree_cfg(
         encoder: EncoderKind::PerLeafBc { tree_number: 0 },
         record_size: TOY_ENTRY_SIZE,
         entries_per_shard: TOY_ENTRIES_PER_SHARD,
-        verification_mode: VerificationMode::ChainRootHistory,
         data_source: DataSourceFilter::ChainTreeNumber(t),
         use_flock: false,
         snapshot_policy: SnapshotPolicy::default(),

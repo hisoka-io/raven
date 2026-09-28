@@ -23,7 +23,6 @@ use raven_railgun_engine::inspire::{
 };
 use raven_railgun_engine::orchestrator::{
     bootstrap_railgun_engine_multi, DataSourceFilter, InstanceConfig, MultiOrchestratorHandle,
-    VerificationMode,
 };
 use raven_railgun_engine::persistence::{ConsumerEvent, SnapshotPolicy};
 use raven_railgun_engine::pir_table::list::PATH10_MAGIC;
@@ -83,7 +82,6 @@ fn boot(
         encoder: EncoderKind::PerListPath10 { list_key: LIST_KEY },
         record_size: PATH10_RECORD_BYTES,
         entries_per_shard: EPS,
-        verification_mode: VerificationMode::UpstreamAsserted,
         data_source: DataSourceFilter::PpoiListBlock {
             list_key: LIST_KEY,
             block: 0,
@@ -156,9 +154,7 @@ async fn mirror_rows(
             list_key: LIST_KEY,
             list_index,
             blinded_commitment: bc_for(list_index),
-            status: POIStatus::Valid.wire_byte(),
             event_type: PpoiEventType::Shield,
-            signature: vec![0; 64],
             validated_merkleroot: upstream.root(),
         };
         handle

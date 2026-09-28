@@ -14,7 +14,7 @@ use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
 use raven_railgun_engine::inspire::InspireServerState;
 use raven_railgun_engine::orchestrator::{
-    bootstrap_railgun_engine, OrchestratorConfig, OrchestratorHandle, VerificationMode,
+    bootstrap_railgun_engine, OrchestratorConfig, OrchestratorHandle,
 };
 use raven_railgun_engine::persistence::{ConsumerEvent, SnapshotPolicy};
 use raven_railgun_engine::InstanceRole;
@@ -177,7 +177,6 @@ fn boot(dir: &std::path::Path) -> OrchestratorHandle {
         max_appends_per_snapshot: 1,
         ..SnapshotPolicy::default()
     };
-    config.verification_mode = VerificationMode::UpstreamAsserted;
     config.verification_cadence_n = 0;
     config.chain_source = None;
     let params = InspireParams::secure_128_d2048();

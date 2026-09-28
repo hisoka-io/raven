@@ -148,10 +148,8 @@ pub struct OrchestratorConfig {
     pub entries_per_shard: u32,
     /// Max concurrent in-flight respond ops. `None` resolves via [`default_k_for`].
     pub max_concurrent_queries: Option<usize>,
-    /// On-disk-state authority: chain rootHistory, or the upstream feed (see
-    /// `VerificationMode::UpstreamAsserted`).
-    pub verification_mode: VerificationMode,
-    /// Run the Layer 2 verifier every Nth commit. `0` disables.
+    /// Run the Layer 2 verifier every Nth commit. `0` disables. Only a chain-tree encoder is
+    /// verified.
     pub verification_cadence_n: u32,
     /// Tree number whose IMT the verifier cross-checks against rootHistory.
     pub verification_tree_number: u32,
@@ -177,7 +175,6 @@ impl OrchestratorConfig {
             record_size: 512,
             entries_per_shard: 2048,
             max_concurrent_queries: None,
-            verification_mode: VerificationMode::ChainRootHistory,
             verification_cadence_n: 10,
             verification_tree_number: 0,
             chain_source: None,
@@ -208,7 +205,6 @@ impl std::fmt::Debug for OrchestratorConfig {
             .field("record_size", &self.record_size)
             .field("entries_per_shard", &self.entries_per_shard)
             .field("max_concurrent_queries", &self.max_concurrent_queries)
-            .field("verification_mode", &self.verification_mode)
             .field("verification_cadence_n", &self.verification_cadence_n)
             .field("verification_tree_number", &self.verification_tree_number)
             .field("chain_source_attached", &self.chain_source.is_some())
@@ -269,11 +265,12 @@ pub fn bootstrap_railgun_engine(
     let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default()));
     let logical_store = Arc::new(parking_lot::Mutex::new(recovered_store));
 
+    // A list's root is published by its provider, not the chain, so no rootHistory can check it.
     let verifier_ctx = config
         .chain_source
         .as_ref()
+        .filter(|_| config.encoder.chain_tree_number().is_some())
         .map(|cs| Layer2VerifierContext {
-            verification_mode: config.verification_mode,
             cadence_n: config.verification_cadence_n,
             tree_number: config.verification_tree_number,
             chain_source: Some(Arc::clone(cs)),
@@ -330,34 +327,6 @@ pub fn bootstrap_railgun_engine(
     })
 }
 
-/// State authority for an instance. List instances must use
-/// `UpstreamAsserted`; their roots are not chain-anchored.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VerificationMode {
-    /// Cross-check IMT root against `RailgunSmartWallet.rootHistory`.
-    ChainRootHistory,
-    /// Accept the upstream feed as the authority: no chain cross-check is possible
-    /// because list roots are not chain-anchored.
-    ///
-    /// **The signature is checked at ingest, by the mirror, when its config asks.** With the
-    /// mirror's `verify_signatures` set, each row's `signedPOIEvent` ed25519 signature is
-    /// verified against the configured list key before the row reaches this crate, and a row
-    /// that fails is never delivered. That authenticates the row's index, blinded commitment
-    /// and type, not the chain or txid version it was signed for, so the endpoint can still
-    /// serve rows the same key signed for another chain or txid version, and can withhold or
-    /// delay rows; the list key is trusted as configured. Unset, rows arrive on the endpoint's
-    /// word. Either way this crate verifies no signature and stores none: the WAL and the
-    /// snapshot drop the signature the mirror hands over.
-    ///
-    /// **The root is the one thing this crate checks about the upstream feed.** Every
-    /// `PpoiListLeafAdded` is held, ahead of its WAL write, to the `validatedMerkleroot` it
-    /// carries ([`crate::ppoi_root`]); a divergent row is refused and counted. Two limits:
-    /// a row carrying the all-zero root is applied uncompared (counted separately), and the
-    /// check relates the served tree to the published list without authenticating the
-    /// publisher, who can put a consistent root over any leaves. This is the only root check.
-    UpstreamAsserted,
-}
-
 /// Routing filter: maps chain/mirror events to a specific instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DataSourceFilter {
@@ -387,9 +356,7 @@ pub struct InstanceConfig {
     pub record_size: usize,
     /// Rows per shard, matching `shard_config().entries_per_shard()`.
     pub entries_per_shard: u32,
-    /// On-disk-state authority.
-    pub verification_mode: VerificationMode,
-    /// Routing filter for chain/mirror events.
+    /// Routing filter for chain/mirror events. Only a chain tree is verified against the chain.
     pub data_source: DataSourceFilter,
     /// Acquire an advisory flock on `data_dir/.lock`.
     pub use_flock: bool,
@@ -416,7 +383,6 @@ impl std::fmt::Debug for InstanceConfig {
             .field("encoder", &self.encoder)
             .field("record_size", &self.record_size)
             .field("entries_per_shard", &self.entries_per_shard)
-            .field("verification_mode", &self.verification_mode)
             .field("data_source", &self.data_source)
             .field("use_flock", &self.use_flock)
             .field("snapshot_policy", &self.snapshot_policy)
@@ -453,7 +419,6 @@ impl InstanceConfig {
             encoder: super::pir_table::EncoderKind::PerLeafPath { tree_number },
             record_size: 16 * 32,
             entries_per_shard: 2048,
-            verification_mode: VerificationMode::ChainRootHistory,
             data_source: DataSourceFilter::ChainTreeNumber(tree_number),
             use_flock: true,
             snapshot_policy: match role {
@@ -493,7 +458,6 @@ impl std::fmt::Debug for PerInstanceHandles {
             .field("instance_id", &self.config.instance_id)
             .field("role", &self.config.role)
             .field("data_source", &self.config.data_source)
-            .field("verification_mode", &self.config.verification_mode)
             .field("encoder_label", &self.config.encoder.label())
             .finish_non_exhaustive()
     }
@@ -641,7 +605,6 @@ where
         let logical_store = Arc::new(parking_lot::Mutex::new(recovered_store));
         let verifier_ctx = match (&cfg.chain_source, cfg.data_source) {
             (Some(cs), DataSourceFilter::ChainTreeNumber(tn)) => Some(Layer2VerifierContext {
-                verification_mode: cfg.verification_mode,
                 cadence_n: cfg.verification_cadence_n,
                 tree_number: tn,
                 chain_source: Some(Arc::clone(cs)),
@@ -1197,9 +1160,7 @@ fn payload_for_ppoi_route(
             WalEntryPayload::PpoiListLeafAdded {
                 list_index,
                 blinded_commitment,
-                status,
                 event_type,
-                signature,
                 validated_merkleroot,
                 ..
             },
@@ -1208,9 +1169,7 @@ fn payload_for_ppoi_route(
                 list_key: route_key,
                 list_index: split_ppoi_index(*list_index).1,
                 blinded_commitment: *blinded_commitment,
-                status: *status,
                 event_type: *event_type,
-                signature: signature.clone(),
                 validated_merkleroot: *validated_merkleroot,
             })
         }
@@ -1227,9 +1186,7 @@ mod forest_routing_tests {
             list_key: [7; 32],
             list_index: index,
             blinded_commitment: [8; 32],
-            status: 0,
             event_type: raven_railgun_persistence::PpoiEventType::Shield,
-            signature: vec![9; 64],
             validated_merkleroot: [10; 32],
         }
     }

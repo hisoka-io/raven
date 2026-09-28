@@ -63,15 +63,11 @@ fn decode_client_id_header(headers: &http::HeaderMap) -> Option<[u8; 16]> {
         .get(X_RAVEN_CLIENT_ID)
         .and_then(|v| v.to_str().ok())?;
     let stripped: String = raw.chars().filter(|c| *c != '-').collect();
+    // Checked here, not left to the decoder: that accepts a `0x` a UUID never carries.
     if stripped.len() != 32 {
         return None;
     }
-    let mut out = [0u8; 16];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let byte_str = stripped.get(i * 2..i * 2 + 2)?;
-        *slot = u8::from_str_radix(byte_str, 16).ok()?;
-    }
-    Some(out)
+    raven_railgun_core::hex::decode_hex(&stripped)
 }
 
 #[derive(Clone, Debug)]
@@ -314,6 +310,16 @@ mod tests {
         headers.insert(
             HeaderName::from_static("x-raven-client-id"),
             HeaderValue::from_static("0102030405060708090a0b0c0d0e0f"),
+        );
+        assert_eq!(parse_client_id_header(&headers), [0u8; 16]);
+    }
+
+    #[test]
+    fn parse_client_id_header_rejects_a_signed_digit_pair_returns_zero() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-raven-client-id"),
+            HeaderValue::from_static("+a02030405060708090a0b0c0d0e0f10"),
         );
         assert_eq!(parse_client_id_header(&headers), [0u8; 16]);
     }

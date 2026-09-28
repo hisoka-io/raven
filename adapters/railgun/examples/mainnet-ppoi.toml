@@ -7,10 +7,13 @@
 # an `[[instance_template]]` with a chain encoder, and refused by one without any of them, as are
 # the other chain settings.
 #
-# Nothing here authenticates the list's publisher: each upstream event's signature is stored and
-# never verified, and the only check on a row is against the root upstream sends with it, which a
-# row carrying an all-zero root skips. List authenticity rests on TLS to `mirror_endpoint` - keep
-# it https.
+# Each upstream event's ed25519 signature is verified against the list key, the list provider's
+# public key, and a row that fails is refused and asked for again; nothing turns this off. That
+# authenticates each row's index, blinded commitment and type, and no more: the endpoint can still
+# withhold or delay rows, the signature names no chain or txid version, so rows the same key signed
+# for another chain or txid version pass, and the list key itself is trusted as configured. The
+# root upstream sends with each row is not signed; the row is held to it against the tree the node
+# builds. Keep `mirror_endpoint` https.
 #
 # The list routes answer only once the mirror has caught up with upstream: until then a
 # partially synced list would read as "Missing" for every row it has not reached, so they

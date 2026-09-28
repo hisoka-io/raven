@@ -14,6 +14,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use raven_railgun_core::hex::decode_hex;
 use raven_railgun_core::MerkleProof as CoreMerkleProof;
 use raven_railgun_engine::orchestrator::LEAVES_PER_PPOI_BLOCK;
 use raven_railgun_engine::PirScheme;
@@ -100,19 +101,6 @@ fn indices_to_hex(idx: u16) -> HexHash {
     hex_encode(&buf)
 }
 
-fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        let pair = s.get(i * 2..i * 2 + 2)?;
-        *byte = u8::from_str_radix(pair, 16).ok()?;
-    }
-    Some(out)
-}
-
 /// `merkle-proofs` looks each commitment up under every block's lock, which the ingest path
 /// also takes, so the vector is capped.
 const MAX_SHIM_BLINDED_COMMITMENTS: usize = 1024;
@@ -190,11 +178,11 @@ pub(crate) async fn merkle_proofs_handler<S: PirScheme>(
     if req.blinded_commitments.len() > MAX_SHIM_BLINDED_COMMITMENTS {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
-    let list_key = hex_decode_32(&req.list_key).ok_or(StatusCode::BAD_REQUEST)?;
+    let list_key = decode_hex(&req.list_key).ok_or(StatusCode::BAD_REQUEST)?;
     let blinded_commitments: Vec<[u8; 32]> = req
         .blinded_commitments
         .iter()
-        .filter_map(|s| hex_decode_32(s))
+        .filter_map(|s| decode_hex(s))
         .collect();
     if blinded_commitments.len() != req.blinded_commitments.len() {
         return Err(StatusCode::BAD_REQUEST);
@@ -263,7 +251,7 @@ pub(crate) async fn bc_prefix_segment_handler<S: PirScheme>(
     Query(segment): Query<IndexSegmentQuery>,
     headers_in: HeaderMap,
 ) -> Result<axum::response::Response, StatusCode> {
-    let list_key = hex_decode_32(&list_key_hex).ok_or(StatusCode::BAD_REQUEST)?;
+    let list_key = decode_hex(&list_key_hex).ok_or(StatusCode::BAD_REQUEST)?;
     let since = segment.since.unwrap_or(0);
     // Waited for here, off the blocking pool, so a queued read holds no thread.
     let permit = {
@@ -431,19 +419,7 @@ mod tests {
         let bytes = [0xab; 32];
         let s = hex_encode(&bytes);
         assert_eq!(s.len(), 64);
-        assert_eq!(hex_decode_32(&s), Some(bytes));
-    }
-
-    #[test]
-    fn hex_decode_rejects_short_input() {
-        assert!(hex_decode_32("ab").is_none());
-    }
-
-    #[test]
-    fn hex_decode_accepts_optional_0x_prefix() {
-        let bytes = [0x12; 32];
-        let with_prefix = format!("0x{}", hex_encode(&bytes));
-        assert_eq!(hex_decode_32(&with_prefix), Some(bytes));
+        assert_eq!(decode_hex(&s), Some(bytes));
     }
 
     #[test]
@@ -510,9 +486,7 @@ mod tests {
                     list_key: LIST_KEY,
                     list_index: local,
                     blinded_commitment: fr(seed),
-                    status: 0,
                     event_type: raven_railgun_persistence::PpoiEventType::Shield,
-                    signature: vec![0; 64],
                     validated_merkleroot: [0; 32],
                 },
                 1_000 + u64::from(local),

@@ -23,8 +23,8 @@ use raven_railgun_cli::serve_production_multi::{
     BootstrapView, MultiServeOptions,
 };
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
+use raven_railgun_engine::orchestrator::DataSourceFilter;
 use raven_railgun_engine::orchestrator::LEAVES_PER_PPOI_BLOCK;
-use raven_railgun_engine::orchestrator::{DataSourceFilter, VerificationMode};
 use raven_railgun_engine::persistence::SnapshotPolicy;
 use raven_railgun_engine::pir_table::EncoderKind;
 use raven_railgun_indexer::{
@@ -180,19 +180,7 @@ fn build_opts(
 }
 
 fn parse_hex32(s: &str) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        let hi = s.as_bytes()[i * 2];
-        let lo = s.as_bytes()[i * 2 + 1];
-        let nib = |c: u8| match c {
-            b'0'..=b'9' => c - b'0',
-            b'a'..=b'f' => c - b'a' + 10,
-            b'A'..=b'F' => c - b'A' + 10,
-            _ => panic!("non-hex byte"),
-        };
-        *byte = (nib(hi) << 4) | nib(lo);
-    }
-    out
+    raven_railgun_core::hex::decode_hex(s).expect("a 32-byte hex key")
 }
 
 use raven_railgun_testkit::canonical as canonical_commit;
@@ -353,9 +341,7 @@ async fn drive_synthetic_events(view: &BootstrapView, list_key_ofac: [u8; 32]) {
                     list_key: list_key_ofac,
                     list_index,
                     blinded_commitment: canonical_commit(bc),
-                    status: 0,
                     event_type: raven_railgun_persistence::PpoiEventType::Shield,
-                    signature: vec![0; 64],
                     validated_merkleroot: [0; 32],
                 },
                 0,
@@ -939,16 +925,6 @@ fn example_toml_parses_to_six_ppoi_blocks_with_expected_encoders() {
         })
         .collect();
     assert_eq!(blocks, vec![0, 1, 2, 3, 4, 5]);
-
-    // No key sets the mode; the loader derives it from the data source.
-    for inst in &opts.instances {
-        let want = if matches!(inst.data_source, DataSourceFilter::ChainTreeNumber(_)) {
-            VerificationMode::ChainRootHistory
-        } else {
-            VerificationMode::UpstreamAsserted
-        };
-        assert_eq!(inst.verification_mode, want, "{}", inst.instance_id);
-    }
 }
 
 /// The parser refuses a group- or world-readable config carrying an inline token.

@@ -243,7 +243,7 @@ pub fn swap_state(
 /// enforces. In-flight queries keep running on the donor store.
 ///
 /// # Errors
-/// [`ServerError::StateShapeMismatch`] if the donor geometry ever diverges.
+/// [`AdapterError::StateShapeMismatch`] if the donor geometry ever diverges.
 pub fn heartbeat_session_eviction(instance: &super::PirInstance<RavenInspireScheme>) -> Result<()> {
     // State and epoch must come from ONE load. Reading the epoch separately lets a
     // commit land in between: the donor is then pre-re-encode while the epoch is
@@ -413,8 +413,8 @@ fn padded_targets(
 /// Padding is client-side because the server is the adversary the ladder hides
 /// the count from: a pad the server generates is a pad the server knows about.
 /// Each pad is a fresh query that costs a full database pass, so it is
-/// indistinguishable from a real slot by size or work. Pads are aimed as
-/// [`padded_targets`] describes. Residual: reals hold slots 0..len in order, so
+/// indistinguishable from a real slot by size or work. Pads go first to shards no real
+/// index occupies, then to uniform shards. Residual: reals hold slots 0..len in order, so
 /// a structured real sequence (an auth path's ascending levels) can mark where
 /// the covers begin; closing that needs a shuffle plus a permutation map, which
 /// changes this contract.
@@ -903,9 +903,7 @@ mod frozen_v8_shape_tests {
                     list_key: LIST_KEY,
                     list_index: index,
                     blinded_commitment: bc,
-                    status: 0,
                     event_type: PpoiEventType::Shield,
-                    signature: vec![0x5a; 64],
                     validated_merkleroot: [0x11; 32],
                 },
                 0,
@@ -1135,9 +1133,7 @@ mod logical_store_tests {
             list_key,
             list_index,
             blinded_commitment: bc,
-            status: 0,
             event_type: raven_railgun_persistence::PpoiEventType::Shield,
-            signature: vec![0; 64],
             validated_merkleroot: [0; 32],
         }
     }

@@ -11,9 +11,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 
-use crate::capture::{decode_hex, hex, Capture, ChainScope, EventRow, EventType};
+use crate::capture::{hex, Capture, ChainScope, EventRow, EventType};
 use crate::json::{write_string, Json};
 use crate::{ReplayError, Result};
+use raven_railgun_core::hex::decode_hex;
 
 const POI_EVENTS: &str = "ppoi_poi_events";
 const NODE_STATUS: &str = "ppoi_node_status";

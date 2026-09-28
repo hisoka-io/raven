@@ -47,8 +47,6 @@ fn a_snapshot_written_under_the_literal_magic_loads_under_the_constant() {
 /// bincode tags an enum with its declaration index as a u32 LE prefix, so reordering the
 /// variants - or reordering, widening or narrowing a field - re-points every frame an
 /// older build wrote at a different variant, and `replay` reports success on the wrong one.
-/// The two transport-only fields of a list leaf are left at their defaults here; the test
-/// below pins that they are not written.
 fn wal_payload_vectors() -> Vec<(WalEntryPayload, Vec<u8>)> {
     let mut append_leaf = vec![0x00, 0x00, 0x00, 0x00];
     append_leaf.extend_from_slice(&0x0102_0304u32.to_le_bytes());
@@ -77,7 +75,7 @@ fn wal_payload_vectors() -> Vec<(WalEntryPayload, Vec<u8>)> {
             },
             append_leaf,
         ),
-        (list_leaf(0, Vec::new()), list_leaf_added),
+        (list_leaf(), list_leaf_added),
         (
             WalEntryPayload::Heartbeat {
                 wallclock_unix_ms: 0x4142_4344_4546_4748,
@@ -93,35 +91,14 @@ fn wal_payload_vectors() -> Vec<(WalEntryPayload, Vec<u8>)> {
     ]
 }
 
-fn list_leaf(status: u8, signature: Vec<u8>) -> WalEntryPayload {
+fn list_leaf() -> WalEntryPayload {
     WalEntryPayload::PpoiListLeafAdded {
         list_key: [0xDD; 32],
         list_index: 0x2122_2324,
         blinded_commitment: [0xEE; 32],
-        status,
         event_type: PpoiEventType::Shield,
-        signature,
         validated_merkleroot: [0xAC; 32],
     }
-}
-
-/// Storage keeps no signature and no status byte: the mirror's values for both are dropped at
-/// the WAL write, and a replayed entry carries the defaults.
-#[test]
-fn a_list_leaf_stores_neither_its_signature_nor_its_status() {
-    let handed_over = list_leaf(3, vec![0xAB; 64]);
-    let (stored, bytes) = wal_payload_vectors()
-        .into_iter()
-        .nth(1)
-        .expect("the list-leaf vector");
-    assert_eq!(
-        bincode::serialize(&handed_over).expect("serialize"),
-        bytes,
-        "the WAL frame of a list leaf must not carry its signature or status"
-    );
-    let replayed: WalEntryPayload =
-        raven_railgun_persistence::decode_no_trailing(&bytes).expect("decode");
-    assert_eq!(replayed, stored);
 }
 
 /// Every WAL frame shape the previous layout wrote, by hand. That layout had a status variant

@@ -16,7 +16,7 @@ use raven_inspire::params::InspireParams;
 use raven_railgun_core::{AdapterError, InstanceId};
 use raven_railgun_engine::inspire::InspireServerState;
 use raven_railgun_engine::orchestrator::{
-    bootstrap_railgun_engine_multi, DataSourceFilter, InstanceConfig, VerificationMode,
+    bootstrap_railgun_engine_multi, DataSourceFilter, InstanceConfig,
 };
 use raven_railgun_engine::persistence::{ConsumerEvent, SnapshotPolicy};
 use raven_railgun_engine::pir_table::EncoderKind;
@@ -56,7 +56,6 @@ fn cfg(
         // fixed-layout encoders pin their own row width; a declared 256 is substituted, not served
         record_size: encoder.effective_record_size(TOY_ENTRY_SIZE),
         entries_per_shard: TOY_ENTRIES_PER_SHARD,
-        verification_mode: VerificationMode::UpstreamAsserted,
         data_source: ds,
         use_flock: false,
         snapshot_policy: SnapshotPolicy::default(),
@@ -138,9 +137,7 @@ async fn a_row_reaches_every_route_bound_to_its_block() {
         list_key: lk,
         list_index: 0,
         blinded_commitment: bc,
-        status: 0,
         event_type: PpoiEventType::Shield,
-        signature: Vec::new(),
         validated_merkleroot: [0; 32],
     };
     handle

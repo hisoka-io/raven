@@ -21,7 +21,7 @@ use raven_railgun_core::ListKey;
 use raven_railgun_persistence::WalEntryPayload;
 use raven_railgun_ppoi_mirror::{
     FeedProgress, FeedStatus, MirrorConfig, MirrorError, PreflightFailure, UpstreamPpoiMirror,
-    TRUST_STATEMENT, UNVERIFIED_TRUST_STATEMENT,
+    TRUST_STATEMENT,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -152,12 +152,11 @@ async fn serve(rows: Vec<Value>) -> String {
     endpoint
 }
 
-fn mirror(endpoint: String, verify_signatures: bool) -> Arc<UpstreamPpoiMirror> {
+fn mirror(endpoint: String) -> Arc<UpstreamPpoiMirror> {
     Arc::new(
         UpstreamPpoiMirror::new(MirrorConfig {
             endpoint,
             poll_interval_secs: 1,
-            verify_signatures,
             ..MirrorConfig::default()
         })
         .expect("mirror builds")
@@ -224,7 +223,7 @@ fn leaves(rx: &mut Rx) -> Vec<(u32, [u8; 32])> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_real_row_verifies_under_the_list_key_the_unprefixed_five_included() {
     let endpoint = serve(REAL_ROWS.iter().map(|row| real(row.0)).collect()).await;
-    let mirror = mirror(endpoint, true);
+    let mirror = mirror(endpoint);
     for (index, _, commitment, _) in REAL_ROWS {
         let (progress, mut rx, outcome) = feed_one(Arc::clone(&mirror), index, |progress| {
             progress.signatures_refused > 0
@@ -340,7 +339,7 @@ fn tampered_rows() -> Vec<(&'static str, u64, Value)> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tampered_row_is_refused_by_index_counted_and_never_delivered() {
     for (case, index, row) in tampered_rows() {
-        let mirror = mirror(serve(vec![row]).await, true);
+        let mirror = mirror(serve(vec![row]).await);
         // Every failed request counts, a refusal or not, so two of them end the wait either way.
         let (progress, mut rx, outcome) =
             feed_one(mirror, index, |progress| progress.consecutive_failures >= 2).await;
@@ -370,7 +369,7 @@ async fn rows_below_a_refused_row_are_taken_and_the_rest_wait_for_it() {
     .await;
     let status = FeedStatus::default();
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    let feed = tokio::spawn(mirror(endpoint, true).run_feed(
+    let feed = tokio::spawn(mirror(endpoint).run_feed(
         list_key(),
         0,
         |cursor| cursor..u64::MAX,
@@ -406,7 +405,7 @@ async fn rows_below_a_refused_row_are_taken_and_the_rest_wait_for_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn preflight_refuses_a_forged_first_row_and_names_it() {
     let (_, event_type, commitment, signature) = REAL_ROWS[0];
-    let good = mirror(serve(vec![real(0)]).await, true);
+    let good = mirror(serve(vec![real(0)]).await);
     good.preflight(&list_key(), Duration::from_secs(5))
         .await
         .expect("a real first row passes");
@@ -418,7 +417,6 @@ async fn preflight_refuses_a_forged_first_row_and_names_it() {
             &flip_hex_digit(signature, 3),
         )])
         .await,
-        true,
     );
     let refusal = forged
         .preflight(&list_key(), Duration::from_secs(5))
@@ -435,7 +433,7 @@ async fn a_list_key_that_is_not_a_public_key_verifies_no_row() {
         .map(|byte| [byte; 32])
         .find(|bytes| ed25519_dalek::VerifyingKey::from_bytes(bytes).is_err())
         .expect("some byte pattern is off the curve");
-    let mirror = mirror(serve(vec![real(0)]).await, true);
+    let mirror = mirror(serve(vec![real(0)]).await);
     let refusal = mirror
         .preflight(&ListKey(not_a_key), Duration::from_secs(5))
         .await
@@ -443,24 +441,9 @@ async fn a_list_key_that_is_not_a_public_key_verifies_no_row() {
     assert_eq!(refusal.failure, PreflightFailure::BadSignature(0));
 }
 
-/// With the check off, a forged row is taken, and the statement the feed logs says so. With it
-/// on, the statement names what is still trusted.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn with_the_check_off_a_forged_row_is_taken_and_the_statement_says_so() {
-    let (_, event_type, commitment, signature) = REAL_ROWS[1];
-    let forged = wire_row(1, event_type, commitment, &flip_hex_digit(signature, 0));
-    let unchecked = mirror(serve(vec![forged]).await, false);
-    assert_eq!(unchecked.trust_statement(), UNVERIFIED_TRUST_STATEMENT);
-    let (progress, mut rx, _) = feed_one(unchecked, 1, |_| false).await;
-    assert_eq!(
-        (progress.rows_delivered, progress.signatures_refused),
-        (1, 0)
-    );
-    assert_eq!(leaves(&mut rx).len(), 1);
-    assert!(UNVERIFIED_TRUST_STATEMENT.contains("not verified"));
-
-    let checked = mirror("http://127.0.0.1:9".to_owned(), true);
-    assert_eq!(checked.trust_statement(), TRUST_STATEMENT);
+/// The statement the feed logs names what the signature leaves trusted.
+#[test]
+fn the_logged_statement_names_what_the_signature_does_not_cover() {
     for still_trusted in [
         "withhold or delay",
         "validatedMerkleroot is not signed",

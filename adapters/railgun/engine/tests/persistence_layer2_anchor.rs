@@ -18,9 +18,7 @@ use async_trait::async_trait;
 use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
 use raven_railgun_engine::inspire::InspireServerState;
-use raven_railgun_engine::orchestrator::{
-    bootstrap_railgun_engine, OrchestratorConfig, VerificationMode,
-};
+use raven_railgun_engine::orchestrator::{bootstrap_railgun_engine, OrchestratorConfig};
 use raven_railgun_engine::persistence::{
     layer2_divergent_instances, ConsumerEvent, SnapshotPolicy,
 };
@@ -130,7 +128,6 @@ fn verifying_config(
         max_appends_per_snapshot: 1,
         ..SnapshotPolicy::default()
     };
-    config.verification_mode = VerificationMode::ChainRootHistory;
     config.verification_cadence_n = 1;
     config.verification_tree_number = 0;
     config.chain_source = Some(Arc::clone(chain_source) as Arc<dyn ChainSource>);
@@ -159,9 +156,7 @@ fn mirror_row(list_index: u32, byte: u8) -> WalEntryPayload {
         list_key: LIST_KEY,
         list_index,
         blinded_commitment: canonical_commitment(byte),
-        status: 0,
         event_type: raven_railgun_persistence::PpoiEventType::Shield,
-        signature: Vec::new(),
         validated_merkleroot: [0; 32],
     }
 }

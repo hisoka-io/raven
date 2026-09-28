@@ -17,9 +17,7 @@ use async_trait::async_trait;
 use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
 use raven_railgun_engine::inspire::InspireServerState;
-use raven_railgun_engine::orchestrator::{
-    bootstrap_railgun_engine, OrchestratorConfig, VerificationMode,
-};
+use raven_railgun_engine::orchestrator::{bootstrap_railgun_engine, OrchestratorConfig};
 use raven_railgun_engine::persistence::{
     clear_layer2_divergent, layer2_divergent_instances, ConsumerEvent, ConsumerMetrics,
     SnapshotPolicy,
@@ -132,7 +130,6 @@ fn verifying_config(
         max_appends_per_snapshot: appends_per_snapshot,
         ..SnapshotPolicy::default()
     };
-    config.verification_mode = VerificationMode::ChainRootHistory;
     config.verification_cadence_n = 1;
     config.verification_tree_number = 0;
     config.chain_source = Some(Arc::clone(chain_source) as Arc<dyn ChainSource>);

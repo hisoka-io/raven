@@ -15,6 +15,8 @@
 mod bc_prefixes;
 #[path = "support/progress.rs"]
 mod progress;
+#[path = "support/signed_list.rs"]
+mod signed_list;
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -46,11 +48,11 @@ use raven_railgun_http::HealthReadyResponse;
 use raven_railgun_persistence::{PpoiEventType, StoreLayout, WalEntryPayload};
 use raven_railgun_ppoi_mirror::PreflightFailure;
 use serde_json::{json, Value};
+use signed_list::{list_key, rekeyed, signed_row, LIST_HEX};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 const BEARER_TOKEN: &str = "mirror-preflight-boot-token-padded";
-const OFAC_LIST_HEX: &str = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88";
 const PATHS_BLOCK_0: &str = "ppoi-paths-ofac-0";
 const PATHS_BLOCK_1: &str = "ppoi-paths-ofac-1";
 const SHIPPED_ENDPOINT: &str = "mirror_endpoint = \"https://ppoi.fdi.network\"";
@@ -101,17 +103,9 @@ async fn upstream_with_an_empty_list() -> (String, Requests) {
     (url, requests)
 }
 
-fn ofac_list() -> [u8; 32] {
-    let mut key = [0u8; 32];
-    for (byte, pair) in key.iter_mut().zip(OFAC_LIST_HEX.as_bytes().chunks(2)) {
-        let pair = std::str::from_utf8(pair).expect("ascii hex");
-        *byte = u8::from_str_radix(pair, 16).expect("hex byte");
-    }
-    key
-}
-
-/// The shipped example narrowed to `instance_ids`, mirror workers left ENABLED as the loader
-/// leaves them, chain workers off. `mirror_endpoint` is the only address a mirror worker dials.
+/// The shipped example narrowed to `instance_ids` and re-keyed to the test list, mirror workers
+/// left ENABLED as the loader leaves them, chain workers off. `mirror_endpoint` is the only
+/// address a mirror worker dials.
 fn shipped_ppoi_options(
     data_root: &Path,
     instance_ids: &[&str],
@@ -146,6 +140,7 @@ fn shipped_ppoi_options_with(
         )
         .replace("/srv/raven/data/", &format!("{}/", data_root.display()))
         .replace("REPLACE_ME", BEARER_TOKEN);
+    let body = rekeyed(&body);
     let config = data_root.join("config.toml");
     std::fs::write(&config, body).expect("write config");
     restrict_to_owner(&config);
@@ -323,7 +318,7 @@ fn rows_under(view: &BootstrapView, instance_id: &str) -> usize {
         .iter()
         .find(|instance| instance.instance_id.as_str() == instance_id)
         .expect("instance booted");
-    local_rows(instance, &ofac_list())
+    local_rows(instance, &list_key())
 }
 
 /// Pages a mirror worker asked upstream for. The preflight asks for index 0 alone and a worker
@@ -333,7 +328,7 @@ fn worker_pages(requests: &Requests) -> Vec<Value> {
         .lock()
         .iter()
         .filter(|request| {
-            request.pointer("/params/listKey") == Some(&json!(OFAC_LIST_HEX))
+            request.pointer("/params/listKey") == Some(&json!(LIST_HEX))
                 && request.pointer("/params/endIndex") != request.pointer("/params/startIndex")
         })
         .cloned()
@@ -391,12 +386,10 @@ async fn leave_rows_on_disk(data_root: &Path, instance_ids: &[&str], indices: &[
             .mirror_tx
             .send((
                 WalEntryPayload::PpoiListLeafAdded {
-                    list_key: ofac_list(),
+                    list_key: list_key(),
                     list_index,
                     blinded_commitment: raven_railgun_testkit::canonical(seed),
-                    status: 0,
                     event_type: PpoiEventType::Shield,
-                    signature: vec![0; 64],
                     validated_merkleroot: [0; 32],
                 },
                 0,
@@ -408,7 +401,7 @@ async fn leave_rows_on_disk(data_root: &Path, instance_ids: &[&str], indices: &[
         let rows: Vec<usize> = engine
             .instances
             .iter()
-            .map(|instance| rows_in(&instance.logical_store, &ofac_list()))
+            .map(|instance| rows_in(&instance.logical_store, &list_key()))
             .collect();
         let done = rows.iter().all(|held| *held == indices.len());
         (rows, done.then_some(()))
@@ -457,12 +450,10 @@ fn leave_rows_committed(data_root: &Path, instance_ids: &[&str], rows: u64) -> I
     let mut store = LogicalLeafStore::new();
     for index in 0..rows {
         let row = WalEntryPayload::PpoiListLeafAdded {
-            list_key: ofac_list(),
+            list_key: list_key(),
             list_index: u32::try_from(index).expect("list index"),
             blinded_commitment: leaf_at(index),
-            status: 0,
             event_type: PpoiEventType::Shield,
-            signature: vec![0; 64],
             validated_merkleroot: [0; 32],
         };
         let encoder = encoders.first().expect("an instance");
@@ -480,7 +471,7 @@ fn leave_rows_committed(data_root: &Path, instance_ids: &[&str], rows: u64) -> I
         }
     });
     store
-        .ppoi_imt(&ofac_list())
+        .ppoi_imt(&list_key())
         .cloned()
         .expect("the list's tree")
 }
@@ -580,7 +571,7 @@ async fn a_node_holding_rows_boots_past_an_upstream_that_never_answers_and_count
             view.instances
                 .first()
                 .expect("the restart brought an instance up"),
-            &ofac_list()
+            &list_key()
         ),
         1,
         "the restart must recover the row, or this test is not about a populated node"
@@ -734,7 +725,7 @@ async fn an_answering_upstream_is_asked_once_per_list_key_however_many_instances
             .first()
             .expect("exactly one preflight was recorded")
             .pointer("/params/listKey"),
-        Some(&json!(OFAC_LIST_HEX))
+        Some(&json!(LIST_HEX))
     );
 
     first_worker_page(&requests).await;
@@ -770,15 +761,11 @@ async fn upstream_holding(rows: u64) -> (String, TimedRequests) {
                 seen.lock().push((tokio::time::Instant::now(), request));
                 let result: Vec<Value> = (start..=end.min(rows.saturating_sub(1)))
                     .map(|index| {
-                        json!({
-                            "signedPOIEvent": {
-                                "index": index,
-                                "blindedCommitment": format!("{index:064x}"),
-                                "signature": "00".repeat(64),
-                                "type": "Shield"
-                            },
-                            "validatedMerkleroot": format!("{:064x}", index + 1)
-                        })
+                        signed_row(
+                            index,
+                            &format!("{index:064x}"),
+                            &format!("{:064x}", index + 1),
+                        )
                     })
                     .collect();
                 Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
@@ -905,14 +892,33 @@ async fn upstream_answering(
     root_at: impl Fn(u64) -> Option<[u8; 32]> + Send + Sync + 'static,
     delay: Duration,
 ) -> (String, Requests) {
-    let root_at = Arc::new(root_at);
+    upstream_serving(
+        move |index| {
+            let root = root_at(index)?;
+            Some(signed_row(
+                index,
+                &hex::encode(leaf_at(index)),
+                &hex::encode(root),
+            ))
+        },
+        delay,
+    )
+    .await
+}
+
+/// Answers each page with the rows `row_at` gives, `delay` after the request arrives.
+async fn upstream_serving(
+    row_at: impl Fn(u64) -> Option<Value> + Send + Sync + 'static,
+    delay: Duration,
+) -> (String, Requests) {
+    let row_at = Arc::new(row_at);
     let requests = Requests::default();
     let seen = Arc::clone(&requests);
     let app = Router::new().route(
         "/",
         post(move |Json(request): Json<Value>| {
             let seen = Arc::clone(&seen);
-            let root_at = Arc::clone(&root_at);
+            let row_at = Arc::clone(&row_at);
             async move {
                 let bound = |name: &str| {
                     request
@@ -923,20 +929,7 @@ async fn upstream_answering(
                 let (start, end) = (bound("startIndex"), bound("endIndex"));
                 seen.lock().push(request);
                 tokio::time::sleep(delay).await;
-                let result: Vec<Value> = (start..=end)
-                    .filter_map(|index| {
-                        let root = root_at(index)?;
-                        Some(json!({
-                            "signedPOIEvent": {
-                                "index": index,
-                                "blindedCommitment": hex::encode(leaf_at(index)),
-                                "signature": "00".repeat(64),
-                                "type": "Shield"
-                            },
-                            "validatedMerkleroot": hex::encode(root)
-                        }))
-                    })
-                    .collect();
+                let result: Vec<Value> = (start..=end).filter_map(|index| row_at(index)).collect();
                 Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
             }
         }),
@@ -988,7 +981,7 @@ async fn readiness(addr: SocketAddr) -> (u16, HealthReadyResponse) {
 fn rows_applied(view: &BootstrapView) -> Vec<usize> {
     view.instances
         .iter()
-        .map(|instance| local_rows(instance, &ofac_list()))
+        .map(|instance| local_rows(instance, &list_key()))
         .collect()
 }
 
@@ -1129,7 +1122,7 @@ fn recovered_rows(data_root: &Path, instance_id: &str) -> u64 {
         0,
         "{instance_id}: a mirror-fed commit marker"
     );
-    u64::try_from(rows_in_store(&opened.recovered_logical_store, &ofac_list())).expect("rows")
+    u64::try_from(rows_in_store(&opened.recovered_logical_store, &list_key())).expect("rows")
 }
 
 fn rows_in_store(store: &LogicalLeafStore, list_key: &[u8; 32]) -> usize {
@@ -1210,6 +1203,130 @@ async fn a_node_holding_rows_stays_ready_while_upstream_refuses_and_says_so() {
         "an uncredentialed probe must not name the upstream endpoint: {body:?}"
     );
     shut_down(booting).await;
+}
+
+/// Roots upstream publishes for rows `0..rows` of the list's first block.
+fn block_0_roots(rows: u64) -> Vec<[u8; 32]> {
+    let mut tree = Imt::new().expect("imt");
+    (0..rows)
+        .map(|index| {
+            let local = usize::try_from(index).expect("local index");
+            tree.insert_leaves(local, &[leaf_at(index)])
+                .expect("append");
+            tree.root()
+        })
+        .collect()
+}
+
+/// Row `index` of the list as upstream serves it, carrying `signature` in place of its own.
+fn row_signed_with(index: u64, root: [u8; 32], signature: &str) -> Value {
+    let mut row = signed_row(index, &hex::encode(leaf_at(index)), &hex::encode(root));
+    *row.pointer_mut("/signedPOIEvent/signature")
+        .expect("a served row carries a signature") = json!(signature);
+    row
+}
+
+/// The production boot applies the rows its list's key signed and refuses one it did not: a row
+/// signed by another key, or carrying no signature, is refused by index, named on readiness, and
+/// never reaches a store, while the honestly signed rows below it are applied. The feed is asked
+/// for it again at the poll interval, and never past it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_boot_applies_signed_rows_and_refuses_a_forged_or_unsigned_one_by_name() {
+    const REFUSED: u64 = 3;
+    let forger = raven_railgun_ppoi_mirror::test_signer::TestListSigner::new(0x0e);
+    let cases = [
+        (
+            "signed by another key",
+            forger
+                .sign(REFUSED, &hex::encode(leaf_at(REFUSED)), "Shield")
+                .expect("signs"),
+        ),
+        ("unsigned", String::new()),
+    ];
+    for (case, signature) in cases {
+        let data_root = tempfile::tempdir().expect("tempdir");
+        let roots = block_0_roots(REFUSED + 3);
+        let (endpoint, requests) = upstream_serving(
+            move |index| {
+                let root = *roots.get(usize::try_from(index).ok()?)?;
+                Some(if index == REFUSED {
+                    row_signed_with(index, root, &signature)
+                } else {
+                    signed_row(index, &hex::encode(leaf_at(index)), &hex::encode(root))
+                })
+            },
+            Duration::ZERO,
+        )
+        .await;
+        let (booting, view) = serving(data_root.path(), &[PATHS_BLOCK_0], &endpoint).await;
+
+        let refusal = PreflightFailure::BadSignature(REFUSED).to_string();
+        // The refusal is recorded once the rows below it are sent, which can be before they apply.
+        // Holding past it means it was applied: stop at once, the assertion below names it.
+        let (_, body) = readiness_until(booting.addr, &view, "the refusal named", |feed| {
+            feed.rows_held > REFUSED
+                || (feed.last_failure.as_deref() == Some(refusal.as_str())
+                    && feed.rows_held >= REFUSED)
+        })
+        .await;
+        let feed = body.mirror_feeds.first().expect("one list");
+        assert_eq!(
+            (feed.rows_held, feed.next_index),
+            (REFUSED, REFUSED),
+            "{case}: the rows below the refused one are applied and it is not: {body:?}"
+        );
+        assert_eq!(
+            rows_under(&view, PATHS_BLOCK_0),
+            usize::try_from(REFUSED).expect("rows"),
+            "{case}: the store holds exactly the rows below the refused one"
+        );
+        assert!(
+            start_indices(&requests)
+                .iter()
+                .all(|start| *start <= REFUSED),
+            "{case}: the feed asked past the refused row: {:?}",
+            start_indices(&requests)
+        );
+        shut_down(booting).await;
+    }
+}
+
+/// A node holding nothing boots only once its first row verifies: a first row carrying no
+/// signature is refused by the boot itself, naming the row and the list key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_holding_no_rows_refuses_to_boot_on_an_unsigned_first_row() {
+    let data_root = tempfile::tempdir().expect("tempdir");
+    let root = *block_0_roots(1).first().expect("row 0's root");
+    let (endpoint, _) = upstream_serving(
+        move |index| (index == 0).then(|| row_signed_with(0, root, "")),
+        Duration::ZERO,
+    )
+    .await;
+    let (opts, observer) = shipped_ppoi_options(data_root.path(), &[PATHS_BLOCK_0], &endpoint);
+    let mut booting = boot_multi(opts).await;
+    let view = bootstrapped(&observer, &mut booting)
+        .await
+        .expect("boot bootstraps");
+    match boot_verdict(&mut booting).await {
+        Boot::Refused(refusal) => {
+            for named in [
+                PreflightFailure::BadSignature(0).to_string(),
+                LIST_HEX.to_owned(),
+                endpoint.clone(),
+            ] {
+                assert!(
+                    refusal.contains(&named),
+                    "refusal must name {named}: {refusal}"
+                );
+            }
+        }
+        Boot::Serving => panic!("a node holding nothing booted on an unsigned first row"),
+    }
+    assert_eq!(
+        rows_under(&view, PATHS_BLOCK_0),
+        0,
+        "the unsigned row was applied"
+    );
 }
 
 /// Across a block boundary from one feed: block 0 fills to its 65,536 rows and the feed carries
@@ -1366,7 +1483,7 @@ async fn a_feed_stops_at_the_last_declared_row_names_the_next_block_and_feeds_it
     assert_eq!(code, 503, "{body:?}");
     assert_eq!(
         body.router_unrouted_targets,
-        [format!("list:{OFAC_LIST_HEX}:block:1")],
+        [format!("list:{LIST_HEX}:block:1")],
         "readiness must name the block the feed waits on"
     );
     let feed = body.mirror_feeds.first().expect("one list");
@@ -1411,7 +1528,7 @@ async fn a_feed_stops_at_the_last_declared_row_names_the_next_block_and_feeds_it
     assert!(
         !body
             .router_unrouted_targets
-            .contains(&format!("list:{OFAC_LIST_HEX}:block:1")),
+            .contains(&format!("list:{LIST_HEX}:block:1")),
         "a delivery to the declared block clears its mark: {body:?}"
     );
 
@@ -1439,7 +1556,7 @@ async fn assert_row_answered_from_its_block(addr: SocketAddr, index: u64, root: 
     let segment = read_segment(
         reqwest::Client::new()
             .get(format!(
-                "http://{addr}/v1/poi/{OFAC_LIST_HEX}/bc-prefixes?since={index}"
+                "http://{addr}/v1/poi/{LIST_HEX}/bc-prefixes?since={index}"
             ))
             .send()
             .await
@@ -1459,7 +1576,7 @@ async fn merkle_proof(addr: SocketAddr, index: u64) -> (StatusCode, Value) {
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/v1/poi/merkle-proofs"))
         .json(&json!({
-            "listKey": OFAC_LIST_HEX,
+            "listKey": LIST_HEX,
             "blindedCommitments": [hex::encode(leaf_at(index))],
         }))
         .send()
@@ -1545,7 +1662,7 @@ async fn a_cold_sync_stops_where_the_declared_blocks_end_and_names_the_next() {
     assert_eq!(code, 503, "{body:?}");
     assert_eq!(
         body.router_unrouted_targets,
-        [format!("list:{OFAC_LIST_HEX}:block:1")],
+        [format!("list:{LIST_HEX}:block:1")],
         "readiness must name the block the feed waits on"
     );
     let feed = body.mirror_feeds.first().expect("one list");

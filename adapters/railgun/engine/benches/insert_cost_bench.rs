@@ -128,9 +128,7 @@ fn ppoi_block_rows() -> Vec<(WalEntryPayload, u64)> {
                 list_key: [0x42; 32],
                 list_index,
                 blinded_commitment: bc,
-                status: 0,
                 event_type: PpoiEventType::Shield,
-                signature: vec![0; 64],
                 validated_merkleroot: [0; 32],
             };
             (payload, 1_000 + u64::from(list_index))

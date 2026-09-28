@@ -117,9 +117,12 @@ tree_number = 3
 data_dir = "/var/lib/raven-railgun/commit-tree-3"
 data_source = { kind = "indexer", filter = { tree_number = 3 } }
 
-# PPOI list blocks, fed by the upstream mirror, which is their authority: each event's
-# signature is stored and never verified, so nothing authenticates the publisher. List
-# authenticity rests on TLS to `mirror_endpoint` - keep it https.
+# PPOI list blocks, fed by the upstream mirror, which verifies each event's ed25519 signature
+# against the list key before the row is applied. That authenticates each row's index, blinded
+# commitment and type, and no more: the endpoint can still withhold or delay rows, the signature
+# names no chain or txid version, so rows the same key signed for another chain or txid version
+# pass, the root upstream sends with each row is not signed, and the list key is trusted as
+# configured. Keep `mirror_endpoint` https.
 [[instance]]
 id = "ppoi-paths-ofac-0"
 role = "static"

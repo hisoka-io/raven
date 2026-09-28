@@ -323,25 +323,7 @@ fn sha256_of(bytes: &[u8]) -> [u8; 32] {
 
 fn parse_hex_sha(quoted: &str) -> Option<[u8; 32]> {
     let inner = quoted.strip_prefix('"').and_then(|s| s.strip_suffix('"'))?;
-    if inner.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, dst) in out.iter_mut().enumerate() {
-        let hi = char_to_nibble(inner.as_bytes().get(i * 2).copied()?)?;
-        let lo = char_to_nibble(inner.as_bytes().get(i * 2 + 1).copied()?)?;
-        *dst = (hi << 4) | lo;
-    }
-    Some(out)
-}
-
-fn char_to_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+    raven_railgun_core::hex::decode_hex(inner)
 }
 
 /// Lowercase hex encoding of a 32-byte SHA-256 digest.

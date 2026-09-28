@@ -98,9 +98,7 @@ async fn mirror_bridge_translates_ppoi_payload() {
         list_key: [1u8; 32],
         list_index: 0,
         blinded_commitment: [2u8; 32],
-        status: 0,
         event_type: raven_railgun_persistence::PpoiEventType::Shield,
-        signature: vec![3; 64],
         validated_merkleroot: [4; 32],
     };
     mir_tx.send((payload.clone(), 0)).await.expect("send ppoi");
