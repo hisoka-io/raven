@@ -175,10 +175,11 @@ async fn feed_one(
 ) -> (FeedProgress, Rx, Option<Result<(), MirrorError>>) {
     let status = FeedStatus::default();
     let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let end = index + 1;
     let mut feed = tokio::spawn(mirror.run_feed(
         list_key(),
         index,
-        move |cursor| cursor..index + 1,
+        move |cursor| cursor..end,
         status.clone(),
         tx,
     ));
