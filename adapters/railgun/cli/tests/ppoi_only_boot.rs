@@ -12,6 +12,8 @@
     clippy::unwrap_used
 )]
 
+#[path = "support/bc_prefixes.rs"]
+mod bc_prefixes;
 #[path = "support/progress.rs"]
 mod progress;
 
@@ -23,6 +25,7 @@ use std::time::Duration;
 
 use axum::routing::post;
 use axum::{Json, Router};
+use bc_prefixes::{prefix_of, read_segment};
 use progress::until_done_or_stalled;
 use raven_railgun_cli::serve_production_multi::{
     chain_indexer_reason, load_options_from_toml, run_with_listener, BootstrapObserver,
@@ -116,9 +119,12 @@ fn narrowed(config: &Path, keep: &[&str]) -> (MultiServeOptions, BootstrapObserv
     (opts, observer)
 }
 
+/// Distinct in the bytes the index publishes too, or a renumbered index would still match.
 fn leaf_at(index: u64) -> [u8; 32] {
     let mut leaf = [0u8; 32];
-    leaf[24..].copy_from_slice(&(index + 1).to_be_bytes());
+    let row = (index + 1).to_be_bytes();
+    leaf[24..].copy_from_slice(&row);
+    leaf[2..6].copy_from_slice(row.last_chunk::<4>().expect("four bytes"));
     leaf
 }
 
@@ -346,10 +352,6 @@ async fn list_routes(addr: SocketAddr, bc: &str) -> Vec<(&'static str, reqwest::
                 .expect("merkle-proofs"),
         ),
         (
-            "bc-to-idx-map",
-            get("bc-to-idx-map").await.expect("bc-to-idx-map"),
-        ),
-        (
             "bc-prefixes",
             get("bc-prefixes").await.expect("bc-prefixes"),
         ),
@@ -394,36 +396,46 @@ async fn assert_every_list_route_refuses(addr: SocketAddr, bc: &str) {
 
 /// Every route answers over the list upstream holds, one row per root in `roots`: its last row
 /// with upstream's root, a row past it as absent, and every row in the index at its global
-/// position.
+/// position. The list is shorter than a block, so one index segment is all of it.
 async fn assert_list_routes_answer_the_whole_list(addr: SocketAddr, roots: &[[u8; 32]]) {
     let rows = u64::try_from(roots.len()).unwrap();
     let last = hex::encode(leaf_at(rows - 1));
     let mut routes = list_routes(addr, &last).await.into_iter();
-    let mut body = async || -> Value {
-        let (route, response) = routes.next().expect("one response per route");
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "{route} refused at the tip"
-        );
-        response.json().await.unwrap_or(Value::Null)
-    };
+    let (_, proof) = routes.next().expect("merkle-proofs");
     assert_eq!(
-        body().await[0]["root"],
+        proof.status(),
+        StatusCode::OK,
+        "merkle-proofs refused at the tip"
+    );
+    let proof: Value = proof.json().await.expect("merkle-proofs body");
+    assert_eq!(
+        proof[0]["root"],
         hex::encode(roots[roots.len() - 1]),
         "the proof's root is the one upstream published for that row"
     );
-    let map = body().await;
-    let entries = map["entries"].as_array().expect("entries");
-    assert_eq!(entries.len(), roots.len());
-    for (index, entry) in (0u64..).zip(entries) {
-        assert_eq!(
-            (entry["idx"].as_u64(), entry["bc"].as_str()),
-            (Some(index), Some(hex::encode(leaf_at(index)).as_str())),
-            "entry {index} does not round-trip to its global index"
-        );
-    }
-    body().await;
+    let (_, index) = routes.next().expect("bc-prefixes");
+    let index = read_segment(index).await;
+    assert_eq!(
+        index.status,
+        StatusCode::OK,
+        "bc-prefixes refused at the tip"
+    );
+    assert_eq!(
+        (index.base, index.next, index.total),
+        (Some(0), Some(rows), Some(rows)),
+        "the whole list in one frontier segment"
+    );
+    let expected: Vec<_> = (0..rows).map(|row| prefix_of(&leaf_at(row))).collect();
+    let misplaced = index
+        .rows
+        .iter()
+        .zip(&expected)
+        .position(|(got, want)| got != want);
+    assert_eq!(
+        (index.rows.len(), misplaced),
+        (expected.len(), None),
+        "every row sits at its global position in the index"
+    );
 
     let past = hex::encode(leaf_at(rows + 7));
     let (_, response) = list_routes(addr, &past)

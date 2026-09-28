@@ -11,6 +11,8 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+#[path = "support/bc_prefixes.rs"]
+mod bc_prefixes;
 #[path = "support/progress.rs"]
 mod progress;
 
@@ -22,6 +24,7 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
+use bc_prefixes::{prefix_of, read_segment};
 use progress::until_done_or_stalled;
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_cli::serve_production_multi::{
@@ -948,9 +951,12 @@ async fn upstream_answering(
     (url, requests)
 }
 
+/// Distinct in the bytes the index publishes too, or a renumbered index would still match.
 fn leaf_at(index: u64) -> [u8; 32] {
     let mut leaf = [0u8; 32];
-    leaf[24..].copy_from_slice(&(index + 1).to_be_bytes());
+    let row = (index + 1).to_be_bytes();
+    leaf[24..].copy_from_slice(&row);
+    leaf[2..6].copy_from_slice(row.last_chunk::<4>().expect("four bytes"));
     leaf
 }
 
@@ -1430,28 +1436,21 @@ async fn assert_row_answered_from_its_block(addr: SocketAddr, index: u64, root: 
         ),
         "the proof must come from the block holding the row: {proof}"
     );
-    let map: Value = reqwest::Client::new()
-        .get(format!(
-            "http://{addr}/v1/poi/{OFAC_LIST_HEX}/bc-to-idx-map"
-        ))
-        .send()
-        .await
-        .expect("bc-to-idx-map")
-        .json()
-        .await
-        .expect("bc-to-idx-map body");
-    let bc = hex::encode(leaf_at(index));
-    let position = map
-        .get("entries")
-        .and_then(Value::as_array)
-        .expect("entries")
-        .iter()
-        .find(|entry| entry.get("bc").and_then(Value::as_str) == Some(bc.as_str()))
-        .and_then(|entry| entry.get("idx").and_then(Value::as_u64));
+    let segment = read_segment(
+        reqwest::Client::new()
+            .get(format!(
+                "http://{addr}/v1/poi/{OFAC_LIST_HEX}/bc-prefixes?since={index}"
+            ))
+            .send()
+            .await
+            .expect("bc-prefixes"),
+    )
+    .await;
+    assert_eq!(segment.status.as_u16(), 200, "{segment:?}");
     assert_eq!(
-        position,
-        Some(index),
-        "the index carries the global position, not the block-local one: {map}"
+        (segment.base, segment.rows.first()),
+        (Some(index), Some(&prefix_of(&leaf_at(index)))),
+        "the index carries the global position, not the block-local one"
     );
 }
 

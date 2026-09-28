@@ -14,6 +14,9 @@
     clippy::unwrap_used
 )]
 
+#[path = "support/bc_prefixes.rs"]
+mod bc_prefixes;
+
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -23,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use axum::routing::post;
 use axum::{Json, Router};
+use bc_prefixes::{prefix_of, read_segment, Segment};
 use raven_railgun_cli::serve_production_multi::{load_options_from_toml, MultiServeOptions};
 use raven_railgun_engine::imt::Imt;
 use raven_railgun_engine::orchestrator::{DataSourceFilter, LEAVES_PER_PPOI_BLOCK};
@@ -52,7 +56,7 @@ const _: () = assert!(LIST_ROWS < LEAVES_PER_PPOI_BLOCK);
 /// refused" from "no store was ever wired": both answer 503.
 const COVERAGE_REFUSALS_TOTAL: &str = "raven_railgun_shim_coverage_refusals_total";
 const COMMIT_TREE_ROUTE: &str = "commit-tree-merkle-proof";
-const LIST_ROUTES: [&str; 2] = ["merkle-proofs", "bc-to-idx-map"];
+const LIST_ROUTES: [&str; 2] = ["merkle-proofs", "bc-prefixes"];
 /// The block the list reaches at row 393,216, which the shipped config must declare ahead of it.
 const NEXT_BLOCK_INSTANCE: &str = "ppoi-paths-ofac-6";
 
@@ -101,9 +105,12 @@ struct Booted {
     roots: Arc<Vec<[u8; 32]>>,
 }
 
+/// Distinct in the bytes the index publishes too, or a renumbered index would still match.
 fn leaf_at(index: u32) -> [u8; 32] {
     let mut leaf = [0u8; 32];
-    leaf[28..].copy_from_slice(&(index + 1).to_be_bytes());
+    let row = (index + 1).to_be_bytes();
+    leaf[28..].copy_from_slice(&row);
+    leaf[2..6].copy_from_slice(&row);
     leaf
 }
 
@@ -427,7 +434,7 @@ fn refusals_for(scrape: &str, route: &str) -> u64 {
 struct ListAnswers {
     proofs: (StatusCode, Value),
     absent_proof: StatusCode,
-    index: (StatusCode, Value),
+    index: Segment,
 }
 
 async fn ask_list_routes(booted: &Booted, held: [u8; 32], absent: [u8; 32]) -> ListAnswers {
@@ -441,9 +448,12 @@ async fn ask_list_routes(booted: &Booted, held: [u8; 32], absent: [u8; 32]) -> L
     };
     let proofs = ask(proof_of(held), "merkle-proofs").await;
     let (absent_proof, _) = ask(proof_of(absent), "merkle-proofs for an absent row").await;
-    let index = ask(
-        client.get(format!("{base}/{list_key}/bc-to-idx-map")),
-        "bc-to-idx-map",
+    let index = read_segment(
+        client
+            .get(format!("{base}/{list_key}/bc-prefixes"))
+            .send()
+            .await
+            .expect("bc-prefixes"),
     )
     .await;
     ListAnswers {
@@ -538,25 +548,18 @@ async fn the_shipped_config_serves_shim_routes_from_the_stores_it_declares() {
         StatusCode::NOT_FOUND,
         "a row past the list's end is absent from the declared blocks that cover it"
     );
-    let (status, index) = &answers.index;
-    assert_eq!(*status, StatusCode::OK, "{}", booted.node.tail());
-    let entries: Vec<(Option<u64>, Option<&str>)> = index["entries"]
-        .as_array()
-        .expect("entries")
-        .iter()
-        .map(|entry| (entry["idx"].as_u64(), entry["bc"].as_str()))
-        .collect();
-    let expected: Vec<String> = (0..LIST_ROWS)
-        .map(|row| hex::encode(leaf_at(row)))
-        .collect();
+    let index = &answers.index;
+    assert_eq!(index.status, StatusCode::OK, "{}", booted.node.tail());
+    let rows = u64::from(LIST_ROWS);
     assert_eq!(
-        entries,
-        expected
-            .iter()
-            .zip(0u64..)
-            .map(|(bc, idx)| (Some(idx), Some(bc.as_str())))
-            .collect::<Vec<_>>(),
-        "{index}"
+        (index.base, index.next, index.total),
+        (Some(0), Some(rows), Some(rows)),
+        "the list ends inside block 0, so one frontier segment is all of it"
+    );
+    let expected: Vec<_> = (0..LIST_ROWS).map(|row| prefix_of(&leaf_at(row))).collect();
+    assert_eq!(
+        index.rows, expected,
+        "every row sits at its global position in the index"
     );
     for route in LIST_ROUTES {
         assert_eq!(
