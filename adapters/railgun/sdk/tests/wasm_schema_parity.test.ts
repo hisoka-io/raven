@@ -1,9 +1,9 @@
 // The suite pins the wire schema version in TypeScript (`helpers/wire_schema.ts`) and
 // every other assertion compares TS-built bytes against that same TS literal. Nothing
-// compared it to the number the LINKED RUST BINARY actually emits — so the pin could
+// compared it to the number the LINKED RUST BINARY actually emits, so the pin could
 // agree with itself while disagreeing with production, and 385 green tests would not
-// notice. `crates/client/src/lib.rs:310` is the Rust source of truth and it is stamped
-// into the wasm at `:548` and `:743`.
+// notice. `SESSION_WIRE_SCHEMA_VERSION` in crates/client/src/lib.rs is the Rust source of
+// truth; the wasm stamps it on the session registration body and the padded query batch.
 //
 // This is the parity gate the suite was missing: it drives the REAL wasm through a real
 // session and reads the prefix off the bytes it produces.

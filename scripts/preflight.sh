@@ -12,7 +12,7 @@
 #
 #   scripts/preflight.sh              fmt + clippy + hygiene + the SDK gates
 #   scripts/preflight.sh --msrv       also both MSRV toolchains (slow, needs 1.89 and 1.91)
-#   scripts/preflight.sh --with-tests also the detached-workspace test suites
+#   scripts/preflight.sh --with-tests also the detached-workspace suites and the engine red-proof
 #   scripts/preflight.sh --fast       hygiene + fmt only, no clippy (seconds)
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -104,6 +104,17 @@ if [ -d adapters/railgun/sdk ]; then
       # Below the suite because it RUNS the suite: leaving it above made --fast take 58s
       # while claiming "seconds", so nobody used the flag for what it is for.
       run "test-count contract"  bash adapters/railgun/scripts/check-sdk-test-count.sh
+      # These install the packed SDK beside the wallet from the npm registry: minutes, not
+      # seconds, and only with a network. The red-proof adds ten installs, so it waits for
+      # --with-tests. CI runs both.
+      if timeout 20 npm ping >/dev/null 2>&1; then
+        run "engine singleton"  timeout 900 bash adapters/railgun/scripts/check-sdk-engine-singleton.sh
+        if [ "$WITH_TESTS" = 1 ]; then
+          run "engine singleton red-proof"  timeout 1500 bash adapters/railgun/scripts/check-sdk-engine-singleton-selftest.sh
+        fi
+      else
+        echo "  npm registry unreachable -- SKIPPED engine singleton (CI still runs it)"
+      fi
     else
       echo "  node_modules absent -- SKIPPED typecheck and suite (run pnpm install)"
     fi

@@ -3,15 +3,16 @@
 // `tests/fixtures/` at ring_dim 256 / 32 B / one shard, so multi-shard addressing and the
 // production cell width had never been decoded in any executed lane. 512 B is illegal
 // below ring 2048: the packing width is ceil(512/2) = 256 and legal widths stop at
-// ring_dim/2 (crates/inspire/src/inspiring/inspiring2.rs:132-137).
+// ring_dim/2 (`PackParams::legal_widths` in crates/inspire/src/inspiring/inspiring2.rs).
 //
 // The responses came off the server path: `respond_seeded_inspiring_cached_with_session`
 // then `mod_switch_response_checked(.., MOD_SWITCH_TARGET_36BIT)`, which is what
-// `RavenInspireScheme::respond` does (engine/src/inspire.rs:92-101).
+// `RavenInspireScheme::respond` does (engine/src/inspire.rs).
 //
 // `crs.bin` is the CRS `GET /v1/instance/{id}/params` ships, not the server's own: the
 // galois keys are ~99.98% of the serialized bytes and only the server's Tree path reads
-// them (http/src/admin.rs:142-158, crates/inspire/src/pir/respond.rs:681). Decoding off
+// them (`crs_wire_bytes` in http/src/handshake.rs empties them before the wire;
+// `respond_one_packing` in crates/inspire/src/pir/respond.rs reads them). Decoding off
 // the shipped bytes is the point - a fixture built from the server's CRS could pass while
 // the artifact a wallet holds does not decode at all.
 
@@ -38,13 +39,13 @@ if (typeof wasmInit.init_panic_hook === "function") {
   wasmInit.init_panic_hook();
 }
 
-/** `PATH10_RECORD_BYTES`, `PATH10_LEVELS`, `PATH10_MAGIC` (engine/src/pir_table/list.rs:20,22,24). */
+/** `PATH10_RECORD_BYTES`, `PATH10_LEVELS`, `PATH10_MAGIC` (engine/src/pir_table/list.rs). */
 const RECORD_BYTES = 512;
 const ROW_LEVELS = 11;
 const NODES_OFFSET = 38;
 const NODE_BYTES = 32;
 const MAGIC = "RVP2";
-/** `WIRE_RESPONSE_MODULUS` (engine/src/inspire.rs:67). */
+/** `WIRE_RESPONSE_MODULUS` (engine/src/inspire.rs). */
 const SERVED_RESPONSE_MODULUS = 68_718_428_161n;
 
 interface ProductionShapeMeta {
@@ -88,7 +89,7 @@ const inspireParamsBincode = read("inspire_params.bin");
  * `params` verbatim, and the `Vec` length follows as a u64 LE.
  */
 function shippedGaloisKeyCount(): bigint {
-  const bodyStart = 16; // ServerCrs::MAGIC (crates/inspire/src/pir/setup.rs:111)
+  const bodyStart = 16; // ServerCrs::MAGIC (crates/inspire/src/pir/setup.rs)
   const paramsEnd = bodyStart + inspireParamsBincode.length;
   const embedded = crsBincode.subarray(bodyStart, paramsEnd);
   expect(hex(embedded), "CRS body must open with the fixture's own InspireParams").toBe(
@@ -147,7 +148,8 @@ describe("wasm decode at the served geometry: ring 2048, 512 B record, two shard
       expect(read(entry.name).length, `${entry.name} size`).toBe(entry.bytes);
     }
     // The CRS decoded above is the shipped one. At this ring dimension the server's own
-    // is over a megabyte; http/tests/crs_wire_omits_galois_keys.rs:112-125 pins both ends.
+    // is over a megabyte; `params_crs_drops_galois_keys_and_keeps_every_serialized_field`
+    // (http/tests/crs_wire_omits_galois_keys.rs) pins both ends.
     expect(shippedGaloisKeyCount()).toBe(0n);
     expect(crsBincode.length).toBeLessThan(4096);
   });

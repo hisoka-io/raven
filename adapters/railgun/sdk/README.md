@@ -64,7 +64,8 @@ with npm, first with nothing else and then with engine listed at the wallet's ve
 default resolution and under `--legacy-peer-deps`), and requires one engine copy on disk, one
 resolved file, a consumer that typechecks against it, and `install` landing on the copy the wallet
 reads. A fourth install lists engine at another version, forcing a second copy, and requires
-`install` to refuse.
+`install` to refuse. CI runs it with a red-proof that plants five defects it must refuse, a second
+engine copy among them.
 
 Engine's status values are a string enum, which no string literal satisfies, so the engine-shaped
 `getPOIsPerList(txidVersion, chain, listKeys, commitments)` is typed with engine's own

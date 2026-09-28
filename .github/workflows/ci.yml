@@ -1190,11 +1190,11 @@ jobs:
       - name: pnpm test
         run: pnpm test
         working-directory: adapters/railgun/sdk
-      # The suite passing is not the same as the suite being able to fail. Five gates,
+      # The suite passing is not the same as the suite being able to fail. Six gates,
       # each shipped with its own red-proof:
       #   - export coverage: a public export with zero test references is caught here,
-      #     not discovered months later (three were dark: subscribeRavenEvents,
-      #     sha256Hex, PATH_RECORD_BYTES).
+      #     not discovered months later (sha256Hex and PATH_RECORD_BYTES were dark when
+      #     it landed).
       #   - constant parity: five values are duplicated between Rust and TypeScript and
       #     nothing tied them together; a drift in either direction now fails.
       #   - suite red-proof: deletes the schema-envelope guard in a scratch COPY and
@@ -1206,6 +1206,10 @@ jobs:
       #     marker, or a pack with no files allowlist is invisible to it. Offline: the one
       #     registry dependency is packed out of sdk/node_modules, so it must follow
       #     `pnpm install`.
+      #   - engine singleton: installs the packed SDK beside the Railgun wallet from the npm
+      #     registry and requires one engine copy that install lands on; a second copy
+      #     splits engine's POI.init static with no error. Its red-proof adds ten installs.
+      #     Each step measured about five minutes on npm 10, so both carry a timeout.
       - name: sdk test-count pin
         run: adapters/railgun/scripts/check-sdk-test-count.sh
       - name: sdk test-count red-proof
@@ -1220,6 +1224,14 @@ jobs:
       - name: sdk pack red-proof
         if: ${{ !cancelled() }}
         run: adapters/railgun/scripts/check-sdk-pack-selftest.sh
+      - name: sdk engine singleton
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: adapters/railgun/scripts/check-sdk-engine-singleton.sh
+      - name: sdk engine singleton red-proof
+        if: ${{ !cancelled() }}
+        timeout-minutes: 25
+        run: adapters/railgun/scripts/check-sdk-engine-singleton-selftest.sh
       # The publish candidate is the exact tarball the pack gate installed and inspected, emitted
       # only when every step above passed. Publishing it stays manual: this job holds no registry
       # credential. The gate's scratch also holds the dependency it packed for its offline
