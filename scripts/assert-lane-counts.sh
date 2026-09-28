@@ -26,10 +26,18 @@
 # constant here once listed every lane under `all` whatever the lane ran.
 #
 # Usage:
-#   scripts/assert-lane-counts.sh            # verify against the checked-in expectations
-#   scripts/assert-lane-counts.sh --update   # rewrite expectations from the current tree
+#   scripts/assert-lane-counts.sh              # verify every lane against the checked-in expectations
+#   scripts/assert-lane-counts.sh --lane NAME  # verify one lane, e.g. in the job that just built it
+#   scripts/assert-lane-counts.sh --update     # rewrite expectations from the current tree
 #
-# CARGO_TARGET_DIR is honoured; a warm one makes this cheap, a cold one pays a full build once.
+# A lane whose filter is a plain union of binary() terms, each naming one test target (or a bench,
+# when the lane passes --all-targets), is listed with only those targets built. The features, and
+# so the tests in those binaries, are what the lane's own build gives them; the other targets are
+# what the build cost was. Any other filter, or a name that does not resolve to exactly one such
+# target, is listed with the lane's full build, so nextest still judges it.
+# LANE_COUNTS_FULL_LISTING=1 lists every lane that way.
+#
+# CARGO_TARGET_DIR is honoured; a warm one makes this cheap, a cold one pays a build once.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -38,6 +46,12 @@ CI="${LANE_COUNTS_WORKFLOW:-.github/workflows/ci.yml}"
 EXPECTED="${LANE_COUNTS_EXPECTED:-.github/expected-lane-counts.tsv}"
 MANIFEST=adapters/railgun/Cargo.toml
 MODE="${1:-check}"
+ONLY_LANE=""
+if [ "$MODE" = "--lane" ]; then
+  [ "$#" -eq 2 ] && [ -n "$2" ] || { echo "usage: $0 --lane NAME" >&2; exit 2; }
+  ONLY_LANE="$2"
+  MODE=check
+fi
 # Fault-injection seam, used only by scripts/assert-lane-counts-selftest.sh: it points this at a
 # stub that exits 101 or 94, so the build-failure and filterset messages below can be red-proved
 # without breaking the shared tree. A real run must never set it; if it is set, the loop below says
@@ -87,11 +101,15 @@ if [ "$MODE" = "--check-name-fixture" ]; then
   exit $?
 fi
 
-# Emit one TSV row per filtered lane: name, packages, cargo flags, extra flags, filter.
+# Emit one TSV row per filtered lane: name, packages, cargo flags, extra flags, filter, and the
+# cargo target flags that narrow its build ("-" for the full build).
 # Sourced from ci.yml itself so a new lane cannot be added without this gate seeing it.
-lanes=$(python3 - "$CI" <<'PY'
-import re, sys, yaml
+narrow=1
+{ [ -n "${LANE_COUNTS_FAKE_CARGO:-}" ] || [ -n "${LANE_COUNTS_FULL_LISTING:-}" ]; } && narrow=0
+lanes=$(python3 - "$CI" "$MANIFEST" "$narrow" <<'PY'
+import json, re, subprocess, sys, yaml
 d = yaml.safe_load(open(sys.argv[1]))
+manifest, narrow = sys.argv[2], sys.argv[3] == '1'
 rows, errors = [], []
 # No 'default': a lane that skips its binaries' ignored tests leaves them running nowhere, and
 # check-ignore-coverage.sh counts any named binary() as coverage whatever the lane's mode.
@@ -145,6 +163,55 @@ if errors:
     for error in errors:
         print(f"LANE MODE NOT READ: {error}", file=sys.stderr)
     sys.exit(1)
+
+targets = {}
+if narrow:
+    meta = subprocess.run(['cargo', 'metadata', '--no-deps', '--format-version', '1',
+                           '--manifest-path', manifest],
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    try:
+        for package in json.loads(meta.stdout)['packages'] if meta.returncode == 0 else []:
+            for target in package['targets']:
+                targets.setdefault(target['name'], []).append((package['name'], target))
+    except (KeyError, TypeError, ValueError):
+        targets = {}  # unreadable metadata: every lane takes its full build
+
+BINARY_TERM = re.compile(r'binary\(([A-Za-z0-9_-]+)\)')
+
+
+def narrowed(pkgs, extra, filt):
+    """`--test X --bench Y ...` building exactly the binaries the filter can select, or '-'."""
+    terms = [t.strip() for t in re.split(r'\s*(?:\+|\||\bor\b)\s*', filt.strip())]
+    names = [BINARY_TERM.fullmatch(t) for t in terms]
+    scope = set(re.findall(r'-p\s+(\S+)', pkgs))
+    if not targets or not scope or not all(names):
+        return '-'
+    flags = []
+    for name in (m.group(1) for m in names):
+        found = [(p, t) for p, t in targets.get(name, []) if p in scope]
+        if len(found) != 1 or len(targets[name]) != 1 or found[0][1].get('required-features'):
+            return '-'
+        kind = found[0][1]['kind']
+        if kind == ['test']:
+            flags.append(f'--test {name}')
+        elif kind == ['bench'] and '--all-targets' in extra.split():
+            flags.append(f'--bench {name}')
+        else:
+            return '-'
+    return ' '.join(flags)
+
+
+def with_targets(row):
+    name, pkgs, flags, extra, filt = row
+    only = narrowed(pkgs, f'{flags} {extra}', filt)
+    if only == '-':
+        return row + ('-',)
+    # --all-targets would widen the build back to every target
+    drop = lambda s: ' '.join(t for t in s.split() if t != '--all-targets')
+    return (name, pkgs, drop(flags), drop(extra), filt, only)
+
+
+rows = [with_targets(r) for r in rows]
 # Empty fields are emitted as "-", never as "". Tab is IFS *whitespace* to bash, so
 # `IFS=$'\t' read a b c d e` COLLAPSES a run of tabs into one delimiter and drops empty
 # fields entirely — every lane with no cargo_flags had its columns shift left and handed
@@ -169,6 +236,12 @@ while IFS=$'\t' read -r -u 3 name _rest; do
   [ -z "$name" ] || printf '%s\n' "$name" >> "$lane_names"
 done 3<<< "$lanes"
 
+if [ -n "$ONLY_LANE" ] && ! /usr/bin/grep -Fqx -- "$ONLY_LANE" "$lane_names"; then
+  echo "assert-lane-counts.sh: no lane named ${ONLY_LANE} in ${CI}. Lanes:" >&2
+  sed 's/^/  /' "$lane_names" >&2
+  exit 1
+fi
+
 if [ "$MODE" != "--update" ]; then
   [ -f "$EXPECTED" ] || { echo "assert-lane-counts.sh: missing ${EXPECTED}; run with --update" >&2; exit 1; }
   if ! check_lane_name_completeness "$EXPECTED" "$lane_names"; then
@@ -178,7 +251,11 @@ fi
 
 # One line, because the build under this loop was silent for seven minutes in CI and a reader
 # could not tell a cold build from a hang. The success path stays quiet after it.
-echo "assert-lane-counts.sh: listing $(wc -l < "$lane_names") lanes; the first pays the test build." >&2
+if [ -n "$ONLY_LANE" ]; then
+  echo "assert-lane-counts.sh: listing lane ${ONLY_LANE}." >&2
+else
+  echo "assert-lane-counts.sh: listing $(wc -l < "$lane_names") lanes; the first of each build shape pays its build." >&2
+fi
 if [ -n "${LANE_COUNTS_FAKE_CARGO:-}" ]; then
   echo "  FAULT INJECTION ACTIVE (LANE_COUNTS_FAKE_CARGO=${CARGO}): this run proves NOTHING" >&2
   echo "  about the real tree. Only the selftest may set it." >&2
@@ -188,17 +265,19 @@ fi
 # on the first version of this script it swallowed the rest of the here-string, so every lane
 # after the first got a truncated line and nextest reported "failed to parse filterset" — a
 # message that blames the filter for a bug in the loop.
-while IFS=$'\t' read -r -u 3 name pkgs flags extra filter; do
+while IFS=$'\t' read -r -u 3 name pkgs flags extra filter targets; do
   [ -z "$name" ] && continue
+  [ -n "$ONLY_LANE" ] && [ "$name" != "$ONLY_LANE" ] && continue
   [ "$pkgs" = "-" ] && pkgs=""
   [ "$flags" = "-" ] && flags=""
   [ "$extra" = "-" ] && extra=""
+  [ "$targets" = "-" ] && targets=""
   # shellcheck disable=SC2086
   # `ci.yml:14` sets CARGO_TERM_COLOR: always workflow-wide, and nextest does NOT suppress
   # colour when stdout is a pipe: measured 30 rows unset, 0 with `always`, 30 with `never`.
   # Every lane then took the count==0 branch, so this gate has been unconditionally red since
   # it was added and has never protected anything. Pin it here rather than trusting the env.
-  out=$("$CARGO" nextest list --color never --manifest-path "$MANIFEST" $pkgs $flags $extra \
+  out=$("$CARGO" nextest list --color never --manifest-path "$MANIFEST" $pkgs $flags $extra $targets \
         --cargo-profile ci-test -E "$filter" 2>"$lane_err" < /dev/null)
   rc=$?
   # Three failures, three operator actions, so three distinct messages: the build is broken / this
@@ -233,10 +312,11 @@ while IFS=$'\t' read -r -u 3 name pkgs flags extra filter; do
   # Omitting it silently dropped exactly the two SLO benches this build enrolled in the nightly
   # lane, i.e. the check would have gone quiet about the tests it was added to protect.
   count=$(printf '%s\n' "$out" | count_nextest_rows)
-  printf '%s\t%s\n' "$name" "$count" >> "$tmp"
+  printf '%s\t%s\t%s\n' "$name" "$count" "${targets:+$(wc -w <<< "$targets" | awk '{print $1/2}') named target(s)}" >> "$tmp"
 done 3<<< "$lanes"
 
 if [ "$MODE" = "--update" ]; then
+  [ -z "$ONLY_LANE" ] || { echo "assert-lane-counts.sh: --update rewrites every lane; it takes no --lane." >&2; exit 2; }
   # A lane that failed above never reached "$tmp", and --update ignores $fail, so rewriting from a
   # broken run would silently DELETE that lane's pin - the gate erasing its own evidence.
   if [ "$fail" -ne 0 ]; then
@@ -247,10 +327,10 @@ if [ "$MODE" = "--update" ]; then
     echo "# Expected test count per filtered CI lane. Regenerate: scripts/assert-lane-counts.sh --update"
     echo "# EXACT: a lane that grows OR shrinks fails until this file is updated in the same change."
     echo "# A floor let growth accumulate as slack a later deletion could hide inside."
-    cat "$tmp"
+    cut -f1,2 "$tmp"
   } > "$EXPECTED"
   echo "assert-lane-counts.sh: wrote ${EXPECTED}"
-  cat "$tmp"
+  cut -f1,2 "$tmp"
   exit 0
 fi
 
@@ -259,7 +339,7 @@ fi
 # which is not hypothetical -- it was measured here. So growth must be recorded in the same change
 # that adds the tests, exactly as a deletion must. Every lane's count is printed either way, so a
 # clean run still says what it counted.
-while IFS=$'\t' read -r name count; do
+while IFS=$'\t' read -r name count listed; do
   want=$(/usr/bin/grep -P "^\Q${name}\E\t" "$EXPECTED" | cut -f2)
   if [ -z "$want" ]; then
     echo "LANE ${name}: no expected count recorded. Add it to ${EXPECTED}." >&2
@@ -277,7 +357,7 @@ while IFS=$'\t' read -r name count; do
     echo "  later deletion hides inside." >&2
     fail=1
   else
-    echo "  lane ${name}: ${count} (pinned ${want})"
+    echo "  lane ${name}: ${count} (pinned ${want})${listed:+, listed from ${listed}}"
   fi
 done < "$tmp"
 

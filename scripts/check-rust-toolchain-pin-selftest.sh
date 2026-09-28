@@ -6,8 +6,8 @@ CHECKER="$SCRIPT_DIR/check-rust-toolchain-pin.sh"
 FIXTURE_ROOT="$(mktemp -d)"
 trap 'rm -rf "$FIXTURE_ROOT"' EXIT
 
-MSRV_189_MANIFESTS='Cargo.toml|adapters/howl/Cargo.toml|adapters/railgun/client-wasm/Cargo.toml|benches/b1-bench/Cargo.toml|crates/inspire/Cargo.toml|tools/bench-compare/Cargo.toml'
-MSRV_189_PACKAGES='bench-compare,howl-poseidon2,howl-record,raven-b1-bench,raven-bench,raven-client,raven-core,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage'
+MSRV_189_MANIFESTS='Cargo.toml|adapters/railgun/client-wasm/Cargo.toml|benches/b1-bench/Cargo.toml|crates/inspire/Cargo.toml|tools/bench-compare/Cargo.toml'
+MSRV_189_PACKAGES='bench-compare,raven-b1-bench,raven-bench,raven-client,raven-core,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage'
 MSRV_189_EXTRA_PACKAGES='raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror'
 MSRV_189_OVERRIDE_MANIFESTS='adapters/railgun/core/Cargo.toml|adapters/railgun/persistence/Cargo.toml|adapters/railgun/poseidon/Cargo.toml|adapters/railgun/ppoi-mirror/Cargo.toml'
 MSRV_191_MANIFESTS='adapters/eth-state/Cargo.toml|adapters/railgun/Cargo.toml'
@@ -177,6 +177,22 @@ write_manifest "extras/untracked/Cargo.toml" "1.89"
 expect_rejection "extras/untracked/Cargo.toml declares rust-version '1.89' but is absent" \
   "untracked floor declaration"
 rm -rf "$FIXTURE_ROOT/extras"
+
+# An independent submodule pins itself: its floor, toolchain file and workflows are not this
+# scan's, and the same files anywhere else still are.
+write_manifest "adapters/howl/Cargo.toml" "1.89"
+printf '[toolchain]\nchannel = "stable"\n' > "$FIXTURE_ROOT/adapters/howl/rust-toolchain.toml"
+mkdir -p "$FIXTURE_ROOT/adapters/howl/.github/workflows"
+printf 'jobs:\n  t:\n    steps:\n      - uses: dtolnay/rust-toolchain@stable\n' \
+  > "$FIXTURE_ROOT/adapters/howl/.github/workflows/ci.yml"
+if ! output="$(RAVEN_TOOLCHAIN_SCAN_ROOT="$FIXTURE_ROOT" "$CHECKER" 2>&1)"; then
+  printf 'selftest failed: an independent submodule was scanned: %s\n' "$output" >&2
+  exit 1
+fi
+cp -r "$FIXTURE_ROOT/adapters/howl" "$FIXTURE_ROOT/adapters/not-independent"
+expect_rejection "adapters/not-independent/Cargo.toml declares rust-version '1.89' but is absent" \
+  "the same files outside the independent submodule"
+rm -rf "$FIXTURE_ROOT/adapters/howl" "$FIXTURE_ROOT/adapters/not-independent"
 
 sed -i '/RUSTUP_TOOLCHAIN: "1.91"/d; s|rust-toolchain@1.91|rust-toolchain@1.98.0|' \
   "$FIXTURE_ROOT/.github/workflows/ci.yml"

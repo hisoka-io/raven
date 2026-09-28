@@ -6,9 +6,16 @@ on:
   pull_request:
     branches: [main, dev]
   schedule:
-    # nightly production-cell closure lane
+    # nightly: the production-cell closure lane, the full lane-count job, and every job a push's
+    # path filter skipped
     - cron: "0 3 * * *"
   workflow_dispatch:
+
+# A newer push or pull-request update supersedes the run on the same ref. Nightly and manual runs
+# are never cancelled by a push: they run what a push skips.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,8 +26,48 @@ env:
   RUSTDOCFLAGS: "-D warnings"
 
 jobs:
+  # Which jobs this change can affect. scripts/ci-changes.sh fails open: a nightly or manual run, an
+  # unreadable range, a path no rule claims, or a change to this file, scripts/ or toolchain config
+  # selects every job. Consumers test `!= 'false'`, so an output that never arrived still runs them.
+  changes:
+    name: select jobs for this change
+    runs-on: ubuntu-latest
+    # actions: read finds the last green run a push is diffed from
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      root: ${{ steps.select.outputs.root }}
+      docs: ${{ steps.select.outputs.docs }}
+      wasm: ${{ steps.select.outputs.wasm }}
+      railgun: ${{ steps.select.outputs.railgun }}
+      lane_counts: ${{ steps.select.outputs.lane_counts }}
+      inspire: ${{ steps.select.outputs.inspire }}
+      eth_state: ${{ steps.select.outputs.eth_state }}
+      b1_bench: ${{ steps.select.outputs.b1_bench }}
+      bench_compare: ${{ steps.select.outputs.bench_compare }}
+      bench_gate: ${{ steps.select.outputs.bench_gate }}
+      msrv_1_89: ${{ steps.select.outputs.msrv_1_89 }}
+      msrv_1_91: ${{ steps.select.outputs.msrv_1_91 }}
+      sdk: ${{ steps.select.outputs.sdk }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # the last green commit and a pull request's merge base must both be in the clone
+          fetch-depth: 0
+      # cargo metadata reads each workspace's path dependencies
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - name: select jobs
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci-changes.sh
+
   check:
     name: fmt + clippy + test (native)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.root != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,6 +96,8 @@ jobs:
 
   docs:
     name: cargo doc (no deps, warnings as errors)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -70,6 +119,8 @@ jobs:
 
   wasm:
     name: check + clippy (wasm32-unknown-unknown)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.wasm != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -125,6 +176,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      # for the job selector's red-proof, which asks cargo metadata for each workspace's inputs
+      - uses: dtolnay/rust-toolchain@1.98.0
       - name: check-hygiene
         if: ${{ !cancelled() }}
         run: adapters/railgun/scripts/check-hygiene.sh
@@ -176,6 +229,11 @@ jobs:
       - name: toolchain-pin red-proof
         if: ${{ !cancelled() }}
         run: scripts/check-rust-toolchain-pin-selftest.sh
+      # The path filter decides which jobs run, so a wrong rule skips a gate on exactly the change
+      # it guards. This proves the rules against fixtures and holds them to this file's jobs.
+      - name: job selector red-proof
+        if: ${{ !cancelled() }}
+        run: scripts/ci-changes-selftest.sh
 
   advisories:
     name: cargo-deny full check (every workspace)
@@ -198,7 +256,6 @@ jobs:
             Cargo.toml \
             adapters/railgun/Cargo.toml \
             adapters/railgun/client-wasm/Cargo.toml \
-            adapters/howl/Cargo.toml \
             adapters/eth-state/Cargo.toml \
             crates/inspire/Cargo.toml \
             benches/b1-bench/Cargo.toml \
@@ -277,6 +334,8 @@ jobs:
 
   railgun-static:
     name: railgun adapter (fmt + check + clippy)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.railgun != 'false' }}
     runs-on: ubuntu-latest
     # cap so a hung tool surfaces instead of blocking the matrix
     timeout-minutes: 30
@@ -313,9 +372,10 @@ jobs:
     # split into three balanced shards (ci-test profile + lld + sccache)
     # to keep the adapter + inspire test build under the time budget
     name: railgun tests (${{ matrix.shard.name }})
-    needs: railgun-static
-    # `skipped` reads as green on a merged board, so an upstream red silenced these for
-    # nineteen days. Run them on their own merits and let them report a real verdict.
+    # Not railgun-static: these ran whatever it returned, so waiting on it only delayed them.
+    needs: changes
+    # Skipped at job level, a matrix job reports under its unexpanded name, which never satisfies
+    # the required "railgun tests (cli)" check. So the job always starts, and its steps skip.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -344,31 +404,40 @@ jobs:
       RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=lld"
     steps:
       - name: free disk space
-        # adapter target/ tree overruns the runner's default free budget
+        if: ${{ needs.changes.outputs.railgun != 'false' }}
+        # The adapter's target/ once overran the runner's disk. Today's image has ~100 GB free, and
+        # deleting the preinstalled SDKs took 1-8 minutes per job, so it now runs only when short.
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force >/dev/null 2>&1 || true
-          df -h
+          avail=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+          if [ "$avail" -lt 40 ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            sudo docker image prune --all --force >/dev/null 2>&1 || true
+          fi
+          df -h /
       - uses: actions/checkout@v4
+        if: ${{ needs.changes.outputs.railgun != 'false' }}
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@1.98.0
+        if: ${{ needs.changes.outputs.railgun != 'false' }}
       - name: install lld linker
+        if: ${{ needs.changes.outputs.railgun != 'false' }}
         run: sudo apt-get update && sudo apt-get install -y lld
       - name: install sccache
+        if: ${{ needs.changes.outputs.railgun != 'false' }}
         # v0.0.10 ships sccache 0.10+ for the GHA cache v2 endpoint
         uses: mozilla-actions/sccache-action@v0.0.10
       - uses: Swatinem/rust-cache@v2
+        if: ${{ needs.changes.outputs.railgun != 'false' }}
         with:
           # shared so shards reuse the first shard's target/ instead of rebuilding inspire cold
           shared-key: "railgun-tests"
       - uses: taiki-e/install-action@v2
+        if: ${{ needs.changes.outputs.railgun != 'false' }}
         with:
           tool: cargo-nextest@0.9.129
       - name: cargo nextest (ci-test profile)
+        if: ${{ needs.changes.outputs.railgun != 'false' }}
         run: |
           # --no-tests=fail pins nextest's zero-match behavior regardless of the
           # installed release. It does NOT cover a union filter where only one term
@@ -386,7 +455,7 @@ jobs:
             --profile ci
       - name: sccache stats
         run: sccache --show-stats
-        if: always()
+        if: ${{ always() && needs.changes.outputs.railgun != 'false' }}
 
   lane-counts:
     # Every filtered lane must still select the number of tests it is supposed to.
@@ -396,15 +465,18 @@ jobs:
     # it ran 65, because a file was deleted or a test renamed. Both shapes occurred here inside
     # one week, and a shrunken lane reports success the whole time.
     #
-    # This needs the adapter's test binaries built, so it is its own job rather than a step in
-    # the cheap hygiene job: that build is the honest price of the check. The counts in
-    # .github/expected-lane-counts.tsv are EXACT: a lane that grows or shrinks fails until that
-    # file is updated in the same change, because unrecorded growth is slack a deletion hides in.
+    # The counts in .github/expected-lane-counts.tsv are EXACT: a lane that grows or shrinks fails
+    # until that file is updated in the same change, because unrecorded growth is slack a deletion
+    # hides in.
+    #
+    # Per push, each durability lane counts itself in its own job, where its binaries are already
+    # built. This job is the whole listing: every lane at once, the production-cell lane, both
+    # red-proofs and the --selected pass, which needs the whole workspace built. It runs nightly, on
+    # manual dispatch, and on any change to this file, scripts/ or a nextest config. The gate and
+    # --selected also run locally before a push.
     name: lane counts (no filter may silently shrink)
-    needs: railgun-static
-    # `skipped` reads as green on a merged board, so an upstream red silenced these for
-    # nineteen days. Run them on their own merits and let them report a real verdict.
-    if: ${{ !cancelled() }}
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.lane_counts != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -462,10 +534,8 @@ jobs:
     # per-push shard enables, so its non-ignored tests run nowhere else. scripts/assert-lane-counts.sh
     # lists each lane with the same `run_ignored` field, so the count and the lane cannot diverge.
     name: durability + closure (${{ matrix.lane.name }}, --run-ignored ${{ matrix.lane.run_ignored }})
-    needs: railgun-static
-    # `skipped` reads as green on a merged board, so an upstream red silenced these for
-    # nineteen days. Run them on their own merits and let them report a real verdict.
-    if: ${{ !cancelled() }}
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.railgun != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -545,13 +615,14 @@ jobs:
       RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=lld"
     steps:
       - name: free disk space
+        # runs only when short; see railgun-tests
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force >/dev/null 2>&1 || true
-          df -h
+          avail=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+          if [ "$avail" -lt 40 ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            sudo docker image prune --all --force >/dev/null 2>&1 || true
+          fi
+          df -h /
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -579,6 +650,10 @@ jobs:
             --profile ${{ matrix.lane.nextest_profile }} \
             --run-ignored ${{ matrix.lane.run_ignored }} \
             -E '${{ matrix.lane.filter }}'
+      # Here, where the run above built exactly this lane's binaries, so listing costs seconds.
+      - name: lane count (this lane still selects its pinned number of tests)
+        if: ${{ !cancelled() }}
+        run: scripts/assert-lane-counts.sh --lane "durability-and-closure/${{ matrix.lane.name }}"
       - name: sccache stats
         run: sccache --show-stats
         if: always()
@@ -619,13 +694,14 @@ jobs:
       RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=lld"
     steps:
       - name: free disk space
+        # runs only when short; see railgun-tests
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force >/dev/null 2>&1 || true
-          df -h
+          avail=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+          if [ "$avail" -lt 40 ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            sudo docker image prune --all --force >/dev/null 2>&1 || true
+          fi
+          df -h /
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -666,6 +742,9 @@ jobs:
             --profile production-cell \
             --run-ignored all \
             -E 'binary(db1_note_record_production_cell) + binary(db2_block_production_cell) + binary(cell_width_runtime_gate) + binary(per_leaf_path_production_cell) + binary(per_node_production_cell) + binary(production_cell_budget_bench) + binary(recovery_latency_bench) + binary(poi_shim_coverage)'
+      - name: lane count (this lane still selects its pinned number of tests)
+        if: ${{ !cancelled() }}
+        run: scripts/assert-lane-counts.sh --lane production-cell-closure/inline
       - name: sccache stats
         run: sccache --show-stats
         if: always()
@@ -674,6 +753,8 @@ jobs:
     # submodule detached workspace; --release avoids the dev-mode d=2048 timeout.
     # lld + sccache keep the two test runs (default + parallel) under budget.
     name: raven-inspire (submodule workspace)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.inspire != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -683,9 +764,14 @@ jobs:
       RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=lld"
     steps:
       - name: free disk space
+        # runs only when short; see railgun-tests
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          avail=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+          if [ "$avail" -lt 40 ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            sudo docker image prune --all --force >/dev/null 2>&1 || true
+          fi
+          df -h /
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -859,6 +945,8 @@ jobs:
     # adapters/eth-state is a submodule that builds against this checkout's crates by path.
     # The check name predates the move and is kept: branch protection requires it by name.
     name: eth-state example (detached workspace)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.eth_state != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -882,6 +970,8 @@ jobs:
 
   b1-bench:
     name: b1-bench (detached workspace)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.b1_bench != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -903,6 +993,8 @@ jobs:
 
   bench-compare:
     name: bench-compare (detached workspace)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.bench_compare != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -927,13 +1019,15 @@ jobs:
 
   msrv-1-89:
     name: MSRV 1.89 (framework and independent workspaces)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.msrv_1_89 != 'false' }}
     runs-on: ubuntu-latest
     env:
       RUSTUP_TOOLCHAIN: "1.89"
       # 1.89 predates rust-lld as rustc's x86_64-linux default, so this job names lld itself
       RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=lld"
-      MSRV_MANIFESTS: "Cargo.toml|adapters/howl/Cargo.toml|adapters/railgun/client-wasm/Cargo.toml|benches/b1-bench/Cargo.toml|crates/inspire/Cargo.toml|tools/bench-compare/Cargo.toml"
-      MSRV_PACKAGES: "bench-compare,howl-poseidon2,howl-record,raven-b1-bench,raven-bench,raven-client,raven-core,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage"
+      MSRV_MANIFESTS: "Cargo.toml|adapters/railgun/client-wasm/Cargo.toml|benches/b1-bench/Cargo.toml|crates/inspire/Cargo.toml|tools/bench-compare/Cargo.toml"
+      MSRV_PACKAGES: "bench-compare,raven-b1-bench,raven-bench,raven-client,raven-core,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage"
       MSRV_EXTRA_PACKAGES: "raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror"
     steps:
       - uses: actions/checkout@v4
@@ -973,8 +1067,6 @@ jobs:
             case "$manifest" in
               Cargo.toml)
                 cargo check --manifest-path "$manifest" --workspace --all-features --all-targets ;;
-              adapters/howl/Cargo.toml)
-                cargo check --manifest-path "$manifest" --workspace --all-targets ;;
               benches/b1-bench/Cargo.toml)
                 cargo check --manifest-path "$manifest" --features inspire --all-targets ;;
               crates/inspire/Cargo.toml)
@@ -994,8 +1086,6 @@ jobs:
             case "$manifest" in
               Cargo.toml)
                 cargo clippy --manifest-path "$manifest" --workspace --all-features --all-targets -- -D warnings ;;
-              adapters/howl/Cargo.toml)
-                cargo clippy --manifest-path "$manifest" --workspace --all-targets -- -D warnings ;;
               benches/b1-bench/Cargo.toml)
                 cargo clippy --manifest-path "$manifest" --features inspire --all-targets -- -D warnings ;;
               crates/inspire/Cargo.toml)
@@ -1009,6 +1099,8 @@ jobs:
 
   msrv-1-91:
     name: MSRV 1.91 (Railgun and eth-state native graphs)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.msrv_1_91 != 'false' }}
     runs-on: ubuntu-latest
     env:
       RUSTUP_TOOLCHAIN: "1.91"
@@ -1067,6 +1159,8 @@ jobs:
 
   bench-gate:
     name: bench regression gate (bytes blocking, timings report-only)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.bench_gate != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -1097,43 +1191,12 @@ jobs:
           path: target/bench-gate/**/*.json
           if-no-files-found: warn
 
-  howl-poseidon2:
-    name: howl adaptor (cross-language KAT + codec parity)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@1.98.0
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      - name: verify Poseidon2 provenance
-        run: adapters/howl/poseidon2/check-provenance.sh
-      - name: Poseidon2 provenance red-proof
-        run: adapters/howl/poseidon2/check-provenance-selftest.sh
-      - name: cargo fmt
-        run: cargo fmt --manifest-path adapters/howl/Cargo.toml --all -- --check
-      - name: cargo clippy
-        run: cargo clippy --manifest-path adapters/howl/Cargo.toml --all-targets -- -D warnings
-      # Two parity surfaces, both against vectors generated by the counterpart implementation
-      # and checked in with their generators. The hash constants are not readable from source
-      # anywhere - one side is a WASM blob, the other a compiler intrinsic - so byte-identity
-      # against them is the only thing separating this from a different hash that permutes
-      # correctly. The record layout is frozen wire, so a disagreement there is a note the
-      # recipient cannot read.
-      - name: cargo test (KAT + codec parity)
-        run: cargo test --manifest-path adapters/howl/Cargo.toml --all-targets
-      - name: cargo test --doc
-        run: cargo test --manifest-path adapters/howl/Cargo.toml --doc
-
   sdk-tests:
     # fresh-clone gate: SDK depends on the gitignored wasm-pack output,
     # so this rebuilds it, enforces the bundle ceiling, then runs tests
     name: sdk tests (typescript + wasm-pack)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.sdk != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -1210,8 +1273,9 @@ jobs:
       #     `pnpm install`.
       #   - engine singleton: installs the packed SDK beside the Railgun wallet from the npm
       #     registry and requires one engine copy that install lands on; a second copy
-      #     splits engine's POI.init static with no error. Its red-proof adds ten installs.
-      #     Each step measured about five minutes on npm 10, so both carry a timeout.
+      #     splits engine's POI.init static with no error. Its red-proof adds ten installs
+      #     and runs beside this job, in sdk-engine-singleton-red-proof, where its 3-4 minutes
+      #     are off this job's path. Both carry a timeout.
       - name: sdk test-count pin
         run: adapters/railgun/scripts/check-sdk-test-count.sh
       - name: sdk test-count red-proof
@@ -1230,10 +1294,6 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: adapters/railgun/scripts/check-sdk-engine-singleton.sh
-      - name: sdk engine singleton red-proof
-        if: ${{ !cancelled() }}
-        timeout-minutes: 25
-        run: adapters/railgun/scripts/check-sdk-engine-singleton-selftest.sh
       # The publish candidate is the exact tarball the pack gate installed and inspected, emitted
       # only when every step above passed. Publishing it stays manual: this job holds no registry
       # credential. The gate's scratch also holds the dependency it packed for its offline
@@ -1272,3 +1332,38 @@ jobs:
           name: wasm-pack-candidate-${{ github.sha }}
           path: ${{ runner.temp }}/wasm-pack-candidate/
           if-no-files-found: error
+
+  sdk-engine-singleton-red-proof:
+    # The engine-singleton gate's red-proof, split from sdk-tests so its ten registry installs run
+    # beside that job's suite instead of after it. It needs what the gate needs: the wasm the SDK
+    # links and the SDK's installed dependencies.
+    name: sdk engine singleton red-proof
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.sdk != 'false' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: adapters/railgun/sdk/pnpm-lock.yaml
+      - name: install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: build wasm-pack pkg-node + pkg-bundler + size gate
+        run: adapters/railgun/client-wasm/scripts/wasm-build.sh
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+        working-directory: adapters/railgun/sdk
+      - name: sdk engine singleton red-proof
+        timeout-minutes: 25
+        run: adapters/railgun/scripts/check-sdk-engine-singleton-selftest.sh

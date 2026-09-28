@@ -10,12 +10,19 @@ PINNED_DOCKER_TAG="1.98.0-slim-bookworm"
 # Gates parse nextest's text output, which is not a stable interface: 0.9.146 changed a
 # show-config line and failed a healthy tree. Move this only with those gates re-proven.
 PINNED_NEXTEST="0.9.129"
-MSRV_189_MANIFESTS='Cargo.toml|adapters/howl/Cargo.toml|adapters/railgun/client-wasm/Cargo.toml|benches/b1-bench/Cargo.toml|crates/inspire/Cargo.toml|tools/bench-compare/Cargo.toml'
-MSRV_189_PACKAGES='bench-compare,howl-poseidon2,howl-record,raven-b1-bench,raven-bench,raven-client,raven-core,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage'
+MSRV_189_MANIFESTS='Cargo.toml|adapters/railgun/client-wasm/Cargo.toml|benches/b1-bench/Cargo.toml|crates/inspire/Cargo.toml|tools/bench-compare/Cargo.toml'
+MSRV_189_PACKAGES='bench-compare,raven-b1-bench,raven-bench,raven-client,raven-core,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage'
 MSRV_189_EXTRA_PACKAGES='raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror'
 MSRV_189_OVERRIDE_MANIFESTS='adapters/railgun/core/Cargo.toml|adapters/railgun/persistence/Cargo.toml|adapters/railgun/poseidon/Cargo.toml|adapters/railgun/ppoi-mirror/Cargo.toml'
 MSRV_191_MANIFESTS='adapters/eth-state/Cargo.toml|adapters/railgun/Cargo.toml'
 MSRV_191_PACKAGES='eth-state,raven-railgun-cli,raven-railgun-core,raven-railgun-engine,raven-railgun-http,raven-railgun-indexer,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-railgun-ppoi-replay,raven-railgun-testkit'
+# Submodules no Raven workspace depends on: their toolchain files, manifests and workflows are
+# their own repository's to pin, so this scan does not reach into them.
+INDEPENDENT_SUBMODULES=(adapters/howl)
+prune_independent=()
+for sub in "${INDEPENDENT_SUBMODULES[@]}"; do
+  prune_independent+=(-path "$REPO_ROOT/$sub" -prune -o)
+done
 
 failed=0
 pinned_actions=0
@@ -43,6 +50,7 @@ while IFS= read -r -d '' toolchain_file; do
 done < <(find "$REPO_ROOT" \
   -path "$REPO_ROOT/.git" -prune -o \
   -path "$REPO_ROOT/no-commit" -prune -o \
+  "${prune_independent[@]}" \
   -path '*/target' -prune -o \
   -type f \( -name rust-toolchain -o -name rust-toolchain.toml \) -print0)
 
@@ -86,6 +94,7 @@ while IFS= read -r -d '' manifest; do
 done < <(find "$REPO_ROOT" \
   -path "$REPO_ROOT/.git" -prune -o \
   -path "$REPO_ROOT/no-commit" -prune -o \
+  "${prune_independent[@]}" \
   -path '*/target' -prune -o \
   -type f -name Cargo.toml -print0)
 
@@ -168,6 +177,7 @@ while IFS= read -r -d '' workflow; do
 done < <(find "$REPO_ROOT" \
   -path "$REPO_ROOT/.git" -prune -o \
   -path "$REPO_ROOT/no-commit" -prune -o \
+  "${prune_independent[@]}" \
   -path '*/target' -prune -o \
   -type f \( -path '*/.github/workflows/*.yml' -o -path '*/.github/workflows/*.yaml' \) -print0)
 
@@ -292,6 +302,7 @@ while IFS= read -r -d '' script; do
 done < <(find "$REPO_ROOT" \
   -path "$REPO_ROOT/.git" -prune -o \
   -path "$REPO_ROOT/no-commit" -prune -o \
+  "${prune_independent[@]}" \
   -path '*/target' -prune -o \
   -type f \( -name '*.sh' -o -name Makefile -o -name '*.mk' \) -print0)
 
@@ -307,6 +318,7 @@ while IFS= read -r -d '' dockerfile; do
 done < <(find "$REPO_ROOT" \
   -path "$REPO_ROOT/.git" -prune -o \
   -path "$REPO_ROOT/no-commit" -prune -o \
+  "${prune_independent[@]}" \
   -path '*/target' -prune -o \
   -type f -name 'Dockerfile*' -print0)
 
@@ -318,7 +330,8 @@ if [[ "$failed" -ne 0 ]]; then
   exit 1
 fi
 
-printf 'Rust toolchain selectors pinned: channel=%s files=%d CI=%d MSRV=1.89/17+1.91/11 overrides=%d Docker=%d nextest=%d@%s cargo-binstall=%d\n' \
+printf 'Rust toolchain selectors pinned: channel=%s files=%d CI=%d MSRV=1.89/%d+1.91/%d overrides=%d Docker=%d nextest=%d@%s cargo-binstall=%d\n' \
   "$PINNED_TOOLCHAIN" "$toolchain_files" "$pinned_actions" \
+  "$(tr ',' '\n' <<< "$MSRV_189_PACKAGES" | wc -l)" "$(tr ',' '\n' <<< "$MSRV_191_PACKAGES" | wc -l)" \
   "$((msrv_189_overrides + msrv_191_overrides))" "$docker_builders" \
   "$nextest_installers" "$PINNED_NEXTEST" "$cargo_binstall_invocations"

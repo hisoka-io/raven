@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Run the CI gates that fail on a narrow local check, before pushing.
 #
-# The repo is eight separate cargo workspaces, each with its own fmt and clippy job, plus two
-# MSRV jobs and the hygiene scripts. Checking only the crate you edited passes locally and reds CI,
-# which is how four green jobs broke in one push. This runs all of them in one command.
+# CI builds seven separate cargo workspaces, each with its own fmt and clippy job, plus two
+# MSRV jobs and the hygiene scripts. Checking only the crate you edited passes locally and reds
+# CI, which is how four green jobs broke in one push. This runs all of them in one command. The
+# Howl submodule is not among them: nothing here depends on it, and its gates belong to its own
+# repository.
 #
 # It deliberately does NOT run the Rust test suites: those take tens of minutes and are sharded
 # in CI. Use --with-tests for the fast per-workspace ones. The SDK gates are the exception and
@@ -64,7 +66,6 @@ run "railgun"       cargo fmt --manifest-path adapters/railgun/Cargo.toml \
                       -p raven-railgun-ppoi-mirror -p raven-railgun-ppoi-replay \
                       -p raven-railgun-testkit -- --check
 run "client-wasm"   cargo fmt --manifest-path adapters/railgun/client-wasm/Cargo.toml -- --check
-run "howl"          cargo fmt --manifest-path adapters/howl/Cargo.toml --all -- --check
 run "inspire"       cargo fmt --manifest-path crates/inspire/Cargo.toml -- --check
 run "eth-state"     cargo fmt --manifest-path adapters/eth-state/Cargo.toml -- --check
 run "b1-bench"      cargo fmt --manifest-path benches/b1-bench/Cargo.toml -- --check
@@ -75,7 +76,6 @@ if [ "$FAST" = 0 ]; then
   echo "== cargo clippy -D warnings, every workspace (the slow part) =="
   run "root"           cargo clippy --workspace --all-targets $OFFLINE -- -D warnings
   run "railgun"        cargo clippy --manifest-path adapters/railgun/Cargo.toml --workspace --all-targets $OFFLINE -- -D warnings
-  run "howl"           cargo clippy --manifest-path adapters/howl/Cargo.toml --all-targets $OFFLINE -- -D warnings
   run "inspire"        cargo clippy --manifest-path crates/inspire/Cargo.toml --all-targets $OFFLINE -- -D warnings
   run "inspire modsw"  cargo clippy --manifest-path crates/inspire/Cargo.toml --all-targets --features mod-switch-response $OFFLINE -- -D warnings
   run "eth-state"      cargo clippy --manifest-path adapters/eth-state/Cargo.toml --all-targets $OFFLINE -- -D warnings
@@ -126,7 +126,7 @@ fi
 if [ "$MSRV" = 1 ]; then
   echo
   echo "== MSRV clippy (separate toolchains; a newer lint set is not the gate) =="
-  for m in Cargo.toml adapters/howl/Cargo.toml adapters/railgun/client-wasm/Cargo.toml \
+  for m in Cargo.toml adapters/railgun/client-wasm/Cargo.toml \
            tools/bench-compare/Cargo.toml; do
     RUSTUP_TOOLCHAIN=1.89 run "1.89 $m" cargo clippy --manifest-path "$m" --all-targets $OFFLINE -- -D warnings
   done
@@ -140,7 +140,6 @@ if [ "$WITH_TESTS" = 1 ]; then
   echo
   echo "== detached-workspace tests (the railgun shards are too slow for preflight) =="
   run "inspire"      cargo test --manifest-path crates/inspire/Cargo.toml $OFFLINE
-  run "howl"         cargo test --manifest-path adapters/howl/Cargo.toml --all-targets $OFFLINE
   run "bench-compare" cargo test --manifest-path tools/bench-compare/Cargo.toml $OFFLINE
 fi
 

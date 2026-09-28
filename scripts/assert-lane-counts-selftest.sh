@@ -17,8 +17,10 @@
 # through LANE_COUNTS_FAKE_CARGO instead of breaking the tree. They need no build and run first.
 #
 # COST: the stub cases are instant. The cases that mutate EXPECTATIONS run the real gate, which
-# invokes `cargo nextest list` per lane: ~1-2 min on a warm target dir, a full build when cold.
-# It is wired into the lane-counts CI job, which already pays that build.
+# invokes `cargo nextest list` per lane: seconds on a warm target dir, the lanes' builds when cold.
+# One case lists every lane from its full build, to prove the narrowed listing counts the same
+# tests; that pays every lane's full build. It is wired into the lane-counts CI job, whose
+# --selected pass builds the whole workspace anyway.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -136,7 +138,8 @@ chmod +x "$STUBS"/*
 stub_case() {  # stub_case <stub> <want-nonzero:0|1> <forbidden-text|-> <label> <required-text>...
   local stub="$1" wantfail="$2" forbid="$3" label="$4"; shift 4
   local out rc bad=0 need
-  out=$(LANE_COUNTS_FAKE_CARGO="$STUBS/$stub" bash "$GATE" 2>&1); rc=$?
+  # shellcheck disable=SC2086
+  out=$(LANE_COUNTS_FAKE_CARGO="$STUBS/$stub" bash "$GATE" ${GATE_ARGS:-} 2>&1); rc=$?
   if [ "$wantfail" = 1 ] && [ "$rc" -eq 0 ]; then
     echo "SELFTEST FAIL: ${label}: expected a non-zero exit, got 0" >&2; bad=1
   elif [ "$wantfail" = 0 ] && [ "$rc" -ne 0 ]; then
@@ -165,6 +168,13 @@ stub_case lists-nothing 1 "BUILD FAILED" \
 stub_case lists-one 1 "selects ZERO tests" \
   "a lane below its pinned count is reported as a SHRINK, not as an empty filter" \
   "it SHRANK by"
+# The per-lane form a lane's own job runs must attribute the same way.
+GATE_ARGS="--lane ${LANE}" stub_case build-fail 1 "selects ZERO tests" \
+  "--lane: a failed build is reported as a build failure" \
+  "BUILD FAILED" "collect2: fatal error: cannot find 'ld'"
+GATE_ARGS="--lane durability-and-closure/cli-ignored" stub_case lists-one 1 "selects ZERO tests" \
+  "--lane: a lane below its pinned count is reported as a SHRINK" \
+  "LANE durability-and-closure/cli-ignored: selects 1 tests" "it SHRANK by"
 # The gate is exact, so this stub's 200 rows pass only against pins of 200; what is under test is
 # that coloured rows are counted at all.
 awk -F'\t' 'BEGIN{OFS="\t"} /^#/ || NF<2 {print; next} {print $1, 200}' .github/expected-lane-counts.tsv \
@@ -234,6 +244,60 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 echo "  ok: the unmutated tree -> exit 0"
+
+# 0. The narrowed listing builds only the binaries a binary()-union filter names. It must count
+#    what the lane's full build counts, lane for lane, or the exact pins mean nothing.
+out=$(bash "$GATE" 2>&1)
+if ! /usr/bin/grep -qF "named target(s)" <<< "$out"; then
+  echo "SELFTEST FAIL: no lane was listed from its named targets, so the narrowing is untested" >&2
+  fails=1
+elif ! LANE_COUNTS_FULL_LISTING=1 bash "$GATE" > /dev/null 2>&1; then
+  echo "SELFTEST FAIL: listed from their full builds, the lanes miss the pins the narrowed listing" >&2
+  echo "  meets. The narrowing changed a count." >&2
+  fails=1
+else
+  echo "  ok: every lane counts the same from its named targets as from its full build"
+fi
+
+# 0a. A binary() term naming no target cannot be narrowed, so nextest still judges the filter.
+sed 's/binary(phase4_closure)/binary(phase4_closure_renamed)/' .github/workflows/ci.yml > "$STUBS/ci-renamed.yml"
+if cmp -s "$STUBS/ci-renamed.yml" .github/workflows/ci.yml; then
+  echo "SELFTEST CANNOT RUN: the renamed-binary plant no longer applies to ci.yml" >&2; fails=1
+elif out=$(LANE_COUNTS_WORKFLOW="$STUBS/ci-renamed.yml" bash "$GATE" --lane durability-and-closure/closure 2>&1) \
+     || ! /usr/bin/grep -qF "LANE durability-and-closure/closure: FILTERSET REJECTED" <<< "$out"; then
+  echo "SELFTEST FAIL: a binary() naming no target was not rejected as a filter fault" >&2
+  printf '%s\n' "$out" | tail -5 >&2; fails=1
+else
+  echo "  ok: a binary() naming no target -> listed in full, FILTERSET REJECTED by nextest"
+fi
+
+# 0b. --lane lists that lane alone, still against the whole ci.yml and the whole pin file.
+if out=$(bash "$GATE" --lane no-such/lane 2>&1) || ! /usr/bin/grep -qF "no lane named no-such/lane" <<< "$out"; then
+  echo "SELFTEST FAIL: --lane accepted a lane ci.yml does not have" >&2; fails=1
+else
+  echo "  ok: --lane with an unknown lane -> refused by name"
+fi
+OTHER='durability-and-closure/closure'
+/usr/bin/grep -q "^${OTHER}	" "$EXPECTED" || {
+  echo "SELFTEST FIXTURE STALE: no row for '${OTHER}' in ${EXPECTED}" >&2; exit 1; }
+cur=$(/usr/bin/grep "^${LANE}	" "$EXPECTED" | cut -f2)
+awk -F'\t' -v l="$LANE" -v n="$((cur + 1))" 'BEGIN{OFS="\t"} $1==l{$2=n} {print}' "$BE" > "$EXPECTED"
+if bash "$GATE" --lane "$LANE" > /dev/null 2>&1; then
+  echo "SELFTEST FAIL: --lane ${LANE} passed with its own pin one above its count" >&2; fails=1
+elif ! bash "$GATE" --lane "$OTHER" > /dev/null 2>&1; then
+  echo "SELFTEST FAIL: --lane ${OTHER} failed on another lane's pin; it must list only its own" >&2; fails=1
+else
+  echo "  ok: --lane trips on its own lane's shrink and ignores another lane's"
+fi
+cp "$BE" "$EXPECTED"
+printf 'durability-and-closure/removed-lane\t3\n' >> "$EXPECTED"
+if out=$(bash "$GATE" --lane "$LANE" 2>&1) \
+   || ! /usr/bin/grep -qF "LANE durability-and-closure/removed-lane: expected count is recorded" <<< "$out"; then
+  echo "SELFTEST FAIL: --lane did not report a pin whose lane left ci.yml" >&2; fails=1
+else
+  echo "  ok: --lane still reports a pin whose lane left ci.yml"
+fi
+cp "$BE" "$EXPECTED"
 
 # 1. The lane SHRANK: raise the expectation, so the measured count now falls short. This is the
 #    real defect - tests deleted out of a lane that still resolves and still reports success.
