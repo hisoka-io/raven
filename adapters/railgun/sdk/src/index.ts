@@ -15,7 +15,6 @@ export {
   containsByteSequence,
   hexToBytes,
   bytesToHex,
-  pathIndicesForPerListLeaf,
   TREE_DEPTH,
   PATH_RECORD_BYTES,
 } from "./raven-poi-node-interface";
@@ -57,9 +56,7 @@ export {
   loadClientPirContext,
 } from "./client-pir";
 
-// Railgun POI validation and Merkle addressing.
-export type { RavenPOIPathWasm } from "./poi-pir";
-
+// Railgun POI validation.
 export {
   validateBcHex,
   validateLeafIndex,

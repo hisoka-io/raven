@@ -1,15 +1,9 @@
-/** Railgun POI input validation and Merkle-path addressing. */
+/** Railgun POI input validation. */
 
 import { RavenError } from "./errors";
 
 /** Wallet-facing POI verdict, spelled as engine's `TXOPOIListStatus`. */
 export type POIStatus = "Valid" | "ShieldBlocked" | "ProofSubmitted" | "Missing";
-
-/** Railgun Merkle-path methods supplied by `raven-inspire-client-wasm`. */
-export interface RavenPOIPathWasm {
-  /** 16 flat-global auth-path row indices for a per-list leaf. */
-  path_indices_for_per_list_leaf(listKey: Uint8Array, idx: number): Uint32Array;
-}
 
 /** Convert a hex string with an optional `0x` prefix to bytes. */
 export function hexToBytes(hex: string): Uint8Array {
@@ -95,33 +89,4 @@ export function validateLeafIndex(idx: number, label: string = "leafIndex"): voi
   if (idx >= TREE_MAX_LEAVES) {
     throw RavenError.invalidQuery(`${label}: ${idx} >= 2^${TREE_DEPTH} (${TREE_MAX_LEAVES})`);
   }
-}
-
-/** Validate and copy the per-list path indices returned by WASM. */
-export function pathIndicesForPerListLeaf(
-  wasm: RavenPOIPathWasm,
-  listKeyHex: string,
-  idx: number,
-): number[] {
-  validateListKeyHex(listKeyHex);
-  validateLeafIndex(idx, "perListIndex");
-  const listKeyBytes = hexToBytes(listKeyHex);
-  let raw: Uint32Array;
-  try {
-    raw = wasm.path_indices_for_per_list_leaf(listKeyBytes, idx);
-  } catch (cause) {
-    throw RavenError.invalidQuery(`path_indices_for_per_list_leaf: wasm threw on (idx=${idx})`, {
-      cause: String(cause),
-    });
-  }
-  if (raw.length !== TREE_DEPTH) {
-    throw RavenError.decodeError(
-      `path_indices_for_per_list_leaf: wasm returned ${raw.length} indices (expected ${TREE_DEPTH})`,
-    );
-  }
-  const out: number[] = new Array(raw.length);
-  for (let i = 0; i < raw.length; i += 1) {
-    out[i] = raw[i];
-  }
-  return out;
 }

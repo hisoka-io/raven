@@ -1,11 +1,10 @@
 /** Client-side PIR helper over `raven-inspire-client-wasm`; only the encrypted blob crosses the wire. */
 
 import { RavenError } from "./errors";
-import type { RavenPOIPathWasm } from "./poi-pir";
 import { idbGet, idbPut, sha256Hex } from "./session-cache";
 
 /** Structural contract for the subset of `raven-inspire-client-wasm` this SDK consumes. */
-export interface RavenInspireWasm extends RavenPOIPathWasm {
+export interface RavenInspireWasm {
   build_client_session(
     paramsBundleBincode: Uint8Array,
     crsBincode: Uint8Array,

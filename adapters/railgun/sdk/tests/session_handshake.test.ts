@@ -103,7 +103,6 @@ function mountRehandshakeRig(
     extract_response: (_session, _crs, _state, response) => new Uint8Array(response),
     register_client_session: () => undefined,
     build_instance_params_blob: () => new Uint8Array(0),
-    path_indices_for_per_list_leaf: () => new Uint32Array(16),
   };
   const context: ClientPirContext = {
     wasm,
@@ -203,7 +202,6 @@ describe("client-PIR remote session handshake", () => {
       extract_response: (_session, _crs, _state, response) => new Uint8Array(response),
       register_client_session: () => undefined,
       build_instance_params_blob: () => new Uint8Array(0),
-      path_indices_for_per_list_leaf: () => new Uint32Array(16),
     };
     const context: ClientPirContext = {
       wasm,

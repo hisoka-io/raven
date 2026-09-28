@@ -88,7 +88,6 @@ export function targetNamingCtx(entrySize = 32): ClientPirContext {
     extract_response: (_s, _c, _st, response, _e) => new Uint8Array(response),
     build_instance_params_blob: () => new Uint8Array(0),
     register_client_session: makeRegisterSpy(),
-    path_indices_for_per_list_leaf: () => new Uint32Array(16),
   };
   return {
     wasm,

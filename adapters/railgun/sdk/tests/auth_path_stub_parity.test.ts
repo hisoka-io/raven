@@ -1,33 +1,15 @@
-// Stub-driven suites read path indices and batch replies through shared helpers, so every
-// conclusion they draw rests on those helpers matching the shipped wasm and the SDK's own reader.
-// A drifted stub fails nothing on its own.
+// Stub-driven suites read batch replies through a shared helper, so every conclusion they draw
+// rests on that helper matching the SDK's own reader. A drifted helper fails nothing on its own.
 
 import { describe, expect, it } from "vitest";
 
-import * as wasmPkg from "raven-inspire-client-wasm";
-
-import { RavenPOINodeInterface, TREE_DEPTH, type RavenInspireWasm } from "../src/index";
-import { TOKEN, encodeBatchResponseNodes, stubCtx, stubWasm } from "./helpers/auth_path_stub";
+import { RavenPOINodeInterface, TREE_DEPTH } from "../src/index";
+import { TOKEN, encodeBatchResponseNodes, stubCtx } from "./helpers/auth_path_stub";
 import { forestConfig } from "./helpers/forest";
 import { startMockServer } from "./helpers/mock_server";
 import { PATH10_ROW_BYTES, path10Root, path10Slot } from "./helpers/path10_row";
 
-const real = wasmPkg as unknown as RavenInspireWasm;
-const stub = stubWasm();
-const LIST_KEY = new Uint8Array(32).fill(0xab);
 const LIST_KEY_HEX = "ab".repeat(32);
-const LEAVES = [0, 1, 7, 100, 1234, 1234 ^ 0b111, 4096, 4223, 65_534, 65_535];
-
-describe("shared path-indices stub matches the shipped wasm geometry", () => {
-  it("reproduces path_indices_for_per_list_leaf at every level", () => {
-    for (const leaf of LEAVES) {
-      expect(
-        Array.from(stub.path_indices_for_per_list_leaf(LIST_KEY, leaf)),
-        `leaf ${leaf}`,
-      ).toEqual(Array.from(real.path_indices_for_per_list_leaf(LIST_KEY, leaf)));
-    }
-  });
-});
 
 describe("shared batch-response encoder round-trips through the SDK's own decode", () => {
   // Suites serve batch replies through encodeBatchResponseNodes; this pins that ONE writer to

@@ -7,11 +7,9 @@ import {
   ChainRegistry,
   RavenError,
   RavenPOINodeInterface,
-  pathIndicesForPerListLeaf,
   validateBcHex,
   validateLeafIndex,
   validateListKeyHex,
-  TREE_DEPTH,
   type BlindedCommitmentType,
   type ClientPirContext,
   type POIStatus,
@@ -30,8 +28,6 @@ import { EXPECTED_WIRE_SCHEMA_VERSION } from "./helpers/wire_schema";
 import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
 import { stubQueryBundle, targetNamingQueryBundle } from "./helpers/private_wire";
 import { commitmentAt, listHolding, mountPrefixChannel } from "./helpers/prefix_channel";
-
-import * as wasmPkg from "raven-inspire-client-wasm";
 
 import { startMockServer, writeJsonRpcResult, type MockServer } from "./helpers/mock_server";
 import { encodeBatchResponseNodes } from "./helpers/auth_path_stub";
@@ -59,13 +55,7 @@ function expectThrowsRavenError(fn: () => unknown, kind: RavenErrorKind): void {
   expect(RavenError.is(thrown, kind)).toBe(true);
 }
 
-// Stub mirroring the real Rust path-indices math; the real wasm runs in the privacy-invariant file.
-function realPathStubWasm(): RavenInspireWasm {
-  function flatIndex(level: number, idxAtLevel: number): number {
-    const total = 1 << (TREE_DEPTH + 1);
-    const levelOffset = total - (1 << (TREE_DEPTH + 1 - level));
-    return levelOffset + idxAtLevel;
-  }
+function pirStubWasm(): RavenInspireWasm {
   return {
     ...stubRemoteSessionExports(),
     build_client_session: () => ({ free: () => undefined }),
@@ -73,24 +63,12 @@ function realPathStubWasm(): RavenInspireWasm {
     extract_response: (_session, _crs, _state, response, _entry) => new Uint8Array(response),
     build_instance_params_blob: () => new Uint8Array(0),
     register_client_session: makeRegisterSpy(),
-    path_indices_for_per_list_leaf: (listKey: Uint8Array, idx: number): Uint32Array => {
-      if (listKey.length !== 32) {
-        throw new Error("path_indices_for_per_list_leaf: list_key length must be 32");
-      }
-      const out = new Uint32Array(TREE_DEPTH);
-      let walk = idx;
-      for (let i = 0; i < TREE_DEPTH; i += 1) {
-        out[i] = flatIndex(i, walk ^ 1);
-        walk = walk >>> 1;
-      }
-      return out;
-    },
   };
 }
 
 function stubCtx(): ClientPirContext {
   return {
-    wasm: realPathStubWasm(),
+    wasm: pirStubWasm(),
     session: { free: () => undefined },
     crsBincode: new Uint8Array(0),
     shardConfigBincode: shardConfigBincode(),
@@ -112,50 +90,6 @@ function pathSdk(endpoint: string, index = LOCAL_LEAF, root?: string): RavenPOIN
     bearerToken: TOKEN,
   });
 }
-
-describe("WASM path-indices accessors", () => {
-  const wasm = wasmPkg as unknown as RavenInspireWasm;
-  const stub = realPathStubWasm();
-  const listKey = new Uint8Array(32).fill(0xab);
-
-  it("path_indices_for_per_list_leaf returns a deterministic Uint32Array of length 16", () => {
-    const a = wasm.path_indices_for_per_list_leaf(listKey, 1234);
-    const b = wasm.path_indices_for_per_list_leaf(listKey, 1234);
-    expect(a).toBeInstanceOf(Uint32Array);
-    expect(a.length).toBe(TREE_DEPTH);
-    expect(Array.from(a)).toEqual(Array.from(b));
-  });
-
-  it("path_indices_for_per_list_leaf level-0 sibling matches XOR-1 leaf layout", () => {
-    expect(wasm.path_indices_for_per_list_leaf(listKey, 0)[0]).toBe(1);
-    expect(wasm.path_indices_for_per_list_leaf(listKey, 100)[0]).toBe(101);
-    expect(wasm.path_indices_for_per_list_leaf(listKey, 65_535)[0]).toBe(65_534);
-  });
-
-  it("the in-file stub reproduces the real wasm path indices at every level", () => {
-    for (const leaf of [0, 1, 7, 1234, 1234 ^ 0b111, 4096, 65_535]) {
-      expect(
-        Array.from(stub.path_indices_for_per_list_leaf(listKey, leaf)),
-        `per-list path for leaf ${leaf}`,
-      ).toEqual(Array.from(wasm.path_indices_for_per_list_leaf(listKey, leaf)));
-    }
-  });
-
-  it("pathIndicesForPerListLeaf wrapper returns plain number[]", () => {
-    const out = pathIndicesForPerListLeaf(wasm, LIST_KEY_HEX, 7);
-    expect(Array.isArray(out)).toBe(true);
-    expect(out.length).toBe(16);
-    expect(typeof out[0]).toBe("number");
-  });
-
-  it("pathIndicesForPerListLeaf rejects malformed list_key via typed InvalidQuery", () => {
-    expectThrowsRavenError(() => pathIndicesForPerListLeaf(wasm, "ab", 0), "InvalidQuery");
-  });
-
-  it("pathIndicesForPerListLeaf rejects an out-of-range leaf via typed InvalidQuery", () => {
-    expectThrowsRavenError(() => pathIndicesForPerListLeaf(wasm, LIST_KEY_HEX, 1 << 16), "InvalidQuery");
-  });
-});
 
 describe("client-PIR auth-path reconstruction", () => {
   let server: MockServer;

@@ -412,9 +412,12 @@ impl InspirePersistence {
                 let payload: WalEntryPayload =
                     raven_railgun_persistence::decode_no_trailing(&entry.payload).map_err(|e| {
                         AdapterError::Serialization(format!(
-                            "wal payload at seq {}: {e}. These bytes are not exactly one \
-                             WalEntryPayload of this build's shape; repair or truncate the WAL \
-                             before reopening",
+                            "wal payload at seq {}: {e}. The frame passed its checksum, so a \
+                             build wrote these bytes in a WalEntryPayload layout other than this \
+                             one's, such as the retired layout that carried PPOI status rows and \
+                             a status byte and signature on each list leaf. No in-place \
+                             migration exists, and dropping the entry would lose its rows. \
+                             Operator: re-bootstrap this instance.",
                             entry.seq
                         ))
                     })?;

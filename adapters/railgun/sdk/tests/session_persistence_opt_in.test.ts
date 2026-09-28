@@ -35,7 +35,6 @@ function spyWasm(): PersistenceSpy {
       extract_response: () => new Uint8Array(32),
       build_instance_params_blob: () => new Uint8Array([9, 9]),
       register_client_session: makeRegisterSpy(),
-      path_indices_for_per_list_leaf: () => new Uint32Array(16),
       serialize_client_session: () => {
         spy.serializeCalls += 1;
         return SESSION_BLOB;

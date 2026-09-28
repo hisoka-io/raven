@@ -503,9 +503,9 @@ impl std::fmt::Debug for PerInstanceHandles {
 /// new routes lock-free.
 pub type ChainTreeRoutes = Arc<arc_swap::ArcSwap<Vec<(u32, mpsc::Sender<ConsumerEvent>)>>>;
 
-/// Per-list routing table.
-pub type PpoiListRoutes =
-    Arc<arc_swap::ArcSwap<Vec<(DataSourceFilter, mpsc::Sender<ConsumerEvent>)>>>;
+/// Per-block PPOI routing table, fixed at boot: a block is declared in config and served
+/// after a restart.
+pub type PpoiListRoutes = Arc<[(DataSourceFilter, mpsc::Sender<ConsumerEvent>)]>;
 
 /// Operator-facing handle returned by [`bootstrap_railgun_engine_multi`].
 pub struct MultiOrchestratorHandle {
@@ -517,7 +517,7 @@ pub struct MultiOrchestratorHandle {
     pub router: tokio::task::JoinHandle<()>,
     /// Live chain-tree routing table.
     pub chain_tree_routes: ChainTreeRoutes,
-    /// Live PPOI-list routing table.
+    /// PPOI routing table.
     pub ppoi_list_routes: PpoiListRoutes,
     /// Lossy broadcast of every chain `tree_number` seen by the router.
     pub tree_observed: tokio::sync::broadcast::Sender<u32>,
@@ -704,7 +704,7 @@ where
         .collect();
 
     let chain_tree_routes = Arc::new(arc_swap::ArcSwap::from_pointee(initial_chain_tree_routes));
-    let ppoi_list_routes: PpoiListRoutes = Arc::new(arc_swap::ArcSwap::from_pointee(ppoi_routes));
+    let ppoi_list_routes: PpoiListRoutes = ppoi_routes.into();
     // Lagged receivers re-sync on the next event, so a small capacity suffices.
     let (tree_observed_tx, _) = tokio::sync::broadcast::channel::<u32>(64);
 
@@ -802,10 +802,11 @@ pub const fn global_ppoi_index(block: u32, local: u32) -> Option<u32> {
 /// Self-healing: a delivery clears the target, a miss or a dead consumer marks it. That
 /// is the same two-way choice `ConsumerMetrics` documents for `consecutive_event_errors`
 /// ("any applied event clears it") as against `unapplied_leaves` ("a contiguity gap
-/// outlives unrelated successes"). This registry is the first kind. Built as the second,
-/// it latched forever on the ordinary block rollover, because a fully provisioned list
-/// crossing a block boundary matches no route for exactly one event before the next
-/// block's instance takes over.
+/// outlives unrelated successes"). This registry is the first kind, because chain-tree
+/// routes are installed at runtime: an event of a new tree can arrive before the
+/// auto-spawned instance for it exists and miss, and the first delivery after the spawn
+/// clears the mark. PPOI routes are fixed at boot, so a PPOI mark stays until a restart with a
+/// config that serves the target.
 ///
 /// **Deliberately not disk-backed, unlike `LAYER2_DIVERGENT`.** The mark asserts a live
 /// property — "no route accepts this target right now" — which the next event for that
@@ -844,21 +845,6 @@ pub fn mark_router_unrouted_target(target: &str) {
 /// Clear a target: an event reached every route bound to it.
 pub fn clear_router_unrouted_target(target: &str) {
     ROUTER_UNROUTED_TARGETS.lock().remove(target);
-}
-
-/// Clear `target`, and -- when it is block-granular -- the list-level key it sits under.
-///
-/// The two are not alternatives, they are the SAME target named at two moments. A list key is
-/// first seen BEFORE its route exists, and that moment marks the coarse `list:<hex>`. Every delivery
-/// after the route lands names the fine `list:<hex>:block:<n>`. Clearing only the fine key
-/// leaves the coarse one set for the life of the process, and readiness fails closed on it --
-/// a permanent 503 on a node that recovered in milliseconds -- the same latching readiness
-/// failure this registry was rebuilt to avoid, reintroduced by the block granularity itself.
-fn clear_delivered_target(target: &str) {
-    clear_router_unrouted_target(target);
-    if let Some((list_scope, _)) = target.split_once(":block:") {
-        clear_router_unrouted_target(list_scope);
-    }
 }
 
 /// A route miss: count it and mark the target unrouted.
@@ -1022,7 +1008,7 @@ async fn forward_indexer_message(
                     }
                     // Self-healing: reaching every bound route is what clears the mark.
                     if delivered_to_all {
-                        clear_delivered_target(&target);
+                        clear_router_unrouted_target(&target);
                     }
                 } else {
                     record_no_route(target);
@@ -1140,7 +1126,7 @@ async fn forward_reorg_barrier(
 async fn forward_mirror_payload(
     payload: WalEntryPayload,
     height: u64,
-    ppoi_list_routes: &arc_swap::ArcSwap<Vec<(DataSourceFilter, mpsc::Sender<ConsumerEvent>)>>,
+    ppoi_list_routes: &[(DataSourceFilter, mpsc::Sender<ConsumerEvent>)],
 ) {
     let list_key: Option<[u8; 32]> = match &payload {
         WalEntryPayload::PpoiListLeafAdded { list_key, .. } => Some(*list_key),
@@ -1152,15 +1138,14 @@ async fn forward_mirror_payload(
         tracing::trace!("mirror payload without list_key; dropping");
         return;
     };
-    let routes = ppoi_list_routes.load();
     let mut matched = Vec::new();
-    for (filter, sender) in routes.iter() {
+    for (filter, sender) in ppoi_list_routes {
         let routed = payload_for_ppoi_route(*filter, &payload, lk);
         if let Some(routed) = routed {
             matched.push((sender.clone(), routed));
         }
     }
-    let target = ppoi_target_name(&payload, &lk, &routes);
+    let target = ppoi_target_name(&payload, &lk, ppoi_list_routes);
     let Some((last, rest)) = matched.split_last() else {
         record_no_route(target);
         tracing::warn!(
@@ -1194,7 +1179,7 @@ async fn forward_mirror_payload(
     }
     // Self-healing: reaching every bound route is what clears the mark.
     if delivered_to_all {
-        clear_delivered_target(&target);
+        clear_router_unrouted_target(&target);
     }
 }
 
@@ -1301,99 +1286,31 @@ mod forest_routing_tests {
         assert_eq!(split_ppoi_index(LEAVES_PER_PPOI_BLOCK + 1), (1, 1));
     }
 
-    /// A distinctive key, because the registry is process-global and unit tests share it.
-    const LATCH_LK: &str = "beeff00d00000000000000000000000000000000000000000000000000000000";
-
-    /// A distinct key again: `ppoi_target_name` is the PRODUCER, and the registry is global.
-    const COUPLE_LK: [u8; 32] = [0xbe; 32];
-
-    // The producer and the clear have to agree on one separator, and nothing asserted that.
-    // Both latch tests below pass literals, so `ppoi_target_name` could be respelled -- from
-    // `:block:` to anything -- and the entire suite stayed green while the latch came back.
-    // Verified: that mutation passed 342/342 before this test existed.
+    // Routes are fixed at boot, so a list is routed for the whole process or never. A routed list
+    // names its targets by block, so readiness can tell an undeclared block from an unserved list.
     #[test]
-    fn the_name_a_pre_route_miss_marks_is_the_one_a_delivery_clears() {
-        let payload = leaf(3 * LEAVES_PER_PPOI_BLOCK + 7);
-
-        // Moment one: the list key is seen before any route is bound to it.
-        let coarse = ppoi_target_name(&payload, &COUPLE_LK, &[]);
-
-        // Moment two: a route exists and the same payload is delivered.
+    fn a_routed_list_names_its_targets_by_block_and_an_unrouted_one_by_list() {
         let (tx, _rx) = mpsc::channel(1);
-        let routes = vec![(
+        let routes = [(
             DataSourceFilter::PpoiListBlock {
-                list_key: COUPLE_LK,
+                list_key: [7; 32],
                 block: 3,
             },
             tx,
         )];
-        let fine = ppoi_target_name(&payload, &COUPLE_LK, &routes);
-
-        assert_ne!(
-            coarse, fine,
-            "the two moments must stay distinguishable, or the granularity buys nothing"
+        let hex = hex_lower_32(&[7; 32]);
+        let named = |index: u32, routes: &[(DataSourceFilter, mpsc::Sender<ConsumerEvent>)]| {
+            ppoi_target_name(&leaf(index), &[7; 32], routes)
+        };
+        assert_eq!(
+            named(3 * LEAVES_PER_PPOI_BLOCK + 7, &routes),
+            format!("list:{hex}:block:3")
         );
-        mark_router_unrouted_target(&coarse);
-        clear_delivered_target(&fine);
-        assert!(
-            !router_unrouted_targets().contains(&coarse),
-            "clearing {fine:?} must heal the mark {coarse:?} left before the route existed; \
-             both strings come from the producer, so this fails if the two spellings drift"
+        assert_eq!(
+            named(5 * LEAVES_PER_PPOI_BLOCK, &routes),
+            format!("list:{hex}:block:5")
         );
-    }
-
-    // THE LATCH. `ppoi_target_name` names the SAME list two ways depending on whether a route
-    // exists yet: coarse before, block-granular after. Routing is asynchronous, so the first
-    // event for a new list key always marks the coarse name and every later one clears the
-    // fine name. Clearing only the fine name pinned readiness at 503 for the life of the
-    // process -- on a node that had already recovered.
-    #[test]
-    fn a_delivery_clears_the_coarse_list_mark_left_by_the_pre_route_miss() {
-        let coarse = format!("list:{LATCH_LK}");
-        let fine = format!("list:{LATCH_LK}:block:2");
-
-        // Exactly what the router does on the first event, before the route is installed.
-        mark_router_unrouted_target(&coarse);
-        assert!(router_unrouted_targets().contains(&coarse));
-
-        // ...and exactly what it does once the route lands and an event gets through.
-        clear_delivered_target(&fine);
-
-        let targets = router_unrouted_targets();
-        assert!(
-            !targets.contains(&coarse),
-            "the pre-route mark must heal when the list starts receiving events again; \
-             leaving it set is a permanent 503 on a healthy node. got {targets:?}"
-        );
-        assert!(!targets.contains(&fine), "got {targets:?}");
-    }
-
-    // ...without becoming a blunt instrument: a delivery to one block says nothing about a
-    // sibling block that genuinely has no instance, which is the distinction the granularity
-    // exists for.
-    #[test]
-    fn a_delivery_to_one_block_does_not_clear_a_sibling_block() {
-        let served = format!("list:{LATCH_LK}:block:4");
-        let unprovisioned = format!("list:{LATCH_LK}:block:5");
-
-        mark_router_unrouted_target(&unprovisioned);
-        clear_delivered_target(&served);
-
-        let targets = router_unrouted_targets();
-        assert!(
-            targets.contains(&unprovisioned),
-            "block 5 has no instance and must stay surfaced; got {targets:?}"
-        );
-        clear_router_unrouted_target(&unprovisioned);
-    }
-
-    // A chain target carries no `:block:` segment, so the coarse-clear must not fire on a
-    // prefix that merely looks similar.
-    #[test]
-    fn a_tree_target_clears_only_itself() {
-        mark_router_unrouted_target("tree:4242");
-        clear_delivered_target("tree:4242");
-        assert!(!router_unrouted_targets().contains(&"tree:4242".to_owned()));
+        assert_eq!(named(0, &[]), format!("list:{hex}"));
     }
 }
 

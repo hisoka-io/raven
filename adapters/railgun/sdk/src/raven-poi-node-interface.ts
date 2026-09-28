@@ -9,7 +9,6 @@ import {
   bytesToHex,
   containsByteSequence,
   hexToBytes,
-  pathIndicesForPerListLeaf,
   validateBcHex,
   validateListKeyHex,
   TREE_DEPTH,
@@ -1848,7 +1847,6 @@ export {
   containsByteSequence,
   hexToBytes,
   bytesToHex,
-  pathIndicesForPerListLeaf,
   TREE_DEPTH,
   PATH_RECORD_BYTES,
 };
@@ -1858,4 +1856,4 @@ export type {
   RavenInspireClientSession,
   ClientPirQueryBundle,
 } from "./client-pir";
-export type { POIStatus, RavenPOIPathWasm } from "./poi-pir";
+export type { POIStatus } from "./poi-pir";

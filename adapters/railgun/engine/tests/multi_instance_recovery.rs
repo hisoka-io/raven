@@ -144,8 +144,9 @@ async fn until_applied(
             let store = h.logical_store.lock();
             let held = match h.config.data_source {
                 DataSourceFilter::ChainTreeNumber(t) => store.imt_leaf_count_for(t),
-                DataSourceFilter::PpoiList(lk) => store.ppoi_list_leaves_iter(&lk).count(),
-                DataSourceFilter::PpoiListBlock { .. } => 0,
+                DataSourceFilter::PpoiListBlock { list_key, .. } => {
+                    store.ppoi_list_leaves_iter(&list_key).count()
+                }
             };
             held < expected(&h.config.data_source)
         });
@@ -225,7 +226,7 @@ async fn multi_instance_bootstrap_routes_events_per_instance() {
 
     until_applied(&mh.instances, |source| match source {
         DataSourceFilter::ChainTreeNumber(2) => 1,
-        DataSourceFilter::PpoiList(lk) if *lk == lk_a => 1,
+        DataSourceFilter::PpoiListBlock { list_key, .. } if *list_key == lk_a => 1,
         _ => 0,
     })
     .await;
@@ -359,11 +360,7 @@ async fn multi_instance_recovery_byte_identity() {
         }
     }
 
-    until_applied(&mh1.instances, |source| match source {
-        DataSourceFilter::ChainTreeNumber(_) | DataSourceFilter::PpoiList(_) => 3,
-        DataSourceFilter::PpoiListBlock { .. } => 0,
-    })
-    .await;
+    until_applied(&mh1.instances, |_| 3).await;
 
     let mut chain_roots_pre: Vec<(u32, Option<[u8; 32]>)> = Vec::new();
     let mut chain_counts_pre: Vec<(u32, usize)> = Vec::new();

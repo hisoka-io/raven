@@ -49,7 +49,6 @@ function stubWasm(): RavenInspireWasm {
     },
     build_instance_params_blob: () => new Uint8Array(0),
     register_client_session: makeRegisterSpy(),
-    path_indices_for_per_list_leaf: () => new Uint32Array(16),
   };
 }
 

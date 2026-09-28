@@ -82,7 +82,7 @@ describe("hexToBytes validation", () => {
 
 describe("path record constants", () => {
   it("PATH_RECORD_BYTES pins the per-leaf path record to 16 levels x 32 B = 512", () => {
-    // Wire-relevant: PerLeafPath/PerListPath PIR cells are exactly this many bytes
+    // Wire-relevant: PerLeafPath PIR cells are exactly this many bytes
     // (engine pir_table PATH_RECORD_BYTES); a drift silently misaligns every path row.
     expect(PATH_RECORD_BYTES).toBe(512);
     expect(PATH_RECORD_BYTES).toBe(TREE_DEPTH * 32);

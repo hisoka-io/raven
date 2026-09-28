@@ -28,7 +28,6 @@ describe("init_panic_hook regression-guard", () => {
       build_seeded_query: () => new Uint8Array(0),
       extract_response: () => new Uint8Array(0),
       build_instance_params_blob: () => new Uint8Array(0),
-      path_indices_for_per_list_leaf: () => new Uint32Array(16),
     };
     expect(installPanicHook(stub)).toBe(false);
   });

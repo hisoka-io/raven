@@ -1190,8 +1190,10 @@ jobs:
       - name: pnpm test
         run: pnpm test
         working-directory: adapters/railgun/sdk
-      # The suite passing is not the same as the suite being able to fail. Six gates,
-      # each shipped with its own red-proof:
+      # The suite passing is not the same as the suite being able to fail. Six gates. Test
+      # count, pack and engine singleton each run a red-proof step, and the suite red-proof
+      # is one itself. Export coverage and constant parity have no red-proof: each guards
+      # only against its own vacuity, failing when an extraction comes back empty.
       #   - export coverage: a public export with zero test references is caught here,
       #     not discovered months later (sha256Hex and PATH_RECORD_BYTES were dark when
       #     it landed).

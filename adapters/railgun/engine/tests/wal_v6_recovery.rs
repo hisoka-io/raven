@@ -340,3 +340,78 @@ fn a_v8_snapshot_keeps_every_occurrence_of_a_recurring_commitment() {
         "both occurrences must come back from the snapshot"
     );
 }
+
+/// The WAL payload layout before the PPOI status row was retired, declared as it was: bincode is
+/// positional, so this derive writes the bytes that build wrote.
+#[derive(serde::Serialize)]
+#[allow(dead_code)]
+enum RetiredStatusLayoutPayload {
+    AppendLeaf {
+        tree_number: u32,
+        leaf_index: u32,
+        commitment: [u8; 32],
+    },
+    PpoiStatus {
+        list_key: [u8; 32],
+        blinded_commitment: [u8; 32],
+        status: u8,
+    },
+    PpoiListLeafAdded {
+        list_key: [u8; 32],
+        list_index: u32,
+        blinded_commitment: [u8; 32],
+        status: u8,
+        event_type: raven_railgun_persistence::PpoiEventType,
+        signature: Vec<u8>,
+        validated_merkleroot: [u8; 32],
+    },
+    Reorg {
+        height: u64,
+    },
+    Heartbeat {
+        wallclock_unix_ms: u64,
+    },
+}
+
+/// Truncating a WAL of the retired layout drops its list rows, so the refusal must say which
+/// layout it met and send the operator to a re-bootstrap instead.
+#[test]
+fn a_wal_only_data_dir_of_the_retired_status_layout_is_refused_toward_a_rebootstrap() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let open = || {
+        InspirePersistence::open(
+            StoreLayout::open(dir.path()).expect("layout"),
+            SCHEME_TAG,
+            InstanceId::new("retired-status-layout"),
+            SnapshotPolicy::default(),
+            encoder_arc(),
+        )
+    };
+    drop(open().expect("fresh open"));
+    {
+        let wal = Wal::open(&StoreLayout::open(dir.path()).expect("layout"), None).expect("wal");
+        wal.append(
+            &RetiredStatusLayoutPayload::PpoiListLeafAdded {
+                list_key: [0xDD; 32],
+                list_index: 0,
+                blinded_commitment: canonical(9),
+                status: 2,
+                event_type: raven_railgun_persistence::PpoiEventType::Shield,
+                signature: vec![0xAB; 64],
+                validated_merkleroot: [0xAC; 32],
+            },
+            100,
+        )
+        .expect("append a retired-layout list leaf");
+    }
+
+    let Err(error) = open() else {
+        panic!("a retired-layout WAL must not open");
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("PPOI status") && message.contains("re-bootstrap"),
+        "{message}"
+    );
+    assert!(!message.contains("truncate"), "{message}");
+}

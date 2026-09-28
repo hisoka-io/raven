@@ -254,7 +254,9 @@ fn declared_list(opts: &MultiServeOptions) -> [u8; 32] {
                 keys.insert(list_key);
                 blocks += 1;
             }
-            other => panic!("the shipped config declares a non-block instance: {other:?}"),
+            other @ DataSourceFilter::ChainTreeNumber(_) => {
+                panic!("the shipped config declares a non-block instance: {other:?}")
+            }
         }
     }
     assert_eq!(

@@ -6,9 +6,9 @@
 # which is how four green jobs broke in one push. This runs all of them in one command.
 #
 # It deliberately does NOT run the Rust test suites: those take tens of minutes and are sharded
-# in CI. Use --with-tests for the fast per-workspace ones. The SDK suite is the exception and
-# runs by default -- it is seconds, and it is the one suite no cargo command can reach.
-# Lint, hygiene and cross-language contracts are what narrow checking misses.
+# in CI. Use --with-tests for the fast per-workspace ones. The SDK gates are the exception and
+# run by default, since no cargo command can reach them. Their suite takes seconds; the engine
+# singleton gate installs from the npm registry, measured 305 s, and is skipped offline.
 #
 #   scripts/preflight.sh              fmt + clippy + hygiene + the SDK gates
 #   scripts/preflight.sh --msrv       also both MSRV toolchains (slow, needs 1.89 and 1.91)
@@ -40,8 +40,10 @@ run() { # run <label> <cmd...>
   local out; out=$("$@" 2>&1); local rc=$?
   if [ $rc -eq 0 ]; then echo "ok"; else
     echo "FAIL (rc=$rc)"; fail=1; FAILED+=("$label")
-    printf '%s\n' "$out" | grep -E '^(error|warning: unused)' | head -4 | sed 's/^/        /'
-    printf '%s\n' "$out" | grep -E '^\s+--> ' | head -4 | sed 's/^/        /'
+    # Compiler diagnostics and a gate's own FAIL line; any other failure shows its last lines.
+    local why; why=$(printf '%s\n' "$out" | grep -E '^(error|warning: unused)|FAIL|^\s+--> ' | head -8)
+    [ -n "$why" ] || why=$(printf '%s\n' "$out" | tail -8)
+    printf '%s\n' "$why" | sed 's/^/        /'
   fi
 }
 

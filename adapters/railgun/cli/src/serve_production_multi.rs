@@ -2537,11 +2537,7 @@ async fn run_mirror_feed(
     let holdings = feed.holdings;
     let span = move |cursor| {
         feed_span(&holdings, cursor, |at| {
-            first_unheld_index(
-                routes.load().iter().map(|(filter, _)| *filter),
-                &list_key,
-                at,
-            )
+            first_unheld_index(routes.iter().map(|(filter, _)| *filter), &list_key, at)
         })
     };
     match mirror
@@ -4281,10 +4277,13 @@ data_source = {{ kind = "mirror", list_key = "0000000000000000000000000000000000
         let next_block = 7;
         let first_unheld = u64::from(next_block * LEAVES_PER_PPOI_BLOCK);
         // The feed reads only the filters; nothing is routed in this test.
-        let consumer = |filter| (filter, tokio::sync::mpsc::channel(1).0);
-        let routes: raven_railgun_engine::orchestrator::PpoiListRoutes = Arc::new(
-            arc_swap::ArcSwap::from_pointee(filters.iter().copied().map(consumer).collect()),
-        );
+        let routes_for =
+            |filters: &[DataSourceFilter]| -> raven_railgun_engine::orchestrator::PpoiListRoutes {
+                filters
+                    .iter()
+                    .map(|&filter| (filter, tokio::sync::mpsc::channel(1).0))
+                    .collect()
+            };
         let (endpoint, asked) = upstream_holding_every_row().await;
         let mirror = Arc::new(
             UpstreamPpoiMirror::new(MirrorConfig {
@@ -4317,7 +4316,7 @@ data_source = {{ kind = "mirror", list_key = "0000000000000000000000000000000000
             run_mirror_feed(
                 Arc::clone(&mirror),
                 feed_from(&filters, first_unheld - 2),
-                Arc::clone(&routes),
+                routes_for(&filters),
                 tx,
                 raven_railgun_ppoi_mirror::FeedStatus::default(),
             ),
@@ -4336,14 +4335,6 @@ data_source = {{ kind = "mirror", list_key = "0000000000000000000000000000000000
             "readiness must name the block the feed is waiting on"
         );
 
-        routes.rcu(|current| {
-            let mut next = (**current).clone();
-            next.push(consumer(DataSourceFilter::PpoiListBlock {
-                list_key,
-                block: next_block,
-            }));
-            next
-        });
         let mut declared = filters.clone();
         declared.push(DataSourceFilter::PpoiListBlock {
             list_key,
@@ -4353,7 +4344,7 @@ data_source = {{ kind = "mirror", list_key = "0000000000000000000000000000000000
         let resumed = tokio::spawn(run_mirror_feed(
             mirror,
             feed_from(&declared, first_unheld),
-            routes,
+            routes_for(&declared),
             tx,
             raven_railgun_ppoi_mirror::FeedStatus::default(),
         ));
@@ -4416,12 +4407,10 @@ data_source = {{ kind = "mirror", list_key = "0000000000000000000000000000000000
                 })
                 .expect("mirror"),
             );
-            let routes: raven_railgun_engine::orchestrator::PpoiListRoutes =
-                Arc::new(arc_swap::ArcSwap::from_pointee(
-                    held.iter()
-                        .map(|&(filter, _)| (filter, tokio::sync::mpsc::channel(1).0))
-                        .collect(),
-                ));
+            let routes: raven_railgun_engine::orchestrator::PpoiListRoutes = held
+                .iter()
+                .map(|&(filter, _)| (filter, tokio::sync::mpsc::channel(1).0))
+                .collect();
             let feed = mirror_feeds(&held).pop().expect("one list");
             let (tx, mut rx) = tokio::sync::mpsc::channel(64);
             tokio::time::timeout(

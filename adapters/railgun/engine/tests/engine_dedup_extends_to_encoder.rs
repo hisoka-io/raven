@@ -22,7 +22,6 @@ use raven_railgun_engine::persistence::{ConsumerEvent, SnapshotPolicy};
 use raven_railgun_engine::pir_table::EncoderKind;
 use raven_railgun_engine::InstanceRole;
 use raven_railgun_persistence::{PpoiEventType, WalEntryPayload};
-use tokio::sync::mpsc;
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-dedup-encoder-test";
 const TOY_ENTRY_SIZE: usize = 256;
@@ -103,7 +102,8 @@ fn bootstrap_engine_rejects_two_instances_with_identical_data_source_AND_encoder
 /// Two routes bound to one block must both receive its row. Drives the REAL router fan-out
 /// (`bootstrap_railgun_engine_multi`'s mirror channel), not a local restatement of it: the
 /// production comment warns that `.find()` would drop events past the first match, and only the
-/// real path can prove that warning is enforced.
+/// real path can prove that warning is enforced. Dedup keys on the encoder too, so two encoders
+/// may share a block.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_row_reaches_every_route_bound_to_its_block() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -112,23 +112,25 @@ async fn a_row_reaches_every_route_bound_to_its_block() {
         list_key: lk,
         block: 0,
     };
-    let cfgs = vec![cfg(
-        "ppoi-fanout-host",
-        "host",
-        tmp.path(),
-        EncoderKind::PerListPath10 { list_key: lk },
-        block,
-    )];
+    let cfgs = vec![
+        cfg(
+            "ppoi-fanout-path",
+            "path",
+            tmp.path(),
+            EncoderKind::PerListPath10 { list_key: lk },
+            block,
+        ),
+        cfg(
+            "ppoi-fanout-bc",
+            "bc",
+            tmp.path(),
+            EncoderKind::PerLeafBc { tree_number: 0 },
+            block,
+        ),
+    ];
     let params = InspireParams::secure_128_d2048();
     let mut handle =
         bootstrap_railgun_engine_multi(cfgs, params, build_toy_state).expect("bootstrap");
-
-    let (tx_first, mut rx_first) = mpsc::channel::<ConsumerEvent>(8);
-    let (tx_second, mut rx_second) = mpsc::channel::<ConsumerEvent>(8);
-    handle.ppoi_list_routes.store(std::sync::Arc::new(vec![
-        (block, tx_first),
-        (block, tx_second),
-    ]));
 
     let mut bc = [0u8; 32];
     bc[31] = 7;
@@ -144,26 +146,20 @@ async fn a_row_reaches_every_route_bound_to_its_block() {
     handle
         .channels
         .mirror_tx
-        .send((payload.clone(), 100))
+        .send((payload, 100))
         .await
         .expect("router mirror inbound open");
 
-    let got_first = tokio::time::timeout(Duration::from_secs(2), rx_first.recv())
-        .await
-        .expect("first consumer timed out")
-        .expect("first channel closed");
-    let got_second = tokio::time::timeout(Duration::from_secs(2), rx_second.recv())
-        .await
-        .expect("second route bound to the same block never received the row")
-        .expect("second channel closed");
-    match (got_first, got_second) {
-        (ConsumerEvent::Ppoi(p1, h1), ConsumerEvent::Ppoi(p2, h2)) => {
-            assert_eq!(p1, payload);
-            assert_eq!(p2, payload);
-            assert_eq!(h1, 100);
-            assert_eq!(h2, 100);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    for h in &handle.instances {
+        while h.logical_store.lock().ppoi_bc_at(&lk, 0) != Some(bc) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{} never received the row its block routes to it",
+                h.config.instance_id
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        other => panic!("expected Ppoi events on both consumers, got {other:?}"),
     }
 
     drop(handle.channels);

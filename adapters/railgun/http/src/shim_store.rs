@@ -969,8 +969,6 @@ mod tests {
         );
     }
 
-    /// A whole-list store holds one IMT of a list that outgrew one, so it proves no index past
-    /// the first block: it neither covers a list alone nor rescues a failed block proof.
     #[test]
     fn an_undeclared_list_is_refused() {
         let registry =

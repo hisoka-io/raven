@@ -6,8 +6,7 @@
 //! the same node map, so a tree that is wrong the same way everywhere passes them.
 //! The oracle here is a naive level-by-level rebuild from the raw leaf commitments,
 //! sharing only the `merkle_node` primitive with production code; the pinned root
-//! vector below covers that primitive drifting too. Mirror of
-//! `per_list_path_independent_root_oracle.rs` for the chain-tree side.
+//! vector below covers that primitive drifting too.
 
 #![allow(
     clippy::expect_used,

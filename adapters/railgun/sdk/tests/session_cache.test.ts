@@ -60,7 +60,6 @@ function makeSpyWasm(): SpyWasm {
     },
     build_seeded_query: () => new Uint8Array(),
     extract_response: () => new Uint8Array(),
-    path_indices_for_per_list_leaf: () => new Uint32Array(16),
   };
   return spy as SpyWasm;
 }

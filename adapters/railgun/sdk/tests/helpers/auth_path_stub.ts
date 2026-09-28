@@ -1,4 +1,4 @@
-/** Auth-path test rig: a path-indices wasm stub and a batch encoder whose nodes carry their serving epoch. */
+/** Auth-path test rig: a wasm stub and a batch encoder whose nodes carry their serving epoch. */
 
 import { TREE_DEPTH, type ClientPirContext, type RavenInspireWasm } from "../../src/index";
 import { makeRegisterSpy, stubRemoteSessionExports } from "./register_spy";
@@ -13,21 +13,6 @@ import { shardConfigBincode } from "./shard_config";
 export const TOKEN = "test-token-padded-long-enough-1234";
 export const NODE_BYTES = 32;
 
-function flatIndex(level: number, idxAtLevel: number): number {
-  const total = 1 << (TREE_DEPTH + 1);
-  return total - (1 << (TREE_DEPTH + 1 - level)) + idxAtLevel;
-}
-
-function siblingPath(leafIdx: number): Uint32Array {
-  const out = new Uint32Array(TREE_DEPTH);
-  let walk = leafIdx;
-  for (let i = 0; i < TREE_DEPTH; i += 1) {
-    out[i] = flatIndex(i, walk ^ 1);
-    walk = walk >>> 1;
-  }
-  return out;
-}
-
 export function stubWasm(queryBytes?: Uint8Array): RavenInspireWasm {
   return {
     ...stubRemoteSessionExports(),
@@ -37,12 +22,6 @@ export function stubWasm(queryBytes?: Uint8Array): RavenInspireWasm {
     extract_response: (_session, _crs, _state, response, _entry) => new Uint8Array(response),
     build_instance_params_blob: () => new Uint8Array(0),
     register_client_session: makeRegisterSpy(),
-    path_indices_for_per_list_leaf: (listKey: Uint8Array, idx: number): Uint32Array => {
-      if (listKey.length !== 32) {
-        throw new Error("path_indices_for_per_list_leaf: list_key length must be 32");
-      }
-      return siblingPath(idx);
-    },
   };
 }
 

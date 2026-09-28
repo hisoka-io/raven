@@ -48,9 +48,9 @@ pub enum WalEntryPayload {
         list_index: u32,
         /// 32-byte blinded commitment.
         blinded_commitment: [u8; 32],
-        /// The mirror's handoff only. Not written to the WAL and read by nothing in this crate
-        /// or the engine: a filled row's status is derived from the row's presence. A replayed
-        /// entry carries 0.
+        /// The mirror's handoff only, and not written to the WAL. A replayed entry carries 0,
+        /// which means nothing: it must never be read as a verdict. A filled row's status is
+        /// derived from the row's presence.
         #[serde(skip)]
         status: u8,
         /// Upstream event kind.
