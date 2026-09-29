@@ -8,6 +8,7 @@ use wasm_bindgen::prelude::*;
 pub use raven_client::*;
 
 // The published wasm must refuse a served parameter set below the floors.
+#[allow(clippy::assertions_on_constants)]
 const _: () = assert!(
     raven_client::PARAMETER_FLOORS_ENFORCED,
     "raven-client was built with unfloored-test-params"

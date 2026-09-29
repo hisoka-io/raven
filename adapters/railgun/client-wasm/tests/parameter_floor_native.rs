@@ -33,7 +33,8 @@ fn session_at(params: &InspireParams) -> (ClientSession, ShardConfig) {
 
 #[test]
 fn this_build_enforces_the_floors() {
-    assert!(PARAMETER_FLOORS_ENFORCED);
+    let enforced = PARAMETER_FLOORS_ENFORCED;
+    assert!(enforced);
 }
 
 #[test]
@@ -65,9 +66,7 @@ fn a_cached_session_under_sub_floor_params_is_refused_before_it_is_read() {
     let params_bin = bincode::serialize(&below_floor()).expect("params");
     let bundle =
         bincode::serialize(&(params_bin, Vec::<u8>::new(), Vec::<u8>::new())).expect("bundle");
-    let refusal = deserialize_client_session_rust(&bundle, &[], &[])
-        .err()
-        .expect("refused");
+    let refusal = deserialize_client_session_rust(&bundle, &[], &[]).expect_err("refused");
     assert!(
         refusal.contains(&format!(
             "parameter floor refused inspire_params: {RING_REFUSAL}"

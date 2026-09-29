@@ -49,6 +49,8 @@ cd "${CRATE_DIR}"
 # Panic locations embed source paths; a published binary must not carry the build machine's.
 SYSROOT="$(rustc --print sysroot)"
 CARGO_HOME_DIR="${CARGO_HOME:-${HOME}/.cargo}"
+# The remap changes every artifact, so it builds in its own target dir, apart from unremapped builds.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${CRATE_DIR}/target}/remapped"
 export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }--remap-path-prefix=${REPO_ROOT}=raven --remap-path-prefix=${CARGO_HOME_DIR}=cargo --remap-path-prefix=${SYSROOT}=rust"
 
 echo "==> wasm-pack build --target nodejs ${PROFILE_FLAG}"
