@@ -14,7 +14,7 @@ request is the recorded upstream body, byte for byte, apart from the fields list
 | File | Used for |
 |---|---|
 | `events.bin` | The rows. 64-byte header (`RVNPPOI1`, version 1, row size 133, count, first index 0, list key), then per row: `u32` LE index, `u8` type (0 Shield, 1 Transact, 2 Unshield, 3 LegacyTransact), 32-byte `blindedCommitment`, 32-byte `validatedMerkleroot`, 64-byte signature. Hashes are the big-endian bytes of the wire hex. |
-| `noncanonical.jsonl` | Rows whose wire strings differ from the canonical rebuild (`"0x"` + lowercase hex for the commitment, bare lowercase hex for root and signature). Their strings are served verbatim. Each must decode to its row's bytes or the folder is refused. |
+| `noncanonical.jsonl` | Rows whose wire strings differ from the canonical rebuild (`"0x"` + lowercase hex for the commitment, bare lowercase hex for root and signature). Their strings are served verbatim. Each must decode to its row's bytes or the folder is refused; a commitment may drop its leading zero digits, as upstream serves some Sepolia rows. |
 | `manifest.json` | `chain` (`chainType`, `chainID`, `network`, `txidVersion`); `n` and `list_key` must agree with `events.bin`. |
 | `node-status-end.json` | A recorded `ppoi_node_status` response, served with this list's status following the served prefix. |
 

@@ -1,0 +1,69 @@
+# Example PPOI-only Sepolia config for
+# `raven-railgun serve-production --config <this file>`.
+#
+# Two PPOI path blocks of 65,536 rows each on the Sepolia OFAC list, fed by the upstream mirror.
+# Upstream serves that list under the same list key as mainnet's; `chain_id` is what selects
+# Sepolia. The [global] settings are `mainnet-ppoi.toml`'s with only `chain_id` changed, so the
+# notes there on the chain settings, the list signature and the list routes hold here too.
+#
+# Block 0 holds list rows 0 to 65,535 and block 1 rows 65,536 to 131,071. The list held 10,627
+# rows on 2026-09-29, all in block 0; block 1 is declared ahead of it and served as empty until
+# the list reaches it. Past the last declared block the list routes refuse and the mirror stops
+# until the next block is declared.
+#
+# Upstream serves some Sepolia commitments without their leading zero digits, signed that way;
+# the node reads each as the 32-byte number it spells.
+#
+# In the image, data lives under the /srv/raven/data volume, which the image's raven user
+# (uid 1500) owns. Copy this file to the secrets volume as sepolia.toml, owned by uid 1500 with
+# mode 600, replace the token, and run the image with
+# `serve-production --config /srv/raven/secrets/sepolia.toml`: its default command reads
+# mainnet.toml.
+
+[global]
+bind = "0.0.0.0:8080"
+# Bearer token, from EXACTLY ONE of: `token` (inline), `token_file`, or the
+# RAVEN_BEARER_TOKEN environment variable. Two sources is a boot error; zero is one
+# unless /metrics is public (`metrics_public` or --metrics-public).
+# The literal "REPLACE_ME" is rejected from every source. A `token_file` and, when
+# `token` is inline, this config itself must be mode 600.
+#   token_file = "/srv/raven/secrets/bearer-token"
+token = "REPLACE_ME"
+# The chain whose PPOI lists the mirror asks upstream for.
+chain_id = 11155111
+mirror_endpoint = "https://ppoi.fdi.network"
+# Least seconds between the starts of two requests to upstream, 1 when absent. One request is in
+# flight at a time, each names raven-railgun and its version in its User-Agent, and failures in
+# a row lengthen the wait before the next. A full page is followed as soon as this allows, so it
+# also paces a cold sync: at 1 s the 10,627-row list takes 22 pages and at least 21 seconds.
+# Once caught up, every page waits the 30 s poll interval. Set 0 only for a local replay.
+#   mirror_backfill_interval_secs = 1
+max_concurrent_queries = 4
+respond_timeout_secs = 30
+record_size = 512
+entries_per_shard = 2048
+scheme_tag = "raven-inspire-twopacking-inspiring-wp3-cache-session"
+use_flock = true
+channel_capacity = 1024
+
+# Key per-IP rate limiting off X-Forwarded-For / cf-connecting-ip only for peers in
+# `trusted_proxy_cidrs`; every other peer keys on its socket address.
+#   trust_proxy_header = true
+#   trusted_proxy_cidrs = ["127.0.0.1/32", "172.16.0.0/12"]
+trust_proxy_header = false
+
+[[instance]]
+id = "ppoi-paths-ofac-0"
+role = "live"
+encoder = "per-list-path10"
+list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
+data_dir = "/srv/raven/data/sepolia/ppoi-paths-ofac-0"
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 0 }
+
+[[instance]]
+id = "ppoi-paths-ofac-1"
+role = "live"
+encoder = "per-list-path10"
+list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88"
+data_dir = "/srv/raven/data/sepolia/ppoi-paths-ofac-1"
+data_source = { kind = "mirror", list_key = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88", block = 1 }

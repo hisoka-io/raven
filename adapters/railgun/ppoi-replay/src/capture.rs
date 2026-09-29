@@ -225,7 +225,7 @@ fn check_override(row: &EventRow, wire: &WireOverride) -> Result<()> {
             row.index
         )))
     };
-    if decode_hex::<32>(&wire.blinded_commitment) != Some(row.blinded_commitment) {
+    if decode_commitment(&wire.blinded_commitment) != Some(row.blinded_commitment) {
         return refuse("blindedCommitment");
     }
     if decode_hex::<32>(&wire.validated_merkleroot) != Some(row.validated_merkleroot) {
@@ -238,6 +238,17 @@ fn check_override(row: &EventRow, wire: &WireOverride) -> Result<()> {
         return refuse("type");
     }
     Ok(())
+}
+
+/// A served `blindedCommitment`: 1 to 64 hex digits, optionally after `0x`, as the 32-byte
+/// big-endian number they spell. Some Sepolia rows are served with their leading zero digits
+/// dropped; upstream's tree inserts the number.
+fn decode_commitment(text: &str) -> Option<[u8; 32]> {
+    let digits = text.strip_prefix("0x").unwrap_or(text).as_bytes();
+    let pad = 64usize.checked_sub(digits.len()).filter(|pad| *pad < 64)?;
+    let mut padded = [b'0'; 64];
+    padded.get_mut(pad..)?.copy_from_slice(digits);
+    decode_hex(std::str::from_utf8(&padded).ok()?)
 }
 
 fn check_manifest(bytes: &[u8], list_key: &[u8; 32], rows: usize) -> Result<ChainScope> {
@@ -530,6 +541,40 @@ mod tests {
             .expect_err("a signed digit pair is not hex")
             .to_string();
         assert!(error.contains("index 2: blindedCommitment"), "{error}");
+    }
+
+    /// Upstream served some Sepolia commitments with their leading zero digits dropped: 62 or 63
+    /// digits that still spell the row's number. Past 64 digits, or with no digit, it is refused.
+    #[test]
+    fn an_override_may_drop_the_commitments_leading_zero_digits() {
+        let mut rows: Vec<EventRow> = (0..2).map(row).collect();
+        rows[1].blinded_commitment[0] = 0;
+        rows[1].blinded_commitment[1] = 0x0c;
+        let full = hex(&rows[1].blinded_commitment);
+        let with = |commitment: String| {
+            let mut overrides = BTreeMap::new();
+            overrides.insert(
+                1,
+                WireOverride {
+                    blinded_commitment: commitment,
+                    signature: hex(&rows[1].signature),
+                    event_type: rows[1].event_type.wire_name().to_owned(),
+                    validated_merkleroot: hex(&rows[1].validated_merkleroot),
+                },
+            );
+            Capture::new([0; 32], rows.clone(), overrides)
+        };
+        for stripped in [format!("0x{}", &full[3..]), full[2..].to_owned()] {
+            with(stripped).expect("the same number without its leading zero digits");
+        }
+        for refused in [
+            format!("0x0{full}"),
+            "0x".to_owned(),
+            format!("0x{}", &full[4..]),
+        ] {
+            let error = with(refused).expect_err("not the row's number").to_string();
+            assert!(error.contains("index 1: blindedCommitment"), "{error}");
+        }
     }
 
     #[test]

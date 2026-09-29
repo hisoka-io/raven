@@ -25,6 +25,13 @@
 //! event's index. So a row this mirror delivers carries no status: it says its commitment sits in
 //! the list at its index, and that is the whole of what the data says. A commitment upstream
 //! would call `ShieldBlocked` was never given a list index, so no row here can express it.
+//!
+//! # Load on upstream
+//!
+//! One request to upstream is in flight at a time, whatever the number of feeds, and two start
+//! no less than [`DEFAULT_REQUEST_SPACING`] apart unless the caller lowers that for a local
+//! replay. Each carries [`USER_AGENT`]. Failures in a row lengthen the wait before the next
+//! request, up to [`MirrorConfig::failure_backoff_cap`], and an answer resets it.
 
 #![allow(missing_docs, clippy::items_after_statements)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
@@ -122,6 +129,19 @@ pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 30;
 /// Default bound on one upstream request, connect to last body byte.
 pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Least time between the starts of two upstream requests, unless the caller lowers it.
+pub const DEFAULT_REQUEST_SPACING: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Default longest wait after failures in a row.
+pub const DEFAULT_FAILURE_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// `User-Agent` on every upstream request: the operator of an endpoint can tell who is asking.
+pub const USER_AGENT: &str = concat!(
+    "raven-railgun/",
+    env!("CARGO_PKG_VERSION"),
+    " (ppoi-mirror; +https://github.com/hisoka-io/raven)"
+);
+
 /// Default upstream PPOI endpoint.
 pub const DEFAULT_PPOI_ENDPOINT: &str = "https://ppoi.fdi.network";
 
@@ -154,6 +174,8 @@ pub struct MirrorConfig {
     pub txid_version: String,
     /// Bound on one feed request, connect to last body byte.
     pub request_timeout: std::time::Duration,
+    /// Longest wait after failures in a row; below the poll interval, the poll interval.
+    pub failure_backoff_cap: std::time::Duration,
 }
 
 impl Default for MirrorConfig {
@@ -166,6 +188,7 @@ impl Default for MirrorConfig {
             max_rows_per_fetch: 501,
             txid_version: DEFAULT_TXID_VERSION.to_owned(),
             request_timeout: REQUEST_TIMEOUT,
+            failure_backoff_cap: DEFAULT_FAILURE_BACKOFF_CAP,
         }
     }
 }
@@ -272,7 +295,9 @@ impl FeedStatus {
 pub struct UpstreamPpoiMirror {
     config: MirrorConfig,
     client: reqwest::Client,
-    backfill_interval: Option<std::time::Duration>,
+    request_spacing: std::time::Duration,
+    /// When the last request started. Held across each request, so only one is ever in flight.
+    last_request: tokio::sync::Mutex<Option<tokio::time::Instant>>,
 }
 
 impl std::fmt::Debug for UpstreamPpoiMirror {
@@ -281,7 +306,7 @@ impl std::fmt::Debug for UpstreamPpoiMirror {
             .field("endpoint", &self.config.endpoint)
             .field("chain_type", &self.config.chain_type)
             .field("chain_id", &self.config.chain_id)
-            .field("backfill_interval", &self.backfill_interval)
+            .field("request_spacing", &self.request_spacing)
             .finish_non_exhaustive()
     }
 }
@@ -308,24 +333,26 @@ impl UpstreamPpoiMirror {
         }
         let client = reqwest::Client::builder()
             .timeout(config.request_timeout)
+            .user_agent(USER_AGENT)
             .build()
             .map_err(|e| MirrorError::Upstream(format!("reqwest builder: {e}")))?;
         Ok(Self {
             config,
             client,
-            backfill_interval: None,
+            request_spacing: DEFAULT_REQUEST_SPACING,
+            last_request: tokio::sync::Mutex::new(None),
         })
     }
 
-    /// Wait `interval` after a page that came back as long as it asked for, and the poll interval
-    /// after any other. Only a cold sync sees full pages, so a caught-up worker is back at the
-    /// poll cadence one page later. Unset, a full page is followed at once: a cold sync then runs
-    /// as fast as the engine applies, which the feed channel paces, and asks upstream for a page
-    /// per `max_rows_per_fetch` rows applied. While a row the feed delivered stands untaken, every
-    /// page waits the poll.
+    /// Least time between the starts of two requests to upstream, from every feed and preflight
+    /// of this mirror together; [`DEFAULT_REQUEST_SPACING`] unless set. A page that came back as
+    /// long as it asked for is followed as soon as this allows, so it also paces a cold sync;
+    /// any other page waits the poll interval, and so does every page while a row the feed
+    /// delivered stands untaken. Only a caught-up worker sees short pages, so it is back at the
+    /// poll one page after a cold sync ends. Lower it only for a local replay of a capture.
     #[must_use]
     pub fn with_backfill_interval(mut self, interval: std::time::Duration) -> Self {
-        self.backfill_interval = Some(interval);
+        self.request_spacing = interval;
         self
     }
 
@@ -420,8 +447,9 @@ impl UpstreamPpoiMirror {
     ///
     /// [`MirrorError::Unheld`] at an empty span, naming the span's start, which can lie below
     /// the cursor; otherwise only non-recoverable failures. A failed request is counted in
-    /// `status` and retried at the poll interval, and so is a page that leaves out a row or
-    /// carries one whose signature fails, once the rows below that row are delivered.
+    /// `status` and retried after the poll interval, longer while failures run on, and so is a
+    /// page that leaves out a row or carries one whose signature fails, once the rows below
+    /// that row are delivered.
     pub async fn run_feed<F>(
         self: std::sync::Arc<Self>,
         list: ListKey,
@@ -456,13 +484,13 @@ impl UpstreamPpoiMirror {
     {
         use tokio::time::{sleep, Duration, Instant};
         let poll = Duration::from_secs(self.config.poll_interval_secs.max(1));
-        let backfill = self.backfill_interval.unwrap_or(Duration::ZERO);
         let verifier = RowVerifier::for_list(&list);
         status.at(cursor);
         tracing::info!(endpoint = %self.config.endpoint, "ppoi mirror: {TRUST_STATEMENT}");
         let mut pause = Duration::ZERO;
         let mut asked_at = Instant::now();
         let mut untaken = UntakenRow::default();
+        let mut failures = 0u32;
         loop {
             // Measured from the previous request, so the setting bounds the request rate. A closed
             // channel ends the wait, so shutdown is not held for a poll interval.
@@ -506,12 +534,15 @@ impl UpstreamPpoiMirror {
                 match self.fetch_page(&list, cursor, end, None, &verifier).await {
                     Ok(page) => page,
                     Err((class, detail)) => {
+                        failures = failures.saturating_add(1);
+                        pause = failure_wait(poll, failures, self.config.failure_backoff_cap);
                         tracing::warn!(
                             endpoint = %self.config.endpoint,
                             method = POI_EVENTS_METHOD,
                             failure = %class,
                             %detail,
-                            "ppoi mirror: page request failed; asking again at the poll interval"
+                            retry_in = ?pause,
+                            "ppoi mirror: page request failed; asking again after the wait"
                         );
                         status.failed(class);
                         continue;
@@ -524,9 +555,10 @@ impl UpstreamPpoiMirror {
             let full = taken == end - cursor + 1;
             // While a row below the cursor is untaken, every page past it may be refused again,
             // so the feed holds to the poll rather than re-download the rest of the span back
-            // to back each time it comes back for the row.
+            // to back each time it comes back for the row. Otherwise the request spacing alone
+            // paces a full page.
             if full && !untaken.pending() {
-                pause = backfill;
+                pause = Duration::ZERO;
             }
             for ev in events {
                 // Upstream rows have no block, and 0 keeps them out of every reorg unwind
@@ -545,10 +577,14 @@ impl UpstreamPpoiMirror {
             }
             cursor = next;
             let delivered = usize::try_from(taken).unwrap_or(usize::MAX);
-            match refusal {
-                Some(refusal) => status.answered_short_of(cursor, delivered, refusal),
+            if let Some(refusal) = refusal {
+                status.answered_short_of(cursor, delivered, refusal);
+                failures = failures.saturating_add(1);
+                pause = failure_wait(poll, failures, self.config.failure_backoff_cap);
+            } else {
                 // A short answer is the whole of upstream's list: no row past its last exists yet.
-                None => status.answered(cursor, delivered, (!full).then_some(cursor)),
+                status.answered(cursor, delivered, (!full).then_some(cursor));
+                failures = 0;
             }
         }
     }
@@ -596,6 +632,12 @@ impl UpstreamPpoiMirror {
         if let Some(timeout) = timeout {
             post = post.timeout(timeout);
         }
+        // Held until the body is read, so feeds sharing this mirror queue behind each other.
+        let mut last_request = self.last_request.lock().await;
+        if let Some(at) = *last_request {
+            tokio::time::sleep_until(at + self.request_spacing).await;
+        }
+        *last_request = Some(tokio::time::Instant::now());
         let response = post.send().await.map_err(RpcFailure::Send)?;
         let status = response.status();
         if !status.is_success() {
@@ -682,6 +724,18 @@ impl UntakenRow {
     fn pending(&self) -> bool {
         self.standing.is_some() || self.asked_again.is_some()
     }
+}
+
+/// Wait before the next request after `failures` in a row. Two in a row still wait the poll, as a
+/// caught-up feed is held to renewing upstream's row count within three polls; each one past
+/// that doubles the wait, up to `cap`.
+fn failure_wait(
+    poll: std::time::Duration,
+    failures: u32,
+    cap: std::time::Duration,
+) -> std::time::Duration {
+    let doublings = failures.saturating_sub(2).min(16);
+    poll.saturating_mul(1 << doublings).min(cap.max(poll))
 }
 
 /// Why a page stops short of what it holds: the first row missing from it, or the first whose
@@ -776,8 +830,8 @@ impl RowVerifier {
     }
 
     /// Upstream signs `JSON.stringify({index, blindedCommitment, type})` over the wire strings.
-    /// Five mainnet rows serve their commitment without `0x` and are signed that way, so the
-    /// strings are never normalised first.
+    /// Some rows serve their commitment without `0x`, or without its leading zero digits, and
+    /// are signed that way, so the strings are never normalised first.
     fn accepts(
         &self,
         index: u64,
@@ -902,7 +956,7 @@ fn decode_indexed_events(
             )));
         }
         let bc_str = &event.signed_event.blinded_commitment;
-        let bc_bytes = decode_hex(bc_str).ok_or_else(|| {
+        let bc_bytes = decode_commitment(bc_str).ok_or_else(|| {
             MirrorError::Decode(format!("invalid bc hex at index {index}: {bc_str}"))
         })?;
         let list_index = u32::try_from(index).map_err(|_| {
@@ -929,6 +983,17 @@ fn decode_indexed_events(
         events: out,
         forged: None,
     })
+}
+
+/// A served `blindedCommitment`: 1 to 64 hex digits, optionally after `0x`, as the 32-byte
+/// big-endian number they spell. Upstream's tree inserts the number, and some Sepolia rows are
+/// served with their leading zero digits dropped.
+fn decode_commitment(text: &str) -> Option<[u8; 32]> {
+    let digits = text.strip_prefix("0x").unwrap_or(text).as_bytes();
+    let pad = 64usize.checked_sub(digits.len()).filter(|pad| *pad < 64)?;
+    let mut padded = [b'0'; 64];
+    padded.get_mut(pad..)?.copy_from_slice(digits);
+    decode_hex(std::str::from_utf8(&padded).ok()?)
 }
 
 /// Wire JSON shape for a `ppoi_poi_events` result row.
@@ -1015,6 +1080,69 @@ mod tests {
         assert_eq!(
             message,
             br#"{"index":301593,"blindedCommitment":"0141bf","type":"Unshield"}"#
+        );
+    }
+
+    #[test]
+    fn a_commitment_of_1_to_64_hex_digits_is_the_number_it_spells() {
+        let full = "0123456789abcdef".repeat(4);
+        let mut expected = [0u8; 32];
+        for (at, byte) in expected.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&full[2 * at..2 * at + 2], 16).unwrap();
+        }
+        assert_eq!(decode_commitment(&full), Some(expected));
+        assert_eq!(decode_commitment(&format!("0x{full}")), Some(expected));
+        assert_eq!(
+            decode_commitment(&format!("0x{}", &full[1..])),
+            Some(expected)
+        );
+        assert_eq!(decode_commitment("0x1"), Some(one_at_the_end()));
+        assert_eq!(decode_commitment("01"), Some(one_at_the_end()));
+        assert_eq!(decode_commitment("0x0"), Some([0u8; 32]));
+        assert_eq!(
+            decode_commitment("0xABC").map(|b| [b[30], b[31]]),
+            Some([0x0a, 0xbc])
+        );
+    }
+
+    fn one_at_the_end() -> [u8; 32] {
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        one
+    }
+
+    #[test]
+    fn a_commitment_past_64_digits_empty_or_not_hex_is_refused() {
+        let full = "ab".repeat(32);
+        for text in [
+            String::new(),
+            "0x".to_owned(),
+            format!("{full}0"),
+            format!("0x0{full}"),
+            "0x12g4".to_owned(),
+            "0X12".to_owned(),
+            "0x0x12".to_owned(),
+            " 12".to_owned(),
+            "+12".to_owned(),
+            format!("\u{e9}{}", &full[2..]),
+        ] {
+            assert_eq!(decode_commitment(&text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn failures_in_a_row_wait_the_poll_twice_then_double_up_to_the_cap() {
+        let poll = std::time::Duration::from_secs(30);
+        let cap = std::time::Duration::from_secs(300);
+        let waits: Vec<u64> = (1..=8)
+            .map(|failures| failure_wait(poll, failures, cap).as_secs())
+            .collect();
+        assert_eq!(waits, [30, 30, 60, 120, 240, 300, 300, 300]);
+        assert_eq!(failure_wait(poll, u32::MAX, cap), cap);
+        assert_eq!(
+            failure_wait(poll, 5, std::time::Duration::from_secs(1)),
+            poll,
+            "a cap below the poll never shortens the poll"
         );
     }
 
