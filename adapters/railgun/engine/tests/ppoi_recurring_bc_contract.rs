@@ -72,7 +72,7 @@ fn every_occurrence_stays_reachable_from_the_commitment() {
         "both occurrences resolve, ascending"
     );
     assert_eq!(
-        store.ppoi_index_of(&LIST_KEY, &bc(11)),
+        store.ppoi_indices_of(&LIST_KEY, &bc(11)).next(),
         Some(0),
         "the single-index lookup serves the LOWEST occurrence"
     );
@@ -90,7 +90,7 @@ fn every_occurrence_stays_reachable_from_the_commitment() {
 fn an_unindexed_commitment_resolves_to_nothing() {
     let store = store_with_one_bc_at_two_indices();
 
-    assert_eq!(store.ppoi_index_of(&LIST_KEY, &bc(99)), None);
+    assert_eq!(store.ppoi_indices_of(&LIST_KEY, &bc(99)).next(), None);
     assert_eq!(store.ppoi_indices_of(&LIST_KEY, &bc(99)).count(), 0);
 }
 
@@ -118,7 +118,7 @@ fn rolling_back_the_later_occurrence_leaves_the_earlier_indexed() {
         vec![0],
         "the surviving occurrence keeps its lookup; unindexing it reports a list member as Missing"
     );
-    assert_eq!(store.ppoi_index_of(&LIST_KEY, &bc(11)), Some(0));
+    assert_eq!(store.ppoi_indices_of(&LIST_KEY, &bc(11)).next(), Some(0));
 }
 
 #[test]
@@ -134,7 +134,7 @@ fn rolling_back_every_occurrence_unindexes_the_commitment() {
     .expect("reorg unwinds both occurrences");
 
     assert_eq!(store.ppoi_indices_of(&LIST_KEY, &bc(11)).count(), 0);
-    assert_eq!(store.ppoi_index_of(&LIST_KEY, &bc(11)), None);
+    assert_eq!(store.ppoi_indices_of(&LIST_KEY, &bc(11)).next(), None);
 }
 
 /// The client resolves an index, fetches that row and binds the row's leaf back to the

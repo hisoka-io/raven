@@ -54,11 +54,15 @@ fn the_shipped_v8_snapshot_resolves_its_bc_index() {
     assert_eq!(store.leaf(0, 0), Some(&[7u8; 32]));
     assert_eq!(store.ppoi_list_leaves_iter(&FIXTURE_LIST_KEY).count(), 2);
     assert_eq!(
-        store.ppoi_index_of(&FIXTURE_LIST_KEY, &fixture_bc(1)),
+        store
+            .ppoi_indices_of(&FIXTURE_LIST_KEY, &fixture_bc(1))
+            .next(),
         Some(0)
     );
     assert_eq!(
-        store.ppoi_index_of(&FIXTURE_LIST_KEY, &fixture_bc(2)),
+        store
+            .ppoi_indices_of(&FIXTURE_LIST_KEY, &fixture_bc(2))
+            .next(),
         Some(1)
     );
 }

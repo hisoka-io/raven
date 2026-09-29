@@ -2557,17 +2557,24 @@ async fn spawn_mirror_workers(
     opts: &MultiServeOptions,
     handle: &MultiOrchestratorHandle,
 ) -> anyhow::Result<MirrorWorkers> {
-    use raven_railgun_ppoi_mirror::{FeedStatus, MirrorConfig, UpstreamPpoiMirror};
+    use raven_railgun_ppoi_mirror::{
+        ppoi_network_name, FeedStatus, MirrorConfig, UpstreamPpoiMirror,
+    };
 
     let mirror_config = MirrorConfig {
         endpoint: opts.mirror_endpoint.clone(),
         chain_id: opts.chain_id,
         ..MirrorConfig::default()
     };
+    let network = ppoi_network_name(&mirror_config.chain_type, mirror_config.chain_id);
     let mut mirror = UpstreamPpoiMirror::new(mirror_config)
         .map_err(|e| anyhow::anyhow!("ppoi mirror constructor: {e}"))?;
     if let Some(secs) = opts.mirror_backfill_interval_secs {
         mirror = mirror.with_backfill_interval(std::time::Duration::from_secs(secs));
+    }
+    // Readiness reads upstream's count from its node status while pages leave the tip unshown.
+    if let Some(network) = network {
+        mirror = mirror.with_node_status(network);
     }
     let mirror = Arc::new(mirror);
     let mirror_tx = handle.channels.mirror_tx.clone();
@@ -2927,6 +2934,7 @@ pub(crate) fn mirror_feed_view(
         state,
         rows_held,
         upstream_rows: progress.upstream_rows,
+        upstream_rows_seen: progress.upstream_rows_seen,
         next_index: progress.next_index,
         consecutive_failures: progress.consecutive_failures,
         last_failure: untaken
@@ -4481,6 +4489,36 @@ data_source = { kind = "indexer", filter = { tree_number = 0 } }
         assert_eq!(
             view.last_failure, None,
             "a row the instance has since taken is not named"
+        );
+    }
+
+    /// A node paging full pages, with upstream's node status stating 5,000 rows: readiness shows
+    /// how far behind it is, and the state still rests on the page-derived count alone.
+    #[test]
+    fn the_feed_view_shows_how_far_upstream_is_ahead_while_syncing() {
+        use raven_railgun_http::status::MirrorFeedState;
+        use raven_railgun_ppoi_mirror::FeedProgress;
+
+        let list = [3u8; 32];
+        let block_0 = DataSourceFilter::PpoiListBlock {
+            list_key: list,
+            block: 0,
+        };
+        let syncing = FeedProgress {
+            next_index: 1_002,
+            upstream_rows_seen: Some(5_000),
+            last_answer: Some(std::time::Instant::now()),
+            ..FeedProgress::default()
+        };
+        let view = mirror_feed_view(&list, &syncing, &[(block_0, 1_002)]);
+        assert_eq!(
+            (
+                view.state,
+                view.rows_held,
+                view.upstream_rows,
+                view.upstream_rows_seen
+            ),
+            (MirrorFeedState::Syncing, 1_002, None, Some(5_000))
         );
     }
 

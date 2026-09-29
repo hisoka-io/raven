@@ -690,16 +690,6 @@ impl LogicalLeafStore {
             .map(|(_, _, list_index)| *list_index)
     }
 
-    /// Per-list `blinded_commitment -> lowest list_index`.
-    ///
-    /// The LOWEST of several occurrences, not the latest: it is the one a later append cannot
-    /// move and a reorg of the tail cannot take away, and each occurrence proves the same
-    /// membership. Use [`Self::ppoi_indices_of`] when every occurrence matters.
-    #[must_use]
-    pub fn ppoi_index_of(&self, list_key: &[u8; 32], blinded_commitment: &[u8; 32]) -> Option<u32> {
-        self.ppoi_indices_of(list_key, blinded_commitment).next()
-    }
-
     /// Per-list `(list_index -> blinded_commitment)` lookup.
     #[must_use]
     pub fn ppoi_bc_at(&self, list_key: &[u8; 32], list_index: u32) -> Option<[u8; 32]> {

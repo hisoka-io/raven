@@ -165,6 +165,7 @@ fn feed_for(
         state: MirrorFeedState::Syncing,
         rows_held: 0,
         upstream_rows,
+        upstream_rows_seen: upstream_rows,
         next_index: upstream_rows.unwrap_or(0),
         consecutive_failures: 0,
         last_failure: None,

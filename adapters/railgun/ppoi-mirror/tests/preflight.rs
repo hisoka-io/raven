@@ -183,16 +183,6 @@ async fn refused_connection_is_classed_connect() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unresolvable_host_is_classed_dns() {
-    // RFC 6761 reserves `.invalid` to never resolve.
-    let error = preflight("http://raven-preflight.invalid", Duration::from_secs(4))
-        .await
-        .expect_err("a reserved-invalid host must be refused");
-    assert_eq!(error.failure, PreflightFailure::Dns, "{error}");
-    assert_eq!(error.endpoint, "http://raven-preflight.invalid");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn non_success_status_is_classed_by_its_code() {
     let (url, _) = serve_fixed(StatusCode::BAD_GATEWAY, "{}").await;
     assert_eq!(

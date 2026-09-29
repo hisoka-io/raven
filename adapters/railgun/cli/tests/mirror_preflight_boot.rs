@@ -770,6 +770,9 @@ async fn upstream_holding(rows: u64) -> (String, TimedRequests) {
             let seen = Arc::clone(&seen);
             let roots = Arc::clone(&roots);
             async move {
+                if request.pointer("/method") == Some(&json!("ppoi_node_status")) {
+                    return Json(node_status_reply(Some(rows)));
+                }
                 let bound = |name: &str| {
                     request
                         .pointer(&format!("/params/{name}"))
@@ -933,6 +936,7 @@ async fn upstream_holding_rooted_after(rows: u64, delay: Duration) -> (String, R
     upstream_answering(
         move |index| roots.get(usize::try_from(index).ok()?).copied(),
         delay,
+        Some(rows),
     )
     .await
 }
@@ -955,10 +959,11 @@ fn list_roots(rows: u64) -> Vec<[u8; 32]> {
 }
 
 /// Answers each page with row `index`'s leaf and the root `root_at(index)` gives, `delay` after
-/// the request arrives, and nothing for an index it gives none.
+/// the request arrives, and nothing for an index it gives none. Node status states `stated`.
 async fn upstream_answering(
     root_at: impl Fn(u64) -> Option<[u8; 32]> + Send + Sync + 'static,
     delay: Duration,
+    stated: Option<u64>,
 ) -> (String, Requests) {
     upstream_serving(
         move |index| {
@@ -970,14 +975,30 @@ async fn upstream_answering(
             ))
         },
         delay,
+        stated,
     )
     .await
 }
 
-/// Answers each page with the rows `row_at` gives, `delay` after the request arrives.
+/// Upstream's node status for the test list on chain 1, stating `stated` rows; with none, the
+/// error upstream gives for a list it cannot report.
+fn node_status_reply(stated: Option<u64>) -> Value {
+    match stated {
+        Some(rows) => json!({ "jsonrpc": "2.0", "id": 1, "result": { "forNetwork": { "Ethereum": {
+            "listStatuses": { LIST_HEX: { "poiEventLengths": { "Shield": rows } } }
+        } } } }),
+        None => json!({ "jsonrpc": "2.0", "id": 1, "error": {
+            "code": -32603, "message": "Cannot connect to listKey"
+        } }),
+    }
+}
+
+/// Answers each page with the rows `row_at` gives, `delay` after the request arrives, and node
+/// status with `stated`.
 async fn upstream_serving(
     row_at: impl Fn(u64) -> Option<Value> + Send + Sync + 'static,
     delay: Duration,
+    stated: Option<u64>,
 ) -> (String, Requests) {
     let row_at = Arc::new(row_at);
     let requests = Requests::default();
@@ -988,6 +1009,11 @@ async fn upstream_serving(
             let seen = Arc::clone(&seen);
             let row_at = Arc::clone(&row_at);
             async move {
+                if request.pointer("/method") == Some(&json!("ppoi_node_status")) {
+                    seen.lock().push(request);
+                    tokio::time::sleep(delay).await;
+                    return Json(node_status_reply(stated));
+                }
                 let bound = |name: &str| {
                     request
                         .pointer(&format!("/params/{name}"))
@@ -1088,6 +1114,48 @@ fn start_indices(requests: &Requests) -> Vec<u64> {
                 .expect("page start")
         })
         .collect()
+}
+
+/// A cold sync on the shipped chain asks upstream's node status for the list's count once a page
+/// comes back full, so readiness shows how far behind the node is before any page reaches the
+/// tip, while its state still waits for a page that does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cold_sync_shows_the_count_upstream_states_before_a_page_reaches_the_tip() {
+    const ROWS: u64 = 1_010;
+    let data_root = tempfile::tempdir().expect("tempdir");
+    let (endpoint, requests) = upstream_holding_rooted_after(ROWS, Duration::from_secs(1)).await;
+    let (opts, observer) = shipped_ppoi_options_with(
+        data_root.path(),
+        &[PATHS_BLOCK_0],
+        &endpoint,
+        "mirror_backfill_interval_secs = 0",
+    );
+    let mut booting = boot_multi(opts).await;
+    let view = bootstrapped(&observer, &mut booting)
+        .await
+        .expect("boot bootstraps");
+    drop(observer);
+    match boot_verdict(&mut booting).await {
+        Boot::Serving => {}
+        Boot::Refused(refusal) => panic!("an answering upstream was refused: {refusal}"),
+    }
+    let (_, body) = readiness_until(booting.addr, &view, "upstream's stated count", |feed| {
+        feed.upstream_rows_seen == Some(ROWS) && feed.next_index < ROWS
+    })
+    .await;
+    let feed = body.mirror_feeds.first().expect("one list");
+    assert_eq!(
+        (feed.state, feed.upstream_rows),
+        (MirrorFeedState::Syncing, None)
+    );
+    assert!(
+        requests
+            .lock()
+            .iter()
+            .any(|request| request.pointer("/method") == Some(&json!("ppoi_node_status"))),
+        "the count came from a node status request"
+    );
+    shut_down(booting).await;
 }
 
 /// The shipped PPOI instances on one list, fed cold from one upstream: each page of the list is
@@ -1325,6 +1393,7 @@ async fn the_boot_applies_signed_rows_and_refuses_a_forged_or_unsigned_one_by_na
                 })
             },
             Duration::ZERO,
+            None,
         )
         .await;
         let (booting, view) = serving(data_root.path(), &[PATHS_BLOCK_0], &endpoint).await;
@@ -1386,6 +1455,7 @@ async fn a_row_refused_once_is_asked_for_again_and_the_list_completes_without_a_
             ))
         },
         Duration::ZERO,
+        Some(ROWS),
     )
     .await;
     let (booting, view) = serving(data_root.path(), &[PATHS_BLOCK_0], &endpoint).await;
@@ -1457,6 +1527,7 @@ async fn a_node_holding_no_rows_refuses_to_boot_on_an_unsigned_first_row() {
     let (endpoint, _) = upstream_serving(
         move |index| (index == 0).then(|| row_signed_with(0, root, "")),
         Duration::ZERO,
+        None,
     )
     .await;
     let (opts, observer) = shipped_ppoi_options(data_root.path(), &[PATHS_BLOCK_0], &endpoint);
@@ -1612,8 +1683,12 @@ async fn a_feed_stops_at_the_last_declared_row_names_the_next_block_and_feeds_it
     let data_root = tempfile::tempdir().expect("tempdir");
     let tree = leave_rows_committed(data_root.path(), &[PATHS_BLOCK_0], held);
     let roots = roots_past(tree, held, beyond);
-    let (endpoint, requests) =
-        upstream_answering(move |index| roots.get(&index).copied(), Duration::ZERO).await;
+    let (endpoint, requests) = upstream_answering(
+        move |index| roots.get(&index).copied(),
+        Duration::ZERO,
+        None,
+    )
+    .await;
 
     let (booting, view) = serving(data_root.path(), &[PATHS_BLOCK_0], &endpoint).await;
     let (code, body) = until_done_or_stalled("block 0 filled and the feed stopped", async || {

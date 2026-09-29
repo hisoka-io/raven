@@ -623,7 +623,9 @@ async fn ppoi_events_route_to_correct_list_instance() {
                     "block {block} holds its row at its local index 0"
                 );
                 assert_eq!(
-                    store.ppoi_index_of(&lk_ofac, &canonical_commit(other)),
+                    store
+                        .ppoi_indices_of(&lk_ofac, &canonical_commit(other))
+                        .next(),
                     None,
                     "block {block} must NOT see the other block's row"
                 );

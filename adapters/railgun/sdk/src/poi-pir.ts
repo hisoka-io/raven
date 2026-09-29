@@ -52,19 +52,6 @@ export const TREE_DEPTH = 16;
 /** Maximum leaves per tree. */
 export const TREE_MAX_LEAVES = 1 << TREE_DEPTH;
 
-/** Validate that a blinded commitment is exactly 32 bytes of hex. */
-export function validateBcHex(bc: string, label: string = "blindedCommitment"): void {
-  const stripped = bc.startsWith("0x") || bc.startsWith("0X") ? bc.slice(2) : bc;
-  if (stripped.length !== 64) {
-    throw RavenError.invalidQuery(
-      `${label}: expected 64 hex chars (32 bytes), got ${stripped.length}`,
-    );
-  }
-  if (!/^[0-9a-fA-F]+$/.test(stripped)) {
-    throw RavenError.invalidQuery(`${label}: contains non-hex characters`);
-  }
-}
-
 /** The 64 lower-case hex digits of the 32-byte value a blinded commitment spells. Upstream serves
  *  some commitments without their leading zero digits, so 1 to 64 digits are taken, as the node's
  *  mirror takes them. */
@@ -79,6 +66,12 @@ export function canonicalCommitmentHex(bc: string, label: string = "blindedCommi
     throw RavenError.invalidQuery(`${label}: contains non-hex characters`);
   }
   return stripped.toLowerCase().padStart(64, "0");
+}
+
+/** Validate a blinded commitment as every commitment-taking method reads one: 1 to 64 hex
+ *  digits, optionally after `0x`. */
+export function validateBcHex(bc: string, label: string = "blindedCommitment"): void {
+  canonicalCommitmentHex(bc, label);
 }
 
 /** Validate that a list key is exactly 32 bytes of hex. */

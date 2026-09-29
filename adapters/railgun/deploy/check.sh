@@ -13,6 +13,9 @@ It alerts when:
              upstream last answered its feed more than RAVEN_BEHIND_SECS ago (a caught-up feed
              asks every 30 s). This catches a cold sync that runs long, a feed held at a row it
              cannot take, and a feed that stopped asking
+  lag        a list holds more than RAVEN_MAX_LAG_ROWS fewer rows than upstream's latest answers
+             show it has (upstream_rows_seen - rows_held), in any state; the behind clock above
+             still catches a feed that stops answering
   failures   upstream has failed more than RAVEN_MAX_FAILURES requests in a row (30 s apart)
   disk       the data volume has less than RAVEN_MIN_FREE_MB free
   rss        the node process holds more than RAVEN_MAX_RSS_MB resident
@@ -25,7 +28,8 @@ Exits 1 while any alert holds.
 
 Environment (defaults in brackets):
   RAVEN_NAME [raven]  RAVEN_PORT [8080]  RAVEN_ALERT_WEBHOOK []
-  RAVEN_BEHIND_SECS [900]  RAVEN_MAX_FAILURES [5]  RAVEN_MIN_FREE_MB [2048]
+  RAVEN_BEHIND_SECS [900]  RAVEN_MAX_LAG_ROWS [500]  RAVEN_MAX_FAILURES [5]
+  RAVEN_MIN_FREE_MB [2048]
   RAVEN_MAX_RSS_MB [3072] (three quarters of deploy.sh's default 4g cap)
   RAVEN_ALERT_REPEAT_SECS [3600]  RAVEN_ALERT_STATE [a file under /var/lib/raven, or
   ~/.local/state/raven when not root; the behind check keeps its clock beside it]
@@ -37,6 +41,7 @@ name=${RAVEN_NAME:-raven}
 port=${RAVEN_PORT:-8080}
 node=$name-node
 behind_secs=${RAVEN_BEHIND_SECS:-900}
+max_lag=${RAVEN_MAX_LAG_ROWS:-500}
 max_failures=${RAVEN_MAX_FAILURES:-5}
 min_free_mb=${RAVEN_MIN_FREE_MB:-2048}
 max_rss_mb=${RAVEN_MAX_RSS_MB:-3072}
@@ -63,8 +68,9 @@ if [[ -f $behind_state ]]; then
   while read -r k t; do [[ -n $k && $t =~ ^[0-9]+$ ]] && since[$k]=$t; done <"$behind_state"
 fi
 feeds_seen=0
-# One line per list: key state rows_held seconds_since_answer failures last_failure.
-while read -r key feed_state held answered failures last_failure; do
+# One line per list: key state rows_held upstream_rows_seen seconds_since_answer failures
+# last_failure.
+while read -r key feed_state held seen answered failures last_failure; do
   [[ -n $key ]] || continue
   feeds_seen=1
   if [[ $feed_state != caught_up ]]; then
@@ -72,6 +78,9 @@ while read -r key feed_state held answered failures last_failure; do
     if ((now - behind[$key] > behind_secs)); then
       add behind "list $key $feed_state for $((now - behind[$key])) s, holding $held rows"
     fi
+  fi
+  if [[ $seen =~ ^[0-9]+$ ]] && ((seen - held > max_lag)); then
+    add lag "list $key holds $held rows, $((seen - held)) behind the $seen upstream has shown"
   fi
   if [[ $answered =~ ^[0-9]+$ ]] && ((answered > behind_secs)); then
     add behind "list $key: upstream last answered $answered s ago"
@@ -86,8 +95,8 @@ try:
 except ValueError:
     feeds = []
 for f in feeds:
-    print(f["list_key"][:16], f["state"], f["rows_held"], f["seconds_since_answer"],
-          f["consecutive_failures"], f["last_failure"])
+    print(f["list_key"][:16], f["state"], f["rows_held"], f.get("upstream_rows_seen"),
+          f["seconds_since_answer"], f["consecutive_failures"], f["last_failure"])
 ' "$body")
 # A node that did not answer keeps the clock running rather than restarting it.
 if ((feeds_seen)); then

@@ -51,11 +51,11 @@ for _ in $(seq 200); do [[ -s $fake/port ]] && break; sleep 0.1; done
 [[ -s $fake/port ]] || { echo "FAIL the stub server did not start"; exit 1; }
 port=$(cat "$fake/port")
 
-# serve <http code> <state> <rows_held> <seconds_since_answer|null> <failures>
+# serve <http code> <state> <rows_held> <seconds_since_answer|null> <failures> [upstream_rows_seen]
 serve() {
   echo "$1" >"$fake/code"
-  printf '{"mirror_feeds":[{"list_key":"%s","state":"%s","rows_held":%s,"upstream_rows":null,"consecutive_failures":%s,"last_failure":null,"seconds_since_answer":%s}]}' \
-    "$(printf 'ab%.0s' $(seq 32))" "$2" "$3" "$5" "$4" >"$fake/body"
+  printf '{"mirror_feeds":[{"list_key":"%s","state":"%s","rows_held":%s,"upstream_rows":null,"upstream_rows_seen":%s,"consecutive_failures":%s,"last_failure":null,"seconds_since_answer":%s}]}' \
+    "$(printf 'ab%.0s' $(seq 32))" "$2" "$3" "${6:-null}" "$5" "$4" >"$fake/body"
 }
 reset() {
   serve 200 caught_up 363278 3 0
@@ -111,6 +111,16 @@ reset failures
 serve 200 upstream_refusing 363000 20 9
 run
 expect "failures past RAVEN_MAX_FAILURES raise failures" '[[ $out == *"alert failures: "* ]]'
+
+reset lag
+serve 200 syncing 206559 3 0 207559
+run
+expect "a list 1000 rows behind what upstream has shown raises lag" '[[ $out == *"alert lag: list abababababababab holds 206559 rows, 1000 behind the 207559 upstream has shown"* ]]'
+serve 200 upstream_refusing 363000 3 2 363400
+run
+expect "a list within RAVEN_MAX_LAG_ROWS of upstream raises no lag" '[[ $out != *"alert lag"* ]]'
+run RAVEN_MAX_LAG_ROWS=100
+expect "RAVEN_MAX_LAG_ROWS sets the threshold" '[[ $out == *"alert lag: "*"400 behind"* ]]'
 
 reset readiness
 serve 503 never_fed 0 null 0

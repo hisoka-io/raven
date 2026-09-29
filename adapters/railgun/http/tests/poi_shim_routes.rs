@@ -148,6 +148,7 @@ fn build_router_with_store() -> (Router, [u8; 32], Arc<parking_lot::Mutex<Logica
         state: MirrorFeedState::Syncing,
         rows_held: 3,
         upstream_rows: Some(3),
+        upstream_rows_seen: Some(3),
         next_index: 3,
         consecutive_failures: 0,
         last_failure: None,

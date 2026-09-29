@@ -454,6 +454,7 @@ mod tests {
                 state: MirrorFeedState::Syncing,
                 rows_held: rows,
                 upstream_rows: Some(rows),
+                upstream_rows_seen: Some(rows),
                 next_index: rows,
                 consecutive_failures: 0,
                 last_failure: None,

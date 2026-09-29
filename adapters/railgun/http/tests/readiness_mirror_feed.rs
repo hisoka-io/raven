@@ -56,6 +56,7 @@ fn view(list: u8, state: MirrorFeedState) -> MirrorFeedView {
             1_010
         },
         upstream_rows: (state == MirrorFeedState::CaughtUp).then_some(1_010),
+        upstream_rows_seen: Some(1_010),
         next_index: 1_010,
         consecutive_failures: u64::from(refusing),
         last_failure: refusing.then(|| "answered HTTP 500".to_owned()),

@@ -372,6 +372,12 @@ pub struct MirrorFeedView {
     pub rows_held: u64,
     /// Upstream's row count as of its last answer, when that answer was short of a full page.
     pub upstream_rows: Option<u64>,
+    /// Upstream's row count as its latest answers give it, taken or not: exact after a page
+    /// that shows where the list ends, else the larger of one past the last row served and
+    /// the count upstream's node status last stated. `upstream_rows_seen - rows_held` is how
+    /// far the node trails upstream while it syncs, while upstream refuses and while the node
+    /// is still applying. Unsigned by upstream, so no state here rests on it.
+    pub upstream_rows_seen: Option<u64>,
     /// List-wide index the feed asks upstream for next.
     pub next_index: u64,
     /// Requests upstream has failed since it last answered.

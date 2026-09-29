@@ -32,6 +32,7 @@ import { commitmentAt, listHolding, mountPrefixChannel } from "./helpers/prefix_
 import { startMockServer, writeJsonRpcResult, type MockServer } from "./helpers/mock_server";
 import { encodeBatchResponseNodes } from "./helpers/auth_path_stub";
 import { foldMerkleRoot } from "../src/poseidon";
+import { canonicalCommitmentHex } from "../src/poi-pir";
 import { shardConfigBincode } from "./helpers/shard_config";
 
 const TOKEN = "test-token-padded-long-enough-1234";
@@ -352,17 +353,31 @@ describe("multi-chain routing", () => {
 });
 
 describe("input validation hardening", () => {
-  it("validateBcHex rejects malformed hex (wrong length)", () => {
-    expectThrowsRavenError(() => validateBcHex("ab"), "InvalidQuery");
-    expectThrowsRavenError(() => validateBcHex("a".repeat(63)), "InvalidQuery");
+  it("validateBcHex rejects no digits and more than 64", () => {
+    expectThrowsRavenError(() => validateBcHex(""), "InvalidQuery");
+    expectThrowsRavenError(() => validateBcHex("0x"), "InvalidQuery");
+    expectThrowsRavenError(() => validateBcHex("a".repeat(65)), "InvalidQuery");
   });
 
   it("validateBcHex rejects non-hex characters", () => {
     expectThrowsRavenError(() => validateBcHex("z".repeat(64)), "InvalidQuery");
   });
 
-  it("validateBcHex accepts 0x-prefixed 64-char hex", () => {
-    expect(() => validateBcHex(`0x${"a".repeat(64)}`)).not.toThrow();
+  it("validateBcHex takes exactly what the commitment-taking methods take", () => {
+    const takes = (read: () => unknown): boolean => {
+      try {
+        read();
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    for (const bc of ["ab", "0x1", "a".repeat(63), `0x${"a".repeat(64)}`]) {
+      expect(takes(() => validateBcHex(bc)), bc).toBe(true);
+    }
+    for (const bc of ["", "0x", "a".repeat(65), "z".repeat(64), "0xg1"]) {
+      expect(takes(() => validateBcHex(bc)), bc).toBe(takes(() => canonicalCommitmentHex(bc)));
+    }
   });
 
   it("validateListKeyHex rejects wrong length", () => {

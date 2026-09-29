@@ -110,8 +110,8 @@ fn ppoi_list_leaf_added_advances_per_list_imt() {
     assert_ne!(r1, r2);
     assert_eq!(store.ppoi_bc_at(&LIST_KEY, 0), Some(bc));
     assert_eq!(store.ppoi_bc_at(&LIST_KEY, 1), Some(bc2));
-    assert_eq!(store.ppoi_index_of(&LIST_KEY, &bc), Some(0));
-    assert_eq!(store.ppoi_index_of(&LIST_KEY, &bc2), Some(1));
+    assert_eq!(store.ppoi_indices_of(&LIST_KEY, &bc).next(), Some(0));
+    assert_eq!(store.ppoi_indices_of(&LIST_KEY, &bc2).next(), Some(1));
     assert_eq!(
         store.ppoi_event_metadata(&LIST_KEY, 1),
         Some(&raven_railgun_persistence::PpoiEventMetadata {

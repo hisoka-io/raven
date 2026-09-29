@@ -31,7 +31,10 @@
 //! One request to upstream is in flight at a time, whatever the number of feeds, and two start
 //! no less than [`DEFAULT_REQUEST_SPACING`] apart unless the caller lowers that for a local
 //! replay. Each carries [`USER_AGENT`]. Failures in a row lengthen the wait before the next
-//! request, up to [`MirrorConfig::failure_backoff_cap`], and an answer resets it.
+//! request, up to [`MirrorConfig::failure_backoff_cap`], and an answer resets it. A mirror given
+//! [`UpstreamPpoiMirror::with_node_status`] also asks upstream's node status for a list's row
+//! count, at most once a poll per feed and only after a page that does not show where the list
+//! ends.
 
 #![allow(missing_docs, clippy::items_after_statements)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
@@ -150,6 +153,22 @@ pub mod test_signer;
 
 const JSON_RPC_VERSION: &str = "2.0";
 const POI_EVENTS_METHOD: &str = "ppoi_poi_events";
+const NODE_STATUS_METHOD: &str = "ppoi_node_status";
+
+/// Upstream's network name for an EVM chain, the key its node status files each list's counts
+/// under; `None` for a pair not listed here. A wrong name would read another chain's count.
+#[must_use]
+pub fn ppoi_network_name(chain_type: &str, chain_id: u64) -> Option<&'static str> {
+    match (chain_type, chain_id) {
+        ("0", 1) => Some("Ethereum"),
+        ("0", 56) => Some("BNB_Chain"),
+        ("0", 137) => Some("Polygon"),
+        ("0", 42_161) => Some("Arbitrum"),
+        ("0", 11_155_111) => Some("Ethereum_Sepolia"),
+        ("0", 80_002) => Some("Polygon_Amoy"),
+        _ => None,
+    }
+}
 
 /// Default chain type in PPOI URLs.
 pub const DEFAULT_CHAIN_TYPE: &str = "0";
@@ -202,6 +221,14 @@ pub struct FeedProgress {
     /// Upstream's row count, known only when its last answer came back shorter than the page
     /// asked for. `None` while pages come back full, and before the first answer.
     pub upstream_rows: Option<u64>,
+    /// Upstream's row count as its latest answers give it, whether or not the node took the
+    /// rows: one past the last row the latest page served, or the index it asked from when it
+    /// served none. After a page that served a row at the end of what it asked for, and so does
+    /// not show where the list ends, the larger of that and the count upstream's node status
+    /// last stated (see [`UpstreamPpoiMirror::with_node_status`]). The status is unsigned, so
+    /// this moves no readiness state. `None` before the first answer; a failed request leaves
+    /// it as it was.
+    pub upstream_rows_seen: Option<u64>,
     /// Rows handed downstream since the feed started.
     pub rows_delivered: u64,
     /// Requests that failed since upstream last answered.
@@ -249,21 +276,28 @@ impl FeedStatus {
         progress.last_failure = Some(class);
     }
 
-    fn answered(&self, next_index: u64, delivered: usize, upstream_rows: Option<u64>) {
+    fn answered(&self, next_index: u64, delivered: usize, upstream_rows: Option<u64>, seen: u64) {
         let mut progress = self.progress();
         progress.next_index = next_index;
         progress.rows_delivered = progress
             .rows_delivered
             .saturating_add(u64::try_from(delivered).unwrap_or(u64::MAX));
         progress.upstream_rows = upstream_rows;
+        progress.upstream_rows_seen = Some(seen);
         progress.consecutive_failures = 0;
         progress.last_failure = None;
         progress.last_answer = Some(std::time::Instant::now());
     }
 
     /// Upstream answered, but the page stops short at a row the feed cannot take: the rows below
-    /// it were delivered, and the page says nothing of upstream's size.
-    fn answered_short_of(&self, next_index: u64, delivered: usize, refusal: PreflightFailure) {
+    /// it were delivered, and the list is not known to end at the last of them.
+    fn answered_short_of(
+        &self,
+        next_index: u64,
+        delivered: usize,
+        refusal: PreflightFailure,
+        seen: u64,
+    ) {
         tracing::warn!(
             %refusal,
             "ppoi mirror: took the rows below the refused one and will ask for it again"
@@ -274,12 +308,17 @@ impl FeedStatus {
             .rows_delivered
             .saturating_add(u64::try_from(delivered).unwrap_or(u64::MAX));
         progress.upstream_rows = None;
+        progress.upstream_rows_seen = Some(seen);
         progress.consecutive_failures = progress.consecutive_failures.saturating_add(1);
         progress.last_failure = Some(refusal);
         progress.last_answer = Some(std::time::Instant::now());
         if matches!(refusal, PreflightFailure::BadSignature(_)) {
             progress.signatures_refused = progress.signatures_refused.saturating_add(1);
         }
+    }
+
+    fn seen(&self, rows: u64) {
+        self.progress().upstream_rows_seen = Some(rows);
     }
 
     fn untaken(&self, row: Option<u64>) {
@@ -296,6 +335,8 @@ pub struct UpstreamPpoiMirror {
     config: MirrorConfig,
     client: reqwest::Client,
     request_spacing: std::time::Duration,
+    /// Upstream's network name for this chain, when the feeds ask its node status for counts.
+    status_network: Option<String>,
     /// When the last request started. Held across each request, so only one is ever in flight.
     last_request: tokio::sync::Mutex<Option<tokio::time::Instant>>,
 }
@@ -307,6 +348,7 @@ impl std::fmt::Debug for UpstreamPpoiMirror {
             .field("chain_type", &self.config.chain_type)
             .field("chain_id", &self.config.chain_id)
             .field("request_spacing", &self.request_spacing)
+            .field("status_network", &self.status_network)
             .finish_non_exhaustive()
     }
 }
@@ -331,17 +373,32 @@ impl UpstreamPpoiMirror {
                 "request_timeout must be above zero".to_owned(),
             ));
         }
-        let client = reqwest::Client::builder()
-            .timeout(config.request_timeout)
-            .user_agent(USER_AGENT)
+        let client = client_builder(&config)
             .build()
             .map_err(|e| MirrorError::Upstream(format!("reqwest builder: {e}")))?;
-        Ok(Self {
+        Ok(Self::with_client(config, client))
+    }
+
+    fn with_client(config: MirrorConfig, client: reqwest::Client) -> Self {
+        Self {
             config,
             client,
             request_spacing: DEFAULT_REQUEST_SPACING,
+            status_network: None,
             last_request: tokio::sync::Mutex::new(None),
-        })
+        }
+    }
+
+    /// Have each feed ask upstream's node status for its list's row count, filed under
+    /// `network` (see [`ppoi_network_name`]), after a page that served a row at the end of what
+    /// it asked for, and so does not show where the list ends; at most once a poll per feed.
+    /// [`FeedProgress::upstream_rows_seen`] then reads upstream's count during a cold sync and
+    /// past a refused row. Upstream keeps these counts for its `V2_PoseidonMerkle` lists only,
+    /// so a mirror on another txid version asks nothing.
+    #[must_use]
+    pub fn with_node_status(mut self, network: impl Into<String>) -> Self {
+        self.status_network = Some(network.into());
+        self
     }
 
     /// Least time between the starts of two requests to upstream, from every feed and preflight
@@ -491,6 +548,7 @@ impl UpstreamPpoiMirror {
         let mut asked_at = Instant::now();
         let mut untaken = UntakenRow::default();
         let mut failures = 0u32;
+        let mut count = UpstreamCount::default();
         loop {
             // Measured from the previous request, so the setting bounds the request rate. A closed
             // channel ends the wait, so shutdown is not held for a poll interval.
@@ -530,24 +588,27 @@ impl UpstreamPpoiMirror {
                     ))
                 })?
                 .min(wanted.end - 1);
-            let Page { mut events, forged } =
-                match self.fetch_page(&list, cursor, end, None, &verifier).await {
-                    Ok(page) => page,
-                    Err((class, detail)) => {
-                        failures = failures.saturating_add(1);
-                        pause = failure_wait(poll, failures, self.config.failure_backoff_cap);
-                        tracing::warn!(
-                            endpoint = %self.config.endpoint,
-                            method = POI_EVENTS_METHOD,
-                            failure = %class,
-                            %detail,
-                            retry_in = ?pause,
-                            "ppoi mirror: page request failed; asking again after the wait"
-                        );
-                        status.failed(class);
-                        continue;
-                    }
-                };
+            let Page {
+                mut events,
+                forged,
+                last_served,
+            } = match self.fetch_page(&list, cursor, end, None, &verifier).await {
+                Ok(page) => page,
+                Err((class, detail)) => {
+                    failures = failures.saturating_add(1);
+                    pause = failure_wait(poll, failures, self.config.failure_backoff_cap);
+                    tracing::warn!(
+                        endpoint = %self.config.endpoint,
+                        method = POI_EVENTS_METHOD,
+                        failure = %class,
+                        %detail,
+                        retry_in = ?pause,
+                        "ppoi mirror: page request failed; asking again after the wait"
+                    );
+                    status.failed(class);
+                    continue;
+                }
+            };
             let missing = truncate_at_first_missing(&mut events, cursor);
             let taken = u64::try_from(events.len()).unwrap_or(u64::MAX);
             let next = cursor.saturating_add(taken);
@@ -560,33 +621,94 @@ impl UpstreamPpoiMirror {
             if full && !untaken.pending() {
                 pause = Duration::ZERO;
             }
-            for ev in events {
-                // Upstream rows have no block, and 0 keeps them out of every reorg unwind
-                // (`h > height` is never true). A real height here makes reorgs drop PPOI rows.
-                let leaf_added = raven_railgun_persistence::WalEntryPayload::PpoiListLeafAdded {
-                    list_key: list.0,
-                    list_index: ev.list_index,
-                    blinded_commitment: ev.blinded_commitment.0,
-                    event_type: ev.event_type,
-                    validated_merkleroot: ev.validated_merkleroot,
-                };
-                if sender.send((leaf_added, 0)).await.is_err() {
-                    tracing::info!("ppoi mirror engine consumer dropped channel; exiting");
-                    return Ok(());
-                }
+            if !deliver(&list, events, &sender).await {
+                tracing::info!("ppoi mirror engine consumer dropped channel; exiting");
+                return Ok(());
             }
+            let (seen, ends) = count.page(last_served, cursor, end);
             cursor = next;
             let delivered = usize::try_from(taken).unwrap_or(usize::MAX);
             if let Some(refusal) = refusal {
-                status.answered_short_of(cursor, delivered, refusal);
+                status.answered_short_of(cursor, delivered, refusal, seen);
                 failures = failures.saturating_add(1);
                 pause = failure_wait(poll, failures, self.config.failure_backoff_cap);
             } else {
                 // A short answer is the whole of upstream's list: no row past its last exists yet.
-                status.answered(cursor, delivered, (!full).then_some(cursor));
+                status.answered(cursor, delivered, (!full).then_some(cursor), seen);
                 failures = 0;
             }
+            self.renew_stated_count(&list, &mut count, ends, poll, status)
+                .await;
         }
+    }
+
+    /// After a page that does not show where the list ends, asks upstream's node status for
+    /// `list`'s count, at most once a poll, and records it. A failure is only logged: the
+    /// pages, not the status, are the feed's health.
+    async fn renew_stated_count(
+        &self,
+        list: &ListKey,
+        count: &mut UpstreamCount,
+        page_ends: bool,
+        poll: std::time::Duration,
+        status: &FeedStatus,
+    ) {
+        let Some(network) = self
+            .status_network
+            .as_deref()
+            .filter(|_| self.config.txid_version == DEFAULT_TXID_VERSION)
+        else {
+            return;
+        };
+        if page_ends || count.asked.is_some_and(|at| at.elapsed() < poll) {
+            return;
+        }
+        count.asked = Some(tokio::time::Instant::now());
+        match self.stated_rows(list, network).await {
+            Ok(rows) => {
+                count.stated = Some(rows);
+                status.seen(rows.max(count.shown));
+            }
+            Err((class, detail)) => tracing::warn!(
+                endpoint = %self.config.endpoint,
+                method = NODE_STATUS_METHOD,
+                failure = %class,
+                %detail,
+                "ppoi mirror: node status gave no row count; the feed goes on without it"
+            ),
+        }
+    }
+
+    /// The row count upstream's node status states for `list` on `network`: the sum of its
+    /// per-type event counts, which is how upstream's own nodes size a list.
+    async fn stated_rows(
+        &self,
+        list: &ListKey,
+        network: &str,
+    ) -> core::result::Result<u64, (PreflightFailure, String)> {
+        let status: serde_json::Value = self
+            .exchange_json_rpc(NODE_STATUS_METHOD, serde_json::Map::new(), None)
+            .await
+            .map_err(|failure| failure.classify(self.config.request_timeout))?;
+        let list_key = hex_lower(&list.0);
+        status
+            .get("forNetwork")
+            .and_then(|networks| networks.get(network))
+            .and_then(|lists| lists.get("listStatuses"))
+            .and_then(|lists| lists.get(&list_key))
+            .and_then(|list| list.get("poiEventLengths"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|lengths| {
+                lengths.values().try_fold(0u64, |sum, count| {
+                    count.as_u64().and_then(|count| sum.checked_add(count))
+                })
+            })
+            .ok_or_else(|| {
+                (
+                    PreflightFailure::MalformedEnvelope,
+                    format!("no poiEventLengths for list {list_key} on {network}"),
+                )
+            })
     }
 
     /// One `ppoi_poi_events` page, decoded and checked by `verifier`. `timeout` overrides the
@@ -663,6 +785,63 @@ impl UpstreamPpoiMirror {
                 "response contains neither result nor error".to_owned(),
             )),
         }
+    }
+}
+
+/// Hands each row downstream; `false` once the consumer has dropped the channel.
+async fn deliver(
+    list: &ListKey,
+    events: Vec<IndexedPoiEvent>,
+    sender: &tokio::sync::mpsc::Sender<(raven_railgun_persistence::WalEntryPayload, u64)>,
+) -> bool {
+    for ev in events {
+        // Upstream rows have no block, and 0 keeps them out of every reorg unwind
+        // (`h > height` is never true). A real height here makes reorgs drop PPOI rows.
+        let leaf_added = raven_railgun_persistence::WalEntryPayload::PpoiListLeafAdded {
+            list_key: list.0,
+            list_index: ev.list_index,
+            blinded_commitment: ev.blinded_commitment.0,
+            event_type: ev.event_type,
+            validated_merkleroot: ev.validated_merkleroot,
+        };
+        if sender.send((leaf_added, 0)).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+fn client_builder(config: &MirrorConfig) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(config.request_timeout)
+        .user_agent(USER_AGENT)
+}
+
+/// What a feed knows of upstream's row count beyond the rows it took.
+#[derive(Debug, Default)]
+struct UpstreamCount {
+    /// One past the last row the latest page served, or where it was asked from if none.
+    shown: u64,
+    /// The count upstream's node status last stated, until a page shows where the list ends.
+    stated: Option<u64>,
+    /// When the node status was last asked for.
+    asked: Option<tokio::time::Instant>,
+}
+
+impl UpstreamCount {
+    /// Takes a page asked for from `from` to `end` whose highest served index is `last_served`.
+    /// Returns upstream's count as now known, and whether the page shows where the list ends:
+    /// one that served nothing at `end` does, whether or not its rows were taken.
+    fn page(&mut self, last_served: Option<u64>, from: u64, end: u64) -> (u64, bool) {
+        self.shown = last_served.map_or(from, |last| last.saturating_add(1));
+        let ends = last_served.is_none_or(|last| last < end);
+        if ends {
+            self.stated = None;
+        }
+        (
+            self.stated.map_or(self.shown, |rows| rows.max(self.shown)),
+            ends,
+        )
     }
 }
 
@@ -873,11 +1052,13 @@ fn signed_message(
     })
 }
 
-/// A decoded page: the rows below `forged`, and the index of the first row whose signature
-/// failed, if one did.
+/// A decoded page: the rows below `forged`, the index of the first row whose signature
+/// failed, if one did, and the highest index the answer served inside the range asked for,
+/// whether or not its row was taken.
 struct Page {
     events: Vec<IndexedPoiEvent>,
     forged: Option<u64>,
+    last_served: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -922,6 +1103,11 @@ fn decode_indexed_events(
             events.len()
         )));
     }
+    let last_served = events
+        .iter()
+        .map(|event| event.signed_event.index)
+        .filter(|index| (start_index..=end_index).contains(index))
+        .max();
     let mut out = Vec::with_capacity(events.len());
     let mut previous = None;
     for event in events {
@@ -970,6 +1156,7 @@ fn decode_indexed_events(
             return Ok(Page {
                 events: out,
                 forged: Some(index),
+                last_served,
             });
         }
         out.push(IndexedPoiEvent {
@@ -982,6 +1169,7 @@ fn decode_indexed_events(
     Ok(Page {
         events: out,
         forged: None,
+        last_served,
     })
 }
 
@@ -1144,6 +1332,34 @@ mod tests {
             poll,
             "a cap below the poll never shortens the poll"
         );
+    }
+
+    /// Refuses every name at once, so the verdict never waits on a real resolver.
+    struct NoSuchHost;
+
+    impl reqwest::dns::Resolve for NoSuchHost {
+        fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            let refusal = format!("{}: no such host", name.as_str());
+            Box::pin(async move { Err(refusal.into()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolvable_host_is_classed_dns() {
+        let config = MirrorConfig {
+            endpoint: "http://raven-preflight.invalid".to_owned(),
+            ..MirrorConfig::default()
+        };
+        let client = client_builder(&config)
+            .dns_resolver(std::sync::Arc::new(NoSuchHost))
+            .build()
+            .expect("client builds");
+        let error = UpstreamPpoiMirror::with_client(config, client)
+            .preflight(&ListKey([0u8; 32]), std::time::Duration::from_secs(60))
+            .await
+            .expect_err("a host that does not resolve must be refused");
+        assert_eq!(error.failure, PreflightFailure::Dns, "{error}");
+        assert_eq!(error.endpoint, "http://raven-preflight.invalid");
     }
 
     #[test]
