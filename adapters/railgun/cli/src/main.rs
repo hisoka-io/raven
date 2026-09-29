@@ -123,7 +123,11 @@ async fn main() -> anyhow::Result<()> {
             metrics_public,
         } => {
             let opts = multi_options_from_config(&config, ws_endpoint, metrics_public)?;
-            raven_railgun_cli::serve_production_multi::run(opts).await
+            return_freed_heap_periodically();
+            raven_railgun_cli::serve_production_multi::run(opts).await?;
+            // A final commit the stop budget abandoned still occupies a runtime worker, and
+            // dropping the runtime would wait for it past the budget.
+            std::process::exit(0)
         }
         Commands::BootstrapFromSubsquid {
             rpc_pool_config,
@@ -185,6 +189,30 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 }
+
+/// glibc keeps freed heap pages resident: the buffers a boot decodes through, every commit's
+/// re-encode and every query's scratch would otherwise hold resident memory near twice the live
+/// heap for the life of the process. A timer returns them whatever freed them.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn return_freed_heap_periodically() {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+    let spawned = std::thread::Builder::new()
+        .name("heap-return".to_owned())
+        .spawn(|| loop {
+            std::thread::sleep(INTERVAL);
+            // SAFETY: malloc_trim takes no pointers; it only releases free pages glibc owns.
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::malloc_trim(0);
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "freed heap will not be returned to the OS");
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn return_freed_heap_periodically() {}
 
 /// Each flag beside `--config` overrides its TOML key.
 fn multi_options_from_config(

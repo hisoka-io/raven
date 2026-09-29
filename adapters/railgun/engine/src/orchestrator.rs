@@ -504,7 +504,7 @@ impl std::fmt::Debug for MultiOrchestratorHandle {
 pub fn bootstrap_railgun_engine_multi<F>(
     configs: Vec<InstanceConfig>,
     params: raven_inspire::params::InspireParams,
-    fresh_state_factory: F,
+    mut fresh_state_factory: F,
 ) -> Result<MultiOrchestratorHandle>
 where
     F: FnMut(&InstanceConfig) -> Result<InspireServerState>,
@@ -513,18 +513,443 @@ where
         configs,
         params,
         SessionStoreLimits::default(),
-        fresh_state_factory,
+        |cfg, _crs| fresh_state_factory(cfg),
     )
+}
+
+/// An instance whose data dir is open and whose state is recovered or still to be built.
+struct OpenedSlot {
+    cfg: InstanceConfig,
+    encoder: Arc<dyn super::pir_table::PirTableEncoder>,
+    session_store: Arc<crate::session_pool::BoundedSessionStore>,
+    persistence: Arc<InspirePersistence>,
+    state: Option<InspireServerState>,
+    store: LogicalLeafStore,
+}
+
+/// The CRS each list is served under. Packing keys are a function of the CRS's `w_seed` and the
+/// cell's packing width, and a client derives one context per list and width, so a block served
+/// under another seed returns bytes unrelated to its rows at HTTP 200.
+#[derive(Default)]
+struct ServedCrs {
+    by_list: Vec<ListCrs>,
+    any: Vec<Arc<raven_inspire::ServerCrs>>,
+}
+
+struct ListCrs {
+    list_key: [u8; 32],
+    crs: Arc<raven_inspire::ServerCrs>,
+}
+
+/// One list and width's recovered blocks, grouped by the seed each was built under.
+struct RecoveredList {
+    list_key: [u8; 32],
+    columns: usize,
+    seeds: Vec<(Arc<raven_inspire::ServerCrs>, Vec<InstanceId>)>,
+}
+
+impl ServedCrs {
+    fn list_of(source: DataSourceFilter) -> Option<[u8; 32]> {
+        match source {
+            DataSourceFilter::PpoiListBlock { list_key, .. } => Some(list_key),
+            DataSourceFilter::ChainTreeNumber(_) => None,
+        }
+    }
+
+    fn list_crs(&self, list_key: [u8; 32], columns: usize) -> Option<&ListCrs> {
+        self.by_list
+            .iter()
+            .find(|list| list.list_key == list_key && list.crs.inspiring_num_columns == columns)
+    }
+
+    /// Every block of a list and width recovered under one seed, or a refusal naming, per list,
+    /// the blocks outside the seed most of its blocks hold: those are the ones to rebuild.
+    fn from_recovered(slots: &[OpenedSlot]) -> Result<Self> {
+        let mut served = Self::default();
+        let mut lists: Vec<RecoveredList> = Vec::new();
+        for slot in slots {
+            let Some(state) = slot.state.as_ref() else {
+                continue;
+            };
+            served.remember(&state.crs);
+            let Some(list_key) = Self::list_of(slot.cfg.data_source) else {
+                continue;
+            };
+            let columns = state.crs.inspiring_num_columns;
+            let at = lists
+                .iter()
+                .position(|list| list.list_key == list_key && list.columns == columns)
+                .unwrap_or_else(|| {
+                    lists.push(RecoveredList {
+                        list_key,
+                        columns,
+                        seeds: Vec::new(),
+                    });
+                    lists.len() - 1
+                });
+            let Some(list) = lists.get_mut(at) else {
+                continue;
+            };
+            let block = slot.cfg.instance_id.clone();
+            match list
+                .seeds
+                .iter_mut()
+                .find(|(crs, _)| crs.inspiring_w_seed == state.crs.inspiring_w_seed)
+            {
+                Some((_, blocks)) => blocks.push(block),
+                None => list.seeds.push((Arc::clone(&state.crs), vec![block])),
+            }
+        }
+        let mut refusals: Vec<String> = Vec::new();
+        for list in lists {
+            // Ties go to the seed seen first, so the choice follows config order.
+            let kept = list
+                .seeds
+                .iter()
+                .enumerate()
+                .max_by_key(|(at, (_, blocks))| (blocks.len(), std::cmp::Reverse(*at)))
+                .map(|(at, _)| at);
+            let Some((crs, _)) = kept.and_then(|at| list.seeds.get(at)) else {
+                continue;
+            };
+            if list.seeds.len() > 1 {
+                let groups: Vec<String> = list
+                    .seeds
+                    .iter()
+                    .map(|(other, blocks)| {
+                        let names: Vec<&str> = blocks.iter().map(InstanceId::as_str).collect();
+                        format!(
+                            "w_seed {} held by {}{}",
+                            seed_prefix(&other.inspiring_w_seed),
+                            names.join(", "),
+                            if Arc::ptr_eq(other, crs) {
+                                " (kept)"
+                            } else {
+                                ""
+                            }
+                        )
+                    })
+                    .collect();
+                refusals.push(format!(
+                    "list {}: {}",
+                    hex_lower_32(&list.list_key),
+                    groups.join("; ")
+                ));
+            }
+            served.by_list.push(ListCrs {
+                list_key: list.list_key,
+                crs: Arc::clone(crs),
+            });
+        }
+        if refusals.is_empty() {
+            return Ok(served);
+        }
+        Err(AdapterError::Internal(format!(
+            "recovered blocks of one list are served under different CRS packing seeds ({}). A \
+             client derives one context per list, so a block under another seed returns \
+             unrelated bytes. Operator: stop, delete the data_dir of each block not marked \
+             kept, and restart; those blocks rebuild under the kept seed and re-sync from \
+             upstream.",
+            refusals.join(" | "),
+        )))
+    }
+
+    /// The CRS a fresh instance of `cfg` at `columns` packing columns is served under, and
+    /// whether its list set it: its list's, else any this boot holds at that width.
+    fn for_fresh(
+        &self,
+        cfg: &InstanceConfig,
+        columns: usize,
+    ) -> Option<(Arc<raven_inspire::ServerCrs>, bool)> {
+        let list = Self::list_of(cfg.data_source)
+            .and_then(|key| self.list_crs(key, columns))
+            .map(|list| (Arc::clone(&list.crs), true));
+        list.or_else(|| {
+            self.any
+                .iter()
+                .find(|crs| crs.inspiring_num_columns == columns)
+                .map(|crs| (Arc::clone(crs), false))
+        })
+    }
+
+    fn record(&mut self, cfg: &InstanceConfig, crs: &Arc<raven_inspire::ServerCrs>) {
+        if let Some(list_key) = Self::list_of(cfg.data_source) {
+            if self.list_crs(list_key, crs.inspiring_num_columns).is_none() {
+                self.by_list.push(ListCrs {
+                    list_key,
+                    crs: Arc::clone(crs),
+                });
+            }
+        }
+        self.remember(crs);
+    }
+
+    fn remember(&mut self, crs: &Arc<raven_inspire::ServerCrs>) {
+        if !self
+            .any
+            .iter()
+            .any(|held| held.inspiring_num_columns == crs.inspiring_num_columns)
+        {
+            self.any.push(Arc::clone(crs));
+        }
+    }
+}
+
+fn seed_prefix(seed: &[u8; 32]) -> String {
+    hex_lower_32(seed).chars().take(16).collect()
+}
+
+/// A recovered data dir is booted only by the binary and the list it was built for.
+fn require_recovered_cell_matches(
+    cfg: &InstanceConfig,
+    state: &InspireServerState,
+    store: &LogicalLeafStore,
+    params: &raven_inspire::params::InspireParams,
+) -> Result<()> {
+    if state.crs.params != *params {
+        return Err(AdapterError::Internal(format!(
+            "instance {id} at {dir} was built under InsPIRe parameters {stored:?}, but this \
+             binary serves {params:?}. Its encoded rows and every client context derived from \
+             its CRS belong to the other parameters, so it is refused rather than served. \
+             Operator: boot it with the binary that built it, or delete the data_dir and \
+             re-sync.",
+            id = cfg.instance_id,
+            dir = cfg.data_dir.display(),
+            stored = state.crs.params,
+        )));
+    }
+    if let DataSourceFilter::PpoiListBlock { list_key, .. } = cfg.data_source {
+        let configured_held = usize::from(store.ppoi_imt(&list_key).is_some());
+        if store.ppoi_list_count() > configured_held {
+            return Err(AdapterError::Internal(format!(
+                "instance {id} at {dir} holds rows of a list other than the configured list \
+                 {list}. Serving it would publish the other list's rows as this one's. \
+                 Operator: point the instance at the list its data_dir was built for, or delete \
+                 the data_dir and re-sync.",
+                id = cfg.instance_id,
+                dir = cfg.data_dir.display(),
+                list = hex_lower_32(&list_key),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Data dirs opened at once. Each open holds its snapshot's decompressed body beside the state it
+/// decodes, so this bounds the transient memory a boot adds to the served states.
+const PARALLEL_DATA_DIR_OPENS: usize = 4;
+
+/// Open every data dir, recovering what a snapshot holds, several at a time. Results keep the
+/// order of `configs`, and the first failure in that order is the one returned.
+fn open_every_data_dir(
+    configs: Vec<InstanceConfig>,
+    params: &raven_inspire::params::InspireParams,
+    session_limits: SessionStoreLimits,
+) -> Result<Vec<OpenedSlot>> {
+    let pending: Vec<parking_lot::Mutex<Option<InstanceConfig>>> = configs
+        .into_iter()
+        .map(|cfg| parking_lot::Mutex::new(Some(cfg)))
+        .collect();
+    let opened: Vec<parking_lot::Mutex<Option<Result<OpenedSlot>>>> = pending
+        .iter()
+        .map(|_| parking_lot::Mutex::new(None))
+        .collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(PARALLEL_DATA_DIR_OPENS)
+        .min(pending.len())
+        .max(1);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (Some(slot), Some(out)) = (pending.get(at), opened.get(at)) else {
+                    break;
+                };
+                if let Some(cfg) = slot.lock().take() {
+                    *out.lock() = Some(open_data_dir(cfg, params, session_limits));
+                }
+            });
+        }
+    });
+    opened
+        .into_iter()
+        .map(|out| {
+            out.into_inner().unwrap_or_else(|| {
+                Err(AdapterError::Internal(
+                    "a data dir open ended without a result".to_owned(),
+                ))
+            })
+        })
+        .collect()
+}
+
+fn open_data_dir(
+    cfg: InstanceConfig,
+    params: &raven_inspire::params::InspireParams,
+    session_limits: SessionStoreLimits,
+) -> Result<OpenedSlot> {
+    let layout = if cfg.use_flock {
+        let (l, lock) = StoreLayout::open_with_lock(&cfg.data_dir)
+            .map_err(|e| AdapterError::Internal(format!("StoreLayout::open_with_lock: {e}")))?;
+        let _ = Box::leak(Box::new(lock));
+        l
+    } else {
+        StoreLayout::open(&cfg.data_dir)
+            .map_err(|e| AdapterError::Internal(format!("StoreLayout::open: {e}")))?
+    };
+
+    let encoder: Arc<dyn super::pir_table::PirTableEncoder> =
+        cfg.encoder.build(cfg.record_size, cfg.entries_per_shard)?;
+
+    let session_store = Arc::new(crate::session_pool::BoundedSessionStore::open_with_limits(
+        layout.root(),
+        session_limits,
+    )?);
+    let opened = InspirePersistence::open(
+        layout,
+        cfg.scheme_tag.clone(),
+        cfg.instance_id.clone(),
+        cfg.snapshot_policy,
+        Arc::clone(&encoder),
+    )?;
+    if let Some(state) = opened.recovered_state.as_ref() {
+        require_recovered_cell_matches(&cfg, state, &opened.recovered_logical_store, params)?;
+    }
+    Ok(OpenedSlot {
+        cfg,
+        encoder,
+        session_store,
+        persistence: Arc::new(opened.persistence),
+        state: opened.recovered_state,
+        store: opened.recovered_logical_store,
+    })
+}
+
+/// Build and commit a state for every instance no snapshot recovered, each under the CRS its
+/// list is served under.
+fn build_fresh_states<F>(slots: &mut [OpenedSlot], fresh_state_factory: &mut F) -> Result<()>
+where
+    F: FnMut(&InstanceConfig, Option<&Arc<raven_inspire::ServerCrs>>) -> Result<InspireServerState>,
+{
+    let mut served = ServedCrs::from_recovered(slots)?;
+    for slot in slots.iter_mut().filter(|slot| slot.state.is_none()) {
+        let columns = super::pir_table::pir_cell_columns(slot.encoder.record_size());
+        let donor = served.for_fresh(&slot.cfg, columns);
+        let built = fresh_state_factory(&slot.cfg, donor.as_ref().map(|(crs, _)| crs))?;
+        let state = match donor {
+            Some((crs, _))
+                if crs.params == built.crs.params
+                    && crs.inspiring_num_columns == built.crs.inspiring_num_columns =>
+            {
+                crate::inspire::serve_under_crs(built, &crs)?
+            }
+            Some((crs, true)) => {
+                return Err(AdapterError::Internal(format!(
+                    "fresh instance {id} was built for a cell of {built_columns} packing columns \
+                     under {built_params:?}, but its list is served at {columns} columns under \
+                     {params:?}; one client context cannot decode both",
+                    id = slot.cfg.instance_id,
+                    built_columns = built.crs.inspiring_num_columns,
+                    built_params = built.crs.params,
+                    columns = crs.inspiring_num_columns,
+                    params = crs.params,
+                )));
+            }
+            _ => built,
+        };
+        served.record(&slot.cfg, &state.crs);
+        // V6 so the store travels with the snapshot from the first manifest write.
+        slot.persistence
+            .commit_v6(&state, &LogicalLeafStore::default(), 0)?;
+        slot.persistence.commit_notify().notify_waiters();
+        slot.state = Some(state);
+    }
+    Ok(())
+}
+
+/// Serve an opened instance and spawn its consumer.
+fn start_instance(
+    slot: OpenedSlot,
+    params: &raven_inspire::params::InspireParams,
+) -> Result<PerInstanceHandles> {
+    let OpenedSlot {
+        cfg,
+        encoder,
+        session_store,
+        persistence,
+        state,
+        store: recovered_store,
+    } = slot;
+    let mut state = state.ok_or_else(|| {
+        AdapterError::Internal(format!(
+            "instance {} has neither a recovered nor a fresh state",
+            cfg.instance_id
+        ))
+    })?;
+    state.session_store = session_store;
+    let instance = PirInstance::new(cfg.instance_id.clone(), cfg.role, state);
+    let instance_arc: Arc<PirInstance<RavenInspireScheme>> = Arc::new(instance);
+
+    let cap = cfg.channel_capacity.max(1);
+    let (sender, receiver) = mpsc::channel::<ConsumerEvent>(cap);
+    let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default()));
+    let logical_store = Arc::new(parking_lot::Mutex::new(recovered_store));
+    let verifier_ctx = match (&cfg.chain_source, cfg.data_source) {
+        (Some(cs), DataSourceFilter::ChainTreeNumber(tn)) => Some(Layer2VerifierContext {
+            cadence_n: cfg.verification_cadence_n,
+            tree_number: tn,
+            chain_source: Some(Arc::clone(cs)),
+        }),
+        _ => None,
+    };
+    let consumer = {
+        let instance_for_task = Arc::clone(&instance_arc);
+        let persistence_for_task = Arc::clone(&persistence);
+        let store_for_task = Arc::clone(&logical_store);
+        let metrics_for_task = Arc::clone(&metrics);
+        let params = params.clone();
+        tokio::spawn(async move {
+            run_consumer_task(
+                instance_for_task,
+                persistence_for_task,
+                store_for_task,
+                metrics_for_task,
+                params,
+                encoder,
+                receiver,
+                verifier_ctx,
+            )
+            .await
+        })
+    };
+
+    Ok(PerInstanceHandles {
+        config: cfg,
+        instance: instance_arc,
+        persistence,
+        consumer,
+        sender,
+        metrics,
+        logical_store,
+    })
 }
 
 /// [`bootstrap_railgun_engine_multi`] with every instance's packing-key store opened at
 /// `session_limits`.
 ///
+/// Every data dir is opened before any fresh state is built, so a fresh instance is built only
+/// when no snapshot recovers it, and under the CRS its list's recovered blocks are served under
+/// (else under the first CRS the boot holds). `fresh_state_factory` receives that CRS; a state
+/// built under another is moved onto it.
+///
 /// # Errors
 ///
 /// As [`bootstrap_railgun_engine_multi`], plus [`AdapterError::Internal`] when
-/// `session_limits` admits no session.
-#[allow(clippy::too_many_lines)]
+/// `session_limits` admits no session, when a recovered data dir was built under other
+/// parameters or for another list, or when the recovered blocks of one list disagree on their
+/// CRS packing seed.
 pub fn bootstrap_railgun_engine_multi_with_session_limits<F>(
     configs: Vec<InstanceConfig>,
     params: raven_inspire::params::InspireParams,
@@ -532,7 +957,7 @@ pub fn bootstrap_railgun_engine_multi_with_session_limits<F>(
     mut fresh_state_factory: F,
 ) -> Result<MultiOrchestratorHandle>
 where
-    F: FnMut(&InstanceConfig) -> Result<InspireServerState>,
+    F: FnMut(&InstanceConfig, Option<&Arc<raven_inspire::ServerCrs>>) -> Result<InspireServerState>,
 {
     if configs.is_empty() {
         return Err(AdapterError::InvalidQuery(
@@ -557,92 +982,12 @@ where
         .max()
         .unwrap_or(1024);
 
-    let mut per_instance: Vec<PerInstanceHandles> = Vec::with_capacity(configs.len());
-    for cfg in configs {
-        let layout = if cfg.use_flock {
-            let (l, lock) = StoreLayout::open_with_lock(&cfg.data_dir)
-                .map_err(|e| AdapterError::Internal(format!("StoreLayout::open_with_lock: {e}")))?;
-            let _ = Box::leak(Box::new(lock));
-            l
-        } else {
-            StoreLayout::open(&cfg.data_dir)
-                .map_err(|e| AdapterError::Internal(format!("StoreLayout::open: {e}")))?
-        };
-
-        let encoder: Arc<dyn super::pir_table::PirTableEncoder> =
-            cfg.encoder.build(cfg.record_size, cfg.entries_per_shard)?;
-
-        let session_store = Arc::new(crate::session_pool::BoundedSessionStore::open_with_limits(
-            layout.root(),
-            session_limits,
-        )?);
-        let opened = InspirePersistence::open(
-            layout,
-            cfg.scheme_tag.clone(),
-            cfg.instance_id.clone(),
-            cfg.snapshot_policy,
-            Arc::clone(&encoder),
-        )?;
-        let persistence = Arc::new(opened.persistence);
-        let recovered_store = opened.recovered_logical_store;
-        let mut state = if let Some(s) = opened.recovered_state {
-            s
-        } else {
-            let s = fresh_state_factory(&cfg)?;
-            // V6 so the store travels with the snapshot from the first manifest write.
-            let empty_store = LogicalLeafStore::default();
-            persistence.commit_v6(&s, &empty_store, 0)?;
-            persistence.commit_notify().notify_waiters();
-            s
-        };
-        state.session_store = session_store;
-        let instance = PirInstance::new(cfg.instance_id.clone(), cfg.role, state);
-        let instance_arc: Arc<PirInstance<RavenInspireScheme>> = Arc::new(instance);
-
-        let cap = cfg.channel_capacity.max(1);
-        let (sender, receiver) = mpsc::channel::<ConsumerEvent>(cap);
-        let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default()));
-        let logical_store = Arc::new(parking_lot::Mutex::new(recovered_store));
-        let verifier_ctx = match (&cfg.chain_source, cfg.data_source) {
-            (Some(cs), DataSourceFilter::ChainTreeNumber(tn)) => Some(Layer2VerifierContext {
-                cadence_n: cfg.verification_cadence_n,
-                tree_number: tn,
-                chain_source: Some(Arc::clone(cs)),
-            }),
-            _ => None,
-        };
-        let consumer = {
-            let instance_for_task = Arc::clone(&instance_arc);
-            let persistence_for_task = Arc::clone(&persistence);
-            let store_for_task = Arc::clone(&logical_store);
-            let metrics_for_task = Arc::clone(&metrics);
-            let encoder = Arc::clone(&encoder);
-            let params = params.clone();
-            tokio::spawn(async move {
-                run_consumer_task(
-                    instance_for_task,
-                    persistence_for_task,
-                    store_for_task,
-                    metrics_for_task,
-                    params,
-                    encoder,
-                    receiver,
-                    verifier_ctx,
-                )
-                .await
-            })
-        };
-
-        per_instance.push(PerInstanceHandles {
-            config: cfg,
-            instance: instance_arc,
-            persistence,
-            consumer,
-            sender,
-            metrics,
-            logical_store,
-        });
-    }
+    let mut slots = open_every_data_dir(configs, &params, session_limits)?;
+    build_fresh_states(&mut slots, &mut fresh_state_factory)?;
+    let per_instance = slots
+        .into_iter()
+        .map(|slot| start_instance(slot, &params))
+        .collect::<Result<Vec<PerInstanceHandles>>>()?;
 
     let (indexer_tx, indexer_rx) = mpsc::channel::<IndexerMessage>(router_capacity);
     let (mirror_tx, mirror_rx) = mpsc::channel::<(WalEntryPayload, u64)>(router_capacity);
@@ -1312,7 +1657,7 @@ mod session_limit_tests {
         };
 
         let handle =
-            bootstrap_railgun_engine_multi_with_session_limits(configs, params, limits, |_| {
+            bootstrap_railgun_engine_multi_with_session_limits(configs, params, limits, |_, _| {
                 Ok(InspireServerState {
                     crs: Arc::clone(&donor.crs),
                     encoded_db: Arc::clone(&donor.encoded_db),

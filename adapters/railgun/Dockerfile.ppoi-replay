@@ -10,8 +10,11 @@ RUN apt-get update \
         pkg-config libssl-dev clang lld git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
-COPY rust-toolchain.toml ./
-COPY crates/inspire ./crates/inspire
+# the same allowlist as the operator image: the adapter's path-deps under crates/ inherit
+# workspace keys from the root manifest, so cargo needs every root member to load them
+COPY rust-toolchain.toml Cargo.toml Cargo.lock README.md ./
+COPY crates ./crates
+COPY benches ./benches
 COPY adapters/railgun ./adapters/railgun
 RUN cargo build --release \
         --manifest-path adapters/railgun/Cargo.toml \

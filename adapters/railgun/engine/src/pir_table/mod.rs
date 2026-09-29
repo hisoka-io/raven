@@ -336,6 +336,27 @@ pub fn validate_rows_per_shard(entries_per_shard: u32, ring_dim: usize) -> Resul
     )))
 }
 
+/// The rows every one of `shard_count` shards holds before the store has a row, so a fresh
+/// cell can encode one shard for all of them.
+///
+/// # Errors
+/// [`AdapterError::Internal`] if two shards of an empty store materialize differently: one
+/// encoded shard could then not stand for the others.
+pub fn empty_store_shard(encoder: &dyn PirTableEncoder, shard_count: u32) -> Result<Vec<u8>> {
+    let empty = LogicalLeafStore::new();
+    let first = encoder.materialize_shard(0, &empty);
+    if let Some(shard_id) =
+        (1..shard_count).find(|&id| encoder.materialize_shard(id, &empty) != first)
+    {
+        return Err(AdapterError::Internal(format!(
+            "encoder {label} materializes shard {shard_id} of an empty store differently from \
+             shard 0, so a fresh cell cannot stand one encoded shard in for all of them",
+            label = encoder.label(),
+        )));
+    }
+    Ok(first)
+}
+
 fn materialize_path_shard(
     imt: Option<&Imt>,
     shard_id: u32,
@@ -487,6 +508,61 @@ mod tests {
     }
 
     use raven_railgun_testkit::canonical;
+
+    // A fresh cell encodes one shard for all of them, which is sound only while an empty store
+    // materializes every shard alike: a new encoder that breaks this must redden here.
+    #[test]
+    fn every_encoder_materializes_an_empty_store_alike_in_every_shard() {
+        let kinds = [
+            EncoderKind::PerLeafBc { tree_number: 3 },
+            EncoderKind::PerLeafPath { tree_number: 3 },
+            EncoderKind::PerNode { tree_number: 3 },
+            EncoderKind::PerListPath10 { list_key: [7; 32] },
+        ];
+        for kind in kinds {
+            let encoder = kind
+                .build(kind.effective_record_size(64), 2048)
+                .expect("encoder");
+            let shards = u32::try_from(kind.default_total_entries() / 2048).expect("shards");
+            let rows = empty_store_shard(encoder.as_ref(), shards)
+                .unwrap_or_else(|e| panic!("{}: {e}", kind.label()));
+            assert_eq!(rows.len(), 2048 * encoder.record_size(), "{}", kind.label());
+        }
+        let path10 = EncoderKind::PerListPath10 { list_key: [7; 32] }
+            .build(PATH10_RECORD_BYTES, 2048)
+            .expect("encoder");
+        let rows = empty_store_shard(path10.as_ref(), 32).expect("uniform");
+        assert!(
+            rows.chunks(PATH10_RECORD_BYTES)
+                .all(|row| row.get(32) == Some(&list::ABSENT_STATUS_BYTE)),
+            "an empty list block reads absent in every row, never Valid"
+        );
+    }
+
+    #[test]
+    fn an_encoder_whose_empty_shards_differ_is_refused() {
+        #[derive(Debug)]
+        struct ShardNumbered;
+        impl PirTableEncoder for ShardNumbered {
+            fn record_size(&self) -> usize {
+                32
+            }
+            fn entries_per_shard(&self) -> u32 {
+                1
+            }
+            fn materialize_shard(&self, shard_id: u32, _store: &LogicalLeafStore) -> Vec<u8> {
+                vec![u8::try_from(shard_id).unwrap_or(u8::MAX); 32]
+            }
+            fn affected_shards_for_leaf(&self, _tree: u32, _leaf_index: u32) -> BTreeSet<u32> {
+                BTreeSet::new()
+            }
+            fn label(&self) -> &'static str {
+                "shard-numbered"
+            }
+        }
+        let error = empty_store_shard(&ShardNumbered, 2).expect_err("shards differ");
+        assert!(error.to_string().contains("shard 1"), "{error}");
+    }
 
     #[test]
     fn new_validates_record_size_floor() {

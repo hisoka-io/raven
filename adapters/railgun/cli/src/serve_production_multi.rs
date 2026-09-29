@@ -2,7 +2,7 @@
 
 #![allow(clippy::too_many_lines, clippy::missing_errors_doc)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,16 +10,15 @@ use std::sync::Arc;
 use crate::bearer_token::{resolve_bearer_token, BearerTokenError, BEARER_TOKEN_ENV};
 use anyhow::Context;
 use raven_inspire::params::{InspireParams, InspireVariant};
+use raven_inspire::ServerCrs;
 use raven_railgun_core::{InstanceId, ListKey};
-use raven_railgun_engine::inspire::{
-    setup_state_with_inspiring_seed, InspireServerState, LogicalLeafStore, RavenInspireScheme,
-};
+use raven_railgun_engine::inspire::{setup_unfilled_state, LogicalLeafStore, RavenInspireScheme};
 use raven_railgun_engine::orchestrator::{
     bootstrap_railgun_engine_multi_with_session_limits, DataSourceFilter, InstanceConfig,
     MultiOrchestratorHandle, OrchestratorChannels, PerInstanceHandles, LEAVES_PER_PPOI_BLOCK,
 };
 use raven_railgun_engine::persistence::{ConsumerMetrics, SnapshotPolicy};
-use raven_railgun_engine::pir_table::EncoderKind;
+use raven_railgun_engine::pir_table::{empty_store_shard, EncoderKind};
 use raven_railgun_engine::session_pool::SessionStoreLimits;
 use raven_railgun_engine::{Engine, InstanceRole};
 use raven_railgun_http::{
@@ -1121,6 +1120,37 @@ async fn signal_shutdown() {
     }
 }
 
+/// Final commits a stop runs at once. Each holds its serialized snapshot while it writes, so
+/// this bounds the memory a stop adds.
+const PARALLEL_FINAL_COMMITS: usize = 3;
+
+/// Time from the stop signal to exit, under Docker's default 10 s before it kills the process.
+/// A final commit still running when it is spent is abandoned: that instance's next boot
+/// recovers from its last snapshot and write-ahead log, as after a crash.
+const STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Run `stops`, at most `parallel` at once, until `stop_by`; returns how many had not finished.
+async fn run_stops_until<S>(stops: Vec<S>, parallel: usize, stop_by: tokio::time::Instant) -> usize
+where
+    S: std::future::Future<Output = ()> + Send + 'static,
+{
+    let slots = Arc::new(tokio::sync::Semaphore::new(parallel.max(1)));
+    let mut running = tokio::task::JoinSet::new();
+    for stop in stops {
+        let slots = Arc::clone(&slots);
+        running.spawn(async move {
+            let _slot = slots.acquire_owned().await;
+            stop.await;
+        });
+    }
+    let _ = tokio::time::timeout_at(stop_by, async {
+        while running.join_next().await.is_some() {}
+    })
+    .await;
+    while running.try_join_next().is_some() {}
+    running.len()
+}
+
 pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'static>(
     opts: MultiServeOptions,
     listener: tokio::net::TcpListener,
@@ -1456,22 +1486,68 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         "raven-railgun multi-instance production serve listening"
     );
 
-    axum::serve(
+    // The budget runs from the signal, so draining open requests spends it too.
+    let (signalled_tx, mut signalled_rx) = tokio::sync::oneshot::channel();
+    let shutdown = async move {
+        shutdown.await;
+        let _ = signalled_tx.send(tokio::time::Instant::now() + STOP_BUDGET);
+    };
+    let serving = axum::serve(
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown)
-    .await?;
+    .with_graceful_shutdown(shutdown);
+    let serving = std::future::IntoFuture::into_future(serving);
+    tokio::pin!(serving);
+    let signalled = tokio::select! {
+        served = &mut serving => {
+            served?;
+            None
+        }
+        stop_by = &mut signalled_rx => {
+            if stop_by.is_err() {
+                (&mut serving).await?;
+            }
+            stop_by.ok()
+        }
+    };
+    let stop_by = match signalled {
+        Some(stop_by) => {
+            if let Ok(served) = tokio::time::timeout_at(stop_by, &mut serving).await {
+                served?;
+            } else {
+                tracing::warn!("requests still open when the stop budget was spent");
+            }
+            stop_by
+        }
+        None => tokio::time::Instant::now() + STOP_BUDGET,
+    };
 
     drop(bootstrap.handles.channels);
-    for handle in bootstrap.handles.instances {
-        let _ = handle
-            .sender
-            .send(raven_railgun_engine::persistence::ConsumerEvent::Shutdown)
-            .await;
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle.consumer).await;
+    let final_commits: Vec<_> = bootstrap
+        .handles
+        .instances
+        .into_iter()
+        .map(|handle| async move {
+            let _ = handle
+                .sender
+                .send(raven_railgun_engine::persistence::ConsumerEvent::Shutdown)
+                .await;
+            let _ = handle.consumer.await;
+        })
+        .collect();
+    let unfinished = run_stops_until(final_commits, PARALLEL_FINAL_COMMITS, stop_by).await;
+    if unfinished > 0 {
+        tracing::warn!(
+            unfinished,
+            budget_secs = STOP_BUDGET.as_secs(),
+            "stop budget spent before every final commit finished; each unfinished instance \
+             recovers from its last snapshot and write-ahead log at the next boot"
+        );
     }
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), bootstrap.handles.router).await;
+    // The feeds that hold its senders drop last, so it would not exit on its own, and nothing it
+    // could still forward has a consumer.
+    bootstrap.handles.router.abort();
 
     // Before teardown so a SIGHUP can't race driver/registry shutdown.
     for t in auxiliary_tasks {
@@ -1488,31 +1564,30 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         } = wiring;
         let auto_spawned = registry.drain_auto_spawned();
         let drained = auto_spawned.len();
-        for handle in auto_spawned {
-            let instance_id = handle.instance_id.clone();
-            let _ = handle
-                .consumer_sender
-                .send(raven_railgun_engine::persistence::ConsumerEvent::Shutdown)
-                .await;
-            match tokio::time::timeout(std::time::Duration::from_secs(30), handle.consumer_join)
-                .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(join_err)) => {
+        let stops: Vec<_> = auto_spawned
+            .into_iter()
+            .map(|handle| async move {
+                let _ = handle
+                    .consumer_sender
+                    .send(raven_railgun_engine::persistence::ConsumerEvent::Shutdown)
+                    .await;
+                if let Err(join_err) = handle.consumer_join.await {
                     tracing::warn!(
-                        instance_id = %instance_id,
+                        instance_id = %handle.instance_id,
                         error = %join_err,
                         "auto_spawn consumer join error on shutdown"
                     );
                 }
-                Err(_) => {
-                    tracing::warn!(
-                        instance_id = %instance_id,
-                        timeout_secs = 30u64,
-                        "auto_spawn consumer did not exit within shutdown timeout"
-                    );
-                }
-            }
+            })
+            .collect();
+        let unfinished = run_stops_until(stops, PARALLEL_FINAL_COMMITS, stop_by).await;
+        if unfinished > 0 {
+            tracing::warn!(
+                unfinished,
+                budget_secs = STOP_BUDGET.as_secs(),
+                "auto_spawn consumers did not exit within the stop budget; each recovers from \
+                 its last snapshot and write-ahead log at the next boot"
+            );
         }
         if drained > 0 {
             tracing::info!(drained, "auto_spawn: drained consumers on shutdown");
@@ -1523,7 +1598,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     // Cooperative so a panic surfaces as a join error rather than being aborted away.
     if let Some(mut workers) = chain_workers {
         workers
-            .shutdown_mode_mirror(std::time::Duration::from_secs(5))
+            .shutdown_mode_mirror(stop_by.saturating_duration_since(tokio::time::Instant::now()))
             .await;
         drop(workers);
     }
@@ -2040,55 +2115,35 @@ fn bootstrap_instances(
     params: &InspireParams,
     session_limits: SessionStoreLimits,
 ) -> anyhow::Result<Bootstrap> {
-    let mut state_holders: Vec<Option<InspireServerState>> =
-        Vec::with_capacity(opts.instances.len());
-    let mut shared_inspiring_seed = None;
+    let mut ids: HashSet<&InstanceId> = HashSet::with_capacity(opts.instances.len());
     for cfg in &opts.instances {
-        let entry_size = cfg.record_size.max(32);
+        if !ids.insert(&cfg.instance_id) {
+            anyhow::bail!("duplicate instance id in config: {}", cfg.instance_id);
+        }
         let entries = entries_for_instance(opts, cfg, fleet_default_entries);
         validate_instance_cell_shape(cfg, entries, params.ring_dim)?;
-        let initial_db: Vec<u8> = (0..entries)
-            .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).unwrap_or(0)))
-            .collect();
-        let (state, _sk) = setup_state_with_inspiring_seed(
+    }
+
+    // Runs only for an instance no snapshot recovers.
+    let factory = |cfg: &InstanceConfig, crs: Option<&Arc<ServerCrs>>| {
+        let entries = entries_for_instance(opts, cfg, fleet_default_entries);
+        let encoder = cfg.encoder.build(cfg.record_size, cfg.entries_per_shard)?;
+        let shard_count = u32::try_from(entries.div_ceil(cfg.entries_per_shard.max(1) as usize))
+            .map_err(|_| {
+                raven_railgun_core::AdapterError::Internal(format!(
+                    "instance {} declares {entries} rows, past a u32 shard count",
+                    cfg.instance_id
+                ))
+            })?;
+        let rows = empty_store_shard(encoder.as_ref(), shard_count)?;
+        setup_unfilled_state(
             params,
-            &initial_db,
-            entry_size,
+            &rows,
+            entries as u64,
+            encoder.record_size(),
             InspireVariant::TwoPacking,
-            shared_inspiring_seed,
+            crs,
         )
-        .map_err(|e| anyhow::anyhow!("setup_state: {e}"))?;
-        shared_inspiring_seed.get_or_insert(state.crs.inspiring_w_seed);
-        state_holders.push(Some(state));
-    }
-
-    let order: Vec<InstanceId> = opts
-        .instances
-        .iter()
-        .map(|c| c.instance_id.clone())
-        .collect();
-
-    let mut idx_lookup: HashMap<InstanceId, usize> = HashMap::with_capacity(order.len());
-    for (i, id) in order.iter().enumerate() {
-        if idx_lookup.insert(id.clone(), i).is_some() {
-            anyhow::bail!("duplicate instance id in config: {id}");
-        }
-    }
-
-    let mut taken = state_holders;
-    let factory = |cfg: &InstanceConfig| {
-        let i = idx_lookup.get(&cfg.instance_id).copied().ok_or_else(|| {
-            raven_railgun_core::AdapterError::Internal(format!(
-                "no state holder for instance {}",
-                cfg.instance_id
-            ))
-        })?;
-        taken.get_mut(i).and_then(Option::take).ok_or_else(|| {
-            raven_railgun_core::AdapterError::Internal(format!(
-                "state holder already consumed for instance {}",
-                cfg.instance_id
-            ))
-        })
     };
 
     let handles = bootstrap_railgun_engine_multi_with_session_limits(
@@ -2835,6 +2890,36 @@ impl Drop for MirrorWorkers {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 mod tests {
+
+    mod stop_budget {
+        use super::super::run_stops_until;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        /// A final commit that never returns must not hold the stop past its budget, and the
+        /// ones that do return must all run, however many share the slots.
+        #[tokio::test]
+        async fn a_stop_that_never_finishes_is_abandoned_at_the_budget() {
+            let finished = Arc::new(AtomicUsize::new(0));
+            let mut stops: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> =
+                vec![Box::pin(std::future::pending())];
+            for _ in 0..5 {
+                let finished = Arc::clone(&finished);
+                stops.push(Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    finished.fetch_add(1, Ordering::SeqCst);
+                }));
+            }
+            let stop_by = tokio::time::Instant::now() + Duration::from_millis(600);
+            let unfinished =
+                tokio::time::timeout(Duration::from_secs(10), run_stops_until(stops, 2, stop_by))
+                    .await
+                    .expect("the stop outlived its budget");
+            assert_eq!(unfinished, 1);
+            assert_eq!(finished.load(Ordering::SeqCst), 5);
+        }
+    }
 
     /// The tree-fill watcher's decision, at the boundary that caused the tree-4 outage.
     ///

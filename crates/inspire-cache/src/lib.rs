@@ -302,6 +302,34 @@ impl OfflinePackingKeysCache {
         Ok(())
     }
 
+    /// Replace this cache's file with a hard link to `source`, so data directories holding the
+    /// same identity share one file on disk. The link lands under a temporary name and is renamed
+    /// into place, so a crash leaves either the old file or the link. `source` is not read: a
+    /// later [`Self::load`] validates what the link points to.
+    pub fn link_from(&self, source: &Path) -> Result<(), OfflinePackingKeysCacheError> {
+        if is_same_file(source, &self.path)? {
+            return Ok(());
+        }
+        let parent = self.path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "cache path has no parent")
+        })?;
+        fs::create_dir_all(parent)?;
+        let mut staged_name = self
+            .path
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cache path has no name"))?
+            .to_owned();
+        staged_name.push(format!(".link.{}.{}", std::process::id(), next_link_seq()));
+        let staged = self.path.with_file_name(staged_name);
+        fs::hard_link(source, &staged)?;
+        if let Err(error) = fs::rename(&staged, &self.path) {
+            let _ = fs::remove_file(&staged);
+            return Err(error.into());
+        }
+        raven_storage::fsync_parent_dir(parent)?;
+        Ok(())
+    }
+
     /// Load the cache or build and persist fresh query-independent cache parts.
     ///
     /// The returned flag is `true` only for a disk hit. The closure must not include
@@ -335,6 +363,32 @@ impl OfflinePackingKeysCache {
                 ))
             }
         }
+    }
+}
+
+fn next_link_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Whether both paths name one file. A missing `target` is not `source`.
+fn is_same_file(source: &Path, target: &Path) -> io::Result<bool> {
+    let target_meta = match fs::metadata(target) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let source_meta = fs::metadata(source)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(source_meta.dev() == target_meta.dev() && source_meta.ino() == target_meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (source_meta, target_meta);
+        Ok(false)
     }
 }
 
@@ -396,6 +450,40 @@ mod tests {
         changed = baseline.clone();
         changed.packing_param_id.push(0);
         assert_ne!(baseline.fingerprint(), changed.fingerprint());
+    }
+
+    #[test]
+    fn link_from_replaces_a_separate_copy_with_the_source_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = OfflinePackingKeysCache::new(dir.path().join("a"));
+        let target = OfflinePackingKeysCache::new(dir.path().join("b"));
+        fs::create_dir_all(source.path().parent().expect("parent")).expect("source dir");
+        fs::write(source.path(), b"validated keys").expect("source");
+        fs::create_dir_all(target.path().parent().expect("parent")).expect("target dir");
+        fs::write(target.path(), b"an older separate copy").expect("target");
+
+        target.link_from(source.path()).expect("link");
+        assert!(is_same_file(source.path(), target.path()).expect("stat"));
+        assert_eq!(fs::read(target.path()).expect("read"), b"validated keys");
+        target
+            .link_from(source.path())
+            .expect("linking a linked file is a no-op");
+        let staged = fs::read_dir(target.path().parent().expect("parent"))
+            .expect("list")
+            .count();
+        assert_eq!(staged, 1, "no staged link is left behind");
+    }
+
+    #[test]
+    fn link_from_a_missing_source_leaves_the_target_as_it_was() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = OfflinePackingKeysCache::new(dir.path());
+        fs::create_dir_all(target.path().parent().expect("parent")).expect("target dir");
+        fs::write(target.path(), b"own copy").expect("target");
+        target
+            .link_from(&dir.path().join("gone.bin"))
+            .expect_err("a missing source cannot be linked");
+        assert_eq!(fs::read(target.path()).expect("read"), b"own copy");
     }
 
     #[test]

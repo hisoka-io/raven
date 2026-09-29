@@ -104,6 +104,11 @@ impl PirScheme for RavenInspireScheme {
             .resolve(query.session_handle, Instant::now())?;
         let mut resolved = query.clone();
         resolved.session_handle = inner;
+        if holds_one_shard_for_all(&state.encoded_db)
+            && u64::from(resolved.shard_id) < state.encoded_db.config.num_shards()
+        {
+            resolved.shard_id = 0;
+        }
         let response = respond_seeded_inspiring_cached_with_session(
             state.crs.as_ref(),
             &state.encoded_db,
@@ -148,26 +153,167 @@ pub fn setup_state_with_inspiring_seed(
         .map_err(|e| AdapterError::Scheme(format!("inspire setup: {e}")))?;
     let cache = if let Some(seed) = inspiring_w_seed {
         crs.inspiring_w_seed = seed;
-        let cache = ServerInspiringCache::new(&crs, &encoded_db)
-            .map_err(|e| AdapterError::Scheme(format!("inspire setup cache: {e}")))?;
         crs.inspiring_pack_params = None;
         crs.inspiring_packing_key = None;
-        cache
+        shared_packing_cache(&crs, &encoded_db)?
     } else {
-        ServerInspiringCache::from_setup(&mut crs, &encoded_db)
-            .map_err(|e| AdapterError::Scheme(format!("inspire setup cache: {e}")))?
+        let built = ServerInspiringCache::from_setup(&mut crs, &encoded_db)
+            .map_err(|e| AdapterError::Scheme(format!("inspire setup cache: {e}")))?;
+        register_packing_cache(&crs, &encoded_db, built)
     };
     Ok((
         InspireServerState {
             crs: Arc::new(crs),
             encoded_db: Arc::new(encoded_db),
-            cache: Arc::new(cache),
+            cache,
             session_store: Arc::new(BoundedSessionStore::new()),
             variant,
             entry_size,
         },
         sk,
     ))
+}
+
+/// A fresh state for a cell that holds no rows yet, in which every shard encodes the same
+/// `shard_rows`. One encoded shard stands in for all of them until the first re-encode, which
+/// gives each shard its own copy: an empty block costs one shard, not the whole cell.
+///
+/// Served under `crs` when given, so every block of a list shares one client context; a new
+/// CRS is set up otherwise.
+///
+/// # Errors
+/// [`AdapterError::Scheme`] if `shard_rows` is not exactly one shard of `entry_size` rows, if
+/// `crs` was set up for other parameters or another row width, or if encoding fails.
+pub fn setup_unfilled_state(
+    params: &InspireParams,
+    shard_rows: &[u8],
+    total_entries: u64,
+    entry_size: usize,
+    variant: InspireVariant,
+    crs: Option<&Arc<ServerCrs>>,
+) -> Result<InspireServerState> {
+    require_wire_rung(params)?;
+    let config = ShardConfig::for_ring_dim(params.ring_dim, entry_size, total_entries)
+        .map_err(|e| AdapterError::Scheme(format!("unfilled cell geometry: {e}")))?;
+    let shard_len = usize::try_from(config.entries_per_shard())
+        .ok()
+        .and_then(|rows| rows.checked_mul(entry_size));
+    if shard_len != Some(shard_rows.len()) {
+        return Err(AdapterError::Scheme(format!(
+            "unfilled cell: one shard is {} rows of {entry_size} bytes, but {} bytes were given",
+            config.entries_per_shard(),
+            shard_rows.len()
+        )));
+    }
+    let (crs, one_shard, minted_cache) = if let Some(crs) = crs {
+        require_crs_fits(crs, params, entry_size)?;
+        let shard_config = ShardConfig {
+            total_entries: config.entries_per_shard(),
+            ..config.clone()
+        };
+        let shards = raven_inspire::encode_database(shard_rows, entry_size, params, &shard_config)
+            .map_err(|e| AdapterError::Scheme(format!("unfilled cell encode: {e}")))?;
+        (Arc::clone(crs), shards, None)
+    } else {
+        let mut sampler = GaussianSampler::new(params.sigma);
+        let (mut minted, one_shard, _sk) =
+            inspire_setup(params, shard_rows, entry_size, &mut sampler)
+                .map_err(|e| AdapterError::Scheme(format!("inspire setup: {e}")))?;
+        let cache = ServerInspiringCache::from_setup(&mut minted, &one_shard)
+            .map_err(|e| AdapterError::Scheme(format!("inspire setup cache: {e}")))?;
+        (Arc::new(minted), one_shard.shards, Some(cache))
+    };
+    let [first] = <[raven_inspire::ShardData; 1]>::try_from(one_shard).map_err(|shards| {
+        AdapterError::Scheme(format!(
+            "unfilled cell: one shard of rows encoded to {} shards",
+            shards.len()
+        ))
+    })?;
+    let encoded_db = EncodedDatabase {
+        shards: vec![raven_inspire::ShardData {
+            id: 0,
+            polynomials: first.polynomials,
+        }],
+        config,
+    };
+    let cache = match minted_cache {
+        Some(built) => register_packing_cache(&crs, &encoded_db, built),
+        None => shared_packing_cache(&crs, &encoded_db)?,
+    };
+    Ok(InspireServerState {
+        crs,
+        encoded_db: Arc::new(encoded_db),
+        cache,
+        session_store: Arc::new(BoundedSessionStore::new()),
+        variant,
+        entry_size,
+    })
+}
+
+fn require_crs_fits(crs: &ServerCrs, params: &InspireParams, entry_size: usize) -> Result<()> {
+    let columns = crate::pir_table::pir_cell_columns(entry_size);
+    if crs.params != *params || crs.inspiring_num_columns != columns {
+        return Err(AdapterError::Scheme(format!(
+            "the CRS was set up for {} packing columns under other parameters than this cell's \
+             {columns} columns; one client context cannot decode both",
+            crs.inspiring_num_columns
+        )));
+    }
+    Ok(())
+}
+
+/// Serve `state` under `crs`, which its encoded rows do not depend on, so one client context
+/// decodes it alongside every other state served under `crs`.
+///
+/// # Errors
+/// [`AdapterError::Scheme`] if `crs` was set up for other parameters or another row width.
+pub fn serve_under_crs(
+    state: InspireServerState,
+    crs: &Arc<ServerCrs>,
+) -> Result<InspireServerState> {
+    if Arc::ptr_eq(&state.crs, crs) {
+        return Ok(state);
+    }
+    require_crs_fits(crs, &state.crs.params, state.entry_size)?;
+    let cache = shared_packing_cache(crs, &state.encoded_db)?;
+    Ok(InspireServerState {
+        crs: Arc::clone(crs),
+        cache,
+        ..state
+    })
+}
+
+/// A cell whose one encoded shard stands in for every shard: see [`setup_unfilled_state`].
+fn holds_one_shard_for_all(encoded_db: &EncodedDatabase) -> bool {
+    encoded_db.config.num_shards() > 1
+        && encoded_db.shards.len() == 1
+        && encoded_db.shards.first().is_some_and(|shard| shard.id == 0)
+}
+
+/// Give every shard of an unfilled cell its own copy before any one is re-encoded.
+fn allocate_every_shard(encoded_db: &mut EncodedDatabase) -> Result<()> {
+    if !holds_one_shard_for_all(encoded_db) {
+        return Ok(());
+    }
+    let declared = u32::try_from(encoded_db.config.num_shards()).map_err(|_| {
+        AdapterError::Scheme(format!(
+            "unfilled cell declares {} shards, past a u32 shard id",
+            encoded_db.config.num_shards()
+        ))
+    })?;
+    let template = encoded_db
+        .shards
+        .first()
+        .map(|shard| shard.polynomials.clone())
+        .ok_or_else(|| AdapterError::Scheme("unfilled cell lost its shard".into()))?;
+    encoded_db.shards.reserve(declared as usize);
+    for id in 1..declared {
+        encoded_db.shards.push(raven_inspire::ShardData {
+            id,
+            polynomials: template.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// Cache-affecting fingerprint: the cache is a pure function of
@@ -184,17 +330,109 @@ impl InspireServerState {
     /// Cache-affecting fingerprint of this state.
     #[must_use]
     pub fn cache_fingerprint(&self) -> CacheFingerprint {
-        let num_columns = self
-            .encoded_db
-            .shards
-            .first()
-            .map_or(0, |s| s.polynomials.len());
-        CacheFingerprint {
-            params: self.crs.params.clone(),
-            num_columns,
-            inspiring_w_seed: self.crs.inspiring_w_seed,
+        fingerprint_for(&self.crs, &self.encoded_db)
+    }
+}
+
+fn fingerprint_for(crs: &ServerCrs, encoded_db: &EncodedDatabase) -> CacheFingerprint {
+    CacheFingerprint {
+        params: crs.params.clone(),
+        num_columns: encoded_db.shards.first().map_or(0, |s| s.polynomials.len()),
+        inspiring_w_seed: crs.inspiring_w_seed,
+    }
+}
+
+/// One packing cache per fingerprint per process. The cache is a pure function of its
+/// fingerprint, so instances that agree on one hold the same keys once rather than a copy each.
+struct PackingCacheEntry {
+    fingerprint: CacheFingerprint,
+    cache: std::sync::Weak<ServerInspiringCache>,
+    /// A validated copy on disk that other data dirs link to instead of writing their own.
+    file: Option<std::path::PathBuf>,
+}
+
+static PACKING_CACHES: parking_lot::Mutex<Vec<PackingCacheEntry>> =
+    parking_lot::Mutex::new(Vec::new());
+
+fn live_packing_cache(
+    registry: &mut Vec<PackingCacheEntry>,
+    fingerprint: &CacheFingerprint,
+) -> Option<(Arc<ServerInspiringCache>, Option<std::path::PathBuf>)> {
+    registry.retain(|entry| entry.cache.strong_count() > 0);
+    registry
+        .iter()
+        .find(|entry| entry.fingerprint == *fingerprint)
+        .and_then(|entry| Some((entry.cache.upgrade()?, entry.file.clone())))
+}
+
+fn record_packing_cache(
+    registry: &mut Vec<PackingCacheEntry>,
+    fingerprint: CacheFingerprint,
+    cache: &Arc<ServerInspiringCache>,
+    file: Option<std::path::PathBuf>,
+) {
+    if let Some(path) = file.as_ref() {
+        // A path now holds this fingerprint's keys, so no other entry may link to it.
+        for entry in registry.iter_mut() {
+            if entry.file.as_ref() == Some(path) {
+                entry.file = None;
+            }
         }
     }
+    if let Some(entry) = registry
+        .iter_mut()
+        .find(|entry| entry.fingerprint == fingerprint)
+    {
+        if entry.cache.strong_count() == 0 {
+            entry.cache = Arc::downgrade(cache);
+        }
+        if file.is_some() {
+            entry.file = file;
+        }
+    } else {
+        registry.push(PackingCacheEntry {
+            fingerprint,
+            cache: Arc::downgrade(cache),
+            file,
+        });
+    }
+}
+
+/// The live cache for `(crs, encoded_db)`, built and registered if no instance holds one.
+fn shared_packing_cache(
+    crs: &ServerCrs,
+    encoded_db: &EncodedDatabase,
+) -> Result<Arc<ServerInspiringCache>> {
+    let fingerprint = fingerprint_for(crs, encoded_db);
+    let mut registry = PACKING_CACHES.lock();
+    if let Some((cache, _)) = live_packing_cache(&mut registry, &fingerprint) {
+        cache
+            .validate_for(crs, encoded_db)
+            .map_err(|e| AdapterError::Scheme(format!("shared packing cache: {e}")))?;
+        return Ok(cache);
+    }
+    let built = Arc::new(
+        ServerInspiringCache::new(crs, encoded_db)
+            .map_err(|e| AdapterError::Scheme(format!("inspire cache build: {e}")))?,
+    );
+    record_packing_cache(&mut registry, fingerprint, &built, None);
+    Ok(built)
+}
+
+/// Register a cache built elsewhere, unless an instance already holds one for its fingerprint.
+fn register_packing_cache(
+    crs: &ServerCrs,
+    encoded_db: &EncodedDatabase,
+    built: ServerInspiringCache,
+) -> Arc<ServerInspiringCache> {
+    let fingerprint = fingerprint_for(crs, encoded_db);
+    let mut registry = PACKING_CACHES.lock();
+    if let Some((cache, _)) = live_packing_cache(&mut registry, &fingerprint) {
+        return cache;
+    }
+    let built = Arc::new(built);
+    record_packing_cache(&mut registry, fingerprint, &built, None);
+    built
 }
 
 /// Atomically swap in a new state, carrying the donor cache on fingerprint
@@ -222,9 +460,7 @@ pub fn swap_state(
         if new_num_columns != 0 && donor.cache_fingerprint() == new_fingerprint {
             Arc::clone(&donor.cache)
         } else {
-            let built = ServerInspiringCache::new(crs.as_ref(), &encoded_db)
-                .map_err(|e| AdapterError::Scheme(format!("inspire cache build: {e}")))?;
-            Arc::new(built)
+            shared_packing_cache(crs.as_ref(), &encoded_db)?
         };
     let new_state = InspireServerState {
         crs,
@@ -511,14 +747,52 @@ impl std::fmt::Debug for PersistedInspireState {
 /// Serialize an [`InspireServerState`] to legacy V5 bincode bytes. Prefer
 /// [`snapshot_inspire_state_v8`], which also embeds the [`LogicalLeafStore`].
 pub fn snapshot_inspire_state(state: &InspireServerState) -> Result<Vec<u8>> {
-    let bundle = PersistedInspireState {
-        crs: (*state.crs).clone(),
-        encoded_db: (*state.encoded_db).clone(),
-        variant: state.variant,
-        entry_size: state.entry_size,
-    };
-    bincode::serialize(&bundle)
+    serialize_after(&[], &PersistedInspireStateRef::of(state))
         .map_err(|e| AdapterError::Serialization(format!("snapshot serialize: {e}")))
+}
+
+/// Borrowing twin of [`PersistedInspireState`]. bincode writes a reference as the value behind
+/// it, so the bytes are the owned bundle's and a commit serializes the served state in place
+/// instead of cloning its encoded rows first.
+#[derive(serde::Serialize)]
+struct PersistedInspireStateRef<'a> {
+    crs: &'a ServerCrs,
+    encoded_db: &'a EncodedDatabase,
+    variant: InspireVariant,
+    entry_size: usize,
+}
+
+impl<'a> PersistedInspireStateRef<'a> {
+    fn of(state: &'a InspireServerState) -> Self {
+        Self {
+            crs: &state.crs,
+            encoded_db: &state.encoded_db,
+            variant: state.variant,
+            entry_size: state.entry_size,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct PersistedInspireStateV8Ref<'a> {
+    state: PersistedInspireStateRef<'a>,
+    store: &'a LogicalLeafStore,
+}
+
+/// `prefix` then the bincode body, in one buffer sized up front.
+fn serialize_after<T: serde::Serialize>(
+    prefix: &[u8],
+    body: &T,
+) -> std::result::Result<Vec<u8>, bincode::Error> {
+    let body_len = usize::try_from(bincode::serialized_size(body)?).map_err(|_| {
+        bincode::Error::from(bincode::ErrorKind::Custom(
+            "snapshot body is larger than this platform can address".to_owned(),
+        ))
+    })?;
+    let mut out = Vec::with_capacity(prefix.len().saturating_add(body_len));
+    out.extend_from_slice(prefix);
+    bincode::serialize_into(&mut out, body)?;
+    Ok(out)
 }
 
 /// V6 magic header, recognised only so a V6 body is refused by name; V5 raw bincode never
@@ -546,21 +820,12 @@ pub fn snapshot_inspire_state_v8(
     state: &InspireServerState,
     store: &LogicalLeafStore,
 ) -> Result<Vec<u8>> {
-    let bundle = PersistedInspireStateV8 {
-        state: PersistedInspireState {
-            crs: (*state.crs).clone(),
-            encoded_db: (*state.encoded_db).clone(),
-            variant: state.variant,
-            entry_size: state.entry_size,
-        },
-        store: store.clone(),
+    let bundle = PersistedInspireStateV8Ref {
+        state: PersistedInspireStateRef::of(state),
+        store,
     };
-    let mut out = Vec::with_capacity(SNAPSHOT_V8_MAGIC.len() + 1024);
-    out.extend_from_slice(&SNAPSHOT_V8_MAGIC);
-    let body = bincode::serialize(&bundle)
-        .map_err(|e| AdapterError::Serialization(format!("v8 snapshot serialize: {e}")))?;
-    out.extend_from_slice(&body);
-    Ok(out)
+    serialize_after(&SNAPSHOT_V8_MAGIC, &bundle)
+        .map_err(|e| AdapterError::Serialization(format!("v8 snapshot serialize: {e}")))
 }
 
 /// Decode a snapshot body, REFUSING surplus bytes.
@@ -604,12 +869,11 @@ pub fn restore_inspire_state(bytes: &[u8]) -> Result<InspireServerState> {
 
 fn bundle_to_state(bundle: PersistedInspireState) -> Result<InspireServerState> {
     validate_persisted_state(&bundle)?;
-    let cache = ServerInspiringCache::new(&bundle.crs, &bundle.encoded_db)
-        .map_err(|e| AdapterError::Scheme(format!("restore cache build: {e}")))?;
+    let cache = shared_packing_cache(&bundle.crs, &bundle.encoded_db)?;
     Ok(InspireServerState {
         crs: Arc::new(bundle.crs),
         encoded_db: Arc::new(bundle.encoded_db),
-        cache: Arc::new(cache),
+        cache,
         session_store: Arc::new(BoundedSessionStore::new()),
         variant: bundle.variant,
         entry_size: bundle.entry_size,
@@ -631,49 +895,112 @@ fn cache_identity(
     )
 }
 
+/// The recovered state's cache, and whether this data dir now holds a validated copy of it on
+/// disk without a rebuild. A cache another instance of this process already holds is shared, and
+/// its validated file is linked into this data dir; otherwise the dir's own file is read.
 fn cache_for_recovery(
     data_dir: &std::path::Path,
     crs: &ServerCrs,
     encoded_db: &EncodedDatabase,
-) -> Result<(ServerInspiringCache, bool, bool)> {
+) -> Result<(Arc<ServerInspiringCache>, bool, bool)> {
     use super::offline_packing_keys_cache::{CacheLoad, OfflinePackingKeysCache};
 
     let identity = cache_identity(crs, encoded_db);
+    let fingerprint = fingerprint_for(crs, encoded_db);
     let disk = OfflinePackingKeysCache::new(data_dir);
-    if let CacheLoad::Hit(parts) = disk.load(&identity) {
-        let cache = ServerInspiringCache::from_parts(parts.pack_params, parts.offline_keys);
-        match cache.validate_for(crs, encoded_db) {
-            Ok(()) => return Ok((cache, true, true)),
-            Err(error) => {
-                tracing::warn!(%error, "offline packing cache failed validation; rebuilding");
+    let mut registry = PACKING_CACHES.lock();
+    let shared = live_packing_cache(&mut registry, &fingerprint);
+    if let Some((cache, canonical)) = shared.as_ref() {
+        cache
+            .validate_for(crs, encoded_db)
+            .map_err(|e| AdapterError::Scheme(format!("shared packing cache: {e}")))?;
+        if let Some(canonical) = canonical.as_deref().filter(|path| *path != disk.path()) {
+            match disk.link_from(canonical) {
+                Ok(()) => {
+                    let linked = Some(disk.path().to_path_buf());
+                    record_packing_cache(&mut registry, fingerprint, cache, linked);
+                    return Ok((Arc::clone(cache), true, true));
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    "offline packing cache link failed; checking this data dir's own copy"
+                ),
             }
         }
     }
-
-    let cache = ServerInspiringCache::new(crs, encoded_db)
-        .map_err(|e| AdapterError::Scheme(format!("restore cache build: {e}")))?;
-    let persisted = match disk.store(&identity, cache.pack_params(), cache.offline_keys()) {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(error = %error, "offline packing cache store failed; recovery remains correct");
-            false
+    let loaded = match disk.load(&identity) {
+        CacheLoad::Hit(parts) => {
+            let cache = ServerInspiringCache::from_parts(parts.pack_params, parts.offline_keys);
+            match cache.validate_for(crs, encoded_db) {
+                Ok(()) => Some(cache),
+                Err(error) => {
+                    tracing::warn!(%error, "offline packing cache failed validation; rebuilding");
+                    None
+                }
+            }
         }
+        CacheLoad::Miss(_) => None,
     };
-    Ok((cache, false, persisted))
+    let hit = loaded.is_some();
+    let cache = match (shared, loaded) {
+        (Some((cache, _)), _) => cache,
+        (None, Some(loaded)) => Arc::new(loaded),
+        (None, None) => Arc::new(
+            ServerInspiringCache::new(crs, encoded_db)
+                .map_err(|e| AdapterError::Scheme(format!("restore cache build: {e}")))?,
+        ),
+    };
+    let persisted = hit
+        || match disk.store(&identity, cache.pack_params(), cache.offline_keys()) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(error = %error, "offline packing cache store failed; recovery remains correct");
+                false
+            }
+        };
+    let file = persisted.then(|| disk.path().to_path_buf());
+    record_packing_cache(&mut registry, fingerprint, &cache, file);
+    Ok((cache, hit, persisted))
 }
 
 pub(crate) fn persist_inspiring_cache(
     data_dir: &std::path::Path,
     state: &InspireServerState,
 ) -> Result<()> {
-    let identity = cache_identity(&state.crs, &state.encoded_db);
-    super::offline_packing_keys_cache::OfflinePackingKeysCache::new(data_dir)
-        .store(
-            &identity,
-            state.cache.pack_params(),
-            state.cache.offline_keys(),
-        )
-        .map_err(|e| AdapterError::Internal(format!("offline packing cache store: {e}")))
+    use super::offline_packing_keys_cache::OfflinePackingKeysCache;
+
+    let disk = OfflinePackingKeysCache::new(data_dir);
+    let fingerprint = state.cache_fingerprint();
+    let mut registry = PACKING_CACHES.lock();
+    let canonical = live_packing_cache(&mut registry, &fingerprint)
+        .and_then(|(_, file)| file)
+        .filter(|path| path != disk.path());
+    if let Some(canonical) = canonical {
+        match disk.link_from(&canonical) {
+            Ok(()) => {
+                let linked = Some(disk.path().to_path_buf());
+                record_packing_cache(&mut registry, fingerprint, &state.cache, linked);
+                return Ok(());
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "offline packing cache link failed; writing this data dir's own copy"
+            ),
+        }
+    }
+    disk.store(
+        &cache_identity(&state.crs, &state.encoded_db),
+        state.cache.pack_params(),
+        state.cache.offline_keys(),
+    )
+    .map_err(|e| AdapterError::Internal(format!("offline packing cache store: {e}")))?;
+    record_packing_cache(
+        &mut registry,
+        fingerprint,
+        &state.cache,
+        Some(disk.path().to_path_buf()),
+    );
+    Ok(())
 }
 
 /// Refused before a byte of the body is read. No V6 or V7 writer survives, so a decoder for
@@ -742,7 +1069,7 @@ pub(crate) fn restore_inspire_state_v6_cached(
         let state = InspireServerState {
             crs: Arc::new(bundle.state.crs),
             encoded_db: Arc::new(bundle.state.encoded_db),
-            cache: Arc::new(cache),
+            cache,
             session_store: Arc::new(BoundedSessionStore::new()),
             variant: bundle.state.variant,
             entry_size: bundle.state.entry_size,
@@ -770,7 +1097,7 @@ pub(crate) fn restore_inspire_state_v6_cached(
         let state = InspireServerState {
             crs: Arc::new(bundle.crs),
             encoded_db: Arc::new(bundle.encoded_db),
-            cache: Arc::new(cache),
+            cache,
             session_store: Arc::new(BoundedSessionStore::new()),
             variant: bundle.variant,
             entry_size: bundle.entry_size,
@@ -779,7 +1106,8 @@ pub(crate) fn restore_inspire_state_v6_cached(
     }
 }
 
-/// Re-encode a single shard from a raw byte buffer in place.
+/// Re-encode a single shard from a raw byte buffer in place. An unfilled cell first gives
+/// every shard its own copy of the one it holds.
 ///
 /// # Errors
 /// [`AdapterError::Scheme`] if the shape is rejected or `shard_bytes` re-shards
@@ -792,6 +1120,7 @@ pub fn re_encode_shard(
     shard_bytes: &[u8],
     entry_size: usize,
 ) -> Result<()> {
+    allocate_every_shard(encoded_db)?;
     let total_shards = encoded_db.shards.len();
     let existing = encoded_db
         .shards
@@ -975,6 +1304,49 @@ mod snapshot_v6_tests {
         let (state, _sk) =
             setup_state(&params, &db, entry_size, InspireVariant::TwoPacking).expect("setup");
         (state, db)
+    }
+
+    // The borrowed writer must emit the owned bundle's exact bytes, or every snapshot it writes
+    // is one the reader cannot decode.
+    #[test]
+    fn a_borrowed_snapshot_is_byte_identical_to_the_owned_bundle() {
+        let (state, _) = toy_state_and_db();
+        let mut store = LogicalLeafStore::new();
+        let encoder =
+            crate::pir_table::PerLeafCommitmentEncoder::new(32, 2048, 0).expect("encoder");
+        super::apply_wal_entry(
+            &mut store,
+            &raven_railgun_persistence::WalEntryPayload::AppendLeaf {
+                tree_number: 0,
+                leaf_index: 0,
+                commitment: [3; 32],
+            },
+            7,
+            &encoder,
+        )
+        .expect("leaf");
+        let owned = super::PersistedInspireState {
+            crs: (*state.crs).clone(),
+            encoded_db: (*state.encoded_db).clone(),
+            variant: state.variant,
+            entry_size: state.entry_size,
+        };
+        assert_eq!(
+            snapshot_inspire_state(&state).expect("v5"),
+            bincode::serialize(&owned).expect("owned v5")
+        );
+        let mut owned_v8 = SNAPSHOT_V8_MAGIC.to_vec();
+        owned_v8.extend(
+            bincode::serialize(&super::PersistedInspireStateV8 {
+                state: owned,
+                store: store.clone(),
+            })
+            .expect("owned v8"),
+        );
+        assert_eq!(
+            snapshot_inspire_state_v8(&state, &store).expect("v8"),
+            owned_v8
+        );
     }
 
     #[test]
@@ -1621,6 +1993,150 @@ mod re_encode_tests {
             msg.contains("999"),
             "error should name the missing shard id: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod unfilled_cell_tests {
+    use super::{
+        build_client_session, build_seeded_query, extract_response, re_encode_shard,
+        restore_inspire_state_v6, setup_unfilled_state, snapshot_inspire_state_v8,
+        InspireServerState, LogicalLeafStore, RavenInspireScheme,
+    };
+    use crate::PirScheme;
+    use raven_inspire::math::GaussianSampler;
+    use raven_inspire::params::{InspireParams, InspireVariant};
+    use raven_inspire::rlwe::RlweSecretKey;
+    use std::sync::Arc;
+
+    const ENTRY: usize = 32;
+    const ROWS_PER_SHARD: usize = 2048;
+
+    fn unfilled() -> InspireServerState {
+        setup_unfilled_state(
+            &InspireParams::secure_128_d2048(),
+            &vec![0x11; ROWS_PER_SHARD * ENTRY],
+            65_536,
+            ENTRY,
+            InspireVariant::TwoPacking,
+            None,
+        )
+        .expect("unfilled cell")
+    }
+
+    fn decode(state: &InspireServerState, row: usize) -> Vec<u8> {
+        let params = InspireParams::secure_128_d2048();
+        let mut sampler = GaussianSampler::new(params.sigma);
+        let secret = RlweSecretKey::generate(&params, &mut sampler);
+        let session = build_client_session((*state.crs).clone(), secret, &params).expect("session");
+        let (client_state, query) =
+            build_seeded_query(&session, state.shard_config(), row as u64, &params).expect("query");
+        let response = RavenInspireScheme::respond(state, &query).expect("respond");
+        extract_response(&state.crs, &client_state, &response, ENTRY).expect("extract")
+    }
+
+    #[test]
+    fn an_unfilled_cell_serves_every_shard_from_its_one_encoding_across_a_restart() {
+        let state = unfilled();
+        assert_eq!(state.encoded_db.shards.len(), 1);
+        assert_eq!(decode(&state, 7 * ROWS_PER_SHARD + 5), vec![0x11; ENTRY]);
+
+        let bytes = snapshot_inspire_state_v8(&state, &LogicalLeafStore::new()).expect("snapshot");
+        let (restored, _) = restore_inspire_state_v6(&bytes).expect("restore");
+        assert_eq!(restored.encoded_db.shards.len(), 1);
+        assert_eq!(decode(&restored, 31 * ROWS_PER_SHARD), vec![0x11; ENTRY]);
+    }
+
+    #[test]
+    fn the_first_re_encode_gives_every_shard_its_own_copy() {
+        let state = unfilled();
+        let mut encoded = (*state.encoded_db).clone();
+        re_encode_shard(
+            &mut encoded,
+            &InspireParams::secure_128_d2048(),
+            3,
+            &vec![0x22; ROWS_PER_SHARD * ENTRY],
+            ENTRY,
+        )
+        .expect("re-encode one shard of an unfilled cell");
+        assert_eq!(encoded.shards.len(), 32);
+        let state = InspireServerState {
+            encoded_db: Arc::new(encoded),
+            ..state
+        };
+        assert_eq!(decode(&state, 3 * ROWS_PER_SHARD + 9), vec![0x22; ENTRY]);
+        assert_eq!(decode(&state, 5 * ROWS_PER_SHARD + 9), vec![0x11; ENTRY]);
+        assert_eq!(decode(&state, 9), vec![0x11; ENTRY]);
+    }
+}
+
+#[cfg(test)]
+mod packing_cache_registry_tests {
+    use super::{
+        cache_for_recovery, cache_identity, persist_inspiring_cache, setup_unfilled_state,
+        InspireServerState,
+    };
+    use crate::offline_packing_keys_cache::{CacheLoad, OfflinePackingKeysCache};
+    use raven_inspire::params::{InspireParams, InspireVariant};
+    use std::path::Path;
+
+    const ENTRY: usize = 32;
+
+    /// Each call sets up a CRS of its own, so each state has its own packing keys.
+    fn own_keys() -> InspireServerState {
+        setup_unfilled_state(
+            &InspireParams::secure_128_d2048(),
+            &vec![0x11; 2048 * ENTRY],
+            65_536,
+            ENTRY,
+            InspireVariant::TwoPacking,
+            None,
+        )
+        .expect("unfilled cell")
+    }
+
+    fn holds_keys_of(dir: &Path, state: &InspireServerState) -> bool {
+        let identity = cache_identity(&state.crs, &state.encoded_db);
+        matches!(
+            OfflinePackingKeysCache::new(dir).load(&identity),
+            CacheLoad::Hit(_)
+        )
+    }
+
+    /// Dir `a` holds the first keys, then is linked to the second's; a third dir that later
+    /// asks for the first keys must not be linked to `a`.
+    fn relinked_dir_is_not_offered_as_its_old_keys(relink: impl Fn(&Path, &InspireServerState)) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (a, b, c) = (
+            root.path().join("a"),
+            root.path().join("b"),
+            root.path().join("c"),
+        );
+        let (first, second) = (own_keys(), own_keys());
+        cache_for_recovery(&a, &first.crs, &first.encoded_db).expect("a holds the first keys");
+        cache_for_recovery(&b, &second.crs, &second.encoded_db).expect("b holds the second");
+        relink(&a, &second);
+        assert!(holds_keys_of(&a, &second), "a is linked to the second keys");
+
+        cache_for_recovery(&c, &first.crs, &first.encoded_db).expect("c asks for the first keys");
+        assert!(
+            holds_keys_of(&c, &first),
+            "c was linked to a file that no longer holds the keys it was recorded for"
+        );
+    }
+
+    #[test]
+    fn a_dir_relinked_on_recovery_is_not_offered_as_its_old_keys() {
+        relinked_dir_is_not_offered_as_its_old_keys(|dir, state| {
+            cache_for_recovery(dir, &state.crs, &state.encoded_db).expect("relink on recovery");
+        });
+    }
+
+    #[test]
+    fn a_dir_relinked_on_persist_is_not_offered_as_its_old_keys() {
+        relinked_dir_is_not_offered_as_its_old_keys(|dir, state| {
+            persist_inspiring_cache(dir, state).expect("relink on persist");
+        });
     }
 }
 
