@@ -93,14 +93,17 @@ expect "catching up resolves behind" '[[ $out == *"RESOLVED"*behind* && ! -s $st
 
 reset unanswered
 serve 200 syncing 206559 0 0
-run RAVEN_BEHIND_SECS=1
+run RAVEN_BEHIND_SECS=100
+read -r clock_key clock_since <"$state.behind"
+echo "$clock_key $((clock_since - 1000))" >"$state.behind"
+backdated=$(cat "$state.behind")
 serve 503 syncing 206559 0 0
 echo "" >"$fake/body"
-sleep 2
-run RAVEN_BEHIND_SECS=1
+run RAVEN_BEHIND_SECS=100
+expect "a run the node does not answer leaves the behind clock as it was" '[[ $(cat "$state.behind") == "$backdated" ]]'
 serve 200 syncing 206559 0 0
-run RAVEN_BEHIND_SECS=1
-expect "a run the node does not answer keeps the behind clock" '[[ $out == *"alert behind: "*syncing* ]]'
+run RAVEN_BEHIND_SECS=100
+expect "the kept clock raises behind once the node answers again" '[[ $out == *"alert behind: "*syncing* ]]'
 
 reset silent
 serve 200 caught_up 363278 5000 0
