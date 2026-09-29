@@ -16,7 +16,7 @@ COPY rust-toolchain.toml Cargo.toml Cargo.lock README.md ./
 COPY crates ./crates
 COPY benches ./benches
 COPY adapters/railgun ./adapters/railgun
-RUN cargo build --release \
+RUN cargo build --release --locked \
         --manifest-path adapters/railgun/Cargo.toml \
         --bin raven-railgun-ppoi-replay
 

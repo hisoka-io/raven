@@ -1,7 +1,9 @@
 # Operator binary image for raven-railgun. Build context MUST be the repo
 # root, since the adapter path-depends on crates/ outside its own workspace:
 #   docker build -t raven-railgun -f adapters/railgun/Dockerfile .
-# Shutdown can wait 5 s per instance; run with --stop-timeout 60 so a slow disk never cuts the final commit.
+# SIGTERM starts the node's 8 s stop budget: a final commit still running when it is spent is
+# abandoned, and its instance recovers from its last snapshot and WAL. Stops have been measured
+# past Docker's default 10 s stop timeout, so run with --stop-timeout 30.
 
 FROM rust:1.98.0-slim-bookworm AS build
 RUN apt-get update \
@@ -19,7 +21,7 @@ COPY crates ./crates
 COPY benches ./benches
 COPY adapters/railgun ./adapters/railgun
 
-RUN cargo build --release \
+RUN cargo build --release --locked \
         --manifest-path adapters/railgun/Cargo.toml \
         --bin raven-railgun
 RUN strip /build/adapters/railgun/target/release/raven-railgun || true
@@ -49,6 +51,7 @@ VOLUME ["/srv/raven/data", "/srv/raven/secrets"]
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=60s \
     CMD curl -f http://localhost:8080/v1/health/ready || exit 1
+STOPSIGNAL SIGTERM
 USER raven:raven
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/raven-railgun"]
 CMD ["serve-production", "--config", "/srv/raven/secrets/mainnet.toml"]

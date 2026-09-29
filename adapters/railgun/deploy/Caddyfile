@@ -1,0 +1,22 @@
+# deploy.sh runs this in a Caddy container on the host network and sets the RAVEN_* values.
+{
+	# Nothing reconfigures it at runtime: deploy.sh replaces the container.
+	admin off
+	# IPv4 only: the node's rate limit keys an IPv6 client per /128, and one client holds a /64.
+	# tcp4 because a bare 0.0.0.0 opens a dual-stack socket that also accepts IPv6.
+	default_bind tcp4/{$RAVEN_BIND_ADDRESS:0.0.0.0}
+	http_port {$RAVEN_HTTP_PORT:80}
+	https_port {$RAVEN_HTTPS_PORT:443}
+	# TCP only, the ports the security group opens: no HTTP/3 listener on UDP.
+	servers {
+		protocols h1 h2
+	}
+}
+
+{$RAVEN_HOSTNAME} {
+	reverse_proxy 127.0.0.1:{$RAVEN_PORT:8080} {
+		# The node takes a trusted proxy's cf-connecting-ip as the client address; a client's
+		# own must not reach it. Caddy already replaces a client's X-Forwarded-For.
+		header_up -Cf-Connecting-Ip
+	}
+}
