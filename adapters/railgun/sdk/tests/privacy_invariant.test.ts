@@ -56,6 +56,7 @@ describe("RavenPOINodeInterface privacy invariant", () => {
 
   function sdk(): RavenPOINodeInterface {
     return new RavenPOINodeInterface({
+      captureWireRequests: true,
       ...forestConfig({ endpoint: server.url, listKeyHex: fixture.meta.list_key_hex, ctx }),
       bearerToken: TOKEN,
     });

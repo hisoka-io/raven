@@ -80,6 +80,7 @@ function stubCtx(): ClientPirContext {
 function pathSdk(endpoint: string, index = LOCAL_LEAF, root?: string): RavenPOINodeInterface {
   const block = Math.floor(index / 65_536);
   return new RavenPOINodeInterface({
+    captureWireRequests: true,
     ...forestConfig({
       endpoint,
       listKeyHex: LIST_KEY_HEX,
@@ -128,6 +129,7 @@ describe("client-PIR auth-path reconstruction", () => {
     // Queries whose bytes do not depend on the target, so only the SDK's own framing is judged.
     const opaque = stubCtx();
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       ...forestConfig({
         endpoint: server.url,
         listKeyHex: LIST_KEY_HEX,
@@ -173,6 +175,7 @@ describe("client-PIR auth-path reconstruction", () => {
       return Buffer.from(sibling).toString("hex");
     });
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: server.url,
       bearerToken: TOKEN,
       clientPirContexts: new Map([[`t2Path:1:${LIST_KEY_HEX}`, stubCtx()]]),
@@ -285,6 +288,7 @@ describe("multi-chain routing", () => {
       { chainId: 11_155_111, endpoint: sepoliaServer.url, bearerToken: TOKEN },
     ]);
     const sdkMainnet = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: "ignored",
       bearerToken: TOKEN,
       chainId: 1,
@@ -293,6 +297,7 @@ describe("multi-chain routing", () => {
       poiListIndexStore: false,
     });
     const sdkSepolia = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: "ignored",
       bearerToken: TOKEN,
       chainId: 11_155_111,
@@ -379,6 +384,7 @@ describe("input validation hardening", () => {
 
   it("getPOIsPerList rejects malformed BC hex pre-flight", async () => {
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: "http://localhost:1",
       bearerToken: TOKEN,
     });
@@ -395,6 +401,7 @@ describe("input validation hardening", () => {
 
   it("getPOIsPerList rejects wrong-length list_key pre-flight", async () => {
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: "http://localhost:1",
       bearerToken: TOKEN,
     });
@@ -446,6 +453,7 @@ describe("status matrix on the device (BC type x POI status)", () => {
         },
       );
       const sdk = new RavenPOINodeInterface({
+        captureWireRequests: true,
         ...forestConfig({ endpoint: server.url, listKeyHex: LIST_KEY_HEX, ctx: stubCtx() }),
         bearerToken: TOKEN,
         upstreamFallbackEndpoint: `${server.url}/`,
@@ -469,12 +477,13 @@ describe("status matrix on the device (BC type x POI status)", () => {
       },
     );
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       ...forestConfig({ endpoint: server.url, listKeyHex: LIST_KEY_HEX, ctx: stubCtx() }),
       bearerToken: TOKEN,
     });
     await expect(
       sdk.getPOIsPerList([LIST_KEY_HEX], [{ blindedCommitment: BC_HEX, type: "Transact" }]),
-    ).rejects.toSatisfy((e: unknown) => RavenError.is(e, "ServerError"));
+    ).rejects.toSatisfy((e: unknown) => RavenError.is(e, "ServerError") && e.retryable);
   });
 });
 
@@ -502,6 +511,18 @@ describe("typed RavenError taxonomy", () => {
     expect(err.context.status).toBe(400);
     expect(err.context.serverWireSchemaVersion).toBe(2);
     expect(err.context.clientWireSchemaVersion).toBe(1);
+  });
+
+  it("only a network failure or a transient status is retryable", () => {
+    expect(RavenError.network("boom").retryable).toBe(true);
+    for (const status of [408, 429, 500, 502, 503, 504]) {
+      expect(RavenError.serverError("boom", { status }).retryable, `status ${status}`).toBe(true);
+    }
+    for (const status of [undefined, 200, 400, 404, 409, 416, 600]) {
+      expect(RavenError.serverError("boom", { status }).retryable, `status ${status}`).toBe(false);
+    }
+    expect(RavenError.invalidQuery("boom", { status: 503 }).retryable).toBe(false);
+    expect(RavenError.decodeError("boom", { status: 503 }).retryable).toBe(false);
   });
 
   it("RavenError extends Error so legacy try/catch consumers see a message", () => {

@@ -2,7 +2,7 @@
 # Proves the packed SDK is installable and usable by a wallet that has no checkout of
 # this repo, and that the tarball carries exactly the surface it means to carry.
 #
-# Three things a green `pnpm test` cannot see, because the suite imports `../src` directly:
+# What a green `pnpm test` cannot see, because the suite imports `../src` directly:
 #   1. `main`/`types`/`exports` can point at TypeScript sources. A consumer then resolves
 #      a `.ts` file at runtime and node refuses it - the suite never notices, because it
 #      never resolves the package by name.
@@ -14,6 +14,9 @@
 #   4. A runtime dependency on a repo-relative `file:` path installs "successfully" and
 #      leaves the consumer a dangling link. Plain `npm ls` exits 0 on that tree; only
 #      `--all` reports it.
+#   5. The package must carry the repository's LICENSE, byte for byte.
+#   6. No `exports` target may be TypeScript source: a subpath mapped to `.ts` hands a consumer
+#      that imports it a file node refuses, and the probes below import only the root.
 #
 # Everything here is offline. The one registry dependency is packed out of the SDK's own
 # installed tree, and the optional engine peer is met by a stand-in, so no network call is made
@@ -79,7 +82,7 @@ node -e '
 const { readdirSync, writeFileSync } = require("node:fs");
 const pkgDir = process.argv[1];
 const modules = readdirSync(`${pkgDir}/src`).filter((f) => f.endsWith(".ts")).map((f) => f.slice(0, -3));
-const expected = ["package.json", "README.md", ...modules.map((m) => `src/${m}.ts`)];
+const expected = ["package.json", "README.md", "LICENSE", ...modules.map((m) => `src/${m}.ts`)];
 for (const format of ["cjs", "esm"]) {
   expected.push(`dist/${format}/package.json`);
   for (const m of modules) expected.push(`dist/${format}/${m}.js`, `dist/${format}/${m}.d.ts`);
@@ -91,6 +94,23 @@ if ! diff -u "${WORK}/expected.txt" "${WORK}/actual.txt" > "${WORK}/contents.dif
   fail "pack-contents: the tarball is not the intended surface (-expected +actual above)"
 fi
 echo "  ok    pack contents: $(wc -l < "${WORK}/actual.txt") files, exactly the derived surface"
+
+node -e '
+const exportsMap = require(process.argv[1]).exports;
+const targets = [];
+const walk = (node) => {
+  if (typeof node === "string") targets.push(node);
+  else if (node !== null && typeof node === "object") Object.values(node).forEach(walk);
+};
+walk(exportsMap);
+const source = targets.filter((t) => /\.(c|m)?ts$/.test(t) && !/\.d\.(c|m)?ts$/.test(t));
+if (source.length > 0) { console.error(source.join(", ")); process.exit(1); }
+' "${PKG}/package.json" || fail "exports-typescript: an exports target is TypeScript source"
+echo "  ok    exports: no target is TypeScript source"
+
+cmp -s <(tar -xOzf "$tarball" package/LICENSE) "${ADAPTER_ROOT}/../../LICENSE" \
+  || fail "license: the packed LICENSE is not the repository's LICENSE"
+echo "  ok    license: the repository's LICENSE"
 
 # The two emits differ only by a nested `type` marker, and losing one is silent until a
 # consumer's first require/import.

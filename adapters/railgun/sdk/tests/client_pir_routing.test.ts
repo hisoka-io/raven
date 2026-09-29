@@ -2,7 +2,7 @@
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { RavenError, RavenPOINodeInterface } from "../src/index";
+import { RavenError, RavenPOINodeInterface, type RavenConfig } from "../src/index";
 import { forestConfig } from "./helpers/forest";
 import { startMockServer, type MockServer } from "./helpers/mock_server";
 import { PATH10_ROW_BYTES } from "./helpers/path10_row";
@@ -28,8 +28,13 @@ describe("client-PIR routing + pre-flight", () => {
     server.reset();
   });
 
-  function servedSdk(endpoint = server.url, placed: [string, number][] = []): RavenPOINodeInterface {
+  function servedSdk(
+    endpoint = server.url,
+    placed: [string, number][] = [],
+    options: Pick<RavenConfig, "captureWireRequests"> = { captureWireRequests: true },
+  ): RavenPOINodeInterface {
     return new RavenPOINodeInterface({
+      ...options,
       ...forestConfig({
         endpoint,
         listKeyHex: LIST_KEY_HEX,
@@ -41,13 +46,13 @@ describe("client-PIR routing + pre-flight", () => {
   }
 
   it("getPOIsPerList refuses a list with no context before any request", async () => {
-    const sdk = new RavenPOINodeInterface({ endpoint: server.url, bearerToken: TOKEN });
+    const sdk = new RavenPOINodeInterface({ captureWireRequests: true, endpoint: server.url, bearerToken: TOKEN });
     await expect(sdk.getPOIsPerList([LIST_KEY_HEX], SHIELD)).rejects.toThrow(/does not serve it/);
     expect(sdk.lastWireRequests().length).toBe(0);
   });
 
   it("getPOIMerkleProofs refuses a list with no context before any request", async () => {
-    const sdk = new RavenPOINodeInterface({ endpoint: server.url, bearerToken: TOKEN });
+    const sdk = new RavenPOINodeInterface({ captureWireRequests: true, endpoint: server.url, bearerToken: TOKEN });
     await expect(sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX])).rejects.toThrow(
       /no t2Path context/,
     );
@@ -71,6 +76,7 @@ describe("client-PIR routing + pre-flight", () => {
     mountPrefixChannel(server, lkA, { commitments: [BC_HEX] });
     mountPrefixChannel(server, lkB, { commitments: [commitmentAt(0)] });
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: server.url,
       bearerToken: TOKEN,
       clientPirContexts: new Map([
@@ -139,9 +145,9 @@ describe("client-PIR routing + pre-flight", () => {
         return true;
       },
     );
-    const sdk = new RavenPOINodeInterface({ endpoint: server.url, bearerToken: TOKEN });
-    // Mirrors the cap literal in captureRequest (src/raven-poi-node-interface.ts); the ring
-    // retains a request body per slot, so its size is a security-relevant quantity.
+    const sdk = new RavenPOINodeInterface({ captureWireRequests: true, endpoint: server.url, bearerToken: TOKEN });
+    // Mirrors WIRE_CAPTURE_CAP (src/raven-poi-node-interface.ts); the ring retains a request
+    // body per slot, so its size is a security-relevant quantity.
     const WIRE_RING_CAP = 64;
     // each fetch 404s but records into the ring first; 70 > the 64 cap
     for (let i = 0; i < WIRE_RING_CAP + 6; i += 1) {
@@ -156,8 +162,19 @@ describe("client-PIR routing + pre-flight", () => {
     expect(sdk.lastWireRequests().length).toBe(WIRE_RING_CAP);
   });
 
+  it("retains no request unless the caller opts in", async () => {
+    const sdk = servedSdk(server.url, [[BC_HEX, 3]], { captureWireRequests: undefined });
+    await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]).catch(() => undefined);
+    expect(server.requests.some((request) => request.method === "POST")).toBe(true);
+    expect((sdk as unknown as { capturedRequests: unknown }).capturedRequests).toBeUndefined();
+    expect(() => sdk.lastWireRequests()).toThrow(
+      expect.objectContaining({ kind: "InvalidQuery", message: expect.stringMatching(/capture is off/) }),
+    );
+    expect(() => sdk.resetWireCapture()).not.toThrow();
+  });
+
   it("resetWireCapture clears the ring", async () => {
-    const sdk = new RavenPOINodeInterface({ endpoint: server.url, bearerToken: TOKEN });
+    const sdk = new RavenPOINodeInterface({ captureWireRequests: true, endpoint: server.url, bearerToken: TOKEN });
     await sdk.syncPoiListIndex(LIST_KEY_HEX).catch(() => undefined);
     expect(sdk.lastWireRequests().length).toBe(1);
     sdk.resetWireCapture();
@@ -165,7 +182,7 @@ describe("client-PIR routing + pre-flight", () => {
   });
 
   it("lastWireRequests returns a fresh array (pushes cannot grow the ring)", async () => {
-    const sdk = new RavenPOINodeInterface({ endpoint: server.url, bearerToken: TOKEN });
+    const sdk = new RavenPOINodeInterface({ captureWireRequests: true, endpoint: server.url, bearerToken: TOKEN });
     await sdk.syncPoiListIndex(LIST_KEY_HEX).catch(() => undefined);
     const ring1 = sdk.lastWireRequests();
     const len1 = ring1.length;

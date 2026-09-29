@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 
 import { afterAll, describe, expect, it } from "vitest";
 
-import * as wasmPkg from "raven-inspire-client-wasm";
+import * as wasmPkg from "@hisoka-io/raven-inspire-client-wasm";
 
 import { decodeClientPirQueryBundle } from "../src/index";
 import type { RavenInspireClientSession, RavenInspireWasm } from "../src/index";

@@ -31,7 +31,7 @@ import { performance } from "node:perf_hooks";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import * as wasmPkg from "raven-inspire-client-wasm";
+import * as wasmPkg from "@hisoka-io/raven-inspire-client-wasm";
 import { decodeClientPirQueryBundle } from "../src/client-pir";
 import { decodeInstanceParams } from "../src/instance-params";
 import {

@@ -44,6 +44,7 @@ describe("privacy across every SDK call path", () => {
   function sdk(): RavenPOINodeInterface {
     mountPrefixChannel(server, fixture.meta.list_key_hex, { commitments: [...MEMBERS] });
     return new RavenPOINodeInterface({
+      captureWireRequests: true,
       ...forestConfig({ endpoint: server.url, listKeyHex: fixture.meta.list_key_hex, ctx }),
       bearerToken: TOKEN,
     });
@@ -177,6 +178,7 @@ describe("privacy across every SDK call path", () => {
   it("the index channel emits GETs with no body", async () => {
     mountPrefixChannel(server, fixture.meta.list_key_hex, { commitments: [] });
     const client = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: server.url,
       bearerToken: TOKEN,
       poiListIndexStore: false,

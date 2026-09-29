@@ -47,7 +47,7 @@ stage() { # name -> prints the staged package dir
   local dest="${PKGS}/$1"
   rm -rf "$dest"
   mkdir -p "$dest"
-  cp -a "${SDK}/src" "${SDK}/README.md" "${SDK}/package.json" "$dest/"
+  cp -a "${SDK}/src" "${SDK}/README.md" "${SDK}/LICENSE" "${SDK}/package.json" "$dest/"
   cp -a "${SDK}"/tsconfig*.json "$dest/"
   ln -s "${SDK}/node_modules" "${dest}/node_modules"
   printf '%s' "$dest"
@@ -96,7 +96,7 @@ mutate_manifest "$dir" 'manifest["dependencies"]["@railgun-community/engine"] = 
 expect_red hard-dependency "$dir" "single-instance (wallet-only)" wallet-only
 
 dir="$(stage required-peer)"
-mutate_manifest "$dir" 'manifest.pop("peerDependenciesMeta")' || exit 3
+mutate_manifest "$dir" 'del manifest["peerDependenciesMeta"]["@railgun-community/engine"]' || exit 3
 expect_red required-peer "$dir" "single-instance (wallet-only)" wallet-only
 
 dir="$(stage peer-excludes-pin)"

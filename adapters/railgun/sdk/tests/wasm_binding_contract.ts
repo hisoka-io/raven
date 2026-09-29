@@ -1,6 +1,6 @@
 // Typecheck only. Every binding site casts the package `as unknown as RavenInspireWasm`, which hides
 // an export the Rust build dropped until a test happens to call it. This assignment names it.
-import type * as builtWasm from "raven-inspire-client-wasm";
+import type * as builtWasm from "@hisoka-io/raven-inspire-client-wasm";
 
 import type { RavenInspireWasm } from "../src/index";
 

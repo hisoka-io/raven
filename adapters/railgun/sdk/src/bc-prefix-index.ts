@@ -39,9 +39,10 @@ export const BC_INDEX_RESUME_ALIGN_ROWS = 2_048;
 /**
  * One list's index, as served: prefixes packed back to back, position IS the global index.
  *
- * `epoch` is returned as the server stamps it, and for a PPOI list that is always 0: mirrored
- * rows carry no chain height. `total` is the quantity that moves when the list grows, so it is
- * what binds an index to the list a node serves.
+ * `epoch` is returned as the server stamps it, and for a mirrored PPOI list it stays 0 as the
+ * list grows: mirrored rows carry no chain height. `total` is the quantity that moves when the
+ * list grows, so it is what binds an index to the list a node serves; an epoch that differs from
+ * the held one names a different list, and the held index is discarded.
  */
 export interface BcPrefixIndex {
   /** The frontier segment's `x-raven-index-epoch`; 0 for a mirrored PPOI list. */
@@ -84,6 +85,24 @@ export function assertBcPrefixIndex(index: BcPrefixIndex, label: string): void {
   }
 }
 
+/** The node answered 416: its list ends before the cursor, at `total` rows when it said. */
+interface PastFrontier {
+  readonly pastFrontier: true;
+  readonly since: number;
+  readonly total: number | undefined;
+  readonly url: string;
+}
+
+type Walked = { readonly epoch: number; readonly total: number; readonly rows: Uint8Array };
+
+function pastFrontierRefusal(past: PastFrontier): RavenError {
+  return RavenError.staleAdapter(
+    `bc-prefixes: the node serves ${past.total === undefined ? "fewer than" : "only"} ` +
+      `${past.total ?? past.since} rows of this list`,
+    { url: past.url, status: 416 },
+  );
+}
+
 /**
  * Walk the channel from row `from` to the frontier.
  *
@@ -101,7 +120,7 @@ async function walkBcPrefixes(
   headers: Record<string, string>,
   from: number,
   onRequest?: (url: string) => void,
-): Promise<{ epoch: number; total: number; rows: Uint8Array }> {
+): Promise<Walked | PastFrontier> {
   const segments: Uint8Array[] = [];
   let since = from;
 
@@ -124,10 +143,14 @@ async function walkBcPrefixes(
       throw RavenError.network("fetchBcPrefixIndex", { url, cause: String(cause) });
     }
     if (res.status === 416) {
-      throw RavenError.staleAdapter(
-        `bc-prefixes: the node serves fewer than ${since} rows of this list`,
-        { url, status: res.status },
-      );
+      const total = res.headers.has(HEADER_TOTAL) ? headerInt(res, HEADER_TOTAL, url) : undefined;
+      if (total !== undefined && total >= since) {
+        throw RavenError.decodeError(
+          `bc-prefixes: a 416 for row ${since} reports ${total} rows, which would include it`,
+          { url },
+        );
+      }
+      return { pastFrontier: true, since, total, url };
     }
     if (!res.ok) {
       throw RavenError.serverError(`bc-prefixes: ${res.status}`, { url, status: res.status });
@@ -191,15 +214,9 @@ export async function fetchBcPrefixIndex(
   headers: Record<string, string>,
   onRequest?: (url: string) => void,
 ): Promise<BcPrefixIndex> {
-  const { epoch, total, rows } = await walkBcPrefixes(
-    fetchImpl,
-    endpoint,
-    listKeyHex,
-    headers,
-    0,
-    onRequest,
-  );
-  return { epoch, prefixes: rows, total };
+  const walked = await walkBcPrefixes(fetchImpl, endpoint, listKeyHex, headers, 0, onRequest);
+  if ("pastFrontier" in walked) throw pastFrontierRefusal(walked);
+  return { epoch: walked.epoch, prefixes: walked.rows, total: walked.total };
 }
 
 /**
@@ -209,10 +226,13 @@ export async function fetchBcPrefixIndex(
  * The list is append-only, so a row the index already holds can never change: a re-read row that
  * differs is the node contradicting an earlier answer, and a node serving fewer rows than the
  * index holds cannot show any absence current against it. Both are refused rather than absorbed.
+ * A frontier stamped with another epoch is another list: the held index is discarded and the
+ * whole list read again.
  *
  * An absence is answered from the index alone, so by default every held row is re-read and
  * compared. A caller whose rows this node already served or confirmed passes that count as
- * `confirmedRows`, and only the tail from the aligned cursor below it is re-read.
+ * `confirmedRows`, and only the tail from the aligned cursor below it is re-read. A cursor past
+ * the node's list (416) resumes from the aligned cursor below the total the node reports.
  */
 export async function resumeBcPrefixIndex(
   fetchImpl: typeof fetch,
@@ -229,9 +249,22 @@ export async function resumeBcPrefixIndex(
       `bc-prefixes: confirmedRows must be a non-negative integer, got ${String(confirmedRows)}`,
     );
   }
+  const aligned = (rows: number): number => rows - (rows % BC_INDEX_RESUME_ALIGN_ROWS);
   const trusted = Math.min(confirmedRows, held.total);
-  const from = trusted - (trusted % BC_INDEX_RESUME_ALIGN_ROWS);
-  const walked = await walkBcPrefixes(fetchImpl, endpoint, listKeyHex, headers, from, onRequest);
+  let from = aligned(trusted);
+  let walk = await walkBcPrefixes(fetchImpl, endpoint, listKeyHex, headers, from, onRequest);
+  if ("pastFrontier" in walk) {
+    if (walk.total === undefined) throw pastFrontierRefusal(walk);
+    from = aligned(walk.total);
+    walk = await walkBcPrefixes(fetchImpl, endpoint, listKeyHex, headers, from, onRequest);
+    if ("pastFrontier" in walk) throw pastFrontierRefusal(walk);
+  }
+  const walked = walk;
+  if (walked.epoch !== held.epoch) {
+    return from === 0
+      ? { epoch: walked.epoch, prefixes: walked.rows, total: walked.total }
+      : fetchBcPrefixIndex(fetchImpl, endpoint, listKeyHex, headers, onRequest);
+  }
   if (walked.total < held.total) {
     throw RavenError.staleAdapter(
       `bc-prefixes: the node serves ${walked.total} rows of a list this index holds ` +

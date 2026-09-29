@@ -37,7 +37,10 @@ export function mountPrefixChannel(server: MockServer, listKeyHex: string, list:
       const since = Number(new URL(req.url ?? "", "http://mock.invalid").searchParams.get("since"));
       const total = list.commitments.length;
       if (since > total) {
-        res.writeHead(416);
+        res.writeHead(416, {
+          "x-raven-index-total": String(total),
+          "x-raven-index-epoch": String(list.epoch ?? 0),
+        });
         res.end();
         return true;
       }

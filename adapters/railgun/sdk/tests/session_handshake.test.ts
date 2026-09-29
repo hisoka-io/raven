@@ -39,6 +39,7 @@ function slotFor(url: string): Uint8Array {
 
 function sessionSdk(server: MockServer, context: ClientPirContext): RavenPOINodeInterface {
   return new RavenPOINodeInterface({
+    captureWireRequests: true,
     ...forestConfig({
       endpoint: server.url,
       listKeyHex: LIST_KEY,

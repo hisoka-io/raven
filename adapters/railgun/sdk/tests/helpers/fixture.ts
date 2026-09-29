@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import * as wasmPkg from "raven-inspire-client-wasm";
+import * as wasmPkg from "@hisoka-io/raven-inspire-client-wasm";
 
 import type { ClientPirContext, RavenInspireWasm } from "../../src/index";
 import { targetRecordingWasm } from "./private_wire";

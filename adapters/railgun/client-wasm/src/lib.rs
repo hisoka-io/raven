@@ -7,6 +7,12 @@ use wasm_bindgen::prelude::*;
 
 pub use raven_client::*;
 
+// The published wasm must refuse a served parameter set below the floors.
+const _: () = assert!(
+    raven_client::PARAMETER_FLOORS_ENFORCED,
+    "raven-client was built with unfloored-test-params"
+);
+
 // Must match raven-railgun-engine::imt::TREE_DEPTH; duplicated to keep this crate
 // a leaf in the WASM dep graph.
 const PATH_INDEX_TREE_DEPTH: u32 = 16;

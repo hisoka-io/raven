@@ -45,6 +45,7 @@ describe("per-network deployments + validation", () => {
     it(`SDK works against a ${net.name} (chain ${net.chainId}) operator`, async () => {
       mountPrefixChannel(server, LIST_KEY_HEX, { commitments: [BC_HEX] });
       const sdk = new RavenPOINodeInterface({
+        captureWireRequests: true,
         ...forestConfig({
           endpoint: server.url,
           listKeyHex: LIST_KEY_HEX,
@@ -66,6 +67,7 @@ describe("per-network deployments + validation", () => {
   it("does not serve a list whose context is keyed for another chain", async () => {
     mountPrefixChannel(server, LIST_KEY_HEX, { commitments: [BC_HEX] });
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       ...forestConfig({ endpoint: server.url, listKeyHex: LIST_KEY_HEX, ctx: targetNamingCtx() }),
       chainId: 137,
       bearerToken: TOKEN,
@@ -79,6 +81,7 @@ describe("per-network deployments + validation", () => {
     // removable with the whole suite green. Assert the observable consequence instead.
     mountPrefixChannel(server, LIST_KEY_HEX, { commitments: [] });
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: `${server.url}/`,
       bearerToken: TOKEN,
       poiListIndexStore: false,
@@ -91,7 +94,7 @@ describe("per-network deployments + validation", () => {
   });
 
   it("answers an empty map per commitment for empty list keys, and nothing to the engine", async () => {
-    const sdk = new RavenPOINodeInterface({ endpoint: server.url, bearerToken: TOKEN });
+    const sdk = new RavenPOINodeInterface({ captureWireRequests: true, endpoint: server.url, bearerToken: TOKEN });
     await expect(sdk.getPOIsPerList([], SHIELD)).resolves.toEqual({ [BC_HEX]: {} });
     await expect(
       sdk.getPOIsPerList("V2_PoseidonMerkle", { type: 0, id: 1 }, [], SHIELD),
@@ -102,6 +105,7 @@ describe("per-network deployments + validation", () => {
   it("accepts empty blinded commitments", async () => {
     mountPrefixChannel(server, LIST_KEY_HEX, { commitments: [BC_HEX] });
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       ...forestConfig({ endpoint: server.url, listKeyHex: LIST_KEY_HEX, ctx: targetNamingCtx() }),
       bearerToken: TOKEN,
     });
@@ -123,6 +127,7 @@ describe("per-network deployments + validation", () => {
         },
       );
       const sdk = new RavenPOINodeInterface({
+        captureWireRequests: true,
         endpoint: server.url,
         bearerToken: TOKEN,
         upstreamFallbackEndpoint: `${server.url}/`,
@@ -141,6 +146,7 @@ describe("per-network deployments + validation", () => {
     };
     mountPrefixChannel(server, LIST_KEY_HEX, { commitments: [] });
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: server.url,
       bearerToken: TOKEN,
       fetchImpl: customFetch,
@@ -153,6 +159,7 @@ describe("per-network deployments + validation", () => {
   it("the index channel carries the bearer token", async () => {
     mountPrefixChannel(server, LIST_KEY_HEX, { commitments: [] });
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: server.url,
       bearerToken: TOKEN,
       poiListIndexStore: false,

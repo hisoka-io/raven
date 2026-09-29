@@ -1,9 +1,9 @@
 {
   "generator": "emit_test_fixture",
-  "generator_git_commit": "10c7cdc48b07975e6f6879a3b145b1d906422f92",
-  "generated_unix_ms": 1790012583019,
+  "generator_git_commit": "ea6ef92fa17a08d76ac5433337f73f1e964942fb",
+  "generated_unix_ms": 1790658531427,
   "inspire_params": {
-    "ring_dim": 256,
+    "ring_dim": 2048,
     "q": 1152921504606830593,
     "crt_moduli": [
       1152921504606830593
@@ -21,22 +21,22 @@
     {
       "name": "inspire_params.bin",
       "bytes": 76,
-      "sha256": "65bcec67fed71798360c585f525e774deee2ec47408a27148a7f34d6c7ef7b6b"
+      "sha256": "e612cfc52717e6fc7aa326492e6f3aa16040640ab5bc2964c760ce19c7938061"
     },
     {
       "name": "crs.bin",
-      "bytes": 94964,
-      "sha256": "3dbd12b5a417c3e7f4a0a2912fabf25e80542cc94bfc7e3a3b2c861da096926d"
+      "bytes": 196,
+      "sha256": "3b0a2ed11b20e5899c3ef102f821636c0e6fde37720a7a54dfc68002b8bbed3d"
     },
     {
       "name": "shard_config.bin",
       "bytes": 24,
-      "sha256": "f939aec5de0237025ac7976005ad1f1483550af94f5dab0bf98178355d151405"
+      "sha256": "6ec1c9a86f51e2b6ee985af728b4c10c2fa63c4fccd1910dc49bed3de89a2030"
     },
     {
       "name": "params_bundle.bin",
-      "bytes": 2093,
-      "sha256": "11bbcb37c203d9a7b5859cb6554d0917d5a59f266a8907d9e92f6aeb3e988610"
+      "bytes": 15533,
+      "sha256": "27a1a966f10b784f37904a3689114c498d753cc0baff02dec02a662d776fe081"
     },
     {
       "name": "list_key.bin",
@@ -65,8 +65,8 @@
     },
     {
       "name": "response_for_idx_0.bin",
-      "bytes": 1302,
-      "sha256": "887755b03b95407202cc2fc28840c3923efe28fac0b8178ec1cb9f9d6129ff38"
+      "bytes": 9366,
+      "sha256": "2c8afae3b4691a63e8e88f761132ab45c87fc1a3ff1c0ed43672930f3e6d0d5c"
     },
     {
       "name": "bc_for_idx_1.bin",
@@ -85,8 +85,8 @@
     },
     {
       "name": "response_for_idx_1.bin",
-      "bytes": 1302,
-      "sha256": "b13a84235912eccea093964466307365d99737fe12c4c38b2068f7aab227039b"
+      "bytes": 9366,
+      "sha256": "89cde1fda524e77aeb5f1050b1154dce35862ab64e171d8a042bfc2b8f658925"
     },
     {
       "name": "bc_for_idx_2.bin",
@@ -105,8 +105,8 @@
     },
     {
       "name": "response_for_idx_2.bin",
-      "bytes": 1302,
-      "sha256": "7562bbfa00fa4d048c5a72e61875b664bcbf4318a04f204d1d0052a8e6c02bcd"
+      "bytes": 9366,
+      "sha256": "fb9d5968f8523fad85f85c9f316f58d9e5a99939e4f1266b237358c446d202e4"
     },
     {
       "name": "bc_for_idx_3.bin",
@@ -125,8 +125,8 @@
     },
     {
       "name": "response_for_idx_3.bin",
-      "bytes": 1302,
-      "sha256": "795b9c4f6c0420435141408758de861f6c9e04ab658bcb444f5925dd0bb779e0"
+      "bytes": 9366,
+      "sha256": "5b5613a41464e40d5c03917f792ae376858e64ddc37253a651a6e47e841876cc"
     },
     {
       "name": "bc_for_idx_4.bin",
@@ -145,8 +145,8 @@
     },
     {
       "name": "response_for_idx_4.bin",
-      "bytes": 1302,
-      "sha256": "2bdb2686918590afa5de25d25d0b565c59cb4fddafb73d5b00233ae2678ed2a8"
+      "bytes": 9366,
+      "sha256": "4e3c1b9b5da7493df68ab97d1196b195cdf63edd00b280f1404cf72f84a04149"
     }
   ]
 }

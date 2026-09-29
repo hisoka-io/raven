@@ -425,6 +425,22 @@ describe("an unpinned PPOI path-10 fold is verified against the upstream aggrega
     expect(String((thrown as Error).message)).toContain("is not hexadecimal");
   });
 
+  // A JavaScript caller is not held to the Map's type: a pin passed as bytes or a bigint is a
+  // caller error with a typed refusal, not a TypeError from inside the fold.
+  it.each([
+    ["bytes", new Uint8Array(32)],
+    ["a bigint", 1n],
+  ])("refuses a caller pin given as %s as a caller error", async (_name, pin) => {
+    mountRowRoute(adapter, nodes);
+    const sdk = makeSdk(adapter, {
+      labels: [[`t2Path:${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, "ppoi-paths-ofac-1"]],
+      pinnedRoots: [[`${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, pin as unknown as string]],
+      pinUpstream: upstream.url,
+    });
+    await expectRejectsWith(sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]), "InvalidQuery");
+    expect(upstream.requests).toHaveLength(0);
+  });
+
   // An empty pin is a configuration mistake, not an absent pin. Falling through to upstream
   // would silently verify against a different party than the caller asked for, so the
   // interesting assertion is not that it throws but that it never reached the network.
@@ -521,11 +537,14 @@ describe("an unpinned PPOI path-10 fold is verified against the upstream aggrega
     const tip = BLOCK * 65_536 + 3;
     mountUpstream(upstream, {
       merklerootsLength: tip + 1,
-      // Ignores the requested range on purpose.
-      rows: () => [
-        { index: BLOCK * 65_536 - 1, root: trueRoot },
-        { index: tip, root: otherRoot },
-      ],
+      // The window query ignores its range on purpose; the one-leaf query finds the block filling.
+      rows: (start) =>
+        start === BLOCK_LAST_INDEX
+          ? []
+          : [
+              { index: BLOCK * 65_536 - 1, root: trueRoot },
+              { index: tip, root: otherRoot },
+            ],
     });
     let thrown: unknown;
     try {
@@ -632,9 +651,9 @@ describe("an unpinned PPOI path-10 fold is verified against the upstream aggrega
   });
 
   // A full tree has one root at its last leaf, and this answer is cached as immutable for the
-  // process lifetime. Unioning a second one would have made upstream's self-contradiction
-  // permanent and invisible.
-  it("refuses a frozen block whose zero-width query returns two different roots", async () => {
+  // process lifetime. A list holds one row per index, so a second row for the one leaf asked is
+  // refused before either root is read, let alone cached.
+  it("refuses a frozen block whose zero-width query returns two rows", async () => {
     mountRowRoute(adapter, nodes);
     mountUpstream(upstream, {
       rows: inRange([
@@ -653,11 +672,71 @@ describe("an unpinned PPOI path-10 fold is verified against the upstream aggrega
     } catch (e) {
       thrown = e;
     }
-    expect(String(thrown)).toMatch(/2 different roots; a frozen block has one/);
-    // The KIND, not just the message. Asserting only the substring is how this test passed
-    // while the refusal reached the caller as `InvalidQuery` -- "your configuration is wrong" --
-    // for an upstream contradicting itself. An audit caught it; this line is the cheap half.
+    expect(String(thrown)).toMatch(/with 2 rows; the range holds at most 1/);
+    // The KIND, not just the message: an upstream answer, never the caller's configuration.
+    expect(RavenError.is(thrown, "DecodeError"), `got ${String(thrown)}`).toBe(true);
+  });
+
+  // 50,000 rows to a one-leaf query were once decoded in full and filtered.
+  it("refuses a pin answer longer than the range it was asked for", async () => {
+    mountRowRoute(adapter, nodes);
+    const firstLeaf = BLOCK * LEAVES_PER_PPOI_BLOCK;
+    const flood = (count: number): EventRow[] =>
+      Array.from({ length: count }, (_unused, at) => ({ index: firstLeaf + at, root: trueRoot }));
+    for (const [script, message] of [
+      [{ rows: () => flood(50_000) }, /answered leaves \d+\.\.\d+ with 50000 rows; the range holds at most 1\)/],
+      [
+        { merklerootsLength: firstLeaf + 200, rows: (start: number) => (start === BLOCK_LAST_INDEX ? [] : flood(PIN_TAIL_WINDOW + 1)) },
+        new RegExp(`with ${PIN_TAIL_WINDOW + 1} rows; the range holds at most ${PIN_TAIL_WINDOW}\\)`),
+      ],
+    ] as const) {
+      upstream.reset();
+      mountUpstream(upstream, script);
+      const sdk = makeSdk(adapter, {
+        labels: [[`t2Path:${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, "ppoi-paths-ofac-1"]],
+        pinnedRoots: [],
+        pinUpstream: upstream.url,
+      });
+      let thrown: unknown;
+      try {
+        await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+      } catch (e) {
+        thrown = e;
+      }
+      expect(RavenError.is(thrown, "DecodeError"), `got ${String(thrown)}`).toBe(true);
+      expect(String((thrown as Error).message)).toMatch(message);
+    }
+  });
+
+  // A proxy's 503 body is no JSON-RPC answer. Read as a malformed one, it reached the wallet as a
+  // non-retryable kind, and a retry policy gave up on a node that was only restarting.
+  it.each([
+    ["an HTML page", "text/html", "<html>Service Unavailable</html>"],
+    ["a JSON body that is no JSON-RPC answer", "application/json", '{"status":"unavailable"}'],
+  ])("reports an upstream 503 with %s as a retryable server error", async (_name, type, body) => {
+    mountRowRoute(adapter, nodes);
+    upstream.route(
+      (req) => req.method === "POST",
+      (_req, _body, res) => {
+        res.writeHead(503, { "content-type": type });
+        res.end(body);
+        return true;
+      },
+    );
+    const sdk = makeSdk(adapter, {
+      labels: [[`t2Path:${MAINNET}:${LIST_KEY_HEX}:${BLOCK}`, "ppoi-paths-ofac-1"]],
+      pinnedRoots: [],
+      pinUpstream: upstream.url,
+    });
+    let thrown: unknown;
+    try {
+      await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+    } catch (e) {
+      thrown = e;
+    }
     expect(RavenError.is(thrown, "ServerError"), `got ${String(thrown)}`).toBe(true);
+    expect((thrown as RavenError).context.status).toBe(503);
+    expect((thrown as RavenError).retryable).toBe(true);
   });
 
   // The same wrapper, on the kind a retry policy actually cares about: a transient upstream

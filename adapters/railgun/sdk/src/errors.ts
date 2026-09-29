@@ -47,12 +47,16 @@ export type RavenErrorByKind<K extends RavenErrorKind> = K extends "StaleData"
 export class RavenError<C = RavenErrorContext> extends Error {
   public readonly kind: RavenErrorKind;
   public readonly context: C;
+  /** True when the same call may succeed later unchanged: a `Network` failure, or a
+   *  `ServerError` whose status is 408, 429 or 5xx. */
+  public readonly retryable: boolean;
 
   private constructor(kind: RavenErrorKind, message: string, context: C) {
     super(message);
     this.name = "RavenError";
     this.kind = kind;
     this.context = context;
+    this.retryable = kind === "Network" || (kind === "ServerError" && isTransientStatus(context));
     // Restores `instanceof RavenError` across a transpiled `extends`.
     Object.setPrototypeOf(this, RavenError.prototype);
   }
@@ -96,4 +100,9 @@ export class RavenError<C = RavenErrorContext> extends Error {
   static is<K extends RavenErrorKind>(err: unknown, kind: K): err is RavenErrorByKind<K> {
     return err instanceof RavenError && err.kind === kind;
   }
+}
+
+function isTransientStatus(context: unknown): boolean {
+  const status = (context as { status?: unknown } | undefined)?.status;
+  return typeof status === "number" && (status === 408 || status === 429 || (status >= 500 && status <= 599));
 }

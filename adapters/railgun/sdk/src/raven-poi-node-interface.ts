@@ -129,6 +129,9 @@ export interface RavenConfig {
    *  default. Without persistence a restart before a proof reaches the list can cost one
    *  resubmission. */
   submittedProofStore?: SubmittedProofStore;
+  /** Keep the last 64 outbound requests, bodies included, for `lastWireRequests()`. Off by
+   *  default: the bodies include proof submissions and encrypted queries. */
+  captureWireRequests?: boolean;
 }
 
 /** How index-derived absences were answered. */
@@ -196,7 +199,7 @@ class SessionHandleRefused extends Error {
   }
 }
 
-/** Captured outbound HTTP request; the privacy-invariant test harness asserts no BC bytes appear in any body. */
+/** One outbound request kept under `captureWireRequests`. */
 export interface CapturedWireRequest {
   url: string;
   method: string;
@@ -222,6 +225,7 @@ const ENGINE_BATCH_SIZE = 20;
 /** The verdicts engine's `TXOPOIListStatus` has. */
 const ENGINE_STATUSES: readonly string[] = ["Valid", "ShieldBlocked", "ProofSubmitted", "Missing"];
 const SESSION_QUERY_ATTEMPTS = 2;
+const WIRE_CAPTURE_CAP = 64;
 
 type UpstreamJsonRpcMethod =
   | "ppoi_validate_poi_merkleroots"
@@ -246,8 +250,10 @@ export class RavenPOINodeInterface {
   private readonly heldIndexes = new Map<string, BcPrefixIndex>();
   // Keys whose held rows this node served or confirmed; any other index is re-read in full.
   private readonly confirmedIndexes = new Set<string>();
-  // One sync per key at a time, so a slower one cannot land an older list over a newer one.
-  private readonly syncQueues = new Map<string, Promise<BcPrefixIndex>>();
+  // One sync or reset per key at a time, so a slower one cannot land an older list over a newer one.
+  private readonly syncQueues = new Map<string, Promise<unknown>>();
+  // Keys reset since construction: their `poiListIndexes` entry is no longer read.
+  private readonly droppedPreloads = new Set<string>();
   // One store read per key, awaited by every caller: a caller arriving mid-read gets its result.
   private readonly storeLoads = new Map<string, Promise<void>>();
   private readonly counters = {
@@ -255,8 +261,8 @@ export class RavenPOINodeInterface {
     staleIndexesCaught: 0,
   };
 
-  // Bounded ring for the privacy-invariant test harness.
-  private readonly capturedRequests: CapturedWireRequest[] = [];
+  // Undefined unless the caller opted in: nothing is retained by default.
+  private readonly capturedRequests: CapturedWireRequest[] | undefined;
   private readonly sessionHandshakes = new Map<string, Promise<bigint>>();
   private readonly clientPirIds = new Map<string, string>();
   private nextUpstreamRequestId = 1;
@@ -292,6 +298,7 @@ export class RavenPOINodeInterface {
         ? undefined
         : (config.poiListIndexStore ?? indexedDbPoiListIndexStore());
     this.submitted = new SubmittedProofs(config.submittedProofStore ?? memorySubmittedProofStore());
+    this.capturedRequests = config.captureWireRequests === true ? [] : undefined;
 
     if (config.chainRegistry) {
       this.registry = config.chainRegistry;
@@ -418,8 +425,14 @@ export class RavenPOINodeInterface {
     return this.registry.resolve(this.chainId);
   }
 
-  /** Test-only snapshot of recent captured requests; order is not guaranteed. */
+  /** The last 64 outbound requests in the order they were sent. Refused unless constructed with
+   *  `captureWireRequests: true`. */
   lastWireRequests(): CapturedWireRequest[] {
+    if (this.capturedRequests === undefined) {
+      throw RavenError.invalidQuery(
+        "lastWireRequests: wire capture is off; construct with captureWireRequests: true",
+      );
+    }
     return this.capturedRequests.map((r) => ({
       url: r.url,
       method: r.method,
@@ -427,9 +440,9 @@ export class RavenPOINodeInterface {
     }));
   }
 
-  /** Reset the captured wire-request ring. */
+  /** Drop every captured request. */
   resetWireCapture(): void {
-    this.capturedRequests.length = 0;
+    if (this.capturedRequests !== undefined) this.capturedRequests.length = 0;
   }
 
   /**
@@ -816,6 +829,32 @@ export class RavenPOINodeInterface {
     };
   }
 
+  /** Forget the index held for a list, in memory and in the store, so the next call reads the
+   *  whole list from the node again. Waits for a sync of that list already running. */
+  async resetPoiListIndex(listKey: string): Promise<void> {
+    validateListKeyHex(listKey);
+    const lkHex = normalizeHex(listKey);
+    const key = this.indexKey(lkHex);
+    await this.serialized(key, async () => {
+      // A restore still reading the store would otherwise land its record after the reset.
+      await this.storeLoads.get(key);
+      this.heldIndexes.delete(key);
+      this.confirmedIndexes.delete(key);
+      this.droppedPreloads.add(key);
+      this.storeLoads.set(key, Promise.resolve());
+      if (this.indexStore === undefined) return;
+      try {
+        // A zero-length record decodes as no index, so any store clears without a delete.
+        await this.indexStore.save(key, new Uint8Array(0));
+      } catch (cause) {
+        throw RavenError.invalidQuery(
+          `resetPoiListIndex: the index store could not clear list ${lkHex} (${String(cause)}); ` +
+            "the next run may resume the old index",
+        );
+      }
+    });
+  }
+
   indexCounters(): PoiIndexCounters {
     return { ...this.counters };
   }
@@ -828,7 +867,9 @@ export class RavenPOINodeInterface {
     const key = this.indexKey(lkHex);
     const held = this.heldIndexes.get(key);
     if (held !== undefined) return held;
-    const preloaded = this.poiListIndexes.get(`${this.chainId}:${lkHex}`);
+    const preloaded = this.droppedPreloads.has(key)
+      ? undefined
+      : this.poiListIndexes.get(`${this.chainId}:${lkHex}`);
     if (preloaded !== undefined) {
       this.heldIndexes.set(key, preloaded);
       return preloaded;
@@ -861,14 +902,12 @@ export class RavenPOINodeInterface {
 
   private syncIndex(lkHex: string): Promise<BcPrefixIndex> {
     const key = this.indexKey(lkHex);
+    return this.serialized(key, () => this.syncIndexNow(lkHex, key));
+  }
+
+  private serialized<T>(key: string, task: () => Promise<T>): Promise<T> {
     const prior = this.syncQueues.get(key);
-    const run =
-      prior === undefined
-        ? this.syncIndexNow(lkHex, key)
-        : prior.then(
-            () => this.syncIndexNow(lkHex, key),
-            () => this.syncIndexNow(lkHex, key),
-          );
+    const run = prior === undefined ? task() : prior.then(task, task);
     this.syncQueues.set(key, run);
     const settle = (): void => {
       if (this.syncQueues.get(key) === run) this.syncQueues.delete(key);
@@ -1350,8 +1389,8 @@ export class RavenPOINodeInterface {
       typeof ctx.wasm.install_server_session_handle !== "function"
     ) {
       throw RavenError.staleAdapter(
-        `client-PIR ${instanceLabel}: WASM lacks the remote-session exports; rebuild ` +
-          "raven-inspire-client-wasm before querying",
+        `client-PIR ${instanceLabel}: WASM lacks the remote-session exports; install the ` +
+          "@hisoka-io/raven-inspire-client-wasm this SDK names as a peer",
       );
     }
     const route = this.route();
@@ -1466,10 +1505,24 @@ export class RavenPOINodeInterface {
     try {
       decoded = await response.json();
     } catch (cause) {
+      if (!response.ok) {
+        throw RavenError.serverError(`upstream ${method}: HTTP ${response.status}`, {
+          url,
+          status: response.status,
+          cause: String(cause),
+        });
+      }
       throw RavenError.decodeError(`upstream ${method}: response is not valid JSON`, {
         url,
         status: response.status,
         cause: String(cause),
+      });
+    }
+    // A non-2xx is the status talking unless it carries this call's JSON-RPC error.
+    if (!response.ok && !isRpcErrorEnvelope(decoded, id)) {
+      throw RavenError.serverError(`upstream ${method}: HTTP ${response.status}`, {
+        url,
+        status: response.status,
       });
     }
     if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) {
@@ -1513,21 +1566,14 @@ export class RavenPOINodeInterface {
         { url, status: response.status },
       );
     }
-    if (!response.ok) {
-      throw RavenError.serverError(`upstream ${method}: HTTP ${response.status}`, {
-        url,
-        status: response.status,
-      });
-    }
     return envelope.result as T;
   }
 
   private captureRequest(url: string, method: string, body: Uint8Array): void {
-    const cap = 64;
-    if (this.capturedRequests.length >= cap) {
-      this.capturedRequests.shift();
-    }
-    this.capturedRequests.push({ url, method, body });
+    const ring = this.capturedRequests;
+    if (ring === undefined) return;
+    if (ring.length >= WIRE_CAPTURE_CAP) ring.shift();
+    ring.push({ url, method, body });
   }
 }
 
@@ -1657,9 +1703,29 @@ function copyForBody(src: Uint8Array): Blob {
   return new Blob([buf], { type: "application/octet-stream" });
 }
 
+/** A JSON-RPC 2.0 error answer to request `id`, and nothing else. */
+function isRpcErrorEnvelope(decoded: unknown, id: number): boolean {
+  if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) return false;
+  const envelope = decoded as Record<string, unknown>;
+  const error = envelope.error;
+  return (
+    envelope.jsonrpc === "2.0" &&
+    envelope.id === id &&
+    !Object.prototype.hasOwnProperty.call(envelope, "result") &&
+    typeof error === "object" &&
+    error !== null &&
+    !Array.isArray(error) &&
+    Number.isInteger((error as Record<string, unknown>).code) &&
+    typeof (error as Record<string, unknown>).message === "string"
+  );
+}
+
 /** A malformed pin can never equal a fold, so without these checks a caller's own typo would
  *  surface as `DecodeError`, the kind that blames the node for forging the path. */
-function checkedPinnedRoot(pin: string, rootKey: string, label: string): string {
+function checkedPinnedRoot(pin: unknown, rootKey: string, label: string): string {
+  if (typeof pin !== "string") {
+    throw RavenError.invalidQuery(`${label}: pinned root for ${rootKey} is a ${typeof pin}, not a hex string`);
+  }
   const normalizedPin = normalizeHex(pin);
   if (normalizedPin.length !== ROOT_HEX_CHARS) {
     throw RavenError.invalidQuery(

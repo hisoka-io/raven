@@ -72,6 +72,7 @@ describe("upstream-passthrough endpoints", () => {
 
   it("refuses validation when no upstream is configured", async () => {
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: server.url,
       bearerToken: TOKEN,
     });
@@ -92,6 +93,7 @@ describe("upstream-passthrough endpoints", () => {
       },
     );
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: server.url,
       bearerToken: TOKEN,
       upstreamFallbackEndpoint: server.url,
@@ -108,6 +110,7 @@ describe("upstream-passthrough endpoints", () => {
       },
     );
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: server.url,
       bearerToken: TOKEN,
       upstreamFallbackEndpoint: server.url,
@@ -127,6 +130,7 @@ describe("upstream-passthrough endpoints", () => {
       },
     );
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: server.url,
       bearerToken: TOKEN,
       upstreamFallbackEndpoint: server.url,
@@ -162,6 +166,7 @@ describe("upstream-passthrough endpoints", () => {
       },
     );
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: server.url,
       bearerToken: TOKEN,
       upstreamFallbackEndpoint: server.url,
@@ -196,6 +201,7 @@ describe("upstream-passthrough endpoints", () => {
         },
       );
       const sdk = new RavenPOINodeInterface({
+        captureWireRequests: true,
         endpoint: server.url,
         bearerToken: TOKEN,
         upstreamFallbackEndpoint: server.url,
@@ -223,6 +229,7 @@ describe("upstream-passthrough endpoints", () => {
       },
     );
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: server.url,
       bearerToken: TOKEN,
       upstreamFallbackEndpoint: server.url,
@@ -236,8 +243,35 @@ describe("upstream-passthrough endpoints", () => {
     }
   });
 
+  it.each([
+    ["a text page", "text/plain", "Service Unavailable"],
+    ["a JSON body that is no JSON-RPC answer", "application/json", '{"error":"overloaded"}'],
+  ])("an upstream 503 with %s surfaces as a retryable ServerError", async (_name, type, body) => {
+    server.route(
+      (req) => req.url === "/",
+      (_req, _body, res) => {
+        res.writeHead(503, { "content-type": type });
+        res.end(body);
+        return true;
+      },
+    );
+    const sdk = new RavenPOINodeInterface({
+      endpoint: server.url,
+      bearerToken: TOKEN,
+      upstreamFallbackEndpoint: server.url,
+    });
+    const thrown = await sdk.validatePOIMerkleroots(LIST_KEY_HEX, [ROOT_A]).then(
+      () => expect.fail("expected a refusal"),
+      (error: unknown) => error,
+    );
+    expect(RavenError.is(thrown, "ServerError"), String(thrown)).toBe(true);
+    expect((thrown as RavenError).context.status).toBe(503);
+    expect((thrown as RavenError).retryable).toBe(true);
+  });
+
   it("submitPOI requires upstream", async () => {
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: server.url,
       bearerToken: TOKEN,
     });
@@ -271,6 +305,7 @@ describe("upstream-passthrough endpoints", () => {
       },
     );
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: server.url,
       bearerToken: TOKEN,
       upstreamFallbackEndpoint: server.url,
@@ -317,6 +352,7 @@ describe("upstream-passthrough endpoints", () => {
       },
     );
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: server.url,
       bearerToken: TOKEN,
       upstreamFallbackEndpoint: server.url,
@@ -352,6 +388,7 @@ describe("upstream-passthrough endpoints", () => {
 
   it("submitLegacyTransactProofs requires upstream", async () => {
     const sdk = new RavenPOINodeInterface({
+      captureWireRequests: true,
       endpoint: server.url,
       bearerToken: TOKEN,
     });

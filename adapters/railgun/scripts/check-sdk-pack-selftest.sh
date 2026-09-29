@@ -10,6 +10,8 @@
 #               leaves a dangling link, which is the state this repo shipped.
 #   mutation D: the SDK loads engine at runtime. Engine is a peer the SDK uses for types alone,
 #               and the gate's stand-in for it throws when loaded.
+#   mutation E: a LICENSE that is not the repository's.
+#   mutation F: a subpath export mapped to TypeScript source, which the root-import probes miss.
 #
 # The real tree is never written to and no git command is run.
 set -uo pipefail
@@ -41,7 +43,7 @@ stage() { # name -> prints the staged package dir
   local dest="${PKGS}/$1"
   rm -rf "$dest"
   mkdir -p "$dest"
-  cp -a "${SDK}/src" "${SDK}/README.md" "${SDK}/package.json" "$dest/"
+  cp -a "${SDK}/src" "${SDK}/README.md" "${SDK}/LICENSE" "${SDK}/package.json" "$dest/"
   cp -a "${SDK}"/tsconfig*.json "$dest/"
   ln -s "${SDK}/node_modules" "${dest}/node_modules"
   # Stands in for the real test tier, so mutation B shows the defect class it names.
@@ -96,8 +98,12 @@ expect_red no-files-allowlist \
   'manifest.pop("files", None)' \
   "pack-contents"
 
+expect_red ts-subpath-export \
+  'manifest["exports"]["./src/*"] = "./src/*.ts"' \
+  "exports-typescript"
+
 expect_red dangling-file-dependency \
-  'manifest.setdefault("dependencies", collections.OrderedDict())["raven-inspire-client-wasm"] = "file:../client-wasm/pkg-node"' \
+  'manifest.setdefault("dependencies", collections.OrderedDict())["@hisoka-io/raven-inspire-client-wasm"] = "file:../client-wasm/pkg-node"' \
   "dependency-tree"
 
 dest="$(stage engine-at-runtime)"
@@ -113,4 +119,17 @@ if ! /usr/bin/grep -q "the SDK loaded @railgun-community/engine at runtime" "${S
 fi
 echo "  ok    engine-at-runtime: refused, naming the engine load"
 
-echo "check-sdk-pack-selftest: the pack gate refuses a TypeScript entry point, an unrestricted pack, a dangling dependency and a runtime engine load."
+dest="$(stage foreign-license)"
+printf 'MIT License\n' > "${dest}/LICENSE"
+if run_gate "$dest" "${SCRATCH}/foreign-license.log"; then
+  echo "check-sdk-pack-selftest: foreign-license: the gate PASSED a package it must refuse" >&2
+  exit 1
+fi
+if ! /usr/bin/grep -q "license: the packed LICENSE is not the repository's" "${SCRATCH}/foreign-license.log"; then
+  echo "check-sdk-pack-selftest: foreign-license: the gate failed, but not for the reason under test" >&2
+  tail -n 30 "${SCRATCH}/foreign-license.log" >&2
+  exit 1
+fi
+echo "  ok    foreign-license: refused, naming the license"
+
+echo "check-sdk-pack-selftest: the pack gate refuses a TypeScript entry point, an unrestricted pack, a dangling dependency, a runtime engine load, a foreign license and a TypeScript subpath export."

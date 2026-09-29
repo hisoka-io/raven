@@ -605,7 +605,7 @@ describe("PPOI acceptance smoke against the real deployment", () => {
   liveIt(
     "a known commitment's status and path, each verified against the aggregator",
     async () => {
-      const wasm = (await import("raven-inspire-client-wasm")) as unknown as RavenInspireWasm;
+      const wasm = (await import("@hisoka-io/raven-inspire-client-wasm")) as unknown as RavenInspireWasm;
       installPanicHook(wasm);
       const report = await runPpoiSmoke({
         node: LIVE_URL as string,

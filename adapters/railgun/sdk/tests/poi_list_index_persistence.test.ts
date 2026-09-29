@@ -8,6 +8,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 
 import {
   LEAVES_PER_PPOI_BLOCK,
+  RavenError,
   RavenPOINodeInterface,
   indexedDbPoiListIndexStore,
   type PoiListIndexStore,
@@ -356,5 +357,116 @@ describe("the browser store", () => {
       rows: 3,
       candidates: [2],
     });
+  });
+});
+
+describe("an index the node no longer vouches for", () => {
+  let server: MockServer;
+  beforeAll(async () => {
+    server = await startMockServer();
+  });
+  afterAll(async () => {
+    await server.close();
+  });
+  afterEach(() => {
+    server.reset();
+  });
+
+  function client(store: PoiListIndexStore): RavenPOINodeInterface {
+    return new RavenPOINodeInterface({
+      endpoint: server.url,
+      bearerToken: TOKEN,
+      clientPirContexts: new Map([[`t2Path:1:${LIST_KEY_HEX}`, targetNamingCtx()]]),
+      poiListIndexStore: store,
+    });
+  }
+
+  const prefixRequests = (): string[] =>
+    server.requests.filter((r) => r.url.includes("/bc-prefixes")).map((r) => r.url);
+  const since = (row: number): string => `/v1/poi/${LIST_KEY_HEX}/bc-prefixes?since=${row}`;
+
+  it("resetPoiListIndex clears the held and stored index, so the next sync reads the whole list", async () => {
+    const list = listOf(2_050);
+    mountPrefixChannel(server, LIST_KEY_HEX, list);
+    const store = new MemoryStore();
+    const sdk = client(store);
+    await sdk.syncPoiListIndex(LIST_KEY_HEX);
+    server.requests.length = 0;
+
+    await sdk.resetPoiListIndex(LIST_KEY_HEX);
+    await expect(sdk.poiListIndexCandidates(LIST_KEY_HEX, commitmentAt(1))).rejects.toThrow(
+      /no index is held/,
+    );
+    await expect(client(store).poiListIndexCandidates(LIST_KEY_HEX, commitmentAt(1))).rejects.toThrow(
+      /no index is held/,
+    );
+    expect((await sdk.syncPoiListIndex(LIST_KEY_HEX)).total).toBe(2_050);
+    expect(prefixRequests()).toStrictEqual([since(0)]);
+  });
+
+  it("resetPoiListIndex also drops an index the caller preloaded", async () => {
+    const list = listOf(3);
+    mountPrefixChannel(server, LIST_KEY_HEX, list);
+    const sdk = new RavenPOINodeInterface({
+      endpoint: server.url,
+      bearerToken: TOKEN,
+      poiListIndexes: new Map([[`1:${LIST_KEY_HEX}`, prefixIndexOf(list.commitments)]]),
+      poiListIndexStore: false,
+    });
+    await sdk.resetPoiListIndex(LIST_KEY_HEX);
+    await expect(sdk.poiListIndexCandidates(LIST_KEY_HEX, commitmentAt(1))).rejects.toThrow(
+      /no index is held/,
+    );
+  });
+
+  it("discards a stored index stamped with another epoch and reads the node's list again", async () => {
+    const list: MockList = { ...listOf(2_050), epoch: 5 };
+    mountPrefixChannel(server, LIST_KEY_HEX, list);
+    const store = new MemoryStore();
+    await client(store).syncPoiListIndex(LIST_KEY_HEX);
+    // Another list under the same key: a row below the resume cursor differs as well.
+    list.commitments[7] = commitmentAt(90_000);
+    list.epoch = 6;
+    server.requests.length = 0;
+
+    const synced = await client(store).syncPoiListIndex(LIST_KEY_HEX);
+
+    expect(synced.epoch).toBe(6);
+    expect(prefixRequests()).toStrictEqual([since(2_048), since(0)]);
+    const again = client(store);
+    expect(await again.poiListIndexCandidates(LIST_KEY_HEX, commitmentAt(90_000))).toStrictEqual({
+      rows: 2_050,
+      candidates: [7],
+    });
+  });
+
+  it("resumes a 416 from the total the node reports, and re-reads a re-bootstrapped list", async () => {
+    const list: MockList = listOf(4_100);
+    mountPrefixChannel(server, LIST_KEY_HEX, list);
+    const store = new MemoryStore();
+    await client(store).syncPoiListIndex(LIST_KEY_HEX);
+    list.commitments.length = 3_000;
+    list.epoch = 1;
+    server.requests.length = 0;
+
+    const synced = await client(store).syncPoiListIndex(LIST_KEY_HEX);
+
+    expect(synced).toMatchObject({ epoch: 1, total: 3_000 });
+    expect(prefixRequests()).toStrictEqual([since(4_096), since(2_048), since(0)]);
+  });
+
+  it("resumes a 416 from the node's total and still refuses a shorter list under the same epoch", async () => {
+    const list = listOf(4_100);
+    mountPrefixChannel(server, LIST_KEY_HEX, list);
+    const store = new MemoryStore();
+    await client(store).syncPoiListIndex(LIST_KEY_HEX);
+    list.commitments.length = 3_000;
+    server.requests.length = 0;
+
+    await expect(client(store).syncPoiListIndex(LIST_KEY_HEX)).rejects.toSatisfy(
+      (e: unknown) =>
+        RavenError.is(e, "StaleAdapter") && /serves 3000 rows of a list this index holds 4100/.test(e.message),
+    );
+    expect(prefixRequests()).toStrictEqual([since(4_096), since(2_048)]);
   });
 });

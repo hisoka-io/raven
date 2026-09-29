@@ -53,7 +53,7 @@ trap cleanup EXIT
 # Copy every package file that affects `npm pack`. node_modules becomes real directories holding
 # links, so a file the copy's suite creates there stays in the copy.
 cp -a "${SDK}/src" "${SDK}/tests" "${SDK}/tsconfig.json" "${SDK}/package.json" \
-  "${SDK}/README.md" "${SDK}/pnpm-lock.yaml" "${SDK}/.gitignore" "$work/"
+  "${SDK}/README.md" "${SDK}/LICENSE" "${SDK}/pnpm-lock.yaml" "${SDK}/.gitignore" "$work/"
 mkdir -p "$work/node_modules"
 cp -as "${SDK}/node_modules/." "$work/node_modules/"
 

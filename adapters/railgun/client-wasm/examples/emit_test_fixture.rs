@@ -23,23 +23,33 @@ use raven_inspire::params::InspireParams;
 use raven_inspire::pir::mod_switch::{mod_switch_response_checked, MOD_SWITCH_TARGET_36BIT};
 use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::setup as inspire_setup;
+use raven_inspire::ServerCrs;
 use raven_inspire_client_wasm::{build_seeded_query_rust, extract_response_rust};
 
 const ENTRY_BYTES: usize = 32;
 const NUM_FIXTURE_INDICES: u32 = 5;
 
+// The shipped preset: the client refuses a smaller ring than this, so a fixture below it
+// would be refused before any query it holds could be decoded.
 fn test_params() -> InspireParams {
-    InspireParams {
-        ring_dim: 256,
-        q: 1_152_921_504_606_830_593,
-        crt_moduli: vec![1_152_921_504_606_830_593],
-        p: 65_537,
-        sigma: 6.4,
-        gadget_base: 1 << 20,
-        query_gadget_len: 3,
-        packing_gadget_len: 3,
-        security_level: raven_inspire::params::SecurityLevel::Bits128,
+    InspireParams::secure_128_d2048()
+}
+
+/// The CRS the params route ships, galois keys stripped, as `emit_production_shape_fixture`
+/// builds it; the full d=2048 CRS is over a megabyte.
+fn crs_wire_bytes(crs: &ServerCrs) -> Vec<u8> {
+    ServerCrs {
+        params: crs.params.clone(),
+        galois_keys: Vec::new(),
+        rgsw_gadget: crs.rgsw_gadget.clone(),
+        inspiring_pack_params: None,
+        inspiring_packing_key: None,
+        inspiring_w_seed: crs.inspiring_w_seed,
+        inspiring_v_seed: crs.inspiring_v_seed,
+        inspiring_num_columns: crs.inspiring_num_columns,
     }
+    .to_versioned_bytes()
+    .expect("versioned wire crs")
 }
 
 fn bc_for(idx: u32) -> [u8; 32] {
@@ -136,7 +146,7 @@ fn main() {
         inspire_setup(&params, &db, ENTRY_BYTES, &mut sampler).expect("setup");
 
     let inspire_params_bin = bincode::serialize(&params).expect("serialize params");
-    let crs_bin = crs.to_versioned_bytes().expect("versioned crs");
+    let crs_bin = crs_wire_bytes(&crs);
     let shard_config_bin = bincode::serialize(&encoded_db.config).expect("serialize shard");
     let sk_bin = bincode::serialize(&sk).expect("serialize sk");
 

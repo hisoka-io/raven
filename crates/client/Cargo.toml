@@ -17,6 +17,11 @@ crate-type = ["cdylib", "rlib"]
 [lints]
 workspace = true
 
+[features]
+# Lifts the parameter floors so this crate's own tests can run at ring dimension 256. Enabled only
+# by the dev-dependency below; the wasm crate refuses to build against it.
+unfloored-test-params = []
+
 [dependencies]
 raven-inspire = { path = "../inspire", features = ["mod-switch-response"] }
 serde = { workspace = true }
@@ -29,6 +34,7 @@ console_error_panic_hook = "0.1"
 rand = { version = "0.8", default-features = false, features = ["getrandom"] }
 
 [dev-dependencies]
+raven-client = { path = ".", features = ["unfloored-test-params"] }
 wasm-bindgen-test = "0.3"
 
 # NOT an unconditional dev-dep: proptest pulls rand 0.9 -> rand_core 0.9 -> getrandom 0.3, which

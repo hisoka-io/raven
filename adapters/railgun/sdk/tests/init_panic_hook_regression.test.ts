@@ -6,7 +6,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import * as wasmPkg from "raven-inspire-client-wasm";
+import * as wasmPkg from "@hisoka-io/raven-inspire-client-wasm";
 
 import { installPanicHook } from "../src/index";
 import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";

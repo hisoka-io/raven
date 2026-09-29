@@ -217,25 +217,18 @@ export class UpstreamPinResolver {
         startIndex: lastIndex,
         endIndex: lastIndex,
       }),
+      lastIndex,
+      lastIndex,
     );
     // Filtering by BLOCK here would accept any row that floor-divides to it, so an upstream
     // answering the zero-width query with an INTERMEDIATE row would have that partial-tree
     // root cached as the block's immutable root for the process lifetime. The query names one
     // index; only that index may answer it.
+    // At most one row, by the cap in `decodeEvents`, so a frozen block caches exactly one root.
     const roots = new Set<string>();
     for (const row of rows) {
       if (row.index !== lastIndex) continue;
       roots.add(row.root);
-    }
-    // A full tree has exactly one root at its last leaf, so a second distinct answer is upstream
-    // contradicting itself -- and this result is cached as immutable for the process lifetime.
-    // Widening the accepted set would have made that contradiction permanent and invisible.
-    if (roots.size > 1) {
-      throw RavenError.serverError(
-        `pin resolver: upstream answered the zero-width query at leaf ${lastIndex} with ` +
-          `${roots.size} different roots; a frozen block has one`,
-        { url: this.endpoint },
-      );
     }
     return roots.size === 0 ? undefined : roots;
   }
@@ -256,6 +249,8 @@ export class UpstreamPinResolver {
         startIndex,
         endIndex: latestIndex,
       }),
+      startIndex,
+      latestIndex,
     );
     return {
       roots: this.rootsInBlock(rows, block, startIndex, latestIndex),
@@ -321,12 +316,25 @@ export class UpstreamPinResolver {
     return length;
   }
 
-  /** Each row is one leaf's insert and the tree root written immediately after it. */
-  private decodeEvents(result: unknown): { index: number; root: string }[] {
+  /** Each row is one leaf's insert and the tree root written immediately after it. A list holds
+   *  one row per index, so an answer longer than the range asked is refused before any is read. */
+  private decodeEvents(
+    result: unknown,
+    startIndex: number,
+    endIndex: number,
+  ): { index: number; root: string }[] {
     if (!Array.isArray(result)) {
       throw RavenError.decodeError("pin resolver: ppoi_poi_events result is not an array", {
         url: this.endpoint,
       });
+    }
+    const width = endIndex - startIndex + 1;
+    if (result.length > width) {
+      throw RavenError.decodeError(
+        `pin resolver: ppoi_poi_events answered leaves ${startIndex}..${endIndex} with ` +
+          `${result.length} rows; the range holds at most ${width}`,
+        { url: this.endpoint },
+      );
     }
     return result.map((entry, position) => {
       if (!isRecord(entry) || !isRecord(entry.signedPOIEvent)) {
@@ -392,10 +400,31 @@ export class UpstreamPinResolver {
     try {
       decoded = await response.json();
     } catch (cause) {
+      if (!response.ok) {
+        throw RavenError.serverError(`pin resolver ${method}: HTTP ${response.status}`, {
+          url: this.endpoint,
+          status: response.status,
+          cause: String(cause),
+        });
+      }
       throw RavenError.decodeError(`pin resolver ${method}: response is not valid JSON`, {
         url: this.endpoint,
         status: response.status,
         cause: String(cause),
+      });
+    }
+    // A non-2xx is the status talking unless it carries this call's JSON-RPC error: a proxy's
+    // 503 body, JSON or not, is not a malformed answer, and reading it as one makes it permanent.
+    const carriesRpcError =
+      isRecord(decoded) &&
+      decoded.jsonrpc === "2.0" &&
+      decoded.id === id &&
+      decoded.error !== undefined &&
+      decoded.error !== null;
+    if (!response.ok && !carriesRpcError) {
+      throw RavenError.serverError(`pin resolver ${method}: HTTP ${response.status}`, {
+        url: this.endpoint,
+        status: response.status,
       });
     }
     if (!isRecord(decoded)) {
@@ -420,12 +449,6 @@ export class UpstreamPinResolver {
         ? `${String(rpcError.code)}: ${String(rpcError.message)}`
         : String(rpcError);
       throw RavenError.serverError(`pin resolver ${method} JSON-RPC error ${detail}`, {
-        url: this.endpoint,
-        status: response.status,
-      });
-    }
-    if (!response.ok) {
-      throw RavenError.serverError(`pin resolver ${method}: HTTP ${response.status}`, {
         url: this.endpoint,
         status: response.status,
       });

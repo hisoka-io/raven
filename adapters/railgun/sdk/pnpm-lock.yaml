@@ -1,7 +1,7 @@
 lockfileVersion: '9.0'
 
 settings:
-  autoInstallPeers: true
+  autoInstallPeers: false
   excludeLinksFromLockfile: false
 
 importers:
@@ -12,6 +12,9 @@ importers:
         specifier: ^1.0.2
         version: 1.0.2
     devDependencies:
+      '@hisoka-io/raven-inspire-client-wasm':
+        specifier: file:../client-wasm/pkg-node
+        version: file:../client-wasm/pkg-node
       '@railgun-community/engine':
         specifier: 9.7.0-rc.0
         version: 9.7.0-rc.0(bufferutil@4.1.0)(chai@5.3.3)(utf-8-validate@5.0.10)
@@ -21,9 +24,6 @@ importers:
       '@types/semver':
         specifier: ^7.7.0
         version: 7.8.0
-      raven-inspire-client-wasm:
-        specifier: file:../client-wasm/pkg-node
-        version: file:../client-wasm/pkg-node
       semver:
         specifier: ^7.7.0
         version: 7.8.5
@@ -245,6 +245,9 @@ packages:
 
   '@ethersproject/web@5.8.0':
     resolution: {integrity: sha512-j7+Ksi/9KfGviws6Qtf9Q7KCqRhpwrYKQPs+JBA/rKVFF/yaWLHJEH3zfVP2plVu+eys0d2DlFmhoQJayFewcw==}
+
+  '@hisoka-io/raven-inspire-client-wasm@file:../client-wasm/pkg-node':
+    resolution: {directory: ../client-wasm/pkg-node, type: directory}
 
   '@jridgewell/sourcemap-codec@1.5.5':
     resolution: {integrity: sha512-cYQ9310grqxueWbl+WuIUIaiUaDcj7WOq5fVhEljNVgRfOUhY9fy2zTvfoqWsnebh8Sl70VScFbICvJnLKB0Og==}
@@ -1517,9 +1520,6 @@ packages:
     resolution: {integrity: sha512-Hrgsx+orqoygnmhFbKaHE6c296J+HTAQXoxEF6gNupROmmGJRoyzfG3ccAveqCBrwr/2yxQ5BVd/GTl5agOwSg==}
     engines: {node: '>= 0.6'}
 
-  raven-inspire-client-wasm@file:../client-wasm/pkg-node:
-    resolution: {directory: ../client-wasm/pkg-node, type: directory}
-
   raw-body@2.5.3:
     resolution: {integrity: sha512-s4VSOf6yN0rvbRZGxs8Om5CWj6seneMwK3oDb4lWDH0UPhWcxwOWw5+qk24bxq87szX1ydrwylIOp2uG1ojUpA==}
     engines: {node: '>= 0.8'}
@@ -2223,6 +2223,8 @@ snapshots:
       '@ethersproject/logger': 5.8.0
       '@ethersproject/properties': 5.8.0
       '@ethersproject/strings': 5.8.0
+
+  '@hisoka-io/raven-inspire-client-wasm@file:../client-wasm/pkg-node': {}
 
   '@jridgewell/sourcemap-codec@1.5.5': {}
 
@@ -3598,8 +3600,6 @@ snapshots:
       safe-buffer: 5.2.1
 
   range-parser@1.2.1: {}
-
-  raven-inspire-client-wasm@file:../client-wasm/pkg-node: {}
 
   raw-body@2.5.3:
     dependencies:

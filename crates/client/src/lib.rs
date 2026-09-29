@@ -31,6 +31,14 @@ use raven_inspire::{
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
+mod floor;
+pub use floor::{
+    check_parameter_floor, ParameterFloorError, MAX_Q, MAX_RING_DIM, MIN_RING_DIM, SHIPPED_SIGMA,
+};
+
+/// False only in this crate's own test builds, whose ring-256 fixtures sit below the floors.
+pub const PARAMETER_FLOORS_ENFORCED: bool = !cfg!(feature = "unfloored-test-params");
+
 /// Route Rust panics to structured JS exceptions instead of opaque WASM traps. Idempotent.
 #[wasm_bindgen]
 pub fn init_panic_hook() {
@@ -65,6 +73,11 @@ enum WasmClientError {
     Inspire { op: &'static str, detail: String },
     #[error("OS entropy unavailable for {what}: {detail}")]
     Entropy { what: &'static str, detail: String },
+    #[error("parameter floor refused {what}: {source}")]
+    ParameterFloor {
+        what: &'static str,
+        source: ParameterFloorError,
+    },
 }
 
 const VERSIONED_BATCH_FRAME_BYTES: usize = 2 + 8;
@@ -271,7 +284,8 @@ pub const WASM_BINCODE_DESERIALIZE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 /// smaller cap is valid only for the client's self-authored cache format.
 pub const WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
-/// Decode server-supplied [`InspireParams`] and enforce [`InspireParams::validate`].
+/// Decode server-supplied [`InspireParams`] and enforce [`InspireParams::validate`] and the
+/// parameter floors.
 ///
 /// Every field arrives over the wire under the server's control, and `sigma` in
 /// particular drives secret-key and query-noise sampling, so nothing downstream may
@@ -287,7 +301,33 @@ fn decode_validated_params(
             what,
             detail: format!("server-supplied params rejected: {detail}"),
         })?;
+    enforce_parameter_floor(&params, what)?;
     Ok(params)
+}
+
+fn enforce_parameter_floor(
+    params: &InspireParams,
+    what: &'static str,
+) -> Result<(), WasmClientError> {
+    floor_refusal(params).map_err(|source| WasmClientError::ParameterFloor { what, source })
+}
+
+fn floor_refusal(params: &InspireParams) -> Result<(), ParameterFloorError> {
+    if PARAMETER_FLOORS_ENFORCED {
+        check_parameter_floor(params)
+    } else {
+        Ok(())
+    }
+}
+
+/// The Rust entry points take a caller-built session, so both the params the noise is drawn at and
+/// the session's own are held to the floors.
+fn floor_refusal_for_query(
+    session: &ClientSession,
+    params: &InspireParams,
+) -> Result<(), ParameterFloorError> {
+    floor_refusal(params)?;
+    floor_refusal(&session.crs().params)
 }
 
 /// Decode the bundle's `ShardConfig`, pin it to `params`, and return the server's
@@ -379,10 +419,13 @@ fn decode_versioned_crs(bytes: &[u8]) -> Result<ServerCrs, WasmClientError> {
             ),
         });
     }
-    ServerCrs::from_versioned_bytes(bytes).map_err(|e| WasmClientError::Decode {
+    let crs = ServerCrs::from_versioned_bytes(bytes).map_err(|e| WasmClientError::Decode {
         what: "server_crs",
         detail: e.to_string(),
-    })
+    })?;
+    // The session encrypts under the CRS's own params, not the bundle's.
+    enforce_parameter_floor(&crs.params, "server_crs")?;
+    Ok(crs)
 }
 
 /// The cached session must have been derived under the CRS the instance serves NOW.
@@ -1025,6 +1068,8 @@ pub fn deserialize_client_session_rust(
         bincode::deserialize(params_bundle_bincode).map_err(|e| e.to_string())?;
     let inspire_params: InspireParams =
         bincode::deserialize(&bundle.inspire_params_bincode).map_err(|e| e.to_string())?;
+    floor_refusal(&inspire_params)
+        .map_err(|e| format!("parameter floor refused inspire_params: {e}"))?;
     ServerCrs::check_magic(crs_bincode).map_err(|e| e.to_string())?;
     if session_bincode.len() > WASM_DESERIALIZE_TRUSTED_LIMIT_BYTES {
         return Err(format!(
@@ -1041,14 +1086,16 @@ pub fn deserialize_client_session_rust(
     Ok((inner, inspire_params))
 }
 
-/// Rust-native mirror of [`build_seeded_query`]. Draws query noise from OS entropy,
-/// so the mirror is never weaker than the wasm path it stands in for.
+/// Rust-native mirror of [`build_seeded_query`]. Draws query noise from OS entropy, and refuses
+/// parameters outside the floors, so the mirror is never weaker than the wasm path it stands in for.
 pub fn build_seeded_query_rust(
     session: &ClientSession,
     params: &InspireParams,
     shard_config: &ShardConfig,
     target_idx: u64,
 ) -> Result<(ClientState, SeededClientQuery), String> {
+    floor_refusal_for_query(session, params)
+        .map_err(|e| format!("parameter floor refused: {e}"))?;
     let mut sampler =
         os_seeded_sampler(params.sigma, "seeded_query_noise").map_err(|e| e.to_string())?;
     seeded_query_with_sampler(session, shard_config, target_idx, &mut sampler)
@@ -1067,6 +1114,8 @@ pub fn build_seeded_query_rust_with_noise_seed(
     target_idx: u64,
     noise_seed: [u8; 32],
 ) -> Result<(ClientState, SeededClientQuery), String> {
+    floor_refusal_for_query(session, params)
+        .map_err(|e| format!("parameter floor refused: {e}"))?;
     let mut sampler = GaussianSampler::from_seed(params.sigma, noise_seed);
     seeded_query_with_sampler(session, shard_config, target_idx, &mut sampler)
 }
@@ -1436,9 +1485,10 @@ fn build_padded_batch_with_randomness(
 /// ```
 ///
 /// # Errors
-/// Returns [`PaddedBatchError`] when the input is empty, sizing overflows, the cap admits no legal
-/// ladder step, the validated geometry cannot supply distinct cover shards, entropy is unavailable,
-/// or InsPIRe cannot construct a query.
+/// Returns [`PaddedBatchError`] when the input is empty, the parameters are outside the floors
+/// ([`check_parameter_floor`]), sizing overflows, the cap admits no legal ladder step, the
+/// validated geometry cannot supply distinct cover shards, entropy is unavailable, or InsPIRe
+/// cannot construct a query.
 pub fn build_padded_batch_rust(
     session: &ClientSession,
     params: &InspireParams,
@@ -1508,6 +1558,9 @@ fn validate_padded_batch_inputs(
         })?;
     ensure_session_params_match(&session.crs().params, params)
         .map_err(|detail| PaddedBatchError::Configuration { detail })?;
+    floor_refusal(params).map_err(|e| PaddedBatchError::Configuration {
+        detail: format!("parameter floor refused: {e}"),
+    })?;
     shard_config
         .validate_for_params(params)
         .map_err(|detail| PaddedBatchError::Configuration {

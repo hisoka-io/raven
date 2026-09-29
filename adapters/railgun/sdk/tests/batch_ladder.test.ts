@@ -76,6 +76,7 @@ describe("batch size ladder", () => {
     try {
       const bc = "5a".repeat(32);
       const sdk = new RavenPOINodeInterface({
+        captureWireRequests: true,
         ...forestConfig({
           endpoint: server.url,
           listKeyHex: "ab".repeat(32),
