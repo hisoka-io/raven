@@ -9,8 +9,10 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use std::sync::OnceLock;
-use std::time::Duration;
 
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use raven_inspire::params::InspireParams;
@@ -157,14 +159,11 @@ async fn an_event_for_a_tree_no_instance_routes_increments_the_dropped_counter()
 
     // The router is a separate task; poll until the drop lands rather than sleeping
     // a fixed interval.
-    let mut after = before;
-    for _ in 0..200 {
-        after = dropped_with_reason("no_route");
-        if after > before {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    let after = progress::until_done_or_stalled("the unrouted drop being counted", || {
+        let after = dropped_with_reason("no_route");
+        (after, (after > before).then_some(after))
+    })
+    .await;
 
     assert_eq!(
         after,
@@ -176,17 +175,14 @@ async fn an_event_for_a_tree_no_instance_routes_increments_the_dropped_counter()
     // The counter says SOMETHING was dropped; these assert WHICH, which is what an
     // operator alert matches on and what nothing exercised before. Both strings are
     // produced by `record_no_route` and the clear inside the router, not by the test.
-    let mut targets = router_unrouted_targets();
-    for _ in 0..200 {
-        if targets
+    let targets = progress::until_done_or_stalled("the unrouted tree being named", || {
+        let targets = router_unrouted_targets();
+        let named = targets
             .iter()
-            .any(|t| t == &format!("tree:{UNROUTED_TREE}"))
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        targets = router_unrouted_targets();
-    }
+            .any(|t| t == &format!("tree:{UNROUTED_TREE}"));
+        (targets.clone(), named.then_some(targets))
+    })
+    .await;
     assert!(
         targets.contains(&format!("tree:{UNROUTED_TREE}")),
         "the unrouted tree must be named in the registry, not merely counted; got {targets:?}"
@@ -203,7 +199,11 @@ async fn an_event_for_a_tree_no_instance_routes_increments_the_dropped_counter()
     drop(handle.channels);
     for h in handle.instances.drain(..) {
         let _ = h.sender.send(ConsumerEvent::Shutdown).await;
-        let _ = tokio::time::timeout(Duration::from_secs(2), h.consumer).await;
+        progress::join_consumer("shutdown", h.consumer, &h.metrics, &h.persistence)
+            .await
+            .expect("final commit");
     }
-    let _ = tokio::time::timeout(Duration::from_secs(2), handle.router).await;
+    // Every consumer has stopped and the inbound channels are closed, so the router has no
+    // progress of its own left to show.
+    progress::join_or_stalled("router", handle.router, || ()).await;
 }

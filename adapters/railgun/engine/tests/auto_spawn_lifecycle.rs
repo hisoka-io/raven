@@ -9,6 +9,9 @@
     clippy::indexing_slicing
 )]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use std::sync::Arc;
 
 use raven_inspire::params::InspireParams;
@@ -93,17 +96,20 @@ async fn synthetic_chain_drives_auto_spawn_to_tree_n_plus_one() {
         })
         .await
         .ok();
-    let next = tokio::time::timeout(std::time::Duration::from_secs(2), observer.recv())
+    let next = progress::await_or_stalled("tree_observed tap", observer.recv(), || ())
         .await
-        .expect("tap fires within 2s")
         .expect("broadcast value");
     assert_eq!(next, 1, "tree_observed surfaces the new tree number");
     drop(handle.channels);
     for h in handle.instances.drain(..) {
         let _ = h.sender.send(ConsumerEvent::Shutdown).await;
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h.consumer).await;
+        progress::join_consumer("shutdown", h.consumer, &h.metrics, &h.persistence)
+            .await
+            .expect("final commit");
     }
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle.router).await;
+    // Every consumer has stopped and the inbound channels are closed, so the router has no
+    // progress of its own left to show.
+    progress::join_or_stalled("router", handle.router, || ()).await;
 }
 
 /// Named for what it proves: the role flip is performed BY HAND here, and the
@@ -198,10 +204,10 @@ async fn five_tree_progression_full_lifecycle() {
     }
 
     for (t, mut rx) in receivers.drain(..) {
-        let got = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
-            .await
-            .unwrap_or_else(|_| panic!("tree {t} consumer did not receive within 3s"))
-            .unwrap_or_else(|| panic!("tree {t} consumer channel closed"));
+        let got =
+            progress::await_or_stalled(&format!("tree {t} consumer receiving"), rx.recv(), || ())
+                .await
+                .unwrap_or_else(|| panic!("tree {t} consumer channel closed"));
         match got {
             ConsumerEvent::Chain(RailgunEvent::Shield { tree_number, .. }, _) => {
                 assert_eq!(tree_number, t, "router routed event to correct receiver");
@@ -213,7 +219,11 @@ async fn five_tree_progression_full_lifecycle() {
     drop(handle.channels);
     for h in handle.instances.drain(..) {
         let _ = h.sender.send(ConsumerEvent::Shutdown).await;
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h.consumer).await;
+        progress::join_consumer("shutdown", h.consumer, &h.metrics, &h.persistence)
+            .await
+            .expect("final commit");
     }
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle.router).await;
+    // Every consumer has stopped and the inbound channels are closed, so the router has no
+    // progress of its own left to show.
+    progress::join_or_stalled("router", handle.router, || ()).await;
 }

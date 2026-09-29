@@ -7,14 +7,17 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use std::sync::Arc;
+#[path = "support/progress.rs"]
+mod progress;
+
 use std::sync::OnceLock;
-use std::time::Duration;
 
 use raven_inspire::params::InspireParams;
 use raven_railgun_engine::imt::Imt;
 use raven_railgun_engine::inspire::InspireServerState;
-use raven_railgun_engine::orchestrator::{bootstrap_railgun_engine, OrchestratorConfig};
+use raven_railgun_engine::orchestrator::{
+    bootstrap_railgun_engine, OrchestratorConfig, OrchestratorHandle,
+};
 use raven_railgun_engine::persistence::{ConsumerEvent, ConsumerMetrics, SnapshotPolicy};
 use raven_railgun_engine::pir_table::EncoderKind;
 use raven_railgun_engine::InstanceRole;
@@ -131,25 +134,15 @@ fn counter(handle: &metrics_exporter_prometheus::PrometheusHandle, name: &str) -
         .unwrap_or_else(|| panic!("counter value must parse as u64 from line {value_line:?}"))
 }
 
-async fn settled(
-    metrics: &Arc<parking_lot::Mutex<ConsumerMetrics>>,
-    outcomes: u64,
-) -> ConsumerMetrics {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let m = *metrics.lock();
-        if m.events_processed + m.consumer_errors >= outcomes {
-            return m;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "consumer settled {} of {outcomes} rows within 30 s (applied {}, refused {})",
-            m.events_processed + m.consumer_errors,
-            m.events_processed,
-            m.consumer_errors,
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+async fn settled(handle: &OrchestratorHandle, outcomes: u64) -> ConsumerMetrics {
+    progress::until_done_or_stalled(&format!("consumer settling {outcomes} rows"), || {
+        let m = *handle.metrics.lock();
+        (
+            progress::consumer_motion(&handle.metrics, &handle.persistence),
+            (m.events_processed + m.consumer_errors >= outcomes).then_some(m),
+        )
+    })
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -171,7 +164,6 @@ async fn a_row_whose_root_is_not_its_own_post_append_root_never_reaches_the_wal(
 
     let params = InspireParams::secure_128_d2048();
     let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
-    let metrics = Arc::clone(&handle.metrics);
 
     let leaves = UPSTREAM_LEAVES.map(hex32);
     let roots = upstream_roots();
@@ -192,7 +184,7 @@ async fn a_row_whose_root_is_not_its_own_post_append_root_never_reaches_the_wal(
         ))
         .await
         .expect("send divergent row 1");
-    let after_divergent = settled(&metrics, 2).await;
+    let after_divergent = settled(&handle, 2).await;
     assert_eq!(
         (
             after_divergent.events_processed,
@@ -220,7 +212,7 @@ async fn a_row_whose_root_is_not_its_own_post_append_root_never_reaches_the_wal(
             .await
             .expect("send upstream row");
     }
-    let after_feed = settled(&metrics, 5).await;
+    let after_feed = settled(&handle, 5).await;
     assert_eq!(
         (after_feed.events_processed, after_feed.consumer_errors),
         (4, 1),
@@ -241,9 +233,17 @@ async fn a_row_whose_root_is_not_its_own_post_append_root_never_reaches_the_wal(
     // the log this reads.
     drop(handle.channels);
     drop(handle.sender);
-    let _ = tokio::time::timeout(Duration::from_secs(10), handle.indexer_bridge).await;
-    let _ = tokio::time::timeout(Duration::from_secs(10), handle.mirror_bridge).await;
-    let _ = tokio::time::timeout(Duration::from_secs(10), handle.consumer).await;
+    // A bridge exits once its inbound channel closes; it has no progress of its own to show.
+    progress::join_or_stalled("indexer bridge", handle.indexer_bridge, || ()).await;
+    progress::join_or_stalled("mirror bridge", handle.mirror_bridge, || ()).await;
+    progress::join_consumer(
+        "consumer on a closed channel",
+        handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await
+    .expect("consumer on a closed channel");
     drop(handle.persistence);
 
     assert_eq!(

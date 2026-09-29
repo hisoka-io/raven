@@ -3,8 +3,10 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use std::sync::Arc;
-use std::time::Duration;
 
 use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, InstanceId, RailgunEvent};
@@ -96,14 +98,16 @@ async fn chain_event_reaches_every_instance_bound_to_the_same_tree_number() {
         .await
         .expect("router inbound open");
 
-    let first = tokio::time::timeout(Duration::from_secs(2), rx_leaf_bc.recv())
+    let first = progress::await_or_stalled("first route", rx_leaf_bc.recv(), || ())
         .await
-        .expect("first route timed out")
         .expect("first route closed");
-    let second = tokio::time::timeout(Duration::from_secs(2), rx_leaf_path.recv())
-        .await
-        .expect("second route bound to the same tree_number never received the event")
-        .expect("second route closed");
+    let second = progress::await_or_stalled(
+        "second route bound to the same tree_number",
+        rx_leaf_path.recv(),
+        || (),
+    )
+    .await
+    .expect("second route closed");
     for (label, got) in [("first", first), ("second", second)] {
         match got {
             ConsumerEvent::Chain(delivered, height) => {
@@ -117,7 +121,11 @@ async fn chain_event_reaches_every_instance_bound_to_the_same_tree_number() {
     drop(handle.channels);
     for h in handle.instances.drain(..) {
         let _ = h.sender.send(ConsumerEvent::Shutdown).await;
-        let _ = tokio::time::timeout(Duration::from_secs(2), h.consumer).await;
+        progress::join_consumer("shutdown", h.consumer, &h.metrics, &h.persistence)
+            .await
+            .expect("final commit");
     }
-    let _ = tokio::time::timeout(Duration::from_secs(2), handle.router).await;
+    // Every consumer has stopped and the inbound channels are closed, so the router has no
+    // progress of its own left to show.
+    progress::join_or_stalled("router", handle.router, || ()).await;
 }

@@ -13,7 +13,8 @@
     clippy::indexing_slicing
 )]
 
-use std::time::Duration;
+#[path = "support/progress.rs"]
+mod progress;
 
 use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
@@ -83,7 +84,7 @@ fn build_three_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
         mk(
             "tree-1",
             "tree-1",
-            EncoderKind::PerLeafBc { tree_number: 0 },
+            EncoderKind::PerLeafBc { tree_number: 1 },
             DataSourceFilter::ChainTreeNumber(1),
             InstanceRole::Live,
         ),
@@ -101,8 +102,7 @@ fn build_three_configs(root: &std::path::Path) -> Vec<InstanceConfig> {
 }
 
 async fn wait_until_seeded(instances: &[PerInstanceHandles], list_key: &[u8; 32]) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    loop {
+    progress::until_done_or_stalled("three-instance seed", || {
         let mut chain_ready = 0usize;
         let mut ppoi_ready = false;
         for handle in instances {
@@ -116,22 +116,21 @@ async fn wait_until_seeded(instances: &[PerInstanceHandles], list_key: &[u8; 32]
                 }
             }
         }
-        if chain_ready == 2 && ppoi_ready {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "three-instance seed did not apply before the deadline"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+        (
+            progress::fleet_motion(instances),
+            (chain_ready == 2 && ppoi_ready).then_some(()),
+        )
+    })
+    .await;
 }
 
 async fn shutdown_all(handles: Vec<PerInstanceHandles>, channels: OrchestratorChannels) {
     drop(channels);
     for h in handles {
         let _ = h.sender.send(ConsumerEvent::Shutdown).await;
-        let _ = tokio::time::timeout(Duration::from_secs(5), h.consumer).await;
+        progress::join_consumer("shutdown", h.consumer, &h.metrics, &h.persistence)
+            .await
+            .expect("final commit");
     }
 }
 
@@ -247,11 +246,12 @@ async fn reorg_cascade_truncates_chain_instances_only() {
         })
         .await
         .expect("send reorg");
-    tokio::time::timeout(Duration::from_secs(60), completed.recv())
-        .await
-        .expect("reorg barrier timeout")
-        .expect("reorg barrier channel")
-        .expect("every chain consumer must commit the reorg");
+    progress::await_or_stalled("reorg barrier", completed.recv(), || {
+        progress::fleet_motion(&mh.instances)
+    })
+    .await
+    .expect("reorg barrier channel")
+    .expect("every chain consumer must commit the reorg");
 
     for h in &mh.instances {
         let store = h.logical_store.lock();
@@ -310,11 +310,12 @@ async fn reorg_cascade_truncates_chain_instances_only() {
         })
         .await
         .expect("send failure probe");
-    let failure = tokio::time::timeout(Duration::from_secs(60), failed.recv())
-        .await
-        .expect("failure barrier timeout")
-        .expect("failure barrier channel")
-        .expect_err("a closed chain consumer must fail the aggregate barrier");
+    let failure = progress::await_or_stalled("failure barrier", failed.recv(), || {
+        progress::fleet_motion(&instances)
+    })
+    .await
+    .expect("failure barrier channel")
+    .expect_err("a closed chain consumer must fail the aggregate barrier");
     assert!(
         failure.contains("consumer channel closed"),
         "unexpected aggregate failure: {failure}"

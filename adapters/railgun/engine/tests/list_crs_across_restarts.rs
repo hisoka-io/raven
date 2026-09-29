@@ -4,8 +4,10 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use std::sync::Arc;
-use std::time::Duration;
 
 use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, InspireVariant};
@@ -90,7 +92,9 @@ async fn stop(handle: MultiOrchestratorHandle) {
     drop(handle.channels);
     for per in handle.instances {
         let _ = per.sender.send(ConsumerEvent::Shutdown).await;
-        let _ = tokio::time::timeout(Duration::from_secs(30), per.consumer).await;
+        progress::join_consumer("shutdown", per.consumer, &per.metrics, &per.persistence)
+            .await
+            .expect("final commit");
     }
 }
 

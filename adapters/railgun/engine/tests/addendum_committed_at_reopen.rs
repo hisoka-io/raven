@@ -12,8 +12,10 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use std::sync::Arc;
-use std::time::Duration;
 
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_core::InstanceId;
@@ -207,21 +209,26 @@ async fn the_consumer_boot_seed_must_not_replace_the_committed_addendum_with_the
     // Sender dropped up front: the task runs its boot seeding, then exits on channel close.
     let (tx, rx) = tokio::sync::mpsc::channel::<ConsumerEvent>(1);
     drop(tx);
+    let persistence = Arc::new(reopened.persistence);
+    let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default()));
     let task = tokio::spawn(run_consumer_task(
         Arc::clone(&instance),
-        Arc::new(reopened.persistence),
+        Arc::clone(&persistence),
         Arc::clone(&store),
-        Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default())),
+        Arc::clone(&metrics),
         InspireParams::secure_128_d2048(),
         enc,
         rx,
         None,
     ));
-    tokio::time::timeout(Duration::from_secs(60), task)
-        .await
-        .expect("consumer task must exit on channel close")
-        .expect("consumer join")
-        .expect("consumer exit");
+    progress::join_consumer(
+        "consumer exiting on channel close",
+        task,
+        &metrics,
+        &persistence,
+    )
+    .await
+    .expect("consumer exit");
 
     let guard = store.lock();
     let served_db = &instance.current_snapshot().state.encoded_db;
@@ -326,21 +333,26 @@ async fn an_instance_with_no_committed_snapshot_serves_no_addendum() {
 
     let (tx, rx) = tokio::sync::mpsc::channel::<ConsumerEvent>(1);
     drop(tx);
+    let persistence = Arc::new(reopened.persistence);
+    let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default()));
     let task = tokio::spawn(run_consumer_task(
         Arc::clone(&instance),
-        Arc::new(reopened.persistence),
+        Arc::clone(&persistence),
         Arc::clone(&store),
-        Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default())),
+        Arc::clone(&metrics),
         InspireParams::secure_128_d2048(),
         enc,
         rx,
         None,
     ));
-    tokio::time::timeout(Duration::from_secs(60), task)
-        .await
-        .expect("consumer task must exit on channel close")
-        .expect("consumer join")
-        .expect("consumer exit");
+    progress::join_consumer(
+        "consumer exiting on channel close",
+        task,
+        &metrics,
+        &persistence,
+    )
+    .await
+    .expect("consumer exit");
 
     let guard = store.lock();
     assert_eq!(

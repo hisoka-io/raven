@@ -12,7 +12,8 @@
     clippy::map_unwrap_or
 )]
 
-use std::time::Duration;
+#[path = "support/progress.rs"]
+mod progress;
 
 use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
@@ -130,8 +131,7 @@ async fn until_applied(
     instances: &[PerInstanceHandles],
     expected: impl Fn(&DataSourceFilter) -> usize,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    loop {
+    progress::until_done_or_stalled("every instance applying its rows", || {
         let short = instances.iter().find(|h| {
             let store = h.logical_store.lock();
             let held = match h.config.data_source {
@@ -142,21 +142,24 @@ async fn until_applied(
             };
             held < expected(&h.config.data_source)
         });
-        let Some(short) = short else { return };
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{:?} did not apply its rows within 60 s",
-            short.config.data_source
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+        (
+            (
+                short.map(|h| format!("{:?}", h.config.data_source)),
+                progress::fleet_motion(instances),
+            ),
+            short.is_none().then_some(()),
+        )
+    })
+    .await;
 }
 
 async fn shutdown_all(handles: Vec<PerInstanceHandles>, channels: OrchestratorChannels) {
     drop(channels);
     for h in handles {
         let _ = h.sender.send(ConsumerEvent::Shutdown).await;
-        let _ = tokio::time::timeout(Duration::from_secs(5), h.consumer).await;
+        progress::join_consumer("shutdown", h.consumer, &h.metrics, &h.persistence)
+            .await
+            .expect("final commit");
     }
 }
 
@@ -379,9 +382,12 @@ async fn multi_instance_recovery_byte_identity() {
     for h in instances {
         h.consumer.abort();
         // The restart must not open a data dir the old consumer is still writing.
-        let _cancelled = tokio::time::timeout(Duration::from_secs(60), h.consumer)
-            .await
-            .expect("an aborted consumer must exit before the restart");
+        let _cancelled = progress::await_or_stalled(
+            "aborted consumer exiting before the restart",
+            h.consumer,
+            || progress::consumer_motion(&h.metrics, &h.persistence),
+        )
+        .await;
     }
     router.abort();
 

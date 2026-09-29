@@ -10,7 +10,8 @@
     non_snake_case
 )]
 
-use std::time::Duration;
+#[path = "support/progress.rs"]
+mod progress;
 
 use raven_inspire::params::InspireParams;
 use raven_railgun_core::{AdapterError, InstanceId};
@@ -147,22 +148,29 @@ async fn a_row_reaches_every_route_bound_to_its_block() {
         .await
         .expect("router mirror inbound open");
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    for h in &handle.instances {
-        while h.logical_store.lock().ppoi_bc_at(&lk, 0) != Some(bc) {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "{} never received the row its block routes to it",
-                h.config.instance_id
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    }
+    progress::until_done_or_stalled(
+        "every instance receiving the row its block routes to it",
+        || {
+            let waiting: Vec<String> = handle
+                .instances
+                .iter()
+                .filter(|h| h.logical_store.lock().ppoi_bc_at(&lk, 0) != Some(bc))
+                .map(|h| h.config.instance_id.to_string())
+                .collect();
+            let done = waiting.is_empty().then_some(());
+            ((waiting, progress::fleet_motion(&handle.instances)), done)
+        },
+    )
+    .await;
 
     drop(handle.channels);
     for h in handle.instances.drain(..) {
         let _ = h.sender.send(ConsumerEvent::Shutdown).await;
-        let _ = tokio::time::timeout(Duration::from_secs(2), h.consumer).await;
+        progress::join_consumer("shutdown", h.consumer, &h.metrics, &h.persistence)
+            .await
+            .expect("final commit");
     }
-    let _ = tokio::time::timeout(Duration::from_secs(2), handle.router).await;
+    // Every consumer has stopped and the inbound channels are closed, so the router has no
+    // progress of its own left to show.
+    progress::join_or_stalled("router", handle.router, || ()).await;
 }

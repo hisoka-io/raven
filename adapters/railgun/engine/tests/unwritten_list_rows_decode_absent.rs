@@ -13,9 +13,11 @@
     clippy::unwrap_used
 )]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use raven_inspire::params::{InspireParams, InspireVariant};
@@ -431,28 +433,30 @@ async fn served_after_commit(
             .await
             .expect("consumer open");
     }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    loop {
+    progress::until_done_or_stalled("the feed's commit", || {
         let metrics = *booted.metrics.lock();
         assert_eq!(
             metrics.consumer_errors, 0,
             "every leaf carries its own root"
         );
-        if metrics.commits_fired >= 1 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the feed's commit did not land"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+        (
+            progress::consumer_motion(&booted.metrics, &booted.persistence),
+            (metrics.commits_fired >= 1).then_some(()),
+        )
+    })
+    .await;
 
     let rows = decrypt_rows(&booted.instance.current_state(), secret_key, list_indices);
-    for instance in &handle.instances {
-        instance.consumer.abort();
-    }
     handle.router.abort();
+    for mut instance in handle.instances {
+        progress::abort_consumer(
+            "aborted consumer exiting",
+            &mut instance.consumer,
+            &instance.metrics,
+            &instance.persistence,
+        )
+        .await;
+    }
     rows
 }
 

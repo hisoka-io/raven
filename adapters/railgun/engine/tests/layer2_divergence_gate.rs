@@ -9,15 +9,19 @@
     clippy::redundant_closure_for_method_calls
 )]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
 use raven_railgun_engine::inspire::InspireServerState;
-use raven_railgun_engine::orchestrator::{bootstrap_railgun_engine, OrchestratorConfig};
+use raven_railgun_engine::orchestrator::{
+    bootstrap_railgun_engine, OrchestratorConfig, OrchestratorHandle,
+};
 use raven_railgun_engine::persistence::{
     clear_layer2_divergent, layer2_divergent_instances, ConsumerEvent, ConsumerMetrics,
     SnapshotPolicy,
@@ -136,43 +140,33 @@ fn verifying_config(
     config
 }
 
-async fn await_marked(instance_id: &str, label: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while !layer2_divergent_instances()
-        .iter()
-        .any(|id| id == instance_id)
-    {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{label}: {instance_id} was never marked divergent; marked = {:?}",
-            layer2_divergent_instances(),
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+async fn await_marked(handle: &OrchestratorHandle, instance_id: &str, label: &str) {
+    progress::until_done_or_stalled(&format!("{label}: {instance_id} marked divergent"), || {
+        let marked = layer2_divergent_instances();
+        let done = marked.iter().any(|id| id == instance_id);
+        (
+            (
+                marked,
+                progress::consumer_motion(&handle.metrics, &handle.persistence),
+            ),
+            done.then_some(()),
+        )
+    })
+    .await;
 }
 
 async fn await_metrics<F: Fn(&ConsumerMetrics) -> bool>(
-    metrics: &parking_lot::Mutex<ConsumerMetrics>,
+    handle: &OrchestratorHandle,
     label: &str,
     done: F,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let snap = *metrics.lock();
-        if done(&snap) {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{label}: events_processed = {}, commits_fired = {}, \
-             consumer_errors = {}, reorgs_handled = {}",
-            snap.events_processed,
-            snap.commits_fired,
-            snap.consumer_errors,
-            snap.reorgs_handled,
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    progress::until_done_or_stalled(label, || {
+        (
+            progress::consumer_motion(&handle.metrics, &handle.persistence),
+            done(&handle.metrics.lock()).then_some(()),
+        )
+    })
+    .await;
 }
 
 /// The anchored arm repairs by cascading a synthetic reorg. When that repair
@@ -194,7 +188,7 @@ async fn an_anchored_verdict_whose_repair_fails_marks_the_instance_divergent() {
         .send(ConsumerEvent::Chain(leaf_event(0, 100), 100))
         .await
         .expect("send anchoring leaf");
-    await_metrics(&handle.metrics, "anchoring leaf", |m| m.commits_fired >= 1).await;
+    await_metrics(&handle, "anchoring leaf", |m| m.commits_fired >= 1).await;
     assert!(
         !layer2_divergent_instances()
             .iter()
@@ -217,7 +211,7 @@ async fn an_anchored_verdict_whose_repair_fails_marks_the_instance_divergent() {
         .send(ConsumerEvent::Chain(leaf_event(1, 101), 101))
         .await
         .expect("send diverging leaf");
-    await_marked(INSTANCE_ID, "failed repair").await;
+    await_marked(&handle, INSTANCE_ID, "failed repair").await;
 
     assert!(
         handle.metrics.lock().consumer_errors >= 1,
@@ -229,7 +223,18 @@ async fn an_anchored_verdict_whose_repair_fails_marks_the_instance_divergent() {
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("shutdown");
-    let _ = tokio::time::timeout(Duration::from_secs(30), handle.consumer).await;
+    let final_commit = progress::join_consumer(
+        "shutdown",
+        handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await
+    .expect_err("the planted blocker still stands, so the final commit fails on it too");
+    assert!(
+        final_commit.to_string().contains("snapshot save"),
+        "the final commit must fail on the planted blocker, not elsewhere: {final_commit}"
+    );
     clear_layer2_divergent(INSTANCE_ID);
 }
 
@@ -252,7 +257,7 @@ async fn a_divergence_mark_outlives_the_process_that_set_it() {
         .send(ConsumerEvent::Chain(leaf_event(0, 100), 100))
         .await
         .expect("send leaf");
-    await_marked(INSTANCE_ID, "no-anchor suppression").await;
+    await_marked(&handle, INSTANCE_ID, "no-anchor suppression").await;
 
     handle
         .sender
@@ -261,10 +266,14 @@ async fn a_divergence_mark_outlives_the_process_that_set_it() {
         .expect("shutdown");
     // The reopen below takes this data_dir without a flock, so the first writer has to be gone
     // before it; a shutdown commit still running would make it a second concurrent writer.
-    let _first_exit = tokio::time::timeout(Duration::from_secs(120), handle.consumer)
-        .await
-        .expect("the first consumer must stop before its data_dir is reopened")
-        .expect("consumer join");
+    progress::join_consumer(
+        "shutdown 1",
+        handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await
+    .expect("final commit 1");
 
     clear_layer2_divergent(INSTANCE_ID);
     let reopened_source = Arc::new(ScriptedChainSource::new(false));
@@ -290,7 +299,14 @@ async fn a_divergence_mark_outlives_the_process_that_set_it() {
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("shutdown 2");
-    let _ = tokio::time::timeout(Duration::from_secs(30), reopened.consumer).await;
+    progress::join_consumer(
+        "shutdown 2",
+        reopened.consumer,
+        &reopened.metrics,
+        &reopened.persistence,
+    )
+    .await
+    .expect("final commit 2");
     clear_layer2_divergent(INSTANCE_ID);
 }
 
@@ -316,7 +332,7 @@ async fn a_stalled_commit_stream_must_not_silence_the_verifier() {
             .await
             .expect("send leaf");
     }
-    await_metrics(&handle.metrics, "quiet stall", |m| m.events_processed >= 3).await;
+    await_metrics(&handle, "quiet stall", |m| m.events_processed >= 3).await;
     assert_eq!(
         handle.metrics.lock().commits_fired,
         0,
@@ -335,14 +351,14 @@ async fn a_stalled_commit_stream_must_not_silence_the_verifier() {
         .send(ConsumerEvent::Chain(leaf_event(7, 103), 103))
         .await
         .expect("send wedging leaf");
-    await_metrics(&handle.metrics, "wedge", |m| m.consumer_errors >= 1).await;
+    await_metrics(&handle, "wedge", |m| m.consumer_errors >= 1).await;
 
     handle
         .sender
         .send(ConsumerEvent::Chain(leaf_event(3, 104), 104))
         .await
         .expect("send leaf after the wedge");
-    await_marked(INSTANCE_ID, "wedged instance").await;
+    await_marked(&handle, INSTANCE_ID, "wedged instance").await;
 
     assert_eq!(
         handle.metrics.lock().commits_fired,
@@ -355,6 +371,13 @@ async fn a_stalled_commit_stream_must_not_silence_the_verifier() {
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("shutdown");
-    let _ = tokio::time::timeout(Duration::from_secs(30), handle.consumer).await;
+    progress::join_consumer(
+        "shutdown",
+        handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await
+    .expect("final commit");
     clear_layer2_divergent(INSTANCE_ID);
 }

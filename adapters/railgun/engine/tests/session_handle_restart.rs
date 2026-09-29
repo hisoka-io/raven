@@ -1,5 +1,8 @@
 #![allow(clippy::expect_used)]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -238,7 +241,7 @@ async fn production_single_boot_opens_the_durable_allocator_and_refuses_corrupti
         .collect();
     let (fresh_state, secret_key) =
         setup_state(&params, &database, 256, InspireVariant::TwoPacking).expect("single setup");
-    let handle = bootstrap_railgun_engine(config, params.clone(), || Ok(fresh_state))
+    let mut handle = bootstrap_railgun_engine(config, params.clone(), || Ok(fresh_state))
         .expect("single production bootstrap");
     assert_eq!(read_floor(&dir.path().join(FLOOR_FILE)), 2048);
     let state = handle.instance.current_state();
@@ -269,9 +272,16 @@ async fn production_single_boot_opens_the_durable_allocator_and_refuses_corrupti
         database.get(3 * 256..4 * 256).expect("expected record"),
         "the registered client's query must serve its own record before the floor is deleted"
     );
-    handle.consumer.abort();
     handle.indexer_bridge.abort();
     handle.mirror_bridge.abort();
+    // The restart below reopens this data dir, so the old consumer must be gone first.
+    progress::abort_consumer(
+        "aborted consumer exiting",
+        &mut handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await;
     drop(handle);
 
     assert!(dir.path().join("manifest.json").exists());
@@ -349,10 +359,16 @@ async fn production_multi_boot_opens_each_data_dir_allocator() {
         .resolve(Some(external), std::time::Instant::now())
         .expect("multi resolve");
     assert_ne!(external, inner.expect("multi inner"));
-    for instance in handle.instances {
-        instance.consumer.abort();
-    }
     handle.router.abort();
+    for mut instance in handle.instances {
+        progress::abort_consumer(
+            "aborted consumer exiting",
+            &mut instance.consumer,
+            &instance.metrics,
+            &instance.persistence,
+        )
+        .await;
+    }
 
     assert!(data_dir.join("manifest.json").exists());
     std::fs::remove_file(data_dir.join(FLOOR_FILE)).expect("remove multi-instance floor");

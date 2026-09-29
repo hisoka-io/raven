@@ -2,12 +2,14 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
 use raven_railgun_engine::orchestrator::{indexer_to_consumer_bridge, mirror_to_consumer_bridge};
 use raven_railgun_engine::persistence::ConsumerEvent;
 use raven_railgun_indexer::IndexerMessage;
 use raven_railgun_persistence::WalEntryPayload;
-use std::time::Duration;
 use tokio::sync::mpsc;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -50,9 +52,8 @@ async fn indexer_bridge_translates_event_reorg_heartbeat() {
         .await
         .expect("send heartbeat");
 
-    let got = tokio::time::timeout(Duration::from_secs(2), cons_rx.recv())
+    let got = progress::await_or_stalled("recv 1", cons_rx.recv(), || ())
         .await
-        .expect("recv 1")
         .expect("event present");
     match got {
         ConsumerEvent::Chain(e, h) => {
@@ -63,15 +64,13 @@ async fn indexer_bridge_translates_event_reorg_heartbeat() {
         other => panic!("expected Chain, got {other:?}"),
     }
 
-    let got = tokio::time::timeout(Duration::from_secs(2), cons_rx.recv())
+    let got = progress::await_or_stalled("recv 2", cons_rx.recv(), || ())
         .await
-        .expect("recv 2")
         .expect("event present");
     assert!(matches!(got, ConsumerEvent::Reorg(99)));
 
-    let got = tokio::time::timeout(Duration::from_secs(2), cons_rx.recv())
+    let got = progress::await_or_stalled("recv 3", cons_rx.recv(), || ())
         .await
-        .expect("recv 3")
         .expect("event present");
     assert!(matches!(
         got,
@@ -82,10 +81,7 @@ async fn indexer_bridge_translates_event_reorg_heartbeat() {
     ));
 
     drop(idx_tx);
-    tokio::time::timeout(Duration::from_secs(2), bridge)
-        .await
-        .expect("bridge exits when indexer channel closes")
-        .expect("join");
+    progress::join_or_stalled("bridge exits when indexer channel closes", bridge, || ()).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -103,9 +99,8 @@ async fn mirror_bridge_translates_ppoi_payload() {
     };
     mir_tx.send((payload.clone(), 0)).await.expect("send ppoi");
 
-    let got = tokio::time::timeout(Duration::from_secs(2), cons_rx.recv())
+    let got = progress::await_or_stalled("recv", cons_rx.recv(), || ())
         .await
-        .expect("recv")
         .expect("event present");
     match got {
         ConsumerEvent::Ppoi(p, h) => {
@@ -116,10 +111,7 @@ async fn mirror_bridge_translates_ppoi_payload() {
     }
 
     drop(mir_tx);
-    tokio::time::timeout(Duration::from_secs(2), bridge)
-        .await
-        .expect("bridge exits when mirror channel closes")
-        .expect("join");
+    progress::join_or_stalled("bridge exits when mirror channel closes", bridge, || ()).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -136,10 +128,7 @@ async fn indexer_bridge_exits_when_consumer_closes() {
             scanned_through_block: 0,
         })
         .await;
-    tokio::time::timeout(Duration::from_secs(2), bridge)
-        .await
-        .expect("bridge exits when consumer channel closes")
-        .expect("join");
+    progress::join_or_stalled("bridge exits when consumer channel closes", bridge, || ()).await;
 }
 
 fn transact_in(tree_number: u32, leaf_index: u32) -> RailgunEvent {
@@ -189,7 +178,7 @@ async fn the_bridge_drops_chain_events_for_other_trees() {
         "a bridge scoped to tree 0 must forward only tree-0 events; forwarding {seen_trees:?} \
          lets a foreign tree reach a store whose rows are indexed by leaf_index alone"
     );
-    let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    progress::join_or_stalled("bridge exits when indexer channel closes", bridge, || ()).await;
 }
 
 /// `None` is a per-list encoder: the bridge scopes nothing and forwards every tree. The
@@ -218,5 +207,5 @@ async fn an_unscoped_bridge_still_forwards_every_tree() {
         }
     }
     assert_eq!(n, 3, "an unscoped bridge must forward all three");
-    let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    progress::join_or_stalled("bridge exits when indexer channel closes", bridge, || ()).await;
 }

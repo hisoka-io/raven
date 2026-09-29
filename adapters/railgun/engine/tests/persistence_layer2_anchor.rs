@@ -10,15 +10,19 @@
     clippy::redundant_closure_for_method_calls
 )]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
 use raven_railgun_engine::inspire::InspireServerState;
-use raven_railgun_engine::orchestrator::{bootstrap_railgun_engine, OrchestratorConfig};
+use raven_railgun_engine::orchestrator::{
+    bootstrap_railgun_engine, OrchestratorConfig, OrchestratorHandle,
+};
 use raven_railgun_engine::persistence::{
     layer2_divergent_instances, ConsumerEvent, SnapshotPolicy,
 };
@@ -101,18 +105,31 @@ fn build_toy_state() -> raven_railgun_core::Result<InspireServerState> {
 
 use raven_railgun_testkit::canonical_zeroable as canonical_commitment;
 
-async fn await_rounds(source: &ScriptedChainSource, target: u64, label: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while source.rounds() < target {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{label}: verifier reached only {} of {target} rounds",
-            source.rounds(),
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    // Let the post-verdict bookkeeping settle before the assertions read it.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+async fn await_rounds(
+    handle: &OrchestratorHandle,
+    source: &ScriptedChainSource,
+    target: u64,
+    label: &str,
+) {
+    progress::until_done_or_stalled(&format!("{label}: {target} verifier rounds"), || {
+        let rounds = source.rounds();
+        (
+            (
+                rounds,
+                progress::consumer_motion(&handle.metrics, &handle.persistence),
+            ),
+            (rounds >= target).then_some(()),
+        )
+    })
+    .await;
+    // The verdict's bookkeeping runs after the round the source counted.
+    progress::drained(
+        &format!("{label}: verdict applied"),
+        &handle.sender,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await;
 }
 
 fn verifying_config(
@@ -180,7 +197,7 @@ async fn mirror_height_zero_in_sync_verdict_must_not_become_a_fork_anchor() {
             .await
             .expect("send leaf");
     }
-    await_rounds(&chain_source, u64::from(LEAVES), "phase 1").await;
+    await_rounds(&handle, &chain_source, u64::from(LEAVES), "phase 1").await;
 
     assert_eq!(
         handle.metrics.lock().reorgs_handled,
@@ -202,7 +219,7 @@ async fn mirror_height_zero_in_sync_verdict_must_not_become_a_fork_anchor() {
         .send(ConsumerEvent::Ppoi(mirror_row(0, 0x91), 0))
         .await
         .expect("send mirror row");
-    await_rounds(&chain_source, before + 1, "phase 2").await;
+    await_rounds(&handle, &chain_source, before + 1, "phase 2").await;
 
     assert!(
         layer2_divergent_instances().is_empty(),
@@ -220,7 +237,7 @@ async fn mirror_height_zero_in_sync_verdict_must_not_become_a_fork_anchor() {
         .send(ConsumerEvent::Ppoi(mirror_row(1, 0x92), 0))
         .await
         .expect("send mirror row");
-    await_rounds(&chain_source, before + 1, "phase 3").await;
+    await_rounds(&handle, &chain_source, before + 1, "phase 3").await;
 
     let metrics = *handle.metrics.lock();
     assert_eq!(
@@ -245,5 +262,12 @@ async fn mirror_height_zero_in_sync_verdict_must_not_become_a_fork_anchor() {
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("shutdown");
-    let _ = tokio::time::timeout(Duration::from_secs(30), handle.consumer).await;
+    progress::join_consumer(
+        "shutdown",
+        handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await
+    .expect("final commit");
 }

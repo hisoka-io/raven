@@ -9,9 +9,11 @@
     clippy::redundant_closure_for_method_calls
 )]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use raven_inspire::params::InspireParams;
@@ -107,11 +109,6 @@ fn build_toy_state() -> raven_railgun_core::Result<InspireServerState> {
 
 use raven_railgun_testkit::canonical_zeroable as canonical_commitment;
 
-/// Every event here commits, and the first commit also writes the offline packing cache, so a
-/// loaded box spends tens of seconds before the first verdict. A pass returns as soon as the
-/// condition holds; only a failure waits this long.
-const LOADED_BOX_DEADLINE: Duration = Duration::from_secs(120);
-
 fn aggressive_snapshot_policy() -> SnapshotPolicy {
     SnapshotPolicy {
         max_appends_per_snapshot: 1,
@@ -161,24 +158,23 @@ async fn layer2_verifier_fires_per_commit_and_cascades_reorg_on_out_of_sync() {
 
     // Post-cascade appends are rejected as non-contiguous, so events_processed
     // stalls and only reorgs_handled is a sound assertion target.
-    let drain_deadline = tokio::time::Instant::now() + LOADED_BOX_DEADLINE;
-    loop {
-        let m = *handle.metrics.lock();
-        if m.reorgs_handled >= 1 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < drain_deadline,
-            "cascade reorg did not fire within {LOADED_BOX_DEADLINE:?}; \
-             events_processed = {}, commits_fired = {}, reorgs_handled = {}, verify_calls = {}",
-            m.events_processed,
-            m.commits_fired,
-            m.reorgs_handled,
-            chain_source.verify_count(),
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    progress::until_done_or_stalled("cascade reorg", || {
+        (
+            (
+                chain_source.verify_count(),
+                progress::consumer_motion(&handle.metrics, &handle.persistence),
+            ),
+            (handle.metrics.lock().reorgs_handled >= 1).then_some(()),
+        )
+    })
+    .await;
+    progress::drained(
+        "every leaf and verdict applied",
+        &handle.sender,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await;
 
     let verify_calls = chain_source.verify_count();
     assert!(
@@ -218,7 +214,14 @@ async fn layer2_verifier_fires_per_commit_and_cascades_reorg_on_out_of_sync() {
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("shutdown");
-    let _ = tokio::time::timeout(Duration::from_secs(10), handle.consumer).await;
+    progress::join_consumer(
+        "shutdown",
+        handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await
+    .expect("final commit");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -267,26 +270,27 @@ async fn layer2_first_verdict_out_of_sync_must_not_truncate_to_genesis() {
 
     // A genesis cascade stalls events_processed at 1 and fires a reorg; a refusal
     // drains all five. Either settles this loop, so it cannot mask the defect.
-    let drain_deadline = tokio::time::Instant::now() + LOADED_BOX_DEADLINE;
-    loop {
+    progress::until_done_or_stalled("verifier firing", || {
         let m = *handle.metrics.lock();
-        if chain_source.verify_count() >= 1
-            && (m.events_processed >= u64::from(LEAF_COUNT) || m.reorgs_handled >= 1)
-        {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < drain_deadline,
-            "verifier never fired within {LOADED_BOX_DEADLINE:?}; events_processed = {}, commits_fired = {}, \
-             reorgs_handled = {}, verify_calls = {}",
-            m.events_processed,
-            m.commits_fired,
-            m.reorgs_handled,
-            chain_source.verify_count(),
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+        let verify_calls = chain_source.verify_count();
+        let done = verify_calls >= 1
+            && (m.events_processed >= u64::from(LEAF_COUNT) || m.reorgs_handled >= 1);
+        (
+            (
+                verify_calls,
+                progress::consumer_motion(&handle.metrics, &handle.persistence),
+            ),
+            done.then_some(()),
+        )
+    })
+    .await;
+    progress::drained(
+        "every leaf and verdict applied",
+        &handle.sender,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await;
 
     let verify_calls = chain_source.verify_count();
     assert!(
@@ -317,7 +321,14 @@ async fn layer2_first_verdict_out_of_sync_must_not_truncate_to_genesis() {
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("shutdown");
-    let _ = tokio::time::timeout(Duration::from_secs(10), handle.consumer).await;
+    progress::join_consumer(
+        "shutdown",
+        handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await
+    .expect("final commit");
 }
 
 /// A list's root is its provider's, not the chain's, so a list instance handed a chain source
@@ -385,20 +396,21 @@ async fn layer2_verifier_does_not_fire_on_a_list_instance_given_a_chain_source()
             .expect("send");
     }
 
-    // Deadlock detector, not a throughput floor.
-    let drain_deadline = tokio::time::Instant::now() + LOADED_BOX_DEADLINE;
-    loop {
+    progress::until_done_or_stalled("apply and commit 20 events", || {
         let m = *handle.metrics.lock();
-        if m.events_processed >= 20 && m.commits_fired >= 1 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < drain_deadline,
-            "consumer did not apply and commit 20 events within {LOADED_BOX_DEADLINE:?}; {m:?}",
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(200)).await;
+        (
+            progress::consumer_motion(&handle.metrics, &handle.persistence),
+            (m.events_processed >= 20 && m.commits_fired >= 1).then_some(()),
+        )
+    })
+    .await;
+    progress::drained(
+        "every event applied",
+        &handle.sender,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await;
 
     assert_eq!(
         chain_source.verify_count(),
@@ -417,5 +429,12 @@ async fn layer2_verifier_does_not_fire_on_a_list_instance_given_a_chain_source()
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("shutdown");
-    let _ = tokio::time::timeout(Duration::from_secs(10), handle.consumer).await;
+    progress::join_consumer(
+        "shutdown",
+        handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await
+    .expect("final commit");
 }

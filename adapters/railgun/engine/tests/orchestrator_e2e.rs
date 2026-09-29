@@ -2,13 +2,17 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
 use raven_railgun_engine::inspire::InspireServerState;
-use raven_railgun_engine::orchestrator::{bootstrap_railgun_engine, OrchestratorConfig};
-use raven_railgun_engine::persistence::{ConsumerEvent, ConsumerMetrics};
+use raven_railgun_engine::orchestrator::{
+    bootstrap_railgun_engine, OrchestratorConfig, OrchestratorHandle,
+};
+use raven_railgun_engine::persistence::ConsumerEvent;
 use raven_railgun_engine::InstanceRole;
-use std::time::Duration;
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-test";
 /// Row width of [`build_toy_state`]'s cell; the configured encoder must emit it.
@@ -29,29 +33,24 @@ fn build_toy_state() -> raven_railgun_core::Result<InspireServerState> {
 }
 
 async fn wait_for_consumer_progress(
-    metrics: &parking_lot::Mutex<ConsumerMetrics>,
+    handle: &OrchestratorHandle,
     min_events: u64,
     scanned_through: u64,
 ) {
-    let observed = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let ready = {
-                let current = *metrics.lock();
-                current.events_processed >= min_events
-                    && current.last_known_chain_head == scanned_through
-                    && current.last_scanned_block == scanned_through
-            };
-            if ready {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    progress::until_done_or_stalled(
+        &format!("consumer reaching head/scan {scanned_through} with {min_events} events"),
+        || {
+            let current = *handle.metrics.lock();
+            let ready = current.events_processed >= min_events
+                && current.last_known_chain_head == scanned_through
+                && current.last_scanned_block == scanned_through;
+            (
+                progress::consumer_motion(&handle.metrics, &handle.persistence),
+                ready.then_some(()),
+            )
+        },
+    )
     .await;
-    assert!(
-        observed.is_ok(),
-        "consumer did not reach head/scan {scanned_through} with {min_events} events within 30s"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -96,7 +95,7 @@ async fn orchestrator_bootstraps_and_consumer_applies_events() {
         .await
         .expect("send heartbeat");
 
-    wait_for_consumer_progress(&handle.metrics, 3, 200).await;
+    wait_for_consumer_progress(&handle, 3, 200).await;
 
     let m = *handle.metrics.lock();
     assert!(
@@ -124,7 +123,7 @@ async fn orchestrator_bootstraps_and_consumer_applies_events() {
         })
         .await
         .expect("send quiet heartbeat");
-    wait_for_consumer_progress(&handle.metrics, 3, 298).await;
+    wait_for_consumer_progress(&handle, 3, 298).await;
 
     let quiet = *handle.metrics.lock();
     assert_eq!(quiet.indexer_lag_blocks(), 0);
@@ -157,12 +156,13 @@ async fn orchestrator_bootstraps_and_consumer_applies_events() {
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("send shutdown");
-    // 5 s reddened here purely from sibling load; every other shutdown join in this
-    // suite allows 30 s and the property asserted is that it exits at all.
-    let join_result = tokio::time::timeout(Duration::from_secs(30), handle.consumer)
-        .await
-        .expect("consumer task did not exit within 30s")
-        .expect("join");
+    let join_result = progress::join_consumer(
+        "shutdown",
+        handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await;
     assert!(
         join_result.is_ok(),
         "consumer returned error: {join_result:?}"
@@ -199,20 +199,17 @@ async fn orchestrator_reorg_truncates_leaves_past_height() {
             .expect("send");
     }
     // poll the store, not a fixed sleep: default policy yields no commit_notify at 3 events, and a sleep races the consumer under load
-    // 30 s, matching the sibling suites: this is a deadlock detector, and a 5 s budget
-    // reds on how many other test binaries share the box.
-    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
+    progress::until_done_or_stalled("drain 3 events", || {
         let count = handle.logical_store.lock().leaf_count();
-        if count == 3 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < drain_deadline,
-            "consumer did not drain 3 events within 30 s (count = {count})"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+        (
+            (
+                count,
+                progress::consumer_motion(&handle.metrics, &handle.persistence),
+            ),
+            (count == 3).then_some(()),
+        )
+    })
+    .await;
 
     // register the notification before sending the reorg, else the wake is missed
     let commit_fut = handle.persistence.commit_notify().notified();
@@ -223,9 +220,10 @@ async fn orchestrator_reorg_truncates_leaves_past_height() {
         .send(ConsumerEvent::Reorg(100))
         .await
         .expect("send reorg");
-    tokio::time::timeout(Duration::from_secs(30), commit_fut)
-        .await
-        .expect("reorg-driven commit did not fire within 30s");
+    progress::await_or_stalled("reorg-driven commit", commit_fut, || {
+        progress::consumer_motion(&handle.metrics, &handle.persistence)
+    })
+    .await;
 
     // snapshot fields out: don't hold the parking_lot guards across the await below
     let (count, leaf_0, has_1, has_2) = {
@@ -259,5 +257,12 @@ async fn orchestrator_reorg_truncates_leaves_past_height() {
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("shutdown");
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle.consumer).await;
+    progress::join_consumer(
+        "shutdown",
+        handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await
+    .expect("final commit");
 }

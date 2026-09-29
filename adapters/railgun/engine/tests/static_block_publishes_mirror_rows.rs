@@ -11,6 +11,9 @@
     clippy::unwrap_used
 )]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use std::time::Duration;
 
 use raven_inspire::params::{InspireParams, InspireVariant};
@@ -24,7 +27,7 @@ use raven_railgun_engine::inspire::{
 use raven_railgun_engine::orchestrator::{
     bootstrap_railgun_engine_multi, DataSourceFilter, InstanceConfig, MultiOrchestratorHandle,
 };
-use raven_railgun_engine::persistence::{ConsumerEvent, SnapshotPolicy};
+use raven_railgun_engine::persistence::SnapshotPolicy;
 use raven_railgun_engine::pir_table::list::PATH10_MAGIC;
 use raven_railgun_engine::pir_table::{EncoderKind, PATH10_RECORD_BYTES};
 use raven_railgun_engine::{InstanceRole, PirScheme};
@@ -37,9 +40,13 @@ const ROWS: u32 = 3;
 const PATH10_STATUS: usize = 32;
 const PATH10_MARKER: std::ops::Range<usize> = 34..38;
 const BOUND_SECS: u64 = 2;
-/// Far past [`BOUND_SECS`], so only a block that never applies or never publishes reaches it on
-/// a loaded box.
-const PUBLISH_DEADLINE: Duration = Duration::from_secs(45);
+/// The steady feed's pace: one row per tick, and a tick never shorter than this.
+const TICK_MS: u64 = 500;
+const TICK: Duration = Duration::from_millis(TICK_MS);
+/// Rows by which the steady feed must see a publish. The timer starts before the second row is
+/// sent, and row `k` reads the shortened bound more than `k - 2` ticks after that, so this row
+/// publishes at the latest. Counted in rows: a slow box only stretches the ticks.
+const MAX_ROWS_BEFORE_PUBLISH: u64 = BOUND_SECS * 1000 / TICK_MS + 2;
 
 /// The static policy with its timer short enough to observe.
 fn short_bound() -> SnapshotPolicy {
@@ -102,25 +109,46 @@ fn boot(
     .expect("boot")
 }
 
-/// Stops without the Shutdown commit, the way a kill does.
-fn stop_uncleanly(handle: MultiOrchestratorHandle) {
-    for instance in &handle.instances {
-        instance.consumer.abort();
-    }
+/// Stops without the Shutdown commit, the way a kill does, and returns once the consumer is gone
+/// so a reboot never opens a data dir it is still writing.
+async fn stop_uncleanly(handle: MultiOrchestratorHandle) {
     handle.router.abort();
+    for mut instance in handle.instances {
+        progress::abort_consumer(
+            "aborted consumer exiting",
+            &mut instance.consumer,
+            &instance.metrics,
+            &instance.persistence,
+        )
+        .await;
+    }
 }
 
-/// Waits for the store's dirty set to drain, up to [`PUBLISH_DEADLINE`], and returns how long it
-/// waited. It does not assert: the served decode that follows is the proof, and the wait it
-/// prints tells a slow box (short) from a block that never published (the full deadline).
+/// Waits for the store's dirty set to drain and for the commit that drained it to land, and
+/// returns how long that took. A block that never publishes stops moving and fails here.
 async fn wait_published(handle: &MultiOrchestratorHandle) -> Duration {
     let booted = handle.instances.first().expect("one instance");
     let started = tokio::time::Instant::now();
-    while !booted.logical_store.lock().dirty_shards().is_empty()
-        && started.elapsed() < PUBLISH_DEADLINE
-    {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    progress::until_done_or_stalled("the block publishing its applied rows", || {
+        (
+            progress::consumer_motion(&booted.metrics, &booted.persistence),
+            booted
+                .logical_store
+                .lock()
+                .dirty_shards()
+                .is_empty()
+                .then_some(()),
+        )
+    })
+    .await;
+    // The commit clears the dirty set before it counts itself.
+    progress::drained(
+        "the publish landing",
+        &booted.sender,
+        &booted.metrics,
+        &booted.persistence,
+    )
+    .await;
     started.elapsed()
 }
 
@@ -168,8 +196,7 @@ async fn mirror_rows(
 
 async fn wait_applied(handle: &MultiOrchestratorHandle, rows: u32) {
     let booted = handle.instances.first().expect("one instance");
-    let deadline = tokio::time::Instant::now() + PUBLISH_DEADLINE;
-    loop {
+    progress::until_done_or_stalled(&format!("the block applying {rows} rows"), || {
         assert_eq!(
             booted.metrics.lock().consumer_errors,
             0,
@@ -180,15 +207,15 @@ async fn wait_applied(handle: &MultiOrchestratorHandle, rows: u32) {
             .lock()
             .ppoi_imt(&LIST_KEY)
             .map_or(0, Imt::leaf_count);
-        if applied == rows as usize {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the block applied {applied} of {rows} rows"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+        (
+            (
+                applied,
+                progress::consumer_motion(&booted.metrics, &booted.persistence),
+            ),
+            (applied == rows as usize).then_some(()),
+        )
+    })
+    .await;
 }
 
 fn decrypt_row(state: &InspireServerState, secret_key: RlweSecretKey, list_index: u32) -> Vec<u8> {
@@ -210,25 +237,35 @@ fn decrypt_row(state: &InspireServerState, secret_key: RlweSecretKey, list_index
 /// Rows applied and then a quiet feed: nothing else arrives, no chain signal, no shutdown.
 ///
 /// The static policy's timer is shortened to [`BOUND_SECS`] so the bound is observable in a test;
-/// the production static policy's own bound is pinned in the persistence unit tests. The feed is
-/// row 0, a quiet spell past the timer, then rows 1 and 2 back to back, so an append-driven
-/// trigger can fire on row 1 but not on row 2. Whatever published the last row did so with no
-/// event after it.
+/// the production static policy's own bound is pinned in the persistence unit tests. Row 0 is
+/// published first, so the later rows arm the timer after a commit rather than at boot. They
+/// append under the static policy, which has no trigger, and the bound is shortened only after
+/// their append checks ran: the one event after them is a heartbeat, which appends nothing, so
+/// what publishes them is the timer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_static_block_serves_mirrored_rows_once_the_feed_goes_quiet() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (fresh, secret_key) = fresh_state();
     let handle = boot(dir.path(), short_bound(), Some(fresh));
+    let booted = handle.instances.first().expect("one instance");
     let mut upstream = Imt::new().expect("reference tree");
 
     mirror_rows(&handle, &mut upstream, 0..1).await;
     wait_applied(&handle, 1).await;
-    tokio::time::sleep(Duration::from_millis(BOUND_SECS * 1000 + 500)).await;
+    wait_published(&handle).await;
+
+    booted
+        .persistence
+        .set_snapshot_policy(SnapshotPolicy::static_default());
     mirror_rows(&handle, &mut upstream, 1..ROWS).await;
     wait_applied(&handle, ROWS).await;
+    let (sender, metrics, persistence) = (&booted.sender, &booted.metrics, &booted.persistence);
+    progress::drained("the rows' append checks", sender, metrics, persistence).await;
+    booted.persistence.set_snapshot_policy(short_bound());
+    // A policy change wakes nothing: the consumer reads the bound at its next loop top.
+    progress::drained("a heartbeat after the bound", sender, metrics, persistence).await;
 
     let waited = wait_published(&handle).await;
-    let booted = handle.instances.first().expect("one instance");
     assert_serves(
         &booted.instance.current_state(),
         secret_key,
@@ -239,7 +276,7 @@ async fn a_static_block_serves_mirrored_rows_once_the_feed_goes_quiet() {
         booted.logical_store.lock().dirty_shards().is_empty(),
         "nothing applied is left unpublished"
     );
-    stop_uncleanly(handle);
+    stop_uncleanly(handle).await;
 }
 
 /// A feed that never goes quiet must not hold off the publish: a row arrives every half second,
@@ -247,11 +284,11 @@ async fn a_static_block_serves_mirrored_rows_once_the_feed_goes_quiet() {
 ///
 /// The shortened timer would also fire the append trigger on every row and publish them whatever
 /// the consumer does, so each row appends under the static policy, which has no trigger, as in
-/// production. The bound is shortened again for a heartbeat sent after the row: it appends
-/// nothing, and it is where the consumer next reads the bound.
+/// production, and the bound is shortened only after the row's append check ran. Two heartbeats
+/// follow: they append nothing, and the second is taken only after the consumer has read the
+/// shortened bound, where a due publish runs before the next receive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_steady_feed_does_not_hold_off_the_publish() {
-    const TICK: Duration = Duration::from_millis(500);
     let min_feed = Duration::from_secs(BOUND_SECS * 3);
     let dir = tempfile::tempdir().expect("tempdir");
     let (fresh, secret_key) = fresh_state();
@@ -265,7 +302,7 @@ async fn a_steady_feed_does_not_hold_off_the_publish() {
     let mut served = None;
     while served.is_none() || started.elapsed() < min_feed {
         assert!(
-            started.elapsed() < PUBLISH_DEADLINE,
+            served.is_some() || u64::from(rows) < MAX_ROWS_BEFORE_PUBLISH,
             "{rows} rows, one per {TICK:?}, and no publish at a {BOUND_SECS} s bound"
         );
         let next_tick = tokio::time::Instant::now() + TICK;
@@ -275,16 +312,19 @@ async fn a_steady_feed_does_not_hold_off_the_publish() {
         mirror_rows(&handle, &mut upstream, rows..rows + 1).await;
         rows += 1;
         wait_applied(&handle, rows).await;
+        // The leaf count moves before the append check reads the bound.
+        progress::drained(
+            "the row's append check",
+            &booted.sender,
+            &booted.metrics,
+            &booted.persistence,
+        )
+        .await;
         booted.persistence.set_snapshot_policy(short_bound());
         // Straight to the consumer: the router sends heartbeats to chain-tree instances only.
-        booted
-            .sender
-            .send(ConsumerEvent::Heartbeat {
-                chain_head: 0,
-                scanned_through: 0,
-            })
-            .await
-            .expect("consumer open");
+        for what in ["a heartbeat", "a heartbeat after the bound is read"] {
+            progress::drained(what, &booted.sender, &booted.metrics, &booted.persistence).await;
+        }
         tokio::time::sleep_until(next_tick).await;
         // A publish swaps the served state before it counts the commit.
         if served.is_none() && booted.metrics.lock().commits_fired > commits {
@@ -299,23 +339,37 @@ async fn a_steady_feed_does_not_hold_off_the_publish() {
         0,
         "a commit landed during the feed and left it unserved",
     );
-    stop_uncleanly(handle);
+    stop_uncleanly(handle).await;
 }
 
 /// A kill leaves the rows in the WAL and out of the snapshot. Recovery replays them into the
 /// logical store only, so the restarted block must still publish them on its own.
 ///
-/// The first life runs the production static policy, whose bound is far past this test, so the
-/// kill is sure to land before any publish.
+/// The first life runs the production static policy, whose bound is far past this test, and is
+/// killed only once its append checks have run without a publish.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_static_block_serves_the_rows_its_wal_replayed() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (fresh, secret_key) = fresh_state();
     let first = boot(dir.path(), SnapshotPolicy::static_default(), Some(fresh));
+    let life = first.instances.first().expect("one instance");
+    let commits = life.metrics.lock().commits_fired;
     let mut upstream = Imt::new().expect("reference tree");
     mirror_rows(&first, &mut upstream, 0..ROWS).await;
     wait_applied(&first, ROWS).await;
-    stop_uncleanly(first);
+    progress::drained(
+        "the first life's append checks",
+        &life.sender,
+        &life.metrics,
+        &life.persistence,
+    )
+    .await;
+    assert_eq!(
+        life.metrics.lock().commits_fired,
+        commits,
+        "precondition: the first life published nothing, so the restart has the rows to publish"
+    );
+    stop_uncleanly(first).await;
 
     let second = boot(dir.path(), short_bound(), None);
     let booted = second.instances.first().expect("one instance");
@@ -338,7 +392,7 @@ async fn a_restarted_static_block_serves_the_rows_its_wal_replayed() {
              after {waited:?}"
         ),
     );
-    stop_uncleanly(second);
+    stop_uncleanly(second).await;
 }
 
 /// Once nothing is pending the block commits nothing while no event arrives.
@@ -357,8 +411,6 @@ async fn a_static_block_takes_no_commit_while_idle() {
         "precondition: the rows were published, still pending after {waited:?}"
     );
 
-    // The publish counts its commit just after draining the dirty set; let it land first.
-    tokio::time::sleep(Duration::from_millis(500)).await;
     let commits = booted.metrics.lock().commits_fired;
     tokio::time::sleep(Duration::from_secs(BOUND_SECS * 3)).await;
     assert_eq!(
@@ -366,5 +418,5 @@ async fn a_static_block_takes_no_commit_while_idle() {
         commits,
         "a block with nothing pending and no event must take no periodic commit"
     );
-    stop_uncleanly(handle);
+    stop_uncleanly(handle).await;
 }

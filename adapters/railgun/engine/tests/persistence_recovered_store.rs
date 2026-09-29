@@ -4,10 +4,12 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use raven_inspire::params::InspireParams;
@@ -188,23 +190,16 @@ async fn drain_until<F: Fn(&raven_railgun_engine::persistence::ConsumerMetrics) 
     label: &str,
     done: F,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let snap = *handle.metrics.lock();
-        if done(&snap) {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{label}: events_processed = {}, commits_fired = {}, consumer_errors = {}, \
-             leaf_count = {}",
-            snap.events_processed,
-            snap.commits_fired,
-            snap.consumer_errors,
-            handle.logical_store.lock().leaf_count(),
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    progress::until_done_or_stalled(label, || {
+        (
+            (
+                handle.logical_store.lock().leaf_count(),
+                progress::consumer_motion(&handle.metrics, &handle.persistence),
+            ),
+            done(&handle.metrics.lock()).then_some(()),
+        )
+    })
+    .await;
 }
 
 async fn shutdown(handle: OrchestratorHandle) {
@@ -213,11 +208,14 @@ async fn shutdown(handle: OrchestratorHandle) {
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("shutdown");
-    tokio::time::timeout(Duration::from_secs(30), handle.consumer)
-        .await
-        .expect("consumer shutdown timeout")
-        .expect("consumer join")
-        .expect("consumer shutdown");
+    progress::join_consumer(
+        "shutdown",
+        handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await
+    .expect("consumer shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -331,12 +329,12 @@ async fn reorg_while_down_replaces_persisted_orphan_leaves() {
         "restart precondition must include the complete orphaned suffix"
     );
     let second_worker = IndexerWorker::new(Arc::clone(&source), second.channels.indexer_tx.clone());
-    let second_run = tokio::time::timeout(
-        Duration::from_secs(10),
+    let second_run = progress::await_or_stalled(
+        "startup reconciliation",
         second_worker.spawn_reconciled(worker_config(2, window.clone())),
+        || progress::consumer_motion(&second.metrics, &second.persistence),
     )
     .await
-    .expect("startup reconciliation timeout")
     .expect("startup reconciliation");
     assert_eq!(
         second.persistence.manifest_block_height(),

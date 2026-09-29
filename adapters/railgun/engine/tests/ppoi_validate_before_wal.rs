@@ -6,9 +6,10 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use std::sync::Arc;
+#[path = "support/progress.rs"]
+mod progress;
+
 use std::sync::OnceLock;
-use std::time::Duration;
 
 use raven_inspire::params::InspireParams;
 use raven_railgun_core::InstanceId;
@@ -116,30 +117,30 @@ async fn ppoi_non_contiguous_list_leaf_never_reaches_the_wal() {
         .await
         .expect("send non-contiguous leaf");
 
-    let metrics = Arc::clone(&handle.metrics);
-    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let m = *metrics.lock();
-        if m.events_processed >= 1 && m.consumer_errors >= 1 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < drain_deadline,
-            "consumer did not accept one leaf and reject the other within 30 s; \
-             events_processed = {}, consumer_errors = {}",
-            m.events_processed,
-            m.consumer_errors,
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    progress::until_done_or_stalled("accept one leaf and reject the other", || {
+        let m = *handle.metrics.lock();
+        (
+            progress::consumer_motion(&handle.metrics, &handle.persistence),
+            (m.events_processed >= 1 && m.consumer_errors >= 1).then_some(()),
+        )
+    })
+    .await;
 
     // Closing the channel instead of sending Shutdown: Shutdown drive_commits,
     // which archives the log and makes the reopen replay nothing.
     drop(handle.channels);
     drop(handle.sender);
-    let _ = tokio::time::timeout(Duration::from_secs(10), handle.indexer_bridge).await;
-    let _ = tokio::time::timeout(Duration::from_secs(10), handle.mirror_bridge).await;
-    let _ = tokio::time::timeout(Duration::from_secs(10), handle.consumer).await;
+    // A bridge exits once its inbound channel closes; it has no progress of its own to show.
+    progress::join_or_stalled("indexer bridge", handle.indexer_bridge, || ()).await;
+    progress::join_or_stalled("mirror bridge", handle.mirror_bridge, || ()).await;
+    progress::join_consumer(
+        "consumer on a closed channel",
+        handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await
+    .expect("consumer on a closed channel");
     drop(handle.persistence);
 
     let wal_indexes = ppoi_list_indexes_in_wal(dir.path());

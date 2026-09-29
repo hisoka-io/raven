@@ -4,12 +4,15 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use std::time::Duration;
+#[path = "support/progress.rs"]
+mod progress;
 
 use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
 use raven_railgun_engine::inspire::InspireServerState;
-use raven_railgun_engine::orchestrator::{bootstrap_railgun_engine, OrchestratorConfig};
+use raven_railgun_engine::orchestrator::{
+    bootstrap_railgun_engine, OrchestratorConfig, OrchestratorHandle,
+};
 use raven_railgun_engine::persistence::{ConsumerEvent, SnapshotPolicy};
 use raven_railgun_engine::InstanceRole;
 use raven_railgun_persistence::WalEntryPayload;
@@ -61,29 +64,17 @@ fn quiet_config(dir: &std::path::Path, instance_id: &str) -> OrchestratorConfig 
 }
 
 async fn drain_until<F: Fn(&raven_railgun_engine::persistence::ConsumerMetrics) -> bool>(
-    metrics: &parking_lot::Mutex<raven_railgun_engine::persistence::ConsumerMetrics>,
+    handle: &OrchestratorHandle,
     label: &str,
     done: F,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let snap = *metrics.lock();
-        if done(&snap) {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{label}: consumer never reached the target state; \
-             events_processed = {}, commits_fired = {}, reorgs_handled = {}, \
-             consumer_errors = {}, last_applied_leaf_block = {}",
-            snap.events_processed,
-            snap.commits_fired,
-            snap.reorgs_handled,
-            snap.consumer_errors,
-            snap.last_applied_leaf_block,
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    progress::until_done_or_stalled(label, || {
+        (
+            progress::consumer_motion(&handle.metrics, &handle.persistence),
+            done(&handle.metrics.lock()).then_some(()),
+        )
+    })
+    .await;
 }
 
 /// A PPOI row carries mirror height 0. Applying it must not move the chain
@@ -106,7 +97,7 @@ async fn ppoi_height_zero_must_not_collapse_the_resume_floor() {
             .await
             .expect("send leaf");
     }
-    drain_until(&handle.metrics, "chain leaves", |m| {
+    drain_until(&handle, "chain leaves", |m| {
         m.last_applied_leaf_block >= LAST_LEAF_HEIGHT
     })
     .await;
@@ -128,7 +119,7 @@ async fn ppoi_height_zero_must_not_collapse_the_resume_floor() {
             .expect("send mirror row");
     }
     // The rows sync and commit as one run, not one by one.
-    drain_until(&handle.metrics, "mirror rows", |m| {
+    drain_until(&handle, "mirror rows", |m| {
         m.events_processed >= u64::from(LEAVES) + 4 && m.commits_fired > leaves_committed
     })
     .await;
@@ -151,7 +142,14 @@ async fn ppoi_height_zero_must_not_collapse_the_resume_floor() {
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("shutdown");
-    let _ = tokio::time::timeout(Duration::from_secs(30), handle.consumer).await;
+    progress::join_consumer(
+        "shutdown",
+        handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await
+    .expect("final commit");
 }
 
 /// Nothing but a reorg rewind may lower the floor. A chain source that returns a
@@ -176,7 +174,7 @@ async fn a_leaf_below_the_floor_must_not_lower_it() {
             .await
             .expect("send leaf");
     }
-    drain_until(&handle.metrics, "chain leaves", |m| {
+    drain_until(&handle, "chain leaves", |m| {
         m.last_applied_leaf_block >= LAST_LEAF_HEIGHT && m.commits_fired >= u64::from(LEAVES)
     })
     .await;
@@ -189,7 +187,7 @@ async fn a_leaf_below_the_floor_must_not_lower_it() {
         ))
         .await
         .expect("send out-of-order leaf");
-    drain_until(&handle.metrics, "out-of-order leaf", |m| {
+    drain_until(&handle, "out-of-order leaf", |m| {
         m.commits_fired > u64::from(LEAVES)
     })
     .await;
@@ -212,7 +210,14 @@ async fn a_leaf_below_the_floor_must_not_lower_it() {
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("shutdown");
-    let _ = tokio::time::timeout(Duration::from_secs(30), handle.consumer).await;
+    progress::join_consumer(
+        "shutdown",
+        handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await
+    .expect("final commit");
 }
 
 /// A reorg rewinds applied leaves, so the floor it leaves behind must be the
@@ -240,7 +245,7 @@ async fn reorg_must_lower_the_shutdown_resume_floor() {
     }
     // `reorgs_handled` is bumped before the commit it drives, so every manifest
     // read gates on `commits_fired` or it races the write it asserts on.
-    drain_until(&handle.metrics, "chain leaves", |m| {
+    drain_until(&handle, "chain leaves", |m| {
         m.last_applied_leaf_block >= LAST_LEAF_HEIGHT && m.commits_fired >= u64::from(LEAVES)
     })
     .await;
@@ -250,7 +255,7 @@ async fn reorg_must_lower_the_shutdown_resume_floor() {
         .send(ConsumerEvent::Reorg(REORG_HEIGHT))
         .await
         .expect("send reorg");
-    drain_until(&handle.metrics, "reorg", |m| {
+    drain_until(&handle, "reorg", |m| {
         m.reorgs_handled >= 1 && m.commits_fired > u64::from(LEAVES)
     })
     .await;
@@ -273,7 +278,7 @@ async fn reorg_must_lower_the_shutdown_resume_floor() {
         .send(ConsumerEvent::Reorg(DEEP_REORG_HEIGHT))
         .await
         .expect("send reorg above the floor");
-    drain_until(&handle.metrics, "reorg above floor", |m| {
+    drain_until(&handle, "reorg above floor", |m| {
         m.reorgs_handled >= 2 && m.commits_fired > u64::from(LEAVES) + 1
     })
     .await;
@@ -297,7 +302,14 @@ async fn reorg_must_lower_the_shutdown_resume_floor() {
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("shutdown");
-    let _ = tokio::time::timeout(Duration::from_secs(30), handle.consumer).await;
+    progress::join_consumer(
+        "shutdown",
+        handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await
+    .expect("final commit");
 
     assert_eq!(
         handle.persistence.manifest_block_height(),

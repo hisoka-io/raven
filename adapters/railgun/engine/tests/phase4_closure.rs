@@ -9,6 +9,9 @@
     clippy::print_stderr
 )]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
 use raven_railgun_engine::inspire::{
@@ -19,7 +22,6 @@ use raven_railgun_engine::orchestrator::{bootstrap_railgun_engine, OrchestratorC
 use raven_railgun_engine::persistence::ConsumerEvent;
 use raven_railgun_engine::{InstanceRole, PirScheme};
 use std::sync::Arc;
-use std::time::Duration;
 
 const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-test";
 
@@ -107,12 +109,10 @@ async fn phase4_chain_event_propagates_to_pir_response() {
         .send(ConsumerEvent::Reorg(100))
         .await
         .expect("send reorg");
-    tokio::time::timeout(Duration::from_secs(60), commit_fut)
-        .await
-        .expect(
-            "commit fired within 60s (re-encode latency at toy cell ~5ms; \
-                 60s allows for slow CI)",
-        );
+    progress::await_or_stalled("reorg-driven commit", commit_fut, || {
+        progress::consumer_motion(&handle.metrics, &handle.persistence)
+    })
+    .await;
 
     let surviving = {
         let store = handle.logical_store.lock();
@@ -170,7 +170,14 @@ async fn phase4_chain_event_propagates_to_pir_response() {
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("shutdown");
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle.consumer).await;
+    progress::join_consumer(
+        "shutdown",
+        handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await
+    .expect("final commit");
 }
 
 // A head-based resume floor would wedge the tree on the next append, so shutdown
@@ -236,9 +243,14 @@ async fn resume_floor_is_last_leaf_block_not_chain_head() {
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("shutdown");
-    let _ = tokio::time::timeout(Duration::from_secs(30), handle.consumer)
-        .await
-        .expect("consumer joins");
+    progress::join_consumer(
+        "shutdown",
+        handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await
+    .expect("final commit");
 
     assert_eq!(
         handle.persistence.manifest_block_height(),
@@ -322,9 +334,10 @@ async fn phase4_chain_event_propagates_to_pir_response_at_production_cell() {
         .send(ConsumerEvent::Reorg(100))
         .await
         .expect("send reorg");
-    tokio::time::timeout(Duration::from_secs(120), commit_fut)
-        .await
-        .expect("commit fired within 120s at production cell");
+    progress::await_or_stalled("reorg-driven commit", commit_fut, || {
+        progress::consumer_motion(&handle.metrics, &handle.persistence)
+    })
+    .await;
 
     let surviving = {
         let store = handle.logical_store.lock();
@@ -386,5 +399,12 @@ async fn phase4_chain_event_propagates_to_pir_response_at_production_cell() {
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("shutdown");
-    let _ = tokio::time::timeout(Duration::from_secs(10), handle.consumer).await;
+    progress::join_consumer(
+        "shutdown",
+        handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await
+    .expect("final commit");
 }

@@ -5,7 +5,8 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use std::time::Duration;
+#[path = "support/progress.rs"]
+mod progress;
 
 use raven_inspire::params::InspireParams;
 use raven_railgun_core::{CommitmentLeaf, RailgunEvent};
@@ -80,24 +81,14 @@ async fn settle<F: Fn(&ConsumerMetrics) -> bool>(
     label: &str,
     done: F,
 ) -> ConsumerMetrics {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    loop {
+    progress::until_done_or_stalled(label, || {
         let snap = *handle.metrics.lock();
-        if done(&snap) {
-            return snap;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{label}: consumer never settled; events_processed = {}, \
-             consumer_errors = {}, last_applied_block = {}, \
-             last_applied_leaf_block = {}",
-            snap.events_processed,
-            snap.consumer_errors,
-            snap.last_applied_block,
-            snap.last_applied_leaf_block,
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+        (
+            progress::consumer_motion(&handle.metrics, &handle.persistence),
+            done(&snap).then_some(snap),
+        )
+    })
+    .await
 }
 
 fn leaf_count(handle: &OrchestratorHandle) -> usize {
@@ -110,7 +101,14 @@ async fn shutdown(handle: OrchestratorHandle) {
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("shutdown");
-    let _ = tokio::time::timeout(Duration::from_secs(30), handle.consumer).await;
+    progress::join_consumer(
+        "shutdown",
+        handle.consumer,
+        &handle.metrics,
+        &handle.persistence,
+    )
+    .await
+    .expect("final commit");
 }
 
 /// A kill between two leaves of one event leaves the resume floor at that block,
