@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -68,9 +68,9 @@ pub enum SessionStoreError {
         /// Configured occupancy ceiling.
         max_sessions: usize,
     },
-    /// Every resident session is still live and the ceiling is reached.
+    /// Live sessions and registrations still deriving their keys fill the ceiling.
     #[error(
-        "session store holds {max_sessions} live sessions, its configured ceiling; refusing registration rather than retiring another caller's keys, retry after a session expires (ttl {ttl_secs}s)"
+        "session store is at its configured ceiling of {max_sessions} live sessions, counting registrations in progress; refusing registration rather than retiring another caller's keys, retry after a session expires (ttl {ttl_secs}s)"
     )]
     AtCapacity {
         /// Configured occupancy ceiling.
@@ -594,6 +594,61 @@ fn encode_handle_record(floor: u64, magic: [u8; 8]) -> [u8; HANDLE_FLOOR_BYTES] 
     bytes
 }
 
+/// A seat counted against the ceiling while its keys derive outside the store lock.
+struct SeatReservation<'a> {
+    owner: Option<&'a BoundedSessionStore>,
+}
+
+impl SeatReservation<'_> {
+    /// Hand the seat back under the lock that also inserts its keys, so no admission check
+    /// sees it twice or not at all.
+    fn release(mut self, _locked: &mut Generation) {
+        if let Some(owner) = self.owner.take() {
+            owner.pending_seats.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for SeatReservation<'_> {
+    fn drop(&mut self) {
+        // Reached only by unwinding out of the derivation; the lock keeps the count exact.
+        if let Some(owner) = self.owner.take() {
+            let _generation = owner.current.write();
+            owner.pending_seats.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Validate wire keys and expand their rotations. A private inner store runs the expansion:
+/// its `register_server_side` is the public path that checks the key geometry first.
+fn derive_server_keys(
+    keys: ClientPackingKeys,
+    pack_params: &PackParams,
+    context: &NttContext,
+) -> Result<ClientPackingKeys> {
+    fn inspire<E: std::error::Error + Send + Sync + 'static>(
+        operation: &'static str,
+    ) -> impl FnOnce(E) -> SessionStoreError {
+        move |source| SessionStoreError::Inspire {
+            operation,
+            source: Box::new(source),
+        }
+    }
+    let scratch = ServerSessionStore::new();
+    let handle = scratch
+        .register_server_side(keys, pack_params, context)
+        .map_err(inspire("session register_server_side"))?;
+    let derived = scratch
+        .get(handle)
+        .map_err(inspire("session key derivation"))?
+        .ok_or_else(|| SessionStoreError::Inspire {
+            operation: "session key derivation",
+            source: "derived keys missing from the private store that registered them".into(),
+        })?;
+    drop(scratch);
+    Ok(Arc::unwrap_or_clone(derived))
+}
+
 /// Occupancy-bounded session store with optional restart-safe external handles.
 ///
 /// In-process reclamation replaces a whole generation. A resolved request retains an `Arc` to its
@@ -603,6 +658,9 @@ fn encode_handle_record(floor: u64, magic: [u8; 8]) -> [u8; HANDLE_FLOOR_BYTES] 
 pub struct BoundedSessionStore {
     limits: SessionStoreLimits,
     current: RwLock<Generation>,
+    /// Wire registrations admitted but still deriving keys unlocked. Changed and read only under
+    /// `current`'s write lock, so admission counts it exactly.
+    pending_seats: AtomicUsize,
     durable_handles: Option<Arc<DurableHandleAllocator>>,
     evicted_total: AtomicU64,
     flushes_total: AtomicU64,
@@ -641,6 +699,7 @@ impl BoundedSessionStore {
         Self {
             limits,
             current: RwLock::new(Generation::fresh()),
+            pending_seats: AtomicUsize::new(0),
             durable_handles: None,
             evicted_total: AtomicU64::new(0),
             flushes_total: AtomicU64::new(0),
@@ -669,6 +728,7 @@ impl BoundedSessionStore {
         Ok(Self {
             limits,
             current: RwLock::new(Generation::fresh()),
+            pending_seats: AtomicUsize::new(0),
             durable_handles: Some(Arc::new(DurableHandleAllocator::open(data_dir)?)),
             evicted_total: AtomicU64::new(0),
             flushes_total: AtomicU64::new(0),
@@ -682,6 +742,7 @@ impl BoundedSessionStore {
         Self {
             limits: self.limits,
             current: RwLock::new(Generation::fresh()),
+            pending_seats: AtomicUsize::new(0),
             durable_handles: self.durable_handles.clone(),
             evicted_total: AtomicU64::new(0),
             flushes_total: AtomicU64::new(0),
@@ -727,8 +788,8 @@ impl BoundedSessionStore {
 
     /// Register wire-delivered packing keys and derive the server-side representation.
     ///
-    /// Refuses with [`SessionStoreError::AtCapacity`] once `max_sessions` live sessions are
-    /// resident, rather than retiring any of them.
+    /// Refuses with [`SessionStoreError::AtCapacity`] once `max_sessions` live sessions, counting
+    /// registrations in progress, are resident, rather than retiring any of them.
     pub fn register_server_side(
         &self,
         keys: ClientPackingKeys,
@@ -740,8 +801,8 @@ impl BoundedSessionStore {
 
     /// Register wire-delivered packing keys against an explicit clock.
     ///
-    /// Refuses with [`SessionStoreError::AtCapacity`] once `max_sessions` live sessions are
-    /// resident, rather than retiring any of them.
+    /// Refuses with [`SessionStoreError::AtCapacity`] once `max_sessions` live sessions, counting
+    /// registrations in progress, are resident, rather than retiring any of them.
     pub fn register_server_side_at(
         &self,
         keys: ClientPackingKeys,
@@ -749,52 +810,51 @@ impl BoundedSessionStore {
         context: &NttContext,
         now: Instant,
     ) -> Observed<ServerSessionHandle> {
-        if let Err(error) = Self::validate_registration_limits(self.limits) {
-            return self.failed_observation(error);
-        }
-        let expires_at = match self.expiry_at(now) {
+        let expires_at = match self.registration_expiry(now) {
             Ok(expires_at) => expires_at,
             Err(error) => return self.failed_observation(error),
         };
-        let mut generation = self.current.write();
         let mut observation = SessionObservation::default();
         let mut warnings = Vec::new();
-        self.reclaim_expired(&mut generation, now, &mut observation, &mut warnings);
-        // Wire-delivered keys arrive from a caller that presented no credential, so
-        // whole-generation reclamation here would let any one of them discard every other
-        // caller's packing keys. Refusing ahead of the derivation also keeps a full pool
-        // from paying for the expansion.
-        if generation.store.len() >= self.limits.max_sessions {
-            observation.counts = Some(generation.counts());
-            self.finish_observation(&mut observation);
-            return Observed {
-                outcome: Err(SessionStoreError::AtCapacity {
-                    max_sessions: self.limits.max_sessions,
-                    ttl_secs: self.limits.ttl.as_secs(),
-                }),
-                observation,
-                warnings,
-            };
-        }
-        let outcome = (|| {
+        let seat = {
+            let mut generation = self.current.write();
+            self.reclaim_expired(&mut generation, now, &mut observation, &mut warnings);
+            // Wire-delivered keys arrive from a caller that presented no credential, so
+            // whole-generation reclamation here would let any one of them discard every other
+            // caller's packing keys. Refusing ahead of the derivation also keeps a full pool
+            // from paying for the expansion.
+            let pending = self.pending_seats.load(Ordering::Relaxed);
+            if generation.store.len().saturating_add(pending) >= self.limits.max_sessions {
+                return self.at_capacity(&generation, observation, warnings);
+            }
+            self.pending_seats.store(pending + 1, Ordering::Relaxed);
+            SeatReservation { owner: Some(self) }
+        };
+        // The expansion and a floor refill run unlocked: under the lock they would stall every
+        // query's resolve for the length of the derivation.
+        let prepared = derive_server_keys(keys, pack_params, context).and_then(|derived| {
             let external = self
                 .durable_handles
                 .as_ref()
                 .map(|allocator| allocator.allocate())
                 .transpose()?;
-            let inner = generation
-                .store
-                .register_server_side(keys, pack_params, context)
-                .map_err(|source| SessionStoreError::Inspire {
+            Ok((derived, external))
+        });
+        let mut generation = self.current.write();
+        seat.release(&mut generation);
+        let outcome = prepared.and_then(|(derived, external)| {
+            let inner = generation.store.register(derived).map_err(|source| {
+                SessionStoreError::Inspire {
                     operation: "session register_server_side",
                     source: Box::new(source),
-                })?;
+                }
+            })?;
             let handle = external.unwrap_or(inner);
             generation
                 .expiry
                 .insert(handle.0, SessionEntry { inner, expires_at });
             Ok(handle)
-        })();
+        });
         observation.counts = Some(generation.counts());
         self.finish_observation(&mut observation);
         Observed {
@@ -805,22 +865,27 @@ impl BoundedSessionStore {
     }
 
     /// Register an in-process client and install the external handle it must send.
+    ///
+    /// Once live sessions and wire registrations in progress fill every seat, the generation is
+    /// flushed: every resident session is retired and this one starts the next generation.
+    /// Refuses with [`SessionStoreError::AtCapacity`] when wire registrations in progress hold
+    /// every seat, since a flush cannot free those.
     pub fn register_client_session_at(
         &self,
         session: &mut ClientSession,
         now: Instant,
     ) -> Observed<Option<ServerSessionHandle>> {
-        if let Err(error) = Self::validate_registration_limits(self.limits) {
-            return self.failed_observation(error);
-        }
-        let expires_at = match self.expiry_at(now) {
+        let expires_at = match self.registration_expiry(now) {
             Ok(expires_at) => expires_at,
             Err(error) => return self.failed_observation(error),
         };
         let mut generation = self.current.write();
         let mut observation = SessionObservation::default();
         let mut warnings = Vec::new();
-        if Self::would_flush_after_sweep(&generation, now, self.limits.max_sessions) {
+        let Some(ceiling) = self.flushable_ceiling() else {
+            return self.at_capacity(&generation, observation, warnings);
+        };
+        if Self::would_flush_after_sweep(&generation, now, ceiling) {
             let outcome = (|| {
                 let external = self
                     .durable_handles
@@ -999,6 +1064,21 @@ impl BoundedSessionStore {
         }
     }
 
+    fn registration_expiry(&self, now: Instant) -> Result<Instant> {
+        Self::validate_registration_limits(self.limits)?;
+        self.expiry_at(now)
+    }
+
+    /// Seats a flush can free: the ceiling less the wire derivations in flight, `None` when
+    /// those hold every seat. Read under `current`'s write lock.
+    fn flushable_ceiling(&self) -> Option<usize> {
+        let pending = self.pending_seats.load(Ordering::Relaxed);
+        self.limits
+            .max_sessions
+            .checked_sub(pending)
+            .filter(|seats| *seats > 0)
+    }
+
     fn expiry_at(&self, now: Instant) -> Result<Instant> {
         now.checked_add(self.limits.ttl)
             .ok_or(SessionStoreError::ExpiryOverflow {
@@ -1013,6 +1093,24 @@ impl BoundedSessionStore {
             });
         }
         Ok(())
+    }
+
+    fn at_capacity<T>(
+        &self,
+        generation: &Generation,
+        mut observation: SessionObservation,
+        warnings: Vec<SessionWarning>,
+    ) -> Observed<T> {
+        observation.counts = Some(generation.counts());
+        self.finish_observation(&mut observation);
+        Observed {
+            outcome: Err(SessionStoreError::AtCapacity {
+                max_sessions: self.limits.max_sessions,
+                ttl_secs: self.limits.ttl.as_secs(),
+            }),
+            observation,
+            warnings,
+        }
     }
 
     fn failed_observation<T>(&self, error: SessionStoreError) -> Observed<T> {
@@ -1072,7 +1170,7 @@ impl BoundedSessionStore {
         warnings: &mut Vec<SessionWarning>,
     ) {
         self.reclaim_expired(generation, now, observation, warnings);
-        if generation.store.len() < self.limits.max_sessions {
+        if generation.store.len() < self.flushable_ceiling().unwrap_or(0) {
             return;
         }
         let dropped = u64::try_from(generation.store.len()).unwrap_or(u64::MAX);
@@ -1156,6 +1254,31 @@ mod tests {
             crs.inspiring_w_seed,
             &mut sampler,
         );
+        (keys, pack_params, params.ntt_context())
+    }
+
+    /// Keys as they arrive over the wire: rotations stripped, so registration derives them.
+    fn wire_registration_material(
+        gamma: usize,
+    ) -> (
+        ClientPackingKeys,
+        PackParams,
+        raven_inspire::math::NttContext,
+    ) {
+        let params = InspireParams::secure_128_d2048();
+        let database = vec![0u8; params.ring_dim * 32];
+        let mut sampler = GaussianSampler::with_seed(params.sigma, 121);
+        let (crs, _encoded, secret_key) =
+            setup(&params, &database, 32, &mut sampler).expect("setup");
+        let pack_params = PackParams::try_new(&params, gamma).expect("pack params");
+        let mut keys = ClientPackingKeys::generate(
+            &secret_key,
+            &pack_params,
+            crs.inspiring_w_seed,
+            &mut sampler,
+        );
+        keys.y_all.clear();
+        keys.y_all_ntt.clear();
         (keys, pack_params, params.ntt_context())
     }
 
@@ -1550,6 +1673,183 @@ mod tests {
         assert_eq!(store.flushes_total(), 0);
         assert!(store.resolve(Some(first), now).is_ok());
         assert_eq!(client.session_handle(), None);
+    }
+
+    #[test]
+    fn concurrent_handshakes_never_admit_past_the_ceiling() {
+        let (keys, pack_params, context) = wire_registration_material(64);
+        let store = store(3);
+        let now = Instant::now();
+        let start = std::sync::Barrier::new(8);
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        store
+                            .register_server_side_at(keys.clone(), &pack_params, &context, now)
+                            .outcome
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("handshake thread"))
+                .collect()
+        });
+
+        let admitted = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+        let refused = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Err(super::SessionStoreError::AtCapacity { .. })))
+            .count();
+        assert_eq!(
+            (admitted, refused),
+            (3, 5),
+            "exactly the ceiling is admitted"
+        );
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.serviceable_len(), 3);
+        assert_eq!(
+            store
+                .pending_seats
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let admitted_handle = outcomes
+            .iter()
+            .find_map(|outcome| outcome.as_ref().ok().copied());
+        let expanded = store
+            .resolve(admitted_handle, now)
+            .expect("an admitted handle resolves");
+        let inner = expanded.1.expect("inner handle");
+        let held = expanded.0.get(inner).expect("store").expect("keys");
+        assert_eq!(
+            held.y_all_ntt.len(),
+            63,
+            "registration derived the rotations"
+        );
+    }
+
+    #[test]
+    fn an_in_process_registration_leaves_room_for_a_wire_derivation_in_flight() {
+        let params = InspireParams::secure_128_d2048();
+        let database = vec![0u8; params.ring_dim * 32];
+        let mut sampler = GaussianSampler::with_seed(params.sigma, 123);
+        let (crs, _encoded, secret_key) =
+            setup(&params, &database, 32, &mut sampler).expect("setup");
+        let mut client = ClientSession::new(crs, secret_key, &mut sampler).expect("client session");
+        let store = store(2);
+        let now = Instant::now();
+        register(&store, now);
+        // The state register_server_side_at leaves while its keys derive unlocked.
+        let seat = {
+            let _generation = store.current.write();
+            store
+                .pending_seats
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            super::SeatReservation {
+                owner: Some(&store),
+            }
+        };
+
+        store
+            .register_client_session_at(&mut client, now)
+            .outcome
+            .expect("in-process registration");
+        let mut generation = store.current.write();
+        seat.release(&mut generation);
+        generation.store.register(keys()).expect("wire keys land");
+        let occupancy = generation.store.len();
+        drop(generation);
+
+        assert!(
+            occupancy <= 2,
+            "{occupancy} sessions resident against a ceiling of 2"
+        );
+    }
+
+    #[test]
+    fn an_in_process_registration_is_refused_while_wire_derivations_hold_every_seat() {
+        let params = InspireParams::secure_128_d2048();
+        let database = vec![0u8; params.ring_dim * 32];
+        let mut sampler = GaussianSampler::with_seed(params.sigma, 123);
+        let (crs, _encoded, secret_key) =
+            setup(&params, &database, 32, &mut sampler).expect("setup");
+        let mut client = ClientSession::new(crs, secret_key, &mut sampler).expect("client session");
+        let store = store(1);
+        let now = Instant::now();
+        let seat = {
+            let _generation = store.current.write();
+            store
+                .pending_seats
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            super::SeatReservation {
+                owner: Some(&store),
+            }
+        };
+
+        let refused = store.register_client_session_at(&mut client, now).outcome;
+        seat.release(&mut store.current.write());
+
+        assert!(
+            matches!(
+                refused,
+                Err(super::SessionStoreError::AtCapacity {
+                    max_sessions: 1,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn a_handshake_deriving_keys_does_not_hold_up_resolve() {
+        let (keys, pack_params, context) = wire_registration_material(256);
+        let store = store(8);
+        let now = Instant::now();
+        let solo = Instant::now();
+        let resident = store
+            .register_server_side_at(keys.clone(), &pack_params, &context, now)
+            .outcome
+            .expect("resident");
+        let derivation = solo.elapsed();
+
+        let slowest_resolve = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        store
+                            .register_server_side_at(keys.clone(), &pack_params, &context, now)
+                            .outcome
+                            .expect("handshake")
+                    })
+                })
+                .collect();
+            let mut slowest = Duration::ZERO;
+            while !workers
+                .iter()
+                .all(std::thread::ScopedJoinHandle::is_finished)
+            {
+                let asked = Instant::now();
+                store
+                    .resolve(Some(resident), now)
+                    .expect("resident resolves");
+                slowest = slowest.max(asked.elapsed());
+            }
+            for worker in workers {
+                worker.join().expect("handshake thread");
+            }
+            slowest
+        });
+
+        assert_eq!(store.len(), 5);
+        assert!(
+            slowest_resolve < derivation / 4,
+            "a resolve waited {slowest_resolve:?} behind handshakes that each derive for {derivation:?}"
+        );
     }
 
     #[test]

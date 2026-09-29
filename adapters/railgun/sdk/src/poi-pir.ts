@@ -65,6 +65,22 @@ export function validateBcHex(bc: string, label: string = "blindedCommitment"): 
   }
 }
 
+/** The 64 lower-case hex digits of the 32-byte value a blinded commitment spells. Upstream serves
+ *  some commitments without their leading zero digits, so 1 to 64 digits are taken, as the node's
+ *  mirror takes them. */
+export function canonicalCommitmentHex(bc: string, label: string = "blindedCommitment"): string {
+  const stripped = bc.startsWith("0x") || bc.startsWith("0X") ? bc.slice(2) : bc;
+  if (stripped.length === 0 || stripped.length > 64) {
+    throw RavenError.invalidQuery(
+      `${label}: expected 1 to 64 hex digits (a 32-byte value), got ${stripped.length}`,
+    );
+  }
+  if (!/^[0-9a-fA-F]+$/.test(stripped)) {
+    throw RavenError.invalidQuery(`${label}: contains non-hex characters`);
+  }
+  return stripped.toLowerCase().padStart(64, "0");
+}
+
 /** Validate that a list key is exactly 32 bytes of hex. */
 export function validateListKeyHex(listKey: string, label: string = "listKey"): void {
   const stripped = listKey.startsWith("0x") || listKey.startsWith("0X") ? listKey.slice(2) : listKey;

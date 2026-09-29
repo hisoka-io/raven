@@ -82,13 +82,14 @@ fn count_establish_refusal(instance_id: &InstanceId, reason: &'static str) {
 /// What a handshake's blocking derivation hands back.
 enum Derivation {
     Registered(ServerSessionHandle),
-    /// Every seat is held by a live session; the caller should retry later.
+    /// Every seat is held by a live session or a derivation in flight; the caller should retry
+    /// later.
     PoolFull(raven_railgun_core::AdapterError),
     Failed(raven_railgun_core::AdapterError),
 }
 
-/// Release a seat on a blocking thread: removal takes the store's write lock, which a
-/// derivation in progress holds.
+/// Release a seat on a blocking thread: removal waits for the store's write lock, which a sweep
+/// holds for its whole pass.
 async fn release_seat(state: Arc<InspireServerState>, handle: ServerSessionHandle) {
     if let Err(join) = tokio::task::spawn_blocking(move || state.session_store.remove(handle)).await
     {
@@ -131,8 +132,8 @@ async fn read_capped(mut body: Body, limit: usize) -> Result<Vec<u8>, StatusCode
     Ok(buffered)
 }
 
-/// Derive the server-side set on a blocking thread: derivation takes tens of milliseconds and
-/// waits on the store's lock, which would stall every route served by the same async workers.
+/// Derive the server-side set on a blocking thread: the key expansion is CPU-bound, and on an
+/// async worker it would stall every route that worker serves.
 /// The permit is held until the work ends, even when the handler has stopped waiting, because
 /// `spawn_blocking` cannot be cancelled.
 async fn derive_off_the_workers(
@@ -158,12 +159,16 @@ async fn derive_off_the_workers(
     let mut derivation = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let ctx = state.crs.params.ntt_context();
-        let store = &state.session_store;
-        match store.register_server_side(keys, state.cache.pack_params(), &ctx) {
+        match state
+            .session_store
+            .register_server_side(keys, state.cache.pack_params(), &ctx)
+        {
             Ok(handle) => Derivation::Registered(handle),
             // A re-handshake counts its own old seat too: that seat stays usable until a new one
             // replaces it.
-            Err(error) if store.len() >= store.limits().max_sessions => Derivation::PoolFull(error),
+            Err(error @ raven_railgun_core::AdapterError::AtCapacity(_)) => {
+                Derivation::PoolFull(error)
+            }
             Err(error) => Derivation::Failed(error),
         }
     });

@@ -131,7 +131,8 @@ impl BoundedSessionStore {
     ///
     /// # Errors
     ///
-    /// Returns an actionable adapter error when durability or InsPIRe rejects registration.
+    /// [`AdapterError::AtCapacity`] when live sessions and registrations still deriving fill the
+    /// ceiling; otherwise an actionable adapter error when durability or InsPIRe rejects it.
     pub fn register_server_side(
         &self,
         keys: ClientPackingKeys,
@@ -145,7 +146,8 @@ impl BoundedSessionStore {
     ///
     /// # Errors
     ///
-    /// Returns an actionable adapter error when durability or InsPIRe rejects registration.
+    /// [`AdapterError::AtCapacity`] when live sessions and registrations still deriving fill the
+    /// ceiling; otherwise an actionable adapter error when durability or InsPIRe rejects it.
     pub fn register_server_side_at(
         &self,
         keys: ClientPackingKeys,
@@ -163,7 +165,8 @@ impl BoundedSessionStore {
     ///
     /// # Errors
     ///
-    /// Returns [`AdapterError::Scheme`] when InsPIRe rejects registration or installation.
+    /// Returns [`AdapterError::AtCapacity`] when registrations still deriving hold every seat, and
+    /// [`AdapterError::Scheme`] when InsPIRe rejects registration or installation.
     pub fn register_client_session_at(
         &self,
         session: &mut ClientSession,
@@ -253,6 +256,9 @@ fn increment_evictions(reason: &'static str, count: u64) {
 }
 
 fn map_error(error: SessionStoreError) -> AdapterError {
+    if matches!(error, SessionStoreError::AtCapacity { .. }) {
+        return AdapterError::AtCapacity(error.to_string());
+    }
     match error.class() {
         SessionStoreErrorClass::Durability | SessionStoreErrorClass::Configuration => {
             AdapterError::Internal(error.to_string())
@@ -289,6 +295,18 @@ mod tests {
         assert!(matches!(
             map_error(error),
             AdapterError::SessionHandleRejected { detail } if detail == "replace this session"
+        ));
+    }
+
+    #[test]
+    fn a_full_pool_maps_to_its_own_variant() {
+        let error = SessionStoreError::AtCapacity {
+            max_sessions: 2,
+            ttl_secs: 60,
+        };
+        assert!(matches!(
+            map_error(error),
+            AdapterError::AtCapacity(detail) if detail.contains("2 live sessions")
         ));
     }
 

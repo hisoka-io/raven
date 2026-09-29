@@ -10,7 +10,7 @@ import {
   bytesToHex,
   containsByteSequence,
   hexToBytes,
-  validateBcHex,
+  canonicalCommitmentHex,
   validateListKeyHex,
   TREE_DEPTH,
 } from "./poi-pir";
@@ -454,7 +454,9 @@ export class RavenPOINodeInterface {
    * Per commitment and served list: `Valid` when its 6-byte prefix is among the rows synced in
    * this call, `ProofSubmitted` when this device submitted a proof covering it for that list and
    * it is not yet there, `Missing` otherwise. A blocked shield also reads `Missing`: nothing here
-   * says a shield is blocked, and `Missing` never makes a note spendable.
+   * says a shield is blocked, and `Missing` never makes a note spendable. A commitment spelled
+   * without its leading zero digits, as upstream serves some, is read as the 32-byte value it
+   * spells, and every answer is keyed by the caller's own string.
    *
    * Engine's status is a nominal string enum that no literal union is assignable to, so the
    * engine-shaped overload answers in engine's own type, and as the stock wallet interface does:
@@ -504,7 +506,7 @@ export class RavenPOINodeInterface {
       validateListKeyHex(lk);
     }
     for (const { blindedCommitment } of blindedCommitmentDatas) {
-      validateBcHex(blindedCommitment);
+      canonicalCommitmentHex(blindedCommitment);
     }
     for (const lk of listKeys) {
       if (!this.servesList(normalizeHex(lk))) {
@@ -533,7 +535,7 @@ export class RavenPOINodeInterface {
     };
     if (!listKeys.every((lk) => valid(() => validateListKeyHex(lk)))) return {};
     const asked = blindedCommitmentDatas.filter(({ blindedCommitment }) =>
-      valid(() => validateBcHex(blindedCommitment)),
+      valid(() => canonicalCommitmentHex(blindedCommitment)),
     );
     const served = listKeys.filter((lk) => this.servesList(normalizeHex(lk)));
     if (served.length === 0) return {};
@@ -559,7 +561,7 @@ export class RavenPOINodeInterface {
       out[blindedCommitment] ??= {};
     }
     const bcHexes = blindedCommitmentDatas.map(({ blindedCommitment }) =>
-      normalizeHex(blindedCommitment),
+      canonicalCommitmentHex(blindedCommitment),
     );
     for (const listKey of listKeys) {
       const lkHex = normalizeHex(listKey);
@@ -605,6 +607,8 @@ export class RavenPOINodeInterface {
     return out;
   }
 
+  /** A commitment spelled without its leading zero digits is proved as the 32-byte value it
+   *  spells, and its proof's `leaf` carries all 64 digits. */
   async getPOIMerkleProofs(
     txidVersion: string,
     chain: Chain,
@@ -638,7 +642,7 @@ export class RavenPOINodeInterface {
     }
     validateListKeyHex(listKey);
     for (const bc of blindedCommitments) {
-      validateBcHex(bc);
+      canonicalCommitmentHex(bc);
     }
     return this.getPOIMerkleProofsClientPir(listKey, blindedCommitments);
   }
@@ -817,7 +821,7 @@ export class RavenPOINodeInterface {
     blindedCommitment: string,
   ): Promise<{ rows: number; candidates: number[] }> {
     validateListKeyHex(listKey);
-    validateBcHex(blindedCommitment);
+    const bcHex = canonicalCommitmentHex(blindedCommitment);
     const lkHex = normalizeHex(listKey);
     const held = await this.heldIndex(lkHex);
     if (held === undefined) {
@@ -827,7 +831,7 @@ export class RavenPOINodeInterface {
     }
     return {
       rows: held.total,
-      candidates: indexCandidatesForEach(held, [normalizeHex(blindedCommitment)])[0],
+      candidates: indexCandidatesForEach(held, [bcHex])[0],
     };
   }
 
@@ -1038,7 +1042,7 @@ export class RavenPOINodeInterface {
     };
     // Resolve every commitment BEFORE any row query goes out: an unknown BC refuses without having
     // disclosed the others, and the grouping below needs the whole set in hand.
-    const bcHexes = blindedCommitments.map((bc) => normalizeHex(bc));
+    const bcHexes = blindedCommitments.map((bc) => canonicalCommitmentHex(bc));
     const candidateSets = indexCandidatesForEach(source.index, bcHexes);
     const listRows = Math.max(1, source.index.total);
     const firstAbsent = candidateSets.findIndex((candidates) => candidates.length === 0);

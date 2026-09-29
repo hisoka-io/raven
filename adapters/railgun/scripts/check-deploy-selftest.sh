@@ -11,8 +11,9 @@ failed=0
 
 fresh() {
   rm -rf "$scratch/a"
-  mkdir -p "$scratch/a/cli/src" "$scratch/a/deploy"
+  mkdir -p "$scratch/a/cli/src" "$scratch/a/deploy" "$scratch/a/examples"
   cp "$adapter"/Dockerfile* "$scratch/a/"
+  cp "$adapter/examples/mainnet-ppoi.toml" "$scratch/a/examples/"
   cp "$adapter/cli/src/serve_production_multi.rs" "$scratch/a/cli/src/"
   cp "$adapter/deploy/lib.sh" "$adapter/deploy/Caddyfile" "$adapter/deploy/deploy.sh" "$scratch/a/deploy/"
 }
@@ -49,5 +50,12 @@ expect "cf-connecting-ip passed through" "cf-connecting-ip" deploy/Caddyfile '/h
 expect "Caddy on a dual-stack socket" "IPv4 only" deploy/Caddyfile 's/default_bind tcp4\//default_bind /'
 expect "port published on every address" "beyond loopback" deploy/deploy.sh \
   's/--publish "127.0.0.1:/--publish "0.0.0.0:/'
+expect "default seats past the memory cap" "do not fit" deploy/deploy.sh 's/^max_sessions=32 /max_sessions=64 /'
+expect "default memory cap too small" "do not fit" deploy/deploy.sh 's/ memory=10g$/ memory=4g/'
+expect "seat size changed, help figure not" "does not state" deploy/lib.sh 's/^SEAT_MIB=24$/SEAT_MIB=12/'
+expect "seat size for another row" "record_size is not 512" examples/mainnet-ppoi.toml \
+  's/^record_size = 512$/record_size = 1024/'
+expect "an eighth instance" "does not state" examples/mainnet-ppoi.toml \
+  '$a [[instance]]'
 
 exit $failed

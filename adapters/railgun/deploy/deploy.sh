@@ -53,10 +53,19 @@ Options:
                           aggregator https://ppoi.fdi.network)
   --name NAME             prefix of containers, volumes, network and units (default raven)
   --port PORT             node port on 127.0.0.1 (default 8080)
-  --memory SIZE           node memory cap (default 4g: in rehearsal a warm boot peaked at
-                          1.8 GiB resident and settled at 1.2 GiB; the rest covers queries)
-  --wait SECS             how long to wait for every list to be caught up (default 120; a
-                          cold sync of the mainnet list took 8 minutes in rehearsal)
+  --memory SIZE           node memory cap (default 10g). The deploy refuses a cap below the
+                          node's worst case, in MiB:
+                            $NODE_PEAK_MIB + SEATS x INSTANCES x $SEAT_MIB + $HEADROOM_MIB
+                          the warm-boot peak (1.8 GiB in rehearsal, settling at 1.2 GiB), every
+                          packing-key seat full ($SEAT_MIB MiB each at a 512 B row), and headroom
+                          for queries. The defaults need 8243 MiB for the template's 7 instances.
+  --max-sessions N        packing-key seats per instance (default 32), written to the config
+                          as max_sessions_per_instance. A full instance refuses new sessions
+                          until one expires
+  --wait SECS             how long to wait for every list to be caught up (default 120). A cold
+                          sync asks upstream for pages of up to 501 rows at least 1 s apart,
+                          so the 363,278-row mainnet list takes at least 726 pages and 12
+                          minutes. --data-from skips it
   --caddy-image REF       default $CADDY_IMAGE_DEFAULT
   --bind-address ADDR     Caddy's listen address (default 0.0.0.0)
   --http-port N           Caddy's HTTP port (default 80)
@@ -69,8 +78,8 @@ Options:
 EOF
 }
 
-image="" hostname="" data_from="" replace_data=0 endpoint="" name=raven port=8080 memory=4g
-wait_secs=120 caddy_image=$CADDY_IMAGE_DEFAULT bind_address=0.0.0.0 http_port=80 https_port=443
+image="" hostname="" data_from="" replace_data=0 endpoint="" name=raven port=8080 memory=10g
+max_sessions=32 wait_secs=120 caddy_image=$CADDY_IMAGE_DEFAULT bind_address=0.0.0.0 http_port=80 https_port=443
 with_caddy=1 with_units=1 print_sg=0 admin_cidr="" vpc_id="" instance_id=""
 while (($#)); do
   case $1 in
@@ -82,6 +91,7 @@ while (($#)); do
     --name) name=$2; shift ;;
     --port) port=$2; shift ;;
     --memory) memory=$2; shift ;;
+    --max-sessions) max_sessions=$2; shift ;;
     --wait) wait_secs=$2; shift ;;
     --caddy-image) caddy_image=$2; shift ;;
     --bind-address) bind_address=$2; shift ;;
@@ -99,6 +109,8 @@ while (($#)); do
   shift
 done
 [[ $name =~ ^[a-z][a-z0-9-]*$ ]] || die "--name must be lowercase letters, digits and dashes"
+[[ $max_sessions =~ ^[1-9][0-9]{0,5}$ ]] || die "--max-sessions must be a whole number from 1"
+memory_cap_mib=$(memory_mib "$memory") || die "--memory $memory is not a size such as 10g or 8192m"
 
 print_sg() {
   [[ $admin_cidr =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]] \
@@ -163,7 +175,13 @@ trusted=""
 ((with_caddy == 0)) || trusted=$gateway/32
 
 say "config and token in volume $secrets"
-config=$(render_config "$image" "$endpoint" "$trusted") || die "no config written; the running node is untouched"
+config=$(render_config "$image" "$endpoint" "$trusted" "$max_sessions") \
+  || die "no config written; the running node is untouched"
+instances=$(grep -cE '^[[][[]instance[]][]]$' <<<"$config" || true)
+worst=$(worst_case_mib "$max_sessions" "$instances")
+((worst <= memory_cap_mib)) || die "the node needs up to $worst MiB ($NODE_PEAK_MIB boot peak + \
+$max_sessions seats x $instances instances x $SEAT_MIB MiB + $HEADROOM_MIB headroom), over --memory \
+$memory; raise --memory or lower --max-sessions. The running node is untouched"
 docker volume create "$secrets" >/dev/null
 install_secrets "$secrets" "$image" <<<"$config"
 

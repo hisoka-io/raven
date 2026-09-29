@@ -303,3 +303,53 @@ async fn a_failed_re_handshake_leaves_the_working_seat_serving() {
     );
     assert_eq!(instance.current_state().session_store.len(), 1);
 }
+
+/// A handshake refused while other seats are still deriving meets the same full pool as one
+/// refused against resident sessions: each refusal answers 503, never 500, and counts as `pool`.
+#[tokio::test]
+async fn a_refusal_while_seats_derive_is_a_counted_pool_refusal() {
+    const SEATS: usize = 2;
+    const EXTRA: usize = 4;
+    let mut config = HttpConfig::demo(READ_TOKEN);
+    config.max_sessions_per_instance = SEATS;
+    config.max_concurrent_handshakes = SEATS + EXTRA;
+    let limits = config.session_store_limits();
+    let Fixture {
+        router,
+        attacker_keys,
+        ..
+    } = fixture_with(config, Some(limits));
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let scrape = recorder.handle();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+
+    let mut storm = tokio::task::JoinSet::new();
+    for index in 0..SEATS + EXTRA {
+        let router = router.clone();
+        let keys = attacker_keys.clone();
+        storm.spawn(async move { establish(&router, &client_id_of(index), keys).await.0 });
+    }
+    let mut statuses = Vec::new();
+    while let Some(status) = storm.join_next().await {
+        statuses.push(status.expect("establish task"));
+    }
+
+    let admitted = statuses.iter().filter(|s| **s == StatusCode::OK).count();
+    let refused = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::SERVICE_UNAVAILABLE)
+        .count();
+    assert_eq!(
+        (admitted, refused),
+        (SEATS, EXTRA),
+        "every handshake past the {SEATS} seats must be a 503 pool refusal: {statuses:?}"
+    );
+    let pool_line = format!(
+        "raven_railgun_session_establish_refused_total{{instance=\"{INSTANCE_ID}\",reason=\"pool\"}} {EXTRA}"
+    );
+    let rendered = scrape.render();
+    assert!(
+        rendered.lines().any(|line| line == pool_line),
+        "expected `{pool_line}`; rendered:\n{rendered}"
+    );
+}

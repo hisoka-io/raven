@@ -13,6 +13,12 @@ TEMPLATE_PATH=/etc/raven-railgun/mainnet-ppoi.toml
 STOP_TIMEOUT=30
 # Debug switches in the respond path: never on a served node.
 FORBIDDEN_ENV=(RAVEN_FORCE_PACKING_ONLINE RAVEN_PROFILE_RESPOND)
+# Node memory, in MiB. A warm boot peaked at 1.8 GiB resident in rehearsal and settled at
+# 1.2 GiB. A packing-key seat holds 1,533 ring polynomials of 16 KiB at a 512 B row. Headroom
+# covers the queries in flight.
+NODE_PEAK_MIB=1843
+SEAT_MIB=24
+HEADROOM_MIB=1024
 
 die() { echo "error: $*" >&2; exit 1; }
 say() { echo "== $*"; }
@@ -60,14 +66,41 @@ replace_one() {  # text pattern replacement
   awk -v pat="$2" -v rep="$3" '$0 ~ pat { print rep; next } { print }' <<<"$1"
 }
 
+# A docker --memory size (a whole number, optionally k, m, g or t, then b or ib) in whole MiB;
+# fails on anything else.
+memory_mib() {  # size
+  local size=${1,,} n unit
+  [[ $size =~ ^([0-9]{1,12})([kmgt]?)(i?b)?$ ]] || return 1
+  n=$((10#${BASH_REMATCH[1]})) unit=${BASH_REMATCH[2]}
+  case $unit in
+    t) echo $((n * 1048576)) ;;
+    g) echo $((n * 1024)) ;;
+    m) echo "$n" ;;
+    k) echo $((n / 1024)) ;;
+    *) echo $((n / 1048576)) ;;
+  esac
+}
+
+# The most the node can hold: the boot peak, every seat of every instance full, and headroom.
+worst_case_mib() {  # seats_per_instance instances
+  echo $((NODE_PEAK_MIB + $1 * $2 * SEAT_MIB + HEADROOM_MIB))
+}
+
 # The image's template with the token read from a file, the mirror endpoint and proxy trust set.
 # Every step returns on failure: errexit does not reach inside the command substitution callers
 # run this in, and a half-edited config must never be written.
-render_config() {  # image mirror_endpoint(empty keeps the template's) trusted_cidr(empty: trust none)
-  local image=$1 endpoint=$2 trusted=$3 cfg
+render_config() {  # image mirror_endpoint(empty keeps the template's) trusted_cidr(empty: trust none) seats
+  local image=$1 endpoint=$2 trusted=$3 seats=$4 cfg
   cfg=$(docker run --rm --network none --entrypoint cat "$image" "$TEMPLATE_PATH") \
     || { echo "error: cannot read $TEMPLATE_PATH from $image" >&2; return 1; }
   cfg=$(replace_one "$cfg" '^token = "REPLACE_ME"$' "token_file = \"$TOKEN_PATH\"") || return 1
+  if grep -qE '^max_sessions_per_instance = ' <<<"$cfg"; then
+    cfg=$(replace_one "$cfg" '^max_sessions_per_instance = [0-9]+$' \
+      "max_sessions_per_instance = $seats") || return 1
+  else
+    cfg=$(replace_one "$cfg" '^[[]global[]]$' "[global]
+max_sessions_per_instance = $seats") || return 1
+  fi
   if [[ -n $endpoint ]]; then
     cfg=$(replace_one "$cfg" '^mirror_endpoint = "[^"]*"$' "mirror_endpoint = \"$endpoint\"") || return 1
   fi

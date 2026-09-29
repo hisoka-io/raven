@@ -279,20 +279,13 @@ impl<S: PirScheme> AppState<S> {
         interval: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
         let sessions = Arc::clone(&self.sessions);
-        let interval = interval.max(std::time::Duration::from_secs(1));
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tick.tick().await;
-                let now = std::time::Instant::now();
-                let removed = sessions.sweep_expired(now);
-                if removed > 0 {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let removed_u64 = removed as u64;
-                    metrics::counter!("raven_railgun_session_evictions_total", "reason" => "ttl")
-                        .increment(removed_u64);
-                }
+        spawn_sweeper(interval, "session", move || {
+            let removed = sessions.sweep_expired(Instant::now());
+            if removed > 0 {
+                #[allow(clippy::cast_possible_truncation)]
+                let removed_u64 = removed as u64;
+                metrics::counter!("raven_railgun_session_evictions_total", "reason" => "ttl")
+                    .increment(removed_u64);
             }
         })
     }
@@ -308,27 +301,38 @@ impl AppState<raven_railgun_engine::inspire::RavenInspireScheme> {
         interval: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
         let engine = Arc::clone(&self.engine);
-        let interval = interval.max(std::time::Duration::from_secs(1));
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tick.tick().await;
-                let engine = Arc::clone(&engine);
-                // A sweep takes the store's write lock, which a derivation in progress holds.
-                let swept = tokio::task::spawn_blocking(move || {
-                    let now = Instant::now();
-                    for instance in engine.instances() {
-                        instance.current_state().session_store.sweep_expired(now);
-                    }
-                })
-                .await;
-                if let Err(join) = swept {
-                    tracing::error!(%join, "packing-key sweep failed");
-                }
+        spawn_sweeper(interval, "packing-key", move || {
+            let now = Instant::now();
+            for instance in engine.instances() {
+                instance.current_state().session_store.sweep_expired(now);
             }
         })
     }
+}
+
+/// Run `sweep` every `interval` (1 s floor) on the blocking pool: a sweep waits for its store's
+/// lock and frees what it drops, and on an async worker either would stall request handling.
+fn spawn_sweeper<F>(
+    interval: std::time::Duration,
+    name: &'static str,
+    sweep: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn() + Send + Sync + 'static,
+{
+    let sweep = Arc::new(sweep);
+    let interval = interval.max(std::time::Duration::from_secs(1));
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let sweep = Arc::clone(&sweep);
+            if let Err(join) = tokio::task::spawn_blocking(move || sweep()).await {
+                tracing::error!(%join, sweeper = name, "sweep failed");
+            }
+        }
+    })
 }
 
 /// Register HELP + TYPE before the first scrape. [`OnceLock`]-guarded.
@@ -523,8 +527,11 @@ fn register_prometheus_descriptions() {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::register_prometheus_descriptions;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     const TIP_HASH_FAILED: &str = "raven_railgun_indexer_reorg_window_tip_hash_failed_total";
     const DROPPED_LOGS: &str = "raven_railgun_indexer_dropped_logs_total";
@@ -568,6 +575,47 @@ mod tests {
                 "{DROPPED_LOGS}{{reason=\"missing_block_number\"}} 0"
             )),
             "counter must scrape as zero for its reason before it fires; rendered:\n{rendered}"
+        );
+    }
+
+    /// A sweep stuck on its store's lock must leave the async worker free: on a one-worker
+    /// runtime, a sweep run inline would hold every other task until the lock is released.
+    #[test]
+    fn a_blocked_sweep_leaves_the_async_worker_free() {
+        let lock = Arc::new(std::sync::Mutex::new(()));
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let lock = Arc::clone(&lock);
+            std::thread::spawn(move || {
+                let _guard = lock.lock().expect("lock");
+                held_tx.send(()).expect("signal held");
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            })
+        };
+        held_rx.recv().expect("lock held");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let waited = runtime.block_on(async {
+            let started = std::time::Instant::now();
+            let sweeper = super::spawn_sweeper(Duration::from_secs(60), "test", move || {
+                drop(lock.lock());
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let waited = started.elapsed();
+            sweeper.abort();
+            waited
+        });
+        // The holder gives up after 5 s on its own, so a failed send only means it already has.
+        let _ = release_tx.send(());
+        holder.join().expect("holder");
+
+        assert!(
+            waited < Duration::from_secs(2),
+            "a 100 ms timer fired after {waited:?}: the sweep held the async worker"
         );
     }
 }

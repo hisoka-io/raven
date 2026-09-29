@@ -22,9 +22,16 @@ import {
   type MockServer,
 } from "./helpers/mock_server";
 import { encodeBatchResponseNodes } from "./helpers/auth_path_stub";
-import { PATH10_ROW_BYTES, path10Siblings, path10Slot } from "./helpers/path10_row";
+import {
+  PATH10_ROW_BYTES,
+  mountPath10Route,
+  path10Root,
+  path10Siblings,
+  path10Slot,
+} from "./helpers/path10_row";
 import {
   commitmentAt,
+  listHolding,
   mountPrefixChannel,
   prefixTwinOf,
   targetNamingCtx,
@@ -137,6 +144,59 @@ describe("on-device status", () => {
       [absent]: { [LIST]: "Missing" },
     });
     expect(upstreamMethods).toEqual(["ppoi_submit_transact_proof"]);
+  });
+
+  it("reads a commitment spelled without its leading zero digits as the value it spells", async () => {
+    const zeroLed = `007c${"ab".repeat(30)}`;
+    const oneZero = `0d${"cd".repeat(31)}`;
+    serve({ commitments: [commitmentAt(0), zeroLed, oneZero] });
+    const sdk = device();
+    const stripped = zeroLed.slice(2);
+    const strippedOne = `0x${oneZero.slice(1)}`;
+    const absent = `5e${"ef".repeat(30)}`;
+    expect([stripped.length, strippedOne.length - 2, absent.length]).toEqual([62, 63, 62]);
+
+    await expect(
+      sdk.getPOIsPerList(TXID, MAINNET, [LIST], [
+        shield(stripped),
+        shield(strippedOne),
+        shield(absent),
+      ]),
+    ).resolves.toStrictEqual({
+      [stripped]: { [LIST]: "Valid" },
+      [strippedOne]: { [LIST]: "Valid" },
+      [absent]: { [LIST]: "Missing" },
+    });
+    await expect(sdk.getPOIsPerList([LIST], [shield(stripped)])).resolves.toStrictEqual({
+      [stripped]: { [LIST]: "Valid" },
+    });
+    await expect(sdk.getPOIsPerList([LIST], [shield("1".repeat(65))])).rejects.toSatisfy(
+      (error: unknown) => RavenError.is(error, "InvalidQuery"),
+    );
+  });
+
+  it("proves and indexes a commitment spelled without its leading zero digits", async () => {
+    const zeroLed = `007c${"ab".repeat(30)}`;
+    const stripped = zeroLed.slice(2);
+    const nodes = path10Siblings(0x5c);
+    serve({ commitments: listHolding([[zeroLed, 3]]) });
+    mountPath10Route(node, { bcHex: zeroLed, nodes });
+    const sdk = new RavenPOINodeInterface(
+      forestConfig({
+        endpoint: node.url,
+        listKeyHex: LIST,
+        ctx: { ...targetNamingCtx(), entrySize: PATH10_ROW_BYTES },
+        pins: new Map([[0, path10Root(zeroLed, nodes, 3)]]),
+      }),
+    );
+
+    const [proof] = await sdk.getPOIMerkleProofs(LIST, [`0x${stripped}`]);
+    expect([proof.leaf, BigInt(`0x${proof.indices}`)]).toEqual([zeroLed, 3n]);
+    await sdk.syncPoiListIndex(LIST);
+    await expect(sdk.poiListIndexCandidates(LIST, stripped)).resolves.toStrictEqual({
+      rows: 4,
+      candidates: [3],
+    });
   });
 
   it("sends nothing that names a commitment, a list index or a shard", async () => {

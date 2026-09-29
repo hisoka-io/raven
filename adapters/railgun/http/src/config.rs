@@ -91,8 +91,8 @@ fn default_session_eviction_interval_secs() -> u64 {
     DEFAULT_SESSION_TTL_SECS
 }
 
-/// Default [`HttpConfig::max_concurrent_handshakes`]. Derivations on one instance serialize on
-/// its session store, so more mostly adds waiting threads.
+/// Default [`HttpConfig::max_concurrent_handshakes`]. Derivations run in parallel, outside the
+/// session store's lock, so this bounds the CPU that handshakes take from queries.
 pub const DEFAULT_MAX_CONCURRENT_HANDSHAKES: usize = 2;
 
 const fn default_max_concurrent_handshakes() -> usize {

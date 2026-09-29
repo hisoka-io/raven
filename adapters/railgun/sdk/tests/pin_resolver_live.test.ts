@@ -167,7 +167,9 @@ describe("pin resolution against a live PPOI aggregator", () => {
     expect(toUpstream.map((r) => JSON.parse(r.body).method)).toEqual(["ppoi_poi_events"]);
     expect(toUpstream.every((r) => !r.body.includes(BLOCK0_LAST_BC))).toBe(true);
     for (const req of adapter.requests) {
-      expect(req.url).toMatch(/\/session$|^\/v1\/instance\/[^/]+\/batch$/);
+      expect(req.url).toMatch(
+        /\/session$|^\/v1\/instance\/[^/]+\/batch$|^\/v1\/poi\/[0-9a-f]{64}\/bc-prefixes\?since=0$/,
+      );
     }
   });
 

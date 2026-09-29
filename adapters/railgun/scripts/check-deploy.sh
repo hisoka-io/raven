@@ -8,7 +8,10 @@
 #   4. the Caddyfile drops a client's cf-connecting-ip, which the node takes as the client
 #      address from a trusted proxy;
 #   5. deploy.sh publishes the node's port on 127.0.0.1 only;
-#   6. the Caddyfile binds IPv4 only (tcp4), since a bare address opens a dual-stack socket.
+#   6. the Caddyfile binds IPv4 only (tcp4), since a bare address opens a dual-stack socket;
+#   7. deploy.sh's default --memory holds its default worst case for the image template's
+#      instances, worst_case_mib in deploy/lib.sh, and --help states that figure; the seat size
+#      there is for the template's 512 B rows.
 # DEPLOY_CHECK_ROOT points it at a copy of the adapter directory (its selftest does).
 set -uo pipefail
 
@@ -47,6 +50,27 @@ publishes=$(grep -oE -- '--publish "[^"]*"' "$root/deploy/deploy.sh")
 while IFS= read -r p; do
   [[ -z $p || $p == '--publish "127.0.0.1:'* ]] || fail "deploy/deploy.sh publishes beyond loopback: $p"
 done <<<"$publishes"
+
+template=$root/examples/mainnet-ppoi.toml
+memory=$(grep -oE '^image=.* memory=[0-9]+[a-z]*$' "$root/deploy/deploy.sh" | grep -oE '[0-9]+[a-z]*$')
+seats=$(grep -oE '^max_sessions=[0-9]+ ' "$root/deploy/deploy.sh" | grep -oE '[0-9]+')
+instances=$(grep -cE '^[[][[]instance[]][]]$' "$template")
+grep -qx 'record_size = 512' "$template" \
+  || fail "examples/mainnet-ppoi.toml: record_size is not 512, the row size deploy/lib.sh SEAT_MIB is for"
+if [[ -z $memory || -z $seats || $instances == 0 ]]; then
+  fail "could not read deploy.sh's default memory (${memory:-none}) or seats (${seats:-none}), or the template's instances ($instances)"
+else
+  (
+    # shellcheck source=adapters/railgun/deploy/lib.sh
+    . "$root/deploy/lib.sh"
+    die() { echo "check-deploy: $*"; exit 1; }
+    cap=$(memory_mib "$memory") || die "deploy.sh's default memory $memory does not parse"
+    worst=$(worst_case_mib "$seats" "$instances")
+    ((worst <= cap)) || die "deploy.sh defaults do not fit: $seats seats x $instances instances need $worst MiB, over the $memory cap"
+    grep -qF "The defaults need $worst MiB for the template's $instances instances" "$root/deploy/deploy.sh" \
+      || die "deploy.sh --help does not state the defaults' $worst MiB for $instances instances"
+  ) || failed=1
+fi
 
 ((failed == 0)) && echo "check-deploy: ok"
 exit $failed
