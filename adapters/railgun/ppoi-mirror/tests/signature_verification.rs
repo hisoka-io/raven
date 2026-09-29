@@ -159,8 +159,7 @@ fn mirror(endpoint: String) -> Arc<UpstreamPpoiMirror> {
             poll_interval_secs: 1,
             ..MirrorConfig::default()
         })
-        .expect("mirror builds")
-        .with_backfill_interval(Duration::ZERO),
+        .expect("mirror builds"),
     )
 }
 

@@ -816,3 +816,122 @@ async fn a_ppoi_only_boot_refuses_a_websocket_endpoint_nothing_reads() {
         "{refusal}"
     );
 }
+
+/// Row 393,216 of the shipped list, the first row of block 6, is served by PIR once it arrives:
+/// the shipped config declares the block before the list reaches it. Booted through the engine
+/// on the shipped instance, fed the row the way the mirror sends it, list-wide, and decoded from
+/// the block's served state with a real query.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn the_shipped_block_6_serves_the_lists_row_393216_by_pir() {
+    use raven_inspire::params::{InspireParams, InspireVariant};
+    use raven_railgun_engine::inspire::{
+        build_client_session, build_seeded_query, extract_response, register_client_session,
+        setup_state,
+    };
+    use raven_railgun_engine::orchestrator::{
+        bootstrap_railgun_engine_multi, split_ppoi_index, InstanceConfig,
+    };
+    use raven_railgun_engine::persistence::ConsumerEvent;
+    use raven_railgun_engine::pir_table::list::PATH10_MAGIC;
+    use raven_railgun_engine::PirScheme;
+    use raven_railgun_persistence::{PpoiEventType, WalEntryPayload};
+
+    const ROW: u32 = 393_216;
+    const BLOCK_6: &str = "ppoi-paths-ofac-6";
+    let root = tempfile::tempdir().expect("tempdir");
+    let config = write_config(root.path(), &example(), "http://127.0.0.1:1", "");
+    let (opts, _) = narrowed(&config, &[BLOCK_6]);
+    let list_key: [u8; 32] = hex::decode(SHIPPED_LIST_HEX).unwrap().try_into().unwrap();
+    assert_eq!(
+        opts.instances[0].data_source,
+        DataSourceFilter::PpoiListBlock { list_key, block: 6 }
+    );
+    assert_eq!(split_ppoi_index(ROW), (6, 0), "row 393,216 opens block 6");
+
+    let params = InspireParams::secure_128_d2048();
+    let mut secret_key = None;
+    let mut handle = bootstrap_railgun_engine_multi(
+        opts.instances.clone(),
+        params.clone(),
+        |instance: &InstanceConfig| {
+            let entries = opts.instance_entries[&instance.instance_id];
+            let seed = vec![0u8; entries * instance.record_size];
+            let (state, key) = setup_state(
+                &params,
+                &seed,
+                instance.record_size,
+                InspireVariant::TwoPacking,
+            )?;
+            secret_key = Some(key);
+            Ok(state)
+        },
+    )
+    .expect("boot block 6");
+    let leaf = leaf_at(u64::from(ROW));
+    let mut tree = raven_railgun_engine::imt::Imt::new().expect("imt");
+    tree.insert_leaves(0, &[leaf]).expect("append");
+    handle
+        .channels
+        .mirror_tx
+        .send((
+            WalEntryPayload::PpoiListLeafAdded {
+                list_key,
+                list_index: ROW,
+                blinded_commitment: leaf,
+                event_type: PpoiEventType::Shield,
+                validated_merkleroot: tree.root(),
+            },
+            0,
+        ))
+        .await
+        .expect("router open");
+    let block_6 = handle.instances.first_mut().expect("block 6");
+    until_done_or_stalled("row 393,216 applied", async || {
+        let held = block_6
+            .logical_store
+            .lock()
+            .ppoi_imt(&list_key)
+            .map_or(0, raven_railgun_engine::imt::Imt::leaf_count);
+        let errors = block_6.metrics.lock().consumer_errors;
+        assert_eq!(errors, 0, "block 6 refused the row");
+        (held, (held == 1).then_some(()))
+    })
+    .await;
+    block_6
+        .sender
+        .send(ConsumerEvent::Shutdown)
+        .await
+        .expect("consumer open");
+    (&mut block_6.consumer)
+        .await
+        .expect("consumer joined")
+        .expect("the publish on stop");
+
+    let state = block_6.instance.current_state();
+    let mut session = build_client_session(
+        (*state.crs).clone(),
+        secret_key.expect("the fresh state's key"),
+        &params,
+    )
+    .expect("client session");
+    register_client_session(&mut session, &state).expect("register session");
+    let (client_state, query) =
+        build_seeded_query(&session, state.shard_config(), 0, &params).expect("query");
+    let response =
+        <raven_railgun_engine::inspire::RavenInspireScheme as PirScheme>::respond(&state, &query)
+            .expect("respond");
+    let decoded =
+        extract_response(&state.crs, &client_state, &response, state.entry_size).expect("decode");
+    assert_eq!(
+        &decoded[..32],
+        &leaf,
+        "block 6 row 0 carries the list's row 393,216"
+    );
+    assert_eq!(
+        &decoded[34..38],
+        PATH10_MAGIC.as_slice(),
+        "a written path row"
+    );
+    handle.router.abort();
+}

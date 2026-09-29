@@ -46,6 +46,8 @@ const STALL: Duration = Duration::from_secs(30);
 #[derive(Default)]
 struct MockState {
     starts: parking_lot::Mutex<Vec<u64>>,
+    /// When each request in `starts` arrived.
+    arrived: parking_lot::Mutex<Vec<std::time::Instant>>,
 }
 
 async fn poi_events_handler(
@@ -59,6 +61,7 @@ async fn poi_events_handler(
     };
     let (start, end) = (bound("startIndex")?, bound("endIndex")?);
     state.starts.lock().push(start);
+    state.arrived.lock().push(std::time::Instant::now());
     let events: Vec<serde_json::Value> = (start..=end.min(ROWS - 1)).map(row).collect();
     Ok(Json(serde_json::json!({
         "jsonrpc": "2.0",
@@ -147,8 +150,7 @@ fn feed(
             max_rows_per_fetch: PAGE,
             ..MirrorConfig::default()
         })
-        .expect("mirror builds")
-        .with_backfill_interval(Duration::ZERO),
+        .expect("mirror builds"),
     );
     let held = Arc::new(AtomicU64::new(0));
     let span = {
@@ -271,5 +273,38 @@ async fn a_row_no_consumer_ever_takes_stays_named_and_is_asked_for_again_each_ti
         status.snapshot().untaken_row,
         Some(u64::from(REFUSED)),
         "the row holding the list back must be named"
+    );
+}
+
+/// Coming back for a row no consumer takes costs upstream a page per poll. The pages past the row
+/// would only be refused again, so they are not re-downloaded back to back each time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_asked_for_again_holds_the_feed_to_a_page_per_poll() {
+    let (url, mock) = start_mock().await;
+    let (worker, mut rx, held, status) = feed(url);
+    let mut consumer = RefusingConsumer::new(usize::MAX);
+    while consumer.refused < 3 {
+        offer_next(&mut rx, &mut consumer, &held, &status, &mock).await;
+    }
+    worker.abort();
+    let starts = mock.starts.lock().clone();
+    let arrived = mock.arrived.lock().clone();
+    let back = (1..starts.len())
+        .find(|&at| {
+            starts[at] == u64::from(REFUSED) && starts[..at].iter().any(|s| *s > u64::from(REFUSED))
+        })
+        .expect("the feed came back for the row");
+    let gaps: Vec<Duration> = arrived[back..]
+        .windows(2)
+        .map(|pair| pair[1].duration_since(pair[0]))
+        .collect();
+    assert!(
+        gaps.len() >= 2,
+        "fixture: pages after the first return {starts:?}"
+    );
+    assert!(
+        gaps.iter().all(|gap| *gap >= Duration::from_millis(900)),
+        "pages came back to back while row {REFUSED} stood untaken: starts {starts:?}, gaps \
+         {gaps:?}"
     );
 }

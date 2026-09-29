@@ -1,8 +1,9 @@
 //! How fast a mirror feed asks upstream for pages, and where it stops asking.
 //!
-//! A cold sync of a list several hundred pages long is a morning at a page per poll interval,
+//! A cold sync of a list several hundred pages long is six hours at a page per poll interval,
 //! and a node that simply polled faster would keep that rate against a third party forever.
-//! So a full page is followed at the backfill setting and every other page waits the poll.
+//! So a full page is followed at once, or at the backfill setting when one is given, and every
+//! other page waits the poll.
 //! Separately, a row nothing downstream can hold must stop the feed, not pass under an
 //! advancing cursor.
 //! And a feed waiting out a poll stops as soon as the engine hangs up.
@@ -41,7 +42,7 @@ fn list() -> ListKey {
 const SEVENTH_BLOCK: u64 = 6 * 65_536;
 
 /// Longest a feed may go without visible progress before a wait fails. Below the 30 s poll, so a
-/// feed paced by the poll where it should be paced by the backfill setting still fails.
+/// full page followed at the poll still fails.
 const STALL: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,13 +235,13 @@ fn page(start: u64, end: u64) -> Asked {
 }
 
 /// At a 30 s poll a page paced by the poll comes 30 s after the one before it, so four pages
-/// each inside half the poll are only reachable at the backfill setting. The short fourth page
-/// then holds the fifth for the poll.
+/// each inside half the poll are only reachable when a full page is followed at once, which it
+/// is with no backfill setting. The short fourth page then holds the fifth for the poll.
 #[tokio::test]
-async fn full_pages_follow_at_the_backfill_setting_and_a_short_page_returns_to_the_poll() {
+async fn full_pages_follow_at_once_and_a_short_page_returns_to_the_poll() {
     let (endpoint, upstream) = serve(Upstream::holding_through(34)).await;
     let (tx, mut rx) = mpsc::channel(256);
-    let worker = feed_all(mirror(&endpoint, 30, 10, Some(Duration::ZERO)), tx);
+    let worker = feed_all(mirror(&endpoint, 30, 10, None), tx);
 
     let leaves = leaves_through(&mut rx, 34).await;
     assert_eq!(leaves, (0..=34).collect::<Vec<u32>>());
@@ -260,18 +261,18 @@ async fn full_pages_follow_at_the_backfill_setting_and_a_short_page_returns_to_t
     worker.abort();
 }
 
-/// Absent the setting, nothing about the cadence changes: a full page still waits the poll.
+/// An operator can still slow a cold sync: a backfill setting spaces full pages by that much.
 #[tokio::test]
-async fn without_a_backfill_setting_a_full_page_still_waits_the_poll() {
+async fn a_backfill_setting_spaces_full_pages() {
     let (endpoint, upstream) = serve(Upstream::holding_through(34)).await;
     let (tx, _rx) = mpsc::channel(256);
-    let worker = feed_all(mirror(&endpoint, 3, 10, None), tx);
+    let worker = feed_all(mirror(&endpoint, 30, 10, Some(Duration::from_secs(2))), tx);
 
     requests_made(&upstream, 2, STALL).await;
     assert_eq!(upstream.asked(), [page(0, 9), page(10, 19)]);
     assert!(
-        upstream.gap_before(2) >= Duration::from_millis(2_500),
-        "a full page was followed after {:?}, inside the 3 s poll",
+        upstream.gap_before(2) >= Duration::from_millis(1_900),
+        "a full page was followed after {:?}, inside the 2 s setting",
         upstream.gap_before(2)
     );
     worker.abort();
@@ -283,7 +284,7 @@ async fn without_a_backfill_setting_a_full_page_still_waits_the_poll() {
 async fn a_failed_page_waits_the_poll_even_mid_backfill() {
     let (endpoint, upstream) = serve(Upstream::holding_through(34).failing(&[2])).await;
     let (tx, _rx) = mpsc::channel(256);
-    let worker = feed_all(mirror(&endpoint, 3, 10, Some(Duration::ZERO)), tx);
+    let worker = feed_all(mirror(&endpoint, 3, 10, None), tx);
 
     requests_made(&upstream, 4, STALL).await;
     assert_eq!(
@@ -305,7 +306,7 @@ async fn a_failed_page_waits_the_poll_even_mid_backfill() {
 async fn an_empty_page_waits_the_poll() {
     let (endpoint, upstream) = serve(Upstream::holding_through(19)).await;
     let (tx, _rx) = mpsc::channel(256);
-    let worker = feed_all(mirror(&endpoint, 3, 10, Some(Duration::ZERO)), tx);
+    let worker = feed_all(mirror(&endpoint, 3, 10, None), tx);
 
     requests_made(&upstream, 4, STALL).await;
     assert_eq!(

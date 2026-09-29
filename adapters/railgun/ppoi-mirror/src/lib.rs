@@ -173,7 +173,8 @@ impl Default for MirrorConfig {
 /// What one list's feed has seen of upstream, as of its last request.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FeedProgress {
-    /// List-wide index of the next row the feed asks for.
+    /// List-wide index of the next row the feed asks for. The rows below it were handed
+    /// downstream, and may still be queued there: nothing here says they are durable.
     pub next_index: u64,
     /// Upstream's row count, known only when its last answer came back shorter than the page
     /// asked for. `None` while pages come back full, and before the first answer.
@@ -318,7 +319,10 @@ impl UpstreamPpoiMirror {
 
     /// Wait `interval` after a page that came back as long as it asked for, and the poll interval
     /// after any other. Only a cold sync sees full pages, so a caught-up worker is back at the
-    /// poll cadence one page later. Unset, every page waits the poll interval.
+    /// poll cadence one page later. Unset, a full page is followed at once: a cold sync then runs
+    /// as fast as the engine applies, which the feed channel paces, and asks upstream for a page
+    /// per `max_rows_per_fetch` rows applied. While a row the feed delivered stands untaken, every
+    /// page waits the poll.
     #[must_use]
     pub fn with_backfill_interval(mut self, interval: std::time::Duration) -> Self {
         self.backfill_interval = Some(interval);
@@ -407,9 +411,10 @@ impl UpstreamPpoiMirror {
     /// hold. A start above the cursor steps over rows every consumer that can hold them already
     /// holds. A start below it is a row the feed delivered and no consumer took; once it has
     /// stood there for a poll interval, the feed moves back, asks for it again and names it in
-    /// [`FeedProgress::untaken_row`] until a consumer takes it. That recovers a refused row
-    /// without a restart only if `span` reads what each consumer holds at the call: a span that
-    /// never starts below the cursor never sends the feed back. An empty span stops the feed.
+    /// [`FeedProgress::untaken_row`] until a consumer takes it, pacing every page at the poll
+    /// meanwhile. That recovers a refused row without a restart only if `span` reads what each
+    /// consumer holds at the call: a span that never starts below the cursor never sends the
+    /// feed back. An empty span stops the feed.
     ///
     /// # Errors
     ///
@@ -451,7 +456,7 @@ impl UpstreamPpoiMirror {
     {
         use tokio::time::{sleep, Duration, Instant};
         let poll = Duration::from_secs(self.config.poll_interval_secs.max(1));
-        let backfill = self.backfill_interval.unwrap_or(poll);
+        let backfill = self.backfill_interval.unwrap_or(Duration::ZERO);
         let verifier = RowVerifier::for_list(&list);
         status.at(cursor);
         tracing::info!(endpoint = %self.config.endpoint, "ppoi mirror: {TRUST_STATEMENT}");
@@ -517,7 +522,10 @@ impl UpstreamPpoiMirror {
             let next = cursor.saturating_add(taken);
             let refusal = page_refusal(missing, forged, next);
             let full = taken == end - cursor + 1;
-            if full {
+            // While a row below the cursor is untaken, every page past it may be refused again,
+            // so the feed holds to the poll rather than re-download the rest of the span back
+            // to back each time it comes back for the row.
+            if full && !untaken.pending() {
                 pause = backfill;
             }
             for ev in events {
@@ -668,6 +676,11 @@ impl UntakenRow {
 
     fn waiting(&self) -> bool {
         self.standing.is_some()
+    }
+
+    /// A row stands below the cursor, or was asked for again and not yet passed.
+    fn pending(&self) -> bool {
+        self.standing.is_some() || self.asked_again.is_some()
     }
 }
 

@@ -127,8 +127,9 @@ async fn ppoi_height_zero_must_not_collapse_the_resume_floor() {
             .await
             .expect("send mirror row");
     }
+    // The rows sync and commit as one run, not one by one.
     drain_until(&handle.metrics, "mirror rows", |m| {
-        m.commits_fired >= leaves_committed + 4
+        m.events_processed >= u64::from(LEAVES) + 4 && m.commits_fired > leaves_committed
     })
     .await;
 

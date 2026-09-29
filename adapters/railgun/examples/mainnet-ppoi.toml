@@ -41,8 +41,9 @@ token = "REPLACE_ME"
 # The chain whose PPOI lists the mirror asks upstream for.
 chain_id = 1
 mirror_endpoint = "https://ppoi.fdi.network"
-# Seconds between pages while upstream answers full ones, i.e. during a cold sync. Absent,
-# every page waits the 30 s poll interval.
+# Seconds between pages while upstream answers full ones, i.e. during a cold sync. Absent, a
+# full page is followed at once, so a cold sync runs as fast as the node applies rows; once
+# caught up, every page waits the 30 s poll interval. Set it only to slow a cold sync down.
 #   mirror_backfill_interval_secs = 1
 max_concurrent_queries = 4
 respond_timeout_secs = 30

@@ -89,8 +89,7 @@ async fn each_row_reaches_the_engine_as_one_leaf_carrying_its_upstream_fields() 
             max_rows_per_fetch: 2,
             ..MirrorConfig::default()
         })
-        .expect("mirror builds")
-        .with_backfill_interval(Duration::ZERO),
+        .expect("mirror builds"),
     );
     let list = ListKey(provider().list_key());
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(WalEntryPayload, u64)>(64);

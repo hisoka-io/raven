@@ -110,8 +110,7 @@ fn mirror(endpoint: String) -> Arc<UpstreamPpoiMirror> {
             max_rows_per_fetch: PAGE,
             ..MirrorConfig::default()
         })
-        .expect("mirror builds")
-        .with_backfill_interval(Duration::ZERO),
+        .expect("mirror builds"),
     )
 }
 

@@ -420,6 +420,123 @@ impl LogicalLeafStore {
         Ok(())
     }
 
+    /// A copy of `list_key`'s tree, for [`Self::stage_list_row`] to append to while this store
+    /// still shows none of the staged rows.
+    pub(crate) fn list_tree_copy(&self, list_key: &[u8; 32]) -> Result<crate::imt::Imt> {
+        match self.ppoi_imts.get(list_key) {
+            Some(imt) => Ok(imt.clone()),
+            None => crate::imt::Imt::new(),
+        }
+    }
+
+    /// Screen a `PpoiListLeafAdded` as [`validate_apply`] does and append its leaf to `staged`,
+    /// hashing its path once: the root it is held to is read off the append. A refused row
+    /// leaves `staged` as it was.
+    ///
+    /// # Errors
+    /// As [`validate_apply`], judged against `staged`; [`AdapterError::InvalidQuery`] for any
+    /// other payload.
+    pub(crate) fn stage_list_row(
+        staged: &mut crate::imt::Imt,
+        payload: &raven_railgun_persistence::WalEntryPayload,
+    ) -> Result<()> {
+        let raven_railgun_persistence::WalEntryPayload::PpoiListLeafAdded {
+            list_key,
+            list_index,
+            blinded_commitment,
+            validated_merkleroot,
+            ..
+        } = payload
+        else {
+            return Err(AdapterError::InvalidQuery(
+                "only a PpoiListLeafAdded is staged on a list tree".into(),
+            ));
+        };
+        let at = checked_imt_append(
+            ImtSlot::List(*list_key),
+            *list_index,
+            staged.leaf_count(),
+            blinded_commitment,
+        )?;
+        staged.insert_leaves(at, &[*blinded_commitment])?;
+        if validated_merkleroot == &crate::ppoi_root::NO_UPSTREAM_ROOT {
+            count_unasserted_root(list_key, *list_index);
+            return Ok(());
+        }
+        let local_root = staged.root();
+        if &local_root == validated_merkleroot {
+            return Ok(());
+        }
+        staged.truncate_to(at);
+        metrics::counter!(crate::ppoi_root::PPOI_ROOT_DIVERGENCE_TOTAL).increment(1);
+        Err(crate::ppoi_root::PpoiRootDivergence {
+            list_key: *list_key,
+            list_index: *list_index,
+            local_root,
+            upstream_root: *validated_merkleroot,
+        }
+        .into())
+    }
+
+    /// Whether this store already holds `payload`'s list row: `Some(true)` byte for byte,
+    /// `Some(false)` a different row at that index, `None` when the index is not held yet.
+    pub(crate) fn holds_list_row(
+        &self,
+        payload: &raven_railgun_persistence::WalEntryPayload,
+    ) -> Option<bool> {
+        let raven_railgun_persistence::WalEntryPayload::PpoiListLeafAdded {
+            list_key,
+            list_index,
+            blinded_commitment,
+            event_type,
+            validated_merkleroot,
+        } = payload
+        else {
+            return None;
+        };
+        let held = self.ppoi_bc_at(list_key, *list_index)?;
+        let metadata = self.ppoi_event_metadata(list_key, *list_index);
+        Some(
+            held == *blinded_commitment
+                && metadata.is_some_and(|m| {
+                    m.event_type == *event_type && m.validated_merkleroot == *validated_merkleroot
+                }),
+        )
+    }
+
+    /// Install `staged`, built by [`Self::stage_list_row`] from [`Self::list_tree_copy`], as
+    /// `list_key`'s tree and record `rows`, the rows staged on it in order.
+    ///
+    /// # Errors
+    /// [`AdapterError::Internal`] when the tree moved since it was copied or `staged` does not
+    /// hold exactly `rows` past it; the store is then untouched.
+    pub(crate) fn apply_staged_list_rows(
+        &mut self,
+        list_key: &[u8; 32],
+        staged: crate::imt::Imt,
+        rows: &[(raven_railgun_persistence::WalEntryPayload, u64)],
+        encoder: &dyn crate::pir_table::PirTableEncoder,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let base = self.slot_leaf_count(ImtSlot::List(*list_key));
+        if staged.leaf_count() != base.saturating_add(rows.len()) {
+            return Err(AdapterError::Internal(format!(
+                "staged list tree holds {} leaves, expected {base} held plus {} staged rows; \
+                 the tree moved while its rows were staged",
+                staged.leaf_count(),
+                rows.len()
+            )));
+        }
+        self.ppoi_imts.insert(*list_key, staged);
+        for (payload, block_height) in rows {
+            self.record_appended_leaf(payload, *block_height, encoder);
+            self.last_block_height = self.last_block_height.max(*block_height);
+        }
+        Ok(())
+    }
+
     /// Everything a leaf row records besides its IMT append, which the caller has made. The one
     /// copy [`Self::apply`] and [`Self::seed_leaf_run`] share.
     fn record_appended_leaf(
@@ -817,10 +934,10 @@ pub fn apply_wal_entry(
 /// [`LogicalLeafStore::apply`] does, so a payload that passes here and is then
 /// applied against the same store cannot be refused for one of those reasons.
 ///
-/// A `PpoiListLeafAdded` is also held to the upstream root it carries, and ONLY here:
-/// [`LogicalLeafStore::apply`] is what WAL replay runs, replay soft-skips a refused row, and
-/// a skipped row leaves the tree a leaf short for good. A row is screened once, ahead of the
-/// write that makes it durable. The all-zero root is the one value not compared; it is
+/// A `PpoiListLeafAdded` is also held to the upstream root it carries, here and in
+/// `LogicalLeafStore::stage_list_row`, and never by [`LogicalLeafStore::apply`]: that is what
+/// WAL replay runs, replay soft-skips a refused row, and a skipped row leaves the tree a leaf
+/// short for good. A row is screened once, ahead of the write that makes it durable. The all-zero root is the one value not compared; it is
 /// counted instead.
 ///
 /// # Errors
@@ -882,13 +999,7 @@ fn screen_upstream_root(
     upstream_root: &[u8; 32],
 ) -> Result<()> {
     if upstream_root == &crate::ppoi_root::NO_UPSTREAM_ROOT {
-        metrics::counter!(crate::ppoi_root::PPOI_ROOT_UNASSERTED_TOTAL).increment(1);
-        tracing::warn!(
-            list_key = %crate::orchestrator::hex_lower_32(list_key),
-            list_index,
-            "PPOI list row carries the all-zero root; applying it with no upstream root \
-             comparison. The upstream feed never serves one"
-        );
+        count_unasserted_root(list_key, list_index);
         return Ok(());
     }
     match store.ppoi_root_divergence(list_key, leaf, upstream_root)? {
@@ -898,6 +1009,16 @@ fn screen_upstream_root(
             Err(divergence.into())
         }
     }
+}
+
+fn count_unasserted_root(list_key: &[u8; 32], list_index: u32) {
+    metrics::counter!(crate::ppoi_root::PPOI_ROOT_UNASSERTED_TOTAL).increment(1);
+    tracing::warn!(
+        list_key = %crate::orchestrator::hex_lower_32(list_key),
+        list_index,
+        "PPOI list row carries the all-zero root; applying it with no upstream root \
+         comparison. The upstream feed never serves one"
+    );
 }
 
 /// Whether applying this payload APPENDS to an IMT.
@@ -914,5 +1035,172 @@ pub(crate) fn appends_to_a_tree(payload: &raven_railgun_persistence::WalEntryPay
     match payload {
         P::AppendLeaf { .. } | P::PpoiListLeafAdded { .. } => true,
         P::Reorg { .. } | P::Heartbeat { .. } => false,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+mod staged_list_rows_differential {
+    //! Staging a list row hashes its path once where `validate_apply` then `apply` hashed it
+    //! twice. Row for row, both must accept and refuse alike, with the same error, and leave the
+    //! same tree. A synthetic list with planted refusals runs always. A recorded capture runs by
+    //! hand: `PPOI_REPLAY_CAPTURE` names its folder, and its first `PPOI_DIFFERENTIAL_ROWS` rows
+    //! (default 70,000, into a second block) are compared.
+
+    use super::{apply_wal_entry, validate_apply, LogicalLeafStore};
+    use crate::imt::{Imt, TREE_MAX_ITEMS};
+    use raven_railgun_persistence::{PpoiEventType, WalEntryPayload};
+
+    const LIST: [u8; 32] = [0x3d; 32];
+    /// Staged rows applied to the store together, as one sync covers them.
+    const PAGE: usize = 501;
+
+    fn row(index: u32, leaf: [u8; 32], root: [u8; 32]) -> WalEntryPayload {
+        WalEntryPayload::PpoiListLeafAdded {
+            list_key: LIST,
+            list_index: index,
+            blinded_commitment: leaf,
+            event_type: PpoiEventType::Transact,
+            validated_merkleroot: root,
+        }
+    }
+
+    /// Feeds `deliveries`, block-local, through both paths and compares them after every row.
+    /// Returns how many rows both accepted.
+    fn differ(deliveries: &[WalEntryPayload]) -> usize {
+        let encoder = crate::pir_table::EncoderKind::PerListPath10 { list_key: LIST }
+            .build(512, 2048)
+            .expect("encoder");
+        let mut old = LogicalLeafStore::new();
+        let mut new = LogicalLeafStore::new();
+        let mut staged = new.list_tree_copy(&LIST).expect("tree");
+        let mut staged_rows = Vec::new();
+        for (at, payload) in deliveries.iter().enumerate() {
+            let before = old.ppoi_imt_root(&LIST);
+            let old_outcome = validate_apply(&old, payload)
+                .and_then(|()| apply_wal_entry(&mut old, payload, 0, encoder.as_ref()));
+            let new_outcome = LogicalLeafStore::stage_list_row(&mut staged, payload);
+            assert_eq!(
+                old_outcome.as_ref().map_err(ToString::to_string),
+                new_outcome.as_ref().map_err(ToString::to_string),
+                "delivery {at}: {payload:?}"
+            );
+            if new_outcome.is_ok() {
+                staged_rows.push((payload.clone(), 0));
+            }
+            let old_root = old.ppoi_imt_root(&LIST);
+            assert_eq!(
+                Some(staged.root()),
+                old_root.or(before),
+                "root after delivery {at}"
+            );
+            if staged_rows.len() == PAGE || at + 1 == deliveries.len() {
+                new.apply_staged_list_rows(&LIST, staged, &staged_rows, encoder.as_ref())
+                    .expect("apply staged");
+                staged_rows.clear();
+                staged = new.list_tree_copy(&LIST).expect("tree");
+            }
+        }
+        assert_eq!(
+            old.ppoi_list_leaves_iter(&LIST).collect::<Vec<_>>(),
+            new.ppoi_list_leaves_iter(&LIST).collect::<Vec<_>>()
+        );
+        let held = old.ppoi_imt(&LIST).map_or(0, Imt::leaf_count);
+        for index in 0..u32::try_from(held).expect("u32") {
+            assert_eq!(
+                old.ppoi_event_metadata(&LIST, index),
+                new.ppoi_event_metadata(&LIST, index)
+            );
+        }
+        assert_eq!(old.ppoi_imt_root(&LIST), new.ppoi_imt_root(&LIST));
+        assert_eq!(old.dirty_shards(), new.dirty_shards());
+        held
+    }
+
+    fn leaf(index: u32) -> [u8; 32] {
+        let mut leaf = [0u8; 32];
+        leaf[0] = 0x07;
+        leaf[28..].copy_from_slice(&index.to_be_bytes());
+        leaf
+    }
+
+    #[test]
+    fn staging_matches_validate_then_apply_row_for_row() {
+        let mut tree = Imt::new().expect("imt");
+        let roots: Vec<[u8; 32]> = (0..3_000u32)
+            .map(|index| {
+                tree.insert_leaves(index as usize, &[leaf(index)])
+                    .expect("append");
+                tree.root()
+            })
+            .collect();
+        let good = |index: u32| row(index, leaf(index), roots[index as usize]);
+        let mut wrong_root = roots[700];
+        wrong_root[31] ^= 1;
+        let mut non_canonical = [0xffu8; 32];
+        non_canonical[31] = 0;
+        let mut deliveries: Vec<WalEntryPayload> = (0..700).map(good).collect();
+        deliveries.extend([
+            row(700, leaf(700), wrong_root),
+            row(701, leaf(701), roots[701]),
+            good(700),
+        ]);
+        deliveries.extend((701..1_200).map(good));
+        deliveries.extend([
+            good(1_300),
+            good(1_199),
+            row(1_200, non_canonical, roots[1_200]),
+        ]);
+        deliveries.extend((1_200..1_600).map(good));
+        deliveries.push(row(1_600, leaf(1_600), [0; 32]));
+        deliveries.extend((1_601..3_000).map(good));
+        deliveries.push(row(
+            u32::try_from(TREE_MAX_ITEMS).expect("u32"),
+            leaf(0),
+            roots[0],
+        ));
+        assert_eq!(differ(&deliveries), 3_000, "every good row once");
+    }
+
+    /// Rows of a recorded capture folder (`events.bin`), split into blocks at block-local
+    /// indices the way the router hands them to each block's instance.
+    fn capture_blocks(folder: &str, rows: usize) -> Vec<Vec<WalEntryPayload>> {
+        const HEADER: usize = 64;
+        const ROW: usize = 133;
+        let bytes =
+            std::fs::read(std::path::Path::new(folder).join("events.bin")).expect("events.bin");
+        let mut blocks: Vec<Vec<WalEntryPayload>> = Vec::new();
+        for chunk in bytes[HEADER..].as_chunks::<ROW>().0.iter().take(rows) {
+            let index = u32::from_le_bytes(chunk[..4].try_into().expect("index"));
+            let (block, local) = crate::orchestrator::split_ppoi_index(index);
+            if blocks.len() <= block as usize {
+                blocks.push(Vec::new());
+            }
+            blocks[block as usize].push(row(
+                local,
+                chunk[5..37].try_into().expect("commitment"),
+                chunk[37..69].try_into().expect("root"),
+            ));
+        }
+        blocks
+    }
+
+    #[test]
+    #[ignore = "cost: stages recorded rows both ways, about 400 s for the whole list; run by hand with PPOI_REPLAY_CAPTURE naming a capture folder, when list-row staging or validate_apply changes"]
+    fn staging_matches_validate_then_apply_over_a_recorded_capture() {
+        let folder = std::env::var("PPOI_REPLAY_CAPTURE")
+            .expect("PPOI_REPLAY_CAPTURE must name a capture folder");
+        let rows = std::env::var("PPOI_DIFFERENTIAL_ROWS")
+            .ok()
+            .map_or(70_000, |n| n.parse().expect("PPOI_DIFFERENTIAL_ROWS"));
+        let blocks = capture_blocks(&folder, rows);
+        assert_eq!(blocks.iter().map(Vec::len).sum::<usize>(), rows);
+        for (at, block) in blocks.iter().enumerate() {
+            assert_eq!(
+                differ(block),
+                block.len(),
+                "block {at}: a recorded row was refused"
+            );
+        }
     }
 }

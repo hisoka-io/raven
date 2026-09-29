@@ -40,7 +40,7 @@ use raven_railgun_engine::inspire::{
 use raven_railgun_engine::orchestrator::{
     bootstrap_railgun_engine_multi, DataSourceFilter, InstanceConfig, LEAVES_PER_PPOI_BLOCK,
 };
-use raven_railgun_engine::persistence::{ConsumerEvent, InspirePersistence};
+use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::PirTableEncoder;
 use raven_railgun_engine::session_pool::BoundedSessionStore;
 use raven_railgun_http::status::{MirrorFeedState, MirrorFeedView};
@@ -57,25 +57,22 @@ const PATHS_BLOCK_0: &str = "ppoi-paths-ofac-0";
 const PATHS_BLOCK_1: &str = "ppoi-paths-ofac-1";
 const SHIPPED_ENDPOINT: &str = "mirror_endpoint = \"https://ppoi.fdi.network\"";
 
-/// Counted from the end of instance bootstrap, because PIR setup is machine speed and the
-/// preflight is not. Twice the bound, so a second sequential wait on one list key overruns it.
-fn boot_guard() -> Duration {
-    MIRROR_PREFLIGHT_TIMEOUT * 2
-}
-
-/// Accepts and holds every connection open in silence.
-async fn upstream_that_never_answers() -> String {
+/// Accepts and holds every connection open in silence, counting them.
+async fn upstream_that_never_answers() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accepted = Arc::clone(&connections);
     tokio::spawn(async move {
         let mut held = Vec::new();
         while let Ok((stream, _)) = listener.accept().await {
+            accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             held.push(stream);
         }
     });
-    url
+    (url, connections)
 }
 
 type Requests = Arc<parking_lot::Mutex<Vec<Value>>>;
@@ -237,7 +234,8 @@ async fn status_answers(addr: SocketAddr) {
     }
 }
 
-/// Call once bootstrap is over; see [`boot_guard`].
+/// Call once bootstrap is over. The boot bounds its own wait on upstream, so no verdict for
+/// [`progress::STALL`] is a hung boot; a slow one is not a failure.
 async fn boot_verdict(booting: &mut Booting) -> Boot {
     let verdict = async {
         tokio::select! {
@@ -248,9 +246,9 @@ async fn boot_verdict(booting: &mut Booting) -> Boot {
             () = status_answers(booting.addr) => Boot::Serving,
         }
     };
-    tokio::time::timeout(boot_guard(), verdict)
+    tokio::time::timeout(progress::STALL, verdict)
         .await
-        .expect("boot neither refused nor served inside twice the preflight bound")
+        .expect("boot neither refused nor served, though it bounds its wait on upstream")
 }
 
 /// A stop commits every instance, re-encoding its whole cell, and nothing observable moves while
@@ -262,6 +260,23 @@ async fn shut_down(booting: Booting) {
         .expect("shutdown stalled")
         .expect("server task panicked")
         .expect("graceful shutdown");
+}
+
+/// [`shut_down`], then waits for every instance's consumer to let go of its store. The stop gives
+/// up waiting on a consumer still making its closing commit, and a data dir opened again before
+/// that commit lands can read a manifest from before it beside a WAL sealed by it.
+async fn shut_down_settled(booting: Booting, view: &BootstrapView) {
+    shut_down(booting).await;
+    until_done_or_stalled("every consumer's closing commit", async || {
+        let holders: Vec<usize> = view
+            .instances
+            .iter()
+            .map(|instance| Arc::strong_count(&instance.logical_store))
+            .collect();
+        let settled = holders.iter().all(|held| *held == 1);
+        (holders, settled.then_some(()))
+    })
+    .await;
 }
 
 fn assert_refusal_names_the_dead_endpoint(refusal: &str, endpoint: &str, setting: &str) {
@@ -350,10 +365,10 @@ async fn leave_one_row_on_disk(data_root: &Path, instance_ids: &[&str]) {
 }
 
 /// Boots `instance_ids` through the engine alone, delivers the upstream rows at `indices` the
-/// way the mirror worker does, and shuts the consumers down cleanly. Every instance must end up
-/// holding all of them. No server: a serving boot installs the process-global metrics recorder,
-/// and one left behind by a seeding boot would hide a count made before the real boot installs
-/// its own.
+/// way the mirror worker does, and stops once every instance holds all of them. A row reaches a
+/// store only once its WAL entry is synced, so the stop needs no final commit: the next boot
+/// replays them. No server: a serving boot installs the process-global metrics recorder, and one
+/// left behind by a seeding boot would hide a count made before the real boot installs its own.
 async fn leave_rows_on_disk(data_root: &Path, instance_ids: &[&str], indices: &[u32]) {
     let (opts, _) = shipped_ppoi_options(data_root, instance_ids, "http://127.0.0.1:1");
     let params = InspireParams::secure_128_d2048();
@@ -376,9 +391,8 @@ async fn leave_rows_on_disk(data_root: &Path, instance_ids: &[&str], indices: &[
         )
         .map(|(state, _)| state)
     };
-    let mut engine =
-        bootstrap_railgun_engine_multi(opts.instances.clone(), params.clone(), factory)
-            .expect("engine bootstrap");
+    let engine = bootstrap_railgun_engine_multi(opts.instances.clone(), params.clone(), factory)
+        .expect("engine bootstrap");
 
     for (seed, &list_index) in (0x71u8..).zip(indices) {
         engine
@@ -408,19 +422,19 @@ async fn leave_rows_on_disk(data_root: &Path, instance_ids: &[&str], indices: &[
     })
     .await;
 
-    for instance in &mut engine.instances {
-        instance
-            .sender
-            .send(ConsumerEvent::Shutdown)
-            .await
-            .expect("consumer open");
-        tokio::time::timeout(Duration::from_secs(60), &mut instance.consumer)
-            .await
-            .expect("consumer drained")
-            .expect("consumer joined")
-            .expect("consumer exited clean");
+    for instance in &engine.instances {
+        instance.consumer.abort();
     }
     engine.router.abort();
+    for instance in engine.instances {
+        let stopped = instance.consumer.await;
+        assert!(
+            stopped
+                .as_ref()
+                .is_err_and(tokio::task::JoinError::is_cancelled),
+            "the consumer failed before the stop: {stopped:?}"
+        );
+    }
 }
 
 /// Leaves each of `instance_ids`, all holding the list from its first row, holding rows `0..rows`
@@ -539,7 +553,7 @@ fn commit_rows(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_holding_no_rows_refuses_to_boot_against_an_upstream_that_never_answers() {
     let data_root = tempfile::tempdir().expect("tempdir");
-    let endpoint = upstream_that_never_answers().await;
+    let (endpoint, connections) = upstream_that_never_answers().await;
     let (opts, observer) = shipped_ppoi_options(data_root.path(), &[PATHS_BLOCK_0], &endpoint);
     let mut booting = boot_multi(opts).await;
     bootstrapped(&observer, &mut booting).await;
@@ -547,6 +561,11 @@ async fn a_node_holding_no_rows_refuses_to_boot_against_an_upstream_that_never_a
     match boot_verdict(&mut booting).await {
         Boot::Refused(refusal) => {
             assert_refusal_names_the_dead_endpoint(&refusal, &endpoint, "mirror_endpoint");
+            assert_eq!(
+                connections.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the boot must wait on a dead upstream once per list key, not again"
+            );
         }
         Boot::Serving => panic!(
             "a node holding no rows for the list booted and is serving, against an upstream \
@@ -560,7 +579,7 @@ async fn a_node_holding_rows_boots_past_an_upstream_that_never_answers_and_count
     let data_root = tempfile::tempdir().expect("tempdir");
     leave_one_row_on_disk(data_root.path(), &[PATHS_BLOCK_0]).await;
 
-    let endpoint = upstream_that_never_answers().await;
+    let (endpoint, _) = upstream_that_never_answers().await;
     let (opts, observer) = shipped_ppoi_options(data_root.path(), &[PATHS_BLOCK_0], &endpoint);
     let mut booting = boot_multi(opts).await;
     let view = bootstrapped(&observer, &mut booting)
@@ -597,7 +616,7 @@ async fn rows_held_by_one_block_of_the_list_keep_the_node_up() {
     let data_root = tempfile::tempdir().expect("tempdir");
     leave_one_row_on_disk(data_root.path(), &[PATHS_BLOCK_0]).await;
 
-    let endpoint = upstream_that_never_answers().await;
+    let (endpoint, _) = upstream_that_never_answers().await;
     let (opts, observer) =
         shipped_ppoi_options(data_root.path(), &[PATHS_BLOCK_0, PATHS_BLOCK_1], &endpoint);
     let mut booting = boot_multi(opts).await;
@@ -742,14 +761,17 @@ async fn an_answering_upstream_is_asked_once_per_list_key_however_many_instances
 
 type TimedRequests = Arc<parking_lot::Mutex<Vec<(tokio::time::Instant, Value)>>>;
 
-/// Holds rows `0..rows` and answers any page of them, stamping each request as it lands.
+/// Holds rows `0..rows` with the roots upstream publishes, and answers any page of them,
+/// stamping each request as it lands.
 async fn upstream_holding(rows: u64) -> (String, TimedRequests) {
+    let roots = Arc::new(list_roots(rows));
     let requests = TimedRequests::default();
     let seen = Arc::clone(&requests);
     let app = Router::new().route(
         "/",
         post(move |Json(request): Json<Value>| {
             let seen = Arc::clone(&seen);
+            let roots = Arc::clone(&roots);
             async move {
                 let bound = |name: &str| {
                     request
@@ -761,11 +783,10 @@ async fn upstream_holding(rows: u64) -> (String, TimedRequests) {
                 seen.lock().push((tokio::time::Instant::now(), request));
                 let result: Vec<Value> = (start..=end.min(rows.saturating_sub(1)))
                     .map(|index| {
-                        signed_row(
-                            index,
-                            &format!("{index:064x}"),
-                            &format!("{:064x}", index + 1),
-                        )
+                        let root = roots
+                            .get(usize::try_from(index).expect("index"))
+                            .expect("a held row");
+                        signed_row(index, &hex::encode(leaf_at(index)), &hex::encode(root))
                     })
                     .collect();
                 Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
@@ -799,21 +820,19 @@ fn timed_worker_pages(requests: &TimedRequests) -> Vec<(tokio::time::Instant, u6
         .collect()
 }
 
-/// A cold sync through the shipped loader: `[global].mirror_backfill_interval_secs = 0` has the
-/// worker ask for each page as soon as the last full one is delivered, and the first short page
-/// puts it back on the 30 s poll. At the poll alone the second page lands 30 s after the first,
-/// so pages landing well inside that show the setting reached the worker.
+/// A cold sync on the shipped config as it ships: the worker asks for each page as soon as the
+/// last full one is delivered, and the first short page puts it back on the 30 s poll. Paced at
+/// the poll, the second page would land 30 s after the first, and a 363,278-row list would take
+/// six hours to sync.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_backfill_setting_pages_a_cold_sync_back_to_back_then_returns_to_the_poll() {
+async fn the_shipped_config_pages_a_cold_sync_back_to_back_then_returns_to_the_poll() {
     let data_root = tempfile::tempdir().expect("tempdir");
     let (endpoint, requests) = upstream_holding(1_010).await;
-    let (opts, observer) = shipped_ppoi_options_with(
-        data_root.path(),
-        &[PATHS_BLOCK_0],
-        &endpoint,
-        "mirror_backfill_interval_secs = 0",
+    let (opts, observer) = shipped_ppoi_options(data_root.path(), &[PATHS_BLOCK_0], &endpoint);
+    assert_eq!(
+        opts.mirror_backfill_interval_secs, None,
+        "the shipped config sets no backfill pace"
     );
-    assert_eq!(opts.mirror_backfill_interval_secs, Some(0));
 
     let mut booting = boot_multi(opts).await;
     let view = bootstrapped(&observer, &mut booting)
@@ -846,7 +865,7 @@ async fn the_backfill_setting_pages_a_cold_sync_back_to_back_then_returns_to_the
         .expect("three pages");
     assert!(
         spacing < Duration::from_secs(15),
-        "full pages were {spacing:?} apart, the pace of the 30 s poll rather than the setting"
+        "full pages were {spacing:?} apart, the pace of the 30 s poll"
     );
 
     let short_page = pages.last().expect("three pages").0;
@@ -859,6 +878,52 @@ async fn the_backfill_setting_pages_a_cold_sync_back_to_back_then_returns_to_the
     shut_down(booting).await;
 }
 
+/// A live block catching up publishes once, when its feed first answers short, and never on the
+/// append count on the way. At the live policy's publish per 1,000 appends, a 2,010-row sync
+/// would publish once the batch holding row 1,000 syncs, at most 501 rows later, and leave the
+/// rest unserved until the 300 s bound. Block 0 runs the live policy here: the shipped live
+/// block starts 327,680 rows into the list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_block_catching_up_publishes_once_it_is_caught_up() {
+    const ROWS: u64 = 2_010;
+    let data_root = tempfile::tempdir().expect("tempdir");
+    let (endpoint, _) = upstream_holding_rooted(ROWS).await;
+    let (mut opts, observer) = shipped_ppoi_options(data_root.path(), &[PATHS_BLOCK_0], &endpoint);
+    let live = SnapshotPolicy::default();
+    assert!(
+        live.max_appends_per_snapshot < usize::try_from(ROWS).expect("rows"),
+        "fixture: the append count falls due inside the sync"
+    );
+    for instance in &mut opts.instances {
+        instance.snapshot_policy = live;
+    }
+    let mut booting = boot_multi(opts).await;
+    let view = bootstrapped(&observer, &mut booting)
+        .await
+        .expect("boot bootstraps");
+    drop(observer);
+    match boot_verdict(&mut booting).await {
+        Boot::Serving => {}
+        Boot::Refused(refusal) => panic!("an answering upstream was refused: {refusal}"),
+    }
+    readiness_until(booting.addr, &view, "the list caught up", |feed| {
+        feed.state == MirrorFeedState::CaughtUp && feed.rows_held == ROWS
+    })
+    .await;
+    let block_0 = view.instances.first().expect("block 0");
+    let commits = until_done_or_stalled("every row published", async || {
+        let unpublished = block_0.logical_store.lock().dirty_shards().len();
+        let commits = block_0.metrics.lock().commits_fired;
+        (
+            (unpublished, commits),
+            (unpublished == 0).then_some(commits),
+        )
+    })
+    .await;
+    assert_eq!(commits, 1, "one publish, at catch-up");
+    shut_down_settled(booting, &view).await;
+}
+
 /// Holds rows `0..rows` of the list with the roots upstream publishes, one depth-16 tree per
 /// 65,536-row block, so every instance on the list applies what it is sent.
 async fn upstream_holding_rooted(rows: u64) -> (String, Requests) {
@@ -867,6 +932,16 @@ async fn upstream_holding_rooted(rows: u64) -> (String, Requests) {
 
 /// [`upstream_holding_rooted`], answering each request `delay` after it arrives.
 async fn upstream_holding_rooted_after(rows: u64, delay: Duration) -> (String, Requests) {
+    let roots = list_roots(rows);
+    upstream_answering(
+        move |index| roots.get(usize::try_from(index).ok()?).copied(),
+        delay,
+    )
+    .await
+}
+
+/// The root upstream publishes with each of rows `0..rows`: one depth-16 tree per block.
+fn list_roots(rows: u64) -> Vec<[u8; 32]> {
     let block = u64::from(raven_railgun_engine::orchestrator::LEAVES_PER_PPOI_BLOCK);
     let mut roots = Vec::new();
     let mut tree = raven_railgun_engine::imt::Imt::new().expect("imt");
@@ -879,11 +954,7 @@ async fn upstream_holding_rooted_after(rows: u64, delay: Duration) -> (String, R
             .expect("append");
         roots.push(tree.root());
     }
-    upstream_answering(
-        move |index| roots.get(usize::try_from(index).ok()?).copied(),
-        delay,
-    )
-    .await
+    roots
 }
 
 /// Answers each page with row `index`'s leaf and the root `root_at(index)` gives, `delay` after
@@ -1041,6 +1112,7 @@ async fn a_ppoi_only_boot_asks_for_each_page_once_and_fills_every_instance_on_th
     let view = bootstrapped(&observer, &mut booting)
         .await
         .expect("boot bootstraps");
+    drop(observer);
     match boot_verdict(&mut booting).await {
         Boot::Serving => {}
         Boot::Refused(refusal) => panic!("an answering upstream was refused: {refusal}"),
@@ -1082,7 +1154,7 @@ async fn a_ppoi_only_boot_asks_for_each_page_once_and_fills_every_instance_on_th
         .filter(|request| request.pointer("/params/endIndex") == Some(&json!(0)))
         .count();
     assert_eq!(preflights, 1, "and one preflight for the list");
-    shut_down(booting).await;
+    shut_down_settled(booting, &view).await;
 
     // What the trigger promises: stopped once caught up, the data dirs hold every row upstream had.
     assert_eq!(
@@ -1289,6 +1361,94 @@ async fn the_boot_applies_signed_rows_and_refuses_a_forged_or_unsigned_one_by_na
         );
         shut_down(booting).await;
     }
+}
+
+/// A row the engine refuses is asked for again while the node runs. Upstream serves row 600 with
+/// a root the tree does not reproduce the first time it is asked, and correctly after. The
+/// instance refuses it and every row past it, readiness names the stalled instance, and the feed
+/// comes back for row 600 once the instance has stood on it for a poll: the list reaches its
+/// full count with no restart, and readiness comes back up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_row_refused_once_is_asked_for_again_and_the_list_completes_without_a_restart() {
+    const ROWS: u64 = 1_010;
+    const REFUSED: u64 = 600;
+    let data_root = tempfile::tempdir().expect("tempdir");
+    let roots = block_0_roots(ROWS);
+    let served_diverged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let diverge_once = Arc::clone(&served_diverged);
+    let (endpoint, requests) = upstream_serving(
+        move |index| {
+            let mut root = *roots.get(usize::try_from(index).ok()?)?;
+            if index == REFUSED && !diverge_once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                root[31] ^= 1;
+            }
+            Some(signed_row(
+                index,
+                &hex::encode(leaf_at(index)),
+                &hex::encode(root),
+            ))
+        },
+        Duration::ZERO,
+    )
+    .await;
+    let (booting, view) = serving(data_root.path(), &[PATHS_BLOCK_0], &endpoint).await;
+
+    let (code, body) = until_done_or_stalled("the refused row", async || {
+        let (code, body) = readiness(booting.addr).await;
+        let held = rows_under(&view, PATHS_BLOCK_0);
+        let refused = held == usize::try_from(REFUSED).expect("rows")
+            && !body.stalled_consumer_instances.is_empty();
+        (
+            (held, feed_progress(&body)),
+            refused.then_some((code, body)),
+        )
+    })
+    .await;
+    assert_eq!(code, 503, "{body:?}");
+    assert_eq!(body.stalled_consumer_instances, [PATHS_BLOCK_0]);
+
+    let (code, body) = readiness_until(booting.addr, &view, "the list complete", |feed| {
+        feed.state == MirrorFeedState::CaughtUp && feed.rows_held == ROWS
+    })
+    .await;
+    assert_eq!(code, 200, "{body:?}");
+    assert!(served_diverged.load(std::sync::atomic::Ordering::SeqCst));
+    let starts = start_indices(&requests);
+    let moved_past = starts
+        .iter()
+        .position(|start| *start > REFUSED)
+        .expect("the feed paged past the refused row");
+    assert!(
+        starts
+            .get(moved_past..)
+            .unwrap_or_default()
+            .contains(&REFUSED),
+        "row {REFUSED} must be asked for again once the feed had moved past it: {starts:?}"
+    );
+    assert!(divergences(booting.addr).await >= 1);
+    shut_down_settled(booting, &view).await;
+    assert_eq!(recovered_rows(data_root.path(), PATHS_BLOCK_0), ROWS);
+}
+
+async fn divergences(addr: SocketAddr) -> u64 {
+    let scrape = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .bearer_auth(BEARER_TOKEN)
+        .send()
+        .await
+        .expect("scrape")
+        .text()
+        .await
+        .expect("metrics body");
+    scrape
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("raven_railgun_ppoi_root_divergence_total")?
+                .trim()
+                .parse()
+                .ok()
+        })
+        .unwrap_or(0)
 }
 
 /// A node holding nothing boots only once its first row verifies: a first row carrying no
@@ -1502,7 +1662,7 @@ async fn a_feed_stops_at_the_last_declared_row_names_the_next_block_and_feeds_it
         StatusCode::OK,
         "a proof for a row no declared block holds must not be served"
     );
-    shut_down(booting).await;
+    shut_down_settled(booting, &view).await;
 
     let asked = worker_pages(&requests).len();
     let (booting, view) =

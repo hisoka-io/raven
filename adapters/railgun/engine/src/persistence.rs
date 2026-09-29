@@ -108,6 +108,14 @@ pub struct InspirePersistence {
     /// refuses to publish a store below it without a dirty shard to explain the
     /// drop.
     committed_leaf_count: std::sync::atomic::AtomicUsize,
+    /// See [`InspirePersistence::list_row_refused`].
+    list_row_refused: Mutex<Option<u32>>,
+    /// See [`InspirePersistence::set_backfilling`].
+    backfilling: std::sync::atomic::AtomicBool,
+    publish_requested: std::sync::atomic::AtomicBool,
+    wake: tokio::sync::Notify,
+    #[cfg(test)]
+    fail_next_sync: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for InspirePersistence {
@@ -480,6 +488,12 @@ impl InspirePersistence {
                     committed_leaf_count: std::sync::atomic::AtomicUsize::new(
                         logical_store.leaf_count(),
                     ),
+                    list_row_refused: Mutex::new(None),
+                    backfilling: std::sync::atomic::AtomicBool::new(false),
+                    publish_requested: std::sync::atomic::AtomicBool::new(false),
+                    wake: tokio::sync::Notify::new(),
+                    #[cfg(test)]
+                    fail_next_sync: std::sync::atomic::AtomicBool::new(false),
                 },
                 recovered_state,
                 recovered_logical_store: logical_store,
@@ -535,6 +549,12 @@ impl InspirePersistence {
                     commit_notify: tokio::sync::Notify::new(),
                     persisted_cache_fingerprint: Mutex::new(None),
                     committed_leaf_count: std::sync::atomic::AtomicUsize::new(0),
+                    list_row_refused: Mutex::new(None),
+                    backfilling: std::sync::atomic::AtomicBool::new(false),
+                    publish_requested: std::sync::atomic::AtomicBool::new(false),
+                    wake: tokio::sync::Notify::new(),
+                    #[cfg(test)]
+                    fail_next_sync: std::sync::atomic::AtomicBool::new(false),
                 },
                 recovered_state: None,
                 recovered_logical_store: super::inspire::LogicalLeafStore::new(),
@@ -669,13 +689,81 @@ impl InspirePersistence {
             .wal
             .append(payload, block_height)
             .map_err(|e| AdapterError::Internal(format!("wal append: {e}")))?;
+        self.count_append();
+        Ok((seq, self.snapshot_due()))
+    }
+
+    fn count_append(&self) {
         let mut c = self.counters.lock();
         c.appends_since_snapshot = c.appends_since_snapshot.saturating_add(1);
-        let elapsed = c.last_snapshot_at.elapsed();
-        let policy_snap = *self.policy.read();
-        let trigger = c.appends_since_snapshot >= policy_snap.max_appends_per_snapshot
-            || elapsed >= Duration::from_secs(policy_snap.max_seconds_between_snapshots);
-        Ok((seq, trigger))
+    }
+
+    /// Write a WAL entry that is durable only once [`Self::sync_rows`] returns. Nothing derived
+    /// from it may be shown before then.
+    fn append_unsynced(&self, payload: &WalEntryPayload, block_height: u64) -> Result<u64> {
+        let seq = self
+            .wal
+            .append_deferred(payload, block_height)
+            .map_err(|e| AdapterError::Internal(format!("wal append: {e}")))?;
+        self.count_append();
+        Ok(seq)
+    }
+
+    /// Make every entry [`Self::append_unsynced`] wrote durable. A failure poisons the WAL until
+    /// a reopen.
+    fn sync_rows(&self) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_sync
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(AdapterError::Internal(
+                "wal sync: injected failure".to_owned(),
+            ));
+        }
+        self.wal
+            .sync()
+            .map_err(|e| AdapterError::Internal(format!("wal sync: {e}")))
+    }
+
+    /// Whether the policy asks for a snapshot now. The append count does not count while
+    /// [`Self::set_backfilling`] holds, nor while the publish that ends it is pending: the count
+    /// a backfill built up would otherwise re-encode the block once more in the middle of the
+    /// rows still queued.
+    fn snapshot_due(&self) -> bool {
+        let c = self.counters.lock();
+        let policy = *self.policy.read();
+        let appends_due = c.appends_since_snapshot >= policy.max_appends_per_snapshot
+            && !self.backfilling.load(std::sync::atomic::Ordering::Acquire)
+            && !self
+                .publish_requested
+                .load(std::sync::atomic::Ordering::Acquire);
+        appends_due
+            || c.last_snapshot_at.elapsed()
+                >= Duration::from_secs(policy.max_seconds_between_snapshots)
+    }
+
+    /// While on, the append count triggers no snapshot: a feed catching up would otherwise
+    /// re-encode the part-filled block every `max_appends_per_snapshot` rows. The timer, the
+    /// publish bound and a filled tree still publish. Turning it off asks the consumer to
+    /// publish what it holds as soon as its queue is empty.
+    pub fn set_backfilling(&self, on: bool) {
+        let was = self
+            .backfilling
+            .swap(on, std::sync::atomic::Ordering::AcqRel);
+        if was && !on {
+            self.publish_requested
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.wake.notify_one();
+        }
+    }
+
+    /// Index, within its block, of the list row this instance lacks and was refused at or past
+    /// since it last applied one. A feed asks for that row again on it, and never on rows that
+    /// are merely still queued. `None` again once a list row applies.
+    #[must_use]
+    pub fn list_row_refused(&self) -> Option<u32> {
+        *self.list_row_refused.lock()
     }
 
     /// Borrow the layout.
@@ -801,7 +889,7 @@ pub enum ConsumerEvent {
         /// Receives the durable-commit outcome.
         completion: tokio::sync::mpsc::Sender<std::result::Result<(), String>>,
     },
-    /// A PPOI status row from the upstream mirror.
+    /// A PPOI list row from the upstream mirror.
     Ppoi(raven_railgun_persistence::WalEntryPayload, u64),
     /// Heartbeat carrying the chain head and the indexer's scan watermark.
     Heartbeat {
@@ -1320,6 +1408,8 @@ pub async fn run_consumer_task(
     // This loop's share of the error run. A complete tree applies no further event to clear it,
     // so the next commit by any path does, or one transient failure holds readiness shut for good.
     let mut failed_publishes: u64 = 0;
+    // An event taken off the queue behind a run of list rows, handled before the next receive.
+    let mut pending: Option<ConsumerEvent> = None;
 
     loop {
         let now = tokio::time::Instant::now();
@@ -1347,7 +1437,12 @@ pub async fn run_consumer_task(
                 .checked_add(persistence.snapshot_policy().publish_bound())
                 .unwrap_or(since)
         });
-        if publish_at.is_some_and(|at| at <= now) {
+        let idle = pending.is_none() && rx.is_empty();
+        let requested = idle
+            && persistence
+                .publish_requested
+                .swap(false, std::sync::atomic::Ordering::AcqRel);
+        if publish_at.is_some_and(|at| at <= now) || (requested && behind) {
             // Between events, so the floor names only blocks whose events fully applied.
             let floor = metrics.lock().last_applied_leaf_block;
             if let Err(e) = drive_commit(
@@ -1374,12 +1469,20 @@ pub async fn run_consumer_task(
             }
             continue;
         }
-        let received = match publish_at {
-            None => rx.recv().await,
-            Some(at) => match tokio::time::timeout_at(at, rx.recv()).await {
-                Ok(received) => received,
-                Err(_) => continue,
-            },
+        let received = if let Some(event) = pending.take() {
+            Some(event)
+        } else {
+            let publish_due = async {
+                match publish_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                received = rx.recv() => received,
+                () = persistence.wake.notified() => continue,
+                () = publish_due => continue,
+            }
         };
         let Some(msg) = received else {
             tracing::info!("consumer channel closed; exiting");
@@ -1515,6 +1618,50 @@ pub async fn run_consumer_task(
                     .await;
                 continue;
             }
+            ConsumerEvent::Ppoi(payload, height)
+                if matches!(payload, WalEntryPayload::PpoiListLeafAdded { .. }) =>
+            {
+                let mut rows = vec![(payload, height)];
+                while rows.len() < MAX_ROWS_PER_SYNC {
+                    match rx.try_recv() {
+                        Ok(ConsumerEvent::Ppoi(payload, height))
+                            if matches!(payload, WalEntryPayload::PpoiListLeafAdded { .. }) =>
+                        {
+                            rows.push((payload, height));
+                        }
+                        Ok(other) => {
+                            pending = Some(other);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                apply_list_rows(
+                    &rows,
+                    &instance,
+                    &persistence,
+                    &logical_store,
+                    &params,
+                    encoder.as_ref(),
+                    &metrics,
+                );
+                if let Some(state) = verifier_state.as_mut() {
+                    state
+                        .maybe_verify_and_act(
+                            height,
+                            &instance,
+                            &persistence,
+                            &logical_store,
+                            &params,
+                            encoder.as_ref(),
+                            &metrics,
+                        )
+                        .await;
+                }
+                continue;
+            }
+            // Any other payload sent as a mirror row. The mirror sends none, but the channel
+            // admits every kind, and each applies as its own.
             ConsumerEvent::Ppoi(payload, height) => (payload, height),
             ConsumerEvent::Heartbeat {
                 chain_head,
@@ -1582,8 +1729,8 @@ pub async fn run_consumer_task(
             record_consumer_error(&metrics, &e, "Ppoi apply", height);
             continue;
         }
-        // Per PAYLOAD, not per arm: this arm carries both an IMT append and a status byte, and
-        // only the append can close the contiguity gap the error run stands for.
+        // Per PAYLOAD, not per arm: only an IMT append can close the contiguity gap the error
+        // run stands for.
         if super::inspire::appends_to_a_tree(&payload) {
             metrics.lock().record_applied_event(height);
         } else {
@@ -1815,6 +1962,219 @@ fn apply_ppoi(
         )?;
     }
     Ok(())
+}
+
+/// Most list rows one WAL sync covers: the queued rows the consumer takes at once, capped at
+/// the mirror's largest page (upstream's limit). A batch need not align with a page, so
+/// recovery stands on the last synced batch, and the feed asks for the rest again.
+const MAX_ROWS_PER_SYNC: usize = 501;
+
+/// One list's rows in a batch, screened on a copy of its tree the store does not show yet.
+struct ListStage {
+    list_key: [u8; 32],
+    /// Rows the store held when the copy was taken.
+    base: u32,
+    tree: crate::imt::Imt,
+    rows: Vec<(raven_railgun_persistence::WalEntryPayload, u64)>,
+}
+
+enum RowOutcome {
+    Applied,
+    /// A row the instance already holds, sent again; nothing to do and nothing to count.
+    Held,
+    Refused {
+        error: AdapterError,
+        /// The row the instance lacks, when this refusal leaves it waiting on that row.
+        lacks: Option<u32>,
+    },
+}
+
+/// Apply a run of list rows under one WAL sync.
+///
+/// Each row is screened on a copy of its list's tree and written to the WAL unsynced. Only once
+/// the sync returns do the store, the metrics and any publish take the rows, so nothing a reader
+/// sees can be lost by a crash: after one, recovery replays up to the last synced run and the
+/// feed asks for the rest again.
+#[allow(clippy::too_many_arguments)]
+fn apply_list_rows(
+    rows: &[(raven_railgun_persistence::WalEntryPayload, u64)],
+    instance: &Arc<PirInstance<RavenInspireScheme>>,
+    persistence: &Arc<InspirePersistence>,
+    logical_store: &Arc<parking_lot::Mutex<super::inspire::LogicalLeafStore>>,
+    params: &raven_inspire::params::InspireParams,
+    encoder: &dyn super::pir_table::PirTableEncoder,
+    metrics: &Arc<parking_lot::Mutex<ConsumerMetrics>>,
+) {
+    let mut stages: Vec<ListStage> = Vec::new();
+    let mut outcomes: Vec<RowOutcome> = rows
+        .iter()
+        .map(|(payload, height)| {
+            stage_list_row(&mut stages, payload, *height, persistence, logical_store)
+        })
+        .collect();
+
+    let written = outcomes
+        .iter()
+        .any(|outcome| matches!(outcome, RowOutcome::Applied));
+    let lists: Vec<[u8; 32]> = stages.iter().map(|stage| stage.list_key).collect();
+    let lacks = stages.iter().map(|stage| stage.base).min();
+    // A failed sync leaves the rows for the feed to ask for again. Only this consumer writes a
+    // list tree, so an install after the sync cannot find it moved; were it to, the rows are
+    // durable and asking for them again would write them twice, so they are not asked for.
+    let durable = if !written {
+        Ok(())
+    } else if let Err(error) = persistence.sync_rows() {
+        Err((error, lacks))
+    } else {
+        let mut store = logical_store.lock();
+        stages
+            .into_iter()
+            .try_for_each(|stage| {
+                store.apply_staged_list_rows(&stage.list_key, stage.tree, &stage.rows, encoder)
+            })
+            .map_err(|error| (error, None))
+    };
+    if let Err((error, lacks)) = durable {
+        let reason = error.to_string();
+        for outcome in &mut outcomes {
+            if matches!(outcome, RowOutcome::Applied) {
+                *outcome = RowOutcome::Refused {
+                    error: AdapterError::Internal(reason.clone()),
+                    lacks,
+                };
+            }
+        }
+    }
+
+    let mut applied = false;
+    for (outcome, (_, height)) in outcomes.into_iter().zip(rows) {
+        match outcome {
+            RowOutcome::Applied => {
+                applied = true;
+                let mut m = metrics.lock();
+                // Mirror rows carry height 0, so neither the floor nor the commit marker may
+                // be driven from `height`.
+                m.last_applied_leaf_block = m.last_applied_leaf_block.max(*height);
+                m.record_applied_event(*height);
+                drop(m);
+                *persistence.list_row_refused.lock() = None;
+            }
+            RowOutcome::Held => {}
+            RowOutcome::Refused { error, lacks } => {
+                record_consumer_error(metrics, &error, "Ppoi apply", *height);
+                if lacks.is_some() {
+                    *persistence.list_row_refused.lock() = lacks;
+                }
+            }
+        }
+    }
+    if !applied {
+        return;
+    }
+    let filled = {
+        let store = logical_store.lock();
+        lists.iter().any(|list_key| {
+            store
+                .ppoi_imt(list_key)
+                .is_some_and(|imt| imt.leaf_count() == super::imt::TREE_MAX_ITEMS)
+        })
+    };
+    if filled || persistence.snapshot_due() {
+        let floor = metrics.lock().last_applied_leaf_block;
+        if let Err(error) = drive_commit(
+            instance,
+            persistence,
+            logical_store,
+            params,
+            encoder,
+            floor,
+            metrics,
+        ) {
+            record_consumer_error(metrics, &error, "Ppoi commit", floor);
+        }
+    }
+}
+
+fn stage_list_row(
+    stages: &mut Vec<ListStage>,
+    payload: &raven_railgun_persistence::WalEntryPayload,
+    height: u64,
+    persistence: &InspirePersistence,
+    logical_store: &parking_lot::Mutex<super::inspire::LogicalLeafStore>,
+) -> RowOutcome {
+    let refused = |error, lacks| RowOutcome::Refused { error, lacks };
+    let raven_railgun_persistence::WalEntryPayload::PpoiListLeafAdded {
+        list_key,
+        list_index,
+        blinded_commitment,
+        ..
+    } = payload
+    else {
+        return refused(
+            AdapterError::InvalidQuery("a list row batch holds a non-list payload".to_owned()),
+            None,
+        );
+    };
+    let at = if let Some(at) = stages.iter().position(|stage| stage.list_key == *list_key) {
+        at
+    } else {
+        let (tree, base) = {
+            let store = logical_store.lock();
+            let held = store
+                .ppoi_imt(list_key)
+                .map_or(0, crate::imt::Imt::leaf_count);
+            (store.list_tree_copy(list_key), held)
+        };
+        let tree = match tree {
+            Ok(tree) => tree,
+            Err(error) => return refused(error, None),
+        };
+        stages.push(ListStage {
+            list_key: *list_key,
+            base: u32::try_from(base).unwrap_or(u32::MAX),
+            tree,
+            rows: Vec::new(),
+        });
+        stages.len() - 1
+    };
+    let Some(stage) = stages.get_mut(at) else {
+        return refused(
+            AdapterError::Internal("list stage vanished".to_owned()),
+            None,
+        );
+    };
+    let staged = stage.tree.leaf_count();
+    let lacks = u32::try_from(staged).ok();
+    if (*list_index as usize) < staged {
+        let same = if *list_index < stage.base {
+            logical_store.lock().holds_list_row(payload) == Some(true)
+        } else {
+            stage
+                .rows
+                .get((*list_index - stage.base) as usize)
+                .is_some_and(|(held, _)| held == payload)
+        };
+        if same {
+            return RowOutcome::Held;
+        }
+        return refused(
+            AdapterError::InvalidQuery(format!(
+                "redelivered list_index {list_index} carries commitment \
+                 {blinded_commitment:02x?}, which is not the row already applied there; the \
+                 upstream is serving a divergent list"
+            )),
+            None,
+        );
+    }
+    if let Err(error) = super::inspire::LogicalLeafStore::stage_list_row(&mut stage.tree, payload) {
+        return refused(error, lacks);
+    }
+    if let Err(error) = persistence.append_unsynced(payload, height) {
+        stage.tree.truncate_to(staged);
+        return refused(error, lacks);
+    }
+    stage.rows.push((payload.clone(), height));
+    RowOutcome::Applied
 }
 
 /// A rewind that drops leaves always marks their shards dirty, so on the branch
@@ -4146,17 +4506,16 @@ mod tests {
         }
         // Mirror rows carry height 0, as in production.
         let append = |index: usize| {
-            super::apply_ppoi(
-                &row(index),
-                0,
+            super::apply_list_rows(
+                &[(row(index), 0)],
                 &instance,
                 &persistence,
                 &logical_store,
                 &params,
                 encoder.as_ref(),
                 &metrics,
-            )
-            .expect("append");
+            );
+            assert_eq!(metrics.lock().consumer_errors, 0, "row {index} was refused");
             metrics.lock().commits_fired
         };
         assert_eq!(
@@ -4321,5 +4680,449 @@ mod tests {
         );
         assert_eq!(landed.consumer_errors, failed.consumer_errors);
         assert!(logical_store.lock().dirty_shards().is_empty());
+    }
+
+    const LIST: [u8; 32] = [0x5c; 32];
+
+    fn list_bc(index: u32) -> [u8; 32] {
+        let mut bc = [0u8; 32];
+        bc[0] = 0x0b;
+        bc[1..5].copy_from_slice(&index.to_be_bytes());
+        bc[31] = 0x01;
+        bc
+    }
+
+    /// Rows `0..count` of [`LIST`], each carrying the root upstream publishes with it.
+    fn list_rows(count: u32) -> Vec<(WalEntryPayload, u64)> {
+        let mut tree = crate::imt::Imt::new().expect("imt");
+        (0..count)
+            .map(|index| {
+                tree.insert_leaves(index as usize, &[list_bc(index)])
+                    .expect("append");
+                let row = WalEntryPayload::PpoiListLeafAdded {
+                    list_key: LIST,
+                    list_index: index,
+                    blinded_commitment: list_bc(index),
+                    event_type: raven_railgun_persistence::PpoiEventType::Shield,
+                    validated_merkleroot: tree.root(),
+                };
+                (row, 0)
+            })
+            .collect()
+    }
+
+    fn rows_held(store: &parking_lot::Mutex<crate::inspire::LogicalLeafStore>) -> usize {
+        store
+            .lock()
+            .ppoi_imt(&LIST)
+            .map_or(0, crate::imt::Imt::leaf_count)
+    }
+
+    /// A kill between a page's apply and its sync: nothing derived from the page may show
+    /// (store rows the shim and the feed read, the ack, a publish, a snapshot or manifest), and
+    /// after the power loss that drops its unsynced frames, recovery stands on the last synced
+    /// page and the page applies again when the feed asks for it again.
+    #[allow(clippy::indexing_slicing, clippy::too_many_lines)]
+    #[test]
+    fn a_crash_between_apply_and_sync_shows_nothing_of_the_page_and_recovers_to_the_last_synced_one(
+    ) {
+        let (instance, persistence, logical_store, params, encoder, metrics, dir) =
+            build_unsat_shard_fixtures();
+        // Due by the append count once the second page lands, so a publish of it would show.
+        persistence.set_snapshot_policy(SnapshotPolicy {
+            max_appends_per_snapshot: 6,
+            max_seconds_between_snapshots: 3_600,
+            ..SnapshotPolicy::default()
+        });
+        let rows = list_rows(9);
+        let apply = |persistence: &Arc<InspirePersistence>,
+                     logical_store: &Arc<parking_lot::Mutex<crate::inspire::LogicalLeafStore>>,
+                     metrics: &Arc<parking_lot::Mutex<ConsumerMetrics>>,
+                     page: std::ops::Range<usize>| {
+            apply_list_rows(
+                &rows[page],
+                &instance,
+                persistence,
+                logical_store,
+                &params,
+                encoder.as_ref(),
+                metrics,
+            );
+        };
+
+        apply(&persistence, &logical_store, &metrics, 0..5);
+        assert_eq!(rows_held(&logical_store), 5);
+        let durable = persistence.wal.synced_len();
+        let acked = *metrics.lock();
+        let snapshot = persistence.current_snapshot_id();
+        let epoch = instance.current_snapshot().epoch;
+
+        persistence
+            .fail_next_sync
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        apply(&persistence, &logical_store, &metrics, 5..9);
+        let after = *metrics.lock();
+        assert_eq!(
+            rows_held(&logical_store),
+            5,
+            "the store shows the unsynced page"
+        );
+        assert_eq!(
+            after.events_processed, acked.events_processed,
+            "acked unsynced rows"
+        );
+        assert_eq!(
+            after.commits_fired, acked.commits_fired,
+            "committed unsynced rows"
+        );
+        assert_eq!(
+            persistence.current_snapshot_id(),
+            snapshot,
+            "snapshot or manifest moved"
+        );
+        assert_eq!(
+            instance.current_snapshot().epoch,
+            epoch,
+            "published unsynced rows"
+        );
+        assert_eq!(
+            persistence.list_row_refused(),
+            Some(5),
+            "the feed must ask for row 5 again"
+        );
+        assert!(
+            after.consecutive_event_errors > 0,
+            "readiness must see the failure"
+        );
+        assert_eq!(persistence.wal.synced_len(), durable);
+
+        let wal = persistence.layout().wal_current_path();
+        drop(persistence);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .expect("wal")
+            .set_len(durable)
+            .expect("drop the unsynced suffix");
+        let reopened = InspirePersistence::open(
+            StoreLayout::open(dir.path()).expect("layout"),
+            SCHEME_TAG,
+            InstanceId::new("unsat-shard-fixtures"),
+            SnapshotPolicy::default(),
+            Arc::clone(&encoder),
+        )
+        .expect("reopen");
+        let logical_store = Arc::new(parking_lot::Mutex::new(reopened.recovered_logical_store));
+        assert_eq!(
+            rows_held(&logical_store),
+            5,
+            "recovery stands on the synced page"
+        );
+
+        let persistence = Arc::new(reopened.persistence);
+        let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default()));
+        apply(&persistence, &logical_store, &metrics, 5..9);
+        assert_eq!(rows_held(&logical_store), 9);
+        let WalEntryPayload::PpoiListLeafAdded {
+            validated_merkleroot,
+            ..
+        } = rows[8].0
+        else {
+            panic!("a list row");
+        };
+        assert_eq!(
+            logical_store.lock().ppoi_imt_root(&LIST),
+            Some(validated_merkleroot)
+        );
+        assert_eq!(metrics.lock().consumer_errors, 0);
+    }
+
+    /// A row sent again is skipped: no error, no ack, no WAL entry, nothing for readiness or
+    /// the root screen to count. Only a different row at a held index is refused.
+    #[allow(clippy::indexing_slicing)]
+    #[test]
+    fn a_row_sent_again_is_skipped_and_counts_nothing() {
+        let (instance, persistence, logical_store, params, encoder, metrics, _dir) =
+            build_unsat_shard_fixtures();
+        let rows = list_rows(6);
+        let apply = |batch: &[(WalEntryPayload, u64)]| {
+            apply_list_rows(
+                batch,
+                &instance,
+                &persistence,
+                &logical_store,
+                &params,
+                encoder.as_ref(),
+                &metrics,
+            );
+        };
+        apply(&rows[..4]);
+        let applied = *metrics.lock();
+        let seq = persistence.wal_next_seq();
+
+        apply(&rows[1..4]);
+        let mut in_one_batch = rows[4..6].to_vec();
+        in_one_batch.extend_from_slice(&rows[4..6]);
+        apply(&in_one_batch);
+        let after = *metrics.lock();
+        assert_eq!(rows_held(&logical_store), 6);
+        assert_eq!(after.consumer_errors, 0);
+        assert_eq!(after.consecutive_event_errors, 0);
+        assert_eq!(persistence.list_row_refused(), None);
+        assert_eq!(after.events_processed, applied.events_processed + 2);
+        assert_eq!(
+            persistence.wal_next_seq(),
+            seq + 2,
+            "a skipped row reached the WAL"
+        );
+
+        let WalEntryPayload::PpoiListLeafAdded {
+            list_index,
+            event_type,
+            validated_merkleroot,
+            ..
+        } = rows[2].0
+        else {
+            panic!("a list row");
+        };
+        apply(&[(
+            WalEntryPayload::PpoiListLeafAdded {
+                list_key: LIST,
+                list_index,
+                blinded_commitment: list_bc(99),
+                event_type,
+                validated_merkleroot,
+            },
+            0,
+        )]);
+        let refused = *metrics.lock();
+        assert_eq!(
+            refused.consumer_errors, 1,
+            "a different row at a held index"
+        );
+        assert_eq!(
+            persistence.list_row_refused(),
+            None,
+            "it leaves no row lacking"
+        );
+    }
+
+    /// A refused row names the row the instance lacks, and so do the rows past it that arrive
+    /// before it is sent again; applying it clears the name.
+    #[allow(clippy::indexing_slicing)]
+    #[test]
+    fn a_refused_row_names_the_row_the_instance_lacks_until_it_applies() {
+        let (instance, persistence, logical_store, params, encoder, metrics, _dir) =
+            build_unsat_shard_fixtures();
+        let rows = list_rows(6);
+        let apply = |batch: &[(WalEntryPayload, u64)]| {
+            apply_list_rows(
+                batch,
+                &instance,
+                &persistence,
+                &logical_store,
+                &params,
+                encoder.as_ref(),
+                &metrics,
+            );
+        };
+        let mut diverged = rows[3].clone();
+        if let WalEntryPayload::PpoiListLeafAdded {
+            validated_merkleroot,
+            ..
+        } = &mut diverged.0
+        {
+            validated_merkleroot[31] ^= 1;
+        }
+        let mut batch = rows[..3].to_vec();
+        batch.push(diverged);
+        batch.extend_from_slice(&rows[4..]);
+        apply(&batch);
+        assert_eq!(rows_held(&logical_store), 3);
+        assert_eq!(persistence.list_row_refused(), Some(3));
+        assert_eq!(metrics.lock().consumer_errors, 3);
+
+        apply(&rows[3..]);
+        assert_eq!(rows_held(&logical_store), 6);
+        assert_eq!(persistence.list_row_refused(), None);
+        assert_eq!(metrics.lock().consecutive_event_errors, 0);
+    }
+
+    /// A list block on the per-list path10 encoder, two shards wide, so list rows dirty shards.
+    fn list_block_fixture(policy: SnapshotPolicy) -> UnsatShardFixtures {
+        use crate::pir_table::list::PATH10_RECORD_BYTES;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let params = InspireParams::secure_128_d2048();
+        let encoder = crate::pir_table::EncoderKind::PerListPath10 { list_key: LIST }
+            .build(PATH10_RECORD_BYTES, 2048)
+            .expect("encoder");
+        let seed = vec![0u8; 2 * 2048 * PATH10_RECORD_BYTES];
+        let (state, _) = super::super::inspire::setup_state(
+            &params,
+            &seed,
+            PATH10_RECORD_BYTES,
+            InspireVariant::TwoPacking,
+        )
+        .expect("state");
+        let opened = InspirePersistence::open(
+            StoreLayout::open(dir.path()).expect("layout"),
+            SCHEME_TAG,
+            InstanceId::new("list-block"),
+            policy,
+            Arc::clone(&encoder),
+        )
+        .expect("open");
+        let persistence = Arc::new(opened.persistence);
+        persistence
+            .commit_v6(&state, &crate::inspire::LogicalLeafStore::default(), 0)
+            .expect("initial commit");
+        let instance = Arc::new(PirInstance::<RavenInspireScheme>::new(
+            InstanceId::new("list-block"),
+            crate::InstanceRole::Live,
+            state,
+        ));
+        (
+            instance,
+            persistence,
+            Arc::new(parking_lot::Mutex::new(
+                crate::inspire::LogicalLeafStore::new(),
+            )),
+            params,
+            encoder,
+            Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default())),
+            dir,
+        )
+    }
+
+    /// Waits until `done` holds, failing only when `progress` stops moving for 60 s.
+    async fn until<P: PartialEq + std::fmt::Debug>(
+        what: &str,
+        progress: impl Fn() -> P,
+        done: impl Fn() -> bool,
+    ) {
+        let mut last = progress();
+        let mut since = tokio::time::Instant::now();
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let now = progress();
+            if now == last {
+                assert!(
+                    since.elapsed() < Duration::from_secs(60),
+                    "{what}: stuck at {now:?}"
+                );
+            } else {
+                (last, since) = (now, tokio::time::Instant::now());
+            }
+        }
+    }
+
+    /// While a feed catches up, the append count re-encodes nothing; catching up publishes once,
+    /// and from then on the policy counts appends again.
+    #[allow(clippy::indexing_slicing)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_backfilling_block_commits_on_catching_up_and_on_its_policy_after() {
+        let (instance, persistence, logical_store, params, encoder, metrics, _dir) =
+            list_block_fixture(SnapshotPolicy {
+                max_appends_per_snapshot: 4,
+                max_seconds_between_snapshots: 3_600,
+                ..SnapshotPolicy::default()
+            });
+        persistence.set_backfilling(true);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let task = tokio::spawn(run_consumer_task(
+            Arc::clone(&instance),
+            Arc::clone(&persistence),
+            Arc::clone(&logical_store),
+            Arc::clone(&metrics),
+            params,
+            encoder,
+            rx,
+            None,
+        ));
+        let rows = list_rows(16);
+        for (row, height) in &rows[..12] {
+            tx.send(ConsumerEvent::Ppoi(row.clone(), *height))
+                .await
+                .expect("send");
+        }
+        // Behind the rows in the queue, so once it lands every commit they drove has run.
+        tx.send(ConsumerEvent::Heartbeat {
+            chain_head: 7,
+            scanned_through: 7,
+        })
+        .await
+        .expect("send");
+        until(
+            "12 rows applied",
+            || {
+                (
+                    rows_held(&logical_store),
+                    metrics.lock().last_known_chain_head,
+                )
+            },
+            || metrics.lock().last_known_chain_head == 7,
+        )
+        .await;
+        assert_eq!(rows_held(&logical_store), 12);
+        assert_eq!(
+            metrics.lock().commits_fired,
+            0,
+            "12 rows at a 4-append policy re-encoded the block while backfilling"
+        );
+        assert!(!logical_store.lock().dirty_shards().is_empty());
+
+        persistence.set_backfilling(false);
+        until(
+            "the catch-up publish",
+            || metrics.lock().commits_fired,
+            || metrics.lock().commits_fired == 1,
+        )
+        .await;
+        assert!(logical_store.lock().dirty_shards().is_empty());
+
+        for (row, height) in &rows[12..] {
+            tx.send(ConsumerEvent::Ppoi(row.clone(), *height))
+                .await
+                .expect("send");
+        }
+        until(
+            "a commit on the policy",
+            || (rows_held(&logical_store), metrics.lock().commits_fired),
+            || metrics.lock().commits_fired == 2,
+        )
+        .await;
+        tx.send(ConsumerEvent::Shutdown).await.expect("shutdown");
+        task.await.expect("join").expect("consumer task");
+    }
+
+    /// The append count a backfill built up is left to the publish that ends the backfill, which
+    /// the consumer makes once its queue is empty, so rows still queued do not re-encode the
+    /// block once more on the way.
+    #[test]
+    fn ending_a_backfill_leaves_the_append_count_to_the_catch_up_publish() {
+        let (_instance, persistence, _store, _params, _encoder, _metrics, _dir) =
+            build_unsat_shard_fixtures();
+        persistence.set_snapshot_policy(SnapshotPolicy {
+            max_appends_per_snapshot: 4,
+            max_seconds_between_snapshots: 3_600,
+            ..SnapshotPolicy::default()
+        });
+        persistence.set_backfilling(true);
+        for _ in 0..6 {
+            persistence.count_append();
+        }
+        assert!(!persistence.snapshot_due(), "due while backfilling");
+        persistence.set_backfilling(false);
+        assert!(
+            !persistence.snapshot_due(),
+            "due again ahead of the catch-up publish"
+        );
+        persistence
+            .publish_requested
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            persistence.snapshot_due(),
+            "once the consumer takes the request, the policy counts appends again"
+        );
     }
 }
