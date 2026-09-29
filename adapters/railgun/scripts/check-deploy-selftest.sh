@@ -43,7 +43,7 @@ expect "no STOPSIGNAL" "no STOPSIGNAL SIGTERM" Dockerfile '/^STOPSIGNAL SIGTERM$
 expect "stale stop bound in the Dockerfile" "could not read" Dockerfile \
   "s/^# SIGTERM starts the node's [0-9]* s stop budget.*/# Shutdown can wait 5 s per instance./"
 expect "STOP_BUDGET moved" "STOP_BUDGET is 12 s" cli/src/serve_production_multi.rs \
-  's/Duration::from_secs(8);/Duration::from_secs(12);/'
+  '/const STOP_BUDGET/s/from_secs([0-9]*)/from_secs(12)/'
 expect "stop timeout too short" "under twice STOP_BUDGET" deploy/lib.sh 's/^STOP_TIMEOUT=30$/STOP_TIMEOUT=10/'
 expect "cf-connecting-ip passed through" "cf-connecting-ip" deploy/Caddyfile '/header_up -Cf-Connecting-Ip/d'
 expect "Caddy on a dual-stack socket" "IPv4 only" deploy/Caddyfile 's/default_bind tcp4\//default_bind /'

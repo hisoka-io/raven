@@ -1,9 +1,9 @@
 # Operator binary image for raven-railgun. Build context MUST be the repo
 # root, since the adapter path-depends on crates/ outside its own workspace:
 #   docker build -t raven-railgun -f adapters/railgun/Dockerfile .
-# SIGTERM starts the node's 8 s stop budget: a final commit still running when it is spent is
-# abandoned, and its instance recovers from its last snapshot and WAL. Stops have been measured
-# past Docker's default 10 s stop timeout, so run with --stop-timeout 30.
+# SIGTERM starts the node's 15 s stop budget: a final commit still running when it is spent is
+# abandoned, and its instance recovers from its last snapshot and WAL. The budget is past Docker's
+# default 10 s stop timeout, so run with --stop-timeout 30.
 
 FROM rust:1.98.0-slim-bookworm AS build
 RUN apt-get update \

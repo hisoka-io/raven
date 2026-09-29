@@ -208,6 +208,7 @@ struct Booting {
     addr: SocketAddr,
     server: JoinHandle<anyhow::Result<()>>,
     stop: oneshot::Sender<()>,
+    view: BootstrapView,
 }
 
 /// The shipped example rewritten at its data root, token, list key and endpoint only.
@@ -221,6 +222,7 @@ fn shipped_sepolia_options(
     let mut opts = load(&rekeyed(&body));
     opts.bind = "127.0.0.1:0".parse().expect("addr");
     opts.skip_chain_workers = true;
+    opts.stop_budget = progress::STOP_BUDGET_LIFTED;
     opts.entries = 256;
     for instance in &mut opts.instances {
         instance.use_flock = false;
@@ -242,7 +244,13 @@ async fn boot(opts: MultiServeOptions, observer: &BootstrapObserver) -> (Booting
     // 300 s: the allowance the six-instance suite gives cold PIR bootstraps under CI contention.
     for _ in 0..1200u32 {
         if let Some(view) = observer.lock().clone() {
-            return (Booting { addr, server, stop }, view);
+            let booting = Booting {
+                addr,
+                server,
+                stop,
+                view: view.clone(),
+            };
+            return (booting, view);
         }
         if server.is_finished() {
             let ended = (&mut server).await.expect("boot task panicked");
@@ -262,12 +270,12 @@ async fn readiness(addr: SocketAddr) -> Option<HealthReadyResponse> {
     response.json().await.ok()
 }
 
+/// With the budget lifted the stop waits for every final commit, bounded by their progress.
 async fn shut_down(booting: Booting) {
     let _ = booting.stop.send(());
-    tokio::time::timeout(progress::STALL, booting.server)
+    let view = booting.view;
+    progress::until_stopped(booting.server, || progress::final_commit_progress(&view))
         .await
-        .expect("shutdown stalled")
-        .expect("server task panicked")
         .expect("graceful shutdown");
 }
 

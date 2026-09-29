@@ -238,18 +238,27 @@ struct Booting {
     addr: SocketAddr,
     server: JoinHandle<anyhow::Result<()>>,
     stop: oneshot::Sender<()>,
+    observer: BootstrapObserver,
 }
 
-async fn boot(opts: MultiServeOptions) -> Booting {
+/// Boots with the stop budget lifted, so [`shut_down`] bounds the stop by progress.
+async fn boot(mut opts: MultiServeOptions) -> Booting {
+    opts.stop_budget = progress::STOP_BUDGET_LIFTED;
     let listener = tokio::net::TcpListener::bind(opts.bind)
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("local addr");
+    let observer = opts.bootstrap_observer.clone().unwrap_or_default();
     let (stop, stopped) = oneshot::channel::<()>();
     let server = tokio::spawn(run_with_listener(opts, listener, async move {
         let _ = stopped.await;
     }));
-    Booting { addr, server, stop }
+    Booting {
+        addr,
+        server,
+        stop,
+        observer,
+    }
 }
 
 /// Waits for `/v1/status`, and fails with the boot's own refusal if it ends first.
@@ -276,15 +285,19 @@ async fn serving(booting: &mut Booting, observer: &BootstrapObserver) -> Bootstr
     panic!("the PPOI-only config never answered /v1/status");
 }
 
-/// A stop commits every instance, re-encoding its whole cell, and nothing observable moves while
-/// it does. A loaded full run has taken that past a minute, so the bound is the stall bound.
+/// A stop commits every dirty instance, re-encoding its whole cell. With the budget lifted it
+/// waits for each, so a clean stop means every final commit landed, however loaded the box.
 async fn shut_down(booting: Booting) {
     let _ = booting.stop.send(());
-    tokio::time::timeout(progress::STALL, booting.server)
-        .await
-        .expect("shutdown stalled")
-        .expect("server task panicked")
-        .expect("graceful shutdown");
+    let observer = booting.observer;
+    progress::until_stopped(booting.server, || {
+        observer
+            .lock()
+            .as_ref()
+            .map(progress::final_commit_progress)
+    })
+    .await
+    .expect("graceful shutdown");
 }
 
 fn rows_under(view: &BootstrapView, instance_id: &str) -> usize {

@@ -10,6 +10,9 @@
     clippy::indexing_slicing
 )]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,6 +21,7 @@ use std::time::Duration;
 use raven_railgun_cli::auto_spawn::load_spawn_log;
 use raven_railgun_cli::serve_production_multi::{
     run_with_listener, AutoSpawnConfigToml, BootstrapObserver, BootstrapView, MultiServeOptions,
+    StopIncomplete,
 };
 use raven_railgun_core::{CommitmentLeaf, InstanceId, RailgunEvent};
 use raven_railgun_engine::orchestrator::{DataSourceFilter, InstanceConfig};
@@ -209,7 +213,8 @@ fn count_snapshots(data_dir: &std::path::Path) -> usize {
         .count()
 }
 
-/// Every option that the stop tests leave at its default.
+/// Every option that the stop tests leave at its default. The stop budget is lifted, so a stop
+/// waits for every final commit and the tests bound it by progress.
 fn serve_options(
     bind: SocketAddr,
     instances: Vec<InstanceConfig>,
@@ -249,6 +254,7 @@ fn serve_options(
         respond_permit_wait_ms: None,
         reorg_window_path: None,
         session_capacity: raven_railgun_cli::serve_production_multi::SessionCapacity::default(),
+        stop_budget: progress::STOP_BUDGET_LIFTED,
     }
 }
 
@@ -290,16 +296,12 @@ async fn a_failed_final_commit_is_the_serve_loops_error() {
     std::fs::write(&staged, b"not a directory").expect("plant the staging path");
 
     let _ = stop_tx.send(());
-    let outcome = tokio::time::timeout(Duration::from_secs(60), server)
-        .await
-        .expect("serve loop must return within the stop budget")
-        .expect("serve task join");
+    let outcome = progress::until_stopped(server, || progress::final_commit_progress(&view)).await;
     let error = outcome.expect_err("a failed final commit must fail the stop");
-    let message = error.to_string();
-    assert!(
-        message.contains("stop incomplete") && message.contains("and 1 failed"),
-        "{message}"
-    );
+    let stop = error
+        .downcast_ref::<StopIncomplete>()
+        .unwrap_or_else(|| panic!("not a stop outcome: {error:#}"));
+    assert_eq!((stop.unfinished, stop.failed), (0, 1), "{stop}");
 
     let after = Manifest::load(&layout)
         .expect("load manifest")
@@ -384,11 +386,15 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
 
     let _ = stop_tx.send(());
 
-    tokio::time::timeout(Duration::from_secs(60), server)
-        .await
-        .expect("serve loop must return within shutdown timeout (no deadlock)")
-        .expect("serve task join")
-        .expect("serve loop returned Ok");
+    progress::until_stopped(server, || {
+        (
+            count_snapshots(&tree1_dir),
+            count_snapshots(&tree2_dir),
+            progress::final_commit_progress(&view),
+        )
+    })
+    .await
+    .expect("serve loop returned Ok");
 
     // Tree 1 applied a leaf after its spawn commit, so its stop commits it. Tree 2 applied
     // nothing, and a stop with nothing to publish writes no snapshot.

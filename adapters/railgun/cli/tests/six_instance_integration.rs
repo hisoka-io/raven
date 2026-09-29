@@ -11,6 +11,9 @@
     clippy::cast_possible_truncation
 )]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -155,6 +158,7 @@ fn build_opts(
     opts.bind = bind;
     opts.skip_chain_workers = true;
     opts.skip_mirror_workers = true;
+    opts.stop_budget = progress::STOP_BUDGET_LIFTED;
     opts.entries = 256;
 
     let mut chain_idx = 0usize;
@@ -234,20 +238,21 @@ async fn wait_for_observer(observer: &BootstrapObserver) -> BootstrapView {
     panic!("bootstrap observer never populated within 300s");
 }
 
-/// Above the server's own drain, 5 s per consumer and 2 s for the router, so a loaded box that
-/// stretches each final commit is not mistaken for a hang.
-const SHUTDOWN_BOUND: Duration = Duration::from_secs(60);
-
+/// With the budget lifted the stop waits for every final commit, so a loaded box that stretches
+/// each one is not mistaken for a hang; only a stop whose commits stop moving fails.
 async fn shutdown(
     tx: oneshot::Sender<()>,
     server: tokio::task::JoinHandle<anyhow::Result<()>>,
+    observer: &BootstrapObserver,
 ) -> anyhow::Result<()> {
     let _ = tx.send(());
-    match tokio::time::timeout(SHUTDOWN_BOUND, server).await {
-        Ok(Ok(res)) => res,
-        Ok(Err(join_err)) => Err(anyhow::anyhow!("server task join error: {join_err}")),
-        Err(_) => Err(anyhow::anyhow!("server shutdown timed out")),
-    }
+    progress::until_stopped(server, || {
+        observer
+            .lock()
+            .as_ref()
+            .map(progress::final_commit_progress)
+    })
+    .await
 }
 
 /// Aborts without the graceful-shutdown oneshot, so no final `drive_commit` runs and
@@ -468,7 +473,9 @@ async fn six_instance_bootstrap_serves_status_for_all_six() {
     assert_eq!(label_for("ppoi-paths-ofac-0"), "per-list-path10");
     assert_eq!(label_for("ppoi-paths-ofac-1"), "per-list-path10");
 
-    shutdown(stop, server).await.expect("graceful shutdown");
+    shutdown(stop, server, &observer)
+        .await
+        .expect("graceful shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -567,7 +574,9 @@ async fn chain_events_route_to_correct_commit_tree_instance() {
         }
     }
 
-    shutdown(stop, server).await.expect("graceful shutdown");
+    shutdown(stop, server, &observer)
+        .await
+        .expect("graceful shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -630,7 +639,9 @@ async fn ppoi_events_route_to_correct_list_instance() {
         }
     }
 
-    shutdown(stop, server).await.expect("graceful shutdown");
+    shutdown(stop, server, &observer)
+        .await
+        .expect("graceful shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -748,7 +759,9 @@ async fn layer2_fires_only_on_commit_tree_instances() {
         }
     }
 
-    shutdown(stop, server).await.expect("graceful shutdown");
+    shutdown(stop, server, &observer)
+        .await
+        .expect("graceful shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -836,7 +849,9 @@ async fn kill_restart_preserves_per_instance_state() {
         );
     }
 
-    shutdown(stop2, server2).await.expect("second shutdown");
+    shutdown(stop2, server2, &observer2)
+        .await
+        .expect("second shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -857,7 +872,9 @@ async fn manifest_label_mismatch_refuses_boot_per_instance() {
     );
     let (_addr1, server1, stop1) = spawn_server(opts1).await;
     let _view1 = wait_for_observer(&observer1).await;
-    shutdown(stop1, server1).await.expect("first shutdown");
+    shutdown(stop1, server1, &observer1)
+        .await
+        .expect("first shutdown");
 
     // Both encoders are valid AND cell-shape compatible; only the manifest verifier rejects the
     // mismatch. The swap must keep the row width: PerNode pins NODE_HASH_BYTES and PerLeafBc takes

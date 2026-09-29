@@ -9,7 +9,7 @@ SECRETS_DIR=/srv/raven/secrets
 CONFIG_PATH=$SECRETS_DIR/mainnet.toml
 TOKEN_PATH=$SECRETS_DIR/bearer-token
 TEMPLATE_PATH=/etc/raven-railgun/mainnet-ppoi.toml
-# Above the node's own 8 s stop budget, so docker never kills a final commit.
+# Twice the node's own 15 s stop budget, so docker never kills a final commit.
 STOP_TIMEOUT=30
 # Debug switches in the respond path: never on a served node.
 FORBIDDEN_ENV=(RAVEN_FORCE_PACKING_ONLINE RAVEN_PROFILE_RESPOND)

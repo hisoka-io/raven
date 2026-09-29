@@ -31,7 +31,7 @@ use progress::until_done_or_stalled;
 use raven_inspire::params::{InspireParams, InspireVariant};
 use raven_railgun_cli::serve_production_multi::{
     load_options_from_toml, run_with_listener, BootstrapObserver, BootstrapView, MultiServeOptions,
-    MIRROR_PREFLIGHT_FAILED_TOTAL, MIRROR_PREFLIGHT_TIMEOUT,
+    StopIncomplete, MIRROR_PREFLIGHT_FAILED_TOTAL, MIRROR_PREFLIGHT_TIMEOUT,
 };
 use raven_railgun_engine::imt::Imt;
 use raven_railgun_engine::inspire::{
@@ -45,7 +45,9 @@ use raven_railgun_engine::pir_table::PirTableEncoder;
 use raven_railgun_engine::session_pool::BoundedSessionStore;
 use raven_railgun_http::status::{MirrorFeedState, MirrorFeedView};
 use raven_railgun_http::HealthReadyResponse;
-use raven_railgun_persistence::{PpoiEventType, StoreLayout, WalEntryPayload};
+use raven_railgun_persistence::{
+    Manifest, PpoiEventType, SnapshotId, StoreLayout, WalEntryPayload,
+};
 use raven_railgun_ppoi_mirror::PreflightFailure;
 use serde_json::{json, Value};
 use signed_list::{list_key, rekeyed, signed_row, LIST_HEX};
@@ -152,6 +154,7 @@ fn shipped_ppoi_options_with(
     );
     opts.bind = "127.0.0.1:0".parse().expect("addr");
     opts.skip_chain_workers = true;
+    opts.stop_budget = progress::STOP_BUDGET_LIFTED;
     mirror_endpoint.clone_into(&mut opts.mirror_endpoint);
     opts.entries = 256;
     for instance in &mut opts.instances {
@@ -178,6 +181,7 @@ struct Booting {
     addr: SocketAddr,
     server: JoinHandle<anyhow::Result<()>>,
     stop: oneshot::Sender<()>,
+    observer: BootstrapObserver,
 }
 
 async fn boot_multi(opts: MultiServeOptions) -> Booting {
@@ -185,11 +189,17 @@ async fn boot_multi(opts: MultiServeOptions) -> Booting {
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("local addr");
+    let observer = opts.bootstrap_observer.clone().unwrap_or_default();
     let (stop, stopped) = oneshot::channel::<()>();
     let server = tokio::spawn(run_with_listener(opts, listener, async move {
         let _ = stopped.await;
     }));
-    Booting { addr, server, stop }
+    Booting {
+        addr,
+        server,
+        stop,
+        observer,
+    }
 }
 
 /// `None` when boot ended before its instances came up; a refused boot is only legitimate
@@ -251,32 +261,19 @@ async fn boot_verdict(booting: &mut Booting) -> Boot {
         .expect("boot neither refused nor served, though it bounds its wait on upstream")
 }
 
-/// A stop commits every instance, re-encoding its whole cell, and nothing observable moves while
-/// it does. A loaded full run has taken that past a minute, so the bound is the stall bound.
+/// A stop commits every dirty instance, re-encoding its whole cell. With the budget lifted it
+/// waits for each, so a clean stop means every final commit landed, however loaded the box.
 async fn shut_down(booting: Booting) {
     let _ = booting.stop.send(());
-    tokio::time::timeout(progress::STALL, booting.server)
-        .await
-        .expect("shutdown stalled")
-        .expect("server task panicked")
-        .expect("graceful shutdown");
-}
-
-/// [`shut_down`], then waits for every instance's consumer to let go of its store. The stop gives
-/// up waiting on a consumer still making its closing commit, and a data dir opened again before
-/// that commit lands can read a manifest from before it beside a WAL sealed by it.
-async fn shut_down_settled(booting: Booting, view: &BootstrapView) {
-    shut_down(booting).await;
-    until_done_or_stalled("every consumer's closing commit", async || {
-        let holders: Vec<usize> = view
-            .instances
-            .iter()
-            .map(|instance| Arc::strong_count(&instance.logical_store))
-            .collect();
-        let settled = holders.iter().all(|held| *held == 1);
-        (holders, settled.then_some(()))
+    let observer = booting.observer;
+    progress::until_stopped(booting.server, || {
+        observer
+            .lock()
+            .as_ref()
+            .map(progress::final_commit_progress)
     })
-    .await;
+    .await
+    .expect("graceful shutdown");
 }
 
 fn assert_refusal_names_the_dead_endpoint(refusal: &str, endpoint: &str, setting: &str) {
@@ -921,7 +918,7 @@ async fn a_live_block_catching_up_publishes_once_it_is_caught_up() {
     })
     .await;
     assert_eq!(commits, 1, "one publish, at catch-up");
-    shut_down_settled(booting, &view).await;
+    shut_down(booting).await;
 }
 
 /// Holds rows `0..rows` of the list with the roots upstream publishes, one depth-16 tree per
@@ -1154,7 +1151,7 @@ async fn a_ppoi_only_boot_asks_for_each_page_once_and_fills_every_instance_on_th
         .filter(|request| request.pointer("/params/endIndex") == Some(&json!(0)))
         .count();
     assert_eq!(preflights, 1, "and one preflight for the list");
-    shut_down_settled(booting, &view).await;
+    shut_down(booting).await;
 
     // What the trigger promises: stopped once caught up, the data dirs hold every row upstream had.
     assert_eq!(
@@ -1426,7 +1423,7 @@ async fn a_row_refused_once_is_asked_for_again_and_the_list_completes_without_a_
         "row {REFUSED} must be asked for again once the feed had moved past it: {starts:?}"
     );
     assert!(divergences(booting.addr).await >= 1);
-    shut_down_settled(booting, &view).await;
+    shut_down(booting).await;
     assert_eq!(recovered_rows(data_root.path(), PATHS_BLOCK_0), ROWS);
 }
 
@@ -1658,7 +1655,7 @@ async fn a_feed_stops_at_the_last_declared_row_names_the_next_block_and_feeds_it
         200,
         "no index segment may be served past the rows the declared blocks hold: {segment:?}"
     );
-    shut_down_settled(booting, &view).await;
+    shut_down(booting).await;
 
     let asked = worker_pages(&requests).len();
     let (booting, view) =
@@ -1690,6 +1687,116 @@ async fn a_feed_stops_at_the_last_declared_row_names_the_next_block_and_feeds_it
 
     assert_row_indexed_at_its_global_position(booting.addr, block).await;
     shut_down(booting).await;
+}
+
+/// A stop that outruns its budget abandons the final commit and says so: the serve loop returns
+/// the unfinished count, so the process exits non-zero, and the next boot recovers every row the
+/// abandoned commit would have published from the write-ahead log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_that_outruns_its_budget_is_an_error_and_the_next_boot_holds_every_row() {
+    let data_root = tempfile::tempdir().expect("tempdir");
+    let (endpoint, _requests) = upstream_with_an_empty_list().await;
+    let (mut opts, observer) = shipped_ppoi_options(data_root.path(), &[PATHS_BLOCK_0], &endpoint);
+    opts.skip_mirror_workers = true;
+    opts.stop_budget = Duration::ZERO;
+    let layout = opts
+        .instances
+        .first()
+        .map(|instance| StoreLayout::open(&instance.data_dir).expect("open the store layout"))
+        .expect("one instance");
+    let mut booting = boot_multi(opts).await;
+    let view = bootstrapped(&observer, &mut booting)
+        .await
+        .expect("boot bootstraps");
+    view.channels
+        .mirror_tx
+        .send((
+            WalEntryPayload::PpoiListLeafAdded {
+                list_key: list_key(),
+                list_index: 0,
+                blinded_commitment: leaf_at(0),
+                event_type: PpoiEventType::Shield,
+                validated_merkleroot: [0; 32],
+            },
+            0,
+        ))
+        .await
+        .expect("mirror channel open");
+    until_done_or_stalled("the row applied", async || {
+        let rows = rows_under(&view, PATHS_BLOCK_0);
+        (rows, (rows == 1).then_some(()))
+    })
+    .await;
+
+    // The detached consumer would otherwise finish the abandoned commit in the background, and the
+    // reopen would read its snapshot instead of replaying the log. A file on the staging path
+    // keeps it from landing, leaving the manifest and log as a process killed mid-commit does.
+    let published = published_snapshot(&layout);
+    let staged = layout.snapshot_dir(published.next()).with_extension("tmp");
+    std::fs::write(&staged, b"not a directory").expect("plant the staging path");
+
+    let _ = booting.stop.send(());
+    let observer = booting.observer;
+    let stopped = progress::until_stopped(booting.server, || {
+        observer
+            .lock()
+            .as_ref()
+            .map(progress::final_commit_progress)
+    })
+    .await
+    .expect_err("a final commit abandoned at the budget fails the stop");
+    let incomplete = stopped
+        .downcast_ref::<StopIncomplete>()
+        .unwrap_or_else(|| panic!("not a stop outcome: {stopped:#}"));
+    assert_eq!(
+        (incomplete.unfinished, incomplete.failed),
+        (1, 0),
+        "{incomplete}"
+    );
+    // The abandoned consumer is detached, not stopped: reopening under it would race its writes.
+    drop(observer.lock().take());
+    until_done_or_stalled("the abandoned consumer lets go of its store", async || {
+        let held = view
+            .instances
+            .first()
+            .map(|instance| Arc::strong_count(&instance.logical_store));
+        (held, (held == Some(1)).then_some(()))
+    })
+    .await;
+    drop(view);
+    assert_eq!(
+        published_snapshot(&layout),
+        published,
+        "the abandoned commit published nothing"
+    );
+    std::fs::remove_file(&staged).expect("clear the staging path");
+
+    let (endpoint, _requests) = upstream_with_an_empty_list().await;
+    let (mut opts, observer) = shipped_ppoi_options(data_root.path(), &[PATHS_BLOCK_0], &endpoint);
+    opts.skip_mirror_workers = true;
+    let mut booting = boot_multi(opts).await;
+    let view = bootstrapped(&observer, &mut booting)
+        .await
+        .expect("the next boot bootstraps");
+    let instance = view.instances.first().expect("one instance");
+    let held = instance
+        .logical_store
+        .lock()
+        .ppoi_imt(&list_key())
+        .map(|imt| (imt.leaf_count(), imt.node(0, 0)));
+    assert_eq!(
+        held,
+        Some((1, leaf_at(0))),
+        "the next boot holds the abandoned row"
+    );
+    shut_down(booting).await;
+}
+
+fn published_snapshot(layout: &StoreLayout) -> SnapshotId {
+    Manifest::load(layout)
+        .expect("load manifest")
+        .expect("the store writes its manifest when it opens")
+        .current_snapshot_id
 }
 
 /// List row `index`, past block 0, sits in the index at its global position rather than the
@@ -1877,12 +1984,7 @@ async fn a_cold_sync_of_the_whole_shipped_list_at_the_live_round_trip() {
     );
 
     let stopping = std::time::Instant::now();
-    let _ = booting.stop.send(());
-    tokio::time::timeout(Duration::from_mins(20), booting.server)
-        .await
-        .expect("the graceful stop finished")
-        .expect("server task panicked")
-        .expect("graceful shutdown");
+    shut_down(booting).await;
     eprintln!(
         "graceful stop, committing the static blocks: {:?}",
         stopping.elapsed()

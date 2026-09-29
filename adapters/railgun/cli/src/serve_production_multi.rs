@@ -370,6 +370,9 @@ pub struct MultiServeOptions {
     pub reorg_window_path: Option<PathBuf>,
     /// Session seats, lifetime, bindings and handshake concurrency; absent keys keep the defaults.
     pub session_capacity: SessionCapacity,
+    /// From the stop signal to exit; [`STOP_BUDGET`] unless a test lifts it to bound its stop by
+    /// progress instead.
+    pub stop_budget: std::time::Duration,
 }
 
 pub type BootstrapObserver = Arc<parking_lot::Mutex<Option<BootstrapView>>>;
@@ -843,6 +846,7 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         session_eviction_interval_secs: parsed.global.session_eviction_interval_secs,
         reorg_window_path: parsed.global.reorg_window_path,
         session_capacity,
+        stop_budget: STOP_BUDGET,
     })
 }
 
@@ -1126,11 +1130,11 @@ async fn signal_shutdown() {
 /// this bounds the memory a stop adds.
 const PARALLEL_FINAL_COMMITS: usize = 3;
 
-/// Time from the stop signal to exit, under Docker's default 10 s before it kills the process.
-/// A final commit still running when it is spent is abandoned, and the stop returns an error:
-/// that instance's next boot recovers from its last snapshot and write-ahead log, as after a
-/// crash.
-const STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+/// Time from the stop signal to exit: half the deploy's 30 s stop timeout. Seven dirty production
+/// cells took 4.3-5.4 s to commit on an idle 16-core host, and past 8 s on a loaded one. A final
+/// commit still running when it is spent is abandoned, and the stop returns an error: that
+/// instance's next boot recovers from its last snapshot and write-ahead log, as after a crash.
+pub const STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Run `stops`, at most `parallel` at once, until `stop_by`; returns how many had not finished.
 async fn run_stops_until<S>(stops: Vec<S>, parallel: usize, stop_by: tokio::time::Instant) -> usize
@@ -1196,6 +1200,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         .validate()
         .map_err(|e| anyhow::anyhow!("[global] {e}"))?;
     let session_limits = http_config.session_store_limits();
+    let stop_budget = opts.stop_budget;
 
     let bootstrap = bootstrap_instances(&opts, fleet_default_entries, &params, session_limits)?;
 
@@ -1493,7 +1498,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     let (signalled_tx, mut signalled_rx) = tokio::sync::oneshot::channel();
     let shutdown = async move {
         shutdown.await;
-        let _ = signalled_tx.send(tokio::time::Instant::now() + STOP_BUDGET);
+        let _ = signalled_tx.send(tokio::time::Instant::now() + stop_budget);
     };
     let serving = axum::serve(
         listener,
@@ -1523,7 +1528,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
             }
             stop_by
         }
-        None => tokio::time::Instant::now() + STOP_BUDGET,
+        None => tokio::time::Instant::now() + stop_budget,
     };
 
     drop(bootstrap.handles.channels);
@@ -1546,7 +1551,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     if unfinished > 0 {
         tracing::error!(
             unfinished,
-            budget_secs = STOP_BUDGET.as_secs(),
+            budget_secs = stop_budget.as_secs(),
             "stop budget spent before every final commit finished; each unfinished instance \
              recovers from its last snapshot and write-ahead log at the next boot"
         );
@@ -1591,7 +1596,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         if spawned_unfinished > 0 {
             tracing::error!(
                 unfinished = spawned_unfinished,
-                budget_secs = STOP_BUDGET.as_secs(),
+                budget_secs = stop_budget.as_secs(),
                 "auto_spawn consumers did not exit within the stop budget; each recovers from \
                  its last snapshot and write-ahead log at the next boot"
             );
@@ -1612,10 +1617,11 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     }
     drop(mirror_workers);
 
-    stop_outcome(
+    stop_outcome(StopIncomplete {
         unfinished,
-        failed.load(std::sync::atomic::Ordering::Relaxed),
-    )
+        failed: failed.load(std::sync::atomic::Ordering::Relaxed),
+        budget: stop_budget,
+    })
 }
 
 /// Send `Shutdown` and wait for the consumer's final commit; `false` when it did not land.
@@ -1636,15 +1642,24 @@ async fn final_commit_landed(
     false
 }
 
+/// A stop that left an instance unpublished; each such instance recovers at its next boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "stop incomplete: {unfinished} final commit(s) outran the {} s stop budget and {failed} \
+     failed; each such instance recovers from its last snapshot and write-ahead log at the next \
+     boot",
+    budget.as_secs()
+)]
+pub struct StopIncomplete {
+    pub unfinished: usize,
+    pub failed: usize,
+    pub budget: std::time::Duration,
+}
+
 /// A stop that left any instance unpublished is an error, so the process exits non-zero.
-fn stop_outcome(unfinished: usize, failed: usize) -> anyhow::Result<()> {
-    if unfinished > 0 || failed > 0 {
-        anyhow::bail!(
-            "stop incomplete: {unfinished} final commit(s) outran the {} s stop budget and \
-             {failed} failed; each such instance recovers from its last snapshot and write-ahead \
-             log at the next boot",
-            STOP_BUDGET.as_secs()
-        );
+fn stop_outcome(stop: StopIncomplete) -> anyhow::Result<()> {
+    if stop.unfinished > 0 || stop.failed > 0 {
+        return Err(stop.into());
     }
     Ok(())
 }
@@ -3210,10 +3225,19 @@ data_source = {{ kind = "mirror", list_key = "{key}", block = 0 }}
 
     #[test]
     fn a_stop_that_left_an_instance_unpublished_is_an_error() {
-        stop_outcome(0, 0).expect("a complete stop");
+        let stop = |unfinished, failed| StopIncomplete {
+            unfinished,
+            failed,
+            budget: STOP_BUDGET,
+        };
+        stop_outcome(stop(0, 0)).expect("a complete stop");
         for (unfinished, failed) in [(1, 0), (0, 1)] {
-            let error = stop_outcome(unfinished, failed).expect_err("an incomplete stop");
-            assert!(error.to_string().contains("stop incomplete"), "{error}");
+            let error = stop_outcome(stop(unfinished, failed)).expect_err("an incomplete stop");
+            assert_eq!(
+                error.downcast_ref::<StopIncomplete>(),
+                Some(&stop(unfinished, failed))
+            );
+            assert!(error.to_string().contains("stop budget"), "{error}");
         }
     }
 

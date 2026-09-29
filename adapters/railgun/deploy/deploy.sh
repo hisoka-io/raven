@@ -20,7 +20,7 @@ config is written again from the new image's template, and the node is stopped a
 Node       container NAME-node as uid 1500, read-only root, volumes NAME-data (instance data)
            and NAME-secrets (config and token), port 127.0.0.1:PORT only, memory capped at
            --memory with no swap, restart on-failure:5, SIGTERM with a ${STOP_TIMEOUT} s stop timeout (the
-           node's stop budget is 8 s, and stops have been measured past Docker's default 10 s).
+           node's stop budget is 15 s, past Docker's default 10 s).
            Its HEALTHCHECK can be red while a cold sync runs, so nothing restarts the node on it.
 Proxy      container NAME-caddy on the host network. It serves HTTPS for HOST (a Let's Encrypt
            certificate, which needs HOST's A record pointing here and port 80 reachable) and

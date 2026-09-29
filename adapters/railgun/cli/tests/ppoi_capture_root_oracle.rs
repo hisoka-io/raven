@@ -20,6 +20,9 @@
     reason = "by-hand oracle; the receipt is the printed run"
 )]
 
+#[path = "support/progress.rs"]
+mod progress;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -272,6 +275,8 @@ async fn every_captured_row_applies_through_the_mirror_feed_with_its_root_matche
     );
     let observer = BootstrapObserver::default();
     opts.bootstrap_observer = Some(Arc::clone(&observer));
+    // The printed stop is every final commit's, however long the box makes it.
+    opts.stop_budget = progress::STOP_BUDGET_LIFTED;
 
     let listener = tokio::net::TcpListener::bind(opts.bind)
         .await
@@ -346,10 +351,8 @@ async fn every_captured_row_applies_through_the_mirror_feed_with_its_root_matche
 
     let stopping = Instant::now();
     let _ = stop.send(());
-    tokio::time::timeout(Duration::from_mins(20), server)
+    progress::until_stopped(server, || progress::final_commit_progress(&view))
         .await
-        .expect("the graceful stop finished")
-        .expect("server task panicked")
         .expect("graceful shutdown");
     eprintln!("graceful stop: {:?}", stopping.elapsed());
 }
