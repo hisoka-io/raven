@@ -13,7 +13,7 @@ use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
 use raven_railgun_persistence::{Manifest, ManifestShape, StoreLayout, MANIFEST_SCHEMA_VERSION};
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-cell-shape-guard";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-cell-shape-guard";
 const ENTRIES_PER_SHARD: u32 = 2048;
 const STORED_WIDTH: usize = 512;
 const NARROW_WIDTH: usize = 32;

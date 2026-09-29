@@ -67,8 +67,8 @@ pub(crate) async fn status_handler<S: PirScheme>(
     Json(build_status_response(&app))
 }
 
-/// Operator-observable engine state, shared by `/v1/status` and `/v1/events`.
-pub(crate) fn build_status_response<S: PirScheme>(app: &AppState<S>) -> StatusResponse {
+/// Operator-observable engine state for `/v1/status`.
+fn build_status_response<S: PirScheme>(app: &AppState<S>) -> StatusResponse {
     let fallback_k = u32::try_from(app.config.max_concurrent_queries.max(1)).unwrap_or(u32::MAX);
     let instances = app
         .engine
@@ -319,6 +319,11 @@ pub struct HealthReadyResponse {
     /// [`MirrorFeedState::NeverFed`] or [`MirrorFeedState::Stopped`] forces 503.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mirror_feeds: Vec<MirrorFeedView>,
+    /// Per instance, commits since process start whose snapshot was published but whose
+    /// retention pass failed, leaving superseded snapshots on disk. Does not gate readiness:
+    /// the node still serves, and the count is for a disk alert.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub retention_failures: std::collections::BTreeMap<String, u64>,
 }
 
 /// Where one PPOI list's upstream feed stands. The first that applies, in this order.
@@ -484,6 +489,7 @@ pub(crate) async fn health_ready_handler<S: PirScheme>(
             stalled_consumer_instances: Vec::new(),
             router_unrouted_targets: Vec::new(),
             mirror_feeds: Vec::new(),
+            retention_failures: raven_railgun_engine::persistence::retention_failures(),
         };
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body));
     }
@@ -552,6 +558,7 @@ pub(crate) async fn health_ready_handler<S: PirScheme>(
         stalled_consumer_instances: stalled,
         router_unrouted_targets: unrouted_targets,
         mirror_feeds,
+        retention_failures: raven_railgun_engine::persistence::retention_failures(),
     };
     (code, Json(body))
 }

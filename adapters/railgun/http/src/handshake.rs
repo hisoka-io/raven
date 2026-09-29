@@ -1,15 +1,18 @@
 //! The client handshake: `GET /params` for the CRS and `POST /session` for a packing-key seat.
 
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::{
+    body::{Body, HttpBody},
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     Json,
 };
 use bytes::Bytes;
 use raven_inspire::inspiring::ClientPackingKeys;
-use raven_inspire::ServerCrs;
+use raven_inspire::params::InspireParams;
+use raven_inspire::{ServerCrs, ServerSessionHandle};
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{InspireServerState, RavenInspireScheme};
 use serde::{Deserialize, Serialize};
@@ -76,11 +79,119 @@ fn count_establish_refusal(instance_id: &InstanceId, reason: &'static str) {
     .increment(1);
 }
 
+/// What a handshake's blocking derivation hands back.
+enum Derivation {
+    Registered(ServerSessionHandle),
+    /// Every seat is held by a live session; the caller should retry later.
+    PoolFull(raven_railgun_core::AdapterError),
+    Failed(raven_railgun_core::AdapterError),
+}
+
+/// Release a seat on a blocking thread: removal takes the store's write lock, which a
+/// derivation in progress holds.
+async fn release_seat(state: Arc<InspireServerState>, handle: ServerSessionHandle) {
+    if let Err(join) = tokio::task::spawn_blocking(move || state.session_store.remove(handle)).await
+    {
+        tracing::error!(%join, "session seat release failed");
+    }
+}
+
+/// Largest packing-key upload an honest client sends under `params`: `y_body` and, for full
+/// packing, `z_body`, each `packing_gadget_len` polys of `ring_dim` coefficients per CRT
+/// modulus at the fixed-width 8 bytes, plus framing. A queued handshake holds its body, so
+/// this, not `max_body_bytes`, bounds what a flood of them can pin.
+pub(crate) fn packing_key_upload_limit(params: &InspireParams) -> usize {
+    const FRAMING_BYTES: usize = 4096;
+    2usize
+        .saturating_mul(params.packing_gadget_len)
+        .saturating_mul(params.ring_dim)
+        .saturating_mul(params.crt_moduli.len().max(1))
+        .saturating_mul(8)
+        .saturating_add(FRAMING_BYTES)
+}
+
+/// Buffers at most `limit` bytes; the size hint refuses a declared oversize body unread.
+async fn read_capped(mut body: Body, limit: usize) -> Result<Vec<u8>, StatusCode> {
+    let declared = usize::try_from(HttpBody::size_hint(&body).lower()).unwrap_or(usize::MAX);
+    if declared > limit {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let mut buffered = Vec::with_capacity(declared);
+    while let Some(frame) =
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await
+    {
+        let frame = frame.map_err(|_| StatusCode::BAD_REQUEST)?;
+        if let Ok(data) = frame.into_data() {
+            if buffered.len().saturating_add(data.len()) > limit {
+                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+            }
+            buffered.extend_from_slice(&data);
+        }
+    }
+    Ok(buffered)
+}
+
+/// Derive the server-side set on a blocking thread: derivation takes tens of milliseconds and
+/// waits on the store's lock, which would stall every route served by the same async workers.
+/// The permit is held until the work ends, even when the handler has stopped waiting, because
+/// `spawn_blocking` cannot be cancelled.
+async fn derive_off_the_workers(
+    app: &AppState<RavenInspireScheme>,
+    instance_id: &InstanceId,
+    state: Arc<InspireServerState>,
+    keys: ClientPackingKeys,
+) -> Result<Derivation, StatusCode> {
+    let permit = match tokio::time::timeout(
+        app.config.respond_permit_wait(),
+        Arc::clone(&app.handshake_permits).acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_closed)) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+        Err(_elapsed) => {
+            count_establish_refusal(instance_id, "busy");
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+    let owner = Arc::clone(&state);
+    let mut derivation = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let ctx = state.crs.params.ntt_context();
+        let store = &state.session_store;
+        match store.register_server_side(keys, state.cache.pack_params(), &ctx) {
+            Ok(handle) => Derivation::Registered(handle),
+            // A re-handshake counts its own old seat too: that seat stays usable until a new one
+            // replaces it.
+            Err(error) if store.len() >= store.limits().max_sessions => Derivation::PoolFull(error),
+            Err(error) => Derivation::Failed(error),
+        }
+    });
+    let limit = Duration::from_secs(app.config.respond_timeout_secs.max(1));
+    match tokio::time::timeout(limit, &mut derivation).await {
+        Ok(Ok(derived)) => Ok(derived),
+        Ok(Err(join)) => {
+            tracing::error!(%join, "session derivation task failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Err(_elapsed) => {
+            count_establish_refusal(instance_id, "timeout");
+            // Nobody will learn the handle, so its seat is released when the derivation lands.
+            tokio::spawn(async move {
+                if let Ok(Derivation::Registered(handle)) = derivation.await {
+                    release_seat(owner, handle).await;
+                }
+            });
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        }
+    }
+}
+
 pub(crate) async fn session_establish_handler(
     State(app): State<AppState<RavenInspireScheme>>,
     Path(id): Path<String>,
     headers_in: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<(StatusCode, HeaderMap, Json<SessionEstablishResponse>), StatusCode> {
     let instance_id = InstanceId::new(id);
     let instance = app
@@ -88,11 +199,15 @@ pub(crate) async fn session_establish_handler(
         .instance(&instance_id)
         .ok_or(StatusCode::NOT_FOUND)?;
     let snapshot = instance.current_snapshot();
-    let state: &InspireServerState = snapshot.state.as_ref();
 
     // No credential: `x-raven-client-id` is the whole session identity.
     let client_id = require_client_id_header(&headers_in).map_err(|()| StatusCode::BAD_REQUEST)?;
+    let session_key = SessionKey::new(instance_id.clone(), client_id);
 
+    let state = Arc::clone(&snapshot.state);
+    // Decoded before a derivation permit is sought, so a body that cannot decode never queues.
+    let limit = packing_key_upload_limit(&state.crs.params).min(app.config.max_body_bytes);
+    let body = read_capped(body, limit).await?;
     let keys: ClientPackingKeys = read_versioned(&body).map_err(|err| {
         tracing::warn!(
             ?err,
@@ -100,43 +215,35 @@ pub(crate) async fn session_establish_handler(
         );
         StatusCode::BAD_REQUEST
     })?;
-    // A re-handshake under one identity must cost the pool the slot it already holds,
-    // not a second one: the superseded keys are unreachable the moment the map moves.
-    let session_key = SessionKey::new(instance_id.clone(), client_id);
-    if let Some(superseded) = app.sessions.take(&session_key) {
-        state.session_store.remove(superseded);
-    }
-
-    let pack_params = state.cache.pack_params();
-    let ctx = state.crs.params.ntt_context();
-    let handle = state
-        .session_store
-        .register_server_side(keys, pack_params, &ctx)
-        .map_err(|error| {
+    drop(body);
+    let handle = match derive_off_the_workers(&app, &instance_id, Arc::clone(&state), keys).await? {
+        Derivation::Registered(handle) => handle,
+        // At the ceiling the store refuses rather than retiring another caller's keys, so the
+        // caller is being asked to wait, not told the server broke.
+        Derivation::PoolFull(error) => {
             tracing::warn!(%error, "session establish refused");
-            // At the ceiling the store refuses rather than retiring another caller's
-            // keys, so the caller is being asked to wait, not told the server broke.
-            if state.session_store.len() >= state.session_store.limits().max_sessions {
-                count_establish_refusal(&instance_id, "pool");
-                StatusCode::SERVICE_UNAVAILABLE
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
-        })?;
+            count_establish_refusal(&instance_id, "pool");
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Derivation::Failed(error) => {
+            tracing::warn!(%error, "session establish refused");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     if instance.current_epoch() != snapshot.epoch {
-        state.session_store.remove(handle);
+        release_seat(state, handle).await;
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
     // The binding must not lapse before the seat it names: a re-handshake after that finds
-    // nothing to take, and the old seat stays held until the store's own expiry.
+    // nothing to replace, and the old seat stays held until the store's own expiry.
     let ttl = state.session_store.limits().ttl;
     let now = Instant::now();
     let Some(expires_at) = now.checked_add(ttl) else {
-        state.session_store.remove(handle);
+        release_seat(state, handle).await;
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
-    let outcome = app.sessions.upsert(
+    let (outcome, superseded) = app.sessions.upsert(
         session_key,
         handle,
         expires_at,
@@ -144,9 +251,13 @@ pub(crate) async fn session_establish_handler(
         now,
     );
     if outcome == EvictionOutcome::AtCapacity {
-        state.session_store.remove(handle);
+        release_seat(state, handle).await;
         count_establish_refusal(&instance_id, "binding");
         return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    // Released only now, so a re-handshake that failed above left the caller its working seat.
+    if let Some(superseded) = superseded {
+        release_seat(state, superseded).await;
     }
 
     metrics::counter!(
@@ -186,6 +297,11 @@ pub(crate) async fn session_establish_handler(
         }),
     ))
 }
+
+/// Stored, but revalidated against the ETag on every use. The CRS is regenerated by a redeploy
+/// and the epoch restarts at zero, so a cache holding the body for any fixed time could serve
+/// the previous deploy's parameters; a revalidation costs a 304 with no body.
+const PARAMS_CACHE_CONTROL: &str = "public, no-cache";
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn params_handler(
@@ -234,7 +350,7 @@ pub(crate) async fn params_handler(
             );
             hdrs.insert(
                 http::header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=86400, immutable"),
+                HeaderValue::from_static(PARAMS_CACHE_CONTROL),
             );
             hdrs.insert(
                 http::header::VARY,
@@ -296,7 +412,7 @@ pub(crate) async fn params_handler(
     );
     hdrs.insert(
         http::header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=86400, immutable"),
+        HeaderValue::from_static(PARAMS_CACHE_CONTROL),
     );
     hdrs.insert(
         http::header::VARY,
@@ -337,4 +453,125 @@ fn to_hex_lower(bytes: &[u8; 32]) -> String {
         out.push(lo);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use axum::extract::ConnectInfo;
+    use axum::http::{header, Method, Request};
+    use http_body_util::BodyExt;
+    use raven_inspire::math::GaussianSampler;
+    use raven_inspire::params::{InspireVariant, SecurityLevel};
+    use raven_railgun_engine::inspire::setup_state;
+    use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::config::HttpConfig;
+
+    const INSTANCE: &str = "session-body-bounds";
+    const ENTRY_BYTES: usize = 32;
+
+    fn params() -> InspireParams {
+        InspireParams {
+            ring_dim: 256,
+            q: 1_152_921_504_606_830_593,
+            crt_moduli: vec![1_152_921_504_606_830_593],
+            p: 65_537,
+            sigma: 6.4,
+            gadget_base: 1 << 20,
+            query_gadget_len: 3,
+            packing_gadget_len: 3,
+            security_level: SecurityLevel::Bits128,
+        }
+    }
+
+    /// The app and one honest packing-key upload for its instance.
+    fn fixture(respond_permit_wait_ms: u64) -> (AppState<RavenInspireScheme>, Vec<u8>) {
+        let params = params();
+        let db = raven_railgun_testkit::toy_db(256, ENTRY_BYTES);
+        let (state, secret_key) =
+            setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("toy state");
+        let mut sampler = GaussianSampler::with_seed(params.sigma, 0x5e);
+        let upload = write_versioned(&ClientPackingKeys::generate(
+            &secret_key,
+            state.cache.pack_params(),
+            state.crs.inspiring_w_seed,
+            &mut sampler,
+        ))
+        .expect("versioned keys");
+        let engine: Engine<RavenInspireScheme> = Engine::new();
+        engine
+            .add_live(Arc::new(PirInstance::new(
+                InstanceId::new(INSTANCE),
+                InstanceRole::Live,
+                state,
+            )))
+            .expect("register instance");
+        let mut config = HttpConfig::demo("session-body-bounds-token-0123456789");
+        config.respond_permit_wait_ms = respond_permit_wait_ms;
+        (AppState::new(engine, config).expect("app state"), upload)
+    }
+
+    async fn establish(app: &AppState<RavenInspireScheme>, body: Body) -> StatusCode {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/instance/{INSTANCE}/session"))
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header("x-raven-client-id", "22222222222222222222222222222222")
+            .body(body)
+            .expect("request");
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12_345,
+        )));
+        crate::inspire_router(app.clone())
+            .expect("router")
+            .oneshot(request)
+            .await
+            .expect("dispatch")
+            .status()
+    }
+
+    /// Past the key size, whether the length is declared or only discovered while reading.
+    #[tokio::test]
+    async fn a_session_body_larger_than_a_packing_key_upload_is_refused_413() {
+        let (app, upload) = fixture(1_000);
+        let limit = packing_key_upload_limit(&params());
+        assert!(upload.len() <= limit, "{} > {limit}", upload.len());
+        assert!(limit < app.config.max_body_bytes);
+        let oversize = vec![0u8; limit + 1];
+        assert_eq!(
+            establish(&app, Body::from(oversize.clone())).await,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "declared length"
+        );
+        let undeclared = http_body_util::Full::new(Bytes::from(oversize)).map_frame(|frame| frame);
+        assert_eq!(
+            establish(&app, Body::new(undeclared)).await,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "undeclared length"
+        );
+        assert_eq!(establish(&app, Body::from(upload)).await, StatusCode::OK);
+    }
+
+    /// With every derivation permit held, a body that cannot decode is still answered at once
+    /// instead of queueing behind derivations for the permit wait.
+    #[tokio::test]
+    async fn an_undecodable_body_does_not_queue_for_a_derivation_permit() {
+        let (app, _) = fixture(2_000);
+        let permits = u32::try_from(app.config.max_concurrent_handshakes.max(1)).expect("u32");
+        let _held = Arc::clone(&app.handshake_permits)
+            .acquire_many_owned(permits)
+            .await
+            .expect("hold every permit");
+        assert_eq!(
+            establish(&app, Body::from(vec![0u8; 64])).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
 }

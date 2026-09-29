@@ -25,7 +25,7 @@ use raven_railgun_engine::pir_table::EncoderKind;
 use raven_railgun_engine::InstanceRole;
 use raven_railgun_indexer::IndexerMessage;
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-router-drop-test";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-router-drop-test";
 const TOY_ENTRY_SIZE: usize = 256;
 const TOY_ENTRIES_PER_SHARD: u32 = 2048;
 const ROUTED_TREE: u32 = 0;

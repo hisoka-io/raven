@@ -26,7 +26,7 @@ use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
 use raven_railgun_engine::{InstanceRole, PirInstance};
 use raven_railgun_persistence::{StoreLayout, WalEntryPayload};
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-start-block-fallback";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-start-block-fallback";
 const ENTRIES_PER_SHARD: u32 = 2048;
 const ENTRY_BYTES: usize = 32;
 

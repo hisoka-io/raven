@@ -8,7 +8,7 @@ use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
 use raven_railgun_persistence::{StoreLayout, WalEntryPayload};
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-encoder-recovery";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-encoder-recovery";
 const ENTRIES_PER_SHARD: u32 = 2048;
 const LEAVES: u32 = 8;
 

@@ -20,7 +20,7 @@ use raven_railgun_engine::pir_table::EncoderKind;
 use raven_railgun_engine::InstanceRole;
 use raven_railgun_persistence::{StoreLayout, Wal, WalEntryPayload};
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-ppoi-upstream-root";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-ppoi-upstream-root";
 const INSTANCE_ID: &str = "ppoi-upstream-root";
 const TOY_ENTRY_SIZE: usize = 512;
 const ENTRIES_PER_SHARD: u32 = 2048;

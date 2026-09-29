@@ -1,4 +1,5 @@
-//! CLI-level test: auto-spawned consumers receive `ConsumerEvent::Shutdown` on graceful exit.
+//! CLI-level tests: auto-spawned consumers receive `ConsumerEvent::Shutdown` on graceful exit,
+//! and a stop whose final commit fails is the serve loop's error.
 
 #![allow(
     clippy::expect_used,
@@ -27,7 +28,7 @@ use raven_railgun_indexer::IndexerMessage;
 use raven_railgun_persistence::{Manifest, SnapshotId, StoreLayout};
 use tokio::sync::oneshot;
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1";
 const TOY_ENTRY_BYTES: usize = 256;
 
 /// Rows every per-leaf-bc cell here must hold - the bootstrap instance as well as the spawned one.
@@ -166,7 +167,36 @@ async fn wait_for_spawn_record(registry_dir: &std::path::Path, tree: u32, deadli
     panic!("auto-spawn of tree {tree} never reached the spawn log");
 }
 
-// bootstrap writes snap-000001; the Shutdown-arm drive_commit must add snap-000002+
+/// Bytes in the instance's live WAL segment; zero before the first append.
+fn wal_len(data_dir: &std::path::Path) -> u64 {
+    let layout = StoreLayout::open(data_dir).expect("open StoreLayout");
+    std::fs::metadata(layout.wal_current_path()).map_or(0, |meta| meta.len())
+}
+
+/// Gives a spawned instance a leaf and waits for its WAL append, so the Shutdown queued behind
+/// it in the same channel has something to drain.
+async fn apply_one_leaf(
+    chain: &tokio::sync::mpsc::Sender<IndexerMessage>,
+    data_dir: &std::path::Path,
+    tree: u32,
+    height: u64,
+) {
+    let before = wal_len(data_dir);
+    chain
+        .send(shield_event(tree, 0, height))
+        .await
+        .expect("send leaf to the spawned instance");
+    let started = tokio::time::Instant::now();
+    while wal_len(data_dir) <= before {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "tree {tree}'s spawned instance never appended its first leaf"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+// The spawn writes snap-000001; a stop with something to drain adds snap-000002.
 fn count_snapshots(data_dir: &std::path::Path) -> usize {
     let snap_dir = data_dir.join("snapshots");
     if !snap_dir.is_dir() {
@@ -177,6 +207,105 @@ fn count_snapshots(data_dir: &std::path::Path) -> usize {
         .filter_map(std::result::Result::ok)
         .filter(|de| de.file_name().to_string_lossy().starts_with("snap-"))
         .count()
+}
+
+/// Every option that the stop tests leave at its default.
+fn serve_options(
+    bind: SocketAddr,
+    instances: Vec<InstanceConfig>,
+    observer: &BootstrapObserver,
+    auto_spawn: Option<AutoSpawnConfigToml>,
+) -> MultiServeOptions {
+    MultiServeOptions {
+        bind,
+        token: "auto-spawn-shutdown-test-token-pad".to_owned(),
+        rpc_url: "http://127.0.0.1:1".to_owned(),
+        railgun_proxy: "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9".to_owned(),
+        chain_id: 1,
+        start_block: 0,
+        mirror_endpoint: "http://127.0.0.1:1".to_owned(),
+        mirror_backfill_interval_secs: None,
+        max_concurrent_queries: 4,
+        respond_timeout_secs: 30,
+        instances,
+        skip_chain_workers: true,
+        skip_mirror_workers: true,
+        entries: AUTO_SPAWN_CELL_ROWS,
+        instance_entries: std::collections::HashMap::new(),
+        bootstrap_observer: Some(Arc::clone(observer)),
+        auto_spawn,
+        rpc_pool: None,
+        instance_templates: vec![],
+        tree_fill_threshold: None,
+        reload_config_path: None,
+        ws_endpoint: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        cors_allowed_origins: None,
+        trust_proxy_header: None,
+        trusted_proxy_cidrs: None,
+        metrics_public: None,
+        session_eviction_interval_secs: None,
+        respond_permit_wait_ms: None,
+        reorg_window_path: None,
+        session_capacity: raven_railgun_cli::serve_production_multi::SessionCapacity::default(),
+    }
+}
+
+/// A final commit that cannot be written is the serve loop's error, so the process exits
+/// non-zero, and the manifest keeps naming the snapshot it named before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_final_commit_is_the_serve_loops_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bind: SocketAddr = "127.0.0.1:0".parse().expect("addr");
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .expect("bind ephemeral");
+    let data_dir = tmp.path().join("commit-tree-0");
+    let observer: BootstrapObserver = Arc::new(parking_lot::Mutex::new(None));
+    let opts = serve_options(
+        bind,
+        vec![bootstrap_tree_zero_cfg(data_dir.clone())],
+        &observer,
+        None,
+    );
+
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let mut server = tokio::spawn(async move {
+        run_with_listener(opts, listener, async move {
+            let _ = stop_rx.await;
+        })
+        .await
+    });
+    let view = wait_for_observer(&observer, &mut server).await;
+    apply_one_leaf(&view.channels.indexer_tx, &data_dir, 0, 150).await;
+
+    // A file where the next snapshot is staged: the save fails for any user, root included.
+    let layout = StoreLayout::open(&data_dir).expect("open StoreLayout");
+    let before = Manifest::load(&layout)
+        .expect("load manifest")
+        .expect("bootstrap manifest")
+        .current_snapshot_id;
+    let staged = layout.snapshot_dir(before.next()).with_extension("tmp");
+    std::fs::write(&staged, b"not a directory").expect("plant the staging path");
+
+    let _ = stop_tx.send(());
+    let outcome = tokio::time::timeout(Duration::from_secs(60), server)
+        .await
+        .expect("serve loop must return within the stop budget")
+        .expect("serve task join");
+    let error = outcome.expect_err("a failed final commit must fail the stop");
+    let message = error.to_string();
+    assert!(
+        message.contains("stop incomplete") && message.contains("and 1 failed"),
+        "{message}"
+    );
+
+    let after = Manifest::load(&layout)
+        .expect("load manifest")
+        .expect("manifest")
+        .current_snapshot_id;
+    assert_eq!(after, before);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -204,24 +333,11 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
 
     let observer: BootstrapObserver = Arc::new(parking_lot::Mutex::new(None));
 
-    let opts = MultiServeOptions {
+    let opts = serve_options(
         bind,
-        token: "auto-spawn-shutdown-test-token-pad".to_owned(),
-        rpc_url: "http://127.0.0.1:1".to_owned(),
-        railgun_proxy: "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9".to_owned(),
-        chain_id: 1,
-        start_block: 0,
-        mirror_endpoint: "http://127.0.0.1:1".to_owned(),
-        mirror_backfill_interval_secs: None,
-        max_concurrent_queries: 4,
-        respond_timeout_secs: 30,
-        instances: vec![bootstrap_tree_zero_cfg(bootstrap_dir)],
-        skip_chain_workers: true,
-        skip_mirror_workers: true,
-        entries: AUTO_SPAWN_CELL_ROWS,
-        instance_entries: std::collections::HashMap::new(),
-        bootstrap_observer: Some(Arc::clone(&observer)),
-        auto_spawn: Some(AutoSpawnConfigToml {
+        vec![bootstrap_tree_zero_cfg(bootstrap_dir)],
+        &observer,
+        Some(AutoSpawnConfigToml {
             enabled: true,
             data_dir_template: auto_spawn_template,
             encoder: "per-leaf-bc".to_owned(),
@@ -231,23 +347,7 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
             max_instance_count: None,
             cooldown_seconds: None,
         }),
-        rpc_pool: None,
-        instance_templates: vec![],
-        tree_fill_threshold: None,
-        reload_config_path: None,
-        ws_endpoint: None,
-        rate_limit_rps: None,
-        rate_limit_burst: None,
-        cors_allowed_origins: None,
-        trust_proxy_header: None,
-        trusted_proxy_cidrs: None,
-        metrics_public: None,
-        session_eviction_interval_secs: None,
-        enable_fanout: None,
-        max_fanout_shards: None,
-        reorg_window_path: None,
-        session_capacity: raven_railgun_cli::serve_production_multi::SessionCapacity::default(),
-    };
+    );
 
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let mut server = tokio::spawn(async move {
@@ -272,6 +372,7 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
     wait_for_data_dir(&tree1_dir, Duration::from_secs(180)).await;
     wait_for_snapshot_dir(&tree1_dir, 1, Duration::from_secs(180)).await;
     wait_for_spawn_record(tmp.path(), 1, Duration::from_secs(180)).await;
+    apply_one_leaf(&chain, &tree1_dir, 1, 150).await;
 
     chain
         .send(shield_event(2, 0, 200))
@@ -289,30 +390,26 @@ async fn auto_spawned_consumers_drain_wal_on_sigterm() {
         .expect("serve task join")
         .expect("serve loop returned Ok");
 
-    for tree_dir in [&tree1_dir, &tree2_dir] {
+    // Tree 1 applied a leaf after its spawn commit, so its stop commits it. Tree 2 applied
+    // nothing, and a stop with nothing to publish writes no snapshot.
+    for (tree_dir, snapshots) in [(&tree1_dir, 2), (&tree2_dir, 1)] {
         let layout = StoreLayout::open(tree_dir).expect("open StoreLayout");
         wait_for_manifest(&layout.manifest_path(), Duration::from_secs(5)).await;
 
-        let snap_count = count_snapshots(tree_dir);
-        assert!(
-            snap_count >= 2,
-            "auto-spawned instance at {} has only {snap_count} snapshot(s); \
-             expected >= 2 (snap-000001 from bootstrap + snap-000002 from \
-             the Shutdown-arm drive_commit). The consumer never saw \
-             ConsumerEvent::Shutdown.",
+        assert_eq!(
+            u64::try_from(count_snapshots(tree_dir)).expect("snapshot count"),
+            snapshots,
+            "snapshots at {} after the stop",
             tree_dir.display(),
         );
-
         let manifest = Manifest::load(&layout)
             .expect("load manifest")
             .unwrap_or_else(|| panic!("no manifest at {}", tree_dir.display()));
-        assert!(
-            manifest.current_snapshot_id > SnapshotId(1),
-            "manifest at {} has current_snapshot_id={:?}; expected > 1 \
-             (bootstrap commit produced id=1; Shutdown drive_commit must \
-             have produced id>=2)",
-            tree_dir.display(),
+        assert_eq!(
             manifest.current_snapshot_id,
+            SnapshotId(snapshots),
+            "manifest at {}",
+            tree_dir.display(),
         );
 
         let wal_floor = manifest.current_snapshot_seq.checked_sub(1);

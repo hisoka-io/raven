@@ -18,7 +18,7 @@ use raven_railgun_engine::InstanceRole;
 use raven_railgun_indexer::IndexerMessage;
 use tokio::sync::mpsc;
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-chain-fanout-test";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-chain-fanout-test";
 const TOY_ENTRY_SIZE: usize = 256;
 const TOY_ENTRIES_PER_SHARD: u32 = 2048;
 const SHARED_TREE: u32 = 0;

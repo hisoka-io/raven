@@ -22,8 +22,6 @@
 pub mod auth;
 pub mod batch;
 pub mod config;
-pub mod events;
-pub mod fanout;
 pub mod handshake;
 pub mod poi_shim;
 pub mod shim_store;
@@ -34,7 +32,6 @@ pub mod versioned;
 
 pub use batch::BatchError;
 pub use config::HttpConfig;
-pub use fanout::{FanoutError, FanoutRequest};
 pub use handshake::{InstanceParams, SessionEstablishResponse};
 pub use shim_store::{CoverageRefusal, ListCoverage, ShimStoreRegistry};
 pub use state::AppState;
@@ -68,8 +65,6 @@ use tracing::Span;
 
 use crate::auth::bearer_auth;
 use crate::batch::{batch_handler, inspire_batch_handler, inspire_query_handler, query_handler};
-use crate::events::events_handler;
-use crate::fanout::fanout_handler;
 use crate::handshake::{params_handler, session_establish_handler};
 use crate::status::{health_live_handler, health_ready_handler, metrics_handler, status_handler};
 use crate::trusted_proxy::cf_connecting_ip_to_xff;
@@ -109,15 +104,11 @@ pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
         rate_limited.layer(build_governor_layer_peer(rps, burst))
     };
 
-    // Its OWN Governor bucket, not none. The original split existed so a scrape or an SSE
-    // reconnect could not exhaust the per-IP burst the query path needs -- an independent bucket
-    // at the same `(rps, burst)` keeps exactly that and stops these four being the one group
-    // that is both uncredentialed and unlimited. `/v1/events` needs more than a rate limit
-    // anyway: see `max_sse_connections`, which bounds what is HELD rather than what arrives.
+    // Its OWN Governor bucket, not none: a scrape cannot exhaust the per-IP burst the query
+    // path needs, and these routes are still not both uncredentialed and unlimited.
     let public = Router::new()
         .route("/v1/health/live", get(health_live_handler))
         .route("/v1/health/ready", get(health_ready_handler::<S>))
-        .route("/v1/events", get(events_handler::<S>))
         .route("/metrics", get(metrics_handler::<S>))
         .with_state(state)
         .layer(auth_layer);
@@ -165,8 +156,8 @@ pub fn router<S: PirScheme>(state: AppState<S>) -> Result<Router, String> {
         ))
 }
 
-/// Inspire router; adds `/session` and `/params`. Two Governor buckets, so scrapes and SSE
-/// cannot exhaust the query path's per-IP burst. `Err` also when the session binding map is
+/// Inspire router; adds `/session` and `/params`. Two Governor buckets, so scrapes cannot
+/// exhaust the query path's per-IP burst. `Err` also when the session binding map is
 /// smaller than every booted instance's seat pool.
 pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, String> {
     // The earliest point the http layer sees the instance count; `AppState::new` only has one
@@ -193,15 +184,7 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
         .route("/v1/status", get(status_handler::<RavenInspireScheme>))
         .route("/v1/instance/:id/query", post(inspire_query_handler))
         .route("/v1/instance/:id/batch", post(inspire_batch_handler))
-        .route("/v1/instance/:id/session", post(session_establish_handler));
-
-    let rate_limited = if state.config.enable_fanout {
-        rate_limited.route("/v1/instance/:id/fanout", post(fanout_handler))
-    } else {
-        rate_limited
-    };
-
-    let rate_limited = rate_limited
+        .route("/v1/instance/:id/session", post(session_establish_handler))
         .with_state(state.clone())
         .merge(params_route)
         .merge(poi_shim::poi_shim_routes(state.clone()))
@@ -213,16 +196,15 @@ pub fn inspire_router(state: AppState<RavenInspireScheme>) -> Result<Router, Str
         rate_limited.layer(build_governor_layer_peer(rps, burst))
     };
 
-    // Its own Governor bucket, as in `router`, so a scrape or an SSE reconnect cannot spend the
-    // query path's burst. `bearer_auth` still gates `/metrics` while it is default-deny; the other
-    // three need no credential.
+    // Its own Governor bucket, as in `router`, so a scrape cannot spend the query path's burst.
+    // `bearer_auth` still gates `/metrics` while it is default-deny; the health routes need no
+    // credential.
     let public = Router::new()
         .route("/v1/health/live", get(health_live_handler))
         .route(
             "/v1/health/ready",
             get(health_ready_handler::<RavenInspireScheme>),
         )
-        .route("/v1/events", get(events_handler::<RavenInspireScheme>))
         .route("/metrics", get(metrics_handler::<RavenInspireScheme>))
         .with_state(state)
         .layer(auth_layer);
@@ -474,7 +456,7 @@ pub(crate) fn global_prometheus_handle(
 mod tests {
     use super::*;
     use crate::auth::{ct_eq_str, EvictionOutcome, SessionKey, SessionMap};
-    use crate::config::{HTTP_MAX_BODY_CEILING, HTTP_MAX_FANOUT_CEILING};
+    use crate::config::HTTP_MAX_BODY_CEILING;
     use raven_inspire::ServerSessionHandle;
     use raven_railgun_core::InstanceId;
     use raven_railgun_engine::PirInstance;
@@ -563,60 +545,6 @@ mod tests {
         );
         assert_eq!(BatchError::SemaphoreClosed.index(), None);
         assert_eq!(BatchError::Invariant("x").index(), None);
-    }
-
-    #[test]
-    fn fanout_error_validation_variants_map_to_400() {
-        assert_eq!(FanoutError::NoShards.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            FanoutError::TooManyShards { got: 99, cap: 16 }.status(),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            FanoutError::ShardOutOfRange {
-                shard_id: 7,
-                index: 1,
-                shard_count: 3
-            }
-            .status(),
-            StatusCode::BAD_REQUEST
-        );
-    }
-
-    #[test]
-    fn fanout_error_dispatch_delegates_status_and_names_the_shard() {
-        let err = FanoutError::Dispatch {
-            shard_id: 11,
-            index: 2,
-            source: BatchError::Timeout { index: 2, secs: 30 },
-        };
-        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(err.class(), "timeout");
-        let rendered = format!("{err}");
-        assert!(
-            rendered.contains("shard 11"),
-            "Display must name the failing shard: {rendered}"
-        );
-    }
-
-    #[test]
-    fn http_config_validate_rejects_zero_max_fanout_shards() {
-        let mut cfg = HttpConfig::demo("test-token-padded-long-enough-1234");
-        cfg.max_fanout_shards = 0;
-        let err = cfg
-            .validate()
-            .expect_err("zero max_fanout_shards must reject");
-        assert!(err.contains("max_fanout_shards"), "err = {err}");
-    }
-
-    #[test]
-    fn http_config_validate_rejects_oversize_max_fanout_shards() {
-        let mut cfg = HttpConfig::demo("test-token-padded-long-enough-1234");
-        cfg.max_fanout_shards = HTTP_MAX_FANOUT_CEILING + 1;
-        let err = cfg
-            .validate()
-            .expect_err("oversize max_fanout_shards must reject");
-        assert!(err.contains("max_fanout_shards"), "err = {err}");
     }
 
     #[test]
@@ -890,8 +818,10 @@ mod tests {
         let h = ServerSessionHandle(1);
         let _ = map.upsert(k1.clone(), h, now + ttl, 2, now);
         let _ = map.upsert(k2, h, now + ttl + Duration::from_secs(1), 2, now);
-        let outcome = map.upsert(k3.clone(), h, now + ttl + Duration::from_secs(2), 2, now);
+        let (outcome, replaced) =
+            map.upsert(k3.clone(), h, now + ttl + Duration::from_secs(2), 2, now);
         assert!(matches!(outcome, EvictionOutcome::AtCapacity));
+        assert_eq!(replaced, None);
         assert_eq!(map.len(), 2, "the refusal must not insert");
         assert_eq!(
             map.get(&k1, now),
@@ -899,9 +829,12 @@ mod tests {
             "the incumbent must keep its binding"
         );
         assert!(map.get(&k3, now).is_none());
-        assert!(
-            matches!(map.upsert(k1, h, now + ttl, 2, now), EvictionOutcome::None),
-            "a caller that already holds a slot must always be able to refresh it"
+        let refreshed = ServerSessionHandle(2);
+        assert_eq!(
+            map.upsert(k1, refreshed, now + ttl, 2, now),
+            (EvictionOutcome::None, Some(h)),
+            "a caller that already holds a slot must always be able to refresh it, and learns \
+             which handle it replaced"
         );
     }
 
@@ -918,7 +851,7 @@ mod tests {
         let _ = map.upsert(dead, h, now + Duration::from_secs(1), 2, now);
         let _ = map.upsert(live.clone(), h, now + Duration::from_secs(3600), 2, now);
         let later = now + Duration::from_secs(2);
-        let outcome = map.upsert(
+        let (outcome, _) = map.upsert(
             fresh.clone(),
             h,
             later + Duration::from_secs(3600),
@@ -1074,19 +1007,20 @@ mod tests {
         // proves the short-circuit without sleeping the respond for longer than the budget.
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            crate::batch::dispatch_batch::<SlowableScheme, SlowableQuery>(
+            crate::batch::dispatch_batch_within::<SlowableScheme>(
                 queries,
                 Arc::clone(&instance),
                 snapshot,
                 semaphore,
                 4,
                 std::time::Duration::from_millis(250),
+                PERMIT_WAIT,
             ),
         )
         .await;
         drop(release);
 
-        let result = outcome.expect("dispatch_batch must short-circuit on timeout");
+        let result = outcome.expect("dispatch must short-circuit on timeout");
         let err = result.expect_err("slow slot must time out");
         match err {
             BatchError::Timeout { index, secs: _ } => {
@@ -1111,14 +1045,14 @@ mod tests {
         let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            crate::batch::dispatch_batch_within::<SlowableScheme, SlowableQuery>(
+            crate::batch::dispatch_batch_within::<SlowableScheme>(
                 queries,
                 instance,
                 snapshot,
                 Arc::new(tokio::sync::Semaphore::new(0)),
                 4,
                 std::time::Duration::from_secs(30),
-                Some(wait),
+                wait,
             ),
         )
         .await;
@@ -1144,6 +1078,9 @@ mod tests {
         );
     }
 
+    /// Long enough that no permit wait in these tests can run out.
+    const PERMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
     fn err_status_for_timeout() -> StatusCode {
         BatchError::Timeout { index: 0, secs: 1 }.status()
     }
@@ -1155,13 +1092,14 @@ mod tests {
 
         let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
         let snapshot = instance.current_snapshot();
-        let result = crate::batch::dispatch_batch::<SlowableScheme, SlowableQuery>(
+        let result = crate::batch::dispatch_batch_within::<SlowableScheme>(
             queries,
             instance,
             snapshot,
             semaphore,
             4,
             std::time::Duration::from_secs(2),
+            PERMIT_WAIT,
         )
         .await;
         let responses = result.expect("all-fast batch must succeed");
@@ -1284,13 +1222,14 @@ mod tests {
         });
 
         let snapshot = instance.current_snapshot();
-        let result = crate::batch::dispatch_batch::<SlowableScheme, SlowableQuery>(
+        let result = crate::batch::dispatch_batch_within::<SlowableScheme>(
             queries,
             Arc::clone(&instance),
             snapshot,
             semaphore,
             2,
             std::time::Duration::from_secs(5),
+            PERMIT_WAIT,
         )
         .await;
         drain_handle.await.expect("drain task must finish");

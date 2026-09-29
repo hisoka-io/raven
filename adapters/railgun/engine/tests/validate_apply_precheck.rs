@@ -11,7 +11,7 @@ use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{PerLeafCommitmentEncoder, PirTableEncoder};
 use raven_railgun_persistence::{StoreLayout, WalEntryPayload};
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-validate-precheck";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-validate-precheck";
 
 /// Independent restatement of the BN254 scalar field modulus, big-endian.
 /// `modulus_vectors_match_the_poseidon_field_boundary` pins it to ark-bn254.

@@ -21,7 +21,7 @@ use raven_railgun_engine::{InstanceRole, PirScheme};
 use std::sync::Arc;
 use std::time::Duration;
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-test";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-test";
 
 const TOY_ENTRIES: usize = 256;
 const TOY_ENTRY_SIZE: usize = 256;

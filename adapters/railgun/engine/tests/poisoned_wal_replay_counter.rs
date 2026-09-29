@@ -15,7 +15,7 @@ use raven_railgun_engine::persistence::{
 use raven_railgun_engine::pir_table::{PerLeafCommitmentEncoder, PirTableEncoder};
 use raven_railgun_persistence::{StoreLayout, WalEntryPayload};
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-poisoned-wal-counter";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-poisoned-wal-counter";
 
 fn install_recorder() -> &'static metrics_exporter_prometheus::PrometheusHandle {
     static HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> = OnceLock::new();

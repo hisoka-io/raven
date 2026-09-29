@@ -24,7 +24,7 @@ use raven_railgun_engine::InstanceRole;
 use raven_railgun_indexer::{BlockId, ChainSource, IndexerError, Result as IndexerResult};
 use raven_railgun_persistence::{PpoiEventType, WalEntryPayload};
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-w2-layer2-test";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-w2-layer2-test";
 /// Row width of the toy cell; the configured encoder must emit it.
 const TOY_ENTRY_SIZE: usize = 256;
 

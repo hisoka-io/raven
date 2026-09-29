@@ -11,7 +11,7 @@ use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
 use raven_railgun_persistence::{StoreLayout, Wal, WalEntryPayload};
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-wal-v6-recovery";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-wal-v6-recovery";
 const TOY_ENTRY_SIZE: usize = 32;
 const ENTRIES_PER_SHARD: u32 = 2048;
 

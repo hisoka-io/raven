@@ -19,7 +19,7 @@ use raven_railgun_persistence::{
 fn sample_manifest(id: u32, seq: u64) -> Manifest {
     Manifest {
         schema_version: MANIFEST_SCHEMA_VERSION,
-        scheme_tag: "raven-inspire-twopacking-inspiring-wp3".to_owned(),
+        scheme_tag: "raven-inspire-twopacking-inspiring-v1".to_owned(),
         instance_id: format!("ppoi-paths-test-{id}"),
         current_snapshot_id: SnapshotId(u64::from(id)),
         current_snapshot_seq: seq,

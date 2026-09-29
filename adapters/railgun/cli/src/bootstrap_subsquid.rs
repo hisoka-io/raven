@@ -404,7 +404,7 @@ impl Default for BootstrapTreeConfig {
             checkpoint_depth: 64,
             data_dir: PathBuf::new(),
             instance_id: "commit-tree-bootstrap".to_owned(),
-            scheme_tag: "raven-inspire-twopacking-inspiring-wp3-cache-session".to_owned(),
+            scheme_tag: raven_railgun_engine::persistence::SCHEME_TAG.to_owned(),
             max_wall_mins: DEFAULT_MAX_BOOTSTRAP_WALL_MINS,
             contract_start_block: COMMITMENTS_PROXY_START_BLOCK,
             repair_trigger_threshold: BOUNDARY_REPAIR_TRIGGER_THRESHOLD,

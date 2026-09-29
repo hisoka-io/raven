@@ -29,7 +29,7 @@ const LIST: [u8; 32] = [0x5a; 32];
 const OTHER_LIST: [u8; 32] = [0x6b; 32];
 const ROWS: u64 = 65_536;
 const ROWS_PER_SHARD: u32 = 2048;
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-list-crs-test";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-list-crs-test";
 
 fn block(root: &std::path::Path, list_key: [u8; 32], number: u32) -> InstanceConfig {
     InstanceConfig {

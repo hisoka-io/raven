@@ -108,7 +108,7 @@ fn the_probe_reports_green_on_a_data_dir_this_binary_just_wrote() {
         .expect("save snapshot");
     Manifest {
         schema_version: MANIFEST_SCHEMA_VERSION,
-        scheme_tag: "raven-inspire-twopacking-inspiring-wp3-reopen-probe".to_owned(),
+        scheme_tag: "raven-inspire-twopacking-inspiring-v1-reopen-probe".to_owned(),
         instance_id: "reopen-probe".to_owned(),
         current_snapshot_id: id,
         current_snapshot_seq: 0,
@@ -148,7 +148,7 @@ fn the_probe_reports_red_when_the_snapshot_body_does_not_match_this_binary() {
         .expect("save snapshot");
     Manifest {
         schema_version: MANIFEST_SCHEMA_VERSION,
-        scheme_tag: "raven-inspire-twopacking-inspiring-wp3-reopen-probe".to_owned(),
+        scheme_tag: "raven-inspire-twopacking-inspiring-v1-reopen-probe".to_owned(),
         instance_id: "reopen-probe".to_owned(),
         current_snapshot_id: id,
         current_snapshot_seq: 0,

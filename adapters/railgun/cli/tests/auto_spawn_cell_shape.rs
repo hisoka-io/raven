@@ -71,7 +71,7 @@ fn runtime(tmp: &std::path::Path) -> AutoSpawnRuntime {
             .to_string_lossy()
             .into_owned(),
         encoder: "per-node".to_owned(),
-        scheme_tag: "raven-inspire-twopacking-inspiring-wp3-cache-session".to_owned(),
+        scheme_tag: "raven-inspire-twopacking-inspiring-v1".to_owned(),
         entries: CELL_ROWS,
         entry_bytes: ENTRY_BYTES,
         channel_capacity: 64,
@@ -160,7 +160,11 @@ async fn spawned_instance_re_encodes_slot_zero_with_first_window_rows() {
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("send shutdown");
-    handle.consumer_join.await.expect("consumer task joined");
+    handle
+        .consumer_join
+        .await
+        .expect("consumer task joined")
+        .expect("final commit");
 
     let state = instance.current_state();
     let rows_per_shard = u32::try_from(params.ring_dim).expect("ring_dim fits u32");

@@ -10,7 +10,7 @@ use raven_railgun_engine::persistence::{ConsumerEvent, ConsumerMetrics};
 use raven_railgun_engine::InstanceRole;
 use std::time::Duration;
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-test";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-test";
 /// Row width of [`build_toy_state`]'s cell; the configured encoder must emit it.
 const TOY_ENTRY_SIZE: usize = 256;
 

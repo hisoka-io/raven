@@ -1,7 +1,7 @@
 //! What an uncredentialed caller can hold on a running server is what the operator configured:
-//! packing-key seats per instance, their lifetime, and `/v1/events` streams in total and per
-//! peer. Each bound is asserted over HTTP against a server booted from `[global]` keys, for every
-//! store the server opens, auto-spawned ones included.
+//! packing-key seats per instance and their lifetime. Each bound is asserted over HTTP against a
+//! server booted from `[global]` keys, for every store the server opens, auto-spawned ones
+//! included.
 
 #![allow(
     clippy::expect_used,
@@ -40,22 +40,18 @@ const ROW_BYTES: usize = 32;
 
 const SEATS: usize = 3;
 const TTL_SECS: u64 = 600;
-const STREAMS: usize = 2;
-const STREAMS_PER_PEER: usize = 1;
 
 const LIMIT_FLAGS: [(&str, &str); 4] = [
     ("--max-sessions-per-instance", "64"),
     ("--session-ttl-secs", "3600"),
-    ("--max-sse-connections", "64"),
-    ("--max-sse-connections-per-peer", "16"),
+    ("--session-lru-cap", "10000"),
+    ("--max-concurrent-handshakes", "2"),
 ];
 
 fn configured_limits() -> String {
     format!(
         "max_sessions_per_instance = {SEATS}\n\
-         session_ttl_secs = {TTL_SECS}\n\
-         max_sse_connections = {STREAMS}\n\
-         max_sse_connections_per_peer = {STREAMS_PER_PEER}\n"
+         session_ttl_secs = {TTL_SECS}\n"
     )
 }
 
@@ -118,11 +114,11 @@ fn assert_documented_defaults(config: &HttpConfig, path: &str) {
             config.max_sessions_per_instance,
             64,
         ),
-        ("max_sse_connections", config.max_sse_connections, 64),
+        ("session_lru_cap", config.session_lru_cap, 10_000),
         (
-            "max_sse_connections_per_peer",
-            config.max_sse_connections_per_peer,
-            16,
+            "max_concurrent_handshakes",
+            config.max_concurrent_handshakes,
+            2,
         ),
     ];
     for (key, value, documented) in pairs {
@@ -313,48 +309,6 @@ async fn assert_configured_seats(
     );
 }
 
-/// Opens one `/v1/events` stream; a 200 is held open by keeping the response.
-async fn open_stream(
-    client: &reqwest::Client,
-    base: &str,
-    forwarded_for: Option<&str>,
-) -> reqwest::Response {
-    let mut request = client.get(format!("{base}/v1/events"));
-    if let Some(peer) = forwarded_for {
-        request = request.header("x-forwarded-for", peer);
-    }
-    tokio::time::timeout(Duration::from_secs(30), request.send())
-        .await
-        .expect("events response within 30 s")
-        .expect("events request")
-}
-
-/// Three peers against `STREAMS` total and `STREAMS_PER_PEER` each: the first peer's second
-/// stream is refused as its own excess, and the third peer finds the shared pool full.
-async fn assert_configured_streams(peers: [(&reqwest::Client, Option<&str>); 3], base: &str) {
-    let [(first, first_as), (second, second_as), (third, third_as)] = peers;
-    let mut held = Vec::new();
-    let opened = open_stream(first, base, first_as).await;
-    assert_eq!(opened.status(), reqwest::StatusCode::OK, "first stream");
-    held.push(opened);
-    let excess = open_stream(first, base, first_as).await;
-    assert_eq!(
-        excess.status(),
-        reqwest::StatusCode::TOO_MANY_REQUESTS,
-        "a peer's stream past the configured {STREAMS_PER_PEER} per peer, not the default 16"
-    );
-    let opened = open_stream(second, base, second_as).await;
-    assert_eq!(opened.status(), reqwest::StatusCode::OK, "second peer");
-    held.push(opened);
-    let full = open_stream(third, base, third_as).await;
-    assert_eq!(
-        full.status(),
-        reqwest::StatusCode::SERVICE_UNAVAILABLE,
-        "a stream past the configured {STREAMS} in total, not the default 64"
-    );
-    drop(held);
-}
-
 async fn wait_for_observer(
     observer: &BootstrapObserver,
     server: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -456,8 +410,7 @@ fn shield(tree: u32, height: u64) -> IndexerMessage {
 }
 
 /// Every store the server opens, the bootstrap one and the one the chain-tree auto-spawn
-/// driver opens after boot, takes the `[global]` seats and lifetime; the event stream takes
-/// both `[global]` stream bounds.
+/// driver opens after boot, takes the `[global]` seats and lifetime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn global_keys_bound_every_store_auto_spawn_opens() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -471,15 +424,6 @@ async fn global_keys_bound_every_store_auto_spawn_opens() {
     let mut pack = None;
 
     assert_configured_seats(&client, &server.base, BOOT_INSTANCE, &mut pack).await;
-    assert_configured_streams(
-        [
-            (&client, Some("10.0.0.1")),
-            (&client, Some("10.0.0.2")),
-            (&client, Some("10.0.0.3")),
-        ],
-        &server.base,
-    )
-    .await;
 
     server
         .view

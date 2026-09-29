@@ -35,7 +35,7 @@ use raven_railgun_engine::inspire::{heartbeat_session_eviction, setup_state, Rav
 use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
 use raven_railgun_http::{
     inspire_router, read_batch_response_versioned, read_versioned, write_versioned, AppState,
-    FanoutRequest, HttpConfig, SessionEstablishResponse,
+    HttpConfig, SessionEstablishResponse,
 };
 use tower::ServiceExt;
 
@@ -99,8 +99,7 @@ fn fixture() -> Fixture {
     // Taken before the engine moves into the AppState; it is the same `Arc` the
     // handler resolves, so a swap through it is visible to the handler.
     let instance = engine.instance(&instance_id).expect("instance just added");
-    let mut cfg = HttpConfig::demo(READ_TOKEN);
-    cfg.enable_fanout = true;
+    let cfg = HttpConfig::demo(READ_TOKEN);
     let ttl_secs = cfg.session_ttl_secs;
     let app_state = {
         let _g = APPSTATE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
@@ -224,7 +223,7 @@ async fn every_handle_route_is_bound_to_the_establishing_client() {
         &expected,
     )
     .await;
-    assert_batch_and_fanout_successes(&router, &query, &crs, &client_state, &expected).await;
+    assert_batch_success(&router, &query, &crs, &client_state, &expected).await;
     assert_wrong_client_refusals(&router, &query).await;
 
     heartbeat_session_eviction(&instance).expect("evict session generation");
@@ -319,52 +318,32 @@ async fn assert_single_successes(
     }
 }
 
-async fn assert_batch_and_fanout_successes(
+async fn assert_batch_success(
     router: &axum::Router,
     query: &SeededClientQuery,
     crs: &ServerCrs,
     client_state: &ClientState,
     expected: &[u8],
 ) {
-    let bodies = [
-        (
-            "batch",
-            write_versioned(&vec![query.clone()]).expect("batch body"),
-        ),
-        (
-            "fanout",
-            write_versioned(&FanoutRequest {
-                query: query.clone(),
-                shard_ids: vec![0],
-            })
-            .expect("fanout body"),
-        ),
-    ];
-    for (route, body) in bodies {
-        let response = router
-            .clone()
-            .oneshot(query_request(route, Some(CLIENT_ID), body))
-            .await
-            .expect("multi-response dispatch");
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = response
-            .into_body()
-            .collect()
-            .await
-            .expect("multi-response body")
-            .to_bytes();
-        let decoded: Vec<ServerResponse> =
-            read_batch_response_versioned(&bytes).expect("multi-response decode");
-        let first = decoded.first().expect("one response");
-        let plaintext = raven_railgun_engine::inspire::extract_response(
-            crs,
-            client_state,
-            first,
-            TOY_ENTRY_BYTES,
-        )
-        .expect("multi-response extract");
-        assert_eq!(plaintext, expected);
-    }
+    let body = write_versioned(&vec![query.clone()]).expect("batch body");
+    let response = router
+        .clone()
+        .oneshot(query_request("batch", Some(CLIENT_ID), body))
+        .await
+        .expect("batch dispatch");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("batch body")
+        .to_bytes();
+    let decoded: Vec<ServerResponse> = read_batch_response_versioned(&bytes).expect("batch decode");
+    let first = decoded.first().expect("one response");
+    let plaintext =
+        raven_railgun_engine::inspire::extract_response(crs, client_state, first, TOY_ENTRY_BYTES)
+            .expect("batch extract");
+    assert_eq!(plaintext, expected);
 }
 
 async fn assert_wrong_client_refusals(router: &axum::Router, query: &SeededClientQuery) {
@@ -374,14 +353,6 @@ async fn assert_wrong_client_refusals(router: &axum::Router, query: &SeededClien
         (
             "batch",
             write_versioned(&vec![query.clone()]).expect("batch body"),
-        ),
-        (
-            "fanout",
-            write_versioned(&FanoutRequest {
-                query: query.clone(),
-                shard_ids: vec![0],
-            })
-            .expect("fanout body"),
         ),
     ];
     for (route, body) in bodies {
@@ -435,21 +406,23 @@ fn an_epoch_swap_inside_registration_is_refused_and_removes_the_handle() {
     } = fixture();
 
     let fired = Arc::new(AtomicBool::new(false));
-    let recorder = SwapOnFirstOccupancyPublish {
-        instance: Arc::clone(&instance),
-        fired: Arc::clone(&fired),
-    };
+    let recorder: &'static SwapOnFirstOccupancyPublish =
+        Box::leak(Box::new(SwapOnFirstOccupancyPublish {
+            instance: Arc::clone(&instance),
+            fired: Arc::clone(&fired),
+        }));
 
     let pre_epoch = instance.current_epoch();
     let pre_swap_state = instance.current_state();
 
-    // current_thread, so the whole dispatch stays on the thread the local
-    // recorder is installed on.
+    // Registration runs on a blocking-pool thread, so every thread this runtime starts gets the
+    // local recorder, and the guard lives as long as the thread.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        .on_thread_start(move || std::mem::forget(metrics::set_default_local_recorder(recorder)))
         .build()
         .expect("runtime");
-    let resp = metrics::with_local_recorder(&recorder, || {
+    let resp = metrics::with_local_recorder(recorder, || {
         rt.block_on(router.oneshot(session_request(body)))
     })
     .expect("dispatch");

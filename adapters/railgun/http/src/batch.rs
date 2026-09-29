@@ -44,14 +44,6 @@ impl AdmissionRefusal {
             Self::Drained(_) | Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
-
-    pub(crate) fn detail(self) -> String {
-        match self {
-            Self::Missing => "unknown instance".to_owned(),
-            Self::Drained(state) => format!("instance is {}", state.label()),
-            Self::Unavailable => "instance stopped serving during admission".to_owned(),
-        }
-    }
 }
 
 pub(crate) fn admit_instance<S: PirScheme>(
@@ -220,14 +212,14 @@ pub(crate) async fn batch_handler<S: PirScheme>(
     let k = app.config.max_concurrent_queries.max(1);
     let respond_timeout = Duration::from_secs(app.config.respond_timeout_secs.max(1));
 
-    let responses_result = dispatch_batch_within::<S, S::Query>(
+    let responses_result = dispatch_batch_within::<S>(
         queries,
         Arc::clone(&instance),
         snapshot_for_batch,
         Arc::clone(&app.semaphore),
         k,
         respond_timeout,
-        Some(app.config.respond_permit_wait()),
+        app.config.respond_permit_wait(),
     )
     .await;
 
@@ -570,50 +562,18 @@ type WorkerOutcome<R> = (usize, Result<R, BatchError>);
 /// same `Arc<Snapshot<S>>` so the whole batch serves one `(epoch, state)` even
 /// under a concurrent `swap_state`.
 ///
-/// A slot becomes an `S::Query` inside the worker, after its permit: a caller
-/// fanning one shared upload across slots pays at most `k` live copies, not one
-/// per slot. `/batch` owns its queries outright and converts through the
-/// identity `Into`.
-///
-/// Waits for each permit without a deadline; `/batch` bounds it through
-/// [`dispatch_batch_within`].
-pub(crate) async fn dispatch_batch<S, Q>(
-    slots: Vec<Q>,
+/// Each slot's permit wait is bounded by `permit_wait`.
+pub(crate) async fn dispatch_batch_within<S>(
+    slots: Vec<S::Query>,
     instance: Arc<PirInstance<S>>,
     snapshot: Arc<Snapshot<S>>,
     semaphore: Arc<Semaphore>,
     k: usize,
     respond_timeout: Duration,
+    permit_wait: Duration,
 ) -> Result<Vec<S::Response>, BatchError>
 where
     S: PirScheme,
-    Q: Into<S::Query> + Send + 'static,
-{
-    dispatch_batch_within(
-        slots,
-        instance,
-        snapshot,
-        semaphore,
-        k,
-        respond_timeout,
-        None,
-    )
-    .await
-}
-
-/// [`dispatch_batch`], with each slot's permit wait bounded by `permit_wait` when set.
-pub(crate) async fn dispatch_batch_within<S, Q>(
-    slots: Vec<Q>,
-    instance: Arc<PirInstance<S>>,
-    snapshot: Arc<Snapshot<S>>,
-    semaphore: Arc<Semaphore>,
-    k: usize,
-    respond_timeout: Duration,
-    permit_wait: Option<Duration>,
-) -> Result<Vec<S::Response>, BatchError>
-where
-    S: PirScheme,
-    Q: Into<S::Query> + Send + 'static,
 {
     use tokio::task::JoinSet;
 
@@ -622,7 +582,7 @@ where
     let mut join: JoinSet<WorkerOutcome<S::Response>> = JoinSet::new();
 
     let mut next_idx = 0usize;
-    let mut slots_iter: std::vec::IntoIter<Q> = slots.into_iter();
+    let mut slots_iter = slots.into_iter();
 
     while next_idx < k.min(n) {
         let Some(slot) = slots_iter.next() else {
@@ -633,7 +593,7 @@ where
         let snap = Arc::clone(&snapshot);
         let idx = next_idx;
         join.spawn(async move {
-            worker::<S, Q>(idx, slot, inst, snap, sem, respond_timeout, permit_wait).await
+            worker::<S>(idx, slot, inst, snap, sem, respond_timeout, permit_wait).await
         });
         next_idx += 1;
     }
@@ -685,7 +645,7 @@ where
                 let snap = Arc::clone(&snapshot);
                 let idx = next_idx;
                 join.spawn(async move {
-                    worker::<S, Q>(idx, slot, inst, snap, sem, respond_timeout, permit_wait).await
+                    worker::<S>(idx, slot, inst, snap, sem, respond_timeout, permit_wait).await
                 });
                 next_idx += 1;
             }
@@ -699,46 +659,39 @@ where
     collected.ok_or(BatchError::Invariant("response collect produced None"))
 }
 
-/// One in-flight batch worker. Acquires a permit, within `permit_wait` when set, runs
+/// One in-flight batch worker. Acquires a permit within `permit_wait`, runs
 /// `query_active_tracked_with_snapshot` against the batch-captured
 /// `Arc<Snapshot<S>>` on `spawn_blocking` under `tokio::time::timeout`.
-/// A timed-out slot keeps its permit until the detached respond ends. The slot
-/// materializes under the permit, so an unacquired worker holds no query-sized
-/// allocation.
-async fn worker<S, Q>(
+/// A timed-out slot keeps its permit until the detached respond ends.
+async fn worker<S>(
     idx: usize,
-    slot: Q,
+    query: S::Query,
     instance: Arc<PirInstance<S>>,
     snapshot: Arc<Snapshot<S>>,
     sem: Arc<Semaphore>,
     respond_timeout: Duration,
-    permit_wait: Option<Duration>,
+    permit_wait: Duration,
 ) -> WorkerOutcome<S::Response>
 where
     S: PirScheme,
-    Q: Into<S::Query> + Send + 'static,
 {
-    let acquired = match permit_wait {
-        Some(wait) => match tokio::time::timeout(wait, sem.acquire_owned()).await {
-            Ok(acquired) => acquired,
-            Err(_elapsed) => {
-                let waited_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
-                return (
-                    idx,
-                    Err(BatchError::PermitWait {
-                        index: idx,
-                        waited_ms,
-                    }),
-                );
-            }
-        },
-        None => sem.acquire_owned().await,
+    let acquired = match tokio::time::timeout(permit_wait, sem.acquire_owned()).await {
+        Ok(acquired) => acquired,
+        Err(_elapsed) => {
+            let waited_ms = u64::try_from(permit_wait.as_millis()).unwrap_or(u64::MAX);
+            return (
+                idx,
+                Err(BatchError::PermitWait {
+                    index: idx,
+                    waited_ms,
+                }),
+            );
+        }
     };
     let Ok(permit) = acquired else {
         return (idx, Err(BatchError::SemaphoreClosed));
     };
     let mut join = tokio::task::spawn_blocking(move || {
-        let query = slot.into();
         instance.query_active_tracked_with_snapshot(&snapshot, &query)
     });
     match tokio::time::timeout(respond_timeout, &mut join).await {

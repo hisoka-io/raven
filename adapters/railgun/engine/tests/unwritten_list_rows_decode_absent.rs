@@ -405,7 +405,7 @@ async fn served_after_commit(
             max_seconds_between_snapshots: u64::MAX,
             retention: RetentionPolicy::default(),
         },
-        scheme_tag: "raven-inspire-twopacking-inspiring-wp3-unwritten-rows".to_owned(),
+        scheme_tag: "raven-inspire-twopacking-inspiring-v1-unwritten-rows".to_owned(),
         channel_capacity: 64,
         max_concurrent_queries: None,
         verification_cadence_n: 0,

@@ -71,10 +71,7 @@ enum Commands {
         #[arg(long, default_value_t = 1)]
         chain_id: u64,
         /// Scheme tag for the persisted manifest.
-        #[arg(
-            long,
-            default_value = "raven-inspire-twopacking-inspiring-wp3-cache-session"
-        )]
+        #[arg(long, default_value = raven_railgun_engine::persistence::SCHEME_TAG)]
         scheme_tag: String,
         /// Removed: the encoder determines bootstrap cell rows.
         #[arg(long, value_parser = removed_bootstrap_entries)]
@@ -124,9 +121,12 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let opts = multi_options_from_config(&config, ws_endpoint, metrics_public)?;
             return_freed_heap_periodically();
-            raven_railgun_cli::serve_production_multi::run(opts).await?;
-            // A final commit the stop budget abandoned still occupies a runtime worker, and
-            // dropping the runtime would wait for it past the budget.
+            // Exits rather than returns: a final commit the stop budget abandoned still occupies
+            // a runtime worker, and dropping the runtime would wait for it past the budget.
+            if let Err(error) = raven_railgun_cli::serve_production_multi::run(opts).await {
+                eprintln!("Error: {error:?}");
+                std::process::exit(1)
+            }
             std::process::exit(0)
         }
         Commands::BootstrapFromSubsquid {

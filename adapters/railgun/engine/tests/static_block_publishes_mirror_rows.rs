@@ -88,7 +88,7 @@ fn boot(
         },
         use_flock: false,
         snapshot_policy: policy,
-        scheme_tag: "raven-inspire-twopacking-inspiring-wp3-static-block".to_owned(),
+        scheme_tag: "raven-inspire-twopacking-inspiring-v1-static-block".to_owned(),
         channel_capacity: 64,
         max_concurrent_queries: None,
         verification_cadence_n: 0,

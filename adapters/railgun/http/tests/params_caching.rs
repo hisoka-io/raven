@@ -134,12 +134,10 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-/// Positive: ETag header is `"<sha256-hex>"` of the full body bytes,
-/// emitted alongside `Cache-Control: public, max-age=86400, immutable`
-/// and `Vary: Authorization`: the headers Cloudflare needs to cache
-/// the body across origin epoch boundaries.
+/// Positive: ETag header is `"<sha256-hex>"` of the full body bytes, emitted alongside
+/// `Cache-Control: public, no-cache` and `Vary: Authorization`.
 #[tokio::test]
-async fn params_handler_emits_etag_and_immutable_cache_control() {
+async fn params_handler_emits_etag_and_revalidating_cache_control() {
     let app_state = build_app_state();
     let router = build_router(app_state);
     let resp = router
@@ -176,8 +174,60 @@ async fn params_handler_emits_etag_and_immutable_cache_control() {
     assert_eq!(etag, expected, "etag must be quoted hex sha256 of body");
     assert!(etag.starts_with('\"') && etag.ends_with('\"'));
     assert_eq!(etag.len(), 1 + 64 + 1);
-    assert_eq!(cc, "public, max-age=86400, immutable");
+    assert_eq!(cc, "public, no-cache");
     assert_eq!(vary, "Authorization");
+}
+
+/// A redeploy regenerates the CRS and restarts the epoch at zero. A cache that keeps the body
+/// must ask the origin again before reusing it, and the new deploy must answer that
+/// revalidation with its own parameters rather than a 304.
+#[tokio::test]
+async fn a_cache_revalidates_params_and_a_redeploy_answers_with_its_own() {
+    let first = build_router(build_app_state())
+        .oneshot(build_params_request(READ_TOKEN))
+        .await
+        .expect("first deploy");
+    assert_eq!(first.status(), StatusCode::OK);
+    let cache_control = first
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .expect("cache-control")
+        .to_ascii_lowercase();
+    let directives: Vec<&str> = cache_control.split(',').map(str::trim).collect();
+    assert!(
+        !directives.contains(&"immutable"),
+        "an immutable body is never revalidated: {cache_control}"
+    );
+    assert!(
+        directives.contains(&"no-cache"),
+        "a stored body must be revalidated before every reuse: {cache_control}"
+    );
+    let first_etag = first
+        .headers()
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .expect("etag")
+        .to_owned();
+    let first_body = body_bytes(first).await;
+
+    let redeployed = build_router(build_app_state())
+        .oneshot(build_params_request_inm(READ_TOKEN, &first_etag))
+        .await
+        .expect("redeploy");
+    assert_eq!(
+        redeployed.status(),
+        StatusCode::OK,
+        "a redeploy must not confirm the previous deploy's parameters"
+    );
+    let redeployed_etag = redeployed
+        .headers()
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .expect("etag")
+        .to_owned();
+    assert_ne!(redeployed_etag, first_etag);
+    assert_ne!(body_bytes(redeployed).await, first_body);
 }
 
 /// Failure-injection: matching `If-None-Match` returns 304 with the
@@ -219,7 +269,7 @@ async fn params_handler_returns_304_on_matching_if_none_match() {
         .expect("cache-control on 304")
         .to_str()
         .expect("ascii");
-    assert_eq!(cc, "public, max-age=86400, immutable");
+    assert_eq!(cc, "public, no-cache");
     let vary = resp2
         .headers()
         .get(header::VARY)

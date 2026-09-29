@@ -19,7 +19,7 @@ use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{PerLeafCommitmentEncoder, PirTableEncoder};
 use raven_railgun_persistence::{StoreLayout, WalEntryPayload};
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-validate-property";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-validate-property";
 const ENTRIES_PER_SHARD: u32 = 2048;
 const LIST_KEY: [u8; 32] = [0x42; 32];
 

@@ -22,7 +22,7 @@ use raven_railgun_engine::pir_table::EncoderKind;
 use raven_railgun_engine::{InstanceRole, PirInstance};
 use raven_railgun_indexer::IndexerMessage;
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1";
 const TOY_ENTRY_SIZE: usize = 256;
 const TOY_ENTRIES_PER_SHARD: u32 = 2048;
 

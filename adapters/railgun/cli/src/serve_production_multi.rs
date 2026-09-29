@@ -182,6 +182,9 @@ struct GlobalSection {
     mirror_backfill_interval_secs: Option<u64>,
     #[serde(default)]
     max_concurrent_queries: Option<usize>,
+    /// Longest a query, batch slot or handshake waits for a permit before a 503.
+    #[serde(default)]
+    respond_permit_wait_ms: Option<u64>,
     #[serde(default)]
     respond_timeout_secs: Option<u64>,
     #[serde(default)]
@@ -230,18 +233,12 @@ struct GlobalSection {
     /// Seat and handle lifetime in seconds; may only be lowered from the default.
     #[serde(default)]
     session_ttl_secs: Option<u64>,
-    /// Concurrent `/v1/events` streams.
+    /// Sticky-session bindings across all instances; must hold every instance's seats.
     #[serde(default)]
-    max_sse_connections: Option<usize>,
-    /// Concurrent `/v1/events` streams one peer may hold.
+    session_lru_cap: Option<usize>,
+    /// Session handshakes deriving packing keys at once.
     #[serde(default)]
-    max_sse_connections_per_peer: Option<usize>,
-    /// Mount one-query multi-shard fanout. Absent keeps the disabled default.
-    #[serde(default)]
-    enable_fanout: Option<bool>,
-    /// Maximum shard ids accepted by one fanout request.
-    #[serde(default)]
-    max_fanout_shards: Option<usize>,
+    max_concurrent_handshakes: Option<usize>,
     /// Layer 1 reorg-window cache sidecar; absent = ephemeral (rebuilt from RPC).
     #[serde(default)]
     reorg_window_path: Option<PathBuf>,
@@ -367,13 +364,11 @@ pub struct MultiServeOptions {
     pub metrics_public: Option<bool>,
     /// `HttpConfig.session_eviction_interval_secs` override; drives the per-instance ticker.
     pub session_eviction_interval_secs: Option<u64>,
-    /// `HttpConfig.enable_fanout` override; absent keeps fanout disabled.
-    pub enable_fanout: Option<bool>,
-    /// `HttpConfig.max_fanout_shards` override.
-    pub max_fanout_shards: Option<usize>,
+    /// `HttpConfig.respond_permit_wait_ms` override.
+    pub respond_permit_wait_ms: Option<u64>,
     /// Indexer Layer 1 reorg-window cache path; absent = ephemeral.
     pub reorg_window_path: Option<PathBuf>,
-    /// Session seats, session lifetime and event-stream bounds; absent keys keep the defaults.
+    /// Session seats, lifetime, bindings and handshake concurrency; absent keys keep the defaults.
     pub session_capacity: SessionCapacity,
 }
 
@@ -415,16 +410,16 @@ impl std::fmt::Debug for BootstrapInstanceView {
 }
 
 /// Operator bounds on what anonymous callers can hold: packing-key seats per instance, how
-/// long a seat lives, and concurrent `/v1/events` streams in total and per peer. The HTTP
-/// layer enforces the stream bounds; every store the serve path opens takes its limits from
-/// [`HttpConfig::session_store_limits`] of the same config, so the two cannot disagree.
+/// long a seat lives, the bindings that name them, and handshakes deriving at once. Every store
+/// the serve path opens takes its limits from [`HttpConfig::session_store_limits`] of the same
+/// config, so the HTTP layer and the stores cannot disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionCapacity {
     pub max_sessions_per_instance: usize,
     /// Refused above [`raven_railgun_http::config::DEFAULT_SESSION_TTL_SECS`].
     pub session_ttl_secs: u64,
-    pub max_sse_connections: usize,
-    pub max_sse_connections_per_peer: usize,
+    pub session_lru_cap: usize,
+    pub max_concurrent_handshakes: usize,
 }
 
 impl Default for SessionCapacity {
@@ -432,9 +427,9 @@ impl Default for SessionCapacity {
         Self {
             max_sessions_per_instance: raven_railgun_engine::session_pool::DEFAULT_MAX_SESSIONS,
             session_ttl_secs: raven_railgun_http::config::DEFAULT_SESSION_TTL_SECS,
-            max_sse_connections: raven_railgun_http::config::DEFAULT_MAX_SSE_CONNECTIONS,
-            max_sse_connections_per_peer:
-                raven_railgun_http::config::DEFAULT_MAX_SSE_CONNECTIONS_PER_PEER,
+            session_lru_cap: raven_railgun_http::config::DEFAULT_SESSION_LRU_CAP,
+            max_concurrent_handshakes:
+                raven_railgun_http::config::DEFAULT_MAX_CONCURRENT_HANDSHAKES,
         }
     }
 }
@@ -443,8 +438,8 @@ impl SessionCapacity {
     pub fn apply_to(&self, config: &mut HttpConfig) {
         config.max_sessions_per_instance = self.max_sessions_per_instance;
         config.session_ttl_secs = self.session_ttl_secs;
-        config.max_sse_connections = self.max_sse_connections;
-        config.max_sse_connections_per_peer = self.max_sse_connections_per_peer;
+        config.session_lru_cap = self.session_lru_cap;
+        config.max_concurrent_handshakes = self.max_concurrent_handshakes;
     }
 }
 
@@ -562,7 +557,17 @@ pub(crate) fn warn_on_record_size_override(
     );
 }
 
-const SCHEME_TAG_DEFAULT: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
+const SCHEME_TAG_DEFAULT: &str = raven_railgun_engine::persistence::SCHEME_TAG;
+
+/// Without the lock a second node, or a restart racing the old process, opens the same data_dir
+/// and both write it.
+fn warn_writer_lock_disabled(config: &Path) {
+    tracing::error!(
+        config = %config.display(),
+        "[global].use_flock = false: every data_dir opens without its writer lock, so nothing \
+         stops a second process from writing it at the same time. Remove the key to take the lock"
+    );
+}
 
 pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> {
     let body = std::fs::read_to_string(path)
@@ -582,6 +587,9 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
     let fallback_record_size = parsed.global.record_size.unwrap_or(16 * 32);
     let entries_per_shard = parsed.global.entries_per_shard.unwrap_or(2048);
     let use_flock = parsed.global.use_flock.unwrap_or(true);
+    if !use_flock {
+        warn_writer_lock_disabled(path);
+    }
     let channel_capacity = parsed.global.channel_capacity.unwrap_or(1024);
 
     let mut instances: Vec<InstanceConfig> = Vec::with_capacity(parsed.instance.len());
@@ -752,12 +760,10 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
                 .max_sessions_per_instance
                 .unwrap_or(defaults.max_sessions_per_instance),
             session_ttl_secs: global.session_ttl_secs.unwrap_or(defaults.session_ttl_secs),
-            max_sse_connections: global
-                .max_sse_connections
-                .unwrap_or(defaults.max_sse_connections),
-            max_sse_connections_per_peer: global
-                .max_sse_connections_per_peer
-                .unwrap_or(defaults.max_sse_connections_per_peer),
+            session_lru_cap: global.session_lru_cap.unwrap_or(defaults.session_lru_cap),
+            max_concurrent_handshakes: global
+                .max_concurrent_handshakes
+                .unwrap_or(defaults.max_concurrent_handshakes),
         }
     };
 
@@ -814,6 +820,7 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         mirror_endpoint: parsed.global.mirror_endpoint,
         mirror_backfill_interval_secs: parsed.global.mirror_backfill_interval_secs,
         max_concurrent_queries: parsed.global.max_concurrent_queries.unwrap_or(4),
+        respond_permit_wait_ms: parsed.global.respond_permit_wait_ms,
         respond_timeout_secs: parsed.global.respond_timeout_secs.unwrap_or(30),
         instances,
         skip_chain_workers: false,
@@ -834,8 +841,6 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         trusted_proxy_cidrs: parsed.global.trusted_proxy_cidrs,
         metrics_public: parsed.global.metrics_public,
         session_eviction_interval_secs: parsed.global.session_eviction_interval_secs,
-        enable_fanout: parsed.global.enable_fanout,
-        max_fanout_shards: parsed.global.max_fanout_shards,
         reorg_window_path: parsed.global.reorg_window_path,
         session_capacity,
     })
@@ -944,11 +949,8 @@ pub fn build_http_config(opts: &MultiServeOptions) -> HttpConfig {
     if let Some(secs) = opts.session_eviction_interval_secs {
         config.session_eviction_interval_secs = secs;
     }
-    if let Some(enable) = opts.enable_fanout {
-        config.enable_fanout = enable;
-    }
-    if let Some(max) = opts.max_fanout_shards {
-        config.max_fanout_shards = max;
+    if let Some(wait) = opts.respond_permit_wait_ms {
+        config.respond_permit_wait_ms = wait;
     }
     opts.session_capacity.apply_to(&mut config);
     config
@@ -1125,8 +1127,9 @@ async fn signal_shutdown() {
 const PARALLEL_FINAL_COMMITS: usize = 3;
 
 /// Time from the stop signal to exit, under Docker's default 10 s before it kills the process.
-/// A final commit still running when it is spent is abandoned: that instance's next boot
-/// recovers from its last snapshot and write-ahead log, as after a crash.
+/// A final commit still running when it is spent is abandoned, and the stop returns an error:
+/// that instance's next boot recovers from its last snapshot and write-ahead log, as after a
+/// crash.
 const STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Run `stops`, at most `parallel` at once, until `stop_by`; returns how many had not finished.
@@ -1524,21 +1527,24 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     };
 
     drop(bootstrap.handles.channels);
+    let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let final_commits: Vec<_> = bootstrap
         .handles
         .instances
         .into_iter()
-        .map(|handle| async move {
-            let _ = handle
-                .sender
-                .send(raven_railgun_engine::persistence::ConsumerEvent::Shutdown)
-                .await;
-            let _ = handle.consumer.await;
+        .map(|handle| {
+            let failed = Arc::clone(&failed);
+            async move {
+                let instance = handle.config.instance_id;
+                if !final_commit_landed(handle.sender, handle.consumer, &instance).await {
+                    failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
         })
         .collect();
-    let unfinished = run_stops_until(final_commits, PARALLEL_FINAL_COMMITS, stop_by).await;
+    let mut unfinished = run_stops_until(final_commits, PARALLEL_FINAL_COMMITS, stop_by).await;
     if unfinished > 0 {
-        tracing::warn!(
+        tracing::error!(
             unfinished,
             budget_secs = STOP_BUDGET.as_secs(),
             "stop budget spent before every final commit finished; each unfinished instance \
@@ -1566,29 +1572,31 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         let drained = auto_spawned.len();
         let stops: Vec<_> = auto_spawned
             .into_iter()
-            .map(|handle| async move {
-                let _ = handle
-                    .consumer_sender
-                    .send(raven_railgun_engine::persistence::ConsumerEvent::Shutdown)
+            .map(|handle| {
+                let failed = Arc::clone(&failed);
+                async move {
+                    let landed = final_commit_landed(
+                        handle.consumer_sender,
+                        handle.consumer_join,
+                        &handle.instance_id,
+                    )
                     .await;
-                if let Err(join_err) = handle.consumer_join.await {
-                    tracing::warn!(
-                        instance_id = %handle.instance_id,
-                        error = %join_err,
-                        "auto_spawn consumer join error on shutdown"
-                    );
+                    if !landed {
+                        failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             })
             .collect();
-        let unfinished = run_stops_until(stops, PARALLEL_FINAL_COMMITS, stop_by).await;
-        if unfinished > 0 {
-            tracing::warn!(
-                unfinished,
+        let spawned_unfinished = run_stops_until(stops, PARALLEL_FINAL_COMMITS, stop_by).await;
+        if spawned_unfinished > 0 {
+            tracing::error!(
+                unfinished = spawned_unfinished,
                 budget_secs = STOP_BUDGET.as_secs(),
                 "auto_spawn consumers did not exit within the stop budget; each recovers from \
                  its last snapshot and write-ahead log at the next boot"
             );
         }
+        unfinished = unfinished.saturating_add(spawned_unfinished);
         if drained > 0 {
             tracing::info!(drained, "auto_spawn: drained consumers on shutdown");
         }
@@ -1604,6 +1612,40 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
     }
     drop(mirror_workers);
 
+    stop_outcome(
+        unfinished,
+        failed.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Send `Shutdown` and wait for the consumer's final commit; `false` when it did not land.
+async fn final_commit_landed(
+    sender: tokio::sync::mpsc::Sender<raven_railgun_engine::persistence::ConsumerEvent>,
+    consumer: tokio::task::JoinHandle<raven_railgun_core::Result<()>>,
+    instance: &raven_railgun_core::InstanceId,
+) -> bool {
+    let _ = sender
+        .send(raven_railgun_engine::persistence::ConsumerEvent::Shutdown)
+        .await;
+    let error = match consumer.await {
+        Ok(Ok(())) => return true,
+        Ok(Err(error)) => error.to_string(),
+        Err(join) => join.to_string(),
+    };
+    tracing::error!(instance = instance.as_str(), %error, "final commit failed");
+    false
+}
+
+/// A stop that left any instance unpublished is an error, so the process exits non-zero.
+fn stop_outcome(unfinished: usize, failed: usize) -> anyhow::Result<()> {
+    if unfinished > 0 || failed > 0 {
+        anyhow::bail!(
+            "stop incomplete: {unfinished} final commit(s) outran the {} s stop budget and \
+             {failed} failed; each such instance recovers from its last snapshot and write-ahead \
+             log at the next boot",
+            STOP_BUDGET.as_secs()
+        );
+    }
     Ok(())
 }
 
@@ -3057,6 +3099,122 @@ data_source = { kind = "mirror", list_key = "00000000000000000000000000000000000
             opts.instances[1].data_source,
             DataSourceFilter::PpoiListBlock { block: 0, .. }
         ));
+    }
+
+    fn ppoi_only_config(extra_global: &str) -> String {
+        let key = "0000000000000000000000000000000000000000000000000000000000000001";
+        format!(
+            r#"
+[global]
+bind = "127.0.0.1:0"
+token = "test-token-padded-long-enough"
+chain_id = 1
+mirror_endpoint = "http://127.0.0.1:1"
+{extra_global}
+[[instance]]
+id = "ppoi-paths-0"
+role = "live"
+encoder = "per-list-path10"
+list_key = "{key}"
+data_dir = "/nonexistent/raven-ppoi"
+data_source = {{ kind = "mirror", list_key = "{key}", block = 0 }}
+"#
+        )
+    }
+
+    /// `HttpConfig::validate` tells an operator to raise these, so the config file must be
+    /// able to.
+    #[test]
+    fn every_session_and_permit_knob_is_settable_from_the_config_file() {
+        let f = write_temp_toml(&ppoi_only_config(
+            "max_sessions_per_instance = 7\nsession_lru_cap = 777\n\
+             max_concurrent_handshakes = 3\nrespond_permit_wait_ms = 1234\n",
+        ));
+        let config = build_http_config(&load_options_from_toml(f.path()).expect("load"));
+        assert_eq!(config.max_sessions_per_instance, 7);
+        assert_eq!(config.session_lru_cap, 777);
+        assert_eq!(config.max_concurrent_handshakes, 3);
+        assert_eq!(config.respond_permit_wait_ms, 1234);
+        config.validate().expect("the configured values validate");
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn errors_logged_while(load: impl FnOnce()) -> String {
+        let log = CapturedLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::ERROR)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, load);
+        let bytes = log.0.lock().clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[test]
+    fn a_disabled_writer_lock_is_logged_as_an_error_at_load() {
+        let off = write_temp_toml(&ppoi_only_config("use_flock = false\n"));
+        let logged = errors_logged_while(|| {
+            load_options_from_toml(off.path()).expect("load");
+        });
+        assert!(logged.contains("ERROR"), "{logged}");
+        assert!(logged.contains("use_flock = false"), "{logged}");
+
+        let on = write_temp_toml(&ppoi_only_config(""));
+        let logged = errors_logged_while(|| {
+            load_options_from_toml(on.path()).expect("load");
+        });
+        assert!(!logged.contains("use_flock"), "{logged}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::panic)]
+    async fn a_final_commit_that_did_not_land_is_reported() {
+        let instance = raven_railgun_core::InstanceId::new("stop-report");
+        let (landed, refused, panicked) = tokio::join!(
+            final_commit_landed(
+                tokio::sync::mpsc::channel(1).0,
+                tokio::spawn(async { Ok(()) }),
+                &instance,
+            ),
+            final_commit_landed(
+                tokio::sync::mpsc::channel(1).0,
+                tokio::spawn(async {
+                    Err(raven_railgun_core::AdapterError::Internal(
+                        "commit refused".to_owned(),
+                    ))
+                }),
+                &instance,
+            ),
+            final_commit_landed(
+                tokio::sync::mpsc::channel(1).0,
+                tokio::spawn(async { panic!("consumer panicked") }),
+                &instance,
+            ),
+        );
+        assert_eq!((landed, refused, panicked), (true, false, false));
+    }
+
+    #[test]
+    fn a_stop_that_left_an_instance_unpublished_is_an_error() {
+        stop_outcome(0, 0).expect("a complete stop");
+        for (unfinished, failed) in [(1, 0), (0, 1)] {
+            let error = stop_outcome(unfinished, failed).expect_err("an incomplete stop");
+            assert!(error.to_string().contains("stop incomplete"), "{error}");
+        }
     }
 
     /// A PPOI instance holds one block of its list. Neither a whole-list instance, a status

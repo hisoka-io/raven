@@ -21,7 +21,7 @@ use raven_railgun_engine::offline_packing_keys_cache::{
 
 const TEST_ENTRIES: usize = 256;
 const TEST_ENTRY_BYTES: usize = 32;
-const SCHEME_TAG: &[u8] = b"raven-inspire-twopacking-wp3-v1";
+const SCHEME_TAG: &[u8] = b"raven-inspire-twopacking-v1";
 const PACKING_PARAM_ID: &[u8] = b"InspireParams::secure_128_d2048";
 
 fn real_parts() -> &'static (PackParams, OfflinePackingKeys, bool) {

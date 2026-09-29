@@ -25,7 +25,7 @@ use raven_railgun_persistence::{Manifest, StoreLayout};
 const TREE: u32 = 0;
 const ENTRY_BYTES: usize = 32;
 const CELL_ROWS: usize = 65_536;
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1";
 const PRE_RESTART_BLOCK: u64 = 100;
 const POST_RESTART_BLOCK: u64 = 200;
 
@@ -89,7 +89,11 @@ async fn drain_one_and_run(registry: &Arc<SpawnRegistry>, event: ConsumerEvent) 
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("send shutdown");
-    handle.consumer_join.await.expect("consumer task joined");
+    handle
+        .consumer_join
+        .await
+        .expect("consumer task joined")
+        .expect("final commit");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

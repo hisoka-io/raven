@@ -23,7 +23,7 @@ use raven_railgun_engine::session_pool::{
     BoundedSessionStore, SessionStoreLimits, DEFAULT_MAX_SESSIONS,
 };
 use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
-use raven_railgun_http::{inspire_router, write_versioned, AppState, HttpConfig};
+use raven_railgun_http::{inspire_router, read_versioned, write_versioned, AppState, HttpConfig};
 use tower::ServiceExt;
 
 const READ_TOKEN: &str = "BEARER-POOL-EXHAUSTION-padded-min-ab";
@@ -266,4 +266,40 @@ async fn a_binding_lives_as_long_as_its_seat_not_the_http_lifetime() {
             .is_ok(),
         "the surviving seat must be the newest handshake"
     );
+}
+
+/// A re-handshake that fails must leave the caller the seat it already had: the old handle is
+/// released only once a new one is bound, not before the new keys are even read.
+#[tokio::test]
+async fn a_failed_re_handshake_leaves_the_working_seat_serving() {
+    let Fixture {
+        router,
+        instance,
+        victim_keys,
+        query,
+        ..
+    } = fixture_with(HttpConfig::demo(READ_TOKEN), None);
+    let (status, handle) = establish(&router, VICTIM_CLIENT, victim_keys.clone()).await;
+    assert_eq!(status, StatusCode::OK, "premise: the caller holds a seat");
+
+    let mut short: ClientPackingKeys = read_versioned(&victim_keys).expect("decode keys");
+    short.y_body.pop();
+    let (status, _) = establish(
+        &router,
+        VICTIM_CLIENT,
+        write_versioned(&short).expect("encode keys"),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "premise: keys missing a component cannot register"
+    );
+
+    assert_eq!(
+        query_status(&router, VICTIM_CLIENT, &query, handle).await,
+        StatusCode::OK,
+        "the failed re-handshake must not have released the seat that was serving"
+    );
+    assert_eq!(instance.current_state().session_store.len(), 1);
 }

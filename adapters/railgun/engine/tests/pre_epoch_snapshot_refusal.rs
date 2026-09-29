@@ -64,7 +64,7 @@ const SURPLUS_FINGERPRINT: &str = "bytes remaining after deserialization";
 
 /// The restored instance's own manifest fields, so the boot path validates the identity it
 /// actually shipped with rather than one invented here.
-const RECOVERED_SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
+const RECOVERED_SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1";
 const RECOVERED_INSTANCE_ID: &str = "ppoi-paths-ofac";
 const RECOVERED_MANIFEST_SCHEMA_VERSION: u32 = 5;
 const _: () = assert!(RECOVERED_MANIFEST_SCHEMA_VERSION < MANIFEST_SCHEMA_VERSION);

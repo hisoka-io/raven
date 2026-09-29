@@ -88,7 +88,7 @@ fn fresh_harness(tmp: &std::path::Path) -> PolicyHarness {
             .expect("build encoder");
         let opened = InspirePersistence::open(
             layout,
-            "raven-inspire-twopacking-inspiring-wp3-cache-session",
+            "raven-inspire-twopacking-inspiring-v1",
             InstanceId::new("commit-tree-0"),
             SnapshotPolicy::default(),
             encoder,
@@ -132,7 +132,7 @@ fn toy_runtime(tmp: &std::path::Path) -> AutoSpawnRuntime {
             .to_string_lossy()
             .into_owned(),
         encoder: "per-leaf-bc".to_owned(),
-        scheme_tag: "raven-inspire-twopacking-inspiring-wp3-cache-session".to_owned(),
+        scheme_tag: "raven-inspire-twopacking-inspiring-v1".to_owned(),
         entries: AUTO_SPAWN_CELL_ROWS,
         entry_bytes: TOY_ENTRY_BYTES,
         channel_capacity: 64,
@@ -468,7 +468,7 @@ max_instance_count = 8
 [[instance_template]]
 template_id = "commit-tree-template"
 encoder = "per-node"
-scheme_tag = "raven-inspire-twopacking-inspiring-wp3-cache-session"
+scheme_tag = "raven-inspire-twopacking-inspiring-v1"
 data_dir_template = "/var/lib/raven-railgun/commit-tree-{tree_number}"
 k_concurrency = 16
 max_instance_count = 5
@@ -529,7 +529,7 @@ max_instance_count = 7
 enabled = true
 data_dir_template = "/var/lib/raven-railgun/commit-tree-{tree_number}"
 encoder = "per-node"
-scheme_tag = "raven-inspire-twopacking-inspiring-wp3-cache-session"
+scheme_tag = "raven-inspire-twopacking-inspiring-v1"
 entries = 65536
 entry_bytes = 512
 cooldown_seconds = 15

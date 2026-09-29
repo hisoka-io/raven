@@ -23,7 +23,7 @@ use raven_railgun_engine::persistence::{InspirePersistence, SnapshotPolicy};
 use raven_railgun_engine::pir_table::{PerLeafCommitmentEncoder, PirTableEncoder};
 use raven_railgun_persistence::StoreLayout;
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-test";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-test";
 
 fn test_encoder() -> Arc<dyn PirTableEncoder> {
     Arc::new(PerLeafCommitmentEncoder::new(512, 2048, 0).expect("test encoder"))

@@ -27,7 +27,7 @@ use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
 use raven_railgun_persistence::{Snapshot, StoreLayout, WalEntryPayload, SNAPSHOT_MAGIC};
 use raven_railgun_testkit::canonical;
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-concurrent-commit";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-concurrent-commit";
 const TOY_ENTRY_SIZE: usize = 32;
 const ENTRIES_PER_SHARD: u32 = 2048;
 

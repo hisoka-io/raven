@@ -100,12 +100,8 @@ impl SessionMap {
         Some(entry.handle)
     }
 
-    /// Stop serving `key`, returning the handle it was bound to.
-    pub(crate) fn take(&self, key: &SessionKey) -> Option<ServerSessionHandle> {
-        self.inner.lock().remove(key).map(|entry| entry.handle)
-    }
-
-    /// Insert or refresh a session, reclaiming expired entries to make room.
+    /// Insert or refresh a session, reclaiming expired entries to make room. Returns the
+    /// handle `key` was bound to before, which the caller must release.
     ///
     /// A caller that already owns `key` always keeps it. A new key is refused once the
     /// map is full of other callers' live entries: an establish carries no credential,
@@ -117,7 +113,7 @@ impl SessionMap {
         expires_at: Instant,
         cap: usize,
         now: Instant,
-    ) -> EvictionOutcome {
+    ) -> (EvictionOutcome, Option<ServerSessionHandle>) {
         let mut guard = self.inner.lock();
         let mut outcome = EvictionOutcome::None;
         if guard.len() >= cap && !guard.contains_key(&key) {
@@ -127,11 +123,13 @@ impl SessionMap {
                 outcome = EvictionOutcome::ExpiredOnly;
             }
             if guard.len() >= cap {
-                return EvictionOutcome::AtCapacity;
+                return (EvictionOutcome::AtCapacity, None);
             }
         }
-        guard.insert(key, SessionEntry { handle, expires_at });
-        outcome
+        let replaced = guard
+            .insert(key, SessionEntry { handle, expires_at })
+            .map(|entry| entry.handle);
+        (outcome, replaced)
     }
 
     pub(crate) fn len(&self) -> usize {

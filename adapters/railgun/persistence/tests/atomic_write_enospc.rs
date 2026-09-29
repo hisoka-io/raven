@@ -21,7 +21,7 @@ use raven_railgun_persistence::{
 fn sample_manifest() -> Manifest {
     Manifest {
         schema_version: MANIFEST_SCHEMA_VERSION,
-        scheme_tag: "raven-inspire-twopacking-inspiring-wp3".to_owned(),
+        scheme_tag: "raven-inspire-twopacking-inspiring-v1".to_owned(),
         instance_id: "atomic-write-enospc-test".to_owned(),
         current_snapshot_id: SnapshotId(7),
         current_snapshot_seq: 42,

@@ -43,7 +43,7 @@ const AUTO_SPAWN_CELL_ROWS: usize = 65_536;
 /// shape, so they timed out as soon as spawning started working. This is a hang-breaker, not an
 /// SLO: it must be generous enough that a slow runner does not red a correct run.
 const SPAWN_BUDGET_PER_TREE: Duration = Duration::from_secs(45);
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1";
 
 struct TestHarness {
     engine: Arc<Engine<RavenInspireScheme>>,

@@ -10,10 +10,6 @@ use crate::trusted_proxy::{resolve_declared_ranges, IpCidr};
 /// Sanity ceiling for [`HttpConfig::max_body_bytes`]; rejected at validate time.
 pub(crate) const HTTP_MAX_BODY_CEILING: usize = 64 * 1024 * 1024;
 
-/// Sanity ceiling for [`HttpConfig::max_fanout_shards`]; the only bound on request
-/// amplification, since one request costs k respond operations.
-pub(crate) const HTTP_MAX_FANOUT_CEILING: usize = 128;
-
 /// Default [`HttpConfig::respond_permit_wait_ms`]: this wait plus the default 30 s respond
 /// timeout stays inside a wallet's 60 s request deadline.
 pub const DEFAULT_RESPOND_PERMIT_WAIT_MS: u64 = 20_000;
@@ -21,6 +17,9 @@ pub const DEFAULT_RESPOND_PERMIT_WAIT_MS: u64 = 20_000;
 /// Ceiling for [`HttpConfig::respond_permit_wait_ms`]: past a wallet's 60 s request deadline a
 /// queued query is answered to nobody.
 pub(crate) const HTTP_MAX_RESPOND_PERMIT_WAIT_MS: u64 = 60_000;
+
+/// Default [`HttpConfig::session_lru_cap`]: every seat of the default pool on 156 instances.
+pub const DEFAULT_SESSION_LRU_CAP: usize = 10_000;
 
 /// Default and ceiling session lifetime in seconds; also the default eviction cadence.
 pub const DEFAULT_SESSION_TTL_SECS: u64 =
@@ -42,24 +41,17 @@ pub struct HttpConfig {
     /// Max concurrent in-flight respond operations. K=4 default.
     pub max_concurrent_queries: usize,
     /// Longest a query waits for one of the [`HttpConfig::max_concurrent_queries`] respond
-    /// permits, in milliseconds, before it is answered 503. Applies to a single query and to
-    /// each `/batch` slot. It bounds the queue without a per-peer cap, which would lock out
-    /// every client sharing one exit address. Default [`DEFAULT_RESPOND_PERMIT_WAIT_MS`].
+    /// permits, in milliseconds, before it is answered 503. Applies to a single query, to each
+    /// `/batch` slot, and to a session handshake's wait for a derivation permit. It bounds the
+    /// queue without a per-peer cap, which would lock out every client sharing one exit address.
+    /// Default [`DEFAULT_RESPOND_PERMIT_WAIT_MS`].
     #[serde(default = "default_respond_permit_wait_ms")]
     pub respond_permit_wait_ms: u64,
-    /// Max concurrent `/v1/events` SSE streams. Each one holds a task, two timers and an
-    /// `AppState` clone for as long as the client stays connected, and the route carries no
-    /// credential, so a rate limit on new connections does not bound what is HELD. This does.
-    ///
-    /// Defaulted for serde because this struct derives `Deserialize` and adding a REQUIRED
-    /// field would make every previously valid serialized config fail to load -- a break that
-    /// shows up at an operator's boot, not at ours.
-    #[serde(default = "default_max_sse_connections")]
-    pub max_sse_connections: usize,
-    /// Streams one peer may hold out of [`HttpConfig::max_sse_connections`], keyed like the
-    /// rate limiter. Without it one peer holds every stream and each wallet's retry loop starves.
-    #[serde(default = "default_max_sse_connections_per_peer")]
-    pub max_sse_connections_per_peer: usize,
+    /// Session handshakes deriving packing keys at once, each on a blocking thread. A handshake
+    /// waits at most [`HttpConfig::respond_permit_wait_ms`] for one and is then answered 503,
+    /// so a flood of them queues here rather than on the threads that serve every route.
+    #[serde(default = "default_max_concurrent_handshakes")]
+    pub max_concurrent_handshakes: usize,
     /// Session lifetime in seconds for a packing-key seat and its handle; see
     /// [`HttpConfig::session_store_limits`]. At most [`DEFAULT_SESSION_TTL_SECS`], because one
     /// handle links every query made under it.
@@ -74,8 +66,9 @@ pub struct HttpConfig {
     pub max_sessions_per_instance: usize,
     /// Identifier surfaced in the `X-Raven-Scheme` response header.
     pub scheme_name: String,
-    /// Per-query response timeout. A timed-out respond keeps its permit until the detached work
-    /// ends, since `spawn_blocking` cannot be cancelled.
+    /// Per-query response timeout, also the bound on one handshake's key derivation. A timed-out
+    /// respond or derivation keeps its permit until the detached work ends, since
+    /// `spawn_blocking` cannot be cancelled.
     pub respond_timeout_secs: u64,
     /// Requires a non-empty [`HttpConfig::trusted_proxy_cidrs`]; validated as a pair.
     pub trust_proxy_header: bool,
@@ -92,35 +85,18 @@ pub struct HttpConfig {
     /// Periodic heartbeat session-eviction interval (seconds). `0` disables.
     #[serde(default = "default_session_eviction_interval_secs")]
     pub session_eviction_interval_secs: u64,
-    /// Max shard ids accepted per `POST /v1/instance/{id}/fanout` request.
-    #[serde(default = "default_max_fanout_shards")]
-    pub max_fanout_shards: usize,
-    /// Mount `POST /v1/instance/{id}/fanout`. Off by default: the route has no
-    /// batch-size ladder, so `shard_ids.len()` travels in the clear, and it clones
-    /// the query per shard, so peak memory is `k x body`. Enable only with a cover
-    /// strategy that fixes the group size.
-    #[serde(default)]
-    pub enable_fanout: bool,
 }
 
 fn default_session_eviction_interval_secs() -> u64 {
     DEFAULT_SESSION_TTL_SECS
 }
 
-/// Default [`HttpConfig::max_sse_connections`]: generous for a status stream a handful of
-/// dashboards watch, and finite, which is the point.
-pub const DEFAULT_MAX_SSE_CONNECTIONS: usize = 64;
+/// Default [`HttpConfig::max_concurrent_handshakes`]. Derivations on one instance serialize on
+/// its session store, so more mostly adds waiting threads.
+pub const DEFAULT_MAX_CONCURRENT_HANDSHAKES: usize = 2;
 
-/// Default [`HttpConfig::max_sse_connections_per_peer`]: a quarter of the global default, so a
-/// shared NAT keeps room and one host needs four addresses to hold every stream.
-pub const DEFAULT_MAX_SSE_CONNECTIONS_PER_PEER: usize = 16;
-
-const fn default_max_sse_connections() -> usize {
-    DEFAULT_MAX_SSE_CONNECTIONS
-}
-
-const fn default_max_sse_connections_per_peer() -> usize {
-    DEFAULT_MAX_SSE_CONNECTIONS_PER_PEER
+const fn default_max_concurrent_handshakes() -> usize {
+    DEFAULT_MAX_CONCURRENT_HANDSHAKES
 }
 
 const fn default_respond_permit_wait_ms() -> u64 {
@@ -129,10 +105,6 @@ const fn default_respond_permit_wait_ms() -> u64 {
 
 const fn default_max_sessions_per_instance() -> usize {
     DEFAULT_MAX_SESSIONS
-}
-
-fn default_max_fanout_shards() -> usize {
-    16
 }
 
 impl HttpConfig {
@@ -148,10 +120,9 @@ impl HttpConfig {
             rate_limit_burst: 400,
             max_concurrent_queries: 4,
             respond_permit_wait_ms: default_respond_permit_wait_ms(),
-            max_sse_connections: default_max_sse_connections(),
-            max_sse_connections_per_peer: default_max_sse_connections_per_peer(),
+            max_concurrent_handshakes: default_max_concurrent_handshakes(),
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
-            session_lru_cap: 10_000,
+            session_lru_cap: DEFAULT_SESSION_LRU_CAP,
             max_sessions_per_instance: default_max_sessions_per_instance(),
             scheme_name: "raven-inspire".to_owned(),
             respond_timeout_secs: 30,
@@ -160,8 +131,6 @@ impl HttpConfig {
             cors_allowed_origins: Vec::new(),
             metrics_public: false,
             session_eviction_interval_secs: DEFAULT_SESSION_TTL_SECS,
-            enable_fanout: false,
-            max_fanout_shards: default_max_fanout_shards(),
         }
     }
 
@@ -187,16 +156,9 @@ impl HttpConfig {
                 return Err("cors_allowed_origins entry must not be empty".to_owned());
             }
         }
-        if self.max_sse_connections == 0 {
+        if self.max_concurrent_handshakes == 0 {
             return Err(
-                "max_sse_connections must be > 0; use a firewall to close /v1/events entirely"
-                    .to_owned(),
-            );
-        }
-        if self.max_sse_connections_per_peer == 0 {
-            return Err(
-                "max_sse_connections_per_peer must be > 0; use a firewall to close /v1/events \
-                 entirely"
+                "max_concurrent_handshakes must be > 0; every session handshake would be refused"
                     .to_owned(),
             );
         }
@@ -209,15 +171,6 @@ impl HttpConfig {
             return Err(format!(
                 "max_body_bytes too large: {} bytes (sanity ceiling {} bytes)",
                 self.max_body_bytes, HTTP_MAX_BODY_CEILING
-            ));
-        }
-        if self.max_fanout_shards == 0 {
-            return Err("max_fanout_shards must be > 0".to_owned());
-        }
-        if self.max_fanout_shards > HTTP_MAX_FANOUT_CEILING {
-            return Err(format!(
-                "max_fanout_shards too large: {} (sanity ceiling {})",
-                self.max_fanout_shards, HTTP_MAX_FANOUT_CEILING
             ));
         }
         self.resolve_trusted_proxy_ranges()?;
@@ -364,34 +317,14 @@ mod tests {
         assert!(err.contains("10.0.0.1/8"), "{err}");
     }
 
-    /// Adding a required field to a `Deserialize` struct breaks every previously valid
-    /// serialized config, and it breaks it at an operator's boot rather than at our build.
-    /// This pins that the new cap is optional and lands on its documented value.
     #[test]
-    fn a_config_serialized_before_the_sse_cap_existed_still_loads() {
+    fn a_config_serialized_before_session_sizing_and_the_handshake_cap_still_loads() {
         let mut value = serde_json::to_value(config())
             .expect("a config serializes")
             .as_object()
             .cloned()
             .expect("an object");
-        assert!(
-            value.remove("max_sse_connections").is_some(),
-            "the field must be present before removing it proves anything"
-        );
-        let restored: HttpConfig = serde_json::from_value(serde_json::Value::Object(value))
-            .expect("loads without the cap");
-        assert_eq!(restored.max_sse_connections, default_max_sse_connections());
-        restored.validate().expect("and the default validates");
-    }
-
-    #[test]
-    fn a_config_serialized_before_session_sizing_and_the_peer_cap_still_loads() {
-        let mut value = serde_json::to_value(config())
-            .expect("a config serializes")
-            .as_object()
-            .cloned()
-            .expect("an object");
-        for field in ["max_sessions_per_instance", "max_sse_connections_per_peer"] {
+        for field in ["max_sessions_per_instance", "max_concurrent_handshakes"] {
             assert!(
                 value.remove(field).is_some(),
                 "{field} must be present first"
@@ -401,8 +334,8 @@ mod tests {
             .expect("loads without either field");
         assert_eq!(restored.max_sessions_per_instance, DEFAULT_MAX_SESSIONS);
         assert_eq!(
-            restored.max_sse_connections_per_peer,
-            default_max_sse_connections_per_peer()
+            restored.max_concurrent_handshakes,
+            DEFAULT_MAX_CONCURRENT_HANDSHAKES
         );
         restored.validate().expect("and the defaults validate");
     }
@@ -429,7 +362,7 @@ mod tests {
         cfg.session_ttl_secs = DEFAULT_SESSION_TTL_SECS;
         cfg.max_sessions_per_instance = 1;
         cfg.session_lru_cap = 1;
-        cfg.max_sse_connections_per_peer = 1;
+        cfg.max_concurrent_handshakes = 1;
         cfg.validate()
             .expect("the ceiling itself and one seat are legal");
         cfg.session_ttl_secs = 1;
@@ -450,8 +383,8 @@ mod tests {
             ("session_lru_cap", |c| {
                 c.session_lru_cap = c.max_sessions_per_instance - 1;
             }),
-            ("max_sse_connections_per_peer", |c| {
-                c.max_sse_connections_per_peer = 0;
+            ("max_concurrent_handshakes", |c| {
+                c.max_concurrent_handshakes = 0;
             }),
         ];
         for (field, break_config) in cases {
@@ -460,15 +393,6 @@ mod tests {
             let err = cfg.validate().expect_err(field);
             assert!(err.contains(field), "{field}: {err}");
         }
-    }
-
-    /// Zero is not "unlimited" here, and reading it that way is the mistake this refuses.
-    #[test]
-    fn a_zero_sse_cap_is_refused_rather_than_read_as_unlimited() {
-        let mut cfg = config();
-        cfg.max_sse_connections = 0;
-        let err = cfg.validate().expect_err("zero is refused");
-        assert!(err.contains("max_sse_connections"), "{err}");
     }
 
     /// `read_token` opens `/metrics` and nothing else, so a public `/metrics` needs none.

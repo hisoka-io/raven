@@ -48,11 +48,9 @@ pub struct AppState<S: PirScheme> {
     pub(crate) rpc_pool: Arc<Option<Arc<raven_railgun_indexer::rpc_pool::RpcEndpointPool>>>,
     pub(crate) sessions: Arc<SessionMap>,
     pub(crate) semaphore: Arc<Semaphore>,
-    /// Concurrent `/v1/events` streams. Separate from `semaphore` on purpose: a respond permit
-    /// is held for milliseconds, an SSE permit for as long as a client stays connected, so one
-    /// pool would let idle watchers starve the query path.
-    pub(crate) sse_permits: Arc<Semaphore>,
-    pub(crate) sse_peers: Arc<crate::events::SsePeerStreams>,
+    /// Session-handshake derivations. Separate from `semaphore` so a handshake flood waits here
+    /// instead of taking the permits queries respond under.
+    pub(crate) handshake_permits: Arc<Semaphore>,
     pub(crate) metrics_handle: Arc<metrics_exporter_prometheus::PrometheusHandle>,
     /// Instance-labelled `/metrics` gauges; empty falls back to `consumer_metrics`.
     pub(crate) instance_metrics: Arc<HashMap<InstanceId, Arc<parking_lot::Mutex<ConsumerMetrics>>>>,
@@ -99,8 +97,7 @@ impl<S: PirScheme> Clone for AppState<S> {
             rpc_pool: Arc::clone(&self.rpc_pool),
             sessions: Arc::clone(&self.sessions),
             semaphore: Arc::clone(&self.semaphore),
-            sse_permits: Arc::clone(&self.sse_permits),
-            sse_peers: Arc::clone(&self.sse_peers),
+            handshake_permits: Arc::clone(&self.handshake_permits),
             metrics_handle: Arc::clone(&self.metrics_handle),
             instance_metrics: Arc::clone(&self.instance_metrics),
             consumer_metrics_required: self.consumer_metrics_required,
@@ -132,13 +129,7 @@ impl<S: PirScheme> AppState<S> {
         let scheme_name = Arc::new(config.scheme_name.clone());
         let max_concurrent = config.max_concurrent_queries.max(1);
         let semaphore = Arc::new(Semaphore::new(max_concurrent));
-        let sse_permits = Arc::new(Semaphore::new(config.max_sse_connections.max(1)));
-        let sse_peers = Arc::new(crate::events::SsePeerStreams::new(
-            crate::trusted_proxy::TrustedProxyIpKeyExtractor::new(
-                config.resolve_trusted_proxy_ranges()?.into(),
-            ),
-            config.max_sse_connections_per_peer,
-        ));
+        let handshake_permits = Arc::new(Semaphore::new(config.max_concurrent_handshakes.max(1)));
         let sessions = Arc::new(SessionMap::new());
 
         let metrics_handle = global_prometheus_handle()?;
@@ -157,8 +148,7 @@ impl<S: PirScheme> AppState<S> {
             rpc_pool: Arc::new(None),
             sessions,
             semaphore,
-            sse_permits,
-            sse_peers,
+            handshake_permits,
             metrics_handle,
             instance_metrics: Arc::new(HashMap::new()),
             consumer_metrics_required: false,
@@ -324,9 +314,17 @@ impl AppState<raven_railgun_engine::inspire::RavenInspireScheme> {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                let now = Instant::now();
-                for instance in engine.instances() {
-                    instance.current_state().session_store.sweep_expired(now);
+                let engine = Arc::clone(&engine);
+                // A sweep takes the store's write lock, which a derivation in progress holds.
+                let swept = tokio::task::spawn_blocking(move || {
+                    let now = Instant::now();
+                    for instance in engine.instances() {
+                        instance.current_state().session_store.sweep_expired(now);
+                    }
+                })
+                .await;
+                if let Err(join) = swept {
+                    tracing::error!(%join, "packing-key sweep failed");
                 }
             }
         })
@@ -349,7 +347,7 @@ pub(crate) fn describe_prometheus_metrics() {
 fn register_prometheus_descriptions() {
     metrics::describe_counter!(
         "raven_railgun_queries_total",
-        "Total PIR queries served, labelled by instance + kind (single|batch|fanout)"
+        "Total PIR queries served, labelled by instance + kind (single|batch)"
     );
     metrics::describe_counter!(
         "raven_railgun_auth_ok_total",
@@ -362,10 +360,6 @@ fn register_prometheus_descriptions() {
     metrics::describe_histogram!(
         "raven_railgun_batch_size",
         "PIR batch size (queries per batch), labelled by instance"
-    );
-    metrics::describe_histogram!(
-        "raven_railgun_fanout_shards",
-        "Fan-out width (shards served per uploaded query), labelled by instance"
     );
     metrics::describe_gauge!(
         "raven_railgun_uptime_seconds",
@@ -476,9 +470,10 @@ fn register_prometheus_descriptions() {
     );
     metrics::describe_counter!(
         "raven_railgun_session_establish_refused_total",
-        "Lifetime count of session handshakes refused because every seat was held by a \
-         live session, labelled by instance + `reason` (pool = packing-key store, \
-         binding = sticky-session map)"
+        "Lifetime count of session handshakes refused, labelled by instance + `reason` \
+         (pool = every packing-key seat held by a live session, binding = sticky-session map \
+         full, busy = no derivation permit within the permit wait, timeout = derivation \
+         outran the respond timeout)"
     );
     metrics::describe_counter!(
         "raven_railgun_session_eviction_swaps_total",

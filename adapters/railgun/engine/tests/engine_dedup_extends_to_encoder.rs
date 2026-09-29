@@ -23,7 +23,7 @@ use raven_railgun_engine::pir_table::EncoderKind;
 use raven_railgun_engine::InstanceRole;
 use raven_railgun_persistence::{PpoiEventType, WalEntryPayload};
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-dedup-encoder-test";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-dedup-encoder-test";
 const TOY_ENTRY_SIZE: usize = 256;
 const TOY_ENTRIES_PER_SHARD: u32 = 2048;
 

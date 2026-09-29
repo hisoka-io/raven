@@ -27,6 +27,12 @@ fn ensure_metrics_described() {
          was active."
     );
     metrics::counter!("raven_railgun_wal_replay_skipped_total").increment(0);
+    metrics::describe_counter!(
+        "raven_railgun_retention_failures_total",
+        metrics::Unit::Count,
+        "Commits whose snapshot was published but whose retention pass failed, labelled by \
+         instance. Each one leaves superseded snapshots and archived WAL on disk."
+    );
 }
 
 /// Snapshot cadence and retention config.
@@ -92,6 +98,10 @@ struct SnapshotCounters {
     appends_since_snapshot: usize,
     last_snapshot_at: Instant,
 }
+
+/// Scheme tag this build writes into every manifest and requires on reopen: the InsPIRe
+/// two-packing variant with InspiRING packing, at version 1 of its persisted layout.
+pub const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1";
 
 /// Per-instance persistence state. Created via [`InspirePersistence::open`].
 pub struct InspirePersistence {
@@ -226,6 +236,21 @@ impl InspirePersistence {
     }
 }
 
+/// The tag is compared, never interpreted: a mismatch says only that the operator must choose.
+fn scheme_tag_mismatch(
+    root: &std::path::Path,
+    stored: &str,
+    configured: &str,
+) -> raven_railgun_persistence::PersistenceError {
+    raven_railgun_persistence::PersistenceError::Invariant(format!(
+        "data_dir {} was written under scheme tag {stored:?}, and this instance is configured \
+         with {configured:?}. If {stored:?} names the same on-disk layout, set this instance's \
+         scheme_tag to {stored:?}; otherwise move that data_dir aside and start on an empty \
+         one, which the node rebuilds from its source",
+        root.display()
+    ))
+}
+
 /// Store-root file whose presence re-marks an instance divergent on open. A
 /// restart is not evidence that the tree was repaired.
 const LAYER2_DIVERGENT_MARKER: &str = "layer2-divergent";
@@ -323,6 +348,13 @@ impl InspirePersistence {
         let encoder_label = encoder.label();
         let configured_shape = encoder_manifest_shape(encoder.as_ref());
         let recovered = open_recovery(&layout, SNAPSHOT_MAGIC, |manifest| {
+            if manifest.scheme_tag != scheme_tag {
+                return Err(scheme_tag_mismatch(
+                    layout.root(),
+                    &manifest.scheme_tag,
+                    &scheme_tag,
+                ));
+            }
             manifest.validate_identity(&scheme_tag, instance_id.as_str(), encoder_label)?;
             if manifest.cell_shape()?.is_some() {
                 manifest.validate_shape(configured_shape)?;
@@ -661,10 +693,11 @@ impl InspirePersistence {
         drop(m);
         let retention = self.policy.read().retention;
         if let Err(error) = apply_retention(&self.layout, next_id, retention) {
-            tracing::warn!(
+            record_retention_failure(self.instance_id.as_str());
+            tracing::error!(
                 snapshot_id = next_id.0,
                 error = %error,
-                "snapshot committed, but retention housekeeping failed"
+                "snapshot committed, but retention failed; superseded snapshots stay on disk"
             );
         }
 
@@ -786,6 +819,16 @@ impl InspirePersistence {
     #[must_use]
     pub fn manifest_block_height(&self) -> u64 {
         self.manifest.lock().current_marker
+    }
+
+    /// Whether a commit at `marker` would publish nothing a reopen does not already recover: a
+    /// snapshot exists, no WAL entry was appended after it, and its resume marker is `marker`.
+    #[must_use]
+    pub fn unchanged_since_commit(&self, marker: u64) -> bool {
+        let manifest = self.manifest.lock();
+        manifest.current_snapshot_id != SnapshotId(0)
+            && manifest.current_snapshot_seq == self.wal.next_seq()
+            && manifest.current_marker == marker
     }
 
     /// Append a `Reorg` WAL marker. Returns the assigned WAL seq.
@@ -1338,6 +1381,34 @@ pub fn clear_wal_replay_skipped(instance_id: &str) {
     WAL_REPLAY_SKIPPED.lock().remove(instance_id);
 }
 
+/// Per instance, commits whose retention pass failed since process start. Process-wide so
+/// `/v1/health/ready` can report it without a handle on each instance's persistence.
+static RETENTION_FAILURES: Mutex<std::collections::BTreeMap<String, u64>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Retention failures per instance id since process start; instances without one are absent.
+///
+/// ```
+/// # use raven_railgun_engine::persistence::retention_failures;
+/// assert!(retention_failures().is_empty(), "nothing has committed in this process");
+/// ```
+#[must_use]
+pub fn retention_failures() -> std::collections::BTreeMap<String, u64> {
+    RETENTION_FAILURES.lock().clone()
+}
+
+fn record_retention_failure(instance_id: &str) {
+    let mut failures = RETENTION_FAILURES.lock();
+    let count = failures.entry(instance_id.to_owned()).or_insert(0);
+    *count = count.saturating_add(1);
+    drop(failures);
+    metrics::counter!(
+        "raven_railgun_retention_failures_total",
+        "instance" => instance_id.to_owned()
+    )
+    .increment(1);
+}
+
 fn ensure_layer2_metrics_described() {
     metrics::describe_counter!(
         "raven_railgun_layer2_in_sync_total",
@@ -1694,6 +1765,21 @@ pub async fn run_consumer_task(
                     let m = metrics.lock();
                     m.last_applied_leaf_block
                 };
+                // A snapshot of an unchanged cell rewrites the whole database for nothing.
+                if logical_store.lock().dirty_shards().is_empty()
+                    && persistence.unchanged_since_commit(final_height)
+                {
+                    if let Err(error) =
+                        persistence.persist_cache_if_changed(instance.current_state().as_ref())
+                    {
+                        tracing::warn!(%error, "offline packing cache store failed at stop");
+                    }
+                    tracing::info!(
+                        final_height,
+                        "nothing applied since the last commit; stopping"
+                    );
+                    return Ok(());
+                }
                 if let Err(e) = drive_commit(
                     &instance,
                     &persistence,
@@ -1703,15 +1789,14 @@ pub async fn run_consumer_task(
                     final_height,
                     &metrics,
                 ) {
-                    tracing::warn!(
+                    tracing::error!(
                         error = %e,
-                        "final drive_commit on Shutdown failed; \
-                         persistence-side fsync still protects committed events"
+                        "final commit on stop failed; the next boot recovers from the last \
+                         snapshot and write-ahead log"
                     );
-                } else {
-                    tracing::info!(final_height, "consumer drained final commit on Shutdown");
+                    return Err(e);
                 }
-                tracing::info!("consumer received Shutdown");
+                tracing::info!(final_height, "consumer drained final commit on Shutdown");
                 return Ok(());
             }
         };
@@ -2392,7 +2477,7 @@ mod tests {
     use raven_inspire::params::{InspireParams, InspireVariant};
     use raven_railgun_core::InstanceId;
 
-    const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-test";
+    const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1-test";
     /// Shared by [`test_encoder`] and [`build_toy_state`]; divergence is a
     /// cell-shape mismatch the open/commit guards refuse.
     const TOY_ENTRY_SIZE: usize = 256;
@@ -2587,6 +2672,92 @@ mod tests {
             "and it must NOT clear the stall /health/ready gates on: leaf application is \
              still wedged, and a nullifier says nothing about that"
         );
+    }
+
+    /// A committed toy instance and its consumer, stopped with `before_stop` run first.
+    async fn stop_committed_consumer(
+        label: &str,
+        before_stop: impl FnOnce(&InspirePersistence),
+    ) -> (Result<()>, SnapshotId, SnapshotId) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_toy_state().expect("toy state");
+        let layout = StoreLayout::open(dir.path()).expect("layout");
+        let opened = InspirePersistence::open(
+            layout,
+            SCHEME_TAG,
+            InstanceId::new(label),
+            SnapshotPolicy::default(),
+            test_encoder(),
+        )
+        .expect("open");
+        let persistence = Arc::new(opened.persistence);
+        let store = super::super::inspire::LogicalLeafStore::new();
+        persistence
+            .commit_v6(&state, &store, 0)
+            .expect("initial commit");
+        let committed = persistence.current_snapshot_id();
+        let instance = Arc::new(PirInstance::<RavenInspireScheme>::new(
+            InstanceId::new(label),
+            crate::InstanceRole::Live,
+            state,
+        ));
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(run_consumer_task(
+            instance,
+            Arc::clone(&persistence),
+            Arc::new(parking_lot::Mutex::new(store)),
+            Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default())),
+            InspireParams::secure_128_d2048(),
+            test_encoder(),
+            rx,
+            None,
+        ));
+        before_stop(&persistence);
+        tx.send(ConsumerEvent::Shutdown)
+            .await
+            .expect("send shutdown");
+        let outcome = task.await.expect("join");
+        (outcome, committed, persistence.current_snapshot_id())
+    }
+
+    /// Nothing was applied since the last commit, so the stop has nothing to publish: a
+    /// snapshot here rewrites the whole encoded database, per instance, inside the stop budget.
+    #[tokio::test]
+    async fn an_idle_stop_writes_no_commit() {
+        let (outcome, committed, after) = stop_committed_consumer("idle-stop", |_| {}).await;
+        outcome.expect("an idle stop succeeds");
+        assert_eq!(after, committed, "an idle stop published a snapshot");
+    }
+
+    #[tokio::test]
+    async fn a_stop_after_a_wal_append_still_commits() {
+        let (outcome, committed, after) = stop_committed_consumer("appended-stop", |persistence| {
+            persistence.signal_reorg(0).expect("append a WAL entry");
+        })
+        .await;
+        outcome.expect("the final commit succeeds");
+        assert_eq!(
+            after,
+            committed.next(),
+            "the appended entry was not committed"
+        );
+    }
+
+    /// A final commit that fails is the consumer's error, so the stop can report it rather
+    /// than exit as if the state were published.
+    #[tokio::test]
+    async fn a_failed_final_commit_is_the_consumers_error() {
+        let (outcome, committed, after) = stop_committed_consumer("failed-stop", |persistence| {
+            persistence.signal_reorg(0).expect("append a WAL entry");
+            // A published store longer than the one held: the commit guard refuses it.
+            persistence
+                .committed_leaf_count
+                .store(1, std::sync::atomic::Ordering::Release);
+        })
+        .await;
+        let error = outcome.expect_err("the refused final commit must surface");
+        assert!(error.to_string().contains("commit refused"), "{error}");
+        assert_eq!(after, committed);
     }
 
     /// Harness for the routing tests: a live consumer over a toy instance, seeded with a
@@ -3746,6 +3917,11 @@ mod tests {
             wrong_type.is_file(),
             "failed retention must leave the obstacle intact"
         );
+        assert_eq!(
+            super::retention_failures().get("retention-failure-after-publish"),
+            Some(&1),
+            "a failed retention pass must be counted where readiness can report it"
+        );
         drop(opened);
 
         let reopened = InspirePersistence::open(
@@ -3918,6 +4094,29 @@ mod tests {
         )
         .expect_err("mismatch should reject");
         assert!(matches!(err, AdapterError::Internal(_)));
+        let message = err.to_string();
+        for needle in [
+            "\"scheme-A\"",
+            "\"scheme-B\"",
+            &dir.path().display().to_string(),
+            "set this instance's scheme_tag to \"scheme-A\"",
+            "start on an empty one",
+        ] {
+            assert!(message.contains(needle), "{needle}: {message}");
+        }
+    }
+
+    /// The tag outlives every data_dir written under it, so it names the scheme and a layout
+    /// version, and nothing about how the work was organised.
+    #[test]
+    fn the_persisted_scheme_tag_names_the_scheme_and_a_version() {
+        let tag = super::SCHEME_TAG;
+        let (scheme, version) = tag.rsplit_once("-v").expect("a -v<N> suffix");
+        assert!(
+            !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
+            "{tag}"
+        );
+        assert_eq!(scheme, "raven-inspire-twopacking-inspiring", "{tag}");
     }
 
     #[test]

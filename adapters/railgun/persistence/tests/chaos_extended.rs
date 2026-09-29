@@ -17,7 +17,7 @@ use raven_railgun_persistence::{
     SNAPSHOT_MAGIC,
 };
 
-const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-wp3-cache-session";
+const SCHEME_TAG: &str = "raven-inspire-twopacking-inspiring-v1";
 
 fn manifest_for(instance: &str, encoder_label: &str) -> Manifest {
     Manifest {

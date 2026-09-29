@@ -139,7 +139,8 @@ struct RegistryEntry {
 pub struct AutoSpawnedHandle {
     pub instance_id: InstanceId,
     pub consumer_sender: tokio::sync::mpsc::Sender<ConsumerEvent>,
-    pub consumer_join: tokio::task::JoinHandle<()>,
+    /// The consumer's result; an `Err` after `Shutdown` is a final commit that did not land.
+    pub consumer_join: tokio::task::JoinHandle<raven_railgun_core::Result<()>>,
 }
 
 impl std::fmt::Debug for AutoSpawnedHandle {
@@ -624,9 +625,11 @@ struct ConsumerSpawnInputs {
     verifier_ctx: Option<Layer2VerifierContext>,
 }
 
-fn spawn_consumer_task(inputs: ConsumerSpawnInputs) -> tokio::task::JoinHandle<()> {
+fn spawn_consumer_task(
+    inputs: ConsumerSpawnInputs,
+) -> tokio::task::JoinHandle<raven_railgun_core::Result<()>> {
     tokio::spawn(async move {
-        if let Err(e) = run_consumer_task(
+        let outcome = run_consumer_task(
             inputs.instance,
             inputs.persistence,
             inputs.store,
@@ -636,10 +639,11 @@ fn spawn_consumer_task(inputs: ConsumerSpawnInputs) -> tokio::task::JoinHandle<(
             inputs.receiver,
             inputs.verifier_ctx,
         )
-        .await
-        {
+        .await;
+        if let Err(e) = &outcome {
             tracing::error!(error = %e, "auto_spawn consumer task exiting");
         }
+        outcome
     })
 }
 
@@ -739,7 +743,7 @@ mod tests {
             .expect("encoder");
         let opened = InspirePersistence::open(
             layout,
-            "raven-inspire-twopacking-inspiring-wp3-cache-session",
+            "raven-inspire-twopacking-inspiring-v1",
             InstanceId::new("commit-tree-0"),
             SnapshotPolicy::default(),
             encoder,

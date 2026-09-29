@@ -46,9 +46,7 @@ fn fixture() -> (axum::Router, Arc<PirInstance<RavenInspireScheme>>) {
     engine
         .add_live(Arc::clone(&instance))
         .expect("register instance");
-    let mut config = HttpConfig::demo(TOKEN);
-    config.enable_fanout = true;
-    let app = AppState::new(engine, config).expect("app state");
+    let app = AppState::new(engine, HttpConfig::demo(TOKEN)).expect("app state");
     (inspire_router(app).expect("router"), instance)
 }
 
@@ -108,9 +106,4 @@ async fn query_route_distinguishes_missing_from_drained() {
 #[tokio::test]
 async fn batch_route_distinguishes_missing_from_drained() {
     assert_route_distinguishes_missing_from_drained("batch").await;
-}
-
-#[tokio::test]
-async fn fanout_route_distinguishes_missing_from_drained() {
-    assert_route_distinguishes_missing_from_drained("fanout").await;
 }

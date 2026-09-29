@@ -18,7 +18,7 @@ use raven_railgun_engine::offline_packing_keys_cache::{CellShape, OfflinePacking
 
 const PROD_ENTRIES: usize = 65_536;
 const PROD_ENTRY_BYTES: usize = 512;
-const SCHEME_TAG: &[u8] = b"raven-inspire-twopacking-wp3-v1";
+const SCHEME_TAG: &[u8] = b"raven-inspire-twopacking-v1";
 const PACKING_PARAM_ID: &[u8] = b"InspireParams::secure_128_d2048";
 
 fn synthetic_db(entries: usize, entry_bytes: usize) -> Vec<u8> {
