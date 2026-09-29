@@ -42,7 +42,7 @@ max_concurrent_queries = 4
 respond_timeout_secs = 30
 record_size = 512
 entries_per_shard = 2048
-scheme_tag = "raven-inspire-twopacking-inspiring-wp3-cache-session"
+scheme_tag = "raven-inspire-twopacking-inspiring-v1"
 use_flock = true
 channel_capacity = 1024
 

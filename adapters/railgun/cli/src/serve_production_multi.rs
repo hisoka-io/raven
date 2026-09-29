@@ -327,7 +327,7 @@ pub struct MultiServeOptions {
     /// Zero when the config reads nothing off the chain.
     pub start_block: u64,
     pub mirror_endpoint: String,
-    /// `[global].mirror_backfill_interval_secs`; `None` follows a full page at once.
+    /// `[global].mirror_backfill_interval_secs`; `None` keeps the mirror's 1 s request spacing, 0 only for a local replay.
     pub mirror_backfill_interval_secs: Option<u64>,
     pub max_concurrent_queries: usize,
     pub respond_timeout_secs: u64,
