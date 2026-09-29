@@ -11,10 +11,12 @@ failed=0
 
 fresh() {
   rm -rf "$scratch/a"
-  mkdir -p "$scratch/a/cli/src" "$scratch/a/deploy" "$scratch/a/examples"
+  mkdir -p "$scratch/a/cli/src" "$scratch/a/http/src" "$scratch/a/deploy/railway" "$scratch/a/examples"
   cp "$adapter"/Dockerfile* "$scratch/a/"
-  cp "$adapter/examples/mainnet-ppoi.toml" "$scratch/a/examples/"
+  cp "$adapter/examples/mainnet-ppoi.toml" "$adapter/examples/sepolia-ppoi.toml" "$scratch/a/examples/"
   cp "$adapter/cli/src/serve_production_multi.rs" "$scratch/a/cli/src/"
+  cp "$adapter/http/src/lib.rs" "$scratch/a/http/src/"
+  cp "$adapter"/deploy/railway/* "$scratch/a/deploy/railway/"
   cp "$adapter/deploy/lib.sh" "$adapter/deploy/Caddyfile" "$adapter/deploy/deploy.sh" "$scratch/a/deploy/"
 }
 
@@ -55,7 +57,31 @@ expect "default memory cap too small" "do not fit" deploy/deploy.sh 's/ memory=1
 expect "seat size changed, help figure not" "does not state" deploy/lib.sh 's/^SEAT_MIB=24$/SEAT_MIB=12/'
 expect "seat size for another row" "record_size is not 512" examples/mainnet-ppoi.toml \
   's/^record_size = 512$/record_size = 1024/'
+# shellcheck disable=SC2016  # sed expressions, not shell
 expect "an eighth instance" "does not state" examples/mainnet-ppoi.toml \
   '$a [[instance]]'
+expect "Railway build stage drifted" "build stage" deploy/railway/Dockerfile 's/ --locked//'
+# shellcheck disable=SC2016  # sed expressions, not shell
+expect "Railway image declares a VOLUME" "declares a VOLUME" deploy/railway/Dockerfile \
+  '$a VOLUME ["/srv/raven/data"]'
+expect "Railway drain under the stop budget" "under twice STOP_BUDGET" deploy/railway/configure.sh \
+  's/^\( *drainingSeconds:\) 30,$/\1 20,/'
+expect "Railway health check on a route the node lacks" "not a route" deploy/railway/configure.sh \
+  's|^\( *healthcheckPath:\) .*|\1 "/v1/health/alive",|'
+expect "entrypoint keeps the template token" "token source" deploy/railway/entrypoint.sh \
+  '/REPLACE_ME"\$. ""$/d'
+# shellcheck disable=SC2016
+expect "entrypoint binds a fixed port" "does not bind" deploy/railway/entrypoint.sh \
+  's/0.0.0.0:\$port/0.0.0.0:8080/'
+expect "a template that trusts forwarding headers" "trusts forwarding headers" examples/sepolia-ppoi.toml \
+  's/^trust_proxy_header = false$/trust_proxy_header = true/'
+expect "template bind reshaped" "cannot render sepolia" examples/sepolia-ppoi.toml 's/^bind = /bind  = /'
+expect "a data dir off the volume" "cannot render mainnet" examples/mainnet-ppoi.toml \
+  's|^data_dir = "/srv/raven/data/ppoi-paths-ofac-6"|data_dir = "/var/lib/ofac-6"|'
+expect "Railway token set unsealed" "without sealing" deploy/railway/configure.sh \
+  "0,/isSealed: true}'/s//isSealed: false}'/"
+# shellcheck disable=SC2016
+expect "Railway token set by a plain upsert" "without sealing" deploy/railway/configure.sh \
+  '$a jq -n --arg v x '"'"'{i: {name: "RAVEN_BEARER_TOKEN", value: $v}}'"'"' | gql'
 
 exit $failed

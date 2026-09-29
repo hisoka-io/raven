@@ -11,7 +11,14 @@
 #   6. the Caddyfile binds IPv4 only (tcp4), since a bare address opens a dual-stack socket;
 #   7. deploy.sh's default --memory holds its default worst case for the image template's
 #      instances, worst_case_mib in deploy/lib.sh, and --help states that figure; the seat size
-#      there is for the template's 512 B rows.
+#      there is for the template's 512 B rows;
+#   8. the Railway image builds the binary exactly as the operator image does (the same build
+#      stage) and declares no VOLUME, since Railway attaches its own;
+#   9. the Railway service settings (deploy/railway/configure.sh) give the node at least twice
+#      STOP_BUDGET between SIGTERM and SIGKILL, and health-check a route the node serves;
+#  10. the Railway entrypoint renders both shipped templates to bind 0.0.0.0:$PORT, carry no token
+#      source beside RAVEN_BEARER_TOKEN, trust no forwarding header (Railway's edge passes a
+#      client's cf-connecting-ip through), and keep every instance's data under the volume.
 # DEPLOY_CHECK_ROOT points it at a copy of the adapter directory (its selftest does).
 set -uo pipefail
 
@@ -71,6 +78,49 @@ else
       || die "deploy.sh --help does not state the defaults' $worst MiB for $instances instances"
   ) || failed=1
 fi
+
+railway=$root/deploy/railway
+build_stage() { awk '/^FROM /{n++} n==1' "$1"; }
+[[ -n $(build_stage "$railway/Dockerfile") && $(build_stage "$root/Dockerfile") == "$(build_stage "$railway/Dockerfile")" ]] \
+  || fail "deploy/railway/Dockerfile: its build stage is not the operator Dockerfile's"
+! grep -qE '^VOLUME' "$railway/Dockerfile" || fail "deploy/railway/Dockerfile declares a VOLUME"
+
+draining=$(grep -oE '^ +drainingSeconds: [0-9]+,?$' "$railway/configure.sh" | grep -oE '[0-9]+')
+if [[ -z $draining || -z $budget ]]; then
+  fail "could not read configure.sh drainingSeconds (${draining:-none}) or STOP_BUDGET (${budget:-none})"
+else
+  ((draining >= 2 * budget)) || fail "configure.sh drainingSeconds=$draining is under twice STOP_BUDGET ($budget s)"
+fi
+health=$(grep -oE '^ +healthcheckPath: "[^"]+",?$' "$railway/configure.sh" | cut -d'"' -f2)
+if [[ -z $health ]] || ! grep -qF ".route(\"$health\"" "$root/http/src/lib.rs"; then
+  fail "configure.sh healthcheckPath '${health:-none}' is not a route the node serves"
+fi
+
+# The token must not be readable back from Railway, where the account's other members can see it.
+sets=$(grep -cE "token_patch '[{]value: " "$railway/configure.sh" || true)
+sealed=$(grep -cE "token_patch '[{]value: input, isSealed: true[}]'" "$railway/configure.sh" || true)
+if [[ $sets == 0 || $sealed != "$sets" ]] || grep -qE 'name: "RAVEN_BEARER_TOKEN"|RAVEN_BEARER_TOKEN: [$]' "$railway/configure.sh"; then
+  fail "configure.sh sets RAVEN_BEARER_TOKEN without sealing it"
+fi
+
+for net in mainnet sepolia; do
+  if ! out=$(RAVEN_TEMPLATE_DIR=$root/examples RAVEN_NETWORK=$net RAILWAY_VOLUME_MOUNT_PATH=/vol \
+    PORT=4321 sh "$railway/entrypoint.sh" --print-config 2>&1); then
+    fail "deploy/railway/entrypoint.sh cannot render $net: $out"
+    continue
+  fi
+  [[ $(grep -cx 'bind = "0.0.0.0:4321"' <<<"$out") == 1 ]] \
+    || fail "the rendered $net config does not bind 0.0.0.0:\$PORT"
+  ! grep -qE '^(token|token_file) = ' <<<"$out" \
+    || fail "the rendered $net config carries a token source beside RAVEN_BEARER_TOKEN"
+  if [[ $(grep -cE '^trust_proxy_header = ' <<<"$out") != 1 ]] || ! grep -qx 'trust_proxy_header = false' <<<"$out"; then
+    fail "the rendered $net config trusts forwarding headers"
+  fi
+  want=$(grep -cE '^[[][[]instance[]][]]$' "$root/examples/$net-ppoi.toml")
+  got=$(grep -cE '^data_dir = "/vol/[^"]+"$' <<<"$out")
+  [[ $want -ge 1 && $got == "$want" && $(grep -cE '^data_dir = ' <<<"$out") == "$want" ]] \
+    || fail "the rendered $net config keeps $got of $want instances' data under the volume"
+done
 
 ((failed == 0)) && echo "check-deploy: ok"
 exit $failed
