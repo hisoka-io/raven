@@ -78,6 +78,8 @@ describe("published package manifest", () => {
     expect(files, "no files allowlist: npm pack ships the whole directory").toBeDefined();
     expect(files).toContain("dist");
     expect(files).not.toContain("tests");
+    // No export reaches the TypeScript source, so shipping it only adds its bytes to the tarball.
+    expect(files).not.toContain("src");
     for (const entry of files ?? []) {
       expect(entry, "an allowlist entry escapes the package").not.toMatch(/^\.\.?\//);
     }

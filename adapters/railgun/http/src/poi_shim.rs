@@ -1,10 +1,11 @@
-//! Wallet-facing PPOI passthrough routes mirroring upstream
-//! `private-proof-of-innocence/packages/node/src/api/api.ts`.
+//! Wallet-facing routes outside the PIR query path: the list index channel and the commit-tree
+//! proof.
 //!
 //! These routes are NOT private; wallet privacy needs `/v1/instance/:id/query`.
 //!
 //! `bc-prefixes` publishes the list's index in per-block segments a client resumes with
-//! `?since=`. No route answers a per-commitment status: the client derives it from the index.
+//! `?since=`. No route takes a blinded commitment: the client derives its status from the
+//! index and fetches its proof by PIR.
 
 use std::sync::Arc;
 
@@ -40,19 +41,6 @@ pub(crate) const X_RAVEN_INDEX_EPOCH: HeaderName = HeaderName::from_static("x-ra
 /// Hex-encoded 32-byte blob. No `0x` prefix (matches Railgun upstream).
 type HexHash = String;
 
-/// Body for `POST /v1/poi/merkle-proofs`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MerkleProofsRequest {
-    /// Optional txid version string (ignored server-side, present for upstream parity).
-    #[serde(default)]
-    pub txid_version: Option<String>,
-    /// Hex-encoded 32-byte list key.
-    pub list_key: HexHash,
-    /// Hex-encoded blinded commitments to look up.
-    pub blinded_commitments: Vec<HexHash>,
-}
-
 /// Body for `POST /v1/commit-tree/:tree_number/merkle-proof`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,7 +52,7 @@ pub struct CommitTreeProofRequest {
 /// Railgun-shaped Merkle proof JSON (`shared-models/src/models/proof-of-innocence.ts`).
 #[derive(Debug, Clone, Serialize)]
 pub struct MerkleProofJson {
-    /// Blinded commitment hex for PPOI proofs; empty for commit-tree proofs.
+    /// Commitment hex at the proven leaf; empty when the tree holds none there.
     pub leaf: HexHash,
     /// Sibling-hash chain, leaf-to-root, 16 entries.
     pub elements: Vec<HexHash>,
@@ -101,11 +89,6 @@ fn indices_to_hex(idx: u16) -> HexHash {
     hex_encode(&buf)
 }
 
-/// `merkle-proofs` looks each commitment up under every block's lock, which the ingest path
-/// also takes, so the vector is capped.
-const MAX_SHIM_BLINDED_COMMITMENTS: usize = 1024;
-
-const MERKLE_PROOFS_ROUTE: &str = "merkle-proofs";
 const COMMIT_TREE_PROOF_ROUTE: &str = "commit-tree-merkle-proof";
 const BC_PREFIXES_ROUTE: &str = "bc-prefixes";
 
@@ -169,47 +152,6 @@ fn cover_tree<'a, S: PirScheme>(
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
         .prove_tree(tree_number)
         .map_err(|refusal| refuse_uncovered(route, &refusal))
-}
-
-pub(crate) async fn merkle_proofs_handler<S: PirScheme>(
-    State(app): State<AppState<S>>,
-    Json(req): Json<MerkleProofsRequest>,
-) -> Result<Json<Vec<MerkleProofJson>>, StatusCode> {
-    if req.blinded_commitments.len() > MAX_SHIM_BLINDED_COMMITMENTS {
-        return Err(StatusCode::PAYLOAD_TOO_LARGE);
-    }
-    let list_key = decode_hex(&req.list_key).ok_or(StatusCode::BAD_REQUEST)?;
-    let blinded_commitments: Vec<[u8; 32]> = req
-        .blinded_commitments
-        .iter()
-        .filter_map(|s| decode_hex(s))
-        .collect();
-    if blinded_commitments.len() != req.blinded_commitments.len() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    // The 404 below is an absence claim, so it needs a whole-list proof: without it, "not in
-    // my block" is served as "not in the list".
-    let coverage = cover_list(
-        &app,
-        list_key,
-        MERKLE_PROOFS_ROUTE,
-        &read_mirror_feeds(&app),
-    )?;
-    let mut proofs = Vec::with_capacity(blinded_commitments.len());
-    for bc in &blinded_commitments {
-        // The proof itself comes from the block that HOLDS the row: a block IMT is exactly
-        // the tree upstream's `validatedMerkleroot` is taken over.
-        let (store, local_index) = coverage.owner_of(bc).ok_or(StatusCode::NOT_FOUND)?;
-        let proof = store
-            .lock()
-            .ppoi_merkle_proof(&list_key, local_index)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        proofs.push(MerkleProofJson::from_core(&proof, hex_encode(bc)));
-    }
-    coverage
-        .recheck_frontier()
-        .map_err(|refusal| refuse_uncovered(MERKLE_PROOFS_ROUTE, &refusal))?;
-    Ok(Json(proofs))
 }
 
 pub(crate) async fn commit_tree_proof_handler<S: PirScheme>(
@@ -398,7 +340,6 @@ fn serve_publishing_bytes(
 pub fn poi_shim_routes<S: PirScheme>(state: AppState<S>) -> axum::Router {
     use axum::routing::{get, post};
     axum::Router::new()
-        .route("/v1/poi/merkle-proofs", post(merkle_proofs_handler::<S>))
         .route(
             "/v1/commit-tree/:tree_number/merkle-proof",
             post(commit_tree_proof_handler::<S>),

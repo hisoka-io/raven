@@ -24,6 +24,12 @@ pub const MAX_Q: u64 = DEFAULT_Q;
 /// one grows each sampler's table, `2 * ceil(6 sigma) + 1` entries, without bound.
 pub const SHIPPED_SIGMA: f64 = 6.4;
 
+/// Most digits either gadget may have: the shipped `secure_128_d2048` decomposes its 60-bit
+/// modulus in base 2^20, which takes 3. The packing keys a client builds and registers hold one
+/// polynomial per digit, so a smaller base cannot grow them past the shipped shape; at the shipped
+/// `q` this holds the base at 2^20 or more.
+pub const MAX_GADGET_LEN: usize = 3;
+
 /// A parameter set outside the floors.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
@@ -57,6 +63,14 @@ pub enum ParameterFloorError {
         base: u64,
         /// Digits the base needs to cover `q`, or 0 when no count up to 64 does.
         covering: usize,
+    },
+    /// A gadget with more digits than `MAX_GADGET_LEN`.
+    #[error("{role} gadget has {len} digits, above the shipped {MAX_GADGET_LEN}")]
+    GadgetDigits {
+        /// Which gadget.
+        role: &'static str,
+        /// The served digit count.
+        len: usize,
     },
 }
 
@@ -102,6 +116,9 @@ pub fn check_parameter_floor(params: &InspireParams) -> Result<(), ParameterFloo
                 base: params.gadget_base,
                 covering,
             });
+        }
+        if len > MAX_GADGET_LEN {
+            return Err(ParameterFloorError::GadgetDigits { role, len });
         }
     }
     Ok(())

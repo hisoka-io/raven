@@ -15,7 +15,7 @@ use raven_client::{
 /// The cap VALUES, pinned to literals. This is the only assertion in the tree that fails if
 /// someone widens the ceiling.
 ///
-/// Every other test in this file and in `panic_safety.rs` derives its fixture FROM the constants
+/// Every other test in this file and in `src/suites/panic_safety.rs` derives its fixture FROM the constants
 /// (`LIMIT + 1`, `LIMIT - 16`), so they all follow the cap wherever it moves: raising the
 /// untrusted limit to 128 MiB leaves the entire suite green while doubling how much attacker-
 /// supplied input the WASM client will allocate before refusing. The boundary tests prove the

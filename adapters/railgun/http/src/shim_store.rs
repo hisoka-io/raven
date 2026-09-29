@@ -743,16 +743,6 @@ impl ListCoverage<'_> {
             block,
         }
     }
-
-    /// The block that holds `blinded_commitment`, as `(store, local_index)`.
-    pub fn owner_of(&self, blinded_commitment: &[u8; 32]) -> Option<(&SharedLogicalStore, u32)> {
-        self.blocks.iter().find_map(|store| {
-            let local = store
-                .lock()
-                .ppoi_index_of(&self.list_key, blinded_commitment)?;
-            Some((*store, local))
-        })
-    }
 }
 
 #[cfg(test)]

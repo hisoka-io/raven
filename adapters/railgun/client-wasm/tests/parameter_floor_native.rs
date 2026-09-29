@@ -1,5 +1,5 @@
 //! The Rust entry points hold a caller-built session to the parameter floors, as the wasm exports
-//! hold a served one. Here and not in `crates/client`: that crate's own tests build it unfloored.
+//! hold a served one, through this crate's re-export.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 #![cfg(not(target_arch = "wasm32"))]
@@ -10,7 +10,7 @@ use raven_inspire::setup as inspire_setup;
 use raven_inspire::ClientSession;
 use raven_inspire_client_wasm::{
     build_padded_batch_rust, build_seeded_query_rust, deserialize_client_session_rust,
-    PaddedBatchError, PARAMETER_FLOORS_ENFORCED,
+    PaddedBatchError,
 };
 
 const ENTRY_BYTES: usize = 32;
@@ -29,12 +29,6 @@ fn session_at(params: &InspireParams) -> (ClientSession, ShardConfig) {
     let (crs, encoded, sk) = inspire_setup(params, &db, ENTRY_BYTES, &mut sampler).expect("setup");
     let session = ClientSession::new(crs, sk, &mut sampler).expect("session");
     (session, encoded.config)
-}
-
-#[test]
-fn this_build_enforces_the_floors() {
-    let enforced = PARAMETER_FLOORS_ENFORCED;
-    assert!(enforced);
 }
 
 #[test]

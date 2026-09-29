@@ -61,7 +61,7 @@ const _: () = assert!(LIST_ROWS < LEAVES_PER_PPOI_BLOCK);
 /// refused" from "no store was ever wired": both answer 503.
 const COVERAGE_REFUSALS_TOTAL: &str = "raven_railgun_shim_coverage_refusals_total";
 const COMMIT_TREE_ROUTE: &str = "commit-tree-merkle-proof";
-const LIST_ROUTES: [&str; 2] = ["merkle-proofs", "bc-prefixes"];
+const LIST_ROUTES: [&str; 1] = ["bc-prefixes"];
 /// The block the list reaches at row 393,216, which the shipped config must declare ahead of it.
 const NEXT_BLOCK_INSTANCE: &str = "ppoi-paths-ofac-6";
 
@@ -107,7 +107,6 @@ struct Booted {
     addr: SocketAddr,
     declared_instances: BTreeSet<String>,
     list_key: String,
-    roots: Arc<Vec<[u8; 32]>>,
 }
 
 /// Distinct in the bytes the index publishes too, or a renumbered index would still match.
@@ -331,10 +330,9 @@ async fn boot_the_shipped_config() -> Booted {
 
     let opts = load_options_from_toml(&config).expect("parse the rewritten shipped config");
     let list_key = hex::encode(declared_list(&opts));
-    let roots = Arc::new(upstream_roots());
     serve(
         upstream_listener,
-        ppoi_upstream(list_key.clone(), Arc::clone(&roots)),
+        ppoi_upstream(list_key.clone(), Arc::new(upstream_roots())),
     );
 
     let mut node = spawn_binary(&config, root.path());
@@ -349,7 +347,6 @@ async fn boot_the_shipped_config() -> Booted {
             .map(|inst| inst.instance_id.as_str().to_owned())
             .collect(),
         list_key,
-        roots,
     }
 }
 
@@ -433,37 +430,19 @@ fn refusals_for(scrape: &str, route: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// What the list routes answered, each asked exactly once so a refusal count is exact.
-struct ListAnswers {
-    proofs: (StatusCode, Value),
-    absent_proof: StatusCode,
-    index: Segment,
-}
-
-async fn ask_list_routes(booted: &Booted, held: [u8; 32], absent: [u8; 32]) -> ListAnswers {
-    let client = reqwest::Client::new();
-    let base = format!("http://{}/v1/poi", booted.addr);
-    let list_key = booted.list_key.as_str();
-    let proof_of = |bc: [u8; 32]| {
-        client
-            .post(format!("{base}/merkle-proofs"))
-            .json(&json!({ "listKey": list_key, "blindedCommitments": [hex::encode(bc)] }))
-    };
-    let proofs = ask(proof_of(held), "merkle-proofs").await;
-    let (absent_proof, _) = ask(proof_of(absent), "merkle-proofs for an absent row").await;
-    let index = read_segment(
-        client
-            .get(format!("{base}/{list_key}/bc-prefixes"))
+/// The list's index, asked exactly once so a refusal count is exact.
+async fn ask_index(booted: &Booted) -> Segment {
+    read_segment(
+        reqwest::Client::new()
+            .get(format!(
+                "http://{}/v1/poi/{}/bc-prefixes",
+                booted.addr, booted.list_key
+            ))
             .send()
             .await
             .expect("bc-prefixes"),
     )
-    .await;
-    ListAnswers {
-        proofs,
-        absent_proof,
-        index,
-    }
+    .await
 }
 
 /// The shipped config serves every block it declares, the one the list reaches next included,
@@ -521,9 +500,7 @@ async fn the_shipped_config_serves_shim_routes_from_the_stores_it_declares() {
     assert_eq!(feed.rows_held, u64::from(LIST_ROWS), "{feed:?}");
 
     let undeclared = ask_commit_tree(addr, 0).await;
-    let held = leaf_at(LIST_ROWS - 1);
-    let absent = leaf_at(LIST_ROWS);
-    let answers = ask_list_routes(&booted, held, absent).await;
+    let index = ask_index(&booted).await;
     let scrape = scrape(addr).await;
 
     assert_eq!(
@@ -538,20 +515,6 @@ async fn the_shipped_config_serves_shim_routes_from_the_stores_it_declares() {
          was installed and every 503 is the absent-store 503: {scrape}"
     );
 
-    let (status, proofs) = &answers.proofs;
-    assert_eq!(*status, StatusCode::OK, "{}", booted.node.tail());
-    assert_eq!(proofs[0]["leaf"], hex::encode(held), "{proofs}");
-    assert_eq!(
-        proofs[0]["root"],
-        hex::encode(booted.roots.last().expect("a root")),
-        "the proof must come from the block holding the row, at the root upstream published"
-    );
-    assert_eq!(
-        answers.absent_proof,
-        StatusCode::NOT_FOUND,
-        "a row past the list's end is absent from the declared blocks that cover it"
-    );
-    let index = &answers.index;
     assert_eq!(index.status, StatusCode::OK, "{}", booted.node.tail());
     let rows = u64::from(LIST_ROWS);
     assert_eq!(

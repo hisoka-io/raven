@@ -7,11 +7,11 @@ client-side PIR.
 ## Install
 
 ```sh
-npm install @hisoka-io/railgun-poi-node-interface @hisoka-io/raven-inspire-client-wasm
+npm install @hisoka-io/railgun-poi-node-interface@alpha @hisoka-io/raven-inspire-client-wasm@alpha
 ```
 
-Node 20 or newer. A browser bundle installs `@hisoka-io/raven-inspire-client-wasm-bundler` in place
-of the Node wasm. `@railgun-community/engine` is an optional peer: the package uses its types only
+Node 20 or newer. A browser bundle installs `@hisoka-io/raven-inspire-client-wasm-bundler@alpha` in
+place of the Node wasm. `@railgun-community/engine` is an optional peer: the package uses its types only
 and reads the copy your wallet already has.
 
 ## Example

@@ -1,7 +1,7 @@
 //! Native timing harness for the wasm client's `_rust` mirror entry points.
 //! Zero assertions: it measures build/extract per cell shape and reports a
 //! findings line. The functional wasm round trip lives in
-//! `tests/wasm_client_roundtrip.rs`.
+//! `src/suites/wasm_client_roundtrip.rs`.
 //! Run by hand: `cargo test --release --bench wasm_client_native_bench -- --ignored --nocapture`.
 #![cfg(not(target_arch = "wasm32"))]
 #![allow(

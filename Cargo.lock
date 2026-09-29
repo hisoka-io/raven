@@ -625,7 +625,6 @@ dependencies = [
  "js-sys",
  "proptest",
  "rand 0.8.6",
- "raven-client",
  "raven-inspire",
  "serde",
  "thiserror",

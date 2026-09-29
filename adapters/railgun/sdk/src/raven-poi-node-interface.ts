@@ -1,6 +1,7 @@
 import type { POIsPerList as EnginePOIsPerList } from "@railgun-community/engine";
 import {
   type ClientPirContext,
+  callWasm,
   decodeClientPirQueryBundle,
   decodeShardGeometry,
 } from "./client-pir";
@@ -579,9 +580,10 @@ export class RavenPOINodeInterface {
         // Unread, the set cannot tell ProofSubmitted from Missing, and a wrong Missing makes the
         // engine submit the same proof again; present commitments do not need it.
         if (unestablished === undefined) {
-          throw RavenError.invalidQuery(
+          throw RavenError.storage(
             `getPOIsPerList: the submitted-proof store could not be read for list ${lkHex} ` +
               `(${String(cause)}), so an absent commitment cannot be told from a submitted one`,
+            { cause: String(cause) },
           );
         }
         pending = undefined;
@@ -847,9 +849,10 @@ export class RavenPOINodeInterface {
         // A zero-length record decodes as no index, so any store clears without a delete.
         await this.indexStore.save(key, new Uint8Array(0));
       } catch (cause) {
-        throw RavenError.invalidQuery(
+        throw RavenError.storage(
           `resetPoiListIndex: the index store could not clear list ${lkHex} (${String(cause)}); ` +
             "the next run may resume the old index",
+          { cause: String(cause) },
         );
       }
     });
@@ -1240,7 +1243,9 @@ export class RavenPOINodeInterface {
       const plan = buildPaddedQueryPlan(targetIndices, entriesPerShard, populatedRows);
       const queryBundles = plan.wireTargets.map((targetIdx) =>
         decodeClientPirQueryBundle(
-          ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, BigInt(targetIdx)),
+          callWasm("client-PIR query", () =>
+            ctx.wasm.build_seeded_query(ctx.session, ctx.shardConfigBincode, BigInt(targetIdx)),
+          ),
         ),
       );
       const batchBody = encodeBatchBody(queryBundles.map(({ queryBytes }) => queryBytes));
@@ -1261,12 +1266,14 @@ export class RavenPOINodeInterface {
         responses[slot].slice(responses[slot].length - PATH10_ADDENDUM_BYTES),
       );
       const plaintexts = plan.realSlots.map((slot) =>
-        ctx.wasm.extract_response(
-          ctx.session,
-          ctx.crsBincode,
-          queryBundles[slot].clientStateBincode,
-          responses[slot].slice(0, -PATH10_ADDENDUM_BYTES),
-          ctx.entrySize,
+        callWasm(`client-PIR batch ${instanceLabel}`, () =>
+          ctx.wasm.extract_response(
+            ctx.session,
+            ctx.crsBincode,
+            queryBundles[slot].clientStateBincode,
+            responses[slot].slice(0, -PATH10_ADDENDUM_BYTES),
+            ctx.entrySize,
+          ),
         ),
       );
       return { plaintexts, addenda, freshness };
@@ -1364,7 +1371,9 @@ export class RavenPOINodeInterface {
     }
     try {
       const handle = await handshake;
-      ctx.wasm.install_server_session_handle(ctx.session, handle);
+      callWasm(`client-PIR session ${instanceLabel}`, () =>
+        ctx.wasm.install_server_session_handle(ctx.session, handle),
+      );
     } catch (cause) {
       if (this.sessionHandshakes.get(handshakeKey) === handshake) {
         this.sessionHandshakes.delete(handshakeKey);
@@ -1396,7 +1405,9 @@ export class RavenPOINodeInterface {
     const route = this.route();
     const credential = bearerHeaders(route.bearerToken);
     const clientId = this.clientPirClientId(instanceLabel);
-    const body = ctx.wasm.client_packing_keys_versioned(ctx.session);
+    const body = callWasm(`client-PIR session ${instanceLabel}`, () =>
+      ctx.wasm.client_packing_keys_versioned(ctx.session),
+    );
     const url = `${route.endpoint}/v1/instance/${encodeURIComponent(instanceLabel)}/session`;
     let response: Response;
     try {

@@ -154,9 +154,7 @@ jobs:
         # build if a file carrying a wasm_bindgen_test attribute is missing from this list,
         # which is the only thing keeping the list honest as files are added.
         run: |
-          wasm-pack test --node crates/client --test wasm_client_roundtrip
-          wasm-pack test --node crates/client --test session_params_drift
-          wasm-pack test --node crates/client --test session_handshake
+          wasm-pack test --node crates/client --lib
       - name: cargo fmt (raven-inspire-client-wasm)
         run: cargo fmt --manifest-path adapters/railgun/client-wasm/Cargo.toml -- --check
       - name: cargo test (native, raven-inspire-client-wasm)

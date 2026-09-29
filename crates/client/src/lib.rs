@@ -5,7 +5,7 @@
 //! mode is whatever the session derived from the CRS and whatever the server
 //! tagged the response with; this layer never overrides either. All complex Rust
 //! types cross the JS boundary as bincode-encoded `Vec<u8>`. See
-//! `tests/parity_native_vs_wasm.rs` for byte-equality tests against a native
+//! `src/suites/parity_native_vs_wasm.rs` for byte-equality tests against a native
 //! Rust client.
 //!
 //! Production entry points draw the RLWE key, packing-key noise, query noise,
@@ -13,7 +13,7 @@
 //! `#[wasm_bindgen]` entry point accepts caller-supplied randomness. The
 //! `#[doc(hidden)]` test seams [`build_seeded_query_rust_with_noise_seed`] and
 //! [`build_padded_batch_rust_with_test_rng`] never cross the JS boundary.
-//! `tests/client_entropy_kat.rs` covers the entropy-drawn query path.
+//! `src/suites/client_entropy_kat.rs` covers the entropy-drawn query path.
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 #![deny(missing_docs)]
@@ -33,11 +33,20 @@ use wasm_bindgen::prelude::*;
 
 mod floor;
 pub use floor::{
-    check_parameter_floor, ParameterFloorError, MAX_Q, MAX_RING_DIM, MIN_RING_DIM, SHIPPED_SIGMA,
+    check_parameter_floor, ParameterFloorError, MAX_GADGET_LEN, MAX_Q, MAX_RING_DIM, MIN_RING_DIM,
+    SHIPPED_SIGMA,
 };
 
-/// False only in this crate's own test builds, whose ring-256 fixtures sit below the floors.
-pub const PARAMETER_FLOORS_ENFORCED: bool = !cfg!(feature = "unfloored-test-params");
+// Lifted only in this crate's unit-test harness, whose ring-256 suites sit below the floors.
+// `cfg(test)` is the one switch no other build sets: no feature, package selection or
+// dependent reaches it, and integration tests link the floored library.
+const PARAMETER_FLOORS_ENFORCED: bool = !cfg!(test);
+
+// The suites keep their `raven_client::` paths from when they were integration tests.
+#[cfg(test)]
+extern crate self as raven_client;
+#[cfg(test)]
+mod suites;
 
 /// Route Rust panics to structured JS exceptions instead of opaque WASM traps. Idempotent.
 #[wasm_bindgen]
@@ -1452,20 +1461,10 @@ fn build_padded_batch_with_randomness(
 /// ```
 /// use raven_client::build_padded_batch_rust;
 /// use raven_inspire::math::GaussianSampler;
-/// use raven_inspire::params::{InspireParams, SecurityLevel};
+/// use raven_inspire::params::InspireParams;
 /// use raven_inspire::{setup, ClientSession};
 ///
-/// let params = InspireParams {
-///     ring_dim: 256,
-///     q: 1_152_921_504_606_830_593,
-///     crt_moduli: vec![1_152_921_504_606_830_593],
-///     p: 65_537,
-///     sigma: 6.4,
-///     gadget_base: 1 << 20,
-///     query_gadget_len: 3,
-///     packing_gadget_len: 3,
-///     security_level: SecurityLevel::Bits128,
-/// };
+/// let params = InspireParams::secure_128_d2048();
 /// let database = vec![0u8; params.ring_dim * 32];
 /// let mut setup_sampler = GaussianSampler::with_seed(params.sigma, 7);
 /// let (crs, encoded, secret_key) =

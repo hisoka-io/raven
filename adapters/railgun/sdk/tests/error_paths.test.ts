@@ -16,7 +16,14 @@ import {
   writeBinary,
   type MockServer,
 } from "./helpers/mock_server";
-import { forestConfig } from "./helpers/forest";
+import { stubCtx as pathStubCtx } from "./helpers/auth_path_stub";
+import { blockLabel, forestConfig } from "./helpers/forest";
+import {
+  PATH10_ROW_BYTES,
+  mountPath10Route,
+  path10Root,
+  path10Siblings,
+} from "./helpers/path10_row";
 import { shardConfigBincode } from "./helpers/shard_config";
 
 const TOKEN = "test-token-padded-long-enough-1234";
@@ -213,5 +220,61 @@ describe("error-path + truncated-response handling", () => {
       bearerToken: TOKEN,
     });
     await expect(sdk.syncPoiListIndex(LIST_KEY_HEX)).rejects.toThrow(/bc-prefixes: 403/);
+  });
+});
+
+// The wasm throws bare strings. Each call on the proof path must still reach the caller as a
+// RavenError, including a refusal of a response the node served.
+describe("a bare string the wasm throws on the proof path", () => {
+  const LEAF = 1234;
+  const NODES = path10Siblings(0xab);
+  const BLOCK = Math.floor(LEAF / 65_536);
+  let server: MockServer;
+
+  beforeAll(async () => {
+    server = await startMockServer();
+    mountPath10Route(server, {
+      bcHex: BC_PRESENT,
+      nodes: NODES,
+      instance: blockLabel(LIST_KEY_HEX, BLOCK),
+    });
+  });
+
+  afterAll(async () => {
+    await server.close();
+  });
+
+  it.each([
+    ["client_packing_keys_versioned", /client-PIR session/],
+    ["install_server_session_handle", /client-PIR session/],
+    ["build_seeded_query", /client-PIR query/],
+    ["extract_response", /client-PIR batch/],
+  ] as const)("from %s is a DecodeError", async (exportName, operation) => {
+    const ctx = pathStubCtx();
+    const wasm = {
+      ...ctx.wasm,
+      [exportName]: () => {
+        throw "wasm refused: planted";
+      },
+    };
+    const sdk = new RavenPOINodeInterface({
+      ...forestConfig({
+        endpoint: server.url,
+        listKeyHex: LIST_KEY_HEX,
+        ctx: { ...ctx, wasm, entrySize: PATH10_ROW_BYTES },
+        placed: [[BC_PRESENT, LEAF]],
+        pins: new Map([[BLOCK, path10Root(BC_PRESENT, NODES, LEAF)]]),
+      }),
+      bearerToken: TOKEN,
+    });
+    const thrown = await sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_PRESENT]).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(RavenError.is(thrown, "DecodeError"), `got ${typeof thrown}: ${String(thrown)}`).toBe(
+      true,
+    );
+    expect((thrown as RavenError).message).toMatch(operation);
+    expect((thrown as RavenError).message).toContain("wasm refused: planted");
   });
 });

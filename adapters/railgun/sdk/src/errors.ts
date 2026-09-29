@@ -7,7 +7,8 @@ export type RavenErrorKind =
   | "StaleData"
   | "ServerError"
   | "DecodeError"
-  | "BatchMismatch";
+  | "BatchMismatch"
+  | "Storage";
 
 export interface RavenErrorContext {
   /** Outbound URL the SDK was talking to when this error arose. */
@@ -86,7 +87,8 @@ export class RavenError<C = RavenErrorContext> extends Error {
     return new RavenError("ServerError", message, context);
   }
 
-  /** 2xx response whose body the SDK could not decode (truncated/malformed). */
+  /** 2xx response whose body the SDK could not decode (truncated/malformed) or refuses to use,
+   *  such as a PIR parameter set outside the client's floors. */
   static decodeError(message: string, context: RavenErrorContext = {}): RavenError {
     return new RavenError("DecodeError", message, context);
   }
@@ -94,6 +96,11 @@ export class RavenError<C = RavenErrorContext> extends Error {
   /** Batch reply count disagrees with expected; bytes parsed but count is wrong. */
   static batchMismatch(message: string, context: RavenErrorContext = {}): RavenError {
     return new RavenError("BatchMismatch", message, context);
+  }
+
+  /** A caller-supplied store failed to read or write; `cause` carries its error. */
+  static storage(message: string, context: RavenErrorContext = {}): RavenError {
+    return new RavenError("Storage", message, context);
   }
 
   /** Type-narrow predicate: true iff `err` is a `RavenError` of `kind`. */

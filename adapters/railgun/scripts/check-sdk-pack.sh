@@ -17,6 +17,7 @@
 #   5. The package must carry the repository's LICENSE, byte for byte.
 #   6. No `exports` target may be TypeScript source: a subpath mapped to `.ts` hands a consumer
 #      that imports it a file node refuses, and the probes below import only the root.
+#   7. The TypeScript source is not shipped: no export reaches it, so it would be dead weight.
 #
 # Everything here is offline. The one registry dependency is packed out of the SDK's own
 # installed tree, and the optional engine peer is met by a stand-in, so no network call is made
@@ -82,7 +83,7 @@ node -e '
 const { readdirSync, writeFileSync } = require("node:fs");
 const pkgDir = process.argv[1];
 const modules = readdirSync(`${pkgDir}/src`).filter((f) => f.endsWith(".ts")).map((f) => f.slice(0, -3));
-const expected = ["package.json", "README.md", "LICENSE", ...modules.map((m) => `src/${m}.ts`)];
+const expected = ["package.json", "README.md", "LICENSE"];
 for (const format of ["cjs", "esm"]) {
   expected.push(`dist/${format}/package.json`);
   for (const m of modules) expected.push(`dist/${format}/${m}.js`, `dist/${format}/${m}.d.ts`);

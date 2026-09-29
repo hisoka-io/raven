@@ -3,8 +3,9 @@
 # nothing as the green suite it was added to cover, so this reintroduces the two defects
 # the gate exists for, in a COPY, and requires the gate to name each one.
 #
-#   mutation A: main/types back to ./src/index.ts with no exports map - the consumer
-#               resolves TypeScript at runtime, which is the state this repo shipped.
+#   mutation A: main/types back to ./src/index.ts with no exports map - the consumer's entry
+#               point is TypeScript the tarball does not carry. This repo once shipped it, and
+#               the consumer resolved TypeScript at runtime.
 #   mutation B: the files allowlist removed - the whole test tier ships to consumers.
 #   mutation C: a runtime dependency on a repo-relative `file:` path. The install succeeds and
 #               leaves a dangling link, which is the state this repo shipped.
@@ -12,6 +13,7 @@
 #               and the gate's stand-in for it throws when loaded.
 #   mutation E: a LICENSE that is not the repository's.
 #   mutation F: a subpath export mapped to TypeScript source, which the root-import probes miss.
+#   mutation G: src/ back in the files allowlist - TypeScript no export reaches ships to consumers.
 #
 # The real tree is never written to and no git command is run.
 set -uo pipefail
@@ -90,12 +92,15 @@ PYEOF
 expect_red ts-entrypoint \
   'manifest["main"] = "./src/index.ts"
 manifest["types"] = "./src/index.ts"
-manifest.pop("exports", None)
-manifest["files"] = ["dist", "src"]' \
+manifest.pop("exports", None)' \
   "commonjs-consumer"
 
 expect_red no-files-allowlist \
   'manifest.pop("files", None)' \
+  "pack-contents"
+
+expect_red ships-typescript-source \
+  'manifest["files"] = ["dist", "src"]' \
   "pack-contents"
 
 expect_red ts-subpath-export \
@@ -132,4 +137,4 @@ if ! /usr/bin/grep -q "license: the packed LICENSE is not the repository's" "${S
 fi
 echo "  ok    foreign-license: refused, naming the license"
 
-echo "check-sdk-pack-selftest: the pack gate refuses a TypeScript entry point, an unrestricted pack, a dangling dependency, a runtime engine load, a foreign license and a TypeScript subpath export."
+echo "check-sdk-pack-selftest: the pack gate refuses a TypeScript entry point, an unrestricted pack, shipped TypeScript source, a dangling dependency, a runtime engine load, a foreign license and a TypeScript subpath export."

@@ -7,7 +7,7 @@ client-side PIR.
 ## Install
 
 ```sh
-npm install @hisoka-io/railgun-poi-node-interface @hisoka-io/raven-inspire-client-wasm
+npm install @hisoka-io/railgun-poi-node-interface@alpha @hisoka-io/raven-inspire-client-wasm@alpha
 ```
 
 ```ts
@@ -38,8 +38,12 @@ the caller installs the one its runtime needs.
 
 Before it derives a key or encrypts a query, the wasm refuses a served parameter set outside the
 shipped bounds: ring dimension 2048 to 4096, ciphertext modulus at most 2^60 - 2^14 + 1, error width
-exactly 6.4, and gadgets no wider than their base needs to cover the modulus. The refusal names the
-bound, whether the set arrived as the instance's parameters or inside its CRS.
+exactly 6.4, and gadgets of at most 3 digits, no more than their base needs to cover the modulus, so
+the packing keys the client builds are never larger than at the shipped base 2^20.
+`loadClientPirContext` raises the refusal as a `DecodeError` naming the bound, whether the set
+arrived as the instance's parameters or inside its CRS: the node served a body the client will not
+use, and the same body is refused again. Anything else the wasm refuses is a `DecodeError` too, and
+a missing OS random source is `InvalidQuery`.
 
 ### Engine is an optional peer: the package needs its types only
 
@@ -251,7 +255,7 @@ submits the proof again: one resubmission per restart for each commitment still 
 wallet passes its own. An entry is dropped only when its commitment appears in the list's index, so
 with a persistent store a device submits at most once per list and commitment. A record that does
 not verify reads as empty, and one the store cannot read leaves that list's absent commitments out
-of the engine-shaped answer rather than risk a resubmission.
+of the engine-shaped answer rather than risk a resubmission; the two-argument call raises `Storage`.
 
 An entry has no expiry and no call removes it. If upstream accepts a proof and the commitment never
 reaches the list, the device answers `ProofSubmitted` for it indefinitely, engine never submits it
@@ -312,7 +316,8 @@ await raven.syncPoiListIndex(listKey); // optional warm-up: the first call walks
   resumes from the aligned cursor below the total the node reports, which reads the frontier's
   epoch: another epoch re-reads the list, the same one is the shorter list refused above.
 - **`resetPoiListIndex(listKey)` forgets a list's index**, in memory, in the store and any preloaded
-  copy, so the next call reads the whole list from the node again.
+  copy, so the next call reads the whole list from the node again. A store that cannot clear the
+  record raises `Storage`.
 - **An index this node did not produce is re-read in full.** One passed in `poiListIndexes`
   (keyed `<chainId>:<listKey>`) is compared row by row against the prefix channel on its first
   sync, because an absence is answered from the index alone and a row changed anywhere in it would

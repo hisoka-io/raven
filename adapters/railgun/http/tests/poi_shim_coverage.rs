@@ -1,9 +1,9 @@
 //! A shim route answers from a store that covers the whole question, or refuses.
 //!
-//! The routes answer questions whose domain is a whole list: a 404 and the end of an index
-//! segment are both claims about absence, and the end of the index is what a client reads as
-//! "Missing". A store holding one 65,536-row block of a 358,320-row list can answer neither,
-//! and every such answer is a well-formed 200. These tests hold the refusal in place.
+//! The index route answers a question whose domain is a whole list: the end of the index is a
+//! claim about absence, which a client reads as "Missing". A store holding one 65,536-row block
+//! of a 358,320-row list cannot make it, and its answer would be a well-formed 200. These tests
+//! hold the refusal in place.
 //!
 //! A gap-free prefix is not enough on its own: the frontier block has to be CURRENT, which only
 //! upstream's own recent row count can say. A cold sync or a restart leaves the frontier short
@@ -286,22 +286,8 @@ async fn send(router: &Router, request: Request<Body>) -> (StatusCode, Vec<u8>) 
 }
 
 /// Every route a build registers.
-fn stock_requests(list_key_hex: &str, probe_bc: &str) -> Vec<(&'static str, Request<Body>)> {
+fn stock_requests(list_key_hex: &str) -> Vec<(&'static str, Request<Body>)> {
     vec![
-        (
-            "merkle-proofs",
-            authed(
-                Method::POST,
-                "/v1/poi/merkle-proofs",
-                Body::from(
-                    serde_json::json!({
-                        "listKey": list_key_hex,
-                        "blindedCommitments": [probe_bc],
-                    })
-                    .to_string(),
-                ),
-            ),
-        ),
         (
             "commit-tree-merkle-proof",
             authed(
@@ -329,8 +315,7 @@ fn stock_requests(list_key_hex: &str, probe_bc: &str) -> Vec<(&'static str, Requ
 async fn every_stock_route_refuses_when_no_store_is_wired() {
     let router = app_state(|state| state);
     let list_key_hex = hex32(&LIST_KEY);
-    let probe = hex32(&bc_for(0));
-    for (name, request) in stock_requests(&list_key_hex, &probe) {
+    for (name, request) in stock_requests(&list_key_hex) {
         let (status, _) = send(&router, request).await;
         assert_eq!(
             status,
@@ -351,14 +336,12 @@ async fn one_block_of_a_multi_block_list_refuses_on_every_stock_route() {
         },
         seed_block(2, 4),
     )]);
-    let list_key_hex = hex32(&LIST_KEY);
-    let probe = hex32(&bc_for(2 * LEAVES_PER_PPOI_BLOCK));
-    for (name, request) in stock_requests(&list_key_hex, &probe) {
+    for (name, request) in stock_requests(&hex32(&LIST_KEY)) {
         let (status, _) = send(&router, request).await;
         assert_eq!(
             status,
             StatusCode::SERVICE_UNAVAILABLE,
-            "{name} must refuse a list no wired store wholly covers, even for a row it holds"
+            "{name} must refuse a list no wired store wholly covers"
         );
     }
 }
@@ -384,8 +367,7 @@ async fn a_short_block_under_a_later_one_refuses() {
         ),
     ]);
     let list_key_hex = hex32(&LIST_KEY);
-    let probe = hex32(&bc_for(0));
-    for (name, request) in stock_requests(&list_key_hex, &probe) {
+    for (name, request) in stock_requests(&list_key_hex) {
         let (status, _) = send(&router, request).await;
         assert_eq!(
             status,
@@ -435,8 +417,7 @@ async fn a_frontier_block_at_capacity_refuses() {
         sealed_block_zero(),
     )]);
     let list_key_hex = hex32(&LIST_KEY);
-    let probe = hex32(&bc_for(0));
-    for (name, request) in stock_requests(&list_key_hex, &probe) {
+    for (name, request) in stock_requests(&list_key_hex) {
         let (status, _) = send(&router, request).await;
         assert_eq!(
             status,
@@ -446,92 +427,18 @@ async fn a_frontier_block_at_capacity_refuses() {
     }
 }
 
-/// A merkle proof comes from the block that holds the row, and the block IMT is the tree
-/// upstream takes `validatedMerkleroot` over, so the proof is against that block's root.
-#[tokio::test]
-async fn a_merkle_proof_past_the_boundary_comes_from_the_block_that_holds_the_row() {
-    let block_one = seed_block(1, 3);
-    let router = declared_with(
-        two_block_declarations(Arc::clone(&block_one)),
-        Some(counted(u64::from(LEAVES_PER_PPOI_BLOCK) + 3)),
-    );
-    let list_key_hex = hex32(&LIST_KEY);
-    let past_boundary = bc_for(LEAVES_PER_PPOI_BLOCK + 1);
-
-    let (status, body) = send(
-        &router,
-        authed(
-            Method::POST,
-            "/v1/poi/merkle-proofs",
-            Body::from(
-                serde_json::json!({
-                    "listKey": list_key_hex,
-                    "blindedCommitments": [hex32(&past_boundary)],
-                })
-                .to_string(),
-            ),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    let served = &parsed[0];
-    assert_eq!(
-        served["leaf"].as_str(),
-        Some(hex32(&past_boundary).as_str())
-    );
-
-    let expected = block_one
-        .lock()
-        .ppoi_merkle_proof(&LIST_KEY, 1)
-        .expect("block-local proof");
-    assert_eq!(
-        served["root"].as_str().map(str::to_owned),
-        Some(hex32(&expected.root)),
-        "the proof must fold to the holding block's root, not to another block's"
-    );
-    let elements = served["elements"].as_array().expect("elements");
-    assert_eq!(elements.len(), 16);
-    for (level, (got, want)) in elements.iter().zip(expected.elements.iter()).enumerate() {
-        assert_eq!(
-            got.as_str().map(str::to_owned),
-            Some(hex32(want)),
-            "sibling at level {level} must be the holding block's sibling"
-        );
-    }
-
-    // A commitment the covered blocks do not hold is absent, not unavailable.
-    let (status, _) = send(
-        &router,
-        authed(
-            Method::POST,
-            "/v1/poi/merkle-proofs",
-            Body::from(
-                serde_json::json!({
-                    "listKey": list_key_hex,
-                    "blindedCommitments": [hex32(&fr(0xDEAD_BEEF))],
-                })
-                .to_string(),
-            ),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
 /// Every stock list route over `router`, in order. The commit-tree route is left out: no list
 /// coverage decides it.
-async fn list_route_statuses(router: &Router, probe_bc: &str) -> Vec<(&'static str, StatusCode)> {
-    list_route_statuses_for(router, &LIST_KEY, probe_bc).await
+async fn list_route_statuses(router: &Router) -> Vec<(&'static str, StatusCode)> {
+    list_route_statuses_for(router, &LIST_KEY).await
 }
 
 async fn list_route_statuses_for(
     router: &Router,
     list_key: &[u8; 32],
-    probe_bc: &str,
 ) -> Vec<(&'static str, StatusCode)> {
     let mut out = Vec::new();
-    for (name, request) in stock_requests(&hex32(list_key), probe_bc) {
+    for (name, request) in stock_requests(&hex32(list_key)) {
         if name == "commit-tree-merkle-proof" {
             continue;
         }
@@ -547,8 +454,6 @@ async fn list_route_statuses_for(
 async fn a_short_frontier_is_answered_only_while_upstream_recently_counted_no_more_rows() {
     let declarations = two_block_declarations(seed_block(1, 3));
     let held = u64::from(LEAVES_PER_PPOI_BLOCK) + 3;
-    // Held by the sealed block, so every list route has a row to answer about.
-    let probe = hex32(&bc_for(0));
 
     for (case, upstream) in [
         ("no mirror feed at all", None),
@@ -560,7 +465,7 @@ async fn a_short_frontier_is_answered_only_while_upstream_recently_counted_no_mo
         ),
     ] {
         let router = declared_with(declarations.clone(), upstream);
-        for (route, status) in list_route_statuses(&router, &probe).await {
+        for (route, status) in list_route_statuses(&router).await {
             assert_eq!(
                 status,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -581,7 +486,7 @@ async fn a_short_frontier_is_answered_only_while_upstream_recently_counted_no_mo
         ),
     ] {
         let router = declared_with(declarations.clone(), upstream);
-        for (route, status) in list_route_statuses(&router, &probe).await {
+        for (route, status) in list_route_statuses(&router).await {
             assert_eq!(status, StatusCode::OK, "{route} refused with {case}");
         }
     }
@@ -592,10 +497,9 @@ async fn a_short_frontier_is_answered_only_while_upstream_recently_counted_no_mo
 #[tokio::test]
 async fn an_empty_frontier_over_sealed_blocks_is_refused_until_upstream_counts_it() {
     let declarations = two_block_declarations(seed_block(1, 0));
-    let probe = hex32(&bc_for(0));
 
     let unanchored = declared_with(declarations.clone(), None);
-    for (route, status) in list_route_statuses(&unanchored, &probe).await {
+    for (route, status) in list_route_statuses(&unanchored).await {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{route}");
     }
 
@@ -605,7 +509,7 @@ async fn an_empty_frontier_over_sealed_blocks_is_refused_until_upstream_counts_i
         declarations.clone(),
         Some(counted(u64::from(LEAVES_PER_PPOI_BLOCK) + 33_000)),
     );
-    for (route, status) in list_route_statuses(&counted_behind, &hex32(&fr(0xDEAD_BEEF))).await {
+    for (route, status) in list_route_statuses(&counted_behind).await {
         assert_eq!(
             status,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -617,7 +521,7 @@ async fn an_empty_frontier_over_sealed_blocks_is_refused_until_upstream_counts_i
         declarations,
         Some(counted(u64::from(LEAVES_PER_PPOI_BLOCK))),
     );
-    for (route, status) in list_route_statuses(&at_tip, &probe).await {
+    for (route, status) in list_route_statuses(&at_tip).await {
         assert_eq!(status, StatusCode::OK, "{route}");
     }
 }
@@ -641,11 +545,10 @@ async fn a_block_declared_ahead_of_the_list_is_answered_over_and_a_row_past_it_i
             })
             .collect()
     };
-    let probe = hex32(&bc_for(0));
     let ahead = blocks([4, 0, 0]);
 
     let at_tip = declared_with(ahead.clone(), Some(counted(4)));
-    for (route, status) in list_route_statuses(&at_tip, &probe).await {
+    for (route, status) in list_route_statuses(&at_tip).await {
         assert_eq!(
             status,
             StatusCode::OK,
@@ -664,25 +567,9 @@ async fn a_block_declared_ahead_of_the_list_is_answered_over_and_a_row_past_it_i
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body.len(), 4 * BC_INDEX_PREFIX_BYTES);
-    let (status, _) = send(
-        &at_tip,
-        authed(
-            Method::POST,
-            "/v1/poi/merkle-proofs",
-            Body::from(
-                serde_json::json!({
-                    "listKey": hex32(&LIST_KEY),
-                    "blindedCommitments": [hex32(&bc_for(4))],
-                })
-                .to_string(),
-            ),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
 
     let behind = declared_with(ahead, Some(counted(5)));
-    for (route, status) in list_route_statuses(&behind, &probe).await {
+    for (route, status) in list_route_statuses(&behind).await {
         assert_eq!(
             status,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -691,7 +578,7 @@ async fn a_block_declared_ahead_of_the_list_is_answered_over_and_a_row_past_it_i
     }
 
     let holed = declared(blocks([4, 0, 1]));
-    for (route, status) in list_route_statuses(&holed, &probe).await {
+    for (route, status) in list_route_statuses(&holed).await {
         assert_eq!(
             status,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -714,7 +601,6 @@ async fn each_list_is_answered_only_on_its_own_upstream_count() {
             )
         })
         .collect();
-    let probe = hex32(&bc_for(0));
     for (case, feeds) in [
         (
             "only the first list fed",
@@ -734,14 +620,14 @@ async fn each_list_is_answered_only_on_its_own_upstream_count() {
                 .with_shim_stores(declared)
                 .with_mirror_feeds(Arc::new(move || feeds.clone()))
         });
-        for (route, status) in list_route_statuses_for(&router, &LIST_KEY, &probe).await {
+        for (route, status) in list_route_statuses_for(&router, &LIST_KEY).await {
             assert_eq!(
                 status,
                 StatusCode::OK,
                 "{route} on the counted list, {case}"
             );
         }
-        for (route, status) in list_route_statuses_for(&router, &OTHER_LIST, &probe).await {
+        for (route, status) in list_route_statuses_for(&router, &OTHER_LIST).await {
             assert_eq!(
                 status,
                 StatusCode::SERVICE_UNAVAILABLE,

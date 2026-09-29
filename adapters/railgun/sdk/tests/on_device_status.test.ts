@@ -443,7 +443,7 @@ describe("on-device status", () => {
     ]);
     expect(got).toStrictEqual({ [commitmentAt(0)]: { [LIST]: "Valid" } });
     await expect(sdk.getPOIsPerList([LIST], [transact(commitmentAt(0x45))])).rejects.toSatisfy(
-      (error: unknown) => RavenError.is(error, "InvalidQuery"),
+      (error: unknown) => RavenError.is(error, "Storage"),
     );
   });
 });

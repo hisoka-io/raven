@@ -153,6 +153,42 @@ export function decodeClientPirQueryBundle(buf: Uint8Array): ClientPirQueryBundl
   };
 }
 
+const FLOOR_REFUSAL = "parameter floor refused";
+const ENTROPY_REFUSAL = "OS entropy unavailable";
+
+/**
+ * Run one call into the wasm, raising what it throws as a `RavenError`: the wasm throws bare
+ * strings. A parameter set outside the client's floors is a `DecodeError`, as is anything else the
+ * wasm refuses, since it refuses only bytes the node served: the same bytes are refused again, so
+ * none is retryable. A missing OS random source is `InvalidQuery`, as in `uniformRandomBelow`.
+ */
+export function callWasm<T>(operation: string, call: () => T): T {
+  try {
+    return call();
+  } catch (cause) {
+    if (cause instanceof RavenError) throw cause;
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    if (detail.startsWith(FLOOR_REFUSAL)) {
+      throw RavenError.decodeError(
+        `${operation}: the node serves a PIR parameter set outside this client's floors ` +
+          `(${detail}); use a node that serves the shipped parameters`,
+        { cause: detail },
+      );
+    }
+    if (detail.startsWith(ENTROPY_REFUSAL)) {
+      throw RavenError.invalidQuery(
+        `${operation}: no OS random source for the PIR keys (${detail}); run the client where ` +
+          "globalThis.crypto.getRandomValues is available",
+        { cause: detail },
+      );
+    }
+    throw RavenError.decodeError(
+      `${operation}: the PIR client refused what the node served (${detail})`,
+      { cause: detail },
+    );
+  }
+}
+
 /** Install the wasm panic hook so Rust panics carry file:line. Returns false on older builds lacking the symbol. */
 export function installPanicHook(wasm: RavenInspireWasm): boolean {
   if (typeof wasm.init_panic_hook === "function") {
@@ -199,9 +235,8 @@ export async function loadClientPirContext(
   const { wasm, instanceId, crsBincode, shardConfigBincode, inspireParamsBincode, entrySize } =
     input;
 
-  const paramsBundle = wasm.build_instance_params_blob(
-    inspireParamsBincode,
-    shardConfigBincode,
+  const paramsBundle = callWasm("loadClientPirContext", () =>
+    wasm.build_instance_params_blob(inspireParamsBincode, shardConfigBincode),
   );
 
   const canCache =
@@ -227,8 +262,7 @@ export async function loadClientPirContext(
       } catch {
       }
     }
-    const session = wasm.build_client_session(paramsBundle, crsBincode);
-    wasm.register_client_session(session, paramsBundle);
+    const session = buildSession();
     try {
       const blob = wasm.serialize_client_session!(session);
       await idbPut(instanceId, crsHash, blob);
@@ -242,9 +276,16 @@ export async function loadClientPirContext(
 
   return coldPath();
 
+  function buildSession(): RavenInspireClientSession {
+    return callWasm("loadClientPirContext", () => {
+      const session = wasm.build_client_session(paramsBundle, crsBincode);
+      wasm.register_client_session(session, paramsBundle);
+      return session;
+    });
+  }
+
   function coldPath(): LoadClientPirContextResult {
-    const session = wasm.build_client_session(paramsBundle, crsBincode);
-    wasm.register_client_session(session, paramsBundle);
+    const session = buildSession();
     return {
       context: { wasm, session, crsBincode, shardConfigBincode, entrySize },
       cacheHit: false,

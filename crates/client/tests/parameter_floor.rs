@@ -2,8 +2,13 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use raven_client::{check_parameter_floor, ParameterFloorError, MAX_Q, SHIPPED_SIGMA};
+use raven_client::{
+    build_seeded_query_rust, check_parameter_floor, ParameterFloorError, MAX_GADGET_LEN, MAX_Q,
+    SHIPPED_SIGMA,
+};
+use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, DEFAULT_CRT_MODULI};
+use raven_inspire::{setup, ClientSession};
 
 fn shipped() -> InspireParams {
     InspireParams::secure_128_d2048()
@@ -96,4 +101,55 @@ fn a_gadget_wider_than_its_base_needs_is_refused() {
         check_parameter_floor(&degenerate_base),
         Err(ParameterFloorError::GadgetWidth { covering: 0, .. })
     ));
+}
+
+/// Keys and queries grow with the digit count, so a smaller base buys no more digits than the
+/// shipped preset has, even where every digit is needed to cover `q`.
+#[test]
+fn a_gadget_with_more_digits_than_the_shipped_preset_is_refused() {
+    let preset = shipped();
+    assert_eq!(
+        (
+            preset.gadget_base,
+            preset.query_gadget_len,
+            preset.packing_gadget_len
+        ),
+        (1 << 20, MAX_GADGET_LEN, MAX_GADGET_LEN)
+    );
+    for (gadget_base, len) in [(2, 60), ((1 << 20) - 1, 4)] {
+        let params = InspireParams {
+            gadget_base,
+            query_gadget_len: len,
+            packing_gadget_len: len,
+            ..shipped()
+        };
+        params
+            .validate()
+            .expect("base covers q in exactly len digits");
+        assert_eq!(
+            check_parameter_floor(&params),
+            Err(ParameterFloorError::GadgetDigits { role: "query", len }),
+            "base {gadget_base}"
+        );
+    }
+}
+
+/// Only the unit-test harness lifts the floors; this crate's own integration tests link the same
+/// floored library a dependent does.
+#[test]
+fn an_integration_build_enforces_the_floors() {
+    let params = InspireParams {
+        ring_dim: 256,
+        ..shipped()
+    };
+    let mut sampler = GaussianSampler::new(params.sigma);
+    let (crs, encoded, secret_key) =
+        setup(&params, &vec![0u8; params.ring_dim * 32], 32, &mut sampler).expect("setup");
+    let session = ClientSession::new(crs, secret_key, &mut sampler).expect("session");
+    let refusal =
+        build_seeded_query_rust(&session, &params, &encoded.config, 0).expect_err("refused");
+    assert!(
+        refusal.contains("ring_dim 256 is outside [2048, 4096]"),
+        "{refusal}"
+    );
 }

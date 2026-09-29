@@ -154,9 +154,8 @@ const COVERAGE_REFUSALS_TOTAL: &str = "raven_railgun_shim_coverage_refusals_tota
 
 const COMMIT_TREE_ROUTE: &str = "commit-tree-merkle-proof";
 
-/// The shim list routes that are mounted unconditionally, so the exact refusal counts
-/// below do not move with whichever index channel is compiled in.
-const LIST_ROUTES: [&str; 1] = ["merkle-proofs"];
+/// The shim list routes, each asked once below so a refusal count of one is exact.
+const LIST_ROUTES: [&str; 1] = ["bc-prefixes"];
 
 fn hex32(bytes: &[u8; 32]) -> String {
     use std::fmt::Write as _;
@@ -235,17 +234,13 @@ async fn ask_list_routes(
     addr: SocketAddr,
     list_key: &str,
 ) -> Vec<(&'static str, reqwest::StatusCode)> {
-    let client = reqwest::Client::new();
-    let probe = hex32(&raven_railgun_testkit::canonical(0x71));
-    let base = format!("http://{addr}");
     vec![(
-        "merkle-proofs",
-        client
-            .post(format!("{base}/v1/poi/merkle-proofs"))
-            .json(&serde_json::json!({ "listKey": list_key, "blindedCommitments": [probe] }))
+        "bc-prefixes",
+        reqwest::Client::new()
+            .get(format!("http://{addr}/v1/poi/{list_key}/bc-prefixes"))
             .send()
             .await
-            .expect("merkle-proofs")
+            .expect("bc-prefixes")
             .status(),
     )]
 }

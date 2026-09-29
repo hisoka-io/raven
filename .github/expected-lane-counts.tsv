@@ -49,4 +49,5 @@ durability-and-closure/closure	4
 # into the index-channel tests. Its fixtures now seed a sealed block as one run: about 1.7 s per
 # test that seeds one, and 8.3 s for the five-block test, measured under ci-test. The earlier
 # "cheap" was wrong: each of those tests then seeded its own sealed block at about 33 s.
-production-cell-closure/inline	37
+# 2026-09-29: production-cell-closure/inline 37 -> 36: the plaintext merkle-proofs route and its test were removed.
+production-cell-closure/inline	36

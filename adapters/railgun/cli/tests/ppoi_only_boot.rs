@@ -130,14 +130,10 @@ fn leaf_at(index: u64) -> [u8; 32] {
     leaf
 }
 
-/// Holds rows `0..rows` of the test list, signed, with the roots upstream publishes, and returns
-/// those roots.
+/// Holds rows `0..rows` of the test list, signed, with the roots upstream publishes.
 /// A page starting at or past `held_back_from` is not answered until `true` is sent, so a cold
 /// sync can be stopped part-way with every page it has had so far come back full.
-async fn upstream_holding(
-    rows: u64,
-    held_back_from: u64,
-) -> (String, Vec<[u8; 32]>, watch::Sender<bool>) {
+async fn upstream_holding(rows: u64, held_back_from: u64) -> (String, watch::Sender<bool>) {
     let mut roots = Vec::new();
     let mut tree = raven_railgun_engine::imt::Imt::new().expect("imt");
     for index in 0..rows {
@@ -147,7 +143,7 @@ async fn upstream_holding(
         roots.push(tree.root());
     }
     let (release, released) = watch::channel(false);
-    let served = Arc::new(roots.clone());
+    let served = Arc::new(roots);
     let app = Router::new().route(
         "/",
         post(move |Json(request): Json<Value>| {
@@ -185,7 +181,7 @@ async fn upstream_holding(
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve");
     });
-    (url, roots, release)
+    (url, release)
 }
 
 /// Counts every connection and closes it unanswered: a chain indexer that started would be
@@ -335,26 +331,16 @@ async fn sync_progress(
     (feed.rows_held, feed.next_index, feed.upstream_rows, rows)
 }
 
-/// Every list route, in order, asked about `bc`. No `Authorization`: the read path is public.
-async fn list_routes(addr: SocketAddr, bc: &str) -> Vec<(&'static str, reqwest::Response)> {
-    let client = reqwest::Client::new();
-    let base = format!("http://{addr}/v1/poi");
-    let get = |path: &str| client.get(format!("{base}/{LIST_HEX}/{path}")).send();
-    vec![
-        (
-            "merkle-proofs",
-            client
-                .post(format!("{base}/merkle-proofs"))
-                .json(&json!({ "listKey": LIST_HEX, "blindedCommitments": [bc] }))
-                .send()
-                .await
-                .expect("merkle-proofs"),
-        ),
-        (
-            "bc-prefixes",
-            get("bc-prefixes").await.expect("bc-prefixes"),
-        ),
-    ]
+/// Every list route, in order. No `Authorization`: the read path is public.
+async fn list_routes(addr: SocketAddr) -> Vec<(&'static str, reqwest::Response)> {
+    vec![(
+        "bc-prefixes",
+        reqwest::Client::new()
+            .get(format!("http://{addr}/v1/poi/{LIST_HEX}/bc-prefixes"))
+            .send()
+            .await
+            .expect("bc-prefixes"),
+    )]
 }
 
 async fn coverage_refusals(addr: SocketAddr, route: &str) -> u64 {
@@ -378,8 +364,8 @@ async fn coverage_refusals(addr: SocketAddr, route: &str) -> u64 {
 }
 
 /// Each list route refuses, and through the coverage proof rather than for want of a store.
-async fn assert_every_list_route_refuses(addr: SocketAddr, bc: &str) {
-    for (route, response) in list_routes(addr, bc).await {
+async fn assert_every_list_route_refuses(addr: SocketAddr) {
+    for (route, response) in list_routes(addr).await {
         assert_eq!(
             response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -393,26 +379,14 @@ async fn assert_every_list_route_refuses(addr: SocketAddr, bc: &str) {
     }
 }
 
-/// Every route answers over the list upstream holds, one row per root in `roots`: its last row
-/// with upstream's root, a row past it as absent, and every row in the index at its global
-/// position. The list is shorter than a block, so one index segment is all of it.
-async fn assert_list_routes_answer_the_whole_list(addr: SocketAddr, roots: &[[u8; 32]]) {
-    let rows = u64::try_from(roots.len()).unwrap();
-    let last = hex::encode(leaf_at(rows - 1));
-    let mut routes = list_routes(addr, &last).await.into_iter();
-    let (_, proof) = routes.next().expect("merkle-proofs");
-    assert_eq!(
-        proof.status(),
-        StatusCode::OK,
-        "merkle-proofs refused at the tip"
-    );
-    let proof: Value = proof.json().await.expect("merkle-proofs body");
-    assert_eq!(
-        proof[0]["root"],
-        hex::encode(roots[roots.len() - 1]),
-        "the proof's root is the one upstream published for that row"
-    );
-    let (_, index) = routes.next().expect("bc-prefixes");
+/// The index answers over the list upstream holds, every row at its global position. The list
+/// is shorter than a block, so one index segment is all of it.
+async fn assert_list_routes_answer_the_whole_list(addr: SocketAddr, rows: u64) {
+    let (_, index) = list_routes(addr)
+        .await
+        .into_iter()
+        .next()
+        .expect("bc-prefixes");
     let index = read_segment(index).await;
     assert_eq!(
         index.status,
@@ -434,18 +408,6 @@ async fn assert_list_routes_answer_the_whole_list(addr: SocketAddr, roots: &[[u8
         (index.rows.len(), misplaced),
         (expected.len(), None),
         "every row sits at its global position in the index"
-    );
-
-    let past = hex::encode(leaf_at(rows + 7));
-    let (_, response) = list_routes(addr, &past)
-        .await
-        .into_iter()
-        .next()
-        .expect("merkle-proofs");
-    assert_eq!(
-        response.status(),
-        StatusCode::NOT_FOUND,
-        "a row past the end of a list upstream has ended is absent"
     );
 }
 
@@ -674,7 +636,7 @@ async fn the_ppoi_only_example_boots_and_answers_list_routes_only_at_upstreams_t
     const ROWS: u64 = 1_010;
     const FIRST_PAGE: u64 = 501;
     let root = tempfile::tempdir().expect("tempdir");
-    let (endpoint, roots, release) = upstream_holding(ROWS, FIRST_PAGE).await;
+    let (endpoint, release) = upstream_holding(ROWS, FIRST_PAGE).await;
     let config = write_config(
         root.path(),
         &rekeyed(&example()),
@@ -699,7 +661,7 @@ async fn the_ppoi_only_example_boots_and_answers_list_routes_only_at_upstreams_t
         (501, None),
         "fixture: a cold sync part-way, its last page full"
     );
-    assert_every_list_route_refuses(addr, &hex::encode(leaf_at(0))).await;
+    assert_every_list_route_refuses(addr).await;
 
     release.send(true).expect("upstream listening");
     let caught_up = until_done_or_stalled("the feed at upstream's tip", async || {
@@ -724,7 +686,7 @@ async fn the_ppoi_only_example_boots_and_answers_list_routes_only_at_upstreams_t
         0,
         "fixture: block 1 is ahead of the list"
     );
-    assert_list_routes_answer_the_whole_list(addr, &roots).await;
+    assert_list_routes_answer_the_whole_list(addr, ROWS).await;
 
     let tree = reqwest::Client::new()
         .post(format!("http://{addr}/v1/commit-tree/0/merkle-proof"))

@@ -39,6 +39,31 @@ class MemoryStore implements PoiListIndexStore {
   }
 }
 
+/** A store whose reads take the bytes at once and hand them back only when opened, like a slow
+ *  disk that has already read the old record. */
+class GatedStore extends MemoryStore {
+  reads = 0;
+  private opened: Promise<void> | undefined;
+  private release: () => void = () => undefined;
+
+  hold(): void {
+    this.opened = new Promise((resolve) => {
+      this.release = resolve;
+    });
+  }
+
+  open(): void {
+    this.release();
+  }
+
+  override async load(key: string): Promise<Uint8Array | undefined> {
+    const record = this.records.get(key);
+    this.reads += 1;
+    await this.opened;
+    return record;
+  }
+}
+
 function listOf(rows: number): MockList {
   return { commitments: Array.from({ length: rows }, (_unused, row) => commitmentAt(row)) };
 }
@@ -417,6 +442,41 @@ describe("an index the node no longer vouches for", () => {
     await expect(sdk.poiListIndexCandidates(LIST_KEY_HEX, commitmentAt(1))).rejects.toThrow(
       /no index is held/,
     );
+  });
+
+  it("resetPoiListIndex waits for a store read under way, so the read cannot land after it", async () => {
+    mountPrefixChannel(server, LIST_KEY_HEX, listOf(5));
+    const store = new GatedStore();
+    await client(store).syncPoiListIndex(LIST_KEY_HEX);
+    const restarted = client(store);
+    store.hold();
+    const readsBefore = store.reads;
+    const reading = restarted.poiListIndexCandidates(LIST_KEY_HEX, commitmentAt(1));
+    expect(store.reads).toBe(readsBefore + 1);
+
+    const reset = restarted.resetPoiListIndex(LIST_KEY_HEX);
+    store.open();
+    await Promise.allSettled([reading, reset]);
+    await reset;
+
+    await expect(restarted.poiListIndexCandidates(LIST_KEY_HEX, commitmentAt(1))).rejects.toThrow(
+      /no index is held/,
+    );
+  });
+
+  it("resetPoiListIndex reports a store that could not clear as a storage failure", async () => {
+    mountPrefixChannel(server, LIST_KEY_HEX, listOf(3));
+    const store = new MemoryStore();
+    const sdk = client(store);
+    await sdk.syncPoiListIndex(LIST_KEY_HEX);
+    store.failSaves = true;
+    const thrown = await sdk.resetPoiListIndex(LIST_KEY_HEX).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(RavenError.is(thrown, "Storage"), `got ${String(thrown)}`).toBe(true);
+    expect((thrown as RavenError).retryable).toBe(false);
+    expect(String((thrown as Error).message)).toContain("could not clear list");
   });
 
   it("discards a stored index stamped with another epoch and reads the node's list again", async () => {

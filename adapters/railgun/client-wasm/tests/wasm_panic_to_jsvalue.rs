@@ -3,7 +3,7 @@
 //!
 //! Only the path-index exports are covered here: the query/extract/decode surface is
 //! `pub use raven_client::*` (src/lib.rs), so its panic-safety tests live with the
-//! function bodies in `crates/client/tests/panic_safety.rs`, which CI actually runs.
+//! function bodies in `crates/client/src/suites/panic_safety.rs`, which CI actually runs.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 #![cfg(not(target_arch = "wasm32"))]

@@ -1,7 +1,7 @@
 //! WASM client functional round trip: build a query and extract a response
 //! through the `_rust` mirrors of the wasm-bindgen wrappers, under Node.
 //!
-//! Run: `wasm-pack test --node --manifest-path crates/client/Cargo.toml`
+//! Run: `wasm-pack test --node crates/client --lib`
 //! (the native timing half lives in `benches/wasm_client_native_bench.rs`).
 
 #![allow(

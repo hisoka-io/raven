@@ -1605,8 +1605,7 @@ fn page_bounds(requests: &Requests) -> Vec<(u64, u64)> {
 /// declare: the shipped block 0, fed from an upstream holding rows past it. The feed asks for the
 /// six and no further, readiness names block 1, and no list route answers for a row no declared
 /// block holds. Declared and restarted, block 1 is fed from its first row, readiness is up past
-/// 65,536 rows, and the list routes answer a row of block 1 at its global index from block 1's
-/// own store.
+/// 65,536 rows, and the index carries a row of block 1 at its global index.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_feed_stops_at_the_last_declared_row_names_the_next_block_and_feeds_it_once_declared() {
     let block = u64::from(LEAVES_PER_PPOI_BLOCK);
@@ -1616,9 +1615,6 @@ async fn a_feed_stops_at_the_last_declared_row_names_the_next_block_and_feeds_it
     let data_root = tempfile::tempdir().expect("tempdir");
     let tree = leave_rows_committed(data_root.path(), &[PATHS_BLOCK_0], held);
     let roots = roots_past(tree, held, beyond);
-    let block_1_root = *roots
-        .get(&(block + beyond - 1))
-        .expect("block 1's last root");
     let (endpoint, requests) =
         upstream_answering(move |index| roots.get(&index).copied(), Duration::ZERO).await;
 
@@ -1656,11 +1652,11 @@ async fn a_feed_stops_at_the_last_declared_row_names_the_next_block_and_feeds_it
         [(held, block - 1)],
         "one page, cut at the last row a declared block holds"
     );
-    let (status, _) = merkle_proof(booting.addr, block).await;
+    let segment = read_segment(bc_prefixes_since(booting.addr, block).await).await;
     assert_ne!(
-        status,
-        StatusCode::OK,
-        "a proof for a row no declared block holds must not be served"
+        segment.status.as_u16(),
+        200,
+        "no index segment may be served past the rows the declared blocks hold: {segment:?}"
     );
     shut_down_settled(booting, &view).await;
 
@@ -1692,37 +1688,14 @@ async fn a_feed_stops_at_the_last_declared_row_names_the_next_block_and_feeds_it
         "a delivery to the declared block clears its mark: {body:?}"
     );
 
-    assert_row_answered_from_its_block(booting.addr, block, block_1_root).await;
+    assert_row_indexed_at_its_global_position(booting.addr, block).await;
     shut_down(booting).await;
 }
 
-/// List row `index`, past block 0, is answered by the block holding it: its proof ends on that
-/// block's `root`, which block 0's tree over the same rows does not have, and the index carries
-/// it at its global position rather than the block-local one.
-async fn assert_row_answered_from_its_block(addr: SocketAddr, index: u64, root: [u8; 32]) {
-    let (status, proof) = merkle_proof(addr, index).await;
-    assert_eq!(status, StatusCode::OK, "{proof}");
-    assert_eq!(
-        (
-            proof.pointer("/0/leaf").and_then(Value::as_str),
-            proof.pointer("/0/root").and_then(Value::as_str)
-        ),
-        (
-            Some(hex::encode(leaf_at(index)).as_str()),
-            Some(hex::encode(root).as_str())
-        ),
-        "the proof must come from the block holding the row: {proof}"
-    );
-    let segment = read_segment(
-        reqwest::Client::new()
-            .get(format!(
-                "http://{addr}/v1/poi/{LIST_HEX}/bc-prefixes?since={index}"
-            ))
-            .send()
-            .await
-            .expect("bc-prefixes"),
-    )
-    .await;
+/// List row `index`, past block 0, sits in the index at its global position rather than the
+/// block-local one.
+async fn assert_row_indexed_at_its_global_position(addr: SocketAddr, index: u64) {
+    let segment = read_segment(bc_prefixes_since(addr, index).await).await;
     assert_eq!(segment.status.as_u16(), 200, "{segment:?}");
     assert_eq!(
         (segment.base, segment.rows.first()),
@@ -1731,19 +1704,15 @@ async fn assert_row_answered_from_its_block(addr: SocketAddr, index: u64, root: 
     );
 }
 
-/// `POST /v1/poi/merkle-proofs` for list row `index`, uncredentialed as a wallet sends it.
-async fn merkle_proof(addr: SocketAddr, index: u64) -> (StatusCode, Value) {
-    let response = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/poi/merkle-proofs"))
-        .json(&json!({
-            "listKey": LIST_HEX,
-            "blindedCommitments": [hex::encode(leaf_at(index))],
-        }))
+/// `GET /v1/poi/:list/bc-prefixes?since=index`, uncredentialed as a wallet sends it.
+async fn bc_prefixes_since(addr: SocketAddr, index: u64) -> reqwest::Response {
+    reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/v1/poi/{LIST_HEX}/bc-prefixes?since={index}"
+        ))
         .send()
         .await
-        .expect("merkle-proofs");
-    let status = StatusCode::from_u16(response.status().as_u16()).expect("status");
-    (status, response.json().await.unwrap_or(Value::Null))
+        .expect("bc-prefixes")
 }
 
 /// Where a cold sync runs out of declared blocks, through the production boot: the shipped

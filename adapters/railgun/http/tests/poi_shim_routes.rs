@@ -211,92 +211,6 @@ async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn merkle_proofs_route_returns_proof_per_blinded_commitment() {
-    let (router, list_key, store) = build_router_with_store();
-    let lk_hex = hex_encode_bytes(&list_key);
-    let bc = fr_canonical(0x22);
-    let bc_hex = hex_encode_bytes(&bc);
-    let payload = serde_json::json!({
-        "listKey": lk_hex,
-        "blindedCommitments": [bc_hex],
-    });
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/v1/poi/merkle-proofs")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(payload.to_string()))
-        .expect("build req");
-    let resp = router.oneshot(req).await.expect("dispatch");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = body_bytes(resp).await;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("decode");
-    let arr = json.as_array().expect("array");
-    assert_eq!(arr.len(), 1);
-    let entry = &arr[0];
-    assert_eq!(entry["leaf"].as_str(), Some(bc_hex.as_str()));
-
-    let expected = {
-        let guard = store.lock();
-        let idx = guard
-            .ppoi_index_of(&list_key, &bc)
-            .expect("seeded bc must have an index");
-        assert_eq!(idx, 1, "0x22 was seeded at list index 1");
-        guard
-            .ppoi_merkle_proof(&list_key, idx)
-            .expect("store proof for seeded slot")
-    };
-    assert_served_proof_matches_store(entry, &expected);
-}
-
-/// Wallets send keys and commitments with or without `0x`; both must reach the same slot.
-#[tokio::test]
-async fn merkle_proofs_route_answers_a_0x_prefixed_list_key_and_commitment() {
-    let (router, list_key, store) = build_router_with_store();
-    let bc = fr_canonical(0x22);
-    let payload = serde_json::json!({
-        "listKey": format!("0x{}", hex_encode_bytes(&list_key)),
-        "blindedCommitments": [format!("0x{}", hex_encode_bytes(&bc).to_uppercase())],
-    });
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/v1/poi/merkle-proofs")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(payload.to_string()))
-        .expect("build req");
-    let resp = router.oneshot(req).await.expect("dispatch");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).expect("decode");
-    let entry = &json.as_array().expect("array")[0];
-    let expected = {
-        let guard = store.lock();
-        let idx = guard.ppoi_index_of(&list_key, &bc).expect("seeded");
-        guard
-            .ppoi_merkle_proof(&list_key, idx)
-            .expect("store proof")
-    };
-    assert_served_proof_matches_store(entry, &expected);
-}
-
-#[tokio::test]
-async fn merkle_proofs_route_404s_unknown_blinded_commitment() {
-    let (router, list_key) = build_router();
-    let lk_hex = hex_encode_bytes(&list_key);
-    let bc_hex = hex_encode_bytes(&fr_canonical(0xff));
-    let payload = serde_json::json!({
-        "listKey": lk_hex,
-        "blindedCommitments": [bc_hex],
-    });
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/v1/poi/merkle-proofs")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(payload.to_string()))
-        .expect("build req");
-    let resp = router.oneshot(req).await.expect("dispatch");
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
 async fn commit_tree_merkle_proof_route_returns_path() {
     let (router, _list_key, store) = build_router_with_store();
     let payload = serde_json::json!({ "leafIndex": 0u32 });
@@ -362,36 +276,23 @@ async fn six_byte_prefix_channel_is_binary_and_index_ordered() {
     );
 }
 
-async fn post_json(router: Router, uri: &str, payload: &serde_json::Value) -> StatusCode {
+/// A blinded commitment in a request body names the wallet's note to the server: the proof comes
+/// by PIR, so the route that took them in the clear is not served.
+#[tokio::test]
+async fn the_plaintext_merkle_proofs_route_is_gone() {
+    let (router, list_key) = build_router();
+    let payload = serde_json::json!({
+        "listKey": hex_encode_bytes(&list_key),
+        "blindedCommitments": [hex_encode_bytes(&fr_canonical(0x22))],
+    });
     let req = Request::builder()
         .method(Method::POST)
-        .uri(uri)
+        .uri("/v1/poi/merkle-proofs")
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(payload.to_string()))
         .expect("build req");
-    router.oneshot(req).await.expect("dispatch").status()
-}
-
-#[tokio::test]
-async fn merkle_proofs_rejects_more_blinded_commitments_than_the_cap() {
-    let (router, list_key) = build_router();
-    let bcs: Vec<String> = (0..1025u64)
-        .map(|i| {
-            let mut bc = [0u8; 32];
-            bc[16..24].copy_from_slice(&i.to_be_bytes());
-            hex_encode_bytes(&bc)
-        })
-        .collect();
-    let payload = serde_json::json!({
-        "listKey": hex_encode_bytes(&list_key),
-        "blindedCommitments": bcs,
-    });
-    assert_eq!(
-        post_json(router, "/v1/poi/merkle-proofs", &payload).await,
-        StatusCode::PAYLOAD_TOO_LARGE,
-        "1025 blinded commitments must be refused before the store lock is taken; \
-         uncapped this body walks every entry and answers 404 on the first unknown BC"
-    );
+    let resp = router.oneshot(req).await.expect("dispatch");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 /// The ETag is the digest of the body that was served, so a same-epoch rewrite

@@ -1,0 +1,4 @@
+# pnpm 10.6 or newer reads its settings here, and npm never reads this file, so no npm command
+# warns about them. The wasm packages are optional peers a wallet installs itself; the dev tree
+# links pkg-node.
+autoInstallPeers: false

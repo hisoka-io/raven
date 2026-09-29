@@ -10,7 +10,7 @@
 //! unwind (`wasm-bindgen-0.2.123/src/lib.rs:1311`, "function not implemented on
 //! non-wasm32 targets"), aborting the process with SIGABRT. `catch_unwind` cannot
 //! observe it. So a native test cannot assert `Err` here - it can only assert that
-//! the guard does NOT fire, which is the accept case below. `tests/panic_safety.rs:1-3`
+//! the guard does NOT fire, which is the accept case below. `panic_safety.rs:1-3`
 //! records the same constraint for the other wrappers.
 //!
 //! The comparisons are a disjunction over every algebraic parameter, so

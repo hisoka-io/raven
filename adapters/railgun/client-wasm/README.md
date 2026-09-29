@@ -12,10 +12,10 @@ Two builds of one wasm, published as two packages:
 ## Install
 
 ```sh
-npm install @hisoka-io/railgun-poi-node-interface @hisoka-io/raven-inspire-client-wasm
+npm install @hisoka-io/railgun-poi-node-interface@alpha @hisoka-io/raven-inspire-client-wasm@alpha
 ```
 
-A browser bundle installs `@hisoka-io/raven-inspire-client-wasm-bundler` in its place.
+A browser bundle installs `@hisoka-io/raven-inspire-client-wasm-bundler@alpha` in its place.
 
 ## Example
 
@@ -29,7 +29,7 @@ const { context } = await loadClientPirContext({ wasm, instanceId: "ppoi-paths-o
 
 Before it derives a key, the client refuses a served parameter set outside the shipped bounds:
 ring dimension 2048 to 4096, modulus at most 2^60 - 2^14 + 1, error width exactly 6.4, and
-gadgets no wider than their base needs to cover the modulus.
+gadgets of at most 3 digits, no more than their base needs to cover the modulus.
 Each package carries `raven_inspire_client_wasm_bg.wasm.sha256`, which `sha256sum -c` checks
 against the wasm beside it.
 

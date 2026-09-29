@@ -5,7 +5,7 @@
 //! disagrees with its own shape is refused at the producer instead of quietly shrinking the
 //! baseline. The response form is carried independently at
 //! `adapters/railgun/cli/tests/production_cell.rs` and the query form at
-//! `crates/client/tests/query_generation_budget.rs`; all three agree at `d = 2048`.
+//! `crates/client/src/suites/query_generation_budget.rs`; all three agree at `d = 2048`.
 
 /// Bit width the tight coefficient packer uses for `modulus`.
 #[must_use]

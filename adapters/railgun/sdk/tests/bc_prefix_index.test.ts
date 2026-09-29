@@ -291,4 +291,23 @@ describe("the six-byte index channel", () => {
     expect(RavenError.is(thrown, "DecodeError"), `got ${String(thrown)}`).toBe(true);
     expect(String((thrown as Error).message)).toContain("expected 24");
   });
+
+  // A 416 says the list ends before the cursor; one whose own total reaches the cursor contradicts
+  // itself, and read as the list's end it would turn rows the node holds into absences.
+  it("refuses a 416 whose reported total reaches the cursor it refused", async () => {
+    for (const total of [0, 3]) {
+      server.reset();
+      server.route(
+        (req) => (req.url ?? "").includes("bc-prefixes"),
+        (_req, _body, res) => {
+          res.writeHead(416, { "x-raven-index-total": String(total) });
+          res.end();
+          return true;
+        },
+      );
+      const thrown = await refusal(fetchBcPrefixIndex(fetch, server.url, LIST_KEY_HEX, {}));
+      expect(RavenError.is(thrown, "DecodeError"), `total ${total}: got ${String(thrown)}`).toBe(true);
+      expect(String((thrown as Error).message)).toContain(`reports ${total} rows, which would include it`);
+    }
+  });
 });
