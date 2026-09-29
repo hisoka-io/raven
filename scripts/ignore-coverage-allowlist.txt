@@ -68,6 +68,8 @@ adapters/railgun/cli/tests/ppoi_capture_root_oracle.rs::every_captured_row_appli
 #  - the capture signature oracle checks every captured row's signature, about 20 s, and needs
 #    the same untracked capture named by PPOI_REPLAY_CAPTURE.
 adapters/railgun/ppoi-replay/tests/capture_signatures.rs::every_captured_row_verifies_at_ingest_and_planted_forgeries_are_refused
+#  - the staging differential replays the same untracked capture through both ingest paths, about 400 s.
+adapters/railgun/engine/src/inspire/logical_store.rs::staging_matches_validate_then_apply_over_a_recorded_capture
 #  - the fixture generator WRITES the fixture bytes it pins. Running it in a lane would
 #    overwrite the evidence the V7 layout test exists to check.
 adapters/railgun/engine/src/inspire.rs::mint_frozen_v8_store_fixture

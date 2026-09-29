@@ -244,7 +244,9 @@ pub(crate) async fn fanout_handler(
     // Captured ONCE so validation and every worker read the same snapshot.
     let snapshot_for_fanout = instance.current_snapshot();
     let epoch_at_start = snapshot_for_fanout.epoch;
-    let shard_count = snapshot_for_fanout.state.encoded_db.shards.len();
+    // The declared count: an unfilled cell encodes one shard that serves for all of them.
+    let shard_count = usize::try_from(snapshot_for_fanout.state.encoded_db.config.num_shards())
+        .unwrap_or(usize::MAX);
 
     let shared_query = Arc::new(query);
     let slots = expand_fanout(

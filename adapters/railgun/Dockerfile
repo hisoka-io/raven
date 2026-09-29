@@ -1,7 +1,7 @@
 # Operator binary image for raven-railgun. Build context MUST be the repo
 # root, since the adapter path-depends on crates/ outside its own workspace:
 #   docker build -t raven-railgun -f adapters/railgun/Dockerfile .
-# A stop exits at most about 8 s after SIGTERM, inside Docker's default 10 s stop timeout.
+# Shutdown can wait 5 s per instance; run with --stop-timeout 60 so a slow disk never cuts the final commit.
 
 FROM rust:1.98.0-slim-bookworm AS build
 RUN apt-get update \
