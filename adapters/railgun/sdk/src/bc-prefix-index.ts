@@ -2,18 +2,11 @@
  * The 6-byte-per-row index channel, client side: segmented one PPOI block per response and
  * resumable from a cursor, so a wallet downloads the list once and then only its tail.
  *
- * What a 6-byte prefix costs, stated because it is the whole design tension: it is not a blinded
- * commitment, so a lookup can return more than one candidate index. A blinded commitment is a
- * big-endian BN254 field element, below r = 0x30644e72e131a029..., so its first six bytes take
- * 0x30644e72e132 values, about 2^45.6 rather than 2^48. Over n uniform rows the chance that ANY two
- * share a prefix is about n^2 / 2^46.6: roughly 0.12% (1 in 820) at ~360k rows, about five times
- * the 48-bit figure -- rare, not impossible, and a client that assumed uniqueness would fail on
- * real data eventually. So the lookup returns EVERY candidate and the caller decides. That costs
- * nothing in practice: the row the server returns carries the full commitment in its first 32
- * bytes and the fold path already refuses a row whose commitment is not the one asked for, so a
- * wrong candidate is caught by a check that has to run anyway. Status fetches no row: it reads
- * any match as `Valid`, so a note whose prefix collides with a listed one reads `Valid` until its
- * proof, which binds all 32 bytes, is fetched and refused.
+ * A 6-byte prefix is not a blinded commitment, so a lookup returns every candidate index. A
+ * blinded commitment is a BN254 field element, so its first six bytes take about 2^45.6 values;
+ * over ~360k rows some two rows share a prefix with probability about 0.12%. A proof resolves
+ * candidates by the full commitment its row carries. Status fetches no row, so a note whose
+ * prefix matches a listed one reads `Valid` until its proof, which binds all 32 bytes, is refused.
  */
 
 import { RavenError } from "./errors";
@@ -106,12 +99,9 @@ function pastFrontierRefusal(past: PastFrontier): RavenError {
 /**
  * Walk the channel from row `from` to the frontier.
  *
- * A segment never crosses a PPOI block. One that ends on its block boundary is sealed: its rows
- * can never change, and it is served `immutable`, so any cache on the path may replay it for a
- * year with whatever headers it was stored under. The walk therefore trusts a sealed segment for
- * its bytes and its cursor only, and takes the list's total and epoch from the frontier, the one
- * segment that is always current. Sealed blocks read earlier hold the same rows when the frontier
- * is read, so the result is the list as of that read, never a splice of two.
+ * A sealed segment (a whole PPOI block) is served `immutable` and a cache may replay it with stale
+ * headers, so the walk takes only its bytes and cursor, and reads the list's total and epoch from
+ * the frontier, the one segment that is always current.
  */
 async function walkBcPrefixes(
   fetchImpl: typeof fetch,
@@ -220,19 +210,13 @@ export async function fetchBcPrefixIndex(
 }
 
 /**
- * Bring a held index up to the list the node serves now, comparing every re-read row with the
- * row held.
+ * Bring a held index up to the list the node serves now.
  *
- * The list is append-only, so a row the index already holds can never change: a re-read row that
- * differs is the node contradicting an earlier answer, and a node serving fewer rows than the
- * index holds cannot show any absence current against it. Both are refused rather than absorbed.
- * A frontier stamped with another epoch is another list: the held index is discarded and the
- * whole list read again.
- *
- * An absence is answered from the index alone, so by default every held row is re-read and
- * compared. A caller whose rows this node already served or confirmed passes that count as
- * `confirmedRows`, and only the tail from the aligned cursor below it is re-read. A cursor past
- * the node's list (416) resumes from the aligned cursor below the total the node reports.
+ * The list is append-only, so a re-read row that differs from the held one, or a node serving
+ * fewer rows than the index holds, is refused. A frontier with another epoch is another list, and
+ * the whole list is read again. Every held row is re-read unless the caller passes
+ * `confirmedRows`, rows this node already served or confirmed; then only the tail from the aligned
+ * cursor below it is. A 416 resumes from the aligned cursor below the total the node reports.
  */
 export async function resumeBcPrefixIndex(
   fetchImpl: typeof fetch,

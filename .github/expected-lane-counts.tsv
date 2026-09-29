@@ -21,7 +21,7 @@ durability-and-closure/engine-ignored	1
 # 2026-09-28: 6 -> 4. t1_status_closure and t2_path_closure were deleted with the status and
 # per-list-path encoders they closed; their terms left the filter in the same change.
 durability-and-closure/closure	4
-# 2026-09-07: was 21 before wave 5. binary(db2_block_production_cell) lost
+# 2026-09-07: was 21. binary(db2_block_production_cell) lost
 # block_exponent_and_payload_are_pinned_to_the_read_path_design, which asserted BLOCK_K == 10
 # against a `const BLOCK_K: usize = 10` three lines above it in the same test file; verified no
 # production symbol carries BLOCK_K, so no shipped-code change could ever red it. A sibling test

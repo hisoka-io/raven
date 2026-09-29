@@ -32,7 +32,7 @@ export interface ChainRegistryEntry {
 /** Per-request routing table; one entry per chain. */
 export class ChainRegistry {
   private readonly entries: Map<number, ChainRegistryEntry> = new Map();
-  private fetchImpl: typeof fetch;
+  private readonly fetchImpl: typeof fetch;
 
   constructor(seed: ChainRegistryEntry[] = [], fetchImpl: typeof fetch = fetch) {
     this.fetchImpl = fetchImpl;
@@ -119,11 +119,6 @@ export class ChainRegistry {
     };
     this.entries.set(chainId, next);
     return next;
-  }
-
-  /** Override the fetch impl (test hook). */
-  setFetchImpl(fetchImpl: typeof fetch): void {
-    this.fetchImpl = fetchImpl;
   }
 }
 

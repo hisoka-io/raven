@@ -63,7 +63,7 @@ wasm-pack build "${PROFILE_FLAG}" \
     --target bundler \
     --out-dir pkg-bundler
 
-finish_package() { # pkg_dir npm_name
+finish_package() { # pkg_dir npm_name build_label
     local dir="${CRATE_DIR}/$1"
     [[ -f "${dir}/${WASM}" ]] || { echo "ERROR: ${dir} has no ${WASM}" >&2; exit 3; }
     local leaked
@@ -71,22 +71,31 @@ finish_package() { # pkg_dir npm_name
     [[ -z "${leaked}" ]] || { echo "ERROR: ${leaked//$'\n'/, } carries a local path" >&2; exit 3; }
     (cd "${dir}" && sha256sum "${WASM}" > "${WASM}.sha256")
     cp "${LICENSE_FILE}" "${dir}/LICENSE"
+    # wasm-pack copies the crate README into both packages; each is titled with its own name.
+    sed -i "1s|^# .*|# $2|" "${dir}/README.md"
     node -e '
 const fs = require("node:fs");
-const [manifestPath, name, tag, record] = process.argv.slice(1);
+const path = require("node:path");
+const [manifestPath, name, tag, record, label] = process.argv.slice(1);
 const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
 manifest.name = name;
+manifest.description = `${manifest.description} (${label} build)`;
+// wasm-pack lists ./snippets/* whether or not the crate emits snippets.
+if (Array.isArray(manifest.sideEffects)) {
+  const snippets = fs.existsSync(path.join(path.dirname(manifestPath), "snippets"));
+  manifest.sideEffects = manifest.sideEffects.filter((entry) => snippets || !entry.startsWith("./snippets/"));
+}
 manifest.repository = { type: "git", url: "git+https://github.com/hisoka-io/raven.git", directory: "adapters/railgun/client-wasm" };
 manifest.homepage = "https://github.com/hisoka-io/raven";
 manifest.publishConfig = { access: "public", tag };
 if (Array.isArray(manifest.files) && !manifest.files.includes(record)) manifest.files.push(record);
 fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
-' "${dir}/package.json" "$2" "${NPM_TAG}" "${WASM}.sha256"
+' "${dir}/package.json" "$2" "${NPM_TAG}" "${WASM}.sha256" "$3"
     echo "==> $1: $(node -p 'require(process.argv[1]).name' "${dir}/package.json"), $(cut -d' ' -f1 "${dir}/${WASM}.sha256")"
 }
 
-finish_package pkg-node "${NPM_NAME}"
-finish_package pkg-bundler "${NPM_NAME}-bundler"
+finish_package pkg-node "${NPM_NAME}" Node
+finish_package pkg-bundler "${NPM_NAME}-bundler" bundler
 
 # One ceiling, owned by the size gate, which weighs the JS glue as well as the wasm.
 "${SIZE_GATE}" --no-build

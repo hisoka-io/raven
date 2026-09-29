@@ -71,13 +71,8 @@ export {
   validateListKeyHex,
 } from "./poi-pir";
 
-// Generic client-side session persistence.
-export {
-  idbGet,
-  idbPut,
-  idbClear,
-  sha256Hex,
-} from "./session-cache";
+// Erases what `persistSession: true` stored.
+export { clearPersistedSessions } from "./session-cache";
 
 // Railgun deployment routing.
 export { ChainRegistry, type ChainRegistryEntry } from "./chain-registry";

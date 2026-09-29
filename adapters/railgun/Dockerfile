@@ -12,7 +12,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 
-# allowlist COPY, so nothing else from root (run/ secrets, no-commit/) lands in
+# allowlist COPY, so nothing else from the root (local secrets, scratch) lands in
 # a build layer. Whole directories, not named crates: the external path-deps
 # inherit `version.workspace`/`lints.workspace` from the root manifest, so cargo
 # loads every root workspace member even to build one adapter binary.

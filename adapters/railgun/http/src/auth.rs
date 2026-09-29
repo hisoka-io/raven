@@ -23,10 +23,8 @@ use crate::state::AppState;
 
 /// Sticky-session identity keyed by `(instance_id, client_id)`.
 ///
-/// `client_id` is the whole discriminator. The bearer that used to be hashed into this
-/// key was ONE value shared by every caller, so it never separated two of them; the read
-/// path now carries none at all. Not an auth check - a handle presented under the wrong
-/// `client_id` is a 409, not a 401.
+/// `client_id` is the whole discriminator; the read path carries no bearer. Not an auth
+/// check: a handle presented under the wrong `client_id` is a 409, not a 401.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SessionKey {
     instance_id: InstanceId,

@@ -1,10 +1,8 @@
 //! The committed baseline, checked against itself.
 //!
-//! The gate compares a fresh run to this file. Nothing compared the file to anything, so it
-//! sat six times above the real figure for three weeks while every run scored IMPROVEMENT
-//! and exited 0. These cases give the pin a reader: it must parse, it must be self-
-//! consistent, and every byte count in it must be accompanied by the closed form that
-//! produced it - so a re-pin to a number nobody can derive fails here rather than shipping.
+//! The gate compares a fresh run to this file; these cases check the file. It must parse, it
+//! must be self-consistent, and every byte count in it must be accompanied by the closed form
+//! that produced it, so a re-pin to a number nobody can derive fails here rather than shipping.
 
 #![allow(
     clippy::expect_used,
@@ -15,9 +13,8 @@
 use bench_compare::{compare, has_regression, BenchFile, Unit, DERIVED_SUFFIX};
 use std::path::PathBuf;
 
-/// `hint_bytes` is `0` by construction: InsPIRe is hintless, and emitting a computed value
-/// for it is a recorded protection in `AGENTS.md`. It is the one byte row with no shape to
-/// derive from.
+/// `hint_bytes` is `0` by construction: InsPIRe is hintless. It is the one byte row with no
+/// shape to derive from.
 const UNDERIVED_METRICS: [&str; 1] = ["hint_bytes"];
 
 fn baselines_dir() -> PathBuf {

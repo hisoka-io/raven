@@ -61,14 +61,8 @@ function stripAndPad(hex: string): string {
 }
 
 /**
- * Left-pad a field element to 64 hex chars, refusing anything longer.
- *
- * Truncating an over-long input - which this did, keeping the LAST 64 chars - silently
- * hashes a DIFFERENT field element and returns a plausible root for input the caller
- * never supplied. There is no over-long value whose correct interpretation is "drop the
- * leading bytes": a 33-byte value is a bug at the caller, and the only safe answer is to
- * say so. Short values are still zero-padded; that is the documented contract and the
- * Rust side agrees.
+ * Left-pad a field element to 64 hex chars. Refuses input longer than 64 hex chars, since
+ * truncating it would hash a different element; shorter input is zero-padded.
  */
 function padTo64(hex: string): string {
   if (!/^[0-9a-f]*$/.test(hex)) {

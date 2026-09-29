@@ -3,16 +3,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   loadClientPirContext,
-  idbClear,
-  idbGet,
-  idbPut,
-  sha256Hex,
   type RavenInspireClientSession,
   type RavenInspireWasm,
 } from "../src/index";
 import { makeRegisterSpy } from "./helpers/register_spy";
 import {
   _setStorageForTests,
+  clearPersistedSessions,
+  idbGet,
+  idbPut,
+  sha256Hex,
   type SessionCacheStorageForTests,
 } from "../src/session-cache";
 
@@ -65,7 +65,7 @@ function makeSpyWasm(): SpyWasm {
 }
 
 afterEach(async () => {
-  await idbClear();
+  await clearPersistedSessions();
   vi.unstubAllGlobals();
   _setStorageForTests(null);
   vi.restoreAllMocks();
@@ -550,13 +550,29 @@ describe("idb chunked + integrity-verified storage", () => {
     expect(got).toBeNull();
   });
 
-  it("idbClear empties the store through real IndexedDB storage", async () => {
+  it("clearPersistedSessions empties the store through real IndexedDB storage", async () => {
     const db = installFakeIndexedDb();
     await idbPut("test", "ab".repeat(32), deterministicBlob(1024, 7));
     expect(db.records.size).toBeGreaterThan(0);
-    await idbClear();
+    await clearPersistedSessions();
     expect(db.records.size).toBe(0);
     expect(await idbGet("test", "ab".repeat(32))).toBeNull();
+  });
+
+  it("clearPersistedSessions rejects with a Storage error when the erase fails", async () => {
+    _setStorageForTests({
+      get: async () => null,
+      put: async () => undefined,
+      deletePrefix: async () => undefined,
+      clear: async () => {
+        throw new Error("injected clear failure");
+      },
+    });
+    try {
+      await expect(clearPersistedSessions()).rejects.toMatchObject({ kind: "Storage" });
+    } finally {
+      _setStorageForTests(null);
+    }
   });
 
   it("a failing backend degrades to a cache miss and a cold rebuild, never a throw", async () => {

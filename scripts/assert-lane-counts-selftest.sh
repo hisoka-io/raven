@@ -260,7 +260,7 @@ else
 fi
 
 # 0a. A binary() term naming no target cannot be narrowed, so nextest still judges the filter.
-sed 's/binary(phase4_closure)/binary(phase4_closure_renamed)/' .github/workflows/ci.yml > "$STUBS/ci-renamed.yml"
+sed 's/binary(chain_event_closure)/binary(chain_event_closure_renamed)/' .github/workflows/ci.yml > "$STUBS/ci-renamed.yml"
 if cmp -s "$STUBS/ci-renamed.yml" .github/workflows/ci.yml; then
   echo "SELFTEST CANNOT RUN: the renamed-binary plant no longer applies to ci.yml" >&2; fails=1
 elif out=$(LANE_COUNTS_WORKFLOW="$STUBS/ci-renamed.yml" bash "$GATE" --lane durability-and-closure/closure 2>&1) \

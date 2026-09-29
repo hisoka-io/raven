@@ -4,9 +4,8 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use raven_client::{
-    build_client_session, build_instance_params_blob, build_padded_batch, build_seeded_query,
-    client_packing_keys_versioned, install_server_session_handle, WasmPaddedBatchOutput,
-    WasmSeededQueryOutput,
+    build_client_session, build_instance_params_blob, build_seeded_query,
+    client_packing_keys_versioned, install_server_session_handle, WasmSeededQueryOutput,
 };
 use raven_inspire::inspiring::ClientPackingKeys;
 use raven_inspire::math::GaussianSampler;
@@ -72,45 +71,4 @@ fn wasm_exports_upload_versioned_keys_then_install_the_returned_handle() {
         query.inspiring_packing_keys.is_none(),
         "registered queries must never inline the uploaded packing keys"
     );
-}
-
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-fn wasm_padded_batch_is_ready_to_post_and_keeps_caller_order_metadata() {
-    let (mut session, shard_config) = session_fixture();
-    install_server_session_handle(&mut session, 91).expect("install handle");
-    let shard_bincode = bincode::serialize(&shard_config).expect("serialize shard config");
-    let targets = vec![3u64, 11, 42];
-    let targets_bincode = bincode::serialize(&targets).expect("serialize targets");
-
-    let encoded = build_padded_batch(&session, &shard_bincode, &targets_bincode, 1_000_000)
-        .expect("padded batch");
-    let output: WasmPaddedBatchOutput = bincode::deserialize(&encoded).expect("decode output");
-    assert_eq!(output.query_batch_bytes.get(..2), Some([0, 8].as_slice()));
-    let queries: Vec<SeededClientQuery> = bincode::deserialize(
-        output
-            .query_batch_bytes
-            .get(2..)
-            .expect("versioned batch body"),
-    )
-    .expect("decode query vector");
-    assert_eq!(queries.len(), 4);
-    assert_eq!(output.client_states_bincode.len(), targets.len());
-    assert_eq!(output.response_slots.len(), targets.len());
-    assert!(output.query_batch_bytes.len() <= 1_000_000);
-
-    let caller_indices = output
-        .client_states_bincode
-        .iter()
-        .map(|bytes| {
-            bincode::deserialize::<raven_inspire::ClientState>(bytes)
-                .expect("decode caller state")
-                .index
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(caller_indices, targets);
-    assert!(output
-        .response_slots
-        .iter()
-        .all(|slot| usize::try_from(*slot).expect("u32 fits usize") < queries.len()));
 }

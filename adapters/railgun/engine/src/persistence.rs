@@ -2574,7 +2574,7 @@ mod tests {
                 "and it must NOT clear the error run /health/ready gates on"
             );
 
-            // The contrast is the whole point: a tree mutation DOES clear it.
+            // A tree mutation does clear it.
             let mut tree = base;
             tree.record_applied_event(height);
             proptest::prop_assert_eq!(

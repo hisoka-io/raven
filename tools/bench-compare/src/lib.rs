@@ -989,20 +989,20 @@ mod unit_direction_tests {
         assert!(!has_regression(&rows));
     }
 
-    /// The failing row has to be identifiable. Every key here shares a 60-character scheme
+    /// The failing row has to be identifiable. Every key here shares a 56-character scheme
     /// slug, and a head-first cut printed all of them as the same string.
     #[test]
     fn the_rendered_row_names_the_metric_that_moved() {
         let key = |m: &str| {
-            format!("inspire-default-q-twopacking-inspiring-commit-e-handshake-solinas/2e16x32/{m}")
+            format!("inspire-default-q-twopacking-inspiring-handshake-solinas/2e16x512/{m}")
         };
         let base = file(vec![
             result(&key("query_bytes"), 15_491.0, Unit::Bytes),
-            result(&key("response_bytes"), 9_366.0, Unit::Bytes),
+            result(&key("response_bytes"), 10_446.0, Unit::Bytes),
         ]);
         let cur = file(vec![
             result(&key("query_bytes"), 15_491.0, Unit::Bytes),
-            result(&key("response_bytes"), 9_000.0, Unit::Bytes),
+            result(&key("response_bytes"), 10_000.0, Unit::Bytes),
         ]);
         let rows = compare(&base, &cur, 0.20);
         let rendered = render_human("base", "cur", 0.20, &rows);

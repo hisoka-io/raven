@@ -39,7 +39,7 @@ export type StaleDataError = RavenError<StaleDataContext> & {
   readonly context: StaleDataContext;
 };
 
-/** Kind-specific Raven error type returned by [`RavenError.is`]. */
+/** Kind-specific Raven error type narrowed by `RavenError.is`. */
 export type RavenErrorByKind<K extends RavenErrorKind> = K extends "StaleData"
   ? StaleDataError
   : RavenError & { readonly kind: K };
@@ -98,7 +98,7 @@ export class RavenError<C = RavenErrorContext> extends Error {
     return new RavenError("BatchMismatch", message, context);
   }
 
-  /** A caller-supplied store failed to read or write; `cause` carries its error. */
+  /** A store failed to read, write or erase; `cause` carries its error. */
   static storage(message: string, context: RavenErrorContext = {}): RavenError {
     return new RavenError("Storage", message, context);
   }

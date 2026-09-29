@@ -284,17 +284,23 @@ class IndexedDbStorage implements SessionCacheStorageForTests {
     const db = await this.openDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE, "readwrite");
-      const req = tx.objectStore(STORE).clear();
-      req.onsuccess = () => resolve();
-      req.onerror = () =>
+      tx.objectStore(STORE).clear();
+      // Resolve on commit, not on request success: the erase is only done once durable.
+      tx.oncomplete = () => resolve();
+      tx.onerror = () =>
         reject(
-          RavenError.decodeError(
-            `session-cache: idb.clear failed: ${req.error?.message ?? "unknown"}`,
+          RavenError.storage(
+            `session-cache: idb.clear tx failed: ${tx.error?.message ?? "unknown"}`,
+          ),
+        );
+      tx.onabort = () =>
+        reject(
+          RavenError.storage(
+            `session-cache: idb.clear tx aborted: ${tx.error?.message ?? "unknown"}`,
           ),
         );
     });
   }
-
 }
 
 function ensureBackend(): IntegrityCache {
@@ -334,11 +340,15 @@ export async function idbPut(
   }
 }
 
-/** Empty the cache. Used by tests to reset between cases. */
-export async function idbClear(): Promise<void> {
+/**
+ * Erase every session cached by `persistSession: true`, including the RLWE secret key it holds.
+ * Rejects with a `Storage` error if the erase did not commit.
+ */
+export async function clearPersistedSessions(): Promise<void> {
   try {
     await ensureBackend().clear();
-  } catch {
-    // best-effort
+  } catch (err) {
+    if (err instanceof RavenError) throw err;
+    throw RavenError.storage("session-cache: erase failed", { cause: String(err) });
   }
 }

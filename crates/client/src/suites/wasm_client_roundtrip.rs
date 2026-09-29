@@ -111,9 +111,8 @@ mod wasm_only {
     ///
     /// The wide case is 256 B, not the 512 B path record. 512 B needs ring_dim 2048: InspiRING
     /// width is `ceil(entry/2)`, which must be a power of two in `[1, 128]` at ring_dim 256, and
-    /// `ceil(512/2) = 256` is outside it. This asked for 512 B until 2026-09-07 and panicked in
-    /// `inspire_setup` on the first run because no CI job had invoked this wasm test target. The real
-    /// 512-byte path record is covered at ring_dim 2048 by the adapter's production-cell lane.
+    /// `ceil(512/2) = 256` is outside it. The 512-byte path record is covered at ring_dim 2048 by
+    /// the adapter's production-cell lane.
     #[wasm_bindgen_test]
     fn build_and_extract_per_encoder() {
         run_for_entry_bytes("bc-32B", 32);

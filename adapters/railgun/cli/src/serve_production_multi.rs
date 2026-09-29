@@ -1366,10 +1366,8 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
             });
             auxiliary_tasks.push(task);
         } else {
-            // A config that switches a safety mechanism off must say so. The 2026-08-27 tree-4
-            // outage was invisible for three days because the dropped events were logged at
-            // trace! under RUST_LOG=info; the layer above was quieter still - a node with no
-            // rollover protection said nothing at all at boot.
+            // A config that switches a safety mechanism off must say so at boot, at a level
+            // RUST_LOG=info shows.
             tracing::warn!(
                 auto_spawn_enabled = opts.auto_spawn.as_ref().is_some_and(|c| c.enabled),
                 "tree_fill_threshold is unset: tree-rollover pre-spawn is DISABLED. When the live \
@@ -1910,10 +1908,8 @@ pub(crate) struct TreeFillWatcherInputs {
     spawn_log_dir: PathBuf,
 }
 
-/// What one watcher poll decided.
-///
-/// The watcher's only entry point used to be an unbounded `loop`, which is why the mechanism whose
-/// absence caused the tree-4 rollover outage had no test. One tick is now callable on its own.
+/// What one watcher poll decided. One tick is callable on its own so the rollover decision is
+/// testable without the watcher's loop.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TickOutcome {
     /// The registry knows no trees yet.

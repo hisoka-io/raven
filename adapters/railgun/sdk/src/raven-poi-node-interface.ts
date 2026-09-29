@@ -149,7 +149,7 @@ export interface BlindedCommitmentData {
   type: BlindedCommitmentType;
 }
 
-/** Outer key BC, inner list key, each as the caller spelled it; mirrors upstream `POIsPerListMap`. */
+/** Outer key blinded commitment, inner list key, each as the caller spelled it; mirrors upstream `POIsPerListMap`. */
 export interface PoisPerListResponse {
   [bcHex: string]: { [listKey: string]: POIStatus };
 }
@@ -1036,12 +1036,12 @@ export class RavenPOINodeInterface {
       if (source.failure !== undefined) return indexSyncFailure(lkHex, source.failure);
       this.counters.absent += absences;
       return RavenError.invalidQuery(
-        `client-PIR: BC ${bcHex} not present in list ${lkHex} (idx unknown; the index holds the ` +
-          `${source.index.total} rows the node serves)`,
+        `client-PIR: blinded commitment ${bcHex} not present in list ${lkHex} (the index holds ` +
+          `the ${source.index.total} rows the node serves)`,
       );
     };
-    // Resolve every commitment BEFORE any row query goes out: an unknown BC refuses without having
-    // disclosed the others, and the grouping below needs the whole set in hand.
+    // Resolve every commitment before any row query goes out: an unknown blinded commitment
+    // refuses without having disclosed the others, and the grouping below needs the whole set.
     const bcHexes = blindedCommitments.map((bc) => canonicalCommitmentHex(bc));
     const candidateSets = indexCandidatesForEach(source.index, bcHexes);
     const listRows = Math.max(1, source.index.total);
@@ -1059,20 +1059,9 @@ export class RavenPOINodeInterface {
       next: 0,
     }));
 
-    // Group by block, then pad each group on the ladder. One unpadded request per commitment would
-    // cost K round trips and hand the server the exact count off a stable client id, which is what
-    // the ladder exists to hide.
-    //
-    // Two bounds on that. (1) Grouping is WITHIN a block, since each block routes to its own
-    // instance label, so commitments spread over six blocks still cost six round trips. (2) The ladder hides K within its dyadic bucket, never K itself: a chunk of k
-    // real targets goes out as P = paddedBatchLength(k) queries, and P tells the server k is in
-    // (P/2, P]. That bucket is a single value at P = 1 and P = 2, so a block group of K = 1 or
-    // K = 2, or any K whose last 32-chunk holds one or two (K mod 32 in {1, 2}), is still disclosed
-    // exactly. Zero cover slots is not the tell: K = 4 draws none and reads the same as K = 3.
-    // Flooring the ladder at 2 would make {1, 2} one bucket and double the cost of the ordinary
-    // single-note proof, which is a product decision rather than one to take here.
-    //
-    // A later round exists only for a prefix collision, and asks the next candidate.
+    // Group by block (each block is its own instance), then pad each group on the ladder so the
+    // server learns only that a chunk holds k real targets with k in (P/2, P]; at P = 1 and
+    // P = 2 that bucket is exact. A later round exists only for a prefix collision.
     const out = new Array<MerkleProof>(pending.length);
     while (pending.length > 0) {
       const collided: typeof pending = [];
@@ -1130,7 +1119,9 @@ export class RavenPOINodeInterface {
               continue;
             }
             if (bytesToHex(row.slice(0, 32)) !== bcHex) {
-              throw RavenError.decodeError(`client-PIR ${pathInstance}: row leaf does not match requested BC`);
+              throw RavenError.decodeError(
+                `client-PIR ${pathInstance}: row leaf does not match the requested blinded commitment`,
+              );
             }
             if (!addendum || addendum.length !== PATH10_ADDENDUM_BYTES) {
               throw RavenError.decodeError(`client-PIR ${pathInstance}: upper-sibling addendum must be 160 bytes`);
@@ -1181,9 +1172,8 @@ export class RavenPOINodeInterface {
     const remedy =
       "; a server-supplied auth path cannot be verified without an independently obtained root";
     if (!this.pinResolver) {
-      // `invalidQuery`, not `staleData`: nothing here is stale, and StaleDataContext demands
-      // lag/confidence numbers a missing pin does not have -- inventing them would be the
-      // fabricated-context version of the defect this guard closes.
+      // `invalidQuery`, not `staleData`: StaleData needs lag and confidence figures a missing
+      // pin does not have.
       throw RavenError.invalidQuery(
         `${preamble}no usable upstream pin source is configured (set pinUpstream, or preload ` +
           `ppoiPinnedRoots)${remedy}`,
@@ -1196,17 +1186,9 @@ export class RavenPOINodeInterface {
       throw pinSourceFailure(preamble, remedy, cause);
     }
     if (!resolved.roots.has(foldedRoot)) {
-      // A block that froze inside the tail TTL is still answered from the window it had while
-      // filling, and its final root is not in that set. Re-ask before refusing, so an honest
-      // caller is not charged a refusal for the privacy fix above.
-      //
-      // Its cost: THREE extra requests (point query, status, events), one of which names the
-      // block, and it fires on every window miss, not only on a real freeze. A node lagging more
-      // than a window behind therefore pays it on every proof while refusing every proof, [6, 3, 3]
-      // requests over three folds. Bounding it per block is not a free win: the bound
-      // that stops the leak also stops a block that freezes between two folds from verifying,
-      // which `ppoi_pinned_root_mandatory.test.ts` pins deliberately. Which of the two a wallet
-      // should get is a caller's decision, so neither is hardcoded here until one is asked for.
+      // A block that froze inside the tail TTL is still answered from its filling window, which
+      // lacks the final root, so re-ask before refusing. The re-ask costs three requests, one
+      // naming the block, on every window miss.
       this.pinResolver.forgetTail(listKeyHex, block);
       try {
         resolved = await this.pinResolver.resolve(listKeyHex, block);
@@ -1832,10 +1814,10 @@ const RELATIVE_ENDPOINT_BASE = "http://same-origin.invalid/";
  *
  * Origin, not string: a differing scheme case, a default port, a trailing slash or an extra path
  * segment all address one server, and a raw string compare would let a node verify its own forged
- * auth path. The tri-state is not decoration -- the callers have OPPOSITE safe defaults (a
- * disclosure guard treats unknown as same-party and refuses; the resolver treats it as different
- * and builds an anchor that may be vacuous), and one boolean would give both the disclosure
- * guard's answer, disabling verification for any deployment whose endpoint is same-origin relative.
+ * auth path. The callers have opposite safe defaults (the disclosure guard treats unknown as
+ * same-party and refuses; the resolver treats it as different and builds an anchor that may be
+ * vacuous), and one boolean would give both the disclosure guard's answer, disabling verification
+ * for any deployment whose endpoint is same-origin relative.
  *
  * A MISCONFIGURATION guard, not a security boundary: `localhost` and `127.0.0.1` are distinct
  * origins that reach one process, and two DNS names can resolve to one host.

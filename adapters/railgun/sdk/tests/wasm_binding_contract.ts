@@ -4,8 +4,7 @@ import type * as builtWasm from "@hisoka-io/raven-inspire-client-wasm";
 
 import type { RavenInspireWasm } from "../src/index";
 
-// Required: the optional members tolerate older builds at runtime, but the build pinned here must
-// still carry every one of them.
+// Required: members optional in the interface must still all be present in the build pinned here.
 export function builtWasmSatisfiesSdkContract(built: typeof builtWasm): Required<RavenInspireWasm> {
   return built;
 }

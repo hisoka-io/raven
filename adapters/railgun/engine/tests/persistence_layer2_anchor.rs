@@ -187,7 +187,7 @@ async fn mirror_height_zero_in_sync_verdict_must_not_become_a_fork_anchor() {
     let params = InspireParams::secure_128_d2048();
     let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
 
-    // Phase 1: every chain-height verdict is out of sync, so no real anchor is
+    // Every chain-height verdict is out of sync, so no real anchor is
     // ever recorded and the cascade must stay suppressed.
     for i in 0..LEAVES {
         let height = 100 + u64::from(i);
@@ -197,7 +197,7 @@ async fn mirror_height_zero_in_sync_verdict_must_not_become_a_fork_anchor() {
             .await
             .expect("send leaf");
     }
-    await_rounds(&handle, &chain_source, u64::from(LEAVES), "phase 1").await;
+    await_rounds(&handle, &chain_source, u64::from(LEAVES), "out of sync").await;
 
     assert_eq!(
         handle.metrics.lock().reorgs_handled,
@@ -210,7 +210,7 @@ async fn mirror_height_zero_in_sync_verdict_must_not_become_a_fork_anchor() {
         "a suppressed cascade must leave the instance marked divergent",
     );
 
-    // Phase 2: a mirror row verifies in sync at height 0. The root now matches
+    // A mirror row then verifies in sync at height 0. The root now matches
     // the chain, but 0 is not a chain height and must not anchor a rewind.
     chain_source.set_in_sync(true);
     let before = chain_source.rounds();
@@ -219,7 +219,7 @@ async fn mirror_height_zero_in_sync_verdict_must_not_become_a_fork_anchor() {
         .send(ConsumerEvent::Ppoi(mirror_row(0, 0x91), 0))
         .await
         .expect("send mirror row");
-    await_rounds(&handle, &chain_source, before + 1, "phase 2").await;
+    await_rounds(&handle, &chain_source, before + 1, "in-sync mirror row").await;
 
     assert!(
         layer2_divergent_instances().is_empty(),
@@ -228,7 +228,7 @@ async fn mirror_height_zero_in_sync_verdict_must_not_become_a_fork_anchor() {
         layer2_divergent_instances(),
     );
 
-    // Phase 3: the next verdict flips out of sync. Phase 2 supplied no anchor,
+    // The next verdict flips out of sync. The height-0 row supplied no anchor,
     // so this must suppress rather than rewind to genesis.
     chain_source.set_in_sync(false);
     let before = chain_source.rounds();
@@ -237,7 +237,7 @@ async fn mirror_height_zero_in_sync_verdict_must_not_become_a_fork_anchor() {
         .send(ConsumerEvent::Ppoi(mirror_row(1, 0x92), 0))
         .await
         .expect("send mirror row");
-    await_rounds(&handle, &chain_source, before + 1, "phase 3").await;
+    await_rounds(&handle, &chain_source, before + 1, "flip out of sync").await;
 
     let metrics = *handle.metrics.lock();
     assert_eq!(

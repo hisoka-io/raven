@@ -1,22 +1,16 @@
 /**
  * Independent PPOI block roots, read from the upstream Railgun aggregator.
  *
- * A root fetched from the node that served the auth path proves nothing, so the pin has to
- * come from somewhere else. Every byte of both requests below is a function of public state
- * only -- a list key, a block number, and upstream's own tip. No blinded commitment is sent,
- * and upstream's API takes none.
+ * A root fetched from the node that served the auth path proves nothing, so the pin comes from
+ * elsewhere. Both requests are a function of public state only: a list key, a block number and
+ * upstream's own tip. No blinded commitment is sent.
  *
- * What that hides, stated exactly: the NOTE is hidden, the BLOCK is not. `block` is
- * `floor(noteLeafIndex / 65_536)`, so a request tells the aggregator which block the note sits
- * in -- about one-in-six for the OFAC list today. Requests for one block are identical between
- * wallets apart from the JSON-RPC `id`, and the tail cache is consulted before the point query,
- * so a BURST of proofs against one Raven snapshot costs one block-naming request rather than one
- * per proof. It is not one per cache window: a fold whose root has moved off the cached window
- * makes `verifyAgainstUpstreamPin` forget the tail and re-resolve, and a re-resolve starts with
- * the point query. For a filling block every insert moves every auth path in it, so a list that
- * takes a leaf between two proofs is back to one block-naming request per proof. A caller who
- * needs the block hidden preloads
- * `ppoiPinnedRoots` and never reaches this module.
+ * The note is hidden and its block is not: `block` is `floor(noteLeafIndex / 65_536)`. Requests
+ * for one block are identical between wallets apart from the JSON-RPC `id`, and the tail cache
+ * makes a burst of proofs against one Raven snapshot cost one block-naming request. A fold whose
+ * root moved off the cached window re-resolves from the point query, so a filling block that
+ * takes a leaf between two proofs costs one such request per proof. A caller who needs the block
+ * hidden preloads `ppoiPinnedRoots` and never reaches this module.
  */
 
 import { RavenError } from "./errors";
@@ -66,7 +60,7 @@ export interface UpstreamPinResolverConfig {
   readonly onRequest?: PinRequestObserver;
 }
 
-// Upstream keys node status by its own network NAME, not by chain id, and a wrong name
+// Upstream keys node status by its own network name, not by chain id, and a wrong name
 // silently reads another chain's tip. Derived from NETWORK_CONFIG entries that carry a
 // `poi` section; anything else must be named explicitly.
 const PPOI_NETWORK_NAMES: ReadonlyMap<string, string> = new Map([
@@ -139,15 +133,12 @@ export class UpstreamPinResolver {
   }
 
   /**
-   * Drop the cached TAIL answer for one block, so the next `resolve` re-asks upstream.
+   * Drop the cached tail answer for one block, so the next `resolve` re-asks upstream.
    *
-   * Consulting the tail cache before the point query stops a filling block leaking one
-   * block-naming request per proof, but it also means a block that FREEZES inside the TTL is
-   * still answered from the window it had while filling, and the block's final root is not in
-   * that set. That direction is a refused honest proof rather than an accepted forged one, so
-   * it is safe -- but it is still wrong, and the caller can turn it back into a correct answer
-   * by forgetting once and re-resolving before it refuses. The frozen cache is never dropped:
-   * a full tree's root is immutable, so a miss against it is a real mismatch.
+   * A block that freezes inside the TTL is still answered from its filling window, which lacks
+   * the final root; forgetting once and re-resolving turns that refusal into a correct answer.
+   * The frozen cache is never dropped: a full tree's root is immutable, so a miss against it is
+   * a real mismatch.
    */
   forgetTail(listKeyHex: string, block: number): void {
     this.tailPins.delete(`${normalizeRootHex(listKeyHex)}:${block}`);
@@ -180,11 +171,8 @@ export class UpstreamPinResolver {
     // One point query classifies the block AND answers it: a row at the block's last leaf
     // means the tree is full, so that row's root is the full tree's root and is immutable.
     // No row means the block is still filling (or is past the tip), which needs the window.
-    // The tail cache is consulted BEFORE the point query, not after. Checking it second made
-    // a filling block re-send the point query on every single proof, and `startIndex` names
-    // the note's block -- so a wallet emitted one block-naming request per note to the very
-    // party PIR exists to blind. A cached tail answer means this block was not frozen within
-    // the TTL, which is exactly what the point query would re-establish.
+    // The tail cache is checked before the point query: `startIndex` names the note's block,
+    // and a cached tail answer saves one block-naming request per proof.
     const now = Date.now();
     const cachedTail = this.tailPins.get(cacheKey);
     if (cachedTail && cachedTail.expiresAt > now) {
@@ -220,8 +208,8 @@ export class UpstreamPinResolver {
       lastIndex,
       lastIndex,
     );
-    // Filtering by BLOCK here would accept any row that floor-divides to it, so an upstream
-    // answering the zero-width query with an INTERMEDIATE row would have that partial-tree
+    // Filtering by block here would accept any row that floor-divides to it, so an upstream
+    // answering the zero-width query with an intermediate row would have that partial-tree
     // root cached as the block's immutable root for the process lifetime. The query names one
     // index; only that index may answer it.
     // At most one row, by the cap in `decodeEvents`, so a frozen block caches exactly one root.
@@ -260,7 +248,7 @@ export class UpstreamPinResolver {
 
   /** Two filters, both load-bearing. Block: a window that began in block B-1 would otherwise hand
    *  back B-1's root, which folds against a different tree. Range: the refusal quotes this window
-   *  as what was checked, so a row upstream volunteered from OUTSIDE it -- the block's first leaf,
+   *  as what was checked, so a row upstream volunteered from outside it -- the block's first leaf,
    *  say -- must not be counted as a candidate the wallet's fold was measured against. `pointQuery`
    *  filters the same way. */
   private rootsInBlock(

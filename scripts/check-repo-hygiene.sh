@@ -80,7 +80,7 @@ if [[ -f .gitmodules ]]; then
   done < <(git config --file .gitmodules --get-regexp '^submodule\..*\.url$' | awk '{print $2}')
 fi
 
-for doc in SECURITY.md README.md CONTRIBUTING.md; do
+for doc in SECURITY.md README.md; do
   [[ -f "$doc" ]] || continue
   if grep -nE 'ACTION-REQUIRED|<FILL IN>|TKTK' "$doc"; then
     fail "$doc carries an unresolved owner-action marker"

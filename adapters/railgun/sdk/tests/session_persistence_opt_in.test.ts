@@ -4,7 +4,7 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { idbClear, loadClientPirContext } from "../src/index";
+import { clearPersistedSessions, loadClientPirContext } from "../src/index";
 import { makeRegisterSpy, stubRemoteSessionExports } from "./helpers/register_spy";
 import type { RavenInspireClientSession, RavenInspireWasm } from "../src/index";
 
@@ -50,7 +50,7 @@ function spyWasm(): PersistenceSpy {
 
 describe("client-PIR session persistence is opt-in", () => {
   afterEach(async () => {
-    await idbClear();
+    await clearPersistedSessions();
   });
 
   it("writes no session blob when persistSession is omitted", async () => {
@@ -135,5 +135,23 @@ describe("client-PIR session persistence is opt-in", () => {
     expect(loaded.cacheHit).toBe(false);
     expect(optedOut.deserializeCalls).toBe(0);
     expect(optedOut.buildCalls).toBe(1);
+  });
+
+  it("clearPersistedSessions erases an opted-in session", async () => {
+    const args = {
+      instanceId: INSTANCE_ID,
+      crsBincode: CRS,
+      shardConfigBincode: new Uint8Array(0),
+      inspireParamsBincode: new Uint8Array(0),
+      entrySize: 32,
+      persistSession: true,
+    };
+    await loadClientPirContext({ ...args, wasm: spyWasm().wasm });
+    await clearPersistedSessions();
+    const after = spyWasm();
+    const loaded = await loadClientPirContext({ ...args, wasm: after.wasm });
+    expect(loaded.cacheHit).toBe(false);
+    expect(after.deserializeCalls).toBe(0);
+    expect(after.buildCalls).toBe(1);
   });
 });

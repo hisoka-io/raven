@@ -27,6 +27,7 @@ const manifest = JSON.parse(readFileSync(resolve(sdkRoot, "package.json"), "utf8
   readonly files?: readonly string[];
   readonly scripts?: Readonly<Record<string, string>>;
   readonly exports?: Readonly<Record<string, unknown>>;
+  readonly engines?: Readonly<Record<string, string>>;
 };
 
 const ENGINE = "@railgun-community/engine";
@@ -101,6 +102,12 @@ describe("published package manifest", () => {
       expect(manifest.scripts?.[script], `${script} script`).toBeTypeOf("string");
       expect(manifest.scripts?.[script]).not.toContain("build");
     }
+  });
+
+  it("declares the Node floor its README states", () => {
+    const readme = readFileSync(resolve(sdkRoot, "README.md"), "utf8");
+    expect(readme).toContain("Node 20 or newer");
+    expect(manifest.engines?.node).toBe(">=20");
   });
 
   it("installs every runtime dependency from the registry, never from a repository path", () => {

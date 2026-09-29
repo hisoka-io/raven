@@ -37,7 +37,7 @@ export interface RavenInspireWasm {
     inspireParamsBincode: Uint8Array,
     shardConfigBincode: Uint8Array,
   ): Uint8Array;
-  /** Serialize a session to a cacheable blob; absent on older builds. */
+  /** Serialize a session to a cacheable blob; optional in the wasm interface. */
   serialize_client_session?(session: RavenInspireClientSession): Uint8Array;
   /** Reconstitute a session from a cached blob and the same params/CRS. */
   deserialize_client_session?(
@@ -189,7 +189,7 @@ export function callWasm<T>(operation: string, call: () => T): T {
   }
 }
 
-/** Install the wasm panic hook so Rust panics carry file:line. Returns false on older builds lacking the symbol. */
+/** Install the wasm panic hook so Rust panics carry file:line. Returns false when the wasm does not export it. */
 export function installPanicHook(wasm: RavenInspireWasm): boolean {
   if (typeof wasm.init_panic_hook === "function") {
     wasm.init_panic_hook();
@@ -198,7 +198,7 @@ export function installPanicHook(wasm: RavenInspireWasm): boolean {
   return false;
 }
 
-/** Decoded `/v1/instance/<id>/params` pieces consumed by [`loadClientPirContext`]. */
+/** Decoded `/v1/instance/<id>/params` pieces consumed by `loadClientPirContext`. */
 export interface LoadClientPirContextInput {
   /** WASM module exposing the `build_*` / `*_client_session` API. */
   readonly wasm: RavenInspireWasm;
@@ -216,7 +216,7 @@ export interface LoadClientPirContextInput {
   readonly persistSession?: boolean;
 }
 
-/** [`ClientPirContext`] plus a test-only warm-cache hit signal. */
+/** The built `ClientPirContext`, and whether it came from the session cache. */
 export interface LoadClientPirContextResult {
   readonly context: ClientPirContext;
   /** `true` when reconstituted from cache; `false` on a cold `build_client_session`. */
@@ -224,7 +224,7 @@ export interface LoadClientPirContextResult {
 }
 
 /**
- * Build a [`ClientPirContext`]. With `persistSession` the IndexedDB warm cache is
+ * Build a `ClientPirContext`. With `persistSession` the IndexedDB warm cache is
  * preferred, keyed `(instanceId, sha256(crsBincode))` so a CRS rotation self-invalidates;
  * storage failures degrade to the cold `build_client_session` path. Without it no session
  * blob is read or written, because that blob is the client's secret key at rest.

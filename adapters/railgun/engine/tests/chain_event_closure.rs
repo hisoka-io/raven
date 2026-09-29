@@ -42,7 +42,7 @@ fn build_initial_db() -> Vec<u8> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)]
-async fn phase4_chain_event_propagates_to_pir_response() {
+async fn chain_event_propagates_to_pir_response() {
     let dir = tempfile::tempdir().expect("tempdir");
     let params = InspireParams::secure_128_d2048();
     let db = build_initial_db();
@@ -58,7 +58,7 @@ async fn phase4_chain_event_propagates_to_pir_response() {
         })
     };
 
-    let mut config = OrchestratorConfig::demo(dir.path().to_path_buf(), "phase4-toy");
+    let mut config = OrchestratorConfig::demo(dir.path().to_path_buf(), "chain-event-toy");
     config.use_flock = false;
     config.role = InstanceRole::Live;
     config.scheme_tag = SCHEME_TAG.to_owned();
@@ -153,7 +153,7 @@ async fn phase4_chain_event_propagates_to_pir_response() {
         .to_vec();
     assert_eq!(
         recovered_first_32, planted,
-        "Phase 4 closure: PIR response's first 32 bytes must equal the \
+        "PIR response's first 32 bytes must equal the \
          planted commitment_hash. If this fires, the chain-event → \
          apply_wal_entry → drive_commit → re_encode_shard → swap_state \
          → respond pipeline is broken."
@@ -265,7 +265,7 @@ async fn resume_floor_is_last_leaf_block_not_chain_head() {
             apply, re-encode at commit, or swap_state. CI runs it in the durability + closure \
             lane."]
 #[allow(clippy::too_many_lines)]
-async fn phase4_chain_event_propagates_to_pir_response_at_production_cell() {
+async fn chain_event_propagates_to_pir_response_at_production_cell() {
     let dir = tempfile::tempdir().expect("tempdir");
     let params = InspireParams::secure_128_d2048();
     let db = build_initial_db_with_size(PROD_ENTRIES, PROD_ENTRY_SIZE);
@@ -274,7 +274,7 @@ async fn phase4_chain_event_propagates_to_pir_response_at_production_cell() {
     let (state, sk) =
         setup_state(&params, &db, PROD_ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup");
     eprintln!(
-        "phase4_closure prod: setup elapsed = {:?}",
+        "chain_event_closure prod: setup elapsed = {:?}",
         started.elapsed()
     );
 
@@ -285,7 +285,7 @@ async fn phase4_chain_event_propagates_to_pir_response_at_production_cell() {
         })
     };
 
-    let mut config = OrchestratorConfig::demo(dir.path().to_path_buf(), "phase4-prod");
+    let mut config = OrchestratorConfig::demo(dir.path().to_path_buf(), "chain-event-prod");
     config.use_flock = false;
     config.role = InstanceRole::Live;
     config.scheme_tag = SCHEME_TAG.to_owned();
@@ -378,9 +378,9 @@ async fn phase4_chain_event_propagates_to_pir_response_at_production_cell() {
         .to_vec();
     assert_eq!(
         recovered_first_32, planted,
-        "Phase 4 closure at production cell: PIR response's first 32 bytes \
-         must equal the planted commitment_hash. If this fires, the \
-         closure-rule shape-dependent regressions sneaked in."
+        "at production cell: PIR response's first 32 bytes \
+         must equal the planted commitment_hash; a failure only at this \
+         shape is a regression specific to the production cell."
     );
 
     let tail = plaintext.get(32..PROD_ENTRY_SIZE).expect("tail in range");
@@ -390,7 +390,7 @@ async fn phase4_chain_event_propagates_to_pir_response_at_production_cell() {
     );
 
     eprintln!(
-        "phase4_closure prod: full pipeline elapsed = {:?}",
+        "chain_event_closure prod: full pipeline elapsed = {:?}",
         started.elapsed()
     );
 

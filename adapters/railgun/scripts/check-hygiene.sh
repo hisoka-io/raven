@@ -2,12 +2,9 @@
 #
 # scripts/check-hygiene.sh
 #
-# CI hygiene-grep step. Catches unambiguous internal-amendment-label
-# patterns that have leaked into production source (or test source)
-# across recent sessions. Per CLAUDE.md: "Comments and Docs Hygiene:
-# no session numbers, no `no-commit/` paths, no internal phase labels,
-# no Hisoka / darkpool / nullifier / note names in `crates/`
-# source/comments."
+# CI hygiene-grep step. Catches unambiguous internal-label patterns in
+# production and test source: no session numbers, no `no-commit/` paths,
+# no internal phase labels.
 #
 # Invoked from .github/workflows/ci.yml. Exits 1 on first match.
 #
@@ -21,8 +18,8 @@
 #   - "no-commit/" repo-internal path leak
 #   - "phase 5" (case-insensitive) project-phase label leak
 #
-# Test scope is NOT excluded — the hygiene rule applies to all of
-# the adapter's source/comments per CLAUDE.md.
+# Test scope is not excluded: the rule applies to all of the adapter's
+# source and comments.
 
 set -euo pipefail
 
@@ -146,8 +143,7 @@ done
 
 if [[ $found_any -ne 0 ]]; then
   echo "scripts/check-hygiene.sh: at least one internal-label leak found."
-  echo "See CLAUDE.md 'Comments and Docs Hygiene' rule. Sweep the leaks"
-  echo "(use unambiguous prose; refer to behavior, not amendment labels)."
+  echo "Sweep the leaks (use unambiguous prose; refer to behavior, not amendment labels)."
   exit 1
 fi
 

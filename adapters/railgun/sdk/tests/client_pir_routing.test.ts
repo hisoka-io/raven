@@ -62,7 +62,9 @@ describe("client-PIR routing + pre-flight", () => {
   it("getPOIMerkleProofs refuses a commitment the synced index lacks before any query", async () => {
     mountPrefixChannel(server, LIST_KEY_HEX, { commitments: [commitmentAt(0)] });
     const sdk = servedSdk();
-    await expect(sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX])).rejects.toThrow(/idx unknown/);
+    await expect(sdk.getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX])).rejects.toThrow(
+      /blinded commitment [0-9a-f]{64} not present in list/,
+    );
     // A query for a BC the client cannot place in the list would publish the lookup to the
     // server the PIR path exists to blind; only the index sync went out.
     expect(sdk.lastWireRequests().map((request) => request.method)).toEqual(["GET"]);

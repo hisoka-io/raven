@@ -53,12 +53,12 @@ pub enum WalEntryPayload {
         /// Upstream root after appending this leaf.
         validated_merkleroot: [u8; 32],
     },
-    /// No-op WAL marker emitted at each snapshot.
+    /// No-op WAL marker; replay skips it.
     Heartbeat {
         /// Unix milliseconds at emission.
         wallclock_unix_ms: u64,
     },
-    /// Reorg fence; entries with a `marker` above `height` are truncated.
+    /// Reorg fence; replay drops every leaf recorded above `height`.
     Reorg {
         /// Chain height at the fork point.
         height: u64,

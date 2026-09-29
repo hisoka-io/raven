@@ -1,6 +1,17 @@
 //! `raven-inspire` bench adapter. Emits a `BenchReport` JSON +
 //! per-trial CSV. A round-trip must recover the planted plaintext
 //! before any numbers are emitted.
+//!
+//! ```text
+//! cargo build --manifest-path benches/b1-bench/Cargo.toml --features inspire --release
+//! taskset -c 0-15 benches/b1-bench/target/release/b1-inspire --entries-log2 16 \
+//!     --record-bytes 512 --variant two-packing --full-bench --warmup 2 --measured 10 \
+//!     --seeds 0,1,2 --out-dir target/bench
+//! ```
+//!
+//! Pin to every logical core: SMT throughput outweighs cache contention at this
+//! workload, and an unpinned WSL2 run migrates threads and widens the spread.
+//! Output per seed: `seed-<N>/cell-2e<log2>x<bytes>.{json,csv}`.
 
 #![allow(clippy::all)]
 
@@ -708,7 +719,7 @@ fn main() {
             None => "default-q".to_owned(),
             Some([g0, g1, g2]) => format!("adaptive-g{g0}-{g1}-{g2}"),
         };
-        let opt_slug = "commit-e-handshake-solinas";
+        let opt_slug = "handshake-solinas";
         let report = BenchReport {
             scheme: format!(
                 "inspire-{preset_slug}-{}-{opt_slug}",

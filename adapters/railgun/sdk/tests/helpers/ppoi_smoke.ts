@@ -518,7 +518,7 @@ export async function runPpoiSmoke(options: PpoiSmokeOptions): Promise<PpoiSmoke
     // Any other InvalidQuery, a row past an instance's capacity say, means the node's index held it.
     if (
       !RavenError.is(refused, "InvalidQuery") ||
-      !refused.message.includes(`BC ${UNLISTED_BC} not present in list`)
+      !refused.message.includes(`blinded commitment ${UNLISTED_BC} not present in list`)
     ) {
       throw new Error(`path: a commitment on no list was not refused as absent: ${String(refused)}`);
     }

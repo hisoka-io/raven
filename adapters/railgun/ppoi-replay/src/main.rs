@@ -9,10 +9,36 @@ use std::time::Duration;
 use clap::Parser;
 use raven_railgun_ppoi_replay::{bind, serve, Capture, Replay, ReplayError};
 
+const AFTER_HELP: &str = "\
+Capture folder:
+  events.bin            64-byte header (RVNPPOI1, version 1, row size 133, count, first index 0,
+                        list key), then per row: u32 LE index, u8 type (0 Shield, 1 Transact,
+                        2 Unshield, 3 LegacyTransact), 32-byte blinded commitment, 32-byte
+                        validated merkleroot, 64-byte signature.
+  noncanonical.jsonl    rows whose upstream wire strings are not the canonical spelling; served
+                        verbatim, and each must decode to its row's bytes.
+  manifest.json         chain (chainType, chainID, network, txidVersion), n and list_key.
+  node-status-end.json  a recorded ppoi_node_status response.
+
+Methods (POST / only):
+  ppoi_poi_events                 rows in [startIndex, endIndex] among the served rows; a span
+                                  above 500 is refused as upstream refuses it.
+  ppoi_node_status                the recorded body, with this list's lengths and latest root
+                                  computed from the served rows.
+  ppoi_validate_poi_merkleroots   true when every root is a served row's root.
+  ppoi_submit_*                   refused: a recording cannot accept a submission.
+  anything else                   upstream's -32601 Method not found.
+
+A recorded ppoi_poi_events page, replayed at the row count it was recorded at, returns the
+recorded body byte for byte apart from the JSON-RPC id. One network and one list are served;
+another listKey is refused as upstream refuses an unknown one. The container image
+(Dockerfile.ppoi-replay) holds the binary only: mount a capture folder at /capture.";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "raven-railgun-ppoi-replay",
-    about = "Serve a recorded Railgun PPOI list capture over the upstream node's JSON-RPC methods."
+    about = "Serve a recorded Railgun PPOI list capture over the upstream node's JSON-RPC methods.",
+    after_long_help = AFTER_HELP
 )]
 struct Cli {
     /// Capture folder: events.bin, manifest.json, node-status-end.json, and noncanonical.jsonl

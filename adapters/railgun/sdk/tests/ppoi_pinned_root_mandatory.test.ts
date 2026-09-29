@@ -1,11 +1,8 @@
-// The pinned root is the ONLY thing standing between a PIR-served path-10 row and a
+// The pinned root is the only thing standing between a PIR-served path-10 row and a
 // forged merkle proof: the siblings arrive from the server, the fold is local, and a
-// wrong sibling set folds to a wrong root that still looks like a proof. Before this
-// file the guard was keyed on the chain-less label `t2Path:<lk>:<block>` while
-// `instanceLabel()` resolves the chain-aware `t2Path:<chainId>:<lk>:<block>` FIRST --
-// so in the primary configuration the guard never fired and an unverified proof was
-// returned `Ok`. That is this codebase's signature defect (AGENTS.md:39) and its
-// eighth recorded recurrence of "guard keyed on one thing, routing on another".
+// wrong sibling set folds to a wrong root that still looks like a proof. The guard must
+// be keyed on the same chain-aware label `t2Path:<chainId>:<lk>:<block>` that routing
+// resolves, or it never fires and an unverified proof is returned `Ok`.
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 

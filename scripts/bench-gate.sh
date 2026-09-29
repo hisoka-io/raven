@@ -1,52 +1,39 @@
 #!/usr/bin/env bash
 # Run the production-shaped bench and diff it against the checked-in baseline.
 #
-# THIS GATE BLOCKS ON BYTE COUNTS ONLY. Timing metrics are measured, printed and
-# deliberately exempt.
+# This gate blocks on byte counts only. Timing metrics are measured, printed and exempt.
 #
-# Byte counts are exact: query_bytes and response_bytes each hold one value across every
-# CI artifact measured, so any movement is a real change and needs no threshold.
+# Byte counts are exact and machine-invariant: query_bytes and response_bytes reproduce
+# byte-identically across runs, seeds and machine classes, so any movement is a real change
+# and needs no threshold. Both directions block: the baseline is a pin, not a budget, and a
+# differ handed two numbers cannot tell a real byte win from a truncated body. A win lands by
+# re-pinning. Every byte count ships beside the closed form its own run predicts
+# (`<metric>_derived`) and the differ refuses a pair that disagrees, so a hand-edited figure
+# reds; tools/bench-compare/tests/tracked_baseline.rs checks the same over every baseline.
 #
-# BOTH DIRECTIONS BLOCK. The baseline is a pin, not a budget. A differ handed two numbers
-# cannot tell a real byte win from a truncated body, so scoring "smaller" as an improvement
-# both let ~83 KB of regression headroom open under a green gate and removed the only moment
-# a human was forced to look. A win is landed by re-pinning, deliberately, in review.
+# Timings are exempt because the sampling unit is wrong, not the statistics: the Welch test
+# is fed ten repeats inside one job and asked about a shift between jobs. On 135 same-commit
+# comparisons, 27 breached +15% and `p < alpha` vetoed none of them. Re-arming timing needs a
+# between-job estimand with the run as the experimental unit, not a different welch_p.
 #
-# What separates a win from truncation is the shape, and the shape stays with the producer:
-# every byte count in an artifact ships beside the closed form its own run predicts, and the
-# differ refuses any pair that disagrees. That is why a re-pin has to come from a producer
-# run - a hand-edited figure keeps the prediction it was produced with and reds.
-#
-# Timings are exempt because the SAMPLING UNIT is wrong, not because the statistics are.
-# The Welch implementation is exact - cross-checked against scipy over 135 same-commit
-# comparisons, agreeing to 1.78e-14 in log10 p. What it is fed is the within-job sample
-# array, ten repeats inside ONE job, and it is then asked about a shift BETWEEN jobs. On
-# 135 comparisons of a commit against itself, 27 breached +15% in the regression direction
-# and the `p < alpha` conjunct vetoed exactly ZERO of them: it has never changed a decision
-# on real data. Nor can it be recalibrated - the alpha giving a 5% realised false-positive
-# rate is around 1e-32, and p tracks the delta it is supposed to cross-check
-# (Spearman -0.86 to -0.91), so it restates the threshold rather than testing it.
-#
-# Do not "fix" this by replacing welch_p. Re-arming timing needs a between-JOB estimand and
-# the run as the experimental unit.
+# Baselines: benches/baselines/b1-<variant>-cell-2e<log2>x<bytes>.json. The committed one
+# records its producer machine in `hardware`; its timing rows are that machine's and are
+# never comparable across machine classes. To re-pin, run this script with no baseline at
+# the path (it writes $BENCH_OUT_DIR/seed-N/cell-*.json and exits 0), copy the whole seed-0
+# artifact into benches/baselines/, and commit it saying what moved and why.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
-# The shipped Railgun cell: two-packing at 2^16 x 32 B. Byte counts from this config have
-# reproduced exactly across four months and different hardware, which is why the byte gate
-# is exact rather than thresholded.
+# The served Railgun cell: one PPOI block, 2^16 rows of 512 B, two-packing.
 ENTRIES_LOG2="${BENCH_ENTRIES_LOG2:-16}"
-RECORD_BYTES="${BENCH_RECORD_BYTES:-32}"
+RECORD_BYTES="${BENCH_RECORD_BYTES:-512}"
 VARIANT="${BENCH_VARIANT:-two-packing}"
 WARMUP="${BENCH_WARMUP:-2}"
-# Raising this does NOT make the gate more accurate, and the intuition that it does is the
-# hazard. The naive standard error is sd/sqrt(n) over within-job repeats, so it shrinks
-# without bound while the real between-job floor does not: measured on this corpus the gap
-# between the two scales as sqrt(n), from 22.6x at n=1 to 2256x at n=10,000. More samples
-# buy more CONFIDENCE ON NOISE. The check below refuses a value that does not match the
-# baseline for the same reason - two runs compared at different n are not like for like.
+# Raising this does not make the gate more accurate: the within-job standard error shrinks
+# as sqrt(n) while the between-job floor does not. It must match the baseline's count, which
+# the check below enforces.
 MEASURED="${BENCH_MEASURED:-10}"
 SEEDS="${BENCH_SEEDS:-0,1,2}"
 
@@ -86,9 +73,9 @@ echo "bench-gate: current = $CURRENT"
 
 if [[ ! -f "$BASELINE" ]]; then
   echo "bench-gate: no baseline at ${BASELINE}."
-  echo "bench-gate: seed one by committing the artifact above, deliberately and reviewed."
-  echo "bench-gate: a baseline is only meaningful when producer, config and machine class"
-  echo "bench-gate: match the run under test, so it is generated here, never imported."
+  echo "bench-gate: seed one by committing the whole artifact above, deliberately and reviewed."
+  echo "bench-gate: its byte rows are what this gate compares and hold on any machine;"
+  echo "bench-gate: its timing rows belong to the machine recorded in its hardware field."
   exit 0
 fi
 

@@ -1,0 +1,111 @@
+{
+  "hardware": "os=linux; arch=x86_64; cpus=16; cpu=AMD Ryzen 7 9800X3D 8-Core Processor; hypervisor=yes; profile_dir=release; debug_assertions=false; rustflags_source=config-or-none; rustflags=unknown; target_features=baseline",
+  "captured_at": "2026-09-29T21:02:13Z",
+  "results": [
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-handshake-solinas/2e16x512/setup",
+      "value": 335245326.00000006,
+      "unit": "nanoseconds",
+      "samples": []
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-handshake-solinas/2e16x512/hint_bytes",
+      "value": 0.0,
+      "unit": "bytes",
+      "samples": []
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-handshake-solinas/2e16x512/query_bytes",
+      "value": 15491.0,
+      "unit": "bytes",
+      "samples": []
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-handshake-solinas/2e16x512/response_bytes",
+      "value": 10446.0,
+      "unit": "bytes",
+      "samples": []
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-handshake-solinas/2e16x512/query_median",
+      "value": 287842000.0,
+      "unit": "nanoseconds",
+      "samples": [
+        274365000.0,
+        268960000.0,
+        273181000.0,
+        274426000.0,
+        287256000.0,
+        295853000.0,
+        287842000.0,
+        454208000.0,
+        310836000.0,
+        301019000.0
+      ]
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-handshake-solinas/2e16x512/throughput",
+      "value": 3.3025688040671795,
+      "unit": "queries_per_second",
+      "samples": []
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-handshake-solinas/2e16x512/server_median",
+      "value": 285906000.0,
+      "unit": "nanoseconds",
+      "samples": [
+        272639000.0,
+        267330000.0,
+        271382000.0,
+        272817000.0,
+        285607000.0,
+        294206000.0,
+        285906000.0,
+        452586000.0,
+        309087000.0,
+        299315000.0
+      ]
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-handshake-solinas/2e16x512/client_median",
+      "value": 1662000.0,
+      "unit": "nanoseconds",
+      "samples": [
+        1726000.0,
+        1628000.0,
+        1798000.0,
+        1608000.0,
+        1648000.0,
+        1646000.0,
+        1935000.0,
+        1621000.0,
+        1748000.0,
+        1703000.0
+      ]
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-handshake-solinas/2e16x512/query_bytes_derived",
+      "value": 15491.0,
+      "unit": "bytes",
+      "samples": []
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-handshake-solinas/2e16x512/response_bytes_derived",
+      "value": 10446.0,
+      "unit": "bytes",
+      "samples": []
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-handshake-solinas/2e16x512/response_unswitched_bytes",
+      "value": 17358.0,
+      "unit": "bytes",
+      "samples": []
+    },
+    {
+      "bench": "inspire-default-q-twopacking-inspiring-handshake-solinas/2e16x512/response_unswitched_bytes_derived",
+      "value": 17358.0,
+      "unit": "bytes",
+      "samples": []
+    }
+  ]
+}
