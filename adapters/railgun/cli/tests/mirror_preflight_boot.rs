@@ -1875,9 +1875,14 @@ fn published_snapshot(layout: &StoreLayout) -> SnapshotId {
 }
 
 /// List row `index`, past block 0, sits in the index at its global position rather than the
-/// block-local one.
+/// block-local one, once the publish that ends the backfill serves it.
 async fn assert_row_indexed_at_its_global_position(addr: SocketAddr, index: u64) {
-    let segment = read_segment(bc_prefixes_since(addr, index).await).await;
+    let segment = until_done_or_stalled("the row advertised", async || {
+        let segment = read_segment(bc_prefixes_since(addr, index).await).await;
+        let progress = (segment.status, segment.next);
+        (progress, (!segment.rows.is_empty()).then_some(segment))
+    })
+    .await;
     assert_eq!(segment.status.as_u16(), 200, "{segment:?}");
     assert_eq!(
         (segment.base, segment.rows.first()),

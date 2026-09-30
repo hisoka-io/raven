@@ -546,6 +546,12 @@ impl ListCoverage<'_> {
         self.block_rows(&store.lock())
     }
 
+    /// Rows of one block `/batch` answers, a prefix of those held. The index advertises only
+    /// these: a row read here is queryable at once.
+    fn served_rows(&self, store: &LogicalLeafStore) -> u32 {
+        u32::try_from(store.published_list_rows(&self.list_key)).unwrap_or(u32::MAX)
+    }
+
     /// Height the composed answer is complete as of: the lowest any contributor has reached.
     pub fn epoch(&self) -> u64 {
         self.blocks
@@ -591,9 +597,9 @@ impl ListCoverage<'_> {
             .probes
             .blocks_walked
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let count = self.block_rows(guard);
+        let count = self.served_rows(guard);
         let mut read = 0u32;
-        for (local, bc) in self.index_rows(guard) {
+        for (local, bc) in self.index_rows(guard).take(count as usize) {
             if local != read {
                 return Err(self.torn(block));
             }
@@ -617,7 +623,7 @@ impl ListCoverage<'_> {
     ) -> Result<(u32, Bytes, Option<String>), CoverageRefusal> {
         let guard = store.lock();
         let rows_stamp = guard.list_rows_stamp();
-        let count = self.block_rows(&guard);
+        let count = self.served_rows(&guard);
         if count >= LEAVES_PER_PPOI_BLOCK {
             let kept = self
                 .publishing
@@ -682,12 +688,12 @@ impl ListCoverage<'_> {
     ) -> Result<IndexSegment, SegmentRefusal> {
         let block = since / LEAVES_PER_PPOI_BLOCK;
         let base = block * LEAVES_PER_PPOI_BLOCK;
-        let held: Vec<u32> = self
+        let served: Vec<u32> = self
             .blocks
             .iter()
-            .map(|store| self.held_rows(store))
+            .map(|store| self.served_rows(&store.lock()))
             .collect();
-        let total = contiguous_rows(&held);
+        let total = contiguous_rows(&served);
         if u64::from(since) > total {
             return Err(SegmentRefusal::PastFrontier {
                 total: u32::try_from(total).unwrap_or(u32::MAX),
@@ -706,7 +712,13 @@ impl ListCoverage<'_> {
             return Err(SegmentRefusal::PastFrontier { total: next });
         }
         let sealed = read >= LEAVES_PER_PPOI_BLOCK;
-        if !sealed {
+        // A hole is a short block HELD under a later one; a full block awaiting its publish is
+        // only a shorter prefix.
+        let held = self
+            .blocks
+            .get(position)
+            .map_or(0, |store| self.held_rows(store));
+        if held < LEAVES_PER_PPOI_BLOCK {
             let later = self.blocks.iter().skip(position.saturating_add(1));
             if later
                 .map(|store| self.held_rows(store))
@@ -715,7 +727,7 @@ impl ListCoverage<'_> {
                 return Err(SegmentRefusal::Uncovered(CoverageRefusal::ShortBlock {
                     list_key: self.list_key,
                     block,
-                    held: read,
+                    held,
                     expected: LEAVES_PER_PPOI_BLOCK,
                 }));
             }
@@ -743,6 +755,20 @@ impl ListCoverage<'_> {
             block,
         }
     }
+}
+
+/// Record every row `store` holds as served, as the commit driver does once it publishes.
+#[cfg(test)]
+pub(crate) fn mark_published(store: &mut LogicalLeafStore) {
+    let table = Arc::new(raven_inspire::EncodedDatabase {
+        shards: Vec::new(),
+        config: raven_inspire::params::ShardConfig {
+            shard_size_bytes: 0,
+            entry_size_bytes: 0,
+            total_entries: 0,
+        },
+    });
+    store.refresh_committed_addenda(&table, 0);
 }
 
 #[cfg(test)]
@@ -774,13 +800,19 @@ mod tests {
             .collect()
     }
 
+    /// A block whose rows are all published.
     fn block_store(local_indices: std::ops::Range<u32>, seed_base: u32) -> SharedLogicalStore {
         let store = Arc::new(parking_lot::Mutex::new(LogicalLeafStore::new()));
         append(&store, local_indices, seed_base);
+        publish(&store);
         store
     }
 
-    /// Append rows at `local_indices`, each at height `1_000 + local`.
+    fn publish(store: &SharedLogicalStore) {
+        mark_published(&mut store.lock());
+    }
+
+    /// Append rows at `local_indices`, each at height `1_000 + local`, unpublished.
     fn append(store: &SharedLogicalStore, local_indices: std::ops::Range<u32>, seed_base: u32) {
         let enc = encoder();
         let mut guard = store.lock();
@@ -1151,6 +1183,112 @@ mod tests {
         );
     }
 
+    /// Rows applied and not yet published are held, so they prove coverage against upstream's
+    /// count, but the index does not advertise them: `/batch` would answer them from a table
+    /// that lacks them.
+    #[test]
+    fn the_index_advertises_a_row_only_once_it_is_published() {
+        let store = block_store(0..4, 0);
+        append(&store, 4..6, 0);
+        let registry =
+            ShimStoreRegistry::from_declarations([(block_filter(0), Arc::clone(&store))]);
+        let coverage = registry
+            .prove_list_coverage(&LIST_KEY, Some(counted(6, 0)))
+            .expect("held rows cover upstream's count");
+        let before = coverage.segment(0).expect("read");
+        assert_eq!(
+            (before.next, before.prefixes.to_vec()),
+            (4, prefixes(0..4)),
+            "advertised rows the served table lacks"
+        );
+        assert_eq!(
+            coverage.segment(5),
+            Err(SegmentRefusal::PastFrontier { total: 4 })
+        );
+
+        publish(&store);
+        let after = coverage.segment(0).expect("read");
+        assert_eq!((after.next, after.prefixes.to_vec()), (6, prefixes(0..6)));
+    }
+
+    /// A reorg that drops published rows lowers the published count with them, so rows appended
+    /// again at those indices wait for their own publish.
+    #[test]
+    fn rows_appended_again_after_a_reorg_wait_for_their_own_publish() {
+        let store = block_store(0..4, 0);
+        let enc = encoder();
+        apply_wal_entry(
+            &mut store.lock(),
+            &WalEntryPayload::Reorg { height: 1_001 },
+            1_001,
+            &enc,
+        )
+        .expect("reorg");
+        append(&store, 2..4, 50);
+        let registry =
+            ShimStoreRegistry::from_declarations([(block_filter(0), Arc::clone(&store))]);
+        let coverage = registry
+            .prove_list_coverage(&LIST_KEY, Some(counted(4, 0)))
+            .expect("covered");
+        assert_eq!(coverage.segment(0).expect("read").next, 2);
+        publish(&store);
+        let republished = coverage.segment(0).expect("read");
+        assert_eq!(republished.next, 4);
+        assert_eq!(
+            &republished.prefixes[2 * BC_INDEX_PREFIX_BYTES..],
+            &prefixes(52..54)[..]
+        );
+    }
+
+    /// A block held full but not yet published under a block already taking rows is a shorter
+    /// prefix, not the hole a short held block would be.
+    #[test]
+    fn a_full_block_awaiting_its_publish_is_a_shorter_prefix_not_a_hole() {
+        let last = LEAVES_PER_PPOI_BLOCK - 1;
+        let run: Vec<(WalEntryPayload, u64)> = (0..last)
+            .map(|local| {
+                let row = WalEntryPayload::PpoiListLeafAdded {
+                    list_key: LIST_KEY,
+                    list_index: local,
+                    blinded_commitment: fr(local),
+                    event_type: raven_railgun_persistence::PpoiEventType::Shield,
+                    validated_merkleroot: [0; 32],
+                };
+                (row, 1_000)
+            })
+            .collect();
+        let full = Arc::new(parking_lot::Mutex::new(LogicalLeafStore::new()));
+        full.lock()
+            .seed_leaf_run(&run, &encoder())
+            .expect("seed rows");
+        publish(&full);
+        append(&full, last..LEAVES_PER_PPOI_BLOCK, 0);
+        let registry = ShimStoreRegistry::from_declarations([
+            (block_filter(0), full),
+            (block_filter(1), block_store(0..2, 200_000)),
+            (block_filter(2), block_store(0..0, 300_000)),
+        ]);
+        let coverage = registry
+            .prove_list_coverage(
+                &LIST_KEY,
+                Some(counted(u64::from(LEAVES_PER_PPOI_BLOCK) + 2, 0)),
+            )
+            .expect("covered");
+        let frontier = coverage
+            .segment(LEAVES_PER_PPOI_BLOCK - 2)
+            .expect("a prefix, not a refusal");
+        assert_eq!(
+            (frontier.next, frontier.sealed),
+            (LEAVES_PER_PPOI_BLOCK - 1, false)
+        );
+        assert_eq!(
+            coverage.segment(LEAVES_PER_PPOI_BLOCK),
+            Err(SegmentRefusal::PastFrontier {
+                total: LEAVES_PER_PPOI_BLOCK - 1
+            })
+        );
+    }
+
     /// Position i of a segment is the row at global index `since + i`, and its ETag is the
     /// digest of exactly the bytes served.
     #[test]
@@ -1198,6 +1336,7 @@ mod tests {
                 )
                 .expect("seed ppoi leaf");
             }
+            mark_published(&mut guard);
         }
         let coverage = registry
             .prove_list_coverage(&LIST_KEY, Some(counted(3, 0)))

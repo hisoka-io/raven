@@ -373,7 +373,7 @@ mod tests {
 
     mod index_channel_reads {
         use super::super::*;
-        use crate::shim_store::{ShimStoreRegistry, SEGMENT_READS_AT_ONCE};
+        use crate::shim_store::{mark_published, ShimStoreRegistry, SEGMENT_READS_AT_ONCE};
         use crate::status::{MirrorFeedState, MirrorFeedView};
         use crate::HttpConfig;
         use raven_railgun_engine::inspire::{apply_wal_entry, LogicalLeafStore};
@@ -444,6 +444,7 @@ mod tests {
             let run: Vec<_> = (0..rows).map(|local| leaf(local, base + local)).collect();
             let mut store = LogicalLeafStore::new();
             store.seed_leaf_run(&run, &encoder()).expect("seed rows");
+            mark_published(&mut store);
             Arc::new(parking_lot::Mutex::new(store))
         }
 
@@ -585,6 +586,7 @@ mod tests {
                     let (payload, height) = leaf(local, 0x00ff_0000 + local);
                     apply_wal_entry(&mut store, &payload, height, &enc).expect("refill");
                 }
+                mark_published(&mut store);
             }
             let (changed, walked, _) = get(0);
             assert_eq!(
@@ -621,6 +623,7 @@ mod tests {
                 .collect();
             let mut seeded = LogicalLeafStore::new();
             seeded.seed_leaf_run(&run, &encoder()).expect("seed rows");
+            mark_published(&mut seeded);
             let sealed = Arc::new(parking_lot::Mutex::new(seeded));
             let frontier = block_store(1, 3);
             let rows = u64::from(LEAVES_PER_PPOI_BLOCK) + 3;

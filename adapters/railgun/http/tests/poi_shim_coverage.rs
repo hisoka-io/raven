@@ -121,7 +121,21 @@ fn seed_list_block(list_key: [u8; 32], block: u32, rows: u32) -> SharedStore {
         .collect();
     let mut store = LogicalLeafStore::new();
     store.seed_leaf_run(&run, &enc).expect("seed ppoi rows");
+    mark_published(&mut store);
     Arc::new(parking_lot::Mutex::new(store))
+}
+
+/// Record every row `store` holds as served, as the commit driver does once it publishes.
+fn mark_published(store: &mut LogicalLeafStore) {
+    let table = Arc::new(raven_inspire::EncodedDatabase {
+        shards: Vec::new(),
+        config: raven_inspire::params::ShardConfig {
+            shard_size_bytes: 0,
+            entry_size_bytes: 0,
+            total_entries: 0,
+        },
+    });
+    store.refresh_committed_addenda(&table, 0);
 }
 
 /// The coverage predicate cannot be satisfied past one block without a sealed one. Shared by
@@ -234,8 +248,9 @@ fn two_covered_blocks_with_frontier() -> (Router, SharedStore) {
 fn append_frontier_row(store: &SharedStore, local: u32) {
     let enc = PerLeafCommitmentEncoder::new(32, LEAVES_PER_PPOI_BLOCK, 0).expect("encoder");
     let global = LEAVES_PER_PPOI_BLOCK + local;
+    let mut store = store.lock();
     apply_wal_entry(
-        &mut store.lock(),
+        &mut store,
         &WalEntryPayload::PpoiListLeafAdded {
             list_key: LIST_KEY,
             list_index: local,
@@ -247,6 +262,7 @@ fn append_frontier_row(store: &SharedStore, local: u32) {
         &enc,
     )
     .expect("append frontier row");
+    mark_published(&mut store);
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {

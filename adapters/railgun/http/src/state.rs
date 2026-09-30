@@ -68,15 +68,10 @@ pub struct AppState<S: PirScheme> {
 pub(crate) const ADDENDUM_SKEW_UNSEEDED: &str = "unseeded";
 /// Refused because the addenda were derived alongside a superseded encoded database.
 pub(crate) const ADDENDUM_SKEW_STALE_PROVENANCE: &str = "stale_provenance";
-/// Refused because a commit replaced the served state between the two provenance reads.
-pub(crate) const ADDENDUM_SKEW_SWAPPED_MID_REQUEST: &str = "swapped_mid_request";
 /// The whole `reason` label domain. Bounded by construction, and named so a typo at an emit
-/// site cannot open a fourth series that no zero-init covers.
-pub(crate) const ADDENDUM_SKEW_REASONS: [&str; 3] = [
-    ADDENDUM_SKEW_UNSEEDED,
-    ADDENDUM_SKEW_STALE_PROVENANCE,
-    ADDENDUM_SKEW_SWAPPED_MID_REQUEST,
-];
+/// site cannot open a third series that no zero-init covers.
+pub(crate) const ADDENDUM_SKEW_REASONS: [&str; 2] =
+    [ADDENDUM_SKEW_UNSEEDED, ADDENDUM_SKEW_STALE_PROVENANCE];
 
 /// `InstanceId -> (Epoch, sha256)` for `/v1/instance/:id/params`.
 pub(crate) type ParamsEtagCache =
@@ -500,7 +495,7 @@ fn register_prometheus_descriptions() {
         "raven_railgun_addendum_provenance_skew_total",
         "Lifetime count of PIR batches refused because the served row and its upper-sibling \
          addendum could not be shown to come from one tree, labelled by instance + reason \
-         (unseeded|stale_provenance|swapped_mid_request)"
+         (unseeded|stale_provenance)"
     );
     metrics::describe_counter!(
         "raven_railgun_addendum_missing_total",

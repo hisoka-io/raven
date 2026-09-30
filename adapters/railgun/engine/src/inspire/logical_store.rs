@@ -208,6 +208,10 @@ pub struct LogicalLeafStore {
     committed_addenda_db: Option<std::sync::Arc<raven_inspire::EncodedDatabase>>,
     #[serde(skip)]
     list_rows_stamp: RowsStamp,
+    // Rows per list the published table holds, recorded with the addenda. The live trees run
+    // ahead of it between a page's apply and its publish.
+    #[serde(skip)]
+    published_list_rows: std::collections::HashMap<[u8; 32], usize>,
 }
 
 impl LogicalLeafStore {
@@ -322,6 +326,10 @@ impl LogicalLeafStore {
                 .map_or(0, |((_, last_idx), _)| *last_idx as usize + 1);
             if let Some(imt) = self.ppoi_imts.get_mut(list_key) {
                 imt.truncate_to(new_count);
+            }
+            // Rows appended again at these indices are not the published ones.
+            if let Some(published) = self.published_list_rows.get_mut(list_key) {
+                *published = (*published).min(new_count);
             }
         }
     }
@@ -742,14 +750,28 @@ impl LogicalLeafStore {
         imt.merkle_proof(list_index as usize)
     }
 
+    /// Rows of `list_key` a `/batch` query is answered from: the prefix the published table was
+    /// encoded from, as of the last [`Self::refresh_committed_addenda`]. Anything that advertises
+    /// a row as queryable reads this, never the tree's leaf count.
+    #[must_use]
+    pub fn published_list_rows(&self, list_key: &[u8; 32]) -> usize {
+        let held = self
+            .ppoi_imts
+            .get(list_key)
+            .map_or(0, crate::imt::Imt::leaf_count);
+        self.published_list_rows
+            .get(list_key)
+            .map_or(0, |published| (*published).min(held))
+    }
+
     /// Re-derive the upper-sibling addendum for every shard of every list this store holds, and
-    /// record the encoded database it was derived alongside.
+    /// record the encoded database it was derived alongside and the rows of each list it holds.
     ///
     /// **`self` MUST be the tree `derived_alongside` was encoded from.** This function cannot
     /// check that and does not try: it records whatever `Arc` it is handed as the provenance of
     /// whatever tree `self` currently holds, so calling it on a store that has run ahead of
     /// `derived_alongside` makes `committed_addenda_derived_from` report consistency for a pair
-    /// that folds to a wrong root. Only two call sites satisfy the precondition: `drive_commit`
+    /// that folds to a wrong root. Only two call sites satisfy the precondition: the commit driver
     /// immediately after `publish_recommitted_state`, and `InspirePersistence::open` on the
     /// snapshot's own store before WAL replay.
     ///
@@ -762,6 +784,11 @@ impl LogicalLeafStore {
     ) {
         self.committed_addenda.clear();
         self.committed_addenda_db = Some(std::sync::Arc::clone(derived_alongside));
+        self.published_list_rows = self
+            .ppoi_imts
+            .iter()
+            .map(|(list_key, imt)| (*list_key, imt.leaf_count()))
+            .collect();
         if entries_per_shard == 0 {
             return;
         }

@@ -123,6 +123,8 @@ pub struct InspirePersistence {
     /// See [`InspirePersistence::set_backfilling`].
     backfilling: std::sync::atomic::AtomicBool,
     publish_requested: std::sync::atomic::AtomicBool,
+    /// See [`InspirePersistence::snapshot_pending`].
+    snapshot_pending: std::sync::atomic::AtomicBool,
     wake: tokio::sync::Notify,
     #[cfg(test)]
     fail_next_sync: std::sync::atomic::AtomicBool,
@@ -523,6 +525,7 @@ impl InspirePersistence {
                     list_row_refused: Mutex::new(None),
                     backfilling: std::sync::atomic::AtomicBool::new(false),
                     publish_requested: std::sync::atomic::AtomicBool::new(false),
+                    snapshot_pending: std::sync::atomic::AtomicBool::new(false),
                     wake: tokio::sync::Notify::new(),
                     #[cfg(test)]
                     fail_next_sync: std::sync::atomic::AtomicBool::new(false),
@@ -584,6 +587,7 @@ impl InspirePersistence {
                     list_row_refused: Mutex::new(None),
                     backfilling: std::sync::atomic::AtomicBool::new(false),
                     publish_requested: std::sync::atomic::AtomicBool::new(false),
+                    snapshot_pending: std::sync::atomic::AtomicBool::new(false),
                     wake: tokio::sync::Notify::new(),
                     #[cfg(test)]
                     fail_next_sync: std::sync::atomic::AtomicBool::new(false),
@@ -689,6 +693,8 @@ impl InspirePersistence {
             c.appends_since_snapshot = 0;
             c.last_snapshot_at = Instant::now();
         }
+        self.snapshot_pending
+            .store(false, std::sync::atomic::Ordering::Release);
 
         drop(m);
         let retention = self.policy.read().retention;
@@ -789,6 +795,14 @@ impl InspirePersistence {
                 .store(true, std::sync::atomic::Ordering::Release);
             self.wake.notify_one();
         }
+    }
+
+    /// Whether the served table holds rows no snapshot does yet: they were published ahead of
+    /// their snapshot, which the consumer takes within [`SnapshotPolicy::publish_bound`].
+    #[must_use]
+    pub fn snapshot_pending(&self) -> bool {
+        self.snapshot_pending
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Index, within its block, of the list row this instance lacks and was refused at or past
@@ -1471,16 +1485,18 @@ pub async fn run_consumer_task(
     });
 
     // Snapshot triggers fire only on an append, so a feed that goes quiet, a static policy, or a
-    // WAL tail replayed at open would otherwise leave applied rows out of the served database
-    // until the next triggering append or shutdown. The shim reads the store and would not show
-    // it.
-    let mut unpublished_since: Option<tokio::time::Instant> = None;
+    // WAL tail replayed at open would otherwise leave applied rows out of the served database, or
+    // published rows out of a snapshot, until the next triggering append or shutdown.
+    let mut unsnapshotted_since: Option<tokio::time::Instant> = None;
     let mut commits_seen = metrics.lock().commits_fired;
     // This loop's share of the error run. A complete tree applies no further event to clear it,
     // so the next commit by any path does, or one transient failure holds readiness shut for good.
     let mut failed_publishes: u64 = 0;
     // An event taken off the queue behind a run of list rows, handled before the next receive.
     let mut pending: Option<ConsumerEvent> = None;
+    // List rows applied since the last publish. Once the queue is empty they are published at
+    // once, not at the next snapshot, since the list index advertises a row only once served.
+    let mut rows_to_publish = false;
 
     loop {
         let now = tokio::time::Instant::now();
@@ -1491,19 +1507,19 @@ pub async fn run_consumer_task(
             }
             if m.commits_fired != commits_seen {
                 commits_seen = m.commits_fired;
-                unpublished_since = None;
+                unsnapshotted_since = None;
                 m.consecutive_event_errors =
                     m.consecutive_event_errors.saturating_sub(failed_publishes);
                 failed_publishes = 0;
             }
         }
         let behind = !logical_store.lock().dirty_shards().is_empty();
-        unpublished_since = if behind {
-            unpublished_since.or(Some(now))
+        unsnapshotted_since = if behind || persistence.snapshot_pending() {
+            unsnapshotted_since.or(Some(now))
         } else {
             None
         };
-        let publish_at = unpublished_since.map(|since| {
+        let publish_at = unsnapshotted_since.map(|since| {
             since
                 .checked_add(persistence.snapshot_policy().publish_bound())
                 .unwrap_or(since)
@@ -1513,7 +1529,10 @@ pub async fn run_consumer_task(
             && persistence
                 .publish_requested
                 .swap(false, std::sync::atomic::Ordering::AcqRel);
-        if publish_at.is_some_and(|at| at <= now) || (requested && behind) {
+        // The request that ends a backfill snapshots too, even when a publish beat it to the rows.
+        if publish_at.is_some_and(|at| at <= now)
+            || (requested && (behind || persistence.snapshot_pending()))
+        {
             // Between events, so the floor names only blocks whose events fully applied.
             let floor = metrics.lock().last_applied_leaf_block;
             if let Err(e) = drive_commit(
@@ -1536,7 +1555,28 @@ pub async fn run_consumer_task(
                 m.consecutive_event_errors = m.consecutive_event_errors.saturating_add(1);
                 drop(m);
                 failed_publishes = failed_publishes.saturating_add(1);
-                unpublished_since = Some(tokio::time::Instant::now());
+                unsnapshotted_since = Some(tokio::time::Instant::now());
+            }
+            continue;
+        }
+        rows_to_publish &= behind;
+        // Not while backfilling: the catch-up publish takes every row at once.
+        if idle
+            && rows_to_publish
+            && !persistence
+                .backfilling
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            rows_to_publish = false;
+            if !publish_applied_rows(
+                &instance,
+                &persistence,
+                &logical_store,
+                &params,
+                encoder.as_ref(),
+                &metrics,
+            ) {
+                failed_publishes = failed_publishes.saturating_add(1);
             }
             continue;
         }
@@ -1716,6 +1756,7 @@ pub async fn run_consumer_task(
                     encoder.as_ref(),
                     &metrics,
                 );
+                rows_to_publish = true;
                 if let Some(state) = verifier_state.as_mut() {
                     state
                         .maybe_verify_and_act(
@@ -1835,6 +1876,32 @@ pub async fn run_consumer_task(
                 .await;
         }
     }
+}
+
+/// [`drive_publish`] with a failure counted where readiness sees it; the rows stay applied and
+/// the publish bound retries them. Returns whether it published.
+fn publish_applied_rows(
+    instance: &Arc<PirInstance<RavenInspireScheme>>,
+    persistence: &InspirePersistence,
+    logical_store: &Arc<parking_lot::Mutex<super::inspire::LogicalLeafStore>>,
+    params: &raven_inspire::params::InspireParams,
+    encoder: &dyn super::pir_table::PirTableEncoder,
+    metrics: &Arc<parking_lot::Mutex<ConsumerMetrics>>,
+) -> bool {
+    let floor = metrics.lock().last_applied_leaf_block;
+    let Err(error) = drive_publish(instance, persistence, logical_store, params, encoder, floor)
+    else {
+        return true;
+    };
+    tracing::error!(
+        %error,
+        block_height = floor,
+        "publishing applied rows failed; they stay applied and the publish bound retries them"
+    );
+    let mut m = metrics.lock();
+    m.consumer_errors = m.consumer_errors.saturating_add(1);
+    m.consecutive_event_errors = m.consecutive_event_errors.saturating_add(1);
+    false
 }
 
 fn record_consumer_error(
@@ -2347,43 +2414,52 @@ fn publish_recommitted_state(
     }
 }
 
-fn drive_commit(
+/// Re-encode the dirty shards and publish them without a snapshot, so an applied row is served
+/// now rather than at the next snapshot. The rows' WAL page is synced, so a crash recovers them
+/// from the last snapshot and the WAL; the consumer snapshots them within the publish bound.
+fn drive_publish(
     instance: &Arc<PirInstance<RavenInspireScheme>>,
-    persistence: &Arc<InspirePersistence>,
+    persistence: &InspirePersistence,
     logical_store: &Arc<parking_lot::Mutex<super::inspire::LogicalLeafStore>>,
     params: &raven_inspire::params::InspireParams,
     encoder: &dyn super::pir_table::PirTableEncoder,
     height: u64,
-    metrics: &Arc<parking_lot::Mutex<ConsumerMetrics>>,
 ) -> Result<()> {
-    let dirty: Vec<u32> = {
-        let store = logical_store.lock();
-        store.dirty_shards().iter().copied().collect()
-    };
-
+    let dirty: Vec<u32> = logical_store
+        .lock()
+        .dirty_shards()
+        .iter()
+        .copied()
+        .collect();
     if dirty.is_empty() {
-        let snapshot_state = instance.current_state();
-        // Snapshot the store under-lock so it matches the state captured above.
-        let store_snapshot = {
-            let s = logical_store.lock();
-            s.clone()
-        };
-        ensure_store_not_shorter_than_published(
-            persistence,
-            instance.id.as_str(),
-            store_snapshot.leaf_count(),
-            height,
-        )?;
-        let _new_id = persistence.commit_v6(snapshot_state.as_ref(), &store_snapshot, height)?;
-        {
-            let mut m = metrics.lock();
-            m.commits_fired = m.commits_fired.saturating_add(1);
-        }
-        persistence.commit_notify().notify_waiters();
         return Ok(());
     }
+    let started = Instant::now();
+    re_encode_and_publish(instance, logical_store, params, encoder, &dirty, height)?;
+    persistence
+        .snapshot_pending
+        .store(true, std::sync::atomic::Ordering::Release);
+    logical_store.lock().clear_dirty_shards();
+    tracing::debug!(
+        instance_id = instance.id.as_str(),
+        shards = dirty.len(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "published applied rows ahead of their snapshot"
+    );
+    Ok(())
+}
 
-    // `Arc::make_mut` copies once per drive_commit; `current` is always a live
+/// Re-encode `dirty` into a copy of the served database, publish it, and record the committed
+/// addenda and published rows from the tree it was encoded from.
+fn re_encode_and_publish(
+    instance: &Arc<PirInstance<RavenInspireScheme>>,
+    logical_store: &Arc<parking_lot::Mutex<super::inspire::LogicalLeafStore>>,
+    params: &raven_inspire::params::InspireParams,
+    encoder: &dyn super::pir_table::PirTableEncoder,
+    dirty: &[u32],
+    height: u64,
+) -> Result<()> {
+    // `Arc::make_mut` copies once per publish; `current` is always a live
     // second reference. State and epoch come from ONE load so the swap below can
     // refuse a derivation another writer has already superseded.
     let derived_from = instance.current_snapshot();
@@ -2401,7 +2477,7 @@ fn drive_commit(
     ensure_encoder_matches_stored_cell(current.shard_config(), entries_per_shard, encoder)?;
     let mut new_db = Arc::clone(&current.encoded_db);
     let instance_label = instance.id.as_str().to_owned();
-    for shard_id in dirty {
+    for &shard_id in dirty {
         let bytes = {
             let store = logical_store.lock();
             encoder.materialize_shard(shard_id, &store)
@@ -2446,12 +2522,50 @@ fn drive_commit(
     // Derive the upper-sibling addenda from the tree this state was encoded from, recorded against
     // the encoded database just published. The consumer is the sole writer for this instance and is inside
     // this function, so no append can interleave and the pair is consistent by construction.
-    {
-        let snapshot = instance.current_snapshot();
-        let entries_per_shard = encoder.entries_per_shard();
-        let mut store = logical_store.lock();
-        store.refresh_committed_addenda(&snapshot.state.encoded_db, entries_per_shard);
+    let snapshot = instance.current_snapshot();
+    logical_store
+        .lock()
+        .refresh_committed_addenda(&snapshot.state.encoded_db, encoder.entries_per_shard());
+    Ok(())
+}
+
+fn drive_commit(
+    instance: &Arc<PirInstance<RavenInspireScheme>>,
+    persistence: &Arc<InspirePersistence>,
+    logical_store: &Arc<parking_lot::Mutex<super::inspire::LogicalLeafStore>>,
+    params: &raven_inspire::params::InspireParams,
+    encoder: &dyn super::pir_table::PirTableEncoder,
+    height: u64,
+    metrics: &Arc<parking_lot::Mutex<ConsumerMetrics>>,
+) -> Result<()> {
+    let dirty: Vec<u32> = {
+        let store = logical_store.lock();
+        store.dirty_shards().iter().copied().collect()
+    };
+
+    if dirty.is_empty() {
+        let snapshot_state = instance.current_state();
+        // Snapshot the store under-lock so it matches the state captured above.
+        let store_snapshot = {
+            let s = logical_store.lock();
+            s.clone()
+        };
+        ensure_store_not_shorter_than_published(
+            persistence,
+            instance.id.as_str(),
+            store_snapshot.leaf_count(),
+            height,
+        )?;
+        let _new_id = persistence.commit_v6(snapshot_state.as_ref(), &store_snapshot, height)?;
+        {
+            let mut m = metrics.lock();
+            m.commits_fired = m.commits_fired.saturating_add(1);
+        }
+        persistence.commit_notify().notify_waiters();
+        return Ok(());
     }
+
+    re_encode_and_publish(instance, logical_store, params, encoder, &dirty, height)?;
 
     let snapshot_state = instance.current_state();
     // Snapshot the store under-lock so it restores atomically with the state.
@@ -5227,6 +5341,7 @@ mod tests {
                 ..SnapshotPolicy::default()
             });
         persistence.set_backfilling(true);
+        let served_at_boot = instance.current_snapshot().epoch;
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let task = tokio::spawn(run_consumer_task(
             Arc::clone(&instance),
@@ -5268,6 +5383,11 @@ mod tests {
             0,
             "12 rows at a 4-append policy re-encoded the block while backfilling"
         );
+        assert_eq!(
+            instance.current_snapshot().epoch,
+            served_at_boot,
+            "a backfilling block published its rows page by page"
+        );
         assert!(!logical_store.lock().dirty_shards().is_empty());
 
         persistence.set_backfilling(false);
@@ -5290,6 +5410,75 @@ mod tests {
             || metrics.lock().commits_fired == 2,
         )
         .await;
+        tx.send(ConsumerEvent::Shutdown).await.expect("shutdown");
+        task.await.expect("join").expect("consumer task");
+    }
+
+    /// A caught-up block serves its new rows at once and leaves their snapshot to the publish
+    /// bound, which still takes it: a publish that skips the snapshot must not skip it for good.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prompt_publish_leaves_the_snapshot_to_the_publish_bound() {
+        let (instance, persistence, logical_store, params, encoder, metrics, _dir) =
+            list_block_fixture(SnapshotPolicy {
+                max_appends_per_snapshot: 1_000,
+                max_seconds_between_snapshots: 3_600,
+                ..SnapshotPolicy::default()
+            });
+        let snapshot = persistence.current_snapshot_id();
+        let served_at_boot = instance.current_snapshot().epoch;
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let task = tokio::spawn(run_consumer_task(
+            Arc::clone(&instance),
+            Arc::clone(&persistence),
+            Arc::clone(&logical_store),
+            Arc::clone(&metrics),
+            params,
+            encoder,
+            rx,
+            None,
+        ));
+        for (row, height) in list_rows(3) {
+            tx.send(ConsumerEvent::Ppoi(row, height))
+                .await
+                .expect("send");
+        }
+        until(
+            "the rows served",
+            || (rows_held(&logical_store), instance.current_snapshot().epoch),
+            || logical_store.lock().published_list_rows(&LIST) == 3,
+        )
+        .await;
+        assert!(instance.current_snapshot().epoch > served_at_boot);
+        assert!(logical_store.lock().dirty_shards().is_empty());
+        assert_eq!(
+            metrics.lock().commits_fired,
+            0,
+            "the rows waited for a snapshot"
+        );
+        assert_eq!(persistence.current_snapshot_id(), snapshot);
+        assert!(persistence.snapshot_pending());
+
+        persistence.set_snapshot_policy(SnapshotPolicy {
+            max_appends_per_snapshot: 1_000,
+            max_seconds_between_snapshots: 1,
+            ..SnapshotPolicy::default()
+        });
+        // The consumer reads the bound at its next loop top.
+        tx.send(ConsumerEvent::Heartbeat {
+            chain_head: 1,
+            scanned_through: 1,
+        })
+        .await
+        .expect("send");
+        until(
+            "the snapshot within the bound",
+            || metrics.lock().commits_fired,
+            || metrics.lock().commits_fired == 1,
+        )
+        .await;
+        assert!(!persistence.snapshot_pending());
+        assert!(persistence.current_snapshot_id() > snapshot);
+        assert_eq!(metrics.lock().consumer_errors, 0);
         tx.send(ConsumerEvent::Shutdown).await.expect("shutdown");
         task.await.expect("join").expect("consumer task");
     }

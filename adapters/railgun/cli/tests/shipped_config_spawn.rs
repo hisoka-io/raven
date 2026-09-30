@@ -18,6 +18,8 @@
 
 #[path = "support/bc_prefixes.rs"]
 mod bc_prefixes;
+#[path = "support/progress.rs"]
+mod progress;
 #[path = "support/signed_list.rs"]
 mod signed_list;
 
@@ -394,6 +396,18 @@ async fn wait_until_caught_up(booted: &Booted) -> MirrorFeedView {
     }
 }
 
+/// The index once it advertises `rows`, which follows the feed catching up by the publish that
+/// ends the backfill. Every answer on the way is a 200 over a shorter prefix, never a refusal.
+async fn wait_until_indexed(booted: &Booted, rows: u64) -> Segment {
+    progress::until_done_or_stalled("the index advertising every row", async || {
+        let index = ask_index(booted).await;
+        let progress = (index.status, index.next);
+        let done = index.status != StatusCode::OK || index.next == Some(rows);
+        (progress, done.then_some(index))
+    })
+    .await
+}
+
 async fn ask_commit_tree(addr: SocketAddr, tree_number: u32) -> StatusCode {
     reqwest::Client::new()
         .post(format!(
@@ -430,7 +444,7 @@ fn refusals_for(scrape: &str, route: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// The list's index, asked exactly once so a refusal count is exact.
+/// The list's index. A wait on it stops at the first refusal, so a refusal count stays exact.
 async fn ask_index(booted: &Booted) -> Segment {
     read_segment(
         reqwest::Client::new()
@@ -500,7 +514,7 @@ async fn the_shipped_config_serves_shim_routes_from_the_stores_it_declares() {
     assert_eq!(feed.rows_held, u64::from(LIST_ROWS), "{feed:?}");
 
     let undeclared = ask_commit_tree(addr, 0).await;
-    let index = ask_index(&booted).await;
+    let index = wait_until_indexed(&booted, u64::from(LIST_ROWS)).await;
     let scrape = scrape(addr).await;
 
     assert_eq!(

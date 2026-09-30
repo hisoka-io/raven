@@ -124,20 +124,16 @@ async fn stop_uncleanly(handle: MultiOrchestratorHandle) {
     }
 }
 
-/// Waits for the store's dirty set to drain and for the commit that drained it to land, and
+/// Waits for the store's dirty set to drain and for the snapshot of those rows to land, and
 /// returns how long that took. A block that never publishes stops moving and fails here.
 async fn wait_published(handle: &MultiOrchestratorHandle) -> Duration {
     let booted = handle.instances.first().expect("one instance");
     let started = tokio::time::Instant::now();
     progress::until_done_or_stalled("the block publishing its applied rows", || {
+        let drained = booted.logical_store.lock().dirty_shards().is_empty();
         (
             progress::consumer_motion(&booted.metrics, &booted.persistence),
-            booted
-                .logical_store
-                .lock()
-                .dirty_shards()
-                .is_empty()
-                .then_some(()),
+            (drained && !booted.persistence.snapshot_pending()).then_some(()),
         )
     })
     .await;
@@ -248,6 +244,8 @@ async fn a_static_block_serves_mirrored_rows_once_the_feed_goes_quiet() {
     let (fresh, secret_key) = fresh_state();
     let handle = boot(dir.path(), short_bound(), Some(fresh));
     let booted = handle.instances.first().expect("one instance");
+    // Backfilling publishes by the bound alone; a caught-up block would publish each row at once.
+    booted.persistence.set_backfilling(true);
     let mut upstream = Imt::new().expect("reference tree");
 
     mirror_rows(&handle, &mut upstream, 0..1).await;
@@ -294,6 +292,8 @@ async fn a_steady_feed_does_not_hold_off_the_publish() {
     let (fresh, secret_key) = fresh_state();
     let handle = boot(dir.path(), SnapshotPolicy::static_default(), Some(fresh));
     let booted = handle.instances.first().expect("one instance");
+    // Backfilling publishes by the bound alone; a caught-up block would publish each row at once.
+    booted.persistence.set_backfilling(true);
     let mut upstream = Imt::new().expect("reference tree");
     let commits = booted.metrics.lock().commits_fired;
 
@@ -353,6 +353,8 @@ async fn a_restarted_static_block_serves_the_rows_its_wal_replayed() {
     let (fresh, secret_key) = fresh_state();
     let first = boot(dir.path(), SnapshotPolicy::static_default(), Some(fresh));
     let life = first.instances.first().expect("one instance");
+    // Backfilling publishes by the bound alone; a caught-up block would publish each row at once.
+    life.persistence.set_backfilling(true);
     let commits = life.metrics.lock().commits_fired;
     let mut upstream = Imt::new().expect("reference tree");
     mirror_rows(&first, &mut upstream, 0..ROWS).await;

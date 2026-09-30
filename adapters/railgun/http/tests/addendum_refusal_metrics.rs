@@ -42,7 +42,7 @@ const SKEW: &str = "raven_railgun_addendum_provenance_skew_total";
 const MISSING: &str = "raven_railgun_addendum_missing_total";
 /// Spelled out rather than imported: an oracle that reads the crate's own list agrees with it
 /// by construction, including when the list is wrong.
-const REASONS: [&str; 3] = ["unseeded", "stale_provenance", "swapped_mid_request"];
+const REASONS: [&str; 2] = ["unseeded", "stale_provenance"];
 
 /// What the instance's committed-addenda table holds when the batch lands.
 enum Provenance {
@@ -263,7 +263,6 @@ async fn a_never_committed_instance_refuses_under_the_unseeded_reason() {
     let text = scrape(&router).await;
     assert_eq!(skew(&text, INSTANCE, "unseeded"), 1, "{text}");
     assert_eq!(skew(&text, INSTANCE, "stale_provenance"), 0, "{text}");
-    assert_eq!(skew(&text, INSTANCE, "swapped_mid_request"), 0, "{text}");
     assert_eq!(missing(&text, INSTANCE), 0, "{text}");
 }
 
@@ -284,7 +283,6 @@ async fn a_superseded_addenda_table_refuses_under_the_stale_provenance_reason() 
     let text = scrape(&router).await;
     assert_eq!(skew(&text, INSTANCE, "stale_provenance"), 1, "{text}");
     assert_eq!(skew(&text, INSTANCE, "unseeded"), 0, "{text}");
-    assert_eq!(skew(&text, INSTANCE, "swapped_mid_request"), 0, "{text}");
     assert_eq!(missing(&text, INSTANCE), 0, "{text}");
 }
 

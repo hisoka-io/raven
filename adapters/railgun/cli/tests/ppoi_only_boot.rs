@@ -393,14 +393,20 @@ async fn assert_every_list_route_refuses(addr: SocketAddr) {
 }
 
 /// The index answers over the list upstream holds, every row at its global position. The list
-/// is shorter than a block, so one index segment is all of it.
+/// is shorter than a block, so one index segment is all of it. It advertises the rows once the
+/// publish that ends the backfill serves them, which follows the feed catching up.
 async fn assert_list_routes_answer_the_whole_list(addr: SocketAddr, rows: u64) {
-    let (_, index) = list_routes(addr)
-        .await
-        .into_iter()
-        .next()
-        .expect("bc-prefixes");
-    let index = read_segment(index).await;
+    let index = until_done_or_stalled("the index advertising the whole list", async || {
+        let (_, index) = list_routes(addr)
+            .await
+            .into_iter()
+            .next()
+            .expect("bc-prefixes");
+        let index = read_segment(index).await;
+        let progress = (index.status, index.next);
+        (progress, (index.next == Some(rows)).then_some(index))
+    })
+    .await;
     assert_eq!(
         index.status,
         StatusCode::OK,

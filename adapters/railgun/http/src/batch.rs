@@ -23,10 +23,7 @@ const ADDENDUM_LEVELS: usize = raven_railgun_engine::imt::TREE_DEPTH - PATH10_LE
 const ADDENDUM_BYTES: usize = ADDENDUM_LEVELS * 32;
 
 use crate::auth::validate_session_binding;
-use crate::state::{
-    AppState, ADDENDUM_SKEW_STALE_PROVENANCE, ADDENDUM_SKEW_SWAPPED_MID_REQUEST,
-    ADDENDUM_SKEW_UNSEEDED,
-};
+use crate::state::{AppState, ADDENDUM_SKEW_STALE_PROVENANCE, ADDENDUM_SKEW_UNSEEDED};
 use crate::versioned::{read_versioned, write_batch_response_versioned, write_versioned};
 use crate::{attach_freshness_header, build_response_headers};
 
@@ -184,8 +181,20 @@ pub(crate) async fn batch_handler<S: PirScheme>(
     let instance_id = InstanceId::new(id);
     let instance =
         admit_instance(&app.engine, &instance_id, "batch").map_err(AdmissionRefusal::status)?;
+    let snapshot = instance.current_snapshot();
+    respond_batch(&app, &instance_id, instance, snapshot, &body).await
+}
 
-    let queries: Vec<S::Query> = read_versioned(&body).map_err(|err| {
+/// Answer a batch from `snapshot_for_batch` alone, so a concurrent `swap_state` cannot split it
+/// across two tables.
+async fn respond_batch<S: PirScheme>(
+    app: &AppState<S>,
+    instance_id: &InstanceId,
+    instance: Arc<PirInstance<S>>,
+    snapshot_for_batch: Arc<Snapshot<S>>,
+    body: &Bytes,
+) -> Result<(StatusCode, HeaderMap, Bytes), StatusCode> {
+    let queries: Vec<S::Query> = read_versioned(body).map_err(|err| {
         tracing::warn!(?err, "batch versioned-bincode deserialize failed");
         StatusCode::BAD_REQUEST
     })?;
@@ -205,8 +214,6 @@ pub(crate) async fn batch_handler<S: PirScheme>(
     }
 
     let started = Instant::now();
-    // Captured ONCE so the batch cannot straddle a concurrent `swap_state`.
-    let snapshot_for_batch = instance.current_snapshot();
     let epoch_at_start = snapshot_for_batch.epoch;
 
     let k = app.config.max_concurrent_queries.max(1);
@@ -227,7 +234,7 @@ pub(crate) async fn batch_handler<S: PirScheme>(
 
     let responses = responses_result.map_err(|err| {
         if matches!(err, BatchError::PermitWait { .. }) {
-            count_permit_wait_refusal(&instance_id, "batch");
+            count_permit_wait_refusal(instance_id, "batch");
         } else {
             tracing::error!(error = %err, "batch dispatch failed");
         }
@@ -281,9 +288,9 @@ pub(crate) async fn inspire_batch_handler(
         validate_session_binding(&headers, app.sessions.as_ref(), &instance_id, Some(handle))?;
     }
     // The addendum comes from the table the commit driver derives from the tree a state was
-    // encoded from -- NOT from the live store, which runs a commit cadence ahead (1000 appends /
-    // 300 s) and cannot be shown to share a state with the row. The table is keyed by shard id, so
-    // no width arithmetic happens on this path.
+    // encoded from -- NOT from the live store, which runs ahead of the served table between a
+    // page's apply and its publish. The table is keyed by shard id, so no width arithmetic
+    // happens on this path.
     //
     // Selecting by `query.shard_id` works only because the shard id is cleartext (SECURITY.md
     // G7), and leaks nothing beyond it: levels 11..15 are constant across a shard. Hide the shard
@@ -293,12 +300,15 @@ pub(crate) async fn inspire_batch_handler(
     // epoch every session-eviction interval while carrying `encoded_db` by `Arc::clone`; an epoch
     // equality check therefore refused every frozen block forever, one hour after boot. A commit
     // replaces the Arc; nothing else does.
+    //
+    // The rows are answered from this same snapshot, so a commit landing mid-request cannot pair
+    // them with another tree's addenda.
+    let snapshot = instance.current_snapshot();
     let addenda = match app.instance_logical_stores.get(&instance_id) {
         None => None,
         Some((list_key, store)) => {
-            let before = instance.current_snapshot();
             let store = store.lock();
-            if !store.committed_addenda_derived_from(&before.state.encoded_db) {
+            if !store.committed_addenda_derived_from(&snapshot.state.encoded_db) {
                 // Two operator situations hide behind one `false`. An instance that has never
                 // committed a tree is a correct transient; a superseded database is the narrow
                 // publish_recommitted_state -> refresh window and must not read as one.
@@ -309,7 +319,7 @@ pub(crate) async fn inspire_batch_handler(
                 };
                 tracing::warn!(
                     instance_id = %instance_id,
-                    epoch = before.epoch.0,
+                    epoch = snapshot.epoch.0,
                     reason,
                     "batch refused: committed addenda were not derived alongside the served state"
                 );
@@ -352,32 +362,14 @@ pub(crate) async fn inspire_batch_handler(
                 }
                 out.push(addendum.to_vec());
             }
-            Some((before, out))
+            Some(out)
         }
     };
-    let (status, headers, response) = batch_handler(State(app), Path(id), body).await?;
-    let Some((before, addenda)) = addenda else {
+    let (status, headers, response) =
+        respond_batch(&app, &instance_id, instance, snapshot, &body).await?;
+    let Some(addenda) = addenda else {
         return Ok((status, headers, response));
     };
-    // `batch_handler` takes its own snapshot between these two reads. If the encoded database is the
-    // same Arc before AND after, the one it served from was that same Arc -- so the row and the
-    // addenda share a tree. A commit landing mid-request changes it, and that pair is refused.
-    let after = instance.current_snapshot();
-    if !Arc::ptr_eq(&before.state.encoded_db, &after.state.encoded_db) {
-        tracing::warn!(
-            instance_id = %instance_id,
-            epoch_before = before.epoch.0,
-            epoch_after = after.epoch.0,
-            "batch refused: a commit replaced the served state mid-request"
-        );
-        metrics::counter!(
-            "raven_railgun_addendum_provenance_skew_total",
-            "instance" => instance_id.to_string(),
-            "reason" => ADDENDUM_SKEW_SWAPPED_MID_REQUEST,
-        )
-        .increment(1);
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
     let reframed = append_batch_addenda(&response, &addenda)
         .map_err(|()| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((status, headers, reframed.into()))
@@ -841,15 +833,14 @@ mod append_addenda_tests {
 }
 
 #[cfg(test)]
-mod swapped_mid_request_metric_tests {
-    //! The third `reason` on `raven_railgun_addendum_provenance_skew_total`, the one that only
-    //! fires after a batch has already been served: the row is correct, and the commit that
-    //! landed while it was in flight is what makes the addenda no longer its own.
+mod commit_mid_request_tests {
+    //! A commit that lands while a batch is in flight: the batch is answered from the snapshot it
+    //! started on, its rows and its addenda both, so it is served rather than refused.
     //!
-    //! Driven at the handler rather than the router because the refusal needs a commit to land
-    //! strictly between the handler's two provenance reads. `join_next` awaits a spawned task,
-    //! which on a current-thread runtime cannot run before this task yields, so a commit
-    //! applied at the first pending poll is exactly a commit landing mid-request.
+    //! Driven at the handler rather than the router because the commit must land strictly while
+    //! the batch is in flight. `join_next` awaits a spawned task, which on a current-thread
+    //! runtime cannot run before this task yields, so a commit applied at the first pending poll
+    //! is exactly a commit landing mid-request.
 
     use std::collections::HashMap;
     use std::future::Future;
@@ -1084,8 +1075,8 @@ mod swapped_mid_request_metric_tests {
         metrics::with_local_recorder(&log, || runtime.block_on(body(captured)));
     }
 
-    /// Control for the refusal below: the same fixture, with nothing committed mid-request,
-    /// serves the batch. Without it a green refusal proves only that the fixture is broken.
+    /// Control for the commit below: the same fixture, with nothing committed mid-request,
+    /// serves the batch. Without it a served batch below proves only that the fixture is broken.
     #[test]
     fn the_same_fixture_serves_when_no_commit_lands_mid_request() {
         with_emit_log(|log| async move {
@@ -1100,25 +1091,18 @@ mod swapped_mid_request_metric_tests {
             let (status, _, body) = served.expect("the fixture must serve when no commit lands");
             assert_eq!(status, StatusCode::OK);
             assert!(!body.is_empty());
-            assert_eq!(
-                log.skew("swapped_mid_request"),
-                vec![0],
-                "a served batch must leave the series at its zero-init and nothing more"
-            );
+            assert_eq!(log.skew("stale_provenance"), vec![0]);
+            assert_eq!(log.skew("unseeded"), vec![0]);
         });
     }
 
     #[test]
-    fn a_commit_landing_mid_request_refuses_under_its_own_reason() {
+    fn a_commit_landing_mid_request_is_answered_from_the_table_the_batch_started_on() {
         with_emit_log(|log| async move {
             let fixture = fixture();
             let instance = Arc::clone(&fixture.instance);
             let (recommitted_crs, recommitted_db) = fixture.recommitted;
-
-            // The zero-init, on the exact label set the refusal below increments. Without it an
-            // alert on this series reads "no data" and cannot tell a silent server from an
-            // unscraped one.
-            assert_eq!(log.skew("swapped_mid_request"), vec![0]);
+            let started_on = instance.current_snapshot().epoch;
 
             let served_db = Arc::clone(&instance.current_snapshot().state.encoded_db);
             let batch = inspire_batch_handler(
@@ -1149,20 +1133,19 @@ mod swapped_mid_request_metric_tests {
                 "the commit must replace the served database, or the fixture proves nothing"
             );
 
+            let (status, headers, _) = batch
+                .await
+                .expect("a batch in flight across a commit is served, not refused");
+            assert_eq!(status, StatusCode::OK);
             assert_eq!(
-                batch
-                    .await
-                    .expect_err("a row and addenda from two trees must be refused"),
-                StatusCode::SERVICE_UNAVAILABLE
+                headers
+                    .get(crate::X_RAVEN_EPOCH)
+                    .and_then(|value| value.to_str().ok()),
+                Some(started_on.0.to_string().as_str()),
+                "answered from the table the batch started on"
             );
-
-            assert_eq!(
-                log.skew("swapped_mid_request"),
-                vec![0, 1],
-                "the refusal must land on its own reason, after the zero-init"
-            );
-            assert_eq!(log.skew("unseeded"), vec![0]);
             assert_eq!(log.skew("stale_provenance"), vec![0]);
+            assert_eq!(log.skew("unseeded"), vec![0]);
         });
     }
 }

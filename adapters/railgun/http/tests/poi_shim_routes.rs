@@ -82,6 +82,19 @@ fn fr_canonical(tag: u8) -> [u8; 32] {
     out
 }
 
+/// Record every row `store` holds as served, as the commit driver does once it publishes.
+fn mark_published(store: &mut LogicalLeafStore) {
+    let table = Arc::new(raven_inspire::EncodedDatabase {
+        shards: Vec::new(),
+        config: raven_inspire::params::ShardConfig {
+            shard_size_bytes: 0,
+            entry_size_bytes: 0,
+            total_entries: 0,
+        },
+    });
+    store.refresh_committed_addenda(&table, 0);
+}
+
 fn seeded_store() -> (LogicalLeafStore, [u8; 32]) {
     let mut store = LogicalLeafStore::new();
     let enc = encoder();
@@ -126,6 +139,7 @@ fn seeded_store() -> (LogicalLeafStore, [u8; 32]) {
         )
         .expect("seed ppoi leaf");
     }
+    mark_published(&mut store);
 
     (store, list_key)
 }
