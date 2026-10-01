@@ -290,11 +290,7 @@ pub(crate) async fn inspire_batch_handler(
     // The addendum comes from the table the commit driver derives from the tree a state was
     // encoded from -- NOT from the live store, which runs ahead of the served table between a
     // page's apply and its publish. The table is keyed by shard id, so no width arithmetic
-    // happens on this path.
-    //
-    // Selecting by `query.shard_id` works only because the shard id is cleartext (SECURITY.md
-    // G7), and leaks nothing beyond it: levels 11..15 are constant across a shard. Hide the shard
-    // and this path goes with it -- the upper siblings must then travel inside the PIR row.
+    // happens on this path; levels 11..15 are constant across a shard.
     //
     // Provenance is the `encoded_db` Arc, NOT the epoch. `heartbeat_session_eviction` bumps the
     // epoch every session-eviction interval while carrying `encoded_db` by `Arc::clone`; an epoch

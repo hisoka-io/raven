@@ -9,9 +9,8 @@ RPC server a leaf index or commitment hash on every read, and that pointer is en
 who you are.
 
 Raven moves those reads to single-server private information retrieval (PIR). The wallet sends an
-encrypted query, the server answers it over the whole shard without decrypting it, and the wallet
-recovers the record locally. A query reveals the block and the 2,048-row shard it targets; the row
-within that shard stays hidden. [SECURITY.md](./SECURITY.md) states what the server sees.
+encrypted query, the server answers it without decrypting it, and the wallet recovers the record
+locally. The server does not learn which row was retrieved.
 
 ## What ships
 
@@ -67,8 +66,7 @@ the `ci-test` profile; a debug build is too slow for them.
 
 ## Toward v1
 
-Hiding the shard within its block, unlinkable per-operation sessions, and a parameter set of at
-least 128 bits.
+A parameter set estimated at 128 bits or more.
 
 ## Contributing
 

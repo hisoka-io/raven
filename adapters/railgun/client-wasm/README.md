@@ -2,8 +2,7 @@
 
 The WebAssembly PIR client that `@hisoka-io/railgun-poi-node-interface` runs on the device: it
 builds encrypted InsPIRe queries and decrypts the answers, so a Raven node serves a PPOI auth path
-without learning which row of the queried 2,048-row shard was asked for; the block and the shard
-are visible to it.
+without learning which row was retrieved.
 
 Two builds of one wasm, published as two packages:
 

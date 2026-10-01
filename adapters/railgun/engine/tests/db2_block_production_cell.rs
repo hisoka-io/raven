@@ -22,7 +22,7 @@ use raven_railgun_engine::pir_table::{EncoderKind, PirTableEncoder};
 use raven_railgun_persistence::WalEntryPayload;
 use raven_railgun_poseidon::{merkle_node, railgun_merkle_zero_value};
 
-/// Wire-format fetch block, not a PPOI list block: 2^10 leaves, 32 KB, anonymity set 1,024.
+/// Wire-format fetch block, not a PPOI list block: 2^10 leaves, 32 KB.
 const BLOCK_K: usize = 10;
 /// Leaf commitments per block.
 const BLOCK_LEAVES: usize = 1 << BLOCK_K;

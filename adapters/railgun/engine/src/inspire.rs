@@ -547,10 +547,9 @@ const fn rejection_limit(bound: u64) -> u64 {
 
 /// Uniform draw below `bound`, rejection-sampled to match the SDK's `randomBelow`.
 ///
-/// The two implementations of one privacy mechanism should not disagree on their draw: a
-/// reader comparing them has to decide which is right. The bias a bare remainder would leave
-/// is about `bound / 2^64`, unobservable at any batch length this ladder admits, so this is
-/// parity rather than a live leak. The attempt bound exists because an unbounded retry in a
+/// The two implementations should not disagree on their draw: a reader comparing them has to
+/// decide which is right. A bare remainder would leave a bias of about `bound / 2^64`; the
+/// rejection sampling here is for parity. The attempt bound exists because an unbounded retry in a
 /// request path is a worse failure than a refusal.
 fn uniform_below(bound: u64) -> Result<u64> {
     if bound == 0 {
@@ -578,11 +577,9 @@ fn uniform_below(bound: u64) -> Result<u64> {
 
 /// Global rows for one padded batch: `global_indices` in order, then `padded - len` covers.
 ///
-/// `shard_id` travels in cleartext, so the server counts the distinct shards a batch touches.
-/// Covers go to shards no real index occupies, up to min(padded, shard count) distinct shards, so
-/// with distinct real shards that count depends on the ladder step and the table alone. A cover
-/// that fits no free shard goes to a uniform shard. Two real indices sharing a shard still show as
-/// one: the cleartext selector cannot hide that. Covers address rows below `total_entries`.
+/// Covers go to shards no real index occupies, up to min(padded, shard count) distinct shards;
+/// a cover that fits no free shard goes to a uniform shard. Covers address rows below
+/// `total_entries`.
 fn padded_targets(
     shard_config: &ShardConfig,
     global_indices: &[u64],
@@ -646,14 +643,8 @@ fn padded_targets(
 /// Build a batch padded up to the next [`batch_ladder`] step. Slots stay in
 /// `global_indices` order, so `states[i]` decodes `responses[i]`.
 ///
-/// Padding is client-side because the server is the adversary the ladder hides
-/// the count from: a pad the server generates is a pad the server knows about.
-/// Each pad is a fresh query that costs a full database pass, so it is
-/// indistinguishable from a real slot by size or work. Pads go first to shards no real
-/// index occupies, then to uniform shards. Residual: reals hold slots 0..len in order, so
-/// a structured real sequence (an auth path's ascending levels) can mark where
-/// the covers begin; closing that needs a shuffle plus a permutation map, which
-/// changes this contract.
+/// Pads are built on the client. Each pad is a fresh query of the same size and work as
+/// a real slot. Pads go first to shards no real index occupies, then to uniform shards.
 ///
 /// # Errors
 /// [`AdapterError::InvalidQuery`] when `global_indices` is empty or exceeds
@@ -2165,8 +2156,8 @@ mod pad_draw_tests {
             .len()
     }
 
-    /// A pad that re-queries a real index touches no new shard, so the distinct cleartext
-    /// `shard_id` count would be the real count the ladder exists to hide.
+    /// Covers fill free shards first, so reals in distinct shards plus their covers touch
+    /// exactly `padded` shards.
     #[test]
     fn distinct_shards_depend_on_the_ladder_step_alone() {
         let config = table(64);
@@ -2210,10 +2201,9 @@ mod pad_draw_tests {
         }
     }
 
-    /// `SeededClientQuery.shard_id` travels in cleartext, so a favoured residue is a bias in
-    /// what an operator sees. The bound is the observable: the bias a bare remainder leaves at
-    /// these batch lengths is about `bound / 2^64`, which no statistical test on the draw could
-    /// distinguish, so asserting on samples would prove nothing either way.
+    /// A favoured residue would bias which cover shards are drawn. The bias a bare remainder
+    /// leaves at these batch lengths is about `bound / 2^64`, which no statistical test on the
+    /// draw could distinguish, so the bound is asserted rather than samples.
     #[test]
     fn the_rejection_bound_is_a_whole_number_of_buckets() {
         for bound in [1_u64, 2, 3, 5, 8, 32, 84, 128, 1000, u64::MAX / 2] {

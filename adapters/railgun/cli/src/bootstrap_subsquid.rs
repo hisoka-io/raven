@@ -326,7 +326,7 @@ pub trait ChainOracle: Send + Sync {
     }
 }
 
-/// Keeps an undecodable response distinguishable from a transport refusal, and names the block
+/// Keeps an undecodable response distinguishable from a transport refusal, and reports the block
 /// that was PROBED rather than whichever block a later classifier happens to hold.
 fn chain_read_error(
     block: u64,

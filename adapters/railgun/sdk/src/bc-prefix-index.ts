@@ -22,10 +22,8 @@ const HEADER_EPOCH = "x-raven-index-epoch";
 const HEADER_BASE = "x-raven-index-base";
 
 /**
- * A resumed walk restarts at a multiple of this below the rows already held. The cursor is sent in
- * the clear on every sync, so an exact one would let the node link a client's calls, and its runs
- * across restarts, by the row it last reached. At ~630 rows a day this names a window of about three
- * days, costs at most 12 KB of re-read rows, and those rows are checked against what is held.
+ * A resumed walk restarts at the multiple of this at or below the rows already held. It costs at
+ * most 12 KB of re-read rows, and those rows are checked against what is held.
  */
 export const BC_INDEX_RESUME_ALIGN_ROWS = 2_048;
 

@@ -40,15 +40,12 @@ function insertSorted(sorted: number[], value: number): void {
 /**
  * Pad `realTargets` to a ladder step and shuffle the slots.
  *
- * `shard_id` is cleartext, so the server counts distinct shards per request. Covers go to shards
- * no real target occupies, up to min(padded length, populated shards) distinct shards, so with
- * distinct real shards that count depends on the ladder step and the table alone. A cover that
- * fits no free shard goes to a uniform populated shard. Two real targets sharing a shard still
- * show as one shard.
+ * Covers go to shards no real target occupies, up to min(padded length, populated shards)
+ * distinct shards; a cover that fits no free shard goes to a uniform populated shard.
  *
  * Covers address rows below `populatedRows`, since a query into rows the instance never wrote
- * could only be a cover. An empty `realTargets` yields one cover query, for a request whose
- * absence would itself say every lookup was answered locally.
+ * could only be a cover. An empty `realTargets` yields one cover query, so a request goes out
+ * even when every lookup was answered locally.
  */
 export function buildPaddedQueryPlan(
   realTargets: readonly number[],

@@ -110,7 +110,7 @@ function clientStateFor(globalIdx: number): Uint8Array {
   return decodeClientPirQueryBundle(seededQueryFor(globalIdx)).clientStateBincode;
 }
 
-/** The clear shard selector: `SeededClientQuery.shard_id`, first bincode field, u32 LE. */
+/** The shard selector: `SeededClientQuery.shard_id`, first bincode field, u32 LE. */
 function clearShardSelector(globalIdx: number): number {
   const queryBytes = decodeClientPirQueryBundle(seededQueryFor(globalIdx)).queryBytes;
   return new DataView(queryBytes.buffer, queryBytes.byteOffset).getUint32(0, true);

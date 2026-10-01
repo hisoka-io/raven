@@ -1,6 +1,5 @@
 /**
- * Fixed-size ladder for batched PIR requests: an unpadded batch publishes the
- * wallet's exact cache-miss count. Railgun's default policy must stay in step
+ * Fixed-size ladder for batched PIR requests. Railgun's default policy must stay in step
  * with `raven_railgun_core::batch_ladder`; Raven core owns the generic arithmetic.
  */
 

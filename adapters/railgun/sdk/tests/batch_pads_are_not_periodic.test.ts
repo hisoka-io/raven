@@ -1,7 +1,6 @@
-// `SeededClientQuery.shard_id` travels in cleartext, so the batch's shard sequence is
-// visible to the server. Cycling pads (`realSlots[slot % len]`) made slot j and slot j+len
-// address the identical global index, so the repeat period IS the cache-miss count - the one
-// quantity the dyadic ladder exists to hide. Pads must be drawn at random.
+// Cycling pads (`realSlots[slot % len]`) made slot j and slot j+len address the identical
+// global index, so the sequence repeated with the real count as its period. Pads must be drawn
+// at random.
 //
 // Every assertion here drives the SHIPPED `buildPaddedQueryPlan`. A test that defines its own
 // draw asserts a property of the test, not of the code that ships.

@@ -2,15 +2,12 @@
  * Independent PPOI block roots, read from the upstream Railgun aggregator.
  *
  * A root fetched from the node that served the auth path proves nothing, so the pin comes from
- * elsewhere. Both requests are a function of public state only: a list key, a block number and
- * upstream's own tip. No blinded commitment is sent.
+ * elsewhere. No blinded commitment is sent.
  *
- * The note is hidden and its block is not: `block` is `floor(noteLeafIndex / 65_536)`. Requests
- * for one block are identical between wallets apart from the JSON-RPC `id`, and the tail cache
- * makes a burst of proofs against one Raven snapshot cost one block-naming request. A fold whose
- * root moved off the cached window re-resolves from the point query, so a filling block that
- * takes a leaf between two proofs costs one such request per proof. A caller who needs the block
- * hidden preloads `ppoiPinnedRoots` and never reaches this module.
+ * `block` is `floor(noteLeafIndex / 65_536)`. The tail cache makes a burst of proofs against one
+ * Raven snapshot cost one request. A fold whose root moved off the cached window re-resolves from
+ * the point query, so a filling block that takes a leaf between two proofs costs one request per
+ * proof. A caller that preloads `ppoiPinnedRoots` never reaches this module.
  */
 
 import { RavenError } from "./errors";
@@ -171,8 +168,8 @@ export class UpstreamPinResolver {
     // One point query classifies the block AND answers it: a row at the block's last leaf
     // means the tree is full, so that row's root is the full tree's root and is immutable.
     // No row means the block is still filling (or is past the tip), which needs the window.
-    // The tail cache is checked before the point query: `startIndex` names the note's block,
-    // and a cached tail answer saves one block-naming request per proof.
+    // The tail cache is checked before the point query: a cached tail answer saves one
+    // upstream request per proof.
     const now = Date.now();
     const cachedTail = this.tailPins.get(cacheKey);
     if (cachedTail && cachedTail.expiresAt > now) {

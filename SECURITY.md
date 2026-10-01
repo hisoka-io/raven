@@ -31,18 +31,10 @@ dimension 2,048, ciphertext modulus q = 2^60 - 2^14 + 1, plaintext modulus 65,53
 the client refuses a served parameter set with a ring dimension outside 2,048 to 4,096, a larger
 modulus, another error width, or gadgets longer than 3 digits.
 
-**Shards.** A shard holds exactly as many rows as the ring dimension, 2,048 at the shipped
-parameters; setup refuses any other shard height.
-
-**What the server sees.** No request to a Raven node carries a commitment. For each proof query
-the node sees the block it targets, the 2,048-row shard it targets, the padded size of its batch,
-the session and client identifier it arrives with (which link one client's queries), the client's
-network address and the timing. It does not see which row of the shard was queried. The five upper
-Merkle levels of a path are the same for every row of a shard and are returned in the clear beside
-the PIR response. PPOI status is answered on the device from a 6-byte prefix index, synced from
-cursors aligned to 2,048 rows. Proof submission and root validation go to the upstream PPOI
-aggregator as they do without Raven, and the root check for a served path asks upstream for the
-block number unless the wallet preloads its roots.
+**Requests.** No request to a Raven node carries a commitment. PPOI status is answered on the
+device from a 6-byte prefix index downloaded from the node. Merkle paths are fetched by an
+encrypted PIR query, and the server does not learn which row was retrieved. Proof submission and
+root validation go to the upstream PPOI aggregator as they do without Raven.
 
 **Integrity.** The node verifies every mirrored row's Ed25519 signature under the list provider's
 key at ingest and holds each row to the root upstream published with it. The client folds every

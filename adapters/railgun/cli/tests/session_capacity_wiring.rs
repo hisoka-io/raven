@@ -171,7 +171,7 @@ fn no_limit_flag_is_accepted_beside_a_config_file() {
     }
 }
 
-/// The lifetime ceiling is a privacy bound, and it is enforced before any store opens: a
+/// The lifetime ceiling is enforced before any store opens: a
 /// refused config leaves no data_dir behind, through the library boot and the binary alike.
 #[tokio::test]
 async fn a_lifetime_above_the_ceiling_is_refused_before_any_store_opens() {

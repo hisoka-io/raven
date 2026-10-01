@@ -23,7 +23,7 @@ interface Note {
   readonly elements: readonly string[];
 }
 
-/** Serves each block's notes at their rows; the instance label names the block. */
+/** Serves each block's notes at their rows, one instance label per block. */
 function mountForest(server: MockServer, notes: readonly Note[]): void {
   server.route(
     (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),

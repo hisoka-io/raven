@@ -74,7 +74,7 @@ fn sibling_for(global_idx: u64, level: usize) -> [u8; NODE_BYTES] {
 
 /// One row exactly as `PerListPath10Encoder::materialize_shard` lays it out
 /// (`engine/src/pir_table/list.rs:246-296`): BC, status, event type, magic, levels 0..10,
-/// zero tail. Levels 11..15 are the cleartext addendum and never enter the PIR record.
+/// zero tail. Levels 11..15 ride in the per-shard addendum and never enter the PIR record.
 fn path10_row(global_idx: u64) -> Vec<u8> {
     let mut row = vec![0u8; ENTRY_BYTES];
     row[..32].copy_from_slice(&bc_for(global_idx));

@@ -371,10 +371,10 @@ describe("an unpinned PPOI path-10 fold is verified against the upstream aggrega
     });
   }
 
-  // The tail cache is consulted before the point query so a filling block stops leaking one
-  // block-naming request per proof. That trades freshness for privacy, and this is the test
-  // that the trade costs no correctness: a block freezing inside the TTL must still verify,
-  // via a single forget-and-retry, rather than refusing an honest proof for up to the TTL.
+  // The tail cache is consulted before the point query so a filling block costs one request
+  // per snapshot rather than one per proof. That trades freshness for fewer requests, and this
+  // is the test that the trade costs no correctness: a block freezing inside the TTL must still
+  // verify, via a single forget-and-retry, rather than refusing an honest proof for up to the TTL.
   it("still verifies a fold after the block freezes inside the tail cache window", async () => {
     mountRowRoute(adapter, nodes);
     let frozen = false;
@@ -905,7 +905,7 @@ describe("the pin resolver as public API", () => {
     expect([...resolved.roots]).toEqual([root]);
   });
 
-  // The window is a privacy and cost bound, not decoration: unbounded it would pull the
+  // The window is a cost bound, not decoration: unbounded it would pull the
   // whole tail every proof.
   it("bounds a filling block's window by the exported window size", async () => {
     const latest = BLOCK * LEAVES_PER_PPOI_BLOCK + 900;
@@ -922,9 +922,9 @@ describe("the pin resolver as public API", () => {
     expect(resolved.window.endIndex).toBe(latest);
   });
 
-  // The whole product is a private read, so the pin fetch must not undo it. Checked with the
+  // The pin fetch must carry nothing that identifies the commitment. Checked with the
   // whole-request helper, because the PIR harness narrows to the instance paths and would
-  // filter these out -- a leak here would otherwise be invisible to every privacy test.
+  // filter these out.
   it("puts nothing that identifies the commitment on the wire", async () => {
     const latest = BLOCK * LEAVES_PER_PPOI_BLOCK + 12;
     mountUpstream(upstream, {

@@ -64,13 +64,11 @@ No request to the Raven node carries a commitment.
 - **Status.** A commitment is `Valid` when its 6-byte prefix is in the synced index,
   `ProofSubmitted` when this device's accepted proof covers it and it is not yet listed, and
   `Missing` otherwise. A note that shares a listed note's prefix reads `Valid`, and its proof,
-  which binds all 32 bytes, is refused. Index syncs resume from a multiple of 2,048 rows, so no
-  sync names a commitment, an index or a shard.
-- **Proofs.** A proof query reveals its block and its 2,048-row shard, the padded batch size and
-  the session; it does not reveal the row. Each served path is folded and checked against a root
-  from `ppoiPinnedRoots` or, failing that, from `pinUpstream` (default `upstreamFallbackEndpoint`),
-  which is asked for the block number only. The SDK never returns an unverified path. Preload
-  `ppoiPinnedRoots` for every block to keep the block from upstream too.
+  which binds all 32 bytes, is refused.
+- **Proofs.** A proof query is an encrypted PIR query, and the server does not learn which row
+  was retrieved. Each served path is folded and checked against a root from `ppoiPinnedRoots` or,
+  failing that, from `pinUpstream` (default `upstreamFallbackEndpoint`). The SDK never returns an
+  unverified path.
 - **Freshness.** Every PIR response carries `X-Raven-Freshness`; confidence below
   `freshnessConfidenceFloor` (default 0.5) raises `StaleData`.
 

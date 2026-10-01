@@ -173,10 +173,9 @@ fn empty_and_oversized_batches_are_typed_errors() {
 
 /// The pad draw is RANDOM, and nothing here asserted that.
 ///
-/// `shard_id` travels in cleartext, so the batch's index sequence is visible to the server. A
-/// cyclic pad makes slot j and slot j+len address the identical global index, and the repeat
-/// period IS the cache-miss count - the one quantity the ladder exists to hide. Every other test
-/// in this file drives the production builder and passes with the draw reverted to `slot % len`.
+/// A cyclic pad makes slot j and slot j+len address the identical global index, so the sequence
+/// repeats with the real count as its period. Every other test in this file drives the production
+/// builder and passes with the draw reverted to `slot % len`.
 ///
 /// The gate is reproducibility, not statistics: `slot % len` is a pure function of its input and
 /// returns the identical sequence on every call, while a random draw does not. `ClientState.index`

@@ -53,8 +53,7 @@ pub struct HttpConfig {
     #[serde(default = "default_max_concurrent_handshakes")]
     pub max_concurrent_handshakes: usize,
     /// Session lifetime in seconds for a packing-key seat and its handle; see
-    /// [`HttpConfig::session_store_limits`]. At most [`DEFAULT_SESSION_TTL_SECS`], because one
-    /// handle links every query made under it.
+    /// [`HttpConfig::session_store_limits`]. At most [`DEFAULT_SESSION_TTL_SECS`].
     pub session_ttl_secs: u64,
     /// Sticky-session bindings across all instances. [`HttpConfig::validate`] requires one
     /// instance's full pool; [`HttpConfig::validate_for_instances`] requires every instance's,
@@ -196,9 +195,8 @@ impl HttpConfig {
         }
         if self.session_ttl_secs > DEFAULT_SESSION_TTL_SECS {
             return Err(format!(
-                "session_ttl_secs {} exceeds the {DEFAULT_SESSION_TTL_SECS} s ceiling: one handle \
-                 links every query made under it, so lengthening it is a privacy decision, not an \
-                 operator setting. Shorten it to free seats sooner",
+                "session_ttl_secs {} exceeds the {DEFAULT_SESSION_TTL_SECS} s ceiling. Shorten it to \
+                 free seats sooner",
                 self.session_ttl_secs
             ));
         }

@@ -3,7 +3,7 @@
 //! Every secret the client draws - the RLWE secret key, the packing-key noise and
 //! the per-query Gaussian noise - MUST come from fresh OS entropy. A fixed PRG seed
 //! anywhere here lets anyone holding the public parameters rebuild the key, decrypt
-//! the query and read the queried index, collapsing the anonymity set to one.
+//! the query and read the queried index.
 //!
 //! These drive the `#[wasm_bindgen]` entry points the SDK calls, not the test
 //! mirrors, so the property is asserted on the shipped surface.

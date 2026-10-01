@@ -1,14 +1,12 @@
 /**
- * How many requests a server sees when a wallet proves K commitments.
+ * How many requests a wallet sends when it proves K commitments.
  *
  * Measured, not asserted: the numbers below come from counting POSTs on the mock, and the
  * test fails on the count rather than on a comment. It exists because the T2 proof path
  * used to `await` one batch per commitment, and each of those batches reached the ladder
- * with a single real target -- `paddedBatchLength(1)` is 1, so no cover slots were drawn
- * and the server could read the wallet's exact cache-miss count off a stable client id.
- * The round-trip cost and the leak were one defect, and one change fixes both down to the
- * ladder's own resolution: a padded length names a dyadic bucket, and the buckets for one and
- * two real queries hold one value each, so K = 1 and K = 2 remain exact.
+ * with a single real target -- `paddedBatchLength(1)` is 1, so no cover slots were drawn.
+ * Grouping a block's targets into one padded batch fixed the round-trip cost and the padding
+ * together.
  *
  * Grouping is per BLOCK because each block routes to its own instance label, so the win
  * caps at the number of blocks a wallet's notes span -- about six for the OFAC list today.

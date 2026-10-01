@@ -449,7 +449,7 @@ export class RavenPOINodeInterface {
   /**
    * Status is read from the list's prefix index on this device. The only requests are the index
    * sync, whose cursors depend only on how many rows the index holds and how long the list is, so
-   * none names a commitment, a list index or a shard.
+   * none names a commitment or a list index.
    *
    * Per commitment and served list: `Valid` when its 6-byte prefix is among the rows synced in
    * this call, `ProofSubmitted` when this device submitted a proof covering it for that list and
@@ -1059,9 +1059,8 @@ export class RavenPOINodeInterface {
       next: 0,
     }));
 
-    // Group by block (each block is its own instance), then pad each group on the ladder so the
-    // server learns only that a chunk holds k real targets with k in (P/2, P]; at P = 1 and
-    // P = 2 that bucket is exact. A later round exists only for a prefix collision.
+    // Group by block (each block is its own instance), then pad each group to a ladder step.
+    // A later round exists only for a prefix collision.
     const out = new Array<MerkleProof>(pending.length);
     while (pending.length > 0) {
       const collided: typeof pending = [];
@@ -1091,7 +1090,7 @@ export class RavenPOINodeInterface {
             chunkIndex * MAX_BATCH_SIZE,
             (chunkIndex + 1) * MAX_BATCH_SIZE,
           );
-          // Encrypted row queries only: the block and each query's shard travel in the clear, the row does not.
+          // Encrypted row queries only.
           const privateReply = await this.runClientPirQueryBatch(
             pathInstance,
             ctx,
@@ -1187,8 +1186,8 @@ export class RavenPOINodeInterface {
     }
     if (!resolved.roots.has(foldedRoot)) {
       // A block that froze inside the tail TTL is still answered from its filling window, which
-      // lacks the final root, so re-ask before refusing. The re-ask costs three requests, one
-      // naming the block, on every window miss.
+      // lacks the final root, so re-ask before refusing. The re-ask costs three requests on
+      // every window miss.
       this.pinResolver.forgetTail(listKeyHex, block);
       try {
         resolved = await this.pinResolver.resolve(listKeyHex, block);

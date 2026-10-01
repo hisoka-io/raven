@@ -3,7 +3,7 @@
  *
  * The path-10 record changed the t2Path read from sixteen 32 B node queries to a single
  * 512 B row carrying merkle levels 0..10, with levels 11..15 riding along as a 160 B
- * cleartext addendum that `runClientPirQueryBatch` splits off the tail. That change
+ * addendum that `runClientPirQueryBatch` splits off the tail. That change
  * reached production without reaching the test corpus, which is why sixteen assertions
  * failed as `malformed PPOI v2 row` and several more as `query count 1, expected 16`.
  *

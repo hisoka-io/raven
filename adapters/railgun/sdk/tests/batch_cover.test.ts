@@ -1,6 +1,5 @@
-// `SeededClientQuery.shard_id` is cleartext, so the node counts the distinct shards a batch
-// touches. A pad that re-queries a real target touches no new shard, so that count would be the
-// real count the ladder exists to hide: three lookups padded to four would read as three shards.
+// Covers fill free shards first, so k lookups in k shards padded to a ladder step touch as many
+// shards as the step holds, up to the shard count.
 // Every assertion here drives the shipped plan, and the wire half drives it through the interface.
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";

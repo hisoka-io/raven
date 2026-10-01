@@ -1,4 +1,4 @@
-//! Dyadic padding arithmetic for hiding exact batch lengths.
+//! Dyadic padding arithmetic for batch lengths.
 //!
 //! Callers supply their own transport or deployment ceiling. The framework derives
 //! the largest fitting power-of-two step and carries no scheme-specific byte limit.
