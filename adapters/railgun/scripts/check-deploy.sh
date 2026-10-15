@@ -10,8 +10,8 @@
 #   5. deploy.sh publishes the node's port on 127.0.0.1 only;
 #   6. the Caddyfile binds IPv4 only (tcp4), since a bare address opens a dual-stack socket;
 #   7. deploy.sh's default --memory holds its default worst case for the image template's
-#      instances, worst_case_mib in deploy/lib.sh, and --help states that figure; the seat size
-#      there is for the template's 512 B rows;
+#      instances, worst_case_mib in deploy/lib.sh, and --help states that figure; the boot peak
+#      there was measured at the template's 512 B rows;
 #   8. the Railway image builds the binary exactly as the operator image does (the same build
 #      stage) and declares no VOLUME, since Railway attaches its own;
 #   9. the Railway service settings (deploy/railway/configure.sh) give the node at least twice
@@ -63,7 +63,7 @@ memory=$(grep -oE '^image=.* memory=[0-9]+[a-z]*$' "$root/deploy/deploy.sh" | gr
 seats=$(grep -oE '^max_sessions=[0-9]+ ' "$root/deploy/deploy.sh" | grep -oE '[0-9]+')
 instances=$(grep -cE '^[[][[]instance[]][]]$' "$template")
 grep -qx 'record_size = 512' "$template" \
-  || fail "examples/mainnet-ppoi.toml: record_size is not 512, the row size deploy/lib.sh SEAT_MIB is for"
+  || fail "examples/mainnet-ppoi.toml: record_size is not 512, the row size deploy/lib.sh NODE_PEAK_MIB is for"
 if [[ -z $memory || -z $seats || $instances == 0 ]]; then
   fail "could not read deploy.sh's default memory (${memory:-none}) or seats (${seats:-none}), or the template's instances ($instances)"
 else

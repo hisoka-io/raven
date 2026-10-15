@@ -65,13 +65,13 @@ trust_proxy_header = false
 # rate_limit_burst = 400    # per-IP token-bucket capacity
 
 # What uncredentialed callers can hold. Each instance, auto-spawned ones included, has
-# max_sessions_per_instance packing-key seats, and a seat keeps about 24 MiB of derived
-# keys at a 512 B row, so lowering it bounds memory. session_ttl_secs can only be
-# lowered from 3600. Key derivation for a new seat runs on at most max_concurrent_handshakes
-# threads; a handshake or query waits respond_permit_wait_ms for a permit, then gets a 503.
-# max_sessions_per_instance = 64
+# max_sessions_per_instance packing-key seats, and a seat keeps 48 KiB of keys at any row
+# size, so lowering it bounds memory. session_ttl_secs can only be lowered from 3600.
+# Registration of a new seat runs on at most max_concurrent_handshakes threads; a handshake
+# or query waits respond_permit_wait_ms for a permit, then gets a 503.
+# max_sessions_per_instance = 1024
 # session_ttl_secs = 3600
-# session_lru_cap = 10000
+# session_lru_cap = 160000
 # max_concurrent_handshakes = 2
 # respond_permit_wait_ms = 20000
 

@@ -8,7 +8,7 @@
 #                              discards
 #   PORT                       set by Railway; the node binds 0.0.0.0:$PORT (8080 when unset)
 #   RAVEN_BEARER_TOKEN         read by the node itself for /metrics, never written to disk
-#   RAVEN_MAX_SESSIONS         packing-key seats per instance (default 32)
+#   RAVEN_MAX_SESSIONS         packing-key seats per instance (default 1024)
 #   RAVEN_MIRROR_ENDPOINT      the upstream aggregator (default: the template's)
 #
 # The template's trust_proxy_header = false stays: Railway's edge passes a client's
@@ -51,7 +51,7 @@ render() {  # out
   case $port in
     '' | *[!0-9]*) die "PORT '$port' is not a number" ;;
   esac
-  seats=${RAVEN_MAX_SESSIONS:-32}
+  seats=${RAVEN_MAX_SESSIONS:-1024}
   case $seats in
     '' | 0* | *[!0-9]*) die "RAVEN_MAX_SESSIONS '$seats' is not a whole number from 1" ;;
   esac

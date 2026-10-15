@@ -55,11 +55,11 @@ Options:
   --port PORT             node port on 127.0.0.1 (default 8080)
   --memory SIZE           node memory cap (default 10g). The deploy refuses a cap below the
                           node's worst case, in MiB:
-                            $NODE_PEAK_MIB + SEATS x INSTANCES x $SEAT_MIB + $HEADROOM_MIB
-                          the warm-boot peak (1.8 GiB in rehearsal, settling at 1.2 GiB), every
-                          packing-key seat full ($SEAT_MIB MiB each at a 512 B row), and headroom
-                          for queries. The defaults need 8243 MiB for the template's 7 instances.
-  --max-sessions N        packing-key seats per instance (default 32), written to the config
+                            $NODE_PEAK_MIB + SEATS x INSTANCES x $SEAT_KIB / 1024 + $HEADROOM_MIB
+                          the warm-boot peak (at most 3.9 GiB in five boots of a replay, settling
+                          at 2.0 GiB, plus a margin), every packing-key seat full ($SEAT_KIB KiB
+                          each at any row size), and headroom for queries. The defaults need 5767 MiB for the template's 7 instances.
+  --max-sessions N        packing-key seats per instance (default 1024), written to the config
                           as max_sessions_per_instance. A full instance refuses new sessions
                           until one expires
   --wait SECS             how long to wait for every list to be caught up (default 120). A cold
@@ -79,7 +79,7 @@ EOF
 }
 
 image="" hostname="" data_from="" replace_data=0 endpoint="" name=raven port=8080 memory=10g
-max_sessions=32 wait_secs=120 caddy_image=$CADDY_IMAGE_DEFAULT bind_address=0.0.0.0 http_port=80 https_port=443
+max_sessions=1024 wait_secs=120 caddy_image=$CADDY_IMAGE_DEFAULT bind_address=0.0.0.0 http_port=80 https_port=443
 with_caddy=1 with_units=1 print_sg=0 admin_cidr="" vpc_id="" instance_id=""
 while (($#)); do
   case $1 in
@@ -180,7 +180,7 @@ config=$(render_config "$image" "$endpoint" "$trusted" "$max_sessions") \
 instances=$(grep -cE '^[[][[]instance[]][]]$' <<<"$config" || true)
 worst=$(worst_case_mib "$max_sessions" "$instances")
 ((worst <= memory_cap_mib)) || die "the node needs up to $worst MiB ($NODE_PEAK_MIB boot peak + \
-$max_sessions seats x $instances instances x $SEAT_MIB MiB + $HEADROOM_MIB headroom), over --memory \
+$max_sessions seats x $instances instances x $SEAT_KIB KiB + $HEADROOM_MIB headroom), over --memory \
 $memory; raise --memory or lower --max-sessions. The running node is untouched"
 docker volume create "$secrets" >/dev/null
 install_secrets "$secrets" "$image" <<<"$config"

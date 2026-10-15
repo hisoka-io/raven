@@ -52,9 +52,10 @@ expect "cf-connecting-ip passed through" "cf-connecting-ip" deploy/Caddyfile '/h
 expect "Caddy on a dual-stack socket" "IPv4 only" deploy/Caddyfile 's/default_bind tcp4\//default_bind /'
 expect "port published on every address" "beyond loopback" deploy/deploy.sh \
   's/--publish "127.0.0.1:/--publish "0.0.0.0:/'
-expect "default seats past the memory cap" "do not fit" deploy/deploy.sh 's/^max_sessions=32 /max_sessions=64 /'
+expect "default seats past the memory cap" "do not fit" deploy/deploy.sh 's/^max_sessions=1024 /max_sessions=999999 /'
 expect "default memory cap too small" "do not fit" deploy/deploy.sh 's/ memory=10g$/ memory=4g/'
-expect "seat size changed, help figure not" "does not state" deploy/lib.sh 's/^SEAT_MIB=24$/SEAT_MIB=12/'
+expect "seat size changed, help figure not" "does not state" deploy/lib.sh 's/^SEAT_KIB=49$/SEAT_KIB=98/'
+expect "boot peak changed, help figure not" "does not state" deploy/lib.sh 's/^NODE_PEAK_MIB=4400$/NODE_PEAK_MIB=2048/'
 expect "seat size for another row" "record_size is not 512" examples/mainnet-ppoi.toml \
   's/^record_size = 512$/record_size = 1024/'
 # shellcheck disable=SC2016  # sed expressions, not shell

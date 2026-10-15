@@ -168,6 +168,7 @@ pub fn to_inspire_params(d: &AdaptiveDerivation) -> InspireParams {
         gadget_base: d.z,
         query_gadget_len: d.t_exp_left,
         packing_gadget_len: d.t_exp_left,
+        approximate_packing_gadget: false,
         security_level: SecurityLevel::Bits128,
     }
 }

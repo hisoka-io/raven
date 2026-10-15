@@ -16,7 +16,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use raven_inspire::inspiring::{ClientPackingKeys, PackParams};
+use raven_inspire::inspiring::ClientPackingKeys;
 use raven_inspire::math::GaussianSampler;
 use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::ServerCrs;
@@ -42,9 +42,9 @@ const SEATS: usize = 3;
 const TTL_SECS: u64 = 600;
 
 const LIMIT_FLAGS: [(&str, &str); 4] = [
-    ("--max-sessions-per-instance", "64"),
+    ("--max-sessions-per-instance", "1024"),
     ("--session-ttl-secs", "3600"),
-    ("--session-lru-cap", "10000"),
+    ("--session-lru-cap", "160000"),
     ("--max-concurrent-handshakes", "2"),
 ];
 
@@ -112,9 +112,9 @@ fn assert_documented_defaults(config: &HttpConfig, path: &str) {
         (
             "max_sessions_per_instance",
             config.max_sessions_per_instance,
-            64,
+            1024,
         ),
-        ("session_lru_cap", config.session_lru_cap, 10_000),
+        ("session_lru_cap", config.session_lru_cap, 160_000),
         (
             "max_concurrent_handshakes",
             config.max_concurrent_handshakes,
@@ -209,13 +209,7 @@ async fn a_lifetime_above_the_ceiling_is_refused_before_any_store_opens() {
 }
 
 /// Packing keys a wallet would upload to `instance`, derived from the parameters it serves.
-/// `pack` caches the packing table, the costly part, across instances that share its shape.
-async fn packing_keys(
-    client: &reqwest::Client,
-    base: &str,
-    instance: &str,
-    pack: &mut Option<(usize, PackParams)>,
-) -> Vec<u8> {
+async fn packing_keys(client: &reqwest::Client, base: &str, instance: &str) -> Vec<u8> {
     let body = client
         .get(format!("{base}/v1/instance/{instance}/params"))
         .send()
@@ -230,13 +224,14 @@ async fn packing_keys(
     let crs = ServerCrs::from_versioned_bytes(&params.crs_bincode).expect("decode crs");
     let mut sampler = GaussianSampler::with_seed(crs.params.sigma, 41);
     let secret = RlweSecretKey::generate(&crs.params, &mut sampler);
-    let columns = crs.inspiring_num_columns;
-    if pack.as_ref().is_none_or(|(cached, _)| *cached != columns) {
-        let built = PackParams::try_new(&crs.params, columns).expect("pack params");
-        *pack = Some((columns, built));
-    }
-    let (_, table) = pack.as_ref().expect("cached above");
-    let keys = ClientPackingKeys::generate(&secret, table, crs.inspiring_w_seed, &mut sampler);
+    let keys = ClientPackingKeys::generate(
+        &secret,
+        &crs.params,
+        crs.inspiring_num_columns,
+        crs.inspiring_w_seed,
+        &mut sampler,
+    )
+    .expect("packing keys");
     write_versioned(&keys).expect("serialize keys")
 }
 
@@ -274,13 +269,8 @@ fn unix_now() -> u64 {
 }
 
 /// `SEATS` distinct identities are seated for `TTL_SECS`, and the next one is refused.
-async fn assert_configured_seats(
-    client: &reqwest::Client,
-    base: &str,
-    instance: &str,
-    pack: &mut Option<(usize, PackParams)>,
-) {
-    let keys = packing_keys(client, base, instance, pack).await;
+async fn assert_configured_seats(client: &reqwest::Client, base: &str, instance: &str) {
+    let keys = packing_keys(client, base, instance).await;
     for identity in 0..SEATS {
         let before = unix_now();
         let (status, expires) = establish(client, base, instance, identity, &keys).await;
@@ -421,9 +411,8 @@ async fn global_keys_bound_every_store_auto_spawn_opens() {
     );
     let server = boot_multi(config.path()).await;
     let client = reqwest::Client::new();
-    let mut pack = None;
 
-    assert_configured_seats(&client, &server.base, BOOT_INSTANCE, &mut pack).await;
+    assert_configured_seats(&client, &server.base, BOOT_INSTANCE).await;
 
     server
         .view
@@ -434,7 +423,7 @@ async fn global_keys_bound_every_store_auto_spawn_opens() {
         .expect("indexer channel open");
     let params = format!("{}/v1/instance/{SPAWNED_TREE_INSTANCE}/params", server.base);
     wait_for_ok(&client, &params, SPAWNED_TREE_INSTANCE).await;
-    assert_configured_seats(&client, &server.base, SPAWNED_TREE_INSTANCE, &mut pack).await;
+    assert_configured_seats(&client, &server.base, SPAWNED_TREE_INSTANCE).await;
 
     shut_down(server).await;
 }

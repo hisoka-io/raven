@@ -79,10 +79,10 @@ fn count_establish_refusal(instance_id: &InstanceId, reason: &'static str) {
     .increment(1);
 }
 
-/// What a handshake's blocking derivation hands back.
-enum Derivation {
+/// What a handshake's blocking registration hands back.
+enum Seating {
     Registered(ServerSessionHandle),
-    /// Every seat is held by a live session or a derivation in flight; the caller should retry
+    /// Every seat is held by a live session or a registration in flight; the caller should retry
     /// later.
     PoolFull(raven_railgun_core::AdapterError),
     Failed(raven_railgun_core::AdapterError),
@@ -98,13 +98,13 @@ async fn release_seat(state: Arc<InspireServerState>, handle: ServerSessionHandl
 }
 
 /// Largest packing-key upload an honest client sends under `params`: `y_body` and, for full
-/// packing, `z_body`, each `packing_gadget_len` polys of `ring_dim` coefficients per CRT
+/// packing, `z_body`, each one poly per packing-key row of `ring_dim` coefficients per CRT
 /// modulus at the fixed-width 8 bytes, plus framing. A queued handshake holds its body, so
 /// this, not `max_body_bytes`, bounds what a flood of them can pin.
 pub(crate) fn packing_key_upload_limit(params: &InspireParams) -> usize {
     const FRAMING_BYTES: usize = 4096;
     2usize
-        .saturating_mul(params.packing_gadget_len)
+        .saturating_mul(params.packing_key_rows())
         .saturating_mul(params.ring_dim)
         .saturating_mul(params.crt_moduli.len().max(1))
         .saturating_mul(8)
@@ -132,16 +132,17 @@ async fn read_capped(mut body: Body, limit: usize) -> Result<Vec<u8>, StatusCode
     Ok(buffered)
 }
 
-/// Derive the server-side set on a blocking thread: the key expansion is CPU-bound, and on an
-/// async worker it would stall every route that worker serves.
+/// Seat the keys on a blocking thread: registration waits for the session store's write lock
+/// and may sync the handle floor to disk, and on an async worker either would stall every
+/// route that worker serves.
 /// The permit is held until the work ends, even when the handler has stopped waiting, because
 /// `spawn_blocking` cannot be cancelled.
-async fn derive_off_the_workers(
+async fn seat_off_the_workers(
     app: &AppState<RavenInspireScheme>,
     instance_id: &InstanceId,
     state: Arc<InspireServerState>,
     keys: ClientPackingKeys,
-) -> Result<Derivation, StatusCode> {
+) -> Result<Seating, StatusCode> {
     let permit = match tokio::time::timeout(
         app.config.respond_permit_wait(),
         Arc::clone(&app.handshake_permits).acquire_owned(),
@@ -156,34 +157,34 @@ async fn derive_off_the_workers(
         }
     };
     let owner = Arc::clone(&state);
-    let mut derivation = tokio::task::spawn_blocking(move || {
+    let mut seating = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let ctx = state.crs.params.ntt_context();
         match state
             .session_store
             .register_server_side(keys, state.cache.pack_params(), &ctx)
         {
-            Ok(handle) => Derivation::Registered(handle),
+            Ok(handle) => Seating::Registered(handle),
             // A re-handshake counts its own old seat too: that seat stays usable until a new one
             // replaces it.
             Err(error @ raven_railgun_core::AdapterError::AtCapacity(_)) => {
-                Derivation::PoolFull(error)
+                Seating::PoolFull(error)
             }
-            Err(error) => Derivation::Failed(error),
+            Err(error) => Seating::Failed(error),
         }
     });
     let limit = Duration::from_secs(app.config.respond_timeout_secs.max(1));
-    match tokio::time::timeout(limit, &mut derivation).await {
-        Ok(Ok(derived)) => Ok(derived),
+    match tokio::time::timeout(limit, &mut seating).await {
+        Ok(Ok(seated)) => Ok(seated),
         Ok(Err(join)) => {
-            tracing::error!(%join, "session derivation task failed");
+            tracing::error!(%join, "session registration task failed");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
         Err(_elapsed) => {
             count_establish_refusal(instance_id, "timeout");
-            // Nobody will learn the handle, so its seat is released when the derivation lands.
+            // Nobody will learn the handle, so its seat is released when the registration lands.
             tokio::spawn(async move {
-                if let Ok(Derivation::Registered(handle)) = derivation.await {
+                if let Ok(Seating::Registered(handle)) = seating.await {
                     release_seat(owner, handle).await;
                 }
             });
@@ -210,7 +211,7 @@ pub(crate) async fn session_establish_handler(
     let session_key = SessionKey::new(instance_id.clone(), client_id);
 
     let state = Arc::clone(&snapshot.state);
-    // Decoded before a derivation permit is sought, so a body that cannot decode never queues.
+    // Decoded before a handshake permit is sought, so a body that cannot decode never queues.
     let limit = packing_key_upload_limit(&state.crs.params).min(app.config.max_body_bytes);
     let body = read_capped(body, limit).await?;
     let keys: ClientPackingKeys = read_versioned(&body).map_err(|err| {
@@ -221,16 +222,16 @@ pub(crate) async fn session_establish_handler(
         StatusCode::BAD_REQUEST
     })?;
     drop(body);
-    let handle = match derive_off_the_workers(&app, &instance_id, Arc::clone(&state), keys).await? {
-        Derivation::Registered(handle) => handle,
+    let handle = match seat_off_the_workers(&app, &instance_id, Arc::clone(&state), keys).await? {
+        Seating::Registered(handle) => handle,
         // At the ceiling the store refuses rather than retiring another caller's keys, so the
         // caller is being asked to wait, not told the server broke.
-        Derivation::PoolFull(error) => {
+        Seating::PoolFull(error) => {
             tracing::warn!(%error, "session establish refused");
             count_establish_refusal(&instance_id, "pool");
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
-        Derivation::Failed(error) => {
+        Seating::Failed(error) => {
             tracing::warn!(%error, "session establish refused");
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
@@ -491,6 +492,7 @@ mod tests {
             gadget_base: 1 << 20,
             query_gadget_len: 3,
             packing_gadget_len: 3,
+            approximate_packing_gadget: false,
             security_level: SecurityLevel::Bits128,
         }
     }
@@ -502,13 +504,15 @@ mod tests {
         let (state, secret_key) =
             setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("toy state");
         let mut sampler = GaussianSampler::with_seed(params.sigma, 0x5e);
-        let upload = write_versioned(&ClientPackingKeys::generate(
+        let keys = ClientPackingKeys::generate(
             &secret_key,
-            state.cache.pack_params(),
+            &state.crs.params,
+            state.crs.inspiring_num_columns,
             state.crs.inspiring_w_seed,
             &mut sampler,
-        ))
-        .expect("versioned keys");
+        )
+        .expect("packing keys");
+        let upload = write_versioned(&keys).expect("versioned keys");
         let engine: Engine<RavenInspireScheme> = Engine::new();
         engine
             .add_live(Arc::new(PirInstance::new(
@@ -564,10 +568,24 @@ mod tests {
         assert_eq!(establish(&app, Body::from(upload)).await, StatusCode::OK);
     }
 
-    /// With every derivation permit held, a body that cannot decode is still answered at once
-    /// instead of queueing behind derivations for the permit wait.
+    /// The cap follows the key a client builds: two bodies of one polynomial per key row.
+    #[test]
+    fn the_upload_limit_is_two_key_bodies_and_framing() {
+        let shipped = InspireParams::secure_128_d2048();
+        assert_eq!(shipped.packing_key_rows(), 3);
+        assert_eq!(packing_key_upload_limit(&shipped), 2 * 3 * 2048 * 8 + 4096);
+        let two_rows = InspireParams {
+            approximate_packing_gadget: true,
+            ..shipped
+        };
+        assert_eq!(two_rows.packing_key_rows(), 2);
+        assert_eq!(packing_key_upload_limit(&two_rows), 2 * 2 * 2048 * 8 + 4096);
+    }
+
+    /// With every handshake permit held, a body that cannot decode is still answered at once
+    /// instead of queueing behind registrations for the permit wait.
     #[tokio::test]
-    async fn an_undecodable_body_does_not_queue_for_a_derivation_permit() {
+    async fn an_undecodable_body_does_not_queue_for_a_permit() {
         let (app, _) = fixture(2_000);
         let permits = u32::try_from(app.config.max_concurrent_handshakes.max(1)).expect("u32");
         let _held = Arc::clone(&app.handshake_permits)
@@ -578,5 +596,27 @@ mod tests {
             establish(&app, Body::from(vec![0u8; 64])).await,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    /// A handshake that finds every permit held is refused once the permit wait has passed,
+    /// rather than queued behind the holders, and is admitted once a permit is free.
+    #[tokio::test]
+    async fn a_handshake_waits_a_bounded_time_for_a_permit() {
+        let (app, upload) = fixture(1);
+        let permits = u32::try_from(app.config.max_concurrent_handshakes.max(1)).expect("u32");
+        let held = Arc::clone(&app.handshake_permits)
+            .acquire_many_owned(permits)
+            .await
+            .expect("hold every permit");
+        // Bounded here, so a handshake that ignores the permit wait fails instead of hanging.
+        let refused = tokio::time::timeout(
+            Duration::from_secs(10),
+            establish(&app, Body::from(upload.clone())),
+        )
+        .await
+        .expect("a handshake with no permit must be answered within the permit wait");
+        assert_eq!(refused, StatusCode::SERVICE_UNAVAILABLE);
+        drop(held);
+        assert_eq!(establish(&app, Body::from(upload)).await, StatusCode::OK);
     }
 }

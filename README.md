@@ -64,10 +64,6 @@ cargo test --manifest-path adapters/railgun/Cargo.toml --profile ci-test
 The wasm target applies to the client path, not to server crates. The adapter's PIR tests need
 the `ci-test` profile; a debug build is too slow for them.
 
-## Toward v1
-
-A parameter set estimated at 128 bits or more.
-
 ## Contributing
 
 Run `scripts/preflight.sh` before pushing: it runs every workspace's hygiene, format and lint

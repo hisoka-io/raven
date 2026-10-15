@@ -36,8 +36,9 @@ if [[ $token_src == stdin ]]; then
   IFS= read -r token || [[ -n ${token:-} ]] || die "--token-stdin: stdin is empty"
   [[ ${#token} -ge 32 && $token != *[[:space:]]* ]] || die "--token-stdin: need 32 or more characters, no spaces"
 fi
-# The node's worst case at 32 seats (deploy/lib.sh worst_case_mib) is 8,243 MiB for mainnet's
-# seven instances and 4,403 MiB for Sepolia's two; each limit leaves room above it.
+# The node's worst case at 1,024 seats (deploy/lib.sh worst_case_mib) is 5,767 MiB for mainnet's
+# seven instances. Sepolia's two give 5,522 MiB on the same formula, an upper bound: its boot peak
+# is mainnet's. Each limit leaves room above it, 6 GB by about 200 MiB even read as decimal.
 case $network in
   mainnet) memory_gb=10 vcpus=8 ;;
   sepolia) memory_gb=6 vcpus=4 ;;

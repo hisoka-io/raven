@@ -33,7 +33,7 @@ use wasm_bindgen::prelude::*;
 mod floor;
 pub use floor::{
     check_parameter_floor, ParameterFloorError, MAX_GADGET_LEN, MAX_Q, MAX_RING_DIM, MIN_RING_DIM,
-    SHIPPED_SIGMA,
+    SHIPPED_CRT_MODULI, SHIPPED_SIGMA,
 };
 
 // Lifted only in this crate's unit-test harness, whose ring-256 suites sit below the floors.
@@ -321,6 +321,7 @@ fn ensure_session_params_match(
         || current.gadget_base != held.gadget_base
         || current.query_gadget_len != held.query_gadget_len
         || current.packing_gadget_len != held.packing_gadget_len
+        || current.approximate_packing_gadget != held.approximate_packing_gadget
     {
         return Err(
             "ring_dim/q/p/sigma mismatch or CRT/gadget drift: session parameters drifted from the \
@@ -363,7 +364,7 @@ impl std::fmt::Debug for ClientSessionHandle {
 
 /// Build a client session from a params bundle (from `build_instance_params_blob`)
 /// and the public CRS bytes.
-/// Pays the one-time O(d^3) packing-key generation cost.
+/// Builds the packing keys the session uploads once.
 #[wasm_bindgen]
 pub fn build_client_session(
     params_bundle_bincode: &[u8],
@@ -383,7 +384,7 @@ pub fn build_client_session(
     })?;
     let shard_config =
         decode_validated_shard_config(&bundle.shard_config_bincode, &inspire_params)?;
-    let registration_body = session_registration_body(&session, &shard_config, &inspire_params)?;
+    let registration_body = session_registration_body(&session)?;
     Ok(ClientSessionHandle {
         inner: session,
         params: inspire_params,
@@ -415,25 +416,18 @@ pub fn client_packing_keys_versioned(session: &ClientSessionHandle) -> Result<Ve
     Ok(session.registration_body.clone())
 }
 
-fn session_registration_body(
-    session: &ClientSession,
-    shard_config: &ShardConfig,
-    params: &InspireParams,
-) -> Result<Vec<u8>, WasmClientError> {
-    let mut sampler = os_seeded_sampler(params.sigma, "session_registration_query")?;
-    let (_, query) = session
-        .query_seeded(0, shard_config, &mut sampler)
-        .map_err(|e| WasmClientError::Inspire {
-            op: "ClientSession::query_seeded for session registration",
-            detail: e.to_string(),
+fn session_registration_body(session: &ClientSession) -> Result<Vec<u8>, WasmClientError> {
+    let keys = session
+        .packing_keys()
+        .ok_or_else(|| WasmClientError::Inspire {
+            op: "client_packing_keys_versioned",
+            detail:
+                "the served CRS has no packing columns, so this session has no packing keys to \
+                 upload"
+                    .to_owned(),
         })?;
-    let keys = query.inspiring_packing_keys.ok_or_else(|| WasmClientError::Inspire {
-        op: "client_packing_keys_versioned",
-        detail: "session has no inline packing keys; establish each remote session before installing its handle"
-            .to_owned(),
-    })?;
     let mut out = SESSION_WIRE_SCHEMA_VERSION.to_be_bytes().to_vec();
-    out.extend_from_slice(&encode(&keys, "client_packing_keys")?);
+    out.extend_from_slice(&encode(keys, "client_packing_keys")?);
     Ok(out)
 }
 
@@ -710,7 +704,7 @@ pub fn deserialize_client_session(
     })?;
     let shard_config =
         decode_validated_shard_config(&bundle.shard_config_bincode, &inspire_params)?;
-    let registration_body = session_registration_body(&inner, &shard_config, &inspire_params)?;
+    let registration_body = session_registration_body(&inner)?;
     Ok(ClientSessionHandle {
         inner,
         params: inspire_params,

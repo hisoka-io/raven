@@ -200,7 +200,6 @@ struct CliArgs {
     variant: InspireVariant,
     adaptive_params: Option<[usize; 3]>,
     derived_params_out: Option<PathBuf>,
-    simulate_wire_format: bool,
     concurrent_queries: u32,
 }
 
@@ -241,7 +240,6 @@ fn parse_args() -> CliArgs {
         variant: InspireVariant::NoPacking,
         adaptive_params: None,
         derived_params_out: None,
-        simulate_wire_format: false,
         concurrent_queries: 1,
     };
     while let Some(a) = args.next() {
@@ -274,7 +272,6 @@ fn parse_args() -> CliArgs {
             "--full-bench" => cli.smoke_only = false,
             "--smoke-only" => cli.smoke_only = true,
             "--variant" => cli.variant = parse_variant(&args.next().unwrap()),
-            "--simulate-wire-format" => cli.simulate_wire_format = true,
             "--concurrent-queries" => {
                 let n: u32 = args
                     .next()
@@ -423,6 +420,7 @@ fn main() {
                 gadget_base: 1 << 20,
                 query_gadget_len: 3,
                 packing_gadget_len: 3,
+                approximate_packing_gadget: false,
                 security_level: SecurityLevel::Bits128,
             }
         }
@@ -490,16 +488,9 @@ fn main() {
     );
 
     let session_store = ServerSessionStore::new();
-    let handle = if cli.simulate_wire_format {
-        eprintln!("wire-format simulation: dropping derived y_all + y_all_ntt pre-register");
-        session
-            .register_with_server_derivation(&session_store)
-            .expect("ClientSession::register_with_server_derivation")
-    } else {
-        session
-            .register_with(&session_store)
-            .expect("ClientSession::register_with")
-    };
+    let handle = session
+        .register_with(&session_store)
+        .expect("ClientSession::register_with");
     eprintln!(
         "session handshake: handle = {:?}, store size = {}",
         handle,

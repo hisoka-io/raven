@@ -48,7 +48,7 @@ pub struct AppState<S: PirScheme> {
     pub(crate) rpc_pool: Arc<Option<Arc<raven_railgun_indexer::rpc_pool::RpcEndpointPool>>>,
     pub(crate) sessions: Arc<SessionMap>,
     pub(crate) semaphore: Arc<Semaphore>,
-    /// Session-handshake derivations. Separate from `semaphore` so a handshake flood waits here
+    /// Session-handshake registrations. Separate from `semaphore` so a handshake flood waits here
     /// instead of taking the permits queries respond under.
     pub(crate) handshake_permits: Arc<Semaphore>,
     pub(crate) metrics_handle: Arc<metrics_exporter_prometheus::PrometheusHandle>,
@@ -471,7 +471,7 @@ fn register_prometheus_descriptions() {
         "raven_railgun_session_establish_refused_total",
         "Lifetime count of session handshakes refused, labelled by instance + `reason` \
          (pool = every packing-key seat held by a live session, binding = sticky-session map \
-         full, busy = no derivation permit within the permit wait, timeout = derivation \
+         full, busy = no handshake permit within the permit wait, timeout = registration \
          outran the respond timeout)"
     );
     metrics::describe_counter!(

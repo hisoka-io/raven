@@ -807,7 +807,7 @@ fn open_data_dir(
         layout.root(),
         session_limits,
     )?);
-    let opened = InspirePersistence::open(
+    let mut opened = InspirePersistence::open(
         layout,
         cfg.scheme_tag.clone(),
         cfg.instance_id.clone(),
@@ -817,6 +817,7 @@ fn open_data_dir(
     if let Some(state) = opened.recovered_state.as_ref() {
         require_recovered_cell_matches(&cfg, state, &opened.recovered_logical_store, params)?;
     }
+    opened.precompute_packing_stores()?;
     Ok(OpenedSlot {
         cfg,
         encoder,
@@ -1672,10 +1673,12 @@ mod session_limit_tests {
         let mut sampler = GaussianSampler::with_seed(donor.crs.params.sigma, 3);
         let keys = ClientPackingKeys::generate(
             &secret_key,
-            donor.cache.pack_params(),
+            &donor.crs.params,
+            donor.crs.inspiring_num_columns,
             donor.crs.inspiring_w_seed,
             &mut sampler,
-        );
+        )
+        .expect("packing keys");
         let context = donor.crs.params.ntt_context();
         assert_eq!(handle.instances.len(), 2);
         for per in &handle.instances {

@@ -19,7 +19,7 @@ pub const DEFAULT_RESPOND_PERMIT_WAIT_MS: u64 = 20_000;
 pub(crate) const HTTP_MAX_RESPOND_PERMIT_WAIT_MS: u64 = 60_000;
 
 /// Default [`HttpConfig::session_lru_cap`]: every seat of the default pool on 156 instances.
-pub const DEFAULT_SESSION_LRU_CAP: usize = 10_000;
+pub const DEFAULT_SESSION_LRU_CAP: usize = 160_000;
 
 /// Default and ceiling session lifetime in seconds; also the default eviction cadence.
 pub const DEFAULT_SESSION_TTL_SECS: u64 =
@@ -42,12 +42,12 @@ pub struct HttpConfig {
     pub max_concurrent_queries: usize,
     /// Longest a query waits for one of the [`HttpConfig::max_concurrent_queries`] respond
     /// permits, in milliseconds, before it is answered 503. Applies to a single query, to each
-    /// `/batch` slot, and to a session handshake's wait for a derivation permit. It bounds the
+    /// `/batch` slot, and to a session handshake's wait for a handshake permit. It bounds the
     /// queue without a per-peer cap, which would lock out every client sharing one exit address.
     /// Default [`DEFAULT_RESPOND_PERMIT_WAIT_MS`].
     #[serde(default = "default_respond_permit_wait_ms")]
     pub respond_permit_wait_ms: u64,
-    /// Session handshakes deriving packing keys at once, each on a blocking thread. A handshake
+    /// Session handshakes seating packing keys at once, each on a blocking thread. A handshake
     /// waits at most [`HttpConfig::respond_permit_wait_ms`] for one and is then answered 503,
     /// so a flood of them queues here rather than on the threads that serve every route.
     #[serde(default = "default_max_concurrent_handshakes")]
@@ -59,14 +59,14 @@ pub struct HttpConfig {
     /// instance's full pool; [`HttpConfig::validate_for_instances`] requires every instance's,
     /// and [`crate::inspire_router`] applies it to the booted instances.
     pub session_lru_cap: usize,
-    /// Packing-key seats per instance, and so a memory bound: a seat holds the server-derived
-    /// keys, about 24 MiB at a 512 B row and 1.5 MiB at a 32 B row.
+    /// Packing-key seats per instance, and so a memory bound: a seat holds one ring polynomial
+    /// per packing-key row, 48 KiB at `d = 2048` whatever the row size.
     #[serde(default = "default_max_sessions_per_instance")]
     pub max_sessions_per_instance: usize,
     /// Identifier surfaced in the `X-Raven-Scheme` response header.
     pub scheme_name: String,
-    /// Per-query response timeout, also the bound on one handshake's key derivation. A timed-out
-    /// respond or derivation keeps its permit until the detached work ends, since
+    /// Per-query response timeout, also the bound on one handshake's key registration. A timed-out
+    /// respond or registration keeps its permit until the detached work ends, since
     /// `spawn_blocking` cannot be cancelled.
     pub respond_timeout_secs: u64,
     /// Requires a non-empty [`HttpConfig::trusted_proxy_cidrs`]; validated as a pair.
@@ -90,8 +90,8 @@ fn default_session_eviction_interval_secs() -> u64 {
     DEFAULT_SESSION_TTL_SECS
 }
 
-/// Default [`HttpConfig::max_concurrent_handshakes`]. Derivations run in parallel, outside the
-/// session store's lock, so this bounds the CPU that handshakes take from queries.
+/// Default [`HttpConfig::max_concurrent_handshakes`]. Registrations run in parallel, outside
+/// the session store's lock, so this bounds the threads that handshakes take from queries.
 pub const DEFAULT_MAX_CONCURRENT_HANDSHAKES: usize = 2;
 
 const fn default_max_concurrent_handshakes() -> usize {

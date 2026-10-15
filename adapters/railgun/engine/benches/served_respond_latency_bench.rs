@@ -453,7 +453,7 @@ fn run_at_concurrency(
             minutes. Trigger: a change to the respond path, the served cell, the raven-inspire \
             features, or the build flags."]
 fn served_respond_latency_at_deployed_cell() {
-    guard_env(&["RAVEN_PROFILE_RESPOND", "RAVEN_FORCE_PACKING_ONLINE"]);
+    guard_env(&["RAVEN_PROFILE_RESPOND"]);
     let warmup = env_usize("RAVEN_BENCH_WARMUP", DEFAULT_WARMUP);
     let samples = env_usize("RAVEN_BENCH_SAMPLES", DEFAULT_SAMPLES);
     assert!(
@@ -542,7 +542,6 @@ fn served_respond_latency_at_deployed_cell() {
             Run with RAVEN_PROFILE_RESPOND=1 and stderr kept to get the in-respond split. \
             Trigger: a change to the respond path or the mod-switch."]
 fn served_respond_stage_split_at_deployed_cell() {
-    guard_env(&["RAVEN_FORCE_PACKING_ONLINE"]);
     let warmup = env_usize("RAVEN_BENCH_WARMUP", DEFAULT_WARMUP);
     let samples = env_usize("RAVEN_BENCH_SAMPLES", DEFAULT_SAMPLES / 4);
     let f = fixture(1 << DB_ROWS_LOG2, true);

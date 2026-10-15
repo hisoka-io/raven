@@ -59,6 +59,7 @@ fn synthetic_parts() -> (PackParams, OfflinePackingKeys) {
         neg_monomials_ntt: vec![zero(), zero()],
         gadget: GadgetVector::new(params.gadget_base, 3, params.q),
         automorph_tables: vec![vec![0, 1], vec![1, 0]],
+        dropped_digits: 0,
     };
     let offline_keys = OfflinePackingKeys {
         w_seed: [7; 32],
@@ -107,7 +108,7 @@ fn inspiring_seed_change_invalidates_the_cache_identity() {
 }
 
 #[test]
-fn cache_uses_v3_magic_and_refuses_v2_before_body_decode() {
+fn cache_uses_v4_magic_and_refuses_v3_before_body_decode() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = OfflinePackingKeysCache::new(dir.path());
     let cell = test_cell();
@@ -115,18 +116,18 @@ fn cache_uses_v3_magic_and_refuses_v2_before_body_decode() {
     cache.store(&cell, &parts.0, &parts.1).expect("store");
 
     let mut bytes = std::fs::read(cache.path()).expect("new cache bytes");
-    assert_eq!(bytes.get(..8), Some(b"RVN_OPK3".as_slice()));
+    assert_eq!(bytes.get(..8), Some(b"RVN_OPK4".as_slice()));
     bytes
         .get_mut(..8)
         .expect("magic prefix")
-        .copy_from_slice(b"RVN_OPK2");
+        .copy_from_slice(b"RVN_OPK3");
     std::fs::write(cache.path(), bytes).expect("write old epoch");
     match cache.load(&cell) {
         CacheLoad::Miss(OfflinePackingKeysCacheError::BadMagic { expected, found }) => {
-            assert_eq!(expected, *b"RVN_OPK3");
-            assert_eq!(found, *b"RVN_OPK2");
+            assert_eq!(expected, *b"RVN_OPK4");
+            assert_eq!(found, *b"RVN_OPK3");
         }
-        other => panic!("expected v2 BadMagic miss, got {other:?}"),
+        other => panic!("expected v3 BadMagic miss, got {other:?}"),
     }
 
     // The version byte alone is not the whole check: a corrupt leading byte must miss too.
@@ -136,7 +137,7 @@ fn cache_uses_v3_magic_and_refuses_v2_before_body_decode() {
     std::fs::write(cache.path(), bytes).expect("mutate leading magic byte");
     match cache.load(&cell) {
         CacheLoad::Miss(OfflinePackingKeysCacheError::BadMagic { expected, found }) => {
-            assert_eq!(expected, *b"RVN_OPK3");
+            assert_eq!(expected, *b"RVN_OPK4");
             assert_ne!(found, expected);
         }
         other => panic!("expected BadMagic miss on a corrupt leading byte, got {other:?}"),

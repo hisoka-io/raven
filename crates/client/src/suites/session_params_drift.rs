@@ -45,6 +45,7 @@ mod wasm_only {
             gadget_base: 1 << 20,
             query_gadget_len: 3,
             packing_gadget_len: 3,
+            approximate_packing_gadget: false,
             security_level: SecurityLevel::Bits128,
         }
     }
@@ -152,6 +153,40 @@ mod wasm_only {
     #[wasm_bindgen_test]
     fn drift_in_packing_gadget_len_is_rejected() {
         assert_drift_rejected("packing_gadget_len", |p| p.packing_gadget_len = 4);
+    }
+
+    #[wasm_bindgen_test]
+    fn drift_in_the_approximate_packing_gadget_is_rejected() {
+        assert_drift_rejected("approximate_packing_gadget", |p| {
+            p.approximate_packing_gadget = true;
+        });
+    }
+
+    /// A cached session against a live CRS that differs in the option alone.
+    #[wasm_bindgen_test]
+    fn warm_restore_refuses_a_live_crs_that_turned_the_approximate_gadget_on() {
+        let params = base_params();
+        let database = build_db(&params);
+        let mut sampler = GaussianSampler::new(params.sigma);
+        let (crs, _, _) =
+            inspire_setup(&params, &database, ENTRY_BYTES, &mut sampler).expect("base CRS");
+        let bundle = bundle_for(&params);
+        let crs_bytes = crs.to_versioned_bytes().expect("base CRS bytes");
+        let session = build_client_session(&bundle, &crs_bytes).expect("session");
+        let residue = serialize_client_session(&session).expect("residue");
+
+        let mut live_crs = crs;
+        live_crs.params.approximate_packing_gadget = true;
+        let live_crs_bytes = live_crs.to_versioned_bytes().expect("live CRS bytes");
+
+        let Err(error) = deserialize_client_session(&bundle, &live_crs_bytes, &residue) else {
+            panic!("a live CRS differing only in the approximate gadget was accepted");
+        };
+        let message = error.as_string().unwrap_or_default();
+        assert!(
+            message.contains("live CRS") && message.contains("parameters drifted"),
+            "{message}"
+        );
     }
 
     #[wasm_bindgen_test]
@@ -266,6 +301,7 @@ mod native {
             gadget_base: 1 << 20,
             query_gadget_len: 3,
             packing_gadget_len: 3,
+            approximate_packing_gadget: false,
             security_level: SecurityLevel::Bits128,
         }
     }
@@ -295,6 +331,24 @@ mod native {
             "the session's own bundle must register; this is the argument both SDK call \
              sites pass"
         );
+    }
+
+    /// The comparison itself, which returns a plain `String` and so is observable here: a
+    /// session and a live set that differ in the approximate packing gadget alone.
+    #[test]
+    fn a_set_differing_only_in_the_approximate_gadget_is_drift() {
+        let held = base_params();
+        let live = InspireParams {
+            approximate_packing_gadget: true,
+            ..base_params()
+        };
+        assert!(crate::ensure_session_params_match(&held, &held).is_ok());
+        assert!(crate::ensure_session_params_match(&live, &live).is_ok());
+        for (held, live) in [(&held, &live), (&live, &held)] {
+            let refusal = crate::ensure_session_params_match(held, live)
+                .expect_err("the option alone must count as drift");
+            assert!(refusal.contains("parameters drifted"), "{refusal}");
+        }
     }
 
     /// Pins why the drift fixtures above are hand-built rather than the two shipped

@@ -127,11 +127,11 @@ impl BoundedSessionStore {
         self.inner.flushes_total()
     }
 
-    /// Register wire-delivered packing keys, deriving the server-side representation.
+    /// Check wire-delivered packing keys against the server's packing shape and seat them.
     ///
     /// # Errors
     ///
-    /// [`AdapterError::AtCapacity`] when live sessions and registrations still deriving fill the
+    /// [`AdapterError::AtCapacity`] when live sessions and registrations in progress fill the
     /// ceiling; otherwise an actionable adapter error when durability or InsPIRe rejects it.
     pub fn register_server_side(
         &self,
@@ -146,7 +146,7 @@ impl BoundedSessionStore {
     ///
     /// # Errors
     ///
-    /// [`AdapterError::AtCapacity`] when live sessions and registrations still deriving fill the
+    /// [`AdapterError::AtCapacity`] when live sessions and registrations in progress fill the
     /// ceiling; otherwise an actionable adapter error when durability or InsPIRe rejects it.
     pub fn register_server_side_at(
         &self,
@@ -165,7 +165,7 @@ impl BoundedSessionStore {
     ///
     /// # Errors
     ///
-    /// Returns [`AdapterError::AtCapacity`] when registrations still deriving hold every seat, and
+    /// Returns [`AdapterError::AtCapacity`] when registrations in progress hold every seat, and
     /// [`AdapterError::Scheme`] when InsPIRe rejects registration or installation.
     pub fn register_client_session_at(
         &self,
@@ -355,10 +355,12 @@ mod tests {
         let pack_params = PackParams::try_new(&params, 16).expect("pack params");
         let keys = ClientPackingKeys::generate(
             &secret_key,
-            &pack_params,
+            &params,
+            16,
             crs.inspiring_w_seed,
             &mut sampler,
-        );
+        )
+        .expect("packing keys");
         (keys, pack_params, params.ntt_context())
     }
 

@@ -20,6 +20,11 @@ pub const MAX_RING_DIM: usize = 4096;
 /// ring and error width a wider modulus is a weaker set.
 pub const MAX_Q: u64 = DEFAULT_Q;
 
+/// The one CRT limb set accepted: the shipped modulus as a single prime. A key is built under
+/// the product of the limbs, which the `q` field only restates, so bounding `q` alone bounds
+/// nothing.
+pub const SHIPPED_CRT_MODULI: [u64; 1] = [DEFAULT_Q];
+
 /// The one error width accepted, every shipped preset's. A narrower one is a weaker set; a wider
 /// one grows each sampler's table, `2 * ceil(6 sigma) + 1` entries, without bound.
 pub const SHIPPED_SIGMA: f64 = 6.4;
@@ -45,6 +50,14 @@ pub enum ParameterFloorError {
     Modulus {
         /// The served modulus.
         q: u64,
+    },
+    /// A modulus or CRT limb set other than `SHIPPED_CRT_MODULI`.
+    #[error("q {q} over CRT limbs {crt_moduli:?} is not the shipped modulus {MAX_Q} as one limb")]
+    ModulusLimbs {
+        /// The served modulus.
+        q: u64,
+        /// The served CRT limbs.
+        crt_moduli: Vec<u64>,
     },
     /// Error width other than `SHIPPED_SIGMA`.
     #[error("sigma {sigma} is not the shipped width {SHIPPED_SIGMA}")]
@@ -72,6 +85,9 @@ pub enum ParameterFloorError {
         /// The served digit count.
         len: usize,
     },
+    /// The approximate packing gadget, which every shipped preset leaves off.
+    #[error("the approximate packing gadget is on, and every shipped preset has it off")]
+    ApproximatePackingGadget,
 }
 
 /// Refuse a parameter set outside the floors. `secure_128_d2048` and `secure_128_d4096` pass.
@@ -99,6 +115,12 @@ pub fn check_parameter_floor(params: &InspireParams) -> Result<(), ParameterFloo
     if params.q > MAX_Q {
         return Err(ParameterFloorError::Modulus { q: params.q });
     }
+    if params.q != MAX_Q || params.crt_moduli != SHIPPED_CRT_MODULI {
+        return Err(ParameterFloorError::ModulusLimbs {
+            q: params.q,
+            crt_moduli: params.crt_moduli.clone(),
+        });
+    }
     if params.sigma.to_bits() != SHIPPED_SIGMA.to_bits() {
         return Err(ParameterFloorError::Sigma {
             sigma: params.sigma,
@@ -120,6 +142,11 @@ pub fn check_parameter_floor(params: &InspireParams) -> Result<(), ParameterFloo
         if len > MAX_GADGET_LEN {
             return Err(ParameterFloorError::GadgetDigits { role, len });
         }
+    }
+    // The option picks which key rows the client builds and uploads; the measured presets
+    // all leave it off.
+    if params.approximate_packing_gadget {
+        return Err(ParameterFloorError::ApproximatePackingGadget);
     }
     Ok(())
 }

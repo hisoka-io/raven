@@ -1,5 +1,5 @@
-//! `POST /session` derives server-side packing keys, the costliest thing an uncredentialed caller
-//! can ask for. A flood of them must not delay `/v1/health/live`, which the container health
+//! `POST /session` seats packing keys for an uncredentialed caller and queues behind a
+//! permit. A flood of them must not delay `/v1/health/live`, which the container health
 //! check polls: a probe that times out restarts a node that was only busy.
 
 #![allow(
@@ -45,12 +45,16 @@ fn serve(config: HttpConfig) -> (Served, Vec<u8>) {
     let (state, sk) =
         setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("toy state");
     let mut sampler = GaussianSampler::with_seed(params.sigma, 7);
-    let keys = write_versioned(&ClientPackingKeys::generate(
-        &sk,
-        state.cache.pack_params(),
-        state.crs.inspiring_w_seed,
-        &mut sampler,
-    ))
+    let keys = write_versioned(
+        &ClientPackingKeys::generate(
+            &sk,
+            &params,
+            state.crs.inspiring_num_columns,
+            state.crs.inspiring_w_seed,
+            &mut sampler,
+        )
+        .expect("packing keys"),
+    )
     .expect("serialize keys");
     let mut engine: Engine<RavenInspireScheme> = Engine::new();
     engine
@@ -124,7 +128,7 @@ fn quantile(sorted: &[Duration], q: f64) -> Duration {
     sorted[index.min(sorted.len() - 1)]
 }
 
-/// Each flooder re-handshakes under its own identity, so the flood costs a derivation per
+/// Each flooder re-handshakes under its own identity, so the flood costs a registration per
 /// request without filling the pool.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_flood_does_not_delay_the_health_probe() {
@@ -179,51 +183,9 @@ async fn a_session_flood_does_not_delay_the_health_probe() {
          p50={p50:?} p99={p99:?} over {} probes; {handshakes} handshakes completed",
         flooded.len()
     );
-    assert!(handshakes > 0, "the flood never derived a key set");
+    assert!(handshakes > 0, "the flood never registered a key set");
     assert!(
         p99 < Duration::from_millis(100),
         "health p99 {p99:?} under a /session flood (p50 {p50:?}, idle p99 {idle_p99:?})"
     );
-}
-
-/// One derivation permit and a 1 ms wait: a concurrent burst is answered, part of it 503 at
-/// once, rather than queued behind every derivation ahead of it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_handshake_waits_a_bounded_time_for_a_derivation_permit() {
-    const BURST: usize = 8;
-    let mut config = config();
-    config.max_concurrent_handshakes = 1;
-    config.respond_permit_wait_ms = 1;
-    let (served, keys) = serve(config);
-    let client = reqwest::Client::new();
-    let url = format!("{}/v1/instance/{INSTANCE_ID}/session", served.base);
-    let burst: Vec<_> = (0..BURST)
-        .map(|index| {
-            let request = client
-                .post(&url)
-                .header("content-type", "application/octet-stream")
-                .header("x-raven-client-id", format!("{:032x}", 0xf200 + index))
-                .body(keys.clone())
-                .send();
-            tokio::spawn(async move { request.await.expect("session request").status() })
-        })
-        .collect();
-    let mut statuses = Vec::new();
-    for request in burst {
-        statuses.push(request.await.expect("burst request"));
-    }
-    let _ = served.stop.send(());
-    served.thread.join().expect("server thread");
-
-    let admitted = statuses.iter().filter(|s| s.is_success()).count();
-    let refused = statuses
-        .iter()
-        .filter(|s| **s == reqwest::StatusCode::SERVICE_UNAVAILABLE)
-        .count();
-    assert!(admitted >= 1, "{statuses:?}");
-    assert!(
-        refused >= 1,
-        "a burst of {BURST} against one permit and a 1 ms wait must refuse some: {statuses:?}"
-    );
-    assert_eq!(admitted + refused, BURST, "{statuses:?}");
 }

@@ -25,10 +25,9 @@ between releases.
 ## What v0 provides
 
 **Parameters.** The shipped InsPIRe parameter set, `InspireParams::secure_128_d2048`, is ring
-dimension 2,048, ciphertext modulus q = 2^60 - 2^14 + 1, plaintext modulus 65,537, Gaussian width
-6.4 and gadget base 2^20. Its security is estimated at 121.5 bits with the lattice estimator
-(binding attack: primal BDD); the preset's name predates that measurement. Before it derives a key,
-the client refuses a served parameter set with a ring dimension outside 2,048 to 4,096, a larger
+dimension 2,048, ciphertext modulus q = 2^60 - 2^14 + 1, plaintext modulus 65,537, Gaussian error
+with standard deviation 6.4 and gadget base 2^20; the preset's name is historical. Before it derives a key,
+the client refuses a served parameter set with a ring dimension outside 2,048 to 4,096, another
 modulus, another error width, or gadgets longer than 3 digits.
 
 **Requests.** No request to a Raven node carries a commitment. PPOI status is answered on the

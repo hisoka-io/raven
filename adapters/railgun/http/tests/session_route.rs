@@ -71,9 +71,15 @@ fn fixture() -> Fixture {
 
     // Client-side half of the handshake, from the same CRS the server serves.
     let keys = {
-        let pack_params = state.cache.pack_params();
         let mut sampler = GaussianSampler::with_seed(params.sigma, 7);
-        ClientPackingKeys::generate(&sk, pack_params, state.crs.inspiring_w_seed, &mut sampler)
+        ClientPackingKeys::generate(
+            &sk,
+            &params,
+            state.crs.inspiring_num_columns,
+            state.crs.inspiring_w_seed,
+            &mut sampler,
+        )
+        .expect("packing keys")
     };
     let body = write_versioned(&keys).expect("serialize ClientPackingKeys");
     let mut query_sampler = GaussianSampler::with_seed(params.sigma, 8);

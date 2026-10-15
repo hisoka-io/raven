@@ -88,6 +88,55 @@ fn validate_persisted_state(bundle: &PersistedInspireState) -> Result<()> {
         .map_err(|e| AdapterError::Scheme(format!("snapshot shard geometry: {e}")))
 }
 
+/// Fold the query-independent half of packing over every shard that holds no store, so a
+/// respond reads it instead of recomputing it per query. A store costs as much memory as its
+/// shard's columns.
+///
+/// A shard keeps the store it has. That is sound because [`re_encode_shard`] drops the store
+/// of a shard whose columns it changes, and the scheme refuses a store whose columns have
+/// changed since.
+fn precompute_missing_packing_stores(
+    encoded_db: &mut EncodedDatabase,
+    crs: &ServerCrs,
+    cache: &ServerInspiringCache,
+) -> Result<()> {
+    let context = crs.params.ntt_context();
+    // One shard at a time: a build already spreads its columns over the cores.
+    encoded_db
+        .shards
+        .iter_mut()
+        .filter(|shard| shard.packing_store().is_none())
+        .try_for_each(|shard| {
+            shard
+                .precompute_packing(cache.pack_params(), &context)
+                .map_err(|e| AdapterError::Scheme(format!("packing store build: {e}")))?;
+            metrics::counter!(PACKING_STORES_BUILT).increment(1);
+            Ok(())
+        })
+}
+
+/// Counts the packing stores the process builds. Those built at boot land before the exporter
+/// is installed and are not seen; after it, a publish adds one per shard whose columns it
+/// changed, so a climb with no new rows is stores being rebuilt for nothing.
+pub(crate) const PACKING_STORES_BUILT: &str = "raven_railgun_packing_stores_built_total";
+
+/// [`precompute_missing_packing_stores`] for a database behind an `Arc`, copied only when a
+/// shard lacks its store.
+pub(crate) fn precompute_missing_packing_stores_shared(
+    encoded_db: &mut Arc<EncodedDatabase>,
+    crs: &ServerCrs,
+    cache: &ServerInspiringCache,
+) -> Result<()> {
+    if encoded_db
+        .shards
+        .iter()
+        .all(|shard| shard.packing_store().is_some())
+    {
+        return Ok(());
+    }
+    precompute_missing_packing_stores(Arc::make_mut(encoded_db), crs, cache)
+}
+
 /// Marker type implementing [`PirScheme`] for the production stack.
 #[derive(Debug, Default)]
 pub struct RavenInspireScheme;
@@ -149,8 +198,9 @@ pub fn setup_state_with_inspiring_seed(
 ) -> Result<(InspireServerState, RlweSecretKey)> {
     require_wire_rung(params)?;
     let mut sampler = GaussianSampler::new(params.sigma);
-    let (mut crs, encoded_db, sk) = inspire_setup(params, database, entry_size, &mut sampler)
-        .map_err(|e| AdapterError::Scheme(format!("inspire setup: {e}")))?;
+    let (mut crs, mut encoded_db, sk) =
+        inspire_setup(params, database, entry_size, &mut sampler)
+            .map_err(|e| AdapterError::Scheme(format!("inspire setup: {e}")))?;
     let cache = if let Some(seed) = inspiring_w_seed {
         crs.inspiring_w_seed = seed;
         crs.inspiring_pack_params = None;
@@ -161,6 +211,7 @@ pub fn setup_state_with_inspiring_seed(
             .map_err(|e| AdapterError::Scheme(format!("inspire setup cache: {e}")))?;
         register_packing_cache(&crs, &encoded_db, built)
     };
+    precompute_missing_packing_stores(&mut encoded_db, &crs, &cache)?;
     Ok((
         InspireServerState {
             crs: Arc::new(crs),
@@ -229,17 +280,15 @@ pub fn setup_unfilled_state(
             shards.len()
         ))
     })?;
-    let encoded_db = EncodedDatabase {
-        shards: vec![raven_inspire::ShardData {
-            id: 0,
-            polynomials: first.polynomials,
-        }],
+    let mut encoded_db = EncodedDatabase {
+        shards: vec![raven_inspire::ShardData::new(0, first.polynomials)],
         config,
     };
     let cache = match minted_cache {
         Some(built) => register_packing_cache(&crs, &encoded_db, built),
         None => shared_packing_cache(&crs, &encoded_db)?,
     };
+    precompute_missing_packing_stores(&mut encoded_db, &crs, &cache)?;
     Ok(InspireServerState {
         crs,
         encoded_db: Arc::new(encoded_db),
@@ -301,17 +350,17 @@ fn allocate_every_shard(encoded_db: &mut EncodedDatabase) -> Result<()> {
             encoded_db.config.num_shards()
         ))
     })?;
+    // A clone shares its packing store: every copy holds the same columns until re-encoded.
     let template = encoded_db
         .shards
         .first()
-        .map(|shard| shard.polynomials.clone())
+        .cloned()
         .ok_or_else(|| AdapterError::Scheme("unfilled cell lost its shard".into()))?;
     encoded_db.shards.reserve(declared as usize);
     for id in 1..declared {
-        encoded_db.shards.push(raven_inspire::ShardData {
-            id,
-            polynomials: template.clone(),
-        });
+        let mut copy = template.clone();
+        copy.id = id;
+        encoded_db.shards.push(copy);
     }
     Ok(())
 }
@@ -448,6 +497,7 @@ pub fn swap_state(
     entry_size: usize,
     new_epoch: super::Epoch,
 ) -> Result<()> {
+    let mut encoded_db = encoded_db;
     let crs = Arc::new(crs);
     let new_num_columns = encoded_db.shards.first().map_or(0, |s| s.polynomials.len());
     let new_fingerprint = CacheFingerprint {
@@ -462,6 +512,7 @@ pub fn swap_state(
         } else {
             shared_packing_cache(crs.as_ref(), &encoded_db)?
         };
+    precompute_missing_packing_stores(&mut encoded_db, &crs, &cache)?;
     let new_state = InspireServerState {
         crs,
         encoded_db: Arc::new(encoded_db),
@@ -858,9 +909,10 @@ pub fn restore_inspire_state(bytes: &[u8]) -> Result<InspireServerState> {
     bundle_to_state(bundle)
 }
 
-fn bundle_to_state(bundle: PersistedInspireState) -> Result<InspireServerState> {
+fn bundle_to_state(mut bundle: PersistedInspireState) -> Result<InspireServerState> {
     validate_persisted_state(&bundle)?;
     let cache = shared_packing_cache(&bundle.crs, &bundle.encoded_db)?;
+    precompute_missing_packing_stores(&mut bundle.encoded_db, &bundle.crs, &cache)?;
     Ok(InspireServerState {
         crs: Arc::new(bundle.crs),
         encoded_db: Arc::new(bundle.encoded_db),
@@ -1048,6 +1100,8 @@ pub fn restore_inspire_state_v6(bytes: &[u8]) -> Result<(InspireServerState, Log
     }
 }
 
+/// The boot's restore. The state comes back without packing stores, so the open costs what
+/// its decode costs; the boot adds them once the open has returned.
 pub(crate) fn restore_inspire_state_v6_cached(
     bytes: &[u8],
     data_dir: &std::path::Path,
@@ -1098,7 +1152,9 @@ pub(crate) fn restore_inspire_state_v6_cached(
 }
 
 /// Re-encode a single shard from a raw byte buffer in place. An unfilled cell first gives
-/// every shard its own copy of the one it holds.
+/// every shard its own copy of the one it holds. The shard's packing store answers for its
+/// columns: when the bytes encode to other columns the store is dropped with the old ones, and
+/// when they encode to the columns already held the shard and its store are left as they are.
 ///
 /// # Errors
 /// [`AdapterError::Scheme`] if the shape is rejected or `shard_bytes` re-shards
@@ -1152,6 +1208,12 @@ pub fn re_encode_shard(
     let new_shard = rebuilt
         .pop()
         .ok_or_else(|| AdapterError::Scheme("re_encode_shard: encoder produced no shard".into()))?;
+    // A commit replayed over rows already served (the dirty set a snapshot restores with)
+    // changes nothing, and must not cost the shard its store.
+    if existing.polynomials == new_shard.polynomials {
+        return Ok(());
+    }
+    existing.drop_packing_store();
     existing.polynomials = new_shard.polynomials;
     Ok(())
 }

@@ -8,8 +8,7 @@
 #    workspace does not resolve without crates/inspire.
 # 2. Public policy files must carry no unresolved owner-action marker.
 # 3. No document outside the vendored submodule may claim 128-bit security for
-#    the shipped InsPIRe parameters: the lattice-estimator measurement at the
-#    shipped modulus is 121.5 bits.
+#    the shipped InsPIRe parameters: no security level is stated publicly.
 # 4. No tracked file may carry an internal ledger label. The adapter gate greps
 #    `*.rs` under the adapter workspace, which is 2 of the 10 places labels have
 #    actually leaked from; the other eight were .yml, .md and .sh, most of them
@@ -93,7 +92,7 @@ sec_hits="$( { git ls-files -- '*.md' ':!:crates/inspire' ':!:crates/inspire/*';
   | xargs grep -nE '128-bit secur|128 bits of secur' 2>/dev/null || true)"
 if [[ -n "$sec_hits" ]]; then
   echo "$sec_hits"
-  fail "a tracked document claims 128-bit security; the measured floor at the shipped modulus is 121.5 bits"
+  fail "a tracked document claims 128-bit security; no security level is stated publicly"
 fi
 
 # Selftests are excluded because planting a label is what they are for: the adapter red-proof

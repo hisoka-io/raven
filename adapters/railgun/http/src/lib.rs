@@ -574,7 +574,7 @@ mod tests {
         assert_eq!(cfg.read_token, token);
         assert_eq!(cfg.max_concurrent_queries, 4);
         assert_eq!(cfg.session_ttl_secs, 60 * 60);
-        assert_eq!(cfg.session_lru_cap, 10_000);
+        assert_eq!(cfg.session_lru_cap, 160_000);
         assert_eq!(cfg.rate_limit_rps, 200);
         assert_eq!(cfg.rate_limit_burst, 400);
         assert!(!cfg.metrics_public);

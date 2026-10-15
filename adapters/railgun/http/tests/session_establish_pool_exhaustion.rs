@@ -53,22 +53,29 @@ fn fixture_with(config: HttpConfig, store_limits: Option<SessionStoreLimits>) ->
         state.session_store = Arc::new(BoundedSessionStore::with_limits(limits));
     }
 
-    let pack_params = state.cache.pack_params();
     let mut victim_sampler = GaussianSampler::with_seed(params.sigma, 11);
-    let victim_keys = write_versioned(&ClientPackingKeys::generate(
-        &sk,
-        pack_params,
-        state.crs.inspiring_w_seed,
-        &mut victim_sampler,
-    ))
+    let victim_keys = write_versioned(
+        &ClientPackingKeys::generate(
+            &sk,
+            &params,
+            state.crs.inspiring_num_columns,
+            state.crs.inspiring_w_seed,
+            &mut victim_sampler,
+        )
+        .expect("victim keys"),
+    )
     .expect("serialize victim keys");
     let mut attacker_sampler = GaussianSampler::with_seed(params.sigma, 12);
-    let attacker_keys = write_versioned(&ClientPackingKeys::generate(
-        &sk,
-        pack_params,
-        state.crs.inspiring_w_seed,
-        &mut attacker_sampler,
-    ))
+    let attacker_keys = write_versioned(
+        &ClientPackingKeys::generate(
+            &sk,
+            &params,
+            state.crs.inspiring_num_columns,
+            state.crs.inspiring_w_seed,
+            &mut attacker_sampler,
+        )
+        .expect("attacker keys"),
+    )
     .expect("serialize attacker keys");
 
     let mut query_sampler = GaussianSampler::with_seed(params.sigma, 13);

@@ -34,6 +34,7 @@ fn test_params() -> InspireParams {
         gadget_base: 1 << 20,
         query_gadget_len: 3,
         packing_gadget_len: 3,
+        approximate_packing_gadget: false,
         security_level: raven_inspire::params::SecurityLevel::Bits128,
     }
 }
@@ -90,9 +91,7 @@ fn wasm_session_serialize_emits_small_residue_blob() {
 }
 
 /// Full warm-cache round-trip: serialize a session, rehydrate from the blob, and
-/// prove the rehydrated session queries and decodes the planted entry - the server
-/// re-derives y_all from the persisted y_body, so a warm-cache load rebuilds no
-/// automorph tables.
+/// prove the rehydrated session queries and decodes the planted entry.
 #[test]
 fn wasm_session_residue_round_trip_decodes() {
     let params = test_params();
@@ -111,10 +110,6 @@ fn wasm_session_residue_round_trip_decodes() {
     let (session2, params2) =
         deserialize_client_session_rust(&bundle_bytes, &crs_bytes, &blob).expect("rehydrate");
     assert_eq!(params2.ring_dim, params.ring_dim);
-    assert!(
-        session2.pack_params().is_none(),
-        "a rehydrated session must not rebuild pack_params"
-    );
 
     let mut q_sampler = GaussianSampler::new(params.sigma);
     for target in [0u64, 1, 7] {

@@ -29,7 +29,7 @@ use raven_inspire::ServerInspiringCache;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const CACHE_MAGIC: [u8; 8] = *b"RVN_OPK3";
+const CACHE_MAGIC: [u8; 8] = *b"RVN_OPK4";
 const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Standard relative path under a caller-owned data directory.
@@ -125,7 +125,7 @@ impl CellShape {
         identity.extend_from_slice(&(num_columns as u64).to_le_bytes());
         identity.extend_from_slice(&inspiring_w_seed);
         Self {
-            scheme_tag: b"raven-inspire-cache-v3".to_vec(),
+            scheme_tag: b"raven-inspire-cache-v4".to_vec(),
             entries: 0,
             entry_bytes: 0,
             packing_param_id: identity,

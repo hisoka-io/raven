@@ -13,8 +13,8 @@ pub enum ServerError {
         instance_id: InstanceId,
     },
 
-    /// Every session seat is held by a live session or a registration still deriving its
-    /// keys. Routing layers should return 503 (transient, retry) rather than 500.
+    /// Every session seat is held by a live session or a registration in progress.
+    /// Routing layers should return 503 (transient, retry) rather than 500.
     #[error("at capacity: {0}")]
     AtCapacity(String),
 

@@ -11,13 +11,15 @@ TOKEN_PATH=$SECRETS_DIR/bearer-token
 TEMPLATE_PATH=/etc/raven-railgun/mainnet-ppoi.toml
 # Twice the node's own 15 s stop budget, so docker never kills a final commit.
 STOP_TIMEOUT=30
-# Debug switches in the respond path: never on a served node.
-FORBIDDEN_ENV=(RAVEN_FORCE_PACKING_ONLINE RAVEN_PROFILE_RESPOND)
-# Node memory, in MiB. A warm boot peaked at 1.8 GiB resident in rehearsal and settled at
-# 1.2 GiB. A packing-key seat holds 1,533 ring polynomials of 16 KiB at a 512 B row. Headroom
-# covers the queries in flight.
-NODE_PEAK_MIB=1843
-SEAT_MIB=24
+# Debug switch in the respond path: never on a served node.
+FORBIDDEN_ENV=(RAVEN_PROFILE_RESPOND)
+# Node memory. Five warm boots of the template's seven instances on a replay of the mainnet list
+# peaked at 3,836 to 3,979 MiB resident and settled at 1,998 MiB: each shard holds its columns and
+# a packing store of the same size. The peak here is the measured maximum of five plus 421 MiB
+# (about 10 %). A packing-key seat holds three ring polynomials of 16 KiB at any row size, 49 KiB
+# with its containers. Headroom covers the queries in flight.
+NODE_PEAK_MIB=4400
+SEAT_KIB=49
 HEADROOM_MIB=1024
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -83,7 +85,7 @@ memory_mib() {  # size
 
 # The most the node can hold: the boot peak, every seat of every instance full, and headroom.
 worst_case_mib() {  # seats_per_instance instances
-  echo $((NODE_PEAK_MIB + $1 * $2 * SEAT_MIB + HEADROOM_MIB))
+  echo $((NODE_PEAK_MIB + ($1 * $2 * SEAT_KIB + 1023) / 1024 + HEADROOM_MIB))
 }
 
 # The image's template with the token read from a file, the mirror endpoint and proxy trust set.
