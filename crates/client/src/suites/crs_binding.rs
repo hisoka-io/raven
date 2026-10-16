@@ -44,18 +44,12 @@ fn build_test_db(params: &InspireParams) -> Vec<u8> {
 struct TestParamsBundle {
     inspire_params_bincode: Vec<u8>,
     shard_config_bincode: Vec<u8>,
-    rlwe_secret_key_bincode: Vec<u8>,
 }
 
-fn make_params_bundle(
-    params: &InspireParams,
-    shard_config: &ShardConfig,
-    sk: &raven_inspire::rlwe::RlweSecretKey,
-) -> Vec<u8> {
+fn make_params_bundle(params: &InspireParams, shard_config: &ShardConfig) -> Vec<u8> {
     let bundle = TestParamsBundle {
         inspire_params_bincode: bincode::serialize(params).expect("serialize params"),
         shard_config_bincode: bincode::serialize(shard_config).expect("serialize shard"),
-        rlwe_secret_key_bincode: bincode::serialize(sk).expect("serialize sk"),
     };
     bincode::serialize(&bundle).expect("serialize bundle")
 }
@@ -73,7 +67,7 @@ fn deploy(params: &InspireParams, database: &[u8]) -> Deployment {
     let mut sampler = GaussianSampler::new(params.sigma);
     let (crs, encoded_db, sk) =
         inspire_setup(params, database, ENTRY_BYTES, &mut sampler).expect("inspire_setup");
-    let bundle = make_params_bundle(params, &encoded_db.config, &sk);
+    let bundle = make_params_bundle(params, &encoded_db.config);
     let crs_bytes = crs.to_versioned_bytes().expect("versioned crs");
     let mut session_sampler = GaussianSampler::new(params.sigma);
     let session = ClientSession::new(crs.clone(), sk, &mut session_sampler).expect("session");

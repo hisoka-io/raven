@@ -18,7 +18,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use raven_inspire::params::{InspireParams, InspireVariant};
-use raven_inspire::rlwe::RlweSecretKey;
 use raven_railgun_core::{AdapterError, InstanceId, POIStatus};
 use raven_railgun_engine::imt::Imt;
 use raven_railgun_engine::inspire::{
@@ -51,7 +50,7 @@ fn bc_for(list_index: u32) -> [u8; 32] {
     bc
 }
 
-fn fresh_state() -> (InspireServerState, RlweSecretKey) {
+fn fresh_state() -> InspireServerState {
     let seed = vec![0u8; SHARDS * EPS as usize * PATH10_RECORD_BYTES];
     setup_state(
         &InspireParams::secure_128_d2048(),
@@ -60,6 +59,7 @@ fn fresh_state() -> (InspireServerState, RlweSecretKey) {
         InspireVariant::TwoPacking,
     )
     .expect("setup")
+    .0
 }
 
 /// A live block under the shipped live policy, whose snapshot triggers are far past this test.
@@ -164,8 +164,8 @@ fn motion(handle: &MultiOrchestratorHandle) -> (String, usize, u64) {
 
 /// Boots a block that has caught up with upstream: its backfill applied [`CAUGHT_UP_ROWS`] rows
 /// and the publish that ends a backfill served them.
-async fn caught_up(dir: &std::path::Path) -> (MultiOrchestratorHandle, RlweSecretKey, Imt) {
-    let (fresh, secret_key) = fresh_state();
+async fn caught_up(dir: &std::path::Path) -> (MultiOrchestratorHandle, Imt) {
+    let fresh = fresh_state();
     let handle = boot(dir, Some(fresh));
     let booted = block(&handle);
     let mut upstream = Imt::new().expect("reference tree");
@@ -188,7 +188,7 @@ async fn caught_up(dir: &std::path::Path) -> (MultiOrchestratorHandle, RlweSecre
     })
     .await;
     assert_eq!(advertised(&handle), CAUGHT_UP_ROWS, "fixture: caught up");
-    (handle, secret_key, upstream)
+    (handle, upstream)
 }
 
 async fn stop_uncleanly(handle: MultiOrchestratorHandle) {
@@ -199,10 +199,9 @@ async fn stop_uncleanly(handle: MultiOrchestratorHandle) {
     }
 }
 
-fn decrypt_row(state: &InspireServerState, secret_key: RlweSecretKey, list_index: u32) -> Vec<u8> {
+fn decrypt_row(state: &InspireServerState, list_index: u32) -> Vec<u8> {
     let params = InspireParams::secure_128_d2048();
-    let mut session =
-        build_client_session((*state.crs).clone(), secret_key, &params).expect("client session");
+    let mut session = build_client_session((*state.crs).clone()).expect("client session");
     register_client_session(&mut session, state).expect("register session");
     let (client_state, query) = build_seeded_query(
         &session,
@@ -215,13 +214,8 @@ fn decrypt_row(state: &InspireServerState, secret_key: RlweSecretKey, list_index
     extract_response(&state.crs, &client_state, &response, state.entry_size).expect("extract")
 }
 
-fn assert_serves(
-    state: &InspireServerState,
-    secret_key: RlweSecretKey,
-    list_index: u32,
-    why: &str,
-) {
-    let row = decrypt_row(state, secret_key, list_index);
+fn assert_serves(state: &InspireServerState, list_index: u32, why: &str) {
+    let row = decrypt_row(state, list_index);
     assert_eq!(
         &row[PATH10_MARKER],
         PATH10_MAGIC.as_slice(),
@@ -237,7 +231,7 @@ fn assert_serves(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_row_the_index_advertises_is_served_by_the_published_table() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (handle, secret_key, mut upstream) = caught_up(dir.path()).await;
+    let (handle, mut upstream) = caught_up(dir.path()).await;
     let booted = block(&handle);
 
     let new_row = CAUGHT_UP_ROWS;
@@ -254,7 +248,6 @@ async fn a_row_the_index_advertises_is_served_by_the_published_table() {
     .await;
     assert_serves(
         &served,
-        secret_key,
         new_row,
         "the index advertised it before the table held it",
     );
@@ -268,7 +261,7 @@ async fn a_row_the_index_advertises_is_served_by_the_published_table() {
 #[allow(clippy::print_stderr)]
 async fn a_caught_up_block_serves_a_new_row_ahead_of_its_snapshot() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (handle, secret_key, mut upstream) = caught_up(dir.path()).await;
+    let (handle, mut upstream) = caught_up(dir.path()).await;
     let booted = block(&handle);
     let commits = booted.metrics.lock().commits_fired;
     let snapshot = booted.persistence.current_snapshot_id();
@@ -306,7 +299,6 @@ async fn a_caught_up_block_serves_a_new_row_ahead_of_its_snapshot() {
     );
     assert_serves(
         &booted.instance.current_state(),
-        secret_key,
         new_row,
         "advertised without being served",
     );
@@ -319,7 +311,7 @@ async fn a_caught_up_block_serves_a_new_row_ahead_of_its_snapshot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restart_advertises_only_the_rows_its_recovered_table_serves() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (first, secret_key, mut upstream) = caught_up(dir.path()).await;
+    let (first, mut upstream) = caught_up(dir.path()).await;
     let new_row = CAUGHT_UP_ROWS;
     mirror_rows(&first, &mut upstream, new_row..new_row + 1).await;
     progress::until_done_or_stalled("the new row advertised", async || {
@@ -347,12 +339,7 @@ async fn a_restart_advertises_only_the_rows_its_recovered_table_serves() {
     );
     let recovered = booted.instance.current_state();
     for row in 0..new_row {
-        assert_serves(
-            &recovered,
-            secret_key.clone(),
-            row,
-            "recovered and advertised",
-        );
+        assert_serves(&recovered, row, "recovered and advertised");
     }
 
     let commits = booted.metrics.lock().commits_fired;
@@ -367,7 +354,6 @@ async fn a_restart_advertises_only_the_rows_its_recovered_table_serves() {
     assert_eq!(advertised(&second), new_row + 1);
     assert_serves(
         &booted.instance.current_state(),
-        secret_key,
         new_row,
         "advertised after the backfill without being served",
     );

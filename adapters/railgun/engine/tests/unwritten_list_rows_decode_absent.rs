@@ -21,7 +21,6 @@ use std::sync::{Arc, Mutex};
 
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use raven_inspire::params::{InspireParams, InspireVariant};
-use raven_inspire::rlwe::RlweSecretKey;
 use raven_railgun_core::{AdapterError, InstanceId, POIStatus};
 use raven_railgun_engine::imt::Imt;
 use raven_railgun_engine::inspire::{
@@ -306,14 +305,9 @@ fn the_path10_encoder_counts_and_names_each_unfilled_row_and_never_padding() {
 
 /// The bytes a client decrypts, not the bytes handed to the encoder: a real query, the
 /// server's respond and the client's extract.
-fn decrypt_rows(
-    state: &InspireServerState,
-    secret_key: RlweSecretKey,
-    list_indices: &[u32],
-) -> Vec<Vec<u8>> {
+fn decrypt_rows(state: &InspireServerState, list_indices: &[u32]) -> Vec<Vec<u8>> {
     let params = InspireParams::secure_128_d2048();
-    let mut session =
-        build_client_session((*state.crs).clone(), secret_key, &params).expect("client session");
+    let mut session = build_client_session((*state.crs).clone()).expect("client session");
     register_client_session(&mut session, state).expect("register session");
     list_indices
         .iter()
@@ -336,9 +330,9 @@ fn decrypt_rows(
 /// One shard served through setup, then decrypted.
 fn served_rows(database: &[u8], entry_size: usize, list_indices: &[u32]) -> Vec<Vec<u8>> {
     let params = InspireParams::secure_128_d2048();
-    let (state, secret_key) =
+    let (state, _) =
         setup_state(&params, database, entry_size, InspireVariant::TwoPacking).expect("setup");
-    decrypt_rows(&state, secret_key, list_indices)
+    decrypt_rows(&state, list_indices)
 }
 
 #[test]
@@ -381,7 +375,7 @@ async fn served_after_commit(
     list_indices: &[u32],
 ) -> Vec<Vec<u8>> {
     let params = InspireParams::secure_128_d2048();
-    let (fresh, secret_key) = setup_state(
+    let (fresh, _) = setup_state(
         &params,
         &seeded_rows(width),
         width,
@@ -446,7 +440,7 @@ async fn served_after_commit(
     })
     .await;
 
-    let rows = decrypt_rows(&booted.instance.current_state(), secret_key, list_indices);
+    let rows = decrypt_rows(&booted.instance.current_state(), list_indices);
     handle.router.abort();
     for mut instance in handle.instances {
         progress::abort_consumer(

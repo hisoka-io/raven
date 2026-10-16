@@ -81,12 +81,10 @@ impl ProductionCell {
         let setup_start = Instant::now();
         let params = InspireParams::secure_128_d2048();
         let db = build_synthetic_db(entries(), ENTRY_BYTES);
-        let (server_state, secret_key) =
-            setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking)
-                .expect("setup_state");
+        let (server_state, _) = setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking)
+            .expect("setup_state");
         let mut client_session =
-            build_client_session((*server_state.crs).clone(), secret_key.clone(), &params)
-                .expect("build_client_session");
+            build_client_session((*server_state.crs).clone()).expect("build_client_session");
         let (_, registration_query) =
             build_seeded_query(&client_session, server_state.shard_config(), 0, &params)
                 .expect("build registration query");

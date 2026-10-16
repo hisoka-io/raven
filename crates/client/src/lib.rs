@@ -23,7 +23,6 @@ use raven_inspire::inspiring::PackParams;
 use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, ShardConfig};
 use raven_inspire::pir::mod_switch::{extract_inspiring_mod_switched, MOD_SWITCH_TARGET_36BIT};
-use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::{
     ClientSession, ClientState, SeededClientQuery, ServerCrs, ServerResponse, SessionResidue,
 };
@@ -53,12 +52,13 @@ pub fn init_panic_hook() {
     console_error_panic_hook::set_once();
 }
 
+/// Public parameters only: the secret key is drawn inside the session build, so no
+/// value the caller holds can build a second packing key under it.
 #[derive(Serialize, Deserialize)]
 #[allow(clippy::struct_field_names)]
 struct WasmInstanceParamsBundle {
     inspire_params_bincode: Vec<u8>,
     shard_config_bincode: Vec<u8>,
-    rlwe_secret_key_bincode: Vec<u8>,
 }
 
 impl std::fmt::Debug for WasmInstanceParamsBundle {
@@ -66,7 +66,6 @@ impl std::fmt::Debug for WasmInstanceParamsBundle {
         f.debug_struct("WasmInstanceParamsBundle")
             .field("inspire_params_len", &self.inspire_params_bincode.len())
             .field("shard_config_len", &self.shard_config_bincode.len())
-            .field("rlwe_secret_key_len", &self.rlwe_secret_key_bincode.len())
             .finish()
     }
 }
@@ -364,7 +363,10 @@ impl std::fmt::Debug for ClientSessionHandle {
 
 /// Build a client session from a params bundle (from `build_instance_params_blob`)
 /// and the public CRS bytes.
-/// Builds the packing keys the session uploads once.
+///
+/// Draws a fresh secret key and builds its one packing key, which every upload and
+/// retry of this handle resends. Calling it again on the same bundle gives a new
+/// secret, never a second key under the first.
 #[wasm_bindgen]
 pub fn build_client_session(
     params_bundle_bincode: &[u8],
@@ -372,15 +374,10 @@ pub fn build_client_session(
 ) -> Result<ClientSessionHandle, JsValue> {
     let bundle: WasmInstanceParamsBundle = decode(params_bundle_bincode, "params_bundle")?;
     let inspire_params = decode_validated_params(&bundle.inspire_params_bincode, "inspire_params")?;
-    let secret_key: RlweSecretKey = decode(&bundle.rlwe_secret_key_bincode, "rlwe_secret_key")?;
     let crs = decode_versioned_crs(crs_bincode)?;
-    // the packing keys ship to the server; a known error term solves for the secret key
-    let mut sampler = os_seeded_sampler(inspire_params.sigma, "client_session_packing_keys")?;
-    let session = ClientSession::new(crs, secret_key, &mut sampler).map_err(|e| {
-        WasmClientError::Inspire {
-            op: "ClientSession::new",
-            detail: e.to_string(),
-        }
+    let session = ClientSession::with_fresh_secret(crs).map_err(|e| WasmClientError::Inspire {
+        op: "ClientSession::with_fresh_secret",
+        detail: e.to_string(),
     })?;
     let shard_config =
         decode_validated_shard_config(&bundle.shard_config_bincode, &inspire_params)?;
@@ -713,8 +710,8 @@ pub fn deserialize_client_session(
     })
 }
 
-/// Generate a fresh RLWE secret key and return the params bundle the SDK passes
-/// to `build_client_session`.
+/// Check the public params and shard geometry and return the bundle the SDK passes
+/// to `build_client_session`. The bundle holds no secret.
 #[wasm_bindgen]
 pub fn build_instance_params_blob(
     inspire_params_bincode: &[u8],
@@ -728,14 +725,9 @@ pub fn build_instance_params_blob(
             what: "shard_config",
             detail: format!("shard geometry does not match the params ring: {detail}"),
         })?;
-    // the key is derived entirely from this sampler: one seed here is one key for every client
-    let mut sampler = os_seeded_sampler(inspire_params.sigma, "rlwe_secret_key")?;
-    let secret_key = RlweSecretKey::generate(&inspire_params, &mut sampler);
-    let secret_key_bincode = encode(&secret_key, "rlwe_secret_key")?;
     let bundle = WasmInstanceParamsBundle {
         inspire_params_bincode: inspire_params_bincode.to_vec(),
         shard_config_bincode: shard_config_bincode.to_vec(),
-        rlwe_secret_key_bincode: secret_key_bincode,
     };
     Ok(encode(&bundle, "wasm_instance_params_bundle")?)
 }

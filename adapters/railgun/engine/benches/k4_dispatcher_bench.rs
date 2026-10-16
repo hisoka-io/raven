@@ -53,10 +53,10 @@ fn k4_dispatcher_strategy_comparison() {
     let params = InspireParams::secure_128_d2048();
     let entries = 1usize << ENTRIES_LOG2;
     let db = build_synthetic_db(entries, ENTRY_BYTES);
-    let (server_state, secret_key) =
+    let (server_state, _) =
         setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("setup_state");
-    let mut client_session = build_client_session((*server_state.crs).clone(), secret_key, &params)
-        .expect("client_session");
+    let mut client_session =
+        build_client_session((*server_state.crs).clone()).expect("client_session");
     let _: ServerSessionHandle = {
         register_client_session(&mut client_session, &server_state).expect("register session");
         client_session

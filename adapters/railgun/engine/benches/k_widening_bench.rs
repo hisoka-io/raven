@@ -149,13 +149,12 @@ fn k_widening_at_two_cells() {
             let setup_start = Instant::now();
             let params = InspireParams::secure_128_d2048();
             let db = build_synthetic_db(entries, cell.entry_bytes);
-            let (server_state, secret_key) =
+            let (server_state, _) =
                 setup_state(&params, &db, cell.entry_bytes, InspireVariant::TwoPacking)
                     .expect("setup_state");
 
             let mut client_session =
-                build_client_session((*server_state.crs).clone(), secret_key, &params)
-                    .expect("client_session");
+                build_client_session((*server_state.crs).clone()).expect("client_session");
             let _: ServerSessionHandle = {
                 register_client_session(&mut client_session, &server_state)
                     .expect("register session");

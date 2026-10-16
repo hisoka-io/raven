@@ -243,10 +243,9 @@ fn worst_mismatch_at_width(entry_size: usize) -> usize {
     for (i, byte) in db.iter_mut().enumerate() {
         *byte = u8::try_from(i % 251).unwrap_or(0);
     }
-    let (state, secret_key) =
+    let (state, _) =
         setup_state(&params, &db, entry_size, InspireVariant::TwoPacking).expect("setup_state");
-    let mut client_session =
-        build_client_session((*state.crs).clone(), secret_key, &params).expect("client session");
+    let mut client_session = build_client_session((*state.crs).clone()).expect("client session");
     register_client_session(&mut client_session, &state).expect("register session");
 
     let mut worst = 0usize;

@@ -5,8 +5,8 @@
 // pointing at a `capture_live_fixture` output, and no such generator is in the tree - the
 // directory it wanted (`client_state.bin`, `response_inner.bin`, `expected_leaf_hex.txt`,
 // `entry_size.txt`, `secret_key.bin`) is emitted by no example, script or CI job. The
-// checked-in fixture carries the same secret key inside `params_bundle.bin`, so a session
-// rebuilt from it decrypts the recorded responses byte-exactly and the gate is unnecessary.
+// checked-in fixture carries the session that recorded the responses in `session.bin`, so a
+// session restored from it decrypts them byte-exactly and the gate is unnecessary.
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -57,14 +57,15 @@ const meta = JSON.parse(
   readFileSync(join(FIXTURES_DIR, "fixture.json"), "utf-8"),
 ) as FixtureMeta;
 const paramsBundle = read("params_bundle.bin");
+const sessionBincode = read("session.bin");
 const crsBincode = read("crs.bin");
 const shardConfigBincode = read("shard_config.bin");
 
 const sessions: RavenInspireClientSession[] = [];
 
-/** A session over the fixture's own secret key, which `params_bundle.bin` carries. */
+/** The fixture's own session, restored with its secret key from `session.bin`. */
 function newSession(): RavenInspireClientSession {
-  const session = wasm.build_client_session(paramsBundle, crsBincode);
+  const session = wasm.deserialize_client_session!(paramsBundle, crsBincode, sessionBincode);
   sessions.push(session);
   return session;
 }

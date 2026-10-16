@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use raven_inspire::inspiring::ShardPackingStore;
 use raven_inspire::params::{InspireParams, InspireVariant};
-use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::{ClientSession, ClientState, EncodedDatabase, SeededClientQuery};
 use raven_railgun_core::{AdapterError, InstanceId, POIStatus};
 use raven_railgun_engine::imt::Imt;
@@ -49,7 +48,7 @@ fn bc_for(list_index: u32) -> [u8; 32] {
     bc
 }
 
-fn fresh_state() -> (InspireServerState, RlweSecretKey) {
+fn fresh_state() -> InspireServerState {
     let seed = vec![0u8; SHARDS * EPS as usize * PATH10_RECORD_BYTES];
     setup_state(
         &InspireParams::secure_128_d2048(),
@@ -58,6 +57,7 @@ fn fresh_state() -> (InspireServerState, RlweSecretKey) {
         InspireVariant::TwoPacking,
     )
     .expect("setup")
+    .0
 }
 
 /// Boots the block over `dir`; `fresh` is `None` when the boot must recover what is there.
@@ -167,10 +167,8 @@ async fn wait_published(handle: &MultiOrchestratorHandle, rows: u32) {
     .await;
 }
 
-fn session_for(state: &InspireServerState, secret_key: &RlweSecretKey) -> ClientSession {
-    let params = InspireParams::secure_128_d2048();
-    let mut session = build_client_session((*state.crs).clone(), secret_key.clone(), &params)
-        .expect("client session");
+fn session_for(state: &InspireServerState) -> ClientSession {
+    let mut session = build_client_session((*state.crs).clone()).expect("client session");
     register_client_session(&mut session, state).expect("register session");
     session
 }
@@ -222,7 +220,7 @@ fn without_stores(state: &InspireServerState) -> InspireServerState {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_published_row_is_served_through_the_store_of_its_new_columns() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (fresh, secret_key) = fresh_state();
+    let fresh = fresh_state();
     let handle = boot(dir.path(), Some(fresh));
     let booted = handle.instances.first().expect("one instance");
     let last = u64::from(ROWS - 1);
@@ -230,7 +228,7 @@ async fn a_published_row_is_served_through_the_store_of_its_new_columns() {
     let before = booted.instance.current_state();
     assert_eq!(before.encoded_db.shards.len(), SHARDS);
     let (before_store_0, before_store_1) = (store_of(&before, 0), store_of(&before, 1));
-    let before_session = session_for(&before, &secret_key);
+    let before_session = session_for(&before);
     let (before_client, before_query) = query_for(&before, &before_session, last);
     assert_eq!(
         served_row(&before, &before_client, &before_query),
@@ -292,7 +290,7 @@ async fn a_published_row_is_served_through_the_store_of_its_new_columns() {
     for shard in 0..SHARDS {
         store_of(&recovered, shard);
     }
-    let session = session_for(&recovered, &secret_key);
+    let session = session_for(&recovered);
     let (client, query) = query_for(&recovered, &session, last);
     assert_eq!(
         &served_row(&recovered, &client, &query)[..32],
@@ -317,7 +315,7 @@ fn planted_rows(marker: u8) -> Vec<u8> {
 fn a_store_kept_over_replaced_columns_is_refused_and_a_re_encode_serves_them() {
     let params = InspireParams::secure_128_d2048();
     let shard_bytes = EPS as usize * PATH10_RECORD_BYTES;
-    let (state, secret_key) = setup_state(
+    let (state, _) = setup_state(
         &params,
         &planted_rows(0xa1),
         PATH10_RECORD_BYTES,
@@ -331,7 +329,7 @@ fn a_store_kept_over_replaced_columns_is_refused_and_a_re_encode_serves_them() {
         InspireVariant::TwoPacking,
     )
     .expect("replacement rows");
-    let session = session_for(&state, &secret_key);
+    let session = session_for(&state);
     let (client, query) = query_for(&state, &session, 5);
     assert_eq!(served_row(&state, &client, &query)[0], 0xa1);
 
@@ -386,7 +384,7 @@ fn a_re_encode_to_the_columns_already_held_keeps_the_store() {
     let params = InspireParams::secure_128_d2048();
     let shard_bytes = EPS as usize * PATH10_RECORD_BYTES;
     let rows = planted_rows(0xa1);
-    let (state, secret_key) = setup_state(
+    let (state, _) = setup_state(
         &params,
         &rows,
         PATH10_RECORD_BYTES,
@@ -433,7 +431,7 @@ fn a_re_encode_to_the_columns_already_held_keeps_the_store() {
         variant: state.variant,
         entry_size: state.entry_size,
     };
-    let session = session_for(&state, &secret_key);
+    let session = session_for(&state);
     let (client, query) = query_for(&state, &session, 5);
     let row = served_row(&kept, &client, &query);
     assert_eq!(row[0], 0xa1);

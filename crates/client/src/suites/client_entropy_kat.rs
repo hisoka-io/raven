@@ -53,18 +53,8 @@ fn build_test_db(params: &InspireParams) -> Vec<u8> {
         .collect()
 }
 
-/// Wire-shape mirror of the crate-private `WasmInstanceParamsBundle`.
-#[derive(serde::Deserialize)]
-#[allow(clippy::struct_field_names)]
-struct BundleView {
-    inspire_params_bincode: Vec<u8>,
-    #[allow(dead_code)]
-    shard_config_bincode: Vec<u8>,
-    rlwe_secret_key_bincode: Vec<u8>,
-}
-
-fn bundle_view(bundle_bincode: &[u8]) -> BundleView {
-    bincode::deserialize(bundle_bincode).expect("decode params bundle")
+fn secret_key_bytes(session: &raven_client::ClientSessionHandle) -> Vec<u8> {
+    bincode::serialize(session.inner.rlwe_secret_key()).expect("encode secret key")
 }
 
 struct Fixture {
@@ -128,15 +118,15 @@ fn two_independently_built_clients_derive_different_secret_keys() {
         .expect("first params blob");
     let second = build_instance_params_blob(&f.params_bincode, &f.shard_config_bincode)
         .expect("second params blob");
-
-    let first_key = bundle_view(&first).rlwe_secret_key_bincode;
-    let second_key = bundle_view(&second).rlwe_secret_key_bincode;
-
     assert_eq!(
-        bundle_view(&first).inspire_params_bincode,
-        bundle_view(&second).inspire_params_bincode,
-        "fixture invariant: both bundles must carry the same public params"
+        first, second,
+        "fixture invariant: a bundle is public parameters only"
     );
+
+    let first_key =
+        secret_key_bytes(&build_client_session(&first, &f.crs_bincode).expect("first session"));
+    let second_key =
+        secret_key_bytes(&build_client_session(&second, &f.crs_bincode).expect("second session"));
     // assert! not assert_ne!: the operands are multi-KiB and their contents are secret
     assert!(
         first_key != second_key,
@@ -148,7 +138,7 @@ fn two_independently_built_clients_derive_different_secret_keys() {
 }
 
 #[test]
-fn two_sessions_over_one_key_carry_independent_packing_noise() {
+fn two_sessions_over_one_bundle_hold_independent_keys() {
     let f = fixture();
     let bundle = build_instance_params_blob(&f.params_bincode, &f.shard_config_bincode)
         .expect("params blob");
@@ -161,10 +151,13 @@ fn two_sessions_over_one_key_carry_independent_packing_noise() {
 
     assert!(
         first_residue != second_residue,
-        "two sessions over the same key produced byte-identical packing keys \
-         ({} bytes); the packing-key error is then known, so the server can solve \
-         for the secret key",
+        "two sessions over one bundle produced byte-identical residues ({} bytes)",
         first_residue.len()
+    );
+    assert!(
+        secret_key_bytes(&first) != secret_key_bytes(&second),
+        "two sessions over one bundle share a secret key, so their packing keys share a \
+         mask and together leak it"
     );
 }
 
@@ -173,9 +166,8 @@ fn repeated_queries_for_one_index_carry_independent_noise() {
     let f = fixture();
     let bundle = build_instance_params_blob(&f.params_bincode, &f.shard_config_bincode)
         .expect("params blob");
-    let sk: RlweSecretKey =
-        bincode::deserialize(&bundle_view(&bundle).rlwe_secret_key_bincode).expect("decode sk");
     let session = build_client_session(&bundle, &f.crs_bincode).expect("session");
+    let sk = session.inner.rlwe_secret_key().clone();
 
     let first =
         build_seeded_query(&session, &f.shard_config_bincode, TARGET_IDX).expect("first query");

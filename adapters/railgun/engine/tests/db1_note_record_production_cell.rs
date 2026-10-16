@@ -137,7 +137,7 @@ fn build_live_state_and_session() -> (
 ) {
     let params = InspireParams::secure_128_d2048();
     let db = vec![0u8; ENTRIES * CELL_RECORD_BYTES];
-    let (server_state, secret_key) =
+    let (server_state, _) =
         setup_state(&params, &db, CELL_RECORD_BYTES, InspireVariant::TwoPacking)
             .expect("setup_state");
 
@@ -184,8 +184,7 @@ fn build_live_state_and_session() -> (
         entry_size: server_state.entry_size,
     };
 
-    let mut client_session =
-        build_client_session((*live_state.crs).clone(), secret_key, &params).expect("client");
+    let mut client_session = build_client_session((*live_state.crs).clone()).expect("client");
     register_client_session(&mut client_session, &live_state).expect("register session");
     (live_state, client_session, store, params)
 }

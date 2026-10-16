@@ -48,7 +48,7 @@ async fn chain_event_propagates_to_pir_response() {
     let db = build_initial_db();
 
     // Setup outside bootstrap so the secret key survives for the client session.
-    let (state, sk) =
+    let (state, _) =
         setup_state(&params, &db, TOY_ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup");
 
     let mut state_holder = Some(state);
@@ -70,7 +70,7 @@ async fn chain_event_propagates_to_pir_response() {
     // sessions are Arc-shared across re-encode swaps so the handle stays valid post-commit
     let live_state: Arc<InspireServerState> = handle.instance.current_state();
     let crs_for_client = (*live_state.crs).clone();
-    let mut client_session = build_client_session(crs_for_client, sk, &params).expect("client");
+    let mut client_session = build_client_session(crs_for_client).expect("client");
     register_client_session(&mut client_session, live_state.as_ref()).expect("register session");
 
     // IMT requires contiguous appends; planted commitment is Fr-canonical (high byte < 0x30) for the Poseidon hash
@@ -271,7 +271,7 @@ async fn chain_event_propagates_to_pir_response_at_production_cell() {
     let db = build_initial_db_with_size(PROD_ENTRIES, PROD_ENTRY_SIZE);
 
     let started = std::time::Instant::now();
-    let (state, sk) =
+    let (state, _) =
         setup_state(&params, &db, PROD_ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup");
     eprintln!(
         "chain_event_closure prod: setup elapsed = {:?}",
@@ -296,7 +296,7 @@ async fn chain_event_propagates_to_pir_response_at_production_cell() {
 
     let live_state: Arc<InspireServerState> = handle.instance.current_state();
     let crs_for_client = (*live_state.crs).clone();
-    let mut client_session = build_client_session(crs_for_client, sk, &params).expect("client");
+    let mut client_session = build_client_session(crs_for_client).expect("client");
     register_client_session(&mut client_session, live_state.as_ref()).expect("register session");
 
     // Fr-canonical commitment (high byte < 0x30) for the IMT's Poseidon hash

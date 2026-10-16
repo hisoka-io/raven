@@ -60,7 +60,7 @@ mod tests {
         let entries = 256usize;
         let entry_size = 256usize;
         let db = raven_railgun_testkit::toy_db(entries, entry_size);
-        let (state_a, sk) =
+        let (state_a, _) =
             inspire::setup_state(&params, &db, entry_size, InspireVariant::TwoPacking)
                 .expect("setup state");
 
@@ -72,8 +72,7 @@ mod tests {
         let state_b = inspire::restore_inspire_state(&snap_loaded.data).expect("restore");
 
         let mut client_session_a =
-            inspire::build_client_session((*state_a.crs).clone(), sk.clone(), &params)
-                .expect("client session a");
+            inspire::build_client_session((*state_a.crs).clone()).expect("client session a");
         inspire::register_client_session(&mut client_session_a, &state_a).expect("register a");
         let target = 42u64;
         let (cs, q) =
@@ -84,8 +83,7 @@ mod tests {
             <inspire::RavenInspireScheme as PirScheme>::respond(&state_a, &q).expect("respond a");
 
         let mut client_session_b =
-            inspire::build_client_session((*state_b.crs).clone(), sk.clone(), &params)
-                .expect("client session b");
+            inspire::build_client_session((*state_b.crs).clone()).expect("client session b");
         inspire::register_client_session(&mut client_session_b, &state_b).expect("register b");
         let (cs_b, q_b) =
             inspire::build_seeded_query(&client_session_b, state_b.shard_config(), target, &params)

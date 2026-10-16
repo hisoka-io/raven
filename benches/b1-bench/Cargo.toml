@@ -34,8 +34,10 @@ bincode = "1.3"
 rayon = "1"
 
 # The adapter consumes the Raven-local fork at crates/inspire/.
+# `caller-secret-keys`: the bench times the per-query key build under one fixed secret.
 raven-inspire = { path = "../../crates/inspire", default-features = false, features = [
     "mod-switch-response",
+    "caller-secret-keys",
 ], optional = true }
 
 [features]

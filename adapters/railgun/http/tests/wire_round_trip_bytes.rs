@@ -313,7 +313,7 @@ async fn one_batch_round_trip_produces_the_published_wire_figure() {
     let started = Instant::now();
     let params = InspireParams::secure_128_d2048();
     let retained = PATH10_RECORD_BYTES.div_ceil(2);
-    let (state, store, secret_key) = served_block(&params);
+    let (state, store, _) = served_block(&params);
     let setup_elapsed = started.elapsed();
 
     let crs = Arc::clone(&state.crs);
@@ -339,8 +339,7 @@ async fn one_batch_round_trip_produces_the_published_wire_figure() {
         .with_instance_logical_stores(logical_stores);
     let router = inspire_router(app).expect("router");
 
-    let mut client_session =
-        build_client_session((*crs).clone(), secret_key, &params).expect("client session");
+    let mut client_session = build_client_session((*crs).clone()).expect("client session");
     let (_, unregistered) = build_seeded_query(&client_session, served.shard_config(), 0, &params)
         .expect("registration query");
     let packing_keys = unregistered

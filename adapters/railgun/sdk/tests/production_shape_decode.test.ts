@@ -79,6 +79,7 @@ const manifest = JSON.parse(
 ) as { inspire_params: { ring_dim: number }; entry_size: number; files: ManifestEntry[] };
 
 const paramsBundle = read("params_bundle.bin");
+const sessionBincode = read("session.bin");
 const crsBincode = read("crs.bin");
 const shardConfigBincode = read("shard_config.bin");
 const inspireParamsBincode = read("inspire_params.bin");
@@ -98,7 +99,7 @@ function shippedGaloisKeyCount(): bigint {
   return new DataView(crsBincode.buffer, crsBincode.byteOffset).getBigUint64(paramsEnd, true);
 }
 
-/** Session construction at ring 2048 costs seconds, so the suite builds exactly one. */
+/** The fixture's own session, restored once from `session.bin`. */
 let session: RavenInspireClientSession;
 
 function seededQueryFor(globalIdx: number): Uint8Array {
@@ -124,7 +125,7 @@ function hex(bytes: Uint8Array): string {
 
 describe("wasm decode at the served geometry: ring 2048, 512 B record, two shards", () => {
   beforeAll(() => {
-    session = wasm.build_client_session(paramsBundle, crsBincode);
+    session = wasm.deserialize_client_session!(paramsBundle, crsBincode, sessionBincode);
   });
 
   afterAll(() => {

@@ -22,6 +22,8 @@ export interface FixtureMeta {
 export interface LoadedFixture {
   meta: FixtureMeta;
   paramsBundle: Uint8Array;
+  /** The session that built the recorded queries; its secret decrypts the recorded responses. */
+  sessionBincode: Uint8Array;
   crsBincode: Uint8Array;
   shardConfigBincode: Uint8Array;
   responsesByIdx: Map<number, Uint8Array>;
@@ -30,6 +32,7 @@ export interface LoadedFixture {
 export function loadFixture(): LoadedFixture {
   const meta = JSON.parse(readFileSync(join(FIXTURES_DIR, "fixture.json"), "utf-8")) as FixtureMeta;
   const paramsBundle = new Uint8Array(readFileSync(join(FIXTURES_DIR, "params_bundle.bin")));
+  const sessionBincode = new Uint8Array(readFileSync(join(FIXTURES_DIR, "session.bin")));
   const crsBincode = new Uint8Array(readFileSync(join(FIXTURES_DIR, "crs.bin")));
   const shardConfigBincode = new Uint8Array(
     readFileSync(join(FIXTURES_DIR, "shard_config.bin")),
@@ -41,7 +44,7 @@ export function loadFixture(): LoadedFixture {
       new Uint8Array(readFileSync(join(FIXTURES_DIR, `response_for_idx_${idx}.bin`))),
     );
   }
-  return { meta, paramsBundle, crsBincode, shardConfigBincode, responsesByIdx };
+  return { meta, paramsBundle, sessionBincode, crsBincode, shardConfigBincode, responsesByIdx };
 }
 
 const recording = targetRecordingWasm(wasmPkg as unknown as RavenInspireWasm);
@@ -63,7 +66,11 @@ export function fixtureResponsesFor(
 
 export function makeClientPirContext(fixture: LoadedFixture): ClientPirContext {
   const wasm = recording.wasm;
-  const session = wasm.build_client_session(fixture.paramsBundle, fixture.crsBincode);
+  const session = wasm.deserialize_client_session!(
+    fixture.paramsBundle,
+    fixture.crsBincode,
+    fixture.sessionBincode,
+  );
   return {
     wasm,
     session,

@@ -831,20 +831,18 @@ async fn the_shipped_block_6_serves_the_lists_row_393216_by_pir() {
     assert_eq!(split_ppoi_index(ROW), (6, 0), "row 393,216 opens block 6");
 
     let params = InspireParams::secure_128_d2048();
-    let mut secret_key = None;
     let mut handle = bootstrap_railgun_engine_multi(
         opts.instances.clone(),
         params.clone(),
         |instance: &InstanceConfig| {
             let entries = opts.instance_entries[&instance.instance_id];
             let seed = vec![0u8; entries * instance.record_size];
-            let (state, key) = setup_state(
+            let (state, _) = setup_state(
                 &params,
                 &seed,
                 instance.record_size,
                 InspireVariant::TwoPacking,
             )?;
-            secret_key = Some(key);
             Ok(state)
         },
     )
@@ -890,12 +888,7 @@ async fn the_shipped_block_6_serves_the_lists_row_393216_by_pir() {
         .expect("the publish on stop");
 
     let state = block_6.instance.current_state();
-    let mut session = build_client_session(
-        (*state.crs).clone(),
-        secret_key.expect("the fresh state's key"),
-        &params,
-    )
-    .expect("client session");
+    let mut session = build_client_session((*state.crs).clone()).expect("client session");
     register_client_session(&mut session, &state).expect("register session");
     let (client_state, query) =
         build_seeded_query(&session, state.shard_config(), 0, &params).expect("query");

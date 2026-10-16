@@ -21,10 +21,12 @@ use std::path::Path;
 use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::InspireParams;
 use raven_inspire::pir::mod_switch::{mod_switch_response_checked, MOD_SWITCH_TARGET_36BIT};
-use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::setup as inspire_setup;
 use raven_inspire::ServerCrs;
-use raven_inspire_client_wasm::{build_seeded_query_rust, extract_response_rust};
+use raven_inspire_client_wasm::{
+    build_instance_params_blob, build_seeded_query_rust, extract_response_rust,
+    serialize_client_session_rust,
+};
 
 const ENTRY_BYTES: usize = 32;
 const NUM_FIXTURE_INDICES: u32 = 5;
@@ -142,17 +144,15 @@ fn main() {
     }
 
     let mut sampler = GaussianSampler::new(params.sigma);
-    let (crs, encoded_db, sk) =
+    let (crs, encoded_db, _) =
         inspire_setup(&params, &db, ENTRY_BYTES, &mut sampler).expect("setup");
 
     let inspire_params_bin = bincode::serialize(&params).expect("serialize params");
     let crs_bin = crs_wire_bytes(&crs);
     let shard_config_bin = bincode::serialize(&encoded_db.config).expect("serialize shard");
-    let sk_bin = bincode::serialize(&sk).expect("serialize sk");
 
-    // WasmInstanceParamsBundle fields are crate-private; hand-build the bincode shape.
     let params_bundle_bin =
-        bincode_three_byte_vecs(&inspire_params_bin, &shard_config_bin, &sk_bin);
+        build_instance_params_blob(&inspire_params_bin, &shard_config_bin).expect("params bundle");
 
     fs::write(out.join("inspire_params.bin"), &inspire_params_bin).expect("write params");
     fs::write(out.join("crs.bin"), &crs_bin).expect("write crs");
@@ -162,9 +162,11 @@ fn main() {
     let list_key: [u8; 32] = [0x42u8; 32];
     fs::write(out.join("list_key.bin"), list_key).expect("write list_key");
 
-    let mut sampler_session = GaussianSampler::new(params.sigma);
-    let session = raven_inspire::ClientSession::new(crs.clone(), sk.clone(), &mut sampler_session)
-        .expect("session");
+    let session = raven_inspire::ClientSession::with_fresh_secret(crs.clone()).expect("session");
+    // The wallet restores this session, never rebuilds it: the responses below decrypt
+    // only under the secret it drew.
+    let session_bin = serialize_client_session_rust(&session).expect("session residue");
+    fs::write(out.join("session.bin"), &session_bin).expect("write session");
     let cache = raven_inspire::ServerInspiringCache::new(&crs, &encoded_db).expect("cache");
     let store = raven_inspire::ServerSessionStore::new();
 
@@ -233,6 +235,7 @@ fn main() {
         "crs.bin".into(),
         "shard_config.bin".into(),
         "params_bundle.bin".into(),
+        "session.bin".into(),
         "list_key.bin".into(),
         "fixture.json".into(),
     ];
@@ -271,7 +274,6 @@ fn main() {
     fs::write(out.join("fixture_manifest.json"), manifest_json).expect("write manifest");
 
     drop(_unused_witness((crs, encoded_db)));
-    let _ = RlweSecretKey::clone(&sk);
     println!("OK: fixture written to {}", out.display());
 }
 
@@ -285,29 +287,4 @@ fn hex_encode(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
-}
-
-/// Bincode shape of the crate-private `WasmInstanceParamsBundle`: 3 `Vec<u8>`,
-/// u64 LE length prefixes, no header.
-fn bincode_three_byte_vecs(a: &[u8], b: &[u8], c: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(24 + a.len() + b.len() + c.len());
-    out.extend_from_slice(
-        &u64::try_from(a.len())
-            .expect("a.len fits u64")
-            .to_le_bytes(),
-    );
-    out.extend_from_slice(a);
-    out.extend_from_slice(
-        &u64::try_from(b.len())
-            .expect("b.len fits u64")
-            .to_le_bytes(),
-    );
-    out.extend_from_slice(b);
-    out.extend_from_slice(
-        &u64::try_from(c.len())
-            .expect("c.len fits u64")
-            .to_le_bytes(),
-    );
-    out.extend_from_slice(c);
-    out
 }

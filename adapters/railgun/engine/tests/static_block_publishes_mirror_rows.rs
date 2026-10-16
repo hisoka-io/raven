@@ -17,7 +17,6 @@ mod progress;
 use std::time::Duration;
 
 use raven_inspire::params::{InspireParams, InspireVariant};
-use raven_inspire::rlwe::RlweSecretKey;
 use raven_railgun_core::{AdapterError, InstanceId, POIStatus};
 use raven_railgun_engine::imt::Imt;
 use raven_railgun_engine::inspire::{
@@ -64,7 +63,7 @@ fn bc_for(list_index: u32) -> [u8; 32] {
     bc
 }
 
-fn fresh_state() -> (InspireServerState, RlweSecretKey) {
+fn fresh_state() -> InspireServerState {
     let seed = vec![0u8; SHARDS * EPS as usize * PATH10_RECORD_BYTES];
     setup_state(
         &InspireParams::secure_128_d2048(),
@@ -73,6 +72,7 @@ fn fresh_state() -> (InspireServerState, RlweSecretKey) {
         InspireVariant::TwoPacking,
     )
     .expect("setup")
+    .0
 }
 
 /// Boots the block over `dir`; `fresh` is `None` when the boot must recover what is there.
@@ -148,13 +148,8 @@ async fn wait_published(handle: &MultiOrchestratorHandle) -> Duration {
     started.elapsed()
 }
 
-fn assert_serves(
-    state: &InspireServerState,
-    secret_key: RlweSecretKey,
-    list_index: u32,
-    why: &str,
-) {
-    let row = decrypt_row(state, secret_key, list_index);
+fn assert_serves(state: &InspireServerState, list_index: u32, why: &str) {
+    let row = decrypt_row(state, list_index);
     assert_eq!(
         &row[PATH10_MARKER],
         PATH10_MAGIC.as_slice(),
@@ -214,10 +209,9 @@ async fn wait_applied(handle: &MultiOrchestratorHandle, rows: u32) {
     .await;
 }
 
-fn decrypt_row(state: &InspireServerState, secret_key: RlweSecretKey, list_index: u32) -> Vec<u8> {
+fn decrypt_row(state: &InspireServerState, list_index: u32) -> Vec<u8> {
     let params = InspireParams::secure_128_d2048();
-    let mut session =
-        build_client_session((*state.crs).clone(), secret_key, &params).expect("client session");
+    let mut session = build_client_session((*state.crs).clone()).expect("client session");
     register_client_session(&mut session, state).expect("register session");
     let (client_state, query) = build_seeded_query(
         &session,
@@ -241,7 +235,7 @@ fn decrypt_row(state: &InspireServerState, secret_key: RlweSecretKey, list_index
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_static_block_serves_mirrored_rows_once_the_feed_goes_quiet() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (fresh, secret_key) = fresh_state();
+    let fresh = fresh_state();
     let handle = boot(dir.path(), short_bound(), Some(fresh));
     let booted = handle.instances.first().expect("one instance");
     // Backfilling publishes by the bound alone; a caught-up block would publish each row at once.
@@ -266,7 +260,6 @@ async fn a_static_block_serves_mirrored_rows_once_the_feed_goes_quiet() {
     let waited = wait_published(&handle).await;
     assert_serves(
         &booted.instance.current_state(),
-        secret_key,
         ROWS - 1,
         &format!("the block applied it and had not published it after {waited:?}"),
     );
@@ -289,7 +282,7 @@ async fn a_static_block_serves_mirrored_rows_once_the_feed_goes_quiet() {
 async fn a_steady_feed_does_not_hold_off_the_publish() {
     let min_feed = Duration::from_secs(BOUND_SECS * 3);
     let dir = tempfile::tempdir().expect("tempdir");
-    let (fresh, secret_key) = fresh_state();
+    let fresh = fresh_state();
     let handle = boot(dir.path(), SnapshotPolicy::static_default(), Some(fresh));
     let booted = handle.instances.first().expect("one instance");
     // Backfilling publishes by the bound alone; a caught-up block would publish each row at once.
@@ -335,7 +328,6 @@ async fn a_steady_feed_does_not_hold_off_the_publish() {
     let served = served.expect("the loop exits only once a publish is seen");
     assert_serves(
         &served,
-        secret_key,
         0,
         "a commit landed during the feed and left it unserved",
     );
@@ -350,7 +342,7 @@ async fn a_steady_feed_does_not_hold_off_the_publish() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_static_block_serves_the_rows_its_wal_replayed() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (fresh, secret_key) = fresh_state();
+    let fresh = fresh_state();
     let first = boot(dir.path(), SnapshotPolicy::static_default(), Some(fresh));
     let life = first.instances.first().expect("one instance");
     // Backfilling publishes by the bound alone; a caught-up block would publish each row at once.
@@ -387,7 +379,6 @@ async fn a_restarted_static_block_serves_the_rows_its_wal_replayed() {
     let waited = wait_published(&second).await;
     assert_serves(
         &booted.instance.current_state(),
-        secret_key,
         ROWS - 1,
         &format!(
             "recovery replayed it into the store and the restarted block had not published it \
@@ -401,7 +392,7 @@ async fn a_restarted_static_block_serves_the_rows_its_wal_replayed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_static_block_takes_no_commit_while_idle() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (fresh, _secret_key) = fresh_state();
+    let fresh = fresh_state();
     let handle = boot(dir.path(), short_bound(), Some(fresh));
     let booted = handle.instances.first().expect("one instance");
     let mut upstream = Imt::new().expect("reference tree");

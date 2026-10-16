@@ -550,14 +550,9 @@ pub fn heartbeat_session_eviction(instance: &super::PirInstance<RavenInspireSche
     Ok(())
 }
 
-/// Build a [`ClientSession`] from a CRS + RLWE secret key.
-pub fn build_client_session(
-    crs: ServerCrs,
-    sk: RlweSecretKey,
-    params: &InspireParams,
-) -> Result<ClientSession> {
-    let mut sampler = GaussianSampler::new(params.sigma);
-    ClientSession::new(crs, sk, &mut sampler)
+/// Build a [`ClientSession`] under a fresh secret key: one session, one secret, one packing key.
+pub fn build_client_session(crs: ServerCrs) -> Result<ClientSession> {
+    ClientSession::with_fresh_secret(crs)
         .map_err(|e| AdapterError::Scheme(format!("client session: {e}")))
 }
 
@@ -2057,9 +2052,7 @@ mod unfilled_cell_tests {
         InspireServerState, LogicalLeafStore, RavenInspireScheme,
     };
     use crate::PirScheme;
-    use raven_inspire::math::GaussianSampler;
     use raven_inspire::params::{InspireParams, InspireVariant};
-    use raven_inspire::rlwe::RlweSecretKey;
     use std::sync::Arc;
 
     const ENTRY: usize = 32;
@@ -2079,9 +2072,7 @@ mod unfilled_cell_tests {
 
     fn decode(state: &InspireServerState, row: usize) -> Vec<u8> {
         let params = InspireParams::secure_128_d2048();
-        let mut sampler = GaussianSampler::new(params.sigma);
-        let secret = RlweSecretKey::generate(&params, &mut sampler);
-        let session = build_client_session((*state.crs).clone(), secret, &params).expect("session");
+        let session = build_client_session((*state.crs).clone()).expect("session");
         let (client_state, query) =
             build_seeded_query(&session, state.shard_config(), row as u64, &params).expect("query");
         let response = RavenInspireScheme::respond(state, &query).expect("respond");

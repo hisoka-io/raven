@@ -64,11 +64,10 @@ fn run_one_seed(cell: &CellShape, seed: u64) -> (Duration, Duration, Duration, D
     let entries = 1usize << cell.entries_log2;
     let params = InspireParams::secure_128_d2048();
     let db = build_synthetic_db(entries, cell.entry_bytes);
-    let (state, secret_key) =
-        setup_state(&params, &db, cell.entry_bytes, InspireVariant::TwoPacking)
-            .expect("setup_state");
+    let (state, _) = setup_state(&params, &db, cell.entry_bytes, InspireVariant::TwoPacking)
+        .expect("setup_state");
     let mut client: ClientSession =
-        build_client_session((*state.crs).clone(), secret_key, &params).expect("client session");
+        build_client_session((*state.crs).clone()).expect("client session");
     register_client_session(&mut client, &state).expect("register session");
     let _: ServerSessionHandle = client.session_handle().expect("session handle");
 

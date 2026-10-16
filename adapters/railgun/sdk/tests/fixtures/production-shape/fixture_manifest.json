@@ -35,8 +35,13 @@
     },
     {
       "name": "params_bundle.bin",
-      "bytes": 15533,
-      "sha256": "9308775d451adf8ffe387746ed535b05f2fc0be46b95857d61b00de93bbef2bd"
+      "bytes": 116,
+      "sha256": "1ea658bd8b419d021218de230e1a02e3bfeec653eb5f551c1b86ad4f18fbc530"
+    },
+    {
+      "name": "session.bin",
+      "bytes": 61842,
+      "sha256": "c4806dc3607129259641698deb275489c04c8f5c9419cc4ceddd5911a8bcc369"
     },
     {
       "name": "fixture.json",

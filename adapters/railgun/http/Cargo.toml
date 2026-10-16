@@ -36,6 +36,8 @@ sha2 = { workspace = true }
 subtle = { workspace = true }
 
 [dev-dependencies]
+# Tests fabricate client uploads under a fixed secret; no shipped path builds a key under one.
+raven-inspire = { workspace = true, features = ["caller-secret-keys"] }
 raven-railgun-testkit = { workspace = true }
 tower = { workspace = true }
 proptest = { workspace = true }

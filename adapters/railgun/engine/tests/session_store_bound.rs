@@ -37,7 +37,7 @@ fn capped_state() -> (
 ) {
     let params = InspireParams::secure_128_d2048();
     let db = database();
-    let (base, sk) =
+    let (base, _) =
         setup_state(&params, &db, ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup_state");
     let state = InspireServerState {
         crs: Arc::clone(&base.crs),
@@ -51,7 +51,7 @@ fn capped_state() -> (
         entry_size: base.entry_size,
     };
     let crs = (*state.crs).clone();
-    let session = build_client_session(crs, sk, &params).expect("client session");
+    let session = build_client_session(crs).expect("client session");
     (params, state, session, db)
 }
 

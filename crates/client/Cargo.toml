@@ -30,6 +30,8 @@ rand = { version = "0.8", default-features = false, features = ["getrandom"] }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+# The suites pin bytes under a fixed secret; the shipped library never builds a key under one.
+raven-inspire = { path = "../inspire", features = ["mod-switch-response", "caller-secret-keys"] }
 
 # NOT an unconditional dev-dep: proptest pulls rand 0.9 -> rand_core 0.9 -> getrandom 0.3, which
 # `compile_error!`s on wasm32-unknown-unknown without the `wasm_js` cfg. ci.yml's

@@ -25,14 +25,13 @@ fn build_toy_state(params: &InspireParams) -> InspireServerState {
     state
 }
 
-fn register_one_session(instance: &Arc<PirInstance<RavenInspireScheme>>, params: &InspireParams) {
+fn register_one_session(instance: &Arc<PirInstance<RavenInspireScheme>>) {
     let snap = instance.current_state();
     let crs_clone = (*snap.crs).clone();
     // The key is independent of state contents, so a sibling setup suffices.
     // Only the key is wanted here; building a whole state to throw it away cost a
     // full setup. Key generation is milliseconds.
-    let sk = raven_railgun_testkit::toy_secret_key(params);
-    let mut session = build_client_session(crs_clone, sk, params).expect("client session");
+    let mut session = build_client_session(crs_clone).expect("client session");
     register_client_session(&mut session, snap.as_ref()).expect("register session");
 }
 
@@ -46,7 +45,7 @@ fn admin_swap_state_clears_session_store() {
         initial_state,
     ));
 
-    register_one_session(&instance, &params);
+    register_one_session(&instance);
     let pre_swap_len = {
         let snap = instance.current_state();
         snap.session_store.len()

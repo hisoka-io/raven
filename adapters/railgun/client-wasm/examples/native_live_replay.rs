@@ -31,7 +31,6 @@ use std::path::{Path, PathBuf};
 
 use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, ShardConfig};
-use raven_inspire::rlwe::RlweSecretKey;
 use raven_inspire::{
     ClientSession, ClientState, PackingMode, SeededClientQuery, ServerCrs, ServerResponse,
     SessionResidue,
@@ -40,7 +39,6 @@ use raven_inspire_client_wasm::extract_response_rust;
 
 const WIRE_SCHEMA_PREFIX_LEN: usize = 2;
 const WIRE_SCHEMA_VERSION: u16 = 8;
-const KEY_SEED: [u8; 32] = *b"raven-native-live-replay-key-001";
 const NOISE_SEED: [u8; 32] = *b"raven-native-live-replay-noise01";
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -93,11 +91,7 @@ fn session_from(params: &InstanceParamsWire) -> (ClientSession, InspireParams, S
     let shard_config: ShardConfig =
         bincode::deserialize(&params.shard_config_bincode).expect("decode ShardConfig");
     let crs = ServerCrs::from_versioned_bytes(&params.crs_bincode).expect("decode wire CRS");
-    let mut key_sampler = GaussianSampler::from_seed(inspire_params.sigma, KEY_SEED);
-    let secret_key = RlweSecretKey::generate(&inspire_params, &mut key_sampler);
-    let mut session_sampler = GaussianSampler::from_seed(inspire_params.sigma, KEY_SEED);
-    let session =
-        ClientSession::new(crs, secret_key, &mut session_sampler).expect("build ClientSession");
+    let session = ClientSession::with_fresh_secret(crs).expect("build ClientSession");
     (session, inspire_params, shard_config)
 }
 

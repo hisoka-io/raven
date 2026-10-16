@@ -4,10 +4,8 @@
 //! cargo permits back to `raven-railgun-engine` without a cycle, and the only one that keeps
 //! fixture code out of the shipped CLI binary.
 //!
-//! The crate exists for three things: ONE definition of the toy database formula, ONE clamping
-//! and ONE zero-admitting commitment helper (they are not interchangeable - see [`canonical`]),
-//! and [`toy_secret_key`], which removes the pattern of building a whole server state and
-//! discarding it just to obtain a key.
+//! The crate exists for two things: ONE definition of the toy database formula, and ONE clamping
+//! and ONE zero-admitting commitment helper (they are not interchangeable - see [`canonical`]).
 //!
 //! It is NOT a wall-time mechanism. See [`cached_toy_state`] for why, and what was measured.
 //!
@@ -27,9 +25,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, InspireVariant};
-use raven_inspire::rlwe::RlweSecretKey;
 use raven_railgun_engine::inspire::{setup_state, InspireServerState};
 use raven_railgun_engine::session_pool::BoundedSessionStore;
 
@@ -92,18 +88,6 @@ pub fn try_toy_state(entry_size: usize) -> raven_railgun_core::Result<InspireSer
     let db = toy_db(TOY_ENTRIES, entry_size);
     let (state, _sk) = setup_state(&params, &db, entry_size, InspireVariant::TwoPacking)?;
     Ok(state)
-}
-
-/// A fresh RLWE secret key, without building a server state to throw away.
-///
-/// Three test files wanted only a key and paid a full `setup_state` for it, discarding the state
-/// into `_off_state`. Key generation is milliseconds; the state around it is seconds. The key is
-/// not bound to any particular CRS - the call sites pair it with a live instance's CRS - so
-/// generating one directly is equivalent to harvesting one from a sibling state.
-#[must_use]
-pub fn toy_secret_key(params: &InspireParams) -> RlweSecretKey {
-    let mut sampler = GaussianSampler::new(params.sigma);
-    RlweSecretKey::generate(params, &mut sampler)
 }
 
 /// The heavy, immutable half of a state, shared across every fixture at one record size.

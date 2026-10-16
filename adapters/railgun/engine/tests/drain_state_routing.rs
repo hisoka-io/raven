@@ -242,9 +242,8 @@ fn build_real_query(
     let snap = inst.current_state();
     // Only the secret key is wanted; the CRS below is the snapshot's, so packing keys derive
     // against the same CRS. This used to build a whole server state and discard it.
-    let sk = raven_railgun_testkit::toy_secret_key(&params);
     let crs_clone = (*snap.crs).clone();
-    let mut session = build_client_session(crs_clone, sk, &params).expect("client session");
+    let mut session = build_client_session(crs_clone).expect("client session");
     // Register against the same session store respond() reads (this snapshot).
     register_client_session(&mut session, snap.as_ref()).expect("register");
     let shard_config = snap.shard_config().clone();

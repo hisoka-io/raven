@@ -9,9 +9,7 @@ mod progress;
 
 use std::sync::Arc;
 
-use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, InspireVariant};
-use raven_inspire::rlwe::RlweSecretKey;
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{
     apply_wal_entry, build_client_session, build_seeded_query, extract_response, re_encode_shard,
@@ -115,9 +113,7 @@ fn decode_through(
     row: u64,
 ) -> Vec<u8> {
     let params = InspireParams::secure_128_d2048();
-    let mut sampler = GaussianSampler::new(params.sigma);
-    let secret = RlweSecretKey::generate(&params, &mut sampler);
-    let session = build_client_session(context_crs.clone(), secret, &params).expect("session");
+    let session = build_client_session(context_crs.clone()).expect("session");
     let (client_state, query) =
         build_seeded_query(&session, served.shard_config(), row, &params).expect("query");
     let response = RavenInspireScheme::respond(served, &query).expect("respond");

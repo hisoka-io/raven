@@ -60,10 +60,9 @@ struct Fixture {
 fn fixture() -> Fixture {
     let params = ring_256();
     let db = raven_railgun_testkit::toy_db(ENTRIES, ENTRY_BYTES);
-    let (state, secret) =
+    let (state, _) =
         setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("setup_state");
-    let mut client_session =
-        build_client_session((*state.crs).clone(), secret, &params).expect("client session");
+    let mut client_session = build_client_session((*state.crs).clone()).expect("client session");
     let (_, registration) = build_seeded_query(&client_session, state.shard_config(), 0, &params)
         .expect("registration query");
     let registration_body = raven_railgun_http::write_versioned(

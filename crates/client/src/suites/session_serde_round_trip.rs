@@ -52,18 +52,12 @@ fn build_test_db(params: &InspireParams) -> Vec<u8> {
 struct TestParamsBundle {
     inspire_params_bincode: Vec<u8>,
     shard_config_bincode: Vec<u8>,
-    rlwe_secret_key_bincode: Vec<u8>,
 }
 
-fn make_params_bundle(
-    params: &InspireParams,
-    shard_config: &ShardConfig,
-    sk: &raven_inspire::rlwe::RlweSecretKey,
-) -> Vec<u8> {
+fn make_params_bundle(params: &InspireParams, shard_config: &ShardConfig) -> Vec<u8> {
     let bundle = TestParamsBundle {
         inspire_params_bincode: bincode::serialize(params).expect("serialize params"),
         shard_config_bincode: bincode::serialize(shard_config).expect("serialize shard"),
-        rlwe_secret_key_bincode: bincode::serialize(sk).expect("serialize sk"),
     };
     bincode::serialize(&bundle).expect("serialize bundle")
 }
@@ -100,7 +94,7 @@ fn wasm_session_residue_round_trip_decodes() {
     let (crs, encoded_db, sk) =
         inspire_setup(&params, &database, ENTRY_BYTES, &mut sampler).expect("inspire_setup");
 
-    let bundle_bytes = make_params_bundle(&params, &encoded_db.config, &sk);
+    let bundle_bytes = make_params_bundle(&params, &encoded_db.config);
     let crs_bytes = crs.to_versioned_bytes().expect("versioned crs");
 
     let mut sampler_session = GaussianSampler::new(params.sigma);
@@ -137,10 +131,10 @@ fn wasm_session_deserialize_rejects_unversioned_crs() {
     let params = test_params();
     let database = build_test_db(&params);
     let mut sampler = GaussianSampler::new(params.sigma);
-    let (crs, encoded_db, sk) =
+    let (crs, encoded_db, _) =
         inspire_setup(&params, &database, ENTRY_BYTES, &mut sampler).expect("inspire_setup");
 
-    let bundle_bytes = make_params_bundle(&params, &encoded_db.config, &sk);
+    let bundle_bytes = make_params_bundle(&params, &encoded_db.config);
     // raw bincode, missing the current CRS magic prefix
     let unversioned_crs = bincode::serialize(&crs).expect("serialize crs");
     let session_stub = vec![0u8; 16];
@@ -160,10 +154,10 @@ fn wasm_session_deserialize_rejects_oversize_blob_with_typed_error() {
     let params = test_params();
     let database = build_test_db(&params);
     let mut sampler = GaussianSampler::new(params.sigma);
-    let (crs, encoded_db, sk) =
+    let (crs, encoded_db, _) =
         inspire_setup(&params, &database, ENTRY_BYTES, &mut sampler).expect("inspire_setup");
 
-    let bundle_bytes = make_params_bundle(&params, &encoded_db.config, &sk);
+    let bundle_bytes = make_params_bundle(&params, &encoded_db.config);
     let crs_bytes = crs.to_versioned_bytes().expect("versioned crs");
 
     let err = {
@@ -196,7 +190,6 @@ fn wasm_session_deserialize_validates_residue_crs_drift() {
     let drifted_bundle = TestParamsBundle {
         inspire_params_bincode: bincode::serialize(&drifted_params).expect("serialize params"),
         shard_config_bincode: bincode::serialize(&encoded_db.config).expect("serialize shard"),
-        rlwe_secret_key_bincode: bincode::serialize(&sk).expect("serialize sk"),
     };
     let drifted_bundle_bytes = bincode::serialize(&drifted_bundle).expect("serialize bundle");
     // the arg CRS is only magic-validated (body never decoded), so its ring_dim is irrelevant
@@ -226,7 +219,7 @@ fn warm_restore_refuses_p_drift_between_the_residue_and_live_response() {
     live_params.p = 65_539;
     let mut live_crs = crs;
     live_crs.params = live_params.clone();
-    let bundle = make_params_bundle(&live_params, &encoded_db.config, &secret_key);
+    let bundle = make_params_bundle(&live_params, &encoded_db.config);
     let crs_bytes = live_crs.to_versioned_bytes().expect("live CRS");
 
     let error = deserialize_client_session_rust(&bundle, &crs_bytes, &blob)
@@ -245,7 +238,7 @@ fn warm_restore_refuses_p_drift_in_the_live_crs_alone() {
     let session =
         ClientSession::new(crs.clone(), secret_key.clone(), &mut session_sampler).expect("session");
     let blob = serialize_client_session_rust(&session).expect("serialize residue");
-    let bundle = make_params_bundle(&params, &encoded_db.config, &secret_key);
+    let bundle = make_params_bundle(&params, &encoded_db.config);
 
     let mut live_crs = crs;
     live_crs.params.p = 65_539;

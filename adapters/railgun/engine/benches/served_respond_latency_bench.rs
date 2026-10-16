@@ -300,15 +300,14 @@ fn fixture(rows: usize, register: bool) -> Fixture {
     let params = InspireParams::secure_128_d2048();
     let db = synthetic_db(rows);
     let started = Instant::now();
-    let (state, sk) =
+    let (state, _) =
         setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("setup_state");
     assert_eq!(
         state.shard_config().entries_per_shard(),
         ROWS_PER_SHARD,
         "not the deployed cell"
     );
-    let mut client =
-        build_client_session((*state.crs).clone(), sk, &params).expect("client session");
+    let mut client = build_client_session((*state.crs).clone()).expect("client session");
     if register {
         register_client_session(&mut client, &state).expect("register session");
     }

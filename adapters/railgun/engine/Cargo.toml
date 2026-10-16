@@ -31,6 +31,8 @@ metrics = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+# Tests fabricate client uploads under a fixed secret; no shipped path builds a key under one.
+raven-inspire = { workspace = true, features = ["caller-secret-keys"] }
 raven-railgun-testkit = { workspace = true }
 tempfile = "3"
 rayon = { workspace = true }

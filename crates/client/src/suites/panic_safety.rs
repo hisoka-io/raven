@@ -58,7 +58,6 @@ fn build_test_db(params: &InspireParams) -> Vec<u8> {
 struct ParamsBundleMirror {
     inspire_params_bincode: Vec<u8>,
     shard_config_bincode: Vec<u8>,
-    rlwe_secret_key_bincode: Vec<u8>,
 }
 
 fn valid_bundle_bytes() -> &'static [u8] {
@@ -68,7 +67,6 @@ fn valid_bundle_bytes() -> &'static [u8] {
         bincode::serialize(&ParamsBundleMirror {
             inspire_params_bincode: params,
             shard_config_bincode: Vec::new(),
-            rlwe_secret_key_bincode: Vec::new(),
         })
         .expect("bundle")
     })

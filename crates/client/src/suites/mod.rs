@@ -2,6 +2,7 @@
 
 mod client_entropy_kat;
 mod crs_binding;
+mod one_secret_one_key;
 mod packing_key_upload_kat;
 mod panic_safety;
 mod parity_native_vs_wasm;

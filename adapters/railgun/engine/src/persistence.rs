@@ -4441,7 +4441,7 @@ mod tests {
         use crate::{InstanceRole, PirInstance};
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let (state, secret_key) = build_small_cache_state_with_key().expect("state");
+        let (state, _) = build_small_cache_state_with_key().expect("state");
         let params = small_params();
         let encoder = small_cache_encoder();
         let opened = InspirePersistence::open(
@@ -4465,12 +4465,9 @@ mod tests {
             state,
         ));
         let registered_state = instance.current_state();
-        let mut client = super::super::inspire::build_client_session(
-            (*registered_state.crs).clone(),
-            secret_key,
-            &params,
-        )
-        .expect("client");
+        let mut client =
+            super::super::inspire::build_client_session((*registered_state.crs).clone())
+                .expect("client");
         super::super::inspire::register_client_session(&mut client, registered_state.as_ref())
             .expect("register session");
 

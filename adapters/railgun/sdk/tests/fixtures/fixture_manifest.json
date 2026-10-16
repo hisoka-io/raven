@@ -35,8 +35,13 @@
     },
     {
       "name": "params_bundle.bin",
-      "bytes": 15533,
-      "sha256": "27a1a966f10b784f37904a3689114c498d753cc0baff02dec02a662d776fe081"
+      "bytes": 116,
+      "sha256": "fe1f02ac577a77d277c5766eb20f1866ecaba638d9cf1df25e88c403ad80a0e8"
+    },
+    {
+      "name": "session.bin",
+      "bytes": 61842,
+      "sha256": "d2004376119960fe4a16e78d7247afe493d17696721bcc66be67e34c7ca7efb2"
     },
     {
       "name": "list_key.bin",

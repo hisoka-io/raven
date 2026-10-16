@@ -53,10 +53,9 @@ fn build_ready_instance(params: &InspireParams, instance_idx: usize) -> ReadyIns
     let entries = 1usize << ENTRIES_LOG2;
     let salt = u8::try_from(instance_idx).unwrap_or(0).saturating_add(1);
     let db = build_synthetic_db(entries, ENTRY_BYTES, salt);
-    let (server_state, secret_key) =
+    let (server_state, _) =
         setup_state(params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("setup_state");
-    let mut client = build_client_session((*server_state.crs).clone(), secret_key, params)
-        .expect("client_session");
+    let mut client = build_client_session((*server_state.crs).clone()).expect("client_session");
     register_client_session(&mut client, &server_state).expect("register session");
     let _: ServerSessionHandle = client.session_handle().expect("session handle");
     ReadyInstance {

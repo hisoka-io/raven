@@ -32,10 +32,10 @@ fn fixture() -> (
 ) {
     let params = InspireParams::secure_128_d2048();
     let db = database();
-    let (state, sk) =
+    let (state, _) =
         setup_state(&params, &db, ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup_state");
     let crs = (*state.crs).clone();
-    let mut session = build_client_session(crs, sk, &params).expect("client session");
+    let mut session = build_client_session(crs).expect("client session");
     register_client_session(&mut session, &state).expect("register session");
     (params, state, session, db)
 }

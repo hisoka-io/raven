@@ -37,12 +37,11 @@ fn reopening_one_data_dir_never_reissues_a_stale_handle() {
     let database: Vec<u8> = (0..params.ring_dim * ENTRY_SIZE)
         .map(|offset| u8::try_from(offset % 251).expect("mod 251"))
         .collect();
-    let (state, secret_key) =
+    let (state, _) =
         setup_state(&params, &database, ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup");
     // The store issues the handle, so one client registered on both sides of the restart is
     // enough to show the restart never reissues.
-    let mut client =
-        build_client_session((*state.crs).clone(), secret_key, &params).expect("client");
+    let mut client = build_client_session((*state.crs).clone()).expect("client");
 
     let first = BoundedSessionStore::open_with_limits(dir.path(), limits()).expect("first open");
     let stale = first
@@ -239,14 +238,13 @@ async fn production_single_boot_opens_the_durable_allocator_and_refuses_corrupti
     let database: Vec<u8> = (0..params.ring_dim * 256)
         .map(|offset| u8::try_from(offset % 251).expect("mod 251"))
         .collect();
-    let (fresh_state, secret_key) =
+    let (fresh_state, _) =
         setup_state(&params, &database, 256, InspireVariant::TwoPacking).expect("single setup");
     let mut handle = bootstrap_railgun_engine(config, params.clone(), || Ok(fresh_state))
         .expect("single production bootstrap");
     assert_eq!(read_floor(&dir.path().join(FLOOR_FILE)), 2048);
     let state = handle.instance.current_state();
-    let mut client =
-        build_client_session((*state.crs).clone(), secret_key, &params).expect("single client");
+    let mut client = build_client_session((*state.crs).clone()).expect("single client");
     let external = state
         .session_store
         .register_client_session_at(&mut client, std::time::Instant::now())
@@ -331,7 +329,7 @@ async fn production_multi_boot_opens_each_data_dir_allocator() {
     config.use_flock = false;
     let params = InspireParams::secure_128_d2048();
     let database = vec![0u8; params.ring_dim * 512];
-    let (fresh_state, secret_key) =
+    let (fresh_state, _) =
         setup_state(&params, &database, 512, InspireVariant::TwoPacking).expect("multi setup");
     let mut fresh_state = Some(fresh_state);
     let handle = bootstrap_railgun_engine_multi(vec![config], params.clone(), |_| {
@@ -347,8 +345,7 @@ async fn production_multi_boot_opens_each_data_dir_allocator() {
         .expect("one multi instance")
         .instance
         .current_state();
-    let mut client =
-        build_client_session((*state.crs).clone(), secret_key, &params).expect("multi client");
+    let mut client = build_client_session((*state.crs).clone()).expect("multi client");
     let external = state
         .session_store
         .register_client_session_at(&mut client, std::time::Instant::now())
@@ -433,10 +430,9 @@ fn run_child(data_dir: &std::path::Path, output: &std::path::Path) {
 fn write_one_child_handle(data_dir: &std::path::Path, output: &std::path::Path) {
     let params = InspireParams::secure_128_d2048();
     let database = vec![0u8; params.ring_dim * ENTRY_SIZE];
-    let (state, secret_key) =
+    let (state, _) =
         setup_state(&params, &database, ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup");
-    let mut client =
-        build_client_session((*state.crs).clone(), secret_key, &params).expect("client session");
+    let mut client = build_client_session((*state.crs).clone()).expect("client session");
     let store = BoundedSessionStore::open_with_limits(data_dir, limits()).expect("durable open");
     let handle = store
         .register_client_session_at(&mut client, std::time::Instant::now())

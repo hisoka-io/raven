@@ -28,17 +28,12 @@ fn build_toy_state(params: &InspireParams) -> InspireServerState {
 
 /// The store issues a fresh handle per registration, so one client registered `count` times
 /// fills `count` entries without paying `count` client builds.
-fn register_sessions(
-    instance: &Arc<PirInstance<RavenInspireScheme>>,
-    params: &InspireParams,
-    count: usize,
-) {
+fn register_sessions(instance: &Arc<PirInstance<RavenInspireScheme>>, count: usize) {
     let snap = instance.current_state();
     let crs_clone = (*snap.crs).clone();
     // Only the key is wanted here; building a whole state to throw it away cost a
     // full setup. Key generation is milliseconds.
-    let sk = raven_railgun_testkit::toy_secret_key(params);
-    let mut session = build_client_session(crs_clone, sk, params).expect("client session");
+    let mut session = build_client_session(crs_clone).expect("client session");
     for _ in 0..count {
         register_client_session(&mut session, snap.as_ref()).expect("register session");
     }
@@ -54,7 +49,7 @@ fn heartbeat_swap_state_drops_inner_session_store() {
         initial_state,
     ));
 
-    register_sessions(&instance, &params, 3);
+    register_sessions(&instance, 3);
     let (pre_len, donor_store_ptr): (usize, *const BoundedSessionStore) = {
         let snap = instance.current_state();
         (snap.session_store.len(), Arc::as_ptr(&snap.session_store))

@@ -23,8 +23,8 @@ fn below_floor() -> InspireParams {
 fn session_at(params: &InspireParams) -> (ClientSession, ShardConfig) {
     let db = vec![7u8; params.ring_dim * ENTRY_BYTES];
     let mut sampler = GaussianSampler::new(params.sigma);
-    let (crs, encoded, sk) = inspire_setup(params, &db, ENTRY_BYTES, &mut sampler).expect("setup");
-    let session = ClientSession::new(crs, sk, &mut sampler).expect("session");
+    let (crs, encoded, _) = inspire_setup(params, &db, ENTRY_BYTES, &mut sampler).expect("setup");
+    let session = ClientSession::with_fresh_secret(crs).expect("session");
     (session, encoded.config)
 }
 
@@ -43,8 +43,7 @@ fn a_query_under_a_sub_floor_session_is_refused() {
 #[test]
 fn a_cached_session_under_sub_floor_params_is_refused_before_it_is_read() {
     let params_bin = bincode::serialize(&below_floor()).expect("params");
-    let bundle =
-        bincode::serialize(&(params_bin, Vec::<u8>::new(), Vec::<u8>::new())).expect("bundle");
+    let bundle = bincode::serialize(&(params_bin, Vec::<u8>::new())).expect("bundle");
     let refusal = deserialize_client_session_rust(&bundle, &[], &[]).expect_err("refused");
     assert!(
         refusal.contains(&format!(

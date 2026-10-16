@@ -9,7 +9,7 @@ use raven_railgun_engine::inspire::{
     setup_state, RavenInspireScheme, WIRE_RESPONSE_MODULUS,
 };
 use raven_railgun_engine::PirScheme;
-use raven_railgun_testkit::{cached_toy_state, toy_db, toy_secret_key, TOY_ENTRIES};
+use raven_railgun_testkit::{cached_toy_state, toy_db, TOY_ENTRIES};
 
 /// The served record: ten Merkle levels plus the leaf, 256 InspiRING columns.
 const ENTRY_BYTES: usize = 512;
@@ -29,8 +29,7 @@ fn served_response(
 ) {
     let state = cached_toy_state(entry_bytes);
     let params = state.crs.params.clone();
-    let mut session = build_client_session((*state.crs).clone(), toy_secret_key(&params), &params)
-        .expect("client session");
+    let mut session = build_client_session((*state.crs).clone()).expect("client session");
     register_client_session(&mut session, &state).expect("register session");
     let (client_state, query) =
         build_seeded_query(&session, state.shard_config(), TARGET_INDEX, &params)
