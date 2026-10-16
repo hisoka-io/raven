@@ -38,6 +38,7 @@ import sys
 ROOT = "Cargo.toml"
 RAILGUN = "adapters/railgun/Cargo.toml"
 CLIENT_WASM = "adapters/railgun/client-wasm/Cargo.toml"
+HOWL_CLIENT = "adapters/howl-node/client-wasm/Cargo.toml"
 
 # output key -> (workspaces it builds, extra paths). Which job reads which key lives in ci.yml;
 # scripts/ci-changes-selftest.sh holds the two together.
@@ -50,13 +51,15 @@ KEYS = {
     "lane_counts": ([], [".config/nextest.toml", "adapters/railgun/.config/**"]),
     "inspire": (["crates/inspire/Cargo.toml"], []),
     "eth_state": (["adapters/eth-state/Cargo.toml"], []),
+    # the submodule's gitlink: its crates are path dependencies, but a bump changes only that path
+    "howl": (["adapters/howl-node/Cargo.toml", HOWL_CLIENT], ["adapters/howl"]),
     "b1_bench": (["benches/b1-bench/Cargo.toml"], []),
     # tests/tracked_baseline.rs reads the committed baselines
     "bench_compare": (["tools/bench-compare/Cargo.toml"], ["benches/baselines/**"]),
     "bench_gate": (["benches/b1-bench/Cargo.toml", "tools/bench-compare/Cargo.toml"], ["benches/baselines/**"]),
     # the adapter manifest for the four railgun crates the 1.89 job checks by name
-    "msrv_1_89": ([ROOT, CLIENT_WASM, "benches/b1-bench/Cargo.toml", "crates/inspire/Cargo.toml",
-                   "tools/bench-compare/Cargo.toml", RAILGUN], []),
+    "msrv_1_89": ([ROOT, CLIENT_WASM, "adapters/howl-node/Cargo.toml", HOWL_CLIENT, "benches/b1-bench/Cargo.toml",
+                   "crates/inspire/Cargo.toml", "tools/bench-compare/Cargo.toml", RAILGUN], ["adapters/howl"]),
     "msrv_1_91": (["adapters/eth-state/Cargo.toml", RAILGUN], []),
     # the SDK gates read Rust constants and scripts from across the adapter
     "sdk": ([CLIENT_WASM, RAILGUN], ["adapters/railgun/**"]),
@@ -67,9 +70,8 @@ ALL = [".github/**", "scripts/**", "rust-toolchain.toml", "**/rust-toolchain.tom
        ".cargo/**", "**/.cargo/**", ".gitmodules"]
 
 # Read by no filtered job. Markdown is included by no Rust source (the selftest checks), except
-# the SDK README, which ships in its package. No workspace here depends on Howl; its gates belong
-# to its own repository.
-NO_JOB = ["LICENSE", ".gitignore", ".dockerignore", ".gitleaks.toml", "deny.toml", "adapters/howl"]
+# the SDK README, which ships in its package.
+NO_JOB = ["LICENSE", ".gitignore", ".dockerignore", ".gitleaks.toml", "deny.toml"]
 NO_JOB_MD_EXCEPT = ["adapters/railgun/sdk/**"]
 
 # Subtrees of a detached workspace directory that its cargo build never reads. The SDK fixtures

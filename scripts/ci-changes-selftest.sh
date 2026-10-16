@@ -55,10 +55,11 @@ expect "the client wasm" wasm,msrv_1_89,sdk adapters/railgun/client-wasm/src/lib
 expect "one detached workspace" bench_compare,bench_gate,msrv_1_89 tools/bench-compare/src/main.rs
 expect "the committed bench baselines" bench_compare,bench_gate benches/baselines/b1-two-packing-cell-2e16x512.json
 expect "the eth-state submodule" eth_state,msrv_1_91 adapters/eth-state
-expect "the inspire submodule" root,docs,wasm,railgun,inspire,eth_state,b1_bench,bench_gate,msrv_1_89,msrv_1_91,sdk crates/inspire
-expect "a framework crate" root,docs,wasm,railgun,eth_state,msrv_1_89,msrv_1_91,sdk crates/core/src/lib.rs
+expect "the inspire submodule" root,docs,wasm,railgun,inspire,eth_state,howl,b1_bench,bench_gate,msrv_1_89,msrv_1_91,sdk crates/inspire
+expect "a framework crate" root,docs,wasm,railgun,eth_state,howl,msrv_1_89,msrv_1_91,sdk crates/core/src/lib.rs
 expect "the root lockfile" root,docs,wasm,msrv_1_89 Cargo.lock
-expect "the howl submodule, which no workspace depends on" NONE adapters/howl
+expect "the howl submodule, whose crates the node builds" howl,msrv_1_89 adapters/howl
+expect "the howl node" howl,msrv_1_89 adapters/howl-node/store/src/lib.rs
 expect "the workflow" ALL .github/workflows/ci.yml
 expect "the lane pins" ALL .github/expected-lane-counts.tsv
 expect "a gate script" ALL scripts/assert-lane-counts.sh

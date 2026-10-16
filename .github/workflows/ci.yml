@@ -44,6 +44,7 @@ jobs:
       lane_counts: ${{ steps.select.outputs.lane_counts }}
       inspire: ${{ steps.select.outputs.inspire }}
       eth_state: ${{ steps.select.outputs.eth_state }}
+      howl: ${{ steps.select.outputs.howl }}
       b1_bench: ${{ steps.select.outputs.b1_bench }}
       bench_compare: ${{ steps.select.outputs.bench_compare }}
       bench_gate: ${{ steps.select.outputs.bench_gate }}
@@ -261,6 +262,8 @@ jobs:
             adapters/railgun/Cargo.toml \
             adapters/railgun/client-wasm/Cargo.toml \
             adapters/eth-state/Cargo.toml \
+            adapters/howl-node/Cargo.toml \
+            adapters/howl-node/client-wasm/Cargo.toml \
             crates/inspire/Cargo.toml \
             benches/b1-bench/Cargo.toml \
             tools/bench-compare/Cargo.toml
@@ -972,6 +975,88 @@ jobs:
         # enough under the dev profile to read as a hang
         run: cargo test --manifest-path adapters/eth-state/Cargo.toml --profile ci-test
 
+  howl-node:
+    # The store is built on this checkout's crates; the pure Howl crates come from the
+    # adapters/howl submodule, whose own CI gates them.
+    name: Howl node (detached workspace)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.howl != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --manifest-path adapters/howl-node/Cargo.toml -p howl-node -p howl-store -p howl-wire -- --check
+      - name: cargo clippy
+        run: cargo clippy --manifest-path adapters/howl-node/Cargo.toml --all-targets --locked -- -D warnings
+      - name: cargo test
+        run: cargo test --manifest-path adapters/howl-node/Cargo.toml --all-targets --locked
+      - name: cargo test --doc
+        run: cargo test --manifest-path adapters/howl-node/Cargo.toml --doc --locked
+
+  howl-client:
+    # The wallet's side: the wasm client against a node driven in-process, then the TypeScript
+    # package against the answers the node served and a node binary following a local chain.
+    name: Howl client (wasm + TypeScript)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.howl != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: adapters/howl-node/sdk/pnpm-lock.yaml
+      # anvil, for the suite that runs the node binary against a local chain
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: cargo fmt
+        run: cargo fmt --manifest-path adapters/howl-node/client-wasm/Cargo.toml -- --check
+      - name: cargo clippy
+        run: cargo clippy --manifest-path adapters/howl-node/client-wasm/Cargo.toml --all-targets --locked -- -D warnings
+      - name: cargo clippy (wasm32)
+        run: cargo clippy --manifest-path adapters/howl-node/client-wasm/Cargo.toml --lib --target wasm32-unknown-unknown --locked -- -D warnings
+      - name: cargo test
+        run: cargo test --manifest-path adapters/howl-node/client-wasm/Cargo.toml --locked
+      - name: install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: build wasm-pack pkg-node
+        working-directory: adapters/howl-node/client-wasm
+        run: wasm-pack build --release --target nodejs --scope hisoka-io --out-dir pkg-node --out-name howl_client_wasm
+      - name: build the node binary
+        run: cargo build --release --manifest-path adapters/howl-node/Cargo.toml -p howl-node --locked
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+        working-directory: adapters/howl-node/sdk
+      - name: pnpm typecheck
+        run: pnpm typecheck
+        working-directory: adapters/howl-node/sdk
+      # The suite with the node binary, held to tests/EXPECTED_COUNTS.json: a live suite that
+      # skips fails here. The cross-check against Howl's own wallet code needs a Howl checkout
+      # and runs locally; its output is pinned in tests/fixtures/howl-vectors.json, checked here.
+      - name: pnpm test (counts held)
+        env:
+          HOWL_NODE_BIN: ${{ github.workspace }}/adapters/howl-node/target/release/howl-node
+        run: node scripts/check-test-count.mjs
+        working-directory: adapters/howl-node/sdk
+
   b1-bench:
     name: b1-bench (detached workspace)
     needs: changes
@@ -1030,8 +1115,8 @@ jobs:
       RUSTUP_TOOLCHAIN: "1.89"
       # 1.89 predates rust-lld as rustc's x86_64-linux default, so this job names lld itself
       RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=lld"
-      MSRV_MANIFESTS: "Cargo.toml|adapters/railgun/client-wasm/Cargo.toml|benches/b1-bench/Cargo.toml|crates/inspire/Cargo.toml|tools/bench-compare/Cargo.toml"
-      MSRV_PACKAGES: "bench-compare,raven-b1-bench,raven-bench,raven-client,raven-core,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage"
+      MSRV_MANIFESTS: "Cargo.toml|adapters/howl-node/Cargo.toml|adapters/howl-node/client-wasm/Cargo.toml|adapters/railgun/client-wasm/Cargo.toml|benches/b1-bench/Cargo.toml|crates/inspire/Cargo.toml|tools/bench-compare/Cargo.toml"
+      MSRV_PACKAGES: "bench-compare,howl-client-wasm,howl-node,howl-store,howl-wire,raven-b1-bench,raven-bench,raven-client,raven-core,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage"
       MSRV_EXTRA_PACKAGES: "raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror"
     steps:
       - uses: actions/checkout@v4

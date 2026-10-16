@@ -1,0 +1,20 @@
+[package]
+name = "howl-wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The Howl node's wire: answer header, route bodies, batch ladder, and the tree arithmetic a wallet folds paths with."
+
+[lints]
+workspace = true
+
+[dependencies]
+howl-poseidon2 = { workspace = true }
+ark-bn254 = { workspace = true }
+ark-ff = { workspace = true }
+thiserror = { workspace = true }
+

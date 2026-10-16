@@ -13,6 +13,7 @@ exclude = [
     "crates/inspire",
     "adapters/railgun",
     "adapters/howl",
+    "adapters/howl-node",
     "adapters/railgun/client-wasm",
     "benches/b1-bench",
     "tools/bench-compare",

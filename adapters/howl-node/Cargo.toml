@@ -1,0 +1,58 @@
+# Standalone workspace for the Howl node, detached from the raven root so the Howl crates'
+# dependency graph never widens the framework's. The pure Howl crates (record, Poseidon2,
+# indexer, prefix feed) come from the `adapters/howl` submodule; what is built on Raven's own
+# crates lives here.
+[workspace]
+resolver = "2"
+members = ["node", "store", "wire"]
+
+[workspace.package]
+version = "0.1.0-alpha.0"
+edition = "2021"
+rust-version = "1.89"
+authors = ["The Raven Authors"]
+license = "Apache-2.0"
+repository = "https://github.com/hisoka-io/raven"
+publish = false
+
+[workspace.dependencies]
+howl-indexer = { path = "../howl/indexer" }
+howl-poseidon2 = { path = "../howl/poseidon2" }
+howl-prefix-feed = { path = "../howl/prefix-feed" }
+howl-record = { path = "../howl/record" }
+raven-storage = { path = "../../crates/storage" }
+raven-inspire = { path = "../../crates/inspire" }
+ark-bn254 = "0.5"
+ark-ff = "0.5"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+sha2 = { version = "0.10", default-features = false }
+tempfile = "3"
+arc-swap = "1"
+axum = "0.7"
+rand_chacha = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "signal", "time"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+http-body-util = "0.1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+
+# Hashing, field arithmetic and the PIR engine under test are impractical at opt-level 0.
+[profile.dev.package."*"]
+opt-level = 2

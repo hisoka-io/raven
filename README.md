@@ -59,10 +59,10 @@ cargo test --manifest-path adapters/railgun/Cargo.toml --profile ci-test
 ```
 
 `--workspace` covers the root members only. `crates/inspire`, `adapters/railgun`,
-`adapters/railgun/client-wasm`, `adapters/howl`, `adapters/eth-state`, `benches/b1-bench` and
-`tools/bench-compare` are outside the root workspace; build each with its own `--manifest-path`.
-The wasm target applies to the client path, not to server crates. The adapter's PIR tests need
-the `ci-test` profile; a debug build is too slow for them.
+`adapters/railgun/client-wasm`, `adapters/howl`, `adapters/howl-node`, `adapters/eth-state`,
+`benches/b1-bench` and `tools/bench-compare` are outside the root workspace; build each with its
+own `--manifest-path`. The wasm target applies to the client path, not to server crates. The
+adapter's PIR tests need the `ci-test` profile; a debug build is too slow for them.
 
 ## Contributing
 

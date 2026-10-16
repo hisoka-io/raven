@@ -969,22 +969,58 @@ impl BoundedSessionStore {
             Some(entry) if entry.expires_at > now => {
                 Ok((Arc::clone(&generation.store), Some(entry.inner)))
             }
-            Some(_) => Err(SessionStoreError::HandleRejected {
-                detail: format!(
-                    "session handle {} expired (ttl {}s); re-run the session handshake",
-                    handle.0,
-                    self.limits.ttl.as_secs()
-                ),
-            }),
-            None => Err(SessionStoreError::HandleRejected {
-                detail: format!(
-                    "session handle {} is not registered on this instance ({} serviceable, {} evicted since start); re-run the session handshake",
-                    handle.0,
-                    generation.expiry.len(),
-                    self.evicted_total()
-                ),
-            }),
+            entry => Err(self.rejected(handle, entry.is_some(), &generation)),
         }
+    }
+
+    /// [`Self::resolve`] for a handle in use: a serviceable handle's expiry moves to
+    /// `now + ttl`, so a session stays registered while it is used and lapses one TTL after
+    /// its last use.
+    ///
+    /// # Errors
+    ///
+    /// The handle is expired or unknown, or the renewed expiry overflows `Instant`.
+    pub fn resolve_renewing(
+        &self,
+        handle: ServerSessionHandle,
+        now: Instant,
+    ) -> Result<(Arc<ServerSessionStore>, ServerSessionHandle)> {
+        let renewed = self.expiry_at(now)?;
+        let mut generation = self.current.write();
+        let store = Arc::clone(&generation.store);
+        match generation.expiry.get_mut(&handle.0) {
+            Some(entry) if entry.expires_at > now => {
+                entry.expires_at = entry.expires_at.max(renewed);
+                Ok((store, entry.inner))
+            }
+            entry => {
+                let expired = entry.is_some();
+                Err(self.rejected(handle, expired, &generation))
+            }
+        }
+    }
+
+    fn rejected(
+        &self,
+        handle: ServerSessionHandle,
+        expired: bool,
+        generation: &Generation,
+    ) -> SessionStoreError {
+        let detail = if expired {
+            format!(
+                "session handle {} expired (ttl {}s); re-run the session handshake",
+                handle.0,
+                self.limits.ttl.as_secs()
+            )
+        } else {
+            format!(
+                "session handle {} is not registered on this instance ({} serviceable, {} evicted since start); re-run the session handshake",
+                handle.0,
+                generation.expiry.len(),
+                self.evicted_total()
+            )
+        };
+        SessionStoreError::HandleRejected { detail }
     }
 
     /// Stop serving an external handle and release its inner packing keys.
@@ -1353,6 +1389,40 @@ mod tests {
         assert!(warnings.is_empty());
         assert_eq!(observation.evictions.expired, 1);
         assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn use_renews_a_session_and_idleness_still_expires_it() {
+        let store = BoundedSessionStore::with_limits(SessionStoreLimits {
+            max_sessions: 64,
+            ttl: Duration::from_secs(10),
+        });
+        let start = Instant::now();
+        let handle = register(&store, start).0;
+        let (_, inner) = store
+            .resolve_renewing(handle, start + Duration::from_secs(9))
+            .expect("live");
+        assert!(store
+            .resolve(Some(handle), start + Duration::from_secs(18))
+            .is_ok());
+        assert_eq!(
+            store
+                .resolve(Some(handle), start + Duration::from_secs(18))
+                .expect("live")
+                .1,
+            Some(inner)
+        );
+        assert!(store
+            .resolve(Some(handle), start + Duration::from_secs(19))
+            .is_err());
+        let late = store
+            .resolve_renewing(handle, start + Duration::from_secs(19))
+            .expect_err("an expired handle is not revived");
+        assert!(late.to_string().contains("expired"));
+        let unknown = store
+            .resolve_renewing(ServerSessionHandle(1u64 << 40), start)
+            .expect_err("unknown");
+        assert!(unknown.to_string().contains("not registered"));
     }
 
     #[test]

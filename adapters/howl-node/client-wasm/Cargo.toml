@@ -1,0 +1,75 @@
+# Own workspace: the wasm release profile below is tuned for size and must not reach the node binary.
+[workspace]
+
+[package]
+name = "howl-client-wasm"
+version = "0.1.0-alpha.0"
+edition = "2021"
+rust-version = "1.89"
+authors = ["The Raven Authors"]
+license = "Apache-2.0"
+repository = "https://github.com/hisoka-io/raven"
+publish = false
+description = "WebAssembly client for a Howl node: answer decoding, private cell reads under a fresh session key, and Merkle paths at a chosen leaf count."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+unreachable_pub = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+[dependencies]
+howl-wire = { path = "../wire" }
+raven-client = { path = "../../../crates/client" }
+raven-inspire = { path = "../../../crates/inspire", features = ["mod-switch-response"] }
+bincode = "1"
+rand = { version = "0.8", default-features = false, features = ["getrandom"] }
+wasm-bindgen = "0.2"
+
+# The integration tests drive a node in-process through its router, with the node's own test
+# support mounted by path; none of it is built for wasm32.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+howl-indexer = { path = "../../howl/indexer" }
+howl-node = { path = "../node" }
+howl-poseidon2 = { path = "../../howl/poseidon2" }
+howl-prefix-feed = { path = "../../howl/prefix-feed" }
+raven-inspire-session = { path = "../../../crates/inspire-session" }
+ark-bn254 = "0.5"
+ark-ff = "0.5"
+axum = "0.7"
+http-body-util = "0.1"
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+opt-level = 3
+panic = "unwind"
+
+# Field arithmetic and the lattice code are impractical at opt-level 0 in tests.
+[profile.dev.package."*"]
+opt-level = 2
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
+
+[package.metadata.wasm-pack.profile.dev]
+wasm-opt = false

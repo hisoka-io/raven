@@ -1,0 +1,50 @@
+[package]
+name = "howl-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Serves Howl wallets: follows the pool on chain, keeps the discovery table, and answers the tag-prefix feed, tree reads and private cell reads."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "howl-node"
+path = "src/main.rs"
+
+[dependencies]
+howl-indexer = { workspace = true }
+howl-prefix-feed = { workspace = true }
+howl-record = { workspace = true }
+howl-store = { path = "../store" }
+howl-wire = { path = "../wire" }
+raven-inspire = { workspace = true, features = ["parallel", "mod-switch-response", "simd-packing-offline"] }
+raven-inspire-session = { path = "../../../crates/inspire-session" }
+arc-swap = { workspace = true }
+axum = { workspace = true }
+bincode = { workspace = true }
+rand_chacha = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# the pinned-bytes suite builds a key under a fixed secret
+raven-inspire = { workspace = true, features = ["caller-secret-keys"] }
+howl-poseidon2 = { workspace = true }
+ark-bn254 = { workspace = true }
+ark-ff = { workspace = true }
+sha2 = { workspace = true }
+sha3 = { version = "0.10", default-features = false }
+tempfile = { workspace = true }
+tower = { workspace = true }
+http-body-util = { workspace = true }

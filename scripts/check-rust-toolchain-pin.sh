@@ -10,14 +10,15 @@ PINNED_DOCKER_TAG="1.98.0-slim-bookworm"
 # Gates parse nextest's text output, which is not a stable interface: 0.9.146 changed a
 # show-config line and failed a healthy tree. Move this only with those gates re-proven.
 PINNED_NEXTEST="0.9.129"
-MSRV_189_MANIFESTS='Cargo.toml|adapters/railgun/client-wasm/Cargo.toml|benches/b1-bench/Cargo.toml|crates/inspire/Cargo.toml|tools/bench-compare/Cargo.toml'
-MSRV_189_PACKAGES='bench-compare,raven-b1-bench,raven-bench,raven-client,raven-core,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage'
+MSRV_189_MANIFESTS='Cargo.toml|adapters/howl-node/Cargo.toml|adapters/howl-node/client-wasm/Cargo.toml|adapters/railgun/client-wasm/Cargo.toml|benches/b1-bench/Cargo.toml|crates/inspire/Cargo.toml|tools/bench-compare/Cargo.toml'
+MSRV_189_PACKAGES='bench-compare,howl-client-wasm,howl-node,howl-store,howl-wire,raven-b1-bench,raven-bench,raven-client,raven-core,raven-inspire,raven-inspire-cache,raven-inspire-client-wasm,raven-inspire-session,raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-server,raven-storage'
 MSRV_189_EXTRA_PACKAGES='raven-railgun-core,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror'
 MSRV_189_OVERRIDE_MANIFESTS='adapters/railgun/core/Cargo.toml|adapters/railgun/persistence/Cargo.toml|adapters/railgun/poseidon/Cargo.toml|adapters/railgun/ppoi-mirror/Cargo.toml'
 MSRV_191_MANIFESTS='adapters/eth-state/Cargo.toml|adapters/railgun/Cargo.toml'
 MSRV_191_PACKAGES='eth-state,raven-railgun-cli,raven-railgun-core,raven-railgun-engine,raven-railgun-http,raven-railgun-indexer,raven-railgun-persistence,raven-railgun-poseidon,raven-railgun-ppoi-mirror,raven-railgun-ppoi-replay,raven-railgun-testkit'
-# Submodules no Raven workspace depends on: their toolchain files, manifests and workflows are
-# their own repository's to pin, so this scan does not reach into them.
+# Submodules with their own CI: their toolchain files, manifests and workflows are their own
+# repository's to pin, so this scan does not reach into them. A Raven workspace that builds their
+# crates carries its own floor here.
 INDEPENDENT_SUBMODULES=(adapters/howl)
 prune_independent=()
 for sub in "${INDEPENDENT_SUBMODULES[@]}"; do

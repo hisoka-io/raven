@@ -1,0 +1,2 @@
+# The wasm package is an optional peer a wallet installs itself; the dev tree links pkg-node.
+autoInstallPeers: false
