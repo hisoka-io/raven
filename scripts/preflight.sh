@@ -4,8 +4,8 @@
 # CI builds seven separate cargo workspaces, each with its own fmt and clippy job, plus two
 # MSRV jobs and the hygiene scripts. Checking only the crate you edited passes locally and reds
 # CI, which is how four green jobs broke in one push. This runs all of them in one command. The
-# Howl submodule is not among them: nothing here depends on it, and its gates belong to its own
-# repository.
+# Howl submodule's pure crates are gated in their own repository; the node and client built on
+# them are gated here.
 #
 # It deliberately does NOT run the Rust test suites: those take tens of minutes and are sharded
 # in CI. Use --with-tests for the fast per-workspace ones. The SDK gates are the exception and
@@ -68,7 +68,9 @@ run "railgun"       cargo fmt --manifest-path adapters/railgun/Cargo.toml \
 run "client-wasm"   cargo fmt --manifest-path adapters/railgun/client-wasm/Cargo.toml -- --check
 run "inspire"       cargo fmt --manifest-path crates/inspire/Cargo.toml -- --check
 run "eth-state"     cargo fmt --manifest-path adapters/eth-state/Cargo.toml -- --check
-run "howl-node"     cargo fmt --manifest-path adapters/howl-node/Cargo.toml -- --check
+# The -p list: a bare --check on this workspace exits 1 "Failed to find targets".
+run "howl-node"     cargo fmt --manifest-path adapters/howl-node/Cargo.toml -p howl-node -p howl-store -p howl-wire -- --check
+run "howl client-wasm" cargo fmt --manifest-path adapters/howl-node/client-wasm/Cargo.toml -- --check
 run "b1-bench"      cargo fmt --manifest-path benches/b1-bench/Cargo.toml -- --check
 run "bench-compare" cargo fmt --manifest-path tools/bench-compare/Cargo.toml -- --check
 
@@ -81,12 +83,14 @@ if [ "$FAST" = 0 ]; then
   run "inspire modsw"  cargo clippy --manifest-path crates/inspire/Cargo.toml --all-targets --features mod-switch-response $OFFLINE -- -D warnings
   run "eth-state"      cargo clippy --manifest-path adapters/eth-state/Cargo.toml --all-targets $OFFLINE -- -D warnings
   run "howl-node"      cargo clippy --manifest-path adapters/howl-node/Cargo.toml --all-targets $OFFLINE -- -D warnings
+  run "howl client-wasm" cargo clippy --manifest-path adapters/howl-node/client-wasm/Cargo.toml --all-targets $OFFLINE -- -D warnings
   run "b1-bench"       cargo clippy --manifest-path benches/b1-bench/Cargo.toml --features inspire --all-targets $OFFLINE -- -D warnings
   run "bench-compare"  cargo clippy --manifest-path tools/bench-compare/Cargo.toml --all-targets $OFFLINE -- -D warnings
   # wasm32 is a separate target and catches things the native lint cannot.
   if rustup target list --installed 2>/dev/null | grep -q wasm32-unknown-unknown; then
     run "wasm32 raven-client" cargo clippy -p raven-client --all-targets --target wasm32-unknown-unknown $OFFLINE -- -D warnings
     run "wasm32 client-wasm"  cargo clippy --manifest-path adapters/railgun/client-wasm/Cargo.toml --all-targets --target wasm32-unknown-unknown $OFFLINE -- -D warnings
+    run "wasm32 howl client-wasm" cargo clippy --manifest-path adapters/howl-node/client-wasm/Cargo.toml --lib --target wasm32-unknown-unknown $OFFLINE -- -D warnings
   else
     echo "  wasm32 target not installed -- SKIPPED (CI will still run it)"
   fi
@@ -129,7 +133,7 @@ if [ "$MSRV" = 1 ]; then
   echo
   echo "== MSRV clippy (separate toolchains; a newer lint set is not the gate) =="
   for m in Cargo.toml adapters/railgun/client-wasm/Cargo.toml adapters/howl-node/Cargo.toml \
-           tools/bench-compare/Cargo.toml; do
+           adapters/howl-node/client-wasm/Cargo.toml tools/bench-compare/Cargo.toml; do
     RUSTUP_TOOLCHAIN=1.89 run "1.89 $m" cargo clippy --manifest-path "$m" --all-targets $OFFLINE -- -D warnings
   done
   RUSTUP_TOOLCHAIN=1.89 run "1.89 root --all-features" cargo clippy --manifest-path Cargo.toml --workspace --all-features --all-targets $OFFLINE -- -D warnings
