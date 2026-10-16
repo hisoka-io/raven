@@ -93,7 +93,7 @@ unplant README.md
 # The security claim, check 3 - the one that works today only because every .md fits one
 # xargs batch.
 plant README.md "This build provides 128-bit security."
-check 1 "$(run_gate)" "a 128-bit security claim is refused"
+check 1 "$(run_gate)" "a security-level claim is refused"
 unplant README.md
 
 # An owned submodule: a checkout of its own, recorded in the parent only as a gitlink. The parent
@@ -125,7 +125,7 @@ check 1 "$(run_gate)" "a ledger label inside an owned submodule is refused"
 sub_unplant lib.rs
 
 sub_plant README.md "This build provides 128-bit security."
-check 1 "$(run_gate)" "a 128-bit security claim inside an owned submodule is refused"
+check 1 "$(run_gate)" "a security-level claim inside an owned submodule is refused"
 sub_unplant README.md
 
 mkdir -p "$work/$owned/probe/wal"

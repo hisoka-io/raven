@@ -107,7 +107,7 @@ const fn default_max_sessions_per_instance() -> usize {
 }
 
 impl HttpConfig {
-    /// Minimum bearer-token length (16 bytes = 128 bits of token-space).
+    /// Minimum bearer-token length, in bytes.
     pub const MIN_TOKEN_LEN: usize = 16;
 
     /// Build a config with sensible defaults.

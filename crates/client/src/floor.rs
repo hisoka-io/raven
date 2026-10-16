@@ -1,10 +1,9 @@
 //! Parameter floors: bounds a server-supplied parameter set must meet before the client
 //! derives a key or encrypts a query under it.
 //!
-//! `InspireParams::validate` checks that a set is structurally usable; it runs no lattice
-//! estimate, so a node could serve a smaller ring or a narrower error and the client would
-//! encrypt under it. These bounds hold every served set to at least the shipped
-//! `secure_128_d2048`, the preset the lattice estimate measured, and cap the sizes every client
+//! `InspireParams::validate` checks that a set is structurally usable, so a node could serve a
+//! smaller ring or a narrower error and the client would encrypt under it. These bounds hold
+//! every served set to at least the shipped `secure_128_d2048` and cap the sizes every client
 //! allocation scales with.
 
 use raven_inspire::math::mod_q::DEFAULT_Q;
