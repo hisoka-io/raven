@@ -236,6 +236,8 @@ impl SpawnRegistry {
         std::mem::take(&mut g.auto_spawned)
     }
 
+    /// Record the successor and retire its predecessor under one lock hold, so no reader sees
+    /// the successor counted beside a predecessor still Live or Draining.
     fn record_spawn(
         &self,
         tree: u32,
@@ -250,6 +252,7 @@ impl SpawnRegistry {
                 persistence,
             },
         );
+        Self::flip_predecessor_locked(&g, tree);
     }
 
     fn record_auto_spawned(&self, handle: AutoSpawnedHandle) {
@@ -257,8 +260,12 @@ impl SpawnRegistry {
         g.auto_spawned.push(handle);
     }
 
+    #[cfg(test)]
     fn flip_predecessor_to_static(&self, new_tree: u32) {
-        let g = self.inner.lock();
+        Self::flip_predecessor_locked(&self.inner.lock(), new_tree);
+    }
+
+    fn flip_predecessor_locked(g: &RegistryInner, new_tree: u32) {
         if let Some(entry) = new_tree
             .checked_sub(1)
             .and_then(|prev| g.by_tree.get(&prev))
@@ -267,7 +274,6 @@ impl SpawnRegistry {
             entry
                 .persistence
                 .set_snapshot_policy(SnapshotPolicy::static_default());
-            // Atomic with the route append so /v1/status and routing observe it together.
             let prev_state = entry.instance.drain_state();
             if matches!(
                 prev_state,
@@ -578,7 +584,6 @@ fn spawn_one(inputs: &SpawnInputs<'_>, tree: u32, append_log: bool) -> anyhow::R
     };
     let consumer_join = spawn_consumer_task(consumer_inputs);
 
-    // Before the role flip, else flip_predecessor_to_static races a `registry.known()` reader.
     inputs
         .registry
         .record_spawn(tree, Arc::clone(&instance_arc), Arc::clone(&persistence));
@@ -599,9 +604,6 @@ fn spawn_one(inputs: &SpawnInputs<'_>, tree: u32, append_log: bool) -> anyhow::R
         };
         append_spawn_record(&inputs.spawn_log_dir, &record)
             .with_context(|| "append spawn record")?;
-    }
-    inputs.registry.flip_predecessor_to_static(tree);
-    if append_log {
         // After every side effect: the cooldown measures successful-spawn intervals.
         inputs.registry.stamp_spawned_at(std::time::Instant::now());
     }

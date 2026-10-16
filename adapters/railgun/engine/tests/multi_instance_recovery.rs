@@ -489,6 +489,7 @@ fn split_handle(
         chain_tree_routes: _,
         ppoi_list_routes: _,
         tree_observed: _,
+        packing_stores_built: _,
     } = mh;
     MultiOrchestratorHandleParts {
         instances,

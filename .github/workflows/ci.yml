@@ -686,7 +686,11 @@ jobs:
     # budget they survive. Today: production_cell_budget_bench (1 s single-query
     # and 12 s batch ceilings, sized for THIS runner rather than a dev box: 3.0x
     # and 2.1x over its measured 335 ms and ~5.6 s, so a red is a ~3x or ~2x
-    # blow-up, and a batch red is within reach of runner variance). A timing harness
+    # blow-up, and a batch red is within reach of runner variance) and
+    # recovery_latency_bench (20 s ceiling: 16 nights on this runner measured
+    # 5.7-12.5 s, median about 8.7 s, against about 3 s on a 16-core dev box, so
+    # the 20 s is 1.6x the worst night and 2.3x the median: a blow-up guard,
+    # which reds a 2x slowdown only on nights above 10 s). A timing harness
     # with NO ceiling stays out of every lane and sits in
     # scripts/ignore-coverage-allowlist.txt instead — a measurement is
     # not a gate, and enrolling one buys nightly minutes and no signal.

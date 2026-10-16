@@ -874,26 +874,6 @@ impl LogicalLeafStore {
             .is_some_and(|mine| std::sync::Arc::ptr_eq(mine, db))
     }
 
-    /// Run `edit` on `db` with this store's own reference to it released, and take the
-    /// reference again after. An edit in place then copies nothing, and the addenda go on
-    /// naming the database that is served. `edit` must leave every column as it is: the
-    /// addenda were derived alongside those columns.
-    pub(crate) fn edit_committed_db_in_place<T>(
-        &mut self,
-        db: &mut std::sync::Arc<raven_inspire::EncodedDatabase>,
-        edit: impl FnOnce(&mut std::sync::Arc<raven_inspire::EncodedDatabase>) -> T,
-    ) -> T {
-        let named = self.committed_addenda_derived_from(db);
-        if named {
-            self.committed_addenda_db = None;
-        }
-        let out = edit(db);
-        if named {
-            self.committed_addenda_db = Some(std::sync::Arc::clone(db));
-        }
-        out
-    }
-
     /// Drain the dirty-shards set after re-encoding.
     pub fn clear_dirty_shards(&mut self) {
         self.dirty_shards.clear();

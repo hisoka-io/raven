@@ -268,6 +268,19 @@ impl Wal {
     /// [`PersistenceError::Invariant`] when the floor sits above a non-empty
     /// tail, plus any I/O failure while creating, syncing, scanning or truncating.
     pub fn open(layout: &StoreLayout, last_committed_seq: Option<u64>) -> Result<Self> {
+        Self::open_with_replay(layout, last_committed_seq).map(|(wal, _)| wal)
+    }
+
+    /// [`Wal::open`], also returning the entries its scan read. The scan runs before any torn
+    /// tail is cut, so `truncated_at` reports where the cut was made; a later
+    /// [`Wal::replay`] reads the already-cut log and cannot.
+    ///
+    /// # Errors
+    /// As [`Wal::open`].
+    pub fn open_with_replay(
+        layout: &StoreLayout,
+        last_committed_seq: Option<u64>,
+    ) -> Result<(Self, WalReplay)> {
         let path = layout.wal_current_path();
         let wal_dir = layout.wal_dir();
         std::fs::create_dir_all(&wal_dir)?;
@@ -283,7 +296,7 @@ impl Wal {
             }
         }
 
-        let scan = scan_for_tail(&path)?;
+        let scan = scan_full(&path)?;
 
         let floor = match last_committed_seq {
             Some(s) => s.saturating_add(1),
@@ -291,7 +304,7 @@ impl Wal {
         };
         let mut next_seq = scan.next_seq;
         if floor > next_seq {
-            if let Some(first) = scan.first_seq {
+            if let Some(first) = scan.entries.first().map(|e| e.seq) {
                 let last = next_seq.saturating_sub(1);
                 RESUME_FLOOR_REFUSALS.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
@@ -314,7 +327,7 @@ impl Wal {
             next_seq = floor;
         }
 
-        if let Some(truncate_at) = scan.truncate_at {
+        if let Some(truncate_at) = scan.truncated_at {
             // some filesystems disallow concurrent write handles
             drop(file);
             let f = OpenOptions::new().write(true).open(&path)?;
@@ -326,14 +339,14 @@ impl Wal {
         let len = rewind_target(&file)?;
         // An earlier process may have left written but unsynced frames, so only a
         // log this open just synced, or an empty one, starts clean.
-        let synced_len = if scan.truncate_at.is_some() { len } else { 0 };
+        let synced_len = if scan.truncated_at.is_some() { len } else { 0 };
 
-        Ok(Self {
+        let wal = Self {
             layout: layout.clone(),
             inner: Mutex::new(WalState {
                 file,
                 next_seq,
-                first_seq: scan.first_seq,
+                first_seq: scan.entries.first().map(|e| e.seq),
                 last_marker: scan.last_marker,
                 len,
                 synced_len,
@@ -343,7 +356,8 @@ impl Wal {
                 #[cfg(test)]
                 faults: WalFaults::default(),
             }),
-        })
+        };
+        Ok((wal, scan))
     }
 
     /// Assigns the next seq, writes the frame, syncs it and every deferred frame
@@ -508,14 +522,6 @@ pub struct WalReplay {
     pub last_marker: u64,
 }
 
-#[derive(Debug)]
-struct ScanResult {
-    next_seq: u64,
-    first_seq: Option<u64>,
-    last_marker: u64,
-    truncate_at: Option<u64>,
-}
-
 /// Reopen `current.log` after `archive` renamed it away, making both the removal and
 /// the creation durable.
 ///
@@ -573,16 +579,6 @@ fn open_wal_owner_only(path: &std::path::Path) -> Result<File> {
             .append(true)
             .open(path)?)
     }
-}
-
-fn scan_for_tail(path: &std::path::Path) -> Result<ScanResult> {
-    let scan = scan_full(path)?;
-    Ok(ScanResult {
-        next_seq: scan.next_seq,
-        first_seq: scan.entries.first().map(|e| e.seq),
-        last_marker: scan.last_marker,
-        truncate_at: scan.truncated_at,
-    })
 }
 
 #[allow(clippy::too_many_lines)] // single linear frame scanner; splitting hurts readability

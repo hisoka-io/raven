@@ -1,5 +1,5 @@
-//! Cold-start bootstrap-from-disk latency at the production cell shape; target
-//! is 1 s for manifest load, snapshot restore and cache rebuild.
+//! Cold-start bootstrap-from-disk latency at the production cell shape: manifest
+//! load, snapshot restore and cache rebuild.
 
 #![allow(
     clippy::expect_used,
@@ -31,9 +31,10 @@ fn test_encoder() -> Arc<dyn PirTableEncoder> {
 
 #[test]
 #[ignore = "production-cell setup is heavy (11 s measured); measures cold-start \
-            bootstrap-from-disk, which is 5.5 s on a 16-core box under the ci-test profile. \
-            Trigger: changing manifest load, snapshot restore, or cache rebuild."]
-fn recovery_from_production_cell_snapshot_under_5s() {
+            bootstrap-from-disk: about 3 s on a 16-core box, 5.7-12.5 s on the GitHub runner, \
+            under the ci-test profile. Trigger: changing manifest load, snapshot restore, or \
+            cache rebuild."]
+fn recovery_from_production_cell_snapshot_under_20s() {
     let setup_start = Instant::now();
     let params = InspireParams::secure_128_d2048();
     let entries = 1usize << 16;
@@ -117,9 +118,11 @@ fn recovery_from_production_cell_snapshot_under_5s() {
     assert_eq!(recovered.entry_size, entry_size);
     assert_eq!(recovered.variant, InspireVariant::TwoPacking);
 
-    // Ceiling sits above the 1s target to absorb cold-page and host variability.
+    // A blow-up guard sized for the nightly runner, where 16 nights measured 5.7-12.5 s (median
+    // about 8.7 s): it reds a slowdown past 1.6x on the worst night and 2.3x on a median night.
+    // A 2x slowdown reds only on nights already above 10 s.
     assert!(
-        recovery_elapsed < Duration::from_secs(5),
-        "recovery latency regressed: {recovery_elapsed:?} > 5 s"
+        recovery_elapsed < Duration::from_secs(20),
+        "recovery latency regressed: {recovery_elapsed:?} > 20 s"
     );
 }

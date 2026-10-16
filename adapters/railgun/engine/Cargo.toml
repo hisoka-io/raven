@@ -28,6 +28,7 @@ parking_lot = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
+rayon = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
@@ -35,7 +36,6 @@ sha2 = { workspace = true }
 raven-inspire = { workspace = true, features = ["caller-secret-keys"] }
 raven-railgun-testkit = { workspace = true }
 tempfile = "3"
-rayon = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 async-trait = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }

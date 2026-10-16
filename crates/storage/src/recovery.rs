@@ -11,7 +11,8 @@ pub struct StoreRecovery {
     pub snapshot: Option<SnapshotFile>,
     /// Appendable WAL opened at the manifest resume floor.
     pub wal: Wal,
-    /// Current-log entries at or above `manifest.current_snapshot_seq`.
+    /// Current-log entries at or above `manifest.current_snapshot_seq`; `truncated_at` is where
+    /// the open cut a torn tail, if it cut one.
     pub replay: WalReplay,
 }
 
@@ -68,8 +69,7 @@ where
         )?)
     };
     let replay_floor = manifest.current_snapshot_seq;
-    let wal = Wal::open(layout, replay_floor.checked_sub(1))?;
-    let mut replay = wal.replay()?;
+    let (wal, mut replay) = Wal::open_with_replay(layout, replay_floor.checked_sub(1))?;
     replay.entries.retain(|entry| entry.seq >= replay_floor);
     Ok(Some(StoreRecovery {
         manifest,

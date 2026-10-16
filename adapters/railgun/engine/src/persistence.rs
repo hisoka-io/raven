@@ -36,8 +36,8 @@ fn ensure_metrics_described() {
     metrics::describe_counter!(
         super::inspire::PACKING_STORES_BUILT,
         metrics::Unit::Count,
-        "Per-shard packing stores built by publishes: one per shard whose served columns a \
-         publish changed. Stores built at boot are not counted."
+        "Per-shard packing stores built: at boot, those finished after the exporter is \
+         installed; then one per shard whose served columns a publish changed."
     );
     metrics::counter!(super::inspire::PACKING_STORES_BUILT).increment(0);
 }
@@ -278,25 +278,23 @@ pub struct OpenedInstance {
 }
 
 impl OpenedInstance {
-    /// Give every shard of the recovered state its packing store, before the state is served.
-    /// [`InspirePersistence::open`] leaves them out so that it costs what its decode costs; a
-    /// boot calls this once the open has returned, and each store is then built once.
+    /// Give every shard of the recovered state its packing store. [`InspirePersistence::open`]
+    /// leaves them out so that it costs what its decode costs. The stores go into the shards'
+    /// shared slots, so the database the recovered addenda name is the one filled.
     ///
     /// # Errors
     /// [`AdapterError::Scheme`] if a shard does not fit the cache's packing shape.
-    pub fn precompute_packing_stores(&mut self) -> Result<()> {
-        let Some(state) = self.recovered_state.as_mut() else {
+    pub fn precompute_packing_stores(&self) -> Result<()> {
+        let Some(state) = self.recovered_state.as_ref() else {
             return Ok(());
         };
-        let (crs, cache) = (Arc::clone(&state.crs), Arc::clone(&state.cache));
-        // The recovered store holds this database as the provenance of its addenda. A build
-        // over a shared database would land in a copy the addenda no longer name.
-        self.recovered_logical_store.edit_committed_db_in_place(
-            &mut state.encoded_db,
-            |encoded_db| {
-                super::inspire::precompute_missing_packing_stores_shared(encoded_db, &crs, &cache)
-            },
+        super::inspire::build_missing_packing_stores(
+            &state.encoded_db,
+            &state.crs,
+            &state.cache,
+            |_| true,
         )
+        .map(|_| ())
     }
 }
 
@@ -474,6 +472,15 @@ impl InspirePersistence {
                 logical_store.refresh_committed_addenda(&state.encoded_db, entries_per_shard);
             }
             let replay = recovery.replay;
+            if let Some(offset) = replay.truncated_at {
+                tracing::warn!(
+                    instance = instance_id.as_str(),
+                    truncated_at = offset,
+                    entries_kept = replay.entries.len(),
+                    "wal open cut a torn or corrupt tail; replay runs without the bytes past \
+                     the cut"
+                );
+            }
             // An unencodable leaf is replay-fatal; every other `InvalidQuery`
             // soft-skips, and Internal/Serialization bubble.
             let mut replay_skipped: u64 = 0;
@@ -941,7 +948,7 @@ pub fn bootstrap_inspire_instance_with_session_limits(
         layout.root(),
         session_limits,
     )?);
-    let mut opened =
+    let opened =
         InspirePersistence::open(layout, scheme_tag, instance_id.clone(), policy, encoder)?;
     opened.precompute_packing_stores()?;
     let persistence = Arc::new(opened.persistence);
@@ -2481,7 +2488,9 @@ fn drive_publish(
 }
 
 /// Re-encode `dirty` into a copy of the served database, publish it, and record the committed
-/// addenda and published rows from the tree it was encoded from.
+/// addenda and published rows from the tree it was encoded from. A shard whose rows encode to
+/// the columns already served is left out, and when that is every shard nothing is copied or
+/// published: `Ok(false)`.
 fn re_encode_and_publish(
     instance: &Arc<PirInstance<RavenInspireScheme>>,
     logical_store: &Arc<parking_lot::Mutex<super::inspire::LogicalLeafStore>>,
@@ -2489,10 +2498,9 @@ fn re_encode_and_publish(
     encoder: &dyn super::pir_table::PirTableEncoder,
     dirty: &[u32],
     height: u64,
-) -> Result<()> {
-    // `Arc::make_mut` copies once per publish; `current` is always a live
-    // second reference. State and epoch come from ONE load so the swap below can
-    // refuse a derivation another writer has already superseded.
+) -> Result<bool> {
+    // State and epoch come from ONE load so the swap below can refuse a derivation another
+    // writer has already superseded.
     let derived_from = instance.current_snapshot();
     let current = Arc::clone(&derived_from.state);
     let entries_per_shard = u32::try_from(
@@ -2506,20 +2514,32 @@ fn re_encode_and_publish(
     let entry_size = current.entry_size;
 
     ensure_encoder_matches_stored_cell(current.shard_config(), entries_per_shard, encoder)?;
+    // `Arc::make_mut` copies the whole database, since `current` is a live second reference,
+    // so it waits for the first shard whose columns really change.
     let mut new_db = Arc::clone(&current.encoded_db);
+    let mut changed = std::collections::BTreeSet::new();
     let instance_label = instance.id.as_str().to_owned();
     for &shard_id in dirty {
         let bytes = {
             let store = logical_store.lock();
             encoder.materialize_shard(shard_id, &store)
         };
-        match super::inspire::re_encode_shard(
-            Arc::make_mut(&mut new_db),
+        // Compared against the served database: `dirty` names each shard once, so no
+        // earlier pass of this loop has changed the slot being compared.
+        match super::inspire::re_encoded_columns(
+            &current.encoded_db,
             params,
             shard_id,
             &bytes,
             entry_size,
-        ) {
+        )
+        .and_then(|columns| match columns {
+            Some(columns) => {
+                changed.insert(shard_id);
+                super::inspire::install_columns(Arc::make_mut(&mut new_db), shard_id, columns)
+            }
+            None => Ok(()),
+        }) {
             Ok(()) => {}
             Err(AdapterError::ShardOutOfRange {
                 shard_id: oor_id,
@@ -2547,12 +2567,15 @@ fn re_encode_and_publish(
             Err(e) => return Err(e),
         }
     }
-    // Before the swap, so no query meets a re-encoded shard without the store of its new columns.
-    super::inspire::precompute_missing_packing_stores_shared(
-        &mut new_db,
-        &current.crs,
-        &current.cache,
-    )?;
+    if changed.is_empty() {
+        return Ok(false);
+    }
+    // Before the swap, so no query meets a re-encoded shard without the store of its new
+    // columns. The other shards share their slots with the served state, so a boot build
+    // still running fills them in both.
+    super::inspire::build_missing_packing_stores(&new_db, &current.crs, &current.cache, |shard| {
+        changed.contains(&shard.id)
+    })?;
 
     publish_recommitted_state(instance, &derived_from, &current, &new_db, height)?;
 
@@ -2563,7 +2586,7 @@ fn re_encode_and_publish(
     logical_store
         .lock()
         .refresh_committed_addenda(&snapshot.state.encoded_db, encoder.entries_per_shard());
-    Ok(())
+    Ok(true)
 }
 
 fn drive_commit(
@@ -2605,10 +2628,14 @@ fn drive_commit(
     re_encode_and_publish(instance, logical_store, params, encoder, &dirty, height)?;
 
     let snapshot_state = instance.current_state();
-    // Snapshot the store under-lock so it restores atomically with the state.
+    // Snapshot the store under-lock so it restores atomically with the state. The served
+    // columns now hold every dirty shard, so the snapshot carries none: one that kept them
+    // would have every boot from it re-encode those shards. The live set is cleared only once
+    // the commit lands, since it is what retries a failed one.
     let store_snapshot = {
-        let s = logical_store.lock();
-        s.clone()
+        let mut snapshot = logical_store.lock().clone();
+        snapshot.clear_dirty_shards();
+        snapshot
     };
     let _new_id = persistence.commit_v6(snapshot_state.as_ref(), &store_snapshot, height)?;
 
@@ -4584,12 +4611,66 @@ mod tests {
         .expect("the commit that writes the snapshot");
     }
 
-    /// A snapshot is written before its commit clears the dirty set, so it restores with that
-    /// set and the next boot commits the same shards again, to the columns they already hold.
-    /// The recovery open builds no store, the boot builds one per shard, and that repeated
-    /// commit keeps every one of them.
+    fn reopen_warm(dir: &std::path::Path, encoder: &Arc<dyn PirTableEncoder>) -> OpenedInstance {
+        InspirePersistence::open(
+            StoreLayout::open(dir).expect("layout"),
+            SCHEME_TAG,
+            InstanceId::new("warm-boot-stores"),
+            SnapshotPolicy::default(),
+            Arc::clone(encoder),
+        )
+        .expect("reopen")
+    }
+
+    /// The commit clears the dirty set before its snapshot, so a warm boot with nothing new
+    /// restores none, and the consumer has nothing to re-encode or publish. The recovery open
+    /// builds no store; the boot build fills the recovered database in place.
     #[test]
-    fn a_warm_boot_with_nothing_new_builds_each_packing_store_once() {
+    fn a_warm_boot_with_nothing_new_restores_no_dirty_shard() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let encoder = small_cache_encoder();
+        let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default()));
+        commit_one_leaf_snapshot(dir.path(), &encoder, &metrics);
+
+        let opened = reopen_warm(dir.path(), &encoder);
+        assert!(
+            opened.recovered_logical_store.dirty_shards().is_empty(),
+            "the snapshot kept the dirty set of the commit that wrote it"
+        );
+        assert!(!opened.persistence.snapshot_pending());
+        let recovered = opened.recovered_state.as_ref().expect("recovered state");
+        assert!(
+            recovered
+                .encoded_db
+                .shards
+                .iter()
+                .all(|shard| shard.packing_store().is_none()),
+            "the recovery open must not build packing stores"
+        );
+        let opened_db = Arc::as_ptr(&recovered.encoded_db);
+        opened
+            .precompute_packing_stores()
+            .expect("boot store build");
+        let recovered = opened.recovered_state.as_ref().expect("recovered state");
+        assert!(std::ptr::eq(Arc::as_ptr(&recovered.encoded_db), opened_db));
+        assert!(recovered
+            .encoded_db
+            .shards
+            .iter()
+            .all(|shard| shard.packing_store().is_some()));
+        assert!(
+            opened
+                .recovered_logical_store
+                .committed_addenda_derived_from(&recovered.encoded_db),
+            "the recovered addenda must still name the database that will be served"
+        );
+    }
+
+    /// A snapshot written by a build that kept the dirty set restores it. The boot commit
+    /// finds every such shard encodes to the columns already served, so it copies no database,
+    /// publishes nothing and keeps every store, and its own snapshot drops the set.
+    #[test]
+    fn a_restored_dirty_set_over_unchanged_rows_copies_and_publishes_nothing() {
         use crate::{InstanceRole, PirInstance};
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4597,54 +4678,42 @@ mod tests {
         let encoder = small_cache_encoder();
         let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default()));
         commit_one_leaf_snapshot(dir.path(), &encoder, &metrics);
+        {
+            let mut opened = reopen_warm(dir.path(), &encoder);
+            let state = opened.recovered_state.take().expect("recovered state");
+            let store = &mut opened.recovered_logical_store;
+            // Shard 0 holds the committed leaf; shard 1 still serves the seed rows, which the
+            // store would not reproduce.
+            store.dirty_shards_mut_for_test().insert(0);
+            opened
+                .persistence
+                .commit_v6(&state, store, 1)
+                .expect("a snapshot that keeps its dirty set");
+        }
 
-        let mut opened = InspirePersistence::open(
-            StoreLayout::open(dir.path()).expect("layout"),
-            SCHEME_TAG,
-            InstanceId::new("warm-boot-stores"),
-            SnapshotPolicy::default(),
-            Arc::clone(&encoder),
-        )
-        .expect("reopen");
-        let opened_db = {
-            let recovered = opened.recovered_state.as_ref().expect("recovered state");
-            assert!(
-                recovered
-                    .encoded_db
-                    .shards
-                    .iter()
-                    .all(|shard| shard.packing_store().is_none()),
-                "the recovery open must not build packing stores"
-            );
-            Arc::as_ptr(&recovered.encoded_db)
-        };
+        let opened = reopen_warm(dir.path(), &encoder);
         opened
             .precompute_packing_stores()
             .expect("boot store build");
-        let recovered = opened.recovered_state.expect("recovered state");
-        assert!(
-            std::ptr::eq(Arc::as_ptr(&recovered.encoded_db), opened_db),
-            "the boot store build must fill the recovered database in place, not a copy"
-        );
-        assert!(
+        assert_eq!(
             opened
                 .recovered_logical_store
-                .committed_addenda_derived_from(&recovered.encoded_db),
-            "the recovered addenda must still name the database that will be served"
+                .dirty_shards()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [0],
+            "precondition: the snapshot restores its dirty set"
         );
         let logical_store = Arc::new(parking_lot::Mutex::new(opened.recovered_logical_store));
-        assert!(
-            logical_store.lock().dirty_shards().contains(&0),
-            "precondition: the snapshot restores with the dirty set of the commit that wrote it"
-        );
         let persistence = Arc::new(opened.persistence);
         let instance: Arc<PirInstance<RavenInspireScheme>> = Arc::new(PirInstance::new(
             InstanceId::new("warm-boot-stores"),
             InstanceRole::Live,
-            recovered,
+            opened.recovered_state.expect("recovered state"),
         ));
         let booted = instance.current_snapshot();
-        let booted_columns = bincode::serialize(&*booted.state.encoded_db).expect("booted db");
+        let snapshot_before = persistence.current_snapshot_id();
 
         super::drive_commit(
             &instance,
@@ -4658,32 +4727,28 @@ mod tests {
         .expect("the boot commit");
 
         let committed = instance.current_snapshot();
-        assert!(
-            committed.epoch > booted.epoch,
-            "precondition: the boot commit re-encoded and published"
-        );
         assert_eq!(
-            bincode::serialize(&*committed.state.encoded_db).expect("committed db"),
-            booted_columns,
-            "precondition: nothing new, so the served columns are unchanged"
+            committed.epoch, booted.epoch,
+            "a commit of no change bumped the epoch"
         );
-        // `booted` is still held, so an equal address is the same store, never a reused one.
-        for (before, after) in booted
-            .state
-            .encoded_db
-            .shards
-            .iter()
-            .zip(&committed.state.encoded_db.shards)
-        {
+        assert!(
+            Arc::ptr_eq(&committed.state.encoded_db, &booted.state.encoded_db),
+            "a commit of no change copied the served database"
+        );
+        for shard in &committed.state.encoded_db.shards {
             assert!(
-                std::ptr::eq(
-                    before.packing_store().expect("a store built at boot"),
-                    after.packing_store().expect("a store after the commit"),
-                ),
-                "shard {}: a commit that changed no column rebuilt the packing store",
-                after.id
+                shard.packing_store().is_some(),
+                "shard {} lost its store",
+                shard.id
             );
         }
+        assert!(logical_store.lock().dirty_shards().is_empty());
+        assert_ne!(persistence.current_snapshot_id(), snapshot_before);
+        let reopened = reopen_warm(dir.path(), &encoder);
+        assert!(
+            reopened.recovered_logical_store.dirty_shards().is_empty(),
+            "the boot commit's snapshot dropped the set"
+        );
     }
 
     /// The empty-dirty branch commits the store verbatim and archives the WAL

@@ -131,3 +131,49 @@ fn corrupt_current_snapshot_is_refused() {
         "{error}"
     );
 }
+
+#[test]
+fn the_recovery_report_states_where_a_torn_log_was_cut() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let layout = StoreLayout::open(dir.path()).expect("layout");
+    let wal = Wal::open(&layout, None).expect("wal");
+    for marker in 0..3u64 {
+        wal.append(&marker, marker).expect("append");
+    }
+    drop(wal);
+    let valid_len = std::fs::metadata(layout.wal_current_path())
+        .expect("wal metadata")
+        .len();
+    {
+        use std::io::Write;
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(layout.wal_current_path())
+            .expect("open log");
+        log.write_all(&[0xA5; 37]).expect("torn tail");
+    }
+    manifest(SnapshotId(0), 0).save(&layout).expect("manifest");
+
+    let recovered = open_recovery(&layout, MAGIC, |_| Ok(()))
+        .expect("recovery")
+        .expect("present");
+    assert_eq!(recovered.replay.truncated_at, Some(valid_len));
+    assert_eq!(recovered.replay.entries.len(), 3);
+    assert_eq!(recovered.wal.next_seq(), 3);
+    assert_eq!(
+        std::fs::metadata(layout.wal_current_path())
+            .expect("wal metadata")
+            .len(),
+        valid_len,
+        "the open cut the tail it reports"
+    );
+
+    let reopened = open_recovery(&layout, MAGIC, |_| Ok(()))
+        .expect("recovery")
+        .expect("present");
+    assert_eq!(
+        reopened.replay.truncated_at, None,
+        "a clean log reports no cut"
+    );
+    assert_eq!(reopened.replay.entries.len(), 3);
+}

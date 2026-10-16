@@ -148,6 +148,7 @@ fn split(mh: raven_railgun_engine::orchestrator::MultiOrchestratorHandle) -> Par
         chain_tree_routes: _,
         ppoi_list_routes: _,
         tree_observed: _,
+        packing_stores_built: _,
     } = mh;
     Parts {
         instances,

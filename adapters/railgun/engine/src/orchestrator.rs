@@ -485,6 +485,9 @@ pub struct MultiOrchestratorHandle {
     pub ppoi_list_routes: PpoiListRoutes,
     /// Lossy broadcast of every chain `tree_number` seen by the router.
     pub tree_observed: tokio::sync::broadcast::Sender<u32>,
+    /// Turns `true` once the boot's packing store builds have finished. Until a shard's store
+    /// lands, that shard packs per query; a build that fails is logged and leaves it so.
+    pub packing_stores_built: tokio::sync::watch::Receiver<bool>,
 }
 
 impl std::fmt::Debug for MultiOrchestratorHandle {
@@ -807,7 +810,8 @@ fn open_data_dir(
         layout.root(),
         session_limits,
     )?);
-    let mut opened = InspirePersistence::open(
+    // Packing stores are built once the instances serve: see `spawn_packing_store_builds`.
+    let opened = InspirePersistence::open(
         layout,
         cfg.scheme_tag.clone(),
         cfg.instance_id.clone(),
@@ -817,7 +821,6 @@ fn open_data_dir(
     if let Some(state) = opened.recovered_state.as_ref() {
         require_recovered_cell_matches(&cfg, state, &opened.recovered_logical_store, params)?;
     }
-    opened.precompute_packing_stores()?;
     Ok(OpenedSlot {
         cfg,
         encoder,
@@ -989,6 +992,12 @@ where
         .into_iter()
         .map(|slot| start_instance(slot, &params))
         .collect::<Result<Vec<PerInstanceHandles>>>()?;
+    let packing_stores_built = spawn_packing_store_builds(
+        per_instance
+            .iter()
+            .map(|handle| Arc::clone(&handle.instance))
+            .collect(),
+    );
 
     let (indexer_tx, indexer_rx) = mpsc::channel::<IndexerMessage>(router_capacity);
     let (mirror_tx, mirror_rx) = mpsc::channel::<(WalEntryPayload, u64)>(router_capacity);
@@ -1035,7 +1044,64 @@ where
         chain_tree_routes,
         ppoi_list_routes,
         tree_observed: tree_observed_tx,
+        packing_stores_built,
     })
+}
+
+/// Build every missing packing store of the served instances off the boot path, so the node
+/// listens once its data dirs are open rather than once every store exists. A shard packs
+/// per query until its store lands; the bytes are the same either way. The stores go into the
+/// shards' shared slots, so no database is copied, and a publish meanwhile shares the slots of
+/// every shard it leaves unchanged.
+fn spawn_packing_store_builds(
+    instances: Vec<Arc<PirInstance<RavenInspireScheme>>>,
+) -> tokio::sync::watch::Receiver<bool> {
+    let (built_tx, built_rx) = tokio::sync::watch::channel(false);
+    tokio::task::spawn_blocking(move || {
+        use rayon::prelude::*;
+        let started = std::time::Instant::now();
+        let build = || {
+            instances
+                .par_iter()
+                .map(|instance| {
+                    let state = instance.current_state();
+                    super::inspire::build_missing_packing_stores(
+                        &state.encoded_db,
+                        &state.crs,
+                        &state.cache,
+                        |_| true,
+                    )
+                    .inspect_err(|error| {
+                        tracing::error!(
+                            instance = instance.id.as_str(),
+                            error = %error,
+                            "packing store build failed; this instance packs per query"
+                        );
+                    })
+                    .unwrap_or(0)
+                })
+                .sum::<usize>()
+        };
+        // Its own pool: respond fans out on the global one, where a job queued behind the
+        // build's own work waits for the whole build to drain.
+        let built = match rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("store-build-{i}"))
+            .build()
+        {
+            Ok(pool) => pool.install(build),
+            Err(error) => {
+                tracing::warn!(error = %error, "store build pool unavailable; using the shared pool");
+                build()
+            }
+        };
+        tracing::info!(
+            stores = built,
+            elapsed_ms = started.elapsed().as_millis(),
+            "packing stores built"
+        );
+        let _ = built_tx.send(true);
+    });
+    built_rx
 }
 
 pub(crate) fn hex_lower_32(bytes: &[u8; 32]) -> String {

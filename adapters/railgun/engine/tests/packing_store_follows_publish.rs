@@ -132,6 +132,18 @@ async fn mirror_rows(
     }
 }
 
+/// The boot builds stores beside serving, not before it, and these tests read them.
+async fn stores_built(handle: &MultiOrchestratorHandle) {
+    let mut built = handle.packing_stores_built.clone();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        built.wait_for(|done| *done),
+    )
+    .await
+    .expect("the boot store build finished")
+    .expect("the boot store build reported");
+}
+
 /// Returns once `rows` rows are applied, nothing is dirty and their snapshot has landed.
 async fn wait_published(handle: &MultiOrchestratorHandle, rows: u32) {
     let booted = handle.instances.first().expect("one instance");
@@ -281,14 +293,28 @@ async fn a_published_row_is_served_through_the_store_of_its_new_columns() {
 
     stop_uncleanly(handle).await;
     let restarted = boot(dir.path(), None);
+    let booted = restarted
+        .instances
+        .first()
+        .expect("one instance")
+        .instance
+        .current_state();
+    stores_built(&restarted).await;
     let recovered = restarted
         .instances
         .first()
         .expect("one instance")
         .instance
         .current_state();
+    assert!(
+        Arc::ptr_eq(&booted.encoded_db, &recovered.encoded_db),
+        "the boot store build filled the served database, it did not publish a copy"
+    );
     for shard in 0..SHARDS {
-        store_of(&recovered, shard);
+        assert!(std::ptr::eq(
+            store_of(&booted, shard),
+            store_of(&recovered, shard)
+        ));
     }
     let session = session_for(&recovered);
     let (client, query) = query_for(&recovered, &session, last);
