@@ -75,7 +75,7 @@ pub fn build_toy_pieces(token: String, config: ToyDbConfig) -> Result<ToyPieces>
 
     let mut client_session = build_client_session((*server_state.crs).clone())?;
     let (_, registration_query) =
-        build_seeded_query(&client_session, server_state.shard_config(), 0, &params)?;
+        build_seeded_query(&client_session, server_state.shard_config(), 0)?;
     let registration_keys = registration_query.inspiring_packing_keys.ok_or_else(|| {
         AdapterError::Internal(
             "toy client session produced no packing keys for HTTP registration".to_owned(),

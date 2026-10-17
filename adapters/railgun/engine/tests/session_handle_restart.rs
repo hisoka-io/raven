@@ -83,8 +83,7 @@ fn reopening_one_data_dir_never_reissues_a_stale_handle() {
         entry_size: state.entry_size,
     };
     let (client_state, query) =
-        build_seeded_query(&client, durable_state.shard_config(), 3, &params)
-            .expect("translated query");
+        build_seeded_query(&client, durable_state.shard_config(), 3).expect("translated query");
     let response = <RavenInspireScheme as PirScheme>::respond(&durable_state, &query)
         .expect("translated response");
     let plaintext = extract_response(
@@ -259,7 +258,7 @@ async fn production_single_boot_opens_the_durable_allocator_and_refuses_corrupti
     // NEGATIVE CONTROL: before the floor goes, this client's query is served. Without it the
     // refusals below could be a client that never worked.
     let (client_state, query) =
-        build_seeded_query(&client, state.shard_config(), 3, &params).expect("single query");
+        build_seeded_query(&client, state.shard_config(), 3).expect("single query");
     assert_eq!(query.session_handle, Some(external));
     let response =
         <RavenInspireScheme as PirScheme>::respond(&state, &query).expect("single response");

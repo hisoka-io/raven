@@ -210,16 +210,10 @@ async fn wait_applied(handle: &MultiOrchestratorHandle, rows: u32) {
 }
 
 fn decrypt_row(state: &InspireServerState, list_index: u32) -> Vec<u8> {
-    let params = InspireParams::secure_128_d2048();
     let mut session = build_client_session((*state.crs).clone()).expect("client session");
     register_client_session(&mut session, state).expect("register session");
-    let (client_state, query) = build_seeded_query(
-        &session,
-        state.shard_config(),
-        u64::from(list_index),
-        &params,
-    )
-    .expect("query");
+    let (client_state, query) =
+        build_seeded_query(&session, state.shard_config(), u64::from(list_index)).expect("query");
     let response = <RavenInspireScheme as PirScheme>::respond(state, &query).expect("respond");
     extract_response(&state.crs, &client_state, &response, state.entry_size).expect("extract")
 }

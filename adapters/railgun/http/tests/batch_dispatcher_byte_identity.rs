@@ -54,7 +54,6 @@ struct Fixture {
     instance: Arc<PirInstance<RavenInspireScheme>>,
     client_session: ClientSession,
     registration_body: Vec<u8>,
-    params: InspireParams,
 }
 
 fn fixture() -> Fixture {
@@ -63,8 +62,8 @@ fn fixture() -> Fixture {
     let (state, _) =
         setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("setup_state");
     let mut client_session = build_client_session((*state.crs).clone()).expect("client session");
-    let (_, registration) = build_seeded_query(&client_session, state.shard_config(), 0, &params)
-        .expect("registration query");
+    let (_, registration) =
+        build_seeded_query(&client_session, state.shard_config(), 0).expect("registration query");
     let registration_body = raven_railgun_http::write_versioned(
         &registration
             .inspiring_packing_keys
@@ -81,7 +80,6 @@ fn fixture() -> Fixture {
         instance,
         client_session,
         registration_body,
-        params,
     }
 }
 
@@ -159,7 +157,6 @@ async fn batch_dispatcher_byte_identity_across_k_values() {
             &fixture.client_session,
             server_state_arc.shard_config(),
             idx,
-            &fixture.params,
         )
         .expect("build_seeded_query");
         batch_queries.push(q);

@@ -133,7 +133,6 @@ fn build_live_state_and_session() -> (
     raven_railgun_engine::inspire::InspireServerState,
     ClientSession,
     LogicalLeafStore,
-    InspireParams,
 ) {
     let params = InspireParams::secure_128_d2048();
     let db = vec![0u8; ENTRIES * CELL_RECORD_BYTES];
@@ -186,20 +185,18 @@ fn build_live_state_and_session() -> (
 
     let mut client_session = build_client_session((*live_state.crs).clone()).expect("client");
     register_client_session(&mut client_session, &live_state).expect("register session");
-    (live_state, client_session, store, params)
+    (live_state, client_session, store)
 }
 
 fn pir_query_note_record(
     leaf_index: u32,
     live_state: &raven_railgun_engine::inspire::InspireServerState,
     client_session: &ClientSession,
-    params: &InspireParams,
 ) -> Vec<u8> {
     let (client_state, query) = build_seeded_query(
         client_session,
         live_state.shard_config(),
         u64::from(leaf_index),
-        params,
     )
     .expect("build_seeded_query");
     use raven_railgun_engine::PirScheme;
@@ -216,13 +213,13 @@ const TARGET_LEAVES: [u32; 6] = [0, 1, 1_337, 2_047, 2_048, LEAVES_PRELOADED - 1
 
 #[test]
 fn db1_note_record_query_recovers_every_field_and_folds_to_root() {
-    let (live_state, client_session, store, params) = build_live_state_and_session();
+    let (live_state, client_session, store) = build_live_state_and_session();
     let imt = store.imt(TREE_NUMBER).expect("tree present");
 
     let mut recovered_rows: Vec<(u32, Vec<u8>)> = Vec::with_capacity(TARGET_LEAVES.len());
 
     for leaf_idx in TARGET_LEAVES {
-        let plaintext = pir_query_note_record(leaf_idx, &live_state, &client_session, &params);
+        let plaintext = pir_query_note_record(leaf_idx, &live_state, &client_session);
         let row = plaintext
             .get(..CELL_RECORD_BYTES)
             .expect("row plaintext present");

@@ -891,7 +891,7 @@ async fn the_shipped_block_6_serves_the_lists_row_393216_by_pir() {
     let mut session = build_client_session((*state.crs).clone()).expect("client session");
     register_client_session(&mut session, &state).expect("register session");
     let (client_state, query) =
-        build_seeded_query(&session, state.shard_config(), 0, &params).expect("query");
+        build_seeded_query(&session, state.shard_config(), 0).expect("query");
     let response =
         <raven_railgun_engine::inspire::RavenInspireScheme as PirScheme>::respond(&state, &query)
             .expect("respond");

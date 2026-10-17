@@ -68,7 +68,7 @@ fn k4_dispatcher_strategy_comparison() {
     let mut queries = Vec::with_capacity(BATCH_SIZE);
     for k in 0..BATCH_SIZE as u64 {
         let idx = (31_415u64.wrapping_add(k * 911)) % (entries as u64);
-        let (_cs, q) = build_seeded_query(&client_session, state_arc.shard_config(), idx, &params)
+        let (_cs, q) = build_seeded_query(&client_session, state_arc.shard_config(), idx)
             .expect("build_seeded_query");
         queries.push(q);
     }

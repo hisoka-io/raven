@@ -36,7 +36,6 @@ fn build_live_state_and_session() -> (
     raven_railgun_engine::inspire::InspireServerState,
     ClientSession,
     LogicalLeafStore,
-    InspireParams,
 ) {
     let params = InspireParams::secure_128_d2048();
     let db = build_zero_db();
@@ -87,20 +86,18 @@ fn build_live_state_and_session() -> (
 
     let mut client_session = build_client_session((*live_state.crs).clone()).expect("client");
     register_client_session(&mut client_session, &live_state).expect("register session");
-    (live_state, client_session, store, params)
+    (live_state, client_session, store)
 }
 
 fn pir_query_leaf_row(
     leaf_index: u32,
     live_state: &raven_railgun_engine::inspire::InspireServerState,
     client_session: &ClientSession,
-    params: &InspireParams,
 ) -> Vec<u8> {
     let (client_state, query) = build_seeded_query(
         client_session,
         live_state.shard_config(),
         u64::from(leaf_index),
-        params,
     )
     .expect("build_seeded_query");
     use raven_railgun_engine::PirScheme;
@@ -113,11 +110,11 @@ fn pir_query_leaf_row(
 
 #[test]
 fn per_leaf_path_query_recovers_sibling_walk_and_root_for_target_leaves() {
-    let (live_state, client_session, store, params) = build_live_state_and_session();
+    let (live_state, client_session, store) = build_live_state_and_session();
     let imt = store.imt(TREE_NUMBER).expect("tree present");
 
     for leaf_idx in [0u32, 1, 7, 16, 31] {
-        let plaintext = pir_query_leaf_row(leaf_idx, &live_state, &client_session, &params);
+        let plaintext = pir_query_leaf_row(leaf_idx, &live_state, &client_session);
         let row = plaintext
             .get(..PATH_RECORD_BYTES)
             .expect("row plaintext present");

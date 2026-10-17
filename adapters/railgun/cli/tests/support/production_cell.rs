@@ -86,7 +86,7 @@ impl ProductionCell {
         let mut client_session =
             build_client_session((*server_state.crs).clone()).expect("build_client_session");
         let (_, registration_query) =
-            build_seeded_query(&client_session, server_state.shard_config(), 0, &params)
+            build_seeded_query(&client_session, server_state.shard_config(), 0)
                 .expect("build registration query");
         let registration_keys = registration_query
             .inspiring_packing_keys
@@ -201,7 +201,6 @@ impl ProductionCell {
             &self.client_session,
             self.server_state.shard_config(),
             target_index,
-            &self.params,
         )
         .expect("build_seeded_query")
     }
@@ -216,13 +215,9 @@ impl ProductionCell {
             let stride = u64::try_from(k).expect("batch index fits u64") * 911;
             let idx = target_index.wrapping_add(stride) % span;
             targets.push(idx);
-            let (cs, q) = build_seeded_query(
-                &self.client_session,
-                self.server_state.shard_config(),
-                idx,
-                &self.params,
-            )
-            .expect("build_seeded_query");
+            let (cs, q) =
+                build_seeded_query(&self.client_session, self.server_state.shard_config(), idx)
+                    .expect("build_seeded_query");
             client_states.push(cs);
             queries.push(q);
         }

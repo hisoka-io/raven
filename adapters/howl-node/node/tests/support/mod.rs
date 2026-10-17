@@ -542,7 +542,7 @@ impl Reader {
         let config = ShardConfig::for_ring_dim(2048, 256, leaf_count).expect("config");
         let (states, batch) = self
             .session
-            .query_batch(&targets, &config, &mut self.sampler)
+            .query_batch_fresh(&targets, &config)
             .expect("batch");
         (
             states,

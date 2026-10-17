@@ -251,7 +251,7 @@ fn worst_mismatch_at_width(entry_size: usize) -> usize {
     let mut worst = 0usize;
     for entry in 0..entries {
         let (client_state, query) =
-            build_seeded_query(&client_session, state.shard_config(), entry as u64, &params)
+            build_seeded_query(&client_session, state.shard_config(), entry as u64)
                 .expect("build_seeded_query");
         let response = <raven_railgun_engine::inspire::RavenInspireScheme as PirScheme>::respond(
             &state, &query,

@@ -57,7 +57,7 @@ fn capped_state() -> (
 
 #[test]
 fn a_retired_handle_is_refused_instead_of_served() {
-    let (params, state, mut session, _db) = capped_state();
+    let (_, state, mut session, _db) = capped_state();
     register_client_session(&mut session, &state).expect("register 1");
     register_client_session(&mut session, &state).expect("register 2");
     let retired = session.session_handle().expect("handle after register 2");
@@ -71,7 +71,7 @@ fn a_retired_handle_is_refused_instead_of_served() {
     );
 
     let (_client_state, mut query) =
-        build_seeded_query(&session, state.shard_config(), 1, &params).expect("build query");
+        build_seeded_query(&session, state.shard_config(), 1).expect("build query");
     query.session_handle = Some(retired);
     let err = <RavenInspireScheme as PirScheme>::respond(&state, &query)
         .expect_err("a retired handle must not be served");
@@ -98,7 +98,7 @@ fn live_adapter_refuses_a_legacy_three_row_query_before_expansion() {
     let (params, state, mut session, _db) = capped_state();
     register_client_session(&mut session, &state).expect("register");
     let (_client_state, mut query) =
-        build_seeded_query(&session, state.shard_config(), 0, &params).expect("build query");
+        build_seeded_query(&session, state.shard_config(), 0).expect("build query");
     let row = query
         .rgsw_ciphertext
         .rows
@@ -122,7 +122,7 @@ fn live_adapter_refuses_a_legacy_three_row_query_before_expansion() {
 /// A wire client holds the same process-global handle that keys the core store.
 #[test]
 fn a_wire_handle_is_the_core_handle_the_store_is_keyed_on() {
-    let (params, state, mut session, db) = capped_state();
+    let (_, state, mut session, db) = capped_state();
     let wire_handle = state
         .session_store
         .register_client_session_at(&mut session, std::time::Instant::now())
@@ -137,7 +137,7 @@ fn a_wire_handle_is_the_core_handle_the_store_is_keyed_on() {
     );
 
     let (client_state, mut query) =
-        build_seeded_query(&session, state.shard_config(), 3, &params).expect("build query");
+        build_seeded_query(&session, state.shard_config(), 3).expect("build query");
     query.session_handle = Some(wire_handle);
     let response = <RavenInspireScheme as PirScheme>::respond(&state, &query)
         .expect("a handle in the form a wire client holds must serve");
@@ -153,7 +153,7 @@ fn a_wire_handle_is_the_core_handle_the_store_is_keyed_on() {
     // The in-process wrapper installs the same core-issued handle.
     register_client_session(&mut session, &state).expect("register via the production wrapper");
     let (wrapped_state, wrapped_query) =
-        build_seeded_query(&session, state.shard_config(), 3, &params).expect("build query");
+        build_seeded_query(&session, state.shard_config(), 3).expect("build query");
     let wrapped_response = <RavenInspireScheme as PirScheme>::respond(&state, &wrapped_query)
         .expect("live session serves");
     let wrapped_plaintext = extract_response(

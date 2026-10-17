@@ -327,7 +327,7 @@ fn query_pool(f: &Fixture, size: usize) -> Vec<(u64, ClientState, SeededClientQu
     (0..size as u64)
         .map(|i| {
             let index = (i % shards) * ROWS_PER_SHARD + (i * 37 + 5) % ROWS_PER_SHARD;
-            let (cs, q) = build_seeded_query(&f.client, f.state.shard_config(), index, &f.params)
+            let (cs, q) = build_seeded_query(&f.client, f.state.shard_config(), index)
                 .expect("build_seeded_query");
             (index, cs, q)
         })

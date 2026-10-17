@@ -9,17 +9,16 @@
 //! Rust client.
 //!
 //! Production entry points draw the RLWE key, packing-key noise and query noise
-//! from `OsRng`-seeded streams. No `#[wasm_bindgen]` entry point accepts
-//! caller-supplied randomness, and the `#[doc(hidden)]` test seam
-//! [`build_seeded_query_rust_with_noise_seed`] never crosses the JS boundary.
+//! inside `raven-inspire` from OS-seeded streams. No `#[wasm_bindgen]` entry point
+//! accepts caller-supplied randomness, and the test-only seam
+//! `build_seeded_query_rust_with_noise_seed` is not built outside this crate's tests.
 //! `src/suites/client_entropy_kat.rs` covers the entropy-drawn query path.
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 #![deny(missing_docs)]
 
-use rand::rngs::OsRng;
-use rand::RngCore;
 use raven_inspire::inspiring::PackParams;
+#[cfg(test)]
 use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, ShardConfig};
 use raven_inspire::pir::mod_switch::{extract_inspiring_mod_switched, MOD_SWITCH_TARGET_36BIT};
@@ -78,28 +77,11 @@ enum WasmClientError {
     Encode { what: &'static str, detail: String },
     #[error("raven-inspire {op}: {detail}")]
     Inspire { op: &'static str, detail: String },
-    #[error("OS entropy unavailable for {what}: {detail}")]
-    Entropy { what: &'static str, detail: String },
     #[error("parameter floor refused {what}: {source}")]
     ParameterFloor {
         what: &'static str,
         source: ParameterFloorError,
     },
-}
-
-/// Gaussian sampler over a fresh 32-byte OS seed.
-///
-/// A failed draw surfaces as an error; falling back to a weaker source would
-/// hand every client the same secret key.
-fn os_seeded_sampler(sigma: f64, what: &'static str) -> Result<GaussianSampler, WasmClientError> {
-    let mut seed = [0u8; 32];
-    OsRng
-        .try_fill_bytes(&mut seed)
-        .map_err(|e| WasmClientError::Entropy {
-            what,
-            detail: e.to_string(),
-        })?;
-    Ok(GaussianSampler::from_seed(sigma, seed))
 }
 
 impl From<WasmClientError> for JsValue {
@@ -476,13 +458,13 @@ pub fn build_seeded_query(
             what: "shard_config",
             detail: format!("shard geometry does not match the session ring: {detail}"),
         })?;
-    // reused query noise lets the server re-encrypt each candidate index and match bytes
-    let mut sampler = os_seeded_sampler(session.params.sigma, "seeded_query_noise")?;
+    // Fresh noise per query: reused noise lets the server re-encrypt each candidate index and
+    // match bytes.
     let (client_state, query) = session
         .inner
-        .query_seeded(target_idx, &shard_config, &mut sampler)
+        .query_seeded_fresh(target_idx, &shard_config)
         .map_err(|e| WasmClientError::Inspire {
-            op: "ClientSession::query_seeded",
+            op: "ClientSession::query_seeded_fresh",
             detail: e.to_string(),
         })?;
     let client_state_bincode = encode(&client_state, "client_state")?;
@@ -797,9 +779,9 @@ pub fn build_seeded_query_rust(
 ) -> Result<(ClientState, SeededClientQuery), String> {
     floor_refusal_for_query(session, params)
         .map_err(|e| format!("parameter floor refused: {e}"))?;
-    let mut sampler =
-        os_seeded_sampler(params.sigma, "seeded_query_noise").map_err(|e| e.to_string())?;
-    seeded_query_with_sampler(session, shard_config, target_idx, &mut sampler)
+    session
+        .query_seeded_fresh(target_idx, shard_config)
+        .map_err(|e| e.to_string())
 }
 
 /// [`build_seeded_query_rust`] with the Gaussian noise seed pinned by the caller.
@@ -807,7 +789,7 @@ pub fn build_seeded_query_rust(
 /// Test seam only: two calls under one seed emit byte-identical noise, which is what
 /// makes a native-vs-wasm byte comparison possible at all. Callers on a real query
 /// path MUST NOT pin a seed - a reused seed hands the server the query index.
-#[doc(hidden)]
+#[cfg(test)]
 pub fn build_seeded_query_rust_with_noise_seed(
     session: &ClientSession,
     params: &InspireParams,
@@ -821,6 +803,7 @@ pub fn build_seeded_query_rust_with_noise_seed(
     seeded_query_with_sampler(session, shard_config, target_idx, &mut sampler)
 }
 
+#[cfg(test)]
 fn seeded_query_with_sampler(
     session: &ClientSession,
     shard_config: &ShardConfig,

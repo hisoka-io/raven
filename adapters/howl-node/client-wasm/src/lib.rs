@@ -27,8 +27,7 @@ use howl_wire::{
     ROWS_PER_SHARD,
 };
 use rand::rngs::OsRng;
-use rand::{Rng, RngCore};
-use raven_inspire::math::GaussianSampler;
+use rand::Rng;
 use raven_inspire::params::ShardConfig;
 use raven_inspire::{ClientSession, ClientState, ServerCrs, ServerResponse, ServerSessionHandle};
 use wasm_bindgen::prelude::*;
@@ -360,16 +359,6 @@ pub fn decode_answer(bytes: &[u8]) -> Result<HowlAnswer, JsValue> {
     Ok(out)
 }
 
-/// A sampler over a fresh OS seed. A failed draw is an error: any fallback would hand clients
-/// a shared secret or shared query noise.
-fn os_sampler(sigma: f64) -> Result<GaussianSampler, String> {
-    let mut seed = [0u8; 32];
-    OsRng
-        .try_fill_bytes(&mut seed)
-        .map_err(|e| format!("OS entropy unavailable: {e}"))?;
-    Ok(GaussianSampler::from_seed(sigma, seed))
-}
-
 fn check_leaf_count(leaf_count: u64) -> Result<(), String> {
     if leaf_count == 0 || leaf_count > MAX_LEAVES {
         return Err(format!(
@@ -568,11 +557,10 @@ impl HowlClient {
         }
         let config = ShardConfig::for_ring_dim(RING_DIM, CELL_BYTES, leaf_count)
             .map_err(|e| e.to_string())?;
-        let mut sampler = os_sampler(self.crs.params.sigma)?;
         let queries: Vec<u64> = targets.iter().map(|t| u64::from(*t)).collect();
         let (states, batch) = self
             .session
-            .query_batch(&queries, &config, &mut sampler)
+            .query_batch_fresh(&queries, &config)
             .map_err(|e| e.to_string())?;
         let body = request(&bincode::serialize(&batch).map_err(|e| e.to_string())?);
         if inline {

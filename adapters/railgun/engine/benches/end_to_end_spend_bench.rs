@@ -89,9 +89,8 @@ fn run_one_seed(cell: &CellShape, seed: u64) -> (Duration, Duration, Duration, D
                 % entries_u64;
 
             let bs = Instant::now();
-            let (cs, query) =
-                build_seeded_query(&client, state_arc.shard_config(), target, &params)
-                    .expect("build_seeded_query");
+            let (cs, query) = build_seeded_query(&client, state_arc.shard_config(), target)
+                .expect("build_seeded_query");
             total_build += bs.elapsed();
 
             let rs = Instant::now();

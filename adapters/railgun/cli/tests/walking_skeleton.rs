@@ -74,7 +74,6 @@ async fn pir_query_round_trip_recovers_planted_row() {
         &pieces.client_session,
         server_state_arc.shard_config(),
         target_index,
-        &pieces.params,
     )
     .expect("build seeded PIR query");
     let query_bytes = raven_railgun_http::write_versioned(&query)

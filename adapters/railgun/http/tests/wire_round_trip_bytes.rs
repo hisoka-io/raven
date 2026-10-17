@@ -340,8 +340,8 @@ async fn one_batch_round_trip_produces_the_published_wire_figure() {
     let router = inspire_router(app).expect("router");
 
     let mut client_session = build_client_session((*crs).clone()).expect("client session");
-    let (_, unregistered) = build_seeded_query(&client_session, served.shard_config(), 0, &params)
-        .expect("registration query");
+    let (_, unregistered) =
+        build_seeded_query(&client_session, served.shard_config(), 0).expect("registration query");
     let packing_keys = unregistered
         .inspiring_packing_keys
         .expect("an unregistered query carries its packing keys");
@@ -358,7 +358,6 @@ async fn one_batch_round_trip_produces_the_published_wire_figure() {
         &client_session,
         served.shard_config(),
         u64::from(TARGET_INDEX),
-        &params,
     )
     .expect("target query");
     assert!(

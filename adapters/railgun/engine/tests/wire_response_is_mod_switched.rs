@@ -28,12 +28,10 @@ fn served_response(
     raven_inspire::ServerResponse,
 ) {
     let state = cached_toy_state(entry_bytes);
-    let params = state.crs.params.clone();
     let mut session = build_client_session((*state.crs).clone()).expect("client session");
     register_client_session(&mut session, &state).expect("register session");
-    let (client_state, query) =
-        build_seeded_query(&session, state.shard_config(), TARGET_INDEX, &params)
-            .expect("build_seeded_query");
+    let (client_state, query) = build_seeded_query(&session, state.shard_config(), TARGET_INDEX)
+        .expect("build_seeded_query");
     let response = RavenInspireScheme::respond(&state, &query).expect("respond");
     (state, client_state, response)
 }

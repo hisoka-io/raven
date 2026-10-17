@@ -14,8 +14,8 @@
 //!   -- extract <work-dir> response.wire
 //! ```
 //!
-//! `mkquery` pins both seeds, so one `(params.bin, flat-index)` always yields the
-//! same `query.wire` and two servers on one snapshot are byte-comparable.
+//! Each `mkquery` draws a fresh secret and fresh query noise; send the one `query.wire` to
+//! every server on a snapshot to compare their answers byte for byte.
 
 #![allow(
     clippy::expect_used,
@@ -29,8 +29,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use raven_inspire::math::GaussianSampler;
-use raven_inspire::params::{InspireParams, ShardConfig};
+use raven_inspire::params::ShardConfig;
 use raven_inspire::{
     ClientSession, ClientState, PackingMode, SeededClientQuery, ServerCrs, ServerResponse,
     SessionResidue,
@@ -39,7 +38,6 @@ use raven_inspire_client_wasm::extract_response_rust;
 
 const WIRE_SCHEMA_PREFIX_LEN: usize = 2;
 const WIRE_SCHEMA_VERSION: u16 = 8;
-const NOISE_SEED: [u8; 32] = *b"raven-native-live-replay-noise01";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct InstanceParamsWire {
@@ -85,25 +83,22 @@ fn read_params(path: &Path) -> InstanceParamsWire {
     bincode::deserialize(&strip_envelope(&raw, "params")).expect("decode InstanceParams")
 }
 
-fn session_from(params: &InstanceParamsWire) -> (ClientSession, InspireParams, ShardConfig) {
-    let inspire_params: InspireParams =
-        bincode::deserialize(&params.inspire_params_bincode).expect("decode InspireParams");
+fn session_from(params: &InstanceParamsWire) -> (ClientSession, ShardConfig) {
     let shard_config: ShardConfig =
         bincode::deserialize(&params.shard_config_bincode).expect("decode ShardConfig");
     let crs = ServerCrs::from_versioned_bytes(&params.crs_bincode).expect("decode wire CRS");
     let session = ClientSession::with_fresh_secret(crs).expect("build ClientSession");
-    (session, inspire_params, shard_config)
+    (session, shard_config)
 }
 
 fn mkquery(params_path: &Path, target_idx: u64, work_dir: &Path) {
     let params = read_params(params_path);
     fs::create_dir_all(work_dir).expect("create work dir");
-    let (session, inspire_params, shard_config) = session_from(&params);
+    let (session, shard_config) = session_from(&params);
 
-    let mut sampler = GaussianSampler::from_seed(inspire_params.sigma, NOISE_SEED);
     let (client_state, mut query) = session
-        .query_seeded(target_idx, &shard_config, &mut sampler)
-        .expect("query_seeded");
+        .query_seeded_fresh(target_idx, &shard_config)
+        .expect("query_seeded_fresh");
     query.packing_mode = PackingMode::Inspiring;
 
     let query_body = bincode::serialize(&query).expect("encode SeededClientQuery");

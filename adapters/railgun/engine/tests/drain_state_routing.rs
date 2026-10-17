@@ -11,7 +11,6 @@
 
 use std::sync::Arc;
 
-use raven_inspire::params::InspireParams;
 use raven_railgun_core::{AdapterError, InstanceId};
 use raven_railgun_engine::inspire::{InspireServerState, RavenInspireScheme};
 use raven_railgun_engine::{DrainState, Engine, InstanceRole, PirInstance};
@@ -238,7 +237,6 @@ fn build_real_query(
     use raven_railgun_engine::inspire::{
         build_client_session, build_seeded_query, register_client_session,
     };
-    let params = InspireParams::secure_128_d2048();
     let snap = inst.current_state();
     // Only the secret key is wanted; the CRS below is the snapshot's, so packing keys derive
     // against the same CRS. This used to build a whole server state and discard it.
@@ -247,7 +245,6 @@ fn build_real_query(
     // Register against the same session store respond() reads (this snapshot).
     register_client_session(&mut session, snap.as_ref()).expect("register");
     let shard_config = snap.shard_config().clone();
-    let (_state, query) =
-        build_seeded_query(&session, &shard_config, 0, &params).expect("build query");
+    let (_state, query) = build_seeded_query(&session, &shard_config, 0).expect("build query");
     query
 }

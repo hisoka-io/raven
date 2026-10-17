@@ -168,9 +168,8 @@ fn k_widening_at_two_cells() {
             for k in 0..BATCH_SIZE as u64 {
                 let idx_offset = k * 911 + (seed as u64 * 31_415);
                 let idx = (37u64.wrapping_add(idx_offset)) % (entries as u64);
-                let (_cs, q) =
-                    build_seeded_query(&client_session, state_arc.shard_config(), idx, &params)
-                        .expect("build_seeded_query");
+                let (_cs, q) = build_seeded_query(&client_session, state_arc.shard_config(), idx)
+                    .expect("build_seeded_query");
                 queries.push(q);
             }
             eprintln!(

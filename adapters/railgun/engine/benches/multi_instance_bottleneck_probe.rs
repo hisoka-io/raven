@@ -207,9 +207,8 @@ fn multi_instance_bottleneck_probe() {
         let instance_idx = (k * 911 % NUM_INSTANCES as u64) as usize;
         let inst = &instances[instance_idx];
         let target_idx = (k.wrapping_mul(7919) + 11) % entries;
-        let (_cs, q) =
-            build_seeded_query(&inst.client, inst.state.shard_config(), target_idx, &params)
-                .expect("build_seeded_query");
+        let (_cs, q) = build_seeded_query(&inst.client, inst.state.shard_config(), target_idx)
+            .expect("build_seeded_query");
         multi_queries.push((instance_idx, q));
     }
 
@@ -222,7 +221,6 @@ fn multi_instance_bottleneck_probe() {
             &instances[0].client,
             instances[0].state.shard_config(),
             target_idx,
-            &params,
         )
         .expect("build_seeded_query");
         single_queries.push((0, q));

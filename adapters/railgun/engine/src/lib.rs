@@ -76,7 +76,7 @@ mod tests {
         inspire::register_client_session(&mut client_session_a, &state_a).expect("register a");
         let target = 42u64;
         let (cs, q) =
-            inspire::build_seeded_query(&client_session_a, state_a.shard_config(), target, &params)
+            inspire::build_seeded_query(&client_session_a, state_a.shard_config(), target)
                 .expect("query a");
 
         let resp_a =
@@ -86,7 +86,7 @@ mod tests {
             inspire::build_client_session((*state_b.crs).clone()).expect("client session b");
         inspire::register_client_session(&mut client_session_b, &state_b).expect("register b");
         let (cs_b, q_b) =
-            inspire::build_seeded_query(&client_session_b, state_b.shard_config(), target, &params)
+            inspire::build_seeded_query(&client_session_b, state_b.shard_config(), target)
                 .expect("query b");
         let resp_b =
             <inspire::RavenInspireScheme as PirScheme>::respond(&state_b, &q_b).expect("respond b");

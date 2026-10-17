@@ -24,12 +24,7 @@ fn database() -> Vec<u8> {
         .collect()
 }
 
-fn fixture() -> (
-    InspireParams,
-    InspireServerState,
-    raven_inspire::ClientSession,
-    Vec<u8>,
-) {
+fn fixture() -> (InspireServerState, raven_inspire::ClientSession, Vec<u8>) {
     let params = InspireParams::secure_128_d2048();
     let db = database();
     let (state, _) =
@@ -37,7 +32,7 @@ fn fixture() -> (
     let crs = (*state.crs).clone();
     let mut session = build_client_session(crs).expect("client session");
     register_client_session(&mut session, &state).expect("register session");
-    (params, state, session, db)
+    (state, session, db)
 }
 
 fn expected_record(db: &[u8], index: usize) -> Vec<u8> {
@@ -48,12 +43,11 @@ fn expected_record(db: &[u8], index: usize) -> Vec<u8> {
 
 #[test]
 fn padding_lands_on_a_ladder_step_for_every_real_count() {
-    let (params, state, session, _db) = fixture();
+    let (state, session, _db) = fixture();
     for real in 1..=8usize {
         let indices: Vec<u64> = (0..real as u64).collect();
         let (states, queries) =
-            build_padded_batch(&session, state.shard_config(), &params, &indices)
-                .expect("pad batch");
+            build_padded_batch(&session, state.shard_config(), &indices).expect("pad batch");
         let step = batch_ladder::padded_len(real).expect("in ladder range");
         assert_eq!(
             queries.len(),
@@ -71,10 +65,10 @@ fn padding_lands_on_a_ladder_step_for_every_real_count() {
 
 #[test]
 fn a_padded_slot_is_wire_identical_in_shape_to_a_real_one() {
-    let (params, state, session, _db) = fixture();
+    let (state, session, _db) = fixture();
     let indices: Vec<u64> = vec![3, 11, 42];
     let (_states, queries) =
-        build_padded_batch(&session, state.shard_config(), &params, &indices).expect("pad batch");
+        build_padded_batch(&session, state.shard_config(), &indices).expect("pad batch");
     assert_eq!(queries.len(), 4, "3 real queries pad to the step at 4");
 
     let mut lengths = Vec::with_capacity(queries.len());
@@ -105,10 +99,10 @@ fn a_padded_slot_is_wire_identical_in_shape_to_a_real_one() {
 
 #[test]
 fn real_slots_still_decode_in_order_inside_a_padded_batch() {
-    let (params, state, session, db) = fixture();
+    let (state, session, db) = fixture();
     let indices: Vec<u64> = vec![5, 9, 17];
     let (states, queries) =
-        build_padded_batch(&session, state.shard_config(), &params, &indices).expect("pad batch");
+        build_padded_batch(&session, state.shard_config(), &indices).expect("pad batch");
 
     let responses: Vec<_> = queries
         .iter()
@@ -140,11 +134,11 @@ fn real_slots_still_decode_in_order_inside_a_padded_batch() {
 
 #[test]
 fn an_unpadded_batch_of_three_is_off_the_ladder() {
-    let (params, state, session, _db) = fixture();
+    let (state, session, _db) = fixture();
     let unpadded: Vec<_> = [1u64, 2, 3]
         .iter()
         .map(|i| {
-            build_seeded_query(&session, state.shard_config(), *i, &params)
+            build_seeded_query(&session, state.shard_config(), *i)
                 .expect("build")
                 .1
         })
@@ -157,8 +151,8 @@ fn an_unpadded_batch_of_three_is_off_the_ladder() {
 
 #[test]
 fn empty_and_oversized_batches_are_typed_errors() {
-    let (params, state, session, _db) = fixture();
-    let err = build_padded_batch(&session, state.shard_config(), &params, &[])
+    let (state, session, _db) = fixture();
+    let err = build_padded_batch(&session, state.shard_config(), &[])
         .expect_err("empty batch has nothing to pad");
     assert!(
         format!("{err}").contains("at least one real query"),
@@ -166,7 +160,7 @@ fn empty_and_oversized_batches_are_typed_errors() {
     );
 
     let too_many: Vec<u64> = (0..33).collect();
-    let err = build_padded_batch(&session, state.shard_config(), &params, &too_many)
+    let err = build_padded_batch(&session, state.shard_config(), &too_many)
         .expect_err("33 exceeds the top ladder step");
     assert!(format!("{err}").contains("split into"), "{err}");
 }
@@ -182,12 +176,12 @@ fn empty_and_oversized_batches_are_typed_errors() {
 /// is the drawn index, so no decryption is needed to see it.
 #[test]
 fn the_pad_draw_does_not_reproduce_itself_across_calls() {
-    let (params, state, session, _db) = fixture();
+    let (state, session, _db) = fixture();
     let indices: Vec<u64> = (0..5).collect();
 
     let drawn = || -> Vec<u64> {
-        let (states, _q) = build_padded_batch(&session, state.shard_config(), &params, &indices)
-            .expect("pad batch");
+        let (states, _q) =
+            build_padded_batch(&session, state.shard_config(), &indices).expect("pad batch");
         states.iter().map(|s| s.index).collect()
     };
 
@@ -217,8 +211,8 @@ fn the_pad_draw_does_not_reproduce_itself_across_calls() {
     let real = indices.len();
     let mut periodic = 0;
     for _ in 0..trials {
-        let (states, _q) = build_padded_batch(&session, state.shard_config(), &params, &indices)
-            .expect("pad batch");
+        let (states, _q) =
+            build_padded_batch(&session, state.shard_config(), &indices).expect("pad batch");
         let seq: Vec<u64> = states.iter().map(|s| s.index).collect();
         if seq.iter().zip(seq.iter().skip(real)).all(|(a, b)| a == b) {
             periodic += 1;

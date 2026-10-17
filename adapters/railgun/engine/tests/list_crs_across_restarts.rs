@@ -112,10 +112,9 @@ fn decode_through(
     served: &InspireServerState,
     row: u64,
 ) -> Vec<u8> {
-    let params = InspireParams::secure_128_d2048();
     let session = build_client_session(context_crs.clone()).expect("session");
     let (client_state, query) =
-        build_seeded_query(&session, served.shard_config(), row, &params).expect("query");
+        build_seeded_query(&session, served.shard_config(), row).expect("query");
     let response = RavenInspireScheme::respond(served, &query).expect("respond");
     extract_response(context_crs, &client_state, &response, PATH10_RECORD_BYTES).expect("extract")
 }

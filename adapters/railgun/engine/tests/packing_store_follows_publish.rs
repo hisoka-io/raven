@@ -190,8 +190,7 @@ fn query_for(
     session: &ClientSession,
     row: u64,
 ) -> (ClientState, SeededClientQuery) {
-    let params = InspireParams::secure_128_d2048();
-    build_seeded_query(session, state.shard_config(), row, &params).expect("query")
+    build_seeded_query(session, state.shard_config(), row).expect("query")
 }
 
 fn served_row(

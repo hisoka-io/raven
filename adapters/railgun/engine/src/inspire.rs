@@ -568,18 +568,16 @@ pub fn register_client_session(
 }
 
 /// Build a [`SeededClientQuery`] for the given index, in whatever packing mode
-/// the session derived from the CRS.
+/// the session derived from the CRS. The query error is drawn inside the session from the
+/// platform entropy source.
 pub fn build_seeded_query(
     client_session: &ClientSession,
     shard_config: &ShardConfig,
     global_index: u64,
-    params: &InspireParams,
 ) -> Result<(ClientState, SeededClientQuery)> {
-    let mut sampler = GaussianSampler::new(params.sigma);
-    let (state, query) = client_session
-        .query_seeded(global_index, shard_config, &mut sampler)
-        .map_err(|e| AdapterError::Scheme(format!("query_seeded: {e}")))?;
-    Ok((state, query))
+    client_session
+        .query_seeded_fresh(global_index, shard_config)
+        .map_err(|e| AdapterError::Scheme(format!("query_seeded_fresh: {e}")))
 }
 
 /// Largest multiple of `bound` representable in `u64`. Draws at or above it are rejected,
@@ -695,7 +693,6 @@ fn padded_targets(
 pub fn build_padded_batch(
     client_session: &ClientSession,
     shard_config: &ShardConfig,
-    params: &InspireParams,
     global_indices: &[u64],
 ) -> Result<(Vec<ClientState>, Vec<SeededClientQuery>)> {
     let padded = batch_ladder::padded_len(global_indices.len()).ok_or_else(|| {
@@ -717,7 +714,7 @@ pub fn build_padded_batch(
     let mut states = Vec::with_capacity(padded);
     let mut queries = Vec::with_capacity(padded);
     for index in targets {
-        let (state, query) = build_seeded_query(client_session, shard_config, index, params)?;
+        let (state, query) = build_seeded_query(client_session, shard_config, index)?;
         states.push(state);
         queries.push(query);
     }
@@ -2114,10 +2111,9 @@ mod unfilled_cell_tests {
     }
 
     fn decode(state: &InspireServerState, row: usize) -> Vec<u8> {
-        let params = InspireParams::secure_128_d2048();
         let session = build_client_session((*state.crs).clone()).expect("session");
         let (client_state, query) =
-            build_seeded_query(&session, state.shard_config(), row as u64, &params).expect("query");
+            build_seeded_query(&session, state.shard_config(), row as u64).expect("query");
         let response = RavenInspireScheme::respond(state, &query).expect("respond");
         extract_response(&state.crs, &client_state, &response, ENTRY).expect("extract")
     }

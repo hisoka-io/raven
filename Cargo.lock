@@ -624,7 +624,6 @@ dependencies = [
  "console_error_panic_hook",
  "js-sys",
  "proptest",
- "rand 0.8.6",
  "raven-inspire",
  "serde",
  "thiserror",

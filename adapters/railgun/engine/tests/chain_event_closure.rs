@@ -129,7 +129,6 @@ async fn chain_event_propagates_to_pir_response() {
         &client_session,
         live_state_after.shard_config(),
         u64::from(TARGET),
-        &params,
     )
     .expect("build query");
 
@@ -354,7 +353,6 @@ async fn chain_event_propagates_to_pir_response_at_production_cell() {
         &client_session,
         live_state_after.shard_config(),
         u64::from(TARGET),
-        &params,
     )
     .expect("build query");
 
