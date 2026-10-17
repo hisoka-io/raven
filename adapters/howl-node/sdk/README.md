@@ -49,9 +49,10 @@ const witness = await source.merkleWitness(records[0].leafIndex); // or (index, 
 
 A key is built under a secret drawn inside the wasm when a client is created, and never under
 one the caller supplies. The client reads under the parameter set the node's params answer
-names, and refuses answers to its own requests from a node of another set. In `session` mode the source uploads one key per session and opens a
-new session, under a new secret, when the node reports the old one expired. In `inline` mode
-every request carries a key built for it alone.
+names, and refuses answers to its own requests from a node of another set. In `session` mode
+the source uploads one key per session and opens a new session, under a new secret, when the
+node reports the old one expired. In `inline` mode every request carries a key built for it
+alone.
 
 ## Sizes on the wire
 

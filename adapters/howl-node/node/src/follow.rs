@@ -7,15 +7,15 @@
 //! chain's. When they differ the chain reorganised below the tip: the table goes back to the
 //! newest recorded block the chain still has, and the step reads on from there.
 //!
-//! Within [`WALK_BLOCKS`] of the head a step also reads the header of every block it covers.
-//! The headers must link to each other and to the table's last block, every log must name one
-//! of them, and the pool's leaf count is read at the final header's hash. Leaves are applied
-//! only in order and only up to that count, so the leaves applied are all of the walked
-//! chain's, whatever the endpoint answered between reads. Deeper ranges are checked by reading
-//! the final block's hash on both sides of the table's own check, and their count at that
-//! hash. A leaf whose logged root the table cannot reproduce, or that does not follow the
-//! table's last, means the table's rows are not the chain's even where the hashes agree, and
-//! the table goes back one more mark; so does a count refused twice at the same block.
+//! Within [`WALK_BLOCKS`] of the head a step also reads the header of every block it covers. The
+//! headers must link to each other and to the table's last block, every log must name one of them,
+//! and the pool's leaf count is read at the final header's hash. Leaves are applied only in order
+//! and only if the batch ends exactly at that count, so the leaves applied are all of the walked
+//! chain's, whatever the endpoint answered between reads. Deeper ranges are checked by reading the
+//! final block's hash on both sides of the table's own check, and their count at that hash. A leaf
+//! whose logged root the table cannot reproduce, or that does not follow the table's last, means
+//! the table's rows are not the chain's even where the hashes agree, and the table goes back one
+//! more mark; so does a count refused twice at the same block.
 
 use std::collections::VecDeque;
 use std::ops::Range;
