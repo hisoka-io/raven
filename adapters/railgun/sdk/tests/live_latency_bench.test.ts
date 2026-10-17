@@ -322,7 +322,7 @@ liveDescribe("live latency bench", () => {
       session.free();
       expect(hotSamples.length).toBe(HOT_QUERIES);
     },
-    { timeout: 1_800_000 },
+    1_800_000,
   );
 
   afterAll(() => {

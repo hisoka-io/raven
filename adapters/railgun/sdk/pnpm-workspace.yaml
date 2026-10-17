@@ -2,3 +2,9 @@
 # warns about them. The wasm packages are optional peers a wallet installs itself; the dev tree
 # links pkg-node.
 autoInstallPeers: false
+# Dev-tree advisory fixes. circomlibjs lists web3 but only ever requires web3-utils, so the web3
+# umbrella (and its unpatched request/tar/ws chain) is dropped; exact pins move to patched releases.
+overrides:
+  "@railgun-community/circomlibjs>web3": "-"
+  "ethers>ws": "^8.21.0"
+  "bn.js@<4.12.3": "^4.12.3"

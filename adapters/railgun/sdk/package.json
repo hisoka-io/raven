@@ -68,6 +68,6 @@
     "@types/semver": "^7.7.0",
     "semver": "^7.7.0",
     "typescript": "^5.4.0",
-    "vitest": "^2.1.0"
+    "vitest": "^4.1.11"
   }
 }
