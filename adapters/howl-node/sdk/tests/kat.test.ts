@@ -63,7 +63,7 @@ describe("answers the fixture node served", () => {
     expect([stale.kind, stale.leafCount, stale.block]).toEqual([KIND.stale, 160, LAST_BLOCK]);
 
     const params = wasm.decodeAnswer(fixtureFile("params.bin"));
-    expect([params.kind, params.ladderCap, params.sessionTtlSecs]).toEqual([KIND.params, 16, 3600]);
+    expect([params.kind, params.paramSet, params.ladderCap, params.sessionTtlSecs]).toEqual([KIND.params, 1, 16, 3600]);
   });
 
   it("refuses an answer whose parts disagree with its header", () => {
@@ -76,7 +76,7 @@ describe("answers the fixture node served", () => {
     version[1] = 2;
     expect(() => wasm.decodeAnswer(version)).toThrow(/wire version/);
     const set = bytes.slice();
-    set[3] = 2;
+    set[3] = 3;
     expect(() => wasm.decodeAnswer(set)).toThrow(/parameter set/);
     expect(() => wasm.decodeAnswer(bytes.subarray(0, bytes.length - 1))).toThrow();
     expect(() => wasm.decodeAnswer(new Uint8Array([...bytes, 0]))).toThrow(/past the end/);
@@ -279,5 +279,70 @@ describe("vectors pinned from Howl's own wallet code", () => {
         `cell ${v.leaf_index}`,
       ).toEqual(v);
     });
+  });
+});
+
+/** The fixture's params answer as a set-2 node sends it: set id 2 and no key material. */
+function setTwoParams(): Uint8Array {
+  const set1 = fixtureFile("params.bin");
+  // header, then entry bytes, rows per shard, ladder cap and lifetime: 56 + 14 bytes
+  const out = new Uint8Array(56 + 14 + 4);
+  out.set(set1.subarray(0, 56 + 14));
+  out[3] = 2;
+  return out;
+}
+
+describe("the private-read client on parameter set 2", () => {
+  const params = setTwoParams();
+
+  it("follows the set the node names, with its own key sizes", () => {
+    expect(wasm.decodeAnswer(params).paramSet).toBe(2);
+    const a = new wasm.HowlClient(params);
+    const b = new wasm.HowlClient(params);
+    try {
+      expect(a.paramSet).toBe(2);
+      expect(a.sessionBody().length).toBe(4 + 15_360);
+      expect([...a.sessionBody().subarray(0, 4)]).toEqual([0, 1, 0, 2]);
+      expect(hex(a.sessionBody())).toBe(hex(a.sessionBody()));
+      expect(hex(a.sessionBody())).not.toBe(hex(b.sessionBody()));
+      for (const [real, slots] of [
+        [1, 1],
+        [3, 4],
+        [9, 16],
+      ] as const) {
+        const client = new wasm.HowlClient(params);
+        try {
+          const batch = client.buildBatch(new Uint32Array(real).fill(7), 160);
+          expect(batch.slots).toBe(slots);
+          expect(batch.body.length).toBe(4 + 1 + 15_360 + 2 + 7_460 * slots);
+          // source 2, then the session key byte for byte
+          expect(batch.body[4]).toBe(2);
+          expect(hex(batch.body.subarray(5, 5 + 15_360))).toBe(hex(client.sessionBody().subarray(4)));
+          batch.free();
+          expect(() => client.buildBatch(new Uint32Array([7]), 160)).toThrow(/new client per request/);
+        } finally {
+          client.free();
+        }
+      }
+    } finally {
+      a.free();
+      b.free();
+    }
+  });
+
+  it("refuses key material the set fixes, and answers of the other set", () => {
+    const withCrs = new Uint8Array(params.length + 1);
+    withCrs.set(params);
+    new DataView(withCrs.buffer).setUint32(56 + 14, 1, false);
+    expect(() => new wasm.HowlClient(withCrs)).toThrow(/key material/);
+    const client = new wasm.HowlClient(params);
+    try {
+      const batch = client.buildBatch(new Uint32Array([1]), 160);
+      // a set-1 answer to a set-2 client's request
+      expect(() => client.openNotes(batch, fixtureFile("stale-161.bin"))).toThrow(/parameter set 1/);
+      batch.free();
+    } finally {
+      client.free();
+    }
   });
 });

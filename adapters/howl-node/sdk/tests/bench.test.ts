@@ -1,6 +1,7 @@
 // Client-side time per sync step in the wasm: key build, batch build and open, the tree work
 // of a sync at large pool sizes, the feed scan and a path; and Howl's two discovery rounds
-// through the source end to end against a local node, cold and again with no new rows.
+// through the source end to end against a local node, cold and again with no new rows. The
+// private-read rows run on both parameter sets, one node each on the same chain.
 // Interleaved samples, load recorded.
 // Runs when HOWL_BENCH=1 and HOWL_NODE_BIN names the node binary.
 import { randomBytes } from "node:crypto";
@@ -34,7 +35,9 @@ function summary(samples: number[]) {
 
 describe.skipIf(!run)("client time", () => {
   let chain: LocalChain;
-  let params: Uint8Array;
+  const SETS = [1, 2] as const;
+  const urls = new Map<number, string>();
+  const params = new Map<number, Uint8Array>();
   const samples = new Map<string, number[]>();
   const time = <T>(name: string, f: () => T): T => {
     const start = performance.now();
@@ -47,9 +50,12 @@ describe.skipIf(!run)("client time", () => {
   beforeAll(async () => {
     chain = await LocalChain.start();
     await chain.mineFixture(0, fixture.blocks.length);
-    await chain.startNode(BIN);
-    await chain.caughtUp();
-    params = new Uint8Array(await (await fetch(`${chain.nodeUrl}/howl/v1/params`)).arrayBuffer());
+    for (const set of SETS) {
+      const url = await chain.startNode(BIN, { paramSet: set });
+      await chain.caughtUp(chain.leafCount, url);
+      urls.set(set, url);
+      params.set(set, new Uint8Array(await (await fetch(`${url}/howl/v1/params`)).arrayBuffer()));
+    }
   });
 
   afterAll(async () => {
@@ -58,10 +64,18 @@ describe.skipIf(!run)("client time", () => {
 
   it("measures", async () => {
     const load = { before: loadavg() };
-    // one session client for batches, as a wallet holds one per session
-    const session = new wasm.HowlClient(params);
-    const seat = await fetch(`${chain.nodeUrl}/howl/v1/session`, { method: "POST", body: new Uint8Array(session.sessionBody()) });
-    session.installSession(new Uint8Array(await seat.arrayBuffer()));
+    // one session client per set for batches, as a wallet holds one per session
+    const sessions = new Map<number, ReturnType<typeof newClient>>();
+    function newClient(set: number) {
+      return new wasm.HowlClient(params.get(set)!);
+    }
+    for (const set of SETS) {
+      const session = newClient(set);
+      expect(session.paramSet).toBe(set);
+      const seat = await fetch(`${urls.get(set)}/howl/v1/session`, { method: "POST", body: new Uint8Array(session.sessionBody()) });
+      session.installSession(new Uint8Array(await seat.arrayBuffer()));
+      sessions.set(set, session);
+    }
 
     // a tree of about a million leaves: 976 full blocks and a newest block that grows
     const big = new wasm.HowlTree();
@@ -85,6 +99,14 @@ describe.skipIf(!run)("client time", () => {
       );
       await src.fetchOccurrences(rest);
     };
+    const timedFetch = async (name: string, url: string, body: Uint8Array): Promise<Uint8Array> => {
+      const start = performance.now();
+      const answer = await fetch(url, { method: "POST", body: new Uint8Array(body) });
+      expect(answer.status).toBe(200);
+      const bytes = new Uint8Array(await answer.arrayBuffer());
+      samples.set(name, [...(samples.get(name) ?? []), performance.now() - start]);
+      return bytes;
+    };
     const timed = async (name: string, f: () => Promise<void>) => {
       const start = performance.now();
       await f();
@@ -92,22 +114,25 @@ describe.skipIf(!run)("client time", () => {
     };
 
     for (let round = 0; round < ROUNDS; round++) {
-      const src = new RavenHowlSource({ transport: fetchTransport(chain.nodeUrl), wasm, field: bigintField });
-      await timed(`discovery of ${notes} notes, cold (end to end, local node)`, () => discover(src));
-      await timed(`discovery of ${notes} notes, no new rows (end to end, local node)`, () => discover(src));
-      src.close();
-      const client = time("key build (new client, fresh secret)", () => new wasm.HowlClient(params));
-      client.free();
-      for (const k of [1, 16]) {
-        const positions = Uint32Array.from({ length: k }, (_, i) => 1 + ((round * 7 + i * 13) % 159));
-        const batch = time(`batch build, ${k} slot(s)`, () => session.buildBatch(positions, 160));
-        const answer = await fetch(`${chain.nodeUrl}/howl/v1/notes`, { method: "POST", body: new Uint8Array(batch.body) });
-        expect(answer.status).toBe(200);
-        const bytes = new Uint8Array(await answer.arrayBuffer());
-        const cells = time(`open, ${k} slot(s)`, () => session.openNotes(batch, bytes));
-        expect(cells.cells.length).toBe(256 * k);
-        cells.free();
-        batch.free();
+      // alternate which set goes first, so neither always runs on a warmer machine
+      for (const set of round % 2 === 0 ? SETS : [...SETS].reverse()) {
+        const url = urls.get(set)!;
+        const session = sessions.get(set)!;
+        const src = new RavenHowlSource({ transport: fetchTransport(url), wasm, field: bigintField });
+        await timed(`set ${set}: discovery of ${notes} notes, cold (end to end, local node)`, () => discover(src));
+        await timed(`set ${set}: discovery of ${notes} notes, no new rows (end to end, local node)`, () => discover(src));
+        src.close();
+        const client = time(`set ${set}: key build (new client, fresh secret)`, () => newClient(set));
+        client.free();
+        for (const k of [1, 16]) {
+          const positions = Uint32Array.from({ length: k }, (_, i) => 1 + ((round * 7 + i * 13) % 159));
+          const batch = time(`set ${set}: batch build, ${k} slot(s)`, () => session.buildBatch(positions, 160));
+          const answer = await timedFetch(`set ${set}: node answer, ${k} slot(s) (local HTTP)`, `${url}/howl/v1/notes`, batch.body);
+          const cells = time(`set ${set}: open, ${k} slot(s)`, () => session.openNotes(batch, answer));
+          expect(cells.cells.length).toBe(256 * k);
+          cells.free();
+          batch.free();
+        }
       }
       // a sync step at ~10^6 leaves: 17 new leaves in the newest block, then the root
       const grown = new Uint8Array(newest.length + 17 * 32);
@@ -123,7 +148,7 @@ describe.skipIf(!run)("client time", () => {
       time("path at 1.0e6 leaves (newest block)", () => big.path(n - 1, n));
       time("feed scan, 1e6 rows x 100 tags", () => feed.matches(tags));
     }
-    session.free();
+    for (const session of sessions.values()) session.free();
     load.before = load.before;
     const report = {
       when: new Date().toISOString(),

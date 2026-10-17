@@ -49,6 +49,7 @@ export class LocalChain {
   nodeUrl = "";
   #anvil: ChildProcess;
   #nodes: ChildProcess[] = [];
+  readonly #byUrl = new Map<string, ChildProcess>();
   #sender = "";
   #dir: string;
   deploymentBlock = 0;
@@ -118,9 +119,15 @@ export class LocalChain {
     return Number(BigInt(await this.rpc("eth_blockNumber")));
   }
 
-  /** Start a node following this chain; the first one started is `nodeUrl`. */
-  async startNode(binary: string, options: { ttlSecs?: number } = {}): Promise<string> {
-    const port = await freePort();
+  /**
+   * Start a node following this chain; the first one started is `nodeUrl`. With `port`, on that
+   * port and its data directory, as a restart of the node that ran there.
+   */
+  async startNode(
+    binary: string,
+    options: { ttlSecs?: number; paramSet?: number; port?: number } = {},
+  ): Promise<string> {
+    const port = options.port ?? (await freePort());
     const url = `http://127.0.0.1:${port}`;
     if (this.nodeUrl === "") this.nodeUrl = url;
     const args = [
@@ -132,14 +139,27 @@ export class LocalChain {
       "--poll-ms", "100",
       "--max-range", "10",
       ...(options.ttlSecs === undefined ? [] : ["--session-ttl-secs", String(options.ttlSecs)]),
+      ...(options.paramSet === undefined ? [] : ["--param-set", String(options.paramSet)]),
     ];
-    this.#nodes.push(
-      spawn(binary, args, {
-        env: { ...process.env, HOWL_NODE_RPC_URL: this.rpcUrl, RUST_LOG: "warn" },
-        stdio: "ignore",
-      }),
-    );
+    const node = spawn(binary, args, {
+      env: { ...process.env, HOWL_NODE_RPC_URL: this.rpcUrl, RUST_LOG: "warn" },
+      stdio: "ignore",
+    });
+    this.#nodes.push(node);
+    this.#byUrl.set(url, node);
     return url;
+  }
+
+  /** Stop the node at `url` and start it again on the same port and data, with `options`. */
+  async restartNode(url: string, binary: string, options: { paramSet?: number } = {}): Promise<void> {
+    const node = this.#byUrl.get(url);
+    if (node === undefined) throw new Error(`no node at ${url}`);
+    if (node.exitCode === null) {
+      const exited = new Promise((r) => node.once("exit", r));
+      node.kill("SIGINT");
+      await exited;
+    }
+    await this.startNode(binary, { ...options, port: Number(new URL(url).port) });
   }
 
   async health(url = this.nodeUrl): Promise<Health | null> {

@@ -10,6 +10,7 @@ pub mod chain;
 pub mod engine;
 pub mod follow;
 pub mod http;
+mod single;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,6 +54,9 @@ pub struct NodeConfig {
     pub max_range: u64,
     /// Seats for sessions, and how long one lives after its last use.
     pub sessions: SessionStoreLimits,
+    /// The parameter set of the private reads: `howl_wire::PARAM_SET_D2048_CELL256` or
+    /// `howl_wire::PARAM_SET_D2048_CELL256_P16`.
+    pub param_set: u16,
     /// Fixes the key material a new directory gets; tests only.
     pub seed: Option<[u8; 32]>,
 }
@@ -80,7 +84,12 @@ pub fn open<C: Chain>(
     chain: C,
 ) -> Result<(Follower<C>, Arc<Engine>), StartError> {
     let store = NoteStore::open(config.data_dir.join("table"), config.chain_id, config.pool)?;
-    let pir = Pir::open(&config.data_dir.join("pir"), config.sessions, config.seed)?;
+    let pir = Pir::open(
+        &config.data_dir.join("pir"),
+        config.param_set,
+        config.sessions,
+        config.seed,
+    )?;
     let follower = Follower::new(chain, store, config.indexer(), config.max_range)?;
     let engine = Arc::new(Engine::new(pir));
     engine.refresh(follower.store(), follower.upper(), 0)?;

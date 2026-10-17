@@ -20,19 +20,23 @@ use arc_swap::ArcSwap;
 use howl_store::{NoteStore, StoreError, ROWS_PER_SHARD, SHARD_BYTES};
 use howl_wire::tree::{Node, BLOCK_LEAVES};
 use howl_wire::{
-    Answer, Body, LeafBlock, PrefixSegment, UpperNodes, CELL_BYTES, LADDER, MAX_UPPER_NODES,
-    NODE_BYTES, PARAM_SET_D2048_CELL256, PREFIX_BYTES,
+    Answer, Body, LeafBlock, P16Batch, PrefixSegment, UpperNodes, CELL_BYTES, LADDER,
+    MAX_UPPER_NODES, NODE_BYTES, P16_KEY_BYTES, PARAM_SET_D2048_CELL256,
+    PARAM_SET_D2048_CELL256_P16, PREFIX_BYTES,
 };
 use raven_inspire::inspiring::ClientPackingKeys;
 use raven_inspire::math::GaussianSampler;
 use raven_inspire::params::{InspireParams, ShardConfig};
 use raven_inspire::pir::mod_switch::{mod_switch_response_checked, MOD_SWITCH_TARGET_36BIT};
+use raven_inspire::special_modulus::{KeySeat, ShardTable};
 use raven_inspire::{
     encode_database, resolve_packing_seat, respond_seeded_with_seat, setup_with_rng,
     EncodedDatabase, PackingKeySource, SeededQueryBatch, ServerCrs, ServerInspiringCache,
     ServerSessionHandle,
 };
 use raven_inspire_session::{BoundedSessionStore, SessionStoreLimits};
+
+use crate::single::Single;
 
 /// Rows of one feed segment, as the feed crate cuts them.
 const SEGMENT_ROWS: u64 = howl_prefix_feed::SEGMENT_ROWS;
@@ -76,8 +80,8 @@ pub enum Refusal {
     Malformed(String),
 }
 
-/// The scheme's fixed parts: parameters, public key material, packing cache, sessions.
-pub struct Pir {
+/// Parameter set 1's fixed parts: parameters, public key material, packing cache, sessions.
+struct Gadget {
     params: InspireParams,
     crs: ServerCrs,
     crs_bytes: Vec<u8>,
@@ -86,9 +90,9 @@ pub struct Pir {
     sessions: BoundedSessionStore,
 }
 
-impl std::fmt::Debug for Pir {
+impl std::fmt::Debug for Gadget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Pir")
+        f.debug_struct("Gadget")
             .field("ring_dim", &self.params.ring_dim)
             .field("sessions", &self.sessions.len())
             .finish_non_exhaustive()
@@ -116,13 +120,8 @@ fn wire_crs(crs: &ServerCrs) -> ServerCrs {
     }
 }
 
-impl Pir {
-    /// Load the node's key material from `dir`, creating it on first start. `seed` fixes
-    /// the material a new directory gets, for tests that pin bytes; a node passes `None`.
-    ///
-    /// # Errors
-    /// [`EngineError`] when the material cannot be made, read or written.
-    pub fn open(
+impl Gadget {
+    fn open(
         dir: &Path,
         limits: SessionStoreLimits,
         seed: Option<[u8; 32]>,
@@ -179,27 +178,7 @@ impl Pir {
         })
     }
 
-    /// The versioned key material clients build under.
-    #[must_use]
-    pub fn crs_bytes(&self) -> &[u8] {
-        &self.crs_bytes
-    }
-
-    /// Seconds a session lives after its last use.
-    #[must_use]
-    pub fn session_ttl(&self) -> Duration {
-        self.sessions.limits().ttl
-    }
-
-    /// Sessions resident.
-    #[must_use]
-    pub fn session_count(&self) -> usize {
-        self.sessions.len()
-    }
-
-    /// The largest key upload an honest client sends.
-    #[must_use]
-    pub fn key_upload_limit(&self) -> usize {
+    fn key_upload_limit(&self) -> usize {
         2usize
             .saturating_mul(self.params.packing_key_rows())
             .saturating_mul(self.params.ring_dim)
@@ -208,12 +187,7 @@ impl Pir {
             .saturating_add(4096)
     }
 
-    /// Seat a session's packing key.
-    ///
-    /// # Errors
-    /// [`Refusal::Full`] when every seat is taken, [`Refusal::Malformed`] for a key of
-    /// another shape.
-    pub fn register(&self, keys: ClientPackingKeys) -> Result<ServerSessionHandle, Refusal> {
+    fn register(&self, keys: ClientPackingKeys) -> Result<ServerSessionHandle, Refusal> {
         let (outcome, _, _) = self
             .sessions
             .register_server_side(keys, self.cache.pack_params(), &self.params.ntt_context())
@@ -226,8 +200,7 @@ impl Pir {
         })
     }
 
-    /// Drop sessions idle past their lifetime.
-    pub fn sweep(&self) -> usize {
+    fn sweep(&self) -> usize {
         self.sessions
             .sweep_expired(Instant::now())
             .into_parts()
@@ -246,12 +219,7 @@ impl Pir {
         Ok(db)
     }
 
-    /// Answer every query of `batch` from `view`, in order, each response switched to the
-    /// wire modulus and serialized.
-    ///
-    /// # Errors
-    /// See [`Refusal`]. Nothing is answered when any query is refused.
-    pub fn respond(&self, view: &View, batch: &SeededQueryBatch) -> Result<Vec<Vec<u8>>, Refusal> {
+    fn respond(&self, view: &View, batch: &SeededQueryBatch) -> Result<Vec<Vec<u8>>, Refusal> {
         let queries = batch.queries();
         if !LADDER.contains(&queries.len()) {
             return Err(Refusal::NotALadderStep(queries.len()));
@@ -261,6 +229,10 @@ impl Pir {
             let shard = view
                 .shards
                 .get(query.shard_id as usize)
+                .and_then(|s| match &s.db {
+                    Encoded::Gadget(db) => Some(db),
+                    Encoded::Single(_) => None,
+                })
                 .ok_or(Refusal::Stale {
                     shard: query.shard_id,
                     shards: view.shards.len(),
@@ -293,7 +265,7 @@ impl Pir {
                 let mut local = query.clone();
                 local.shard_id = 0;
                 let response =
-                    respond_seeded_with_seat(&self.crs, &shard.db, &local, &self.cache, &seat)
+                    respond_seeded_with_seat(&self.crs, shard, &local, &self.cache, &seat)
                         .map_err(|e| Refusal::Malformed(e.to_string()))?;
                 let switched =
                     mod_switch_response_checked(&self.params, &response, MOD_SWITCH_TARGET_36BIT)
@@ -301,6 +273,209 @@ impl Pir {
                 bincode::serialize(&switched).map_err(|e| Refusal::Malformed(e.to_string()))
             })
             .collect()
+    }
+}
+
+/// A key upload, decoded for the set the node serves.
+#[derive(Debug)]
+pub enum Key {
+    /// Set 1.
+    Gadget(Box<ClientPackingKeys>),
+    /// Set 2, already seated.
+    Single(Box<KeySeat>),
+}
+
+/// A batch body, decoded for the set the node serves.
+#[derive(Debug)]
+pub enum Batch {
+    /// Set 1.
+    Gadget(SeededQueryBatch),
+    /// Set 2.
+    Single(P16Batch),
+}
+
+enum Scheme {
+    Gadget(Box<Gadget>),
+    Single(Box<Single>),
+}
+
+/// The private-read scheme of the one parameter set a node serves.
+pub struct Pir {
+    set: u16,
+    scheme: Scheme,
+}
+
+impl std::fmt::Debug for Pir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("Pir");
+        d.field("param_set", &self.set);
+        match &self.scheme {
+            Scheme::Gadget(g) => d.field("scheme", g),
+            Scheme::Single(s) => d.field("scheme", s),
+        };
+        d.finish()
+    }
+}
+
+fn bincode_decode<T: serde::de::DeserializeOwned>(bytes: &[u8], limit: usize) -> Result<T, String> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_limit(limit as u64)
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize(bytes)
+        .map_err(|e| format!("body does not decode: {e}"))
+}
+
+impl Pir {
+    /// The scheme of parameter set `set`. Set 1 loads its key material from `dir`, creating it
+    /// on first start; `seed` fixes the material a new directory gets, for tests that pin
+    /// bytes, and a node passes `None`. Set 2's public material is fixed in code.
+    ///
+    /// # Errors
+    /// [`EngineError`] for a set this node does not serve, or material that cannot be made,
+    /// read or written.
+    pub fn open(
+        dir: &Path,
+        set: u16,
+        limits: SessionStoreLimits,
+        seed: Option<[u8; 32]>,
+    ) -> Result<Self, EngineError> {
+        let scheme = match set {
+            PARAM_SET_D2048_CELL256 => Scheme::Gadget(Box::new(Gadget::open(dir, limits, seed)?)),
+            PARAM_SET_D2048_CELL256_P16 => Scheme::Single(Box::new(Single::new(limits)?)),
+            other => {
+                return Err(EngineError::Scheme(format!(
+                    "parameter set {other} is not one this node serves (1 or 2)"
+                )))
+            }
+        };
+        Ok(Self { set, scheme })
+    }
+
+    /// The parameter set served.
+    #[must_use]
+    pub const fn param_set(&self) -> u16 {
+        self.set
+    }
+
+    /// The versioned key material clients build under; empty under set 2.
+    #[must_use]
+    pub fn crs_bytes(&self) -> &[u8] {
+        match &self.scheme {
+            Scheme::Gadget(g) => &g.crs_bytes,
+            Scheme::Single(_) => &[],
+        }
+    }
+
+    /// Seconds a session lives after its last use.
+    #[must_use]
+    pub fn session_ttl(&self) -> Duration {
+        match &self.scheme {
+            Scheme::Gadget(g) => g.sessions.limits().ttl,
+            Scheme::Single(s) => s.limits().ttl,
+        }
+    }
+
+    /// Sessions resident.
+    #[must_use]
+    pub fn session_count(&self) -> usize {
+        match &self.scheme {
+            Scheme::Gadget(g) => g.sessions.len(),
+            Scheme::Single(s) => s.sessions(),
+        }
+    }
+
+    /// The largest key upload an honest client sends.
+    #[must_use]
+    pub fn key_upload_limit(&self) -> usize {
+        match &self.scheme {
+            Scheme::Gadget(g) => g.key_upload_limit(),
+            Scheme::Single(_) => P16_KEY_BYTES,
+        }
+    }
+
+    /// Decode a session payload.
+    ///
+    /// # Errors
+    /// A message for a payload that is not a key of the set served.
+    pub fn decode_key(&self, payload: &[u8]) -> Result<Key, String> {
+        match &self.scheme {
+            Scheme::Gadget(g) => {
+                bincode_decode(payload, g.key_upload_limit()).map(|k| Key::Gadget(Box::new(k)))
+            }
+            Scheme::Single(s) => s.seat(payload).map(|k| Key::Single(Box::new(k))),
+        }
+    }
+
+    /// Decode a batch payload.
+    ///
+    /// # Errors
+    /// A message for a payload that is not a batch of the set served.
+    pub fn decode_batch(&self, payload: &[u8], query_limit: usize) -> Result<Batch, String> {
+        match &self.scheme {
+            Scheme::Gadget(g) => {
+                bincode_decode(payload, g.key_upload_limit() + query_limit).map(Batch::Gadget)
+            }
+            Scheme::Single(_) => P16Batch::decode(payload)
+                .map(Batch::Single)
+                .map_err(|e| format!("body does not decode: {e}")),
+        }
+    }
+
+    /// Seat a session's packing key.
+    ///
+    /// # Errors
+    /// [`Refusal::Full`] when every seat is taken, [`Refusal::Malformed`] for a key of
+    /// another shape or set.
+    pub fn register(&self, key: Key) -> Result<ServerSessionHandle, Refusal> {
+        match (&self.scheme, key) {
+            (Scheme::Gadget(g), Key::Gadget(keys)) => g.register(*keys),
+            (Scheme::Single(s), Key::Single(seat)) => s.register(*seat).map(ServerSessionHandle),
+            _ => Err(Refusal::Malformed(
+                "a key of another parameter set".to_owned(),
+            )),
+        }
+    }
+
+    /// Drop sessions idle past their lifetime.
+    pub fn sweep(&self) -> usize {
+        match &self.scheme {
+            Scheme::Gadget(g) => g.sweep(),
+            Scheme::Single(s) => s.sweep(),
+        }
+    }
+
+    fn encode(&self, cells: &[u8]) -> Result<Encoded, EngineError> {
+        Ok(match &self.scheme {
+            Scheme::Gadget(g) => Encoded::Gadget(g.encode(cells)?),
+            Scheme::Single(s) => Encoded::Single(s.encode(cells)?),
+        })
+    }
+
+    /// Answer every query of `batch` from `view`, in order, each response serialized for
+    /// the wire (under set 1 switched to the wire modulus first).
+    ///
+    /// # Errors
+    /// See [`Refusal`]. Nothing is answered when any query is refused.
+    pub fn respond(&self, view: &View, batch: &Batch) -> Result<Vec<Vec<u8>>, Refusal> {
+        match (&self.scheme, batch) {
+            (Scheme::Gadget(g), Batch::Gadget(batch)) => g.respond(view, batch),
+            (Scheme::Single(s), Batch::Single(batch)) => {
+                let tables: Vec<&ShardTable> = view
+                    .shards
+                    .iter()
+                    .map_while(|shard| match &shard.db {
+                        Encoded::Single(table) => Some(table),
+                        Encoded::Gadget(_) => None,
+                    })
+                    .collect();
+                s.respond(&tables, view.shards.len(), batch)
+            }
+            _ => Err(Refusal::Malformed(
+                "a batch of another parameter set".to_owned(),
+            )),
+        }
     }
 }
 
@@ -322,11 +497,16 @@ fn encode_one(
     })
 }
 
+enum Encoded {
+    Gadget(EncodedDatabase),
+    Single(ShardTable),
+}
+
 /// One encoded shard and the digest of the cells it was encoded from.
 pub struct ShardServe {
     /// SHA-256 of the cells.
     pub digest: [u8; 32],
-    db: EncodedDatabase,
+    db: Encoded,
 }
 
 impl std::fmt::Debug for ShardServe {
@@ -340,6 +520,8 @@ impl std::fmt::Debug for ShardServe {
 /// Everything served, at one leaf count.
 #[derive(Debug, Default)]
 pub struct View {
+    /// The parameter set of the private reads, stated in every answer's header.
+    pub param_set: u16,
     /// Leaves in the tree.
     pub leaf_count: u64,
     /// The chain block the table is the state after; zero before any.
@@ -358,7 +540,7 @@ impl View {
     #[must_use]
     pub const fn answer(&self, body: Body) -> Answer {
         Answer {
-            param_set: PARAM_SET_D2048_CELL256,
+            param_set: self.param_set,
             leaf_count: self.leaf_count,
             block: self.block,
             root: self.root,
@@ -473,9 +655,13 @@ impl Engine {
     /// An engine serving an empty view until the first [`Engine::refresh`].
     #[must_use]
     pub fn new(pir: Pir) -> Self {
+        let empty = View {
+            param_set: pir.param_set(),
+            ..View::default()
+        };
         Self {
             pir,
-            view: ArcSwap::from_pointee(View::default()),
+            view: ArcSwap::from_pointee(empty),
             encodes: AtomicU64::new(0),
             unpublished: AtomicU64::new(u64::MAX),
         }
@@ -589,6 +775,7 @@ impl Engine {
             ))
         })?;
         self.view.store(Arc::new(View {
+            param_set: self.pir.param_set(),
             leaf_count: n,
             block: resume.final_block.unwrap_or(0),
             root: resume.root,

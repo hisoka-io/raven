@@ -2,8 +2,9 @@
 //!
 //! - [`decode_answer`] reads any plain answer (feed segment, block, upper nodes, sync, params,
 //!   stale) and checks that its parts agree with the leaf count in its header.
-//! - [`HowlClient`] holds one freshly drawn secret and the one packing key built under it. It
-//!   builds padded batches of private cell reads and opens their answers.
+//! - [`HowlClient`] holds one freshly drawn secret and the one packing key built under it, for
+//!   the parameter set the node's params answer names (1 or 2). It builds padded batches of
+//!   private cell reads and opens their answers.
 //! - [`HowlTree`] keeps the tree a wallet verified level by level: a sync hashes only what is
 //!   new, and a root or a path at any count it covers walks one right edge.
 //! - [`merkle_path`], [`tree_root`], [`block_node`] and [`fold_path`] are the same arithmetic over
@@ -22,19 +23,23 @@
 )]
 
 use howl_wire::tree::{self, Node, TreeView, TREE_DEPTH};
+use std::cell::{Cell, RefCell};
+
 use howl_wire::{
-    Answer, Body, RequestPrefix, CELL_BYTES, LADDER_CAP, NODE_BYTES, PARAM_SET_D2048_CELL256,
-    ROWS_PER_SHARD,
+    Answer, Body, KeySource, P16Batch, P16Query, RequestPrefix, CELL_BYTES, LADDER_CAP, NODE_BYTES,
+    P16_KEY_BYTES, P16_RESPONSE_BYTES, PARAM_SET_D2048_CELL256, PARAM_SET_D2048_CELL256_P16,
+    RECORD_BYTES, ROWS_PER_SHARD,
 };
 use rand::rngs::OsRng;
 use rand::Rng;
 use raven_inspire::params::ShardConfig;
+use raven_inspire::special_modulus as p16;
 use raven_inspire::{ClientSession, ClientState, ServerCrs, ServerResponse, ServerSessionHandle};
 use wasm_bindgen::prelude::*;
 
 mod lean;
 
-/// Ring dimension of the one parameter set this client speaks.
+/// Ring dimension of both parameter sets this client speaks.
 const RING_DIM: usize = 2048;
 
 /// Largest leaf count of the pool's depth-32 tree.
@@ -91,6 +96,7 @@ pub fn init_panic_hook() {
 #[derive(Debug, Clone, Default)]
 pub struct HowlAnswer {
     kind: u8,
+    param_set: u16,
     leaf_count: u64,
     block: u64,
     root: Vec<u8>,
@@ -115,6 +121,11 @@ impl HowlAnswer {
     #[wasm_bindgen(getter)]
     pub fn kind(&self) -> u8 {
         self.kind
+    }
+    /// Parameter set of the node's private reads.
+    #[wasm_bindgen(getter, js_name = paramSet)]
+    pub fn param_set(&self) -> u16 {
+        self.param_set
     }
     /// Leaves in the tree every part of this answer was read at.
     #[wasm_bindgen(getter, js_name = leafCount)]
@@ -239,8 +250,8 @@ fn check_upper(upper: &howl_wire::UpperNodes, leaf_count: u64) -> Result<(), Str
     Ok(())
 }
 
-/// Decode an answer and check its parts against its own header. Only the parameter set this
-/// client speaks is accepted.
+/// Decode an answer and check its parts against its own header. Only the parameter sets this
+/// client speaks are accepted.
 pub fn decode_answer_rust(bytes: &[u8]) -> Result<Answer, String> {
     if bytes.len() > MAX_ANSWER_BYTES {
         return Err(format!(
@@ -249,9 +260,11 @@ pub fn decode_answer_rust(bytes: &[u8]) -> Result<Answer, String> {
         ));
     }
     let answer = Answer::decode(bytes).map_err(|e| e.to_string())?;
-    if answer.param_set != PARAM_SET_D2048_CELL256 {
+    if answer.param_set != PARAM_SET_D2048_CELL256
+        && answer.param_set != PARAM_SET_D2048_CELL256_P16
+    {
         return Err(format!(
-            "answer is for parameter set {}, this client speaks {PARAM_SET_D2048_CELL256}",
+            "answer is for parameter set {}, this client speaks {PARAM_SET_D2048_CELL256} and {PARAM_SET_D2048_CELL256_P16}",
             answer.param_set
         ));
     }
@@ -300,6 +313,13 @@ pub fn decode_answer_rust(bytes: &[u8]) -> Result<Answer, String> {
                     params.ladder_cap
                 ));
             }
+            // Set 2's key material is fixed in this client, so a node cannot hand out its own.
+            if answer.param_set == PARAM_SET_D2048_CELL256_P16 && !params.crs.is_empty() {
+                return Err(format!(
+                    "a set-{PARAM_SET_D2048_CELL256_P16} params answer carries {} bytes of key material, where the set fixes it",
+                    params.crs.len()
+                ));
+            }
         }
         Body::Session(_) | Body::Notes(_) | Body::Stale => {}
     }
@@ -316,6 +336,7 @@ pub fn decode_answer(bytes: &[u8]) -> Result<HowlAnswer, JsValue> {
     let answer = decode_answer_rust(bytes).map_err(err)?;
     let mut out = HowlAnswer {
         kind: answer.body.kind() as u8,
+        param_set: answer.param_set,
         leaf_count: answer.leaf_count,
         block: answer.block,
         root: answer.root.to_vec(),
@@ -368,14 +389,23 @@ fn check_leaf_count(leaf_count: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn request(payload: &[u8]) -> Vec<u8> {
-    let mut body = RequestPrefix {
-        param_set: PARAM_SET_D2048_CELL256,
-    }
-    .encode()
-    .to_vec();
+fn request(param_set: u16, payload: &[u8]) -> Vec<u8> {
+    let mut body = RequestPrefix { param_set }.encode().to_vec();
     body.extend_from_slice(payload);
     body
+}
+
+/// The secret half of a client, per parameter set.
+enum Reader {
+    Gadget {
+        session: Box<ClientSession>,
+        crs: Box<ServerCrs>,
+    },
+    Single {
+        // Each query draws fresh error and a fresh mask seed from the client.
+        client: Box<RefCell<p16::Client>>,
+        handle: Cell<Option<u64>>,
+    },
 }
 
 /// One private-read client: a secret drawn from OS entropy when it is built, and the one
@@ -387,18 +417,19 @@ fn request(payload: &[u8]) -> Vec<u8> {
 /// without a session.
 #[wasm_bindgen]
 pub struct HowlClient {
-    session: ClientSession,
-    crs: ServerCrs,
+    param_set: u16,
+    reader: Reader,
     ladder_cap: usize,
     session_body: Vec<u8>,
-    sent_inline: std::cell::Cell<bool>,
+    sent_inline: Cell<bool>,
 }
 
 impl std::fmt::Debug for HowlClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HowlClient")
+            .field("param_set", &self.param_set)
             .field("ladder_cap", &self.ladder_cap)
-            .field("has_session", &self.session.session_handle().is_some())
+            .field("has_session", &self.holds_session())
             .finish_non_exhaustive()
     }
 }
@@ -413,34 +444,77 @@ impl HowlClient {
                 answer.body.kind() as u8
             ));
         };
-        let crs = ServerCrs::from_versioned_bytes(&params.crs).map_err(|e| e.to_string())?;
-        raven_client::check_parameter_floor(&crs.params)
-            .map_err(|e| format!("parameter floor refused the node's key material: {e}"))?;
-        if crs.params.ring_dim != RING_DIM
-            || crs.inspiring_num_columns != raven_inspire::num_columns(CELL_BYTES)
-        {
+        let param_set = answer.param_set;
+        let (reader, key) = if param_set == PARAM_SET_D2048_CELL256_P16 {
+            let client =
+                p16::Client::new(&p16::Params::ring2048_cell256()).map_err(|e| e.to_string())?;
+            let key = client
+                .packing_key()
+                .to_bytes(client.params())
+                .map_err(|e| e.to_string())?;
+            if key.len() != P16_KEY_BYTES {
+                return Err(format!("a set-2 key of {} bytes", key.len()));
+            }
+            let reader = Reader::Single {
+                client: Box::new(RefCell::new(client)),
+                handle: Cell::new(None),
+            };
+            (reader, key)
+        } else {
+            let crs = ServerCrs::from_versioned_bytes(&params.crs).map_err(|e| e.to_string())?;
+            raven_client::check_parameter_floor(&crs.params)
+                .map_err(|e| format!("parameter floor refused the node's key material: {e}"))?;
+            if crs.params.ring_dim != RING_DIM
+                || crs.inspiring_num_columns != raven_inspire::num_columns(CELL_BYTES)
+            {
+                return Err(format!(
+                    "key material is for ring {} and {} columns; this client reads {CELL_BYTES}-byte cells at ring {RING_DIM}",
+                    crs.params.ring_dim, crs.inspiring_num_columns
+                ));
+            }
+            let session =
+                ClientSession::with_fresh_secret(crs.clone()).map_err(|e| e.to_string())?;
+            let keys = session
+                .packing_keys()
+                .ok_or("the node's key material has no packing columns")?;
+            let key = bincode::serialize(keys).map_err(|e| e.to_string())?;
+            let reader = Reader::Gadget {
+                session: Box::new(session),
+                crs: Box::new(crs),
+            };
+            (reader, key)
+        };
+        Ok(Self {
+            param_set,
+            reader,
+            ladder_cap: usize::from(params.ladder_cap),
+            session_body: request(param_set, &key),
+            sent_inline: Cell::new(false),
+        })
+    }
+
+    fn holds_session(&self) -> bool {
+        match &self.reader {
+            Reader::Gadget { session, .. } => session.session_handle().is_some(),
+            Reader::Single { handle, .. } => handle.get().is_some(),
+        }
+    }
+
+    /// An answer to this client's own requests must come from a node serving its set.
+    fn decode_own(&self, bytes: &[u8]) -> Result<Answer, String> {
+        let answer = decode_answer_rust(bytes)?;
+        if answer.param_set != self.param_set {
             return Err(format!(
-                "key material is for ring {} and {} columns; this client reads {CELL_BYTES}-byte cells at ring {RING_DIM}",
-                crs.params.ring_dim, crs.inspiring_num_columns
+                "answer is for parameter set {}, this client reads under {}",
+                answer.param_set, self.param_set
             ));
         }
-        let session = ClientSession::with_fresh_secret(crs.clone()).map_err(|e| e.to_string())?;
-        let keys = session
-            .packing_keys()
-            .ok_or("the node's key material has no packing columns")?;
-        let session_body = request(&bincode::serialize(keys).map_err(|e| e.to_string())?);
-        Ok(Self {
-            session,
-            crs,
-            ladder_cap: usize::from(params.ladder_cap),
-            session_body,
-            sent_inline: std::cell::Cell::new(false),
-        })
+        Ok(answer)
     }
 
     /// [`Self::install_session`] for native callers.
     pub fn install_session_rust(&mut self, answer: &[u8]) -> Result<u32, String> {
-        if self.session.session_handle().is_some() {
+        if self.holds_session() {
             return Err(
                 "this client already holds a session; build a new client for another".into(),
             );
@@ -451,16 +525,21 @@ impl HowlClient {
                     .into(),
             );
         }
-        let answer = decode_answer_rust(answer)?;
+        let answer = self.decode_own(answer)?;
         let Body::Session(session) = answer.body else {
             return Err(format!(
                 "expected a session answer, got route {}",
                 answer.body.kind() as u8
             ));
         };
-        self.session
-            .install_server_session_handle(ServerSessionHandle(session.handle))
-            .map_err(|e| e.to_string())?;
+        match &mut self.reader {
+            Reader::Gadget {
+                session: client, ..
+            } => client
+                .install_server_session_handle(ServerSessionHandle(session.handle))
+                .map_err(|e| e.to_string())?,
+            Reader::Single { handle, .. } => handle.set(Some(session.handle)),
+        }
         Ok(session.ttl_secs)
     }
 
@@ -549,24 +628,55 @@ impl HowlClient {
                 _ => return Err(format!("slot {slot} is repeated or outside the batch")),
             }
         }
-        let inline = self.session.session_handle().is_none();
+        let inline = !self.holds_session();
         if inline && self.sent_inline.get() {
             return Err(
                 "this client's key already went out inline; build a new client per request".into(),
             );
         }
-        let config = ShardConfig::for_ring_dim(RING_DIM, CELL_BYTES, leaf_count)
-            .map_err(|e| e.to_string())?;
-        let queries: Vec<u64> = targets.iter().map(|t| u64::from(*t)).collect();
-        let (states, batch) = self
-            .session
-            .query_batch_fresh(&queries, &config)
-            .map_err(|e| e.to_string())?;
-        let body = request(&bincode::serialize(&batch).map_err(|e| e.to_string())?);
+        let (states, payload) = match &self.reader {
+            Reader::Gadget { session, .. } => {
+                let config = ShardConfig::for_ring_dim(RING_DIM, CELL_BYTES, leaf_count)
+                    .map_err(|e| e.to_string())?;
+                let queries: Vec<u64> = targets.iter().map(|t| u64::from(*t)).collect();
+                let (states, batch) = session
+                    .query_batch_fresh(&queries, &config)
+                    .map_err(|e| e.to_string())?;
+                let payload = bincode::serialize(&batch).map_err(|e| e.to_string())?;
+                (Slots::Gadget(states), payload)
+            }
+            Reader::Single { client, handle } => {
+                let mut client = client.borrow_mut();
+                let key = match handle.get() {
+                    Some(handle) => KeySource::Session(handle),
+                    None => KeySource::Inline(
+                        self.session_body
+                            .get(howl_wire::REQUEST_PREFIX_BYTES..)
+                            .unwrap_or_default()
+                            .to_vec(),
+                    ),
+                };
+                let mut queries = Vec::with_capacity(targets.len());
+                for target in targets {
+                    // ROWS_PER_SHARD is a power of two: the row is the target's low bits.
+                    let row = (u64::from(*target) & (ROWS_PER_SHARD - 1)) as usize;
+                    let shard = (u64::from(*target) / ROWS_PER_SHARD) as u32;
+                    let query = client.query(row).map_err(|e| e.to_string())?;
+                    queries.push(P16Query {
+                        shard,
+                        query: query.to_bytes(client.params()).map_err(|e| e.to_string())?,
+                    });
+                }
+                let payload = P16Batch { key, queries }.encode();
+                (Slots::Single(targets.len()), payload)
+            }
+        };
+        let body = request(self.param_set, &payload);
         if inline {
             self.sent_inline.set(true);
         }
         Ok(HowlBatch {
+            param_set: self.param_set,
             states,
             targets: targets.to_vec(),
             slots: slots.to_vec(),
@@ -577,7 +687,13 @@ impl HowlClient {
 
     /// [`Self::open_notes`] for native callers.
     pub fn open_notes_rust(&self, batch: &HowlBatch, answer: &[u8]) -> Result<HowlCells, String> {
-        let answer = decode_answer_rust(answer)?;
+        if batch.param_set != self.param_set {
+            return Err(format!(
+                "a set-{} batch opened by a set-{} client",
+                batch.param_set, self.param_set
+            ));
+        }
+        let answer = self.decode_own(answer)?;
         let Body::Notes(notes) = &answer.body else {
             return Err(match answer.body {
                 Body::Stale => format!(
@@ -606,13 +722,37 @@ impl HowlClient {
         }
         let mut cells = Vec::with_capacity(batch.slots.len() * CELL_BYTES);
         for slot in &batch.slots {
-            let (Some(bytes), Some(state)) = (notes.responses.get(*slot), batch.states.get(*slot))
-            else {
+            let Some(bytes) = notes.responses.get(*slot) else {
                 return Err(format!("slot {slot} is outside the batch"));
             };
-            let response = decode_response(bytes)?;
-            let cell =
-                raven_client::extract_response_rust(&self.crs, state, &response, CELL_BYTES)?;
+            let cell = match (&self.reader, &batch.states) {
+                (Reader::Gadget { crs, .. }, Slots::Gadget(states)) => {
+                    let state = states
+                        .get(*slot)
+                        .ok_or_else(|| format!("slot {slot} is outside the batch"))?;
+                    let response = decode_response(bytes)?;
+                    raven_client::extract_response_rust(crs, state, &response, CELL_BYTES)?
+                }
+                (Reader::Single { client, .. }, Slots::Single(_)) => {
+                    let client = client.borrow();
+                    if bytes.len() != P16_RESPONSE_BYTES {
+                        return Err(format!(
+                            "a set-2 response of {} bytes, not {P16_RESPONSE_BYTES}",
+                            bytes.len()
+                        ));
+                    }
+                    let response = p16::Response::from_bytes(client.params(), bytes)
+                        .map_err(|e| format!("response does not decode: {e}"))?;
+                    // A served cell is its record and zeros.
+                    let mut cell = client.decode(&response).map_err(|e| e.to_string())?;
+                    if cell.len() != RECORD_BYTES {
+                        return Err(format!("a record decoded to {} bytes", cell.len()));
+                    }
+                    cell.resize(CELL_BYTES, 0);
+                    cell
+                }
+                _ => return Err("the batch is of another parameter set".to_owned()),
+            };
             if cell.len() != CELL_BYTES {
                 return Err(format!("a cell decoded to {} bytes", cell.len()));
             }
@@ -681,7 +821,13 @@ impl HowlClient {
     /// Whether batches go by session handle (otherwise the key rides in each batch).
     #[wasm_bindgen(getter, js_name = hasSession)]
     pub fn has_session(&self) -> bool {
-        self.session.session_handle().is_some()
+        self.holds_session()
+    }
+
+    /// The parameter set this client reads under: the one the node's params answer named.
+    #[wasm_bindgen(getter, js_name = paramSet)]
+    pub fn param_set(&self) -> u16 {
+        self.param_set
     }
 
     /// The largest batch the node takes.
@@ -738,13 +884,30 @@ impl HowlClient {
 /// never leaves this module.
 #[wasm_bindgen]
 pub struct HowlBatch {
-    states: Vec<ClientState>,
+    param_set: u16,
+    states: Slots,
     /// The row each slot reads, pads included.
     targets: Vec<u32>,
     /// Slot of each requested position, in request order.
     slots: Vec<usize>,
     positions: Vec<u32>,
     body: Vec<u8>,
+}
+
+/// What opens each slot's response: per-slot state under set 1; under set 2 the client's
+/// secret alone, so only the count.
+enum Slots {
+    Gadget(Vec<ClientState>),
+    Single(usize),
+}
+
+impl Slots {
+    fn len(&self) -> usize {
+        match self {
+            Self::Gadget(states) => states.len(),
+            Self::Single(n) => *n,
+        }
+    }
 }
 
 impl std::fmt::Debug for HowlBatch {
@@ -1074,7 +1237,8 @@ pub fn block_node_rust(leaves: &[u8]) -> Result<Vec<u8>, String> {
         .to_vec())
 }
 
-/// Wire constants a caller sizes its buffers and batches by.
+/// Wire constants a caller sizes its buffers and batches by: wire version, parameter set 1,
+/// cell bytes, prefix bytes, ladder cap, block leaves, tree depth, parameter set 2.
 #[wasm_bindgen(js_name = wireConstants)]
 pub fn wire_constants() -> Vec<u32> {
     [
@@ -1085,6 +1249,7 @@ pub fn wire_constants() -> Vec<u32> {
         LADDER_CAP as u32,
         tree::BLOCK_LEAVES as u32,
         TREE_DEPTH as u32,
+        u32::from(PARAM_SET_D2048_CELL256_P16),
     ]
     .to_vec()
 }

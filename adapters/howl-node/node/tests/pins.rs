@@ -78,6 +78,7 @@ async fn every_route_answers_the_pinned_bytes() {
             max_sessions: 8,
             ttl: Duration::from_secs(3_600),
         },
+        param_set: howl_wire::PARAM_SET_D2048_CELL256,
         seed: Some([7; 32]),
     };
     let chain = FakeChain::new(
@@ -178,4 +179,286 @@ fn a_session_seat_holds_48_kib_of_key() {
     );
     assert_eq!((gamma, seat.payload_bytes()), (128, 49_152));
     assert!(seat.resident_bytes() < 50 * 1024);
+}
+
+/// A node of parameter set `set` caught up with the fixture chain, behind its router.
+async fn fixture_http(set: u16, dir: &std::path::Path) -> (Fixture, Http) {
+    let fixture = Fixture::load();
+    let config = NodeConfig {
+        data_dir: dir.to_path_buf(),
+        chain_id: fixture.chain_id,
+        pool: fixture.pool,
+        deployment_block: fixture.first_block,
+        max_range: 40,
+        sessions: SessionStoreLimits {
+            max_sessions: 8,
+            ttl: Duration::from_secs(3_600),
+        },
+        param_set: set,
+        seed: Some([7; 32]),
+    };
+    let chain = FakeChain::new(
+        fixture.pool,
+        fixture.first_block,
+        fixture.logs.clone(),
+        fixture.head,
+    );
+    let (mut follower, engine) = howl_node::open(&config, chain).expect("open");
+    for steps in 0.. {
+        assert!(steps < 5_000, "no idle step");
+        let step = follower.step().await.expect("step");
+        howl_node::publish(&follower, &engine, &step).expect("publish");
+        if matches!(step, howl_node::follow::Step::Idle { .. }) {
+            break;
+        }
+    }
+    (fixture, Http(router(Served::new(engine, 2))))
+}
+
+fn set_2_request(payload: &[u8]) -> Vec<u8> {
+    let mut body = howl_wire::RequestPrefix {
+        param_set: howl_wire::PARAM_SET_D2048_CELL256_P16,
+    }
+    .encode()
+    .to_vec();
+    body.extend_from_slice(payload);
+    body
+}
+
+/// Shard 0 of the fixture as the table holds it: each leaf's cell, zero where a leaf has none.
+fn shard_0(fixture: &Fixture) -> Vec<u8> {
+    let mut cells = vec![0u8; 2_048 * 256];
+    for (i, leaf) in fixture.leaves.iter().enumerate() {
+        if let Some(cell) = &leaf.cell {
+            cells[i * 256..(i + 1) * 256].copy_from_slice(cell);
+        }
+    }
+    cells
+}
+
+// An inline read of leaf 5 by the client of seed [9; 32]; equal above to the library's own bytes.
+const PINNED_SET_2_NOTES: &str = "92ae97c0ddcbaf2c7afbdd38da8c95210beaa29b278f3efc58da147b71d43802";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_2_answers_the_same_routes_under_its_own_id_and_reads_byte_exact() {
+    use howl_wire::{KeySource, P16Batch, P16Query, PARAM_SET_D2048_CELL256_P16};
+    use raven_inspire::special_modulus::{Client, Params, Response, Server};
+
+    let one = tempfile::tempdir().expect("tempdir");
+    let two = tempfile::tempdir().expect("tempdir");
+    let (fixture, set_1) = fixture_http(howl_wire::PARAM_SET_D2048_CELL256, one.path()).await;
+    let (_, set_2) = fixture_http(PARAM_SET_D2048_CELL256_P16, two.path()).await;
+
+    // Every plain route: set 1's bytes with the header's parameter set byte reading 2.
+    for (path, _) in &PINNED[1..] {
+        let (s1, mut b1) = set_1.get(path).await;
+        let (s2, b2) = set_2.get(path).await;
+        assert_eq!(s1, s2, "{path}");
+        assert_eq!(b1[2..4], [0, 1], "{path}");
+        b1[3] = 2;
+        assert_eq!(b2, b1, "{path}");
+    }
+
+    // The params answer carries no key material: the set fixes it.
+    let (_, params) = set_2.get("/howl/v1/params").await;
+    let decoded = Answer::decode(&params).expect("params");
+    assert_eq!(decoded.param_set, PARAM_SET_D2048_CELL256_P16);
+    let Body::Params(p) = &decoded.body else {
+        panic!("params")
+    };
+    assert_eq!(
+        (
+            p.entry_bytes,
+            p.rows_per_shard,
+            p.ladder_cap,
+            p.session_ttl_secs,
+            p.crs.len()
+        ),
+        (256, 2_048, 16, 3_600, 0)
+    );
+    // Written out by hand: version 1, set 2, route 1, the fixture's state after block 259, then
+    // 256-byte cells, 2,048 rows, cap 16, an hour, no key material.
+    let mut by_hand = vec![0, 1, 0, 2, 1, 0, 0, 0];
+    by_hand.extend_from_slice(&fixture.leaf_count.to_be_bytes());
+    by_hand.extend_from_slice(&259u64.to_be_bytes());
+    by_hand.extend_from_slice(&fixture.root);
+    by_hand.extend_from_slice(&[0, 0, 1, 0, 0, 0, 8, 0, 0, 16, 0, 0, 0x0e, 0x10, 0, 0, 0, 0]);
+    assert_eq!(params, by_hand);
+
+    // A read under a fixed seed is the same bytes the library answers on the same cells.
+    let set = Params::ring2048_cell256();
+    let mut client = Client::from_seed(&set, [9; 32]).expect("client");
+    let key = client.packing_key().to_bytes(&set).expect("key");
+    let query = client.query(5).expect("query");
+    let body = set_2_request(
+        &P16Batch {
+            key: KeySource::Inline(key.clone()),
+            queries: vec![P16Query {
+                shard: 0,
+                query: query.to_bytes(&set).expect("query bytes"),
+            }],
+        }
+        .encode(),
+    );
+    let (status, answer) = set_2.post("/howl/v1/notes", body.clone()).await;
+    assert!(status.is_success(), "{}", String::from_utf8_lossy(&answer));
+    let decoded = Answer::decode(&answer).expect("answer");
+    assert_eq!(decoded.param_set, PARAM_SET_D2048_CELL256_P16);
+    let Body::Notes(notes) = &decoded.body else {
+        panic!("notes")
+    };
+    let server = Server::new(&set).expect("server");
+    let table = server.table(&shard_0(&fixture)).expect("table");
+    let seat = server
+        .seat(&raven_inspire::special_modulus::PackingKey::from_bytes(&set, &key).expect("key"))
+        .expect("seat");
+    let library = server
+        .respond(&table, &seat, &query)
+        .expect("respond")
+        .to_bytes(&set)
+        .expect("bytes");
+    assert_eq!(notes.responses, vec![library.clone()]);
+    let record = client
+        .decode(&Response::from_bytes(&set, &library).expect("response"))
+        .expect("decode");
+    let cell = fixture.leaves[5].cell.as_ref().expect("leaf 5 is a note");
+    assert_eq!(record[..], cell[..246]);
+    assert!(cell[246..].iter().all(|b| *b == 0));
+
+    let notes_digest = hex(&Sha256::digest(&answer));
+    eprintln!("set 2 notes {notes_digest}");
+    eprintln!(
+        "set 2: key upload {} B, inline batch of 1 {} B, response {} B, answer of 1 {} B",
+        set_2_request(&key).len(),
+        body.len(),
+        library.len(),
+        answer.len()
+    );
+    assert_eq!(
+        (
+            set_2_request(&key).len(),
+            body.len(),
+            library.len(),
+            answer.len()
+        ),
+        (
+            4 + 15_360,
+            4 + 1 + 15_360 + 2 + 4 + 7_456,
+            9_208,
+            HEADER_BYTES + 2 + 4 + 9_208
+        )
+    );
+    assert_eq!(notes_digest, PINNED_SET_2_NOTES);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_2_refusals() {
+    use axum::http::StatusCode;
+    use howl_wire::{KeySource, P16Batch, P16Query, PARAM_SET_D2048_CELL256_P16};
+    use raven_inspire::special_modulus::{Client, Params};
+
+    let one = tempfile::tempdir().expect("tempdir");
+    let two = tempfile::tempdir().expect("tempdir");
+    let (_, set_1) = fixture_http(howl_wire::PARAM_SET_D2048_CELL256, one.path()).await;
+    let (_, set_2) = fixture_http(PARAM_SET_D2048_CELL256_P16, two.path()).await;
+    let set = Params::ring2048_cell256();
+    let mut client = Client::from_seed(&set, [4; 32]).expect("client");
+    let key = client.packing_key().to_bytes(&set).expect("key");
+    let mut query = |row: usize| {
+        client
+            .query(row)
+            .expect("query")
+            .to_bytes(&set)
+            .expect("bytes")
+    };
+    let batch = |key: KeySource, shards: &[u32], query: &mut dyn FnMut(usize) -> Vec<u8>| {
+        set_2_request(
+            &P16Batch {
+                key,
+                queries: shards
+                    .iter()
+                    .map(|&shard| P16Query {
+                        shard,
+                        query: query(7),
+                    })
+                    .collect(),
+            }
+            .encode(),
+        )
+    };
+
+    // Each node refuses the other set's bodies before reading them.
+    let (status, _) = set_1.post("/howl/v1/session", set_2_request(&key)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let mut set_1_prefix = set_2_request(&key);
+    set_1_prefix[3] = 1;
+    let (status, text) = set_2.post("/howl/v1/session", set_1_prefix).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&text).contains("parameter set 1 is not the 2"));
+    // A key one byte short, and one whose first coefficient is not a residue.
+    let (status, _) = set_2
+        .post("/howl/v1/session", set_2_request(&key[1..]))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let mut not_residue = key.clone();
+    not_residue[..4].copy_from_slice(&[0xff, 0xff, 0xff, 0x1f]);
+    let (status, _) = set_2
+        .post("/howl/v1/session", set_2_request(&not_residue))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, body) = set_2.post("/howl/v1/session", set_2_request(&key)).await;
+    assert_eq!(status, StatusCode::OK);
+    let Body::Session(session) = Answer::decode(&body).expect("session").body else {
+        panic!("session")
+    };
+    let (status, _) = set_2
+        .post(
+            "/howl/v1/notes",
+            batch(KeySource::Session(session.handle), &[0, 0], &mut query),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = set_2
+        .post(
+            "/howl/v1/notes",
+            batch(KeySource::Session(session.handle ^ 1), &[0], &mut query),
+        )
+        .await;
+    assert_eq!(status, StatusCode::GONE, "an unknown handle");
+    let (status, _) = set_2
+        .post(
+            "/howl/v1/notes",
+            batch(KeySource::Session(session.handle), &[0, 0, 0], &mut query),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "three is no step");
+    let (status, stale) = set_2
+        .post(
+            "/howl/v1/notes",
+            batch(KeySource::Session(session.handle), &[1], &mut query),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "shard 1 is past the table");
+    assert!(matches!(
+        Answer::decode(&stale).expect("stale").body,
+        Body::Stale
+    ));
+    let mut bad_query = batch(KeySource::Session(session.handle), &[0], &mut query);
+    let at = 4 + 1 + 8 + 2 + 4 + 32;
+    bad_query[at..at + 4].copy_from_slice(&[0xff, 0xff, 0xff, 0x1f]);
+    let (status, _) = set_2.post("/howl/v1/notes", bad_query).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a query coefficient past q"
+    );
+
+    // Eight seats: the ninth registration waits for one to expire.
+    for _ in 1..8 {
+        let (status, _) = set_2.post("/howl/v1/session", set_2_request(&key)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, _) = set_2.post("/howl/v1/session", set_2_request(&key)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }

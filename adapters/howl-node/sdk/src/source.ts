@@ -462,11 +462,38 @@ export class RavenHowlSource<F> {
     return client;
   }
 
+  /**
+   * After a refusal a node serving another parameter set gives (400 for a body of another set,
+   * 413 for a key larger than its set's), whether the node's params answer names a set other
+   * than the one held. When it does, the source reads under the new set from then on.
+   */
+  async #setChanged(error: unknown): Promise<boolean> {
+    const status = error instanceof HowlError ? error.status : undefined;
+    if ((status !== 400 && status !== 413) || this.#params === null) return false;
+    const held = decode(this.#wasm, this.#params).paramSet;
+    const ex = await this.#get("/howl/v1/params");
+    const fresh = this.#answer(ex, KIND.params, "params");
+    if (fresh.paramSet === held) return false;
+    this.close();
+    this.#params = ex.body;
+    return true;
+  }
+
   async #readBatch(positions: number[]): Promise<Uint8Array> {
     const key = positions.join(",");
+    let reread = false;
     for (let attempt = 0; ; attempt++) {
       const inline = this.#keyMode === "inline";
-      const client = inline ? await this.#newClient() : await this.#sessionClient();
+      let client: HowlClientHandle;
+      try {
+        client = inline ? await this.#newClient() : await this.#sessionClient();
+      } catch (e) {
+        if (!reread && (await this.#setChanged(e))) {
+          reread = true;
+          continue;
+        }
+        throw e;
+      }
       try {
         const plan = this.#plans.get(key);
         const batch = protocol("batch", () =>
@@ -481,7 +508,16 @@ export class RavenHowlSource<F> {
             this.close();
             continue;
           }
-          this.#answer(ex, KIND.notes, "notes");
+          try {
+            this.#answer(ex, KIND.notes, "notes");
+          } catch (e) {
+            // The same rows and slots are asked again under the node's set.
+            if (!reread && (await this.#setChanged(e))) {
+              reread = true;
+              continue;
+            }
+            throw e;
+          }
           const cells = protocol("notes", () => client.openNotes(batch, ex.body));
           try {
             this.#lastRead = { leafCount: cells.leafCount, block: cells.block };

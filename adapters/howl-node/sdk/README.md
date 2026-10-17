@@ -48,19 +48,20 @@ const witness = await source.merkleWitness(records[0].leafIndex); // or (index, 
 | `snapshot()` | what a wallet stores to resume: feed rows, upper nodes, newest block, state |
 
 A key is built under a secret drawn inside the wasm when a client is created, and never under
-one the caller supplies. In `session` mode the source uploads one key per session and opens a
+one the caller supplies. The client reads under the parameter set the node's params answer
+names, and refuses answers to its own requests from a node of another set. In `session` mode the source uploads one key per session and opens a
 new session, under a new secret, when the node reports the old one expired. In `inline` mode
 every request carries a key built for it alone.
 
 ## Sizes on the wire
 
-| Item | Bytes |
-|---|---:|
-| Feed | 6 per leaf |
-| Session key upload (once per session) | 46,256 |
-| Private read, per slot of a batch, session mode | 15,477 up, 9,874 down |
-| Batch framing | 24 up, 58 down |
-| Key carried inline | 46,244 more per request |
+| Item | Parameter set 1 | Parameter set 2 |
+|---|---:|---:|
+| Feed | 6 per leaf | 6 per leaf |
+| Session key upload (once per session) | 46,256 | 15,364 |
+| Private read, per slot of a batch, session mode | 15,477 up, 9,874 down | 7,460 up, 9,212 down |
+| Batch framing | 24 up, 58 down | 15 up, 58 down |
+| Key carried inline | 46,244 more per request | 15,352 more per request |
 
 ## Develop
 

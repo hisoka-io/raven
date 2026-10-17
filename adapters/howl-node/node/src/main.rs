@@ -3,7 +3,7 @@
 //! ```text
 //! HOWL_NODE_RPC_URL=<endpoint> howl-node --data-dir DIR --chain-id N --pool 0x.. \
 //!     --deployment-block N [--listen 127.0.0.1:8545] [--poll-ms 2000] [--max-range 2000] \
-//!     [--max-sessions 2048] [--session-ttl-secs 3600] [--concurrent N]
+//!     [--max-sessions 2048] [--session-ttl-secs 3600] [--concurrent N] [--param-set 1|2]
 //! ```
 //!
 //! The endpoint is read from the environment so that a key in its URL stays out of the
@@ -40,6 +40,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         ttl: Duration::from_secs(3_600),
     };
     let mut concurrent = std::thread::available_parallelism().map_or(4, usize::from);
+    let mut param_set = howl_wire::PARAM_SET_D2048_CELL256;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         let number = |text: String| {
@@ -69,6 +70,10 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                 concurrent =
                     usize::try_from(number(value()?)?).map_err(|_| "--concurrent: too large")?;
             }
+            "--param-set" => {
+                param_set =
+                    u16::try_from(number(value()?)?).map_err(|_| "--param-set: too large")?;
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -80,6 +85,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             deployment_block: deployment_block.ok_or("--deployment-block is required")?,
             max_range,
             sessions,
+            param_set,
             seed: None,
         },
         listen,

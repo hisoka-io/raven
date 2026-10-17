@@ -22,23 +22,27 @@ const live = BIN !== "" && existsSync(BIN);
 const HALF = Math.floor(fixture.blocks.length / 2);
 
 /** A transport that records every path asked for and the bytes moved. */
-function recorded(url: string): HowlTransport & { paths: string[]; down: number[] } {
+function recorded(url: string): HowlTransport & { paths: string[]; down: number[]; up: number[] } {
   const inner = fetchTransport(url);
   const paths: string[] = [];
   const down: number[] = [];
+  const up: number[] = [];
   return {
     paths,
     down,
+    up,
     get: async (path) => {
       const ex = await inner.get(path);
       paths.push(`GET ${path}`);
       down.push(ex.body.length);
+      up.push(0);
       return ex;
     },
     post: async (path, body) => {
       const ex = await inner.post(path, body);
       paths.push(`POST ${path}`);
       down.push(ex.body.length);
+      up.push(body.length);
       return ex;
     },
   };
@@ -210,6 +214,91 @@ describe.skipIf(!live)("against a running node", () => {
       }
     }
     expect(checked).toBeGreaterThan(60);
+  });
+
+  it("a node on parameter set 2 serves every wallet its notes byte-exact through the same package", async () => {
+    const url = await chain.startNode(BIN, { paramSet: 2 });
+    await chain.caughtUp(chain.leafCount, url);
+    const params = await fetchTransport(url).get("/howl/v1/params");
+    const advertised = wasm.decodeAnswer(params.body);
+    expect(advertised.paramSet).toBe(2);
+    advertised.free();
+    const bytes: Record<string, { up: number; down: number; posts: number }> = {};
+    for (const [i, w] of fixture.wallets.entries()) {
+      for (const [set, nodeUrl] of [
+        [1, chain.nodeUrl],
+        [2, url],
+      ] as const) {
+        const keyMode: KeyMode = i % 2 === 0 ? "session" : "inline";
+        const transport = recorded(nodeUrl);
+        const src = new RavenHowlSource({ transport, wasm, field: bigintField, keyMode });
+        const found = await discover(src, tagsOf(w.label));
+        expect([...found.keys()].sort((a, b) => a - b), `${w.label} on set ${set}`).toEqual(
+          owned(w.label, chain.leafCount),
+        );
+        found.forEach(expectFixtureCell);
+        const posts = transport.paths.flatMap((p, k) => (p.startsWith("POST") ? [k] : []));
+        for (const k of posts) {
+          if (set === 2 && transport.paths[k] === "POST /howl/v1/notes") {
+            // one 9,212-byte slot per ladder step, after the header and count
+            expect((transport.down[k]! - 58) % 9_212, w.label).toBe(0);
+          }
+        }
+        const row = (bytes[`${keyMode} set ${set}`] ??= { up: 0, down: 0, posts: 0 });
+        for (const k of posts) {
+          row.up += transport.up[k]!;
+          row.down += transport.down[k]!;
+          row.posts += 1;
+        }
+      }
+    }
+    // private-read bytes (session, notes) moved by the same discoveries on each set
+    console.log(`private-read bytes by key mode and set: ${JSON.stringify(bytes)}`);
+    for (const mode of ["session", "inline"]) {
+      expect(bytes[`${mode} set 2`]!.up).toBeLessThan(bytes[`${mode} set 1`]!.up);
+      expect(bytes[`${mode} set 2`]!.down).toBeLessThan(bytes[`${mode} set 1`]!.down);
+    }
+  });
+
+  it("a source follows its node through a restart under the other parameter set", async () => {
+    const url = await chain.startNode(BIN);
+    await chain.caughtUp(chain.leafCount, url);
+    // alice reads with a session, bob with the key inline; each keeps one source throughout
+    const readers = (["session", "inline"] as const).map((keyMode, k) => {
+      const transport = recorded(url);
+      const label = fixture.wallets[k]!.label;
+      const src = new RavenHowlSource({ transport, wasm, field: bigintField, keyMode });
+      return { keyMode, label, transport, src, found: new Map<number, HowlNoteRecord<bigint>>() };
+    });
+    // set 1, then 2, then 1 again; each phase reads a third of the tags, so its cells are new
+    for (const [phase, set] of [1, 2, 1].entries()) {
+      if (phase > 0) {
+        await chain.restartNode(url, BIN, { paramSet: set });
+        await chain.caughtUp(chain.leafCount, url);
+        // Into set 2 alice registers again under set 1 (a key the node refuses 413); back into
+        // set 1 she sends a batch under her set-2 session (refused 400), as bob's inline batches are.
+        if (set === 2) readers[0]!.src.close();
+      }
+      for (const r of readers) {
+        const tags = tagsOf(r.label).filter((_, i) => i % 3 === phase);
+        const before = r.transport.paths.length;
+        const found = await discover(r.src, tags);
+        expect(found.size, `${r.label} phase ${phase}`).toBeGreaterThan(0);
+        found.forEach((record, position) => {
+          expectFixtureCell(record);
+          r.found.set(position, record);
+        });
+        if (phase > 0) {
+          // the refused request, one params read, then the same request under the node's set
+          const asked = r.transport.paths.slice(before);
+          expect(asked.filter((p) => p === "GET /howl/v1/params").length, `${r.keyMode} phase ${phase}`).toBe(1);
+        }
+      }
+    }
+    for (const r of readers) {
+      expect([...r.found.keys()].sort((a, b) => a - b), r.label).toEqual(owned(r.label, chain.leafCount));
+      r.src.close();
+    }
   });
 
   it("a session that expires on the node is replaced under a new secret", async () => {

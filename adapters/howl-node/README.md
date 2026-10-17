@@ -36,7 +36,7 @@ HOWL_NODE_RPC_URL=<json-rpc endpoint> \
 The endpoint is read from the environment so that a key in its URL stays out of the process list.
 Optional flags: `--poll-ms` (2,000), `--max-range` (blocks per log read, 2,000), `--max-sessions`
 (2,048), `--session-ttl-secs` (3,600; a session's lifetime restarts with each use), `--concurrent`
-(batches answered at once).
+(batches answered at once), `--param-set` (1 or 2, below; 1 by default).
 
 The node serves each block as soon as it is read, and every answer names that block. When the chain
 reorganises below the node's newest block, the node returns to the newest block it recorded that the
@@ -51,7 +51,21 @@ followed at once.
 A wallet that holds the newest block up to its leaf count sends that count as `held`, so a sync with
 nothing new carries the header and three empty runs: 96 bytes.
 
-## Routes
+## Parameter sets
+
+A node serves one parameter set, chosen at start and named in every answer's header and every
+request's prefix. A client builds its key and queries for the set the params answer names. The
+plain routes are the same bytes under either set apart from that id.
+
+| | Set 1 | Set 2 |
+|---|---|---|
+| Scheme | ring 2,048, a 60-bit modulus, plaintext modulus 65,537, responses switched to 36 bits | ring 2,048, a 29-bit prime, plaintext modulus 16, a one-row packing key at about 2^60 |
+| Key material in the params answer | the node's, versioned | none: fixed by the set |
+| Session payload | the serialized key, 46,252 B | the key, 15,360 B |
+| Batch payload | the serialized batch | `howl_wire::P16Batch`: the key's source, then 7,456 B per query |
+| Response per query | 9,870 B | 9,208 B, the first 246 bytes of the cell; the rest of a cell is zero |
+| Seat per session | 48 KiB | 16 KiB |
+
 
 | Route | Answer body |
 |---|---|

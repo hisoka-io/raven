@@ -42,6 +42,10 @@ struct TestNode {
 
 impl TestNode {
     fn start(dir: &std::path::Path, fixture: &Fixture, chain: FakeChain) -> Self {
+        Self::start_set(dir, fixture, chain, howl_wire::PARAM_SET_D2048_CELL256)
+    }
+
+    fn start_set(dir: &std::path::Path, fixture: &Fixture, chain: FakeChain, set: u16) -> Self {
         let config = NodeConfig {
             data_dir: dir.to_path_buf(),
             chain_id: fixture.chain_id,
@@ -52,6 +56,7 @@ impl TestNode {
                 max_sessions: 64,
                 ttl: Duration::from_secs(3_600),
             },
+            param_set: set,
             seed: Some([7; 32]),
         };
         let (follower, engine) = howl_node::open(&config, chain).expect("open");
@@ -82,6 +87,10 @@ impl TestNode {
 }
 
 async fn fixture_node(dir: &std::path::Path) -> (Fixture, TestNode) {
+    fixture_node_set(dir, howl_wire::PARAM_SET_D2048_CELL256).await
+}
+
+async fn fixture_node_set(dir: &std::path::Path, set: u16) -> (Fixture, TestNode) {
     let fixture = Fixture::load();
     let chain = FakeChain::new(
         fixture.pool,
@@ -89,7 +98,7 @@ async fn fixture_node(dir: &std::path::Path) -> (Fixture, TestNode) {
         fixture.logs.clone(),
         fixture.head,
     );
-    let mut node = TestNode::start(dir, &fixture, chain);
+    let mut node = TestNode::start_set(dir, &fixture, chain, set);
     node.catch_up().await;
     (fixture, node)
 }
@@ -172,8 +181,17 @@ fn wallet_positions(fixture: &Fixture, feed: &Answer) -> Vec<Vec<u32>> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn wallets_read_their_cells_by_handle_and_inline() {
+    wallets_read_their_cells(howl_wire::PARAM_SET_D2048_CELL256).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_2_wallets_read_their_cells_by_handle_and_inline() {
+    wallets_read_their_cells(howl_wire::PARAM_SET_D2048_CELL256_P16).await;
+}
+
+async fn wallets_read_their_cells(set: u16) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (fixture, node) = fixture_node(dir.path()).await;
+    let (fixture, node) = fixture_node_set(dir.path(), set).await;
     let feed = Answer::decode(&node.raw("/howl/v1/prefixes?since=0").await).expect("feed");
     let n = feed.leaf_count;
     let positions = wallet_positions(&fixture, &feed);
@@ -197,6 +215,11 @@ async fn wallets_read_their_cells_by_handle_and_inline() {
             .collect();
 
         let mut by_handle = client(&node).await;
+        assert_eq!(
+            by_handle.param_set(),
+            set,
+            "the client reads under the node's set"
+        );
         register(&node, &mut by_handle).await;
         assert!(by_handle.has_session());
         assert_eq!(
@@ -212,8 +235,17 @@ async fn wallets_read_their_cells_by_handle_and_inline() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn every_ladder_step_reads_every_slot_count() {
+    every_ladder_step(howl_wire::PARAM_SET_D2048_CELL256).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_2_every_ladder_step_reads_every_slot_count() {
+    every_ladder_step(howl_wire::PARAM_SET_D2048_CELL256_P16).await;
+}
+
+async fn every_ladder_step(set: u16) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (fixture, node) = fixture_node(dir.path()).await;
+    let (fixture, node) = fixture_node_set(dir.path(), set).await;
     let n = fixture.leaf_count;
     let mut reader = client(&node).await;
     register(&node, &mut reader).await;
@@ -741,4 +773,250 @@ async fn the_package_fixture_answers_are_what_the_node_serves() {
     } else {
         assert_eq!(std::fs::read_to_string(&sums).expect("sums"), digests);
     }
+}
+
+fn set_2_batch_of(body: &[u8]) -> howl_wire::P16Batch {
+    assert_eq!(body[..4], [0, 1, 0, 2], "version 1, set 2");
+    howl_wire::P16Batch::decode(&body[4..]).expect("set-2 batch decodes")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_2_sizes_on_the_wire_and_one_key_per_client() {
+    use howl_wire::KeySource;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_fixture, node) =
+        fixture_node_set(dir.path(), howl_wire::PARAM_SET_D2048_CELL256_P16).await;
+    let mut reader = client(&node).await;
+    let key = reader.session_body_rust().to_vec();
+    assert_eq!(key.len(), 4 + 15_360);
+    assert_eq!(
+        key,
+        reader.session_body_rust(),
+        "a retry resends the same bytes"
+    );
+    assert_ne!(
+        key,
+        client(&node).await.session_body_rust(),
+        "a new client draws a new secret"
+    );
+    register(&node, &mut reader).await;
+    let mut sizes = Vec::new();
+    for step in LADDER {
+        let positions = vec![3u32; step];
+        let handle = reader.build_batch_rust(&positions, 160).expect("batch");
+        let decoded = set_2_batch_of(handle.body_rust());
+        assert!(matches!(decoded.key, KeySource::Session(_)));
+        assert_eq!(decoded.queries.len(), step);
+        let carried_by = client(&node).await;
+        let carried = carried_by.build_batch_rust(&positions, 160).expect("batch");
+        // the inline key is the one the session would upload
+        match set_2_batch_of(carried.body_rust()).key {
+            KeySource::Inline(k) => assert_eq!(k, carried_by.session_body_rust()[4..]),
+            KeySource::Session(_) => panic!("expected the key inline"),
+        }
+        assert!(
+            carried_by.build_batch_rust(&[1], 160).is_err(),
+            "a second inline batch"
+        );
+        let (status, answer) = node
+            .http
+            .post("/howl/v1/notes", handle.body_rust().to_vec())
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        sizes.push((
+            step,
+            handle.body_rust().len(),
+            carried.body_rust().len(),
+            answer.len(),
+        ));
+    }
+    // per slot 7,460 B up (shard and query) and 9,212 B down; 15 B of batch framing up by
+    // handle, 15,367 B with the key inline; 58 B of header and count down
+    let expected: Vec<(usize, usize, usize, usize)> = LADDER
+        .iter()
+        .map(|&s| {
+            (
+                s,
+                15 + 7_460 * s,
+                4 + 1 + 15_360 + 2 + 7_460 * s,
+                56 + 2 + (4 + 9_208) * s,
+            )
+        })
+        .collect();
+    assert_eq!(sizes, expected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_2_pads_cover_the_table_and_the_real_slot_moves() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_fixture, node) =
+        fixture_node_set(dir.path(), howl_wire::PARAM_SET_D2048_CELL256_P16).await;
+    let mut reader = client(&node).await;
+    register(&node, &mut reader).await;
+    let trials = 480;
+    let mut shards = HashMap::new();
+    let mut slots = [0u32; 16];
+    for _ in 0..trials {
+        let batch = reader
+            .build_batch_rust(&[42, 43, 44, 45, 46, 47, 48, 49, 4_500], 5_000)
+            .expect("batch");
+        for query in set_2_batch_of(batch.body_rust()).queries {
+            assert!(query.shard <= 2, "pads stay inside the table");
+            *shards.entry(query.shard).or_insert(0u32) += 1;
+        }
+        let batch = reader
+            .build_batch_rust(&[7, 8, 9, 10, 11, 12, 13, 14, 15], 160)
+            .expect("batch");
+        slots[batch.slot_order()[0]] += 1;
+    }
+    assert_eq!(shards.len(), 3, "{shards:?}");
+    let expected = trials / 16;
+    for (slot, count) in slots.iter().enumerate() {
+        assert!(
+            *count > expected / 3 && *count < expected * 3,
+            "slot {slot}: {count} of {trials}: {slots:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_reads_under_the_set_its_node_names_and_no_other() {
+    let one = tempfile::tempdir().expect("tempdir");
+    let two = tempfile::tempdir().expect("tempdir");
+    let (_fixture, set_1) = fixture_node_set(one.path(), howl_wire::PARAM_SET_D2048_CELL256).await;
+    let (_fixture, set_2) =
+        fixture_node_set(two.path(), howl_wire::PARAM_SET_D2048_CELL256_P16).await;
+    let mut c1 = client(&set_1).await;
+    let mut c2 = client(&set_2).await;
+    assert_eq!((c1.param_set(), c2.param_set()), (1, 2));
+    let d = decode_answer_rust(&set_2.raw("/howl/v1/params").await).expect("params");
+    assert_eq!(d.param_set, 2);
+
+    // A body of one set is refused by a node of the other: by its prefix, or for a set-1 key
+    // by its size first.
+    for (node, body, refusal) in [
+        (
+            &set_1,
+            c2.session_body_rust().to_vec(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            &set_2,
+            c1.session_body_rust().to_vec(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+    ] {
+        let (status, _) = node.http.post("/howl/v1/session", body).await;
+        assert_eq!(status, refusal);
+    }
+    // A session answer from a node of the other set is not installed.
+    let (_, other) = set_1
+        .http
+        .post("/howl/v1/session", c1.session_body_rust().to_vec())
+        .await;
+    assert!(c2.install_session_rust(&other).is_err());
+    register(&set_2, &mut c2).await;
+    register(&set_1, &mut c1).await;
+    // A notes answer of the other set does not open, even with the right count.
+    let b1 = c1.build_batch_rust(&[5], 160).expect("batch");
+    let b2 = c2.build_batch_rust(&[5], 160).expect("batch");
+    let (_, a1) = set_1
+        .http
+        .post("/howl/v1/notes", b1.body_rust().to_vec())
+        .await;
+    let (_, a2) = set_2
+        .http
+        .post("/howl/v1/notes", b2.body_rust().to_vec())
+        .await;
+    assert!(c1.open_notes_rust(&b1, &a1).is_ok(), "control, set 1");
+    assert!(c2.open_notes_rust(&b2, &a2).is_ok(), "control, set 2");
+    assert!(c2.open_notes_rust(&b2, &a1).is_err());
+    assert!(c1.open_notes_rust(&b1, &a2).is_err());
+    assert!(
+        c2.open_notes_rust(&b1, &a2).is_err(),
+        "a batch of the other set"
+    );
+    // The same response bytes under set 1's header id are refused before decoding.
+    let mut relabelled = a2.clone();
+    relabelled[3] = 1;
+    assert!(c2.open_notes_rust(&b2, &relabelled).is_err());
+    // A set-2 response one byte short.
+    let decoded = Answer::decode(&a2).expect("answer");
+    let Body::Notes(notes) = &decoded.body else {
+        panic!("notes")
+    };
+    let short = Answer {
+        body: Body::Notes(Notes {
+            responses: vec![notes.responses[0][1..].to_vec()],
+        }),
+        ..decoded.clone()
+    };
+    assert!(c2.open_notes_rust(&b2, &short.encode()).is_err());
+
+    // A set-2 params answer that carries key material is refused: the set fixes it.
+    let params = set_2.raw("/howl/v1/params").await;
+    let mut with_crs = Answer::decode(&params).expect("params");
+    if let Body::Params(p) = &mut with_crs.body {
+        p.crs = vec![1];
+    }
+    assert!(HowlClient::from_params(&with_crs.encode()).is_err());
+    // Another parameter set is refused outright.
+    let mut set_3 = params.clone();
+    set_3[3] = 3;
+    assert!(decode_answer_rust(&set_3).is_err());
+    assert!(HowlClient::from_params(&set_3).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_2_reads_every_shard_as_set_1_does() {
+    let fixture = Fixture::load();
+    let (mut tree, _) = fixture_tree(&fixture);
+    let ext = extend(fixture.pool, &mut tree, fixture.head + 1, 300, 17, 0x5e72);
+    let mut logs = fixture.logs.clone();
+    logs.extend(ext.logs);
+    let total = 160 + ext.leaves.len() as u64;
+    assert!(total > 2 * 2_048, "three shards");
+    let mut nodes = Vec::new();
+    let mut dirs = Vec::new();
+    for set in [
+        howl_wire::PARAM_SET_D2048_CELL256,
+        howl_wire::PARAM_SET_D2048_CELL256_P16,
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let chain = FakeChain::new(
+            fixture.pool,
+            fixture.first_block,
+            logs.clone(),
+            ext.last_block,
+        );
+        let mut node = TestNode::start_set(dir.path(), &fixture, chain, set);
+        node.catch_up().await;
+        nodes.push(node);
+        dirs.push(dir);
+    }
+    // both ends of every shard, and leaves inside each
+    let positions: Vec<u32> = vec![
+        0, 5, 159, 2_047, 2_048, 2_049, 3_000, 4_095, 4_096, 4_097, 5_000,
+    ]
+    .into_iter()
+    .chain([u32::try_from(total - 1).expect("u32")])
+    .collect();
+    let mut reads = Vec::new();
+    for node in &nodes {
+        let mut reader = client(node).await;
+        register(node, &mut reader).await;
+        reads.push(read(node, Some(&reader), &positions, total).await);
+    }
+    assert_eq!(reads[0].len(), positions.len());
+    assert_eq!(reads[1], reads[0], "set 2's cells are set 1's");
+    for (p, cell) in positions.iter().zip(&reads[1]) {
+        // the fixture's own leaves are known; every extension leaf is a note
+        let want = fixture.leaves.get(*p as usize).map(|l| l.cell.clone());
+        match want {
+            Some(Some(want)) => assert_eq!(*cell, want, "leaf {p}"),
+            Some(None) => assert!(cell.iter().all(|b| *b == 0), "leaf {p}"),
+            None => assert!(cell.iter().any(|b| *b != 0), "leaf {p}"),
+        }
+    }
+    assert!(reads[1].iter().all(|c| c[246..].iter().all(|b| *b == 0)));
 }

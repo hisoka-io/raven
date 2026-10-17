@@ -6,6 +6,8 @@
 /** A decoded plain answer; fields the route does not carry read as zero or empty. */
 export interface HowlAnswerView {
   readonly kind: number;
+  /** Parameter set of the node's private reads: 1, or 2 for the one-row-key set. */
+  readonly paramSet: number;
   readonly leafCount: number;
   readonly block: number;
   readonly root: Uint8Array;
@@ -42,8 +44,12 @@ export interface HowlCellsView {
   free(): void;
 }
 
-/** One secret, drawn when the client is built, and the one packing key built under it. */
+/**
+ * One secret, drawn when the client is built, and the one packing key built under it, for the
+ * parameter set the node's params answer names.
+ */
 export interface HowlClientHandle {
+  readonly paramSet: number;
   sessionBody(): Uint8Array;
   installSession(answer: Uint8Array): number;
   readonly hasSession: boolean;
@@ -103,6 +109,7 @@ export const KIND = {
 /** A plain answer copied out of the wasm. */
 export interface Answer {
   readonly kind: number;
+  readonly paramSet: number;
   readonly leafCount: number;
   readonly block: number;
   readonly root: Uint8Array;
@@ -123,6 +130,7 @@ export function decode(wasm: HowlWasm, bytes: Uint8Array): Answer {
   try {
     return {
       kind: view.kind,
+      paramSet: view.paramSet,
       leafCount: view.leafCount,
       block: view.block,
       root: view.root,

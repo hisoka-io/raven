@@ -23,14 +23,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use howl_wire::{
-    Body, Notes, Params, RequestPrefix, Session, CELL_BYTES, LADDER_CAP, PARAM_SET_D2048_CELL256,
-    REQUEST_PREFIX_BYTES, ROWS_PER_SHARD,
+    Body, Notes, Params, RequestPrefix, Session, CELL_BYTES, LADDER_CAP, REQUEST_PREFIX_BYTES,
+    ROWS_PER_SHARD,
 };
-use raven_inspire::inspiring::ClientPackingKeys;
-use raven_inspire::SeededQueryBatch;
 use tokio::sync::Semaphore;
 
-use crate::engine::{Engine, Refusal, View};
+use crate::engine::{Engine, Pir, Refusal, View};
 
 /// Upper bound on one batch body beyond its key: sixteen seeded queries with room to spare.
 const QUERY_BYTES_LIMIT: usize = 1 << 20;
@@ -191,43 +189,32 @@ async fn sync(
     }
 }
 
-fn payload(body: &[u8]) -> Result<&[u8], Bad> {
+fn payload<'a>(pir: &Pir, body: &'a [u8]) -> Result<&'a [u8], Bad> {
     let (prefix, rest) =
         RequestPrefix::decode(body).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    if prefix.param_set != PARAM_SET_D2048_CELL256 {
+    if prefix.param_set != pir.param_set() {
         return Err((
             StatusCode::BAD_REQUEST,
             format!(
-                "parameter set {} is not the {PARAM_SET_D2048_CELL256} this node serves",
-                prefix.param_set
+                "parameter set {} is not the {} this node serves",
+                prefix.param_set,
+                pir.param_set()
             ),
         ));
     }
     Ok(rest)
 }
 
-fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8], limit: usize) -> Result<T, Bad> {
-    use bincode::Options;
-    bincode::DefaultOptions::new()
-        .with_limit(limit as u64)
-        .with_fixint_encoding()
-        .reject_trailing_bytes()
-        .deserialize(bytes)
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("body does not decode: {e}"),
-            )
-        })
+fn bad(message: String) -> Bad {
+    (StatusCode::BAD_REQUEST, message)
 }
 
 async fn session(State(served): State<Arc<Served>>, body: Bytes) -> Response {
     let pir = served.engine.pir();
-    let keys: ClientPackingKeys =
-        match payload(&body).and_then(|rest| decode(rest, pir.key_upload_limit())) {
-            Ok(keys) => keys,
-            Err(bad) => return bad.into_response(),
-        };
+    let keys = match payload(pir, &body).and_then(|rest| pir.decode_key(rest).map_err(bad)) {
+        Ok(keys) => keys,
+        Err(bad) => return bad.into_response(),
+    };
     let Ok(_permit) = served.respond_permits.acquire().await else {
         return refuse(StatusCode::SERVICE_UNAVAILABLE, "shutting down");
     };
@@ -262,8 +249,10 @@ fn refusal_response(view: &View, refusal: &Refusal) -> Response {
 }
 
 async fn notes(State(served): State<Arc<Served>>, body: Bytes) -> Response {
-    let limit = served.engine.pir().key_upload_limit() + QUERY_BYTES_LIMIT;
-    let batch: SeededQueryBatch = match payload(&body).and_then(|rest| decode(rest, limit)) {
+    let pir = served.engine.pir();
+    let batch = match payload(pir, &body)
+        .and_then(|rest| pir.decode_batch(rest, QUERY_BYTES_LIMIT).map_err(bad))
+    {
         Ok(batch) => batch,
         Err(bad) => return bad.into_response(),
     };

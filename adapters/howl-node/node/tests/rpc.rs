@@ -140,6 +140,7 @@ fn config(dir: &std::path::Path, fixture: &Fixture) -> NodeConfig {
             max_sessions: 8,
             ttl: Duration::from_secs(60),
         },
+        param_set: howl_wire::PARAM_SET_D2048_CELL256,
         seed: Some([7; 32]),
     }
 }

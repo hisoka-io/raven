@@ -44,6 +44,7 @@ fn config(dir: &std::path::Path, fixture: &Fixture, ttl: Duration) -> NodeConfig
             max_sessions: 64,
             ttl,
         },
+        param_set: howl_wire::PARAM_SET_D2048_CELL256,
         seed: Some([7; 32]),
     }
 }
@@ -1206,4 +1207,191 @@ async fn a_count_refused_twice_at_the_same_block_is_walked_back() {
         errors.last()
     );
     same_as_fresh(&node, &fixture, logs, x + 1).await;
+}
+
+/// A set-2 wallet's private-read half: one fresh secret and its one key.
+struct P16Reader {
+    client: raven_inspire::special_modulus::Client,
+    handle: Option<u64>,
+}
+
+impl P16Reader {
+    fn new() -> Self {
+        let set = raven_inspire::special_modulus::Params::ring2048_cell256();
+        Self {
+            client: raven_inspire::special_modulus::Client::new(&set).expect("client"),
+            handle: None,
+        }
+    }
+
+    fn request(payload: &[u8]) -> Vec<u8> {
+        let mut body = howl_wire::RequestPrefix {
+            param_set: howl_wire::PARAM_SET_D2048_CELL256_P16,
+        }
+        .encode()
+        .to_vec();
+        body.extend_from_slice(payload);
+        body
+    }
+
+    async fn register(&mut self, http: &Http) -> u64 {
+        let key = self
+            .client
+            .packing_key()
+            .to_bytes(self.client.params())
+            .expect("key");
+        let (status, body) = http.post("/howl/v1/session", Self::request(&key)).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let Body::Session(session) = Answer::decode(&body).expect("session").body else {
+            panic!("session");
+        };
+        self.handle = Some(session.handle);
+        session.handle
+    }
+
+    /// The batch body for `positions` by handle, padded with row 0 of shard 0.
+    fn body(&mut self, positions: &[u64]) -> Vec<u8> {
+        let padded = howl_wire::padded_len(positions.len()).expect("ladder");
+        let set = self.client.params().clone();
+        let queries = (0..padded)
+            .map(|i| {
+                let p = positions.get(i).copied().unwrap_or(0);
+                howl_wire::P16Query {
+                    shard: u32::try_from(p / 2_048).expect("shard"),
+                    query: self
+                        .client
+                        .query((p % 2_048) as usize)
+                        .expect("query")
+                        .to_bytes(&set)
+                        .expect("bytes"),
+                }
+            })
+            .collect();
+        Self::request(
+            &howl_wire::P16Batch {
+                key: howl_wire::KeySource::Session(self.handle.expect("registered")),
+                queries,
+            }
+            .encode(),
+        )
+    }
+
+    /// The records at `positions` and the answer they came in, or the refusal.
+    async fn fetch(
+        &mut self,
+        http: &Http,
+        positions: &[u64],
+    ) -> Result<(Answer, Vec<Vec<u8>>), (StatusCode, Vec<u8>)> {
+        let (status, bytes) = http.post("/howl/v1/notes", self.body(positions)).await;
+        if status != StatusCode::OK {
+            return Err((status, bytes));
+        }
+        let answer = Answer::decode(&bytes).expect("answer");
+        assert_eq!(answer.param_set, howl_wire::PARAM_SET_D2048_CELL256_P16);
+        let Body::Notes(notes) = &answer.body else {
+            panic!("notes");
+        };
+        let set = self.client.params().clone();
+        let records = notes
+            .responses
+            .iter()
+            .take(positions.len())
+            .map(|r| {
+                let response = raven_inspire::special_modulus::Response::from_bytes(&set, r)
+                    .expect("response");
+                let mut cell = self.client.decode(&response).expect("decode");
+                cell.resize(CELL_BYTES, 0);
+                cell
+            })
+            .collect();
+        Ok((answer, records))
+    }
+}
+
+fn set_2(mut config: NodeConfig) -> NodeConfig {
+    config.param_set = howl_wire::PARAM_SET_D2048_CELL256_P16;
+    config
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_2_an_append_re_encodes_the_newest_shard_alone_and_is_served_at_once() {
+    let fixture = Fixture::load();
+    let (logs, leaves, last) = long_chain(&fixture, 150, 17, 0xa99);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let chain = FakeChain::new(fixture.pool, fixture.first_block, logs, fixture.head);
+    let mut node = TestNode::start_with(
+        set_2(config(dir.path(), &fixture, Duration::from_secs(3_600))),
+        chain.clone(),
+    );
+    node.catch_up().await;
+    let mut reader = P16Reader::new();
+    reader.register(&node.http).await;
+    let mut block = fixture.head;
+    let mut reads = 0;
+    while block < last {
+        block += 1;
+        chain.set_head(block);
+        let before = node.engine.view();
+        let encodes = node.engine.encodes();
+        let Step::Read { leaves: added, .. } = node.step().await else {
+            panic!("a block was read");
+        };
+        let after = node.engine.view();
+        let first = added.start / ROWS_PER_SHARD as u64;
+        let touched = (added.end - 1) / ROWS_PER_SHARD as u64 - first + 1;
+        assert_eq!(node.engine.encodes() - encodes, touched, "block {block}");
+        for (old, new) in before.shards.iter().zip(&after.shards).take(first as usize) {
+            assert!(Arc::ptr_eq(old, new), "a full shard is the same allocation");
+        }
+        // A row the feed shows is a row a private read returns, and the oldest row still is.
+        if block.is_multiple_of(25) || added.end / 2_048 != added.start / 2_048 {
+            let sync = node.sync().await;
+            assert_eq!(sync.leaf_count, added.end);
+            let newest = added.end - 1;
+            let (answer, cells) = reader.fetch(&node.http, &[newest, 5]).await.expect("read");
+            assert_eq!(answer.leaf_count, added.end);
+            let record = decode(&cells[0]).expect("decodes");
+            assert_eq!(u64::from(record.leaf_index), newest);
+            assert_eq!(record.commitment_prefix, leaves[newest as usize][..16]);
+            assert_eq!(Some(&cells[1]), fixture.leaves[5].cell.as_ref());
+            reads += 1;
+        }
+    }
+    assert!(reads >= 6);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_2_a_session_lapses_a_ttl_after_its_last_use() {
+    let fixture = Fixture::load();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut node = TestNode::start_with(
+        set_2(config(dir.path(), &fixture, Duration::from_secs(2))),
+        FakeChain::new(
+            fixture.pool,
+            fixture.first_block,
+            fixture.logs.clone(),
+            fixture.head,
+        ),
+    );
+    node.catch_up().await;
+    let mut reader = P16Reader::new();
+    let handle = reader.register(&node.http).await;
+    let mut idle = P16Reader::new();
+    idle.register(&node.http).await;
+    assert_eq!(node.engine.pir().session_count(), 2);
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        reader.fetch(&node.http, &[1]).await.expect("in use");
+    }
+    // the idle session lapsed; the one in use did not
+    assert_eq!(node.engine.pir().sweep(), 1);
+    assert_eq!(node.engine.pir().session_count(), 1);
+    tokio::time::sleep(Duration::from_millis(2_300)).await;
+    let (status, body) = reader.fetch(&node.http, &[1]).await.expect_err("lapsed");
+    assert_eq!(
+        status,
+        StatusCode::GONE,
+        "handle {handle}: {}",
+        String::from_utf8_lossy(&body)
+    );
 }

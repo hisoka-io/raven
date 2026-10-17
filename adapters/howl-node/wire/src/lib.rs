@@ -7,7 +7,9 @@
 //! the upper nodes in it agree with each other and with the root.
 //!
 //! A request body starts with a [`RequestPrefix`]: the wire version and the parameter set the
-//! caller built its keys and queries under. A node refuses a body made for another one.
+//! caller built its keys and queries under. A node refuses a body made for another one. Under
+//! set 1 the payload after it is the scheme's own serialized key or batch; under set 2 a
+//! session payload is the [`P16_KEY_BYTES`] key and a batch payload is a [`P16Batch`].
 //!
 //! All integers are big-endian. Variable runs carry their length or are fixed by a count
 //! given before them, so every body decodes without a schema.
@@ -22,6 +24,24 @@ pub const WIRE_VERSION: u16 = 1;
 /// Parameter set of the private reads: ring dimension 2,048, one 60-bit modulus, plaintext
 /// modulus 65,537, 256-byte cells, responses switched to the 36-bit modulus.
 pub const PARAM_SET_D2048_CELL256: u16 = 1;
+
+/// Parameter set of the private reads: ring dimension 2,048, a 29-bit prime, plaintext
+/// modulus 16, a one-row packing key at about 2^60, 256-byte cells of which a response
+/// returns the first [`RECORD_BYTES`]. Its key, query and response bytes are fixed widths and
+/// its public key material is fixed in code, so its params answer carries none.
+pub const PARAM_SET_D2048_CELL256_P16: u16 = 2;
+
+/// Leading bytes of a cell a set-2 response returns; the rest of a served cell is zero.
+pub const RECORD_BYTES: usize = 246;
+
+/// Bytes of a set-2 packing key.
+pub const P16_KEY_BYTES: usize = 15_360;
+
+/// Bytes of a set-2 query.
+pub const P16_QUERY_BYTES: usize = 7_456;
+
+/// Bytes of a set-2 response.
+pub const P16_RESPONSE_BYTES: usize = 9_208;
 
 /// Bytes of one discovery cell.
 pub const CELL_BYTES: usize = 256;
@@ -233,6 +253,84 @@ impl RequestPrefix {
     }
 }
 
+/// Where the packing key of a set-2 batch comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeySource {
+    /// A session registered earlier: `1 u8 | handle u64`.
+    Session(u64),
+    /// The key itself, [`P16_KEY_BYTES`]: `2 u8 | key`.
+    Inline(Vec<u8>),
+}
+
+/// One query of a set-2 batch: a shard index and the query bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct P16Query {
+    /// Shard of [`ROWS_PER_SHARD`] rows the query selects in.
+    pub shard: u32,
+    /// [`P16_QUERY_BYTES`] bytes.
+    pub query: Vec<u8>,
+}
+
+/// The payload of a set-2 `POST /howl/v1/notes`, after the [`RequestPrefix`]:
+/// `key source | count u16 | (shard u32 | query)*`. The answer is [`Body::Notes`] with one
+/// [`P16_RESPONSE_BYTES`] response per query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct P16Batch {
+    /// The packing key's source.
+    pub key: KeySource,
+    /// The queries, in slot order.
+    pub queries: Vec<P16Query>,
+}
+
+impl P16Batch {
+    /// The payload's bytes.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer(Vec::with_capacity(
+            11 + P16_KEY_BYTES + self.queries.len() * (4 + P16_QUERY_BYTES),
+        ));
+        match &self.key {
+            KeySource::Session(handle) => {
+                w.bytes(&[1]);
+                w.u64(*handle);
+            }
+            KeySource::Inline(key) => {
+                w.bytes(&[2]);
+                w.bytes(key);
+            }
+        }
+        w.u16(u16::try_from(self.queries.len()).unwrap_or(u16::MAX));
+        for q in &self.queries {
+            w.u32(q.shard);
+            w.bytes(&q.query);
+        }
+        w.0
+    }
+
+    /// Read a payload.
+    ///
+    /// # Errors
+    /// [`WireError`] for an unknown key source, a short run or surplus bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
+        let mut r = Reader::new("set-2 batch", bytes);
+        let key = match r.u8()? {
+            1 => KeySource::Session(r.u64()?),
+            2 => KeySource::Inline(r.take(P16_KEY_BYTES)?.to_vec()),
+            _ => return Err(WireError::Invalid("unknown key source")),
+        };
+        let count = r.u16()?;
+        let mut queries = Vec::with_capacity(usize::from(count).min(LADDER_CAP));
+        for _ in 0..count {
+            queries.push(P16Query {
+                shard: r.u32()?,
+                query: r.take(P16_QUERY_BYTES)?.to_vec(),
+            });
+        }
+        r.end()?;
+        Ok(Self { key, queries })
+    }
+}
+
 /// Rows `[base, next)` of the tag-prefix feed: `base u64 | next u64 | rows`.
 ///
 /// The feed holds [`Header::leaf_count`] rows; `next == leaf_count` marks the newest segment.
@@ -336,7 +434,8 @@ impl UpperNodes {
 }
 
 /// What the node serves with: `entry_bytes u32 | rows_per_shard u32 | ladder_cap u16 |
-/// session_ttl_secs u32 | crs_len u32 | crs`.
+/// session_ttl_secs u32 | crs_len u32 | crs`. The header's parameter set says which scheme;
+/// under set 2 `crs` is empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Params {
     /// Bytes per discovery cell.
