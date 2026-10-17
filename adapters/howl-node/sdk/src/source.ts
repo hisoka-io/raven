@@ -281,6 +281,35 @@ export class RavenHowlSource<F> {
     return at;
   }
 
+  /** The leaf count up to which the held newest block runs: its leaves need not be sent again. */
+  #heldTo(): number {
+    const to = this.#tree.newestIndex * LEAF_BLOCK_SIZE + this.#tree.newestLeaves().length / NODE_BYTES;
+    return to === this.#state.leafCount ? to : 0;
+  }
+
+  /**
+   * The newest block's leaves from an answer that carries them from the leaf it names: the
+   * leaves before that are the ones held. `null` when the block is full and wholly held, so
+   * the upper nodes alone fix the root.
+   */
+  #newestFrom(a: Answer, held: number, before: { index: number; leaves: Uint8Array }): Uint8Array | null {
+    const start = a.blockIndex * LEAF_BLOCK_SIZE;
+    const begin = a.leafCount - a.blockLeaves.length / NODE_BYTES;
+    if (begin === start) return a.blockLeaves;
+    if (begin !== held || begin < start || begin > start + LEAF_BLOCK_SIZE) {
+      throw new HowlError("Protocol", `sync sent block ${a.blockIndex} from leaf ${begin}, ${held} held`);
+    }
+    const own = (begin - start) * NODE_BYTES;
+    if (before.index === a.blockIndex && before.leaves.length >= own) {
+      const leaves = new Uint8Array(own + a.blockLeaves.length);
+      leaves.set(before.leaves.subarray(0, own));
+      leaves.set(a.blockLeaves, own);
+      return leaves;
+    }
+    if (begin === start + LEAF_BLOCK_SIZE && a.blockLeaves.length === 0) return null;
+    throw new HowlError("Protocol", `sync skipped leaves of block ${a.blockIndex} the client does not hold`);
+  }
+
   /** Whether the held leaves `[b * 1024, v)` of the old newest block are a prefix of `leaves`. */
   #keeps(held: Uint8Array, v: number, leaves: Uint8Array): boolean {
     const need = (v - Math.floor((v - 1) / LEAF_BLOCK_SIZE) * LEAF_BLOCK_SIZE) * NODE_BYTES;
@@ -310,7 +339,10 @@ export class RavenHowlSource<F> {
     for (;;) {
       const since = this.#feed.length;
       const upperSince = this.#tree.fullBlocks;
-      const ex = await this.#get(`/howl/v1/sync?since=${since}&upper=${upperSince}`);
+      const held = this.#heldTo();
+      const ex = await this.#get(
+        `/howl/v1/sync?since=${since}&upper=${upperSince}` + (held > 0 ? `&held=${held}` : ""),
+      );
       if (ex.status === 409) {
         const stale = protocol("sync", () => decode(this.#wasm, ex.body));
         // The node is behind the cursor: a lagging replica, or a chain that got shorter. Only
@@ -342,9 +374,10 @@ export class RavenHowlSource<F> {
       if (upperSince + a.upperNodes.length / NODE_BYTES !== Math.floor(n / LEAF_BLOCK_SIZE)) {
         throw new HowlError("Protocol", `sync carries ${a.upperNodes.length / NODE_BYTES} upper nodes for ${n} leaves`);
       }
+      const newest = this.#newestFrom(a, held, before);
       protocol("sync", () => {
         this.#tree.appendUpper(a.upperNodes);
-        this.#tree.setNewest(a.blockIndex, a.blockLeaves);
+        if (newest !== null) this.#tree.setNewest(a.blockIndex, newest);
       });
       if (!equal(protocol("sync", () => this.#tree.root(n)), a.root)) {
         // The nodes held below the cursor are not the node's: the chain changed under them.
@@ -358,7 +391,7 @@ export class RavenHowlSource<F> {
         if (n >= v && b === before.index) {
           kept =
             b === a.blockIndex
-              ? this.#keeps(before.leaves, v, a.blockLeaves)
+              ? newest !== null && this.#keeps(before.leaves, v, newest)
               : this.#keeps(before.leaves, v, await this.#fullBlock(b));
         }
         if (!kept) {

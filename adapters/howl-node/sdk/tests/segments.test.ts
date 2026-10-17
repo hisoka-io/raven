@@ -27,10 +27,15 @@ class Pool {
   readonly upper: Uint8Array;
   readonly root: Uint8Array;
 
-  constructor(readonly count: number, planted: Map<number, Uint8Array>) {
+  /** `count` random leaves after those of `base`, when given. */
+  constructor(readonly count: number, planted: Map<number, Uint8Array>, base?: Pool) {
     this.leaves = new Uint8Array(randomBytes(count * 32));
     for (let i = 0; i < count; i++) this.leaves[i * 32]! &= 0x0f;
     this.rows = new Uint8Array(randomBytes(count * 6));
+    if (base !== undefined) {
+      this.leaves.set(base.leaves);
+      this.rows.set(base.rows);
+    }
     for (const [position, prefix] of planted) this.rows.set(prefix, position * 6);
     const full = Math.floor(count / BLOCK);
     this.upper = new Uint8Array(full * 32);
@@ -53,12 +58,14 @@ class Pool {
     return out;
   }
 
-  sync(since: number, upperSince: number): Exchange {
-    if (since > this.count) return { status: 409, body: this.#answer(KIND.stale, []) };
+  /** The node's sync answer; `held` as the node reads it, `skip` leaves dropped by a lying node. */
+  sync(since: number, upperSince: number, held = 0, skip = 0): Exchange {
+    if (since > this.count || held > this.count) return { status: 409, body: this.#answer(KIND.stale, []) };
     const next = Math.min((Math.floor(since / SEGMENT_ROWS) + 1) * SEGMENT_ROWS, this.count);
     const full = Math.floor(this.count / BLOCK);
     const newest = Math.floor((this.count - 1) / BLOCK);
-    const newestLeaves = this.leaves.subarray(newest * BLOCK * 32, this.count * 32);
+    const from = Math.max(held, newest * BLOCK) + skip;
+    const newestLeaves = this.leaves.subarray(from * 32, this.count * 32);
     return {
       status: 200,
       body: this.#answer(KIND.sync, [
@@ -73,17 +80,29 @@ class Pool {
   }
 }
 
-/** A transport over `pool` that loses the connection on the requests numbered in `drop`. */
-function served(pool: Pool, drop: Set<number>): HowlTransport & { paths: string[] } {
+/**
+ * A transport over `pool` that loses the connection on the requests numbered in `drop`. A node
+ * that predates `held` ignores it; a lying one drops `skip` more leaves.
+ */
+function served(
+  pool: Pool,
+  drop: Set<number>,
+  node: { ignoresHeld?: boolean; skip?: number } = {},
+): HowlTransport & { paths: string[]; down: number[] } {
   const paths: string[] = [];
+  const down: number[] = [];
   return {
     paths,
+    down,
     get: async (path) => {
       paths.push(path);
       if (drop.has(paths.length)) throw new HowlError("Network", `GET ${path}: connection reset`);
-      const m = /^\/howl\/v1\/sync\?since=(\d+)&upper=(\d+)$/.exec(path);
+      const m = /^\/howl\/v1\/sync\?since=(\d+)&upper=(\d+)(?:&held=(\d+))?$/.exec(path);
       if (m === null) throw new Error(`unexpected ${path}`);
-      return pool.sync(Number(m[1]), Number(m[2]));
+      const held = node.ignoresHeld === true ? 0 : Number(m[3] ?? 0);
+      const ex = pool.sync(Number(m[1]), Number(m[2]), held, node.skip ?? 0);
+      down.push(ex.body.length);
+      return ex;
     },
     post: async (path) => {
       throw new Error(`unexpected POST ${path}`);
@@ -112,7 +131,7 @@ describe("a pool past one feed segment", () => {
     await expect(first.sync()).rejects.toMatchObject({ kind: "Network" });
     expect(transport.paths).toEqual([
       "/howl/v1/sync?since=0&upper=0",
-      `/howl/v1/sync?since=${SEGMENT_ROWS}&upper=${Math.floor(LEAVES / BLOCK)}`,
+      `/howl/v1/sync?since=${SEGMENT_ROWS}&upper=${Math.floor(LEAVES / BLOCK)}&held=${LEAVES}`,
     ]);
     const stored = first.snapshot();
     expect(stored.rows.length / 6).toBe(SEGMENT_ROWS);
@@ -120,7 +139,9 @@ describe("a pool past one feed segment", () => {
     const again = served(pool, new Set());
     const resumed = new RavenHowlSource({ transport: again, wasm, field: bigintField, snapshot: stored });
     const result = await resumed.sync();
-    expect(again.paths).toEqual([`/howl/v1/sync?since=${SEGMENT_ROWS}&upper=${Math.floor(LEAVES / BLOCK)}`]);
+    expect(again.paths).toEqual([
+      `/howl/v1/sync?since=${SEGMENT_ROWS}&upper=${Math.floor(LEAVES / BLOCK)}&held=${LEAVES}`,
+    ]);
     expect(result.leafCount).toBe(LEAVES);
     expect(result.rowsAdded).toBe(LEAVES - SEGMENT_ROWS);
     expect(hex(result.root)).toBe(hex(pool.root));
@@ -140,5 +161,46 @@ describe("a pool past one feed segment", () => {
     expect(transport.paths.length).toBe(2);
     expect([result.leafCount, result.rowsAdded, src.feed.length]).toEqual([LEAVES, LEAVES, LEAVES]);
     expect(src.snapshot().rows.length).toBe(LEAVES * 6);
+  });
+
+  it("a synced client sends what it holds: an idle sync is the header and three empty runs", async () => {
+    const transport = served(pool, new Set());
+    const src = new RavenHowlSource({ transport, wasm, field: bigintField });
+    await src.sync();
+    const mark = transport.paths.length;
+    const idle = await src.sync();
+    expect(transport.paths.slice(mark)).toEqual([
+      `/howl/v1/sync?since=${LEAVES}&upper=${Math.floor(LEAVES / BLOCK)}&held=${LEAVES}`,
+    ]);
+    expect(transport.down.slice(mark)).toEqual([56 + 16 + 16 + 8]);
+    expect([idle.leafCount, idle.rowsAdded, hex(idle.root)]).toEqual([LEAVES, 0, hex(pool.root)]);
+  });
+
+  it("the held leaves rebuild the newest block, from a node that skips them or one that sends it whole", async () => {
+    const stored = await (async () => {
+      const src = new RavenHowlSource({ transport: served(pool, new Set()), wasm, field: bigintField });
+      await src.sync();
+      return src.snapshot();
+    })();
+    const grown = new Pool(LEAVES + 300, new Map(), pool);
+    const newestStart = Math.floor((grown.count - 1) / BLOCK) * BLOCK;
+    expect(newestStart).toBeLessThan(LEAVES);
+
+    for (const node of [{}, { ignoresHeld: true }]) {
+      const transport = served(grown, new Set(), node);
+      const src = new RavenHowlSource({ transport, wasm, field: bigintField, snapshot: stored });
+      const result = await src.sync();
+      expect([result.leafCount, result.rowsAdded, hex(result.root)]).toEqual([grown.count, 300, hex(grown.root)]);
+      const leavesSent = "ignoresHeld" in node ? grown.count - newestStart : 300;
+      expect(transport.down).toEqual([56 + 16 + 300 * 6 + 16 + 8 + leavesSent * 32]);
+    }
+    // A node that leaves out a leaf the client does not hold is refused.
+    const lying = new RavenHowlSource({
+      transport: served(grown, new Set(), { skip: 1 }),
+      wasm,
+      field: bigintField,
+      snapshot: stored,
+    });
+    await expect(lying.sync()).rejects.toMatchObject({ kind: "Protocol" });
   });
 });

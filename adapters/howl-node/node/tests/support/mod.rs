@@ -19,7 +19,7 @@ use axum::body::Body as HttpBody;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use howl_indexer::{RawLog, TOPIC_LEAF_INSERTED, TOPIC_NEW_NOTE, TOPIC_NEW_PRIVATE_MEMO};
-use howl_node::chain::{Chain, ChainError};
+use howl_node::chain::{BlockLog, Chain, ChainError, Header};
 use howl_wire::{Answer, Body, RequestPrefix, PARAM_SET_D2048_CELL256};
 use http_body_util::BodyExt;
 use raven_inspire::math::GaussianSampler;
@@ -115,6 +115,12 @@ struct Inner {
     on_head: Option<(u64, Vec<RawLog>, u64)>,
     /// Hashes a stale backend keeps answering.
     frozen: HashMap<u64, [u8; 32]>,
+    /// The next logs read answers from another fork from this block on: `(first block, logs)`.
+    logs_from_fork: Option<(u64, Vec<RawLog>)>,
+    /// The next header read of a block answers from that fork: `(block, first block)`.
+    header_from_fork: Option<(u64, u64)>,
+    /// A fork applied when a block's header is next read: `(block, first block, logs)`.
+    on_header: Option<(u64, u64, Vec<RawLog>)>,
 }
 
 impl Inner {
@@ -142,6 +148,9 @@ impl FakeChain {
             first,
             on_head: None,
             frozen: HashMap::new(),
+            logs_from_fork: None,
+            header_from_fork: None,
+            on_header: None,
         })))
     }
 
@@ -185,6 +194,25 @@ impl FakeChain {
         inner.frozen.insert(number, hash);
     }
 
+    /// Answer the next logs read from a fork that replaces every block from `from` with
+    /// `logs`, and every other read from the chain as it is: a chain that reorganised and
+    /// reorganised back while one step read it.
+    pub fn fork_for_next_logs(&self, from: u64, logs: Vec<RawLog>) {
+        self.0.lock().expect("lock").logs_from_fork = Some((from, logs));
+    }
+
+    /// Answer the next header read of block `number` from the fork of
+    /// [`Self::fork_for_next_logs`] that starts at `from`.
+    pub fn fork_for_next_header(&self, number: u64, from: u64) {
+        self.0.lock().expect("lock").header_from_fork = Some((number, from));
+    }
+
+    /// Fork as [`Self::fork`] when block `number`'s header is next read: inside a step, after
+    /// its logs read.
+    pub fn fork_on_header_of(&self, number: u64, from: u64, logs: Vec<RawLog>) {
+        self.0.lock().expect("lock").on_header = Some((number, from, logs));
+    }
+
     pub fn thaw(&self) {
         self.0.lock().expect("lock").frozen.clear();
     }
@@ -194,10 +222,23 @@ impl FakeChain {
     }
 
     fn hash(inner: &Inner, block: u64) -> [u8; 32] {
+        Self::hash_on(inner.fork_of(block), block)
+    }
+
+    fn hash_on(fork: u32, block: u64) -> [u8; 32] {
         let mut h = Sha256::new();
-        h.update(inner.fork_of(block).to_be_bytes());
+        h.update(fork.to_be_bytes());
         h.update(block.to_be_bytes());
         h.finalize().into()
+    }
+
+    /// Block `number`'s hash as this backend answers it.
+    fn answered(inner: &Inner, number: u64) -> [u8; 32] {
+        inner
+            .frozen
+            .get(&number)
+            .copied()
+            .unwrap_or_else(|| Self::hash(inner, number))
     }
 }
 
@@ -211,27 +252,82 @@ impl Chain for FakeChain {
         Ok(self.0.lock().expect("lock").head)
     }
 
-    async fn block_hash(&self, number: u64) -> Result<Option<[u8; 32]>, ChainError> {
-        let inner = self.0.lock().expect("lock");
-        if let Some(hash) = inner.frozen.get(&number) {
-            return Ok(Some(*hash));
+    async fn header(&self, number: u64) -> Result<Option<Header>, ChainError> {
+        let armed = {
+            let mut inner = self.0.lock().expect("lock");
+            match inner.on_header.take() {
+                Some((block, from, logs)) if block == number => Some((from, logs)),
+                other => {
+                    inner.on_header = other;
+                    None
+                }
+            }
+        };
+        if let Some((from, logs)) = armed {
+            self.fork(from, logs);
         }
-        Ok((number <= inner.head).then(|| Self::hash(&inner, number)))
+        let mut inner = self.0.lock().expect("lock");
+        if number > inner.head && !inner.frozen.contains_key(&number) {
+            return Ok(None);
+        }
+        let cut = match inner.header_from_fork {
+            Some((block, from)) if block == number => {
+                inner.header_from_fork = None;
+                from
+            }
+            _ => u64::MAX,
+        };
+        let other = inner.forks.len() as u32 + 1_000;
+        let at = |block: u64| {
+            if block >= cut {
+                Self::hash_on(other, block)
+            } else {
+                Self::answered(&inner, block)
+            }
+        };
+        Ok(Some(Header {
+            hash: at(number),
+            parent: at(number.wrapping_sub(1)),
+        }))
     }
 
-    async fn logs(&self, from: u64, to: u64) -> Result<Vec<RawLog>, ChainError> {
-        let inner = self.0.lock().expect("lock");
+    async fn logs(&self, from: u64, to: u64) -> Result<Vec<BlockLog>, ChainError> {
+        let mut inner = self.0.lock().expect("lock");
         let to = to.min(inner.head);
+        let fork = inner.logs_from_fork.take();
+        let other = inner.forks.len() as u32 + 1_000;
+        let (cut, extra) = fork.unwrap_or((u64::MAX, Vec::new()));
+        let place = |log: &RawLog| BlockLog {
+            log: log.clone(),
+            block_hash: if log.block_number >= cut {
+                Self::hash_on(other, log.block_number)
+            } else {
+                Self::answered(&inner, log.block_number)
+            },
+        };
         Ok(inner
             .logs
             .iter()
+            .filter(|log| log.block_number < cut)
+            .chain(&extra)
             .filter(|log| (from..=to).contains(&log.block_number))
-            .cloned()
+            .map(place)
             .collect())
     }
 
-    async fn leaf_count(&self, number: u64) -> Result<Option<u64>, ChainError> {
+    async fn leaf_count(&self, block: [u8; 32]) -> Result<Option<u64>, ChainError> {
         let inner = self.0.lock().expect("lock");
+        // A block this chain no longer has is unknown to it, as to an endpoint that keeps
+        // no other fork.
+        let top = inner
+            .head
+            .max(inner.frozen.keys().copied().max().unwrap_or(0));
+        let Some(number) = (0..=top).find(|n| Self::answered(&inner, *n) == block) else {
+            return Err(ChainError::Rpc {
+                method: "eth_call",
+                message: "unknown block".to_owned(),
+            });
+        };
         Ok(Some(
             inner
                 .logs

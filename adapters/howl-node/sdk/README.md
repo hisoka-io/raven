@@ -39,7 +39,7 @@ const witness = await source.merkleWitness(records[0].leafIndex); // or (index, 
 
 | Method | What it does |
 |---|---|
-| `sync()` | pulls the feed from the cursor, the new upper nodes and the newest block; checks the root; reports `rewoundTo` after a reorganisation |
+| `sync()` | pulls the feed from the cursor, the new upper nodes and the newest block past the leaves held (96 bytes when nothing is new); checks the root; reports `rewoundTo` after a reorganisation |
 | `matches(tags, from?)` | positions whose feed row equals a tag's low six bytes |
 | `fetchNotes(positions)` | private read, one record per position in request order, batches of up to the node's ladder cap |
 | `fetchTagPrefixes(since)` | one feed segment as served |

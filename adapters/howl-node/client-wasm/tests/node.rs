@@ -564,6 +564,23 @@ async fn refusals() {
         decode_answer_rust(&short.encode()).is_err(),
         "feed vs count"
     );
+    // A sync carries the newest block from the leaf after those the client holds: a tail
+    // decodes, more leaves than the tree holds does not.
+    let tail = decode_answer_rust(&node.raw("/howl/v1/sync?since=160&upper=0&held=150").await)
+        .expect("a tail of the newest block");
+    let Body::Sync { newest, .. } = &tail.body else {
+        panic!("sync");
+    };
+    assert_eq!(newest.leaves.len(), 10 * 32);
+    let mut over = tail.clone();
+    let Body::Sync { newest, .. } = &mut over.body else {
+        panic!("sync");
+    };
+    newest.leaves.extend_from_slice(&[0u8; 32 * 151]);
+    assert!(
+        decode_answer_rust(&over.encode()).is_err(),
+        "newest block vs count"
+    );
 }
 
 /// `root at count i + 1` for every `LeafInserted`.

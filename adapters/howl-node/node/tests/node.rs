@@ -91,6 +91,27 @@ impl TestNode {
     async fn sync(&self) -> Answer {
         self.http.answer("/howl/v1/sync?since=0&upper=0").await
     }
+
+    /// Step until idle, taking refused steps as retries; the errors seen.
+    async fn settle(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for _ in 0..64 {
+            match self.follower.step().await {
+                Ok(step) => {
+                    howl_node::publish(&self.follower, &self.engine, &step).expect("publish");
+                    if matches!(step, Step::Idle { .. }) {
+                        return errors;
+                    }
+                }
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+        panic!(
+            "no idle step; refused {} times: {:?}",
+            errors.len(),
+            errors.last()
+        );
+    }
 }
 
 /// `root after leaf i` for every `LeafInserted` in `logs`: the root at count `i + 1`.
@@ -981,4 +1002,208 @@ async fn a_sync_skips_the_newest_leaves_the_wallet_holds() {
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(Answer::decode(&body).expect("stale").leaf_count, n);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reorganisation_undone_inside_a_step_is_never_applied() {
+    let fixture = Fixture::load();
+    // B replaces A's last block with as many other leaves, so the leaf count agrees.
+    let f = forked(&fixture, 5, 4, 4, 1, 4);
+    let x = f.a_last;
+    let chain = FakeChain::new(fixture.pool, fixture.first_block, f.logs_a.clone(), x - 1);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut node = TestNode::start(dir.path(), &fixture, chain.clone());
+    node.catch_up().await;
+
+    // Block x arrives; the chain is B while the step reads the logs and A for every other read.
+    chain.set_head(x);
+    chain.fork_for_next_logs(x, f.b.logs.clone());
+    let step = node.step().await;
+    assert_ne!(
+        node.sync().await.root,
+        root_of(&f.leaves_b),
+        "{step:?} applied the logs of a fork the chain left"
+    );
+    node.catch_up().await;
+    let served = node.sync().await;
+    assert_eq!(
+        (served.leaf_count, served.block),
+        (f.leaves_a.len() as u64, x)
+    );
+    assert_eq!(served.root, root_of(&f.leaves_a));
+    same_as_fresh(&node, &fixture, f.logs_a.clone(), x).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shorter_chain_whose_head_block_is_not_ours_is_followed_at_once() {
+    let fixture = Fixture::load();
+    let (logs, leaves, last) = long_chain(&fixture, 30, 9, 0x5a7);
+    let chain = FakeChain::new(fixture.pool, fixture.first_block, logs.clone(), last);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut node = TestNode::start(dir.path(), &fixture, chain.clone());
+    node.catch_up().await;
+
+    // The chain drops its last three blocks and replaces the one before them with an empty one.
+    let cut = last - 3;
+    chain.fork(cut, Vec::new());
+    chain.set_head(cut);
+    let step = node.step().await;
+    assert!(matches!(step, Step::Rewound { .. }), "{step:?}");
+    node.catch_up().await;
+    let kept: Vec<RawLog> = logs
+        .iter()
+        .filter(|l| l.block_number < cut)
+        .cloned()
+        .collect();
+    let served = node.sync().await;
+    let count = served.leaf_count as usize;
+    assert!(count < leaves.len());
+    assert_eq!(served.root, root_of(&leaves[..count]));
+    same_as_fresh(&node, &fixture, kept, cut).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn headers_that_do_not_link_are_never_applied() {
+    let fixture = Fixture::load();
+    // B replaces A's block x with as many other leaves; neither chain has pool logs at x + 1.
+    let f = forked(&fixture, 5, 4, 4, 1, 4);
+    let x = f.a_last;
+    let chain = FakeChain::new(fixture.pool, fixture.first_block, f.logs_a.clone(), x - 1);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut node = TestNode::start(dir.path(), &fixture, chain.clone());
+    node.catch_up().await;
+
+    // The logs and block x's header come from B; block x + 1's header, and all else, from A.
+    chain.set_head(x + 1);
+    chain.fork_for_next_logs(x, f.b.logs.clone());
+    chain.fork_for_next_header(x, x);
+    let step = node.step().await;
+    assert_ne!(
+        node.sync().await.root,
+        root_of(&f.leaves_b),
+        "{step:?} applied logs under a header that is not its child's parent"
+    );
+    node.catch_up().await;
+    let served = node.sync().await;
+    assert_eq!(
+        (served.leaf_count, served.block),
+        (f.leaves_a.len() as u64, x + 1)
+    );
+    assert_eq!(served.root, root_of(&f.leaves_a));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_read_from_one_fork_under_another_forks_header_is_never_applied() {
+    let fixture = Fixture::load();
+    let (logs, leaves, last) = long_chain(&fixture, 3, 2, 0xaa1);
+    let chain = FakeChain::new(fixture.pool, fixture.first_block, logs, last);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut node = TestNode::start(dir.path(), &fixture, chain.clone());
+    node.catch_up().await;
+    let mut tree = support::LeanTree::default();
+    for leaf in &leaves {
+        tree.insert(support::scalar(leaf));
+    }
+
+    // Block x is empty on A and holds a note on B. The chain turns to B after the step reads
+    // the logs and before it reads x's header.
+    let x = last + 1;
+    let b = extend(fixture.pool, &mut tree, x, 2, 1, 0xbb);
+    chain.set_head(x);
+    chain.fork_on_header_of(x, x, b.logs.clone());
+    let first = node.follower.step().await;
+    if let Ok(step) = &first {
+        howl_node::publish(&node.follower, &node.engine, step).expect("publish");
+    }
+    let served = node.sync().await;
+    assert!(
+        !(served.block >= x && served.leaf_count == leaves.len() as u64),
+        "{first:?} applied A's empty block under B's header"
+    );
+
+    chain.set_head(x + 1);
+    let errors = node.settle().await;
+    let mut want = leaves;
+    want.extend(&b.leaves);
+    let served = node.sync().await;
+    assert_eq!(
+        (served.leaf_count, served.block, served.root),
+        (want.len() as u64, x + 1, root_of(&want)),
+        "refused {} times: {:?}",
+        errors.len(),
+        errors.last()
+    );
+}
+
+/// Chain A, then a backend that keeps answering A's hash for block `x` while the chain is B,
+/// whose block `x` holds one leaf fewer: the table writes a mark over A's rows at `x`.
+async fn hidden_fork(
+    more_at_next: bool,
+) -> (
+    TestNode,
+    FakeChain,
+    Fixture,
+    Vec<RawLog>,
+    Vec<Node>,
+    u64,
+    tempfile::TempDir,
+) {
+    let fixture = Fixture::load();
+    let f = forked(&fixture, 5, 4, 4, 1, 3);
+    let x = f.a_last;
+    let chain = FakeChain::new(fixture.pool, fixture.first_block, f.logs_a.clone(), x);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut node = TestNode::start(dir.path(), &fixture, chain.clone());
+    node.catch_up().await;
+    let mut logs = f.logs_b.clone();
+    let mut leaves = f.leaves_b.clone();
+    let mut fork = f.b.logs.clone();
+    if more_at_next {
+        let mut tree_b = f.tree_b.clone();
+        let more = extend(fixture.pool, &mut tree_b, x + 1, 1, 3, 0xc5);
+        fork.extend(more.logs.iter().cloned());
+        logs.extend(more.logs);
+        leaves.extend(&more.leaves);
+    }
+    chain.freeze_hash(x);
+    chain.fork(x, fork);
+    chain.set_head(x + 1);
+    (node, chain, fixture, logs, leaves, x, dir)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rows_the_next_leaf_does_not_follow_are_walked_back() {
+    let (mut node, chain, fixture, logs, leaves, x, _dir) = hidden_fork(true).await;
+    // B's next leaf is numbered from B's count, one below the table's.
+    let errors = node.settle().await;
+    chain.thaw();
+    node.settle().await;
+    let served = node.sync().await;
+    assert_eq!(
+        (served.leaf_count, served.root),
+        (leaves.len() as u64, root_of(&leaves)),
+        "refused {} times: {:?}",
+        errors.len(),
+        errors.last()
+    );
+    same_as_fresh(&node, &fixture, logs, x + 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_count_refused_twice_at_the_same_block_is_walked_back() {
+    let (mut node, chain, fixture, logs, leaves, x, _dir) = hidden_fork(false).await;
+    // Nothing new on B: only the pool's count disagrees with the table.
+    let errors = node.settle().await;
+    assert!(!errors.is_empty(), "the count was never compared");
+    chain.thaw();
+    node.settle().await;
+    let served = node.sync().await;
+    assert_eq!(
+        (served.leaf_count, served.root),
+        (leaves.len() as u64, root_of(&leaves)),
+        "refused {} times: {:?}",
+        errors.len(),
+        errors.last()
+    );
+    same_as_fresh(&node, &fixture, logs, x + 1).await;
 }

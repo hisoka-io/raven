@@ -32,29 +32,57 @@ pub enum ChainError {
     },
 }
 
+/// A block's hash and its parent's: a run of headers that link proves one chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Header {
+    /// The block's hash.
+    pub hash: [u8; 32],
+    /// Its parent's hash.
+    pub parent: [u8; 32],
+}
+
+/// A pool log with the hash of the block the endpoint read it from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockLog {
+    /// The log.
+    pub log: RawLog,
+    /// Hash of its block.
+    pub block_hash: [u8; 32],
+}
+
 /// The four reads that keep the node on the chain.
 pub trait Chain: Send + Sync {
     /// Number of the newest block.
     fn head(&self) -> impl Future<Output = Result<u64, ChainError>> + Send;
 
+    /// Header of block `number` on the chain as it is now; `None` when there is no such block.
+    fn header(
+        &self,
+        number: u64,
+    ) -> impl Future<Output = Result<Option<Header>, ChainError>> + Send;
+
     /// Hash of block `number` on the chain as it is now; `None` when there is no such block.
     fn block_hash(
         &self,
         number: u64,
-    ) -> impl Future<Output = Result<Option<[u8; 32]>, ChainError>> + Send;
+    ) -> impl Future<Output = Result<Option<[u8; 32]>, ChainError>> + Send {
+        async move { Ok(self.header(number).await?.map(|header| header.hash)) }
+    }
 
     /// Every pool log of the four tree events in blocks `from..=to`.
     fn logs(
         &self,
         from: u64,
         to: u64,
-    ) -> impl Future<Output = Result<Vec<RawLog>, ChainError>> + Send;
+    ) -> impl Future<Output = Result<Vec<BlockLog>, ChainError>> + Send;
 
-    /// The pool's leaf count after block `number`, when the source can read it. A batch that
-    /// ends on another count is refused, which catches a log source that dropped logs.
+    /// The pool's leaf count after the block whose hash is `block`, when the source can read
+    /// it. Read by hash, it belongs to that block whatever the chain did since. A batch that
+    /// ends on another count is refused, which catches a log source that dropped logs and an
+    /// absence of logs read from another fork.
     fn leaf_count(
         &self,
-        number: u64,
+        block: [u8; 32],
     ) -> impl Future<Output = Result<Option<u64>, ChainError>> + Send;
 }
 
@@ -117,7 +145,7 @@ fn fixed<const N: usize>(value: &Value) -> Option<[u8; N]> {
 }
 
 /// One log of an `eth_getLogs` answer; `Ok(None)` for a log the endpoint marks removed.
-fn parse_log(log: &Value) -> Result<Option<RawLog>, ChainError> {
+fn parse_log(log: &Value) -> Result<Option<BlockLog>, ChainError> {
     let bad = |what| ChainError::Malformed {
         method: "eth_getLogs",
         what,
@@ -132,7 +160,11 @@ fn parse_log(log: &Value) -> Result<Option<RawLog>, ChainError> {
         .iter()
         .map(|topic| fixed::<32>(topic).ok_or_else(|| bad("topic")))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Some(RawLog {
+    let block_hash = log
+        .get("blockHash")
+        .and_then(fixed::<32>)
+        .ok_or_else(|| bad("blockHash"))?;
+    let log = RawLog {
         block_number: log
             .get("blockNumber")
             .and_then(parse_quantity)
@@ -151,7 +183,8 @@ fn parse_log(log: &Value) -> Result<Option<RawLog>, ChainError> {
             .and_then(Value::as_str)
             .and_then(unhex)
             .ok_or_else(|| bad("data"))?,
-    }))
+    };
+    Ok(Some(BlockLog { log, block_hash }))
 }
 
 impl RpcChain {
@@ -223,24 +256,29 @@ impl Chain for RpcChain {
         })
     }
 
-    async fn block_hash(&self, number: u64) -> Result<Option<[u8; 32]>, ChainError> {
+    async fn header(&self, number: u64) -> Result<Option<Header>, ChainError> {
         let result = self
             .call("eth_getBlockByNumber", json!([quantity(number), false]))
             .await?;
         if result.is_null() {
             return Ok(None);
         }
-        result
-            .get("hash")
-            .and_then(fixed::<32>)
-            .map(Some)
-            .ok_or(ChainError::Malformed {
-                method: "eth_getBlockByNumber",
-                what: "hash",
-            })
+        let field = |name, what| {
+            result
+                .get(name)
+                .and_then(fixed::<32>)
+                .ok_or(ChainError::Malformed {
+                    method: "eth_getBlockByNumber",
+                    what,
+                })
+        };
+        Ok(Some(Header {
+            hash: field("hash", "hash")?,
+            parent: field("parentHash", "parentHash")?,
+        }))
     }
 
-    async fn logs(&self, from: u64, to: u64) -> Result<Vec<RawLog>, ChainError> {
+    async fn logs(&self, from: u64, to: u64) -> Result<Vec<BlockLog>, ChainError> {
         let topics = [
             TOPIC_LEAF_INSERTED,
             TOPIC_GENESIS_SEEDED,
@@ -265,10 +303,11 @@ impl Chain for RpcChain {
         Ok(logs)
     }
 
-    async fn leaf_count(&self, number: u64) -> Result<Option<u64>, ChainError> {
+    async fn leaf_count(&self, block: [u8; 32]) -> Result<Option<u64>, ChainError> {
+        // EIP-1898: the state of exactly that block.
         let call = json!([
             { "to": hex(&self.pool), "data": hex(&SELECTOR_NEXT_LEAF_INDEX) },
-            quantity(number),
+            { "blockHash": hex(&block) },
         ]);
         let result = self.call("eth_call", call).await?;
         let bytes = result
@@ -318,6 +357,7 @@ mod tests {
     fn a_log_parses_and_a_removed_log_is_dropped() {
         let log = json!({
             "blockNumber": "0x1a",
+            "blockHash": format!("0x{}", "33".repeat(32)),
             "logIndex": "0x3",
             "address": format!("0x{}", "11".repeat(20)),
             "topics": [format!("0x{}", "22".repeat(32))],
@@ -325,12 +365,18 @@ mod tests {
             "removed": false,
         });
         let parsed = parse_log(&log).expect("parses").expect("kept");
+        assert_eq!(parsed.block_hash, [0x33; 32]);
+        let parsed = parsed.log;
         assert_eq!((parsed.block_number, parsed.log_index), (26, 3));
         assert_eq!(parsed.address, [0x11; 20]);
         assert_eq!(parsed.topics, vec![[0x22; 32]]);
         assert_eq!(parsed.data, vec![1, 2]);
-        let mut removed = log;
+        let mut removed = log.clone();
         removed["removed"] = json!(true);
         assert!(parse_log(&removed).expect("parses").is_none());
+        // A log that cannot be placed on a block is refused, not applied.
+        let mut unplaced = log;
+        unplaced["blockHash"] = json!(null);
+        assert!(parse_log(&unplaced).is_err());
     }
 }

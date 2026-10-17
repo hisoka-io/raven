@@ -15,9 +15,9 @@ use axum::routing::post;
 use axum::{Json, Router};
 use chain::Fixture;
 use howl_indexer::{
-    RawLog, TOPIC_GENESIS_SEEDED, TOPIC_LEAF_INSERTED, TOPIC_NEW_NOTE, TOPIC_NEW_PRIVATE_MEMO,
+    TOPIC_GENESIS_SEEDED, TOPIC_LEAF_INSERTED, TOPIC_NEW_NOTE, TOPIC_NEW_PRIVATE_MEMO,
 };
-use howl_node::chain::{unhex, Chain, RpcChain, SELECTOR_NEXT_LEAF_INDEX};
+use howl_node::chain::{unhex, BlockLog, Chain, RpcChain, SELECTOR_NEXT_LEAF_INDEX};
 use howl_node::follow::Step;
 use howl_node::http::{router, Served};
 use howl_node::NodeConfig;
@@ -37,14 +37,15 @@ fn quantity(value: &Value) -> u64 {
         .expect("quantity")
 }
 
-fn log_json(log: &RawLog) -> Value {
+fn log_json(logged: &BlockLog) -> Value {
+    let log = &logged.log;
     json!({
         "blockNumber": format!("0x{:x}", log.block_number),
         "logIndex": format!("0x{:x}", log.log_index),
         "address": hex(&log.address),
         "topics": log.topics.iter().map(|t| hex(t)).collect::<Vec<_>>(),
         "data": hex(&log.data),
-        "blockHash": hex(&[0u8; 32]),
+        "blockHash": hex(&logged.block_hash),
         "removed": false,
     })
 }
@@ -59,8 +60,12 @@ async fn endpoint(
         "eth_blockNumber" => json!(format!("0x{:x}", chain.head().await.expect("head"))),
         "eth_getBlockByNumber" => {
             assert_eq!(params[1], json!(false));
-            match chain.block_hash(quantity(&params[0])).await.expect("hash") {
-                Some(hash) => json!({ "hash": hex(&hash), "number": params[0] }),
+            match chain.header(quantity(&params[0])).await.expect("header") {
+                Some(header) => json!({
+                    "hash": hex(&header.hash),
+                    "parentHash": hex(&header.parent),
+                    "number": params[0],
+                }),
                 None => Value::Null,
             }
         }
@@ -84,7 +89,7 @@ async fn endpoint(
             // A real endpoint filters by address; the fixture also holds another contract's logs.
             json!(logs
                 .iter()
-                .filter(|l| l.address == pool)
+                .filter(|l| l.log.address == pool)
                 .map(log_json)
                 .collect::<Vec<_>>())
         }
@@ -94,11 +99,11 @@ async fn endpoint(
                 unhex(params[0]["data"].as_str().expect("data")).expect("hex"),
                 SELECTOR_NEXT_LEAF_INDEX
             );
-            let count = chain
-                .leaf_count(quantity(&params[1]))
-                .await
-                .expect("count")
-                .expect("some");
+            let block: [u8; 32] = unhex(params[1]["blockHash"].as_str().expect("by hash"))
+                .expect("hex")
+                .try_into()
+                .expect("32 bytes");
+            let count = chain.leaf_count(block).await.expect("count").expect("some");
             let mut word = [0u8; 32];
             word[24..].copy_from_slice(&count.to_be_bytes());
             json!(hex(&word))

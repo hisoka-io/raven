@@ -204,6 +204,21 @@ fn check_block(block: &howl_wire::LeafBlock, leaf_count: u64) -> Result<(), Stri
     }
 }
 
+/// A sync's newest block carries its leaves from the one after those the client said it
+/// holds: a tail of the leaves present, never more.
+fn check_newest(block: &howl_wire::LeafBlock, leaf_count: u64) -> Result<(), String> {
+    let carried = (block.leaves.len() / NODE_BYTES) as u64;
+    let present = leaves_present(block.block_index, leaf_count);
+    if carried <= present {
+        Ok(())
+    } else {
+        Err(format!(
+            "block {} carries {carried} leaves where a tree of {leaf_count} holds {present}",
+            block.block_index
+        ))
+    }
+}
+
 fn check_segment(segment: &howl_wire::PrefixSegment, leaf_count: u64) -> Result<(), String> {
     if segment.next > leaf_count {
         return Err(format!(
@@ -259,7 +274,7 @@ pub fn decode_answer_rust(bytes: &[u8]) -> Result<Answer, String> {
         } => {
             check_segment(prefixes, n)?;
             check_upper(upper, n)?;
-            check_block(newest, n)?;
+            check_newest(newest, n)?;
             let expected = u32::try_from(n.saturating_sub(1) / tree::BLOCK_LEAVES)
                 .map_err(|e| e.to_string())?;
             if newest.block_index != expected {

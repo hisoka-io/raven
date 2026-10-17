@@ -40,10 +40,13 @@ Optional flags: `--poll-ms` (2,000), `--max-range` (blocks per log read, 2,000),
 
 The node serves each block as soon as it is read, and every answer names that block. When the chain
 reorganises below the node's newest block, the node returns to the newest block it recorded that the
-chain still has and reads on from there. A read that spans a reorganisation is dropped and read again,
-and a leaf whose logged root the node's rows cannot reproduce takes the node back one recorded block
-further. A newest block the endpoint does not know, while the blocks below it are unchanged, is
-waited for a few polls before the node takes the chain to be shorter.
+chain still has and reads on from there. Within 64 blocks of the head it reads the header of every
+block it takes in, and applies the read only when the headers link to each other and to the node's
+newest block and every log names one of them; a read that spans a reorganisation is dropped and read
+again. A leaf whose logged root the node's rows cannot reproduce takes the node back one recorded
+block further. A newest block the endpoint does not know is waited for a few polls while the
+endpoint's head block is one the node read; a head block the node did not read is a shorter chain,
+followed at once.
 
 A wallet that holds the newest block up to its leaf count sends that count as `held`, so a sync with
 nothing new carries the header and three empty runs: 96 bytes.
