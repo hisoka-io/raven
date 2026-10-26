@@ -813,6 +813,11 @@ jobs:
         # host always had the flags) while the cargo-feature guard always fired (the default
         # step does not build with simd-packing-offline). The lane therefore failed exactly
         # when it landed on a capable runner, which read as a flake.
+        #
+        # RAVEN_HAS_AVX512 keys on IFMA, the packing kernels' requirement. The special-modulus
+        # kernel needs F/BW/DQ/VL instead and checks them itself, so on a runner without AVX-512
+        # (the AMD hosted runners) its differential loud-skips. That kernel is proven on capable
+        # runners and on a capable local host; per-kernel strictness is the next step.
         run: |
           flags=$(grep -o 'avx512[a-z0-9_]*' /proc/cpuinfo | sort -u | tr '\n' ' ') || flags=""
           echo "runner avx512 flags: ${flags:-none}"
@@ -843,6 +848,9 @@ jobs:
         # failure, on an incapable one it is a named loud skip. The whole suite runs here, so
         # the KAT is covered; a second step naming just the KAT ran it again WITHOUT the
         # strictness, which is the weaker of the two answers and the one a reader would trust.
+        # This suite also holds the special-modulus differential
+        # (kernels_give_the_same_table_and_response), which runs wherever F/BW/DQ/VL are present
+        # and loud-skips elsewhere; the IFMA-keyed strictness does not cover it (see above).
         env:
           RAVEN_REQUIRE_AVX512: ${{ env.RAVEN_HAS_AVX512 }}
         run: |
