@@ -1,7 +1,7 @@
 import { HowlError, protocol, type AnswerState } from "./errors.js";
-import { PrefixFeed, type FeedMatch } from "./feed.js";
+import { PrefixFeed, type FeedMatch, type FeedView } from "./feed.js";
 import type { Exchange, HowlTransport } from "./http.js";
-import { decodeCell, missRecord, type FieldCodec, type HowlNoteRecord } from "./record.js";
+import { COMMITMENT_PREFIX_BYTES, decodeCell, missRecord, type FieldCodec, type HowlNoteRecord } from "./record.js";
 import { decode, KIND, type Answer, type HowlClientHandle, type HowlTreeHandle, type HowlWasm } from "./wasm.js";
 
 /** Leaves per tree block; the node serves leaves block by block. */
@@ -76,7 +76,10 @@ export interface SyncResult extends AnswerState {
 export interface MerkleWitness<F> {
   readonly leafIndex: number;
   readonly leafCount: number;
-  /** The chain block of the newest state the client verified. */
+  /**
+   * The chain block of the newest state the client verified, which is not the block at which
+   * the pool reached `leafCount` when the witness is built at an older count.
+   */
   readonly block: number;
   /** Level 0 up; a zero sibling means the node is carried up unhashed. */
   readonly siblings: readonly F[];
@@ -85,13 +88,30 @@ export interface MerkleWitness<F> {
   readonly leaf: F;
 }
 
-/** Howl's round-1 answer shape, served from the feed and one private batch. */
+/** Howl's round-1 answer shape, served from the feed and one private read. */
 export interface FirstOccurrence<F> {
   readonly tag: F;
-  /** On a miss, a well-formed record that opens to nothing (`occurrenceCount` 0). */
+  /**
+   * The record at the first matching position. On a miss, a well-formed record that opens to
+   * nothing (`occurrenceCount` 0).
+   */
   readonly record: HowlNoteRecord<F>;
   readonly occurrenceCount: number;
+  /** Every position whose feed row matches the tag, in order. */
+  readonly positions: readonly number[];
+  /**
+   * The record at each of `positions`. A feed row is six bytes, so another note's row can match
+   * a tag and sort before the tag's own: a tag is in use when any of these opens, not only
+   * `record`.
+   */
+  readonly records: readonly HowlNoteRecord<F>[];
 }
+
+/**
+ * What `confirmNote` could check without a request: `"confirmed"` when the note is the verified
+ * tree's leaf, `"unconfirmed"` when the client does not hold that leaf's block yet.
+ */
+export type NoteCheck = "confirmed" | "unconfirmed";
 
 /** Howl's round-2 request shape; `occurrence` is 1-based beyond the first. */
 export interface OccurrenceRequest<F> {
@@ -109,6 +129,25 @@ function equal(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
   return true;
+}
+
+// Answer header: version and set [0, 4), route and zeros [4, 8), then leaf count, block and
+// root [8, 56), which move with the chain.
+const HEADER_BYTES = 56;
+const HEADER_STATE_START = 8;
+
+/**
+ * Whether two params answers name the same serving material: the same bytes apart from the
+ * header's chain state. A node restarted under another set, or re-seeded with new key
+ * material, answers other bytes here.
+ */
+function sameServing(a: Uint8Array, b: Uint8Array): boolean {
+  return (
+    a.length === b.length &&
+    a.length >= HEADER_BYTES &&
+    equal(a.subarray(0, HEADER_STATE_START), b.subarray(0, HEADER_STATE_START)) &&
+    equal(a.subarray(HEADER_BYTES), b.subarray(HEADER_BYTES))
+  );
 }
 
 function nodeAt(list: Uint8Array, index: number): Uint8Array {
@@ -135,6 +174,7 @@ export class RavenHowlSource<F> {
   readonly #field: FieldCodec<F>;
   readonly #keyMode: KeyMode;
   readonly #feed: PrefixFeed;
+  readonly #feedView: FeedView;
   readonly #tree: HowlTreeHandle;
   #state: { leafCount: number; block: number; root: Uint8Array };
   #params: Uint8Array | null = null;
@@ -156,6 +196,14 @@ export class RavenHowlSource<F> {
     this.#keyMode = options.keyMode ?? "session";
     const s = options.snapshot;
     this.#feed = new PrefixFeed(s?.rows);
+    const feed = this.#feed;
+    this.#feedView = Object.freeze({
+      get length() {
+        return feed.length;
+      },
+      bytes: () => feed.bytes(),
+      matches: (tags: readonly Uint8Array[], from?: number) => feed.matches(tags, from),
+    });
     this.#tree = new this.#wasm.HowlTree();
     this.#state = { leafCount: 0, block: 0, root: new Uint8Array(32) };
     if (s !== undefined) {
@@ -182,9 +230,12 @@ export class RavenHowlSource<F> {
     return this.#lastRead;
   }
 
-  /** The feed rows held; scan them with `matches`. */
-  get feed(): PrefixFeed {
-    return this.#feed;
+  /**
+   * The feed rows held, as verified by the last sync: for a wallet's own occupancy or
+   * preflight checks, which need no request. Read-only; `sync` moves it.
+   */
+  get feed(): FeedView {
+    return this.#feedView;
   }
 
   snapshot(): SyncSnapshot {
@@ -463,81 +514,95 @@ export class RavenHowlSource<F> {
   }
 
   /**
-   * After a refusal a node serving another parameter set gives (400 for a body of another set,
-   * 413 for a key larger than its set's), whether the node's params answer names a set other
-   * than the one held. When it does, the source reads under the new set from then on.
+   * After a private read the node refused, or whose answer did not open, whether the node now
+   * serves other material than the params held: another set, or the same set re-seeded with
+   * new key material. When it does, the params and session are dropped for the node's.
    */
-  async #setChanged(error: unknown): Promise<boolean> {
-    const status = error instanceof HowlError ? error.status : undefined;
-    if ((status !== 400 && status !== 413) || this.#params === null) return false;
-    const held = decode(this.#wasm, this.#params).paramSet;
-    const ex = await this.#get("/howl/v1/params");
-    const fresh = this.#answer(ex, KIND.params, "params");
-    if (fresh.paramSet === held) return false;
+  async #nodeChanged(error: unknown): Promise<boolean> {
+    if (!(error instanceof HowlError) || (error.kind !== "Refused" && error.kind !== "Protocol")) return false;
+    if (this.#params === null) return false;
+    let ex: Exchange;
+    try {
+      ex = await this.#get("/howl/v1/params");
+      this.#answer(ex, KIND.params, "params");
+    } catch {
+      // Unread params tell nothing about the node; the refusal stands.
+      return false;
+    }
+    if (sameServing(ex.body, this.#params)) return false;
     this.close();
     this.#params = ex.body;
     return true;
   }
 
+  /**
+   * Private read of `positions`. An expired session is replaced once; a read that fails
+   * because the node changed is built again once under the node's params, with the same rows
+   * and slots, so the retry shows the node nothing the first request did not.
+   */
   async #readBatch(positions: number[]): Promise<Uint8Array> {
     const key = positions.join(",");
+    let renewed = false;
     let reread = false;
-    for (let attempt = 0; ; attempt++) {
+    for (;;) {
       const inline = this.#keyMode === "inline";
-      let client: HowlClientHandle;
       try {
-        client = inline ? await this.#newClient() : await this.#sessionClient();
+        return await this.#readOnce(key, positions, inline);
       } catch (e) {
-        if (!reread && (await this.#setChanged(e))) {
+        if (!inline && !renewed && e instanceof HowlError && e.kind === "SessionExpired") {
+          renewed = true;
+          this.close();
+          continue;
+        }
+        if (!reread && (await this.#nodeChanged(e))) {
           reread = true;
           continue;
         }
-        throw e;
-      }
-      try {
-        const plan = this.#plans.get(key);
-        const batch = protocol("batch", () =>
-          plan === undefined
-            ? client.buildBatch(Uint32Array.from(positions), this.#state.leafCount)
-            : client.buildBatchAt(plan.targets, plan.slots, this.#state.leafCount),
-        );
-        if (plan === undefined) this.#plans.set(key, { targets: batch.targets, slots: batch.realSlots });
-        try {
-          const ex = await this.#transport.post("/howl/v1/notes", batch.body);
-          if (ex.status === 410 && !inline && attempt === 0) {
-            this.close();
-            continue;
-          }
-          try {
-            this.#answer(ex, KIND.notes, "notes");
-          } catch (e) {
-            // The same rows and slots are asked again under the node's set.
-            if (!reread && (await this.#setChanged(e))) {
-              reread = true;
-              continue;
-            }
-            throw e;
-          }
-          const cells = protocol("notes", () => client.openNotes(batch, ex.body));
-          try {
-            this.#lastRead = { leafCount: cells.leafCount, block: cells.block };
-            this.#plans.delete(key);
-            return cells.cells;
-          } finally {
-            cells.free();
-          }
-        } finally {
-          batch.free();
-        }
-      } finally {
-        if (inline) client.free();
+        if (!reread || !(e instanceof HowlError)) throw e;
+        throw new HowlError(e.kind, `${e.message} (after reading the node's params again)`, {
+          ...(e.status === undefined ? {} : { status: e.status }),
+          ...(e.state === undefined ? {} : { state: e.state }),
+          cause: e,
+        });
       }
     }
   }
 
+  async #readOnce(key: string, positions: number[], inline: boolean): Promise<Uint8Array> {
+    const client = inline ? await this.#newClient() : await this.#sessionClient();
+    try {
+      const plan = this.#plans.get(key);
+      const batch = protocol("batch", () =>
+        plan === undefined
+          ? client.buildBatch(Uint32Array.from(positions), this.#state.leafCount)
+          : client.buildBatchAt(plan.targets, plan.slots, this.#state.leafCount),
+      );
+      if (plan === undefined) this.#plans.set(key, { targets: batch.targets, slots: batch.realSlots });
+      try {
+        const ex = await this.#transport.post("/howl/v1/notes", batch.body);
+        this.#answer(ex, KIND.notes, "notes");
+        const cells = protocol("notes", () => client.openNotes(batch, ex.body));
+        try {
+          const out = cells.cells;
+          // A key built under material the node no longer holds opens to cells that fail here.
+          positions.forEach((p, k) => decodeCell(out.subarray(k * 256, (k + 1) * 256), p, this.#field));
+          this.#lastRead = { leafCount: cells.leafCount, block: cells.block };
+          this.#plans.delete(key);
+          return out;
+        } finally {
+          cells.free();
+        }
+      } finally {
+        batch.free();
+      }
+    } finally {
+      if (inline) client.free();
+    }
+  }
+
   /**
-   * Private read of the cells at `leafIndices` (1 and up), one record per index in request
-   * order. Indices are padded to the node's ladder in batches of at most its cap. A cell read
+   * Private read of the cells at `leafIndices` (1 and up; 0 is the genesis filler and is
+   * refused), one record per index in request order. Indices are padded to the node's ladder in batches of at most its cap. A cell read
    * once is kept, and read again only after a rewind drops its row.
    */
   fetchNotes(leafIndices: readonly number[]): Promise<HowlNoteRecord<F>[]> {
@@ -546,7 +611,10 @@ export class RavenHowlSource<F> {
 
   async #fetchNotes(leafIndices: readonly number[]): Promise<HowlNoteRecord<F>[]> {
     if (leafIndices.length === 0) return [];
-    leafIndices.forEach((p) => checkPosition(p, "leaf index"));
+    leafIndices.forEach((p) => {
+      checkPosition(p, "leaf index");
+      if (p === 0) throw new RangeError("leaf 0 is the genesis filler and holds no note");
+    });
     const highest = Math.max(...leafIndices);
     if (highest >= this.#state.leafCount) await this.#sync();
     if (highest >= this.#state.leafCount) {
@@ -558,14 +626,43 @@ export class RavenHowlSource<F> {
       for (let i = 0; i < wanted.length; i += cap) {
         const chunk = wanted.slice(i, i + cap);
         const cells = await this.#readBatch(chunk);
-        chunk.forEach((p, k) => {
-          const cell = cells.slice(k * 256, (k + 1) * 256);
-          decodeCell(cell, p, this.#field);
-          this.#cells.set(p, cell);
-        });
+        chunk.forEach((p, k) => this.#cells.set(p, cells.slice(k * 256, (k + 1) * 256)));
       }
     }
     return leafIndices.map((p) => decodeCell(this.#cells.get(p)!, p, this.#field));
+  }
+
+  /**
+   * Check a note the wallet opened from `record` against the verified tree: `commitment`, the
+   * commitment the wallet recomputed from the plaintext, must start with the record's prefix
+   * and be the tree's leaf at `record.leafIndex`. A cell that opens but whose note is not that
+   * leaf is refused with a `Protocol` error, so it is never spent or counted.
+   *
+   * It sends no request for the leaf: a block read here would show the node which blocks hold
+   * the wallet's notes. When the client does not hold the note's block it answers
+   * `"unconfirmed"`, and the check falls to spend time: the `leaf` of `merkleWitness`, which
+   * reads the block anyway, must equal `commitment` (or call this again after the witness).
+   */
+  confirmNote(record: HowlNoteRecord<F>, commitment: F): Promise<NoteCheck> {
+    return this.#exclusive(() => this.#confirmNote(record, commitment));
+  }
+
+  async #confirmNote(record: HowlNoteRecord<F>, commitment: F): Promise<NoteCheck> {
+    const p = record.leafIndex;
+    checkPosition(p, "leaf index");
+    if (p === 0) throw new RangeError("leaf 0 is the genesis filler and holds no note");
+    const c = this.#field.toBytes(commitment);
+    if (!equal(record.commitmentPrefix, c.subarray(0, COMMITMENT_PREFIX_BYTES))) {
+      throw new HowlError("Protocol", `leaf ${p}: the commitment does not start with the record's prefix`);
+    }
+    if (p >= this.#state.leafCount) await this.#sync();
+    if (p >= this.#state.leafCount) {
+      throw new RangeError(`leaf ${p} is past the ${this.#state.leafCount} leaves of the pool`);
+    }
+    if (!this.#tree.holdsBlock(Math.floor(p / LEAF_BLOCK_SIZE))) return "unconfirmed";
+    const leaf = protocol("leaf", () => this.#tree.leaf(p));
+    if (!equal(leaf, c)) throw new HowlError("Protocol", `leaf ${p}: the verified tree holds another commitment`);
+    return "confirmed";
   }
 
   /** The leaves of block `blockIndex` in the verified tree: a full block, or the newest. */
@@ -588,7 +685,8 @@ export class RavenHowlSource<F> {
 
   /**
    * The path of `leafIndex` in the tree of the first `leafCount` leaves (default: the newest
-   * verified count), built from the verified tree and checked by folding it.
+   * verified count), built from the verified tree and checked by folding it. Its `block` is
+   * that of the newest verified state, whatever `leafCount` is asked for.
    */
   merkleWitness(leafIndex: number, leafCount?: number): Promise<MerkleWitness<F>> {
     return this.#exclusive(() => this.#merkleWitness(leafIndex, leafCount));
@@ -631,8 +729,10 @@ export class RavenHowlSource<F> {
 
   /**
    * Howl's round 1, answered from the feed: pull the feed delta, match every tag locally and
-   * read the first match of each tag that has one in one padded private batch. A tag with no
-   * match gets a record that opens to nothing, as Howl's self-mint preflight requires.
+   * read every matching position in one private read (padded batches). Each answer carries the
+   * first record and all of them; `fetchOccurrences` then serves the rest without a request. A
+   * tag with no match gets a record that opens to nothing, as Howl's self-mint preflight
+   * requires.
    */
   probeFirst(tags: readonly F[]): Promise<FirstOccurrence<F>[]> {
     return this.#exclusive(() => this.#probeFirst(tags));
@@ -649,20 +749,26 @@ export class RavenHowlSource<F> {
       found.set(k, list);
     }
     for (const [k, list] of found) this.#occurrences.set(k, list);
-    const firsts = [...new Set([...found.values()].map((list) => list[0]!))];
+    const every = [...new Set([...found.values()].flat())];
     const records = new Map<number, HowlNoteRecord<F>>();
-    (await this.#fetchNotes(firsts)).forEach((r, i) => records.set(firsts[i]!, r));
+    (await this.#fetchNotes(every)).forEach((r, i) => records.set(every[i]!, r));
     return tags.map((tag, i) => {
       const list = found.get(keys[i]!) ?? [];
+      const all = list.map((p) => records.get(p)!);
       return {
         tag,
-        record: list.length === 0 ? missRecord(this.#field) : records.get(list[0]!)!,
+        record: all[0] ?? missRecord(this.#field),
         occurrenceCount: list.length,
+        positions: list,
+        records: all,
       };
     });
   }
 
-  /** Howl's round 2: the remaining matches of tags seen by `probeFirst`, in one private read. */
+  /**
+   * Howl's round 2: the remaining matches of tags seen by `probeFirst`. Their cells were read in
+   * round 1, so this sends a request only after a rewind dropped them.
+   */
   fetchOccurrences(requests: readonly OccurrenceRequest<F>[]): Promise<(HowlNoteRecord<F> | null)[]> {
     return this.#exclusive(() => this.#fetchOccurrences(requests));
   }

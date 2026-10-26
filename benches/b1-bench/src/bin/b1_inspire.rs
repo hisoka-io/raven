@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use raven_inspire::math::GaussianSampler;
-use raven_inspire::params::{InspireParams, InspireVariant, SecurityLevel, ShardConfig};
+use raven_inspire::params::{InspireParams, InspireVariant, ParamsLabel, ShardConfig};
 use raven_inspire::pir::mod_switch::{
     extract_inspiring_mod_switched, mod_switch_response_checked, MOD_SWITCH_TARGET_36BIT,
 };
@@ -421,7 +421,7 @@ fn main() {
                 query_gadget_len: 3,
                 packing_gadget_len: 3,
                 approximate_packing_gadget: false,
-                security_level: SecurityLevel::Bits128,
+                params_label: ParamsLabel::Primary,
             }
         }
         Some(gammas) => {

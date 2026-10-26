@@ -74,7 +74,7 @@ fn snapshot_codec_acceleration_at_production_cell() {
     let mut zstd_decompress_t: Vec<Duration> = Vec::with_capacity(SEEDS);
     let mut zstd_bytes: usize = 0;
 
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let entries = 1usize << ENTRIES_LOG2;
 
     for seed in 0..SEEDS {

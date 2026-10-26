@@ -676,7 +676,7 @@ mod tests {
 
     #[test]
     fn rows_per_shard_equals_the_shard_config_setup_builds() {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let entry_size = 32usize;
         let db: Vec<u8> = (0..4096usize)
             .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).unwrap_or(0)))
@@ -717,7 +717,7 @@ mod tests {
     async fn registry_seed_then_flip_marks_predecessor_static() {
         use raven_inspire::params::InspireVariant;
         use raven_railgun_engine::orchestrator::InstanceConfig;
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let entry_size = 32usize;
         let db: Vec<u8> = (0..256usize)
             .flat_map(|i| (0..entry_size).map(move |j| u8::try_from((i + j) % 251).unwrap_or(0)))

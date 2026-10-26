@@ -118,7 +118,7 @@ async fn shutdown(handle: OrchestratorHandle) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_redelivered_applied_prefix_must_not_strand_the_tail() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let handle = bootstrap_railgun_engine(
         quiet_config(dir.path(), "leaf-replay"),
         params,
@@ -167,7 +167,7 @@ async fn a_redelivered_applied_prefix_must_not_strand_the_tail() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replayed_index_with_different_bytes_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let handle = bootstrap_railgun_engine(
         quiet_config(dir.path(), "leaf-divergence"),
         params,
@@ -225,7 +225,7 @@ async fn a_replayed_index_with_different_bytes_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_errored_event_must_not_advance_the_applied_gauge() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let handle = bootstrap_railgun_engine(
         quiet_config(dir.path(), "error-gauge"),
         params,

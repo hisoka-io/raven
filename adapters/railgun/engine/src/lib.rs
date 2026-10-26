@@ -56,7 +56,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = StoreLayout::open(dir.path()).expect("open");
 
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let entries = 256usize;
         let entry_size = 256usize;
         let db = raven_railgun_testkit::toy_db(entries, entry_size);

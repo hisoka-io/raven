@@ -11,21 +11,18 @@ use raven_inspire::params::{InspireParams, DEFAULT_CRT_MODULI};
 use raven_inspire::{setup, ClientSession};
 
 fn shipped() -> InspireParams {
-    InspireParams::secure_128_d2048()
+    InspireParams::d2048()
 }
 
 #[test]
 fn both_shipped_presets_pass() {
-    check_parameter_floor(&InspireParams::secure_128_d2048()).expect("d2048");
-    check_parameter_floor(&InspireParams::secure_128_d4096()).expect("d4096");
+    check_parameter_floor(&InspireParams::d2048()).expect("d2048");
+    check_parameter_floor(&InspireParams::d4096()).expect("d4096");
 }
 
 #[test]
 fn both_shipped_presets_carry_the_one_accepted_limb_set() {
-    for preset in [
-        InspireParams::secure_128_d2048(),
-        InspireParams::secure_128_d4096(),
-    ] {
+    for preset in [InspireParams::d2048(), InspireParams::d4096()] {
         assert_eq!(preset.crt_moduli, SHIPPED_CRT_MODULI);
         assert_eq!(preset.q, MAX_Q);
     }
@@ -248,7 +245,7 @@ fn the_approximate_packing_gadget_is_refused() {
     );
     let wider_ring = InspireParams {
         approximate_packing_gadget: true,
-        ..InspireParams::secure_128_d4096()
+        ..InspireParams::d4096()
     };
     assert_eq!(
         check_parameter_floor(&wider_ring),

@@ -48,7 +48,7 @@ fn per_shard_re_encode_cost_per_cell() {
         );
 
         let setup_start = Instant::now();
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         #[allow(clippy::cast_possible_truncation)]
         let mut db: Vec<u8> = (0..entries)
             .flat_map(|i| (0..*record_bytes).map(move |j| ((i * 31 + j * 17) % 251) as u8))

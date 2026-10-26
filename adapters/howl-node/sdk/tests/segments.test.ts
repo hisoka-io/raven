@@ -2,7 +2,15 @@
 // the wire layout, with the connection lost between the two segments of a cold sync.
 import { randomBytes } from "node:crypto";
 import { beforeAll, describe, expect, it } from "vitest";
-import { bigintField, HowlError, KIND, RavenHowlSource, type Exchange, type HowlTransport } from "../src/index.js";
+import {
+  bigintField,
+  HowlError,
+  KIND,
+  RavenHowlSource,
+  type Exchange,
+  type HowlNoteRecord,
+  type HowlTransport,
+} from "../src/index.js";
 import { hex, wasm } from "./helpers/fixture.js";
 
 const SEGMENT_ROWS = 65_536;
@@ -58,6 +66,12 @@ class Pool {
     return out;
   }
 
+  /** Full block `b`, as the plaintext block route answers it. */
+  block(b: number): Exchange {
+    const leaves = this.leaves.subarray(b * BLOCK * 32, (b + 1) * BLOCK * 32);
+    return { status: 200, body: this.#answer(KIND.block, [Uint8Array.from([...u32(b), ...u32(BLOCK)]), leaves]) };
+  }
+
   /** The node's sync answer; `held` as the node reads it, `skip` leaves dropped by a lying node. */
   sync(since: number, upperSince: number, held = 0, skip = 0): Exchange {
     if (since > this.count || held > this.count) return { status: 409, body: this.#answer(KIND.stale, []) };
@@ -97,6 +111,8 @@ function served(
     get: async (path) => {
       paths.push(path);
       if (drop.has(paths.length)) throw new HowlError("Network", `GET ${path}: connection reset`);
+      const b = /^\/howl\/v1\/block\/(\d+)$/.exec(path);
+      if (b !== null) return pool.block(Number(b[1]));
       const m = /^\/howl\/v1\/sync\?since=(\d+)&upper=(\d+)(?:&held=(\d+))?$/.exec(path);
       if (m === null) throw new Error(`unexpected ${path}`);
       const held = node.ignoresHeld === true ? 0 : Number(m[3] ?? 0);
@@ -202,5 +218,37 @@ describe("a pool past one feed segment", () => {
       snapshot: stored,
     });
     await expect(lying.sync()).rejects.toMatchObject({ kind: "Protocol" });
+  });
+  it("discovery and the leaf check send no block read; the check of an older note waits for the witness", async () => {
+    const transport = served(pool, new Set());
+    const src = new RavenHowlSource({ transport, wasm, field: bigintField });
+    await src.sync();
+    const mark = transport.paths.length;
+    const leaf = (p: number): Uint8Array => pool.leaves.slice(p * 32, (p + 1) * 32);
+    const record = (p: number): HowlNoteRecord<bigint> => ({
+      layoutVersion: 1,
+      recordKind: 0,
+      leafIndex: p,
+      commitmentPrefix: leaf(p).slice(0, 16),
+      ephemeralPkX: 0n,
+      cekWrap: 0n,
+      ciphertextKept: [],
+    });
+    const forged = (p: number): bigint => bigintField.fromBytes(leaf(p)) ^ 1n;
+    const tags = [bigintField.fromBytes(early), bigintField.fromBytes(late)];
+    expect(src.matches(tags).map((m) => m.position)).toEqual([100, 69_999]);
+    // block 0 is full and not held; the newest block is
+    expect(await src.confirmNote(record(100), bigintField.fromBytes(leaf(100)))).toBe("unconfirmed");
+    expect(await src.confirmNote(record(100), forged(100))).toBe("unconfirmed");
+    expect(await src.confirmNote(record(69_999), bigintField.fromBytes(leaf(69_999)))).toBe("confirmed");
+    await expect(src.confirmNote(record(69_999), forged(69_999))).rejects.toThrow(/another commitment/);
+    expect(transport.paths.slice(mark)).toEqual([]);
+    // spend time: the witness reads the block, and its leaf settles the check
+    const witness = await src.merkleWitness(100);
+    expect(transport.paths.slice(mark)).toEqual(["/howl/v1/block/0"]);
+    expect(witness.leaf).toBe(bigintField.fromBytes(leaf(100)));
+    expect(await src.confirmNote(record(100), bigintField.fromBytes(leaf(100)))).toBe("confirmed");
+    await expect(src.confirmNote(record(100), forged(100))).rejects.toThrow(/another commitment/);
+    expect(transport.paths.slice(mark)).toEqual(["/howl/v1/block/0"]);
   });
 });

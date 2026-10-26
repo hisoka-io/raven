@@ -44,7 +44,7 @@ fn build_initial_db() -> Vec<u8> {
 #[allow(clippy::too_many_lines)]
 async fn chain_event_propagates_to_pir_response() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = build_initial_db();
 
     // Setup outside bootstrap so the secret key survives for the client session.
@@ -184,7 +184,7 @@ async fn chain_event_propagates_to_pir_response() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resume_floor_is_last_leaf_block_not_chain_head() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = build_initial_db();
     let (state, _sk) =
         setup_state(&params, &db, TOY_ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup");
@@ -266,7 +266,7 @@ async fn resume_floor_is_last_leaf_block_not_chain_head() {
 #[allow(clippy::too_many_lines)]
 async fn chain_event_propagates_to_pir_response_at_production_cell() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = build_initial_db_with_size(PROD_ENTRIES, PROD_ENTRY_SIZE);
 
     let started = std::time::Instant::now();

@@ -105,7 +105,7 @@ async fn fetch_wire_crs(router: &axum::Router) -> Vec<u8> {
 
 #[tokio::test]
 async fn params_crs_drops_galois_keys_and_keeps_every_serialized_field() {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let (state, _sk, _db) = build_state(&params);
     let full = state.crs.as_ref().clone();
     let full_bytes = full.to_versioned_bytes().expect("full crs bytes");
@@ -158,7 +158,7 @@ async fn params_crs_drops_galois_keys_and_keeps_every_serialized_field() {
 /// mod-switched production respond) answers it.
 #[tokio::test]
 async fn wire_crs_drives_the_inspiring_round_trip() {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let (state, sk, db) = build_state(&params);
     let shard_config = state.encoded_db.config.clone();
     let router = served(state);
@@ -191,7 +191,7 @@ async fn wire_crs_drives_the_inspiring_round_trip() {
 
 #[tokio::test]
 async fn tree_round_trip_survives_on_the_server_crs() {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let (state, sk, db) = build_state(&params);
     let crs = state.crs.as_ref();
     let shard_config = state.encoded_db.config.clone();

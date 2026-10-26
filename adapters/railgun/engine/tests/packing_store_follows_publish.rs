@@ -51,7 +51,7 @@ fn bc_for(list_index: u32) -> [u8; 32] {
 fn fresh_state() -> InspireServerState {
     let seed = vec![0u8; SHARDS * EPS as usize * PATH10_RECORD_BYTES];
     setup_state(
-        &InspireParams::secure_128_d2048(),
+        &InspireParams::d2048(),
         &seed,
         PATH10_RECORD_BYTES,
         InspireVariant::TwoPacking,
@@ -86,7 +86,7 @@ fn boot(dir: &std::path::Path, fresh: Option<InspireServerState>) -> MultiOrches
         verification_cadence_n: 0,
         chain_source: None,
     };
-    bootstrap_railgun_engine_multi(vec![config], InspireParams::secure_128_d2048(), |_| {
+    bootstrap_railgun_engine_multi(vec![config], InspireParams::d2048(), |_| {
         fresh.take().ok_or_else(|| {
             AdapterError::Internal("a recovering boot built a fresh state".to_owned())
         })
@@ -338,7 +338,7 @@ fn planted_rows(marker: u8) -> Vec<u8> {
 /// must refuse the shard, and the engine's own re-encode must serve the new rows.
 #[test]
 fn a_store_kept_over_replaced_columns_is_refused_and_a_re_encode_serves_them() {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let shard_bytes = EPS as usize * PATH10_RECORD_BYTES;
     let (state, _) = setup_state(
         &params,
@@ -406,7 +406,7 @@ fn a_store_kept_over_replaced_columns_is_refused_and_a_re_encode_serves_them() {
 /// columns and the store folded from them; one changed row still costs the store.
 #[test]
 fn a_re_encode_to_the_columns_already_held_keeps_the_store() {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let shard_bytes = EPS as usize * PATH10_RECORD_BYTES;
     let rows = planted_rows(0xa1);
     let (state, _) = setup_state(
@@ -467,7 +467,7 @@ fn a_re_encode_to_the_columns_already_held_keeps_the_store() {
 /// each its own store: the copies are equal until one is re-encoded.
 #[test]
 fn the_shards_of_an_unfilled_cell_share_one_store_until_re_encoded() {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let shard_bytes = EPS as usize * PATH10_RECORD_BYTES;
     let total = u64::from(EPS) * 4;
     let state = setup_unfilled_state(

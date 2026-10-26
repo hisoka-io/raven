@@ -28,7 +28,7 @@ use toy_server::{
 const BEARER_TOKEN: &str = "http-error-paths-test-token";
 
 fn build_state() -> AppState<RavenInspireScheme> {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = build_toy_database(TOY_DB_ENTRIES, TOY_ENTRY_BYTES);
     let (server_state, _sk) =
         setup_state(&params, &db, TOY_ENTRY_BYTES, InspireVariant::TwoPacking)

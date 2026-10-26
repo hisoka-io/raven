@@ -68,7 +68,7 @@ impl std::fmt::Debug for ToyPieces {
 }
 
 pub fn build_toy_pieces(token: String, config: ToyDbConfig) -> Result<ToyPieces> {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = build_toy_database(config.entries, config.entry_bytes);
 
     let (server_state, secret_key) = setup_state(&params, &db, config.entry_bytes, config.variant)?;

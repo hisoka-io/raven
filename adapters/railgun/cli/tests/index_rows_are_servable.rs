@@ -53,7 +53,7 @@ fn bc_for(list_index: u32) -> [u8; 32] {
 fn fresh_state() -> InspireServerState {
     let seed = vec![0u8; SHARDS * EPS as usize * PATH10_RECORD_BYTES];
     setup_state(
-        &InspireParams::secure_128_d2048(),
+        &InspireParams::d2048(),
         &seed,
         PATH10_RECORD_BYTES,
         InspireVariant::TwoPacking,
@@ -84,7 +84,7 @@ fn boot(dir: &std::path::Path, fresh: Option<InspireServerState>) -> MultiOrches
         verification_cadence_n: 0,
         chain_source: None,
     };
-    bootstrap_railgun_engine_multi(vec![config], InspireParams::secure_128_d2048(), |_| {
+    bootstrap_railgun_engine_multi(vec![config], InspireParams::d2048(), |_| {
         fresh.take().ok_or_else(|| {
             AdapterError::Internal("a recovering boot built a fresh state".to_owned())
         })

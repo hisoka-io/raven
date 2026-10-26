@@ -185,7 +185,7 @@ async fn synthetic_chain_drives_template_based_spawn_to_5_trees() {
     let harness = fresh_harness(tmp.path());
 
     let runtime = toy_runtime(tmp.path());
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let (tx, rx) = tokio::sync::broadcast::channel::<u32>(16);
     let log_dir = harness.bootstrap_tree_dir.clone();
 
@@ -248,7 +248,7 @@ async fn max_instance_count_4_refuses_5th_spawn_loud() {
 
     let mut runtime = toy_runtime(tmp.path());
     runtime.max_instance_count = Some(4); // 1 bootstrap + 3 successors = ceiling
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let (tx, rx) = tokio::sync::broadcast::channel::<u32>(16);
     let log_dir = harness.bootstrap_tree_dir.clone();
 
@@ -325,7 +325,7 @@ async fn cooldown_seconds_refuses_back_to_back_spawns() {
     let cooldown = Duration::from_millis(750);
     let mut runtime = toy_runtime(tmp.path());
     runtime.cooldown = Some(cooldown);
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let (tx, rx) = tokio::sync::broadcast::channel::<u32>(16);
     let log_dir = harness.bootstrap_tree_dir.clone();
 
@@ -393,7 +393,7 @@ async fn max_count_and_cooldown_compose() {
     let mut runtime = toy_runtime(tmp.path());
     runtime.max_instance_count = Some(3); // bootstrap + 2 successors
     runtime.cooldown = Some(cooldown);
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let (tx, rx) = tokio::sync::broadcast::channel::<u32>(16);
     let log_dir = harness.bootstrap_tree_dir.clone();
 

@@ -29,7 +29,7 @@ const ROWS_PER_SHARD: u32 = 2048;
 
 #[tokio::test]
 async fn a_failed_retention_pass_is_counted_in_readiness() {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = raven_railgun_testkit::toy_db(raven_railgun_testkit::TOY_ENTRIES, ENTRY_BYTES);
     let (state, _sk) =
         setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("toy state");

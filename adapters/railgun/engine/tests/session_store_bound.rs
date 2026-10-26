@@ -35,7 +35,7 @@ fn capped_state() -> (
     raven_inspire::ClientSession,
     Vec<u8>,
 ) {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = database();
     let (base, _) =
         setup_state(&params, &db, ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup_state");

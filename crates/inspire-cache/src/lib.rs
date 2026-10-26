@@ -114,9 +114,9 @@ impl CellShape {
         identity.extend_from_slice(&params.sigma.to_bits().to_le_bytes());
         identity.extend_from_slice(&params.gadget_base.to_le_bytes());
         identity.extend_from_slice(&(params.packing_gadget_len as u64).to_le_bytes());
-        identity.push(match params.security_level {
-            raven_inspire::params::SecurityLevel::Bits128 => 0,
-            raven_inspire::params::SecurityLevel::Bits256 => 1,
+        identity.push(match params.params_label {
+            raven_inspire::params::ParamsLabel::Primary => 0,
+            raven_inspire::params::ParamsLabel::Secondary => 1,
         });
         identity.extend_from_slice(&(params.crt_moduli.len() as u64).to_le_bytes());
         for modulus in &params.crt_moduli {
@@ -424,7 +424,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use raven_inspire::params::{InspireParams, SecurityLevel};
+    use raven_inspire::params::{InspireParams, ParamsLabel};
 
     fn shape() -> CellShape {
         CellShape {
@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn inspiring_identity_binds_every_declared_input() {
-        let baseline_params = InspireParams::secure_128_d2048();
+        let baseline_params = InspireParams::d2048();
         let baseline = CellShape::for_inspiring(&baseline_params, 16, [7; 32]);
 
         let assert_params_change = |params: &InspireParams| {
@@ -551,7 +551,7 @@ mod tests {
         changed.packing_gadget_len += 1;
         assert_params_change(&changed);
         changed = baseline_params.clone();
-        changed.security_level = SecurityLevel::Bits256;
+        changed.params_label = ParamsLabel::Secondary;
         assert_params_change(&changed);
         changed = baseline_params.clone();
         changed.crt_moduli.push(17);

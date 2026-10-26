@@ -37,7 +37,7 @@ fn build_live_state_and_session() -> (
     ClientSession,
     LogicalLeafStore,
 ) {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = build_zero_db();
     let (server_state, _) =
         setup_state(&params, &db, PATH_RECORD_BYTES, InspireVariant::TwoPacking)

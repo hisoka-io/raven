@@ -814,10 +814,15 @@ jobs:
         # step does not build with simd-packing-offline). The lane therefore failed exactly
         # when it landed on a capable runner, which read as a flake.
         #
-        # RAVEN_HAS_AVX512 keys on IFMA, the packing kernels' requirement. The special-modulus
-        # kernel needs F/BW/DQ/VL instead and checks them itself, so on a runner without AVX-512
-        # (the AMD hosted runners) its differential loud-skips. That kernel is proven on capable
-        # runners and on a capable local host; per-kernel strictness is the next step.
+        # RAVEN_HAS_AVX512 keys on IFMA, the packing kernels' requirement. Every IFMA host also
+        # has F/BW/DQ/VL, which the special-modulus kernel needs, so wherever the flag is set
+        # both differentials are strict. Hosted runners do not guarantee AVX-512, so a run can
+        # land on a runner without it and every AVX-512 differential then loud-skips by name;
+        # the flags line above shows which case a run hit. To prove the kernels on an AVX-512
+        # host:
+        #   RAVEN_REQUIRE_AVX512=1 cargo test --manifest-path crates/inspire/Cargo.toml \
+        #     --release --features simd-packing-offline
+        # A runner that guarantees AVX-512 is the next step for making this strict in CI.
         run: |
           flags=$(grep -o 'avx512[a-z0-9_]*' /proc/cpuinfo | sort -u | tr '\n' ' ') || flags=""
           echo "runner avx512 flags: ${flags:-none}"
@@ -849,8 +854,9 @@ jobs:
         # the KAT is covered; a second step naming just the KAT ran it again WITHOUT the
         # strictness, which is the weaker of the two answers and the one a reader would trust.
         # This suite also holds the special-modulus differential
-        # (kernels_give_the_same_table_and_response), which runs wherever F/BW/DQ/VL are present
-        # and loud-skips elsewhere; the IFMA-keyed strictness does not cover it (see above).
+        # (kernels_give_the_same_table_and_response): it runs wherever F/BW/DQ/VL are present,
+        # is strict wherever RAVEN_HAS_AVX512 is set, and loud-skips on a runner without
+        # AVX-512 (see the capability step above for the local command).
         env:
           RAVEN_REQUIRE_AVX512: ${{ env.RAVEN_HAS_AVX512 }}
         run: |

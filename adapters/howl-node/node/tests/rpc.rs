@@ -82,10 +82,17 @@ async fn endpoint(
             .map(|t| hex(t))
             .collect();
             assert_eq!(filter["topics"], json!([topics]));
-            let logs = chain
+            let logs = match chain
                 .logs(quantity(&filter["fromBlock"]), quantity(&filter["toBlock"]))
                 .await
-                .expect("logs");
+            {
+                Ok(logs) => logs,
+                Err(e) => {
+                    return Json(
+                        json!({ "jsonrpc": "2.0", "id": request["id"], "error": { "code": -32005, "message": e.to_string() } }),
+                    )
+                }
+            };
             // A real endpoint filters by address; the fixture also holds another contract's logs.
             json!(logs
                 .iter()
@@ -103,7 +110,14 @@ async fn endpoint(
                 .expect("hex")
                 .try_into()
                 .expect("32 bytes");
-            let count = chain.leaf_count(block).await.expect("count").expect("some");
+            let count = match chain.leaf_count(block).await {
+                Ok(count) => count.expect("some"),
+                // A call to an address without code succeeds with no bytes.
+                Err(howl_node::chain::ChainError::NoCode) => {
+                    return Json(json!({ "jsonrpc": "2.0", "id": request["id"], "result": "0x" }))
+                }
+                Err(e) => panic!("count: {e}"),
+            };
             let mut word = [0u8; 32];
             word[24..].copy_from_slice(&count.to_be_bytes());
             json!(hex(&word))
@@ -212,6 +226,35 @@ async fn the_rpc_source_builds_the_table_the_chain_holds() {
     follow(&mut reference, &reference_engine).await;
     assert_eq!(over_rpc.get(path).await, in_process.get(path).await);
     assert_eq!(over_rpc.answer(path).await.leaf_count, 160 + 30 * 5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_past_the_byte_limit_is_read_again_in_halves() {
+    let fixture = Fixture::load();
+    let (mut tree, _) = fixture_tree(&fixture);
+    let ext = extend(fixture.pool, &mut tree, fixture.head + 1, 40, 9, 0x3e);
+    let mut logs = fixture.logs.clone();
+    logs.extend(ext.logs);
+    let chain = FakeChain::new(fixture.pool, fixture.first_block, logs, ext.last_block);
+    let url = serve(chain.clone(), fixture.pool).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut limited_config = config(dir.path(), &fixture);
+    limited_config.max_range = 50_000;
+    // Room for about three blocks of this chain's logs.
+    let source = RpcChain::new(url, fixture.pool)
+        .expect("client")
+        .with_log_bytes_limit(32 << 10);
+    let (mut follower, engine) = howl_node::open(&limited_config, source).expect("open");
+    follow(&mut follower, &engine).await;
+    let reference_dir = tempfile::tempdir().expect("tempdir");
+    let (mut reference, reference_engine) =
+        howl_node::open(&config(reference_dir.path(), &fixture), chain).expect("open");
+    follow(&mut reference, &reference_engine).await;
+    let path = "/howl/v1/sync?since=0&upper=0";
+    let limited = Http(router(Served::new(Arc::clone(&engine), 2)));
+    let in_process = Http(router(Served::new(reference_engine, 2)));
+    assert_eq!(limited.get(path).await, in_process.get(path).await);
+    assert_eq!(limited.answer(path).await.leaf_count, 160 + 40 * 9);
 }
 
 #[tokio::test(flavor = "multi_thread")]

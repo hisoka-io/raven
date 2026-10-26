@@ -34,13 +34,24 @@ HOWL_NODE_RPC_URL=<json-rpc endpoint> \
 ```
 
 The endpoint is read from the environment so that a key in its URL stays out of the process list.
-Optional flags: `--poll-ms` (2,000), `--max-range` (blocks per log read, 2,000), `--max-sessions`
+Optional flags: `--poll-ms` (2,000), `--max-range` (most blocks one log read asks for, 50,000),
+`--max-sessions`
 (2,048), `--session-ttl-secs` (3,600; a session's lifetime restarts with each use), `--concurrent`
-(batches answered at once), `--param-set` (1 or 2, below; 1 by default).
+(batches answered at once), `--respond-threads` (threads computing set-2 responses, shared by every
+batch; the cores), `--walk-blocks` (64, at least 1, below), `--param-set` (1 or 2, below; 1 by
+default).
+
+A log read starts at one block and doubles while it holds less than half of one table batch. When the
+endpoint refuses a read (a block-range or result cap, a timeout) or its answer passes 192 MiB, the
+read is halved and asked again at once, so `--max-range` needs no tuning to the endpoint's limits; a
+lower value only saves the refused reads on an endpoint with a small range cap.
 
 The node serves each block as soon as it is read, and every answer names that block. When the chain
 reorganises below the node's newest block, the node returns to the newest block it recorded that the
-chain still has and reads on from there. Within 64 blocks of the head it reads the header of every
+chain still has and reads on from there. Within the walk depth (`--walk-blocks`, 64) of the head it
+reads the pool's leaf count there, which needs the endpoint to keep that block's state for the walk
+depth plus the blocks made during one step; deeper blocks need no old state, so a pruned endpoint
+serves a catch-up. A walk deeper than the endpoint's recent state fails each step near the head. Within the walk it also reads the header of every
 block it takes in, and applies the read only when the headers link to each other and to the node's
 newest block and every log names one of them; a read that spans a reorganisation is dropped and read
 again. A leaf whose logged root the node's rows cannot reproduce takes the node back one recorded
@@ -60,8 +71,8 @@ plain routes are the same bytes under either set apart from that id.
 | | Set 1 | Set 2 |
 |---|---|---|
 | Scheme | ring 2,048, a 60-bit modulus, plaintext modulus 65,537, responses switched to 36 bits | ring 2,048, a 29-bit prime, plaintext modulus 16, a one-row packing key at about 2^60 |
-| Key material in the params answer | the node's, versioned | none: fixed by the set |
-| Session payload | the serialized key, 46,252 B | the key, 15,360 B |
+| Key material in the params answer | the node's, versioned | the key-mask version, 2 B; the mask itself is fixed in code |
+| Session payload | the serialized key, 46,252 B | the key, 15,362 B: its key-mask version, then the key |
 | Batch payload | the serialized batch | `howl_wire::P16Batch`: the key's source, then 7,456 B per query |
 | Response per query | 9,870 B | 9,208 B, the first 246 bytes of the cell; the rest of a cell is zero |
 | Seat per session | 48 KiB | 16 KiB |

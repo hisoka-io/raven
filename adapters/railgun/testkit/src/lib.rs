@@ -84,7 +84,7 @@ pub fn toy_state(entry_size: usize) -> InspireServerState {
 
 /// Build a fresh server state at `entry_size`, returning the adapter's error type.
 pub fn try_toy_state(entry_size: usize) -> raven_railgun_core::Result<InspireServerState> {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = toy_db(TOY_ENTRIES, entry_size);
     let (state, _sk) = setup_state(&params, &db, entry_size, InspireVariant::TwoPacking)?;
     Ok(state)
@@ -111,7 +111,7 @@ fn cached_parts(entry_size: usize) -> Arc<CachedParts> {
     if let Some(hit) = cache_slot().lock().expect("cache lock").get(&entry_size) {
         return Arc::clone(hit);
     }
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = toy_db(TOY_ENTRIES, entry_size);
     let (state, _sk) =
         setup_state(&params, &db, entry_size, InspireVariant::TwoPacking).expect("setup_state");

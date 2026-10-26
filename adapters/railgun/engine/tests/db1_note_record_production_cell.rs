@@ -134,7 +134,7 @@ fn build_live_state_and_session() -> (
     ClientSession,
     LogicalLeafStore,
 ) {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = vec![0u8; ENTRIES * CELL_RECORD_BYTES];
     let (server_state, _) =
         setup_state(&params, &db, CELL_RECORD_BYTES, InspireVariant::TwoPacking)

@@ -33,7 +33,7 @@ fn limits() -> SessionStoreLimits {
 #[test]
 fn reopening_one_data_dir_never_reissues_a_stale_handle() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let database: Vec<u8> = (0..params.ring_dim * ENTRY_SIZE)
         .map(|offset| u8::try_from(offset % 251).expect("mod 251"))
         .collect();
@@ -232,7 +232,7 @@ async fn production_single_boot_opens_the_durable_allocator_and_refuses_corrupti
     config.record_size = 256;
     config.use_flock = false;
     config.role = InstanceRole::Live;
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     // Non-constant rows, so the control below proves the client decoded its own record.
     let database: Vec<u8> = (0..params.ring_dim * 256)
         .map(|offset| u8::try_from(offset % 251).expect("mod 251"))
@@ -307,7 +307,7 @@ async fn production_single_boot_opens_the_durable_allocator_and_refuses_corrupti
     let mut config = OrchestratorConfig::demo(corrupt.path().to_path_buf(), "durable-corrupt");
     config.record_size = 256;
     config.use_flock = false;
-    let error = bootstrap_railgun_engine(config, InspireParams::secure_128_d2048(), || {
+    let error = bootstrap_railgun_engine(config, InspireParams::d2048(), || {
         raven_railgun_testkit::try_toy_state(256)
     })
     .expect_err("production bootstrap must refuse a corrupt floor");
@@ -326,7 +326,7 @@ async fn production_multi_boot_opens_each_data_dir_allocator() {
     let mut config =
         InstanceConfig::commit_tree("durable-multi", data_dir.clone(), 0, InstanceRole::Live);
     config.use_flock = false;
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let database = vec![0u8; params.ring_dim * 512];
     let (fresh_state, _) =
         setup_state(&params, &database, 512, InspireVariant::TwoPacking).expect("multi setup");
@@ -427,7 +427,7 @@ fn run_child(data_dir: &std::path::Path, output: &std::path::Path) {
 }
 
 fn write_one_child_handle(data_dir: &std::path::Path, output: &std::path::Path) {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let database = vec![0u8; params.ring_dim * ENTRY_SIZE];
     let (state, _) =
         setup_state(&params, &database, ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup");

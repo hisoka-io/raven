@@ -103,7 +103,7 @@ async fn spawn_log_restart_appends_onto_the_recovered_leaf_prefix() {
         .with_max_level(tracing::Level::ERROR)
         .try_init();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let rt = runtime(tmp.path());
     let data_dir = data_dir_for_tree(&rt.data_dir_template, TREE);
 

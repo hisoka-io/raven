@@ -830,7 +830,7 @@ async fn the_shipped_block_6_serves_the_lists_row_393216_by_pir() {
     );
     assert_eq!(split_ppoi_index(ROW), (6, 0), "row 393,216 opens block 6");
 
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let mut handle = bootstrap_railgun_engine_multi(
         opts.instances.clone(),
         params.clone(),

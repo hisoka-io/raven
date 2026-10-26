@@ -43,7 +43,7 @@ fn test_params() -> InspireParams {
         query_gadget_len: 3,
         packing_gadget_len: 3,
         approximate_packing_gadget: false,
-        security_level: raven_inspire::params::SecurityLevel::Bits128,
+        params_label: raven_inspire::params::ParamsLabel::Primary,
     }
 }
 

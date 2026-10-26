@@ -40,7 +40,7 @@ fn seed_data_dir(dir: &std::path::Path, instance: &str, stored_width: usize) {
     )
     .expect("fresh open");
 
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = raven_railgun_testkit::toy_db(CELL_ROWS, stored_width);
     let (state, _sk) =
         setup_state(&params, &db, stored_width, InspireVariant::TwoPacking).expect("setup_state");
@@ -279,7 +279,7 @@ fn commit_refuses_a_state_that_disagrees_with_the_manifest_shape() {
         encoder_at(NARROW_WIDTH),
     )
     .expect("fresh open");
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let database = raven_railgun_testkit::toy_db(CELL_ROWS, STORED_WIDTH);
     let (wrong_state, _secret) =
         setup_state(&params, &database, STORED_WIDTH, InspireVariant::TwoPacking)

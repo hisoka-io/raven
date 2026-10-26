@@ -1,7 +1,7 @@
 //! Emit the multi-shard fixture at the geometry the deployment serves.
 //!
 //! `emit_test_fixture` runs at `ring_dim 256`, a 32 B record and one shard; production is
-//! `InspireParams::secure_128_d2048` with a 512 B path-10 record and `entries_per_shard
+//! `InspireParams::d2048` with a 512 B path-10 record and `entries_per_shard
 //! = 2048` (`engine/src/orchestrator.rs:174`, `:175`). 512 B is illegal below ring 2048:
 //! the InspiRING packing width is `ceil(512/2) = 256` and legal widths are the powers of
 //! two up to `ring_dim/2` (`inspiring/inspiring2.rs:132-137`).
@@ -180,7 +180,7 @@ fn main() {
     let out = Path::new(&args[1]);
     fs::create_dir_all(out).expect("mkdir out");
 
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let entries_per_shard = params.ring_dim as u64;
     let total_entries = entries_per_shard * NUM_SHARDS;
 

@@ -121,7 +121,7 @@ fn seed(dir: &std::path::Path, trailing_append: bool) -> Vec<u8> {
         .expect("store append");
     }
 
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = enc.materialize_shard(0, &store);
     let (state, _sk) = setup_state(
         &params,
@@ -216,7 +216,7 @@ async fn the_consumer_boot_seed_must_not_replace_the_committed_addendum_with_the
         Arc::clone(&persistence),
         Arc::clone(&store),
         Arc::clone(&metrics),
-        InspireParams::secure_128_d2048(),
+        InspireParams::d2048(),
         enc,
         rx,
         None,
@@ -340,7 +340,7 @@ async fn an_instance_with_no_committed_snapshot_serves_no_addendum() {
         Arc::clone(&persistence),
         Arc::clone(&store),
         Arc::clone(&metrics),
-        InspireParams::secure_128_d2048(),
+        InspireParams::d2048(),
         enc,
         rx,
         None,

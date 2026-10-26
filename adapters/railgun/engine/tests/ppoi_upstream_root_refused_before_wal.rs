@@ -162,7 +162,7 @@ async fn a_row_whose_root_is_not_its_own_post_append_root_never_reaches_the_wal(
     config.verification_cadence_n = 0;
     config.chain_source = None;
 
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
 
     let leaves = UPSTREAM_LEAVES.map(hex32);

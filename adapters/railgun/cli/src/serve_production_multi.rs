@@ -1175,7 +1175,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         );
     }
 
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let fleet_default_entries = opts.entries.max(1);
     let smallest_cell_entries = opts
         .instances
@@ -3712,7 +3712,7 @@ data_source = { kind = "indexer", filter = { tree_number = 2 } }
             "a per-instance record_size overrides [global].record_size"
         );
 
-        let ring_dim = InspireParams::secure_128_d2048().ring_dim;
+        let ring_dim = InspireParams::d2048().ring_dim;
         for cfg in &opts.instances {
             let entries = entries_for_instance(&opts, cfg, DEFAULT_PRODUCTION_ENTRIES);
             validate_instance_cell_shape(cfg, entries, ring_dim)
@@ -3812,7 +3812,7 @@ data_source = {{ kind = "mirror", list_key = "{OFAC_LIST_KEY}", block = 1 }}
             );
         }
 
-        let ring_dim = InspireParams::secure_128_d2048().ring_dim;
+        let ring_dim = InspireParams::d2048().ring_dim;
         for cfg in &opts.instances {
             let entries = entries_for_instance(&opts, cfg, DEFAULT_PRODUCTION_ENTRIES);
             validate_instance_cell_shape(cfg, entries, ring_dim).unwrap_or_else(|e| {
@@ -3828,7 +3828,7 @@ data_source = {{ kind = "mirror", list_key = "{OFAC_LIST_KEY}", block = 1 }}
     fn a_fleet_wide_default_production_entries_rejects_the_node_family() {
         let f = write_temp_toml(&live_six_instance_toml(None));
         let opts = load_options_from_toml(f.path()).expect("parse");
-        let ring_dim = InspireParams::secure_128_d2048().ring_dim;
+        let ring_dim = InspireParams::d2048().ring_dim;
 
         let rejected: Vec<&str> = opts
             .instances
@@ -3854,7 +3854,7 @@ data_source = {{ kind = "mirror", list_key = "{OFAC_LIST_KEY}", block = 1 }}
     fn an_undersized_per_instance_entries_is_rejected_with_an_actionable_error() {
         let f = write_temp_toml(&live_six_instance_toml(Some(DEFAULT_PRODUCTION_ENTRIES)));
         let opts = load_options_from_toml(f.path()).expect("parse");
-        let ring_dim = InspireParams::secure_128_d2048().ring_dim;
+        let ring_dim = InspireParams::d2048().ring_dim;
         let cfg = opts
             .instances
             .iter()
@@ -3885,7 +3885,7 @@ data_source = {{ kind = "mirror", list_key = "{OFAC_LIST_KEY}", block = 1 }}
             "the override is per-instance, not fleet-wide"
         );
 
-        let ring_dim = InspireParams::secure_128_d2048().ring_dim;
+        let ring_dim = InspireParams::d2048().ring_dim;
         for cfg in &opts.instances {
             let entries = entries_for_instance(&opts, cfg, DEFAULT_PRODUCTION_ENTRIES);
             validate_instance_cell_shape(cfg, entries, ring_dim)

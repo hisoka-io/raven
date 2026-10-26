@@ -86,7 +86,7 @@ async fn ppoi_height_zero_must_not_collapse_the_resume_floor() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let config = quiet_config(dir.path(), "ppoi-floor");
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
 
     for i in 0..LEAVES {
@@ -163,7 +163,7 @@ async fn a_leaf_below_the_floor_must_not_lower_it() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let config = quiet_config(dir.path(), "leaf-below-floor");
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
 
     for i in 0..LEAVES {
@@ -232,7 +232,7 @@ async fn reorg_must_lower_the_shutdown_resume_floor() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let config = quiet_config(dir.path(), "reorg-floor");
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
 
     for i in 0..LEAVES {

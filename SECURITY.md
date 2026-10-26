@@ -24,9 +24,9 @@ between releases.
 
 ## What v0 provides
 
-**Parameters.** The shipped InsPIRe parameter set, `InspireParams::secure_128_d2048`, is ring
+**Parameters.** The shipped InsPIRe parameter set, `InspireParams::d2048`, is ring
 dimension 2,048, ciphertext modulus q = 2^60 - 2^14 + 1, plaintext modulus 65,537, Gaussian error
-with standard deviation 6.4 and gadget base 2^20; the preset's name is historical. Before it derives a key,
+with standard deviation 6.4 and gadget base 2^20. Before it derives a key,
 the client refuses a served parameter set with a ring dimension outside 2,048 to 4,096, another
 modulus, another error width, or gadgets longer than 3 digits.
 
@@ -41,9 +41,8 @@ served auth path and accepts it only against a root obtained independently of th
 
 **Noise.** Decryption fails silently once noise passes the decode boundary, so the margin is
 measured: `crates/inspire/benches/packing_noise_measurement.rs`, a benchmark run by hand, samples
-1,000 served (mod-switched, 36-bit) responses per record width and finds a worst-case margin of
-8.88 bits at 512-byte rows and 10.30 bits at 32-byte rows. This is a measurement, not an analytic
-bound.
+1,000 served (mod-switched, 36-bit) responses per record width and reports the worst-case margin at
+512-byte and 32-byte rows. This is a measurement, not an analytic bound.
 
 ## Scope
 

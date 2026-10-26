@@ -50,7 +50,7 @@ pub struct NodeConfig {
     pub pool: [u8; 20],
     /// Block the pool was deployed in.
     pub deployment_block: u64,
-    /// Blocks one chain read covers at most.
+    /// Blocks one logs read asks for at most; a read the endpoint refuses is halved.
     pub max_range: u64,
     /// Seats for sessions, and how long one lives after its last use.
     pub sessions: SessionStoreLimits,
@@ -74,14 +74,44 @@ impl NodeConfig {
     }
 }
 
+/// Settings whose defaults suit most deployments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tuning {
+    /// The walk depth, at least 1: see [`follow::WALK_BLOCKS`].
+    pub walk_blocks: u64,
+    /// Threads that answer set-2 queries, shared by every batch in flight.
+    pub respond_threads: usize,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            walk_blocks: follow::WALK_BLOCKS,
+            respond_threads: std::thread::available_parallelism().map_or(1, usize::from),
+        }
+    }
+}
+
+/// [`open_with`] under the default [`Tuning`].
+///
+/// # Errors
+/// As [`open_with`].
+pub fn open<C: Chain>(
+    config: &NodeConfig,
+    chain: C,
+) -> Result<(Follower<C>, Arc<Engine>), StartError> {
+    open_with(config, chain, Tuning::default())
+}
+
 /// Open the table and the engine, publish the table as it stands, and return the follower
 /// that keeps it current.
 ///
 /// # Errors
 /// [`StartError`] when the table, the key material or the resume point is unusable.
-pub fn open<C: Chain>(
+pub fn open_with<C: Chain>(
     config: &NodeConfig,
     chain: C,
+    tuning: Tuning,
 ) -> Result<(Follower<C>, Arc<Engine>), StartError> {
     let store = NoteStore::open(config.data_dir.join("table"), config.chain_id, config.pool)?;
     let pir = Pir::open(
@@ -89,8 +119,15 @@ pub fn open<C: Chain>(
         config.param_set,
         config.sessions,
         config.seed,
+        tuning.respond_threads,
     )?;
-    let follower = Follower::new(chain, store, config.indexer(), config.max_range)?;
+    let follower = Follower::new(
+        chain,
+        store,
+        config.indexer(),
+        config.max_range,
+        tuning.walk_blocks,
+    )?;
     let engine = Arc::new(Engine::new(pir));
     engine.refresh(follower.store(), follower.upper(), 0)?;
     Ok((follower, engine))

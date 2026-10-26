@@ -165,7 +165,7 @@ async fn reorg_cascade_truncates_chain_instances_only() {
     let configs = build_three_configs(dir.path());
     let lk_a = list_key(0xA1);
 
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let factory = |_cfg: &InstanceConfig| -> raven_railgun_core::Result<InspireServerState> {
         build_toy_state()
     };

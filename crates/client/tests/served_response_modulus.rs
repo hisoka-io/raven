@@ -15,7 +15,7 @@ use raven_inspire::pir::mod_switch::{
 };
 use raven_inspire::rlwe::RlweCiphertext;
 use raven_inspire::{
-    query_seeded, respond_seeded_inspiring, setup, ClientState, InspireParams, SecurityLevel,
+    query_seeded, respond_seeded_inspiring, setup, ClientState, InspireParams, ParamsLabel,
     ServerCrs, ServerResponse,
 };
 
@@ -44,7 +44,7 @@ fn serve(crt_moduli: Vec<u64>) -> Served {
         query_gadget_len: 3,
         packing_gadget_len: 3,
         approximate_packing_gadget: false,
-        security_level: SecurityLevel::Bits128,
+        params_label: ParamsLabel::Primary,
     };
     let database: Vec<u8> = (0..params.ring_dim * ENTRY_SIZE)
         .map(|i| u8::try_from((i * 17 + 3) % 251).expect("reduced mod 251, so it fits u8"))

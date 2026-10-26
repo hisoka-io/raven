@@ -1,5 +1,5 @@
 export { HowlError, type AnswerState, type HowlErrorKind } from "./errors.js";
-export { PrefixFeed, tagPrefix, TAG_PREFIX_BYTES, type FeedMatch } from "./feed.js";
+export { PrefixFeed, tagPrefix, TAG_PREFIX_BYTES, type FeedMatch, type FeedView } from "./feed.js";
 export { fetchTransport, type Exchange, type FetchTransportOptions, type HowlTransport, type TransportStats } from "./http.js";
 export {
   bigintField,
@@ -21,6 +21,7 @@ export {
   type FirstOccurrence,
   type KeyMode,
   type MerkleWitness,
+  type NoteCheck,
   type OccurrenceRequest,
   type RavenHowlSourceOptions,
   type SyncResult,

@@ -4,10 +4,10 @@
 #![allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 use howl_wire::{
-    padded_len, Answer, Body, Header, KeySource, Kind, LeafBlock, Notes, P16Batch, P16Query,
-    Params, PrefixSegment, RequestPrefix, Session, UpperNodes, WireError, HEADER_BYTES, LADDER,
-    P16_KEY_BYTES, P16_QUERY_BYTES, P16_RESPONSE_BYTES, PARAM_SET_D2048_CELL256,
-    PARAM_SET_D2048_CELL256_P16, RECORD_BYTES,
+    p16_crs, p16_key_mask_version, padded_len, Answer, Body, Header, KeySource, Kind, LeafBlock,
+    Notes, P16Batch, P16Query, Params, PrefixSegment, RequestPrefix, Session, UpperNodes,
+    WireError, HEADER_BYTES, LADDER, P16_CRS_BYTES, P16_KEY_BYTES, P16_QUERY_BYTES,
+    P16_RESPONSE_BYTES, PARAM_SET_D2048_CELL256, PARAM_SET_D2048_CELL256_P16, RECORD_BYTES,
 };
 
 const LEAF_COUNT: u64 = 0x0102_0304_0506_0708;
@@ -281,8 +281,52 @@ fn parameter_set_2_sizes() {
             P16_RESPONSE_BYTES,
             RECORD_BYTES
         ),
-        (15_360, 7_456, 9_208, 246)
+        (15_362, 7_456, 9_208, 246)
     );
+}
+
+#[test]
+fn a_set_2_params_answer_names_its_key_mask_version() {
+    let params = |crs: Vec<u8>| Answer {
+        param_set: PARAM_SET_D2048_CELL256_P16,
+        ..answer(Body::Params(Params {
+            entry_bytes: 256,
+            rows_per_shard: 2_048,
+            ladder_cap: 16,
+            session_ttl_secs: 3_600,
+            crs,
+        }))
+    };
+    let served = params(p16_crs(1)).encode();
+    let mut want = header(1);
+    want[3] = 2;
+    want.extend_from_slice(&[0, 0, 1, 0, 0, 0, 8, 0, 0, 16, 0, 0, 0x0e, 0x10]);
+    want.extend_from_slice(&[0, 0, 0, 2, 0, 1]);
+    assert_eq!(served, want);
+    let Body::Params(got) = Answer::decode(&served).expect("decodes").body else {
+        panic!("params");
+    };
+    assert_eq!(p16_key_mask_version(&got.crs), Ok(1));
+    assert_eq!(P16_CRS_BYTES, 2);
+    assert_eq!(p16_crs(0x0102), [1, 2]);
+
+    // No version, version 0, or a longer field is refused at decode.
+    for crs in [vec![], vec![0, 0], vec![0, 1, 0]] {
+        let bytes = params(crs.clone()).encode();
+        assert!(
+            matches!(Answer::decode(&bytes), Err(WireError::Invalid(_))),
+            "{crs:?}"
+        );
+    }
+    // Set 1 carries its own key material, whatever its length.
+    let set1 = answer(Body::Params(Params {
+        entry_bytes: 256,
+        rows_per_shard: 2_048,
+        ladder_cap: 16,
+        session_ttl_secs: 3_600,
+        crs: vec![],
+    }));
+    assert_eq!(Answer::decode(&set1.encode()).expect("set 1"), set1);
 }
 
 fn filled(len: usize, from: u8) -> Vec<u8> {

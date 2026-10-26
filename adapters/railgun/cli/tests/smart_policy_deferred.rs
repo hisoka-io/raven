@@ -173,7 +173,7 @@ async fn tree_fill_threshold_pre_spawns_at_95_percent() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());
     let runtime = toy_runtime(tmp.path());
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
 
     assert_eq!(harness.registry.chain_tree_count(), 1);
     assert!(!harness.registry.known().contains(&1u32));
@@ -245,7 +245,7 @@ async fn admin_drain_concurrent_with_auto_spawn_routes_consistently() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let harness = fresh_harness(tmp.path());
     let runtime = toy_runtime(tmp.path());
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
 
     harness
         .bootstrap_instance

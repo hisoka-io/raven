@@ -30,6 +30,18 @@ pub enum ChainError {
         /// What was wrong.
         what: &'static str,
     },
+    /// The answer outgrew what one read may hold; a smaller range may fit.
+    #[error("chain endpoint answered {method} with more than {limit} bytes")]
+    TooLarge {
+        /// Method called.
+        method: &'static str,
+        /// The byte limit.
+        limit: usize,
+    },
+    /// The pool had no code at the block read: it was not deployed yet, or the address is
+    /// not a pool.
+    #[error("the pool address has no code at the block read")]
+    NoCode,
 }
 
 /// A block's hash and its parent's: a run of headers that link proves one chain.
@@ -79,12 +91,18 @@ pub trait Chain: Send + Sync {
     /// The pool's leaf count after the block whose hash is `block`, when the source can read
     /// it. Read by hash, it belongs to that block whatever the chain did since. A batch that
     /// ends on another count is refused, which catches a log source that dropped logs and an
-    /// absence of logs read from another fork.
+    /// absence of logs read from another fork. [`ChainError::NoCode`] when the pool had no
+    /// code at that block.
     fn leaf_count(
         &self,
         block: [u8; 32],
     ) -> impl Future<Output = Result<Option<u64>, ChainError>> + Send;
 }
+
+/// Bytes one `eth_getLogs` answer may hold before the read is dropped and its range halved:
+/// 3 KiB for each leaf of one batch, more than an insert's logs take, so a range the table
+/// takes in one batch always fits, and a denser one costs no more than this to refuse.
+pub const LOG_BYTES_LIMIT: usize = 3 * 1024 * howl_store::MAX_BATCH_ROWS;
 
 /// `bytes4(keccak256("getNextLeafIndex()"))`.
 pub const SELECTOR_NEXT_LEAF_INDEX: [u8; 4] = [0x50, 0xe9, 0xb9, 0x25];
@@ -96,6 +114,7 @@ pub struct RpcChain {
     // May carry a credential: never formatted.
     url: String,
     pool: [u8; 20],
+    log_bytes_limit: usize,
 }
 
 impl std::fmt::Debug for RpcChain {
@@ -197,12 +216,34 @@ impl RpcChain {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|_| ChainError::Transport("could not build the HTTP client".to_owned()))?;
-        Ok(Self { client, url, pool })
+        Ok(Self {
+            client,
+            url,
+            pool,
+            log_bytes_limit: LOG_BYTES_LIMIT,
+        })
+    }
+
+    /// The same source with `limit` bytes per logs answer instead of [`LOG_BYTES_LIMIT`].
+    #[must_use]
+    pub const fn with_log_bytes_limit(mut self, limit: usize) -> Self {
+        self.log_bytes_limit = limit;
+        self
     }
 
     async fn call(&self, method: &'static str, params: Value) -> Result<Value, ChainError> {
+        self.call_limited(method, params, usize::MAX).await
+    }
+
+    /// [`Self::call`], dropping an answer longer than `limit` bytes as it arrives.
+    async fn call_limited(
+        &self,
+        method: &'static str,
+        params: Value,
+        limit: usize,
+    ) -> Result<Value, ChainError> {
         let request = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-        let response = self
+        let mut response = self
             .client
             .post(&self.url)
             .json(&request)
@@ -211,9 +252,28 @@ impl RpcChain {
             // The error's text names the URL; only its kind leaves this function.
             .map_err(|e| ChainError::Transport(transport_kind(&e).to_owned()))?;
         let status = response.status();
-        let mut body: Value = response.json().await.map_err(|_| {
+        let too_large = ChainError::TooLarge { method, limit };
+        if response
+            .content_length()
+            .is_some_and(|length| length > u64::try_from(limit).unwrap_or(u64::MAX))
+        {
+            return Err(too_large);
+        }
+        let mut raw = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| ChainError::Transport(transport_kind(&e).to_owned()))?
+        {
+            if raw.len() + chunk.len() > limit {
+                return Err(too_large);
+            }
+            raw.extend_from_slice(&chunk);
+        }
+        let mut body: Value = serde_json::from_slice(&raw).map_err(|_| {
             ChainError::Transport(format!("{method}: status {status}, body unreadable"))
         })?;
+        drop(raw);
         if let Some(error) = body.get("error") {
             return Err(ChainError::Rpc {
                 method,
@@ -292,7 +352,9 @@ impl Chain for RpcChain {
             "toBlock": quantity(to),
             "topics": [topics],
         }]);
-        let result = self.call("eth_getLogs", filter).await?;
+        let result = self
+            .call_limited("eth_getLogs", filter, self.log_bytes_limit)
+            .await?;
         let mut logs = Vec::new();
         for log in result.as_array().ok_or(ChainError::Malformed {
             method: "eth_getLogs",
@@ -310,6 +372,10 @@ impl Chain for RpcChain {
             { "blockHash": hex(&block) },
         ]);
         let result = self.call("eth_call", call).await?;
+        // A call to an address without code succeeds with no bytes.
+        if result.as_str() == Some("0x") {
+            return Err(ChainError::NoCode);
+        }
         let bytes = result
             .as_str()
             .and_then(unhex)

@@ -37,7 +37,7 @@ fn register_one_session(instance: &Arc<PirInstance<RavenInspireScheme>>) {
 
 #[test]
 fn admin_swap_state_clears_session_store() {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let initial_state = build_toy_state(&params);
     let instance: Arc<PirInstance<RavenInspireScheme>> = Arc::new(PirInstance::new(
         InstanceId::new("h11-admin-swap-clears"),

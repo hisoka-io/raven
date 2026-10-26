@@ -30,21 +30,39 @@ const source = new RavenHowlSource({
 const { leafCount, block } = await source.sync(); // feed delta, upper nodes, newest block
 const matches = source.matches(candidateTags); // local scan, no request
 const records = await source.fetchNotes(matches.map((m) => m.position));
+// after opening a record and recomputing its commitment, with no request:
+const check = await source.confirmNote(records[0], commitment); // "confirmed" | "unconfirmed"
+// at spend time (reads the note's block in plaintext):
 const witness = await source.merkleWitness(records[0].leafIndex); // or (index, leafCount)
+// witness.leaf must equal the commitment; confirmNote now answers "confirmed" or refuses
 ```
 
+`confirmNote` refuses a cell that opens but is not the verified tree's leaf at its position. It
+never reads a block from the node: when the client does not hold the note's 1,024-leaf block it
+answers `"unconfirmed"`, and the check is made at spend time against the witness, whose build
+reads that block anyway.
+
+A feed row is six bytes, so a row of another note can match a tag. Read and try to open every
+matched position, never only the first: a tag is in use when any of its rows opens.
+
 `RavenHowlSource` also answers Howl's current `DiscoverySource` shape from the feed:
-`probeFirst(tags)` and `fetchOccurrences(requests)` give the same records, and
-`fetchLeafBlock(blockIndex)` returns a block's leaves from the verified tree.
+`probeFirst(tags)` reads every matching position in one private read and returns, per tag, the
+first record (`record`) and all of them (`positions`, `records`); `fetchOccurrences(requests)`
+then answers from those cells, and `fetchLeafBlock(blockIndex)` returns a block's leaves from the
+verified tree. Checks that decide whether a tag or index is in use (a self-mint preflight, a
+counter reconcile) use `matches(tags)` or the `feed` view of the synced rows, and every record in
+`records`.
 
 | Method | What it does |
 |---|---|
 | `sync()` | pulls the feed from the cursor, the new upper nodes and the newest block past the leaves held (96 bytes when nothing is new); checks the root; reports `rewoundTo` after a reorganisation |
 | `matches(tags, from?)` | positions whose feed row equals a tag's low six bytes |
-| `fetchNotes(positions)` | private read, one record per position in request order, batches of up to the node's ladder cap |
+| `feed` | read-only view of the synced feed rows: `length`, `bytes()`, `matches(prefixTags, from?)` |
+| `fetchNotes(positions)` | private read, one record per position in request order, batches of up to the node's ladder cap; position 0 (the genesis filler) is refused |
+| `confirmNote(record, commitment)` | checks a recomputed commitment against the record's prefix and, when the client holds the note's block, the verified tree's leaf at its position; sends no request; `"unconfirmed"` otherwise |
 | `fetchTagPrefixes(since)` | one feed segment as served |
-| `fetchLeafBlock(b)` | the leaves of block `b` |
-| `merkleWitness(index, leafCount?)` | siblings from level 0 up, the root at that count, folded and checked |
+| `fetchLeafBlock(b)` | the leaves of block `b`; a full block the client does not hold is read from the node in plaintext, so call it at spend time, not at discovery |
+| `merkleWitness(index, leafCount?)` | siblings from level 0 up, the root at that count, folded and checked; its `block` is the newest verified block, not the block at that count |
 | `snapshot()` | what a wallet stores to resume: feed rows, upper nodes, newest block, state |
 
 A key is built under a secret drawn inside the wasm when a client is created, and never under
@@ -53,6 +71,13 @@ names, and refuses answers to its own requests from a node of another set. In `s
 the source uploads one key per session and opens a new session, under a new secret, when the
 node reports the old one expired. In `inline` mode every request carries a key built for it
 alone.
+
+When a private read is refused, or its answer does not open, the source reads the node's params
+again once. If the node now serves other material (it restarted under the other parameter set,
+or was re-seeded with new key material), the source drops its key and session, builds the same
+read again under the node's params, and sends it once; otherwise, or if that read fails too, it
+raises the error. The feed, the tree and the cells already read are chain data and stay: after a
+re-seed on the same chain the next sync goes on from the cursor.
 
 ## Sizes on the wire
 

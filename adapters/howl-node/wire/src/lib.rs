@@ -28,14 +28,38 @@ pub const PARAM_SET_D2048_CELL256: u16 = 1;
 /// Parameter set of the private reads: ring dimension 2,048, a 29-bit prime, plaintext
 /// modulus 16, a one-row packing key at about 2^60, 256-byte cells of which a response
 /// returns the first [`RECORD_BYTES`]. Its key, query and response bytes are fixed widths and
-/// its public key material is fixed in code, so its params answer carries none.
+/// its public key mask is fixed in code up to a version, so its params answer carries only that
+/// version ([`p16_crs`]).
 pub const PARAM_SET_D2048_CELL256_P16: u16 = 2;
 
 /// Leading bytes of a cell a set-2 response returns; the rest of a served cell is zero.
 pub const RECORD_BYTES: usize = 246;
 
-/// Bytes of a set-2 packing key.
-pub const P16_KEY_BYTES: usize = 15_360;
+/// Bytes of a set-2 packing key, the first two of them its key-mask version.
+pub const P16_KEY_BYTES: usize = 15_362;
+
+/// Bytes of a set-2 params answer's `crs`: the key-mask version the node seats keys under.
+pub const P16_CRS_BYTES: usize = 2;
+
+/// The `crs` of a set-2 params answer: key-mask `version`, `u16`.
+#[must_use]
+pub fn p16_crs(version: u16) -> Vec<u8> {
+    version.to_be_bytes().to_vec()
+}
+
+/// The key-mask version a set-2 params answer's `crs` names.
+///
+/// # Errors
+/// [`WireError::Invalid`] unless `crs` is [`P16_CRS_BYTES`] naming a version above 0.
+pub fn p16_key_mask_version(crs: &[u8]) -> Result<u16, WireError> {
+    match crs {
+        [0, 0] => Err(WireError::Invalid("key-mask version 0 names no mask")),
+        [hi, lo] => Ok(u16::from_be_bytes([*hi, *lo])),
+        _ => Err(WireError::Invalid(
+            "a set-2 params answer names its key-mask version in 2 bytes",
+        )),
+    }
+}
 
 /// Bytes of a set-2 query.
 pub const P16_QUERY_BYTES: usize = 7_456;
@@ -435,7 +459,7 @@ impl UpperNodes {
 
 /// What the node serves with: `entry_bytes u32 | rows_per_shard u32 | ladder_cap u16 |
 /// session_ttl_secs u32 | crs_len u32 | crs`. The header's parameter set says which scheme;
-/// under set 2 `crs` is empty.
+/// under set 2 `crs` is the key-mask version ([`p16_crs`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Params {
     /// Bytes per discovery cell.
@@ -598,6 +622,9 @@ impl Answer {
                 let session_ttl_secs = r.u32()?;
                 let len = r.u32()?;
                 let crs = r.take(usize::try_from(len).unwrap_or(usize::MAX))?.to_vec();
+                if header.param_set == PARAM_SET_D2048_CELL256_P16 {
+                    p16_key_mask_version(&crs)?;
+                }
                 Body::Params(Params {
                     entry_bytes,
                     rows_per_shard,

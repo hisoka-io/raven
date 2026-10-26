@@ -25,8 +25,18 @@ export interface FeedMatch {
   readonly candidate: number;
 }
 
+/** The feed rows a source holds, read-only: what a wallet scans without a request. */
+export interface FeedView {
+  /** Rows held: `[0, length)`. */
+  readonly length: number;
+  /** The rows held, for the wallet to store. */
+  bytes(): Uint8Array;
+  /** As {@link PrefixFeed.matches}. */
+  matches(tags: readonly Uint8Array[], from?: number): FeedMatch[];
+}
+
 /** The wallet's copy of the feed: rows `[0, length)`, appended in order. */
-export class PrefixFeed {
+export class PrefixFeed implements FeedView {
   #rows: Uint8Array;
   #length = 0;
 

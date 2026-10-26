@@ -86,13 +86,13 @@ async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
 
 /// Round-trip: the `inspire_params_bincode` bytes decode into a
 /// `raven_inspire::params::InspireParams` value byte-equal to the
-/// preset the engine was bootstrapped with (`secure_128_d2048`).
+/// preset the engine was bootstrapped with (`d2048`).
 /// Decoding all three bincode fields strictly dominates the former
 /// non-empty smoke checks (a wrong-preset mutation left those green);
 /// the envelope pins (schema version, entry_size) live here too.
 #[tokio::test]
-async fn instance_params_inspire_params_decodes_to_secure_128_d2048() {
-    let params = InspireParams::secure_128_d2048();
+async fn instance_params_inspire_params_decodes_to_d2048() {
+    let params = InspireParams::d2048();
     let engine = build_engine_with_one_instance(&params);
     let router = build_router_with_engine(engine);
 
@@ -111,7 +111,7 @@ async fn instance_params_inspire_params_decodes_to_secure_128_d2048() {
     assert_eq!(decoded.entry_size, TOY_ENTRY_BYTES);
     let recovered_params: InspireParams =
         bincode::deserialize(&decoded.inspire_params_bincode).expect("decode InspireParams");
-    let expected = InspireParams::secure_128_d2048();
+    let expected = InspireParams::d2048();
 
     // `InspireParams` has no `Eq`; sigma drives the sampler and ring_dim the
     // secret-key shape, so those are the load-bearing fields.

@@ -22,7 +22,7 @@ use axum::extract::ConnectInfo;
 use axum::http::{header, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use raven_inspire::math::GaussianSampler;
-use raven_inspire::params::{InspireParams, InspireVariant, SecurityLevel};
+use raven_inspire::params::{InspireParams, InspireVariant, ParamsLabel};
 use raven_inspire::query_seeded;
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{setup_state, LogicalLeafStore, RavenInspireScheme};
@@ -65,7 +65,7 @@ fn params() -> InspireParams {
         query_gadget_len: 3,
         packing_gadget_len: 3,
         approximate_packing_gadget: false,
-        security_level: SecurityLevel::Bits128,
+        params_label: ParamsLabel::Primary,
     }
 }
 

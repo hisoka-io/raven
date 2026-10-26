@@ -2,9 +2,16 @@
 //!
 //! ```text
 //! HOWL_NODE_RPC_URL=<endpoint> howl-node --data-dir DIR --chain-id N --pool 0x.. \
-//!     --deployment-block N [--listen 127.0.0.1:8545] [--poll-ms 2000] [--max-range 2000] \
+//!     --deployment-block N [--listen 127.0.0.1:8545] [--poll-ms 2000] [--max-range 50000] \
 //!     [--max-sessions 2048] [--session-ttl-secs 3600] [--concurrent N] [--param-set 1|2]
+//!     [--walk-blocks 64] [--respond-threads N]
 //! ```
+//!
+//! `--concurrent` bounds the batches answered at once and `--respond-threads` the threads that
+//! compute set-2 responses for all of them (both default to the cores). `--walk-blocks` is the
+//! depth below the head within which every header and the pool's count are read; it must be at
+//! least 1 and lie within the recent state the endpoint keeps. `--max-range` caps the blocks one
+//! log read asks for; a read the endpoint refuses is halved, so it need not match the endpoint.
 //!
 //! The endpoint is read from the environment so that a key in its URL stays out of the
 //! process list.
@@ -17,11 +24,12 @@ use std::time::Duration;
 
 use howl_node::chain::{unhex, RpcChain};
 use howl_node::http::{router, Served};
-use howl_node::NodeConfig;
+use howl_node::{NodeConfig, Tuning};
 use raven_inspire_session::SessionStoreLimits;
 
 struct Args {
     node: NodeConfig,
+    tuning: Tuning,
     listen: SocketAddr,
     poll: Duration,
     concurrent: usize,
@@ -34,13 +42,14 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut deployment_block = None;
     let mut listen: SocketAddr = ([127, 0, 0, 1], 8645).into();
     let mut poll = Duration::from_millis(2_000);
-    let mut max_range = 2_000u64;
+    let mut max_range = 50_000u64;
     let mut sessions = SessionStoreLimits {
         max_sessions: 2_048,
         ttl: Duration::from_secs(3_600),
     };
     let mut concurrent = std::thread::available_parallelism().map_or(4, usize::from);
     let mut param_set = howl_wire::PARAM_SET_D2048_CELL256;
+    let mut tuning = Tuning::default();
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         let number = |text: String| {
@@ -74,6 +83,17 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                 param_set =
                     u16::try_from(number(value()?)?).map_err(|_| "--param-set: too large")?;
             }
+            "--walk-blocks" => {
+                tuning.walk_blocks = number(value()?)?;
+                if tuning.walk_blocks == 0 {
+                    // No walk would leave every count and header link unchecked.
+                    return Err("--walk-blocks: at least 1".to_owned());
+                }
+            }
+            "--respond-threads" => {
+                tuning.respond_threads = usize::try_from(number(value()?)?)
+                    .map_err(|_| "--respond-threads: too large")?;
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -88,6 +108,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             param_set,
             seed: None,
         },
+        tuning,
         listen,
         poll,
         concurrent,
@@ -114,7 +135,8 @@ fn run() -> Result<(), String> {
     let args = parse(std::env::args().skip(1))?;
     let url = std::env::var("HOWL_NODE_RPC_URL").map_err(|_| "HOWL_NODE_RPC_URL is not set")?;
     let chain = RpcChain::new(url, args.node.pool).map_err(|e| e.to_string())?;
-    let (follower, engine) = howl_node::open(&args.node, chain).map_err(|e| e.to_string())?;
+    let (follower, engine) =
+        howl_node::open_with(&args.node, chain, args.tuning).map_err(|e| e.to_string())?;
     tracing::info!(
         leaves = engine.view().leaf_count,
         block = engine.view().block,
@@ -154,4 +176,43 @@ fn run() -> Result<(), String> {
     stop.store(true, Ordering::Relaxed);
     let _ = following.join();
     served
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::parse;
+
+    fn args(extra: &[&str]) -> impl Iterator<Item = String> {
+        let pool = format!("0x{}", "11".repeat(20));
+        let base = [
+            "--data-dir",
+            "/tmp/x",
+            "--chain-id",
+            "1",
+            "--pool",
+            pool.as_str(),
+            "--deployment-block",
+            "5",
+        ];
+        base.iter()
+            .chain(extra)
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn a_walk_of_no_blocks_is_refused() {
+        let refused = parse(args(&["--walk-blocks", "0"])).err().expect("refused");
+        assert!(refused.contains("--walk-blocks"), "{refused}");
+        let one = parse(args(&["--walk-blocks", "1"])).expect("one block");
+        assert_eq!(one.tuning.walk_blocks, 1);
+    }
+
+    #[test]
+    fn the_default_range_needs_no_flag() {
+        let parsed = parse(args(&[])).expect("parses");
+        assert_eq!(parsed.node.max_range, 50_000);
+    }
 }

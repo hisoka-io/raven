@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use raven_inspire::params::{InspireParams, InspireVariant, SecurityLevel};
+use raven_inspire::params::{InspireParams, InspireVariant, ParamsLabel};
 use raven_inspire::{ClientSession, ServerResponse, ServerSessionHandle};
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{
@@ -46,7 +46,7 @@ fn ring_256() -> InspireParams {
         query_gadget_len: 3,
         packing_gadget_len: 3,
         approximate_packing_gadget: false,
-        security_level: SecurityLevel::Bits128,
+        params_label: ParamsLabel::Primary,
     }
 }
 

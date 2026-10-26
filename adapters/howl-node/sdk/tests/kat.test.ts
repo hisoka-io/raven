@@ -282,13 +282,14 @@ describe("vectors pinned from Howl's own wallet code", () => {
   });
 });
 
-/** The fixture's params answer as a set-2 node sends it: set id 2 and no key material. */
+/** The fixture's params answer as a set-2 node sends it: set id 2 and key-mask version 1. */
 function setTwoParams(): Uint8Array {
   const set1 = fixtureFile("params.bin");
   // header, then entry bytes, rows per shard, ladder cap and lifetime: 56 + 14 bytes
-  const out = new Uint8Array(56 + 14 + 4);
+  const out = new Uint8Array(56 + 14 + 4 + 2);
   out.set(set1.subarray(0, 56 + 14));
   out[3] = 2;
+  out.set([0, 0, 0, 2, 0, 1], 56 + 14);
   return out;
 }
 
@@ -301,7 +302,8 @@ describe("the private-read client on parameter set 2", () => {
     const b = new wasm.HowlClient(params);
     try {
       expect(a.paramSet).toBe(2);
-      expect(a.sessionBody().length).toBe(4 + 15_360);
+      expect(a.sessionBody().length).toBe(4 + 15_362);
+      expect([...a.sessionBody().subarray(4, 6)]).toEqual([0, 1]);
       expect([...a.sessionBody().subarray(0, 4)]).toEqual([0, 1, 0, 2]);
       expect(hex(a.sessionBody())).toBe(hex(a.sessionBody()));
       expect(hex(a.sessionBody())).not.toBe(hex(b.sessionBody()));
@@ -314,10 +316,10 @@ describe("the private-read client on parameter set 2", () => {
         try {
           const batch = client.buildBatch(new Uint32Array(real).fill(7), 160);
           expect(batch.slots).toBe(slots);
-          expect(batch.body.length).toBe(4 + 1 + 15_360 + 2 + 7_460 * slots);
+          expect(batch.body.length).toBe(4 + 1 + 15_362 + 2 + 7_460 * slots);
           // source 2, then the session key byte for byte
           expect(batch.body[4]).toBe(2);
-          expect(hex(batch.body.subarray(5, 5 + 15_360))).toBe(hex(client.sessionBody().subarray(4)));
+          expect(hex(batch.body.subarray(5, 5 + 15_362))).toBe(hex(client.sessionBody().subarray(4)));
           batch.free();
           expect(() => client.buildBatch(new Uint32Array([7]), 160)).toThrow(/new client per request/);
         } finally {
@@ -330,11 +332,14 @@ describe("the private-read client on parameter set 2", () => {
     }
   });
 
-  it("refuses key material the set fixes, and answers of the other set", () => {
-    const withCrs = new Uint8Array(params.length + 1);
-    withCrs.set(params);
-    new DataView(withCrs.buffer).setUint32(56 + 14, 1, false);
-    expect(() => new wasm.HowlClient(withCrs)).toThrow(/key material/);
+  it("refuses a key-mask version it does not know, and answers of the other set", () => {
+    const newer = params.slice();
+    newer[56 + 14 + 5] = 2;
+    expect(() => new wasm.HowlClient(newer)).toThrow(/key-mask version 2/);
+    const longer = new Uint8Array(params.length + 1);
+    longer.set(params);
+    new DataView(longer.buffer).setUint32(56 + 14, 3, false);
+    expect(() => new wasm.HowlClient(longer)).toThrow(/key-mask version/);
     const client = new wasm.HowlClient(params);
     try {
       const batch = client.buildBatch(new Uint32Array([1]), 160);

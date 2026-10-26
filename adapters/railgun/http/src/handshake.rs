@@ -471,7 +471,7 @@ mod tests {
     use axum::http::{header, Method, Request};
     use http_body_util::BodyExt;
     use raven_inspire::math::GaussianSampler;
-    use raven_inspire::params::{InspireVariant, SecurityLevel};
+    use raven_inspire::params::{InspireVariant, ParamsLabel};
     use raven_railgun_engine::inspire::setup_state;
     use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
     use tower::ServiceExt;
@@ -493,7 +493,7 @@ mod tests {
             query_gadget_len: 3,
             packing_gadget_len: 3,
             approximate_packing_gadget: false,
-            security_level: SecurityLevel::Bits128,
+            params_label: ParamsLabel::Primary,
         }
     }
 
@@ -571,7 +571,7 @@ mod tests {
     /// The cap follows the key a client builds: two bodies of one polynomial per key row.
     #[test]
     fn the_upload_limit_is_two_key_bodies_and_framing() {
-        let shipped = InspireParams::secure_128_d2048();
+        let shipped = InspireParams::d2048();
         assert_eq!(shipped.packing_key_rows(), 3);
         assert_eq!(packing_key_upload_limit(&shipped), 2 * 3 * 2048 * 8 + 4096);
         let two_rows = InspireParams {

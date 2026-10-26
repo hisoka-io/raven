@@ -3,7 +3,7 @@
 //!
 //! `InspireParams::validate` checks that a set is structurally usable, so a node could serve a
 //! smaller ring or a narrower error and the client would encrypt under it. These bounds hold
-//! every served set to at least the shipped `secure_128_d2048` and cap the sizes every client
+//! every served set to at least the shipped `d2048` and cap the sizes every client
 //! allocation scales with.
 
 use raven_inspire::math::mod_q::DEFAULT_Q;
@@ -12,7 +12,7 @@ use raven_inspire::params::InspireParams;
 /// Smallest ring dimension accepted: the shipped preset's.
 pub const MIN_RING_DIM: usize = 2048;
 
-/// Largest ring dimension accepted: raven-inspire's largest preset, `secure_128_d4096`.
+/// Largest ring dimension accepted: raven-inspire's largest preset, `d4096`.
 pub const MAX_RING_DIM: usize = 4096;
 
 /// Largest ciphertext modulus accepted: the shipped `DEFAULT_Q = 2^60 - 2^14 + 1`. At a fixed
@@ -28,7 +28,7 @@ pub const SHIPPED_CRT_MODULI: [u64; 1] = [DEFAULT_Q];
 /// one grows each sampler's table, `2 * ceil(6 sigma) + 1` entries, without bound.
 pub const SHIPPED_SIGMA: f64 = 6.4;
 
-/// Most digits either gadget may have: the shipped `secure_128_d2048` decomposes its 60-bit
+/// Most digits either gadget may have: the shipped `d2048` decomposes its 60-bit
 /// modulus in base 2^20, which takes 3. The packing keys a client builds and registers hold one
 /// polynomial per digit, so a smaller base cannot grow them past the shipped shape; at the shipped
 /// `q` this holds the base at 2^20 or more.
@@ -89,14 +89,14 @@ pub enum ParameterFloorError {
     ApproximatePackingGadget,
 }
 
-/// Refuse a parameter set outside the floors. `secure_128_d2048` and `secure_128_d4096` pass.
+/// Refuse a parameter set outside the floors. `d2048` and `d4096` pass.
 ///
 /// ```
 /// use raven_client::{check_parameter_floor, ParameterFloorError};
 /// use raven_inspire::params::InspireParams;
 ///
-/// assert!(check_parameter_floor(&InspireParams::secure_128_d2048()).is_ok());
-/// let small = InspireParams { ring_dim: 1024, ..InspireParams::secure_128_d2048() };
+/// assert!(check_parameter_floor(&InspireParams::d2048()).is_ok());
+/// let small = InspireParams { ring_dim: 1024, ..InspireParams::d2048() };
 /// assert_eq!(
 ///     check_parameter_floor(&small),
 ///     Err(ParameterFloorError::RingDim { ring_dim: 1024 })

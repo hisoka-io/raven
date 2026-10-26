@@ -297,7 +297,7 @@ struct Fixture {
 }
 
 fn fixture(rows: usize, register: bool) -> Fixture {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = synthetic_db(rows);
     let started = Instant::now();
     let (state, _) =
@@ -512,7 +512,7 @@ fn served_respond_latency_at_deployed_cell() {
                 "record_size": ENTRY_BYTES,
                 "rows_per_shard": ROWS_PER_SHARD,
                 "db_rows": 1u64 << DB_ROWS_LOG2,
-                "params": "secure_128_d2048",
+                "params": "d2048",
                 "variant": "TwoPacking",
                 "wire_response_modulus": WIRE_RESPONSE_MODULUS,
                 "ifma_dispatch_preconditions": ifma_dispatch_preconditions(&f.params),

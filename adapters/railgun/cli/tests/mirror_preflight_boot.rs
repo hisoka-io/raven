@@ -368,7 +368,7 @@ async fn leave_one_row_on_disk(data_root: &Path, instance_ids: &[&str]) {
 /// left behind by a seeding boot would hide a count made before the real boot installs its own.
 async fn leave_rows_on_disk(data_root: &Path, instance_ids: &[&str], indices: &[u32]) {
     let (opts, _) = shipped_ppoi_options(data_root, instance_ids, "http://127.0.0.1:1");
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     // The cell the serve path builds, so the snapshot left behind is the one it would leave.
     let factory = |config: &InstanceConfig| {
         let entry_size = config.record_size.max(32);
@@ -440,7 +440,7 @@ async fn leave_rows_on_disk(data_root: &Path, instance_ids: &[&str], indices: &[
 /// the list's tree over those rows.
 fn leave_rows_committed(data_root: &Path, instance_ids: &[&str], rows: u64) -> Imt {
     let (opts, _) = shipped_ppoi_options(data_root, instance_ids, "http://127.0.0.1:1");
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let encoders: Vec<_> = opts
         .instances
         .iter()

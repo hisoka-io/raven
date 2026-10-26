@@ -55,7 +55,11 @@ impl TestNode {
     }
 
     fn start_with(config: NodeConfig, chain: FakeChain) -> Self {
-        let (follower, engine) = howl_node::open(&config, chain).expect("open");
+        Self::start_tuned(config, chain, howl_node::Tuning::default())
+    }
+
+    fn start_tuned(config: NodeConfig, chain: FakeChain, tuning: howl_node::Tuning) -> Self {
+        let (follower, engine) = howl_node::open_with(&config, chain, tuning).expect("open");
         let http = Http(router(Served::new(Arc::clone(&engine), 4)));
         Self {
             follower,
@@ -313,6 +317,130 @@ fn long_chain(
     logs.extend(ext.logs);
     leaves.extend(ext.leaves);
     (logs, leaves, ext.last_block)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cold_catch_up_reads_in_frames_and_needs_no_old_state() {
+    let fixture = Fixture::load();
+    // More leaves than two frames, most of them deeper than the walk.
+    let (logs, leaves, last) = long_chain(&fixture, 300, 512, 0xc01d);
+    assert!(leaves.len() > 2 * howl_store::MAX_BATCH_ROWS);
+    let chain = FakeChain::new(fixture.pool, fixture.first_block, logs, last);
+    chain.keep_state_for(howl_node::follow::WALK_BLOCKS);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = config(dir.path(), &fixture, Duration::from_secs(3_600));
+    config.max_range = 2_000;
+    let mut node = TestNode::start_with(config, chain.clone());
+    let steps = node.catch_up().await;
+    for step in &steps {
+        match step {
+            Step::Read { leaves, .. } => {
+                assert!(leaves.end - leaves.start <= howl_store::MAX_BATCH_ROWS as u64);
+            }
+            Step::Idle { .. } => {}
+            other => panic!("a cold catch-up stepped {other:?}"),
+        }
+    }
+    // A read past the frame is cut before its roots are checked, and the next one shrinks.
+    assert!(
+        chain.largest_read() <= 2 * howl_store::MAX_BATCH_ROWS,
+        "one read returned {} leaves",
+        chain.largest_read()
+    );
+    let served = node.sync().await;
+    assert_eq!(
+        (served.leaf_count, served.root),
+        (leaves.len() as u64, root_of(&leaves))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dense_blocks_after_a_sparse_stretch_are_read_within_the_endpoints_cap() {
+    let fixture = Fixture::load();
+    // 3,000 empty blocks grow the range to its cap; then 60 blocks of 512 leaves each.
+    let (mut tree, mut leaves) = fixture_tree(&fixture);
+    let ext = extend(fixture.pool, &mut tree, fixture.head + 3_001, 60, 512, 0x5a);
+    let mut logs = fixture.logs.clone();
+    logs.extend(ext.logs);
+    leaves.extend(ext.leaves);
+    let chain = FakeChain::new(
+        fixture.pool,
+        fixture.first_block,
+        logs,
+        ext.last_block + 100,
+    );
+    // An endpoint that answers at most 8,192 logs: 4,096 leaves at two logs each.
+    chain.cap_logs(8_192);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = config(dir.path(), &fixture, Duration::from_secs(3_600));
+    config.max_range = 50_000;
+    let mut node = TestNode::start_with(config, chain.clone());
+    node.catch_up().await;
+    assert!(chain.refused_reads() > 0, "the cap never bit");
+    assert!(chain.largest_read() <= 4_096, "{}", chain.largest_read());
+    let served = node.sync().await;
+    assert_eq!(
+        (served.leaf_count, served.root),
+        (leaves.len() as u64, root_of(&leaves))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deployment_block_before_the_pools_code_is_read_as_no_leaves() {
+    let fixture = Fixture::load();
+    let chain = FakeChain::new(
+        fixture.pool,
+        fixture.first_block,
+        fixture.logs.clone(),
+        fixture.head,
+    );
+    chain.code_from(fixture.first_block);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = config(dir.path(), &fixture, Duration::from_secs(3_600));
+    config.deployment_block = fixture.first_block - 40;
+    // Every read walked, so the first count is read before the code exists.
+    let tuning = howl_node::Tuning {
+        walk_blocks: 1_000,
+        ..howl_node::Tuning::default()
+    };
+    let mut node = TestNode::start_tuned(config, chain.clone(), tuning);
+    let errors = node.settle().await;
+    assert!(errors.is_empty(), "{errors:?}");
+    let (_, leaves) = fixture_tree(&fixture);
+    let served = node.sync().await;
+    assert_eq!(
+        (served.leaf_count, served.root),
+        (leaves.len() as u64, root_of(&leaves))
+    );
+    // With leaves held, no code at the newest block is the chain disagreeing, not a zero.
+    chain.code_from(u64::MAX);
+    chain.set_head(fixture.head + 1);
+    let refused = node
+        .follower
+        .step()
+        .await
+        .expect_err("no code under held leaves");
+    assert!(refused.to_string().contains("no code"), "{refused}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_walk_depth_of_zero_still_walks_the_newest_block() {
+    let fixture = Fixture::load();
+    let chain = FakeChain::new(
+        fixture.pool,
+        fixture.first_block,
+        fixture.logs.clone(),
+        fixture.head,
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tuning = howl_node::Tuning {
+        walk_blocks: 0,
+        ..howl_node::Tuning::default()
+    };
+    let config = config(dir.path(), &fixture, Duration::from_secs(3_600));
+    let mut node = TestNode::start_tuned(config, chain.clone(), tuning);
+    node.catch_up().await;
+    assert!(chain.count_reads() > 0, "no count was ever read");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -184,7 +184,7 @@ async fn mirror_height_zero_in_sync_verdict_must_not_become_a_fork_anchor() {
     let chain_source = Arc::new(ScriptedChainSource::new());
     let config = verifying_config(dir.path(), &chain_source);
 
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
 
     // Every chain-height verdict is out of sync, so no real anchor is

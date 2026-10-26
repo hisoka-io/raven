@@ -103,7 +103,7 @@ async fn ppoi_non_contiguous_list_leaf_never_reaches_the_wal() {
     config.verification_cadence_n = 0;
     config.chain_source = None;
 
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
 
     handle

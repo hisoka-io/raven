@@ -45,7 +45,7 @@ fn build_donor_state(params: &InspireParams) -> PirInstance<inspire::RavenInspir
             in swap_state."]
 fn swap_state_with_matching_seed_carries_cache_under_50ms() {
     let setup_start = Instant::now();
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let instance = build_donor_state(&params);
     let setup_elapsed = setup_start.elapsed();
     eprintln!("cache_carry_bench: donor setup elapsed = {setup_elapsed:?}");
@@ -92,7 +92,7 @@ fn swap_state_with_matching_seed_carries_cache_under_50ms() {
             ServerInspiringCache reuse in swap_state."]
 fn swap_state_with_mismatched_seed_rebuilds_cache_above_baseline() {
     let setup_start = Instant::now();
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let instance = build_donor_state(&params);
     let setup_elapsed = setup_start.elapsed();
     eprintln!("cache_carry_bench: rebuild-guard donor setup elapsed = {setup_elapsed:?}");

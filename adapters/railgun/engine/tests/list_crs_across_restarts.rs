@@ -67,7 +67,7 @@ fn own_crs_state(cfg: &InstanceConfig) -> raven_railgun_core::Result<InspireServ
         panic!("list blocks only");
     };
     setup_unfilled_state(
-        &InspireParams::secure_128_d2048(),
+        &InspireParams::d2048(),
         &empty_rows(list_key),
         ROWS,
         PATH10_RECORD_BYTES,
@@ -79,7 +79,7 @@ fn own_crs_state(cfg: &InstanceConfig) -> raven_railgun_core::Result<InspireServ
 fn boot(configs: Vec<InstanceConfig>) -> raven_railgun_core::Result<MultiOrchestratorHandle> {
     bootstrap_railgun_engine_multi_with_session_limits(
         configs,
-        InspireParams::secure_128_d2048(),
+        InspireParams::d2048(),
         SessionStoreLimits::default(),
         |cfg, _served_under| own_crs_state(cfg),
     )
@@ -140,7 +140,7 @@ fn with_distinct_shard(
     let mut encoded = (*served.encoded_db).clone();
     re_encode_shard(
         &mut encoded,
-        &InspireParams::secure_128_d2048(),
+        &InspireParams::d2048(),
         shard,
         &rows,
         PATH10_RECORD_BYTES,
@@ -258,7 +258,7 @@ async fn a_data_dir_built_under_other_parameters_is_refused() {
     let root = tempfile::tempdir().expect("tempdir");
     stop(boot(vec![block(root.path(), LIST, 0)]).expect("boot")).await;
 
-    let mut other = InspireParams::secure_128_d2048();
+    let mut other = InspireParams::d2048();
     other.sigma += 0.5;
     let error = bootstrap_railgun_engine_multi_with_session_limits(
         vec![block(root.path(), LIST, 0)],

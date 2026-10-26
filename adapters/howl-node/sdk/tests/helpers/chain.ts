@@ -125,13 +125,13 @@ export class LocalChain {
    */
   async startNode(
     binary: string,
-    options: { ttlSecs?: number; paramSet?: number; port?: number } = {},
+    options: { ttlSecs?: number; paramSet?: number; port?: number; data?: string } = {},
   ): Promise<string> {
     const port = options.port ?? (await freePort());
     const url = `http://127.0.0.1:${port}`;
     if (this.nodeUrl === "") this.nodeUrl = url;
     const args = [
-      "--data-dir", join(this.#dir, `data-${port}`),
+      "--data-dir", join(this.#dir, `data-${port}${options.data ?? ""}`),
       "--chain-id", String(fixture.chain_id),
       "--pool", fixture.pool,
       "--deployment-block", String(this.deploymentBlock),
@@ -150,8 +150,11 @@ export class LocalChain {
     return url;
   }
 
-  /** Stop the node at `url` and start it again on the same port and data, with `options`. */
-  async restartNode(url: string, binary: string, options: { paramSet?: number } = {}): Promise<void> {
+  /**
+   * Stop the node at `url` and start it again on the same port with `options`: on the same data,
+   * or with `data` on another directory, as a node re-seeded from the chain.
+   */
+  async restartNode(url: string, binary: string, options: { paramSet?: number; data?: string } = {}): Promise<void> {
     const node = this.#byUrl.get(url);
     if (node === undefined) throw new Error(`no node at ${url}`);
     if (node.exitCode === null) {

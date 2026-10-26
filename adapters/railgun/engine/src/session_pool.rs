@@ -347,7 +347,7 @@ mod tests {
         PackParams,
         raven_inspire::math::NttContext,
     ) {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let database = vec![0u8; params.ring_dim * 32];
         let mut sampler = GaussianSampler::with_seed(params.sigma, 118);
         let (crs, _encoded, secret_key) =

@@ -27,7 +27,7 @@ fn row_bytes(row: usize) -> [u8; ENTRY_BYTES] {
 }
 
 fn production_cell() -> (InspireParams, InspireServerState, Vec<u8>) {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db: Vec<u8> = (0..CELL_ROWS).flat_map(row_bytes).collect();
     let (state, _sk) = setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking)
         .expect("setup_state at production cell");

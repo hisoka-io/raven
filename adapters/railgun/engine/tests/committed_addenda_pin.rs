@@ -17,7 +17,7 @@ use raven_railgun_persistence::WalEntryPayload;
 
 /// Any encoded database will do for the store-level property; identity is what is compared.
 fn some_encoded_db() -> std::sync::Arc<raven_inspire::EncodedDatabase> {
-    let params = raven_inspire::params::InspireParams::secure_128_d2048();
+    let params = raven_inspire::params::InspireParams::d2048();
     let db = raven_railgun_testkit::toy_db(raven_railgun_testkit::TOY_ENTRIES, 32);
     let (state, _sk) = raven_railgun_engine::inspire::setup_state(
         &params,

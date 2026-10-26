@@ -163,7 +163,7 @@ fn multi_instance_bottleneck_probe() {
         rayon::current_num_threads()
     );
 
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
 
     let setup_start = Instant::now();
     let instances: Vec<ReadyInstance> = (0..NUM_INSTANCES)

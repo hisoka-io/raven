@@ -85,7 +85,7 @@ fn bootstrap_engine_rejects_two_instances_with_identical_data_source_AND_encoder
         )
     };
     let configs = vec![block("ppoi-block-a", "a"), block("ppoi-block-b", "b")];
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let res = bootstrap_railgun_engine_multi(configs, params, build_toy_state);
     let err = res.expect_err("expected dedup rejection");
     match err {
@@ -128,7 +128,7 @@ async fn a_row_reaches_every_route_bound_to_its_block() {
             block,
         ),
     ];
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let mut handle =
         bootstrap_railgun_engine_multi(cfgs, params, build_toy_state).expect("bootstrap");
 

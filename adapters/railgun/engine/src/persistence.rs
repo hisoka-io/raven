@@ -2813,7 +2813,7 @@ mod tests {
             Arc::clone(&persistence),
             Arc::clone(&logical_store),
             Arc::clone(&metrics),
-            InspireParams::secure_128_d2048(),
+            InspireParams::d2048(),
             test_encoder(),
             rx,
             None,
@@ -2885,7 +2885,7 @@ mod tests {
             Arc::clone(&persistence),
             Arc::new(parking_lot::Mutex::new(store)),
             Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default())),
-            InspireParams::secure_128_d2048(),
+            InspireParams::d2048(),
             test_encoder(),
             rx,
             None,
@@ -2978,7 +2978,7 @@ mod tests {
             Arc::clone(&persistence),
             Arc::clone(&logical_store),
             Arc::clone(&metrics),
-            InspireParams::secure_128_d2048(),
+            InspireParams::d2048(),
             test_encoder(),
             rx,
             None,
@@ -3469,7 +3469,7 @@ mod tests {
     // the worse trade. The DB formula is shared - that is the part that was actually duplicated -
     // and the four-line wrapper stays local.
     fn build_toy_state_with_entry_size(entry_size: usize) -> Result<InspireServerState> {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let db = raven_railgun_testkit::toy_db(raven_railgun_testkit::TOY_ENTRIES, entry_size);
         let (state, _sk) = super::super::inspire::setup_state(
             &params,
@@ -3495,7 +3495,7 @@ mod tests {
             query_gadget_len: 3,
             packing_gadget_len: 3,
             approximate_packing_gadget: false,
-            security_level: raven_inspire::params::SecurityLevel::Bits128,
+            params_label: raven_inspire::params::ParamsLabel::Primary,
         }
     }
 
@@ -4344,7 +4344,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = StoreLayout::open(dir.path()).expect("layout");
         let state = build_toy_state().expect("state");
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let encoder = test_encoder();
         let opened = InspirePersistence::open(
             layout,
@@ -5528,7 +5528,7 @@ mod tests {
     fn list_block_fixture(policy: SnapshotPolicy) -> UnsatShardFixtures {
         use crate::pir_table::list::PATH10_RECORD_BYTES;
         let dir = tempfile::tempdir().expect("tempdir");
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let encoder = crate::pir_table::EncoderKind::PerListPath10 { list_key: LIST }
             .build(PATH10_RECORD_BYTES, 2048)
             .expect("encoder");

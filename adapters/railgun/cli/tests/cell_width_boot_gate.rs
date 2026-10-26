@@ -10,7 +10,7 @@ use std::path::Path;
 use raven_railgun_cli::serve_production_multi::{load_options_from_toml, run_with_listener};
 
 const NOTE_RECORD_BYTES: usize = 328;
-/// `InspireParams::secure_128_d2048().ring_dim`, the only legal rows-per-shard.
+/// `InspireParams::d2048().ring_dim`, the only legal rows-per-shard.
 const ROWS_PER_SHARD: u32 = 2048;
 const LIST_KEY_HEX: &str = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88";
 

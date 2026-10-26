@@ -27,6 +27,7 @@ use howl_wire::{
     ROWS_PER_SHARD,
 };
 use tokio::sync::Semaphore;
+use tokio::task::JoinError;
 
 use crate::engine::{Engine, Pir, Refusal, View};
 
@@ -39,7 +40,7 @@ pub struct Served {
     engine: Arc<Engine>,
     // Each batch occupies a blocking thread and the cores its responds use; beyond this many
     // a caller waits.
-    respond_permits: Semaphore,
+    respond_permits: Arc<Semaphore>,
 }
 
 impl Served {
@@ -48,7 +49,7 @@ impl Served {
     pub fn new(engine: Arc<Engine>, concurrent: usize) -> Arc<Self> {
         Arc::new(Self {
             engine,
-            respond_permits: Semaphore::new(concurrent.max(1)),
+            respond_permits: Arc::new(Semaphore::new(concurrent.max(1))),
         })
     }
 }
@@ -84,6 +85,23 @@ fn number(query: &HashMap<String, String>, key: &str) -> Result<u64, Bad> {
             .parse()
             .map_err(|_| (StatusCode::BAD_REQUEST, format!("{key} is not a number"))),
     }
+}
+
+/// `work` on a blocking thread under one of `permits`; `None` once they are closed. The permit
+/// goes with the work, so a caller that disconnects frees it only when the work is done: the
+/// work in flight stays bounded by the permits whatever the callers do.
+async fn gated<T: Send + 'static>(
+    permits: &Arc<Semaphore>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<Result<T, JoinError>> {
+    let permit = Arc::clone(permits).acquire_owned().await.ok()?;
+    Some(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        })
+        .await,
+    )
 }
 
 /// The router over `served`.
@@ -215,11 +233,11 @@ async fn session(State(served): State<Arc<Served>>, body: Bytes) -> Response {
         Ok(keys) => keys,
         Err(bad) => return bad.into_response(),
     };
-    let Ok(_permit) = served.respond_permits.acquire().await else {
+    let engine = Arc::clone(&served.engine);
+    let Some(seated) = gated(&served.respond_permits, move || engine.pir().register(keys)).await
+    else {
         return refuse(StatusCode::SERVICE_UNAVAILABLE, "shutting down");
     };
-    let engine = Arc::clone(&served.engine);
-    let seated = tokio::task::spawn_blocking(move || engine.pir().register(keys)).await;
     let view = served.engine.view();
     match seated {
         Ok(Ok(handle)) => answer(
@@ -256,14 +274,17 @@ async fn notes(State(served): State<Arc<Served>>, body: Bytes) -> Response {
         Ok(batch) => batch,
         Err(bad) => return bad.into_response(),
     };
-    let Ok(_permit) = served.respond_permits.acquire().await else {
-        return refuse(StatusCode::SERVICE_UNAVAILABLE, "shutting down");
-    };
     // One view for the whole batch, so every response is read from one table.
     let view = served.engine.view();
     let engine = Arc::clone(&served.engine);
     let read = Arc::clone(&view);
-    let answered = tokio::task::spawn_blocking(move || engine.pir().respond(&read, &batch)).await;
+    let Some(answered) = gated(&served.respond_permits, move || {
+        engine.pir().respond(&read, &batch)
+    })
+    .await
+    else {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, "shutting down");
+    };
     match answered {
         Ok(Ok(responses)) => answer(&view, Body::Notes(Notes { responses })),
         Ok(Err(refusal)) => refusal_response(&view, &refusal),
@@ -284,4 +305,54 @@ async fn health(State(served): State<Arc<Served>>) -> Response {
         served.engine.pir().session_count()
     )
     .into_response()
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use tokio::sync::Semaphore;
+
+    use super::gated;
+
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        let start = Instant::now();
+        while !done() {
+            assert!(start.elapsed() < Duration::from_secs(10), "{what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_caller_keeps_its_permit_until_the_work_ends() {
+        let permits = Arc::new(Semaphore::new(1));
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let started = Arc::new(AtomicBool::new(false));
+        let caller = {
+            let permits = Arc::clone(&permits);
+            let started = Arc::clone(&started);
+            tokio::spawn(async move {
+                gated(&permits, move || {
+                    started.store(true, Ordering::SeqCst);
+                    wait.recv()
+                })
+                .await
+            })
+        };
+        // Wait for the work itself: a caller dropped before the task is spawned frees its permit.
+        until("the work never started", || started.load(Ordering::SeqCst)).await;
+        // The caller goes away, as when a client disconnects mid-batch.
+        caller.abort();
+        assert!(caller.await.expect_err("aborted").is_cancelled());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(permits.available_permits(), 0, "freed while its work runs");
+        release.send(()).expect("work waits");
+        until("never freed after the work", || {
+            permits.available_permits() == 1
+        })
+        .await;
+    }
 }

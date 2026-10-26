@@ -277,7 +277,7 @@ async fn metrics_handler_emits_per_instance_engine_gauges() {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let params = raven_inspire::params::InspireParams::secure_128_d2048();
+        let params = raven_inspire::params::InspireParams::d2048();
         let db: Vec<u8> = vec![0u8; 2048 * 32];
         let (state, _sk) = setup_state(
             &params,

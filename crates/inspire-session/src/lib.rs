@@ -1245,7 +1245,7 @@ mod tests {
         PackParams,
         raven_inspire::math::NttContext,
     ) {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let mut sampler = GaussianSampler::with_seed(params.sigma, seed);
         let secret_key = RlweSecretKey::generate(&params, &mut sampler);
         let pack_params = PackParams::try_new(&params, gamma).expect("pack params");
@@ -1506,7 +1506,7 @@ mod tests {
 
     #[test]
     fn zero_cap_refuses_registration_before_allocating_or_mutating() {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let database = vec![0u8; params.ring_dim * 32];
         let mut sampler = GaussianSampler::with_seed(params.sigma, 91);
         let (crs, _server_key, secret_key) =
@@ -1651,7 +1651,7 @@ mod tests {
 
     #[test]
     fn refused_client_registration_at_capacity_preserves_the_live_session() {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let database = vec![0u8; params.ring_dim * 32];
         let mut sampler = GaussianSampler::with_seed(params.sigma, 119);
         let (crs, _encoded, secret_key) =
@@ -1824,7 +1824,7 @@ mod tests {
     // A seat's size is what the session ceiling budgets, at every packing width.
     #[test]
     fn a_seat_holds_one_polynomial_per_key_row_at_every_width() {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let rows = params.packing_key_rows();
         assert_eq!(rows, 3);
         for gamma in [16, 128, 256] {
@@ -1865,7 +1865,7 @@ mod tests {
 
     #[test]
     fn an_in_process_registration_leaves_room_for_a_wire_registration_in_flight() {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let database = vec![0u8; params.ring_dim * 32];
         let mut sampler = GaussianSampler::with_seed(params.sigma, 123);
         let (crs, _encoded, secret_key) =
@@ -1906,7 +1906,7 @@ mod tests {
 
     #[test]
     fn an_in_process_registration_is_refused_while_wire_registrations_hold_every_seat() {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let database = vec![0u8; params.ring_dim * 32];
         let mut sampler = GaussianSampler::with_seed(params.sigma, 123);
         let (crs, _encoded, secret_key) =

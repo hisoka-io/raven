@@ -119,7 +119,7 @@ fn payload_for(cell: &Cell, idx: u32) -> WalEntryPayload {
 }
 
 fn run_one_seed(cell: &Cell, preload_to: u32) -> Duration {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = build_synthetic_db(cell.entries, cell.entry_bytes);
     let (state, _secret_key) =
         setup_state(&params, &db, cell.entry_bytes, InspireVariant::TwoPacking)
