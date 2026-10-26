@@ -788,17 +788,19 @@ async fn set_2_sizes_on_the_wire_and_one_key_per_client() {
         fixture_node_set(dir.path(), howl_wire::PARAM_SET_D2048_CELL256_P16).await;
     let mut reader = client(&node).await;
     let key = reader.session_body_rust().to_vec();
-    assert_eq!(key.len(), 4 + 15_362);
-    assert_eq!(key[4..6], [0, 1], "the key names key-mask version 1");
+    assert_eq!(key.len(), 4 + 15_394);
+    assert_eq!(key[4..6], [0, 2], "the key names key-mask version 2");
     assert_eq!(
         key,
         reader.session_body_rust(),
         "a retry resends the same bytes"
     );
+    let other = client(&node).await.session_body_rust().to_vec();
+    assert_ne!(key, other, "a new client draws a new secret");
     assert_ne!(
-        key,
-        client(&node).await.session_body_rust(),
-        "a new client draws a new secret"
+        key[6..38],
+        other[6..38],
+        "a new client draws a new key-mask seed"
     );
     register(&node, &mut reader).await;
     let mut sizes = Vec::new();
@@ -839,7 +841,7 @@ async fn set_2_sizes_on_the_wire_and_one_key_per_client() {
             (
                 s,
                 15 + 7_460 * s,
-                4 + 1 + 15_362 + 2 + 7_460 * s,
+                4 + 1 + 15_394 + 2 + 7_460 * s,
                 56 + 2 + (4 + 9_208) * s,
             )
         })
@@ -963,14 +965,15 @@ async fn a_client_reads_under_the_set_its_node_names_and_no_other() {
         }
         answer.encode()
     };
-    assert!(HowlClient::from_params(&with_crs(vec![0, 1])).is_ok());
+    assert!(HowlClient::from_params(&with_crs(vec![0, 2])).is_ok());
     for crs in [vec![], vec![1], vec![0, 0], vec![0, 1, 0]] {
         assert!(
             HowlClient::from_params(&with_crs(crs.clone())).is_err(),
             "{crs:?}"
         );
     }
-    for crs in [vec![0, 2], vec![1, 0]] {
+    // Version 1, the mask every key shared, is refused like any version this client does not build.
+    for crs in [vec![0, 1], vec![0, 3], vec![1, 0]] {
         let refused = HowlClient::from_params(&with_crs(crs.clone()))
             .err()
             .unwrap_or_else(|| panic!("{crs:?} accepted"));

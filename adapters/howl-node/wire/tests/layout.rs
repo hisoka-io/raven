@@ -281,7 +281,7 @@ fn parameter_set_2_sizes() {
             P16_RESPONSE_BYTES,
             RECORD_BYTES
         ),
-        (15_362, 7_456, 9_208, 246)
+        (15_394, 7_456, 9_208, 246)
     );
 }
 
@@ -297,16 +297,16 @@ fn a_set_2_params_answer_names_its_key_mask_version() {
             crs,
         }))
     };
-    let served = params(p16_crs(1)).encode();
+    let served = params(p16_crs(2)).encode();
     let mut want = header(1);
     want[3] = 2;
     want.extend_from_slice(&[0, 0, 1, 0, 0, 0, 8, 0, 0, 16, 0, 0, 0x0e, 0x10]);
-    want.extend_from_slice(&[0, 0, 0, 2, 0, 1]);
+    want.extend_from_slice(&[0, 0, 0, 2, 0, 2]);
     assert_eq!(served, want);
     let Body::Params(got) = Answer::decode(&served).expect("decodes").body else {
         panic!("params");
     };
-    assert_eq!(p16_key_mask_version(&got.crs), Ok(1));
+    assert_eq!(p16_key_mask_version(&got.crs), Ok(2));
     assert_eq!(P16_CRS_BYTES, 2);
     assert_eq!(p16_crs(0x0102), [1, 2]);
 

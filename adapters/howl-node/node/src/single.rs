@@ -1,7 +1,8 @@
 //! Parameter set 2: a one-row packing key per session, 32-bit kernels, one record per query.
 //!
 //! A shard's table keeps the cells it was folded from, so a response is always computed from
-//! the cells its table was built from. A seat is the client's key in transform form, 16 KiB.
+//! the cells its table was built from. A seat is the client's key and the mask its seed expands
+//! to, in transform form, 32 KiB.
 //! Queries run on one fixed pool shared by every batch in flight, so the threads computing
 //! responses never exceed its size however many batches arrive at once.
 

@@ -27,16 +27,16 @@ pub const PARAM_SET_D2048_CELL256: u16 = 1;
 
 /// Parameter set of the private reads: ring dimension 2,048, a 29-bit prime, plaintext
 /// modulus 16, a one-row packing key at about 2^60, 256-byte cells of which a response
-/// returns the first [`RECORD_BYTES`]. Its key, query and response bytes are fixed widths and
-/// its public key mask is fixed in code up to a version, so its params answer carries only that
-/// version ([`p16_crs`]).
+/// returns the first [`RECORD_BYTES`]. Its key, query and response bytes are fixed widths, and
+/// each key carries the seed of its own public mask, so its params answer carries only the
+/// key-mask version ([`p16_crs`]).
 pub const PARAM_SET_D2048_CELL256_P16: u16 = 2;
 
 /// Leading bytes of a cell a set-2 response returns; the rest of a served cell is zero.
 pub const RECORD_BYTES: usize = 246;
 
-/// Bytes of a set-2 packing key, the first two of them its key-mask version.
-pub const P16_KEY_BYTES: usize = 15_362;
+/// Bytes of a set-2 packing key: its key-mask version (2 bytes), its mask seed (32), then the key.
+pub const P16_KEY_BYTES: usize = 15_394;
 
 /// Bytes of a set-2 params answer's `crs`: the key-mask version the node seats keys under.
 pub const P16_CRS_BYTES: usize = 2;

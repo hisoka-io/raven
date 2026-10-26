@@ -237,7 +237,7 @@ fn shard_0(fixture: &Fixture) -> Vec<u8> {
 }
 
 // An inline read of leaf 5 by the client of seed [9; 32]; equal above to the library's own bytes.
-const PINNED_SET_2_NOTES: &str = "03c77a2a4959e3c6d22d9441e20244882d9d8d3e1b7130aecc06d5b142594869";
+const PINNED_SET_2_NOTES: &str = "d00d84c254cad0ecf4b87583573fe7778d865c8d37752e20710b0010cd80e2e2";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn set_2_answers_the_same_routes_under_its_own_id_and_reads_byte_exact() {
@@ -274,16 +274,16 @@ async fn set_2_answers_the_same_routes_under_its_own_id_and_reads_byte_exact() {
             p.session_ttl_secs,
             p.crs.as_slice()
         ),
-        (256, 2_048, 16, 3_600, &[0u8, 1][..])
+        (256, 2_048, 16, 3_600, &[0u8, 2][..])
     );
     // Written out by hand: version 1, set 2, route 1, the fixture's state after block 259, then
-    // 256-byte cells, 2,048 rows, cap 16, an hour, key-mask version 1.
+    // 256-byte cells, 2,048 rows, cap 16, an hour, key-mask version 2.
     let mut by_hand = vec![0, 1, 0, 2, 1, 0, 0, 0];
     by_hand.extend_from_slice(&fixture.leaf_count.to_be_bytes());
     by_hand.extend_from_slice(&259u64.to_be_bytes());
     by_hand.extend_from_slice(&fixture.root);
     by_hand.extend_from_slice(&[
-        0, 0, 1, 0, 0, 0, 8, 0, 0, 16, 0, 0, 0x0e, 0x10, 0, 0, 0, 2, 0, 1,
+        0, 0, 1, 0, 0, 0, 8, 0, 0, 16, 0, 0, 0x0e, 0x10, 0, 0, 0, 2, 0, 2,
     ]);
     assert_eq!(params, by_hand);
 
@@ -344,8 +344,8 @@ async fn set_2_answers_the_same_routes_under_its_own_id_and_reads_byte_exact() {
             answer.len()
         ),
         (
-            4 + 15_362,
-            4 + 1 + 15_362 + 2 + 4 + 7_456,
+            4 + 15_394,
+            4 + 1 + 15_394 + 2 + 4 + 7_456,
             9_208,
             HEADER_BYTES + 2 + 4 + 9_208
         )
@@ -397,25 +397,46 @@ async fn set_2_refusals() {
     let (status, text) = set_2.post("/howl/v1/session", set_1_prefix).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(String::from_utf8_lossy(&text).contains("parameter set 1 is not the 2"));
-    // A key one byte short, one under another key-mask version, and one whose first coefficient
-    // is not a residue.
+    // A key one byte short; one of the shared-mask form (version 1, no seed); the same key
+    // relabelled version 1 or 3; and one whose first coefficient is not a residue.
     let (status, _) = set_2
         .post("/howl/v1/session", set_2_request(&key[1..]))
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    let mut other_mask = key.clone();
-    other_mask[..2].copy_from_slice(&[0, 2]);
-    let (status, text) = set_2
-        .post("/howl/v1/session", set_2_request(&other_mask))
+    let shared_form = [&[0u8, 1][..], &key[34..]].concat();
+    assert_eq!(shared_form.len(), 15_362);
+    let (status, _) = set_2
+        .post("/howl/v1/session", set_2_request(&shared_form))
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(
-        String::from_utf8_lossy(&text).contains("key-mask version 2"),
-        "{}",
-        String::from_utf8_lossy(&text)
-    );
+    for version in [1u8, 3] {
+        let mut relabelled = key.clone();
+        relabelled[..2].copy_from_slice(&[0, version]);
+        // An upload is refused as a bad body; an inline key as a batch the node cannot serve.
+        for (route, body, want) in [
+            (
+                "/howl/v1/session",
+                set_2_request(&relabelled),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/howl/v1/notes",
+                batch(KeySource::Inline(relabelled.clone()), &[0], &mut query),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+        ] {
+            let (status, text) = set_2.post(route, body).await;
+            assert_eq!(status, want, "{route}");
+            assert!(
+                String::from_utf8_lossy(&text).contains(&format!("key-mask version {version}")),
+                "{route}: {}",
+                String::from_utf8_lossy(&text)
+            );
+        }
+    }
+    // Bytes 2..34 are the mask seed, which any value fills; the first coefficient follows.
     let mut not_residue = key.clone();
-    not_residue[2..6].copy_from_slice(&[0xff, 0xff, 0xff, 0x1f]);
+    not_residue[34..38].copy_from_slice(&[0xff, 0xff, 0xff, 0x1f]);
     let (status, _) = set_2
         .post("/howl/v1/session", set_2_request(&not_residue))
         .await;

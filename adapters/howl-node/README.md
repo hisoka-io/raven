@@ -71,11 +71,11 @@ plain routes are the same bytes under either set apart from that id.
 | | Set 1 | Set 2 |
 |---|---|---|
 | Scheme | ring 2,048, a 60-bit modulus, plaintext modulus 65,537, responses switched to 36 bits | ring 2,048, a 29-bit prime, plaintext modulus 16, a one-row packing key at about 2^60 |
-| Key material in the params answer | the node's, versioned | the key-mask version, 2 B; the mask itself is fixed in code |
-| Session payload | the serialized key, 46,252 B | the key, 15,362 B: its key-mask version, then the key |
+| Key material in the params answer | the node's, versioned | the key-mask version, 2 B; each key carries its own mask seed |
+| Session payload | the serialized key, 46,252 B | the key, 15,394 B: its key-mask version, its 32-byte mask seed, then the key |
 | Batch payload | the serialized batch | `howl_wire::P16Batch`: the key's source, then 7,456 B per query |
 | Response per query | 9,870 B | 9,208 B, the first 246 bytes of the cell; the rest of a cell is zero |
-| Seat per session | 48 KiB | 16 KiB |
+| Seat per session | 48 KiB | 32 KiB: the key and its mask |
 
 
 | Route | Answer body |
