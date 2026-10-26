@@ -41,7 +41,6 @@ export interface Health {
   leaves: number;
   block: number;
   shards: number;
-  sessions: number;
 }
 
 export class LocalChain {
@@ -125,7 +124,7 @@ export class LocalChain {
    */
   async startNode(
     binary: string,
-    options: { ttlSecs?: number; paramSet?: number; port?: number; data?: string } = {},
+    options: { ttlSecs?: number; paramSet?: number; port?: number; data?: string; maxSessions?: number } = {},
   ): Promise<string> {
     const port = options.port ?? (await freePort());
     const url = `http://127.0.0.1:${port}`;
@@ -140,6 +139,7 @@ export class LocalChain {
       "--max-range", "10",
       ...(options.ttlSecs === undefined ? [] : ["--session-ttl-secs", String(options.ttlSecs)]),
       ...(options.paramSet === undefined ? [] : ["--param-set", String(options.paramSet)]),
+      ...(options.maxSessions === undefined ? [] : ["--max-sessions", String(options.maxSessions)]),
     ];
     const node = spawn(binary, args, {
       env: { ...process.env, HOWL_NODE_RPC_URL: this.rpcUrl, RUST_LOG: "warn" },
@@ -180,7 +180,6 @@ export class LocalChain {
         leaves: Number(fields.leaves),
         block: Number(fields.block),
         shards: Number(fields.shards),
-        sessions: Number(fields.sessions),
       };
     } catch {
       return null;

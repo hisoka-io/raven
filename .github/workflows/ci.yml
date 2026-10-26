@@ -1017,6 +1017,11 @@ jobs:
         run: cargo test --manifest-path adapters/howl-node/Cargo.toml --all-targets --locked
       - name: cargo test --doc
         run: cargo test --manifest-path adapters/howl-node/Cargo.toml --doc --locked
+      # The image's entrypoint, run without the image: rendered arguments and refusals.
+      - name: image entrypoint checks
+        run: adapters/howl-node/deploy/check-entrypoint.sh
+      - name: image entrypoint checks red-proof
+        run: adapters/howl-node/deploy/check-entrypoint.sh --red-proof
 
   howl-client:
     # The wallet's side: the wasm client against a node driven in-process, then the TypeScript
@@ -1055,9 +1060,12 @@ jobs:
         run: cargo test --manifest-path adapters/howl-node/client-wasm/Cargo.toml --locked
       - name: install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-      - name: build wasm-pack pkg-node
-        working-directory: adapters/howl-node/client-wasm
-        run: wasm-pack build --release --target nodejs --scope hisoka-io --out-dir pkg-node --out-name howl_client_wasm
+      # Builds pkg-node, which the TypeScript suite links, and pkg-bundler, and holds both to the
+      # gzipped ceiling in the script.
+      - name: build wasm-pack pkg-node + pkg-bundler + size gate
+        run: adapters/howl-node/client-wasm/scripts/check-wasm-size.sh
+      - name: wasm size gate red-proof
+        run: adapters/howl-node/client-wasm/scripts/check-wasm-size-selftest.sh
       - name: build the node binary
         run: cargo build --release --manifest-path adapters/howl-node/Cargo.toml -p howl-node --locked
       - name: pnpm install

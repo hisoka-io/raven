@@ -69,8 +69,9 @@ A key is built under a secret drawn inside the wasm when a client is created, an
 one the caller supplies. The client reads under the parameter set the node's params answer
 names, and refuses answers to its own requests from a node of another set. In `session` mode
 the source uploads one key per session and opens a new session, under a new secret, when the
-node reports the old one expired. In `inline` mode every request carries a key built for it
-alone.
+node reports the old one expired. When the node has no seat free, the read carries its key inline
+instead, and the source asks for a seat again a minute later. In `inline` mode every request
+carries a key built for it alone.
 
 When a private read is refused, or its answer does not open, the source reads the node's params
 again once. If the node now serves other material (it restarted under the other parameter set,

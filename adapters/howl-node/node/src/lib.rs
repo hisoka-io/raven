@@ -10,6 +10,7 @@ pub mod chain;
 pub mod engine;
 pub mod follow;
 pub mod http;
+pub mod limit;
 mod single;
 
 use std::path::PathBuf;

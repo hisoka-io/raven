@@ -39,7 +39,7 @@ Optional flags: `--poll-ms` (2,000), `--max-range` (most blocks one log read ask
 (2,048), `--session-ttl-secs` (3,600; a session's lifetime restarts with each use), `--concurrent`
 (batches answered at once), `--respond-threads` (threads computing set-2 responses, shared by every
 batch; the cores), `--walk-blocks` (64, at least 1, below), `--param-set` (1 or 2, below; 1 by
-default).
+default). The bounds of a public node are under [Serving in public](#serving-in-public).
 
 A log read starts at one block and doubles while it holds less than half of one table batch. When the
 endpoint refuses a read (a block-range or result cap, a timeout) or its answer passes 192 MiB, the
@@ -87,7 +87,61 @@ plain routes are the same bytes under either set apart from that id.
 | `GET /howl/v1/sync?since=N&upper=K&held=H` | the three reads above for the newest block, at one leaf count; the newest block's leaves start at leaf `H` when it falls inside that block (`held` is optional, 0 by default) |
 | `POST /howl/v1/session` | a session handle for an uploaded packing key |
 | `POST /howl/v1/notes` | one response per query of a batch |
-| `GET /howl/v1/health` | plain text: leaves, block, shards, sessions |
+| `GET /howl/v1/health` | plain text: leaves, block, shards |
+| `GET /howl/v1/status` | plain text for the operator, under a bearer token: seats, queue, refusals |
 
 A read that names a position past the node's state is answered `409` with a header-only answer that
 states where the node stands.
+
+## Serving in public
+
+Every read route answers any caller: the feed is public, and a private read needs no account. The
+one credential is the operator's: `GET /howl/v1/status` reports seats in use, the respond queue and
+the refusals of each bound, and opens only to `Authorization: Bearer <token>` with the token set in
+`HOWL_NODE_OPERATOR_TOKEN` (16 bytes at least, compared in constant time). Generate it at random,
+e.g. `openssl rand -hex 32`: its length is all the node checks. Unset, the route answers `401` to
+everyone. The public health answer carries only what every answer's header carries.
+
+Wallets reach a node through shared exits, so the bounds are on the node's work, never on a
+caller's address:
+
+| Flag | Default | Bounds |
+|---|---|---|
+| `--rate`, `--rate-burst` | 5,000 / s, 10,000 | requests on each route but health, status and session, all callers together, each route with a bucket of its own; past it `429` on that route only |
+| `--session-rate`, `--session-burst` | 4 / s, 64 | sessions opened, so seats cannot be filled faster; past it `429` |
+| `--queued` | 8 per `--concurrent` | batches and registrations waiting for a permit; past it `503` at once |
+| `--permit-wait-ms` | 20,000 | how long one waits for a permit before `503` |
+| `--bodies` | twice the permits and queue places | session and batch bodies being read or answered; a body takes its place before its first byte is read; past it `503` at once |
+| `--body-timeout-ms` | 30,000 | how long one body may take to arrive before `408` |
+| `--max-sessions` | 2,048 | seats; a full table answers a new session `503`, and the TypeScript client then reads with the key inline, which needs no seat |
+
+`429` and `503` carry `Retry-After`, which browsers may read, and close the connection. A session or
+batch body past its route's size is refused with `413` and never decoded. Measured on two cores
+over a local socket, each read route answered about 64,000 requests a second and a two-query
+private read about 87 a second; the request rate sits well below the first, and the permits bound
+the second. These bounds hold the node's memory and CPU whatever reaches it; telling a flood from
+wallets belongs to the proxy or filter in front of a public node.
+
+## Container
+
+`deploy/Dockerfile` builds the node from the repository root, with the `adapters/howl` submodule
+checked out:
+
+```sh
+docker build -f adapters/howl-node/deploy/Dockerfile -t howl-node .
+docker run -v howl-data:/data -p 8645:8645 \
+  -e HOWL_NODE_RPC_URL=<json-rpc endpoint> -e HOWL_CHAIN_ID=<chain id> \
+  -e HOWL_POOL=<pool address> -e HOWL_DEPLOYMENT_BLOCK=<block> howl-node
+```
+
+The node runs as an unprivileged user under `tini`, keeps its table and key material in the `/data`
+volume (or `HOWL_DATA_DIR`, or a platform's `RAILWAY_VOLUME_MOUNT_PATH`), binds `0.0.0.0:$PORT`
+(8645), and stops cleanly on `SIGTERM`. The image's health check reads `/howl/v1/health`.
+`HOWL_PARAM_SET` picks the set, `HOWL_NODE_OPERATOR_TOKEN` opens the status route, and arguments
+after the image name are passed to the node, so `--max-sessions 512` or any flag above can be added
+there; the address, data directory and pool come only from the variables, so the health check
+always probes the port the node binds. `deploy/entrypoint.sh` lists every variable.
+
+The endpoint must accept a block hash as the block of `eth_call` (EIP-1898). It may be pruned: it
+needs the full log history from the deployment block, and the state of the blocks within the walk
+depth of the head.

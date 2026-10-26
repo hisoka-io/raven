@@ -375,9 +375,15 @@ impl Pir {
     /// Seconds a session lives after its last use.
     #[must_use]
     pub fn session_ttl(&self) -> Duration {
+        self.session_limits().ttl
+    }
+
+    /// Seats and session lifetime.
+    #[must_use]
+    pub fn session_limits(&self) -> SessionStoreLimits {
         match &self.scheme {
-            Scheme::Gadget(g) => g.sessions.limits().ttl,
-            Scheme::Single(s) => s.limits().ttl,
+            Scheme::Gadget(g) => g.sessions.limits(),
+            Scheme::Single(s) => s.limits(),
         }
     }
 

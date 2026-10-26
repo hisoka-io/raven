@@ -326,6 +326,27 @@ describe.skipIf(!live)("against a running node", () => {
     expect(spy.plans[1]!.targets.length).toBe(4);
   });
 
+  it("a node with every seat taken still answers a session wallet's reads, with the key inline", async () => {
+    const url = await chain.startNode(BIN, { maxSessions: 1 });
+    await chain.caughtUp(chain.leafCount, url);
+    const holder = new RavenHowlSource({ transport: recorded(url), wasm, field: bigintField });
+    expect((await holder.fetchNotes([1]))[0]!.leafIndex).toBe(1);
+    const transport = recorded(url);
+    const src = new RavenHowlSource({ transport, wasm, field: bigintField });
+    const records = await src.fetchNotes([2, 3]);
+    expect(records.map((r) => r.leafIndex)).toEqual([2, 3]);
+    records.forEach(expectFixtureCell);
+    expectFixtureCell((await src.fetchNotes([4]))[0]!);
+    // One refused seat, then each read inline, without asking for a seat again at once.
+    expect(transport.paths.filter((p) => p.startsWith("POST"))).toEqual([
+      "POST /howl/v1/session",
+      "POST /howl/v1/notes",
+      "POST /howl/v1/notes",
+    ]);
+    holder.close();
+    src.close();
+  });
+
   it("a read the node refused with 410 at will is sent again with the same rows and slots", async () => {
     const inner = recorded(chain.nodeUrl);
     let refused = 0;

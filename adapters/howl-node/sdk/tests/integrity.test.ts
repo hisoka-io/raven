@@ -123,3 +123,25 @@ describe.skipIf(!live)("wallet-side integrity against a running node", () => {
     expect(older.root).not.toBe(newest.root);
   });
 });
+
+describe("refusals a wallet may retry", () => {
+  it("a node over its rate (429) is Busy and retryable, like a full queue (503); a 400 is not", async () => {
+    const refusing = (status: number): HowlTransport => {
+      const ex = async () => ({ status, body: new Uint8Array() });
+      return { get: ex, post: ex };
+    };
+    const kindOf = async (status: number): Promise<[string, boolean, number | undefined]> => {
+      const src = new RavenHowlSource({ transport: refusing(status), wasm, field: bigintField });
+      const e = await src.fetchTagPrefixes(0).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(e).toBeInstanceOf(HowlError);
+      const err = e as HowlError;
+      return [err.kind, err.retryable, err.status];
+    };
+    expect(await kindOf(429)).toEqual(["Busy", true, 429]);
+    expect(await kindOf(503)).toEqual(["Busy", true, 503]);
+    expect(await kindOf(400)).toEqual(["Refused", false, 400]);
+  });
+});

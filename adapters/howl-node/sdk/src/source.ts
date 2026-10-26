@@ -10,11 +10,15 @@ const NODE_BYTES = 32;
 const TREE_DEPTH = 32;
 // A node that keeps disagreeing with what the client verified is refused rather than followed.
 const MAX_REWINDS_PER_SYNC = 8;
+// After a node had no seat to give, reads carry their key inline this long before a seat is asked
+// for again, so a key is not uploaded twice per read while the seats stay full.
+const SEAT_RETRY_MS = 60_000;
 
 /**
  * How private reads carry the packing key.
  * - `session`: uploaded once per session, then batches go by handle (the smallest bytes per
- *   sync). An expired session is replaced by a new one under a new secret.
+ *   sync). An expired session is replaced by a new one under a new secret. When the node has no
+ *   seat free, the read carries its key inline instead, and a seat is asked for again later.
  * - `inline`: every request carries a key built for it alone, under a fresh secret; the node
  *   keeps nothing between requests.
  */
@@ -179,6 +183,7 @@ export class RavenHowlSource<F> {
   #state: { leafCount: number; block: number; root: Uint8Array };
   #params: Uint8Array | null = null;
   #session: HowlClientHandle | null = null;
+  #noSeatUntil = 0;
   readonly #occurrences = new Map<string, number[]>();
   // Cells already opened, by position: a cell never changes unless a rewind drops its row.
   readonly #cells = new Map<number, Uint8Array>();
@@ -277,8 +282,10 @@ export class RavenHowlSource<F> {
     if (ex.status === 410) {
       throw new HowlError("SessionExpired", `${what}: session expired`, { status: 410 });
     }
-    if (ex.status === 503) {
-      throw new HowlError("Busy", `${what}: ${new TextDecoder().decode(ex.body)}`, { status: 503 });
+    if (ex.status === 503 || ex.status === 429) {
+      throw new HowlError("Busy", `${what}: ${ex.status} ${new TextDecoder().decode(ex.body)}`, {
+        status: ex.status,
+      });
     }
     if (ex.status !== 200) {
       throw new HowlError("Refused", `${what}: ${ex.status} ${new TextDecoder().decode(ex.body)}`, {
@@ -513,6 +520,18 @@ export class RavenHowlSource<F> {
     return client;
   }
 
+  /** The seated client, or `null` when the node has no seat to give now. */
+  async #seated(): Promise<HowlClientHandle | null> {
+    if (this.#session === null && Date.now() < this.#noSeatUntil) return null;
+    try {
+      return await this.#sessionClient();
+    } catch (e) {
+      if (!(e instanceof HowlError) || e.kind !== "Busy") throw e;
+      this.#noSeatUntil = Date.now() + SEAT_RETRY_MS;
+      return null;
+    }
+  }
+
   /**
    * After a private read the node refused, or whose answer did not open, whether the node now
    * serves other material than the params held: another set, or the same set re-seeded with
@@ -569,7 +588,9 @@ export class RavenHowlSource<F> {
   }
 
   async #readOnce(key: string, positions: number[], inline: boolean): Promise<Uint8Array> {
-    const client = inline ? await this.#newClient() : await this.#sessionClient();
+    // A read the node has no seat for goes inline under a key of its own.
+    const seated = inline ? null : await this.#seated();
+    const client = seated ?? (await this.#newClient());
     try {
       const plan = this.#plans.get(key);
       const batch = protocol("batch", () =>
@@ -596,7 +617,7 @@ export class RavenHowlSource<F> {
         batch.free();
       }
     } finally {
-      if (inline) client.free();
+      if (seated === null) client.free();
     }
   }
 

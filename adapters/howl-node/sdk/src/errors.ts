@@ -6,7 +6,8 @@ export type HowlErrorKind =
   | "Stale"
   /** The session handle expired or is unknown to the node (410). */
   | "SessionExpired"
-  /** Every seat is taken, or the node is shutting down (503). */
+  /** The node is over its request or session rate (429), its seats or respond queue are full, or
+   *  it is shutting down (503). The same call may succeed later. */
   | "Busy"
   /** The node refused the request as malformed (400, 422, others). */
   | "Refused"
