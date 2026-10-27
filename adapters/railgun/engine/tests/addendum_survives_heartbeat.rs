@@ -3,7 +3,7 @@
 //! `heartbeat_session_eviction` republishes the same `encoded_db` by `Arc::clone` under a NEW epoch,
 //! every session-eviction interval (3,600 s by default). A block marked `role = "static"` never
 //! commits again, so anything that keys addendum validity on the epoch refuses it forever one hour
-//! after boot. Five of six PPOI blocks in the shipped topology are static. This file is the
+//! after boot. Most PPOI blocks in the shipped topology are static. This file is the
 //! reddening case for that outage, and the proof that the replacement signal survives it.
 
 #![allow(clippy::expect_used)]

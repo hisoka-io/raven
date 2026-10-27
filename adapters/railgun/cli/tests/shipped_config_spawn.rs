@@ -39,7 +39,7 @@ use raven_railgun_engine::orchestrator::{DataSourceFilter, LEAVES_PER_PPOI_BLOCK
 use raven_railgun_http::status::{MirrorFeedState, MirrorFeedView};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
-use signed_list::{rekeyed, signed_row};
+use signed_list::{rekeyed, shipped_block_id, signed_row, LAST_REQUIRED_BLOCK, NEXT_BLOCK};
 
 const BEARER_TOKEN: &str = "shipped-config-spawn-token-padded-long";
 
@@ -64,8 +64,6 @@ const _: () = assert!(LIST_ROWS < LEAVES_PER_PPOI_BLOCK);
 const COVERAGE_REFUSALS_TOTAL: &str = "raven_railgun_shim_coverage_refusals_total";
 const COMMIT_TREE_ROUTE: &str = "commit-tree-merkle-proof";
 const LIST_ROUTES: [&str; 1] = ["bc-prefixes"];
-/// The block the list reaches at row 393,216, which the shipped config must declare ahead of it.
-const NEXT_BLOCK_INSTANCE: &str = "ppoi-paths-ofac-6";
 
 /// The boot builds one production cell per instance, close to serially, so a runner's per-core
 /// speed sets it. The CI lane runs under nextest's `production-cell` profile, which kills at
@@ -459,9 +457,9 @@ async fn ask_index(booted: &Booted) -> Segment {
     .await
 }
 
-/// The shipped config serves every block it declares, the one the list reaches next included,
-/// and answers list rows only from a store the binary fed from upstream; a commit tree it does
-/// not declare is refused by the coverage proof.
+/// The shipped config serves every block it declares, the one the list fills next and the one
+/// after it included, and answers list rows only from a store the binary fed from upstream; a
+/// commit tree it does not declare is refused by the coverage proof.
 ///
 /// The refusal count is the load-bearing assertion there: exactly one, the commit tree, while
 /// the list routes answered from the declared blocks. Take the store registry out of the boot
@@ -470,7 +468,7 @@ async fn ask_index(booted: &Booted) -> Segment {
 /// No `Authorization` header goes to a shim route: the read path is public and a wallet holds
 /// no credential. Only the `/metrics` scrape is authenticated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "boots the production binary on the shipped seven-block config, a production cell per \
+#[ignore = "boots the production binary on the shipped config, a production cell per declared \
             block. Trigger: changing serve-production --config boot wiring, shim-route store \
             resolution, or the example config's declared list blocks."]
 async fn the_shipped_config_serves_shim_routes_from_the_stores_it_declares() {
@@ -493,22 +491,22 @@ async fn the_shipped_config_serves_shim_routes_from_the_stores_it_declares() {
         served, booted.declared_instances,
         "the binary serves every declared instance"
     );
-    assert!(
-        served.contains(NEXT_BLOCK_INSTANCE),
-        "the block holding row 393,216 must be served before the list reaches it: {served:?}"
-    );
-    let params = reqwest::Client::new()
-        .get(format!(
-            "http://{addr}/v1/instance/{NEXT_BLOCK_INSTANCE}/params"
-        ))
-        .send()
-        .await
-        .expect("params of the next block");
-    assert_eq!(
-        params.status(),
-        StatusCode::OK,
-        "{NEXT_BLOCK_INSTANCE} hands a wallet what it needs to query it"
-    );
+    for ahead in [NEXT_BLOCK, LAST_REQUIRED_BLOCK].map(shipped_block_id) {
+        assert!(
+            served.contains(&ahead),
+            "{ahead} must be served before the list reaches it: {served:?}"
+        );
+        let params = reqwest::Client::new()
+            .get(format!("http://{addr}/v1/instance/{ahead}/params"))
+            .send()
+            .await
+            .expect("params of a block ahead of the list");
+        assert_eq!(
+            params.status(),
+            StatusCode::OK,
+            "{ahead} hands a wallet what it needs to query it"
+        );
+    }
 
     let feed = wait_until_caught_up(&booted).await;
     assert_eq!(feed.rows_held, u64::from(LIST_ROWS), "{feed:?}");

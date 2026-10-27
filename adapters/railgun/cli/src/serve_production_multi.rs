@@ -4344,16 +4344,18 @@ data_source = { kind = "indexer", filter = { tree_number = 0 } }
     }
 
     /// The shipped forest booted empty: one page per 501 rows, back to back, through every
-    /// declared block, although seven instances share the list.
+    /// declared block, although all its instances share the list.
     #[test]
     fn a_cold_shipped_boot_asks_for_each_page_of_the_list_exactly_once() {
         let (_, routes) = shipped_ppoi_routes();
         let held: Vec<(DataSourceFilter, usize)> = routes.iter().map(|&route| (route, 0)).collect();
         let (asked, stopped_at) = walk_feed(&held, 501);
-        let declared = 7 * u64::from(LEAVES_PER_PPOI_BLOCK);
+        let declared =
+            u64::try_from(routes.len()).expect("block count") * u64::from(LEAVES_PER_PPOI_BLOCK);
         assert!(
             asked.iter().copied().eq(0..declared),
-            "every row of seven blocks, once, in order"
+            "every row of the {} declared blocks, once, in order",
+            routes.len()
         );
         assert_eq!(stopped_at, declared);
     }
@@ -4586,10 +4588,10 @@ data_source = {{ kind = "mirror", list_key = "0000000000000000000000000000000000
         (list_key, filters)
     }
 
-    /// The shipped forest is blocks 0-6 and nothing else. Every row below the eighth block has
-    /// a holder and none at or past it does, so a row at 393,216 lands in block 6.
+    /// The shipped forest is blocks 0 to N - 1 and nothing else. Every row below block N has a
+    /// holder and none at or past it does, and leaving a block out stops the coverage there.
     #[test]
-    fn the_shipped_topology_holds_every_row_below_the_eighth_block_and_none_past_it() {
+    fn the_shipped_topology_holds_every_row_below_its_last_block_and_none_past_it() {
         let (list, routes) = shipped_ppoi_routes();
         let blocks: Vec<u32> = routes
             .iter()
@@ -4600,13 +4602,16 @@ data_source = {{ kind = "mirror", list_key = "0000000000000000000000000000000000
                 }
             })
             .collect();
-        assert_eq!(blocks, (0..7).collect::<Vec<u32>>());
+        let n = u32::try_from(blocks.len()).expect("block count");
+        assert_eq!(blocks, (0..n).collect::<Vec<u32>>());
+        assert!(n > 3, "the gap case below leaves out block 3");
         let block = u64::from(LEAVES_PER_PPOI_BLOCK);
+        let end = u64::from(n) * block;
         let unheld = |routes: &[DataSourceFilter], cursor| {
             first_unheld_index(routes.iter().copied(), &list, cursor)
         };
-        for cursor in [0, block - 1, block, 6 * block, 7 * block - 1, 7 * block] {
-            assert_eq!(unheld(&routes, cursor), 7 * block, "cursor {cursor}");
+        for cursor in [0, block - 1, block, end - block, end - 1, end] {
+            assert_eq!(unheld(&routes, cursor), end, "cursor {cursor}");
         }
 
         let without_block_3: Vec<_> = routes
@@ -4616,12 +4621,12 @@ data_source = {{ kind = "mirror", list_key = "0000000000000000000000000000000000
             .collect();
         assert_eq!(unheld(&without_block_3, 0), 3 * block);
 
-        let mut with_block_7 = routes.clone();
-        with_block_7.push(DataSourceFilter::PpoiListBlock {
+        let mut with_block_n = routes.clone();
+        with_block_n.push(DataSourceFilter::PpoiListBlock {
             list_key: list,
-            block: 7,
+            block: n,
         });
-        assert_eq!(unheld(&with_block_7, 7 * block), 8 * block);
+        assert_eq!(unheld(&with_block_n, end), end + block);
 
         assert_eq!(
             first_unheld_index(routes.iter().copied(), &[0xAB; 32], 7),
@@ -4722,7 +4727,7 @@ data_source = {{ kind = "mirror", list_key = "0000000000000000000000000000000000
                 other @ DataSourceFilter::ChainTreeNumber(_) => other,
             })
             .collect();
-        let next_block = 7;
+        let next_block = u32::try_from(filters.len()).expect("block count");
         let first_unheld = u64::from(next_block * LEAVES_PER_PPOI_BLOCK);
         // The feed reads only the filters; nothing is routed in this test.
         let routes_for =

@@ -38,7 +38,10 @@ use raven_railgun_http::status::{MirrorFeedState, MirrorFeedView};
 use raven_railgun_http::HealthReadyResponse;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
-use signed_list::{rekeyed, signed_row, LIST_HEX, SHIPPED_LIST_HEX};
+use signed_list::{
+    rekeyed, shipped_block_id, signed_row, LAST_REQUIRED_BLOCK, LIST_HEX, NEXT_BLOCK,
+    SHIPPED_LIST_HEX,
+};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -475,10 +478,14 @@ fn the_ppoi_only_example_names_no_chain_setting_and_loads() {
             ),
         })
         .collect();
-    assert_eq!(
-        blocks,
-        (0..7).collect::<Vec<u32>>(),
-        "seven blocks, the one the list reaches at row 393,216 included, and nothing else"
+    assert!(
+        blocks.iter().zip(0u32..).all(|(&block, at)| block == at),
+        "the blocks must be contiguous from 0: {blocks:?}"
+    );
+    assert!(
+        blocks.contains(&LAST_REQUIRED_BLOCK),
+        "the list fills block {NEXT_BLOCK} next, so block {LAST_REQUIRED_BLOCK} must be declared \
+         too: {blocks:?}"
     );
 }
 
@@ -798,13 +805,13 @@ async fn a_ppoi_only_boot_refuses_a_websocket_endpoint_nothing_reads() {
     );
 }
 
-/// Row 393,216 of the shipped list, the first row of block 6, is served by PIR once it arrives:
-/// the shipped config declares the block before the list reaches it. Booted through the engine
+/// The first row of the block the shipped list fills next is served by PIR once it arrives: the
+/// shipped config declares the block before the list reaches it. Booted through the engine
 /// on the shipped instance, fed the row the way the mirror sends it, list-wide, and decoded from
 /// the block's served state with a real query.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)]
-async fn the_shipped_block_6_serves_the_lists_row_393216_by_pir() {
+async fn the_shipped_next_block_serves_its_first_row_by_pir() {
     use raven_inspire::params::{InspireParams, InspireVariant};
     use raven_railgun_engine::inspire::{
         build_client_session, build_seeded_query, extract_response, register_client_session,
@@ -818,17 +825,24 @@ async fn the_shipped_block_6_serves_the_lists_row_393216_by_pir() {
     use raven_railgun_engine::PirScheme;
     use raven_railgun_persistence::{PpoiEventType, WalEntryPayload};
 
-    const ROW: u32 = 393_216;
-    const BLOCK_6: &str = "ppoi-paths-ofac-6";
+    const ROW: u32 = NEXT_BLOCK * raven_railgun_engine::orchestrator::LEAVES_PER_PPOI_BLOCK;
+    let next = shipped_block_id(NEXT_BLOCK);
     let root = tempfile::tempdir().expect("tempdir");
     let config = write_config(root.path(), &example(), "http://127.0.0.1:1", "");
-    let (opts, _) = narrowed(&config, &[BLOCK_6]);
+    let (opts, _) = narrowed(&config, &[next.as_str()]);
     let list_key: [u8; 32] = hex::decode(SHIPPED_LIST_HEX).unwrap().try_into().unwrap();
     assert_eq!(
         opts.instances[0].data_source,
-        DataSourceFilter::PpoiListBlock { list_key, block: 6 }
+        DataSourceFilter::PpoiListBlock {
+            list_key,
+            block: NEXT_BLOCK
+        }
     );
-    assert_eq!(split_ppoi_index(ROW), (6, 0), "row 393,216 opens block 6");
+    assert_eq!(
+        split_ppoi_index(ROW),
+        (NEXT_BLOCK, 0),
+        "row {ROW} opens {next}"
+    );
 
     let params = InspireParams::secure_128_d2048();
     let mut handle = bootstrap_railgun_engine_multi(
@@ -846,7 +860,7 @@ async fn the_shipped_block_6_serves_the_lists_row_393216_by_pir() {
             Ok(state)
         },
     )
-    .expect("boot block 6");
+    .expect("boot the next block");
     let leaf = leaf_at(u64::from(ROW));
     let mut tree = raven_railgun_engine::imt::Imt::new().expect("imt");
     tree.insert_leaves(0, &[leaf]).expect("append");
@@ -865,29 +879,29 @@ async fn the_shipped_block_6_serves_the_lists_row_393216_by_pir() {
         ))
         .await
         .expect("router open");
-    let block_6 = handle.instances.first_mut().expect("block 6");
-    until_done_or_stalled("row 393,216 applied", async || {
-        let held = block_6
+    let booted = handle.instances.first_mut().expect("the next block");
+    until_done_or_stalled("the first row applied", async || {
+        let held = booted
             .logical_store
             .lock()
             .ppoi_imt(&list_key)
             .map_or(0, raven_railgun_engine::imt::Imt::leaf_count);
-        let errors = block_6.metrics.lock().consumer_errors;
-        assert_eq!(errors, 0, "block 6 refused the row");
+        let errors = booted.metrics.lock().consumer_errors;
+        assert_eq!(errors, 0, "{next} refused the row");
         (held, (held == 1).then_some(()))
     })
     .await;
-    block_6
+    booted
         .sender
         .send(ConsumerEvent::Shutdown)
         .await
         .expect("consumer open");
-    (&mut block_6.consumer)
+    (&mut booted.consumer)
         .await
         .expect("consumer joined")
         .expect("the publish on stop");
 
-    let state = block_6.instance.current_state();
+    let state = booted.instance.current_state();
     let mut session = build_client_session((*state.crs).clone()).expect("client session");
     register_client_session(&mut session, &state).expect("register session");
     let (client_state, query) =
@@ -900,7 +914,7 @@ async fn the_shipped_block_6_serves_the_lists_row_393216_by_pir() {
     assert_eq!(
         &decoded[..32],
         &leaf,
-        "block 6 row 0 carries the list's row 393,216"
+        "{next} row 0 carries the list's row {ROW}"
     );
     assert_eq!(
         &decoded[34..38],

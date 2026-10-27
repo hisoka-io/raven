@@ -13,11 +13,13 @@ TEMPLATE_PATH=/etc/raven-railgun/mainnet-ppoi.toml
 STOP_TIMEOUT=30
 # Debug switch in the respond path: never on a served node.
 FORBIDDEN_ENV=(RAVEN_PROFILE_RESPOND)
-# Node memory. Five warm boots of the template's seven instances on a replay of the mainnet list
-# peaked at 3,836 to 3,979 MiB resident and settled at 1,998 MiB: each shard holds its columns and
-# a packing store of the same size. The peak here is the measured maximum of five plus 421 MiB
-# (about 10 %). A packing-key seat holds three ring polynomials of 16 KiB at any row size, 49 KiB
-# with its containers. Headroom covers the queries in flight.
+# Node memory. Five warm boots of the template's first seven instances on a replay of the mainnet
+# list peaked at 3,836 to 3,979 MiB resident and settled at 1,998 MiB: each shard holds its columns
+# and a packing store of the same size. An eighth, still empty block settled a warm boot 9 MiB
+# higher, its 3 s samples peaking at 2,343 MiB against 2,363 for seven. The peak here is the
+# measured maximum of five plus 421 MiB (about 10 %). A packing-key seat holds three ring
+# polynomials of 16 KiB at any row size, 49 KiB with its containers. Headroom covers the queries
+# in flight.
 NODE_PEAK_MIB=4400
 SEAT_KIB=49
 HEADROOM_MIB=1024
