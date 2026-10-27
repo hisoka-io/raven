@@ -15,7 +15,7 @@ workspace = true
 raven-storage = { path = "../../../crates/storage" }
 serde = { workspace = true }
 bincode = { workspace = true }
-zstd = { version = "0.13", optional = true }
+zstd = { version = "0.14", optional = true }
 
 [dev-dependencies]
 proptest = "1"

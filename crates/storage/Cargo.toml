@@ -23,7 +23,7 @@ sha2 = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 fs4 = { workspace = true }
-zstd = { version = "0.13", optional = true }
+zstd = { version = "0.14", optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
