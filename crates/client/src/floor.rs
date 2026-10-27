@@ -34,6 +34,12 @@ pub const SHIPPED_SIGMA: f64 = 6.4;
 /// `q` this holds the base at 2^20 or more.
 pub const MAX_GADGET_LEN: usize = 3;
 
+/// The one ring the approximate packing gadget is accepted on.
+pub const APPROXIMATE_GADGET_RING_DIM: usize = 2048;
+
+/// The one gadget base the approximate packing gadget is accepted with.
+pub const APPROXIMATE_GADGET_BASE: u64 = 1 << 20;
+
 /// A parameter set outside the floors.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
@@ -84,12 +90,23 @@ pub enum ParameterFloorError {
         /// The served digit count.
         len: usize,
     },
-    /// The approximate packing gadget, which every shipped preset leaves off.
-    #[error("the approximate packing gadget is on, and every shipped preset has it off")]
-    ApproximatePackingGadget,
+    /// The approximate packing gadget on a shape other than the one its noise was measured on.
+    #[error(
+        "the approximate packing gadget is on at ring_dim {ring_dim}, base {base}, {len} packing \
+         digits; it is accepted only on the measured d2048 shape (base 2^20, 3 digits)"
+    )]
+    ApproximatePackingGadget {
+        /// The served ring dimension.
+        ring_dim: usize,
+        /// The served gadget base.
+        base: u64,
+        /// The served packing digit count.
+        len: usize,
+    },
 }
 
-/// Refuse a parameter set outside the floors. `d2048` and `d4096` pass.
+/// Refuse a parameter set outside the floors. `d2048`, `d4096` and `d2048_approximate_gadget`
+/// pass.
 ///
 /// ```
 /// use raven_client::{check_parameter_floor, ParameterFloorError};
@@ -142,10 +159,24 @@ pub fn check_parameter_floor(params: &InspireParams) -> Result<(), ParameterFloo
             return Err(ParameterFloorError::GadgetDigits { role, len });
         }
     }
-    // The option picks which key rows the client builds and uploads; the measured presets
-    // all leave it off.
-    if params.approximate_packing_gadget {
-        return Err(ParameterFloorError::ApproximatePackingGadget);
+    // The dropped digit's rounding residual grows with the base, and the decode margin was
+    // measured on this one shape.
+    if params.approximate_packing_gadget
+        && (
+            params.ring_dim,
+            params.gadget_base,
+            params.packing_gadget_len,
+        ) != (
+            APPROXIMATE_GADGET_RING_DIM,
+            APPROXIMATE_GADGET_BASE,
+            MAX_GADGET_LEN,
+        )
+    {
+        return Err(ParameterFloorError::ApproximatePackingGadget {
+            ring_dim: params.ring_dim,
+            base: params.gadget_base,
+            len: params.packing_gadget_len,
+        });
     }
     Ok(())
 }

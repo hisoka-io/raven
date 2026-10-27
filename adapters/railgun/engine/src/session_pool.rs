@@ -260,7 +260,7 @@ fn map_error(error: SessionStoreError) -> AdapterError {
         return AdapterError::AtCapacity(error.to_string());
     }
     match error.class() {
-        SessionStoreErrorClass::Durability | SessionStoreErrorClass::Configuration => {
+        SessionStoreErrorClass::Entropy | SessionStoreErrorClass::Configuration => {
             AdapterError::Internal(error.to_string())
         }
         SessionStoreErrorClass::Inspire => AdapterError::Scheme(error.to_string()),

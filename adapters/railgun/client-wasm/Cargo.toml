@@ -2,7 +2,7 @@
 
 [package]
 name = "raven-inspire-client-wasm"
-version = "0.1.0-alpha.0"
+version = "0.1.0-alpha.1"
 edition = "2021"
 # 1.89: this tree depends on raven-inspire, which declares that floor, and cargo
 # enforces a dependency's rust-version.

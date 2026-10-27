@@ -33,6 +33,21 @@ pub(crate) fn bincode_deserialize_capped<T: serde::de::DeserializeOwned>(
 /// structural break requiring every client to upgrade.
 pub const WIRE_SCHEMA_VERSION: u16 = 8;
 
+/// The schema of an instance whose parameter set has the approximate packing gadget. The set
+/// picks the schema, so a client or node that knows only [`WIRE_SCHEMA_VERSION`] refuses the
+/// other set at its first body instead of building or seating a key of the wrong shape.
+pub const WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET: u16 = 9;
+
+/// The schema an instance serving `params` speaks.
+#[must_use]
+pub fn wire_schema_for(params: &raven_inspire::params::InspireParams) -> u16 {
+    if params.approximate_packing_gadget {
+        WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET
+    } else {
+        WIRE_SCHEMA_VERSION
+    }
+}
+
 /// Length of the [`WIRE_SCHEMA_VERSION`] prefix in bytes.
 pub const WIRE_SCHEMA_PREFIX_LEN: usize = 2;
 
@@ -44,6 +59,14 @@ pub(crate) const X_RAVEN_SCHEMA_VERSION_HEADER: &str = "x-raven-schema-version";
 /// Decode a versioned wire body, returning `Err` on short body or version mismatch.
 pub fn read_versioned<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
+) -> Result<T, VersionedDecodeError> {
+    read_versioned_as(bytes, WIRE_SCHEMA_VERSION)
+}
+
+/// [`read_versioned`] for an instance that speaks `expected`.
+pub fn read_versioned_as<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    expected: u16,
 ) -> Result<T, VersionedDecodeError> {
     if bytes.len() < WIRE_SCHEMA_PREFIX_LEN {
         return Err(VersionedDecodeError::Short {
@@ -60,9 +83,9 @@ pub fn read_versioned<T: serde::de::DeserializeOwned>(
     let mut buf = [0u8; WIRE_SCHEMA_PREFIX_LEN];
     buf.copy_from_slice(version_bytes);
     let version = u16::from_be_bytes(buf);
-    if version != WIRE_SCHEMA_VERSION {
+    if version != expected {
         return Err(VersionedDecodeError::BadVersion {
-            expected: WIRE_SCHEMA_VERSION,
+            expected,
             got: version,
         });
     }
@@ -77,8 +100,16 @@ pub fn read_versioned<T: serde::de::DeserializeOwned>(
 
 /// Serialize a value with the versioned wire prefix.
 pub fn write_versioned<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, bincode::Error> {
+    write_versioned_as(value, WIRE_SCHEMA_VERSION)
+}
+
+/// [`write_versioned`] for an instance that speaks `version`.
+pub fn write_versioned_as<T: serde::Serialize>(
+    value: &T,
+    version: u16,
+) -> Result<Vec<u8>, bincode::Error> {
     let mut out = Vec::with_capacity(WIRE_SCHEMA_PREFIX_LEN + 64);
-    out.extend_from_slice(&WIRE_SCHEMA_VERSION.to_be_bytes());
+    out.extend_from_slice(&version.to_be_bytes());
     let body = bincode::serialize(value)?;
     out.extend_from_slice(&body);
     Ok(out)
@@ -92,8 +123,16 @@ pub fn write_versioned<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, bincod
 pub fn write_batch_response_versioned<T: serde::Serialize>(
     items: &[T],
 ) -> Result<Vec<u8>, bincode::Error> {
+    write_batch_response_versioned_as(items, WIRE_SCHEMA_VERSION)
+}
+
+/// [`write_batch_response_versioned`] for an instance that speaks `version`.
+pub fn write_batch_response_versioned_as<T: serde::Serialize>(
+    items: &[T],
+    version: u16,
+) -> Result<Vec<u8>, bincode::Error> {
     let mut out = Vec::with_capacity(WIRE_SCHEMA_PREFIX_LEN + 8 + items.len() * 64);
-    out.extend_from_slice(&WIRE_SCHEMA_VERSION.to_be_bytes());
+    out.extend_from_slice(&version.to_be_bytes());
     let count = u64::try_from(items.len()).map_err(|_| bincode::ErrorKind::SizeLimit)?;
     out.extend_from_slice(&count.to_le_bytes());
     for item in items {
@@ -108,6 +147,14 @@ pub fn write_batch_response_versioned<T: serde::Serialize>(
 /// Decode a batch-response body emitted by [`write_batch_response_versioned`].
 pub fn read_batch_response_versioned<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
+) -> Result<Vec<T>, VersionedDecodeError> {
+    read_batch_response_versioned_as(bytes, WIRE_SCHEMA_VERSION)
+}
+
+/// [`read_batch_response_versioned`] for an instance that speaks `expected`.
+pub fn read_batch_response_versioned_as<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    expected: u16,
 ) -> Result<Vec<T>, VersionedDecodeError> {
     let header_end = WIRE_SCHEMA_PREFIX_LEN + 8;
     if bytes.len() < header_end {
@@ -125,9 +172,9 @@ pub fn read_batch_response_versioned<T: serde::de::DeserializeOwned>(
     let mut buf = [0u8; WIRE_SCHEMA_PREFIX_LEN];
     buf.copy_from_slice(prefix);
     let version = u16::from_be_bytes(buf);
-    if version != WIRE_SCHEMA_VERSION {
+    if version != expected {
         return Err(VersionedDecodeError::BadVersion {
-            expected: WIRE_SCHEMA_VERSION,
+            expected,
             got: version,
         });
     }
@@ -199,7 +246,7 @@ pub enum VersionedDecodeError {
         /// Bytes required.
         need: usize,
     },
-    /// Leading u16 doesn't match [`WIRE_SCHEMA_VERSION`].
+    /// Leading u16 doesn't match the instance's schema.
     #[error("schema version mismatch: server expects v{expected}, client sent v{got}")]
     BadVersion {
         /// Server's expected version.

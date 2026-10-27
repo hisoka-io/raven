@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{require_client_id_header, EvictionOutcome, SessionKey};
 use crate::state::AppState;
-use crate::versioned::{read_versioned, write_versioned, WIRE_SCHEMA_VERSION};
+use crate::versioned::{read_versioned_as, wire_schema_for, write_versioned_as};
 use crate::{X_RAVEN_EPOCH, X_RAVEN_SCHEME, X_RAVEN_SESSION};
 
 /// JSON returned by `POST /v1/instance/{id}/session`.
@@ -34,7 +34,8 @@ pub struct SessionEstablishResponse {
 /// Wire-format instance parameters returned by `GET /v1/instance/{id}/params`.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct InstanceParams {
-    /// Server's wire schema version; wallets validate at bootstrap.
+    /// The instance's wire schema version, which its parameter set picks; wallets validate it
+    /// at bootstrap.
     pub wire_schema_version: u16,
     /// Bincode-encoded [`raven_inspire::ServerCrs`].
     pub crs_bincode: Vec<u8>,
@@ -214,7 +215,8 @@ pub(crate) async fn session_establish_handler(
     // Decoded before a handshake permit is sought, so a body that cannot decode never queues.
     let limit = packing_key_upload_limit(&state.crs.params).min(app.config.max_body_bytes);
     let body = read_capped(body, limit).await?;
-    let keys: ClientPackingKeys = read_versioned(&body).map_err(|err| {
+    let schema = wire_schema_for(&state.crs.params);
+    let keys: ClientPackingKeys = read_versioned_as(&body, schema).map_err(|err| {
         tracing::warn!(
             ?err,
             "session establish versioned-bincode deserialize failed"
@@ -377,8 +379,9 @@ pub(crate) async fn params_handler(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let inspire_params_bincode =
         bincode::serialize(&state.crs.params).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let schema = wire_schema_for(&state.crs.params);
     let payload = InstanceParams {
-        wire_schema_version: WIRE_SCHEMA_VERSION,
+        wire_schema_version: schema,
         crs_bincode,
         shard_config_bincode,
         inspire_params_bincode,
@@ -386,7 +389,8 @@ pub(crate) async fn params_handler(
         variant: format!("{:?}", state.variant),
         epoch: epoch.0,
     };
-    let body = write_versioned(&payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let body =
+        write_versioned_as(&payload, schema).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Cached as `(epoch, sha)` so an epoch bump invalidates without growing the map.
     let sha = if let Some(value) = cached_etag_value.as_ref() {
@@ -478,6 +482,7 @@ mod tests {
 
     use super::*;
     use crate::config::HttpConfig;
+    use crate::versioned::write_versioned;
 
     const INSTANCE: &str = "session-body-bounds";
     const ENTRY_BYTES: usize = 32;

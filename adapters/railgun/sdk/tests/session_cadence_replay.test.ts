@@ -15,6 +15,7 @@ import { forestConfig } from "./helpers/forest";
 import { PATH10_ROW_BYTES, path10Siblings, path10Slot } from "./helpers/path10_row";
 import { STUB_QUERY_BYTES, stubQueryBundle } from "./helpers/private_wire";
 import { shardConfigBincode } from "./helpers/shard_config";
+import { EXPECTED_WIRE_SCHEMA_PREFIX } from "./helpers/wire_schema";
 
 const LIST_KEY_HEX = "ab".repeat(32);
 const BC_HEX = "5a".repeat(32);
@@ -107,7 +108,7 @@ async function replayActualSdk(_timestamps: readonly number[]): Promise<CadenceD
   const baseWasm = stubWasm();
   const wasm: RavenInspireWasm = {
     ...baseWasm,
-    client_packing_keys_versioned: () => new Uint8Array([0, 6, 5, 0, 4]),
+    client_packing_keys_versioned: () => new Uint8Array([...EXPECTED_WIRE_SCHEMA_PREFIX, 5, 0, 4]),
     install_server_session_handle: (_session, handle) => {
       installedHandle = handle;
     },

@@ -230,6 +230,10 @@ struct GlobalSection {
     /// Packing-key seats per instance, auto-spawned ones included.
     #[serde(default)]
     max_sessions_per_instance: Option<usize>,
+    /// Serve the parameter set with the approximate packing gadget: 32 KiB seats, wire schema 9,
+    /// which a schema-8 client refuses. A data dir built under the other set is refused at boot.
+    #[serde(default)]
+    approximate_packing_gadget: Option<bool>,
     /// Seat and handle lifetime in seconds; may only be lowered from the default.
     #[serde(default)]
     session_ttl_secs: Option<u64>,
@@ -370,6 +374,8 @@ pub struct MultiServeOptions {
     pub reorg_window_path: Option<PathBuf>,
     /// Session seats, lifetime, bindings and handshake concurrency; absent keys keep the defaults.
     pub session_capacity: SessionCapacity,
+    /// `[global].approximate_packing_gadget`: serve `InspireParams::d2048_approximate_gadget`.
+    pub approximate_packing_gadget: bool,
     /// From the stop signal to exit; [`STOP_BUDGET`] unless a test lifts it to bound its stop by
     /// progress instead.
     pub stop_budget: std::time::Duration,
@@ -846,6 +852,7 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         session_eviction_interval_secs: parsed.global.session_eviction_interval_secs,
         reorg_window_path: parsed.global.reorg_window_path,
         session_capacity,
+        approximate_packing_gadget: parsed.global.approximate_packing_gadget.unwrap_or(false),
         stop_budget: STOP_BUDGET,
     })
 }
@@ -1175,7 +1182,11 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         );
     }
 
-    let params = InspireParams::d2048();
+    let params = if opts.approximate_packing_gadget {
+        InspireParams::d2048_approximate_gadget()
+    } else {
+        InspireParams::d2048()
+    };
     let fleet_default_entries = opts.entries.max(1);
     let smallest_cell_entries = opts
         .instances
@@ -1377,6 +1388,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
             );
         }
     }
+    // Feeds only the freshness header now: status and metrics read the per-instance map below.
     let app_state = if let Some(metrics) = bootstrap.handles.instances.first() {
         app_state.with_consumer_metrics(Arc::clone(&metrics.metrics))
     } else {

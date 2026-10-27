@@ -24,7 +24,10 @@ const ADDENDUM_BYTES: usize = ADDENDUM_LEVELS * 32;
 
 use crate::auth::validate_session_binding;
 use crate::state::{AppState, ADDENDUM_SKEW_STALE_PROVENANCE, ADDENDUM_SKEW_UNSEEDED};
-use crate::versioned::{read_versioned, write_batch_response_versioned, write_versioned};
+use crate::versioned::{
+    read_versioned_as, wire_schema_for, write_batch_response_versioned_as, write_versioned_as,
+    WIRE_SCHEMA_VERSION,
+};
 use crate::{attach_freshness_header, build_response_headers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +74,15 @@ pub(crate) async fn query_handler<S: PirScheme>(
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<(StatusCode, HeaderMap, Bytes), StatusCode> {
+    query_handler_at(app, id, body, WIRE_SCHEMA_VERSION).await
+}
+
+async fn query_handler_at<S: PirScheme>(
+    app: AppState<S>,
+    id: String,
+    body: Bytes,
+    schema: u16,
+) -> Result<(StatusCode, HeaderMap, Bytes), StatusCode> {
     let instance_id = InstanceId::new(id);
     let instance =
         admit_instance(&app.engine, &instance_id, "query").map_err(AdmissionRefusal::status)?;
@@ -85,7 +97,7 @@ pub(crate) async fn query_handler<S: PirScheme>(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
     let permit = acquired.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let query: S::Query = read_versioned(&body).map_err(|err| {
+    let query: S::Query = read_versioned_as(&body, schema).map_err(|err| {
         tracing::warn!(?err, "query versioned-bincode deserialize failed");
         StatusCode::BAD_REQUEST
     })?;
@@ -144,7 +156,8 @@ pub(crate) async fn query_handler<S: PirScheme>(
     )
     .increment(1);
 
-    let body_bytes = write_versioned(&response).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let body_bytes =
+        write_versioned_as(&response, schema).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let mut headers = build_response_headers(epoch.0, &app.scheme_name)?;
     attach_freshness_header(
@@ -162,15 +175,18 @@ pub(crate) async fn inspire_query_handler(
     body: Bytes,
 ) -> Result<(StatusCode, HeaderMap, Bytes), StatusCode> {
     let instance_id = InstanceId::new(id.clone());
-    admit_instance(&app.engine, &instance_id, "query").map_err(AdmissionRefusal::status)?;
-    let query: SeededClientQuery = read_versioned(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let instance =
+        admit_instance(&app.engine, &instance_id, "query").map_err(AdmissionRefusal::status)?;
+    let schema = wire_schema_for(&instance.current_state().crs.params);
+    let query: SeededClientQuery =
+        read_versioned_as(&body, schema).map_err(|_| StatusCode::BAD_REQUEST)?;
     validate_session_binding(
         &headers,
         app.sessions.as_ref(),
         &instance_id,
         query.session_handle,
     )?;
-    query_handler(State(app), Path(id), body).await
+    query_handler_at(app, id, body, schema).await
 }
 
 pub(crate) async fn batch_handler<S: PirScheme>(
@@ -182,7 +198,15 @@ pub(crate) async fn batch_handler<S: PirScheme>(
     let instance =
         admit_instance(&app.engine, &instance_id, "batch").map_err(AdmissionRefusal::status)?;
     let snapshot = instance.current_snapshot();
-    respond_batch(&app, &instance_id, instance, snapshot, &body).await
+    respond_batch(
+        &app,
+        &instance_id,
+        instance,
+        snapshot,
+        &body,
+        WIRE_SCHEMA_VERSION,
+    )
+    .await
 }
 
 /// Answer a batch from `snapshot_for_batch` alone, so a concurrent `swap_state` cannot split it
@@ -193,8 +217,9 @@ async fn respond_batch<S: PirScheme>(
     instance: Arc<PirInstance<S>>,
     snapshot_for_batch: Arc<Snapshot<S>>,
     body: &Bytes,
+    schema: u16,
 ) -> Result<(StatusCode, HeaderMap, Bytes), StatusCode> {
-    let queries: Vec<S::Query> = read_versioned(body).map_err(|err| {
+    let queries: Vec<S::Query> = read_versioned_as(body, schema).map_err(|err| {
         tracing::warn!(?err, "batch versioned-bincode deserialize failed");
         StatusCode::BAD_REQUEST
     })?;
@@ -261,7 +286,7 @@ async fn respond_batch<S: PirScheme>(
     )
     .record(batch_len_f64);
 
-    let body_bytes = write_batch_response_versioned(&responses)
+    let body_bytes = write_batch_response_versioned_as(&responses, schema)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let mut headers = build_response_headers(epoch_at_start.0, &app.scheme_name)?;
@@ -282,8 +307,9 @@ pub(crate) async fn inspire_batch_handler(
     let instance_id = InstanceId::new(id.clone());
     let instance =
         admit_instance(&app.engine, &instance_id, "batch").map_err(AdmissionRefusal::status)?;
+    let schema = wire_schema_for(&instance.current_state().crs.params);
     let queries: Vec<SeededClientQuery> =
-        read_versioned(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+        read_versioned_as(&body, schema).map_err(|_| StatusCode::BAD_REQUEST)?;
     for handle in queries.iter().filter_map(|query| query.session_handle) {
         validate_session_binding(&headers, app.sessions.as_ref(), &instance_id, Some(handle))?;
     }
@@ -362,7 +388,7 @@ pub(crate) async fn inspire_batch_handler(
         }
     };
     let (status, headers, response) =
-        respond_batch(&app, &instance_id, instance, snapshot, &body).await?;
+        respond_batch(&app, &instance_id, instance, snapshot, &body, schema).await?;
     let Some(addenda) = addenda else {
         return Ok((status, headers, response));
     };

@@ -33,7 +33,8 @@ pub struct AppState<S: PirScheme> {
     pub read_token: Arc<parking_lot::RwLock<String>>,
     /// Identifier surfaced in `X-Raven-Scheme`.
     pub scheme_name: Arc<String>,
-    /// Orchestrator metrics for `/v1/status` lag fields. `None` omits the fields.
+    /// Single consumer cell: the `X-Raven-Freshness` source, and the `/v1/status` and
+    /// `/metrics` source only while `instance_metrics` is empty. `None` omits the fields.
     pub(crate) consumer_metrics:
         Arc<Option<Arc<parking_lot::Mutex<raven_railgun_engine::persistence::ConsumerMetrics>>>>,
     /// Filter-tagged stores the shim routes prove coverage against. Installed at boot; `None`
@@ -52,7 +53,8 @@ pub struct AppState<S: PirScheme> {
     /// instead of taking the permits queries respond under.
     pub(crate) handshake_permits: Arc<Semaphore>,
     pub(crate) metrics_handle: Arc<metrics_exporter_prometheus::PrometheusHandle>,
-    /// Instance-labelled `/metrics` gauges; empty falls back to `consumer_metrics`.
+    /// Per-instance consumer cells for `/metrics`, `/v1/status` and readiness; empty falls back
+    /// to `consumer_metrics`.
     pub(crate) instance_metrics: Arc<HashMap<InstanceId, Arc<parking_lot::Mutex<ConsumerMetrics>>>>,
     /// Whether every served instance must have consumer telemetry before readiness can pass.
     pub(crate) consumer_metrics_required: bool,
@@ -205,7 +207,7 @@ impl<S: PirScheme> AppState<S> {
         self
     }
 
-    /// Attach consumer metrics; surfaced as indexer lag in `/v1/status`.
+    /// Attach the single consumer cell; see the field for where it is read.
     #[must_use]
     pub fn with_consumer_metrics(
         mut self,

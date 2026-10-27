@@ -676,7 +676,6 @@ version = "0.1.0-alpha.0"
 dependencies = [
  "parking_lot",
  "raven-inspire",
- "raven-storage",
  "sha2",
  "tempfile",
  "thiserror",

@@ -30,7 +30,8 @@ use wasm_bindgen::prelude::*;
 
 mod floor;
 pub use floor::{
-    check_parameter_floor, ParameterFloorError, MAX_GADGET_LEN, MAX_Q, MAX_RING_DIM, MIN_RING_DIM,
+    check_parameter_floor, ParameterFloorError, APPROXIMATE_GADGET_BASE,
+    APPROXIMATE_GADGET_RING_DIM, MAX_GADGET_LEN, MAX_Q, MAX_RING_DIM, MIN_RING_DIM,
     SHIPPED_CRT_MODULI, SHIPPED_SIGMA,
 };
 
@@ -171,8 +172,19 @@ fn decode_validated_shard_config(
     Ok(shard_config)
 }
 
-// Adapter HTTP envelope version; parity-gated here to avoid a framework-to-transport dependency.
+// Adapter HTTP envelope versions; parity-gated here to avoid a framework-to-transport dependency.
+// The set picks the version, so a node or client that knows only the exact set refuses the other.
 const SESSION_WIRE_SCHEMA_VERSION: u16 = 8;
+const SESSION_WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET: u16 = 9;
+
+/// The adapter wire schema an instance serving `params` speaks.
+fn session_wire_schema(params: &InspireParams) -> u16 {
+    if params.approximate_packing_gadget {
+        SESSION_WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET
+    } else {
+        SESSION_WIRE_SCHEMA_VERSION
+    }
+}
 
 fn decode<T: for<'de> Deserialize<'de>>(
     bytes: &[u8],
@@ -388,7 +400,8 @@ pub fn register_client_session(
 
 /// Serialize this session's client packing keys for `POST /v1/instance/:id/session`.
 ///
-/// The body is `[u16 BE schema version][bincode ClientPackingKeys]`. It contains
+/// The body is `[u16 BE schema version][bincode ClientPackingKeys]`, the version the
+/// session's parameter set is served under (8 exact, 9 approximate gadget). It contains
 /// key material and must be sent only to the instance that supplied this session's CRS.
 #[wasm_bindgen]
 pub fn client_packing_keys_versioned(session: &ClientSessionHandle) -> Result<Vec<u8>, JsValue> {
@@ -405,7 +418,9 @@ fn session_registration_body(session: &ClientSession) -> Result<Vec<u8>, WasmCli
                  upload"
                     .to_owned(),
         })?;
-    let mut out = SESSION_WIRE_SCHEMA_VERSION.to_be_bytes().to_vec();
+    let mut out = session_wire_schema(&session.crs().params)
+        .to_be_bytes()
+        .to_vec();
     out.extend_from_slice(&encode(keys, "client_packing_keys")?);
     Ok(out)
 }

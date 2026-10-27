@@ -114,7 +114,7 @@ console.log(`  unmutated scratch: ${report.numPassedTests} passed / ${skipped} s
 ' "$pristine_json" "$work/tests/EXPECTED_COUNTS.json" || exit 1
 
 MUT_FILE="$work/src/raven-poi-node-interface.ts"
-NEEDLE='if (envelope !== WIRE_SCHEMA_VERSION) {'
+NEEDLE='if (envelope !== schema) {'
 count="$(/usr/bin/grep -c "$NEEDLE" "$MUT_FILE" || true)"
 if [[ "$count" -ne 1 ]]; then
   echo "check-sdk-suite-selftest: expected exactly 1 envelope-guard site, found ${count} — the mutation no longer applies; update this selftest" >&2
@@ -126,7 +126,7 @@ python3 - "$MUT_FILE" <<'PYEOF'
 import io, sys
 p = sys.argv[1]
 s = io.open(p, encoding="utf-8").read()
-needle = """  if (envelope !== WIRE_SCHEMA_VERSION) {
+needle = """  if (envelope !== schema) {
     throw RavenError.decodeError(
       `${label}: unexpected schema envelope version ${envelope}`,
     );
@@ -163,13 +163,15 @@ const expected = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
 const wantedFailures = new Set([
   "refuses an unknown schema envelope version instead of eating two payload bytes",
   "refuses a previous-schema prefix before WASM extraction",
+  "refuses a reply framed for the exact set",
 ]);
 const files = report.testResults ?? [];
 const assertions = files.flatMap((file) => file.assertionResults ?? []);
 const failures = assertions.filter((test) => test.status === "failed");
 const failureTitles = new Set(failures.map((test) => test.title));
 const skipped = report.numPendingTests + (report.numTodoTests ?? 0);
-if (failures.length !== 2 || report.numFailedTests !== 2 || failureTitles.size !== 2 ||
+if (failures.length !== wantedFailures.size || report.numFailedTests !== wantedFailures.size ||
+    failureTitles.size !== wantedFailures.size ||
     [...wantedFailures].some((title) => !failureTitles.has(title)) ||
     files.length !== expected.testFiles || skipped !== expected.skipped ||
     report.numPassedTests + report.numFailedTests !== expected.passed) {
@@ -180,4 +182,4 @@ if (failures.length !== 2 || report.numFailedTests !== 2 || failureTitles.size !
   tail -n 20 -- "$schema_err" "$schema_json" >&2
   exit 1
 }
-echo "check-sdk-suite-selftest: schema guard deletion failed exactly both version tests."
+echo "check-sdk-suite-selftest: schema guard deletion failed exactly the three version tests."

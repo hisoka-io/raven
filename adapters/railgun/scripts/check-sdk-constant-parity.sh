@@ -125,27 +125,41 @@ compare "client session schema version" "$rs_client_env" "$rs_env"
 ts_test_pin="$(extract "TS test-side schema pin" "${ADAPTER_ROOT}/sdk/tests/helpers/wire_schema.ts" \
   's/^export const EXPECTED_WIRE_SCHEMA_VERSION = \([0-9]*\);$/\1/p')"
 compare "test-side schema pin" "$ts_test_pin" "$rs_env"
+# The approximate-gadget set's schema: one value in the server, the client session body, the
+# SDK and the test pin.
+ts_env_approx="$(extract "TS approximate-gadget version" "${ADAPTER_ROOT}/sdk/src/raven-poi-node-interface.ts" \
+  's/^const WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET = \([0-9]*\);$/\1/p')"
+rs_env_approx="$(extract "Rust approximate-gadget version" "${ADAPTER_ROOT}/http/src/versioned.rs" \
+  's/^pub const WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET: u16 = \([0-9]*\);$/\1/p')"
+compare "approximate-gadget schema version" "$ts_env_approx" "$rs_env_approx"
+rs_client_env_approx="$(extract "Rust client approximate-gadget version" "${ADAPTER_ROOT}/../../crates/client/src/lib.rs" \
+  's/^const SESSION_WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET: u16 = \([0-9]*\);$/\1/p')"
+compare "client session approximate-gadget version" "$rs_client_env_approx" "$rs_env_approx"
+ts_test_pin_approx="$(extract "TS test-side approximate-gadget pin" "${ADAPTER_ROOT}/sdk/tests/helpers/wire_schema.ts" \
+  's/^export const EXPECTED_WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET = \([0-9]*\);$/\1/p')"
+compare "test-side approximate-gadget pin" "$ts_test_pin_approx" "$rs_env_approx"
+# The batch reader and writer take the instance's schema, never a literal.
 ts_reader="$(extract "TS envelope reader delegation" "${ADAPTER_ROOT}/sdk/src/raven-poi-node-interface.ts" \
-  's/^ *if (envelope !== \(WIRE_SCHEMA_VERSION\)) {$/\1/p')"
-compare "TS envelope reader uses shared version" "$ts_reader" "WIRE_SCHEMA_VERSION"
+  's/^ *if (envelope !== \(schema\)) {$/\1/p')"
+compare "TS envelope reader uses the instance's version" "$ts_reader" "schema"
 ts_writer_hi="$(extract "TS envelope writer high byte" "${ADAPTER_ROOT}/sdk/src/raven-poi-node-interface.ts" \
-  's/^ *(\(WIRE_SCHEMA_VERSION\) >>> 8) \& 0xff,$/\1/p')"
+  's/^ *(\(schema\) >>> 8) \& 0xff,$/\1/p')"
 ts_writer_lo="$(extract "TS envelope writer low byte" "${ADAPTER_ROOT}/sdk/src/raven-poi-node-interface.ts" \
-  's/^ *\(WIRE_SCHEMA_VERSION\) \& 0xff,$/\1/p')"
-compare "TS envelope writer high byte uses shared version" "$ts_writer_hi" "WIRE_SCHEMA_VERSION"
-compare "TS envelope writer low byte uses shared version" "$ts_writer_lo" "WIRE_SCHEMA_VERSION"
+  's/^ *\(schema\) \& 0xff,$/\1/p')"
+compare "TS envelope writer high byte uses the instance's version" "$ts_writer_hi" "schema"
+compare "TS envelope writer low byte uses the instance's version" "$ts_writer_lo" "schema"
 
 # 6. Batch response framing. The existing envelope-version pair above owns the
 # version value; this pair owns prefix width, count/element integer widths and
 # endian, and the length-delimited element body.
 rs_batch_prefix="$(extract "Rust batch prefix width" "${ADAPTER_ROOT}/http/src/versioned.rs" \
-  '/^pub fn write_batch_response_versioned/,/^}/{s/^    out.extend_from_slice(&WIRE_SCHEMA_VERSION.to_be_bytes());$/prefix2/p;}')"
+  '/^pub fn write_batch_response_versioned_as/,/^}/{s/^    out.extend_from_slice(&version.to_be_bytes());$/prefix2/p;}')"
 rs_batch_count="$(extract "Rust batch count framing" "${ADAPTER_ROOT}/http/src/versioned.rs" \
-  '/^pub fn write_batch_response_versioned/,/^}/{s/^    out.extend_from_slice(&count.to_le_bytes());$/count-u64-le/p;}')"
+  '/^pub fn write_batch_response_versioned_as/,/^}/{s/^    out.extend_from_slice(&count.to_le_bytes());$/count-u64-le/p;}')"
 rs_batch_len="$(extract "Rust batch element length" "${ADAPTER_ROOT}/http/src/versioned.rs" \
-  '/^pub fn write_batch_response_versioned/,/^}/{s/^        out.extend_from_slice(&elem_len.to_le_bytes());$/len-u64-le/p;}')"
+  '/^pub fn write_batch_response_versioned_as/,/^}/{s/^        out.extend_from_slice(&elem_len.to_le_bytes());$/len-u64-le/p;}')"
 rs_batch_body="$(extract "Rust batch element body" "${ADAPTER_ROOT}/http/src/versioned.rs" \
-  '/^pub fn write_batch_response_versioned/,/^}/{s/^        out.extend_from_slice(&body);$/bytes/p;}')"
+  '/^pub fn write_batch_response_versioned_as/,/^}/{s/^        out.extend_from_slice(&body);$/bytes/p;}')"
 rs_batch="${rs_batch_prefix}|${rs_batch_count}|${rs_batch_len}|${rs_batch_body}"
 
 ts_batch_prefix="$(extract "TS batch prefix width" "${ADAPTER_ROOT}/sdk/src/raven-poi-node-interface.ts" \
