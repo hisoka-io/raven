@@ -13,7 +13,7 @@
 #   HOWL_CHAIN_ID             chain id
 #   HOWL_POOL                 the pool's address, 0x-prefixed
 #   HOWL_DEPLOYMENT_BLOCK     the block the pool was deployed in
-#   HOWL_PARAM_SET            1 or 2 (default 1)
+#   HOWL_PARAM_SET            2 or 1 (default 2)
 #   HOWL_DATA_DIR             the table and key material (default: RAILWAY_VOLUME_MOUNT_PATH when
 #                             set, else /data, the image's volume)
 #   PORT                      the node binds 0.0.0.0:$PORT (default 8645)
@@ -53,7 +53,7 @@ esac
 case ${pool#0x} in
   *[!0-9a-fA-F]*) die "HOWL_POOL '$pool' is not hex" ;;
 esac
-param_set=${HOWL_PARAM_SET:-1}
+param_set=${HOWL_PARAM_SET:-2}
 case $param_set in
   1 | 2) ;;
   *) die "HOWL_PARAM_SET must be 1 or 2, not '$param_set'" ;;

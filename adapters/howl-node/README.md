@@ -38,7 +38,7 @@ Optional flags: `--poll-ms` (2,000), `--max-range` (most blocks one log read ask
 `--max-sessions`
 (2,048), `--session-ttl-secs` (3,600; a session's lifetime restarts with each use), `--concurrent`
 (batches answered at once), `--respond-threads` (threads computing set-2 responses, shared by every
-batch; the cores), `--walk-blocks` (64, at least 1, below), `--param-set` (1 or 2, below; 1 by
+batch; the cores), `--walk-blocks` (64, at least 1, below), `--param-set` (2 or 1, below; 2 by
 default). The bounds of a public node are under [Serving in public](#serving-in-public).
 
 A log read starts at one block and doubles while it holds less than half of one table batch. When the
@@ -65,7 +65,8 @@ nothing new carries the header and three empty runs: 96 bytes.
 ## Parameter sets
 
 A node serves one parameter set, chosen at start and named in every answer's header and every
-request's prefix. A client builds its key and queries for the set the params answer names. The
+request's prefix. It serves set 2 unless started with `--param-set 1` (`HOWL_PARAM_SET=1` in the
+container); set 1 stays selectable. A client builds its key and queries for the set the params answer names. The
 plain routes are the same bytes under either set apart from that id.
 
 | | Set 1 | Set 2 |

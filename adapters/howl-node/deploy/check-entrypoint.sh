@@ -64,11 +64,11 @@ refuses() {  # refuses <message part> <env...> -- <args...>
   fi
 }
 
-renders "--data-dir $data --chain-id 421614 --pool $pool --deployment-block 312414608 --param-set 1 --listen 0.0.0.0:8645" \
+renders "--data-dir $data --chain-id 421614 --pool $pool --deployment-block 312414608 --param-set 2 --listen 0.0.0.0:8645" \
   "${base[@]}" -- --print-args
-renders "--data-dir $data --chain-id 421614 --pool $pool --deployment-block 312414608 --param-set 2 --listen 0.0.0.0:9100 --rate 7" \
-  "${base[@]}" HOWL_PARAM_SET=2 PORT=9100 -- --print-args --rate 7
-renders "--data-dir /data --chain-id 421614 --pool $pool --deployment-block 312414608 --param-set 1 --listen 0.0.0.0:8645" \
+renders "--data-dir $data --chain-id 421614 --pool $pool --deployment-block 312414608 --param-set 1 --listen 0.0.0.0:9100 --rate 7" \
+  "${base[@]}" HOWL_PARAM_SET=1 PORT=9100 -- --print-args --rate 7
+renders "--data-dir /data --chain-id 421614 --pool $pool --deployment-block 312414608 --param-set 2 --listen 0.0.0.0:8645" \
   HOWL_CHAIN_ID=421614 HOWL_POOL=$pool HOWL_DEPLOYMENT_BLOCK=312414608 -- --print-args
 
 # --print-args skips the endpoint check, so this one runs as a start would.

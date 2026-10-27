@@ -116,7 +116,7 @@ describe.skipIf(!live)("against a running node", () => {
     chain = await LocalChain.start();
     await chain.mineFixture(0, HALF);
     halfway = await chain.rpc("evm_snapshot");
-    await chain.startNode(BIN);
+    await chain.startNode(BIN, { paramSet: 1 });
     await chain.caughtUp();
   });
 
@@ -260,8 +260,16 @@ describe.skipIf(!live)("against a running node", () => {
     }
   });
 
-  it("a source follows its node through a restart under the other parameter set", async () => {
+  it("a node started without a set serves set 2", async () => {
     const url = await chain.startNode(BIN);
+    await chain.caughtUp(chain.leafCount, url);
+    const params = wasm.decodeAnswer((await fetchTransport(url).get("/howl/v1/params")).body);
+    expect(params.paramSet).toBe(2);
+    params.free();
+  });
+
+  it("a source follows its node through a restart under the other parameter set", async () => {
+    const url = await chain.startNode(BIN, { paramSet: 1 });
     await chain.caughtUp(chain.leafCount, url);
     // alice reads with a session, bob with the key inline; each keeps one source throughout
     const readers = (["session", "inline"] as const).map((keyMode, k) => {

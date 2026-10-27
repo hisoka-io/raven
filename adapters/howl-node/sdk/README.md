@@ -80,6 +80,47 @@ read again under the node's params, and sends it once; otherwise, or if that rea
 raises the error. The feed, the tree and the cells already read are chain data and stay: after a
 re-seed on the same chain the next sync goes on from the cursor.
 
+## Multisig
+
+Howl's `MultisigScanner` reads chain events, with all seven ciphertext words and the full
+commitment, and keeps its tag maps to itself. `MultisigRavenScan` feeds it from Raven cells:
+
+```ts
+import { MultisigRavenScan } from "@hisoka-io/raven-howl-client";
+
+const scanner = await MultisigScanner.create({ v, gpk, compliancePk, memberIds, selfWindow, incomingWindow });
+const scan = new MultisigRavenScan({
+  source, field, scanner, memberIds, selfWindow, incomingWindow, // the scanner's own windows
+  keys: {
+    selfTag: async (memberId, j) => { /* deriveSelfEph; null when its y is odd */ },
+    incomingAt: async (from) => { /* multisigIncomingKeyAt: { index, tag, secret } */ },
+    open: async (record, source, secret) => { /* per content key: reconstructCiphertext with
+      owner = multisigOwner(gpk), demDecrypt, leaf -> [{ words, commitment }] */ },
+  },
+});
+const { found, refused, unopened } = await scan.scan(); // found[i].view is the scanner's own view
+```
+
+It registers the tags the scanner registers, under the same lookahead rules, probes them, opens
+every matched position of the right record kind, accepts a note whose commitment starts with the
+cell's 16-byte prefix, checks it with `confirmNote`, and passes the scanner the event it would have
+read from the chain. Windows grow on both sides from the same notes, so a note past the first
+window is reached in a later round of the same scan.
+
+A FROST spend signs a message that binds the tree root. The coordinator takes every path of a
+session at one leaf count, and each signer checks the session against its own client before it
+commits:
+
+```ts
+const { session, witnesses } = await openSigningSession(source, [leafIndex], leafCount); // { leafCount, root, notes }
+// each signer, with the notes its own scan found (leaf index -> commitment):
+await checkSigningSession(mySource, field, session, myNotes); // throws SigningSessionRefused
+```
+
+A signer refuses a note its scan did not find (`unknown-note`), a tree leaf that is not that note
+(`leaf`), a path that folds to another root at the session count (`root`), or a count its node
+does not reach (`count`). The root must still be known on chain before proving.
+
 ## Sizes on the wire
 
 | Item | Parameter set 1 | Parameter set 2 |
@@ -103,7 +144,7 @@ HOWL_NODE_BIN=../target/release/howl-node pnpm test   # plus a node following a 
 ```
 
 `HOWL_REPO=<Howl checkout>` adds cross-checks against Howl's own key derivation, codec and
-self-mint preflight, and regenerates the vectors in `tests/fixtures/howl-vectors.json` that the
+self-mint preflight, a FROST group's multisig scan and signing session on both parameter sets, and regenerates the vectors in `tests/fixtures/howl-vectors.json` that the
 offline tests check (`HOWL_WRITE_VECTORS=1` rewrites them). CI runs the offline tests and the
 node suite; `node scripts/check-test-count.mjs` holds the run to the counts in
 `tests/EXPECTED_COUNTS.json`.

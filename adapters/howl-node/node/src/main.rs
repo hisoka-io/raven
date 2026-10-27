@@ -3,11 +3,13 @@
 //! ```text
 //! HOWL_NODE_RPC_URL=<endpoint> howl-node --data-dir DIR --chain-id N --pool 0x.. \
 //!     --deployment-block N [--listen 127.0.0.1:8545] [--poll-ms 2000] [--max-range 50000] \
-//!     [--max-sessions 2048] [--session-ttl-secs 3600] [--concurrent N] [--param-set 1|2]
+//!     [--max-sessions 2048] [--session-ttl-secs 3600] [--concurrent N] [--param-set 2|1]
 //!     [--walk-blocks 64] [--respond-threads N] [--rate 5000] [--rate-burst 10000]
 //!     [--session-rate 4] [--session-burst 64] [--queued N] [--permit-wait-ms 20000]
 //!     [--bodies N] [--body-timeout-ms 30000]
 //! ```
+//!
+//! `--param-set` picks the scheme served: 2 (the default) or the older 1.
 //!
 //! `--concurrent` bounds the batches answered at once and `--respond-threads` the threads that
 //! compute set-2 responses for all of them (both default to the cores). `--walk-blocks` is the
@@ -59,7 +61,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         ttl: Duration::from_secs(3_600),
     };
     let mut concurrent = std::thread::available_parallelism().map_or(4, usize::from);
-    let mut param_set = howl_wire::PARAM_SET_D2048_CELL256;
+    let mut param_set = howl_wire::PARAM_SET_D2048_CELL256_P16;
     let mut tuning = Tuning::default();
     let mut requests = None;
     let mut sessions_opened = None;
@@ -331,6 +333,19 @@ mod tests {
             follows.limits.bodies, 10,
             "twice the permits and queue places"
         );
+    }
+
+    #[test]
+    fn set_two_is_the_default_and_set_one_stays_selectable() {
+        let parsed = parse(args(&[])).expect("parses");
+        assert_eq!(
+            parsed.node.param_set,
+            howl_wire::PARAM_SET_D2048_CELL256_P16
+        );
+        let one = parse(args(&["--param-set", "1"])).expect("set 1");
+        assert_eq!(one.node.param_set, howl_wire::PARAM_SET_D2048_CELL256);
+        let two = parse(args(&["--param-set", "2"])).expect("set 2");
+        assert_eq!(two.node.param_set, howl_wire::PARAM_SET_D2048_CELL256_P16);
     }
 
     #[test]

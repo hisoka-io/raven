@@ -29,3 +29,19 @@ export {
   type TagPrefixSegment,
 } from "./source.js";
 export { KIND, type HowlAnswerView, type HowlBatchHandle, type HowlCellsView, type HowlClientHandle, type HowlTreeHandle, type HowlWasm } from "./wasm.js";
+export {
+  checkSigningSession,
+  MultisigRavenScan,
+  openSigningSession,
+  SigningSessionRefused,
+  type MultisigChainEvent,
+  type MultisigEventScanner,
+  type MultisigFound,
+  type MultisigKeys,
+  type MultisigScanOptions,
+  type MultisigScanResult,
+  type MultisigTagSource,
+  type OpenedCell,
+  type SigningRefusalReason,
+  type SigningSession,
+} from "./multisig.js";
