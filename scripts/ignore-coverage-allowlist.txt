@@ -56,7 +56,6 @@ crates/inspire/benches/packing_noise_measurement.rs::served_post_switch_noise_di
 # A dump tool, not a check: it writes the special-modulus cases the off-CI exact-integer
 # reference reads, so no lane runs it.
 crates/inspire/tests/special_modulus_kat.rs::dump_cases_for_the_integer_reference
-crates/inspire/benches/approximate_gadget_noise.rs::approximate_gadget_keeps_the_exact_gadgets_margin
 crates/inspire/benches/packing_seat_bench.rs::client_key_build_and_seat_registration
 crates/inspire/benches/packing_seat_bench.rs::respond_under_a_seat_and_the_online_kernel
 crates/inspire/benches/shard_packing_store_bench.rs::respond_with_and_without_a_shard_store

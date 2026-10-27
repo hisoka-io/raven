@@ -1,0 +1,119 @@
+name: Howl e2e
+
+# Howl's own contracts, at a pinned commit of their public repository, deployed on a local anvil chain;
+# the Raven Howl node built from this commit following that chain; wallets on this commit's SDK and
+# wasm client sending real proofs. Each wallet is graded after every transaction against an independent
+# scan of the chain's logs, and the run fails on any mismatch. See adapters/howl-node/e2e/run.sh.
+#
+# Not on push: the proofs are real, so a run takes tens of minutes. Nightly runs the default suites;
+# a manual run can pick suites, e.g. `full:1` for the long run with outsider load and a 70,000-leaf pool.
+on:
+  schedule:
+    # after the main nightly at 03:00
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: "run.sh suites, e.g. nightly | sim:2 smoke:1 | full:1"
+        required: false
+        default: nightly
+
+permissions:
+  contents: read
+
+concurrency:
+  group: howl-e2e-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # replaces .cargo/config.toml's rustflags and its lld flag, as in ci.yml
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  e2e:
+    name: Howl contracts + Raven node + SDK (agents, real proofs)
+    runs-on: ubuntu-latest
+    # the long run needs hours; a hosted job's ceiling is six
+    timeout-minutes: ${{ contains(inputs.suites, 'full') && 360 || 90 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: read the pinned Howl commit
+        id: pin
+        run: echo "rev=$(tr -d '[:space:]' < adapters/howl-node/e2e/darkpool.rev)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: hisoka-io/darkpool
+          ref: ${{ steps.pin.outputs.rev }}
+          path: darkpool
+          persist-credentials: false
+      # Toolchains as Howl's CI pins them at that commit: their nargo action, native bb 5.0.0 (the
+      # Kage settlement proof is recursive, which bb.js does not build) and their pnpm. Node 22 rather
+      # than their 20: the harness imports workspace packages that ship TypeScript sources.
+      - uses: ./darkpool/.github/actions/setup-nargo
+      - name: install native bb 5.0.0
+        run: |
+          curl -L https://raw.githubusercontent.com/AztecProtocol/aztec-packages/master/barretenberg/bbup/install | bash
+          export PATH="$HOME/.bb:$PATH"
+          bbup -v 5.0.0
+          echo "$HOME/.bb" >> "$GITHUB_PATH"
+          "$HOME/.bb/bb" --version | grep -q '5.0.0'
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.3.2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.24.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.17.1"
+          cache: pnpm
+          cache-dependency-path: |
+            darkpool/pnpm-lock.yaml
+            adapters/howl-node/sdk/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            adapters/howl-node
+            adapters/howl-node/client-wasm
+      - name: install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: plant checker red-proof
+        run: python3 -I adapters/howl-node/e2e/test_check_plant.py
+      - name: stage the harness into Howl's checkout
+        run: adapters/howl-node/e2e/run.sh darkpool e2e-out stage
+      - name: build the node
+        run: cargo build --release --manifest-path adapters/howl-node/Cargo.toml -p howl-node --locked
+      - name: build the wasm client (nodejs)
+        working-directory: adapters/howl-node/client-wasm
+        run: wasm-pack build --release --target nodejs --scope hisoka-io --out-dir pkg-node --out-name howl_client_wasm
+      - name: build the SDK
+        working-directory: adapters/howl-node/sdk
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+      - name: build Howl's packages and contracts
+        working-directory: darkpool
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm turbo run build --filter=evm-contracts...
+      - name: run the suites
+        env:
+          SUITES: ${{ github.event_name == 'workflow_dispatch' && inputs.suites || 'nightly' }}
+        # run.sh refuses a suite name it does not know
+        run: adapters/howl-node/e2e/run.sh darkpool e2e-out $SUITES
+      - name: keep the run logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: howl-e2e-${{ github.run_id }}
+          path: |
+            e2e-out/
+            !e2e-out/**/node-data/
+          retention-days: 14
+          if-no-files-found: ignore
