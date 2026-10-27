@@ -58,7 +58,7 @@ Options:
                             $NODE_PEAK_MIB + SEATS x INSTANCES x $SEAT_KIB / 1024 + $HEADROOM_MIB
                           the warm-boot peak (at most 3.9 GiB in five boots of a replay, settling
                           at 2.0 GiB, plus a margin), every packing-key seat full ($SEAT_KIB KiB
-                          each at any row size), and headroom for queries. The defaults need 5767 MiB for the template's 7 instances.
+                          each at any row size), and headroom for queries. The defaults need 5816 MiB for the template's 8 instances.
   --max-sessions N        packing-key seats per instance (default 1024), written to the config
                           as max_sessions_per_instance. A full instance refuses new sessions
                           until one expires

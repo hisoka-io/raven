@@ -2005,16 +2005,22 @@ async fn a_cold_sync_stops_where_the_declared_blocks_end_and_names_the_next() {
 /// the backfill setting from an upstream holding the list at its measured row count and answering
 /// each page after the measured live round trip, so fetch and apply overlap as they would against
 /// the real one. Prints the wall clock to caught up and the graceful stop that commits the static
-/// blocks. Blocks 0-4 fill, block 5 holds the rest, and block 6 stays empty.
+/// blocks. Blocks 0-4 fill, block 5 holds the rest, and the later blocks stay empty.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "cost: a cold sync of 358,344 rows into seven production cells, tens of minutes; run by hand, as the test binary with --ignored, when the feed, router, commit policy or list size changes"]
+#[ignore = "cost: a cold sync of 358,344 rows into a production cell per declared block, tens of minutes; run by hand, as the test binary with --ignored, when the feed, router, commit policy or list size changes"]
 #[allow(clippy::print_stderr)]
 async fn a_cold_sync_of_the_whole_shipped_list_at_the_live_round_trip() {
     // Upstream's row count at 2026-09-20T08:14:13Z, and its round trip for a full page.
     const ROWS: u64 = 358_344;
     const ROUND_TRIP: Duration = Duration::from_millis(1_050);
     let block = u64::from(raven_railgun_engine::orchestrator::LEAVES_PER_PPOI_BLOCK);
-    let blocks: Vec<String> = (0..7)
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/mainnet-ppoi.toml");
+    let declared = std::fs::read_to_string(example)
+        .expect("read the shipped example")
+        .lines()
+        .filter(|line| line.trim() == "[[instance]]")
+        .count();
+    let blocks: Vec<String> = (0..declared)
         .map(|index| format!("ppoi-paths-ofac-{index}"))
         .collect();
     let ids: Vec<&str> = blocks.iter().map(String::as_str).collect();
@@ -2045,7 +2051,14 @@ async fn a_cold_sync_of_the_whole_shipped_list_at_the_live_round_trip() {
     let full = usize::try_from(block).expect("block rows");
     let held: Vec<usize> = ids.iter().map(|id| rows_under(&view, id)).collect();
     let last = usize::try_from(ROWS - 5 * block).expect("rows");
-    assert_eq!(held, [full, full, full, full, full, last, 0]);
+    let expected: Vec<usize> = (0..declared)
+        .map(|index| match index {
+            0..=4 => full,
+            5 => last,
+            _ => 0,
+        })
+        .collect();
+    assert_eq!(held, expected);
     let (paging, polling): (Vec<u64>, Vec<u64>) = start_indices(&requests)
         .into_iter()
         .partition(|start| *start < ROWS);

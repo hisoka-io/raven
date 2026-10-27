@@ -599,9 +599,10 @@ jobs:
           - name: shipped-config-spawn
             packages: "-p raven-railgun-cli"
             cargo_flags: ""
-            # production-cell, not ci: the boot is close to serial (the seven-block config's
-            # test took 100 s on a 16-core box beside another boot), so per-core speed sets it,
-            # and this runner's is unmeasured against ci's 120 s x 3 cap
+            # production-cell, not ci: the boot is close to serial (the eight-block config's
+            # test takes 5-6 s on a 16-core box under load 9-11, 100 s in an earlier build beside
+            # another boot), so per-core speed sets it, and this runner's is unmeasured against
+            # ci's 120 s x 3 cap
             nextest_profile: production-cell
             run_ignored: only
             filter: "binary(shipped_config_spawn)"

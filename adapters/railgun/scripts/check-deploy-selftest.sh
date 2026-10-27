@@ -59,7 +59,7 @@ expect "boot peak changed, help figure not" "does not state" deploy/lib.sh 's/^N
 expect "seat size for another row" "record_size is not 512" examples/mainnet-ppoi.toml \
   's/^record_size = 512$/record_size = 1024/'
 # shellcheck disable=SC2016  # sed expressions, not shell
-expect "an eighth instance" "does not state" examples/mainnet-ppoi.toml \
+expect "an instance past the template's count" "does not state" examples/mainnet-ppoi.toml \
   '$a [[instance]]'
 expect "Railway build stage drifted" "build stage" deploy/railway/Dockerfile 's/ --locked//'
 # shellcheck disable=SC2016  # sed expressions, not shell
