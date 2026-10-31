@@ -41,7 +41,7 @@ expect() {
 
 echo "ci-changes-selftest.sh: fixtures, the workflow, the sources, CI mode"
 
-RAILGUN_SET=docs,railgun,msrv_1_89,msrv_1_91,sdk
+RAILGUN_SET=docs,railgun,msrv_1_89,msrv_1_91,sdk,railgun_image
 expect "docs only" NONE README.md SECURITY.md adapters/railgun/client-wasm/README.md
 expect "the SDK only" sdk adapters/railgun/sdk/src/client-pir.ts adapters/railgun/sdk/package.json
 expect "the SDK README ships in the package" sdk adapters/railgun/sdk/README.md
@@ -55,11 +55,15 @@ expect "the client wasm" wasm,msrv_1_89,sdk adapters/railgun/client-wasm/src/lib
 expect "one detached workspace" bench_compare,bench_gate,msrv_1_89 tools/bench-compare/src/main.rs
 expect "the committed bench baselines" bench_compare,bench_gate benches/baselines/b1-two-packing-cell-2e16x512.json
 expect "the eth-state submodule" eth_state,msrv_1_91 adapters/eth-state
-expect "the inspire submodule" root,docs,wasm,railgun,inspire,eth_state,howl,b1_bench,bench_gate,msrv_1_89,msrv_1_91,sdk crates/inspire
-expect "a framework crate" root,docs,wasm,railgun,eth_state,howl,msrv_1_89,msrv_1_91,sdk crates/core/src/lib.rs
-expect "the root lockfile" root,docs,wasm,msrv_1_89 Cargo.lock
-expect "the howl submodule, whose crates the node builds" howl,msrv_1_89 adapters/howl
-expect "the howl node" howl,msrv_1_89 adapters/howl-node/store/src/lib.rs
+expect "the inspire submodule" root,docs,wasm,railgun,inspire,eth_state,howl,b1_bench,bench_gate,msrv_1_89,msrv_1_91,sdk,howl_image,railgun_image crates/inspire
+expect "a framework crate" root,docs,wasm,railgun,eth_state,howl,msrv_1_89,msrv_1_91,sdk,howl_image,railgun_image crates/core/src/lib.rs
+expect "the root lockfile" root,docs,wasm,msrv_1_89,howl_image,railgun_image Cargo.lock
+expect "the howl submodule, whose crates the node builds" howl,msrv_1_89,howl_image adapters/howl
+expect "the howl node" howl,msrv_1_89,howl_image adapters/howl-node/store/src/lib.rs
+expect "the Howl node image" howl,msrv_1_89,howl_image adapters/howl-node/deploy/Dockerfile
+expect "the Railway image and its staging" "$RAILGUN_SET" adapters/railgun/deploy/railway/Dockerfile \
+  adapters/railgun/deploy/railway/up.sh
+expect "the Docker build filter" howl_image .dockerignore
 expect "the workflow" ALL .github/workflows/ci.yml
 expect "the lane pins" ALL .github/expected-lane-counts.tsv
 expect "a gate script" ALL scripts/assert-lane-counts.sh

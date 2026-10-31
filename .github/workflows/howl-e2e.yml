@@ -106,7 +106,9 @@ jobs:
         env:
           SUITES: ${{ github.event_name == 'workflow_dispatch' && inputs.suites || 'nightly' }}
         # run.sh refuses a suite name it does not know
-        run: adapters/howl-node/e2e/run.sh darkpool e2e-out $SUITES
+        run: |
+          # shellcheck disable=SC2086  # SUITES is a list of suite names, one argument each
+          adapters/howl-node/e2e/run.sh darkpool e2e-out $SUITES
       - name: keep the run logs
         if: ${{ always() }}
         uses: actions/upload-artifact@v4

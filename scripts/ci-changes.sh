@@ -63,6 +63,11 @@ KEYS = {
     "msrv_1_91": (["adapters/eth-state/Cargo.toml", RAILGUN], []),
     # the SDK gates read Rust constants and scripts from across the adapter
     "sdk": ([CLIENT_WASM, RAILGUN], ["adapters/railgun/**"]),
+    # Each image builds one adapter workspace, and cargo loads the root workspace for its path
+    # dependencies. The Howl context is the root, filtered by .dockerignore; the Railway context
+    # is what its up.sh stages, which the adapter workspace holds.
+    "howl_image": ([ROOT, "adapters/howl-node/Cargo.toml"], ["adapters/howl", ".dockerignore"]),
+    "railgun_image": ([ROOT, RAILGUN], []),
 }
 
 # A change here selects every job.
@@ -71,7 +76,7 @@ ALL = [".github/**", "scripts/**", "rust-toolchain.toml", "**/rust-toolchain.tom
 
 # Read by no filtered job. Markdown is included by no Rust source (the selftest checks), except
 # the SDK README, which ships in its package.
-NO_JOB = ["LICENSE", ".gitignore", ".dockerignore", ".gitleaks.toml", "deny.toml"]
+NO_JOB = ["LICENSE", ".gitignore", ".gitleaks.toml", "deny.toml"]
 NO_JOB_MD_EXCEPT = ["adapters/railgun/sdk/**"]
 
 # Subtrees of a detached workspace directory that its cargo build never reads. The SDK fixtures

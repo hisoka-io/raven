@@ -51,6 +51,8 @@ jobs:
       msrv_1_89: ${{ steps.select.outputs.msrv_1_89 }}
       msrv_1_91: ${{ steps.select.outputs.msrv_1_91 }}
       sdk: ${{ steps.select.outputs.sdk }}
+      howl_image: ${{ steps.select.outputs.howl_image }}
+      railgun_image: ${{ steps.select.outputs.railgun_image }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1105,6 +1107,51 @@ jobs:
         run: node scripts/check-test-count.mjs
         working-directory: adapters/howl-node/sdk
 
+  # The node images, built from their Dockerfiles and run once with no network by
+  # scripts/image-smoke.sh: the liveness route answers, the node runs as its own user, and a stop
+  # exits clean. Nothing is pushed; the jobs hold no registry credential.
+  howl-image:
+    name: Howl node image (build + smoke run)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.howl_image != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: docker build
+        run: docker build --progress=plain -f adapters/howl-node/deploy/Dockerfile -t raven-ci/howl-node:ci .
+      - name: smoke run
+        run: scripts/image-smoke.sh howl-node raven-ci/howl-node:ci
+
+  railgun-image:
+    name: Railgun node image for Railway (build + smoke run)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.railgun_image != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+          persist-credentials: false
+      # The context Railway builds: the tracked files under the Dockerfile's COPY paths.
+      - name: stage the Railway build context
+        run: adapters/railgun/deploy/railway/up.sh --stage-only "$RUNNER_TEMP/railway-context"
+      - name: docker build
+        run: |
+          docker build --progress=plain -t raven-ci/railgun-node:ci \
+            -f "$RUNNER_TEMP/railway-context/adapters/railgun/deploy/railway/Dockerfile" \
+            "$RUNNER_TEMP/railway-context"
+      - name: smoke run
+        run: scripts/image-smoke.sh railgun-node raven-ci/railgun-node:ci
+
   b1-bench:
     name: b1-bench (detached workspace)
     needs: changes
@@ -1443,9 +1490,11 @@ jobs:
       - name: stage the sdk pack candidate
         run: |
           set -euo pipefail
+          # shellcheck disable=SC2016  # a JavaScript template literal
           want=$(node -p 'const m = require("./adapters/railgun/sdk/package.json"); `${m.name}@${m.version}`')
           out="$RUNNER_TEMP/sdk-pack-candidate"
           mkdir -p "$out"
+          # shellcheck disable=SC2016  # a JavaScript template literal
           for tgz in "$RUNNER_TEMP"/sdk-pack/tar/*.tgz; do
             got=$(tar -xOzf "$tgz" package/package.json \
               | node -p 'const m = JSON.parse(require("node:fs").readFileSync(0, "utf8")); `${m.name}@${m.version}`')
@@ -1456,6 +1505,7 @@ jobs:
           cd "$out"
           sha256sum -- *.tgz > SHA256SUMS
           # The form a registry reports as dist.integrity, so a published copy can be matched to this one.
+          # shellcheck disable=SC2016  # a JavaScript template literal
           node -e 'const c = require("node:crypto"), f = require("node:fs");
             for (const p of process.argv.slice(1)) console.log(`sha512-${c.createHash("sha512").update(f.readFileSync(p)).digest("base64")}  ${p}`)' \
             -- *.tgz > INTEGRITY
