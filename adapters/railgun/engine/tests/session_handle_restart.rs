@@ -20,7 +20,6 @@ use raven_railgun_engine::{InstanceRole, PirScheme};
 const ENTRY_SIZE: usize = 32;
 /// Written by builds that kept a handle floor; a data dir may still hold one.
 const FLOOR_FILE: &str = "session-handle-floor-v1.bin";
-const CHILD_DATA_DIR: &str = "RAVEN_RESTART_HANDLE_CHILD_DATA_DIR";
 const CHILD_OUTPUT: &str = "RAVEN_RESTART_HANDLE_CHILD_OUTPUT";
 
 fn limits() -> SessionStoreLimits {
@@ -31,8 +30,7 @@ fn limits() -> SessionStoreLimits {
 }
 
 #[test]
-fn reopening_one_data_dir_never_reissues_a_stale_handle() {
-    let dir = tempfile::tempdir().expect("tempdir");
+fn reopening_the_store_never_reissues_a_stale_handle() {
     let params = InspireParams::d2048();
     let database: Vec<u8> = (0..params.ring_dim * ENTRY_SIZE)
         .map(|offset| u8::try_from(offset % 251).expect("mod 251"))
@@ -43,16 +41,14 @@ fn reopening_one_data_dir_never_reissues_a_stale_handle() {
     // enough to show the restart never reissues.
     let mut client = build_client_session((*state.crs).clone()).expect("client");
 
-    let first = BoundedSessionStore::open_with_limits(dir.path(), limits()).expect("first open");
+    let first = BoundedSessionStore::open_with_limits(limits()).expect("first open");
     let stale = first
         .register_client_session_at(&mut client, std::time::Instant::now())
         .expect("first register")
         .expect("packing handle");
     drop(first);
 
-    let second = Arc::new(
-        BoundedSessionStore::open_with_limits(dir.path(), limits()).expect("restart open"),
-    );
+    let second = Arc::new(BoundedSessionStore::open_with_limits(limits()).expect("restart open"));
     let live = second
         .register_client_session_at(&mut client, std::time::Instant::now())
         .expect("second register")
@@ -305,20 +301,16 @@ async fn production_multi_boot_issues_random_handles() {
 
 #[test]
 fn two_process_restarts_issue_unrelated_handles() {
-    if let (Ok(data_dir), Ok(output)) = (std::env::var(CHILD_DATA_DIR), std::env::var(CHILD_OUTPUT))
-    {
-        write_one_child_handle(
-            std::path::Path::new(&data_dir),
-            std::path::Path::new(&output),
-        );
+    if let Ok(output) = std::env::var(CHILD_OUTPUT) {
+        write_one_child_handle(std::path::Path::new(&output));
         return;
     }
 
     let dir = tempfile::tempdir().expect("tempdir");
     let first_output = dir.path().join("first-handle");
     let second_output = dir.path().join("second-handle");
-    run_child(dir.path(), &first_output);
-    run_child(dir.path(), &second_output);
+    run_child(&first_output);
+    run_child(&second_output);
     let stale = read_u64(&first_output);
     let live = read_u64(&second_output);
     assert_ne!(
@@ -331,24 +323,23 @@ fn two_process_restarts_issue_unrelated_handles() {
     );
 }
 
-fn run_child(data_dir: &std::path::Path, output: &std::path::Path) {
+fn run_child(output: &std::path::Path) {
     let status = std::process::Command::new(std::env::current_exe().expect("current test binary"))
         .arg("--exact")
         .arg("two_process_restarts_issue_unrelated_handles")
-        .env(CHILD_DATA_DIR, data_dir)
         .env(CHILD_OUTPUT, output)
         .status()
         .expect("spawn restart child");
     assert!(status.success(), "restart child exited {status}");
 }
 
-fn write_one_child_handle(data_dir: &std::path::Path, output: &std::path::Path) {
+fn write_one_child_handle(output: &std::path::Path) {
     let params = InspireParams::d2048();
     let database = vec![0u8; params.ring_dim * ENTRY_SIZE];
     let (state, _) =
         setup_state(&params, &database, ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup");
     let mut client = build_client_session((*state.crs).clone()).expect("client session");
-    let store = BoundedSessionStore::open_with_limits(data_dir, limits()).expect("open");
+    let store = BoundedSessionStore::open_with_limits(limits()).expect("open");
     let handle = store
         .register_client_session_at(&mut client, std::time::Instant::now())
         .expect("register")

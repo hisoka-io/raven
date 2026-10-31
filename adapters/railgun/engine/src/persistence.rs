@@ -945,7 +945,6 @@ pub fn bootstrap_inspire_instance_with_session_limits(
     super::inspire::LogicalLeafStore,
 )> {
     let session_store = Arc::new(super::session_pool::BoundedSessionStore::open_with_limits(
-        layout.root(),
         session_limits,
     )?);
     let opened =

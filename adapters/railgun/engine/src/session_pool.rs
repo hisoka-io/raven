@@ -1,6 +1,5 @@
 //! Railgun metric facade over the bounded InsPIRe session mechanism.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -19,7 +18,7 @@ pub use raven_inspire_session::{SessionStoreLimits, DEFAULT_MAX_SESSIONS, DEFAUL
 
 /// Occupancy-bounded InsPIRe sessions with Railgun's operator metrics.
 ///
-/// State, durability, and handle binding live in `raven-inspire-session`. This facade maps its
+/// State and handle binding live in `raven-inspire-session`. This facade maps its
 /// typed errors into the adapter error contract and emits the existing `raven_railgun_*` series.
 pub struct BoundedSessionStore {
     inner: raven_inspire_session::BoundedSessionStore,
@@ -55,24 +54,14 @@ impl BoundedSessionStore {
         ))
     }
 
-    /// Open a restart-safe store with default limits.
+    /// A store with caller-selected limits, checked up front. Restart-safe without disk state:
+    /// handles are drawn at random.
     ///
     /// # Errors
     ///
-    /// [`AdapterError::Internal`] when the durable floor cannot prove handle non-reuse.
-    pub fn open(data_dir: &Path) -> Result<Self> {
-        raven_inspire_session::BoundedSessionStore::open(data_dir)
-            .map(Self::from_inner)
-            .map_err(map_error)
-    }
-
-    /// Open a restart-safe store with caller-selected limits.
-    ///
-    /// # Errors
-    ///
-    /// [`AdapterError::Internal`] when the durable floor cannot prove handle non-reuse.
-    pub fn open_with_limits(data_dir: &Path, limits: SessionStoreLimits) -> Result<Self> {
-        raven_inspire_session::BoundedSessionStore::open_with_limits(data_dir, limits)
+    /// [`AdapterError::Internal`] when `limits` admits no session.
+    pub fn open_with_limits(limits: SessionStoreLimits) -> Result<Self> {
+        raven_inspire_session::BoundedSessionStore::open_with_limits(limits)
             .map(Self::from_inner)
             .map_err(map_error)
     }
@@ -132,7 +121,8 @@ impl BoundedSessionStore {
     /// # Errors
     ///
     /// [`AdapterError::AtCapacity`] when live sessions and registrations in progress fill the
-    /// ceiling; otherwise an actionable adapter error when durability or InsPIRe rejects it.
+    /// ceiling; otherwise an actionable adapter error when the entropy source or InsPIRe
+    /// rejects it.
     pub fn register_server_side(
         &self,
         keys: ClientPackingKeys,
@@ -147,7 +137,8 @@ impl BoundedSessionStore {
     /// # Errors
     ///
     /// [`AdapterError::AtCapacity`] when live sessions and registrations in progress fill the
-    /// ceiling; otherwise an actionable adapter error when durability or InsPIRe rejects it.
+    /// ceiling; otherwise an actionable adapter error when the entropy source or InsPIRe
+    /// rejects it.
     pub fn register_server_side_at(
         &self,
         keys: ClientPackingKeys,

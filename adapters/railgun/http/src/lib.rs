@@ -34,7 +34,7 @@ pub use batch::BatchError;
 pub use config::HttpConfig;
 pub use handshake::{InstanceParams, SessionEstablishResponse};
 pub use shim_store::{CoverageRefusal, ListCoverage, ShimStoreRegistry};
-pub use state::AppState;
+pub use state::{AppState, InstanceMetricsMap};
 pub use status::{
     ConsumerStatus, HealthConsumerView, HealthReadyResponse, InstanceStatus, RpcEndpointHealthView,
     RpcPoolHealthView, StatusResponse,
@@ -432,17 +432,19 @@ pub(crate) fn build_response_headers(epoch: u64, scheme: &str) -> Result<HeaderM
     Ok(headers)
 }
 
+/// The consumer numbers `X-Raven-Freshness` carries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FreshnessReading {
+    pub(crate) lag_blocks: u64,
+    pub(crate) applied_height: u64,
+}
+
 /// `X-Raven-Freshness`: `confidence = 1.0 - clamp(lag / 256.0, 0, 1)`.
-fn freshness_header_value(
-    metrics: Option<&parking_lot::Mutex<raven_railgun_engine::persistence::ConsumerMetrics>>,
-    epoch: u64,
-) -> String {
-    let (lag, applied) = if let Some(m) = metrics {
-        let snap = *m.lock();
-        (snap.indexer_lag_blocks(), snap.last_applied_block)
-    } else {
-        (0, 0)
-    };
+fn freshness_header_value(reading: Option<FreshnessReading>, epoch: u64) -> String {
+    let FreshnessReading {
+        lag_blocks: lag,
+        applied_height: applied,
+    } = reading.unwrap_or_default();
     #[allow(clippy::cast_precision_loss)]
     let lag_f = lag as f64;
     #[allow(clippy::cast_precision_loss)]
@@ -454,10 +456,10 @@ fn freshness_header_value(
 /// Best-effort: failures are logged and dropped (freshness is non-critical).
 pub(crate) fn attach_freshness_header(
     headers: &mut HeaderMap,
-    metrics: Option<&parking_lot::Mutex<raven_railgun_engine::persistence::ConsumerMetrics>>,
+    reading: Option<FreshnessReading>,
     epoch: u64,
 ) {
-    let value = freshness_header_value(metrics, epoch);
+    let value = freshness_header_value(reading, epoch);
     match HeaderValue::from_str(&value) {
         Ok(v) => {
             headers.insert(X_RAVEN_FRESHNESS, v);

@@ -279,8 +279,7 @@ async fn a_data_dir_holding_another_list_is_refused() {
         .build(cfg.record_size, cfg.entries_per_shard)
         .expect("encoder");
     let layout = StoreLayout::open(&cfg.data_dir).expect("layout");
-    BoundedSessionStore::open_with_limits(layout.root(), SessionStoreLimits::default())
-        .expect("session store");
+    BoundedSessionStore::open_with_limits(SessionStoreLimits::default()).expect("session store");
     let opened = InspirePersistence::open(
         layout,
         SCHEME_TAG,

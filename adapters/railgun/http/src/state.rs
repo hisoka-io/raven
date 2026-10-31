@@ -19,6 +19,11 @@ pub use crate::auth::X_RAVEN_CLIENT_ID;
 type SharedLogicalStore = Arc<parking_lot::Mutex<raven_railgun_engine::inspire::LogicalLeafStore>>;
 type InstanceLogicalStores = HashMap<InstanceId, ([u8; 32], SharedLogicalStore)>;
 
+/// Per-instance consumer cells. Shared rather than built once, because instances spawned after
+/// boot register theirs into the same map the handlers read.
+pub type InstanceMetricsMap =
+    parking_lot::RwLock<HashMap<InstanceId, Arc<parking_lot::Mutex<ConsumerMetrics>>>>;
+
 /// Reads every mirrored PPOI list's feed for `/v1/health/ready`. Called once per probe.
 pub type MirrorFeedProbe = Arc<dyn Fn() -> Vec<crate::status::MirrorFeedView> + Send + Sync>;
 
@@ -33,8 +38,8 @@ pub struct AppState<S: PirScheme> {
     pub read_token: Arc<parking_lot::RwLock<String>>,
     /// Identifier surfaced in `X-Raven-Scheme`.
     pub scheme_name: Arc<String>,
-    /// Single consumer cell: the `X-Raven-Freshness` source, and the `/v1/status` and
-    /// `/metrics` source only while `instance_metrics` is empty. `None` omits the fields.
+    /// Single consumer cell, labelled with the first instance. Read only while
+    /// `instance_metrics` is empty. `None` omits the fields.
     pub(crate) consumer_metrics:
         Arc<Option<Arc<parking_lot::Mutex<raven_railgun_engine::persistence::ConsumerMetrics>>>>,
     /// Filter-tagged stores the shim routes prove coverage against. Installed at boot; `None`
@@ -53,9 +58,9 @@ pub struct AppState<S: PirScheme> {
     /// instead of taking the permits queries respond under.
     pub(crate) handshake_permits: Arc<Semaphore>,
     pub(crate) metrics_handle: Arc<metrics_exporter_prometheus::PrometheusHandle>,
-    /// Per-instance consumer cells for `/metrics`, `/v1/status` and readiness; empty falls back
-    /// to `consumer_metrics`.
-    pub(crate) instance_metrics: Arc<HashMap<InstanceId, Arc<parking_lot::Mutex<ConsumerMetrics>>>>,
+    /// Per-instance consumer cells for `/metrics`, `/v1/status`, readiness and
+    /// `X-Raven-Freshness`; empty falls back to `consumer_metrics`.
+    pub(crate) instance_metrics: Arc<InstanceMetricsMap>,
     /// Whether every served instance must have consumer telemetry before readiness can pass.
     pub(crate) consumer_metrics_required: bool,
     /// Mirrored PPOI list feeds for `/v1/health/ready`. `None` reports and gates on none.
@@ -147,7 +152,7 @@ impl<S: PirScheme> AppState<S> {
             semaphore,
             handshake_permits,
             metrics_handle,
-            instance_metrics: Arc::new(HashMap::new()),
+            instance_metrics: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             consumer_metrics_required: false,
             mirror_feeds: None,
             process_started_at: Instant::now(),
@@ -233,13 +238,23 @@ impl<S: PirScheme> AppState<S> {
     }
 
     /// `/metrics` emits `instance="<id>"` gauges; empty falls back to the single cell.
+    ///
+    /// Adds to the shared map rather than replacing it, so cells an instance spawned at boot
+    /// already registered through [`Self::instance_metrics_registry`] survive.
     #[must_use]
     pub fn with_instance_metrics(
-        mut self,
+        self,
         per_instance: HashMap<InstanceId, Arc<parking_lot::Mutex<ConsumerMetrics>>>,
     ) -> Self {
-        self.instance_metrics = Arc::new(per_instance);
+        self.instance_metrics.write().extend(per_instance);
         self
+    }
+
+    /// The live per-instance map, for registering an instance's cell after boot. Insert it
+    /// before the instance serves, or readiness counts it as having no telemetry.
+    #[must_use]
+    pub fn instance_metrics_registry(&self) -> Arc<InstanceMetricsMap> {
+        Arc::clone(&self.instance_metrics)
     }
 
     /// Register the filter-tagged stores every shim route proves coverage against. A route

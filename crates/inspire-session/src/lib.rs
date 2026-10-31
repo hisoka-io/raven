@@ -14,7 +14,6 @@
 #![deny(missing_docs)]
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -397,26 +396,16 @@ impl BoundedSessionStore {
         }
     }
 
-    /// [`Self::open_with_limits`] with default limits.
+    /// A store with its limits checked up front.
     ///
-    /// # Errors
-    ///
-    /// The default limits are refused, which they never are.
-    pub fn open(data_dir: &Path) -> Result<Self> {
-        Self::open_with_limits(data_dir, SessionStoreLimits::default())
-    }
-
-    /// A store for an instance's data directory, with its limits checked up front.
-    ///
-    /// Nothing is read from or written to `data_dir`: a random handle repeats across a restart
-    /// only by a 64-bit collision, so no issuance history has to survive one. A directory written
-    /// by an earlier build that kept a handle floor there is left as it is.
+    /// The store keeps nothing on disk: a random handle repeats across a restart only by a
+    /// 64-bit collision, so no issuance history has to survive one. A data directory written by
+    /// an earlier build that kept a handle floor there is never read.
     ///
     /// # Errors
     ///
     /// [`SessionStoreError::InvalidLimits`] when `limits` admits no session.
-    pub fn open_with_limits(data_dir: &Path, limits: SessionStoreLimits) -> Result<Self> {
-        let _ = data_dir;
+    pub fn open_with_limits(limits: SessionStoreLimits) -> Result<Self> {
         Self::validate_registration_limits(limits)?;
         Ok(Self::with_limits(limits))
     }
@@ -1621,23 +1610,16 @@ mod tests {
         assert!((1_848..=2_248).contains(&ones), "{ones} set bits");
     }
 
-    /// Two stores on one data directory, as across a restart, issue unrelated handles, and
-    /// opening touches nothing a previous build left there.
+    /// Two stores opened one after the other, as across a restart, issue unrelated handles.
     #[test]
-    fn a_restart_issues_unrelated_handles_and_writes_nothing() {
+    fn a_restart_issues_unrelated_handles() {
         let (keys, pack_params, context) = real_registration_material();
-        let directory = tempfile::tempdir().expect("data dir");
-        let left_behind = directory.path().join("session-handle-floor-v1.bin");
-        std::fs::write(&left_behind, b"an older build's floor").expect("old floor");
         let mut issued = Vec::new();
         for _ in 0..2 {
-            let store = BoundedSessionStore::open_with_limits(
-                directory.path(),
-                SessionStoreLimits {
-                    max_sessions: 8,
-                    ttl: Duration::from_secs(3600),
-                },
-            )
+            let store = BoundedSessionStore::open_with_limits(SessionStoreLimits {
+                max_sessions: 8,
+                ttl: Duration::from_secs(3600),
+            })
             .expect("open");
             for _ in 0..8 {
                 issued.push(
@@ -1655,11 +1637,6 @@ mod tests {
             }
         }
         assert!(!enumerable(&issued), "{issued:?}");
-        assert_eq!(
-            std::fs::read(&left_behind).expect("old floor"),
-            b"an older build's floor"
-        );
-        assert_eq!(std::fs::read_dir(directory.path()).expect("dir").count(), 1);
     }
 
     /// A guessed handle neither resolves nor renews: the victim's seat lapses on its own TTL

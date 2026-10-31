@@ -107,6 +107,9 @@ struct SpawnInputs<'a> {
 /// Chain-tree instances the driver knows about.
 pub struct SpawnRegistry {
     inner: parking_lot::Mutex<RegistryInner>,
+    /// Where each spawned instance's consumer cell is published for status, readiness and
+    /// freshness. `None` publishes nowhere.
+    instance_metrics: Option<Arc<raven_railgun_http::InstanceMetricsMap>>,
 }
 
 impl std::fmt::Debug for SpawnRegistry {
@@ -118,6 +121,7 @@ impl std::fmt::Debug for SpawnRegistry {
                 &g.by_tree.keys().copied().collect::<Vec<u32>>(),
             )
             .field("auto_spawned_count", &g.auto_spawned.len())
+            .field("publishes_metrics", &self.instance_metrics.is_some())
             .finish()
     }
 }
@@ -161,6 +165,49 @@ impl SpawnRegistry {
                 last_spawn_at: None,
                 refused_spawns: 0,
             }),
+            instance_metrics: None,
+        }
+    }
+
+    /// A registry that publishes every spawned instance's consumer cell into `instance_metrics`.
+    #[must_use]
+    pub fn publishing_metrics_to(
+        instance_metrics: Arc<raven_railgun_http::InstanceMetricsMap>,
+    ) -> Self {
+        Self {
+            instance_metrics: Some(instance_metrics),
+            ..Self::new()
+        }
+    }
+
+    /// Never replaces a cell already published under `instance_id`: that one belongs to a
+    /// serving instance, and `add_live` refuses the duplicate id.
+    fn publish_metrics(
+        &self,
+        instance_id: &InstanceId,
+        cell: &Arc<parking_lot::Mutex<ConsumerMetrics>>,
+    ) {
+        if let Some(map) = &self.instance_metrics {
+            map.write()
+                .entry(instance_id.clone())
+                .or_insert_with(|| Arc::clone(cell));
+        }
+    }
+
+    /// Removes `cell` only, so a refused spawn cannot take a serving instance's cell with it.
+    fn withdraw_metrics(
+        &self,
+        instance_id: &InstanceId,
+        cell: &Arc<parking_lot::Mutex<ConsumerMetrics>>,
+    ) {
+        if let Some(map) = &self.instance_metrics {
+            let mut map = map.write();
+            if map
+                .get(instance_id)
+                .is_some_and(|held| Arc::ptr_eq(held, cell))
+            {
+                map.remove(instance_id);
+            }
         }
     }
 
@@ -550,10 +597,13 @@ fn spawn_one(inputs: &SpawnInputs<'_>, tree: u32, append_log: bool) -> anyhow::R
     let cap = runtime.channel_capacity.max(1);
     let (sender, receiver) = tokio::sync::mpsc::channel::<ConsumerEvent>(cap);
 
-    inputs
-        .engine
-        .add_live(Arc::clone(&instance_arc))
-        .map_err(|e| anyhow::anyhow!("engine.add_live: {e}"))?;
+    // Published before the instance serves, else readiness sees it without telemetry.
+    let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default()));
+    inputs.registry.publish_metrics(&instance_id, &metrics);
+    if let Err(e) = inputs.engine.add_live(Arc::clone(&instance_arc)) {
+        inputs.registry.withdraw_metrics(&instance_id, &metrics);
+        anyhow::bail!("engine.add_live: {e}");
+    }
 
     inputs.chain_tree_routes.rcu(|cur| {
         let mut next: Vec<(u32, tokio::sync::mpsc::Sender<ConsumerEvent>)> = (**cur).clone();
@@ -561,7 +611,6 @@ fn spawn_one(inputs: &SpawnInputs<'_>, tree: u32, append_log: bool) -> anyhow::R
         next
     });
 
-    let metrics = Arc::new(parking_lot::Mutex::new(ConsumerMetrics::default()));
     let logical_store = Arc::new(parking_lot::Mutex::new(recovered_store));
     let verifier_ctx = inputs
         .chain_source

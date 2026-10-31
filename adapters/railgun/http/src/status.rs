@@ -122,18 +122,23 @@ type MetricsCell = Arc<parking_lot::Mutex<ConsumerMetrics>>;
 
 /// Each registered instance with its consumer cell, by the rule `/metrics` labels with: the
 /// per-instance map, or, when that is empty, the single cell on the first instance.
-fn instance_consumer_cells<'a, S: PirScheme>(
-    app: &'a AppState<S>,
+fn instance_consumer_cells<S: PirScheme>(
+    app: &AppState<S>,
     instances: &[Arc<raven_railgun_engine::PirInstance<S>>],
-) -> Vec<Option<&'a MetricsCell>> {
+) -> Vec<Option<MetricsCell>> {
+    let per_instance = app.instance_metrics.read();
     instances
         .iter()
         .enumerate()
         .map(|(at, instance)| {
-            if app.instance_metrics.is_empty() {
-                app.consumer_metrics.as_ref().as_ref().filter(|_| at == 0)
+            if per_instance.is_empty() {
+                app.consumer_metrics
+                    .as_ref()
+                    .as_ref()
+                    .filter(|_| at == 0)
+                    .cloned()
             } else {
-                app.instance_metrics.get(&instance.id)
+                per_instance.get(&instance.id).cloned()
             }
         })
         .collect()
@@ -143,8 +148,39 @@ fn instance_consumer_cells<'a, S: PirScheme>(
 fn node_consumer_status<S: PirScheme>(app: &AppState<S>) -> Option<ConsumerStatus> {
     let instances = app.engine.instances();
     let cells = instance_consumer_cells(app, &instances);
-    let wired: Vec<&MetricsCell> = cells.into_iter().flatten().collect();
+    let wired: Vec<&MetricsCell> = cells.iter().flatten().collect();
     ConsumerStatus::merged(&wired)
+}
+
+/// `X-Raven-Freshness` for a response `instance_id` served: that instance's own consumer, since
+/// the bytes came from its snapshot alone. An instance with no cell of its own gets the node
+/// view `/v1/status` reports, never another instance's.
+pub(crate) fn freshness_reading<S: PirScheme>(
+    app: &AppState<S>,
+    instance_id: &raven_railgun_core::InstanceId,
+) -> Option<crate::FreshnessReading> {
+    let own = {
+        let per_instance = app.instance_metrics.read();
+        if per_instance.is_empty() {
+            // The single cell is also the whole node view, so it answers for every instance.
+            app.consumer_metrics.as_ref().clone()
+        } else {
+            per_instance.get(instance_id).cloned()
+        }
+    };
+    match own {
+        Some(cell) => {
+            let snap = *cell.lock();
+            Some(crate::FreshnessReading {
+                lag_blocks: snap.indexer_lag_blocks(),
+                applied_height: snap.last_applied_block,
+            })
+        }
+        None => node_consumer_status(app).map(|node| crate::FreshnessReading {
+            lag_blocks: node.indexer_lag_blocks,
+            applied_height: node.last_applied_block,
+        }),
+    }
 }
 
 pub(crate) async fn status_handler<S: PirScheme>(
@@ -172,10 +208,10 @@ fn build_status_response<S: PirScheme>(app: &AppState<S>) -> StatusResponse {
                 .get(&inst.id)
                 .copied()
                 .unwrap_or(fallback_k),
-            consumer: cell.map(|cell| ConsumerStatus::of(&cell.lock())),
+            consumer: cell.as_ref().map(|cell| ConsumerStatus::of(&cell.lock())),
         })
         .collect();
-    let wired: Vec<&MetricsCell> = cells.into_iter().flatten().collect();
+    let wired: Vec<&MetricsCell> = cells.iter().flatten().collect();
     let consumer = ConsumerStatus::merged(&wired);
     StatusResponse {
         scheme: (*app.scheme_name).clone(),
@@ -215,17 +251,18 @@ fn refresh_dynamic_metrics<S: raven_railgun_engine::PirScheme>(app: &AppState<S>
     metrics::gauge!("raven_railgun_semaphore_permits_available").set(permits_avail);
 
     let instances = app.engine.instances();
+    let per_instance = app.instance_metrics.read().clone();
     for instance in &instances {
         let instance_id = instance.id.as_str().to_owned();
         emit_per_instance_engine_gauges(&instance_id, instance);
 
-        if let Some(consumer) = app.instance_metrics.get(&instance.id) {
+        if let Some(consumer) = per_instance.get(&instance.id) {
             let snap = *consumer.lock();
             emit_instance_consumer_gauges(&instance_id, &snap);
         }
     }
 
-    if app.instance_metrics.is_empty() {
+    if per_instance.is_empty() {
         if let Some(cell) = app.consumer_metrics.as_ref().as_ref() {
             if let Some(first) = instances.first() {
                 let snap = *cell.lock();
@@ -526,7 +563,8 @@ fn consumer_is_stalled(m: &raven_railgun_engine::persistence::ConsumerMetrics) -
 /// `with_consumer_metrics` still gets a gate.
 fn stalled_consumer_instances<S: PirScheme>(app: &AppState<S>) -> Vec<String> {
     let instances = app.engine.instances();
-    if app.instance_metrics.is_empty() {
+    let per_instance = app.instance_metrics.read().clone();
+    if per_instance.is_empty() {
         let Some(cell) = app.consumer_metrics.as_ref().as_ref() else {
             return if app.consumer_metrics_required {
                 instances
@@ -545,7 +583,7 @@ fn stalled_consumer_instances<S: PirScheme>(app: &AppState<S>) -> Vec<String> {
     }
     let mut stalled: Vec<String> = instances
         .iter()
-        .filter(|instance| match app.instance_metrics.get(&instance.id) {
+        .filter(|instance| match per_instance.get(&instance.id) {
             Some(cell) => consumer_is_stalled(&cell.lock()),
             None => app.consumer_metrics_required,
         })

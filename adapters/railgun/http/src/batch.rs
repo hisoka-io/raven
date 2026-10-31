@@ -162,7 +162,7 @@ async fn query_handler_at<S: PirScheme>(
     let mut headers = build_response_headers(epoch.0, &app.scheme_name)?;
     attach_freshness_header(
         &mut headers,
-        app.consumer_metrics.as_ref().as_ref().map(AsRef::as_ref),
+        crate::status::freshness_reading(&app, &instance_id),
         epoch.0,
     );
     Ok((StatusCode::OK, headers, body_bytes.into()))
@@ -292,7 +292,7 @@ async fn respond_batch<S: PirScheme>(
     let mut headers = build_response_headers(epoch_at_start.0, &app.scheme_name)?;
     attach_freshness_header(
         &mut headers,
-        app.consumer_metrics.as_ref().as_ref().map(AsRef::as_ref),
+        crate::status::freshness_reading(app, instance_id),
         epoch_at_start.0,
     );
     Ok((StatusCode::OK, headers, body_bytes.into()))

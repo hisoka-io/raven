@@ -166,8 +166,7 @@ impl Gadget {
         let zero = encode_one(&params, &shard_config, &vec![0u8; SHARD_BYTES])?;
         let cache = ServerInspiringCache::new(&crs, &zero).map_err(scheme)?;
         std::fs::create_dir_all(dir.join(SESSIONS_DIR))?;
-        let sessions = BoundedSessionStore::open_with_limits(&dir.join(SESSIONS_DIR), limits)
-            .map_err(scheme)?;
+        let sessions = BoundedSessionStore::open_with_limits(limits).map_err(scheme)?;
         Ok(Self {
             params,
             crs,

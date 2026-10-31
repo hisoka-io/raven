@@ -807,7 +807,6 @@ fn open_data_dir(
         cfg.encoder.build(cfg.record_size, cfg.entries_per_shard)?;
 
     let session_store = Arc::new(crate::session_pool::BoundedSessionStore::open_with_limits(
-        layout.root(),
         session_limits,
     )?);
     // Packing stores are built once the instances serve: see `spawn_packing_store_builds`.

@@ -495,7 +495,7 @@ fn commit_rows(
     mut store: LogicalLeafStore,
 ) {
     let layout = StoreLayout::open(&config.data_dir).expect("layout");
-    let sessions = BoundedSessionStore::open(layout.root()).expect("session floor");
+    let sessions = BoundedSessionStore::new();
     let opened = InspirePersistence::open(
         layout,
         config.scheme_tag.clone(),

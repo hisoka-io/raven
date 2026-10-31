@@ -1325,6 +1325,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
             &bootstrap.handles.instances,
             &opts,
             session_limits,
+            app_state.instance_metrics_registry(),
         )?)
     } else {
         None
@@ -1388,12 +1389,6 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
             );
         }
     }
-    // Feeds only the freshness header now: status and metrics read the per-instance map below.
-    let app_state = if let Some(metrics) = bootstrap.handles.instances.first() {
-        app_state.with_consumer_metrics(Arc::clone(&metrics.metrics))
-    } else {
-        app_state
-    };
     let app_state = app_state.with_instance_concurrency(k_map);
     let instance_logical_stores = bootstrap
         .handles
@@ -2068,6 +2063,7 @@ fn wire_auto_spawn(
     initial_handles: &[raven_railgun_engine::orchestrator::PerInstanceHandles],
     opts: &MultiServeOptions,
     session_limits: SessionStoreLimits,
+    instance_metrics: Arc<raven_railgun_http::InstanceMetricsMap>,
 ) -> anyhow::Result<AutoSpawnWiring> {
     use crate::auto_spawn_driver::{replay_spawn_log, run_driver_dynamic, SpawnRegistry};
 
@@ -2082,7 +2078,7 @@ fn wire_auto_spawn(
         None => std::path::PathBuf::from("."),
     };
 
-    let registry = Arc::new(SpawnRegistry::new());
+    let registry = Arc::new(SpawnRegistry::publishing_metrics_to(instance_metrics));
     registry.seed_from_bootstrap(initial_handles);
 
     let restored = replay_spawn_log(

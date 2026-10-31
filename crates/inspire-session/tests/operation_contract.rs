@@ -53,35 +53,20 @@ fn missing_remove_publishes_current_counts_without_an_eviction() {
     );
 }
 
-/// A data directory an earlier build wrote a handle floor into, valid or not, beside an
-/// instance manifest, opens as it is and is left as it is: nothing about past handles is read.
+/// A checked open starts empty under exactly the limits it was given.
 #[test]
-fn an_older_builds_handle_floor_is_neither_read_nor_rewritten() {
-    for floor in [b"short".to_vec(), vec![0xa5; 50]] {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let floor_path = dir.path().join("session-handle-floor-v1.bin");
-        std::fs::write(&floor_path, &floor).expect("old floor");
-        std::fs::write(dir.path().join("manifest.json"), b"prior instance").expect("manifest");
-
-        let store = BoundedSessionStore::open_with_limits(dir.path(), limits()).expect("open");
-        assert!(store.is_empty());
-        drop(store);
-
-        assert_eq!(std::fs::read(&floor_path).expect("floor"), floor);
-        assert_eq!(std::fs::read_dir(dir.path()).expect("dir").count(), 2);
-    }
+fn a_checked_open_starts_empty_under_its_limits() {
+    let store = BoundedSessionStore::open_with_limits(limits()).expect("open");
+    assert!(store.is_empty());
+    assert_eq!(store.limits(), limits());
 }
 
 #[test]
-fn zero_cap_open_refuses_and_creates_nothing() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let error = BoundedSessionStore::open_with_limits(
-        dir.path(),
-        SessionStoreLimits {
-            max_sessions: 0,
-            ttl: Duration::from_secs(10),
-        },
-    )
+fn zero_cap_open_refuses() {
+    let error = BoundedSessionStore::open_with_limits(SessionStoreLimits {
+        max_sessions: 0,
+        ttl: Duration::from_secs(10),
+    })
     .expect_err("zero cap must refuse open");
 
     assert!(matches!(
@@ -89,5 +74,4 @@ fn zero_cap_open_refuses_and_creates_nothing() {
         SessionStoreError::InvalidLimits { max_sessions: 0 }
     ));
     assert_eq!(error.class(), SessionStoreErrorClass::Configuration);
-    assert_eq!(std::fs::read_dir(dir.path()).expect("dir").count(), 0);
 }
