@@ -1,6 +1,6 @@
-import { HowlError, protocol, type AnswerState } from "./errors.js";
+import { HowlError, MAX_RETRY_AFTER_SECONDS, protocol, retryAfterSeconds, type AnswerState } from "./errors.js";
 import { PrefixFeed, type FeedMatch, type FeedView } from "./feed.js";
-import type { Exchange, HowlTransport } from "./http.js";
+import { neverAnswered, type Exchange, type HowlTransport } from "./http.js";
 import { COMMITMENT_PREFIX_BYTES, decodeCell, missRecord, type FieldCodec, type HowlNoteRecord } from "./record.js";
 import { decode, KIND, type Answer, type HowlClientHandle, type HowlTreeHandle, type HowlWasm } from "./wasm.js";
 
@@ -12,7 +12,7 @@ const TREE_DEPTH = 32;
 const MAX_REWINDS_PER_SYNC = 8;
 // After a node had no seat to give, reads carry their key inline this long before a seat is asked
 // for again, so a key is not uploaded twice per read while the seats stay full.
-const SEAT_RETRY_MS = 60_000;
+const SEAT_RETRY_MS = MAX_RETRY_AFTER_SECONDS * 1000;
 
 /**
  * How private reads carry the packing key.
@@ -283,8 +283,10 @@ export class RavenHowlSource<F> {
       throw new HowlError("SessionExpired", `${what}: session expired`, { status: 410 });
     }
     if (ex.status === 503 || ex.status === 429) {
+      const retryAfter = retryAfterSeconds(ex.headers?.get("retry-after") ?? null);
       throw new HowlError("Busy", `${what}: ${ex.status} ${new TextDecoder().decode(ex.body)}`, {
         status: ex.status,
+        ...(retryAfter === undefined ? {} : { retryAfter }),
       });
     }
     if (ex.status !== 200) {
@@ -581,9 +583,25 @@ export class RavenHowlSource<F> {
         throw new HowlError(e.kind, `${e.message} (after reading the node's params again)`, {
           ...(e.status === undefined ? {} : { status: e.status }),
           ...(e.state === undefined ? {} : { state: e.state }),
+          ...(e.retryAfter === undefined ? {} : { retryAfter: e.retryAfter }),
           cause: e,
         });
       }
+    }
+  }
+
+  /**
+   * A read that got no response at all, as on a keep-alive socket the node closed when it
+   * restarted, is sent once more with the same bytes: the same key and rows, so the node learns
+   * nothing the first request did not carry. A read is free of side effects apart from renewing
+   * its seat. A read that got any status is never sent again here.
+   */
+  async #postNotes(body: Uint8Array): Promise<Exchange> {
+    try {
+      return await this.#transport.post("/howl/v1/notes", body);
+    } catch (e) {
+      if (!neverAnswered(e)) throw e;
+      return this.#transport.post("/howl/v1/notes", body);
     }
   }
 
@@ -600,7 +618,7 @@ export class RavenHowlSource<F> {
       );
       if (plan === undefined) this.#plans.set(key, { targets: batch.targets, slots: batch.realSlots });
       try {
-        const ex = await this.#transport.post("/howl/v1/notes", batch.body);
+        const ex = await this.#postNotes(batch.body);
         this.#answer(ex, KIND.notes, "notes");
         const cells = protocol("notes", () => client.openNotes(batch, ex.body));
         try {

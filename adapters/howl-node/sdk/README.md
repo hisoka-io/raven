@@ -80,6 +80,13 @@ read again under the node's params, and sends it once; otherwise, or if that rea
 raises the error. The feed, the tree and the cells already read are chain data and stay: after a
 re-seed on the same chain the next sync goes on from the cursor.
 
+A private read whose connection closes before any response arrives (a keep-alive socket the node
+dropped when it restarted) is sent once more over a new connection with the same bytes. A read
+that got any status, or that ran out its timeout, is not sent again by the source. A node over
+its rate or with its queue full answers `Busy` (`retryable` is true); `retryAfter` carries the
+seconds its `Retry-After` asked for, at most `MAX_RETRY_AFTER_SECONDS`, and the caller chooses
+when to call again. A custom transport passes `headers` in its `Exchange` to carry it.
+
 ## Multisig
 
 Howl's `MultisigScanner` reads chain events, with all seven ciphertext words and the full

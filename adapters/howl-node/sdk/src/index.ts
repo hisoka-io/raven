@@ -1,4 +1,4 @@
-export { HowlError, type AnswerState, type HowlErrorKind } from "./errors.js";
+export { HowlError, MAX_RETRY_AFTER_SECONDS, type AnswerState, type HowlErrorKind } from "./errors.js";
 export { PrefixFeed, tagPrefix, TAG_PREFIX_BYTES, type FeedMatch, type FeedView } from "./feed.js";
 export { fetchTransport, type Exchange, type FetchTransportOptions, type HowlTransport, type TransportStats } from "./http.js";
 export {
