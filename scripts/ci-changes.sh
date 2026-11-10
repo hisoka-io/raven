@@ -68,6 +68,9 @@ KEYS = {
     # is what its up.sh stages, which the adapter workspace holds.
     "howl_image": ([ROOT, "adapters/howl-node/Cargo.toml"], ["adapters/howl", ".dockerignore"]),
     "railgun_image": ([ROOT, RAILGUN], []),
+    # its own workspace over the decoders' crates by path, so a decoder change rebuilds the targets;
+    # the seeds read the SDK's recorded answers
+    "fuzz": (["fuzz/Cargo.toml"], ["adapters/howl", "adapters/howl-node/sdk/tests/fixtures/**"]),
 }
 
 # A change here selects every job.

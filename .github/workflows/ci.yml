@@ -53,6 +53,7 @@ jobs:
       sdk: ${{ steps.select.outputs.sdk }}
       howl_image: ${{ steps.select.outputs.howl_image }}
       railgun_image: ${{ steps.select.outputs.railgun_image }}
+      fuzz: ${{ steps.select.outputs.fuzz }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -417,7 +418,8 @@ jobs:
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
-      # re-declare -D warnings since RUSTFLAGS overrides the workflow-level env
+      # re-declare -D warnings since RUSTFLAGS overrides the workflow-level env. The lld is the
+      # toolchain's own rust-lld (gcc-ld), so no job on 1.98 installs a system lld.
       RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=lld"
     steps:
       - name: free disk space
@@ -437,13 +439,16 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@1.98.0
         if: ${{ needs.changes.outputs.railgun != 'false' }}
-      - name: install lld linker
-        if: ${{ needs.changes.outputs.railgun != 'false' }}
-        run: sudo apt-get update && sudo apt-get install -y lld
       - name: install sccache
         if: ${{ needs.changes.outputs.railgun != 'false' }}
-        # v0.0.10 ships sccache 0.10+ for the GHA cache v2 endpoint
-        uses: mozilla-actions/sccache-action@v0.0.10
+        # v0.0.10 ships sccache 0.10+ for the GHA cache v2 endpoint. A failed download costs the
+        # run its cache, never its build: the next step drops the wrapper.
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: compile without sccache when it did not install
+        if: ${{ needs.changes.outputs.railgun != 'false' }}
+        run: sccache --show-stats >/dev/null 2>&1 || echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         if: ${{ needs.changes.outputs.railgun != 'false' }}
         with:
@@ -471,7 +476,7 @@ jobs:
             --cargo-profile ci-test \
             --profile ci
       - name: sccache stats
-        run: sccache --show-stats
+        run: if [ -n "${RUSTC_WRAPPER:-}" ]; then sccache --show-stats; fi
         if: ${{ always() && needs.changes.outputs.railgun != 'false' }}
 
   lane-counts:
@@ -505,12 +510,16 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@1.98.0
-      - name: install lld linker
-        run: sudo apt-get update && sudo apt-get install -y lld
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "railgun"
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: install sccache
+        # a failed download costs the run its cache, never its build: see railgun-tests
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: compile without sccache when it did not install
+        run: sccache --show-stats >/dev/null 2>&1 || echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       # One release in every job, the one the nextest-reading gates are proven against: an
       # unpinned install took 0.9.146, whose show-config shape the gate did not read.
       # scripts/check-rust-toolchain-pin.sh fails a floating or divergent pin.
@@ -535,7 +544,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: scripts/check-ci-filter-names-selftest.sh --selected
       - name: sccache stats
-        run: sccache --show-stats
+        run: if [ -n "${RUSTC_WRAPPER:-}" ]; then sccache --show-stats; fi
         if: always()
 
   durability-and-closure:
@@ -645,9 +654,13 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@1.98.0
-      - name: install lld linker
-        run: sudo apt-get update && sudo apt-get install -y lld
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - name: install sccache
+        # a failed download costs the run its cache, never its build: see railgun-tests
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: compile without sccache when it did not install
+        run: sccache --show-stats >/dev/null 2>&1 || echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "railgun-tests"
@@ -673,7 +686,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: scripts/assert-lane-counts.sh --lane "durability-and-closure/${{ matrix.lane.name }}"
       - name: sccache stats
-        run: sccache --show-stats
+        run: if [ -n "${RUSTC_WRAPPER:-}" ]; then sccache --show-stats; fi
         if: always()
 
   production-cell-closure:
@@ -728,9 +741,13 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@1.98.0
-      - name: install lld linker
-        run: sudo apt-get update && sudo apt-get install -y lld
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - name: install sccache
+        # a failed download costs the run its cache, never its build: see railgun-tests
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: compile without sccache when it did not install
+        run: sccache --show-stats >/dev/null 2>&1 || echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "railgun-tests"
@@ -768,7 +785,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: scripts/assert-lane-counts.sh --lane production-cell-closure/inline
       - name: sccache stats
-        run: sccache --show-stats
+        run: if [ -n "${RUSTC_WRAPPER:-}" ]; then sccache --show-stats; fi
         if: always()
 
   inspire-tests:
@@ -801,9 +818,13 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
           components: clippy, rustfmt
-      - name: install lld linker
-        run: sudo apt-get update && sudo apt-get install -y lld
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - name: install sccache
+        # a failed download costs the run its cache, never its build: see railgun-tests
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: compile without sccache when it did not install
+        run: sccache --show-stats >/dev/null 2>&1 || echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "inspire-tests"
@@ -988,7 +1009,7 @@ jobs:
         run: cargo check --manifest-path crates/inspire/Cargo.toml --target wasm32-unknown-unknown --no-default-features
       - name: sccache stats
         if: always()
-        run: sccache --show-stats
+        run: if [ -n "${RUSTC_WRAPPER:-}" ]; then sccache --show-stats; fi
 
   eth-state-example:
     # adapters/eth-state is a submodule that builds against this checkout's crates by path.
@@ -1084,12 +1105,14 @@ jobs:
         run: cargo test --manifest-path adapters/howl-node/client-wasm/Cargo.toml --locked
       - name: install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-      # Builds pkg-node, which the TypeScript suite links, and pkg-bundler, and holds both to the
-      # gzipped ceiling in the script.
-      - name: build wasm-pack pkg-node + pkg-bundler + size gate
+      # Builds pkg-node, which the TypeScript suite links, pkg-bundler and pkg-web, holds all three
+      # to the gzipped ceiling and checks each is a publishable package.
+      - name: build wasm-pack pkg-node + pkg-bundler + pkg-web + size and package gates
         run: adapters/howl-node/client-wasm/scripts/check-wasm-size.sh
       - name: wasm size gate red-proof
         run: adapters/howl-node/client-wasm/scripts/check-wasm-size-selftest.sh
+      - name: package gate red-proof
+        run: adapters/howl-node/client-wasm/scripts/check-packages-selftest.sh
       - name: build the node binary
         run: cargo build --release --manifest-path adapters/howl-node/Cargo.toml -p howl-node --locked
       - name: pnpm install
@@ -1110,6 +1133,54 @@ jobs:
   # The node images, built from their Dockerfiles and run once with no network by
   # scripts/image-smoke.sh: the liveness route answers, the node runs as its own user, and a stop
   # exits clean. Nothing is pushed; the jobs hold no registry credential.
+  fuzz:
+    # The decoders a hostile body reaches first, through each crate's public decode functions:
+    # Railgun's session, query and batch bodies and its params blob, Howl's session and notes
+    # bodies, and the answers a wallet reads. A change to those crates builds every target; the
+    # nightly also runs each for FUZZ_SECONDS from honest seeds and keeps a crash's input.
+    name: decoder fuzzing (cargo-fuzz)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.fuzz != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # libFuzzer needs a nightly; a dated one, so a new nightly cannot red the job
+      FUZZ_TOOLCHAIN: nightly-2026-09-23
+      FUZZ_SECONDS: "60"
+      # the product crates are linted on the pinned stable; a newer nightly's lint is no fuzz finding
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt
+      - name: cargo fmt
+        run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+      - name: install the fuzz toolchain
+        timeout-minutes: 10
+        run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: install cargo-fuzz
+        timeout-minutes: 15
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: build every target
+        run: cargo "+$FUZZ_TOOLCHAIN" fuzz build --fuzz-dir fuzz
+      - name: fuzz each target
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: fuzz/run.sh "$FUZZ_SECONDS"
+      - name: keep crash inputs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ github.run_id }}
+          path: fuzz/artifacts/
+          retention-days: 14
+          if-no-files-found: ignore
+
   howl-image:
     name: Howl node image (build + smoke run)
     needs: changes
@@ -1226,7 +1297,8 @@ jobs:
       - name: install clippy for the toolchain this job actually selects
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --component clippy
       - name: install lld linker
-        run: sudo apt-get update && sudo apt-get install -y lld
+        timeout-minutes: 10
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y lld
       - uses: Swatinem/rust-cache@v2
       - name: verify, build, and lint the exact 1.89 package set
         run: |

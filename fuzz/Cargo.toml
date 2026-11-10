@@ -1,0 +1,79 @@
+# Its own workspace, so the fuzz build's sanitizer flags and lockfile reach no product workspace.
+[workspace]
+members = ["."]
+
+[package]
+name = "raven-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bincode = "1.3"
+libfuzzer-sys = "0.4"
+howl-node = { path = "../adapters/howl-node/node" }
+howl-wire = { path = "../adapters/howl-node/wire" }
+raven-inspire = { path = "../crates/inspire" }
+raven-inspire-session = { path = "../crates/inspire-session" }
+raven-railgun-http = { path = "../adapters/railgun/http" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "railgun_session_body"
+path = "fuzz_targets/railgun_session_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "railgun_batch_body"
+path = "fuzz_targets/railgun_batch_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "railgun_params_blob"
+path = "fuzz_targets/railgun_params_blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inspire_crs_blob"
+path = "fuzz_targets/inspire_crs_blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "howl_session_body"
+path = "fuzz_targets/howl_session_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "howl_notes_body"
+path = "fuzz_targets/howl_notes_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "howl_answer"
+path = "fuzz_targets/howl_answer.rs"
+test = false
+doc = false
+bench = false
+
+[lib]
+path = "src/lib.rs"
+test = false
+doc = false

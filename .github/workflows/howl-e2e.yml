@@ -7,6 +7,9 @@ name: Howl e2e
 #
 # Not on push: the proofs are real, so a run takes tens of minutes. Nightly runs the default suites;
 # a manual run can pick suites, e.g. `full:1` for the long run with outsider load and a 70,000-leaf pool.
+#
+# Beside it, the same SDK in headless Chromium, as a bundled page and as an unpacked MV3 extension,
+# against a node following a local chain: adapters/howl-node/sdk/scripts/browser-smoke.sh.
 on:
   schedule:
     # after the main nightly at 03:00
@@ -117,5 +120,71 @@ jobs:
           path: |
             e2e-out/
             !e2e-out/**/node-data/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  browser-smoke:
+    name: Howl SDK in a browser page and an MV3 extension (Playwright Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # anvil for the local chain the script mines its fixture on
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.3.2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.24.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.17.1"
+          cache: pnpm
+          cache-dependency-path: |
+            adapters/howl-node/sdk/pnpm-lock.yaml
+            adapters/howl-node/sdk/browser-smoke/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            adapters/howl-node
+            adapters/howl-node/client-wasm
+      - name: install wasm-pack
+        timeout-minutes: 5
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: build the node
+        run: cargo build --release --manifest-path adapters/howl-node/Cargo.toml -p howl-node --locked
+      # the three packages the page, the worker and the reference run load
+      - name: build the wasm packages (node, bundler, web)
+        run: adapters/howl-node/client-wasm/scripts/wasm-build.sh
+      # Playwright lives in browser-smoke/ with its own lockfile; the script installs it too, and
+      # this step adds the system libraries Chromium needs on a runner.
+      - name: install Playwright Chromium
+        working-directory: adapters/howl-node/sdk/browser-smoke
+        timeout-minutes: 10
+        run: |
+          pnpm install --frozen-lockfile --ignore-workspace
+          pnpm exec playwright install --with-deps chromium
+      - name: browser and MV3 smoke
+        env:
+          HOWL_NODE_BIN: ${{ github.workspace }}/adapters/howl-node/target/release/howl-node
+        run: |
+          mkdir -p smoke-out
+          adapters/howl-node/sdk/scripts/browser-smoke.sh 2>&1 | tee smoke-out/smoke.log
+      # each planted fault (CSP, CORS strip, the Node wasm in a page) must fail it for its own reason
+      - name: browser smoke red-proof
+        env:
+          HOWL_NODE_BIN: ${{ github.workspace }}/adapters/howl-node/target/release/howl-node
+        run: adapters/howl-node/sdk/scripts/browser-smoke.sh --red-proof 2>&1 | tee smoke-out/red-proof.log
+      - name: keep the smoke logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: howl-browser-smoke-${{ github.run_id }}
+          path: smoke-out/
           retention-days: 14
           if-no-files-found: ignore
