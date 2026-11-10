@@ -7,6 +7,7 @@ import {
   bigintField,
   fetchTransport,
   RavenHowlSource,
+  SYNC_CURSOR_GRANULE,
   type HowlBatchHandle,
   type HowlClientHandle,
   type HowlNoteRecord,
@@ -20,6 +21,14 @@ import { chainRoots, fixture, hex, unhex, walletTags, wasm, type FixtureLog } fr
 const BIN = process.env.HOWL_NODE_BIN ?? "";
 const live = BIN !== "" && existsSync(BIN);
 const HALF = Math.floor(fixture.blocks.length / 2);
+
+/** The sync a client holding `n` leaves sends: its cursor rounded down to the granule. */
+function syncPath(n: number): string {
+  const at = n - (n % SYNC_CURSOR_GRANULE);
+  return `GET /howl/v1/sync?since=${at}&upper=0` + (at > 0 ? `&held=${at}` : "");
+}
+/** An idle sync: the header, three runs, and the rows and leaves past the rounded cursor. */
+const idleBytes = (n: number): number => 96 + (n % SYNC_CURSOR_GRANULE) * (6 + 32);
 
 /** A transport that records every path asked for and the bytes moved. */
 function recorded(url: string): HowlTransport & { paths: string[]; down: number[]; up: number[] } {
@@ -144,7 +153,7 @@ describe.skipIf(!live)("against a running node", () => {
         const before = w.source.state.leafCount;
         const mark = w.transport.paths.length;
         const found = await discover(w.source, tagsOf(w.label));
-        expect(w.transport.paths[mark]).toBe(`GET /howl/v1/sync?since=${before}&upper=0&held=${before}`);
+        expect(w.transport.paths[mark]).toBe(syncPath(before));
         expect(w.source.state.leafCount).toBe(chain.leafCount);
         expect(w.source.state.block).toBe(await chain.head());
         expect([...found.keys()].sort((a, b) => a - b)).toEqual(owned(w.label, chain.leafCount));
@@ -384,9 +393,8 @@ describe.skipIf(!live)("against a running node", () => {
     const second = await discover(src, tags);
     expect([...second.keys()]).toEqual([...first.keys()]);
     const n = src.state.leafCount;
-    expect(transport.paths.slice(mark)).toEqual([`GET /howl/v1/sync?since=${n}&upper=0&held=${n}`]);
-    // An idle sync: the header and three empty runs.
-    expect(transport.down.slice(mark)).toEqual([96]);
+    expect(transport.paths.slice(mark)).toEqual([syncPath(n)]);
+    expect(transport.down.slice(mark)).toEqual([idleBytes(n)]);
   });
 
   it("a tag with no match gets a well-formed record that opens to nothing", async () => {
@@ -416,8 +424,8 @@ describe.skipIf(!live)("against a running node", () => {
     const resumed = new RavenHowlSource({ transport, wasm, field: bigintField, snapshot: stored });
     expect(resumed.state.leafCount).toBe(stored.leafCount);
     const result = await resumed.sync();
-    expect(transport.paths).toEqual([`GET /howl/v1/sync?since=${stored.leafCount}&upper=0&held=${stored.leafCount}`]);
-    expect(transport.down).toEqual([96]);
+    expect(transport.paths).toEqual([syncPath(stored.leafCount)]);
+    expect(transport.down).toEqual([idleBytes(stored.leafCount)]);
     expect(result.rowsAdded).toBe(0);
     const tampered = { ...stored, root: new Uint8Array(32) };
     expect(() => new RavenHowlSource({ transport, wasm, field: bigintField, snapshot: tampered })).toThrow(/root/);

@@ -18,6 +18,7 @@ export {
 export {
   LEAF_BLOCK_SIZE,
   RavenHowlSource,
+  SYNC_CURSOR_GRANULE,
   type FirstOccurrence,
   type KeyMode,
   type MerkleWitness,
@@ -28,6 +29,14 @@ export {
   type SyncSnapshot,
   type TagPrefixSegment,
 } from "./source.js";
+export {
+  discoverySource,
+  witnessSource,
+  type DiscoveryReads,
+  type HowlDiscoverySource,
+  type HowlWitnessSource,
+  type WitnessSourceOptions,
+} from "./howl.js";
 export { KIND, type HowlAnswerView, type HowlBatchHandle, type HowlCellsView, type HowlClientHandle, type HowlTreeHandle, type HowlWasm } from "./wasm.js";
 export {
   checkSigningSession,

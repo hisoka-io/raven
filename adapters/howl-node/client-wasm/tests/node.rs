@@ -834,7 +834,7 @@ async fn set_2_sizes_on_the_wire_and_one_key_per_client() {
         ));
     }
     // per slot 7,460 B up (shard and query) and 9,212 B down; 15 B of batch framing up by
-    // handle, 15,367 B with the key inline; 58 B of header and count down
+    // handle, 15,401 B of framing and key with the key inline; 58 B of header and count down
     let expected: Vec<(usize, usize, usize, usize)> = LADDER
         .iter()
         .map(|&s| {
@@ -856,7 +856,7 @@ async fn set_2_pads_cover_the_table_and_the_real_slot_moves() {
         fixture_node_set(dir.path(), howl_wire::PARAM_SET_D2048_CELL256_P16).await;
     let mut reader = client(&node).await;
     register(&node, &mut reader).await;
-    let trials = 480;
+    let trials = 480u32;
     let mut shards = HashMap::new();
     let mut slots = [0u32; 16];
     for _ in 0..trials {
@@ -873,13 +873,17 @@ async fn set_2_pads_cover_the_table_and_the_real_slot_moves() {
         slots[batch.slot_order()[0]] += 1;
     }
     assert_eq!(shards.len(), 3, "{shards:?}");
-    let expected = trials / 16;
-    for (slot, count) in slots.iter().enumerate() {
-        assert!(
-            *count > expected / 3 && *count < expected * 3,
-            "slot {slot}: {count} of {trials}: {slots:?}"
-        );
-    }
+    // Pearson's statistic against a uniform spread, held to the upper 1e-6 point of chi-square
+    // with 15 degrees of freedom, so a uniform sampler fails once in a million runs.
+    let expected = f64::from(trials) / 16.0;
+    let stat: f64 = slots
+        .iter()
+        .map(|&c| (f64::from(c) - expected).powi(2) / expected)
+        .sum();
+    assert!(
+        stat < 56.49,
+        "chi-square {stat:.2} over {trials}: {slots:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

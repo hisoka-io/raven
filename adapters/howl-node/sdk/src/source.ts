@@ -1,5 +1,5 @@
 import { HowlError, MAX_RETRY_AFTER_SECONDS, protocol, retryAfterSeconds, type AnswerState } from "./errors.js";
-import { PrefixFeed, type FeedMatch, type FeedView } from "./feed.js";
+import { PrefixFeed, TAG_PREFIX_BYTES, type FeedMatch, type FeedView } from "./feed.js";
 import { neverAnswered, type Exchange, type HowlTransport } from "./http.js";
 import { COMMITMENT_PREFIX_BYTES, decodeCell, missRecord, type FieldCodec, type HowlNoteRecord } from "./record.js";
 import { decode, KIND, type Answer, type HowlClientHandle, type HowlTreeHandle, type HowlWasm } from "./wasm.js";
@@ -13,6 +13,13 @@ const MAX_REWINDS_PER_SYNC = 8;
 // After a node had no seat to give, reads carry their key inline this long before a seat is asked
 // for again, so a key is not uploaded twice per read while the seats stay full.
 const SEAT_RETRY_MS = MAX_RETRY_AFTER_SECONDS * 1000;
+/**
+ * A sync names its cursor rounded down to this many leaves, so the node learns a window that every
+ * wallet synced within it shares, not the wallet's own count. The rows and leaves sent again cost
+ * an idle sync at most 63 x (6 + 32) = 2,394 bytes. It divides the block and the feed segment.
+ */
+export const SYNC_CURSOR_GRANULE = 64;
+const granular = (n: number): number => n - (n % SYNC_CURSOR_GRANULE);
 
 /**
  * How private reads carry the packing key.
@@ -396,32 +403,35 @@ export class RavenHowlSource<F> {
       const at = this.#rewindTo(r);
       rewoundTo = Math.min(rewoundTo ?? at, at);
     };
+    // The node is behind the cursor: a lagging replica, or a chain that got shorter. Only a root
+    // that differs from the held tree's at the node's count proves the latter.
+    const behindCursor = async (node: { leafCount: number; block: number; root: Uint8Array }, status?: number) => {
+      // A node at or past the verified block with fewer leaves follows a chain that dropped
+      // them, even when the leaves it kept are the held ones.
+      let ours: Uint8Array | null = null;
+      try {
+        ours = this.#tree.root(node.leafCount);
+      } catch {
+        ours = null;
+      }
+      if (node.block < this.#state.block && (ours === null || equal(ours, node.root))) {
+        throw new HowlError(
+          "Stale",
+          `the node holds ${node.leafCount} leaves, behind the ${this.#state.leafCount} held`,
+          { ...(status === undefined ? {} : { status }), state: { leafCount: node.leafCount, block: node.block } },
+        );
+      }
+      rewind(Math.min(await this.#divergence(), node.leafCount));
+    };
     for (;;) {
-      const since = this.#feed.length;
+      const since = granular(this.#feed.length);
       const upperSince = this.#tree.fullBlocks;
-      const held = this.#heldTo();
+      const held = granular(this.#heldTo());
       const ex = await this.#get(
         `/howl/v1/sync?since=${since}&upper=${upperSince}` + (held > 0 ? `&held=${held}` : ""),
       );
       if (ex.status === 409) {
-        const stale = protocol("sync", () => decode(this.#wasm, ex.body));
-        // The node is behind the cursor: a lagging replica, or a chain that got shorter. Only
-        // a root that differs from the held tree's at the node's count proves the latter.
-        const behind = new HowlError(
-          "Stale",
-          `the node holds ${stale.leafCount} leaves, behind the ${since} held`,
-          { status: 409, state: { leafCount: stale.leafCount, block: stale.block } },
-        );
-        // A node at or past the verified block with fewer leaves follows a chain that dropped
-        // them, even when the leaves it kept are the held ones.
-        let ours: Uint8Array | null = null;
-        try {
-          ours = this.#tree.root(stale.leafCount);
-        } catch {
-          ours = null;
-        }
-        if (stale.block < this.#state.block && (ours === null || equal(ours, stale.root))) throw behind;
-        rewind(Math.min(await this.#divergence(), stale.leafCount));
+        await behindCursor(protocol("sync", () => decode(this.#wasm, ex.body)), 409);
         continue;
       }
       const a = this.#answer(ex, KIND.sync, "sync");
@@ -430,6 +440,11 @@ export class RavenHowlSource<F> {
       }
       const n = a.leafCount;
       const v = this.#state.leafCount;
+      if (n < v) {
+        // The rounded cursor lets a node behind the held count answer instead of refusing.
+        await behindCursor(a);
+        continue;
+      }
       const before = { index: this.#tree.newestIndex, leaves: this.#tree.newestLeaves() };
       if (upperSince + a.upperNodes.length / NODE_BYTES !== Math.floor(n / LEAF_BLOCK_SIZE)) {
         throw new HowlError("Protocol", `sync carries ${a.upperNodes.length / NODE_BYTES} upper nodes for ${n} leaves`);
@@ -448,7 +463,7 @@ export class RavenHowlSource<F> {
         // The leaves of the old newest block up to the old count must still be there.
         const b = Math.floor((v - 1) / LEAF_BLOCK_SIZE);
         let kept = false;
-        if (n >= v && b === before.index) {
+        if (b === before.index) {
           kept =
             b === a.blockIndex
               ? newest !== null && this.#keeps(before.leaves, v, newest)
@@ -458,11 +473,15 @@ export class RavenHowlSource<F> {
           rewind(b * LEAF_BLOCK_SIZE);
           continue;
         }
-      } else if (n < v) {
-        rewind(n);
+      }
+      // Rows below the cursor come again; a node that now serves other rows there moved them.
+      const moved = this.#feed.firstDifference(a.base, a.rows);
+      if (moved !== null) {
+        rewind(moved);
         continue;
       }
-      this.#feed.append(a.base, a.rows);
+      const resent = Math.min(this.#feed.length, a.next) - a.base;
+      this.#feed.append(this.#feed.length, a.rows.subarray(resent * TAG_PREFIX_BYTES));
       this.#state = { leafCount: n, block: a.block, root: a.root };
       if (a.next === n) {
         const result: SyncResult = {

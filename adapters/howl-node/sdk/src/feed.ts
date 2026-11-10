@@ -61,6 +61,18 @@ export class PrefixFeed implements FeedView {
     return this.#rows.slice(0, this.#length * TAG_PREFIX_BYTES);
   }
 
+  /**
+   * The first position in `[base, length)` where `rows`, read from `base`, differ from the rows
+   * held, or `null` when every row both cover is the same.
+   */
+  firstDifference(base: number, rows: Uint8Array): number | null {
+    const shared = Math.min(this.#length - base, rows.length / TAG_PREFIX_BYTES);
+    for (let i = 0; i < shared * TAG_PREFIX_BYTES; i++) {
+      if (rows[i] !== this.#rows[base * TAG_PREFIX_BYTES + i]) return base + Math.floor(i / TAG_PREFIX_BYTES);
+    }
+    return null;
+  }
+
   /** Append rows that start exactly at the rows held. */
   append(base: number, rows: Uint8Array): void {
     if (base !== this.#length) {

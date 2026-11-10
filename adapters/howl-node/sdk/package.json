@@ -1,6 +1,6 @@
 {
   "name": "@hisoka-io/raven-howl-client",
-  "version": "0.1.0-alpha.0",
+  "version": "0.1.0-alpha.1",
   "description": "Howl discovery over a Raven node: the public tag-prefix feed scanned on the device, private cell reads by PIR, and Merkle paths at a chosen leaf count.",
   "repository": {
     "type": "git",
@@ -11,6 +11,7 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "sideEffects": false,
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -19,7 +20,8 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "dist"
+    "dist",
+    "CHANGELOG.md"
   ],
   "license": "Apache-2.0",
   "engines": {
@@ -33,13 +35,22 @@
     "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
     "prepack": "npm run build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "vitest run --config tests/vitest.config.ts"
+    "test": "vitest run --config tests/vitest.config.ts",
+    "check-pack": "node scripts/check-pack.mjs"
   },
   "peerDependencies": {
-    "@hisoka-io/howl-client-wasm": "0.1.0-alpha.0"
+    "@hisoka-io/howl-client-wasm": "0.1.0-alpha.1",
+    "@hisoka-io/howl-client-wasm-bundler": "0.1.0-alpha.1",
+    "@hisoka-io/howl-client-wasm-web": "0.1.0-alpha.1"
   },
   "peerDependenciesMeta": {
     "@hisoka-io/howl-client-wasm": {
+      "optional": true
+    },
+    "@hisoka-io/howl-client-wasm-bundler": {
+      "optional": true
+    },
+    "@hisoka-io/howl-client-wasm-web": {
       "optional": true
     }
   },

@@ -5,7 +5,7 @@ set -uo pipefail
 GATE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-wasm-size.sh"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-mkdir -p "$work/scripts" "$work/pkg-node" "$work/pkg-bundler"
+mkdir -p "$work/scripts" "$work/pkg-node" "$work/pkg-bundler" "$work/pkg-web"
 cp "$GATE" "$work/scripts/gate.sh"
 failed=0
 
@@ -30,7 +30,8 @@ seed() { # dir wasm_bytes js_bytes
 echo "wasm size gate selftest:"
 seed "$work/pkg-node" 60000 4000
 seed "$work/pkg-bundler" 60000 4000
-check 0 "two small targets pass"
+seed "$work/pkg-web" 60000 4000
+check 0 "three small targets pass"
 seed "$work/pkg-node" 300000 4000
 check 2 "an oversized node wasm is refused"
 seed "$work/pkg-node" 60000 4000
@@ -41,6 +42,12 @@ mkdir -p "$work/pkg-node/snippets/howl-client-wasm"
 head -c 300000 /dev/urandom > "$work/pkg-node/snippets/howl-client-wasm/inline.js"
 check 2 "oversized JS under snippets/ is weighed"
 rm -rf "$work/pkg-node/snippets"
+seed "$work/pkg-web" 300000 4000
+check 2 "an oversized web wasm is refused"
+seed "$work/pkg-web" 60000 4000
+rm -f "$work/pkg-web/howl_client_wasm_bg.wasm"
+check 3 "a missing web wasm fails closed"
+seed "$work/pkg-web" 60000 4000
 rm -f "$work/pkg-bundler/howl_client_wasm_bg.wasm"
 check 3 "a missing wasm fails closed, not as zero bytes"
 

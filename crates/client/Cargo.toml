@@ -17,6 +17,12 @@ crate-type = ["cdylib", "rlib"]
 [lints]
 workspace = true
 
+# Exports this crate's surface to JS. A cdylib that links the crate for its Rust API alone turns it
+# off, or wasm-bindgen exports every item marked here from that cdylib too.
+[features]
+default = ["js-exports"]
+js-exports = []
+
 [dependencies]
 raven-inspire = { path = "../inspire", features = ["mod-switch-response"] }
 serde = { workspace = true }

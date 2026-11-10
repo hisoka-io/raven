@@ -561,10 +561,7 @@ impl HowlClient {
         }
         // Real positions take random slots among uniform pads, so slot order carries nothing
         // about the request.
-        let mut slots: Vec<usize> = (0..padded).collect();
-        for i in (1..padded).rev() {
-            slots.swap(i, OsRng.gen_range(0..=i));
-        }
+        let mut slots = shuffled_slots(padded);
         let mut targets: Vec<u32> = (0..padded)
             .map(|_| {
                 // below leaf_count, which is at most 2^32
@@ -957,6 +954,15 @@ impl HowlBatch {
     }
 }
 
+/// The slots `0..padded` in a uniformly random order (Fisher-Yates over the OS generator).
+fn shuffled_slots(padded: usize) -> Vec<usize> {
+    let mut slots: Vec<usize> = (0..padded).collect();
+    for i in (1..padded).rev() {
+        slots.swap(i, OsRng.gen_range(0..=i));
+    }
+    slots
+}
+
 /// Cells read privately, in request order, with the state they were read at.
 #[wasm_bindgen]
 #[derive(Debug, Clone)]
@@ -1262,6 +1268,34 @@ mod tests {
         for bad in [-1.0, 1.5, 11.0, f64::NAN, f64::INFINITY] {
             assert!(whole(bad, "x", 10).is_err(), "{bad}");
         }
+    }
+
+    /// Pearson's statistic of `counts` against a uniform spread over them.
+    fn chi_square(counts: &[u32]) -> f64 {
+        let total: u32 = counts.iter().sum();
+        let expected = f64::from(total) / counts.len() as f64;
+        counts
+            .iter()
+            .map(|&c| (f64::from(c) - expected).powi(2) / expected)
+            .sum()
+    }
+
+    // The upper 1e-6 point of chi-square with 15 degrees of freedom: a uniform sampler fails
+    // this once in a million runs.
+    const CHI2_15_AT_1E6: f64 = 56.49;
+
+    #[test]
+    fn the_first_real_slot_is_uniform_over_the_padded_batch() {
+        let draws = 20_000;
+        let mut first = [0u32; 16];
+        for _ in 0..draws {
+            first[shuffled_slots(16)[0]] += 1;
+        }
+        let stat = chi_square(&first);
+        assert!(
+            stat < CHI2_15_AT_1E6,
+            "chi-square {stat:.2} over {draws}: {first:?}"
+        );
     }
 
     #[test]

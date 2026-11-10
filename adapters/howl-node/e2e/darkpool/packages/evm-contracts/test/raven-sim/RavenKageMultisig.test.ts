@@ -65,7 +65,12 @@ import {
   userSpendScalar,
 } from "../helpers/fixtures";
 import { buildMultisigNote } from "../helpers/frostMultisig";
-import { RavenAgent, type FoundNote, type RavenSource } from "./ravenAgent";
+import {
+  RavenAgent,
+  useRavenPorts,
+  type FoundNote,
+  type RavenSource,
+} from "./ravenAgent";
 import type { DarkPool, MockERC20 } from "../../typechain-types";
 
 const env = (k: string): string => {
@@ -615,6 +620,7 @@ describe("Raven smoke: Kage swap and FROST multisig on Howl's contracts", functi
     mkdirSync(OUT, { recursive: true });
     sdk = require(env("RAVEN_SDK"));
     wasm = require(env("RAVEN_WASM"));
+    useRavenPorts(sdk);
     deployBlock = await ethers.provider.getBlockNumber();
     ({ darkPool, token } = await deployDarkPoolFixture());
     poolAddr = await darkPool.getAddress();

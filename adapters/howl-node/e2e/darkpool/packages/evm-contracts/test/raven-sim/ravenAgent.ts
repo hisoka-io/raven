@@ -22,7 +22,6 @@ import {
   buildPublicClaim,
   type HowlNoteRecord,
   type DiscoverySource,
-  type FirstOccurrence,
   type OccurrenceRequest,
   type SelfMintAuthorization,
 } from "@hisoka/wallets";
@@ -99,18 +98,46 @@ export interface RavenSource {
   close(): void;
 }
 
+/** Howl's wallet ports as the Raven client package exports them. */
+export interface RavenPorts {
+  discoverySource(raven: RavenSource): DiscoverySource;
+  witnessSource(options: {
+    source: RavenSource;
+    field: { fromBytes(b: Uint8Array): Fr; toBytes(f: Fr): Uint8Array };
+    leafIndexOf(commitment: Fr): number | undefined;
+    isKnownRoot(root: Fr): Promise<boolean>;
+    observe?(
+      witness: { leafIndex: number; leafCount: number; block: number; root: Fr },
+      knownRoot: boolean,
+    ): Promise<void>;
+  }): MerkleWitnessSource;
+}
+
+let ports: RavenPorts | undefined;
+
+/** The package the suite loaded; every agent takes Howl's ports from it. */
+export function useRavenPorts(sdk: RavenPorts): void {
+  ports = sdk;
+}
+
+function ravenPorts(): RavenPorts {
+  if (ports === undefined)
+    throw new Error("useRavenPorts(sdk) was not called before the agents ran");
+  return ports;
+}
+
 /**
  * Howl's DiscoverySource over the Raven client, as shipped: a tag with no feed match gets the
  * client's padded miss record, which both Howl's scanner and its self-mint preflight accept.
  */
 export function discoveryView(raven: RavenSource): DiscoverySource {
-  return {
-    probeFirst: (tags: readonly Fr[]): Promise<readonly FirstOccurrence[]> =>
-      raven.probeFirst(tags),
-    fetchOccurrences: (requests) => raven.fetchOccurrences(requests),
-    fetchLeafBlock: (b) => raven.fetchLeafBlock(b),
-  };
+  return ravenPorts().discoverySource(raven);
 }
+
+const FR_FIELD = {
+  fromBytes: (b: Uint8Array) => Fr.fromBuffer(Buffer.from(b)),
+  toBytes: (f: Fr) => new Uint8Array(f.toBuffer()),
+};
 
 export interface WitnessRecord {
   leafIndex: number;
@@ -398,22 +425,18 @@ export class RavenAgent {
 
   /** Merkle paths from Raven only, checked against the pool before a proof is built on them. */
   witnessSource(): MerkleWitnessSource {
-    return {
-      witnessFor: async (leaf: Fr) => {
+    return ravenPorts().witnessSource({
+      source: this.raven,
+      field: FR_FIELD,
+      leafIndexOf: (commitment) => {
         const owned = [...this.notes.values()].find((n) =>
-          n.commitment.equals(leaf),
+          n.commitment.equals(commitment),
         );
-        if (owned === undefined)
-          throw new Error(
-            `${this.name}: leaf ${leaf.toString()} is not a Raven-found note`,
-          );
-        const w = await this.raven.merkleWitness(owned.leafIndex);
-        if (!w.leaf.equals(leaf))
-          throw new Error(
-            `${this.name}: Raven's leaf ${owned.leafIndex} is not the note`,
-          );
+        return owned === undefined ? undefined : Number(owned.leafIndex);
+      },
+      isKnownRoot: (root) => this.darkPool.isKnownRoot(root.toString()),
+      observe: async (w, knownRoot) => {
         const root = w.root.toString();
-        const knownRoot = await this.darkPool.isKnownRoot(root);
         const chainRoot = await this.chainRootAt(w.leafCount);
         this.witnesses.push({
           leafIndex: w.leafIndex,
@@ -424,13 +447,8 @@ export class RavenAgent {
           chainRootAtCount:
             chainRoot !== undefined && BigInt(chainRoot) === BigInt(root),
         });
-        if (!knownRoot)
-          throw new Error(
-            `${this.name}: Raven's root at ${w.leafCount} is not known to the pool`,
-          );
-        return { leafIndex: w.leafIndex, siblings: w.siblings, root: w.root };
       },
-    };
+    });
   }
 
   ctx(): AssemblyContext {

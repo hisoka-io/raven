@@ -1,28 +1,20 @@
 #!/usr/bin/env bash
-# Builds the Howl client's two wasm-pack targets (Node and bundler) and fails when either ships more
-# than the ceiling, gzipped. A target ships its .wasm and every .js wasm-pack emits for it, snippets
+# Fails when any of the Howl client's three wasm-pack targets (Node, bundler, web) ships more than
+# the ceiling, gzipped. A target ships its .wasm and every .js wasm-pack emits for it, snippets
 # included; .d.ts and package.json never reach a browser and are not weighed.
 #
-#   scripts/check-wasm-size.sh             build both targets, then check
-#   scripts/check-wasm-size.sh --no-build  check pkg-node/ and pkg-bundler/ as they are
+#   scripts/check-wasm-size.sh             build and finish all three (scripts/wasm-build.sh), then check
+#   scripts/check-wasm-size.sh --no-build  check pkg-node/, pkg-bundler/ and pkg-web/ as they are
 #
 # Exit: 0 under the ceiling, 1 a build failed, 2 over the ceiling, 3 an output is missing.
 set -euo pipefail
 
 CRATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# 168,279 B (node) and 168,315 B (bundler) when set; the rest is headroom for the next features.
+# 168,279 B (node) and 168,315 B (bundler) at alpha.0; the rest is headroom for the next features.
 MAX_GZIP_BYTES=256000
 
 if [[ "${1:-}" != "--no-build" ]]; then
-    for target in nodejs bundler; do
-        out=pkg-node
-        [[ $target == bundler ]] && out=pkg-bundler
-        (cd "${CRATE_DIR}" && wasm-pack build --release --target "${target}" --scope hisoka-io \
-            --out-dir "${out}" --out-name howl_client_wasm) || {
-            echo "ERROR: wasm-pack ${target} build failed" >&2
-            exit 1
-        }
-    done
+    exec "${CRATE_DIR}/scripts/wasm-build.sh"
 fi
 
 shipped_gzip_bytes() { # pkg_dir
@@ -34,7 +26,7 @@ shipped_gzip_bytes() { # pkg_dir
 }
 
 failed=0
-for out in pkg-node pkg-bundler; do
+for out in pkg-node pkg-bundler pkg-web; do
     dir="${CRATE_DIR}/${out}"
     if [[ ! -f "${dir}/howl_client_wasm_bg.wasm" ]]; then
         echo "ERROR: missing wasm output ${dir}/howl_client_wasm_bg.wasm" >&2
@@ -49,4 +41,4 @@ for out in pkg-node pkg-bundler; do
     fi
 done
 (( failed == 0 )) || exit 2
-echo "OK: both targets under the ceiling."
+echo "OK: all three targets under the ceiling."

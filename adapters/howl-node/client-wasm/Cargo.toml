@@ -3,7 +3,7 @@
 
 [package]
 name = "howl-client-wasm"
-version = "0.1.0-alpha.0"
+version = "0.1.0-alpha.1"
 edition = "2021"
 rust-version = "1.89"
 authors = ["The Raven Authors"]
@@ -33,7 +33,7 @@ print_stderr = "deny"
 
 [dependencies]
 howl-wire = { path = "../wire" }
-raven-client = { path = "../../../crates/client" }
+raven-client = { path = "../../../crates/client", default-features = false }
 raven-inspire = { path = "../../../crates/inspire", features = ["mod-switch-response"] }
 bincode = "1"
 rand = { version = "0.8", default-features = false, features = ["getrandom"] }

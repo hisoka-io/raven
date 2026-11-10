@@ -45,7 +45,12 @@ import {
   mintSelfNote,
   userSpendScalar,
 } from "../helpers/fixtures";
-import { RavenAgent, type FoundNote, type RavenSource } from "./ravenAgent";
+import {
+  RavenAgent,
+  useRavenPorts,
+  type FoundNote,
+  type RavenSource,
+} from "./ravenAgent";
 import type { DarkPool, MockERC20 } from "../../typechain-types";
 
 const env = (k: string): string => {
@@ -311,6 +316,7 @@ describe("Raven multi-agent simulation on Howl's contracts", function () {
 
     const sdk = require(env("RAVEN_SDK"));
     const wasm = require(env("RAVEN_WASM"));
+    useRavenPorts(sdk);
 
     const provider = ethers.provider;
     const signers = await ethers.getSigners();
