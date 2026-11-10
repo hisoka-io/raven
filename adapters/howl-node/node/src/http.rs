@@ -9,8 +9,9 @@
 //! | `GET /howl/v1/sync?since=N&upper=K&held=H` | the feed from `N`, the upper nodes from `K` and the newest block's leaves from `H` |
 //! | `POST /howl/v1/session` | seat a packing key; returns a handle |
 //! | `POST /howl/v1/notes` | answer a padded batch, by handle or with the key inline |
-//! | `GET /howl/v1/health` | plain text: the leaf count, block and shards served |
-//! | `GET /howl/v1/status` | plain text for the operator, under a bearer token: seats, refusals |
+//! | `GET /howl/v1/health` | plain text: the leaf count, block and shards served; `200` while the node runs |
+//! | `GET /howl/v1/ready` | `200` while the follower reached the head within the stale bound, else `503` |
+//! | `GET /howl/v1/status` | plain text for the operator, under a bearer token: freshness, seats, refusals |
 //!
 //! A read that names a position past the node's state is refused with `409` and a
 //! [`Body::Stale`] answer whose header says where the node stands. A caller over a route's
@@ -51,6 +52,7 @@ const UPPER: &str = "/howl/v1/upper";
 const SYNC: &str = "/howl/v1/sync";
 const NOTES: &str = "/howl/v1/notes";
 const HEALTH: &str = "/howl/v1/health";
+const READY: &str = "/howl/v1/ready";
 const STATUS: &str = "/howl/v1/status";
 const SESSION: &str = "/howl/v1/session";
 
@@ -71,6 +73,7 @@ pub struct Served {
     refused_session_rate: AtomicU64,
     refused_bodies: AtomicU64,
     refused_body_timeout: AtomicU64,
+    stale_after: Duration,
 }
 
 /// Each batch or registration occupies a blocking thread and the cores its work uses; beyond
@@ -153,6 +156,7 @@ impl Served {
             sessions: Bucket::new(limits.sessions),
             bodies: Arc::new(Semaphore::new(limits.bodies.max(1))),
             body_timeout: limits.body_timeout,
+            stale_after: limits.stale_after,
             operator_token: limits.operator_token,
             refused_rate: AtomicU64::new(0),
             refused_session_rate: AtomicU64::new(0),
@@ -288,7 +292,7 @@ fn unread(status: StatusCode) -> Response {
     response
 }
 
-/// Health and status are never rate limited: the platform and the operator must reach them
+/// Health, readiness and status are never rate limited: the platform and the operator must reach them
 /// while the node is loaded. Opening a session takes a session token; every other route a token
 /// from its own bucket.
 async fn admit(State(served): State<Arc<Served>>, request: Request, next: Next) -> Response {
@@ -318,6 +322,10 @@ async fn admit(State(served): State<Arc<Served>>, request: Request, next: Next) 
     }
 }
 
+/// How long a browser may reuse a preflight: Chromium's cap, so the octet-stream POSTs of a
+/// wallet are preflighted once per two hours rather than once per call.
+pub const PREFLIGHT_MAX_AGE: Duration = Duration::from_secs(7_200);
+
 /// Any origin may call; a browser wallet may read `Retry-After` on a refusal.
 pub fn cors() -> CorsLayer {
     CorsLayer::new()
@@ -325,6 +333,7 @@ pub fn cors() -> CorsLayer {
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([header::CONTENT_TYPE])
         .expose_headers([header::RETRY_AFTER])
+        .max_age(PREFLIGHT_MAX_AGE)
 }
 
 /// The router over `served`, CORS included.
@@ -338,6 +347,7 @@ pub fn router(served: Arc<Served>) -> Router {
         .route(SESSION, post(session))
         .route(NOTES, post(notes))
         .route(HEALTH, get(health))
+        .route(READY, get(ready))
         .route(STATUS, get(status))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&served), admit))
         .with_state(served)
@@ -527,6 +537,34 @@ async fn health(State(served): State<Arc<Served>>) -> Response {
     .into_response()
 }
 
+fn millis(age: Option<Duration>) -> String {
+    age.map_or_else(|| "none".to_owned(), |age| age.as_millis().to_string())
+}
+
+fn head_text(head: Option<u64>) -> String {
+    head.map_or_else(|| "none".to_owned(), |head| head.to_string())
+}
+
+/// Whether the follower reached the head within the stale bound. An idle chain stays ready:
+/// a step that finds no new block ends at the head.
+async fn ready(State(served): State<Arc<Served>>) -> Response {
+    let reading = served.engine.freshness().read(Instant::now());
+    let view = served.engine.view();
+    let ready = reading.ready(served.stale_after);
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let body = format!(
+        "{} block={} head={}\n",
+        if ready { "ready" } else { "stale" },
+        view.block,
+        head_text(reading.head),
+    );
+    (status, body).into_response()
+}
+
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)?
@@ -548,10 +586,12 @@ async fn status(State(served): State<Arc<Served>>, headers: HeaderMap) -> Respon
     let pir = served.engine.pir();
     let gate = &served.gate;
     let count = |n: &AtomicU64| n.load(Ordering::Relaxed);
+    let fresh = served.engine.freshness().read(Instant::now());
     format!(
         "ok leaves={} block={} shards={} sessions={} seats={} queued={} refused_rate={} \
          refused_session_rate={} refused_bodies={} refused_body_timeout={} refused_queue_full={} \
-         refused_wait={}\n",
+         refused_wait={} head={} behind={} ready={} current_age_ms={} step_age_ms={} \
+         step_errors={}\n",
         view.leaf_count,
         view.block,
         view.shards.len(),
@@ -564,6 +604,12 @@ async fn status(State(served): State<Arc<Served>>, headers: HeaderMap) -> Respon
         count(&served.refused_body_timeout),
         count(&gate.refused_queue_full),
         count(&gate.refused_wait),
+        head_text(fresh.head),
+        head_text(fresh.head.map(|head| head.saturating_sub(view.block))),
+        u8::from(fresh.ready(served.stale_after)),
+        millis(fresh.current_age),
+        millis(fresh.step_age),
+        fresh.failed,
     )
     .into_response()
 }

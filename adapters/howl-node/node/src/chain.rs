@@ -231,6 +231,18 @@ impl RpcChain {
         self
     }
 
+    /// The chain id the endpoint serves.
+    ///
+    /// # Errors
+    /// [`ChainError`] when the read fails.
+    pub async fn chain_id(&self) -> Result<u64, ChainError> {
+        let result = self.call("eth_chainId", json!([])).await?;
+        parse_quantity(&result).ok_or(ChainError::Malformed {
+            method: "eth_chainId",
+            what: "not a quantity",
+        })
+    }
+
     async fn call(&self, method: &'static str, params: Value) -> Result<Value, ChainError> {
         self.call_limited(method, params, usize::MAX).await
     }

@@ -7,7 +7,8 @@
 //! chain's. When they differ the chain reorganised below the tip: the table goes back to the
 //! newest recorded block the chain still has, and the step reads on from there.
 //!
-//! Within the walk depth of the head a step also reads the header of every block it covers. The
+//! Within the walk depth of the head a step also reads the header of every block it covers, and so
+//! does a step that starts less than twice the walk depth below the head and ends within it. The
 //! headers must link to each other and to the table's last block, every log must name one of them,
 //! and the pool's leaf count is read at the final header's hash. Leaves are applied only in order
 //! and only if the batch ends exactly at that count, so the leaves applied are all of the walked
@@ -157,6 +158,7 @@ pub struct Follower<C> {
     recent: VecDeque<(u64, [u8; 32])>,
     /// The block a step last read from when the pool's count refused its batch.
     refused: Option<u64>,
+    head_seen: Option<u64>,
 }
 
 fn nodes(bytes: &[u8]) -> Vec<Node> {
@@ -204,6 +206,7 @@ impl<C: Chain> Follower<C> {
             lagged: 0,
             recent: VecDeque::new(),
             refused: None,
+            head_seen: None,
         })
     }
 
@@ -225,6 +228,12 @@ impl<C: Chain> Follower<C> {
         &self.chain
     }
 
+    /// The head the last step that got that far read.
+    #[must_use]
+    pub const fn head_seen(&self) -> Option<u64> {
+        self.head_seen
+    }
+
     /// Read on from the table's last block, or go back if the chain reorganised.
     ///
     /// # Errors
@@ -234,13 +243,21 @@ impl<C: Chain> Follower<C> {
             return Ok(step);
         }
         let head = self.chain.head().await?;
+        self.head_seen = Some(head);
         let from = self.indexer.next_block();
         if from > head {
             return Ok(Step::Idle { head });
         }
         let last = from.saturating_add(self.range - 1);
-        let span = if head - from < self.walk_blocks {
-            self.read_walked(from, head.min(last)).await?
+        let walked_to = head.min(last);
+        // A deep read ends one walk below the head it read. On a chain that makes a block while
+        // a step runs, the next step would start a walk below the new head and read deep again,
+        // every step: the table would trail by the walk and the count never be read. Up to twice
+        // the walk is walked at once instead, with the count still read within the walk.
+        let span = if head - from < self.walk_blocks.saturating_mul(2)
+            && head - walked_to < self.walk_blocks
+        {
+            self.read_walked(from, walked_to).await?
         } else {
             self.read_deep(from, (head - self.walk_blocks).min(last))
                 .await?

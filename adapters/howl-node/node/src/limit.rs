@@ -45,6 +45,8 @@ pub struct Limits {
     pub sessions: Rate,
     /// Bearer token opening the status route; `None` keeps it closed.
     pub operator_token: Option<String>,
+    /// How long after the follower last reached the head the ready route still answers `200`.
+    pub stale_after: Duration,
 }
 
 impl std::fmt::Debug for Limits {
@@ -61,6 +63,7 @@ impl std::fmt::Debug for Limits {
                 "operator_token",
                 &self.operator_token.as_ref().map(|_| "set"),
             )
+            .field("stale_after", &self.stale_after)
             .finish()
     }
 }
@@ -89,6 +92,8 @@ impl Limits {
                 burst: 64,
             },
             operator_token: None,
+            // Several polls and one endpoint timeout, so one slow read does not flap it.
+            stale_after: Duration::from_secs(120),
         }
     }
 
@@ -110,6 +115,9 @@ impl Limits {
             return Err(
                 "the permit wait must be above zero; zero refuses every busy caller".to_owned(),
             );
+        }
+        if self.stale_after.is_zero() {
+            return Err("the stale bound must be above zero".to_owned());
         }
         for (name, rate) in [("requests", self.requests), ("sessions", self.sessions)] {
             if rate.per_sec == 0 || rate.burst == 0 {
@@ -270,6 +278,11 @@ mod tests {
         assert!(no_body_time
             .validate()
             .is_err_and(|e| e.contains("body timeout")));
+        let never_ready = Limits {
+            stale_after: Duration::ZERO,
+            ..Limits::new(4)
+        };
+        assert!(never_ready.validate().is_err_and(|e| e.contains("stale")));
     }
 
     #[test]

@@ -33,7 +33,8 @@ VOLUME ["/data"]
 ENV PORT=8645
 EXPOSE 8645
 STOPSIGNAL SIGTERM
-# Liveness: the routes answer. It stays 200 while the follower retries a failing endpoint.
+# Liveness: the routes answer. It stays 200 while the follower retries a failing endpoint or
+# catches up; /howl/v1/ready is the route that turns 503 when the view falls behind the head.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${PORT}/howl/v1/health" >/dev/null || exit 1
 # Starts as root only to hand a root-owned volume to uid 1500; the node itself never runs as root.

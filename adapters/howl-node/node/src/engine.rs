@@ -36,6 +36,7 @@ use raven_inspire::{
 };
 use raven_inspire_session::{BoundedSessionStore, SessionStoreLimits};
 
+use crate::fresh::Freshness;
 use crate::single::Single;
 
 /// Rows of one feed segment, as the feed crate cuts them.
@@ -104,7 +105,6 @@ fn scheme(e: impl std::fmt::Display) -> EngineError {
 }
 
 const CRS_FILE: &str = "crs.bin";
-const SESSIONS_DIR: &str = "sessions";
 
 /// The wire CRS: everything a client needs and nothing only another packing mode reads.
 fn wire_crs(crs: &ServerCrs) -> ServerCrs {
@@ -165,7 +165,6 @@ impl Gadget {
         let crs_bytes = crs.to_versioned_bytes().map_err(scheme)?;
         let zero = encode_one(&params, &shard_config, &vec![0u8; SHARD_BYTES])?;
         let cache = ServerInspiringCache::new(&crs, &zero).map_err(scheme)?;
-        std::fs::create_dir_all(dir.join(SESSIONS_DIR))?;
         let sessions = BoundedSessionStore::open_with_limits(limits).map_err(scheme)?;
         Ok(Self {
             params,
@@ -650,6 +649,7 @@ pub struct Engine {
     // The lowest leaf a refused refresh was asked to read again: the table changed from
     // there and the served view does not show it yet.
     unpublished: AtomicU64,
+    freshness: Freshness,
 }
 
 impl std::fmt::Debug for Engine {
@@ -673,7 +673,14 @@ impl Engine {
             view: ArcSwap::from_pointee(empty),
             encodes: AtomicU64::new(0),
             unpublished: AtomicU64::new(u64::MAX),
+            freshness: Freshness::default(),
         }
+    }
+
+    /// How current the view is, as the follower last established.
+    #[must_use]
+    pub const fn freshness(&self) -> &Freshness {
+        &self.freshness
     }
 
     /// The scheme half.
