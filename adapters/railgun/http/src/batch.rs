@@ -23,6 +23,7 @@ const ADDENDUM_LEVELS: usize = raven_railgun_engine::imt::TREE_DEPTH - PATH10_LE
 const ADDENDUM_BYTES: usize = ADDENDUM_LEVELS * 32;
 
 use crate::auth::validate_session_binding;
+use crate::shape::{check_query_shape, refuse_malformed_shape};
 use crate::state::{AppState, ADDENDUM_SKEW_STALE_PROVENANCE, ADDENDUM_SKEW_UNSEEDED};
 use crate::versioned::{
     read_versioned_as, wire_schema_for, write_batch_response_versioned_as, write_versioned_as,
@@ -177,9 +178,11 @@ pub(crate) async fn inspire_query_handler(
     let instance_id = InstanceId::new(id.clone());
     let instance =
         admit_instance(&app.engine, &instance_id, "query").map_err(AdmissionRefusal::status)?;
-    let schema = wire_schema_for(&instance.current_state().crs.params);
+    let state = instance.current_state();
+    let schema = wire_schema_for(&state.crs.params);
     let query: SeededClientQuery =
         read_versioned_as(&body, schema).map_err(|_| StatusCode::BAD_REQUEST)?;
+    refuse_malformed_shape(&instance_id, 0, check_query_shape(&state, &query))?;
     validate_session_binding(
         &headers,
         app.sessions.as_ref(),
@@ -307,9 +310,13 @@ pub(crate) async fn inspire_batch_handler(
     let instance_id = InstanceId::new(id.clone());
     let instance =
         admit_instance(&app.engine, &instance_id, "batch").map_err(AdmissionRefusal::status)?;
-    let schema = wire_schema_for(&instance.current_state().crs.params);
+    let state = instance.current_state();
+    let schema = wire_schema_for(&state.crs.params);
     let queries: Vec<SeededClientQuery> =
         read_versioned_as(&body, schema).map_err(|_| StatusCode::BAD_REQUEST)?;
+    for (slot, query) in queries.iter().enumerate() {
+        refuse_malformed_shape(&instance_id, slot, check_query_shape(&state, query))?;
+    }
     for handle in queries.iter().filter_map(|query| query.session_handle) {
         validate_session_binding(&headers, app.sessions.as_ref(), &instance_id, Some(handle))?;
     }

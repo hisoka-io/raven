@@ -38,10 +38,6 @@ pub struct AppState<S: PirScheme> {
     pub read_token: Arc<parking_lot::RwLock<String>>,
     /// Identifier surfaced in `X-Raven-Scheme`.
     pub scheme_name: Arc<String>,
-    /// Single consumer cell, labelled with the first instance. Read only while
-    /// `instance_metrics` is empty. `None` omits the fields.
-    pub(crate) consumer_metrics:
-        Arc<Option<Arc<parking_lot::Mutex<raven_railgun_engine::persistence::ConsumerMetrics>>>>,
     /// Filter-tagged stores the shim routes prove coverage against. Installed at boot; `None`
     /// refuses every shim route.
     pub(crate) shim_stores: Arc<Option<crate::shim_store::ShimStoreRegistry>>,
@@ -59,7 +55,7 @@ pub struct AppState<S: PirScheme> {
     pub(crate) handshake_permits: Arc<Semaphore>,
     pub(crate) metrics_handle: Arc<metrics_exporter_prometheus::PrometheusHandle>,
     /// Per-instance consumer cells for `/metrics`, `/v1/status`, readiness and
-    /// `X-Raven-Freshness`; empty falls back to `consumer_metrics`.
+    /// `X-Raven-Freshness`. An instance without a cell reports no consumer fields.
     pub(crate) instance_metrics: Arc<InstanceMetricsMap>,
     /// Whether every served instance must have consumer telemetry before readiness can pass.
     pub(crate) consumer_metrics_required: bool,
@@ -91,7 +87,6 @@ impl<S: PirScheme> Clone for AppState<S> {
             config: Arc::clone(&self.config),
             read_token: Arc::clone(&self.read_token),
             scheme_name: Arc::clone(&self.scheme_name),
-            consumer_metrics: Arc::clone(&self.consumer_metrics),
             shim_stores: Arc::clone(&self.shim_stores),
             instance_logical_stores: Arc::clone(&self.instance_logical_stores),
             instance_concurrency: Arc::clone(&self.instance_concurrency),
@@ -142,7 +137,6 @@ impl<S: PirScheme> AppState<S> {
             config: Arc::new(config),
             read_token,
             scheme_name,
-            consumer_metrics: Arc::new(None),
             shim_stores: Arc::new(None),
             instance_logical_stores: Arc::new(HashMap::new()),
             instance_concurrency: Arc::new(HashMap::new()),
@@ -212,16 +206,6 @@ impl<S: PirScheme> AppState<S> {
         self
     }
 
-    /// Attach the single consumer cell; see the field for where it is read.
-    #[must_use]
-    pub fn with_consumer_metrics(
-        mut self,
-        metrics: Arc<parking_lot::Mutex<raven_railgun_engine::persistence::ConsumerMetrics>>,
-    ) -> Self {
-        self.consumer_metrics = Arc::new(Some(metrics));
-        self
-    }
-
     /// Fail readiness closed when consumer telemetry is absent for a served instance.
     #[must_use]
     pub fn require_consumer_metrics(mut self) -> Self {
@@ -237,7 +221,7 @@ impl<S: PirScheme> AppState<S> {
         self
     }
 
-    /// `/metrics` emits `instance="<id>"` gauges; empty falls back to the single cell.
+    /// `/metrics` emits `instance="<id>"` gauges for each instance in the map.
     ///
     /// Adds to the shared map rather than replacing it, so cells an instance spawned at boot
     /// already registered through [`Self::instance_metrics_registry`] survive.

@@ -120,8 +120,7 @@ impl ConsumerStatus {
 
 type MetricsCell = Arc<parking_lot::Mutex<ConsumerMetrics>>;
 
-/// Each registered instance with its consumer cell, by the rule `/metrics` labels with: the
-/// per-instance map, or, when that is empty, the single cell on the first instance.
+/// Each registered instance with its consumer cell from the per-instance map.
 fn instance_consumer_cells<S: PirScheme>(
     app: &AppState<S>,
     instances: &[Arc<raven_railgun_engine::PirInstance<S>>],
@@ -129,18 +128,7 @@ fn instance_consumer_cells<S: PirScheme>(
     let per_instance = app.instance_metrics.read();
     instances
         .iter()
-        .enumerate()
-        .map(|(at, instance)| {
-            if per_instance.is_empty() {
-                app.consumer_metrics
-                    .as_ref()
-                    .as_ref()
-                    .filter(|_| at == 0)
-                    .cloned()
-            } else {
-                per_instance.get(&instance.id).cloned()
-            }
-        })
+        .map(|instance| per_instance.get(&instance.id).cloned())
         .collect()
 }
 
@@ -159,15 +147,7 @@ pub(crate) fn freshness_reading<S: PirScheme>(
     app: &AppState<S>,
     instance_id: &raven_railgun_core::InstanceId,
 ) -> Option<crate::FreshnessReading> {
-    let own = {
-        let per_instance = app.instance_metrics.read();
-        if per_instance.is_empty() {
-            // The single cell is also the whole node view, so it answers for every instance.
-            app.consumer_metrics.as_ref().clone()
-        } else {
-            per_instance.get(instance_id).cloned()
-        }
-    };
+    let own = app.instance_metrics.read().get(instance_id).cloned();
     match own {
         Some(cell) => {
             let snap = *cell.lock();
@@ -233,7 +213,6 @@ pub(crate) async fn metrics_handler<S: raven_railgun_engine::PirScheme>(
 }
 
 /// Per-scrape gauge values; HELP/TYPE are registered once at `AppState::new`.
-/// An empty `instance_metrics` falls back to the single cell.
 fn refresh_dynamic_metrics<S: raven_railgun_engine::PirScheme>(app: &AppState<S>) {
     use std::time::Instant;
     let uptime_secs = Instant::now()
@@ -259,15 +238,6 @@ fn refresh_dynamic_metrics<S: raven_railgun_engine::PirScheme>(app: &AppState<S>
         if let Some(consumer) = per_instance.get(&instance.id) {
             let snap = *consumer.lock();
             emit_instance_consumer_gauges(&instance_id, &snap);
-        }
-    }
-
-    if per_instance.is_empty() {
-        if let Some(cell) = app.consumer_metrics.as_ref().as_ref() {
-            if let Some(first) = instances.first() {
-                let snap = *cell.lock();
-                emit_instance_consumer_gauges(first.id.as_str(), &snap);
-            }
         }
     }
 }
@@ -558,29 +528,11 @@ fn consumer_is_stalled(m: &raven_railgun_engine::persistence::ConsumerMetrics) -
 /// Instances whose consumer has failed every event since its last applied one, or is carrying
 /// leaves a broken per-leaf loop abandoned.
 ///
-/// Reads the same cells the consumer tasks mutate, with the single-cell fallback
-/// `refresh_dynamic_metrics` uses: a deployment that wires only
-/// `with_consumer_metrics` still gets a gate.
+/// Reads the same cells the consumer tasks mutate. An instance without a cell counts as stalled
+/// only when consumer telemetry is required.
 fn stalled_consumer_instances<S: PirScheme>(app: &AppState<S>) -> Vec<String> {
     let instances = app.engine.instances();
     let per_instance = app.instance_metrics.read().clone();
-    if per_instance.is_empty() {
-        let Some(cell) = app.consumer_metrics.as_ref().as_ref() else {
-            return if app.consumer_metrics_required {
-                instances
-                    .iter()
-                    .map(|instance| instance.id.as_str().to_owned())
-                    .collect()
-            } else {
-                Vec::new()
-            };
-        };
-        let stalled = consumer_is_stalled(&cell.lock());
-        return match instances.first() {
-            Some(first) if stalled => vec![first.id.as_str().to_owned()],
-            _ => Vec::new(),
-        };
-    }
     let mut stalled: Vec<String> = instances
         .iter()
         .filter(|instance| match per_instance.get(&instance.id) {
@@ -889,14 +841,6 @@ mod tests {
             .collect()
     }
 
-    /// What `/v1/status` reported before: the single cell, wired to the first instance.
-    fn first_cell_view(app: &AppState<StubScheme>) -> Option<ConsumerStatus> {
-        app.consumer_metrics
-            .as_ref()
-            .as_ref()
-            .map(|m| ConsumerStatus::of(&m.lock()))
-    }
-
     /// A sealed mirror block, as the first instance on a mainnet-shaped node: nothing to ingest.
     fn sealed() -> ConsumerMetrics {
         ConsumerMetrics {
@@ -939,9 +883,7 @@ mod tests {
         const SEALED: &str = "status-counter-ofac-0";
         const LIVE: &str = "status-counter-ofac-6";
         let (sealed, live) = (cell(sealed()), cell(live()));
-        // Production's wiring: the single cell is the first instance's.
         let app = state_with(&[SEALED, LIVE])
-            .with_consumer_metrics(Arc::clone(&sealed))
             .with_instance_metrics(per_instance(&[(SEALED, &sealed), (LIVE, &live)]));
 
         let status = build_status_response(&app);
@@ -955,9 +897,10 @@ mod tests {
             "the sealed row keeps its own number"
         );
 
-        // Planted control: the old first-cell report on the same node fails the same check.
+        // Planted control: a report of the first instance's cell alone fails the same check.
+        let first_cell = ConsumerStatus::of(&sealed.lock());
         let old = StatusResponse {
-            consumer: first_cell_view(&app),
+            consumer: Some(first_cell),
             ..build_status_response(&app)
         };
         let caught = std::panic::catch_unwind(|| assert_reports_the_ingesting_instance(&old, LIVE));
@@ -1015,32 +958,8 @@ mod tests {
     }
 
     #[test]
-    fn single_cell_wiring_reports_exactly_what_it_did() {
+    fn an_unwired_node_reports_no_consumer_block() {
         const ONLY: &str = "status-counter-single-a";
-        const OTHER: &str = "status-counter-single-b";
-        let only = cell(ConsumerMetrics {
-            last_known_chain_head: 2_000,
-            last_scanned_block: 1_990,
-            last_applied_block: 1_900,
-            events_processed: 7,
-            commits_fired: 2,
-            reorgs_handled: 1,
-            consumer_errors: 3,
-            ..ConsumerMetrics::default()
-        });
-        let app = state_with(&[ONLY, OTHER]).with_consumer_metrics(Arc::clone(&only));
-        let status = build_status_response(&app);
-        assert_eq!(
-            serde_json::to_vec(&status.consumer).expect("json"),
-            serde_json::to_vec(&first_cell_view(&app)).expect("json"),
-            "without a per-instance map the node block is the single cell, byte for byte"
-        );
-        assert!(status.instances[0].consumer.is_some());
-        assert!(
-            status.instances[1].consumer.is_none(),
-            "the single cell is labelled with the first instance only, as /metrics does"
-        );
-
         let unwired = build_status_response(&state_with(&[ONLY]));
         let json = serde_json::to_value(&unwired).expect("json");
         assert!(json.get("consumer").is_none());
@@ -1060,7 +979,6 @@ mod tests {
             m.last_applied_block = 480;
         }
         let app = state_with(&[SEALED, LIVE])
-            .with_consumer_metrics(Arc::clone(&sealed))
             .with_instance_metrics(per_instance(&[(SEALED, &sealed), (LIVE, &live)]));
 
         let (code, body) = ready_probe(app.clone()).await;
@@ -1095,7 +1013,6 @@ mod tests {
         const LIVE: &str = "status-counter-metrics-ofac-6";
         let (sealed, live) = (cell(sealed()), cell(live()));
         let app = state_with(&[SEALED, LIVE])
-            .with_consumer_metrics(Arc::clone(&sealed))
             .with_instance_metrics(per_instance(&[(SEALED, &sealed), (LIVE, &live)]));
         super::refresh_dynamic_metrics(&app);
         let body = app.metrics_handle.render();

@@ -15,7 +15,7 @@ import {
   TREE_DEPTH,
 } from "./poi-pir";
 import { MAX_BATCH_SIZE } from "./batch-ladder";
-import { buildPaddedQueryPlan } from "./batch-cover";
+import { buildPaddedQueryPlan, type PaddedQueryPlan } from "./batch-cover";
 import {
   type BcPrefixIndex,
   assertBcPrefixIndex,
@@ -254,6 +254,7 @@ const ENGINE_BATCH_SIZE = 20;
 /** The verdicts engine's `TXOPOIListStatus` has. */
 const ENGINE_STATUSES: readonly string[] = ["Valid", "ShieldBlocked", "ProofSubmitted", "Missing"];
 const SESSION_QUERY_ATTEMPTS = 2;
+const UNANSWERED_PLAN_CAP = 64;
 const WIRE_CAPTURE_CAP = 64;
 
 type UpstreamJsonRpcMethod =
@@ -296,6 +297,9 @@ export class RavenPOINodeInterface {
   private readonly capturedRequests: CapturedWireRequest[] | undefined;
   private readonly sessionHandshakes = new Map<string, Promise<bigint>>();
   private readonly clientPirIds = new Map<string, string>();
+  // Covers and slot order of batches not yet answered, so a batch sent again asks for the same
+  // rows in the same slots.
+  private readonly unansweredPlans = new Map<string, PaddedQueryPlan>();
   private nextUpstreamRequestId = 1;
 
   constructor(config: RavenConfig) {
@@ -1351,10 +1355,19 @@ export class RavenPOINodeInterface {
     targetIndices: readonly number[],
     populatedRows: number,
   ): Promise<PrivateQueryBatchResult> {
-    return this.withClientPirSessionRetry(instanceLabel, ctx, async () => {
+    const { entriesPerShard } = decodeShardGeometry(ctx.shardConfigBincode);
+    const planKey = `${instanceLabel}:${entriesPerShard}:${targetIndices.join(",")}`;
+    const plan =
+      this.unansweredPlans.get(planKey) ??
+      buildPaddedQueryPlan(targetIndices, entriesPerShard, populatedRows);
+    this.unansweredPlans.delete(planKey);
+    this.unansweredPlans.set(planKey, plan);
+    for (const oldest of this.unansweredPlans.keys()) {
+      if (this.unansweredPlans.size <= UNANSWERED_PLAN_CAP) break;
+      this.unansweredPlans.delete(oldest);
+    }
+    const answered = await this.withClientPirSessionRetry(instanceLabel, ctx, async () => {
       const route = this.route();
-      const { entriesPerShard } = decodeShardGeometry(ctx.shardConfigBincode);
-      const plan = buildPaddedQueryPlan(targetIndices, entriesPerShard, populatedRows);
       const queryBundles = plan.wireTargets.map((targetIdx) =>
         decodeClientPirQueryBundle(
           callWasm("client-PIR query", () =>
@@ -1396,6 +1409,8 @@ export class RavenPOINodeInterface {
       );
       return { plaintexts, addenda, freshness };
     });
+    this.unansweredPlans.delete(planKey);
+    return answered;
   }
 
   private async withClientPirSessionRetry<T>(

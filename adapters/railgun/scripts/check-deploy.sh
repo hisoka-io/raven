@@ -18,7 +18,11 @@
 #      STOP_BUDGET between SIGTERM and SIGKILL, and health-check a route the node serves;
 #  10. the Railway entrypoint renders both shipped templates to bind 0.0.0.0:$PORT, carry no token
 #      source beside RAVEN_BEARER_TOKEN, trust no forwarding header (Railway's edge passes a
-#      client's cf-connecting-ip through), and keep every instance's data under the volume.
+#      client's cf-connecting-ip through), and keep every instance's data under the volume;
+#  11. RAVEN_APPROXIMATE_PACKING_GADGET is the one switch for the served gadget: unset or false,
+#      the entrypoint and deploy/lib.sh render_config write the default config byte for byte; true
+#      adds exactly approximate_packing_gadget = true under [global]; and deploy/lib.sh sizes a
+#      seat from the same variable, 49 KiB or the approximate set's 36.
 # DEPLOY_CHECK_ROOT points it at a copy of the adapter directory (its selftest does).
 set -uo pipefail
 
@@ -68,6 +72,8 @@ if [[ -z $memory || -z $seats || $instances == 0 ]]; then
   fail "could not read deploy.sh's default memory (${memory:-none}) or seats (${seats:-none}), or the template's instances ($instances)"
 else
   (
+    # The help states the default parameter set's figure.
+    unset RAVEN_APPROXIMATE_PACKING_GADGET
     # shellcheck source=adapters/railgun/deploy/lib.sh
     . "$root/deploy/lib.sh"
     die() { echo "check-deploy: $*"; exit 1; }
@@ -103,12 +109,37 @@ if [[ $sets == 0 || $sealed != "$sets" ]] || grep -qE 'name: "RAVEN_BEARER_TOKEN
   fail "configure.sh sets RAVEN_BEARER_TOKEN without sealing it"
 fi
 
+# The entrypoint's render for a network; trailing VAR=value words are set for it.
+print_railway() {  # network [VAR=value...]
+  env -u RAVEN_APPROXIMATE_PACKING_GADGET RAVEN_TEMPLATE_DIR="$root/examples" RAVEN_NETWORK="$1" \
+    RAILWAY_VOLUME_MOUNT_PATH=/vol PORT=4321 "${@:2}" sh "$railway/entrypoint.sh" --print-config
+}
+
+# Each line one render adds to another, `>`-prefixed; a removed line shows `<`-prefixed.
+render_delta() {  # base flipped
+  diff <(printf '%s\n' "$1") <(printf '%s\n' "$2") | grep -E '^[<>]'
+}
+
+gadget_section() {  # config
+  awk '/^[[]/ { section = $0 } /^approximate_packing_gadget = true$/ { print section }' <<<"$1"
+}
+
 for net in mainnet sepolia; do
-  if ! out=$(RAVEN_TEMPLATE_DIR=$root/examples RAVEN_NETWORK=$net RAILWAY_VOLUME_MOUNT_PATH=/vol \
-    PORT=4321 sh "$railway/entrypoint.sh" --print-config 2>&1); then
+  if ! out=$(print_railway "$net" 2>&1); then
     fail "deploy/railway/entrypoint.sh cannot render $net: $out"
     continue
   fi
+  ! grep -qE '^approximate_packing_gadget' <<<"$out" \
+    || fail "the default $net render sets approximate_packing_gadget; the default set needs no line"
+  [[ $(print_railway "$net" RAVEN_APPROXIMATE_PACKING_GADGET=false 2>&1) == "$out" ]] \
+    || fail "the $net render with RAVEN_APPROXIMATE_PACKING_GADGET=false is not the default render"
+  if ! on=$(print_railway "$net" RAVEN_APPROXIMATE_PACKING_GADGET=true 2>&1); then
+    fail "deploy/railway/entrypoint.sh cannot render $net with the approximate gadget: $on"
+  elif [[ $(render_delta "$out" "$on") != '> approximate_packing_gadget = true' || $(gadget_section "$on") != '[global]' ]]; then
+    fail "the $net render with RAVEN_APPROXIMATE_PACKING_GADGET=true does not add exactly approximate_packing_gadget = true under [global]"
+  fi
+  ! print_railway "$net" RAVEN_APPROXIMATE_PACKING_GADGET=yes >/dev/null 2>&1 \
+    || fail "deploy/railway/entrypoint.sh accepts RAVEN_APPROXIMATE_PACKING_GADGET=yes"
   [[ $(grep -cx 'bind = "0.0.0.0:4321"' <<<"$out") == 1 ]] \
     || fail "the rendered $net config does not bind 0.0.0.0:\$PORT"
   ! grep -qE '^(token|token_file) = ' <<<"$out" \
@@ -121,6 +152,38 @@ for net in mainnet sepolia; do
   [[ $want -ge 1 && $got == "$want" && $(grep -cE '^data_dir = ' <<<"$out") == "$want" ]] \
     || fail "the rendered $net config keeps $got of $want instances' data under the volume"
 done
+
+# deploy/lib.sh under one value of the switch ("unset" leaves it out): its seat size, then
+# render_config's output from the mainnet template, which the stub hands it in place of the image's.
+lib_under() {  # value
+  (
+    unset RAVEN_APPROXIMATE_PACKING_GADGET
+    [[ $1 == unset ]] || export RAVEN_APPROXIMATE_PACKING_GADGET=$1
+    # shellcheck source=adapters/railgun/deploy/lib.sh
+    . "$root/deploy/lib.sh"
+    docker() { cat "$root/examples/mainnet-ppoi.toml"; }
+    echo "$SEAT_KIB"
+    render_config image "" "" 1024
+  )
+}
+if ! lib_default=$(lib_under unset 2>&1); then
+  fail "deploy/lib.sh render_config cannot render the mainnet template: $lib_default"
+else
+  for value in false true; do
+    if ! lib_flipped=$(lib_under "$value" 2>&1); then
+      fail "deploy/lib.sh with RAVEN_APPROXIMATE_PACKING_GADGET=$value: $lib_flipped"
+      continue
+    fi
+    want_kib=49 want_delta=""
+    [[ $value == false ]] || want_kib=36 want_delta='> approximate_packing_gadget = true'
+    [[ ${lib_flipped%%$'\n'*} == "$want_kib" ]] \
+      || fail "deploy/lib.sh SEAT_KIB is ${lib_flipped%%$'\n'*} with RAVEN_APPROXIMATE_PACKING_GADGET=$value, not $want_kib"
+    [[ $(render_delta "${lib_default#*$'\n'}" "${lib_flipped#*$'\n'}") == "$want_delta" ]] \
+      || fail "deploy/lib.sh render_config with RAVEN_APPROXIMATE_PACKING_GADGET=$value does not ${want_delta:+add exactly approximate_packing_gadget = true}${want_delta:-match the default render}"
+  done
+  [[ ${lib_default%%$'\n'*} == 49 ]] || fail "deploy/lib.sh SEAT_KIB is ${lib_default%%$'\n'*} with the switch unset, not 49"
+  ! lib_under yes >/dev/null 2>&1 || fail "deploy/lib.sh accepts RAVEN_APPROXIMATE_PACKING_GADGET=yes"
+fi
 
 ((failed == 0)) && echo "check-deploy: ok"
 exit $failed

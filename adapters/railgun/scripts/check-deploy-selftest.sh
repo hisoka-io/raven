@@ -54,7 +54,21 @@ expect "port published on every address" "beyond loopback" deploy/deploy.sh \
   's/--publish "127.0.0.1:/--publish "0.0.0.0:/'
 expect "default seats past the memory cap" "do not fit" deploy/deploy.sh 's/^max_sessions=1024 /max_sessions=999999 /'
 expect "default memory cap too small" "do not fit" deploy/deploy.sh 's/ memory=10g$/ memory=4g/'
-expect "seat size changed, help figure not" "does not state" deploy/lib.sh 's/^SEAT_KIB=49$/SEAT_KIB=98/'
+expect "seat size changed, help figure not" "does not state" deploy/lib.sh 's/^  false) SEAT_KIB=49 ;;$/  false) SEAT_KIB=98 ;;/'
+expect "seat size does not follow the gadget switch" "SEAT_KIB is 49 with RAVEN_APPROXIMATE_PACKING_GADGET=true" \
+  deploy/lib.sh 's/^  true) SEAT_KIB=36 ;;$/  true) SEAT_KIB=49 ;;/'
+expect "lib.sh accepts any switch value" "accepts RAVEN_APPROXIMATE_PACKING_GADGET=yes" deploy/lib.sh \
+  's/^  true) SEAT_KIB=36 ;;$/  *) SEAT_KIB=36 ;;/'
+expect "render_config ignores the gadget switch" "render_config with RAVEN_APPROXIMATE_PACKING_GADGET=true" \
+  deploy/lib.sh 's/^  if \[\[ \$APPROXIMATE_PACKING_GADGET == true \]\]; then$/  if false; then/'
+expect "entrypoint ignores the gadget switch" "RAVEN_APPROXIMATE_PACKING_GADGET=true does not add" \
+  deploy/railway/entrypoint.sh '/^approximate_packing_gadget = true" ;;$/s/^approximate/# approximate/'
+# shellcheck disable=SC2016
+expect "entrypoint changes the default render" "the default mainnet render sets approximate_packing_gadget" \
+  deploy/railway/entrypoint.sh 's/^    false) ;;$/    false) global="$global\
+approximate_packing_gadget = false" ;;/'
+expect "entrypoint accepts any switch value" "accepts RAVEN_APPROXIMATE_PACKING_GADGET=yes" \
+  deploy/railway/entrypoint.sh 's/^    false) ;;$/    false | yes) ;;/'
 expect "boot peak changed, help figure not" "does not state" deploy/lib.sh 's/^NODE_PEAK_MIB=4400$/NODE_PEAK_MIB=2048/'
 expect "seat size for another row" "record_size is not 512" examples/mainnet-ppoi.toml \
   's/^record_size = 512$/record_size = 1024/'

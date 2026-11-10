@@ -24,6 +24,7 @@ pub mod batch;
 pub mod config;
 pub mod handshake;
 pub mod poi_shim;
+mod shape;
 pub mod shim_store;
 pub mod state;
 pub mod status;

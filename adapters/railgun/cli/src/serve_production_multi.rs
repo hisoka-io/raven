@@ -1093,12 +1093,10 @@ fn warn_if_ifma52_small_cell(opts: &MultiServeOptions, entries: usize) {
         tracing::warn!(
             entries,
             min_record_size,
-            "host CPU exposes AVX-512-IFMA52 (W-G IFMA52 SIMD path) AND \
-             the configured cell is small (entries < 2^16 OR \
-             record_size <= 32). At T1-style small cells the IFMA52 \
-             path regresses by ~1.038x on Zen 5. See OPERATOR_RUNBOOK \
-             section 7a for the cell applicability table. The path is \
-             auto-detected; no action required if you accept the \
+            "host CPU exposes AVX-512-IFMA52 AND the configured cell is \
+             small (entries < 2^16 OR record_size <= 32). At cells this \
+             small the IFMA52 path measured ~1.038x slower on Zen 5. The \
+             path is auto-detected; no action required if you accept the \
              measured regression."
         );
     }

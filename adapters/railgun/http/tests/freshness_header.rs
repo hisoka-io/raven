@@ -97,7 +97,10 @@ fn build_router(cell: Option<Arc<parking_lot::Mutex<ConsumerMetrics>>>) -> axum:
         AppState::new(engine, cfg).expect("appstate")
     };
     let state = match cell {
-        Some(c) => state.with_consumer_metrics(c),
+        Some(c) => state.with_instance_metrics(std::collections::HashMap::from([(
+            InstanceId::new(INSTANCE),
+            c,
+        )])),
         None => state,
     };
     router::<EchoScheme>(state).expect("router")
@@ -106,9 +109,7 @@ fn build_router(cell: Option<Arc<parking_lot::Mutex<ConsumerMetrics>>>) -> axum:
 type Cell = Arc<parking_lot::Mutex<ConsumerMetrics>>;
 
 /// A node serving `ids`, wired as production wires one: a cell per instance in the map.
-/// `single` additionally installs the legacy single cell, as production once did with the
-/// first instance's.
-fn build_node(ids: &[&str], cells: &[(&str, &Cell)], single: Option<&Cell>) -> axum::Router {
+fn build_node(ids: &[&str], cells: &[(&str, &Cell)]) -> axum::Router {
     let mut engine: Engine<EchoScheme> = Engine::new();
     for id in ids {
         engine
@@ -128,10 +129,6 @@ fn build_node(ids: &[&str], cells: &[(&str, &Cell)], single: Option<&Cell>) -> a
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         AppState::new(engine, cfg).expect("appstate")
-    };
-    let state = match single {
-        Some(c) => state.with_consumer_metrics(Arc::clone(c)),
-        None => state,
     };
     let state = state.with_instance_metrics(
         cells
@@ -244,17 +241,11 @@ fn sealed_and_live() -> (Cell, Cell) {
 }
 
 /// The response came from one instance's snapshot, so its freshness is that instance's, on
-/// both routes, even with the old first-instance single cell still installed beside the map.
+/// both routes.
 #[tokio::test]
 async fn freshness_describes_the_instance_that_answered() {
     let (sealed, live) = sealed_and_live();
-    let node = || {
-        build_node(
-            &[SEALED, LIVE],
-            &[(SEALED, &sealed), (LIVE, &live)],
-            Some(&sealed),
-        )
-    };
+    let node = || build_node(&[SEALED, LIVE], &[(SEALED, &sealed), (LIVE, &live)]);
     let live_reading = "lag_blocks=10 applied_height=20999990 epoch=0 confidence=0.961";
     for (route, body) in [("query", single_body()), ("batch", batch_body())] {
         let value = freshness_from(node(), request_to(LIVE, route, body.clone()), route).await;
@@ -275,7 +266,6 @@ async fn an_instance_without_its_own_cell_reports_the_node_view() {
     let node = build_node(
         &[SEALED, LIVE, UNWIRED],
         &[(SEALED, &sealed), (LIVE, &live)],
-        None,
     );
     let value = freshness_from(node, request_to(UNWIRED, "query", single_body()), "query").await;
     assert_eq!(

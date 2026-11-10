@@ -234,7 +234,7 @@ async fn a_body_of_the_other_set_is_refused_with_the_instances_schema() {
             "{instance}"
         );
     }
-    // Control: the right schema with the wrong key shape is refused by the key check instead.
+    // Control: the right schema with the wrong key shape is refused by the admission key check.
     let (status, _, _) = send(
         &router,
         request(
@@ -245,7 +245,7 @@ async fn a_body_of_the_other_set_is_refused_with_the_instances_schema() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

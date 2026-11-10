@@ -190,30 +190,6 @@ async fn readiness_fails_closed_while_an_instance_consumer_is_stalled() {
     fixture.shutdown().await;
 }
 
-/// Mirrors `serve_production`'s single-cell wiring, where `instance_metrics` may
-/// be empty and the one shared cell is the only consumer view.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn readiness_fails_closed_on_the_single_consumer_cell() {
-    let cell = caught_up_at_tip();
-    let fixture = spawn(&[HEALTHY], |state| {
-        state.with_consumer_metrics(Arc::clone(&cell))
-    })
-    .await;
-
-    let (code, _) = fixture.probe().await;
-    assert_eq!(code, 200, "a caught-up consumer must be ready");
-
-    cell.lock().consecutive_event_errors = 3;
-    let (code, body) = fixture.probe().await;
-    assert_eq!(
-        code, 503,
-        "the single-cell deployment must fail closed on a stalled consumer too"
-    );
-    assert_eq!(body.stalled_consumer_instances, vec![HEALTHY.to_owned()]);
-
-    fixture.shutdown().await;
-}
-
 /// An unwired consumer is not evidence of a stall.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn readiness_stays_ready_without_consumer_metrics() {
@@ -249,7 +225,10 @@ async fn readiness_fails_closed_when_indexer_lag_reaches_zero_confidence() {
         metrics.last_scanned_block = 20_999_745;
     }
     let fixture = spawn(&[HEALTHY], |state| {
-        state.with_consumer_metrics(Arc::clone(&cell))
+        state.with_instance_metrics(HashMap::from([(
+            InstanceId::new(HEALTHY),
+            Arc::clone(&cell),
+        )]))
     })
     .await;
 
