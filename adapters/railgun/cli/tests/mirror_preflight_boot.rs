@@ -1698,10 +1698,12 @@ async fn a_feed_stops_at_the_last_declared_row_names_the_next_block_and_feeds_it
             "the feed asked upstream for rows no declared block holds: {pages:?}"
         );
         let (code, body) = readiness(booting.addr).await;
-        let stopped = body
-            .mirror_feeds
-            .iter()
-            .any(|feed| feed.state == MirrorFeedState::Stopped);
+        // The feed can stop before its last page is applied, and readiness is read before the
+        // rows are, so a probe can show Stopped with a count the rows read after it has passed.
+        let stopped = body.mirror_feeds.iter().any(|feed| {
+            (feed.state, feed.rows_held, feed.next_index)
+                == (MirrorFeedState::Stopped, block, block)
+        });
         let applied = rows_under(&view, PATHS_BLOCK_0) == full;
         let progress = (feed_progress(&body), rows_applied(&view), pages.len());
         let done = stopped && applied && !body.router_unrouted_targets.is_empty();

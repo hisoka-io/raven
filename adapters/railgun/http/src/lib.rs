@@ -22,6 +22,8 @@
 pub mod auth;
 pub mod batch;
 pub mod config;
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod fuzzing;
 pub mod handshake;
 pub mod poi_shim;
 mod shape;

@@ -3,8 +3,9 @@
 //! refusal the respond or registration path makes later.
 
 use axum::http::StatusCode;
-use raven_inspire::inspiring::ClientPackingKeys;
+use raven_inspire::inspiring::{ClientPackingKeys, PackParams};
 use raven_inspire::math::Poly;
+use raven_inspire::params::InspireParams;
 use raven_inspire::SeededClientQuery;
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::InspireServerState;
@@ -25,7 +26,28 @@ pub(crate) fn check_query_shape(
     state: &InspireServerState,
     query: &SeededClientQuery,
 ) -> Result<(), String> {
-    let params = &state.crs.params;
+    query_shape(
+        &state.crs.params,
+        state.cache.pack_params(),
+        state.encoded_db.config.num_shards(),
+        query,
+    )
+}
+
+pub(crate) fn check_packing_key_shape(
+    state: &InspireServerState,
+    keys: &ClientPackingKeys,
+) -> Result<(), String> {
+    packing_key_shape(state.cache.pack_params(), keys)
+}
+
+/// The query check over the served parameters alone, so it runs without a loaded instance.
+pub(crate) fn query_shape(
+    params: &InspireParams,
+    pack: &PackParams,
+    num_shards: u64,
+    query: &SeededClientQuery,
+) -> Result<(), String> {
     let rgsw = &query.rgsw_ciphertext;
     let gadget = &rgsw.gadget;
     if gadget.len != 1 || gadget.base != params.gadget_base || gadget.q != params.q {
@@ -49,7 +71,6 @@ pub(crate) fn check_query_shape(
             params.moduli(),
         )?;
     }
-    let num_shards = state.encoded_db.config.num_shards();
     if u64::from(query.shard_id) >= num_shards {
         return Err(format!(
             "shard {} is past the {num_shards} shards this instance serves",
@@ -57,7 +78,7 @@ pub(crate) fn check_query_shape(
         ));
     }
     match (&query.inspiring_packing_keys, query.session_handle) {
-        (Some(keys), None) => check_packing_key_shape(state, keys),
+        (Some(keys), None) => packing_key_shape(pack, keys),
         (None, Some(_)) => Ok(()),
         (Some(_), Some(_)) => {
             Err("query carries both inline packing keys and a session handle".to_owned())
@@ -68,11 +89,8 @@ pub(crate) fn check_query_shape(
     }
 }
 
-pub(crate) fn check_packing_key_shape(
-    state: &InspireServerState,
-    keys: &ClientPackingKeys,
-) -> Result<(), String> {
-    let pack = state.cache.pack_params();
+/// The packing-key check over the served packing parameters alone.
+pub(crate) fn packing_key_shape(pack: &PackParams, keys: &ClientPackingKeys) -> Result<(), String> {
     if keys.y_body.len() != pack.key_rows() {
         return Err(format!(
             "packing key has {} y_body rows, the served gadget needs {}",
@@ -130,7 +148,7 @@ mod tests {
     use axum::body::Body;
     use axum::extract::ConnectInfo;
     use axum::http::{header, Method, Request, StatusCode};
-    use raven_inspire::inspiring::ClientPackingKeys;
+    use raven_inspire::inspiring::{ClientPackingKeys, PackParams};
     use raven_inspire::math::{GaussianSampler, Poly};
     use raven_inspire::params::{InspireParams, InspireVariant, ParamsLabel};
     use raven_inspire::rgsw::GadgetVector;
@@ -140,6 +158,7 @@ mod tests {
     use raven_railgun_engine::{Engine, InstanceRole, PirInstance};
     use tower::ServiceExt;
 
+    use super::{check_packing_key_shape, check_query_shape};
     use crate::config::HttpConfig;
     use crate::state::AppState;
     use crate::versioned::{read_versioned, wire_schema_for, write_versioned, write_versioned_as};
@@ -372,6 +391,66 @@ mod tests {
         drop(held);
         let honest = write_versioned(&fixture.keys).expect("upload");
         assert_eq!(post(app, "session", honest).await, StatusCode::OK);
+    }
+
+    /// The exported checks, over parameters a harness builds with no instance loaded, return
+    /// what the routes' checks return for the honest query, its upload and every forgery.
+    #[test]
+    fn the_exported_checks_agree_with_the_routes() {
+        let params = params();
+        let db = raven_railgun_testkit::toy_db(256, ENTRY_BYTES);
+        let (state, secret_key) =
+            setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("toy state");
+        let mut sampler = GaussianSampler::with_seed(params.sigma, 0x52);
+        let (_, honest) = query_seeded(
+            &state.crs,
+            0,
+            state.shard_config(),
+            &secret_key,
+            &mut sampler,
+        )
+        .expect("seeded query");
+        let keys = ClientPackingKeys::generate(
+            &secret_key,
+            &state.crs.params,
+            state.crs.inspiring_num_columns,
+            state.crs.inspiring_w_seed,
+            &mut sampler,
+        )
+        .expect("packing keys");
+        let pack = PackParams::try_new(&params, raven_inspire::num_columns(ENTRY_BYTES))
+            .expect("pack params");
+        let num_shards = state.shard_config().num_shards();
+
+        let mut queries = vec![honest.clone(), mainnet_gadget(&honest)];
+        let mut forged = honest.clone();
+        forged.shard_id = u32::try_from(num_shards).expect("u32");
+        queries.push(forged);
+        let mut forged = honest.clone();
+        forged.inspiring_packing_keys = None;
+        queries.push(forged);
+        let mut forged = honest.clone();
+        if let Some(inline) = forged.inspiring_packing_keys.as_mut() {
+            inline.num_to_pack += 1;
+        }
+        queries.push(forged);
+        for (at, query) in queries.iter().enumerate() {
+            let exported = crate::fuzzing::check_query_shape(&params, &pack, num_shards, query);
+            assert_eq!(exported, check_query_shape(&state, query), "query {at}");
+            assert_eq!(exported.is_ok(), at == 0, "query {at}: {exported:?}");
+        }
+
+        let mut short = keys.clone();
+        short.y_body.pop();
+        for (at, upload) in [&keys, &short].into_iter().enumerate() {
+            let exported = crate::fuzzing::check_packing_key_shape(&pack, upload);
+            assert_eq!(
+                exported,
+                check_packing_key_shape(&state, upload),
+                "upload {at}"
+            );
+            assert_eq!(exported.is_ok(), at == 0, "upload {at}: {exported:?}");
+        }
     }
 
     /// The approximate packing gadget seats one key row fewer; its honest query and upload are

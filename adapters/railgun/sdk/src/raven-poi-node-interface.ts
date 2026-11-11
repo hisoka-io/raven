@@ -255,6 +255,9 @@ const ENGINE_BATCH_SIZE = 20;
 const ENGINE_STATUSES: readonly string[] = ["Valid", "ShieldBlocked", "ProofSubmitted", "Missing"];
 const SESSION_QUERY_ATTEMPTS = 2;
 const UNANSWERED_PLAN_CAP = 64;
+/** How long an unanswered plan stays reusable: a caller's immediate retry resends the same rows,
+ *  and a call made after it draws its own covers, so two unrelated reads never share a cover set. */
+const PLAN_REUSE_MS = 30_000;
 const WIRE_CAPTURE_CAP = 64;
 
 type UpstreamJsonRpcMethod =
@@ -297,9 +300,9 @@ export class RavenPOINodeInterface {
   private readonly capturedRequests: CapturedWireRequest[] | undefined;
   private readonly sessionHandshakes = new Map<string, Promise<bigint>>();
   private readonly clientPirIds = new Map<string, string>();
-  // Covers and slot order of batches not yet answered, so a batch sent again asks for the same
-  // rows in the same slots.
-  private readonly unansweredPlans = new Map<string, PaddedQueryPlan>();
+  // Covers and slot order of batches not yet answered, so a batch sent again within
+  // `PLAN_REUSE_MS` asks for the same rows in the same slots.
+  private readonly unansweredPlans = new Map<string, { plan: PaddedQueryPlan; until: number }>();
   private nextUpstreamRequestId = 1;
 
   constructor(config: RavenConfig) {
@@ -1356,15 +1359,25 @@ export class RavenPOINodeInterface {
     populatedRows: number,
   ): Promise<PrivateQueryBatchResult> {
     const { entriesPerShard } = decodeShardGeometry(ctx.shardConfigBincode);
-    const planKey = `${instanceLabel}:${entriesPerShard}:${targetIndices.join(",")}`;
-    const plan =
-      this.unansweredPlans.get(planKey) ??
-      buildPaddedQueryPlan(targetIndices, entriesPerShard, populatedRows);
+    // The shard count is in the key: a plan drawn over a larger table can name shards the
+    // instance no longer serves, which admission refuses on every resend.
+    const rowBound = Math.max(populatedRows, ...targetIndices.map((target) => target + 1));
+    const shards = Math.ceil(rowBound / entriesPerShard);
+    const planKey = `${instanceLabel}:${entriesPerShard}:${shards}:${targetIndices.join(",")}`;
+    const now = Date.now();
+    let held = this.unansweredPlans.get(planKey);
+    if (held === undefined || held.until <= now) {
+      held = {
+        plan: buildPaddedQueryPlan(targetIndices, entriesPerShard, populatedRows),
+        until: now + PLAN_REUSE_MS,
+      };
+    }
+    const { plan } = held;
     this.unansweredPlans.delete(planKey);
-    this.unansweredPlans.set(planKey, plan);
-    for (const oldest of this.unansweredPlans.keys()) {
-      if (this.unansweredPlans.size <= UNANSWERED_PLAN_CAP) break;
-      this.unansweredPlans.delete(oldest);
+    this.unansweredPlans.set(planKey, held);
+    for (const [key, entry] of this.unansweredPlans) {
+      if (this.unansweredPlans.size <= UNANSWERED_PLAN_CAP && entry.until > now) continue;
+      this.unansweredPlans.delete(key);
     }
     const answered = await this.withClientPirSessionRetry(instanceLabel, ctx, async () => {
       const route = this.route();
@@ -1408,6 +1421,9 @@ export class RavenPOINodeInterface {
         ),
       );
       return { plaintexts, addenda, freshness };
+    }).catch((cause: unknown) => {
+      if (refusalOutlivesRetry(cause)) this.unansweredPlans.delete(planKey);
+      throw cause;
     });
     this.unansweredPlans.delete(planKey);
     return answered;
@@ -1730,6 +1746,19 @@ export class RavenPOINodeInterface {
 }
 
 const contextSchemas = new WeakMap<ClientPirContext, number>();
+
+/** A 4xx that a resend of the same body meets again; 408, 425 and 429 ask for a later try, and
+ *  a 409 is a session handle the retry replaces. */
+function refusalOutlivesRetry(cause: unknown): boolean {
+  if (!(cause instanceof RavenError)) return false;
+  const status = (cause.context as { status?: unknown }).status;
+  return (
+    typeof status === "number" &&
+    status >= 400 &&
+    status <= 499 &&
+    ![408, 409, 425, 429].includes(status)
+  );
+}
 
 /**
  * The schema the context's instance speaks, read off the session's own registration body: the
