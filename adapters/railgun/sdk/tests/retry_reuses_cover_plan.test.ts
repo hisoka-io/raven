@@ -1,8 +1,8 @@
 // A batch sent again for the same rows carries the same covers in the same slots, whether the
 // resend is the SDK's own retry after a refused session handle or the caller's retry right after
 // a failure. Fresh covers on each send would leave the real rows as the ones every send shares.
-// A plan lives only that long: a later call, a refusal a resend meets again, or a table with a
-// different shard count gets covers of its own.
+// A plan lives only that long: a later call, a refusal a resend meets again, or a table shrunk
+// below one of its covers gets covers of its own. A table that grows keeps the plan.
 
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -187,7 +187,19 @@ describe("a batch sent again reuses its cover plan", () => {
     expect(rig.batches[1]).not.toEqual(rig.batches[0]);
   });
 
-  it("never replays a plan against a table with a different shard count", async () => {
+  it("keeps the same covers when the table grows past a shard boundary", async () => {
+    const rig = mountRefusingRig(server, 503);
+    const shards = Math.ceil(LIST_ROWS / ENTRIES_PER_SHARD);
+    const grown = shards * ENTRIES_PER_SHARD + 1;
+    await refusedStep(rig, LIST_ROWS);
+    await refusedStep(rig, grown);
+    await refusedStep(rig, grown + 4 * ENTRIES_PER_SHARD);
+
+    expect(rig.batches).toHaveLength(3);
+    for (const batch of rig.batches) expect(batch).toEqual(rig.batches[0]);
+  });
+
+  it("never replays a plan against a table shrunk below one of its covers", async () => {
     const rig = mountRefusingRig(server, 503);
     const shrunk = 2 * ENTRIES_PER_SHARD;
     await refusedStep(rig, LIST_ROWS);

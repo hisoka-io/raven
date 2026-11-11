@@ -1359,14 +1359,19 @@ export class RavenPOINodeInterface {
     populatedRows: number,
   ): Promise<PrivateQueryBatchResult> {
     const { entriesPerShard } = decodeShardGeometry(ctx.shardConfigBincode);
-    // The shard count is in the key: a plan drawn over a larger table can name shards the
-    // instance no longer serves, which admission refuses on every resend.
     const rowBound = Math.max(populatedRows, ...targetIndices.map((target) => target + 1));
     const shards = Math.ceil(rowBound / entriesPerShard);
-    const planKey = `${instanceLabel}:${entriesPerShard}:${shards}:${targetIndices.join(",")}`;
+    const planKey = `${instanceLabel}:${entriesPerShard}:${targetIndices.join(",")}`;
     const now = Date.now();
     let held = this.unansweredPlans.get(planKey);
-    if (held === undefined || held.until <= now) {
+    // A grown table keeps the plan, since a second cover set for the same targets would meet the
+    // first only at the real shards. A shrunk one rebuilds it once a cover names a shard the
+    // instance no longer serves, which admission refuses on every resend.
+    if (
+      held === undefined ||
+      held.until <= now ||
+      held.plan.wireTargets.some((row) => Math.floor(row / entriesPerShard) >= shards)
+    ) {
       held = {
         plan: buildPaddedQueryPlan(targetIndices, entriesPerShard, populatedRows),
         until: now + PLAN_REUSE_MS,
