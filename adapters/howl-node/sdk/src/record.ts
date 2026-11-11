@@ -47,15 +47,16 @@ export interface HowlNoteRecord<F> {
 }
 
 /**
- * The record a probe returns for a tag with no match: well-formed, at the genesis position,
- * all zero, so it opens under no key.
+ * A well-formed record that is all zero past `leafIndex`, so it opens under no key: what a probe
+ * returns for a tag with no match (at the genesis position), and what a read returns for a
+ * position the client does not hold verified yet.
  */
-export function missRecord<F>(field: FieldCodec<F>): HowlNoteRecord<F> {
+export function missRecord<F>(field: FieldCodec<F>, leafIndex = 0): HowlNoteRecord<F> {
   const zero = () => field.fromBytes(new Uint8Array(32));
   return {
     layoutVersion: HOWL_NOTE_LAYOUT_VERSION,
     recordKind: RECORD_KIND_INCOMING,
-    leafIndex: 0,
+    leafIndex,
     commitmentPrefix: new Uint8Array(COMMITMENT_PREFIX_BYTES),
     ephemeralPkX: zero(),
     cekWrap: zero(),

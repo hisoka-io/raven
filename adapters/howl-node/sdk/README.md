@@ -74,7 +74,7 @@ counter reconcile) use `matches(tags)` or the `feed` view of the synced rows, an
 | `sync()` | pulls the new feed rows, the new upper nodes and the newest block, reading a short tail of the feed and the block again (96 bytes plus at most 2,394 when nothing is new); checks the root; reports `rewoundTo` after a reorganisation |
 | `matches(tags, from?)` | positions whose feed row equals a tag's low six bytes |
 | `feed` | read-only view of the synced feed rows: `length`, `bytes()`, `matches(prefixTags, from?)` |
-| `fetchNotes(positions)` | private read, one record per position in request order, batches of up to the node's ladder cap; position 0 (the genesis filler) is refused |
+| `fetchNotes(positions)` | private read, one record per position in request order, batches of up to the node's ladder cap; position 0 (the genesis filler) is refused; a position at or past `state.leafCount` takes a slot like any other and answers a record that opens to nothing (`commitmentPrefix` all zero), so sync and ask again |
 | `confirmNote(record, commitment)` | checks a recomputed commitment against the record's prefix and, when the client holds the note's block, the verified tree's leaf at its position; sends no request; `"unconfirmed"` otherwise |
 | `fetchTagPrefixes(since)` | one feed segment as served |
 | `fetchLeafBlock(b)` | the leaves of block `b`; call it at spend time, not at discovery |
@@ -97,9 +97,12 @@ raises the error. The feed, the tree and the cells already read are chain data a
 re-seed on the same chain the next sync goes on from the cursor.
 
 After a rewind, the cells already read stay when the completed sync brings back every feed row and
-tree leaf the client held. Otherwise the next private read reads all of them again, at most once
-per sync: one slot per cell, at the per-slot sizes under [Sizes on the wire](#sizes-on-the-wire),
-in batches of up to the node's ladder cap.
+tree leaf the client held. Otherwise the next private read reads all of them again: one slot per
+cell, at the per-slot sizes under [Sizes on the wire](#sizes-on-the-wire), in batches of up to the
+node's ladder cap. While the chain is shorter than the count the cells were set aside at, the next
+`fetchNotes` syncs first and reads them all once; after that, a cell held aside past the count of
+that read answers a record that opens to nothing until a sync reaches the old count. One rewind
+costs at most two full re-reads and one sync.
 
 A private read whose connection closes before any response arrives (a keep-alive socket the node
 dropped when it restarted) is sent once more over a new connection with the same bytes. A read

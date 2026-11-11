@@ -1,4 +1,4 @@
-// The sync cursor the node sees: rounded to the granule at every count, at a bounded cost to an
+// The sync cursor: rounded to the granule at every count, at a bounded cost to an
 // idle sync, with the reorganisation and lagging-node checks still in force.
 import { describe, expect, it } from "vitest";
 import { bigintField, RavenHowlSource, SYNC_CURSOR_GRANULE, type HowlTransport } from "../src/index.js";

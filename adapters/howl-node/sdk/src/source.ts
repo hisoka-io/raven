@@ -166,7 +166,10 @@ function nodeAt(list: Uint8Array, index: number): Uint8Array {
   return list.subarray(index * NODE_BYTES, (index + 1) * NODE_BYTES);
 }
 
-/** The tree and feed held when a rewind first set the cells aside, and the cells set aside. */
+/**
+ * The tree and feed held when a rewind first set the cells aside, and the cells set aside.
+ * `readTo` is the count of the one full read made since the last rewind, `null` before it.
+ */
 interface Suspect {
   readonly rows: Uint8Array;
   readonly upper: Uint8Array;
@@ -174,6 +177,7 @@ interface Suspect {
   readonly newestLeaves: Uint8Array;
   readonly leafCount: number;
   readonly cells: Map<number, Uint8Array>;
+  readTo: number | null;
 }
 
 function checkPosition(value: number, what: string): void {
@@ -208,8 +212,8 @@ export class RavenHowlSource<F> {
   // Every cell, set aside by a rewind with the tree and feed it was verified under, until a sync
   // reaches the old count and shows whether all of those rows and leaves came back unchanged.
   #suspect: Suspect | null = null;
-  // Cells the next private read covers again: a read sized by where the chain changed would
-  // show which blocks hold the wallet's cells.
+  // Cells the next private read covers again, all of them, so the read is the same wherever the
+  // chain changed.
   readonly #reread = new Set<number>();
   // Pads and slot order of reads not yet answered, so a read sent again asks for the same rows.
   readonly #plans = new Map<string, { targets: Uint32Array; slots: Uint32Array }>();
@@ -367,7 +371,9 @@ export class RavenHowlSource<F> {
       newestLeaves: held?.leaves ?? this.#tree.newestLeaves(),
       leafCount: this.#state.leafCount,
       cells: new Map(),
+      readTo: null,
     };
+    this.#suspect!.readTo = null;
     this.#feed.truncate(at);
     this.#tree.truncate(at);
     this.#state = { leafCount: at, block: this.#state.block, root: this.#tree.root(at) };
@@ -740,10 +746,17 @@ export class RavenHowlSource<F> {
 
   /**
    * Private read of the cells at `leafIndices` (1 and up; 0 is the genesis filler and is
-   * refused), one record per index in request order. Indices are padded to the node's ladder in
-   * batches of at most its cap. A cell read once is kept. After a rewind finds any feed row or
-   * tree leaf changed, or while a shorter chain holds the cells aside, the read covers every
-   * cell read before as well.
+   * refused), one record per index in request order, in batches of at most the node's ladder
+   * cap. A cell read once is kept. A source that holds no leaves yet syncs once first. A position
+   * at or past `state.leafCount` takes a slot like any other and answers a record that opens to
+   * nothing at that index (`commitmentPrefix` all zero): sync, then ask for it again.
+   *
+   * After a rewind finds any feed row or tree leaf changed, the next read covers every cell read
+   * before as well. While a shorter chain holds the cells aside, the next read syncs first and
+   * covers them all, each one past the count in a slot of its own. After that read, a cell held
+   * aside past its count answers a record that opens to nothing, as above, until a sync reaches
+   * the count the cells were set aside at. One rewind costs at most two full re-reads, and one
+   * sync before the first.
    */
   fetchNotes(leafIndices: readonly number[]): Promise<HowlNoteRecord<F>[]> {
     return this.#exclusive(() => this.#fetchNotes(leafIndices));
@@ -755,16 +768,18 @@ export class RavenHowlSource<F> {
       checkPosition(p, "leaf index");
       if (p === 0) throw new RangeError("leaf 0 is the genesis filler and holds no note");
     });
-    const highest = Math.max(...leafIndices);
-    if (highest >= this.#state.leafCount || this.#suspect !== null) await this.#sync();
-    if (highest >= this.#state.leafCount) {
-      throw new RangeError(`leaf ${highest} is past the ${this.#state.leafCount} leaves of the pool`);
-    }
+    // Whether to sync, and the slots, follow the cells held, never where the asked positions sit
+    // against the count.
+    if (this.#state.leafCount === 0 || this.#suspect?.readTo === null) await this.#sync();
     const n = this.#state.leafCount;
-    const wanted = new Set([...leafIndices].filter((p) => !this.#cells.has(p)));
-    const again = new Set([...this.#reread, ...(this.#suspect?.cells.keys() ?? [])]);
-    const reads = [...new Set([...wanted, ...[...again].filter((p) => p < n)])].sort((a, b) => a - b);
-    // A cell held aside past a shorter chain's count still takes a slot, so the read keeps its size.
+    const s = this.#suspect;
+    const covering = s !== null && s.readTo === null;
+    // A cell held aside after its full read keeps no slot, as a cell held keeps none.
+    const held = (p: number): boolean => this.#cells.has(p) || (s !== null && !covering && s.cells.has(p));
+    const wanted = new Set(leafIndices.filter((p) => !held(p)));
+    const again = new Set(s === null ? this.#reread : covering ? [...this.#reread, ...s.cells.keys()] : []);
+    const reads = [...new Set([...wanted, ...again])].filter((p) => p < n).sort((a, b) => a - b);
+    // A position past the count still takes a slot, so the read keeps its size.
     const size = new Set([...wanted, ...again]).size;
     const taken = new Set(reads);
     const fill: number[] = [];
@@ -780,8 +795,12 @@ export class RavenHowlSource<F> {
         });
       }
     }
+    if (covering) s.readTo = n;
     if (this.#suspect === null) this.#reread.clear();
-    return leafIndices.map((p) => decodeCell(this.#cells.get(p)!, p, this.#field));
+    return leafIndices.map((p) => {
+      const cell = this.#cells.get(p);
+      return cell === undefined ? missRecord(this.#field, p) : decodeCell(cell, p, this.#field);
+    });
   }
 
   /**

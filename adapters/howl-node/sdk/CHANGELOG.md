@@ -19,6 +19,10 @@ of the three is the peer.
   held: other rows there are followed by a rewind. A node behind the held count is
   `Stale` when its tree agrees with the verified one, and a rewind otherwise.
 - After a rewind, the cells read before are kept when the completed sync brings back every feed
-  row and tree leaf held unchanged. Otherwise the next private read reads all of them again, at
-  most once per sync.
+  row and tree leaf held unchanged. Otherwise the next private read reads all of them again. One
+  rewind costs at most two full re-reads and one sync, however far the chain moved.
+- `fetchNotes` sends the same requests whatever the asked positions are against the count: a
+  position at or past `state.leafCount` takes a slot and answers a record that opens to nothing
+  (`missRecord(field, leafIndex)`, `commitmentPrefix` all zero). A source with no leaves yet syncs
+  once before its first read.
 - `sideEffects: false`; the package ships its LICENSE and this changelog.

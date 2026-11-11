@@ -280,6 +280,97 @@ describe("the read after a rewind", () => {
     }
   });
 
+  it("costs at most two full re-reads and one sync, however far ahead a forged count sat", async () => {
+    const truth = new Pool(COUNT, new Map());
+    const syncs = (node: Node) => node.paths.filter((p) => p.startsWith("/howl/v1/sync")).length;
+    for (const claim of [3_200, 4_200, 9_000]) {
+      const { node, src } = rig(truth);
+      await src.sync();
+      await src.fetchNotes(OWNED);
+      node.at = new Pool(claim, new Map(), truth);
+      await src.sync();
+      node.at = truth;
+      expect((await src.sync()).rewoundTo, `claim ${claim}`).toBe(3_072);
+      let mark = node.reads.length;
+      let synced = syncs(node);
+      for (let i = 0; i < 10; i++) await src.fetchNotes([OWNED[0]!]);
+      expect(node.reads.slice(mark), `claim ${claim}, true chain`).toEqual([OWNED]);
+      expect(syncs(node) - synced, `claim ${claim}, true chain`).toBe(1);
+      // the true chain passes the forged count with other rows: one more full read, then none
+      const grown = new Pool(claim + 50, new Map(), truth);
+      node.at = grown;
+      await src.sync();
+      mark = node.reads.length;
+      synced = syncs(node);
+      for (let i = 0; i < 10; i++) {
+        const records = await src.fetchNotes(OWNED);
+        records.forEach((r, k) => expect(hex(r.commitmentPrefix)).toBe(prefixAt(grown, OWNED[k]!)));
+      }
+      expect(node.reads.slice(mark), `claim ${claim}, grown chain`).toEqual([OWNED]);
+      expect(syncs(node) - synced).toBe(0);
+    }
+  });
+
+  it("answers a cell held aside past its full read as not held until a sync reaches the old count", async () => {
+    const truth = new Pool(COUNT, new Map());
+    const { node, src } = rig(truth);
+    await src.sync();
+    await src.fetchNotes(OWNED);
+    node.at = new Pool(3_200, new Map(), truth);
+    await src.sync();
+    await src.fetchNotes([3_150]);
+    node.at = truth;
+    await src.sync();
+    let mark = node.reads.length;
+    await src.fetchNotes([OWNED[0]!]);
+    // the cell past the count takes a filler slot
+    expect(node.reads.slice(mark).map((r) => r.length)).toEqual([OWNED.length + 1]);
+    const later = new Pool(3_250, new Map(), truth);
+    node.at = prefixOf(later, 3_160);
+    await src.sync();
+    mark = node.reads.length;
+    const [held] = await src.fetchNotes([3_150]);
+    expect(node.reads.slice(mark)).toEqual([]);
+    expect([held!.leafIndex, hex(held!.commitmentPrefix)]).toEqual([3_150, "00".repeat(16)]);
+    node.at = later;
+    await src.sync();
+    mark = node.reads.length;
+    const [read] = await src.fetchNotes([3_150]);
+    expect(node.reads.slice(mark)).toEqual([[...OWNED, 3_150]]);
+    expect(hex(read!.commitmentPrefix)).toBe(prefixAt(later, 3_150));
+  });
+
+  it("sends the same requests whether or not the asked positions sit past the count", async () => {
+    const truth = new Pool(COUNT, new Map());
+    const syncs = (node: Node) => node.paths.filter((p) => p.startsWith("/howl/v1/sync")).length;
+    const seen: string[] = [];
+    for (const c of [3_000, 3_080, 3_095, COUNT]) {
+      const { node, src } = rig(truth);
+      await src.sync();
+      await src.fetchNotes(OWNED);
+      node.at = prefixOf(truth, c);
+      await src.sync();
+      const pattern: unknown[] = [];
+      for (const asked of [OWNED, [OWNED[0]!, 3_200], [OWNED[0]!, 6]]) {
+        const mark = node.reads.length;
+        const synced = syncs(node);
+        const records = await src.fetchNotes(asked);
+        pattern.push(syncs(node) - synced, node.reads.slice(mark).map((r) => r.length));
+        records.forEach((r, i) => {
+          const p = asked[i]!;
+          expect(r.leafIndex).toBe(p);
+          expect(hex(r.commitmentPrefix), `count ${c}, leaf ${p}`).toBe(p < c ? prefixAt(truth, p) : "00".repeat(16));
+        });
+      }
+      // a shorter chain's first read syncs first and covers every cell, whatever was asked
+      if (c < COUNT) expect(pattern.slice(0, 2), `count ${c}`).toEqual([1, [OWNED.length]]);
+      seen.push(JSON.stringify(pattern.slice(2)));
+    }
+    // past the full read, a held cell and a new position cost the same whatever the count
+    expect(new Set(seen).size, seen.join("\n")).toBe(1);
+    expect(JSON.parse(seen[0]!)).toEqual([0, [1], 0, [1]]);
+  });
+
   it("keeps the cells of the old newest block once it has filled, at every boundary", async () => {
     const truth = new Pool(COUNT, new Map());
     const grown = new Pool(4_200, new Map(), truth);

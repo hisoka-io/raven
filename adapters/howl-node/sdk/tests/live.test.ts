@@ -184,7 +184,9 @@ describe.skipIf(!live)("against a running node", () => {
     // more than the ladder cap is split over batches
     const many = Array.from({ length: 40 }, (_, i) => i + 1);
     expect((await src.fetchNotes(many)).map((r) => r.leafIndex)).toEqual(many);
-    await expect(src.fetchNotes([160])).rejects.toThrow(/past the 160 leaves/);
+    // a position past the count is read like any other and answers a record that opens to nothing
+    const [past] = await src.fetchNotes([160]);
+    expect([past!.leafIndex, hex(past!.commitmentPrefix)]).toEqual([160, "00".repeat(16)]);
 
     const block = await src.fetchLeafBlock(0);
     expect(block.map((l) => l)).toEqual(fixture.leaves.map((l) => BigInt(l.commitment)));

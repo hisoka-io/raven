@@ -1,6 +1,6 @@
 // A batch sent again for the same rows carries the same covers in the same slots, whether the
 // resend is the SDK's own retry after a refused session handle or the caller's retry right after
-// a failure. Fresh covers on each send would leave the real rows as the ones every send shares.
+// a failure, so every send of one batch is the same request.
 // A plan lives only that long: a later call, a refusal a resend meets again, or a table shrunk
 // below one of its covers gets covers of its own. A table that grows keeps the plan.
 

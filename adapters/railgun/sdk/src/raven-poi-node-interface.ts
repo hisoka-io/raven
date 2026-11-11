@@ -1364,9 +1364,9 @@ export class RavenPOINodeInterface {
     const planKey = `${instanceLabel}:${entriesPerShard}:${targetIndices.join(",")}`;
     const now = Date.now();
     let held = this.unansweredPlans.get(planKey);
-    // A grown table keeps the plan, since a second cover set for the same targets would meet the
-    // first only at the real shards. A shrunk one rebuilds it once a cover names a shard the
-    // instance no longer serves, which admission refuses on every resend.
+    // A grown table keeps the plan, so every send of these targets carries the same covers. A
+    // shrunk one rebuilds it once a cover names a shard the instance no longer serves, which
+    // admission refuses on every resend.
     if (
       held === undefined ||
       held.until <= now ||
