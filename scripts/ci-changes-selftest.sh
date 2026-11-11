@@ -45,6 +45,8 @@ RAILGUN_SET=docs,railgun,msrv_1_89,msrv_1_91,sdk,railgun_image
 # an adapter crate the fuzz targets link: the HTTP decoders and what they call
 RAILGUN_CRATE_SET=$RAILGUN_SET,fuzz
 expect "docs only" NONE README.md SECURITY.md adapters/railgun/client-wasm/README.md
+# both SDK pack gates compare their package's LICENSE with the root one
+expect "the root LICENSE" howl,sdk LICENSE
 expect "the SDK only" sdk adapters/railgun/sdk/src/client-pir.ts adapters/railgun/sdk/package.json
 expect "the SDK README ships in the package" sdk adapters/railgun/sdk/README.md
 expect "an SDK gate script" sdk adapters/railgun/scripts/check-sdk-pack.sh

@@ -283,6 +283,8 @@ jobs:
             cargo deny --manifest-path "$manifest" --all-features check -c deny.toml
             echo "::endgroup::"
           done
+          # the fuzz harness ships nothing, so its lockfile is held to the advisories alone
+          cargo deny --manifest-path fuzz/Cargo.toml --all-features check advisories -c deny.toml
 
   secret-scan:
     name: secret scan (gitleaks)
@@ -1121,6 +1123,10 @@ jobs:
       - name: pnpm typecheck
         run: pnpm typecheck
         working-directory: adapters/howl-node/sdk
+      # the tarball npm would publish: dist as built, the README, the root LICENSE byte for byte
+      - name: pnpm build + pack gate
+        run: pnpm build && pnpm check-pack
+        working-directory: adapters/howl-node/sdk
       # The suite with the node binary, held to tests/EXPECTED_COUNTS.json: a live suite that
       # skips fails here. The cross-check against Howl's own wallet code needs a Howl checkout
       # and runs locally; its output is pinned in tests/fixtures/howl-vectors.json, checked here.
@@ -1130,14 +1136,12 @@ jobs:
         run: node scripts/check-test-count.mjs
         working-directory: adapters/howl-node/sdk
 
-  # The node images, built from their Dockerfiles and run once with no network by
-  # scripts/image-smoke.sh: the liveness route answers, the node runs as its own user, and a stop
-  # exits clean. Nothing is pushed; the jobs hold no registry credential.
+  # The decoders a hostile body reaches first, through each crate's public decode functions:
+  # Railgun's session, query and batch bodies with their admission checks and its params blob,
+  # Howl's session and notes bodies, and the answers a wallet reads. A change to those crates
+  # builds every target; the nightly also runs each for FUZZ_SECONDS from honest seeds and keeps
+  # a crash's input.
   fuzz:
-    # The decoders a hostile body reaches first, through each crate's public decode functions:
-    # Railgun's session, query and batch bodies and its params blob, Howl's session and notes
-    # bodies, and the answers a wallet reads. A change to those crates builds every target; the
-    # nightly also runs each for FUZZ_SECONDS from honest seeds and keeps a crash's input.
     name: decoder fuzzing (cargo-fuzz)
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.fuzz != 'false' }}
@@ -1167,6 +1171,9 @@ jobs:
       - name: install cargo-fuzz
         timeout-minutes: 15
         run: cargo install cargo-fuzz --version 0.13.2 --locked
+      # cargo-fuzz takes no --locked; this refuses a fuzz/Cargo.lock that no longer resolves as is
+      - name: fuzz/Cargo.lock is current
+        run: cargo "+$FUZZ_TOOLCHAIN" metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml >/dev/null
       - name: build every target
         run: cargo "+$FUZZ_TOOLCHAIN" fuzz build --fuzz-dir fuzz
       - name: fuzz each target
@@ -1181,6 +1188,9 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+  # The node images, built from their Dockerfiles and run once with no network by
+  # scripts/image-smoke.sh: the liveness route answers, the node runs as its own user, and a stop
+  # exits clean. Nothing is pushed; the jobs hold no registry credential.
   howl-image:
     name: Howl node image (build + smoke run)
     needs: changes

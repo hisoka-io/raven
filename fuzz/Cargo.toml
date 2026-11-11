@@ -19,7 +19,7 @@ howl-node = { path = "../adapters/howl-node/node" }
 howl-wire = { path = "../adapters/howl-node/wire" }
 raven-inspire = { path = "../crates/inspire" }
 raven-inspire-session = { path = "../crates/inspire-session" }
-raven-railgun-http = { path = "../adapters/railgun/http" }
+raven-railgun-http = { path = "../adapters/railgun/http", features = ["fuzzing"] }
 
 [profile.release]
 debug = 1

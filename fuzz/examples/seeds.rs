@@ -42,8 +42,8 @@ fn put(corpus: &Path, target: &str, name: &str, bytes: &[u8]) -> Fallible<()> {
 
 fn railgun(corpus: &Path, params: InspireParams, tag: &str) -> Fallible<()> {
     let schema = wire_schema_for(&params);
-    // two rows' worth of cells: enough for a CRS and a shard, nothing is answered
-    let database = vec![0u8; params.ring_dim * RAILGUN_ENTRY_BYTES];
+    // the table the fuzz shapes take their shard count from; nothing is answered
+    let database = vec![0u8; raven_fuzz::railgun_table_bytes(&params)];
     let mut sampler = GaussianSampler::from_os_entropy(params.sigma)?;
     let (crs, encoded, _) = setup(&params, &database, RAILGUN_ENTRY_BYTES, &mut sampler)?;
     // the CRS as GET .../params serves it: no Galois keys, no server-side packing state

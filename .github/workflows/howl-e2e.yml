@@ -173,13 +173,16 @@ jobs:
         env:
           HOWL_NODE_BIN: ${{ github.workspace }}/adapters/howl-node/target/release/howl-node
         run: |
+          set -euo pipefail
           mkdir -p smoke-out
           adapters/howl-node/sdk/scripts/browser-smoke.sh 2>&1 | tee smoke-out/smoke.log
       # each planted fault (CSP, CORS strip, the Node wasm in a page) must fail it for its own reason
       - name: browser smoke red-proof
         env:
           HOWL_NODE_BIN: ${{ github.workspace }}/adapters/howl-node/target/release/howl-node
-        run: adapters/howl-node/sdk/scripts/browser-smoke.sh --red-proof 2>&1 | tee smoke-out/red-proof.log
+        run: |
+          set -euo pipefail
+          adapters/howl-node/sdk/scripts/browser-smoke.sh --red-proof 2>&1 | tee smoke-out/red-proof.log
       - name: keep the smoke logs
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
