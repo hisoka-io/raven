@@ -1,5 +1,5 @@
-// After a rewind the next private read covers only the cells whose feed row or leaf changed, so a
-// node that fakes a divergence at any block boundary gets the same read back.
+// After a rewind the next private read is the same whatever block, leaf or row the node changed
+// or claimed to change: nothing when the tree and feed came back unchanged, every cell otherwise.
 import { describe, expect, it } from "vitest";
 import {
   bigintField,
@@ -206,15 +206,12 @@ describe("the read after a rewind", () => {
     for (const s of seen) expect(s.reread, s.why).toEqual([]);
   });
 
-  it("covers only the cells whose feed row or block really changed", async () => {
+  it("covers every cell read before when any feed row or leaf changed", async () => {
     const truth = new Pool(COUNT, new Map());
-    const cases: { at: Pool; rewoundTo: number; reread: number[] }[] = [
-      // a feed row of the newest block, the leaves kept
-      { at: new Pool(COUNT, new Map([[3_090, new Uint8Array(6).fill(9)]]), truth), rewoundTo: 3_072, reread: [3_090] },
-      // a leaf of full block 1: a full block's leaves are compared by its upper node
-      { at: withLeaf(truth, 2_000), rewoundTo: 1_024, reread: [1_030, 2_000] },
-      // a leaf of the newest block
-      { at: withLeaf(truth, 3_075), rewoundTo: 3_072, reread: [3_075] },
+    const cases: { at: Pool; rewoundTo: number }[] = [
+      { at: new Pool(COUNT, new Map([[3_090, new Uint8Array(6).fill(9)]]), truth), rewoundTo: 3_072 },
+      { at: withLeaf(truth, 2_000), rewoundTo: 1_024 },
+      { at: withLeaf(truth, 3_075), rewoundTo: 3_072 },
     ];
     for (const c of cases) {
       const { node, src } = rig(truth);
@@ -223,9 +220,63 @@ describe("the read after a rewind", () => {
       node.at = c.at;
       expect((await src.sync()).rewoundTo).toBe(c.rewoundTo);
       const mark = node.reads.length;
+      // a read of one cell covers them all, once
+      await src.fetchNotes([OWNED[0]!]);
+      expect(node.reads.slice(mark)).toEqual([OWNED]);
       const records = await src.fetchNotes(OWNED);
-      expect(node.reads.slice(mark)).toEqual([c.reread]);
+      expect(node.reads.length).toBe(mark + 1);
       records.forEach((r, i) => expect(hex(r.commitmentPrefix)).toBe(prefixAt(c.at, OWNED[i]!)));
+    }
+  });
+
+  it("is the same whichever block holds the leaf or row a node changes, on the forged chain and after the true one", async () => {
+    const truth = new Pool(COUNT, new Map());
+    const changes: { why: string; at: Pool }[] = [];
+    // a leaf that is not the wallet's in each block, and a row of the tail a sync reads again
+    for (const p of [100, 1_500, 2_100, 3_080]) changes.push({ why: `leaf ${p}`, at: withLeaf(truth, p) });
+    for (const p of [3_073, 3_099]) {
+      changes.push({ why: `row ${p}`, at: new Pool(COUNT, new Map([[p, new Uint8Array(6).fill(9)]]), truth) });
+    }
+    for (const c of changes) {
+      const { node, src } = rig(truth);
+      await src.sync();
+      await src.fetchNotes(OWNED);
+      node.at = c.at;
+      await src.sync();
+      let mark = node.reads.length;
+      const forged = await src.fetchNotes(OWNED);
+      expect(node.reads.slice(mark), `${c.why}, forged`).toEqual([OWNED]);
+      forged.forEach((r, i) => expect(hex(r.commitmentPrefix)).toBe(prefixAt(c.at, OWNED[i]!)));
+      node.at = truth;
+      await src.sync();
+      mark = node.reads.length;
+      const back = await src.fetchNotes(OWNED);
+      expect(node.reads.slice(mark), `${c.why}, true chain`).toEqual([OWNED]);
+      back.forEach((r, i) => expect(hex(r.commitmentPrefix)).toBe(prefixAt(truth, OWNED[i]!)));
+    }
+  });
+
+  it("keeps its size while a shorter chain holds cells aside, whatever count the node claims", async () => {
+    const truth = new Pool(COUNT, new Map());
+    for (const c of [600, 1_500, 2_100, 3_080]) {
+      const { node, src } = rig(truth);
+      await src.sync();
+      await src.fetchNotes(OWNED);
+      // a chain of c leaves that agrees with the verified one up to there
+      node.at = prefixOf(truth, c);
+      await src.sync();
+      const below = OWNED.filter((p) => p < c);
+      let mark = node.reads.length;
+      const short = await src.fetchNotes(below);
+      expect(node.reads.slice(mark).map((r) => r.length), `count ${c}`).toEqual([OWNED.length]);
+      expect(node.reads[mark]!.slice(0, below.length)).toEqual(below);
+      short.forEach((r, i) => expect(hex(r.commitmentPrefix)).toBe(prefixAt(truth, below[i]!)));
+      node.at = truth;
+      await src.sync();
+      mark = node.reads.length;
+      const back = await src.fetchNotes(OWNED);
+      expect(node.reads.slice(mark), `count ${c}, true chain`).toEqual([]);
+      back.forEach((r, i) => expect(hex(r.commitmentPrefix)).toBe(prefixAt(truth, OWNED[i]!)));
     }
   });
 

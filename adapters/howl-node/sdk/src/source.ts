@@ -14,9 +14,8 @@ const MAX_REWINDS_PER_SYNC = 8;
 // for again, so a key is not uploaded twice per read while the seats stay full.
 const SEAT_RETRY_MS = MAX_RETRY_AFTER_SECONDS * 1000;
 /**
- * A sync names its feed cursor and held leaf count rounded down to this many leaves. The rows and
- * leaves past the rounded count come again, so an idle sync costs at most 63 x (6 + 32) = 2,394
- * bytes more. It divides the block and the feed segment.
+ * The step a sync resumes the feed and the newest block at. A sync reads a short tail of both
+ * again, at most 2,394 bytes more when nothing is new. It divides the block and the feed segment.
  */
 export const SYNC_CURSOR_GRANULE = 64;
 const granular = (n: number): number => n - (n % SYNC_CURSOR_GRANULE);
@@ -78,8 +77,9 @@ export interface SyncResult extends AnswerState {
   readonly rowsAdded: number;
   /**
    * Set when the chain was reorganised below the client's old cursor: every row from this
-   * position on was dropped and read again, so notes found there must be found again. A cell
-   * read before is kept when its feed row and tree leaf came back unchanged.
+   * position on was dropped and read again, so notes found there must be found again. The cells
+   * read before are kept when every feed row and tree leaf held came back unchanged; otherwise
+   * the next private read reads all of them again.
    */
   readonly rewoundTo?: number;
 }
@@ -166,7 +166,7 @@ function nodeAt(list: Uint8Array, index: number): Uint8Array {
   return list.subarray(index * NODE_BYTES, (index + 1) * NODE_BYTES);
 }
 
-/** The tree and feed held when a rewind first set cells aside, and the cells set aside. */
+/** The tree and feed held when a rewind first set the cells aside, and the cells set aside. */
 interface Suspect {
   readonly rows: Uint8Array;
   readonly upper: Uint8Array;
@@ -205,9 +205,12 @@ export class RavenHowlSource<F> {
   readonly #occurrences = new Map<string, number[]>();
   // Cells already opened, by position: a cell never changes unless its feed row or leaf does.
   readonly #cells = new Map<number, Uint8Array>();
-  // Cells set aside by a rewind, with the tree and feed they were verified under, until a sync
-  // completes and shows which of their rows and leaves came back unchanged.
+  // Every cell, set aside by a rewind with the tree and feed it was verified under, until a sync
+  // reaches the old count and shows whether all of those rows and leaves came back unchanged.
   #suspect: Suspect | null = null;
+  // Cells the next private read covers again: a read sized by where the chain changed would
+  // show which blocks hold the wallet's cells.
+  readonly #reread = new Set<number>();
   // Pads and slot order of reads not yet answered, so a read sent again asks for the same rows.
   readonly #plans = new Map<string, { targets: Uint32Array; slots: Uint32Array }>();
   #lastRead: AnswerState | null = null;
@@ -369,52 +372,54 @@ export class RavenHowlSource<F> {
     this.#tree.truncate(at);
     this.#state = { leafCount: at, block: this.#state.block, root: this.#tree.root(at) };
     this.#occurrences.clear();
-    for (const [p, cell] of this.#cells) {
-      if (p < at) continue;
-      this.#suspect!.cells.set(p, cell);
-      this.#cells.delete(p);
-    }
+    for (const [p, cell] of this.#cells) if (!this.#suspect!.cells.has(p)) this.#suspect!.cells.set(p, cell);
+    this.#cells.clear();
     this.#plans.clear();
     return at;
   }
 
   /**
-   * Restore each set-aside cell whose feed row and leaf the completed sync reproduced; the rest
-   * are read again. A leaf of a block full on both sides is compared by its block's upper node.
-   * The old newest block, when it has filled since, is read whether or not a cell lies in it, as
-   * a sync without a rewind reads it.
+   * Once a sync reaches the count the cells were set aside at, restore them all when every row
+   * and leaf held then came back unchanged, or mark them all to be read again. The old newest
+   * block, when it has filled since, is read as a sync without a rewind reads it.
    */
   async #settle(): Promise<void> {
     const s = this.#suspect;
-    if (s === null) return;
-    const n = this.#state.leafCount;
-    const oldFull = s.upper.length / NODE_BYTES;
+    if (s === null || this.#state.leafCount < s.leafCount) return;
     const filled = s.leafCount % LEAF_BLOCK_SIZE !== 0 && s.newestIndex < this.#tree.fullBlocks;
     if (filled && !this.#tree.holdsBlock(s.newestIndex)) await this.#fullBlock(s.newestIndex);
-    const upper = this.#tree.upperNodes();
-    const leafOf = (p: number): Uint8Array | null => {
-      try {
-        return this.#tree.leaf(p);
-      } catch {
-        return null;
-      }
-    };
-    for (const [p, cell] of s.cells) {
-      if (p >= n || p >= this.#feed.length || this.#cells.has(p)) continue;
-      const row = s.rows.subarray(p * TAG_PREFIX_BYTES, (p + 1) * TAG_PREFIX_BYTES);
-      if (row.length !== TAG_PREFIX_BYTES || this.#feed.firstDifference(p, row) !== null) continue;
-      const b = Math.floor(p / LEAF_BLOCK_SIZE);
-      let same: boolean;
-      if (b < oldFull) {
-        same = b < this.#tree.fullBlocks && equal(nodeAt(upper, b), nodeAt(s.upper, b));
-      } else {
-        const now = leafOf(p);
-        const was = nodeAt(s.newestLeaves, p - b * LEAF_BLOCK_SIZE);
-        same = b === s.newestIndex && now !== null && was.length === NODE_BYTES && equal(now, was);
-      }
-      if (same) this.#cells.set(p, cell);
+    if (this.#unchanged(s)) {
+      for (const [p, cell] of s.cells) if (!this.#cells.has(p)) this.#cells.set(p, cell);
+    } else {
+      for (const p of s.cells.keys()) this.#reread.add(p);
+      for (const p of this.#cells.keys()) this.#reread.add(p);
+      this.#cells.clear();
     }
     this.#suspect = null;
+  }
+
+  /** Whether the tree and feed now hold every row and leaf `s` held. */
+  #unchanged(s: Suspect): boolean {
+    if (this.#feed.length * TAG_PREFIX_BYTES < s.rows.length || this.#feed.firstDifference(0, s.rows) !== null) {
+      return false;
+    }
+    const oldFull = s.upper.length / NODE_BYTES;
+    if (oldFull > this.#tree.fullBlocks) return false;
+    const upper = this.#tree.upperNodes();
+    for (let b = 0; b < oldFull; b++) if (!equal(nodeAt(upper, b), nodeAt(s.upper, b))) return false;
+    const start = s.newestIndex * LEAF_BLOCK_SIZE;
+    if (s.leafCount <= start || s.leafCount % LEAF_BLOCK_SIZE === 0) return true;
+    for (let p = start; p < s.leafCount; p++) {
+      const was = nodeAt(s.newestLeaves, p - start);
+      let now: Uint8Array;
+      try {
+        now = this.#tree.leaf(p);
+      } catch {
+        return false;
+      }
+      if (was.length !== NODE_BYTES || !equal(now, was)) return false;
+    }
+    return true;
   }
 
   /** The leaf count up to which the held newest block runs: its leaves need not be sent again. */
@@ -513,7 +518,7 @@ export class RavenHowlSource<F> {
       const n = a.leafCount;
       const v = this.#state.leafCount;
       if (n < v) {
-        // The rounded cursor lets a node behind the held count answer instead of refusing.
+        // A node behind the held count may answer from the resume point instead of refusing.
         await behindCursor(a);
         continue;
       }
@@ -736,8 +741,9 @@ export class RavenHowlSource<F> {
   /**
    * Private read of the cells at `leafIndices` (1 and up; 0 is the genesis filler and is
    * refused), one record per index in request order. Indices are padded to the node's ladder in
-   * batches of at most its cap. A cell read once is kept, and read again only after a rewind
-   * finds its feed row or tree leaf changed.
+   * batches of at most its cap. A cell read once is kept. After a rewind finds any feed row or
+   * tree leaf changed, or while a shorter chain holds the cells aside, the read covers every
+   * cell read before as well.
    */
   fetchNotes(leafIndices: readonly number[]): Promise<HowlNoteRecord<F>[]> {
     return this.#exclusive(() => this.#fetchNotes(leafIndices));
@@ -754,15 +760,27 @@ export class RavenHowlSource<F> {
     if (highest >= this.#state.leafCount) {
       throw new RangeError(`leaf ${highest} is past the ${this.#state.leafCount} leaves of the pool`);
     }
-    const wanted = [...new Set(leafIndices)].filter((p) => !this.#cells.has(p)).sort((a, b) => a - b);
-    if (wanted.length > 0) {
+    const n = this.#state.leafCount;
+    const wanted = new Set([...leafIndices].filter((p) => !this.#cells.has(p)));
+    const again = new Set([...this.#reread, ...(this.#suspect?.cells.keys() ?? [])]);
+    const reads = [...new Set([...wanted, ...[...again].filter((p) => p < n)])].sort((a, b) => a - b);
+    // A cell held aside past a shorter chain's count still takes a slot, so the read keeps its size.
+    const size = new Set([...wanted, ...again]).size;
+    const taken = new Set(reads);
+    const fill: number[] = [];
+    for (let p = 1; reads.length + fill.length < size && p < n; p++) if (!taken.has(p)) fill.push(p);
+    const all = [...reads, ...fill];
+    if (all.length > 0) {
       const cap = decode(this.#wasm, await this.#paramsAnswer()).ladderCap;
-      for (let i = 0; i < wanted.length; i += cap) {
-        const chunk = wanted.slice(i, i + cap);
+      for (let i = 0; i < all.length; i += cap) {
+        const chunk = all.slice(i, i + cap);
         const cells = await this.#readBatch(chunk);
-        chunk.forEach((p, k) => this.#cells.set(p, cells.slice(k * 256, (k + 1) * 256)));
+        chunk.forEach((p, k) => {
+          if (taken.has(p)) this.#cells.set(p, cells.slice(k * 256, (k + 1) * 256));
+        });
       }
     }
+    if (this.#suspect === null) this.#reread.clear();
     return leafIndices.map((p) => decodeCell(this.#cells.get(p)!, p, this.#field));
   }
 

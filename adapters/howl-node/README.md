@@ -62,8 +62,8 @@ block further. A newest block the endpoint does not know is waited for a few pol
 endpoint's head block is one the node read; a head block the node did not read is a shorter chain,
 followed at once.
 
-A wallet that holds the newest block up to its leaf count sends that count as `held`, so a sync with
-nothing new carries the header and three empty runs: 96 bytes.
+The newest block's leaves start at `held`, so a sync with nothing new past `since` and `held` carries
+the header and three empty runs: 96 bytes.
 
 ## Parameter sets
 

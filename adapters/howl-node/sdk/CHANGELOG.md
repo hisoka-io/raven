@@ -14,10 +14,11 @@ of the three is the peer.
 - `discoverySource(source)` answers Howl's `DiscoverySource`, and `witnessSource(options)` its
   `MerkleWitnessSource`, keyed by the note's commitment. A witness is refused for a commitment the
   wallet did not find, a tree leaf that is not that commitment, and a root the pool does not know.
-- A sync names its feed cursor and held leaf count rounded down to `SYNC_CURSOR_GRANULE` (64)
-  leaves, which costs an idle sync at most 2,394 bytes more. The rows and leaves sent again must
-  match the ones held: other rows there are followed by a rewind. A node behind the held count is
+- A sync reads a short tail of the feed and the newest block again (`SYNC_CURSOR_GRANULE`), at
+  most 2,394 bytes more when nothing is new. The rows and leaves read again must match the ones
+  held: other rows there are followed by a rewind. A node behind the held count is
   `Stale` when its tree agrees with the verified one, and a rewind otherwise.
-- After a rewind, a cell read before is kept when the completed sync brings back its feed row and
-  its tree leaf unchanged (a full block's leaves by its upper node), and read again otherwise.
+- After a rewind, the cells read before are kept when the completed sync brings back every feed
+  row and tree leaf held unchanged. Otherwise the next private read reads all of them again, at
+  most once per sync.
 - `sideEffects: false`; the package ships its LICENSE and this changelog.

@@ -18,6 +18,7 @@ const NEVER: u64 = u64::MAX;
 pub struct Freshness {
     origin: Instant,
     head: AtomicU64,
+    highest: AtomicU64,
     grown_ms: AtomicU64,
     current_ms: AtomicU64,
     good_ms: AtomicU64,
@@ -29,7 +30,7 @@ pub struct Freshness {
 pub struct Reading {
     /// The newest head a step read.
     pub head: Option<u64>,
-    /// Since the head a step read last grew.
+    /// Since a step last read a head above every head read before.
     pub head_age: Option<Duration>,
     /// Since a step last ended with the table at the head.
     pub current_age: Option<Duration>,
@@ -54,6 +55,7 @@ impl Default for Freshness {
         Self {
             origin: Instant::now(),
             head: AtomicU64::new(NEVER),
+            highest: AtomicU64::new(0),
             grown_ms: AtomicU64::new(NEVER),
             current_ms: AtomicU64::new(NEVER),
             good_ms: AtomicU64::new(NEVER),
@@ -71,8 +73,11 @@ impl Freshness {
     pub fn stepped(&self, at: Instant, head: Option<u64>, at_head: bool) {
         let ms = self.millis(at);
         if let Some(head) = head {
-            let before = self.head.swap(head, Ordering::Relaxed);
-            if before == NEVER || head > before {
+            self.head.store(head, Ordering::Relaxed);
+            // Against the highest head, not the last: replicas frozen at 100 and 101 behind one
+            // endpoint never grow.
+            let highest = self.highest.fetch_max(head, Ordering::Relaxed);
+            if head > highest || self.grown_ms.load(Ordering::Relaxed) == NEVER {
                 self.grown_ms.store(ms, Ordering::Relaxed);
             }
         }
@@ -157,5 +162,27 @@ mod tests {
         assert!(fresh.read(now).ready(bound, Some(stall)));
         fresh.stepped(now + stall, Some(99), true);
         assert!(!fresh.read(now + stall + ms(1)).ready(bound, Some(stall)));
+    }
+
+    #[test]
+    fn heads_that_alternate_below_the_highest_do_not_grow() {
+        let fresh = Freshness::default();
+        let start = Instant::now();
+        let bound = Duration::from_secs(10);
+        let stall = Duration::from_secs(60);
+        // two frozen replicas behind one endpoint
+        for s in 0..=70 {
+            let head = if s % 2 == 0 { 100 } else { 101 };
+            fresh.stepped(start + Duration::from_secs(s), Some(head), true);
+        }
+        let now = start + Duration::from_secs(70);
+        assert_eq!(fresh.read(now).head, Some(100));
+        assert_eq!(fresh.read(now).head_age, Some(Duration::from_secs(69)));
+        assert!(
+            !fresh.read(now).ready(bound, Some(stall)),
+            "alternating heads"
+        );
+        fresh.stepped(now, Some(102), true);
+        assert!(fresh.read(now).ready(bound, Some(stall)));
     }
 }
