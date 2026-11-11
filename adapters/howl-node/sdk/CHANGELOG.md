@@ -25,4 +25,7 @@ of the three is the peer.
   position at or past `state.leafCount` takes a slot and answers a record that opens to nothing
   (`missRecord(field, leafIndex)`, `commitmentPrefix` all zero). A source with no leaves yet syncs
   once before its first read.
+- `confirmNote` sends no request: a record whose block the client does not hold, or whose
+  position is at or past `state.leafCount`, answers `"unconfirmed"` until a later sync or the
+  spend-time witness.
 - `sideEffects: false`; the package ships its LICENSE and this changelog.

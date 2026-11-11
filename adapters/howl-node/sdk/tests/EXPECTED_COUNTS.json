@@ -1,7 +1,7 @@
 {
   "_comment": "Held exactly by scripts/check-test-count.mjs, for a run with HOWL_NODE_BIN set and HOWL_REPO unset (CI). The three skipped files are tests/howl.test.ts and tests/howl-multisig.test.ts, which need a Howl checkout, and tests/bench.test.ts, which runs only with HOWL_BENCH=1. Any other skip is a regression.",
   "testFiles": 14,
-  "passed": 90,
+  "passed": 91,
   "skipped": 10,
   "skippedFiles": 3
 }

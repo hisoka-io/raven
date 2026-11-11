@@ -371,6 +371,33 @@ describe("the read after a rewind", () => {
     expect(JSON.parse(seen[0]!)).toEqual([0, [1], 0, [1]]);
   });
 
+  it("confirms a note with no request wherever it sits against a count the node claims", async () => {
+    const truth = new Pool(COUNT, new Map());
+    for (const c of [2_100, 3_000, 3_080, 3_095]) {
+      for (const p of OWNED) {
+        const { node, src } = rig(truth);
+        await src.sync();
+        const record = (await src.fetchNotes(OWNED))[OWNED.indexOf(p)]!;
+        const commitment = bigintField.fromBytes(truth.leaves.slice(p * 32, p * 32 + 32));
+        node.at = prefixOf(truth, c);
+        await src.sync();
+        await src.fetchNotes([OWNED[0]!]);
+        const mark = node.paths.length;
+        const check = await src.confirmNote(record, commitment);
+        expect(node.paths.slice(mark), `count ${c}, leaf ${p}`).toEqual([]);
+        if (p >= c) expect(check, `count ${c}, leaf ${p}`).toBe("unconfirmed");
+        if (c !== 3_080 || p !== 3_090) continue;
+        // once the true chain is verified the same record confirms
+        node.at = truth;
+        await src.sync();
+        expect(await src.confirmNote(record, commitment)).toBe("confirmed");
+        await src.merkleWitness(700);
+        const low = (await src.fetchNotes([700]))[0]!;
+        expect(await src.confirmNote(low, bigintField.fromBytes(truth.leaves.slice(700 * 32, 701 * 32)))).toBe("confirmed");
+      }
+    }
+  });
+
   it("keeps the cells of the old newest block once it has filled, at every boundary", async () => {
     const truth = new Pool(COUNT, new Map());
     const grown = new Pool(4_200, new Map(), truth);

@@ -121,7 +121,8 @@ export interface FirstOccurrence<F> {
 
 /**
  * What `confirmNote` could check without a request: `"confirmed"` when the note is the verified
- * tree's leaf, `"unconfirmed"` when the client does not hold that leaf's block yet.
+ * tree's leaf, `"unconfirmed"` when the client does not hold that leaf's block yet or the leaf is
+ * at or past the verified count.
  */
 export type NoteCheck = "confirmed" | "unconfirmed";
 
@@ -810,9 +811,10 @@ export class RavenHowlSource<F> {
    * leaf is refused with a `Protocol` error, so it is never spent or counted.
    *
    * It sends no request: it reads only the blocks the client already holds. When the client
-   * does not hold the note's block it answers
-   * `"unconfirmed"`, and the check falls to spend time: the `leaf` of `merkleWitness`, which
-   * reads the block anyway, must equal `commitment` (or call this again after the witness).
+   * does not hold the note's block, or `record.leafIndex` is at or past `state.leafCount`, it
+   * answers `"unconfirmed"`, and the check falls to a later sync or to spend time: the `leaf` of
+   * `merkleWitness`, which reads the block anyway, must equal `commitment` (or call this again
+   * after the witness).
    */
   confirmNote(record: HowlNoteRecord<F>, commitment: F): Promise<NoteCheck> {
     return this.#exclusive(() => this.#confirmNote(record, commitment));
@@ -826,11 +828,10 @@ export class RavenHowlSource<F> {
     if (!equal(record.commitmentPrefix, c.subarray(0, COMMITMENT_PREFIX_BYTES))) {
       throw new HowlError("Protocol", `leaf ${p}: the commitment does not start with the record's prefix`);
     }
-    if (p >= this.#state.leafCount) await this.#sync();
-    if (p >= this.#state.leafCount) {
-      throw new RangeError(`leaf ${p} is past the ${this.#state.leafCount} leaves of the pool`);
+    // no sync here: a request would then depend on where p sits against the count
+    if (p >= this.#state.leafCount || !this.#tree.holdsBlock(Math.floor(p / LEAF_BLOCK_SIZE))) {
+      return "unconfirmed";
     }
-    if (!this.#tree.holdsBlock(Math.floor(p / LEAF_BLOCK_SIZE))) return "unconfirmed";
     const leaf = protocol("leaf", () => this.#tree.leaf(p));
     if (!equal(leaf, c)) throw new HowlError("Protocol", `leaf ${p}: the verified tree holds another commitment`);
     return "confirmed";

@@ -55,8 +55,9 @@ const witness = await source.merkleWitness(records[0].leafIndex); // or (index, 
 ```
 
 `confirmNote` refuses a cell that opens but is not the verified tree's leaf at its position. It
-never reads a block from the node: when the client does not hold the note's 1,024-leaf block it
-answers `"unconfirmed"`, and the check is made at spend time against the witness.
+sends no request, whatever the record's position: when the client does not hold the note's
+1,024-leaf block, or the position is at or past `state.leafCount`, it answers `"unconfirmed"`, and
+the check is made after a later sync or at spend time against the witness.
 
 A feed row is six bytes, so a row of another note can match a tag. Read and try to open every
 matched position, never only the first: a tag is in use when any of its rows opens.
@@ -75,7 +76,7 @@ counter reconcile) use `matches(tags)` or the `feed` view of the synced rows, an
 | `matches(tags, from?)` | positions whose feed row equals a tag's low six bytes |
 | `feed` | read-only view of the synced feed rows: `length`, `bytes()`, `matches(prefixTags, from?)` |
 | `fetchNotes(positions)` | private read, one record per position in request order, batches of up to the node's ladder cap; position 0 (the genesis filler) is refused; a position at or past `state.leafCount` takes a slot like any other and answers a record that opens to nothing (`commitmentPrefix` all zero), so sync and ask again |
-| `confirmNote(record, commitment)` | checks a recomputed commitment against the record's prefix and, when the client holds the note's block, the verified tree's leaf at its position; sends no request; `"unconfirmed"` otherwise |
+| `confirmNote(record, commitment)` | checks a recomputed commitment against the record's prefix and, when the client holds the note's block, the verified tree's leaf at its position; sends no request; `"unconfirmed"` otherwise, including a position at or past `state.leafCount` |
 | `fetchTagPrefixes(since)` | one feed segment as served |
 | `fetchLeafBlock(b)` | the leaves of block `b`; call it at spend time, not at discovery |
 | `merkleWitness(index, leafCount?)` | siblings from level 0 up, the root at that count, folded and checked; its `block` is the newest verified block, not the block at that count |
