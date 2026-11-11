@@ -210,6 +210,20 @@ async fn bodies_past_a_routes_cap_are_refused_before_they_are_decoded() {
     let past_cap = request(&vec![0u8; key + 1]);
     let (status, _) = http.post("/howl/v1/session", past_cap).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    // A batch may carry a key and the published query allowance.
+    let batch = key + howl_wire::QUERY_BYTES_LIMIT;
+    let (status, _) = http
+        .post("/howl/v1/notes", request(&vec![0u8; batch]))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "read, and refused as a batch that does not decode"
+    );
+    let (status, _) = http
+        .post("/howl/v1/notes", request(&vec![0u8; batch + 1]))
+        .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 #[tokio::test(flavor = "multi_thread")]

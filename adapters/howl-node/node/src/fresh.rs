@@ -3,7 +3,9 @@
 //! A step that ends with the table at the head it read marks the view current. The view is
 //! ready while that mark is younger than a bound. An idle chain keeps it current, because a
 //! step that finds no new block ends at the head; a follower that stopped, or whose steps keep
-//! failing, lets it age past the bound.
+//! failing, lets it age past the bound. The head is the endpoint's: an optional second bound on
+//! how long that head may go without growing turns an endpoint stuck at an old head unready,
+//! for chains that make blocks at a known pace.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -16,6 +18,7 @@ const NEVER: u64 = u64::MAX;
 pub struct Freshness {
     origin: Instant,
     head: AtomicU64,
+    grown_ms: AtomicU64,
     current_ms: AtomicU64,
     good_ms: AtomicU64,
     failed: AtomicU64,
@@ -26,6 +29,8 @@ pub struct Freshness {
 pub struct Reading {
     /// The newest head a step read.
     pub head: Option<u64>,
+    /// Since the head a step read last grew.
+    pub head_age: Option<Duration>,
     /// Since a step last ended with the table at the head.
     pub current_age: Option<Duration>,
     /// Since a step last succeeded.
@@ -35,10 +40,12 @@ pub struct Reading {
 }
 
 impl Reading {
-    /// Whether the view was current within `bound`.
+    /// Whether the view was current within `bound` and, under `head_stall`, the head read grew
+    /// within that.
     #[must_use]
-    pub fn ready(&self, bound: Duration) -> bool {
+    pub fn ready(&self, bound: Duration, head_stall: Option<Duration>) -> bool {
         self.current_age.is_some_and(|age| age <= bound)
+            && head_stall.is_none_or(|stall| self.head_age.is_some_and(|age| age <= stall))
     }
 }
 
@@ -47,6 +54,7 @@ impl Default for Freshness {
         Self {
             origin: Instant::now(),
             head: AtomicU64::new(NEVER),
+            grown_ms: AtomicU64::new(NEVER),
             current_ms: AtomicU64::new(NEVER),
             good_ms: AtomicU64::new(NEVER),
             failed: AtomicU64::new(0),
@@ -63,7 +71,10 @@ impl Freshness {
     pub fn stepped(&self, at: Instant, head: Option<u64>, at_head: bool) {
         let ms = self.millis(at);
         if let Some(head) = head {
-            self.head.store(head, Ordering::Relaxed);
+            let before = self.head.swap(head, Ordering::Relaxed);
+            if before == NEVER || head > before {
+                self.grown_ms.store(ms, Ordering::Relaxed);
+            }
         }
         self.good_ms.store(ms, Ordering::Relaxed);
         if at_head {
@@ -89,6 +100,7 @@ impl Freshness {
                 NEVER => None,
                 head => Some(head),
             },
+            head_age: age(&self.grown_ms),
             current_age: age(&self.current_ms),
             step_age: age(&self.good_ms),
             failed: self.failed.load(Ordering::Relaxed),
@@ -108,15 +120,42 @@ mod tests {
         let fresh = Freshness::default();
         let start = Instant::now();
         let bound = Duration::from_secs(10);
-        assert!(!fresh.read(start).ready(bound), "never at the head");
+        assert!(!fresh.read(start).ready(bound, None), "never at the head");
         fresh.stepped(start, Some(100), false);
-        assert!(!fresh.read(start).ready(bound), "behind the head");
+        assert!(!fresh.read(start).ready(bound, None), "behind the head");
         fresh.stepped(start, Some(100), true);
-        assert!(fresh.read(start + bound).ready(bound));
+        assert!(fresh.read(start + bound).ready(bound, None));
         let late = fresh.read(start + bound + Duration::from_millis(1));
-        assert!(!late.ready(bound));
+        assert!(!late.ready(bound, None));
         assert_eq!(late.head, Some(100));
         fresh.failed();
         assert_eq!(fresh.read(start).failed, 1);
+    }
+
+    #[test]
+    fn a_head_that_stops_growing_is_unready_only_past_its_own_bound() {
+        let fresh = Freshness::default();
+        let start = Instant::now();
+        let bound = Duration::from_secs(10);
+        let stall = Duration::from_secs(60);
+        let ms = Duration::from_millis;
+        // every step ends at the endpoint's head, which stays at 100
+        for s in 0..=70 {
+            fresh.stepped(start + Duration::from_secs(s), Some(100), true);
+        }
+        let now = start + Duration::from_secs(70);
+        assert_eq!(fresh.read(now).head_age, Some(Duration::from_secs(70)));
+        assert!(fresh.read(now).ready(bound, None), "no stall bound: ready");
+        assert!(
+            !fresh.read(now).ready(bound, Some(stall)),
+            "stuck at one head"
+        );
+        assert!(fresh.read(start + stall).ready(bound, Some(stall)));
+        assert!(!fresh.read(start + stall + ms(1)).ready(bound, Some(stall)));
+        // a head that grows again, and one that goes back, which is no growth
+        fresh.stepped(now, Some(101), true);
+        assert!(fresh.read(now).ready(bound, Some(stall)));
+        fresh.stepped(now + stall, Some(99), true);
+        assert!(!fresh.read(now + stall + ms(1)).ready(bound, Some(stall)));
     }
 }

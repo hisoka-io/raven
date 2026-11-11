@@ -47,6 +47,10 @@ pub struct Limits {
     pub operator_token: Option<String>,
     /// How long after the follower last reached the head the ready route still answers `200`.
     pub stale_after: Duration,
+    /// How long the endpoint's head may go without growing before the ready route answers
+    /// `503`; `None`, the default, sets no such bound. Set it well above the chain's longest
+    /// gap between blocks.
+    pub head_stall: Option<Duration>,
 }
 
 impl std::fmt::Debug for Limits {
@@ -64,6 +68,7 @@ impl std::fmt::Debug for Limits {
                 &self.operator_token.as_ref().map(|_| "set"),
             )
             .field("stale_after", &self.stale_after)
+            .field("head_stall", &self.head_stall)
             .finish()
     }
 }
@@ -94,6 +99,8 @@ impl Limits {
             operator_token: None,
             // Several polls and one endpoint timeout, so one slow read does not flap it.
             stale_after: Duration::from_secs(120),
+            // Off: chains that make blocks only for new transactions sit at one head for long.
+            head_stall: None,
         }
     }
 
@@ -118,6 +125,9 @@ impl Limits {
         }
         if self.stale_after.is_zero() {
             return Err("the stale bound must be above zero".to_owned());
+        }
+        if self.head_stall.is_some_and(|stall| stall.is_zero()) {
+            return Err("the head stall bound must be above zero".to_owned());
         }
         for (name, rate) in [("requests", self.requests), ("sessions", self.sessions)] {
             if rate.per_sec == 0 || rate.burst == 0 {
@@ -283,6 +293,11 @@ mod tests {
             ..Limits::new(4)
         };
         assert!(never_ready.validate().is_err_and(|e| e.contains("stale")));
+        let no_stall = Limits {
+            head_stall: Some(Duration::ZERO),
+            ..Limits::new(4)
+        };
+        assert!(no_stall.validate().is_err_and(|e| e.contains("head stall")));
     }
 
     #[test]

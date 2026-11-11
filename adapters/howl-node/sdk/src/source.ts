@@ -14,9 +14,9 @@ const MAX_REWINDS_PER_SYNC = 8;
 // for again, so a key is not uploaded twice per read while the seats stay full.
 const SEAT_RETRY_MS = MAX_RETRY_AFTER_SECONDS * 1000;
 /**
- * A sync names its cursor rounded down to this many leaves, so the node learns a window that every
- * wallet synced within it shares, not the wallet's own count. The rows and leaves sent again cost
- * an idle sync at most 63 x (6 + 32) = 2,394 bytes. It divides the block and the feed segment.
+ * A sync names its feed cursor and held leaf count rounded down to this many leaves. The rows and
+ * leaves past the rounded count come again, so an idle sync costs at most 63 x (6 + 32) = 2,394
+ * bytes more. It divides the block and the feed segment.
  */
 export const SYNC_CURSOR_GRANULE = 64;
 const granular = (n: number): number => n - (n % SYNC_CURSOR_GRANULE);
@@ -78,7 +78,8 @@ export interface SyncResult extends AnswerState {
   readonly rowsAdded: number;
   /**
    * Set when the chain was reorganised below the client's old cursor: every row from this
-   * position on was dropped and read again, so notes found there must be found again.
+   * position on was dropped and read again, so notes found there must be found again. A cell
+   * read before is kept when its feed row and tree leaf came back unchanged.
    */
   readonly rewoundTo?: number;
 }
@@ -165,6 +166,16 @@ function nodeAt(list: Uint8Array, index: number): Uint8Array {
   return list.subarray(index * NODE_BYTES, (index + 1) * NODE_BYTES);
 }
 
+/** The tree and feed held when a rewind first set cells aside, and the cells set aside. */
+interface Suspect {
+  readonly rows: Uint8Array;
+  readonly upper: Uint8Array;
+  readonly newestIndex: number;
+  readonly newestLeaves: Uint8Array;
+  readonly leafCount: number;
+  readonly cells: Map<number, Uint8Array>;
+}
+
 function checkPosition(value: number, what: string): void {
   if (!Number.isInteger(value) || value < 0 || value > 0xffff_ffff) {
     throw new RangeError(`${what} ${value} is not a leaf index`);
@@ -192,8 +203,11 @@ export class RavenHowlSource<F> {
   #session: HowlClientHandle | null = null;
   #noSeatUntil = 0;
   readonly #occurrences = new Map<string, number[]>();
-  // Cells already opened, by position: a cell never changes unless a rewind drops its row.
+  // Cells already opened, by position: a cell never changes unless its feed row or leaf does.
   readonly #cells = new Map<number, Uint8Array>();
+  // Cells set aside by a rewind, with the tree and feed they were verified under, until a sync
+  // completes and shows which of their rows and leaves came back unchanged.
+  #suspect: Suspect | null = null;
   // Pads and slot order of reads not yet answered, so a read sent again asks for the same rows.
   readonly #plans = new Map<string, { targets: Uint32Array; slots: Uint32Array }>();
   #lastRead: AnswerState | null = null;
@@ -335,17 +349,72 @@ export class RavenHowlSource<F> {
     return shared * LEAF_BLOCK_SIZE;
   }
 
-  #rewindTo(r: number): number {
+  /**
+   * `held` names the verified newest block and upper-node count when an answer not yet accepted
+   * has been applied to the tree; the cells set aside are compared against those.
+   */
+  #rewindTo(r: number, held: { upper: number; index: number; leaves: Uint8Array } | null): number {
     // Back to a block boundary: the root there follows from the upper nodes alone.
     const limit = Math.max(0, Math.min(r, this.#feed.length, this.#state.leafCount));
     const at = Math.floor(limit / LEAF_BLOCK_SIZE) * LEAF_BLOCK_SIZE;
+    this.#suspect ??= {
+      rows: this.#feed.bytes(),
+      upper: this.#tree.upperNodes().slice(0, (held?.upper ?? this.#tree.fullBlocks) * NODE_BYTES),
+      newestIndex: held?.index ?? this.#tree.newestIndex,
+      newestLeaves: held?.leaves ?? this.#tree.newestLeaves(),
+      leafCount: this.#state.leafCount,
+      cells: new Map(),
+    };
     this.#feed.truncate(at);
     this.#tree.truncate(at);
     this.#state = { leafCount: at, block: this.#state.block, root: this.#tree.root(at) };
     this.#occurrences.clear();
-    for (const p of this.#cells.keys()) if (p >= at) this.#cells.delete(p);
+    for (const [p, cell] of this.#cells) {
+      if (p < at) continue;
+      this.#suspect!.cells.set(p, cell);
+      this.#cells.delete(p);
+    }
     this.#plans.clear();
     return at;
+  }
+
+  /**
+   * Restore each set-aside cell whose feed row and leaf the completed sync reproduced; the rest
+   * are read again. A leaf of a block full on both sides is compared by its block's upper node.
+   * The old newest block, when it has filled since, is read whether or not a cell lies in it, as
+   * a sync without a rewind reads it.
+   */
+  async #settle(): Promise<void> {
+    const s = this.#suspect;
+    if (s === null) return;
+    const n = this.#state.leafCount;
+    const oldFull = s.upper.length / NODE_BYTES;
+    const filled = s.leafCount % LEAF_BLOCK_SIZE !== 0 && s.newestIndex < this.#tree.fullBlocks;
+    if (filled && !this.#tree.holdsBlock(s.newestIndex)) await this.#fullBlock(s.newestIndex);
+    const upper = this.#tree.upperNodes();
+    const leafOf = (p: number): Uint8Array | null => {
+      try {
+        return this.#tree.leaf(p);
+      } catch {
+        return null;
+      }
+    };
+    for (const [p, cell] of s.cells) {
+      if (p >= n || p >= this.#feed.length || this.#cells.has(p)) continue;
+      const row = s.rows.subarray(p * TAG_PREFIX_BYTES, (p + 1) * TAG_PREFIX_BYTES);
+      if (row.length !== TAG_PREFIX_BYTES || this.#feed.firstDifference(p, row) !== null) continue;
+      const b = Math.floor(p / LEAF_BLOCK_SIZE);
+      let same: boolean;
+      if (b < oldFull) {
+        same = b < this.#tree.fullBlocks && equal(nodeAt(upper, b), nodeAt(s.upper, b));
+      } else {
+        const now = leafOf(p);
+        const was = nodeAt(s.newestLeaves, p - b * LEAF_BLOCK_SIZE);
+        same = b === s.newestIndex && now !== null && was.length === NODE_BYTES && equal(now, was);
+      }
+      if (same) this.#cells.set(p, cell);
+    }
+    this.#suspect = null;
   }
 
   /** The leaf count up to which the held newest block runs: its leaves need not be sent again. */
@@ -396,11 +465,14 @@ export class RavenHowlSource<F> {
     const startRows = this.#feed.length;
     let rewoundTo: number | undefined;
     let rewinds = 0;
+    // The verified tree while an answer not yet accepted is applied to it.
+    let applied: { upper: number; index: number; leaves: Uint8Array } | null = null;
     const rewind = (r: number): void => {
       if (++rewinds > MAX_REWINDS_PER_SYNC) {
         throw new HowlError("Protocol", "the node keeps disagreeing with the verified tree");
       }
-      const at = this.#rewindTo(r);
+      const at = this.#rewindTo(r, applied);
+      applied = null;
       rewoundTo = Math.min(rewoundTo ?? at, at);
     };
     // The node is behind the cursor: a lagging replica, or a chain that got shorter. Only a root
@@ -450,6 +522,7 @@ export class RavenHowlSource<F> {
         throw new HowlError("Protocol", `sync carries ${a.upperNodes.length / NODE_BYTES} upper nodes for ${n} leaves`);
       }
       const newest = this.#newestFrom(a, held, before);
+      applied = { upper: upperSince, index: before.index, leaves: before.leaves };
       protocol("sync", () => {
         this.#tree.appendUpper(a.upperNodes);
         if (newest !== null) this.#tree.setNewest(a.blockIndex, newest);
@@ -483,7 +556,9 @@ export class RavenHowlSource<F> {
       const resent = Math.min(this.#feed.length, a.next) - a.base;
       this.#feed.append(this.#feed.length, a.rows.subarray(resent * TAG_PREFIX_BYTES));
       this.#state = { leafCount: n, block: a.block, root: a.root };
+      applied = null;
       if (a.next === n) {
+        await this.#settle();
         const result: SyncResult = {
           leafCount: n,
           block: a.block,
@@ -578,7 +653,7 @@ export class RavenHowlSource<F> {
   /**
    * Private read of `positions`. An expired session is replaced once; a read that fails
    * because the node changed is built again once under the node's params, with the same rows
-   * and slots, so the retry shows the node nothing the first request did not.
+   * and slots as the first request.
    */
   async #readBatch(positions: number[]): Promise<Uint8Array> {
     const key = positions.join(",");
@@ -611,9 +686,9 @@ export class RavenHowlSource<F> {
 
   /**
    * A read that got no response at all, as on a keep-alive socket the node closed when it
-   * restarted, is sent once more with the same bytes: the same key and rows, so the node learns
-   * nothing the first request did not carry. A read is free of side effects apart from renewing
-   * its seat. A read that got any status is never sent again here.
+   * restarted, is sent once more with the same bytes: the same key and rows. A read is free of
+   * side effects apart from renewing its seat. A read that got any status is never sent again
+   * here.
    */
   async #postNotes(body: Uint8Array): Promise<Exchange> {
     try {
@@ -660,8 +735,9 @@ export class RavenHowlSource<F> {
 
   /**
    * Private read of the cells at `leafIndices` (1 and up; 0 is the genesis filler and is
-   * refused), one record per index in request order. Indices are padded to the node's ladder in batches of at most its cap. A cell read
-   * once is kept, and read again only after a rewind drops its row.
+   * refused), one record per index in request order. Indices are padded to the node's ladder in
+   * batches of at most its cap. A cell read once is kept, and read again only after a rewind
+   * finds its feed row or tree leaf changed.
    */
   fetchNotes(leafIndices: readonly number[]): Promise<HowlNoteRecord<F>[]> {
     return this.#exclusive(() => this.#fetchNotes(leafIndices));
@@ -674,7 +750,7 @@ export class RavenHowlSource<F> {
       if (p === 0) throw new RangeError("leaf 0 is the genesis filler and holds no note");
     });
     const highest = Math.max(...leafIndices);
-    if (highest >= this.#state.leafCount) await this.#sync();
+    if (highest >= this.#state.leafCount || this.#suspect !== null) await this.#sync();
     if (highest >= this.#state.leafCount) {
       throw new RangeError(`leaf ${highest} is past the ${this.#state.leafCount} leaves of the pool`);
     }
@@ -696,8 +772,8 @@ export class RavenHowlSource<F> {
    * and be the tree's leaf at `record.leafIndex`. A cell that opens but whose note is not that
    * leaf is refused with a `Protocol` error, so it is never spent or counted.
    *
-   * It sends no request for the leaf: a block read here would show the node which blocks hold
-   * the wallet's notes. When the client does not hold the note's block it answers
+   * It sends no request: it reads only the blocks the client already holds. When the client
+   * does not hold the note's block it answers
    * `"unconfirmed"`, and the check falls to spend time: the `leaf` of `merkleWitness`, which
    * reads the block anyway, must equal `commitment` (or call this again after the witness).
    */

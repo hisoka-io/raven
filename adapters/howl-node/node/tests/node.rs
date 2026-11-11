@@ -424,6 +424,51 @@ async fn a_deployment_block_before_the_pools_code_is_read_as_no_leaves() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_walked_read_cut_past_the_walk_reads_no_state_deeper_than_it() {
+    let fixture = Fixture::load();
+    let walk = howl_node::follow::WALK_BLOCKS;
+    // A quiet stretch grows the range past twice the walk; then one leaf in each of 2w - 1 blocks.
+    let quiet = 2_000;
+    let (mut tree, mut leaves) = fixture_tree(&fixture);
+    let first = fixture.head + quiet + 1;
+    let ext = extend(fixture.pool, &mut tree, first, 2 * walk - 1, 1, 0xdee9);
+    let mut logs = fixture.logs.clone();
+    logs.extend(ext.logs);
+    leaves.extend(ext.leaves);
+    let chain = FakeChain::new(
+        fixture.pool,
+        fixture.first_block,
+        logs,
+        fixture.head + quiet,
+    );
+    chain.keep_state_for(walk);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = config(dir.path(), &fixture, Duration::from_secs(3_600));
+    config.max_range = 50_000;
+    let mut node = TestNode::start_with(config, chain.clone());
+    node.catch_up().await;
+    // The endpoint answers at most 100 logs: the whole stretch is halved twice, to 31 blocks,
+    // whose end lies 96 blocks below the head.
+    chain.cap_logs(100);
+    chain.set_head(ext.last_block);
+    let step = node.step().await;
+    assert_eq!(chain.refused_reads(), 2);
+    assert_eq!(
+        step,
+        Step::Read {
+            leaves: fixture.leaves.len() as u64..fixture.leaves.len() as u64 + 31,
+            block: first + 30,
+        }
+    );
+    node.catch_up().await;
+    let served = node.sync().await;
+    assert_eq!(
+        (served.leaf_count, served.root),
+        (leaves.len() as u64, root_of(&leaves))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_walk_depth_of_zero_still_walks_the_newest_block() {
     let fixture = Fixture::load();
     let chain = FakeChain::new(

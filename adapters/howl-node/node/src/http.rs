@@ -10,7 +10,7 @@
 //! | `POST /howl/v1/session` | seat a packing key; returns a handle |
 //! | `POST /howl/v1/notes` | answer a padded batch, by handle or with the key inline |
 //! | `GET /howl/v1/health` | plain text: the leaf count, block and shards served; `200` while the node runs |
-//! | `GET /howl/v1/ready` | `200` while the follower reached the head within the stale bound, else `503` |
+//! | `GET /howl/v1/ready` | `200` while the follower is alive and reached the endpoint's head within the stale bound (and, when set, that head grew within the head stall bound), else `503` |
 //! | `GET /howl/v1/status` | plain text for the operator, under a bearer token: freshness, seats, refusals |
 //!
 //! A read that names a position past the node's state is refused with `409` and a
@@ -32,8 +32,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use howl_wire::{
-    Body, Notes, Params, RequestPrefix, Session, CELL_BYTES, LADDER_CAP, REQUEST_PREFIX_BYTES,
-    ROWS_PER_SHARD,
+    Body, Notes, Params, RequestPrefix, Session, CELL_BYTES, LADDER_CAP, QUERY_BYTES_LIMIT,
+    REQUEST_PREFIX_BYTES, ROWS_PER_SHARD,
 };
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
@@ -41,9 +41,6 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::engine::{Engine, Pir, Refusal, View};
 use crate::limit::{operator_token_matches, retry_after_secs, Bucket, Limits};
-
-/// Upper bound on one batch body beyond its key: sixteen seeded queries with room to spare.
-const QUERY_BYTES_LIMIT: usize = 1 << 20;
 
 const PARAMS: &str = "/howl/v1/params";
 const PREFIXES: &str = "/howl/v1/prefixes";
@@ -74,6 +71,7 @@ pub struct Served {
     refused_bodies: AtomicU64,
     refused_body_timeout: AtomicU64,
     stale_after: Duration,
+    head_stall: Option<Duration>,
 }
 
 /// Each batch or registration occupies a blocking thread and the cores its work uses; beyond
@@ -157,6 +155,7 @@ impl Served {
             bodies: Arc::new(Semaphore::new(limits.bodies.max(1))),
             body_timeout: limits.body_timeout,
             stale_after: limits.stale_after,
+            head_stall: limits.head_stall,
             operator_token: limits.operator_token,
             refused_rate: AtomicU64::new(0),
             refused_session_rate: AtomicU64::new(0),
@@ -545,12 +544,13 @@ fn head_text(head: Option<u64>) -> String {
     head.map_or_else(|| "none".to_owned(), |head| head.to_string())
 }
 
-/// Whether the follower reached the head within the stale bound. An idle chain stays ready:
-/// a step that finds no new block ends at the head.
+/// Whether the follower reached the endpoint's head within the stale bound. An idle chain stays
+/// ready: a step that finds no new block ends at the head. Under a head stall bound, a head that
+/// has not grown for longer than that is unready too.
 async fn ready(State(served): State<Arc<Served>>) -> Response {
     let reading = served.engine.freshness().read(Instant::now());
     let view = served.engine.view();
-    let ready = reading.ready(served.stale_after);
+    let ready = reading.ready(served.stale_after, served.head_stall);
     let status = if ready {
         StatusCode::OK
     } else {
@@ -591,7 +591,7 @@ async fn status(State(served): State<Arc<Served>>, headers: HeaderMap) -> Respon
         "ok leaves={} block={} shards={} sessions={} seats={} queued={} refused_rate={} \
          refused_session_rate={} refused_bodies={} refused_body_timeout={} refused_queue_full={} \
          refused_wait={} head={} behind={} ready={} current_age_ms={} step_age_ms={} \
-         step_errors={}\n",
+         step_errors={} head_age_ms={}\n",
         view.leaf_count,
         view.block,
         view.shards.len(),
@@ -606,10 +606,11 @@ async fn status(State(served): State<Arc<Served>>, headers: HeaderMap) -> Respon
         count(&gate.refused_wait),
         head_text(fresh.head),
         head_text(fresh.head.map(|head| head.saturating_sub(view.block))),
-        u8::from(fresh.ready(served.stale_after)),
+        u8::from(fresh.ready(served.stale_after, served.head_stall)),
         millis(fresh.current_age),
         millis(fresh.step_age),
         fresh.failed,
+        millis(fresh.head_age),
     )
     .into_response()
 }

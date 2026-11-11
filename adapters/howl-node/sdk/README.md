@@ -71,7 +71,7 @@ counter reconcile) use `matches(tags)` or the `feed` view of the synced rows, an
 
 | Method | What it does |
 |---|---|
-| `sync()` | pulls the feed from the cursor, the new upper nodes and the newest block past the leaves held (96 bytes when nothing is new); checks the root; reports `rewoundTo` after a reorganisation |
+| `sync()` | pulls the feed from the rounded cursor, the new upper nodes and the newest block from the rounded held count (96 bytes plus at most 2,394 when nothing is new); checks the root; reports `rewoundTo` after a reorganisation |
 | `matches(tags, from?)` | positions whose feed row equals a tag's low six bytes |
 | `feed` | read-only view of the synced feed rows: `length`, `bytes()`, `matches(prefixTags, from?)` |
 | `fetchNotes(positions)` | private read, one record per position in request order, batches of up to the node's ladder cap; position 0 (the genesis filler) is refused |

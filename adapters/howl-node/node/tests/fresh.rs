@@ -167,6 +167,61 @@ async fn an_idle_chain_stays_ready_past_the_bound() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn under_a_head_stall_bound_an_endpoint_stuck_at_one_head_goes_unready() {
+    let fixture = Fixture::load();
+    let chain = FakeChain::new(
+        fixture.pool,
+        fixture.first_block,
+        fixture.logs.clone(),
+        fixture.head,
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut follower, engine) =
+        howl_node::open(&config(dir.path(), &fixture), chain.clone()).expect("open");
+    let stall = Duration::from_millis(400);
+    let http = Http(router(Served::with_limits(
+        Arc::clone(&engine),
+        Limits {
+            stale_after: Duration::from_secs(60),
+            head_stall: Some(stall),
+            operator_token: Some(TOKEN.to_owned()),
+            ..Limits::new(2)
+        },
+    )));
+    // The catch-up itself may outlast the bound; a head that grows right after it is ready.
+    settle(&mut follower, &engine).await;
+    chain.set_head(fixture.head + 1);
+    settle(&mut follower, &engine).await;
+    let (status, body) = text(&http, "/howl/v1/ready").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Every step ends at the endpoint's head, which never grows.
+    let stuck = Instant::now();
+    loop {
+        let step = follower.step().await.expect("step");
+        assert!(matches!(step, Step::Idle { .. }), "{step:?}");
+        howl_node::publish(&follower, &engine, &step).expect("publish");
+        let (status, body) = text(&http, "/howl/v1/ready").await;
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            assert!(body.starts_with("stale "), "{body}");
+            break;
+        }
+        assert!(
+            stuck.elapsed() < stall + Duration::from_secs(2),
+            "still ready long past the stall bound: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(stuck.elapsed() + Duration::from_millis(50) >= stall);
+    let (_, body) = text(&http, "/howl/v1/status").await;
+    assert_eq!(field(&body, "ready"), "0", "{body}");
+    // A head that grows makes it ready again.
+    chain.set_head(fixture.head + 2);
+    settle(&mut follower, &engine).await;
+    let (status, body) = text(&http, "/howl/v1/ready").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 /// A source whose every read fails while `down` is set: an endpoint gone away.
 #[derive(Clone)]
 struct Flaky {

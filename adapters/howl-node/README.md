@@ -51,7 +51,10 @@ reorganises below the node's newest block, the node returns to the newest block 
 chain still has and reads on from there. Within the walk depth (`--walk-blocks`, 64) of the head it
 reads the pool's leaf count there, which needs the endpoint to keep that block's state for the walk
 depth plus the blocks made during one step; deeper blocks need no old state, so a pruned endpoint
-serves a catch-up. A walk deeper than the endpoint's recent state fails each step near the head. Within the walk it also reads the header of every
+serves a catch-up. A read near the head that the endpoint's caps or the table's batch cut to the walk
+depth or more below the head is read as a deeper range, so the count is never read deeper than the
+walk. A walk deeper than the endpoint's recent state fails each step near the head. Within the walk
+it also reads the header of every
 block it takes in, and applies the read only when the headers link to each other and to the node's
 newest block and every log names one of them; a read that spans a reorganisation is dropped and read
 again. A leaf whose logged root the node's rows cannot reproduce takes the node back one recorded
@@ -89,7 +92,7 @@ plain routes are the same bytes under either set apart from that id.
 | `POST /howl/v1/session` | a session handle for an uploaded packing key |
 | `POST /howl/v1/notes` | one response per query of a batch |
 | `GET /howl/v1/health` | liveness: `ok leaves=.. block=.. shards=..`, `200` while the process serves |
-| `GET /howl/v1/ready` | readiness: `ready block=.. head=..` with `200` while the follower reached the head within `--stale-after-secs`, else `stale ...` with `503` |
+| `GET /howl/v1/ready` | readiness: `ready block=.. head=..` with `200` while the follower is alive and reached the endpoint's head within `--stale-after-secs` (and, with `--head-stall-secs`, that head grew within it), else `stale ...` with `503` |
 | `GET /howl/v1/status` | plain text for the operator, under a bearer token: freshness, seats, queue, refusals |
 
 A read that names a position past the node's state is answered `409` with a header-only answer that
@@ -159,15 +162,20 @@ The node tells three things apart:
 - **Liveness**, `GET /howl/v1/health`: `200` while the process serves, whatever the endpoint does.
   The image's `HEALTHCHECK` reads it, so a node catching up or riding out an endpoint outage keeps
   running.
-- **Readiness**, `GET /howl/v1/ready`: `200` while the follower's last step that ended at the chain
-  head is younger than `--stale-after-secs` (120). A chain that makes no new block keeps the node
-  ready, since each poll ends at the head. A follower that falls behind, or whose reads fail, turns
-  it `503` within the bound. A cold start is ready once the catch-up reaches the head.
+- **Readiness**, `GET /howl/v1/ready`: `200` while the follower is alive and its last step that
+  ended at the endpoint's head is younger than `--stale-after-secs` (120). The head is the one the
+  endpoint answers. A chain that makes no new block keeps the node ready, since each poll ends at
+  the head. A follower that falls behind, or whose reads fail, turns it `503` within the bound. A
+  cold start is ready once the catch-up reaches the head. On a chain that makes blocks at a steady
+  pace, `--head-stall-secs` (unset by default) also turns it `503` once the endpoint's head has not
+  grown for that long, which catches an endpoint stuck at an old head; give it well above the
+  chain's longest gap between blocks, and leave it unset on a chain that makes blocks only for new
+  transactions.
 - **Status**, `GET /howl/v1/status` under the operator token: one line of `key=value` fields. The
   freshness fields are `head` (the newest head the follower read), `block` (the block served),
   `behind` (their gap in blocks), `ready` (1 or 0), `current_age_ms` (since the follower last
-  reached the head), `step_age_ms` (since its last good step) and `step_errors` (failed steps since
-  start). Failed steps are logged at `warn` and retried every poll.
+  reached the head), `step_age_ms` (since its last good step), `step_errors` (failed steps since
+  start) and `head_age_ms` (since the endpoint's head last grew). Failed steps are logged at `warn` and retried every poll.
 
 The follower runs beside the routes. Should it end, the node logs why and exits non-zero, so the
 container's restart policy brings it back.

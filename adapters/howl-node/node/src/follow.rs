@@ -10,7 +10,9 @@
 //! Within the walk depth of the head a step also reads the header of every block it covers, and so
 //! does a step that starts less than twice the walk depth below the head and ends within it. The
 //! headers must link to each other and to the table's last block, every log must name one of them,
-//! and the pool's leaf count is read at the final header's hash. Leaves are applied only in order
+//! and the pool's leaf count is read at the final header's hash. A walked read that the batch or
+//! the endpoint cuts to the walk depth or more below the head is read as a deep range instead, so
+//! the count is only ever read within the walk depth of the head. Leaves are applied only in order
 //! and only if the batch ends exactly at that count, so the leaves applied are all of the walked
 //! chain's, whatever the endpoint answered between reads. Before the pool has code its count is
 //! zero. Deeper ranges are checked by reading the final block's hash before the logs and on both
@@ -257,7 +259,7 @@ impl<C: Chain> Follower<C> {
         let span = if head - from < self.walk_blocks.saturating_mul(2)
             && head - walked_to < self.walk_blocks
         {
-            self.read_walked(from, walked_to).await?
+            self.read_walked(from, walked_to, head).await?
         } else {
             self.read_deep(from, (head - self.walk_blocks).min(last))
                 .await?
@@ -381,8 +383,14 @@ impl<C: Chain> Follower<C> {
     }
 
     /// Blocks `from..=to` near the head: every header read, linked to the next and to the
-    /// table's last block, every log on one of them, and the count at `to`'s.
-    async fn read_walked(&mut self, from: u64, to: u64) -> Result<Result<Span, Step>, FollowError> {
+    /// table's last block, every log on one of them, and the count at `to`'s. A range cut to the
+    /// walk depth below `head` or deeper is read by [`Self::read_deep`], which needs no state.
+    async fn read_walked(
+        &mut self,
+        from: u64,
+        to: u64,
+        head: u64,
+    ) -> Result<Result<Span, Step>, FollowError> {
         let mut to = to;
         let mut logs = loop {
             match self.chain.logs(from, to).await {
@@ -391,6 +399,9 @@ impl<C: Chain> Follower<C> {
             }
         };
         let (to, cut) = fit(self.config.pool, from, to, &logs);
+        if head.saturating_sub(to) >= self.walk_blocks {
+            return self.read_deep(from, to).await;
+        }
         logs.retain(|logged| logged.log.block_number <= to);
         let mut hashes = Vec::new();
         let mut parent = None;

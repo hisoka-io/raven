@@ -61,6 +61,15 @@ export class Pool {
     return { status: 200, body: this.#answer(KIND.block, [Uint8Array.from([...u32(b), ...u32(BLOCK)]), leaves]) };
   }
 
+  /** Level-10 nodes of the full blocks from `since`, as the upper route answers them. */
+  upperAnswer(since: number): Exchange {
+    const full = Math.floor(this.count / BLOCK);
+    return {
+      status: 200,
+      body: this.#answer(KIND.upper, [Uint8Array.from([...u64(since), ...u64(full)]), this.upper.subarray(since * 32)]),
+    };
+  }
+
   /** The node's sync answer; `held` as the node reads it, `skip` leaves dropped by a lying node. */
   sync(since: number, upperSince: number, held = 0, skip = 0): Exchange {
     if (since > this.count || held > this.count) return { status: 409, body: this.#answer(KIND.stale, []) };

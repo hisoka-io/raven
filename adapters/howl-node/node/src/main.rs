@@ -6,7 +6,7 @@
 //!     [--max-sessions 2048] [--session-ttl-secs 3600] [--concurrent N] [--param-set 2|1]
 //!     [--walk-blocks 64] [--respond-threads N] [--rate 5000] [--rate-burst 10000]
 //!     [--session-rate 4] [--session-burst 64] [--queued N] [--permit-wait-ms 20000]
-//!     [--bodies N] [--body-timeout-ms 30000] [--stale-after-secs 120]
+//!     [--bodies N] [--body-timeout-ms 30000] [--stale-after-secs 120] [--head-stall-secs N]
 //! HOWL_NODE_RPC_URL=<endpoint> howl-node check --chain-id N --pool 0x.. --deployment-block N \
 //!     [--walk-blocks 64]
 //! ```
@@ -28,7 +28,9 @@
 //! default), `--permit-wait-ms` how long one waits, `--bodies` the session and batch bodies held
 //! at once (twice the permits and queue places by default), and `--body-timeout-ms` how long one
 //! body may take to arrive. `--stale-after-secs` is how long after the follower last reached the
-//! head `/howl/v1/ready` still answers `200`.
+//! endpoint's head `/howl/v1/ready` still answers `200`. `--head-stall-secs`, unset by default,
+//! also turns it `503` when the endpoint's head has not grown for that long; give it well above the
+//! chain's longest gap between blocks.
 //!
 //! The endpoint is read from the environment so that a key in its URL stays out of the
 //! process list, and so is `HOWL_NODE_OPERATOR_TOKEN`, the bearer token of the status route
@@ -77,6 +79,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut bodies = None;
     let mut body_timeout = None;
     let mut stale_after = None;
+    let mut head_stall = None;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         let number = |text: String| {
@@ -148,6 +151,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--body-timeout-ms" => body_timeout = Some(Duration::from_millis(number(value()?)?)),
             "--stale-after-secs" => stale_after = Some(Duration::from_secs(number(value()?)?)),
+            "--head-stall-secs" => head_stall = Some(Duration::from_secs(number(value()?)?)),
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -162,6 +166,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         requests: requests.unwrap_or(defaults.requests),
         sessions: sessions_opened.unwrap_or(defaults.sessions),
         stale_after: stale_after.unwrap_or(defaults.stale_after),
+        head_stall: head_stall.or(defaults.head_stall),
         ..defaults
     };
     limits.validate()?;
@@ -445,6 +450,14 @@ mod tests {
         let set = parse(args(&["--stale-after-secs", "30"])).expect("parses");
         assert_eq!(set.limits.stale_after, Duration::from_secs(30));
         assert!(parse(args(&["--stale-after-secs", "0"])).is_err());
+    }
+
+    #[test]
+    fn the_head_stall_bound_is_off_by_default_and_refuses_zero() {
+        assert_eq!(parse(args(&[])).expect("parses").limits.head_stall, None);
+        let set = parse(args(&["--head-stall-secs", "600"])).expect("parses");
+        assert_eq!(set.limits.head_stall, Some(Duration::from_secs(600)));
+        assert!(parse(args(&["--head-stall-secs", "0"])).is_err());
     }
 
     #[test]

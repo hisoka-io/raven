@@ -91,6 +91,10 @@ pub const LADDER: [usize; 5] = [1, 2, 4, 8, 16];
 /// The largest batch: more positions are split over several batches.
 pub const LADDER_CAP: usize = 16;
 
+/// Bytes a batch body may carry beyond its prefix and key: sixteen seeded queries with room to
+/// spare. The node reads no more than this, and the fuzz harness explores up to it.
+pub const QUERY_BYTES_LIMIT: usize = 1 << 20;
+
 /// Upper nodes one answer carries at most.
 pub const MAX_UPPER_NODES: u64 = 65_536;
 
