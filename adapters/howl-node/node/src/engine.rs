@@ -36,6 +36,7 @@ use raven_inspire::{
 };
 use raven_inspire_session::{BoundedSessionStore, SessionStoreLimits};
 
+use crate::fresh::Freshness;
 use crate::single::Single;
 
 /// Rows of one feed segment, as the feed crate cuts them.
@@ -104,7 +105,6 @@ fn scheme(e: impl std::fmt::Display) -> EngineError {
 }
 
 const CRS_FILE: &str = "crs.bin";
-const SESSIONS_DIR: &str = "sessions";
 
 /// The wire CRS: everything a client needs and nothing only another packing mode reads.
 fn wire_crs(crs: &ServerCrs) -> ServerCrs {
@@ -127,7 +127,7 @@ impl Gadget {
         seed: Option<[u8; 32]>,
     ) -> Result<Self, EngineError> {
         use rand_chacha::rand_core::SeedableRng;
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let shard_config =
             ShardConfig::for_ring_dim(params.ring_dim, CELL_BYTES, ROWS_PER_SHARD as u64)
                 .map_err(scheme)?;
@@ -165,9 +165,7 @@ impl Gadget {
         let crs_bytes = crs.to_versioned_bytes().map_err(scheme)?;
         let zero = encode_one(&params, &shard_config, &vec![0u8; SHARD_BYTES])?;
         let cache = ServerInspiringCache::new(&crs, &zero).map_err(scheme)?;
-        std::fs::create_dir_all(dir.join(SESSIONS_DIR))?;
-        let sessions = BoundedSessionStore::open_with_limits(&dir.join(SESSIONS_DIR), limits)
-            .map_err(scheme)?;
+        let sessions = BoundedSessionStore::open_with_limits(limits).map_err(scheme)?;
         Ok(Self {
             params,
             crs,
@@ -330,7 +328,8 @@ fn bincode_decode<T: serde::de::DeserializeOwned>(bytes: &[u8], limit: usize) ->
 impl Pir {
     /// The scheme of parameter set `set`. Set 1 loads its key material from `dir`, creating it
     /// on first start; `seed` fixes the material a new directory gets, for tests that pin
-    /// bytes, and a node passes `None`. Set 2's public material is fixed in code.
+    /// bytes, and a node passes `None`. Set 2's public material is fixed in code, and its
+    /// queries are answered by `respond_threads` threads shared by every batch.
     ///
     /// # Errors
     /// [`EngineError`] for a set this node does not serve, or material that cannot be made,
@@ -340,10 +339,13 @@ impl Pir {
         set: u16,
         limits: SessionStoreLimits,
         seed: Option<[u8; 32]>,
+        respond_threads: usize,
     ) -> Result<Self, EngineError> {
         let scheme = match set {
             PARAM_SET_D2048_CELL256 => Scheme::Gadget(Box::new(Gadget::open(dir, limits, seed)?)),
-            PARAM_SET_D2048_CELL256_P16 => Scheme::Single(Box::new(Single::new(limits)?)),
+            PARAM_SET_D2048_CELL256_P16 => {
+                Scheme::Single(Box::new(Single::new(limits, respond_threads)?))
+            }
             other => {
                 return Err(EngineError::Scheme(format!(
                     "parameter set {other} is not one this node serves (1 or 2)"
@@ -359,21 +361,27 @@ impl Pir {
         self.set
     }
 
-    /// The versioned key material clients build under; empty under set 2.
+    /// The key material clients build under: set 1's versioned CRS, set 2's key-mask version.
     #[must_use]
     pub fn crs_bytes(&self) -> &[u8] {
         match &self.scheme {
             Scheme::Gadget(g) => &g.crs_bytes,
-            Scheme::Single(_) => &[],
+            Scheme::Single(s) => s.crs(),
         }
     }
 
     /// Seconds a session lives after its last use.
     #[must_use]
     pub fn session_ttl(&self) -> Duration {
+        self.session_limits().ttl
+    }
+
+    /// Seats and session lifetime.
+    #[must_use]
+    pub fn session_limits(&self) -> SessionStoreLimits {
         match &self.scheme {
-            Scheme::Gadget(g) => g.sessions.limits().ttl,
-            Scheme::Single(s) => s.limits().ttl,
+            Scheme::Gadget(g) => g.sessions.limits(),
+            Scheme::Single(s) => s.limits(),
         }
     }
 
@@ -449,7 +457,7 @@ impl Pir {
     fn encode(&self, cells: &[u8]) -> Result<Encoded, EngineError> {
         Ok(match &self.scheme {
             Scheme::Gadget(g) => Encoded::Gadget(g.encode(cells)?),
-            Scheme::Single(s) => Encoded::Single(s.encode(cells)?),
+            Scheme::Single(s) => Encoded::Single(Arc::new(s.encode(cells)?)),
         })
     }
 
@@ -462,7 +470,7 @@ impl Pir {
         match (&self.scheme, batch) {
             (Scheme::Gadget(g), Batch::Gadget(batch)) => g.respond(view, batch),
             (Scheme::Single(s), Batch::Single(batch)) => {
-                let tables: Vec<&ShardTable> = view
+                let tables: Vec<&Arc<ShardTable>> = view
                     .shards
                     .iter()
                     .map_while(|shard| match &shard.db {
@@ -499,7 +507,7 @@ fn encode_one(
 
 enum Encoded {
     Gadget(EncodedDatabase),
-    Single(ShardTable),
+    Single(Arc<ShardTable>),
 }
 
 /// One encoded shard and the digest of the cells it was encoded from.
@@ -641,6 +649,7 @@ pub struct Engine {
     // The lowest leaf a refused refresh was asked to read again: the table changed from
     // there and the served view does not show it yet.
     unpublished: AtomicU64,
+    freshness: Freshness,
 }
 
 impl std::fmt::Debug for Engine {
@@ -664,7 +673,14 @@ impl Engine {
             view: ArcSwap::from_pointee(empty),
             encodes: AtomicU64::new(0),
             unpublished: AtomicU64::new(u64::MAX),
+            freshness: Freshness::default(),
         }
+    }
+
+    /// How current the view is, as the follower last established.
+    #[must_use]
+    pub const fn freshness(&self) -> &Freshness {
+        &self.freshness
     }
 
     /// The scheme half.

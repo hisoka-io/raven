@@ -16,7 +16,7 @@ const RING_REFUSAL: &str = "ring_dim 256 is outside [2048, 4096]";
 fn below_floor() -> InspireParams {
     InspireParams {
         ring_dim: 256,
-        ..InspireParams::secure_128_d2048()
+        ..InspireParams::d2048()
     }
 }
 
@@ -35,7 +35,7 @@ fn a_query_under_a_sub_floor_session_is_refused() {
     let refusal = build_seeded_query_rust(&session, &params, &config, 0).expect_err("refused");
     assert!(refusal.contains(RING_REFUSAL), "{refusal}");
     // The session's own params are checked too, not only the ones passed beside it.
-    let shipped = InspireParams::secure_128_d2048();
+    let shipped = InspireParams::d2048();
     let refusal = build_seeded_query_rust(&session, &shipped, &config, 0).expect_err("refused");
     assert!(refusal.contains(RING_REFUSAL), "{refusal}");
 }

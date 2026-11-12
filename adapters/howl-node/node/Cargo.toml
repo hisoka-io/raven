@@ -27,10 +27,12 @@ raven-inspire-session = { path = "../../../crates/inspire-session" }
 arc-swap = { workspace = true }
 axum = { workspace = true }
 bincode = { workspace = true }
+http-body-util = { workspace = true }
 rand_chacha = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+subtle = { version = "2.6", default-features = false }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tower-http = { workspace = true }
@@ -47,4 +49,3 @@ sha2 = { workspace = true }
 sha3 = { version = "0.10", default-features = false }
 tempfile = { workspace = true }
 tower = { workspace = true }
-http-body-util = { workspace = true }

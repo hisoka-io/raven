@@ -43,6 +43,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: "cargo-nextest@0.9.129"
+  fuzz:
+    env:
+      FUZZ_TOOLCHAIN: nightly-2026-09-23
+    steps:
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - run: rustup toolchain install "\$FUZZ_TOOLCHAIN" --profile minimal
+      - run: cargo "+\$FUZZ_TOOLCHAIN" fuzz build --fuzz-dir fuzz
   msrv-1-89:
     env:
       RUSTUP_TOOLCHAIN: "1.89"
@@ -90,7 +97,11 @@ printf 'FROM rust:1.98.0-slim-bookworm AS build\n' > "$FIXTURE_ROOT/adapters/rai
 
 GOOD_WORKFLOW="$FIXTURE_ROOT/ci.good.yml"
 cp "$FIXTURE_ROOT/.github/workflows/ci.yml" "$GOOD_WORKFLOW"
-RAVEN_TOOLCHAIN_SCAN_ROOT="$FIXTURE_ROOT" "$CHECKER" >/dev/null
+output="$(RAVEN_TOOLCHAIN_SCAN_ROOT="$FIXTURE_ROOT" "$CHECKER")"
+if [[ "$output" != *"dated-nightly=1"* ]]; then
+  printf 'selftest failed: the dated nightly env pin was not counted: %s\n' "$output" >&2
+  exit 1
+fi
 
 expect_rejection() {
   local expected="$1"
@@ -120,7 +131,69 @@ expect_rejection "floating or divergent Rust selector 'stable'" "planted @stable
 rm "$FIXTURE_ROOT/.github/workflows/planted.yml"
 
 printf 'cargo +nightly check\n' > "$FIXTURE_ROOT/scripts/planted.sh"
-expect_rejection "invokes floating cargo +nightly" "planted shell selector"
+expect_rejection "invokes floating cargo + 'nightly'" "planted shell selector"
+rm "$FIXTURE_ROOT/scripts/planted.sh"
+
+# A dated nightly is one fixed build and passes in every form; a bare or host-only nightly, or
+# a date that is not YYYY-MM-DD, floats wherever it is written, an env value included.
+expect_acceptance() {
+  local dated="$1"
+  local label="$2"
+  local output
+  if ! output="$(RAVEN_TOOLCHAIN_SCAN_ROOT="$FIXTURE_ROOT" "$CHECKER" 2>&1)"; then
+    printf 'selftest failed: %s was refused: %s\n' "$label" "$output" >&2
+    exit 1
+  fi
+  if [[ "$output" != *"dated-nightly=$dated"* ]]; then
+    printf 'selftest failed: %s: expected dated-nightly=%s: %s\n' "$label" "$dated" "$output" >&2
+    exit 1
+  fi
+}
+printf '%s\n' \
+  'FUZZ_TOOLCHAIN=nightly-2026-09-23' \
+  'cargo +nightly-2026-09-23 fuzz build' \
+  'rustup toolchain install "nightly-2026-09-23"' \
+  > "$FIXTURE_ROOT/scripts/planted.sh"
+printf '%s\n' \
+  'jobs:' \
+  '  dated:' \
+  '    env:' \
+  '      RUSTUP_TOOLCHAIN: "nightly-2026-09-23"' \
+  '    steps:' \
+  '      - uses: dtolnay/rust-toolchain@1.98.0' \
+  '        with:' \
+  '          toolchain: nightly-2026-09-23' \
+  > "$FIXTURE_ROOT/.github/workflows/planted.yml"
+expect_acceptance 6 "dated nightlies in a script, an env value and an action input"
+rm "$FIXTURE_ROOT/scripts/planted.sh" "$FIXTURE_ROOT/.github/workflows/planted.yml"
+
+plant_workflow_line() {
+  printf 'jobs:\n  planted:\n    steps:\n      - run: true\n%s\n' "$1" \
+    > "$FIXTURE_ROOT/.github/workflows/planted.yml"
+}
+sed -i 's/FUZZ_TOOLCHAIN: nightly-2026-09-23/FUZZ_TOOLCHAIN: nightly/' \
+  "$FIXTURE_ROOT/.github/workflows/ci.yml"
+expect_rejection "sets a floating toolchain variable 'nightly'" "bare nightly in a job env"
+cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
+sed -i 's/FUZZ_TOOLCHAIN: nightly-2026-09-23/FUZZ_TOOLCHAIN: "nightly"/' \
+  "$FIXTURE_ROOT/.github/workflows/ci.yml"
+expect_rejection "sets a floating toolchain variable 'nightly'" "quoted bare nightly in a job env"
+cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
+sed -i 's/FUZZ_TOOLCHAIN: nightly-2026-09-23/FUZZ_TOOLCHAIN: nightly-2026-9-23/' \
+  "$FIXTURE_ROOT/.github/workflows/ci.yml"
+expect_rejection "sets a floating toolchain variable 'nightly-2026-9-23'" "undated nightly-like env"
+cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
+plant_workflow_line '    env: { RUST_TOOLCHAIN: stable }'
+expect_rejection "sets a floating toolchain variable 'stable'" "flow-style stable env value"
+plant_workflow_line '        run: cargo +nightly-x86_64-unknown-linux-gnu fuzz build'
+expect_rejection "invokes floating cargo + 'nightly-x86_64-unknown-linux-gnu'" "host-only nightly"
+plant_workflow_line '          toolchain: nightly'
+expect_rejection "contains floating toolchain input 'nightly'" "bare nightly action input"
+plant_workflow_line '        run: rustup toolchain install "nightly" --profile minimal'
+expect_rejection "invokes floating rustup selector 'nightly'" "quoted bare rustup nightly"
+rm "$FIXTURE_ROOT/.github/workflows/planted.yml"
+printf 'export FUZZ_TOOLCHAIN=nightly\n' > "$FIXTURE_ROOT/scripts/planted.sh"
+expect_rejection "assigns floating selector 'nightly'" "bare nightly script variable"
 rm "$FIXTURE_ROOT/scripts/planted.sh"
 
 sed -i 's/rust:1.98.0-slim-bookworm/rust:latest/' "$FIXTURE_ROOT/adapters/railgun/Dockerfile"
@@ -243,4 +316,4 @@ cp "$GOOD_WORKFLOW" "$FIXTURE_ROOT/.github/workflows/ci.yml"
 sed -i '/RUSTUP_TOOLCHAIN: "1.91"/d' "$FIXTURE_ROOT/.github/workflows/ci.yml"
 expect_rejection "MSRV 1.91 override" "shadowed 1.91 floor"
 
-printf 'toolchain pin selftest: all five scan families, the nextest pin and MSRV job invariants rejected their mutations\n'
+printf 'toolchain pin selftest: all five scan families, the nextest pin, the dated nightly and MSRV job invariants held against their mutations\n'

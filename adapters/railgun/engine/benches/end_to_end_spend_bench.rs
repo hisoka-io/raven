@@ -62,7 +62,7 @@ const CELLS: &[CellShape] = &[
 
 fn run_one_seed(cell: &CellShape, seed: u64) -> (Duration, Duration, Duration, Duration) {
     let entries = 1usize << cell.entries_log2;
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = build_synthetic_db(entries, cell.entry_bytes);
     let (state, _) = setup_state(&params, &db, cell.entry_bytes, InspireVariant::TwoPacking)
         .expect("setup_state");

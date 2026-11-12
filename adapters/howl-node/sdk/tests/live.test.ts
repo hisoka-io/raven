@@ -7,6 +7,7 @@ import {
   bigintField,
   fetchTransport,
   RavenHowlSource,
+  SYNC_CURSOR_GRANULE,
   type HowlBatchHandle,
   type HowlClientHandle,
   type HowlNoteRecord,
@@ -20,6 +21,14 @@ import { chainRoots, fixture, hex, unhex, walletTags, wasm, type FixtureLog } fr
 const BIN = process.env.HOWL_NODE_BIN ?? "";
 const live = BIN !== "" && existsSync(BIN);
 const HALF = Math.floor(fixture.blocks.length / 2);
+
+/** The sync a client holding `n` leaves sends: its cursor rounded down to the granule. */
+function syncPath(n: number): string {
+  const at = n - (n % SYNC_CURSOR_GRANULE);
+  return `GET /howl/v1/sync?since=${at}&upper=0` + (at > 0 ? `&held=${at}` : "");
+}
+/** An idle sync: the header, three runs, and the rows and leaves past the rounded cursor. */
+const idleBytes = (n: number): number => 96 + (n % SYNC_CURSOR_GRANULE) * (6 + 32);
 
 /** A transport that records every path asked for and the bytes moved. */
 function recorded(url: string): HowlTransport & { paths: string[]; down: number[]; up: number[] } {
@@ -116,7 +125,7 @@ describe.skipIf(!live)("against a running node", () => {
     chain = await LocalChain.start();
     await chain.mineFixture(0, HALF);
     halfway = await chain.rpc("evm_snapshot");
-    await chain.startNode(BIN);
+    await chain.startNode(BIN, { paramSet: 1 });
     await chain.caughtUp();
   });
 
@@ -144,7 +153,7 @@ describe.skipIf(!live)("against a running node", () => {
         const before = w.source.state.leafCount;
         const mark = w.transport.paths.length;
         const found = await discover(w.source, tagsOf(w.label));
-        expect(w.transport.paths[mark]).toBe(`GET /howl/v1/sync?since=${before}&upper=0&held=${before}`);
+        expect(w.transport.paths[mark]).toBe(syncPath(before));
         expect(w.source.state.leafCount).toBe(chain.leafCount);
         expect(w.source.state.block).toBe(await chain.head());
         expect([...found.keys()].sort((a, b) => a - b)).toEqual(owned(w.label, chain.leafCount));
@@ -175,7 +184,9 @@ describe.skipIf(!live)("against a running node", () => {
     // more than the ladder cap is split over batches
     const many = Array.from({ length: 40 }, (_, i) => i + 1);
     expect((await src.fetchNotes(many)).map((r) => r.leafIndex)).toEqual(many);
-    await expect(src.fetchNotes([160])).rejects.toThrow(/past the 160 leaves/);
+    // a position past the count is read like any other and answers a record that opens to nothing
+    const [past] = await src.fetchNotes([160]);
+    expect([past!.leafIndex, hex(past!.commitmentPrefix)]).toEqual([160, "00".repeat(16)]);
 
     const block = await src.fetchLeafBlock(0);
     expect(block.map((l) => l)).toEqual(fixture.leaves.map((l) => BigInt(l.commitment)));
@@ -260,8 +271,16 @@ describe.skipIf(!live)("against a running node", () => {
     }
   });
 
-  it("a source follows its node through a restart under the other parameter set", async () => {
+  it("a node started without a set serves set 2", async () => {
     const url = await chain.startNode(BIN);
+    await chain.caughtUp(chain.leafCount, url);
+    const params = wasm.decodeAnswer((await fetchTransport(url).get("/howl/v1/params")).body);
+    expect(params.paramSet).toBe(2);
+    params.free();
+  });
+
+  it("a source follows its node through a restart under the other parameter set", async () => {
+    const url = await chain.startNode(BIN, { paramSet: 1 });
     await chain.caughtUp(chain.leafCount, url);
     // alice reads with a session, bob with the key inline; each keeps one source throughout
     const readers = (["session", "inline"] as const).map((keyMode, k) => {
@@ -326,6 +345,27 @@ describe.skipIf(!live)("against a running node", () => {
     expect(spy.plans[1]!.targets.length).toBe(4);
   });
 
+  it("a node with every seat taken still answers a session wallet's reads, with the key inline", async () => {
+    const url = await chain.startNode(BIN, { maxSessions: 1 });
+    await chain.caughtUp(chain.leafCount, url);
+    const holder = new RavenHowlSource({ transport: recorded(url), wasm, field: bigintField });
+    expect((await holder.fetchNotes([1]))[0]!.leafIndex).toBe(1);
+    const transport = recorded(url);
+    const src = new RavenHowlSource({ transport, wasm, field: bigintField });
+    const records = await src.fetchNotes([2, 3]);
+    expect(records.map((r) => r.leafIndex)).toEqual([2, 3]);
+    records.forEach(expectFixtureCell);
+    expectFixtureCell((await src.fetchNotes([4]))[0]!);
+    // One refused seat, then each read inline, without asking for a seat again at once.
+    expect(transport.paths.filter((p) => p.startsWith("POST"))).toEqual([
+      "POST /howl/v1/session",
+      "POST /howl/v1/notes",
+      "POST /howl/v1/notes",
+    ]);
+    holder.close();
+    src.close();
+  });
+
   it("a read the node refused with 410 at will is sent again with the same rows and slots", async () => {
     const inner = recorded(chain.nodeUrl);
     let refused = 0;
@@ -355,9 +395,8 @@ describe.skipIf(!live)("against a running node", () => {
     const second = await discover(src, tags);
     expect([...second.keys()]).toEqual([...first.keys()]);
     const n = src.state.leafCount;
-    expect(transport.paths.slice(mark)).toEqual([`GET /howl/v1/sync?since=${n}&upper=0&held=${n}`]);
-    // An idle sync: the header and three empty runs.
-    expect(transport.down.slice(mark)).toEqual([96]);
+    expect(transport.paths.slice(mark)).toEqual([syncPath(n)]);
+    expect(transport.down.slice(mark)).toEqual([idleBytes(n)]);
   });
 
   it("a tag with no match gets a well-formed record that opens to nothing", async () => {
@@ -387,8 +426,8 @@ describe.skipIf(!live)("against a running node", () => {
     const resumed = new RavenHowlSource({ transport, wasm, field: bigintField, snapshot: stored });
     expect(resumed.state.leafCount).toBe(stored.leafCount);
     const result = await resumed.sync();
-    expect(transport.paths).toEqual([`GET /howl/v1/sync?since=${stored.leafCount}&upper=0&held=${stored.leafCount}`]);
-    expect(transport.down).toEqual([96]);
+    expect(transport.paths).toEqual([syncPath(stored.leafCount)]);
+    expect(transport.down).toEqual([idleBytes(stored.leafCount)]);
     expect(result.rowsAdded).toBe(0);
     const tampered = { ...stored, root: new Uint8Array(32) };
     expect(() => new RavenHowlSource({ transport, wasm, field: bigintField, snapshot: tampered })).toThrow(/root/);

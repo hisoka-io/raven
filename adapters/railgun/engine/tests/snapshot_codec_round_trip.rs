@@ -36,7 +36,7 @@ fn assert_same_bytes(got: &[u8], want: &[u8], what: &str) {
 /// stored field, so both values share one setup.
 #[test]
 fn snapshot_bytes_are_canonical_across_a_restore_under_both_variants() {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = raven_railgun_testkit::toy_db(ENTRIES, ENTRY_BYTES);
     let (base, _sk) =
         setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("setup_state");

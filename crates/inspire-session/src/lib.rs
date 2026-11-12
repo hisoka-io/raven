@@ -1,8 +1,8 @@
-//! Durable bounded server sessions for InsPIRe.
+//! Bounded server sessions for InsPIRe.
 //!
-//! The store keeps scheme-specific packing keys out of `raven-server`, reserves restart-safe
-//! external handles before issuing them, and reports mutations as typed observations. Metrics and
-//! operator namespaces remain the caller's policy.
+//! The store keeps scheme-specific packing keys out of `raven-server`, issues external handles
+//! drawn at random, so no caller can name another caller's seat, and reports mutations as typed
+//! observations. Metrics and operator namespaces remain the caller's policy.
 //!
 //! ```
 //! use raven_inspire_session::{BoundedSessionStore, SessionStoreLimits};
@@ -14,7 +14,6 @@
 #![deny(missing_docs)]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,33 +22,22 @@ use parking_lot::{Mutex, RwLock};
 use raven_inspire::inspiring::{ClientPackingKeys, PackParams};
 use raven_inspire::math::NttContext;
 use raven_inspire::{ClientSession, PackingKeySeat, ServerSessionHandle, ServerSessionStore};
-use raven_storage::{atomic_write, ExclusiveLock, PersistenceError, StoreLayout};
 use sha2::{Digest, Sha256};
 
 /// Session ceiling: wire registration is refused above it, and the in-process path
 /// reclaims a whole generation. A memory bound: a seat holds one ring polynomial per
-/// packing-key row at any gamma, 48 KiB for three rows at `d = 2048`, so a full store
-/// holds 48 MiB of keys.
+/// packing-key row at any gamma, 48 KiB for three rows at `d = 2048` and 32 KiB for the two
+/// of the approximate gadget, so a full store holds 48 MiB or 32 MiB of keys.
 pub const DEFAULT_MAX_SESSIONS: usize = 1024;
 
 /// Serviceable lifetime of a registered session.
 pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(3600);
 
-const HANDLE_FLOOR_FILE: &str = "session-handle-floor-v1.bin";
-const HANDLE_WITNESS_FILE: &str = "session-handle-issuance-v1.bin";
-const HANDLE_FLOOR_LOCK: &str = ".session-handle-floor.lock";
-const HANDLE_FLOOR_MAGIC: [u8; 8] = *b"RVNHNDL1";
-const HANDLE_WITNESS_MAGIC: [u8; 8] = *b"RVNHISS1";
-const HANDLE_FLOOR_VERSION: u16 = 1;
-const HANDLE_FLOOR_PREFIX_BYTES: usize = 18;
-const HANDLE_FLOOR_BYTES: usize = HANDLE_FLOOR_PREFIX_BYTES + 32;
-const HANDLE_RESERVATION_SIZE: u64 = 1024;
-
 /// Broad handling category for a typed [`SessionStoreError`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionStoreErrorClass {
-    /// Persistent allocator state could not prove non-reuse.
-    Durability,
+    /// The OS random source the handles are drawn from failed.
+    Entropy,
     /// InsPIRe rejected packing-key registration or client-handle installation.
     Inspire,
     /// Store limits cannot satisfy the requested operation.
@@ -79,147 +67,13 @@ pub enum SessionStoreError {
         /// Serviceable lifetime a resident session is counted for.
         ttl_secs: u64,
     },
-    /// The short reservation lock could not be acquired.
-    #[error("session handle floor lock failed under {}: {source}", data_dir.display())]
-    FloorLock {
-        /// Instance data directory.
-        data_dir: PathBuf,
-        /// Lock failure.
-        #[source]
-        source: PersistenceError,
-    },
-    /// The floor record could not be read.
-    #[error("session handle floor read failed at {}: {source}", path.display())]
-    FloorRead {
-        /// Floor file path.
-        path: PathBuf,
-        /// Read failure.
-        #[source]
-        source: std::io::Error,
-    },
-    /// Prior issuance evidence exists but the authoritative floor is missing.
+    /// The OS random source the handle key is drawn from failed.
     #[error(
-        "session handle floor missing at {} after {reason}; restore the floor from a trusted backup before serving handles",
-        path.display()
+        "session handle key: {detail}; refusing registration rather than issue guessable handles"
     )]
-    FloorMissing {
-        /// Missing floor path.
-        path: PathBuf,
-        /// Evidence that makes zero unsafe.
-        reason: &'static str,
-    },
-    /// A present floor is older than an independent issued-range witness.
-    #[error(
-        "session handle floor regressed at {}: found {observed}, required at least {required}; restore a current floor before serving handles",
-        path.display()
-    )]
-    FloorRegressed {
-        /// Floor file path.
-        path: PathBuf,
-        /// Observed floor value.
-        observed: u64,
-        /// Smallest safe floor value.
-        required: u64,
-    },
-    /// The fixed-width floor record was truncated or extended.
-    #[error(
-        "session handle floor at {} has {actual} bytes, expected {expected}; refusing startup because reuse cannot be excluded",
-        path.display()
-    )]
-    FloorLength {
-        /// Floor file path.
-        path: PathBuf,
-        /// Observed byte length.
-        actual: usize,
-        /// Required byte length.
-        expected: usize,
-    },
-    /// The floor record magic was not recognized.
-    #[error(
-        "session handle floor at {} has invalid magic; refusing startup because reuse cannot be excluded",
-        path.display()
-    )]
-    FloorMagic {
-        /// Floor file path.
-        path: PathBuf,
-    },
-    /// The floor record version is unsupported.
-    #[error(
-        "session handle floor at {} has version {actual}, expected {expected}; refusing startup",
-        path.display()
-    )]
-    FloorVersion {
-        /// Floor file path.
-        path: PathBuf,
-        /// Observed version.
-        actual: u16,
-        /// Supported version.
-        expected: u16,
-    },
-    /// A fixed-width field could not be recovered after length validation.
-    #[error("session handle floor at {} has an invalid {field} field", path.display())]
-    FloorField {
-        /// Floor file path.
-        path: PathBuf,
-        /// Field name.
-        field: &'static str,
-    },
-    /// The floor checksum did not match the prefix.
-    #[error(
-        "session handle floor checksum mismatch at {}; refusing startup because reuse cannot be excluded",
-        path.display()
-    )]
-    FloorChecksum {
-        /// Floor file path.
-        path: PathBuf,
-    },
-    /// Reserving another range would wrap the public handle namespace.
-    #[error("session handle floor exhausted at {next}; refusing registration to prevent reuse")]
-    FloorExhausted {
-        /// First value the failed range would issue.
-        next: u64,
-    },
-    /// The advanced floor could not be durably published.
-    #[error(
-        "session handle floor publish failed at {}: {source}; refusing registration because the reserved range is not durable",
-        path.display()
-    )]
-    FloorPublish {
-        /// Floor file path.
-        path: PathBuf,
-        /// Atomic write failure.
-        #[source]
-        source: std::io::Error,
-    },
-    /// The independent issued-range witness could not be validated.
-    #[error("session handle issuance witness invalid at {}: {source}", path.display())]
-    WitnessInvalid {
-        /// Witness file path.
-        path: PathBuf,
-        /// Record validation failure.
-        #[source]
-        source: Box<SessionStoreError>,
-    },
-    /// The independent issued-range witness could not be published.
-    #[error(
-        "session handle issuance witness publish failed at {}: {source}; refusing registration because the reserved range is not fully durable",
-        path.display()
-    )]
-    WitnessPublish {
-        /// Witness file path.
-        path: PathBuf,
-        /// Atomic write failure.
-        #[source]
-        source: std::io::Error,
-    },
-    /// The storage history signal could not be inspected.
-    #[error("session handle history probe failed at {}: {source}; refusing allocation", path.display())]
-    HistoryRead {
-        /// Manifest path.
-        path: PathBuf,
-        /// Probe failure.
-        #[source]
-        source: std::io::Error,
+    Entropy {
+        /// The entropy failure.
+        detail: String,
     },
     /// InsPIRe rejected a session operation.
     #[error("{operation}: {source}")]
@@ -252,20 +106,7 @@ impl SessionStoreError {
             Self::InvalidLimits { .. } | Self::AtCapacity { .. } => {
                 SessionStoreErrorClass::Configuration
             }
-            Self::FloorLock { .. }
-            | Self::FloorRead { .. }
-            | Self::FloorMissing { .. }
-            | Self::FloorRegressed { .. }
-            | Self::FloorLength { .. }
-            | Self::FloorMagic { .. }
-            | Self::FloorVersion { .. }
-            | Self::FloorField { .. }
-            | Self::FloorChecksum { .. }
-            | Self::FloorExhausted { .. }
-            | Self::FloorPublish { .. }
-            | Self::WitnessInvalid { .. }
-            | Self::WitnessPublish { .. }
-            | Self::HistoryRead { .. } => SessionStoreErrorClass::Durability,
+            Self::Entropy { .. } => SessionStoreErrorClass::Entropy,
             Self::Inspire { .. } | Self::ExpiryOverflow { .. } => SessionStoreErrorClass::Inspire,
             Self::HandleRejected { .. } => SessionStoreErrorClass::HandleRejected,
         }
@@ -278,20 +119,7 @@ impl SessionStoreError {
             Self::HandleRejected { detail } => Some(detail),
             Self::InvalidLimits { .. }
             | Self::AtCapacity { .. }
-            | Self::FloorLock { .. }
-            | Self::FloorRead { .. }
-            | Self::FloorMissing { .. }
-            | Self::FloorRegressed { .. }
-            | Self::FloorLength { .. }
-            | Self::FloorMagic { .. }
-            | Self::FloorVersion { .. }
-            | Self::FloorField { .. }
-            | Self::FloorChecksum { .. }
-            | Self::FloorExhausted { .. }
-            | Self::FloorPublish { .. }
-            | Self::WitnessInvalid { .. }
-            | Self::WitnessPublish { .. }
-            | Self::HistoryRead { .. }
+            | Self::Entropy { .. }
             | Self::Inspire { .. }
             | Self::ExpiryOverflow { .. } => None,
         }
@@ -408,191 +236,81 @@ impl Generation {
     }
 }
 
-#[derive(Debug)]
-struct DurableHandleAllocator {
-    data_dir: PathBuf,
-    next: AtomicU64,
-    end: AtomicU64,
-    refill: Mutex<()>,
+/// External handles: SHA-256 of a secret key and a counter, truncated to 64 bits. A handle
+/// says nothing about any other, so holding one names no other caller's seat, and a guess hits
+/// a live seat with odds of the live count over 2^64.
+struct RandomHandles {
+    stream: Mutex<HandleStream>,
 }
 
-impl DurableHandleAllocator {
-    fn open(data_dir: &Path) -> Result<Self> {
-        let (next, end) = reserve_handle_range(data_dir, None)?;
-        Ok(Self {
-            data_dir: data_dir.to_path_buf(),
-            next: AtomicU64::new(next),
-            end: AtomicU64::new(end),
-            refill: Mutex::new(()),
-        })
+struct HandleStream {
+    /// Drawn at the first registration, so building a store needs no entropy.
+    key: Option<[u8; 32]>,
+    counter: u64,
+    #[cfg(test)]
+    entropy_fails: bool,
+}
+
+impl std::fmt::Debug for RandomHandles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RandomHandles").finish_non_exhaustive()
+    }
+}
+
+impl RandomHandles {
+    fn new() -> Self {
+        Self {
+            stream: Mutex::new(HandleStream {
+                key: None,
+                counter: 0,
+                #[cfg(test)]
+                entropy_fails: false,
+            }),
+        }
     }
 
-    fn allocate(&self) -> Result<ServerSessionHandle> {
+    #[cfg(test)]
+    fn without_entropy() -> Self {
+        let handles = Self::new();
+        handles.stream.lock().entropy_fails = true;
+        handles
+    }
+
+    /// A handle no live binding of `taken` holds.
+    fn draw(&self, taken: &HashMap<u64, SessionEntry>) -> Result<ServerSessionHandle> {
+        let mut stream = self.stream.lock();
+        #[cfg(test)]
+        if stream.entropy_fails {
+            return Err(SessionStoreError::Entropy {
+                detail: "test source refused".to_owned(),
+            });
+        }
+        let key = if let Some(key) = stream.key {
+            key
+        } else {
+            let key =
+                raven_inspire::math::gaussian::os_seed("session handle key").map_err(|e| {
+                    SessionStoreError::Entropy {
+                        detail: e.to_string(),
+                    }
+                })?;
+            stream.key = Some(key);
+            key
+        };
         loop {
-            let end = self.end.load(Ordering::Acquire);
-            if let Ok(handle) =
-                self.next
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
-                        (next < end).then(|| next + 1)
-                    })
-            {
+            stream.counter = stream.counter.wrapping_add(1);
+            let mut hasher = Sha256::new();
+            hasher.update(key);
+            hasher.update(stream.counter.to_be_bytes());
+            let digest = hasher.finalize();
+            let mut word = [0u8; 8];
+            word.copy_from_slice(digest.get(..8).unwrap_or(&[0u8; 8]));
+            let handle = u64::from_be_bytes(word);
+            if !taken.contains_key(&handle) {
                 return Ok(ServerSessionHandle(handle));
             }
-
-            let _refill = self.refill.lock();
-            if self.next.load(Ordering::Acquire) >= self.end.load(Ordering::Acquire) {
-                let minimum_floor = self.end.load(Ordering::Acquire);
-                let (next, end) = reserve_handle_range(&self.data_dir, Some(minimum_floor))?;
-                self.next.store(next, Ordering::Release);
-                self.end.store(end, Ordering::Release);
-            }
         }
     }
-}
-
-fn reserve_handle_range(data_dir: &Path, minimum_floor: Option<u64>) -> Result<(u64, u64)> {
-    let _lock = ExclusiveLock::acquire(data_dir.join(HANDLE_FLOOR_LOCK)).map_err(|source| {
-        SessionStoreError::FloorLock {
-            data_dir: data_dir.to_path_buf(),
-            source,
-        }
-    })?;
-    let floor_path = data_dir.join(HANDLE_FLOOR_FILE);
-    let witness_path = data_dir.join(HANDLE_WITNESS_FILE);
-    let floor = read_handle_record(&floor_path, HANDLE_FLOOR_MAGIC)?;
-    let witness = read_handle_record(&witness_path, HANDLE_WITNESS_MAGIC).map_err(|source| {
-        SessionStoreError::WitnessInvalid {
-            path: witness_path.clone(),
-            source: Box::new(source),
-        }
-    })?;
-    let next = if let Some(floor) = floor {
-        let required = witness.unwrap_or(0).max(minimum_floor.unwrap_or(0));
-        if floor < required {
-            return Err(SessionStoreError::FloorRegressed {
-                path: floor_path,
-                observed: floor,
-                required,
-            });
-        }
-        floor
-    } else {
-        if witness.is_some() || minimum_floor.is_some() {
-            return Err(SessionStoreError::FloorMissing {
-                path: floor_path,
-                reason: "a prior reserved range",
-            });
-        }
-        let manifest_path = StoreLayout::inspect(data_dir).manifest_path();
-        match std::fs::metadata(&manifest_path) {
-            Ok(_) => {
-                return Err(SessionStoreError::FloorMissing {
-                    path: floor_path,
-                    reason: "a persisted instance manifest",
-                });
-            }
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(source) => {
-                return Err(SessionStoreError::HistoryRead {
-                    path: manifest_path,
-                    source,
-                });
-            }
-        }
-    };
-    let end = next
-        .checked_add(HANDLE_RESERVATION_SIZE)
-        .ok_or(SessionStoreError::FloorExhausted { next })?;
-    let floor_bytes = encode_handle_record(end, HANDLE_FLOOR_MAGIC);
-    atomic_write(&floor_path, &floor_bytes).map_err(|source| SessionStoreError::FloorPublish {
-        path: floor_path,
-        source,
-    })?;
-    let witness_bytes = encode_handle_record(end, HANDLE_WITNESS_MAGIC);
-    atomic_write(&witness_path, &witness_bytes).map_err(|source| {
-        SessionStoreError::WitnessPublish {
-            path: witness_path,
-            source,
-        }
-    })?;
-    Ok((next, end))
-}
-
-fn read_handle_record(path: &Path, magic: [u8; 8]) -> Result<Option<u64>> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(SessionStoreError::FloorRead {
-                path: path.to_path_buf(),
-                source,
-            })
-        }
-    };
-    if bytes.len() != HANDLE_FLOOR_BYTES {
-        return Err(SessionStoreError::FloorLength {
-            path: path.to_path_buf(),
-            actual: bytes.len(),
-            expected: HANDLE_FLOOR_BYTES,
-        });
-    }
-    if bytes.get(..8) != Some(magic.as_slice()) {
-        return Err(SessionStoreError::FloorMagic {
-            path: path.to_path_buf(),
-        });
-    }
-    let version_bytes: [u8; 2] = bytes
-        .get(8..10)
-        .and_then(|field| field.try_into().ok())
-        .ok_or_else(|| SessionStoreError::FloorField {
-            path: path.to_path_buf(),
-            field: "version",
-        })?;
-    let version = u16::from_be_bytes(version_bytes);
-    if version != HANDLE_FLOOR_VERSION {
-        return Err(SessionStoreError::FloorVersion {
-            path: path.to_path_buf(),
-            actual: version,
-            expected: HANDLE_FLOOR_VERSION,
-        });
-    }
-    let prefix =
-        bytes
-            .get(..HANDLE_FLOOR_PREFIX_BYTES)
-            .ok_or_else(|| SessionStoreError::FloorField {
-                path: path.to_path_buf(),
-                field: "checksum prefix",
-            })?;
-    let stored_checksum =
-        bytes
-            .get(HANDLE_FLOOR_PREFIX_BYTES..)
-            .ok_or_else(|| SessionStoreError::FloorField {
-                path: path.to_path_buf(),
-                field: "checksum",
-            })?;
-    if Sha256::digest(prefix).as_slice() != stored_checksum {
-        return Err(SessionStoreError::FloorChecksum {
-            path: path.to_path_buf(),
-        });
-    }
-    let floor_bytes: [u8; 8] = bytes
-        .get(10..18)
-        .and_then(|field| field.try_into().ok())
-        .ok_or_else(|| SessionStoreError::FloorField {
-            path: path.to_path_buf(),
-            field: "floor",
-        })?;
-    Ok(Some(u64::from_be_bytes(floor_bytes)))
-}
-
-fn encode_handle_record(floor: u64, magic: [u8; 8]) -> [u8; HANDLE_FLOOR_BYTES] {
-    let mut bytes = [0u8; HANDLE_FLOOR_BYTES];
-    bytes[..8].copy_from_slice(&magic);
-    bytes[8..10].copy_from_slice(&HANDLE_FLOOR_VERSION.to_be_bytes());
-    bytes[10..18].copy_from_slice(&floor.to_be_bytes());
-    let checksum = Sha256::digest(&bytes[..HANDLE_FLOOR_PREFIX_BYTES]);
-    bytes[HANDLE_FLOOR_PREFIX_BYTES..].copy_from_slice(&checksum);
-    bytes
 }
 
 /// A seat counted against the ceiling while its keys are checked outside the store lock.
@@ -620,7 +338,7 @@ impl Drop for SeatReservation<'_> {
     }
 }
 
-/// Occupancy-bounded session store with optional restart-safe external handles.
+/// Occupancy-bounded session store with random external handles.
 ///
 /// In-process reclamation replaces a whole generation. A resolved request retains an `Arc` to its
 /// generation, so an in-flight response can finish while every later request rejects its retired
@@ -632,7 +350,7 @@ pub struct BoundedSessionStore {
     /// Wire registrations admitted but not yet seated. Changed and read only under
     /// `current`'s write lock, so admission counts it exactly.
     pending_seats: AtomicUsize,
-    durable_handles: Option<Arc<DurableHandleAllocator>>,
+    handles: Arc<RandomHandles>,
     evicted_total: AtomicU64,
     flushes_total: AtomicU64,
     observation_sequence: Arc<AtomicU64>,
@@ -671,50 +389,35 @@ impl BoundedSessionStore {
             limits,
             current: RwLock::new(Generation::fresh()),
             pending_seats: AtomicUsize::new(0),
-            durable_handles: None,
+            handles: Arc::new(RandomHandles::new()),
             evicted_total: AtomicU64::new(0),
             flushes_total: AtomicU64::new(0),
             observation_sequence: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Open an empty store whose external handles do not repeat while durable history survives.
+    /// A store with its limits checked up front.
+    ///
+    /// The store keeps nothing on disk: a random handle repeats across a restart only by a
+    /// 64-bit collision, so no issuance history has to survive one. A data directory written by
+    /// an earlier build that kept a handle floor there is never read.
     ///
     /// # Errors
     ///
-    /// Returns a typed durability error when the floor cannot be locked, validated, advanced, or
-    /// atomically published.
-    pub fn open(data_dir: &Path) -> Result<Self> {
-        Self::open_with_limits(data_dir, SessionStoreLimits::default())
-    }
-
-    /// Open a store with caller-selected limits and the same durable-history requirement.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed durability error when the floor cannot be locked, validated, advanced, or
-    /// atomically published.
-    pub fn open_with_limits(data_dir: &Path, limits: SessionStoreLimits) -> Result<Self> {
+    /// [`SessionStoreError::InvalidLimits`] when `limits` admits no session.
+    pub fn open_with_limits(limits: SessionStoreLimits) -> Result<Self> {
         Self::validate_registration_limits(limits)?;
-        Ok(Self {
-            limits,
-            current: RwLock::new(Generation::fresh()),
-            pending_seats: AtomicUsize::new(0),
-            durable_handles: Some(Arc::new(DurableHandleAllocator::open(data_dir)?)),
-            evicted_total: AtomicU64::new(0),
-            flushes_total: AtomicU64::new(0),
-            observation_sequence: Arc::new(AtomicU64::new(0)),
-        })
+        Ok(Self::with_limits(limits))
     }
 
-    /// Build an empty generation retaining the same limits and durable allocator.
+    /// Build an empty generation retaining the same limits and handle stream.
     #[must_use]
     pub fn empty_successor(&self) -> Self {
         Self {
             limits: self.limits,
             current: RwLock::new(Generation::fresh()),
             pending_seats: AtomicUsize::new(0),
-            durable_handles: self.durable_handles.clone(),
+            handles: Arc::clone(&self.handles),
             evicted_total: AtomicU64::new(0),
             flushes_total: AtomicU64::new(0),
             observation_sequence: Arc::clone(&self.observation_sequence),
@@ -800,32 +503,24 @@ impl BoundedSessionStore {
             self.pending_seats.store(pending + 1, Ordering::Relaxed);
             SeatReservation { owner: Some(self) }
         };
-        // The key transforms and a floor refill run unlocked: a refill is two synced writes,
-        // and under the lock it would stall every query's resolve.
-        let prepared = PackingKeySeat::from_wire(keys, pack_params, context)
-            .map_err(|source| SessionStoreError::Inspire {
+        // The key transforms run unlocked: under the lock they would stall every query's resolve.
+        let prepared = PackingKeySeat::from_wire(keys, pack_params, context).map_err(|source| {
+            SessionStoreError::Inspire {
                 operation: "session register_server_side",
                 source: Box::new(source),
-            })
-            .and_then(|seat| {
-                let external = self
-                    .durable_handles
-                    .as_ref()
-                    .map(|allocator| allocator.allocate())
-                    .transpose()?;
-                Ok((seat, external))
-            });
+            }
+        });
         let mut generation = self.current.write();
         seat.release(&mut generation);
         let outcome =
-            prepared.and_then(|(seat, external)| {
+            prepared.and_then(|seat| {
+                let handle = self.handles.draw(&generation.expiry)?;
                 let inner = generation.store.register(seat).map_err(|source| {
                     SessionStoreError::Inspire {
                         operation: "session register_server_side",
                         source: Box::new(source),
                     }
                 })?;
-                let handle = external.unwrap_or(inner);
                 generation
                     .expiry
                     .insert(handle.0, SessionEntry { inner, expires_at });
@@ -863,11 +558,7 @@ impl BoundedSessionStore {
         };
         if Self::would_flush_after_sweep(&generation, now, ceiling) {
             let outcome = (|| {
-                let external = self
-                    .durable_handles
-                    .as_ref()
-                    .map(|allocator| allocator.allocate())
-                    .transpose()?;
+                let external = self.handles.draw(&generation.expiry)?;
                 let replacement = Arc::new(ServerSessionStore::new());
                 let inner = session
                     .register_with(replacement.as_ref())
@@ -875,8 +566,8 @@ impl BoundedSessionStore {
                         operation: "session register",
                         source: Box::new(source),
                     })?;
-                let binding = match (inner, external) {
-                    (Some(inner), Some(external)) => {
+                let binding = match inner {
+                    Some(inner) => {
                         session
                             .install_server_session_handle(external)
                             .map_err(|source| SessionStoreError::Inspire {
@@ -885,8 +576,7 @@ impl BoundedSessionStore {
                             })?;
                         Some((external, inner))
                     }
-                    (Some(inner), None) => Some((inner, inner)),
-                    (None, Some(_) | None) => None,
+                    None => None,
                 };
                 if let Some((external, inner)) = binding {
                     self.make_room(&mut generation, now, &mut observation, &mut warnings);
@@ -907,19 +597,15 @@ impl BoundedSessionStore {
         }
         self.make_room(&mut generation, now, &mut observation, &mut warnings);
         let outcome = (|| {
-            let external = self
-                .durable_handles
-                .as_ref()
-                .map(|allocator| allocator.allocate())
-                .transpose()?;
+            let external = self.handles.draw(&generation.expiry)?;
             let inner = session
                 .register_with(generation.store.as_ref())
                 .map_err(|source| SessionStoreError::Inspire {
                     operation: "session register",
                     source: Box::new(source),
                 })?;
-            let binding = match (inner, external) {
-                (Some(inner), Some(external)) => {
+            let binding = match inner {
+                Some(inner) => {
                     if let Err(source) = session.install_server_session_handle(external) {
                         if let Err(source) = generation.store.remove(inner) {
                             warnings.push(SessionWarning::RemovalFailed {
@@ -934,8 +620,7 @@ impl BoundedSessionStore {
                     }
                     Some((external, inner))
                 }
-                (Some(inner), None) => Some((inner, inner)),
-                (None, Some(_) | None) => None,
+                None => None,
             };
             if let Some((external, inner)) = binding {
                 generation
@@ -1245,7 +930,19 @@ mod tests {
         PackParams,
         raven_inspire::math::NttContext,
     ) {
-        let params = InspireParams::secure_128_d2048();
+        registration_material_for(&InspireParams::d2048(), gamma, seed)
+    }
+
+    fn registration_material_for(
+        params: &InspireParams,
+        gamma: usize,
+        seed: u64,
+    ) -> (
+        ClientPackingKeys,
+        PackParams,
+        raven_inspire::math::NttContext,
+    ) {
+        let params = params.clone();
         let mut sampler = GaussianSampler::with_seed(params.sigma, seed);
         let secret_key = RlweSecretKey::generate(&params, &mut sampler);
         let pack_params = PackParams::try_new(&params, gamma).expect("pack params");
@@ -1506,7 +1203,7 @@ mod tests {
 
     #[test]
     fn zero_cap_refuses_registration_before_allocating_or_mutating() {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let database = vec![0u8; params.ring_dim * 32];
         let mut sampler = GaussianSampler::with_seed(params.sigma, 91);
         let (crs, _server_key, secret_key) =
@@ -1651,30 +1348,19 @@ mod tests {
 
     #[test]
     fn refused_client_registration_at_capacity_preserves_the_live_session() {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let database = vec![0u8; params.ring_dim * 32];
         let mut sampler = GaussianSampler::with_seed(params.sigma, 119);
         let (crs, _encoded, secret_key) =
             setup(&params, &database, 32, &mut sampler).expect("setup");
         let mut client = ClientSession::new(crs, secret_key, &mut sampler).expect("client session");
-        let directory = tempfile::tempdir().expect("temporary floor directory");
-        let store = BoundedSessionStore::open_with_limits(
-            directory.path(),
-            SessionStoreLimits {
-                max_sessions: 1,
-                ttl: Duration::from_secs(3600),
-            },
-        )
-        .expect("durable store");
+        let mut store = BoundedSessionStore::with_limits(SessionStoreLimits {
+            max_sessions: 1,
+            ttl: Duration::from_secs(3600),
+        });
         let now = Instant::now();
         let first = register(&store, now).0;
-        let allocator = store.durable_handles.as_ref().expect("durable allocator");
-        allocator.next.store(
-            allocator.end.load(std::sync::atomic::Ordering::Acquire),
-            std::sync::atomic::Ordering::Release,
-        );
-        std::fs::write(directory.path().join(super::HANDLE_FLOOR_FILE), b"bad")
-            .expect("corrupt floor");
+        store.handles = Arc::new(super::RandomHandles::without_entropy());
 
         let (outcome, observation, warnings) = store
             .register_client_session_at(&mut client, now)
@@ -1682,7 +1368,7 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            Err(super::SessionStoreError::FloorLength { .. })
+            Err(super::SessionStoreError::Entropy { .. })
         ));
         assert!(warnings.is_empty());
         assert_eq!(observation.evictions, super::SessionEvictions::default());
@@ -1754,81 +1440,26 @@ mod tests {
         assert_eq!(held.num_to_pack(), 64);
     }
 
-    // A registration parked on the handle-floor refill, the slow step of its unlocked section,
-    // must leave the store lock free for a query's resolve.
-    #[test]
-    fn a_registration_waiting_on_a_floor_refill_does_not_hold_up_resolve() {
-        use std::sync::atomic::Ordering;
-        use std::sync::mpsc;
-
-        let (keys, pack_params, context) = real_registration_material();
-        let directory = tempfile::tempdir().expect("temporary floor directory");
-        let store = BoundedSessionStore::open_with_limits(
-            directory.path(),
-            SessionStoreLimits {
-                max_sessions: 4,
-                ttl: Duration::from_secs(3600),
-            },
-        )
-        .expect("durable store");
-        let now = Instant::now();
-        let resident = store
-            .register_server_side_at(keys.clone(), &pack_params, &context, now)
-            .outcome
-            .expect("resident session");
-
-        let allocator = Arc::clone(store.durable_handles.as_ref().expect("durable handles"));
-        // Spend the reserved range, so the next registration has to refill, and hold the
-        // refill so it parks there.
-        allocator
-            .next
-            .store(allocator.end.load(Ordering::Acquire), Ordering::Release);
-        let refill = allocator.refill.lock();
-
-        let (resolved_tx, resolved_rx) = mpsc::channel();
-        let (resolved, registered) = std::thread::scope(|scope| {
-            let registration = scope.spawn(|| {
-                store
-                    .register_server_side_at(keys.clone(), &pack_params, &context, now)
-                    .outcome
-            });
-            while store.pending_seats.load(Ordering::Relaxed) == 0 {
-                std::thread::yield_now();
-            }
-            scope.spawn(|| {
-                let seated = store.resolve(Some(resident), now).is_ok();
-                let inline = store.resolve(None, now).is_ok();
-                let _ = resolved_tx.send(seated && inline);
-            });
-            // Only a held lock reaches this bound; a free one answers in microseconds.
-            let resolved = resolved_rx.recv_timeout(Duration::from_secs(20));
-            let still_parked = !registration.is_finished();
-            drop(refill);
-            (
-                resolved.map(|ok| (ok, still_parked)),
-                registration.join().expect("registration thread"),
-            )
-        });
-
-        assert_eq!(
-            resolved,
-            Ok((true, true)),
-            "resolve must finish while the registration is still parked on the refill"
-        );
-        let handle = registered.expect("the parked registration seats once the refill is free");
-        assert!(store.resolve(Some(handle), now).is_ok());
-        assert_eq!(store.pending_seats.load(Ordering::Relaxed), 0);
-        assert_eq!(store.len(), 2);
-    }
-
     // A seat's size is what the session ceiling budgets, at every packing width.
     #[test]
     fn a_seat_holds_one_polynomial_per_key_row_at_every_width() {
-        let params = InspireParams::secure_128_d2048();
-        let rows = params.packing_key_rows();
-        assert_eq!(rows, 3);
+        for (params, rows, payload, resident_ceiling) in [
+            (InspireParams::d2048(), 3, 49_152, 49_664),
+            (InspireParams::d2048_approximate_gadget(), 2, 32_768, 33_280),
+        ] {
+            assert_eq!(params.packing_key_rows(), rows);
+            seats_hold_their_rows(&params, rows, payload, resident_ceiling);
+        }
+    }
+
+    fn seats_hold_their_rows(
+        params: &InspireParams,
+        rows: usize,
+        payload: usize,
+        resident_ceiling: usize,
+    ) {
         for gamma in [16, 128, 256] {
-            let (keys, pack_params, context) = registration_material(gamma, 131);
+            let (keys, pack_params, context) = registration_material_for(params, gamma, 131);
             let store = store(2);
             let handle = store
                 .register_server_side_at(keys, &pack_params, &context, Instant::now())
@@ -1842,9 +1473,9 @@ mod tests {
                 .expect("store")
                 .expect("seat");
             assert_eq!(seat.payload_bytes(), rows * params.ring_dim * 8);
-            assert_eq!(seat.payload_bytes(), 49_152, "gamma {gamma}");
+            assert_eq!(seat.payload_bytes(), payload, "gamma {gamma}");
             assert!(
-                seat.resident_bytes() <= 49_664,
+                seat.resident_bytes() <= resident_ceiling,
                 "gamma {gamma}: {} bytes resident",
                 seat.resident_bytes()
             );
@@ -1865,7 +1496,7 @@ mod tests {
 
     #[test]
     fn an_in_process_registration_leaves_room_for_a_wire_registration_in_flight() {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let database = vec![0u8; params.ring_dim * 32];
         let mut sampler = GaussianSampler::with_seed(params.sigma, 123);
         let (crs, _encoded, secret_key) =
@@ -1906,7 +1537,7 @@ mod tests {
 
     #[test]
     fn an_in_process_registration_is_refused_while_wire_registrations_hold_every_seat() {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let database = vec![0u8; params.ring_dim * 32];
         let mut sampler = GaussianSampler::with_seed(params.sigma, 123);
         let (crs, _encoded, secret_key) =
@@ -1940,43 +1571,112 @@ mod tests {
         assert_eq!(store.len(), 0);
     }
 
-    #[test]
-    fn missing_floor_after_issue_refuses_restart_and_refill() {
-        let directory = tempfile::tempdir().expect("temporary floor directory");
-        let allocator = super::DurableHandleAllocator::open(directory.path()).expect("first open");
-        assert_eq!(allocator.allocate().expect("first issue").0, 0);
-        std::fs::remove_file(directory.path().join(super::HANDLE_FLOOR_FILE))
-            .expect("remove floor only");
-
-        let restart = super::DurableHandleAllocator::open(directory.path())
-            .expect_err("lost floor must refuse restart");
-        assert_eq!(restart.class(), super::SessionStoreErrorClass::Durability);
-
-        for expected in 1..super::HANDLE_RESERVATION_SIZE {
-            assert_eq!(allocator.allocate().expect("reserved issue").0, expected);
-        }
-        let refill = allocator
-            .allocate()
-            .expect_err("lost floor must refuse refill");
-        assert_eq!(refill.class(), super::SessionStoreErrorClass::Durability);
+    /// The old allocator's handles, for the control: consecutive from a floor.
+    fn sequential(count: u64) -> Vec<u64> {
+        (1024..1024 + count).collect()
     }
 
-    #[test]
-    fn deleting_both_files_during_a_live_allocator_cannot_rewind_refill() {
-        let directory = tempfile::tempdir().expect("temporary floor directory");
-        let allocator = super::DurableHandleAllocator::open(directory.path()).expect("first open");
-        assert_eq!(allocator.allocate().expect("first issue").0, 0);
-        std::fs::remove_file(directory.path().join(super::HANDLE_FLOOR_FILE))
-            .expect("remove floor");
-        std::fs::remove_file(directory.path().join("session-handle-issuance-v1.bin"))
-            .expect("remove witness");
-        for expected in 1..super::HANDLE_RESERVATION_SIZE {
-            assert_eq!(allocator.allocate().expect("reserved issue").0, expected);
-        }
+    /// Handles a stranger could enumerate: any two within 2^20 of each other, or all below 2^32.
+    fn enumerable(handles: &[u64]) -> bool {
+        let mut sorted = handles.to_vec();
+        sorted.sort_unstable();
+        sorted.windows(2).any(|pair| pair[1] - pair[0] < 1 << 20)
+            || handles.iter().all(|handle| *handle < 1 << 32)
+    }
 
-        let error = allocator
-            .allocate()
-            .expect_err("live refill cannot restart at zero");
-        assert_eq!(error.class(), super::SessionStoreErrorClass::Durability);
+    /// Wire handles are drawn at random: distinct, nowhere near each other, using the whole
+    /// 64-bit space. The predicate flags the sequential handles a floor allocator issued.
+    #[test]
+    fn wire_handles_are_unguessable() {
+        assert!(
+            enumerable(&sequential(64)),
+            "control: the predicate must flag a counter"
+        );
+        let (keys, pack_params, context) = real_registration_material();
+        let store = store(64);
+        let now = Instant::now();
+        let handles: Vec<u64> = (0..64)
+            .map(|_| {
+                store
+                    .register_server_side_at(keys.clone(), &pack_params, &context, now)
+                    .outcome
+                    .expect("seat")
+                    .0
+            })
+            .collect();
+        assert!(!enumerable(&handles), "{handles:?}");
+        let ones: u32 = handles.iter().map(|handle| handle.count_ones()).sum();
+        // 64 handles of 64 fair bits: 2,048 ones expected, sd 32.
+        assert!((1_848..=2_248).contains(&ones), "{ones} set bits");
+    }
+
+    /// Two stores opened one after the other, as across a restart, issue unrelated handles.
+    #[test]
+    fn a_restart_issues_unrelated_handles() {
+        let (keys, pack_params, context) = real_registration_material();
+        let mut issued = Vec::new();
+        for _ in 0..2 {
+            let store = BoundedSessionStore::open_with_limits(SessionStoreLimits {
+                max_sessions: 8,
+                ttl: Duration::from_secs(3600),
+            })
+            .expect("open");
+            for _ in 0..8 {
+                issued.push(
+                    store
+                        .register_server_side_at(
+                            keys.clone(),
+                            &pack_params,
+                            &context,
+                            Instant::now(),
+                        )
+                        .outcome
+                        .expect("seat")
+                        .0,
+                );
+            }
+        }
+        assert!(!enumerable(&issued), "{issued:?}");
+    }
+
+    /// A guessed handle neither resolves nor renews: the victim's seat lapses on its own TTL
+    /// while strangers try its neighbours. Control: the victim's own use renews it.
+    #[test]
+    fn a_guessed_handle_cannot_use_or_renew_another_seat() {
+        let (keys, pack_params, context) = real_registration_material();
+        let ttl = Duration::from_secs(10);
+        for victim_renews in [false, true] {
+            let store = BoundedSessionStore::with_limits(SessionStoreLimits {
+                max_sessions: 4,
+                ttl,
+            });
+            let start = Instant::now();
+            let victim = store
+                .register_server_side_at(keys.clone(), &pack_params, &context, start)
+                .outcome
+                .expect("victim seat");
+            let later = start + Duration::from_secs(9);
+            let guesses = (1..=512u64)
+                .flat_map(|delta| [victim.0.wrapping_add(delta), victim.0.wrapping_sub(delta)])
+                .chain((0..512u64).map(|bit| victim.0 ^ (1 << (bit % 64))))
+                .chain(0..512u64)
+                .filter(|guess| *guess != victim.0);
+            for guess in guesses {
+                assert!(store
+                    .resolve_renewing(ServerSessionHandle(guess), later)
+                    .is_err());
+                assert!(store
+                    .resolve(Some(ServerSessionHandle(guess)), later)
+                    .is_err());
+            }
+            if victim_renews {
+                store.resolve_renewing(victim, later).expect("own use");
+            }
+            assert_eq!(
+                store.resolve(Some(victim), start + ttl).is_ok(),
+                victim_renews,
+                "renewed by its own use: {victim_renews}"
+            );
+        }
     }
 }

@@ -7,9 +7,12 @@
 #![deny(missing_docs)]
 
 pub mod chain;
+pub mod check;
 pub mod engine;
 pub mod follow;
+pub mod fresh;
 pub mod http;
+pub mod limit;
 mod single;
 
 use std::path::PathBuf;
@@ -50,7 +53,7 @@ pub struct NodeConfig {
     pub pool: [u8; 20],
     /// Block the pool was deployed in.
     pub deployment_block: u64,
-    /// Blocks one chain read covers at most.
+    /// Blocks one logs read asks for at most; a read the endpoint refuses is halved.
     pub max_range: u64,
     /// Seats for sessions, and how long one lives after its last use.
     pub sessions: SessionStoreLimits,
@@ -74,14 +77,44 @@ impl NodeConfig {
     }
 }
 
+/// Settings whose defaults suit most deployments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tuning {
+    /// The walk depth, at least 1: see [`follow::WALK_BLOCKS`].
+    pub walk_blocks: u64,
+    /// Threads that answer set-2 queries, shared by every batch in flight.
+    pub respond_threads: usize,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            walk_blocks: follow::WALK_BLOCKS,
+            respond_threads: std::thread::available_parallelism().map_or(1, usize::from),
+        }
+    }
+}
+
+/// [`open_with`] under the default [`Tuning`].
+///
+/// # Errors
+/// As [`open_with`].
+pub fn open<C: Chain>(
+    config: &NodeConfig,
+    chain: C,
+) -> Result<(Follower<C>, Arc<Engine>), StartError> {
+    open_with(config, chain, Tuning::default())
+}
+
 /// Open the table and the engine, publish the table as it stands, and return the follower
 /// that keeps it current.
 ///
 /// # Errors
 /// [`StartError`] when the table, the key material or the resume point is unusable.
-pub fn open<C: Chain>(
+pub fn open_with<C: Chain>(
     config: &NodeConfig,
     chain: C,
+    tuning: Tuning,
 ) -> Result<(Follower<C>, Arc<Engine>), StartError> {
     let store = NoteStore::open(config.data_dir.join("table"), config.chain_id, config.pool)?;
     let pir = Pir::open(
@@ -89,14 +122,21 @@ pub fn open<C: Chain>(
         config.param_set,
         config.sessions,
         config.seed,
+        tuning.respond_threads,
     )?;
-    let follower = Follower::new(chain, store, config.indexer(), config.max_range)?;
+    let follower = Follower::new(
+        chain,
+        store,
+        config.indexer(),
+        config.max_range,
+        tuning.walk_blocks,
+    )?;
     let engine = Arc::new(Engine::new(pir));
     engine.refresh(follower.store(), follower.upper(), 0)?;
     Ok((follower, engine))
 }
 
-/// Apply one step's outcome to the served view.
+/// Apply one step's outcome to the served view, and record how current it leaves the view.
 ///
 /// # Errors
 /// [`EngineError`] when the view cannot be rebuilt; the previous view stays served.
@@ -107,31 +147,45 @@ pub fn publish<C: Chain>(
 ) -> Result<(), EngineError> {
     match step {
         Step::Read { leaves, .. } | Step::Rewound { leaves, .. } => {
-            engine.refresh(follower.store(), follower.upper(), leaves.start)
+            engine.refresh(follower.store(), follower.upper(), leaves.start)?;
         }
         // A refresh that failed is retried with the range it was asked for.
         Step::Idle { .. } | Step::Moved if engine.unpublished() => {
-            engine.refresh(follower.store(), follower.upper(), u64::MAX)
+            engine.refresh(follower.store(), follower.upper(), u64::MAX)?;
         }
-        Step::Idle { .. } | Step::Moved => Ok(()),
+        Step::Idle { .. } | Step::Moved => {}
+    }
+    let head = follower.head_seen();
+    engine
+        .freshness()
+        .stepped(Instant::now(), head, at_head(step, head));
+    Ok(())
+}
+
+/// Whether `step` left the table at `head`, the head it read.
+fn at_head(step: &Step, head: Option<u64>) -> bool {
+    match step {
+        Step::Idle { .. } => true,
+        Step::Read { block, .. } => head.is_some_and(|head| *block >= head),
+        Step::Rewound { .. } | Step::Moved => false,
     }
 }
 
-/// Follow the chain until `stop` is set: a step every `poll` while at the head, back to back
-/// while behind. Runs on the calling thread.
+/// Follow the chain until `stop` is set: back to back while behind the head, and a step every
+/// `poll` once at it, so a chain that makes blocks faster than `poll` is read once per `poll`.
+/// Runs on the calling thread.
+///
+/// # Errors
+/// When the follower's runtime cannot start; nothing is followed then.
 pub fn follow_until<C: Chain>(
     mut follower: Follower<C>,
     engine: &Engine,
     poll: Duration,
     stop: &AtomicBool,
-) {
-    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+) -> std::io::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()
-    else {
-        tracing::error!("could not start the follower's runtime");
-        return;
-    };
+        .build()?;
     let mut swept = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         let wait = match runtime.block_on(follower.step()) {
@@ -139,15 +193,21 @@ pub fn follow_until<C: Chain>(
                 if let Err(e) = publish(&follower, engine, &step) {
                     tracing::error!(error = %e, "publishing the table failed");
                 }
+                let current = at_head(&step, follower.head_seen());
                 match step {
                     Step::Read { leaves, block } => {
-                        tracing::info!(
-                            block,
-                            leaves = leaves.end,
-                            added = leaves.end - leaves.start,
-                            "read"
-                        );
-                        Duration::ZERO
+                        let added = leaves.end - leaves.start;
+                        if current {
+                            if added > 0 {
+                                tracing::info!(block, leaves = leaves.end, added, "read");
+                            } else {
+                                tracing::debug!(block, "read");
+                            }
+                            poll
+                        } else {
+                            tracing::info!(block, leaves = leaves.end, added, "read");
+                            Duration::ZERO
+                        }
                     }
                     Step::Rewound { leaves, block } => {
                         tracing::warn!(
@@ -161,6 +221,7 @@ pub fn follow_until<C: Chain>(
                 }
             }
             Err(e) => {
+                engine.freshness().failed();
                 tracing::warn!(error = %e, "follow step failed; retrying");
                 poll
             }
@@ -171,6 +232,7 @@ pub fn follow_until<C: Chain>(
         }
         std::thread::sleep(wait);
     }
+    Ok(())
 }
 
 /// Stop flag shared between the follower thread and whoever shuts it down.

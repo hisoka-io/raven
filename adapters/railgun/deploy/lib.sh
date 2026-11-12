@@ -18,13 +18,21 @@ FORBIDDEN_ENV=(RAVEN_PROFILE_RESPOND)
 # and a packing store of the same size. An eighth, still empty block settled a warm boot 9 MiB
 # higher, its 3 s samples peaking at 2,343 MiB against 2,363 for seven. The peak here is the
 # measured maximum of five plus 421 MiB (about 10 %). A packing-key seat holds three ring
-# polynomials of 16 KiB at any row size, 49 KiB with its containers. Headroom covers the queries
-# in flight.
+# polynomials of 16 KiB at any row size, 49 KiB with its containers; the approximate gadget drops
+# one, measured at 35.96 KiB. Headroom covers the queries in flight.
 NODE_PEAK_MIB=4400
-SEAT_KIB=49
 HEADROOM_MIB=1024
 
 die() { echo "error: $*" >&2; exit 1; }
+
+# One switch for the served parameter set and the seat size it implies; render_config writes it.
+APPROXIMATE_PACKING_GADGET=${RAVEN_APPROXIMATE_PACKING_GADGET:-false}
+case $APPROXIMATE_PACKING_GADGET in
+  false) SEAT_KIB=49 ;;
+  true) SEAT_KIB=36 ;;
+  *) die "RAVEN_APPROXIMATE_PACKING_GADGET must be true or false, not '$APPROXIMATE_PACKING_GADGET'" ;;
+esac
+
 say() { echo "== $*"; }
 
 # A tag can be moved to other bytes; a digest cannot.
@@ -104,6 +112,12 @@ render_config() {  # image mirror_endpoint(empty keeps the template's) trusted_c
   else
     cfg=$(replace_one "$cfg" '^[[]global[]]$' "[global]
 max_sessions_per_instance = $seats") || return 1
+  fi
+  if [[ $APPROXIMATE_PACKING_GADGET == true ]]; then
+    ! grep -qE '^approximate_packing_gadget *=' <<<"$cfg" \
+      || { echo "error: config template sets approximate_packing_gadget itself" >&2; return 1; }
+    cfg=$(replace_one "$cfg" '^[[]global[]]$' "[global]
+approximate_packing_gadget = true") || return 1
   fi
   if [[ -n $endpoint ]]; then
     cfg=$(replace_one "$cfg" '^mirror_endpoint = "[^"]*"$' "mirror_endpoint = \"$endpoint\"") || return 1

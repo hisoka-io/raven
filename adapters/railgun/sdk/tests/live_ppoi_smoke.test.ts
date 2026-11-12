@@ -70,7 +70,7 @@ import {
   type MockList,
 } from "./helpers/prefix_channel";
 import { shardConfigBincode } from "./helpers/shard_config";
-import { EXPECTED_WIRE_SCHEMA_VERSION } from "./helpers/wire_schema";
+import { EXPECTED_SPOKEN_SCHEMAS, EXPECTED_WIRE_SCHEMA_VERSION } from "./helpers/wire_schema";
 
 const liveIt = LIVE_URL !== undefined && LIVE_AGGREGATOR !== undefined ? it : it.skip;
 
@@ -389,15 +389,15 @@ describe("PPOI acceptance smoke against a local node and aggregator", () => {
 
   it("refuses a node on another wire schema before asking the aggregator anything", async () => {
     await expect(smoke({ schema: EXPECTED_WIRE_SCHEMA_VERSION - 1 })).rejects.toThrow(
-      `envelope is wire schema ${EXPECTED_WIRE_SCHEMA_VERSION - 1}, this client speaks ${EXPECTED_WIRE_SCHEMA_VERSION}`,
+      `envelope is wire schema ${EXPECTED_WIRE_SCHEMA_VERSION - 1}, this client speaks ${EXPECTED_SPOKEN_SCHEMAS}`,
     );
     expect(aggregator.requests).toHaveLength(0);
   });
 
   it("refuses params whose body declares another wire schema than their envelope", async () => {
     await expect(smoke({ innerSchema: EXPECTED_WIRE_SCHEMA_VERSION - 1 })).rejects.toThrow(
-      `instance params: body declares wire schema ${EXPECTED_WIRE_SCHEMA_VERSION - 1}, ` +
-        `this client speaks ${EXPECTED_WIRE_SCHEMA_VERSION}`,
+      `instance params: body declares wire schema ${EXPECTED_WIRE_SCHEMA_VERSION - 1} inside a ` +
+        `schema ${EXPECTED_WIRE_SCHEMA_VERSION} envelope; this client speaks ${EXPECTED_SPOKEN_SCHEMAS}`,
     );
     expect(aggregator.requests).toHaveLength(0);
   });

@@ -21,7 +21,7 @@ const INSTANCES: usize = 2;
 static APPSTATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn build(session_lru_cap: usize) -> Result<axum::Router, String> {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = raven_railgun_testkit::toy_db(TOY_ENTRIES, TOY_ENTRY_BYTES);
     let mut engine: Engine<RavenInspireScheme> = Engine::new();
     for index in 0..INSTANCES {

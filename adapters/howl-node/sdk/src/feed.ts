@@ -25,8 +25,18 @@ export interface FeedMatch {
   readonly candidate: number;
 }
 
+/** The feed rows a source holds, read-only: what a wallet scans without a request. */
+export interface FeedView {
+  /** Rows held: `[0, length)`. */
+  readonly length: number;
+  /** The rows held, for the wallet to store. */
+  bytes(): Uint8Array;
+  /** As {@link PrefixFeed.matches}. */
+  matches(tags: readonly Uint8Array[], from?: number): FeedMatch[];
+}
+
 /** The wallet's copy of the feed: rows `[0, length)`, appended in order. */
-export class PrefixFeed {
+export class PrefixFeed implements FeedView {
   #rows: Uint8Array;
   #length = 0;
 
@@ -49,6 +59,18 @@ export class PrefixFeed {
   /** The rows held, for the wallet to store. */
   bytes(): Uint8Array {
     return this.#rows.slice(0, this.#length * TAG_PREFIX_BYTES);
+  }
+
+  /**
+   * The first position in `[base, length)` where `rows`, read from `base`, differ from the rows
+   * held, or `null` when every row both cover is the same.
+   */
+  firstDifference(base: number, rows: Uint8Array): number | null {
+    const shared = Math.min(this.#length - base, rows.length / TAG_PREFIX_BYTES);
+    for (let i = 0; i < shared * TAG_PREFIX_BYTES; i++) {
+      if (rows[i] !== this.#rows[base * TAG_PREFIX_BYTES + i]) return base + Math.floor(i / TAG_PREFIX_BYTES);
+    }
+    return null;
   }
 
   /** Append rows that start exactly at the rows held. */

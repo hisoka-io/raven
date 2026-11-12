@@ -147,7 +147,7 @@ fn k_widening_at_two_cells() {
 
         for seed in 0..SEEDS {
             let setup_start = Instant::now();
-            let params = InspireParams::secure_128_d2048();
+            let params = InspireParams::d2048();
             let db = build_synthetic_db(entries, cell.entry_bytes);
             let (server_state, _) =
                 setup_state(&params, &db, cell.entry_bytes, InspireVariant::TwoPacking)

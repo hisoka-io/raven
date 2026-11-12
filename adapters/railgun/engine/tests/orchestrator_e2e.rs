@@ -63,7 +63,7 @@ async fn orchestrator_bootstraps_and_consumer_applies_events() {
     config.use_flock = false;
     config.role = InstanceRole::Live;
     config.scheme_tag = SCHEME_TAG.to_owned();
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
 
     for i in 0..3u32 {
@@ -176,7 +176,7 @@ async fn orchestrator_reorg_truncates_leaves_past_height() {
     config.record_size = TOY_ENTRY_SIZE;
     config.use_flock = false;
     config.scheme_tag = SCHEME_TAG.to_owned();
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
 
     for i in 0..3u32 {

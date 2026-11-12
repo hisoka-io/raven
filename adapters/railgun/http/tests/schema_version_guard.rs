@@ -133,7 +133,7 @@ fn response_layouts() -> (ServerResponse, ServerResponse) {
         packed_coefficients: Some(2),
     };
     (
-        response_at(InspireParams::secure_128_d2048().q),
+        response_at(InspireParams::d2048().q),
         response_at(WIRE_RESPONSE_MODULUS),
     )
 }

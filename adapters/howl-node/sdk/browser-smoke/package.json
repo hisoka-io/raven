@@ -1,0 +1,19 @@
+{
+  "name": "howl-client-browser-smoke",
+  "private": true,
+  "description": "The Howl client in headless Chromium: a page bundled with the -bundler wasm and a Manifest V3 extension whose service worker runs the -web wasm, both against a local chain and node.",
+  "type": "module",
+  "scripts": {
+    "smoke": "tsx run.ts"
+  },
+  "devDependencies": {
+    "@hisoka-io/howl-client-wasm": "link:../../client-wasm/pkg-node",
+    "@hisoka-io/howl-client-wasm-bundler": "link:../../client-wasm/pkg-bundler",
+    "@hisoka-io/howl-client-wasm-web": "link:../../client-wasm/pkg-web",
+    "@hisoka-io/raven-howl-client": "link:..",
+    "esbuild": "0.28.2",
+    "playwright": "1.63.0",
+    "tsx": "4.23.15",
+    "webpack": "5.112.2"
+  }
+}

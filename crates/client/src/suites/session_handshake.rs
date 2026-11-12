@@ -9,7 +9,7 @@ use raven_client::{
 };
 use raven_inspire::inspiring::ClientPackingKeys;
 use raven_inspire::math::GaussianSampler;
-use raven_inspire::params::{InspireParams, SecurityLevel, ShardConfig};
+use raven_inspire::params::{InspireParams, ParamsLabel, ShardConfig};
 use raven_inspire::{setup, SeededClientQuery, ServerSessionHandle};
 
 #[cfg(target_arch = "wasm32")]
@@ -28,12 +28,16 @@ fn params() -> InspireParams {
         query_gadget_len: 3,
         packing_gadget_len: 3,
         approximate_packing_gadget: false,
-        security_level: SecurityLevel::Bits128,
+        params_label: ParamsLabel::Primary,
     }
 }
 
 fn session_fixture() -> (raven_client::ClientSessionHandle, ShardConfig) {
-    let params = params();
+    session_fixture_for(&params())
+}
+
+fn session_fixture_for(params: &InspireParams) -> (raven_client::ClientSessionHandle, ShardConfig) {
+    let params = params.clone();
     let database = vec![7u8; 2 * params.ring_dim * ENTRY_BYTES];
     let mut sampler = GaussianSampler::with_seed(params.sigma, 19);
     let (crs, encoded, _secret_key) =
@@ -72,4 +76,23 @@ fn wasm_exports_upload_versioned_keys_then_install_the_returned_handle() {
         query.inspiring_packing_keys.is_none(),
         "registered queries must never inline the uploaded packing keys"
     );
+}
+
+/// The registration body opens with the schema the set is served under: 8 for the exact
+/// gadget, 9 for the approximate one, whose key is a row shorter.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn the_registration_schema_follows_the_parameter_set() {
+    for (approximate_packing_gadget, schema, rows) in [(false, 8u8, 3usize), (true, 9, 2)] {
+        let params = InspireParams {
+            approximate_packing_gadget,
+            ..params()
+        };
+        let (session, _) = session_fixture_for(&params);
+        let registration = client_packing_keys_versioned(&session).expect("registration body");
+        assert_eq!(registration.get(..2), Some([0, schema].as_slice()));
+        let keys: ClientPackingKeys =
+            bincode::deserialize(registration.get(2..).expect("body")).expect("packing keys");
+        assert_eq!(keys.y_body.len(), rows);
+    }
 }

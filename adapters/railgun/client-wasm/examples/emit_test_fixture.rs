@@ -34,7 +34,7 @@ const NUM_FIXTURE_INDICES: u32 = 5;
 // The shipped preset: the client refuses a smaller ring than this, so a fixture below it
 // would be refused before any query it holds could be decoded.
 fn test_params() -> InspireParams {
-    InspireParams::secure_128_d2048()
+    InspireParams::d2048()
 }
 
 /// The CRS the params route ships, galois keys stripped, as `emit_production_shape_fixture`

@@ -117,7 +117,7 @@ fn payload_for(cell: &Cell, idx: u32) -> WalEntryPayload {
 
 // returns per-seed median (not mean) per-insert duration and the sample count taken
 fn run_one_seed(cell: &Cell, preload_to: u32) -> (Duration, u32) {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = build_synthetic_db(cell.entries, cell.entry_bytes);
     let (state, _secret_key) =
         setup_state(&params, &db, cell.entry_bytes, InspireVariant::TwoPacking)

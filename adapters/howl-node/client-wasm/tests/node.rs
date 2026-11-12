@@ -788,16 +788,19 @@ async fn set_2_sizes_on_the_wire_and_one_key_per_client() {
         fixture_node_set(dir.path(), howl_wire::PARAM_SET_D2048_CELL256_P16).await;
     let mut reader = client(&node).await;
     let key = reader.session_body_rust().to_vec();
-    assert_eq!(key.len(), 4 + 15_360);
+    assert_eq!(key.len(), 4 + 15_394);
+    assert_eq!(key[4..6], [0, 2], "the key names key-mask version 2");
     assert_eq!(
         key,
         reader.session_body_rust(),
         "a retry resends the same bytes"
     );
+    let other = client(&node).await.session_body_rust().to_vec();
+    assert_ne!(key, other, "a new client draws a new secret");
     assert_ne!(
-        key,
-        client(&node).await.session_body_rust(),
-        "a new client draws a new secret"
+        key[6..38],
+        other[6..38],
+        "a new client draws a new key-mask seed"
     );
     register(&node, &mut reader).await;
     let mut sizes = Vec::new();
@@ -831,14 +834,14 @@ async fn set_2_sizes_on_the_wire_and_one_key_per_client() {
         ));
     }
     // per slot 7,460 B up (shard and query) and 9,212 B down; 15 B of batch framing up by
-    // handle, 15,367 B with the key inline; 58 B of header and count down
+    // handle, 15,401 B of framing and key with the key inline; 58 B of header and count down
     let expected: Vec<(usize, usize, usize, usize)> = LADDER
         .iter()
         .map(|&s| {
             (
                 s,
                 15 + 7_460 * s,
-                4 + 1 + 15_360 + 2 + 7_460 * s,
+                4 + 1 + 15_394 + 2 + 7_460 * s,
                 56 + 2 + (4 + 9_208) * s,
             )
         })
@@ -853,7 +856,7 @@ async fn set_2_pads_cover_the_table_and_the_real_slot_moves() {
         fixture_node_set(dir.path(), howl_wire::PARAM_SET_D2048_CELL256_P16).await;
     let mut reader = client(&node).await;
     register(&node, &mut reader).await;
-    let trials = 480;
+    let trials = 480u32;
     let mut shards = HashMap::new();
     let mut slots = [0u32; 16];
     for _ in 0..trials {
@@ -870,13 +873,17 @@ async fn set_2_pads_cover_the_table_and_the_real_slot_moves() {
         slots[batch.slot_order()[0]] += 1;
     }
     assert_eq!(shards.len(), 3, "{shards:?}");
-    let expected = trials / 16;
-    for (slot, count) in slots.iter().enumerate() {
-        assert!(
-            *count > expected / 3 && *count < expected * 3,
-            "slot {slot}: {count} of {trials}: {slots:?}"
-        );
-    }
+    // Pearson's statistic against a uniform spread, held to the upper 1e-6 point of chi-square
+    // with 15 degrees of freedom, so a uniform sampler fails once in a million runs.
+    let expected = f64::from(trials) / 16.0;
+    let stat: f64 = slots
+        .iter()
+        .map(|&c| (f64::from(c) - expected).powi(2) / expected)
+        .sum();
+    assert!(
+        stat < 56.49,
+        "chi-square {stat:.2} over {trials}: {slots:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -953,13 +960,29 @@ async fn a_client_reads_under_the_set_its_node_names_and_no_other() {
     };
     assert!(c2.open_notes_rust(&b2, &short.encode()).is_err());
 
-    // A set-2 params answer that carries key material is refused: the set fixes it.
+    // A set-2 params answer names a key-mask version this client knows, and nothing else.
     let params = set_2.raw("/howl/v1/params").await;
-    let mut with_crs = Answer::decode(&params).expect("params");
-    if let Body::Params(p) = &mut with_crs.body {
-        p.crs = vec![1];
+    let with_crs = |crs: Vec<u8>| {
+        let mut answer = Answer::decode(&params).expect("params");
+        if let Body::Params(p) = &mut answer.body {
+            p.crs = crs;
+        }
+        answer.encode()
+    };
+    assert!(HowlClient::from_params(&with_crs(vec![0, 2])).is_ok());
+    for crs in [vec![], vec![1], vec![0, 0], vec![0, 1, 0]] {
+        assert!(
+            HowlClient::from_params(&with_crs(crs.clone())).is_err(),
+            "{crs:?}"
+        );
     }
-    assert!(HowlClient::from_params(&with_crs.encode()).is_err());
+    // Version 1, the mask every key shared, is refused like any version this client does not build.
+    for crs in [vec![0, 1], vec![0, 3], vec![1, 0]] {
+        let refused = HowlClient::from_params(&with_crs(crs.clone()))
+            .err()
+            .unwrap_or_else(|| panic!("{crs:?} accepted"));
+        assert!(refused.contains("key-mask version"), "{refused}");
+    }
     // Another parameter set is refused outright.
     let mut set_3 = params.clone();
     set_3[3] = 3;

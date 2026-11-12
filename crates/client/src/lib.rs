@@ -30,7 +30,8 @@ use wasm_bindgen::prelude::*;
 
 mod floor;
 pub use floor::{
-    check_parameter_floor, ParameterFloorError, MAX_GADGET_LEN, MAX_Q, MAX_RING_DIM, MIN_RING_DIM,
+    check_parameter_floor, ParameterFloorError, APPROXIMATE_GADGET_BASE,
+    APPROXIMATE_GADGET_RING_DIM, MAX_GADGET_LEN, MAX_Q, MAX_RING_DIM, MIN_RING_DIM,
     SHIPPED_CRT_MODULI, SHIPPED_SIGMA,
 };
 
@@ -46,7 +47,7 @@ extern crate self as raven_client;
 mod suites;
 
 /// Route Rust panics to structured JS exceptions instead of opaque WASM traps. Idempotent.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js-exports", wasm_bindgen)]
 pub fn init_panic_hook() {
     console_error_panic_hook::set_once();
 }
@@ -171,8 +172,19 @@ fn decode_validated_shard_config(
     Ok(shard_config)
 }
 
-// Adapter HTTP envelope version; parity-gated here to avoid a framework-to-transport dependency.
+// Adapter HTTP envelope versions; parity-gated here to avoid a framework-to-transport dependency.
+// The set picks the version, so a node or client that knows only the exact set refuses the other.
 const SESSION_WIRE_SCHEMA_VERSION: u16 = 8;
+const SESSION_WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET: u16 = 9;
+
+/// The adapter wire schema an instance serving `params` speaks.
+fn session_wire_schema(params: &InspireParams) -> u16 {
+    if params.approximate_packing_gadget {
+        SESSION_WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET
+    } else {
+        SESSION_WIRE_SCHEMA_VERSION
+    }
+}
 
 fn decode<T: for<'de> Deserialize<'de>>(
     bytes: &[u8],
@@ -325,7 +337,7 @@ fn hex8(seed: &[u8; 32]) -> String {
 }
 
 /// Opaque client PIR session, built by `build_client_session`.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js-exports", wasm_bindgen)]
 pub struct ClientSessionHandle {
     inner: ClientSession,
     params: InspireParams,
@@ -349,7 +361,7 @@ impl std::fmt::Debug for ClientSessionHandle {
 /// Draws a fresh secret key and builds its one packing key, which every upload and
 /// retry of this handle resends. Calling it again on the same bundle gives a new
 /// secret, never a second key under the first.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js-exports", wasm_bindgen)]
 pub fn build_client_session(
     params_bundle_bincode: &[u8],
     crs_bincode: &[u8],
@@ -374,7 +386,7 @@ pub fn build_client_session(
 
 /// Validate that `instance_params_bincode` matches the session's ring params.
 /// Catches CRS/params drift at session-bind time rather than at first query.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js-exports", wasm_bindgen)]
 pub fn register_client_session(
     session: &mut ClientSessionHandle,
     instance_params_bincode: &[u8],
@@ -388,9 +400,10 @@ pub fn register_client_session(
 
 /// Serialize this session's client packing keys for `POST /v1/instance/:id/session`.
 ///
-/// The body is `[u16 BE schema version][bincode ClientPackingKeys]`. It contains
+/// The body is `[u16 BE schema version][bincode ClientPackingKeys]`, the version the
+/// session's parameter set is served under (8 exact, 9 approximate gadget). It contains
 /// key material and must be sent only to the instance that supplied this session's CRS.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js-exports", wasm_bindgen)]
 pub fn client_packing_keys_versioned(session: &ClientSessionHandle) -> Result<Vec<u8>, JsValue> {
     Ok(session.registration_body.clone())
 }
@@ -405,7 +418,9 @@ fn session_registration_body(session: &ClientSession) -> Result<Vec<u8>, WasmCli
                  upload"
                     .to_owned(),
         })?;
-    let mut out = SESSION_WIRE_SCHEMA_VERSION.to_be_bytes().to_vec();
+    let mut out = session_wire_schema(&session.crs().params)
+        .to_be_bytes()
+        .to_vec();
     out.extend_from_slice(&encode(keys, "client_packing_keys")?);
     Ok(out)
 }
@@ -414,7 +429,7 @@ fn session_registration_body(session: &ClientSession) -> Result<Vec<u8>, WasmCli
 ///
 /// Subsequent query bodies carry this handle and omit inline packing keys. The
 /// server validates whether the opaque handle is current for that instance.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js-exports", wasm_bindgen)]
 pub fn install_server_session_handle(
     session: &mut ClientSessionHandle,
     handle: u64,
@@ -445,7 +460,7 @@ pub struct WasmSeededQueryOutput {
 /// The caller re-supplies `shard_config` per query, so it is checked against the
 /// session's ring: a drifted geometry would otherwise map `target_idx` to a
 /// different shard and retrieve the wrong record with no error.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js-exports", wasm_bindgen)]
 pub fn build_seeded_query(
     session: &ClientSessionHandle,
     shard_config_bincode: &[u8],
@@ -482,7 +497,7 @@ pub fn build_seeded_query(
 ///
 /// `client_state_bincode` is the client state `build_seeded_query` returned. It
 /// carries no secret key; the key is taken from `session`.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js-exports", wasm_bindgen)]
 pub fn extract_response(
     session: &ClientSessionHandle,
     crs_bincode: &[u8],
@@ -638,7 +653,7 @@ mod entry_size_tests {
 /// a secret at rest: a stolen blob plus observed traffic deanonymizes this
 /// client's query indices (not funds). Storage is not encrypted at rest; persist
 /// only with the user's informed consent.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js-exports", wasm_bindgen)]
 pub fn serialize_client_session(session: &ClientSessionHandle) -> Result<Vec<u8>, JsValue> {
     Ok(encode(
         &session.inner.to_residue(),
@@ -652,7 +667,7 @@ pub fn serialize_client_session(session: &ClientSessionHandle) -> Result<Vec<u8>
 /// rebuilding the automorph tables. The residue's CRS is
 /// checked against both the current parameters and current CRS so a rotation
 /// surfaces as a typed error, not a silently wrong query.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js-exports", wasm_bindgen)]
 pub fn deserialize_client_session(
     params_bundle_bincode: &[u8],
     crs_bincode: &[u8],
@@ -694,7 +709,7 @@ pub fn deserialize_client_session(
 
 /// Check the public params and shard geometry and return the bundle the SDK passes
 /// to `build_client_session`. The bundle holds no secret.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js-exports", wasm_bindgen)]
 pub fn build_instance_params_blob(
     inspire_params_bincode: &[u8],
     shard_config_bincode: &[u8],

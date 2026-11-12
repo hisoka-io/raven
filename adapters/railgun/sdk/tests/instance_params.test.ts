@@ -7,7 +7,11 @@ import { RavenError, decodeInstanceParams, fetchInstanceParams } from "../src/in
 import { encodeInstanceParams } from "./helpers/live_wire";
 import { startMockServer, writeBinary, writeError, type MockServer } from "./helpers/mock_server";
 import { shardConfigBincode } from "./helpers/shard_config";
-import { EXPECTED_WIRE_SCHEMA_VERSION } from "./helpers/wire_schema";
+import {
+  EXPECTED_SPOKEN_SCHEMAS,
+  EXPECTED_WIRE_SCHEMA_VERSION,
+  EXPECTED_WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET,
+} from "./helpers/wire_schema";
 
 const PARAMS = {
   crsBincode: new Uint8Array([1, 2, 3, 4]),
@@ -49,12 +53,38 @@ describe("decodeInstanceParams", () => {
     expect(RavenError.is(e, "StaleAdapter"), String(e)).toBe(true);
     expect((e as RavenError).message).toBe(
       `instance params: envelope is wire schema ${EXPECTED_WIRE_SCHEMA_VERSION - 1}, ` +
-        `this client speaks ${EXPECTED_WIRE_SCHEMA_VERSION}`,
+        `this client speaks ${EXPECTED_SPOKEN_SCHEMAS}`,
     );
     expect((e as RavenError).context).toEqual({
       serverWireSchemaVersion: EXPECTED_WIRE_SCHEMA_VERSION - 1,
-      clientWireSchemaVersion: EXPECTED_WIRE_SCHEMA_VERSION,
     });
+  });
+
+  it("reads an approximate-gadget instance's schema from its envelope", () => {
+    const version = EXPECTED_WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET;
+    const decoded = decodeInstanceParams(encodeInstanceParams(PARAMS, version));
+    expect([decoded.envelope, decoded.wireSchemaVersion]).toEqual([version, version]);
+  });
+
+  it("refuses a schema past every one it speaks", () => {
+    const past = EXPECTED_WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET + 1;
+    const e = caught(() => decodeInstanceParams(encodeInstanceParams(PARAMS, past)));
+    expect(RavenError.is(e, "StaleAdapter"), String(e)).toBe(true);
+    expect((e as RavenError).context).toEqual({ serverWireSchemaVersion: past });
+  });
+
+  it("refuses an approximate-gadget envelope around an exact-set body", () => {
+    const body = encodeInstanceParams(
+      PARAMS,
+      EXPECTED_WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET,
+      EXPECTED_WIRE_SCHEMA_VERSION,
+    );
+    const e = caught(() => decodeInstanceParams(body));
+    expect(RavenError.is(e, "StaleAdapter"), String(e)).toBe(true);
+    expect((e as RavenError).message).toContain(
+      `body declares wire schema ${EXPECTED_WIRE_SCHEMA_VERSION} inside a schema ` +
+        `${EXPECTED_WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET} envelope`,
+    );
   });
 
   it("refuses a body whose inner version disagrees with its envelope", () => {
@@ -162,7 +192,7 @@ describe("fetchInstanceParams", () => {
     node.route(
       () => true,
       (_req, _body, res) => {
-        writeBinary(res, encodeInstanceParams(PARAMS, EXPECTED_WIRE_SCHEMA_VERSION + 1));
+        writeBinary(res, encodeInstanceParams(PARAMS, EXPECTED_WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET + 1));
         return true;
       },
     );
@@ -170,7 +200,7 @@ describe("fetchInstanceParams", () => {
     expect(RavenError.is(e, "StaleAdapter"), String(e)).toBe(true);
     expect((e as RavenError).context).toMatchObject({
       url: `${node.url}/v1/instance/a/params`,
-      serverWireSchemaVersion: EXPECTED_WIRE_SCHEMA_VERSION + 1,
+      serverWireSchemaVersion: EXPECTED_WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET + 1,
     });
   });
 

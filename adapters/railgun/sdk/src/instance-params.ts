@@ -2,7 +2,7 @@
 
 import { bearerHeaders } from "./bearer-auth";
 import { RavenError } from "./errors";
-import { WIRE_SCHEMA_VERSION } from "./raven-poi-node-interface";
+import { KNOWN_WIRE_SCHEMA_VERSIONS } from "./raven-poi-node-interface";
 import { checkedRequestTimeoutMs, fetchWithDeadline } from "./request-deadline";
 
 /** `InstanceParams` as the server serializes it; the byte fields feed `loadClientPirContext`. */
@@ -48,27 +48,27 @@ function readBytes(
   return { value: new Uint8Array(buf.subarray(start, end)), next: end };
 }
 
+const SPOKEN = KNOWN_WIRE_SCHEMA_VERSIONS.join(" or ");
+
 function staleSchema(message: string, served: number): RavenError {
-  return RavenError.staleAdapter(message, {
-    serverWireSchemaVersion: served,
-    clientWireSchemaVersion: WIRE_SCHEMA_VERSION,
-  });
+  return RavenError.staleAdapter(message, { serverWireSchemaVersion: served });
 }
 
 /**
  * `[u16 BE envelope][u16 LE wire_schema_version][Vec crs][Vec shard_config][Vec inspire_params]
- * [u64 entry_size][String variant][u64 epoch]`, every length and integer little-endian. Both
- * version fields are checked, the envelope first, as `StaleAdapter` naming the served version:
- * that is the first thing to know about a node that has not been redeployed.
+ * [u64 entry_size][String variant][u64 epoch]`, every length and integer little-endian. The
+ * instance's parameter set picks the schema; the envelope must be one this client speaks and the
+ * inner field must repeat it. Either refusal is `StaleAdapter` naming the served version: that is
+ * the first thing to know about a node that runs another build.
  */
 export function decodeInstanceParams(buf: Uint8Array): InstanceParams {
   if (buf.length < 2) {
     throw RavenError.decodeError(`${LABEL}: ${buf.length} bytes is too short for the schema envelope`);
   }
   const envelope = (buf[0] << 8) | buf[1];
-  if (envelope !== WIRE_SCHEMA_VERSION) {
+  if (!KNOWN_WIRE_SCHEMA_VERSIONS.includes(envelope)) {
     throw staleSchema(
-      `${LABEL}: envelope is wire schema ${envelope}, this client speaks ${WIRE_SCHEMA_VERSION}`,
+      `${LABEL}: envelope is wire schema ${envelope}, this client speaks ${SPOKEN}`,
       envelope,
     );
   }
@@ -77,9 +77,10 @@ export function decodeInstanceParams(buf: Uint8Array): InstanceParams {
   }
   const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   const wireSchemaVersion = view.getUint16(2, true);
-  if (wireSchemaVersion !== WIRE_SCHEMA_VERSION) {
+  if (wireSchemaVersion !== envelope) {
     throw staleSchema(
-      `${LABEL}: body declares wire schema ${wireSchemaVersion}, this client speaks ${WIRE_SCHEMA_VERSION}`,
+      `${LABEL}: body declares wire schema ${wireSchemaVersion} inside a schema ${envelope} ` +
+        `envelope; this client speaks ${SPOKEN}`,
       wireSchemaVersion,
     );
   }

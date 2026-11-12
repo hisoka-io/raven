@@ -222,7 +222,7 @@ fn full_blocks_freeze_and_only_the_tail_block_changes_on_append() {
 
 #[test]
 fn db2_block_is_outside_the_pir_cell_width_range() {
-    let ring_dim = InspireParams::secure_128_d2048().ring_dim;
+    let ring_dim = InspireParams::d2048().ring_dim;
     let num_columns = raven_inspire::num_columns(BLOCK_BYTES);
     assert!(
         num_columns > ring_dim,

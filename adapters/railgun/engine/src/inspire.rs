@@ -1385,7 +1385,7 @@ mod snapshot_v6_tests {
     use raven_inspire::params::InspireParams;
 
     fn toy_state_and_db() -> (super::InspireServerState, Vec<u8>) {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let entries = 256usize;
         let entry_size = 32usize;
         let db = raven_railgun_testkit::toy_db(entries, entry_size);
@@ -1450,7 +1450,7 @@ mod snapshot_v6_tests {
 
     #[test]
     fn explicit_inspiring_seed_is_reused_across_fresh_instances() {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let database = raven_railgun_testkit::toy_db(256, 32);
         let (first, _) = super::setup_state_with_inspiring_seed(
             &params,
@@ -1900,7 +1900,7 @@ mod re_encode_tests {
 
     #[test]
     fn re_encode_matches_fresh_encode() {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let entries = 256usize;
         let entry_size = 256usize;
         let db = raven_railgun_testkit::toy_db(entries, entry_size);
@@ -1953,7 +1953,7 @@ mod re_encode_tests {
     /// Mutated bytes must produce different polynomials, proving the rebuild is real.
     #[test]
     fn re_encode_mutates_polys_for_changed_bytes() {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let entries = 256usize;
         let entry_size = 256usize;
         let db = raven_railgun_testkit::toy_db(entries, entry_size);
@@ -2005,7 +2005,7 @@ mod re_encode_tests {
     /// Re-encoding shard 1 must be byte-identical to setup, ruling out shard-0 specialization.
     #[test]
     fn re_encode_shard_k1_byte_identity() {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let entries = 4096usize; // 2 x ring_dim => 2 shards.
         let entry_size = 32usize;
         let db = raven_railgun_testkit::toy_db(entries, entry_size);
@@ -2062,7 +2062,7 @@ mod re_encode_tests {
 
     #[test]
     fn re_encode_unknown_shard_returns_internal_error() {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let entries = 256usize;
         let entry_size = 256usize;
         let db = raven_railgun_testkit::toy_db(entries, entry_size);
@@ -2100,7 +2100,7 @@ mod unfilled_cell_tests {
 
     fn unfilled() -> InspireServerState {
         setup_unfilled_state(
-            &InspireParams::secure_128_d2048(),
+            &InspireParams::d2048(),
             &vec![0x11; ROWS_PER_SHARD * ENTRY],
             65_536,
             ENTRY,
@@ -2136,7 +2136,7 @@ mod unfilled_cell_tests {
         let mut encoded = (*state.encoded_db).clone();
         re_encode_shard(
             &mut encoded,
-            &InspireParams::secure_128_d2048(),
+            &InspireParams::d2048(),
             3,
             &vec![0x22; ROWS_PER_SHARD * ENTRY],
             ENTRY,
@@ -2168,7 +2168,7 @@ mod packing_cache_registry_tests {
     /// Each call sets up a CRS of its own, so each state has its own packing keys.
     fn own_keys() -> InspireServerState {
         setup_unfilled_state(
-            &InspireParams::secure_128_d2048(),
+            &InspireParams::d2048(),
             &vec![0x11; 2048 * ENTRY],
             65_536,
             ENTRY,

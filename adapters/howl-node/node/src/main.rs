@@ -2,12 +2,39 @@
 //!
 //! ```text
 //! HOWL_NODE_RPC_URL=<endpoint> howl-node --data-dir DIR --chain-id N --pool 0x.. \
-//!     --deployment-block N [--listen 127.0.0.1:8545] [--poll-ms 2000] [--max-range 2000] \
-//!     [--max-sessions 2048] [--session-ttl-secs 3600] [--concurrent N] [--param-set 1|2]
+//!     --deployment-block N [--listen 127.0.0.1:8645] [--poll-ms 2000] [--max-range 50000] \
+//!     [--max-sessions 2048] [--session-ttl-secs 3600] [--concurrent N] [--param-set 2|1]
+//!     [--walk-blocks 64] [--respond-threads N] [--rate 5000] [--rate-burst 10000]
+//!     [--session-rate 4] [--session-burst 64] [--queued N] [--permit-wait-ms 20000]
+//!     [--bodies N] [--body-timeout-ms 30000] [--stale-after-secs 120] [--head-stall-secs N]
+//! HOWL_NODE_RPC_URL=<endpoint> howl-node check --chain-id N --pool 0x.. --deployment-block N \
+//!     [--walk-blocks 64]
 //! ```
 //!
+//! `check` makes the follower's reads once and prints which the endpoint answers; it exits
+//! non-zero when one fails.
+//!
+//! `--param-set` picks the scheme served: 2 (the default) or the older 1.
+//!
+//! `--concurrent` bounds the batches answered at once and `--respond-threads` the threads that
+//! compute set-2 responses for all of them (both default to the cores). `--walk-blocks` is the
+//! depth below the head within which every header and the pool's count are read; it must be at
+//! least 1 and lie within the recent state the endpoint keeps. `--max-range` caps the blocks one
+//! log read asks for; a read the endpoint refuses is halved, so it need not match the endpoint.
+//!
+//! `--rate`/`--rate-burst` bound the requests of all callers together on each route, every route
+//! with a bucket of its own (health and status are exempt), `--session-rate`/`--session-burst`
+//! the sessions opened, `--queued` the batches waiting for a permit (eight per permit by
+//! default), `--permit-wait-ms` how long one waits, `--bodies` the session and batch bodies held
+//! at once (twice the permits and queue places by default), and `--body-timeout-ms` how long one
+//! body may take to arrive. `--stale-after-secs` is how long after the follower last reached the
+//! endpoint's head `/howl/v1/ready` still answers `200`. `--head-stall-secs`, unset by default,
+//! also turns it `503` when the endpoint's head has not grown for that long; give it well above the
+//! chain's longest gap between blocks.
+//!
 //! The endpoint is read from the environment so that a key in its URL stays out of the
-//! process list.
+//! process list, and so is `HOWL_NODE_OPERATOR_TOKEN`, the bearer token of the status route
+//! (16 bytes at least; unset, the route stays closed).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -16,15 +43,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use howl_node::chain::{unhex, RpcChain};
+use howl_node::check::Expect;
 use howl_node::http::{router, Served};
-use howl_node::NodeConfig;
+use howl_node::limit::Limits;
+use howl_node::{NodeConfig, Tuning};
 use raven_inspire_session::SessionStoreLimits;
 
 struct Args {
     node: NodeConfig,
+    tuning: Tuning,
     listen: SocketAddr,
     poll: Duration,
-    concurrent: usize,
+    limits: Limits,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -34,18 +64,31 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut deployment_block = None;
     let mut listen: SocketAddr = ([127, 0, 0, 1], 8645).into();
     let mut poll = Duration::from_millis(2_000);
-    let mut max_range = 2_000u64;
+    let mut max_range = 50_000u64;
     let mut sessions = SessionStoreLimits {
         max_sessions: 2_048,
         ttl: Duration::from_secs(3_600),
     };
     let mut concurrent = std::thread::available_parallelism().map_or(4, usize::from);
-    let mut param_set = howl_wire::PARAM_SET_D2048_CELL256;
+    let mut param_set = howl_wire::PARAM_SET_D2048_CELL256_P16;
+    let mut tuning = Tuning::default();
+    let mut requests = None;
+    let mut sessions_opened = None;
+    let mut queued = None;
+    let mut permit_wait = None;
+    let mut bodies = None;
+    let mut body_timeout = None;
+    let mut stale_after = None;
+    let mut head_stall = None;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         let number = |text: String| {
             text.parse::<u64>()
                 .map_err(|_| format!("{flag}: not a number"))
+        };
+        let small = |text: String| {
+            text.parse::<u32>()
+                .map_err(|_| format!("{flag}: not a number up to {}", u32::MAX))
         };
         match flag.as_str() {
             "--data-dir" => data_dir = Some(PathBuf::from(value()?)),
@@ -74,9 +117,59 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                 param_set =
                     u16::try_from(number(value()?)?).map_err(|_| "--param-set: too large")?;
             }
+            "--walk-blocks" => {
+                tuning.walk_blocks = number(value()?)?;
+                if tuning.walk_blocks == 0 {
+                    // No walk would leave every count and header link unchecked.
+                    return Err("--walk-blocks: at least 1".to_owned());
+                }
+            }
+            "--respond-threads" => {
+                tuning.respond_threads = usize::try_from(number(value()?)?)
+                    .map_err(|_| "--respond-threads: too large")?;
+            }
+            "--rate" => requests.get_or_insert(Limits::new(1).requests).per_sec = small(value()?)?,
+            "--rate-burst" => {
+                requests.get_or_insert(Limits::new(1).requests).burst = small(value()?)?
+            }
+            "--session-rate" => {
+                sessions_opened
+                    .get_or_insert(Limits::new(1).sessions)
+                    .per_sec = small(value()?)?;
+            }
+            "--session-burst" => {
+                sessions_opened.get_or_insert(Limits::new(1).sessions).burst = small(value()?)?;
+            }
+            "--queued" => {
+                queued =
+                    Some(usize::try_from(number(value()?)?).map_err(|_| "--queued: too large")?);
+            }
+            "--permit-wait-ms" => permit_wait = Some(Duration::from_millis(number(value()?)?)),
+            "--bodies" => {
+                bodies =
+                    Some(usize::try_from(number(value()?)?).map_err(|_| "--bodies: too large")?);
+            }
+            "--body-timeout-ms" => body_timeout = Some(Duration::from_millis(number(value()?)?)),
+            "--stale-after-secs" => stale_after = Some(Duration::from_secs(number(value()?)?)),
+            "--head-stall-secs" => head_stall = Some(Duration::from_secs(number(value()?)?)),
             other => return Err(format!("unknown argument {other}")),
         }
     }
+    let defaults = Limits::new(concurrent);
+    let queued = queued.unwrap_or(defaults.queued);
+    let limits = Limits {
+        queued,
+        bodies: bodies
+            .unwrap_or_else(|| defaults.concurrent.saturating_add(queued).saturating_mul(2)),
+        body_timeout: body_timeout.unwrap_or(defaults.body_timeout),
+        permit_wait: permit_wait.unwrap_or(defaults.permit_wait),
+        requests: requests.unwrap_or(defaults.requests),
+        sessions: sessions_opened.unwrap_or(defaults.sessions),
+        stale_after: stale_after.unwrap_or(defaults.stale_after),
+        head_stall: head_stall.or(defaults.head_stall),
+        ..defaults
+    };
+    limits.validate()?;
     Ok(Args {
         node: NodeConfig {
             data_dir: data_dir.ok_or("--data-dir is required")?,
@@ -88,10 +181,69 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             param_set,
             seed: None,
         },
+        tuning,
         listen,
         poll,
-        concurrent,
+        limits,
     })
+}
+
+fn parse_check(mut args: impl Iterator<Item = String>) -> Result<Expect, String> {
+    let (mut chain_id, mut pool, mut deployment_block) = (None, None, None);
+    let mut walk_blocks = howl_node::follow::WALK_BLOCKS;
+    while let Some(flag) = args.next() {
+        let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
+        let number = || {
+            value
+                .parse::<u64>()
+                .map_err(|_| format!("{flag}: not a number"))
+        };
+        match flag.as_str() {
+            "--chain-id" => chain_id = Some(number()?),
+            "--pool" => {
+                pool = Some(
+                    unhex(&value)
+                        .and_then(|bytes| <[u8; 20]>::try_from(bytes).ok())
+                        .ok_or("--pool: not a 20-byte 0x address")?,
+                );
+            }
+            "--deployment-block" => deployment_block = Some(number()?),
+            "--walk-blocks" => walk_blocks = number()?.max(1),
+            other => return Err(format!("check: unknown argument {other}")),
+        }
+    }
+    Ok(Expect {
+        chain_id: chain_id.ok_or("--chain-id is required")?,
+        pool: pool.ok_or("--pool is required")?,
+        deployment_block: deployment_block.ok_or("--deployment-block is required")?,
+        walk_blocks,
+    })
+}
+
+fn endpoint() -> Result<String, String> {
+    std::env::var("HOWL_NODE_RPC_URL").map_err(|_| "HOWL_NODE_RPC_URL is not set".to_owned())
+}
+
+fn run_check(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let expect = parse_check(args)?;
+    let chain = RpcChain::new(endpoint()?, expect.pool).map_err(|e| e.to_string())?;
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let findings = runtime.block_on(howl_node::check::check(&chain, &expect));
+    let failed = findings.iter().filter(|f| !f.ok).count();
+    for f in &findings {
+        println!(
+            "{} {}: {}",
+            if f.ok { "ok  " } else { "FAIL" },
+            f.name,
+            f.detail
+        );
+    }
+    if failed == 0 {
+        println!("the endpoint serves a node");
+        Ok(())
+    } else {
+        Err(format!("{failed} endpoint checks failed"))
+    }
 }
 
 fn main() -> std::process::ExitCode {
@@ -101,7 +253,13 @@ fn main() -> std::process::ExitCode {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    match run() {
+    let mut args = std::env::args().skip(1).peekable();
+    let outcome = if args.peek().map(String::as_str) == Some("check") {
+        run_check(args.skip(1))
+    } else {
+        run(args)
+    };
+    match outcome {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(message) => {
             tracing::error!("{message}");
@@ -110,11 +268,15 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-fn run() -> Result<(), String> {
-    let args = parse(std::env::args().skip(1))?;
-    let url = std::env::var("HOWL_NODE_RPC_URL").map_err(|_| "HOWL_NODE_RPC_URL is not set")?;
-    let chain = RpcChain::new(url, args.node.pool).map_err(|e| e.to_string())?;
-    let (follower, engine) = howl_node::open(&args.node, chain).map_err(|e| e.to_string())?;
+fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let mut args = parse(args)?;
+    args.limits.operator_token = std::env::var("HOWL_NODE_OPERATOR_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty());
+    args.limits.validate()?;
+    let chain = RpcChain::new(endpoint()?, args.node.pool).map_err(|e| e.to_string())?;
+    let (follower, engine) =
+        howl_node::open_with(&args.node, chain, args.tuning).map_err(|e| e.to_string())?;
     tracing::info!(
         leaves = engine.view().leaf_count,
         block = engine.view().block,
@@ -122,36 +284,228 @@ fn run() -> Result<(), String> {
     );
 
     let stop = Arc::new(AtomicBool::new(false));
+    // Dropped when the follower thread ends, by returning or by a panic: the node then stops,
+    // rather than serve a view nothing keeps current.
+    let (ended, follower_ended) = tokio::sync::oneshot::channel::<()>();
     let following = {
         let engine = Arc::clone(&engine);
         let stop = Arc::clone(&stop);
         let poll = args.poll;
         std::thread::Builder::new()
             .name("follow".to_owned())
-            .spawn(move || howl_node::follow_until(follower, &engine, poll, &stop))
+            .spawn(move || {
+                let _ended = ended;
+                howl_node::follow_until(follower, &engine, poll, &stop)
+            })
             .map_err(|e| e.to_string())?
     };
 
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let served = runtime.block_on(async {
-        let app = router(Served::new(engine, args.concurrent)).layer(
-            tower_http::cors::CorsLayer::new()
-                .allow_origin(tower_http::cors::Any)
-                .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
-                .allow_headers([axum::http::header::CONTENT_TYPE]),
-        );
+        let app = router(Served::with_limits(engine, args.limits));
         let listener = tokio::net::TcpListener::bind(args.listen)
             .await
             .map_err(|e| format!("cannot listen on {}: {e}", args.listen))?;
         tracing::info!(listen = %args.listen, "serving");
         axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
-            })
+            .with_graceful_shutdown(stopped(follower_ended))
             .await
             .map_err(|e| e.to_string())
     });
     stop.store(true, Ordering::Relaxed);
-    let _ = following.join();
-    served
+    // The follower returns `Ok` only once `stop` is set, so any other end is a failure.
+    let followed = match following.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("the follower could not start: {e}")),
+        Err(_) => Err("the follower panicked".to_owned()),
+    };
+    served.and(followed)
+}
+
+/// Ctrl-C, the SIGTERM a container runtime sends to stop the node, or the follower's end.
+async fn stopped(follower_ended: tokio::sync::oneshot::Receiver<()>) {
+    let signalled = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            if let Ok(mut term) = signal(SignalKind::terminate()) {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+                return;
+            }
+        }
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    tokio::select! {
+        () = signalled => {}
+        _ = follower_ended => tracing::error!("the follower ended; stopping the node"),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{parse, parse_check};
+
+    fn args(extra: &[&str]) -> impl Iterator<Item = String> {
+        let pool = format!("0x{}", "11".repeat(20));
+        let base = [
+            "--data-dir",
+            "/tmp/x",
+            "--chain-id",
+            "1",
+            "--pool",
+            pool.as_str(),
+            "--deployment-block",
+            "5",
+        ];
+        base.iter()
+            .chain(extra)
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn a_walk_of_no_blocks_is_refused() {
+        let refused = parse(args(&["--walk-blocks", "0"])).err().expect("refused");
+        assert!(refused.contains("--walk-blocks"), "{refused}");
+        let one = parse(args(&["--walk-blocks", "1"])).expect("one block");
+        assert_eq!(one.tuning.walk_blocks, 1);
+    }
+
+    #[test]
+    fn the_default_range_needs_no_flag() {
+        let parsed = parse(args(&[])).expect("parses");
+        assert_eq!(parsed.node.max_range, 50_000);
+    }
+
+    #[test]
+    fn the_limits_default_from_the_permits_and_take_each_flag() {
+        let parsed = parse(args(&["--concurrent", "3"])).expect("parses");
+        assert_eq!(parsed.limits.concurrent, 3);
+        assert_eq!(parsed.limits.queued, 24);
+        assert_eq!(parsed.limits.bodies, 54);
+        assert_eq!(parsed.limits.requests.per_sec, 5_000);
+        assert!(parsed.limits.operator_token.is_none());
+        let set = parse(args(&[
+            "--rate",
+            "10",
+            "--rate-burst",
+            "20",
+            "--session-rate",
+            "1",
+            "--session-burst",
+            "2",
+            "--queued",
+            "5",
+            "--permit-wait-ms",
+            "250",
+            "--bodies",
+            "7",
+            "--body-timeout-ms",
+            "900",
+        ]))
+        .expect("parses");
+        assert_eq!(
+            (set.limits.requests.per_sec, set.limits.requests.burst),
+            (10, 20)
+        );
+        assert_eq!(
+            (set.limits.sessions.per_sec, set.limits.sessions.burst),
+            (1, 2)
+        );
+        assert_eq!(set.limits.queued, 5);
+        assert_eq!(set.limits.permit_wait, Duration::from_millis(250));
+        assert_eq!(set.limits.bodies, 7);
+        assert_eq!(set.limits.body_timeout, Duration::from_millis(900));
+        let follows = parse(args(&["--concurrent", "2", "--queued", "3"])).expect("parses");
+        assert_eq!(
+            follows.limits.bodies, 10,
+            "twice the permits and queue places"
+        );
+    }
+
+    #[test]
+    fn set_two_is_the_default_and_set_one_stays_selectable() {
+        let parsed = parse(args(&[])).expect("parses");
+        assert_eq!(
+            parsed.node.param_set,
+            howl_wire::PARAM_SET_D2048_CELL256_P16
+        );
+        let one = parse(args(&["--param-set", "1"])).expect("set 1");
+        assert_eq!(one.node.param_set, howl_wire::PARAM_SET_D2048_CELL256);
+        let two = parse(args(&["--param-set", "2"])).expect("set 2");
+        assert_eq!(two.node.param_set, howl_wire::PARAM_SET_D2048_CELL256_P16);
+    }
+
+    #[test]
+    fn the_stale_bound_defaults_to_two_minutes_and_refuses_zero() {
+        let parsed = parse(args(&[])).expect("parses");
+        assert_eq!(parsed.limits.stale_after, Duration::from_secs(120));
+        let set = parse(args(&["--stale-after-secs", "30"])).expect("parses");
+        assert_eq!(set.limits.stale_after, Duration::from_secs(30));
+        assert!(parse(args(&["--stale-after-secs", "0"])).is_err());
+    }
+
+    #[test]
+    fn the_head_stall_bound_is_off_by_default_and_refuses_zero() {
+        assert_eq!(parse(args(&[])).expect("parses").limits.head_stall, None);
+        let set = parse(args(&["--head-stall-secs", "600"])).expect("parses");
+        assert_eq!(set.limits.head_stall, Some(Duration::from_secs(600)));
+        assert!(parse(args(&["--head-stall-secs", "0"])).is_err());
+    }
+
+    #[test]
+    fn the_check_takes_the_pool_flags_and_needs_no_data_dir() {
+        let pool = format!("0x{}", "11".repeat(20));
+        let flags = |extra: &[&str]| {
+            [
+                "--chain-id",
+                "421614",
+                "--pool",
+                pool.as_str(),
+                "--deployment-block",
+                "5",
+            ]
+            .iter()
+            .chain(extra)
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>()
+            .into_iter()
+        };
+        let expect = parse_check(flags(&[])).expect("parses");
+        assert_eq!(
+            (expect.chain_id, expect.deployment_block, expect.walk_blocks),
+            (421_614, 5, 64)
+        );
+        assert_eq!(expect.pool, [0x11; 20]);
+        assert_eq!(
+            parse_check(flags(&["--walk-blocks", "200"]))
+                .expect("parses")
+                .walk_blocks,
+            200
+        );
+        assert!(parse_check(flags(&["--data-dir", "x"])).is_err());
+    }
+
+    #[test]
+    fn a_rate_of_zero_is_refused() {
+        for flag in [
+            "--rate",
+            "--rate-burst",
+            "--session-rate",
+            "--session-burst",
+        ] {
+            let refused = parse(args(&[flag, "0"])).err().expect("refused");
+            assert!(refused.contains("at least 1"), "{flag}: {refused}");
+        }
+        assert!(parse(args(&["--permit-wait-ms", "0"])).is_err());
+        assert!(parse(args(&["--bodies", "0"])).is_err());
+        assert!(parse(args(&["--body-timeout-ms", "0"])).is_err());
+    }
 }

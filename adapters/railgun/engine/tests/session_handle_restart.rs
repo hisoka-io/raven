@@ -16,11 +16,10 @@ use raven_railgun_engine::orchestrator::{
 };
 use raven_railgun_engine::session_pool::{BoundedSessionStore, SessionStoreLimits};
 use raven_railgun_engine::{InstanceRole, PirScheme};
-use sha2::{Digest, Sha256};
 
 const ENTRY_SIZE: usize = 32;
+/// Written by builds that kept a handle floor; a data dir may still hold one.
 const FLOOR_FILE: &str = "session-handle-floor-v1.bin";
-const CHILD_DATA_DIR: &str = "RAVEN_RESTART_HANDLE_CHILD_DATA_DIR";
 const CHILD_OUTPUT: &str = "RAVEN_RESTART_HANDLE_CHILD_OUTPUT";
 
 fn limits() -> SessionStoreLimits {
@@ -31,9 +30,8 @@ fn limits() -> SessionStoreLimits {
 }
 
 #[test]
-fn reopening_one_data_dir_never_reissues_a_stale_handle() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let params = InspireParams::secure_128_d2048();
+fn reopening_the_store_never_reissues_a_stale_handle() {
+    let params = InspireParams::d2048();
     let database: Vec<u8> = (0..params.ring_dim * ENTRY_SIZE)
         .map(|offset| u8::try_from(offset % 251).expect("mod 251"))
         .collect();
@@ -43,16 +41,14 @@ fn reopening_one_data_dir_never_reissues_a_stale_handle() {
     // enough to show the restart never reissues.
     let mut client = build_client_session((*state.crs).clone()).expect("client");
 
-    let first = BoundedSessionStore::open_with_limits(dir.path(), limits()).expect("first open");
+    let first = BoundedSessionStore::open_with_limits(limits()).expect("first open");
     let stale = first
         .register_client_session_at(&mut client, std::time::Instant::now())
         .expect("first register")
         .expect("packing handle");
     drop(first);
 
-    let second = Arc::new(
-        BoundedSessionStore::open_with_limits(dir.path(), limits()).expect("restart open"),
-    );
+    let second = Arc::new(BoundedSessionStore::open_with_limits(limits()).expect("restart open"));
     let live = second
         .register_client_session_at(&mut client, std::time::Instant::now())
         .expect("second register")
@@ -65,7 +61,7 @@ fn reopening_one_data_dir_never_reissues_a_stale_handle() {
     let inner = inner.expect("translated inner handle");
     assert_ne!(
         live, inner,
-        "durable external handle must translate to the core handle"
+        "the random external handle must translate to the core handle"
     );
     assert!(
         second
@@ -101,10 +97,10 @@ fn reopening_one_data_dir_never_reissues_a_stale_handle() {
         "external-to-inner translation must preserve response bytes"
     );
 
-    assert_durable_lifecycle(&second, &mut client, live, &inner_store, inner);
+    assert_lifecycle(&second, &mut client, live, &inner_store, inner);
 }
 
-fn assert_durable_lifecycle(
+fn assert_lifecycle(
     store: &BoundedSessionStore,
     client: &mut raven_inspire::ClientSession,
     live: raven_inspire::ServerSessionHandle,
@@ -156,83 +152,14 @@ fn assert_durable_lifecycle(
         .is_some());
 }
 
-#[test]
-fn a_present_truncated_floor_refuses_startup() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    std::fs::write(dir.path().join("session-handle-floor-v1.bin"), b"short")
-        .expect("write truncated floor");
-
-    let error = BoundedSessionStore::open_with_limits(dir.path(), limits())
-        .expect_err("present corruption must fail closed");
-    assert!(
-        error.to_string().contains("session handle floor"),
-        "{error}"
-    );
-}
-
-#[test]
-fn a_present_checksum_mismatch_refuses_startup() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let store = BoundedSessionStore::open_with_limits(dir.path(), limits()).expect("first open");
-    drop(store);
-    let floor_path = dir.path().join(FLOOR_FILE);
-    let mut bytes = std::fs::read(&floor_path).expect("read floor");
-    *bytes.get_mut(10).expect("floor byte") ^= 1;
-    std::fs::write(&floor_path, bytes).expect("corrupt floor");
-
-    let error = BoundedSessionStore::open_with_limits(dir.path(), limits())
-        .expect_err("checksum corruption must fail closed");
-    assert!(error.to_string().contains("checksum mismatch"), "{error}");
-}
-
-#[test]
-fn a_published_but_unused_range_is_burned_after_restart() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let first = BoundedSessionStore::open_with_limits(dir.path(), limits()).expect("first open");
-    drop(first);
-    let after_first = read_floor(&dir.path().join(FLOOR_FILE));
-    let second = BoundedSessionStore::open_with_limits(dir.path(), limits()).expect("second open");
-    drop(second);
-    let after_second = read_floor(&dir.path().join(FLOOR_FILE));
-
-    assert_eq!(after_first, 1024);
-    assert_eq!(
-        after_second, 2048,
-        "restart must burn the unissued first range"
-    );
-}
-
-#[test]
-fn same_data_dir_stores_reserve_disjoint_ranges() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let first = BoundedSessionStore::open_with_limits(dir.path(), limits()).expect("first open");
-    let second = BoundedSessionStore::open_with_limits(dir.path(), limits()).expect("second open");
-    assert_eq!(read_floor(&dir.path().join(FLOOR_FILE)), 2048);
-    drop((first, second));
-}
-
-#[test]
-fn distinct_data_dirs_have_independent_handle_floors() {
-    let first_dir = tempfile::tempdir().expect("first tempdir");
-    let second_dir = tempfile::tempdir().expect("second tempdir");
-    let first =
-        BoundedSessionStore::open_with_limits(first_dir.path(), limits()).expect("first open");
-    let second =
-        BoundedSessionStore::open_with_limits(second_dir.path(), limits()).expect("second open");
-    assert_eq!(read_floor(&first_dir.path().join(FLOOR_FILE)), 1024);
-    assert_eq!(read_floor(&second_dir.path().join(FLOOR_FILE)), 1024);
-    drop((first, second));
-}
-
 #[tokio::test]
-async fn production_single_boot_opens_the_durable_allocator_and_refuses_corruption() {
+async fn production_single_boot_serves_random_handles_across_a_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
-    drop(BoundedSessionStore::open(dir.path()).expect("prime durable floor"));
     let mut config = OrchestratorConfig::demo(dir.path().to_path_buf(), "durable-single");
     config.record_size = 256;
     config.use_flock = false;
     config.role = InstanceRole::Live;
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     // Non-constant rows, so the control below proves the client decoded its own record.
     let database: Vec<u8> = (0..params.ring_dim * 256)
         .map(|offset| u8::try_from(offset % 251).expect("mod 251"))
@@ -241,7 +168,7 @@ async fn production_single_boot_opens_the_durable_allocator_and_refuses_corrupti
         setup_state(&params, &database, 256, InspireVariant::TwoPacking).expect("single setup");
     let mut handle = bootstrap_railgun_engine(config, params.clone(), || Ok(fresh_state))
         .expect("single production bootstrap");
-    assert_eq!(read_floor(&dir.path().join(FLOOR_FILE)), 2048);
+    assert!(!dir.path().join(FLOOR_FILE).exists());
     let state = handle.instance.current_state();
     let mut client = build_client_session((*state.crs).clone()).expect("single client");
     let external = state
@@ -255,19 +182,18 @@ async fn production_single_boot_opens_the_durable_allocator_and_refuses_corrupti
         .expect("single resolve");
     assert_ne!(external, inner.expect("single inner"));
 
-    // NEGATIVE CONTROL: before the floor goes, this client's query is served. Without it the
-    // refusals below could be a client that never worked.
+    // The registered client is served under its random handle.
     let (client_state, query) =
         build_seeded_query(&client, state.shard_config(), 3).expect("single query");
     assert_eq!(query.session_handle, Some(external));
     let response =
         <RavenInspireScheme as PirScheme>::respond(&state, &query).expect("single response");
     let plaintext = extract_response(state.crs.as_ref(), &client_state, &response, 256)
-        .expect("the registered client's query must serve before the floor is deleted");
+        .expect("the registered client's query must serve");
     assert_eq!(
         plaintext,
         database.get(3 * 256..4 * 256).expect("expected record"),
-        "the registered client's query must serve its own record before the floor is deleted"
+        "the registered client's query must serve its own record"
     );
     handle.indexer_bridge.abort();
     handle.mirror_bridge.abort();
@@ -282,51 +208,55 @@ async fn production_single_boot_opens_the_durable_allocator_and_refuses_corrupti
     drop(handle);
 
     assert!(dir.path().join("manifest.json").exists());
-    std::fs::remove_file(dir.path().join(FLOOR_FILE)).expect("remove production floor");
-    // The allocator decides before any responder runs, so a stale client's handle can never be
-    // rebound to a replacement client's keys.
-    let error = BoundedSessionStore::open_with_limits(dir.path(), limits())
-        .expect_err("a deleted floor must refuse the allocator itself");
-    assert!(
-        matches!(error, raven_railgun_core::AdapterError::Internal(_)),
-        "{error}"
-    );
-    assert!(error.to_string().contains("floor missing"), "{error}");
+    // An older build's floor beside the manifest neither blocks the restart nor is read.
+    std::fs::write(dir.path().join(FLOOR_FILE), b"short").expect("old floor");
     let mut restart_config = OrchestratorConfig::demo(dir.path().to_path_buf(), "durable-single");
     restart_config.record_size = 256;
     restart_config.use_flock = false;
     restart_config.role = InstanceRole::Live;
-    let error = bootstrap_railgun_engine(restart_config, params.clone(), || {
+    let mut restarted = bootstrap_railgun_engine(restart_config, params.clone(), || {
         raven_railgun_testkit::try_toy_state(256)
     })
-    .expect_err("production restart must refuse a missing floor");
-    assert!(error.to_string().contains("floor missing"), "{error}");
-
-    let corrupt = tempfile::tempdir().expect("corrupt tempdir");
-    std::fs::write(corrupt.path().join(FLOOR_FILE), b"short").expect("write corrupt floor");
-    let mut config = OrchestratorConfig::demo(corrupt.path().to_path_buf(), "durable-corrupt");
-    config.record_size = 256;
-    config.use_flock = false;
-    let error = bootstrap_railgun_engine(config, InspireParams::secure_128_d2048(), || {
-        raven_railgun_testkit::try_toy_state(256)
-    })
-    .expect_err("production bootstrap must refuse a corrupt floor");
-    assert!(
-        error.to_string().contains("session handle floor"),
-        "{error}"
+    .expect("a restart needs no handle history");
+    let state = restarted.instance.current_state();
+    let mut client = build_client_session((*state.crs).clone()).expect("restart client");
+    let after = state
+        .session_store
+        .register_client_session_at(&mut client, std::time::Instant::now())
+        .expect("restart register")
+        .expect("restart handle");
+    assert_ne!(
+        after, external,
+        "a restart must not reissue the stale handle"
     );
+    assert!(state
+        .session_store
+        .resolve(Some(external), std::time::Instant::now())
+        .is_err());
+    assert_eq!(
+        std::fs::read(dir.path().join(FLOOR_FILE)).expect("old floor"),
+        b"short"
+    );
+    restarted.indexer_bridge.abort();
+    restarted.mirror_bridge.abort();
+    progress::abort_consumer(
+        "aborted consumer exiting",
+        &mut restarted.consumer,
+        &restarted.metrics,
+        &restarted.persistence,
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn production_multi_boot_opens_each_data_dir_allocator() {
+async fn production_multi_boot_issues_random_handles() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().join("instance");
     std::fs::create_dir_all(&data_dir).expect("create instance dir");
-    drop(BoundedSessionStore::open(&data_dir).expect("prime multi durable floor"));
     let mut config =
         InstanceConfig::commit_tree("durable-multi", data_dir.clone(), 0, InstanceRole::Live);
     config.use_flock = false;
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let database = vec![0u8; params.ring_dim * 512];
     let (fresh_state, _) =
         setup_state(&params, &database, 512, InspireVariant::TwoPacking).expect("multi setup");
@@ -337,7 +267,7 @@ async fn production_multi_boot_opens_each_data_dir_allocator() {
             .ok_or_else(|| raven_railgun_core::AdapterError::Internal("factory reused".to_owned()))
     })
     .expect("multi production bootstrap");
-    assert_eq!(read_floor(&data_dir.join(FLOOR_FILE)), 2048);
+    assert!(!data_dir.join(FLOOR_FILE).exists());
     let state = handle
         .instances
         .first()
@@ -367,42 +297,20 @@ async fn production_multi_boot_opens_each_data_dir_allocator() {
     }
 
     assert!(data_dir.join("manifest.json").exists());
-    std::fs::remove_file(data_dir.join(FLOOR_FILE)).expect("remove multi-instance floor");
-    let mut restart_config =
-        InstanceConfig::commit_tree("durable-multi", data_dir.clone(), 0, InstanceRole::Live);
-    restart_config.use_flock = false;
-    let error = bootstrap_railgun_engine_multi(vec![restart_config], params, |_| {
-        raven_railgun_testkit::try_toy_state(512)
-    })
-    .expect_err("multi-instance restart must refuse a missing floor");
-    assert!(error.to_string().contains("floor missing"), "{error}");
 }
 
 #[test]
-fn checked_floor_overflow_refuses_startup() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    write_floor(&dir.path().join(FLOOR_FILE), u64::MAX - 100);
-    let error = BoundedSessionStore::open_with_limits(dir.path(), limits())
-        .expect_err("range overflow must fail closed");
-    assert!(error.to_string().contains("exhausted"), "{error}");
-}
-
-#[test]
-fn two_process_restarts_reserve_distinct_handle_ranges() {
-    if let (Ok(data_dir), Ok(output)) = (std::env::var(CHILD_DATA_DIR), std::env::var(CHILD_OUTPUT))
-    {
-        write_one_child_handle(
-            std::path::Path::new(&data_dir),
-            std::path::Path::new(&output),
-        );
+fn two_process_restarts_issue_unrelated_handles() {
+    if let Ok(output) = std::env::var(CHILD_OUTPUT) {
+        write_one_child_handle(std::path::Path::new(&output));
         return;
     }
 
     let dir = tempfile::tempdir().expect("tempdir");
     let first_output = dir.path().join("first-handle");
     let second_output = dir.path().join("second-handle");
-    run_child(dir.path(), &first_output);
-    run_child(dir.path(), &second_output);
+    run_child(&first_output);
+    run_child(&second_output);
     let stale = read_u64(&first_output);
     let live = read_u64(&second_output);
     assert_ne!(
@@ -410,29 +318,28 @@ fn two_process_restarts_reserve_distinct_handle_ranges() {
         "a process restart must not reissue the stale handle"
     );
     assert!(
-        live > stale,
-        "durable allocation must advance: {stale} -> {live}"
+        stale.abs_diff(live) > 1 << 20,
+        "restarted handles must not sit next to each other: {stale}, {live}"
     );
 }
 
-fn run_child(data_dir: &std::path::Path, output: &std::path::Path) {
+fn run_child(output: &std::path::Path) {
     let status = std::process::Command::new(std::env::current_exe().expect("current test binary"))
         .arg("--exact")
-        .arg("two_process_restarts_reserve_distinct_handle_ranges")
-        .env(CHILD_DATA_DIR, data_dir)
+        .arg("two_process_restarts_issue_unrelated_handles")
         .env(CHILD_OUTPUT, output)
         .status()
         .expect("spawn restart child");
     assert!(status.success(), "restart child exited {status}");
 }
 
-fn write_one_child_handle(data_dir: &std::path::Path, output: &std::path::Path) {
-    let params = InspireParams::secure_128_d2048();
+fn write_one_child_handle(output: &std::path::Path) {
+    let params = InspireParams::d2048();
     let database = vec![0u8; params.ring_dim * ENTRY_SIZE];
     let (state, _) =
         setup_state(&params, &database, ENTRY_SIZE, InspireVariant::TwoPacking).expect("setup");
     let mut client = build_client_session((*state.crs).clone()).expect("client session");
-    let store = BoundedSessionStore::open_with_limits(data_dir, limits()).expect("durable open");
+    let store = BoundedSessionStore::open_with_limits(limits()).expect("open");
     let handle = store
         .register_client_session_at(&mut client, std::time::Instant::now())
         .expect("register")
@@ -446,24 +353,4 @@ fn read_u64(path: &std::path::Path) -> u64 {
         .try_into()
         .expect("u64 bytes");
     u64::from_be_bytes(bytes)
-}
-
-fn read_floor(path: &std::path::Path) -> u64 {
-    let bytes = std::fs::read(path).expect("read floor");
-    let floor: [u8; 8] = bytes
-        .get(10..18)
-        .expect("floor slice")
-        .try_into()
-        .expect("floor field");
-    u64::from_be_bytes(floor)
-}
-
-fn write_floor(path: &std::path::Path, floor: u64) {
-    let mut bytes = [0u8; 50];
-    bytes[..8].copy_from_slice(b"RVNHNDL1");
-    bytes[8..10].copy_from_slice(&1u16.to_be_bytes());
-    bytes[10..18].copy_from_slice(&floor.to_be_bytes());
-    let checksum = Sha256::digest(&bytes[..18]);
-    bytes[18..].copy_from_slice(&checksum);
-    std::fs::write(path, bytes).expect("write floor");
 }

@@ -180,7 +180,7 @@ async fn an_anchored_verdict_whose_repair_fails_marks_the_instance_divergent() {
     let dir = tempfile::tempdir().expect("tempdir");
     let chain_source = Arc::new(ScriptedChainSource::new(true));
     let config = verifying_config(dir.path(), INSTANCE_ID, &chain_source, 1);
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
 
     handle
@@ -249,7 +249,7 @@ async fn a_divergence_mark_outlives_the_process_that_set_it() {
     let dir = tempfile::tempdir().expect("tempdir");
     let chain_source = Arc::new(ScriptedChainSource::new(false));
     let config = verifying_config(dir.path(), INSTANCE_ID, &chain_source, 1);
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap 1");
 
     handle
@@ -278,12 +278,9 @@ async fn a_divergence_mark_outlives_the_process_that_set_it() {
     clear_layer2_divergent(INSTANCE_ID);
     let reopened_source = Arc::new(ScriptedChainSource::new(false));
     let reopened_config = verifying_config(dir.path(), INSTANCE_ID, &reopened_source, 1);
-    let reopened = bootstrap_railgun_engine(
-        reopened_config,
-        InspireParams::secure_128_d2048(),
-        build_toy_state,
-    )
-    .expect("bootstrap 2");
+    let reopened =
+        bootstrap_railgun_engine(reopened_config, InspireParams::d2048(), build_toy_state)
+            .expect("bootstrap 2");
 
     assert!(
         layer2_divergent_instances()
@@ -321,7 +318,7 @@ async fn a_stalled_commit_stream_must_not_silence_the_verifier() {
     let dir = tempfile::tempdir().expect("tempdir");
     let chain_source = Arc::new(ScriptedChainSource::new(false));
     let config = verifying_config(dir.path(), INSTANCE_ID, &chain_source, usize::MAX);
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
 
     for i in 0..3u32 {

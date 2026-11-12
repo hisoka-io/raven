@@ -22,12 +22,12 @@ use raven_railgun_engine::offline_packing_keys_cache::{
 const TEST_ENTRIES: usize = 256;
 const TEST_ENTRY_BYTES: usize = 32;
 const SCHEME_TAG: &[u8] = b"raven-inspire-twopacking-v1";
-const PACKING_PARAM_ID: &[u8] = b"InspireParams::secure_128_d2048";
+const PACKING_PARAM_ID: &[u8] = b"InspireParams::d2048";
 
 fn real_parts() -> &'static (PackParams, OfflinePackingKeys, bool) {
     static PARTS: OnceLock<(PackParams, OfflinePackingKeys, bool)> = OnceLock::new();
     PARTS.get_or_init(|| {
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let db = synthetic_db(TEST_ENTRIES, TEST_ENTRY_BYTES);
         let (state, _sk) =
             inspire::setup_state(&params, &db, TEST_ENTRY_BYTES, InspireVariant::TwoPacking)
@@ -42,7 +42,7 @@ fn real_parts() -> &'static (PackParams, OfflinePackingKeys, bool) {
 
 /// Two-poly stand-ins with the production ring and modulus, so the file keeps its real layout.
 fn synthetic_parts() -> (PackParams, OfflinePackingKeys) {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let zero = || Poly::zero(params.ring_dim, params.q);
     let pack_params = PackParams {
         num_to_pack: 16,
@@ -101,7 +101,7 @@ fn test_cell() -> CellShape {
 
 #[test]
 fn inspiring_seed_change_invalidates_the_cache_identity() {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let first = CellShape::for_inspiring(&params, 16, [1; 32]);
     let second = CellShape::for_inspiring(&params, 16, [2; 32]);
     assert_ne!(first.fingerprint(), second.fingerprint());

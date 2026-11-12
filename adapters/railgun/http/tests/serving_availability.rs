@@ -8,7 +8,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{header, Method, Request, StatusCode};
-use raven_inspire::params::{InspireParams, InspireVariant, SecurityLevel};
+use raven_inspire::params::{InspireParams, InspireVariant, ParamsLabel};
 use raven_railgun_core::InstanceId;
 use raven_railgun_engine::inspire::{setup_state, RavenInspireScheme};
 use raven_railgun_engine::{DrainState, Engine, InstanceRole, PirInstance};
@@ -29,7 +29,7 @@ fn params() -> InspireParams {
         query_gadget_len: 3,
         packing_gadget_len: 3,
         approximate_packing_gadget: false,
-        security_level: SecurityLevel::Bits128,
+        params_label: ParamsLabel::Primary,
     }
 }
 

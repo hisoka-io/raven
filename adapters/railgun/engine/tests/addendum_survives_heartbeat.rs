@@ -24,7 +24,7 @@ const LIST_KEY: [u8; 32] = [0xab; 32];
 const ENTRIES_PER_SHARD: u32 = 2_048;
 
 fn toy_state() -> InspireServerState {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = raven_railgun_testkit::toy_db(raven_railgun_testkit::TOY_ENTRIES, 32);
     let (state, _sk) =
         setup_state(&params, &db, 32, InspireVariant::TwoPacking).expect("toy setup_state");

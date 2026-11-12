@@ -13,6 +13,12 @@
  */
 export const EXPECTED_WIRE_SCHEMA_VERSION = 8;
 
+/** The schema of an instance whose parameter set has the approximate packing gadget. */
+export const EXPECTED_WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET = 9;
+
+/** How a refusal names the schemas this client speaks. */
+export const EXPECTED_SPOKEN_SCHEMAS = `${EXPECTED_WIRE_SCHEMA_VERSION} or ${EXPECTED_WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET}`;
+
 /** The two big-endian prefix bytes every batch and query body opens with. */
 export const EXPECTED_WIRE_SCHEMA_PREFIX: readonly [number, number] = [
   (EXPECTED_WIRE_SCHEMA_VERSION >>> 8) & 0xff,

@@ -181,7 +181,7 @@ fn boot(dir: &std::path::Path) -> OrchestratorHandle {
     };
     config.verification_cadence_n = 0;
     config.chain_source = None;
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap")
 }
 

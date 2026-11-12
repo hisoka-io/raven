@@ -254,6 +254,7 @@ fn serve_options(
         respond_permit_wait_ms: None,
         reorg_window_path: None,
         session_capacity: raven_railgun_cli::serve_production_multi::SessionCapacity::default(),
+        approximate_packing_gadget: false,
         stop_budget: progress::STOP_BUDGET_LIFTED,
     }
 }

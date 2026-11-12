@@ -156,7 +156,7 @@ fn run(args: &Args) -> ! {
     std::fs::create_dir_all(data_dir).expect("create_dir_all data_dir");
     let layout = StoreLayout::open(data_dir).expect("StoreLayout::open data_dir");
 
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let encoder = build_encoder();
     let instance_id = InstanceId::new(instance_id_for_tree(*tree_number));
     let fresh_state_factory = {

@@ -324,7 +324,7 @@ fn decrypt_rows(state: &InspireServerState, list_indices: &[u32]) -> Vec<Vec<u8>
 
 /// One shard served through setup, then decrypted.
 fn served_rows(database: &[u8], entry_size: usize, list_indices: &[u32]) -> Vec<Vec<u8>> {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let (state, _) =
         setup_state(&params, database, entry_size, InspireVariant::TwoPacking).expect("setup");
     decrypt_rows(&state, list_indices)
@@ -369,7 +369,7 @@ async fn served_after_commit(
     width: usize,
     list_indices: &[u32],
 ) -> Vec<Vec<u8>> {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let (fresh, _) = setup_state(
         &params,
         &seeded_rows(width),

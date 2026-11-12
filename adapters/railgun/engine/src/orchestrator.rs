@@ -807,7 +807,6 @@ fn open_data_dir(
         cfg.encoder.build(cfg.record_size, cfg.entries_per_shard)?;
 
     let session_store = Arc::new(crate::session_pool::BoundedSessionStore::open_with_limits(
-        layout.root(),
         session_limits,
     )?);
     // Packing stores are built once the instances serve: see `spawn_packing_store_builds`.
@@ -1696,7 +1695,7 @@ mod session_limit_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn every_store_a_multi_bootstrap_opens_carries_the_requested_limits() {
         let root = tempfile::tempdir().expect("tempdir");
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let (donor, secret_key) = crate::inspire::setup_state(
             &params,
             &raven_railgun_testkit::toy_db(raven_railgun_testkit::TOY_ENTRIES, ENTRY_SIZE),

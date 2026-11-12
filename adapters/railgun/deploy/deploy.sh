@@ -75,6 +75,10 @@ Options:
   --admin-cidr CIDR       with --print-sg: the IPv4 range SSH is opened to
   --vpc-id ID             with --print-sg: the VPC to create the group in
   --instance-id ID        with --print-sg: also print the command that attaches the group
+
+Environment:
+  RAVEN_APPROXIMATE_PACKING_GADGET=true   serve the approximate packing gadget: 36 KiB seats
+                          and wire schema 9, which a schema-8 wallet refuses (default false)
 EOF
 }
 

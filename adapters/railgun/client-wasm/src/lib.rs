@@ -7,7 +7,7 @@
 //!
 //! ```
 //! # use raven_inspire::{math::GaussianSampler, params::InspireParams, setup, ClientSession};
-//! # let params = InspireParams { ring_dim: 256, ..InspireParams::secure_128_d2048() };
+//! # let params = InspireParams { ring_dim: 256, ..InspireParams::d2048() };
 //! # let mut sampler = GaussianSampler::new(params.sigma);
 //! # let (crs, _, secret) = setup(&params, &vec![0u8; params.ring_dim * 32], 32, &mut sampler)?;
 //! # drop(secret);
@@ -20,7 +20,7 @@
 //!
 //! ```compile_fail,E0599
 //! # use raven_inspire::{math::GaussianSampler, params::InspireParams, setup, ClientSession};
-//! # let params = InspireParams { ring_dim: 256, ..InspireParams::secure_128_d2048() };
+//! # let params = InspireParams { ring_dim: 256, ..InspireParams::d2048() };
 //! # let mut sampler = GaussianSampler::new(params.sigma);
 //! # let (crs, _, secret) = setup(&params, &vec![0u8; params.ring_dim * 32], 32, &mut sampler)?;
 //! let session = ClientSession::new(crs, secret, &mut sampler)?;

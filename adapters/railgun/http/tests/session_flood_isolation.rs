@@ -40,7 +40,7 @@ struct Served {
 
 /// The server on its own small runtime, so the client's flood tasks do not share its workers.
 fn serve(config: HttpConfig) -> (Served, Vec<u8>) {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = raven_railgun_testkit::toy_db(ENTRIES, ENTRY_BYTES);
     let (state, sk) =
         setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking).expect("toy state");

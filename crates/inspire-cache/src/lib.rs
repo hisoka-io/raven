@@ -114,9 +114,9 @@ impl CellShape {
         identity.extend_from_slice(&params.sigma.to_bits().to_le_bytes());
         identity.extend_from_slice(&params.gadget_base.to_le_bytes());
         identity.extend_from_slice(&(params.packing_gadget_len as u64).to_le_bytes());
-        identity.push(match params.security_level {
-            raven_inspire::params::SecurityLevel::Bits128 => 0,
-            raven_inspire::params::SecurityLevel::Bits256 => 1,
+        identity.push(match params.params_label {
+            raven_inspire::params::ParamsLabel::Primary => 0,
+            raven_inspire::params::ParamsLabel::Secondary => 1,
         });
         identity.extend_from_slice(&(params.crt_moduli.len() as u64).to_le_bytes());
         for modulus in &params.crt_moduli {
@@ -124,6 +124,10 @@ impl CellShape {
         }
         identity.extend_from_slice(&(num_columns as u64).to_le_bytes());
         identity.extend_from_slice(&inspiring_w_seed);
+        // Appended only when on, so an exact set's identity keeps its bytes and its caches.
+        if params.approximate_packing_gadget {
+            identity.extend_from_slice(b"approximate-packing-gadget");
+        }
         Self {
             scheme_tag: b"raven-inspire-cache-v4".to_vec(),
             entries: 0,
@@ -424,7 +428,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use raven_inspire::params::{InspireParams, SecurityLevel};
+    use raven_inspire::params::{InspireParams, ParamsLabel};
 
     fn shape() -> CellShape {
         CellShape {
@@ -517,7 +521,7 @@ mod tests {
 
     #[test]
     fn inspiring_identity_binds_every_declared_input() {
-        let baseline_params = InspireParams::secure_128_d2048();
+        let baseline_params = InspireParams::d2048();
         let baseline = CellShape::for_inspiring(&baseline_params, 16, [7; 32]);
 
         let assert_params_change = |params: &InspireParams| {
@@ -551,7 +555,7 @@ mod tests {
         changed.packing_gadget_len += 1;
         assert_params_change(&changed);
         changed = baseline_params.clone();
-        changed.security_level = SecurityLevel::Bits256;
+        changed.params_label = ParamsLabel::Secondary;
         assert_params_change(&changed);
         changed = baseline_params.clone();
         changed.crt_moduli.push(17);
@@ -565,6 +569,57 @@ mod tests {
             CellShape::for_inspiring(&baseline_params, 16, [8; 32]).packing_param_id,
             baseline.packing_param_id
         );
+        assert_params_change(&InspireParams::d2048_approximate_gadget());
+    }
+
+    /// The identity as it was composed before the gadget option was bound into it.
+    fn identity_before_the_option(
+        params: &InspireParams,
+        columns: usize,
+        seed: [u8; 32],
+    ) -> Vec<u8> {
+        let mut identity = Vec::new();
+        for word in [
+            params.ring_dim as u64,
+            params.q,
+            params.p,
+            params.sigma.to_bits(),
+        ] {
+            identity.extend_from_slice(&word.to_le_bytes());
+        }
+        identity.extend_from_slice(&params.gadget_base.to_le_bytes());
+        identity.extend_from_slice(&(params.packing_gadget_len as u64).to_le_bytes());
+        identity.push(u8::from(params.params_label == ParamsLabel::Secondary));
+        identity.extend_from_slice(&(params.crt_moduli.len() as u64).to_le_bytes());
+        for modulus in &params.crt_moduli {
+            identity.extend_from_slice(&modulus.to_le_bytes());
+        }
+        identity.extend_from_slice(&(columns as u64).to_le_bytes());
+        identity.extend_from_slice(&seed);
+        identity
+    }
+
+    /// An exact set keeps the identity, and so the cache files, it always had; the
+    /// approximate set of the same shape does not share it.
+    #[test]
+    fn the_gadget_option_moves_only_the_approximate_identity() {
+        for columns in [16usize, 128, 256] {
+            let exact = InspireParams::d2048();
+            assert_eq!(
+                CellShape::for_inspiring(&exact, columns, [9; 32]).packing_param_id,
+                identity_before_the_option(&exact, columns, [9; 32])
+            );
+            let approximate = InspireParams::d2048_approximate_gadget();
+            assert_ne!(
+                CellShape::for_inspiring(&approximate, columns, [9; 32]).fingerprint(),
+                CellShape::for_inspiring(&exact, columns, [9; 32]).fingerprint()
+            );
+            assert_eq!(
+                identity_before_the_option(&approximate, columns, [9; 32]),
+                identity_before_the_option(&exact, columns, [9; 32]),
+                "control: without the option bound in, the two sets collide"
+            );
+        }
     }
 
     proptest! {

@@ -51,8 +51,9 @@ KEYS = {
     "lane_counts": ([], [".config/nextest.toml", "adapters/railgun/.config/**"]),
     "inspire": (["crates/inspire/Cargo.toml"], []),
     "eth_state": (["adapters/eth-state/Cargo.toml"], []),
-    # the submodule's gitlink: its crates are path dependencies, but a bump changes only that path
-    "howl": (["adapters/howl-node/Cargo.toml", HOWL_CLIENT], ["adapters/howl"]),
+    # the submodule's gitlink: its crates are path dependencies, but a bump changes only that path;
+    # the packages it gates carry the root LICENSE byte for byte
+    "howl": (["adapters/howl-node/Cargo.toml", HOWL_CLIENT], ["adapters/howl", "LICENSE"]),
     "b1_bench": (["benches/b1-bench/Cargo.toml"], []),
     # tests/tracked_baseline.rs reads the committed baselines
     "bench_compare": (["tools/bench-compare/Cargo.toml"], ["benches/baselines/**"]),
@@ -61,8 +62,17 @@ KEYS = {
     "msrv_1_89": ([ROOT, CLIENT_WASM, "adapters/howl-node/Cargo.toml", HOWL_CLIENT, "benches/b1-bench/Cargo.toml",
                    "crates/inspire/Cargo.toml", "tools/bench-compare/Cargo.toml", RAILGUN], ["adapters/howl"]),
     "msrv_1_91": (["adapters/eth-state/Cargo.toml", RAILGUN], []),
-    # the SDK gates read Rust constants and scripts from across the adapter
-    "sdk": ([CLIENT_WASM, RAILGUN], ["adapters/railgun/**"]),
+    # the SDK gates read Rust constants and scripts from across the adapter, and its package
+    # carries the root LICENSE byte for byte
+    "sdk": ([CLIENT_WASM, RAILGUN], ["adapters/railgun/**", "LICENSE"]),
+    # Each image builds one adapter workspace, and cargo loads the root workspace for its path
+    # dependencies. The Howl context is the root, filtered by .dockerignore; the Railway context
+    # is what its up.sh stages, which the adapter workspace holds.
+    "howl_image": ([ROOT, "adapters/howl-node/Cargo.toml"], ["adapters/howl", ".dockerignore"]),
+    "railgun_image": ([ROOT, RAILGUN], []),
+    # its own workspace over the decoders' crates by path, so a decoder change rebuilds the targets;
+    # the seeds read the SDK's recorded answers
+    "fuzz": (["fuzz/Cargo.toml"], ["adapters/howl", "adapters/howl-node/sdk/tests/fixtures/**"]),
 }
 
 # A change here selects every job.
@@ -71,7 +81,7 @@ ALL = [".github/**", "scripts/**", "rust-toolchain.toml", "**/rust-toolchain.tom
 
 # Read by no filtered job. Markdown is included by no Rust source (the selftest checks), except
 # the SDK README, which ships in its package.
-NO_JOB = ["LICENSE", ".gitignore", ".dockerignore", ".gitleaks.toml", "deny.toml"]
+NO_JOB = [".gitignore", ".gitleaks.toml", "deny.toml"]
 NO_JOB_MD_EXCEPT = ["adapters/railgun/sdk/**"]
 
 # Subtrees of a detached workspace directory that its cargo build never reads. The SDK fixtures

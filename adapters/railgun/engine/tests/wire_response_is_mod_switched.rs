@@ -94,7 +94,7 @@ fn the_switched_response_extracts_to_the_row_and_the_unswitched_extractor_cannot
 /// carry must fail where an operator sees it, not boot healthy and refuse every query.
 #[test]
 fn a_parameter_set_the_served_rung_cannot_carry_is_refused_at_setup() {
-    let mut params = InspireParams::secure_128_d2048();
+    let mut params = InspireParams::d2048();
     params.p = (1 << 22) + 1;
     let err = setup_state(
         &params,

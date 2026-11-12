@@ -17,7 +17,7 @@
 mod wasm_only {
     use raven_client::{build_seeded_query_rust, extract_response_rust};
     use raven_inspire::math::GaussianSampler;
-    use raven_inspire::params::{InspireParams, SecurityLevel};
+    use raven_inspire::params::{InspireParams, ParamsLabel};
     use raven_inspire::respond_seeded_inspiring_cached_with_session;
     use raven_inspire::{
         setup as inspire_setup, ClientSession, ServerInspiringCache, ServerSessionStore,
@@ -37,7 +37,7 @@ mod wasm_only {
             query_gadget_len: 3,
             packing_gadget_len: 3,
             approximate_packing_gadget: false,
-            security_level: SecurityLevel::Bits128,
+            params_label: ParamsLabel::Primary,
         }
     }
 

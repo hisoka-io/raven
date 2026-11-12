@@ -79,7 +79,7 @@ impl ProductionCell {
     /// Stands up `setup_state` at the production cell and serves it over loopback.
     pub async fn spawn() -> Self {
         let setup_start = Instant::now();
-        let params = InspireParams::secure_128_d2048();
+        let params = InspireParams::d2048();
         let db = build_synthetic_db(entries(), ENTRY_BYTES);
         let (server_state, _) = setup_state(&params, &db, ENTRY_BYTES, InspireVariant::TwoPacking)
             .expect("setup_state");

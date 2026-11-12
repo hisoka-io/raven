@@ -51,6 +51,9 @@ jobs:
       msrv_1_89: ${{ steps.select.outputs.msrv_1_89 }}
       msrv_1_91: ${{ steps.select.outputs.msrv_1_91 }}
       sdk: ${{ steps.select.outputs.sdk }}
+      howl_image: ${{ steps.select.outputs.howl_image }}
+      railgun_image: ${{ steps.select.outputs.railgun_image }}
+      fuzz: ${{ steps.select.outputs.fuzz }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -239,6 +242,14 @@ jobs:
       - name: job selector red-proof
         if: ${{ !cancelled() }}
         run: scripts/ci-changes-selftest.sh
+      # The scripts that decide where each AVX-512 differential is required, and the check that
+      # the nightly Howl e2e plant went red for the planted fault alone.
+      - name: SIMD capability red-proof
+        if: ${{ !cancelled() }}
+        run: scripts/simd-capability-selftest.sh
+      - name: e2e plant checker red-proof
+        if: ${{ !cancelled() }}
+        run: python3 -I adapters/howl-node/e2e/test_check_plant.py
 
   advisories:
     name: cargo-deny full check (every workspace)
@@ -272,6 +283,8 @@ jobs:
             cargo deny --manifest-path "$manifest" --all-features check -c deny.toml
             echo "::endgroup::"
           done
+          # the fuzz harness ships nothing, so its lockfile is held to the advisories alone
+          cargo deny --manifest-path fuzz/Cargo.toml --all-features check advisories -c deny.toml
 
   secret-scan:
     name: secret scan (gitleaks)
@@ -407,7 +420,8 @@ jobs:
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
-      # re-declare -D warnings since RUSTFLAGS overrides the workflow-level env
+      # re-declare -D warnings since RUSTFLAGS overrides the workflow-level env. The lld is the
+      # toolchain's own rust-lld (gcc-ld), so no job on 1.98 installs a system lld.
       RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=lld"
     steps:
       - name: free disk space
@@ -427,13 +441,16 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@1.98.0
         if: ${{ needs.changes.outputs.railgun != 'false' }}
-      - name: install lld linker
-        if: ${{ needs.changes.outputs.railgun != 'false' }}
-        run: sudo apt-get update && sudo apt-get install -y lld
       - name: install sccache
         if: ${{ needs.changes.outputs.railgun != 'false' }}
-        # v0.0.10 ships sccache 0.10+ for the GHA cache v2 endpoint
-        uses: mozilla-actions/sccache-action@v0.0.10
+        # v0.0.10 ships sccache 0.10+ for the GHA cache v2 endpoint. A failed download costs the
+        # run its cache, never its build: the next step drops the wrapper.
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: compile without sccache when it did not install
+        if: ${{ needs.changes.outputs.railgun != 'false' }}
+        run: sccache --show-stats >/dev/null 2>&1 || echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         if: ${{ needs.changes.outputs.railgun != 'false' }}
         with:
@@ -461,7 +478,7 @@ jobs:
             --cargo-profile ci-test \
             --profile ci
       - name: sccache stats
-        run: sccache --show-stats
+        run: if [ -n "${RUSTC_WRAPPER:-}" ]; then sccache --show-stats; fi
         if: ${{ always() && needs.changes.outputs.railgun != 'false' }}
 
   lane-counts:
@@ -495,12 +512,16 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@1.98.0
-      - name: install lld linker
-        run: sudo apt-get update && sudo apt-get install -y lld
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "railgun"
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: install sccache
+        # a failed download costs the run its cache, never its build: see railgun-tests
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: compile without sccache when it did not install
+        run: sccache --show-stats >/dev/null 2>&1 || echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       # One release in every job, the one the nextest-reading gates are proven against: an
       # unpinned install took 0.9.146, whose show-config shape the gate did not read.
       # scripts/check-rust-toolchain-pin.sh fails a floating or divergent pin.
@@ -525,7 +546,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: scripts/check-ci-filter-names-selftest.sh --selected
       - name: sccache stats
-        run: sccache --show-stats
+        run: if [ -n "${RUSTC_WRAPPER:-}" ]; then sccache --show-stats; fi
         if: always()
 
   durability-and-closure:
@@ -635,9 +656,13 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@1.98.0
-      - name: install lld linker
-        run: sudo apt-get update && sudo apt-get install -y lld
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - name: install sccache
+        # a failed download costs the run its cache, never its build: see railgun-tests
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: compile without sccache when it did not install
+        run: sccache --show-stats >/dev/null 2>&1 || echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "railgun-tests"
@@ -663,7 +688,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: scripts/assert-lane-counts.sh --lane "durability-and-closure/${{ matrix.lane.name }}"
       - name: sccache stats
-        run: sccache --show-stats
+        run: if [ -n "${RUSTC_WRAPPER:-}" ]; then sccache --show-stats; fi
         if: always()
 
   production-cell-closure:
@@ -718,9 +743,13 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@1.98.0
-      - name: install lld linker
-        run: sudo apt-get update && sudo apt-get install -y lld
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - name: install sccache
+        # a failed download costs the run its cache, never its build: see railgun-tests
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: compile without sccache when it did not install
+        run: sccache --show-stats >/dev/null 2>&1 || echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "railgun-tests"
@@ -758,7 +787,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: scripts/assert-lane-counts.sh --lane production-cell-closure/inline
       - name: sccache stats
-        run: sccache --show-stats
+        run: if [ -n "${RUSTC_WRAPPER:-}" ]; then sccache --show-stats; fi
         if: always()
 
   inspire-tests:
@@ -791,9 +820,13 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
           components: clippy, rustfmt
-      - name: install lld linker
-        run: sudo apt-get update && sudo apt-get install -y lld
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - name: install sccache
+        # a failed download costs the run its cache, never its build: see railgun-tests
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: compile without sccache when it did not install
+        run: sccache --show-stats >/dev/null 2>&1 || echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "inspire-tests"
@@ -806,28 +839,18 @@ jobs:
         # the default-feature lint above never compiles it.
         run: cargo clippy --manifest-path crates/inspire/Cargo.toml --all-targets --features mod-switch-response -- -D warnings
       - name: record runner SIMD capability
-        # Runners are heterogeneous, so record the answer and let each step decide.
-        #
-        # This used to export RAVEN_REQUIRE_AVX512=1 to GITHUB_ENV, which is global and was
-        # wrong in both directions. That flag turns a SIMD test's skip into a failure, and
-        # arming it ONLY on capable runners meant the capability guard could never fire (the
-        # host always had the flags) while the cargo-feature guard always fired (the default
-        # step does not build with simd-packing-offline). The lane therefore failed exactly
-        # when it landed on a capable runner, which read as a flake.
-        #
-        # RAVEN_HAS_AVX512 keys on IFMA, the packing kernels' requirement. The special-modulus
-        # kernel needs F/BW/DQ/VL instead and checks them itself, so on a runner without AVX-512
-        # (the AMD hosted runners) its differential loud-skips. That kernel is proven on capable
-        # runners and on a capable local host; per-kernel strictness is the next step.
+        # Each AVX-512 differential is required on exactly the runners that carry its own kernel's
+        # flags and loud-skips by name elsewhere. Hosted runners do not guarantee AVX-512, and the
+        # two kernels need different flags: the IFMA52 packing and Montgomery kernels avx512f and
+        # avx512ifma, the special-modulus kernel avx512f/bw/dq/vl. A single switch keyed on IFMA
+        # left the special-modulus differential unenforced on a runner with F/BW/DQ/VL and no IFMA.
+        # RAVEN_REQUIRE_AVX512 is set per step, never job-wide: it also fails the cargo-feature
+        # guard, which the default step trips by design. To prove both kernels on an AVX-512 host:
+        #   RAVEN_REQUIRE_AVX512=1 cargo test --manifest-path crates/inspire/Cargo.toml \
+        #     --release --features simd-packing-offline
         run: |
-          flags=$(grep -o 'avx512[a-z0-9_]*' /proc/cpuinfo | sort -u | tr '\n' ' ') || flags=""
-          echo "runner avx512 flags: ${flags:-none}"
-          if grep -qw avx512ifma /proc/cpuinfo && grep -qw avx512f /proc/cpuinfo; then
-            echo "RAVEN_HAS_AVX512=1" >> "$GITHUB_ENV"
-            echo "runner HAS avx512ifma - the SIMD differential will really run"
-          else
-            echo "runner LACKS avx512ifma - the SIMD halves will loud-skip by name"
-          fi
+          echo "runner avx512 flags: $(grep -o 'avx512[a-z0-9_]*' /proc/cpuinfo | sort -u | tr '\n' ' ')"
+          scripts/simd-capability.sh | tee -a "$GITHUB_ENV"
       - name: cargo test (default)
         # The DEFAULT feature set, which is what a client builds, so no feature flags and no
         # strictness: the SIMD halves loud-skip here by design and are gated in their own step.
@@ -844,21 +867,37 @@ jobs:
         # The only lane where the packing differential is a differential rather than the
         # scalar path compared against itself -- without this feature the dispatch under test
         # IS the scalar reference, which is why simd_packing_offline_kat was green-vacuous on
-        # every run it ever made. Strictness is armed only when the runner can actually
-        # execute the kernels, so both guards are satisfiable: on a capable runner a skip is a
-        # failure, on an incapable one it is a named loud skip. The whole suite runs here, so
-        # the KAT is covered; a second step naming just the KAT ran it again WITHOUT the
-        # strictness, which is the weaker of the two answers and the one a reader would trust.
-        # This suite also holds the special-modulus differential
-        # (kernels_give_the_same_table_and_response), which runs wherever F/BW/DQ/VL are present
-        # and loud-skips elsewhere; the IFMA-keyed strictness does not cover it (see above).
+        # every run it ever made. The whole suite runs here, so the KAT is covered, strict
+        # wherever the runner carries the IFMA kernels' flags. The special-modulus differential
+        # has its own step below, keyed on its own flags. --show-output is what makes a skip
+        # visible: libtest otherwise swallows a passing test's stderr.
         env:
-          RAVEN_REQUIRE_AVX512: ${{ env.RAVEN_HAS_AVX512 }}
+          RAVEN_REQUIRE_AVX512: ${{ env.RAVEN_HAS_AVX512_IFMA }}
         run: |
           set -euo pipefail
           mkdir -p target/inspire-results
           cargo test --manifest-path crates/inspire/Cargo.toml --release --no-fail-fast \
-            --features simd-packing-offline 2>&1 | tee target/inspire-results/simd-packing-offline.txt
+            --features simd-packing-offline -- --show-output \
+            --skip kernels_give_the_same_table_and_response \
+            2>&1 | tee target/inspire-results/simd-packing-offline.txt
+          scripts/simd-skips.sh target/inspire-results/simd-packing-offline.txt "$RAVEN_REQUIRE_AVX512"
+      - name: cargo test (special-modulus kernel differential)
+        # The portable and AVX-512 special-modulus kernels give the same table and responses.
+        # Strict wherever the runner carries avx512f/bw/dq/vl, whether or not it has IFMA.
+        env:
+          RAVEN_REQUIRE_AVX512: ${{ env.RAVEN_HAS_AVX512_SPECIAL_MODULUS }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/inspire-results
+          name=kernels_give_the_same_table_and_response
+          listed=$(cargo test --manifest-path crates/inspire/Cargo.toml --release \
+            --features simd-packing-offline --test special_modulus_kat -- --list)
+          /usr/bin/grep -Fxq "$name: test" <<< "$listed"
+          cargo test --manifest-path crates/inspire/Cargo.toml --release \
+            --features simd-packing-offline --test special_modulus_kat "$name" -- --exact --show-output \
+            2>&1 | tee target/inspire-results/special-modulus-kernels.txt
+          /usr/bin/grep -q "^test $name ... ok$" target/inspire-results/special-modulus-kernels.txt
+          scripts/simd-skips.sh target/inspire-results/special-modulus-kernels.txt "$RAVEN_REQUIRE_AVX512"
       - name: cargo test (parallel feature)
         # re-runs the byte-identity KAT under the rayon path so it cannot regress undetected
         run: |
@@ -946,6 +985,19 @@ jobs:
             -- --ignored --exact commit_d_preset_default_q_passes_smoke_at_2_20_x_256b \
             2>&1 | tee target/inspire-results/production-scale-round-trip.txt
           /usr/bin/grep -Eq '^test result: ok\. 1 passed; 0 failed' target/inspire-results/production-scale-round-trip.txt
+      # The approximate packing gadget's served noise against the exact gadget's, at gamma 128 and
+      # 256 over 50 fresh secrets each. A preset serves the gadget, so a change to the gadget, the
+      # packing recursion or the noise sampling is held to the exact gadget's margin here.
+      - name: cargo test (approximate packing gadget noise gate)
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/inspire-results
+          cargo test --manifest-path crates/inspire/Cargo.toml --release \
+            --features mod-switch-response,parallel --bench approximate_gadget_noise \
+            -- --ignored --exact served::approximate_gadget_keeps_the_exact_gadgets_margin --nocapture \
+            2>&1 | tee target/inspire-results/approximate-gadget-noise.txt
+          /usr/bin/grep -Eq '^test result: ok\. 1 passed; 0 failed' target/inspire-results/approximate-gadget-noise.txt
       # The packing round trips and KATs run inside the suite steps above, so their verdicts are
       # kept the same way: a file that can be diffed against an earlier run.
       - name: upload packing round-trip results
@@ -959,7 +1011,7 @@ jobs:
         run: cargo check --manifest-path crates/inspire/Cargo.toml --target wasm32-unknown-unknown --no-default-features
       - name: sccache stats
         if: always()
-        run: sccache --show-stats
+        run: if [ -n "${RUSTC_WRAPPER:-}" ]; then sccache --show-stats; fi
 
   eth-state-example:
     # adapters/eth-state is a submodule that builds against this checkout's crates by path.
@@ -1012,6 +1064,11 @@ jobs:
         run: cargo test --manifest-path adapters/howl-node/Cargo.toml --all-targets --locked
       - name: cargo test --doc
         run: cargo test --manifest-path adapters/howl-node/Cargo.toml --doc --locked
+      # The image's entrypoint, run without the image: rendered arguments and refusals.
+      - name: image entrypoint checks
+        run: adapters/howl-node/deploy/check-entrypoint.sh
+      - name: image entrypoint checks red-proof
+        run: adapters/howl-node/deploy/check-entrypoint.sh --red-proof
 
   howl-client:
     # The wallet's side: the wasm client against a node driven in-process, then the TypeScript
@@ -1050,9 +1107,14 @@ jobs:
         run: cargo test --manifest-path adapters/howl-node/client-wasm/Cargo.toml --locked
       - name: install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-      - name: build wasm-pack pkg-node
-        working-directory: adapters/howl-node/client-wasm
-        run: wasm-pack build --release --target nodejs --scope hisoka-io --out-dir pkg-node --out-name howl_client_wasm
+      # Builds pkg-node, which the TypeScript suite links, pkg-bundler and pkg-web, holds all three
+      # to the gzipped ceiling and checks each is a publishable package.
+      - name: build wasm-pack pkg-node + pkg-bundler + pkg-web + size and package gates
+        run: adapters/howl-node/client-wasm/scripts/check-wasm-size.sh
+      - name: wasm size gate red-proof
+        run: adapters/howl-node/client-wasm/scripts/check-wasm-size-selftest.sh
+      - name: package gate red-proof
+        run: adapters/howl-node/client-wasm/scripts/check-packages-selftest.sh
       - name: build the node binary
         run: cargo build --release --manifest-path adapters/howl-node/Cargo.toml -p howl-node --locked
       - name: pnpm install
@@ -1060,6 +1122,10 @@ jobs:
         working-directory: adapters/howl-node/sdk
       - name: pnpm typecheck
         run: pnpm typecheck
+        working-directory: adapters/howl-node/sdk
+      # the tarball npm would publish: dist as built, the README, the root LICENSE byte for byte
+      - name: pnpm build + pack gate
+        run: pnpm build && pnpm check-pack
         working-directory: adapters/howl-node/sdk
       # The suite with the node binary, held to tests/EXPECTED_COUNTS.json: a live suite that
       # skips fails here. The cross-check against Howl's own wallet code needs a Howl checkout
@@ -1069,6 +1135,103 @@ jobs:
           HOWL_NODE_BIN: ${{ github.workspace }}/adapters/howl-node/target/release/howl-node
         run: node scripts/check-test-count.mjs
         working-directory: adapters/howl-node/sdk
+
+  # The decoders a hostile body reaches first, through each crate's public decode functions:
+  # Railgun's session, query and batch bodies with their admission checks and its params blob,
+  # Howl's session and notes bodies, and the answers a wallet reads. A change to those crates
+  # builds every target; the nightly also runs each for FUZZ_SECONDS from honest seeds and keeps
+  # a crash's input.
+  fuzz:
+    name: decoder fuzzing (cargo-fuzz)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.fuzz != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # libFuzzer needs a nightly; a dated one, so a new nightly cannot red the job
+      FUZZ_TOOLCHAIN: nightly-2026-09-23
+      FUZZ_SECONDS: "60"
+      # the product crates are linted on the pinned stable; a newer nightly's lint is no fuzz finding
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt
+      - name: cargo fmt
+        run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+      - name: install the fuzz toolchain
+        timeout-minutes: 10
+        run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: install cargo-fuzz
+        timeout-minutes: 15
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      # cargo-fuzz takes no --locked; this refuses a fuzz/Cargo.lock that no longer resolves as is
+      - name: fuzz/Cargo.lock is current
+        run: cargo "+$FUZZ_TOOLCHAIN" metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml >/dev/null
+      - name: build every target
+        run: cargo "+$FUZZ_TOOLCHAIN" fuzz build --fuzz-dir fuzz
+      - name: fuzz each target
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: fuzz/run.sh "$FUZZ_SECONDS"
+      - name: keep crash inputs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ github.run_id }}
+          path: fuzz/artifacts/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # The node images, built from their Dockerfiles and run once with no network by
+  # scripts/image-smoke.sh: the liveness route answers, the node runs as its own user, and a stop
+  # exits clean. Nothing is pushed; the jobs hold no registry credential.
+  howl-image:
+    name: Howl node image (build + smoke run)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.howl_image != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: docker build
+        run: docker build --progress=plain -f adapters/howl-node/deploy/Dockerfile -t raven-ci/howl-node:ci .
+      - name: smoke run
+        run: scripts/image-smoke.sh howl-node raven-ci/howl-node:ci
+
+  railgun-image:
+    name: Railgun node image for Railway (build + smoke run)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.railgun_image != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+          persist-credentials: false
+      # The context Railway builds: the tracked files under the Dockerfile's COPY paths.
+      - name: stage the Railway build context
+        run: adapters/railgun/deploy/railway/up.sh --stage-only "$RUNNER_TEMP/railway-context"
+      - name: docker build
+        run: |
+          docker build --progress=plain -t raven-ci/railgun-node:ci \
+            -f "$RUNNER_TEMP/railway-context/adapters/railgun/deploy/railway/Dockerfile" \
+            "$RUNNER_TEMP/railway-context"
+      - name: smoke run
+        run: scripts/image-smoke.sh railgun-node raven-ci/railgun-node:ci
 
   b1-bench:
     name: b1-bench (detached workspace)
@@ -1144,7 +1307,8 @@ jobs:
       - name: install clippy for the toolchain this job actually selects
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --component clippy
       - name: install lld linker
-        run: sudo apt-get update && sudo apt-get install -y lld
+        timeout-minutes: 10
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y lld
       - uses: Swatinem/rust-cache@v2
       - name: verify, build, and lint the exact 1.89 package set
         run: |
@@ -1408,9 +1572,11 @@ jobs:
       - name: stage the sdk pack candidate
         run: |
           set -euo pipefail
+          # shellcheck disable=SC2016  # a JavaScript template literal
           want=$(node -p 'const m = require("./adapters/railgun/sdk/package.json"); `${m.name}@${m.version}`')
           out="$RUNNER_TEMP/sdk-pack-candidate"
           mkdir -p "$out"
+          # shellcheck disable=SC2016  # a JavaScript template literal
           for tgz in "$RUNNER_TEMP"/sdk-pack/tar/*.tgz; do
             got=$(tar -xOzf "$tgz" package/package.json \
               | node -p 'const m = JSON.parse(require("node:fs").readFileSync(0, "utf8")); `${m.name}@${m.version}`')
@@ -1421,6 +1587,7 @@ jobs:
           cd "$out"
           sha256sum -- *.tgz > SHA256SUMS
           # The form a registry reports as dist.integrity, so a published copy can be matched to this one.
+          # shellcheck disable=SC2016  # a JavaScript template literal
           node -e 'const c = require("node:crypto"), f = require("node:fs");
             for (const p of process.argv.slice(1)) console.log(`sha512-${c.createHash("sha512").update(f.readFileSync(p)).digest("base64")}  ${p}`)' \
             -- *.tgz > INTEGRITY

@@ -19,7 +19,7 @@ use raven_railgun_engine::offline_packing_keys_cache::{CellShape, OfflinePacking
 const PROD_ENTRIES: usize = 65_536;
 const PROD_ENTRY_BYTES: usize = 512;
 const SCHEME_TAG: &[u8] = b"raven-inspire-twopacking-v1";
-const PACKING_PARAM_ID: &[u8] = b"InspireParams::secure_128_d2048";
+const PACKING_PARAM_ID: &[u8] = b"InspireParams::d2048";
 
 fn synthetic_db(entries: usize, entry_bytes: usize) -> Vec<u8> {
     #[allow(clippy::cast_possible_truncation)]
@@ -41,7 +41,7 @@ fn production_cell_three_seed_cold_vs_warm() {
     eprintln!(
         "offline_packing_keys_cache: production-cell bench cell={PROD_ENTRIES} entries × {PROD_ENTRY_BYTES} B"
     );
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let mut cold_timings: Vec<Duration> = Vec::with_capacity(3);
     let mut warm_timings: Vec<Duration> = Vec::with_capacity(3);
     let mut cache_size_bytes: u64 = 0;

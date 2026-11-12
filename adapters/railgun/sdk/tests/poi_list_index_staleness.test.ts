@@ -115,7 +115,12 @@ describe("an index answers an absence only at the row count the node serves", ()
     );
 
     expect(got[appended][LIST_KEY_HEX]).toBe("Valid");
-    expect(sdk.indexCounters()).toStrictEqual({ absent: 0, staleIndexesCaught: 1 });
+    expect(sdk.indexCounters()).toStrictEqual({
+      absent: 0,
+      staleIndexesCaught: 1,
+      speculativeRounds: 0,
+      speculativeRoundsDiscarded: 0,
+    });
   });
 
   it("answers a commitment absent from every served row as Missing, and counts it", async () => {
@@ -127,7 +132,12 @@ describe("an index answers an absence only at the row count the node serves", ()
     const got = await sdk.getPOIsPerList([LIST_KEY_HEX], stranger());
 
     expect(got[commitmentAt(99)][LIST_KEY_HEX]).toBe("Missing");
-    expect(sdk.indexCounters()).toStrictEqual({ absent: 1, staleIndexesCaught: 0 });
+    expect(sdk.indexCounters()).toStrictEqual({
+      absent: 1,
+      staleIndexesCaught: 0,
+      speculativeRounds: 0,
+      speculativeRoundsDiscarded: 0,
+    });
     expect(prefixRequests(server)).toStrictEqual([`/v1/poi/${LIST_KEY_HEX}/bc-prefixes?since=0`]);
   });
 

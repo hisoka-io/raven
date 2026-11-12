@@ -29,7 +29,7 @@ mod wasm_only {
         register_client_session, serialize_client_session, ClientSessionHandle,
     };
     use raven_inspire::math::GaussianSampler;
-    use raven_inspire::params::{InspireParams, SecurityLevel, ShardConfig};
+    use raven_inspire::params::{InspireParams, ParamsLabel, ShardConfig};
     use raven_inspire::setup as inspire_setup;
     use wasm_bindgen_test::wasm_bindgen_test;
 
@@ -46,7 +46,7 @@ mod wasm_only {
             query_gadget_len: 3,
             packing_gadget_len: 3,
             approximate_packing_gadget: false,
-            security_level: SecurityLevel::Bits128,
+            params_label: ParamsLabel::Primary,
         }
     }
 
@@ -286,7 +286,7 @@ mod wasm_only {
 mod native {
     use raven_client::{build_client_session, build_instance_params_blob, register_client_session};
     use raven_inspire::math::GaussianSampler;
-    use raven_inspire::params::{InspireParams, SecurityLevel, ShardConfig};
+    use raven_inspire::params::{InspireParams, ParamsLabel, ShardConfig};
     use raven_inspire::setup as inspire_setup;
 
     const ENTRY_BYTES: usize = 32;
@@ -302,7 +302,7 @@ mod native {
             query_gadget_len: 3,
             packing_gadget_len: 3,
             approximate_packing_gadget: false,
-            security_level: SecurityLevel::Bits128,
+            params_label: ParamsLabel::Primary,
         }
     }
 
@@ -352,14 +352,14 @@ mod native {
     }
 
     /// Pins why the drift fixtures above are hand-built rather than the two shipped
-    /// presets: `secure_128_d2048` and `secure_128_d4096` differ in `ring_dim` ALONE,
+    /// presets: `d2048` and `d4096` differ in `ring_dim` ALONE,
     /// so a d2048-vs-d4096 drift test exercises one of the guard's four comparisons and
     /// stays green while the other three are deleted. If a future edit makes the presets
     /// differ in `q`, `p` or `sigma`, this reddens and the preset pair becomes usable.
     #[test]
     fn the_shipped_preset_pair_differs_only_in_ring_dim() {
-        let d2048 = InspireParams::secure_128_d2048();
-        let d4096 = InspireParams::secure_128_d4096();
+        let d2048 = InspireParams::d2048();
+        let d4096 = InspireParams::d4096();
         assert!(d2048.validate().is_ok(), "d2048 preset must validate");
         assert!(d4096.validate().is_ok(), "d4096 preset must validate");
 

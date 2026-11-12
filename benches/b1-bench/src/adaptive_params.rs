@@ -1,7 +1,7 @@
 //! Port of Google's `params_for_scenario_medium_payload` (see
 //! `private-membership/research/InsPIRe/src/params.rs:109-167`).
 
-use raven_inspire::params::{InspireParams, SecurityLevel};
+use raven_inspire::params::{InspireParams, ParamsLabel};
 
 #[derive(Debug, Clone, Copy)]
 pub struct AdaptiveInputs {
@@ -169,7 +169,7 @@ pub fn to_inspire_params(d: &AdaptiveDerivation) -> InspireParams {
         query_gadget_len: d.t_exp_left,
         packing_gadget_len: d.t_exp_left,
         approximate_packing_gadget: false,
-        security_level: SecurityLevel::Bits128,
+        params_label: ParamsLabel::Primary,
     }
 }
 
@@ -203,7 +203,7 @@ pub fn fmt_derivation(inputs: &AdaptiveInputs, d: &AdaptiveDerivation) -> String
             "InspireParams: ring_dim={ring_dim}, q={q} (log2={q_log2:.4}), ",
             "crt_moduli={crt_moduli:?}, p={bridge_p}, sigma={bridge_sigma}, ",
             "gadget_base={gadget_base}, query_gadget_len={query_gadget_len}, ",
-            "packing_gadget_len={packing_gadget_len}, security={sec_level:?}\n",
+            "packing_gadget_len={packing_gadget_len}, label={params_label:?}\n",
         ),
         num_items = inputs.input_num_items,
         num_items_log2 = (inputs.input_num_items as f64).log2() as u32,
@@ -243,6 +243,6 @@ pub fn fmt_derivation(inputs: &AdaptiveInputs, d: &AdaptiveDerivation) -> String
         gadget_base = inspire.gadget_base,
         query_gadget_len = inspire.query_gadget_len,
         packing_gadget_len = inspire.packing_gadget_len,
-        sec_level = inspire.security_level,
+        params_label = inspire.params_label,
     )
 }

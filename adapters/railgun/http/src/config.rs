@@ -60,7 +60,8 @@ pub struct HttpConfig {
     /// and [`crate::inspire_router`] applies it to the booted instances.
     pub session_lru_cap: usize,
     /// Packing-key seats per instance, and so a memory bound: a seat holds one ring polynomial
-    /// per packing-key row, 48 KiB at `d = 2048` whatever the row size.
+    /// per packing-key row at any row size, 48 KiB at `d = 2048` and 32 KiB under the approximate
+    /// packing gadget.
     #[serde(default = "default_max_sessions_per_instance")]
     pub max_sessions_per_instance: usize,
     /// Identifier surfaced in the `X-Raven-Scheme` response header.

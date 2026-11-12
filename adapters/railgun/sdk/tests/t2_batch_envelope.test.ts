@@ -14,7 +14,11 @@ import {
   path10Siblings,
   path10Slot,
 } from "./helpers/path10_row";
-import { EXPECTED_WIRE_SCHEMA_PREFIX, EXPECTED_WIRE_SCHEMA_VERSION } from "./helpers/wire_schema";
+import {
+  EXPECTED_WIRE_SCHEMA_PREFIX,
+  EXPECTED_WIRE_SCHEMA_VERSION,
+  EXPECTED_WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET,
+} from "./helpers/wire_schema";
 
 const LIST_KEY_HEX = "42".repeat(32);
 const BC_HEX = "0bc1".repeat(16);
@@ -48,12 +52,25 @@ describe("path proof batch envelope", () => {
     );
   }
 
-  function makeSdk(): RavenPOINodeInterface {
+  /** A stub context whose session registers under `schema`, as the wasm stamps it. */
+  function ctxSpeaking(schema: number): ReturnType<typeof stubCtx> {
+    const ctx = stubCtx();
+    return {
+      ...ctx,
+      wasm: {
+        ...ctx.wasm,
+        client_packing_keys_versioned: () => new Uint8Array([schema >>> 8, schema & 0xff, 1, 2]),
+      },
+      entrySize: PATH10_ROW_BYTES,
+    };
+  }
+
+  function makeSdk(schema: number = EXPECTED_WIRE_SCHEMA_VERSION): RavenPOINodeInterface {
     return new RavenPOINodeInterface({
       ...forestConfig({
         endpoint: server.url,
         listKeyHex: LIST_KEY_HEX,
-        ctx: { ...stubCtx(), entrySize: PATH10_ROW_BYTES },
+        ctx: ctxSpeaking(schema),
         placed: [[BC_HEX, 3]],
         pins: new Map([[0, path10Root(BC_HEX, NODES, 3)]]),
       }),
@@ -133,5 +150,84 @@ describe("path proof batch envelope", () => {
       expect(thrown.context.clientWireSchemaVersion).toBe(EXPECTED_WIRE_SCHEMA_VERSION);
       expect(thrown.context.serverWireSchemaVersion).toBe(2);
     }
+  });
+
+  describe("an instance on the approximate-gadget schema", () => {
+    const APPROXIMATE = EXPECTED_WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET;
+    const proveAt = (schema: number): Promise<unknown> =>
+      makeSdk(schema).getPOIMerkleProofs(LIST_KEY_HEX, [BC_HEX]);
+
+    it("sends the session's schema on the session and the batch and proves its reply", async () => {
+      let sessionPrefix: number[] = [];
+      let batchPrefix: number[] = [];
+      server.routeSession((_req, body, res) => {
+        sessionPrefix = Array.from(body.subarray(0, 2));
+        res.writeHead(200, { "x-raven-session": "1" });
+        res.end("{}");
+        return true;
+      });
+      server.route(
+        (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
+        (_req, requestBody, res) => {
+          batchPrefix = Array.from(requestBody.subarray(0, 2));
+          const slot = path10Slot({ bcHex: BC_HEX, nodes: NODES });
+          const framed = encodeBatchResponseNodes(
+            Array.from({ length: encodedBatchCount(requestBody) }, () => slot),
+          );
+          framed[1] = APPROXIMATE;
+          writeBinary(res, framed);
+          return true;
+        },
+      );
+      await expect(proveAt(APPROXIMATE)).resolves.toHaveLength(1);
+      expect([sessionPrefix, batchPrefix]).toEqual([
+        [0, APPROXIMATE],
+        [0, APPROXIMATE],
+      ]);
+    });
+
+    it("refuses a reply framed for the exact set", async () => {
+      serveFramed((framed) => framed);
+      await expect(proveAt(APPROXIMATE)).rejects.toThrow(
+        new RegExp(`unexpected schema envelope version ${EXPECTED_WIRE_SCHEMA_VERSION}`),
+      );
+    });
+
+    it("classifies an exact-set node's refusal as StaleAdapter naming both schemas", async () => {
+      server.route(
+        (req) => /^\/v1\/instance\/[^/]+\/batch$/.test(req.url ?? ""),
+        (_req, _body, res) => {
+          res.writeHead(400, { "x-raven-schema-version": String(EXPECTED_WIRE_SCHEMA_VERSION) });
+          res.end();
+          return true;
+        },
+      );
+      const thrown = await proveAt(APPROXIMATE).catch((e: unknown) => e);
+      expect(RavenError.is(thrown, "StaleAdapter"), String(thrown)).toBe(true);
+      if (RavenError.is(thrown, "StaleAdapter")) {
+        expect(thrown.context.clientWireSchemaVersion).toBe(APPROXIMATE);
+        expect(thrown.context.serverWireSchemaVersion).toBe(EXPECTED_WIRE_SCHEMA_VERSION);
+      }
+    });
+
+    it("classifies a session refused by an exact-set node as StaleAdapter", async () => {
+      server.routeSession((_req, _body, res) => {
+        res.writeHead(400, { "x-raven-schema-version": String(EXPECTED_WIRE_SCHEMA_VERSION) });
+        res.end();
+        return true;
+      });
+      const thrown = await proveAt(APPROXIMATE).catch((e: unknown) => e);
+      expect(RavenError.is(thrown, "StaleAdapter"), String(thrown)).toBe(true);
+      if (RavenError.is(thrown, "StaleAdapter")) {
+        expect(thrown.context.serverWireSchemaVersion).toBe(EXPECTED_WIRE_SCHEMA_VERSION);
+      }
+    });
+
+    it("refuses a session on a schema this client does not speak before sending anything", async () => {
+      serveFramed((framed) => framed);
+      const thrown = await proveAt(APPROXIMATE + 1).catch((e: unknown) => e);
+      expect(RavenError.is(thrown, "StaleAdapter"), String(thrown)).toBe(true);
+      expect(server.requests.filter((r) => /\/(batch|session)$/.test(r.url))).toHaveLength(0);
+    });
   });
 });

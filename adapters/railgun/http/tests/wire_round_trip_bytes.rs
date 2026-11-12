@@ -311,7 +311,7 @@ fn assert_row_and_addendum_reassemble_the_path(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_batch_round_trip_produces_the_published_wire_figure() {
     let started = Instant::now();
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let retained = PATH10_RECORD_BYTES.div_ceil(2);
     let (state, store, _) = served_block(&params);
     let setup_elapsed = started.elapsed();

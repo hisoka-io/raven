@@ -36,7 +36,7 @@ fn test_encoder() -> Arc<dyn PirTableEncoder> {
             cache rebuild."]
 fn recovery_from_production_cell_snapshot_under_20s() {
     let setup_start = Instant::now();
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let entries = 1usize << 16;
     let entry_size = 512usize;
     #[allow(clippy::cast_possible_truncation)]

@@ -28,7 +28,8 @@ const BC = "0c00112233445566778899aabbccddeeff00112233445566778899aabbccdd01";
 /** The same note shape one block up, so a second instance is asked. */
 const BC_BLOCK1 = "0d00112233445566778899aabbccddeeff00112233445566778899aabbccdd02";
 const HANDLE = 9_007_199_254_740_997n;
-const REGISTRATION_BODY = new Uint8Array([0, 2, 7, 8, 9]);
+// The session's schema opens the body; the SDK reads it to frame the batches.
+const REGISTRATION_BODY = new Uint8Array([0, EXPECTED_WIRE_SCHEMA_VERSION, 7, 8, 9]);
 const NODES = path10Siblings(0x3c);
 
 /** Every slot answers with the note of the block the instance label names. */

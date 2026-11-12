@@ -121,6 +121,18 @@ struct Inner {
     header_from_fork: Option<(u64, u64)>,
     /// A fork applied when a block's header is next read: `(block, first block, logs)`.
     on_header: Option<(u64, u64, Vec<RawLog>)>,
+    /// State is kept only for blocks this close to the head, as on a pruned endpoint.
+    state_depth: Option<u64>,
+    /// The most leaves one logs read returned.
+    largest_read: usize,
+    /// A logs read holding more logs than this is refused, as an endpoint's result cap does.
+    logs_cap: Option<usize>,
+    /// Logs reads refused.
+    refused_reads: usize,
+    /// The pool has code from this block on; a count below it is `NoCode`.
+    code_from: u64,
+    /// Count reads answered.
+    count_reads: usize,
 }
 
 impl Inner {
@@ -151,7 +163,43 @@ impl FakeChain {
             logs_from_fork: None,
             header_from_fork: None,
             on_header: None,
+            state_depth: None,
+            largest_read: 0,
+            logs_cap: None,
+            refused_reads: 0,
+            code_from: 0,
+            count_reads: 0,
         })))
+    }
+
+    /// Refuse a logs read holding more than `logs` logs.
+    pub fn cap_logs(&self, logs: usize) {
+        self.0.lock().expect("lock").logs_cap = Some(logs);
+    }
+
+    /// Logs reads refused by the cap.
+    pub fn refused_reads(&self) -> usize {
+        self.0.lock().expect("lock").refused_reads
+    }
+
+    /// The pool has no code below `block`.
+    pub fn code_from(&self, block: u64) {
+        self.0.lock().expect("lock").code_from = block;
+    }
+
+    /// Count reads answered.
+    pub fn count_reads(&self) -> usize {
+        self.0.lock().expect("lock").count_reads
+    }
+
+    /// Refuse a count at a block more than `depth` below the head, as a pruned endpoint does.
+    pub fn keep_state_for(&self, depth: u64) {
+        self.0.lock().expect("lock").state_depth = Some(depth);
+    }
+
+    /// The most leaves one logs read returned.
+    pub fn largest_read(&self) -> usize {
+        self.0.lock().expect("lock").largest_read
     }
 
     pub fn set_head(&self, head: u64) {
@@ -305,18 +353,31 @@ impl Chain for FakeChain {
                 Self::answered(&inner, log.block_number)
             },
         };
-        Ok(inner
+        let read: Vec<BlockLog> = inner
             .logs
             .iter()
             .filter(|log| log.block_number < cut)
             .chain(&extra)
             .filter(|log| (from..=to).contains(&log.block_number))
             .map(place)
-            .collect())
+            .collect();
+        if let Some(cap) = inner.logs_cap.filter(|cap| read.len() > *cap) {
+            inner.refused_reads += 1;
+            return Err(ChainError::Rpc {
+                method: "eth_getLogs",
+                message: format!("query returned more than {cap} results"),
+            });
+        }
+        let leaves = read
+            .iter()
+            .filter(|l| l.log.topics.first() == Some(&TOPIC_LEAF_INSERTED))
+            .count();
+        inner.largest_read = inner.largest_read.max(leaves);
+        Ok(read)
     }
 
     async fn leaf_count(&self, block: [u8; 32]) -> Result<Option<u64>, ChainError> {
-        let inner = self.0.lock().expect("lock");
+        let mut inner = self.0.lock().expect("lock");
         // A block this chain no longer has is unknown to it, as to an endpoint that keeps
         // no other fork.
         let top = inner
@@ -328,6 +389,19 @@ impl Chain for FakeChain {
                 message: "unknown block".to_owned(),
             });
         };
+        if inner
+            .state_depth
+            .is_some_and(|depth| number + depth < inner.head)
+        {
+            return Err(ChainError::Rpc {
+                method: "eth_call",
+                message: "missing trie node".to_owned(),
+            });
+        }
+        if number < inner.code_from {
+            return Err(ChainError::NoCode);
+        }
+        inner.count_reads += 1;
         Ok(Some(
             inner
                 .logs

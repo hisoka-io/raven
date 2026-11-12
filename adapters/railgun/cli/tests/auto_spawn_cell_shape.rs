@@ -90,7 +90,7 @@ async fn spawned_instance_re_encodes_slot_zero_with_first_window_rows() {
         .with_max_level(tracing::Level::ERROR)
         .try_init();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let engine: Arc<Engine<RavenInspireScheme>> = Arc::new(Engine::new());
     let chain_tree_routes: ChainTreeRoutes = Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
     let registry = Arc::new(SpawnRegistry::new());

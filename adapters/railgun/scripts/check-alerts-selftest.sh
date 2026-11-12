@@ -82,13 +82,16 @@ expect "a caught-up node raises nothing" '[[ -z $out ]]'
 
 reset behind
 serve 200 syncing 206559 0 0
-run RAVEN_BEHIND_SECS=1
-expect "a feed just seen syncing raises nothing yet" '[[ $out != *behind* ]]'
-sleep 2
-run RAVEN_BEHIND_SECS=1
+run RAVEN_BEHIND_SECS=100
+expect "a feed just seen syncing raises nothing yet" '[[ $out != *behind* && -s $state.behind ]]'
+# Aged by rewriting the recorded clock, not by sleeping, so the verdict does not hang on how far
+# the wall clock moves between two runs.
+read -r clock_key clock_since <"$state.behind"
+echo "$clock_key $((clock_since - 1000))" >"$state.behind"
+run RAVEN_BEHIND_SECS=100
 expect "a feed syncing past RAVEN_BEHIND_SECS raises behind" '[[ $out == *"alert behind: list abababababababab syncing for"* ]]'
 serve 200 caught_up 363278 0 0
-run RAVEN_BEHIND_SECS=1
+run RAVEN_BEHIND_SECS=100
 expect "catching up resolves behind" '[[ $out == *"RESOLVED"*behind* && ! -s $state.behind ]]'
 
 reset unanswered

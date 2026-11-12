@@ -50,7 +50,7 @@ fn median_of_three(timings: &[Duration]) -> Duration {
 #[allow(clippy::too_many_lines)]
 fn k4_dispatcher_strategy_comparison() {
     let setup_start = Instant::now();
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let entries = 1usize << ENTRIES_LOG2;
     let db = build_synthetic_db(entries, ENTRY_BYTES);
     let (server_state, _) =

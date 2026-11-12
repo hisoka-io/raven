@@ -40,7 +40,7 @@ use raven_railgun_persistence::{
 /// Verbatim head of `ppoi-paths-ofac/snapshots/snap-000001/data.bincode`, zstd-decompressed.
 /// Decoded against the layout that wrote it: `ring_dim 2048`, `q 1152921504606830593`,
 /// `crt_moduli [q]`, `p 65537`, `sigma 6.4`, `gadget_base 1048576`, `gadget_len 3`,
-/// `security_level 0` -- every value self-consistent, which is how a shift is told from damage.
+/// `params_label 0` -- every value self-consistent, which is how a shift is told from damage.
 const RECOVERED_V5_SNAPSHOT_HEAD: [u8; 100] = [
     0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xc0, //
     0xff, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x01, 0x00, 0x00, 0x00, //

@@ -131,7 +131,7 @@ async fn layer2_verifier_fires_per_commit_and_cascades_reorg_on_out_of_sync() {
     config.verification_tree_number = 0;
     config.chain_source = Some(Arc::clone(&chain_source) as Arc<dyn ChainSource>);
 
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
 
     for i in 0..50u32 {
@@ -242,7 +242,7 @@ async fn layer2_first_verdict_out_of_sync_must_not_truncate_to_genesis() {
     config.verification_tree_number = 0;
     config.chain_source = Some(Arc::clone(&chain_source) as Arc<dyn ChainSource>);
 
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let handle = bootstrap_railgun_engine(config, params, build_toy_state).expect("bootstrap");
 
     for i in 0..LEAF_COUNT {
@@ -353,7 +353,7 @@ async fn layer2_verifier_does_not_fire_on_a_list_instance_given_a_chain_source()
     config.verification_tree_number = 0;
     config.chain_source = Some(Arc::clone(&chain_source) as Arc<dyn ChainSource>);
 
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let handle = bootstrap_railgun_engine(config, params, || {
         raven_railgun_testkit::try_toy_state(LIST_ENTRY_SIZE)
     })

@@ -844,7 +844,7 @@ async fn the_shipped_next_block_serves_its_first_row_by_pir() {
         "row {ROW} opens {next}"
     );
 
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let mut handle = bootstrap_railgun_engine_multi(
         opts.instances.clone(),
         params.clone(),

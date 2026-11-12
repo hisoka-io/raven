@@ -940,7 +940,7 @@ fn persist_initial_snapshot(
 
     let encoder_kind = cfg.encoder_kind;
     let (total_rows, record_size) = cell_shape_for_encoder(encoder_kind);
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let entries_per_shard = u32::try_from(params.ring_dim).unwrap_or(u32::MAX);
     validate_rows_per_shard(entries_per_shard, params.ring_dim)
         .map_err(|e| BootstrapError::Engine(format!("rows per shard: {e}")))?;

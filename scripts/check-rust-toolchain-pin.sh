@@ -42,6 +42,21 @@ fail() {
   failed=1
 }
 
+# A channel name (stable, beta, nightly, nightly-<host>) moves under the job; a dated nightly
+# (nightly-YYYY-MM-DD) is one fixed build, which is how a job that needs nightly pins it.
+SELECTOR='(stable|beta|nightly)[^[:space:]"'"'"'#}]*'
+dated_nightlies=0
+check_selector() {
+  local where="$1"
+  local what="$2"
+  local selector="$3"
+  if [[ "$selector" =~ ^nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    dated_nightlies=$((dated_nightlies + 1))
+  else
+    fail "$where $what '$selector'; pin a release or nightly-YYYY-MM-DD"
+  fi
+}
+
 while IFS= read -r -d '' toolchain_file; do
   toolchain_files=$((toolchain_files + 1))
   channel="$(awk -F'"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2 }' "$toolchain_file")"
@@ -129,14 +144,18 @@ while IFS= read -r -d '' workflow; do
     if [[ "$line" =~ actions-rs/toolchain@ ]]; then
       fail "$workflow:$line_number uses unsupported actions-rs/toolchain; use the pinned dtolnay selector"
     fi
-    if [[ "$line" =~ toolchain:[[:space:]]*(stable|beta|nightly) ]]; then
-      fail "$workflow:$line_number contains floating toolchain input '${BASH_REMATCH[1]}'"
+    if [[ "$line" =~ toolchain:[[:space:]]*[\"\']?($SELECTOR) ]]; then
+      check_selector "$workflow:$line_number" "contains floating toolchain input" "${BASH_REMATCH[1]}"
     fi
-    if [[ "$line" =~ cargo[[:space:]]+\+(stable|beta|nightly) ]]; then
-      fail "$workflow:$line_number invokes floating cargo +${BASH_REMATCH[1]}"
+    # an env value a later `cargo +$VAR` or `rustup ... "$VAR"` reads
+    if [[ "$line" =~ [A-Z_]*TOOLCHAIN[A-Z_]*:[[:space:]]*[\"\']?($SELECTOR) ]]; then
+      check_selector "$workflow:$line_number" "sets a floating toolchain variable" "${BASH_REMATCH[1]}"
     fi
-    if [[ "$line" =~ rustup[[:space:]]+(default|install|toolchain[[:space:]]+install|run)[[:space:]]+(stable|beta|nightly) ]]; then
-      fail "$workflow:$line_number invokes floating rustup selector '${BASH_REMATCH[2]}'"
+    if [[ "$line" =~ cargo[[:space:]]+\+($SELECTOR) ]]; then
+      check_selector "$workflow:$line_number" "invokes floating cargo +" "${BASH_REMATCH[1]}"
+    fi
+    if [[ "$line" =~ rustup[[:space:]]+(default|install|toolchain[[:space:]]+install|run)[[:space:]]+[\"\']?($SELECTOR) ]]; then
+      check_selector "$workflow:$line_number" "invokes floating rustup selector" "${BASH_REMATCH[2]}"
     fi
     # install-action's tool-named refs (@nextest, @cargo-nextest) install whatever is newest
     if [[ "$line" =~ taiki-e/install-action@(cargo-)?nextest([^[:alnum:]_.-]|$) ]]; then
@@ -290,14 +309,14 @@ while IFS= read -r -d '' script; do
   line_number=0
   while IFS= read -r line || [[ -n "$line" ]]; do
     line_number=$((line_number + 1))
-    if [[ "$line" =~ cargo[[:space:]]+\+(stable|beta|nightly) ]]; then
-      fail "$script:$line_number invokes floating cargo +${BASH_REMATCH[1]}"
+    if [[ "$line" =~ cargo[[:space:]]+\+($SELECTOR) ]]; then
+      check_selector "$script:$line_number" "invokes floating cargo +" "${BASH_REMATCH[1]}"
     fi
-    if [[ "$line" =~ rustup[[:space:]]+(default|install|toolchain[[:space:]]+install|run)[[:space:]]+(stable|beta|nightly) ]]; then
-      fail "$script:$line_number invokes floating rustup selector '${BASH_REMATCH[2]}'"
+    if [[ "$line" =~ rustup[[:space:]]+(default|install|toolchain[[:space:]]+install|run)[[:space:]]+[\"\']?($SELECTOR) ]]; then
+      check_selector "$script:$line_number" "invokes floating rustup selector" "${BASH_REMATCH[2]}"
     fi
-    if [[ "$line" =~ (RUSTUP_TOOLCHAIN|RUST_TOOLCHAIN|TOOLCHAIN)=(stable|beta|nightly) ]]; then
-      fail "$script:$line_number assigns floating selector '${BASH_REMATCH[2]}'"
+    if [[ "$line" =~ [A-Z_]*TOOLCHAIN[A-Z_]*=[\"\']?($SELECTOR) ]]; then
+      check_selector "$script:$line_number" "assigns floating selector" "${BASH_REMATCH[1]}"
     fi
   done < "$script"
 done < <(find "$REPO_ROOT" \
@@ -331,8 +350,8 @@ if [[ "$failed" -ne 0 ]]; then
   exit 1
 fi
 
-printf 'Rust toolchain selectors pinned: channel=%s files=%d CI=%d MSRV=1.89/%d+1.91/%d overrides=%d Docker=%d nextest=%d@%s cargo-binstall=%d\n' \
+printf 'Rust toolchain selectors pinned: channel=%s files=%d CI=%d MSRV=1.89/%d+1.91/%d overrides=%d Docker=%d nextest=%d@%s cargo-binstall=%d dated-nightly=%d\n' \
   "$PINNED_TOOLCHAIN" "$toolchain_files" "$pinned_actions" \
   "$(tr ',' '\n' <<< "$MSRV_189_PACKAGES" | wc -l)" "$(tr ',' '\n' <<< "$MSRV_191_PACKAGES" | wc -l)" \
   "$((msrv_189_overrides + msrv_191_overrides))" "$docker_builders" \
-  "$nextest_installers" "$PINNED_NEXTEST" "$cargo_binstall_invocations"
+  "$nextest_installers" "$PINNED_NEXTEST" "$cargo_binstall_invocations" "$dated_nightlies"

@@ -41,32 +41,48 @@ expect() {
 
 echo "ci-changes-selftest.sh: fixtures, the workflow, the sources, CI mode"
 
-RAILGUN_SET=docs,railgun,msrv_1_89,msrv_1_91,sdk
+RAILGUN_SET=docs,railgun,msrv_1_89,msrv_1_91,sdk,railgun_image
+# an adapter crate the fuzz targets link: the HTTP decoders and what they call
+RAILGUN_CRATE_SET=$RAILGUN_SET,fuzz
 expect "docs only" NONE README.md SECURITY.md adapters/railgun/client-wasm/README.md
+# both SDK pack gates compare their package's LICENSE with the root one
+expect "the root LICENSE" howl,sdk LICENSE
 expect "the SDK only" sdk adapters/railgun/sdk/src/client-pir.ts adapters/railgun/sdk/package.json
 expect "the SDK README ships in the package" sdk adapters/railgun/sdk/README.md
 expect "an SDK gate script" sdk adapters/railgun/scripts/check-sdk-pack.sh
 expect "an SDK fixture adapter tests include" "$RAILGUN_SET" adapters/railgun/sdk/tests/fixtures/path10_row.hex
-expect "an adapter crate" "$RAILGUN_SET" adapters/railgun/engine/src/lib.rs
-expect "the adapter core" "$RAILGUN_SET" adapters/railgun/core/src/lib.rs
+expect "an adapter crate" "$RAILGUN_CRATE_SET" adapters/railgun/engine/src/lib.rs
+expect "the adapter core" "$RAILGUN_CRATE_SET" adapters/railgun/core/src/lib.rs
 expect "the adapter's nextest config" "$RAILGUN_SET,lane_counts" adapters/railgun/.config/nextest.toml
 expect "an adapter example config its tests read" "$RAILGUN_SET" adapters/railgun/examples/mainnet-ppoi.toml
 expect "the client wasm" wasm,msrv_1_89,sdk adapters/railgun/client-wasm/src/lib.rs
 expect "one detached workspace" bench_compare,bench_gate,msrv_1_89 tools/bench-compare/src/main.rs
 expect "the committed bench baselines" bench_compare,bench_gate benches/baselines/b1-two-packing-cell-2e16x512.json
 expect "the eth-state submodule" eth_state,msrv_1_91 adapters/eth-state
-expect "the inspire submodule" root,docs,wasm,railgun,inspire,eth_state,howl,b1_bench,bench_gate,msrv_1_89,msrv_1_91,sdk crates/inspire
-expect "a framework crate" root,docs,wasm,railgun,eth_state,howl,msrv_1_89,msrv_1_91,sdk crates/core/src/lib.rs
-expect "the root lockfile" root,docs,wasm,msrv_1_89 Cargo.lock
-expect "the howl submodule, whose crates the node builds" howl,msrv_1_89 adapters/howl
-expect "the howl node" howl,msrv_1_89 adapters/howl-node/store/src/lib.rs
+expect "the inspire submodule" root,docs,wasm,railgun,inspire,eth_state,howl,b1_bench,bench_gate,msrv_1_89,msrv_1_91,sdk,howl_image,railgun_image,fuzz crates/inspire
+expect "a framework crate" root,docs,wasm,railgun,eth_state,howl,msrv_1_89,msrv_1_91,sdk,howl_image,railgun_image,fuzz crates/core/src/lib.rs
+expect "the root lockfile" root,docs,wasm,msrv_1_89,howl_image,railgun_image Cargo.lock
+expect "the howl submodule, whose crates the node builds" howl,msrv_1_89,howl_image,fuzz adapters/howl
+expect "the howl node" howl,msrv_1_89,howl_image,fuzz adapters/howl-node/store/src/lib.rs
+expect "the Howl node image" howl,msrv_1_89,howl_image adapters/howl-node/deploy/Dockerfile
+expect "the Railway image and its staging" "$RAILGUN_SET" adapters/railgun/deploy/railway/Dockerfile \
+  adapters/railgun/deploy/railway/up.sh
+expect "the Docker build filter" howl_image .dockerignore
+expect "a fuzz target" fuzz fuzz/fuzz_targets/railgun_session_body.rs
+expect "the fuzz workspace's lockfile and runner" fuzz fuzz/Cargo.lock fuzz/run.sh
+expect "a Railgun decoder the fuzz targets link" "$RAILGUN_CRATE_SET" adapters/railgun/http/src/handshake.rs
+expect "a Howl wire decoder" howl,msrv_1_89,howl_image,fuzz adapters/howl-node/wire/src/lib.rs
+expect "a recorded Howl answer the fuzz seeds read" howl,msrv_1_89,howl_image,fuzz \
+  adapters/howl-node/sdk/tests/fixtures/params.bin
+expect "the Howl browser smoke, inside the node workspace directory" howl,msrv_1_89,howl_image \
+  adapters/howl-node/sdk/scripts/browser-smoke.sh
 expect "the workflow" ALL .github/workflows/ci.yml
 expect "the lane pins" ALL .github/expected-lane-counts.tsv
 expect "a gate script" ALL scripts/assert-lane-counts.sh
 expect "the toolchain pin" ALL rust-toolchain.toml
 expect "the cargo config" ALL .cargo/config.toml
 expect "a path no rule claims" ALL a-new-top-level-dir/file.txt
-expect "docs beside a Rust change" "$RAILGUN_SET" README.md adapters/railgun/http/src/lib.rs
+expect "docs beside a Rust change" "$RAILGUN_CRATE_SET" README.md adapters/railgun/http/src/lib.rs
 
 # --- the workflow -------------------------------------------------------------------------------
 bash "$GATE" --manifests > "$work/manifests"

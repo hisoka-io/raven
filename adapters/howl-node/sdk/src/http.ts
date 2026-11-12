@@ -4,6 +4,8 @@ import { HowlError } from "./errors.js";
 export interface Exchange {
   readonly status: number;
   readonly body: Uint8Array;
+  /** The response headers, when the transport has them; `Retry-After` is read from here. */
+  readonly headers?: { get(name: string): string | null };
 }
 
 /** How the client reaches a node. Swap it to add headers, a proxy or an anonymity network. */
@@ -17,6 +19,14 @@ export interface TransportStats {
   requests: number;
   bytesUp: number;
   bytesDown: number;
+}
+
+// Failures of requests that got no response at all, outside a timeout or an abort.
+const unanswered = new WeakSet<HowlError>();
+
+/** Whether `e` is a `fetchTransport` failure before any response arrived. */
+export function neverAnswered(e: unknown): boolean {
+  return e instanceof HowlError && unanswered.has(e);
 }
 
 export interface FetchTransportOptions {
@@ -41,9 +51,13 @@ export function fetchTransport(
     try {
       response = await doFetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
     } catch (e) {
-      throw new HowlError("Network", `${init.method ?? "GET"} ${path}: ${String(e)}`, {
+      const failure = new HowlError("Network", `${init.method ?? "GET"} ${path}: ${String(e)}`, {
         cause: e,
       });
+      // A timeout spent the caller's whole budget, and an abort was asked for.
+      const stopped = e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError");
+      if (!stopped) unanswered.add(failure);
+      throw failure;
     }
     let body: Uint8Array;
     try {
@@ -55,7 +69,7 @@ export function fetchTransport(
     }
     stats.requests += 1;
     stats.bytesDown += body.length;
-    return { status: response.status, body };
+    return { status: response.status, body, headers: response.headers };
   };
   return {
     stats,

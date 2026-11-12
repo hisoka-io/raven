@@ -172,7 +172,7 @@ async fn multi_instance_bootstrap_routes_events_per_instance() {
 
     let lk_a = list_key(0xA1);
     let lk_b = list_key(0xB2);
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
 
     let factory = |_cfg: &InstanceConfig| -> raven_railgun_core::Result<InspireServerState> {
         build_toy_state()
@@ -292,7 +292,7 @@ async fn multi_instance_recovery_byte_identity() {
     let dir = tempfile::tempdir().expect("tempdir");
     let lk_a = list_key(0xA1);
     let lk_b = list_key(0xB2);
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
 
     let configs1 = build_six_configs(dir.path());
     let factory1 = |_cfg: &InstanceConfig| -> raven_railgun_core::Result<InspireServerState> {

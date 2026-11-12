@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use raven_railgun_engine::persistence::ConsumerMetrics;
 use raven_railgun_engine::PirScheme;
 use serde::{Deserialize, Serialize};
 
@@ -15,7 +16,8 @@ pub struct StatusResponse {
     pub scheme: String,
     /// One entry per registered instance.
     pub instances: Vec<InstanceStatus>,
-    /// Consumer metrics; omitted when not wired.
+    /// Consumer metrics merged across every instance (see [`ConsumerStatus`]); omitted when
+    /// not wired.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consumer: Option<ConsumerStatus>,
 }
@@ -35,9 +37,16 @@ pub struct InstanceStatus {
     pub in_flight: u64,
     /// Resolved per-instance K; falls back to `HttpConfig::max_concurrent_queries`.
     pub active_k_concurrency: u32,
+    /// This instance's own consumer; omitted when it has none wired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer: Option<ConsumerStatus>,
 }
 
 /// Live consumer-task metrics; mirrors [`raven_railgun_engine::persistence::ConsumerMetrics`].
+///
+/// On an instance row these are that instance's numbers. The node-level block merges every
+/// instance, because the first instance is often a sealed block that ingests nothing: heights
+/// are the highest any instance reached, counts are summed, and the lag is the worst instance's.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ConsumerStatus {
     /// Last block height applied by the consumer task.
@@ -46,7 +55,8 @@ pub struct ConsumerStatus {
     pub last_scanned_block: u64,
     /// Last block height reported as the chain tip.
     pub last_known_chain_head: u64,
-    /// `last_known_chain_head - last_scanned_block`, saturating at 0.
+    /// `last_known_chain_head - last_scanned_block`, saturating at 0. Node-level: the largest
+    /// across instances, so one stuck scanner is not hidden by a healthy one.
     pub indexer_lag_blocks: u64,
     /// `last_known_chain_head - last_applied_block`, saturating; grows on a quiet
     /// chain even when caught up.
@@ -61,35 +71,9 @@ pub struct ConsumerStatus {
     pub consumer_errors: u64,
 }
 
-pub(crate) async fn status_handler<S: PirScheme>(
-    State(app): State<AppState<S>>,
-) -> Json<StatusResponse> {
-    Json(build_status_response(&app))
-}
-
-/// Operator-observable engine state for `/v1/status`.
-fn build_status_response<S: PirScheme>(app: &AppState<S>) -> StatusResponse {
-    let fallback_k = u32::try_from(app.config.max_concurrent_queries.max(1)).unwrap_or(u32::MAX);
-    let instances = app
-        .engine
-        .instances()
-        .into_iter()
-        .map(|inst| InstanceStatus {
-            id: inst.id.to_string(),
-            epoch: inst.current_epoch().0,
-            role: inst.role().label().to_owned(),
-            drain_state: inst.drain_state().label().to_owned(),
-            in_flight: inst.in_flight_count(),
-            active_k_concurrency: app
-                .instance_concurrency
-                .get(&inst.id)
-                .copied()
-                .unwrap_or(fallback_k),
-        })
-        .collect();
-    let consumer = app.consumer_metrics.as_ref().as_ref().map(|m| {
-        let snap = *m.lock();
-        ConsumerStatus {
+impl ConsumerStatus {
+    fn of(snap: &ConsumerMetrics) -> Self {
+        Self {
             last_applied_block: snap.last_applied_block,
             last_scanned_block: snap.last_scanned_block,
             last_known_chain_head: snap.last_known_chain_head,
@@ -100,7 +84,115 @@ fn build_status_response<S: PirScheme>(app: &AppState<S>) -> StatusResponse {
             reorgs_handled: snap.reorgs_handled,
             consumer_errors: snap.consumer_errors,
         }
-    });
+    }
+
+    /// Node-level view over `cells`; `None` when there are none.
+    fn merged(cells: &[&MetricsCell]) -> Option<Self> {
+        let mut unique: Vec<&MetricsCell> = Vec::with_capacity(cells.len());
+        for cell in cells {
+            // Wirings that share one cell between instances must not count its events twice.
+            if !unique.iter().any(|seen| Arc::ptr_eq(seen, cell)) {
+                unique.push(cell);
+            }
+        }
+        let mut snaps = unique.iter().map(|cell| *cell.lock());
+        let mut merged = Self::of(&snaps.next()?);
+        for snap in snaps {
+            merged.last_applied_block = merged.last_applied_block.max(snap.last_applied_block);
+            merged.last_scanned_block = merged.last_scanned_block.max(snap.last_scanned_block);
+            merged.last_known_chain_head =
+                merged.last_known_chain_head.max(snap.last_known_chain_head);
+            merged.indexer_lag_blocks = merged.indexer_lag_blocks.max(snap.indexer_lag_blocks());
+            merged.events_processed = merged
+                .events_processed
+                .saturating_add(snap.events_processed);
+            merged.commits_fired = merged.commits_fired.saturating_add(snap.commits_fired);
+            merged.reorgs_handled = merged.reorgs_handled.saturating_add(snap.reorgs_handled);
+            merged.consumer_errors = merged.consumer_errors.saturating_add(snap.consumer_errors);
+        }
+        // Since ANY instance applied an event: the node is ingesting while one block is.
+        merged.blocks_since_last_applied_event = merged
+            .last_known_chain_head
+            .saturating_sub(merged.last_applied_block);
+        Some(merged)
+    }
+}
+
+type MetricsCell = Arc<parking_lot::Mutex<ConsumerMetrics>>;
+
+/// Each registered instance with its consumer cell from the per-instance map.
+fn instance_consumer_cells<S: PirScheme>(
+    app: &AppState<S>,
+    instances: &[Arc<raven_railgun_engine::PirInstance<S>>],
+) -> Vec<Option<MetricsCell>> {
+    let per_instance = app.instance_metrics.read();
+    instances
+        .iter()
+        .map(|instance| per_instance.get(&instance.id).cloned())
+        .collect()
+}
+
+/// The node-level consumer block shared by `/v1/status` and `/v1/health/ready`.
+fn node_consumer_status<S: PirScheme>(app: &AppState<S>) -> Option<ConsumerStatus> {
+    let instances = app.engine.instances();
+    let cells = instance_consumer_cells(app, &instances);
+    let wired: Vec<&MetricsCell> = cells.iter().flatten().collect();
+    ConsumerStatus::merged(&wired)
+}
+
+/// `X-Raven-Freshness` for a response `instance_id` served: that instance's own consumer, since
+/// the bytes came from its snapshot alone. An instance with no cell of its own gets the node
+/// view `/v1/status` reports, never another instance's.
+pub(crate) fn freshness_reading<S: PirScheme>(
+    app: &AppState<S>,
+    instance_id: &raven_railgun_core::InstanceId,
+) -> Option<crate::FreshnessReading> {
+    let own = app.instance_metrics.read().get(instance_id).cloned();
+    match own {
+        Some(cell) => {
+            let snap = *cell.lock();
+            Some(crate::FreshnessReading {
+                lag_blocks: snap.indexer_lag_blocks(),
+                applied_height: snap.last_applied_block,
+            })
+        }
+        None => node_consumer_status(app).map(|node| crate::FreshnessReading {
+            lag_blocks: node.indexer_lag_blocks,
+            applied_height: node.last_applied_block,
+        }),
+    }
+}
+
+pub(crate) async fn status_handler<S: PirScheme>(
+    State(app): State<AppState<S>>,
+) -> Json<StatusResponse> {
+    Json(build_status_response(&app))
+}
+
+/// Operator-observable engine state for `/v1/status`.
+fn build_status_response<S: PirScheme>(app: &AppState<S>) -> StatusResponse {
+    let fallback_k = u32::try_from(app.config.max_concurrent_queries.max(1)).unwrap_or(u32::MAX);
+    let engine_instances = app.engine.instances();
+    let cells = instance_consumer_cells(app, &engine_instances);
+    let instances = engine_instances
+        .iter()
+        .zip(&cells)
+        .map(|(inst, cell)| InstanceStatus {
+            id: inst.id.to_string(),
+            epoch: inst.current_epoch().0,
+            role: inst.role().label().to_owned(),
+            drain_state: inst.drain_state().label().to_owned(),
+            in_flight: inst.in_flight_count(),
+            active_k_concurrency: app
+                .instance_concurrency
+                .get(&inst.id)
+                .copied()
+                .unwrap_or(fallback_k),
+            consumer: cell.as_ref().map(|cell| ConsumerStatus::of(&cell.lock())),
+        })
+        .collect();
+    let wired: Vec<&MetricsCell> = cells.iter().flatten().collect();
+    let consumer = ConsumerStatus::merged(&wired);
     StatusResponse {
         scheme: (*app.scheme_name).clone(),
         instances,
@@ -121,7 +213,6 @@ pub(crate) async fn metrics_handler<S: raven_railgun_engine::PirScheme>(
 }
 
 /// Per-scrape gauge values; HELP/TYPE are registered once at `AppState::new`.
-/// An empty `instance_metrics` falls back to the single cell.
 fn refresh_dynamic_metrics<S: raven_railgun_engine::PirScheme>(app: &AppState<S>) {
     use std::time::Instant;
     let uptime_secs = Instant::now()
@@ -139,22 +230,14 @@ fn refresh_dynamic_metrics<S: raven_railgun_engine::PirScheme>(app: &AppState<S>
     metrics::gauge!("raven_railgun_semaphore_permits_available").set(permits_avail);
 
     let instances = app.engine.instances();
+    let per_instance = app.instance_metrics.read().clone();
     for instance in &instances {
         let instance_id = instance.id.as_str().to_owned();
         emit_per_instance_engine_gauges(&instance_id, instance);
 
-        if let Some(consumer) = app.instance_metrics.get(&instance.id) {
+        if let Some(consumer) = per_instance.get(&instance.id) {
             let snap = *consumer.lock();
             emit_instance_consumer_gauges(&instance_id, &snap);
-        }
-    }
-
-    if app.instance_metrics.is_empty() {
-        if let Some(cell) = app.consumer_metrics.as_ref().as_ref() {
-            if let Some(first) = instances.first() {
-                let snap = *cell.lock();
-                emit_instance_consumer_gauges(first.id.as_str(), &snap);
-            }
         }
     }
 }
@@ -388,7 +471,7 @@ pub struct MirrorFeedView {
     pub seconds_since_answer: Option<u64>,
 }
 
-/// Indexer-consumer view in [`HealthReadyResponse`].
+/// Indexer-consumer view in [`HealthReadyResponse`]; the same node-level merge as `/v1/status`.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct HealthConsumerView {
     /// Saturating chain-tip-minus-scanned lag in blocks.
@@ -445,31 +528,14 @@ fn consumer_is_stalled(m: &raven_railgun_engine::persistence::ConsumerMetrics) -
 /// Instances whose consumer has failed every event since its last applied one, or is carrying
 /// leaves a broken per-leaf loop abandoned.
 ///
-/// Reads the same cells the consumer tasks mutate, with the single-cell fallback
-/// `refresh_dynamic_metrics` uses: a deployment that wires only
-/// `with_consumer_metrics` still gets a gate.
+/// Reads the same cells the consumer tasks mutate. An instance without a cell counts as stalled
+/// only when consumer telemetry is required.
 fn stalled_consumer_instances<S: PirScheme>(app: &AppState<S>) -> Vec<String> {
     let instances = app.engine.instances();
-    if app.instance_metrics.is_empty() {
-        let Some(cell) = app.consumer_metrics.as_ref().as_ref() else {
-            return if app.consumer_metrics_required {
-                instances
-                    .iter()
-                    .map(|instance| instance.id.as_str().to_owned())
-                    .collect()
-            } else {
-                Vec::new()
-            };
-        };
-        let stalled = consumer_is_stalled(&cell.lock());
-        return match instances.first() {
-            Some(first) if stalled => vec![first.id.as_str().to_owned()],
-            _ => Vec::new(),
-        };
-    }
+    let per_instance = app.instance_metrics.read().clone();
     let mut stalled: Vec<String> = instances
         .iter()
-        .filter(|instance| match app.instance_metrics.get(&instance.id) {
+        .filter(|instance| match per_instance.get(&instance.id) {
             Some(cell) => consumer_is_stalled(&cell.lock()),
             None => app.consumer_metrics_required,
         })
@@ -508,15 +574,12 @@ pub(crate) async fn health_ready_handler<S: PirScheme>(
         .as_ref()
         .map(|probe| probe())
         .unwrap_or_default();
-    let consumer = app.consumer_metrics.as_ref().as_ref().map(|m| {
-        let snap = *m.lock();
-        HealthConsumerView {
-            indexer_lag_blocks: snap.indexer_lag_blocks(),
-            last_applied_block: snap.last_applied_block,
-            last_scanned_block: snap.last_scanned_block,
-            last_known_chain_head: snap.last_known_chain_head,
-            blocks_since_last_applied_event: snap.blocks_since_last_applied_event(),
-        }
+    let consumer = node_consumer_status(&app).map(|merged| HealthConsumerView {
+        indexer_lag_blocks: merged.indexer_lag_blocks,
+        last_applied_block: merged.last_applied_block,
+        last_scanned_block: merged.last_scanned_block,
+        last_known_chain_head: merged.last_known_chain_head,
+        blocks_since_last_applied_event: merged.blocks_since_last_applied_event,
     });
     let chain_source_mode = app
         .chain_source_mode
@@ -598,17 +661,22 @@ fn build_rpc_pool_health_view(
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
-    use super::{health_ready_handler, HealthReadyResponse};
+    use super::{
+        build_status_response, health_ready_handler, ConsumerStatus, HealthReadyResponse,
+        StatusResponse,
+    };
     use crate::config::HttpConfig;
     use crate::state::AppState;
     use axum::extract::State;
     use axum::response::IntoResponse;
     use raven_railgun_core::InstanceId;
+    use raven_railgun_engine::persistence::ConsumerMetrics;
     use raven_railgun_engine::persistence::{
         clear_layer2_divergent, clear_wal_replay_skipped, mark_layer2_divergent,
         mark_wal_replay_skipped,
     };
     use raven_railgun_engine::{Engine, InstanceRole, PirInstance, PirScheme};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     #[derive(Debug, Default)]
@@ -742,5 +810,221 @@ mod tests {
             "clearing the replay-skip mark must restore readiness"
         );
         assert!(body.wal_replay_skipped_instances.is_empty());
+    }
+
+    type Cell = Arc<parking_lot::Mutex<ConsumerMetrics>>;
+
+    fn cell(m: ConsumerMetrics) -> Cell {
+        Arc::new(parking_lot::Mutex::new(m))
+    }
+
+    fn state_with(ids: &[&str]) -> AppState<StubScheme> {
+        let mut engine: Engine<StubScheme> = Engine::new();
+        for id in ids {
+            engine
+                .register_instance(Arc::new(PirInstance::new(
+                    InstanceId::new(*id),
+                    InstanceRole::Static,
+                    StubState,
+                )))
+                .expect("register instance");
+        }
+        AppState::new(engine, HttpConfig::demo("status-counter-token"))
+            .expect("appstate")
+            .require_consumer_metrics()
+    }
+
+    fn per_instance(pairs: &[(&str, &Cell)]) -> HashMap<InstanceId, Cell> {
+        pairs
+            .iter()
+            .map(|(id, c)| (InstanceId::new(*id), Arc::clone(c)))
+            .collect()
+    }
+
+    /// A sealed mirror block, as the first instance on a mainnet-shaped node: nothing to ingest.
+    fn sealed() -> ConsumerMetrics {
+        ConsumerMetrics {
+            commits_fired: 1,
+            ..ConsumerMetrics::default()
+        }
+    }
+
+    /// The live mirror block: mirror rows carry height 0, so only the counters move.
+    fn live() -> ConsumerMetrics {
+        ConsumerMetrics {
+            events_processed: 5_400,
+            commits_fired: 3,
+            consumer_errors: 2,
+            ..ConsumerMetrics::default()
+        }
+    }
+
+    fn assert_reports_the_ingesting_instance(status: &StatusResponse, live_id: &str) {
+        let node = status.consumer.as_ref().expect("node consumer block");
+        assert_eq!(
+            node.events_processed, 5_400,
+            "the node block must count what the live instance ingests"
+        );
+        assert_eq!(node.commits_fired, 4);
+        assert_eq!(node.consumer_errors, 2);
+        let row = status
+            .instances
+            .iter()
+            .find(|row| row.id == live_id)
+            .expect("live row");
+        assert_eq!(
+            row.consumer.as_ref().map(|c| c.events_processed),
+            Some(5_400)
+        );
+    }
+
+    #[test]
+    fn status_counts_the_live_instance_when_the_first_is_sealed() {
+        const SEALED: &str = "status-counter-ofac-0";
+        const LIVE: &str = "status-counter-ofac-6";
+        let (sealed, live) = (cell(sealed()), cell(live()));
+        let app = state_with(&[SEALED, LIVE])
+            .with_instance_metrics(per_instance(&[(SEALED, &sealed), (LIVE, &live)]));
+
+        let status = build_status_response(&app);
+        assert_reports_the_ingesting_instance(&status, LIVE);
+        assert_eq!(
+            status.instances[0]
+                .consumer
+                .as_ref()
+                .map(|c| c.events_processed),
+            Some(0),
+            "the sealed row keeps its own number"
+        );
+
+        // Planted control: a report of the first instance's cell alone fails the same check.
+        let first_cell = ConsumerStatus::of(&sealed.lock());
+        let old = StatusResponse {
+            consumer: Some(first_cell),
+            ..build_status_response(&app)
+        };
+        let caught = std::panic::catch_unwind(|| assert_reports_the_ingesting_instance(&old, LIVE));
+        assert!(
+            caught.is_err(),
+            "the check must reject the first-instance report"
+        );
+        assert_eq!(old.consumer.map(|c| c.events_processed), Some(0));
+    }
+
+    #[test]
+    fn node_lag_is_the_worst_instance_and_recency_the_newest() {
+        const AHEAD: &str = "status-counter-ahead";
+        const BEHIND: &str = "status-counter-behind";
+        let ahead = cell(ConsumerMetrics {
+            last_known_chain_head: 1_000,
+            last_scanned_block: 1_000,
+            last_applied_block: 990,
+            ..ConsumerMetrics::default()
+        });
+        let behind = cell(ConsumerMetrics {
+            last_known_chain_head: 1_000,
+            last_scanned_block: 700,
+            last_applied_block: 650,
+            ..ConsumerMetrics::default()
+        });
+        let app = state_with(&[AHEAD, BEHIND])
+            .with_instance_metrics(per_instance(&[(AHEAD, &ahead), (BEHIND, &behind)]));
+        let node = build_status_response(&app).consumer.expect("node block");
+        assert_eq!(
+            node.indexer_lag_blocks, 300,
+            "a healthy scanner must not hide a stuck one"
+        );
+        assert_eq!(node.blocks_since_last_applied_event, 10);
+        assert_eq!(node.last_scanned_block, 1_000);
+        assert_eq!(node.last_applied_block, 990);
+    }
+
+    #[test]
+    fn a_cell_shared_by_two_instances_counts_once() {
+        const A: &str = "status-counter-shared-a";
+        const B: &str = "status-counter-shared-b";
+        let shared = cell(live());
+        let app =
+            state_with(&[A, B]).with_instance_metrics(per_instance(&[(A, &shared), (B, &shared)]));
+        let node = build_status_response(&app).consumer.expect("node block");
+        assert_eq!(node.events_processed, 5_400);
+
+        // Planted control: two distinct cells with the same numbers do add up.
+        let other = cell(live());
+        let app =
+            state_with(&[A, B]).with_instance_metrics(per_instance(&[(A, &shared), (B, &other)]));
+        let node = build_status_response(&app).consumer.expect("node block");
+        assert_eq!(node.events_processed, 10_800);
+    }
+
+    #[test]
+    fn an_unwired_node_reports_no_consumer_block() {
+        const ONLY: &str = "status-counter-single-a";
+        let unwired = build_status_response(&state_with(&[ONLY]));
+        let json = serde_json::to_value(&unwired).expect("json");
+        assert!(json.get("consumer").is_none());
+        assert!(json["instances"][0].get("consumer").is_none());
+    }
+
+    #[tokio::test]
+    async fn readiness_keeps_its_meaning_and_reports_the_same_block() {
+        const SEALED: &str = "status-counter-ready-ofac-0";
+        const LIVE: &str = "status-counter-ready-ofac-6";
+        let (sealed, live) = (cell(sealed()), cell(live()));
+        // Heights only the live instance has, so a first-cell view cannot pass by accident.
+        {
+            let mut m = live.lock();
+            m.last_known_chain_head = 500;
+            m.last_scanned_block = 500;
+            m.last_applied_block = 480;
+        }
+        let app = state_with(&[SEALED, LIVE])
+            .with_instance_metrics(per_instance(&[(SEALED, &sealed), (LIVE, &live)]));
+
+        let (code, body) = ready_probe(app.clone()).await;
+        assert_eq!(code, http::StatusCode::OK);
+        let node = build_status_response(&app).consumer.expect("node block");
+        let view = body.consumer.expect("health consumer view");
+        assert_eq!(view.last_applied_block, 480);
+        assert_eq!(view.indexer_lag_blocks, node.indexer_lag_blocks);
+        assert_eq!(view.last_applied_block, node.last_applied_block);
+        assert_eq!(
+            view.blocks_since_last_applied_event,
+            node.blocks_since_last_applied_event
+        );
+
+        // The gate stays per instance: a stalled live block still fails, and is named.
+        live.lock().consecutive_event_errors = 1;
+        let (code, body) = ready_probe(app.clone()).await;
+        assert_eq!(code, http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.stalled_consumer_instances, vec![LIVE.to_owned()]);
+
+        // And an instance without telemetry still fails closed under the production flag.
+        let app =
+            state_with(&[SEALED, LIVE]).with_instance_metrics(per_instance(&[(SEALED, &sealed)]));
+        let (code, body) = ready_probe(app).await;
+        assert_eq!(code, http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.stalled_consumer_instances, vec![LIVE.to_owned()]);
+    }
+
+    #[test]
+    fn metrics_carry_the_live_instance_under_the_same_names() {
+        const SEALED: &str = "status-counter-metrics-ofac-0";
+        const LIVE: &str = "status-counter-metrics-ofac-6";
+        let (sealed, live) = (cell(sealed()), cell(live()));
+        let app = state_with(&[SEALED, LIVE])
+            .with_instance_metrics(per_instance(&[(SEALED, &sealed), (LIVE, &live)]));
+        super::refresh_dynamic_metrics(&app);
+        let body = app.metrics_handle.render();
+        let line = |id: &str| {
+            body.lines()
+                .find(|l| {
+                    l.starts_with("raven_railgun_consumer_events_processed{")
+                        && l.contains(&format!("instance=\"{id}\""))
+                })
+                .map(str::to_owned)
+        };
+        assert!(line(LIVE).is_some_and(|l| l.ends_with(" 5400")), "{body}");
+        assert!(line(SEALED).is_some_and(|l| l.ends_with(" 0")), "{body}");
     }
 }

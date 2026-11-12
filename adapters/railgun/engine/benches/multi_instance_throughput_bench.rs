@@ -188,7 +188,7 @@ fn multi_instance_throughput_at_production_cell() {
          total_queries={TOTAL_QUERIES}"
     );
 
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
 
     let setup_start = Instant::now();
     let instances: Vec<ReadyInstance> = (0..NUM_INSTANCES)

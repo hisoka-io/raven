@@ -76,7 +76,7 @@ async fn chain_event_reaches_every_instance_bound_to_the_same_tree_number() {
         tmp.path().join("host"),
         SHARED_TREE,
     )];
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let mut handle =
         bootstrap_railgun_engine_multi(cfgs, params, |_| build_toy_state()).expect("bootstrap");
 

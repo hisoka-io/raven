@@ -78,7 +78,7 @@ fn leaf_value(local: u32) -> [u8; 32] {
 
 /// Provenance is pointer identity; the fold never reads these bytes.
 fn committed_database() -> Arc<raven_inspire::EncodedDatabase> {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = raven_railgun_testkit::toy_db(raven_railgun_testkit::TOY_ENTRIES, 32);
     let (state, _secret_key) =
         setup_state(&params, &db, 32, InspireVariant::TwoPacking).expect("toy setup_state");

@@ -156,7 +156,7 @@ proptest! {
 #[test]
 fn manifest_block_height_reflects_committed_height_after_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db: Vec<u8> = (0..(ENTRIES_PER_SHARD as usize) * ENTRY_BYTES)
         .map(|i| u8::try_from(i & 0xff).expect("byte"))
         .collect();
@@ -213,7 +213,7 @@ fn manifest_block_height_reflects_committed_height_after_reopen() {
 fn two_instances_at_different_heights_yield_per_tree_distinct_floors() {
     let dir_a = tempfile::tempdir().expect("tempdir A");
     let dir_b = tempfile::tempdir().expect("tempdir B");
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db: Vec<u8> = (0..(ENTRIES_PER_SHARD as usize) * ENTRY_BYTES)
         .map(|i| u8::try_from(i & 0xff).expect("byte"))
         .collect();
@@ -300,7 +300,7 @@ fn append_leaf(tree_number: u32, leaf_index: u32) -> WalEntryPayload {
 #[tokio::test]
 async fn per_tree_floor_follows_the_manifest_after_a_reorg_rollback() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db: Vec<u8> = (0..(ENTRIES_PER_SHARD as usize) * ENTRY_BYTES)
         .map(|i| u8::try_from(i & 0xff).expect("byte"))
         .collect();

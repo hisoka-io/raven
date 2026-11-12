@@ -1,4 +1,4 @@
-//! Each parameter floor refuses the one field it bounds and admits both shipped presets.
+//! Each parameter floor refuses the one field it bounds and admits every shipped preset.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
@@ -11,21 +11,18 @@ use raven_inspire::params::{InspireParams, DEFAULT_CRT_MODULI};
 use raven_inspire::{setup, ClientSession};
 
 fn shipped() -> InspireParams {
-    InspireParams::secure_128_d2048()
+    InspireParams::d2048()
 }
 
 #[test]
 fn both_shipped_presets_pass() {
-    check_parameter_floor(&InspireParams::secure_128_d2048()).expect("d2048");
-    check_parameter_floor(&InspireParams::secure_128_d4096()).expect("d4096");
+    check_parameter_floor(&InspireParams::d2048()).expect("d2048");
+    check_parameter_floor(&InspireParams::d4096()).expect("d4096");
 }
 
 #[test]
 fn both_shipped_presets_carry_the_one_accepted_limb_set() {
-    for preset in [
-        InspireParams::secure_128_d2048(),
-        InspireParams::secure_128_d4096(),
-    ] {
+    for preset in [InspireParams::d2048(), InspireParams::d4096()] {
         assert_eq!(preset.crt_moduli, SHIPPED_CRT_MODULI);
         assert_eq!(preset.q, MAX_Q);
     }
@@ -232,46 +229,67 @@ fn a_gadget_with_more_digits_than_the_shipped_preset_is_refused() {
     }
 }
 
+/// The approximate gadget passes on the one shape its noise was measured on, and only there.
 #[test]
-fn the_approximate_packing_gadget_is_refused() {
-    let approximate = InspireParams {
-        approximate_packing_gadget: true,
-        ..shipped()
-    };
-    assert!(
-        approximate.validate().is_ok(),
-        "fixture: the set must be usable, so the floor is what refuses it"
-    );
-    assert_eq!(
-        check_parameter_floor(&approximate),
-        Err(ParameterFloorError::ApproximatePackingGadget)
-    );
+fn the_approximate_packing_gadget_passes_only_on_its_measured_shape() {
+    check_parameter_floor(&InspireParams::d2048_approximate_gadget()).expect("measured shape");
     let wider_ring = InspireParams {
         approximate_packing_gadget: true,
-        ..InspireParams::secure_128_d4096()
+        ..InspireParams::d4096()
     };
     assert_eq!(
         check_parameter_floor(&wider_ring),
-        Err(ParameterFloorError::ApproximatePackingGadget)
+        Err(ParameterFloorError::ApproximatePackingGadget {
+            ring_dim: 4096,
+            base: 1 << 20,
+            len: 3
+        })
     );
-}
-
-/// A served set with the option on reaches no key build: the session entry point refuses the
-/// CRS before it derives anything.
-#[test]
-fn a_session_is_not_built_under_the_approximate_packing_gadget() {
-    let params = InspireParams {
-        approximate_packing_gadget: true,
+    let wider_base = InspireParams {
+        gadget_base: 1 << 21,
+        ..InspireParams::d2048_approximate_gadget()
+    };
+    wider_base
+        .validate()
+        .expect("fixture: usable, so the floor is what refuses it");
+    assert_eq!(
+        check_parameter_floor(&wider_base),
+        Err(ParameterFloorError::ApproximatePackingGadget {
+            ring_dim: 2048,
+            base: 1 << 21,
+            len: 3
+        })
+    );
+    let control = InspireParams {
+        gadget_base: 1 << 21,
         ..shipped()
     };
+    check_parameter_floor(&control).expect("control: the exact gadget takes that base");
+}
+
+/// A served set with the option on its measured shape builds a two-row key and a query; off
+/// that shape the session entry point refuses the CRS before it derives anything.
+#[test]
+fn a_session_under_the_approximate_gadget_is_built_only_on_its_measured_shape() {
+    let params = InspireParams::d2048_approximate_gadget();
     let mut sampler = GaussianSampler::new(params.sigma);
+    let (crs, encoded, secret_key) =
+        setup(&params, &vec![0u8; params.ring_dim * 32], 32, &mut sampler).expect("setup");
+    let session = ClientSession::new(crs, secret_key, &mut sampler).expect("session");
+    assert_eq!(session.packing_keys().expect("keys").y_body.len(), 2);
+    build_seeded_query_rust(&session, &params, &encoded.config, 0).expect("measured shape");
+
+    let params = InspireParams {
+        approximate_packing_gadget: true,
+        ..InspireParams::d4096()
+    };
     let (crs, encoded, secret_key) =
         setup(&params, &vec![0u8; params.ring_dim * 32], 32, &mut sampler).expect("setup");
     let session = ClientSession::new(crs, secret_key, &mut sampler).expect("session");
     let refusal =
         build_seeded_query_rust(&session, &params, &encoded.config, 0).expect_err("refused");
     assert!(
-        refusal.contains("the approximate packing gadget is on"),
+        refusal.contains("the approximate packing gadget is on at ring_dim 4096"),
         "{refusal}"
     );
 }

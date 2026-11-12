@@ -41,7 +41,7 @@ fn register_sessions(instance: &Arc<PirInstance<RavenInspireScheme>>, count: usi
 
 #[test]
 fn heartbeat_swap_state_drops_inner_session_store() {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let initial_state = build_toy_state(&params);
     let instance: Arc<PirInstance<RavenInspireScheme>> = Arc::new(PirInstance::new(
         InstanceId::new("heartbeat-drops-inner"),
@@ -87,7 +87,7 @@ fn heartbeat_swap_state_drops_inner_session_store() {
 #[test]
 fn heartbeat_swap_state_preserves_cache_across_swap() {
     // Cache rebuild is ~3.7 s at production cell, so it must be carried, not rebuilt.
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let initial_state = build_toy_state(&params);
     let instance: Arc<PirInstance<RavenInspireScheme>> = Arc::new(PirInstance::new(
         InstanceId::new("heartbeat-preserves-cache"),
@@ -120,7 +120,7 @@ fn heartbeat_swap_state_preserves_cache_across_swap() {
 /// Across N fires the `Arc<EncodedDatabase>` allocation address must stay stable.
 #[test]
 fn heartbeat_eviction_does_not_clone_encoded_db_under_steady_load() {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let initial_state = build_toy_state(&params);
     let instance: Arc<PirInstance<RavenInspireScheme>> = Arc::new(PirInstance::new(
         InstanceId::new("heartbeat-no-encoded-db-clone"),

@@ -10,6 +10,9 @@
 #   RAVEN_BEARER_TOKEN         read by the node itself for /metrics, never written to disk
 #   RAVEN_MAX_SESSIONS         packing-key seats per instance (default 1024)
 #   RAVEN_MIRROR_ENDPOINT      the upstream aggregator (default: the template's)
+#   RAVEN_APPROXIMATE_PACKING_GADGET
+#                              true serves the approximate packing gadget: 36 KiB seats, wire
+#                              schema 9, which a schema-8 wallet refuses (default false)
 #
 # The template's trust_proxy_header = false stays: Railway's edge passes a client's
 # cf-connecting-ip through, and the node takes that header as the client address from any
@@ -55,13 +58,22 @@ render() {  # out
   case $seats in
     '' | 0* | *[!0-9]*) die "RAVEN_MAX_SESSIONS '$seats' is not a whole number from 1" ;;
   esac
+  global="[global]
+max_sessions_per_instance = $seats"
+  case ${RAVEN_APPROXIMATE_PACKING_GADGET:-false} in
+    false) ;;
+    true) global="$global
+approximate_packing_gadget = true" ;;
+    *) die "RAVEN_APPROXIMATE_PACKING_GADGET must be true or false, not '$RAVEN_APPROXIMATE_PACKING_GADGET'" ;;
+  esac
 
   cp "$templates/$RAVEN_NETWORK-ppoi.toml" "$out"
   replace_one "$out" '^bind = "[^"]*"$' "bind = \"0.0.0.0:$port\""
   # The node takes RAVEN_BEARER_TOKEN from its environment; a second source is a boot error.
   replace_one "$out" '^token = "REPLACE_ME"$' ""
-  replace_one "$out" '^[[]global[]]$' "[global]
-max_sessions_per_instance = $seats"
+  ! grep -qE '^approximate_packing_gadget *=' "$out" \
+    || die "template: sets approximate_packing_gadget itself; RAVEN_APPROXIMATE_PACKING_GADGET owns it"
+  replace_one "$out" '^[[]global[]]$' "$global"
   if [ -n "${RAVEN_MIRROR_ENDPOINT:-}" ]; then
     case $RAVEN_MIRROR_ENDPOINT in
       *[\"\\]*) die "RAVEN_MIRROR_ENDPOINT holds a quote or backslash" ;;

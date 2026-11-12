@@ -40,7 +40,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 fn upload(entry_bytes: usize, seed: u64) -> Vec<u8> {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     // The CRS as a wallet receives it: parameters and public seeds, no server-side tables.
     let crs = ServerCrs {
         rgsw_gadget: GadgetVector::new(params.gadget_base, params.query_gadget_len, params.q),

@@ -84,8 +84,9 @@ for pattern in (r'filter: "((?:[^"\\]|\\.)*)"', r"-E '([^']*)'"):
         included |= set(re.findall(r'test\(([A-Za-z_0-9]+)\)', inclusion))
         excluded |= set(re.findall(r'test\(([A-Za-z_0-9]+)\)', exclusion))
 # a `cargo test -- --ignored --exact NAME` step runs the test as surely as a lane does, and the
-# submodule workspaces are driven that way rather than through nextest filters
-included |= set(re.findall(r'--exact[ \t]+([A-Za-z_0-9]+)', ci))
+# submodule workspaces are driven that way rather than through nextest filters; a test inside a
+# module is named by its path, and the function is its last segment
+included |= set(re.findall(r'--exact[ \t]+(?:[A-Za-z_0-9]+::)*([A-Za-z_0-9]+)', ci))
 
 
 def names(terms, fn):

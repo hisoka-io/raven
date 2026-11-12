@@ -83,7 +83,7 @@ async fn synthetic_chain_drives_auto_spawn_to_tree_n_plus_one() {
         0,
         InstanceRole::Live,
     )];
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let mut handle =
         bootstrap_railgun_engine_multi(cfgs, params, |_| build_toy_state()).expect("bootstrap");
     let mut observer = handle.tree_observed.subscribe();
@@ -177,7 +177,7 @@ async fn five_tree_progression_full_lifecycle() {
         0,
         InstanceRole::Live,
     )];
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let mut handle =
         bootstrap_railgun_engine_multi(cfgs, params, |_| build_toy_state()).expect("bootstrap");
 

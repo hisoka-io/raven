@@ -15,7 +15,7 @@ import {
   TREE_DEPTH,
 } from "./poi-pir";
 import { MAX_BATCH_SIZE } from "./batch-ladder";
-import { buildPaddedQueryPlan } from "./batch-cover";
+import { buildPaddedQueryPlan, type PaddedQueryPlan } from "./batch-cover";
 import {
   type BcPrefixIndex,
   assertBcPrefixIndex,
@@ -142,6 +142,11 @@ export interface PoiIndexCounters {
   readonly absent: number;
   /** Syncs that found the node's list longer than the index held. */
   readonly staleIndexesCaught: number;
+  /** Proof calls whose first batch went out beside the index's tail read. */
+  readonly speculativeRounds: number;
+  /** Of those, the ones whose tail read showed the index had moved, so their replies were
+   *  discarded unread and the batch asked again from the synced index. */
+  readonly speculativeRoundsDiscarded: number;
 }
 
 export interface BlindedCommitmentData {
@@ -180,6 +185,22 @@ interface ListIndexSource {
   readonly failure?: unknown;
 }
 
+/** One commitment being proved: its candidate indices, and which one is being asked. */
+interface ProofTarget {
+  readonly bcHex: string;
+  readonly position: number;
+  candidates: number[];
+  next: number;
+}
+
+/** One ladder-padded batch to one block's instance. */
+interface ProofChunk {
+  readonly block: number;
+  readonly label: string;
+  readonly rows: number;
+  readonly group: { target: ProofTarget; at: ListRowTarget }[];
+}
+
 /** Where one list index is asked, and where its leaf sits in its PPOI block's tree. */
 interface ListRowTarget {
   readonly block: number;
@@ -211,6 +232,13 @@ export interface CapturedWireRequest {
 const X_RAVEN_FRESHNESS = "x-raven-freshness";
 const X_RAVEN_SCHEMA_VERSION = "x-raven-schema-version";
 const WIRE_SCHEMA_VERSION = 8;
+/** The schema of an instance whose parameter set has the approximate packing gadget. */
+const WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET = 9;
+/** Every schema this client speaks; the instance's parameter set picks one. */
+const KNOWN_WIRE_SCHEMA_VERSIONS: readonly number[] = [
+  WIRE_SCHEMA_VERSION,
+  WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET,
+];
 const DEFAULT_TXID_VERSION = "V2_PoseidonMerkle";
 const DEFAULT_CONFIDENCE_FLOOR = 0.5;
 const DEFAULT_CHAIN_ID = 1;
@@ -226,6 +254,10 @@ const ENGINE_BATCH_SIZE = 20;
 /** The verdicts engine's `TXOPOIListStatus` has. */
 const ENGINE_STATUSES: readonly string[] = ["Valid", "ShieldBlocked", "ProofSubmitted", "Missing"];
 const SESSION_QUERY_ATTEMPTS = 2;
+const UNANSWERED_PLAN_CAP = 64;
+/** How long an unanswered plan stays reusable: a caller's immediate retry resends the same rows,
+ *  and a call made after it draws its own covers, so two unrelated reads never share a cover set. */
+const PLAN_REUSE_MS = 30_000;
 const WIRE_CAPTURE_CAP = 64;
 
 type UpstreamJsonRpcMethod =
@@ -260,12 +292,17 @@ export class RavenPOINodeInterface {
   private readonly counters = {
     absent: 0,
     staleIndexesCaught: 0,
+    speculativeRounds: 0,
+    speculativeRoundsDiscarded: 0,
   };
 
   // Undefined unless the caller opted in: nothing is retained by default.
   private readonly capturedRequests: CapturedWireRequest[] | undefined;
   private readonly sessionHandshakes = new Map<string, Promise<bigint>>();
   private readonly clientPirIds = new Map<string, string>();
+  // Covers and slot order of batches not yet answered, so a batch sent again within
+  // `PLAN_REUSE_MS` asks for the same rows in the same slots.
+  private readonly unansweredPlans = new Map<string, { plan: PaddedQueryPlan; until: number }>();
   private nextUpstreamRequestId = 1;
 
   constructor(config: RavenConfig) {
@@ -1030,131 +1067,230 @@ export class RavenPOINodeInterface {
           "via loadClientPirContext before calling getPOIMerkleProofs",
       );
     }
-    const source = await this.listSource(lkHex);
-    // No proof exists for an absence, and its refusal says whether it could be shown current.
-    const notPresent = (bcHex: string, absences: number): RavenError => {
-      if (source.failure !== undefined) return indexSyncFailure(lkHex, source.failure);
-      this.counters.absent += absences;
-      return RavenError.invalidQuery(
-        `client-PIR: blinded commitment ${bcHex} not present in list ${lkHex} (the index holds ` +
-          `the ${source.index.total} rows the node serves)`,
-      );
-    };
-    // Resolve every commitment before any row query goes out: an unknown blinded commitment
-    // refuses without having disclosed the others, and the grouping below needs the whole set.
     const bcHexes = blindedCommitments.map((bc) => canonicalCommitmentHex(bc));
-    const candidateSets = indexCandidatesForEach(source.index, bcHexes);
-    const listRows = Math.max(1, source.index.total);
-    const firstAbsent = candidateSets.findIndex((candidates) => candidates.length === 0);
-    if (firstAbsent !== -1) {
-      throw notPresent(
-        bcHexes[firstAbsent],
-        candidateSets.filter((candidates) => candidates.length === 0).length,
-      );
-    }
-    let pending = blindedCommitments.map((_bc, position) => ({
-      bcHex: bcHexes[position],
-      position,
-      candidates: candidateSets[position],
-      next: 0,
-    }));
+    const out = new Array<MerkleProof>(bcHexes.length);
 
-    // Group by block (each block is its own instance), then pad each group to a ladder step.
-    // A later round exists only for a prefix collision.
-    const out = new Array<MerkleProof>(pending.length);
-    while (pending.length > 0) {
-      const collided: typeof pending = [];
-      const byBlock = new Map<
-        number,
-        {
-          label: string;
-          rows: number;
-          group: { target: (typeof pending)[number]; at: ListRowTarget }[];
+    // Round one goes out beside the tail read when a confirmed index already places every
+    // commitment: a held row never moves, and its replies are read only once the tail shows
+    // the index did not.
+    const held = await this.speculativeIndex(lkHex, bcHexes);
+    let source: ListIndexSource;
+    let pending: ProofTarget[];
+    if (held === undefined) {
+      source = await this.listSource(lkHex);
+      pending = this.resolveTargets(lkHex, source, bcHexes);
+    } else {
+      this.counters.speculativeRounds += 1;
+      const targets = indexCandidatesForEach(held, bcHexes).map((candidates, position) => ({
+        bcHex: bcHexes[position],
+        position,
+        candidates,
+        next: 0,
+      }));
+      const chunks = this.planRound(lkHex, ctx, targets, Math.max(1, held.total));
+      const [synced, replies] = await Promise.all([
+        this.listSource(lkHex),
+        this.askRound(ctx, chunks).then(
+          (answered) => ({ answered }),
+          (failure: unknown) => ({ failure }),
+        ),
+      ]);
+      source = synced;
+      const fresh = indexCandidatesForEach(source.index, bcHexes);
+      const moved =
+        source.failure === undefined &&
+        (source.index.epoch !== held.epoch ||
+          source.index.total < held.total ||
+          fresh.some((candidates, at) => candidates[0] !== targets[at].candidates[0]));
+      if (moved) {
+        this.counters.speculativeRoundsDiscarded += 1;
+        pending = this.resolveTargets(lkHex, source, bcHexes);
+      } else {
+        if ("failure" in replies) throw replies.failure;
+        // Collisions continue from the synced index, as a sequential call would.
+        for (const target of targets) {
+          if (source.failure === undefined) target.candidates = fresh[target.position];
         }
-      >();
-      for (const target of pending) {
-        const at = this.listRowTarget(lkHex, target.candidates[target.next], ctx, listRows);
-        const held = byBlock.get(at.block);
-        if (held === undefined) {
-          byBlock.set(at.block, { label: at.label, rows: at.rows, group: [{ target, at }] });
-        } else {
-          held.group.push({ target, at });
+        const collided: ProofTarget[] = [];
+        for (const [at, chunk] of chunks.entries()) {
+          await this.readChunk(lkHex, source, chunk, replies.answered[at], out, collided);
         }
+        pending = collided;
       }
+    }
 
-      for (const [block, { label: pathInstance, rows, group }] of byBlock) {
-        const rootKey = `${lkHex}:${block}`;
-        const chunkCount = Math.ceil(group.length / MAX_BATCH_SIZE);
-        for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
-          const chunk = group.slice(
-            chunkIndex * MAX_BATCH_SIZE,
-            (chunkIndex + 1) * MAX_BATCH_SIZE,
-          );
-          // Encrypted row queries only.
-          const privateReply = await this.runClientPirQueryBatch(
-            pathInstance,
-            ctx,
-            chunk.map(({ at }) => at.leaf),
-            rows,
-          );
-          this.privateFreshnessAction(privateReply.freshness);
-          for (let slot = 0; slot < chunk.length; slot += 1) {
-            const { target, at } = chunk[slot];
-            const { bcHex, position } = target;
-            const localIndex = at.leaf;
-            const row = privateReply.plaintexts[slot];
-            const addendum = privateReply.addenda[slot];
-            if (
-              !row ||
-              row.length !== PATH10_ROW_BYTES ||
-              new TextDecoder().decode(row.slice(34, 38)) !== "RVP2"
-            ) {
-              throw RavenError.decodeError(`client-PIR ${pathInstance}: malformed PPOI v2 row`);
-            }
-            if (sharesOnlyPrefix(row.subarray(0, 32), hexToBytes(bcHex))) {
-              target.next += 1;
-              if (target.next === target.candidates.length) throw notPresent(bcHex, 1);
-              collided.push(target);
-              continue;
-            }
-            if (bytesToHex(row.slice(0, 32)) !== bcHex) {
-              throw RavenError.decodeError(
-                `client-PIR ${pathInstance}: row leaf does not match the requested blinded commitment`,
-              );
-            }
-            if (!addendum || addendum.length !== PATH10_ADDENDUM_BYTES) {
-              throw RavenError.decodeError(`client-PIR ${pathInstance}: upper-sibling addendum must be 160 bytes`);
-            }
-            const nodes = Array.from({ length: 11 }, (_unused, level) =>
-              row.slice(38 + level * 32, 38 + (level + 1) * 32),
-            ).concat(
-              Array.from({ length: 5 }, (_unused, level) =>
-                addendum.slice(level * 32, (level + 1) * 32),
-              ),
-            );
-            const proof = buildMerkleProof(localIndex, bcHex, nodes);
-            const pinnedRoot = this.pinnedRootFor(rootKey);
-            if (pinnedRoot !== undefined) {
-              const normalizedPin = checkedPinnedRoot(
-                pinnedRoot,
-                rootKey,
-                `client-PIR ${pathInstance}`,
-              );
-              if (normalizedPin !== proof.root) {
-                throw RavenError.decodeError(
-                  `client-PIR ${pathInstance}: folded root does not match pinned root`,
-                );
-              }
-            } else {
-              await this.verifyAgainstUpstreamPin(pathInstance, lkHex, block, rootKey, proof.root);
-            }
-            out[position] = proof;
-          }
-        }
+    // A later round exists only for a prefix collision.
+    const listRows = Math.max(1, source.index.total);
+    while (pending.length > 0) {
+      const collided: ProofTarget[] = [];
+      for (const chunk of this.planRound(lkHex, ctx, pending, listRows)) {
+        const [answered] = await this.askRound(ctx, [chunk]);
+        await this.readChunk(lkHex, source, chunk, answered, out, collided);
       }
       pending = collided;
     }
     return out;
+  }
+
+  /** The held index when it can place every commitment for a speculative first round: held,
+   *  confirmed by this node, and holding a candidate for each. */
+  private async speculativeIndex(
+    lkHex: string,
+    bcHexes: readonly string[],
+  ): Promise<BcPrefixIndex | undefined> {
+    const held = await this.heldIndex(lkHex);
+    if (held === undefined || !this.confirmedIndexes.has(this.indexKey(lkHex))) return undefined;
+    const candidates = indexCandidatesForEach(held, bcHexes);
+    return candidates.every((found) => found.length > 0) ? held : undefined;
+  }
+
+  /** Each commitment's candidates, or the refusal for the first absent one. Runs before any row
+   *  query goes out, so an unknown commitment refuses without having disclosed the others. */
+  private resolveTargets(
+    lkHex: string,
+    source: ListIndexSource,
+    bcHexes: readonly string[],
+  ): ProofTarget[] {
+    const candidateSets = indexCandidatesForEach(source.index, bcHexes);
+    const firstAbsent = candidateSets.findIndex((candidates) => candidates.length === 0);
+    if (firstAbsent !== -1) {
+      throw this.notPresent(
+        lkHex,
+        source,
+        bcHexes[firstAbsent],
+        candidateSets.filter((candidates) => candidates.length === 0).length,
+      );
+    }
+    return bcHexes.map((bcHex, position) => ({
+      bcHex,
+      position,
+      candidates: candidateSets[position],
+      next: 0,
+    }));
+  }
+
+  /** No proof exists for an absence, and its refusal says whether it could be shown current. */
+  private notPresent(
+    lkHex: string,
+    source: ListIndexSource,
+    bcHex: string,
+    absences: number,
+  ): RavenError {
+    if (source.failure !== undefined) return indexSyncFailure(lkHex, source.failure);
+    this.counters.absent += absences;
+    return RavenError.invalidQuery(
+      `client-PIR: blinded commitment ${bcHex} not present in list ${lkHex} (the index holds ` +
+        `the ${source.index.total} rows the node serves)`,
+    );
+  }
+
+  /** Group by block (each block is its own instance), then split each group into ladder-padded
+   *  batches. */
+  private planRound(
+    lkHex: string,
+    ctx: ClientPirContext,
+    pending: readonly ProofTarget[],
+    listRows: number,
+  ): ProofChunk[] {
+    const byBlock = new Map<number, ProofChunk>();
+    for (const target of pending) {
+      const at = this.listRowTarget(lkHex, target.candidates[target.next], ctx, listRows);
+      const held = byBlock.get(at.block);
+      if (held === undefined) {
+        byBlock.set(at.block, { block: at.block, label: at.label, rows: at.rows, group: [{ target, at }] });
+      } else {
+        held.group.push({ target, at });
+      }
+    }
+    const chunks: ProofChunk[] = [];
+    for (const { block, label, rows, group } of byBlock.values()) {
+      for (let first = 0; first < group.length; first += MAX_BATCH_SIZE) {
+        chunks.push({ block, label, rows, group: group.slice(first, first + MAX_BATCH_SIZE) });
+      }
+    }
+    return chunks;
+  }
+
+  /** Encrypted row queries only, one batch per chunk, in order. */
+  private async askRound(
+    ctx: ClientPirContext,
+    chunks: readonly ProofChunk[],
+  ): Promise<PrivateQueryBatchResult[]> {
+    const answered: PrivateQueryBatchResult[] = [];
+    for (const chunk of chunks) {
+      answered.push(
+        await this.runClientPirQueryBatch(
+          chunk.label,
+          ctx,
+          chunk.group.map(({ at }) => at.leaf),
+          chunk.rows,
+        ),
+      );
+    }
+    return answered;
+  }
+
+  /** Check one batch's replies and fold each into its proof, or queue it for its next candidate
+   *  when its row only shares the prefix. */
+  private async readChunk(
+    lkHex: string,
+    source: ListIndexSource,
+    chunk: ProofChunk,
+    privateReply: PrivateQueryBatchResult,
+    out: MerkleProof[],
+    collided: ProofTarget[],
+  ): Promise<void> {
+    const pathInstance = chunk.label;
+    const rootKey = `${lkHex}:${chunk.block}`;
+    this.privateFreshnessAction(privateReply.freshness);
+    for (let slot = 0; slot < chunk.group.length; slot += 1) {
+      const { target, at } = chunk.group[slot];
+      const { bcHex, position } = target;
+      const localIndex = at.leaf;
+      const row = privateReply.plaintexts[slot];
+      const addendum = privateReply.addenda[slot];
+      if (
+        !row ||
+        row.length !== PATH10_ROW_BYTES ||
+        new TextDecoder().decode(row.slice(34, 38)) !== "RVP2"
+      ) {
+        throw RavenError.decodeError(`client-PIR ${pathInstance}: malformed PPOI v2 row`);
+      }
+      if (sharesOnlyPrefix(row.subarray(0, 32), hexToBytes(bcHex))) {
+        target.next += 1;
+        if (target.next === target.candidates.length) throw this.notPresent(lkHex, source, bcHex, 1);
+        collided.push(target);
+        continue;
+      }
+      if (bytesToHex(row.slice(0, 32)) !== bcHex) {
+        throw RavenError.decodeError(
+          `client-PIR ${pathInstance}: row leaf does not match the requested blinded commitment`,
+        );
+      }
+      if (!addendum || addendum.length !== PATH10_ADDENDUM_BYTES) {
+        throw RavenError.decodeError(`client-PIR ${pathInstance}: upper-sibling addendum must be 160 bytes`);
+      }
+      const nodes = Array.from({ length: 11 }, (_unused, level) =>
+        row.slice(38 + level * 32, 38 + (level + 1) * 32),
+      ).concat(
+        Array.from({ length: 5 }, (_unused, level) =>
+          addendum.slice(level * 32, (level + 1) * 32),
+        ),
+      );
+      const proof = buildMerkleProof(localIndex, bcHex, nodes);
+      const pinnedRoot = this.pinnedRootFor(rootKey);
+      if (pinnedRoot !== undefined) {
+        const normalizedPin = checkedPinnedRoot(pinnedRoot, rootKey, `client-PIR ${pathInstance}`);
+        if (normalizedPin !== proof.root) {
+          throw RavenError.decodeError(
+            `client-PIR ${pathInstance}: folded root does not match pinned root`,
+          );
+        }
+      } else {
+        await this.verifyAgainstUpstreamPin(pathInstance, lkHex, chunk.block, rootKey, proof.root);
+      }
+      out[position] = proof;
+    }
   }
 
   /** Second rung of the root ladder. A caller-supplied pin always wins; with none, the
@@ -1222,10 +1358,34 @@ export class RavenPOINodeInterface {
     targetIndices: readonly number[],
     populatedRows: number,
   ): Promise<PrivateQueryBatchResult> {
-    return this.withClientPirSessionRetry(instanceLabel, ctx, async () => {
+    const { entriesPerShard } = decodeShardGeometry(ctx.shardConfigBincode);
+    const rowBound = Math.max(populatedRows, ...targetIndices.map((target) => target + 1));
+    const shards = Math.ceil(rowBound / entriesPerShard);
+    const planKey = `${instanceLabel}:${entriesPerShard}:${targetIndices.join(",")}`;
+    const now = Date.now();
+    let held = this.unansweredPlans.get(planKey);
+    // A grown table keeps the plan, so every send of these targets carries the same covers. A
+    // shrunk one rebuilds it once a cover names a shard the instance no longer serves, which
+    // admission refuses on every resend.
+    if (
+      held === undefined ||
+      held.until <= now ||
+      held.plan.wireTargets.some((row) => Math.floor(row / entriesPerShard) >= shards)
+    ) {
+      held = {
+        plan: buildPaddedQueryPlan(targetIndices, entriesPerShard, populatedRows),
+        until: now + PLAN_REUSE_MS,
+      };
+    }
+    const { plan } = held;
+    this.unansweredPlans.delete(planKey);
+    this.unansweredPlans.set(planKey, held);
+    for (const [key, entry] of this.unansweredPlans) {
+      if (this.unansweredPlans.size <= UNANSWERED_PLAN_CAP && entry.until > now) continue;
+      this.unansweredPlans.delete(key);
+    }
+    const answered = await this.withClientPirSessionRetry(instanceLabel, ctx, async () => {
       const route = this.route();
-      const { entriesPerShard } = decodeShardGeometry(ctx.shardConfigBincode);
-      const plan = buildPaddedQueryPlan(targetIndices, entriesPerShard, populatedRows);
       const queryBundles = plan.wireTargets.map((targetIdx) =>
         decodeClientPirQueryBundle(
           callWasm("client-PIR query", () =>
@@ -1233,13 +1393,17 @@ export class RavenPOINodeInterface {
           ),
         ),
       );
-      const batchBody = encodeBatchBody(queryBundles.map(({ queryBytes }) => queryBytes));
+      const schema = contextWireSchema(ctx, instanceLabel);
+      const batchBody = encodeBatchBody(
+        queryBundles.map(({ queryBytes }) => queryBytes),
+        schema,
+      );
       const url = `${route.endpoint}/v1/instance/${encodeURIComponent(instanceLabel)}/batch`;
       this.captureRequest(url, "POST", batchBody);
-      const res = await this.postClientPirRequest(instanceLabel, url, batchBody);
+      const res = await this.postClientPirRequest(instanceLabel, url, batchBody, schema);
       const freshness = parsePrivateFreshnessHeader(res.headers.get(X_RAVEN_FRESHNESS));
       const responseBytes = new Uint8Array(await res.arrayBuffer());
-      void stripSchemaEnvelope(responseBytes, instanceLabel);
+      void stripSchemaEnvelope(responseBytes, instanceLabel, schema);
       const responses = decodeBatchBody(responseBytes);
       if (responses.length !== queryBundles.length) {
         throw RavenError.batchMismatch(
@@ -1262,7 +1426,12 @@ export class RavenPOINodeInterface {
         ),
       );
       return { plaintexts, addenda, freshness };
+    }).catch((cause: unknown) => {
+      if (refusalOutlivesRetry(cause)) this.unansweredPlans.delete(planKey);
+      throw cause;
     });
+    this.unansweredPlans.delete(planKey);
+    return answered;
   }
 
   private async withClientPirSessionRetry<T>(
@@ -1295,6 +1464,7 @@ export class RavenPOINodeInterface {
     instanceLabel: string,
     url: string,
     requestBody: Uint8Array,
+    schema: number,
   ): Promise<Response> {
     const credential = bearerHeaders(this.route().bearerToken);
     const clientId = this.clientPirClientId(instanceLabel);
@@ -1322,15 +1492,12 @@ export class RavenPOINodeInterface {
       const serverVersion = parseSchemaVersion(
         response.headers.get(X_RAVEN_SCHEMA_VERSION)?.trim() ?? "",
       );
-      if (
-        response.headers.has(X_RAVEN_SCHEMA_VERSION) &&
-        serverVersion !== WIRE_SCHEMA_VERSION
-      ) {
+      if (response.headers.has(X_RAVEN_SCHEMA_VERSION) && serverVersion !== schema) {
         throw RavenError.staleAdapter(`client-PIR batch ${instanceLabel}: schema mismatch`, {
           url,
           status: 400,
           serverWireSchemaVersion: serverVersion ?? undefined,
-          clientWireSchemaVersion: WIRE_SCHEMA_VERSION,
+          clientWireSchemaVersion: schema,
         });
       }
     }
@@ -1387,6 +1554,7 @@ export class RavenPOINodeInterface {
           "@hisoka-io/raven-inspire-client-wasm this SDK names as a peer",
       );
     }
+    const schema = contextWireSchema(ctx, instanceLabel);
     const route = this.route();
     const credential = bearerHeaders(route.bearerToken);
     const clientId = this.clientPirClientId(instanceLabel);
@@ -1412,6 +1580,15 @@ export class RavenPOINodeInterface {
       });
     }
     if (!response.ok) {
+      const served = parseSchemaVersion(response.headers.get(X_RAVEN_SCHEMA_VERSION)?.trim() ?? "");
+      if (response.status === 400 && served !== null && served !== schema) {
+        throw RavenError.staleAdapter(`client-PIR session ${instanceLabel}: schema mismatch`, {
+          url,
+          status: 400,
+          serverWireSchemaVersion: served,
+          clientWireSchemaVersion: schema,
+        });
+      }
       throw RavenError.serverError(
         `client-PIR session ${instanceLabel}: ${response.status}`,
         { url, status: response.status },
@@ -1573,15 +1750,53 @@ export class RavenPOINodeInterface {
   }
 }
 
-/** Validate a response's `[u16 BE version]` prefix. */
-function stripSchemaEnvelope(buf: Uint8Array, label: string): Uint8Array {
+const contextSchemas = new WeakMap<ClientPirContext, number>();
+
+/** A 4xx that a resend of the same body meets again; 408, 425 and 429 ask for a later try, and
+ *  a 409 is a session handle the retry replaces. */
+function refusalOutlivesRetry(cause: unknown): boolean {
+  if (!(cause instanceof RavenError)) return false;
+  const status = (cause.context as { status?: unknown }).status;
+  return (
+    typeof status === "number" &&
+    status >= 400 &&
+    status <= 499 &&
+    ![408, 409, 425, 429].includes(status)
+  );
+}
+
+/**
+ * The schema the context's instance speaks, read off the session's own registration body: the
+ * wasm stamps it from the CRS's parameter set, so the queries go out under the set the keys were
+ * built for. One the SDK does not know is refused before anything is sent.
+ */
+function contextWireSchema(ctx: ClientPirContext, label: string): number {
+  const held = contextSchemas.get(ctx);
+  if (held !== undefined) return held;
+  const body = callWasm(`client-PIR session ${label}`, () =>
+    ctx.wasm.client_packing_keys_versioned(ctx.session),
+  );
+  const schema = body.length >= 2 ? (body[0] << 8) | body[1] : -1;
+  if (!KNOWN_WIRE_SCHEMA_VERSIONS.includes(schema)) {
+    throw RavenError.staleAdapter(
+      `client-PIR ${label}: the session speaks wire schema ${schema}, this client speaks ` +
+        KNOWN_WIRE_SCHEMA_VERSIONS.join(" or "),
+      { clientWireSchemaVersion: schema },
+    );
+  }
+  contextSchemas.set(ctx, schema);
+  return schema;
+}
+
+/** Validate a response's `[u16 BE version]` prefix against the instance's schema. */
+function stripSchemaEnvelope(buf: Uint8Array, label: string, schema: number): Uint8Array {
   if (buf.length < 2) {
     throw RavenError.decodeError(
       `${label}: response too short for schema envelope (${buf.length})`,
     );
   }
   const envelope = (buf[0] << 8) | buf[1];
-  if (envelope !== WIRE_SCHEMA_VERSION) {
+  if (envelope !== schema) {
     throw RavenError.decodeError(
       `${label}: unexpected schema envelope version ${envelope}`,
     );
@@ -1591,10 +1806,10 @@ function stripSchemaEnvelope(buf: Uint8Array, label: string): Uint8Array {
 
 /** Encode the `Vec<SeededClientQuery>` shape `dispatch_batch` expects:
  * `[u16 BE version][u64 LE count][concatenated per-query bincode]`. */
-function encodeBatchBody(queries: Uint8Array[]): Uint8Array {
+function encodeBatchBody(queries: Uint8Array[], schema: number): Uint8Array {
   const schemaPrefix = new Uint8Array([
-    (WIRE_SCHEMA_VERSION >>> 8) & 0xff,
-    WIRE_SCHEMA_VERSION & 0xff,
+    (schema >>> 8) & 0xff,
+    schema & 0xff,
   ]);
   let bodyBytes = 8;
   for (const q of queries) {
@@ -1912,6 +2127,8 @@ export {
   TREE_DEPTH,
   PATH_RECORD_BYTES,
   WIRE_SCHEMA_VERSION,
+  WIRE_SCHEMA_VERSION_APPROXIMATE_GADGET,
+  KNOWN_WIRE_SCHEMA_VERSIONS,
 };
 export type {
   ClientPirContext,

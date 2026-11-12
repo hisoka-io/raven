@@ -34,7 +34,7 @@ fn a_howl_record_survives_the_production_cell() {
         .flat_map(|index| store.shard(index).expect("shard").cells)
         .collect();
 
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     assert_eq!(
         params.ring_dim, ROWS_PER_SHARD,
         "a shard is one ring of rows"
@@ -76,7 +76,7 @@ fn a_howl_record_survives_the_production_cell() {
 
 #[test]
 fn the_bare_record_width_is_not_a_cell() {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let mut sampler = GaussianSampler::with_seed(params.sigma, 1);
     let rows = vec![0u8; ROWS_PER_SHARD * RECORD_BYTES];
     assert!(setup(&params, &rows, RECORD_BYTES, &mut sampler).is_err());

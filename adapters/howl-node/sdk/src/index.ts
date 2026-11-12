@@ -1,5 +1,5 @@
-export { HowlError, type AnswerState, type HowlErrorKind } from "./errors.js";
-export { PrefixFeed, tagPrefix, TAG_PREFIX_BYTES, type FeedMatch } from "./feed.js";
+export { HowlError, MAX_RETRY_AFTER_SECONDS, type AnswerState, type HowlErrorKind } from "./errors.js";
+export { PrefixFeed, tagPrefix, TAG_PREFIX_BYTES, type FeedMatch, type FeedView } from "./feed.js";
 export { fetchTransport, type Exchange, type FetchTransportOptions, type HowlTransport, type TransportStats } from "./http.js";
 export {
   bigintField,
@@ -18,13 +18,39 @@ export {
 export {
   LEAF_BLOCK_SIZE,
   RavenHowlSource,
+  SYNC_CURSOR_GRANULE,
   type FirstOccurrence,
   type KeyMode,
   type MerkleWitness,
+  type NoteCheck,
   type OccurrenceRequest,
   type RavenHowlSourceOptions,
   type SyncResult,
   type SyncSnapshot,
   type TagPrefixSegment,
 } from "./source.js";
+export {
+  discoverySource,
+  witnessSource,
+  type DiscoveryReads,
+  type HowlDiscoverySource,
+  type HowlWitnessSource,
+  type WitnessSourceOptions,
+} from "./howl.js";
 export { KIND, type HowlAnswerView, type HowlBatchHandle, type HowlCellsView, type HowlClientHandle, type HowlTreeHandle, type HowlWasm } from "./wasm.js";
+export {
+  checkSigningSession,
+  MultisigRavenScan,
+  openSigningSession,
+  SigningSessionRefused,
+  type MultisigChainEvent,
+  type MultisigEventScanner,
+  type MultisigFound,
+  type MultisigKeys,
+  type MultisigScanOptions,
+  type MultisigScanResult,
+  type MultisigTagSource,
+  type OpenedCell,
+  type SigningRefusalReason,
+  type SigningSession,
+} from "./multisig.js";

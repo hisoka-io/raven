@@ -24,7 +24,7 @@ const ILLEGAL_WIDTHS: [usize; 5] = [328, 640, 4096, 8192, 32768];
 const NOTE_RECORD_BYTES: usize = 328;
 
 fn ring_dim() -> usize {
-    InspireParams::secure_128_d2048().ring_dim
+    InspireParams::d2048().ring_dim
 }
 
 #[test]
@@ -237,7 +237,7 @@ fn cell_shape_still_enforces_the_total_entries_floor() {
 
 /// Full PIR round trip at one width; returns the worst per-entry mismatched-byte count.
 fn worst_mismatch_at_width(entry_size: usize) -> usize {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let entries = 8usize;
     let mut db = vec![0u8; entries * entry_size];
     for (i, byte) in db.iter_mut().enumerate() {
@@ -276,7 +276,7 @@ fn worst_mismatch_at_width(entry_size: usize) -> usize {
 
 /// `Some(error)` when setup refuses the width, `None` when it accepts.
 fn setup_rejection_at_width(entry_size: usize) -> Option<String> {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = vec![0u8; 8 * entry_size];
     setup_state(&params, &db, entry_size, InspireVariant::TwoPacking)
         .err()

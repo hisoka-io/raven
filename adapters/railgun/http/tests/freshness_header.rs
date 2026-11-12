@@ -97,16 +97,56 @@ fn build_router(cell: Option<Arc<parking_lot::Mutex<ConsumerMetrics>>>) -> axum:
         AppState::new(engine, cfg).expect("appstate")
     };
     let state = match cell {
-        Some(c) => state.with_consumer_metrics(c),
+        Some(c) => state.with_instance_metrics(std::collections::HashMap::from([(
+            InstanceId::new(INSTANCE),
+            c,
+        )])),
         None => state,
     };
     router::<EchoScheme>(state).expect("router")
 }
 
+type Cell = Arc<parking_lot::Mutex<ConsumerMetrics>>;
+
+/// A node serving `ids`, wired as production wires one: a cell per instance in the map.
+fn build_node(ids: &[&str], cells: &[(&str, &Cell)]) -> axum::Router {
+    let mut engine: Engine<EchoScheme> = Engine::new();
+    for id in ids {
+        engine
+            .register_instance(Arc::new(PirInstance::new(
+                InstanceId::new(*id),
+                InstanceRole::Live,
+                EchoState,
+            )))
+            .expect("register instance");
+    }
+    let mut cfg = HttpConfig::demo(TOKEN);
+    cfg.respond_timeout_secs = 5;
+    cfg.rate_limit_rps = 10_000;
+    cfg.rate_limit_burst = 10_000;
+    let state = {
+        let _g = APPSTATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        AppState::new(engine, cfg).expect("appstate")
+    };
+    let state = state.with_instance_metrics(
+        cells
+            .iter()
+            .map(|(id, c)| (InstanceId::new(*id), Arc::clone(c)))
+            .collect(),
+    );
+    router::<EchoScheme>(state).expect("router")
+}
+
 fn request(route: &str, body: Vec<u8>) -> Request<Body> {
+    request_to(INSTANCE, route, body)
+}
+
+fn request_to(instance: &str, route: &str, body: Vec<u8>) -> Request<Body> {
     let mut req = Request::builder()
         .method(Method::POST)
-        .uri(format!("/v1/instance/{INSTANCE}/{route}"))
+        .uri(format!("/v1/instance/{instance}/{route}"))
         .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .body(Body::from(body))
@@ -127,10 +167,11 @@ fn batch_body() -> Vec<u8> {
 }
 
 async fn freshness_of(router: axum::Router, route: &str, body: Vec<u8>) -> String {
-    let resp = router
-        .oneshot(request(route, body))
-        .await
-        .expect("dispatch");
+    freshness_from(router, request(route, body), route).await
+}
+
+async fn freshness_from(router: axum::Router, req: Request<Body>, route: &str) -> String {
+    let resp = router.oneshot(req).await.expect("dispatch");
     assert_eq!(resp.status(), StatusCode::OK, "{route} must be served");
     resp.headers()
         .get(FRESHNESS)
@@ -184,5 +225,51 @@ async fn freshness_header_is_still_emitted_without_consumer_metrics() {
     assert_eq!(
         value,
         "lag_blocks=0 applied_height=0 epoch=0 confidence=1.000"
+    );
+}
+
+const SEALED: &str = "freshness-sealed-block";
+const LIVE: &str = "freshness-live-block";
+const UNWIRED: &str = "freshness-unwired-block";
+
+/// A sealed first block whose consumer stopped long ago, beside a live one at the tip.
+fn sealed_and_live() -> (Cell, Cell) {
+    (
+        metrics_cell(20_000_000, 19_999_000, 21_000_010),
+        metrics_cell(21_000_000, 20_999_990, 21_000_010),
+    )
+}
+
+/// The response came from one instance's snapshot, so its freshness is that instance's, on
+/// both routes.
+#[tokio::test]
+async fn freshness_describes_the_instance_that_answered() {
+    let (sealed, live) = sealed_and_live();
+    let node = || build_node(&[SEALED, LIVE], &[(SEALED, &sealed), (LIVE, &live)]);
+    let live_reading = "lag_blocks=10 applied_height=20999990 epoch=0 confidence=0.961";
+    for (route, body) in [("query", single_body()), ("batch", batch_body())] {
+        let value = freshness_from(node(), request_to(LIVE, route, body.clone()), route).await;
+        assert_eq!(value, live_reading, "{route} served by the live block");
+        let value = freshness_from(node(), request_to(SEALED, route, body), route).await;
+        assert_eq!(
+            value, "lag_blocks=1000010 applied_height=19999000 epoch=0 confidence=0.000",
+            "{route} served by the sealed block"
+        );
+    }
+}
+
+/// An instance with no cell of its own reports the node view `/v1/status` gives: the worst
+/// lag and the highest applied height, not a clean zero and not another instance's numbers.
+#[tokio::test]
+async fn an_instance_without_its_own_cell_reports_the_node_view() {
+    let (sealed, live) = sealed_and_live();
+    let node = build_node(
+        &[SEALED, LIVE, UNWIRED],
+        &[(SEALED, &sealed), (LIVE, &live)],
+    );
+    let value = freshness_from(node, request_to(UNWIRED, "query", single_body()), "query").await;
+    assert_eq!(
+        value,
+        "lag_blocks=1000010 applied_height=20999990 epoch=0 confidence=0.000"
     );
 }

@@ -36,7 +36,7 @@ const TOY_ENTRY_BYTES: usize = 256;
 static APPSTATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn build_engine() -> Engine<RavenInspireScheme> {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = raven_railgun_testkit::toy_db(TOY_ENTRIES, TOY_ENTRY_BYTES);
     let (state, _sk) =
         setup_state(&params, &db, TOY_ENTRY_BYTES, InspireVariant::TwoPacking).expect("toy state");
@@ -59,7 +59,7 @@ fn build_router(app_state: AppState<RavenInspireScheme>) -> axum::Router {
 /// One instance, so two `AppState`s serve byte-identical `/params` bodies while
 /// holding independent ETag caches.
 fn build_shared_instance() -> Arc<PirInstance<RavenInspireScheme>> {
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db = raven_railgun_testkit::toy_db(TOY_ENTRIES, TOY_ENTRY_BYTES);
     let (state, _sk) =
         setup_state(&params, &db, TOY_ENTRY_BYTES, InspireVariant::TwoPacking).expect("toy state");
@@ -372,7 +372,7 @@ async fn params_handler_invalidates_etag_on_epoch_bump() {
     // `swap_state` refuses any epoch that does not advance, so one (instance, epoch) key
     // can only ever name one body. The DB differs so the swapped-in state is genuinely a
     // different state, but the assertion below does not rest on that.
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let db_v2: Vec<u8> = (0..TOY_ENTRIES)
         .flat_map(|i| {
             (0..TOY_ENTRY_BYTES).map(move |j| u8::try_from((i + j + 7) % 251).expect("< 251"))

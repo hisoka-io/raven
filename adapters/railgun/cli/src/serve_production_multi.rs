@@ -230,6 +230,10 @@ struct GlobalSection {
     /// Packing-key seats per instance, auto-spawned ones included.
     #[serde(default)]
     max_sessions_per_instance: Option<usize>,
+    /// Serve the parameter set with the approximate packing gadget: 32 KiB seats, wire schema 9,
+    /// which a schema-8 client refuses. A data dir built under the other set is refused at boot.
+    #[serde(default)]
+    approximate_packing_gadget: Option<bool>,
     /// Seat and handle lifetime in seconds; may only be lowered from the default.
     #[serde(default)]
     session_ttl_secs: Option<u64>,
@@ -370,6 +374,8 @@ pub struct MultiServeOptions {
     pub reorg_window_path: Option<PathBuf>,
     /// Session seats, lifetime, bindings and handshake concurrency; absent keys keep the defaults.
     pub session_capacity: SessionCapacity,
+    /// `[global].approximate_packing_gadget`: serve `InspireParams::d2048_approximate_gadget`.
+    pub approximate_packing_gadget: bool,
     /// From the stop signal to exit; [`STOP_BUDGET`] unless a test lifts it to bound its stop by
     /// progress instead.
     pub stop_budget: std::time::Duration,
@@ -846,6 +852,7 @@ pub fn load_options_from_toml(path: &Path) -> anyhow::Result<MultiServeOptions> 
         session_eviction_interval_secs: parsed.global.session_eviction_interval_secs,
         reorg_window_path: parsed.global.reorg_window_path,
         session_capacity,
+        approximate_packing_gadget: parsed.global.approximate_packing_gadget.unwrap_or(false),
         stop_budget: STOP_BUDGET,
     })
 }
@@ -1086,12 +1093,10 @@ fn warn_if_ifma52_small_cell(opts: &MultiServeOptions, entries: usize) {
         tracing::warn!(
             entries,
             min_record_size,
-            "host CPU exposes AVX-512-IFMA52 (W-G IFMA52 SIMD path) AND \
-             the configured cell is small (entries < 2^16 OR \
-             record_size <= 32). At T1-style small cells the IFMA52 \
-             path regresses by ~1.038x on Zen 5. See OPERATOR_RUNBOOK \
-             section 7a for the cell applicability table. The path is \
-             auto-detected; no action required if you accept the \
+            "host CPU exposes AVX-512-IFMA52 AND the configured cell is \
+             small (entries < 2^16 OR record_size <= 32). At cells this \
+             small the IFMA52 path measured ~1.038x slower on Zen 5. The \
+             path is auto-detected; no action required if you accept the \
              measured regression."
         );
     }
@@ -1175,7 +1180,11 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
         );
     }
 
-    let params = InspireParams::secure_128_d2048();
+    let params = if opts.approximate_packing_gadget {
+        InspireParams::d2048_approximate_gadget()
+    } else {
+        InspireParams::d2048()
+    };
     let fleet_default_entries = opts.entries.max(1);
     let smallest_cell_entries = opts
         .instances
@@ -1314,6 +1323,7 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
             &bootstrap.handles.instances,
             &opts,
             session_limits,
+            app_state.instance_metrics_registry(),
         )?)
     } else {
         None
@@ -1377,11 +1387,6 @@ pub async fn run_with_listener<F: std::future::Future<Output = ()> + Send + 'sta
             );
         }
     }
-    let app_state = if let Some(metrics) = bootstrap.handles.instances.first() {
-        app_state.with_consumer_metrics(Arc::clone(&metrics.metrics))
-    } else {
-        app_state
-    };
     let app_state = app_state.with_instance_concurrency(k_map);
     let instance_logical_stores = bootstrap
         .handles
@@ -2056,6 +2061,7 @@ fn wire_auto_spawn(
     initial_handles: &[raven_railgun_engine::orchestrator::PerInstanceHandles],
     opts: &MultiServeOptions,
     session_limits: SessionStoreLimits,
+    instance_metrics: Arc<raven_railgun_http::InstanceMetricsMap>,
 ) -> anyhow::Result<AutoSpawnWiring> {
     use crate::auto_spawn_driver::{replay_spawn_log, run_driver_dynamic, SpawnRegistry};
 
@@ -2070,7 +2076,7 @@ fn wire_auto_spawn(
         None => std::path::PathBuf::from("."),
     };
 
-    let registry = Arc::new(SpawnRegistry::new());
+    let registry = Arc::new(SpawnRegistry::publishing_metrics_to(instance_metrics));
     registry.seed_from_bootstrap(initial_handles);
 
     let restored = replay_spawn_log(
@@ -3712,7 +3718,7 @@ data_source = { kind = "indexer", filter = { tree_number = 2 } }
             "a per-instance record_size overrides [global].record_size"
         );
 
-        let ring_dim = InspireParams::secure_128_d2048().ring_dim;
+        let ring_dim = InspireParams::d2048().ring_dim;
         for cfg in &opts.instances {
             let entries = entries_for_instance(&opts, cfg, DEFAULT_PRODUCTION_ENTRIES);
             validate_instance_cell_shape(cfg, entries, ring_dim)
@@ -3812,7 +3818,7 @@ data_source = {{ kind = "mirror", list_key = "{OFAC_LIST_KEY}", block = 1 }}
             );
         }
 
-        let ring_dim = InspireParams::secure_128_d2048().ring_dim;
+        let ring_dim = InspireParams::d2048().ring_dim;
         for cfg in &opts.instances {
             let entries = entries_for_instance(&opts, cfg, DEFAULT_PRODUCTION_ENTRIES);
             validate_instance_cell_shape(cfg, entries, ring_dim).unwrap_or_else(|e| {
@@ -3828,7 +3834,7 @@ data_source = {{ kind = "mirror", list_key = "{OFAC_LIST_KEY}", block = 1 }}
     fn a_fleet_wide_default_production_entries_rejects_the_node_family() {
         let f = write_temp_toml(&live_six_instance_toml(None));
         let opts = load_options_from_toml(f.path()).expect("parse");
-        let ring_dim = InspireParams::secure_128_d2048().ring_dim;
+        let ring_dim = InspireParams::d2048().ring_dim;
 
         let rejected: Vec<&str> = opts
             .instances
@@ -3854,7 +3860,7 @@ data_source = {{ kind = "mirror", list_key = "{OFAC_LIST_KEY}", block = 1 }}
     fn an_undersized_per_instance_entries_is_rejected_with_an_actionable_error() {
         let f = write_temp_toml(&live_six_instance_toml(Some(DEFAULT_PRODUCTION_ENTRIES)));
         let opts = load_options_from_toml(f.path()).expect("parse");
-        let ring_dim = InspireParams::secure_128_d2048().ring_dim;
+        let ring_dim = InspireParams::d2048().ring_dim;
         let cfg = opts
             .instances
             .iter()
@@ -3885,7 +3891,7 @@ data_source = {{ kind = "mirror", list_key = "{OFAC_LIST_KEY}", block = 1 }}
             "the override is per-instance, not fleet-wide"
         );
 
-        let ring_dim = InspireParams::secure_128_d2048().ring_dim;
+        let ring_dim = InspireParams::d2048().ring_dim;
         for cfg in &opts.instances {
             let entries = entries_for_instance(&opts, cfg, DEFAULT_PRODUCTION_ENTRIES);
             validate_instance_cell_shape(cfg, entries, ring_dim)

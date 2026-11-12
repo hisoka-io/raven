@@ -120,7 +120,7 @@ fn cfg(root: &std::path::Path) -> InstanceConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_event_for_a_tree_no_instance_routes_increments_the_dropped_counter() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let params = InspireParams::secure_128_d2048();
+    let params = InspireParams::d2048();
     let mut handle =
         bootstrap_railgun_engine_multi(vec![cfg(tmp.path())], params, |_c| build_toy_state())
             .expect("bootstrap");
